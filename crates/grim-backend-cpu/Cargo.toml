@@ -1,0 +1,14 @@
+[package]
+name = "grim-backend-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CPU backend for Grim — reference implementation of BackendDevice. SIMD-accelerated where available, scalar fallback otherwise."
+
+[dependencies]
+grim-tensor = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default = []

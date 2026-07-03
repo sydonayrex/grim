@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/grim-tensor",
+    "crates/grim-backend-cpu",
+    "crates/grim-backend-rocm",
+    "crates/grim-nn",
+    "crates/grim-core",
+    "crates/grim-models/transformer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Internal crates
+grim-tensor        = { path = "crates/grim-tensor" }
+grim-backend-cpu   = { path = "crates/grim-backend-cpu" }
+grim-backend-rocm  = { path = "crates/grim-backend-rocm" }
+grim-nn            = { path = "crates/grim-nn" }
+grim-core          = { path = "crates/grim-core" }
+grim-models-transformer = { path = "crates/grim-models/transformer" }
+
+# External (only commonly-needed / safe defaults; backends add their own)
+thiserror = "1"
+parking_lot = "0.12"
+
+[profile.release]
+opt-level = 3
+lto       = "thin"
+codegen-units = 1

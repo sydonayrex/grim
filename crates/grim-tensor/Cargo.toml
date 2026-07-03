@@ -1,0 +1,13 @@
+[package]
+name = "grim-tensor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Tensor, DType, Shape, and Device abstractions for the Grim inference engine."
+
+[dependencies]
+thiserror = { workspace = true }
+
+[features]
+default = []
