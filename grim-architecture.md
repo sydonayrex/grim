@@ -25,6 +25,8 @@ The rest of this document treats these as *inspirations for subsystems*, not a m
 - Plugin system: third parties can add new model architectures, new tokenizers/processors, new samplers, new backends (custom kernels/hardware), and pre/post-processing steps — without forking Grim.
 - Batched, concurrent serving with streaming output.
 - Confidence-scheduled, semi-autoregressive speculative decoding **on by default** for every autoregressive text request, transparent to callers and lossless with respect to the target model's output distribution.
+- A tiered KV cache memory hierarchy (GPU → host RAM → NVMe → remote peer) and disaggregated prefill/decode as native scheduling primitives, not deployment-time bolt-ons — including a self-tuning scheduler that calibrates its own knobs (admission budget, batching, speculation depth, KV compression bit-width) against observed SLA behavior instead of requiring manual per-deployment tuning.
+- An opt-in deterministic-replay mode giving byte-identical output across runs for evaluation, regression testing, and compliance use cases, at an explicit, stated throughput cost.
 
 **Non-functional**
 - Native Rust, no mandatory Python at runtime (build tooling — converters, evals — may use it).
@@ -32,6 +34,7 @@ The rest of this document treats these as *inspirations for subsystems*, not a m
 - Memory-safe by construction where possible; `unsafe` isolated to kernel/FFI boundaries.
 - Predictable latency under load (continuous batching, backpressure, no unbounded queues).
 - A plugin can crash or misbehave without taking down the whole engine (isolation boundary).
+- **Model safety at load time**: checkpoint formats are parsed by a non-executing consumer — no `pickle`, `.bin`, or Python dependency during model load. The parser is auditable, deterministic, and fuzzable by design. Plugin execution (WAMR/WASM or dylib) runs inside fuel+memory-limited sandboxes with no ambient authority.
 
 **Constraints**
 - Single cohesive workspace, but with crate boundaries that mirror deployment boundaries (you should be able to ship `grim-runtime` as a library with zero server dependencies).
@@ -92,6 +95,8 @@ The rest of this document treats these as *inspirations for subsystems*, not a m
 
 Data flows top-down for control (requests → scheduling → execution) and bottom-up for capability discovery (backends and model families register themselves into `grim-core` at startup).
 
+`grim-kvtransport` and `grim-disagg` (§5.5, §5.6) aren't drawn as separate boxes above to keep the diagram legible — think of them as extending `grim-memory` and `grim-scheduler` respectively rather than sitting beside them: `grim-kvtransport` is what `KvBlockPool` uses once a block needs to live somewhere other than local GPU memory, and `grim-disagg` is what `grim-scheduler` consults to decide which pool a request belongs on before its existing admit/preempt logic runs.
+
 ---
 
 ## 3. Workspace layout
@@ -127,11 +132,20 @@ grim/
 │   │                                # for values, bit-packing, fused dequant-attention
 │   │                                # kernels (see §5.4) — separate from grim-quant,
 │   │                                # which quantizes weights, not runtime KV
+│   ├── grim-kvtransport/           # Tiered KV cache: host RAM / NVMe spill + RDMA-or-TCP
+│   │                                # remote transfer between Grim instances, see §5.5.
+│   │                                # Local tiers ship first; remote tier is what
+│   │                                # grim-disagg's prefill→decode handoff runs over.
+│   ├── grim-disagg/                # Disaggregated prefill/decode: pool roles, static
+│   │                                # request routing, cross-pool KV handoff via
+│   │                                # grim-kvtransport — see §5.6
 │   ├── grim-speculative/           # DSpark-style semi-autoregressive drafter, Markov head,
 │   │                                # confidence head, confidence-scheduled verifier, plus
 │   │                                # native MTP support — default-on decode acceleration,
 │   │                                # see §5.3
-│   ├── grim-scheduler/             # Continuous batching scheduler, admission control
+│   ├── grim-scheduler/             # Continuous batching scheduler, admission control,
+│   │                                # self-tuning controller (§5.7), deterministic-replay
+│   │                                # mode (§5.8), consults grim-disagg for pool routing
 │   ├── grim-plugin/                # Plugin trait ABI, dynamic loading (dylib) + WASM host,
 │   │                                # capability negotiation, manifest schema
 │   ├── grim-engine/                # Wires scheduler + memory + core into a runtime;
@@ -200,13 +214,22 @@ pub struct DType {
 }
 
 /// Every tensor knows its quantization provenance — this stops Grim from
-/// re-quantizing a tensor that was already quantization-aware trained,
-/// and tells the dequant/matmul kernel which layout to expect.
+/// re-quantizing a tensor that was already quantization-aware trained.
+/// Provenance is a governance tag only: it records *who* produced the
+/// tensor's current encoding, and therefore whether `grim-quant` is
+/// allowed to replace it — it does not re-describe *how* the encoding is
+/// laid out, since that already lives in `dtype.storage` (`Storage::KQuant`
+/// / `Storage::GroupInt`, above). Keeping layout in exactly one place means
+/// there's nothing here for provenance to duplicate, and nothing that can
+/// silently drift out of sync with it.
 pub enum QuantProvenance {
     /// Not quantized, or produced by grim-quant's own post-training pass.
+    /// Eligible for grim-quant to re-quantize or re-pack.
     GrimNative,
-    /// Produced by an external QAT pipeline. Never re-quantized by grim-quant.
-    ExternalQat { bits: u8, group_size: usize, scheme: GroupQuantScheme, desc_act: bool },
+    /// Produced by an external QAT pipeline and ingested as-is. Never
+    /// re-quantized by grim-quant. Layout details (bits/group_size/
+    /// scheme/desc_act) live in `dtype.storage`, not here.
+    ExternalQat,
 }
 
 pub struct Tensor {
@@ -316,10 +339,26 @@ pub trait Model: Send + Sync {
     fn param_arith(&self) -> ArithType;  // arithmetic type for computation
 }
 
+/// Handle to a loaded adapter (LoRA weights + A/B rank + scaling factor).
+/// Multiple adapters may be active in the same batch; the engine fuses their
+/// low-rank updates into the base forward pass (Punica-style batched LoRA).
+pub struct AdapterHandle {
+    pub id: u32,
+    pub a: Tensor,      // low-rank A matrix, shape [r, in_features]
+    pub b: Tensor,      // low-rank B matrix, shape [out_features, r]
+    pub alpha: f32,
+}
+
 /// Autoregressive, token-level generation — dense transformers, Mamba, hybrids.
 pub trait CausalLm: Model {
     fn new_session(&self) -> Box<dyn Session>;
-    fn forward(&self, session: &mut dyn Session, input_ids: &Tensor, positions: &Tensor) -> Result<Tensor>; // logits
+    fn forward(
+        &self,
+        session: &mut dyn Session,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        adapters: &[AdapterHandle],
+    ) -> Result<Tensor>; // logits
 }
 
 /// Sequence state models need an explicit state cache instead of KV blocks.
@@ -349,6 +388,10 @@ pub trait DiffusionModel: Model {
 A hybrid architecture (e.g. a Jamba-style Mamba+attention model) just implements both `CausalLm` and internally mixes `StatefulSequence` layers with attention layers inside its own `forward` — the trait boundary is at the *request* level, not forced down into every layer.
 
 Every `CausalLm` served by Grim is, by default, actually a `SpeculativeCausalLm` — a transparent wrapper adding speculative decoding via whichever strategy applies (native MTP heads or an attached DSpark draft bundle, §5.3). Callers of `CausalLm::forward` never see this; it's chosen at model-load time based on what the model supports and what's attached, and can be disabled per-model or per-request.
+
+### 4.5 Multi-adapter (LoRA) batched serving
+
+Native batched LoRA serving is a first-class `CausalLm` capability, not a post-hoc bolt-on. The forward pass accepts an `&[AdapterHandle]` — zero or more loaded adapters per request — and fuses their low-rank updates into the base matmul in a single GPU kernel (Punica / S-LoRA / QLoRA-style `y = xW^T + Σ_i α_i·(x A_i) B_i`). Adapter weights are dtype-heterogeneous per tensor (`GpuIntConfig` already supports mixed precision), so QLoRA 4-bit adapters alongside 16-bit base weights are transparent. The KV cache and attention kernels are unaffected; only the linear projections are augmented. Batching heterogeneous adapter sets in one forward pass requires the engine to group requests by `(base_model, active_adapters)` into sub-batches, but this is a scheduling concern (§5.2) not a model concern — the `CausalLm` trait simply exposes the capability.
 
 `grim-scheduler` and `grim-server` branch on **which capability traits a loaded model implements** to decide what request types it can serve, rather than hard-coding a model-family enum — so a new modality plugin just needs to implement one of these traits (or its own, via the plugin extension point in §6).
 
@@ -391,19 +434,22 @@ This is a direct structural analogue of vLLM's block-table-over-physical-blocks 
 
 **SSM/Mamba state is not paged the same way** — Mamba's recurrent state is a small, fixed-size tensor per sequence (not O(sequence length) like KV cache), so `grim-memory` gives it a separate, much simpler `SsmStatePool` that just allocates/frees fixed-size slots. This is one of the reasons Grim doesn't force a single cache abstraction across model families. It also means SSM rollback for speculative decoding (§5.3) is a cheap state-snapshot/restore rather than a block-table truncation — see the caveat in §5.3 on why Mamba speculation ships later than transformer speculation.
 
-Physical blocks in `KvBlockPool` don't have to hold full-precision tensors — §5.4 covers compressing block contents in place to buy back capacity, and it's this same pool/block-table structure that compression operates on.
+Physical blocks in `KvBlockPool` don't have to hold full-precision tensors — §5.4 covers compressing block contents in place to buy back capacity, and it's this same pool/block-table structure that compression operates on. They don't have to live only in GPU memory either — §5.5 extends the pool across host RAM, local disk, and remote peers as a proper memory hierarchy rather than a single fixed-size tier.
 
 ### 5.2 Scheduler (`grim-scheduler`) — with admission control for latency guarantees
 
 Iteration-level / continuous batching, three queues, matching vLLM's model, plus a latency-aware admission gate:
 
 ```rust
-/// Tells the scheduler whether to admit, defer, or reject an incoming
-/// request based on its predicted impact on time-to-first-token (TTFT).
-/// This is what prevents a single long-prompt request from silently
-/// degrading every other user's response time — even on single-GPU
-/// hobbyist setups where there's no SLA contract, just a user who
-/// closes the app when it feels slow.
+/// Tells the scheduler whether to admit or defer an incoming request based
+/// on its predicted impact on time-to-first-token (TTFT). There is no
+/// reject path: work is deferred, or — for requests too large to ever
+/// clear the budget by waiting — admitted immediately rather than
+/// deferred forever (see `admit()`'s floor check below). This is what
+/// prevents a single long-prompt request from silently degrading every
+/// other user's response time — even on single-GPU hobbyist setups where
+/// there's no SLA contract, just a user who closes the app when it feels
+/// slow.
 pub struct AdmissionController {
     /// Maximum acceptable TTFT in milliseconds.
     /// Default: 2000 — most users perceive >2 s as sluggish.
@@ -448,6 +494,18 @@ impl AdmissionController {
         if self.target_ttft_ms == 0 {
             return AdmissionDecision::Admit;   // gated feature, no-op when off
         }
+        // Floor check: predicted TTFT is monotonically non-decreasing in
+        // backlog, so if the request's own prompt alone already busts the
+        // budget at zero backlog, no amount of waiting will ever bring it
+        // under budget — deferring it would defer it forever, a silent
+        // livelock. Admit immediately instead; the "deferred, not
+        // rejected" guarantee below only holds if every deferred request
+        // is genuinely admissible once the backlog drains, and an
+        // oversized solo request never is.
+        let solo_predicted = self.predict_ttft(request.prompt_tokens(), 0);
+        if solo_predicted.as_millis() as u64 > self.target_ttft_ms {
+            return AdmissionDecision::Admit;  // can't be fixed by waiting — run it now
+        }
         let predicted = self.predict_ttft(request.prompt_tokens(), backlog.total());
         if predicted.as_millis() as u64 <= self.target_ttft_ms {
             AdmissionDecision::Admit
@@ -476,6 +534,7 @@ pub struct Scheduler {
     waiting: VecDeque<Request>,   // not yet admitted (prefill pending)
     running: Vec<Request>,        // actively decoding this iteration
     swapped: VecDeque<Request>,   // preempted, KV evicted to host memory or dropped
+    paused: VecDeque<Request>,    // explicitly paused; KV is retained in block pool
     block_pool: Arc<Mutex<KvBlockPool>>,
     max_batched_tokens: usize,
     max_num_seqs: usize,
@@ -522,12 +581,18 @@ Design notes carried over deliberately from vLLM:
 New differences driven by the latency-aware admission gate:
 - **Self-calibrating throughput model**: the `AdmissionController` learns the backend's actual tokens/second from real prefill timings — no manual benchmark, no hardware-specific config. A hobbyist on a laptop ROCm iGPU gets the same latency behavior as a datacenter MI300X, just slower throughput, because admission scales to the hardware's actual capability.
 - **Default TTFT target of 2 seconds**: tuned for human perception of responsiveness. A user pasting a 10k prompt into a chat interface sees results start within 2 seconds, or their prompt was explicitly deferred (the request doesn't silently queue). This is the same latency bar web apps set for page loads, applied to LLM inference.
-- **Requests are deferred, not rejected**: admission control never drops work — it defers requests whose estimated TTFT exceed the budget. The request stays in `waiting` and is re-evaluated each tick. Under steady load, the controller automatically spaces admissions so no individual request starves.
+- **Requests are deferred, not rejected — with a floor for the unfixable case**: admission control never drops work. It defers requests whose estimated TTFT exceeds the budget, and the request stays in `waiting` and is re-evaluated each tick — but only when deferring can actually help. Predicted TTFT only grows with backlog, so a request whose *own prompt alone* already exceeds the budget at zero backlog would defer forever if treated the same way; `admit()` checks for exactly this case and admits such requests immediately instead of queuing them behind a budget they can never clear. Under steady load with prompts that fit the budget, the controller spaces admissions so those requests don't starve; oversized solo requests bypass the gate entirely rather than exploiting it into a livelock.
 - **Per-token ITL check during decode**: once a request is admitted and enters decode phase, the controller also caps inter-token latency. If a dense decode batch slows per-token throughput below the `target_itl_ms` budget, the controller defers new prefill admissions for the next tick, protecting the streaming feel of already-running requests — the user who's watching tokens appear doesn't get a stall because a new request arrived.
 
 The admission controller is **always active** (including minimal threshold defaults) but its penalty is low: on an idle engine the model predicts zero backlog so every request is admitted immediately. The gate only engages when the engine is under enough load that admitting one more request would degrade everyone else's responsiveness — which is exactly when hobbyists start noticing lag and leave.
 
 For diffusion requests, "scheduling" means something different — there's no growing KV cache, but there is a fixed number of denoising steps and a request occupies a latent buffer for its full duration. `grim-scheduler` treats these as a separate request class with a simpler capacity-based admission policy (bounded by concurrent latent-buffer memory, not token budget). The admission controller applies its prefill TTFT prediction to the first denoising step (the "prefill" equivalent), and the per-token ITL check to the intermediate steps (the "decode" equivalent).
+
+### 5.2.1 Interruptible / resumable generation
+
+Pause and resume are scheduler-level primitives, not application-layer state machines every caller hand-rolls. A request in the `paused` queue retains its KV state in the block pool at zero scheduling priority — it is not evicted, but it is also never selected for the running batch. The engine exposes `pause(request_id)` and `resume(request_id)` APIs; the scheduler moves the request between `running` and `paused`, and `resume` transparently continues from the exact token position where `pause` stopped. The KV blocks stay alive (ref-counted, per §5.4), so resume is O(1) — just re-admit to `running`.
+
+This is what makes speculative decoding's `KvCache::tentative_append` / `commit` / `rollback_to` (§5.3) useful beyond correctness: a paused mid-speculation request can be resumed later without losing its draft tokens, because the KV state was never committed, just tentatively appended. The speculative decoding layer handles rollback on its own when the resume happens; the scheduler just ensures the request gets scheduled again.
 
 ### 5.3 Speculative decoding (`grim-speculative`) — **default-on**
 
@@ -648,7 +713,7 @@ impl ConfidenceScheduler {
 **Caveats worth carrying into the roadmap, not glossing over:**
 - Every DSpark number above (26.7–30.9% higher accepted length vs. Eagle3, 16.3–18.4% vs. DFlash, 60–85% per-user latency improvement on V4-Flash) is DeepSeek's own reported benchmark on their own infrastructure as of the June 2026 release; there's no independent third-party reproduction yet, so Grim should treat these as directional, not as guaranteed numbers on Grim's own kernels/hardware.
 - **A DSpark draft bundle has to be trained per target checkpoint** — this is not a zero-shot technique. `grim-speculative` needs a clean "no bundle, no native MTP" fallback (skip speculation, decode normally) rather than assuming one always exists, especially for community/plugin-supplied models. MTP doesn't have this problem, but only covers the handful of model families that ship MTP-trained checkpoints (per vLLM's docs: model families with native MTP support only — everything else needs EAGLE-, draft-model-, or DSpark-style speculation instead).
-- Both techniques as published target dense/MoE **transformer** decode. Applying either to `StatefulSequence` (Mamba/hybrid) targets requires a different drafting strategy — the state-recurrence pattern doesn't support the KV-block-rollback that transformer speculation uses, and neither DSpark's tree-attention nor MTP's shared-trunk approach has been validated for SSMs. However, a simpler and well-understood path exists: **train a small draft *transformer* model for the Mamba target** (Medusa/EAGLE-style), where the draft is a separate model, not the SSM itself speculating. The draft model (a tiny transformer, 10-20% of the target's parameter count) learns to predict the target Mamba's output distribution via distillation — a known process with existing tooling. It doesn't need to understand SSM state; it just needs to be right often enough to be accepted at the usual speculative-sampling rate. This trades the research risk (making DSpark work on SSM states) for engineering cost (training a transformer draft for each Mamba target), which is a solvable pipeline problem rather than an open research question. **Ship transformer speculation in phase 5; commit Mamba (SSM) speculation to phase 7.5** — immediately after model breadth lands in phase 7 — starting with the draft-model approach and reassessing if DSpark-on-SSM research matures.
+- Both techniques as published target dense/MoE **transformer** decode. Applying either to `StatefulSequence` (Mamba/hybrid) targets requires a different drafting strategy — the state-recurrence pattern doesn't support the KV-block-rollback that transformer speculation uses, and neither DSpark's tree-attention nor MTP's shared-trunk approach has been validated for SSMs. However, a simpler and well-understood path exists: **train a small draft *transformer* model for the Mamba target** (Medusa/EAGLE-style), where the draft is a separate model, not the SSM itself speculating. The draft model (a tiny transformer, 10-20% of the target's parameter count) learns to predict the target Mamba's output distribution via distillation — a known process with existing tooling. It doesn't need to understand SSM state; it just needs to be right often enough to be accepted at the usual speculative-sampling rate. This trades the research risk (making DSpark work on SSM states) for engineering cost (training a transformer draft for each Mamba target), which is a solvable pipeline problem rather than an open research question. **Ship transformer speculation in phase 5; commit Mamba (SSM) speculation to phase 9** (§10) — immediately after model breadth lands in phase 8 — starting with the draft-model approach and reassessing if DSpark-on-SSM research matures.
 - Reported acceptance can degrade over long multi-turn context as a DSpark draft model's approximation of the target's distribution drifts further from its training distribution — worth a monitored fallback (auto-shrink `block_len`, drop to MTP if available, or disable speculation entirely) rather than a fixed config assumed to hold forever.
 
 ### 5.4 Runtime KV cache compression (`grim-kvquant`, TurboQuant-inspired)
@@ -678,10 +743,130 @@ pub struct KvQuantConfig {
 **What this buys, and what it doesn't** — carrying TurboQuant's own adversarial self-audit forward rather than only the headline numbers:
 - **Capacity, not raw compute speed**: freed KV memory converts into more concurrent sequences or longer max context (TurboQuant reports roughly 2x token capacity on a pure dense model, less on hybrid/MoE architectures where full-attention layers are a minority of total KV). Prefill/decode throughput deltas were reported as within noise on the source project's own benchmarks — this is a memory-capacity feature first, a raw-speed feature second.
 - **Value quantization is the quality bottleneck, not key quantization**: 3-bit key compression measured near-lossless (cosine similarity ≈1.0) against full precision, but 2-bit value quantization measurably degrades output (cosine similarity ≈0.94), while 4-bit values stay close to lossless (≈0.997). `grim-kvquant`'s default config should bias toward 4-bit values unless a deployment explicitly opts into 2-bit for maximum capacity and has validated quality on its own workload.
-- **No free lunch on compute during decode**: dequantizing compressed KV back to full precision for the attention computation itself costs real work per decode step; the win is memory capacity, and realizing a *compute* win too requires the fused compressed-attention kernels (grim-backend-cuda's equivalent of TurboQuant's Triton kernels) actually being wired into the decode path rather than compress-then-dequantize-to-float32-then-attend, which only saves memory, not compute.
+- **No free lunch on compute during decode**: dequantizing compressed KV back to full precision for the attention computation itself costs real work per decode step; the win is memory capacity, and realizing a *compute* win too requires fused compressed-attention kernels — `grim-backend-rocm`'s equivalent of TurboQuant's Triton kernels, since ROCm is Grim's primary GPU target (§1, §3), with the same kernel shape mirrored into `grim-backend-vulkan`/`grim-backend-cuda`/`grim-backend-metal` as those backends come online — actually being wired into the decode path, rather than compress-then-dequantize-to-float32-then-attend, which only saves memory, not compute.
 - **This is genuinely new capacity, not automatically "free"**: like TurboQuant's own honest audit of its headline compression-ratio claims, Grim's docs/benchmarks for `grim-kvquant` should report measured, workload-specific numbers rather than a single generic compression ratio, since the achievable ratio depends heavily on how much of a given model's KV is full-attention vs. linear-attention/SSM.
 
 **Interaction with §5.3 speculative decoding**: compressed KV blocks still support `tentative_append`/`commit`/`rollback_to` — speculative draft tokens get written into the same compressed representation as committed tokens, so the two features compose rather than requiring separate code paths. The dequantize-for-attention step simply runs once per verification batch either way.
+
+### 5.5 Tiered, network-transparent KV cache (`grim-kvtransport`)
+
+§5.1's `KvBlockPool` is described as living in "pre-allocated GPU/CPU buffers," as if GPU memory were the only tier that mattered. It's the natural next step to make that pool genuinely tiered — GPU HBM → pinned host RAM → local NVMe → a remote peer over the network — so that a block under memory pressure gets *demoted* to a slower, cheaper tier instead of being evicted and recomputed from scratch, and so the same interface that spills a block to host RAM locally can also ship it to a different machine.
+
+```rust
+/// Where a physical KV block currently lives. Ordered fastest-to-slowest;
+/// `KvBlockPool` (§5.1) tracks this per block alongside its existing
+/// free-list/ref-count bookkeeping, it doesn't replace that bookkeeping.
+pub enum KvTier {
+    Hbm,                       // on-device GPU memory
+    HostPinned,                // pinned host RAM, fast DMA to/from GPU
+    Nvme,                      // local disk spill
+    Remote { peer: PeerId },   // a different Grim instance's HBM/HostPinned tier
+}
+
+/// Moves a block's contents between tiers. Local tiers use plain
+/// memcpy/DMA; the remote tier uses RDMA where the network supports it,
+/// falling back to plain TCP otherwise. Returns a ComputeHandle (§4.1) so
+/// the caller can overlap the transfer with other work rather than
+/// blocking on it immediately.
+pub trait KvTransport: Send + Sync {
+    fn migrate(&self, block: BlockId, from: KvTier, to: KvTier) -> Result<Box<dyn ComputeHandle>>;
+}
+```
+
+**This tier is what makes §5.6's disaggregated prefill/decode possible, not a separate feature bolted alongside it**: a prefill pool produces KV blocks that a decode pool needs to consume, and that's a `Remote`-tier migration through the exact same `KvTransport` interface used for a purely local host-RAM spill under memory pressure — one abstraction, two use cases.
+
+**Bandwidth is the real constraint, and it's worth being concrete about the numbers rather than hand-waving "it's fast enough."** For a model in the Llama-2-70B-ish size class, KV cache runs roughly 320KB per token; a 4K-token prompt's KV cache is on the order of 1.3GB. If a decode pool needs that block within, say, a 300ms transfer budget to keep time-to-first-token under 500ms, that implies needing on the order of 4-5GB/s of sustained transfer bandwidth for that single request — which a 25Gbps Ethernet link can just about deliver, but which competing with other in-flight transfers on the same link will not. `grim-kvtransport` should treat transfer bandwidth as a schedulable resource with its own admission/backpressure, not assume the network is free capacity. This is also where §5.4's compression composes usefully: transferring TurboQuant-compressed blocks cuts bytes-over-the-wire roughly in proportion to the compression ratio, directly easing this constraint rather than only saving local memory.
+
+**Eviction policy under tiering**: demote-before-drop — a block facing eviction moves to the next slower tier if one has room, and is only actually freed (forcing recompute or request failure) once every tier is full. This changes the failure mode from "hard eviction under memory pressure" to "graceful slowdown," which is a real quality-of-service improvement over a single-tier pool, at the cost of needing eviction/promotion policy tuning (LRU is the obvious starting point, not necessarily the best one long-term).
+
+### 5.6 Disaggregated prefill/decode (`grim-disagg`)
+
+Separating prefill and decode onto distinct worker pools — so prefill's compute-bound burst doesn't stall decode's steady memory-bound streaming, and each phase can scale and get hardware-matched independently — has become the standard architecture for serving at scale: it's supported by every major serving framework and already running in production at several large deployments. Grim should have it as a native scheduling primitive rather than an experimental add-on layered on top of the scheduler after the fact, which is where it currently sits in the existing engines that support it at all.
+
+```rust
+/// A worker pool's role. Colocated is the default single-pool mode Grim
+/// already has (§5.2); Prefill/Decode pools only exist once §5.6 is
+/// deployed with more than one pool.
+pub enum PoolRole {
+    Colocated,
+    Prefill,
+    Decode,
+}
+
+/// Decides which pool should handle a given request. The static version
+/// (below) is what ships first: an operator configures fixed prefill/decode
+/// pool counts and the router just load-balances within each role. The
+/// content-adaptive version — deciding per request whether disaggregating
+/// even helps — is materially harder and belongs in the research track
+/// (§10, §11), not the default path.
+pub trait DisaggRouter: Send + Sync {
+    fn route(&self, request: &Request, pool_loads: &PoolLoads) -> PoolAssignment;
+}
+
+pub enum PoolAssignment {
+    Colocated,
+    Prefill { pool_id: PoolId },
+    /// A decode pool assignment carries the prefill pool it should pull
+    /// the finished KV cache from via KvTransport (§5.5).
+    Decode { pool_id: PoolId, source_prefill_pool: PoolId },
+}
+```
+
+**Why static-first, not content-adaptive-first, despite content-adaptive being the more interesting design**: the standard justification for disaggregation — prefill is compute-bound, decode is memory-bound, so hardware-match and scale them separately — is exactly the assumption that recent research shows breaking down once KV-cache offloading and long, heavily-cached contexts make prefill itself memory-bound. A request that's 95% cache hit and 5% new tokens doesn't look like a "prefill" in the classic sense at all. A static router can't see this; a content-adaptive router that decides per-request whether disaggregating even helps is the genuinely forward-looking version of this feature — but it's an open research question with the emerging-limitations literature actively working through it, not a solved engineering problem Grim can just implement. Shipping the static version first (matching where the rest of the industry already is) and explicitly scoping the content-adaptive version to the research track keeps the roadmap honest about which part is "catching up" and which part is actually novel.
+
+**Integration points**:
+- **`grim-scheduler`** (§5.2): the waiting/running/swapped queues become per-pool; a request's admission decision now also carries a pool assignment from `DisaggRouter`.
+- **`grim-kvtransport`** (§5.5): handles the actual prefill→decode KV handoff as a `Remote`-tier migration once a prefill pool finishes a request's prompt processing.
+- **`grim-speculative`** (§5.3): drafting and verification need the full KV context, so they run on the decode pool after handoff completes, not split across pools.
+- **Multi-modal requests**: for diffusion, "prefill" maps naturally to the first denoising step (or the conditioning encode) and "decode" to the remaining steps — the same pool-role concept applies, though this is a secondary concern behind getting text disaggregation right first.
+
+### 5.7 Self-tuning scheduler (generalizing §5.2's `AdmissionController`)
+
+§5.2 already self-calibrates one knob — the TTFT admission budget — against measured throughput instead of requiring manual tuning. The same philosophy generalizes to every other config surface that currently requires per-deployment, per-hardware manual tuning in existing engines: chunked-prefill chunk size, `max_batched_tokens`, speculative decoding's `block_len` (§5.3), and KV-compression bit-width (§5.4).
+
+```rust
+/// One auto-tuned scheduler knob. Each knob observes an SLA-relevant
+/// signal (a violation rate, not a raw latency number) and nudges its own
+/// value — the same EMA-based self-calibration `AdmissionController`
+/// already does for throughput, generalized to more than one dimension.
+pub trait TunableKnob: Send + Sync {
+    type Value;
+    fn current(&self) -> Self::Value;
+    fn observe(&self, sla_violation_rate: f64);
+    fn adjust(&self) -> Self::Value;
+}
+
+pub struct SelfTuningController {
+    admission: AdmissionController,               // §5.2, TTFT/ITL — unchanged
+    chunk_size: Box<dyn TunableKnob<Value = usize>>,
+    max_batched_tokens: Box<dyn TunableKnob<Value = usize>>,
+    speculation_block_len: Box<dyn TunableKnob<Value = usize>>,
+    kv_compression_bits: Box<dyn TunableKnob<Value = u8>>,
+}
+```
+
+**This is a harder control problem than the single-knob TTFT case already shipped, and the doc should say so rather than imply it's a drop-in generalization**: these knobs interact. Shrinking `speculation_block_len` to relieve an inter-token-latency violation can starve throughput and *worsen* the TTFT budget the `AdmissionController` is separately trying to protect; loosening `max_batched_tokens` to help throughput can blow the memory budget `grim-kvquant`'s bit-width knob is trying to hold. A naive per-knob EMA controller with no coupling between them risks oscillation — two knobs each correcting for a problem the other one's last adjustment caused. The credible path is: ship each knob's auto-calibration independently first (each is useful on its own, and each is exactly the kind of thing §5.2's `AdmissionController` already validates as a viable pattern), then add a damping/priority layer once multiple knobs are live simultaneously and real interaction effects can be measured rather than guessed at — not the coupled multi-knob controller as day-one scope.
+
+### 5.8 Deterministic replay mode
+
+Both vLLM-style continuous batching and llama.cpp-style single-stream decoding produce outputs that vary run-to-run at temperature 0, because batch composition changes floating-point reduction order and because default kernels use fast-but-nondeterministic reductions (atomics, parallel tree reduction with unspecified order). That's a real gap for evaluation harnesses, regression testing, and any compliance context that needs "run this exact request again and get the exact same tokens."
+
+```rust
+/// Opt-in, not default — determinism costs real throughput (see below).
+/// Set per-request or engine-wide.
+pub enum DeterminismMode {
+    Default,   // fastest path, output may vary run-to-run at temp 0
+    Strict,    // byte-identical output across runs, given the same seed
+}
+```
+
+**What actually has to change under `Strict`, itemized rather than hand-waved**:
+- **Batch composition must be canonicalized.** The same request must always see the same set of co-batched sequences in the same order, since reduction order affects floating-point results — this means either isolating a `Strict` request into its own batch (simplest, costs the most throughput) or enforcing a fixed canonical ordering rule across an entire batch of `Strict` requests.
+- **Kernel reduction order must be fixed.** `grim-backend-*` needs a deterministic kernel variant per op that matters (matmul, softmax, attention reductions) — a fixed reduction tree instead of the default fast/nondeterministic one. This is real, backend-specific engineering work, not a flag flip.
+- **Speculative decoding's rejection sampling** (§5.3) needs a per-request-seeded RNG rather than an engine-global stream whose draws depend on scheduling order — otherwise which draws land on which request becomes a function of what else happened to be batched alongside it that tick.
+- **KV compression's quantization** (§5.4) is already deterministic given fixed centroids (Lloyd-Max quantization doesn't need stochastic rounding to work), so this tier shouldn't need changes — worth confirming once implemented rather than assuming, since a future optimization could quietly introduce nondeterminism here too.
+
+**Cost, stated plainly**: `Strict` mode gives up continuous batching's main advantage (flexible, load-adaptive batch composition) for whichever requests use it, and forces the slower deterministic kernel path. This should be an explicit per-request or per-deployment opt-in — like `grim-kvquant`'s bit-width choice, not a silent default — aimed at eval/debugging/compliance workloads that value reproducibility over throughput, not general-purpose serving.
 
 ---
 
@@ -782,12 +967,12 @@ A separate, growing class of models are shipped already quantized *through train
 
 **Format version distinction**: EfficientQAT checkpoints come in two forms. The *native training format* saves `QuantLinear` modules with trainable `nn.Parameter` scales. The **GPTQ v2 transfer format** (what EfficientQAT publishes on HuggingFace as `*‑GPTQ`) freezes scales and zero-points into inference-ready buffers with the `qweight`/`qzeros`/`scales`/`g_idx` layout. Grim ingests the **GPTQ v2 transfer format** only — training-format checkpoint loading is not a target.
 
-**Per-weight-tensor provenance**: The `QuantProvenance` enum lives in `grim-tensor` (§4.1) and every `Tensor` carries its own `provenance` field, resolved from the checkpoint's per-tensor metadata at load time by `WeightSource::get()` (§4.2). This means a single model can mix e.g. FP16 embeddings + w4g128 attention + w3g128 MLP layers, each with an independent `QuantProvenance::ExternalQat` config, without any model-level override. The `Storage::GroupInt` variant in the `DType` struct mirrors this: the dequant kernel is selected per tensor based on `(tensor.provenance, tensor.dtype.storage)`, not from a model-global flag. This design was chosen to avoid a painful refactor when mixed-precision QAT models — already common in the EfficientQAT model zoo — become the norm.
+**Per-weight-tensor provenance**: The `QuantProvenance` enum lives in `grim-tensor` (§4.1) and every `Tensor` carries its own `provenance` tag, resolved from the checkpoint's per-tensor metadata at load time by `WeightSource::get()` (§4.2). This means a single model can mix e.g. FP16 embeddings + w4g128 attention + w3g128 MLP layers, each independently tagged `QuantProvenance::ExternalQat`, without any model-level override — `grim-quant` simply skips re-quantizing any tensor tagged `ExternalQat`. The actual layout each tensor needs decoding with — bits, group size, symmetric/asymmetric, `desc_act` — lives entirely in that tensor's own `dtype.storage` (`Storage::GroupInt(GpuIntConfig)`, §4.1), so there's exactly one place recording layout and one place recording governance, and the dequant kernel is selected per tensor from `dtype.storage` alone. This design was chosen to avoid a painful refactor when mixed-precision QAT models — already common in the EfficientQAT model zoo — become the norm.
 
 - **Loader**: `grim-format` gains a GPTQ-tensor-layout reader (`qweight`/`qzeros`/`scales`/`g_idx` naming, the layout EfficientQAT itself transfers checkpoints into for downstream compatibility via GPTQModel) alongside the existing GGUF and safetensors loaders — same `TensorProvider` trait, so `WeightSource` (§4.2) doesn't care which of the three produced the file it's reading from.
-    - **`g_idx` and `desc_act`**: EfficientQAT-transferred models have `desc_act=False`, meaning `g_idx` is a sequential group index (`[i // group_size for i in range(in_features)]`), not a column-permutation map as in classic GPTQ with activation ordering. The loader must read a `desc_act` flag from the checkpoint metadata (or infer it from the format version). If `desc_act=False`, `g_idx` is a group-assignment index only; if `desc_act=True`, `g_idx` is a permutation. The `ExternalQat` type's carry-over field should include a `desc_act: bool` discriminant, defaulting to `false` for EfficientQAT-ingested checkpoints.
+    - **`g_idx` and `desc_act`**: EfficientQAT-transferred models have `desc_act=False`, meaning `g_idx` is a sequential group index (`[i // group_size for i in range(in_features)]`), not a column-permutation map as in classic GPTQ with activation ordering. The loader must read a `desc_act` flag from the checkpoint metadata (or infer it from the format version). If `desc_act=False`, `g_idx` is a group-assignment index only; if `desc_act=True`, `g_idx` is a permutation. This is exactly what `GpuIntConfig::desc_act` (§4.1) records, defaulting to `false` for EfficientQAT-ingested checkpoints.
 - **Dequant/matmul kernel**: grouped INT weights need their own dequantize-and-matmul kernel per backend (distinct from the block-32 K-quant kernel), following the same shape GPTQ/BitBLAS kernels use — packed low-bit weights unpacked against a per-group scale/zero-point immediately before the matmul. This is a defined, bounded kernel surface (`grim-backend-*` gains one more op alongside `matmul`/`conv1d`/etc.), not a new execution model.
-    - **Bit-widths**: 2, 3, 4, 8 (matching EfficientQAT's shipped `w2`, `w3`, `w4`). 3-bit packing uses 10 weights per int32 with 2 unused bits — a non-power-of-two stride — so the dequant kernel must handle irregular unpacking, unlike the 2-, 4-, and 8-bit paths which align to 16, 8, and 4 weights per int32 respectively.
+    - **Bit-widths**: 2, 3, 4, 8 (matching EfficientQAT's shipped `w2`, `w3`, `w4`). 2-, 4-, and 8-bit pack cleanly within a single int32 (16, 8, and 4 weights per word respectively, since bits divides 32 evenly). 3-bit does not divide 32 evenly, so — matching real GPTQ packing rather than a naive per-word scheme — the dequant kernel must pack **32 values across three consecutive int32 words** (96 bits = 32×3, no wasted bits), with individual values allowed to straddle a word boundary. This is more fiddly to unpack than the other bit-widths and is exactly the kind of detail that has to be gotten right against a real reference implementation (e.g. AutoGPTQ/GPTQModel's own packing code) rather than re-derived from first principles.
 - **Group size compatibility**: `g` values of 64 and 128 (EfficientQAT's shipped configurations) become supported group sizes in `grim-quant`'s reader; the group-size field is read from checkpoint metadata rather than assumed, so future group sizes from other QAT tools aren't a breaking change.
 - **What Grim does *not* do**: retrain or fine-tune quantization parameters itself — Block-AP/E2E-QP-style QAT is a training-time technique that lives upstream of Grim (in a training framework, not an inference engine); Grim's job is correct, efficient ingestion and serving of the result, not reproducing the training pipeline.
 - **Interaction with §5.3 speculative decoding**: EfficientQAT's asymmetric quantization (per-group zero-point, not round-to-nearest-symmetric) shifts the target's output distribution *more* than symmetric quant at the same bit-width. A DSpark draft/confidence bundle trained against a full-precision target will drift further from a w2g64 EfficientQAT target than from a symmetric w2g64 model. `grim spec train` must accept the exact quantized checkpoint (QAT or not) it will run against, not a proxy full-precision version. Draft bundles should be validated against the deployment target before shipping.
@@ -812,14 +997,15 @@ A separate, growing class of models are shipped already quantized *through train
 ```text
 1. grim-server receives request → validates → builds Request { modality, params, priority, prompt_len }
 2. grim-engine enqueues into grim-scheduler.waiting
-2.5. Each tick, before schedule() admits from waiting:
-       AdmissionController::admit() evaluates each queued request against
-       the predicted TTFT budget (backlog + this request's prompt).
-       Requests are deferred (stay in waiting) if they'd bust the budget
-       — re-evaluated next tick. See §5.2 for the prediction model and
-       self-calibrating throughput estimate.
 3. Each engine tick:
-...
+     AdmissionController::admit() evaluates each queued request against
+       the predicted TTFT budget (backlog + this request's prompt) before
+       schedule() admits from waiting. Requests are deferred (stay in
+       waiting) if they'd bust the budget — re-evaluated next tick — unless
+       the request's own prompt alone already busts the budget at zero
+       backlog, in which case it's admitted immediately rather than
+       deferred forever. See §5.2 for the full prediction model and
+       self-calibrating throughput estimate.
      for CausalLm sequences with a speculation bundle attached (default path, §5.3):
        DraftBackbone + MarkovHead propose a block → ConfidenceHead scores it →
        ConfidenceScheduler picks a verify length under current load →
@@ -839,23 +1025,30 @@ A separate, growing class of models are shipped already quantized *through train
 
 1. **Foundation**: `grim-tensor` + `grim-backend-cpu` + `grim-nn` — get a dense transformer running single-request, unbatched, F32, CPU only. Validate against a known-good Candle output for numerical parity.
 2. **Format & quant**: `grim-format` (GGUF + safetensors) + `grim-quant` (Q8_0, Q4_K) — load real checkpoints, quantized and not.
-3. **Serving core**: `grim-memory` (paged KV) + `grim-scheduler` with `AdmissionController` (latency-aware admission, §5.2) + `grim-server` minimal HTTP — multi-request throughput on transformers with bounded TTFT. Admission control ships as part of phase 3, not deferred — without it, the scheduler has no mechanism to prevent a long prefill from silently degrading every other request's latency.
+3. **Serving core**: `grim-memory` (paged KV) + `grim-scheduler` with `AdmissionController` (latency-aware admission, §5.2) + pause/resume as a scheduler-level primitive (§5.2.1) + `grim-server` minimal HTTP — multi-request throughput on transformers with bounded TTFT. Admission control ships as part of phase 3, not deferred — without it, the scheduler has no mechanism to prevent a long prefill from silently degrading every other request's latency.
 4. **GPU backends**: `grim-backend-rocm` (primary GPU target via hip/rocBLAS), then `grim-backend-vulkan` (platform-agnostic shader-based compute) — same model code, new device. `grim-backend-cuda` and `grim-backend-metal` built if their respective feature flags are set, but they are not blocking delivery.
 5. **Speculative decoding for transformers**: `grim-speculative` — start with `NativeMtp` support (zero-config, no distillation needed, immediately useful for MTP-trained checkpoints), then add the DSpark path (`DraftBackbone`/`MarkovHead`/`ConfidenceHead`, `ConfidenceScheduler`, the `grim spec train` distillation CLI) as the enhanced option. Ships as soon as dense-transformer serving is solid, since it's the default decode path, not a later add-on — a model with neither native MTP nor an attached bundle just falls back to normal decoding.
 6. **KV cache compression**: `grim-kvquant` — TurboQuant-style compression for full-attention-layer KV blocks, defaulting to 4-bit values for quality, with fused compressed-attention kernels tracked as a follow-up once the compress/dequantize path is correct.
-7. **Model breadth**: Mamba/SSM (`StatefulSequence` + `SsmStatePool`), vision (`Encoder`), audio (`EncoderDecoderLm`), diffusion (`DiffusionModel` + scheduler).
-8. **Mamba speculative decoding**: small draft transformer model trained per Mamba target (Medusa/EAGLE-style distillation). Ships immediately after model breadth — without it, Mamba users decode at 1× while transformer users get 2-3× speculation speedup, creating a UX deficit that the architecture cannot otherwise close. Start with the draft-model approach (well-understood, existing tooling); reassess if DSpark-on-SSM research matures.
-9. **Plugin system**: WASM sampler/processor plugins first (lower risk), then dylib model-architecture plugins.
-10. **Hardening**: fault isolation, chunked prefill, prefix caching, multi-GPU tensor parallelism.
-11. **Research track**: KV compression for whatever fraction of a hybrid model's state turns out to be compressible beyond today's full-attention-only scope — state-snapshot rollback is mechanically straightforward but compression has not been validated for SSMs; treat as exploratory rather than a committed default.
+7. **Tiered KV cache — local tiers**: `grim-kvtransport`'s host-RAM and NVMe spill tiers (§5.5), with demote-before-drop eviction replacing hard eviction. Ships before the remote tier since local tiering is useful standalone (better single-node behavior under memory pressure) and de-risks the transport abstraction before a network hop is added on top of it.
+8. **Model breadth**: Mamba/SSM (`StatefulSequence` + `SsmStatePool`), vision (`Encoder`), audio (`EncoderDecoderLm`), diffusion (`DiffusionModel` + scheduler), plus multi-adapter (LoRA) batched serving as a native `CausalLm` capability (§4.5).
+9. **Mamba speculative decoding**: small draft transformer model trained per Mamba target (Medusa/EAGLE-style distillation). Ships immediately after model breadth — without it, Mamba users decode at 1× while transformer users get 2-3× speculation speedup, creating a UX deficit that the architecture cannot otherwise close. Start with the draft-model approach (well-understood, existing tooling); reassess if DSpark-on-SSM research matures.
+10. **Deterministic replay mode**: `DeterminismMode::Strict` (§5.8) — canonical batch composition, deterministic kernel variants for matmul/softmax/attention, per-request-seeded speculative-decoding RNG. Sequenced after speculative decoding (phase 5) and KV compression (phase 6) since it has to account for both — determinism can't be retrofitted onto a decode path it doesn't know about.
+11. **Self-tuning scheduler generalization**: `SelfTuningController` (§5.7) extending `AdmissionController`'s already-shipped TTFT self-calibration to chunked-prefill size, `max_batched_tokens`, speculative `block_len`, and KV-compression bit-width. Sequenced after phases 5–7 give it real knobs to tune, and shipped as independent per-knob calibration first — the coupled multi-knob controller is explicitly *not* day-one scope here, see §11.
+12. **Plugin system**: WASM sampler/processor plugins first (lower risk), then dylib model-architecture plugins.
+13. **Distributed serving**: multi-GPU tensor/pipeline parallelism, then `grim-disagg`'s static-pool prefill/decode disaggregation (§5.6) running its cross-pool handoff over `grim-kvtransport`'s remote tier (§5.5) — the network hop deferred from phase 7 lands here, once there's a multi-node deployment for it to actually run across.
+14. **Hardening**: fault isolation, remaining chunked-prefill/prefix-caching polish beyond what phase 3 shipped.
+15. **Research track**: content-adaptive prefill/decode routing (§5.6) — deciding per-request whether disaggregation helps, rather than the static pool assignment phase 13 ships, is an open problem the literature is still working through, not a solved one; KV compression and speculative decoding validation for SSMs, extending beyond today's full-attention-only / transformer-only scope; **semantic (embedding-similarity) prefix caching** — exact prefix reuse already works (shared physical KV blocks via ref-counting, §5.4), but matching on embedding similarity rather than token identity requires either rotating KV layers to a lower-dimensional space and doing approximate nearest-neighbor lookup (CacheBlend-style), or a learned projection head. Both are genuine research bets, not incremental engineering, because quality guarantees under semantic substitution are still unproven at scale. Kept flagged here deliberately, not promised on the main path; promote to a real subsystem only when the quality/eval story is solid.
 
 ---
 
 ## 11. Trade-offs to revisit as Grim grows
 
 - **Static ABI vtable vs. a full component-model boundary everywhere**: starting with C-ABI dylibs for performance plugins is simpler now but means Grim owns compatibility guarantees across its own version bumps; migrating hot-path plugins to WASM+SIMD once wasmtime's numerical performance closes the gap is worth revisiting.
-- **One graph executor for all modalities**: diffusion's iterative denoising and Mamba's recurrent state stress the "build once, replay" graph model differently than transformer decode; if this abstraction leaks too much complexity, splitting into a `TokenGraph` vs `StepGraph` executor is a reasonable fallback. Note: per-step analysis of the single executor confirms it does NOT cause a Mamba/transformer latency deficit — both modalities use the same build-once pattern with external state buffers (KV cache vs. SSM state), and the executor's fusion passes are op-pattern-driven, not modality-driven. The Mamba deficit, if it exists, comes from the speculation timeline (phase 5 for transformers, phase 8 for Mamba), not from executor overhead.
+- **One graph executor for all modalities**: diffusion's iterative denoising and Mamba's recurrent state stress the "build once, replay" graph model differently than transformer decode; if this abstraction leaks too much complexity, splitting into a `TokenGraph` vs `StepGraph` executor is a reasonable fallback. On paper the single-executor design shouldn't itself cause a Mamba/transformer latency gap — both modalities fit the same build-once pattern with external state buffers (KV cache vs. SSM state), and the executor's fusion passes are meant to be op-pattern-driven rather than modality-driven — but that's a design intent, not a measured result; it should be verified once Mamba is actually running (phase 8) rather than assumed. If a Mamba/transformer speed gap shows up in practice, check the speculative-decoding timeline first (transformer speculation ships in phase 5, Mamba's in phase 9, per §10) before suspecting the executor.
 - **Paged KV for everything vs. per-family memory strategy**: already split (KV pool vs. SSM state pool vs. diffusion latent buffers) — worth watching whether a fourth pattern emerges (e.g. video models) that needs its own pool type rather than being forced into one of the three.
-- **Tensor-parallel / pipeline-parallel** multi-GPU is deliberately out of scope for the initial design above; it changes `Session` and the scheduler's placement logic non-trivially and deserves its own design pass once single-GPU serving is solid.
+- **Tensor-parallel / pipeline-parallel** multi-GPU is deliberately out of scope for the initial design above; it changes `Session` and the scheduler's placement logic non-trivially and deserves its own design pass once single-GPU serving is solid — see phase 13.
 - **Default-on speculative decoding vs. simplicity**: making `SpeculativeCausalLm` the default wrapper for every `CausalLm` buys real latency wins but adds a mandatory draft→score→verify phase to the hot loop and a rollback contract every `KvCache` implementation must honor correctly — worth re-examining if it turns out to complicate backend or plugin development more than the throughput gain justifies for smaller deployments (an escape hatch — load a model with no attached draft bundle and no native MTP heads, or set `speculation: off` — should always exist). It's also worth re-benchmarking DSpark's own reported gains against Grim's kernels directly once phase 5 lands, rather than assuming DeepSeek's numbers transfer unchanged.
 - **KV compression as a default-off, opt-in tier**: unlike speculative decoding, `grim-kvquant` is deliberately *not* default-on — it's a memory/quality trade-off a deployment should choose deliberately (particularly the 2-bit-vs-4-bit value question), not one Grim should silently make on someone's behalf. Revisit this stance once fused compressed-attention kernels close the compute gap and the quality trade-off at 4-bit values is validated broadly enough to be a safe default.
+- **Static-first disaggregation vs. content-adaptive routing (§5.6)**: shipping the static router first is the honest choice given where the research actually stands, but it means Grim's phase-13 disaggregation is, at launch, matching industry practice rather than exceeding it. The content-adaptive router is where the real differentiation is — worth resourcing seriously once phase 13 is stable, not treated as a someday-maybe research footnote indefinitely.
+- **Multi-knob self-tuning as a control-systems problem, not a config problem (§5.7)**: the design explicitly defers coupled multi-knob tuning past independent per-knob calibration, because knobs correcting against each other's side effects is a real oscillation risk, not a hypothetical one. If phase 11 shows independent per-knob calibration is already good enough in practice, the coupled controller may not be worth building at all — that's a legitimate outcome, not a failure to reach it.
+- **Deterministic replay's cost should stay visible, not get quietly optimized away**: it would be tempting, once `Strict` mode exists, to try to claw back its throughput cost until it's "basically free" — but the moment that optimization silently reintroduces a nondeterminism source (a faster reduction order, a relaxed batch-canonicalization rule), the mode stops doing what it promises. Any future work narrowing the performance gap should be validated against the same determinism guarantee, not just against speed.

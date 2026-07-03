@@ -13,3 +13,21 @@ pub struct InlineConfig {
     pub modality: ModalityHint,
     pub cfg: Box<dyn std::any::Any + Send + Sync>,
 }
+
+/// A minimal `ModelConfig` implementation for dynamic registration.
+pub struct GenericModelConfig {
+    pub name: String,
+    pub modality: ModalityHint,
+}
+
+impl crate::model::ModelConfig for GenericModelConfig {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn modality(&self) -> ModalityHint {
+        self.modality
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}

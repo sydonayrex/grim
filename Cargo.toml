@@ -7,6 +7,20 @@ members = [
     "crates/grim-nn",
     "crates/grim-core",
     "crates/grim-models/transformer",
+    "crates/grim-models/mamba",
+    "crates/grim-models/vision",
+    "crates/grim-models/audio",
+    "crates/grim-models/diffusion",
+    "crates/grim-format",
+    "crates/grim-quant",
+    "crates/grim-memory",
+    "crates/grim-scheduler",
+    "crates/grim-engine",
+    "crates/grim-server",
+    "crates/grim-cli",
+    "crates/grim-speculative",
+    "crates/grim-kvquant",
+    "crates/grim-plugin",
 ]
 
 [workspace.package]
@@ -23,6 +37,20 @@ grim-backend-rocm  = { path = "crates/grim-backend-rocm" }
 grim-nn            = { path = "crates/grim-nn" }
 grim-core          = { path = "crates/grim-core" }
 grim-models-transformer = { path = "crates/grim-models/transformer" }
+grim-models-mamba       = { path = "crates/grim-models/mamba" }
+grim-models-vision      = { path = "crates/grim-models/vision" }
+grim-models-audio       = { path = "crates/grim-models/audio" }
+grim-models-diffusion   = { path = "crates/grim-models/diffusion" }
+grim-format        = { path = "crates/grim-format" }
+grim-quant         = { path = "crates/grim-quant" }
+grim-memory        = { path = "crates/grim-memory" }
+grim-scheduler     = { path = "crates/grim-scheduler" }
+grim-engine        = { path = "crates/grim-engine" }
+grim-server        = { path = "crates/grim-server" }
+grim-cli           = { path = "crates/grim-cli" }
+grim-speculative   = { path = "crates/grim-speculative" }
+grim-kvquant       = { path = "crates/grim-kvquant" }
+grim-plugin        = { path = "crates/grim-plugin" }
 
 # External (only commonly-needed / safe defaults; backends add their own)
 thiserror = "1"

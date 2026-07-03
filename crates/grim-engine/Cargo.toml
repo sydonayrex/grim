@@ -1,0 +1,18 @@
+[package]
+name = "grim-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Grim inference engine runtime. Wires the scheduler, memory manager, model registry, and executor into a single `Engine` struct."
+
+[dependencies]
+grim-tensor = { workspace = true }
+grim-core = { workspace = true }
+grim-nn = { workspace = true }
+grim-memory = { workspace = true }
+grim-scheduler = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default = []

@@ -1,0 +1,17 @@
+[package]
+name = "grim-models-mamba"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Mamba/SSM model family for Grim — selective state-space scan + hybrid SSM+attention. Implements StatefulSequence."
+
+[dependencies]
+grim-tensor = { workspace = true }
+grim-nn = { workspace = true }
+grim-core = { workspace = true }
+grim-backend-cpu = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default = []

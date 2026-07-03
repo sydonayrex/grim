@@ -1,0 +1,15 @@
+[package]
+name = "grim-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Continuous-batching scheduler with latency-aware admission control for Grim. Three-queue design (waiting/running/swapped) with the AdmissionController per architecture §5.2."
+
+[dependencies]
+grim-tensor = { workspace = true }
+grim-core = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default = []
