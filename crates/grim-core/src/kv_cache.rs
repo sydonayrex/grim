@@ -5,8 +5,9 @@
 //! common interface every cache implementation honors; speculative-decoding
 //! integration (§5.3) uses `tentative_append` / `commit` / `rollback_to`.
 
-use grim_tensor::error::Result;
 use grim_tensor::Tensor;
+
+use crate::error::Result;
 
 /// Block-addressed KV cache. Backed by a shared pool of physical blocks
 /// (§5.1). Sequences address memory through a logical block table; the

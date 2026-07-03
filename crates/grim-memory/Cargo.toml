@@ -1,0 +1,15 @@
+[package]
+name = "grim-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Paged KV cache, block allocator, prefix cache, and SSM state pool for Grim. Implements the KvCache trait from grim-core."
+
+[dependencies]
+grim-tensor = { workspace = true }
+grim-core = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default = []

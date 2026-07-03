@@ -1,0 +1,16 @@
+[package]
+name = "grim-kvquant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Runtime KV cache compression for Grim — TurboQuant-style rotation + Lloyd-Max scalar quant + QJL residual + group quant. §5.4."
+
+[dependencies]
+grim-tensor = { workspace = true }
+grim-core = { workspace = true }
+grim-memory = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default = []

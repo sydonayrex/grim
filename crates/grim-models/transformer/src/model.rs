@@ -2,7 +2,7 @@
 
 use grim_backend_cpu::CpuDevice;
 use grim_core::error::Result;
-use grim_core::model::{CausalLm, ModalityHint};
+use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
 use grim_nn::{Embedding, Linear, RmsNorm, Rope};
@@ -178,6 +178,7 @@ impl CausalLm for Llama {
         session: &mut dyn SessionT,
         input_ids: &Tensor,
         _positions: &Tensor,
+        _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
         let ids: Vec<u32> = match input_ids.dtype() {
             d if d == DType::F32 => {

@@ -1,0 +1,18 @@
+[package]
+name = "grim-speculative"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Default-on speculative decoding for Grim. DSpark-style semi-autoregressive drafter + MTP zero-config path. Architecture §5.3."
+
+[dependencies]
+grim-tensor = { workspace = true }
+grim-core = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+grim-backend-cpu = { workspace = true }
+
+[features]
+default = []

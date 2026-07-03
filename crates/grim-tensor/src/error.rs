@@ -26,6 +26,9 @@ pub enum Error {
 
     #[error("index out of bounds: {0}")]
     IndexOutOfBounds(String),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

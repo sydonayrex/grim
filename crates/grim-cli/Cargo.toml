@@ -1,0 +1,22 @@
+[package]
+name = "grim-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Grim CLI — run, bench, quantize, plugin management."
+
+[dependencies]
+grim-tensor = { workspace = true }
+grim-core = { workspace = true }
+grim-engine = { workspace = true }
+grim-server = { workspace = true }
+grim-memory = { workspace = true }
+grim-scheduler = { workspace = true }
+grim-models-transformer = { workspace = true }
+grim-backend-cpu = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+
+[features]
+default = []

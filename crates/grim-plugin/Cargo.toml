@@ -1,0 +1,16 @@
+[package]
+name = "grim-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Plugin system for Grim — dynamic library + WASM component loading, ABI, capability flags. §6 of Grim architecture."
+
+[dependencies]
+grim-tensor = { workspace = true }
+grim-core = { workspace = true }
+thiserror = { workspace = true }
+toml = "0.8"
+
+[features]
+default = []

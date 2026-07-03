@@ -13,6 +13,17 @@ use grim_tensor::{ArithType, Device, Tensor};
 
 use crate::error::Result;
 
+/// Handle to a loaded adapter (LoRA weights + A/B rank + scaling factor).
+/// Zero or more adapters may be active per request; the engine fuses their
+/// low-rank updates into the base forward pass (Punica-style batched LoRA).
+#[derive(Debug, Clone)]
+pub struct AdapterHandle {
+    pub id: u32,
+    pub a: Tensor,
+    pub b: Tensor,
+    pub alpha: f32,
+}
+
 /// Concrete dynamic model config — what every `load` constructor expects.
 pub trait ModelConfig: Send + Sync {
     fn name(&self) -> &str;
@@ -51,6 +62,7 @@ pub trait CausalLm: Model {
         session: &mut dyn crate::session::SessionT,
         input_ids: &Tensor,
         positions: &Tensor,
+        adapters: &[AdapterHandle],
     ) -> Result<Tensor>;
 }
 
@@ -65,9 +77,15 @@ pub trait StatefulSequence: Model {
 
 /// Per-sequence SSM state. Cheap to init/drop because Mamba-style state is
 /// O(model dimension) per sequence, not O(sequence-length) like KV.
+///
+/// `as_any` is essential for downcasting to concrete state types — the
+/// `StatefulSequence::step` impl needs to mutate state fields, which
+/// requires a concrete reference.
 pub trait SsmState: Send {
     fn clone_snapshot(&self) -> Result<Box<dyn SsmState>>;
     fn restore_snapshot(&mut self, snap: &dyn SsmState) -> Result<()>;
+    fn as_any(&self) -> &dyn std::any::Any;
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
 /// Non-autoregressive encoders — vision towers, CLIP, audio encoders.
