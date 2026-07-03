@@ -1,0 +1,15 @@
+[package]
+name = "grim-nn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Neural-network modules and weight-loading for Grim — VarBuilder-equivalent, Linear, RmsNorm, RoPE, Embedding."
+
+[dependencies]
+grim-tensor = { workspace = true }
+grim-backend-cpu = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default = []
