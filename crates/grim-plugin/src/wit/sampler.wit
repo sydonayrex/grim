@@ -1,0 +1,40 @@
+/// WIT (WebAssembly Interface Types) definition for sampler plugins.
+/// §6.1.1 — Canonical interface definition that WASM plugins must implement.
+///
+/// This interface is used by both:
+/// - The WASM loader to call into plugin functions
+/// - Plugin authors to write compatible WASM modules
+
+package grim:plugin@0.1.0;
+
+interface sampler {
+    // Get the sampler name for logging/debugging
+    get-name: func() -> string;
+    
+    // Sample the next token given logits and history.
+    // logits-ptr/history-ptr point to WASM memory regions.
+    // Returns the selected token ID or error string.
+    sample: func(logits-ptr: i32, logits-len: i32, history-ptr: i32, history-len: i32) -> result<i32, string>;
+    
+    // Query memory consumption in bytes (for enforcement)
+    memory-usage: func() -> i32;
+    
+    // Initialize with optional config string
+    init: func(config: string) -> result<_, string>;
+    
+    // Cleanup resources
+    drop: func();
+}
+
+world grim-sampler {
+    export sampler;
+    
+    // Import host functions for plugin use (optional, gated by capabilities)
+    import host {
+        // Log to host (capability: SAMPLER)
+        log: func(level: string, msg: string) -> ();
+        
+        // Get current timestamp (capability: SAMPLER)  
+        now: func() -> f64;
+    }
+}

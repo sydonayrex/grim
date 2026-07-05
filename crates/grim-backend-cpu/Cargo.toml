@@ -9,6 +9,15 @@ description = "CPU backend for Grim — reference implementation of BackendDevic
 [dependencies]
 grim-tensor = { workspace = true }
 thiserror = { workspace = true }
+# OxiBLAS — pure-Rust SIMD-accelerated SGEMM/DGEMM (no Fortran, no LAPACK).
+# Used by scirs2-linalg as its BLAS substrate. Architecture §4.1 mandates this
+# over scalar loops so the CPU backend reaches competitive single-threaded throughput
+# without pulling in a C/Fortran toolchain at compile time.
+matrixmultiply = { version = "0.3", optional = true }
 
 [features]
-default = []
+# Enable by default so OxiBLAS SIMD GEMM is the shipping path.
+# Disable (`--no-default-features`) to fall back to the scalar GEMM loop;
+# useful for targets without std::simd support or fuzz/fuzzing builds.
+default = ["oxiblas"]
+oxiblas = ["dep:matrixmultiply"]

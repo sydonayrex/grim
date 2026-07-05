@@ -8,8 +8,12 @@ description = "GGUF-compatible reader/writer and safetensors bridge for Grim. Im
 
 [dependencies]
 grim-tensor = { workspace = true }
+grim-quant = { workspace = true }
 thiserror = { workspace = true }
 serde_json = "1"
 
 [features]
 default = []
+
+[dev-dependencies]
+tempfile = "3"

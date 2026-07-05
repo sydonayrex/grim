@@ -10,8 +10,11 @@ description = "Grim inference engine runtime. Wires the scheduler, memory manage
 grim-tensor = { workspace = true }
 grim-core = { workspace = true }
 grim-nn = { workspace = true }
+grim-backend-cpu = { workspace = true }
 grim-memory = { workspace = true }
 grim-scheduler = { workspace = true }
+grim-models-transformer = { workspace = true }
+grim-speculative = { workspace = true }
 thiserror = { workspace = true }
 
 [features]

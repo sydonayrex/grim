@@ -14,6 +14,9 @@ use crate::draft_backbone::DraftBlock;
 /// Implemented directly by a target model that was trained with its own
 /// multi-token-prediction head(s).
 pub trait NativeMtp: grim_core::CausalLm {
+    /// Returns the causal LM trait reference.
+    fn as_causal_lm(&self) -> &dyn grim_core::CausalLm;
+
     /// How many extra tokens the model can natively predict ahead in one
     /// pass (vLLM's `num_speculative_tokens`). Typically small (1 is a
     /// good default).

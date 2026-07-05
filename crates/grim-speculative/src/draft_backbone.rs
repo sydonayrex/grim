@@ -18,7 +18,11 @@ pub trait DraftBackbone: Send + Sync {
         context: &Tensor,
         block_len: usize,
     ) -> Result<DraftBlock>;
+
+    /// Estimate the VRAM footprint of the draft model in bytes.
+    fn estimated_footprint_bytes(&self) -> usize;
 }
+
 
 /// One drafted candidate block.
 #[derive(Clone)]

@@ -1,0 +1,16 @@
+[package]
+name = "grim-disagg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Distributed serving and disaggregation layer for Prefill and Decode decoupling in Grim."
+
+[dependencies]
+grim-core = { workspace = true }
+grim-kvtransport = { workspace = true }
+grim-tensor = { workspace = true }
+thiserror = { workspace = true }
+
+[features]
+default = []

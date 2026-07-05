@@ -1,0 +1,21 @@
+[package]
+name = "grim-kvtransport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Tiered KV Cache local transport and spillage (GPU -> Host RAM -> NVMe). §5.5."
+
+[dependencies]
+grim-tensor = { workspace = true }
+grim-core = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+libc = "0.2"
+
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []

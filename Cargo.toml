@@ -2,8 +2,12 @@
 resolver = "2"
 members = [
     "crates/grim-tensor",
+    "crates/grim-tensor-graph",
     "crates/grim-backend-cpu",
     "crates/grim-backend-rocm",
+    "crates/grim-backend-cuda",
+    "crates/grim-backend-vulkan",
+    "crates/grim-backend-metal",
     "crates/grim-nn",
     "crates/grim-core",
     "crates/grim-models/transformer",
@@ -21,19 +25,26 @@ members = [
     "crates/grim-speculative",
     "crates/grim-kvquant",
     "crates/grim-plugin",
+    "crates/grim-kvtransport",
+    "crates/grim-disagg",
+    "crates/grim-garage",
 ]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.75"
+rust-version = "1.85"
 
 [workspace.dependencies]
 # Internal crates
 grim-tensor        = { path = "crates/grim-tensor" }
+grim-tensor-graph  = { path = "crates/grim-tensor-graph" }
 grim-backend-cpu   = { path = "crates/grim-backend-cpu" }
 grim-backend-rocm  = { path = "crates/grim-backend-rocm" }
+grim-backend-cuda  = { path = "crates/grim-backend-cuda" }
+grim-backend-vulkan = { path = "crates/grim-backend-vulkan" }
+grim-backend-metal = { path = "crates/grim-backend-metal" }
 grim-nn            = { path = "crates/grim-nn" }
 grim-core          = { path = "crates/grim-core" }
 grim-models-transformer = { path = "crates/grim-models/transformer" }
@@ -51,6 +62,8 @@ grim-cli           = { path = "crates/grim-cli" }
 grim-speculative   = { path = "crates/grim-speculative" }
 grim-kvquant       = { path = "crates/grim-kvquant" }
 grim-plugin        = { path = "crates/grim-plugin" }
+grim-kvtransport   = { path = "crates/grim-kvtransport" }
+grim-disagg        = { path = "crates/grim-disagg" }
 
 # External (only commonly-needed / safe defaults; backends add their own)
 thiserror = "1"

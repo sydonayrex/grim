@@ -8,7 +8,18 @@ description = "ROCm (hip/rocBLAS) backend for Grim — primary GPU target per ar
 
 [dependencies]
 grim-tensor = { workspace = true }
+grim-format = { workspace = true }
 thiserror = { workspace = true }
+half = "2.0"
+seahash = "4.1"
+lazy_static = "1.4"
+
+[build-dependencies]
+# rocm-rs = { git = "https://github.com/RustNSparks/rocm-rs", rev = "master" }
 
 [features]
 default = []
+rocm-profile = []
+rocm-aiter = []
+# hip-graph-capture feature temporarily disabled
+rocm-kernel-macros = []

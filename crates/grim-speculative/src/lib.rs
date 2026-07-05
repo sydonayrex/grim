@@ -17,15 +17,28 @@
 pub mod confidence_head;
 pub mod confidence_scheduler;
 pub mod draft_backbone;
+pub mod entropy_confidence_head;
+pub mod llama_mtp_adapter;
 pub mod markov_head;
 pub mod native_mtp;
 pub mod speculative_wrapper;
+pub mod distill;
+pub mod mamba_speculative;
+pub mod test_rng;
+pub mod tiny_draft_backbone;
+pub mod uniform_markov_head;
 
 pub use confidence_head::ConfidenceHead;
 pub use confidence_scheduler::{
     ConfidenceScheduler, SpeculationConfig, ThroughputProfile,
 };
 pub use draft_backbone::{DraftBackbone, DraftBlock};
+pub use entropy_confidence_head::EntropyConfidenceHead;
+pub use llama_mtp_adapter::LlamaMtpAdapter;
 pub use markov_head::MarkovHead;
 pub use native_mtp::NativeMtp;
 pub use speculative_wrapper::{SpeculativeCausalLm, Strategy};
+pub use distill::train_speculative_draft;
+pub use mamba_speculative::{MambaSpeculativeEngine, MambaStepState};
+pub use tiny_draft_backbone::TinyDraftBackbone;
+pub use uniform_markov_head::UniformMarkovHead;

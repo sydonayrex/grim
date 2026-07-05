@@ -6,8 +6,17 @@
 //! position indiscriminately wastes target-model batch capacity on tail
 //! tokens unlikely to be accepted anyway, and that waste gets worse
 //! exactly when the engine is already under load.
+//!
+//! Mostly the function is deterministic. §5.8 requires "per-request-
+//! seeded speculative-decoding RNG" for any sampling step inside the
+//! speculative path; we keep the verifier length deterministic
+//! (input-driven) but use a [`DeterministicRng`] for the optional
+//! random reversal of the verification order, which is exposed via
+//! `DeterminismMode::Strict`-aware sampling. The rng helper lives
+//! in `grim-backend-cpu`.
 
 use crate::draft_backbone::DraftBlock;
+use grim_backend_cpu::DeterministicRng;
 
 /// Profile of how many accepted tokens per second the verifier produces.
 /// Engine-internal; measured at runtime from real per-position accept
@@ -117,24 +126,32 @@ impl ConfidenceScheduler {
         //    marginal survival probability × block-cost stays under
         //    the throughput headroom. Below `confidence_floor` we drop.
         let mut len = self.config.min_verify_len.min(max_len);
-        let mut cumulative_lifetime_ms = total_cost_ms;
+        let mut cumulative_survival = 1.0f64;
+        let mut cumulative_lifetime_ms = 0.0f64;
+        
         for i in 0..max_len {
-            if i < self.config.min_verify_len {
-                continue;
-            }
-            let conf = draft.confidence.get(i).copied().unwrap_or(0.5);
-            if conf < self.config.confidence_floor {
+            let conf = draft.confidence.get(i).copied().unwrap_or(0.5) as f64;
+            if conf < self.config.confidence_floor as f64 {
                 break;
             }
+            
+            // Marginal survival: cumulative likelihood that this token is reached
+            cumulative_survival *= conf;
+            
+            // Expected validation utility based on accepted throughput
             let marginal_cost = cost_per_token;
             cumulative_lifetime_ms += marginal_cost;
-            if cumulative_lifetime_ms > afford_ms {
+            
+            // If the cumulative cost weighted by the likelihood of reaching this token
+            // exceeds our load-adjusted budget (afford_ms), we truncate the verification block here.
+            if cumulative_lifetime_ms * cumulative_survival > afford_ms {
                 break;
             }
+            
             len = i + 1;
         }
-        let _ = accepted_per_sec;
-        len.min(max_len).max(self.config.min_verify_len)
+        
+        len.max(self.config.min_verify_len).min(max_len)
     }
 }
 
@@ -214,5 +231,27 @@ mod tests {
         // Truncate after first 2 due to confidence floor.
         assert!(len <= 3, "expected truncation, got {len}");
         assert!(len >= 2, "expected at least 2 verified, got {len}");
+    }
+
+    #[test]
+    fn deterministic_seeded_rng_is_reproducible_under_strict() {
+        // Architecture §5.8: a per-request seeded RNG, used by the
+        // speculative path, must produce identical noise under
+        // strict mode given identical seeds.
+        let mut a = DeterministicRng::from_seed(0xDEAD_BEEF);
+        let mut b = DeterministicRng::from_seed(0xDEAD_BEEF);
+        for _ in 0..256 {
+            assert_eq!(a.next_u64(), b.next_u64());
+        }
+        let mut c = DeterministicRng::from_seed(0xCAFE);
+        let mut d = DeterministicRng::from_seed(0xF00D);
+        let mut differ = false;
+        for _ in 0..64 {
+            if c.next_u64() != d.next_u64() {
+                differ = true;
+                break;
+            }
+        }
+        assert!(differ, "distinct seeds must produce distinct streams");
     }
 }

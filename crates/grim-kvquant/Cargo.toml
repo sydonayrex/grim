@@ -9,8 +9,10 @@ description = "Runtime KV cache compression for Grim — TurboQuant-style rotati
 [dependencies]
 grim-tensor = { workspace = true }
 grim-core = { workspace = true }
-grim-memory = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+grim-backend-cpu = { path = "../grim-backend-cpu" }
 
 [features]
 default = []

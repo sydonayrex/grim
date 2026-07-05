@@ -1,0 +1,14 @@
+# Example Custom Sampler Plugin (Dylib)
+# Demonstrates the dylib plugin path for high-performance samplers
+
+[plugin]
+name = "top-k-sampler"
+abi_version = 1
+kind = "dylib"
+capabilities = ["sampler"]
+entry = "libtop_k_sampler.so"
+
+[plugin.limits]
+# Limits are advisory for dylib plugins - they run in-process
+fuel = 0 # No fuel limit for native plugins
+max_memory_mb = 0 # No memory limit - trust the plugin

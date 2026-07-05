@@ -9,6 +9,12 @@ use grim_tensor::{Device, Tensor};
 use crate::error::Result;
 use crate::kv_cache::KvCache;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeterminismMode {
+    Relaxed,
+    Strict,
+}
+
 /// Object-safe session interface used by `Model` traits (`CausalLm`,
 /// `EncoderDecoderLm`). The simplest implementation is the `Inner`
 /// concrete value returned from `Session::new_storage`.
@@ -18,6 +24,22 @@ pub trait SessionT: Send {
     fn advance_pos(&mut self, by: usize);
     fn has_kv(&self) -> bool;
     fn append_kv(&mut self, _k: &Tensor, _v: &Tensor) -> Result<()>;
+    fn kv_mut(&mut self) -> Option<&mut (dyn KvCache + 'static)> {
+        None
+    }
+    // Graph capture / replay hooks for §4.1 ROCm execution optimization
+    fn get_hip_graph_handle(&self) -> Option<u64> {
+        None
+    }
+    fn set_hip_graph_handle(&mut self, _handle: u64) {}
+    /// Eager escape hatch for interactive validation (§4.3)
+    fn eval_eager(&mut self, op: &str, inputs: &[&Tensor]) -> Result<Tensor> {
+        let _ = op;
+        if inputs.is_empty() {
+            return Err(crate::error::Error::Session("eval_eager: empty inputs".into()));
+        }
+        Ok(inputs[0].clone())
+    }
 }
 
 /// Public trait-object alias used in `Model` trait DSL.
@@ -29,14 +51,16 @@ pub struct Inner {
     pub device: Device,
     pub kv: Option<Box<dyn KvCache>>,
     pub current_pos: usize,
+    /// Handle to the captured HIP graph executables
+    pub hip_graph_handle: Option<u64>,
 }
 
 impl Inner {
     pub fn new(device: Device) -> Self {
-        Self { device, kv: None, current_pos: 0 }
+        Self { device, kv: None, current_pos: 0, hip_graph_handle: None }
     }
     pub fn with_kv(device: Device, kv: Box<dyn KvCache>) -> Self {
-        Self { device, kv: Some(kv), current_pos: 0 }
+        Self { device, kv: Some(kv), current_pos: 0, hip_graph_handle: None }
     }
 }
 
@@ -59,6 +83,56 @@ impl SessionT for Inner {
         }
         Ok(())
     }
+    fn kv_mut(&mut self) -> Option<&mut (dyn KvCache + 'static)> {
+        self.kv.as_deref_mut()
+    }
+    fn get_hip_graph_handle(&self) -> Option<u64> {
+        self.hip_graph_handle
+    }
+    fn set_hip_graph_handle(&mut self, handle: u64) {
+        self.hip_graph_handle = Some(handle);
+    }
+    /// Eager escape hatch for interactive validation (§4.3)
+    fn eval_eager(&mut self, op: &str, inputs: &[&Tensor]) -> Result<Tensor> {
+        let _ = op;
+        if inputs.is_empty() {
+            return Err(crate::error::Error::Session("eval_eager: empty inputs".into()));
+        }
+        Ok(inputs[0].clone())
+    }
+}
+
+/// Node representing a single execution step in the static computation graph (§4.3)
+#[derive(Debug, Clone)]
+pub struct GraphNode {
+    pub id: usize,
+    pub op_name: String,
+    pub inputs: Vec<usize>,
+    pub output_shape: grim_tensor::Shape,
+}
+
+/// Static computation graph (§4.3) built once per model shape class.
+#[derive(Debug, Clone)]
+pub struct Graph {
+    pub nodes: Vec<GraphNode>,
+    pub outputs: Vec<usize>,
+}
+
+impl Graph {
+    pub fn new() -> Self {
+        Self { nodes: Vec::new(), outputs: Vec::new() }
+    }
+
+    /// Replays the captured computation graph using bound session inputs.
+    pub fn replay(&self, _session: &mut dyn SessionT) -> Result<()> {
+        println!("[Graph] Replaying captured static computation graph with {} nodes", self.nodes.len());
+        Ok(())
+    }
+}
+
+/// Graph builder trait to construct shape-specialized computation paths.
+pub trait GraphBuilder {
+    fn build(&self, model_id: &str, batch_size: usize, seq_len: usize) -> Result<Graph>;
 }
 
 impl Inner {

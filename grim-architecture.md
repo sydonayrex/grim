@@ -27,6 +27,7 @@ The rest of this document treats these as *inspirations for subsystems*, not a m
 - Confidence-scheduled, semi-autoregressive speculative decoding **on by default** for every autoregressive text request, transparent to callers and lossless with respect to the target model's output distribution.
 - A tiered KV cache memory hierarchy (GPU → host RAM → NVMe → remote peer) and disaggregated prefill/decode as native scheduling primitives, not deployment-time bolt-ons — including a self-tuning scheduler that calibrates its own knobs (admission budget, batching, speculation depth, KV compression bit-width) against observed SLA behavior instead of requiring manual per-deployment tuning.
 - An opt-in deterministic-replay mode giving byte-identical output across runs for evaluation, regression testing, and compliance use cases, at an explicit, stated throughput cost.
+- Installable as a proper OS-native background service on Linux (systemd), macOS (launchd), and Windows (Service Control Manager), via a scripted install/uninstall path, with the service's own restart/liveness behavior driven by Grim's own configuration rather than three independently hand-maintained platform configs.
 
 **Non-functional**
 - Native Rust, no mandatory Python at runtime (build tooling — converters, evals — may use it).
@@ -34,7 +35,6 @@ The rest of this document treats these as *inspirations for subsystems*, not a m
 - Memory-safe by construction where possible; `unsafe` isolated to kernel/FFI boundaries.
 - Predictable latency under load (continuous batching, backpressure, no unbounded queues).
 - A plugin can crash or misbehave without taking down the whole engine (isolation boundary).
-- **Model safety at load time**: checkpoint formats are parsed by a non-executing consumer — no `pickle`, `.bin`, or Python dependency during model load. The parser is auditable, deterministic, and fuzzable by design. Plugin execution (WAMR/WASM or dylib) runs inside fuel+memory-limited sandboxes with no ambient authority.
 
 **Constraints**
 - Single cohesive workspace, but with crate boundaries that mirror deployment boundaries (you should be able to ship `grim-runtime` as a library with zero server dependencies).
@@ -151,10 +151,24 @@ grim/
 │   ├── grim-engine/                # Wires scheduler + memory + core into a runtime;
 │   │                                # this is the library entry point (`grim-runtime`)
 │   ├── grim-server/                # axum HTTP/gRPC server, OpenAI-compatible + native API
-│   └── grim-cli/                   # `grim run`, `grim quantize`, `grim bench`, `grim plugin`
+│   ├── grim-service/               # Cross-platform OS service registration/lifecycle —
+│   │                                # systemd, launchd, Windows SCM backends behind one
+│   │                                # trait, driven by grim.toml's [service] block, see §12
+│   └── grim-cli/                   # `grim run`, `grim quantize`, `grim bench`, `grim plugin`,
+│                                    # `grim service {install,uninstall,start,stop,status}`
 ├── plugins/                        # first-party example plugins (out-of-tree by design)
 │   ├── example-json-grammar/
 │   └── example-custom-sampler/
+├── dist/                           # OS-native install/uninstall bootstrap scripts, see §12 —
+│   │                                # thin by design: they fetch the binary and a default
+│   │                                # config, then delegate everything else to
+│   │                                # `grim service install`/`uninstall` so there's exactly
+│   │                                # one implementation of the actual service logic, not
+│   │                                # three (one per script)
+│   ├── install.sh                  # Linux + macOS
+│   ├── install.ps1                 # Windows
+│   ├── uninstall.sh                # Linux + macOS
+│   └── uninstall.ps1               # Windows
 └── xtask/                          # cargo-xtask for kernel codegen, GGUF conversion scripts
 ```
 
@@ -339,26 +353,10 @@ pub trait Model: Send + Sync {
     fn param_arith(&self) -> ArithType;  // arithmetic type for computation
 }
 
-/// Handle to a loaded adapter (LoRA weights + A/B rank + scaling factor).
-/// Multiple adapters may be active in the same batch; the engine fuses their
-/// low-rank updates into the base forward pass (Punica-style batched LoRA).
-pub struct AdapterHandle {
-    pub id: u32,
-    pub a: Tensor,      // low-rank A matrix, shape [r, in_features]
-    pub b: Tensor,      // low-rank B matrix, shape [out_features, r]
-    pub alpha: f32,
-}
-
 /// Autoregressive, token-level generation — dense transformers, Mamba, hybrids.
 pub trait CausalLm: Model {
     fn new_session(&self) -> Box<dyn Session>;
-    fn forward(
-        &self,
-        session: &mut dyn Session,
-        input_ids: &Tensor,
-        positions: &Tensor,
-        adapters: &[AdapterHandle],
-    ) -> Result<Tensor>; // logits
+    fn forward(&self, session: &mut dyn Session, input_ids: &Tensor, positions: &Tensor) -> Result<Tensor>; // logits
 }
 
 /// Sequence state models need an explicit state cache instead of KV blocks.
@@ -388,10 +386,6 @@ pub trait DiffusionModel: Model {
 A hybrid architecture (e.g. a Jamba-style Mamba+attention model) just implements both `CausalLm` and internally mixes `StatefulSequence` layers with attention layers inside its own `forward` — the trait boundary is at the *request* level, not forced down into every layer.
 
 Every `CausalLm` served by Grim is, by default, actually a `SpeculativeCausalLm` — a transparent wrapper adding speculative decoding via whichever strategy applies (native MTP heads or an attached DSpark draft bundle, §5.3). Callers of `CausalLm::forward` never see this; it's chosen at model-load time based on what the model supports and what's attached, and can be disabled per-model or per-request.
-
-### 4.5 Multi-adapter (LoRA) batched serving
-
-Native batched LoRA serving is a first-class `CausalLm` capability, not a post-hoc bolt-on. The forward pass accepts an `&[AdapterHandle]` — zero or more loaded adapters per request — and fuses their low-rank updates into the base matmul in a single GPU kernel (Punica / S-LoRA / QLoRA-style `y = xW^T + Σ_i α_i·(x A_i) B_i`). Adapter weights are dtype-heterogeneous per tensor (`GpuIntConfig` already supports mixed precision), so QLoRA 4-bit adapters alongside 16-bit base weights are transparent. The KV cache and attention kernels are unaffected; only the linear projections are augmented. Batching heterogeneous adapter sets in one forward pass requires the engine to group requests by `(base_model, active_adapters)` into sub-batches, but this is a scheduling concern (§5.2) not a model concern — the `CausalLm` trait simply exposes the capability.
 
 `grim-scheduler` and `grim-server` branch on **which capability traits a loaded model implements** to decide what request types it can serve, rather than hard-coding a model-family enum — so a new modality plugin just needs to implement one of these traits (or its own, via the plugin extension point in §6).
 
@@ -534,7 +528,6 @@ pub struct Scheduler {
     waiting: VecDeque<Request>,   // not yet admitted (prefill pending)
     running: Vec<Request>,        // actively decoding this iteration
     swapped: VecDeque<Request>,   // preempted, KV evicted to host memory or dropped
-    paused: VecDeque<Request>,    // explicitly paused; KV is retained in block pool
     block_pool: Arc<Mutex<KvBlockPool>>,
     max_batched_tokens: usize,
     max_num_seqs: usize,
@@ -587,12 +580,6 @@ New differences driven by the latency-aware admission gate:
 The admission controller is **always active** (including minimal threshold defaults) but its penalty is low: on an idle engine the model predicts zero backlog so every request is admitted immediately. The gate only engages when the engine is under enough load that admitting one more request would degrade everyone else's responsiveness — which is exactly when hobbyists start noticing lag and leave.
 
 For diffusion requests, "scheduling" means something different — there's no growing KV cache, but there is a fixed number of denoising steps and a request occupies a latent buffer for its full duration. `grim-scheduler` treats these as a separate request class with a simpler capacity-based admission policy (bounded by concurrent latent-buffer memory, not token budget). The admission controller applies its prefill TTFT prediction to the first denoising step (the "prefill" equivalent), and the per-token ITL check to the intermediate steps (the "decode" equivalent).
-
-### 5.2.1 Interruptible / resumable generation
-
-Pause and resume are scheduler-level primitives, not application-layer state machines every caller hand-rolls. A request in the `paused` queue retains its KV state in the block pool at zero scheduling priority — it is not evicted, but it is also never selected for the running batch. The engine exposes `pause(request_id)` and `resume(request_id)` APIs; the scheduler moves the request between `running` and `paused`, and `resume` transparently continues from the exact token position where `pause` stopped. The KV blocks stay alive (ref-counted, per §5.4), so resume is O(1) — just re-admit to `running`.
-
-This is what makes speculative decoding's `KvCache::tentative_append` / `commit` / `rollback_to` (§5.3) useful beyond correctness: a paused mid-speculation request can be resumed later without losing its draft tokens, because the KV state was never committed, just tentatively appended. The speculative decoding layer handles rollback on its own when the resume happens; the scheduler just ensures the request gets scheduled again.
 
 ### 5.3 Speculative decoding (`grim-speculative`) — **default-on**
 
@@ -912,7 +899,7 @@ bitflags! {
 }
 ```
 
-WASM plugins implement an equivalent surface via a WIT interface (component model), e.g.:
+WASM plugins implement an equivalent surface via a WIT interface (component model). Three shapes cover the capability table above — a plugin declares which one(s) it implements, not a single generic interface stretched to fit all of them:
 
 ```wit
 package grim:plugin@1.0.0;
@@ -924,9 +911,60 @@ interface sampler {
     sample: func(logits: list<f32>, history: list<u32>) -> u32;
   }
 }
+
+/// Covers moderation filters, PII redactors, grammar/constrained-decoding
+/// enforcers, and any other pre/post-processing plugin — one shape
+/// instead of each inventing its own call signature. `on-chunk` runs
+/// incrementally as tokens are produced (or consumed, for pre-processors
+/// watching prompt/tool input), matching the streaming behavior §8
+/// already promises elsewhere in the engine — not a single call at the
+/// end of generation.
+interface processor {
+  enum verdict {
+    allow,      // pass the chunk through unchanged
+    transform,  // pass through a modified chunk (see chunk-result.transformed)
+    block,      // stop the stream here; emit no further chunks
+  }
+  record chunk-result {
+    verdict: verdict,
+    transformed: option<string>,  // meaningful only when verdict = transform
+    reason: option<string>,       // surfaced in tracing (§6.5) and to the client on block
+  }
+  record processor-config {
+    params: list<tuple<string, string>>,
+    /// Declared by the plugin itself, not inferred by the engine — see
+    /// §6.5 for what this controls on failure. Safety-relevant plugins
+    /// (moderation, PII redaction) should declare `false`; best-effort
+    /// enhancements can reasonably declare `true`.
+    fail-open: bool,
+  }
+  resource processor {
+    constructor(config: processor-config);
+    on-chunk: func(text: string, window: list<string>) -> chunk-result;
+  }
+}
+
+/// Minimal by design — encode/decode is the whole contract; special
+/// tokens, merges, and vocabulary all live in the plugin's own state.
+interface tokenizer {
+  resource tokenizer {
+    encode: func(text: string) -> list<u32>;
+    decode: func(ids: list<u32>) -> string;
+  }
+}
 ```
 
-### 6.3 Manifest & discovery
+### 6.3 Processing pipeline & composition
+
+Samplers are singular: one active sampler per request, a straightforward registry lookup. Processors are not — a deployment might run a moderation filter, a PII redactor, and a grammar constraint on the same request simultaneously, and none of them is mutually exclusive with the others the way two samplers would be. `grim-plugin` treats processor-capability plugins as a declared, ordered **chain**, not a single registry slot:
+
+- Each processor plugin declares a `stage` (`pre`, running on prompt/tool input, or `post`, running on generated output) and a `priority` (ascending order within a stage) in its manifest (§6.4).
+- Within a stage, processors run in priority order, and a `transform` verdict composes — the next plugin in the chain sees the *already-transformed* chunk, not the original.
+- The first `block` verdict short-circuits the rest of the chain. This is a deliberate default-to-safety rule: whichever plugin blocks first wins, and a later, lower-priority plugin never gets a chance to override a block that already happened.
+- Two processors are never invoked concurrently on the same chunk — this is a strict pipeline, not a merge, specifically because "should this token survive" has no obvious answer when two plugins disagree, other than "first blocker wins."
+- `grim-plugin` rejects a manifest set with a duplicate `(stage, priority)` pair at load time rather than silently picking one — an easy, deterministic check that avoids a whole class of "which plugin actually ran first" bugs.
+
+### 6.4 Manifest & discovery
 
 ```toml
 # plugin.grim.toml
@@ -936,18 +974,42 @@ abi_version = 1
 kind = "wasm"                     # or "dylib"
 capabilities = ["sampler"]
 entry = "grammar_json.wasm"
+stage = "post"                    # only meaningful for processor-capability plugins, §6.3
+priority = 10                     # only meaningful for processor-capability plugins, §6.3
 
 [plugin.limits]                   # only meaningful for kind = "wasm"
-fuel = 5_000_000
+fuel_per_invocation = 50_000      # charged per on-chunk/sample call, not once for the
+                                   # whole request — a fixed request-lifetime budget could
+                                   # exhaust partway through a long generation and fail
+                                   # mid-stream; a per-call budget can't
 max_memory_mb = 64
+
+[plugin.capabilities.grants]      # explicit and enumerated; empty/false by default —
+                                   # a plugin gets nothing beyond pure computation
+                                   # unless it's granted here
+network = false                   # outbound network, e.g. a remote moderation API
+filesystem = []                   # explicit read-only paths, if any (e.g. a wordlist)
+request_metadata = false          # user/tenant id, if the plugin needs per-tenant behavior
+
+[plugin.reload]
+hot_reload = true                 # if true, grim-plugin watches `entry` for changes and
+                                   # swaps the running instance without an engine restart.
+                                   # In-flight requests already using the old instance
+                                   # finish against it; new requests get the new one.
+                                   # Defaults to false for dylib plugins, where a bad
+                                   # swap can't be sandboxed the way a WASM one can.
 ```
 
-`grim-plugin` scans a plugins directory at startup, validates `abi_version` compatibility, and registers each plugin's declared capabilities into `grim-core`'s registries (model factory registry, sampler registry, etc.) so the rest of the engine looks up "give me the factory for architecture `mamba2`" without knowing whether it's built-in or plugin-provided.
+`grim-plugin` scans a plugins directory at startup, validates `abi_version` compatibility, and registers each plugin's declared capabilities into `grim-core`'s registries (model factory registry, sampler registry, processor chains per stage, etc.) so the rest of the engine looks up "give me the factory for architecture `mamba2`" or "give me the post-stage processor chain" without knowing whether any given entry is built-in or plugin-provided. Everything under `[plugin.capabilities.grants]` is deny-by-default: a plugin manifest that requests `network = true` is a visible, auditable line item, not an assumed capability that ships with the sandbox.
 
-### 6.4 Failure isolation
+### 6.5 Failure isolation & observability
 
-- WASM plugins: fuel metering + memory limits enforced by wasmtime; a panic or fuel exhaustion returns an error to the calling request, not a process crash.
-- Dylib plugins: run their `forward`/`sample` calls behind `catch_unwind` at minimum; longer-term, performance-critical dylib plugins that need real fault isolation can be run in a supervised subprocess with a shared-memory tensor handoff (opt-in, since it costs a copy or a `memfd`/IPC round trip).
+- **WASM plugins**: fuel metering + memory limits enforced by wasmtime; a panic or fuel exhaustion returns an error rather than crashing the process. What happens *to the request* is no longer left implicit:
+  - **Samplers** fall back to Grim's built-in sampler (temperature/top-p) for the rest of the request — a sampler plugin failing degrades quality, not availability.
+  - **Processors** honor their own declared `fail-open` field (§6.2). `fail-open = false` — required for anything moderation- or safety-relevant — fails the request closed: better to return an explicit error than silently skip a check because the plugin crashed. `fail-open = true` lets the chain continue past the failed stage as though it had returned `allow`.
+  - **Tokenizers and model-architecture plugins** have no reasonable fallback — there's no default tokenizer for an unknown vocabulary — so a failure here fails the request outright, with a "plugin X failed" error rather than a generic 500.
+- **Dylib plugins**: run their `forward`/`sample` calls behind `catch_unwind` at minimum; longer-term, performance-critical dylib plugins that need real fault isolation can be run in a supervised subprocess with a shared-memory tensor handoff (opt-in, since it costs a copy or a `memfd`/IPC round trip).
+- **Observability**: every plugin invocation is wrapped in a span recording wall-clock latency, fuel consumed (WASM) or wall-clock alone (dylib), and outcome (success / fallback / failure), attributed to the plugin's name — surfaced alongside the token-level timing §9's request lifecycle already tracks, so "the model got slower" and "plugin X is adding 40ms/token" are distinguishable in practice, not just in principle.
 
 ---
 
@@ -989,6 +1051,7 @@ A separate, growing class of models are shipped already quantized *through train
 - `axum`-based HTTP server, OpenAI-compatible endpoints (`/v1/chat/completions`, `/v1/embeddings`, `/v1/audio/transcriptions`, `/v1/images/generations`) plus a native streaming API (`grim-server` speaks both JSON-over-SSE and a binary gRPC/protobuf path for lower overhead).
 - Each endpoint maps to a request type that `grim-engine` dispatches based on which `Model` capability traits the target model implements — a `/v1/chat/completions` request against a model that only implements `Encoder` returns a clear "model does not support this operation" error rather than a panic.
 - Streaming: token-level SSE for LLMs, chunked partial-transcript streaming for ASR, and progress-callback streaming (denoise step N/T) for diffusion.
+- **Health/liveness endpoints** (`/healthz` for "process is up," `/readyz` for "models loaded and accepting requests"): not just a convenience for load balancers — these are what §12's OS-native service managers poll to decide whether to restart Grim, so they need to genuinely check engine health (scheduler responsive, no stuck backend calls) rather than just confirming the HTTP listener is alive.
 
 ---
 
@@ -1025,19 +1088,20 @@ A separate, growing class of models are shipped already quantized *through train
 
 1. **Foundation**: `grim-tensor` + `grim-backend-cpu` + `grim-nn` — get a dense transformer running single-request, unbatched, F32, CPU only. Validate against a known-good Candle output for numerical parity.
 2. **Format & quant**: `grim-format` (GGUF + safetensors) + `grim-quant` (Q8_0, Q4_K) — load real checkpoints, quantized and not.
-3. **Serving core**: `grim-memory` (paged KV) + `grim-scheduler` with `AdmissionController` (latency-aware admission, §5.2) + pause/resume as a scheduler-level primitive (§5.2.1) + `grim-server` minimal HTTP — multi-request throughput on transformers with bounded TTFT. Admission control ships as part of phase 3, not deferred — without it, the scheduler has no mechanism to prevent a long prefill from silently degrading every other request's latency.
+3. **Serving core**: `grim-memory` (paged KV) + `grim-scheduler` with `AdmissionController` (latency-aware admission, §5.2) + `grim-server` minimal HTTP — multi-request throughput on transformers with bounded TTFT. Admission control ships as part of phase 3, not deferred — without it, the scheduler has no mechanism to prevent a long prefill from silently degrading every other request's latency.
 4. **GPU backends**: `grim-backend-rocm` (primary GPU target via hip/rocBLAS), then `grim-backend-vulkan` (platform-agnostic shader-based compute) — same model code, new device. `grim-backend-cuda` and `grim-backend-metal` built if their respective feature flags are set, but they are not blocking delivery.
 5. **Speculative decoding for transformers**: `grim-speculative` — start with `NativeMtp` support (zero-config, no distillation needed, immediately useful for MTP-trained checkpoints), then add the DSpark path (`DraftBackbone`/`MarkovHead`/`ConfidenceHead`, `ConfidenceScheduler`, the `grim spec train` distillation CLI) as the enhanced option. Ships as soon as dense-transformer serving is solid, since it's the default decode path, not a later add-on — a model with neither native MTP nor an attached bundle just falls back to normal decoding.
 6. **KV cache compression**: `grim-kvquant` — TurboQuant-style compression for full-attention-layer KV blocks, defaulting to 4-bit values for quality, with fused compressed-attention kernels tracked as a follow-up once the compress/dequantize path is correct.
 7. **Tiered KV cache — local tiers**: `grim-kvtransport`'s host-RAM and NVMe spill tiers (§5.5), with demote-before-drop eviction replacing hard eviction. Ships before the remote tier since local tiering is useful standalone (better single-node behavior under memory pressure) and de-risks the transport abstraction before a network hop is added on top of it.
-8. **Model breadth**: Mamba/SSM (`StatefulSequence` + `SsmStatePool`), vision (`Encoder`), audio (`EncoderDecoderLm`), diffusion (`DiffusionModel` + scheduler), plus multi-adapter (LoRA) batched serving as a native `CausalLm` capability (§4.5).
+8. **Model breadth**: Mamba/SSM (`StatefulSequence` + `SsmStatePool`), vision (`Encoder`), audio (`EncoderDecoderLm`), diffusion (`DiffusionModel` + scheduler).
 9. **Mamba speculative decoding**: small draft transformer model trained per Mamba target (Medusa/EAGLE-style distillation). Ships immediately after model breadth — without it, Mamba users decode at 1× while transformer users get 2-3× speculation speedup, creating a UX deficit that the architecture cannot otherwise close. Start with the draft-model approach (well-understood, existing tooling); reassess if DSpark-on-SSM research matures.
 10. **Deterministic replay mode**: `DeterminismMode::Strict` (§5.8) — canonical batch composition, deterministic kernel variants for matmul/softmax/attention, per-request-seeded speculative-decoding RNG. Sequenced after speculative decoding (phase 5) and KV compression (phase 6) since it has to account for both — determinism can't be retrofitted onto a decode path it doesn't know about.
 11. **Self-tuning scheduler generalization**: `SelfTuningController` (§5.7) extending `AdmissionController`'s already-shipped TTFT self-calibration to chunked-prefill size, `max_batched_tokens`, speculative `block_len`, and KV-compression bit-width. Sequenced after phases 5–7 give it real knobs to tune, and shipped as independent per-knob calibration first — the coupled multi-knob controller is explicitly *not* day-one scope here, see §11.
 12. **Plugin system**: WASM sampler/processor plugins first (lower risk), then dylib model-architecture plugins.
 13. **Distributed serving**: multi-GPU tensor/pipeline parallelism, then `grim-disagg`'s static-pool prefill/decode disaggregation (§5.6) running its cross-pool handoff over `grim-kvtransport`'s remote tier (§5.5) — the network hop deferred from phase 7 lands here, once there's a multi-node deployment for it to actually run across.
 14. **Hardening**: fault isolation, remaining chunked-prefill/prefix-caching polish beyond what phase 3 shipped.
-15. **Research track**: content-adaptive prefill/decode routing (§5.6) — deciding per-request whether disaggregation helps, rather than the static pool assignment phase 13 ships, is an open problem the literature is still working through, not a solved one; KV compression and speculative decoding validation for SSMs, extending beyond today's full-attention-only / transformer-only scope; **semantic (embedding-similarity) prefix caching** — exact prefix reuse already works (shared physical KV blocks via ref-counting, §5.4), but matching on embedding similarity rather than token identity requires either rotating KV layers to a lower-dimensional space and doing approximate nearest-neighbor lookup (CacheBlend-style), or a learned projection head. Both are genuine research bets, not incremental engineering, because quality guarantees under semantic substitution are still unproven at scale. Kept flagged here deliberately, not promised on the main path; promote to a real subsystem only when the quality/eval story is solid.
+15. **Installation & system services**: `grim-service` (§12) — systemd/launchd/Windows SCM backends behind one trait, driven by grim.toml's `[service]` block — plus the `dist/install.sh`/`install.ps1`/`uninstall.sh`/`uninstall.ps1` bootstrap scripts. Sequenced after hardening rather than earlier, since installing an unhardened engine as an always-on background service is exactly backwards — fault isolation should exist before Grim is the kind of thing that respawns itself automatically on failure.
+16. **Research track**: content-adaptive prefill/decode routing (§5.6) — deciding per-request whether disaggregation helps, rather than the static pool assignment phase 13 ships, is an open problem the literature is still working through, not a solved one; KV compression and speculative decoding validation for SSMs, extending beyond today's full-attention-only / transformer-only scope; semantic (embedding-similarity) prefix caching as a longer-horizon idea, flagged here deliberately rather than promised on the main path.
 
 ---
 
@@ -1052,3 +1116,166 @@ A separate, growing class of models are shipped already quantized *through train
 - **Static-first disaggregation vs. content-adaptive routing (§5.6)**: shipping the static router first is the honest choice given where the research actually stands, but it means Grim's phase-13 disaggregation is, at launch, matching industry practice rather than exceeding it. The content-adaptive router is where the real differentiation is — worth resourcing seriously once phase 13 is stable, not treated as a someday-maybe research footnote indefinitely.
 - **Multi-knob self-tuning as a control-systems problem, not a config problem (§5.7)**: the design explicitly defers coupled multi-knob tuning past independent per-knob calibration, because knobs correcting against each other's side effects is a real oscillation risk, not a hypothetical one. If phase 11 shows independent per-knob calibration is already good enough in practice, the coupled controller may not be worth building at all — that's a legitimate outcome, not a failure to reach it.
 - **Deterministic replay's cost should stay visible, not get quietly optimized away**: it would be tempting, once `Strict` mode exists, to try to claw back its throughput cost until it's "basically free" — but the moment that optimization silently reintroduces a nondeterminism source (a faster reduction order, a relaxed batch-canonicalization rule), the mode stops doing what it promises. Any future work narrowing the performance gap should be validated against the same determinism guarantee, not just against speed.
+- **A Rust-native cross-platform service layer vs. leaning on existing OS tooling (§12)**: implementing systemd/launchd/Windows-SCM registration directly in `grim-service` (rather than, say, just shipping a systemd unit file and telling macOS/Windows users to figure it out, or depending on a third-party wrapper like NSSM for Windows) is more work upfront but keeps the "single native binary, no external runtime dependencies" principle from §1 intact across all three platforms. Worth revisiting if any one platform's backend turns out to need disproportionate maintenance relative to how many deployments actually use it.
+
+---
+
+## 12. Installation & system services (`grim-service`)
+
+The goal here is a single source of truth: one `[service]` block in `grim.toml` that every platform's native service registration is generated from, rather than three independently hand-maintained platform configs (a systemd unit, a launchd plist, and a Windows service definition) that can silently drift out of sync with each other and with the engine's own config.
+
+### 12.1 The `[service]` config block
+
+```toml
+# grim.toml
+[service]
+name = "grim"
+run_as_user = "grim"              # created at install time on Linux/macOS if missing;
+                                    # ignored on Windows, which runs services under a
+                                    # dedicated service account instead
+restart_policy = "on-failure"      # "never" | "on-failure" | "always"
+max_restarts = 5
+restart_backoff_secs = 2
+
+[service.health_check]
+endpoint = "/healthz"              # §8's liveness endpoint
+interval_secs = 10
+timeout_secs = 3
+failure_threshold = 3              # consecutive failures before the service manager restarts Grim
+```
+
+### 12.2 `grim-service`: one trait, three platform backends
+
+```rust
+/// Abstracts over the three platform-native service managers so
+/// `grim-cli`'s `service` subcommand and the install/uninstall scripts
+/// (§12.3) share one code path instead of three OS-specific
+/// implementations that could each get the restart/health-check
+/// semantics slightly differently.
+pub trait ServiceManager: Send + Sync {
+    fn install(&self, cfg: &ServiceConfig) -> Result<()>;
+    fn uninstall(&self, purge: bool) -> Result<()>;
+    fn start(&self) -> Result<()>;
+    fn stop(&self) -> Result<()>;
+    fn status(&self) -> Result<ServiceStatus>;
+    /// Apply a changed grim.toml to the running service — hot-applies
+    /// what it can (e.g. §5.7's tunable knobs), triggers a graceful
+    /// restart (drain, then respawn) for anything that can't be changed
+    /// live, such as the listen address or which base model is loaded.
+    fn reload_config(&self) -> Result<()>;
+}
+
+/// Parsed from grim.toml's [service] block (§12.1) — the single
+/// representation every backend below derives its platform-native
+/// artifact from.
+pub struct ServiceConfig {
+    pub name: String,
+    pub exec_path: PathBuf,           // resolved at install time
+    pub config_path: PathBuf,
+    pub restart_policy: RestartPolicy,
+    pub run_as_user: Option<String>,
+    pub health_check: HealthCheckConfig,
+    pub log_path: Option<PathBuf>,
+}
+```
+
+**Linux — `SystemdManager`** writes a unit file and calls `systemctl`:
+
+```ini
+[Unit]
+Description=Grim inference engine
+After=network.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/grim serve --config /etc/grim/grim.toml
+User=grim
+Restart=on-failure
+RestartSec=2
+StartLimitBurst=5
+WatchdogSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`Type=notify` plus `WatchdogSec` is the systemd-native way to do liveness, not just "is the process still running": Grim's own health-check loop (§12.1's `health_check` block) calls `sd_notify(WATCHDOG=1)` after each successful self-check, and systemd restarts the unit if that ping doesn't arrive within `WatchdogSec` — catching a hung-but-still-running process, not just a crashed one.
+
+**macOS — `LaunchdManager`** writes a plist and calls `launchctl`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.grim.server</string>
+    <key>ProgramArguments</key>
+    <array><string>/usr/local/bin/grim</string><string>serve</string><string>--config</string><string>/etc/grim/grim.toml</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key>
+    <dict><key>SuccessfulExit</key><false/><key>Crashed</key><true/></dict>
+    <key>StandardOutPath</key><string>/var/log/grim/grim.log</string>
+    <key>StandardErrorPath</key><string>/var/log/grim/grim.err.log</string>
+</dict>
+</plist>
+```
+
+**launchd has no equivalent to systemd's watchdog ping** — `KeepAlive` only reacts to the process actually exiting, not to it hanging while still technically running. To get the same liveness guarantee on macOS, Grim's own health-check loop has to detect its own failure and exit the process deliberately (rather than just logging an error and continuing), letting `KeepAlive`'s `Crashed` condition pick up the restart. This is a real platform asymmetry worth stating plainly rather than implying all three platforms behave identically — they don't, and macOS is the weakest of the three here.
+
+**Windows — `WindowsScmManager`** registers directly with the Service Control Manager via the `windows-service` crate, rather than depending on a third-party wrapper like NSSM: `grim.exe` itself implements the SCM's service control handler when launched in service mode (`grim.exe service run`, which `grim.exe service install` registers as the service's binary path). Restart-on-failure is configured through the SCM's own recovery actions (equivalent to the Service Recovery tab / `sc.exe failure`), set from `ServiceConfig.restart_policy` at install time. Like launchd, **Windows SCM has no generic periodic-health-check primitive** — the same self-check-then-exit pattern applies, letting SCM's crash-triggered recovery action do the restart.
+
+### 12.3 Install and uninstall
+
+The `dist/` scripts (§3) are deliberately thin — they bootstrap, then delegate to `grim service install`/`uninstall`, so there's exactly one implementation of the actual service-registration logic rather than three divergent ones hidden inside shell/PowerShell scripts:
+
+**`install.sh` (Linux/macOS)**:
+1. Detect OS and architecture; download the matching release binary, verifying its checksum and signature before placing it anywhere executable — the same supply-chain-conscious posture §6's plugin sandboxing and §7's QAT-checkpoint handling already take, applied to the binary itself.
+2. Install to `/usr/local/bin/grim`.
+3. Create `/etc/grim/grim.toml` from a default template **only if one doesn't already exist** — an install script that overwrites an existing config on upgrade is a real, avoidable footgun.
+4. Create the dedicated `grim` system user/group (`useradd --system --no-create-home`) if `run_as_user` is set and the account doesn't already exist; set ownership on config/data/log directories accordingly.
+5. Run `grim service install`, which reads `[service]` from the config just written and registers the platform-native service via §12.2's `ServiceManager`.
+6. Optionally `grim service start`; print next steps (config location, log location, how to check status).
+
+**`install.ps1` (Windows)** follows the same shape — requires an elevated (Administrator) shell, installs to `Program Files`, and calls `grim.exe service install`.
+
+**`uninstall.sh`/`uninstall.ps1`** reverse it, and are conservative by default:
+1. `grim service stop` then `grim service uninstall` — unregisters the systemd unit / launchd plist / SCM entry cleanly rather than leaving a dangling service definition pointing at a binary that's about to be deleted.
+2. Remove the binary.
+3. **Preserve** `/etc/grim` (config) and any model/data directories by default — an uninstall should never silently delete a user's downloaded models or configuration.
+4. A `--purge` flag additionally removes config, data, logs, and the dedicated system user — and requires an explicit confirmation prompt (or `--yes` to skip it in scripted/CI contexts), since this is the one destructive path through either script.
+
+### 12.4 Config reload and graceful restart
+
+A config change that only touches something §5.7's `SelfTuningController` already owns (admission budget, batching knobs) can be hot-applied via `reload_config()` without restarting the process at all. A change to something structural — listen address, which base model is loaded, backend selection — can't be hot-applied safely, so `reload_config()` instead triggers a **graceful restart**: new requests stop being admitted (the same admission-control "defer" path from §5.2, repurposed here as a drain signal rather than a load-shedding one), in-flight generations are allowed to finish, and only then does the service manager actually respawn the process against the new config. This reuses machinery that already exists for a different reason rather than inventing a second, parallel "drain the engine" code path.
+
+---
+
+## 13. Implementation integrity: fail loud, fail closed
+
+Everything in this section exists because of one pattern found across an early usability pass, worth naming explicitly rather than treating as a list of unrelated bugs: a command reported success without performing the effect it claimed, repeatedly, across unrelated subsystems (service installation, model loading, request handling, telemetry). That's a more serious defect class than any individual missing feature, because it costs the person who hits it *twice* — once to discover the feature doesn't work, and again to re-verify everything else Grim told them, since a component that lies once has forfeited the benefit of the doubt everywhere else. The following are binding rules, not aspirations, for anything built against this architecture.
+
+### 13.1 No operation reports success it didn't earn
+
+Any mutating operation — CLI command, service-manager call, plugin registration — must verify its own effect before reporting success, not assume success after issuing an action. Concretely: `ServiceManager::install` (§12.2) confirms the unit file/plist/SCM entry actually exists with the expected content before returning `Ok(())`; `start()` polls the platform's own status query (`systemctl is-active`, `launchctl print`, an SCM query) rather than assuming the process came up because the start command was issued. Anything genuinely unimplemented says so explicitly — an `EngineError::NotYetImplemented(&'static str)` variant, or `unimplemented!()` in debug builds — rather than returning `Ok(())` from a stub. A successful no-op is the single worst failure mode available, because it defers the cost of discovery to whoever trusts the reported result.
+
+### 13.2 Fail closed on model and data loading
+
+If a supplied model path can't be opened, parsed, or matched against the requested architecture, Grim refuses to start that load rather than substituting a placeholder model that "works" but is meaningless. A crash on a bad path is a strictly better experience than a plausible-looking wrong answer — the failure is immediate and diagnosable instead of silently producing output that looks like it might be right. This generalizes past models: a QAT checkpoint with corrupt group-quant metadata (§7.2), a GGUF file with an unrecognized architecture tag, a draft bundle (§5.3) that doesn't match its declared target — every one of these is a load-time error, never a best-effort partial load that degrades invisibly.
+
+### 13.3 Request-level validation: no silent partial fulfillment
+
+A request field the server recognizes but doesn't act on for the current model/configuration — an `adapters` list when no adapter is resolvable, a `determinism: strict` flag (§5.8) a loaded model family doesn't support yet — is a client-visible `400` with a specific reason, not a value quietly dropped. The client asked for something specific; silently substituting different behavior is a correctness bug even when the substituted behavior (base model, default determinism) is reasonable in isolation. Unrecognized top-level request fields follow the same default: `grim-server` rejects unknown keys unless a request opts into permissive parsing, since the strict default catches typos and version-skew (an old client sending a field a newer server renamed) instead of silently ignoring them.
+
+### 13.4 Security claims require enforcement, not just a data model
+
+A capability grant, permission, or isolation guarantee documented anywhere in Grim's config surface — plugin `[plugin.capabilities.grants]` (§6.4), any future model-safety or multi-tenancy claim — is not "shipped" until an automated test proves the *runtime* enforces it. Parsing a grant into a struct is necessary but not sufficient; a `network = false` grant that isn't wired into the WASM linker's import gating is a false safety guarantee, which is worse than not claiming isolation at all, because it invites someone to run something untrusted believing they're protected. Until enforcement exists for a given claim, it's surfaced as unenforced — a startup warning, a `grim doctor` finding (§13.5) — not left to read as a real guarantee in documentation or a config file. This applies retroactively to claims already made elsewhere in this document, not only to future ones.
+
+### 13.5 Self-diagnosis: `grim doctor`
+
+`grim-cli` includes a `grim doctor` subcommand whose entire job is re-verifying, from the outside, every claim the engine and its services make about themselves: is the systemd unit actually on disk and does `systemctl` see it; is the process actually running rather than `status()` reporting a cached belief; does `/healthz` (§8) respond; is the configured GPU backend actually opened or silently running on CPU; are declared plugin grants actually enforced, checked by probing a synthetic denied capability and confirming it's refused. This exists specifically so there's one command that tells the truth even when an individual subsystem doesn't yet — the diagnostic of last resort for exactly the failure mode §13.1–§13.4 are designed to prevent in the first place.
+
+### 13.6 Docs, generated artifacts, and the CLI cannot independently drift
+
+The systemd unit / launchd plist / Windows SCM `ExecStart` line (§12.2) is generated from the same command definition `grim-cli` itself parses against, never hand-typed as a separate string literal — a CLI subcommand rename can't silently leave a generated service file pointing at a subcommand that no longer exists. Any `grim ...` command shown as an example anywhere in this document is treated as a checkable claim: it should keep working against the CLI's actual `--help` output, the same way a doctest is expected to keep compiling — not prose that's allowed to quietly go stale as the implementation moves.
+
+**The cost, stated plainly**: verify-before-success adds a real round trip to every mutating operation (an extra `systemctl is-active` call, a read-back after every disk write) that a more trusting implementation wouldn't pay. That's the right trade for anything touching installation, security, or model correctness, where the cost of a wrong "success" vastly exceeds the cost of one extra syscall — it would be the wrong trade for something genuinely latency-critical on the token-generation hot path, which is why this section is scoped to control-plane operations (install, load, request validation) and deliberately not proposed for the decode loop itself.

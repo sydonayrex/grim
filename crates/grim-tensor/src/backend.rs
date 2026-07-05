@@ -32,10 +32,35 @@ impl ComputeHandle for ReadyHandle {
     }
 }
 
+/// Unified memory-advice options matching `madvise` and `hipMemAdvise`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemAdvice {
+    // OS-level hints (madvise equivalents)
+    Sequential,
+    Random,
+    WillNeed,
+    DontNeed,
+
+    // ROCm/HIP unified-memory hints (hipMemAdvise equivalents)
+    ReadMostly,
+    PreferredLocation { device_id: u32 },
+    AccessedBy { device_id: u32 },
+    CoarseGrain,
+    FineGrain,
+}
+
+
 /// Per-device compute primitive surface. `grim-tensor` dispatches through
 /// this trait and contains no device-specific code itself. Operations
 /// return both the result storage and a `ComputeHandle` that tracks the
 /// operation's completion.
+///
+/// # Safety Taxonomy
+/// Operations implemented by backends conform to the following three-tier model:
+/// - **Tier 1 — Safe-by-construction**: Safe Rust code utilizing type-safety rules.
+/// - **Tier 2 — Explicit `unsafe` with contract**: Backend operations that execute
+///   cross-FFI boundaries (e.g. CUDA/ROCm/Vulkan API calls) requiring caller-side contracts.
+/// - **Tier 3 — Raw hardware intrinsics**: Low-level instructions (e.g. LDS swizzling, inline GCN asm).
 pub trait BackendDevice: Send + Sync {
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>>;
 
@@ -96,15 +121,30 @@ pub trait BackendDevice: Send + Sync {
         indices: &[u32],
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
+
+    /// Copy a slice of F32 values from host memory to the device storage.
+    fn from_cpu(
+        &self,
+        data: &[f32],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>>;
+
+    /// Provide hints about memory usage/advice patterns to the device/system.
+    /// Maps to OS-level `madvise` or backend-specific APIs like `hipMemAdvise`.
+    fn advise(&self, storage: &dyn BackendStorage, advice: MemAdvice) -> Result<()>;
 }
 
 /// Owned tensor storage on a specific backend. Backends manage their own
 /// buffer lifetimes; tensors on the CPU store directly, GPU tensors wrap a
 /// device pointer (ROCm/Vulkan/CUDA/Metal).
 ///
-/// `as_any` exists so backends can downcast to their concrete storage type
-/// internally without the trait leaking its existence into `grim-tensor`'s
-/// public surface.
+/// # Safety Taxonomy
+/// Access to storage handles conforms to:
+/// - **Tier 1 — Safe-by-construction**: Safe CPU vector conversions or metadata queries.
+/// - **Tier 2 — Explicit `unsafe` with contract**: Fetching device pointers directly
+///   or mapping/unmapping buffers across threads. Invariants must be documented.
+/// - **Tier 3 — Raw pointer manipulations**: Raw hardware allocations and pointers.
 pub trait BackendStorage: Send + Sync {
     fn dtype(&self) -> DType;
     fn provenance(&self) -> QuantProvenance;

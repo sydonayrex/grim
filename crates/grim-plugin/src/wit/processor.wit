@@ -1,0 +1,32 @@
+/// WIT definition for processor plugins (§6.2).
+/// Covers moderation filters, PII redactors, grammar/constrained-decoding enforcers,
+/// and any other pre/post-processing plugin using incremental on-chunk validation.
+package grim:plugin@1.0.0;
+
+interface processor {
+    enum verdict {
+        allow,      // pass the chunk through unchanged
+        transform,  // pass through a modified chunk
+        block,      // stop the stream here; emit no further chunks
+    }
+
+    record chunk-result {
+        verdict: verdict,
+        transformed: option<string>,
+        reason: option<string>,
+    }
+
+    record processor-config {
+        params: list<tuple<string, string>>,
+        fail-open: bool,
+    }
+
+    resource processor {
+        constructor(config: processor-config);
+        on-chunk: func(text: string, window: list<string>) -> chunk-result;
+    }
+}
+
+world grim-processor {
+    export processor;
+}

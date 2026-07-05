@@ -1,0 +1,13 @@
+# Example JSON Grammar Sampler Plugin (WASM)
+# §6.3 manifest example
+
+[plugin]
+name = "grammar-constrained-json"
+abi_version = 1
+kind = "wasm"
+capabilities = ["sampler"]
+entry = "grammar_json.wasm"
+
+[plugin.limits]
+fuel = 10000000
+max_memory_mb = 128

@@ -1,0 +1,15 @@
+/// WIT definition for tokenizer plugins (§6.2).
+/// Minimal by design — encode/decode is the whole contract; vocab/merges
+/// live entirely in the plugin's own state.
+package grim:plugin@1.0.0;
+
+interface tokenizer {
+    resource tokenizer {
+        encode: func(text: string) -> list<u32>;
+        decode: func(ids: list<u32>) -> string;
+    }
+}
+
+world grim-tokenizer {
+    export tokenizer;
+}
