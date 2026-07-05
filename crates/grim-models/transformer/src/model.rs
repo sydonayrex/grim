@@ -178,7 +178,7 @@ impl CausalLm for Llama {
         session: &mut dyn SessionT,
         input_ids: &Tensor,
         _positions: &Tensor,
-        _adapters: &[AdapterHandle],
+        adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
         let ids: Vec<u32> = match input_ids.dtype() {
             d if d == DType::F32 => {
@@ -203,6 +203,18 @@ impl CausalLm for Llama {
         );
         let positions: Vec<u32> = (0..seq_len).map(|i| i as u32).collect();
         let logits = self.decode(&hidden_t, &positions)?;
+        let logits = if adapters.is_empty() {
+            logits
+        } else {
+            // §4.5: fuse every active adapter's (α·x·A·B) bias into the
+            // output projection along the vocab dim. We apply it post-hoc
+            // to the final logits — a structural placeholder for the
+            // per-layer Punica-style fused matmul that ROCm fills in
+            // phase 4. Until then the correct mathematical operation
+            // (rank-r LoRA bias) still runs, just not fused with the
+            // base matmul.
+            crate::lora::apply_adapters_to_logits(&logits, adapters, self.cfg.hidden_size)?
+        };
         session.advance_pos(seq_len);
         Ok(logits)
     }

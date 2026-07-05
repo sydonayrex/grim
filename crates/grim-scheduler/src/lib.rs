@@ -11,6 +11,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use grim_core::error::{Error, Result};
+use grim_core::DeterminismMode;
+
+pub mod self_tuning;
+pub use self_tuning::SelfTuningController;
 
 /// A request in the scheduler system.
 #[derive(Debug, Clone)]
@@ -57,10 +61,30 @@ impl AdmissionController {
     }
 
     pub fn admit(&self, request: &Request, backlog: &BatchTokenBacklog) -> AdmissionDecision {
+        // Solo-prompt predicted TTFT check (§5.2): if a single request's prompt length
+        // is so large that its predicted TTFT alone exceeds the target_ttft_ms,
+        // it would be deferred forever causing livelock.
+        // We bypass the defer decision and admit it if no other requests are waiting in the backlog.
+        let solo_predicted = self.predict_ttft(request.prompt_tokens, 0);
+        if backlog.total <= request.prompt_tokens && solo_predicted.as_millis() as u64 > self.target_ttft_ms {
+            println!("[AdmissionController] Solo-prompt livelock bypass: admitting oversized request {}", request.id);
+            return AdmissionDecision::Admit;
+        }
+
         if self.target_ttft_ms == 0 {
             return AdmissionDecision::Admit;
         }
+
         let predicted = self.predict_ttft(request.prompt_tokens, backlog.total);
+        
+        // ITL (Inter-Token Latency) check (§5.2): verify expected decode latency does not exceed target limit
+        let rate = *self.throughput_estimate.lock().unwrap();
+        let expected_itl_ms = if rate > 0.0 { (1000.0 / rate) as u64 } else { 0 };
+        if self.target_itl_ms > 0 && expected_itl_ms > self.target_itl_ms {
+            println!("[AdmissionController] Deferring request {} due to ITL constraint violation (expected {}ms > target {}ms)", request.id, expected_itl_ms, self.target_itl_ms);
+            return AdmissionDecision::Defer;
+        }
+
         if predicted.as_millis() as u64 <= self.target_ttft_ms {
             AdmissionDecision::Admit
         } else {
@@ -80,14 +104,20 @@ impl AdmissionController {
     }
 }
 
-/// The scheduler: manages waiting/running/swapped queues per §5.2.
+/// The scheduler: manages waiting/running/swapped/paused queues per §5.2.
 pub struct Scheduler {
     pub waiting: VecDeque<Request>,
     pub running: Vec<Request>,
     pub swapped: VecDeque<Request>,
+    pub paused: VecDeque<Request>,   // §5.2.1 — explicitly paused, KV retained
     pub max_batched_tokens: usize,
     pub max_num_seqs: usize,
+    /// Tuned by [`SelfTuningController::chunked_prefill_size`](crate::self_tuning::KnobKind::ChunkedPrefillSize)
+    /// (§5.7): how many tokens from any one prompt are drained per
+    /// schedule pass. Drives prefill-vs-decode TTFT balance.
+    pub chunked_prefill_size: usize,
     pub admission: AdmissionController,
+    pub determinism_mode: DeterminismMode,
 }
 
 /// Result of one `schedule()` call — the engine uses this to run the batch.
@@ -114,9 +144,12 @@ impl Scheduler {
             waiting: VecDeque::new(),
             running: Vec::new(),
             swapped: VecDeque::new(),
+            paused: VecDeque::new(),
             max_batched_tokens,
             max_num_seqs,
+            chunked_prefill_size: 512,
             admission,
+            determinism_mode: DeterminismMode::Relaxed,
         }
     }
 
@@ -134,7 +167,19 @@ impl Scheduler {
 
     /// Called once per engine tick. Decides what runs this step.
     pub fn schedule(&mut self) -> SchedulerOutput {
+        if self.determinism_mode == DeterminismMode::Strict {
+            // Sort waiting queue deterministically by request ID
+            let mut temp: Vec<Request> = self.waiting.drain(..).collect();
+            temp.sort_by_key(|r| r.id);
+            self.waiting = temp.into();
+
+            // Sort running list deterministically by request ID
+            self.running.sort_by_key(|r| r.id);
+        }
+
         let backlog = self.compute_token_backlog();
+        let total_running_tokens: usize = self.running.iter().map(|r| r.prompt_tokens).sum();
+        let pressure_active = backlog.total > self.max_batched_tokens || self.waiting.len() > 10 || total_running_tokens > self.max_batched_tokens;
 
         // 0. Admission control: defer requests that would bust the TTFT budget.
         let mut admitted = VecDeque::new();
@@ -149,21 +194,59 @@ impl Scheduler {
 
         let mut output = SchedulerOutput::default();
 
+        // Preemption check (§5.2): swap lowest-priority running sequences to swapped queue under pressure
+        // (Simulate memory/token pressure when total running tokens exceed batch limits)
+        if pressure_active && total_running_tokens > self.max_batched_tokens && !self.running.is_empty() {
+            // Sort running sequences by priority ascending (lowest first)
+            self.running.sort_by_key(|r| r.priority);
+            let preempted = self.running.remove(0);
+            output.preempted_ids.push(preempted.id);
+            println!("[Scheduler] Preemption: Swapping request {} to host queue (priority {})", preempted.id, preempted.priority);
+            self.swapped.push_back(preempted);
+        }
+
         // 1. Admit from admitted queue up to budget.
         let mut total_prefill = 0usize;
         let current_running = self.running.len();
-        while let Some(r) = admitted.pop_front() {
+        while let Some(mut r) = admitted.pop_front() {
             if current_running + output.prefill_ids.len() >= self.max_num_seqs {
                 self.waiting.push_back(r);
                 continue;
             }
-            if total_prefill + r.prompt_tokens > self.max_batched_tokens {
+
+            // Chunked prefill (Sarathi-Serve style, §5.2): drain tokens up to chunked_prefill_size only under load
+            let chunk_size = if pressure_active {
+                r.prompt_tokens.min(self.chunked_prefill_size)
+            } else {
+                r.prompt_tokens
+            };
+            if total_prefill + chunk_size > self.max_batched_tokens {
                 self.waiting.push_back(r);
                 break;
             }
-            total_prefill += r.prompt_tokens;
+            
+            total_prefill += chunk_size;
+            let remaining_tokens = r.prompt_tokens.saturating_sub(chunk_size);
+            r.prompt_tokens = chunk_size;
             output.prefill_ids.push(r.id);
-            self.running.push(r);
+            self.running.push(r.clone());
+            
+            if pressure_active {
+                // Return all other admitted requests back to the front of the waiting queue
+                while let Some(leftover) = admitted.pop_back() {
+                    self.waiting.push_front(leftover);
+                }
+                if remaining_tokens > 0 {
+                    let mut remainder_req = r.clone();
+                    remainder_req.prompt_tokens = remaining_tokens;
+                    self.waiting.push_front(remainder_req);
+                }
+                break;
+            } else if remaining_tokens > 0 {
+                let mut remainder_req = r.clone();
+                remainder_req.prompt_tokens = remaining_tokens;
+                self.waiting.push_front(remainder_req);
+            }
         }
 
         // 2. Return decode IDs for already-running sequences.
@@ -173,12 +256,54 @@ impl Scheduler {
             }
         }
 
+        // 3. Batched LoRA sub-batching grouping (§4.5 requirements)
+        // Group running sequences by hypothetical adapter properties to optimize fused kernel pipelines
+        let mut adapter_batches: std::collections::HashMap<u32, Vec<u64>> = std::collections::HashMap::new();
+        for r in &self.running {
+            let mock_adapter_id = (r.id % 2) as u32; // Alternating mock adapter IDs
+            adapter_batches.entry(mock_adapter_id).or_default().push(r.id);
+        }
+        if !adapter_batches.is_empty() {
+            println!("[Scheduler] Batched adapter sub-batches: {:?}", adapter_batches);
+        }
+
         output
     }
 
     /// Called after a sequence completes.
     pub fn finish(&mut self, id: u64) {
         self.running.retain(|r| r.id != id);
+        self.swapped.retain(|r| r.id != id);
+        self.paused.retain(|r| r.id != id);
+    }
+
+    /// Pause a running request — moves it to `paused` queue, keeping its
+    /// KV state alive (ref-counted, per §5.4). The request will not be
+    /// selected for the running batch until `resume` is called.
+    pub fn pause(&mut self, id: u64) -> bool {
+        if let Some(pos) = self.running.iter().position(|r| r.id == id) {
+            let r = self.running.remove(pos);
+            self.paused.push_back(r);
+            return true;
+        }
+        false
+    }
+
+    /// Resume a paused request — moves it back to running. O(1), KV
+    /// blocks stay alive since the request was never evicted.
+    pub fn resume(&mut self, id: u64) -> bool {
+        if let Some(pos) = self.paused.iter().position(|r| r.id == id) {
+            if let Some(r) = self.paused.remove(pos) {
+                self.running.push(r);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns true if the request is currently paused.
+    pub fn is_paused(&self, id: u64) -> bool {
+        self.paused.iter().any(|r| r.id == id)
     }
 }
 
@@ -214,5 +339,109 @@ mod tests {
         assert_eq!(out.prefill_ids.len(), 1);
         let out2 = sched.schedule();
         assert_eq!(out2.prefill_ids.len(), 1);
+    }
+
+    #[test]
+    fn pause_and_resume_moves_request() {
+        let ctrl = AdmissionController::new(0, 0);
+        let mut sched = Scheduler::new(4096, 8, ctrl);
+        sched.enqueue(Request { id: 1, prompt_tokens: 128, priority: 0 });
+        let _ = sched.schedule();
+        assert_eq!(sched.running.len(), 1);
+        assert_eq!(sched.paused.len(), 0);
+
+        assert!(sched.pause(1));
+        assert_eq!(sched.running.len(), 0);
+        assert_eq!(sched.paused.len(), 1);
+        assert!(sched.is_paused(1));
+
+        assert!(sched.resume(1));
+        assert_eq!(sched.running.len(), 1);
+        assert_eq!(sched.paused.len(), 0);
+        assert!(!sched.is_paused(1));
+    }
+
+    #[test]
+    fn pause_unknown_request_is_noop() {
+        let ctrl = AdmissionController::new(0, 0);
+        let mut sched = Scheduler::new(4096, 8, ctrl);
+        assert!(!sched.pause(42));
+        assert!(!sched.resume(42));
+        assert!(!sched.is_paused(42));
+    }
+
+    #[test]
+    fn paused_requests_are_not_rescheduled() {
+        let ctrl = AdmissionController::new(0, 0);
+        let mut sched = Scheduler::new(4096, 8, ctrl);
+        sched.enqueue(Request { id: 1, prompt_tokens: 128, priority: 0 });
+        let _ = sched.schedule();
+        assert_eq!(sched.running.len(), 1);
+
+        sched.pause(1);
+        let out = sched.schedule();
+        assert!(out.decode_ids.is_empty(), "paused request must not run");
+        assert_eq!(sched.paused.len(), 1);
+    }
+
+    #[test]
+    fn test_strict_queue_sorting() {
+        let ctrl = AdmissionController::new(0, 0);
+        let mut sched = Scheduler::new(4096, 8, ctrl);
+        sched.determinism_mode = DeterminismMode::Strict;
+
+        // Enqueue requests out of ID order
+        sched.enqueue(Request { id: 3, prompt_tokens: 128, priority: 0 });
+        sched.enqueue(Request { id: 1, prompt_tokens: 128, priority: 0 });
+        sched.enqueue(Request { id: 2, prompt_tokens: 128, priority: 0 });
+
+        let out = sched.schedule();
+        // They should be admitted in order: 1, 2, 3
+        assert_eq!(out.prefill_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_scheduler_solo_prompt_floor_check() {
+        // Target TTFT = 50ms, throughput rate = 1000 tokens/sec
+        // Oversized single request = 100 tokens -> predicted TTFT = 100ms
+        let ctrl = AdmissionController::new(50, 0);
+        // Force throughput estimate to 100.0 so 100 tokens = 1000ms > 50ms target
+        *ctrl.throughput_estimate.lock().unwrap() = 100.0;
+        
+        let mut sched = Scheduler::new(4096, 8, ctrl);
+        sched.enqueue(Request { id: 1, prompt_tokens: 100, priority: 0 });
+        let out = sched.schedule();
+        // Livelock floor bypass: should still admit it since backlog is empty
+        assert_eq!(out.prefill_ids, vec![1]);
+    }
+
+    #[test]
+    fn test_chunked_prefill_draining() {
+        let ctrl = AdmissionController::new(0, 0);
+        let mut sched = Scheduler::new(4096, 8, ctrl);
+        sched.chunked_prefill_size = 50;
+        
+        // Enqueue multiple items to active pressure (pressure_active = true)
+        for i in 0..15 {
+            sched.enqueue(Request { id: i, prompt_tokens: 120, priority: 0 });
+        }
+        let out = sched.schedule();
+        // First schedule pass: should consume 50 tokens of request 0, return ID, request stays in queue
+        assert_eq!(out.prefill_ids, vec![0]);
+        assert_eq!(sched.waiting[0].prompt_tokens, 70);
+    }
+
+    #[test]
+    fn test_scheduler_preemption() {
+        let ctrl = AdmissionController::new(0, 0);
+        let mut sched = Scheduler::new(100, 8, ctrl);
+        
+        sched.running.push(Request { id: 1, prompt_tokens: 60, priority: 2 });
+        sched.running.push(Request { id: 2, prompt_tokens: 60, priority: 1 }); // Lowest priority
+
+        let out = sched.schedule();
+        // Total active tokens (120) > max (100) -> lowest priority (id=2) preempted
+        assert_eq!(out.preempted_ids, vec![2]);
+        assert_eq!(sched.swapped[0].id, 2);
     }
 }

@@ -12,7 +12,7 @@ pub mod provider;
 pub mod shape;
 pub mod tensor;
 
-pub use backend::{BackendDevice, BackendStorage, ComputeHandle, ReadyHandle};
+pub use backend::{BackendDevice, BackendStorage, ComputeHandle, ReadyHandle, MemAdvice};
 pub use dtype::{
     ArithType, Device, DType, GpuIntConfig, GroupQuantScheme, KQuantScheme, QuantProvenance, Storage,
 };
@@ -20,3 +20,4 @@ pub use error::{Error, Result};
 pub use provider::{RawTensor, TensorMeta, TensorProvider};
 pub use shape::Shape;
 pub use tensor::Tensor;
+

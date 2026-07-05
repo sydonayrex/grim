@@ -16,7 +16,7 @@ use crate::error::Result;
 /// Handle to a loaded adapter (LoRA weights + A/B rank + scaling factor).
 /// Zero or more adapters may be active per request; the engine fuses their
 /// low-rank updates into the base forward pass (Punica-style batched LoRA).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AdapterHandle {
     pub id: u32,
     pub a: Tensor,

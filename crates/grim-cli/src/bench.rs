@@ -27,7 +27,7 @@ pub async fn cmd_bench(tokens: usize, concurrency: usize) -> Result<()> {
             grim_tensor::Shape::new(vec![tokens]),
         );
         let mut sess = Inner::new(model.device.clone());
-        let _ = model.forward(&mut sess, &inp, &inp)?;
+        let _ = model.forward(&mut sess, &inp, &inp, &[])?;
     }
     let elapsed = start.elapsed();
     println!(

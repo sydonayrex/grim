@@ -11,6 +11,12 @@ grim-tensor = { workspace = true }
 grim-core = { workspace = true }
 thiserror = { workspace = true }
 toml = "0.8"
+libloading = { version = "0.8", optional = true }
+
+# WASM runtime for sandboxed plugin execution
+wasmtime = { version = "28", features = ["async"], optional = true }
 
 [features]
 default = []
+wasm-sandbox = ["wasmtime"]
+dylib-loading = ["libloading"]

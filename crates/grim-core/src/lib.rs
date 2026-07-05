@@ -12,4 +12,4 @@ pub use model::{
     NoiseScheduler, SsmState, StatefulSequence,
 };
 pub use sampler::Sampler;
-pub use session::Session;
+pub use session::{Session, DeterminismMode};

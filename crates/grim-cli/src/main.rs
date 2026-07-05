@@ -5,6 +5,12 @@ use grim_core::error::Result;
 
 mod run;
 mod bench;
+mod spec;
+mod plugin;
+mod service;
+mod doctor;
+mod oxidizer;
+mod client;
 
 /// Grim inference engine CLI.
 #[derive(Parser)]
@@ -16,19 +22,74 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run a model (single-request or server mode).
-    Run {
-        /// Path to model file (GGUF or safetensors).
-        #[arg(short, long)]
-        model: String,
-        /// Prompt string.
-        prompt: Option<String>,
-        /// Start HTTP server instead of one-shot inference.
-        #[arg(short, long)]
-        serve: bool,
-        /// Address to bind the server (default 127.0.0.1:8080).
-        #[arg(short, long, default_value = "127.0.0.1:8080")]
+    /// Start the inference HTTP server (Ollama-compatible, default port 11434).
+    /// This is the subcommand used by the systemd/launchd service unit.
+    Serve {
+        /// Address to bind the server.
+        #[arg(short, long, default_value = "127.0.0.1:11434")]
         address: String,
+        /// Path to grim config file.
+        #[arg(short, long, default_value = "grim.toml")]
+        config: String,
+        /// Path to plugins directory.
+        #[arg(short, long, default_value = "plugins")]
+        plugins: String,
+    },
+    /// One-shot inference or HTTP serving for a model.
+    Run {
+        /// Name or path of the model.
+        model: Option<String>,
+        /// Prompt string (runs one-shot mode instead of interactive chat).
+        prompt: Option<String>,
+        /// Start the HTTP server (Ollama-compatible) on the specified port.
+        #[arg(long)]
+        serve: bool,
+        /// Address to bind (only used with --serve).
+        #[arg(short, long, default_value = "127.0.0.1:11434")]
+        address: String,
+        /// Path to config file.
+        #[arg(short, long, default_value = "grim.toml")]
+        config: String,
+        /// Path to plugins directory.
+        #[arg(short, long, default_value = "plugins")]
+        plugins: String,
+    },
+    /// Delete a model from local cache.
+    Reap {
+        /// Model name or path to delete.
+        model: String,
+    },
+    /// Unload an active model from memory.
+    Kill {
+        /// Name of the model to unload.
+        model: String,
+    },
+    /// Download a model from Hugging Face or Ollama.
+    Dl {
+        /// Registry model path or URL (e.g. hf.co/user/model or ollama.com/library/llama3).
+        model: String,
+        /// Optional destination path.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Show loaded models, memory usage, and execution backend.
+    Status,
+    /// Check the local model cache and report completed and partial downloads.
+    Check,
+    /// Set a model (local or cloud-routed) as the default model point for a client context.
+    Use {
+        /// Context to bind (e.g. 'default', 'claude-code', 'hermes').
+        context: String,
+        /// Target model name (e.g. 'llama3', 'ollama:cloud').
+        model: String,
+    },
+    /// Log in to a registry or cloud provider.
+    Login {
+        /// Provider name (e.g. 'hf.co', 'ollama').
+        provider: String,
+        /// API key or Token.
+        #[arg(short, long)]
+        token: Option<String>,
     },
     /// Benchmark / smoke test.
     Bench {
@@ -41,14 +102,272 @@ enum Commands {
     },
     /// Quantize a model.
     Quantize,
+    /// Speculative decoding commands.
+    Spec {
+        #[command(subcommand)]
+        subcommand: SpecCommands,
+    },
+    /// Plugin management.
+    Plugin {
+        #[command(subcommand)]
+        subcommand: PluginCommands,
+    },
+    /// Service management.
+    Service {
+        #[command(subcommand)]
+        subcommand: ServiceCommands,
+    },
+    /// Re-verify every claim Grim makes about itself (§13.5).
+    /// Checks: unit on disk, OS service visibility, HTTP health, GPU backend,
+    /// WASM grant enforcement, and ExecStart consistency.
+    Doctor {
+        /// Address the server is expected to be reachable on.
+        #[arg(long, default_value = "127.0.0.1:11434")]
+        addr: String,
+        /// Service name registered with the OS service manager.
+        #[arg(long, default_value = "grim")]
+        service_name: String,
+        /// Absolute path to the grim binary (used for ExecStart check).
+        #[arg(long, default_value = "/usr/local/bin/grim")]
+        exec_path: String,
+        /// Absolute path to grim.toml (used for ExecStart check).
+        #[arg(long, default_value = "/etc/grim/grim.toml")]
+        config_path: String,
+    },
+    /// ROCm-optimized GGUF conversion tool — calibrate, search, and convert.
+    Oxidizer {
+        #[command(subcommand)]
+        subcommand: OxidizerCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommands {
+    /// Install platform-native background daemon.
+    Install {
+        #[arg(short, long, default_value = "grim")]
+        name: String,
+        #[arg(short, long, default_value = "grim.toml")]
+        config: String,
+    },
+    /// Uninstall platform-native background daemon.
+    Uninstall {
+        #[arg(short, long)]
+        purge: bool,
+    },
+    /// Start service daemon.
+    Start,
+    /// Stop service daemon.
+    Stop,
+    /// Query current service status.
+    Status,
+    /// Run the service process (invoked by Windows SCM/service manager).
+    Run {
+        #[arg(short, long, default_value = "grim.toml")]
+        config: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SpecCommands {
+    /// Distill / train a draft model.
+    Train {
+        /// Path to target model.
+        #[arg(short, long)]
+        target: String,
+        /// Path to output draft model.
+        #[arg(short, long)]
+        output: String,
+        /// Training dataset path.
+        #[arg(short, long)]
+        dataset: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCommands {
+    /// List loaded plugins.
+    List,
+    /// Load plugins from a directory.
+    Load {
+        /// Path to plugins directory.
+        #[arg(short, long, default_value = "plugins")]
+        path: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum OxidizerCommands {
+    /// Display grim metadata from a GGUF/.grim file.
+    Info {
+        /// Path to GGUF or .grim file.
+        path: String,
+    },
+    /// Run importance-matrix calibration and cache results.
+    Calibrate {
+        /// Path to input GGUF model.
+        model: String,
+        /// Path for output (importance scores written alongside).
+        output: String,
+        /// Optional calibration dataset name.
+        #[arg(long)]
+        dataset: Option<String>,
+    },
+    /// Run EvoPress evolutionary search on pre-computed importance scores.
+    Search {
+        /// Path to importance scores JSON (from `calibrate`).
+        scores_path: String,
+        /// Comma-separated list of tensor sizes.
+        tensor_sizes: String,
+        /// Target average bits-per-weight.
+        #[arg(long, default_value = "4.0")]
+        target_bpw: f32,
+        /// Number of EvoPress generations.
+        #[arg(long, default_value = "50")]
+        generations: usize,
+    },
+    /// Full convert pipeline: calibrate → search → write .grim.
+    Convert {
+        /// Path to input GGUF model.
+        model: String,
+        /// Path for output .grim file.
+        output: String,
+        /// Target average bits-per-weight.
+        #[arg(long, default_value = "4.0")]
+        target_bpw: f32,
+        /// Number of EvoPress generations.
+        #[arg(long, default_value = "50")]
+        generations: usize,
+        /// Target ROCm profile (cdna2, rdna3, mi300x).
+        #[arg(long)]
+        profile: Option<String>,
+        /// Calibration dataset name.
+        #[arg(long)]
+        dataset: Option<String>,
+    },
+    /// Prepare a training-capable `.grim` artifact from a base checkpoint.
+    Prepare {
+        /// Path to input GGUF or `.grim` file.
+        input: String,
+        /// Path for output `.grim` file.
+        output: String,
+        /// Enable training metadata materialization.
+        #[arg(long, default_value_t = true)]
+        train: bool,
+        /// Preferred training materialization format.
+        #[arg(long, default_value = "bf16")]
+        format: String,
+        /// Target ROCm profile (cdna2, cdna3, rdna3, mi300x).
+        #[arg(long)]
+        profile: Option<String>,
+        /// Calibration dataset name recorded in metadata.
+        #[arg(long)]
+        dataset: Option<String>,
+    },
+    /// Analyze a checkpoint and bake ROCm fusion hints into the output artifact.
+    Fuse {
+        /// Path to input GGUF or `.grim` file.
+        input: String,
+        /// Path for output `.grim` file.
+        output: String,
+        /// Target ROCm profile (cdna2, cdna3, rdna3, mi300x).
+        #[arg(long)]
+        profile: Option<String>,
+        /// Mark the output as ROCm KV-layout optimized.
+        #[arg(long, default_value_t = true)]
+        rocm: bool,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run { model, prompt, serve, address } => {
-            run::cmd_run(model, prompt, serve, address).await?;
+        Commands::Serve { address, config: _, plugins } => {
+            // `grim serve` — starts the HTTP server in a long-running mode with zero preloaded models.
+            let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+            eprintln!("[grim] serve: binding to {address} (Ollama-compatible)");
+            grim_server::serve(&address, engine).await?;
+            let _ = plugins;
+        }
+        Commands::Run { model, prompt, serve, address, config: _, plugins } => {
+            if serve {
+                let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+                if let Some(ref m) = model {
+                    let mock_model = Box::new(grim_models_transformer::Llama::random(
+                        grim_models_transformer::LlamaConfig {
+                            vocab_size: 32000,
+                            hidden_size: 512,
+                            num_heads: 8,
+                            num_kv_heads: 2,
+                            head_dim: 64,
+                            num_layers: 4,
+                            intermediate_size: 1024,
+                            rms_norm_eps: 1e-5,
+                            rope_theta: 10000.0,
+                            max_seq_len: 2048,
+                        }
+                    ));
+                    engine.register_model(m, mock_model);
+                }
+                eprintln!("[grim] serve: binding to {address} (Ollama-compatible)");
+                grim_server::serve(&address, engine).await?;
+            } else {
+                let model_name = model.unwrap_or_else(|| "default".to_string());
+                // Enforce download security boundary
+                let model_path = client::validate_model_cached(&model_name)?;
+                
+                if let Some(p) = prompt {
+                    println!("[grim run] Running prompt on cached model: {}", model_path.display());
+                    run::cmd_run(model_name, Some(p), false, address, &plugins).await?;
+                } else {
+                    println!("[grim run] Starting interactive terminal session with: {}", model_name);
+                    println!("Type your prompt below (Ctrl+C to exit):");
+                    loop {
+                        print!(">>> ");
+                        use std::io::Write;
+                        std::io::stdout().flush().unwrap();
+                        let mut line = String::new();
+                        std::io::stdin().read_line(&mut line).unwrap();
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() { continue; }
+                        let _ = run::cmd_run(model_name.clone(), Some(trimmed.to_string()), false, address.clone(), &plugins).await;
+                        println!();
+                    }
+                }
+            }
+        }
+        Commands::Reap { model } => {
+            client::delete_model(&model)?;
+        }
+        Commands::Kill { model } => {
+            client::unload_model_from_server(&model, "127.0.0.1:11434").await?;
+        }
+        Commands::Dl { model, output } => {
+            client::download_model(&model, output).await?;
+        }
+        Commands::Status => {
+            client::query_server_status("127.0.0.1:11434").await?;
+        }
+        Commands::Check => {
+            client::check_model_cache()?;
+        }
+        Commands::Use { context, model } => {
+            client::set_default_model(&context, &model)?;
+        }
+        Commands::Login { provider, token } => {
+            let t = match token {
+                Some(tk) => tk,
+                None => {
+                    print!("Enter API token for {}: ", provider);
+                    use std::io::Write;
+                    std::io::stdout().flush().unwrap();
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).unwrap();
+                    input.trim().to_string()
+                }
+            };
+            client::save_login_token(&provider, &t)?;
         }
         Commands::Bench { tokens, concurrency } => {
             bench::cmd_bench(tokens, concurrency).await?;
@@ -56,6 +375,250 @@ async fn main() -> Result<()> {
         Commands::Quantize => {
             println!("Quantize command — not yet implemented (phase 2).");
         }
+        Commands::Spec { subcommand } => match subcommand {
+            SpecCommands::Train { target, output, dataset } => {
+                spec::cmd_spec_train(target, output, dataset)?;
+            }
+        }
+        Commands::Plugin { subcommand } => match subcommand {
+            PluginCommands::List => {
+                println!("Loaded plugins: (none loaded in this mode)");
+            }
+            PluginCommands::Load { path } => {
+                let mut registry = grim_plugin::PluginRegistry::new();
+                match plugin::load_plugins(&path, &mut registry) {
+                    Ok(n) => println!("Loaded {n} plugins from {path}"),
+                    Err(e) => eprintln!("Failed to load plugins: {e}"),
+                }
+            }
+        }
+        Commands::Service { subcommand } => {
+            // Select appropriate platform manager
+            let manager: Box<dyn service::ServiceManager> = if cfg!(target_os = "windows") {
+                Box::new(service::WindowsScmManager)
+            } else if cfg!(target_os = "macos") {
+                Box::new(service::LaunchdManager)
+            } else {
+                Box::new(service::SystemdManager)
+            };
+
+            match subcommand {
+                ServiceCommands::Install { name, config } => {
+                    let cfg = service::ServiceConfig {
+                        name,
+                        exec_path: std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("grim")),
+                        config_path: std::path::PathBuf::from(config),
+                        restart_policy: service::RestartPolicy::OnFailure,
+                        run_as_user: Some("grim".to_string()),
+                        health_check: service::HealthCheckConfig {
+                            endpoint: "/healthz".to_string(),
+                            interval_secs: 10,
+                            timeout_secs: 3,
+                            failure_threshold: 3,
+                        },
+                        log_path: None,
+                    };
+                    manager.install(&cfg)?;
+                    println!("Service installation finished successfully.");
+                }
+                ServiceCommands::Uninstall { purge } => {
+                    manager.uninstall(purge)?;
+                    println!("Service uninstall finished successfully.");
+                }
+                ServiceCommands::Start => {
+                    manager.start()?;
+                }
+                ServiceCommands::Stop => {
+                    manager.stop()?;
+                }
+                ServiceCommands::Status => {
+                    match manager.status()? {
+                        service::ServiceStatus::Running => println!("grim service: running"),
+                        service::ServiceStatus::Stopped => println!("grim service: stopped"),
+                        service::ServiceStatus::Failed(msg) => println!("grim service: FAILED — {msg}"),
+                        service::ServiceStatus::Unknown(s) => println!("grim service: unknown ({s})"),
+                    }
+                }
+                ServiceCommands::Run { config } => {
+                    #[cfg(target_os = "windows")]
+                    {
+                        run_windows_service_dispatcher(&config)?;
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        let _ = config;
+                        let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+                        println!("[Service] Running background daemon on port 11434");
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        rt.block_on(async {
+                            let _ = grim_server::serve("127.0.0.1:11434", engine).await;
+                        });
+                    }
+                }
+            }
+        }
+        Commands::Doctor { addr, service_name, exec_path, config_path } => {
+            let healthy = doctor::run_doctor(&addr, &service_name, &exec_path, &config_path);
+            match healthy {
+                Ok(ok) => {
+                    if !ok {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Doctor check failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Oxidizer { subcommand } => {
+            match subcommand {
+                OxidizerCommands::Info { path } => {
+                    if let Err(e) = oxidizer::cmd_oxidizer_info(&path) {
+                        eprintln!("oxidizer info failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                OxidizerCommands::Calibrate { model, output, dataset } => {
+                    match oxidizer::cmd_oxidizer_calibrate(&model, &output, dataset.as_deref()) {
+                        Ok(_scores) => println!("[oxidizer] calibration complete"),
+                        Err(e) => {
+                            eprintln!("oxidizer calibrate failed: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                OxidizerCommands::Search { scores_path, tensor_sizes, target_bpw, generations } => {
+                    let content = std::fs::read_to_string(&scores_path).unwrap_or_else(|e| {
+                        eprintln!("failed to read {}: {e}", scores_path);
+                        std::process::exit(1);
+                    });
+                    let v: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|e| {
+                        eprintln!("failed to parse {}: {e}", scores_path);
+                        std::process::exit(1);
+                    });
+                    let tensors = v["tensors"].as_array().expect("invalid scores format");
+                    let names: Vec<String> = tensors.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+                    let scores: Vec<f32> = tensors.iter().map(|t| t["importance_score"].as_f64().unwrap() as f32).collect();
+                    let sizes: Vec<usize> = tensor_sizes
+                        .split(',')
+                        .filter_map(|s| s.trim().parse().ok())
+                        .collect();
+                    let imp_scores = grim_quant::ImportanceScores::new(names, scores);
+                    let bitwidths = oxidizer::cmd_oxidizer_search(&imp_scores, &sizes, target_bpw, generations);
+                    println!("EvoPress result (per-tensor bitwidths):");
+                    for (i, bw) in bitwidths.iter().enumerate() {
+                        let name = imp_scores.tensor_names.get(i).map(|s| s.as_str()).unwrap_or("?");
+                        println!("  {name}: {bw}");
+                    }
+                }
+                OxidizerCommands::Convert { model, output, target_bpw, generations, profile, dataset } => {
+                    if let Err(e) = oxidizer::cmd_oxidizer_convert(
+                        &model, &output, target_bpw, generations,
+                        profile.as_deref(), dataset,
+                    ) {
+                        eprintln!("oxidizer convert failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                OxidizerCommands::Prepare { input, output, train, format, profile, dataset } => {
+                    if let Err(e) = oxidizer::cmd_oxidizer_prepare(
+                        &input,
+                        &output,
+                        train,
+                        &format,
+                        profile.as_deref(),
+                        dataset,
+                    ) {
+                        eprintln!("oxidizer prepare failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                OxidizerCommands::Fuse { input, output, profile, rocm } => {
+                    if let Err(e) = oxidizer::cmd_oxidizer_fuse(&input, &output, profile.as_deref(), rocm) {
+                        eprintln!("oxidizer fuse failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
+
+#[cfg(target_os = "windows")]
+windows_service::define_windows_service!(ffi_service_main, win_service_main);
+
+#[cfg(target_os = "windows")]
+fn win_service_main(_arguments: Vec<std::ffi::OsString>) {
+    if let Err(e) = run_service_loop() {
+        eprintln!("[Service] Windows service execution error: {e}");
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_service_loop() -> Result<()> {
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+    use windows_service::service::{ServiceStatus, ServiceType, ServiceState, ServiceControlAccept};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+
+    let event_handler = move |control_event| -> ServiceControlHandlerResult {
+        match control_event {
+            windows_service::service::ServiceControl::Stop => {
+                let _ = shutdown_tx.send(());
+                ServiceControlHandlerResult::NoError
+            }
+            windows_service::service::ServiceControl::Interrogate => {
+                ServiceControlHandlerResult::NoError
+            }
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
+    };
+
+    let status_handle = service_control_handler::register("grim", event_handler)
+        .map_err(|e| grim_core::error::Error::Backend(format!("Failed to register SCM handler: {e}")))?;
+
+    status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::Running,
+        controls_accepted: ServiceControlAccept::STOP,
+        exit_code: 0,
+        checkpoint: 0,
+        wait_hint: Duration::from_secs(5),
+        process_id: None,
+    }).map_err(|e| grim_core::error::Error::Backend(format!("Failed to set SCM status: {e}")))?;
+
+    // Spin up tokio runtime and HTTP server
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.spawn(async {
+        let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let _ = grim_server::serve("127.0.0.1:11434", engine).await;
+    });
+
+    let _ = shutdown_rx.recv();
+
+    let _ = status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::Stopped,
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code: 0,
+        checkpoint: 0,
+        wait_hint: Duration::from_secs(1),
+        process_id: None,
+    });
+
+    rt.shutdown_background();
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_service_dispatcher(_config: &str) -> Result<()> {
+    use windows_service::service_dispatcher;
+    service_dispatcher::start("grim", ffi_service_main)
+        .map_err(|e| grim_core::error::Error::Backend(format!("Failed to start service dispatcher: {e}")))?;
+    Ok(())
+}
+

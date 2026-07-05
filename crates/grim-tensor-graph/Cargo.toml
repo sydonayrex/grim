@@ -1,0 +1,15 @@
+[package]
+name = "grim-tensor-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Checkpoint-derived tensor graph IR and fusion-pattern detection for Grim."
+
+[dependencies]
+grim-format = { workspace = true }
+grim-tensor = { workspace = true }
+thiserror = "1"
+
+[features]
+default = []

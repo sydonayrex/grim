@@ -19,6 +19,9 @@ pub enum Error {
     #[error("sampler error: {0}")]
     Sampler(String),
 
+    #[error("shape error: {0}")]
+    Shape(String),
+
     #[error("not implemented: {0}")]
     Unimplemented(String),
 }
