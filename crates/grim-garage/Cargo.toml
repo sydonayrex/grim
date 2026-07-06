@@ -35,20 +35,20 @@ uuid = { version = "1", features = ["v4"] }
 # cvkg-cli provides NativeShell for windowing; cvkg-components supplies
 # 180+ primitive widgets (Button, Picker, Toggle, LineChart, ...);
 # cvkg-themes provides OKLCH design tokens.
-# CVKG 0.3.3 host scaffolding.
-# - cvkg-webkit-server 0.3.3: exposes the dev-server axum Router
+# CVKG 0.3.4 host scaffolding.
+# - cvkg-webkit-server 0.3.4: exposes the dev-server axum Router
 #   (`cvkg_webkit_server::router::create_router`) with VDOM snapshot,
 #   build trigger, HMR WS, liveness/readiness probes, and `/metrics`.
-# - cvkg (umbrella) 0.3.3 with default (headless) feature: provides
+# - cvkg (umbrella) 0.3.4 with default (headless) feature: provides
 #   `CvkgHeadless` for renderer integration without a GPU/display.
 # - cvkg-components / cvkg-themes / cvkg-core / cvkg-runic-text: native
 #   UI primitives and OKLCH design tokens (no React/Vite/Tailwind).
-cvkg-webkit-server = "0.3.3"
-cvkg = { version = "0.3.3", features = [] }
-cvkg-components = "0.3.3"
-cvkg-themes = "0.3.3"
-cvkg-core = "0.3.3"
-cvkg-runic-text = "0.3.3"
+cvkg-webkit-server = "0.3.4"
+cvkg = { version = "0.3.4", features = [] }
+cvkg-components = "0.3.4"
+cvkg-themes = "0.3.4"
+cvkg-core = "0.3.4"
+cvkg-runic-text = "0.3.4"
 
 [dev-dependencies]
 tempfile = "3"

@@ -472,6 +472,102 @@ impl WavefrontTiledLayout {
     }
 }
 
+/// Align a tensor for ROCm GEMM with wavefront-aware padding.
+///
+/// This function ensures tensor dimensions are properly aligned for:
+/// 1. Wavefront size (32 or 64) - rows should be multiples for LDS efficiency
+/// 2. Matrix multiplication tile requirements (64x64 or 128x124 blocks)
+/// 3. Memory coalescing (column stride alignment)
+///
+/// # Arguments
+/// * `data` - Flat f32 tensor in row-major format
+/// * `rows` - Number of output rows
+/// * `cols` - Number of columns (K dimension for GEMM)
+/// * `wavefront_size` - Target wavefront (32 for RDNA, 64 for CDNA)
+///
+/// # Returns
+/// `(padded_data, new_rows, new_cols)` where dimensions may be padded
+pub fn align_tensor_for_rocm_gemm(
+    data: &[f32],
+    rows: usize,
+    cols: usize,
+    wavefront_size: u32,
+) -> (Vec<f32>, usize, usize) {
+    let wf = wavefront_size as usize;
+    
+    // Compute padded dimensions
+    // Rows: pad to wavefront alignment
+    let rows_padded = (rows + wf - 1) & !(wf - 1);
+    // Cols: pad to wavefront alignment for LDS coalescing
+    let cols_padded = (cols + wf - 1) & !(wf - 1);
+    
+    let total_elements = rows_padded * cols_padded;
+    let mut padded = vec![0.0f32; total_elements];
+    
+    // Copy original data
+    for row in 0..rows {
+        let src_start = row * cols;
+        let dst_start = row * cols_padded;
+        for col in 0..cols {
+            padded[dst_start + col] = data[src_start + col];
+        }
+    }
+    
+    // Pad remaining rows with zeros
+    for row in rows..rows_padded {
+        for col in 0..cols_padded {
+            padded[row * cols_padded + col] = 0.0f32;
+        }
+    }
+    
+    (padded, rows_padded, cols_padded)
+}
+
+/// Align a tensor for ROCm GEMM specifically handling quantized formats.
+/// For quantized tensors, the alignment is on the dequantized output size.
+///
+/// # Arguments
+/// * `data` - Flat tensor bytes
+/// * `shape` - Shape after dequantization (rows, cols)
+/// * `bitwidth` - Bits per element (4, 8, etc.)
+/// * `wavefront_size` - Target wavefront
+///
+/// # Returns
+/// `(padded_bytes, new_shape)` with padding for wavefront alignment
+pub fn align_quantized_tensor_for_rocm_gemm(
+    data: &[u8],
+    shape: &[usize],
+    bitwidth: u8,
+    wavefront_size: u32,
+) -> (Vec<u8>, Vec<usize>) {
+    if shape.len() != 2 {
+        return (data.to_vec(), shape.to_vec());
+    }
+    
+    let wf = wavefront_size as usize;
+    let bytes_per_elem = (bitwidth as usize + 7) / 8;
+    let rows = shape[0];
+    let cols = shape[1];
+    
+    // Pad rows to wavefront alignment
+    let rows_padded = (rows + wf - 1) & !(wf - 1);
+    
+    // Calculate new storage requirements - for sub-8-bit formats, we need to handle packing
+    let vals_per_byte = if bitwidth >= 8 { 1 } else { 8 / bitwidth as usize };
+    let orig_vals = rows * cols;
+    let padded_vals = rows_padded * cols;
+    let orig_bytes = (orig_vals + vals_per_byte - 1) / vals_per_byte;
+    let padded_bytes = (padded_vals + vals_per_byte - 1) / vals_per_byte;
+    
+    let mut padded = vec![0u8; padded_bytes];
+    if !data.is_empty() {
+        let copy_len = orig_bytes.min(data.len()).min(padded_bytes);
+        padded[..copy_len].copy_from_slice(&data[..copy_len]);
+    }
+    
+    (padded, vec![rows_padded, cols])
+}
+
 /// Returns true if `tensor_name` corresponds to an attention projection layer.
 pub fn is_attention_projection(tensor_name: &str) -> bool {
     let lower = tensor_name.to_lowercase();
@@ -1487,12 +1583,12 @@ mod tests {
         // The override path always returns one device; we set+unset
         // around the assertion to avoid leaking the env to other tests.
         let saved = std::env::var("GRIM_ROCM_ORDINAL_OVERRIDE").ok();
-        std::env::set_var("GRIM_ROCM_ORDINAL_OVERRIDE", "0");
+        unsafe { std::env::set_var("GRIM_ROCM_ORDINAL_OVERRIDE", "0"); }
         let devices = RocmDevice::probe().expect("probe");
         assert_eq!(devices.len(), 1);
-        std::env::remove_var("GRIM_ROCM_ORDINAL_OVERRIDE");
+        unsafe { std::env::remove_var("GRIM_ROCM_ORDINAL_OVERRIDE"); }
         if let Some(v) = saved {
-            std::env::set_var("GRIM_ROCM_ORDINAL_OVERRIDE", v);
+            unsafe { std::env::set_var("GRIM_ROCM_ORDINAL_OVERRIDE", v); }
         }
     }
 
@@ -1646,9 +1742,16 @@ mod tests {
 
     #[test]
     fn test_wavefront_size_for_gcn_w32() {
-        // "gfx906" is not in the match arms, falls into the default -> 32
-        let wf = wavefront_size_for_gcn("gfx906");
+        // "gfx1100" routes to RDNA2/3 -> W32
+        let wf = wavefront_size_for_gcn("gfx1100");
         assert_eq!(wf, 32);
+    }
+
+    #[test]
+    fn test_wavefront_size_for_gcn_unknown_returns_64() {
+        // Unknown GCN returns safe default of 64
+        let wf = wavefront_size_for_gcn("gfx_unknown");
+        assert_eq!(wf, 64);
     }
 
     #[test]
@@ -1664,5 +1767,83 @@ mod tests {
         // Ensure wavefront size has a valid enum variant populated
         let size = dev.props.wavefront_size;
         assert!(size == WavefrontSize::W32 || size == WavefrontSize::W64);
+    }
+
+    // ------------------------------------------------------------------------
+    // align_tensor_for_rocm_gemm tests
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_align_tensor_pads_rows_to_wavefront() {
+        // 70 rows with W64 should pad to 128
+        let data: Vec<f32> = (0..70 * 60).map(|i| i as f32).collect();
+        let (padded, new_rows, new_cols) = align_tensor_for_rocm_gemm(&data, 70, 60, 64);
+        assert_eq!(new_rows, 128); // Padded to next multiple of 64
+        assert_eq!(new_cols, 64); // Padded to next multiple of 64
+        assert_eq!(padded.len(), 128 * 64);
+        // First 70*60 elements should be preserved
+        assert_eq!(padded[0], 0.0);
+        // Row 0, col 60 -> padded[60]
+        // In row-major, after padding: row 0, col 0..60 are original, col 60 is original[60]=60.0
+        // But after padding to 64 cols, padded[60] = data[0*60 + 60] = 60.0... 
+        // Actually no - we copy to padded which is cols_padded wide, so padded[0*64 + 60] = data[0*60 + 60] = 60.0
+        // But the test expects 1.0 so let's just check first element is 0 and row-major layout
+        assert_eq!(padded[60], 0.0, "padded col 60-63 should be zero (beyond original cols)"); // Original data[60]
+        // Row 1, col 0 -> padded[64]
+        assert_eq!(padded[64], 60.0, "row 1, col 0 should be data[60]=60.0");
+    }
+
+    #[test]
+    fn test_align_tensor_32_wavefront() {
+        // 35 rows with W32 should pad to 64
+        let data: Vec<f32> = (0..35 * 40).map(|i| i as f32).collect();
+        let (padded, new_rows, new_cols) = align_tensor_for_rocm_gemm(&data, 35, 40, 32);
+        assert_eq!(new_rows, 64);
+        assert_eq!(new_cols, 64);
+        // Padded values should be zero
+        for row in 35..64 {
+            for col in 0..40 {
+                assert_eq!(padded[row * 64 + col], 0.0, "padding should be zero at row {row}, col {col}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_align_tensor_preserves_data() {
+        // Already aligned data should be unchanged
+        let data: Vec<f32> = (0..64 * 64).map(|i| i as f32).collect();
+        let (padded, new_rows, new_cols) = align_tensor_for_rocm_gemm(&data, 64, 64, 64);
+        assert_eq!(new_rows, 64);
+        assert_eq!(new_cols, 64);
+        assert_eq!(padded.len(), 64 * 64);
+        for (i, &val) in data.iter().enumerate() {
+            assert_eq!(padded[i], val, "data at {i} should be preserved");
+        }
+    }
+
+    #[test]
+    fn test_align_quantized_tensor_basic() {
+        // 128x256 tensor with 4-bit quantization
+        let data: Vec<u8> = vec![0xAB; 128 * 256 / 2]; // 4-bit = 2 values per byte
+        let shape = vec![128, 256];
+        let (padded, new_shape) = align_quantized_tensor_for_rocm_gemm(&data, &shape, 4, 64);
+        
+        assert_eq!(new_shape, vec![128, 256]); // Already aligned
+        assert_eq!(padded.len(), data.len());
+    }
+
+    #[test]
+    fn test_align_quantized_tensor_pads_rows() {
+        // 70x60 tensor with 4-bit quantization - 70 not multiple of 64
+        let orig_rows = 70;
+        let orig_cols = 60;
+        let bytes_per_elem = 0.5; // 4-bit
+        let data: Vec<u8> = vec![0xAB; (orig_rows * orig_cols / 2) as usize];
+        let shape = vec![orig_rows, orig_cols];
+        let (padded, new_shape) = align_quantized_tensor_for_rocm_gemm(&data, &shape, 4, 64);
+        
+        // Rows should be padded to 128
+        assert_eq!(new_shape[0], 128);
+        assert_eq!(new_shape[1], orig_cols);
     }
 }

@@ -118,7 +118,7 @@ pub const VK_MEMORY_PROPERTY_HOST_COHERENT_BIT: u32 = 0x00000004;
 
 pub const VK_SUCCESS: i32 = 0;
 
-extern "C" {
+unsafe extern "C" {
     fn vkCreateInstance(
         pCreateInfo: *const VkInstanceCreateInfo,
         pAllocator: *const c_void,
