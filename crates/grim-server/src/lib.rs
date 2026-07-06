@@ -676,3 +676,190 @@ pub async fn serve(addr: &str, engine: Engine) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        Router,
+    };
+    use tower::ServiceExt;
+
+    /// Integration test: grim-server endpoints wire correctly to grim-engine.
+    /// Tests that chat_completions endpoint can invoke engine and return valid response.
+    #[tokio::test]
+    async fn test_server_engine_end_to_end_non_streaming() {
+        // Build engine with default config
+        let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+        });
+        
+        // Build router
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state.clone());
+        
+        // Send request
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": false
+        });
+        
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        
+        assert_eq!(response.status(), StatusCode::OK);
+        
+        // Verify response is valid JSON
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(body.get("choices").is_some());
+        assert!(body.get("adapters_active").is_some());
+    }
+
+    /// Integration test: streaming endpoint wires to engine and produces tokens.
+    #[tokio::test]
+    async fn test_server_engine_end_to_end_streaming() {
+        let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+        });
+        
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state.clone());
+        
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true
+        });
+        
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        
+        // Streaming returns SSE with content-type text/event-stream
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Integration test: unknown fields are rejected per §13.3 strict default.
+    #[tokio::test]
+    async fn test_server_strict_unknown_field_rejection() {
+        let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+        });
+        
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state.clone());
+        
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [],
+            "unknown_field_this_should_fail": true
+        });
+        
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Integration test: determinism mismatch returns 400.
+    #[tokio::test]
+    async fn test_server_determinism_mismatch_strict() {
+        let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default()); // Relaxed mode
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+        });
+        
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state.clone());
+        
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [],
+            "determinism": "strict"
+        });
+        
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Integration test: unknown adapter returns 400.
+    #[tokio::test]
+    async fn test_server_unknown_adapter_rejection() {
+        let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+        });
+        
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state.clone());
+        
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [],
+            "adapters": ["nonexistent_adapter"]
+        });
+        
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}

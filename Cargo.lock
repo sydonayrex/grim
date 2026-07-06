@@ -648,7 +648,7 @@ dependencies = [
  "log",
  "num-rational",
  "num-traits",
- "pastey",
+ "pastey 0.1.1",
  "rayon",
  "thiserror 2.0.18",
  "v_frame",
@@ -846,12 +846,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
-name = "bincode"
-version = "1.3.3"
+name = "bincode-next"
+version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+checksum = "1d6626829353ae29293be5c86f42de5f0468bc758af074b0c7d08f07e538ccbc"
 dependencies = [
+ "bincode_derive-next",
+ "pastey 0.2.3",
+ "rapidhash",
  "serde",
+ "unty-next",
+]
+
+[[package]]
+name = "bincode_derive-next"
+version = "3.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "409532b1da3be643427e49c2f79e0c47d445f695e1b028270d9e80e9044d7d1c"
+dependencies = [
+ "virtue-next",
 ]
 
 [[package]]
@@ -1785,9 +1798,9 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "cvkg"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9ced693faeefb3ba48904255e6a6d7b845c0ceeb49e1d1d70020c8bb36bd969"
+checksum = "bf11286117838cb6ee280e2d207f4d57358a26efaa9a34ef8a5438b536a00ef6"
 dependencies = [
  "cvkg-anim",
  "cvkg-components",
@@ -1804,9 +1817,9 @@ dependencies = [
 
 [[package]]
 name = "cvkg-anim"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fe5d053924edb7bf7cbfe7f0959feba6e52ba1cc619d6c2c6c48f89ece6c59b"
+checksum = "ae8b44280d444e2e280cad1979dbd1aaba79d7c5b8cf05b421e64fdeadf35ae1"
 dependencies = [
  "cvkg-core",
  "getrandom 0.4.3",
@@ -1816,9 +1829,9 @@ dependencies = [
 
 [[package]]
 name = "cvkg-cli"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f7a8820a1d892e083632b4b28561aa2d5403a81510d118cd398006e23f7323b"
+checksum = "1570e748d3e2da91766e2babb2a18600b2ba65b5f435d4367752cd2b498e1731"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -1850,9 +1863,9 @@ dependencies = [
 
 [[package]]
 name = "cvkg-components"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ca680f749abb544cabcf669203facef2a5fcc05d02eadcac7693caa8ea94810"
+checksum = "6eb07abd42ce43bf8095f1eead6bc97d2c72bfddbe9efa2b61710b99658a9fb5"
 dependencies = [
  "arboard",
  "cvkg-anim",
@@ -1870,9 +1883,9 @@ dependencies = [
 
 [[package]]
 name = "cvkg-compositor"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16a88ae51875ed87aa7d8552dec4ca75f8e57492eff470781a44599b2a7a7df3"
+checksum = "1c018dbceaa897954c4b2b5766d82db6369cc16e978e64dfccf062271195aaa8"
 dependencies = [
  "anyhow",
  "cvkg-core",
@@ -1886,9 +1899,9 @@ dependencies = [
 
 [[package]]
 name = "cvkg-core"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9aca8c93b24bc0debf581262884e4e942fc0146eb495d4182b28d2c4b2e84fd2"
+checksum = "cc87024524ec3f1a040c0a552a676e3ae9e14681b591e8e5ce08363bfb729075"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1915,9 +1928,9 @@ dependencies = [
 
 [[package]]
 name = "cvkg-export-raster"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd860eebe5ca3f8c247a366e228f3d82a51c6d251ed611e005893009de56d687"
+checksum = "2003f805b4c23c5c3843501c03f43304b3391d2969497f15fbc727de6bece4e7"
 dependencies = [
  "cvkg-render-gpu",
  "gif",
@@ -1926,9 +1939,9 @@ dependencies = [
 
 [[package]]
 name = "cvkg-layout"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd9949e45f4504f6be160942fd8d4ca139b4e5acf42cdf00634839bd4eba7cf4"
+checksum = "69b6f9dc857514e25ed601d37be71944eacbbaa0f39549beb8f7dad1b8f79caa"
 dependencies = [
  "cvkg-anim",
  "cvkg-core",
@@ -1941,9 +1954,9 @@ dependencies = [
 
 [[package]]
 name = "cvkg-macros"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5acbf137899ed79ffd92e60d3b818976aca6b9f6174f4d48abfa962ec9fc13b2"
+checksum = "d454ea498c858bbd1d35dd116992abeccf4b4d6791cf6e9bcaad06690e074cbc"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1952,9 +1965,9 @@ dependencies = [
 
 [[package]]
 name = "cvkg-materials"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad201cc1fd5eb930e662dc63f8293bf645c3e65e4279928278e7bdec8eca91c9"
+checksum = "c65221b0256b2ef35b579db84f8d7e5df8c1a524a3a5a8442c05f4f2bb6e33f5"
 dependencies = [
  "log",
  "serde",
@@ -1962,9 +1975,9 @@ dependencies = [
 
 [[package]]
 name = "cvkg-physics"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cba86398a99462af48348f72322a83a10fef8ec308d659f0cfa949da40f7e6f3"
+checksum = "3f4a333bc377be159d1a989753a8f2426b0171234bf5775e6f23a3bdacf3de9a"
 dependencies = [
  "cvkg-core",
  "cvkg-scene",
@@ -1975,9 +1988,9 @@ dependencies = [
 
 [[package]]
 name = "cvkg-reflect"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7aa3544c6d053bd58a4da3f5913add2c76e8640e62a06939703523035428e5b4"
+checksum = "a529776ecb5420391f589c05b7709fc33241a9be7bfba5fc12bf770943b44cf1"
 dependencies = [
  "log",
  "serde",
@@ -1986,9 +1999,9 @@ dependencies = [
 
 [[package]]
 name = "cvkg-render-gpu"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa4ba99253460b5166a1b8687ae1828b03635182a3c97c973614d8cfc039d734"
+checksum = "dec4436d576d462d46acec206c8909c06b5e74ec78002f8f57e4e2937197e549"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -2026,9 +2039,9 @@ dependencies = [
 
 [[package]]
 name = "cvkg-runic-text"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79e8cf08c266d602b8a54b09301cdcf3258afa8a96ec481108ca4944a35bf52f"
+checksum = "40ce70b29b16f3f97ad066b7ab1ba32c4f3fed429cc9008c3dd92f75821a1ef5"
 dependencies = [
  "bytemuck",
  "fontdb",
@@ -2046,11 +2059,11 @@ dependencies = [
 
 [[package]]
 name = "cvkg-scene"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50f658f775626c2f572a53d997bc9e7a3ec0f90e467d84f5b7f428dd188df0eb"
+checksum = "1407154aa4f55dbd13428905399dcd01728966c6eb627dcd193ff8e40c473b9f"
 dependencies = [
- "bincode",
+ "bincode-next",
  "cvkg-core",
  "cvkg-runic-text",
  "cvkg-spatial",
@@ -2061,9 +2074,9 @@ dependencies = [
 
 [[package]]
 name = "cvkg-scheduler"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4bef2757d22afe339f130bc82913f5b2d308ee7c4b7f229cf71493778c90585"
+checksum = "f64bd5626229484774a8971c93d21017efa582238660af1b2ce41d73a4c61d33"
 dependencies = [
  "cvkg-core",
  "cvkg-vdom",
@@ -2074,9 +2087,9 @@ dependencies = [
 
 [[package]]
 name = "cvkg-spatial"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cd3d1380353644be11d95cec8c6e0d3a509983e27d5c672fc6c88378722f5d7"
+checksum = "ac893a1eebc5f6c25324c2f8f39f17efb36d520417f9026c916618efc926468e"
 dependencies = [
  "cvkg-core",
  "glam",
@@ -2086,15 +2099,15 @@ dependencies = [
 
 [[package]]
 name = "cvkg-stl"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0575a9bd6575b52d375fc86b652197826db82f685a4a2bd53e50a75045db5fe8"
+checksum = "83626f9d670a723f35c6f0fd618f00204fdc05b76014c87122542b1a911703e2"
 
 [[package]]
 name = "cvkg-svg-filters"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06c2785954fd89f90b6076f6502e9cb5204f0654ad41c425036e6bb309accda8"
+checksum = "445466d0815acf220b686f7d89fec4ec3ecbde81b65d232aa12da34991b2d166"
 dependencies = [
  "bytemuck",
  "log",
@@ -2105,20 +2118,20 @@ dependencies = [
 
 [[package]]
 name = "cvkg-svg-serialize"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fc62c605eaabd78a1cf2b5290a05e8f391d75e04ec675ee1099d114f25d7c27"
+checksum = "fc9752457714ff9df4cc18b91d1e1e813ddefb93eb4ed912f3f382b5e28017ab"
 dependencies = [
- "quick-xml 0.40.1",
+ "quick-xml 0.41.0",
  "thiserror 2.0.18",
  "usvg",
 ]
 
 [[package]]
 name = "cvkg-themes"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "770cbd2aa1c0e9b8266c0e507d3599997cb0c1e3d95419e464212254b4526026"
+checksum = "21c627597e51844b1a263d0c9cfaaed0033fa035a463576cf8a85b7d9beb8351"
 dependencies = [
  "cvkg-anim",
  "cvkg-core",
@@ -2129,9 +2142,9 @@ dependencies = [
 
 [[package]]
 name = "cvkg-vdom"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c86e7da74c1651b3dfabc70edaa39555c507cc0a768ebbca2da4131421ae4dfb"
+checksum = "6c424c32335243c8f2e89957c1c1455d806cf8c3f6d8bd8c7eae91037b3c58a2"
 dependencies = [
  "accesskit",
  "cvkg-core",
@@ -2147,9 +2160,9 @@ dependencies = [
 
 [[package]]
 name = "cvkg-webkit-server"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcd19e2a22e010b3dc016f58e6d5ede8791d04e53be187a5e3626ea26830e61e"
+checksum = "727bb080aa00abd41e3d4d927a59d15b3b4f41a21bef07e965f7c9f53e0a10d9"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2164,6 +2177,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "mime_guess",
+ "rand 0.10.2",
  "regex",
  "serde",
  "serde_json",
@@ -3652,6 +3666,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tower",
 ]
 
 [[package]]
@@ -5728,6 +5743,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6171,9 +6192,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.40.1"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2474bd2e5029e7ccb6abb2ba48cf2383a333851dedf495901544281590c7da7f"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
 ]
@@ -8223,6 +8244,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "unty-next"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16062d030850f35054e37746427b9febb74a2f24c9c6dd6fa2d0c13c5f53221e"
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8356,6 +8383,12 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virtue-next"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d5208a9710a6ca1c2da0d64289a5dcca13deb05afdedf651f4e11bcd9fc53eb"
 
 [[package]]
 name = "walkdir"

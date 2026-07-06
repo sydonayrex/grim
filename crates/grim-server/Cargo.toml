@@ -22,5 +22,8 @@ rcgen = "0.12"
 serde = { version = "1", features = ["derive"] }
 grim-models-transformer = { workspace = true }
 
+[dev-dependencies]
+tower = "0.5"
+
 [features]
 default = []

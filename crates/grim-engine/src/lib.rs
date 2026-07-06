@@ -555,8 +555,8 @@ mod tests {
     #[test]
     fn engine_registers_and_resolves_adapters() {
         let mut engine = Engine::new(EngineConfig::default());
-        engine.register_adapter("base", small_handle(1, 32, 32));
-        engine.register_adapter("base", small_handle(2, 32, 32));
+        engine.register_adapter("base", "adapter-1", small_handle(1, 32, 32));
+        engine.register_adapter("base", "adapter-2", small_handle(2, 32, 32));
         assert_eq!(engine.adapter_count(), 2);
 
         let resolved = engine.resolve_adapters(&[1, 2]).unwrap();
@@ -572,7 +572,7 @@ mod tests {
     #[test]
     fn engine_resolve_returns_none_for_unknown_id() {
         let mut engine = Engine::new(EngineConfig::default());
-        engine.register_adapter("base", small_handle(1, 32, 32));
+        engine.register_adapter("base", "adapter-1", small_handle(1, 32, 32));
         assert!(engine.resolve_adapters(&[99]).is_none());
     }
 
@@ -634,7 +634,7 @@ mod tests {
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
         engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0 });
-        engine.register_adapter("small", small_handle(99, 32, 32));
+        engine.register_adapter("small", "adapter-99", small_handle(99, 32, 32));
         let _ = engine.tick();
         let outcome = engine.last_outcome(1).expect("tick must record outcome");
         assert!(outcome.logits.is_some(), "logits tensor must be recorded");

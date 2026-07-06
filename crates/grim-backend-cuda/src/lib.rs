@@ -21,7 +21,7 @@ pub const CUBLAS_STATUS_SUCCESS: i32 = 0;
 pub const CUBLAS_OP_N: i32 = 0;
 pub const CUBLAS_OP_T: i32 = 1;
 
-extern "C" {
+unsafe extern "C" {
     fn cudaMalloc(devPtr: *mut *mut c_void, size: usize) -> i32;
     fn cudaFree(devPtr: *mut c_void) -> i32;
     fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32) -> i32;
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn test_cuda_device_probe() {
-        std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0");
+        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
         let devices = CudaDevice::probe().unwrap();
         assert!(!devices.is_empty());
         assert_eq!(devices[0].ordinal, 0);
@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn test_cuda_zeros() {
-        std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0");
+        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
         let devices = CudaDevice::probe().unwrap();
         let dev = &devices[0];
         let shape = Shape::new(vec![2, 4]);
@@ -532,7 +532,7 @@ mod tests {
 
     #[test]
     fn test_cuda_from_cpu() {
-        std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0");
+        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
         let devices = CudaDevice::probe().unwrap();
         let dev = &devices[0];
         let shape = Shape::new(vec![3, 2]);
@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn test_cuda_matmul() {
-        std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0");
+        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
         let devices = CudaDevice::probe().unwrap();
         let dev = &devices[0];
 

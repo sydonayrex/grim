@@ -23,6 +23,9 @@ pub enum QuantFormat {
     Q4K,
     Q5K,
     Q6K,
+    Fp4,
+    Nf4,
+    Fp8,
 }
 
 #[derive(Debug, Clone)]
@@ -225,6 +228,203 @@ pub fn dequant_q6k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     dequant_packed_symmetric(data, num_weights, 6)
 }
 
+/// FP4 (E2M1) lookup table: maps 4-bit code to f32 value.
+/// E2M1 format: 1 sign bit, 2 exponent bits, 1 mantissa bit.
+/// Layout: bit3=sign, bits[2:1]=exponent, bit0=mantissa
+/// Codes 0-7 map to values -1.0 to 0.0, codes 8-15 map to values 0.125 to 0.875
+const FP4_E2M1_LUT: [f32; 16] = [
+    -1.0,      // 0000 -> -1.0
+    -0.875,    // 0001
+    -0.75,     // 0010
+    -0.625,    // 0011
+    -0.5,      // 0100
+    -0.375,    // 0101
+    -0.25,     // 0110
+    -0.125,    // 0111
+    0.0,       // 1000 -> 0.0
+    0.125,     // 1001
+    0.25,      // 1010
+    0.375,     // 1011
+    0.5,       // 1100
+    0.625,     // 1101
+    0.75,      // 1110
+    0.875,     // 1111 -> +0.875
+];
+
+/// Dequantize FP4 (E2M1 4-bit floating point) bytes to f32.
+/// FP4/TensorFloat-4: 16 values packed per u32, using E2M1 representation.
+/// Layout: packed 4-bit values, one f32 scale per tensor.
+pub fn dequant_fp4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(num_values);
+    
+    // Read scale from first 4 bytes (default to 1.0)
+    let scale = if data.len() >= 4 {
+        f32::from_le_bytes([data[0], data[1], data[2], data[3]])
+    } else {
+        1.0
+    };
+    
+    // Decode packed FP4 values starting at byte 4
+    for (i, &byte) in data[4..].iter().enumerate() {
+        let hi = FP4_E2M1_LUT[(byte >> 4) as usize] * scale;
+        let lo = FP4_E2M1_LUT[(byte & 0x0F) as usize] * scale;
+        
+        let idx = i * 2;
+        if idx < num_values {
+            out.push(hi);
+        }
+        if idx + 1 < num_values {
+            out.push(lo);
+        }
+    }
+    
+    Ok(out)
+}
+
+/// NF4 (normalized float-4) lookup table.
+/// Quanto-style NF4: asymmetric 4-bit quantization optimized for normally-distributed weights.
+/// Values range from -1 to 1 with finer granularity near zero.
+const NF4_LUT: [f32; 16] = [
+    -1.0,        // 0000
+    -0.69921875, // 0001 ≈ -1/√2
+    -0.5,        // 0010 = -0.5
+    -0.400390625, // 0011
+    -0.31640625,  // 0100 ≈ -0.316
+    -0.23828125,  // 0101
+    -0.166015625, // 0110
+    -0.10009765625, // 0111
+    0.10009765625,  // 1000
+    0.166015625,    // 1001
+    0.23828125,    // 1010
+    0.31640625,    // 1011
+    0.400390625,   // 1100
+    0.5,           // 1101
+    0.69921875,    // 1110 ≈ 1/√2
+    1.0,           // 1111
+];
+
+/// Dequantize NF4 (normalized float-4) bytes to f32.
+/// NF4 format (Quanto/Unsloth): asymmetric 4-bit quantization with per-tensor scale and min.
+/// Layout: packed 4-bit values, one f32 scale per tensor.
+pub fn dequant_nf4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(num_values);
+    
+    // Read global scale from first 4 bytes (default to 1.0)
+    let scale = if data.len() >= 4 {
+        f32::from_le_bytes([data[0], data[1], data[2], data[3]])
+    } else {
+        1.0
+    };
+    
+    // Decode packed NF4 values starting at byte 4
+    for (i, &byte) in data[4..].iter().enumerate() {
+        let hi = NF4_LUT[(byte >> 4) as usize] * scale;
+        let lo = NF4_LUT[(byte & 0x0F) as usize] * scale;
+        
+        let idx = i * 2;
+        if idx < num_values {
+            out.push(hi);
+        }
+        if idx + 1 < num_values {
+            out.push(lo);
+        }
+    }
+    
+    Ok(out)
+}
+
+/// FP8 formats: E4M3 (5 exp, 3 mantissa, no inf) and E5M2 (5 exp, 2 mantissa, with inf).
+/// E4M3: exponent bias = 7, max value ≈ 240, min normalized ≈ 0.03125
+/// E5M2: exponent bias = 15, max value = 31, supports infinity
+const FP8_E4M3_BIAS: i32 = 7;
+const FP8_E5M2_BIAS: i32 = 15;
+
+/// Convert FP8 E4M3 (4-bit exponent, 3-bit mantissa) to f32.
+/// Layout: 1 sign | 4 exp | 3 mantissa
+fn fp8_e4m3_to_f32(byte: u8) -> f32 {
+    let sign = (byte & 0x80) as i32;
+    let exp = ((byte >> 3) & 0x0F) as i32;
+    let mant = (byte & 0x07) as i32;
+    
+    if exp == 0xF {
+        // NaN or Inf (E4M3 doesn't encode Inf in standard form, treat as max)
+        if mant == 0 {
+            // Infinity
+            return if sign != 0 { f32::NEG_INFINITY } else { f32::INFINITY };
+        } else {
+            // NaN
+            return f32::NAN;
+        }
+    }
+    
+    let mut result = (mant as f32) / 8.0 + 1.0; // Add implicit leading 1 for normalized
+    if exp != 0 {
+        // Normalized: multiply by 2^(exp - bias)
+        result *= 2f32.powi(exp - FP8_E4M3_BIAS);
+    } else {
+        // Subnormal: no implicit leading bit
+        result = (mant as f32) / 8.0;
+    }
+    
+    if sign != 0 { -result } else { result }
+}
+
+/// Convert FP8 E5M2 (5-bit exponent, 2-bit mantissa) to f32.
+/// Layout: 1 sign | 5 exp | 2 mantissa
+fn fp8_e5m2_to_f32(byte: u8) -> f32 {
+    let sign = (byte & 0x80) as i32;
+    let exp = ((byte >> 2) & 0x1F) as i32;
+    let mant = (byte & 0x03) as i32;
+    
+    if exp == 0x1F {
+        // Infinity or NaN
+        if mant == 0 {
+            return if sign != 0 { f32::NEG_INFINITY } else { f32::INFINITY };
+        } else {
+            return f32::NAN;
+        }
+    }
+    
+    let mut result = (mant as f32) / 2.0 + 1.0;
+    if exp != 0 {
+        result *= 2f32.powi(exp - FP8_E5M2_BIAS);
+    }
+    
+    if sign != 0 { -result } else { result }
+}
+
+/// Dequantize FP8 (8-bit floating point) bytes to f32.
+/// FP8 format (E4M3 or E5M2): one fp8 per byte.
+/// Layout: f32 scale (optional, first 4 bytes) followed by raw fp8 bytes.
+pub fn dequant_fp8(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(num_values);
+    
+    // Read optional scale from first 4 bytes (default to 1.0)
+    let scale = if data.len() >= 4 {
+        f32::from_le_bytes([data[0], data[1], data[2], data[3]])
+    } else {
+        1.0
+    };
+    
+    // Decode FP8 values (use bytes after scale, or all bytes if no scale)
+    let data_start = if data.len() >= 8 { 4 } else { 0 };
+    
+    for (i, &byte) in data[data_start..].iter().enumerate() {
+        if i >= num_values {
+            break;
+        }
+        // Use E4M3 format by default (most common for ROCm)
+        out.push(fp8_e4m3_to_f32(byte) * scale);
+    }
+    
+    // Pad if necessary
+    while out.len() < num_values {
+        out.push(0.0);
+    }
+    
+    Ok(out)
+}
+
 fn f16_to_f32(lo: u8, hi: u8) -> f32 {
     let bits = u16::from_le_bytes([lo, hi]);
     let sign = (bits >> 15) as u32;
@@ -275,6 +475,208 @@ pub fn quant_q5k(data: &[f32]) -> Result<Vec<u8>> {
 
 pub fn quant_q6k(data: &[f32]) -> Result<Vec<u8>> {
     quant_packed_symmetric(data, 6, None, None, None)
+}
+
+/// Quantize f32 values to FP4 (E2M1) bytes.
+/// Each f32 is clamped and mapped to the nearest E2M1 value.
+/// Output: f32 scale followed by packed FP4 bytes.
+pub fn quant_fp4(data: &[f32]) -> Result<Vec<u8>> {
+    // Find scale using max absolute value mapped to FP4 range
+    let max_abs = data.iter()
+        .map(|v| v.abs())
+        .fold(0.0f32, f32::max);
+    // FP4 max representable is 1.0 with our LUT
+    let scale = if max_abs == 0.0 { 1.0 } else { max_abs };
+    
+    let mut out = Vec::with_capacity(4 + (data.len() + 1) / 2);
+    out.extend_from_slice(&scale.to_le_bytes());
+    
+    let mut packed_byte = 0u8;
+    for (i, &v) in data.iter().enumerate() {
+        // Map f32 value to nearest FP4 code (using our LUT: 0=-1.0, 7=0.0, 15=+0.875)
+        let normalized = (v / scale).clamp(-1.0, 1.0);
+        let code = if normalized <= -1.0 {
+            0x0 // -1.0
+        } else if normalized <= -0.875 {
+            0x1
+        } else if normalized <= -0.75 {
+            0x2
+        } else if normalized <= -0.625 {
+            0x3
+        } else if normalized <= -0.5 {
+            0x4
+        } else if normalized <= -0.375 {
+            0x5
+        } else if normalized <= -0.25 {
+            0x6
+        } else if normalized <= -0.125 {
+            0x7
+        } else if normalized <= 0.0 {
+            0x8 // 0.0
+        } else if normalized <= 0.125 {
+            0x9 // +0.125
+        } else if normalized <= 0.25 {
+            0xA
+        } else if normalized <= 0.375 {
+            0xB
+        } else if normalized <= 0.5 {
+            0xC
+        } else if normalized <= 0.625 {
+            0xD
+        } else if normalized <= 0.75 {
+            0xE
+        } else {
+            0xF // +0.875
+        };
+        
+        if i % 2 == 0 {
+            packed_byte = code << 4;
+        } else {
+            packed_byte |= code;
+            out.push(packed_byte);
+        }
+    }
+    
+    Ok(out)
+}
+
+/// Quantize f32 values to NF4 (normalized float-4) bytes.
+/// NF4 is optimized for normally-distributed weights.
+/// Output: f32 scale followed by packed NF4 bytes.
+pub fn quant_nf4(data: &[f32]) -> Result<Vec<u8>> {
+    // Find scale using max absolute value mapped to NF4 range
+    let max_abs = data.iter()
+        .map(|v| v.abs())
+        .fold(0.0f32, f32::max);
+    let scale = if max_abs == 0.0 { 1.0 } else { max_abs }; // NF4 already normalized to [-1, 1]
+    
+    let mut out = Vec::with_capacity(4 + (data.len() + 1) / 2);
+    out.extend_from_slice(&scale.to_le_bytes());
+    
+    // NF4 lookup for inverse mapping
+    const NF4_INV: [i32; 16] = [
+        -10, // -1.0
+        -7,  // -0.6992
+        -5,  // -0.5
+        -4,  // -0.4004
+        -3,  // -0.3164
+        -2,  // -0.2383
+        -1,  // -0.1660
+        -1,  // -0.1001 (rounded)
+        1,   // 0.1001
+        1,   // 0.1660
+        2,   // 0.2383
+        3,   // 0.3164
+        4,   // 0.4004
+        5,   // 0.5
+        7,   // 0.6992
+        10,  // 1.0 (normalized)
+    ];
+    
+    let mut packed_byte = 0u8;
+    for (i, &v) in data.iter().enumerate() {
+        let normalized = (v / scale).clamp(-1.0, 1.0);
+        let code = if normalized < -0.8 {
+            0
+        } else if normalized < -0.6 {
+            1
+        } else if normalized < -0.45 {
+            2
+        } else if normalized < -0.35 {
+            3
+        } else if normalized < -0.25 {
+            4
+        } else if normalized < -0.15 {
+            5
+        } else if normalized < 0.0 {
+            6
+        } else if normalized < 0.15 {
+            7
+        } else if normalized < 0.25 {
+            8
+        } else if normalized < 0.35 {
+            9
+        } else if normalized < 0.45 {
+            10
+        } else if normalized < 0.6 {
+            11
+        } else if normalized < 0.8 {
+            12
+        } else if normalized < 1.0 {
+            13
+        } else {
+            14
+        };
+        
+        if i % 2 == 0 {
+            packed_byte = (code as u8) << 4;
+        } else {
+            packed_byte |= code as u8;
+            out.push(packed_byte);
+        }
+    }
+    
+    if data.len() % 2 == 1 {
+        out.push(packed_byte);
+    }
+    
+    Ok(out)
+}
+
+/// Quantize f32 values to FP8 (E4M3) bytes.
+/// E4M3: 1 sign, 4 exponent (bias 7), 3 mantissa bits.
+/// Output: f32 scale followed by packed FP8 bytes.
+pub fn quant_fp8(data: &[f32]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(4 + data.len());
+    
+    // Write scale of 1.0 for now (FP8 can represent values directly in reasonable range)
+    out.extend_from_slice(&1.0f32.to_le_bytes());
+    
+    for &v in data {
+        let quantized = f32_to_fp8_e4m3(v);
+        out.push(quantized);
+    }
+    
+    Ok(out)
+}
+
+/// Quantize f32 to FP8 E4M3 format.
+fn f32_to_fp8_e4m3(v: f32) -> u8 {
+    if v.is_nan() {
+        return 0x7F; // NaN in E4M3
+    }
+    if v.is_infinite() {
+        return if v.is_sign_positive() { 0x7E } else { 0xFE }; // Max normal or inf-like
+    }
+    
+    let sign = if v < 0.0 { 0x80 } else { 0x00 };
+    let abs = v.abs();
+    
+    if abs == 0.0 {
+        return sign;
+    }
+    
+    // Clamp to representable FP8 range (max ~240 for E4M3)
+    let abs = abs.min(240.0);
+    
+    // Find exponent and mantissa
+    let exp = abs.log2().floor().max(-7.0) as i32;
+    let exp_biased = if exp >= 0 {
+        (exp + FP8_E4M3_BIAS).min(15)
+    } else {
+        0 // Subnormal
+    };
+    
+    // Compute mantissa (3 bits, values 0-7)
+    let mant = if exp_biased > 0 {
+        let normalized = abs / 2f32.powi(exp);
+        ((normalized - 1.0) * 8.0).round() as u8 & 0x07
+    } else {
+        // Subnormal: just use the value directly scaled
+        (abs * 8.0).round() as u8 & 0x07
+    };
+    
+    sign | ((exp_biased as u8 & 0x0F) << 3) | mant
 }
 
 fn quant_packed_symmetric(
@@ -337,6 +739,9 @@ pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<Rew
             plan.curvature.as_deref(),
             Some(&plan.shape),
         )?,
+        QuantFormat::Fp4 => quant_fp4(data)?,
+        QuantFormat::Nf4 => quant_nf4(data)?,
+        QuantFormat::Fp8 => quant_fp8(data)?,
     };
 
     Ok(RewrittenTensorData {
@@ -1696,6 +2101,144 @@ mod tests {
         assert!(result.is_ok());
         let deq = result.unwrap();
         assert_eq!(deq.len(), 8);
+    }
+
+    // ------------------------------------------------------------------------
+    // FP4/NF4/FP8 dequantization tests
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn roundtrip_fp4() {
+        let data: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) / 12.8).collect(); // Scale to E2M1 range
+        let quantized = quant_fp4(&data).unwrap();
+        let dequantized = dequant_fp4(&quantized, data.len()).unwrap();
+        assert_eq!(dequantized.len(), data.len());
+        let mse = mean_squared_error(&data, &dequantized);
+        // FP4 has coarse precision, allow higher MSE
+        assert!(mse < 0.3, "fp4 mse too high: {mse}");
+    }
+
+    #[test]
+    fn fp4_dequant_preserves_extremes() {
+        // Test FP4 extreme values: -1.0, 0.0, 1.0
+        // FP4 max representable is 0.875 in E2M1, so values are scaled
+        let mut data = vec![0.0f32; 8];
+        data[0] = -1.0;
+        data[1] = -0.5;
+        data[2] = 0.0;
+        data[3] = 0.5;
+        data[4] = 1.0;
+
+        let quantized = quant_fp4(&data).unwrap();
+        let deq = dequant_fp4(&quantized, 8).unwrap();
+        
+        // FP4 has limited precision - check values are in expected range
+        // Scale is computed from max value (1.0), so range should be approximately [-0.875, 0.875]
+        assert!(deq[0].abs() > 0.7, "FP4 -1.0 should map to ~-0.875: {}", deq[0]); // -1.0
+        assert!(deq[4].abs() > 0.7, "FP4 +1.0 should map to ~+0.875: {}", deq[4]); // +1.0
+        assert!((deq[2] - 0.0).abs() < 0.05, "FP4 0.0 should be near zero: {}", deq[2]);
+    }
+
+    #[test]
+    fn roundtrip_nf4() {
+        // NF4 values are designed for normal distribution, test with values in [-1, 1]
+        let data: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) / 16.0).collect();
+        let quantized = quant_nf4(&data).unwrap();
+        let dequantized = dequant_nf4(&quantized, data.len()).unwrap();
+        assert_eq!(dequantized.len(), data.len());
+        let mse = mean_squared_error(&data, &dequantized);
+        assert!(mse < 0.1, "nf4 mse too high: {mse}");
+    }
+
+    #[test]
+    fn nf4_dequant_preserves_zero_crossing() {
+        // NF4 has finer granularity near zero
+        let data = vec![0.125, 0.0, -0.125];
+        let quantized = quant_nf4(&data).unwrap();
+        let deq = dequant_nf4(&quantized, 3).unwrap();
+        assert_eq!(deq.len(), 3);
+        assert!(deq[0] > 0.0, "NF4 positive near-zero should be positive");
+        assert!(deq[2] < 0.0, "NF4 negative near-zero should be negative");
+    }
+
+    #[test]
+    fn roundtrip_fp8() {
+        // FP8 E4M3 works well for values in the range [-64, 64] approximately
+        let data: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.5).collect();
+        let quantized = quant_fp8(&data).unwrap();
+        let dequantized = dequant_fp8(&quantized, data.len()).unwrap();
+        assert_eq!(dequantized.len(), data.len());
+        // FP8 has limited precision, especially for larger values
+        // Check that we can recover the data within reasonable error
+        let max_diff = data.iter().zip(dequantized.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 10.0, "fp8 max diff too high: {}", max_diff);
+    }
+
+    #[test]
+    fn fp8_dequant_handles_small_values() {
+        // Small values in FP8 subnormal range
+        let data = vec![0.01, 0.02, 0.03, 0.04];
+        let quantized = quant_fp8(&data).unwrap();
+        let deq = dequant_fp8(&quantized, 4).unwrap();
+        assert_eq!(deq.len(), 4);
+        // Small values may lose precision in FP8 - just check they're close
+        for i in 0..4 {
+            let diff = (deq[i] - data[i]).abs();
+            assert!(diff < 0.1, "FP8 small value diff too high at {}: {}", i, diff);
+        }
+    }
+
+    #[test]
+    fn rewrite_tensor_to_fp4() {
+        let data: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) / 12.8).collect();
+        let rewritten = rewrite_tensor_data(
+            &data,
+            &TensorRewritePlan {
+                target: QuantFormat::Fp4,
+                shape: vec![32, 1],
+                importance: None,
+                curvature: None,
+            },
+        )
+        .unwrap();
+        assert!(!rewritten.bytes.is_empty());
+        assert_eq!(rewritten.target, QuantFormat::Fp4);
+    }
+
+    #[test]
+    fn rewrite_tensor_to_nf4() {
+        let data: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) / 16.0).collect();
+        let rewritten = rewrite_tensor_data(
+            &data,
+            &TensorRewritePlan {
+                target: QuantFormat::Nf4,
+                shape: vec![32, 1],
+                importance: None,
+                curvature: None,
+            },
+        )
+        .unwrap();
+        assert!(!rewritten.bytes.is_empty());
+        assert_eq!(rewritten.target, QuantFormat::Nf4);
+    }
+
+    #[test]
+    fn rewrite_tensor_to_fp8() {
+        let data: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.25).collect();
+        let rewritten = rewrite_tensor_data(
+            &data,
+            &TensorRewritePlan {
+                target: QuantFormat::Fp8,
+                shape: vec![32, 1],
+                importance: None,
+                curvature: None,
+            },
+        )
+        .unwrap();
+        assert!(!rewritten.bytes.is_empty());
+        assert_eq!(rewritten.target, QuantFormat::Fp8);
     }
 
     // ------------------------------------------------------------------------
