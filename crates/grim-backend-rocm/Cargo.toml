@@ -13,6 +13,7 @@ thiserror = { workspace = true }
 half = "2.0"
 seahash = "4.1"
 lazy_static = "1.4"
+temp-env = "0.3"
 
 [build-dependencies]
 # rocm-rs = { git = "https://github.com/RustNSparks/rocm-rs", rev = "master" }
