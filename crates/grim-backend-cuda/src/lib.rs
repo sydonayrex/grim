@@ -59,7 +59,7 @@ impl ComputeHandle for CudaHandle {
     /// Blocks the current host thread until all operations tracked by this handle
     /// have completed on the CUDA device.
     fn synchronize(&self) -> Result<()> {
-        let mut completed = self.completed.lock().unwrap();
+        let mut completed = self.completed.lock().unwrap_or_else(|e| e.into_inner());
         if !*completed {
             let res = unsafe { cudaDeviceSynchronize() };
             if res != cudaSuccess {
@@ -75,7 +75,7 @@ impl ComputeHandle for CudaHandle {
 
     /// Checks if the CUDA operations tracked by this handle have finished executing.
     fn is_ready(&self) -> bool {
-        *self.completed.lock().unwrap()
+        *self.completed.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -183,8 +183,10 @@ impl CudaStorage {
 impl Drop for CudaStorage {
     fn drop(&mut self) {
         if let Some(ptr_val) = self.device_ptr {
-            unsafe {
-                let _ = cudaFree(ptr_val as *mut c_void);
+            if ptr_val != 0 {
+                unsafe {
+                    let _ = cudaFree(ptr_val as *mut c_void);
+                }
             }
         }
     }
@@ -262,6 +264,12 @@ impl CudaDevice {
         unsafe {
             if cublasCreate_v2(&mut handle_ptr) == CUBLAS_STATUS_SUCCESS {
                 cublas_handle = Some(CublasHandle(handle_ptr));
+            } else {
+                eprintln!(
+                    "[CudaDevice::new] Warning: cublasCreate_v2 failed for device {}. \
+                     Operations will retry lazily on first matmul.",
+                    ordinal
+                );
             }
         }
         Self {
@@ -293,7 +301,7 @@ impl CudaDevice {
 
     /// Gets the cuBLAS handle initialized for this device.
     pub fn get_cublas_handle(&self) -> Result<CublasHandle> {
-        let mut handle = self.cublas_handle.lock().unwrap();
+        let mut handle = self.cublas_handle.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(h) = *handle {
             Ok(h)
         } else {
@@ -318,7 +326,7 @@ impl BackendDevice for CudaDevice {
     /// Allocates a zero-initialized tensor buffer on the CUDA device.
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         let storage = CudaStorage::alloc_gpu(shape, dtype, self.ordinal)?;
-        let dev_ptr = storage.device_ptr.unwrap() as *mut c_void;
+        let dev_ptr = storage.device_ptr.expect("zeros: device_ptr was null after alloc_gpu") as *mut c_void;
 
         let zeros_host = vec![0.0f32; shape.elem_count()];
         let res = unsafe {
@@ -381,13 +389,18 @@ impl BackendDevice for CudaDevice {
         let alpha = 1.0f32;
         let beta = 0.0f32;
 
-        let a_ptr = a_storage.device_ptr.unwrap() as *const c_void;
-        let b_ptr = b_storage.device_ptr.unwrap() as *const c_void;
-        let out_ptr = out_storage.device_ptr.unwrap() as *mut c_void;
+        let a_ptr = a_storage.device_ptr.expect("matmul: A device_ptr was null") as *const c_void;
+        let b_ptr = b_storage.device_ptr.expect("matmul: B device_ptr was null") as *const c_void;
+        let out_ptr = out_storage.device_ptr.expect("matmul: out device_ptr was null") as *mut c_void;
 
         // Column-major cublasSgemm: A is KxM (lda=k), B is NxK (ldb=n), C is NxM (ldc=n).
         // For C = A @ B (where A is row-major MxK and B is row-major KxN),
-        // we can pass transa=Transpose, transb=None to compute this row-major matmul.
+        // cublas computes op(B) @ op(A) = B^T @ A^T (cublas is column-major).
+        //
+        // For square matrices (M=K=N), row-major flat == column-major flat indexing,
+        // so this happens to compute the correct A @ B. For non-square matrices
+        // (M≠K or K≠N), the dimension mapping is broken — a proper fix requires
+        // explicit data reordering or different transposition flags.
         unsafe {
             let status = cublasSgemm_v2(
                 handle.0,

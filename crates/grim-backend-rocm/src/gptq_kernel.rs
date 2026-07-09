@@ -13,7 +13,7 @@
 //! Design follows the FFI pattern from `lib.rs` — safe wrappers over unsafe
 //! HIP FFI, using `jit_compile_hsaco` for on-demand kernel compilation.
 
-use std::ffi::c_void;
+
 
 use crate::{jit_compile_hsaco, HiprtcProgram, HipDim3, hipSuccess};
 
@@ -132,10 +132,11 @@ void gptq_scale_fit_kernel(
 "#;
 
 /// Returns the wavefront size for a given AMD GCN architecture identifier.
+/// Returns the wavefront size for a given AMD GCN architecture identifier.
 pub fn wavefront_size_for_gcn(gcn: &str) -> u32 {
     match gcn {
         "gfx90a" | "gfx942" | "gfx90c" => 64, // CDNA2/3 (MI210, MI250, MI300X)
-        "gfx1100" | "gfx1102" | "gfx11" => 32, // RDNA2/3 (RX 6600, RX 7900)
+        "gfx1200" | "gfx1201" | "gfx1100" | "gfx1102" | "gfx11" => 32, // RDNA4/3/2
         "gfx1030" => 32,                       // RDNA2 (RX 6700)
         _ => 64,                                // safe default
     }
@@ -144,15 +145,27 @@ pub fn wavefront_size_for_gcn(gcn: &str) -> u32 {
 /// Compile a GPTQ HIP kernel and return the compiled HSACO bytes.
 ///
 /// Uses `hiprtc` (HIP runtime compilation) for JIT compilation targeting
-/// the specified GCN architecture. The compiled HSACO is cached by the
-/// caller's `HsacoKernelCache`.
-pub fn compile_gptq_kernel(kernel_name: &str, source: &str, gcn: &str) -> Result<Vec<u8>, String> {
+/// the specified GCN architecture. Consults `HsacoKernelCache` first to
+/// bypass compilation on cache hit.
+pub fn compile_gptq_kernel(kernel_name: &str, source: &str, gcn: &str) -> Result<Vec<u8>, crate::Error> {
+    let hash = seahash::hash(source.as_bytes());
+    let cache_key = format!("{}_{:016x}", kernel_name, hash);
+
+    let cache = crate::HsacoKernelCache::new();
+    if let Some(path) = cache.get_cached_kernel(&cache_key) {
+        if let Ok(bytes) = std::fs::read(&path) {
+            return Ok(bytes);
+        }
+    }
+
     let target = match gcn {
         "gfx90a" => "gfx900",
         "gfx942" => "gfx942",
         "gfx1100" => "gfx1100",
         "gfx11" => "gfx1100",
         "gfx1030" => "gfx1030",
+        "gfx1200" => "gfx1200",
+        "gfx1201" => "gfx1201",
         _ => "gfx900",
     };
 
@@ -163,9 +176,9 @@ pub fn compile_gptq_kernel(kernel_name: &str, source: &str, gcn: &str) -> Result
     let option_ptrs: Vec<*const i8> = options.iter().map(|c| c.as_ptr()).collect();
 
     let source_cstr = std::ffi::CString::new(source)
-        .map_err(|e| format!("CString conversion failed: {}", e))?;
+        .map_err(|e| crate::Error::Backend(format!("CString conversion failed: {}", e)))?;
     let name_cstr = std::ffi::CString::new(kernel_name)
-        .map_err(|e| format!("CString conversion failed: {}", e))?;
+        .map_err(|e| crate::Error::Backend(format!("CString conversion failed: {}", e)))?;
 
     unsafe {
         let mut prog: HiprtcProgram = std::ptr::null_mut();
@@ -178,46 +191,42 @@ pub fn compile_gptq_kernel(kernel_name: &str, source: &str, gcn: &str) -> Result
             std::ptr::null(),
         );
         if status != hipSuccess {
-            return Err(format!("hiprtcCreateProgram failed with status {}", status));
+            return Err(crate::Error::Backend(format!("hiprtcCreateProgram failed with status {}", status)));
         }
 
         let compile_status = crate::hiprtcCompileProgram(prog, options.len() as i32, option_ptrs.as_ptr());
 
         if compile_status != hipSuccess {
             let mut log_size: usize = 0;
-            crate::hiprtcGetCodeSize(prog, &mut log_size);
-            let mut log: Vec<u8> = vec![0u8; log_size.max(1) as usize];
-            crate::hiprtcGetCodeLog(prog, log.as_mut_ptr() as *mut i8);
+            let _ = crate::hiprtcGetProgramLogSize(prog, &mut log_size);
+            let mut log: Vec<u8> = vec![0u8; log_size.max(1)];
+            let _ = crate::hiprtcGetProgramLog(prog, log.as_mut_ptr() as *mut i8);
             let log_str = String::from_utf8_lossy(&log);
             let _ = crate::hiprtcDestroyProgram(&mut prog);
-            return Err(format!(
+            return Err(crate::Error::Backend(format!(
                 "hiprtcCompileProgram failed (status {}): {}",
                 compile_status, log_str
-            ));
+            )));
         }
 
         let mut code_size: usize = 0;
         let size_status = crate::hiprtcGetCodeSize(prog, &mut code_size);
         if size_status != hipSuccess {
             let _ = crate::hiprtcDestroyProgram(&mut prog);
-            return Err(format!("hiprtcGetCodeSize failed: {}", size_status));
+            return Err(crate::Error::Backend(format!("hiprtcGetCodeSize failed: {}", size_status)));
         }
 
         let mut code_bytes = vec![0u8; code_size];
         let code_status = crate::hiprtcGetCode(prog, code_bytes.as_mut_ptr() as *mut i8);
         if code_status != hipSuccess {
             let _ = crate::hiprtcDestroyProgram(&mut prog);
-            return Err(format!("hiprtcGetCode failed: {}", code_status));
+            return Err(crate::Error::Backend(format!("hiprtcGetCode failed: {}", code_status)));
         }
 
         let _ = crate::hiprtcDestroyProgram(&mut prog);
+        
+        let _ = cache.cache_kernel(&cache_key, source, &code_bytes);
         Ok(code_bytes)
     }
 }
 
-/// Validate a GPTQ kernel compiles without errors for a given GCN target.
-pub fn validate_kernel_for_target(gcn: &str) -> Result<(), String> {
-    compile_gptq_kernel("gptq_wavefront_correction_kernel", GPTQ_CORRECTION_KERNEL, gcn)?;
-    compile_gptq_kernel("gptq_scale_fit_kernel", GPTQ_SCALE_FIT_KERNEL, gcn)?;
-    Ok(())
-}

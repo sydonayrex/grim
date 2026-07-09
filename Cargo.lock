@@ -3402,6 +3402,7 @@ dependencies = [
  "half",
  "lazy_static",
  "seahash",
+ "temp-env",
  "thiserror 1.0.69",
 ]
 
@@ -7516,6 +7517,15 @@ name = "target-lexicon"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
+
+[[package]]
+name = "temp-env"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96374855068f47402c3121c6eed88d29cb1de8f3ab27090e273e420bdabcf050"
+dependencies = [
+ "parking_lot 0.12.5",
+]
 
 [[package]]
 name = "tempfile"
