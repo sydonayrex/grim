@@ -316,6 +316,43 @@ unsafe extern "C" {
         solution_index: RocblasInt,
         flags: rocblas_gemm_flags,
     ) -> Rocblstatus;
+
+    // rocBLAS strided-batched extended GEMM (one call collapses `batch_count`
+    // same-shape GEMMs). Signature matches rocblas_gemm_strided_batched_ex exactly
+    // (29 args, verified against rocBLAS docs/rocblas-functions.h): it is gemm_ex
+    // with a `rocblas_stride` inserted after each of lda/ldb/ldc/ldd, plus
+    // `batch_count` immediately before `compute_type`. `rocblas_stride` is int64_t.
+    pub fn rocblas_gemm_strided_batched_ex(
+        handle: RoclabsHandle,
+        trans_a: RocblasOperation,
+        trans_b: RocblasOperation,
+        m: RocblasInt,
+        n: RocblasInt,
+        k: RocblasInt,
+        alpha: *const c_void,
+        a: *const c_void,
+        a_type: rocblas_datatype,
+        lda: RocblasInt,
+        stride_a: i64,
+        b: *const c_void,
+        b_type: rocblas_datatype,
+        ldb: RocblasInt,
+        stride_b: i64,
+        beta: *const c_void,
+        c: *const c_void,
+        c_type: rocblas_datatype,
+        ldc: RocblasInt,
+        stride_c: i64,
+        d: *mut c_void,
+        d_type: rocblas_datatype,
+        ldd: RocblasInt,
+        stride_d: i64,
+        batch_count: RocblasInt,
+        compute_type: rocblas_datatype,
+        algo: rocblas_gemm_algo,
+        solution_index: RocblasInt,
+        flags: rocblas_gemm_flags,
+    ) -> Rocblstatus;
     pub fn rocblas_set_stream(handle: RoclabsHandle, stream: *mut c_void) -> Rocblstatus;
 }
 
@@ -1135,6 +1172,12 @@ pub struct RocmDevice {
     /// Keyed cache of captured + instantiated graphs. A graph is recorded exactly once
     /// per key; `replay_graph` launches the cached executable without re-recording.
     captured_graphs: Mutex<HashMap<String, CapturedGraph>>,
+    /// Once-flag: the first `matmul_batched` call in a process warms up the
+    /// rocBLAS `gemm_strided_batched_ex` kernel (lazy JIT / handle init) with a
+    /// throwaway 2x2 batch=2 GEMM. Without this, the first real call can return
+    /// before the kernel is ready and produce a zero-filled output (observed as
+    /// an intermittent all-zeros result on the first process invocation).
+    batched_gemm_warmed: AtomicBool,
 }
 
 unsafe impl Send for RocmDevice {}
@@ -1208,6 +1251,7 @@ impl RocmDevice {
             capture_stream: RwLock::new(None),
             capture_active: AtomicBool::new(false),
             captured_graphs: Mutex::new(HashMap::new()),
+            batched_gemm_warmed: AtomicBool::new(false),
         }
     }
 
@@ -1413,6 +1457,213 @@ impl RocmDevice {
     /// capture or replay without first attempting a replay).
     pub fn has_captured_graph(&self, key: &str) -> bool {
         self.captured_graphs.lock().unwrap().contains_key(key)
+    }
+
+    /// Collapse a batch of `batch_count` same-shape GEMMs into one
+    /// `rocblas_gemm_strided_batched_ex` call (Item 6). Each `a[i]` is `[m, k]` and
+    /// each `b[i]` is `[k, n]`; every output is `[m, n]`.
+    ///
+    /// Inputs are packed into contiguous device buffers (stride = per-matrix
+    /// element count) via device-to-device copies so this works for any dtype
+    /// without a host round-trip or f32 packing. The outputs are returned as
+    /// individual `RocmStorage`s on the device, ready to feed downstream ops.
+    pub fn matmul_batched(
+        &self,
+        a: &[&dyn BackendStorage],
+        b: &[&dyn BackendStorage],
+        out_shape: &Shape,
+    ) -> Result<Vec<Box<dyn BackendStorage>>> {
+        if a.len() != b.len() {
+            return Err(Error::Shape(
+                "matmul_batched: a and b batch counts differ".into(),
+            ));
+        }
+        let batch = a.len();
+        if batch == 0 {
+            return Ok(Vec::new());
+        }
+
+        // One-time warm-up of the rocBLAS `gemm_strided_batched_ex` kernel.
+        // The first call in a process can return before the lazy JIT kernel is
+        // ready, yielding a zero-filled output; a throwaway 2x2 batch=2 GEMM
+        // absorbs that race. The flag is flipped *before* the recursive call so
+        // the warm-up itself doesn't re-enter the guard.
+        if !self.batched_gemm_warmed.swap(true, Ordering::SeqCst) {
+            let warm_a = self.from_cpu(&[1.0f32, 2.0, 3.0, 4.0], &Shape::from_slice(&[2, 2]), DType::F32)?;
+            let warm_b = self.from_cpu(&[1.0f32, 2.0, 3.0, 4.0], &Shape::from_slice(&[2, 2]), DType::F32)?;
+            let wa: Vec<&dyn BackendStorage> = vec![warm_a.as_ref(), warm_a.as_ref()];
+            let wb: Vec<&dyn BackendStorage> = vec![warm_b.as_ref(), warm_b.as_ref()];
+            let _ = self.matmul_batched(&wa, &wb, &Shape::from_slice(&[2, 2]));
+        }
+
+        let a0 = as_rocm(a[0])?;
+        let b0 = as_rocm(b[0])?;
+        let a_dims = a0.shape().dims();
+        let b_dims = b0.shape().dims();
+        if a_dims.len() != 2 || b_dims.len() != 2 {
+            return Err(Error::Shape("matmul_batched expects 2-D inputs".into()));
+        }
+        let (m, k) = (a_dims[0], a_dims[1]);
+        let (k2, n) = (b_dims[0], b_dims[1]);
+        if k != k2 {
+            return Err(Error::ShapeMismatch {
+                expected: a_dims.to_vec(),
+                got: b_dims.to_vec(),
+            });
+        }
+        if out_shape.dims() != &[m, n] {
+            return Err(Error::Shape(format!(
+                "expected out [{m},{n}], got {:?}",
+                out_shape.dims()
+            )));
+        }
+        let dtype_out = DType {
+            arith: a0.dtype.arith,
+            storage: DTypeStorage::Native,
+        };
+        for i in 1..batch {
+            let ai = as_rocm(a[i])?;
+            let bi = as_rocm(b[i])?;
+            if ai.shape().dims() != &[m, k] || bi.shape().dims() != &[k, n] {
+                return Err(Error::Shape(
+                    "matmul_batched: all batch entries must share shape [m,k]/[k,n]".into(),
+                ));
+            }
+            if ai.dtype != a0.dtype || bi.dtype != b0.dtype {
+                return Err(Error::Shape(
+                    "matmul_batched: all batch entries must share dtype".into(),
+                ));
+            }
+        }
+
+        let stride_a = (m * k) as usize;
+        let stride_b = (k * n) as usize;
+        let stride_d = (m * n) as usize;
+
+        // Pack inputs into contiguous device buffers (device-to-device copies).
+        let a_packed = RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[batch * stride_a]),
+            dtype_out.clone(),
+            self,
+        )?;
+        let b_packed = RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[batch * stride_b]),
+            dtype_out.clone(),
+            self,
+        )?;
+        let d_packed = RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[batch * stride_d]),
+            dtype_out.clone(),
+            self,
+        )?;
+        let stream = self.active_stream();
+        let handle = self.get_rocblas_handle()?;
+        // Bind rocBLAS to the same stream the D2D input copies use, so the copies
+        // are guaranteed to land before the GEMM reads the packed buffers
+        // (rocBLAS would otherwise run on its own handle stream with no dependency
+        // on the copies — a race that intermittently feeds uninitialized buffers).
+        unsafe {
+            let _ = rocblas_set_stream(handle, stream);
+        }
+        for i in 0..batch {
+            let ai = as_rocm(a[i])?;
+            let bi = as_rocm(b[i])?;
+            let res = unsafe {
+                hipMemcpy(
+                    (a_packed.device_ptr.unwrap() as *mut c_void).add(i * stride_a * 4),
+                    ai.device_ptr.unwrap() as *mut c_void,
+                    ai.bytes,
+                    HipMemcpyKind::DeviceToDevice,
+                )
+            };
+            if res != hipSuccess {
+                return Err(Error::Backend(format!(
+                    "matmul_batched: hipMemcpyDtoD a failed: code {res}"
+                )));
+            }
+            let res = unsafe {
+                hipMemcpy(
+                    (b_packed.device_ptr.unwrap() as *mut c_void).add(i * stride_b * 4),
+                    bi.device_ptr.unwrap() as *mut c_void,
+                    bi.bytes,
+                    HipMemcpyKind::DeviceToDevice,
+                )
+            };
+            if res != hipSuccess {
+                return Err(Error::Backend(format!(
+                    "matmul_batched: hipMemcpyDtoD b failed: code {res}"
+                )));
+            }
+        }
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let a_type = arith_to_rocblas_dtype(a0.dtype.arith);
+        let b_type = arith_to_rocblas_dtype(b0.dtype.arith);
+        let out_type = arith_to_rocblas_dtype(dtype_out.arith);
+        let compute_type = arith_to_compute_dtype(dtype_out.arith);
+
+        // Row-major C[M,N] = A[M,K] @ B[K,N] via rocBLAS column-major recipe
+        // (operands swapped, transa=transb='N'); see `matmul` for the rationale.
+        // For strided-batched, stride_a/b/d are the per-matrix element counts.
+        unsafe {
+            let status = rocblas_gemm_strided_batched_ex(
+                handle,
+                RocblasOperation::None,
+                RocblasOperation::None,
+                n as RocblasInt,
+                m as RocblasInt,
+                k as RocblasInt,
+                &alpha as *const f32 as *const c_void,
+                b_packed.device_ptr.unwrap() as *const c_void,
+                b_type,
+                n as RocblasInt,
+                (stride_b) as i64,
+                a_packed.device_ptr.unwrap() as *const c_void,
+                a_type,
+                k as RocblasInt,
+                (stride_a) as i64,
+                &beta as *const f32 as *const c_void,
+                d_packed.device_ptr.unwrap() as *const c_void,
+                out_type,
+                n as RocblasInt,
+                (stride_d) as i64,
+                d_packed.device_ptr.unwrap() as *mut c_void,
+                out_type,
+                n as RocblasInt,
+                (stride_d) as i64,
+                batch as RocblasInt,
+                compute_type,
+                rocblas_gemm_algo::standard,
+                0,
+                ROCBLAS_GEMM_FLAGS_NONE,
+            );
+            // Restore the handle to the default (null) stream so other eager GEMMs
+            // are unaffected by this call's binding.
+            let _ = rocblas_set_stream(handle, std::ptr::null_mut());
+            if status != rocblas_status_success {
+                return Err(Error::Backend(format!(
+                    "rocblas_gemm_strided_batched_ex failed with status {status}"
+                )));
+            }
+        }
+
+        // Read the packed results back, then split into per-batch device storages.
+        // rocBLAS fans the GEMM out to internal streams that may not join back to
+        // `active_stream`; a device-wide sync is the reliable join point before a
+        // host readback, and skips the cost during graph capture (replay syncs).
+        if self.active_capture_stream().is_none() {
+            unsafe {
+                let _ = hipDeviceSynchronize();
+            }
+        }
+        let d_host = d_packed.to_cpu_vec_f32()?;
+        let mut out = Vec::with_capacity(batch);
+        for i in 0..batch {
+            let slice = &d_host[i * stride_d..(i + 1) * stride_d];
+            out.push(self.from_cpu(slice, out_shape, dtype_out.clone())?);
+        }
+        Ok(out)
     }
 
     /// Pinned-memory + async host→device upload for the per-token decode hot path.
@@ -3621,6 +3872,63 @@ mod tests {
             }
         }
         c
+    }
+
+    #[test]
+    fn matmul_batched_matches_loop_of_single_gemms() {
+        // Item 6: a batch of same-shape GEMMs collapsed into one
+        // rocblas_gemm_strided_batched_ex call must equal running the equivalent
+        // single GEMMs (dev.matmul) in a loop, for several batch sizes.
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        if !env {
+            return;
+        }
+        let dev = RocmDevice::new(0);
+        for &batch in &[1usize, 3, 5] {
+            let m = 8usize;
+            let k = 16usize;
+            let n = 8usize;
+            let mut a_storages: Vec<Box<dyn BackendStorage>> = Vec::new();
+            let mut b_storages: Vec<Box<dyn BackendStorage>> = Vec::new();
+            for bi in 0..batch {
+                let av: Vec<f32> =
+                    (0..m * k).map(|i| (i as f32 * 0.05) + bi as f32).collect();
+                let bv: Vec<f32> =
+                    (0..k * n).map(|i| (i as f32 * 0.05) - 0.5 + bi as f32).collect();
+                a_storages.push(dev.from_cpu(&av, &Shape::from_slice(&[m, k]), DType::F32).unwrap());
+                b_storages.push(dev.from_cpu(&bv, &Shape::from_slice(&[k, n]), DType::F32).unwrap());
+            }
+            let a_refs: Vec<&dyn BackendStorage> =
+                a_storages.iter().map(|s| s.as_ref()).collect();
+            let b_refs: Vec<&dyn BackendStorage> =
+                b_storages.iter().map(|s| s.as_ref()).collect();
+            let batched = dev
+                .matmul_batched(&a_refs, &b_refs, &Shape::from_slice(&[m, n]))
+                .unwrap();
+            assert_eq!(batched.len(), batch, "batch count mismatch for batch={batch}");
+            for bi in 0..batch {
+                let (ref_out, _h) = dev
+                    .matmul(
+                        a_storages[bi].as_ref(),
+                        b_storages[bi].as_ref(),
+                        &Shape::from_slice(&[m, n]),
+                    )
+                    .unwrap();
+                let ref_vec = ref_out.to_cpu_vec_f32().unwrap();
+                let got = batched[bi].to_cpu_vec_f32().unwrap();
+                assert_eq!(got.len(), ref_vec.len(), "len mismatch batch {bi}");
+                for (i, (g, e)) in got.iter().zip(ref_vec.iter()).enumerate() {
+                    assert!(
+                        approx_eq(*g, *e, 1e-2),
+                        "matmul_batched mismatch batch {bi} [{}/{}]: got {}, loop {}",
+                        i / n,
+                        i % n,
+                        g,
+                        e
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -200,6 +200,8 @@ if !dev.replay_graph(&key)? {
 
 ## Item 6: No batched/strided-batched GEMM
 
+**Status (DONE):** Implemented and validated on gfx1036. `rocblas_gemm_strided_batched_ex` FFI declared with the verified 29-arg signature; `RocmDevice::matmul_batched` packs inputs into contiguous device buffers via D2D copies, calls the strided-batched GEMM (row-major recipe via swapped operands, matching `matmul`), and returns per-batch device storages. The rocBLAS handle is bound to the active stream for the call so the D2D copies land before the GEMM reads them, then restored. A one-time warm-up GEMM (2x2 batch=2) absorbs rocBLAS's lazy first-call JIT race that otherwise intermittently zeroed the first batched output. Correctness test `matmul_batched_matches_loop_of_single_gemms` (batches 1,3,5) passes; 44 lib tests stable across 5 multithreaded runs under `GRIM_RUN_GPU_TESTS=1`. Scoped to the `matmul_batched` primitive only — no cross-crate wiring (per spec).
+
 All matmuls go through single-GEMM `rocblas_sgemm`/`rocblas_gemm_ex`. Any batch size above 1 (even small decode-time batches across multiple concurrent sequences) currently means one GEMM dispatch per sequence per layer.
 
 ### Required changes
