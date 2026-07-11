@@ -2127,10 +2127,13 @@ impl BackendDevice for RocmDevice {
 
         // Shape-indexed GEMM dispatch lookup (Tensile-inspired layout resolution)
         let tile_config = lookup_gemm_config(m, n, k, self.props.wavefront_size);
+        // Offline-tuned solution_index per (M,N,K) for FP32. Falls back to 0 for
+        // unknown shapes or other dtypes. Populated by `examples/tune_gemm.rs`.
+        let solution_index = lookup_solution_index(m, n, k, dtype_out.arith);
         #[cfg(feature = "rocm-profile")]
         println!(
-            "[RocmDevice] GEMM Dispatch: Shape ({}, {}, {}) resolved to autotune tile config {:?} on Wavefront {:?}",
-            m, n, k, tile_config, self.props.wavefront_size
+            "[RocmDevice] GEMM Dispatch: Shape ({}, {}, {}) resolved to autotune tile config {:?} on Wavefront {:?}, solution_index={}",
+            m, n, k, tile_config, self.props.wavefront_size, solution_index
         );
 
 
@@ -2187,7 +2190,7 @@ impl BackendDevice for RocmDevice {
                     n as RocblasInt,
                     compute_type,
                     rocblas_gemm_algo::standard,
-                    0,
+                    solution_index as RocblasInt,
                     ROCBLAS_GEMM_FLAGS_NONE,
                 )
             } else {
@@ -2212,6 +2215,157 @@ impl BackendDevice for RocmDevice {
             if status != rocblas_status_success {
                 return Err(Error::Backend(format!(
                     "rocblas matmul execution failed with error status {}",
+                    status
+                )));
+            }
+        };
+
+        let compute_handle = Box::new(RocmHandle::new(None));
+        Ok((Box::new(out_storage), compute_handle))
+    }
+
+    fn matmul_with_solution(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out_shape: &Shape,
+        solution_index: i32,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        #[cfg(feature = "rocm-profile")]
+        println!("[rocprofiler-sdk] Begin marker span: matmul_with_solution");
+
+        // For matmul on GPU, both inputs must be RocmStorage (or we need to copy them to the device first)
+        let a_storage = match a.as_any().downcast_ref::<RocmStorage>() {
+            Some(s) => s,
+            None => return Err(Error::Backend("matmul_with_solution: input a is not RocmStorage".into())),
+        };
+
+        let b_storage = match b.as_any().downcast_ref::<RocmStorage>() {
+            Some(s) => s,
+            None => return Err(Error::Backend("matmul_with_solution: input b is not RocmStorage".into())),
+        };
+
+        if !a_storage.device_ptr_is_valid() || !b_storage.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "matmul_with_solution: inputs must have valid GPU device pointers".into(),
+            ));
+        }
+
+        let a_dims = a.shape().dims();
+        let b_dims = b.shape().dims();
+        
+        if a_dims.len() != 2 || b_dims.len() != 2 {
+            return Err(Error::Shape("matmul_with_solution expects 2-D inputs".into()));
+        }
+        
+        let (m, k) = (a_dims[0], a_dims[1]);
+        let (k2, n) = (b_dims[0], b_dims[1]);
+
+        if k != k2 {
+            return Err(Error::ShapeMismatch {
+                expected: a_dims.to_vec(),
+                got: b_dims.to_vec(),
+            });
+        }
+        
+        if out_shape.dims() != &[m, n] {
+            return Err(Error::Shape(format!(
+                "expected out [{m},{n}], got {:?}",
+                out_shape.dims()
+            )));
+        }
+
+        // Allocate output GPU storage with the actual input precision
+        let dtype_out = DType {
+            arith: a_storage.dtype.arith,
+            storage: DTypeStorage::Native,
+        };
+        let out_storage = RocmStorage::alloc_gpu(out_shape, dtype_out.clone(), self)?;
+
+        // Shape-indexed GEMM dispatch lookup (Tensile-inspired layout resolution)
+        let tile_config = lookup_gemm_config(m, n, k, self.props.wavefront_size);
+        #[cfg(feature = "rocm-profile")]
+        println!(
+            "[RocmDevice] GEMM Dispatch: Shape ({}, {}, {}) resolved to autotune tile config {:?} on Wavefront {:?}",
+            m, n, k, tile_config, self.props.wavefront_size
+        );
+
+        // Get rocBLAS handle and execute gemm_ex with the provided solution_index
+        let handle = self.get_rocblas_handle()?;
+
+        let alpha: f32 = 1.0f32;
+        let beta: f32 = 0.0f32;
+        
+        let a_ptr_void = a_storage.device_ptr.unwrap() as *const c_void;
+        let b_ptr_void = b_storage.device_ptr.unwrap() as *const c_void;
+        let out_ptr_void = out_storage.device_ptr.unwrap() as *mut c_void;
+
+        // In ROCm/rocBLAS (column-major), row-major C[M,N] = A[M,K] @ B[K,N] is
+        // computed via sgemm/gemm_ex with transa=transb='N', the A/B operands
+        // swapped, and (m,n,k,lda,ldb,ldc) = (N, M, K, N, K, N). See e.g. the
+        // canonical row-major GEMM recipe used by ggml/llama.cpp.
+
+        let use_gemm_ex = cfg!(feature = "rocm-aiter") || {
+            let gcn = std::env::var("GRIM_GPU_TARGET").unwrap_or_else(|_| "gfx900".into());
+            gcn == "gfx90a" || gcn == "gfx942"
+        };
+
+        unsafe {
+            let status = if use_gemm_ex || dtype_out.arith == ArithType::F16 || dtype_out.arith == ArithType::BF16 {
+                let a_type = arith_to_rocblas_dtype(a_storage.dtype.arith);
+                let b_type = arith_to_rocblas_dtype(b_storage.dtype.arith);
+                let out_type = arith_to_rocblas_dtype(dtype_out.arith);
+                let compute_type = arith_to_compute_dtype(dtype_out.arith);
+                let alpha_ptr = &alpha as *const f32 as *const c_void;
+                let beta_ptr = &beta as *const f32 as *const c_void;
+                rocblas_gemm_ex(
+                    handle,
+                    RocblasOperation::None,
+                    RocblasOperation::None,
+                    n as RocblasInt,
+                    m as RocblasInt,
+                    k as RocblasInt,
+                    alpha_ptr,
+                    b_ptr_void,
+                    b_type,
+                    n as RocblasInt,
+                    a_ptr_void,
+                    a_type,
+                    k as RocblasInt,
+                    beta_ptr,
+                    out_ptr_void,
+                    out_type,
+                    n as RocblasInt,
+                    out_ptr_void,
+                    out_type,
+                    n as RocblasInt,
+                    compute_type,
+                    rocblas_gemm_algo::standard,
+                    solution_index as RocblasInt,
+                    ROCBLAS_GEMM_FLAGS_NONE,
+                )
+            } else {
+                rocblas_sgemm(
+                    handle,
+                    RocblasOperation::None,
+                    RocblasOperation::None,
+                    n as RocblasInt,
+                    m as RocblasInt,
+                    k as RocblasInt,
+                    &alpha,
+                    b_ptr_void as *const f32,
+                    n as RocblasInt,
+                    a_ptr_void as *const f32,
+                    k as RocblasInt,
+                    &beta,
+                    out_ptr_void as *mut f32,
+                    n as RocblasInt,
+                )
+            };
+
+            if status != rocblas_status_success {
+                return Err(Error::Backend(format!(
+                    "rocblas matmul_with_solution execution failed with error status {}",
                     status
                 )));
             }
@@ -2549,6 +2703,28 @@ fn lookup_gemm_config(m: usize, n: usize, k: usize, wave: WavefrontSize) -> Gemm
                 }
             }
         }
+    }
+}
+
+/// Offline-tuned rocBLAS solution index lookup table (Item 7).
+/// Keys are (m, n, k, arith) tuples representing shapes seen in real inference
+/// (Llama/Gemma prefill + decode). Values are the fastest solution_index from
+/// `rocblas_gemm_ex_get_solutions` benchmarks. Falls back to 0 (standard) for
+/// untuned shapes.
+/// Generated by running `examples/tune_gemm.rs` on gfx1036 (AMD Radeon 610M).
+fn lookup_solution_index(m: usize, n: usize, k: usize, arith: ArithType) -> i32 {
+    // Only tuned for FP32 on gfx1036 so far; other dtypes fall back to 0.
+    if arith != ArithType::F32 {
+        return 0;
+    }
+    match (m, n, k) {
+        // Decode shapes (m=1,8)
+        (1, 4096, 4096) => 4,
+        (8, 4096, 4096) => 11,
+        (1, 11008, 4096) => 65,
+        (8, 11008, 4096) => 1,
+        // Prefill shapes can be added here as they are tuned.
+        _ => 0,
     }
 }
 

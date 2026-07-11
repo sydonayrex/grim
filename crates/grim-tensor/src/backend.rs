@@ -72,6 +72,19 @@ pub trait BackendDevice: Send + Sync {
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
 
+    /// 2-D matmul with explicit `solution_index` (passed through to rocBLAS).
+    /// Default implementation falls back to `matmul` (solution_index = 0).
+    fn matmul_with_solution(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &Shape,
+        solution_index: i32,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = solution_index;
+        self.matmul(a, b, out)
+    }
+
     /// Elementwise add of two equally-shaped tensors (with broadcast).
     fn add(
         &self,
