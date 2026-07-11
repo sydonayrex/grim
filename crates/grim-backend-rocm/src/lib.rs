@@ -84,6 +84,8 @@ unsafe extern "C" {
         count: usize,
         kind: HipMemcpyKind,
     ) -> HipErrorT;
+    pub fn hipMemset(dst: *mut c_void, value: i32, size_bytes: usize) -> HipErrorT;
+    pub fn hipDeviceSynchronize() -> HipErrorT;
     pub fn hipGetDeviceCount(count: *mut HipErrorT) -> HipErrorT;
     pub fn hipSetDevice(ordinal: HipErrorT) -> HipErrorT;
     pub fn hipGetDeviceProperties(prop: *mut c_void, device: i32) -> HipErrorT;
@@ -1109,6 +1111,14 @@ impl RocmDevice {
 
 impl Drop for RocmDevice {
     fn drop(&mut self) {
+        // Drain any in-flight kernels on the pooled streams before recycling or
+        // freeing buffers. Since Item 2 removed the per-launch sync, a buffer can
+        // still be written by an async dispatch at the moment the device is torn
+        // down; without this, freeing/reusing it races with the running kernel
+        // (and with other tests that allocate the same address afterward).
+        unsafe {
+            let _ = hipDeviceSynchronize();
+        }
         // Return all pooled buffers to the driver before the allocator Arc is dropped,
         // otherwise they would leak (the pool is only drained by empty_cache).
         self.allocator.empty_cache();
@@ -1214,25 +1224,17 @@ impl BackendDevice for RocmDevice {
         #[cfg(feature = "rocm-profile")]
         println!("[rocprofiler-sdk] Begin marker span: zeros");
 
-        // alloc GPU memory filled with 0s. hipMalloc doesn't guarantee zero-fill, so we need to do hipMemset or copy zeros from host.
+        // `hipMemset` zeroes bytes, which is only correct when the dtype's zero
+        // representation is all-zero bytes. This holds for every DType this
+        // backend supports (f32/f16/bf16/integer), so it is safe for all paths.
         let storage = RocmStorage::alloc_gpu(shape, dtype.clone(), self)?;
 
-        // clear the allocated buffer using a minimal HIP memset (we can just memcpy zeros from host)
         if !storage.device_ptr_is_valid() {
             return Err(Error::Backend("Invalid device pointer after alloc".into()));
         }
 
         let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
-        // allocate a zero-filled host buffer to copy
-        let zeros_host = vec![0.0f32; shape.elem_count()];
-        let res = unsafe {
-            hipMemcpy(
-                dev_ptr_void,
-                zeros_host.as_ptr() as *const c_void,
-                storage.bytes,
-                HipMemcpyKind::HostToDevice,
-            )
-        };
+        let res = unsafe { hipMemset(dev_ptr_void, 0, storage.bytes) };
 
         if res != hipSuccess {
             // Free on failure
@@ -1243,8 +1245,25 @@ impl BackendDevice for RocmDevice {
                 }
             }
             return Err(Error::Backend(format!(
-                "hipMemcpy for zeros failed with error code {}",
+                "hipMemset for zeros failed with error code {}",
                 res
+            )));
+        }
+
+        // `hipMemset` is asynchronous (default stream); callers expect a fully
+        // zeroed buffer on return, so drain it before handing the storage out.
+        // This matches the old hipMemcpy(H2D) path, which was implicitly sync.
+        let sync = unsafe { hipDeviceSynchronize() };
+        if sync != hipSuccess {
+            if storage.device_ptr.is_some() {
+                let ptr_void = storage.device_ptr.unwrap() as *mut c_void;
+                unsafe {
+                    _ = hipFree(ptr_void);
+                }
+            }
+            return Err(Error::Backend(format!(
+                "hipDeviceSynchronize after zeros failed with error code {}",
+                sync
             )));
         }
 
@@ -3323,5 +3342,51 @@ mod tests {
         let out_shape = Shape::from_slice(&[4, 8]);
         let res = dev.embedding(weight.as_ref(), &indices, &out_shape);
         assert!(res.is_ok(), "embedding must succeed without use-after-free: {:?}", res.err());
+    }
+
+    // ------------------------------------------------------------------------
+    // Item 3: zeros() must zero device memory via hipMemset, not a host round-trip
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn zeros_uses_hipmemset_not_host_copy() {
+        // zeros() must fill the device buffer with zero bytes for every dtype it
+        // supports, without allocating a host-side Vec (Item 3). hipMemset zeroes
+        // bytes, which is valid because every supported dtype's zero is all-zero bytes.
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        if !env {
+            return;
+        }
+        let dev = RocmDevice::new(0);
+        let shape = Shape::from_slice(&[3, 7, 5]);
+
+        let dtypes = [
+            DType::F32,
+            DType { arith: ArithType::F16, storage: DTypeStorage::Native },
+            DType::BF16,
+            DType { arith: ArithType::U32, storage: DTypeStorage::Native },
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        ];
+        for dtype in &dtypes {
+            let storage = dev.zeros(&shape, dtype.clone()).unwrap();
+            let rs = storage.as_any().downcast_ref::<RocmStorage>().expect("RocmStorage");
+            assert!(rs.device_ptr_is_valid(), "expected valid ptr for {dtype:?}");
+            let nbytes = rs.bytes();
+            let mut host = vec![0xABu8; nbytes];
+            let res = unsafe {
+                hipMemcpy(
+                    host.as_mut_ptr() as *mut c_void,
+                    rs.device_ptr.unwrap() as *mut c_void,
+                    nbytes,
+                    HipMemcpyKind::DeviceToHost,
+                )
+            };
+            assert_eq!(res, hipSuccess, "readback failed for {dtype:?}");
+            assert!(
+                host.iter().all(|&b| b == 0),
+                "zeros() left non-zero bytes for {dtype:?}: {:?}",
+                &host[..nbytes.min(8)]
+            );
+        }
     }
 }
