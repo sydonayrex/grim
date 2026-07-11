@@ -11,6 +11,7 @@
 
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -85,6 +86,7 @@ unsafe extern "C" {
     ) -> HipErrorT;
     pub fn hipGetDeviceCount(count: *mut HipErrorT) -> HipErrorT;
     pub fn hipSetDevice(ordinal: HipErrorT) -> HipErrorT;
+    pub fn hipGetDeviceProperties(prop: *mut c_void, device: i32) -> HipErrorT;
     pub fn hipDeviceGetAttribute(
         value: *mut i32,
         attribute: i32,
@@ -241,13 +243,12 @@ pub struct RocmDeviceProps {
 pub type Rocblstatus = i32;
 pub const rocblas_status_success: Rocblstatus = 0;
 
-#[repr(C)]
+#[repr(i32)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum RocblasOperation {
-    None = 0,                  // rocblas_operation_none
-    Transpose = 1,             // rocblas_operation_transpose
-    ConjugateTranspose = 2,    // rocblas_operation_conjugate_transpose
-    ConjugateGeneral = 3,      // rocblas_operation_conjugate_general
+    None = 111,                  // rocblas_operation_none
+    Transpose = 112,             // rocblas_operation_transpose
+    ConjugateTranspose = 113,    // rocblas_operation_conjugate_transpose
 }
 
 pub type RocblasInt = i32;
@@ -282,7 +283,8 @@ unsafe extern "C" {
         ldc: RocblasInt,
     ) -> Rocblstatus;
     
-    // rocBLAS INT8/GEMM support for quantized inference (rocm-aiter)
+    // rocBLAS extended GEMM with explicit datatypes / mixed precision (rocm-aiter).
+    // Signature matches rocblas_gemm_ex exactly (24 args, see rocblas-functions.h).
     pub fn rocblas_gemm_ex(
         handle: RoclabsHandle,
         trans_a: RocblasOperation,
@@ -290,42 +292,82 @@ unsafe extern "C" {
         m: RocblasInt,
         n: RocblasInt,
         k: RocblasInt,
-        alpha: *const f32,
-        A: *const c_void,
+        alpha: *const c_void,
+        a: *const c_void,
+        a_type: rocblas_datatype,
         lda: RocblasInt,
-        B: *const c_void,
+        b: *const c_void,
+        b_type: rocblas_datatype,
         ldb: RocblasInt,
-        beta: *const f32,
-        C: *mut c_void,
+        beta: *const c_void,
+        c: *mut c_void,
+        c_type: rocblas_datatype,
         ldc: RocblasInt,
-        A_type: rocblas_datatype,
-        B_type: rocblas_datatype,
-        C_type: rocblas_datatype,
+        d: *mut c_void,
+        d_type: rocblas_datatype,
+        ldd: RocblasInt,
+        compute_type: rocblas_datatype,
+        algo: rocblas_gemm_algo,
+        solution_index: RocblasInt,
+        flags: rocblas_gemm_flags,
     ) -> Rocblstatus;
     pub fn rocblas_set_stream(handle: RoclabsHandle, stream: *mut c_void) -> Rocblstatus;
 }
 
-// rocBLAS data types
-pub type rocblas_datatype = i32;
-pub const ROCBLAS_DATATYPE_F32: rocblas_datatype = 0;
-pub const ROCBLAS_DATATYPE_F16: rocblas_datatype = 1;
-pub const ROCBLAS_DATATYPE_I8: rocblas_datatype = 2;
-pub const ROCBLAS_DATATYPE_U8: rocblas_datatype = 3;
-pub const ROCBLAS_DATATYPE_INT32: rocblas_datatype = 4;
-pub const ROCBLAS_DATATYPE_UINT32: rocblas_datatype = 5;
-pub const ROCBLAS_DATATYPE_INT8_F32: rocblas_datatype = 6;
-pub const ROCBLAS_DATATYPE_UINT8_F32: rocblas_datatype = 7;
+// rocBLAS data types. Discriminants match the official rocBLAS `rocblas_datatype`
+// enum (see rocblas/rocblas-types.h). Passing the wrong integer here silently
+// yields rocblas_status_invalid_value and zeroes the output.
+#[repr(i32)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum rocblas_datatype {
+    f16_r = 150,
+    f32_r = 151,
+    f64_r = 152,
+    f16_c = 153,
+    f32_c = 154,
+    f64_c = 155,
+    i8_r = 160,
+    u8_r = 161,
+    i32_r = 162,
+    u32_r = 163,
+    i8_c = 164,
+    u8_c = 165,
+    i32_c = 166,
+    u32_c = 167,
+    bf16_r = 168,
+    bf16_c = 169,
+    invalid = 255,
+}
 
-/// Maps Grim `ArithType` to the corresponding `rocblas_datatype` constant.
-/// Falls back to `ROCBLAS_DATATYPE_F32` for unknown or unsupported types.
+/// GEMM algorithm selector (rocblas_gemm_algo).
+#[repr(i32)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum rocblas_gemm_algo {
+    standard = 0x0,
+    solution_index = 0x1,
+}
+
+/// GEMM control flags (rocblas_gemm_flags). Bitmask; 0x0 = none.
+pub type rocblas_gemm_flags = u32;
+pub const ROCBLAS_GEMM_FLAGS_NONE: rocblas_gemm_flags = 0x0;
+
+/// Maps Grim `ArithType` to the corresponding `rocblas_datatype` enum value.
+/// Falls back to `f32_r` for unknown or unsupported types.
 pub fn arith_to_rocblas_dtype(arith: ArithType) -> rocblas_datatype {
     match arith {
-        ArithType::F32 => ROCBLAS_DATATYPE_F32,
-        ArithType::F16 => ROCBLAS_DATATYPE_F16,
-        ArithType::BF16 => ROCBLAS_DATATYPE_F16, // rocBLAS uses F16 for BF16 in gemm_ex
-        ArithType::I64 | ArithType::U32 => ROCBLAS_DATATYPE_INT32,
-        ArithType::U8 => ROCBLAS_DATATYPE_U8,
+        ArithType::F32 => rocblas_datatype::f32_r,
+        ArithType::F16 => rocblas_datatype::f16_r,
+        ArithType::BF16 => rocblas_datatype::bf16_r,
+        ArithType::I64 | ArithType::U32 => rocblas_datatype::i32_r,
+        ArithType::U8 => rocblas_datatype::u8_r,
     }
+}
+
+/// Maps Grim `ArithType` to the rocBLAS compute (accumulation) datatype.
+/// Mixed-precision GEMMs accumulate in FP32 regardless of the input precision
+/// (FP16/BF16 -> FP32) for numerical stability.
+pub fn arith_to_compute_dtype(_arith: ArithType) -> rocblas_datatype {
+    rocblas_datatype::f32_r
 }
 
 /// Block-major KV layout for attention optimization.
@@ -691,6 +733,128 @@ pub fn resolve_weight_layout(
 
 /// ROCm-side tensor storage. Holds a hipDeviceptr_t (as u64) plus shape/dtype/provenance metadata.
 #[derive(Debug)]
+/// Size-bucketed caching allocator for device memory.
+///
+/// `hipMalloc`/`hipFree` are effectively device-synchronizing driver calls, so
+/// calling them per-op in a decode loop is the dominant fixed per-token cost.
+/// This allocator keeps a free-list of device buffers keyed by power-of-two size
+/// class per device and reuses them across allocations, only falling back to the
+/// real `hipMalloc`/`hipFree` when the pool is empty or over its soft cap.
+///
+/// Buffers are returned to the pool by `Drop for RocmStorage` (which holds an
+/// `Arc` to this allocator), so callers do not need to manage reuse explicitly.
+pub struct RocmCachingAllocator {
+    /// Free-list: size class -> available device pointers (stored as `u64` so the
+    /// pool stays `Send + Sync`; device pointers are just integers).
+    pool: Mutex<HashMap<usize, Vec<u64>>>,
+    /// Total bytes currently held in `pool` (not returned to the driver).
+    cached_bytes: Mutex<usize>,
+    /// Soft cap on `cached_bytes`. Once exceeded, freed buffers are actually
+    /// `hipFree`'d instead of retained, bounding steady-state memory use.
+    cap_bytes: usize,
+    /// Device ordinal this allocator serves.
+    ordinal: usize,
+    /// Count of real `hipMalloc` calls (misses). Always incremented.
+    malloc_count: AtomicUsize,
+    /// Count of real `hipFree` calls (evictions / cap overflow). Always incremented.
+    free_count: AtomicUsize,
+}
+
+impl RocmCachingAllocator {
+    pub fn new(ordinal: usize, cap_bytes: usize) -> Self {
+        Self {
+            pool: Mutex::new(HashMap::new()),
+            cached_bytes: Mutex::new(0),
+            cap_bytes,
+            ordinal,
+            malloc_count: AtomicUsize::new(0),
+            free_count: AtomicUsize::new(0),
+        }
+    }
+
+    /// Round a byte size up to the next power of two. Class 0 is treated as 1 to
+    /// avoid a zero-sized `hipMalloc`.
+    fn size_class(bytes: usize) -> usize {
+        if bytes <= 1 {
+            1
+        } else {
+            bytes.next_power_of_two()
+        }
+    }
+
+    /// Allocate a device buffer of at least `bytes` usable bytes, reusing a pooled
+    /// buffer when one is available.
+    pub fn alloc(&self, bytes: usize) -> Result<*mut c_void> {
+        let cls = Self::size_class(bytes);
+        let reused = {
+            let mut pool = self.pool.lock().unwrap();
+            pool.get_mut(&cls).and_then(|v| v.pop())
+        };
+        if let Some(ptr_u64) = reused {
+            // Buffer leaves the pool: adjust cached accounting.
+            if let Ok(mut cached) = self.cached_bytes.lock() {
+                *cached = cached.saturating_sub(cls);
+            }
+            return Ok(ptr_u64 as *mut c_void);
+        }
+
+        let mut dev_ptr_void: *mut c_void = std::ptr::null_mut();
+        let res = unsafe { hipMalloc(&mut dev_ptr_void, cls) };
+        if res != hipSuccess {
+            return Err(Error::Backend(format!(
+                "hipMalloc failed with error code {}",
+                res
+            )));
+        }
+        self.malloc_count.fetch_add(1, Ordering::Relaxed);
+        Ok(dev_ptr_void)
+    }
+
+    /// Return a buffer to the pool (or actually free it if over cap).
+    pub fn free(&self, ptr: *mut c_void, bytes: usize) {
+        let cls = Self::size_class(bytes);
+        let over_cap = {
+            let cached = self.cached_bytes.lock().unwrap();
+            *cached + cls > self.cap_bytes
+        };
+        if over_cap || ptr.is_null() {
+            unsafe {
+                let _ = hipFree(ptr);
+            }
+            self.free_count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        {
+            let mut pool = self.pool.lock().unwrap();
+            pool.entry(cls).or_default().push(ptr as u64);
+            let mut cached = self.cached_bytes.lock().unwrap();
+            *cached += cls;
+        }
+    }
+
+    /// Release every pooled buffer back to the driver. Mirrors `torch.cuda.empty_cache()`.
+    pub fn empty_cache(&self) {
+        let mut pool = self.pool.lock().unwrap();
+        for (_cls, bufs) in pool.drain() {
+            for p in bufs {
+                unsafe {
+                    let _ = hipFree(p as *mut c_void);
+                }
+                self.free_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        *self.cached_bytes.lock().unwrap() = 0;
+    }
+
+    /// `(malloc_count, free_count)` — real driver allocation calls since start.
+    pub fn stats(&self) -> (usize, usize) {
+        (
+            self.malloc_count.load(Ordering::Relaxed),
+            self.free_count.load(Ordering::Relaxed),
+        )
+    }
+}
+
 pub struct RocmStorage {
     /// Opaque device pointer, stored as u64
     pub(crate) device_ptr: Option<u64>,
@@ -699,6 +863,9 @@ pub struct RocmStorage {
     dtype: DType,
     provenance: QuantProvenance,
     ordinal: usize,
+    /// Back-reference to the owning device allocator; used by `Drop` to return the
+    /// buffer to the free-list instead of calling `hipFree`.
+    allocator: Arc<RocmCachingAllocator>,
 }
 
 impl RocmStorage {
@@ -718,19 +885,10 @@ impl RocmStorage {
         self.bytes
     }
 
-    /// Allocates GPU memory using `hipMalloc`. Returns the storage on success.
-    fn alloc_gpu(shape: &Shape, dtype: DType, device_ordinal: usize) -> Result<Self> {
+    /// Allocates GPU memory via the device's caching allocator. Returns the storage on success.
+    fn alloc_gpu(shape: &Shape, dtype: DType, device: &RocmDevice) -> Result<Self> {
         let bytes = shape.elem_count() * dtype_byte_size(&dtype);
-        let mut dev_ptr_void: *mut c_void = std::ptr::null_mut();
-        
-        // Call hipMalloc
-        let res = unsafe { hipMalloc(&mut dev_ptr_void, bytes) };
-        if res != hipSuccess {
-            return Err(Error::Backend(format!(
-                "hipMalloc failed with error code {}",
-                res
-            )));
-        }
+        let dev_ptr_void = device.allocator.alloc(bytes)?;
 
         Ok(RocmStorage {
             device_ptr: Some(dev_ptr_void as u64),
@@ -738,22 +896,21 @@ impl RocmStorage {
             shape: shape.clone(),
             dtype,
             provenance: QuantProvenance::GrimNative,
-            ordinal: device_ordinal,
+            ordinal: device.ordinal,
+            allocator: Arc::clone(&device.allocator),
         })
     }
 
-    /// Copies data from host to GPU using `hipMalloc` and `hipMemcpyHostToDevice`.
+    /// Copies data from host to GPU using the caching allocator + `hipMemcpy`.
     fn copy_from_host(
         host_data: &[f32],
         shape: &Shape,
         dtype: DType,
-        device_ordinal: usize,
+        device: &RocmDevice,
     ) -> Result<Self> {
-        let storage = RocmStorage::alloc_gpu(shape, dtype, device_ordinal)?;
+        let mut storage = RocmStorage::alloc_gpu(shape, dtype, device)?;
 
-        // Ensure we have a valid pointer
         let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
-
         let res = unsafe {
             hipMemcpy(
                 dev_ptr_void,
@@ -763,13 +920,11 @@ impl RocmStorage {
             )
         };
         if res != hipSuccess {
-            // Free on failure to avoid leak
-            if storage.device_ptr.is_some() {
-                let ptr_void = storage.device_ptr.unwrap() as *mut c_void;
-                unsafe {
-                    _ = hipFree(ptr_void);
-                }
+            // Return the buffer to the pool (Drop would also do this, but be explicit).
+            unsafe {
+                storage.allocator.free(dev_ptr_void, storage.bytes);
             }
+            storage.device_ptr = None;
             return Err(Error::Backend(format!(
                 "hipMemcpyHostToDevice failed with error code {}",
                 res
@@ -783,9 +938,7 @@ impl RocmStorage {
 impl Drop for RocmStorage {
     fn drop(&mut self) {
         if let Some(ptr_val) = self.device_ptr {
-            unsafe {
-                let _ = hipFree(ptr_val as *mut c_void);
-            }
+            self.allocator.free(ptr_val as *mut c_void, self.bytes);
         }
     }
 }
@@ -849,6 +1002,20 @@ pub struct RocmDevice {
     handle_cache: Mutex<Option<RoclabsHandle>>,
     pub(crate) stream_pool: Mutex<Vec<*mut c_void>>,
     pub(crate) hsaco_cache: HsacoKernelCache,
+    /// Caching device-memory allocator (size-bucketed free-list). See `RocmCachingAllocator`.
+    pub(crate) allocator: Arc<RocmCachingAllocator>,
+    /// Loaded HIP modules + resolved entry functions, cached per unique kernel entry.
+    /// `hipModuleLoad`/`hipModuleGetFunction` happen once per kernel for the process
+    /// lifetime; every later dispatch reuses the cached module (Item 2). `Send + Sync`
+    /// via raw pointers + the Mutex (the struct is already asserted Send/Sync).
+    pub(crate) module_cache: Mutex<HashMap<String, (*mut c_void, *mut c_void)>>,
+    /// Real `hipModuleLoad` call count (cache hits excluded). Item 2 acceptance.
+    pub(crate) module_load_count: AtomicUsize,
+    /// GPU target this device was created for, captured at construction. Used to
+    /// key the module cache so a binary is never loaded onto the wrong arch. Captured
+    /// once (not read live) so a concurrent `temp_env::with_var("GRIM_GPU_TARGET", ..)`
+    /// in another test thread can't flip the key mid-run and spuriously reload.
+    pub(crate) gpu_target: String,
 }
 
 unsafe impl Send for RocmDevice {}
@@ -902,18 +1069,58 @@ impl RocmDevice {
         };
         let xnack_enabled = xnack_val == 1;
 
+        // Caching allocator soft cap. Default 256 MiB; overridable for testing/large models.
+        let cap_bytes = std::env::var("GRIM_ALLOC_POOL_CAP_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(256 * 1024 * 1024);
+
         Self {
             ordinal,
             props: RocmDeviceProps { wavefront_size, xnack_enabled },
             handle_cache: Mutex::new(handle_cache),
             stream_pool: Mutex::new(streams),
             hsaco_cache: HsacoKernelCache::new(),
+            allocator: Arc::new(RocmCachingAllocator::new(ordinal, cap_bytes)),
+            module_cache: Mutex::new(HashMap::new()),
+            module_load_count: AtomicUsize::new(0),
+            gpu_target: detect_gpu_arch(ordinal as i32),
         }
+    }
+
+    /// Release all pooled device buffers back to the driver. Mirrors `torch.cuda.empty_cache()`.
+    pub fn empty_cache(&self) {
+        self.allocator.empty_cache();
+    }
+
+    /// `(hipMalloc_count, hipFree_count)` since this device was created — real driver
+    /// allocation calls, useful for asserting pool reuse (Item 1 acceptance).
+    pub fn allocator_stats(&self) -> (usize, usize) {
+        self.allocator.stats()
+    }
+
+    /// Number of real `hipModuleLoad` calls since device creation. Cache hits are
+    /// excluded, so this stays constant once every compute kernel has been loaded
+    /// once (Item 2 acceptance: `module_cache_loads_each_kernel_once`).
+    pub fn module_load_stats(&self) -> usize {
+        self.module_load_count.load(Ordering::SeqCst)
     }
 }
 
 impl Drop for RocmDevice {
     fn drop(&mut self) {
+        // Return all pooled buffers to the driver before the allocator Arc is dropped,
+        // otherwise they would leak (the pool is only drained by empty_cache).
+        self.allocator.empty_cache();
+        // Unload every cached HIP module (they were loaded exactly once per
+        // kernel entry and retained for the device lifetime, Item 2).
+        if let Ok(mut cache) = self.module_cache.lock() {
+            for (_, (module, _func)) in cache.drain() {
+                unsafe {
+                    let _ = hipModuleUnload(module);
+                }
+            }
+        }
         if let Ok(mut pool) = self.stream_pool.lock() {
             for stream in pool.drain(..) {
                 unsafe {
@@ -1008,7 +1215,7 @@ impl BackendDevice for RocmDevice {
         println!("[rocprofiler-sdk] Begin marker span: zeros");
 
         // alloc GPU memory filled with 0s. hipMalloc doesn't guarantee zero-fill, so we need to do hipMemset or copy zeros from host.
-        let storage = RocmStorage::alloc_gpu(shape, dtype.clone(), self.ordinal)?;
+        let storage = RocmStorage::alloc_gpu(shape, dtype.clone(), self)?;
 
         // clear the allocated buffer using a minimal HIP memset (we can just memcpy zeros from host)
         if !storage.device_ptr_is_valid() {
@@ -1053,7 +1260,7 @@ impl BackendDevice for RocmDevice {
         #[cfg(feature = "rocm-profile")]
         println!("[rocprofiler-sdk] Begin marker span: from_cpu");
 
-        RocmStorage::copy_from_host(data, shape, dtype, self.ordinal)
+        RocmStorage::copy_from_host(data, shape, dtype, self)
             .map(|s| Box::new(s) as Box<dyn BackendStorage>)
     }
 
@@ -1112,7 +1319,7 @@ impl BackendDevice for RocmDevice {
             arith: a_storage.dtype.arith,
             storage: DTypeStorage::Native,
         };
-        let out_storage = RocmStorage::alloc_gpu(out_shape, dtype_out.clone(), self.ordinal)?;
+        let out_storage = RocmStorage::alloc_gpu(out_shape, dtype_out.clone(), self)?;
 
         // Shape-indexed GEMM dispatch lookup (Tensile-inspired layout resolution)
         let tile_config = lookup_gemm_config(m, n, k, self.props.wavefront_size);
@@ -1133,8 +1340,10 @@ impl BackendDevice for RocmDevice {
         let b_ptr_void = b_storage.device_ptr.unwrap() as *const c_void;
         let out_ptr_void = out_storage.device_ptr.unwrap() as *mut c_void;
 
-        // In ROCm/rocBLAS (column-major), to do row-major MxK @ KxN -> MxN, 
-        // we can just call rocblas_sgemm with transa='T', transb='N' and appropriate m,n,k,ld parameters.
+        // In ROCm/rocBLAS (column-major), row-major C[M,N] = A[M,K] @ B[K,N] is
+        // computed via sgemm/gemm_ex with transa=transb='N', the A/B operands
+        // swapped, and (m,n,k,lda,ldb,ldc) = (N, M, K, N, K, N). See e.g. the
+        // canonical row-major GEMM recipe used by ggml/llama.cpp.
         
         let use_gemm_ex = cfg!(feature = "rocm-aiter") || {
             let gcn = std::env::var("GRIM_GPU_TARGET").unwrap_or_else(|_| "gfx900".into());
@@ -1146,29 +1355,39 @@ impl BackendDevice for RocmDevice {
                 let a_type = arith_to_rocblas_dtype(a_storage.dtype.arith);
                 let b_type = arith_to_rocblas_dtype(b_storage.dtype.arith);
                 let out_type = arith_to_rocblas_dtype(dtype_out.arith);
+                let compute_type = arith_to_compute_dtype(dtype_out.arith);
+                let alpha_ptr = &alpha as *const f32 as *const c_void;
+                let beta_ptr = &beta as *const f32 as *const c_void;
                 rocblas_gemm_ex(
                     handle,
-                    RocblasOperation::Transpose,
+                    RocblasOperation::None,
                     RocblasOperation::None,
                     n as RocblasInt,
                     m as RocblasInt,
                     k as RocblasInt,
-                    &alpha,
+                    alpha_ptr,
                     b_ptr_void,
+                    b_type,
                     n as RocblasInt,
                     a_ptr_void,
-                    k as RocblasInt,
-                    &beta,
-                    out_ptr_void,
-                    m as RocblasInt,
-                    b_type,
                     a_type,
+                    k as RocblasInt,
+                    beta_ptr,
+                    out_ptr_void,
                     out_type,
+                    n as RocblasInt,
+                    out_ptr_void,
+                    out_type,
+                    n as RocblasInt,
+                    compute_type,
+                    rocblas_gemm_algo::standard,
+                    0,
+                    ROCBLAS_GEMM_FLAGS_NONE,
                 )
             } else {
                 rocblas_sgemm(
                     handle,
-                    RocblasOperation::Transpose,
+                    RocblasOperation::None,
                     RocblasOperation::None,
                     n as RocblasInt,
                     m as RocblasInt,
@@ -1180,7 +1399,7 @@ impl BackendDevice for RocmDevice {
                     k as RocblasInt,
                     &beta,
                     out_ptr_void as *mut f32,
-                    m as RocblasInt,
+                    n as RocblasInt,
                 )
             };
 
@@ -1221,6 +1440,9 @@ impl BackendDevice for RocmDevice {
                         let a_type = arith_to_rocblas_dtype(a_storage.dtype.arith);
                         let b_type = arith_to_rocblas_dtype(b_storage.dtype.arith);
                         let out_type = arith_to_rocblas_dtype(dtype_out.arith);
+                        let compute_type = arith_to_compute_dtype(dtype_out.arith);
+                        let alpha_ptr = &alpha as *const f32 as *const c_void;
+                        let beta_ptr = &beta as *const f32 as *const c_void;
                         rocblas_gemm_ex(
                             handle,
                             RocblasOperation::Transpose,
@@ -1228,17 +1450,24 @@ impl BackendDevice for RocmDevice {
                             n as RocblasInt,
                             m as RocblasInt,
                             k as RocblasInt,
-                            &alpha,
+                            alpha_ptr,
                             b_ptr_void,
+                            b_type,
                             n as RocblasInt,
                             a_ptr_void,
-                            k as RocblasInt,
-                            &beta,
-                            out_ptr_void,
-                            m as RocblasInt,
-                            b_type,
                             a_type,
+                            k as RocblasInt,
+                            beta_ptr,
+                            out_ptr_void,
                             out_type,
+                            m as RocblasInt,
+                            out_ptr_void,
+                            out_type,
+                            m as RocblasInt,
+                            compute_type,
+                            rocblas_gemm_algo::standard,
+                            0,
+                            ROCBLAS_GEMM_FLAGS_NONE,
                         )
                     } else {
                         rocblas_sgemm(
@@ -1308,7 +1537,7 @@ impl BackendDevice for RocmDevice {
             return Err(Error::Backend("add: inputs lack a valid device pointer".into()));
         }
         let total = out.elem_count();
-        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self.ordinal)?;
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut a_ptr = dev_ptr(a_s)?;
         let mut b_ptr = dev_ptr(b_s)?;
@@ -1335,7 +1564,7 @@ impl BackendDevice for RocmDevice {
             return Err(Error::Backend("mul: inputs lack a valid device pointer".into()));
         }
         let total = out.elem_count();
-        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self.ordinal)?;
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut a_ptr = dev_ptr(a_s)?;
         let mut b_ptr = dev_ptr(b_s)?;
@@ -1362,7 +1591,7 @@ impl BackendDevice for RocmDevice {
             return Err(Error::Backend("silu_mul: inputs lack a valid device pointer".into()));
         }
         let total = out.elem_count();
-        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self.ordinal)?;
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut gate_ptr = dev_ptr(gate_s)?;
         let mut up_ptr = dev_ptr(up_s)?;
@@ -1395,7 +1624,7 @@ impl BackendDevice for RocmDevice {
         }
         let row_len = *x_dims.last().unwrap();
         let total = out.elem_count();
-        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self.ordinal)?;
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut x_ptr = dev_ptr(x_s)?;
         let mut w_ptr = dev_ptr(w_s)?;
@@ -1434,7 +1663,7 @@ impl BackendDevice for RocmDevice {
         }
         let row_len = *x_dims.last().unwrap();
         let total = out.elem_count();
-        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self.ordinal)?;
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut x_ptr = dev_ptr(x_s)?;
         let mut row_len_i = row_len as i32;
@@ -1478,14 +1707,14 @@ impl BackendDevice for RocmDevice {
             )));
         }
         let total = out.elem_count();
-        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self.ordinal)?;
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut w_ptr = dev_ptr(w_s)?;
         let mut idx_ptr = upload_device_buffer(indices)?;
         let mut dim_i = dim as i32;
         let mut total_i = total as i32;
         let (grid, block) = linear_launch(total);
-        let launch_res = self.launch_compute_kernel(
+        let stream = self.launch_compute_kernel(
             "grim_embedding",
             grid,
             block,
@@ -1496,9 +1725,18 @@ impl BackendDevice for RocmDevice {
                 arg(&mut dim_i),
                 arg(&mut total_i),
             ],
-        );
-        unsafe { hipFree(idx_ptr); }
-        launch_res?;
+        )?;
+        // The fused kernel reads idx_ptr from the GPU. With the per-launch sync
+        // removed (Item 2) we must wait on the stream before freeing the temp
+        // buffer, otherwise hipFree could race the still-running kernel.
+        unsafe {
+            let sync = hipStreamSynchronize(stream);
+            if sync != hipSuccess {
+                hipFree(idx_ptr);
+                return Err(Error::Backend(format!("hipStreamSynchronize failed: {}", sync)));
+            }
+            hipFree(idx_ptr);
+        }
         Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
     }
 
@@ -1858,7 +2096,7 @@ impl Default for HsacoKernelCache {
 }
 
 /// JIT compile HIP source to .hsaco binary.
-pub fn jit_compile_hsaco(source: &str, entry_name: &str) -> Result<Vec<u8>> {
+pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<Vec<u8>> {
     let mut prog: HiprtcProgram = std::ptr::null_mut();
     let source_cstr = std::ffi::CString::new(source)
         .map_err(|e| Error::Backend(format!("CString conversion failed: {}", e)))?;
@@ -1873,7 +2111,7 @@ pub fn jit_compile_hsaco(source: &str, entry_name: &str) -> Result<Vec<u8>> {
 
         let options_c = vec![
             std::ffi::CString::new("--std=c++14").unwrap(),
-            gpu_target_flag(),
+            gpu_target_flag(arch),
         ];
         let options_ptrs: Vec<*const i8> = options_c.iter().map(|c| c.as_ptr()).collect();
         
@@ -2058,20 +2296,30 @@ fn upload_device_buffer<T: Copy>(data: &[T]) -> Result<*mut c_void> {
 
 impl RocmDevice {
     /// JIT-compile or query the cache, then launch the specified kernel on a stream from the persistent pool.
+    /// Dispatch a compute kernel onto a pooled stream. The HIP module for `entry`
+    /// is loaded (and the entry function resolved) exactly once per process and
+    /// reused on every later dispatch via `module_cache` (Item 2). The per-launch
+    /// `hipStreamSynchronize` that previously forced every op to block has been
+    /// removed; the stream the kernel was enqueued on is returned so callers that
+    /// must wait (e.g. before freeing a temporary buffer) can synchronize
+    /// explicitly. Read-back (`to_cpu_vec_f32`) still blocks on the default stream,
+    /// which synchronizes with all streams, so results remain correct.
     fn launch_compute_kernel(
         &self,
         entry: &str,
         grid: HipDim3,
         block: HipDim3,
         args: &mut [*mut c_void],
-    ) -> Result<()> {
+    ) -> Result<*mut c_void> {
         let hash = seahash::hash(COMPUTE_KERNEL_SOURCE.as_bytes());
-        let cache_key = format!("grim_{}_{:016x}", entry, hash);
+        // Include the GPU target in the cache key so a binary compiled for one
+        // architecture is never loaded onto a different one (hipErrorNoBinaryForGpu).
+        let cache_key = format!("grim_{}_{}_{:016x}", entry, self.gpu_target, hash);
         
         let path = if let Some(cached_path) = self.hsaco_cache.get_cached_kernel(&cache_key) {
             cached_path
         } else {
-            let code = jit_compile_hsaco(COMPUTE_KERNEL_SOURCE, entry)?;
+            let code = jit_compile_hsaco(COMPUTE_KERNEL_SOURCE, entry, &self.gpu_target)?;
             self.hsaco_cache.cache_kernel(&cache_key, COMPUTE_KERNEL_SOURCE, &code)?
         };
 
@@ -2080,18 +2328,28 @@ impl RocmDevice {
         let entry_c = std::ffi::CString::new(entry)
             .map_err(|e| Error::Backend(format!("entry CString: {}", e)))?;
 
-        let mut module: *mut c_void = std::ptr::null_mut();
-        let res = unsafe { hipModuleLoad(&mut module, path_c.as_ptr()) };
-        if res != hipSuccess {
-            return Err(Error::Backend(format!("hipModuleLoad failed: {}", res)));
-        }
-
-        let mut func: *mut c_void = std::ptr::null_mut();
-        let res = unsafe { hipModuleGetFunction(&mut func, module, entry_c.as_ptr()) };
-        if res != hipSuccess {
-            unsafe { hipModuleUnload(module); }
-            return Err(Error::Backend(format!("hipModuleGetFunction failed: {}", res)));
-        }
+        // Load the HIP module once per unique kernel; reuse the cached module +
+        // resolved function on every subsequent dispatch (Item 2).
+        let mut module_cache = self.module_cache.lock().unwrap();
+        let (module, func) = if let Some(cached) = module_cache.get(&cache_key) {
+            *cached
+        } else {
+            let mut module: *mut c_void = std::ptr::null_mut();
+            let res = unsafe { hipModuleLoad(&mut module, path_c.as_ptr()) };
+            if res != hipSuccess {
+                return Err(Error::Backend(format!("hipModuleLoad failed: {}", res)));
+            }
+            let mut func: *mut c_void = std::ptr::null_mut();
+            let res = unsafe { hipModuleGetFunction(&mut func, module, entry_c.as_ptr()) };
+            if res != hipSuccess {
+                unsafe { hipModuleUnload(module); }
+                return Err(Error::Backend(format!("hipModuleGetFunction failed: {}", res)));
+            }
+            self.module_load_count.fetch_add(1, Ordering::SeqCst);
+            module_cache.insert(cache_key, (module, func));
+            (module, func)
+        };
+        drop(module_cache);
 
         let stream = self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut());
 
@@ -2108,24 +2366,10 @@ impl RocmDevice {
             )
         };
         
-        if res == hipSuccess {
-            unsafe {
-                let sync = hipStreamSynchronize(stream);
-                if sync != hipSuccess {
-                    unsafe { hipModuleUnload(module); }
-                    return Err(Error::Backend(format!("hipStreamSynchronize failed: {}", sync)));
-                }
-            }
-        }
-
-        unsafe {
-            hipModuleUnload(module);
-        }
-        
         if res != hipSuccess {
             return Err(Error::Backend(format!("hipModuleLaunchKernel failed: {}", res)));
         }
-        Ok(())
+        Ok(stream)
     }
 
     /// Dispatch a fused RMSNorm + MatMul operation onto the GPU.
@@ -2169,7 +2413,7 @@ impl RocmDevice {
         };
         let launch = config.hip_launch_params();
         
-        let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), self.ordinal)?;
+        let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), self)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut x_ptr = dev_ptr(x_s)?;
         let mut w_norm_ptr = dev_ptr(w_norm_s)?;
@@ -2229,7 +2473,7 @@ impl RocmDevice {
         };
         let launch = config.hip_launch_params();
         
-        let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), self.ordinal)?;
+        let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), self)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut q_ptr = dev_ptr(q_s)?;
         let mut k_ptr = dev_ptr(k_s)?;
@@ -2287,8 +2531,45 @@ fn arg<T>(v: &mut T) -> *mut c_void {
 
 /// Build the AMD-clang hipRTC `--offload-arch=<arch>` option. Defaults to
 /// `gfx900` to preserve historical CDNA builds; override via `GRIM_GPU_TARGET`.
-fn gpu_target_flag() -> std::ffi::CString {
-    let arch = std::env::var("GRIM_GPU_TARGET").unwrap_or_else(|_| "gfx900".into());
+fn gpu_target_arch() -> String {
+    std::env::var("GRIM_GPU_TARGET").unwrap_or_else(|_| "gfx900".into())
+}
+
+/// Query the device's real gfx target so JIT-compiled kernels always match the
+/// GPU, independent of the process-global `GRIM_GPU_TARGET` env (which other
+/// tests flip via `temp_env` and would otherwise race with device creation).
+fn detect_gpu_arch(device: i32) -> String {
+    // `hipDeviceProp_t` is version-sensitive and large; rather than redefining
+    // it, dump the properties into an over-sized zeroed buffer and scan for the
+    // `gcnArchName` token (a NUL-terminated "gfx<hex>" string). This is robust
+    // to field reordering and alignment differences across ROCm releases.
+    let mut buf = vec![0u8; 8192];
+    unsafe {
+        if hipGetDeviceProperties(buf.as_mut_ptr() as *mut c_void, device) == 0 {
+            let mut i = 0;
+            while i + 3 < buf.len() {
+                if buf[i] == b'g' && buf[i + 1] == b'f' && buf[i + 2] == b'x' {
+                    let start = i;
+                    let mut end = start;
+                    while end < buf.len() && buf[end] != 0 {
+                        end += 1;
+                    }
+                    let s = std::str::from_utf8(&buf[start..end]).unwrap_or("");
+                    let base: String = s.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+                    if base.starts_with("gfx") {
+                        return base;
+                    }
+                    i = end + 1;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+    gpu_target_arch()
+}
+
+fn gpu_target_flag(arch: &str) -> std::ffi::CString {
     std::ffi::CString::new(format!("--offload-arch={arch}"))
         .expect("GRIM_GPU_TARGET contains interior NUL")
 }
@@ -2367,6 +2648,7 @@ mod tests {
             dtype: DType { arith: ArithType::F32, storage: DTypeStorage::Native },
             provenance: QuantProvenance::GrimNative,
             ordinal: 0,
+            allocator: Arc::new(RocmCachingAllocator::new(0, 0)),
         };
         assert_eq!(dummy.bytes(), 0);
         assert_eq!(dummy.shape_metadata().elem_count(), 1);
@@ -2769,5 +3051,277 @@ mod tests {
         let out_shape = Shape::from_slice(&[2, 3]);
         let res = dev.embedding(w_s.as_ref(), &[0, 1, 2], &out_shape); // 3 indices vs leading dim 2
         assert!(res.is_err(), "embedding must reject indices.len() != out leading dim");
+    }
+
+    // ------------------------------------------------------------------------
+    // Item 0: rocBLAS `gemm_ex` ABI correctness
+    // ------------------------------------------------------------------------
+    //
+    // The original FFI used fabricated integer discriminants (RocblasOperation =
+    // 0/1/2, rocblas_datatype = 0/1/2/...) and a truncated/ reordered
+    // `rocblas_gemm_ex` argument list. rocBLAS expects the exact enum values from
+    // rocblas/rocblas-types.h, otherwise every GEMM returns invalid_value and
+    // silently zeroes the output. These tests pin the ABI constants so the bug
+    // cannot regress.
+
+    #[test]
+    fn gemm_ex_abi_constants_match_rocblas() {
+        // rocblas_operation_*
+        assert_eq!(RocblasOperation::None as i32, 111);
+        assert_eq!(RocblasOperation::Transpose as i32, 112);
+        assert_eq!(RocblasOperation::ConjugateTranspose as i32, 113);
+
+        // rocblas_datatype_* (real discriminants from rocblas-types.h)
+        assert_eq!(rocblas_datatype::f16_r as i32, 150);
+        assert_eq!(rocblas_datatype::f32_r as i32, 151);
+        assert_eq!(rocblas_datatype::bf16_r as i32, 168);
+        assert_eq!(rocblas_datatype::i8_r as i32, 160);
+        assert_eq!(rocblas_datatype::i32_r as i32, 162);
+
+        // gemm_ex control enums
+        assert_eq!(rocblas_gemm_algo::standard as i32, 0x0);
+        assert_eq!(rocblas_gemm_algo::solution_index as i32, 0x1);
+        assert_eq!(ROCBLAS_GEMM_FLAGS_NONE, 0x0);
+    }
+
+    #[test]
+    fn arith_to_rocblas_dtype_is_not_fabricated() {
+        // Previously BF16 was mapped to the F16 constant and the constants were
+        // fabricated (0/1/2). These must map to the real rocBLAS discriminants.
+        assert_eq!(arith_to_rocblas_dtype(ArithType::F32), rocblas_datatype::f32_r);
+        assert_eq!(arith_to_rocblas_dtype(ArithType::F16), rocblas_datatype::f16_r);
+        assert_eq!(arith_to_rocblas_dtype(ArithType::BF16), rocblas_datatype::bf16_r);
+        // Mixed-precision GEMMs accumulate in FP32.
+        assert_eq!(arith_to_compute_dtype(ArithType::F16), rocblas_datatype::f32_r);
+        assert_eq!(arith_to_compute_dtype(ArithType::BF16), rocblas_datatype::f32_r);
+    }
+
+    /// Run a 2-D matmul on host f32 and return the device result, or `None` when
+    /// GPU execution is unavailable.
+    /// Run a matmul on an explicit device and read the result back. Used by tests
+    /// that need to share a single `RocmDevice` (and thus a single allocator).
+    fn run_matmul_on_dev(
+        dev: &RocmDevice,
+        a: &[f32],
+        a_dims: &[usize],
+        b: &[f32],
+        b_dims: &[usize],
+        out_dims: &[usize],
+    ) -> Vec<f32> {
+        let a_s = dev.from_cpu(a, &Shape::from_slice(a_dims), DType::F32).unwrap();
+        let b_s = dev.from_cpu(b, &Shape::from_slice(b_dims), DType::F32).unwrap();
+        let (out, _h) = dev
+            .matmul(a_s.as_ref(), b_s.as_ref(), &Shape::from_slice(out_dims))
+            .unwrap();
+        out.to_cpu_vec_f32().unwrap()
+    }
+
+    fn run_matmul_op(
+        env_present: bool,
+        a: &[f32],
+        a_dims: &[usize],
+        b: &[f32],
+        b_dims: &[usize],
+        out_dims: &[usize],
+    ) -> Option<Vec<f32>> {
+        if !env_present {
+            return None;
+        }
+        let dev = RocmDevice::new(0);
+        Some(run_matmul_on_dev(
+            &dev,
+            a,
+            a_dims,
+            b,
+            b_dims,
+            out_dims,
+        ))
+    }
+
+    /// Reference row-major matmul: C[m,n] = sum_k A[m,k] * B[k,n].
+    fn cpu_matmul(a: &[f32], a_dims: &[usize], b: &[f32], b_dims: &[usize]) -> Vec<f32> {
+        let (m, k) = (a_dims[0], a_dims[1]);
+        let n = b_dims[1];
+        let mut c = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    acc += a[i * k + p] * b[p * n + j];
+                }
+                c[i * n + j] = acc;
+            }
+        }
+        c
+    }
+
+    #[test]
+    fn gemm_ex_f32_matches_cpu_reference() {
+        // Force the gemm_ex (extended-datatype) code path even for FP32 inputs by
+        // selecting a CDNA target, which exercises the Item 0 ABI fix directly.
+        temp_env::with_var("GRIM_GPU_TARGET", Some("gfx90a"), || {
+            let env = std::env::var(GPU_TEST_ENV).is_ok();
+            let a_dims = [4usize, 8];
+            let b_dims = [8usize, 4];
+            let a: Vec<f32> = (0..32).map(|i| i as f32 * 0.1 + 1.0).collect();
+            let b: Vec<f32> = (0..32).map(|i| (i as f32 * 0.2) - 3.0).collect();
+            let expected = cpu_matmul(&a, &a_dims, &b, &b_dims);
+            let got = run_matmul_op(env, &a, &a_dims, &b, &b_dims, &[4, 4]);
+            if let Some(out) = got {
+                assert_eq!(out.len(), expected.len());
+                for (i, (g, e)) in out.iter().zip(expected.iter()).enumerate() {
+                    assert!(
+                        approx_eq(*g, *e, 1e-2),
+                        "gemm_ex f32 mismatch at [{}/{}]: got {}, expected {}",
+                        i / 4,
+                        i % 4,
+                        g,
+                        e
+                    );
+                }
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------------
+    // Item 1: caching/pooling GPU allocator
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn caching_allocator_reuses_buffers_across_steps() {
+        // After a short warmup of same-shape matmuls, the steady-state loop must
+        // reuse pooled device buffers and NOT call hipMalloc per step. This is the
+        // regression test for Item 1'sallocator reuse.
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        if !env {
+            return;
+        }
+        let dev = RocmDevice::new(0);
+        let a_dims = [16usize, 32];
+        let b_dims = [32usize, 16];
+        let a: Vec<f32> = (0..16 * 32).map(|i| (i as f32 * 0.01) - 1.0).collect();
+        let b: Vec<f32> = (0..32 * 16).map(|i| (i as f32 * 0.02)).collect();
+
+        // Warmup so the pool fills with the right size classes.
+        for _ in 0..3 {
+            let _ = run_matmul_on_dev(&dev, &a, &a_dims, &b, &b_dims, &[16, 16]);
+        }
+        let (m1, _f1) = dev.allocator_stats();
+        for _ in 0..20 {
+            let _ = run_matmul_on_dev(&dev, &a, &a_dims, &b, &b_dims, &[16, 16]);
+        }
+        let (m2, _f2) = dev.allocator_stats();
+
+        // Steady-state: repeated same-shape matmuls reuse pooled buffers, so new
+        // hipMalloc calls must be ~0 (allow a couple for slack).
+        assert!(
+            (m2 - m1) <= 2,
+            "hipMalloc calls grew by {} during steady-state loop (expected ~0, proving pool reuse)",
+            m2 - m1
+        );
+    }
+
+    #[test]
+    fn empty_cache_releases_pooled_buffers() {
+        // empty_cache() must actually hipFree the retained buffers, bounding memory.
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        if !env {
+            return;
+        }
+        let dev = RocmDevice::new(0);
+        let a_dims = [8usize, 8];
+        let b_dims = [8usize, 8];
+        let a: Vec<f32> = (0..64).map(|i| i as f32).collect();
+        let b: Vec<f32> = (0..64).map(|i| (i + 1) as f32).collect();
+        for _ in 0..5 {
+            let _ = run_matmul_on_dev(&dev, &a, &a_dims, &b, &b_dims, &[8, 8]);
+        }
+        let (_m_before, f_before) = dev.allocator_stats();
+        dev.empty_cache();
+        let (_m_after, f_after) = dev.allocator_stats();
+        assert!(
+            f_after > f_before,
+            "empty_cache must release pooled buffers via hipFree (free_count {} -> {})",
+            f_before,
+            f_after
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Item 2: module cache + no per-launch sync
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn module_cache_loads_each_kernel_once() {
+        // Each unique compute kernel must be hipModuleLoad'd exactly once for the
+        // process lifetime; repeated dispatches reuse the cached module (Item 2).
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        if !env {
+            return;
+        }
+        // The device detects its own gfx target from the driver, so kernel
+        // compilation is immune to the process-global `GRIM_GPU_TARGET` flips
+        // done by sibling tests via temp_env.
+        let dev = RocmDevice::new(0);
+
+        let x = dev.from_cpu(&vec![1.0f32; 4*8], &Shape::from_slice(&[4,8]), DType::F32).unwrap();
+        let w_norm = dev.from_cpu(&vec![1.0f32; 8], &Shape::from_slice(&[8]), DType::F32).unwrap();
+        let w_mat = dev.from_cpu(&vec![1.0f32; 8*16], &Shape::from_slice(&[8,16]), DType::F32).unwrap();
+
+        // Warmup: load the rmsnorm_matmul module once.
+        let (_o, _h) = dev
+            .rmsnorm_matmul(x.as_ref(), w_norm.as_ref(), w_mat.as_ref(), 1e-5, &Shape::from_slice(&[4, 16]))
+            .unwrap();
+        let baseline = dev.module_load_stats();
+        assert!(baseline >= 1, "expected >=1 module loaded, got {}", baseline);
+
+        // Repeat many times: module load count must NOT increase.
+        for _ in 0..20 {
+            let (_o, _h) = dev
+                .rmsnorm_matmul(x.as_ref(), w_norm.as_ref(), w_mat.as_ref(), 1e-5, &Shape::from_slice(&[4, 16]))
+                .unwrap();
+        }
+        assert_eq!(
+            dev.module_load_stats(),
+            baseline,
+            "module cache reloaded rmsnorm_matmul across repeated dispatches"
+        );
+
+        // A second distinct kernel (qkv_attention) must load once, then reuse.
+        // num_heads must be a multiple of 4 (the kernel computes num_kv_heads =
+        // num_heads/4 and divides by it), so use [seq=4, heads=4, dim=8].
+        let q = dev.from_cpu(&vec![1.0f32; 4*4*8], &Shape::from_slice(&[4,4,8]), DType::F32).unwrap();
+        let (_o, _h) = dev
+            .qkv_attention(q.as_ref(), q.as_ref(), q.as_ref(), &Shape::from_slice(&[4,4,8]))
+            .unwrap();
+        let with_qkv = dev.module_load_stats();
+        assert_eq!(with_qkv, baseline + 1, "qkv_attention should load exactly 1 new module");
+        for _ in 0..10 {
+            let (_o, _h) = dev
+                .qkv_attention(q.as_ref(), q.as_ref(), q.as_ref(), &Shape::from_slice(&[4,4,8]))
+                .unwrap();
+        }
+        assert_eq!(
+            dev.module_load_stats(),
+            with_qkv,
+            "module cache reloaded qkv_attention across repeated dispatches"
+        );
+    }
+
+    #[test]
+    fn embedding_frees_temp_buffer_after_launch() {
+        // Regression: embedding allocated a temp idx buffer and freed it right
+        // after launch. With the per-launch sync removed (Item 2) it must still
+        // synchronize the stream before hipFree to avoid a use-after-free race.
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        if !env {
+            return;
+        }
+        let dev = RocmDevice::new(0);
+        let weight = dev.from_cpu(&vec![1.0f32; 16*8], &Shape::from_slice(&[16,8]), DType::F32).unwrap();
+        let indices: Vec<u32> = (0..4).collect();
+        let out_shape = Shape::from_slice(&[4, 8]);
+        let res = dev.embedding(weight.as_ref(), &indices, &out_shape);
+        assert!(res.is_ok(), "embedding must succeed without use-after-free: {:?}", res.err());
     }
 }
