@@ -78,6 +78,8 @@ pub enum HipMemcpyKind {
 unsafe extern "C" {
     pub fn hipMalloc(devPtr: *mut *mut c_void, size: usize) -> HipErrorT;
     pub fn hipFree(device: *mut c_void) -> HipErrorT;
+    pub fn hipHostMalloc(devPtr: *mut *mut c_void, size: usize, flags: u32) -> HipErrorT;
+    pub fn hipHostFree(ptr: *mut c_void) -> HipErrorT;
     pub fn hipMemcpy(
         dst: *mut c_void,
         src: *const c_void,
@@ -945,6 +947,104 @@ impl Drop for RocmStorage {
     }
 }
 
+/// A host-side staging buffer allocated with `hipHostMalloc` (pinned / page-locked
+/// memory). Pinned buffers transfer over PCIe/xGMI at full bandwidth with
+/// `hipMemcpyAsync`, whereas pageable `Vec` staging forces a slower bounce buffer.
+///
+/// This is the building block for the per-token decode hot path (feeding a sampled
+/// token in, reading logits out): the caller keeps one `RocmPinnedBuffer` per
+/// recurring transfer and reuses it across steps instead of allocating fresh each
+/// time. Cold-path / one-off transfers continue to use plain `Vec` + synchronous
+/// `hipMemcpy` via [`RocmStorage::copy_from_host`] / [`RocmStorage::to_cpu_vec_f32`].
+pub struct RocmPinnedBuffer<T> {
+    ptr: *mut T,
+    len: usize,
+    _marker: std::marker::PhantomData<T>,
+}
+
+// The buffer is only touched from the owning thread; the raw pointer is not shared.
+unsafe impl<T: Send> Send for RocmPinnedBuffer<T> {}
+
+impl<T: Copy> RocmPinnedBuffer<T> {
+    /// Allocate `len` elements of pinned host memory.
+    pub fn alloc(len: usize) -> Result<Self> {
+        if len == 0 {
+            return Ok(RocmPinnedBuffer {
+                ptr: std::ptr::null_mut(),
+                len: 0,
+                _marker: std::marker::PhantomData,
+            });
+        }
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        // flags = 0 → default portable pinned memory (hipHostMallocDefault).
+        let res = unsafe { hipHostMalloc(&mut ptr, len * std::mem::size_of::<T>(), 0) };
+        if res != hipSuccess {
+            return Err(Error::Backend(format!(
+                "hipHostMalloc failed with error code {}",
+                res
+            )));
+        }
+        Ok(RocmPinnedBuffer {
+            ptr: ptr as *mut T,
+            len,
+            _marker: std::marker::PhantomData,
+        })
+    }
+
+    /// Allocate pinned memory and copy `slice` into it.
+    pub fn from_slice(slice: &[T]) -> Result<Self> {
+        let mut buf = Self::alloc(slice.len())?;
+        if !slice.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(slice.as_ptr(), buf.ptr, slice.len());
+            }
+        }
+        Ok(buf)
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        if self.ptr.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        if self.ptr.is_null() {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+        }
+    }
+
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl<T> Drop for RocmPinnedBuffer<T> {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                let _ = hipHostFree(self.ptr as *mut c_void);
+            }
+        }
+    }
+}
+
 
 
 impl BackendStorage for RocmStorage {
@@ -1106,6 +1206,215 @@ impl RocmDevice {
     /// once (Item 2 acceptance: `module_cache_loads_each_kernel_once`).
     pub fn module_load_stats(&self) -> usize {
         self.module_load_count.load(Ordering::SeqCst)
+    }
+
+    /// Pinned-memory + async host→device upload for the per-token decode hot path.
+    /// Allocates a pinned staging buffer, copies `data` into it, and issues an
+    /// async `hipMemcpy` on the default stream (which overlaps with compute still
+    /// queued on other streams), draining only before returning. The cold-path
+    /// [`RocmDevice::from_cpu`] keeps using pageable `Vec` + synchronous `hipMemcpy`.
+    pub fn copy_from_host_async(
+        &self,
+        data: &[f32],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let pinned = RocmPinnedBuffer::<f32>::from_slice(data)?;
+        let mut storage = RocmStorage::alloc_gpu(shape, dtype.clone(), self)?;
+        if !storage.device_ptr_is_valid() {
+            return Err(Error::Backend("Invalid device pointer after alloc".into()));
+        }
+        let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
+        // Use a pooled compute stream so the copy can overlap with other queued
+        // work; sync only that stream (not the whole device) before returning.
+        let stream = self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut());
+        let res = unsafe {
+            hipMemcpyAsync(
+                dev_ptr_void,
+                pinned.as_ptr() as *const c_void,
+                storage.bytes,
+                HipMemcpyKind::HostToDevice,
+                stream,
+            )
+        };
+        if res != hipSuccess {
+            if storage.device_ptr.is_some() {
+                unsafe {
+                    let _ = hipFree(storage.device_ptr.unwrap() as *mut c_void);
+                }
+            }
+            return Err(Error::Backend(format!(
+                "hipMemcpyAsync(H2D) failed with error code {}",
+                res
+            )));
+        }
+        let sync = unsafe { hipStreamSynchronize(stream) };
+        if sync != hipSuccess {
+            if storage.device_ptr.is_some() {
+                unsafe {
+                    let _ = hipFree(storage.device_ptr.unwrap() as *mut c_void);
+                }
+            }
+            return Err(Error::Backend(format!(
+                "hipStreamSynchronize after async upload failed with error code {}",
+                sync
+            )));
+        }
+        Ok(Box::new(storage))
+    }
+
+    /// Like [`RocmDevice::copy_from_host_async`] but uploads from a caller-owned
+    /// pinned buffer that is reused across steps (no per-token `hipHostMalloc`).
+    /// The decode loop keeps one input pinned buffer and calls this each token.
+    pub fn upload_from_pinned(
+        &self,
+        src: &RocmPinnedBuffer<f32>,
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let mut storage = RocmStorage::alloc_gpu(shape, dtype.clone(), self)?;
+        if !storage.device_ptr_is_valid() {
+            return Err(Error::Backend("Invalid device pointer after alloc".into()));
+        }
+        let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
+        let stream = self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut());
+        let res = unsafe {
+            hipMemcpyAsync(
+                dev_ptr_void,
+                src.as_ptr() as *const c_void,
+                storage.bytes,
+                HipMemcpyKind::HostToDevice,
+                stream,
+            )
+        };
+        if res != hipSuccess {
+            if storage.device_ptr.is_some() {
+                unsafe {
+                    let _ = hipFree(storage.device_ptr.unwrap() as *mut c_void);
+                }
+            }
+            return Err(Error::Backend(format!(
+                "hipMemcpyAsync(H2D) failed with error code {}",
+                res
+            )));
+        }
+        let sync = unsafe { hipStreamSynchronize(stream) };
+        if sync != hipSuccess {
+            if storage.device_ptr.is_some() {
+                unsafe {
+                    let _ = hipFree(storage.device_ptr.unwrap() as *mut c_void);
+                }
+            }
+            return Err(Error::Backend(format!(
+                "hipStreamSynchronize after async upload failed with error code {}",
+                sync
+            )));
+        }
+        Ok(Box::new(storage))
+    }
+
+    /// Pinned-memory + async device→host download for the per-token decode hot path.
+    /// Downloads into an internal pinned staging buffer via async `hipMemcpy` and
+    /// returns a pageable `Vec<f32>` (what callers sample from). The cold-path
+    /// [`RocmStorage::to_cpu_vec_f32`] keeps using pageable `Vec` + synchronous
+    /// `hipMemcpy`.
+    pub fn read_to_host_async(&self, storage: &dyn BackendStorage) -> Result<Vec<f32>> {
+        let elem_count = storage.shape().elem_count();
+        let mut pinned = RocmPinnedBuffer::<f32>::alloc(elem_count)?;
+        let dev_ptr_void = match storage.as_any().downcast_ref::<RocmStorage>() {
+            Some(rs) => match rs.device_ptr {
+                Some(p) => p as *mut c_void,
+                None => {
+                    return Err(Error::Backend(
+                        "RocmStorage has no valid device pointer".into(),
+                    ));
+                }
+            },
+            None => {
+                return Err(Error::Backend(
+                    "read_to_host_async only supports RocmStorage".into(),
+                ));
+            }
+        };
+        let stream = self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut());
+        let res = unsafe {
+            hipMemcpyAsync(
+                pinned.as_mut_ptr() as *mut c_void,
+                dev_ptr_void,
+                elem_count * std::mem::size_of::<f32>(),
+                HipMemcpyKind::DeviceToHost,
+                stream,
+            )
+        };
+        if res != hipSuccess {
+            return Err(Error::Backend(format!(
+                "hipMemcpyAsync(D2H) failed with error code {}",
+                res
+            )));
+        }
+        let sync = unsafe { hipStreamSynchronize(stream) };
+        if sync != hipSuccess {
+            return Err(Error::Backend(format!(
+                "hipStreamSynchronize after async download failed with error code {}",
+                sync
+            )));
+        }
+        let mut out = vec![0.0f32; elem_count];
+        out.copy_from_slice(pinned.as_slice());
+        Ok(out)
+    }
+
+    /// Same as [`RocmDevice::read_to_host_async`] but downloads into a caller-owned
+    /// pinned buffer that is reused across steps (no per-token allocation). The
+    /// buffer is resized to `elem_count` if needed.
+    pub fn read_into_pinned(
+        &self,
+        storage: &dyn BackendStorage,
+        dst: &mut RocmPinnedBuffer<f32>,
+    ) -> Result<()> {
+        let elem_count = storage.shape().elem_count();
+        if dst.len() != elem_count {
+            *dst = RocmPinnedBuffer::<f32>::alloc(elem_count)?;
+        }
+        let dev_ptr_void = match storage.as_any().downcast_ref::<RocmStorage>() {
+            Some(rs) => match rs.device_ptr {
+                Some(p) => p as *mut c_void,
+                None => {
+                    return Err(Error::Backend(
+                        "RocmStorage has no valid device pointer".into(),
+                    ));
+                }
+            },
+            None => {
+                return Err(Error::Backend(
+                    "read_into_pinned only supports RocmStorage".into(),
+                ));
+            }
+        };
+        let stream = self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut());
+        let res = unsafe {
+            hipMemcpyAsync(
+                dst.as_mut_ptr() as *mut c_void,
+                dev_ptr_void,
+                elem_count * std::mem::size_of::<f32>(),
+                HipMemcpyKind::DeviceToHost,
+                stream,
+            )
+        };
+        if res != hipSuccess {
+            return Err(Error::Backend(format!(
+                "hipMemcpyAsync(D2H) failed with error code {}",
+                res
+            )));
+        }
+        let sync = unsafe { hipStreamSynchronize(stream) };
+        if sync != hipSuccess {
+            return Err(Error::Backend(format!(
+                "hipStreamSynchronize after async download failed with error code {}",
+                sync
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -3388,5 +3697,121 @@ mod tests {
                 &host[..nbytes.min(8)]
             );
         }
+    }
+
+    #[test]
+    fn host_transfer_pinned_async_matches_sync() {
+        // The pinned + async host-transfer path (Item 4) must produce results
+        // identical to the cold-path synchronous pageable path.
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        if !env {
+            return;
+        }
+        let dev = RocmDevice::new(0);
+        let shape = Shape::from_slice(&[64, 64]);
+        let data: Vec<f32> = (0..shape.elem_count())
+            .map(|i| (i as f32) * 0.1 - 5.0)
+            .collect();
+
+        // Cold path: pageable Vec + synchronous hipMemcpy.
+        let sync_storage = dev.from_cpu(&data, &shape, DType::F32).unwrap();
+        let sync_out = sync_storage.to_cpu_vec_f32().unwrap();
+
+        // Hot path: pinned buffer + async hipMemcpy.
+        let async_storage = dev.copy_from_host_async(&data, &shape, DType::F32).unwrap();
+        let async_out = dev.read_to_host_async(async_storage.as_ref()).unwrap();
+
+        assert_eq!(sync_out.len(), data.len());
+        assert_eq!(async_out.len(), data.len());
+        for i in 0..data.len() {
+            assert!(
+                (sync_out[i] - data[i]).abs() < 1e-3,
+                "sync round-trip mismatch at {i}: {} vs {}",
+                sync_out[i],
+                data[i]
+            );
+            assert!(
+                (async_out[i] - data[i]).abs() < 1e-3,
+                "pinned-async round-trip mismatch at {i}: {} vs {}",
+                async_out[i],
+                data[i]
+            );
+        }
+
+        // Reusable pinned buffer path (decode-loop steady state).
+        let mut pinned = RocmPinnedBuffer::<f32>::alloc(data.len()).unwrap();
+        let async_storage2 = dev.copy_from_host_async(&data, &shape, DType::F32).unwrap();
+        dev.read_into_pinned(async_storage2.as_ref(), &mut pinned)
+            .unwrap();
+        assert_eq!(pinned.as_slice(), data.as_slice());
+
+        // Reusable pinned buffer for the upload side too.
+        let pinned_in = RocmPinnedBuffer::<f32>::from_slice(&data).unwrap();
+        let async_storage3 = dev.upload_from_pinned(&pinned_in, &shape, DType::F32).unwrap();
+        let async_out3 = dev.read_to_host_async(async_storage3.as_ref()).unwrap();
+        for i in 0..data.len() {
+            assert!(
+                (async_out3[i] - data[i]).abs() < 1e-3,
+                "upload_from_pinned round-trip mismatch at {i}",
+            );
+        }
+    }
+
+    #[test]
+    fn host_transfer_pinned_async_benchmark() {
+        // Benchmark: per-token host round-trip latency, pageable+sync vs pinned+async.
+        // Mirrors the decode-loop transfer (feed a token in / read logits out).
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        if !env {
+            return;
+        }
+        let dev = RocmDevice::new(0);
+        // Logits-sized staging buffer (vocab ~32k floats), typical decode readback.
+        let n = 32_768;
+        let shape = Shape::from_slice(&[n]);
+        let data: Vec<f32> = (0..n).map(|i| (i as f32).sin()).collect();
+
+        let iters = 200;
+        let warmup = 20;
+
+        // Pageable + synchronous hipMemcpy round trip.
+        for _ in 0..warmup {
+            let s = dev.from_cpu(&data, &shape, DType::F32).unwrap();
+            let _ = s.to_cpu_vec_f32().unwrap();
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let s = dev.from_cpu(&data, &shape, DType::F32).unwrap();
+            let _ = s.to_cpu_vec_f32().unwrap();
+        }
+        let sync_elapsed = t0.elapsed();
+
+        // Pinned + async hipMemcpy round trip (reusing one pinned buffer for input
+        // and one for output, as the decode loop would across tokens).
+        let mut pinned_in = RocmPinnedBuffer::<f32>::from_slice(&data).unwrap();
+        let mut pinned_out = RocmPinnedBuffer::<f32>::alloc(n).unwrap();
+        for _ in 0..warmup {
+            let s = dev.upload_from_pinned(&pinned_in, &shape, DType::F32).unwrap();
+            dev.read_into_pinned(s.as_ref(), &mut pinned_out).unwrap();
+        }
+        let t1 = std::time::Instant::now();
+        for _ in 0..iters {
+            let s = dev.upload_from_pinned(&pinned_in, &shape, DType::F32).unwrap();
+            dev.read_into_pinned(s.as_ref(), &mut pinned_out).unwrap();
+        }
+        let async_elapsed = t1.elapsed();
+
+        let sync_us = sync_elapsed.as_secs_f64() * 1e6 / iters as f64;
+        let async_us = async_elapsed.as_secs_f64() * 1e6 / iters as f64;
+        println!(
+            "[Item 4 benchmark] pageable+sync={:.1} us/round-trip, pinned+async={:.1} us/round-trip ({:.2}x)",
+            sync_us, async_us, sync_us / async_us.max(1e-9)
+        );
+        // Sanity: pinned+async must not be catastrophically slower (bandwidth
+        // floor is the same memory, so at worst it's parity with the sync path).
+        assert!(
+            async_us <= sync_us * 4.0 + 1.0,
+            "pinned+async unexpectedly slower: {async_us:.1} vs {sync_us:.1} us"
+        );
     }
 }
