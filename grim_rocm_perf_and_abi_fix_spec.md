@@ -219,6 +219,13 @@ All matmuls go through single-GEMM `rocblas_sgemm`/`rocblas_gemm_ex`. Any batch 
 
 ## Item 7: `solution_index`/`algo` tuning (depends on Item 0)
 
+**Status (DONE):** Implemented and validated on gfx1036. 
+- `matmul_with_solution` added to `BackendDevice` trait with default fallback to `matmul`, and implemented in `RocmDevice` passing `solution_index` through to `rocblas_gemm_ex` (replacing hardcoded `0`). 
+- Offline tuning example `examples/tune_gemm.rs` compiles and runs end-to-end, sweeping solution indices 0..80 over representative Llama/Gemma decode shapes (M=1,8 x N=4096,11008 x K=4096). 
+- Static lookup table `lookup_solution_index(m,n,k,ArithType::F32)` checked into `src/lib.rs` with best indices found on gfx1036 (e.g., (1,4096,4096)→4, (8,4096,4096)→11, (1,11008,4096)→65, (8,11008,4096)→1; other dtypes fall back to 0). 
+- `matmul` now uses this table automatically; untuned shapes fall back to `solution_index=0`. 
+- All 44 lib tests pass; `tune_gemm` example runs successfully under `GRIM_RUN_GPU_TESTS=1`.
+
 Once Item 0 gives `rocblas_gemm_ex` real access to `algo` and `solution_index`, these are currently hardcoded to `0`/standard. Tie `solution_index` into the existing `lookup_gemm_config` shape-dispatch table: offline, use `rocblas_gemm_ex_get_solutions` to enumerate valid solutions for representative (m, n, k, dtype) shapes seen in real inference (prefill and decode), benchmark them, and record the fastest solution index per shape bucket. At runtime, `lookup_gemm_config` (or a new sibling table) returns a `solution_index` alongside its existing tile-config heuristics, and that value is passed into `rocblas_gemm_ex` instead of `0`.
 
 **The offline tuning deliverable already exists and is broken — fix it, don't create a new one.** `examples/tune_gemm.rs` in this repo already has the right shape (a sweep over representative `(m, n, k)` shapes benchmarking solution indices), but it calls a method, `matmul_with_solution`, that was never implemented anywhere in `src/lib.rs`, so the example does not compile. Implementing that method is part of this item, not a separate task — do not consider this item done while `examples/tune_gemm.rs` still fails to build. Its exact required signature:
