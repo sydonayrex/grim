@@ -544,8 +544,10 @@ fn gguf_dtype_for_quant_format(format: QuantFormat) -> GgufDType {
         QuantFormat::Q4K => GgufDType::Q4K,
         QuantFormat::Q5K => GgufDType::Q5K,
         QuantFormat::Q6K => GgufDType::Q6K,
+        QuantFormat::Fp4 | QuantFormat::Nf4 | QuantFormat::Fp8 => unimplemented!("fp4/nf4/fp8 quantization not implemented in CLI"),
     }
 }
+
 
 fn materialize_f32(bytes: &[u8], shape: &[usize], source_dtype: Option<GgufDType>) -> Result<Vec<f32>, String> {
     let elem_count = shape.iter().product::<usize>();

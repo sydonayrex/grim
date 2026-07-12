@@ -2409,7 +2409,7 @@ pub mod autotune;
 pub mod fusion;
 
 pub use fusion::{HipKernelLaunch, QkvAttentionFusionConfig, RmsNormMatMulFusionConfig, hipDim3};
-pub use kernels::qkv_attention::{BlockTableEntry, launch_paged_attention};
+pub use kernels::qkv_attention::{BlockTableEntry, launch_paged_attention, launch_tree_attention};
 
 pub mod device;
 pub mod gptq_kernel;
