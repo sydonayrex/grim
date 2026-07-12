@@ -1728,20 +1728,9 @@ pub mod quantization;
 pub use quantization::QuantMode;
 pub mod speculative;
 
-/// XNACK probe for unified memory availability.
-/// Returns true if concurrent page faulting is supported.
-pub fn probe_xnack(device_ordinal: usize) -> bool {
-    let mut val: i32 = 0;
-    unsafe {
-        hipSetDevice(device_ordinal as i32);
-        let status = hipDeviceGetAttribute(
-            &mut val,
-            HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS,
-            device_ordinal as i32,
-        );
-        status == hipSuccess && val == 1
-    }
-}
+
+// Device-feature probes — `probe_xnack` moved to `device::probe`.
+pub use crate::device::probe::probe_xnack;
 
 // Device helpers — `memcpy_with_xnack_fallback`, `jit_compile_hsaco`,
 // `upload_device_buffer` — moved to `device::helpers`.
