@@ -73,6 +73,10 @@ pub use crate::device::rocblas::{
     rocblas_status_success, RocblasInt, RocblasOperation, Rocblstatus,
     RoclabsHandle, rocblas_datatype, rocblas_gemm_algo, rocblas_gemm_flags,
     ROCBLAS_GEMM_FLAGS_NONE,
+    // gemm-tuning dispatch helper — picks the right `algo` enum from a
+    // non-zero `solution_index` lookup table entry, falling back to
+    // `rocblas_gemm_algo::standard` for `solution_index == 0`.
+    select_gemm_algo,
 };
 
 pub use crate::device::layout::{

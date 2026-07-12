@@ -69,6 +69,12 @@ use crate::{
     // rocBLAS FFI
     arith_to_compute_dtype, arith_to_rocblas_dtype, rocblas_create_handle,
     rocblas_destroy_handle, rocblas_gemm_ex, rocblas_gemm_strided_batched_ex,
+    // matmul / matmul_batched / matmul_with_solution route their
+    // `solution_index` lookup through `select_gemm_algo` so the rocBLAS
+    // `algo` argument gets bumped to `rocblas_gemm_algo::solution_index`
+    // when a non-zero tuned index is in scope (otherwise rocBLAS
+    // silently ignores the index, defeating the tune cache).
+    select_gemm_algo,
     rocblas_set_stream, rocblas_sgemm, rocblas_status_success, RocblasInt,
     RocblasOperation, Rocblstatus, RoclabsHandle, rocblas_datatype,
     rocblas_gemm_algo, rocblas_gemm_flags, ROCBLAS_GEMM_FLAGS_NONE,
@@ -666,7 +672,14 @@ impl RocmDevice {
                 (stride_d) as i64,
                 batch as RocblasInt,
                 compute_type,
-                rocblas_gemm_algo::standard,
+                // Per Item 7 + the §3.6 cross-task correction in
+                // grim_qkv_attention_kernel_spec.md: solution_index is
+                // *ignored* by rocBLAS unless algo == solution_index.
+                // `select_gemm_algo(0)` is `standard` so the throwaway
+                // 2x2 batch=2 warm-up GEMM (Item 6's "lazy rocBLAS JIT"
+                // pre-flush) stays on the default engine; nobody tunes
+                // that call because it never runs real inference.
+                select_gemm_algo(0),
                 0,
                 ROCBLAS_GEMM_FLAGS_NONE,
             );
@@ -1219,7 +1232,13 @@ impl BackendDevice for RocmDevice {
                     out_type,
                     n as RocblasInt,
                     compute_type,
-                    rocblas_gemm_algo::standard,
+                    // Wire `lookup_solution_index` to `algo` so rocBLAS actually
+                    // honors it. `select_gemm_algo(0)` returns `standard` (untuned
+                    // fallback); any non-zero solution_index gets
+                    // `rocblas_gemm_algo::solution_index`, the only enum variant
+                    // that tells rocBLAS to use the tuned index. See the §3.6
+                    // cross-task correction in grim_qkv_attention_kernel_spec.md.
+                    select_gemm_algo(solution_index),
                     solution_index as RocblasInt,
                     ROCBLAS_GEMM_FLAGS_NONE,
                 )
@@ -1370,7 +1389,13 @@ impl BackendDevice for RocmDevice {
                     out_type,
                     n as RocblasInt,
                     compute_type,
-                    rocblas_gemm_algo::standard,
+                    // Wire `lookup_solution_index` to `algo` so rocBLAS actually
+                    // honors it. `select_gemm_algo(0)` returns `standard` (untuned
+                    // fallback); any non-zero solution_index gets
+                    // `rocblas_gemm_algo::solution_index`, the only enum variant
+                    // that tells rocBLAS to use the tuned index. See the §3.6
+                    // cross-task correction in grim_qkv_attention_kernel_spec.md.
+                    select_gemm_algo(solution_index),
                     solution_index as RocblasInt,
                     ROCBLAS_GEMM_FLAGS_NONE,
                 )
