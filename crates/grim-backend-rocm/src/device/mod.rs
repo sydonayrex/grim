@@ -27,4 +27,5 @@ pub mod helpers;
 pub mod layout;
 pub mod probe;
 pub mod rocblas;
+pub mod roc_device;
 pub mod util;

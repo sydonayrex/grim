@@ -208,6 +208,20 @@ pub fn status_to_result(status: Rocblstatus, op: &'static str) -> Result<()> {
     }
 }
 
+/// Selects the appropriate rocBLAS GEMM algorithm mode based on the tuned solution index.
+///
+/// Under rocBLAS FFI specifications, passing a non-zero solution index has no effect
+/// unless the algorithm is explicitly set to `rocblas_gemm_algo::solution_index`.
+/// Otherwise, `rocblas_gemm_algo::standard` must be used for default dispatch behavior.
+pub fn select_gemm_algo(solution_index: i32) -> rocblas_gemm_algo {
+    if solution_index != 0 {
+        rocblas_gemm_algo::solution_index
+    } else {
+        rocblas_gemm_algo::standard
+    }
+}
+
+
 #[cfg(test)]
 mod rocblas_self_tests {
     use super::*;
