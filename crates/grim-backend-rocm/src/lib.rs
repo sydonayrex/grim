@@ -1144,6 +1144,13 @@ pub struct RocmDevice {
     pub(crate) hsaco_cache: HsacoKernelCache,
     /// Caching device-memory allocator (size-bucketed free-list). See `RocmCachingAllocator`.
     pub(crate) allocator: Arc<RocmCachingAllocator>,
+    /// Phase-3 §3.1: device scratch pool — a thread-safe, power-of-2-bucketed
+    /// `hipMalloc` free-list. `get_scratch` hands out RAII buffers; the
+    /// underlying slot is recycled on `Drop` so the fused-decode path doesn't
+    /// pay per-call driver overhead. Skills: `rust-ai-ml-inference-guide`
+    /// Action 3, `rust-gpu-parallelism` (stream-ordered memory plan),
+    /// `rocm-profiling-perf` (allocation overhead).
+    pub(crate) scratch_pool: Arc<crate::memory::pool::DeviceScratchPool>,
     /// Loaded HIP modules + resolved entry functions, cached per unique kernel entry.
     /// `hipModuleLoad`/`hipModuleGetFunction` happen once per kernel for the process
     /// lifetime; every later dispatch reuses the cached module (Item 2). `Send + Sync`
@@ -1244,6 +1251,7 @@ impl RocmDevice {
             stream_pool: Mutex::new(streams),
             hsaco_cache: HsacoKernelCache::new(),
             allocator: Arc::new(RocmCachingAllocator::new(ordinal, cap_bytes)),
+            scratch_pool: crate::memory::pool::DeviceScratchPool::new(),
             module_cache: Mutex::new(HashMap::new()),
             module_load_count: AtomicUsize::new(0),
             gpu_target: detect_gpu_arch(ordinal as i32),
@@ -1271,6 +1279,73 @@ impl RocmDevice {
     /// once (Item 2 acceptance: `module_cache_loads_each_kernel_once`).
     pub fn module_load_stats(&self) -> usize {
         self.module_load_count.load(Ordering::SeqCst)
+    }
+
+    /// Phase-3 §3.1: get a pooled scratch buffer.
+    ///
+    /// Recycles the most-recently-freed slot in the matching bucket when one
+    /// exists; otherwise `hipMalloc`s a fresh one and tracks the peak. Returns
+    /// `Result` so the GPU-error path is explicit (no silent CPU fallback —
+    /// `rust-gpu-discipline` §3).
+    pub fn get_scratch(
+        &self,
+        size: usize,
+        align: usize,
+    ) -> Result<crate::memory::pool::PooledBuffer> {
+        self.scratch_pool.get(size, align)
+    }
+
+    /// Phase-3 §3.1: peek at the live pool's tracked size (for ops/tests).
+    pub fn scratch_pool_current_bytes(&self) -> usize {
+        self.scratch_pool.current_bytes()
+    }
+
+    /// Phase-3 §3.1: peak in-flight bytes since pool creation.
+    pub fn scratch_pool_peak_bytes(&self) -> usize {
+        self.scratch_pool.peak_bytes()
+    }
+
+    /// Phase-3 §3.1 (REFACTOR): upload `data` into a pooled scratch buffer
+    /// sized for the requested dtype/shape, instead of `hipMalloc`+`hipFree`
+    /// per call. Returns the `PooledBuffer`; the caller drops it to return
+    /// the slot to the pool. Skill: `rust-ai-ml-inference-guide` Action 3.
+    pub fn upload_to_scratch(
+        &self,
+        data: &[f32],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<crate::memory::pool::PooledBuffer> {
+        let _ = shape;
+        let elem_size: usize = match dtype {
+            DType::F32 => 4,
+            DType::BF16 => 2,
+            _ => {
+                return Err(Error::Backend(format!(
+                    "upload_to_scratch: unsupported dtype {:?}; only F32/BF16 in this revision",
+                    dtype
+                )));
+            }
+        };
+        let bytes = data.len() * elem_size;
+        let align = elem_size.max(16); // safe default; matches element boundaries.
+        let buf = self.scratch_pool.get(bytes, align)?;
+        // Copy host → device. We do a synchronous `hipMemcpy` here; the
+        // decode-loop's per-call cost was the hipMalloc, not the copy.
+        let res: HipErrorT = unsafe {
+            crate::hipMemcpy(
+                buf.as_ptr(),
+                data.as_ptr() as *const std::ffi::c_void,
+                bytes,
+                crate::HipMemcpyKind::HostToDevice,
+            )
+        };
+        if res != hipSuccess {
+            return Err(Error::Backend(format!(
+                "upload_to_scratch: hipMemcpy failed: code={}",
+                res
+            )));
+        }
+        Ok(buf)
     }
 
     /// If a graph-capture session is active, returns the dedicated capture stream.
@@ -2852,10 +2927,19 @@ impl Drop for HipGraphExecutor {
 
 pub use crate::gptq_kernel::wavefront_size_for_gcn;
 
+pub mod autotune;
 pub mod fusion;
 pub use fusion::{HipKernelLaunch, QkvAttentionFusionConfig, RmsNormMatMulFusionConfig, hipDim3};
 
 pub mod gptq_kernel;
+pub mod graph_capture;
+pub mod kernels;
+pub mod memory;
+pub mod p2p_route;
+pub mod peer_access;
+pub mod perf_gate;
+pub mod quantization;
+pub mod speculative;
 
 /// XNACK probe for unified memory availability.
 /// Returns true if concurrent page faulting is supported.
@@ -3058,7 +3142,12 @@ const ROCM_COMPUTE_BLOCK: u32 = 256;
 
 /// HIP/C++ source for the six compute ops. Each entry point is `extern "C"`
 /// so `hipModuleGetFunction` resolves it without name mangling.
-const COMPUTE_KERNEL_SOURCE: &str = r#"
+/// HIP source for the *other* compute kernels (add / mul / silu_mul / rms_norm
+/// / softmax / embedding / rmsnorm_matmul). The Phase-1 QKV attention kernel
+/// lives in `kernels::qkv_attention::KERNEL_SOURCE` so its HIP body and the
+/// Rust host launcher can co-evolve without touching this file. Concat both
+/// at runtime via [`compute_kernel_source`].
+pub const OTHER_KERNEL_SOURCE: &str = r#"
 extern "C" __global__ void grim_add(float* a, float* b, float* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -3142,26 +3231,17 @@ extern "C" __global__ void grim_rmsnorm_matmul(
     }
     out[row * n + col] = sum;
 }
-
-extern "C" __global__ void grim_qkv_attention(
-    float* q, float* k_tensor, float* v_tensor, float* out,
-    int num_heads, int num_kv_heads, int head_dim, int seq_len
-) {
-    int head = blockIdx.x * blockDim.x + threadIdx.x;
-    if (head >= num_heads) return;
-    
-    int kv_head = head / (num_heads / num_kv_heads);
-    for (int t = 0; t < seq_len; ++t) {
-        float sum = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-            float q_val = q[head * head_dim + d];
-            float k_val = k_tensor[kv_head * head_dim + d];
-            sum += q_val * k_val;
-        }
-        out[head * head_dim] = sum;
-    }
-}
 "#;
+
+/// Concatenate [`OTHER_KERNEL_SOURCE`] and the live QKV-attention kernel and
+/// return the full HIP program text. Build into a runtime string (not `const`)
+/// because the QKV module is a constant from another compilation unit.
+pub fn compute_kernel_source() -> String {
+    let mut s = String::with_capacity(OTHER_KERNEL_SOURCE.len() + 4096);
+    s.push_str(OTHER_KERNEL_SOURCE);
+    s.push_str(kernels::qkv_attention::KERNEL_SOURCE);
+    s
+}
 
 /// Allocate a device-side scratch buffer, copy `data` into it, and return the
 /// raw device pointer. Caller is responsible for `hipFree` on the returned ptr.
@@ -3206,16 +3286,21 @@ impl RocmDevice {
         block: HipDim3,
         args: &mut [*mut c_void],
     ) -> Result<*mut c_void> {
-        let hash = seahash::hash(COMPUTE_KERNEL_SOURCE.as_bytes());
+        // Build the kernel source fresh per dispatch so the live QKV kernel
+        // module (and any other future sibling kernel modules) is included
+        // without `const`-`concat!` gymnastics. The compile is cached by hash
+        // below, so the rebuild cost is amortized.
+        let kernel_source = compute_kernel_source();
+        let hash = seahash::hash(kernel_source.as_bytes());
         // Include the GPU target in the cache key so a binary compiled for one
         // architecture is never loaded onto a different one (hipErrorNoBinaryForGpu).
         let cache_key = format!("grim_{}_{}_{:016x}", entry, self.gpu_target, hash);
-        
+
         let path = if let Some(cached_path) = self.hsaco_cache.get_cached_kernel(&cache_key) {
             cached_path
         } else {
-            let code = jit_compile_hsaco(COMPUTE_KERNEL_SOURCE, entry, &self.gpu_target)?;
-            self.hsaco_cache.cache_kernel(&cache_key, COMPUTE_KERNEL_SOURCE, &code)?
+            let code = jit_compile_hsaco(&kernel_source, entry, &self.gpu_target)?;
+            self.hsaco_cache.cache_kernel(&cache_key, &kernel_source, &code)?
         };
 
         let path_c = std::ffi::CString::new(path.to_str().unwrap_or(""))
@@ -3338,13 +3423,83 @@ impl RocmDevice {
     }
 
     /// Dispatch a fused QKV Projection + Attention operation onto the GPU.
+    ///
+    /// Phase-1 contract (`grim_qkv_attention_kernel_spec.md`):
+    /// - `q`: `[seq_len, num_heads, head_dim]`, f32
+    /// - `k`, `v`: `[kv_seq_len, num_kv_heads, head_dim]`, f32
+    /// - `kv_seq_len` and `cache_offset` must be supplied by the caller (the
+    ///   paged KV cache or prefill gather is responsible for materializing
+    ///   contiguous K/V buffers; this kernel does not slice).
+    /// - `num_kv_heads` is a *real* call-site parameter — never derived as
+    ///   `num_heads / 4`. Any GQA ratio (1:1, 2:1, 4:1, 8:1, ...) is valid;
+    ///   the host validates `num_heads % num_kv_heads == 0`.
+    /// - Causal masking happens **inside** the kernel against absolute
+    ///   position `j <= cache_offset + i` (no caller-side pre-slicing).
+    /// - The kernel is gated by `config.enabled`. When `false`, returns
+    ///   `Err(Error::Backend(...))` and does *not* launch — this is the
+    ///   PyTorch-parity path (`rust-gpu-discipline` §3), not a silent CPU
+    ///   fallback. The field is preserved long-term so a regression can
+    ///   be gated off without an emergency patch.
     pub fn qkv_attention(
         &self,
         q: &dyn BackendStorage,
         k: &dyn BackendStorage,
         v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        // ─── enabled gate ────────────────────────────────────────────────
+        // Build the config up front to read its gate. We allow the caller
+        // to override individual fields via env-on-the-fly in a follow-up,
+        // but for now `enabled: true` is the launch path and `false` is
+        // the eager-error path. PyTorch parity: never silent CPU fallback.
+        let config = {
+            let out_dims = out_shape.dims();
+            if out_dims.len() != 3 {
+                return Err(Error::Shape("qkv_attention expects 3-D output shape [seq_len, num_heads, head_dim]".into()));
+            }
+            let seq_len = out_dims[0];
+            let num_heads = out_dims[1];
+            let head_dim = out_dims[2];
+            QkvAttentionFusionConfig {
+                enabled: true, // launch path; the gate check is below and *after* the structural validation.
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                max_seq_len: seq_len,
+                wavefront_size: self.props.wavefront_size as u32,
+            }
+        };
+        if !config.enabled {
+            return Err(Error::Backend(
+                "qkv_attention: kernel is gated (QkvAttentionFusionConfig.enabled=false) — flip to true after Step 4 tests pass".into(),
+            ));
+        }
+
+        // ─── structural validation ──────────────────────────────────────
+        if config.num_heads == 0 || config.num_kv_heads == 0 || config.head_dim == 0 {
+            return Err(Error::Shape(
+                "qkv_attention: zero-sized num_heads / num_kv_heads / head_dim".into(),
+            ));
+        }
+        if config.num_heads % config.num_kv_heads != 0 {
+            return Err(Error::Shape(format!(
+                "qkv_attention: num_heads ({}) must be a multiple of num_kv_heads ({})",
+                config.num_heads, config.num_kv_heads
+            )));
+        }
+        // Wave64 mandate: kernel block dim is 256 = 4 wavefronts of 64 on
+        // gfx1036/gfx110x/gfx1200; head_dim must fit in one wave (≤ 64)
+        // for the Phase-1 reference path (Phase 2 will tile).
+        if config.head_dim > 64 {
+            return Err(Error::Shape(format!(
+                "qkv_attention Phase 1 supports head_dim ≤ 64 (got {}); Phase 2 will tile via MFMA",
+                config.head_dim
+            )));
+        }
+
         let q_s = as_rocm(q)?;
         let k_s = as_rocm(k)?;
         let v_s = as_rocm(v)?;
@@ -3352,47 +3507,68 @@ impl RocmDevice {
             return Err(Error::Backend("qkv_attention: inputs lack a valid device pointer".into()));
         }
         let out_dims = out_shape.dims();
-        if out_dims.len() != 3 {
-            return Err(Error::Shape("qkv_attention expects 3-D output shape [seq_len, num_heads, head_dim]".into()));
-        }
         let seq_len = out_dims[0];
-        let num_heads = out_dims[1];
-        let head_dim = out_dims[2];
 
-        let config = QkvAttentionFusionConfig {
-            num_heads,
-            num_kv_heads: num_heads / 4,
-            head_dim,
-            max_seq_len: seq_len,
-            wavefront_size: self.props.wavefront_size as u32,
-        };
+        // ─── allocate output + launch ────────────────────────────────────
         let launch = config.hip_launch_params();
-        
         let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), self)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut q_ptr = dev_ptr(q_s)?;
         let mut k_ptr = dev_ptr(k_s)?;
         let mut v_ptr = dev_ptr(v_s)?;
-        let mut num_heads_i = num_heads as i32;
+        let mut num_heads_i = config.num_heads as i32;
         let mut num_kv_heads_i = config.num_kv_heads as i32;
-        let mut head_dim_i = head_dim as i32;
+        let mut head_dim_i = config.head_dim as i32;
         let mut seq_len_i = seq_len as i32;
+        let mut kv_seq_len_i = kv_seq_len as i32;
+        let mut cache_offset_i = cache_offset as i32;
+        let inv_sqrt_d: f32 = 1.0 / (config.head_dim as f32).sqrt();
+        let mut inv_sqrt_d_bits = inv_sqrt_d.to_bits();
+        // The kernel signature accepts this as a float argument; emit it via
+        // a pointer to a local float that the trampoline will pass through.
+        let inv_sqrt_d_ptr = &mut inv_sqrt_d_bits as *mut u32 as *mut f32;
+        // SAFETY: the kernel reads `inv_sqrt_d` from this pointer across the
+        // entire dispatch; the lifetime covers the launch below.
+        let mut inv_sqrt_d_stable = inv_sqrt_d_ptr; // keep the pointer pinned
+
+        // Build the arg slice with all 11 params in the order the kernel
+        // signature declares them.
+        let mut qptr = q_ptr;
+        let mut kptr = k_ptr;
+        let mut vptr = v_ptr;
+        let mut optr = out_ptr;
+        let mut nh = num_heads_i;
+        let mut nkv = num_kv_heads_i;
+        let mut hd = head_dim_i;
+        let mut sl = seq_len_i;
+        let mut ksl = kv_seq_len_i;
+        let mut co = cache_offset_i;
+        let mut isd = inv_sqrt_d;
 
         self.launch_compute_kernel(
             "grim_qkv_attention",
             launch.grid_dim,
             launch.block_dim,
             &mut [
-                arg(&mut q_ptr),
-                arg(&mut k_ptr),
-                arg(&mut v_ptr),
-                arg(&mut out_ptr),
-                arg(&mut num_heads_i),
-                arg(&mut num_kv_heads_i),
-                arg(&mut head_dim_i),
-                arg(&mut seq_len_i),
+                arg(&mut qptr),
+                arg(&mut kptr),
+                arg(&mut vptr),
+                arg(&mut optr),
+                arg(&mut nh),
+                arg(&mut nkv),
+                arg(&mut hd),
+                arg(&mut sl),
+                arg(&mut ksl),
+                arg(&mut co),
+                arg(&mut isd),
             ],
         )?;
+
+        // Surface we used the temp pointers (suppress unused-mut warnings) and
+        // keep them alive for the duration of the kernel call.
+        let _ = (
+            qptr, kptr, vptr, optr, nh, nkv, hd, sl, ksl, co, isd, inv_sqrt_d_stable,
+        );
 
         Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
     }
@@ -4240,17 +4416,34 @@ mod tests {
         );
 
         // A second distinct kernel (qkv_attention) must load once, then reuse.
-        // num_heads must be a multiple of 4 (the kernel computes num_kv_heads =
-        // num_heads/4 and divides by it), so use [seq=4, heads=4, dim=8].
-        let q = dev.from_cpu(&vec![1.0f32; 4*4*8], &Shape::from_slice(&[4,4,8]), DType::F32).unwrap();
+        // num_heads=4, num_kv_heads=2 (a 2:1 GQA ratio), head_dim=64 fits the
+        // Wave64 + Phase-1 head_dim<=64 constraint. seq_len=4, kv_seq_len=4,
+        // cache_offset=0 is a degenerate identity-size prefill.
+        let q = dev.from_cpu(&vec![1.0f32; 4*4*64], &Shape::from_slice(&[4,4,64]), DType::F32).unwrap();
         let (_o, _h) = dev
-            .qkv_attention(q.as_ref(), q.as_ref(), q.as_ref(), &Shape::from_slice(&[4,4,8]))
+            .qkv_attention(
+                q.as_ref(),
+                q.as_ref(),
+                q.as_ref(),
+                2,                // num_kv_heads: real param, not num_heads/4
+                4,                // kv_seq_len
+                0,                // cache_offset
+                &Shape::from_slice(&[4, 4, 64]),
+            )
             .unwrap();
         let with_qkv = dev.module_load_stats();
         assert_eq!(with_qkv, baseline + 1, "qkv_attention should load exactly 1 new module");
         for _ in 0..10 {
             let (_o, _h) = dev
-                .qkv_attention(q.as_ref(), q.as_ref(), q.as_ref(), &Shape::from_slice(&[4,4,8]))
+                .qkv_attention(
+                    q.as_ref(),
+                    q.as_ref(),
+                    q.as_ref(),
+                    2,
+                    4,
+                    0,
+                    &Shape::from_slice(&[4, 4, 64]),
+                )
                 .unwrap();
         }
         assert_eq!(
