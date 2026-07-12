@@ -50,172 +50,18 @@ pub use crate::device::handles::{
     WavefrontSize, hipSuccess,
 };
 
-pub type Rocblstatus = i32;
-pub const rocblas_status_success: Rocblstatus = 0;
-
-#[repr(i32)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum RocblasOperation {
-    None = 111,                  // rocblas_operation_none
-    Transpose = 112,             // rocblas_operation_transpose
-    ConjugateTranspose = 113,    // rocblas_operation_conjugate_transpose
-}
-
-pub type RocblasInt = i32;
-
-/// Opaque rocBLAS handle. rocBLAS handles are thread-safe according to the library docs.
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy)]
-pub struct RoclabsHandle(pub *mut c_void);
-
-unsafe impl Send for RoclabsHandle {}
-unsafe impl Sync for RoclabsHandle {}
-
-#[link(name = "rocblas", kind = "dylib")]
-unsafe extern "C" {
-    pub fn rocblas_create_handle(handle: *mut RoclabsHandle) -> Rocblstatus;
-    pub fn rocblas_destroy_handle(handle: RoclabsHandle) -> Rocblstatus;
-    
-    pub fn rocblas_sgemm(
-        handle: RoclabsHandle,
-        trans_a: RocblasOperation,
-        trans_b: RocblasOperation,
-        m: RocblasInt,
-        n: RocblasInt,
-        k: RocblasInt,
-        alpha: *const f32,
-        A: *const f32,
-        lda: RocblasInt,
-        B: *const f32,
-        ldb: RocblasInt,
-        beta: *const f32,
-        C: *mut f32,
-        ldc: RocblasInt,
-    ) -> Rocblstatus;
-    
-    // rocBLAS extended GEMM with explicit datatypes / mixed precision (rocm-aiter).
-    // Signature matches rocblas_gemm_ex exactly (24 args, see rocblas-functions.h).
-    pub fn rocblas_gemm_ex(
-        handle: RoclabsHandle,
-        trans_a: RocblasOperation,
-        trans_b: RocblasOperation,
-        m: RocblasInt,
-        n: RocblasInt,
-        k: RocblasInt,
-        alpha: *const c_void,
-        a: *const c_void,
-        a_type: rocblas_datatype,
-        lda: RocblasInt,
-        b: *const c_void,
-        b_type: rocblas_datatype,
-        ldb: RocblasInt,
-        beta: *const c_void,
-        c: *mut c_void,
-        c_type: rocblas_datatype,
-        ldc: RocblasInt,
-        d: *mut c_void,
-        d_type: rocblas_datatype,
-        ldd: RocblasInt,
-        compute_type: rocblas_datatype,
-        algo: rocblas_gemm_algo,
-        solution_index: RocblasInt,
-        flags: rocblas_gemm_flags,
-    ) -> Rocblstatus;
-
-    // rocBLAS strided-batched extended GEMM (one call collapses `batch_count`
-    // same-shape GEMMs). Signature matches rocblas_gemm_strided_batched_ex exactly
-    // (29 args, verified against rocBLAS docs/rocblas-functions.h): it is gemm_ex
-    // with a `rocblas_stride` inserted after each of lda/ldb/ldc/ldd, plus
-    // `batch_count` immediately before `compute_type`. `rocblas_stride` is int64_t.
-    pub fn rocblas_gemm_strided_batched_ex(
-        handle: RoclabsHandle,
-        trans_a: RocblasOperation,
-        trans_b: RocblasOperation,
-        m: RocblasInt,
-        n: RocblasInt,
-        k: RocblasInt,
-        alpha: *const c_void,
-        a: *const c_void,
-        a_type: rocblas_datatype,
-        lda: RocblasInt,
-        stride_a: i64,
-        b: *const c_void,
-        b_type: rocblas_datatype,
-        ldb: RocblasInt,
-        stride_b: i64,
-        beta: *const c_void,
-        c: *const c_void,
-        c_type: rocblas_datatype,
-        ldc: RocblasInt,
-        stride_c: i64,
-        d: *mut c_void,
-        d_type: rocblas_datatype,
-        ldd: RocblasInt,
-        stride_d: i64,
-        batch_count: RocblasInt,
-        compute_type: rocblas_datatype,
-        algo: rocblas_gemm_algo,
-        solution_index: RocblasInt,
-        flags: rocblas_gemm_flags,
-    ) -> Rocblstatus;
-    pub fn rocblas_set_stream(handle: RoclabsHandle, stream: *mut c_void) -> Rocblstatus;
-}
-
-// rocBLAS data types. Discriminants match the official rocBLAS `rocblas_datatype`
-// enum (see rocblas/rocblas-types.h). Passing the wrong integer here silently
-// yields rocblas_status_invalid_value and zeroes the output.
-#[repr(i32)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum rocblas_datatype {
-    f16_r = 150,
-    f32_r = 151,
-    f64_r = 152,
-    f16_c = 153,
-    f32_c = 154,
-    f64_c = 155,
-    i8_r = 160,
-    u8_r = 161,
-    i32_r = 162,
-    u32_r = 163,
-    i8_c = 164,
-    u8_c = 165,
-    i32_c = 166,
-    u32_c = 167,
-    bf16_r = 168,
-    bf16_c = 169,
-    invalid = 255,
-}
-
-/// GEMM algorithm selector (rocblas_gemm_algo).
-#[repr(i32)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum rocblas_gemm_algo {
-    standard = 0x0,
-    solution_index = 0x1,
-}
-
-/// GEMM control flags (rocblas_gemm_flags). Bitmask; 0x0 = none.
-pub type rocblas_gemm_flags = u32;
-pub const ROCBLAS_GEMM_FLAGS_NONE: rocblas_gemm_flags = 0x0;
-
-/// Maps Grim `ArithType` to the corresponding `rocblas_datatype` enum value.
-/// Falls back to `f32_r` for unknown or unsupported types.
-pub fn arith_to_rocblas_dtype(arith: ArithType) -> rocblas_datatype {
-    match arith {
-        ArithType::F32 => rocblas_datatype::f32_r,
-        ArithType::F16 => rocblas_datatype::f16_r,
-        ArithType::BF16 => rocblas_datatype::bf16_r,
-        ArithType::I64 | ArithType::U32 => rocblas_datatype::i32_r,
-        ArithType::U8 => rocblas_datatype::u8_r,
-    }
-}
-
-/// Maps Grim `ArithType` to the rocBLAS compute (accumulation) datatype.
-/// Mixed-precision GEMMs accumulate in FP32 regardless of the input precision
-/// (FP16/BF16 -> FP32) for numerical stability.
-pub fn arith_to_compute_dtype(_arith: ArithType) -> rocblas_datatype {
-    rocblas_datatype::f32_r
-}
+// rocBLAS FFI surface — handle type, enums (operation / datatype / algo),
+// flag typedef, status constants, raw rocBLAS function declarations,
+// and the ArithType→rocblas_datatype mapping helpers. Re-exported
+// here so existing call sites see no API change.
+pub use crate::device::rocblas::{
+    arith_to_compute_dtype, arith_to_rocblas_dtype,
+    rocblas_create_handle, rocblas_destroy_handle, rocblas_gemm_ex,
+    rocblas_gemm_strided_batched_ex, rocblas_set_stream, rocblas_sgemm,
+    rocblas_status_success, RocblasInt, RocblasOperation, Rocblstatus,
+    RoclabsHandle, rocblas_datatype, rocblas_gemm_algo, rocblas_gemm_flags,
+    ROCBLAS_GEMM_FLAGS_NONE,
+};
 
 // Weight / KV / wavefront-tiled layout helpers — moved to
 // `device::layout` (KvLayout, WeightLayout, WavefrontTiledLayout, plus
