@@ -4,3 +4,5 @@
 //! touching the rest of the backend. Phase-1 qkv_attention lives here.
 
 pub mod qkv_attention;
+pub mod compute_kernels;
+
