@@ -2109,8 +2109,10 @@ pub use crate::kernels::jit_cache::HsacoKernelCache;
 //
 // Kernels are JIT-compiled through `jit_compile_hsaco` (already wired to
 // libamdhip64) and dispatched through the module-launch FFI below.
-
-const ROCM_COMPUTE_BLOCK: u32 = 256;
+//
+// `ROCM_COMPUTE_BLOCK` (the Wave64-tuned 256-thread default) now lives
+// in `device::util`; it was the only piece of this comment block that
+// wasn't already extracted elsewhere.
 
 pub use crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE;
 
@@ -2435,93 +2437,15 @@ impl RocmDevice {
     }
 }
 
-/// Grid/block dims for a 1-D launch over `total` elements.
-fn linear_launch(total: usize) -> (HipDim3, HipDim3) {
-    let grid = ((total as u32) + ROCM_COMPUTE_BLOCK - 1) / ROCM_COMPUTE_BLOCK;
-    (HipDim3::new(grid, 1, 1), HipDim3::new(ROCM_COMPUTE_BLOCK, 1, 1))
-}
+// Module-level helpers moved to `device::util`. Re-exported here so
+// the existing call sites (and lib_internal_tests) see no API change.
+pub use crate::device::util::{
+    arg, as_rocm, dev_ptr, detect_gpu_arch, dtype_byte_size, dtype_f32,
+    gpu_target_arch, gpu_target_flag, linear_launch, ROCM_COMPUTE_BLOCK,
+};
 
-/// Helper: downcast a `BackendStorage` to `RocmStorage`, returning a clear error
-/// if the input is not ROCm-resident.
-fn as_rocm<'a>(s: &'a dyn BackendStorage) -> Result<&'a RocmStorage> {
-    s.as_any()
-        .downcast_ref::<RocmStorage>()
-        .ok_or_else(|| Error::Backend("expected RocmStorage input".into()))
-}
 
-/// Helper: require a valid device pointer on a `RocmStorage`.
-fn dev_ptr(s: &RocmStorage) -> Result<u64> {
-    s.device_ptr
-        .ok_or_else(|| Error::Backend("RocmStorage has no device pointer".into()))
-}
-
-/// Helper: turn a mutable borrow of a kernel argument into the `*mut c_void`
-/// slot the HIP module-launch ABI expects. Each arg is passed by pointer.
-fn arg<T>(v: &mut T) -> *mut c_void {
-    v as *mut T as *mut c_void
-}
-
-/// Build the AMD-clang hipRTC `--offload-arch=<arch>` option. Defaults to
-/// `gfx900` to preserve historical CDNA builds; override via `GRIM_GPU_TARGET`.
-fn gpu_target_arch() -> String {
-    std::env::var("GRIM_GPU_TARGET").unwrap_or_else(|_| "gfx900".into())
-}
-
-/// Query the device's real gfx target so JIT-compiled kernels always match the
-/// GPU, independent of the process-global `GRIM_GPU_TARGET` env (which other
-/// tests flip via `temp_env` and would otherwise race with device creation).
-fn detect_gpu_arch(device: i32) -> String {
-    // `hipDeviceProp_t` is version-sensitive and large; rather than redefining
-    // it, dump the properties into an over-sized zeroed buffer and scan for the
-    // `gcnArchName` token (a NUL-terminated "gfx<hex>" string). This is robust
-    // to field reordering and alignment differences across ROCm releases.
-    let mut buf = vec![0u8; 8192];
-    unsafe {
-        if hipGetDeviceProperties(buf.as_mut_ptr() as *mut c_void, device) == 0 {
-            let mut i = 0;
-            while i + 3 < buf.len() {
-                if buf[i] == b'g' && buf[i + 1] == b'f' && buf[i + 2] == b'x' {
-                    let start = i;
-                    let mut end = start;
-                    while end < buf.len() && buf[end] != 0 {
-                        end += 1;
-                    }
-                    let s = std::str::from_utf8(&buf[start..end]).unwrap_or("");
-                    let base: String = s.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
-                    if base.starts_with("gfx") {
-                        return base;
-                    }
-                    i = end + 1;
-                } else {
-                    i += 1;
-                }
-            }
-        }
-    }
-    gpu_target_arch()
-}
-
-fn gpu_target_flag(arch: &str) -> std::ffi::CString {
-    std::ffi::CString::new(format!("--offload-arch={arch}"))
-        .expect("GRIM_GPU_TARGET contains interior NUL")
-}
-
-/// Build the canonical F32 native dtype used by every compute op in this crate.
-pub fn dtype_f32() -> DType {
-    DType { arith: ArithType::F32, storage: DTypeStorage::Native }
-}
-
-/// Helper function to retrieve the size in bytes of a data type.
-pub fn dtype_byte_size(dtype: &DType) -> usize {
-    match dtype.arith {
-        ArithType::F32 | ArithType::U32 => 4,
-        ArithType::F16 | ArithType::BF16 => 2,
-        ArithType::I64 => 8,
-        ArithType::U8 => 1,
-    }
-}
-
-#[cfg(test)]
+#[cfg(test)] 
 
 
 #[cfg(test)]
