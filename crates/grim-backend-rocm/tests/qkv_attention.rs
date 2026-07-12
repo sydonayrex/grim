@@ -503,3 +503,41 @@ fn qkv_attention_gpu_rejects_bad_gqa_ratio() {
     );
     assert!(res.is_err(), "bad GQA ratio must surface as Err; got Ok");
 }
+
+/// GPU-gated: when kv_seq_len is 0, the kernel must not divide by zero and produce NaN.
+#[test]
+fn qkv_attention_gpu_zero_kv_seq_len_not_nan() {
+    let env = std::env::var(GPU_TEST_ENV).is_ok();
+    if !env {
+        return;
+    }
+    let dev = RocmDevice::new(0);
+    let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len, cache_offset) =
+        (4_usize, 4, 4, 8, 0, 0);
+
+    let q_data: Vec<f32> = vec![0.5f32; seq_len * num_heads * head_dim];
+    let k_data: Vec<f32> = vec![];
+    let v_data: Vec<f32> = vec![];
+    let out_shape = Shape::from_slice(&[seq_len, num_heads, head_dim]);
+
+    let q_buf = dev.from_cpu(&q_data, &out_shape, DType::F32).unwrap();
+    let k_buf = dev.from_cpu(&k_data, &Shape::from_slice(&[0, num_kv_heads, head_dim]), DType::F32).unwrap();
+    let v_buf = dev.from_cpu(&v_data, &Shape::from_slice(&[0, num_kv_heads, head_dim]), DType::F32).unwrap();
+
+    let (out, _h) = dev
+        .qkv_attention(
+            q_buf.as_ref(),
+            k_buf.as_ref(),
+            v_buf.as_ref(),
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset as u32,
+            &out_shape,
+        )
+        .unwrap();
+    let got = out.to_cpu_vec_f32().unwrap();
+    for x in got {
+        assert!(!x.is_nan(), "GPU output must not be NaN for empty KV cache");
+    }
+}
+
