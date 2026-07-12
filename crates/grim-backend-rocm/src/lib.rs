@@ -1757,17 +1757,16 @@ pub use crate::kernels::jit_cache::HsacoKernelCache;
 // in `device::util`; it was the only piece of this comment block that
 // wasn't already extracted elsewhere.
 
+// Module-level helper `compute_kernel_source` moved to
+// `kernels::source_asm::compute_kernel_source`. Re-exported here so the
+// launch_compute_kernel impl method (and any other caller) sees the
+// same `compute_kernel_source()` name at the crate root.
+pub use crate::kernels::source_asm::compute_kernel_source;
 pub use crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE;
 
 #[allow(unused_imports)]
 use crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE as COMPUTE_KERNEL_SRC;
 
-pub fn compute_kernel_source() -> String {
-    let mut s = String::with_capacity(OTHER_KERNEL_SOURCE.len() + 4096);
-    s.push_str(OTHER_KERNEL_SOURCE);
-    s.push_str(crate::kernels::qkv_attention::KERNEL_SOURCE);
-    s
-}
 
 // `upload_device_buffer<T>` moved to `device::helpers`.
 //
