@@ -24,7 +24,8 @@ use grim_tensor::error::{Error, Result};
 use crate::{
     hipGraphCreate, hipGraphDestroy, hipGraphExecDestroy,
     hipGraphInstantiate, hipGraphLaunch, hipStreamBeginCapture, hipStreamCreate,
-    hipStreamDestroy, hipStreamEndCapture, hipSuccess, HipErrorT, RocmDevice,
+    hipStreamDestroy, hipStreamEndCapture, hipStreamSynchronize, hipSuccess,
+    HipErrorT, RocmDevice,
 };
 
 /// Key for the cached graph: every captured kernel sequence is keyed by
@@ -259,6 +260,133 @@ impl Drop for GraphCaptureManager {
                 if !s.is_null() {
                     unsafe { let _ = hipStreamDestroy(s); }
                 }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Legacy HIP graph wrapper (Item 5 first iteration — `hip_graph_launch` +
+// `CapturedGraph` + `HipGraphExecutor`). Kept here so lib.rs stays small;
+// the modern `GraphCaptureManager` above is the Phase-3 §3.2 implementation.
+// =============================================================================
+
+/// Thin `hipGraphLaunch` wrapper.
+pub fn hip_graph_launch(graph_exec: *mut c_void, stream: *mut c_void) -> HipErrorT {
+    unsafe { hipGraphLaunch(graph_exec, stream) }
+}
+
+/// A captured HIP graph plus its instantiated executable, owned under a key in
+/// `RocmDevice::captured_graphs`. Frees both handles when dropped so a device
+/// teardown never leaks graph resources even if a key is overwritten.
+#[derive(Debug)]
+pub struct CapturedGraph {
+    pub(crate) graph: *mut c_void,
+    pub(crate) exec: *mut c_void,
+}
+
+impl Drop for CapturedGraph {
+    fn drop(&mut self) {
+        unsafe {
+            hipGraphExecDestroy(self.exec);
+            hipGraphDestroy(self.graph);
+        }
+    }
+}
+
+/// HIP Graph capture and replay for optimized kernel execution.
+/// §4.1: Build once, replay many pattern.
+pub struct HipGraphExecutor {
+    graph: *mut c_void,
+    exec: Option<*mut c_void>,
+    stream: Option<*mut c_void>,
+    device_ordinal: usize,
+}
+
+impl HipGraphExecutor {
+    /// Create a new graph executor. The graph is instantiated on the current device.
+    pub fn new(device_ordinal: usize) -> Result<Self> {
+        let mut graph: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            let res = hipGraphCreate(&mut graph, 0);
+            if res != hipSuccess {
+                return Err(Error::Backend(format!("hipGraphCreate failed: {}", res)));
+            }
+        }
+
+        Ok(Self {
+            graph,
+            exec: None,
+            stream: None,
+            device_ordinal,
+        })
+    }
+
+    /// Instantiate the graph for replay. Must be called after all nodes are added.
+    pub fn instantiate(&mut self) -> Result<()> {
+        let mut exec: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            let mut stream: *mut c_void = std::ptr::null_mut();
+            let res = hipStreamCreate(&mut stream);
+            if res != hipSuccess {
+                return Err(Error::Backend(format!("hipStreamCreate failed: {}", res)));
+            }
+
+            // Instantiate graph before taking ownership of the stream.
+            // If instantiation fails, we destroy the stream here and return —
+            // self.stream is never set, so Drop won't double-destroy.
+            let res = hipGraphInstantiate(
+                &mut exec,
+                self.graph,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            );
+            if res != hipSuccess {
+                let _ = hipStreamDestroy(stream);
+                return Err(Error::Backend(format!("hipGraphInstantiate failed: {}", res)));
+            }
+
+            // Now safe to take ownership — both graph instantiation and stream
+            // creation succeeded; if later steps fail, Drop cleans up.
+            self.stream = Some(stream);
+            self.exec = Some(exec);
+        }
+        Ok(())
+    }
+
+    /// Launch the graph. Safe to call after instantiate().
+    pub fn launch(&mut self) -> Result<()> {
+        let (stream, exec) = match (self.stream, self.exec) {
+            (Some(s), Some(e)) => (s, e),
+            _ => return Err(Error::Backend("Graph not instantiated".into())),
+        };
+
+        unsafe {
+            let res = hipGraphLaunch(exec, stream);
+            if res != hipSuccess {
+                return Err(Error::Backend(format!("hipGraphLaunch failed: {}", res)));
+            }
+            let res = hipStreamSynchronize(stream);
+            if res != hipSuccess {
+                return Err(Error::Backend(format!("hipStreamSynchronize failed: {}", res)));
+            }
+            Ok(())
+        }
+    }
+}
+
+impl Drop for HipGraphExecutor {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(exec) = self.exec {
+                let _ = hipGraphExecDestroy(exec);
+            }
+            if let Some(stream) = self.stream {
+                let _ = hipStreamDestroy(stream);
+            }
+            if !self.graph.is_null() {
+                let _ = hipGraphDestroy(self.graph);
             }
         }
     }
