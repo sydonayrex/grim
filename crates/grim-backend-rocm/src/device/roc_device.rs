@@ -2033,4 +2033,161 @@ impl RocmDevice {
 
         Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
     }
+
+    /// Tree-attention wrapper for speculative-decoding verification.
+    ///
+    /// Spec context (grim_qkv_attention_kernel_spec.md Phase-2 +
+    /// grim_rocm_perf_and_abi_fix_spec.md Phase-3 3.5):
+    ///
+    /// > End-to-end latency 2-3x lower than greedy decoding at same quality.
+    /// > Draft model accuracy >= 90% token acceptance rate.
+    /// > Tree attention kernel latency < 2x single-token attention.
+    ///
+    /// Forward of the Phase-2 speculative decoder: the target model
+    /// verifies `1 + gamma` tokens (the prompt + gamma drafted tokens)
+    /// in a single combined QKV forward by branching each drafted
+    /// token's attention to its ancestor chain in the speculative
+    /// tree (see `tree_parents`).
+    ///
+    /// Shape contract:
+    /// - `q:       [batch, 1 + gamma, num_heads, head_dim]`
+    /// - `k:       [kv_seq_len, num_kv_heads, head_dim]` (shared across `batch`)
+    /// - `v:       [kv_seq_len, num_kv_heads, head_dim]` (shared across `batch`)
+    /// - `tree_parents: [1 + gamma]` u32, where index `i` is the parent of
+    ///   tree position `i` (root has parent 0 / self); see kernel
+    ///   `is_ancestor` for the dedup rule.
+    /// - `out_shape: [batch, 1 + gamma, num_heads, head_dim]`
+    ///
+    /// Out allocation: this method allocates the output device
+    /// storage up-front and returns it via the `Result<(Box<dyn
+    /// BackendStorage>, ...)>` pattern that `BackendDevice` already
+    /// uses for `qkv_attention`. This keeps the speculative-decoding
+    /// dispatch site's tree-attention call composable.
+    ///
+    /// Wave64 mandate: head_dim must fit in one wave (<= 64) on
+    /// gfx1036 / gfx110x / gfx1200; the Phase-3 tile-via-MFMA path is
+    /// a follow-up (the kernel currently increments `q_offset` linearly
+    /// and would lose one wave per extra head_dim).
+    pub fn tree_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        tree_parents: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        // ─── structural validation ─────────────────────────────────────────
+        // The tree-attention launch has stricter constraints than
+        // `qkv_attention` because the kernel is also memory-layout-
+        // bound (K/V is shared across batch; q is `[batch, 1+gamma,
+        // num_heads, head_dim]`).
+        let out_dims = out_shape.dims();
+        if out_dims.len() != 4 {
+            return Err(Error::Shape(
+                "tree_attention requires 4-D output shape \
+                 [batch, 1+gamma, num_heads, head_dim]"
+                    .into(),
+            ));
+        }
+        let batch = out_dims[0];
+        let one_plus_gamma = out_dims[1];
+        let num_heads = out_dims[2];
+        let head_dim = out_dims[3];
+
+        if batch == 0 || num_heads == 0 || head_dim == 0 {
+            return Err(Error::Shape(
+                "tree_attention: zero-sized batch / num_heads / head_dim".into(),
+            ));
+        }
+        if one_plus_gamma == 0 {
+            return Err(Error::Shape(
+                "tree_attention: 1+gamma must be >= 1 (gamma == 0 still has a root)".into(),
+            ));
+        }
+        // tree_parents must have at least 1+gamma entries.
+        if tree_parents.shape().elem_count() < one_plus_gamma {
+            return Err(Error::Shape(format!(
+                "tree_attention: tree_parents must have >= {} entries (got {})",
+                one_plus_gamma,
+                tree_parents.shape().elem_count(),
+            )));
+        }
+        // Wave64 mandate: kernel block dim is 256 = 4 wavefronts of 64 on
+        // gfx10xx / gfx11xx / gfx12xx; head_dim must fit in one wave (<=64).
+        if head_dim > 64 {
+            return Err(Error::Shape(format!(
+                "tree_attention Phase-2 supports head_dim <= 64 (got {}); \
+                 Phase-3 will tile via MFMA",
+                head_dim
+            )));
+        }
+        // GQA head-count sanity (same rule as `qkv_attention`).
+        let gamma = one_plus_gamma - 1;
+        if num_kv_heads == 0 || num_kv_heads > num_heads {
+            return Err(Error::Shape(format!(
+                "tree_attention: num_kv_heads ({}) must be within [1, num_heads] ({})",
+                num_kv_heads, num_heads
+            )));
+        }
+        if num_heads % num_kv_heads != 0 {
+            return Err(Error::Shape(format!(
+                "tree_attention: num_heads ({}) must be a multiple of num_kv_heads ({})",
+                num_heads, num_kv_heads
+            )));
+        }
+
+        // ─── input pointer validation ─────────────────────────────────────
+        // Downcasting to RocmStorage verifies each input is GPU-resident;
+        // any non-RocmBackendStorage surface returns Err rather than
+        // crashing the launcher with a bad downcast.
+        let q_s = as_rocm(q)?;
+        let k_s = as_rocm(k)?;
+        let v_s = as_rocm(v)?;
+        let tp_s = as_rocm(tree_parents)?;
+        if !q_s.device_ptr_is_valid()
+            || !k_s.device_ptr_is_valid()
+            || !v_s.device_ptr_is_valid()
+            || !tp_s.device_ptr_is_valid()
+        {
+            return Err(Error::Backend(
+                "tree_attention: an input lacks a valid device pointer".into(),
+            ));
+        }
+
+        // ─── allocate output + launch ──────────────────────────────────
+        let mut storage = RocmStorage::alloc_gpu(
+            out_shape,
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let gamma_u32 = gamma as u32;
+
+        // The launcher takes `&dyn BackendStorage` for inputs and
+        // `&mut dyn BackendStorage` for the output. `RocmStorage` does
+        // implement `BackendStorage` directly, so &RocmStorage coerces
+        // to &dyn BackendStorage automatically. `tree_attention` does
+        // its own `1 / sqrt(head_dim)` scaling inside the kernel -- the
+        // host-side value here is intentionally not handed to FFI.
+        crate::launch_tree_attention(
+            self,
+            q_s,
+            k_s,
+            v_s,
+            tp_s,
+            &mut storage,
+            batch as u32,
+            num_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            gamma_u32,
+            kv_seq_len as u32,
+            cache_offset,
+        )?;
+
+        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+    }
 }
