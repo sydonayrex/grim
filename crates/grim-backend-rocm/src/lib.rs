@@ -777,62 +777,6 @@ pub fn resolve_weight_layout(
 pub use crate::memory::allocator::RocmCachingAllocator;
 pub(crate) use crate::memory::storage::RocmStorage;
 
-impl RocmStorage {
-    /// Allocates GPU memory via the device's caching allocator. Returns the storage on success.
-    ///
-    /// Lives in `lib.rs` (not `memory::storage`) because it takes a `&RocmDevice`,
-    /// which would otherwise create a circular `memory::storage` ↔ `RocmDevice`
-    /// module import. Extracting `RocmDevice` (next modularization step) will
-    /// free this up to relocate alongside the type.
-    pub(crate) fn alloc_gpu(shape: &Shape, dtype: DType, device: &RocmDevice) -> Result<Self> {
-        let bytes = shape.elem_count() * dtype_byte_size(&dtype);
-        let dev_ptr_void = device.allocator.alloc(bytes)?;
-
-        Ok(RocmStorage {
-            device_ptr: Some(dev_ptr_void as u64),
-            bytes,
-            shape: shape.clone(),
-            dtype,
-            provenance: QuantProvenance::GrimNative,
-            ordinal: device.ordinal,
-            allocator: Arc::clone(&device.allocator),
-        })
-    }
-
-    /// Copies data from host to GPU using the caching allocator + `hipMemcpy`.
-    pub(crate) fn copy_from_host(
-        host_data: &[f32],
-        shape: &Shape,
-        dtype: DType,
-        device: &RocmDevice,
-    ) -> Result<Self> {
-        let mut storage = RocmStorage::alloc_gpu(shape, dtype, device)?;
-
-        let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
-        let res = unsafe {
-            hipMemcpy(
-                dev_ptr_void,
-                host_data.as_ptr() as *const c_void,
-                storage.bytes,
-                HipMemcpyKind::HostToDevice,
-            )
-        };
-        if res != hipSuccess {
-            // Return the buffer to the pool (Drop would also do this, but be explicit).
-            unsafe {
-                storage.allocator.free(dev_ptr_void, storage.bytes);
-            }
-            storage.device_ptr = None;
-            return Err(Error::Backend(format!(
-                "hipMemcpyHostToDevice failed with error code {}",
-                res
-            )));
-        }
-
-        Ok(storage)
-    }
-}
-
 /// A host-side staging buffer allocated with `hipHostMalloc` (pinned / page-locked
 /// memory). Pinned buffers transfer over PCIe/xGMI at full bandwidth with
 /// `hipMemcpyAsync`, whereas pageable `Vec` staging forces a slower bounce buffer.
@@ -1340,17 +1284,20 @@ impl RocmDevice {
         let a_packed = RocmStorage::alloc_gpu(
             &Shape::from_slice(&[batch * stride_a]),
             dtype_out.clone(),
-            self,
+            &self.allocator,
+            self.ordinal,
         )?;
         let b_packed = RocmStorage::alloc_gpu(
             &Shape::from_slice(&[batch * stride_b]),
             dtype_out.clone(),
-            self,
+            &self.allocator,
+            self.ordinal,
         )?;
         let d_packed = RocmStorage::alloc_gpu(
             &Shape::from_slice(&[batch * stride_d]),
             dtype_out.clone(),
-            self,
+            &self.allocator,
+            self.ordinal,
         )?;
         let stream = self.active_stream();
         let handle = self.get_rocblas_handle()?;
@@ -1474,7 +1421,7 @@ impl RocmDevice {
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
         let pinned = RocmPinnedBuffer::<f32>::from_slice(data)?;
-        let mut storage = RocmStorage::alloc_gpu(shape, dtype.clone(), self)?;
+        let mut storage = RocmStorage::alloc_gpu(shape, dtype.clone(), &self.allocator, self.ordinal)?;
         if !storage.device_ptr_is_valid() {
             return Err(Error::Backend("Invalid device pointer after alloc".into()));
         }
@@ -1526,7 +1473,7 @@ impl RocmDevice {
         shape: &Shape,
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
-        let mut storage = RocmStorage::alloc_gpu(shape, dtype.clone(), self)?;
+        let mut storage = RocmStorage::alloc_gpu(shape, dtype.clone(), &self.allocator, self.ordinal)?;
         if !storage.device_ptr_is_valid() {
             return Err(Error::Backend("Invalid device pointer after alloc".into()));
         }
@@ -1798,7 +1745,7 @@ impl BackendDevice for RocmDevice {
         // `hipMemset` zeroes bytes, which is only correct when the dtype's zero
         // representation is all-zero bytes. This holds for every DType this
         // backend supports (f32/f16/bf16/integer), so it is safe for all paths.
-        let storage = RocmStorage::alloc_gpu(shape, dtype.clone(), self)?;
+        let storage = RocmStorage::alloc_gpu(shape, dtype.clone(), &self.allocator, self.ordinal)?;
 
         if !storage.device_ptr_is_valid() {
             return Err(Error::Backend("Invalid device pointer after alloc".into()));
@@ -1860,7 +1807,7 @@ impl BackendDevice for RocmDevice {
         #[cfg(feature = "rocm-profile")]
         println!("[rocprofiler-sdk] Begin marker span: from_cpu");
 
-        RocmStorage::copy_from_host(data, shape, dtype, self)
+        RocmStorage::copy_from_host(data, shape, dtype, &self.allocator, self.ordinal)
             .map(|s| Box::new(s) as Box<dyn BackendStorage>)
     }
 
@@ -1919,7 +1866,7 @@ impl BackendDevice for RocmDevice {
             arith: a_storage.dtype.arith,
             storage: DTypeStorage::Native,
         };
-        let out_storage = RocmStorage::alloc_gpu(out_shape, dtype_out.clone(), self)?;
+        let out_storage = RocmStorage::alloc_gpu(out_shape, dtype_out.clone(), &self.allocator, self.ordinal)?;
 
         // Shape-indexed GEMM dispatch lookup (Tensile-inspired layout resolution)
         let tile_config = lookup_gemm_config(m, n, k, self.props.wavefront_size);
@@ -2076,7 +2023,7 @@ impl BackendDevice for RocmDevice {
             arith: a_storage.dtype.arith,
             storage: DTypeStorage::Native,
         };
-        let out_storage = RocmStorage::alloc_gpu(out_shape, dtype_out.clone(), self)?;
+        let out_storage = RocmStorage::alloc_gpu(out_shape, dtype_out.clone(), &self.allocator, self.ordinal)?;
 
         // Shape-indexed GEMM dispatch lookup (Tensile-inspired layout resolution)
         let tile_config = lookup_gemm_config(m, n, k, self.props.wavefront_size);
@@ -2183,7 +2130,7 @@ impl BackendDevice for RocmDevice {
             return Err(Error::Backend("add: inputs lack a valid device pointer".into()));
         }
         let total = out.elem_count();
-        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self)?;
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut a_ptr = dev_ptr(a_s)?;
         let mut b_ptr = dev_ptr(b_s)?;
@@ -2210,7 +2157,7 @@ impl BackendDevice for RocmDevice {
             return Err(Error::Backend("mul: inputs lack a valid device pointer".into()));
         }
         let total = out.elem_count();
-        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self)?;
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut a_ptr = dev_ptr(a_s)?;
         let mut b_ptr = dev_ptr(b_s)?;
@@ -2237,7 +2184,7 @@ impl BackendDevice for RocmDevice {
             return Err(Error::Backend("silu_mul: inputs lack a valid device pointer".into()));
         }
         let total = out.elem_count();
-        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self)?;
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut gate_ptr = dev_ptr(gate_s)?;
         let mut up_ptr = dev_ptr(up_s)?;
@@ -2270,7 +2217,7 @@ impl BackendDevice for RocmDevice {
         }
         let row_len = *x_dims.last().unwrap();
         let total = out.elem_count();
-        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self)?;
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut x_ptr = dev_ptr(x_s)?;
         let mut w_ptr = dev_ptr(w_s)?;
@@ -2309,7 +2256,7 @@ impl BackendDevice for RocmDevice {
         }
         let row_len = *x_dims.last().unwrap();
         let total = out.elem_count();
-        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self)?;
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut x_ptr = dev_ptr(x_s)?;
         let mut row_len_i = row_len as i32;
@@ -2353,7 +2300,7 @@ impl BackendDevice for RocmDevice {
             )));
         }
         let total = out.elem_count();
-        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), self)?;
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut w_ptr = dev_ptr(w_s)?;
         let mut idx_ptr = upload_device_buffer(indices)?;
@@ -2756,7 +2703,7 @@ impl RocmDevice {
         };
         let launch = config.hip_launch_params();
         
-        let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), self)?;
+        let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut x_ptr = dev_ptr(x_s)?;
         let mut w_norm_ptr = dev_ptr(w_norm_s)?;
@@ -2875,7 +2822,7 @@ impl RocmDevice {
 
         // ─── allocate output + launch ────────────────────────────────────
         let launch = config.hip_launch_params();
-        let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), self)?;
+        let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut q_ptr = dev_ptr(q_s)?;
         let mut k_ptr = dev_ptr(k_s)?;

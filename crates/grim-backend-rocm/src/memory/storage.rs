@@ -1,11 +1,9 @@
 //! `RocmStorage`: ROCm-side device buffer + metadata, plus its
-//! `BackendStorage` trait impl that integrates with the broader
-//! `grim-tensor` backend abstraction.
-//!
-//! Allocation helpers (`RocmStorage::alloc_gpu`, `RocmStorage::copy_from_host`)
-//! are kept in `lib.rs` as free-standing items because they need the full
-//! `RocmDevice` reference (a static method on `RocmStorage` would create a
-//! circular module import — see module-layout note in lib.rs).
+//! `BackendStorage` trait impl and the canonical allocation helpers
+//! (`alloc_gpu`, `copy_from_host`). The helpers take
+//! `Arc<RocmCachingAllocator> + ordinal` rather than `&RocmDevice`
+//! so this module stays free of any circular import with whatever
+//! module ends up housing `RocmDevice`.
 //!
 //! Skill attribution:
 //! - `rust-ai-ml-inference-guide` Action 3 — `BackendStorage` integration
@@ -55,6 +53,71 @@ impl RocmStorage {
 
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Allocates GPU memory via a caching allocator. Returns the storage on success.
+    ///
+    /// Takes the components needed for allocation (`Arc<RocmCachingAllocator>` +
+    /// ordinal) rather than a `&RocmDevice` reference. This breaks the circular
+    /// module import between `memory::storage` and wherever `RocmDevice` lives,
+    /// so the helper stays next to the `RocmStorage` type even after the device
+    /// is extracted.
+    pub fn alloc_gpu(
+        shape: &Shape,
+        dtype: DType,
+        allocator: &Arc<RocmCachingAllocator>,
+        ordinal: usize,
+    ) -> Result<Self> {
+        let bytes = shape.elem_count() * crate::dtype_byte_size(&dtype);
+        let dev_ptr_void = allocator.alloc(bytes)?;
+
+        Ok(RocmStorage {
+            device_ptr: Some(dev_ptr_void as u64),
+            bytes,
+            shape: shape.clone(),
+            dtype,
+            provenance: QuantProvenance::GrimNative,
+            ordinal,
+            allocator: Arc::clone(allocator),
+        })
+    }
+
+    /// Copies data from host to GPU using the caching allocator + `hipMemcpy`.
+    ///
+    /// Same parameter-shape rationale as [`alloc_gpu`]: pulls the bytes from a
+    /// `&[f32]` (the only dtype currently wired through), routing the
+    /// allocation through the caching allocator passed in.
+    pub fn copy_from_host(
+        host_data: &[f32],
+        shape: &Shape,
+        dtype: DType,
+        allocator: &Arc<RocmCachingAllocator>,
+        ordinal: usize,
+    ) -> Result<Self> {
+        let mut storage = Self::alloc_gpu(shape, dtype, allocator, ordinal)?;
+
+        let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
+        let res = unsafe {
+            hipMemcpy(
+                dev_ptr_void,
+                host_data.as_ptr() as *const c_void,
+                storage.bytes,
+                HipMemcpyKind::HostToDevice,
+            )
+        };
+        if res != hipSuccess {
+            // Return the buffer to the pool (Drop would also do this, but be explicit).
+            unsafe {
+                storage.allocator.free(dev_ptr_void, storage.bytes);
+            }
+            storage.device_ptr = None;
+            return Err(Error::Backend(format!(
+                "hipMemcpyHostToDevice failed with error code {}",
+                res
+            )));
+        }
+
+        Ok(storage)
     }
 }
 
