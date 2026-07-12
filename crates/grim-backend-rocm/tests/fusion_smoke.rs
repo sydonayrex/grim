@@ -58,6 +58,7 @@ fn qkv_attention_w64_uses_2d_grid_seq_x_heads() {
         head_dim: 64,    // fits Wave64 in one pass; Phase 1 enforces <=64
         max_seq_len: 4096,
         wavefront_size: 64,
+        quant_mode: grim_backend_rocm::QuantMode::Fp32,
     };
     let launch = cfg.hip_launch_params();
     assert_eq!(launch.grid_dim.x, 4096);
@@ -76,6 +77,7 @@ fn qkv_attention_w32_uses_smaller_block() {
         head_dim: 32,
         max_seq_len: 4096,
         wavefront_size: 32,
+        quant_mode: grim_backend_rocm::QuantMode::Fp32,
     };
     let launch = cfg.hip_launch_params();
     assert_eq!(launch.block_dim.x, 128);
@@ -96,6 +98,7 @@ fn qkv_attention_shared_mem_clamped_to_32768() {
         head_dim: 8192,
         max_seq_len: 4096,
         wavefront_size: 64,
+        quant_mode: grim_backend_rocm::QuantMode::Fp32,
     };
     let launch = cfg.hip_launch_params();
     assert_eq!(launch.shared_mem_bytes, 32768);
@@ -140,4 +143,11 @@ fn hip_kernel_launch_struct_equality() {
     let b = a;
     assert_eq!(a.grid_dim, b.grid_dim);
     assert_eq!(a.shared_mem_bytes, 8192);
+}
+
+#[test]
+fn qkv_attention_default_quant_mode_is_fp32() {
+    let cfg = QkvAttentionFusionConfig::default();
+    // This will fail compilation since QuantMode / quant_mode doesn't exist yet
+    assert_eq!(cfg.quant_mode, grim_backend_rocm::QuantMode::Fp32);
 }

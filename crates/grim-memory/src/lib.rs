@@ -424,11 +424,23 @@ impl KvCache for PagedKvCache {
     }
 
     fn current_k(&self) -> Result<Tensor> {
-        Err(Error::KvCache("current_k not implemented in v1 paged cache".into()))
+        let pool = self.pool.lock().unwrap();
+        let mut k_data = Vec::with_capacity(self.table.len() * BLOCK_SIZE * self.num_heads * self.head_dim);
+        for &id in &self.table.logical_to_physical {
+            k_data.extend_from_slice(pool.read_keys(id));
+        }
+        let shape = grim_tensor::Shape::new(vec![self.table.len() * BLOCK_SIZE, self.num_heads, self.head_dim]);
+        Ok(grim_backend_cpu::cpu_tensor(k_data, shape))
     }
 
     fn current_v(&self) -> Result<Tensor> {
-        Err(Error::KvCache("current_v not implemented in v1 paged cache".into()))
+        let pool = self.pool.lock().unwrap();
+        let mut v_data = Vec::with_capacity(self.table.len() * BLOCK_SIZE * self.num_heads * self.head_dim);
+        for &id in &self.table.logical_to_physical {
+            v_data.extend_from_slice(pool.read_values(id));
+        }
+        let shape = grim_tensor::Shape::new(vec![self.table.len() * BLOCK_SIZE, self.num_heads, self.head_dim]);
+        Ok(grim_backend_cpu::cpu_tensor(v_data, shape))
     }
 }
 
@@ -529,6 +541,49 @@ mod tests {
             assert!(pool.is_block_major());
         } else {
             assert!(!pool.is_block_major());
+        }
+    }
+
+    #[test]
+    fn test_paged_kv_cache_current_k_v() {
+        let pool = Arc::new(Mutex::new(KvBlockPool::new(4, 2, 4)));
+        let mut cache = PagedKvCache::new(pool.clone(), 2, 4);
+
+        // Append two slots (allocates two blocks)
+        cache.append_slot().unwrap();
+        cache.append_slot().unwrap();
+
+        // Populate mock data into the pool for these physical blocks
+        {
+            let mut pool_g = pool.lock().unwrap();
+            let block1_id = cache.table.logical_to_physical[0];
+            let block2_id = cache.table.logical_to_physical[1];
+
+            let block_elems = BLOCK_SIZE * 2 * 4;
+            pool_g.write_keys(block1_id, &vec![1.0f32; block_elems], BLOCK_SIZE);
+            pool_g.write_values(block1_id, &vec![2.0f32; block_elems]);
+            pool_g.write_keys(block2_id, &vec![3.0f32; block_elems], BLOCK_SIZE);
+            pool_g.write_values(block2_id, &vec![4.0f32; block_elems]);
+        }
+
+        // Retrieve current K and V.
+        let k = cache.current_k().unwrap();
+        let v = cache.current_v().unwrap();
+        
+        assert_eq!(k.shape().dims(), &[2 * BLOCK_SIZE, 2, 4]);
+        assert_eq!(v.shape().dims(), &[2 * BLOCK_SIZE, 2, 4]);
+
+        let k_data = k.to_vec_f32().unwrap();
+        let v_data = v.to_vec_f32().unwrap();
+
+        let block_elems = BLOCK_SIZE * 2 * 4;
+        for i in 0..block_elems {
+            assert_eq!(k_data[i], 1.0f32);
+            assert_eq!(v_data[i], 2.0f32);
+        }
+        for i in block_elems..(2 * block_elems) {
+            assert_eq!(k_data[i], 3.0f32);
+            assert_eq!(v_data[i], 4.0f32);
         }
     }
 }

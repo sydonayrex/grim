@@ -27,6 +27,8 @@ pub struct RmsNormMatMulFusionConfig {
     pub lds_size: u32,
 }
 
+use crate::quantization::QuantMode;
+
 /// Fusion configuration for QKV Projection + Attention operation.
 ///
 /// `enabled` is the runtime gate for the fused QKV-attention kernel:
@@ -41,6 +43,7 @@ pub struct QkvAttentionFusionConfig {
     pub head_dim: usize,
     pub max_seq_len: usize,
     pub wavefront_size: u32,
+    pub quant_mode: QuantMode,
 }
 
 impl Default for QkvAttentionFusionConfig {
@@ -56,6 +59,7 @@ impl Default for QkvAttentionFusionConfig {
             head_dim: 128,
             max_seq_len: 4096,
             wavefront_size: 64,
+            quant_mode: QuantMode::Fp32,
         }
     }
 }
