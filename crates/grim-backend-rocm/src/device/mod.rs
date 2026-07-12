@@ -17,3 +17,4 @@
 //! dispatch table.
 
 pub mod gemm_tuning;
+pub mod helpers;
