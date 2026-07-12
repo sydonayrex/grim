@@ -22,6 +22,7 @@
 //! dispatch table.
 
 pub mod gemm_tuning;
+pub mod handles;
 pub mod helpers;
 pub mod layout;
 pub mod util;

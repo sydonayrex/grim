@@ -23,224 +23,32 @@ use grim_tensor::error::{Error, Result};
 use grim_tensor::{ArithType, BackendDevice, BackendStorage, Shape};
 use grim_format::gguf::{GrimMetadata, GrimLayoutHint};
 
-/// A handle to a queued ROCm stream operation. Tracks completion for the
-/// `ComputeHandle` contract — the caller submits work on a stream and receives
-/// this handle. `synchronize()` blocks until the stream's prior operations finish.
-#[derive(Debug)]
-pub struct RocmHandle {
-    stream: Option<*mut c_void>,
-}
-
-impl RocmHandle {
-    pub fn new(stream: Option<*mut c_void>) -> Self {
-        Self { stream }
-    }
-}
-
-// SAFETY: HIP stream handles are opaque platform resources that can safely be
-// used from any thread. The underlying HIP runtime serializes stream operations.
-unsafe impl Send for RocmHandle {}
-
-impl ComputeHandle for RocmHandle {
-    fn synchronize(&self) -> Result<()> {
-        if let Some(stream) = self.stream {
-            unsafe {
-                let res = hipStreamSynchronize(stream);
-                if res != hipSuccess {
-                    return Err(Error::Backend(format!("hipStreamSynchronize failed: {}", res)));
-                }
-            }
-        }
-        Ok(())
-    }
-    fn is_ready(&self) -> bool {
-        true
-    }
-}
-
-// ======== HIP FFI Declarations ========
-
-pub type HipErrorT = i32;
-pub const hipSuccess: HipErrorT = 0;
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub enum HipMemcpyKind {
-    HostToHost = 0,
-    HostToDevice = 1,
-    DeviceToHost = 2,
-    DeviceToDevice = 3,
-}
-
-#[link(name = "amdhip64", kind = "dylib")]
-#[link(name = "hiprtc", kind = "dylib")]
-unsafe extern "C" {
-    pub fn hipMalloc(devPtr: *mut *mut c_void, size: usize) -> HipErrorT;
-    pub fn hipFree(device: *mut c_void) -> HipErrorT;
-    pub fn hipHostMalloc(devPtr: *mut *mut c_void, size: usize, flags: u32) -> HipErrorT;
-    pub fn hipHostFree(ptr: *mut c_void) -> HipErrorT;
-    pub fn hipMemcpy(
-        dst: *mut c_void,
-        src: *const c_void,
-        count: usize,
-        kind: HipMemcpyKind,
-    ) -> HipErrorT;
-    pub fn hipMemset(dst: *mut c_void, value: i32, size_bytes: usize) -> HipErrorT;
-    pub fn hipMemsetAsync(dst: *mut c_void, value: i32, size_bytes: usize, stream: *mut c_void) -> HipErrorT;
-    pub fn hipDeviceSynchronize() -> HipErrorT;
-    pub fn hipGetDeviceCount(count: *mut HipErrorT) -> HipErrorT;
-    pub fn hipSetDevice(ordinal: HipErrorT) -> HipErrorT;
-    pub fn hipGetDeviceProperties(prop: *mut c_void, device: i32) -> HipErrorT;
-    pub fn hipDeviceGetAttribute(
-        value: *mut i32,
-        attribute: i32,
-        device: i32,
-    ) -> HipErrorT;
-    pub fn hipMemAdvise(
-        devPtr: *const c_void,
-        count: usize,
-        advice: i32,
-        device: i32,
-    ) -> HipErrorT;
-    
-    // Graph and Stream FFI for §4.1 execution and replay optimization
-    pub fn hipStreamCreate(stream: *mut *mut c_void) -> HipErrorT;
-    pub fn hipStreamDestroy(stream: *mut c_void) -> HipErrorT;
-    pub fn hipStreamSynchronize(stream: *mut c_void) -> HipErrorT;
-    pub fn hipMemcpyAsync(
-        dst: *mut c_void,
-        src: *const c_void,
-        count: usize,
-        kind: HipMemcpyKind,
-        stream: *mut c_void,
-    ) -> HipErrorT;
-    pub fn hipGraphCreate(graph: *mut *mut c_void, flags: u32) -> HipErrorT;
-    pub fn hipGraphDestroy(graph: *mut c_void) -> HipErrorT;
-    pub fn hipGraphInstantiate(
-        exec: *mut *mut c_void,
-        graph: *mut c_void,
-        errorNode: *mut *mut c_void,
-        logBuffer: *mut i8,
-        bufferSize: usize,
-    ) -> HipErrorT;
-    pub fn hipGraphLaunch(exec: *mut c_void, stream: *mut c_void) -> HipErrorT;
-    pub fn hipGraphExecDestroy(exec: *mut c_void) -> HipErrorT;
-    pub fn hipGraphExtendFromGlobalStream(
-        exec: *mut *mut c_void,
-        stream: *mut c_void,
-        flags: u32,
-    ) -> HipErrorT;
-    pub fn hipGraphUpload(exec: *mut c_void, stream: *mut c_void) -> HipErrorT;
-    pub fn hipStreamBeginCapture(stream: *mut c_void, mode: u32) -> HipErrorT;
-    pub fn hipStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> HipErrorT;
-    
-    pub fn hipModuleLoad(module: *mut *mut c_void, path: *const i8) -> HipErrorT;
-    pub fn hipModuleUnload(module: *mut c_void) -> HipErrorT;
-    pub fn hipModuleGetFunction(
-        func: *mut *mut c_void,
-        module: *mut c_void,
-        name: *const i8,
-    ) -> HipErrorT;
-    pub fn hipModuleLaunchKernel(
-        func: *mut c_void,
-        gridX: u32, gridY: u32, gridZ: u32,
-        blockX: u32, blockY: u32, blockZ: u32,
-        sharedMemBytes: u32,
-        stream: *mut c_void,
-        args: *mut *mut c_void,
-        extra: *mut c_void,
-    ) -> HipErrorT;
-    
-    pub fn hiprtcCreateProgram(
-        prog: *mut HiprtcProgram,
-        src: *const i8,
-        name: *const i8,
-        numHeaders: i32,
-        headers: *const *const i8,
-        headerNames: *const *const i8,
-    ) -> HipErrorT;
-    pub fn hiprtcCompileProgram(
-        prog: HiprtcProgram,
-        numOptions: i32,
-        options: *const *const i8,
-    ) -> HipErrorT;
-    pub fn hiprtcGetCode(prog: HiprtcProgram, code: *mut i8) -> HipErrorT;
-    pub fn hiprtcDestroyProgram(prog: *mut HiprtcProgram) -> HipErrorT;
-    pub fn hiprtcAddNameExpression(prog: HiprtcProgram, name: *const i8) -> HipErrorT;
-    pub fn hiprtcGetCodeSize(prog: HiprtcProgram, size: *mut usize) -> HipErrorT;
-    pub fn hiprtcGetErrorString(error: HipErrorT) -> *const i8;
-    pub fn hiprtcGetProgramLogSize(prog: HiprtcProgram, log_size: *mut usize) -> HipErrorT;
-    pub fn hiprtcGetProgramLog(prog: HiprtcProgram, log: *mut i8) -> HipErrorT;
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct HipDim3 {
-    pub x: u32,
-    pub y: u32,
-    pub z: u32,
-}
-
-impl HipDim3 {
-    pub fn new(x: u32, y: u32, z: u32) -> Self {
-        Self { x, y, z }
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct HipGraphKernelNodeParams {
-    pub func: *mut c_void,
-    pub gridDim: HipDim3,
-    pub blockDim: HipDim3,
-    pub args: *mut *mut c_void,
-    pub sharedMemBytes: u32,
-    pub stream: *mut c_void,
-    pub extra: *mut c_void,
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct HipGraphMemcpyNodeParams {
-    pub dst: *mut c_void,
-    pub src: *const c_void,
-    pub kind: HipMemcpyKind,
-    pub size: usize,
-}
-
-pub type HiprtcProgram = *mut c_void;
-
-// XNACK and device memory attribute flags for unified memory detection
-pub const HIP_DEVICE_ATTRIBUTE_COHERENT_DEVICE_ALLOC: i32 = 230; // Mock/actual attribute mapping
-pub const HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS: i32 = 231; // Managed memory / XNACK check support
-
-pub const HIP_DEVICE_ATTRIBUTE_WARP_SIZE: i32 = 24;
-
-pub const HIP_MEM_ADVISE_SET_READ_MOSTLY: i32 = 1;
-pub const HIP_MEM_ADVISE_UNSET_READ_MOSTLY: i32 = 2;
-pub const HIP_MEM_ADVISE_SET_PREFERRED_LOCATION: i32 = 3;
-pub const HIP_MEM_ADVISE_UNSET_PREFERRED_LOCATION: i32 = 4;
-pub const HIP_MEM_ADVISE_SET_ACCESSED_BY: i32 = 5;
-pub const HIP_MEM_ADVISE_UNSET_ACCESSED_BY: i32 = 6;
-pub const HIP_MEM_ADVISE_SET_COARSE_GRAIN: i32 = 100;
-pub const HIP_MEM_ADVISE_UNSET_COARSE_GRAIN: i32 = 101;
-
-/// Correctness gate representation for target hardware wavefront width.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WavefrontSize {
-    /// CDNA targets (MI200/MI300) requiring W64.
-    W64 = 64,
-    /// RDNA targets (consumer gaming GPUs, APUs) requiring W32.
-    W32 = 32,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct RocmDeviceProps {
-    pub wavefront_size: WavefrontSize,
-    pub xnack_enabled: bool,
-}
-
-// ======== rocBLAS FFI Declarations ========
+// HIP / amdhip64 handles — RocmHandle + HipDim3 + HipGraphKernelNodeParams +
+// HipGraphMemcpyNodeParams + HiprtcProgram + WavefrontSize + RocmDeviceProps +
+// hipMalloc/hipFree/hipStreamCreate/etc. raw FFI declarations + HIP
+// attribute / advice constants. Re-exported here so the existing
+// callers see no API change.
+pub use crate::device::handles::{
+    hipDeviceGetAttribute, hipDeviceSynchronize, hipFree, hipGetDeviceCount,
+    hipGetDeviceProperties, hipGraphCreate, hipGraphDestroy,
+    hipGraphExecDestroy, hipGraphExtendFromGlobalStream, hipGraphInstantiate,
+    hipGraphLaunch, hipGraphUpload, hipHostFree, hipHostMalloc,
+    hipMemAdvise, hipMemcpy, hipMemcpyAsync, hipMemset, hipMemsetAsync,
+    hipMalloc, hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad,
+    hipModuleUnload, hipSetDevice, hipStreamBeginCapture, hipStreamCreate,
+    hipStreamDestroy, hipStreamEndCapture, hipStreamSynchronize,
+    hiprtcAddNameExpression, hiprtcCompileProgram, hiprtcCreateProgram,
+    hiprtcDestroyProgram, hiprtcGetCode, hiprtcGetCodeSize,
+    hiprtcGetErrorString, hiprtcGetProgramLog, hiprtcGetProgramLogSize,
+    HIP_DEVICE_ATTRIBUTE_COHERENT_DEVICE_ALLOC, HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS,
+    HIP_DEVICE_ATTRIBUTE_WARP_SIZE, HIP_MEM_ADVISE_SET_ACCESSED_BY,
+    HIP_MEM_ADVISE_SET_COARSE_GRAIN, HIP_MEM_ADVISE_SET_PREFERRED_LOCATION,
+    HIP_MEM_ADVISE_SET_READ_MOSTLY, HIP_MEM_ADVISE_UNSET_ACCESSED_BY,
+    HIP_MEM_ADVISE_UNSET_COARSE_GRAIN, HIP_MEM_ADVISE_UNSET_PREFERRED_LOCATION,
+    HIP_MEM_ADVISE_UNSET_READ_MOSTLY, HipDim3, HipErrorT, HipGraphKernelNodeParams,
+    HipGraphMemcpyNodeParams, HipMemcpyKind, HiprtcProgram, RocmDeviceProps, RocmHandle,
+    WavefrontSize, hipSuccess,
+};
 
 pub type Rocblstatus = i32;
 pub const rocblas_status_success: Rocblstatus = 0;
