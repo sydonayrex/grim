@@ -24,3 +24,4 @@
 pub mod gemm_tuning;
 pub mod helpers;
 pub mod layout;
+pub mod util;
