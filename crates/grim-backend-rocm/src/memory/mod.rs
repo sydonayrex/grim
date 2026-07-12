@@ -17,3 +17,4 @@
 
 pub mod allocator;
 pub mod pool;
+pub mod pinned;
