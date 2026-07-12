@@ -5,4 +5,5 @@
 
 pub mod qkv_attention;
 pub mod compute_kernels;
+pub mod jit_cache;
 
