@@ -774,129 +774,9 @@ pub fn resolve_weight_layout(
 }
 
 /// ROCm-side tensor storage. Holds a hipDeviceptr_t (as u64) plus shape/dtype/provenance metadata.
+pub use crate::memory::allocator::RocmCachingAllocator;
+
 #[derive(Debug)]
-/// Size-bucketed caching allocator for device memory.
-///
-/// `hipMalloc`/`hipFree` are effectively device-synchronizing driver calls, so
-/// calling them per-op in a decode loop is the dominant fixed per-token cost.
-/// This allocator keeps a free-list of device buffers keyed by power-of-two size
-/// class per device and reuses them across allocations, only falling back to the
-/// real `hipMalloc`/`hipFree` when the pool is empty or over its soft cap.
-///
-/// Buffers are returned to the pool by `Drop for RocmStorage` (which holds an
-/// `Arc` to this allocator), so callers do not need to manage reuse explicitly.
-pub struct RocmCachingAllocator {
-    /// Free-list: size class -> available device pointers (stored as `u64` so the
-    /// pool stays `Send + Sync`; device pointers are just integers).
-    pool: Mutex<HashMap<usize, Vec<u64>>>,
-    /// Total bytes currently held in `pool` (not returned to the driver).
-    cached_bytes: Mutex<usize>,
-    /// Soft cap on `cached_bytes`. Once exceeded, freed buffers are actually
-    /// `hipFree`'d instead of retained, bounding steady-state memory use.
-    cap_bytes: usize,
-    /// Device ordinal this allocator serves.
-    ordinal: usize,
-    /// Count of real `hipMalloc` calls (misses). Always incremented.
-    malloc_count: AtomicUsize,
-    /// Count of real `hipFree` calls (evictions / cap overflow). Always incremented.
-    free_count: AtomicUsize,
-}
-
-impl RocmCachingAllocator {
-    pub fn new(ordinal: usize, cap_bytes: usize) -> Self {
-        Self {
-            pool: Mutex::new(HashMap::new()),
-            cached_bytes: Mutex::new(0),
-            cap_bytes,
-            ordinal,
-            malloc_count: AtomicUsize::new(0),
-            free_count: AtomicUsize::new(0),
-        }
-    }
-
-    /// Round a byte size up to the next power of two. Class 0 is treated as 1 to
-    /// avoid a zero-sized `hipMalloc`.
-    fn size_class(bytes: usize) -> usize {
-        if bytes <= 1 {
-            1
-        } else {
-            bytes.next_power_of_two()
-        }
-    }
-
-    /// Allocate a device buffer of at least `bytes` usable bytes, reusing a pooled
-    /// buffer when one is available.
-    pub fn alloc(&self, bytes: usize) -> Result<*mut c_void> {
-        let cls = Self::size_class(bytes);
-        let reused = {
-            let mut pool = self.pool.lock().unwrap();
-            pool.get_mut(&cls).and_then(|v| v.pop())
-        };
-        if let Some(ptr_u64) = reused {
-            // Buffer leaves the pool: adjust cached accounting.
-            if let Ok(mut cached) = self.cached_bytes.lock() {
-                *cached = cached.saturating_sub(cls);
-            }
-            return Ok(ptr_u64 as *mut c_void);
-        }
-
-        let mut dev_ptr_void: *mut c_void = std::ptr::null_mut();
-        let res = unsafe { hipMalloc(&mut dev_ptr_void, cls) };
-        if res != hipSuccess {
-            return Err(Error::Backend(format!(
-                "hipMalloc failed with error code {}",
-                res
-            )));
-        }
-        self.malloc_count.fetch_add(1, Ordering::Relaxed);
-        Ok(dev_ptr_void)
-    }
-
-    /// Return a buffer to the pool (or actually free it if over cap).
-    pub fn free(&self, ptr: *mut c_void, bytes: usize) {
-        let cls = Self::size_class(bytes);
-        let over_cap = {
-            let cached = self.cached_bytes.lock().unwrap();
-            *cached + cls > self.cap_bytes
-        };
-        if over_cap || ptr.is_null() {
-            unsafe {
-                let _ = hipFree(ptr);
-            }
-            self.free_count.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        {
-            let mut pool = self.pool.lock().unwrap();
-            pool.entry(cls).or_default().push(ptr as u64);
-            let mut cached = self.cached_bytes.lock().unwrap();
-            *cached += cls;
-        }
-    }
-
-    /// Release every pooled buffer back to the driver. Mirrors `torch.cuda.empty_cache()`.
-    pub fn empty_cache(&self) {
-        let mut pool = self.pool.lock().unwrap();
-        for (_cls, bufs) in pool.drain() {
-            for p in bufs {
-                unsafe {
-                    let _ = hipFree(p as *mut c_void);
-                }
-                self.free_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        *self.cached_bytes.lock().unwrap() = 0;
-    }
-
-    /// `(malloc_count, free_count)` — real driver allocation calls since start.
-    pub fn stats(&self) -> (usize, usize) {
-        (
-            self.malloc_count.load(Ordering::Relaxed),
-            self.free_count.load(Ordering::Relaxed),
-        )
-    }
-}
-
 pub struct RocmStorage {
     /// Opaque device pointer, stored as u64
     pub(crate) device_ptr: Option<u64>,
@@ -3140,106 +3020,15 @@ pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<V
 
 const ROCM_COMPUTE_BLOCK: u32 = 256;
 
-/// HIP/C++ source for the six compute ops. Each entry point is `extern "C"`
-/// so `hipModuleGetFunction` resolves it without name mangling.
-/// HIP source for the *other* compute kernels (add / mul / silu_mul / rms_norm
-/// / softmax / embedding / rmsnorm_matmul). The Phase-1 QKV attention kernel
-/// lives in `kernels::qkv_attention::KERNEL_SOURCE` so its HIP body and the
-/// Rust host launcher can co-evolve without touching this file. Concat both
-/// at runtime via [`compute_kernel_source`].
-pub const OTHER_KERNEL_SOURCE: &str = r#"
-extern "C" __global__ void grim_add(float* a, float* b, float* c, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    c[i] = a[i] + b[i];
-}
+pub use crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE;
 
-extern "C" __global__ void grim_mul(float* a, float* b, float* c, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    c[i] = a[i] * b[i];
-}
+#[allow(unused_imports)]
+use crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE as COMPUTE_KERNEL_SRC;
 
-extern "C" __global__ void grim_silu_mul(float* gate, float* up, float* out, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float g = gate[i];
-    float s = g / (1.0f + expf(-g));
-    out[i] = s * up[i];
-}
-
-extern "C" __global__ void grim_rms_norm(float* x, float* w, float* out,
-                                         int row_len, float eps, int total) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-    int row = idx / row_len;
-    float ss = 0.0f;
-    for (int j = 0; j < row_len; ++j) {
-        float v = x[row * row_len + j];
-        ss += v * v;
-    }
-    float rms = sqrtf(ss / (float)row_len + eps);
-    out[idx] = x[idx] * w[idx] / rms;
-}
-
-extern "C" __global__ void grim_softmax(float* x, float* out, int row_len, int total) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-    int row = idx / row_len;
-    float maxv = -1e30f;
-    for (int j = 0; j < row_len; ++j) {
-        float v = x[row * row_len + j];
-        if (v > maxv) maxv = v;
-    }
-    float sum = 0.0f;
-    for (int j = 0; j < row_len; ++j) {
-        float e = expf(x[row * row_len + j] - maxv);
-        sum += e;
-    }
-    out[idx] = expf(x[idx] - maxv) / sum;
-}
-
-extern "C" __global__ void grim_embedding(float* weight, float* out,
-                                           int* indices, int dim, int total) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-    int i = idx / dim;
-    int j = idx % dim;
-    out[idx] = weight[indices[i] * dim + j];
-}
-
-extern "C" __global__ void grim_rmsnorm_matmul(
-    float* x, float* w_norm, float* weight_mat, float* out,
-    int m, int n, int k, float eps
-) {
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    if (row >= m || col >= n) return;
-
-    float ss = 0.0f;
-    for (int j = 0; j < k; ++j) {
-        float val = x[row * k + j];
-        ss += val * val;
-    }
-    float rms = sqrtf(ss / (float)k + eps);
-
-    float sum = 0.0f;
-    for (int j = 0; j < k; ++j) {
-        float x_norm = x[row * k + j] * w_norm[j] / rms;
-        float w_val = weight_mat[j * n + col];
-        sum += x_norm * w_val;
-    }
-    out[row * n + col] = sum;
-}
-"#;
-
-/// Concatenate [`OTHER_KERNEL_SOURCE`] and the live QKV-attention kernel and
-/// return the full HIP program text. Build into a runtime string (not `const`)
-/// because the QKV module is a constant from another compilation unit.
 pub fn compute_kernel_source() -> String {
     let mut s = String::with_capacity(OTHER_KERNEL_SOURCE.len() + 4096);
     s.push_str(OTHER_KERNEL_SOURCE);
-    s.push_str(kernels::qkv_attention::KERNEL_SOURCE);
+    s.push_str(crate::kernels::qkv_attention::KERNEL_SOURCE);
     s
 }
 
