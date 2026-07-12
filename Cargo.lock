@@ -3402,6 +3402,8 @@ dependencies = [
  "half",
  "lazy_static",
  "seahash",
+ "serde",
+ "serde_json",
  "temp-env",
  "thiserror 1.0.69",
 ]
