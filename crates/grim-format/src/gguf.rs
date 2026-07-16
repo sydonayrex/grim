@@ -51,6 +51,12 @@ impl GgufValue {
         match self {
             GgufValue::Uint32(v) => Some(*v),
             GgufValue::Uint64(v) => Some(*v as u32),
+            GgufValue::Int32(v) => Some(*v as u32),
+            GgufValue::Int64(v) => Some(*v as u32),
+            GgufValue::Int8(v) => Some(*v as u32),
+            GgufValue::Int16(v) => Some(*v as u32),
+            GgufValue::Uint8(v) => Some(*v as u32),
+            GgufValue::Uint16(v) => Some(*v as u32),
             _ => None,
         }
     }
@@ -95,6 +101,7 @@ pub enum GgufDType {
     F64 = 20,
     Q4_2 = 21,
     Q8_1Hx = 22,
+    IQ4_NL = 35,
 }
 
 impl GgufDType {
@@ -121,11 +128,13 @@ impl GgufDType {
             20 => Some(GgufDType::F64),
             21 => Some(GgufDType::Q4_2),
             22 => Some(GgufDType::Q8_1Hx),
+            35 => Some(GgufDType::IQ4_NL),
             _ => None,
         }
     }
 
-    /// Returns the number of bytes per element for this dtype.
+    /// Returns the number of bytes per element for this dtype (used by
+    /// downstream materializers to size CPU buffers).
     pub fn elem_size(self) -> u64 {
         match self {
             GgufDType::F32 => 4,
@@ -135,14 +144,59 @@ impl GgufDType {
             GgufDType::I32 => 4,
             GgufDType::I64 => 8,
             GgufDType::F64 => 8,
-            // K-quants have block-specific sizes
-            GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 => 17, // Q4 block = 16 bytes + 1 scale
-            GgufDType::Q5_0 | GgufDType::Q5_1 => 21, // Q5 block
-            GgufDType::Q8_0 | GgufDType::Q8_1 | GgufDType::Q8K | GgufDType::Q8_1Hx => 34, // Q8 block
-            GgufDType::Q2K => 13, // Q2 block
-            GgufDType::Q3K | GgufDType::Q4K => 19, // Q3/Q4_K block
-            GgufDType::Q5K => 23, // Q5_K block
-            GgufDType::Q6K => 25, // Q6_K block
+            // Quantized layouts use block storage; their effective per-element cost
+            // when dequantized to F32 (or how many bytes a single weight occupies in
+            // a codebook) is computed via `type_size_bytes / block_size`. The values
+            // 17, 21, 34, etc. were placeholder block-sizes and must NOT be used to
+            // compute on-disk byte counts — see `type_size_per_block` / `block_size`.
+            _ => 1,
+        }
+    }
+
+    /// Number of weights stored per quantization block. Quant layouts package
+    /// N weights together with shared scales/deltas; this is the N. F32/F16/I*/BF16
+    /// are stored as 1-element blocks.
+    pub fn block_size(self) -> u64 {
+        match self {
+            GgufDType::F32 | GgufDType::F16 | GgufDType::F64
+            | GgufDType::I8 | GgufDType::I16 | GgufDType::I32 | GgufDType::I64
+            | GgufDType::Q4_2
+            | GgufDType::Q8_1Hx => 1,
+            // K-quants and Q-families: 32 weights per super-block
+            _ => 32,
+        }
+    }
+
+    /// Bytes consumed by ONE quantization block. For F32/F16/I* kinds this is
+    /// just `elem_size`. For block-quantized kinds it's the literal block layout
+    /// size in the GGUF stream (scales + codebook + packed nibbles).
+    ///
+    /// Reference: gguf-main/src/lib.rs lines 706-748 — `type_size` per dtype.
+    pub fn type_size_per_block(self) -> u64 {
+        let bs = self.block_size();
+        match self {
+            GgufDType::F32 => 4,
+            GgufDType::F16 => 2,
+            GgufDType::I8 => 1,
+            GgufDType::I16 => 2,
+            GgufDType::I32 => 4,
+            GgufDType::I64 => 8,
+            GgufDType::F64 => 8,
+            GgufDType::Q4_0 => 2 + bs / 2,
+            GgufDType::Q4_1 => 2 + 2 + bs / 2,
+            GgufDType::Q4_2 => 0,
+            GgufDType::Q5_0 => 2 + 4 + bs / 2,
+            GgufDType::Q5_1 => 2 + 2 + 4 + bs / 2,
+            GgufDType::Q8_0 => 2 + bs,
+            GgufDType::Q8_1 => 4 + 4 + bs,
+            GgufDType::Q2K => bs / 16 + bs / 4 + 2 + 2,
+            GgufDType::Q3K => bs / 8 + bs / 4 + 12 + 2,
+            GgufDType::Q4K => 2 + 2 + 12 + bs / 2,
+            GgufDType::Q5K => 2 + 2 + 12 + bs / 8 + bs / 2,
+            GgufDType::Q6K => bs / 2 + bs / 4 + bs / 16 + 2,
+            GgufDType::Q8K => 4 + bs + bs / 16 * 2,
+            GgufDType::IQ4_NL => 2 + 16,
+            _ => 0,
         }
     }
 }
@@ -162,7 +216,9 @@ pub struct GgufTensorInfo {
 
 impl GgufTensorInfo {
     pub fn shape(&self) -> Vec<usize> {
-        self.dims.iter().map(|d| *d as usize).collect()
+        let mut s: Vec<usize> = self.dims.iter().map(|d| *d as usize).collect();
+        s.reverse();
+        s
     }
     pub fn elem_count(&self) -> usize {
         self.shape().iter().product()
@@ -193,6 +249,8 @@ pub enum GrimRocmlProfile {
     Cdna3,
     /// RDNA3 graphics (RX 7900 XTX)
     Rdna3,
+    /// RDNA4 graphics (RX 8000 series)
+    Rdna4,
     /// All supported architectures (no specialization)
     All,
     /// Unknown — no ROCm-specific optimization hints
@@ -211,6 +269,7 @@ impl GrimRocmlProfile {
             "cdna2" => GrimRocmlProfile::Cdna2,
             "cdna3" | "mi300x" => GrimRocmlProfile::Cdna3,
             "rdna3" => GrimRocmlProfile::Rdna3,
+            "rdna4" => GrimRocmlProfile::Rdna4,
             "all" => GrimRocmlProfile::All,
             _ => GrimRocmlProfile::Unknown,
         }
@@ -221,6 +280,7 @@ impl GrimRocmlProfile {
             GrimRocmlProfile::Cdna2 => 32,
             GrimRocmlProfile::Cdna3 => 32,
             GrimRocmlProfile::Rdna3 => 64,
+            GrimRocmlProfile::Rdna4 => 64,
             GrimRocmlProfile::All | GrimRocmlProfile::Unknown => 0,
         }
     }
@@ -230,6 +290,7 @@ impl GrimRocmlProfile {
             GrimRocmlProfile::Cdna2 => 65536,
             GrimRocmlProfile::Cdna3 => 65536,
             GrimRocmlProfile::Rdna3 => 32768,
+            GrimRocmlProfile::Rdna4 => 32768,
             GrimRocmlProfile::All | GrimRocmlProfile::Unknown => 0,
         }
     }
@@ -465,6 +526,7 @@ impl GrimMetadata {
                 GrimRocmlProfile::Cdna2 => "cdna2",
                 GrimRocmlProfile::Cdna3 => "cdna3",
                 GrimRocmlProfile::Rdna3 => "rdna3",
+                GrimRocmlProfile::Rdna4 => "rdna4",
                 GrimRocmlProfile::All => "all",
                 GrimRocmlProfile::Unknown => "unknown",
             }
@@ -656,9 +718,18 @@ pub fn read_gguf<R: Read + Seek>(mut reader: R) -> Result<GgufFile> {
         let dtype = GgufDType::from_tag(dtype_tag)
             .ok_or_else(|| Error::Backend(format!("unknown GGUF dtype tag {dtype_tag}")))?;
         let offset = read_u64_le(&mut reader)?;
-        // Compute size using the dtype's element size
-        let elem_size = dtype.elem_size();
-        let size_bytes: u64 = dims.iter().product::<u64>() * elem_size;
+        // Compute size using the dtype's BLOCK layout (per gguf-main/src/lib.rs):
+        //   size_bytes = (params × type_size_per_block) / block_size
+        let block_size = dtype.block_size();
+        let type_size = dtype.type_size_per_block();
+        let params: u64 = dims.iter().product();
+        let size_bytes: u64 = if block_size == 1 {
+            params * type_size
+        } else if type_size == 0 {
+            0
+        } else {
+            (params.saturating_mul(type_size)) / block_size
+        };
         tensors.push(GgufTensorInfo {
             name,
             dims,
@@ -719,13 +790,23 @@ fn read_gguf_string<R: Read>(r: &mut R) -> Result<String> {
 
 fn read_gguf_value<R: Read>(r: &mut R) -> Result<GgufValue> {
     let tag = read_u32_le(r)?;
+    read_gguf_value_with_tag(r, tag)
+}
+
+/// Read a single GGUF metadata value given its type tag.
+///
+/// GGUF stores scalars at their natural byte widths (UINT8/INT8/BOOL = 1
+/// byte, UINT16/INT16 = 2, UINT32/INT32/FLOAT32 = 4, UINT64/INT64/FLOAT64
+/// = 8). ARRAY elements are stored WITHOUT a repeated type tag — only the
+/// array's element type (read once) precedes the count and the raw elements.
+fn read_gguf_value_with_tag<R: Read>(r: &mut R, tag: u32) -> Result<GgufValue> {
     match tag {
         // GGUF metadata value type tags
-        0 => Ok(GgufValue::Uint8(read_u32_le(r).map(|v| {
+        0 => Ok(GgufValue::Uint8({
             let mut buf = [0u8; 1];
-            buf.copy_from_slice(&v.to_le_bytes()[..1]);
+            r.read_exact(&mut buf)?;
             buf[0]
-        })?)),
+        })),
         1 => Ok(GgufValue::Int8({
             let mut buf = [0u8; 1];
             r.read_exact(&mut buf)?;
@@ -752,17 +833,21 @@ fn read_gguf_value<R: Read>(r: &mut R) -> Result<GgufValue> {
             r.read_exact(&mut buf)?;
             f32::from_le_bytes(buf)
         })),
-        7 => Ok(GgufValue::Bool(read_u32_le(r)? != 0)),
+        7 => Ok(GgufValue::Bool({
+            let mut buf = [0u8; 1];
+            r.read_exact(&mut buf)?;
+            buf[0] != 0
+        })),
         8 => Ok(GgufValue::String(read_gguf_string(r)?)),
         9 => {
-            // Array: tag of array element type (u32) + count (u64) + elements
-            let _elem_tag = read_u32_le(r)?; // all elements have same tag
+            // Array: element type tag (u32) + count (u64) + `count` raw
+            // elements of that type (no per-element tag). Elements may
+            // themselves be arrays (nested), so recurse on the element tag.
+            let elem_tag = read_u32_le(r)?;
             let count = read_u64_le(r)?;
             let mut items = Vec::with_capacity(count as usize);
             for _ in 0..count {
-                // We read as the tag we already consumed; for simplicity
-                // we just read string values since those are common in metadata.
-                items.push(read_gguf_value(r)?);
+                items.push(read_gguf_value_with_tag(r, elem_tag)?);
             }
             Ok(GgufValue::Array(items))
         }
@@ -819,6 +904,7 @@ pub fn map_gguf_dtype_to_grim(gguf_dtype: GgufDType) -> (DType, Option<u32>) {
         GgufDType::Q5K => (DType::F32, Some(5)),
         GgufDType::Q6K => (DType::F32, Some(6)),
         GgufDType::Q8K => (DType::F32, Some(8)),
+        GgufDType::IQ4_NL => (DType::F32, Some(4)),
     }
 }
 
@@ -840,9 +926,10 @@ impl GgufDType {
                 | GgufDType::Q4K
                 | GgufDType::Q5K
                 | GgufDType::Q6K
-                | GgufDType::Q8K
-        )
-    }
+     | GgufDType::Q8K
+     | GgufDType::IQ4_NL
+ )
+ }
 
     /// Returns the GGUF display name for this dtype.
     pub fn display_name(self) -> &'static str {
@@ -868,6 +955,7 @@ impl GgufDType {
             GgufDType::Q5K => "Q5_K",
             GgufDType::Q6K => "Q6_K",
             GgufDType::Q8K => "Q8_K",
-        }
-    }
+            GgufDType::IQ4_NL => "IQ4_NL",
+            }
+            }
 }

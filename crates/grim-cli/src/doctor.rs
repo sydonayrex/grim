@@ -11,7 +11,7 @@ pub struct DoctorReport {
     pub unit_file_exists: Option<bool>,
     pub unit_file_verifies: Option<bool>,
     pub service_is_active: Option<bool>,
-    pub process_running: Option<bool>,
+    pub _process_running: Option<bool>,
     pub health_endpoint_ok: Option<bool>,
     pub gpu_detected: Option<bool>,
     pub gpu_backend_actual: Option<String>,
@@ -46,7 +46,7 @@ pub fn run_doctor(addr: &str, service_name: &str, exec_path: &str, config_path: 
     Ok(true)
 }
 
-fn check_unit_file(report: &mut DoctorReport, service_name: &str, exec_path: &str, config_path: &str) {
+fn check_unit_file(report: &mut DoctorReport, service_name: &str, _exec_path: &str, _config_path: &str) {
     let path = format!("/etc/systemd/system/{service_name}.service");
     match std::fs::read_to_string(&path) {
         Ok(content) => {
@@ -169,7 +169,7 @@ fn check_health_endpoint(report: &mut DoctorReport, addr: &str) {
                 eprintln!("[WARN] /health at {} returned unexpected body: {}", url, body.trim());
             }
         }
-        Ok(o) => {
+        Ok(_o) => {
             report.health_endpoint_ok = Some(false);
             report.warnings.push(format!("health endpoint at {} returned HTTP error", url));
             eprintln!("[WARN] /health at {} returned HTTP error (status not 200).", url);
@@ -184,6 +184,21 @@ fn check_health_endpoint(report: &mut DoctorReport, addr: &str) {
 }
 
 fn check_gpu_backend(report: &mut DoctorReport) {
+    // Query system ROCm path and version info
+    match grim_backend_rocm::device::probe::probe_system_rocm() {
+        Ok(rocm) => {
+            println!(
+                "[OK]  System ROCm installation detected: {} (version {})",
+                rocm.path.display(),
+                rocm.version
+            );
+        }
+        Err(e) => {
+            report.warnings.push(format!("No system ROCm installation detected: {e}"));
+            eprintln!("[WARN] No system ROCm installation detected: {e}");
+        }
+    }
+
     // Probe for ROCm hardware.
     match grim_backend_rocm::RocmDevice::probe() {
         Ok(devices) if !devices.is_empty() => {
@@ -195,6 +210,51 @@ fn check_gpu_backend(report: &mut DoctorReport) {
                 first.wavefront_size(),
                 first.xnack_enabled()
             );
+
+            // Verify if GCN target is compatible with RDNA 3 or RDNA 4
+            match grim_backend_rocm::device::probe::probe_host_gpu(first.ordinal()) {
+                Ok(c) => {
+                    println!(
+                        "[OK]  Host GPU hardware stats: GCN={}, Wavefront={}, LDS={} bytes",
+                        c.gcn,
+                        c.wavefront_size,
+                        c.lds_size_bytes
+                    );
+                    if c.wavefront_size != 64 {
+                        report.warnings.push(format!(
+                            "Host GPU wavefront size is {} (Wave64 layout optimizations require 64)",
+                            c.wavefront_size
+                        ));
+                        eprintln!(
+                            "[WARN] Host GPU wavefront size is {} (Wave64 layout optimizations require 64)",
+                            c.wavefront_size
+                        );
+                    }
+                    if c.gcn.starts_with("gfx10") {
+                        report.errors.push(format!(
+                            "Host GPU architecture {} is RDNA 2. RDNA 2 does not support wave64 and is incompatible with .grim optimizations",
+                            c.gcn
+                        ));
+                        eprintln!(
+                            "[ERR] Host GPU architecture {} is RDNA 2. RDNA 2 does not support wave64 and is incompatible with .grim optimizations",
+                            c.gcn
+                        );
+                    } else if !c.gcn.starts_with("gfx11") && !c.gcn.starts_with("gfx12") {
+                        report.warnings.push(format!(
+                            "Host GPU GCN architecture {} is not standard RDNA 3/4. Optimization overrides may mismatch.",
+                            c.gcn
+                        ));
+                        eprintln!(
+                            "[WARN] Host GPU GCN architecture {} is not standard RDNA 3/4. Optimization overrides may mismatch.",
+                            c.gcn
+                        );
+                    }
+                }
+                Err(e) => {
+                    report.warnings.push(format!("Failed to query host GPU GCN capabilities: {e}"));
+                    eprintln!("[WARN] Failed to query host GPU GCN capabilities: {e}");
+                }
+            }
 
             // Check if the running engine is actually using it, not falling back to CPU.
             // We check the /metrics endpoint for rocm_gpu_count.
