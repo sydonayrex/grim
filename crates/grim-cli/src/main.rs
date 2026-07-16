@@ -102,6 +102,18 @@ enum Commands {
     },
     /// Quantize a model.
     Quantize,
+    /// Convert standard GGUF model to ROCm-optimized .grim format.
+    Convert {
+        /// Path to input GGUF model file.
+        #[arg(short, long)]
+        input: String,
+        /// Path to output .grim model file.
+        #[arg(short, long)]
+        output: String,
+        /// Target GPU GCN architecture (e.g. gfx1100, gfx1201), or "auto" to detect the host GPU.
+        #[arg(short, long, default_value = "auto")]
+        target: String,
+    },
     /// Speculative decoding commands.
     Spec {
         #[command(subcommand)]
@@ -314,12 +326,24 @@ async fn main() -> Result<()> {
                 grim_server::serve(&address, engine).await?;
             } else {
                 let model_name = model.unwrap_or_else(|| "default".to_string());
-                // Enforce download security boundary
-                let model_path = client::validate_model_cached(&model_name)?;
-                
+                // Local GGUF file path: bypass the cache/download gate and
+                // hand the path straight to `cmd_run`, which loads it via
+                // `load_model_from_gguf`. This is the documented escape hatch
+                // for running a model you already have on disk (e.g.
+                // `grim run ./models/sleipnir.gguf`). The download security
+                // boundary still applies to named/cached models below.
+                let resolved = if model_name.to_lowercase().ends_with(".gguf")
+                    && std::path::Path::new(&model_name).is_file()
+                {
+                    model_name.clone()
+                } else {
+                    // Enforce download security boundary
+                    let model_path = client::validate_model_cached(&model_name)?;
+                    model_path.to_string_lossy().into_owned()
+                };
                 if let Some(p) = prompt {
-                    println!("[grim run] Running prompt on cached model: {}", model_path.display());
-                    run::cmd_run(model_name, Some(p), false, address, &plugins).await?;
+                    println!("[grim run] Running prompt on cached model: {}", resolved);
+                    run::cmd_run(resolved, Some(p), false, address, &plugins).await?;
                 } else {
                     println!("[grim run] Starting interactive terminal session with: {}", model_name);
                     println!("Type your prompt below (Ctrl+C to exit):");
@@ -331,7 +355,7 @@ async fn main() -> Result<()> {
                         std::io::stdin().read_line(&mut line).unwrap();
                         let trimmed = line.trim();
                         if trimmed.is_empty() { continue; }
-                        let _ = run::cmd_run(model_name.clone(), Some(trimmed.to_string()), false, address.clone(), &plugins).await;
+                        let _ = run::cmd_run(resolved.clone(), Some(trimmed.to_string()), false, address.clone(), &plugins).await;
                         println!();
                     }
                 }
@@ -469,6 +493,37 @@ async fn main() -> Result<()> {
                     eprintln!("Doctor check failed: {e}");
                     std::process::exit(1);
                 }
+            }
+        }
+        Commands::Convert { input, output, target } => {
+            let resolved_gcn = if target == "auto" {
+                println!("[grim convert] Auto-detecting host GPU target architecture...");
+                match grim_backend_rocm::device::probe::probe_system_rocm() {
+                    Ok(rocm) => {
+                        println!("[grim convert] ROCm installation detected: {} (version {})", rocm.path.display(), rocm.version);
+                        match grim_backend_rocm::device::probe::probe_host_gpu(0) {
+                            Ok(caps) => {
+                                println!("[grim convert] Host GPU detected GCN architecture: {}", caps.gcn);
+                                caps.gcn
+                            }
+                            Err(e) => {
+                                eprintln!("Error querying host GPU properties: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("ROCm environment dynamic discovery failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                target
+            };
+
+            if let Err(e) = grim_format::convert::convert_gguf_to_grim(&input, &output, &resolved_gcn) {
+                eprintln!("Conversion failed: {e}");
+                std::process::exit(1);
             }
         }
         Commands::Oxidizer { subcommand } => {

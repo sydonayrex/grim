@@ -82,6 +82,17 @@ impl GgufProvider {
         &self.grim
     }
 
+    /// Construct a `GgufTokenizer` using this provider's parsed metadata keys.
+    pub fn tokenizer(&self) -> Result<crate::tokenizer::GgufTokenizer> {
+        crate::tokenizer::GgufTokenizer::from_metadata(&self.file.metadata)
+    }
+
+    /// Resolve the architecture string. Mirrors `architecture()` but returns an owned
+    /// copy for callers that need to keep the value past the provider's lifetime.
+    pub fn architecture_owned(&self) -> Option<String> {
+        self.architecture().map(|s| s.to_string())
+    }
+
     /// Access the tensor index (name → info mapping).
     pub fn tensors(&self) -> &HashMap<String, GgufTensorInfo> {
         &self.tensors
@@ -90,6 +101,21 @@ impl GgufProvider {
     /// Training quantization mode declared by `.grim` metadata, if any.
     pub fn train_quant_mode(&self) -> Option<GrimTrainQuantMode> {
         self.grim.train_quant_mode
+    }
+
+    /// Target GPU GCN architecture (e.g. "gfx1100") declared by `.grim` metadata, if any.
+    pub fn target_gcn(&self) -> Option<&str> {
+        self.grim.target_gcn.as_deref()
+    }
+
+    /// Target execution wavefront/warp size (32 or 64) declared by `.grim` metadata.
+    pub fn wavefront_size(&self) -> u32 {
+        self.grim.wavefront_size
+    }
+
+    /// Target GPU LDS (local data share) memory size in bytes, if any.
+    pub fn lds_size(&self) -> Option<u32> {
+        self.grim.lds_size
     }
 
     /// ROCm fusion operations declared by `.grim` metadata, if any.
@@ -113,28 +139,48 @@ impl GgufProvider {
 /// Maps a `GgufDType` to a grim `DType` using the built-in GGUF mapping.
 fn dtype_from_gguf(gguf_dtype: GgufDType) -> DType {
     match gguf_dtype {
-        GgufDType::F16 => DType::BF16,
+        GgufDType::F16 => DType::F16,
         GgufDType::F32 => DType::F32,
         GgufDType::I8 => DType {
             arith: grim_tensor::ArithType::U8,
             storage: Storage::Native,
         },
         // K-quants: store the quantization scheme so dequant kernels know the layout
-        GgufDType::Q4K | GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 => DType {
+        GgufDType::Q2K => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q2K),
+        },
+        GgufDType::Q3K => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q3K),
+        },
+        GgufDType::Q4K => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::Block(grim_tensor::dtype::BlockDtype::Fp4),
+        },
+        GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::Q4K),
         },
-        GgufDType::Q5K | GgufDType::Q5_0 | GgufDType::Q5_1 => DType {
+        GgufDType::Q5K => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::Block(grim_tensor::dtype::BlockDtype::Nf4),
+        },
+        GgufDType::Q5_0 | GgufDType::Q5_1 => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::Q5K),
         },
-        GgufDType::Q6K | GgufDType::Q2K | GgufDType::Q3K => DType {
+        GgufDType::Q6K => DType {
             arith: grim_tensor::ArithType::F32,
-            storage: Storage::KQuant(KQuantScheme::Q6K),
+            storage: Storage::Block(grim_tensor::dtype::BlockDtype::Fp8),
         },
         GgufDType::Q8K | GgufDType::Q8_0 | GgufDType::Q8_1 | GgufDType::Q8_1Hx => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::Q80),
+        },
+        GgufDType::IQ4_NL => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::IQ4NL),
         },
         _ => DType::F32,
     }
@@ -281,7 +327,6 @@ mod tests {
                         .expect("write array count");
                     for item in items {
                         if let GgufValue::String(s) = item {
-                            buf.write_all(&8u32.to_le_bytes()).expect("write elem string tag");
                             let s_bytes = s.as_bytes();
                             buf.write_all(&(s_bytes.len() as u64).to_le_bytes())
                                 .expect("write elem string len");
@@ -363,5 +408,23 @@ mod tests {
         );
         let provider = open_provider_from_metadata(meta);
         assert!(provider.rocm_fusion_ops().is_empty());
+    }
+
+    #[test]
+    fn test_dtype_from_gguf_block_mappings() {
+        use crate::gguf::GgufDType;
+        use grim_tensor::dtype::{BlockDtype, Storage, KQuantScheme};
+        
+        let d_q4k = super::dtype_from_gguf(GgufDType::Q4K);
+        assert_eq!(d_q4k.storage, Storage::Block(BlockDtype::Fp4));
+        
+        let d_q5k = super::dtype_from_gguf(GgufDType::Q5K);
+        assert_eq!(d_q5k.storage, Storage::Block(BlockDtype::Nf4));
+
+        let d_q6k = super::dtype_from_gguf(GgufDType::Q6K);
+        assert_eq!(d_q6k.storage, Storage::Block(BlockDtype::Fp8));
+
+        let d_q80 = super::dtype_from_gguf(GgufDType::Q8_0);
+        assert_eq!(d_q80.storage, Storage::KQuant(KQuantScheme::Q80));
     }
 }
