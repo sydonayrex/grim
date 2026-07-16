@@ -33,6 +33,36 @@ extern crate alloc;
 /// Concatenated into the crate-wide `COMPUTE_KERNEL_SOURCE` constant for JIT
 /// compilation; the kernel signature must match exactly the kernel-launch
 /// argument packing done in `lib.rs::RocmDevice::qkv_attention`.
+///
+/// WI 1.4.2 — all kernels in this source parallelize the KV walk across all 4
+/// RDNA wavefronts in the 256-thread block (one wavefront per wave_id 0..3),
+/// each owning a contiguous quarter of the valid `j`-range. Per-wavefront
+/// partial online-softmax state (max, sum, per-dim acc) is published to
+/// in-kernel `__shared__` LDS, then wave 0 merges the 4 partials pairwise and
+/// writes the final `out[d]`. See `grim_rocm_consumer_perf_plan.md` WI 1.
+///
+/// Hardware-aware corner (RDNA iGPU, e.g. gfx1036): `warpSize` resolves to 32
+/// at runtime; the host launches block = wave_size (single wavefront) since
+/// one wave covers head_dim up to wave_size. `head_dim > wave_size` throws
+/// NaN. The kernel uses `__shared__ float s_acc[8][wave_size == 64 ? 64 : 32]`
+/// so the same kernel handles wave64 (full WI 1.4.2 4-way path) and wave32
+/// (single-wavefront correctness path) without source forks. On wave32 the
+/// WI 1.4.2 KV-parallel speedup is not realized (only one wavefront runs);
+/// treat wave64 hardware (`gfx110x`, `gfx1200`, CDNA) as the optimization
+/// target.
+///
+/// Load-imbalance note (DCU-GCN §2.4.4-2 caution in WI 1.6.1): within one
+/// block, the 4 wavefronts get a static (base, rem) stride partition. If a
+/// batch mixes very different kv_seq_len sequences the *cross-block* part of
+/// the kernel is unaffected (each block has its own j_range), but per-kernel
+/// terminals can see uneven per-wave work. Correctness holds either way; the
+/// perf headroom is reserved for a future dynamic-chunk-sizing step rather
+/// than a correction to this PR.
+///
+/// TODO(gpu-verify): Gate 1.6.4 perf number — measure on wave64 hardware
+/// (gfx1100+ / CDNA) at `kv_seq_len ∈ {128, 512, 2048, 8192}` to confirm
+/// the ~1.5×+ speedup expected from using 4× the working threads. No perf
+/// number has been measured or claimed.
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" __global__ __launch_bounds__(256)
 void grim_qkv_attention(
@@ -75,31 +105,71 @@ void grim_qkv_attention(
     //
     // Each thread owns one output dim d in [0, head_dim).
     // Wave-cross accumulations are reduced via shfl_xor for tree reduction.
+    //
+    // WI 1.4.2 (wave64 hardware — RDNA dGPU / CDNA): the causal KV walk is
+    // split across the 4 wavefronts in the 256-thread block, each owning a
+    // contiguous quarter. The 4 partial (max, sum, acc[d]) states are merged
+    // in wave 0 after __syncthreads().
+    //
+    // Wave32 hardware fallback (RDNA iGPU, gfx1036 et al.): warpSize resolves
+    // to 32 at runtime. The host launches block = wave_size (single
+    // wavefront); WI 1.4.2's per-d up-axis at head_dim > wave_size would be
+    // incomplete. We constrain head_dim ≤ wave_size and run a single-thread
+    // (per dim) softmax — same algorithm, no parallelism across KV. This is a
+    // hardware-mediated fast path; the wave64 branch keeps the WI 1.4.2 speedup.
     // ──────────────────────────────────────────────────────────────────────
     const int tid = threadIdx.x;
     const int wave_size = warpSize;
     const int wave_id = tid / wave_size;
     const int lane_id = tid % wave_size;
-
-    // Only let wave 0 perform the computation.
-    if (wave_id > 0) return;
+    // On wave64 hardware the host launches 256 threads = 4 wavefronts;
+    // on wave32 hardware (RDNA iGPU) the host launches wave_size threads
+    // (single wavefront fallback). Either way num_waves = block / wave_size.
+    const int num_waves = 256 / wave_size;
 
     const int d = lane_id;
     const bool thread_active = d < head_dim;
 
-    if (head_dim > 64) {
+    // Hardware-aware head-dim cap.
+    //   wave64  → ≤ 64 (lane_id ∈ [0, 64) covers the full head).
+    //   wave32  → ≤ 32 (lane_id ∈ [0, 32); > 32 would be unassigned).
+    if (head_dim > wave_size) {
         if (thread_active) {
             out[q_offset + d] = nanf("");
         }
         return;
     }
 
+    // Per-wavefront partials published to LDS for the wave-0 merge. Sized to
+    // the worst-case 8 wavefronts (RDNA iGPU wave32 + block 256 host path);
+    // when wave_size=32 the host falls back to a single-wavefront launch so
+    // only entry [0] is touched. <2.1 KB total.
+    //
+    // NOTE: always allocate [8][64] (the max head_dim/wave_size). On wave32
+    // hardware the extra 32 lanes' slots are unused but harmless. Using a
+    // runtime ternary (`wave_size == 64 ? 64 : 32`) would make this a VLA
+    // (variable-length array) which is illegal for `__shared__` (static
+    // storage duration) in HIP/C++ — caught when JIT-compiling on gfx1036.
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][64];
+
+    // Causal KV range for this query: [0, hi) where hi = min(abs_i + 1, kv_seq_len).
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int range_len = hi;  // j in [0, hi)
+
+    // Quarter-stride partitioning of [0, hi) across the wavefronts.
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
     float out_acc = 0.0f;
     float running_max = -1e30f;
     float running_sum = 0.0f;
 
-    // Walk K/V up to: each valid kv position j satisfies j <= abs_i (causal).
-    for (int j = 0; j <= abs_i && j < kv_seq_len; ++j) {
+    // Walk this wavefront's K/V slice [j_start, j_end).
+    for (int j = j_start; j < j_end; ++j) {
         const int kv_offset = (j * num_kv_heads + kv_head) * head_dim;
 
         // Score = dot(q[i,h,:], k[j, kv_head, :])
@@ -130,8 +200,51 @@ void grim_qkv_attention(
         running_sum += w;
     }
 
+    // Publish per-wavefront partials to LDS. max/sum are wavefront-uniform
+    // (score reduce makes them identical across lanes), so only lane 0 writes.
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    // acc is per-dim; every active lane writes its own slot. Inactive lanes
+    // (d >= head_dim) leave the slot at its default 0 (harmless for the merge).
     if (thread_active) {
-        out[q_offset + d] = out_acc / running_sum;
+        s_acc[wave_id][d] = out_acc;
+    } else if (d < 64) {
+        s_acc[wave_id][d] = 0.0f;
+    }
+    __syncthreads();
+
+    // Wave 0 merges the partials from every wave into one (max, sum, acc[d]).
+    // Each lane d merges its own data parallel to other lanes; the merge is
+    // a left-fold combine that adapts to any num_waves (4 on RDNA dGPU/ CDNA,
+    // 8 on RDNA iGPU with wave32). Pair-merge:
+    //   m_new = fmaxf(m_a, m_b)
+    //   sum_a' = sum_a * exp(m_a - m_new),  sum_b' = sum_b * exp(m_b - m_new)
+    //   sum_new = sum_a' + sum_b'  ;  acc_new = acc_a * exp(m_a - m_new) + acc_b * exp(m_b - m_new)
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    float acc_final = s_acc[0][d];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float aw = s_acc[w][d];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        acc_final = acc_final * scale_a + aw * scale_b;
+        m_final = m_new;
+    }
+
+    if (thread_active) {
+        // F5 guard: zero-output (e.g. empty KV) must not produce NaN.
+        const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+        out[q_offset + d] = acc_final * inv_sum;
     }
 }
 
@@ -170,9 +283,9 @@ void grim_qkv_attention_paged(
     const int wave_size = warpSize;
     const int wave_id = tid / wave_size;
     const int lane_id = tid % wave_size;
-
-    // Only let wave 0 perform the computation.
-    if (wave_id > 0) return;
+    // Block is fixed at 256 (`__launch_bounds__(256)`); num_waves = block_size / wave_size
+    // adapts to RDNA iGPU wave32 (num_waves=8) and RDNA dGPU / CDNA wave64 (num_waves=4).
+    const int num_waves = 256 / wave_size;
 
     const int d = lane_id;
     const bool thread_active = d < head_dim;
@@ -184,55 +297,100 @@ void grim_qkv_attention_paged(
         return;
     }
 
+    // WI 1.4.2: per-wavefront partials published to LDS for the wave-0 merge.
+    // Sized [8] so the same kernel handles both wave32 (8 waves/block, RDNA iGPU)
+    // and wave64 (4 waves/block, RDNA dGPU / CDNA).
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][64];
+
+    // Per-wavefront KV slice [j_start, j_end) over the flattened page/token
+    // index space [0, kv_seq_len). Same stride partition as the non-paged kernel.
+    const int range_len = kv_seq_len;
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
     float out_acc = 0.0f;
     float running_max = -1e30f;
     float running_sum = 0.0f;
 
     // Get the block table for this batch
     const BlockTableEntry* my_table = block_tables + batch_idx * max_blocks;
-    
-    // Loop over the pages/blocks
-    int num_blocks = (kv_seq_len + page_size - 1) / page_size;
-    for (int b = 0; b < num_blocks; ++b) {
-        BlockTableEntry entry = my_table[b];
-        int num_tokens = entry.page_size;
+
+    // Walk this wavefront's K/V slice [j_start, j_end).
+    for (int j = j_start; j < j_end; ++j) {
+        if (j > abs_i || j >= kv_seq_len) break;
+
+        // Decompose j into (block b, token t within page)
+        const int b = j / page_size;
+        const int t = j % page_size;
+        const BlockTableEntry entry = my_table[b];
+        const int physical_token_idx = entry.block_id * page_size + t;
+        // K/V page layout: [num_pages, page_size, num_kv_heads, head_dim]
+        const int kv_offset = (physical_token_idx * num_kv_heads + kv_head) * head_dim;
         
-        for (int t = 0; t < num_tokens; ++t) {
-            int j = b * page_size + t;
-            if (j > abs_i || j >= kv_seq_len) break;
-            
-            // K/V page layout: [num_pages, page_size, num_kv_heads, head_dim]
-            const int physical_token_idx = entry.block_id * page_size + t;
-            const int kv_offset = (physical_token_idx * num_kv_heads + kv_head) * head_dim;
-            
-            float local_score = 0.0f;
-            if (thread_active) {
-                local_score = q[q_offset + d] * k_pages[kv_offset + d];
-            }
-            
-            float s = local_score;
-            for (int offset = wave_size / 2; offset > 0; offset >>= 1) {
-                s += __shfl_xor(s, offset);
-            }
-            s *= inv_sqrt_d;
-            
-            if (!thread_active) continue;
-            
-            float w = expf(s - running_max);
-            if (s > running_max) {
-                const float scale = expf(running_max - s);
-                running_sum = running_sum * scale;
-                out_acc = out_acc * scale;
-                running_max = s;
-                w = 1.0f;
-            }
-            out_acc += w * v_pages[kv_offset + d];
-            running_sum += w;
+        float local_score = 0.0f;
+        if (thread_active) {
+            local_score = q[q_offset + d] * k_pages[kv_offset + d];
         }
+        
+        float s = local_score;
+        for (int offset = wave_size / 2; offset > 0; offset >>= 1) {
+            s += __shfl_xor(s, offset);
+        }
+        s *= inv_sqrt_d;
+        
+        if (!thread_active) continue;
+        
+        float w = expf(s - running_max);
+        if (s > running_max) {
+            const float scale = expf(running_max - s);
+            running_sum = running_sum * scale;
+            out_acc = out_acc * scale;
+            running_max = s;
+            w = 1.0f;
+        }
+        out_acc += w * v_pages[kv_offset + d];
+        running_sum += w;
+    }
+
+    // Publish per-wavefront partials to LDS.
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
+    if (thread_active) {
+        s_acc[wave_id][d] = out_acc;
+    } else if (d < 64) {
+        s_acc[wave_id][d] = 0.0f;
+    }
+    __syncthreads();
+
+    // Wave 0 merges the partials from every wave into one (max, sum, acc[d]).
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    float acc_final = s_acc[0][d];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float aw = s_acc[w][d];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        acc_final = acc_final * scale_a + aw * scale_b;
+        m_final = m_new;
     }
 
     if (thread_active) {
-        out[q_offset + d] = out_acc / running_sum;
+        const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+        out[q_offset + d] = acc_final * inv_sum;
     }
 }
 
@@ -275,9 +433,9 @@ void grim_tree_attention(
     const int wave_size = warpSize;
     const int wave_id = tid / wave_size;
     const int lane_id = tid % wave_size;
-
-    // Only let wave 0 perform the computation.
-    if (wave_id > 0) return;
+    // Block is fixed at 256 (`__launch_bounds__(256)`); num_waves = block_size / wave_size
+    // adapts to RDNA iGPU wave32 (num_waves=8) and RDNA dGPU / CDNA wave64 (num_waves=4).
+    const int num_waves = 256 / wave_size;
 
     const int d = lane_id;
     const bool thread_active = d < head_dim;
@@ -289,11 +447,26 @@ void grim_tree_attention(
         return;
     }
 
+    // WI 1.4.2: per-wavefront partials published to LDS for the wave-0 merge.
+    // Sized [8] so the same kernel handles both wave32 (8 waves/block, RDNA iGPU)
+    // and wave64 (4 waves/block, RDNA dGPU / CDNA).
+    __shared__ float s_max[8];
+    __shared__ float s_sum[8];
+    __shared__ float s_acc[8][64];
+
+    // Per-wavefront KV slice [j_start, j_end) over the flattened page/token
+    // index space [0, kv_seq_len). Same stride partition as the non-paged kernel.
+    const int range_len = kv_seq_len;
+    const int base = range_len / num_waves;
+    const int rem  = range_len % num_waves;
+    int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
+    int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
+
     float out_acc = 0.0f;
     float running_max = -1e30f;
     float running_sum = 0.0f;
 
-    for (int j = 0; j < kv_seq_len; ++j) {
+    for (int j = j_start; j < j_end; ++j) {
         bool attend = false;
         if (j < cache_offset) {
             attend = true;
@@ -332,8 +505,41 @@ void grim_tree_attention(
         running_sum += w;
     }
 
+    // Publish per-wavefront partials to LDS.
+    if (lane_id == 0) {
+        s_max[wave_id] = running_max;
+        s_sum[wave_id] = running_sum;
+    }
     if (thread_active) {
-        out[q_offset + d] = out_acc / running_sum;
+        s_acc[wave_id][d] = out_acc;
+    } else if (d < 64) {
+        s_acc[wave_id][d] = 0.0f;
+    }
+    __syncthreads();
+
+    // Wave 0 merges the partials from every wave into one (max, sum, acc[d]).
+    if (wave_id != 0) return;
+
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    float acc_final = s_acc[0][d];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float aw = s_acc[w][d];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        acc_final = acc_final * scale_a + aw * scale_b;
+        m_final = m_new;
+    }
+
+    if (thread_active) {
+        const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+        out[q_offset + d] = acc_final * inv_sum;
     }
 }
 "#;
