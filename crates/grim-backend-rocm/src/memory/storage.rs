@@ -94,26 +94,59 @@ impl RocmStorage {
         allocator: &Arc<RocmCachingAllocator>,
         ordinal: usize,
     ) -> Result<Self> {
+        let arith = dtype.arith;
         let mut storage = Self::alloc_gpu(shape, dtype, allocator, ordinal)?;
-
         let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
-        let res = unsafe {
-            hipMemcpy(
-                dev_ptr_void,
-                host_data.as_ptr() as *const c_void,
-                storage.bytes,
-                HipMemcpyKind::HostToDevice,
-            )
+
+        // F16/BF16: the host provides f32 values but the device buffer holds
+        // 2-byte elements. Convert before uploading so the kernel reads valid
+        // quantized data, not raw f32 bit-pairs misinterpreted as f16.
+        let upload_result = match arith {
+            grim_tensor::ArithType::F16 => {
+                let f16_vec: Vec<half::f16> =
+                    host_data.iter().map(|&f| half::f16::from_f32(f)).collect();
+                let bytes = f16_vec.len() * 2;
+                unsafe {
+                    hipMemcpy(
+                        dev_ptr_void,
+                        f16_vec.as_ptr() as *const c_void,
+                        bytes,
+                        HipMemcpyKind::HostToDevice,
+                    )
+                }
+            }
+            grim_tensor::ArithType::BF16 => {
+                let bf16_vec: Vec<half::bf16> =
+                    host_data.iter().map(|&f| half::bf16::from_f32(f)).collect();
+                let bytes = bf16_vec.len() * 2;
+                unsafe {
+                    hipMemcpy(
+                        dev_ptr_void,
+                        bf16_vec.as_ptr() as *const c_void,
+                        bytes,
+                        HipMemcpyKind::HostToDevice,
+                    )
+                }
+            }
+            // F32 and integer types: direct memcpy (source is already f32 bytes).
+            _ => unsafe {
+                hipMemcpy(
+                    dev_ptr_void,
+                    host_data.as_ptr() as *const c_void,
+                    storage.bytes,
+                    HipMemcpyKind::HostToDevice,
+                )
+            },
         };
-        if res != hipSuccess {
-            // Return the buffer to the pool (Drop would also do this, but be explicit).
+
+        if upload_result != hipSuccess {
             unsafe {
                 storage.allocator.free(dev_ptr_void, storage.bytes);
             }
             storage.device_ptr = None;
             return Err(Error::Backend(format!(
                 "hipMemcpyHostToDevice failed with error code {}",
-                res
+                upload_result
             )));
         }
 
@@ -149,26 +182,78 @@ impl BackendStorage for RocmStorage {
             ));
         }
 
-        let mut host_data = vec![0.0f32; self.shape.elem_count()];
         let dev_ptr_void = self.device_ptr.unwrap() as *mut c_void;
+        let elem_count = self.shape.elem_count();
 
-        // Copy from device to host
-        let res = unsafe {
-            hipMemcpy(
-                host_data.as_mut_ptr() as *mut c_void,
-                dev_ptr_void,
-                self.bytes,
-                HipMemcpyKind::DeviceToHost,
-            )
-        };
-        if res != hipSuccess {
-            return Err(Error::Backend(format!(
-                "hipMemcpyDtoH failed with error code {}",
-                res
-            )));
+        // F16/BF16 storage: the device buffer holds 2-byte elements, but the
+        // caller expects f32. We can't just memcpy into a Vec<f32> (that would
+        // reinterpret pairs of f16 values as single f32 values — a silent
+        // correctness bug). Instead, read the raw 2-byte elements into a byte
+        // buffer, then convert each to f32.
+        match self.dtype.arith {
+            grim_tensor::ArithType::F16 => {
+                let mut raw = vec![0u8; elem_count * 2];
+                let res = unsafe {
+                    hipMemcpy(
+                        raw.as_mut_ptr() as *mut c_void,
+                        dev_ptr_void,
+                        self.bytes,
+                        HipMemcpyKind::DeviceToHost,
+                    )
+                };
+                if res != hipSuccess {
+                    return Err(Error::Backend(format!(
+                        "hipMemcpyDtoH (f16) failed with error code {}",
+                        res
+                    )));
+                }
+                // Reinterpret the byte buffer as f16 (little-endian) and convert.
+                let f16_slice: &[half::f16] = unsafe {
+                    std::slice::from_raw_parts(raw.as_ptr() as *const half::f16, elem_count)
+                };
+                Ok(f16_slice.iter().map(|&h| h.to_f32()).collect())
+            }
+            grim_tensor::ArithType::BF16 => {
+                let mut raw = vec![0u8; elem_count * 2];
+                let res = unsafe {
+                    hipMemcpy(
+                        raw.as_mut_ptr() as *mut c_void,
+                        dev_ptr_void,
+                        self.bytes,
+                        HipMemcpyKind::DeviceToHost,
+                    )
+                };
+                if res != hipSuccess {
+                    return Err(Error::Backend(format!(
+                        "hipMemcpyDtoH (bf16) failed with error code {}",
+                        res
+                    )));
+                }
+                let bf16_slice: &[half::bf16] = unsafe {
+                    std::slice::from_raw_parts(raw.as_ptr() as *const half::bf16, elem_count)
+                };
+                Ok(bf16_slice.iter().map(|&b| b.to_f32()).collect())
+            }
+            // F32 and integer types: direct memcpy into f32 buffer.
+            _ => {
+                let mut host_data = vec![0.0f32; elem_count];
+                let res = unsafe {
+                    hipMemcpy(
+                        host_data.as_mut_ptr() as *mut c_void,
+                        dev_ptr_void,
+                        self.bytes,
+                        HipMemcpyKind::DeviceToHost,
+                    )
+                };
+                if res != hipSuccess {
+                    return Err(Error::Backend(format!(
+                        "hipMemcpyDtoH failed with error code {}",
+                        res
+                    )));
+                }
+                Ok(host_data)
+            }
         }
-
-        Ok(host_data)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

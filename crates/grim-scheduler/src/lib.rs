@@ -307,6 +307,119 @@ impl Scheduler {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WI 3.4.1 / 3.4.5 — Hybrid CPU/GPU attention offload (APEX-style).
+//
+// The *decision* of how to partition a sequence's KV blocks between GPU and
+// CPU for a hybrid decode step lives here in the scheduler (Gate 3.6.4:
+// scheduling policy must not live in a backend crate). The backend crates
+// expose the primitives ("run this partial on CPU", "run that partial on
+// GPU"); this module decides *which* blocks go where using the existing
+// tier-tracking API from `grim-kvtransport`.
+// ---------------------------------------------------------------------------
+
+/// Partition a sequence's physical block list into device-resident and
+/// host-offloaded halves, based on each block's current `CacheTier`.
+///
+/// Per WI 3.4.1: for a given decode step, once some KV blocks are on the
+/// `HostRam`/`NvMe` tier and some remain on-device, the attention computation
+/// needs contributions from both. This function uses the existing
+/// `SharedSpillManager::get_tier` API to classify each block — no new
+/// tier-tracking mechanism is added.
+///
+/// **Tier inference rule** (matches the spill manager's contract):
+/// - `get_tier(id) == None` → device/GPU-resident (a block that was `alloc`'d
+///   and never demoted has no tier entry).
+/// - `get_tier(id) == Some(HostRam)` or `Some(NvMe)` → host/offloaded.
+/// - `Some(Gpu)` is theoretically in the enum but never written by this spill
+///   manager; treated as device-resident (same as `None`) for safety.
+/// - `Some(NvMeWeightStream)` is for weight tensors, not KV blocks; treated as
+///   device-resident (should not appear for KV block IDs).
+///
+/// Returns `(device_blocks, host_blocks)` — the two partitions, preserving
+/// the input order within each.
+pub fn plan_hybrid_attention_step(
+    physical_ids: &[grim_kvtransport::BlockId],
+    spill: &grim_kvtransport::SharedSpillManager,
+) -> (Vec<grim_kvtransport::BlockId>, Vec<grim_kvtransport::BlockId>) {
+    use grim_kvtransport::CacheTier;
+
+    let mut device_blocks = Vec::new();
+    let mut host_blocks = Vec::new();
+    for &id in physical_ids {
+        match spill.get_tier(id) {
+            // Offloaded tiers → host side.
+            Some(CacheTier::HostRam) | Some(CacheTier::NvMe) => host_blocks.push(id),
+            // GPU-resident (explicit Gpu, NvMeWeightStream, or None for fresh
+            // alloc) → device side.
+            Some(CacheTier::Gpu) | Some(CacheTier::NvMeWeightStream) | None => {
+                device_blocks.push(id)
+            }
+        }
+    }
+    (device_blocks, host_blocks)
+}
+
+#[cfg(test)]
+mod hybrid_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn make_spill() -> grim_kvtransport::SharedSpillManager {
+        let dir = std::env::temp_dir().join(format!(
+            "grim_hybrid_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        grim_kvtransport::SharedSpillManager::new(dir, 64).unwrap()
+    }
+
+    #[test]
+    fn all_gpu_resident_blocks_go_to_device_partition() {
+        let spill = make_spill();
+        // No demotions: all blocks are None (GPU-resident).
+        let ids = vec![0usize, 1, 2, 3];
+        let (device, host) = plan_hybrid_attention_step(&ids, &spill);
+        assert_eq!(device, ids);
+        assert!(host.is_empty());
+    }
+
+    #[test]
+    fn demoted_blocks_go_to_host_partition() {
+        let spill = make_spill();
+        // Demote blocks 1 and 3 to HostRam.
+        spill.demote_to_host(1, vec![0.0; 64], vec![0.0; 64]).unwrap();
+        spill.demote_to_host(3, vec![0.0; 64], vec![0.0; 64]).unwrap();
+        let ids = vec![0usize, 1, 2, 3];
+        let (device, host) = plan_hybrid_attention_step(&ids, &spill);
+        assert_eq!(device, vec![0, 2], "GPU-resident blocks");
+        assert_eq!(host, vec![1, 3], "offloaded blocks");
+    }
+
+    #[test]
+    fn empty_block_list_returns_empty_partitions() {
+        let spill = make_spill();
+        let (device, host) = plan_hybrid_attention_step(&[], &spill);
+        assert!(device.is_empty());
+        assert!(host.is_empty());
+    }
+
+    #[test]
+    fn mixed_nvme_and_hostram_all_go_to_host() {
+        let spill = make_spill();
+        spill.demote_to_host(0, vec![0.0; 64], vec![0.0; 64]).unwrap();
+        spill.demote_to_host(1, vec![0.0; 64], vec![0.0; 64]).unwrap();
+        spill.demote_to_nvme(1).unwrap(); // block 1 → NvMe
+        // block 0 stays HostRam, block 1 → NvMe, block 2 is GPU-resident.
+        let ids = vec![0usize, 1, 2];
+        let (device, host) = plan_hybrid_attention_step(&ids, &spill);
+        assert_eq!(device, vec![2]);
+        assert_eq!(host, vec![0, 1]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

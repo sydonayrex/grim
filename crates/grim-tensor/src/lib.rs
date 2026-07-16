@@ -10,6 +10,7 @@ pub mod dtype;
 pub mod error;
 pub mod provider;
 pub mod shape;
+pub mod softmax_merge;
 pub mod tensor;
 
 pub use backend::{BackendDevice, BackendStorage, ComputeHandle, ReadyHandle, MemAdvice};
@@ -19,5 +20,6 @@ pub use dtype::{
 pub use error::{Error, Result};
 pub use provider::{RawTensor, TensorMeta, TensorProvider};
 pub use shape::Shape;
+pub use softmax_merge::{merge_all, merge_partials, SoftmaxPartial};
 pub use tensor::Tensor;
 

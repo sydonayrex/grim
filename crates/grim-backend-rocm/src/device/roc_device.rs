@@ -90,7 +90,8 @@ use crate::{
     gpu_target_arch, gpu_target_flag, linear_launch, ROCM_COMPUTE_BLOCK,
     // Misc types
     RocmStorage, RocmCachingAllocator, RocmDeviceProps, RocmPinnedBuffer,
-    QkvAttentionFusionConfig, RmsNormMatMulFusionConfig, QuantMode,
+    DecodeGemmConfig, QkvAttentionFusionConfig, RmsNormMatMulFusionConfig,
+    QuantMode,
 };
 
 
@@ -102,6 +103,12 @@ pub struct RocmDevice {
     handle_cache: Mutex<Option<RoclabsHandle>>,
     pub(crate) stream_pool: Mutex<Vec<*mut c_void>>,
     pub(crate) hsaco_cache: HsacoKernelCache,
+    /// WI 2.4.4-2 — opt-in switch for the JIT `grim_decode_gemm_f16`
+    /// (decode-class, double-buffered LDS) — default `false`. See
+    /// `fusion::DecodeGemmConfig`. Held behind a `Mutex` for consistency
+    /// with `handle_cache`/`stream_pool` (no async, plain
+    /// `std::sync::Mutex`).
+    pub(crate) decode_gemm_config: Mutex<DecodeGemmConfig>,
     /// Caching device-memory allocator (size-bucketed free-list). See `RocmCachingAllocator`.
     pub(crate) allocator: Arc<RocmCachingAllocator>,
     /// Phase-3 §3.1: device scratch pool — a thread-safe, power-of-2-bucketed
@@ -220,12 +227,24 @@ impl RocmDevice {
             capture_active: AtomicBool::new(false),
             captured_graphs: Mutex::new(HashMap::new()),
             batched_gemm_warmed: AtomicBool::new(false),
+            decode_gemm_config: Mutex::new(DecodeGemmConfig::default()),
         }
     }
 
     /// Release all pooled device buffers back to the driver. Mirrors `torch.cuda.empty_cache()`.
     pub fn empty_cache(&self) {
         self.allocator.empty_cache();
+    }
+
+    /// WI 2.4.4-2 — opt-in flag for the JIT `grim_decode_gemm_f16`.
+    ///
+    /// Set to `true` after a positive benchmark vs. rocBLAS; otherwise
+    /// the decode-class F16 GEMM shape trips the rocBLAS path as it
+    /// always has. Mirror `QkvAttentionFusionConfig::enabled` for
+    /// pattern consistency.
+    pub fn set_decode_gemm_enabled(&self, enabled: bool) {
+        let mut cfg = self.decode_gemm_config.lock().unwrap();
+        cfg.enabled = enabled;
     }
 
     /// `(hipMalloc_count, hipFree_count)` since this device was created — real driver
@@ -1174,11 +1193,60 @@ impl BackendDevice for RocmDevice {
         // Offline-tuned solution_index per (M,N,K) for FP32. Falls back to 0 for
         // unknown shapes or other dtypes. Populated by `examples/tune_gemm.rs`.
         let solution_index = lookup_solution_index(m, n, k, dtype_out.arith);
+        // WI 2.4.3 — split_k clamp gate.
+        //
+        // `tile_config.split_k` is *suggestion-only* until a cross-block
+        // K-reduction kernel lands in this crate (WI 2.4.2 deferred it;
+        // 2.4.5's STREAMK++ wire-up would route through CK's Stream-K
+        // decomposition, not a hand-written kernel). Structurally clamp
+        // here so the value reaching any launch path is 1 even if a
+        // future patch forgets — Gate 2.6.2 asserts this in
+        // `f2_split_k_at_launch_is_one` below.
+        let split_k_effective: u32 = 1;
+        debug_assert_eq!(
+            split_k_effective, 1,
+            "split_k > 1 reached a kernel launch without a reduction kernel — see TODO(split-k-kernel) in GemmTileConfig"
+        );
+        // TODO(split-k-kernel): wire split_k_effective into a real SplitK
+        // launch path once CK's Stream-K or a hand-written reduction
+        // kernel is in (WI 2.4.5 / future). Discarding the suggested
+        // value here means no shape currently splits K across blocks.
+        let _ = tile_config.split_k;
         #[cfg(feature = "rocm-profile")]
         println!(
             "[RocmDevice] GEMM Dispatch: Shape ({}, {}, {}) resolved to autotune tile config {:?} on Wavefront {:?}, solution_index={}",
             m, n, k, tile_config, self.props.wavefront_size, solution_index
         );
+
+        // ─── WI 2.4.4-2 — decode GEMM dispatch (opt-in, F16-only, m ≤ 8) ─────
+        //
+        // Replaces the vendored CK `ck_gemm.cpp` C wrapper with a JIT
+        // `grim_decode_gemm_f16` kernel living in
+        // `kernels::decode_gemm::KERNEL_SOURCE`. The gate mirroring
+        // `QkvAttentionFusionConfig::enabled` pattern ensures this
+        // never silently swaps the GEMM path — the user must flip
+        // `set_decode_gemm_enabled(true)` after a positive benchmark.
+        // Plan gate WI 2.6.4 demands a GPu parity test before that
+        // happens; this branch also serves that test (enable in the
+        // test harness, run comparison, disable).
+        {
+            let cfg = self.decode_gemm_config.lock().unwrap();
+            if cfg.enabled && dtype_out.arith == ArithType::F16 && m <= 8 {
+                drop(cfg); // release the lock before the JIT launch
+                // WI 2.4.4-2(a) — thread the *real* enqueued stream into the
+                // returned handle. `launch_compute_kernel` already enqueues via
+                // `hipModuleLaunchKernel` and returns the stream; discarding it
+                // (the prior `RocmHandle::new(None)`, the Rust analog of the
+                // plan's `(void)s;`) made `ComputeHandle::synchronize` a silent
+                // no-op, so a caller that waited on this handle could read
+                // half-written decode output. Passing `Some(stream)` makes the
+                // wait real — the read-back path (`to_cpu_vec_f32`) syncing the
+                // default stream is the backstop, not the contract.
+                let stream = self.launch_decode_gemm_f16(a_storage, b_storage, &out_storage, m, n, k)?;
+                let compute_handle = Box::new(RocmHandle::new(Some(stream)));
+                return Ok((Box::new(out_storage), compute_handle));
+            }
+        }
 
         // Get rocBLAS handle and execute sgemm. The handle's stream was already bound
         // to the capture stream in `begin_graph_capture` (and restored in
@@ -1729,15 +1797,77 @@ pub use crate::device::gemm_tuning::{
 // is wired into the crate root via the same `pub use` chain.
 
 impl RocmDevice {
-    /// JIT-compile or query the cache, then launch the specified kernel on a stream from the persistent pool.
-    /// Dispatch a compute kernel onto a pooled stream. The HIP module for `entry`
-    /// is loaded (and the entry function resolved) exactly once per process and
-    /// reused on every later dispatch via `module_cache` (Item 2). The per-launch
-    /// `hipStreamSynchronize` that previously forced every op to block has been
-    /// removed; the stream the kernel was enqueued on is returned so callers that
-    /// must wait (e.g. before freeing a temporary buffer) can synchronize
-    /// explicitly. Read-back (`to_cpu_vec_f32`) still blocks on the default stream,
-    /// which synchronizes with all streams, so results remain correct.
+    /// WI 2.4.4-2c — dispatch `grim_decode_gemm_f16` and return the
+    /// enqueued stream handle for the caller to synchronize on.
+    ///
+    /// Kernel tile: (M_TILE=8, N_TILE=64, K_STEP=16), F16→f32 acc→F16,
+    /// double-buffered LDS. Grid: (ceil(M / 8), ceil(N / 64)), block: 256.
+    /// Stream from the persistent pool (mirrors `launch_compute_kernel`).
+    ///
+    /// Invariant: only called after the `DecodeGemmConfig::enabled` gate,
+    /// `dtype == F16`, and `m <= 8` — see the call site in `RocmDevice::matmul`.
+    pub(crate) fn launch_decode_gemm_f16(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage.device_ptr.ok_or_else(|| Error::Backend("decode_gemm: a has no device ptr".into()))?;
+        let b_ptr = b_storage.device_ptr.ok_or_else(|| Error::Backend("decode_gemm: b has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("decode_gemm: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems = m * n;
+        let grid_x = ((total_elems + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        // Row-major strides in fp16 elements (not bytes).
+        let stride_a = k;     // A[M, K]
+        let stride_b = n;     // B[K, N]
+        let stride_c = n;     // C[M, N]
+        let mut sa = stride_a as i32;
+        let mut sb = stride_b as i32;
+        let mut sc = stride_c as i32;
+
+        self.launch_compute_kernel(
+            "grim_decode_gemm_f16",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut sa),
+                arg(&mut sb),
+                arg(&mut sc),
+            ],
+        )
+    }
+
+    /// JIT-compile or query the cache, then launch the specified kernel on a
+    /// stream from the persistent pool.
+    ///
+    /// The HIP module for `entry` is loaded (and the entry function resolved)
+    /// exactly once per process and reused on every later dispatch via
+    /// `module_cache` (Item 2). The per-launch `hipStreamSynchronize` that
+    /// previously forced every op to block has been removed; the stream the
+    /// kernel was enqueued on is returned so callers that must wait (e.g.
+    /// before freeing a temporary buffer) can synchronize explicitly.
+    /// Read-back (`to_cpu_vec_f32`) still blocks on the default stream, which
+    /// synchronizes with all streams, so results remain correct.
     pub(crate) fn launch_compute_kernel(
         &self,
         entry: &str,

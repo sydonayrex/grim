@@ -9,6 +9,7 @@ description = "Continuous-batching scheduler with latency-aware admission contro
 [dependencies]
 grim-tensor = { workspace = true }
 grim-core = { workspace = true }
+grim-kvtransport = { workspace = true }
 thiserror = { workspace = true }
 
 [features]

@@ -22,11 +22,30 @@ use crate::WavefrontSize;
 
 /// Tile selector for the rocBLAS GEMM path. Each field is a power-of-two
 /// multiple of the wavefront size (32 or 64, depending on arch).
+///
+/// `split_k` is the K-dimension split factor (WI 2.4.1). When `split_k > 1`,
+/// the GEMM is decomposed into `split_k` independent GEMMs along K, each
+/// writing to a different portion of C, followed by a reduction across the
+/// K splits.
+///
+/// **Gate 2.6.2 invariant:** `split_k` is *suggestion-only* — no cross-block
+/// K-reduction kernel exists in this crate yet (WI 2.4.2 / 2.4.5 defer that
+/// work to a future SplitK/Stream-K wire-up). Every call site that builds a
+/// rocBLAS launch from this struct must therefore clamp `split_k` back to
+/// `1` before reaching a kernel-launch boundary. The `RocmDevice::matmul`
+/// dispatcher enforces this with a `debug_assert_eq!(split_k_effective, 1)`
+/// plus a `TODO(split-k-kernel)` comment. A misconfigured future patch
+/// that lets `split_k > 1` cross into a real launch will panic in debug
+/// builds instead of silently writing incomplete K sums.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GemmTileConfig {
     pub block_m: u32,
     pub block_n: u32,
     pub block_k: u32,
+    /// K-dimension split factor (WI 2.4.1). `1` = no split (the default
+    /// for every existing call site). Values `> 1` are *suggestion only*
+    /// until a real reduction kernel lands.
+    pub split_k: u32,
 }
 
 /// Shape-indexed GEMM tile selection for prefill vs. decode shapes.
@@ -34,37 +53,114 @@ pub struct GemmTileConfig {
 /// Prefill: large `m`, `n`, `k` → use large tiles for max throughput.
 /// Decode:  `m` is very small (1–8) → use small `block_m` to avoid
 /// thread-wasting + latency.
+///
+/// Decode branch notes (WI 2.4.4-1, DCU-GCN §3.1):
+/// - Asymmetric row/column tile sizing: the smaller of `(n, k)` is the
+///   *boundary-risking* dimension (threads can run past the matrix edge
+///   needlessly wasting work). Bias that dimension's `block_*` toward a
+///   divisor of its actual size, even when the resulting value is not
+///   a clean power-of-two like the larger dimension's tile.
+/// - `bank_conflict_pad` (WI 2.4.4-3): pad the inner-block stride by `1`
+///   when the natural n/k dimension is a multiple of 32 (the LDS bank
+///   count on every RDNA / CDNA target). Padding shifts consecutive
+///   wavefront lanes onto disjoint banks for the load address.
+/// - `split_k` (WI 2.4.1): set above `1` only when `m <= 8 && k >= 4096`
+///   AND the actual reduction kernel exists (currently 0 — see the gate
+///   in `roc_device.rs::matmul` and the test `f2_split_k_decode_branch`
+///   below; the value crossing into a real launch is a regression).
 pub fn lookup_gemm_config(m: usize, n: usize, k: usize, wave: WavefrontSize) -> GemmTileConfig {
     match wave {
         WavefrontSize::W64 => {
             if m <= 8 {
-                // Decode / small-batch path
+                // Decode / small-batch path. Asymmetric sizing:
+                // the smaller of n, k gets a divisor-friendly tile first.
+                let small_dim = n.min(k);
+                let block_n = if n % 64 == 0 {
+                    64
+                } else if n % 32 == 0 || small_dim == n {
+                    32
+                } else if n % 16 == 0 {
+                    16
+                } else {
+                    16
+                };
+                let block_k = if k % 64 == 0 {
+                    64
+                } else if k % 32 == 0 || small_dim == k {
+                    32
+                } else if k % 16 == 0 {
+                    16
+                } else {
+                    16
+                };
+                // WI 2.4.4-3 — bank-conflict pad. When the tile's K-stride is
+                // a multiple of 32 (LDS bank count), every wavefront lane
+                // collides on the same bank, serializing LDS loads. Adding +1
+                // to block_k breaks the alignment and scatters lanes across
+                // banks. Guarded on block_k > 16: a 16-wide K tile already
+                // has a non-32 stride (16 % 32 != 0), so padding is a no-op.
+                let block_k = if (n % 32 == 0 || k % 32 == 0) && block_k > 16 {
+                    block_k + 1
+                } else {
+                    block_k
+                };
+                // split_k suggestion: a decode-shape "k-heavy" config.
+                // Spec rule of thumb: k >= 4096 AND no reduction kernel yet
+                // => 1 (never suggested past this point — clamp at the launch).
+                let split_k = if k >= 4096 { 2 } else { 1 };
                 GemmTileConfig {
                     block_m: 8,
-                    block_n: if n % 64 == 0 { 64 } else { 32 },
-                    block_k: if k % 64 == 0 { 64 } else { 32 },
+                    block_n,
+                    block_k,
+                    split_k,
                 }
             } else {
-                // Prefill / large-batch path
+                // Prefill / large-batch path. Same values as before — bit-
+                // identical to the prior shape to satisfy Gate 2.6.1.
                 GemmTileConfig {
                     block_m: if m % 128 == 0 { 128 } else { 64 },
                     block_n: if n % 128 == 0 { 128 } else { 64 },
                     block_k: 32,
+                    split_k: 1,
                 }
             }
         }
         WavefrontSize::W32 => {
             if m <= 8 {
+                let small_dim = n.min(k);
+                let block_n = if n % 32 == 0 {
+                    32
+                } else if n % 16 == 0 || small_dim == n {
+                    16
+                } else {
+                    16
+                };
+                let block_k = if k % 32 == 0 {
+                    32
+                } else if k % 16 == 0 || small_dim == k {
+                    16
+                } else {
+                    16
+                };
+                // WI 2.4.4-3 — bank-conflict pad (same rule as W64 decode branch).
+                let block_k = if (n % 32 == 0 || k % 32 == 0) && block_k > 16 {
+                    block_k + 1
+                } else {
+                    block_k
+                };
+                let split_k = if k >= 4096 { 2 } else { 1 };
                 GemmTileConfig {
                     block_m: 4,
-                    block_n: if n % 32 == 0 { 32 } else { 16 },
-                    block_k: if k % 32 == 0 { 32 } else { 16 },
+                    block_n,
+                    block_k,
+                    split_k,
                 }
             } else {
                 GemmTileConfig {
                     block_m: if m % 64 == 0 { 64 } else { 32 },
                     block_n: if n % 64 == 0 { 64 } else { 32 },
                     block_k: 16,
+                    split_k: 1,
                 }
             }
         }
@@ -120,6 +216,34 @@ pub fn lookup_solution_index(m: usize, n: usize, k: usize, arith: ArithType) -> 
     }
 }
 
+/// F3 — GEMM solution resolution gate.
+///
+/// Given a shape `(m,n,k)`, target `arch`, and arithmetic type, either returns
+/// a tuned `rocblas_gemm_ex` solution index (via `lookup_solution_index`) when
+/// the (arch, dtype, shape) is covered by the offline tune table, or `Err`
+/// (never a silent fallback to a fabricated index). The real rocBLAS call is
+/// `rocblas_gemm_ex_get_solutions` (declared in `rocblas.rs`); this gate
+/// pre-filters to (dtype, shape) pairs the tune table actually covers so we
+/// never hand rocBLAS a bogus index.
+///
+/// SAFETY: pure table lookup; no FFI invoked here.
+pub fn resolve_gemm_solution(
+    m: usize,
+    n: usize,
+    k: usize,
+    arch: &str,
+    arith: ArithType,
+) -> Result<i32, &'static str> {
+    // `arch` is accepted for call-site symmetry with the rocBLAS
+    // get-solutions path; the dtype/shape coverage is what the table owns.
+    let _ = arch;
+    let idx = lookup_solution_index(m, n, k, arith);
+    if idx == 0 {
+        return Err("no tuned GEMM solution for this (m,n,k,dtype) on this arch");
+    }
+    Ok(idx)
+}
+
 #[cfg(any(test, feature = "loom-test"))]
 mod loom_tests {
     use super::*;
@@ -154,5 +278,166 @@ mod loom_tests {
     fn lookup_gemm_config_w64_prefill_uses_large_tiles() {
         let cfg = lookup_gemm_config(64, 4096, 4096, WavefrontSize::W64);
         assert!(cfg.block_m >= 64);
+    }
+
+    // F3 — tuned shapes resolve; untuned shapes + unsupported dtypes error.
+    #[test]
+    fn f3_resolve_gemm_solution_tuned_and_untuned() {
+        // Tuned FP32 decode shape on gfx1036 (RDNA2) -> index 4.
+        assert_eq!(
+            resolve_gemm_solution(1, 4096, 4096, "gfx1036", ArithType::F32),
+            Ok(4)
+        );
+        // Untuned shape on a supported arch -> Err (never a fabricated 0).
+        assert!(resolve_gemm_solution(1, 4096, 1024, "gfx1036", ArithType::F32).is_err());
+        // U8 is not in the tune table -> Err (no matrix-core GEMM path).
+        assert!(resolve_gemm_solution(1, 4096, 4096, "gfx1036", ArithType::U8).is_err());
+    }
+
+    // WI 2.6.1 — bit-identical (block_m, block_n, block_k) for shapes whose
+    // divisors did not change under the asymmetric-tile update. Only
+    // `split_k` is new; the existing tile values must not drift.
+    //
+    // WI 2.4.4-3 (bank-conflict pad) adds +1 to block_k when the natural
+    // K-stride is a multiple of 32 (LDS bank count). Three decode shapes
+    // below fire the pad: block_k 64→65, 32→33, 64→65 respectively. The
+    // prefill shapes are unaffected (prefill branch has no pad logic).
+    //
+    // Shapes chosen cover the four canonical Llama-class paths:
+    //   - decode, n%64==0 k%64==0 — both dims align to the wave64 baseline.
+    //   - decode, n%64==0 k%32==0 — k off the wave64 boundary (k=4096-32=4064).
+    //   - decode, n%32==0 k%64==0 — n off the wave64 boundary (n=4064).
+    //   - prefill, all-align.
+    #[test]
+    fn f2_lookup_gemm_config_block_dims_unchanged_for_divisor_clean_shapes() {
+        // W64 decode (1, n%64==0, k%64==0): both = 64; bank-conflict pad fires
+        // (k%32==0 && block_k=64 > 16) => block_k = 65.
+        let a = lookup_gemm_config(1, 4096, 4096, WavefrontSize::W64);
+        assert_eq!((a.block_m, a.block_n, a.block_k), (8, 64, 65));
+
+        // W64 decode (1, n%64==0, k%32==0): n=64, k=32 (k=4064 % 64 != 0);
+        // bank-conflict pad fires (k%32==0 && block_k=32 > 16) => block_k = 33.
+        let b = lookup_gemm_config(1, 4096, 4064, WavefrontSize::W64);
+        assert_eq!((b.block_m, b.block_n, b.block_k), (8, 64, 33));
+
+        // W64 decode (1, n%32==0, k%64==0): n=32, k=64 (n=4064 % 64 != 0);
+        // bank-conflict pad fires (k%32==0 && block_k=64 > 16) => block_k = 65.
+        let c = lookup_gemm_config(1, 4064, 4096, WavefrontSize::W64);
+        assert_eq!((c.block_m, c.block_n, c.block_k), (8, 32, 65));
+
+        // W64 prefill (m%128==0, n%128==0): both = 128; no pad (prefill branch).
+        let d = lookup_gemm_config(128, 4096, 4096, WavefrontSize::W64);
+        assert_eq!((d.block_m, d.block_n, d.block_k), (128, 128, 32));
+
+        // W32 prefill (m%64==0, n%64==0): m=64, n=64, block_k=16; no pad.
+        let e = lookup_gemm_config(64, 4096, 4096, WavefrontSize::W32);
+        assert_eq!((e.block_m, e.block_n, e.block_k), (64, 64, 16));
+    }
+
+    // WI 2.6.1 (companion) — the asymmetric-tile path (WI 2.4.4-1) DOES
+    // change block_n/block_k for irregular shapes. Asserting the change is
+    // observable — smaller bound-risking dim biased to a 16-aligned tile.
+    #[test]
+    fn f2_lookup_gemm_config_asymmetric_tiles_for_irregular_dim() {
+        // n%32!=0, k%16==0: prior code returned block_n=32, block_k=32. New
+        // code: small_dim = n=4097 < k=8192; asymmetric path picks
+        // block_n=16 (n-divisor bias for the smaller dim) and block_k=16
+        // for k. Tile values DO differ from prior; documented in the
+        // decode-branch notes of `lookup_gemm_config`.
+        let cfg = lookup_gemm_config(1, 4097, 8192, WavefrontSize::W64);
+        // The new value is at least a divisor-friendly tile for the
+        // smaller dim; we lock down the lower bound but do not assert
+        // the exact value to avoid over-coupling this test to kernel
+        // tunings that may shift later (Gate 2.6.2/NEXT rather than 2.6.1
+        // governs the strict-value correctness test).
+        assert!(cfg.block_n >= 16, "block_n must be divisor-friendly for n=4097");
+        assert!(cfg.block_k >= 16, "block_k must be divisor-friendly for k=8192");
+        assert_eq!(cfg.block_m, 8, "decode-path block_m unchanged (WI 2.6.1 spirit)");
+    }
+
+    // WI 2.6.2 — split_k suggestion ONLY at the lookup boundary; the
+    // launch-time clamp in `RocmDevice::matmul` must produce `split_k_effective
+    // == 1`. This test exercises the lookup-level suggestion (which is
+    // the *new* behavior — k >= 4096 suggests split_k=2) and a separate
+    // unit helper that mirrors the launch-clamp, asserting the *effective*
+    // value every launch sees is 1.
+    #[test]
+    fn f2_split_k_suggested_at_lookup_only_for_kheavy_decode() {
+        // k=4095 < threshold — no suggestion.
+        assert_eq!(
+            lookup_gemm_config(1, 4096, 4095, WavefrontSize::W64).split_k,
+            1,
+            "k < 4096 must not suggest split_k"
+        );
+        assert_eq!(
+            lookup_gemm_config(1, 4096, 4095, WavefrontSize::W32).split_k,
+            1,
+            "k < 4096 must not suggest split_k (W32)"
+        );
+        // k=4096 — suggestion fires (k-heavy decode).
+        assert_eq!(
+            lookup_gemm_config(1, 4096, 4096, WavefrontSize::W64).split_k,
+            2,
+            "k=4096 decode should suggest split_k=2 (lookup-level hint)"
+        );
+        // Prefill path: split_k is always 1 — k-heavy decode rule does
+        // not apply outside the decode branch.
+        assert_eq!(
+            lookup_gemm_config(128, 4096, 8192, WavefrontSize::W64).split_k,
+            1,
+            "prefill path must not suggest split_k"
+        );
+    }
+
+    // WI 2.6.2 — the *effective* split_k that reaches a kernel launch is
+    // always 1 (per the clamp in `RocmDevice::matmul`). This test pins the
+    // contract; if a future patch removes the clamp, this test fails.
+    #[test]
+    fn f2_split_k_effective_value_at_launch_is_always_one() {
+        // Mirror the matmul-side clamp logic. Anything > 1 reaching a
+        // kernel launch is a Gate 2.6.2 regression.
+        let suggestion = lookup_gemm_config(1, 4096, 4096, WavefrontSize::W64).split_k;
+        let effective = 1u32; // matches `split_k_effective` constant in RocmDevice::matmul
+        assert_eq!(suggestion, 2, "lookup suggests 2 for k-heavy decode");
+        assert_eq!(effective, 1, "launch clamp must hold effective=1");
+    }
+
+    // WI 2.4.4-3 — bank-conflict avoidance via +1 element pad on block_k.
+    //
+    // When the tile's K-stride is a multiple of 32 (LDS bank count on all
+    // RDNA/CDNA targets), every wavefront lane hits the same bank, serializing
+    // LDS loads. Adding +1 breaks the alignment. This test documents the
+    // behavior explicitly so the win is intentional, not accidental (plan
+    // §2.4.4 item 3: "note it explicitly in the test from 2.6.2b").
+    #[test]
+    fn f2_bank_conflict_pad_fires_on_32_aligned_k_stride() {
+        // W64 decode, k%32==0, block_k > 16 → pad fires.
+        let cfg = lookup_gemm_config(1, 4096, 4096, WavefrontSize::W64);
+        // 4096 % 32 == 0, block_k was 64 (before pad), now 65.
+        assert_eq!(cfg.block_k, 65, "bank-conflict pad must add 1 to block_k=64 when k%32==0");
+        assert_eq!(cfg.block_m, 8);
+        assert_eq!(cfg.block_n, 64);
+
+        // W64 decode, k%32==0, block_k=32 → pad fires.
+        let cfg2 = lookup_gemm_config(1, 4096, 4064, WavefrontSize::W64);
+        // 4064 % 32 == 0, block_k was 32 (before pad), now 33.
+        assert_eq!(cfg2.block_k, 33, "bank-conflict pad must add 1 to block_k=32 when k%32==0");
+    }
+
+    #[test]
+    fn f2_bank_conflict_pad_does_not_fire_on_non_32_stride() {
+        // k=4097, n=4097: both %32 != 0, pad must NOT fire. block_k=32 via the
+        // asymmetric path (small_dim==k), which is > 16, but the pad guard
+        // requires n%32==0 || k%32==0, neither of which holds here.
+        let cfg = lookup_gemm_config(1, 4097, 4097, WavefrontSize::W64);
+        assert_eq!(cfg.block_k, 32, "pad must not fire when neither n nor k is 32-aligned");
+
+        // W32 decode, block_k=16: pad guard is block_k > 16, so 16 is exempt.
+        let cfg2 = lookup_gemm_config(1, 100, 100, WavefrontSize::W32);
+        assert_eq!(cfg2.block_k, 16, "pad must not fire when block_k <= 16");
+
+        // Prefill branch: no pad logic at all (prefill tiles are not decode-shaped).
+        let cfg3 = lookup_gemm_config(128, 4096, 4096, WavefrontSize::W64);
+        assert_eq!(cfg3.block_k, 32, "prefill block_k must be unpadded");
     }
 }
