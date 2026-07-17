@@ -70,6 +70,8 @@ void grim_qkv_attention(
     const float* __restrict__ k_tensor,
     const float* __restrict__ v_tensor,
     float* __restrict__ out,
+    float* __restrict__ out_max,
+    float* __restrict__ out_sum,
     int num_heads,
     int num_kv_heads,
     int head_dim,
@@ -108,11 +110,11 @@ void grim_qkv_attention(
     //
     // WI 1.4.2 (wave64 hardware — RDNA dGPU / CDNA): the causal KV walk is
     // split across the 4 wavefronts in the 256-thread block, each owning a
-    // contiguous quarter. The 4 partial (max, sum, acc[d]) states are merged
-    // in wave 0 after __syncthreads().
+    // quarter-stride partitioning of the sequence. At the end, wave 0
+    // combines the 4 wavefront partials in shared memory LDS.
     //
     // Wave32 hardware fallback (RDNA iGPU, gfx1036 et al.): warpSize resolves
-    // to 32 at runtime. The host launches block = wave_size (single
+    // to 32 at runtime; the host launches block = wave_size (single
     // wavefront); WI 1.4.2's per-d up-axis at head_dim > wave_size would be
     // incomplete. We constrain head_dim ≤ wave_size and run a single-thread
     // (per dim) softmax — same algorithm, no parallelism across KV. This is a
@@ -122,9 +124,8 @@ void grim_qkv_attention(
     const int wave_size = warpSize;
     const int wave_id = tid / wave_size;
     const int lane_id = tid % wave_size;
-    // On wave64 hardware the host launches 256 threads = 4 wavefronts;
-    // on wave32 hardware (RDNA iGPU) the host launches wave_size threads
-    // (single wavefront fallback). Either way num_waves = block / wave_size.
+    // Block is fixed at 256 (`__launch_bounds__(256)`); num_waves = block_size / wave_size
+    // adapts to RDNA iGPU wave32 (num_waves=8) and RDNA dGPU / CDNA wave64 (num_waves=4).
     const int num_waves = 256 / wave_size;
 
     const int d = lane_id;
@@ -168,45 +169,39 @@ void grim_qkv_attention(
     float running_max = -1e30f;
     float running_sum = 0.0f;
 
-    // Walk this wavefront's K/V slice [j_start, j_end).
+    // Fast-path GQA key/value stride pointers
+    const float* __restrict__ k_head = &k_tensor[kv_head * head_dim];
+    const float* __restrict__ v_head = &v_tensor[kv_head * head_dim];
+
+    // Inner loop: online-softmax over assigned range
     for (int j = j_start; j < j_end; ++j) {
-        const int kv_offset = (j * num_kv_heads + kv_head) * head_dim;
-
-        // Score = dot(q[i,h,:], k[j, kv_head, :])
-        float local_score = 0.0f;
-        if (thread_active) {
-            local_score = q[q_offset + d] * k_tensor[kv_offset + d];
+        // Dot product Q.K for this head
+        float score = 0.0f;
+        #pragma unroll
+        for (int dim = 0; dim < 64; ++dim) {
+            if (dim < head_dim) {
+                score += q[q_offset + dim] * k_head[j * (num_kv_heads * head_dim) + dim];
+            }
         }
+        score *= inv_sqrt_d;
 
-        // Reduce local_score across the wavefront (tree).
-        float s = local_score;
-        for (int offset = wave_size / 2; offset > 0; offset >>= 1) {
-            s += __shfl_xor(s, offset);
-        }
-        s *= inv_sqrt_d;
+        // Online-softmax update
+        const float old_max = running_max;
+        running_max = fmaxf(running_max, score);
+        const float scale_old = expf(old_max - running_max);
+        const float scale_new = expf(score - running_max);
 
-        if (!thread_active) continue;
-
-        // ---- online softmax update (numerically stable) ----
-        float w = expf(s - running_max);
-        if (s > running_max) {
-            const float scale = expf(running_max - s);
-            running_sum = running_sum * scale;
-            out_acc = out_acc * scale;
-            running_max = s;
-            w = 1.0f;
-        }
-        out_acc += w * v_tensor[kv_offset + d];
-        running_sum += w;
+        running_sum = running_sum * scale_old + scale_new;
+        out_acc = out_acc * scale_old + scale_new * v_head[j * (num_kv_heads * head_dim) + d];
     }
 
     // Publish per-wavefront partials to LDS. max/sum are wavefront-uniform
-    // (score reduce makes them identical across lanes), so only lane 0 writes.
+    // (all lanes see same j_start/j_end loop range). Wave 0 (lane 0) publishes
+    // the max/sum state.
     if (lane_id == 0) {
         s_max[wave_id] = running_max;
         s_sum[wave_id] = running_sum;
     }
-    // acc is per-dim; every active lane writes its own slot. Inactive lanes
     // (d >= head_dim) leave the slot at its default 0 (harmless for the merge).
     if (thread_active) {
         s_acc[wave_id][d] = out_acc;
@@ -245,6 +240,15 @@ void grim_qkv_attention(
         // F5 guard: zero-output (e.g. empty KV) must not produce NaN.
         const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
         out[q_offset + d] = acc_final * inv_sum;
+    }
+
+    if (tid == 0) {
+        if (out_max != nullptr) {
+            out_max[i * num_heads + h] = m_final;
+        }
+        if (out_sum != nullptr) {
+            out_sum[i * num_heads + h] = sum_final;
+        }
     }
 }
 

@@ -2039,6 +2039,8 @@ impl RocmDevice {
         kv_seq_len: usize,
         cache_offset: u32,
         out_shape: &Shape,
+        out_max: Option<&dyn BackendStorage>,
+        out_sum: Option<&dyn BackendStorage>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         // ─── enabled gate ────────────────────────────────────────────────
         // Build the config up front to read its gate. We allow the caller
@@ -2107,6 +2109,18 @@ impl RocmDevice {
         let mut q_ptr = dev_ptr(q_s)?;
         let mut k_ptr = dev_ptr(k_s)?;
         let mut v_ptr = dev_ptr(v_s)?;
+
+        let mut max_ptr: u64 = 0;
+        if let Some(m) = out_max {
+            let m_s = as_rocm(m)?;
+            max_ptr = dev_ptr(m_s)?;
+        }
+        let mut sum_ptr: u64 = 0;
+        if let Some(s) = out_sum {
+            let s_s = as_rocm(s)?;
+            sum_ptr = dev_ptr(s_s)?;
+        }
+
         let mut num_heads_i = config.num_heads as i32;
         let mut num_kv_heads_i = config.num_kv_heads as i32;
         let mut head_dim_i = config.head_dim as i32;
@@ -2122,7 +2136,7 @@ impl RocmDevice {
         // entire dispatch; the lifetime covers the launch below.
         let mut inv_sqrt_d_stable = inv_sqrt_d_ptr; // keep the pointer pinned
 
-        // Build the arg slice with all 11 params in the order the kernel
+        // Build the arg slice with all 13 params in the order the kernel
         // signature declares them.
         let mut qptr = q_ptr;
         let mut kptr = k_ptr;
@@ -2145,6 +2159,8 @@ impl RocmDevice {
                 arg(&mut kptr),
                 arg(&mut vptr),
                 arg(&mut optr),
+                arg(&mut max_ptr),
+                arg(&mut sum_ptr),
                 arg(&mut nh),
                 arg(&mut nkv),
                 arg(&mut hd),
@@ -2158,7 +2174,7 @@ impl RocmDevice {
         // Surface we used the temp pointers (suppress unused-mut warnings) and
         // keep them alive for the duration of the kernel call.
         let _ = (
-            qptr, kptr, vptr, optr, nh, nkv, hd, sl, ksl, co, isd, inv_sqrt_d_stable,
+            qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd, inv_sqrt_d_stable,
         );
 
         Ok((Box::new(storage), Box::new(RocmHandle::new(None))))

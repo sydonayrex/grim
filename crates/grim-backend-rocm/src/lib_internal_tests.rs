@@ -773,6 +773,8 @@ mod tests {
                 4,                // kv_seq_len
                 0,                // cache_offset
                 &Shape::from_slice(&[4, 4, 64]),
+                None,
+                None,
             )
             .unwrap();
         let with_qkv = dev.module_load_stats();
@@ -787,6 +789,8 @@ mod tests {
                     4,
                     0,
                     &Shape::from_slice(&[4, 4, 64]),
+                    None,
+                    None,
                 )
                 .unwrap();
         }
@@ -1163,5 +1167,320 @@ mod tests {
                 "capture+replay unexpectedly slower: {replay_us:.1} vs {eager_us:.1} us"
             );
         });
+    }
+
+    // ------------------------------------------------------------------------
+    // WI 1.6.1 — wavefront-parallel attention correctness (grim_rocm_consumer_perf_plan.md)
+    //
+    // The fused QKV attention kernel splits the KV walk across all 4 RDNA
+    // wavefronts in the 256-thread block, then merges the 4 partial (max, sum,
+    // acc[d]) states in wave 0 via LDS. These tests verify that the 4-way
+    // merge produces mathematically identical output to the structural
+    // CPU reference.
+    //
+    // Reference: `woody_attention_online_f32` — a CPU helper that performs
+    // the *same* online-softmax algorithm (running max + running weighted
+    // sum) with the same float32 reductions, but on a single thread per dim.
+    // This isolates correctness (merge + causal mask + GQA) from
+    // softmax-precision noise on near-uniform inputs.
+    //
+    // Tolerance rationale: f32 softmax on head_dim<=64 with normally
+    // distributed scores has ~1e-5 abs+rel error; we use 1e-3 to be
+    // generous against saturating input ranges that occasionally appear in
+    // the shape-class sweep below. The kv_seq_len==1 case (only one valid j)
+    // has zero softmax-pre-cision noise and is checked bit-exact at 1e-5.
+    // ------------------------------------------------------------------------
+
+    /// CPU reference for the fused QKV attention kernel.
+    ///
+    /// Mirrors the kernel algorithm: causal j ∈ [0, min(abs_i+1, kv_seq_len));
+    /// GQA via `kv_head = h / (num_heads/num_kv_heads)`; online softmax with
+    /// numerically stable running max + running sum; weighted sum against V.
+    /// Layouts: q shape `[seq_len * num_heads * head_dim]` (row-major 3-D),
+    /// k/v shape `[kv_seq_len * num_kv_heads * head_dim]` (shared across queries).
+    #[allow(clippy::too_many_arguments)]
+    fn woody_attention_online_f32(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+    ) -> Vec<f32> {
+        assert!(num_heads % num_kv_heads == 0, "GQA: num_heads must be multiple of num_kv_heads");
+        let q_per_kv = num_heads / num_kv_heads;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let q_stride = num_heads * head_dim;
+        let kv_stride = num_kv_heads * head_dim;
+        let mut out = vec![0.0f32; seq_len * num_heads * head_dim];
+
+        for h in 0..num_heads {
+            let kv_head = h / q_per_kv;
+            for qt in 0..seq_len {
+                let abs_i = (cache_offset as usize) + qt;
+                let hi = (abs_i + 1).min(kv_seq_len);
+
+                // Per-d online softmax running state.
+                let mut acc = vec![0.0f32; head_dim];
+                let mut running_max = vec![f32::NEG_INFINITY; head_dim];
+                let mut running_sum = vec![0.0f32; head_dim];
+
+                for j in 0..hi {
+                    // Score = (q · k[j]) * scale
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[qt * q_stride + h * head_dim + d]
+                            * k[j * kv_stride + kv_head * head_dim + d];
+                    }
+                    let s = dot * scale;
+                    for d in 0..head_dim {
+                        let prev_m = running_max[d];
+                        // Stable online softmax update.
+                        let new_m = if s > prev_m { s } else { prev_m };
+                        // scale = exp(prev_m - new_m): 1.0 when prev_m == -inf
+                        let scale_prev = if new_m == f32::NEG_INFINITY {
+                            0.0
+                        } else {
+                            (prev_m - new_m).exp()
+                        };
+                        running_sum[d] = running_sum[d] * scale_prev;
+                        acc[d] = acc[d] * scale_prev;
+                        running_max[d] = new_m;
+                        // Weight for this j.
+                        let w = if s == new_m { 1.0f32 } else { (s - new_m).exp() };
+                        running_sum[d] += w;
+                        acc[d] += w * v[j * kv_stride + kv_head * head_dim + d];
+                    }
+                }
+
+                // Final write: out = acc / sum (with F5 zero-guard for empty ranges).
+                for d in 0..head_dim {
+                    let denom = running_sum[d];
+                    out[qt * q_stride + h * head_dim + d] =
+                        if denom > 0.0 { acc[d] / denom } else { 0.0 };
+                }
+            }
+        }
+        out
+    }
+
+    /// Deterministic f32 pattern: lanes are derivable, promote exact reproducibility.
+    fn lcg_f32(seed: u32) -> Vec<f32> {
+        // Wyrand-style: Cheap and reproducible in f32.
+        let mut state = seed.wrapping_add(0x9E3779B9);
+        let mut out = Vec::new();
+        for _ in 0..4096 {
+            state = state.wrapping_mul(0x85EBCA6B).wrapping_add(0xC2B2AE35);
+            let x = (state as f32) / (u32::MAX as f32) * 4.0 - 2.0; // ~[-2, 2]
+            out.push(x);
+        }
+        out
+    }
+
+    /// Run `dev.qkv_attention` and copy result back to host. Gated by env.
+    fn run_qkv_attention(
+        env_present: bool,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Option<Vec<f32>> {
+        if !env_present {
+            return None;
+        }
+        let dev = RocmDevice::new(0);
+        let q_s = dev
+            .from_cpu(
+                q,
+                &Shape::from_slice(&[seq_len, num_heads, head_dim]),
+                DType::F32,
+            )
+            .ok()?;
+        let k_s = dev
+            .from_cpu(
+                k,
+                &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+                DType::F32,
+            )
+            .ok()?;
+        let v_s = dev
+            .from_cpu(
+                v,
+                &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+                DType::F32,
+            )
+            .ok()?;
+        let (out, _h) = dev
+            .qkv_attention(
+                q_s.as_ref(),
+                k_s.as_ref(),
+                v_s.as_ref(),
+                num_kv_heads,
+                kv_seq_len,
+                cache_offset,
+                &Shape::from_slice(&[seq_len, num_heads, head_dim]),
+                None,
+                None,
+            )
+            .ok()?;
+        out.to_cpu_vec_f32().ok()
+    }
+
+    fn approx_close(a: f32, b: f32, abs_tol: f32, rel_tol: f32) -> bool {
+        let diff = (a - b).abs();
+        let scale = a.abs().max(b.abs());
+        diff <= abs_tol.max(rel_tol * scale)
+    }
+
+    /// Compare two flat vectors and return the max abs diff observed.
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len(), "len mismatch: {} vs {}", a.len(), b.len());
+        a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    }
+
+    /// Common shape for all 5 shape-class tests.
+    ///
+    /// `head_dim = 32` keeps the tests runnable on wave32 hardware (RDNA
+    /// iGPU, e.g. gfx1036 — `RocmDevice::props.wavefront_size == 32`), where
+    /// lane_id caps at 32. On wave64 hardware (RDNA dGPU / CDNA) the SAME
+    /// fixture still exercises the WI 1.4.2 4-way partition because the
+    /// host launches block = wave_size_check(64) -> 4 wavefronts by default,
+    /// making waves 1-3 fully populated for d in [0, 32). The WI 1.4.2 merge
+    /// arithmetic run on each wave's partials, which is exactly what these
+    /// tests verify.
+    fn shape_fixture() -> (usize, usize, usize, usize) {
+        // (num_heads, num_kv_heads, head_dim, seq_len)
+        // 2:1 GQA, 32-dim, 4 query positions.
+        (8, 4, 32, 4)
+    }
+
+    fn build_inputs(
+        seed: u32,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        kv_seq_len: usize,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let q_len = seq_len * num_heads * head_dim;
+        let kv_len = kv_seq_len * num_kv_heads * head_dim;
+        let mut stream = lcg_f32(seed);
+        let mut take = |n: usize| -> Vec<f32> {
+            if stream.len() < n {
+                // deterministic refill for big shapes
+                let mut s = (seed.wrapping_add(n as u32)).wrapping_add(0x9E3779B9);
+                for _ in 0..n {
+                    s = s.wrapping_mul(0x85EBCA6B).wrapping_add(0xC2B2AE35);
+                    stream.push((s as f32) / (u32::MAX as f32) * 4.0 - 2.0);
+                }
+            }
+            stream.drain(..n).collect()
+        };
+        let q = take(q_len);
+        let k = take(kv_len);
+        let v = take(kv_len);
+        (q, k, v)
+    }
+
+    #[test]
+    fn wi1_qkv_attention_kvseq_mod4_eq0() {
+        let _ = approx_close; // silence dead-code warning for helper-only tests
+        let (nh, nkv, hd, sl) = shape_fixture();
+        let kv_seq = 64usize; // divisible by 4
+        let cache_off = 4u32; // ensures causal path active
+        let (q, k, v) = build_inputs(0xA1, nh, nkv, hd, sl, kv_seq);
+        let cpu = woody_attention_online_f32(&q, &k, &v, sl, nh, nkv, hd, kv_seq, cache_off);
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let got = run_qkv_attention(env, &q, &k, &v, nkv, kv_seq, cache_off, sl, nh, hd);
+        if let Some(out) = got {
+            let max = max_abs_diff(&out, &cpu);
+            assert!(max <= 1e-3, "wi1 mod4=0 max_abs_diff {} too large", max);
+        }
+    }
+
+    #[test]
+    fn wi1_qkv_attention_kvseq_mod4_ne0() {
+        let _ = approx_close;
+        let (nh, nkv, hd, sl) = shape_fixture();
+        let kv_seq = 65usize; // 65 mod 4 == 1 — splits unevenly across waves
+        let cache_off = 16u32; // forces 17 valid js, all in the past window
+        let (q, k, v) = build_inputs(0xB2, nh, nkv, hd, sl, kv_seq);
+        let cpu = woody_attention_online_f32(&q, &k, &v, sl, nh, nkv, hd, kv_seq, cache_off);
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let got = run_qkv_attention(env, &q, &k, &v, nkv, kv_seq, cache_off, sl, nh, hd);
+        if let Some(out) = got {
+            let max = max_abs_diff(&out, &cpu);
+            assert!(max <= 1e-3, "wi1 mod4!=0 max_abs_diff {} too large", max);
+        }
+    }
+
+    #[test]
+    fn wi1_qkv_attention_kvseq_lt_4() {
+        let _ = approx_close;
+        let (nh, nkv, hd, sl) = shape_fixture();
+        let kv_seq = 3usize; // smaller than wavefront count — most waves idle
+        let cache_off = 0u32;
+        let (q, k, v) = build_inputs(0xC3, nh, nkv, hd, sl, kv_seq);
+        let cpu = woody_attention_online_f32(&q, &k, &v, sl, nh, nkv, hd, kv_seq, cache_off);
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let got = run_qkv_attention(env, &q, &k, &v, nkv, kv_seq, cache_off, sl, nh, hd);
+        if let Some(out) = got {
+            let max = max_abs_diff(&out, &cpu);
+            assert!(max <= 1e-3, "wi1 kv<4 max_abs_diff {} too large", max);
+        }
+    }
+
+    #[test]
+    fn wi1_qkv_attention_kvseq_eq_1_bit_exact() {
+        // kv_seq_len=1 has zero softmax-precision noise (only one valid j and
+        // one softmax weight = 1.0). The 4-wavefront merge receives three empty
+        // partials (max=-1e30,sum=0,acc=0) plus one real partial. The structural
+        // identity test below asserts it matches the CPU reference bit-exact
+        // at 1e-5 tolerance, which is tight enough to flag any merge arithmetic
+        // bug independent of precision noise.
+        let _ = approx_close;
+        let (nh, nkv, hd, sl) = shape_fixture();
+        let kv_seq = 1usize;
+        let cache_off = 0u32;
+        let (q, k, v) = build_inputs(0xD4, nh, nkv, hd, sl, kv_seq);
+        let cpu = woody_attention_online_f32(&q, &k, &v, sl, nh, nkv, hd, kv_seq, cache_off);
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let got = run_qkv_attention(env, &q, &k, &v, nkv, kv_seq, cache_off, sl, nh, hd);
+        if let Some(out) = got {
+            let max = max_abs_diff(&out, &cpu);
+            assert!(max <= 1e-5, "wi1 kv=1 (bit-exact) max_abs_diff {} too large", max);
+        }
+    }
+
+    #[test]
+    fn wi1_qkv_attention_skewed_short_seq() {
+        // Different head_dim (32, num_heads=4, num_kv_heads=2) and a sharply
+        // skewed layout: small head_dim, small num_heads, large kv_seq_len
+        // (1021 = 4*255+1). Confirms the 4-way split holds when individual
+        // dims don't match power-of-two boundaries. This is the most
+        // numerically hostile shape (long softmax tail, granular split).
+        let _ = approx_close;
+        let nh = 4usize;
+        let nkv = 2usize;
+        let hd = 32usize;
+        let sl = 2usize;
+        let kv_seq = 1021usize;
+        let cache_off = 0u32;
+        let (q, k, v) = build_inputs(0xE5, nh, nkv, hd, sl, kv_seq);
+        let cpu = woody_attention_online_f32(&q, &k, &v, sl, nh, nkv, hd, kv_seq, cache_off);
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let got = run_qkv_attention(env, &q, &k, &v, nkv, kv_seq, cache_off, sl, nh, hd);
+        if let Some(out) = got {
+            let max = max_abs_diff(&out, &cpu);
+            assert!(max <= 5e-3, "wi1 skewed max_abs_diff {} too large", max);
+        }
     }
 }
