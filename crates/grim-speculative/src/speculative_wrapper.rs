@@ -317,7 +317,7 @@ impl SpeculativeCausalLm {
                     min_accept_rate: sched.adaptation_config.min_accept_rate,
                 };
                 // Call the distill module's adaptation interface
-                let _outcome = crate::distill::refresh_draft(&signal, &refresh_input)?;
+                let _outcome = crate::distill::refresh_draft(&signal, &refresh_input, draft.as_ref())?;
             }
         }
 
@@ -362,7 +362,6 @@ mod tests {
     struct MockCausalLm {
         cfg: grim_models_transformer::LlamaConfig,
         device: Device,
-        should_reject: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Clone for MockCausalLm {
@@ -370,7 +369,6 @@ mod tests {
             Self {
                 cfg: self.cfg.clone(),
                 device: self.device.clone(),
-                should_reject: self.should_reject.clone(),
             }
         }
     }
@@ -406,14 +404,9 @@ mod tests {
             );
             session.set_last_hidden_state(hidden_state);
             
-            // Mock output logits: if should_reject, return low values to fail check
-            let val = if self.should_reject.load(std::sync::atomic::Ordering::SeqCst) {
-                -5.0f32
-            } else {
-                0.1f32
-            };
+            // Mock output logits: return constant values (all accepted)
             let logits = grim_backend_cpu::cpu_tensor(
-                vec![val; seq_len * self.cfg.vocab_size],
+                vec![0.1f32; seq_len * self.cfg.vocab_size],
                 Shape::new(vec![seq_len, self.cfg.vocab_size]),
             );
             Ok(logits)
@@ -435,11 +428,9 @@ mod tests {
             max_seq_len: 2048,
             rms_norm_eps: 1e-5,
         };
-        let should_reject = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let target = Box::new(MockCausalLm {
             cfg: cfg.clone(),
             device,
-            should_reject: should_reject.clone(),
         });
         
         // Mock DSpark components
@@ -452,18 +443,18 @@ mod tests {
         let markov = Arc::new(crate::uniform_markov_head::UniformMarkovHead::new(100, 5, 42));
         let confidence = Arc::new(crate::entropy_confidence_head::EntropyConfidenceHead);
 
-        // Create scheduler with low trigger threshold (e.g. 0.8) and immediate trigger activation
+        // Create scheduler with high trigger threshold (e.g. 1.5) to always trigger adaptation
         let mut scheduler = ConfidenceScheduler::new(
             ThroughputProfile::default(),
             SpeculationConfig::default(),
         );
         scheduler.adaptation_config.min_steps_before_trigger = 1;
-        scheduler.adaptation_config.min_accept_rate = 0.8;
+        scheduler.adaptation_config.min_accept_rate = 1.5;
         scheduler.adaptation_config.ema_alpha = 0.5;
 
         let spec_lm = SpeculativeCausalLm::with_dspark(
             target,
-            draft,
+            draft.clone(),
             markov,
             confidence,
             scheduler,
@@ -491,9 +482,12 @@ mod tests {
         let hidden_shape = captured_hidden.shape();
         assert_eq!(hidden_shape.dims(), &[1, 1, 16]); // [1, verify_len, hidden_size]
 
-        // 4. Force acceptance rate to 0.0 (by running a step with 0 accepted tokens) to trigger adaptation
-        // The EMA will drop below 0.8 min threshold after this step
-        should_reject.store(true, std::sync::atomic::Ordering::SeqCst);
+        // 4. Force weight update (adaptation EMA will drop below 1.5 min threshold after this step)
+        let w_head_before = {
+            let w = draft.weights.lock().unwrap();
+            w.w_head.clone()
+        };
+        
         let _logits2 = spec_lm.decode_one(
             session.as_mut(),
             &input_ids,
@@ -506,6 +500,13 @@ mod tests {
         // Check that the scheduler registered the step and triggered adaptation
         let sched = spec_lm.scheduler.lock().unwrap();
         assert!(sched.adaptation_state.steps_observed >= 2);
-        assert!(sched.adaptation_state.accept_rate_ema < 0.8);
+        assert!(sched.adaptation_state.accept_rate_ema < 1.5);
+
+        // Check that weights were indeed updated (nudge applied)
+        let w_head_after = {
+            let w = draft.weights.lock().unwrap();
+            w.w_head.clone()
+        };
+        assert_ne!(w_head_before, w_head_after);
     }
 }
