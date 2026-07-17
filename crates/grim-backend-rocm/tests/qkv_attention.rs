@@ -121,6 +121,8 @@ fn qkv_attention_structural_empty_call() {
             0, // kv_seq_len
             0, // cache_offset
             &Shape::from_slice(&[0, 0, 0]),
+            None,
+            None,
         );
         // Either an empty-output Ok or a structural error are acceptable —
         // nothing crashes. The point is "the launcher is wired up".
@@ -449,6 +451,8 @@ fn qkv_attention_gpu_matches_reference_when_enabled() {
             kv_seq_len,
             cache_offset as u32,
             &out_shape,
+            None,
+            None,
         )
         .unwrap();
     let got = out.to_cpu_vec_f32().unwrap();
@@ -500,6 +504,8 @@ fn qkv_attention_gpu_rejects_bad_gqa_ratio() {
         8,
         0,
         &out_shape,
+        None,
+        None,
     );
     assert!(res.is_err(), "bad GQA ratio must surface as Err; got Ok");
 }
@@ -533,6 +539,8 @@ fn qkv_attention_gpu_zero_kv_seq_len_not_nan() {
             kv_seq_len,
             cache_offset as u32,
             &out_shape,
+            None,
+            None,
         )
         .unwrap();
     let got = out.to_cpu_vec_f32().unwrap();

@@ -152,6 +152,8 @@ fn qkv_attention_gpu_head_dim_128_not_nan() {
         kv_seq_len,
         cache_offset as u32,
         &q_shape,
+        None,
+        None,
     );
 
     // The host guard in roc_device.rs intentionally returns Err for head_dim > 64
@@ -208,6 +210,7 @@ fn qkv_attention_gpu_head_dim_64_still_correct() {
     let (out, _) = dev.qkv_attention(
         q_buf.as_ref(), k_buf.as_ref(), v_buf.as_ref(),
         num_kv_heads, kv_seq_len, cache_offset as u32, &q_shape,
+        None, None,
     ).expect("head_dim=64 must still succeed");
 
     let got = out.to_cpu_vec_f32().unwrap();

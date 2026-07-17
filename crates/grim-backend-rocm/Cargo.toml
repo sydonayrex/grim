@@ -16,9 +16,25 @@ lazy_static = "1.4"
 temp-env = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Dynamic loading for MIOpen (grim-sonnet F9): the lib may be absent at
+# link time (no real libMIOpen.so in this env), so we dlopen it at runtime
+# via libloading and error cleanly if missing — never panic (rust-gpu-discipline §2 #12).
+libloading = "0.8"
+cubecl = { version = "0.10.0", features = ["hip"], optional = true }
+cubecl-hip = { version = "0.10.0", optional = true }
+# Direct dep (mirrors cubecl-hip's own) so we can read `gcnArchName`
+# via hipRTC FFI and gate the RDNA2 cold-start workarounds on arch.
+# NOTE: cubecl-hip-sys is ROCm-versioned (7.2.5321100), NOT 0.10.x.
+cubecl-hip-sys = { version = "7.2.5321100", optional = true }
+# Force cubecl-runtime's `std` feature on so its `std_io` cfg is active, which
+# compiles the on-disk kernel compilation cache (`cubecl::config::CacheConfig`).
+# Without this, `cubecl-hip`'s `cubecl-runtime` dep (default-features = false) keeps
+# `std` off and the cache module is cfg'd out.
+cubecl-runtime = { version = "0.10.0", features = ["std"], optional = true }
 
 [build-dependencies]
 # rocm-rs = { git = "https://github.com/RustNSparks/rocm-rs", rev = "master" }
+cc = "1.0"
 
 [features]
 default = []
@@ -26,3 +42,12 @@ rocm-profile = []
 rocm-aiter = []
 # hip-graph-capture feature temporarily disabled
 rocm-kernel-macros = []
+# grim-sonnet F8 — Composable Kernel (ck_tile) GEMM used to expose a
+# `ck` cargo feature that built src/device/ck_gemm.cpp + a C FFI surface
+# against the vendored CK headers. grim is Rust-centric now: the
+# decode-GEMM kernel is an embedded HIP source literal in
+# `kernels::decode_gemm::KERNEL_SOURCE`, JIT-compiled at runtime. The
+cubecl = ["dep:cubecl", "dep:cubecl-hip", "dep:cubecl-runtime", "dep:cubecl-hip-sys"]
+
+[dev-dependencies]
+grim-backend-cpu = { path = "../grim-backend-cpu" }
