@@ -21,6 +21,14 @@ pub trait DraftBackbone: Send + Sync {
 
     /// Estimate the VRAM footprint of the draft model in bytes.
     fn estimated_footprint_bytes(&self) -> usize;
+
+    /// Update the draft model's weights using target hidden states and acceptance feedback.
+    fn update_weights(
+        &self,
+        target_hidden_states: &[f32],
+        draft_tokens: &[u32],
+        accepted_mask: &[bool],
+    ) -> Result<()>;
 }
 
 

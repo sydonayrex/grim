@@ -6,12 +6,22 @@
 //! enough to produce non-trivial base logits for the verifier and
 //! Markov-corrected confidence head to operate on.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use grim_core::error::Result;
 use grim_tensor::{Shape, Tensor};
 
 use crate::draft_backbone::{DraftBackbone, DraftBlock};
+
+/// Thread-safe interior mutability container for weights.
+pub struct DraftWeights {
+    pub(crate) pos_emb: Vec<f32>,
+    pub(crate) w_q: Vec<f32>,
+    pub(crate) w_k: Vec<f32>,
+    pub(crate) w_v: Vec<f32>,
+    pub(crate) w_proj: Vec<f32>,
+    pub(crate) w_head: Vec<f32>,
+}
 
 /// Tiny draft transformer.
 ///
@@ -24,12 +34,7 @@ pub struct TinyDraftBackbone {
     pub vocab_size: usize,
     pub hidden: usize,
     pub block_len: usize,
-    pub(crate) pos_emb: Vec<f32>,
-    pub(crate) w_q: Vec<f32>,
-    pub(crate) w_k: Vec<f32>,
-    pub(crate) w_v: Vec<f32>,
-    pub(crate) w_proj: Vec<f32>,
-    pub(crate) w_head: Vec<f32>,
+    pub(crate) weights: Mutex<DraftWeights>,
 }
 
 impl TinyDraftBackbone {
@@ -42,12 +47,14 @@ impl TinyDraftBackbone {
             vocab_size,
             hidden,
             block_len,
-            pos_emb: rand_vec(block_len * hidden, 0.05),
-            w_q: rand_vec(hidden * hidden, 0.05),
-            w_k: rand_vec(hidden * hidden, 0.05),
-            w_v: rand_vec(hidden * hidden, 0.05),
-            w_proj: rand_vec(vocab_size * hidden, 0.05),
-            w_head: rand_vec(vocab_size * hidden, 0.05),
+            weights: Mutex::new(DraftWeights {
+                pos_emb: rand_vec(block_len * hidden, 0.05),
+                w_q: rand_vec(hidden * hidden, 0.05),
+                w_k: rand_vec(hidden * hidden, 0.05),
+                w_v: rand_vec(hidden * hidden, 0.05),
+                w_proj: rand_vec(vocab_size * hidden, 0.05),
+                w_head: rand_vec(vocab_size * hidden, 0.05),
+            }),
         }
     }
 }
@@ -62,6 +69,9 @@ impl DraftBackbone for TinyDraftBackbone {
         let block_len = block_len.min(self.block_len);
         let vocab = self.vocab_size;
         let hidden = self.hidden;
+
+        // Lock weights for the forward pass
+        let weights = self.weights.lock().unwrap();
 
         // 1. Pull the context representation (a 1-D F32 tensor of size `hidden`
         //    proxying the embedding of the last prompt token; real impl would
@@ -81,7 +91,7 @@ impl DraftBackbone for TinyDraftBackbone {
         let mut queries = vec![0.0f32; block_len * hidden];
         for pos in 0..block_len {
             for h in 0..hidden {
-                queries[pos * hidden + h] = ctx_vec[h] + self.pos_emb[pos * hidden + h];
+                queries[pos * hidden + h] = ctx_vec[h] + weights.pos_emb[pos * hidden + h];
             }
         }
 
@@ -89,10 +99,10 @@ impl DraftBackbone for TinyDraftBackbone {
         //    as both q and k, simplified to position-conditioned vectors).
         //    For v1 we drop the k/v attention and just project the queries
         //    straight to vocab logits.
-        let attn_out = matmul(&queries, &self.w_q, block_len, hidden, hidden);
+        let attn_out = matmul(&queries, &weights.w_q, block_len, hidden, hidden);
 
         // 4. Decode to vocab.
-        let logits = matmul(&attn_out, &self.w_head, block_len, hidden, vocab);
+        let logits = matmul(&attn_out, &weights.w_head, block_len, hidden, vocab);
 
         // 5. Argmax sample per position.
         let mut tokens = Vec::with_capacity(block_len);
@@ -138,14 +148,46 @@ impl DraftBackbone for TinyDraftBackbone {
     }
 
     fn estimated_footprint_bytes(&self) -> usize {
+        let weights = self.weights.lock().unwrap();
         // Calculate raw size of all the parameter arrays
-        let params_len = self.pos_emb.len()
-            + self.w_q.len()
-            + self.w_k.len()
-            + self.w_v.len()
-            + self.w_proj.len()
-            + self.w_head.len();
+        let params_len = weights.pos_emb.len()
+            + weights.w_q.len()
+            + weights.w_k.len()
+            + weights.w_v.len()
+            + weights.w_proj.len()
+            + weights.w_head.len();
         params_len * std::mem::size_of::<f32>()
+    }
+
+    fn update_weights(
+        &self,
+        target_hidden_states: &[f32],
+        draft_tokens: &[u32],
+        accepted_mask: &[bool],
+    ) -> Result<()> {
+        let verify_len = draft_tokens.len();
+        let hidden_size = self.hidden;
+        let vocab_size = self.vocab_size;
+        let mut weights = self.weights.lock().unwrap();
+        
+        let lr = 0.01f32;
+        // Penultimate layer target hidden state mapping update:
+        // Adjust the linear classification head (w_head) columns for accepted draft tokens
+        // to associate stronger with the target's computed hidden states.
+        for pos in 0..verify_len {
+            if pos < accepted_mask.len() && accepted_mask[pos] {
+                let t = draft_tokens[pos] as usize;
+                if t < vocab_size {
+                    let h_start = pos * hidden_size;
+                    if h_start + hidden_size <= target_hidden_states.len() {
+                        for d in 0..hidden_size {
+                            weights.w_head[t * hidden_size + d] += lr * target_hidden_states[h_start + d];
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 

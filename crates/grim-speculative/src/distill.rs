@@ -90,9 +90,12 @@ pub enum DraftRefreshOutcome {
 /// `target.forward` — it only consumes data the caller already computed.
 /// Gate 4.6.3 (determinism): the decision to skip is input-determined,
 /// no wall-clock or RNG.
+use crate::draft_backbone::DraftBackbone;
+
 pub fn refresh_draft(
     signal: &AdaptationSignal,
     input: &DraftRefreshInput,
+    draft: &dyn DraftBackbone,
 ) -> Result<DraftRefreshOutcome> {
     // The signal must indicate actual degradation, not just the initial ramp.
     // This is a redundant check (the caller gates on should_adapt_draft), but
@@ -114,23 +117,12 @@ pub fn refresh_draft(
         )));
     }
 
-    // The hidden-state capture surface (gap 1) does not exist yet —
-    // CausalLm::forward returns logits only. Skip the refresh cleanly rather
-    // than fabricating a training signal.
     if input.target_hidden_states.is_none() {
         return Ok(DraftRefreshOutcome::SkippedNoHiddenStates);
     }
 
-    // TODO(WI-4.4.3-followup): Implement the actual weight-update mechanism.
-    // Once the hidden-state capture surface lands upstream (CausalLm::forward
-    // exposes penultimate hidden states), the Some(_) branch here will:
-    //   1. Compute the alignment error between draft logits and target hidden
-    //      states for the accepted positions.
-    //   2. Apply a lightweight update (LoRA delta or direct weight nudge).
-    //   3. Return DraftRefreshOutcome::Applied.
-    //
-    // Per the plan's §4.4.3 right-limit, building a full gradient-based
-    // training loop is explicitly out of scope for this work item.
+    let states = input.target_hidden_states.as_ref().unwrap();
+    draft.update_weights(states, &input.draft_tokens, &input.accepted_mask)?;
     Ok(DraftRefreshOutcome::Applied)
 }
 
@@ -174,11 +166,12 @@ pub fn train_speculative_draft(target_path: &str, output_path: &str, dataset_pat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tiny_draft_backbone::TinyDraftBackbone;
 
-    fn make_signal(rate: f64, threshold: f64) -> AdaptationSignal {
+    fn make_signal(ema: f64, threshold: f64) -> AdaptationSignal {
         AdaptationSignal {
-            accept_rate_ema: rate,
-            steps_observed: 100,
+            accept_rate_ema: ema,
+            steps_observed: 10,
             min_accept_rate: threshold,
         }
     }
@@ -193,21 +186,21 @@ mod tests {
             draft_tokens: vec![1, 2, 3],
             accepted_mask: vec![true, false, true],
         };
-        let outcome = refresh_draft(&signal, &input).unwrap();
+        let draft = TinyDraftBackbone::new(100, 16, 5, 42);
+        let outcome = refresh_draft(&signal, &input, &draft).unwrap();
         assert_eq!(outcome, DraftRefreshOutcome::SkippedNoHiddenStates);
     }
 
     #[test]
     fn refresh_applies_when_hidden_states_present() {
-        // Once hidden states are available, the interface returns Applied
-        // (the actual weight update is TODO, but the interface is exercised).
         let signal = make_signal(0.1, 0.3);
         let input = DraftRefreshInput {
-            target_hidden_states: Some(vec![0.5; 32]),
+            target_hidden_states: Some(vec![0.5; 48]), // 3 tokens * 16 hidden
             draft_tokens: vec![1, 2, 3],
             accepted_mask: vec![true, false, true],
         };
-        let outcome = refresh_draft(&signal, &input).unwrap();
+        let draft = TinyDraftBackbone::new(100, 16, 5, 42);
+        let outcome = refresh_draft(&signal, &input, &draft).unwrap();
         assert_eq!(outcome, DraftRefreshOutcome::Applied);
     }
 
@@ -219,7 +212,8 @@ mod tests {
             draft_tokens: vec![1, 2, 3],
             accepted_mask: vec![true, false], // wrong length
         };
-        assert!(refresh_draft(&signal, &input).is_err());
+        let draft = TinyDraftBackbone::new(100, 16, 5, 42);
+        assert!(refresh_draft(&signal, &input, &draft).is_err());
     }
 
     #[test]
@@ -231,7 +225,8 @@ mod tests {
             draft_tokens: vec![],
             accepted_mask: vec![],
         };
-        let outcome = refresh_draft(&signal, &input).unwrap();
+        let draft = TinyDraftBackbone::new(100, 16, 5, 42);
+        let outcome = refresh_draft(&signal, &input, &draft).unwrap();
         // Empty draft with hidden states → Applied (no-op update).
         assert_eq!(outcome, DraftRefreshOutcome::Applied);
     }
@@ -246,11 +241,12 @@ mod tests {
         // any model object in scope (there is none in this module).
         let signal = make_signal(0.1, 0.3);
         let input = DraftRefreshInput {
-            target_hidden_states: Some(vec![0.5; 8]),
+            target_hidden_states: Some(vec![0.5; 16]), // 1 token * 16 hidden
             draft_tokens: vec![42],
             accepted_mask: vec![true],
         };
-        let _ = refresh_draft(&signal, &input).unwrap();
+        let draft = TinyDraftBackbone::new(100, 16, 5, 42);
+        let _ = refresh_draft(&signal, &input, &draft).unwrap();
         // If refresh_draft tried to call a model forward, it would need a
         // model reference — which neither AdaptationSignal nor
         // DraftRefreshInput provides. The API shape enforces zero-overhead.
