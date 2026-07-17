@@ -102,7 +102,7 @@ enum Commands {
     },
     /// Quantize a model.
     Quantize,
-    /// Convert standard GGUF model to ROCm-optimized .grim format.
+    /// Convert standard GGUF model to ROCm-optimized .grim format using Oxidizer.
     Convert {
         /// Path to input GGUF model file.
         #[arg(short, long)]
@@ -113,6 +113,15 @@ enum Commands {
         /// Target GPU GCN architecture (e.g. gfx1100, gfx1201), or "auto" to detect the host GPU.
         #[arg(short, long, default_value = "auto")]
         target: String,
+        /// Target average bits-per-weight.
+        #[arg(long, default_value = "4.0")]
+        target_bpw: f32,
+        /// Number of EvoPress generations.
+        #[arg(long, default_value = "50")]
+        generations: usize,
+        /// Calibration dataset name.
+        #[arg(long)]
+        dataset: Option<String>,
     },
     /// Speculative decoding commands.
     Spec {
@@ -495,7 +504,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Convert { input, output, target } => {
+        Commands::Convert { input, output, target, target_bpw, generations, dataset } => {
             let resolved_gcn = if target == "auto" {
                 println!("[grim convert] Auto-detecting host GPU target architecture...");
                 match grim_backend_rocm::device::probe::probe_system_rocm() {
@@ -521,7 +530,20 @@ async fn main() -> Result<()> {
                 target
             };
 
-            if let Err(e) = grim_format::convert::convert_gguf_to_grim(&input, &output, &resolved_gcn) {
+            let profile_str = if resolved_gcn.starts_with("gfx12") {
+                "rdna4"
+            } else {
+                "rdna3"
+            };
+
+            if let Err(e) = oxidizer::cmd_oxidizer_convert(
+                &input,
+                &output,
+                target_bpw,
+                generations,
+                Some(profile_str),
+                dataset,
+            ) {
                 eprintln!("Conversion failed: {e}");
                 std::process::exit(1);
             }
