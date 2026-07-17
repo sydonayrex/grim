@@ -10,7 +10,7 @@
 //! Callers of `CausalLm::forward` never see the wrapper; it's chosen at
 //! model-load time based on what the model supports.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use grim_core::error::Result;
 use grim_core::model::AdapterHandle;
@@ -20,7 +20,7 @@ use grim_tensor::{ArithType, Device, Tensor};
 
 use crate::confidence_head::ConfidenceHead;
 use crate::confidence_scheduler::{ConfidenceScheduler, SpeculationConfig, ThroughputProfile};
-use crate::draft_backbone::{DraftBackbone, DraftBlock};
+use crate::draft_backbone::DraftBackbone;
 use crate::markov_head::MarkovHead;
 use crate::native_mtp::NativeMtp;
 
@@ -46,7 +46,7 @@ pub struct SpeculativeCausalLm {
     markov: Option<Arc<dyn MarkovHead>>,
     confidence: Option<Arc<dyn ConfidenceHead>>,
     /// Confidence scheduler shared across DSpark sessions.
-    scheduler: ConfidenceScheduler,
+    scheduler: Mutex<ConfidenceScheduler>,
 }
 
 impl SpeculativeCausalLm {
@@ -59,10 +59,10 @@ impl SpeculativeCausalLm {
             draft: None,
             markov: None,
             confidence: None,
-            scheduler: ConfidenceScheduler::new(
+            scheduler: Mutex::new(ConfidenceScheduler::new(
                 ThroughputProfile::default(),
                 SpeculationConfig::default(),
-            ),
+            )),
         }
     }
 
@@ -81,7 +81,7 @@ impl SpeculativeCausalLm {
             draft: Some(draft),
             markov: Some(markov),
             confidence: Some(confidence),
-            scheduler,
+            scheduler: Mutex::new(scheduler),
         }
     }
 
@@ -94,10 +94,10 @@ impl SpeculativeCausalLm {
             draft: None,
             markov: None,
             confidence: None,
-            scheduler: ConfidenceScheduler::new(
+            scheduler: Mutex::new(ConfidenceScheduler::new(
                 ThroughputProfile::default(),
                 SpeculationConfig::default(),
-            ),
+            )),
         }
     }
 
@@ -239,7 +239,7 @@ impl SpeculativeCausalLm {
         let confidence = self.confidence.as_ref().unwrap();
 
         // Phase 1: draft block.
-        let block_len = self.scheduler.config.block_len;
+        let block_len = self.scheduler.lock().unwrap().config.block_len;
         let draft_block = draft.draft_block(session, input_ids, block_len)?;
         if draft_block.tokens.is_empty() {
             return self.target.forward(session, input_ids, positions, adapters);
@@ -253,6 +253,8 @@ impl SpeculativeCausalLm {
         // Phase 3: choose verify length.
         let verify_len = self
             .scheduler
+            .lock()
+            .unwrap()
             .choose_verify_len(&scored, live_gpu_utilization, batch_pressure);
         let verify_len = verify_len.min(scored.tokens.len());
 
@@ -292,6 +294,33 @@ impl SpeculativeCausalLm {
         }
         session.advance_pos(accepted_count);
 
+        // Update scheduler and check adaptation gating (TIDE WI 4)
+        {
+            let mut sched = self.scheduler.lock().unwrap();
+            sched.record_acceptance(accepted_count, verify_len);
+
+            if sched.should_adapt_draft() {
+                // Construct the input mask and extract real target hidden states if present in session
+                let mut accepted_mask = vec![false; verify_len];
+                for i in 0..accepted_count {
+                    accepted_mask[i] = true;
+                }
+                let target_hidden_states = session.get_last_hidden_state().and_then(|t| t.to_vec_f32().ok());
+                let refresh_input = crate::distill::DraftRefreshInput {
+                    target_hidden_states,
+                    draft_tokens: scored.tokens[..verify_len].to_vec(),
+                    accepted_mask,
+                };
+                let signal = crate::distill::AdaptationSignal {
+                    accept_rate_ema: sched.adaptation_state.accept_rate_ema,
+                    steps_observed: sched.adaptation_state.steps_observed,
+                    min_accept_rate: sched.adaptation_config.min_accept_rate,
+                };
+                // Call the distill module's adaptation interface
+                let _outcome = crate::distill::refresh_draft(&signal, &refresh_input)?;
+            }
+        }
+
         Ok(target_logits)
     }
 }
@@ -321,5 +350,162 @@ impl CausalLm for SpeculativeCausalLm {
         adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
         self.decode_one(session, input_ids, positions, 0.0, 0, adapters)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grim_core::session::Inner;
+    use grim_tensor::Shape;
+
+    struct MockCausalLm {
+        cfg: grim_models_transformer::LlamaConfig,
+        device: Device,
+        should_reject: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Clone for MockCausalLm {
+        fn clone(&self) -> Self {
+            Self {
+                cfg: self.cfg.clone(),
+                device: self.device.clone(),
+                should_reject: self.should_reject.clone(),
+            }
+        }
+    }
+
+    impl Model for MockCausalLm {
+        fn config(&self) -> &dyn ModelConfig {
+            &self.cfg
+        }
+        fn device(&self) -> &Device {
+            &self.device
+        }
+        fn param_arith(&self) -> ArithType {
+            ArithType::F32
+        }
+    }
+
+    impl CausalLm for MockCausalLm {
+        fn new_session(&self) -> Box<dyn SessionT> {
+            Box::new(Inner::new(self.device.clone()))
+        }
+        fn forward(
+            &self,
+            session: &mut dyn SessionT,
+            input_ids: &Tensor,
+            _positions: &Tensor,
+            _adapters: &[AdapterHandle],
+        ) -> Result<Tensor> {
+            let seq_len = input_ids.shape().dims()[0];
+            // Mock penultimate hidden states: [1, seq_len, hidden_size]
+            let hidden_state = grim_backend_cpu::cpu_tensor(
+                vec![0.5f32; seq_len * self.cfg.hidden_size],
+                Shape::new(vec![1, seq_len, self.cfg.hidden_size]),
+            );
+            session.set_last_hidden_state(hidden_state);
+            
+            // Mock output logits: if should_reject, return low values to fail check
+            let val = if self.should_reject.load(std::sync::atomic::Ordering::SeqCst) {
+                -5.0f32
+            } else {
+                0.1f32
+            };
+            let logits = grim_backend_cpu::cpu_tensor(
+                vec![val; seq_len * self.cfg.vocab_size],
+                Shape::new(vec![seq_len, self.cfg.vocab_size]),
+            );
+            Ok(logits)
+        }
+    }
+
+    #[test]
+    fn test_hidden_state_capture_and_adaptation_trigger() {
+        let device = Device::Cpu;
+        let cfg = grim_models_transformer::LlamaConfig {
+            vocab_size: 100,
+            hidden_size: 16,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 8,
+            intermediate_size: 32,
+            num_layers: 2,
+            rope_theta: 10000.0,
+            max_seq_len: 2048,
+            rms_norm_eps: 1e-5,
+        };
+        let should_reject = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let target = Box::new(MockCausalLm {
+            cfg: cfg.clone(),
+            device,
+            should_reject: should_reject.clone(),
+        });
+        
+        // Mock DSpark components
+        let draft = Arc::new(crate::tiny_draft_backbone::TinyDraftBackbone::new(
+            100, // vocab_size
+            16,  // hidden_size
+            5,   // block_len
+            42,  // seed
+        ));
+        let markov = Arc::new(crate::uniform_markov_head::UniformMarkovHead::new(100, 5, 42));
+        let confidence = Arc::new(crate::entropy_confidence_head::EntropyConfidenceHead);
+
+        // Create scheduler with low trigger threshold (e.g. 0.8) and immediate trigger activation
+        let mut scheduler = ConfidenceScheduler::new(
+            ThroughputProfile::default(),
+            SpeculationConfig::default(),
+        );
+        scheduler.adaptation_config.min_steps_before_trigger = 1;
+        scheduler.adaptation_config.min_accept_rate = 0.8;
+        scheduler.adaptation_config.ema_alpha = 0.5;
+
+        let spec_lm = SpeculativeCausalLm::with_dspark(
+            target,
+            draft,
+            markov,
+            confidence,
+            scheduler,
+        );
+
+        let mut session = spec_lm.new_session();
+        let input_ids = grim_backend_cpu::cpu_tensor(vec![1f32], Shape::new(vec![1]));
+        let positions = grim_backend_cpu::cpu_tensor(vec![0f32], Shape::new(vec![1]));
+
+        // 1. Verify that before forward run, last hidden state is empty
+        assert!(session.get_last_hidden_state().is_none());
+
+        // 2. Perform a speculative decode step (this will call MockCausalLm's forward pass)
+        let _logits = spec_lm.decode_one(
+            session.as_mut(),
+            &input_ids,
+            &positions,
+            0.0,
+            0,
+            &[],
+        ).unwrap();
+
+        // 3. Verify that the penultimate hidden state is successfully captured in the session
+        let captured_hidden = session.get_last_hidden_state().unwrap();
+        let hidden_shape = captured_hidden.shape();
+        assert_eq!(hidden_shape.dims(), &[1, 1, 16]); // [1, verify_len, hidden_size]
+
+        // 4. Force acceptance rate to 0.0 (by running a step with 0 accepted tokens) to trigger adaptation
+        // The EMA will drop below 0.8 min threshold after this step
+        should_reject.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _logits2 = spec_lm.decode_one(
+            session.as_mut(),
+            &input_ids,
+            &positions,
+            0.0,
+            0,
+            &[],
+        ).unwrap();
+
+        // Check that the scheduler registered the step and triggered adaptation
+        let sched = spec_lm.scheduler.lock().unwrap();
+        assert!(sched.adaptation_state.steps_observed >= 2);
+        assert!(sched.adaptation_state.accept_rate_ema < 0.8);
     }
 }
