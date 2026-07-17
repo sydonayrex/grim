@@ -40,6 +40,11 @@ pub trait SessionT: Send {
         }
         Ok(inputs[0].clone())
     }
+    // Hidden-state capture hooks for WI 4 §4.4.1
+    fn get_last_hidden_state(&self) -> Option<Tensor> {
+        None
+    }
+    fn set_last_hidden_state(&mut self, _hidden: Tensor) {}
 }
 
 /// Public trait-object alias used in `Model` trait DSL.
@@ -53,14 +58,15 @@ pub struct Inner {
     pub current_pos: usize,
     /// Handle to the captured HIP graph executables
     pub hip_graph_handle: Option<u64>,
+    pub last_hidden_state: Option<Tensor>,
 }
 
 impl Inner {
     pub fn new(device: Device) -> Self {
-        Self { device, kv: None, current_pos: 0, hip_graph_handle: None }
+        Self { device, kv: None, current_pos: 0, hip_graph_handle: None, last_hidden_state: None }
     }
     pub fn with_kv(device: Device, kv: Box<dyn KvCache>) -> Self {
-        Self { device, kv: Some(kv), current_pos: 0, hip_graph_handle: None }
+        Self { device, kv: Some(kv), current_pos: 0, hip_graph_handle: None, last_hidden_state: None }
     }
 }
 
@@ -99,6 +105,12 @@ impl SessionT for Inner {
             return Err(crate::error::Error::Session("eval_eager: empty inputs".into()));
         }
         Ok(inputs[0].clone())
+    }
+    fn get_last_hidden_state(&self) -> Option<Tensor> {
+        self.last_hidden_state.clone()
+    }
+    fn set_last_hidden_state(&mut self, hidden: Tensor) {
+        self.last_hidden_state = Some(hidden);
     }
 }
 

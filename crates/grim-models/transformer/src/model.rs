@@ -145,14 +145,14 @@ impl Llama {
         Ok(self.tok_embeddings.forward(&[token], 1, self.cfg.hidden_size)?)
     }
 
-    pub fn decode(&self, hidden: &Tensor, _positions: &[u32]) -> Result<Tensor> {
+    pub fn decode(&self, hidden: &Tensor, _positions: &[u32]) -> Result<(Tensor, Tensor)> {
         let mut h = hidden.clone();
         for layer in &self.layers {
             h = layer.forward(&h)?;
         }
         let h = self.norm.forward(&h)?;
         let logits = self.output.forward(&h)?;
-        Ok(logits)
+        Ok((logits, h))
     }
 }
 
@@ -202,7 +202,8 @@ impl CausalLm for Llama {
             Shape::new(vec![1, seq_len, self.cfg.hidden_size]),
         );
         let positions: Vec<u32> = (0..seq_len).map(|i| i as u32).collect();
-        let logits = self.decode(&hidden_t, &positions)?;
+        let (logits, hidden_state) = self.decode(&hidden_t, &positions)?;
+        session.set_last_hidden_state(hidden_state);
         let logits = if adapters.is_empty() {
             logits
         } else {
