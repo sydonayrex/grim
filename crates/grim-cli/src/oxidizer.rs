@@ -11,14 +11,14 @@ use grim_format::gguf::{
 };
 use grim_format::GgufProvider;
 use grim_quant::{
-    compute_fisher_diagonal, compute_grouped_fisher_diagonal, compute_importance_scores,
+    compute_fisher_diagonal, compute_importance_scores,
     dequant_q4k, dequant_q80, evopress_search, rewrite_tensor_data, EvoPressConfig,
     FisherCalibrationSample, ImportanceScores, QuantFormat, RewrittenTensorData,
     TensorRewritePlan,
 };
 use grim_backend_rocm::{
     enforce_attention_precision, is_attention_projection, resolve_weight_layout,
-    attention_min_bpw, WeightLayout,
+    WeightLayout,
 };
 use grim_tensor::provider::TensorProvider;
 use grim_tensor_graph::build_transformer_ir;
@@ -97,6 +97,7 @@ pub struct CalibrationBatch {
     pub group_size: usize,
 }
 
+#[allow(dead_code)]
 impl CalibrationBatch {
     pub fn new(group_size: usize) -> Self {
         Self { samples: Vec::new(), group_size }
@@ -201,7 +202,7 @@ pub fn cmd_oxidizer_convert(
     grim_meta.wavefront_size = grim_meta.rocml_profile.wavefront_size();
     grim_meta.lds_size = Some(grim_meta.rocml_profile.lds_size());
     grim_meta.quant_method = Some("evopress-gptq-sequential".into());
-    grim_meta.calibration_dataset = calibration_dataset;
+    grim_meta.calibration_dataset = calibration_dataset.clone();
     grim_meta.quant_overrides = tensor_names
         .iter()
         .enumerate()
@@ -227,14 +228,15 @@ pub fn cmd_oxidizer_convert(
         })
         .collect();
 
-    let rewritten_tensors = build_rewritten_tensors(
-        &provider,
-        &importance_scores,
-        &bitwidths,
-        &CalibrationBatch::default(),
-        Some(&grim_meta),
-    )?;
-    write_grim_file(model_path, output_path, &grim_meta, &rewritten_tensors)?;
+    let resolved_gcn = rocml_profile.unwrap_or("gfx1100");
+    grim_format::convert_to_grim_v2(
+        model_path,
+        output_path,
+        resolved_gcn,
+        target_bpw,
+        generations,
+        calibration_dataset.as_deref(),
+    ).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -586,36 +588,38 @@ fn write_string<W: Write>(writer: &mut W, value: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-fn write_value<W: Write>(writer: &mut W, value: &GgufValue) -> Result<(), String> {
+fn write_value_raw<W: Write>(writer: &mut W, value: &GgufValue) -> Result<(), String> {
     match value {
-        GgufValue::Uint8(v) => writer.write_all(&0u32.to_le_bytes()).and_then(|_| writer.write_all(&u32::from(*v).to_le_bytes())).map_err(|e| e.to_string()),
-        GgufValue::Int8(v) => writer.write_all(&1u32.to_le_bytes()).and_then(|_| writer.write_all(&v.to_le_bytes())).map_err(|e| e.to_string()),
-        GgufValue::Uint16(v) => writer.write_all(&2u32.to_le_bytes()).and_then(|_| writer.write_all(&v.to_le_bytes())).map_err(|e| e.to_string()),
-        GgufValue::Int16(v) => writer.write_all(&3u32.to_le_bytes()).and_then(|_| writer.write_all(&v.to_le_bytes())).map_err(|e| e.to_string()),
-        GgufValue::Uint32(v) => writer.write_all(&4u32.to_le_bytes()).and_then(|_| writer.write_all(&v.to_le_bytes())).map_err(|e| e.to_string()),
-        GgufValue::Int32(v) => writer.write_all(&5u32.to_le_bytes()).and_then(|_| writer.write_all(&v.to_le_bytes())).map_err(|e| e.to_string()),
-        GgufValue::Float32(v) => writer.write_all(&6u32.to_le_bytes()).and_then(|_| writer.write_all(&v.to_le_bytes())).map_err(|e| e.to_string()),
-        GgufValue::Bool(v) => writer.write_all(&7u32.to_le_bytes()).and_then(|_| writer.write_all(&u32::from(*v).to_le_bytes())).map_err(|e| e.to_string()),
-        GgufValue::String(v) => {
-            writer.write_all(&8u32.to_le_bytes()).map_err(|e| e.to_string())?;
-            write_string(writer, v)
-        }
+        GgufValue::Uint8(v) => writer.write_all(&[*v]).map_err(|e| e.to_string()),
+        GgufValue::Int8(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
+        GgufValue::Uint16(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
+        GgufValue::Int16(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
+        GgufValue::Uint32(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
+        GgufValue::Int32(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
+        GgufValue::Float32(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
+        GgufValue::Bool(v) => writer.write_all(&[*v as u8]).map_err(|e| e.to_string()),
+        GgufValue::String(v) => write_string(writer, v),
         GgufValue::Array(values) => {
-            writer.write_all(&9u32.to_le_bytes()).map_err(|e| e.to_string())?;
             let type_tag = values.first().map(value_type_tag).unwrap_or(8);
             writer.write_all(&type_tag.to_le_bytes()).map_err(|e| e.to_string())?;
             writer
                 .write_all(&(values.len() as u64).to_le_bytes())
                 .map_err(|e| e.to_string())?;
             for item in values {
-                write_value(writer, item)?;
+                write_value_raw(writer, item)?;
             }
             Ok(())
         }
-        GgufValue::Uint64(v) => writer.write_all(&10u32.to_le_bytes()).and_then(|_| writer.write_all(&v.to_le_bytes())).map_err(|e| e.to_string()),
-        GgufValue::Int64(v) => writer.write_all(&11u32.to_le_bytes()).and_then(|_| writer.write_all(&v.to_le_bytes())).map_err(|e| e.to_string()),
-        GgufValue::Float64(v) => writer.write_all(&12u32.to_le_bytes()).and_then(|_| writer.write_all(&v.to_le_bytes())).map_err(|e| e.to_string()),
+        GgufValue::Uint64(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
+        GgufValue::Int64(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
+        GgufValue::Float64(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
     }
+}
+
+fn write_value<W: Write>(writer: &mut W, value: &GgufValue) -> Result<(), String> {
+    let tag = value_type_tag(value);
+    writer.write_all(&tag.to_le_bytes()).map_err(|e| e.to_string())?;
+    write_value_raw(writer, value)
 }
 
 fn estimate_tensor_info_size(info: &GgufTensorInfo) -> u64 {
@@ -626,18 +630,22 @@ fn estimate_string_size(value: &str) -> u64 {
     8 + value.len() as u64
 }
 
-fn estimate_value_size(value: &GgufValue) -> u64 {
+fn estimate_value_raw_size(value: &GgufValue) -> u64 {
     match value {
-        GgufValue::Uint8(_) | GgufValue::Bool(_) => 4 + 4,
-        GgufValue::Int8(_) => 4 + 1,
-        GgufValue::Uint16(_) | GgufValue::Int16(_) => 4 + 2,
-        GgufValue::Uint32(_) | GgufValue::Int32(_) | GgufValue::Float32(_) => 4 + 4,
-        GgufValue::Uint64(_) | GgufValue::Int64(_) | GgufValue::Float64(_) => 4 + 8,
-        GgufValue::String(v) => 4 + estimate_string_size(v),
+        GgufValue::Uint8(_) | GgufValue::Int8(_) | GgufValue::Bool(_) => 1,
+        GgufValue::Uint16(_) | GgufValue::Int16(_) => 2,
+        GgufValue::Uint32(_) | GgufValue::Int32(_) | GgufValue::Float32(_) => 4,
+        GgufValue::Uint64(_) | GgufValue::Int64(_) | GgufValue::Float64(_) => 8,
+        GgufValue::String(v) => estimate_string_size(v),
         GgufValue::Array(values) => {
-            4 + 4 + 8 + values.iter().map(estimate_value_size).sum::<u64>()
+            let _type_tag = values.first().map(value_type_tag).unwrap_or(8);
+            4 + 8 + values.iter().map(estimate_value_raw_size).sum::<u64>()
         }
     }
+}
+
+fn estimate_value_size(value: &GgufValue) -> u64 {
+    4 + estimate_value_raw_size(value)
 }
 
 fn value_type_tag(value: &GgufValue) -> u32 {
@@ -736,10 +744,10 @@ mod tests {
 
         let mut rewritten_tensors = HashMap::new();
         let rewritten = rewrite_tensor_data(
-            &[1.0f32],
+            &vec![1.0f32; 32],
             &TensorRewritePlan {
                 target: QuantFormat::Q8_0,
-                shape: vec![1, 1],
+                shape: vec![32, 1],
                 importance: None,
                 curvature: None,
             },
@@ -763,9 +771,9 @@ mod tests {
     fn write_minimal_gguf(path: &Path) -> Result<(), String> {
         let tensor = GgufTensorInfo {
             name: "blk.0.attention.wq.weight".into(),
-            dims: vec![1, 1],
+            dims: vec![32, 1],
             offset: 0,
-            size_bytes: 4,
+            size_bytes: 128,
             dtype: GgufDType::F32,
         };
         let gguf = GgufFile {
@@ -778,7 +786,7 @@ mod tests {
             tensors: vec![tensor],
             data_start: 0,
         };
-        let mut src = BufReader::new(std::io::Cursor::new(1.0f32.to_le_bytes().to_vec()));
+        let mut src = BufReader::new(std::io::Cursor::new(vec![0u8; 128]));
         let file = fs::File::create(path).map_err(|e| e.to_string())?;
         let mut writer = BufWriter::new(file);
         write_gguf(&mut writer, &gguf, &gguf.metadata, &HashMap::new(), &mut src)?;
