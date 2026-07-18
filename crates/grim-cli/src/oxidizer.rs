@@ -236,6 +236,7 @@ pub fn cmd_oxidizer_convert(
         target_bpw,
         generations,
         calibration_dataset.as_deref(),
+        None,
     ).map_err(|e| e.to_string())?;
     Ok(())
 }

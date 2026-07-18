@@ -240,6 +240,7 @@ pub fn convert_to_grim(
     target_bpw: f32,
     generations: usize,
     dataset: Option<&str>,
+    train_state: Option<&crate::train::TrainState>,
 ) -> Result<()> {
     println!("[Grim Convert] Starting conversion pipeline...");
     println!("  Source: {}", input_path);
@@ -250,6 +251,9 @@ pub fn convert_to_grim(
     }
     if let Some(ds) = dataset {
         println!("  Dataset: {} (calibration engine not yet wired)", ds);
+    }
+    if train_state.is_some() {
+        println!("  Training sidecar: will emit {}.train", output_path);
     }
 
     let base_bitwidth = (target_bpw.round() as u8).clamp(2, 16);
@@ -289,6 +293,15 @@ pub fn convert_to_grim(
     writer.flush()
         .map_err(|e| Error::Backend(format!("flush failed: {e}")))?;
     println!("[Grim Convert] Conversion completed: {} ({} tensors)", output_path, written_entries.len());
+
+    // WI-R6: optionally emit the training sidecar next to the .grim file.
+    // The sidecar path is `output_path` with a `.train` suffix (e.g.
+    // `model.grim` → `model.grim.train`).
+    if let Some(train) = train_state {
+        let sidecar_path = format!("{}.train", output_path);
+        train.write(&sidecar_path)?;
+        println!("[Grim Convert] Training sidecar written: {}", sidecar_path);
+    }
     Ok(())
 }
 
