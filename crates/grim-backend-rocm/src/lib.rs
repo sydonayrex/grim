@@ -38,6 +38,7 @@ pub mod p2p_route;
 pub mod peer_access;
 pub mod perf_gate;
 pub mod quantization;
+pub mod rccl;
 pub mod rocm_detect;
 pub mod speculative;
 

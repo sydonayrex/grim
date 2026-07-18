@@ -1,6 +1,6 @@
 /// Pure ROCm/RCCL lib-dir discovery, shared with `src/rocm_detect.rs`
 /// (single source of truth, `include!`-ed — no duplicated knowledge).
-include!("build_rocm_detect.rs");
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/build_rocm_detect.rs"));
 
 /// Crate manifest dir is `crates/grim-backend-rocm`; workspace root is
 /// two parents up.
@@ -41,15 +41,19 @@ fn main() {
 
     // grim-sonnet F11 — RCCL is OPTIONAL and discoverable (WI-R0).
     //
-    // The `rccl` feature gates multi-GPU collectives. When it is OFF (the
-    // default, single-GPU consumer builds) we emit nothing and never require
-    // librccl.so. When ON, we resolve the lib dir from RCCL_PATH /
-    // ROCM_RCCL_PATH / ROCM_PATH / standard prefixes / workspace .rocm-N,
-    // and only then emit the link directive. A system without RCCL + feature
-    // ON compiles but prints a warning (no hard link failure) and the
-    // runtime wrappers return Error::Unsupported.
-    #[cfg(feature = "rccl")]
-    {
+    // The `rccl` feature gates multi-GPU collectives. Cargo does NOT pass
+    // the crate's own features to the build script via `cfg!` — build
+    // scripts see them as `CARGO_FEATURE_<NAME>` env vars instead. So we
+    // gate on that env var, not `#[cfg(feature = "rccl")]`.
+    //
+    // When the feature is OFF (the default, single-GPU consumer builds) we
+    // emit nothing and never require librccl.so. When ON, we resolve the
+    // lib dir from RCCL_PATH / ROCM_RCCL_PATH / ROCM_PATH / standard
+    // prefixes / workspace .rocm-N, and only then emit the link directive.
+    // A system without RCCL + feature ON compiles but prints a warning
+    // (no hard link failure) and the runtime wrappers return
+    // Error::Unsupported.
+    if std::env::var("CARGO_FEATURE_RCCL").is_ok() {
         match resolve_rocm_lib_dir(&workspace) {
             Some(dir) => {
                 println!("cargo:rustc-link-search=native={}", dir.display());
@@ -57,7 +61,7 @@ fn main() {
             }
             None => {
                 println!(
-                    "cargo:warning=rccl feature enabled but no libcrccl.so \
+                    "cargo:warning=rccl feature enabled but no librccl.so \
                      found via RCCL_PATH/ROCM_RCCL_PATH/ROCM_PATH; \
                      multi-GPU collectives will be unavailable"
                 );
