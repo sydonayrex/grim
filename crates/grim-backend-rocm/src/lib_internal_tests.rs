@@ -97,6 +97,24 @@ mod tests {
     }
 
     #[test]
+    fn test_packed_quant_layout_roundtrip() {
+        use crate::device::layout::PackedQuantLayout;
+        for bits in [2, 3, 4] {
+            let layout = PackedQuantLayout::new(4, 32, bits, 64);
+            let src: Vec<f32> = (0..4 * 32).map(|i| (i as f32 / 128.0) * 2.0 - 1.0).collect();
+            let packed = layout.pack(&src);
+            let unpacked = layout.unpack(&packed);
+            assert_eq!(unpacked.len(), src.len());
+            // Quantization will introduce some error, but check that it's within quantization bucket size:
+            // max error = 0.5 * step_size = 0.5 * (2.0 / (2^bits - 1))
+            let max_allowed_error = 1.0 / ((1 << bits) - 1) as f32 + 1e-5;
+            for (a, b) in src.iter().zip(unpacked.iter()) {
+                assert!((a - b).abs() <= max_allowed_error, "Error too large for {} bits: got a={}, b={}, diff={}", bits, a, b, (a-b).abs());
+            }
+        }
+    }
+
+    #[test]
     fn test_wavefront_tiled_layout_with_padding() {
         let wf = WavefrontTiledLayout::new(70, 50, 64);
         assert_eq!(wf.num_wavefronts, 2);

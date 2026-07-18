@@ -8,6 +8,7 @@ description = "CPU backend for Grim — reference implementation of BackendDevic
 
 [dependencies]
 grim-tensor = { workspace = true }
+grim-format = { workspace = true }
 thiserror = { workspace = true }
 # OxiBLAS — pure-Rust SIMD-accelerated SGEMM/DGEMM (no Fortran, no LAPACK).
 # Used by scirs2-linalg as its BLAS substrate. Architecture §4.1 mandates this
