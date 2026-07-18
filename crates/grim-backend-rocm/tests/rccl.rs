@@ -85,3 +85,14 @@ fn p2p_ffi_linked() -> TestResult {
     assert!(true, "RCCL P2P FFI linked (build-time check)");
     Ok(())
 }
+
+/// WI-R5: `KvDequantAttentionConfig` mirrors the other fusion configs —
+/// default-OFF so a stock build never dispatches the KV-dequant kernel.
+#[test]
+fn kv_dequant_attention_config_default_is_disabled() -> TestResult {
+    use grim_backend_rocm::KvDequantAttentionConfig;
+    let cfg = KvDequantAttentionConfig::default();
+    assert_eq!(cfg.enabled, false);
+    assert_eq!(cfg.quant_bits, 4);
+    Ok(())
+}

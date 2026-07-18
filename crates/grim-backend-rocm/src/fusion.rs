@@ -183,3 +183,39 @@ impl Default for SplitKGemmConfig {
         }
     }
 }
+
+/// Configuration for the fused KV-dequant-attention kernel (WI-R5).
+///
+/// Consumes a `CompressedKvBlock` (RotateKV-rotated, per-head bits) at
+/// attention time without materializing a full-precision KV cache in VRAM.
+/// Default-gated `off` like every other grim kernel — flip to `true` only
+/// after the WI-R5 correctness gate (kernel output vs CPU reference
+/// dequant-attention within f16 epsilon) passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvDequantAttentionConfig {
+    /// Runtime gate. `false` = fall back to the dense attention path.
+    pub enabled: bool,
+    /// Number of query heads (GQA: `num_heads >= num_kv_heads`).
+    pub num_heads: usize,
+    /// Number of KV heads in the compressed block.
+    pub num_kv_heads: usize,
+    /// Head dimension.
+    pub head_dim: usize,
+    /// Quantization bits of the cached K/V (4 or 8).
+    pub quant_bits: u8,
+    /// Wavefront size of the active arch.
+    pub wavefront_size: u32,
+}
+
+impl Default for KvDequantAttentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            num_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 128,
+            quant_bits: 4,
+            wavefront_size: 64,
+        }
+    }
+}

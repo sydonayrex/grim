@@ -2365,6 +2365,165 @@ impl RocmDevice {
         Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
     }
 
+    /// Fused KV-dequant-attention (WI-R5).
+    ///
+    /// Consumes a `CompressedKvBlock`'s packed key/value tensors and per-group
+    /// scales directly at attention time, dequantizing on the fly (per-head
+    /// `quant_bits`) and applying the online-softmax attention — no
+    /// materialized full-precision KV cache in VRAM. The packed `k_tensor`/
+    /// `v_tensor` are the `CompressedKvBlock::key_bits`/`value_bits` byte
+    /// blobs; `k_scales`/`v_scales` are the `key_meta`/`value_meta` f32 rows.
+    ///
+    /// Gated by [`KvDequantAttentionConfig`] (default-off, matching
+    /// `QkvAttentionFusionConfig`). When `enabled == false` the call returns
+    /// a typed error so callers fall back to the dense attention path rather
+    /// than silently computing the wrong result.
+    pub fn kv_dequant_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k_tensor: &dyn BackendStorage,
+        k_scales: &dyn BackendStorage,
+        v_tensor: &dyn BackendStorage,
+        v_scales: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let config = {
+            let out_dims = out_shape.dims();
+            if out_dims.len() != 3 {
+                return Err(Error::Shape(
+                    "kv_dequant_attention expects 3-D output shape [seq_len, num_heads, head_dim]".into(),
+                ));
+            }
+            crate::fusion::KvDequantAttentionConfig {
+                enabled: true,
+                num_heads: out_dims[1],
+                num_kv_heads,
+                head_dim: out_dims[2],
+                quant_bits: 4,
+                wavefront_size: self.props.wavefront_size as u32,
+            }
+        };
+        if !config.enabled {
+            return Err(Error::Backend(
+                "kv_dequant_attention: kernel is gated (KvDequantAttentionConfig.enabled=false)".into(),
+            ));
+        }
+
+        if config.num_heads == 0 || config.num_kv_heads == 0 || config.head_dim == 0 {
+            return Err(Error::Shape(
+                "kv_dequant_attention: zero-sized num_heads / num_kv_heads / head_dim".into(),
+            ));
+        }
+        if config.num_heads % config.num_kv_heads != 0 {
+            return Err(Error::Shape(format!(
+                "kv_dequant_attention: num_heads ({}) must be a multiple of num_kv_heads ({})",
+                config.num_heads, config.num_kv_heads
+            )));
+        }
+        if config.head_dim > 256 {
+            return Err(Error::Shape(format!(
+                "kv_dequant_attention supports head_dim <= 256 (got {})",
+                config.head_dim
+            )));
+        }
+
+        let q_s = as_rocm(q)?;
+        let k_s = as_rocm(k_tensor)?;
+        let ks_s = as_rocm(k_scales)?;
+        let v_s = as_rocm(v_tensor)?;
+        let vs_s = as_rocm(v_scales)?;
+        if !q_s.device_ptr_is_valid()
+            || !k_s.device_ptr_is_valid()
+            || !ks_s.device_ptr_is_valid()
+            || !v_s.device_ptr_is_valid()
+            || !vs_s.device_ptr_is_valid()
+        {
+            return Err(Error::Backend(
+                "kv_dequant_attention: an input lacks a valid device pointer".into(),
+            ));
+        }
+
+        let out_dims = out_shape.dims();
+        let seq_len = out_dims[0];
+
+        // One block per (seq_position, head); block dim 256 = 4 waves on RDNA.
+        let block_dim_x: u32 = if config.wavefront_size == 32 { 128 } else { 256 };
+        let grid_x = seq_len as u32;
+        let grid_y = config.num_heads as u32;
+        let shared_mem_bytes = (config.head_dim * 4).min(32768);
+        let launch = crate::fusion::HipKernelLaunch {
+            grid_dim: HipDim3::new(grid_x, grid_y, 1),
+            block_dim: HipDim3::new(block_dim_x, 1, 1),
+            shared_mem_bytes,
+        };
+
+        let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut out_ptr = dev_ptr(&storage)?;
+        let mut q_ptr = dev_ptr(q_s)?;
+        let mut k_ptr = dev_ptr(k_s)?;
+        let mut ks_ptr = dev_ptr(ks_s)?;
+        let mut v_ptr = dev_ptr(v_s)?;
+        let mut vs_ptr = dev_ptr(vs_s)?;
+
+        let mut num_heads_i = config.num_heads as i32;
+        let mut num_kv_heads_i = config.num_kv_heads as i32;
+        let mut head_dim_i = config.head_dim as i32;
+        let mut seq_len_i = seq_len as i32;
+        let mut kv_seq_len_i = kv_seq_len as i32;
+        let mut cache_offset_i = cache_offset as i32;
+        let inv_sqrt_d: f32 = 1.0 / (config.head_dim as f32).sqrt();
+        let mut inv_sqrt_d_bits = inv_sqrt_d.to_bits();
+        let inv_sqrt_d_ptr = &mut inv_sqrt_d_bits as *mut u32 as *mut f32;
+        let mut inv_sqrt_d_stable = inv_sqrt_d_ptr;
+        let mut quant_bits_i = config.quant_bits as i32;
+
+        let mut qp = q_ptr;
+        let mut kp = k_ptr;
+        let mut ksp = ks_ptr;
+        let mut vp = v_ptr;
+        let mut vsp = vs_ptr;
+        let mut op = out_ptr;
+        let mut nh = num_heads_i;
+        let mut nkv = num_kv_heads_i;
+        let mut hd = head_dim_i;
+        let mut sl = seq_len_i;
+        let mut ksl = kv_seq_len_i;
+        let mut co = cache_offset_i;
+        let mut isd = inv_sqrt_d;
+        let mut qb = quant_bits_i;
+
+        self.launch_compute_kernel(
+            "grim_kv_dequant_attention",
+            launch.grid_dim,
+            launch.block_dim,
+            &mut [
+                arg(&mut qp),
+                arg(&mut kp),
+                arg(&mut ksp),
+                arg(&mut vp),
+                arg(&mut vsp),
+                arg(&mut op),
+                arg(&mut nh),
+                arg(&mut nkv),
+                arg(&mut hd),
+                arg(&mut sl),
+                arg(&mut ksl),
+                arg(&mut co),
+                arg(&mut isd),
+                arg(&mut qb),
+            ],
+        )?;
+
+        let _ = (
+            qp, kp, ksp, vp, vsp, op, nh, nkv, hd, sl, ksl, co, isd, qb, inv_sqrt_d_stable,
+        );
+
+        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+    }
+
     /// Tree-attention wrapper for speculative-decoding verification.
     ///
     /// Spec context (grim_qkv_attention_kernel_spec.md Phase-2 +
