@@ -9,4 +9,5 @@ pub mod compute_kernels;
 pub mod jit_cache;
 pub mod source_asm;
 pub mod fused_dequant_gemm;
+pub mod kv_dequant_attention;
 
