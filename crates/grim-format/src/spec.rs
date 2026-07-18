@@ -121,11 +121,21 @@ impl PayloadCompression {
 }
 
 /// Kernel-side layout hint. Spec field `layout_hint`.
+///
+/// Numeric tags are assigned via [`LayoutHintTag::as_u8`] /
+/// [`LayoutHintTag::from_u8`] (not `#[repr(u8)]`, because the `PackedQuantWmma`
+/// variant carries data). Tag values: `Default=0`, `WavefrontTiled=1`,
+/// `BlockSparse=2`, `PackedQuantWmma=3`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutHintTag {
-    Default = 0,
-    WavefrontTiled = 1,
-    BlockSparse = 2,
+    Default,
+    WavefrontTiled,
+    BlockSparse,
+    /// WI-R7: packed low-bit, matrix-fragment-aligned layout for the WMMA
+    /// GEMM path (WI-G). Tells the kernel "this tensor is N-bit packed for
+    /// WMMA" so it can dispatch without re-deriving strides. RDNA3/RDNA4
+    /// only (gfx110x/gfx1200); does not touch CDNA/MFMA.
+    PackedQuantWmma { bits: u8, frag_m: u8, frag_n: u8 },
 }
 
 impl LayoutHintTag {
@@ -134,11 +144,21 @@ impl LayoutHintTag {
             0 => Some(Self::Default),
             1 => Some(Self::WavefrontTiled),
             2 => Some(Self::BlockSparse),
+            3 => Some(Self::PackedQuantWmma {
+                bits: 0,
+                frag_m: 0,
+                frag_n: 0,
+            }),
             _ => None,
         }
     }
     pub fn as_u8(self) -> u8 {
-        self as u8
+        match self {
+            LayoutHintTag::Default => 0,
+            LayoutHintTag::WavefrontTiled => 1,
+            LayoutHintTag::BlockSparse => 2,
+            LayoutHintTag::PackedQuantWmma { .. } => 3,
+        }
     }
 }
 
@@ -378,7 +398,21 @@ impl GrimTensorExt {
             "outlier_residual_bpw": self.outlier_residual_bpw,
             "compression": self.compression.as_u8(),
             "fusion_mask": self.fusion_mask,
-            "layout_hint": self.layout_hint.as_u8(),
+            "layout_hint": {
+                "tag": self.layout_hint.as_u8(),
+                "wmma_bits": match self.layout_hint {
+                    LayoutHintTag::PackedQuantWmma { bits, .. } => bits as u64,
+                    _ => 0,
+                },
+                "wmma_frag_m": match self.layout_hint {
+                    LayoutHintTag::PackedQuantWmma { frag_m, .. } => frag_m as u64,
+                    _ => 0,
+                },
+                "wmma_frag_n": match self.layout_hint {
+                    LayoutHintTag::PackedQuantWmma { frag_n, .. } => frag_n as u64,
+                    _ => 0,
+                },
+            },
             "layout_descriptor": [
                 self.layout_descriptor.0[0],
                 self.layout_descriptor.0[1],
@@ -433,8 +467,42 @@ impl GrimTensorExt {
             compression: PayloadCompression::from_u8(pick_u8("compression", 0))
                 .unwrap_or(PayloadCompression::Raw),
             fusion_mask: pick_u8("fusion_mask", 0),
-            layout_hint: LayoutHintTag::from_u8(pick_u8("layout_hint", 0))
-                .unwrap_or(LayoutHintTag::Default),
+            layout_hint: {
+                let lh = obj.get("layout_hint");
+                match lh.and_then(|v| v.as_u64()) {
+                    // Legacy flat u8 form still supported.
+                    Some(tag) => LayoutHintTag::from_u8(tag as u8)
+                        .unwrap_or(LayoutHintTag::Default),
+                    None => {
+                        // Object form: { tag, wmma_bits, wmma_frag_m, wmma_frag_n }.
+                        let tag = lh
+                            .and_then(|v| v.get("tag"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u8;
+                        let wmma_bits = lh
+                            .and_then(|v| v.get("wmma_bits"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u8;
+                        let wmma_frag_m = lh
+                            .and_then(|v| v.get("wmma_frag_m"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u8;
+                        let wmma_frag_n = lh
+                            .and_then(|v| v.get("wmma_frag_n"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u8;
+                        if tag == 3 {
+                            LayoutHintTag::PackedQuantWmma {
+                                bits: wmma_bits,
+                                frag_m: wmma_frag_m,
+                                frag_n: wmma_frag_n,
+                            }
+                        } else {
+                            LayoutHintTag::from_u8(tag).unwrap_or(LayoutHintTag::Default)
+                        }
+                    }
+                }
+            },
             layout_descriptor,
             backup1: obj
                 .get("backup1")

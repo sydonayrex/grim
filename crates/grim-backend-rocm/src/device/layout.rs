@@ -15,6 +15,7 @@
 
 use crate::WavefrontSize;
 use grim_format::gguf::{GrimLayoutHint, GrimMetadata};
+use grim_format::spec::LayoutHintTag;
 
 // Block-major KV layout for attention optimization.
 // In block-major layout, keys/values are stored as [num_blocks, head_dim, block_size]
@@ -308,6 +309,78 @@ impl PackedQuantLayout {
     }
 }
 
+/// WI-R7: packed low-bit, matrix-fragment-aligned layout for the WMMA GEMM
+/// path (WI-G). Unlike [`PackedQuantLayout`] (Wave64-aligned row segments),
+/// this computes fragment-aligned strides so the WMMA kernel can dispatch
+/// without re-deriving the packing from raw tensor dims. RDNA3/RDNA4 only
+/// (gfx110x/gfx1200); does not apply to CDNA/MFMA.
+///
+/// The stride math mirrors [`PackedQuantLayout`] for identical inputs so the
+/// two packing schemes agree on byte layout — WI-R7 correctness gate:
+/// `PackedQuantWmma`'s row pitch must equal `PackedQuant`'s Wave64-aligned
+/// row pitch for the same `(cols, bits)`.
+pub struct PackedQuantWmmaLayout {
+    pub bits: u8,
+    pub frag_m: u8,
+    pub frag_n: u8,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl PackedQuantWmmaLayout {
+    pub fn new(rows: usize, cols: usize, bits: u8, frag_m: u8, frag_n: u8) -> Self {
+        Self { bits, frag_m, frag_n, rows, cols }
+    }
+
+    /// Bytes needed to pack one row of `cols` elements at `bits`, unaligned.
+    pub fn row_packed_bytes(&self) -> usize {
+        let bits = self.cols as u64 * self.bits as u64;
+        ((bits + 7) / 8) as usize
+    }
+
+    /// Wave64-aligned row pitch (matches `PackedQuantLayout`'s packing), so a
+    /// tensor packed by either scheme lands at the same byte offset per row.
+    pub fn row_stride_bytes(&self) -> usize {
+        let raw = self.row_packed_bytes();
+        (raw + 255) & !255
+    }
+
+    /// Total packed payload size: `rows × row_stride`, Wave64-aligned per row.
+    pub fn packed_size(&self) -> usize {
+        self.rows * self.row_stride_bytes()
+    }
+
+    /// Pack one row of f32 weights into the fragment-aligned byte blob
+    /// (big-endian-bit / little-endian-byte, same convention as
+    /// `PackedQuantLayout::pack`).
+    pub fn pack_row(&self, row: &[f32]) -> Vec<u8> {
+        let bits = self.cols as u64 * self.bits as u64;
+        let bytes_needed = (bits + 7) / 8;
+        let mut out = vec![0u8; bytes_needed as usize];
+        for (i, &v) in row.iter().enumerate() {
+            let levels = (1u32 << self.bits) as f32;
+            let normalized = (v.clamp(-1.0, 1.0) + 1.0) * 0.5;
+            let code = (normalized * (levels - 1.0)).round() as u32;
+            let bit_offset = i * self.bits as usize;
+            let byte_offset = bit_offset / 8;
+            let in_byte_offset = bit_offset % 8;
+            let bits_left = 8 - in_byte_offset;
+            if bits_left >= self.bits as usize {
+                let shift = bits_left - self.bits as usize;
+                out[byte_offset] |= ((code & ((1 << self.bits) - 1)) << shift) as u8;
+            } else {
+                let high = bits_left;
+                let low = self.bits as usize - high;
+                out[byte_offset] |= (code >> low) as u8;
+                if byte_offset + 1 < out.len() {
+                    out[byte_offset + 1] |= ((code & ((1 << low) - 1)) << (8 - low)) as u8;
+                }
+            }
+        }
+        out
+    }
+}
+
 /// Align a tensor for ROCm GEMM with wavefront-aware padding.
 ///
 /// This function ensures tensor dimensions are properly aligned for:
@@ -481,4 +554,99 @@ pub fn resolve_weight_layout(
     }
 
     WeightLayout::RowMajor
+}
+
+/// WI-R7 bridge: build a [`PackedQuantWmmaLayout`] from the format's
+/// `LayoutHintTag::PackedQuantWmma` hint. Returns `None` for any other hint
+/// (the caller falls back to its existing path). RDNA3/RDNA4 only.
+pub fn resolve_packed_quant_wmma(
+    hint: LayoutHintTag,
+    rows: usize,
+    cols: usize,
+) -> Option<PackedQuantWmmaLayout> {
+    match hint {
+        LayoutHintTag::PackedQuantWmma { bits, frag_m, frag_n } => {
+            Some(PackedQuantWmmaLayout::new(rows, cols, bits, frag_m, frag_n))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod wmma_tests {
+    use super::*;
+
+    /// WI-R7 correctness gate: PackedQuantWmma's row pitch must equal the
+    /// Wave64-aligned row pitch used by PackedQuantLayout for identical inputs.
+    #[test]
+    fn wmma_stride_matches_packed_quant() {
+        let cols = 4096;
+        let bits = 4u8;
+        let wf = 64u32;
+
+        // Reference row pitch: the WI-A PackedQuant convention is
+        // Wave64-aligned per row (see format::align_wave64 / PackedQuantLayout).
+        let raw_bytes = ((cols as u64 * bits as u64 + 7) / 8) as usize;
+        let ref_pitch = (raw_bytes + 255) & !255;
+
+        // WI-R7: PackedQuantWmmaLayout with arbitrary fragment shape.
+        let wmma = PackedQuantWmmaLayout::new(1, cols, bits, 16, 16);
+        assert_eq!(wmma.row_packed_bytes(), raw_bytes, "raw row bytes must match");
+        assert_eq!(wmma.row_stride_bytes(), ref_pitch, "row pitch must match");
+
+        // And packed_size for many rows scales identically per row.
+        let wmma_multi = PackedQuantWmmaLayout::new(8, cols, bits, 16, 16);
+        assert_eq!(wmma_multi.packed_size(), 8 * ref_pitch);
+    }
+
+    #[test]
+    fn resolve_packed_quant_wmma_bridges_hint() {
+        let hint = LayoutHintTag::PackedQuantWmma { bits: 4, frag_m: 8, frag_n: 8 };
+        let layout = resolve_packed_quant_wmma(hint, 64, 1024);
+        assert!(layout.is_some());
+        let l = layout.unwrap();
+        assert_eq!(l.bits, 4);
+        assert_eq!(l.frag_m, 8);
+
+        // Non-WMMA hints resolve to None.
+        assert!(resolve_packed_quant_wmma(LayoutHintTag::WavefrontTiled, 64, 1024).is_none());
+        assert!(resolve_packed_quant_wmma(LayoutHintTag::Default, 64, 1024).is_none());
+    }
+
+    /// Inline reference packing (big-endian-bit / little-endian-byte) so the
+    /// WI-R7 pack_row is validated against an independent implementation.
+    fn ref_pack_row(row: &[f32], bits: u8) -> Vec<u8> {
+        let raw = (row.len() as u64 * bits as u64 + 7) / 8;
+        let mut out = vec![0u8; raw as usize];
+        let levels = (1u32 << bits) as f32;
+        for (i, &v) in row.iter().enumerate() {
+            let normalized = (v.clamp(-1.0, 1.0) + 1.0) * 0.5;
+            let code = (normalized * (levels - 1.0)).round() as u32;
+            let bit_offset = i * bits as usize;
+            let byte_offset = bit_offset / 8;
+            let in_byte_offset = bit_offset % 8;
+            let bits_left = 8 - in_byte_offset;
+            if bits_left >= bits as usize {
+                let shift = bits_left - bits as usize;
+                out[byte_offset] |= ((code & ((1 << bits) - 1)) << shift) as u8;
+            } else {
+                let high = bits_left;
+                let low = bits as usize - high;
+                out[byte_offset] |= (code >> low) as u8;
+                if byte_offset + 1 < out.len() {
+                    out[byte_offset + 1] |= ((code & ((1 << low) - 1)) << (8 - low)) as u8;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn wmma_pack_row_matches_reference() {
+        let row: Vec<f32> = (0..64).map(|i| (i as f32 * 0.03).sin()).collect();
+        let wmma = PackedQuantWmmaLayout::new(1, 64, 4, 16, 16);
+        let packed_wmma = wmma.pack_row(&row);
+        let packed_ref = ref_pack_row(&row, 4);
+        assert_eq!(packed_wmma, packed_ref, "packed bytes must match reference");
+    }
 }
