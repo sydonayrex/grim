@@ -104,6 +104,52 @@ impl Default for KvQuantConfig {
     }
 }
 
+/// On-disk KV-block descriptor (WI-R4 bridge).
+///
+/// `grim-kvquant` produces a [`CompressedKvBlock`] at runtime; this struct
+/// packages it into the exact shape the `grim-format` `GrimTensorEntry`
+/// KV region consumes — without `grim-kvquant` taking a dependency on
+/// `grim-format` (kept clean so the format crate stays the single source
+/// of the wire layout). The CLI/convert layer turns this into
+/// `GrimTensorEntry::set_kv_layout` + `GrimFile::add_kv_blob`.
+pub struct KvBlockOnDisk {
+    /// Serialized blob bytes (passed to `GrimFile::add_kv_blob`).
+    pub blob: Vec<u8>,
+    /// Per-head key bit-width (0 = inherit default).
+    pub bits_k: u8,
+    /// Per-head value bit-width (0 = inherit default).
+    pub bits_v: u8,
+    /// RotateKV-style pre-rotation applied.
+    pub rotated: bool,
+}
+
+impl CompressedKvBlock {
+    /// Build the on-disk descriptor: the serialized blob plus the per-head
+    /// bit-widths and rotation flag the format entry needs.
+    pub fn to_ondisk(&self, rotated: bool) -> KvBlockOnDisk {
+        KvBlockOnDisk {
+            blob: self.to_bytes(),
+            bits_k: self.key_meta_bits(),
+            bits_v: self.value_meta_bits(),
+            rotated,
+        }
+    }
+}
+
+impl CompressedKvBlock {
+    /// Per-head key bit-width inferred from `key_meta` length (0 = inherit).
+    fn key_meta_bits(&self) -> u8 {
+        // `key_meta` holds one f32 per group; the producer's config key_bits
+        // is the source of truth when available. We surface 0 (inherit) here
+        // because the block itself doesn't carry the encoder bit-width; callers
+        // that know it should override `KvBlockOnDisk::bits_k` directly.
+        0
+    }
+    fn value_meta_bits(&self) -> u8 {
+        0
+    }
+}
+
 /// Optimal centroids for a 3-bit Lloyd-Max quantizer under a standard normal distribution.
 const LLOYD_MAX_3BIT_CENTROIDS: [f32; 8] = [
     -2.152, -1.344, -0.758, -0.245, 0.245, 0.758, 1.344, 2.152,
@@ -441,6 +487,97 @@ impl CompressedKvBlock {
     pub fn num_head_dim(&self) -> usize {
         self.head_dim
     }
+
+    /// Serialize to a self-describing byte blob for on-disk persistence
+    /// (WI-R4 `.grim` KV region). Layout:
+    ///
+    /// ```text
+    /// [ num_tokens : u32 LE ][ num_kv_heads: u32 LE ][ head_dim: u32 LE ]
+    /// [ key_meta_len   : u32 LE ][ value_meta_len : u32 LE ]
+    /// [ key_bits_len   : u32 LE ]   // byte length of key_bits
+    /// [ key_meta   : f32 LE × key_meta_len ]
+    /// [ value_meta : f32 LE × value_meta_len ]
+    /// [ key_bits   : u8 × key_bits_len ]
+    /// [ value_bits : u8 × (rest) ]
+    /// ```
+    ///
+    /// The consumer-side `grim-format` writer carries these bytes verbatim in
+    /// `GrimTensorEntry::kv_compressed_*`; a reloaded session reconstructs the
+    /// block bit-for-bit via [`CompressedKvBlock::from_bytes`].
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(
+            4 * 6 + self.key_meta.len() * 4 + self.value_meta.len() * 4
+                + self.key_bits.len() + self.value_bits.len(),
+        );
+        buf.extend_from_slice(&(self.num_tokens as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.num_kv_heads as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.head_dim as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.key_meta.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.value_meta.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.key_bits.len() as u32).to_le_bytes());
+        for &m in &self.key_meta {
+            buf.extend_from_slice(&m.to_le_bytes());
+        }
+        for &m in &self.value_meta {
+            buf.extend_from_slice(&m.to_le_bytes());
+        }
+        buf.extend_from_slice(&self.key_bits);
+        buf.extend_from_slice(&self.value_bits);
+        buf
+    }
+
+    /// Inverse of [`CompressedKvBlock::to_bytes`]. Errors on a malformed or
+    /// truncated buffer.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self> {
+        if buf.len() < 24 {
+            return Err(grim_core::error::Error::KvCache(format!(
+                "CompressedKvBlock::from_bytes: buffer too short ({} bytes)",
+                buf.len()
+            )));
+        }
+        let mut pos = 0;
+        let rd_u32 = |b: &[u8], p: &mut usize| -> u32 {
+            let v = u32::from_le_bytes([b[*p], b[*p + 1], b[*p + 2], b[*p + 3]]);
+            *p += 4;
+            v
+        };
+        let num_tokens = rd_u32(buf, &mut pos) as usize;
+        let num_kv_heads = rd_u32(buf, &mut pos) as usize;
+        let head_dim = rd_u32(buf, &mut pos) as usize;
+        let key_meta_len = rd_u32(buf, &mut pos) as usize;
+        let value_meta_len = rd_u32(buf, &mut pos) as usize;
+        let key_bits_len = rd_u32(buf, &mut pos) as usize;
+
+        let need = pos + key_meta_len * 4 + value_meta_len * 4 + key_bits_len;
+        if buf.len() < need {
+            return Err(grim_core::error::Error::KvCache(format!(
+                "CompressedKvBlock::from_bytes: truncated (need {need}, have {})",
+                buf.len()
+            )));
+        }
+        let mut key_meta = Vec::with_capacity(key_meta_len);
+        for _ in 0..key_meta_len {
+            key_meta.push(f32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]));
+            pos += 4;
+        }
+        let mut value_meta = Vec::with_capacity(value_meta_len);
+        for _ in 0..value_meta_len {
+            value_meta.push(f32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]));
+            pos += 4;
+        }
+        let key_bits = buf[pos..pos + key_bits_len].to_vec();
+        pos += key_bits_len;
+        let value_bits = buf[pos..].to_vec();
+        Ok(Self {
+            key_bits,
+            key_meta,
+            value_bits,
+            value_meta,
+            num_tokens,
+            num_kv_heads,
+            head_dim,
+        })
+    }
 }
 
 /// An opaque identity transform — exact-passthrough compressor useful for
@@ -645,5 +782,41 @@ mod tests {
         
         let compressed = compressor.compress(&keys, &keys).unwrap();
         assert!(!compressed.key_bits.is_empty());
+    }
+
+    /// WI-R4: a `CompressedKvBlock` round-trips byte-identically through
+    /// `to_bytes` / `from_bytes`, including the (key_bits, value_bits)
+    /// split.
+    #[test]
+    fn compressed_kv_block_bytes_round_trip() {
+        let config = KvQuantConfig::default();
+        let compressor = LloydMaxCompressor::new(config);
+        let shape = Shape::new(vec![2, 4, 64]);
+        let dtype = DType {
+            arith: ArithType::F32,
+            storage: Storage::Native,
+        };
+        let device = grim_backend_cpu::CpuDevice::new();
+        let mut k_data = Vec::new();
+        let mut v_data = Vec::new();
+        for i in 0..512 {
+            k_data.push((i as f32 * 0.01).sin());
+            v_data.push((i as f32 * 0.02).cos());
+        }
+        let k_storage = Arc::from(device.from_cpu(&k_data, &shape, dtype.clone()).unwrap());
+        let v_storage = Arc::from(device.from_cpu(&v_data, &shape, dtype.clone()).unwrap());
+        let keys = Tensor::new(k_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
+        let values = Tensor::new(v_storage, shape, dtype, QuantProvenance::GrimNative, Device::Cpu);
+
+        let block = compressor.compress(&keys, &values).unwrap();
+        let bytes = block.to_bytes();
+        let restored = CompressedKvBlock::from_bytes(&bytes).unwrap();
+        assert_eq!(block.num_tokens, restored.num_tokens);
+        assert_eq!(block.num_kv_heads, restored.num_kv_heads);
+        assert_eq!(block.head_dim, restored.head_dim);
+        assert_eq!(block.key_bits, restored.key_bits, "key_bits mismatch");
+        assert_eq!(block.value_bits, restored.value_bits, "value_bits mismatch");
+        assert_eq!(block.key_meta, restored.key_meta);
+        assert_eq!(block.value_meta, restored.value_meta);
     }
 }

@@ -215,6 +215,7 @@ fn grim_provider_returns_extension_declaration_after_round_trip() {
         payload_size: 256,
         outlier_count: 0,
         outlier_offset: 0,
+        ..Default::default()
     };
 
     let grim_file = GrimFile {
@@ -222,6 +223,7 @@ fn grim_provider_returns_extension_declaration_after_round_trip() {
         metadata,
         tensors: vec![entry],
         tensors_by_name: HashMap::new(),
+        kv_blobs: HashMap::new(),
     };
 
     let dir = tempfile::tempdir().expect("create tempdir");
@@ -301,12 +303,14 @@ fn v1_file_without_extensions_still_opens_and_ext_for_returns_none() {
         payload_size: 256,
         outlier_count: 0,
         outlier_offset: 0,
+        ..Default::default()
     };
     let grim_file = GrimFile {
         header: GrimHeader::new(1, 0),
         metadata,
         tensors: vec![entry],
         tensors_by_name: HashMap::new(),
+        kv_blobs: HashMap::new(),
     };
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -366,6 +370,7 @@ fn grim_provider_meta_populates_fusion_mask_from_extension() {
         payload_size: 256,
         outlier_count: 0,
         outlier_offset: 0,
+        ..Default::default()
     };
 
     let grim_file = GrimFile {
@@ -373,6 +378,7 @@ fn grim_provider_meta_populates_fusion_mask_from_extension() {
         metadata,
         tensors: vec![entry],
         tensors_by_name: HashMap::new(),
+        kv_blobs: HashMap::new(),
     };
 
     let dir = tempfile::tempdir().expect("tempdir");

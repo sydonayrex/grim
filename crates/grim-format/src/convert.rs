@@ -263,6 +263,7 @@ pub fn convert_to_grim(
         metadata,
         tensors: entries.iter().map(|(e, _)| e.clone()).collect(),
         tensors_by_name: std::collections::HashMap::new(),
+        kv_blobs: std::collections::HashMap::new(),
     };
 
     let outfile = File::create(output_path)
@@ -336,6 +337,7 @@ fn pack_tensors(
             payload_size,
             outlier_count: 0,
             outlier_offset: 0,
+            ..Default::default()
         };
         result.push((entry, normals));
     }

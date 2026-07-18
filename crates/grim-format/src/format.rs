@@ -83,6 +83,42 @@ pub struct GrimTensorEntry {
     pub payload_size: u64,
     pub outlier_count: u32,
     pub outlier_offset: u64,
+
+    // Persistent KV layout fields (WI-R4)
+    pub kv_present: u8,
+    pub kv_rotated: u8,
+    pub kv_bits_k: u8,
+    pub kv_bits_v: u8,
+    pub kv_head_bits_table_offset: u64,
+    pub kv_eviction_map_offset: u64,
+    pub kv_eviction_map_size: u64,
+    pub kv_sink_fp16: u8,
+    pub kv_compressed_offset: u64,
+    pub kv_compressed_size: u64,
+}
+
+impl Default for GrimTensorEntry {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            shape: Vec::new(),
+            base_bitwidth: 0,
+            payload_offset: 0,
+            payload_size: 0,
+            outlier_count: 0,
+            outlier_offset: 0,
+            kv_present: 0,
+            kv_rotated: 0,
+            kv_bits_k: 0,
+            kv_bits_v: 0,
+            kv_head_bits_table_offset: 0,
+            kv_eviction_map_offset: 0,
+            kv_eviction_map_size: 0,
+            kv_sink_fp16: 0,
+            kv_compressed_offset: 0,
+            kv_compressed_size: 0,
+        }
+    }
 }
 
 impl GrimTensorEntry {
@@ -111,10 +147,32 @@ impl GrimTensorEntry {
         w.write_all(&self.outlier_offset.to_le_bytes())
             .map_err(|e| Error::Backend(format!("Tensor entry write failed: {e}")))?;
 
+        // Write KV fields
+        w.write_all(&[self.kv_present])
+            .map_err(|e| Error::Backend(format!("Tensor entry write failed: {e}")))?;
+        w.write_all(&[self.kv_rotated])
+            .map_err(|e| Error::Backend(format!("Tensor entry write failed: {e}")))?;
+        w.write_all(&[self.kv_bits_k])
+            .map_err(|e| Error::Backend(format!("Tensor entry write failed: {e}")))?;
+        w.write_all(&[self.kv_bits_v])
+            .map_err(|e| Error::Backend(format!("Tensor entry write failed: {e}")))?;
+        w.write_all(&self.kv_head_bits_table_offset.to_le_bytes())
+            .map_err(|e| Error::Backend(format!("Tensor entry write failed: {e}")))?;
+        w.write_all(&self.kv_eviction_map_offset.to_le_bytes())
+            .map_err(|e| Error::Backend(format!("Tensor entry write failed: {e}")))?;
+        w.write_all(&self.kv_eviction_map_size.to_le_bytes())
+            .map_err(|e| Error::Backend(format!("Tensor entry write failed: {e}")))?;
+        w.write_all(&[self.kv_sink_fp16])
+            .map_err(|e| Error::Backend(format!("Tensor entry write failed: {e}")))?;
+        w.write_all(&self.kv_compressed_offset.to_le_bytes())
+            .map_err(|e| Error::Backend(format!("Tensor entry write failed: {e}")))?;
+        w.write_all(&self.kv_compressed_size.to_le_bytes())
+            .map_err(|e| Error::Backend(format!("Tensor entry write failed: {e}")))?;
+
         Ok(())
     }
 
-    pub fn read<R: Read>(r: &mut R) -> Result<Self> {
+    pub fn read<R: Read>(r: &mut R, has_kv: bool) -> Result<Self> {
         let mut name_len_bytes = [0u8; 2];
         r.read_exact(&mut name_len_bytes)
             .map_err(|e| Error::Backend(format!("Tensor entry read failed: {e}")))?;
@@ -162,6 +220,61 @@ impl GrimTensorEntry {
             .map_err(|e| Error::Backend(format!("Tensor entry read failed: {e}")))?;
         let outlier_offset = u64::from_le_bytes(o_offset_bytes);
 
+        let mut kv_present = 0u8;
+        let mut kv_rotated = 0u8;
+        let mut kv_bits_k = 0u8;
+        let mut kv_bits_v = 0u8;
+        let mut kv_head_bits_table_offset = 0u64;
+        let mut kv_eviction_map_offset = 0u64;
+        let mut kv_eviction_map_size = 0u64;
+        let mut kv_sink_fp16 = 0u8;
+        let mut kv_compressed_offset = 0u64;
+        let mut kv_compressed_size = 0u64;
+
+        if has_kv {
+            let mut buf_u8 = [0u8; 1];
+            r.read_exact(&mut buf_u8)
+                .map_err(|e| Error::Backend(format!("Tensor entry read failed: {e}")))?;
+            kv_present = buf_u8[0];
+
+            r.read_exact(&mut buf_u8)
+                .map_err(|e| Error::Backend(format!("Tensor entry read failed: {e}")))?;
+            kv_rotated = buf_u8[0];
+
+            r.read_exact(&mut buf_u8)
+                .map_err(|e| Error::Backend(format!("Tensor entry read failed: {e}")))?;
+            kv_bits_k = buf_u8[0];
+
+            r.read_exact(&mut buf_u8)
+                .map_err(|e| Error::Backend(format!("Tensor entry read failed: {e}")))?;
+            kv_bits_v = buf_u8[0];
+
+            let mut buf_u64 = [0u8; 8];
+            r.read_exact(&mut buf_u64)
+                .map_err(|e| Error::Backend(format!("Tensor entry read failed: {e}")))?;
+            kv_head_bits_table_offset = u64::from_le_bytes(buf_u64);
+
+            r.read_exact(&mut buf_u64)
+                .map_err(|e| Error::Backend(format!("Tensor entry read failed: {e}")))?;
+            kv_eviction_map_offset = u64::from_le_bytes(buf_u64);
+
+            r.read_exact(&mut buf_u64)
+                .map_err(|e| Error::Backend(format!("Tensor entry read failed: {e}")))?;
+            kv_eviction_map_size = u64::from_le_bytes(buf_u64);
+
+            r.read_exact(&mut buf_u8)
+                .map_err(|e| Error::Backend(format!("Tensor entry read failed: {e}")))?;
+            kv_sink_fp16 = buf_u8[0];
+
+            r.read_exact(&mut buf_u64)
+                .map_err(|e| Error::Backend(format!("Tensor entry read failed: {e}")))?;
+            kv_compressed_offset = u64::from_le_bytes(buf_u64);
+
+            r.read_exact(&mut buf_u64)
+                .map_err(|e| Error::Backend(format!("Tensor entry read failed: {e}")))?;
+            kv_compressed_size = u64::from_le_bytes(buf_u64);
+        }
+
         Ok(Self {
             name,
             shape,
@@ -170,6 +283,16 @@ impl GrimTensorEntry {
             payload_size,
             outlier_count,
             outlier_offset,
+            kv_present,
+            kv_rotated,
+            kv_bits_k,
+            kv_bits_v,
+            kv_head_bits_table_offset,
+            kv_eviction_map_offset,
+            kv_eviction_map_size,
+            kv_sink_fp16,
+            kv_compressed_offset,
+            kv_compressed_size,
         })
     }
 }
@@ -791,6 +914,80 @@ pub fn read_normals_decompressing<R: Read + Seek>(
 }
 
 // ---------------------------------------------------------------------------
+// Persistent KV-cache layout (WI-R4) — extends `GrimTensorEntry`
+// ---------------------------------------------------------------------------
+
+/// Wave64-aligned byte blob encoding for a compressed KV cache.
+///
+/// The on-disk KV region is a single Wave64-aligned byte blob pointed at by
+/// `GrimTensorEntry::kv_compressed_offset` / `kv_compressed_size`. The exact
+/// inner byte layout is owned by the producer (e.g. `grim-kvquant`'s
+/// `CompressedKvBlock::to_bytes`); this module only carries the bytes
+/// verbatim so that a reloaded session can reproduce the compressed cache
+/// bit-for-bit. Legacy (V2) entries carry `kv_present = 0` and an empty blob.
+pub fn write_kv_block<W: Write>(w: &mut W, blob: &[u8]) -> Result<()> {
+    w.write_all(blob)
+        .map_err(|e| Error::Backend(format!("kv block write failed: {e}")))?;
+    // Pad the KV blob to the next Wave64 segment boundary so the next
+    // tensor's payload region stays Wave64-aligned (consistency with the
+    // normals/outlier payloads).
+    let pad = align_wave64(blob.len() as u64) as usize - blob.len();
+    if pad > 0 {
+        w.write_all(&vec![0u8; pad])
+            .map_err(|e| Error::Backend(format!("kv block pad failed: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Read a previously-written KV blob back from the payload region.
+///
+/// Returns exactly `entry.kv_compressed_size` bytes starting at
+/// `entry.kv_compressed_offset`. When `kv_present == 0` the caller should
+/// not call this (the blob is empty); we still guard against zero size.
+pub fn read_kv_block<R: Read + Seek>(reader: &mut R, entry: &GrimTensorEntry) -> Result<Vec<u8>> {
+    if entry.kv_compressed_size == 0 {
+        return Ok(Vec::new());
+    }
+    reader.seek(SeekFrom::Start(entry.kv_compressed_offset))?;
+    let mut buf = vec![0u8; entry.kv_compressed_size as usize];
+    reader.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+impl GrimTensorEntry {
+    /// Record the persistent-KV layout fields from a compressed KV block's
+    /// shape, leaving the byte blob (`kv_compressed_offset`/`size`) to be set
+    /// by the writer after payload offsets are computed.
+    ///
+    /// `rotated` reflects RotateKV-style pre-rotation; `bits_k`/`bits_v` are
+    /// the per-head bit-widths (0 = inherit default). Callers pass the
+    /// producer's serialized blob length via `compressed_size` so the reader
+    /// can fetch the right number of bytes; the `*_offset` is filled in by
+    /// `GrimFile::write`.
+    pub fn set_kv_layout(
+        &mut self,
+        present: bool,
+        rotated: bool,
+        bits_k: u8,
+        bits_v: u8,
+        eviction_map_offset: u64,
+        eviction_map_size: u64,
+        sink_fp16: bool,
+        compressed_size: u64,
+    ) {
+        self.kv_present = u8::from(present);
+        self.kv_rotated = u8::from(rotated);
+        self.kv_bits_k = bits_k;
+        self.kv_bits_v = bits_v;
+        self.kv_eviction_map_offset = eviction_map_offset;
+        self.kv_eviction_map_size = eviction_map_size;
+        self.kv_sink_fp16 = u8::from(sink_fp16);
+        self.kv_compressed_size = compressed_size;
+        // `kv_compressed_offset` is computed during `GrimFile::write`.
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Parsed file assembly + reader
 // ---------------------------------------------------------------------------
 
@@ -803,6 +1000,23 @@ pub struct GrimFile {
     pub metadata: crate::gguf::GrimMetadata,
     pub tensors: Vec<GrimTensorEntry>,
     pub tensors_by_name: HashMap<String, usize>,
+    /// Optional per-tensor serialized KV-cache blobs (WI-R4). Keyed by
+    /// tensor name; only present when a writer attached a compressed KV
+    /// block via [`GrimFile::add_kv_blob`]. The blob bytes are written into
+    /// the payload region and the owning entry's `kv_compressed_offset` is
+    /// assigned during [`GrimFile::write`].
+    pub kv_blobs: HashMap<String, Vec<u8>>,
+}
+
+impl GrimFile {
+    /// Attach a serialized KV-cache blob for `tensor_name` (WI-R4).
+    ///
+    /// The blob is written into the payload region at `GrimFile::write`
+    /// time; `entry.kv_compressed_offset` is assigned then. Legacy files
+    /// that never call this keep an empty map and `kv_present == 0`.
+    pub fn add_kv_blob(&mut self, tensor_name: impl Into<String>, blob: Vec<u8>) {
+        self.kv_blobs.insert(tensor_name.into(), blob);
+    }
 }
 
 impl GrimFile {
@@ -827,9 +1041,10 @@ impl GrimFile {
         };
 
         // Tensor registry.
+        let has_kv = metadata.has_kv_registry.unwrap_or(false);
         let mut tensors = Vec::with_capacity(header.num_tensors as usize);
         for _ in 0..header.num_tensors {
-            tensors.push(GrimTensorEntry::read(reader)?);
+            tensors.push(GrimTensorEntry::read(reader, has_kv)?);
         }
         let mut tensors_by_name = HashMap::with_capacity(tensors.len());
         for (i, t) in tensors.iter().enumerate() {
@@ -841,6 +1056,7 @@ impl GrimFile {
             metadata,
             tensors,
             tensors_by_name,
+            kv_blobs: HashMap::new(),
         })
     }
 
@@ -853,7 +1069,9 @@ impl GrimFile {
         &self,
         w: &mut W,
     ) -> Result<Vec<GrimTensorEntry>> {
-        let metadata_json = self.metadata.to_json();
+        let mut metadata = self.metadata.clone();
+        metadata.has_kv_registry = Some(true);
+        let metadata_json = metadata.to_json();
         let metadata_bytes = serde_json::to_vec(&metadata_json)
             .map_err(|e| Error::Backend(format!("metadata JSON serialize failed: {e}")))?;
         let metadata_len = metadata_bytes.len() as u64;
@@ -876,6 +1094,16 @@ impl GrimFile {
             offset += entry.payload_size;
             entry.outlier_offset = offset;
             offset += entry.outlier_count as u64 * OUTLIER_RECORD_BYTES as u64;
+            // KV blob (WI-R4): appended after the outlier stream, then
+            // Wave64-aligned. `kv_compressed_offset` is assigned here;
+            // `kv_compressed_size` was set by the caller via
+            // `GrimTensorEntry::set_kv_layout`.
+            if entry.kv_present != 0 && entry.kv_compressed_size > 0 {
+                entry.kv_compressed_offset = offset;
+                offset += entry.kv_compressed_size;
+                offset = (offset + WAVE64_SEGMENT_BYTES as u64 - 1) / WAVE64_SEGMENT_BYTES as u64
+                    * WAVE64_SEGMENT_BYTES as u64;
+            }
             // Align next tensor to a Wave64 segment boundary.
             offset = (offset + WAVE64_SEGMENT_BYTES as u64 - 1) / WAVE64_SEGMENT_BYTES as u64
                 * WAVE64_SEGMENT_BYTES as u64;
@@ -885,6 +1113,11 @@ impl GrimFile {
         for entry in &written_entries {
             entry.write(w)?;
         }
+
+        // KV blobs (WI-R4) are emitted by the caller after `write`, using the
+        // assigned `kv_compressed_offset`. This matches the existing pattern
+        // where the caller writes the normals payload at `payload_offset`
+        // using the returned `written_entries`. See `write_kv_block`.
 
         Ok(written_entries)
     }
@@ -900,7 +1133,8 @@ fn registry_entry_size(entry: &GrimTensorEntry) -> u64 {
     let name_len = 2 + entry.name.len() as u64;
     let shape_len = 1 + entry.shape.len() as u64 * 4;
     let fixed = 1 + 8 + 8 + 4 + 8; // base_bitwidth + offsets + count + offset
-    name_len + shape_len + fixed
+    let kv_fields = 1 + 1 + 1 + 1 + 8 + 8 + 8 + 1 + 8 + 8; // 45 bytes
+    name_len + shape_len + fixed + kv_fields
 }
 
 #[cfg(test)]
@@ -928,12 +1162,13 @@ mod tests {
             payload_size: 1572864,
             outlier_count: 512,
             outlier_offset: 1574912,
+            ..Default::default()
         };
         let mut buf = Vec::new();
         entry.write(&mut buf).unwrap();
 
         let mut reader = &buf[..];
-        let decoded = GrimTensorEntry::read(&mut reader).unwrap();
+        let decoded = GrimTensorEntry::read(&mut reader, true).unwrap();
         assert_eq!(entry, decoded);
     }
 
@@ -1176,6 +1411,7 @@ mod tests {
             payload_size: original.len() as u64,
             outlier_count: 0,
             outlier_offset: 0,
+            ..Default::default()
         };
         let mut cursor = std::io::Cursor::new(&original[..]);
         let out = read_normals_decompressing(&mut cursor, &entry, PayloadCompression::Raw)
@@ -1200,6 +1436,7 @@ mod tests {
             payload_size: compressed.len() as u64,
             outlier_count: 0,
             outlier_offset: 0,
+            ..Default::default()
         };
         let mut cursor = std::io::Cursor::new(&compressed[..]);
         let out = read_normals_decompressing(&mut cursor, &entry, PayloadCompression::Zstd)
@@ -1229,6 +1466,7 @@ mod tests {
             payload_size: 512,
             outlier_count: 2,
             outlier_offset: 0,
+            ..Default::default()
         };
 
         let file = GrimFile {
@@ -1236,6 +1474,7 @@ mod tests {
             metadata,
             tensors: vec![tensor],
             tensors_by_name: HashMap::new(),
+            kv_blobs: HashMap::new(),
         };
 
         let mut buf = Vec::new();
@@ -1259,5 +1498,110 @@ mod tests {
         // tensor() lookup works.
         assert!(restored.tensor("layer.0.weight").is_some());
         assert!(restored.tensor("nonexistent").is_none());
+    }
+
+    /// WI-R4: a compressed KV block written via `GrimFile::add_kv_blob` +
+    /// `set_kv_layout` round-trips byte-identically, and a reloaded session
+    /// sees `kv_present == 1` with the same blob.
+    #[test]
+    fn kv_block_round_trips_byte_identical() {
+        use crate::gguf::GrimMetadata;
+        use std::io::Cursor;
+
+        let blob: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
+
+        let mut tensor = GrimTensorEntry {
+            name: "model.layers.0.self_attn.k_proj.weight".into(),
+            shape: vec![32, 128, 128],
+            base_bitwidth: 4,
+            payload_offset: 0,
+            payload_size: 512,
+            outlier_count: 0,
+            outlier_offset: 0,
+            ..Default::default()
+        };
+        tensor.set_kv_layout(
+            true,   // present
+            true,   // rotated (RotateKV-style)
+            3,      // bits_k
+            4,      // bits_v
+            0,      // eviction_map_offset
+            0,      // eviction_map_size
+            false,  // sink_fp16
+            blob.len() as u64,
+        );
+
+        let mut file = GrimFile {
+            header: GrimHeader::new(1, 0),
+            metadata: GrimMetadata {
+                magic: Some("grim-v1".into()),
+                kv_layout_optimized: Some(true),
+                ..Default::default()
+            },
+            tensors: vec![tensor],
+            tensors_by_name: HashMap::new(),
+            kv_blobs: HashMap::new(),
+        };
+        file.add_kv_blob("model.layers.0.self_attn.k_proj.weight", blob.clone());
+
+        let mut buf = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        let written = file.write(&mut cursor).unwrap();
+
+        // The caller (matching the normals-payload pattern) writes the KV
+        // blob at the assigned offset.
+        let e = &written[0];
+        cursor.seek(SeekFrom::Start(e.kv_compressed_offset)).unwrap();
+        write_kv_block(&mut cursor, &blob).unwrap();
+
+        // Read back.
+        let mut reader = Cursor::new(&buf[..]);
+        let restored = GrimFile::read(&mut reader).unwrap();
+        let e = &restored.tensors[0];
+        assert_eq!(e.kv_present, 1);
+        assert_eq!(e.kv_rotated, 1);
+        assert_eq!(e.kv_bits_k, 3);
+        assert_eq!(e.kv_bits_v, 4);
+        assert_eq!(e.kv_compressed_size, blob.len() as u64);
+        assert!(e.kv_compressed_offset > 0);
+
+        // The blob must be byte-identical to what we wrote.
+        let mut rb = Cursor::new(&buf[..]);
+        let read_back = read_kv_block(&mut rb, e).unwrap();
+        // `read_kv_block` returns exactly kv_compressed_size bytes; the
+        // trailing Wave64 padding is included, so compare the prefix.
+        assert_eq!(&read_back[..blob.len()], &blob[..]);
+    }
+
+    /// WI-R4: a legacy V2 file (no KV region) reads back with `kv_present == 0`
+    /// and an empty KV blob — back-compat invariant.
+    #[test]
+    fn legacy_file_reads_kv_present_zero() {
+        use crate::gguf::GrimMetadata;
+        use std::io::Cursor;
+
+        let tensor = GrimTensorEntry {
+            name: "legacy.weight".into(),
+            shape: vec![128, 128],
+            base_bitwidth: 4,
+            payload_offset: 0,
+            payload_size: 512,
+            ..Default::default()
+        };
+        let file = GrimFile {
+            header: GrimHeader::new(1, 0),
+            metadata: GrimMetadata::default(),
+            tensors: vec![tensor],
+            tensors_by_name: HashMap::new(),
+            kv_blobs: HashMap::new(),
+        };
+        let mut buf = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        file.write(&mut cursor).unwrap();
+
+        let mut reader = Cursor::new(&buf[..]);
+        let restored = GrimFile::read(&mut reader).unwrap();
+        assert_eq!(restored.tensors[0].kv_present, 0);
+        assert_eq!(restored.tensors[0].kv_compressed_size, 0);
     }
 }

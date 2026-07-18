@@ -526,6 +526,7 @@ mod tests {
             payload_size: 16, // 16 elements * 4 bits / 8 = 8 bytes, padded
             outlier_count: 1,
             outlier_offset: 0,
+            ..Default::default()
         };
 
         let grim_file = GrimFile {
@@ -533,6 +534,7 @@ mod tests {
             metadata,
             tensors: vec![tensor.clone()],
             tensors_by_name: HashMap::new(),
+            kv_blobs: HashMap::new(),
         };
 
         let mut buf = Vec::new();
