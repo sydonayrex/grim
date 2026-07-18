@@ -90,6 +90,12 @@ the existing unit tests' synthetic buffers.
 **Gate:** This blocks WI-C's correctness gate. It does not block WI-A
 (pure layout math, no file I/O) or WI-D (unrelated to the format).
 
+**Relevant Skills:**
+- `writing-plans` (Writing plans)
+- `writing-guidelines` (Writing guidelines)
+- `specification-writing` (Specification-driven development)
+- `requirements-clarity` (Specification requirements)
+
 ## 3. Work items
 
 ### WI-A — Packed-weight `WeightLayout` variant + host-side pack/unpack (format↔kernel bridge)
@@ -125,6 +131,12 @@ proposed separately, not smuggled in here.
 including odd row counts that don't divide the wavefront size) → compile →
 no changes to existing `WeightLayout` variants' behavior.
 
+**Relevant Skills:**
+- `rust-tdd` & `tdd` (Rust TDD / Test-Driven Development)
+- `rust-architecture` (Architecture)
+- `writing-guidelines` (Writing guidelines)
+- `humanizer` (Humanizer)
+
 ---
 
 ### WI-B — Outlier merge + per-row dequant scale application (host-side reference kernel)
@@ -151,6 +163,12 @@ indices. This is the numerical spec the HIP kernel in WI-C must match.
 output matches a float64 reference dequant within tight epsilon on synthetic
 tensors covering: uniform bpw, per-row bpw table, one backup layer, two
 backup layers, delta-varint outliers, flat-u32 legacy outliers.
+
+**Relevant Skills:**
+- `rust-tdd` & `tdd` (Rust TDD / Test-Driven Development)
+- `rust-architecture` (Architecture)
+- `writing-guidelines` (Writing guidelines)
+- `humanizer` (Humanizer)
 
 ---
 
@@ -223,6 +241,13 @@ established for JIT-source concatenation).
    then plain GEMM) to prove the *fusion* itself is worth the added kernel
    complexity, not just that quantization saves memory.
 
+**Relevant Skills:**
+- `rocm-hip-kernels` & `rocm-kernel-design` (Rust FFI ROCm / GPU Kernels)
+- `rust-ffi-grim` & `rust-ffi` (Rust FFI ROCm)
+- `system-design` (Architecture)
+- `writing-guidelines` (Writing guidelines)
+- `humanizer` (Humanizer)
+
 ---
 
 ### WI-D — Wire up `split_k` for real (separate from WI-C)
@@ -246,6 +271,11 @@ behind its own default-off config flag.
 
 **Gates:** Same four-gate ordering as WI-C. Keep this independent of WI-C so
 a regression in one doesn't block the other's rollout.
+
+**Relevant Skills:**
+- `rocm-hip-kernels` & `rocm-kernel-design` (Rust FFI ROCm / GPU Kernels)
+- `writing-guidelines` (Writing guidelines)
+- `humanizer` (Humanizer)
 
 ### WI-C follow-up — capture the fused dequant GEMM into the decode graph
 
@@ -287,6 +317,11 @@ launch output, same epsilon as WI-C's own gate) → compile → architecture
 `DecodegKey` extension requires it) → `TODO(gpu-verify)` perf: measure the
 15–30µs/token figure still holds with the dequant kernel included, not just
 assume it carries over from the dense-only baseline.
+
+**Relevant Skills:**
+- `rocm-hip` (Rust FFI ROCm)
+- `system-design` (Architecture)
+- `writing-guidelines` (Writing guidelines)
 
 ---
 
@@ -379,6 +414,12 @@ crate needs, nothing more.
    real hardware — this is the number the whole feature exists to produce,
    and it's currently unmeasurable because there's nothing to measure yet.
 
+**Relevant Skills:**
+- `rust-tdd` & `tdd` (Rust TDD / Test-Driven Development)
+- `system-design` (Architecture)
+- `writing-guidelines` (Writing guidelines)
+- `humanizer` (Humanizer)
+
 ---
 
 ### WI-F — Remove the `head_dim > 64` guard: port cubecl's existing tiled attention into the primary kernel path
@@ -449,6 +490,12 @@ throughput doesn't regress from the generalized chunk-loop replacing the
 single-element path, on RDNA2, RDNA3, and RDNA4 separately (per the
 occupancy-tradeoff caution already noted for this item — don't assume one
 arch's numbers carry over).
+
+**Relevant Skills:**
+- `rocm-hip-kernels` & `rocm-kernel-design` (Rust FFI ROCm / GPU Kernels)
+- `rust-architecture` (Architecture)
+- `writing-guidelines` (Writing guidelines)
+- `humanizer` (Humanizer)
 
 ---
 
@@ -532,6 +579,13 @@ plan — matrix-core vs. scalar-loop throughput is the kind of claim that
 needs an actual measured ratio on real RDNA3 and RDNA4 hardware before
 anyone treats it as delivered, not an assumed multiplier from the general
 GPU literature.
+
+**Relevant Skills:**
+- `rocm-hip-kernels` & `rocm-kernel-design` (Rust FFI ROCm / GPU Kernels)
+- `rust-ffi-grim` & `rust-ffi` (Rust FFI ROCm)
+- `system-design` (Architecture)
+- `writing-guidelines` (Writing guidelines)
+- `humanizer` (Humanizer)
 
 ---
 
