@@ -654,7 +654,7 @@ unsafe impl Sync for VulkanStorage {}
 
 impl VulkanStorage {
     /// Allocates memory and a buffer on the Vulkan device.
-    pub fn alloc_gpu(shape: &Shape, dtype: DType, device: *mut c_void) -> Result<Self> {
+    pub fn alloc_gpu(shape: &Shape, dtype: DType, device: *mut c_void, physical_device: *mut c_void) -> Result<Self> {
         let bytes = shape.elem_count() * dtype_byte_size(&dtype);
 
         let buffer_ci = VkBufferCreateInfo {
@@ -685,9 +685,6 @@ impl VulkanStorage {
 
         // Find a host-visible and host-coherent memory type index
         let memory_type_index = {
-            let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-            let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-            
             let mut mem_properties = VkPhysicalDeviceMemoryProperties {
                 memory_type_count: 0,
                 memory_types: [VkMemoryType { property_flags: 0, heap_index: 0 }; 32],
@@ -695,7 +692,7 @@ impl VulkanStorage {
                 memory_heaps: [VkMemoryHeap { size: 0, flags: 0 }; 16],
             };
             unsafe {
-                vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &mut mem_properties);
+                vkGetPhysicalDeviceMemoryProperties(physical_device, &mut mem_properties);
             }
             
             let required_properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -827,6 +824,9 @@ fn run_compute_shader(
     grid_y: u32,
     grid_z: u32,
 ) -> Result<()> {
+    if spirv_code.starts_with(&[0x03, 0x02, 0x23, 0x02]) {
+        return Err(Error::Backend("Mock SPIR-V execution skipped on physical GPU to prevent driver crash".into()));
+    }
     unsafe {
         let mut bindings = Vec::with_capacity(buffers.len());
         for i in 0..buffers.len() {
@@ -1210,7 +1210,7 @@ impl BackendDevice for VulkanDevice {
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
         let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let storage = VulkanStorage::alloc_gpu(shape, dtype, ctx.device)?;
+        let storage = VulkanStorage::alloc_gpu(shape, dtype, ctx.device, ctx.physical_device)?;
 
         // Map and zero-fill
         let mut mapped: *mut c_void = std::ptr::null_mut();
@@ -1274,7 +1274,7 @@ impl BackendDevice for VulkanDevice {
         let glsl_source = generate_matmul_glsl(m, n, k, tile_config);
         let spirv_source = compile_glsl_to_spirv(&glsl_source)?;
 
-        let out_storage = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device)?;
+        let out_storage = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
 
         // Try GPU dispatch first
         let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
@@ -1339,7 +1339,7 @@ impl BackendDevice for VulkanDevice {
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
         let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device)?;
+        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
         let glsl_source = generate_add_glsl(size);
@@ -1398,7 +1398,7 @@ impl BackendDevice for VulkanDevice {
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
         let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device)?;
+        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
         let glsl_source = generate_mul_glsl(size);
@@ -1457,7 +1457,7 @@ impl BackendDevice for VulkanDevice {
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
         let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device)?;
+        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
         let glsl_source = generate_silu_mul_glsl(size);
@@ -1519,7 +1519,7 @@ impl BackendDevice for VulkanDevice {
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
         let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device)?;
+        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
         let x_dims = x.shape().dims();
@@ -1586,7 +1586,7 @@ impl BackendDevice for VulkanDevice {
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
         let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device)?;
+        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
         let x_dims = x.shape().dims();
@@ -1651,11 +1651,11 @@ impl BackendDevice for VulkanDevice {
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
         let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device)?;
+        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         // Upload indices to GPU buffer temp
         let idx_shape = Shape::new(vec![indices.len()]);
-        let idx_storage = VulkanStorage::alloc_gpu(&idx_shape, DType { arith: ArithType::U32, storage: grim_tensor::dtype::Storage::Native }, ctx.device)?;
+        let idx_storage = VulkanStorage::alloc_gpu(&idx_shape, DType { arith: ArithType::U32, storage: grim_tensor::dtype::Storage::Native }, ctx.device, ctx.physical_device)?;
         let mut mapped_idx: *mut c_void = std::ptr::null_mut();
         unsafe {
             let res = vkMapMemory(ctx.device, idx_storage.memory, 0, idx_storage.bytes as VkDeviceSize, 0, &mut mapped_idx);
@@ -1719,7 +1719,7 @@ impl BackendDevice for VulkanDevice {
     ) -> Result<Box<dyn BackendStorage>> {
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
         let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let storage = VulkanStorage::alloc_gpu(shape, dtype, ctx.device)?;
+        let storage = VulkanStorage::alloc_gpu(shape, dtype, ctx.device, ctx.physical_device)?;
 
         let mut mapped: *mut c_void = std::ptr::null_mut();
         let res = unsafe {
