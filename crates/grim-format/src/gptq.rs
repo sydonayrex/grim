@@ -135,6 +135,7 @@ impl TensorProvider for GptqProvider {
                 desc_act: info.desc_act,
             },
             shape: info.shape.clone(),
+            fusion_mask: 0,
         })
     }
 }

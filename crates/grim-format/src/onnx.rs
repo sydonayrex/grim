@@ -88,6 +88,7 @@ impl TensorProvider for OnnxProvider {
             dtype: info.dtype.to_grim_dtype(),
             provenance: QuantProvenance::GrimNative,
             shape: info.shape.clone(),
+            fusion_mask: 0,
         })
     }
 }

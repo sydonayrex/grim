@@ -169,7 +169,35 @@ impl LoRAWeights {
 /// hooks — 32-byte vectorised loads, LDS-coalesced stride patterns,
 /// wavefront-aware padding — land alongside the fused-LoRA HIP kernel.
 pub fn align_tensor_for_rocm_gemm(tensor: &grim_tensor::Tensor) -> Result<grim_tensor::Tensor> {
-    // No-op alignment for the CPU structural path; ROCm HIP path will deliver
-    // real alignment once the fused-LoRA kernel is available.
-    Ok(tensor.clone())
+    let dims = tensor.shape().dims();
+    if dims.len() != 2 {
+        return Ok(tensor.clone());
+    }
+    let rows = dims[0];
+    let cols = dims[1];
+    let wavefront_size = 64;
+    let wf = wavefront_size as usize;
+    let rows_padded = (rows + wf - 1) & !(wf - 1);
+    let cols_padded = cols;
+    if rows_padded == rows {
+        return Ok(tensor.clone());
+    }
+
+    let data = tensor.to_vec_f32()?;
+    let total_elements = rows_padded * cols_padded;
+    let mut padded = vec![0.0f32; total_elements];
+    
+    // Copy original data
+    for row in 0..rows {
+        let src_start = row * cols;
+        let dst_start = row * cols_padded;
+        for col in 0..cols {
+            padded[dst_start + col] = data[src_start + col];
+        }
+    }
+    
+    Ok(grim_backend_cpu::cpu_tensor(
+        padded,
+        grim_tensor::Shape::new(vec![rows_padded, cols_padded]),
+    ))
 }

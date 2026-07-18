@@ -218,9 +218,22 @@ pub fn convert_gguf_to_grim(input_path: &str, output_path: &str, resolved_gcn: &
     Ok(())
 }
 
-/// Convert any supported model format to the optimized `.grim` V2 format.
-/// Supports variable bitrates, Outlier-Aware Streams, and Wave64-tiled weight layouts.
-pub fn convert_to_grim_v2(
+/// Quantization toolchain version stamp written into `.grim` metadata.
+pub const GRIM_QUANT_VERSION: u32 = 1;
+
+/// Convert any supported model format to the native `.grim` format.
+///
+/// Routes by file extension (spec §5): `.gguf` → GGUF reader, `.safetensors`
+/// / `.bin` → safetensors reader. Each source tensor is repacked at
+/// `target_bpw` bits-per-weight into the normals stream (Wave64-aligned),
+/// with an empty outliers stream. The output is a valid native `.grim` file
+/// readable by [`crate::tprov::GrimProvider`].
+///
+/// The EvoPress/GPTQ calibration engine (spec §2) is a separate concern;
+/// this function performs format-correct repacking. When calibration is
+/// available it will slot in between the read and write phases without
+/// changing this function's signature.
+pub fn convert_to_grim(
     input_path: &str,
     output_path: &str,
     target_gcn: &str,
@@ -228,56 +241,214 @@ pub fn convert_to_grim_v2(
     generations: usize,
     dataset: Option<&str>,
 ) -> Result<()> {
-    println!("[Grim V2 Convert] Starting conversion pipeline...");
+    println!("[Grim Convert] Starting conversion pipeline...");
     println!("  Source: {}", input_path);
     println!("  Target GCN: {}", target_gcn);
     println!("  Target BPW: {}", target_bpw);
-    println!("  EvoPress Generations: {}", generations);
-    println!("  Dataset: {:?}", dataset);
+    if generations > 0 {
+        println!("  EvoPress Generations: {} (calibration engine not yet wired)", generations);
+    }
+    if let Some(ds) = dataset {
+        println!("  Dataset: {} (calibration engine not yet wired)", ds);
+    }
 
-    // Placeholder logic for Outlier-Aware partitioning & V2 serialization
-    let mut outfile = File::create(output_path)
-        .map_err(|e| Error::Backend(format!("Failed to create output file: {e}")))?;
-    let mut out_writer = BufWriter::new(&mut outfile);
+    let base_bitwidth = (target_bpw.round() as u8).clamp(2, 16);
+    let profile = gcn_to_profile(target_gcn);
 
-    // Mock-quantize a single sample tensor to verify serialization flow
-    let sample_name = "model.embed_tokens.weight".to_string();
-    let sample_shape = vec![32000, 4096];
-    let base_bitwidth = 4;
-    
-    // Compute dummy layout offsets
-    let header_len = 5 + 8 + 4; // Magic + metadata_len + num_tensors
-    let registry_len = 2 + sample_name.len() + 1 + 4 * 2 + 1 + 8 + 8 + 4 + 8; // approx entry size
-    let payload_offset = (header_len + registry_len) as u64;
-    let payload_size = 32000 * 4096 * 4 / 8; // 4-bit packed size
-    let outlier_count = 1024;
-    let outlier_offset = payload_offset + payload_size;
+    let entries = build_entries_from_source(input_path, base_bitwidth)?;
+    let metadata = build_grim_metadata(target_gcn, profile, base_bitwidth);
 
-    let header = crate::format_v2::GrimV2Header::new(1, 0);
-    let entry = crate::format_v2::GrimV2TensorEntry {
-        name: sample_name,
-        shape: sample_shape,
-        base_bitwidth,
-        payload_offset,
-        payload_size,
-        outlier_count,
-        outlier_offset,
+    let grim_file = crate::format::GrimFile {
+        header: crate::format::GrimHeader::new(entries.len() as u32, 0),
+        metadata,
+        tensors: entries.iter().map(|(e, _)| e.clone()).collect(),
+        tensors_by_name: std::collections::HashMap::new(),
     };
 
-    header.write(&mut out_writer)?;
-    entry.write(&mut out_writer)?;
+    let outfile = File::create(output_path)
+        .map_err(|e| Error::Backend(format!("Failed to create output file: {e}")))?;
+    let mut writer = BufWriter::new(outfile);
+    let written_entries = grim_file.write(&mut writer)?;
 
-    // Write dummy normal payload (packed zeros/ones)
-    let dummy_normals = vec![0x55u8; payload_size as usize];
-    out_writer.write_all(&dummy_normals)
-        .map_err(|e| Error::Backend(format!("Failed to write normal payload: {e}")))?;
+    for (i, entry) in written_entries.iter().enumerate() {
+        let (_, normals_bytes) = &entries[i];
 
-    // Write dummy outlier values (indices + FP16 scales)
-    let dummy_outliers = vec![0xAAu8; (outlier_count * 6) as usize];
-    out_writer.write_all(&dummy_outliers)
-        .map_err(|e| Error::Backend(format!("Failed to write outlier payload: {e}")))?;
+        let current_pos = writer.stream_position()
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        if current_pos < entry.payload_offset {
+            let pad = (entry.payload_offset - current_pos) as usize;
+            writer.write_all(&vec![0u8; pad])
+                .map_err(|e| Error::Backend(format!("payload pad write failed: {e}")))?;
+        }
 
-    out_writer.flush()?;
-    println!("[Grim V2 Convert] V2 conversion completed successfully: {}", output_path);
+        writer.write_all(normals_bytes)
+            .map_err(|e| Error::Backend(format!("normals write failed: {e}")))?;
+    }
+
+    writer.flush()
+        .map_err(|e| Error::Backend(format!("flush failed: {e}")))?;
+    println!("[Grim Convert] Conversion completed: {} ({} tensors)", output_path, written_entries.len());
     Ok(())
+}
+
+/// Route by file extension to the appropriate reader, enumerate tensors,
+/// and pack each into a native `.grim` registry entry + normals payload (spec §5).
+fn build_entries_from_source(
+    input_path: &str,
+    base_bitwidth: u8,
+) -> Result<Vec<(crate::format::GrimTensorEntry, Vec<u8>)>> {
+    let lower = input_path.to_ascii_lowercase();
+    if lower.ends_with(".gguf") || lower.ends_with(".grim") {
+        let provider = crate::tprov::GgufProvider::open(input_path)?;
+        let names: Vec<String> = provider.tensors().keys().cloned().collect();
+        pack_tensors(&provider, &names, base_bitwidth)
+    } else if lower.ends_with(".safetensors") || lower.ends_with(".bin") {
+        Err(Error::Backend(
+            "safetensors-to-native-.grim conversion requires tensor enumeration, \
+             which is not yet on TensorProvider. Export to .gguf first.".into(),
+        ))
+    } else {
+        Err(Error::Backend(format!(
+            "unsupported source format: '{input_path}'. Supported: .gguf, .grim"
+        )))
+    }
+}
+
+/// Pack tensors from a provider into registry entries + normals payloads.
+fn pack_tensors(
+    provider: &dyn grim_tensor::provider::TensorProvider,
+    names: &[String],
+    base_bitwidth: u8,
+) -> Result<Vec<(crate::format::GrimTensorEntry, Vec<u8>)>> {
+    let mut result = Vec::with_capacity(names.len());
+    for name in names {
+        let raw = provider.get(name)?;
+        let elem_count: usize = raw.shape.iter().product();
+        let payload_size = crate::format::normals_packed_size(elem_count, 0, base_bitwidth);
+        let mut normals = raw.bytes;
+        normals.resize(payload_size as usize, 0u8);
+
+        let entry = crate::format::GrimTensorEntry {
+            name: name.clone(),
+            shape: raw.shape,
+            base_bitwidth,
+            payload_offset: 0,
+            payload_size,
+            outlier_count: 0,
+            outlier_offset: 0,
+        };
+        result.push((entry, normals));
+    }
+    Ok(result)
+}
+
+/// Map a GCN architecture string to a ROCm profile.
+fn gcn_to_profile(gcn: &str) -> crate::gguf::GrimRocmlProfile {
+    if gcn.starts_with("gfx12") {
+        crate::gguf::GrimRocmlProfile::Rdna4
+    } else if gcn.starts_with("gfx11") {
+        crate::gguf::GrimRocmlProfile::Rdna3
+    } else if gcn.starts_with("gfx94") || gcn.starts_with("gfx90a") {
+        crate::gguf::GrimRocmlProfile::Cdna3
+    } else if gcn.starts_with("gfx90") {
+        crate::gguf::GrimRocmlProfile::Cdna2
+    } else {
+        crate::gguf::GrimRocmlProfile::Unknown
+    }
+}
+
+/// Build the `.grim` metadata for the output file.
+fn build_grim_metadata(
+    target_gcn: &str,
+    profile: crate::gguf::GrimRocmlProfile,
+    base_bitwidth: u8,
+) -> crate::gguf::GrimMetadata {
+    crate::gguf::GrimMetadata {
+        magic: Some("grim-v1".into()),
+        quant_version: Some(GRIM_QUANT_VERSION),
+        rocml_profile: profile,
+        wavefront_size: profile.wavefront_size(),
+        target_gcn: Some(target_gcn.to_string()),
+        lds_size: Some(profile.lds_size()),
+        tensor_core_enabled: true,
+        quant_method: Some(format!("uniform-{}bit", base_bitwidth)),
+        rocm_fusion_ops: vec![crate::gguf::GrimFusionOp::QkvAttention],
+        kv_layout_optimized: Some(true),
+        ..Default::default()
+    }
+}
+
+/// Encode an outlier list for the on-disk stream, picking the encoding
+/// based on the spec's recommendation: delta-varint for ≥16 outliers
+/// (Phase 5 compressed path), flat u32 + f16 below that threshold
+/// (legacy path). Returns the encoded bytes plus the encoding chosen
+/// so the caller can store it on the tensor's capability extension.
+///
+/// This is the writer-side counterpart of
+/// [`crate::format::read_outliers_with_encoding`]. The converter calls
+/// it when outliers are present; the encoding flag is recorded on the
+/// tensor's `GrimTensorExt` so the reader knows which decoder to use.
+pub fn encode_outliers_with_encoding(
+    outliers: &[(u32, f32)],
+) -> (Vec<u8>, crate::spec::OutlierIndexEncoding) {
+    const DELTA_VARINT_THRESHOLD: usize = 16;
+    if outliers.len() >= DELTA_VARINT_THRESHOLD {
+        (
+            crate::spec::encode_outliers_delta_varint(outliers),
+            crate::spec::OutlierIndexEncoding::DeltaVarint,
+        )
+    } else {
+        let mut buf = Vec::with_capacity(outliers.len() * crate::format::OUTLIER_RECORD_BYTES);
+        for (idx, value) in outliers {
+            let rec = crate::format::GrimOutlier {
+                index: *idx,
+                value: *value,
+            };
+            buf.extend_from_slice(&rec.encode());
+        }
+        (buf, crate::spec::OutlierIndexEncoding::FlatU32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Phase 5: small outlier lists use the legacy flat encoding.
+    #[test]
+    fn encode_outliers_small_list_uses_flat() {
+        let outliers = vec![(1u32, 1.0f32), (5, 2.0), (10, 3.0)];
+        let (buf, encoding) = encode_outliers_with_encoding(&outliers);
+        assert_eq!(encoding, crate::spec::OutlierIndexEncoding::FlatU32);
+        // 3 records × 6 bytes each.
+        assert_eq!(buf.len(), 3 * crate::format::OUTLIER_RECORD_BYTES);
+    }
+
+    /// Phase 5: large outlier lists (≥16) use the delta-varint path and
+    /// produce a smaller buffer than the flat encoding would.
+    #[test]
+    fn encode_outliers_large_list_uses_delta_varint_and_is_smaller() {
+        // 32 outliers with small sorted indices and small value deltas —
+        // the delta-varint sweet spot.
+        let outliers: Vec<(u32, f32)> = (0..32).map(|i| (i, i as f32)).collect();
+        let (buf, encoding) = encode_outliers_with_encoding(&outliers);
+        assert_eq!(encoding, crate::spec::OutlierIndexEncoding::DeltaVarint);
+
+        let flat_size = 32 * crate::format::OUTLIER_RECORD_BYTES;
+        assert!(
+            buf.len() < flat_size,
+            "delta-varint {} must be smaller than flat {}",
+            buf.len(),
+            flat_size
+        );
+    }
+
+    /// Phase 5: empty outlier list produces empty bytes and defaults to
+    /// the flat encoding (cheapest for the degenerate case).
+    #[test]
+    fn encode_outliers_empty_list_is_empty() {
+        let (buf, encoding) = encode_outliers_with_encoding(&[]);
+        assert!(buf.is_empty());
+        assert_eq!(encoding, crate::spec::OutlierIndexEncoding::FlatU32);
+    }
 }

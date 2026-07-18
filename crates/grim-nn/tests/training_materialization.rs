@@ -28,7 +28,7 @@ impl TensorProvider for MemProvider {
             .get(name)
             .cloned()
             .ok_or_else(|| grim_tensor::error::Error::Backend(format!("missing tensor: {name}")))?;
-        Ok(TensorMeta { dtype, provenance, shape })
+        Ok(TensorMeta { dtype, provenance, shape, fusion_mask: 0 })
     }
 }
 
@@ -103,6 +103,29 @@ fn get_for_training_materializes_q4k_to_native() {
             );
         }
     }
+}
+
+#[test]
+fn get_for_training_materializes_block_fp4() {
+    use grim_tensor::dtype::BlockDtype;
+    let num_weights: usize = 16;
+    let mut bytes = vec![0u8; 12];
+    bytes[0..4].copy_from_slice(&1.0f32.to_le_bytes()); // scale = 1.0
+    let block_fp4 = DType {
+        arith: ArithType::F32,
+        storage: Storage::Block(BlockDtype::Fp4),
+    };
+    let provider = memory_provider_with(&[(
+        "fp4weight",
+        bytes,
+        vec![num_weights],
+        block_fp4,
+        QuantProvenance::GrimNative,
+    )]);
+
+    let ws = WeightSource::root(&provider, Device::Cpu);
+    let t = ws.get_for_training(vec![num_weights], "fp4weight").expect("materialize");
+    assert_eq!(t.shape().dims(), &[num_weights]);
 }
 
 #[test]

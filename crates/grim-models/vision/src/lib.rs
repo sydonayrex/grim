@@ -8,5 +8,7 @@
 
 pub mod vit;
 pub mod rng;
+pub mod bert;
 
 pub use vit::{Vit, VitConfig};
+pub use bert::{Bert, BertConfig};

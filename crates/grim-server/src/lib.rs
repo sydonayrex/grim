@@ -30,6 +30,7 @@ use grim_scheduler::Request;
 /// Shared engine state for the HTTP server.
 pub struct AppState {
     pub engine: Mutex<Engine>,
+    pub tokenizer: Mutex<Option<grim_format::GgufTokenizer>>,
 }
 
 /// Health-check endpoint.
@@ -240,13 +241,17 @@ async fn chat_completions(
 
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-                    // Use token id as a simple text placeholder.
-                    // Phase 5 will add a proper tokenizer + sampling.
-                    let token_text = format!("<tok:{token_id}>");
+                    let tokenizer = state.tokenizer.lock().unwrap().clone();
+                    let token_text = if let Some(tok) = &tokenizer {
+                        tok.decode(&[token_id])
+                    } else {
+                        format!("<tok:{token_id}>")
+                    };
                     let event = axum::response::sse::Event::default()
                         .event("message")
                         .data(format!(
-                            r#"{{"choices": [{{"index": 0, "delta": {{"content": "{token_text}"}}}}], "adapters_active": {}}}"#,
+                            r#"{{"choices": [{{"index": 0, "delta": {{"content": "{}"}}}}], "adapters_active": {}}}"#,
+                            token_text.replace("\"", "\\\""),
                             adapter_ids.len()
                         ));
                     let res: std::result::Result<axum::response::sse::Event, axum::Error> = Ok(event);
@@ -256,6 +261,57 @@ async fn chat_completions(
         );
         Sse::new(stream).into_response()
     } else {
+        let mut content = String::new();
+        const REQUEST_ID: u64 = 0xDEAD_0001;
+        let _adapter_ids: Vec<u32> = {
+            let engine = state.engine.lock().unwrap();
+            adapter_names
+                .iter()
+                .filter_map(|name| {
+                    engine.get_adapter_by_name(name).map(|a| a.handle.id)
+                })
+                .collect()
+        };
+
+        let tokenizer = state.tokenizer.lock().unwrap().clone();
+        for step in 0..5 {
+            let token_id = {
+                let mut engine = state.engine.lock().unwrap();
+                if step == 0 {
+                    let req = Request {
+                        id: REQUEST_ID,
+                        prompt_tokens: 1,
+                        priority: 0,
+                    };
+                    engine.enqueue_request(req);
+                }
+                let _ = engine.tick();
+                let argmax = engine
+                    .last_outcome(REQUEST_ID)
+                    .and_then(|o| {
+                        o.logits.as_ref().map(|l| {
+                            l.to_vec_f32().ok().and_then(|v| {
+                                v.iter()
+                                    .enumerate()
+                                    .max_by(|(_, a), (_, b)| {
+                                        a.partial_cmp(b).unwrap()
+                                    })
+                                    .map(|(i, _)| i as u32)
+                            })
+                        })
+                    })
+                    .flatten()
+                    .unwrap_or(step as u32);
+                argmax
+            };
+            let token_text = if let Some(tok) = &tokenizer {
+                tok.decode(&[token_id])
+            } else {
+                format!("<tok:{token_id}>")
+            };
+            content.push_str(&token_text);
+        }
+
         Json(serde_json::json!({
             "id": "chatcmpl-000",
             "object": "chat.completion",
@@ -264,7 +320,7 @@ async fn chat_completions(
             "adapters_active": adapter_names.len(),
             "choices": [{
                 "index": 0,
-                "message": { "role": "assistant", "content": "Grim engine running. Non-streaming completed." },
+                "message": { "role": "assistant", "content": content },
                 "finish_reason": "stop"
             }]
         }))
@@ -639,8 +695,14 @@ fn load_tls_config_from_file(path: &str) -> Option<TlsConfig> {
 
 /// Start the server on `addr`.
 pub async fn serve(addr: &str, engine: Engine) -> Result<()> {
+    let tokenizer = if std::path::Path::new("./models/sleipnir.gguf").exists() {
+        grim_format::GgufProvider::open("./models/sleipnir.gguf").ok().and_then(|p| p.tokenizer().ok())
+    } else {
+        None
+    };
     let state = Arc::new(AppState {
         engine: Mutex::new(engine),
+        tokenizer: Mutex::new(tokenizer),
     });
     
     // Capability-based routing verification at server startup (§8)
@@ -695,6 +757,7 @@ mod tests {
         let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
         let state = Arc::new(AppState {
             engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
         });
         
         // Build router
@@ -736,6 +799,7 @@ mod tests {
         let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
         let state = Arc::new(AppState {
             engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
         });
         
         let app = Router::new()
@@ -770,6 +834,7 @@ mod tests {
         let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
         let state = Arc::new(AppState {
             engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
         });
         
         let app = Router::new()
@@ -803,6 +868,7 @@ mod tests {
         let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default()); // Relaxed mode
         let state = Arc::new(AppState {
             engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
         });
         
         let app = Router::new()
@@ -836,6 +902,7 @@ mod tests {
         let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
         let state = Arc::new(AppState {
             engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
         });
         
         let app = Router::new()

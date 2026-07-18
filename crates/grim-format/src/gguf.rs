@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
 use grim_tensor::dtype::DType;
+use grim_tensor::dtype::{BlockDtype, KQuantScheme, Storage};
 use grim_tensor::error::{Error, Result};
 
 pub const GGUF_MAGIC: u32 = 0x4655_4747; // "GGUF" LE
@@ -373,6 +374,12 @@ impl GrimFusionOp {
 
 /// `.grim` file metadata — parsed from `grim.*` GGUF metadata keys.
 /// Absent keys indicate the file is a plain GGUF (no ROCm hints).
+///
+/// The on-disk file format stays at version 1 (`GRIM\x01`); the spec's
+/// per-tensor capability fields (per-row scales, mixed-bitwidth rows,
+/// backup streams, GPTQ-ORDERED, fusion mask, ...) ride this metadata
+/// layer instead of changing the registry wire layout. See
+/// `GrimTensorExt` in `spec.rs` for the capability surface.
 #[derive(Debug, Clone)]
 pub struct GrimMetadata {
     /// `"grim-v1"` if this is a `.grim` file; absent otherwise.
@@ -407,6 +414,11 @@ pub struct GrimMetadata {
     pub xnack_enabled: Option<bool>,
     /// Whether the KV cache layout was pre-optimized for ROCm decode.
     pub kv_layout_optimized: Option<bool>,
+    /// Per-tensor capability extensions attached via the JSON metadata layer.
+    /// Each entry declares capabilities (per-row scales, mixed bitwidth,
+    /// backup streams, GPTQ-ORDERED, fusion mask) without changing the
+    /// on-disk registry layout. See `spec.rs` for the descriptor schema.
+    pub ext_entries: Vec<crate::spec::GrimTensorExt>,
 }
 
 impl Default for GrimMetadata {
@@ -428,6 +440,7 @@ impl Default for GrimMetadata {
             rocm_fusion_ops: Vec::new(),
             xnack_enabled: None,
             kv_layout_optimized: None,
+            ext_entries: Vec::new(),
         }
     }
 }
@@ -498,6 +511,7 @@ impl GrimMetadata {
             rocm_fusion_ops,
             xnack_enabled,
             kv_layout_optimized,
+            ext_entries: Vec::new(),
         }
     }
 
@@ -623,6 +637,227 @@ impl GrimMetadata {
         }
         metadata
     }
+
+    /// Serialize to a JSON object for the native `.grim` metadata layer.
+    ///
+    /// The native format stores metadata as a JSON blob between the header
+    /// and the tensor registry (spec §1 "Metadata JSON Layer"). This is the
+    /// same information `to_gguf_metadata` encodes as GGUF KV pairs, but in
+    /// a self-describing representation that does not require a GGUF reader.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        if let Some(magic) = &self.magic {
+            obj.insert("magic".into(), serde_json::Value::String(magic.clone()));
+        }
+        if let Some(version) = self.quant_version {
+            obj.insert("quant_version".into(), serde_json::Value::Number(version.into()));
+        }
+        obj.insert(
+            "rocml_profile".into(),
+            serde_json::Value::String(match self.rocml_profile {
+                GrimRocmlProfile::Cdna2 => "cdna2",
+                GrimRocmlProfile::Cdna3 => "cdna3",
+                GrimRocmlProfile::Rdna3 => "rdna3",
+                GrimRocmlProfile::Rdna4 => "rdna4",
+                GrimRocmlProfile::All => "all",
+                GrimRocmlProfile::Unknown => "unknown",
+            }.into()),
+        );
+        if self.wavefront_size > 0 {
+            obj.insert(
+                "wavefront_size".into(),
+                serde_json::Value::Number(self.wavefront_size.into()),
+            );
+        }
+        if let Some(gcn) = &self.target_gcn {
+            obj.insert("target_gcn".into(), serde_json::Value::String(gcn.clone()));
+        }
+        if let Some(block_size) = self.block_size {
+            obj.insert("block_size".into(), serde_json::Value::Number(block_size.into()));
+        }
+        if let Some(lds) = self.lds_size {
+            obj.insert("lds_size".into(), serde_json::Value::Number(lds.into()));
+        }
+        obj.insert(
+            "tensor_core_enabled".into(),
+            serde_json::Value::Bool(self.tensor_core_enabled),
+        );
+        if let Some(method) = &self.quant_method {
+            obj.insert("quant_method".into(), serde_json::Value::String(method.clone()));
+        }
+        if let Some(dataset) = &self.calibration_dataset {
+            obj.insert("calibration_dataset".into(), serde_json::Value::String(dataset.clone()));
+        }
+        if !self.quant_overrides.is_empty() {
+            obj.insert(
+                "quant_overrides".into(),
+                serde_json::Value::Array(
+                    self.quant_overrides.iter().map(override_to_json).collect(),
+                ),
+            );
+        }
+        if let Some(mode) = self.train_quant_mode {
+            obj.insert("train_quant_mode".into(), serde_json::Value::String(mode.as_str().into()));
+        }
+        if !self.train_fusion_ops.is_empty() {
+            obj.insert(
+                "train_fusion_ops".into(),
+                serde_json::Value::Array(
+                    self.train_fusion_ops.iter().map(|o| serde_json::Value::String(o.as_str().into())).collect(),
+                ),
+            );
+        }
+        if !self.rocm_fusion_ops.is_empty() {
+            obj.insert(
+                "rocm_fusion_ops".into(),
+                serde_json::Value::Array(
+                    self.rocm_fusion_ops.iter().map(|o| serde_json::Value::String(o.as_str().into())).collect(),
+                ),
+            );
+        }
+        if let Some(xnack) = self.xnack_enabled {
+            obj.insert("xnack_enabled".into(), serde_json::Value::Bool(xnack));
+        }
+        if let Some(kv_opt) = self.kv_layout_optimized {
+            obj.insert("kv_layout_optimized".into(), serde_json::Value::Bool(kv_opt));
+        }
+        if !self.ext_entries.is_empty() {
+            // Capability extensions are tucked under a namespaced key so the
+            // on-disk wire layout (header + JSON metadata + tensor registry)
+            // stays unchanged.
+            obj.insert(
+                "grim.ext.entries".into(),
+                serde_json::Value::Array(
+                    self.ext_entries
+                        .iter()
+                        .map(crate::spec::GrimTensorExt::to_json)
+                        .collect(),
+                ),
+            );
+        }
+        serde_json::Value::Object(obj)
+    }
+
+    /// Deserialize from a JSON object produced by [`to_json`](Self::to_json).
+    ///
+    /// Missing keys fall back to [`Default`] values, so a partial or empty
+    /// JSON object yields a valid (if uninformative) `GrimMetadata`.
+    pub fn from_json(value: &serde_json::Value) -> Self {
+        let empty = serde_json::Map::new();
+        let obj = value.as_object().unwrap_or(&empty);
+
+        let magic = obj.get("magic").and_then(|v| v.as_str()).map(String::from);
+        let quant_version = obj.get("quant_version").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let profile = obj
+            .get("rocml_profile")
+            .and_then(|v| v.as_str())
+            .map(GrimRocmlProfile::from_str)
+            .unwrap_or_default();
+        let wavefront_size = obj
+            .get("wavefront_size")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or_else(|| profile.wavefront_size());
+        let target_gcn = obj.get("target_gcn").and_then(|v| v.as_str()).map(String::from);
+        let block_size = obj.get("block_size").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let lds_size = obj.get("lds_size").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let tensor_core_enabled = obj.get("tensor_core_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+        let quant_method = obj.get("quant_method").and_then(|v| v.as_str()).map(String::from);
+        let calibration_dataset = obj.get("calibration_dataset").and_then(|v| v.as_str()).map(String::from);
+        let quant_overrides = obj
+            .get("quant_overrides")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(override_from_json).collect())
+            .unwrap_or_default();
+        let train_quant_mode = obj
+            .get("train_quant_mode")
+            .and_then(|v| v.as_str())
+            .and_then(GrimTrainQuantMode::from_str);
+        let train_fusion_ops = obj
+            .get("train_fusion_ops")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(GrimFusionOp::from_str)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rocm_fusion_ops = obj
+            .get("rocm_fusion_ops")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(GrimFusionOp::from_str)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let xnack_enabled = obj.get("xnack_enabled").and_then(|v| v.as_bool());
+        let kv_layout_optimized = obj.get("kv_layout_optimized").and_then(|v| v.as_bool());
+        let ext_entries = obj
+            .get("grim.ext.entries")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(crate::spec::GrimTensorExt::from_json).collect())
+            .unwrap_or_default();
+
+        GrimMetadata {
+            magic,
+            quant_version,
+            rocml_profile: profile,
+            wavefront_size,
+            target_gcn,
+            block_size,
+            lds_size,
+            tensor_core_enabled,
+            quant_method,
+            calibration_dataset,
+            quant_overrides,
+            train_quant_mode,
+            train_fusion_ops,
+            rocm_fusion_ops,
+            xnack_enabled,
+            kv_layout_optimized,
+            ext_entries,
+        }
+    }
+}
+
+/// Serialize a [`GrimQuantOverride`] to JSON for the native metadata layer.
+fn override_to_json(ov: &GrimQuantOverride) -> serde_json::Value {
+    serde_json::json!({
+        "tensor_name": ov.tensor_name,
+        "effective_bpw": ov.effective_bpw,
+        "override_dtype": ov.override_dtype as u32,
+        "importance_score": ov.importance_score,
+        "layout_hint": match ov.layout_hint {
+            Some(GrimLayoutHint::WavefrontTiled) => "wavefront-tiled",
+            Some(GrimLayoutHint::BlockSparse) => "block-sparse",
+            None => "none",
+        }
+    })
+}
+
+/// Deserialize a [`GrimQuantOverride`] from JSON.
+fn override_from_json(value: &serde_json::Value) -> Option<GrimQuantOverride> {
+    let tensor_name = value.get("tensor_name")?.as_str()?.to_string();
+    let effective_bpw = value.get("effective_bpw")?.as_u64()? as u32;
+    let override_dtype_tag = value.get("override_dtype")?.as_u64()? as u32;
+    let override_dtype = GgufDType::from_tag(override_dtype_tag)?;
+    let importance_score = value.get("importance_score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+    let layout_hint = value.get("layout_hint").and_then(|v| v.as_str()).and_then(|s| match s {
+        "wavefront-tiled" => Some(GrimLayoutHint::WavefrontTiled),
+        "block-sparse" => Some(GrimLayoutHint::BlockSparse),
+        _ => None,
+    });
+
+    Some(GrimQuantOverride {
+        tensor_name,
+        effective_bpw,
+        override_dtype,
+        importance_score,
+        layout_hint,
+    })
 }
 
 /// Decode `grim.quant_overrides` from a GGUF `Array` metadata value.
@@ -866,46 +1101,83 @@ fn read_gguf_value_with_tag<R: Read>(r: &mut R, tag: u32) -> Result<GgufValue> {
     }
 }
 
-/// Derive DType from GGUF metadata 'general.architecture' name + per-weight
-/// metadata. This is a heuristic used when the GGUF file does not store
-/// explicit per-tensor dtype.
-pub fn dtype_for_gguf(name: &str) -> DType {
-    let _ = name;
-    // GGUF v3 stores all tensors as f32 by default (llama.cpp uses
-    // quantization-specific per-tensor overrides). We default to F32
-    // and let the per-tensor metadata override.
-    DType::F32
-}
-
-/// Guess the GGUF tensor name from a weight path (slash-separated -> dot-separated).
-pub fn gguf_tensor_name(path: &str) -> String {
-    path.replace('.', ".")
-}
-
-/// Comprehensive GGUF dtype mapping to grim DType.
-/// Maps GGUF quantization tags to appropriate DType + provenance metadata.
-/// §7.2.4: per-tensor quantization type tag parsing.
-pub fn map_gguf_dtype_to_grim(gguf_dtype: GgufDType) -> (DType, Option<u32>) {
+/// Canonical GGUF dtype → grim `DType` mapping, preserving quantization storage.
+///
+/// This is the single source of truth for how GGUF tensor dtypes map to grim's
+/// `DType` (arithmetic type + storage encoding). Both `map_gguf_dtype_to_grim`
+/// (provenance-aware) and `tprov::dtype_from_gguf` delegate here so they cannot
+/// disagree.
+///
+/// Unquantized types map to `Storage::Native`. Block-quantized K-quants map to
+/// the appropriate `Storage::KQuant`/`Storage::Block` variant so dequant kernels
+/// can select the correct layout.
+pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
     match gguf_dtype {
-        GgufDType::F32 => (DType::F32, None),
-        GgufDType::F16 => (DType::BF16, None),
-        GgufDType::F64 => (DType::F32, None), // Map F64 to F32 for compat
-        GgufDType::I8 => (DType::F32, Some(8)),
-        GgufDType::I16 => (DType::F32, Some(16)),
-        GgufDType::I32 => (DType::F32, Some(32)),
-        GgufDType::I64 => (DType::F32, Some(32)),
-        // K-quants and Q-family: return F32 (dequantized) with bit count for provenance
-        GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 => (DType::F32, Some(4)),
-        GgufDType::Q5_0 | GgufDType::Q5_1 => (DType::F32, Some(5)),
-        GgufDType::Q8_0 | GgufDType::Q8_1 | GgufDType::Q8_1Hx => (DType::F32, Some(8)),
-        GgufDType::Q2K => (DType::F32, Some(2)),
-        GgufDType::Q3K => (DType::F32, Some(3)),
-        GgufDType::Q4K => (DType::F32, Some(4)),
-        GgufDType::Q5K => (DType::F32, Some(5)),
-        GgufDType::Q6K => (DType::F32, Some(6)),
-        GgufDType::Q8K => (DType::F32, Some(8)),
-        GgufDType::IQ4_NL => (DType::F32, Some(4)),
+        GgufDType::F32 => DType::F32,
+        GgufDType::F16 => DType::F16,
+        GgufDType::F64 => DType::F32,
+        GgufDType::I8 => DType {
+            arith: grim_tensor::ArithType::U8,
+            storage: Storage::Native,
+        },
+        GgufDType::I16 | GgufDType::I32 | GgufDType::I64 => DType::F32,
+        GgufDType::Q2K => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q2K),
+        },
+        GgufDType::Q3K => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q3K),
+        },
+        GgufDType::Q4K => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::Block(BlockDtype::Fp4),
+        },
+        GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q4K),
+        },
+        GgufDType::Q5K => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::Block(BlockDtype::Nf4),
+        },
+        GgufDType::Q5_0 | GgufDType::Q5_1 => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q5K),
+        },
+        GgufDType::Q6K => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::Block(BlockDtype::Fp8),
+        },
+        GgufDType::Q8K | GgufDType::Q8_0 | GgufDType::Q8_1 | GgufDType::Q8_1Hx => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q80),
+        },
+        GgufDType::IQ4_NL => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::IQ4NL),
+        },
     }
+}
+
+/// GGUF dtype → `(DType, effective_bpw)` for provenance tracking.
+///
+/// Delegates to [`map_gguf_dtype_to_storage`] for the DType, then attaches
+/// the effective bits-per-weight as provenance metadata.
+pub fn map_gguf_dtype_to_grim(gguf_dtype: GgufDType) -> (DType, Option<u32>) {
+    let dtype = map_gguf_dtype_to_storage(gguf_dtype);
+    let bpw = match gguf_dtype {
+        GgufDType::F32 | GgufDType::F64 | GgufDType::I32 | GgufDType::I64 => None,
+        GgufDType::F16 | GgufDType::I16 => Some(16),
+        GgufDType::I8 => Some(8),
+        GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 | GgufDType::Q4K | GgufDType::IQ4_NL => Some(4),
+        GgufDType::Q5_0 | GgufDType::Q5_1 | GgufDType::Q5K => Some(5),
+        GgufDType::Q6K => Some(6),
+        GgufDType::Q2K => Some(2),
+        GgufDType::Q3K => Some(3),
+        GgufDType::Q8_0 | GgufDType::Q8_1 | GgufDType::Q8_1Hx | GgufDType::Q8K => Some(8),
+    };
+    (dtype, bpw)
 }
 
 /// Enum extension to determine if a GGUF dtype is quantized.
@@ -926,10 +1198,10 @@ impl GgufDType {
                 | GgufDType::Q4K
                 | GgufDType::Q5K
                 | GgufDType::Q6K
-     | GgufDType::Q8K
-     | GgufDType::IQ4_NL
- )
- }
+                | GgufDType::Q8K
+                | GgufDType::IQ4_NL
+        )
+    }
 
     /// Returns the GGUF display name for this dtype.
     pub fn display_name(self) -> &'static str {
@@ -958,4 +1230,168 @@ impl GgufDType {
             GgufDType::IQ4_NL => "IQ4_NL",
             }
             }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_metadata() -> GrimMetadata {
+        GrimMetadata {
+            magic: Some("grim-v1".into()),
+            quant_version: Some(1),
+            rocml_profile: GrimRocmlProfile::Rdna3,
+            wavefront_size: 64,
+            target_gcn: Some("gfx1100".into()),
+            block_size: Some(256),
+            lds_size: Some(32768),
+            tensor_core_enabled: true,
+            quant_method: Some("evopress-gptq".into()),
+            calibration_dataset: Some("wikitext".into()),
+            quant_overrides: vec![GrimQuantOverride {
+                tensor_name: "model.layers.0.wq".into(),
+                effective_bpw: 4,
+                override_dtype: GgufDType::Q4K,
+                importance_score: 0.42,
+                layout_hint: Some(GrimLayoutHint::WavefrontTiled),
+            }],
+            train_quant_mode: Some(GrimTrainQuantMode::Bf16),
+            train_fusion_ops: vec![GrimFusionOp::RmsNormMatMul],
+            rocm_fusion_ops: vec![GrimFusionOp::QkvAttention],
+            xnack_enabled: Some(false),
+            kv_layout_optimized: Some(true),
+            ext_entries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn metadata_json_round_trip_preserves_all_fields() {
+        let original = sample_metadata();
+        let json = original.to_json();
+        let restored = GrimMetadata::from_json(&json);
+        assert_eq!(original.magic, restored.magic);
+        assert_eq!(original.quant_version, restored.quant_version);
+        assert_eq!(original.rocml_profile, restored.rocml_profile);
+        assert_eq!(original.wavefront_size, restored.wavefront_size);
+        assert_eq!(original.target_gcn, restored.target_gcn);
+        assert_eq!(original.block_size, restored.block_size);
+        assert_eq!(original.lds_size, restored.lds_size);
+        assert_eq!(original.tensor_core_enabled, restored.tensor_core_enabled);
+        assert_eq!(original.quant_method, restored.quant_method);
+        assert_eq!(original.calibration_dataset, restored.calibration_dataset);
+        assert_eq!(original.quant_overrides.len(), restored.quant_overrides.len());
+        assert_eq!(original.quant_overrides[0].tensor_name, restored.quant_overrides[0].tensor_name);
+        assert_eq!(original.quant_overrides[0].effective_bpw, restored.quant_overrides[0].effective_bpw);
+        assert_eq!(original.quant_overrides[0].override_dtype, restored.quant_overrides[0].override_dtype);
+        assert!((original.quant_overrides[0].importance_score - restored.quant_overrides[0].importance_score).abs() < 1e-6);
+        assert_eq!(original.quant_overrides[0].layout_hint, restored.quant_overrides[0].layout_hint);
+        assert_eq!(original.train_quant_mode, restored.train_quant_mode);
+        assert_eq!(original.train_fusion_ops, restored.train_fusion_ops);
+        assert_eq!(original.rocm_fusion_ops, restored.rocm_fusion_ops);
+        assert_eq!(original.xnack_enabled, restored.xnack_enabled);
+        assert_eq!(original.kv_layout_optimized, restored.kv_layout_optimized);
+    }
+
+    #[test]
+    fn metadata_json_round_trip_default_is_identity() {
+        let original = GrimMetadata::default();
+        let json = original.to_json();
+        let restored = GrimMetadata::from_json(&json);
+        assert_eq!(original.magic, restored.magic);
+        assert_eq!(original.quant_version, restored.quant_version);
+        assert_eq!(original.rocml_profile, restored.rocml_profile);
+        assert_eq!(original.wavefront_size, restored.wavefront_size);
+        assert!(original.quant_overrides.is_empty());
+    }
+
+    #[test]
+    fn metadata_from_empty_json_yields_default() {
+        let empty = serde_json::Value::Object(serde_json::Map::new());
+        let restored = GrimMetadata::from_json(&empty);
+        assert_eq!(restored.magic, None);
+        assert_eq!(restored.quant_version, None);
+        assert_eq!(restored.rocml_profile, GrimRocmlProfile::Unknown);
+        assert_eq!(restored.wavefront_size, 0);
+    }
+
+    /// The spec capability extensions ride the JSON metadata layer under
+    /// `grim.ext.entries`. This test proves a populated `ext_entries`
+    /// round-trips through `to_json`/`from_json` with all fields intact.
+    #[test]
+    fn metadata_ext_entries_round_trip_through_json() {
+        use crate::spec::{
+            GrimTensorExt, LayoutDescriptor, LayoutHintTag, OutlierIndexEncoding,
+            PayloadCompression, PerRowBpwMode, RowScaleDtype,
+        };
+
+        let original = GrimMetadata {
+            ext_entries: vec![
+                GrimTensorExt {
+                    tensor_name: "layer.0.weight".into(),
+                    row_count: 128,
+                    row_stride: 4096,
+                    block_size: 0,
+                    per_row_bpw_mode: PerRowBpwMode::PerRowTable,
+                    default_bpw: 4,
+                    own_bpw_table: 1,
+                    row_scale_dtype: RowScaleDtype::U8,
+                    scale_offset: 8192,
+                    scale_size: 128,
+                    gptq_ordered: 1,
+                    outlier_index_encoding: OutlierIndexEncoding::DeltaVarint,
+                    outlier_residual_bpw: 8,
+                    compression: PayloadCompression::Zstd,
+                    fusion_mask: 0b11,
+                    layout_hint: LayoutHintTag::WavefrontTiled,
+                    layout_descriptor: LayoutDescriptor([1, 2, 3, 4]),
+                    backup1: crate::spec::BackupLayer {
+                        codes_offset: 16384,
+                        codes_size: 4096,
+                        bpw: 8,
+                        scale_offset: 20480,
+                        scale_size: 64,
+                    },
+                    backup2: crate::spec::BackupLayer::default(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let json = original.to_json();
+        let restored = GrimMetadata::from_json(&json);
+
+        assert_eq!(restored.ext_entries.len(), 1);
+        let ext = &restored.ext_entries[0];
+        assert_eq!(ext.tensor_name, "layer.0.weight");
+        assert_eq!(ext.row_count, 128);
+        assert_eq!(ext.row_stride, 4096);
+        assert_eq!(ext.per_row_bpw_mode, PerRowBpwMode::PerRowTable);
+        assert_eq!(ext.default_bpw, 4);
+        assert_eq!(ext.row_scale_dtype, RowScaleDtype::U8);
+        assert_eq!(ext.scale_offset, 8192);
+        assert_eq!(ext.scale_size, 128);
+        assert_eq!(ext.gptq_ordered, 1);
+        assert_eq!(ext.outlier_index_encoding, OutlierIndexEncoding::DeltaVarint);
+        assert_eq!(ext.outlier_residual_bpw, 8);
+        assert_eq!(ext.compression, PayloadCompression::Zstd);
+        assert_eq!(ext.fusion_mask, 0b11);
+        assert_eq!(ext.layout_hint, LayoutHintTag::WavefrontTiled);
+        assert_eq!(ext.layout_descriptor.0, [1, 2, 3, 4]);
+        assert!(ext.backup1.is_present());
+        assert_eq!(ext.backup1.codes_offset, 16384);
+        assert_eq!(ext.backup1.bpw, 8);
+        assert!(!ext.backup2.is_present());
+    }
+
+    /// A metadata object without `grim.ext.entries` deserializes to an
+    /// empty extension list, not an error — V1 files still load cleanly.
+    #[test]
+    fn metadata_without_ext_entries_yields_empty_list() {
+        let json = serde_json::json!({
+            "magic": "grim-v1",
+            "quant_version": 1,
+        });
+        let restored = GrimMetadata::from_json(&json);
+        assert!(restored.ext_entries.is_empty());
+    }
 }

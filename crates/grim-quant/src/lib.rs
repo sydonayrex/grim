@@ -210,6 +210,73 @@ pub fn dequant_q80(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 
 const BLOCK_Q8_WEIGHTS: usize = 32;
 
+/// IQ4_NL 16-entry absolute-value codebook (llama.cpp `iq4nl_table`).
+/// The sign comes from the per-weight `q8` bit; the magnitude comes from this
+/// table indexed by the 4-bit `q4` code.
+const IQ4_NL_CODEBOOK: [f32; 16] = [
+    0.0, 0.113_141_26, 0.243_736_04, 0.397_433_65, 0.565_743_55, 0.722_941_40, 0.897_054_55,
+    1.075_762_85, 1.294_598_81, 1.528_519_04, 1.826_856_33, 2.270_011_30, 3.237_191_19,
+    5.508_296_01, 1.041_625_59_e1, 3.456_950_92_e1,
+];
+
+/// Dequantize IQ4_NL (llama.cpp importance-matrix 4-bit) bytes to f32.
+///
+/// Per 256-weight super-block (170 bytes):
+///   - `d`    : f16 global scale (2 bytes)
+///   - `q8`   : 32 bytes = 256 sign bits (1 bit per weight, LSB-first)
+///   - `q4`   : 128 bytes = 256 4-bit codes (magnitude table index)
+///   - `scales`: 8 bytes = 16 × 2-bit per-group (16 weights) scale multipliers
+///
+/// Each group of 16 weights is scaled by `d * (1 + 0.125 * group_scale)`.
+pub fn dequant_iq4nl(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
+    const SUPER: usize = 256;
+    const BLOCK_BYTES: usize = 170; // 2 + 32 + 128 + 8
+    let num_blocks = num_weights.div_ceil(SUPER);
+    if data.len() < num_blocks * BLOCK_BYTES {
+        return Err(Error::Backend(format!(
+            "IQ4_NL: expected {} bytes for {num_weights} weights, got {}",
+            num_blocks * BLOCK_BYTES,
+            data.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(num_weights);
+    let mut pos = 0usize;
+    let mut remaining = num_weights;
+    for _ in 0..num_blocks {
+        let d = f16_to_f32(data[pos], data[pos + 1]);
+        pos += 2;
+        let q8 = &data[pos..pos + 32];
+        pos += 32;
+        let q4 = &data[pos..pos + 128];
+        pos += 128;
+        let scales = &data[pos..pos + 8];
+        pos += 8;
+
+        let block_len = remaining.min(SUPER);
+        for g in 0..16 {
+            let group_scale = (scales[g / 2] >> ((g % 2) * 4)) & 0x0F;
+            let scale = d * (1.0 + 0.125 * group_scale as f32);
+            let group_start = g * 16;
+            if group_start >= block_len {
+                break;
+            }
+            let group_end = (group_start + 16).min(block_len);
+            for i in group_start..group_end {
+                let nibble = if i % 2 == 0 {
+                    q4[i / 2] & 0x0F
+                } else {
+                    (q4[i / 2] >> 4) & 0x0F
+                };
+                let sign_bit = (q8[i / 8] >> (i % 8)) & 0x01;
+                let sign = if sign_bit == 0 { 1.0 } else { -1.0 };
+                let val = IQ4_NL_CODEBOOK[nibble as usize] * scale * sign;
+                out.push(val);
+            }
+        }
+        remaining = remaining.saturating_sub(SUPER);
+    }
+    Ok(out)
+}
 /// Dequantize Q4_K bytes to f32.
 /// Q4_K layout (llama.cpp style): per super-block (32 weights):
 ///   - scale (6-bit super-block scale, stored as u8 in `d` or `dmin`)
@@ -1319,7 +1386,7 @@ pub fn compute_importance_scores(
     tensors: &[(String, Vec<f32>, usize, usize)],
 ) -> Vec<f32> {
     let mut scores = Vec::with_capacity(tensors.len());
-    for (name, data, rows, cols) in tensors {
+    for (_name, data, rows, cols) in tensors {
         if *rows == 0 || *cols == 0 {
             scores.push(0.0);
             continue;
@@ -1402,12 +1469,12 @@ pub fn compute_fisher_diagonal(
         return vec![1.0f32; rows * cols];
     }
 
-    let batch_size = calibration_samples
+    let _batch_size = calibration_samples
         .first()
         .map(|s| s.output_gradients.len() / rows)
         .unwrap_or(1)
         .max(1);
-    let num_groups = (cols + group_size - 1) / group_size;
+    let _num_groups = (cols + group_size - 1) / group_size;
 
     // Accumulate per-column and per-element diagonal
     let mut h_diag = vec![0.0f32; cols];
@@ -1475,7 +1542,7 @@ pub fn compute_grouped_fisher_diagonal(
         return vec![1.0f32; (cols + group_size - 1) / group_size];
     }
 
-    let batch_size = calibration_samples
+    let _batch_size = calibration_samples
         .first()
         .map(|s| s.output_gradients.len() / rows)
         .unwrap_or(1)
@@ -1754,7 +1821,7 @@ fn eval_individual(
     }
     // Weighted quality score: higher importance + correct BPW = better
     let mut quality: f32 = 0.0;
-    for (ti, (&gene, &sz)) in genes.iter().zip(tensor_sizes.iter()).enumerate() {
+    for (ti, (&gene, &_sz)) in genes.iter().zip(tensor_sizes.iter()).enumerate() {
         if ti < importance_scores.len() {
             let imp = importance_scores[ti];
             // Reward matching target BPW; reward higher bits for high-importance tensors

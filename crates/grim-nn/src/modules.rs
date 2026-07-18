@@ -19,6 +19,11 @@ pub struct Linear {
 }
 
 impl Linear {
+    /// Load a Linear layer.
+    ///
+    /// GGUF stores matrix weights as `[out_dim, in_dim]` (rows = output units,
+    /// columns = input units). This matches llama.cpp's convention: `y = x @ W^T`,
+    /// so `Linear::forward` transposes the stored weight before matmul.
     pub fn load(ws: &WeightSource<'_>, in_dim: usize, out_dim: usize, has_bias: bool) -> Result<Self> {
         let weight = ws.get([out_dim, in_dim], "weight")?;
         let bias = if has_bias {
@@ -36,6 +41,7 @@ impl Linear {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let dev = CpuDevice::new();
         let in_dim = x.shape().dims().last().copied().unwrap_or(0);
+        // Weight is GGUF-native: dim(0) = out_dim, dim(1) = in_dim.
         let out_dim = self.weight.shape().dim(0)?;
         let batch = x.shape().elem_count() / in_dim;
 
@@ -154,7 +160,20 @@ pub struct Embedding {
 
 impl Embedding {
     pub fn load(ws: &WeightSource<'_>, vocab: usize, dim: usize) -> Result<Self> {
-        let weight = ws.get([vocab, dim], "weight")?;
+        let weight = match ws.get([vocab, dim], "weight") {
+            Ok(t) => t,
+            Err(_) => {
+                let raw = ws.get([dim, vocab], "weight")?;
+                let raw_vec = raw.to_vec_f32()?;
+                let mut out = vec![0.0f32; vocab * dim];
+                for i in 0..dim {
+                    for j in 0..vocab {
+                        out[j * dim + i] = raw_vec[i * vocab + j];
+                    }
+                }
+                grim_backend_cpu::cpu_tensor(out, Shape::new(vec![vocab, dim]))
+            }
+        };
         Ok(Self { weight })
     }
 

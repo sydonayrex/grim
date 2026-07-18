@@ -4,10 +4,10 @@
 //! a lightweight MTP head in the same forward pass.
 
 use grim_core::error::Result;
-use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
+use grim_core::model::{AdapterHandle, CausalLm};
 use grim_core::session::SessionT;
 use grim_core::{Model, ModelConfig};
-use grim_tensor::{ArithType, Device, DType, Shape, Tensor};
+use grim_tensor::{ArithType, Device, Tensor};
 
 use crate::Llama;
 

@@ -107,9 +107,9 @@ mod tests {
         let head = EntropyConfidenceHead;
         let mut logits = vec![0.0f32; 3 * 8];
         for i in 0..8 {
-            logits[i] = (i as f32);
-            logits[8 + i] = (i as f32) * 0.5;
-            logits[16 + i] = -((i as f32));
+            logits[i] = i as f32;
+            logits[8 + i] = i as f32 * 0.5;
+            logits[16 + i] = -(i as f32);
         }
         let block = DraftBlock {
             tokens: vec![0, 0, 0],

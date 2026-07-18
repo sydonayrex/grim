@@ -79,14 +79,41 @@ pub enum Storage {
     KQuant(KQuantScheme),
     /// Grouped INT weights from an external QAT pipeline (EfficientQAT, GPTQ).
     GroupInt(GpuIntConfig),
+    /// Low-bit floating-point pack formats (FP4 E2M1, NF4, FP8 E4M3/E5M2).
+    /// Dequantized to F32 on load; kept distinct from KQuant so the dequant
+    /// kernel selects the correct float-pack layout.
+    FloatPack(FloatPackScheme),
+    /// Block-quantized formats mapping FP4/NF4/FP8.
+    Block(BlockDtype),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlockDtype {
+    Fp4,
+    Nf4,
+    Fp8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KQuantScheme {
+    Q2K,
+    Q3K,
     Q4K,
     Q5K,
     Q6K,
     Q80,
+    /// IQ4_NL — importance-matrix-optimized 4-bit (llama.cpp `IQ4_NL`).
+    IQ4NL,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FloatPackScheme {
+    /// FP4 (E2M1 4-bit float).
+    Fp4,
+    /// NF4 (normalized float-4, Quanto/Unsloth-style).
+    Nf4,
+    /// FP8 (E4M3 by default; E5M2 recognized).
+    Fp8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -114,6 +141,7 @@ pub struct DType {
 impl DType {
     pub const F32: DType = DType { arith: ArithType::F32, storage: Storage::Native };
     pub const BF16: DType = DType { arith: ArithType::BF16, storage: Storage::Native };
+    pub const F16: DType = DType { arith: ArithType::F16, storage: Storage::Native };
 
     pub fn is_quantized(&self) -> bool {
         !matches!(self.storage, Storage::Native)

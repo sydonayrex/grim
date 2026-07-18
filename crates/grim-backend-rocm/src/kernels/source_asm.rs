@@ -26,6 +26,11 @@ pub fn compute_kernel_source() -> String {
     );
     s.push_str(crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE);
     s.push_str(crate::kernels::qkv_attention::KERNEL_SOURCE);
+    // WI 2.4.4-2 — Rust-centric decode GEMM (F16, double-buffered LDS).
+    // Opt-in via `DecodeGemmConfig::enabled` in `RocmDevice::matmul`; the
+    // source is concatenated here regardless so the JIT cache can resolve
+    // the symbol at first dispatch without rebuilding the program.
+    s.push_str(crate::kernels::decode_gemm::KERNEL_SOURCE);
     s
 }
 

@@ -22,7 +22,7 @@ use grim_core::kv_cache::KvCache;
 use grim_core::error::{Error, Result};
 use grim_kvquant::{CompressedKvBlock, KvCompressor};
 use grim_kvtransport::{BlockId as TransportBlockId, CacheTier, SharedSpillManager};
-use grim_tensor::{Device, Tensor};
+use grim_tensor::Tensor;
 
 pub const BLOCK_SIZE: usize = 16;
 
@@ -30,7 +30,7 @@ pub type BlockId = usize;
 
 /// One physical KV block in the pool.
 struct KvBlock {
-    id: BlockId,
+    _id: BlockId,
     /// Flat `[BLOCK_SIZE, num_kv_heads, head_dim]` for keys.
     key_data: Vec<f32>,
     /// Flat `[BLOCK_SIZE, num_kv_heads, head_dim]` for values.
@@ -90,7 +90,7 @@ impl KvBlockPool {
         let mut free_list = VecDeque::with_capacity(capacity);
         for i in 0..capacity {
             blocks.push(KvBlock {
-                id: i,
+                _id: i,
                 key_data: vec![0.0; block_elem],
                 value_data: vec![0.0; block_elem],
                 num_tokens: 0,
@@ -309,14 +309,14 @@ impl KvBlockPool {
 /// Logical → physical block mapping for one sequence.
 pub struct BlockTable {
     logical_to_physical: Vec<BlockId>,
-    pool_id: usize,
+    _pool_id: usize,
 }
 
 impl BlockTable {
     pub fn new() -> Self {
         Self {
             logical_to_physical: Vec::new(),
-            pool_id: 0,
+            _pool_id: 0,
         }
     }
 

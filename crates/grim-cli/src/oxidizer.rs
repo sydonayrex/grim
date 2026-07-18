@@ -229,7 +229,7 @@ pub fn cmd_oxidizer_convert(
         .collect();
 
     let resolved_gcn = rocml_profile.unwrap_or("gfx1100");
-    grim_format::convert_to_grim_v2(
+    grim_format::convert_to_grim(
         model_path,
         output_path,
         resolved_gcn,
