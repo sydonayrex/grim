@@ -117,7 +117,7 @@ pub use crate::device::util::{
 // keep using `RocmDevice::new(...)` etc. unchanged.
 pub use crate::device::roc_device::RocmDevice;
 
-pub use fusion::{DecodeGemmConfig, HipKernelLaunch, QkvAttentionFusionConfig, RmsNormMatMulFusionConfig, hipDim3};
+pub use fusion::{DecodeGemmConfig, FusedDequantGemmConfig, HipKernelLaunch, QkvAttentionFusionConfig, RmsNormMatMulFusionConfig, hipDim3};
 
 pub use kernels::qkv_attention::{BlockTableEntry, launch_paged_attention, launch_tree_attention};
 

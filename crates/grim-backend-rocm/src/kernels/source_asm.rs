@@ -31,6 +31,7 @@ pub fn compute_kernel_source() -> String {
     // source is concatenated here regardless so the JIT cache can resolve
     // the symbol at first dispatch without rebuilding the program.
     s.push_str(crate::kernels::decode_gemm::KERNEL_SOURCE);
+    s.push_str(crate::kernels::fused_dequant_gemm::KERNEL_SOURCE);
     s
 }
 

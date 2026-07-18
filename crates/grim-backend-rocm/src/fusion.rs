@@ -149,3 +149,22 @@ impl Default for DecodeGemmConfig {
         }
     }
 }
+
+/// Configuration for fused dequantization matmul kernels (WI-C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FusedDequantGemmConfig {
+    /// Runtime gate: `false` = always use standard paths, `true` = dispatch to the
+    /// JIT'd `grim_fused_dequant_gemm_f16` kernel.
+    pub enabled: bool,
+    /// Wavefront size of the active arch.
+    pub wavefront_size: u32,
+}
+
+impl Default for FusedDequantGemmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            wavefront_size: 64,
+        }
+    }
+}

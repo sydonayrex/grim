@@ -246,6 +246,17 @@ mod tests {
         assert!(size == WavefrontSize::W32 || size == WavefrontSize::W64);
     }
 
+    #[test]
+    fn test_fused_dequant_gemm_compiles() {
+        if std::env::var("GRIM_RUN_GPU_TESTS").is_err() {
+            return;
+        }
+        let kernel_source = crate::kernels::source_asm::compute_kernel_source();
+        let target = detect_gpu_arch(0);
+        let res = jit_compile_hsaco(&kernel_source, "grim_fused_dequant_gemm_f16", &target);
+        assert!(res.is_ok(), "Failed to JIT compile grim_fused_dequant_gemm_f16: {:?}", res.err());
+    }
+
     // ------------------------------------------------------------------------
     // align_tensor_for_rocm_gemm tests
     // ------------------------------------------------------------------------
