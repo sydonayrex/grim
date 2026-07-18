@@ -1876,15 +1876,14 @@ mod tests {
     #[test]
     fn test_vulkan_device_probe() {
         let devices = VulkanDevice::probe().unwrap();
-        // If Vulkan is available on the platform, we expect at least 1 device
-        if let Ok(_ctx) = VulkanContext::init() {
+        if GLOBAL_CONTEXT.lock().unwrap().is_some() {
             assert!(!devices.is_empty());
         }
     }
 
     #[test]
     fn test_vulkan_zeros() {
-        if VulkanContext::init().is_err() {
+        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
             return;
         }
         let devices = VulkanDevice::probe().unwrap();
@@ -1897,7 +1896,7 @@ mod tests {
 
     #[test]
     fn test_vulkan_from_cpu() {
-        if VulkanContext::init().is_err() {
+        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
             return;
         }
         let devices = VulkanDevice::probe().unwrap();
@@ -1925,7 +1924,7 @@ mod tests {
 
     #[test]
     fn test_vulkan_matmul_simulated() {
-        if VulkanContext::init().is_err() {
+        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
             return;
         }
         let devices = VulkanDevice::probe().unwrap();
