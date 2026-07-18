@@ -2384,4 +2384,157 @@ mod tests {
         // All values >= 1.0
         assert!(result.iter().all(|v| *v >= 1.0));
     }
+
+    // -------------------------------------------------------------------------
+    // Edge-case + boundary tests (P1 strengthening).
+    //
+    // The existing tests above cover happy paths with 64-element inputs. These
+    // add the boundary cases that mutation testing surfaces: empty, sub-block,
+    // exact-block, all-zeros, all-same, and reject-truncated-buffer. Each one
+    // is the kind of input a mutant (flipped < to <=, dropped +1, etc.) would
+    // slip past the happy-path-only suite.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn q80_round_trip_preserves_length_across_block_boundary() {
+        // Q8_0 block size is 32. Test inputs that cross the boundary: 31
+        // (sub-block tail), 32 (exact block), 33 (block + 1). A flipped
+        // `chunks(BLOCK_Q8_WEIGHTS)` or dropped `+1` in num_blocks math
+        // would corrupt the length contract.
+        for &n in &[31usize, 32, 33, 63, 64, 65] {
+            let data: Vec<f32> = (0..n).map(|i| (i as f32 - (n as f32 / 2.0)) * 0.1).collect();
+            let q = quant_q80(&data).expect("quant");
+            let d = dequant_q80(&q, n).expect("dequant");
+            assert_eq!(d.len(), n, "Q8_0 length contract broken at n={n}");
+        }
+    }
+
+    #[test]
+    fn q80_round_trip_all_zeros_does_not_produce_nan() {
+        // All-zero input → amax = 0 → scale guard picks 1.0 (line 518).
+        // A mutant that dropped the `amax == 0.0` guard would divide by
+        // zero and produce NaN/Inf.
+        let data = vec![0.0f32; 64];
+        let q = quant_q80(&data).expect("quant");
+        let d = dequant_q80(&q, 64).expect("dequant");
+        assert_eq!(d.len(), 64);
+        assert!(d.iter().all(|v| v.is_finite()), "all-zero must not yield NaN");
+        // Reconstruction of zero is exactly zero (q=0, scale arbitrary).
+        assert!(d.iter().all(|v| v.abs() < 1e-6));
+    }
+
+    #[test]
+    fn q80_round_trip_constant_nonzero_input() {
+        // Constant input exercises the scale path without amax=0 degeneracy.
+        // A scale-fit mutant would surface as reconstruction != constant.
+        let data = vec![0.5f32; 64];
+        let q = quant_q80(&data).expect("quant");
+        let d = dequant_q80(&q, 64).expect("dequant");
+        for v in &d {
+            assert!((v - 0.5).abs() < 0.02, "constant reconstruction drifted: {v}");
+        }
+    }
+
+    #[test]
+    fn q4k_rejects_truncated_buffer() {
+        // Q4_K stride is 4 (scale) + 16 (packed 4-bit) = 20 bytes per 32-weight
+        // block. A buffer shorter than `num_blocks * 20` must error, not
+        // silently read past the end (the dequant loop indexes raw bytes).
+        let short_buf = vec![0u8; 10]; // claims 64 weights but only 10 bytes
+        let res = dequant_q4k(&short_buf, 64);
+        assert!(res.is_err(), "dequant_q4k must reject truncated buffer");
+    }
+
+    #[test]
+    fn q80_rejects_truncated_buffer() {
+        // Q8_0 stride is 2 (f16 scale) + 32 (i8 weights) = 34 bytes per
+        // 32-weight block. Handing in 5 bytes while claiming 32 weights must
+        // error rather than reading out of bounds.
+        let short_buf = vec![0u8; 5];
+        let res = dequant_q80(&short_buf, 32);
+        assert!(res.is_err(), "dequant_q80 must reject truncated buffer");
+    }
+
+    #[test]
+    fn iq4nl_rejects_truncated_buffer() {
+        // IQ4_NL super-block is 170 bytes per 256 weights. A 50-byte buffer
+        // claiming 256 weights must error.
+        let short_buf = vec![0u8; 50];
+        let res = dequant_iq4nl(&short_buf, 256);
+        assert!(res.is_err(), "dequant_iq4nl must reject truncated buffer");
+    }
+
+    #[test]
+    fn fp4_round_trip_preserves_sign() {
+        // FP4 E2M1 has a sign bit; quant → dequant must not flip the sign of
+        // a clearly positive or clearly negative input. A mutant that
+        // dropped the sign-bit branch in the quantizer would surface here.
+        let pos = vec![0.5f32; 16];
+        let neg = vec![-0.5f32; 16];
+        let q_pos = quant_fp4(&pos).expect("quant pos");
+        let d_pos = dequant_fp4(&q_pos, 16).expect("dequant pos");
+        let q_neg = quant_fp4(&neg).expect("quant neg");
+        let d_neg = dequant_fp4(&q_neg, 16).expect("dequant neg");
+        assert!(d_pos.iter().all(|v| *v >= 0.0), "FP4 must preserve positive sign");
+        assert!(d_neg.iter().all(|v| *v <= 0.0), "FP4 must preserve negative sign");
+    }
+
+    #[test]
+    fn nf4_round_trip_preserves_zero_crossing() {
+        // NF4 is asymmetric with no exact zero code; the smallest positive
+        // code is +0.1 and the largest negative is -0.1. Quantizing a
+        // mixed-sign input must produce a dequant vector that has both
+        // signs — a mutant that collapsed the code lookup to all-positive
+        // or all-negative would fail here.
+        let data: Vec<f32> = (0..16).map(|i| (i as f32 - 8.0) * 0.1).collect();
+        let q = quant_nf4(&data).expect("quant");
+        let d = dequant_nf4(&q, 16).expect("dequant");
+        let has_pos = d.iter().any(|v| *v > 0.0);
+        let has_neg = d.iter().any(|v| *v < 0.0);
+        assert!(has_pos && has_neg, "NF4 must preserve both signs; got {:?}", d);
+    }
+
+    #[test]
+    fn fp8_quant_clamps_to_representable_range() {
+        // E4M3 max representable is ~240. Quantizing +1e6 must clamp, not
+        // overflow the 4-bit exponent field — a mutant that dropped the
+        // `.min(240.0)` clamp at line 727 would corrupt the bit pattern.
+        let data = vec![1.0e6f32, -1.0e6, 0.0, 1.0];
+        let q = quant_fp8(&data).expect("quant");
+        let d = dequant_fp8(&q, 4).expect("dequant");
+        // The clamped values land near the E4M3 max (~240). We assert only
+        // finiteness + sign preservation — exact value depends on the LUT.
+        assert!(d[0].is_finite() && d[0] > 100.0, "large positive must clamp to ~240; got {}", d[0]);
+        assert!(d[1].is_finite() && d[1] < -100.0, "large negative must clamp to ~-240; got {}", d[1]);
+        assert!(d[2].abs() < 1e-6, "zero must round-trip; got {}", d[2]);
+    }
+
+    #[test]
+    fn quant_q80_empty_input_returns_empty_or_errors_cleanly() {
+        // Empty input is a boundary the existing tests skip. The contract
+        // is "no panic" — either empty output or clean Err.
+        let res = quant_q80(&[]);
+        match res {
+            Ok(bytes) => assert!(bytes.is_empty(), "empty input must yield empty bytes"),
+            Err(_) => { /* clean error is also acceptable */ }
+        }
+    }
+
+    #[test]
+    fn dequant_fp4_empty_input_returns_empty() {
+        // dequant_fp4 with num_values=0 must not index into data[4..].
+        let data = vec![0u8; 4]; // scale only, no packed codes
+        let d = dequant_fp4(&data, 0).expect("dequant");
+        assert!(d.is_empty(), "num_values=0 must yield empty output");
+    }
+
+    #[test]
+    fn dequant_fp8_handles_short_buffer_without_panic() {
+        // dequant_fp8 with `data.len() < 8` uses data_start=0 (no scale
+        // prefix). The boundary at len=7 vs len=8 must not panic.
+        let short = vec![0u8; 3];
+        let _ = dequant_fp8(&short, 3).expect("short fp8 dequant");
+        let exact = vec![0u8; 8];
+        let _ = dequant_fp8(&exact, 4).expect("fp8 dequant at scale boundary");
+    }
 }

@@ -161,7 +161,45 @@ unsafe impl Sync for RocmDevice {}
 
 impl RocmDevice {
     /// Create a new ROCm device instance and initialize its handle caches and stream pool.
+    ///
+    /// Infallible constructor: probes the runtime and falls back to safe
+    /// defaults (empty stream pool, default Wave64) on GPU-less boxes. Use
+    /// [`RocmDevice::try_new`] when you need the typed error from a failed
+    /// `hipSetDevice` (e.g. an out-of-range ordinal).
     pub fn new(ordinal: usize) -> Self {
+        match Self::try_new(ordinal) {
+            Ok(dev) => dev,
+            Err(e) => {
+                // Surface the failure loudly so a misconfigured host is
+                // visible, then build a defensive device that won't crash
+                // downstream callers — every subsequent op will also fail
+                // with a typed `Error::Backend`, never a panic.
+                eprintln!(
+                    "[RocmDevice::new] hipSetDevice({ordinal}) failed: {e}; \
+                     constructing a no-stream fallback device"
+                );
+                Self::fallback(ordinal)
+            }
+        }
+    }
+
+    /// Fallible constructor that propagates the `hipSetDevice` error.
+    ///
+    /// Use this in callers that want to distinguish "no GPU at this ordinal"
+    /// (Err) from "GPU present, ready to go" (Ok) — e.g. `probe()` and CLI
+    /// device enumeration. The infallible [`RocmDevice::new`] wraps this and
+    /// falls back to a no-stream device on error.
+    pub fn try_new(ordinal: usize) -> Result<Self> {
+        unsafe {
+            let set_status = hipSetDevice(ordinal as i32);
+            if set_status != hipSuccess {
+                return Err(Error::Backend(format!(
+                    "hipSetDevice({ordinal}) failed with code {set_status} \
+                     (is the ordinal out of range?)"
+                )));
+            }
+        }
+
         let mut handle_cache = None;
         // Attempt to create rocblas handle lazily on first op if needed.
         unsafe {
@@ -172,15 +210,15 @@ impl RocmDevice {
             }
         }
 
-        // Query device attributes for Wavefront size correctness gate
+        // Query device attributes for Wavefront size correctness gate.
+        // hipDeviceGetAttribute takes the device id explicitly, so these
+        // queries are correct regardless of which device hipSetDevice
+        // last selected — but hipStreamCreate below IS device-implicit,
+        // so we must fail loudly if hipSetDevice rejects the ordinal.
         let mut warp_size = 64; // Default to W64 (MI200/MI300 CDNA) safety fallback
         let mut xnack_val = 0;
         let mut streams = Vec::new();
         unsafe {
-            // NOTE: if hipSetDevice fails here, subsequent hipDeviceGetAttribute calls
-            // query the wrong device. This is a silent correctness bug — the API needs
-            // redesign to propagate errors from constructors.
-            let _ = hipSetDevice(ordinal as i32);
             let mut val = 0;
             let status = hipDeviceGetAttribute(&mut val, HIP_DEVICE_ATTRIBUTE_WARP_SIZE, ordinal as i32);
             if status == hipSuccess {
@@ -200,6 +238,32 @@ impl RocmDevice {
                 }
             }
         }
+        Ok(Self::build(
+            ordinal,
+            warp_size,
+            xnack_val,
+            handle_cache,
+            streams,
+        ))
+    }
+
+    /// Build a defensive device with no streams and default props. Used by
+    /// [`RocmDevice::new`] when `try_new` errors — keeps the infallible
+    /// constructor contract while making the failure visible (every later
+    /// op dispatches onto `null_stream` and returns `Err`).
+    fn fallback(ordinal: usize) -> Self {
+        Self::build(ordinal, 64, 0, None, Vec::new())
+    }
+
+    /// Shared tail of `try_new` / `fallback`: assemble the struct from
+    /// already-probed fields. Pure construction, no FFI calls.
+    fn build(
+        ordinal: usize,
+        warp_size: i32,
+        xnack_val: i32,
+        handle_cache: Option<RoclabsHandle>,
+        streams: Vec<*mut c_void>,
+    ) -> Self {
         let wavefront_size = if warp_size == 32 {
             WavefrontSize::W32
         } else {
@@ -1911,7 +1975,8 @@ impl RocmDevice {
         let mut sb = stride_b as i32;
         let mut sc = stride_c as i32;
 
-        self.launch_compute_kernel(
+        let solution_index = lookup_solution_index(m, n, k, ArithType::F16);
+        self.launch_compute_kernel_with_solution(
             "grim_decode_gemm_f16",
             grid_dim,
             block_dim,
@@ -1926,6 +1991,7 @@ impl RocmDevice {
                 arg(&mut sb),
                 arg(&mut sc),
             ],
+            Some(solution_index),
         )
     }
 
@@ -1979,7 +2045,8 @@ impl RocmDevice {
         let mut b_codes_off = backup_codes_offset as i32;
         let mut b_scale_off = backup_scale_offset as i32;
 
-        self.launch_compute_kernel(
+        let solution_index = lookup_solution_index(m, n, k, ArithType::F16);
+        self.launch_compute_kernel_with_solution(
             "grim_fused_dequant_gemm_f16",
             grid_dim,
             block_dim,
@@ -2001,6 +2068,7 @@ impl RocmDevice {
                 arg(&mut b_codes_off),
                 arg(&mut b_scale_off),
             ],
+            Some(solution_index),
         )
     }
 
@@ -2060,6 +2128,17 @@ impl RocmDevice {
         block: HipDim3,
         args: &mut [*mut c_void],
     ) -> Result<*mut c_void> {
+        self.launch_compute_kernel_with_solution(entry, grid, block, args, None)
+    }
+
+    pub(crate) fn launch_compute_kernel_with_solution(
+        &self,
+        entry: &str,
+        grid: HipDim3,
+        block: HipDim3,
+        args: &mut [*mut c_void],
+        solution_index: Option<i32>,
+    ) -> Result<*mut c_void> {
         // Build the kernel source fresh per dispatch so the live QKV kernel
         // module (and any other future sibling kernel modules) is included
         // without `const`-`concat!` gymnastics. The compile is cached by hash
@@ -2069,7 +2148,12 @@ impl RocmDevice {
         let hash = seahash::hash(kernel_source.as_bytes());
         // Include the GPU target in the cache key so a binary compiled for one
         // architecture is never loaded onto a different one (hipErrorNoBinaryForGpu).
-        let cache_key = format!("grim_{}_{}_{:016x}", entry, self.gpu_target, hash);
+        let base_key = format!("grim_{}_{}_{:016x}", entry, self.gpu_target, hash);
+        let cache_key = if let Some(sol) = solution_index {
+            format!("{}_sol{}", base_key, sol)
+        } else {
+            base_key
+        };
 
         let path = if let Some(cached_path) = self.hsaco_cache.get_cached_kernel(&cache_key) {
             cached_path
