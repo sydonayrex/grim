@@ -414,6 +414,8 @@ pub struct GrimMetadata {
     pub xnack_enabled: Option<bool>,
     /// Whether the KV cache layout was pre-optimized for ROCm decode.
     pub kv_layout_optimized: Option<bool>,
+    /// Whether the registry entries contain KV fields.
+    pub has_kv_registry: Option<bool>,
     /// Per-tensor capability extensions attached via the JSON metadata layer.
     /// Each entry declares capabilities (per-row scales, mixed bitwidth,
     /// backup streams, GPTQ-ORDERED, fusion mask) without changing the
@@ -440,6 +442,7 @@ impl Default for GrimMetadata {
             rocm_fusion_ops: Vec::new(),
             xnack_enabled: None,
             kv_layout_optimized: None,
+            has_kv_registry: None,
             ext_entries: Vec::new(),
         }
     }
@@ -493,6 +496,9 @@ impl GrimMetadata {
         let kv_layout_optimized = metadata
             .get("grim.rocm.kv_layout_optimized")
             .and_then(read_bool);
+        let has_kv_registry = metadata
+            .get("grim.has_kv_registry")
+            .and_then(read_bool);
 
         GrimMetadata {
             magic,
@@ -511,6 +517,7 @@ impl GrimMetadata {
             rocm_fusion_ops,
             xnack_enabled,
             kv_layout_optimized,
+            has_kv_registry,
             ext_entries: Vec::new(),
         }
     }
@@ -635,6 +642,12 @@ impl GrimMetadata {
                 GgufValue::Bool(kv_layout_optimized),
             );
         }
+        if let Some(has_kv_registry) = self.has_kv_registry {
+            metadata.insert(
+                "grim.has_kv_registry".into(),
+                GgufValue::Bool(has_kv_registry),
+            );
+        }
         metadata
     }
 
@@ -721,6 +734,9 @@ impl GrimMetadata {
         if let Some(kv_opt) = self.kv_layout_optimized {
             obj.insert("kv_layout_optimized".into(), serde_json::Value::Bool(kv_opt));
         }
+        if let Some(has_kv) = self.has_kv_registry {
+            obj.insert("has_kv_registry".into(), serde_json::Value::Bool(has_kv));
+        }
         if !self.ext_entries.is_empty() {
             // Capability extensions are tucked under a namespaced key so the
             // on-disk wire layout (header + JSON metadata + tensor registry)
@@ -795,6 +811,7 @@ impl GrimMetadata {
             .unwrap_or_default();
         let xnack_enabled = obj.get("xnack_enabled").and_then(|v| v.as_bool());
         let kv_layout_optimized = obj.get("kv_layout_optimized").and_then(|v| v.as_bool());
+        let has_kv_registry = obj.get("has_kv_registry").and_then(|v| v.as_bool());
         let ext_entries = obj
             .get("grim.ext.entries")
             .and_then(|v| v.as_array())
@@ -818,6 +835,7 @@ impl GrimMetadata {
             rocm_fusion_ops,
             xnack_enabled,
             kv_layout_optimized,
+            has_kv_registry,
             ext_entries,
         }
     }
@@ -1260,6 +1278,7 @@ mod tests {
             rocm_fusion_ops: vec![GrimFusionOp::QkvAttention],
             xnack_enabled: Some(false),
             kv_layout_optimized: Some(true),
+            has_kv_registry: Some(true),
             ext_entries: Vec::new(),
         }
     }
