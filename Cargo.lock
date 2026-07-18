@@ -4061,6 +4061,7 @@ checksum = "b40ca9252762c466af32d0b1002e91e4e1bc5398f77455e55474deb466355ff5"
 name = "grim-backend-cpu"
 version = "0.1.0"
 dependencies = [
+ "grim-format",
  "grim-tensor",
  "matrixmultiply",
  "thiserror 1.0.69",
@@ -4071,6 +4072,7 @@ name = "grim-backend-cuda"
 version = "0.1.0"
 dependencies = [
  "grim-tensor",
+ "seahash",
  "thiserror 1.0.69",
 ]
 
@@ -4123,6 +4125,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "grim-backend-cpu",
+ "grim-backend-cuda",
  "grim-backend-rocm",
  "grim-core",
  "grim-engine",

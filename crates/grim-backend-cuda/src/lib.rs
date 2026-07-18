@@ -3,8 +3,14 @@
 //! Provides the `CudaDevice` and `CudaStorage` structs implementing the `BackendDevice`
 //! and `BackendStorage` traits from `grim-tensor` by wrapping CUDA runtime APIs and cuBLAS.
 
+pub mod kernels;
+
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::fs;
+use std::process::Command;
+use std::sync::LazyLock;
 
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::{ArithType, DType, QuantProvenance, Storage as DTypeStorage};
@@ -23,6 +29,17 @@ pub const cudaMemcpyDeviceToHost: i32 = 2;
 pub const CUBLAS_STATUS_SUCCESS: i32 = 0;
 pub const CUBLAS_OP_N: i32 = 0;
 pub const CUBLAS_OP_T: i32 = 1;
+
+#[allow(non_camel_case_types)]
+pub type CUdevice = i32;
+#[allow(non_camel_case_types)]
+pub type CUcontext = *mut c_void;
+#[allow(non_camel_case_types)]
+pub type CUmodule = *mut c_void;
+#[allow(non_camel_case_types)]
+pub type CUfunction = *mut c_void;
+#[allow(non_camel_case_types)]
+pub type CUstream = *mut c_void;
 
 #[allow(dead_code)]
 unsafe extern "C" {
@@ -51,6 +68,111 @@ unsafe extern "C" {
         C: *mut f32,
         ldc: i32,
     ) -> i32;
+
+    fn cuInit(flags: u32) -> i32;
+    fn cuModuleLoadData(module: *mut CUmodule, image: *const c_void) -> i32;
+    fn cuModuleGetFunction(hfunc: *mut CUfunction, hmod: CUmodule, name: *const i8) -> i32;
+    fn cuLaunchKernel(
+        f: CUfunction,
+        gridDimX: u32,
+        gridDimY: u32,
+        gridDimZ: u32,
+        blockDimX: u32,
+        blockDimY: u32,
+        blockDimZ: u32,
+        sharedMemBytes: u32,
+        hStream: CUstream,
+        kernelParams: *mut *mut c_void,
+        extra: *mut *mut c_void,
+    ) -> i32;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SendCmodule(pub CUmodule);
+unsafe impl Send for SendCmodule {}
+unsafe impl Sync for SendCmodule {}
+
+static JIT_CACHE: LazyLock<Mutex<HashMap<u64, SendCmodule>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn compile_and_load_kernel(src: &str, device_ordinal: usize) -> Result<CUmodule> {
+    let hash = seahash::hash(src.as_bytes());
+    {
+        let cache = JIT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&module) = cache.get(&hash) {
+            return Ok(module.0);
+        }
+    }
+
+    unsafe {
+        let res = cuInit(0);
+        if res != 0 {
+            return Err(Error::Backend(format!("cuInit failed with status {}", res)));
+        }
+    }
+
+    let cache_dir = std::env::current_dir()
+        .unwrap_or_default()
+        .join("target")
+        .join("grim_cuda_cache");
+    fs::create_dir_all(&cache_dir).ok();
+
+    let cu_path = cache_dir.join(format!("{}.cu", hash));
+    let ptx_path = cache_dir.join(format!("{}.ptx", hash));
+
+    fs::write(&cu_path, src).map_err(|e| Error::Backend(format!("Failed to write CUDA source: {e}")))?;
+
+    let status = Command::new("nvcc")
+        .arg("-ptx")
+        .arg("-O3")
+        .arg("--gpu-architecture=sm_80")
+        .arg(&cu_path)
+        .arg("-o")
+        .arg(&ptx_path)
+        .status();
+
+    let success = match status {
+        Ok(s) => s.success(),
+        Err(_) => false,
+    };
+
+    if !success {
+        let status2 = Command::new("nvcc")
+            .arg("-ptx")
+            .arg("-O3")
+            .arg(&cu_path)
+            .arg("-o")
+            .arg(&ptx_path)
+            .status();
+        let success2 = match status2 {
+            Ok(s) => s.success(),
+            Err(_) => false,
+        };
+        if !success2 {
+            return Err(Error::Backend("nvcc compilation failed".into()));
+        }
+    }
+
+    let ptx_content = fs::read_to_string(&ptx_path)
+        .map_err(|e| Error::Backend(format!("Failed to read compiled PTX: {e}")))?;
+
+    let mut module: CUmodule = std::ptr::null_mut();
+    unsafe {
+        let select_res = cudaSetDevice(device_ordinal as i32);
+        if select_res != 0 {
+            return Err(Error::Backend(format!("cudaSetDevice failed: {}", select_res)));
+        }
+
+        let mut ptx_bytes = ptx_content.into_bytes();
+        ptx_bytes.push(0); // Null-terminate the PTX string!
+        let load_res = cuModuleLoadData(&mut module, ptx_bytes.as_ptr() as *const c_void);
+        if load_res != 0 {
+            return Err(Error::Backend(format!("cuModuleLoadData failed with error {}", load_res)));
+        }
+    }
+
+    let mut cache = JIT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.insert(hash, SendCmodule(module));
+    Ok(module)
 }
 
 /// A handle to a queued CUDA stream operation.
@@ -323,6 +445,11 @@ impl CudaDevice {
             }
         }
     }
+
+    /// Gets the ordinal of the CUDA device.
+    pub fn ordinal(&self) -> usize {
+        self.ordinal
+    }
 }
 
 
@@ -440,61 +567,397 @@ impl BackendDevice for CudaDevice {
     /// Performs elementwise addition on the CUDA device.
     fn add(
         &self,
-        _a: &dyn BackendStorage,
-        _b: &dyn BackendStorage,
-        _out: &Shape,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        Err(Error::Unimplemented("CUDA add pending".into()))
+        let a_storage = a.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("add a is not CudaStorage".into())
+        })?;
+        let b_storage = b.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("add b is not CudaStorage".into())
+        })?;
+
+        let out_storage = CudaStorage::alloc_gpu(out, DType::F32, self.ordinal)?;
+        let n = out.elem_count();
+
+        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+        let mut func: CUfunction = std::ptr::null_mut();
+        unsafe {
+            let func_name = std::ffi::CString::new("grim_add").unwrap();
+            let res = cuModuleGetFunction(&mut func, module, func_name.as_ptr());
+            if res != 0 {
+                return Err(Error::Backend(format!("cuModuleGetFunction failed: {}", res)));
+            }
+
+            let mut a_ptr = a_storage.device_ptr.unwrap() as *mut c_void;
+            let mut b_ptr = b_storage.device_ptr.unwrap() as *mut c_void;
+            let mut out_ptr = out_storage.device_ptr.unwrap() as *mut c_void;
+            let mut n_i = n as i32;
+
+            let mut args = [
+                &mut a_ptr as *mut *mut c_void as *mut c_void,
+                &mut b_ptr as *mut *mut c_void as *mut c_void,
+                &mut out_ptr as *mut *mut c_void as *mut c_void,
+                &mut n_i as *mut i32 as *mut c_void,
+            ];
+
+            let block_size = 256;
+            let grid_size = (n + block_size - 1) / block_size;
+
+            let launch_res = cuLaunchKernel(
+                func,
+                grid_size as u32, 1, 1,
+                block_size as u32, 1, 1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr() as *mut *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if launch_res != 0 {
+                return Err(Error::Backend(format!("cuLaunchKernel failed: {}", launch_res)));
+            }
+        }
+
+        let compute_handle = Box::new(CudaHandle {
+            completed: Arc::new(Mutex::new(false)),
+        });
+        Ok((Box::new(out_storage), compute_handle))
     }
 
     /// Performs elementwise multiplication on the CUDA device.
     fn mul(
         &self,
-        _a: &dyn BackendStorage,
-        _b: &dyn BackendStorage,
-        _out: &Shape,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        Err(Error::Unimplemented("CUDA mul pending".into()))
+        let a_storage = a.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("mul a is not CudaStorage".into())
+        })?;
+        let b_storage = b.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("mul b is not CudaStorage".into())
+        })?;
+
+        let out_storage = CudaStorage::alloc_gpu(out, DType::F32, self.ordinal)?;
+        let n = out.elem_count();
+
+        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+        let mut func: CUfunction = std::ptr::null_mut();
+        unsafe {
+            let func_name = std::ffi::CString::new("grim_mul").unwrap();
+            let res = cuModuleGetFunction(&mut func, module, func_name.as_ptr());
+            if res != 0 {
+                return Err(Error::Backend(format!("cuModuleGetFunction failed: {}", res)));
+            }
+
+            let mut a_ptr = a_storage.device_ptr.unwrap() as *mut c_void;
+            let mut b_ptr = b_storage.device_ptr.unwrap() as *mut c_void;
+            let mut out_ptr = out_storage.device_ptr.unwrap() as *mut c_void;
+            let mut n_i = n as i32;
+
+            let mut args = [
+                &mut a_ptr as *mut *mut c_void as *mut c_void,
+                &mut b_ptr as *mut *mut c_void as *mut c_void,
+                &mut out_ptr as *mut *mut c_void as *mut c_void,
+                &mut n_i as *mut i32 as *mut c_void,
+            ];
+
+            let block_size = 256;
+            let grid_size = (n + block_size - 1) / block_size;
+
+            let launch_res = cuLaunchKernel(
+                func,
+                grid_size as u32, 1, 1,
+                block_size as u32, 1, 1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr() as *mut *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if launch_res != 0 {
+                return Err(Error::Backend(format!("cuLaunchKernel failed: {}", launch_res)));
+            }
+        }
+
+        let compute_handle = Box::new(CudaHandle {
+            completed: Arc::new(Mutex::new(false)),
+        });
+        Ok((Box::new(out_storage), compute_handle))
     }
 
     /// Performs elementwise SiLU-multiplication (SwiGLU gate) on the CUDA device.
     fn silu_mul(
         &self,
-        _gate: &dyn BackendStorage,
-        _up: &dyn BackendStorage,
-        _out: &Shape,
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        Err(Error::Unimplemented("CUDA silu_mul pending".into()))
+        let gate_storage = gate.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("silu_mul gate is not CudaStorage".into())
+        })?;
+        let up_storage = up.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("silu_mul up is not CudaStorage".into())
+        })?;
+
+        let out_storage = CudaStorage::alloc_gpu(out, DType::F32, self.ordinal)?;
+        let n = out.elem_count();
+
+        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+        let mut func: CUfunction = std::ptr::null_mut();
+        unsafe {
+            let func_name = std::ffi::CString::new("grim_silu_mul").unwrap();
+            let res = cuModuleGetFunction(&mut func, module, func_name.as_ptr());
+            if res != 0 {
+                return Err(Error::Backend(format!("cuModuleGetFunction failed: {}", res)));
+            }
+
+            let mut gate_ptr = gate_storage.device_ptr.unwrap() as *mut c_void;
+            let mut up_ptr = up_storage.device_ptr.unwrap() as *mut c_void;
+            let mut out_ptr = out_storage.device_ptr.unwrap() as *mut c_void;
+            let mut n_i = n as i32;
+
+            let mut args = [
+                &mut gate_ptr as *mut *mut c_void as *mut c_void,
+                &mut up_ptr as *mut *mut c_void as *mut c_void,
+                &mut out_ptr as *mut *mut c_void as *mut c_void,
+                &mut n_i as *mut i32 as *mut c_void,
+            ];
+
+            let block_size = 256;
+            let grid_size = (n + block_size - 1) / block_size;
+
+            let launch_res = cuLaunchKernel(
+                func,
+                grid_size as u32, 1, 1,
+                block_size as u32, 1, 1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr() as *mut *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if launch_res != 0 {
+                return Err(Error::Backend(format!("cuLaunchKernel failed: {}", launch_res)));
+            }
+        }
+
+        let compute_handle = Box::new(CudaHandle {
+            completed: Arc::new(Mutex::new(false)),
+        });
+        Ok((Box::new(out_storage), compute_handle))
     }
 
     /// Performs RMS Normalization on the CUDA device.
     fn rms_norm(
         &self,
-        _x: &dyn BackendStorage,
-        _w: &dyn BackendStorage,
-        _eps: f32,
-        _out: &Shape,
+        x: &dyn BackendStorage,
+        w: &dyn BackendStorage,
+        eps: f32,
+        out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        Err(Error::Unimplemented("CUDA rms_norm pending".into()))
+        let x_storage = x.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("rms_norm x is not CudaStorage".into())
+        })?;
+        let w_storage = w.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("rms_norm w is not CudaStorage".into())
+        })?;
+
+        let out_storage = CudaStorage::alloc_gpu(out, DType::F32, self.ordinal)?;
+        let total = out.elem_count();
+        let row_len = out.dims()[out.dims().len() - 1];
+
+        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+        let mut func: CUfunction = std::ptr::null_mut();
+        unsafe {
+            let func_name = std::ffi::CString::new("grim_rms_norm").unwrap();
+            let res = cuModuleGetFunction(&mut func, module, func_name.as_ptr());
+            if res != 0 {
+                return Err(Error::Backend(format!("cuModuleGetFunction failed: {}", res)));
+            }
+
+            let mut x_ptr = x_storage.device_ptr.unwrap() as *mut c_void;
+            let mut w_ptr = w_storage.device_ptr.unwrap() as *mut c_void;
+            let mut out_ptr = out_storage.device_ptr.unwrap() as *mut c_void;
+            let mut row_len_i = row_len as i32;
+            let mut eps_val = eps;
+            let mut total_i = total as i32;
+
+            let mut args = [
+                &mut x_ptr as *mut *mut c_void as *mut c_void,
+                &mut w_ptr as *mut *mut c_void as *mut c_void,
+                &mut out_ptr as *mut *mut c_void as *mut c_void,
+                &mut row_len_i as *mut i32 as *mut c_void,
+                &mut eps_val as *mut f32 as *mut c_void,
+                &mut total_i as *mut i32 as *mut c_void,
+            ];
+
+            let block_size = 256;
+            let grid_size = (total + block_size - 1) / block_size;
+
+            let launch_res = cuLaunchKernel(
+                func,
+                grid_size as u32, 1, 1,
+                block_size as u32, 1, 1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr() as *mut *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if launch_res != 0 {
+                return Err(Error::Backend(format!("cuLaunchKernel failed: {}", launch_res)));
+            }
+        }
+
+        let compute_handle = Box::new(CudaHandle {
+            completed: Arc::new(Mutex::new(false)),
+        });
+        Ok((Box::new(out_storage), compute_handle))
     }
 
     /// Performs Softmax along the last dimension on the CUDA device.
     fn softmax(
         &self,
-        _x: &dyn BackendStorage,
-        _out: &Shape,
+        x: &dyn BackendStorage,
+        out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        Err(Error::Unimplemented("CUDA softmax pending".into()))
+        let x_storage = x.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("softmax x is not CudaStorage".into())
+        })?;
+
+        let out_storage = CudaStorage::alloc_gpu(out, DType::F32, self.ordinal)?;
+        let total = out.elem_count();
+        let last_dim = out.dims()[out.dims().len() - 1];
+
+        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+        let mut func: CUfunction = std::ptr::null_mut();
+        unsafe {
+            let func_name = std::ffi::CString::new("grim_softmax").unwrap();
+            let res = cuModuleGetFunction(&mut func, module, func_name.as_ptr());
+            if res != 0 {
+                return Err(Error::Backend(format!("cuModuleGetFunction failed: {}", res)));
+            }
+
+            let mut x_ptr = x_storage.device_ptr.unwrap() as *mut c_void;
+            let mut out_ptr = out_storage.device_ptr.unwrap() as *mut c_void;
+            let mut last_dim_i = last_dim as i32;
+            let mut total_i = total as i32;
+
+            let mut args = [
+                &mut x_ptr as *mut *mut c_void as *mut c_void,
+                &mut out_ptr as *mut *mut c_void as *mut c_void,
+                &mut last_dim_i as *mut i32 as *mut c_void,
+                &mut total_i as *mut i32 as *mut c_void,
+            ];
+
+            let block_size = 256;
+            let grid_size = (total + block_size - 1) / block_size;
+
+            let launch_res = cuLaunchKernel(
+                func,
+                grid_size as u32, 1, 1,
+                block_size as u32, 1, 1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr() as *mut *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if launch_res != 0 {
+                return Err(Error::Backend(format!("cuLaunchKernel failed: {}", launch_res)));
+            }
+        }
+
+        let compute_handle = Box::new(CudaHandle {
+            completed: Arc::new(Mutex::new(false)),
+        });
+        Ok((Box::new(out_storage), compute_handle))
     }
 
     /// Performs embedding lookup on the CUDA device.
     fn embedding(
         &self,
-        _weight: &dyn BackendStorage,
-        _indices: &[u32],
-        _out: &Shape,
+        weight: &dyn BackendStorage,
+        indices: &[u32],
+        out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        Err(Error::Unimplemented("CUDA embedding pending".into()))
+        let weight_storage = weight.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("embedding weight is not CudaStorage".into())
+        })?;
+
+        let out_storage = CudaStorage::alloc_gpu(out, DType::F32, self.ordinal)?;
+        let num_indices = indices.len();
+        let embedding_dim = out.dims()[out.dims().len() - 1];
+
+        // Allocate device memory for indices
+        let mut dev_indices_ptr: *mut c_void = std::ptr::null_mut();
+        let size_indices = num_indices * 4;
+        unsafe {
+            let res = cudaMalloc(&mut dev_indices_ptr, size_indices);
+            if res != cudaSuccess {
+                return Err(Error::Backend(format!("cudaMalloc for indices failed: {}", res)));
+            }
+            let res = cudaMemcpy(
+                dev_indices_ptr,
+                indices.as_ptr() as *const c_void,
+                size_indices,
+                cudaMemcpyHostToDevice,
+            );
+            if res != cudaSuccess {
+                let _ = cudaFree(dev_indices_ptr);
+                return Err(Error::Backend(format!("cudaMemcpy for indices failed: {}", res)));
+            }
+        }
+
+        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+        let mut func: CUfunction = std::ptr::null_mut();
+        unsafe {
+            let func_name = std::ffi::CString::new("grim_embedding").unwrap();
+            let res = cuModuleGetFunction(&mut func, module, func_name.as_ptr());
+            if res != 0 {
+                let _ = cudaFree(dev_indices_ptr);
+                return Err(Error::Backend(format!("cuModuleGetFunction failed: {}", res)));
+            }
+
+            let mut w_ptr = weight_storage.device_ptr.unwrap() as *mut c_void;
+            let mut out_ptr = out_storage.device_ptr.unwrap() as *mut c_void;
+            let mut emb_dim_i = embedding_dim as i32;
+            let mut num_idx_i = num_indices as i32;
+
+            let mut args = [
+                &mut w_ptr as *mut *mut c_void as *mut c_void,
+                &mut dev_indices_ptr as *mut *mut c_void as *mut c_void,
+                &mut out_ptr as *mut *mut c_void as *mut c_void,
+                &mut emb_dim_i as *mut i32 as *mut c_void,
+                &mut num_idx_i as *mut i32 as *mut c_void,
+            ];
+
+            let block_size = 256;
+            let total_threads = num_indices * embedding_dim;
+            let grid_size = (total_threads + block_size - 1) / block_size;
+
+            let launch_res = cuLaunchKernel(
+                func,
+                grid_size as u32, 1, 1,
+                block_size as u32, 1, 1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr() as *mut *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if launch_res != 0 {
+                let _ = cudaFree(dev_indices_ptr);
+                return Err(Error::Backend(format!("cuLaunchKernel failed: {}", launch_res)));
+            }
+        }
+
+        unsafe {
+            let _ = cudaDeviceSynchronize();
+            let _ = cudaFree(dev_indices_ptr);
+        }
+
+        let compute_handle = Box::new(CudaHandle {
+            completed: Arc::new(Mutex::new(true)),
+        });
+        Ok((Box::new(out_storage), compute_handle))
     }
 
     fn from_cpu(
@@ -581,5 +1044,67 @@ mod tests {
         // [1 2] @ [5 6] = [19 22]
         // [3 4]   [7 8]   [43 50]
         assert_eq!(res, vec![19.0, 22.0, 43.0, 50.0]);
+    }
+
+    #[test]
+    fn test_cuda_ops() {
+        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
+        let devices = CudaDevice::probe().unwrap();
+        let dev = &devices[0];
+
+        let a_data = vec![1.0, 2.0, 3.0, 4.0];
+        let b_data = vec![5.0, 6.0, 7.0, 8.0];
+        let shape = Shape::new(vec![4]);
+
+        let a = dev.from_cpu(&a_data, &shape, DType::F32).unwrap();
+        let b = dev.from_cpu(&b_data, &shape, DType::F32).unwrap();
+
+        // 1. Add
+        let (out_add, h) = dev.add(a.as_ref(), b.as_ref(), &shape).unwrap();
+        h.synchronize().unwrap();
+        assert_eq!(out_add.to_cpu_vec_f32().unwrap(), vec![6.0, 8.0, 10.0, 12.0]);
+
+        // 2. Mul
+        let (out_mul, h) = dev.mul(a.as_ref(), b.as_ref(), &shape).unwrap();
+        h.synchronize().unwrap();
+        assert_eq!(out_mul.to_cpu_vec_f32().unwrap(), vec![5.0, 12.0, 21.0, 32.0]);
+
+        // 3. SiLU Mul
+        let (out_silu, h) = dev.silu_mul(a.as_ref(), b.as_ref(), &shape).unwrap();
+        h.synchronize().unwrap();
+        let res_silu = out_silu.to_cpu_vec_f32().unwrap();
+        let expected_silu0 = (1.0f32 / (1.0f32 + (-1.0f32).exp())) * 5.0f32;
+        assert!((res_silu[0] - expected_silu0).abs() < 1e-4);
+
+        // 4. RMS Norm
+        let weight_data = vec![1.0, 1.0, 1.0, 1.0];
+        let weight = dev.from_cpu(&weight_data, &shape, DType::F32).unwrap();
+        let (out_rms, h) = dev.rms_norm(a.as_ref(), weight.as_ref(), 1e-5, &shape).unwrap();
+        h.synchronize().unwrap();
+        let res_rms = out_rms.to_cpu_vec_f32().unwrap();
+        // RMS of [1, 2, 3, 4] is sqrt((1+4+9+16)/4) = sqrt(7.5) = 2.7386
+        let rms_val = 7.5f32.sqrt();
+        assert!((res_rms[0] - 1.0 / rms_val).abs() < 1e-4);
+
+        // 5. Softmax
+        let (out_sm, h) = dev.softmax(a.as_ref(), &shape).unwrap();
+        h.synchronize().unwrap();
+        let res_sm = out_sm.to_cpu_vec_f32().unwrap();
+        let sum_exp = 1.0f32.exp() + 2.0f32.exp() + 3.0f32.exp() + 4.0f32.exp();
+        assert!((res_sm[0] - 1.0f32.exp() / sum_exp).abs() < 1e-4);
+
+        // 6. Embedding
+        let weight_emb_data = vec![
+            10.0, 20.0,
+            30.0, 40.0,
+            50.0, 60.0,
+        ];
+        let weight_emb = dev.from_cpu(&weight_emb_data, &Shape::new(vec![3, 2]), DType::F32).unwrap();
+        let indices = vec![2u32, 0u32];
+        let out_emb_shape = Shape::new(vec![2, 2]);
+        let (out_emb, h) = dev.embedding(weight_emb.as_ref(), &indices, &out_emb_shape).unwrap();
+        h.synchronize().unwrap();
+        let res_emb = out_emb.to_cpu_vec_f32().unwrap();
+        assert_eq!(res_emb, vec![50.0, 60.0, 10.0, 20.0]);
     }
 }
