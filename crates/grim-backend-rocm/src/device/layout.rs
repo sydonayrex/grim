@@ -123,6 +123,8 @@ pub enum WeightLayout {
     WavefrontTiled { wavefront_size: u32 },
     /// Block-sparse layout for FFN layers.
     BlockSparse,
+    /// Packed quantized weight layout with variable bits.
+    PackedQuant { bits: u8, wavefront_size: u32 },
 }
 
 /// Wavefront-tiled weight transformation for attention projections.
@@ -199,6 +201,110 @@ impl WavefrontTiledLayout {
     /// Returns the output shape `(num_wavefronts, cols_padded, wavefront_size)`.
     pub fn output_shape(&self) -> (usize, usize, usize) {
         (self.num_wavefronts, self.cols_padded, self.wavefront_size as usize)
+    }
+}
+
+/// Packed quantized layout for 2-4 bit variables packed into Wave64 aligned row segments.
+pub struct PackedQuantLayout {
+    pub bits: u8,
+    pub wavefront_size: u32,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl PackedQuantLayout {
+    pub fn new(rows: usize, cols: usize, bits: u8, wavefront_size: u32) -> Self {
+        Self { rows, cols, bits, wavefront_size }
+    }
+
+    /// Packs raw weights into a bit-packed format (little-endian byte, big-endian bit).
+    pub fn pack(&self, weights: &[f32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for r in 0..self.rows {
+            let start = r * self.cols;
+            let end = start + self.cols;
+            let row_vals = &weights[start..end];
+            
+            let bits_needed = self.cols as u64 * self.bits as u64;
+            let bytes_needed = (bits_needed + 7) / 8;
+            let out_start = out.len();
+            out.resize(out_start + bytes_needed as usize, 0u8);
+            
+            for (i, &v) in row_vals.iter().enumerate() {
+                let levels = (1u32 << self.bits) as f32;
+                let normalized = (v.clamp(-1.0, 1.0) + 1.0) * 0.5;
+                let code = (normalized * (levels - 1.0)).round() as u32;
+                
+                let bit_offset = i * self.bits as usize;
+                let byte_offset = bit_offset / 8;
+                let in_byte_offset = bit_offset % 8;
+                let bits_left_in_byte = 8 - in_byte_offset;
+                
+                if bits_left_in_byte >= self.bits as usize {
+                    let shift = bits_left_in_byte - self.bits as usize;
+                    out[out_start + byte_offset] |= (code << shift) as u8;
+                } else {
+                    let high_bits = bits_left_in_byte;
+                    let low_bits = self.bits as usize - high_bits;
+                    out[out_start + byte_offset] |= (code >> low_bits) as u8;
+                    if byte_offset + 1 < bytes_needed as usize {
+                        let low_shift = 8 - low_bits;
+                        out[out_start + byte_offset + 1] |= (code << low_shift) as u8;
+                    }
+                }
+            }
+            
+            // Align each row to 256-byte (Wave64 segment) boundary
+            let aligned = (out.len() + 255) & !255;
+            out.resize(aligned, 0u8);
+        }
+        out
+    }
+
+    /// Unpacks bit-packed bytes back to f32 elements.
+    pub fn unpack(&self, packed: &[u8]) -> Vec<f32> {
+        let mut out = vec![0.0f32; self.rows * self.cols];
+        let row_bytes = ((self.cols as u64 * self.bits as u64 + 7) / 8 + 255) & !255;
+        let row_bytes = row_bytes as usize;
+        
+        for r in 0..self.rows {
+            let row_start_idx = r * row_bytes;
+            if row_start_idx >= packed.len() { break; }
+            let row_data = &packed[row_start_idx..];
+            
+            for i in 0..self.cols {
+                let bit_offset = i * self.bits as usize;
+                let byte_offset = bit_offset / 8;
+                let in_byte_offset = bit_offset % 8;
+                let bits_left_in_byte = 8 - in_byte_offset;
+                
+                let code = if byte_offset < row_data.len() {
+                    if bits_left_in_byte >= self.bits as usize {
+                        let shift = bits_left_in_byte - self.bits as usize;
+                        ((row_data[byte_offset] >> shift) & ((1 << self.bits) - 1)) as u32
+                    } else {
+                        let high_bits = bits_left_in_byte;
+                        let low_bits = self.bits as usize - high_bits;
+                        let high_part = (row_data[byte_offset] & ((1 << high_bits) - 1)) as u32;
+                        let low_part = if byte_offset + 1 < row_data.len() {
+                            let shift = 8 - low_bits;
+                            ((row_data[byte_offset + 1] >> shift) & ((1 << low_bits) - 1)) as u32
+                        } else {
+                            0
+                        };
+                        (high_part << low_bits) | low_part
+                    }
+                } else {
+                    0
+                };
+                
+                let levels = (1u32 << self.bits) as f32;
+                let normalized = code as f32 / (levels - 1.0);
+                let val = normalized * 2.0 - 1.0;
+                out[r * self.cols + i] = val;
+            }
+        }
+        out
     }
 }
 

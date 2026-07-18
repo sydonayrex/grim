@@ -16,8 +16,10 @@ pub mod strict_kernels;
 pub mod deterministic_rng;
 /// SIMD-accelerated GEMM kernel (AVX2/SSE on x86_64)
 pub mod simd_gemm;
+pub mod dequant_gemm;
 
 pub use device::{cpu_tensor, CpuDevice};
 pub use deterministic_rng::DeterministicRng;
 pub use storage::CpuStorage;
 pub use simd_gemm::{gemm_f32_simd, gemm_f32_lora_fused};
+pub use dequant_gemm::dequant_row;
