@@ -97,4 +97,20 @@ extern "C" __global__ void grim_rmsnorm_matmul(
     }
     out[row * n + col] = sum;
 }
+
+extern "C" __global__ void grim_split_k_reduction(
+    const _Float16* __restrict__ partials,
+    _Float16* __restrict__ out,
+    int m, int n, int split_k)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = m * n;
+    if (idx >= total) return;
+
+    float sum = 0.0f;
+    for (int k = 0; k < split_k; ++k) {
+        sum += (float)partials[k * total + idx];
+    }
+    out[idx] = (_Float16)sum;
+}
 "#;

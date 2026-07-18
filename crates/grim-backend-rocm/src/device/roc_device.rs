@@ -90,7 +90,7 @@ use crate::{
     gpu_target_arch, gpu_target_flag, linear_launch, ROCM_COMPUTE_BLOCK,
     // Misc types
     RocmStorage, RocmCachingAllocator, RocmDeviceProps, RocmPinnedBuffer,
-    DecodeGemmConfig, FusedDequantGemmConfig, QkvAttentionFusionConfig, RmsNormMatMulFusionConfig,
+    DecodeGemmConfig, FusedDequantGemmConfig, SplitKGemmConfig, QkvAttentionFusionConfig, RmsNormMatMulFusionConfig,
     QuantMode,
 };
 
@@ -110,6 +110,7 @@ pub struct RocmDevice {
     /// `std::sync::Mutex`).
     pub(crate) decode_gemm_config: Mutex<DecodeGemmConfig>,
     pub(crate) fused_dequant_gemm_config: Mutex<FusedDequantGemmConfig>,
+    pub(crate) split_k_config: Mutex<SplitKGemmConfig>,
     /// Caching device-memory allocator (size-bucketed free-list). See `RocmCachingAllocator`.
     pub(crate) allocator: Arc<RocmCachingAllocator>,
     /// Phase-3 §3.1: device scratch pool — a thread-safe, power-of-2-bucketed
@@ -230,6 +231,7 @@ impl RocmDevice {
             batched_gemm_warmed: AtomicBool::new(false),
             decode_gemm_config: Mutex::new(DecodeGemmConfig::default()),
             fused_dequant_gemm_config: Mutex::new(FusedDequantGemmConfig::default()),
+            split_k_config: Mutex::new(SplitKGemmConfig::default()),
         }
     }
 
@@ -252,6 +254,12 @@ impl RocmDevice {
     /// Set whether fused dequantization GEMM is enabled (WI-C).
     pub fn set_fused_dequant_gemm_enabled(&self, enabled: bool) {
         let mut cfg = self.fused_dequant_gemm_config.lock().unwrap();
+        cfg.enabled = enabled;
+    }
+
+    /// Set whether SplitK GEMM is enabled (WI-D).
+    pub fn set_split_k_enabled(&self, enabled: bool) {
+        let mut cfg = self.split_k_config.lock().unwrap();
         cfg.enabled = enabled;
     }
 
@@ -1202,24 +1210,80 @@ impl BackendDevice for RocmDevice {
         // unknown shapes or other dtypes. Populated by `examples/tune_gemm.rs`.
         let solution_index = lookup_solution_index(m, n, k, dtype_out.arith);
         // WI 2.4.3 — split_k clamp gate.
-        //
-        // `tile_config.split_k` is *suggestion-only* until a cross-block
-        // K-reduction kernel lands in this crate (WI 2.4.2 deferred it;
-        // 2.4.5's STREAMK++ wire-up would route through CK's Stream-K
-        // decomposition, not a hand-written kernel). Structurally clamp
-        // here so the value reaching any launch path is 1 even if a
-        // future patch forgets — Gate 2.6.2 asserts this in
-        // `f2_split_k_at_launch_is_one` below.
-        let split_k_effective: u32 = 1;
-        debug_assert_eq!(
-            split_k_effective, 1,
-            "split_k > 1 reached a kernel launch without a reduction kernel — see TODO(split-k-kernel) in GemmTileConfig"
-        );
-        // TODO(split-k-kernel): wire split_k_effective into a real SplitK
-        // launch path once CK's Stream-K or a hand-written reduction
-        // kernel is in (WI 2.4.5 / future). Discarding the suggested
-        // value here means no shape currently splits K across blocks.
-        let _ = tile_config.split_k;
+        let split_k_effective: u32 = {
+            let split_k_enabled = self.split_k_config.lock().unwrap().enabled;
+            if split_k_enabled && tile_config.split_k > 1 && (k % tile_config.split_k as usize == 0) {
+                tile_config.split_k
+            } else {
+                1
+            }
+        };
+
+        if split_k_effective > 1 {
+            let k_part = k / split_k_effective as usize;
+            let partials_shape = Shape::from_slice(&[split_k_effective as usize, m, n]);
+            let partials_storage = RocmStorage::alloc_gpu(&partials_shape, dtype_out.clone(), &self.allocator, self.ordinal)?;
+
+            let handle = self.get_rocblas_handle()?;
+            let alpha: f32 = 1.0f32;
+            let beta: f32 = 0.0f32;
+
+            let a_ptr_void = a_storage.device_ptr.unwrap() as *const c_void;
+            let b_ptr_void = b_storage.device_ptr.unwrap() as *const c_void;
+            let partials_ptr_void = partials_storage.device_ptr.unwrap() as *mut c_void;
+
+            let status = unsafe {
+                let a_type = arith_to_rocblas_dtype(a_storage.dtype.arith);
+                let b_type = arith_to_rocblas_dtype(b_storage.dtype.arith);
+                let out_type = arith_to_rocblas_dtype(dtype_out.arith);
+                let compute_type = arith_to_compute_dtype(dtype_out.arith);
+                let alpha_ptr = &alpha as *const f32 as *const c_void;
+                let beta_ptr = &beta as *const f32 as *const c_void;
+
+                rocblas_gemm_strided_batched_ex(
+                    handle,
+                    RocblasOperation::None,
+                    RocblasOperation::None,
+                    n as RocblasInt,
+                    m as RocblasInt,
+                    k_part as RocblasInt,
+                    alpha_ptr,
+                    b_ptr_void,
+                    b_type,
+                    n as RocblasInt,
+                    (k_part * n) as i64,
+                    a_ptr_void,
+                    a_type,
+                    k as RocblasInt,
+                    k_part as i64,
+                    beta_ptr,
+                    partials_ptr_void,
+                    out_type,
+                    n as RocblasInt,
+                    (m * n) as i64,
+                    partials_ptr_void,
+                    out_type,
+                    n as RocblasInt,
+                    (m * n) as i64,
+                    split_k_effective as RocblasInt,
+                    compute_type,
+                    select_gemm_algo(solution_index),
+                    0,
+                    ROCBLAS_GEMM_FLAGS_NONE,
+                )
+            };
+
+            if status != rocblas_status_success {
+                return Err(Error::Backend(format!(
+                    "rocblas_gemm_strided_batched_ex failed with status {status}"
+                )));
+            }
+
+            // Sum up the partials along the batch dimension using the hand-written reduction kernel
+            let stream = self.launch_split_k_reduction(&partials_storage, &out_storage, m, n, split_k_effective)?;
+            let compute_handle = Box::new(RocmHandle::new(Some(stream)));
+            return Ok((Box::new(out_storage), compute_handle));
+        }
         #[cfg(feature = "rocm-profile")]
         println!(
             "[RocmDevice] GEMM Dispatch: Shape ({}, {}, {}) resolved to autotune tile config {:?} on Wavefront {:?}, solution_index={}",
@@ -1936,6 +2000,44 @@ impl RocmDevice {
                 arg(&mut b_bpw),
                 arg(&mut b_codes_off),
                 arg(&mut b_scale_off),
+            ],
+        )
+    }
+
+    /// Launch the JIT compiled SplitK reduction kernel (WI-D).
+    pub(crate) fn launch_split_k_reduction(
+        &self,
+        partials_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        split_k: u32,
+    ) -> Result<*mut c_void> {
+        let partials_ptr = partials_storage.device_ptr.ok_or_else(|| Error::Backend("split_k_reduction: partials has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("split_k_reduction: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems = m * n;
+        let grid_x = ((total_elems + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut p_ptr = partials_ptr;
+        let mut o_ptr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut sk = split_k as i32;
+
+        self.launch_compute_kernel(
+            "grim_split_k_reduction",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut p_ptr),
+                arg(&mut o_ptr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut sk),
             ],
         )
     }
