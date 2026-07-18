@@ -109,6 +109,23 @@ pub const VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO: u32 = 3;
 pub const VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: u32 = 12;
 pub const VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO: u32 = 5;
 
+pub const VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO: u32 = 11;
+pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO: u32 = 12;
+pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: u32 = 14;
+pub const VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO: u32 = 16;
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO: u32 = 32;
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO: u32 = 33;
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO: u32 = 34;
+pub const VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET: u32 = 35;
+pub const VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO: u32 = 29;
+pub const VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO: u32 = 30;
+pub const VK_STRUCTURE_TYPE_SUBMIT_INFO: u32 = 3;
+pub const VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO: u32 = 18;
+
+pub const VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: u32 = 7;
+pub const VK_SHADER_STAGE_COMPUTE_BIT: u32 = 0x00000080;
+pub const VK_QUEUE_COMPUTE_BIT: u32 = 0x00000002;
+
 pub const VK_BUFFER_USAGE_STORAGE_BUFFER_BIT: u32 = 0x00000020;
 pub const VK_SHARING_MODE_EXCLUSIVE: u32 = 0;
 
@@ -117,6 +134,161 @@ pub const VK_MEMORY_PROPERTY_HOST_COHERENT_BIT: u32 = 0x00000004;
 
 
 pub const VK_SUCCESS: i32 = 0;
+
+#[repr(C)]
+pub struct VkDescriptorSetLayoutBinding {
+    pub binding: u32,
+    pub descriptor_type: u32,
+    pub descriptor_count: u32,
+    pub stage_flags: u32,
+    pub p_immutable_samplers: *const c_void,
+}
+
+#[repr(C)]
+pub struct VkDescriptorSetLayoutCreateInfo {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub flags: VkFlags,
+    pub binding_count: u32,
+    pub p_bindings: *const VkDescriptorSetLayoutBinding,
+}
+
+#[repr(C)]
+pub struct VkDescriptorPoolSize {
+    pub r#type: u32,
+    pub descriptor_count: u32,
+}
+
+#[repr(C)]
+pub struct VkDescriptorPoolCreateInfo {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub flags: VkFlags,
+    pub max_sets: u32,
+    pub pool_size_count: u32,
+    pub p_pool_sizes: *const VkDescriptorPoolSize,
+}
+
+#[repr(C)]
+pub struct VkDescriptorBufferInfo {
+    pub buffer: u64,
+    pub offset: VkDeviceSize,
+    pub range: VkDeviceSize,
+}
+
+#[repr(C)]
+pub struct VkWriteDescriptorSet {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub dst_set: u64,
+    pub dst_binding: u32,
+    pub dst_array_element: u32,
+    pub descriptor_count: u32,
+    pub descriptor_type: u32,
+    pub p_buffer_info: *const VkDescriptorBufferInfo,
+    pub p_image_info: *const c_void,
+    pub p_texel_buffer_view: *const c_void,
+}
+
+#[repr(C)]
+pub struct VkDescriptorSetAllocateInfo {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub descriptor_pool: u64,
+    pub descriptor_set_count: u32,
+    pub p_set_layouts: *const u64,
+}
+
+#[repr(C)]
+pub struct VkShaderModuleCreateInfo {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub flags: VkFlags,
+    pub code_size: usize,
+    pub p_code: *const u32,
+}
+
+#[repr(C)]
+pub struct VkPipelineLayoutCreateInfo {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub flags: VkFlags,
+    pub set_layout_count: u32,
+    pub p_set_layouts: *const u64,
+    pub push_constant_range_count: u32,
+    pub p_push_constant_ranges: *const c_void,
+}
+
+#[repr(C)]
+pub struct VkPipelineShaderStageCreateInfo {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub flags: VkFlags,
+    pub stage: u32,
+    pub module: u64,
+    pub p_name: *const i8,
+    pub p_specialization_info: *const c_void,
+}
+
+#[repr(C)]
+pub struct VkComputePipelineCreateInfo {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub flags: VkFlags,
+    pub stage: VkPipelineShaderStageCreateInfo,
+    pub layout: u64,
+    pub base_pipeline_handle: u64,
+    pub base_pipeline_index: i32,
+}
+
+#[repr(C)]
+pub struct VkCommandPoolCreateInfo {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub flags: VkFlags,
+    pub queue_family_index: u32,
+}
+
+#[repr(C)]
+pub struct VkCommandBufferAllocateInfo {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub command_pool: u64,
+    pub level: u32,
+    pub command_buffer_count: u32,
+}
+
+#[repr(C)]
+pub struct VkCommandBufferBeginInfo {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub flags: u32,
+    pub p_inheritance_info: *const c_void,
+}
+
+#[repr(C)]
+pub struct VkSubmitInfo {
+    pub s_type: u32,
+    pub p_next: *const c_void,
+    pub wait_semaphore_count: u32,
+    pub p_wait_semaphores: *const u64,
+    pub p_wait_dst_stage_mask: *const u32,
+    pub command_buffer_count: u32,
+    pub p_command_buffers: *const *mut c_void,
+    pub signal_semaphore_count: u32,
+    pub p_signal_semaphores: *const u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VkQueueFamilyProperties {
+    pub queue_flags: u32,
+    pub queue_count: u32,
+    pub min_image_transfer_granularity_width: u32,
+    pub min_image_transfer_granularity_height: u32,
+    pub min_image_transfer_granularity_depth: u32,
+    pub timestamp_valid_bits: u32,
+}
 
 unsafe extern "C" {
     fn vkCreateInstance(
@@ -175,6 +347,127 @@ unsafe extern "C" {
         physicalDevice: *mut c_void,
         pMemoryProperties: *mut VkPhysicalDeviceMemoryProperties,
     );
+    fn vkGetPhysicalDeviceQueueFamilyProperties(
+        physicalDevice: *mut c_void,
+        pQueueFamilyPropertyCount: *mut u32,
+        pQueueFamilyProperties: *mut VkQueueFamilyProperties,
+    );
+    fn vkGetDeviceQueue(
+        device: *mut c_void,
+        queueFamilyIndex: u32,
+        queueIndex: u32,
+        pQueue: *mut *mut c_void,
+    );
+    fn vkCreateDescriptorSetLayout(
+        device: *mut c_void,
+        pCreateInfo: *const VkDescriptorSetLayoutCreateInfo,
+        pAllocator: *const c_void,
+        pSetLayout: *mut u64,
+    ) -> i32;
+    fn vkDestroyDescriptorSetLayout(
+        device: *mut c_void,
+        descriptorSetLayout: u64,
+        pAllocator: *const c_void,
+    );
+    fn vkCreateDescriptorPool(
+        device: *mut c_void,
+        pCreateInfo: *const VkDescriptorPoolCreateInfo,
+        pAllocator: *const c_void,
+        pDescriptorPool: *mut u64,
+    ) -> i32;
+    fn vkDestroyDescriptorPool(
+        device: *mut c_void,
+        descriptorPool: u64,
+        pAllocator: *const c_void,
+    );
+    fn vkAllocateDescriptorSets(
+        device: *mut c_void,
+        pAllocateInfo: *const VkDescriptorSetAllocateInfo,
+        pDescriptorSets: *mut u64,
+    ) -> i32;
+    fn vkUpdateDescriptorSets(
+        device: *mut c_void,
+        descriptorWriteCount: u32,
+        pDescriptorWrites: *const VkWriteDescriptorSet,
+        descriptorCopyCount: u32,
+        pDescriptorCopies: *const c_void,
+    );
+    fn vkCreateShaderModule(
+        device: *mut c_void,
+        pCreateInfo: *const VkShaderModuleCreateInfo,
+        pAllocator: *const c_void,
+        pShaderModule: *mut u64,
+    ) -> i32;
+    fn vkDestroyShaderModule(
+        device: *mut c_void,
+        shaderModule: u64,
+        pAllocator: *const c_void,
+    );
+    fn vkCreatePipelineLayout(
+        device: *mut c_void,
+        pCreateInfo: *const VkPipelineLayoutCreateInfo,
+        pAllocator: *const c_void,
+        pPipelineLayout: *mut u64,
+    ) -> i32;
+    fn vkDestroyPipelineLayout(
+        device: *mut c_void,
+        pipelineLayout: u64,
+        pAllocator: *const c_void,
+    );
+    fn vkCreateComputePipelines(
+        device: *mut c_void,
+        pipelineCache: u64,
+        createInfoCount: u32,
+        pCreateInfos: *const VkComputePipelineCreateInfo,
+        pAllocator: *const c_void,
+        pPipelines: *mut u64,
+    ) -> i32;
+    fn vkDestroyPipeline(device: *mut c_void, pipeline: u64, pAllocator: *const c_void);
+    fn vkCreateCommandPool(
+        device: *mut c_void,
+        pCreateInfo: *const VkCommandPoolCreateInfo,
+        pAllocator: *const c_void,
+        pCommandPool: *mut u64,
+    ) -> i32;
+    fn vkDestroyCommandPool(device: *mut c_void, commandPool: u64, pAllocator: *const c_void);
+    fn vkAllocateCommandBuffers(
+        device: *mut c_void,
+        pAllocateInfo: *const VkCommandBufferAllocateInfo,
+        pCommandBuffers: *mut *mut c_void,
+    ) -> i32;
+    fn vkBeginCommandBuffer(
+        commandBuffer: *mut c_void,
+        pBeginInfo: *const VkCommandBufferBeginInfo,
+    ) -> i32;
+    fn vkEndCommandBuffer(commandBuffer: *mut c_void) -> i32;
+    fn vkCmdBindPipeline(
+        commandBuffer: *mut c_void,
+        pipelineBindPoint: u32,
+        pipeline: u64,
+    );
+    fn vkCmdBindDescriptorSets(
+        commandBuffer: *mut c_void,
+        pipelineBindPoint: u32,
+        layout: u64,
+        firstSet: u32,
+        descriptorSetCount: u32,
+        pDescriptorSets: *const u64,
+        dynamicOffsetCount: u32,
+        pDynamicOffsets: *const u32,
+    );
+    fn vkCmdDispatch(
+        commandBuffer: *mut c_void,
+        groupCountX: u32,
+        groupCountY: u32,
+        groupCountZ: u32,
+    );
+    fn vkQueueSubmit(
+        queue: *mut c_void,
+        submitCount: u32,
+        pSubmits: *const VkSubmitInfo,
+        fence: u64,
+    ) -> i32;
+    fn vkQueueWaitIdle(queue: *mut c_void) -> i32;
 }
 
 // ---------- Vulkan Helper Context ----------
@@ -183,6 +476,8 @@ struct VulkanContext {
     instance: *mut c_void,
     physical_device: *mut c_void,
     device: *mut c_void,
+    queue: *mut c_void,
+    compute_family_index: u32,
 }
 
 unsafe impl Send for VulkanContext {}
@@ -191,6 +486,11 @@ unsafe impl Sync for VulkanContext {}
 
 impl VulkanContext {
     fn init() -> Result<Self> {
+        if std::env::var("ENABLE_PRIMUS_LAYER").is_err() {
+            unsafe {
+                std::env::set_var("ENABLE_PRIMUS_LAYER", "1");
+            }
+        }
         let instance_ci = VkInstanceCreateInfo {
             s_type: VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
             p_next: std::ptr::null(),
@@ -223,12 +523,47 @@ impl VulkanContext {
         }
         let physical_device = gpus[0];
 
+        // Find compute queue family index
+        let mut qfam_count: u32 = 0;
+        unsafe {
+            vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &mut qfam_count, std::ptr::null_mut());
+        }
+        if qfam_count == 0 {
+            unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+            return Err(Error::Backend("No queue families found on Vulkan physical device".into()));
+        }
+        let mut qfam_props = vec![VkQueueFamilyProperties {
+            queue_flags: 0,
+            queue_count: 0,
+            min_image_transfer_granularity_width: 0,
+            min_image_transfer_granularity_height: 0,
+            min_image_transfer_granularity_depth: 0,
+            timestamp_valid_bits: 0,
+        }; qfam_count as usize];
+        unsafe {
+            vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &mut qfam_count, qfam_props.as_mut_ptr());
+        }
+        let mut compute_family_index = None;
+        for i in 0..qfam_count {
+            if (qfam_props[i as usize].queue_flags & VK_QUEUE_COMPUTE_BIT) != 0 {
+                compute_family_index = Some(i);
+                break;
+            }
+        }
+        let compute_family_index = match compute_family_index {
+            Some(idx) => idx,
+            None => {
+                unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+                return Err(Error::Backend("No compute queue family found on Vulkan physical device".into()));
+            }
+        };
+
         let priorities: f32 = 1.0f32;
         let queue_ci = VkDeviceQueueCreateInfo {
             s_type: VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
             p_next: std::ptr::null(),
             flags: 0,
-            queue_family_index: 0,
+            queue_family_index: compute_family_index,
             queue_count: 1,
             p_queue_priorities: &priorities,
         };
@@ -253,10 +588,17 @@ impl VulkanContext {
             return Err(Error::Backend(format!("vkCreateDevice failed with status {}", res)));
         }
 
+        let mut queue: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            vkGetDeviceQueue(device, compute_family_index, 0, &mut queue);
+        }
+
         Ok(Self {
             instance,
             physical_device,
             device,
+            queue,
+            compute_family_index,
         })
     }
 }
@@ -477,6 +819,387 @@ impl VulkanDevice {
     }
 }
 
+fn run_compute_shader(
+    ctx: &VulkanContext,
+    spirv_code: &[u8],
+    buffers: &[u64],
+    grid_x: u32,
+    grid_y: u32,
+    grid_z: u32,
+) -> Result<()> {
+    unsafe {
+        let mut bindings = Vec::with_capacity(buffers.len());
+        for i in 0..buffers.len() {
+            bindings.push(VkDescriptorSetLayoutBinding {
+                binding: i as u32,
+                descriptor_type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                descriptor_count: 1,
+                stage_flags: VK_SHADER_STAGE_COMPUTE_BIT,
+                p_immutable_samplers: std::ptr::null(),
+            });
+        }
+        let ds_layout_ci = VkDescriptorSetLayoutCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            binding_count: bindings.len() as u32,
+            p_bindings: bindings.as_ptr(),
+        };
+        let mut ds_layout = 0u64;
+        let res = vkCreateDescriptorSetLayout(ctx.device, &ds_layout_ci, std::ptr::null(), &mut ds_layout);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!("vkCreateDescriptorSetLayout failed: {res}")));
+        }
+
+        struct Cleanup {
+            device: *mut c_void,
+            ds_layout: u64,
+            ds_pool: u64,
+            shader_module: u64,
+            pipeline_layout: u64,
+            pipeline: u64,
+            command_pool: u64,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    if self.command_pool != 0 {
+                        vkDestroyCommandPool(self.device, self.command_pool, std::ptr::null());
+                    }
+                    if self.pipeline != 0 {
+                        vkDestroyPipeline(self.device, self.pipeline, std::ptr::null());
+                    }
+                    if self.pipeline_layout != 0 {
+                        vkDestroyPipelineLayout(self.device, self.pipeline_layout, std::ptr::null());
+                    }
+                    if self.shader_module != 0 {
+                        vkDestroyShaderModule(self.device, self.shader_module, std::ptr::null());
+                    }
+                    if self.ds_pool != 0 {
+                        vkDestroyDescriptorPool(self.device, self.ds_pool, std::ptr::null());
+                    }
+                    if self.ds_layout != 0 {
+                        vkDestroyDescriptorSetLayout(self.device, self.ds_layout, std::ptr::null());
+                    }
+                }
+            }
+        }
+        let mut cleanup = Cleanup {
+            device: ctx.device,
+            ds_layout,
+            ds_pool: 0,
+            shader_module: 0,
+            pipeline_layout: 0,
+            pipeline: 0,
+            command_pool: 0,
+        };
+
+        let pool_size = VkDescriptorPoolSize {
+            r#type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            descriptor_count: buffers.len() as u32,
+        };
+        let ds_pool_ci = VkDescriptorPoolCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            max_sets: 1,
+            pool_size_count: 1,
+            p_pool_sizes: &pool_size,
+        };
+        let mut ds_pool = 0u64;
+        let res = vkCreateDescriptorPool(ctx.device, &ds_pool_ci, std::ptr::null(), &mut ds_pool);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!("vkCreateDescriptorPool failed: {res}")));
+        }
+        cleanup.ds_pool = ds_pool;
+
+        let ds_alloc_info = VkDescriptorSetAllocateInfo {
+            s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            p_next: std::ptr::null(),
+            descriptor_pool: ds_pool,
+            descriptor_set_count: 1,
+            p_set_layouts: &ds_layout,
+        };
+        let mut ds = 0u64;
+        let res = vkAllocateDescriptorSets(ctx.device, &ds_alloc_info, &mut ds);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!("vkAllocateDescriptorSets failed: {res}")));
+        }
+
+        let mut buf_infos = Vec::with_capacity(buffers.len());
+        for &buf in buffers {
+            buf_infos.push(VkDescriptorBufferInfo {
+                buffer: buf,
+                offset: 0,
+                range: !0u64,
+            });
+        }
+        let mut writes = Vec::with_capacity(buffers.len());
+        for i in 0..buffers.len() {
+            writes.push(VkWriteDescriptorSet {
+                s_type: VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                p_next: std::ptr::null(),
+                dst_set: ds,
+                dst_binding: i as u32,
+                dst_array_element: 0,
+                descriptor_count: 1,
+                descriptor_type: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                p_buffer_info: &buf_infos[i],
+                p_image_info: std::ptr::null(),
+                p_texel_buffer_view: std::ptr::null(),
+            });
+        }
+        vkUpdateDescriptorSets(ctx.device, writes.len() as u32, writes.as_ptr(), 0, std::ptr::null());
+
+        if spirv_code.len() % 4 != 0 {
+            return Err(Error::Backend("SPIR-V code size must be a multiple of 4 bytes".into()));
+        }
+        let shader_ci = VkShaderModuleCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            code_size: spirv_code.len(),
+            p_code: spirv_code.as_ptr() as *const u32,
+        };
+        let mut shader_module = 0u64;
+        let res = vkCreateShaderModule(ctx.device, &shader_ci, std::ptr::null(), &mut shader_module);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!("vkCreateShaderModule failed: {res}")));
+        }
+        cleanup.shader_module = shader_module;
+
+        let pipe_layout_ci = VkPipelineLayoutCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            set_layout_count: 1,
+            p_set_layouts: &ds_layout,
+            push_constant_range_count: 0,
+            p_push_constant_ranges: std::ptr::null(),
+        };
+        let mut pipeline_layout = 0u64;
+        let res = vkCreatePipelineLayout(ctx.device, &pipe_layout_ci, std::ptr::null(), &mut pipeline_layout);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!("vkCreatePipelineLayout failed: {res}")));
+        }
+        cleanup.pipeline_layout = pipeline_layout;
+
+        let entry_name = std::ffi::CString::new("main").unwrap();
+        let stage_ci = VkPipelineShaderStageCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            stage: VK_SHADER_STAGE_COMPUTE_BIT,
+            module: shader_module,
+            p_name: entry_name.as_ptr(),
+            p_specialization_info: std::ptr::null(),
+        };
+        let pipe_ci = VkComputePipelineCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            stage: stage_ci,
+            layout: pipeline_layout,
+            base_pipeline_handle: 0,
+            base_pipeline_index: 0,
+        };
+        let mut pipeline = 0u64;
+        let res = vkCreateComputePipelines(ctx.device, 0, 1, &pipe_ci, std::ptr::null(), &mut pipeline);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!("vkCreateComputePipelines failed: {res}")));
+        }
+        cleanup.pipeline = pipeline;
+
+        let pool_ci = VkCommandPoolCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            queue_family_index: ctx.compute_family_index,
+        };
+        let mut command_pool = 0u64;
+        let res = vkCreateCommandPool(ctx.device, &pool_ci, std::ptr::null(), &mut command_pool);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!("vkCreateCommandPool failed: {res}")));
+        }
+        cleanup.command_pool = command_pool;
+
+        let cmd_alloc_info = VkCommandBufferAllocateInfo {
+            s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            p_next: std::ptr::null(),
+            command_pool,
+            level: 0,
+            command_buffer_count: 1,
+        };
+        let mut command_buffer: *mut c_void = std::ptr::null_mut();
+        let res = vkAllocateCommandBuffers(ctx.device, &cmd_alloc_info, &mut command_buffer);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!("vkAllocateCommandBuffers failed: {res}")));
+        }
+
+        let begin_info = VkCommandBufferBeginInfo {
+            s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            p_next: std::ptr::null(),
+            flags: 1,
+            p_inheritance_info: std::ptr::null(),
+        };
+        let res = vkBeginCommandBuffer(command_buffer, &begin_info);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!("vkBeginCommandBuffer failed: {res}")));
+        }
+
+        vkCmdBindPipeline(command_buffer, 0, pipeline);
+        vkCmdBindDescriptorSets(command_buffer, 0, pipeline_layout, 0, 1, &ds, 0, std::ptr::null());
+        vkCmdDispatch(command_buffer, grid_x, grid_y, grid_z);
+
+        let res = vkEndCommandBuffer(command_buffer);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!("vkEndCommandBuffer failed: {res}")));
+        }
+
+        let submit_info = VkSubmitInfo {
+            s_type: VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            p_next: std::ptr::null(),
+            wait_semaphore_count: 0,
+            p_wait_semaphores: std::ptr::null(),
+            p_wait_dst_stage_mask: std::ptr::null(),
+            command_buffer_count: 1,
+            p_command_buffers: &command_buffer,
+            signal_semaphore_count: 0,
+            p_signal_semaphores: std::ptr::null(),
+        };
+        let res = vkQueueSubmit(ctx.queue, 1, &submit_info, 0);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!("vkQueueSubmit failed: {res}")));
+        }
+
+        let res = vkQueueWaitIdle(ctx.queue);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!("vkQueueWaitIdle failed: {res}")));
+        }
+    }
+    Ok(())
+}
+
+pub fn generate_add_glsl(size: usize) -> String {
+    format!(
+        r#"#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer A {{ float a[]; }};
+layout(std430, binding = 1) readonly buffer B {{ float b[]; }};
+layout(std430, binding = 2) writeonly buffer C {{ float c[]; }};
+void main() {{
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= {size}) return;
+    c[id] = a[id] + b[id];
+}}
+"#
+    )
+}
+
+pub fn generate_mul_glsl(size: usize) -> String {
+    format!(
+        r#"#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer A {{ float a[]; }};
+layout(std430, binding = 1) readonly buffer B {{ float b[]; }};
+layout(std430, binding = 2) writeonly buffer C {{ float c[]; }};
+void main() {{
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= {size}) return;
+    c[id] = a[id] * b[id];
+}}
+"#
+    )
+}
+
+pub fn generate_silu_mul_glsl(size: usize) -> String {
+    format!(
+        r#"#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer A {{ float a[]; }};
+layout(std430, binding = 1) readonly buffer B {{ float b[]; }};
+layout(std430, binding = 2) writeonly buffer C {{ float c[]; }};
+void main() {{
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= {size}) return;
+    float gate = a[id];
+    float silu = gate / (1.0 + exp(-gate));
+    c[id] = silu * b[id];
+}}
+"#
+    )
+}
+
+pub fn generate_rms_norm_glsl(size: usize, dim: usize, eps: f32) -> String {
+    format!(
+        r#"#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer X {{ float x[]; }};
+layout(std430, binding = 1) readonly buffer W {{ float w[]; }};
+layout(std430, binding = 2) writeonly buffer Y {{ float y[]; }};
+void main() {{
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= {size}) return;
+    uint row = id / {dim};
+    uint col = id % {dim};
+    
+    float sum_sq = 0.0;
+    for (uint i = 0; i < {dim}; ++i) {{
+        float val = x[row * {dim} + i];
+        sum_sq += val * val;
+    }}
+    float rms = sqrt(sum_sq / {dim} + {eps});
+    y[id] = (x[id] / rms) * w[col];
+}}
+"#
+    )
+}
+
+pub fn generate_softmax_glsl(size: usize, dim: usize) -> String {
+    format!(
+        r#"#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer X {{ float x[]; }};
+layout(std430, binding = 1) writeonly buffer Y {{ float y[]; }};
+void main() {{
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= {size}) return;
+    uint row = id / {dim};
+    
+    float max_val = -1e9;
+    for (uint i = 0; i < {dim}; ++i) {{
+        max_val = max(max_val, x[row * {dim} + i]);
+    }}
+    float sum = 0.0;
+    for (uint i = 0; i < {dim}; ++i) {{
+        sum += exp(x[row * {dim} + i] - max_val);
+    }}
+    y[id] = exp(x[id] - max_val) / sum;
+}}
+"#
+    )
+}
+
+pub fn generate_embedding_glsl(num_indices: usize, dim: usize) -> String {
+    format!(
+        r#"#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer W {{ float w[]; }};
+layout(std430, binding = 1) readonly buffer I {{ uint indices[]; }};
+layout(std430, binding = 2) writeonly buffer Y {{ float y[]; }};
+void main() {{
+    uint id = gl_GlobalInvocationID.x;
+    uint total = {num_indices} * {dim};
+    if (id >= total) return;
+    uint idx_pos = id / {dim};
+    uint col = id % {dim};
+    uint weight_row = indices[idx_pos];
+    y[id] = w[weight_row * {dim} + col];
+}}
+"#
+    )
+}
+
 impl Default for VulkanDevice {
     fn default() -> Self {
         Self::new()
@@ -543,51 +1266,59 @@ impl BackendDevice for VulkanDevice {
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
         let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
 
-        // 1. autotuner search simulation (Phase 4 requirement)
+        // 1. autotuner search (Phase 4 requirement)
         let autotuner = VulkanAutotuner::new();
         let tile_config = autotuner.search_tile_config(m, n, k);
 
         // 2. CubeCL #[cube] JIT compiler shader generator (Phase 4 requirement)
-        let spirv_source = compile_cube_kernel_to_spirv(m, n, k, tile_config);
-        println!(
-            "[VulkanDevice] CubeCL comptime! JIT compiler: compiled target matmul to Vulkan SPIR-V (Source bytes: {}) using tile configuration {:?}",
-            spirv_source.len(),
-            tile_config
-        );
+        let glsl_source = generate_matmul_glsl(m, n, k, tile_config);
+        let spirv_source = compile_glsl_to_spirv(&glsl_source)?;
 
-        // 3. Perform Vulkan compute shader buffer math simulation
         let out_storage = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device)?;
 
-        // Map buffers and simulate execution of the autotuned SPIR-V shader
-        let mut mapped_a: *mut c_void = std::ptr::null_mut();
-        let mut mapped_b: *mut c_void = std::ptr::null_mut();
-        let mut mapped_out: *mut c_void = std::ptr::null_mut();
+        // Try GPU dispatch first
+        let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
+        let grid_x = ((n + tile_config.block_n as usize - 1) / tile_config.block_n as usize) as u32;
+        let grid_y = ((m + tile_config.block_m as usize - 1) / tile_config.block_m as usize) as u32;
+        
+        let mut dispatch_success = false;
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, grid_y, 1) {
+            eprintln!("[Vulkan matmul] GPU dispatch failed ({}); falling back to host simulation", e);
+        } else {
+            dispatch_success = true;
+        }
 
-        unsafe {
-            _ = vkMapMemory(ctx.device, a_s.memory, 0, a_s.bytes as VkDeviceSize, 0, &mut mapped_a);
-            _ = vkMapMemory(ctx.device, b_s.memory, 0, b_s.bytes as VkDeviceSize, 0, &mut mapped_b);
-            _ = vkMapMemory(ctx.device, out_storage.memory, 0, out_storage.bytes as VkDeviceSize, 0, &mut mapped_out);
+        // Host fallback simulation
+        if !dispatch_success {
+            let mut mapped_a: *mut c_void = std::ptr::null_mut();
+            let mut mapped_b: *mut c_void = std::ptr::null_mut();
+            let mut mapped_out: *mut c_void = std::ptr::null_mut();
 
-            if !mapped_a.is_null() && !mapped_b.is_null() && !mapped_out.is_null() {
-                let ptr_a = mapped_a as *const f32;
-                let ptr_b = mapped_b as *const f32;
-                let ptr_out = mapped_out as *mut f32;
-                
-                // Simulate SPIR-V hardware execution of tiling math
-                for i in 0..m {
-                    for j in 0..n {
-                        let mut sum = 0.0f32;
-                        for p in 0..k {
-                            sum += *ptr_a.add(i * k + p) * *ptr_b.add(p * n + j);
+            unsafe {
+                _ = vkMapMemory(ctx.device, a_s.memory, 0, a_s.bytes as VkDeviceSize, 0, &mut mapped_a);
+                _ = vkMapMemory(ctx.device, b_s.memory, 0, b_s.bytes as VkDeviceSize, 0, &mut mapped_b);
+                _ = vkMapMemory(ctx.device, out_storage.memory, 0, out_storage.bytes as VkDeviceSize, 0, &mut mapped_out);
+
+                if !mapped_a.is_null() && !mapped_b.is_null() && !mapped_out.is_null() {
+                    let ptr_a = mapped_a as *const f32;
+                    let ptr_b = mapped_b as *const f32;
+                    let ptr_out = mapped_out as *mut f32;
+                    
+                    for i in 0..m {
+                        for j in 0..n {
+                            let mut sum = 0.0f32;
+                            for p in 0..k {
+                                sum += *ptr_a.add(i * k + p) * *ptr_b.add(p * n + j);
+                            }
+                            *ptr_out.add(i * n + j) = sum;
                         }
-                        *ptr_out.add(i * n + j) = sum;
                     }
                 }
-            }
 
-            vkUnmapMemory(ctx.device, a_s.memory);
-            vkUnmapMemory(ctx.device, b_s.memory);
-            vkUnmapMemory(ctx.device, out_storage.memory);
+                vkUnmapMemory(ctx.device, a_s.memory);
+                vkUnmapMemory(ctx.device, b_s.memory);
+                vkUnmapMemory(ctx.device, out_storage.memory);
+            }
         }
 
         Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
@@ -595,56 +1326,389 @@ impl BackendDevice for VulkanDevice {
 
     fn add(
         &self,
-        _a: &dyn BackendStorage,
-        _b: &dyn BackendStorage,
-        _out: &Shape,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        Err(Error::Unimplemented("Vulkan add pending".into()))
+        let a_s = a.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan add: input a is not VulkanStorage".into())
+        })?;
+        let b_s = b.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan add: input b is not VulkanStorage".into())
+        })?;
+
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device)?;
+
+        let size = out.elem_count();
+        let glsl_source = generate_add_glsl(size);
+        let spirv_source = compile_glsl_to_spirv(&glsl_source)?;
+
+        let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
+        let grid_x = ((size + 255) / 256) as u32;
+
+        let mut dispatch_success = false;
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1) {
+            eprintln!("[Vulkan add] GPU dispatch failed ({}); falling back to host simulation", e);
+        } else {
+            dispatch_success = true;
+        }
+
+        if !dispatch_success {
+            let mut mapped_a: *mut c_void = std::ptr::null_mut();
+            let mut mapped_b: *mut c_void = std::ptr::null_mut();
+            let mut mapped_out: *mut c_void = std::ptr::null_mut();
+
+            unsafe {
+                _ = vkMapMemory(ctx.device, a_s.memory, 0, a_s.bytes as VkDeviceSize, 0, &mut mapped_a);
+                _ = vkMapMemory(ctx.device, b_s.memory, 0, b_s.bytes as VkDeviceSize, 0, &mut mapped_b);
+                _ = vkMapMemory(ctx.device, out_storage.memory, 0, out_storage.bytes as VkDeviceSize, 0, &mut mapped_out);
+
+                if !mapped_a.is_null() && !mapped_b.is_null() && !mapped_out.is_null() {
+                    let ptr_a = mapped_a as *const f32;
+                    let ptr_b = mapped_b as *const f32;
+                    let ptr_out = mapped_out as *mut f32;
+                    for i in 0..size {
+                        *ptr_out.add(i) = *ptr_a.add(i) + *ptr_b.add(i);
+                    }
+                }
+
+                vkUnmapMemory(ctx.device, a_s.memory);
+                vkUnmapMemory(ctx.device, b_s.memory);
+                vkUnmapMemory(ctx.device, out_storage.memory);
+            }
+        }
+
+        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
     fn mul(
         &self,
-        _a: &dyn BackendStorage,
-        _b: &dyn BackendStorage,
-        _out: &Shape,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        Err(Error::Unimplemented("Vulkan mul pending".into()))
+        let a_s = a.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan mul: input a is not VulkanStorage".into())
+        })?;
+        let b_s = b.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan mul: input b is not VulkanStorage".into())
+        })?;
+
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device)?;
+
+        let size = out.elem_count();
+        let glsl_source = generate_mul_glsl(size);
+        let spirv_source = compile_glsl_to_spirv(&glsl_source)?;
+
+        let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
+        let grid_x = ((size + 255) / 256) as u32;
+
+        let mut dispatch_success = false;
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1) {
+            eprintln!("[Vulkan mul] GPU dispatch failed ({}); falling back to host simulation", e);
+        } else {
+            dispatch_success = true;
+        }
+
+        if !dispatch_success {
+            let mut mapped_a: *mut c_void = std::ptr::null_mut();
+            let mut mapped_b: *mut c_void = std::ptr::null_mut();
+            let mut mapped_out: *mut c_void = std::ptr::null_mut();
+
+            unsafe {
+                _ = vkMapMemory(ctx.device, a_s.memory, 0, a_s.bytes as VkDeviceSize, 0, &mut mapped_a);
+                _ = vkMapMemory(ctx.device, b_s.memory, 0, b_s.bytes as VkDeviceSize, 0, &mut mapped_b);
+                _ = vkMapMemory(ctx.device, out_storage.memory, 0, out_storage.bytes as VkDeviceSize, 0, &mut mapped_out);
+
+                if !mapped_a.is_null() && !mapped_b.is_null() && !mapped_out.is_null() {
+                    let ptr_a = mapped_a as *const f32;
+                    let ptr_b = mapped_b as *const f32;
+                    let ptr_out = mapped_out as *mut f32;
+                    for i in 0..size {
+                        *ptr_out.add(i) = *ptr_a.add(i) * *ptr_b.add(i);
+                    }
+                }
+
+                vkUnmapMemory(ctx.device, a_s.memory);
+                vkUnmapMemory(ctx.device, b_s.memory);
+                vkUnmapMemory(ctx.device, out_storage.memory);
+            }
+        }
+
+        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
     fn silu_mul(
         &self,
-        _gate: &dyn BackendStorage,
-        _up: &dyn BackendStorage,
-        _out: &Shape,
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        Err(Error::Unimplemented("Vulkan silu_mul pending".into()))
+        let gate_s = gate.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan silu_mul: input gate is not VulkanStorage".into())
+        })?;
+        let up_s = up.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan silu_mul: input up is not VulkanStorage".into())
+        })?;
+
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device)?;
+
+        let size = out.elem_count();
+        let glsl_source = generate_silu_mul_glsl(size);
+        let spirv_source = compile_glsl_to_spirv(&glsl_source)?;
+
+        let buffers = [gate_s.buffer, up_s.buffer, out_storage.buffer];
+        let grid_x = ((size + 255) / 256) as u32;
+
+        let mut dispatch_success = false;
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1) {
+            eprintln!("[Vulkan silu_mul] GPU dispatch failed ({}); falling back to host simulation", e);
+        } else {
+            dispatch_success = true;
+        }
+
+        if !dispatch_success {
+            let mut mapped_gate: *mut c_void = std::ptr::null_mut();
+            let mut mapped_up: *mut c_void = std::ptr::null_mut();
+            let mut mapped_out: *mut c_void = std::ptr::null_mut();
+
+            unsafe {
+                _ = vkMapMemory(ctx.device, gate_s.memory, 0, gate_s.bytes as VkDeviceSize, 0, &mut mapped_gate);
+                _ = vkMapMemory(ctx.device, up_s.memory, 0, up_s.bytes as VkDeviceSize, 0, &mut mapped_up);
+                _ = vkMapMemory(ctx.device, out_storage.memory, 0, out_storage.bytes as VkDeviceSize, 0, &mut mapped_out);
+
+                if !mapped_gate.is_null() && !mapped_up.is_null() && !mapped_out.is_null() {
+                    let ptr_gate = mapped_gate as *const f32;
+                    let ptr_up = mapped_up as *const f32;
+                    let ptr_out = mapped_out as *mut f32;
+                    for i in 0..size {
+                        let g = *ptr_gate.add(i);
+                        let silu = g / (1.0 + (-g).exp());
+                        *ptr_out.add(i) = silu * *ptr_up.add(i);
+                    }
+                }
+
+                vkUnmapMemory(ctx.device, gate_s.memory);
+                vkUnmapMemory(ctx.device, up_s.memory);
+                vkUnmapMemory(ctx.device, out_storage.memory);
+            }
+        }
+
+        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
     fn rms_norm(
         &self,
-        _x: &dyn BackendStorage,
-        _w: &dyn BackendStorage,
-        _eps: f32,
-        _out: &Shape,
+        x: &dyn BackendStorage,
+        w: &dyn BackendStorage,
+        eps: f32,
+        out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        Err(Error::Unimplemented("Vulkan rms_norm pending".into()))
+        let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan rms_norm: input x is not VulkanStorage".into())
+        })?;
+        let w_s = w.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan rms_norm: input w is not VulkanStorage".into())
+        })?;
+
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device)?;
+
+        let size = out.elem_count();
+        let x_dims = x.shape().dims();
+        let dim = x_dims[x_dims.len() - 1];
+
+        let glsl_source = generate_rms_norm_glsl(size, dim, eps);
+        let spirv_source = compile_glsl_to_spirv(&glsl_source)?;
+
+        let buffers = [x_s.buffer, w_s.buffer, out_storage.buffer];
+        let grid_x = ((size + 255) / 256) as u32;
+
+        let mut dispatch_success = false;
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1) {
+            eprintln!("[Vulkan rms_norm] GPU dispatch failed ({}); falling back to host simulation", e);
+        } else {
+            dispatch_success = true;
+        }
+
+        if !dispatch_success {
+            let mut mapped_x: *mut c_void = std::ptr::null_mut();
+            let mut mapped_w: *mut c_void = std::ptr::null_mut();
+            let mut mapped_out: *mut c_void = std::ptr::null_mut();
+
+            unsafe {
+                _ = vkMapMemory(ctx.device, x_s.memory, 0, x_s.bytes as VkDeviceSize, 0, &mut mapped_x);
+                _ = vkMapMemory(ctx.device, w_s.memory, 0, w_s.bytes as VkDeviceSize, 0, &mut mapped_w);
+                _ = vkMapMemory(ctx.device, out_storage.memory, 0, out_storage.bytes as VkDeviceSize, 0, &mut mapped_out);
+
+                if !mapped_x.is_null() && !mapped_w.is_null() && !mapped_out.is_null() {
+                    let ptr_x = mapped_x as *const f32;
+                    let ptr_w = mapped_w as *const f32;
+                    let ptr_out = mapped_out as *mut f32;
+
+                    for i in 0..size {
+                        let row = i / dim;
+                        let col = i % dim;
+                        let mut sum_sq = 0.0f32;
+                        for d in 0..dim {
+                            let val = *ptr_x.add(row * dim + d);
+                            sum_sq += val * val;
+                        }
+                        let rms = (sum_sq / dim as f32 + eps).sqrt();
+                        *ptr_out.add(i) = (*ptr_x.add(i) / rms) * *ptr_w.add(col);
+                    }
+                }
+
+                vkUnmapMemory(ctx.device, x_s.memory);
+                vkUnmapMemory(ctx.device, w_s.memory);
+                vkUnmapMemory(ctx.device, out_storage.memory);
+            }
+        }
+
+        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
     fn softmax(
         &self,
-        _x: &dyn BackendStorage,
-        _out: &Shape,
+        x: &dyn BackendStorage,
+        out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        Err(Error::Unimplemented("Vulkan softmax pending".into()))
+        let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan softmax: input x is not VulkanStorage".into())
+        })?;
+
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device)?;
+
+        let size = out.elem_count();
+        let x_dims = x.shape().dims();
+        let dim = x_dims[x_dims.len() - 1];
+
+        let glsl_source = generate_softmax_glsl(size, dim);
+        let spirv_source = compile_glsl_to_spirv(&glsl_source)?;
+
+        let buffers = [x_s.buffer, out_storage.buffer];
+        let grid_x = ((size + 255) / 256) as u32;
+
+        let mut dispatch_success = false;
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1) {
+            eprintln!("[Vulkan softmax] GPU dispatch failed ({}); falling back to host simulation", e);
+        } else {
+            dispatch_success = true;
+        }
+
+        if !dispatch_success {
+            let mut mapped_x: *mut c_void = std::ptr::null_mut();
+            let mut mapped_out: *mut c_void = std::ptr::null_mut();
+
+            unsafe {
+                _ = vkMapMemory(ctx.device, x_s.memory, 0, x_s.bytes as VkDeviceSize, 0, &mut mapped_x);
+                _ = vkMapMemory(ctx.device, out_storage.memory, 0, out_storage.bytes as VkDeviceSize, 0, &mut mapped_out);
+
+                if !mapped_x.is_null() && !mapped_out.is_null() {
+                    let ptr_x = mapped_x as *const f32;
+                    let ptr_out = mapped_out as *mut f32;
+
+                    for i in 0..size {
+                        let row = i / dim;
+                        let mut max_val = -1e9f32;
+                        for d in 0..dim {
+                            max_val = max_val.max(*ptr_x.add(row * dim + d));
+                        }
+                        let mut sum = 0.0f32;
+                        for d in 0..dim {
+                            sum += (*ptr_x.add(row * dim + d) - max_val).exp();
+                        }
+                        *ptr_out.add(i) = (*ptr_x.add(i) - max_val).exp() / sum;
+                    }
+                }
+
+                vkUnmapMemory(ctx.device, x_s.memory);
+                vkUnmapMemory(ctx.device, out_storage.memory);
+            }
+        }
+
+        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
     fn embedding(
         &self,
-        _weight: &dyn BackendStorage,
-        _indices: &[u32],
-        _out: &Shape,
+        weight: &dyn BackendStorage,
+        indices: &[u32],
+        out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        Err(Error::Unimplemented("Vulkan embedding pending".into()))
+        let w_s = weight.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan embedding: weight is not VulkanStorage".into())
+        })?;
+
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device)?;
+
+        // Upload indices to GPU buffer temp
+        let idx_shape = Shape::new(vec![indices.len()]);
+        let idx_storage = VulkanStorage::alloc_gpu(&idx_shape, DType { arith: ArithType::U32, storage: grim_tensor::dtype::Storage::Native }, ctx.device)?;
+        let mut mapped_idx: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            let res = vkMapMemory(ctx.device, idx_storage.memory, 0, idx_storage.bytes as VkDeviceSize, 0, &mut mapped_idx);
+            if res == VK_SUCCESS {
+                std::ptr::copy_nonoverlapping(indices.as_ptr(), mapped_idx as *mut u32, indices.len());
+                vkUnmapMemory(ctx.device, idx_storage.memory);
+            }
+        }
+
+        let w_dims = weight.shape().dims();
+        let dim = w_dims[w_dims.len() - 1];
+        let num_indices = indices.len();
+        let size = num_indices * dim;
+
+        let glsl_source = generate_embedding_glsl(num_indices, dim);
+        let spirv_source = compile_glsl_to_spirv(&glsl_source)?;
+
+        let buffers = [w_s.buffer, idx_storage.buffer, out_storage.buffer];
+        let grid_x = ((size + 255) / 256) as u32;
+
+        let mut dispatch_success = false;
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1) {
+            eprintln!("[Vulkan embedding] GPU dispatch failed ({}); falling back to host simulation", e);
+        } else {
+            dispatch_success = true;
+        }
+
+        if !dispatch_success {
+            let mut mapped_w: *mut c_void = std::ptr::null_mut();
+            let mut mapped_out: *mut c_void = std::ptr::null_mut();
+
+            unsafe {
+                _ = vkMapMemory(ctx.device, w_s.memory, 0, w_s.bytes as VkDeviceSize, 0, &mut mapped_w);
+                _ = vkMapMemory(ctx.device, out_storage.memory, 0, out_storage.bytes as VkDeviceSize, 0, &mut mapped_out);
+
+                if !mapped_w.is_null() && !mapped_out.is_null() {
+                    let ptr_w = mapped_w as *const f32;
+                    let ptr_out = mapped_out as *mut f32;
+
+                    for i in 0..size {
+                        let idx_pos = i / dim;
+                        let col = i % dim;
+                        let weight_row = indices[idx_pos] as usize;
+                        *ptr_out.add(i) = *ptr_w.add(weight_row * dim + col);
+                    }
+                }
+
+                vkUnmapMemory(ctx.device, w_s.memory);
+                vkUnmapMemory(ctx.device, out_storage.memory);
+            }
+        }
+
+        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
     }
 
     fn from_cpu(
@@ -813,7 +1877,7 @@ mod tests {
     fn test_vulkan_device_probe() {
         let devices = VulkanDevice::probe().unwrap();
         // If Vulkan is available on the platform, we expect at least 1 device
-        if let Ok(ctx) = VulkanContext::init() {
+        if let Ok(_ctx) = VulkanContext::init() {
             assert!(!devices.is_empty());
         }
     }
