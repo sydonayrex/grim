@@ -79,7 +79,7 @@ fn convert_to_grim_then_grim_provider_round_trips_tensor_payload() {
     let gguf_path_str = gguf_path.to_str().expect("utf8 gguf path");
     let grim_path_str = grim_path.to_str().expect("utf8 grim path");
 
-    convert_to_grim(gguf_path_str, grim_path_str, "gfx1100", 4.0, 0, None)
+    convert_to_grim(gguf_path_str, grim_path_str, "gfx1100", 4.0, 0, None, None)
         .expect("convert_to_grim must succeed on a valid GGUF source");
 
     let provider = GrimProvider::open(grim_path_str).expect("GrimProvider must open the converted .grim");
@@ -131,8 +131,8 @@ fn convert_to_grim_produces_deterministic_payload_for_same_input() {
     let a_str = grim_a.to_str().unwrap();
     let b_str = grim_b.to_str().unwrap();
 
-    convert_to_grim(gguf_str, a_str, "gfx1100", 4.0, 0, None).unwrap();
-    convert_to_grim(gguf_str, b_str, "gfx1100", 4.0, 0, None).unwrap();
+    convert_to_grim(gguf_str, a_str, "gfx1100", 4.0, 0, None, None).unwrap();
+    convert_to_grim(gguf_str, b_str, "gfx1100", 4.0, 0, None, None).unwrap();
 
     let provider_a = GrimProvider::open(a_str).unwrap();
     let provider_b = GrimProvider::open(b_str).unwrap();
