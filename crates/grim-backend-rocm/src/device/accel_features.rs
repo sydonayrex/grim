@@ -105,6 +105,40 @@ pub fn mfma_dispatch(arch: &str, requested: QuantMode) -> Result<QuantMode, &'st
 }
 
 // ---------------------------------------------------------------------------
+// WMMA availability (WI-G)
+// ---------------------------------------------------------------------------
+
+/// Whether the arch has native **WMMA** matrix cores for a given arithmetic mode.
+pub fn wmma_supported(arch: GcnArch, mode: QuantMode) -> bool {
+    let is_rdna3_or_rdna4 = matches!(arch, GcnArch::RDNA3 | GcnArch::RDNA4);
+    if !is_rdna3_or_rdna4 {
+        return false; // CDNA or older RDNA lacks WMMA.
+    }
+    arch_capability(arch).supports(mode)
+}
+
+/// Runtime variant: detect the arch from the actual device and classify WMMA.
+pub fn wmma_supported_on_device(device: i32, mode: QuantMode) -> bool {
+    wmma_supported(gcn_arch(&detect_gpu_arch(device)), mode)
+}
+
+/// Dispatch gate for a WMMA-backed GEMM. Returns the resolved mode or `Err`.
+pub fn wmma_dispatch(arch: &str, requested: QuantMode) -> Result<QuantMode, &'static str> {
+    let a = gcn_arch(arch);
+    if wmma_supported(a, requested) {
+        Ok(requested)
+    } else if !matches!(a, GcnArch::RDNA3 | GcnArch::RDNA4) {
+        Err("no WMMA matrix cores on this architecture; CDNA uses MFMA, older RDNA uses JIT HIP")
+    } else {
+        match requested {
+            QuantMode::Fp8 => Err("no native fp8 WMMA on this RDNA arch; downshift via resolve_quant_mode"),
+            _ => Err("requested WMMA mode unavailable; fall back to fp32 path"),
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
 // F8 — Composable Kernel (CK) dispatch
 // ---------------------------------------------------------------------------
 
