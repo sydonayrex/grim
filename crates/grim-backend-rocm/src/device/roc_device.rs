@@ -90,7 +90,7 @@ use crate::{
     gpu_target_arch, gpu_target_flag, linear_launch, ROCM_COMPUTE_BLOCK,
     // Misc types
     RocmStorage, RocmCachingAllocator, RocmDeviceProps, RocmPinnedBuffer,
-    DecodeGemmConfig, QkvAttentionFusionConfig, RmsNormMatMulFusionConfig,
+    DecodeGemmConfig, FusedDequantGemmConfig, QkvAttentionFusionConfig, RmsNormMatMulFusionConfig,
     QuantMode,
 };
 
@@ -109,6 +109,7 @@ pub struct RocmDevice {
     /// with `handle_cache`/`stream_pool` (no async, plain
     /// `std::sync::Mutex`).
     pub(crate) decode_gemm_config: Mutex<DecodeGemmConfig>,
+    pub(crate) fused_dequant_gemm_config: Mutex<FusedDequantGemmConfig>,
     /// Caching device-memory allocator (size-bucketed free-list). See `RocmCachingAllocator`.
     pub(crate) allocator: Arc<RocmCachingAllocator>,
     /// Phase-3 §3.1: device scratch pool — a thread-safe, power-of-2-bucketed
@@ -228,6 +229,7 @@ impl RocmDevice {
             captured_graphs: Mutex::new(HashMap::new()),
             batched_gemm_warmed: AtomicBool::new(false),
             decode_gemm_config: Mutex::new(DecodeGemmConfig::default()),
+            fused_dequant_gemm_config: Mutex::new(FusedDequantGemmConfig::default()),
         }
     }
 
@@ -244,6 +246,12 @@ impl RocmDevice {
     /// pattern consistency.
     pub fn set_decode_gemm_enabled(&self, enabled: bool) {
         let mut cfg = self.decode_gemm_config.lock().unwrap();
+        cfg.enabled = enabled;
+    }
+
+    /// Set whether fused dequantization GEMM is enabled (WI-C).
+    pub fn set_fused_dequant_gemm_enabled(&self, enabled: bool) {
+        let mut cfg = self.fused_dequant_gemm_config.lock().unwrap();
         cfg.enabled = enabled;
     }
 
@@ -1853,6 +1861,81 @@ impl RocmDevice {
                 arg(&mut sa),
                 arg(&mut sb),
                 arg(&mut sc),
+            ],
+        )
+    }
+
+    /// Launch the JIT compiled fused dequantization matmul kernel (WI-C).
+    pub(crate) fn launch_fused_dequant_gemm_f16(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        b_scales_ptr: *const c_void,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        default_bpw: u8,
+        outlier_count: usize,
+        outlier_indices_ptr: *const c_void,
+        outlier_values_ptr: *const c_void,
+        backup_bpw: u8,
+        backup_codes_offset: usize,
+        backup_scale_offset: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm: a has no device ptr".into()))?;
+        let b_ptr = b_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm: b has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems = m * n;
+        let grid_x = ((total_elems + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut bsptr = b_scales_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        
+        let stride_a = k;     // A[M, K]
+        let stride_c = n;     // C[M, N]
+        let mut sa = stride_a as i32;
+        let mut sc = stride_c as i32;
+        
+        let mut bpw_val = default_bpw as i32;
+        let mut out_cnt = outlier_count as i32;
+        let mut out_idx_ptr = outlier_indices_ptr;
+        let mut out_val_ptr = outlier_values_ptr;
+        
+        let mut b_bpw = backup_bpw as i32;
+        let mut b_codes_off = backup_codes_offset as i32;
+        let mut b_scale_off = backup_scale_offset as i32;
+
+        self.launch_compute_kernel(
+            "grim_fused_dequant_gemm_f16",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut bsptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut sa),
+                arg(&mut sc),
+                arg(&mut bpw_val),
+                arg(&mut out_cnt),
+                arg(&mut out_idx_ptr),
+                arg(&mut out_val_ptr),
+                arg(&mut b_bpw),
+                arg(&mut b_codes_off),
+                arg(&mut b_scale_off),
             ],
         )
     }

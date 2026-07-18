@@ -40,6 +40,7 @@ pub struct DecodeGraphKey {
     pub head_dim: u32,
     pub num_heads: u32,
     pub num_kv_heads: u32,
+    pub fused_dequant: bool,
 }
 
 /// A captured HIP graph plus its instantiated executable. Both handles
