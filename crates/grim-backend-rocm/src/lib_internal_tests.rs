@@ -279,6 +279,25 @@ mod tests {
         assert!(res.is_ok(), "Failed to JIT compile grim_qkv_attention with large head_dim support: {:?}", res.err());
     }
 
+    #[test]
+    fn test_wmma_capability_gates() {
+        use crate::device::accel_features::{wmma_supported, wmma_dispatch};
+        use crate::quantization::{GcnArch, QuantMode};
+
+        // RDNA3 and RDNA4 support WMMA for native modes
+        assert!(wmma_supported(GcnArch::RDNA3, QuantMode::F16));
+        assert!(wmma_supported(GcnArch::RDNA4, QuantMode::Fp8));
+        
+        // CDNA and RDNA1/2 do not support WMMA
+        assert!(!wmma_supported(GcnArch::CDNA2, QuantMode::F16));
+        assert!(!wmma_supported(GcnArch::RDNA1, QuantMode::F16));
+
+        // dispatch checks
+        assert_eq!(wmma_dispatch("gfx1100", QuantMode::F16), Ok(QuantMode::F16));
+        assert!(wmma_dispatch("gfx90a", QuantMode::F16).is_err());
+        assert!(wmma_dispatch("gfx1100", QuantMode::Fp8).is_err()); // gfx1100 (RDNA3) doesn't support FP8
+    }
+
     // ------------------------------------------------------------------------
     // align_tensor_for_rocm_gemm tests
     // ------------------------------------------------------------------------
