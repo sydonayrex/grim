@@ -14,7 +14,7 @@
 //!   panics; errors surface as `grim_tensor::Result`.
 //! - `clean-code-guard` — no `unwrap()` in tests; `?`-bubble + `assert_*`.
 
-use grim_backend_rocm::rccl::{p2p_memcpy_async, CollectiveConfig, RocmComm, UniqueId};
+use grim_backend_rocm::rccl::{p2p_memcpy_async, CollectiveConfig, UniqueId};
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<R = ()> = Result<R, TestError>;
