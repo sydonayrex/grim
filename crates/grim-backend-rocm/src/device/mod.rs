@@ -25,6 +25,8 @@ pub mod gemm_tuning;
 pub mod handles;
 pub mod helpers;
 pub mod layout;
+pub mod accel_features;
+pub mod accel_ffi;
 pub mod probe;
 pub mod rocblas;
 pub mod roc_device;

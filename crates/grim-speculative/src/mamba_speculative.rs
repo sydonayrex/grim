@@ -15,18 +15,18 @@ pub struct MambaStepState {
 
 pub struct MambaSpeculativeEngine {
     state_history: Vec<MambaStepState>,
-    d_model: usize,
-    d_state: usize,
-    d_conv: usize,
+    _d_model: usize,
+    _d_state: usize,
+    _d_conv: usize,
 }
 
 impl MambaSpeculativeEngine {
     pub fn new(d_model: usize, d_state: usize, d_conv: usize) -> Self {
         Self {
             state_history: Vec::new(),
-            d_model,
-            d_state,
-            d_conv,
+            _d_model: d_model,
+            _d_state: d_state,
+            _d_conv: d_conv,
         }
     }
 

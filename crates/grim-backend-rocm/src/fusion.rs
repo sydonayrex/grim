@@ -105,3 +105,47 @@ impl QkvAttentionFusionConfig {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// WI 2.4.4-2 — decode GEMM config (Rust-centric, replaces vendored CK wrapper).
+//
+// grim is Rust-centric: there is no `ck_gemm.cpp` and no `ck` cargo feature.
+// The decode-shaped F16 GEMM lives in `kernels::decode_gemm::KERNEL_SOURCE`
+// and is JIT-compiled at runtime through the same `hipModuleLoad` path
+// every grim compute kernel uses. Dispatch from `RocmDevice::matmul` is
+// gated by this config's `enabled` flag (default off), matching the
+// `QkvAttentionFusionConfig::enabled` pattern from this same file.
+//
+// Per-plan gating rules (`grim_rocm_consumer_perf_plan.md` WI 2.4.4-2c):
+//   - `enabled` must be `true` for dispatch to skip rocBLAS.
+//   - dtype must be FP16 (CK-style kernel is F16-only; BF16/F32 are out of
+//     scope per plan limits).
+//   - `m <= 8` (the only decode M-slot the 8×64×64 tile is shaped for).
+//   - Otherwise the kernel is skipped and rocBLAS handles the GEMM as today.
+//
+// perf gate (WI 2.6.4): the flag should NOT be flipped to `true` until a
+// positive benchmark vs. rocBLAS is in hand. Plan §2.4.4-4 (SMALL-BATCH-MC)
+// warns that double-buffered LDS can *reduce* decode throughput vs. plain
+// rocBLAS when m is already tiny.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeGemmConfig {
+    /// Runtime gate: `false` = always use rocBLAS, `true` = dispatch to the
+    /// JIT'd `grim_decode_gemm_f16` kernel subject to the dtype/M filter
+    /// in `RocmDevice::matmul`.
+    pub enabled: bool,
+    /// Wavefront size of the active arch. Tile geometry is the same for
+    /// wave32 and wave64 (the kernel sizes the block to 256 and divides
+    /// by `warpSize` at runtime), but this is recorded so a future
+    /// architecture-specific tile resize hook (e.g. tile=128 on Wave32
+    /// to keep occupancy) has the data it needs without an env lookup.
+    pub wavefront_size: u32,
+}
+
+impl Default for DecodeGemmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            wavefront_size: 64,
+        }
+    }
+}

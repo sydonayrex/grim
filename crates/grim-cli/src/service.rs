@@ -8,8 +8,8 @@
 
 use std::path::PathBuf;
 use grim_tensor::error::{Error, Result};
-use rcgen::generate_simple_self_signed;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartPolicy {
     Never,
@@ -17,6 +17,7 @@ pub enum RestartPolicy {
     Always,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct HealthCheckConfig {
     pub endpoint: String,
@@ -25,6 +26,7 @@ pub struct HealthCheckConfig {
     pub failure_threshold: u32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ServiceConfig {
     pub name: String,
@@ -36,6 +38,7 @@ pub struct ServiceConfig {
     pub log_path: Option<PathBuf>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum ServiceStatus {
     Stopped,
@@ -51,6 +54,7 @@ pub trait ServiceManager: Send + Sync {
     fn start(&self) -> Result<()>;
     fn stop(&self) -> Result<()>;
     fn status(&self) -> Result<ServiceStatus>;
+    #[allow(dead_code)]
     fn reload_config(&self) -> Result<()>;
 }
 

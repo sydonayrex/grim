@@ -1,0 +1,16 @@
+.*
+!/.gitignore
+!/.gitattributes
+
+.a0proj/*
+target/*
+Cargo.lock
+fixplans/*
+usr/*
+Specs/*
+.cargo/
+old/*
+.rocm-2/*
+.rocm-3/*
+.rocm-4/*
+.zl/*

@@ -36,6 +36,21 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unused_variables = "warn"
+unused_mut = "warn"
+dead_code = "warn"
+unused_imports = "warn"
+unused_parens = "warn"
+non_snake_case = "warn"
+non_upper_case_globals = "warn"
+non_camel_case_types = "warn"
+unexpected_cfgs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
 [workspace.dependencies]
 # Internal crates
 grim-tensor        = { path = "crates/grim-tensor" }

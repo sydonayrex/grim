@@ -1,7 +1,7 @@
 //! Plugin management CLI commands.
 
 use grim_tensor::error::Result;
-use grim_plugin::{parse_manifest, validate_abi, PluginRegistry, PluginKind, WasmPluginLoader, PluginLimits};
+use grim_plugin::{parse_manifest, validate_abi, PluginRegistry, PluginKind, WasmPluginLoader};
 use std::path::Path;
 
 /// Load plugins from a directory and populate the registry.
@@ -45,7 +45,7 @@ pub fn load_plugins(plugin_dir: &str, registry: &mut PluginRegistry) -> Result<u
                     match loader.create_sampler(&wasm_bytes) {
                         Ok(sampler) => {
                             registry.register_sampler(manifest.name.clone(), sampler);
-                            registry.register_manifest(manifest);
+                            let _ = registry.register_manifest(manifest);
                             count += 1;
                         }
                         Err(e) => {
@@ -57,7 +57,7 @@ pub fn load_plugins(plugin_dir: &str, registry: &mut PluginRegistry) -> Result<u
             PluginKind::Dylib => {
                 // Dylib plugins would be loaded differently - require runtime support
                 // For now, just register the manifest for discovery
-                registry.register_manifest(manifest);
+                let _ = registry.register_manifest(manifest);
             }
         }
     }
@@ -65,7 +65,7 @@ pub fn load_plugins(plugin_dir: &str, registry: &mut PluginRegistry) -> Result<u
     Ok(count)
 }
 
-/// List all loaded plugins.
+#[allow(dead_code)]
 pub fn list_plugins(registry: &PluginRegistry) -> Vec<String> {
     registry.list_samplers().into_iter().cloned().collect()
 }

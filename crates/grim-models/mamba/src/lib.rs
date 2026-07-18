@@ -13,16 +13,17 @@
 //! a single linear SSM update per timestep, no conv1d mixing.
 
 use std::any::Any;
-use std::sync::Arc;
 
 use grim_backend_cpu::{cpu_tensor, CpuDevice};
 use grim_core::error::{Error, Result};
-use grim_core::model::{SsmState, StatefulSequence, Model, ModelConfig, ModalityHint};
-use grim_core::session::SessionT as _;
+use grim_core::model::{SsmState, StatefulSequence, Model, ModelConfig, ModalityHint, CausalLm, AdapterHandle};
 use grim_nn::{Linear, RmsNorm};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 
 mod rng;
+pub mod rwkv;
+
+pub use rwkv::{Rwkv, RwkvConfig};
 
 #[derive(Debug, Clone)]
 pub struct MambaConfig {
@@ -246,18 +247,18 @@ impl Mamba {
 
     pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: MambaConfig) -> Result<Self> {
         let tok_embeddings = grim_nn::Embedding::load(
-            &ws.pp("tok_embeddings"),
+            &ws.pp("token_embd"),
             cfg.vocab_size,
             cfg.hidden_size,
         )?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             layers.push(MambaBlock::load(
-                &ws.pp("layers").pp(&i.to_string()),
+                &ws.pp("blk").pp(&i.to_string()),
                 &cfg,
             )?);
         }
-        let norm = RmsNorm::load(&ws.pp("norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let norm = RmsNorm::load(&ws.pp("output_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
         let output = Linear::load(
             &ws.pp("output"),
             cfg.hidden_size,
@@ -276,9 +277,28 @@ impl Mamba {
 }
 
 impl MambaBlock {
-    pub fn load(_ws: &grim_nn::WeightSource<'_>, cfg: &MambaConfig) -> Result<Self> {
-        let mut rng = crate::rng::SimpleRng::new(0xAA00_BB00u64);
-        Ok(Self::random(cfg, &mut rng))
+    pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: &MambaConfig) -> Result<Self> {
+        let norm = RmsNorm::load(&ws.pp("attn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let in_proj = Linear::load(&ws.pp("ssm_in"), cfg.hidden_size, 2 * cfg.d_inner, false)?;
+        let out_proj = Linear::load(&ws.pp("ssm_out"), cfg.d_inner, cfg.hidden_size, false)?;
+
+        let conv = ws.get([cfg.d_inner, cfg.conv_kernel], "ssm_conv1d.weight")?.to_vec_f32()?;
+        let a_log = ws.get([cfg.d_inner, cfg.d_state], "ssm_a")?.to_vec_f32()?;
+        let d_param = ws.get([cfg.d_inner], "ssm_d")?.to_vec_f32()?;
+        let dt_bias = ws.get([cfg.d_inner], "ssm_dt.bias")?.to_vec_f32()?;
+
+        Ok(Self {
+            norm,
+            in_proj,
+            conv,
+            a_log,
+            d_param,
+            dt_bias,
+            out_proj,
+            d_state: cfg.d_state,
+            d_inner: cfg.d_inner,
+            d_conv: cfg.d_conv,
+        })
     }
 }
 
@@ -326,5 +346,22 @@ impl StatefulSequence for Mamba {
         let h = self.norm.forward(&h)?;
         let logits = self.output.forward(&h)?;
         Ok(logits)
+    }
+}
+
+impl CausalLm for Mamba {
+    fn new_session(&self) -> Box<dyn grim_core::session::SessionT> {
+        Box::new(grim_core::session::Inner::new(self.device.clone()))
+    }
+
+    fn forward(
+        &self,
+        _session: &mut dyn grim_core::session::SessionT,
+        input_ids: &Tensor,
+        _positions: &Tensor,
+        _adapters: &[AdapterHandle],
+    ) -> Result<Tensor> {
+        let mut state = self.init_state(1);
+        self.step(&mut *state, input_ids)
     }
 }

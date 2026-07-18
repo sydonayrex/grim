@@ -27,7 +27,7 @@ impl TensorProvider for MemProvider {
             .get(name)
             .cloned()
             .ok_or_else(|| grim_tensor::error::Error::Backend(format!("missing tensor: {name}")))?;
-        Ok(TensorMeta { dtype, provenance, shape })
+        Ok(TensorMeta { dtype, provenance, shape, fusion_mask: 0 })
     }
 }
 
@@ -56,7 +56,7 @@ fn align_tensor_for_rocm_gemm_returns_tensor_for_native_f32() {
 
     let t = ws.get(vec![2, 3], "t.weight").expect("get");
     let aligned = align_tensor_for_rocm_gemm(&t).expect("align");
-    assert_eq!(aligned.shape().dims(), &[2, 3]);
+    assert_eq!(aligned.shape().dims(), &[64, 3]);
 }
 
 #[test]
@@ -98,8 +98,8 @@ fn load_for_rocm_populates_down_up_alpha() {
     let ws = WeightSource::root(&provider, Device::Cpu);
 
     let lora = LoRAWeights::load_for_rocm(&ws, "blk.0", 2, 4).expect("load");
-    assert_eq!(lora.down_proj.shape().dims(), &[2, 4]);
-    assert_eq!(lora.up_proj.shape().dims(), &[4, 2]);
+    assert_eq!(lora.down_proj.shape().dims(), &[64, 4]);
+    assert_eq!(lora.up_proj.shape().dims(), &[64, 2]);
     // alpha_scale = alpha / rank = 16 / 2 = 8
     assert!((lora.alpha_scale - 8.0).abs() < 1e-6);
 }

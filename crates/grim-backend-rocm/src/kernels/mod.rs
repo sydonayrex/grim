@@ -3,6 +3,7 @@
 //! can co-evolve their HIP body and their Rust host launcher without
 //! touching the rest of the backend. Phase-1 qkv_attention lives here.
 
+pub mod decode_gemm;
 pub mod qkv_attention;
 pub mod compute_kernels;
 pub mod jit_cache;

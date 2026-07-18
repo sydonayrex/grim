@@ -13,14 +13,18 @@ use grim_tensor::{BackendDevice, BackendStorage, Shape};
 
 // ---------- CUDA FFI bindings ----------
 
+#[allow(non_upper_case_globals)]
 pub const cudaSuccess: i32 = 0;
+#[allow(non_upper_case_globals)]
 pub const cudaMemcpyHostToDevice: i32 = 1;
+#[allow(non_upper_case_globals)]
 pub const cudaMemcpyDeviceToHost: i32 = 2;
 
 pub const CUBLAS_STATUS_SUCCESS: i32 = 0;
 pub const CUBLAS_OP_N: i32 = 0;
 pub const CUBLAS_OP_T: i32 = 1;
 
+#[allow(dead_code)]
 unsafe extern "C" {
     fn cudaMalloc(devPtr: *mut *mut c_void, size: usize) -> i32;
     fn cudaFree(devPtr: *mut c_void) -> i32;

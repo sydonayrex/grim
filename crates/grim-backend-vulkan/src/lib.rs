@@ -4,7 +4,7 @@
 //! and `BackendStorage` traits from `grim-tensor` by wrapping Vulkan FFI bindings.
 
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::{ArithType, DType, QuantProvenance};

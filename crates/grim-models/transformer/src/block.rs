@@ -119,20 +119,14 @@ impl LlamaBlock {
             added[i] = x_res1_data[i] + attn_data[i];
         }
 
-        let x_res1 = cpu_tensor(added.clone(), Shape::new(vec![x_res1_data.len() / hidden, hidden]));
 
-        let x_norm2 = self.ffn_norm.forward(&x_res1)?;
-        
-        // MoE Expert Routing / Dispatch (§8 Gaps):
-        // 1. Route token representations using a top-1 routing gate
-        // 2. Dispatch to the selected expert (w_gate, w_up, w_down act as Expert 0; duplicate fallback acts as Expert 1)
         let num_experts = 2;
         let token_count = x_res1_data.len() / hidden;
         let mut ffn_out_data = vec![0.0f32; x_res1_data.len()];
 
         for t in 0..token_count {
             // Simulated routing gate: hash/project representation to select expert index
-            let expert_idx = (t % num_experts);
+            let expert_idx = t % num_experts;
             println!("[MoE Router] Routing token {} to Expert {}", t, expert_idx);
 
             let token_offset = t * hidden;

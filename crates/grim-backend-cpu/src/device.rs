@@ -417,6 +417,7 @@ fn oxiblas_sgemm(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: usize, k: u
 /// WHY kept: serves as the exact reference implementation that correctness
 /// tests compare OxiBLAS results against, and as the compile target when
 /// `--no-default-features` is set (fuzz builds, embedded, etc.).
+#[allow(dead_code)]
 fn gemm_scalar(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: usize, k: usize) {
     for i in 0..m {
         for j in 0..n {

@@ -8,10 +8,19 @@
 //! > `rocm-profile`) is roughly constant after a warmup period, not O(N)
 //! > per allocation site.
 //!
-//! Strategy: capture `RocmDevice::allocator_stats()` once after a warmup,
-//! then run many small identical `upload_to_scratch` calls and re-check.
-//! If the allocator is doing its job, the count of raw `hipMalloc`
-//! calls stays flat — the pool is recycling the slot across calls.
+//! Strategy: drive the *caching* allocator (`RocmCachingAllocator`, the
+//! subject of Item 1) via the public `copy_from_host_async` path, which
+//! routes storage through `RocmStorage::alloc_gpu` -> `allocator.alloc`.
+//! Capture `RocmDevice::allocator_stats()` (the caching allocator's
+//! real `hipMalloc`/`hipFree` counters) once after a warmup, then run
+//! many identical uploads and re-check. If the allocator is doing its
+//! job, the count of raw `hipMalloc` calls stays flat — the pool is
+//! recycling the slot across calls.
+//!
+//! NOTE: `upload_to_scratch` intentionally routes through the separate
+//! `DeviceScratchPool` (Phase-3 §3.1), which has its own counters and is
+//! NOT what `allocator_stats()` reports. Asserting the caching
+//! allocator's stats against the scratch pool would always read 0.
 
 use std::sync::Arc;
 
@@ -22,13 +31,13 @@ fn gpu_tests_enabled() -> bool {
     std::env::var("GRIM_RUN_GPU_TESTS").is_ok()
 }
 
-/// One warmup + a large loop of `upload_to_scratch`. The number of
-/// `hipMalloc` calls observed at the end must equal the count at the
+/// One warmup + a large loop of `copy_from_host_async` uploads. The number
+/// of `hipMalloc` calls observed at the end must equal the count at the
 /// end of warmup (within a small fudge for path-finding). This proves
-/// the pool is recycling the same bucket slot across calls, not
+/// the caching pool is recycling the same bucket slot across calls, not
 /// re-allocating per invocation.
 #[test]
-fn upload_to_scratch_does_not_grow_malloc_count_per_call() {
+fn copy_from_host_async_does_not_grow_malloc_count_per_call() {
     if !gpu_tests_enabled() {
         eprintln!("[skipped: GRIM_RUN_GPU_TESTS not set]");
         return;
@@ -38,12 +47,11 @@ fn upload_to_scratch_does_not_grow_malloc_count_per_call() {
     let shape = Shape::from_slice(&[64]);
     let data: Vec<f32> = (0..64).map(|i| i as f32 * 0.01).collect();
 
-    // Warmup: drop the buffer so the pool registers one bucket hit.
+    // Warmup: drop the buffer so the caching pool registers one bucket hit.
     for _ in 0..4 {
-        let _buf = std::sync::Arc::new(
-            dev.upload_to_scratch(&data, &shape, DType::F32)
-                .expect("warmup upload_to_scratch"),
-        );
+        let _buf = dev
+            .copy_from_host_async(&data, &shape, DType::F32)
+            .expect("warmup copy_from_host_async");
     }
     let (malloc_after_warmup, _free_after_warmup) = dev.allocator_stats();
     assert!(
@@ -55,9 +63,9 @@ fn upload_to_scratch_does_not_grow_malloc_count_per_call() {
     let iters: usize = 64;
     for _ in 0..iters {
         let buf = dev
-            .upload_to_scratch(&data, &shape, DType::F32)
-            .expect("steady-state upload_to_scratch");
-        drop(buf); // explicit Drop returns the slot to the pool
+            .copy_from_host_async(&data, &shape, DType::F32)
+            .expect("steady-state copy_from_host_async");
+        drop(buf); // explicit Drop returns the slot to the caching pool
     }
 
     let (malloc_after_steady, free_after_steady) = dev.allocator_stats();

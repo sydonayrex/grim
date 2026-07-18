@@ -8,11 +8,21 @@ pub mod lora;
 pub mod model;
 pub mod native_mtp;
 pub mod rng;
+pub mod lfm2;
+pub mod gpt2;
+pub mod gemma;
+pub mod deepseek;
+pub mod t5;
 
 pub use block::{LlamaBlock, LlamaConfigRefs};
 pub use lora::apply_adapters_to_logits;
 pub use model::{Llama, LlamaConfig};
 pub use native_mtp::{LlamaMtp, MtpDepthProvider};
+pub use lfm2::{Lfm2, Lfm2Config};
+pub use gpt2::{Gpt2, Gpt2Config};
+pub use gemma::{Gemma, GemmaConfig};
+pub use deepseek::{DeepSeek, DeepSeekConfig};
+pub use t5::{T5, T5Config};
 
 #[cfg(test)]
 mod tests {

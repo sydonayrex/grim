@@ -25,33 +25,35 @@ pub fn gemm_f32_simd(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn gemm_f32_avx2(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
-    for i in 0..m {
-        for j in 0..n {
-            let mut sum = _mm256_setzero_ps();
-            let mut kk = 0;
-            
-            // Process 8 elements at a time
-            while kk + 8 <= k {
-                let a_vec = _mm256_loadu_ps(a.as_ptr().add(i * k + kk));
-                let b_vec = _mm256_loadu_ps(b.as_ptr().add(j * k + kk));
-                sum = _mm256_fmadd_ps(a_vec, b_vec, sum);
-                kk += 8;
+    unsafe {
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = _mm256_setzero_ps();
+                let mut kk = 0;
+                
+                // Process 8 elements at a time
+                while kk + 8 <= k {
+                    let a_vec = _mm256_loadu_ps(a.as_ptr().add(i * k + kk));
+                    let b_vec = _mm256_loadu_ps(b.as_ptr().add(j * k + kk));
+                    sum = _mm256_fmadd_ps(a_vec, b_vec, sum);
+                    kk += 8;
+                }
+                
+                // Horizontal sum of AVX2 register
+                let sum_high = _mm256_extractf128_ps::<1>(sum);
+                let sum_low = _mm256_castps256_ps128(sum);
+                let sum = _mm_add_ps(sum_low, sum_high);
+                
+                let mut sum_arr = [0.0f32; 4];
+                _mm_storeu_ps(sum_arr.as_mut_ptr(), sum);
+                let mut total = sum_arr.iter().sum::<f32>();
+                
+                // Handle remaining elements
+                for kk_rem in kk..k {
+                    total += a[i * k + kk_rem] * b[j * k + kk_rem];
+                }
+                c[i * n + j] = total;
             }
-            
-            // Horizontal sum of AVX2 register
-            let sum_high = _mm256_extractf128_ps::<1>(sum);
-            let sum_low = _mm256_castps256_ps128(sum);
-            let sum = _mm_add_ps(sum_low, sum_high);
-            
-            let mut sum_arr = [0.0f32; 4];
-            _mm_storeu_ps(sum_arr.as_mut_ptr(), sum);
-            let mut total = sum_arr.iter().sum::<f32>();
-            
-            // Handle remaining elements
-            for kk_rem in kk..k {
-                total += a[i * k + kk_rem] * b[j * k + kk_rem];
-            }
-            c[i * n + j] = total;
         }
     }
 }

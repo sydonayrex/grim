@@ -1,7 +1,7 @@
-//! `TensorProvider` implementations for GGUF and safetensors files.
+//! `TensorProvider` implementations for GGUF, native `.grim`, and safetensors files.
 //!
 //! Each implements `TensorProvider` so `WeightSource` can walk checkpoints
-//! without caring whether they came from GGUF or safetensors.
+//! without caring whether they came from GGUF, native `.grim`, or safetensors.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -15,6 +15,7 @@ use crate::gguf::{
     read_gguf, read_tensor_bytes, GgufDType, GgufFile, GgufTensorInfo, GrimFusionOp, GrimMetadata,
     GrimQuantOverride, GrimTrainQuantMode,
 };
+use crate::format::{GrimFile, GrimTensorEntry, read_normals, read_outliers};
 use crate::safetensors::{read_safetensor_bytes, read_safetensors_header, SafetensorInfo};
 
 /// GGUF-backed `TensorProvider`. Holds the parsed file index and wraps a
@@ -136,54 +137,12 @@ impl GgufProvider {
     }
 }
 
-/// Maps a `GgufDType` to a grim `DType` using the built-in GGUF mapping.
+/// Maps a `GgufDType` to a grim `DType` using the canonical mapping.
+///
+/// Delegates to [`crate::gguf::map_gguf_dtype_to_storage`] so there is a
+/// single source of truth for GGUF→DType conversion.
 fn dtype_from_gguf(gguf_dtype: GgufDType) -> DType {
-    match gguf_dtype {
-        GgufDType::F16 => DType::F16,
-        GgufDType::F32 => DType::F32,
-        GgufDType::I8 => DType {
-            arith: grim_tensor::ArithType::U8,
-            storage: Storage::Native,
-        },
-        // K-quants: store the quantization scheme so dequant kernels know the layout
-        GgufDType::Q2K => DType {
-            arith: grim_tensor::ArithType::F32,
-            storage: Storage::KQuant(KQuantScheme::Q2K),
-        },
-        GgufDType::Q3K => DType {
-            arith: grim_tensor::ArithType::F32,
-            storage: Storage::KQuant(KQuantScheme::Q3K),
-        },
-        GgufDType::Q4K => DType {
-            arith: grim_tensor::ArithType::F32,
-            storage: Storage::Block(grim_tensor::dtype::BlockDtype::Fp4),
-        },
-        GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 => DType {
-            arith: grim_tensor::ArithType::F32,
-            storage: Storage::KQuant(KQuantScheme::Q4K),
-        },
-        GgufDType::Q5K => DType {
-            arith: grim_tensor::ArithType::F32,
-            storage: Storage::Block(grim_tensor::dtype::BlockDtype::Nf4),
-        },
-        GgufDType::Q5_0 | GgufDType::Q5_1 => DType {
-            arith: grim_tensor::ArithType::F32,
-            storage: Storage::KQuant(KQuantScheme::Q5K),
-        },
-        GgufDType::Q6K => DType {
-            arith: grim_tensor::ArithType::F32,
-            storage: Storage::Block(grim_tensor::dtype::BlockDtype::Fp8),
-        },
-        GgufDType::Q8K | GgufDType::Q8_0 | GgufDType::Q8_1 | GgufDType::Q8_1Hx => DType {
-            arith: grim_tensor::ArithType::F32,
-            storage: Storage::KQuant(KQuantScheme::Q80),
-        },
-        GgufDType::IQ4_NL => DType {
-            arith: grim_tensor::ArithType::F32,
-            storage: Storage::KQuant(KQuantScheme::IQ4NL),
-        },
-        _ => DType::F32,
-    }
+    crate::gguf::map_gguf_dtype_to_storage(gguf_dtype)
 }
 
 /// Resolves the effective dtype for a tensor, applying any `.grim` per-tensor
@@ -220,6 +179,7 @@ impl TensorProvider for GgufProvider {
             dtype,
             provenance: QuantProvenance::GrimNative,
             shape: info.shape(),
+            fusion_mask: 0,
         })
     }
 }
@@ -280,7 +240,120 @@ impl TensorProvider for SafetensorsProvider {
             dtype: info.grim_dtype(),
             provenance: QuantProvenance::GrimNative,
             shape: info.shape(),
+            fusion_mask: 0,
         })
+    }
+}
+
+/// Native `.grim`-backed `TensorProvider`.
+///
+/// Opens a file with the `GRIM\x01` magic header, parses the JSON metadata
+/// layer and tensor registry, and lazily reads normals + outliers streams
+/// on `get()`. The returned `RawTensor.bytes` contains the raw packed
+/// normals; callers that need outlier correction read them separately via
+/// the [`crate::format`] helpers.
+pub struct GrimProvider {
+    file: GrimFile,
+    reader: std::sync::Mutex<BufReader<File>>,
+}
+
+impl GrimProvider {
+    /// Open a native `.grim` file for reading.
+    pub fn open(path: &str) -> Result<Self> {
+        let f = File::open(path)
+            .map_err(|e| Error::Backend(format!("cannot open .grim file '{path}': {e}")))?;
+        let mut reader = BufReader::new(f);
+        let file = GrimFile::read(&mut reader)?;
+
+        // Reopen for lazy reads — the BufReader above was consumed by the parse.
+        let f = File::open(path)
+            .map_err(|e| Error::Backend(format!("cannot reopen .grim file '{path}': {e}")))?;
+        let reader = std::sync::Mutex::new(BufReader::new(f));
+        Ok(Self { file, reader })
+    }
+
+    /// Access the parsed `.grim` metadata.
+    pub fn grim_metadata(&self) -> &GrimMetadata {
+        &self.file.metadata
+    }
+
+    /// Look up the per-tensor capability extension for `name`, if any.
+    ///
+    /// Returns `None` for plain version-1 tensors that carry no extension
+    /// declaration. Callers can use `GrimTensorExt::is_legacy()` to detect
+    /// the default (zeroed) extension.
+    pub fn ext_for(&self, name: &str) -> Option<&crate::spec::GrimTensorExt> {
+        self.file.metadata.ext_entries.iter().find(|e| e.tensor_name == name)
+    }
+
+    /// Access the tensor registry.
+    pub fn tensors(&self) -> &[GrimTensorEntry] {
+        &self.file.tensors
+    }
+
+    /// Read the outliers stream for a tensor (lazily, from disk).
+    pub fn outliers(&self, name: &str) -> Result<Vec<crate::format::GrimOutlier>> {
+        let entry = self.file.tensor(name).ok_or_else(|| {
+            Error::Backend(format!("tensor '{name}' not found in .grim file"))
+        })?;
+        let mut reader = self.reader.lock().unwrap();
+        read_outliers(&mut *reader, entry)
+    }
+}
+
+impl TensorProvider for GrimProvider {
+    fn get(&self, name: &str) -> Result<RawTensor> {
+        let entry = self.file.tensor(name).ok_or_else(|| {
+            Error::Backend(format!("tensor '{name}' not found in .grim file"))
+        })?;
+        let mut reader = self.reader.lock().unwrap();
+        let bytes = read_normals(&mut *reader, entry)?;
+        Ok(RawTensor {
+            bytes,
+            shape: entry.shape.clone(),
+            dtype: dtype_from_bitwidth(entry.base_bitwidth),
+            provenance: QuantProvenance::GrimNative,
+        })
+    }
+
+    fn meta(&self, name: &str) -> Result<TensorMeta> {
+        let entry = self.file.tensor(name).ok_or_else(|| {
+            Error::Backend(format!("tensor '{name}' not found in .grim file"))
+        })?;
+        let fusion_mask = self
+            .ext_for(name)
+            .map(|ext| ext.fusion_mask)
+            .unwrap_or(0);
+        Ok(TensorMeta {
+            dtype: dtype_from_bitwidth(entry.base_bitwidth),
+            provenance: QuantProvenance::GrimNative,
+            shape: entry.shape.clone(),
+            fusion_mask,
+        })
+    }
+}
+
+/// Map a `.grim` base bitwidth to the arithmetic `DType` used for dequant.
+///
+/// The packed normals are stored at `base_bitwidth` bits per weight; the
+/// arithmetic type is always F32 (dequantized). The storage layer carries
+/// the bitwidth so dequant kernels know how to unpack.
+fn dtype_from_bitwidth(base_bitwidth: u8) -> DType {
+    match base_bitwidth {
+        16 => DType::F16,
+        8 => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q80),
+        },
+        4 => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::Block(grim_tensor::dtype::BlockDtype::Fp4),
+        },
+        3 | 2 => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q2K),
+        },
+        _ => DType::F32,
     }
 }
 
@@ -426,5 +499,99 @@ mod tests {
 
         let d_q80 = super::dtype_from_gguf(GgufDType::Q8_0);
         assert_eq!(d_q80.storage, Storage::KQuant(KQuantScheme::Q80));
+    }
+
+    /// Write a minimal native `.grim` file to a temp path, then open it
+    /// with `GrimProvider` and verify `meta`/`get` round-trip the registry.
+    fn write_minimal_grim_file(path: &std::path::Path) {
+        use crate::format::{GrimFile, GrimHeader, GrimTensorEntry, OUTLIER_RECORD_BYTES};
+        use crate::gguf::{GrimMetadata, GrimRocmlProfile};
+        use std::collections::HashMap;
+        use std::io::Cursor;
+
+        let metadata = GrimMetadata {
+            magic: Some("grim-v1".into()),
+            quant_version: Some(1),
+            rocml_profile: GrimRocmlProfile::Rdna3,
+            wavefront_size: 64,
+            target_gcn: Some("gfx1100".into()),
+            ..Default::default()
+        };
+
+        let tensor = GrimTensorEntry {
+            name: "layer.0.weight".into(),
+            shape: vec![4, 4],
+            base_bitwidth: 4,
+            payload_offset: 0,
+            payload_size: 16, // 16 elements * 4 bits / 8 = 8 bytes, padded
+            outlier_count: 1,
+            outlier_offset: 0,
+        };
+
+        let grim_file = GrimFile {
+            header: GrimHeader::new(1, 0),
+            metadata,
+            tensors: vec![tensor.clone()],
+            tensors_by_name: HashMap::new(),
+        };
+
+        let mut buf = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        let written = grim_file.write(&mut cursor).unwrap();
+        let entry = &written[0];
+        let normals_bytes = entry.payload_size as usize;
+
+        // Pad from buf end to payload_offset, append normals, then the single outlier.
+        let current_len = buf.len();
+        if (current_len as u64) < entry.payload_offset {
+            buf.resize(entry.payload_offset as usize, 0u8);
+        }
+        buf.resize(buf.len() + normals_bytes, 0u8);
+        let outlier = crate::format::GrimOutlier { index: 0, value: 1.0 };
+        buf.extend_from_slice(&outlier.encode());
+
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    #[test]
+    fn grim_provider_opens_native_file_and_reads_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.grim");
+        write_minimal_grim_file(&path);
+
+        let provider = GrimProvider::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(provider.grim_metadata().magic.as_deref(), Some("grim-v1"));
+        assert_eq!(provider.grim_metadata().target_gcn.as_deref(), Some("gfx1100"));
+
+        let meta = provider.meta("layer.0.weight").unwrap();
+        assert_eq!(meta.shape, vec![4, 4]);
+    }
+
+    #[test]
+    fn grim_provider_reads_normals_and_outliers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.grim");
+        write_minimal_grim_file(&path);
+
+        let provider = GrimProvider::open(path.to_str().unwrap()).unwrap();
+        let tensor = provider.get("layer.0.weight").unwrap();
+        assert_eq!(tensor.shape, vec![4, 4]);
+        assert!(!tensor.bytes.is_empty());
+
+        let outliers = provider.outliers("layer.0.weight").unwrap();
+        assert_eq!(outliers.len(), 1);
+        assert_eq!(outliers[0].index, 0);
+        assert!((outliers[0].value - 1.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn grim_provider_rejects_unknown_tensor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.grim");
+        write_minimal_grim_file(&path);
+
+        let provider = GrimProvider::open(path.to_str().unwrap()).unwrap();
+        assert!(provider.get("nonexistent").is_err());
+        assert!(provider.meta("nonexistent").is_err());
     }
 }

@@ -11,6 +11,7 @@ grim-tensor = { workspace = true }
 grim-core = { workspace = true }
 grim-scheduler = { workspace = true }
 grim-engine = { workspace = true }
+grim-format = { workspace = true }
 grim-backend-rocm = { workspace = true }
 thiserror = { workspace = true }
 axum = "0.7"
