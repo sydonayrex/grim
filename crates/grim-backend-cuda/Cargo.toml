@@ -9,6 +9,7 @@ description = "CUDA (cudarc) compatibility backend for Grim."
 [dependencies]
 grim-tensor = { workspace = true }
 thiserror = { workspace = true }
+seahash = "4.0"
 
 [features]
 default = []

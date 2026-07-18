@@ -28,12 +28,30 @@ pub async fn cmd_run(model_path: String, prompt: Option<String>, serve: bool, ad
                 ordinal, wavefront, xnack
             );
             (Device::Rocm(ordinal), format!("rocm:{}", ordinal))
+        } else if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
+            if let Some(first) = cuda_devices.first() {
+                let ordinal = first.ordinal();
+                eprintln!("[grim] CUDA GPU {} detected", ordinal);
+                (Device::Cuda(ordinal), format!("cuda:{}", ordinal))
+            } else {
+                eprintln!("[grim] No GPU detected; using CPU backend.");
+                (Device::Cpu, "cpu".into())
+            }
         } else {
             eprintln!("[grim] No ROCm GPU detected; using CPU backend.");
             (Device::Cpu, "cpu".into())
         }
+    } else if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
+        if let Some(first) = cuda_devices.first() {
+            let ordinal = first.ordinal();
+            eprintln!("[grim] CUDA GPU {} detected", ordinal);
+            (Device::Cuda(ordinal), format!("cuda:{}", ordinal))
+        } else {
+            eprintln!("[grim] No GPU detected; using CPU backend.");
+            (Device::Cpu, "cpu".into())
+        }
     } else {
-        eprintln!("[grim] ROCm runtime not available; using CPU backend.");
+        eprintln!("[grim] GPU runtime not available; using CPU backend.");
         (Device::Cpu, "cpu".into())
     };
 

@@ -19,6 +19,7 @@ grim-models-mamba       = { workspace = true }
 grim-models-vision      = { workspace = true }
 grim-backend-cpu = { workspace = true }
 grim-backend-rocm = { workspace = true }
+grim-backend-cuda = { workspace = true }
 grim-speculative = { workspace = true }
 grim-plugin = { workspace = true }
 grim-format = { workspace = true }

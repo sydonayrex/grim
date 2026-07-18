@@ -48,6 +48,12 @@ rocm-kernel-macros = []
 # decode-GEMM kernel is an embedded HIP source literal in
 # `kernels::decode_gemm::KERNEL_SOURCE`, JIT-compiled at runtime. The
 cubecl = ["dep:cubecl", "dep:cubecl-hip", "dep:cubecl-runtime", "dep:cubecl-hip-sys"]
+# WI-R0 — RCCL (multi-GPU collectives) is OPTIONAL + discoverable.
+# OFF by default: single-GPU consumer builds never require librccl.so.
+# ON: build.rs emits the rccl link directive only when libcrccl.so*
+# resolves via RCCL_PATH / ROCM_RCCL_PATH / ROCM_PATH / standard
+# prefixes / workspace .rocm-N/lib (see build_rocm_detect.rs).
+rccl = []
 
 [dev-dependencies]
 grim-backend-cpu = { path = "../grim-backend-cpu" }
