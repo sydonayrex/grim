@@ -41,6 +41,38 @@ mod tests {
     }
 
     #[test]
+    fn try_new_propagates_hip_set_device_error() {
+        // P0 fix: hipSetDevice failure must surface via try_new rather than
+        // being silently dropped. On a host without ROCm, an out-of-range
+        // ordinal (e.g. 9999) yields an error from hipSetDevice. On a host
+        // with ROCm, the same out-of-range ordinal also errors. Either way
+        // the contract is: try_new returns Err, never silently constructs a
+        // wrong-device RocmDevice. The infallible `new()` wraps this and
+        // builds a fallback (no-stream) device instead.
+        let res = RocmDevice::try_new(9999);
+        assert!(res.is_err(), "try_new(9999) must Err on any host; got Ok");
+        match res {
+            Err(Error::Backend(msg)) => {
+                // The error message must name the failing call so a future
+                // debugger can trace it back to hipSetDevice.
+                assert!(
+                    msg.contains("hipSetDevice"),
+                    "error must mention hipSetDevice; got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_infallible_constructor_does_not_panic_on_bad_ordinal() {
+        // The infallible `new()` must never panic — it logs and falls back
+        // to a no-stream device. We assert only that it returns; the
+        // resulting device's later ops will Err cleanly.
+        let _dev = RocmDevice::new(9999);
+    }
+
+    #[test]
     fn rocblas_handle_cache_initializes_lazily() {
         // Without HIP installed, this returns an Error. We accept either.
         let dev = RocmDevice::new(0);
@@ -869,6 +901,98 @@ mod tests {
             with_qkv,
             "module cache reloaded qkv_attention across repeated dispatches"
         );
+    }
+
+    #[test]
+    fn test_module_cache_solution_index_keys() {
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        if !env {
+            return;
+        }
+
+        let dev = RocmDevice::new(0);
+
+        let a = dev.from_cpu(&vec![1.0f32; 16], &Shape::from_slice(&[4,4]), DType::F16).unwrap();
+        let b = dev.from_cpu(&vec![1.0f32; 16], &Shape::from_slice(&[4,4]), DType::F16).unwrap();
+        let out = dev.zeros(&Shape::from_slice(&[4,4]), DType::F16).unwrap();
+
+        let a_storage = a.as_any().downcast_ref::<RocmStorage>().unwrap();
+        let b_storage = b.as_any().downcast_ref::<RocmStorage>().unwrap();
+        let out_storage = out.as_any().downcast_ref::<RocmStorage>().unwrap();
+
+        let initial_loads = dev.module_load_stats();
+
+        let mut a_ptr = a_storage.device_ptr.unwrap();
+        let mut b_ptr = b_storage.device_ptr.unwrap();
+        let mut out_ptr = out_storage.device_ptr.unwrap();
+        let mut m = 4i32;
+        let mut n = 4i32;
+        let mut k = 4i32;
+        let mut sa = 4i32;
+        let mut sb = 4i32;
+        let mut sc = 4i32;
+
+        let grid_dim = HipDim3::new(1, 1, 1);
+        let block_dim = HipDim3::new(256, 1, 1);
+
+        dev.launch_compute_kernel_with_solution(
+            "grim_decode_gemm_f16",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a_ptr),
+                arg(&mut b_ptr),
+                arg(&mut out_ptr),
+                arg(&mut m),
+                arg(&mut n),
+                arg(&mut k),
+                arg(&mut sa),
+                arg(&mut sb),
+                arg(&mut sc),
+            ],
+            Some(42),
+        ).unwrap();
+
+        let loads_after_sol42 = dev.module_load_stats();
+        assert!(loads_after_sol42 > initial_loads);
+
+        dev.launch_compute_kernel_with_solution(
+            "grim_decode_gemm_f16",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a_ptr),
+                arg(&mut b_ptr),
+                arg(&mut out_ptr),
+                arg(&mut m),
+                arg(&mut n),
+                arg(&mut k),
+                arg(&mut sa),
+                arg(&mut sb),
+                arg(&mut sc),
+            ],
+            Some(42),
+        ).unwrap();
+        assert_eq!(dev.module_load_stats(), loads_after_sol42);
+
+        dev.launch_compute_kernel_with_solution(
+            "grim_decode_gemm_f16",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a_ptr),
+                arg(&mut b_ptr),
+                arg(&mut out_ptr),
+                arg(&mut m),
+                arg(&mut n),
+                arg(&mut k),
+                arg(&mut sa),
+                arg(&mut sb),
+                arg(&mut sc),
+            ],
+            Some(43),
+        ).unwrap();
+        assert!(dev.module_load_stats() > loads_after_sol42);
     }
 
     #[test]
