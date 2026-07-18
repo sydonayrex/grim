@@ -168,3 +168,18 @@ impl Default for FusedDequantGemmConfig {
         }
     }
 }
+
+/// Configuration for SplitK matmul reduction (WI-D).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitKGemmConfig {
+    /// Runtime gate: `false` = always clamp split_k to 1, `true` = allow split_k > 1 with reduction.
+    pub enabled: bool,
+}
+
+impl Default for SplitKGemmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+        }
+    }
+}
