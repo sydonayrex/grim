@@ -132,28 +132,22 @@ void grim_qkv_attention(
     const bool thread_active = d < head_dim;
 
     // Hardware-aware head-dim cap.
-    //   wave64  → ≤ 64 (lane_id ∈ [0, 64) covers the full head).
-    //   wave32  → ≤ 32 (lane_id ∈ [0, 32); > 32 would be unassigned).
-    if (head_dim > wave_size) {
-        if (thread_active) {
-            out[q_offset + d] = nanf("");
+    if (head_dim > 256) {
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = nanf("");
+            }
         }
         return;
     }
 
     // Per-wavefront partials published to LDS for the wave-0 merge. Sized to
-    // the worst-case 8 wavefronts (RDNA iGPU wave32 + block 256 host path);
-    // when wave_size=32 the host falls back to a single-wavefront launch so
-    // only entry [0] is touched. <2.1 KB total.
-    //
-    // NOTE: always allocate [8][64] (the max head_dim/wave_size). On wave32
-    // hardware the extra 32 lanes' slots are unused but harmless. Using a
-    // runtime ternary (`wave_size == 64 ? 64 : 32`) would make this a VLA
-    // (variable-length array) which is illegal for `__shared__` (static
-    // storage duration) in HIP/C++ — caught when JIT-compiling on gfx1036.
+    // the worst-case 8 wavefronts (RDNA iGPU wave32 + block 256 host path) and
+    // head dimensions up to 256.
     __shared__ float s_max[8];
     __shared__ float s_sum[8];
-    __shared__ float s_acc[8][64];
+    __shared__ float s_acc[8][256];
 
     // Causal KV range for this query: [0, hi) where hi = min(abs_i + 1, kv_seq_len).
     const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
@@ -165,7 +159,7 @@ void grim_qkv_attention(
     int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
     int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
 
-    float out_acc = 0.0f;
+    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float running_max = -1e30f;
     float running_sum = 0.0f;
 
@@ -178,7 +172,7 @@ void grim_qkv_attention(
         // Dot product Q.K for this head
         float score = 0.0f;
         #pragma unroll
-        for (int dim = 0; dim < 64; ++dim) {
+        for (int dim = 0; dim < 256; ++dim) {
             if (dim < head_dim) {
                 score += q[q_offset + dim] * k_head[j * (num_kv_heads * head_dim) + dim];
             }
@@ -192,7 +186,12 @@ void grim_qkv_attention(
         const float scale_new = expf(score - running_max);
 
         running_sum = running_sum * scale_old + scale_new;
-        out_acc = out_acc * scale_old + scale_new * v_head[j * (num_kv_heads * head_dim) + d];
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_head[j * (num_kv_heads * head_dim) + d];
+            }
+        }
     }
 
     // Publish per-wavefront partials to LDS. max/sum are wavefront-uniform
@@ -202,44 +201,41 @@ void grim_qkv_attention(
         s_max[wave_id] = running_max;
         s_sum[wave_id] = running_sum;
     }
-    // (d >= head_dim) leave the slot at its default 0 (harmless for the merge).
-    if (thread_active) {
-        s_acc[wave_id][d] = out_acc;
-    } else if (d < 64) {
-        s_acc[wave_id][d] = 0.0f;
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
     }
     __syncthreads();
 
     // Wave 0 merges the partials from every wave into one (max, sum, acc[d]).
-    // Each lane d merges its own data parallel to other lanes; the merge is
-    // a left-fold combine that adapts to any num_waves (4 on RDNA dGPU/ CDNA,
-    // 8 on RDNA iGPU with wave32). Pair-merge:
-    //   m_new = fmaxf(m_a, m_b)
-    //   sum_a' = sum_a * exp(m_a - m_new),  sum_b' = sum_b * exp(m_b - m_new)
-    //   sum_new = sum_a' + sum_b'  ;  acc_new = acc_a * exp(m_a - m_new) + acc_b * exp(m_b - m_new)
     if (wave_id != 0) return;
 
-    float m_final = s_max[0];
-    float sum_final = s_sum[0];
-    float acc_final = s_acc[0][d];
-    #pragma unroll
-    for (int w = 1; w < 8; ++w) {
-        if (w >= num_waves) break;
-        const float mw = s_max[w];
-        const float uw = s_sum[w];
-        const float aw = s_acc[w][d];
-        const float m_new = fmaxf(m_final, mw);
-        const float scale_a = expf(m_final - m_new);
-        const float scale_b = expf(mw - m_new);
-        sum_final = sum_final * scale_a + uw * scale_b;
-        acc_final = acc_final * scale_a + aw * scale_b;
-        m_final = m_new;
-    }
-
-    if (thread_active) {
-        // F5 guard: zero-output (e.g. empty KV) must not produce NaN.
-        const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
-        out[q_offset + d] = acc_final * inv_sum;
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            float m_final = s_max[0];
+            float sum_final = s_sum[0];
+            float acc_final = s_acc[0][d];
+            #pragma unroll
+            for (int w = 1; w < 8; ++w) {
+                if (w >= num_waves) break;
+                const float mw = s_max[w];
+                const float uw = s_sum[w];
+                const float aw = s_acc[w][d];
+                const float m_new = fmaxf(m_final, mw);
+                const float scale_a = expf(m_final - m_new);
+                const float scale_b = expf(mw - m_new);
+                sum_final = sum_final * scale_a + uw * scale_b;
+                acc_final = acc_final * scale_a + aw * scale_b;
+                m_final = m_new;
+            }
+            const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+            out[q_offset + d] = acc_final * inv_sum;
+        }
     }
 
     if (tid == 0) {
@@ -294,19 +290,21 @@ void grim_qkv_attention_paged(
     const int d = lane_id;
     const bool thread_active = d < head_dim;
 
-    if (head_dim > 64) {
-        if (thread_active) {
-            out[q_offset + d] = nanf("");
+    // Hardware-aware head-dim cap.
+    if (head_dim > 256) {
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = nanf("");
+            }
         }
         return;
     }
 
     // WI 1.4.2: per-wavefront partials published to LDS for the wave-0 merge.
-    // Sized [8] so the same kernel handles both wave32 (8 waves/block, RDNA iGPU)
-    // and wave64 (4 waves/block, RDNA dGPU / CDNA).
     __shared__ float s_max[8];
     __shared__ float s_sum[8];
-    __shared__ float s_acc[8][64];
+    __shared__ float s_acc[8][256];
 
     // Per-wavefront KV slice [j_start, j_end) over the flattened page/token
     // index space [0, kv_seq_len). Same stride partition as the non-paged kernel.
@@ -316,7 +314,7 @@ void grim_qkv_attention_paged(
     int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
     int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
 
-    float out_acc = 0.0f;
+    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float running_max = -1e30f;
     float running_sum = 0.0f;
 
@@ -335,28 +333,31 @@ void grim_qkv_attention_paged(
         // K/V page layout: [num_pages, page_size, num_kv_heads, head_dim]
         const int kv_offset = (physical_token_idx * num_kv_heads + kv_head) * head_dim;
         
-        float local_score = 0.0f;
-        if (thread_active) {
-            local_score = q[q_offset + d] * k_pages[kv_offset + d];
+        float score = 0.0f;
+        #pragma unroll
+        for (int dim = 0; dim < 256; ++dim) {
+            if (dim < head_dim) {
+                score += q[q_offset + dim] * k_pages[kv_offset + dim];
+            }
         }
+        score *= inv_sqrt_d;
         
-        float s = local_score;
-        for (int offset = wave_size / 2; offset > 0; offset >>= 1) {
-            s += __shfl_xor(s, offset);
-        }
-        s *= inv_sqrt_d;
-        
-        if (!thread_active) continue;
-        
-        float w = expf(s - running_max);
-        if (s > running_max) {
-            const float scale = expf(running_max - s);
+        float w = expf(score - running_max);
+        if (score > running_max) {
+            const float scale = expf(running_max - score);
             running_sum = running_sum * scale;
-            out_acc = out_acc * scale;
-            running_max = s;
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                out_acc[chunk] = out_acc[chunk] * scale;
+            }
+            running_max = score;
             w = 1.0f;
         }
-        out_acc += w * v_pages[kv_offset + d];
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out_acc[chunk] += w * v_pages[kv_offset + d];
+            }
+        }
         running_sum += w;
     }
 
@@ -365,36 +366,41 @@ void grim_qkv_attention_paged(
         s_max[wave_id] = running_max;
         s_sum[wave_id] = running_sum;
     }
-    if (thread_active) {
-        s_acc[wave_id][d] = out_acc;
-    } else if (d < 64) {
-        s_acc[wave_id][d] = 0.0f;
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
     }
     __syncthreads();
 
     // Wave 0 merges the partials from every wave into one (max, sum, acc[d]).
     if (wave_id != 0) return;
 
-    float m_final = s_max[0];
-    float sum_final = s_sum[0];
-    float acc_final = s_acc[0][d];
-    #pragma unroll
-    for (int w = 1; w < 8; ++w) {
-        if (w >= num_waves) break;
-        const float mw = s_max[w];
-        const float uw = s_sum[w];
-        const float aw = s_acc[w][d];
-        const float m_new = fmaxf(m_final, mw);
-        const float scale_a = expf(m_final - m_new);
-        const float scale_b = expf(mw - m_new);
-        sum_final = sum_final * scale_a + uw * scale_b;
-        acc_final = acc_final * scale_a + aw * scale_b;
-        m_final = m_new;
-    }
-
-    if (thread_active) {
-        const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
-        out[q_offset + d] = acc_final * inv_sum;
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            float m_final = s_max[0];
+            float sum_final = s_sum[0];
+            float acc_final = s_acc[0][d];
+            #pragma unroll
+            for (int w = 1; w < 8; ++w) {
+                if (w >= num_waves) break;
+                const float mw = s_max[w];
+                const float uw = s_sum[w];
+                const float aw = s_acc[w][d];
+                const float m_new = fmaxf(m_final, mw);
+                const float scale_a = expf(m_final - m_new);
+                const float scale_b = expf(mw - m_new);
+                sum_final = sum_final * scale_a + uw * scale_b;
+                acc_final = acc_final * scale_a + aw * scale_b;
+                m_final = m_new;
+            }
+            const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+            out[q_offset + d] = acc_final * inv_sum;
+        }
     }
 }
 
@@ -444,19 +450,21 @@ void grim_tree_attention(
     const int d = lane_id;
     const bool thread_active = d < head_dim;
 
-    if (head_dim > 64) {
-        if (thread_active) {
-            out[q_offset + d] = nanf("");
+    // Hardware-aware head-dim cap.
+    if (head_dim > 256) {
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out[q_offset + d] = nanf("");
+            }
         }
         return;
     }
 
     // WI 1.4.2: per-wavefront partials published to LDS for the wave-0 merge.
-    // Sized [8] so the same kernel handles both wave32 (8 waves/block, RDNA iGPU)
-    // and wave64 (4 waves/block, RDNA dGPU / CDNA).
     __shared__ float s_max[8];
     __shared__ float s_sum[8];
-    __shared__ float s_acc[8][64];
+    __shared__ float s_acc[8][256];
 
     // Per-wavefront KV slice [j_start, j_end) over the flattened page/token
     // index space [0, kv_seq_len). Same stride partition as the non-paged kernel.
@@ -466,7 +474,7 @@ void grim_tree_attention(
     int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
     int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
 
-    float out_acc = 0.0f;
+    float out_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float running_max = -1e30f;
     float running_sum = 0.0f;
 
@@ -484,28 +492,31 @@ void grim_tree_attention(
         
         const int kv_offset = ((batch_idx * kv_seq_len + j) * num_kv_heads + kv_head) * head_dim;
         
-        float local_score = 0.0f;
-        if (thread_active) {
-            local_score = q[q_offset + d] * k_tensor[kv_offset + d];
+        float score = 0.0f;
+        #pragma unroll
+        for (int dim = 0; dim < 256; ++dim) {
+            if (dim < head_dim) {
+                score += q[q_offset + dim] * k_tensor[kv_offset + dim];
+            }
         }
+        score *= inv_sqrt_d;
         
-        float s = local_score;
-        for (int offset = wave_size / 2; offset > 0; offset >>= 1) {
-            s += __shfl_xor(s, offset);
-        }
-        s *= inv_sqrt_d;
-        
-        if (!thread_active) continue;
-        
-        float w = expf(s - running_max);
-        if (s > running_max) {
-            const float scale = expf(running_max - s);
+        float w = expf(score - running_max);
+        if (score > running_max) {
+            const float scale = expf(running_max - score);
             running_sum = running_sum * scale;
-            out_acc = out_acc * scale;
-            running_max = s;
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                out_acc[chunk] = out_acc[chunk] * scale;
+            }
+            running_max = score;
             w = 1.0f;
         }
-        out_acc += w * v_tensor[kv_offset + d];
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            int d = lane_id + chunk * wave_size;
+            if (d < head_dim) {
+                out_acc[chunk] += w * v_tensor[kv_offset + d];
+            }
+        }
         running_sum += w;
     }
 
@@ -514,36 +525,41 @@ void grim_tree_attention(
         s_max[wave_id] = running_max;
         s_sum[wave_id] = running_sum;
     }
-    if (thread_active) {
-        s_acc[wave_id][d] = out_acc;
-    } else if (d < 64) {
-        s_acc[wave_id][d] = 0.0f;
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            s_acc[wave_id][d] = out_acc[chunk];
+        } else if (d < 256) {
+            s_acc[wave_id][d] = 0.0f;
+        }
     }
     __syncthreads();
 
     // Wave 0 merges the partials from every wave into one (max, sum, acc[d]).
     if (wave_id != 0) return;
 
-    float m_final = s_max[0];
-    float sum_final = s_sum[0];
-    float acc_final = s_acc[0][d];
-    #pragma unroll
-    for (int w = 1; w < 8; ++w) {
-        if (w >= num_waves) break;
-        const float mw = s_max[w];
-        const float uw = s_sum[w];
-        const float aw = s_acc[w][d];
-        const float m_new = fmaxf(m_final, mw);
-        const float scale_a = expf(m_final - m_new);
-        const float scale_b = expf(mw - m_new);
-        sum_final = sum_final * scale_a + uw * scale_b;
-        acc_final = acc_final * scale_a + aw * scale_b;
-        m_final = m_new;
-    }
-
-    if (thread_active) {
-        const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
-        out[q_offset + d] = acc_final * inv_sum;
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        int d = lane_id + chunk * wave_size;
+        if (d < head_dim) {
+            float m_final = s_max[0];
+            float sum_final = s_sum[0];
+            float acc_final = s_acc[0][d];
+            #pragma unroll
+            for (int w = 1; w < 8; ++w) {
+                if (w >= num_waves) break;
+                const float mw = s_max[w];
+                const float uw = s_sum[w];
+                const float aw = s_acc[w][d];
+                const float m_new = fmaxf(m_final, mw);
+                const float scale_a = expf(m_final - m_new);
+                const float scale_b = expf(mw - m_new);
+                sum_final = sum_final * scale_a + uw * scale_b;
+                acc_final = acc_final * scale_a + aw * scale_b;
+                m_final = m_new;
+            }
+            const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
+            out[q_offset + d] = acc_final * inv_sum;
+        }
     }
 }
 "#;

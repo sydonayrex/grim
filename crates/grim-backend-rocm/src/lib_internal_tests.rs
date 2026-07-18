@@ -268,6 +268,17 @@ mod tests {
         assert!(res.is_ok(), "Failed to JIT compile grim_split_k_reduction: {:?}", res.err());
     }
 
+    #[test]
+    fn test_qkv_attention_large_head_dim_compiles() {
+        if std::env::var("GRIM_RUN_GPU_TESTS").is_err() {
+            return;
+        }
+        let kernel_source = crate::kernels::source_asm::compute_kernel_source();
+        let target = detect_gpu_arch(0);
+        let res = jit_compile_hsaco(&kernel_source, "grim_qkv_attention", &target);
+        assert!(res.is_ok(), "Failed to JIT compile grim_qkv_attention with large head_dim support: {:?}", res.err());
+    }
+
     // ------------------------------------------------------------------------
     // align_tensor_for_rocm_gemm tests
     // ------------------------------------------------------------------------

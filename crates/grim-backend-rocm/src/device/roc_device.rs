@@ -2271,9 +2271,9 @@ impl RocmDevice {
         // Wave64 mandate: kernel block dim is 256 = 4 wavefronts of 64 on
         // gfx1036/gfx110x/gfx1200; head_dim must fit in one wave (≤ 64)
         // for the Phase-1 reference path (Phase 2 will tile).
-        if config.head_dim > 64 {
+        if config.head_dim > 256 {
             return Err(Error::Shape(format!(
-                "qkv_attention Phase 1 supports head_dim ≤ 64 (got {}); Phase 2 will tile via MFMA",
+                "qkv_attention Phase 2 supports head_dim <= 256 (got {})",
                 config.head_dim
             )));
         }
@@ -2448,10 +2448,9 @@ impl RocmDevice {
         }
         // Wave64 mandate: kernel block dim is 256 = 4 wavefronts of 64 on
         // gfx10xx / gfx11xx / gfx12xx; head_dim must fit in one wave (<=64).
-        if head_dim > 64 {
+        if head_dim > 256 {
             return Err(Error::Shape(format!(
-                "tree_attention Phase-2 supports head_dim <= 64 (got {}); \
-                 Phase-3 will tile via MFMA",
+                "tree_attention Phase-3 supports head_dim <= 256 (got {})",
                 head_dim
             )));
         }
