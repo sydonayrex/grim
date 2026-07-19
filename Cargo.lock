@@ -1274,6 +1274,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "chrono"
+version = "0.4.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
+dependencies = [
+ "iana-time-zone",
+ "js-sys",
+ "num-traits",
+ "serde",
+ "wasm-bindgen",
+ "windows-link 0.2.1",
+]
+
+[[package]]
 name = "ciborium"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4123,10 +4137,14 @@ dependencies = [
 name = "grim-cli"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
+ "futures-util",
  "grim-backend-cpu",
  "grim-backend-cuda",
+ "grim-backend-metal",
  "grim-backend-rocm",
+ "grim-backend-vulkan",
  "grim-core",
  "grim-engine",
  "grim-format",
@@ -4144,7 +4162,9 @@ dependencies = [
  "grim-tensor-graph",
  "rcgen",
  "reqwest 0.11.27",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "windows-service",
@@ -4174,9 +4194,15 @@ name = "grim-engine"
 version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
+ "grim-backend-cuda",
+ "grim-backend-rocm",
  "grim-core",
+ "grim-format",
+ "grim-kvquant",
  "grim-memory",
+ "grim-models-mamba",
  "grim-models-transformer",
+ "grim-models-vision",
  "grim-nn",
  "grim-scheduler",
  "grim-speculative",
@@ -4324,6 +4350,8 @@ name = "grim-nn"
 version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
+ "grim-backend-cuda",
+ "grim-backend-rocm",
  "grim-quant",
  "grim-tensor",
  "thiserror 1.0.69",
@@ -4371,6 +4399,7 @@ dependencies = [
  "grim-engine",
  "grim-format",
  "grim-models-transformer",
+ "grim-nn",
  "grim-scheduler",
  "grim-tensor",
  "rcgen",
@@ -7576,10 +7605,12 @@ dependencies = [
  "system-configuration",
  "tokio",
  "tokio-native-tls",
+ "tokio-util",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "winreg",
 ]
@@ -9788,6 +9819,19 @@ checksum = "8185ae345fa5687c054626ff9a50e7089797a343d9904d1dc9820eb4c4d3196f"
 dependencies = [
  "leb128fmt",
  "wasmparser 0.252.0",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

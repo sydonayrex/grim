@@ -48,10 +48,7 @@ pub struct QkvAttentionFusionConfig {
 
 impl Default for QkvAttentionFusionConfig {
     fn default() -> Self {
-        // Spec: `enabled` defaults to `false`. Detailed numeric defaults for
-        // the GQA / launch geometry match the Phase-1 contract (a typical
-        // 4:1 GQA Llama-style head layout); callers should always set
-        // `enabled` explicitly anyway.
+        // Spec: default config gates the kernel off until step 4 / benchmarking flips it.
         Self {
             enabled: false,
             num_heads: 32,
@@ -144,7 +141,7 @@ pub struct DecodeGemmConfig {
 impl Default for DecodeGemmConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             wavefront_size: 64,
         }
     }
@@ -163,7 +160,7 @@ pub struct FusedDequantGemmConfig {
 impl Default for FusedDequantGemmConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             wavefront_size: 64,
         }
     }
@@ -179,7 +176,7 @@ pub struct SplitKGemmConfig {
 impl Default for SplitKGemmConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
         }
     }
 }
@@ -237,7 +234,7 @@ pub struct WmmaGemmConfig {
 impl Default for WmmaGemmConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             wavefront_size: 64,
         }
     }

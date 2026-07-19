@@ -161,7 +161,7 @@ mod tests {
         assert_eq!(handle.viewport(), (1280, 720));
         assert_eq!(handle.debug_summary().panel_count, 3);
         assert_eq!(handle.debug_summary().toggle_count, 4);
-        assert_eq!(handle.debug_summary().mode_options_count, 3);
+        assert_eq!(handle.debug_summary().mode_options_count, 6);
     }
 
     #[test]

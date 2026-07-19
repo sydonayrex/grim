@@ -11,6 +11,7 @@ mod service;
 mod doctor;
 mod oxidizer;
 mod client;
+mod catalog;
 
 /// Grim inference engine CLI.
 #[derive(Parser)]
@@ -80,6 +81,10 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
     },
+    /// Show active loaded models (alias for status)
+    Ps,
+    /// List local cached models (alias for check)
+    List,
     /// Show loaded models, memory usage, and execution backend.
     Status,
     /// Check the local model cache and report completed and partial downloads.
@@ -314,34 +319,45 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Serve { address, config: _, plugins } => {
-            // `grim serve` — starts the HTTP server in a long-running mode with zero preloaded models.
+            // `grim serve` — starts the HTTP server. Scans the models directory
+            // for the first available model and loads its tokenizer automatically.
             let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
             eprintln!("[grim] serve: binding to {address} (Ollama-compatible)");
-            grim_server::serve(&address, engine).await?;
+            grim_server::serve(&address, engine, None).await?;
             let _ = plugins;
         }
         Commands::Run { model, prompt, serve, address, config: _, plugins } => {
             if serve {
                 let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-                if let Some(ref m) = model {
-                    let mock_model = Box::new(grim_models_transformer::Llama::random(
-                        grim_models_transformer::LlamaConfig {
-                            vocab_size: 32000,
-                            hidden_size: 512,
-                            num_heads: 8,
-                            num_kv_heads: 2,
-                            head_dim: 64,
-                            num_layers: 4,
-                            intermediate_size: 1024,
-                            rms_norm_eps: 1e-5,
-                            rope_theta: 10000.0,
-                            max_seq_len: 2048,
+                // Resolve model name → file path and load it into the engine.
+                let model_path = if let Some(ref m) = model {
+                    let p = catalog::resolve_model_path(m)
+                        .or_else(|| {
+                            // Direct file path fallback.
+                            let dp = std::path::Path::new(m);
+                            if dp.exists() { Some(dp.to_path_buf()) } else { None }
+                        });
+                    if let Some(ref path) = p {
+                        match grim_engine::model_loader::load_from_path(
+                            &path.display().to_string()
+                        ) {
+                            Ok(loaded) => engine.register_model(m, loaded),
+                            Err(e) => eprintln!("[grim] WARNING: could not load '{}': {e}", m),
                         }
-                    ));
-                    engine.register_model(m, mock_model);
-                }
+                    } else {
+                        eprintln!(
+                            "[grim] WARNING: model '{}' not found in catalog. \
+                             Starting server without a preloaded model. \
+                             Run 'grim pull {}' to download it.",
+                            m, m
+                        );
+                    }
+                    p
+                } else {
+                    None
+                };
                 eprintln!("[grim] serve: binding to {address} (Ollama-compatible)");
-                grim_server::serve(&address, engine).await?;
+                grim_server::serve(&address, engine, model_path).await?;
             } else {
                 let model_name = model.unwrap_or_else(|| "default".to_string());
                 // Local GGUF file path: bypass the cache/download gate and
@@ -355,15 +371,19 @@ async fn main() -> Result<()> {
                 {
                     model_name.clone()
                 } else {
-                    // Enforce download security boundary
-                    let model_path = client::validate_model_cached(&model_name)?;
+                    // Resolve from catalog (T1-2 fix: catalog lookup replaces old client:: call).
+                    let model_path = catalog::resolve_model_path(&model_name)
+                        .ok_or_else(|| grim_core::error::Error::Config(
+                            format!("Model '{}' not found. Run 'grim pull {}' to download it.",
+                                model_name, model_name)
+                        ))?;
                     model_path.to_string_lossy().into_owned()
                 };
                 if let Some(p) = prompt {
-                    println!("[grim run] Running prompt on cached model: {}", resolved);
+                    println!("[grim run] Running prompt on: {}", resolved);
                     run::cmd_run(resolved, Some(p), false, address, &plugins).await?;
                 } else {
-                    println!("[grim run] Starting interactive terminal session with: {}", model_name);
+                    println!("[grim run] Starting interactive session with: {}", model_name);
                     println!("Type your prompt below (Ctrl+C to exit):");
                     loop {
                         print!(">>> ");
@@ -388,10 +408,10 @@ async fn main() -> Result<()> {
         Commands::Dl { model, output } | Commands::Pull { model, output } => {
             client::download_model(&model, output).await?;
         }
-        Commands::Status => {
+        Commands::Status | Commands::Ps => {
             client::query_server_status("127.0.0.1:11434").await?;
         }
-        Commands::Check => {
+        Commands::Check | Commands::List => {
             client::check_model_cache()?;
         }
         Commands::Use { context, model } => {
@@ -493,7 +513,7 @@ async fn main() -> Result<()> {
                         println!("[Service] Running background daemon on port 11434");
                         let rt = tokio::runtime::Runtime::new().unwrap();
                         rt.block_on(async {
-                            let _ = grim_server::serve("127.0.0.1:11434", engine).await;
+                            let _ = grim_server::serve("127.0.0.1:11434", engine, None).await;
                         });
                     }
                 }
@@ -702,7 +722,7 @@ fn run_service_loop() -> Result<()> {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.spawn(async {
         let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-        let _ = grim_server::serve("127.0.0.1:11434", engine).await;
+        let _ = grim_server::serve("127.0.0.1:11434", engine, None).await;
     });
 
     let _ = shutdown_rx.recv();

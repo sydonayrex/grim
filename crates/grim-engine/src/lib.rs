@@ -13,6 +13,8 @@
 //! iteration to run the scheduler and execute the batch on every
 //! running request through the speculative wrapper.
 
+pub mod model_loader;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -53,6 +55,8 @@ pub struct EngineConfig {
     pub target_itl_ms: u64,
     /// Determinism mode for callers that care about reproducible outputs.
     pub determinism_mode: DeterminismMode,
+    /// Optional KV compressor for runtime KV cache quantization.
+    pub kv_compressor: Option<Arc<dyn grim_kvquant::KvCompressor>>,
 }
 
 impl Default for EngineConfig {
@@ -66,6 +70,7 @@ impl Default for EngineConfig {
             target_ttft_ms: 2000,
             target_itl_ms: 100,
             determinism_mode: DeterminismMode::Relaxed,
+            kv_compressor: None,
         }
     }
 }
@@ -102,11 +107,15 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(config: EngineConfig) -> Self {
-        let block_pool = Arc::new(std::sync::Mutex::new(KvBlockPool::new(
+        let mut pool = KvBlockPool::new(
             config.block_pool_capacity,
             config.num_kv_heads,
             config.head_dim,
-        )));
+        );
+        if let Some(comp) = &config.kv_compressor {
+            pool.attach_compressor(comp.clone());
+        }
+        let block_pool = Arc::new(std::sync::Mutex::new(pool));
         let admission = grim_scheduler::AdmissionController::new(config.target_ttft_ms, config.target_itl_ms);
         let mut scheduler = grim_scheduler::Scheduler::new(
             config.max_batched_tokens,
@@ -114,6 +123,7 @@ impl Engine {
             admission,
         );
         scheduler.determinism_mode = config.determinism_mode;
+
         Self {
             config,
             scheduler,

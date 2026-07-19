@@ -25,7 +25,14 @@ pub struct TrainingPanelV1 {
 
 impl TrainingPanelV1 {
     pub fn from_form(form: &HyperparamFormV1) -> Self {
-        let mode_options = vec!["LoRA".into(), "QLoRA".into(), "Bf16-Full".into()];
+        let mode_options = vec![
+            "LoRA".into(),
+            "QLoRA".into(),
+            "Bf16-Full".into(),
+            "GRPO".into(),
+            "DPO".into(),
+            "ORPO".into(),
+        ];
         // Conditional picker: shown for any mode that consumes quantized storage.
         let show_quant_format_picker = matches!(form.training_mode.as_str(), "QLoRA" | "LoRA");
         let quant_format_options = vec!["Q4_K".into(), "Q5_K".into(), "Q8_0".into()];
@@ -38,6 +45,18 @@ impl TrainingPanelV1 {
             "QLoRA" => (
                 "Training mode: QLoRA (quantized)".into(),
                 "Wider quant formats (Q5_K, Q8_0) preserve more signal but consume more VRAM.".into(),
+            ),
+            "GRPO" => (
+                "Training mode: GRPO (RL)".into(),
+                "Group Relative Policy Optimization for reinforcement learning.".into(),
+            ),
+            "DPO" => (
+                "Training mode: DPO (RL)".into(),
+                "Direct Preference Optimization for preference alignment.".into(),
+            ),
+            "ORPO" => (
+                "Training mode: ORPO (RL)".into(),
+                "Odds-Ratio Preference Optimization for joint SFT and alignment.".into(),
             ),
             _ => (
                 "Training mode: BF16 full fine-tune".into(),
@@ -53,6 +72,7 @@ impl TrainingPanelV1 {
             help_text,
         }
     }
+
 }
 
 #[cfg(test)]
@@ -88,4 +108,25 @@ mod tests {
         assert!(!p.show_quant_format_picker);
         assert!(p.help_text.contains("Materialization"));
     }
+
+    #[test]
+    fn reinforcement_learning_panels_exist_and_hide_quant_picker() {
+        let mut form = HyperparamFormV1::default();
+        
+        form.training_mode = "GRPO".into();
+        let p_grpo = TrainingPanelV1::from_form(&form);
+        assert!(!p_grpo.show_quant_format_picker);
+        assert!(p_grpo.help_text.contains("Group Relative Policy"));
+
+        form.training_mode = "DPO".into();
+        let p_dpo = TrainingPanelV1::from_form(&form);
+        assert!(!p_dpo.show_quant_format_picker);
+        assert!(p_dpo.help_text.contains("Direct Preference"));
+
+        form.training_mode = "ORPO".into();
+        let p_orpo = TrainingPanelV1::from_form(&form);
+        assert!(!p_orpo.show_quant_format_picker);
+        assert!(p_orpo.help_text.contains("Odds-Ratio"));
+    }
 }
+
