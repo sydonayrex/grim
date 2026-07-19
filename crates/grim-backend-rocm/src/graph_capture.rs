@@ -301,6 +301,7 @@ pub struct HipGraphExecutor {
     graph: *mut c_void,
     exec: Option<*mut c_void>,
     stream: Option<*mut c_void>,
+    #[allow(dead_code)]
     device_ordinal: usize,
 }
 

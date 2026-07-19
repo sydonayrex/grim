@@ -214,24 +214,28 @@ void grim_qkv_attention(
     // Wave 0 merges the partials from every wave into one (max, sum, acc[d]).
     if (wave_id != 0) return;
 
+    float m_final = s_max[0];
+    float sum_final = s_sum[0];
+    #pragma unroll
+    for (int w = 1; w < 8; ++w) {
+        if (w >= num_waves) break;
+        const float mw = s_max[w];
+        const float uw = s_sum[w];
+        const float m_new = fmaxf(m_final, mw);
+        const float scale_a = expf(m_final - m_new);
+        const float scale_b = expf(mw - m_new);
+        sum_final = sum_final * scale_a + uw * scale_b;
+        m_final = m_new;
+    }
+
     for (int chunk = 0; chunk < 4; ++chunk) {
         int d = lane_id + chunk * wave_size;
         if (d < head_dim) {
-            float m_final = s_max[0];
-            float sum_final = s_sum[0];
-            float acc_final = s_acc[0][d];
+            float acc_final = 0.0f;
             #pragma unroll
-            for (int w = 1; w < 8; ++w) {
+            for (int w = 0; w < 8; ++w) {
                 if (w >= num_waves) break;
-                const float mw = s_max[w];
-                const float uw = s_sum[w];
-                const float aw = s_acc[w][d];
-                const float m_new = fmaxf(m_final, mw);
-                const float scale_a = expf(m_final - m_new);
-                const float scale_b = expf(mw - m_new);
-                sum_final = sum_final * scale_a + uw * scale_b;
-                acc_final = acc_final * scale_a + aw * scale_b;
-                m_final = m_new;
+                acc_final += s_acc[w][d] * expf(s_max[w] - m_final);
             }
             const float inv_sum = (sum_final > 0.0f) ? (1.0f / sum_final) : 0.0f;
             out[q_offset + d] = acc_final * inv_sum;
@@ -605,9 +609,13 @@ pub fn launch_paged_attention(
     let v_pages_ptr = v_pages_s.device_ptr.ok_or_else(|| crate::Error::Backend("v_pages has no device ptr".into()))?;
     let out_ptr = out_s.device_ptr.ok_or_else(|| crate::Error::Backend("out has no device ptr".into()))?;
 
-    // Grid: (batch, num_heads, 1); Block: (256, 1, 1)
+    let wf = dev.wavefront_size() as u32;
     let grid_dim = crate::HipDim3::new(batch, num_heads, 1);
-    let block_dim = crate::HipDim3::new(256, 1, 1);
+    let block_dim = crate::HipDim3::new(wf * 4, 1, 1);
+
+
+
+    // Wavefront-aware: W32→128 threads, W64→256 threads
 
     let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
 
@@ -676,9 +684,10 @@ pub fn launch_tree_attention(
     let parents_ptr = parents_s.device_ptr.ok_or_else(|| crate::Error::Backend("tree_parents has no device ptr".into()))?;
     let out_ptr = out_s.device_ptr.ok_or_else(|| crate::Error::Backend("out has no device ptr".into()))?;
 
-    // Grid: (1 + gamma, num_heads, batch); Block: (256, 1, 1)
+    let wf = dev.wavefront_size() as u32;
+// Wavefront-aware: W32→128 threads, W64→256 threads
     let grid_dim = crate::HipDim3::new(1 + gamma, num_heads, batch);
-    let block_dim = crate::HipDim3::new(256, 1, 1);
+    let block_dim = crate::HipDim3::new(wf * 4, 1, 1);
 
     let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
 

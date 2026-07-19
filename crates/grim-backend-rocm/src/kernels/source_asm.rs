@@ -33,6 +33,7 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::decode_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::fused_dequant_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::kv_dequant_attention::KERNEL_SOURCE);
+    s.push_str(crate::kernels::wmma_gemm::KERNEL_SOURCE);
     s
 }
 
@@ -48,6 +49,8 @@ mod source_asm_self_tests {
         assert!(src.contains("grim_rms_norm"));
         // The fused QKV attention lives in qkv_attention::KERNEL_SOURCE.
         assert!(src.contains("grim_qkv_attention"));
+        // WMMA GEMM lives in wmma_gemm::KERNEL_SOURCE.
+        assert!(src.contains("grim_wmma_gemm"));
     }
 
     #[test]

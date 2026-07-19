@@ -102,6 +102,7 @@ pub enum GgufDType {
     F64 = 20,
     Q4_2 = 21,
     Q8_1Hx = 22,
+    #[allow(non_camel_case_types)]
     IQ4_NL = 35,
 }
 

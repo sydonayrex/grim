@@ -18,11 +18,11 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
-use grim_tensor::error::{Error, Result};
+use grim_tensor::error::Result;
 
-use crate::{hipFree, hipMalloc, HipErrorT, hipSuccess};
+use crate::{check_hip, hipFree, hipMalloc};
 
 /// Size-bucketed caching allocator for device memory.
 ///
@@ -45,6 +45,7 @@ pub struct RocmCachingAllocator {
     /// `hipFree`'d instead of retained, bounding steady-state memory use.
     cap_bytes: usize,
     /// Device ordinal this allocator serves.
+    #[allow(dead_code)]
     ordinal: usize,
     /// Count of real `hipMalloc` calls (misses). Always incremented.
     malloc_count: AtomicUsize,
@@ -91,13 +92,7 @@ impl RocmCachingAllocator {
         }
 
         let mut dev_ptr_void: *mut c_void = std::ptr::null_mut();
-        let res: HipErrorT = unsafe { hipMalloc(&mut dev_ptr_void, cls) };
-        if res != hipSuccess {
-            return Err(Error::Backend(format!(
-                "hipMalloc failed with error code {}",
-                res
-            )));
-        }
+        check_hip("hipMalloc", unsafe { hipMalloc(&mut dev_ptr_void, cls) })?;
         self.malloc_count.fetch_add(1, Ordering::Relaxed);
         Ok(dev_ptr_void)
     }

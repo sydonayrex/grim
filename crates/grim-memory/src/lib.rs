@@ -258,10 +258,8 @@ impl KvBlockPool {
         let block = &mut self.blocks[id];
         let n = num_tokens.min(BLOCK_SIZE);
         let elem = self.num_heads * self.head_dim;
-        let total = n * elem;
-        for i in 0..total.min(keys.len()) {
-            block.key_data[i] = keys[i];
-        }
+        let len = (n * elem).min(keys.len());
+        block.key_data[..len].copy_from_slice(&keys[..len]);
         block.num_tokens = n;
     }
 
@@ -269,9 +267,8 @@ impl KvBlockPool {
         let block = &mut self.blocks[id];
         let n = block.num_tokens;
         let elem = self.num_heads * self.head_dim;
-        for i in 0..(n * elem).min(values.len()) {
-            block.value_data[i] = values[i];
-        }
+        let len = (n * elem).min(values.len());
+        block.value_data[..len].copy_from_slice(&values[..len]);
     }
 
     pub fn read_keys(&self, id: BlockId) -> &[f32] {

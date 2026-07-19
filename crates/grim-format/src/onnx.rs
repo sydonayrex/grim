@@ -6,7 +6,7 @@
 //!
 //! Uses `ort` crate for ONNX runtime integration and tensor extraction.
 
-use grim_tensor::dtype::{DType, QuantProvenance, Storage};
+use grim_tensor::dtype::{DType, QuantProvenance};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
 

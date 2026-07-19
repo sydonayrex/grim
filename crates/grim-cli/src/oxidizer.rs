@@ -25,7 +25,31 @@ use grim_tensor_graph::build_transformer_ir;
 
 const OXIDIZER_VERSION: u32 = 1;
 
+fn open_provider(path: &str) -> Result<(Box<dyn TensorProvider>, Vec<String>, Vec<usize>, GrimMetadata), String> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".safetensors") || lower.ends_with(".bin") {
+        let provider = grim_format::tprov::SafetensorsProvider::open(path).map_err(|e| e.to_string())?;
+        let names: Vec<String> = provider.tensors().keys().cloned().collect();
+        let sizes = names.iter().map(|n| provider.tensors().get(n).map(|i| i.shape().iter().product()).unwrap_or(0)).collect();
+        Ok((Box::new(provider), names, sizes, GrimMetadata::default()))
+    } else {
+        let provider = GgufProvider::open(path).map_err(|e| e.to_string())?;
+        let names: Vec<String> = provider.tensors().keys().cloned().collect();
+        let sizes = names.iter().map(|n| provider.tensors().get(n).map(|i| i.shape().iter().product()).unwrap_or(0)).collect();
+        let meta = provider.grim_metadata().clone();
+        Ok((Box::new(provider), names, sizes, meta))
+    }
+}
+
 pub fn cmd_oxidizer_info(path: &str) -> Result<(), String> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".safetensors") || lower.ends_with(".bin") {
+        let provider = grim_format::tprov::SafetensorsProvider::open(path).map_err(|e| e.to_string())?;
+        println!("File: {path}");
+        println!("Format: safetensors");
+        println!("Tensors: {} entries", provider.tensors().len());
+        return Ok(());
+    }
     let provider = GgufProvider::open(path).map_err(|e| e.to_string())?;
     let grim = provider.grim_metadata();
 
@@ -91,6 +115,7 @@ pub fn cmd_oxidizer_info(path: &str) -> Result<(), String> {
 /// When `samples` is empty, `build_curvature` falls back to the CPU heuristic
 /// (`build_curvature_proxy`) so there's no regression for users without a
 /// calibrated model.
+#[allow(dead_code)] // benchmark helper
 #[derive(Debug, Clone, Default)]
 pub struct CalibrationBatch {
     pub samples: Vec<FisherCalibrationSample>,
@@ -117,11 +142,12 @@ pub fn cmd_oxidizer_calibrate(
     output_path: &str,
     _calibration_dataset: Option<&str>,
 ) -> Result<ImportanceScores, String> {
-    let provider = GgufProvider::open(model_path).map_err(|e| e.to_string())?;
+    let (provider, names, _sizes, _meta) = open_provider(model_path)?;
     let mut tensor_data: Vec<(String, Vec<f32>, usize, usize)> = Vec::new();
 
-    for (name, info) in provider.tensors() {
-        let shape = info.shape();
+    for name in &names {
+        let meta = provider.meta(name).map_err(|e| e.to_string())?;
+        let shape = meta.shape;
         if shape.len() != 2 || shape[0] == 0 || shape[1] == 0 {
             continue;
         }
@@ -139,8 +165,8 @@ pub fn cmd_oxidizer_calibrate(
     }
 
     let scores = compute_importance_scores(&tensor_data);
-    let names = tensor_data.iter().map(|(n, _, _, _)| n.clone()).collect();
-    let result = ImportanceScores::new(names, scores);
+    let names_collected = tensor_data.iter().map(|(n, _, _, _)| n.clone()).collect();
+    let result = ImportanceScores::new(names_collected, scores);
     let out_json = serde_json::json!({
         "version": OXIDIZER_VERSION,
         "model_path": model_path,
@@ -179,7 +205,7 @@ pub fn cmd_oxidizer_convert(
     rocml_profile: Option<&str>,
     calibration_dataset: Option<String>,
 ) -> Result<(), String> {
-    let provider = GgufProvider::open(model_path).map_err(|e| e.to_string())?;
+    let (provider, names, sizes, mut grim_meta) = open_provider(model_path)?;
     let importance_scores = if Path::new(&format!("{}.importance.json", model_path)).exists() {
         load_importance_scores(&format!("{}.importance.json", model_path))?
     } else {
@@ -189,11 +215,16 @@ pub fn cmd_oxidizer_convert(
     let tensor_names = importance_scores.tensor_names.clone();
     let tensor_sizes = tensor_names
         .iter()
-        .map(|name| provider.tensors().get(name).map(|info| info.shape().iter().product()).unwrap_or(0))
+        .map(|name| {
+            if let Some(idx) = names.iter().position(|n| n == name) {
+                sizes[idx]
+            } else {
+                0
+            }
+        })
         .collect::<Vec<usize>>();
     let bitwidths = cmd_oxidizer_search(&importance_scores, &tensor_sizes, target_bpw, generations);
 
-    let mut grim_meta = provider.grim_metadata().clone();
     grim_meta.magic = Some("grim-v1".into());
     grim_meta.quant_version = Some(OXIDIZER_VERSION);
     grim_meta.rocml_profile = rocml_profile
@@ -249,8 +280,7 @@ pub fn cmd_oxidizer_prepare(
     profile: Option<&str>,
     dataset: Option<String>,
 ) -> Result<(), String> {
-    let provider = GgufProvider::open(input_path).map_err(|e| e.to_string())?;
-    let mut grim = provider.grim_metadata().clone();
+    let (_provider, names, _sizes, mut grim) = open_provider(input_path)?;
     grim.magic = Some("grim-v1".into());
     grim.quant_version = Some(OXIDIZER_VERSION);
     if let Some(profile) = profile {
@@ -261,7 +291,7 @@ pub fn cmd_oxidizer_prepare(
     grim.calibration_dataset = dataset;
     if train {
         grim.train_quant_mode = GrimTrainQuantMode::from_str(format);
-        grim.train_fusion_ops = inferred_fusion_ops(&provider);
+        grim.train_fusion_ops = inferred_fusion_ops(&names);
         grim.quant_method.get_or_insert_with(|| "train-prepare".into());
     }
     write_grim_file(input_path, output_path, &grim, &HashMap::new())
@@ -273,8 +303,7 @@ pub fn cmd_oxidizer_fuse(
     profile: Option<&str>,
     rocm: bool,
 ) -> Result<(), String> {
-    let provider = GgufProvider::open(input_path).map_err(|e| e.to_string())?;
-    let mut grim = provider.grim_metadata().clone();
+    let (_provider, names, _sizes, mut grim) = open_provider(input_path)?;
     grim.magic = Some("grim-v1".into());
     grim.quant_version = Some(OXIDIZER_VERSION);
     if let Some(profile) = profile {
@@ -282,15 +311,15 @@ pub fn cmd_oxidizer_fuse(
     }
     grim.wavefront_size = grim.rocml_profile.wavefront_size();
     grim.lds_size = Some(grim.rocml_profile.lds_size());
-    grim.rocm_fusion_ops = inferred_fusion_ops(&provider);
+    grim.rocm_fusion_ops = inferred_fusion_ops(&names);
     grim.kv_layout_optimized = Some(rocm);
     grim.xnack_enabled = Some(false);
     grim.quant_method.get_or_insert_with(|| "rocm-fuse".into());
     write_grim_file(input_path, output_path, &grim, &HashMap::new())
 }
 
-fn inferred_fusion_ops(provider: &GgufProvider) -> Vec<GrimFusionOp> {
-    let ir = build_transformer_ir(provider.tensors().keys().map(String::as_str));
+fn inferred_fusion_ops(names: &[String]) -> Vec<GrimFusionOp> {
+    let ir = build_transformer_ir(names.iter().map(String::as_str));
     ir.recommended_fusion_ops()
 }
 
@@ -319,6 +348,7 @@ fn bitwidth_to_dtype(bw: u32) -> GgufDType {
     }
 }
 
+#[allow(dead_code)] // benchmark helper
 fn build_rewritten_tensors(
     provider: &GgufProvider,
     importance_scores: &ImportanceScores,
@@ -408,6 +438,7 @@ fn build_rewritten_tensors(
 ///
 /// Uses true Fisher/GGN diagonal when `calibration_batch` has samples;
 /// otherwise falls back to the heuristic `build_curvature_proxy`.
+#[allow(dead_code)] // benchmark helper
 fn build_curvature(
     data: &[f32],
     layer_importance: f32,
@@ -423,6 +454,7 @@ fn build_curvature(
 
 /// Fallback: heuristic curvature proxy using activation magnitude as importance proxy.
 /// Used when no calibration data is available.
+#[allow(dead_code)] // benchmark helper
 fn build_curvature_proxy(data: &[f32], layer_importance: f32) -> Vec<f32> {
     let layer_scale = layer_importance.abs().max(1e-3);
     data.iter()
@@ -531,6 +563,7 @@ fn write_gguf<W: Write, R: Read + Seek>(
     Ok(())
 }
 
+#[allow(dead_code)] // benchmark helper
 fn quant_format_for_bitwidth(bw: u32) -> Option<QuantFormat> {
     match bw {
         8 => Some(QuantFormat::Q8_0),
@@ -547,11 +580,12 @@ fn gguf_dtype_for_quant_format(format: QuantFormat) -> GgufDType {
         QuantFormat::Q4K => GgufDType::Q4K,
         QuantFormat::Q5K => GgufDType::Q5K,
         QuantFormat::Q6K => GgufDType::Q6K,
-        QuantFormat::Fp4 | QuantFormat::Nf4 | QuantFormat::Fp8 => unimplemented!("fp4/nf4/fp8 quantization not implemented in CLI"),
+        QuantFormat::Fp4 | QuantFormat::Nf4 | QuantFormat::Fp8 | QuantFormat::Fp4Block16 | QuantFormat::Fp8Block16 => unimplemented!("fp4/nf4/fp8 quantization not implemented in CLI"),
     }
 }
 
 
+#[allow(dead_code)] // benchmark helper
 fn materialize_f32(bytes: &[u8], shape: &[usize], source_dtype: Option<GgufDType>) -> Result<Vec<f32>, String> {
     let elem_count = shape.iter().product::<usize>();
     match source_dtype.unwrap_or(GgufDType::F32) {

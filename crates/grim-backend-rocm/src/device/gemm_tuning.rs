@@ -244,7 +244,7 @@ pub fn resolve_gemm_solution(
     Ok(idx)
 }
 
-#[cfg(any(test, feature = "loom-test"))]
+#[cfg(test)]
 mod loom_tests {
     use super::*;
 

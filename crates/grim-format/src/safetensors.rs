@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
-use grim_tensor::dtype::DType;
+use grim_tensor::dtype::{DType, Storage, ArithType};
 use grim_tensor::error::{Error, Result};
 
 /// Parsed safetensors header. Each tensor entry contains its shape, dtype
@@ -38,9 +38,9 @@ impl SafetensorInfo {
     }
 }
 
-/// Parse the safetensors header JSON and return tensor index entries.
+/// Parse the safetensors header JSON and return tensor index entries and header metadata.
 /// Does NOT read tensor data — call `read_safetensor_bytes` per tensor.
-pub fn read_safetensors_header<R: Read + Seek>(mut reader: R) -> Result<(HashMap<String, SafetensorInfo>, u64)> {
+pub fn read_safetensors_header<R: Read + Seek>(mut reader: R) -> Result<(HashMap<String, SafetensorInfo>, Option<HashMap<String, String>>, u64)> {
     let mut len_bytes = [0u8; 8];
     reader.read_exact(&mut len_bytes)?;
     let header_len = u64::from_le_bytes(len_bytes) as usize;
@@ -53,6 +53,18 @@ pub fn read_safetensors_header<R: Read + Seek>(mut reader: R) -> Result<(HashMap
 
     let header_map = header.as_object()
         .ok_or_else(|| Error::Backend("safetensors header is not a JSON object".into()))?;
+
+    let metadata = header_map.get("__metadata__")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            let mut map = HashMap::new();
+            for (k, val) in obj {
+                if let Some(s) = val.as_str() {
+                    map.insert(k.clone(), s.to_string());
+                }
+            }
+            map
+        });
 
     let mut tensors = HashMap::new();
     let mut total_data = 0u64;
@@ -95,7 +107,7 @@ pub fn read_safetensors_header<R: Read + Seek>(mut reader: R) -> Result<(HashMap
 
     // Data section starts at header_len + 8 (the length prefix)
     let data_region_start = 8 + header_len as u64;
-    Ok((tensors, data_region_start))
+    Ok((tensors, metadata, data_region_start))
 }
 
 /// Read one tensor's raw bytes from a safetensors file.
@@ -114,11 +126,13 @@ pub fn read_safetensor_bytes<R: Read + Seek>(
 
 impl SafetensorInfo {
     /// Map safetensors dtype tag to Grim DType.
-    pub fn grim_dtype(&self) -> DType {
+    pub fn grim_dtype(&self) -> Result<DType> {
         match self.dtype_tag.as_str() {
-            "F32" => DType::F32,
-            "BF16" => DType::BF16,
-            _ => DType::F32,
+            "F32" => Ok(DType::F32),
+            "BF16" => Ok(DType::BF16),
+            "F16" => Ok(DType::F16),
+            "I8" | "U8" => Ok(DType { arith: ArithType::U8, storage: Storage::Native }),
+            other => Err(Error::Backend(format!("Unsupported safetensors dtype: '{other}'"))),
         }
     }
 }

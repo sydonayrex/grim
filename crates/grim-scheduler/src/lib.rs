@@ -10,7 +10,6 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use grim_core::error::{Error, Result};
 use grim_core::DeterminismMode;
 
 pub mod self_tuning;

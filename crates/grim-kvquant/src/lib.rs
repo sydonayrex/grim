@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 use grim_core::error::Result;
-use grim_tensor::{Tensor, BackendDevice, BackendStorage, QuantProvenance, Device};
+use grim_tensor::{Tensor, BackendDevice, QuantProvenance, Device};
 
 /// Generate a random orthogonal matrix using QR decomposition of a random matrix.
 /// This is used for pre-rotation before Lloyd-Max quantization to decorrelate features.

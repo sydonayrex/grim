@@ -51,8 +51,7 @@ pub fn kv_to_block_major(
     
     for block_idx in 0..num_blocks {
         let start_token = block_idx * block_size;
-        let end_token = (start_token + block_size).min(num_tokens);
-        
+
         for head in 0..num_heads {
             for dim in 0..head_dim {
                 for t in 0..block_size {
@@ -66,7 +65,7 @@ pub fn kv_to_block_major(
             }
         }
     }
-    
+
     out
 }
 
@@ -80,11 +79,10 @@ pub fn kv_from_block_major(
 ) -> Vec<f32> {
     let num_blocks = (num_tokens + block_size - 1) / block_size;
     let mut out = vec![0.0f32; num_tokens * num_heads * head_dim];
-    
+
     for block_idx in 0..num_blocks {
         let start_token = block_idx * block_size;
-        let end_token = (start_token + block_size).min(num_tokens);
-        
+
         for head in 0..num_heads {
             for dim in 0..head_dim {
                 for t in 0..block_size {
@@ -454,7 +452,6 @@ pub fn align_quantized_tensor_for_rocm_gemm(
     }
     
     let wf = wavefront_size as usize;
-    let bytes_per_elem = (bitwidth as usize + 7) / 8;
     let rows = shape[0];
     let cols = shape[1];
     
@@ -582,7 +579,6 @@ mod wmma_tests {
     fn wmma_stride_matches_packed_quant() {
         let cols = 4096;
         let bits = 4u8;
-        let wf = 64u32;
 
         // Reference row pitch: the WI-A PackedQuant convention is
         // Wave64-aligned per row (see format::align_wave64 / PackedQuantLayout).

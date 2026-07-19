@@ -317,13 +317,12 @@ fn build_entries_from_source(
         let names: Vec<String> = provider.tensors().keys().cloned().collect();
         pack_tensors(&provider, &names, base_bitwidth)
     } else if lower.ends_with(".safetensors") || lower.ends_with(".bin") {
-        Err(Error::Backend(
-            "safetensors-to-native-.grim conversion requires tensor enumeration, \
-             which is not yet on TensorProvider. Export to .gguf first.".into(),
-        ))
+        let provider = crate::tprov::SafetensorsProvider::open(input_path)?;
+        let names: Vec<String> = provider.tensors().keys().cloned().collect();
+        pack_tensors(&provider, &names, base_bitwidth)
     } else {
         Err(Error::Backend(format!(
-            "unsupported source format: '{input_path}'. Supported: .gguf, .grim"
+            "unsupported source format: '{input_path}'. Supported: .gguf, .grim, .safetensors, .bin"
         )))
     }
 }
@@ -337,6 +336,10 @@ fn pack_tensors(
     let mut result = Vec::with_capacity(names.len());
     for name in names {
         let raw = provider.get(name)?;
+        let meta = provider.meta(name)?;
+        if meta.provenance.is_external_qat() {
+            println!("[WARN] Re-quantizing external QAT tensor '{}' may lead to accuracy loss.", name);
+        }
         let elem_count: usize = raw.shape.iter().product();
         let payload_size = crate::format::normals_packed_size(elem_count, 0, base_bitwidth);
         let mut normals = raw.bytes;

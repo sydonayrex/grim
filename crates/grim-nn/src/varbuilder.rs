@@ -4,14 +4,21 @@
 //! config-defined layer hierarchy and pulls tensors by prefix. Per-tensor
 //! dtype/provenance resolution (§4.2, §7.2) happens in `get()`.
 
+use std::sync::Arc;
+
 use grim_tensor::dtype::{BlockDtype, DType, Device, FloatPackScheme, KQuantScheme, QuantProvenance, Storage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::shape::Shape;
 use grim_tensor::tensor::Tensor;
-use grim_tensor::RawTensor;
+use grim_tensor::{BackendDevice, RawTensor};
 
-use grim_backend_cpu::{cpu_tensor, CpuDevice};
-use grim_quant::{dequant_fp4, dequant_nf4, dequant_fp8, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80, dequant_iq4nl};
+use grim_backend_cpu::cpu_tensor;
+use grim_quant::{dequant_fp4, dequant_nf4, dequant_fp8, dequant_fp4_block16, dequant_fp8_block16, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80, dequant_iq4nl};
+
+#[cfg(feature = "cuda-mem")]
+use grim_backend_cuda::CudaDevice;
+#[cfg(feature = "rocm-mem")]
+use grim_backend_rocm::RocmDevice;
 
 /// A handle that walks a `TensorProvider` by hierarchical prefix. Models
 /// call `ws.pp("model").pp("layers").pp("0").get(...)` to materialize
@@ -94,16 +101,13 @@ impl<'a> WeightSource<'a> {
             Err(_) => (self.default_dtype.clone(), self.default_provenance.clone()),
         };
 
-        tensor_from_raw(raw, shape, dtype, provenance, self.device.clone())
+        materialize(raw, shape, dtype, provenance, &self.device)
     }
 
     /// Materialize a tensor for training. Quantized storage types (Q4_K, Q5_K,
     /// Q6_K, Q8_0, ...) are dequantized to native F32 in CPU memory so the
     /// optimization pass has full-precision weights to take gradients against.
     /// Native dtypes flow through unchanged.
-    ///
-    /// Currently supports CPU dequantization only; ROCm/Vulkan will land as
-    /// their respective materialization paths.
     pub fn get_for_training(&self, shape: impl Into<Shape>, leaf: &str) -> Result<Tensor> {
         let shape = shape.into();
         let name = self.full_name(leaf);
@@ -120,34 +124,124 @@ impl<'a> WeightSource<'a> {
             Err(_) => (self.default_dtype.clone(), self.default_provenance.clone()),
         };
 
-        tensor_from_raw_for_training(raw, shape, dtype, provenance, self.device.clone())
+        materialize(raw, shape, dtype, provenance, &self.device)
     }
 }
 
-fn tensor_from_raw(
+// Materialization helpers — each arm is a self-contained branch so cfg(...)
+// attributes on `use` statements don't create non-exhaustive match arms.
+
+fn materialize_cuda(
+    f32s: Vec<f32>,
+    shape: Shape,
+    _dtype: DType,
+    provenance: QuantProvenance,
+    device: &Device,
+    ordinal: usize,
+) -> Result<Tensor> {
+    let dev = CudaDevice::new(ordinal);
+    // Storage is F32 bytes regardless of the GGUF-stored quantization tag:
+    // `f32s` was already dequantized in `materialize` above. Pass F32 to
+    // `from_cpu` so the CUDA storage carries DType::F32, which downstream
+    // embedding/matmul kernels require.
+    let storage = BackendDevice::from_cpu(&dev, &f32s, &shape, DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        shape,
+        DType::F32,
+        provenance,
+        device.clone(),
+    ))
+}
+
+#[cfg(not(feature = "cuda-mem"))]
+fn materialize_cuda(
+    _f32s: Vec<f32>,
+    _shape: Shape,
+    _dtype: DType,
+    _provenance: QuantProvenance,
+    _device: &Device,
+    ordinal: usize,
+) -> Result<Tensor> {
+    Err(Error::Unimplemented(format!(
+        "CUDA materialization: enable 'cuda-mem' feature on grim-nn (ordinal={})",
+        ordinal
+    )))
+}
+
+#[cfg(feature = "rocm-mem")]
+fn materialize_rocm(
+    f32s: Vec<f32>,
+    shape: Shape,
+    _dtype: DType,
+    provenance: QuantProvenance,
+    device: &Device,
+    ordinal: usize,
+) -> Result<Tensor> {
+    let dev = RocmDevice::new(ordinal);
+    // Storage is F32 bytes (already dequantized in `materialize`). Mirror
+    // CUDA: stamp the storage as DType::F32 so ROCm kernels that check
+    // input dtype (embedding, matmul) accept the result.
+    let storage = BackendDevice::from_cpu(&dev, &f32s, &shape, DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        shape,
+        DType::F32,
+        provenance,
+        device.clone(),
+    ))
+}
+
+#[cfg(not(feature = "rocm-mem"))]
+fn materialize_rocm(
+    _f32s: Vec<f32>,
+    _shape: Shape,
+    _dtype: DType,
+    _provenance: QuantProvenance,
+    _device: &Device,
+    ordinal: usize,
+) -> Result<Tensor> {
+    Err(Error::Unimplemented(format!(
+        "ROCm materialization: enable 'rocm-mem' feature on grim-nn (ordinal={})",
+        ordinal
+    )))
+}
+
+fn materialize(
     raw: RawTensor,
     shape: Shape,
     dtype: DType,
     provenance: QuantProvenance,
-    device: Device,
+    device: &Device,
 ) -> Result<Tensor> {
-    // v1 only materializes CPU tensors; per-device (ROCm/Vulkan) materialization
-    // lands with each backend. Quantized / low-bit tensors are dequantized to
-    // native F32 on the CPU so downstream compute sees uniform F32 weights.
-    if !device.is_cpu() {
-        return Err(Error::Unimplemented(
-            "WeightSource v1 only materializes CPU tensors; \
-             per-device materialization lands with each backend."
-                .into(),
-        ));
+    if device.is_cpu() {
+        let f32s = dequant_to_f32(&raw, &dtype)?;
+        return Ok(cpu_tensor(f32s, shape));
     }
-
     let f32s = dequant_to_f32(&raw, &dtype)?;
-    let _ = CpuDevice::new(); // keep the device type reachable
-    let _ = provenance; // CPU backend stamps default GrimNative; per-tensor provenance
-                        // will be carried once non-Native storage lands.
-    let _ = dtype;
-    Ok(cpu_tensor(f32s, shape))
+    match device {
+        Device::Cpu => {
+            _ = f32s;
+            Err(Error::Backend(
+                "Device::Cpu reached after is_cpu early-return — unreachable".into(),
+            ))
+        }
+        Device::Cuda(ordinal) => materialize_cuda(f32s, shape, dtype, provenance, device, *ordinal),
+        Device::Rocm(ordinal) => materialize_rocm(f32s, shape, dtype, provenance, device, *ordinal),
+        Device::Vulkan => {
+            _ = f32s;
+            Err(Error::Unimplemented(
+                "Vulkan materialization not yet wired up".into(),
+            ))
+        }
+        Device::Metal(ordinal) => {
+            _ = f32s;
+            Err(Error::Unimplemented(format!(
+                "Metal(device={}) materialization not yet wired up",
+                ordinal
+            )))
+        }
+    }
 }
 
 /// Materialize any supported storage format to a flat `Vec<f32>` of
@@ -172,9 +266,6 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             KQuantScheme::Q6K => dequant_q6k(&raw.bytes, n),
             KQuantScheme::Q80 => dequant_q80(&raw.bytes, n),
             KQuantScheme::IQ4NL => dequant_iq4nl(&raw.bytes, n),
-            // Q2K/Q3K share the 4-bit super-block structure; reuse the Q4K
-            // symmetric dequant as an approximation until exact K-quant readers
-            // are added. (sleipnir.gguf is Q8, so this is not on its hot path.)
             KQuantScheme::Q2K | KQuantScheme::Q3K => dequant_q4k(&raw.bytes, n),
         },
         Storage::FloatPack(fp) => match fp {
@@ -186,6 +277,8 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             BlockDtype::Fp4 => dequant_fp4(&raw.bytes, n),
             BlockDtype::Nf4 => dequant_nf4(&raw.bytes, n),
             BlockDtype::Fp8 => dequant_fp8(&raw.bytes, n),
+            BlockDtype::Fp4Block16 => dequant_fp4_block16(&raw.bytes, n),
+            BlockDtype::Fp8Block16 => dequant_fp8_block16(&raw.bytes, n),
         },
         Storage::GroupInt(_) => Err(Error::Unimplemented(
             "WeightSource inference path does not yet dequantize GroupInt (GPTQ) \
@@ -228,66 +321,5 @@ pub(crate) fn f16_to_f32_le(bytes: &[u8]) -> f32 {
         f32::from_bits((sign << 31) | 0x7F80_0000 | (mant << 13))
     } else {
         f32::from_bits((sign << 31) | ((exp + 112) << 23) | (mant << 13))
-    }
-}
-
-/// Training-aware counterpart of `tensor_from_raw`. Quantized storage types
-/// are dequantized to native F32 so the optimizer can compute gradients in
-/// full-precision weight space.
-fn tensor_from_raw_for_training(
-    raw: RawTensor,
-    shape: Shape,
-    dtype: DType,
-    provenance: QuantProvenance,
-    device: Device,
-) -> Result<Tensor> {
-    if !device.is_cpu() {
-        return Err(Error::Unimplemented(
-            "Training materialization only implemented for CPU; per-device \
-             materialization lands with each backend."
-                .into(),
-        ));
-    }
-
-    if !device.is_cpu() {
-        return Err(Error::Unimplemented(
-            "Training materialization only implemented for CPU; per-device \
-             materialization lands with each backend."
-                .into(),
-        ));
-    }
-
-    match &dtype.storage {
-        Storage::Native => {
-            if dtype.arith != grim_tensor::ArithType::F32
-                && dtype.arith != grim_tensor::ArithType::BF16
-            {
-                return Err(Error::Unimplemented(format!(
-                    "Training materialization to native {dtype:?} not supported; \
-                     only F32/BF16 are valid for gradient computation."
-                )));
-            }
-            let total: usize = raw.shape.iter().product();
-            let f32s = bytes_to_f32(&raw.bytes, total)?;
-            let _ = CpuDevice::new();
-            Ok(cpu_tensor(f32s, shape))
-        }
-        // Quantized + float-pack formats share the inference dequant path.
-        Storage::KQuant(_) | Storage::FloatPack(_) | Storage::Block(_) => {
-            let f32s = dequant_to_f32(&raw, &dtype)?;
-            let _ = CpuDevice::new();
-            let _ = provenance;
-            Ok(cpu_tensor(f32s, shape))
-        }
-        Storage::GroupInt(_gqscheme) => {
-            // GPTQ-style group-quantized storage. The training materializer
-            // returns native F32 once we have a hook to read the group scales;
-            // for now we deliver the same error contract as phase 2 callers.
-            Err(Error::Unimplemented(
-                "training materialization for GroupInt tensors is staged after \
-                 grim-quant dequant_group_int scales are exposed; use the inference `get()` path."
-                    .into(),
-            ))
-        }
     }
 }

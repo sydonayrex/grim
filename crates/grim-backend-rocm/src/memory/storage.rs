@@ -19,9 +19,9 @@ use grim_tensor::error::{Error, Result};
 // Re-exports used by the type's field types. The actual type declarations
 // live in lib.rs and are reachable via the crate-root imports below.
 use crate::{
-    hipMemcpy, DType, HipMemcpyKind, QuantProvenance, RocmCachingAllocator, Shape, hipSuccess,
+    check_hip, hipMemcpy, DType, HipMemcpyKind, QuantProvenance, RocmCachingAllocator, Shape,
+    hipSuccess,
 };
-pub(crate) use crate::dtype_byte_size;
 
 /// ROCm-side tensor storage. Holds a hipDeviceptr_t (as u64) plus shape/dtype/provenance metadata.
 #[derive(Debug)]
@@ -140,9 +140,7 @@ impl RocmStorage {
         };
 
         if upload_result != hipSuccess {
-            unsafe {
-                storage.allocator.free(dev_ptr_void, storage.bytes);
-            }
+            storage.allocator.free(dev_ptr_void, storage.bytes);
             storage.device_ptr = None;
             return Err(Error::Backend(format!(
                 "hipMemcpyHostToDevice failed with error code {}",
@@ -193,20 +191,14 @@ impl BackendStorage for RocmStorage {
         match self.dtype.arith {
             grim_tensor::ArithType::F16 => {
                 let mut raw = vec![0u8; elem_count * 2];
-                let res = unsafe {
+                check_hip("hipMemcpyDtoH (f16)", unsafe {
                     hipMemcpy(
                         raw.as_mut_ptr() as *mut c_void,
                         dev_ptr_void,
                         self.bytes,
                         HipMemcpyKind::DeviceToHost,
                     )
-                };
-                if res != hipSuccess {
-                    return Err(Error::Backend(format!(
-                        "hipMemcpyDtoH (f16) failed with error code {}",
-                        res
-                    )));
-                }
+                })?;
                 // Reinterpret the byte buffer as f16 (little-endian) and convert.
                 let f16_slice: &[half::f16] = unsafe {
                     std::slice::from_raw_parts(raw.as_ptr() as *const half::f16, elem_count)
@@ -215,20 +207,14 @@ impl BackendStorage for RocmStorage {
             }
             grim_tensor::ArithType::BF16 => {
                 let mut raw = vec![0u8; elem_count * 2];
-                let res = unsafe {
+                check_hip("hipMemcpyDtoH (bf16)", unsafe {
                     hipMemcpy(
                         raw.as_mut_ptr() as *mut c_void,
                         dev_ptr_void,
                         self.bytes,
                         HipMemcpyKind::DeviceToHost,
                     )
-                };
-                if res != hipSuccess {
-                    return Err(Error::Backend(format!(
-                        "hipMemcpyDtoH (bf16) failed with error code {}",
-                        res
-                    )));
-                }
+                })?;
                 let bf16_slice: &[half::bf16] = unsafe {
                     std::slice::from_raw_parts(raw.as_ptr() as *const half::bf16, elem_count)
                 };
@@ -237,20 +223,14 @@ impl BackendStorage for RocmStorage {
             // F32 and integer types: direct memcpy into f32 buffer.
             _ => {
                 let mut host_data = vec![0.0f32; elem_count];
-                let res = unsafe {
+                check_hip("hipMemcpyDtoH", unsafe {
                     hipMemcpy(
                         host_data.as_mut_ptr() as *mut c_void,
                         dev_ptr_void,
                         self.bytes,
                         HipMemcpyKind::DeviceToHost,
                     )
-                };
-                if res != hipSuccess {
-                    return Err(Error::Backend(format!(
-                        "hipMemcpyDtoH failed with error code {}",
-                        res
-                    )));
-                }
+                })?;
                 Ok(host_data)
             }
         }

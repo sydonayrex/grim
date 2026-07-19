@@ -7,8 +7,6 @@
 //! `lib.rs` concatenates this string with that one at runtime for JIT
 //! compilation.
 
-use grim_tensor::error::{Error, Result};
-
 /// HIP source for the six non-QKV compute kernels.
 ///
 /// Concatenated into the crate-wide kernel program via
