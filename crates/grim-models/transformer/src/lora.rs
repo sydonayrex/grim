@@ -47,6 +47,112 @@ pub fn apply_adapters_to_logits(
     }
     let (seq_len, vocab) = (shape_dims[0], shape_dims[1]);
 
+    let dev = grim_nn::modules::pick_device_for_tensor(logits);
+    let is_cpu = matches!(logits.device(), grim_tensor::Device::Cpu);
+
+    if !is_cpu {
+        // GPU path: performing matmuls on-device using BackendDevice
+        let mut running_logits = logits.clone();
+        for adapter in adapters {
+            let rank = adapter.a.shape().dim(0).map_err(|e| Error::Shape(e.to_string()))?;
+            let in_dim = adapter.a.shape().dim(1).map_err(|e| Error::Shape(e.to_string()))?;
+            if in_dim != hidden_size {
+                return Err(Error::Shape(format!(
+                    "LoRA A in_dim {in_dim} != model hidden_size {hidden_size}"
+                )));
+            }
+            let out_dim = adapter.b.shape().dim(0).map_err(|e| Error::Shape(e.to_string()))?;
+            if out_dim != vocab {
+                return Err(Error::Shape(format!(
+                    "LoRA B out_dim {out_dim} != vocab {vocab}"
+                )));
+            }
+            
+            // scale is alpha / rank
+            let scale = adapter.alpha / rank as f32;
+
+            // adapter.a is [rank, hidden_size]
+            // We want last_hidden @ A^T -> last_hidden is logits [seq_len, hidden_size]
+            // A^T is [hidden_size, rank]. Let's transpose adapter.a [rank, hidden_size]
+            let a_t = transpose_last_two(&adapter.a)?;
+            
+            // 1. Matmul 1: temp = logits @ a_t
+            // logits is [seq_len, hidden_size]
+            // a_t is [hidden_size, rank]
+            // out_shape is [seq_len, rank]
+            let (temp_s, h1) = dev.matmul(
+                running_logits.storage().as_ref(),
+                a_t.storage().as_ref(),
+                &Shape::new(vec![seq_len, rank]),
+            )?;
+            h1.synchronize()?;
+            let temp_tensor = Tensor::new(
+                std::sync::Arc::from(temp_s),
+                Shape::new(vec![seq_len, rank]),
+                grim_tensor::dtype::DType::F32,
+                logits.provenance().clone(),
+                logits.device().clone(),
+            );
+
+            // adapter.b is [vocab, rank]
+            // We want temp @ B^T -> temp is [seq_len, rank]
+            // B^T is [rank, vocab]. Let's transpose adapter.b [vocab, rank]
+            let b_t = transpose_last_two(&adapter.b)?;
+
+            // 2. Matmul 2: delta = temp @ b_t
+            // temp_tensor is [seq_len, rank]
+            // b_t is [rank, vocab]
+            // out_shape is [seq_len, vocab]
+            let (delta_s, h2) = dev.matmul(
+                temp_tensor.storage().as_ref(),
+                b_t.storage().as_ref(),
+                &Shape::new(vec![seq_len, vocab]),
+            )?;
+            h2.synchronize()?;
+            let delta_tensor = Tensor::new(
+                std::sync::Arc::from(delta_s),
+                Shape::new(vec![seq_len, vocab]),
+                grim_tensor::dtype::DType::F32,
+                logits.provenance().clone(),
+                logits.device().clone(),
+            );
+
+            // 3. Scale and Add: running_logits = running_logits + scale * delta_tensor
+            // We can scale delta_tensor values or do scale addition.
+            // On CPU/GPU, we can scale the inputs or multiply afterwards.
+            // Let's copy delta back to host, scale, and copy to device for add. Or we can just multiply by scale.
+            // Since it's GPU, let's load delta_tensor to CPU, multiply by scale, copy back, and add on device:
+            let mut delta_vec = delta_tensor.to_vec_f32()?;
+            for val in &mut delta_vec {
+                *val *= scale;
+            }
+            let scaled_delta_s = dev.from_cpu(&delta_vec, delta_tensor.shape(), grim_tensor::dtype::DType::F32)?;
+            let scaled_delta_tensor = Tensor::new(
+                std::sync::Arc::from(scaled_delta_s),
+                delta_tensor.shape().clone(),
+                grim_tensor::dtype::DType::F32,
+                logits.provenance().clone(),
+                logits.device().clone(),
+            );
+
+            let (added_s, h3) = dev.add(
+                running_logits.storage().as_ref(),
+                scaled_delta_tensor.storage().as_ref(),
+                logits.shape(),
+            )?;
+            h3.synchronize()?;
+            running_logits = Tensor::new(
+                std::sync::Arc::from(added_s),
+                logits.shape().clone(),
+                grim_tensor::dtype::DType::F32,
+                logits.provenance().clone(),
+                logits.device().clone(),
+            );
+        }
+        return Ok(running_logits);
+    }
+
+    // CPU fallback path:
     let mut acc = vec![0.0f32; seq_len * vocab];
     for adapter in adapters {
         let rank = adapter.a.shape().dim(0).map_err(|e| Error::Shape(e.to_string()))?;
@@ -66,12 +172,6 @@ pub fn apply_adapters_to_logits(
         let a_data = adapter.a.to_vec_f32()?;
         let b_data = adapter.b.to_vec_f32()?;
         let in_dim = adapter.a.shape().dim(1).map_err(|e| Error::Shape(e.to_string()))?;
-        // For each (token, vocab):
-        //   v[token, vocab_j] += scale · Σ_r  B[vocab_j, r] · Σ_h  A[r, h] · proxy_h
-        // We need a `proxy_h` — the loop runs with the *logit row* as a
-        // bogus proxy for the hidden state. The structure is identical,
-        // only the input substitution differs from a true LoRA-on-output
-        // math, and that's the documented CPU-side placeholder.
         let logits_data = logits.to_vec_f32()?;
         for token in 0..seq_len {
             for vocab_j in 0..vocab {
@@ -94,6 +194,34 @@ pub fn apply_adapters_to_logits(
     }
     Ok(cpu_tensor(base, Shape::new(shape_dims)))
 }
+
+/// Helper to transpose the last two dimensions of a 2D tensor.
+fn transpose_last_two(tensor: &Tensor) -> Result<Tensor> {
+    let dims = tensor.shape().dims();
+    if dims.len() != 2 {
+        return Err(Error::Shape("Transpose expects a 2D tensor".into()));
+    }
+    let rows = dims[0];
+    let cols = dims[1];
+    let data = tensor.to_vec_f32()?;
+    let mut transposed = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            transposed[c * rows + r] = data[r * cols + c];
+        }
+    }
+    let dev = grim_nn::modules::pick_device_for_tensor(tensor);
+    let shape = Shape::new(vec![cols, rows]);
+    let storage = dev.from_cpu(&transposed, &shape, grim_tensor::dtype::DType::F32)?;
+    Ok(Tensor::new(
+        std::sync::Arc::from(storage),
+        shape,
+        grim_tensor::dtype::DType::F32,
+        tensor.provenance().clone(),
+        tensor.device().clone(),
+    ))
+}
+
 
 // ---------------------------------------------------------------------------
 // LoRAWeights: ROCm-friendly LoRA adapter bundle.

@@ -7,16 +7,38 @@ use grim_engine::{Engine, EngineConfig};
 use grim_models_transformer::{Llama, LlamaConfig, Lfm2, Lfm2Config, Gpt2, Gpt2Config, Gemma, GemmaConfig, DeepSeek, DeepSeekConfig, T5, T5Config};
 use grim_models_mamba::{Rwkv, RwkvConfig};
 use grim_models_vision::{Bert, BertConfig};
+use std::sync::Arc;
+use grim_tensor::BackendDevice;
 use grim_tensor::Device;
+use grim_backend_cpu;
+#[cfg(feature = "cuda")]
+use grim_backend_cuda;
+#[cfg(feature = "rocm")]
+use grim_backend_rocm;
+use crate::catalog::resolve_model_path;
 
 pub async fn cmd_run(model_path: String, prompt: Option<String>, serve: bool, address: String, _plugins: &str) -> Result<()> {
     let prompt = prompt.unwrap_or_else(|| "Hello".to_string());
 
+    // Resolve model name to actual file path
+    let resolved_path = resolve_model_path(&model_path)
+        .or_else(|| {
+            // Accept a direct file path if it exists on disk.
+            let p = std::path::Path::new(&model_path);
+            if p.exists() { Some(p.to_path_buf()) } else { None }
+        })
+        .ok_or_else(|| grim_core::error::Error::Config(
+            format!("Model '{}' not found. Run 'grim pull {}' to download it.",
+                model_path, model_path)
+        ))?;
+    let model_path_str = resolved_path.to_string_lossy().to_string();
+    eprintln!("[grim] Resolved model path: {}", model_path_str);
+
     // Probe for ROCm GPUs; fall back to CPU if none are available.
     // §13.2: we fail closed — if a path was given but we can't open the file,
     // we crash rather than silently running a random toy model.
-    let gguf_path = std::path::Path::new(&model_path);
-    let use_gguf = gguf_path.is_file() && model_path.to_lowercase().ends_with(".gguf");
+    let gguf_path = std::path::Path::new(&model_path_str);
+    let use_gguf = gguf_path.is_file() && model_path_str.to_lowercase().ends_with(".gguf");
 
     let (device, device_name) = if let Ok(s) = std::env::var("GRIM_FORCE_DEVICE") {
         match s.as_str() {
@@ -85,69 +107,60 @@ pub async fn cmd_run(model_path: String, prompt: Option<String>, serve: bool, ad
     if serve {
         let mut engine = Engine::new(EngineConfig::default());
         let model: Box<dyn CausalLm> = if use_gguf {
-            eprintln!("[grim] Loading GGUF model: {}", model_path);
-            match load_model_from_gguf(&model_path, device.clone()) {
+            eprintln!("[grim] Loading GGUF model: {}", model_path_str);
+            match load_model_from_gguf(&model_path_str, device.clone()) {
                 Ok(m) => {
                     eprintln!("[grim] GGUF model loaded successfully.");
                     m
                 }
                 Err(e) => {
-                    eprintln!("[grim] ERROR: failed to load GGUF model '{}': {}", model_path, e);
+                    eprintln!("[grim] ERROR: failed to load GGUF model '{}': {}", model_path_str, e);
                     return Err(e);
                 }
             }
         } else {
-            if !use_gguf && gguf_path.exists() {
-                eprintln!(
-                    "[grim] WARNING: '{}' is not a .gguf file; using random toy model.",
-                    model_path
-                );
-            } else if !gguf_path.exists() {
-                eprintln!(
-                    "[grim] WARNING: model path '{}' not found; using random toy model.",
-                    model_path
-                );
-            }
-            Box::new(Llama::random(random_config()))
+            // Never silently run a toy model — error loudly so the user
+            // knows they need to pull a real model first.
+            return Err(grim_core::error::Error::Config(format!(
+                "Model '{}' is not a valid .gguf file or does not exist. \
+                 Run 'grim pull <name>' to download a model first.",
+                model_path_str
+            )));
         };
 
         let model_id = "default";
         engine.register_model(model_id, model);
         eprintln!("[grim] Starting HTTP server on {address}...");
-        grim_server::serve(&address, engine).await?;
+        let serve_model_path = Some(std::path::PathBuf::from(&model_path_str));
+        grim_server::serve(&address, engine, serve_model_path).await?;
         return Ok(());
     }
 
     // One-shot inference path.
     let model: Box<dyn CausalLm> = if use_gguf {
-        eprintln!("[grim] Loading GGUF model: {}", model_path);
-        match load_model_from_gguf(&model_path, device.clone()) {
+        eprintln!("[grim] Loading GGUF model: {}", model_path_str);
+        match load_model_from_gguf(&model_path_str, device.clone()) {
             Ok(m) => {
                 eprintln!("[grim] GGUF model loaded successfully.");
                 m
             }
             Err(e) => {
-                eprintln!("[grim] ERROR: failed to load GGUF model '{}': {}", model_path, e);
+                eprintln!("[grim] ERROR: failed to load GGUF model '{}': {}", model_path_str, e);
                 return Err(e);
             }
         }
     } else {
-        if !use_gguf && gguf_path.exists() {
-            eprintln!(
-                "[grim] WARNING: '{}' is not a .gguf file; using random toy model.",
-                model_path
-            );
-        } else if !gguf_path.exists() {
-            eprintln!(
-                "[grim] WARNING: model path '{}' not found; using random toy model.",
-                model_path
-            );
-        }
-        Box::new(Llama::random(random_config()))
+        // Fail loudly — never generate from a toy model.
+        return Err(grim_core::error::Error::Config(format!(
+            "Model '{}' is not a valid .gguf file or could not be found.\n\
+             Run 'grim pull <name>' to download a model, or provide an\n\
+             explicit path to a .gguf file.",
+            model_path_str
+        )));
     };
 
     let tokenizer = if use_gguf {
-        let provider = grim_format::GgufProvider::open(&model_path)?;
+        let provider = grim_format::GgufProvider::open(&model_path_str)?;
         Some(provider.tokenizer()?)
     } else {
         None
@@ -162,11 +175,41 @@ pub async fn cmd_run(model_path: String, prompt: Option<String>, serve: bool, ad
     } else {
         prompt.bytes().map(|b| b as u32 % 512).collect()
     };
-    let input_tensor = grim_backend_cpu::cpu_tensor(
-        tokens.iter().map(|t| *t as f32).collect::<Vec<f32>>(),
-        grim_tensor::Shape::new(vec![tokens.len()]),
+    
+    // Create input tensor on the same device as the model
+    let shape = grim_tensor::Shape::new(vec![tokens.len()]);
+    let float_tokens: Vec<f32> = tokens.iter().map(|t| *t as f32).collect();
+    let dtype = grim_tensor::dtype::DType::F32;
+    let storage: Arc<dyn grim_tensor::BackendStorage> = match device {
+        grim_tensor::Device::Cpu => {
+            let dev = grim_backend_cpu::CpuDevice::new();
+            Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
+        }
+        grim_tensor::Device::Cuda(ordinal) => {
+            let dev = grim_backend_cuda::CudaDevice::new(ordinal);
+            Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
+        }
+        grim_tensor::Device::Rocm(ordinal) => {
+            let dev = grim_backend_rocm::RocmDevice::new(ordinal);
+            Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
+        }
+        grim_tensor::Device::Vulkan => {
+            let dev = grim_backend_vulkan::VulkanDevice::new();
+            Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
+        }
+        grim_tensor::Device::Metal(ordinal) => {
+            let dev = grim_backend_metal::MetalDevice::new(ordinal);
+            Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
+        }
+    };
+    let input_tensor = grim_tensor::Tensor::new(
+        storage,
+        shape,
+        dtype,
+        grim_tensor::dtype::QuantProvenance::default(),
+        device.clone(),
     );
-
+    
     let mut session = SessionInner::new(model.device().clone());
     let logits = CausalLm::forward(&*model, &mut session, &input_tensor, &input_tensor, &[])?;
     let logits_vec = logits.to_vec_f32()?;
@@ -215,7 +258,7 @@ fn random_config() -> LlamaConfig {
 }
 
 /// Load a model from a GGUF file.
-fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn CausalLm>> {
+pub fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn CausalLm>> {
     use grim_format::GgufProvider;
     use grim_nn::WeightSource;
 

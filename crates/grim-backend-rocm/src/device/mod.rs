@@ -31,3 +31,4 @@ pub mod probe;
 pub mod rocblas;
 pub mod roc_device;
 pub mod util;
+pub mod cubecl;

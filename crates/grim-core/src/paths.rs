@@ -81,14 +81,18 @@ mod tests {
 
     #[test]
     fn models_dir_env_override() {
-        // SAFETY: single-threaded test; env mutation is isolated.
+        // SAFETY: single-threaded test process; env mutation is isolated.
         let prev = std::env::var("GRIM_MODELS_DIR").ok();
-        std::env::set_var("GRIM_MODELS_DIR", "/tmp/grim_test_models");
+        unsafe {
+            std::env::set_var("GRIM_MODELS_DIR", "/tmp/grim_test_models");
+        }
         let dir = grim_models_dir();
         assert_eq!(dir, PathBuf::from("/tmp/grim_test_models"));
-        match prev {
-            Some(v) => std::env::set_var("GRIM_MODELS_DIR", v),
-            None => std::env::remove_var("GRIM_MODELS_DIR"),
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("GRIM_MODELS_DIR", v),
+                None => std::env::remove_var("GRIM_MODELS_DIR"),
+            }
         }
     }
 

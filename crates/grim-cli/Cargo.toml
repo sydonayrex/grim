@@ -20,6 +20,8 @@ grim-models-vision      = { workspace = true }
 grim-backend-cpu = { workspace = true }
 grim-backend-rocm = { workspace = true }
 grim-backend-cuda = { workspace = true }
+grim-backend-vulkan = { workspace = true }
+grim-backend-metal = { workspace = true }
 grim-speculative = { workspace = true }
 grim-plugin = { workspace = true }
 grim-format = { workspace = true }
@@ -28,14 +30,19 @@ grim-nn = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 windows-service = "0.8.1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rcgen = "0.12"
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11", features = ["json", "stream"] }
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
 
 
 [dev-dependencies]
 tempfile = "3"
 
 [features]
-default = []
+default = ["rocm"]
+rocm = ["grim-backend-rocm/cubecl"]
 wasm-sandbox = ["grim-plugin/wasm-sandbox"]

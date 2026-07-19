@@ -167,7 +167,94 @@ impl SpeculativeCausalLm {
         match self.strategy {
             Strategy::Plain => self.target.forward(session, input_ids, positions, adapters),
             Strategy::NativeMtp => self.decode_native_mtp(session, input_ids, positions, adapters),
-            Strategy::DSpark => self.decode_dspark(session, input_ids, positions, live_gpu_utilization, batch_pressure, adapters),
+            Strategy::DSpark => {
+                // T2-4: Implement the actual draft step loop (K=3 draft tokens)
+                let draft = self.draft.as_ref().unwrap();
+                let markov = self.markov.as_ref().unwrap();
+                let confidence = self.confidence.as_ref().unwrap();
+
+                // Phase 1: Run K=3 draft steps
+                let draft_block = draft.draft_block(session, input_ids, 3)?;
+                if draft_block.tokens.is_empty() {
+                    return self.target.forward(session, input_ids, positions, adapters);
+                }
+
+                // Phase 2: Score confidence
+                let scores = confidence.score(&draft_block);
+                let mut scored = draft_block.clone();
+                scored.confidence = scores;
+
+                // Phase 3: Choose verify length dynamically
+                let verify_len = self
+                    .scheduler
+                    .lock()
+                    .unwrap()
+                    .choose_verify_len(&scored, live_gpu_utilization, batch_pressure);
+                let verify_len = verify_len.min(scored.tokens.len());
+
+                if verify_len == 0 {
+                    return self.target.forward(session, input_ids, positions, adapters);
+                }
+
+                // Phase 4: Tentative KV Cache append
+                if let Some(kv) = session.kv_mut() {
+                    kv.tentative_append(verify_len)?;
+                }
+
+                // Apply Markov head bias
+                let prefix = scored.tokens[..verify_len].to_vec();
+                let _bias = markov.bias(&prefix, &scored.base_logits)?;
+
+                // Phase 5: Verification step on Target Causal LM
+                let target_logits = self.target.forward(session, input_ids, positions, adapters)?;
+
+                // Rejection-sampling validation loop
+                let target_probs = target_logits.to_vec_f32()?;
+                let mut accepted_count = 0;
+                for i in 0..verify_len {
+                    let draft_tok = scored.tokens[i];
+                    let p_target = target_probs.get(draft_tok as usize).copied().unwrap_or(0.0);
+                    
+                    // Standard verification acceptance threshold
+                    if p_target >= 0.1 {
+                        accepted_count += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                if let Some(kv) = session.kv_mut() {
+                    kv.commit(accepted_count)?;
+                }
+                session.advance_pos(accepted_count);
+
+                // Update scheduler and check adaptation gating
+                {
+                    let mut sched = self.scheduler.lock().unwrap();
+                    sched.record_acceptance(accepted_count, verify_len);
+
+                    if sched.should_adapt_draft() {
+                        let mut accepted_mask = vec![false; verify_len];
+                        for i in 0..accepted_count {
+                            accepted_mask[i] = true;
+                        }
+                        let target_hidden_states = session.get_last_hidden_state().and_then(|t| t.to_vec_f32().ok());
+                        let refresh_input = crate::distill::DraftRefreshInput {
+                            target_hidden_states,
+                            draft_tokens: scored.tokens[..verify_len].to_vec(),
+                            accepted_mask,
+                        };
+                        let signal = crate::distill::AdaptationSignal {
+                            accept_rate_ema: sched.adaptation_state.accept_rate_ema,
+                            steps_observed: sched.adaptation_state.steps_observed,
+                            min_accept_rate: sched.adaptation_config.min_accept_rate,
+                        };
+                        let _outcome = crate::distill::refresh_draft(&signal, &refresh_input, draft.as_ref())?;
+                    }
+                }
+
+                Ok(target_logits)
+            }
         }
     }
 
@@ -225,104 +312,7 @@ impl SpeculativeCausalLm {
         Ok(target_logits)
     }
 
-    fn decode_dspark(
-        &self,
-        session: &mut dyn SessionT,
-        input_ids: &Tensor,
-        positions: &Tensor,
-        live_gpu_utilization: f32,
-        batch_pressure: usize,
-        adapters: &[AdapterHandle],
-    ) -> Result<Tensor> {
-        let draft = self.draft.as_ref().unwrap();
-        let markov = self.markov.as_ref().unwrap();
-        let confidence = self.confidence.as_ref().unwrap();
 
-        // Phase 1: draft block.
-        let block_len = self.scheduler.lock().unwrap().config.block_len;
-        let draft_block = draft.draft_block(session, input_ids, block_len)?;
-        if draft_block.tokens.is_empty() {
-            return self.target.forward(session, input_ids, positions, adapters);
-        }
-
-        // Phase 2: score.
-        let scores = confidence.score(&draft_block);
-        let mut scored = draft_block.clone();
-        scored.confidence = scores;
-
-        // Phase 3: choose verify length.
-        let verify_len = self
-            .scheduler
-            .lock()
-            .unwrap()
-            .choose_verify_len(&scored, live_gpu_utilization, batch_pressure);
-        let verify_len = verify_len.min(scored.tokens.len());
-
-        if verify_len == 0 {
-            return self.target.forward(session, input_ids, positions, adapters);
-        }
-
-        // Phase 4: tentative append.
-        if let Some(kv) = session.kv_mut() {
-            kv.tentative_append(verify_len)?;
-        }
-
-        // Apply Markov head bias
-        let prefix = scored.tokens[..verify_len].to_vec();
-        let _bias = markov.bias(&prefix, &scored.base_logits)?;
-
-        // Phase 5: verify
-        let target_logits = self.target.forward(session, input_ids, positions, adapters)?;
-
-        // Rejection-sampling validation loop (§5.3)
-        let target_probs = target_logits.to_vec_f32()?;
-        let mut accepted_count = 0;
-        for i in 0..verify_len {
-            let draft_tok = scored.tokens[i];
-            let p_target = target_probs.get(draft_tok as usize).copied().unwrap_or(0.0);
-            
-            // Standard DSpark rejection threshold boundary
-            if p_target >= 0.1 {
-                accepted_count += 1;
-            } else {
-                break;
-            }
-        }
-
-        if let Some(kv) = session.kv_mut() {
-            kv.commit(accepted_count)?;
-        }
-        session.advance_pos(accepted_count);
-
-        // Update scheduler and check adaptation gating (TIDE WI 4)
-        {
-            let mut sched = self.scheduler.lock().unwrap();
-            sched.record_acceptance(accepted_count, verify_len);
-
-            if sched.should_adapt_draft() {
-                // Construct the input mask and extract real target hidden states if present in session
-                let mut accepted_mask = vec![false; verify_len];
-                for i in 0..accepted_count {
-                    accepted_mask[i] = true;
-                }
-                let target_hidden_states = session.get_last_hidden_state().and_then(|t| t.to_vec_f32().ok());
-                let refresh_input = crate::distill::DraftRefreshInput {
-                    target_hidden_states,
-                    draft_tokens: scored.tokens[..verify_len].to_vec(),
-                    accepted_mask,
-                };
-                let signal = crate::distill::AdaptationSignal {
-                    accept_rate_ema: sched.adaptation_state.accept_rate_ema,
-                    steps_observed: sched.adaptation_state.steps_observed,
-                    min_accept_rate: sched.adaptation_config.min_accept_rate,
-                };
-                // Call the distill module's adaptation interface
-                let _outcome = crate::distill::refresh_draft(&signal, &refresh_input, draft.as_ref())?;
-            }
-        }
-
-        Ok(target_logits)
-    }
 }
 
 impl Model for SpeculativeCausalLm {
