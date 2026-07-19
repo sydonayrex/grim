@@ -12,9 +12,9 @@
 use std::ffi::c_void;
 use std::marker::PhantomData;
 
-use grim_tensor::error::{Error, Result};
+use grim_tensor::error::Result;
 
-use crate::{hipHostFree, hipHostMalloc, HipErrorT, hipSuccess};
+use crate::{check_hip, hipHostFree, hipHostMalloc};
 
 /// A host-side staging buffer allocated with `hipHostMalloc` (pinned / page-locked
 /// memory). Pinned buffers transfer over PCIe/xGMI at full bandwidth with
@@ -46,13 +46,9 @@ impl<T: Copy> RocmPinnedBuffer<T> {
         }
         let mut ptr: *mut c_void = std::ptr::null_mut();
         // flags = 0 → default portable pinned memory (hipHostMallocDefault).
-        let res: HipErrorT = unsafe { hipHostMalloc(&mut ptr, len * std::mem::size_of::<T>(), 0) };
-        if res != hipSuccess {
-            return Err(Error::Backend(format!(
-                "hipHostMalloc failed with error code {}",
-                res
-            )));
-        }
+        check_hip("hipHostMalloc", unsafe {
+            hipHostMalloc(&mut ptr, len * std::mem::size_of::<T>(), 0)
+        })?;
         Ok(RocmPinnedBuffer {
             ptr: ptr as *mut T,
             len,
@@ -62,7 +58,7 @@ impl<T: Copy> RocmPinnedBuffer<T> {
 
     /// Allocate pinned memory and copy `slice` into it.
     pub fn from_slice(slice: &[T]) -> Result<Self> {
-        let mut buf = Self::alloc(slice.len())?;
+        let buf = Self::alloc(slice.len())?;
         if !slice.is_empty() {
             unsafe {
                 std::ptr::copy_nonoverlapping(slice.as_ptr(), buf.ptr, slice.len());

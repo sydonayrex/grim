@@ -92,6 +92,8 @@ pub enum BlockDtype {
     Fp4,
     Nf4,
     Fp8,
+    Fp4Block16,
+    Fp8Block16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -631,12 +631,97 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     }))
 }
 
+/// Resolve the configured models directory, checking common locations in order.
+/// Returns the first path that exists, or a sensible default if none do.
+fn resolve_models_dir() -> std::path::PathBuf {
+    let candidates = [
+        // 1. Environment variable override
+        std::env::var("GRIM_MODELS_DIR").ok().map(std::path::PathBuf::from),
+        // 2. Config file `models_dir` key
+        get_default_model_from_config().map(|_| None).unwrap_or(None),
+        // 3. Known install path
+        Some(std::path::PathBuf::from("/var/lib/grim/models")),
+        // 4. User home fallback
+        dirs_sys_home().map(|h| h.join(".grim").join("models")),
+    ];
+    for c in candidates.into_iter().flatten() {
+        if c.exists() {
+            return c;
+        }
+    }
+    std::path::PathBuf::from("/var/lib/grim/models")
+}
+
+/// Portable home-directory probe used only by `resolve_models_dir`.
+fn dirs_sys_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+}
+
+/// `GET /v1/models` — OpenAI-compatible model catalog endpoint.
+///
+/// Scans the configured models directory for files with recognised
+/// extensions (`.grim`, `.gguf`, `.safetensors`, `.bin`) and returns them
+/// as an OpenAI-style `{ "object": "list", "data": [...] }` response.
+/// Also includes any models currently loaded in the engine.
+async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let models_dir = resolve_models_dir();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+
+    // 1. Walk the filesystem catalog.
+    if let Ok(read_dir) = std::fs::read_dir(&models_dir) {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if matches!(ext, "grim" | "gguf" | "safetensors" | "bin") {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let id = format!("{stem}:{ext}");
+                if seen.insert(id.clone()) {
+                    entries.push(serde_json::json!({
+                        "id": id,
+                        "object": "model",
+                        "owned_by": "local",
+                        "created": 0,
+                        "format": ext,
+                        "path": path.display().to_string()
+                    }));
+                }
+            }
+        }
+    }
+
+    // 2. Add any models that are currently loaded in the engine (may not be on disk).
+    {
+        let engine = state.engine.lock().unwrap();
+        for name in engine.loaded_models() {
+            if seen.insert(name.clone()) {
+                entries.push(serde_json::json!({
+                    "id": name,
+                    "object": "model",
+                    "owned_by": "local",
+                    "created": 0,
+                    "format": "loaded"
+                }));
+            }
+        }
+    }
+
+    Json(serde_json::json!({ "object": "list", "data": entries }))
+}
+
 /// Build a new HTTP router with the given engine state.
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/status", get(get_status))
         .route("/metrics", get(metrics_endpoint))
+        .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models/load", post(load_model))
         .route("/v1/models/unload", post(unload_model))

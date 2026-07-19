@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 use std::time::SystemTime;
 
-use grim_tensor::error::{Error, Result};
+use grim_tensor::error::Result;
 
 /// Cache for compiled .hsaco kernels.
 #[derive(Debug)]

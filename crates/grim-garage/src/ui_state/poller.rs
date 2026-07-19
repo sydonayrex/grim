@@ -88,6 +88,9 @@ fn job_summary_to_ui_job(s: JobSummaryDto) -> UiJob {
             crate::jobs::TrainingMode::Lora => "LoRA".into(),
             crate::jobs::TrainingMode::QLoRA => "QLoRA".into(),
             crate::jobs::TrainingMode::Bf16Full => "Bf16-Full".into(),
+            crate::jobs::TrainingMode::Orpo => "ORPO".into(),
+            crate::jobs::TrainingMode::Dpo => "DPO".into(),
+            crate::jobs::TrainingMode::Grpo => "GRPO".into(),
         },
     }
 }

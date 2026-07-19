@@ -12,7 +12,7 @@
 //! can land later behind a feature gate (`GRIM_GARAGE_UI=window`).
 
 use cvkg::headless::{CvkgHeadless, HeadlessFrame};
-use cvkg::prelude::{Rect, View};
+use cvkg::prelude::Rect;
 use cvkg_components::Text;
 
 use crate::view_model::ViewModel;

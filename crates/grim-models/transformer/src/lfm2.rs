@@ -286,8 +286,8 @@ impl CausalLm for Lfm2 {
 
 // Helpers
 fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    let dev = grim_backend_cpu::CpuDevice::new();
-    let (s, h) = grim_tensor::BackendDevice::add(&dev, a.storage().as_ref(), b.storage().as_ref(), a.shape())?;
+    let dev = grim_nn::modules::pick_device_for_tensor(a);
+    let (s, h) = grim_tensor::BackendDevice::add(&*dev, a.storage().as_ref(), b.storage().as_ref(), a.shape())?;
     h.synchronize()?;
     Ok(Tensor::new(Arc::from(s), a.shape().clone(), DType::F32, a.provenance().clone(), a.device().clone()))
 }

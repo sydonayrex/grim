@@ -6,7 +6,9 @@
 //! pipeline to ensure full capability compatibility on all supported targets.
 
 use grim_tensor::backend::ComputeHandle;
-use grim_tensor::dtype::{ArithType, DType, QuantProvenance};
+use grim_tensor::dtype::{DType, QuantProvenance};
+#[cfg(target_vendor = "apple")]
+use grim_tensor::dtype::ArithType;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendDevice, BackendStorage, Shape};
 
@@ -58,22 +60,18 @@ impl ComputeHandle for MetalHandle {
 #[derive(Debug)]
 pub struct MetalStorage {
     buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-    bytes: usize,
     shape: Shape,
     dtype: DType,
     provenance: QuantProvenance,
-    ordinal: usize,
 }
 
 #[cfg(not(target_vendor = "apple"))]
 #[derive(Debug)]
 pub struct MetalStorage {
     data: std::sync::Mutex<Vec<f32>>,
-    bytes: usize,
     shape: Shape,
     dtype: DType,
     provenance: QuantProvenance,
-    ordinal: usize,
 }
 
 impl BackendStorage for MetalStorage {
@@ -130,6 +128,7 @@ pub struct MetalDevice {
 #[cfg(not(target_vendor = "apple"))]
 #[derive(Debug, Clone)]
 pub struct MetalDevice {
+    #[allow(dead_code)]
     ordinal: usize,
 }
 
@@ -180,24 +179,19 @@ impl BackendDevice for MetalDevice {
 
             Ok(Box::new(MetalStorage {
                 buffer,
-                bytes,
                 shape: shape.clone(),
                 dtype,
                 provenance: QuantProvenance::GrimNative,
-                ordinal: self.ordinal,
             }))
         }
         #[cfg(not(target_vendor = "apple"))]
         {
             let elem_count = shape.elem_count();
-            let bytes = elem_count * dtype_byte_size(&dtype);
             Ok(Box::new(MetalStorage {
                 data: std::sync::Mutex::new(vec![0.0f32; elem_count]),
-                bytes,
                 shape: shape.clone(),
                 dtype,
                 provenance: QuantProvenance::GrimNative,
-                ordinal: self.ordinal,
             }))
         }
     }
@@ -324,23 +318,18 @@ impl BackendDevice for MetalDevice {
 
             Ok(Box::new(MetalStorage {
                 buffer,
-                bytes,
                 shape: shape.clone(),
                 dtype,
                 provenance: QuantProvenance::GrimNative,
-                ordinal: self.ordinal,
             }))
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            let bytes = shape.elem_count() * dtype_byte_size(&dtype);
             Ok(Box::new(MetalStorage {
                 data: std::sync::Mutex::new(data.to_vec()),
-                bytes,
                 shape: shape.clone(),
                 dtype,
                 provenance: QuantProvenance::GrimNative,
-                ordinal: self.ordinal,
             }))
         }
     }
@@ -385,6 +374,7 @@ where
 }
 
 /// Helper function to retrieve the size in bytes of a data type.
+#[cfg(target_vendor = "apple")]
 fn dtype_byte_size(dtype: &DType) -> usize {
     match dtype.arith {
         ArithType::F32 | ArithType::U32 => 4,

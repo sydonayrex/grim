@@ -26,6 +26,8 @@ pub enum QuantFormat {
     Fp4,
     Nf4,
     Fp8,
+    Fp4Block16,
+    Fp8Block16,
 }
 
 #[derive(Debug, Clone)]
@@ -61,117 +63,113 @@ pub fn dequant_gptq_group_int(
     qweight: &[u8],
     qzeros: &[u8],
     scales: &[u8],
+    g_idx: Option<&[u8]>,
     shape: &[usize],
     bits: u32,
     group_size: usize,
 ) -> Result<Vec<f32>> {
     let in_features = shape[0];
     let out_features = shape[1];
-    let num_groups = (in_features + group_size - 1) / group_size;
     
-    // Dequant output
     let mut out = vec![0.0f32; in_features * out_features];
     
-    // Compute packed element stride
     let values_per_word = match bits {
         2 => 16,
-        3 => 32, // Special: 32 values across 3 words
+        3 => 32,
         4 => 8,
         8 => 1,
         _ => return Err(Error::Backend(format!("unsupported GPTQ bits: {bits}"))),
     };
     
-    let words_per_group = match bits {
-        2 => (group_size + 15) / 16,
-        3 => 3 * ((group_size + 31) / 32), // Cross-word packing
-        4 => (group_size + 7) / 8,
-        8 => group_size,
-        _ => unreachable!(),
-    };
-    
-    let words_per_row = match bits {
-        2 => (out_features + 15) / 16,
-        3 => 3 * ((out_features + 31) / 32),
-        4 => (out_features + 7) / 8,
-        8 => out_features,
-        _ => unreachable!(),
-    };
-    
-    for g in 0..num_groups {
-        let scale = if bits == 8 {
-            // For 8-bit, scales are f8 or use uint8 with default scale
-            1.0f32
+    let read_u32 = |bytes: &[u8], word_idx: usize| -> u32 {
+        let offset = word_idx * 4;
+        if offset + 4 <= bytes.len() {
+            u32::from_le_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ])
         } else {
-            // Parse scale (f32 or f16 depending on format)
-            let scale_bytes = [scales[g * 4], scales[g * 4 + 1], scales[g * 4 + 2], scales[g * 4 + 3]];
-            f32::from_le_bytes(scale_bytes)
-        };
-        
-        for row in 0..out_features {
-            let out_idx = (g * group_size) * out_features + row;
-            
-            if bits == 3 {
-                // 3-bit cross-word unpacking
-                let word_base = g * words_per_group * out_features + row * words_per_row;
-                let mut val_idx = 0usize;
-                
-                // Unpack 32 values across 3 u32 words
-                for &word_idx in &[word_base, word_base + 1, word_base + 2] {
-                    let word = u32::from_le_bytes([
-                        qweight[word_idx * 4],
-                        qweight[word_idx * 4 + 1],
-                        qweight[word_idx * 4 + 2],
-                        qweight[word_idx * 4 + 3],
-                    ]);
-                    
-                    // Each word contributes ~10-11 values
-                    // This is a simplified unpacking - real GPTQ uses lookup tables
-                    for bit_offset in 0..32 {
-                        if val_idx >= group_size {
-                            break;
-                        }
-                        let bits_val = ((word >> bit_offset) as u32) & 0x7;
-                        let zero = ((qzeros[g * 2] as u32) | ((qzeros[g * 2 + 1] as u32) << 8)) as u8 as f32;
-                        let quantized = bits_val as f32;
-                        out[out_idx + val_idx * out_features] = (quantized - zero) * scale;
-                        val_idx += 1;
-                    }
-                }
+            0
+        }
+    };
+    
+    let get_group = |in_idx: usize| -> usize {
+        if let Some(bytes) = g_idx {
+            if bytes.len() == in_features * 4 {
+                let offset = in_idx * 4;
+                u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]) as usize
+            } else if bytes.len() == in_features * 8 {
+                let offset = in_idx * 8;
+                u64::from_le_bytes([
+                    bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
+                    bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]
+                ]) as usize
             } else {
-                // 2/4/8-bit unpacking (simpler)
-                let word_base = g * words_per_group + row * words_per_row;
-                for col in 0..group_size {
-                    let src_idx = word_base + col / values_per_word;
-                    let bit_offset = match bits {
-                        2 => (col % 16) * 2,
-                        4 => (col % 8) * 4,
-                        8 => col,
-                        _ => unreachable!(),
-                    };
-                    
-                    let quantized = match bits {
-                        2 => (qweight[src_idx] as u32 >> bit_offset) & 0x3,
-                        4 => (qweight[src_idx] as u32 >> bit_offset) & 0xF,
-                        8 => qweight[src_idx] as u32,
-                        _ => unreachable!(),
-                    };
-                    
-                    // Get zero-point for this group
-                    let zero = match bits {
-                        2 | 4 => {
-                            let (zl, zh) = match bits {
-                                2 => (qzeros[g], qzeros[g / 128]),
-                                4 => (qzeros[g * 2], qzeros[g * 2 + 1]),
-                                _ => (0, 0),
-                            };
-                            u16::from_le_bytes([zl, zh]) as f32
-                        }
-                        _ => 0.0,
-                    };
-                    
-                    out[out_idx + col * out_features] = (quantized as f32 - zero) * scale;
-                }
+                in_idx / group_size
             }
+        } else {
+            in_idx / group_size
+        }
+    };
+
+    let words_per_row_zeros = (out_features + values_per_word - 1) / values_per_word;
+    
+    for in_idx in 0..in_features {
+        let g = get_group(in_idx);
+        
+        for out_idx in 0..out_features {
+            // Read scale
+            let scale_idx = g * out_features + out_idx;
+            let scale = if scale_idx * 4 + 4 <= scales.len() {
+                f32::from_le_bytes([
+                    scales[scale_idx * 4],
+                    scales[scale_idx * 4 + 1],
+                    scales[scale_idx * 4 + 2],
+                    scales[scale_idx * 4 + 3],
+                ])
+            } else {
+                1.0f32
+            };
+            
+            // Read zero-point
+            let zero = if bits == 3 {
+                let super_idx = out_idx / 32;
+                let total_bit = (out_idx % 32) * 3;
+                let zero_word_idx = g * (3 * ((out_features + 31) / 32)) + super_idx * 3;
+                let word0 = read_u32(qzeros, zero_word_idx) as u128;
+                let word1 = read_u32(qzeros, zero_word_idx + 1) as u128;
+                let word2 = read_u32(qzeros, zero_word_idx + 2) as u128;
+                let packed = word0 | (word1 << 32) | (word2 << 64);
+                let zero_val = ((packed >> total_bit) & 0x7) as u32;
+                (zero_val + 1) as f32
+            } else {
+                let zero_word_idx = g * words_per_row_zeros + out_idx / values_per_word;
+                let zero_word = read_u32(qzeros, zero_word_idx);
+                let bit_offset = (out_idx % values_per_word) * bits as usize;
+                let zero_val = (zero_word >> bit_offset) & ((1 << bits) - 1);
+                (zero_val + 1) as f32
+            };
+            
+            // Read quantized code
+            let quantized_code = if bits == 3 {
+                let super_idx = in_idx / 32;
+                let total_bit = (in_idx % 32) * 3;
+                let word0_idx = (super_idx * 3) * out_features + out_idx;
+                let word0 = read_u32(qweight, word0_idx) as u128;
+                let word1 = read_u32(qweight, word0_idx + out_features) as u128;
+                let word2 = read_u32(qweight, word0_idx + 2 * out_features) as u128;
+                let packed = word0 | (word1 << 32) | (word2 << 64);
+                ((packed >> total_bit) & 0x7) as u32
+            } else {
+                let word_idx = (in_idx / values_per_word) * out_features + out_idx;
+                let word = read_u32(qweight, word_idx);
+                let bit_offset = (in_idx % values_per_word) * bits as usize;
+                (word >> bit_offset) & ((1 << bits) - 1)
+            };
+            
+            out[in_idx * out_features + out_idx] = (quantized_code as f32 - zero) * scale;
         }
     }
     
@@ -318,21 +316,17 @@ const FP4_E2M1_LUT: [f32; 16] = [
     0.875,     // 1111 -> +0.875
 ];
 
-/// Dequantize FP4 (E2M1 4-bit floating point) bytes to f32.
-/// FP4/TensorFloat-4: 16 values packed per u32, using E2M1 representation.
-/// Layout: packed 4-bit values, one f32 scale per tensor.
+/// Dequantize FP4 E2M1 bytes to f32.
 pub fn dequant_fp4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     let mut out = Vec::with_capacity(num_values);
-    
-    // Read scale from first 4 bytes (default to 1.0)
     let scale = if data.len() >= 4 {
         f32::from_le_bytes([data[0], data[1], data[2], data[3]])
     } else {
         1.0
     };
     
-    // Decode packed FP4 values starting at byte 4
-    for (i, &byte) in data[4..].iter().enumerate() {
+    let data_start = if data.len() >= 8 { 4 } else { 0 };
+    for (i, &byte) in data[data_start..].iter().enumerate() {
         let hi = FP4_E2M1_LUT[(byte >> 4) as usize] * scale;
         let lo = FP4_E2M1_LUT[(byte & 0x0F) as usize] * scale;
         
@@ -344,7 +338,121 @@ pub fn dequant_fp4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
             out.push(lo);
         }
     }
-    
+    while out.len() < num_values {
+        out.push(0.0);
+    }
+    Ok(out)
+}
+
+/// Dequantize block-scaled FP4 E2M1 bytes to f32.
+pub fn dequant_fp4_block16(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
+    if num_values == 0 {
+        return Ok(Vec::new());
+    }
+    let global_scale = if data.len() >= 4 {
+        f32::from_le_bytes([data[0], data[1], data[2], data[3]])
+    } else {
+        1.0
+    };
+
+    let num_blocks = num_values.div_ceil(16);
+    let mut out = Vec::with_capacity(num_values);
+    let mut pos = 4;
+    for b in 0..num_blocks {
+        if pos >= data.len() {
+            break;
+        }
+        let block_scale_fp8 = data[pos];
+        let block_scale = fp8_e4m3_to_f32(block_scale_fp8);
+        let scale = block_scale * global_scale;
+        pos += 1;
+        
+        let block_rem = num_values - b * 16;
+        let block_len = block_rem.min(16);
+        
+        for i in 0..8 {
+            if pos + i >= data.len() {
+                break;
+            }
+            let byte = data[pos + i];
+            let hi = FP4_E2M1_LUT[(byte >> 4) as usize] * scale;
+            let lo = FP4_E2M1_LUT[(byte & 0x0F) as usize] * scale;
+            
+            let idx = i * 2;
+            if idx < block_len {
+                out.push(hi);
+            }
+            if idx + 1 < block_len {
+                out.push(lo);
+            }
+        }
+        pos += 8;
+    }
+    while out.len() < num_values {
+        out.push(0.0);
+    }
+    Ok(out)
+}
+
+/// Dequantize FP8 (8-bit floating point) bytes to f32.
+pub fn dequant_fp8(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
+    let mut out = Vec::with_capacity(num_values);
+    let scale = if data.len() >= 4 {
+        f32::from_le_bytes([data[0], data[1], data[2], data[3]])
+    } else {
+        1.0
+    };
+    let data_start = if data.len() >= 8 { 4 } else { 0 };
+    for (i, &byte) in data[data_start..].iter().enumerate() {
+        if i >= num_values {
+            break;
+        }
+        out.push(fp8_e4m3_to_f32(byte) * scale);
+    }
+    while out.len() < num_values {
+        out.push(0.0);
+    }
+    Ok(out)
+}
+
+/// Dequantize block-scaled FP8 bytes to f32.
+pub fn dequant_fp8_block16(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
+    if num_values == 0 {
+        return Ok(Vec::new());
+    }
+    let global_scale = if data.len() >= 4 {
+        f32::from_le_bytes([data[0], data[1], data[2], data[3]])
+    } else {
+        1.0
+    };
+
+    let num_blocks = num_values.div_ceil(16);
+    let mut out = Vec::with_capacity(num_values);
+    let mut pos = 4;
+    for b in 0..num_blocks {
+        if pos >= data.len() {
+            break;
+        }
+        let block_scale_fp8 = data[pos];
+        let block_scale = fp8_e4m3_to_f32(block_scale_fp8);
+        let scale = block_scale * global_scale;
+        pos += 1;
+        
+        let block_rem = num_values - b * 16;
+        let block_len = block_rem.min(16);
+        
+        for i in 0..block_len {
+            if pos + i >= data.len() {
+                break;
+            }
+            let byte = data[pos + i];
+            out.push(fp8_e4m3_to_f32(byte) * scale);
+        }
+        pos += 16;
+    }
+    while out.len() < num_values {
+        out.push(0.0);
+    }
     Ok(out)
 }
 
@@ -404,7 +512,6 @@ pub fn dequant_nf4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
 /// E4M3: exponent bias = 7, max value ≈ 240, min normalized ≈ 0.03125
 /// E5M2: exponent bias = 15, max value = 31, supports infinity
 const FP8_E4M3_BIAS: i32 = 7;
-const FP8_E5M2_BIAS: i32 = 15;
 
 /// Convert FP8 E4M3 (4-bit exponent, 3-bit mantissa) to f32.
 /// Layout: 1 sign | 4 exp | 3 mantissa
@@ -436,61 +543,7 @@ fn fp8_e4m3_to_f32(byte: u8) -> f32 {
     if sign != 0 { -result } else { result }
 }
 
-/// Convert FP8 E5M2 (5-bit exponent, 2-bit mantissa) to f32.
-/// Layout: 1 sign | 5 exp | 2 mantissa
-fn fp8_e5m2_to_f32(byte: u8) -> f32 {
-    let sign = (byte & 0x80) as i32;
-    let exp = ((byte >> 2) & 0x1F) as i32;
-    let mant = (byte & 0x03) as i32;
-    
-    if exp == 0x1F {
-        // Infinity or NaN
-        if mant == 0 {
-            return if sign != 0 { f32::NEG_INFINITY } else { f32::INFINITY };
-        } else {
-            return f32::NAN;
-        }
-    }
-    
-    let mut result = (mant as f32) / 2.0 + 1.0;
-    if exp != 0 {
-        result *= 2f32.powi(exp - FP8_E5M2_BIAS);
-    }
-    
-    if sign != 0 { -result } else { result }
-}
 
-/// Dequantize FP8 (8-bit floating point) bytes to f32.
-/// FP8 format (E4M3 or E5M2): one fp8 per byte.
-/// Layout: f32 scale (optional, first 4 bytes) followed by raw fp8 bytes.
-pub fn dequant_fp8(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
-    let mut out = Vec::with_capacity(num_values);
-    
-    // Read optional scale from first 4 bytes (default to 1.0)
-    let scale = if data.len() >= 4 {
-        f32::from_le_bytes([data[0], data[1], data[2], data[3]])
-    } else {
-        1.0
-    };
-    
-    // Decode FP8 values (use bytes after scale, or all bytes if no scale)
-    let data_start = if data.len() >= 8 { 4 } else { 0 };
-    
-    for (i, &byte) in data[data_start..].iter().enumerate() {
-        if i >= num_values {
-            break;
-        }
-        // Use E4M3 format by default (most common for ROCm)
-        out.push(fp8_e4m3_to_f32(byte) * scale);
-    }
-    
-    // Pad if necessary
-    while out.len() < num_values {
-        out.push(0.0);
-    }
-    
-    Ok(out)
-}
 
 fn f16_to_f32(lo: u8, hi: u8) -> f32 {
     let bits = u16::from_le_bytes([lo, hi]);
@@ -620,26 +673,6 @@ pub fn quant_nf4(data: &[f32]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(4 + (data.len() + 1) / 2);
     out.extend_from_slice(&scale.to_le_bytes());
     
-    // NF4 lookup for inverse mapping
-    const NF4_INV: [i32; 16] = [
-        -10, // -1.0
-        -7,  // -0.6992
-        -5,  // -0.5
-        -4,  // -0.4004
-        -3,  // -0.3164
-        -2,  // -0.2383
-        -1,  // -0.1660
-        -1,  // -0.1001 (rounded)
-        1,   // 0.1001
-        1,   // 0.1660
-        2,   // 0.2383
-        3,   // 0.3164
-        4,   // 0.4004
-        5,   // 0.5
-        7,   // 0.6992
-        10,  // 1.0 (normalized)
-    ];
-    
     let mut packed_byte = 0u8;
     for (i, &v) in data.iter().enumerate() {
         let normalized = (v / scale).clamp(-1.0, 1.0);
@@ -737,13 +770,107 @@ fn f32_to_fp8_e4m3(v: f32) -> u8 {
     // Compute mantissa (3 bits, values 0-7)
     let mant = if exp_biased > 0 {
         let normalized = abs / 2f32.powi(exp);
-        ((normalized - 1.0) * 8.0).round() as u8 & 0x07
+        let m = ((normalized - 1.0) * 8.0).round() as u8;
+        if m >= 8 {
+            let next_exp = (exp + 1 + FP8_E4M3_BIAS).min(15);
+            return sign | ((next_exp as u8) << 3);
+        }
+        m & 0x07
     } else {
         // Subnormal: just use the value directly scaled
-        (abs * 8.0).round() as u8 & 0x07
+        let m = (abs * 8.0).round() as u8;
+        if m >= 8 {
+            // Carry over to normalized 1.0
+            return sign | 56;
+        }
+        m & 0x07
     };
     
     sign | ((exp_biased as u8 & 0x0F) << 3) | mant
+}
+
+/// Quantize f32 values to block-scaled FP4 (E2M1) bytes.
+pub fn quant_fp4_block16(data: &[f32], block_size: usize) -> Result<Vec<u8>> {
+    assert_eq!(block_size, 16);
+    let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let global_scale = if max_abs == 0.0 { 1.0 } else { max_abs };
+    
+    let num_blocks = data.len().div_ceil(block_size);
+    let mut out = Vec::with_capacity(4 + num_blocks * 9);
+    out.extend_from_slice(&global_scale.to_le_bytes());
+    
+    for block in data.chunks(block_size) {
+        let block_max = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let block_scale = (block_max / global_scale).min(1.0);
+        let block_scale_fp8 = f32_to_fp8_e4m3(block_scale);
+        out.push(block_scale_fp8);
+        
+        let rec_block_scale = fp8_e4m3_to_f32(block_scale_fp8);
+        let effective_scale = rec_block_scale * global_scale;
+        
+        let mut packed_byte = 0u8;
+        for (i, &v) in block.iter().enumerate() {
+            let normalized = if effective_scale == 0.0 { 0.0 } else { (v / effective_scale).clamp(-1.0, 1.0) };
+            
+            // Nearest neighbor search in FP4_E2M1_LUT
+            let mut code = 0;
+            let mut min_diff = f32::MAX;
+            for c in 0..16 {
+                let diff = (normalized - FP4_E2M1_LUT[c]).abs();
+                if diff < min_diff {
+                    min_diff = diff;
+                    code = c;
+                }
+            }
+            
+            if i % 2 == 0 {
+                packed_byte = (code as u8) << 4;
+            } else {
+                packed_byte |= code as u8;
+                out.push(packed_byte);
+            }
+        }
+        if block.len() % 2 == 1 {
+            out.push(packed_byte);
+        }
+        // Pad the block to 8 bytes of packed data if it was short
+        let expected_packed_len = 8;
+        let actual_packed_len = (block.len() + 1) / 2;
+        if actual_packed_len < expected_packed_len {
+            out.resize(out.len() + (expected_packed_len - actual_packed_len), 0);
+        }
+    }
+    Ok(out)
+}
+
+/// Quantize f32 values to block-scaled FP8 (E4M3) bytes.
+pub fn quant_fp8_block16(data: &[f32], block_size: usize) -> Result<Vec<u8>> {
+    assert_eq!(block_size, 16);
+    let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let global_scale = if max_abs == 0.0 { 1.0 } else { max_abs };
+    
+    let num_blocks = data.len().div_ceil(block_size);
+    let mut out = Vec::with_capacity(4 + num_blocks * 17);
+    out.extend_from_slice(&global_scale.to_le_bytes());
+    
+    for block in data.chunks(block_size) {
+        let block_max = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let block_scale = (block_max / global_scale).min(1.0);
+        let block_scale_fp8 = f32_to_fp8_e4m3(block_scale);
+        out.push(block_scale_fp8);
+        
+        let rec_block_scale = fp8_e4m3_to_f32(block_scale_fp8);
+        let effective_scale = rec_block_scale * global_scale;
+        
+        for &v in block {
+            let val_scaled = if effective_scale == 0.0 { 0.0 } else { v / effective_scale };
+            out.push(f32_to_fp8_e4m3(val_scaled));
+        }
+        if block.len() < 16 {
+            out.resize(out.len() + (16 - block.len()), 0);
+        }
+    }
+    Ok(out)
 }
 
 fn quant_packed_symmetric(
@@ -809,6 +936,8 @@ pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<Rew
         QuantFormat::Fp4 => quant_fp4(data)?,
         QuantFormat::Nf4 => quant_nf4(data)?,
         QuantFormat::Fp8 => quant_fp8(data)?,
+        QuantFormat::Fp4Block16 => quant_fp4_block16(data, 16)?,
+        QuantFormat::Fp8Block16 => quant_fp8_block16(data, 16)?,
     };
 
     Ok(RewrittenTensorData {
@@ -1335,15 +1464,6 @@ pub fn randomized_svd_importance(
     }
 
     Ok((u_trunc, s, vt_trunc))
-}
-
-trait Clamp {
-    fn clamp(self, lo: f32, hi: f32) -> Self;
-}
-impl Clamp for f32 {
-    fn clamp(self, lo: f32, hi: f32) -> Self {
-        if self < lo { lo } else if self > hi { hi } else { self }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2110,6 +2230,7 @@ mod tests {
             &qweight,
             &qzeros,
             &scales_bytes,
+            None,
             &[32, 1], // in_features=32, out_features=1
             3,       // 3-bit
             32,      // group_size=32
@@ -2135,6 +2256,7 @@ mod tests {
             &qweight,
             &qzeros,
             &scales_bytes,
+            None,
             &[16, 1], // in_features=16
             2,       // 2-bit
             16,      // group_size=16
@@ -2160,6 +2282,7 @@ mod tests {
             &qweight,
             &qzeros,
             &scales_bytes,
+            None,
             &[8, 1], // in_features=8
             4,       // 4-bit
             8,       // group_size=8
@@ -2530,11 +2653,97 @@ mod tests {
 
     #[test]
     fn dequant_fp8_handles_short_buffer_without_panic() {
-        // dequant_fp8 with `data.len() < 8` uses data_start=0 (no scale
-        // prefix). The boundary at len=7 vs len=8 must not panic.
         let short = vec![0u8; 3];
         let _ = dequant_fp8(&short, 3).expect("short fp8 dequant");
         let exact = vec![0u8; 8];
         let _ = dequant_fp8(&exact, 4).expect("fp8 dequant at scale boundary");
+    }
+
+    #[test]
+    fn fp4_block_round_trip() {
+        let data: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.1).collect();
+        let q = quant_fp4_block16(&data, 16).expect("quant block fp4");
+        println!("fp4 q: {:?}", q);
+        let d = dequant_fp4_block16(&q, 32).expect("dequant block fp4");
+        println!("fp4 d: {:?}", d);
+        assert_eq!(d.len(), 32);
+        for (got, want) in d.iter().zip(data.iter()) {
+            assert!((got - want).abs() < 0.15, "FP4 block round trip error too high: got {} vs want {}", got, want);
+        }
+    }
+
+    #[test]
+    fn fp8_block_round_trip() {
+        let data: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) * 0.1).collect();
+        let q = quant_fp8_block16(&data, 16).expect("quant block fp8");
+        println!("fp8 q: {:?}", q);
+        let d = dequant_fp8_block16(&q, 32).expect("dequant block fp8");
+        println!("fp8 d: {:?}", d);
+        assert_eq!(d.len(), 32);
+        for (got, want) in d.iter().zip(data.iter()) {
+            assert!((got - want).abs() < 0.15, "FP8 block round trip error too high: got {} vs want {}", got, want);
+        }
+    }
+
+    #[test]
+    fn test_gptq_dequant_correctness_fixture() {
+        let in_features = 32;
+        let out_features = 32;
+        let group_size = 16;
+        let bits = 4;
+        let values_per_word = 8;
+        
+        let mut expected = vec![0.0f32; in_features * out_features];
+        let mut qweight = vec![0u8; (in_features / values_per_word) * out_features * 4];
+        let mut qzeros = vec![0u8; (in_features / group_size) * (out_features / values_per_word) * 4];
+        let mut scales = vec![0u8; (in_features / group_size) * out_features * 4];
+        
+        let zero_val = 7u32;
+        let scale_val = 0.5f32;
+        
+        let num_groups = in_features / group_size;
+        for g in 0..num_groups {
+            for col in 0..out_features {
+                let scale_idx = g * out_features + col;
+                let sb = scale_val.to_le_bytes();
+                scales[scale_idx * 4..scale_idx * 4 + 4].copy_from_slice(&sb);
+                
+                let zero_word_idx = g * (out_features / values_per_word) + col / values_per_word;
+                let bit_offset = (col % values_per_word) * bits;
+                let offset = zero_word_idx * 4;
+                let mut word = u32::from_le_bytes([qzeros[offset], qzeros[offset+1], qzeros[offset+2], qzeros[offset+3]]);
+                word |= zero_val << bit_offset;
+                qzeros[offset..offset+4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        
+        for in_idx in 0..in_features {
+            for out_idx in 0..out_features {
+                let code = ((in_idx + out_idx) % 16) as u32;
+                expected[in_idx * out_features + out_idx] = (code as f32 - (zero_val + 1) as f32) * scale_val;
+                
+                let word_idx = (in_idx / values_per_word) * out_features + out_idx;
+                let bit_offset = (in_idx % values_per_word) * bits;
+                let offset = word_idx * 4;
+                let mut word = u32::from_le_bytes([qweight[offset], qweight[offset+1], qweight[offset+2], qweight[offset+3]]);
+                word |= code << bit_offset;
+                qweight[offset..offset+4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        
+        let dequanted = dequant_gptq_group_int(
+            &qweight,
+            &qzeros,
+            &scales,
+            None,
+            &[in_features, out_features],
+            bits as u32,
+            group_size,
+        ).unwrap();
+        
+        assert_eq!(dequanted.len(), expected.len());
+        for i in 0..dequanted.len() {
+            assert!((dequanted[i] - expected[i]).abs() < 1e-5, "Mismatch at index {}: got {}, want {}", i, dequanted[i], expected[i]);
+        }
     }
 }

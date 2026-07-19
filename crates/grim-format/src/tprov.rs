@@ -187,8 +187,10 @@ impl TensorProvider for GgufProvider {
 /// Safetensors-backed `TensorProvider`.
 pub struct SafetensorsProvider {
     info: std::collections::HashMap<String, SafetensorInfo>,
+    tensors: std::collections::HashMap<String, SafetensorInfo>,
     reader: std::sync::Mutex<BufReader<File>>,
     data_region_start: u64,
+    gptq: Option<crate::gptq::GptqProvider>,
 }
 
 impl SafetensorsProvider {
@@ -196,7 +198,7 @@ impl SafetensorsProvider {
         let file = File::open(path)
             .map_err(|e| Error::Backend(format!("cannot open safetensors file '{path}': {e}")))?;
         let reader = BufReader::new(file);
-        let (info, data_region_start) = read_safetensors_header(reader)?;
+        let (info, _metadata, data_region_start) = read_safetensors_header(reader)?;
 
         // §5.3 companion draft bundle config loading
         let companion_path = format!("{}.json", path);
@@ -206,19 +208,57 @@ impl SafetensorsProvider {
             }
         }
 
+        let has_gptq = info.keys().any(|k| k.ends_with(".qweight"));
+        let gptq = if has_gptq {
+            Some(crate::gptq::GptqProvider::open(path)?)
+        } else {
+            None
+        };
+
+        let mut tensors = info.clone();
+        if let Some(ref g) = gptq {
+            tensors.retain(|k, _| {
+                !k.ends_with(".qweight") && !k.ends_with(".qzeros") && !k.ends_with(".scales") && !k.ends_with(".g_idx")
+            });
+            for (base_name, gptq_info) in &g.tensors {
+                let qweight_name = format!("{}.qweight", base_name);
+                if let Some(qw_info) = info.get(&qweight_name) {
+                    tensors.insert(base_name.clone(), SafetensorInfo {
+                        name: base_name.clone(),
+                        dims: gptq_info.shape.clone(),
+                        dtype_tag: qw_info.dtype_tag.clone(),
+                        data_start: qw_info.data_start,
+                        data_end: qw_info.data_end,
+                    });
+                }
+            }
+        }
+
         let file = File::open(path)
             .map_err(|e| Error::Backend(format!("cannot reopen safetensors file '{path}': {e}")))?;
         let reader = std::sync::Mutex::new(BufReader::new(file));
         Ok(Self {
             info,
+            tensors,
             reader,
             data_region_start,
+            gptq,
         })
+    }
+
+    /// Access the logical tensor index (filtered for quantized GPTQ models).
+    pub fn tensors(&self) -> &std::collections::HashMap<String, SafetensorInfo> {
+        &self.tensors
     }
 }
 
 impl TensorProvider for SafetensorsProvider {
     fn get(&self, name: &str) -> Result<RawTensor> {
+        if let Some(ref gptq) = self.gptq {
+            if gptq.tensors.contains_key(name) {
+                return gptq.get(name);
+            }
+        }
         let info = self.info.get(name).ok_or_else(|| {
             Error::Backend(format!("tensor '{name}' not found in safetensors file"))
         })?;
@@ -227,17 +267,22 @@ impl TensorProvider for SafetensorsProvider {
         Ok(RawTensor {
             bytes,
             shape: info.shape(),
-            dtype: info.grim_dtype(),
+            dtype: info.grim_dtype()?,
             provenance: QuantProvenance::GrimNative,
         })
     }
 
     fn meta(&self, name: &str) -> Result<TensorMeta> {
+        if let Some(ref gptq) = self.gptq {
+            if gptq.tensors.contains_key(name) {
+                return gptq.meta(name);
+            }
+        }
         let info = self.info.get(name).ok_or_else(|| {
             Error::Backend(format!("tensor '{name}' not found in safetensors file"))
         })?;
         Ok(TensorMeta {
-            dtype: info.grim_dtype(),
+            dtype: info.grim_dtype()?,
             provenance: QuantProvenance::GrimNative,
             shape: info.shape(),
             fusion_mask: 0,

@@ -21,6 +21,7 @@ use std::ffi::c_void;
 
 use grim_tensor::error::{Error, Result};
 
+use crate::device::helpers::check_hip;
 use crate::{hipSuccess, HipErrorT};
 
 // HIP symbols we call. We declare them locally rather than going
@@ -72,13 +73,7 @@ const HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED: HipErrorT = 0xb16;
 /// actually fails to query — never for "no devices found".
 pub fn enumerate_devices() -> Result<usize> {
     let mut count: i32 = 0;
-    let res = unsafe { hipGetDeviceCount(&mut count as *mut _) };
-    if res != hipSuccess {
-        return Err(Error::Backend(format!(
-            "enumerate_devices: hipGetDeviceCount failed with code={}",
-            res
-        )));
-    }
+    check_hip("hipGetDeviceCount", unsafe { hipGetDeviceCount(&mut count as *mut _) })?;
     Ok((count.max(0)) as usize)
 }
 
@@ -174,7 +169,7 @@ fn is_instinct(arch: &str) -> bool {
 /// branch isn't forced into `Other` by missing devices.
 unsafe fn gcn_arch_for(device: i32) -> Cow<'static, String> {
     let mut buf = vec![0u8; 8192];
-    let r = hipGetDeviceProperties(buf.as_mut_ptr() as *mut c_void, device);
+    let r = unsafe { hipGetDeviceProperties(buf.as_mut_ptr() as *mut c_void, device) };
     if r != hipSuccess || buf.is_empty() {
         return Cow::Owned("gfx9999".to_string());
     }

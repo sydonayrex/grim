@@ -18,7 +18,34 @@ pub async fn cmd_run(model_path: String, prompt: Option<String>, serve: bool, ad
     let gguf_path = std::path::Path::new(&model_path);
     let use_gguf = gguf_path.is_file() && model_path.to_lowercase().ends_with(".gguf");
 
-    let (device, device_name) = if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
+    let (device, device_name) = if let Ok(s) = std::env::var("GRIM_FORCE_DEVICE") {
+        match s.as_str() {
+            "cuda" => {
+                if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
+                    if let Some(first) = cuda_devices.first() {
+                        (Device::Cuda(first.ordinal()), format!("cuda:{}", first.ordinal()))
+                    } else {
+                        (Device::Cpu, "cpu".into())
+                    }
+                } else {
+                    (Device::Cpu, "cpu".into())
+                }
+            }
+            "rocm" => {
+                if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
+                    if let Some(first) = rocm_devices.first() {
+                        (Device::Rocm(first.ordinal()), format!("rocm:{}", first.ordinal()))
+                    } else {
+                        (Device::Cpu, "cpu".into())
+                    }
+                } else {
+                    (Device::Cpu, "cpu".into())
+                }
+            }
+            "cpu" => (Device::Cpu, "cpu".into()),
+            _ => (Device::Cpu, "cpu".into()),
+        }
+    } else if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
         if let Some(first) = rocm_devices.first() {
             let ordinal = first.ordinal();
             let wavefront = format!("{:?}", first.wavefront_size());
@@ -188,7 +215,7 @@ fn random_config() -> LlamaConfig {
 }
 
 /// Load a model from a GGUF file.
-fn load_model_from_gguf(path: &str, _device: Device) -> Result<Box<dyn CausalLm>> {
+fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn CausalLm>> {
     use grim_format::GgufProvider;
     use grim_nn::WeightSource;
 
@@ -233,7 +260,7 @@ fn load_model_from_gguf(path: &str, _device: Device) -> Result<Box<dyn CausalLm>
         arch, num_layers, hidden_size, vocab_size
     );
 
-    let ws = WeightSource::root(&provider, Device::Cpu);
+    let ws = WeightSource::root(&provider, device);
 
 
     if arch.contains("mamba") {

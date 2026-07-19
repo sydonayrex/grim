@@ -9,8 +9,12 @@ description = "Neural-network modules and weight-loading for Grim — VarBuilder
 [dependencies]
 grim-tensor = { workspace = true }
 grim-backend-cpu = { workspace = true }
+grim-backend-cuda = { workspace = true }
+grim-backend-rocm = { workspace = true }
 grim-quant = { workspace = true }
 thiserror = { workspace = true }
 
 [features]
-default = []
+default = ["cuda-mem", "rocm-mem"]
+cuda-mem = []
+rocm-mem = []

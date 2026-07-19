@@ -72,6 +72,14 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
     },
+    /// Pull (download) a model from Hugging Face or Ollama. Alias for `dl`.
+    Pull {
+        /// Registry model path or URL (e.g. hf.co/user/model, ollama.com/library/llama3).
+        model: String,
+        /// Optional destination path.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
     /// Show loaded models, memory usage, and execution backend.
     Status,
     /// Check the local model cache and report completed and partial downloads.
@@ -102,9 +110,10 @@ enum Commands {
     },
     /// Quantize a model.
     Quantize,
-    /// Convert standard GGUF model to ROCm-optimized .grim format using Oxidizer.
+    /// Convert a model file to ROCm-optimized .grim format using Oxidizer.
+    /// Supports GGUF (.gguf), GGML (.ggml), safetensors (.safetensors), and PyTorch (.bin).
     Convert {
-        /// Path to input GGUF model file.
+        /// Path to input model file (.gguf, .ggml, .safetensors, or .bin).
         #[arg(short, long)]
         input: String,
         /// Path to output .grim model file.
@@ -376,7 +385,7 @@ async fn main() -> Result<()> {
         Commands::Kill { model } => {
             client::unload_model_from_server(&model, "127.0.0.1:11434").await?;
         }
-        Commands::Dl { model, output } => {
+        Commands::Dl { model, output } | Commands::Pull { model, output } => {
             client::download_model(&model, output).await?;
         }
         Commands::Status => {
@@ -505,6 +514,27 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Convert { input, output, target, target_bpw, generations, dataset } => {
+            // Detect input format from file extension and warn the user.
+            let ext = std::path::Path::new(&input)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            match ext.as_str() {
+                "gguf" => {
+                    println!("[grim convert] Detected GGUF format — using Oxidizer pipeline.");
+                }
+                "safetensors" | "bin" => {
+                    println!("[grim convert] Detected safetensors/PyTorch format — using SafetensorsProvider pipeline.");
+                }
+                "ggml" => {
+                    println!("[grim convert] Detected GGML format — using GGUF/GGML compatibility reader.");
+                }
+                other => {
+                    eprintln!("[grim convert] WARNING: Unknown extension '.{other}' — attempting GGUF reader.");
+                }
+            }
+
             let resolved_gcn = if target == "auto" {
                 println!("[grim convert] Auto-detecting host GPU target architecture...");
                 match grim_backend_rocm::device::probe::probe_system_rocm() {

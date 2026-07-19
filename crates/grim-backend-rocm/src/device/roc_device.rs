@@ -32,15 +32,12 @@
 //!   re-exports; they keep their unsafe blocks narrow.
 
 use std::ffi::c_void;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime};
-use std::fs;
 
 use grim_tensor::backend::ComputeHandle;
-use grim_tensor::dtype::{DType, QuantProvenance, Storage as DTypeStorage};
+use grim_tensor::dtype::{DType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{ArithType, BackendDevice, BackendStorage, Shape};
 
@@ -51,46 +48,32 @@ use grim_tensor::{ArithType, BackendDevice, BackendStorage, Shape};
 use crate::{
     // HIP runtime FFI
     hipDeviceGetAttribute, hipDeviceSynchronize, hipFree, hipGetDeviceCount,
-    hipGetDeviceProperties, hipGraphCreate, hipGraphDestroy,
-    hipGraphExecDestroy, hipGraphExtendFromGlobalStream, hipGraphInstantiate,
-    hipGraphLaunch, hipGraphUpload, hipHostFree, hipHostMalloc,
-    hipMemAdvise, hipMemcpy, hipMemcpyAsync, hipMemset, hipMemsetAsync,
-    hipMalloc, hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad,
+    hipGraphDestroy, hipGraphExecDestroy, hipGraphInstantiate,
+    hipGraphLaunch, hipMemAdvise, hipMemcpy, hipMemcpyAsync, hipMemset, hipMemsetAsync,
+    hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad,
     hipModuleUnload, hipSetDevice, hipStreamBeginCapture, hipStreamCreate,
     hipStreamDestroy, hipStreamEndCapture, hipStreamSynchronize,
-    hiprtcAddNameExpression, hiprtcCompileProgram, hiprtcCreateProgram,
-    hiprtcDestroyProgram, hiprtcGetCode, hiprtcGetCodeSize,
-    hiprtcGetErrorString, hiprtcGetProgramLog, hiprtcGetProgramLogSize,
     // HIP types / constants
-    HIP_DEVICE_ATTRIBUTE_COHERENT_DEVICE_ALLOC,
     HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS,
     HIP_DEVICE_ATTRIBUTE_WARP_SIZE, HipDim3, HipErrorT, HipMemcpyKind,
-    HiprtcProgram, hipSuccess, RocmHandle, WavefrontSize,
+    hipSuccess, RocmHandle, WavefrontSize,
     // rocBLAS FFI
     arith_to_compute_dtype, arith_to_rocblas_dtype, rocblas_create_handle,
     rocblas_destroy_handle, rocblas_gemm_ex, rocblas_gemm_strided_batched_ex,
-    // matmul / matmul_batched / matmul_with_solution route their
-    // `solution_index` lookup through `select_gemm_algo` so the rocBLAS
-    // `algo` argument gets bumped to `rocblas_gemm_algo::solution_index`
-    // when a non-zero tuned index is in scope (otherwise rocBLAS
-    // silently ignores the index, defeating the tune cache).
     select_gemm_algo,
     rocblas_set_stream, rocblas_sgemm, rocblas_status_success, RocblasInt,
-    RocblasOperation, Rocblstatus, RoclabsHandle, rocblas_datatype,
-    rocblas_gemm_algo, rocblas_gemm_flags, ROCBLAS_GEMM_FLAGS_NONE,
-    // gemm tuning
-    // (GemmTileConfig + lookup_gemm_config resolved via crate::* —
-    // declared in device/gemm_tuning.rs and re-exported by lib.rs.)
+    RocblasOperation, RoclabsHandle,
+    ROCBLAS_GEMM_FLAGS_NONE,
     // kernel cache + graph capture
-    HsacoKernelCache, CapturedGraph, HipGraphExecutor, hip_graph_launch,
+    HsacoKernelCache, CapturedGraph,
     // device helpers
-    memcpy_with_xnack_fallback, jit_compile_hsaco, upload_device_buffer,
+    check_hip, jit_compile_hsaco, upload_device_buffer,
     // lib.rs helpers (re-exported from memory/, device::util/, etc.)
-    arg, as_rocm, dev_ptr, detect_gpu_arch, dtype_byte_size, dtype_f32,
-    gpu_target_arch, gpu_target_flag, linear_launch, ROCM_COMPUTE_BLOCK,
+    arg, as_rocm, dev_ptr, detect_gpu_arch, dtype_f32,
+    linear_launch,
     // Misc types
     RocmStorage, RocmCachingAllocator, RocmDeviceProps, RocmPinnedBuffer,
-    DecodeGemmConfig, FusedDequantGemmConfig, SplitKGemmConfig, QkvAttentionFusionConfig, RmsNormMatMulFusionConfig,
+    DecodeGemmConfig, FusedDequantGemmConfig, SplitKGemmConfig, QkvAttentionFusionConfig, RmsNormMatMulFusionConfig, WmmaGemmConfig,
     QuantMode,
 };
 
@@ -111,6 +94,7 @@ pub struct RocmDevice {
     pub(crate) decode_gemm_config: Mutex<DecodeGemmConfig>,
     pub(crate) fused_dequant_gemm_config: Mutex<FusedDequantGemmConfig>,
     pub(crate) split_k_config: Mutex<SplitKGemmConfig>,
+    pub(crate) wmma_gemm_config: Mutex<WmmaGemmConfig>,
     /// Caching device-memory allocator (size-bucketed free-list). See `RocmCachingAllocator`.
     pub(crate) allocator: Arc<RocmCachingAllocator>,
     /// Phase-3 §3.1: device scratch pool — a thread-safe, power-of-2-bucketed
@@ -296,6 +280,7 @@ impl RocmDevice {
             decode_gemm_config: Mutex::new(DecodeGemmConfig::default()),
             fused_dequant_gemm_config: Mutex::new(FusedDequantGemmConfig::default()),
             split_k_config: Mutex::new(SplitKGemmConfig::default()),
+            wmma_gemm_config: Mutex::new(WmmaGemmConfig::default()),
         }
     }
 
@@ -324,6 +309,15 @@ impl RocmDevice {
     /// Set whether SplitK GEMM is enabled (WI-D).
     pub fn set_split_k_enabled(&self, enabled: bool) {
         let mut cfg = self.split_k_config.lock().unwrap();
+        cfg.enabled = enabled;
+    }
+
+    /// Set whether the JIT compiled WMMA GEMM kernel is enabled (WI-G).
+    ///
+    /// When enabled and the architecture supports WMMA (or falls back), the matmul
+    /// dispatch will use the JIT'd `grim_wmma_gemm` kernel.
+    pub fn set_wmma_gemm_enabled(&self, enabled: bool) {
+        let mut cfg = self.wmma_gemm_config.lock().unwrap();
         cfg.enabled = enabled;
     }
 
@@ -440,7 +434,7 @@ impl RocmDevice {
     ///
     /// No-op (Ok) when capture is disabled (`GRIM_CAPTURE_GRAPH` unset), so callers
     /// can bracket work unconditionally.
-    pub fn begin_graph_capture(&self, key: &str) -> Result<()> {
+    pub fn begin_graph_capture(&self, _key: &str) -> Result<()> {
         if !self.capture_enabled {
             return Ok(());
         }
@@ -467,7 +461,7 @@ impl RocmDevice {
         // Canonical rocBLAS graph-capture pattern: bind the handle to the capture
         // stream *before* beginning capture so rocBLAS records its GEMM into the
         // graph (rather than running it eagerly with a stale workspace).
-        if let Ok(mut h) = self.get_rocblas_handle() {
+        if let Ok(h) = self.get_rocblas_handle() {
             unsafe {
                 let _ = rocblas_set_stream(h, stream);
             }
@@ -536,7 +530,7 @@ impl RocmDevice {
             }
         }
         // Restore the rocBLAS handle to its default stream now that capture is done.
-        if let Ok(mut h) = self.get_rocblas_handle() {
+        if let Ok(h) = self.get_rocblas_handle() {
             unsafe {
                 let _ = rocblas_set_stream(h, std::ptr::null_mut());
             }
@@ -563,7 +557,7 @@ impl RocmDevice {
         match cache.get(key) {
             Some(g) => {
                 // Bind rocblas to the replay stream so its captured GEMM node executes there.
-                if let Ok(mut h) = self.get_rocblas_handle() {
+                if let Ok(h) = self.get_rocblas_handle() {
                     unsafe {
                         let _ = rocblas_set_stream(h, stream);
                     }
@@ -576,7 +570,7 @@ impl RocmDevice {
                     let _ = hipStreamSynchronize(stream);
                 }
                 // Restore the default stream so later eager ops don't land on the capture stream.
-                if let Ok(mut h) = self.get_rocblas_handle() {
+                if let Ok(h) = self.get_rocblas_handle() {
                     unsafe {
                         let _ = rocblas_set_stream(h, std::ptr::null_mut());
                     }
@@ -705,32 +699,22 @@ impl RocmDevice {
         for i in 0..batch {
             let ai = as_rocm(a[i])?;
             let bi = as_rocm(b[i])?;
-            let res = unsafe {
+            check_hip("matmul_batched: hipMemcpyDtoD a", unsafe {
                 hipMemcpy(
                     (a_packed.device_ptr.unwrap() as *mut c_void).add(i * stride_a * 4),
                     ai.device_ptr.unwrap() as *mut c_void,
                     ai.bytes,
                     HipMemcpyKind::DeviceToDevice,
                 )
-            };
-            if res != hipSuccess {
-                return Err(Error::Backend(format!(
-                    "matmul_batched: hipMemcpyDtoD a failed: code {res}"
-                )));
-            }
-            let res = unsafe {
+            })?;
+            check_hip("matmul_batched: hipMemcpyDtoD b", unsafe {
                 hipMemcpy(
                     (b_packed.device_ptr.unwrap() as *mut c_void).add(i * stride_b * 4),
                     bi.device_ptr.unwrap() as *mut c_void,
                     bi.bytes,
                     HipMemcpyKind::DeviceToDevice,
                 )
-            };
-            if res != hipSuccess {
-                return Err(Error::Backend(format!(
-                    "matmul_batched: hipMemcpyDtoD b failed: code {res}"
-                )));
-            }
+            })?;
         }
 
         let alpha: f32 = 1.0;
@@ -822,7 +806,7 @@ impl RocmDevice {
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
         let pinned = RocmPinnedBuffer::<f32>::from_slice(data)?;
-        let mut storage = RocmStorage::alloc_gpu(shape, dtype.clone(), &self.allocator, self.ordinal)?;
+        let storage = RocmStorage::alloc_gpu(shape, dtype.clone(), &self.allocator, self.ordinal)?;
         if !storage.device_ptr_is_valid() {
             return Err(Error::Backend("Invalid device pointer after alloc".into()));
         }
@@ -874,7 +858,7 @@ impl RocmDevice {
         shape: &Shape,
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
-        let mut storage = RocmStorage::alloc_gpu(shape, dtype.clone(), &self.allocator, self.ordinal)?;
+        let storage = RocmStorage::alloc_gpu(shape, dtype.clone(), &self.allocator, self.ordinal)?;
         if !storage.device_ptr_is_valid() {
             return Err(Error::Backend("Invalid device pointer after alloc".into()));
         }
@@ -939,7 +923,7 @@ impl RocmDevice {
             }
         };
         let stream = self.active_stream();
-        let res = unsafe {
+        check_hip("hipMemcpyAsync(D2H)", unsafe {
             hipMemcpyAsync(
                 pinned.as_mut_ptr() as *mut c_void,
                 dev_ptr_void,
@@ -947,20 +931,8 @@ impl RocmDevice {
                 HipMemcpyKind::DeviceToHost,
                 stream,
             )
-        };
-        if res != hipSuccess {
-            return Err(Error::Backend(format!(
-                "hipMemcpyAsync(D2H) failed with error code {}",
-                res
-            )));
-        }
-        let sync = unsafe { hipStreamSynchronize(stream) };
-        if sync != hipSuccess {
-            return Err(Error::Backend(format!(
-                "hipStreamSynchronize after async download failed with error code {}",
-                sync
-            )));
-        }
+        })?;
+        check_hip("hipStreamSynchronize (after async download)", unsafe { hipStreamSynchronize(stream) })?;
         let mut out = vec![0.0f32; elem_count];
         out.copy_from_slice(pinned.as_slice());
         Ok(out)
@@ -994,7 +966,7 @@ impl RocmDevice {
             }
         };
         let stream = self.active_stream();
-        let res = unsafe {
+        check_hip("hipMemcpyAsync(D2H)", unsafe {
             hipMemcpyAsync(
                 dst.as_mut_ptr() as *mut c_void,
                 dev_ptr_void,
@@ -1002,20 +974,8 @@ impl RocmDevice {
                 HipMemcpyKind::DeviceToHost,
                 stream,
             )
-        };
-        if res != hipSuccess {
-            return Err(Error::Backend(format!(
-                "hipMemcpyAsync(D2H) failed with error code {}",
-                res
-            )));
-        }
-        let sync = unsafe { hipStreamSynchronize(stream) };
-        if sync != hipSuccess {
-            return Err(Error::Backend(format!(
-                "hipStreamSynchronize after async download failed with error code {}",
-                sync
-            )));
-        }
+        })?;
+        check_hip("hipStreamSynchronize (after async download)", unsafe { hipStreamSynchronize(stream) })?;
         Ok(())
     }
 }
@@ -1384,6 +1344,17 @@ impl BackendDevice for RocmDevice {
             }
         }
 
+        // ─── WI-G — WMMA GEMM dispatch (opt-in, F16-only) ─────
+        {
+            let cfg = self.wmma_gemm_config.lock().unwrap();
+            if cfg.enabled && dtype_out.arith == ArithType::F16 {
+                drop(cfg); // release lock before JIT launch
+                let stream = self.launch_wmma_gemm(a_storage, b_storage, &out_storage, m, n, k)?;
+                let compute_handle = Box::new(RocmHandle::new(Some(stream)));
+                return Ok((Box::new(out_storage), compute_handle));
+            }
+        }
+
         // Get rocBLAS handle and execute sgemm. The handle's stream was already bound
         // to the capture stream in `begin_graph_capture` (and restored in
         // `end_graph_capture`), so a GEMM issued during a session records into the graph.
@@ -1536,7 +1507,7 @@ impl BackendDevice for RocmDevice {
         let out_storage = RocmStorage::alloc_gpu(out_shape, dtype_out.clone(), &self.allocator, self.ordinal)?;
 
         // Shape-indexed GEMM dispatch lookup (Tensile-inspired layout resolution)
-        let tile_config = lookup_gemm_config(m, n, k, self.props.wavefront_size);
+        let _tile_config = lookup_gemm_config(m, n, k, self.props.wavefront_size);
         #[cfg(feature = "rocm-profile")]
         println!(
             "[RocmDevice] GEMM Dispatch: Shape ({}, {}, {}) resolved to autotune tile config {:?} on Wavefront {:?}",
@@ -1877,19 +1848,13 @@ impl BackendDevice for RocmDevice {
             // Simulate/fallback to a null stream async memcpy (using stream 0)
             unsafe {
                 let null_stream: *mut c_void = std::ptr::null_mut();
-                let res = hipMemcpyAsync(
+                check_hip("hipMemcpyAsync (fallback D2D)", hipMemcpyAsync(
                     dev_ptr as *mut c_void,
                     dev_ptr,
                     rocm_storage.bytes,
                     HipMemcpyKind::DeviceToDevice,
                     null_stream,
-                );
-                if res != hipSuccess {
-                    return Err(Error::Backend(format!(
-                        "Fallback hipMemcpyAsync failed with status {}",
-                        res
-                    )));
-                }
+                ))?;
             }
             return Ok(());
         }
@@ -1909,13 +1874,7 @@ impl BackendDevice for RocmDevice {
         };
 
         unsafe {
-            let res = hipMemAdvise(dev_ptr, rocm_storage.bytes, raw_advice, self.ordinal as i32);
-            if res != hipSuccess {
-                return Err(Error::Backend(format!(
-                    "hipMemAdvise failed with status {}",
-                    res
-                )));
-            }
+            check_hip("hipMemAdvise", hipMemAdvise(dev_ptr, rocm_storage.bytes, raw_advice, self.ordinal as i32))?;
         }
         Ok(())
     }
@@ -1995,7 +1954,66 @@ impl RocmDevice {
         )
     }
 
+    /// Enqueues the JIT-compiled WMMA matrix-core GEMM kernel (WI-G).
+    ///
+    /// The kernel maps to either the hardware-accelerated WMMA block operations
+    /// (on RDNA3+) or the scalar fallback logic (on RDNA2/older).
+    pub(crate) fn launch_wmma_gemm(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage.device_ptr.ok_or_else(|| Error::Backend("wmma_gemm: a has no device ptr".into()))?;
+        let b_ptr = b_storage.device_ptr.ok_or_else(|| Error::Backend("wmma_gemm: b has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("wmma_gemm: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems = m * n;
+        let grid_x = ((total_elems + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let stride_a = k;     // A[M, K]
+        let stride_b = n;     // B[K, N]
+        let stride_c = n;     // C[M, N]
+        let mut sa = stride_a as i32;
+        let mut sb = stride_b as i32;
+        let mut sc = stride_c as i32;
+
+        let solution_index = lookup_solution_index(m, n, k, ArithType::F16);
+        self.launch_compute_kernel_with_solution(
+            "grim_wmma_gemm",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut sa),
+                arg(&mut sb),
+                arg(&mut sc),
+            ],
+            Some(solution_index),
+        )
+    }
+
+
+    /// TODO(WI-C): Kernel + config exist; wire dispatch in matmul path when enabled.
     /// Launch the JIT compiled fused dequantization matmul kernel (WI-C).
+    #[allow(dead_code)]
     pub(crate) fn launch_fused_dequant_gemm_f16(
         &self,
         a_storage: &RocmStorage,
@@ -2170,14 +2188,11 @@ impl RocmDevice {
         // Load the HIP module once per unique kernel; reuse the cached module +
         // resolved function on every subsequent dispatch (Item 2).
         let mut module_cache = self.module_cache.lock().unwrap();
-        let (module, func) = if let Some(cached) = module_cache.get(&cache_key) {
+        let (_module, func) = if let Some(cached) = module_cache.get(&cache_key) {
             *cached
         } else {
             let mut module: *mut c_void = std::ptr::null_mut();
-            let res = unsafe { hipModuleLoad(&mut module, path_c.as_ptr()) };
-            if res != hipSuccess {
-                return Err(Error::Backend(format!("hipModuleLoad failed: {}", res)));
-            }
+            check_hip("hipModuleLoad", unsafe { hipModuleLoad(&mut module, path_c.as_ptr()) })?;
             let mut func: *mut c_void = std::ptr::null_mut();
             let res = unsafe { hipModuleGetFunction(&mut func, module, entry_c.as_ptr()) };
             if res != hipSuccess {
@@ -2192,8 +2207,8 @@ impl RocmDevice {
 
         let stream = self.active_stream();
 
-        let mut args_ptr = args.as_mut_ptr();
-        let res = unsafe {
+        let args_ptr = args.as_mut_ptr();
+        check_hip("hipModuleLaunchKernel", unsafe {
             hipModuleLaunchKernel(
                 func,
                 grid.x, grid.y, grid.z,
@@ -2203,11 +2218,7 @@ impl RocmDevice {
                 args_ptr,
                 std::ptr::null_mut(),
             )
-        };
-        
-        if res != hipSuccess {
-            return Err(Error::Backend(format!("hipModuleLaunchKernel failed: {}", res)));
-        }
+        })?;
         Ok(stream)
     }
 
@@ -2374,10 +2385,10 @@ impl RocmDevice {
         // ─── allocate output + launch ────────────────────────────────────
         let launch = config.hip_launch_params();
         let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
-        let mut out_ptr = dev_ptr(&storage)?;
-        let mut q_ptr = dev_ptr(q_s)?;
-        let mut k_ptr = dev_ptr(k_s)?;
-        let mut v_ptr = dev_ptr(v_s)?;
+        let out_ptr = dev_ptr(&storage)?;
+        let q_ptr = dev_ptr(q_s)?;
+        let k_ptr = dev_ptr(k_s)?;
+        let v_ptr = dev_ptr(v_s)?;
 
         let mut max_ptr: u64 = 0;
         if let Some(m) = out_max {
@@ -2390,12 +2401,12 @@ impl RocmDevice {
             sum_ptr = dev_ptr(s_s)?;
         }
 
-        let mut num_heads_i = config.num_heads as i32;
-        let mut num_kv_heads_i = config.num_kv_heads as i32;
-        let mut head_dim_i = config.head_dim as i32;
-        let mut seq_len_i = seq_len as i32;
-        let mut kv_seq_len_i = kv_seq_len as i32;
-        let mut cache_offset_i = cache_offset as i32;
+        let num_heads_i = config.num_heads as i32;
+        let num_kv_heads_i = config.num_kv_heads as i32;
+        let head_dim_i = config.head_dim as i32;
+        let seq_len_i = seq_len as i32;
+        let kv_seq_len_i = kv_seq_len as i32;
+        let cache_offset_i = cache_offset as i32;
         let inv_sqrt_d: f32 = 1.0 / (config.head_dim as f32).sqrt();
         let mut inv_sqrt_d_bits = inv_sqrt_d.to_bits();
         // The kernel signature accepts this as a float argument; emit it via
@@ -2403,7 +2414,7 @@ impl RocmDevice {
         let inv_sqrt_d_ptr = &mut inv_sqrt_d_bits as *mut u32 as *mut f32;
         // SAFETY: the kernel reads `inv_sqrt_d` from this pointer across the
         // entire dispatch; the lifetime covers the launch below.
-        let mut inv_sqrt_d_stable = inv_sqrt_d_ptr; // keep the pointer pinned
+        let inv_sqrt_d_stable = inv_sqrt_d_ptr; // keep the pointer pinned
 
         // Build the arg slice with all 13 params in the order the kernel
         // signature declares them.
@@ -2545,24 +2556,24 @@ impl RocmDevice {
         };
 
         let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
-        let mut out_ptr = dev_ptr(&storage)?;
-        let mut q_ptr = dev_ptr(q_s)?;
-        let mut k_ptr = dev_ptr(k_s)?;
-        let mut ks_ptr = dev_ptr(ks_s)?;
-        let mut v_ptr = dev_ptr(v_s)?;
-        let mut vs_ptr = dev_ptr(vs_s)?;
+        let out_ptr = dev_ptr(&storage)?;
+        let q_ptr = dev_ptr(q_s)?;
+        let k_ptr = dev_ptr(k_s)?;
+        let ks_ptr = dev_ptr(ks_s)?;
+        let v_ptr = dev_ptr(v_s)?;
+        let vs_ptr = dev_ptr(vs_s)?;
 
-        let mut num_heads_i = config.num_heads as i32;
-        let mut num_kv_heads_i = config.num_kv_heads as i32;
-        let mut head_dim_i = config.head_dim as i32;
-        let mut seq_len_i = seq_len as i32;
-        let mut kv_seq_len_i = kv_seq_len as i32;
-        let mut cache_offset_i = cache_offset as i32;
+        let num_heads_i = config.num_heads as i32;
+        let num_kv_heads_i = config.num_kv_heads as i32;
+        let head_dim_i = config.head_dim as i32;
+        let seq_len_i = seq_len as i32;
+        let kv_seq_len_i = kv_seq_len as i32;
+        let cache_offset_i = cache_offset as i32;
         let inv_sqrt_d: f32 = 1.0 / (config.head_dim as f32).sqrt();
         let mut inv_sqrt_d_bits = inv_sqrt_d.to_bits();
         let inv_sqrt_d_ptr = &mut inv_sqrt_d_bits as *mut u32 as *mut f32;
-        let mut inv_sqrt_d_stable = inv_sqrt_d_ptr;
-        let mut quant_bits_i = config.quant_bits as i32;
+        let inv_sqrt_d_stable = inv_sqrt_d_ptr;
+        let quant_bits_i = config.quant_bits as i32;
 
         let mut qp = q_ptr;
         let mut kp = k_ptr;

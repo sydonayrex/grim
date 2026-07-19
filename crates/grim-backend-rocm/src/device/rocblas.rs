@@ -28,6 +28,7 @@ use grim_tensor::{ArithType, Error, Result};
 pub type Rocblstatus = i32;
 
 /// Success return code for rocBLAS FFI calls.
+#[allow(non_upper_case_globals)]
 pub const rocblas_status_success: Rocblstatus = 0;
 
 #[repr(i32)]
@@ -82,6 +83,7 @@ unsafe extern "C" {
 /// and zeroes the output.
 #[repr(i32)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
 pub enum rocblas_datatype {
     f16_r = 150,
     f32_r = 151,
@@ -105,12 +107,14 @@ pub enum rocblas_datatype {
 /// GEMM algorithm selector (rocblas_gemm_algo).
 #[repr(i32)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
 pub enum rocblas_gemm_algo {
     standard = 0x0,
     solution_index = 0x1,
 }
 
 /// GEMM control flags (rocblas_gemm_flags). Bitmask; 0x0 = none.
+#[allow(non_camel_case_types)]
 pub type rocblas_gemm_flags = u32;
 pub const ROCBLAS_GEMM_FLAGS_NONE: rocblas_gemm_flags = 0x0;
 

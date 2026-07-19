@@ -5,9 +5,28 @@ use std::sync::Arc;
 use grim_backend_cpu::CpuDevice;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::shape::Shape;
-use grim_tensor::{BackendDevice, DType, Tensor};
+use grim_tensor::{BackendDevice, Device, DType, Tensor};
 
 use crate::varbuilder::WeightSource;
+
+#[cfg(feature = "cuda-mem")]
+use grim_backend_cuda::CudaDevice;
+#[cfg(feature = "rocm-mem")]
+use grim_backend_rocm::RocmDevice;
+
+/// Pick the `BackendDevice` that matches the storage location of `x` so
+/// arithmetic ops dispatch to GPU kernels when the tensor lives on a GPU.
+/// Falls back to CPU if the requested backend is unavailable in this build.
+pub fn pick_device_for_tensor(x: &Tensor) -> Box<dyn BackendDevice> {
+    match x.device() {
+        Device::Cpu => Box::new(CpuDevice::new()),
+        #[cfg(feature = "cuda-mem")]
+        Device::Cuda(ordinal) => Box::new(CudaDevice::new(*ordinal)),
+        #[cfg(feature = "rocm-mem")]
+        Device::Rocm(ordinal) => Box::new(RocmDevice::new(*ordinal)),
+        _ => Box::new(CpuDevice::new()),
+    }
+}
 
 // ---------- Linear ----------
 
@@ -39,7 +58,7 @@ impl Linear {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let dev = CpuDevice::new();
+        let dev = pick_device_for_tensor(x);
         let in_dim = x.shape().dims().last().copied().unwrap_or(0);
         // Weight is GGUF-native: dim(0) = out_dim, dim(1) = in_dim.
         let out_dim = self.weight.shape().dim(0)?;
@@ -48,7 +67,7 @@ impl Linear {
         let w_t = transpose_last_two(&self.weight)?;
         let a_storage = x.storage().as_ref();
         let b_storage = w_t.storage().as_ref();
-        let (out_s, h) = BackendDevice::matmul(&dev, a_storage, b_storage, &Shape::new(vec![batch, out_dim]))?;
+        let (out_s, h) = BackendDevice::matmul(&*dev, a_storage, b_storage, &Shape::new(vec![batch, out_dim]))?;
         h.synchronize()?;
         let mat_out = Tensor::new(
             Arc::from(out_s),
@@ -61,7 +80,7 @@ impl Linear {
         if let Some(b) = &self.bias {
             let broadcast_b = broadcast_bias(b, batch, out_dim)?;
             let (s, hh) = BackendDevice::add(
-                &dev,
+                &*dev,
                 mat_out.storage().as_ref(),
                 broadcast_b.storage().as_ref(),
                 mat_out.shape(),
@@ -99,7 +118,22 @@ fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
             out[j * a + i] = src[i * b + j];
         }
     }
-    Ok(grim_backend_cpu::cpu_tensor(out, Shape::new(vec![b, a])))
+    let new_shape = Shape::new(vec![b, a]);
+    if t.device().is_cpu() {
+        Ok(grim_backend_cpu::cpu_tensor(out, new_shape))
+    } else {
+        // Re-upload transposed weights back to the source device so the
+        // downstream matmul sees matching CUDA/CUDA storages.
+        let dev = pick_device_for_tensor(t);
+        let storage = dev.from_cpu(&out, &new_shape, DType::F32)?;
+        Ok(Tensor::new(
+            Arc::from(storage),
+            new_shape,
+            DType::F32,
+            t.provenance().clone(),
+            t.device().clone(),
+        ))
+    }
 }
 
 fn broadcast_bias(b: &Tensor, batch: usize, out_dim: usize) -> Result<Tensor> {
@@ -111,7 +145,20 @@ fn broadcast_bias(b: &Tensor, batch: usize, out_dim: usize) -> Result<Tensor> {
     if out.len() != batch * out_dim {
         return Err(Error::Shape("broadcast_bias: size mismatch".into()));
     }
-    Ok(grim_backend_cpu::cpu_tensor(out, Shape::new(vec![batch, out_dim])))
+    let new_shape = Shape::new(vec![batch, out_dim]);
+    if b.device().is_cpu() {
+        Ok(grim_backend_cpu::cpu_tensor(out, new_shape))
+    } else {
+        let dev = pick_device_for_tensor(b);
+        let storage = dev.from_cpu(&out, &new_shape, DType::F32)?;
+        Ok(Tensor::new(
+            Arc::from(storage),
+            new_shape,
+            DType::F32,
+            b.provenance().clone(),
+            b.device().clone(),
+        ))
+    }
 }
 
 // ---------- RMSNorm ----------
@@ -129,12 +176,12 @@ impl RmsNorm {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let dev = CpuDevice::new();
+        let dev = pick_device_for_tensor(x);
         let dim = x.shape().dims().last().copied().unwrap_or(0);
         let batch = x.shape().elem_count() / dim;
         let out_shape = Shape::new(vec![batch, dim]);
         let (s, h) = BackendDevice::rms_norm(
-            &dev,
+            &*dev,
             x.storage().as_ref(),
             self.weight.storage().as_ref(),
             self.eps,
@@ -178,9 +225,9 @@ impl Embedding {
     }
 
     pub fn forward(&self, indices: &[u32], seq_len: usize, dim: usize) -> Result<Tensor> {
-        let dev = CpuDevice::new();
+        let dev = pick_device_for_tensor(&self.weight);
         let out_shape = Shape::new(vec![seq_len, dim]);
-        let (s, h) = BackendDevice::embedding(&dev, self.weight.storage().as_ref(), indices, &out_shape)?;
+        let (s, h) = BackendDevice::embedding(&*dev, self.weight.storage().as_ref(), indices, &out_shape)?;
         h.synchronize()?;
         Ok(Tensor::new(
             Arc::from(s),
@@ -245,6 +292,19 @@ impl Rope {
                 }
             }
         }
-        Ok(grim_backend_cpu::cpu_tensor(src, Shape::new(vec![b, s, d])))
+        let out_shape = Shape::new(vec![b, s, d]);
+        if x.device().is_cpu() {
+            Ok(grim_backend_cpu::cpu_tensor(src, out_shape))
+        } else {
+            let dev = pick_device_for_tensor(x);
+            let storage = dev.from_cpu(&src, &out_shape, DType::F32)?;
+            Ok(Tensor::new(
+                Arc::from(storage),
+                out_shape,
+                DType::F32,
+                x.provenance().clone(),
+                x.device().clone(),
+            ))
+        }
     }
 }

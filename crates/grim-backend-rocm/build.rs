@@ -1,9 +1,9 @@
-/// Pure ROCm/RCCL lib-dir discovery, shared with `src/rocm_detect.rs`
-/// (single source of truth, `include!`-ed — no duplicated knowledge).
+// Pure ROCm/RCCL lib-dir discovery, shared with `src/rocm_detect.rs`
+// (single source of truth, `include!`-ed — no duplicated knowledge).
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/build_rocm_detect.rs"));
 
-/// Crate manifest dir is `crates/grim-backend-rocm`; workspace root is
-/// two parents up.
+// Crate manifest dir is `crates/grim-backend-rocm`; workspace root is
+// two parents up.
 fn workspace_root() -> std::path::PathBuf {
     let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     manifest
