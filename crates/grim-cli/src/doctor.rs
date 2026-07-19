@@ -34,13 +34,33 @@ pub fn run_doctor(addr: &str, service_name: &str, exec_path: &str, config_path: 
     print_report(&report);
 
     if !report.errors.is_empty() {
-        eprintln!("\nDoctor found {} error(s). Run 'grim service install' and ensure ROCm is available.", report.errors.len());
+        eprintln!("\n[grim doctor] SUGGESTIONS FOR ERRORS:");
+        for err in &report.errors {
+            if err.contains("grim serve") || err.contains("obsolete") {
+                eprintln!("  -> FIX ExecStart: Run 'sudo grim service install --config /etc/grim/grim.toml' to overwrite systemd service with correct ExecStart command.");
+            } else if err.contains("RDNA 2") || err.contains("compatibility") {
+                eprintln!("  -> RDNA 2 COMPATIBILITY: Force RDNA2 compilation by setting environment variable: export HSA_OVERRIDE_GFX_VERSION=10.3.0");
+            } else {
+                eprintln!("  -> {err}");
+            }
+        }
+        eprintln!("\nDoctor found {} error(s).", report.errors.len());
         return Ok(false);
     }
 
     if report.warnings.is_empty() {
         println!("\nAll checks passed.");
     } else {
+        eprintln!("\n[grim doctor] SUGGESTIONS FOR WARNINGS:");
+        for warn in &report.warnings {
+            if warn.contains("not found") || warn.contains("systemd") {
+                eprintln!("  -> INSTALL SERVICE: Run 'grim service install --config /etc/grim/grim.toml' to install a background service daemon.");
+            } else if warn.contains("unreachable") {
+                eprintln!("  -> START SERVER: Start the server manually using 'grim run --serve' or via service: 'grim service start'.");
+            } else {
+                eprintln!("  -> {warn}");
+            }
+        }
         eprintln!("\nDoctor found {} warning(s). Review above.", report.warnings.len());
     }
     Ok(true)

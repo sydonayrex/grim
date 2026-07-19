@@ -277,10 +277,10 @@ impl RocmDevice {
             capture_active: AtomicBool::new(false),
             captured_graphs: Mutex::new(HashMap::new()),
             batched_gemm_warmed: AtomicBool::new(false),
-            decode_gemm_config: Mutex::new(DecodeGemmConfig::default()),
-            fused_dequant_gemm_config: Mutex::new(FusedDequantGemmConfig::default()),
-            split_k_config: Mutex::new(SplitKGemmConfig::default()),
-            wmma_gemm_config: Mutex::new(WmmaGemmConfig::default()),
+            decode_gemm_config: Mutex::new(DecodeGemmConfig { enabled: true, wavefront_size: warp_size as u32 }),
+            fused_dequant_gemm_config: Mutex::new(FusedDequantGemmConfig { enabled: true, wavefront_size: warp_size as u32 }),
+            split_k_config: Mutex::new(SplitKGemmConfig { enabled: true }),
+            wmma_gemm_config: Mutex::new(WmmaGemmConfig { enabled: true, wavefront_size: warp_size as u32 }),
         }
     }
 
@@ -2653,6 +2653,66 @@ impl RocmDevice {
     /// gfx1036 / gfx110x / gfx1200; the Phase-3 tile-via-MFMA path is
     /// a follow-up (the kernel currently increments `q_offset` linearly
     /// and would lose one wave per extra head_dim).
+    /// Fused Paged Attention (T2-2).
+    ///
+    /// Dispatches the JIT compiled `grim_qkv_attention_paged` kernel to run
+    /// multi-query attention using paged KV blocks (represented by `block_tables`
+    /// mapping request indexes to logical blocks in `k_pages` and `v_pages`).
+    ///
+    /// Gated by `enabled = true`. Returns a `RocmStorage` result storage and a
+    /// computed handle to track execution status.
+    pub fn qkv_attention_paged(
+        &self,
+        q: &dyn BackendStorage,
+        block_tables: &dyn BackendStorage,
+        k_pages: &dyn BackendStorage,
+        v_pages: &dyn BackendStorage,
+        num_kv_heads: usize,
+        max_blocks: usize,
+        page_size: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let out_dims = out_shape.dims();
+        if out_dims.len() != 3 {
+            return Err(Error::Shape("qkv_attention_paged expects 3-D output shape [batch, num_heads, head_dim]".into()));
+        }
+        let batch = out_dims[0];
+        let num_heads = out_dims[1];
+        let head_dim = out_dims[2];
+
+        let q_s = as_rocm(q)?;
+        let bt_s = as_rocm(block_tables)?;
+        let k_s = as_rocm(k_pages)?;
+        let v_s = as_rocm(v_pages)?;
+
+        if !q_s.device_ptr_is_valid() || !bt_s.device_ptr_is_valid() || !k_s.device_ptr_is_valid() || !v_s.device_ptr_is_valid() {
+            return Err(Error::Backend("qkv_attention_paged: inputs lack a valid device pointer".into()));
+        }
+
+        let mut storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        
+        crate::launch_paged_attention(
+            self,
+            q_s,
+            bt_s,
+            k_s,
+            v_s,
+            &mut storage,
+            batch as u32,
+            num_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            max_blocks as u32,
+            page_size as u32,
+            kv_seq_len as u32,
+            cache_offset,
+        )?;
+
+        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+    }
+
     pub fn tree_attention(
         &self,
         q: &dyn BackendStorage,

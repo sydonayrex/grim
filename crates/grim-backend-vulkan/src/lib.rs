@@ -1461,11 +1461,8 @@ impl BackendDevice for VulkanDevice {
         let mut dispatch_success = false;
         if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push)) {
             eprintln!("[Vulkan mul] GPU dispatch failed ({}); falling back to host simulation", e);
-            } else {
-                dispatch_success = true;
-            }
         } else {
-            eprintln!("[Vulkan mul] GPU shader compilation unavailable; falling back to host simulation");
+            dispatch_success = true;
         }
 
         if !dispatch_success {
