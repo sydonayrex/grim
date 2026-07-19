@@ -392,10 +392,9 @@ mod tests {
         // 70x60 tensor with 4-bit quantization - 70 not multiple of 64
         let orig_rows = 70;
         let orig_cols = 60;
-        let bytes_per_elem = 0.5; // 4-bit
         let data: Vec<u8> = vec![0xAB; (orig_rows * orig_cols / 2) as usize];
         let shape = vec![orig_rows, orig_cols];
-        let (padded, new_shape) = align_quantized_tensor_for_rocm_gemm(&data, &shape, 4, 64);
+        let (_padded, new_shape) = align_quantized_tensor_for_rocm_gemm(&data, &shape, 4, 64);
 
         // Rows should be padded to 128
         assert_eq!(new_shape[0], 128);
@@ -774,7 +773,7 @@ mod tests {
         let a_dims = [16usize, 32];
         let b_dims = [32usize, 16];
         let a: Vec<f32> = (0..16 * 32).map(|i| (i as f32 * 0.01) - 1.0).collect();
-        let b: Vec<f32> = (0..32 * 16).map(|i| (i as f32 * 0.02)).collect();
+        let b: Vec<f32> = (0..32 * 16).map(|i| i as f32 * 0.02).collect();
 
         // Warmup so the pool fills with the right size classes.
         for _ in 0..3 {
@@ -1147,7 +1146,7 @@ mod tests {
 
         // Pinned + async hipMemcpy round trip (reusing one pinned buffer for input
         // and one for output, as the decode loop would across tokens).
-        let mut pinned_in = RocmPinnedBuffer::<f32>::from_slice(&data).unwrap();
+        let pinned_in = RocmPinnedBuffer::<f32>::from_slice(&data).unwrap();
         let mut pinned_out = RocmPinnedBuffer::<f32>::alloc(n).unwrap();
         for _ in 0..warmup {
             let s = dev.upload_from_pinned(&pinned_in, &shape, DType::F32).unwrap();
@@ -1304,7 +1303,7 @@ mod tests {
             let k = 128usize;
             let n = 64usize;
             let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.01) - 1.0).collect();
-            let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.02)).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| i as f32 * 0.02).collect();
             let w: Vec<f32> = (0..n).map(|i| 1.0 + (i as f32 * 0.1)).collect();
             let a_s = dev.from_cpu(&a, &Shape::from_slice(&[m, k]), DType::F32).unwrap();
             let b_s = dev.from_cpu(&b, &Shape::from_slice(&[k, n]), DType::F32).unwrap();

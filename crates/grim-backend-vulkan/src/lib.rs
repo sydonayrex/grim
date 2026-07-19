@@ -109,9 +109,9 @@ pub const VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO: u32 = 3;
 pub const VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: u32 = 12;
 pub const VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO: u32 = 5;
 
-pub const VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO: u32 = 11;
-pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO: u32 = 12;
-pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: u32 = 14;
+pub const VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO: u32 = 39;
+pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO: u32 = 40;
+pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: u32 = 42;
 pub const VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO: u32 = 16;
 pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO: u32 = 32;
 pub const VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO: u32 = 33;
@@ -119,11 +119,11 @@ pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO: u32 = 34;
 pub const VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET: u32 = 35;
 pub const VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO: u32 = 29;
 pub const VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO: u32 = 30;
-pub const VK_STRUCTURE_TYPE_SUBMIT_INFO: u32 = 3;
+pub const VK_STRUCTURE_TYPE_SUBMIT_INFO: u32 = 4;
 pub const VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO: u32 = 18;
 
 pub const VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: u32 = 7;
-pub const VK_SHADER_STAGE_COMPUTE_BIT: u32 = 0x00000080;
+pub const VK_SHADER_STAGE_COMPUTE_BIT: u32 = 0x00000020;
 pub const VK_QUEUE_COMPUTE_BIT: u32 = 0x00000002;
 
 pub const VK_BUFFER_USAGE_STORAGE_BUFFER_BIT: u32 = 0x00000020;
@@ -185,8 +185,8 @@ pub struct VkWriteDescriptorSet {
     pub dst_array_element: u32,
     pub descriptor_count: u32,
     pub descriptor_type: u32,
-    pub p_buffer_info: *const VkDescriptorBufferInfo,
     pub p_image_info: *const c_void,
+    pub p_buffer_info: *const VkDescriptorBufferInfo,
     pub p_texel_buffer_view: *const c_void,
 }
 
@@ -217,6 +217,13 @@ pub struct VkPipelineLayoutCreateInfo {
     pub p_set_layouts: *const u64,
     pub push_constant_range_count: u32,
     pub p_push_constant_ranges: *const c_void,
+}
+
+#[repr(C)]
+pub struct VkPushConstantRange {
+    pub stage_flags: u32,
+    pub offset: u32,
+    pub size: u32,
 }
 
 #[repr(C)]
@@ -274,7 +281,7 @@ pub struct VkSubmitInfo {
     pub p_wait_semaphores: *const u64,
     pub p_wait_dst_stage_mask: *const u32,
     pub command_buffer_count: u32,
-    pub p_command_buffers: *const *mut c_void,
+    pub p_command_buffers: *const u64,
     pub signal_semaphore_count: u32,
     pub p_signal_semaphores: *const u64,
 }
@@ -284,10 +291,10 @@ pub struct VkSubmitInfo {
 pub struct VkQueueFamilyProperties {
     pub queue_flags: u32,
     pub queue_count: u32,
+    pub timestamp_valid_bits: u32,
     pub min_image_transfer_granularity_width: u32,
     pub min_image_transfer_granularity_height: u32,
     pub min_image_transfer_granularity_depth: u32,
-    pub timestamp_valid_bits: u32,
 }
 
 unsafe extern "C" {
@@ -460,6 +467,14 @@ unsafe extern "C" {
         groupCountX: u32,
         groupCountY: u32,
         groupCountZ: u32,
+    );
+    fn vkCmdPushConstants(
+        commandBuffer: *mut c_void,
+        layout: u64,
+        stageFlags: u32,
+        offset: u32,
+        size: u32,
+        pValues: *const c_void,
     );
     fn vkQueueSubmit(
         queue: *mut c_void,
@@ -823,10 +838,8 @@ fn run_compute_shader(
     grid_x: u32,
     grid_y: u32,
     grid_z: u32,
+    push_constants: Option<[u32; 6]>,
 ) -> Result<()> {
-    if spirv_code.starts_with(&[0x03, 0x02, 0x23, 0x02]) {
-        return Err(Error::Backend("Mock SPIR-V execution skipped on physical GPU to prevent driver crash".into()));
-    }
     unsafe {
         let mut bindings = Vec::with_capacity(buffers.len());
         for i in 0..buffers.len() {
@@ -968,14 +981,25 @@ fn run_compute_shader(
         }
         cleanup.shader_module = shader_module;
 
+        // Push-constant block (the precompiled kernels declare a `Params`
+        // uniform: { size:u32, dim:u32, k:u32, n:u32, m:u32, eps:f32 } = 24 bytes).
+        let push_range = VkPushConstantRange {
+            stage_flags: VK_SHADER_STAGE_COMPUTE_BIT,
+            offset: 0,
+            size: 24,
+        };
         let pipe_layout_ci = VkPipelineLayoutCreateInfo {
             s_type: VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             p_next: std::ptr::null(),
             flags: 0,
             set_layout_count: 1,
             p_set_layouts: &ds_layout,
-            push_constant_range_count: 0,
-            p_push_constant_ranges: std::ptr::null(),
+            push_constant_range_count: if push_constants.is_some() { 1 } else { 0 },
+            p_push_constant_ranges: if push_constants.is_some() {
+                &push_range as *const VkPushConstantRange as *const c_void
+            } else {
+                std::ptr::null()
+            },
         };
         let mut pipeline_layout = 0u64;
         let res = vkCreatePipelineLayout(ctx.device, &pipe_layout_ci, std::ptr::null(), &mut pipeline_layout);
@@ -1047,8 +1071,18 @@ fn run_compute_shader(
             return Err(Error::Backend(format!("vkBeginCommandBuffer failed: {res}")));
         }
 
-        vkCmdBindPipeline(command_buffer, 0, pipeline);
-        vkCmdBindDescriptorSets(command_buffer, 0, pipeline_layout, 0, 1, &ds, 0, std::ptr::null());
+        vkCmdBindPipeline(command_buffer, 1, pipeline);
+        vkCmdBindDescriptorSets(command_buffer, 1, pipeline_layout, 0, 1, &ds, 0, std::ptr::null());
+        if let Some(pc) = push_constants {
+            vkCmdPushConstants(
+                command_buffer,
+                pipeline_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT,
+                0,
+                24,
+                pc.as_ptr() as *const c_void,
+            );
+        }
         vkCmdDispatch(command_buffer, grid_x, grid_y, grid_z);
 
         let res = vkEndCommandBuffer(command_buffer);
@@ -1056,6 +1090,7 @@ fn run_compute_shader(
             return Err(Error::Backend(format!("vkEndCommandBuffer failed: {res}")));
         }
 
+        let cmd_buf_u64 = command_buffer as u64;
         let submit_info = VkSubmitInfo {
             s_type: VK_STRUCTURE_TYPE_SUBMIT_INFO,
             p_next: std::ptr::null(),
@@ -1063,7 +1098,7 @@ fn run_compute_shader(
             p_wait_semaphores: std::ptr::null(),
             p_wait_dst_stage_mask: std::ptr::null(),
             command_buffer_count: 1,
-            p_command_buffers: &command_buffer,
+            p_command_buffers: &cmd_buf_u64,
             signal_semaphore_count: 0,
             p_signal_semaphores: std::ptr::null(),
         };
@@ -1078,6 +1113,14 @@ fn run_compute_shader(
         }
     }
     Ok(())
+}
+
+/// Build the 24-byte push-constant block (`Params`) the precompiled kernels
+/// expect: { size:u32, dim:u32, k:u32, n:u32, m:u32, eps:f32 }. Each kernel
+/// reads only the fields it needs; supplying the full block is always valid.
+fn push_params(size: u32, dim: u32, k: u32, n: u32, m: u32, eps: f32) -> [u32; 6] {
+    let eps_bits = eps.to_bits();
+    [size, dim, k, n, m, eps_bits]
 }
 
 pub fn generate_add_glsl(size: usize) -> String {
@@ -1270,9 +1313,13 @@ impl BackendDevice for VulkanDevice {
         let autotuner = VulkanAutotuner::new();
         let tile_config = autotuner.search_tile_config(m, n, k);
 
-        // 2. CubeCL #[cube] JIT compiler shader generator (Phase 4 requirement)
-        let glsl_source = generate_matmul_glsl(m, n, k, tile_config);
-        let spirv_source = compile_glsl_to_spirv(&glsl_source)?;
+        // Use the precompiled, autotuner-matched matmul blob (block size 64 or 32).
+        let kernel = if tile_config.block_m == 64 {
+            VulkanKernel::Matmul64
+        } else {
+            VulkanKernel::Matmul32
+        };
+        let spirv_source: Vec<u8> = spirv_for(kernel).to_vec();
 
         let out_storage = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
 
@@ -1280,9 +1327,11 @@ impl BackendDevice for VulkanDevice {
         let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
         let grid_x = ((n + tile_config.block_n as usize - 1) / tile_config.block_n as usize) as u32;
         let grid_y = ((m + tile_config.block_m as usize - 1) / tile_config.block_m as usize) as u32;
-        
+
+        let push = push_params(0, 0, k as u32, n as u32, m as u32, 0.0);
+
         let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, grid_y, 1) {
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, grid_y, 1, Some(push)) {
             eprintln!("[Vulkan matmul] GPU dispatch failed ({}); falling back to host simulation", e);
         } else {
             dispatch_success = true;
@@ -1342,14 +1391,15 @@ impl BackendDevice for VulkanDevice {
         let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
-        let glsl_source = generate_add_glsl(size);
-        let spirv_source = compile_glsl_to_spirv(&glsl_source)?;
+        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Add).to_vec();
 
         let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
         let grid_x = ((size + 255) / 256) as u32;
 
+        let push = push_params(size as u32, 0, 0, 0, 0, 0.0);
+
         let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1) {
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push)) {
             eprintln!("[Vulkan add] GPU dispatch failed ({}); falling back to host simulation", e);
         } else {
             dispatch_success = true;
@@ -1401,17 +1451,21 @@ impl BackendDevice for VulkanDevice {
         let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
-        let glsl_source = generate_mul_glsl(size);
-        let spirv_source = compile_glsl_to_spirv(&glsl_source)?;
+        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Mul).to_vec();
 
         let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
         let grid_x = ((size + 255) / 256) as u32;
 
+        let push = push_params(size as u32, 0, 0, 0, 0, 0.0);
+
         let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1) {
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push)) {
             eprintln!("[Vulkan mul] GPU dispatch failed ({}); falling back to host simulation", e);
+            } else {
+                dispatch_success = true;
+            }
         } else {
-            dispatch_success = true;
+            eprintln!("[Vulkan mul] GPU shader compilation unavailable; falling back to host simulation");
         }
 
         if !dispatch_success {
@@ -1467,7 +1521,7 @@ impl BackendDevice for VulkanDevice {
         let grid_x = ((size + 255) / 256) as u32;
 
         let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1) {
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, None) {
             eprintln!("[Vulkan silu_mul] GPU dispatch failed ({}); falling back to host simulation", e);
         } else {
             dispatch_success = true;
@@ -1532,7 +1586,7 @@ impl BackendDevice for VulkanDevice {
         let grid_x = ((size + 255) / 256) as u32;
 
         let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1) {
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, None) {
             eprintln!("[Vulkan rms_norm] GPU dispatch failed ({}); falling back to host simulation", e);
         } else {
             dispatch_success = true;
@@ -1599,7 +1653,7 @@ impl BackendDevice for VulkanDevice {
         let grid_x = ((size + 255) / 256) as u32;
 
         let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1) {
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, None) {
             eprintln!("[Vulkan softmax] GPU dispatch failed ({}); falling back to host simulation", e);
         } else {
             dispatch_success = true;
@@ -1677,7 +1731,7 @@ impl BackendDevice for VulkanDevice {
         let grid_x = ((size + 255) / 256) as u32;
 
         let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1) {
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, None) {
             eprintln!("[Vulkan embedding] GPU dispatch failed ({}); falling back to host simulation", e);
         } else {
             dispatch_success = true;
@@ -1842,20 +1896,38 @@ void main() {{
     )
 }
 
-/// Parse GLSL source to SPIR-V using a mock compilation (in production, use glslc or spirv-builder)
-pub fn compile_glsl_to_spirv(glsl_source: &str) -> Result<Vec<u8>> {
-    // In production, this would call glslc or use spirv_builder
-    // For now, we generate a minimal valid SPIR-V binary
-    let magic = [0x03, 0x02, 0x23, 0x02]; // SPIR-V magic number
-    let version = [0x01, 0x00, 0x00, 0x00]; // Version 1.0
-    let mut spirv = Vec::new();
-    spirv.extend_from_slice(&magic);
-    spirv.extend_from_slice(&version);
-    // Append serialized GLSL (for debugging)
-    let len_bytes = (glsl_source.len() as u32).to_le_bytes();
-    spirv.extend_from_slice(&len_bytes);
-    spirv.extend_from_slice(glsl_source.as_bytes());
-    Ok(spirv)
+include!(concat!(env!("OUT_DIR"), "/spirv_spv.rs"));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VulkanKernel {
+    Add,
+    Mul,
+    SiluMul,
+    RmsNorm,
+    Softmax,
+    Embedding,
+    Matmul64,
+    Matmul32,
+}
+
+pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
+    match kernel {
+        VulkanKernel::Add => SPIRV_ADD,
+        VulkanKernel::Mul => SPIRV_MUL,
+        VulkanKernel::SiluMul => SPIRV_SILU_MUL,
+        VulkanKernel::RmsNorm => SPIRV_RMS_NORM,
+        VulkanKernel::Softmax => SPIRV_SOFTMAX,
+        VulkanKernel::Embedding => SPIRV_EMBEDDING,
+        VulkanKernel::Matmul64 => SPIRV_MATMUL_64,
+        VulkanKernel::Matmul32 => SPIRV_MATMUL_32,
+    }
+}
+
+pub fn compile_glsl_to_spirv(_glsl_source: &str) -> Result<Vec<u8>> {
+    Err(Error::Backend(
+        "compile_glsl_to_spirv: runtime GLSL compilation is not supported. \
+         Use precompiled kernel blobs from build.rs via spirv_for() instead.".into(),
+    ))
 }
 
 /// Helper function to retrieve the size in bytes of a data type.
@@ -1944,12 +2016,6 @@ mod tests {
 
     #[test]
     fn test_vulkan_gpu_compute() {
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-        let ctx = match ctx_guard.as_ref() {
-            Some(c) => c,
-            None => return,
-        };
-
         let a_data = vec![1.0f32, 2.0, 3.0, 4.0];
         let b_data = vec![10.0f32, 20.0, 30.0, 40.0];
         let shape = Shape::new(vec![4]);
@@ -1960,6 +2026,12 @@ mod tests {
 
         let a_storage = a_s.as_any().downcast_ref::<VulkanStorage>().unwrap();
         let b_storage = b_s.as_any().downcast_ref::<VulkanStorage>().unwrap();
+
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = match ctx_guard.as_ref() {
+            Some(c) => c,
+            None => return,
+        };
         let out_storage = VulkanStorage::alloc_gpu(&shape, DType::F32, ctx.device, ctx.physical_device).unwrap();
 
         // Standard precompiled add SPIR-V binary from radv_repro.rs
@@ -2018,7 +2090,7 @@ mod tests {
         };
 
         let buffers = [a_storage.buffer, b_storage.buffer, out_storage.buffer];
-        run_compute_shader(ctx, spirv_bytes, &buffers, 1, 1, 1).unwrap();
+        run_compute_shader(ctx, spirv_bytes, &buffers, 1, 1, 1, None).unwrap();
 
         let cpu_data = out_storage.to_cpu_vec_f32().unwrap();
         assert_eq!(cpu_data, vec![11.0, 22.0, 33.0, 44.0]);

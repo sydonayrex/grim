@@ -23,6 +23,32 @@ use crate::{
     hipSuccess, HipErrorT, HipMemcpyKind, HiprtcProgram,
 };
 
+/// Convert a raw `HipErrorT` into `Result<()>`.
+///
+/// Every HIP runtime call (`hipMalloc`, `hipStreamSynchronize`, …) returns
+/// `HipErrorT`.  Before this helper every call site had a hand-written
+/// `if res != hipSuccess { return Err(...) }` block.  This function
+/// consolidates the pattern in one place so that:
+///
+/// - error messages are consistent and include the call-site label,
+/// - future additions (logging, metrics) touch one function, and
+/// - call sites shrink from 5 lines to 1.
+///
+/// # Examples
+///
+/// ```ignore
+/// let res = unsafe { hipStreamSynchronize(stream) };
+/// check_hip("hipStreamSynchronize", res)?;
+/// ```
+#[inline]
+pub fn check_hip(label: &str, res: HipErrorT) -> Result<()> {
+    if res != hipSuccess {
+        Err(Error::Backend(format!("{} failed: {}", label, res)))
+    } else {
+        Ok(())
+    }
+}
+
 /// Memory copy that handles XNACK automatically.
 /// Falls back to async copy with stream when XNACK is available.
 pub fn memcpy_with_xnack_fallback(

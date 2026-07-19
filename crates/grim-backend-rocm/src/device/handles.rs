@@ -17,9 +17,11 @@
 
 use std::ffi::c_void;
 
-use grim_tensor::error::{Error, Result};
+use grim_tensor::error::Result;
 
 use grim_tensor::backend::ComputeHandle;
+
+use crate::device::helpers::check_hip;
 
 // ======== HIP FFI root types (kept in lib.rs's clippy namespace) ========
 
@@ -28,6 +30,7 @@ use grim_tensor::backend::ComputeHandle;
 pub type HipErrorT = i32;
 
 /// Success return code for HIP runtime FFI calls.
+#[allow(non_upper_case_globals)]
 pub const hipSuccess: HipErrorT = 0;
 
 // ======== RocmHandle: typed wrapper around an optional HIP stream ========
@@ -53,12 +56,7 @@ unsafe impl Send for RocmHandle {}
 impl ComputeHandle for RocmHandle {
     fn synchronize(&self) -> Result<()> {
         if let Some(stream) = self.stream {
-            unsafe {
-                let res = hipStreamSynchronize(stream);
-                if res != hipSuccess {
-                    return Err(Error::Backend(format!("hipStreamSynchronize failed: {}", res)));
-                }
-            }
+            check_hip("hipStreamSynchronize", unsafe { hipStreamSynchronize(stream) })?;
         }
         Ok(())
     }
@@ -94,6 +92,7 @@ impl HipDim3 {
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+#[allow(non_snake_case)]
 pub struct HipGraphKernelNodeParams {
     pub func: *mut c_void,
     pub gridDim: HipDim3,

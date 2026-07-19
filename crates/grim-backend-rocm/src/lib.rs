@@ -9,19 +9,16 @@
 //! - HIP runtime (`libamdhip64.so`): `hipMalloc`, `hipFree`, `hipMemcpy`
 //! - rocBLAS (`librocblas.so`): `rocblas_create_handle`, `rocblas_sgemm`, etc.
 
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
-use std::fs;
+use grim_tensor::dtype::{DType, QuantProvenance};
+pub use grim_tensor::error::Error;
+pub use grim_tensor::error::Result;
+pub use grim_tensor::Shape;
 
-use grim_tensor::backend::ComputeHandle;
-use grim_tensor::dtype::{DType, QuantProvenance, Storage as DTypeStorage};
-use grim_tensor::error::{Error, Result};
-use grim_tensor::{ArithType, BackendDevice, BackendStorage, Shape};
-use grim_format::gguf::{GrimMetadata, GrimLayoutHint};
+pub use std::ffi::c_void;
+pub use std::sync::Arc;
+pub use grim_tensor::backend::{ComputeHandle, BackendDevice};
+pub use grim_tensor::Storage as DTypeStorage;
+pub use grim_tensor::{ArithType, BackendStorage};
 
 // ----- Crate-wide module declarations ---------------------------
 // Per spec: lib.rs holds the cross-cutting re-export surface plus
@@ -106,7 +103,7 @@ pub use crate::memory::pinned::RocmPinnedBuffer;
 
 pub use crate::device::probe::probe_xnack;
 pub use crate::device::helpers::{
-    jit_compile_hsaco, memcpy_with_xnack_fallback, upload_device_buffer,
+    check_hip, jit_compile_hsaco, memcpy_with_xnack_fallback, upload_device_buffer,
 };
 
 pub use crate::device::util::{
@@ -119,7 +116,7 @@ pub use crate::device::util::{
 // keep using `RocmDevice::new(...)` etc. unchanged.
 pub use crate::device::roc_device::RocmDevice;
 
-pub use fusion::{DecodeGemmConfig, FusedDequantGemmConfig, SplitKGemmConfig, HipKernelLaunch, QkvAttentionFusionConfig, RmsNormMatMulFusionConfig, KvDequantAttentionConfig, hipDim3};
+pub use fusion::{DecodeGemmConfig, FusedDequantGemmConfig, SplitKGemmConfig, HipKernelLaunch, QkvAttentionFusionConfig, RmsNormMatMulFusionConfig, KvDequantAttentionConfig, WmmaGemmConfig, hipDim3};
 
 pub use kernels::qkv_attention::{BlockTableEntry, launch_paged_attention, launch_tree_attention};
 

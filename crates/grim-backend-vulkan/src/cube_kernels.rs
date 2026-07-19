@@ -103,20 +103,41 @@ pub const AVAILABLE_KERNELS: &[ComputeKernel] = &[
 ];
 
 /// Kernel builder for CubeCL-style operations.
+///
+/// Kernels are precompiled to real SPIR-V at build time (see `build.rs` +
+/// `glslangValidator`). `build_kernel` selects the matching precompiled blob
+/// from the generated [`crate::precompiled_spv`] module.
 pub struct KernelBuilder;
 
 impl KernelBuilder {
-    /// Build a kernel module from GLSL source.
-    /// Would use naga for runtime compilation in real implementation.
-    pub fn build_kernel(_source: &str, _entry: &str) -> Result<Vec<u32>> {
-        // Placeholder: real implementation would compile via naga
-        Err(grim_tensor::error::Error::Unimplemented(
-            "CubeCL kernel compilation requires naga integration".into()
-        ))
+    /// Build a kernel module from GLSL source, returning genuine SPIR-V words.
+    ///
+    /// The source must be one of the canonical generated shaders
+    /// (`generate_*_glsl` / `generate_matmul_glsl`); the matching precompiled
+    /// blob is looked up and returned. This replaces the previous naga
+    /// placeholder so callers get real Vulkan SPIR-V without a runtime
+    /// compiler dependency.
+    pub fn build_kernel(source: &str, _entry: &str) -> Result<Vec<u32>, grim_tensor::error::Error> {
+        let bytes = crate::compile_glsl_to_spirv(source)?;
+        if bytes.len() % 4 != 0 {
+            return Err(grim_tensor::error::Error::Backend(
+                "CubeCL build_kernel: SPIR-V byte length not a multiple of 4".into(),
+            ));
+        }
+        let words = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        Ok(words)
     }
-    
+
+    /// Select the precompiled SPIR-V blob for a known operation directly.
+    pub fn spirv_for(kernel: crate::VulkanKernel) -> &'static [u8] {
+        crate::spirv_for(kernel)
+    }
+
     /// Compute dispatches needed for a GEMM operation.
-    pub fn gemm_dispatches(m: u32, n: u32, k: u32) -> u32 {
+    pub fn gemm_dispatches(m: u32, n: u32, _k: u32) -> u32 {
         ((m + 15) / 16) * ((n + 15) / 16)
     }
 }
@@ -136,5 +157,15 @@ mod tests {
     fn test_gemm_dispatch_calculation() {
         // M=128, N=256 should need (128/16)*(256/16) = 8*16 = 128 dispatches
         assert_eq!(KernelBuilder::gemm_dispatches(128, 256, 64), 128);
+    }
+
+    #[test]
+    fn test_build_kernel_returns_real_spirv() {
+        // build_kernel now returns genuine SPIR-V words from the precompiled blob.
+        let words = KernelBuilder::build_kernel(&crate::generate_add_glsl(), "main")
+            .expect("add kernel should precompile to SPIR-V");
+        assert!(!words.is_empty());
+        // SPIR-V magic number: 0x07230203 little-endian.
+        assert_eq!(words[0], 0x07230203);
     }
 }

@@ -219,3 +219,27 @@ impl Default for KvDequantAttentionConfig {
         }
     }
 }
+
+/// Configuration for the WMMA (Wave Matrix Multiply-Accumulate) GEMM kernel (WI-G).
+///
+/// `enabled` is the runtime gate for the JIT'd WMMA GEMM kernel:
+/// `RocmDevice::matmul` only dispatches to this kernel when `enabled` is `true`.
+/// Default = `false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WmmaGemmConfig {
+    /// Runtime gate: `false` = always use standard paths, `true` = dispatch to the
+    /// JIT'd `grim_wmma_gemm` kernel when supported.
+    pub enabled: bool,
+    /// Wavefront size of the active arch.
+    pub wavefront_size: u32,
+}
+
+impl Default for WmmaGemmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            wavefront_size: 64,
+        }
+    }
+}
+

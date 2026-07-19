@@ -15,13 +15,16 @@
 
 
 
-use crate::{jit_compile_hsaco, HiprtcProgram, HipDim3, hipSuccess};
+use crate::device::helpers::check_hip;
+use crate::{hipSuccess, HiprtcProgram};
 
 /// HIP source for the GPTQ wavefront correction kernel.
 ///
 /// Each HIP thread corrects one element of the weight matrix using the
 /// diagonal Fisher preconditioner. Threads within a wavefront cooperate
 /// via shuffle to reduce LDS bank pressure during the correction pass.
+// TODO(Phase-4): Wire compile_gptq_kernel() call site for GPTQ GPU acceleration.
+#[allow(dead_code)]
 const GPTQ_CORRECTION_KERNEL: &str = r#"
 extern "C" __global__
 void gptq_wavefront_correction_kernel(
@@ -64,6 +67,8 @@ void gptq_wavefront_correction_kernel(
 /// One HIP thread per quantization block. Each thread evaluates all 7
 /// scale multipliers and picks the one with lowest weighted quantization error.
 /// This replaces `fit_block_quantization` on CPU.
+// TODO(Phase-4): Wire compile_gptq_kernel() call site for GPTQ GPU acceleration.
+#[allow(dead_code)]
 const GPTQ_SCALE_FIT_KERNEL: &str = r#"
 extern "C" __global__
 void gptq_scale_fit_kernel(
@@ -190,9 +195,7 @@ pub fn compile_gptq_kernel(kernel_name: &str, source: &str, gcn: &str) -> Result
             std::ptr::null(),
             std::ptr::null(),
         );
-        if status != hipSuccess {
-            return Err(crate::Error::Backend(format!("hiprtcCreateProgram failed with status {}", status)));
-        }
+        check_hip("hiprtcCreateProgram", status)?;
 
         let compile_status = crate::hiprtcCompileProgram(prog, options.len() as i32, option_ptrs.as_ptr());
 

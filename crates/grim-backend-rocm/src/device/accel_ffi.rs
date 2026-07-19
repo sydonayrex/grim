@@ -35,6 +35,7 @@ use libloading::{Library, Symbol};
 
 /// MIOpen status code (every function returns one).
 pub type MiopenStatus = i32;
+#[allow(non_upper_case_globals)]
 pub const miopen_status_success: MiopenStatus = 0;
 
 /// Opaque MIOpen handle (mirrors `#[repr(transparent)]` newtype pattern).
@@ -108,6 +109,7 @@ pub fn miopen_probe() -> Result<(), Error> {
 
 /// RCCL (NCCL) status code.
 pub type NcclResult = i32;
+#[allow(non_upper_case_globals)]
 pub const nccl_success: NcclResult = 0;
 
 /// Opaque RCCL communicator.
@@ -159,8 +161,9 @@ pub fn rccl_init_all(devlist: &[i32]) -> Result<Vec<NcclComm>, Error> {
 // `kernels::decode_gemm::KERNEL_SOURCE` and the `DecodeGemmConfig` flag
 // in `RocmDevice::matmul`. The vendored CK headers under
 // `old/repos/rocm-libraries-develop/` are dead reference code.
+#[cfg(test)]
 mod self_tests {
-    use super::*;
+    use super::miopen_probe;
 
     // F9 — MIOpen: probe must ERROR (not panic) here because no real
     // libMIOpen.so exists in this environment. We assert graceful failure

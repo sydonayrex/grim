@@ -114,13 +114,10 @@ impl HostStagingBuffer {
             ));
         }
         let mut ptr: *mut c_void = std::ptr::null_mut();
-        let res = unsafe { hipHostMalloc(&mut ptr, size, 0) };
-        if res != hipSuccess {
-            return Err(Error::Backend(format!(
-                "HostStagingBuffer::new: hipHostMalloc({}) failed with code={}",
-                size, res
-            )));
-        }
+        crate::device::helpers::check_hip(
+            "hipHostMalloc",
+            unsafe { hipHostMalloc(&mut ptr, size, 0) },
+        )?;
         Ok(Self { ptr, size })
     }
 
@@ -186,7 +183,7 @@ impl Drop for HostStagingBuffer {
 
 // HIP symbols we call directly. The crate root's `hipHostMalloc` already
 // declares this; we shadow locally to keep the module self-contained.
-use crate::{hipHostFree, hipHostMalloc, hipSuccess, hipMemcpyAsync, HipMemcpyKind};
+use crate::{hipHostFree, hipHostMalloc, hipMemcpyAsync, HipMemcpyKind};
 
 /// Performs inter-device copy routing either via direct peer copies or host bounce staging.
 pub fn copy_route(
@@ -203,31 +200,31 @@ pub fn copy_route(
             crate::rccl::p2p_memcpy_async(dst_ptr, dst_device, src_ptr, src_device, len, stream)?;
         }
         RouteLink::HostBounce => {
-            let mut staging = HostStagingBuffer::new(len)?;
-            let res = unsafe {
-                hipMemcpyAsync(
-                    staging.as_device_ptr(),
-                    src_ptr,
-                    len,
-                    HipMemcpyKind::DeviceToHost,
-                    stream,
-                )
-            };
-            if res != hipSuccess {
-                return Err(Error::Backend(format!("copy_route: D2H copy to staging failed with status {}", res)));
-            }
-            let res = unsafe {
-                hipMemcpyAsync(
-                    dst_ptr,
-                    staging.as_device_ptr(),
-                    len,
-                    HipMemcpyKind::HostToDevice,
-                    stream,
-                )
-            };
-            if res != hipSuccess {
-                return Err(Error::Backend(format!("copy_route: H2D copy from staging failed with status {}", res)));
-            }
+            let staging = HostStagingBuffer::new(len)?;
+            crate::device::helpers::check_hip(
+                "copy_route: D2H copy to staging",
+                unsafe {
+                    hipMemcpyAsync(
+                        staging.as_device_ptr(),
+                        src_ptr,
+                        len,
+                        HipMemcpyKind::DeviceToHost,
+                        stream,
+                    )
+                },
+            )?;
+            crate::device::helpers::check_hip(
+                "copy_route: H2D copy from staging",
+                unsafe {
+                    hipMemcpyAsync(
+                        dst_ptr,
+                        staging.as_device_ptr(),
+                        len,
+                        HipMemcpyKind::HostToDevice,
+                        stream,
+                    )
+                },
+            )?;
         }
     }
     Ok(())

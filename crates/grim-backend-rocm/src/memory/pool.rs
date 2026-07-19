@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use grim_tensor::error::{Error, Result};
 
-use crate::{hipFree, hipMalloc, HipErrorT, hipSuccess};
+use crate::{check_hip, hipFree, hipMalloc};
 
 /// Layout key for the scratch pool: (rounded size, alignment).
 ///
@@ -108,13 +108,7 @@ impl DeviceScratchPool {
             Some(p) => p,
             None => {
                 let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
-                let res: HipErrorT = unsafe { hipMalloc(&mut p, layout.size) };
-                if res != hipSuccess {
-                    return Err(Error::Backend(format!(
-                        "scratch pool hipMalloc failed: code={}",
-                        res
-                    )));
-                }
+                check_hip("scratch pool hipMalloc", unsafe { hipMalloc(&mut p, layout.size) })?;
                 self.current_bytes
                     .fetch_add(layout.size, Ordering::Relaxed);
                 let cur = self.current_bytes.load(Ordering::Relaxed);

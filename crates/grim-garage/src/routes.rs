@@ -211,9 +211,16 @@ async fn start_training(
 
     match state.registry.create(job).await {
         Ok(id) => {
+            // Spawn the background worker that drives the training loop.
+            // The task runs asynchronously; the HTTP response returns immediately
+            // with the job id so the UI can start polling /api/train/status/{id}.
+            let registry = state.registry.clone();
+            let worker_id = id.clone();
+            tokio::spawn(crate::jobs::run_training_worker(registry, worker_id));
+
             Ok(Json(StartTrainingResponse {
                 job_id: id.0,
-                status: "pending".into(),
+                status: "running".into(),
             }))
         }
         Err(e) => Err((

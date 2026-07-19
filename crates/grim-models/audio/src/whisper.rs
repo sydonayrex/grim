@@ -49,8 +49,8 @@ struct WhisperEncoderBlock {
     fc1: Linear,
     fc2: Linear,
     d_model: usize,
-    num_heads: usize,
-    head_dim: usize,
+    _num_heads: usize,
+    _head_dim: usize,
 }
 
 impl WhisperEncoderBlock {
@@ -84,8 +84,8 @@ impl WhisperEncoderBlock {
                 bias: Some(cpu_tensor(vec![0.0; d_model], Shape::new(vec![d_model]))),
             },
             d_model,
-            num_heads,
-            head_dim,
+            _num_heads: num_heads,
+            _head_dim: head_dim,
         }
     }
 
@@ -112,13 +112,13 @@ struct WhisperDecoderBlock {
     self_q: Vec<f32>,
     self_k: Vec<f32>,
     self_v: Vec<f32>,
-    self_o: Vec<f32>,
+    _self_o: Vec<f32>,
     cross_norm: RmsNorm,
-    cross_q: Vec<f32>,
+    _cross_q: Vec<f32>,
     cross_k: Vec<f32>,
-    cross_v: Vec<f32>,
-    cross_o: Vec<f32>,
-    ffn_norm: RmsNorm,
+    _cross_v: Vec<f32>,
+    _cross_o: Vec<f32>,
+    _ffn_norm: RmsNorm,
     fc1: Linear,
     fc2: Linear,
     d_model: usize,
@@ -147,16 +147,16 @@ impl WhisperDecoderBlock {
             self_q,
             self_k,
             self_v,
-            self_o,
+            _self_o: self_o,
             cross_norm: RmsNorm {
                 weight: cpu_tensor(vec![1.0; d_model], Shape::new(vec![d_model])),
                 eps,
             },
-            cross_q,
+            _cross_q: cross_q,
             cross_k,
-            cross_v,
-            cross_o,
-            ffn_norm: RmsNorm {
+            _cross_v: cross_v,
+            _cross_o: cross_o,
+            _ffn_norm: RmsNorm {
                 weight: cpu_tensor(vec![1.0; d_model], Shape::new(vec![d_model])),
                 eps,
             },

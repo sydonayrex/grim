@@ -41,11 +41,23 @@ impl Default for JobStatus {
 }
 
 /// Training mode the UI's "Training Mode" dropdown drives.
+///
+/// SFT modes: `Lora`, `QLoRA`, `Bf16Full`.
+/// Reinforcement-learning modes: `Orpo`, `Dpo`, `Grpo`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrainingMode {
+    /// LoRA supervised fine-tuning on compressed weights.
     Lora,
+    /// Quantized LoRA — LoRA adapters with block-quantized base weights.
     QLoRA,
+    /// Full BF16 supervised fine-tuning (unpacked weights).
     Bf16Full,
+    /// Odds-Ratio Preference Optimization (HLRF reinforcement).
+    Orpo,
+    /// Direct Preference Optimization (HLRF reinforcement).
+    Dpo,
+    /// Group Relative Policy Optimization (HLRF reinforcement, DeepSeek-R1-style).
+    Grpo,
 }
 
 /// One per-step metric sample: step id, loss, tokens processed.
@@ -209,4 +221,102 @@ impl JobRegistry {
     pub fn subscribe_metrics(&self) -> broadcast::Receiver<MetricStreamEvent> {
         self.metrics_tx.subscribe()
     }
+}
+
+/// Compute a baseline loss for the given training mode.
+///
+/// SFT modes start from an empirical cross-entropy target (~2.3);
+/// RL modes use an initial reward differential of 0.0 converging upward.
+fn initial_loss(mode: TrainingMode) -> f64 {
+    match mode {
+        TrainingMode::Lora | TrainingMode::QLoRA | TrainingMode::Bf16Full => 2.3,
+        TrainingMode::Orpo | TrainingMode::Dpo | TrainingMode::Grpo => 0.0,
+    }
+}
+
+/// Execute a training job inside a Tokio background task.
+///
+/// The caller should spawn this with `tokio::spawn`:
+/// ```rust,no_run
+/// # use std::sync::Arc;
+/// # use grim_garage::jobs::{JobId, JobRegistry, run_training_worker};
+/// # async fn example(registry: Arc<JobRegistry>, job_id: JobId) {
+/// tokio::spawn(run_training_worker(registry.clone(), job_id));
+/// # }
+/// ```
+///
+/// Contract:
+/// - Transitions `Pending → Running` immediately.
+/// - Emits one `Metric` event per simulated step (200 ms sleep).
+/// - On completion, transitions to `Completed`.
+/// - On any registry error, transitions to `Failed` and logs the error.
+pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
+    // Retrieve the job configuration.
+    let job = match registry.get(&id).await {
+        Some(j) => j,
+        None => {
+            eprintln!("[grim-garage] worker: job {} not found — aborting", id);
+            return;
+        }
+    };
+
+    let mode = job.training_mode;
+    let epochs = job.epochs.max(1) as u64;
+    // Simulated steps per epoch; real implementors would use dataset_len / batch_size.
+    let steps_per_epoch: u64 = 10;
+    let total_steps = epochs * steps_per_epoch;
+
+    // Transition → Running
+    if let Err(e) = registry.update_status(&id, JobStatus::Running).await {
+        eprintln!("[grim-garage] worker: failed to mark {} Running: {e}", id);
+        return;
+    }
+    eprintln!("[grim-garage] worker: job {} started (mode={mode:?}, epochs={epochs})", id);
+
+    let mut loss = initial_loss(mode);
+    // Exponential decay factor per step for SFT modes.
+    let decay: f64 = 0.85;
+
+    for step in 0..total_steps {
+        // Simulate one training step.
+        // SFT: loss decays exponentially toward zero.
+        // RL:  reward differential rises; reported as negative "loss" for chart compat.
+        loss = match mode {
+            TrainingMode::Lora | TrainingMode::QLoRA | TrainingMode::Bf16Full => {
+                loss * decay + rand_noise(0.02)
+            }
+            TrainingMode::Orpo | TrainingMode::Dpo | TrainingMode::Grpo => {
+                let reward = (step as f64 / total_steps as f64) + rand_noise(0.05);
+                -reward
+            }
+        };
+
+        let metric = Metric { step, loss, tokens: (step + 1) * 512 };
+        if let Err(e) = registry.append_metric(&id, metric).await {
+            eprintln!("[grim-garage] worker: metric append failed for {}: {e}", id);
+            let _ = registry.update_status(&id, JobStatus::Failed).await;
+            return;
+        }
+
+        // Yield so other tasks can run; a real trainer awaits GPU kernel completion here.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    if let Err(e) = registry.update_status(&id, JobStatus::Completed).await {
+        eprintln!("[grim-garage] worker: failed to mark {} Completed: {e}", id);
+    } else {
+        eprintln!("[grim-garage] worker: job {} completed successfully", id);
+    }
+}
+
+/// Minimal pseudo-random noise for the step simulator.
+/// Uses the system-time nanosecond sub-second counter as a lightweight seed.
+/// This is acceptable for non-security use (training loss jitter simulation only).
+fn rand_noise(amplitude: f64) -> f64 {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as f64;
+    // Map nanos in [0, 1e9) → [-amplitude, +amplitude].
+    (seed / 1_000_000_000.0 - 0.5) * amplitude * 2.0
 }

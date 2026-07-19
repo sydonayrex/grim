@@ -22,14 +22,15 @@ use serde_json::Value;
 /// Per-row scale dtype. Spec D2 + D15.
 ///
 /// `U8` is the default symmetric mode; `F16` is reserved for a future
-/// asymmetric-quant fallback and is documented in the spec as "writers
-/// MUST set `row_scale_dtype = 0`" until asymmetric lands.
+/// asymmetric-quant fallback. `Fp8` is the FP8 block scale mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowScaleDtype {
     /// Symmetric u8 scale (default).
     U8 = 0,
     /// Reserved asymmetric f16 scale; not emitted by current writers.
     F16 = 1,
+    /// FP8 block scale.
+    Fp8 = 2,
 }
 
 impl RowScaleDtype {
@@ -37,6 +38,7 @@ impl RowScaleDtype {
         match tag {
             0 => Some(Self::U8),
             1 => Some(Self::F16),
+            2 => Some(Self::Fp8),
             _ => None,
         }
     }
