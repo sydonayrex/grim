@@ -47,6 +47,64 @@ impl RowScaleDtype {
     }
 }
 
+/// Activation quantization dtype (P3-WI-2 / WI-R5 enabler).
+///
+/// Records which numeric format the *activations* (not weights) are
+/// quantized to when this tensor participates in a fused GEMM.  A value
+/// of `None` means no activation quantization — the legacy inference path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActQuantDtype {
+    /// No activation quantization (default, legacy).
+    None = 0,
+    /// INT8 symmetric activation quantization.
+    Int8 = 1,
+    /// FP8 E4M3 activation quantization (RDNA4 / CDNA3 target).
+    Fp8E4M3 = 2,
+}
+
+impl ActQuantDtype {
+    pub fn from_u8(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::None),
+            1 => Some(Self::Int8),
+            2 => Some(Self::Fp8E4M3),
+            _ => None,
+        }
+    }
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Scale layout for activation quantization (P3-WI-2 / WI-R5 enabler).
+///
+/// Tells the kernel where to find the activation scale factors:
+/// per-tensor (one global f32) or per-token (one f32 per sequence position).
+/// `None` means no activation scale is stored alongside this tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActScaleLayout {
+    /// No activation scale (default, legacy).
+    None = 0,
+    /// One f32 scale for the entire activation tensor.
+    PerTensor = 1,
+    /// One f32 scale per token (sequence position).
+    PerToken = 2,
+}
+
+impl ActScaleLayout {
+    pub fn from_u8(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::None),
+            1 => Some(Self::PerTensor),
+            2 => Some(Self::PerToken),
+            _ => None,
+        }
+    }
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
 /// Per-row bitwidth assignment mode. Spec D3 + Phase 3.
 ///
 /// `Uniform` is the legacy whole-tensor mode: every row uses
@@ -313,6 +371,12 @@ pub struct GrimTensorExt {
     /// Up to two residual backup layers. Absent layers have `bpw == 0`.
     pub backup1: BackupLayer,
     pub backup2: BackupLayer,
+
+    // --- P3-WI-2: activation-quant metadata (WI-R5 enabler) ---
+    /// Dtype of activation quantization for fused GEMM, or `None`.
+    pub act_quant_dtype: ActQuantDtype,
+    /// Scale layout for activation quantization, or `None`.
+    pub act_scale_layout: ActScaleLayout,
 }
 
 /// bit0 = RmsNormMatMul, bit1 = QkvAttention (spec §GrimTensorEntry V3
@@ -360,6 +424,8 @@ impl Default for GrimTensorExt {
             layout_descriptor: LayoutDescriptor::default(),
             backup1: BackupLayer::default(),
             backup2: BackupLayer::default(),
+            act_quant_dtype: ActQuantDtype::None,
+            act_scale_layout: ActScaleLayout::None,
         }
     }
 }
@@ -380,6 +446,8 @@ impl GrimTensorExt {
             && self.layout_hint == LayoutHintTag::Default
             && !self.backup1.is_present()
             && !self.backup2.is_present()
+            && self.act_quant_dtype == ActQuantDtype::None
+            && self.act_scale_layout == ActScaleLayout::None
     }
 
     /// Encode this extension to a JSON object for the metadata layer.
@@ -423,6 +491,8 @@ impl GrimTensorExt {
             ],
             "backup1": self.backup1.to_json(),
             "backup2": self.backup2.to_json(),
+            "act_quant_dtype": self.act_quant_dtype.as_u8(),
+            "act_scale_layout": self.act_scale_layout.as_u8(),
         })
     }
 
@@ -514,6 +584,10 @@ impl GrimTensorExt {
                 .get("backup2")
                 .and_then(BackupLayer::from_json)
                 .unwrap_or_default(),
+            act_quant_dtype: ActQuantDtype::from_u8(pick_u8("act_quant_dtype", 0))
+                .unwrap_or(ActQuantDtype::None),
+            act_scale_layout: ActScaleLayout::from_u8(pick_u8("act_scale_layout", 0))
+                .unwrap_or(ActScaleLayout::None),
         })
     }
 }
@@ -642,6 +716,60 @@ fn decode_varint(buf: &[u8]) -> Result<(u64, usize), String> {
         }
     }
     Err("truncated varint".into())
+}
+
+// ---------------------------------------------------------------------------
+// KvCacheLayout — on-disk KV-cache metadata schema (P3-WI-1)
+// ---------------------------------------------------------------------------
+
+/// On-disk KV-cache layout descriptor (WI-R4 / P3-WI-1).
+///
+/// Stored as optional `grim.kv_cache` JSON in the `.grim` file's metadata
+/// region. When absent, the reader behaves exactly as a plain weight-only
+/// file (backward compatible). When present, a resumed session can
+/// reconstruct the compressed KV cache without re-compressing.
+///
+/// Field naming tracks the plan: `kv_rotated`, `kv_bits_k/v`,
+/// `kv_eviction_map_offset`, `kv_sink_fp16`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvCacheLayout {
+    /// `true` if the KV keys were random-orthogonal-rotated before
+    /// quantization (required by the Lloyd-Max / RotateKV path).
+    pub kv_rotated: bool,
+    /// Bits used to quantize the K (key) tensors. 0 = unquantized.
+    pub kv_bits_k: u8,
+    /// Bits used to quantize the V (value) tensors. 0 = unquantized.
+    pub kv_bits_v: u8,
+    /// Byte offset of the eviction map inside the payload region. 0 = absent.
+    pub kv_eviction_map_offset: u64,
+    /// `true` if sink tokens are stored in FP16 (not quantized).
+    pub kv_sink_fp16: bool,
+}
+
+impl KvCacheLayout {
+    /// Encode to the JSON object stored at `grim.kv_cache` metadata key.
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "kv_rotated": self.kv_rotated,
+            "kv_bits_k": self.kv_bits_k,
+            "kv_bits_v": self.kv_bits_v,
+            "kv_eviction_map_offset": self.kv_eviction_map_offset,
+            "kv_sink_fp16": self.kv_sink_fp16,
+        })
+    }
+
+    /// Decode from a JSON value (the value stored at `grim.kv_cache`).
+    /// Returns `None` if the value is not an object or lacks `kv_bits_k`.
+    pub fn from_json(value: &Value) -> Option<Self> {
+        let obj = value.as_object()?;
+        Some(Self {
+            kv_rotated: obj.get("kv_rotated").and_then(|v| v.as_bool()).unwrap_or(false),
+            kv_bits_k: obj.get("kv_bits_k").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
+            kv_bits_v: obj.get("kv_bits_v").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
+            kv_eviction_map_offset: obj.get("kv_eviction_map_offset").and_then(|v| v.as_u64()).unwrap_or(0),
+            kv_sink_fp16: obj.get("kv_sink_fp16").and_then(|v| v.as_bool()).unwrap_or(false),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -836,5 +964,97 @@ mod tests {
             crate::gguf::GrimFusionOp::RmsNormMatMul, // duplicate
         ]);
         assert_eq!(mask, 0b11);
+    }
+
+    // --- P3-WI-2: activation-quant metadata ---
+
+    /// Act-quant fields default to None, keeping `is_legacy()` true.
+    #[test]
+    fn act_quant_fields_default_to_none_and_is_legacy() {
+        let ext = GrimTensorExt::default();
+        assert_eq!(ext.act_quant_dtype, ActQuantDtype::None);
+        assert_eq!(ext.act_scale_layout, ActScaleLayout::None);
+        assert!(ext.is_legacy());
+    }
+
+    /// Non-None act_quant_dtype breaks `is_legacy()`.
+    #[test]
+    fn act_quant_dtype_nonzero_breaks_is_legacy() {
+        let ext = GrimTensorExt {
+            tensor_name: "w".into(),
+            act_quant_dtype: ActQuantDtype::Int8,
+            ..Default::default()
+        };
+        assert!(!ext.is_legacy());
+    }
+
+    /// Act-quant fields round-trip through JSON byte-identical.
+    #[test]
+    fn act_quant_fields_round_trip_json() {
+        let ext = GrimTensorExt {
+            tensor_name: "proj.weight".into(),
+            act_quant_dtype: ActQuantDtype::Fp8E4M3,
+            act_scale_layout: ActScaleLayout::PerToken,
+            ..Default::default()
+        };
+        let restored = GrimTensorExt::from_json(&ext.to_json()).expect("round-trip");
+        assert_eq!(restored.act_quant_dtype, ActQuantDtype::Fp8E4M3);
+        assert_eq!(restored.act_scale_layout, ActScaleLayout::PerToken);
+    }
+
+    /// All ActQuantDtype variants parse from their u8 tag.
+    #[test]
+    fn act_quant_dtype_parses_all_variants() {
+        assert_eq!(ActQuantDtype::from_u8(0), Some(ActQuantDtype::None));
+        assert_eq!(ActQuantDtype::from_u8(1), Some(ActQuantDtype::Int8));
+        assert_eq!(ActQuantDtype::from_u8(2), Some(ActQuantDtype::Fp8E4M3));
+        assert_eq!(ActQuantDtype::from_u8(99), None);
+    }
+
+    /// All ActScaleLayout variants parse from their u8 tag.
+    #[test]
+    fn act_scale_layout_parses_all_variants() {
+        assert_eq!(ActScaleLayout::from_u8(0), Some(ActScaleLayout::None));
+        assert_eq!(ActScaleLayout::from_u8(1), Some(ActScaleLayout::PerTensor));
+        assert_eq!(ActScaleLayout::from_u8(2), Some(ActScaleLayout::PerToken));
+        assert_eq!(ActScaleLayout::from_u8(99), None);
+    }
+
+    // --- P3-WI-1: KvCacheLayout on-disk schema ---
+
+    /// KvCacheLayout round-trips JSON byte-identical.
+    #[test]
+    fn kv_cache_layout_round_trips_json() {
+        let layout = KvCacheLayout {
+            kv_rotated: true,
+            kv_bits_k: 3,
+            kv_bits_v: 4,
+            kv_eviction_map_offset: 0x1000,
+            kv_sink_fp16: true,
+        };
+        let json = layout.to_json();
+        let restored = KvCacheLayout::from_json(&json).expect("round-trip");
+        assert_eq!(restored.kv_rotated, true);
+        assert_eq!(restored.kv_bits_k, 3);
+        assert_eq!(restored.kv_bits_v, 4);
+        assert_eq!(restored.kv_eviction_map_offset, 0x1000);
+        assert_eq!(restored.kv_sink_fp16, true);
+    }
+
+    /// A JSON object lacking `kv_bits_k` still parses (defaults to 0).
+    #[test]
+    fn kv_cache_layout_absent_region_uses_defaults() {
+        let json = serde_json::json!({ "kv_rotated": false });
+        let layout = KvCacheLayout::from_json(&json).expect("parse");
+        assert_eq!(layout.kv_bits_k, 0);
+        assert_eq!(layout.kv_bits_v, 0);
+        assert_eq!(layout.kv_eviction_map_offset, 0);
+        assert!(!layout.kv_rotated);
+    }
+
+    /// A non-object JSON value produces None.
+    #[test]
+    fn kv_cache_layout_from_non_object_returns_none() {
+        assert!(KvCacheLayout::from_json(&serde_json::json!(42)).is_none());
     }
 }

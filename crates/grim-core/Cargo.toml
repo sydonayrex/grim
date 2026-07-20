@@ -10,3 +10,9 @@ description = "Grim core: Model trait family, Session, KV cache, sampler, error 
 grim-tensor = { workspace = true }
 grim-nn = { workspace = true }
 thiserror = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.11", features = ["json", "stream"] }
+sha2 = "0.10"
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt", "sync"] }

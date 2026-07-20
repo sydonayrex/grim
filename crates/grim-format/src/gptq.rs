@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::sync::Mutex;
 
-use grim_tensor::dtype::{DType, GroupQuantScheme, QuantProvenance, Storage};
+use grim_tensor::dtype::{DType, GroupQuantScheme, QuantProvenance, Storage, ArithType};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
 use crate::safetensors::read_safetensor_bytes;
@@ -290,6 +290,89 @@ impl TensorProvider for GptqProvider {
         })
     }
 
+    fn get_packed(&self, name: &str) -> Result<RawTensor> {
+        let info = self.tensors.get(name).ok_or_else(|| {
+            Error::Backend(format!("tensor '{name}' not found in GPTQ file"))
+        })?;
+        
+        let mut reader = self.reader.lock().unwrap();
+        
+        // Helper to read raw bytes from offsets
+        let mut read_bytes = |offset: Option<u64>, size: u64| -> Result<Vec<u8>> {
+            let off = offset.ok_or_else(|| Error::Backend("Missing companion offset".into()))?;
+            let start = self.data_region_start + off;
+            reader.seek(SeekFrom::Start(start))?;
+            let mut buf = vec![0u8; size as usize];
+            reader.read_exact(&mut buf)?;
+            Ok(buf)
+        };
+
+        let qweight = read_bytes(info.qweight_offset, info.qweight_size)?;
+        let qzeros = read_bytes(info.qzeros_offset, info.qzeros_size)?;
+        let scales = read_bytes(info.scales_offset, info.scales_size)?;
+        let g_idx = if let Some(off) = info.g_idx_offset {
+            let sz = info.g_idx_size.unwrap_or(0);
+            if sz > 0 {
+                Some(read_bytes(Some(off), sz)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Concatenate following the documented length-prefixed convention:
+        // [u64 LE: qweight_len] [qweight_bytes...]
+        // [u64 LE: qzeros_len]  [qzeros_bytes...]
+        // [u64 LE: scales_len]  [scales_bytes...]
+        // [u64 LE: g_idx_len]   [g_idx_bytes...]
+        let qweight_len = qweight.len() as u64;
+        let qzeros_len = qzeros.len() as u64;
+        let scales_len = scales.len() as u64;
+        let g_idx_len = g_idx.as_ref().map(|v| v.len()).unwrap_or(0) as u64;
+
+        let total_size = 32 + qweight_len as usize + qzeros_len as usize + scales_len as usize + g_idx_len as usize;
+        let mut bytes = Vec::with_capacity(total_size);
+
+        bytes.extend_from_slice(&qweight_len.to_le_bytes());
+        bytes.extend_from_slice(&qweight);
+
+        bytes.extend_from_slice(&qzeros_len.to_le_bytes());
+        bytes.extend_from_slice(&qzeros);
+
+        bytes.extend_from_slice(&scales_len.to_le_bytes());
+        bytes.extend_from_slice(&scales);
+
+        bytes.extend_from_slice(&g_idx_len.to_le_bytes());
+        if let Some(ref g) = g_idx {
+            bytes.extend_from_slice(g);
+        }
+
+        let prov = QuantProvenance::ExternalQat {
+            bits: info.bits as u8,
+            group_size: info.group_size,
+            scheme: GroupQuantScheme::Asymmetric,
+            desc_act: info.desc_act,
+        };
+
+        let storage_cfg = grim_tensor::dtype::GpuIntConfig {
+            bits: info.bits as u8,
+            group_size: info.group_size,
+            scheme: GroupQuantScheme::Asymmetric,
+            desc_act: info.desc_act,
+        };
+
+        Ok(RawTensor {
+            bytes,
+            shape: info.shape.clone(),
+            dtype: DType {
+                arith: ArithType::F32,
+                storage: Storage::GroupInt(storage_cfg),
+            },
+            provenance: prov,
+        })
+    }
+
     fn meta(&self, name: &str) -> Result<TensorMeta> {
         let info = self.tensors.get(name).ok_or_else(|| {
             Error::Backend(format!("tensor '{name}' not found in GPTQ file"))
@@ -366,5 +449,134 @@ mod tests {
         // 128x128 = 16384 elements
         // 4-bit packed: 8 values per u32 => 16384 / 8 = 2048 u32s
         assert_eq!(packed_elem_count(&[128, 128], 4), 128 * 128 / 8);
+    }
+
+    #[test]
+    fn test_gptq_packed_vs_eager_correctness() {
+        // Build mock inputs representing a GPTQ tensor layout
+        let in_features = 32;
+        let out_features = 32;
+        let group_size = 16;
+        let bits = 4;
+        let values_per_word = 8;
+        
+        let mut qweight = vec![0u8; (in_features / values_per_word) * out_features * 4];
+        let mut qzeros = vec![0u8; (in_features / group_size) * (out_features / values_per_word) * 4];
+        let mut scales = vec![0u8; (in_features / group_size) * out_features * 4];
+        
+        let zero_val = 7u32;
+        let scale_val = 0.5f32;
+        
+        let num_groups = in_features / group_size;
+        for g in 0..num_groups {
+            for col in 0..out_features {
+                let scale_idx = g * out_features + col;
+                let sb = scale_val.to_le_bytes();
+                scales[scale_idx * 4..scale_idx * 4 + 4].copy_from_slice(&sb);
+                
+                let zero_word_idx = g * (out_features / values_per_word) + col / values_per_word;
+                let bit_offset = (col % values_per_word) * bits;
+                let offset = zero_word_idx * 4;
+                let mut word = u32::from_le_bytes([qzeros[offset], qzeros[offset+1], qzeros[offset+2], qzeros[offset+3]]);
+                word |= zero_val << bit_offset;
+                qzeros[offset..offset+4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        
+        for in_idx in 0..in_features {
+            for out_idx in 0..out_features {
+                let code = ((in_idx + out_idx) % 16) as u32;
+                let word_idx = (in_idx / values_per_word) * out_features + out_idx;
+                let bit_offset = (in_idx % values_per_word) * bits;
+                let offset = word_idx * 4;
+                let mut word = u32::from_le_bytes([qweight[offset], qweight[offset+1], qweight[offset+2], qweight[offset+3]]);
+                word |= code << bit_offset;
+                qweight[offset..offset+4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+
+        let info = GptqTensorInfo {
+            name: "test_tensor".to_string(),
+            shape: vec![in_features, out_features],
+            bits: bits as u32,
+            group_size,
+            desc_act: false,
+            qweight_offset: Some(0),
+            qweight_size: qweight.len() as u64,
+            qzeros_offset: Some(0),
+            qzeros_size: qzeros.len() as u64,
+            scales_offset: Some(0),
+            scales_size: scales.len() as u64,
+            g_idx_offset: None,
+            g_idx_size: None,
+        };
+
+        // 1. Eager dequant path (old GptqProvider::get behavior)
+        let eager_dequant = dequant_gptq_tensor(&info, &qweight, &qzeros, &scales, None).unwrap();
+
+        // 2. Packed path (new GptqProvider::get_packed behavior)
+        let qweight_len = qweight.len() as u64;
+        let qzeros_len = qzeros.len() as u64;
+        let scales_len = scales.len() as u64;
+        let g_idx_len = 0u64;
+
+        let total_size = 32 + qweight_len as usize + qzeros_len as usize + scales_len as usize;
+        let mut packed_bytes = Vec::with_capacity(total_size);
+        packed_bytes.extend_from_slice(&qweight_len.to_le_bytes());
+        packed_bytes.extend_from_slice(&qweight);
+        packed_bytes.extend_from_slice(&qzeros_len.to_le_bytes());
+        packed_bytes.extend_from_slice(&qzeros);
+        packed_bytes.extend_from_slice(&scales_len.to_le_bytes());
+        packed_bytes.extend_from_slice(&scales);
+        packed_bytes.extend_from_slice(&g_idx_len.to_le_bytes());
+
+        let storage_cfg = grim_tensor::dtype::GpuIntConfig {
+            bits: bits as u8,
+            group_size,
+            scheme: GroupQuantScheme::Asymmetric,
+            desc_act: false,
+        };
+        let raw_tensor = RawTensor {
+            bytes: packed_bytes,
+            shape: info.shape.clone(),
+            dtype: DType {
+                arith: ArithType::F32,
+                storage: Storage::GroupInt(storage_cfg),
+            },
+            provenance: QuantProvenance::ExternalQat {
+                bits: bits as u8,
+                group_size,
+                scheme: GroupQuantScheme::Asymmetric,
+                desc_act: false,
+            },
+        };
+
+        // Dequantize via the new Storage::GroupInt arm logic
+        let mut cursor = 0;
+        let read_segment = |bytes: &[u8], cursor: &mut usize| -> Result<Vec<u8>> {
+            let len = u64::from_le_bytes(bytes[*cursor..*cursor+8].try_into().unwrap()) as usize;
+            *cursor += 8;
+            let segment = bytes[*cursor..*cursor+len].to_vec();
+            *cursor += len;
+            Ok(segment)
+        };
+
+        let unpacked_qweight = read_segment(&raw_tensor.bytes, &mut cursor).unwrap();
+        let unpacked_qzeros = read_segment(&raw_tensor.bytes, &mut cursor).unwrap();
+        let unpacked_scales = read_segment(&raw_tensor.bytes, &mut cursor).unwrap();
+        let unpacked_g_idx = read_segment(&raw_tensor.bytes, &mut cursor).unwrap();
+
+        let unpacked_g_idx_opt = if unpacked_g_idx.is_empty() { None } else { Some(&unpacked_g_idx[..]) };
+
+        let varbuilder_dequant = dequant_gptq_tensor(
+            &info,
+            &unpacked_qweight,
+            &unpacked_qzeros,
+            &unpacked_scales,
+            unpacked_g_idx_opt,
+        ).unwrap();
+
+        // Assert identical float outputs
+        assert_eq!(eager_dequant, varbuilder_dequant);
     }
 }

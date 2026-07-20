@@ -1,0 +1,196 @@
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void grim_add(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* c [[buffer(2)]],
+    constant int& n [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < uint(n)) {
+        c[id] = a[id] + b[id];
+    }
+}
+
+kernel void grim_mul(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* c [[buffer(2)]],
+    constant int& n [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < uint(n)) {
+        c[id] = a[id] * b[id];
+    }
+}
+
+kernel void grim_silu_mul(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant int& n [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < uint(n)) {
+        float g = gate[id];
+        float s = g / (1.0f + exp(-g));
+        out[id] = s * up[id];
+    }
+}
+
+kernel void grim_rms_norm(
+    device const float* x [[buffer(0)]],
+    device const float* w [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant int& row_len [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    constant int& total [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx < uint(total)) {
+        int row = idx / row_len;
+        int col = idx % row_len;
+
+        float ss = 0.0f;
+        for (int j = 0; j < row_len; ++j) {
+            float val = x[row * row_len + j];
+            ss += val * val;
+        }
+        float rms = sqrt(ss / (float)row_len + eps);
+        out[idx] = x[idx] * w[col] / rms;
+    }
+}
+
+kernel void grim_softmax(
+    device const float* x [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant int& last_dim [[buffer(2)]],
+    constant int& total [[buffer(3)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx < uint(total)) {
+        int row = idx / last_dim;
+        int col = idx % last_dim;
+
+        float max_val = -1e30f;
+        for (int j = 0; j < last_dim; ++j) {
+            max_val = max(max_val, x[row * last_dim + j]);
+        }
+
+        float sum = 0.0f;
+        for (int j = 0; j < last_dim; ++j) {
+            sum += exp(x[row * last_dim + j] - max_val);
+        }
+
+        out[idx] = exp(x[idx] - max_val) / (sum > 0.0f ? sum : 1.0f);
+    }
+}
+
+kernel void grim_embedding(
+    device const float* weight [[buffer(0)]],
+    device const uint* indices [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant int& embedding_dim [[buffer(3)]],
+    constant int& num_indices [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    int total = num_indices * embedding_dim;
+    if (idx < uint(total)) {
+        int token_idx = idx / embedding_dim;
+        int embed_offset = idx % embedding_dim;
+
+        uint word_idx = indices[token_idx];
+        out[idx] = weight[word_idx * embedding_dim + embed_offset];
+    }
+}
+
+kernel void grim_matmul(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* c [[buffer(2)]],
+    constant int& m [[buffer(3)]],
+    constant int& n [[buffer(4)]],
+    constant int& k [[buffer(5)]],
+    uint2 id [[thread_position_in_grid]]
+) {
+    uint row = id.y;
+    uint col = id.x;
+    if (row < uint(m) && col < uint(n)) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+kernel void grim_qkv_attention(
+    device const float* q [[buffer(0)]],
+    device const float* k_tensor [[buffer(1)]],
+    device const float* v_tensor [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    device float* out_max [[buffer(4)]],
+    device float* out_sum [[buffer(5)]],
+    constant int& num_heads [[buffer(6)]],
+    constant int& num_kv_heads [[buffer(7)]],
+    constant int& head_dim [[buffer(8)]],
+    constant int& seq_len [[buffer(9)]],
+    constant int& kv_seq_len [[buffer(10)]],
+    constant int& cache_offset [[buffer(11)]],
+    constant float& inv_sqrt_d [[buffer(12)]],
+    uint2 id [[thread_position_in_grid]]
+) {
+    uint i = id.x;
+    uint h = id.y;
+    if (i >= uint(seq_len) || h >= uint(num_heads)) return;
+
+    int q_per_kv = num_heads / num_kv_heads;
+    int kv_head = h / q_per_kv;
+    int q_offset = (i * num_heads + h) * head_dim;
+    int abs_i = cache_offset + i;
+
+    int range_len = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    for (int j = 0; j < range_len; ++j) {
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            score += q[q_offset + d] * k_tensor[(j * num_kv_heads + kv_head) * head_dim + d];
+        }
+        score *= inv_sqrt_d;
+        running_max = max(running_max, score);
+    }
+
+    for (int j = 0; j < range_len; ++j) {
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            score += q[q_offset + d] * k_tensor[(j * num_kv_heads + kv_head) * head_dim + d];
+        }
+        score *= inv_sqrt_d;
+        running_sum += exp(score - running_max);
+    }
+
+    for (int d = 0; d < head_dim; ++d) {
+        float acc = 0.0f;
+        for (int j = 0; j < range_len; ++j) {
+            float score = 0.0f;
+            for (int d2 = 0; d2 < head_dim; ++d2) {
+                score += q[q_offset + d2] * k_tensor[(j * num_kv_heads + kv_head) * head_dim + d2];
+            }
+            score *= inv_sqrt_d;
+            float weight = exp(score - running_max) / (running_sum > 0.0f ? running_sum : 1.0f);
+            acc += weight * v_tensor[(j * num_kv_heads + kv_head) * head_dim + d];
+        }
+        out[q_offset + d] = acc;
+    }
+
+    if (out_max != nullptr) {
+        out_max[i * num_heads + h] = running_max;
+    }
+    if (out_sum != nullptr) {
+        out_sum[i * num_heads + h] = running_sum;
+    }
+}

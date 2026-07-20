@@ -11,10 +11,12 @@ grim-tensor = { workspace = true }
 grim-backend-cpu = { workspace = true }
 grim-backend-cuda = { workspace = true }
 grim-backend-rocm = { workspace = true }
+grim-backend-metal = { workspace = true }
 grim-quant = { workspace = true }
 thiserror = { workspace = true }
 
 [features]
-default = ["cuda-mem", "rocm-mem"]
+default = ["cuda-mem", "rocm-mem", "metal-mem"]
 cuda-mem = []
 rocm-mem = []
+metal-mem = []

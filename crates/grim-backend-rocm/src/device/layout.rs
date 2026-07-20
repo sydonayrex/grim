@@ -124,6 +124,10 @@ pub enum WeightLayout {
     BlockSparse,
     /// Packed quantized weight layout with variable bits.
     PackedQuant { bits: u8, wavefront_size: u32 },
+    /// WI-R7: packed, matrix-fragment-aligned layout for the WMMA GEMM path
+    /// (pairs with `LayoutHintTag::PackedQuantWmma`). `frag_m` / `frag_n`
+    /// are the WMMA fragment tile sizes (typically 16×16 on RDNA3/4).
+    Wmma { bits: u8, frag_m: u8, frag_n: u8 },
 }
 
 /// Wavefront-tiled weight transformation for attention projections.
@@ -376,6 +380,24 @@ impl PackedQuantWmmaLayout {
             }
         }
         out
+    }
+}
+
+/// Map a [`LayoutHintTag`] (stored in `.grim` metadata) to the corresponding
+/// [`WeightLayout`] that the ROCm backend should use for this tensor.
+///
+/// Default / unknown hints map to `RowMajor` so existing models are
+/// unaffected. `WavefrontTiled` and `BlockSparse` map to their variants
+/// with a 64-lane default (matches RDNA2/CDNA2 baseline; callers can
+/// override the wavefront size before calling the kernel).
+pub fn resolve_layout_hint_tag(hint: LayoutHintTag) -> WeightLayout {
+    match hint {
+        LayoutHintTag::Default => WeightLayout::RowMajor,
+        LayoutHintTag::WavefrontTiled => WeightLayout::WavefrontTiled { wavefront_size: 64 },
+        LayoutHintTag::BlockSparse => WeightLayout::BlockSparse,
+        LayoutHintTag::PackedQuantWmma { bits, frag_m, frag_n } => {
+            WeightLayout::Wmma { bits, frag_m, frag_n }
+        }
     }
 }
 
@@ -644,5 +666,44 @@ mod wmma_tests {
         let packed_wmma = wmma.pack_row(&row);
         let packed_ref = ref_pack_row(&row, 4);
         assert_eq!(packed_wmma, packed_ref, "packed bytes must match reference");
+    }
+
+    // --- P3-WI-4: resolve_layout_hint_tag tests ---
+
+    #[test]
+    fn resolve_layout_hint_tag_default_yields_row_major() {
+        assert_eq!(resolve_layout_hint_tag(LayoutHintTag::Default), WeightLayout::RowMajor);
+    }
+
+    #[test]
+    fn resolve_layout_hint_tag_wavefront_tiled_yields_correct_variant() {
+        let layout = resolve_layout_hint_tag(LayoutHintTag::WavefrontTiled);
+        assert_eq!(layout, WeightLayout::WavefrontTiled { wavefront_size: 64 });
+    }
+
+    #[test]
+    fn resolve_layout_hint_tag_block_sparse_yields_correct_variant() {
+        assert_eq!(resolve_layout_hint_tag(LayoutHintTag::BlockSparse), WeightLayout::BlockSparse);
+    }
+
+    #[test]
+    fn resolve_layout_hint_tag_packed_quant_wmma_carries_dims() {
+        let hint = LayoutHintTag::PackedQuantWmma { bits: 4, frag_m: 16, frag_n: 16 };
+        let layout = resolve_layout_hint_tag(hint);
+        assert_eq!(layout, WeightLayout::Wmma { bits: 4, frag_m: 16, frag_n: 16 });
+    }
+
+    #[test]
+    fn resolve_layout_hint_tag_is_total_over_all_tags() {
+        // Every LayoutHintTag variant must reach a non-panic arm.
+        let all = [
+            LayoutHintTag::Default,
+            LayoutHintTag::WavefrontTiled,
+            LayoutHintTag::BlockSparse,
+            LayoutHintTag::PackedQuantWmma { bits: 4, frag_m: 16, frag_n: 16 },
+        ];
+        for hint in all {
+            let _ = resolve_layout_hint_tag(hint); // must not panic
+        }
     }
 }
