@@ -36,6 +36,11 @@ impl TensorMeta {
 pub trait TensorProvider: Send + Sync {
     /// Look up a tensor by slash-separated path (e.g. `"model.layers.0.wq"`).
     fn get(&self, name: &str) -> Result<RawTensor>;
+    /// Look up a tensor and return it in a packed, low-bit representation if supported
+    /// by the provider, bypassing eager CPU dequantization.
+    fn get_packed(&self, name: &str) -> Result<RawTensor> {
+        self.get(name)
+    }
     /// Optional hint — metadata the loader wants to expose without
     /// materializing the full tensor (shape, dtype, provenance).
     fn meta(&self, name: &str) -> Result<TensorMeta>;

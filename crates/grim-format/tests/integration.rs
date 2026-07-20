@@ -203,6 +203,7 @@ fn grim_provider_returns_extension_declaration_after_round_trip() {
                 scale_size: 64,
             },
             backup2: grim_format::spec::BackupLayer::default(),
+            ..Default::default()
         }],
         ..Default::default()
     };

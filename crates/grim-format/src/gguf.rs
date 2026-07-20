@@ -249,6 +249,8 @@ pub enum GrimRocmlProfile {
     Cdna2,
     /// CDNA3 compute (MI300X)
     Cdna3,
+    /// RDNA2 graphics (RX 6000 series, Steam Deck APU — gfx1036)
+    Rdna2,
     /// RDNA3 graphics (RX 7900 XTX)
     Rdna3,
     /// RDNA4 graphics (RX 8000 series)
@@ -270,6 +272,7 @@ impl GrimRocmlProfile {
         match s.trim().to_lowercase().as_str() {
             "cdna2" => GrimRocmlProfile::Cdna2,
             "cdna3" | "mi300x" => GrimRocmlProfile::Cdna3,
+            "rdna2" | "gfx1036" => GrimRocmlProfile::Rdna2,
             "rdna3" => GrimRocmlProfile::Rdna3,
             "rdna4" => GrimRocmlProfile::Rdna4,
             "all" => GrimRocmlProfile::All,
@@ -281,6 +284,7 @@ impl GrimRocmlProfile {
         match self {
             GrimRocmlProfile::Cdna2 => 32,
             GrimRocmlProfile::Cdna3 => 32,
+            GrimRocmlProfile::Rdna2 => 64,
             GrimRocmlProfile::Rdna3 => 64,
             GrimRocmlProfile::Rdna4 => 64,
             GrimRocmlProfile::All | GrimRocmlProfile::Unknown => 0,
@@ -291,6 +295,7 @@ impl GrimRocmlProfile {
         match self {
             GrimRocmlProfile::Cdna2 => 65536,
             GrimRocmlProfile::Cdna3 => 65536,
+            GrimRocmlProfile::Rdna2 => 32768,
             GrimRocmlProfile::Rdna3 => 32768,
             GrimRocmlProfile::Rdna4 => 32768,
             GrimRocmlProfile::All | GrimRocmlProfile::Unknown => 0,
@@ -547,6 +552,7 @@ impl GrimMetadata {
             GgufValue::String(match self.rocml_profile {
                 GrimRocmlProfile::Cdna2 => "cdna2",
                 GrimRocmlProfile::Cdna3 => "cdna3",
+                GrimRocmlProfile::Rdna2 => "rdna2",
                 GrimRocmlProfile::Rdna3 => "rdna3",
                 GrimRocmlProfile::Rdna4 => "rdna4",
                 GrimRocmlProfile::All => "all",
@@ -671,6 +677,7 @@ impl GrimMetadata {
             serde_json::Value::String(match self.rocml_profile {
                 GrimRocmlProfile::Cdna2 => "cdna2",
                 GrimRocmlProfile::Cdna3 => "cdna3",
+                GrimRocmlProfile::Rdna2 => "rdna2",
                 GrimRocmlProfile::Rdna3 => "rdna3",
                 GrimRocmlProfile::Rdna4 => "rdna4",
                 GrimRocmlProfile::All => "all",
@@ -1334,6 +1341,29 @@ mod tests {
         assert_eq!(restored.wavefront_size, 0);
     }
 
+    /// WI-S5: the RDNA2 (gfx1036) profile parses from both `rdna2` and
+    /// `gfx1036` aliases, returns the RDNA-family numeric hints
+    /// (wavefront 64, LDS 32 kB), and round-trips through JSON metadata
+    /// exactly like its RDNA3/RDNA4 siblings.
+    #[test]
+    fn rocml_profile_rdna2_parses_aliases_and_round_trips() {
+        assert_eq!(GrimRocmlProfile::from_str("rdna2"), GrimRocmlProfile::Rdna2);
+        assert_eq!(GrimRocmlProfile::from_str("gfx1036"), GrimRocmlProfile::Rdna2);
+        assert_eq!(GrimRocmlProfile::from_str("RDNA2"), GrimRocmlProfile::Rdna2);
+        assert_eq!(GrimRocmlProfile::Rdna2.wavefront_size(), 64);
+        assert_eq!(GrimRocmlProfile::Rdna2.lds_size(), 32768);
+
+        // Round-trip through the JSON metadata layer.
+        let mut original = sample_metadata();
+        original.rocml_profile = GrimRocmlProfile::Rdna2;
+        original.wavefront_size = GrimRocmlProfile::Rdna2.wavefront_size();
+        original.lds_size = Some(GrimRocmlProfile::Rdna2.lds_size());
+        let restored = GrimMetadata::from_json(&original.to_json());
+        assert_eq!(restored.rocml_profile, GrimRocmlProfile::Rdna2);
+        assert_eq!(restored.wavefront_size, 64);
+        assert_eq!(restored.lds_size, Some(32768));
+    }
+
     /// The spec capability extensions ride the JSON metadata layer under
     /// `grim.ext.entries`. This test proves a populated `ext_entries`
     /// round-trips through `to_json`/`from_json` with all fields intact.
@@ -1372,6 +1402,7 @@ mod tests {
                         scale_size: 64,
                     },
                     backup2: crate::spec::BackupLayer::default(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()

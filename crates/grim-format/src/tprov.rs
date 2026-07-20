@@ -272,6 +272,15 @@ impl TensorProvider for SafetensorsProvider {
         })
     }
 
+    fn get_packed(&self, name: &str) -> Result<RawTensor> {
+        if let Some(ref gptq) = self.gptq {
+            if gptq.tensors.contains_key(name) {
+                return gptq.get_packed(name);
+            }
+        }
+        self.get(name)
+    }
+
     fn meta(&self, name: &str) -> Result<TensorMeta> {
         if let Some(ref gptq) = self.gptq {
             if gptq.tensors.contains_key(name) {
@@ -353,6 +362,40 @@ impl TensorProvider for GrimProvider {
         })?;
         let mut reader = self.reader.lock().unwrap();
         let bytes = read_normals(&mut *reader, entry)?;
+
+        // P2-WI-1: if the per-tensor extension declares Fp8 block-scale mode
+        // (row_scale_dtype = Fp8, block_size = 16), dequantize on the fly to F32
+        // instead of returning the raw packed bytes. This is the single dispatch
+        // hook; all other metadata fields are passed through unchanged.
+        if let Some(ext) = self.ext_for(name) {
+            if ext.row_scale_dtype == crate::spec::RowScaleDtype::Fp8 && ext.block_size == 16 {
+                // Total element count = product of shape dimensions.
+                let num_values: usize = entry.shape.iter().product();
+                let f32_vals = if entry.base_bitwidth == 4 {
+                    grim_quant::dequant_fp4_block16(&bytes, num_values).map_err(|e| {
+                        Error::Backend(format!("dequant_fp4_block16 for '{name}': {e}"))
+                    })?
+                } else {
+                    // 8-bit FP8 block-scale (and any other bitwidth) falls to fp8 path.
+                    grim_quant::dequant_fp8_block16(&bytes, num_values).map_err(|e| {
+                        Error::Backend(format!("dequant_fp8_block16 for '{name}': {e}"))
+                    })?
+                };
+                // Repack f32 values to bytes for the RawTensor carrier.
+                let mut out_bytes = Vec::with_capacity(f32_vals.len() * 4);
+                for v in &f32_vals {
+                    out_bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                return Ok(RawTensor {
+                    bytes: out_bytes,
+                    shape: entry.shape.clone(),
+                    dtype: DType::F32,
+                    provenance: QuantProvenance::GrimNative,
+                });
+            }
+        }
+
+        // Legacy / plain path: return packed bytes with bitwidth-derived dtype.
         Ok(RawTensor {
             bytes,
             shape: entry.shape.clone(),
@@ -640,5 +683,49 @@ mod tests {
         let provider = GrimProvider::open(path.to_str().unwrap()).unwrap();
         assert!(provider.get("nonexistent").is_err());
         assert!(provider.meta("nonexistent").is_err());
+    }
+
+    /// P0-WI-2 (WI-F2) regression: a plain (non-quantized) safetensors file
+    /// must round-trip with `GrimNative` provenance and unchanged bytes. This
+    /// guards the plain path while GPTQ `.qweight` groups are delegated to
+    /// `GptqProvider` (which stamps `ExternalQat`). Constructing a minimal
+    /// valid safetensors (8-byte LE length prefix + JSON header + F32 data).
+    #[test]
+    fn plain_safetensors_keeps_grim_native_provenance() {
+        // Header: one F32 tensor "w" of shape [4] (16 bytes), no metadata.
+        let header = r#"{"w":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}}"#;
+        let header_len = header.len() as u64;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&header_len.to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        // 4 × f32 little-endian.
+        for v in [1.0f32, 2.0, 3.0, 4.0] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.safetensors");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let provider = SafetensorsProvider::open(path.to_str().unwrap()).unwrap();
+        let meta = provider.meta("w").unwrap();
+        assert_eq!(
+            meta.provenance,
+            QuantProvenance::GrimNative,
+            "plain safetensors tensors must stay GrimNative"
+        );
+        assert_eq!(meta.dtype, DType::F32);
+
+        let raw = provider.get("w").unwrap();
+        assert_eq!(raw.provenance, QuantProvenance::GrimNative);
+        assert_eq!(raw.shape, vec![4]);
+        assert_eq!(raw.bytes.len(), 16);
+        // Bytes are read verbatim — no silent reinterpretation.
+        let read_back: Vec<f32> = raw
+            .bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(read_back, vec![1.0, 2.0, 3.0, 4.0]);
     }
 }

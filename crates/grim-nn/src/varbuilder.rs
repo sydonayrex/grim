@@ -19,6 +19,8 @@ use grim_quant::{dequant_fp4, dequant_nf4, dequant_fp8, dequant_fp4_block16, deq
 use grim_backend_cuda::CudaDevice;
 #[cfg(feature = "rocm-mem")]
 use grim_backend_rocm::RocmDevice;
+#[cfg(feature = "metal-mem")]
+use grim_backend_metal::MetalDevice;
 
 /// A handle that walks a `TensorProvider` by hierarchical prefix. Models
 /// call `ws.pp("model").pp("layers").pp("0").get(...)` to materialize
@@ -88,7 +90,7 @@ impl<'a> WeightSource<'a> {
     pub fn get(&self, shape: impl Into<Shape>, leaf: &str) -> Result<Tensor> {
         let shape = shape.into();
         let name = self.full_name(leaf);
-        let raw = self.tensors.get(&name)?;
+        let raw = self.tensors.get_packed(&name)?;
 
         if raw.shape != shape.dims() {
             return Err(Error::ShapeMismatch {
@@ -111,7 +113,7 @@ impl<'a> WeightSource<'a> {
     pub fn get_for_training(&self, shape: impl Into<Shape>, leaf: &str) -> Result<Tensor> {
         let shape = shape.into();
         let name = self.full_name(leaf);
-        let raw = self.tensors.get(&name)?;
+        let raw = self.tensors.get_packed(&name)?;
 
         if raw.shape != shape.dims() {
             return Err(Error::ShapeMismatch {
@@ -207,6 +209,41 @@ fn materialize_rocm(
     )))
 }
 
+#[cfg(feature = "metal-mem")]
+fn materialize_metal(
+    f32s: Vec<f32>,
+    shape: Shape,
+    _dtype: DType,
+    provenance: QuantProvenance,
+    device: &Device,
+    ordinal: usize,
+) -> Result<Tensor> {
+    let dev = MetalDevice::new(ordinal);
+    let storage = BackendDevice::from_cpu(&dev, &f32s, &shape, DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        shape,
+        DType::F32,
+        provenance,
+        device.clone(),
+    ))
+}
+
+#[cfg(not(feature = "metal-mem"))]
+fn materialize_metal(
+    _f32s: Vec<f32>,
+    _shape: Shape,
+    _dtype: DType,
+    _provenance: QuantProvenance,
+    _device: &Device,
+    ordinal: usize,
+) -> Result<Tensor> {
+    Err(Error::Unimplemented(format!(
+        "Metal materialization: enable 'metal-mem' feature on grim-nn (ordinal={})",
+        ordinal
+    )))
+}
+
 fn materialize(
     raw: RawTensor,
     shape: Shape,
@@ -234,13 +271,7 @@ fn materialize(
                 "Vulkan materialization not yet wired up".into(),
             ))
         }
-        Device::Metal(ordinal) => {
-            _ = f32s;
-            Err(Error::Unimplemented(format!(
-                "Metal(device={}) materialization not yet wired up",
-                ordinal
-            )))
-        }
+        Device::Metal(ordinal) => materialize_metal(f32s, shape, dtype, provenance, device, *ordinal),
     }
 }
 
@@ -280,11 +311,42 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             BlockDtype::Fp4Block16 => dequant_fp4_block16(&raw.bytes, n),
             BlockDtype::Fp8Block16 => dequant_fp8_block16(&raw.bytes, n),
         },
-        Storage::GroupInt(_) => Err(Error::Unimplemented(
-            "WeightSource inference path does not yet dequantize GroupInt (GPTQ) \
-             tensors; use the training materialization path."
-                .into(),
-        )),
+        Storage::GroupInt(cfg) => {
+            // Unpack the four parallel arrays from raw.bytes
+            let mut cursor = 0;
+            let read_segment = |bytes: &[u8], cursor: &mut usize| -> Result<Vec<u8>> {
+                if *cursor + 8 > bytes.len() {
+                    return Err(Error::Backend("Truncated GPTQ packed header".into()));
+                }
+                let len = u64::from_le_bytes(bytes[*cursor..*cursor+8].try_into().unwrap()) as usize;
+                *cursor += 8;
+                if *cursor + len > bytes.len() {
+                    return Err(Error::Backend(format!(
+                        "Truncated GPTQ packed segment (expected {len} bytes)"
+                    )));
+                }
+                let segment = bytes[*cursor..*cursor+len].to_vec();
+                *cursor += len;
+                Ok(segment)
+            };
+
+            let qweight = read_segment(&raw.bytes, &mut cursor)?;
+            let qzeros = read_segment(&raw.bytes, &mut cursor)?;
+            let scales = read_segment(&raw.bytes, &mut cursor)?;
+            let g_idx = read_segment(&raw.bytes, &mut cursor)?;
+
+            let g_idx_opt = if g_idx.is_empty() { None } else { Some(&g_idx[..]) };
+
+            grim_quant::dequant_gptq_group_int(
+                &qweight,
+                &qzeros,
+                &scales,
+                g_idx_opt,
+                &raw.shape,
+                cfg.bits as u32,
+                cfg.group_size,
+            )
+        }
     }
 }
 

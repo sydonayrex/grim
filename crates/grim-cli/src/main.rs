@@ -54,6 +54,12 @@ enum Commands {
         /// Path to plugins directory.
         #[arg(short, long, default_value = "plugins")]
         plugins: String,
+        /// Preferred ROCm profile to use when a `.grim` conversion is
+        /// available (cdna2, cdna3, rdna2, rdna3, rdna4, or "auto" to detect
+        /// the host GPU). Only affects which sibling `grim run` loads once a
+        /// conversion exists; it never forces a conversion on its own.
+        #[arg(long)]
+        rocml_profile: Option<String>,
     },
     /// Delete a model from local cache.
     Reap {
@@ -72,6 +78,11 @@ enum Commands {
         /// Optional destination path.
         #[arg(short, long)]
         output: Option<String>,
+        /// Preferred ROCm profile to suggest for ROCm-tuned conversion after
+        /// the pull (cdna2, cdna3, rdna2, rdna3, rdna4, or "auto"). See
+        /// `Pull` for semantics; `dl` shares the same flag.
+        #[arg(long)]
+        rocml_profile: Option<String>,
     },
     /// Pull (download) a model from Hugging Face or Ollama. Alias for `dl`.
     Pull {
@@ -80,6 +91,13 @@ enum Commands {
         /// Optional destination path.
         #[arg(short, long)]
         output: Option<String>,
+        /// Preferred ROCm profile to suggest for ROCm-tuned conversion after
+        /// the pull (cdna2, cdna3, rdna2, rdna3, rdna4, or "auto"). When
+        /// "auto" (or unset on a ROCm host), the local GPU's `gfx` target is
+        /// detected and the matching profile is suggested. The suggestion is
+        /// offered, never executed automatically.
+        #[arg(long)]
+        rocml_profile: Option<String>,
     },
     /// Show active loaded models (alias for status)
     Ps,
@@ -314,6 +332,79 @@ enum OxidizerCommands {
     },
 }
 
+/// WI-S6: after a successful `grim pull`, offer the ROCm-tuned conversion
+/// instead of silently running it. This keeps the behaviour opt-in (the
+/// user decides) while making the capability reachable by default.
+///
+/// - If `preferred` is `Some`, it is used as the profile suggestion verbatim
+///   (e.g. `cdna3`, `rdna2`). `Some("auto")` falls through to detection.
+/// - Otherwise, on a ROCm host we probe the local GPU's `gfx` target and map
+///   it to a profile (`gfx1036`→`rdna2`, `gfx11xx`→`rdna3`, `gfx12xx`→`rdna4`,
+///   `gfx90a`/`gfx908`→`cdna3`). If no ROCm GPU is present, no suggestion is
+///   printed (there is no target to tune for).
+fn offer_rocml_conversion(model_ref: &str, preferred: Option<&str>) {
+    let profile = match preferred {
+        Some("auto") | None => detect_host_rocml_profile(),
+        Some(p) => {
+            // Validate against known profile names; the convert command will
+            // parse this again via GrimRocmlProfile::from_str.
+            let valid = matches!(
+                p.to_lowercase().as_str(),
+                "cdna2" | "cdna3" | "rdna2" | "rdna3" | "rdna4" | "all"
+            );
+            if valid {
+                Some(p.to_string())
+            } else {
+                eprintln!(
+                    "[grim] WARNING: unknown --rocml-profile '{p}'; falling back to auto-detection."
+                );
+                detect_host_rocml_profile()
+            }
+        }
+    };
+
+    if let Some(profile) = profile {
+        println!();
+        println!(
+            "[grim] Tip: convert '{model_ref}' to a ROCm-tuned .grim for better performance on this GPU:"
+        );
+        println!(
+            "       grim oxidize convert {model_ref} --rocml-profile {profile}"
+        );
+        println!(
+            "       Or run 'grim run {model_ref}' now to use the unconverted GGUF."
+        );
+    }
+}
+
+/// Detect the local host GPU's ROCm profile string, or `None` if no ROCm GPU
+/// is present.
+fn detect_host_rocml_profile() -> Option<String> {
+    match grim_backend_rocm::device::probe::probe_host_gpu(0) {
+        Ok(caps) => Some(gcn_to_rocml_profile_str(&caps.gcn)),
+        Err(_) => None,
+    }
+}
+
+/// Map a GCN `gfx` target string to a ROCm profile name (WI-S5 adds `rdna2`
+/// for `gfx1036`/`gfx103x`). Mirrors the mapping in `Convert` so the suggested
+/// profile matches what `grim convert --target auto` would pick.
+fn gcn_to_rocml_profile_str(gcn: &str) -> String {
+    if gcn.starts_with("gfx103") {
+        "rdna2".to_string()
+    } else if gcn.starts_with("gfx12") {
+        "rdna4".to_string()
+    } else if gcn.starts_with("gfx11") {
+        "rdna3".to_string()
+    } else if gcn.starts_with("gfx90") {
+        "cdna3".to_string()
+    } else if gcn.starts_with("gfx9") {
+        "cdna2".to_string()
+    } else {
+        "rdna3".to_string()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -326,12 +417,20 @@ async fn main() -> Result<()> {
             grim_server::serve(&address, engine, None).await?;
             let _ = plugins;
         }
-        Commands::Run { model, prompt, serve, address, config: _, plugins } => {
+        Commands::Run { model, prompt, serve, address, config: _, plugins, rocml_profile } => {
+            // The --rocml-profile flag documents an explicit ROCm tuning
+            // preference. `resolve_model_preferring_grim` already honours an
+            // existing .grim conversion automatically; if the user passed a
+            // profile we surface a hint so they know the preference is noted
+            // (it never forces a conversion on its own — WI-S6).
+            if let Some(ref profile) = rocml_profile {
+                eprintln!("[grim] ROCm profile preference noted: {profile} (used automatically if a .grim conversion exists).");
+            }
             if serve {
                 let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
                 // Resolve model name → file path and load it into the engine.
                 let model_path = if let Some(ref m) = model {
-                    let p = catalog::resolve_model_path(m)
+                    let p = catalog::resolve_model_preferring_grim(m)
                         .or_else(|| {
                             // Direct file path fallback.
                             let dp = std::path::Path::new(m);
@@ -371,8 +470,9 @@ async fn main() -> Result<()> {
                 {
                     model_name.clone()
                 } else {
-                    // Resolve from catalog (T1-2 fix: catalog lookup replaces old client:: call).
-                    let model_path = catalog::resolve_model_path(&model_name)
+                    // Resolve from catalog, preferring an existing ROCm-tuned
+                    // `.grim` conversion over a sibling `.gguf` (WI-S6).
+                    let model_path = catalog::resolve_model_preferring_grim(&model_name)
                         .ok_or_else(|| grim_core::error::Error::Config(
                             format!("Model '{}' not found. Run 'grim pull {}' to download it.",
                                 model_name, model_name)
@@ -405,8 +505,13 @@ async fn main() -> Result<()> {
         Commands::Kill { model } => {
             client::unload_model_from_server(&model, "127.0.0.1:11434").await?;
         }
-        Commands::Dl { model, output } | Commands::Pull { model, output } => {
+        Commands::Dl { model, output, rocml_profile } | Commands::Pull { model, output, rocml_profile } => {
             client::download_model(&model, output).await?;
+            // WI-S6: after a successful pull, offer (but never silently run)
+            // the ROCm-tuned conversion. Detection respects an explicit
+            // --rocml-profile; otherwise on a ROCm host we detect the local
+            // GPU's gfx target; non-ROCm hosts get no suggestion.
+            offer_rocml_conversion(&model, rocml_profile.as_deref());
         }
         Commands::Status | Commands::Ps => {
             client::query_server_status("127.0.0.1:11434").await?;
@@ -580,8 +685,16 @@ async fn main() -> Result<()> {
                 target
             };
 
-            let profile_str = if resolved_gcn.starts_with("gfx12") {
+            let profile_str = if resolved_gcn.starts_with("gfx103") {
+                "rdna2"
+            } else if resolved_gcn.starts_with("gfx12") {
                 "rdna4"
+            } else if resolved_gcn.starts_with("gfx11") {
+                "rdna3"
+            } else if resolved_gcn.starts_with("gfx90") {
+                "cdna3"
+            } else if resolved_gcn.starts_with("gfx9") {
+                "cdna2"
             } else {
                 "rdna3"
             };

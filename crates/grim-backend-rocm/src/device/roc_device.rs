@@ -289,6 +289,29 @@ impl RocmDevice {
         self.allocator.empty_cache();
     }
 
+    /// P1-WI-1 dispatch probe: should this GEMM route through the WMMA path
+    /// based on the per-tensor `GrimTensorExt` descriptor?
+    ///
+    /// Returns `true` only when:
+    /// 1. The `wmma_gemm_config` is enabled (default-on for RDNA3/4 devices).
+    /// 2. The descriptor's `layout_hint` is `PackedQuantWmma` (RDNA matrix-core
+    ///    fragment-aligned packing).
+    /// 3. The bit-width falls within the supported range (2/3/4/8).
+    /// 4. The output dtype is F16 — the only path for which `launch_wmma_gemm`
+    ///    has a JIT'd solution registered.
+    ///
+    /// When `false`, the call site falls back to the rocBLAS path. There is
+    /// zero scatter: this is the single dispatch probe; `matmul` reads its
+    /// answer via this method to keep the kernel path arch-branching-free.
+    pub fn should_use_wmma_path(
+        &self,
+        ext: Option<&grim_format::spec::GrimTensorExt>,
+        out_arith: ArithType,
+    ) -> bool {
+        let cfg_enabled = self.wmma_gemm_config.lock().unwrap().enabled;
+        wmma_route_decision(ext, out_arith, cfg_enabled)
+    }
+
     /// WI 2.4.4-2 — opt-in flag for the JIT `grim_decode_gemm_f16`.
     ///
     /// Set to `true` after a positive benchmark vs. rocBLAS; otherwise
@@ -1878,6 +1901,33 @@ impl BackendDevice for RocmDevice {
         }
         Ok(())
     }
+
+    fn kv_dequant_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k_tensor: &dyn BackendStorage,
+        k_scales: &dyn BackendStorage,
+        v_tensor: &dyn BackendStorage,
+        v_scales: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        quant_bits: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.kv_dequant_attention(
+            q,
+            k_tensor,
+            k_scales,
+            v_tensor,
+            v_scales,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            quant_bits,
+            out_shape,
+        )
+    }
 }
 
 // `GemmTileConfig`, `lookup_gemm_config`, `lookup_solution_index` moved
@@ -2483,6 +2533,7 @@ impl RocmDevice {
         num_kv_heads: usize,
         kv_seq_len: usize,
         cache_offset: u32,
+        quant_bits: u32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let config = {
@@ -2497,7 +2548,7 @@ impl RocmDevice {
                 num_heads: out_dims[1],
                 num_kv_heads,
                 head_dim: out_dims[2],
-                quant_bits: 4,
+                quant_bits: quant_bits as u8,
                 wavefront_size: self.props.wavefront_size as u32,
             }
         };
@@ -2544,10 +2595,12 @@ impl RocmDevice {
         let out_dims = out_shape.dims();
         let seq_len = out_dims[0];
 
-        // One block per (seq_position, head); block dim 256 = 4 waves on RDNA.
+        // One block per (seq_position, head); block dim 256 = 4 waves on
+        // RDNA / 8 waves on wave32. grid_x enumerates seq*heads so
+        // blockIdx.x is the unique (seq, head) index the kernel derives.
         let block_dim_x: u32 = if config.wavefront_size == 32 { 128 } else { 256 };
-        let grid_x = seq_len as u32;
-        let grid_y = config.num_heads as u32;
+        let grid_x = (seq_len * config.num_heads) as u32;
+        let grid_y = 1u32;
         let shared_mem_bytes = (config.head_dim * 4).min(32768);
         let launch = crate::fusion::HipKernelLaunch {
             grid_dim: HipDim3::new(grid_x, grid_y, 1),
@@ -2590,7 +2643,7 @@ impl RocmDevice {
         let mut isd = inv_sqrt_d;
         let mut qb = quant_bits_i;
 
-        self.launch_compute_kernel(
+        let stream = self.launch_compute_kernel(
             "grim_kv_dequant_attention",
             launch.grid_dim,
             launch.block_dim,
@@ -2616,7 +2669,7 @@ impl RocmDevice {
             qp, kp, ksp, vp, vsp, op, nh, nkv, hd, sl, ksl, co, isd, qb, inv_sqrt_d_stable,
         );
 
-        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
     }
 
     /// Tree-attention wrapper for speculative-decoding verification.
@@ -2833,5 +2886,121 @@ impl RocmDevice {
         )?;
 
         Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+    }
+}
+
+/// P1-WI-1: pure routing decision for the WMMA GEMM path. Extracted from
+/// [`RocmDevice::should_use_wmma_path`] so the rule can be unit-tested
+/// without constructing a real device. Single source of truth for the
+/// per-tensor descriptor → dispatch decision.
+pub(crate) fn wmma_route_decision(
+    ext: Option<&grim_format::spec::GrimTensorExt>,
+    out_arith: ArithType,
+    cfg_enabled: bool,
+) -> bool {
+    // No extension ⇒ no per-tensor hint ⇒ stick with the existing dispatcher
+    // (Default / WavefrontTiled / BlockSparse weights keep their current path
+    // to make this change regression-safe).
+    let Some(ext) = ext else {
+        return false;
+    };
+    if !cfg_enabled {
+        return false;
+    }
+    match ext.layout_hint {
+        grim_format::spec::LayoutHintTag::PackedQuantWmma { bits, .. } => {
+            matches!(bits, 2 | 3 | 4 | 8) && out_arith == ArithType::F16
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod wmma_route_tests {
+    use super::*;
+    use grim_format::spec::{GrimTensorExt, LayoutHintTag};
+
+    fn ext_packed(bits: u8) -> GrimTensorExt {
+        GrimTensorExt {
+            tensor_name: "test.weight".into(),
+            layout_hint: LayoutHintTag::PackedQuantWmma {
+                bits,
+                frag_m: 16,
+                frag_n: 16,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_extension_routes_to_default() {
+        assert!(!wmma_route_decision(None, ArithType::F16, true));
+    }
+
+    #[test]
+    fn disabled_config_skips_wmma() {
+        assert!(!wmma_route_decision(
+            Some(&ext_packed(4)),
+            ArithType::F16,
+            false,
+        ));
+    }
+
+    #[test]
+    fn packed_4bit_f16_enabled() {
+        assert!(wmma_route_decision(
+            Some(&ext_packed(4)),
+            ArithType::F16,
+            true,
+        ));
+    }
+
+    #[test]
+    fn packed_2bit_supported_too() {
+        assert!(wmma_route_decision(
+            Some(&ext_packed(2)),
+            ArithType::F16,
+            true,
+        ));
+    }
+
+    #[test]
+    fn packed_unsupported_bpw_falls_back() {
+        // 6-bit is not in {2,3,4,8} → must not dispatch to WMMA.
+        assert!(!wmma_route_decision(
+            Some(&ext_packed(6)),
+            ArithType::F16,
+            true,
+        ));
+    }
+
+    #[test]
+    fn non_f16_output_skips_wmma() {
+        // WMMA path only registered for F16; F32 arch falls to rocBLAS.
+        assert!(!wmma_route_decision(
+            Some(&ext_packed(4)),
+            ArithType::F32,
+            true,
+        ));
+    }
+
+    #[test]
+    fn default_hint_skips_wmma() {
+        let ext = GrimTensorExt {
+            layout_hint: LayoutHintTag::Default,
+            ..Default::default()
+        };
+        assert!(!wmma_route_decision(Some(&ext), ArithType::F16, true));
+    }
+
+    #[test]
+    fn wavefront_tiled_does_not_route_wmma() {
+        // WavefrontTiled goes through a different (existing) tiled path; do
+        // not steal it.
+        let ext = GrimTensorExt {
+            layout_hint: LayoutHintTag::WavefrontTiled,
+            ..Default::default()
+        };
+        assert!(!wmma_route_decision(Some(&ext), ArithType::F16, true));
     }
 }

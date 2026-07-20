@@ -146,6 +146,40 @@ pub trait BackendDevice: Send + Sync {
     /// Provide hints about memory usage/advice patterns to the device/system.
     /// Maps to OS-level `madvise` or backend-specific APIs like `hipMemAdvise`.
     fn advise(&self, storage: &dyn BackendStorage, advice: MemAdvice) -> Result<()>;
+
+    /// Fused dequantized KV-attention (P1-WI-2).
+    ///
+    /// Runs online-softmax attention while dequantizing packed K/V caches
+    /// on the fly. Layouts (per the `grim_kv_dequant_attention` HIP kernel):
+    /// - `q`:         `[seq_len, num_heads, head_dim]` (f32)
+    /// - `k_tensor`/`v_tensor`: packed K/V `[kv_seq_len, num_kv_heads, head_dim]`
+    ///   (8-bit: 1 elem/byte; 4-bit: 2 elems/byte) as `unsigned char`
+    /// - `k_scales`/`v_scales`: f32 per `(kv_seq_len, num_kv_heads)` row
+    /// - `quant_bits`: 4 or 8
+    /// - `kv_seq_len`: length of the K/V cache being attended to
+    /// - `cache_offset`: absolute position of `q[head, 0, *]` (for causal mask)
+    /// - `out_shape`: `[seq_len, num_heads, head_dim]`
+    ///
+    /// Default implementation returns `Err(Unsupported)` so backends without a
+    /// wired kernel (CPU, CUDA, Vulkan, Metal) are unaffected; only the ROCm
+    /// backend overrides this with the real HIP launch.
+    fn kv_dequant_attention(
+        &self,
+        _q: &dyn BackendStorage,
+        _k_tensor: &dyn BackendStorage,
+        _k_scales: &dyn BackendStorage,
+        _v_tensor: &dyn BackendStorage,
+        _v_scales: &dyn BackendStorage,
+        _num_kv_heads: usize,
+        _kv_seq_len: usize,
+        _cache_offset: u32,
+        _quant_bits: u32,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "kv_dequant_attention requires a GPU backend with a wired dequant-attention kernel (ROCm)".into(),
+        ))
+    }
 }
 
 /// Owned tensor storage on a specific backend. Backends manage their own

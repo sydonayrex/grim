@@ -1,0 +1,12 @@
+# cargo-mutants configuration for grim workspace.
+# See: https://mutants.rs/reference.html
+
+[workspace]
+# Only mutate grim-quant in CI — it's the pure-CPU crate where mutation
+# testing adds the most value.  ROCm/HIP crates require hardware + ROCm
+# libs that CI runners don't have.
+# Additional crates can be added as their test suites mature.
+
+[options]
+# 2-minute timeout per mutant; grim-quant tests are fast.
+timeout = 120

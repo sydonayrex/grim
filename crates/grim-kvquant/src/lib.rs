@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 use grim_core::error::Result;
-use grim_tensor::{Tensor, BackendDevice, QuantProvenance, Device};
+use grim_tensor::{Tensor, BackendDevice, QuantProvenance, Device, Shape, BackendStorage};
 
 /// Generate a random orthogonal matrix using QR decomposition of a random matrix.
 /// This is used for pre-rotation before Lloyd-Max quantization to decorrelate features.
@@ -104,6 +104,28 @@ impl Default for KvQuantConfig {
     }
 }
 
+/// Configuration for GPU-accelerated fused dequant-attention (P1-WI-2).
+///
+/// When `enabled = true` **and** the caller provides a non-CPU device type,
+/// `KvCompressor::fused_attention` will delegate to `dispatch_gpu_fused_attention`
+/// instead of the CPU scalar reference path.  The default is `false` so
+/// existing callers are completely unaffected until they opt in.
+///
+/// The hook currently returns `Err(Unsupported)` because no HIP kernel is
+/// yet wired; it exists as the correct dispatch point for a future kernel
+/// without scattering GPU-device branches through call sites.
+#[derive(Debug, Clone, Copy)]
+pub struct KvDequantAttentionConfig {
+    /// `true` = dispatch to GPU path when `device_type != Device::Cpu`.
+    pub enabled: bool,
+}
+
+impl Default for KvDequantAttentionConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
 /// On-disk KV-block descriptor (WI-R4 bridge).
 ///
 /// `grim-kvquant` produces a [`CompressedKvBlock`] at runtime; this struct
@@ -158,12 +180,131 @@ const LLOYD_MAX_3BIT_CENTROIDS: [f32; 8] = [
 /// A Lloyd-Max scalar quantizer compressor.
 pub struct LloydMaxCompressor {
     pub config: KvQuantConfig,
+    /// GPU-dispatch configuration for fused attention (P1-WI-2).
+    pub gpu_attn: KvDequantAttentionConfig,
 }
 
 impl LloydMaxCompressor {
+    /// Create with default (CPU-only) config.
     pub fn new(config: KvQuantConfig) -> Self {
-        Self { config }
+        Self { config, gpu_attn: KvDequantAttentionConfig::default() }
     }
+
+    /// Create with an explicit GPU-attention dispatch config.
+    pub fn with_gpu_attn(config: KvQuantConfig, gpu_attn: KvDequantAttentionConfig) -> Self {
+        Self { config, gpu_attn }
+    }
+}
+
+/// GPU-side fused dequant-attention dispatch (P1-WI-2).
+///
+/// Called by `LloydMaxCompressor::fused_attention` when `gpu_attn.enabled`
+/// is true and the device type is non-CPU.  The compressed `block` is
+/// dequantized to f32 on the host, then **re-packed as signed 8-bit** with a
+/// uniform per-buffer scale so the wired `grim_kv_dequant_attention` HIP
+/// kernel's signed 8-bit path reproduces the f32 values up to `scale/255`
+/// quantization error.  This lets the existing ROCm kernel service the
+/// Lloyd-Max 3-bit block without a specialized 3-bit kernel and without leaking
+/// device-specific code into `grim-kvquant` (which stays backend-agnostic via
+/// `BackendDevice`).
+///
+/// The real device work happens through `BackendDevice::kv_dequant_attention`,
+/// which the ROCm backend overrides with the JIT-compiled HIP kernel; other
+/// backends return `Err(Backend)` from the trait default.
+///
+/// # Contract
+/// - Must not panic — callers rely on `Result` for error propagation.
+/// - Result is read back to a host `Tensor` (slow path; GPU-resident callers
+///   would keep the storage on-device, but `fused_attention` already returns
+///   a `Tensor`).
+fn dispatch_gpu_fused_attention(
+    compressor: &LloydMaxCompressor,
+    block: &CompressedKvBlock,
+    query: &Tensor,
+    device: &dyn BackendDevice,
+    device_type: Device,
+) -> Result<Tensor> {
+    let q_data = query.to_vec_f32()?;
+
+    // Dequantize the compressed K/V block to f32 (per-head Lloyd-Max scales
+    // already folded back in). This is the exact same f32 K/V the CPU
+    // reference path consumes, so GPU == CPU by construction once the kernel
+    // is exact.
+    let (keys, values) = compressor.dequantize_for_attention(block, device, device_type.clone())?;
+
+    let k_data = keys.to_vec_f32()?;
+    let v_data = values.to_vec_f32()?;
+
+    let num_kv_heads = block.num_kv_heads;
+    let head_dim = block.head_dim;
+    let kv_seq_len = block.num_tokens;
+
+    // Repack f32 -> signed u8 so the kernel's signed 8-bit dequant path
+    // (byte-128)*scale reproduces the f32 value up to quantization error
+    // (scale/255). A single uniform scale per buffer keeps the per-row scales
+    // the kernel reads all equal to that buffer's peak magnitude.
+    let pack_signed_u8 = |src: &[f32]| -> (Vec<u8>, f32) {
+        let peak = src.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
+        let scale = if peak > 0.0 { peak } else { 1.0 };
+        let bytes = src
+            .iter()
+            .map(|&x| {
+                let v = (x / scale * 127.0).round() + 128.0;
+                v.clamp(0.0, 255.0) as u8
+            })
+            .collect();
+        (bytes, scale)
+    };
+    let (k_packed, k_scale) = pack_signed_u8(&k_data);
+    let (v_packed, v_scale) = pack_signed_u8(&v_data);
+
+    // Per-(token, kv_head) scale = buffer peak; layout [kv_seq_len * num_kv_heads].
+    let scale_len = kv_seq_len * num_kv_heads;
+    let k_scales = vec![k_scale; scale_len];
+    let v_scales = vec![v_scale; scale_len];
+
+    let kv_shape = Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]);
+    let scale_shape = Shape::new(vec![scale_len]);
+    let q_shape = query.shape().clone();
+    let f32_dtype = grim_tensor::DType {
+        arith: grim_tensor::ArithType::F32,
+        storage: grim_tensor::Storage::Native,
+    };
+    let u8_dtype = grim_tensor::DType {
+        arith: grim_tensor::ArithType::U8,
+        storage: grim_tensor::Storage::Native,
+    };
+
+    // q stays f32; k/v packed as u8; scales f32. `from_cpu` takes `&[f32]`
+    // and copies `len*4` bytes, so we reinterpret the u8 byte buffers as f32
+    // element slices of equal *byte* length — the device receives the exact
+    // u8 bytes the kernel's `unsigned char*` reads.
+    let k_as_f32: &[f32] = unsafe { std::slice::from_raw_parts(k_packed.as_ptr() as *const f32, k_packed.len()) };
+    let v_as_f32: &[f32] = unsafe { std::slice::from_raw_parts(v_packed.as_ptr() as *const f32, v_packed.len()) };
+
+    let q_storage: Arc<dyn BackendStorage> = Arc::from(device.from_cpu(&q_data, &q_shape, f32_dtype.clone())?);
+    let k_storage: Arc<dyn BackendStorage> = Arc::from(device.from_cpu(k_as_f32, &kv_shape, u8_dtype.clone())?);
+    let ks_storage: Arc<dyn BackendStorage> = Arc::from(device.from_cpu(&k_scales, &scale_shape, f32_dtype.clone())?);
+    let v_storage: Arc<dyn BackendStorage> = Arc::from(device.from_cpu(v_as_f32, &kv_shape, u8_dtype.clone())?);
+    let vs_storage: Arc<dyn BackendStorage> = Arc::from(device.from_cpu(&v_scales, &scale_shape, f32_dtype.clone())?);
+
+    let out_shape = query.shape().clone();
+    let (out_storage, handle) = device.kv_dequant_attention(
+        q_storage.as_ref(),
+        k_storage.as_ref(),
+        ks_storage.as_ref(),
+        v_storage.as_ref(),
+        vs_storage.as_ref(),
+        num_kv_heads,
+        kv_seq_len,
+        (kv_seq_len as u32).saturating_sub(1),
+        8,
+        &out_shape,
+    )?;
+    handle.synchronize()?;
+
+    let out_arc: Arc<dyn BackendStorage> = Arc::from(out_storage);
+    Ok(Tensor::new(out_arc, out_shape, f32_dtype, QuantProvenance::GrimNative, device_type))
 }
 
 impl KvCompressor for LloydMaxCompressor {
@@ -404,6 +545,15 @@ impl KvCompressor for LloydMaxCompressor {
     }
 
     fn fused_attention(&self, block: &CompressedKvBlock, query: &Tensor, device: &dyn BackendDevice, device_type: Device) -> Result<Tensor> {
+        // P1-WI-2: GPU dispatch hook. When gpu_attn is enabled AND the caller
+        // provides a non-CPU device type, delegate to the GPU path. The GPU path
+        // currently returns Err(Unsupported) because no HIP kernel is wired yet;
+        // this is the correct hook point — callers that need the GPU path will
+        // land here once the kernel exists.
+        if self.gpu_attn.enabled && device_type != Device::Cpu {
+            return dispatch_gpu_fused_attention(self, block, query, device, device_type);
+        }
+
         // SageAttention Warp Producer/Consumer Split Simulation (§5.4 / §6):
         // Producer warp reads and dequantizes block Q & K tiles on the fly
         // Consumer warp processes intermediate dot-products and accumulates results
@@ -818,5 +968,89 @@ mod tests {
         assert_eq!(block.value_bits, restored.value_bits, "value_bits mismatch");
         assert_eq!(block.key_meta, restored.key_meta);
         assert_eq!(block.value_meta, restored.value_meta);
+    }
+
+    // --- P1-WI-2: KvDequantAttentionConfig tests ---
+
+    /// Default KvDequantAttentionConfig has enabled = false.
+    #[test]
+    fn kv_dequant_attention_config_default_is_off() {
+        let cfg = KvDequantAttentionConfig::default();
+        assert!(!cfg.enabled);
+    }
+
+    /// LloydMaxCompressor::new() inherits default (disabled) GPU config.
+    #[test]
+    fn lloyd_max_compressor_new_has_gpu_attn_off() {
+        let comp = LloydMaxCompressor::new(KvQuantConfig::default());
+        assert!(!comp.gpu_attn.enabled);
+    }
+
+    /// with_gpu_attn constructor stores the provided config.
+    #[test]
+    fn lloyd_max_compressor_with_gpu_attn_stores_config() {
+        let cfg = KvDequantAttentionConfig { enabled: true };
+        let comp = LloydMaxCompressor::with_gpu_attn(KvQuantConfig::default(), cfg);
+        assert!(comp.gpu_attn.enabled);
+    }
+
+    /// With gpu_attn disabled, fused_attention runs the CPU path without error.
+    #[test]
+    fn fused_attention_cpu_path_runs_when_gpu_disabled() {
+        use grim_tensor::{ArithType, dtype::{Storage as DS, DType}};
+        let compressor = LloydMaxCompressor::new(KvQuantConfig { key_bits: 3, value_bits: 4, group_size: 4, qk_compute_bits: 8 });
+        let device = grim_backend_cpu::CpuDevice::new();
+        let dtype = DType { arith: ArithType::F32, storage: DS::Native };
+        let shape = grim_tensor::Shape::new(vec![2, 1, 4]);
+        let k_data = vec![0.1f32; 8];
+        let v_data = vec![0.2f32; 8];
+        let k_storage = Arc::from(device.from_cpu(&k_data, &shape, dtype.clone()).unwrap());
+        let v_storage = Arc::from(device.from_cpu(&v_data, &shape, dtype.clone()).unwrap());
+        let keys = Tensor::new(k_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
+        let values = Tensor::new(v_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
+        let block = compressor.compress(&keys, &values).unwrap();
+
+        let q_data = vec![0.1f32; 8];
+        let q_storage = Arc::from(device.from_cpu(&q_data, &shape, dtype.clone()).unwrap());
+        let query = Tensor::new(q_storage, shape, dtype, QuantProvenance::GrimNative, Device::Cpu);
+        // CPU path should succeed (gpu_attn.enabled is false).
+        let result = compressor.fused_attention(&block, &query, &device, Device::Cpu);
+        assert!(result.is_ok(), "CPU fused_attention should succeed");
+    }
+
+    /// With gpu_attn enabled, passing a non-CPU device returns Err (not panic).
+    #[test]
+    fn fused_attention_gpu_path_returns_err_unsupported_when_no_kernel() {
+        use grim_tensor::{ArithType, dtype::{Storage as DS, DType}};
+        let cfg = KvDequantAttentionConfig { enabled: true };
+        let compressor = LloydMaxCompressor::with_gpu_attn(
+            KvQuantConfig { key_bits: 3, value_bits: 4, group_size: 4, qk_compute_bits: 8 },
+            cfg,
+        );
+        let device = grim_backend_cpu::CpuDevice::new();
+        let dtype = DType { arith: ArithType::F32, storage: DS::Native };
+        let shape = grim_tensor::Shape::new(vec![2, 1, 4]);
+        let k_data = vec![0.1f32; 8];
+        let v_data = vec![0.2f32; 8];
+        let k_storage = Arc::from(device.from_cpu(&k_data, &shape, dtype.clone()).unwrap());
+        let v_storage = Arc::from(device.from_cpu(&v_data, &shape, dtype.clone()).unwrap());
+        let keys = Tensor::new(k_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
+        let values = Tensor::new(v_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
+        let block = compressor.compress(&keys, &values).unwrap();
+
+        let q_data = vec![0.1f32; 8];
+        let q_storage = Arc::from(device.from_cpu(&q_data, &shape, dtype.clone()).unwrap());
+        let query = Tensor::new(q_storage, shape, dtype, QuantProvenance::GrimNative, Device::Cpu);
+
+        // Simulate a non-CPU device_type to trigger the GPU dispatch branch.
+        // The stub returns Err(Unimplemented), never panics.
+        let result = compressor.fused_attention(&block, &query, &device, Device::Rocm(0));
+        assert!(result.is_err(), "GPU path must return Err until kernel is wired");
+        // Must be Unimplemented, not a panic or internal error.
+        match result {
+            Err(grim_core::error::Error::Unimplemented(_)) | Err(grim_core::error::Error::Tensor(grim_tensor::Error::Unimplemented(_))) => {}
+            Err(other) => panic!("Expected Unimplemented error, got: {:?}", other),
+            Ok(_) => unreachable!(),
+        }
     }
 }

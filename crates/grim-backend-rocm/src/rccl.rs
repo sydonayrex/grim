@@ -334,3 +334,39 @@ pub fn p2p_memcpy_async(
         Err(Error::Backend("RCCL feature not enabled".into()))
     }
 }
+
+/// Tensor-parallel all-reduce hook for the serving path (P2-WI-2 / WI-R3).
+///
+/// This is the **single, canonical call site** for TP all-reduce so that:
+/// 1. The serving path has one place to enable/disable/profile the collective.
+/// 2. A future `CommComputeOverlapConfig` can intercept here for stream-overlap.
+///
+/// Delegates directly to `comm.all_reduce`; the thin wrapper exists to keep
+/// call sites unaware of the `RocmComm` API details, and to serve as the
+/// correct hook point for comm-compute overlap (P2-WI-2 Phase 2).
+///
+/// Returns `Err(Unsupported)` when the `rccl` feature is disabled so
+/// single-GPU builds compile cleanly without `#[cfg]` at every call site.
+#[allow(unused_variables)]
+pub fn tp_all_reduce(
+    comm: &RocmComm,
+    buf: *mut std::ffi::c_void,
+    count: usize,
+    dtype: &DType,
+    stream: *mut std::ffi::c_void,
+) -> Result<()> {
+    #[cfg(feature = "rccl")]
+    {
+        // Safety: buf must be a valid GPU device buffer for `count` elements of
+        // the given dtype; stream must be a valid HIP stream. These invariants
+        // are upheld by the caller (the serving scheduler that owns the buffer).
+        comm.all_reduce(buf as *const std::ffi::c_void, buf, count, dtype, stream)
+    }
+    #[cfg(not(feature = "rccl"))]
+    {
+        Err(Error::Backend(
+            "tp_all_reduce: RCCL feature not enabled; \
+             build with --features rccl for multi-GPU TP".into(),
+        ))
+    }
+}
