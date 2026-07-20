@@ -4113,6 +4113,7 @@ dependencies = [
  "cubecl-runtime",
  "grim-backend-cpu",
  "grim-format",
+ "grim-kvquant",
  "grim-tensor",
  "half",
  "lazy_static",
@@ -4174,9 +4175,15 @@ dependencies = [
 name = "grim-core"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "grim-nn",
  "grim-tensor",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -4195,6 +4202,7 @@ version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
  "grim-backend-cuda",
+ "grim-backend-metal",
  "grim-backend-rocm",
  "grim-core",
  "grim-format",
@@ -4207,6 +4215,7 @@ dependencies = [
  "grim-scheduler",
  "grim-speculative",
  "grim-tensor",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 
@@ -4351,6 +4360,7 @@ version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
  "grim-backend-cuda",
+ "grim-backend-metal",
  "grim-backend-rocm",
  "grim-quant",
  "grim-tensor",

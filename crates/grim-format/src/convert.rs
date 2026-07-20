@@ -100,25 +100,13 @@ pub fn convert_gguf_to_grim(input_path: &str, output_path: &str, resolved_gcn: &
     let mut in_reader = BufReader::new(&mut infile);
     let mut gguf = read_gguf(&mut in_reader)?;
 
-    // Exclude RDNA 2 and below (gfx10)
-    if resolved_gcn.starts_with("gfx10") {
-        return Err(Error::Backend(format!(
-            "Conversion rejected: GPU target {} is RDNA 2-based. RDNA 2 is not supported as it lacks wave64 capabilities.",
-            resolved_gcn
-        )));
-    }
-
-    // Only allow RDNA 3 (gfx11) and RDNA 4 (gfx12)
-    if !resolved_gcn.starts_with("gfx11") && !resolved_gcn.starts_with("gfx12") {
-        println!("[WARN] GPU target {} is not recognized as standard RDNA 3/4. Conversion will proceed but optimizations may mismatch.", resolved_gcn);
+    // Only allow CDNA 2/3, RDNA 2/3/4
+    if !resolved_gcn.starts_with("gfx10") && !resolved_gcn.starts_with("gfx11") && !resolved_gcn.starts_with("gfx12") && !resolved_gcn.starts_with("gfx9") {
+        println!("[WARN] GPU target {} is not recognized as standard CDNA or RDNA. Conversion will proceed but optimizations may mismatch.", resolved_gcn);
     }
 
     // Build ROCm profile metadata properties
-    let profile = if resolved_gcn.starts_with("gfx12") {
-        GrimRocmlProfile::Rdna4
-    } else {
-        GrimRocmlProfile::Rdna3
-    };
+    let profile = gcn_to_profile(resolved_gcn);
 
     println!("[Grim Convert] Optimization target: {} (Profile: {:?})", resolved_gcn, profile);
 
@@ -128,8 +116,13 @@ pub fn convert_gguf_to_grim(input_path: &str, output_path: &str, resolved_gcn: &
     gguf.metadata.insert(
         "grim.rocml.profile".into(),
         GgufValue::String(match profile {
+            GrimRocmlProfile::Cdna2 => "cdna2".into(),
+            GrimRocmlProfile::Cdna3 => "cdna3".into(),
+            GrimRocmlProfile::Rdna2 => "rdna2".into(),
+            GrimRocmlProfile::Rdna3 => "rdna3".into(),
             GrimRocmlProfile::Rdna4 => "rdna4".into(),
-            _ => "rdna3".into(),
+            GrimRocmlProfile::All => "all".into(),
+            GrimRocmlProfile::Unknown => "unknown".into(),
         }),
     );
     gguf.metadata.insert("grim.rocml.wavefront_size".into(), GgufValue::Uint32(profile.wavefront_size()));
@@ -366,6 +359,8 @@ fn gcn_to_profile(gcn: &str) -> crate::gguf::GrimRocmlProfile {
         crate::gguf::GrimRocmlProfile::Rdna4
     } else if gcn.starts_with("gfx11") {
         crate::gguf::GrimRocmlProfile::Rdna3
+    } else if gcn.starts_with("gfx10") {
+        crate::gguf::GrimRocmlProfile::Rdna2
     } else if gcn.starts_with("gfx94") || gcn.starts_with("gfx90a") {
         crate::gguf::GrimRocmlProfile::Cdna3
     } else if gcn.starts_with("gfx90") {

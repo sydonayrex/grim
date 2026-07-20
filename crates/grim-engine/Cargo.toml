@@ -13,6 +13,7 @@ grim-nn = { workspace = true }
 grim-backend-cpu = { workspace = true }
 grim-backend-rocm = { workspace = true }
 grim-backend-cuda = { workspace = true }
+grim-backend-metal = { workspace = true }
 grim-memory = { workspace = true }
 grim-scheduler = { workspace = true }
 grim-models-transformer = { workspace = true }
@@ -22,6 +23,9 @@ grim-format = { workspace = true }
 grim-speculative = { workspace = true }
 grim-kvquant = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 default = []

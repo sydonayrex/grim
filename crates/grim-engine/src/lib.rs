@@ -852,4 +852,108 @@ mod tests {
         engine.finish_request(11);
         assert_eq!(engine.request_rng_state(11), None);
     }
+
+    fn write_mock_gguf_for_test(path: &std::path::Path) {
+        use std::io::Write;
+        use std::collections::HashMap;
+        use grim_format::gguf::{GgufValue, GGUF_MAGIC, GGUF_VERSION};
+
+        let mut metadata = HashMap::new();
+        metadata.insert("general.architecture".to_string(), GgufValue::String("llama".to_string()));
+        metadata.insert("tokenizer.ggml.vocab_size".to_string(), GgufValue::String("256".to_string()));
+        metadata.insert("llama.embedding_length".to_string(), GgufValue::String("32".to_string()));
+        metadata.insert("llama.block_count".to_string(), GgufValue::String("1".to_string()));
+        metadata.insert("llama.intermediate_size".to_string(), GgufValue::String("64".to_string()));
+        metadata.insert("llama.attention.head_count".to_string(), GgufValue::String("2".to_string()));
+        metadata.insert("llama.attention.head_count_kv".to_string(), GgufValue::String("1".to_string()));
+        metadata.insert("llama.attention.key_length".to_string(), GgufValue::String("16".to_string()));
+        metadata.insert("llama.attention.layer_norm_eps".to_string(), GgufValue::String("0.00001".to_string()));
+
+        let tensor_specs = vec![
+            ("tok_embeddings.weight", vec![32, 256]),
+            ("norm.weight", vec![32]),
+            ("output.weight", vec![32, 256]),
+            ("layers.0.attn_norm.weight", vec![32]),
+            ("layers.0.attn.wq.weight", vec![32, 32]),
+            ("layers.0.attn.wk.weight", vec![32, 16]),
+            ("layers.0.attn.wv.weight", vec![32, 16]),
+            ("layers.0.attn.wo.weight", vec![32, 32]),
+            ("layers.0.ffn_norm.weight", vec![32]),
+            ("layers.0.ffn.w_gate.weight", vec![32, 64]),
+            ("layers.0.ffn.w_down.weight", vec![64, 32]),
+            ("layers.0.ffn.w_up.weight", vec![32, 64]),
+        ];
+
+        let mut buf = Vec::new();
+        buf.write_all(&GGUF_MAGIC.to_le_bytes()).unwrap(); // GGUF magic
+        buf.write_all(&GGUF_VERSION.to_le_bytes()).unwrap(); // version
+        buf.write_all(&(tensor_specs.len() as u64).to_le_bytes()).unwrap();
+        buf.write_all(&(metadata.len() as u64).to_le_bytes()).unwrap();
+
+        for (k, v) in &metadata {
+            let kb = k.as_bytes();
+            buf.write_all(&(kb.len() as u64).to_le_bytes()).unwrap();
+            buf.write_all(kb).unwrap();
+            buf.write_all(&8u32.to_le_bytes()).unwrap(); // String type
+            if let GgufValue::String(s) = v {
+                let vb = s.as_bytes();
+                buf.write_all(&(vb.len() as u64).to_le_bytes()).unwrap();
+                buf.write_all(vb).unwrap();
+            }
+        }
+
+        let mut payload = Vec::new();
+        for (name, dims) in &tensor_specs {
+            let nb = name.as_bytes();
+            buf.write_all(&(nb.len() as u64).to_le_bytes()).unwrap();
+            buf.write_all(nb).unwrap();
+            buf.write_all(&(dims.len() as u32).to_le_bytes()).unwrap();
+            for &d in dims {
+                buf.write_all(&(d as u64).to_le_bytes()).unwrap();
+            }
+            buf.write_all(&6u32.to_le_bytes()).unwrap(); // F32 dtype
+            
+            let offset = payload.len() as u64;
+            buf.write_all(&offset.to_le_bytes()).unwrap();
+
+            let size = dims.iter().product::<usize>() * 4;
+            payload.resize(payload.len() + size, 0);
+        }
+
+        while buf.len() % 32 != 0 {
+            buf.push(0);
+        }
+        buf.extend_from_slice(&payload);
+
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    #[test]
+    fn test_load_grim_with_gguf_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let gguf_path = dir.path().join("model.gguf");
+        let grim_path = dir.path().join("model.grim");
+
+        write_mock_gguf_for_test(&gguf_path);
+
+        // Convert GGUF to GRIM
+        grim_format::convert_to_grim(
+            gguf_path.to_str().unwrap(),
+            grim_path.to_str().unwrap(),
+            "gfx1100",
+            16.0,
+            0,
+            None,
+            None,
+        )
+        .expect("conversion failed");
+
+        // Verify sibling GGUF is next to it
+        assert!(gguf_path.exists());
+        assert!(grim_path.exists());
+
+        // Now load the model via load_from_path!
+        let loaded = crate::model_loader::load_from_path(grim_path.to_str().unwrap());
+        assert!(loaded.is_ok(), "failed to load .grim: {:?}", loaded.err());
+    }
 }

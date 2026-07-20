@@ -124,6 +124,20 @@ pub enum GroupQuantScheme {
     Asymmetric,
 }
 
+/// Configuration for GroupInt quantization (used by external QAT pipelines such as GPTQ).
+///
+/// ### Packed Byte Layout for `RawTensor.bytes` (concatenation convention):
+/// When `storage` is `Storage::GroupInt(_)`, all four parallel arrays are concatenated
+/// into a single `Vec<u8>` in `RawTensor.bytes`. Each array segment is prefixed with its length:
+///
+/// ```text
+/// [u64 LE: qweight_len] [qweight_bytes...]
+/// [u64 LE: qzeros_len]  [qzeros_bytes...]
+/// [u64 LE: scales_len]  [scales_bytes...]
+/// [u64 LE: g_idx_len]   [g_idx_bytes...]
+/// ```
+///
+/// If `g_idx` is absent, its segment has `g_idx_len` set to 0.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GpuIntConfig {
     pub bits: u8,
