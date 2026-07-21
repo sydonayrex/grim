@@ -198,7 +198,7 @@ pub async fn cmd_run(model_path: String, prompt: Option<String>, serve: bool, ad
             Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
         }
         grim_tensor::Device::Metal(ordinal) => {
-            let dev = grim_backend_metal::MetalDevice::new(ordinal);
+            let dev = grim_backend_metal::MetalDevice::try_new(ordinal)?;
             Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
         }
     };

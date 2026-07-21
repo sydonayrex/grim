@@ -178,35 +178,77 @@ const LLOYD_MAX_3BIT_CENTROIDS: [f32; 8] = [
 ];
 
 /// A Lloyd-Max scalar quantizer compressor.
+/// Reusable packed K/V buffer for the GPU fused-attention dispatch.
+///
+/// `fused_attention` is a *decode* primitive: the same compressed KV cache is
+/// queried many times (one new token per step). Re-dequantizing and re-packing
+/// the whole cache on every call is O(cache) CPU work per step — the dominant
+/// cost at decode time. We memoize the packed bytes + per-row scales keyed by
+/// the block's identity so only the *first* call pays the pack cost; later
+/// calls (same block, different query) reuse the packed buffers and pay just
+/// the device upload + kernel launch.
+#[derive(Clone)]
+struct PackedKvBuf {
+    k_packed: Vec<u8>,
+    v_packed: Vec<u8>,
+    /// Per-(token, kv_head) scale. `k_scales[j * num_kv_heads + kv_head]`.
+    k_scales: Vec<f32>,
+    v_scales: Vec<f32>,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_seq_len: usize,
+    /// What `quant_bits` the kernel was launched with (4 or 8).
+    quant_bits: u32,
+    /// Identity of the block this buffer was packed from (for memo reuse).
+    key_bits_cfg: u8,
+    value_bits_cfg: u8,
+    key_bits_len: usize,
+    value_bits_len: usize,
+}
+
 pub struct LloydMaxCompressor {
     pub config: KvQuantConfig,
     /// GPU-dispatch configuration for fused attention (P1-WI-2).
     pub gpu_attn: KvDequantAttentionConfig,
+    /// Packed-KV memo for the GPU dispatch (pack-once, reuse across decode
+    /// steps). See `PackedKvBuf` contract. Guarded so the compressor stays
+    /// `Send`/`Sync`-friendly across threads.
+    packed_kv: std::sync::Mutex<Option<PackedKvBuf>>,
 }
 
 impl LloydMaxCompressor {
     /// Create with default (CPU-only) config.
     pub fn new(config: KvQuantConfig) -> Self {
-        Self { config, gpu_attn: KvDequantAttentionConfig::default() }
+        Self { config, gpu_attn: KvDequantAttentionConfig::default(), packed_kv: std::sync::Mutex::new(None) }
     }
 
     /// Create with an explicit GPU-attention dispatch config.
     pub fn with_gpu_attn(config: KvQuantConfig, gpu_attn: KvDequantAttentionConfig) -> Self {
-        Self { config, gpu_attn }
+        Self { config, gpu_attn, packed_kv: std::sync::Mutex::new(None) }
     }
 }
 
 /// GPU-side fused dequant-attention dispatch (P1-WI-2).
 ///
 /// Called by `LloydMaxCompressor::fused_attention` when `gpu_attn.enabled`
-/// is true and the device type is non-CPU.  The compressed `block` is
-/// dequantized to f32 on the host, then **re-packed as signed 8-bit** with a
-/// uniform per-buffer scale so the wired `grim_kv_dequant_attention` HIP
-/// kernel's signed 8-bit path reproduces the f32 values up to `scale/255`
-/// quantization error.  This lets the existing ROCm kernel service the
-/// Lloyd-Max 3-bit block without a specialized 3-bit kernel and without leaking
-/// device-specific code into `grim-kvquant` (which stays backend-agnostic via
-/// `BackendDevice`).
+/// is true and the device type is non-CPU. The dispatcher:
+///
+/// 1. **Pack-once, reuse** — the compressed KV cache is dequantized to f32 and
+///    re-packed to the kernel's packed format only on the *first* call for a
+///    given block; subsequent calls (same block, fresh query — i.e. a decode
+///    loop) reuse the memoized packed bytes + per-row scales via
+///    `compressor.packed_kv`. Mirrors real decode: pack the cache at fill time,
+///    stream queries through it.
+/// 2. **Bitwidth-aware** — when the block's `key_bits` AND `value_bits` are
+///    `≤ 4` (and `head_dim` is even), K/V are packed two-per-byte (4-bit
+///    nibbles) and the kernel's 4-bit dequant branch `((nib-8)/7)*scale` is
+///    used, realizing the sub-8-bit KV-memory win. Otherwise the 8-bit signed
+///    path `((byte-128)/127)*scale` is used (covers the legacy 8-bit fallback
+///    and any odd-`head_dim` case safely).
+/// 3. **Per-row scales** — one f32 scale per `(token, kv_head)` = peak |value|
+///    over that row's `head_dim` elements. More accurate than a single
+///    buffer-scale and matches the kernel's `k_scales[j*num_kv_heads+kv_head]`
+///    read pattern.
 ///
 /// The real device work happens through `BackendDevice::kv_dequant_attention`,
 /// which the ROCm backend overrides with the JIT-compiled HIP kernel; other
@@ -214,9 +256,10 @@ impl LloydMaxCompressor {
 ///
 /// # Contract
 /// - Must not panic — callers rely on `Result` for error propagation.
-/// - Result is read back to a host `Tensor` (slow path; GPU-resident callers
-///   would keep the storage on-device, but `fused_attention` already returns
-///   a `Tensor`).
+/// - The memo is keyed by the block's identity (dims + bitwidth cfg + packed
+///   byte lengths). A mutated-in-place block invalidates the memo naturally
+///   only if its Vec lengths change; treat `CompressedKvBlock` as immutable
+///   after `compress` for the lifetime of the memo.
 fn dispatch_gpu_fused_attention(
     compressor: &LloydMaxCompressor,
     block: &CompressedKvBlock,
@@ -226,44 +269,73 @@ fn dispatch_gpu_fused_attention(
 ) -> Result<Tensor> {
     let q_data = query.to_vec_f32()?;
 
-    // Dequantize the compressed K/V block to f32 (per-head Lloyd-Max scales
-    // already folded back in). This is the exact same f32 K/V the CPU
-    // reference path consumes, so GPU == CPU by construction once the kernel
-    // is exact.
-    let (keys, values) = compressor.dequantize_for_attention(block, device, device_type.clone())?;
-
-    let k_data = keys.to_vec_f32()?;
-    let v_data = values.to_vec_f32()?;
-
     let num_kv_heads = block.num_kv_heads;
     let head_dim = block.head_dim;
     let kv_seq_len = block.num_tokens;
 
-    // Repack f32 -> signed u8 so the kernel's signed 8-bit dequant path
-    // (byte-128)*scale reproduces the f32 value up to quantization error
-    // (scale/255). A single uniform scale per buffer keeps the per-row scales
-    // the kernel reads all equal to that buffer's peak magnitude.
-    let pack_signed_u8 = |src: &[f32]| -> (Vec<u8>, f32) {
-        let peak = src.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
-        let scale = if peak > 0.0 { peak } else { 1.0 };
-        let bytes = src
-            .iter()
-            .map(|&x| {
-                let v = (x / scale * 127.0).round() + 128.0;
-                v.clamp(0.0, 255.0) as u8
-            })
-            .collect();
-        (bytes, scale)
+    // Bitwidth comes from the *compressor config* (u8), not the block's packed
+    // `key_bits` Vec (which is packed byte data, not a bitwidth scalar).  Sub-4-bit
+    // path needs both ≤4 AND an even head_dim (the kernel packs two dims per
+    // byte indexed by dim/2, dim%2).
+    let cfg_key_bits = compressor.config.key_bits;
+    let cfg_value_bits = compressor.config.value_bits;
+    let both_low_bw = cfg_key_bits <= 4 && cfg_value_bits <= 4;
+    let quant_bits: u32 = if both_low_bw && head_dim % 2 == 0 { 4 } else { 8 };
+
+    // Memo key — reuse packed buffers across decode steps (same block). The
+    // block's packed-byte Vec lengths reflect its identity too, so include them.
+    let key_bits_len = block.key_bits.len();
+    let value_bits_len = block.value_bits.len();
+    let memo_hit = match compressor.packed_kv.lock() {
+        Ok(g) => match g.as_ref() {
+            Some(buf) => {
+                buf.num_kv_heads == num_kv_heads
+                    && buf.head_dim == head_dim
+                    && buf.kv_seq_len == kv_seq_len
+                    && buf.quant_bits == quant_bits
+                    && buf.key_bits_cfg == cfg_key_bits
+                    && buf.value_bits_cfg == cfg_value_bits
+                    && buf.key_bits_len == key_bits_len
+                    && buf.value_bits_len == value_bits_len
+            }
+            None => false,
+        },
+        Err(_) => false,
     };
-    let (k_packed, k_scale) = pack_signed_u8(&k_data);
-    let (v_packed, v_scale) = pack_signed_u8(&v_data);
 
-    // Per-(token, kv_head) scale = buffer peak; layout [kv_seq_len * num_kv_heads].
+    // Acquire the packed buffer for this block: reuse the memo or repack.
+    let packed: PackedKvBuf = if memo_hit {
+        // Reuse: clone the memoized packed bytes (cheap relative to dequant+pack).
+        match compressor.packed_kv.lock() {
+            Ok(g) => match g.as_ref() {
+                Some(buf) => buf.clone(),
+                None => pack_kv_buf(compressor, block, quant_bits, device, device_type.clone())?,
+            },
+            Err(_) => pack_kv_buf(compressor, block, quant_bits, device, device_type.clone())?,
+        }
+    } else {
+        let buf = pack_kv_buf(compressor, block, quant_bits, device, device_type.clone())?;
+        if let Ok(mut g) = compressor.packed_kv.lock() {
+            *g = Some(buf.clone());
+        }
+        buf
+    };
+
     let scale_len = kv_seq_len * num_kv_heads;
-    let k_scales = vec![k_scale; scale_len];
-    let v_scales = vec![v_scale; scale_len];
-
-    let kv_shape = Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]);
+    let kv_byte_len = if quant_bits == 8 {
+        kv_seq_len * num_kv_heads * head_dim
+    } else {
+        kv_seq_len * num_kv_heads * (head_dim / 2)
+    };
+    let kv_shape = if quant_bits == 8 {
+        Shape::new(vec![kv_seq_len, num_kv_heads, head_dim])
+    } else {
+        // 4-bit: half the bytes; lie about the innermost dim to keep the
+        // byte count correct while `from_cpu` copies `len*4` bytes for f32
+        // elements. We reinterpret the u8 buffer as &[f32] of equal byte
+        // length below, so the shape only needs the right product.
+        Shape::new(vec![kv_seq_len, num_kv_heads, head_dim / 2])
+    };
     let scale_shape = Shape::new(vec![scale_len]);
     let q_shape = query.shape().clone();
     let f32_dtype = grim_tensor::DType {
@@ -275,18 +347,27 @@ fn dispatch_gpu_fused_attention(
         storage: grim_tensor::Storage::Native,
     };
 
-    // q stays f32; k/v packed as u8; scales f32. `from_cpu` takes `&[f32]`
-    // and copies `len*4` bytes, so we reinterpret the u8 byte buffers as f32
-    // element slices of equal *byte* length — the device receives the exact
-    // u8 bytes the kernel's `unsigned char*` reads.
-    let k_as_f32: &[f32] = unsafe { std::slice::from_raw_parts(k_packed.as_ptr() as *const f32, k_packed.len()) };
-    let v_as_f32: &[f32] = unsafe { std::slice::from_raw_parts(v_packed.as_ptr() as *const f32, v_packed.len()) };
+    // Reinterpret the u8 packed bytes as &[f32] of equal *byte* length so
+    // `from_cpu` (which copies `len*4` bytes for f32) ships the exact u8
+    // bytes the kernel's `unsigned char*` reads.
+    assert_eq!(k_packed_byte_len(&packed, quant_bits, kv_seq_len, num_kv_heads, head_dim), kv_byte_len);
+    let k_as_f32: &[f32] = unsafe {
+        std::slice::from_raw_parts(packed.k_packed.as_ptr() as *const f32, packed.k_packed.len())
+    };
+    let v_as_f32: &[f32] = unsafe {
+        std::slice::from_raw_parts(packed.v_packed.as_ptr() as *const f32, packed.v_packed.len())
+    };
 
-    let q_storage: Arc<dyn BackendStorage> = Arc::from(device.from_cpu(&q_data, &q_shape, f32_dtype.clone())?);
-    let k_storage: Arc<dyn BackendStorage> = Arc::from(device.from_cpu(k_as_f32, &kv_shape, u8_dtype.clone())?);
-    let ks_storage: Arc<dyn BackendStorage> = Arc::from(device.from_cpu(&k_scales, &scale_shape, f32_dtype.clone())?);
-    let v_storage: Arc<dyn BackendStorage> = Arc::from(device.from_cpu(v_as_f32, &kv_shape, u8_dtype.clone())?);
-    let vs_storage: Arc<dyn BackendStorage> = Arc::from(device.from_cpu(&v_scales, &scale_shape, f32_dtype.clone())?);
+    let q_storage: Arc<dyn BackendStorage> =
+        Arc::from(device.from_cpu(&q_data, &q_shape, f32_dtype.clone())?);
+    let k_storage: Arc<dyn BackendStorage> =
+        Arc::from(device.from_cpu(k_as_f32, &kv_shape, u8_dtype.clone())?);
+    let ks_storage: Arc<dyn BackendStorage> =
+        Arc::from(device.from_cpu(&packed.k_scales, &scale_shape, f32_dtype.clone())?);
+    let v_storage: Arc<dyn BackendStorage> =
+        Arc::from(device.from_cpu(v_as_f32, &kv_shape, u8_dtype.clone())?);
+    let vs_storage: Arc<dyn BackendStorage> =
+        Arc::from(device.from_cpu(&packed.v_scales, &scale_shape, f32_dtype.clone())?);
 
     let out_shape = query.shape().clone();
     let (out_storage, handle) = device.kv_dequant_attention(
@@ -298,13 +379,179 @@ fn dispatch_gpu_fused_attention(
         num_kv_heads,
         kv_seq_len,
         (kv_seq_len as u32).saturating_sub(1),
-        8,
+        quant_bits,
         &out_shape,
     )?;
     handle.synchronize()?;
 
     let out_arc: Arc<dyn BackendStorage> = Arc::from(out_storage);
     Ok(Tensor::new(out_arc, out_shape, f32_dtype, QuantProvenance::GrimNative, device_type))
+}
+
+fn k_packed_byte_len(_: &PackedKvBuf, quant_bits: u32, seq: usize, heads: usize, dim: usize) -> usize {
+    if quant_bits == 8 {
+        seq * heads * dim
+    } else {
+        seq * heads * (dim / 2)
+    }
+}
+
+/// Dequantize `block` to f32 and re-pack to the kernel's format at `quant_bits`
+/// (4 or 8), with per-(token, kv_head) scales. This is the O(cache) pack cost
+/// that the memo lets us pay once per block.
+fn pack_kv_buf(
+    compressor: &LloydMaxCompressor,
+    block: &CompressedKvBlock,
+    quant_bits: u32,
+    device: &dyn BackendDevice,
+    device_type: Device,
+) -> Result<PackedKvBuf> {
+    // Dequant on the caller's device (GPU when available): f32 K/V with
+    // Lloyd-Max per-head scales folded back in.
+    let (keys, values) = compressor.dequantize_for_attention(block, device, device_type)?;
+    let k_data = keys.to_vec_f32()?;
+    let v_data = values.to_vec_f32()?;
+
+    let num_kv_heads = block.num_kv_heads;
+    let head_dim = block.head_dim;
+    let kv_seq_len = block.num_tokens;
+    let row_len = head_dim;
+
+    // Per-(token, kv_head) packed rows + scales.
+    let mut k_packed: Vec<u8> = Vec::with_capacity(kv_seq_len * num_kv_heads * (row_len + 1) / 2 + row_len);
+    let mut v_packed: Vec<u8> = Vec::with_capacity(kv_seq_len * num_kv_heads * (row_len + 1) / 2 + row_len);
+    let mut k_scales: Vec<f32> = Vec::with_capacity(kv_seq_len * num_kv_heads);
+    let mut v_scales: Vec<f32> = Vec::with_capacity(kv_seq_len * num_kv_heads);
+
+    let pack_row = |src: &[f32], out: &mut Vec<u8>, scales: &mut Vec<f32>| {
+        for j in 0..kv_seq_len {
+            for h in 0..num_kv_heads {
+                let base = (j * num_kv_heads + h) * row_len;
+                let row = &src[base..base + row_len];
+                let peak = row.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
+                let scale = if peak > 0.0 { peak } else { 1.0 };
+                scales.push(scale);
+                if quant_bits == 8 {
+                    for &x in row {
+                        let b = (x / scale * 127.0).round() + 128.0;
+                        out.push(b.clamp(0.0, 255.0) as u8);
+                    }
+                } else {
+                    // 4-bit: even dim -> low nibble, odd dim -> high nibble.
+                    let mut d = 0;
+                    while d < row_len {
+                        let lo = (row[d] / scale * 7.0).round() + 8.0;
+                        let lo = lo.clamp(0.0, 15.0) as u8;
+                        let hi = if d + 1 < row_len {
+                            let h = (row[d + 1] / scale * 7.0).round() + 8.0;
+                            h.clamp(0.0, 15.0) as u8
+                        } else {
+                            8 // neutral (0 after dequant)
+                        };
+                        out.push(lo | (hi << 4));
+                        d += 2;
+                    }
+                }
+            }
+        }
+    };
+
+    pack_row(&k_data, &mut k_packed, &mut k_scales);
+    pack_row(&v_data, &mut v_packed, &mut v_scales);
+
+    Ok(PackedKvBuf {
+        k_packed,
+        v_packed,
+        k_scales,
+        v_scales,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        quant_bits,
+        key_bits_cfg: compressor.config.key_bits,
+        value_bits_cfg: compressor.config.value_bits,
+        key_bits_len: block.key_bits.len(),
+        value_bits_len: block.value_bits.len(),
+    })
+}
+
+/// Bit-packing helper. Writes values of an arbitrary fixed width (1..=8 bits)
+/// into a `Vec<u8>` Little-Endian-first (low-order bits of the byte first),
+/// matching the format `compress` / `dequantize_for_attention` use for
+/// variable-density KV quantization. Tracks byte position and bit offset
+/// within the current byte. Pads the final byte with zero bits.
+struct BitWriter {
+    buf: Vec<u8>,
+    bit_pos: u32,
+}
+
+impl BitWriter {
+    fn new() -> Self {
+        Self { buf: Vec::new(), bit_pos: 0 }
+    }
+
+    /// Append `value` (must fit in `n_bits` bits) at the current bit position.
+    fn push(&mut self, value: u32, n_bits: u8) {
+        debug_assert!(n_bits > 0 && n_bits <= 8);
+        debug_assert!(value < (1u32 << n_bits));
+        // Bits per byte boundary.
+        let byte_idx = self.bit_pos / 8;
+        let bit_off = self.bit_pos % 8;
+        if bit_off == 0 {
+            self.buf.push(value as u8);
+        } else {
+            // Span across at most one extra byte given n_bits <= 8.
+            let free_hi = 8 - bit_off;
+            let byte = *self.buf.get_mut(byte_idx as usize).unwrap();
+            let lo_bits = value & ((1u32 << free_hi) - 1);
+            let hi_bits = value >> free_hi;
+            *self.buf.get_mut(byte_idx as usize).unwrap() = byte | (lo_bits as u8);
+            self.buf.push(hi_bits as u8);
+        }
+        self.bit_pos += n_bits as u32;
+    }
+
+    /// Finalize and return the underlying byte buffer.
+    fn finish(self) -> Vec<u8> {
+        self.buf
+    }
+
+    /// Approximate bytes reserved for `n_elems` of `bits_per_elem` bits.
+    fn capacity_for(n_elems: usize, bits_per_elem: u8) -> usize {
+        (n_elems * bits_per_elem as usize + 7) / 8
+    }
+}
+
+/// Bit-unpack helper. Reads values of fixed width from a packed byte stream.
+struct BitReader<'a> {
+    buf: &'a [u8],
+    bit_pos: u32,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, bit_pos: 0 }
+    }
+
+    /// Read the next `n_bits` as a u32.
+    fn next(&mut self, n_bits: u8) -> u32 {
+        debug_assert!(n_bits > 0 && n_bits <= 8);
+        let byte_idx = (self.bit_pos / 8) as usize;
+        let bit_off = self.bit_pos % 8;
+        let mut v: u32 = if byte_idx < self.buf.len() { self.buf[byte_idx] as u32 } else { 0 };
+        if bit_off > 0 && byte_idx + 1 < self.buf.len() {
+            let free_hi = 8 - bit_off;
+            let lo_bits = v & ((1u32 << free_hi) - 1);
+            let hi_bits = self.buf[byte_idx + 1] as u32;
+            v = lo_bits | (hi_bits << free_hi);
+        } else if bit_off > 0 {
+            // Spanned into the (nonexistent) next byte; zero-pad the high bits.
+            let free_hi = 8 - bit_off;
+            v &= (1u32 << free_hi) - 1;
+        }
+        self.bit_pos += n_bits as u32;
+        v & ((1u32 << n_bits) - 1)
+    }
 }
 
 impl KvCompressor for LloydMaxCompressor {
@@ -327,63 +574,42 @@ impl KvCompressor for LloydMaxCompressor {
             }
         }
 
-        // 2. QJL sign-bit key compression + Lloyd-Max (3-bit)
+        // 2. Symmetric uniform key compression at `config.key_bits` density
+        // (replaces the prior hard-coded 3-bit Lloyd-Max path so the host
+        // block's bit density actually responds to the configured bitwidth).
         let group_size = self.config.group_size;
-        let mut key_bits = Vec::new();
-        let mut key_meta = Vec::new();
+        let key_bits_w = {
+            let kb = self.config.key_bits.max(1).min(8);
+            let bits = if self.config.key_bits <= 4 { kb } else { 8 }; // cap at 8 for memory accounting
+            let half_levels = ((1u32 << bits) / 2).max(1);
+            let mut writer = BitWriter::new();
+            let cap = BitWriter::capacity_for(k_data.len(), bits as u8);
+            // Pre-reserve rough capacity
+            writer.buf.reserve(cap + 4);
 
-        let mut current_byte = 0u8;
-        let mut bit_offset = 0;
+            for group_idx in 0..((k_data.len() + group_size - 1) / group_size) {
+                let start = group_idx * group_size;
+                let end = (start + group_size).min(k_data.len());
+                let slice = &k_data[start..end];
 
-        for group_idx in 0..((k_data.len() + group_size - 1) / group_size) {
-            let start = group_idx * group_size;
-            let end = (start + group_size).min(k_data.len());
-            let slice = &k_data[start..end];
-
-            // Find scale
-            let mut sum_sq = 0.0;
-            for &x in slice {
-                sum_sq += x * x;
-            }
-            let std_dev = f32::sqrt(sum_sq / slice.len() as f32).max(1e-5);
-            key_meta.push(std_dev);
-
-            for &x in slice {
-                // Normalize
-                let norm_x = x / std_dev;
-                // QJL (Quantized Joint Limit) check / Sign-bit extraction
-                // Extracts sign-bit residual for keys
-                let is_negative = norm_x < 0.0;
-                
-                // Find closest Lloyd-Max centroid
-                let mut best_idx = 0;
-                let mut min_dist = (norm_x - LLOYD_MAX_3BIT_CENTROIDS[0]).abs();
-                for i in 1..8 {
-                    let dist = (norm_x - LLOYD_MAX_3BIT_CENTROIDS[i]).abs();
-                    if dist < min_dist {
-                        min_dist = dist;
-                        best_idx = i;
-                    }
+                // Group scale (RMS ≈ std_dev) for symmetric quantization.
+                let mut sum_sq = 0.0f32;
+                for &x in slice {
+                    sum_sq += x * x;
                 }
+                let std_dev = f32::sqrt(sum_sq / slice.len() as f32).max(1e-5);
+                key_meta.push(std_dev);
 
-                // If negative, enforce sign bit flag into the best centroid mapping
-                if is_negative && best_idx >= 4 {
-                    best_idx = 7 - best_idx; // Wrap centroid to symmetric negative space
-                }
-
-                // Pack 3 bits
-                current_byte |= (best_idx as u8) << bit_offset;
-                bit_offset += 3;
-                if bit_offset >= 8 {
-                    key_bits.push(current_byte);
-                    current_byte = (best_idx as u8) >> (3 - (bit_offset - 8));
-                    bit_offset -= 8;
+                for &x in slice {
+                    // Map x/std_dev into [0, 2*half_levels - 1] via centered uniform.
+                    let n = (x / std_dev).clamp(-1.0 + 1e-7, 1.0 - 1e-7);
+                    let q = ((n + 1.0) * (half_levels - 1) as f32).round() as i64;
+                    let q = q.clamp(0, (1u32 << bits) as i64 - 1) as u32;
+                    writer.push(q, bits as u8);
                 }
             }
-        }
-        if bit_offset > 0 {
-            key_bits.push(current_byte);
-        }
+            writer.finish()
+        };
 
         // 3. Value Compression using Group Quantization (4-bit asymmetric)
         let mut value_bits = Vec::new();

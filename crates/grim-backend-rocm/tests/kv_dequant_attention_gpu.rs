@@ -79,20 +79,28 @@ fn float_reference(
 
 #[test]
 fn gpu_fused_attention_matches_cpu_reference() -> TestResult {
-    // (num_heads, num_kv_heads, head_dim): covers 1:1 heads and
-    // GQA (kv_heads < heads), and head_dim <= 64 (single chunk)
-    // vs > 64 (multi-chunk).
-    for &(num_heads, num_kv_heads, head_dim) in &[
-        (4usize, 4usize, 64usize),
-        (8usize, 2usize, 128usize),
-        (4usize, 1usize, 96usize),
+    // (num_heads, num_kv_heads, head_dim, key_bits, value_bits): covers 1:1
+    // heads and GQA (kv_heads < heads), head_dim <= 64 vs > 64 (multi-chunk),
+    // and BOTH kernel paths — 4-bit (≤4) and 8-bit (>4 / odd config).
+    for &(num_heads, num_kv_heads, head_dim, key_bits, value_bits) in &[
+        (4usize, 4usize, 64usize, 3u8, 4u8),
+        (8usize, 2usize, 128usize, 3u8, 4u8),
+        (4usize, 1usize, 96usize, 3u8, 4u8),
+        (4usize, 4usize, 64usize, 8u8, 8u8),
+        (8usize, 2usize, 128usize, 8u8, 8u8),
     ] {
-        run_case(num_heads, num_kv_heads, head_dim)?;
+        run_case(num_heads, num_kv_heads, head_dim, key_bits, value_bits)?;
     }
     Ok(())
 }
 
-fn run_case(num_heads: usize, num_kv_heads: usize, head_dim: usize) -> TestResult {
+fn run_case(
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    key_bits: u8,
+    value_bits: u8,
+) -> TestResult {
     let dev = RocmDevice::new(0);
 
     let num_tokens = 4usize;
@@ -119,7 +127,7 @@ fn run_case(num_heads: usize, num_kv_heads: usize, head_dim: usize) -> TestResul
     let values = Tensor::new(v_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
 
     let gpu_compressor = LloydMaxCompressor::with_gpu_attn(
-        KvQuantConfig::default(),
+        KvQuantConfig { key_bits, value_bits, ..Default::default() },
         KvDequantAttentionConfig { enabled: true },
     );
     let block = gpu_compressor.compress(&keys, &values)?;
