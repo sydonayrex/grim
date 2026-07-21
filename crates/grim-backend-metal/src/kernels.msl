@@ -105,6 +105,12 @@ kernel void grim_embedding(
     }
 }
 
+struct TileConfig {
+    int block_m;
+    int block_n;
+    int block_k;
+};
+
 kernel void grim_matmul(
     device const float* a [[buffer(0)]],
     device const float* b [[buffer(1)]],
@@ -112,16 +118,47 @@ kernel void grim_matmul(
     constant int& m [[buffer(3)]],
     constant int& n [[buffer(4)]],
     constant int& k [[buffer(5)]],
-    uint2 id [[thread_position_in_grid]]
+    constant TileConfig& config [[buffer(6)]],
+    uint2 tg_id [[threadgroup_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]]
 ) {
-    uint row = id.y;
-    uint col = id.x;
-    if (row < uint(m) && col < uint(n)) {
-        float sum = 0.0f;
-        for (int i = 0; i < k; ++i) {
-            sum += a[row * k + i] * b[i * n + col];
+    threadgroup float tile_a[32][32];
+    threadgroup float tile_b[32][32];
+
+    int block_m = config.block_m;
+    int block_n = config.block_n;
+    int block_k = config.block_k;
+
+    int row_start = tg_id.y * block_m;
+    int col_start = tg_id.x * block_n;
+
+    float acc = 0.0f;
+    for (int bk = 0; bk < k; bk += block_k) {
+        int t_row = tid.y;
+        int t_col = tid.x;
+        if (row_start + t_row < m && bk + t_col < k) {
+            tile_a[t_row][t_col] = a[(row_start + t_row) * k + (bk + t_col)];
+        } else {
+            tile_a[t_row][t_col] = 0.0f;
         }
-        c[row * n + col] = sum;
+
+        if (bk + t_row < k && col_start + t_col < n) {
+            tile_b[t_row][t_col] = b[(bk + t_row) * n + (col_start + t_col)];
+        } else {
+            tile_b[t_row][t_col] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int i = 0; i < block_k; ++i) {
+            acc += tile_a[t_row][i] * tile_b[i][t_col];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    int out_row = row_start + tid.y;
+    int out_col = col_start + tid.x;
+    if (out_row < m && out_col < n) {
+        c[out_row * n + out_col] = acc;
     }
 }
 
@@ -139,52 +176,79 @@ kernel void grim_qkv_attention(
     constant int& kv_seq_len [[buffer(10)]],
     constant int& cache_offset [[buffer(11)]],
     constant float& inv_sqrt_d [[buffer(12)]],
-    uint2 id [[thread_position_in_grid]]
+    uint2 id [[thread_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 tg_id [[threadgroup_position_in_grid]]
 ) {
-    uint i = id.x;
-    uint h = id.y;
+    uint i = tg_id.x;
+    uint h = tg_id.y;
     if (i >= uint(seq_len) || h >= uint(num_heads)) return;
 
     int q_per_kv = num_heads / num_kv_heads;
     int kv_head = h / q_per_kv;
     int q_offset = (i * num_heads + h) * head_dim;
     int abs_i = cache_offset + i;
-
     int range_len = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+
+    // Threadgroup tiling buffers for key-value slots
+    threadgroup float tile_k[32][32];
+    threadgroup float tile_v[32][32];
 
     float running_max = -1e30f;
     float running_sum = 0.0f;
+    
+    // Output registers accumulator
+    float acc[128] = {0.0f};
 
-    for (int j = 0; j < range_len; ++j) {
-        float score = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-            score += q[q_offset + d] * k_tensor[(j * num_kv_heads + kv_head) * head_dim + d];
-        }
-        score *= inv_sqrt_d;
-        running_max = max(running_max, score);
+    // Load query locally
+    float local_q[128];
+    for (int d = 0; d < head_dim && d < 128; ++d) {
+        local_q[d] = q[q_offset + d];
     }
 
-    for (int j = 0; j < range_len; ++j) {
-        float score = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-            score += q[q_offset + d] * k_tensor[(j * num_kv_heads + kv_head) * head_dim + d];
+    for (int block_start = 0; block_start < range_len; block_start += 32) {
+        int block_end = min(block_start + 32, range_len);
+        
+        // Coalesced collaborative load from device memory to threadgroup shared storage
+        if (tid < 32) {
+            for (int d = 0; d < head_dim && d < 32; ++d) {
+                int j = block_start + tid;
+                if (j < block_end) {
+                    tile_k[tid][d] = k_tensor[(j * num_kv_heads + kv_head) * head_dim + d];
+                    tile_v[tid][d] = v_tensor[(j * num_kv_heads + kv_head) * head_dim + d];
+                } else {
+                    tile_k[tid][d] = 0.0f;
+                    tile_v[tid][d] = 0.0f;
+                }
+            }
         }
-        score *= inv_sqrt_d;
-        running_sum += exp(score - running_max);
-    }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int d = 0; d < head_dim; ++d) {
-        float acc = 0.0f;
-        for (int j = 0; j < range_len; ++j) {
+        // Score evaluation & scaling over the block
+        for (int j_local = 0; j_local < (block_end - block_start); ++j_local) {
             float score = 0.0f;
-            for (int d2 = 0; d2 < head_dim; ++d2) {
-                score += q[q_offset + d2] * k_tensor[(j * num_kv_heads + kv_head) * head_dim + d2];
+            for (int d = 0; d < head_dim && d < 32; ++d) {
+                score += local_q[d] * tile_k[j_local][d];
             }
             score *= inv_sqrt_d;
-            float weight = exp(score - running_max) / (running_sum > 0.0f ? running_sum : 1.0f);
-            acc += weight * v_tensor[(j * num_kv_heads + kv_head) * head_dim + d];
+
+            float prev_max = running_max;
+            running_max = max(running_max, score);
+            float scale_prev = exp(prev_max - running_max);
+            float scale_score = exp(score - running_max);
+            
+            running_sum = running_sum * scale_prev + scale_score;
+
+            for (int d = 0; d < head_dim && d < 128; ++d) {
+                acc[d] = acc[d] * scale_prev + scale_score * tile_v[j_local][d];
+            }
         }
-        out[q_offset + d] = acc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_sum = running_sum > 0.0f ? (1.0f / running_sum) : 1.0f;
+    for (int d = 0; d < head_dim && d < 128; ++d) {
+        out[q_offset + d] = acc[d] * inv_sum;
     }
 
     if (out_max != nullptr) {
@@ -194,3 +258,92 @@ kernel void grim_qkv_attention(
         out_sum[i * num_heads + h] = running_sum;
     }
 }
+
+kernel void grim_kv_dequant_attention(
+    device const float* q [[buffer(0)]],
+    device const uchar* k_tensor [[buffer(1)]],
+    device const float* k_scales [[buffer(2)]],
+    device const uchar* v_tensor [[buffer(3)]],
+    device const float* v_scales [[buffer(4)]],
+    device float* out [[buffer(5)]],
+    constant int& num_heads [[buffer(6)]],
+    constant int& num_kv_heads [[buffer(7)]],
+    constant int& head_dim [[buffer(8)]],
+    constant int& seq_len [[buffer(9)]],
+    constant int& kv_seq_len [[buffer(10)]],
+    constant int& cache_offset [[buffer(11)]],
+    constant float& inv_sqrt_d [[buffer(12)]],
+    constant int& quant_bits [[buffer(13)]],
+    uint2 tg_id [[threadgroup_position_in_grid]]
+) {
+    uint i = tg_id.x;
+    uint h = tg_id.y;
+    if (i >= uint(seq_len) || h >= uint(num_heads)) return;
+
+    int q_per_kv = num_heads / num_kv_heads;
+    int kv_head = h / q_per_kv;
+    int q_offset = (i * num_heads + h) * head_dim;
+    int abs_i = cache_offset + i;
+    int range_len = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+    float acc[256] = {0.0f};
+
+    // Load query locally
+    float local_q[256];
+    for (int d = 0; d < head_dim && d < 256; ++d) {
+        local_q[d] = q[q_offset + d];
+    }
+
+    for (int j = 0; j < range_len; ++j) {
+        float score = 0.0f;
+        float scale_k = k_scales[j * num_kv_heads + kv_head];
+        
+        if (quant_bits == 8) {
+            int k_row_offset = (j * num_kv_heads + kv_head) * head_dim;
+            for (int d = 0; d < head_dim && d < 256; ++d) {
+                float k_val = (((float)((int)k_tensor[k_row_offset + d]) - 128.0f) / 127.0f) * scale_k;
+                score += local_q[d] * k_val;
+            }
+        } else {
+            int k_row_offset = ((j * num_kv_heads + kv_head) * head_dim) / 2;
+            for (int d = 0; d < head_dim && d < 256; ++d) {
+                uchar byte = k_tensor[k_row_offset + d / 2];
+                float nib = (float)((d % 2 == 0) ? (byte & 0xF) : (byte >> 4));
+                float k_val = (nib - 8.0f) / 7.0f * scale_k;
+                score += local_q[d] * k_val;
+            }
+        }
+        score *= inv_sqrt_d;
+
+        float prev_max = running_max;
+        running_max = max(running_max, score);
+        float scale_prev = exp(prev_max - running_max);
+        float scale_score = exp(score - running_max);
+        running_sum = running_sum * scale_prev + scale_score;
+
+        float scale_v = v_scales[j * num_kv_heads + kv_head];
+        if (quant_bits == 8) {
+            int v_row_offset = (j * num_kv_heads + kv_head) * head_dim;
+            for (int d = 0; d < head_dim && d < 256; ++d) {
+                float v_val = (((float)((int)v_tensor[v_row_offset + d]) - 128.0f) / 127.0f) * scale_v;
+                acc[d] = acc[d] * scale_prev + scale_score * v_val;
+            }
+        } else {
+            int v_row_offset = ((j * num_kv_heads + kv_head) * head_dim) / 2;
+            for (int d = 0; d < head_dim && d < 256; ++d) {
+                uchar byte = v_tensor[v_row_offset + d / 2];
+                float nib = (float)((d % 2 == 0) ? (byte & 0xF) : (byte >> 4));
+                float v_val = (nib - 8.0f) / 7.0f * scale_v;
+                acc[d] = acc[d] * scale_prev + scale_score * v_val;
+            }
+        }
+    }
+
+    float inv_sum = running_sum > 0.0f ? (1.0f / running_sum) : 1.0f;
+    for (int d = 0; d < head_dim && d < 256; ++d) {
+        out[q_offset + d] = acc[d] * inv_sum;
+    }
+}
+

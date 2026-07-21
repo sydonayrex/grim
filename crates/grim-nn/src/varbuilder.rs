@@ -218,7 +218,7 @@ fn materialize_metal(
     device: &Device,
     ordinal: usize,
 ) -> Result<Tensor> {
-    let dev = MetalDevice::new(ordinal);
+    let dev = MetalDevice::try_new(ordinal)?;
     let storage = BackendDevice::from_cpu(&dev, &f32s, &shape, DType::F32)?;
     Ok(Tensor::new(
         Arc::from(storage),
