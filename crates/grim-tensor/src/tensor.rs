@@ -78,3 +78,15 @@ impl Tensor {
         }
     }
 }
+
+/// Debug formatting implementation displaying tensor layout shape, dtype, and device location.
+impl std::fmt::Debug for Tensor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tensor")
+            .field("shape", &self.layout)
+            .field("dtype", &self.dtype)
+            .field("device", &self.device)
+            .finish()
+    }
+}
+

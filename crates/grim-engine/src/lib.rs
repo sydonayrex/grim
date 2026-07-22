@@ -14,6 +14,7 @@
 //! running request through the speculative wrapper.
 
 pub mod model_loader;
+pub mod streaming_forward;
 
 use std::collections::HashMap;
 use std::sync::Arc;

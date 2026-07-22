@@ -12,6 +12,7 @@ mod doctor;
 mod oxidizer;
 mod client;
 mod catalog;
+mod train;
 
 /// Grim inference engine CLI.
 #[derive(Parser)]
@@ -133,6 +134,30 @@ enum Commands {
     },
     /// Quantize a model.
     Quantize,
+    /// Train / fine-tune LoRA adapters on a dataset (SFT QLoRA).
+    Train {
+        /// Base model path or catalog name.
+        #[arg(short, long)]
+        model: String,
+        /// Dataset path.
+        #[arg(short, long)]
+        dataset: String,
+        /// Output .grim.train sidecar path.
+        #[arg(short, long, default_value = "adapter.grim.train")]
+        output: String,
+        /// Number of training epochs.
+        #[arg(long, default_value_t = 3)]
+        epochs: usize,
+        /// Learning rate.
+        #[arg(long, default_value_t = 2e-4)]
+        lr: f32,
+        /// LoRA rank.
+        #[arg(long, default_value_t = 16)]
+        rank: usize,
+        /// LoRA alpha.
+        #[arg(long, default_value_t = 32.0)]
+        alpha: f32,
+    },
     /// Convert a model file to ROCm-optimized .grim format using Oxidizer.
     /// Supports GGUF (.gguf), GGML (.ggml), safetensors (.safetensors), and PyTorch (.bin).
     Convert {
@@ -541,6 +566,21 @@ async fn main() -> Result<()> {
         }
         Commands::Quantize => {
             println!("Quantize command — not yet implemented (phase 2).");
+        }
+        Commands::Train { model, dataset, output, epochs, lr, rank, alpha } => {
+            let opts = train::TrainOptions {
+                model_path: model,
+                dataset_path: dataset,
+                output_sidecar: output,
+                epochs,
+                lr,
+                rank,
+                alpha,
+            };
+            if let Err(e) = train::cmd_train(opts) {
+                eprintln!("[grim train] Failed: {e}");
+                std::process::exit(1);
+            }
         }
         Commands::Spec { subcommand } => match subcommand {
             SpecCommands::Train { target, output, dataset } => {
