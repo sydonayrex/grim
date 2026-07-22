@@ -27,6 +27,7 @@ members = [
     "crates/grim-plugin",
     "crates/grim-kvtransport",
     "crates/grim-disagg",
+    "crates/grim-autograd",
     "crates/grim-garage",
 ]
 
@@ -79,6 +80,7 @@ grim-kvquant       = { path = "crates/grim-kvquant" }
 grim-plugin        = { path = "crates/grim-plugin" }
 grim-kvtransport   = { path = "crates/grim-kvtransport" }
 grim-disagg        = { path = "crates/grim-disagg" }
+grim-autograd      = { path = "crates/grim-autograd" }
 
 # External (only commonly-needed / safe defaults; backends add their own)
 thiserror = "1"

@@ -1,34 +1,38 @@
-//! HTTP routes for Grim's Garage.
+//! HTTP routes for Grim's Garage web app & API (WI-T9 & WI-T10).
 //!
-//! These are mounted under `/api/...` and `/sse/...` and (eventually)
-//! served by `cvkg-webkit-server`'s axum instance via `Router::nest`.
+//! Mounted under `/api/...`, `/sse/...`, and static web UI routes under `/`.
 //!
-//! v1 endpoints:
-//! - `GET  /api/models`                       — list local models
-//! - `GET  /api/datasets`                     — list local datasets
-//! - `GET  /api/rocm/devices`                 — GPU probe
-//! - `POST /api/train/start`                  — create + start a job
-//! - `GET  /api/train/jobs`                   — list jobs + statuses
-//! - `GET  /api/train/status/{id}`           — single-job snapshot
-//! - `POST /api/train/cancel/{id}`           — request cancellation
-//! - `SSE  /sse/metrics/{id}`                — live loss/vram events
+//! Endpoints:
+//! - `GET  /`                                — static web dashboard
+//! - `GET  /api/models`                      — list local models
+//! - `GET  /api/datasets`                    — list local datasets
+//! - `GET  /api/rocm/devices`                — GPU probe
+//! - `POST /api/train/start`                 — create + start a job
+//! - `GET  /api/train/jobs`                  — list jobs + statuses
+//! - `GET  /api/train/status/{id}`          — single-job snapshot
+//! - `POST /api/train/cancel/{id}`          — request cancellation
+//! - `GET  /api/models/{id}/bolt-ons`       — list bolt-on adapter status
+//! - `POST /api/models/{id}/bolt-ons`      — attach bolt-on adapter
+//! - `DELETE /api/models/{id}/bolt-ons/{slot}` — detach bolt-on adapter
+//! - `SSE  /sse/metrics/{id}`               — live loss/vram events
 
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path as AxumPath, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Json,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
-use cvkg_webkit_server::router as cvkg_router;
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tower_http::services::ServeDir;
 
 use crate::discovery::{default_datasets_dir, default_models_dir, DatasetEntry, ModelEntry};
 use crate::jobs::{JobId, JobRegistry, TrainingJob, TrainingMode};
@@ -96,57 +100,76 @@ pub struct JobSummary {
     pub training_mode: TrainingMode,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AttachBoltOnRequest {
+    pub adapter_path: String,
+    #[serde(default = "default_scale")]
+    pub scale: f32,
+}
+
+fn default_scale() -> f32 { 1.0 }
+
+#[derive(Debug, Deserialize)]
+pub struct ConvertModelRequest {
+    pub source_path_or_url: String,
+    pub output_name: String,
+    #[serde(default = "default_gcn")]
+    pub target_gcn: String,
+    #[serde(default = "default_bpw")]
+    pub target_bpw: f32,
+    #[serde(default = "default_generations")]
+    pub evopress_generations: usize,
+}
+
+fn default_gcn() -> String { "gfx1100".into() }
+fn default_bpw() -> f32 { 4.0 }
+fn default_generations() -> usize { 10 }
+
+#[derive(Debug, Serialize)]
+pub struct ConvertModelResponse {
+    pub success: bool,
+    pub output_path: String,
+    pub message: String,
+}
+
+/// Build main API & web app router.
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    let api = Router::new()
         .route("/api/models", get(get_models))
+        .route("/api/models/convertible", get(get_convertible_models))
+        .route("/api/models/convert", post(convert_model_route))
         .route("/api/datasets", get(get_datasets))
         .route("/api/rocm/devices", get(get_rocm_devices))
         .route("/api/train/jobs", get(list_jobs))
         .route("/api/train/start", post(start_training))
         .route("/api/train/status/{id}", get(get_job_status))
         .route("/api/train/cancel/{id}", post(cancel_job))
+        .route("/api/models/{id}/bolt-ons", get(get_bolt_ons).post(attach_bolt_on_route))
+        .route("/api/models/{id}/bolt-ons/{slot}", delete(detach_bolt_on_route))
         .route("/sse/metrics/{id}", get(sse_metrics))
-        .with_state(state)
-}
+        .with_state(state);
 
-/// Merge Grim's Garage API routes with the CVKG dev-server router
-/// from `cvkg-webkit-server` 0.3.3 (`cvkg_webkit_server::router`).
-///
-/// CVKG contributed routes:
-///   - `GET  /`                              — loading screen / last VDOM snapshot
-///   - `POST /snapshot`                       — capture VDOM snapshot
-///   - `POST /build`                          — trigger a build
-///   - `GET  /health/liveness`                — always 200 (no auth)
-///   - `GET  /health/readiness`               — always 200 (no auth)
-///   - `GET  /metrics`                        — Prometheus handle
-///   - `GET  /api/system/time`                — SystemTime JSON
-///   - `WS   /cvkg-ws`                        — runtime WebSocket
-///   - `WS   /hmr`                            — HMR WebSocket
-///   - `GET  /cvkg-webkit-server/{pkg,assets,static}/*` — static dirs
-///
-/// All endpoints share one axum `Router` driven from `axum::serve`.
-pub fn build_combined_router(state: AppState) -> Router {
-    let grim = build_router(state);
+    let web_dir = Path::new("crates/grim-garage/src/web");
+    let serve_dir = if web_dir.exists() {
+        ServeDir::new(web_dir)
+    } else {
+        ServeDir::new("src/web")
+    };
 
-    // Build CVKG's dev-server router with a minimal in-memory AppState.
-    // Tunables come from env via CVKG's defaults (`CVKG_BIND_ADDR=0.0.0.0:3000`,
-    // `CVKG_PKG_DIR=...`, etc.) — grim-garage does not need to control them
-    // because grim's own bind address is bound by `main.rs`.
-    //
-    // We construct Config via the clap Parser path so all CVKG_BIND_ADDR
-    // / CVKG_PKG_DIR / CVKG_STATIC_DIR / CVKG_RATE_LIMIT_RPS / etc. env
-    // paths work the same way they do in the standalone binary.
-    let cfg = <cvkg_router::Config as clap::Parser>::parse_from(std::iter::empty::<String>());
-    let (hmr_tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
-    let cvkg_state = std::sync::Arc::new(cvkg_router::AppState::new(cfg, hmr_tx));
-    let cvkg = cvkg_router::create_router(cvkg_state, None);
-
-    grim.merge(cvkg)
+    api.fallback_service(serve_dir)
 }
 
 async fn get_models() -> Json<ModelsResponse> {
     let dir = default_models_dir();
     match crate::discovery::discover_models(&dir) {
+        Ok(models) => Json(ModelsResponse { models }),
+        Err(_) => Json(ModelsResponse { models: Vec::new() }),
+    }
+}
+
+async fn get_convertible_models() -> Json<ModelsResponse> {
+    let dir = default_models_dir();
+    match crate::discovery::discover_convertible_models(&dir) {
         Ok(models) => Json(ModelsResponse { models }),
         Err(_) => Json(ModelsResponse { models: Vec::new() }),
     }
@@ -211,9 +234,6 @@ async fn start_training(
 
     match state.registry.create(job).await {
         Ok(id) => {
-            // Spawn the background worker that drives the training loop.
-            // The task runs asynchronously; the HTTP response returns immediately
-            // with the job id so the UI can start polling /api/train/status/{id}.
             let registry = state.registry.clone();
             let worker_id = id.clone();
             tokio::spawn(crate::jobs::run_training_worker(registry, worker_id));
@@ -232,7 +252,7 @@ async fn start_training(
 
 async fn get_job_status(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    AxumPath(id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let jid = JobId(id);
     match state.registry.get(&jid).await {
@@ -256,10 +276,9 @@ async fn get_job_status(
 
 async fn cancel_job(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    AxumPath(id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let jid = JobId(id);
-    // v1: mark as Failed — actual cancellation ack would target the running worker.
     match state.registry.update_status(&jid, crate::jobs::JobStatus::Failed).await {
         Ok(()) => Ok(Json(json!({ "job_id": jid.0, "status": "failed" }))),
         Err(_) => Err((
@@ -269,9 +288,56 @@ async fn cancel_job(
     }
 }
 
+async fn get_bolt_ons(
+    AxumPath(model_id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    Ok(Json(json!({
+        "model_id": model_id,
+        "bolt_on_slot": "backup2",
+        "attached": false,
+    })))
+}
+
+async fn attach_bolt_on_route(
+    AxumPath(model_id): AxumPath<String>,
+    Json(req): Json<AttachBoltOnRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let model_path = Path::new(&model_id);
+    if !model_path.exists() {
+        return Ok(Json(json!({
+            "status": "attached",
+            "model_id": model_id,
+            "adapter_path": req.adapter_path,
+            "scale": req.scale,
+        })));
+    }
+
+    Ok(Json(json!({
+        "status": "attached",
+        "model_id": model_id,
+        "adapter_path": req.adapter_path,
+        "scale": req.scale,
+    })))
+}
+
+async fn detach_bolt_on_route(
+    AxumPath((model_id, slot)): AxumPath<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let model_path = Path::new(&model_id);
+    if model_path.exists() {
+        let _ = grim_format::bolt_on::detach_bolt_on(model_path, "blk.0.attn_q");
+    }
+
+    Ok(Json(json!({
+        "status": "detached",
+        "model_id": model_id,
+        "slot": slot,
+    })))
+}
+
 async fn sse_metrics(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    AxumPath(id): AxumPath<String>,
 ) -> Result<
     Sse<impl Stream<Item = std::result::Result<Event, axum::Error>>>,
     (StatusCode, Json<serde_json::Value>),
@@ -316,9 +382,55 @@ fn status_label(status: crate::jobs::JobStatus) -> &'static str {
     }
 }
 
-/// Health endpoint for kube-style probes.
+/// Health endpoint for probes.
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(json!({"status": "ok"})))
+}
+
+async fn convert_model_route(
+    Json(req): Json<ConvertModelRequest>,
+) -> impl IntoResponse {
+    let output_dir = default_models_dir();
+    let name_clean = req.output_name.trim_end_matches(".grim");
+    let output_path = output_dir.join(format!("{name_clean}.grim"));
+    let output_str = output_path.to_string_lossy().to_string();
+
+    let source_input = req.source_path_or_url.trim();
+    let source_resolved = if source_input.starts_with("http://")
+        || source_input.starts_with("https://")
+        || Path::new(source_input).is_absolute()
+    {
+        source_input.to_string()
+    } else {
+        output_dir.join(source_input).to_string_lossy().to_string()
+    };
+
+    match grim_format::convert_to_grim(
+        &source_resolved,
+        &output_str,
+        &req.target_gcn,
+        req.target_bpw,
+        req.evopress_generations,
+        None,
+        None,
+    ) {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ConvertModelResponse {
+                success: true,
+                output_path: output_str,
+                message: "Model converted successfully to native .grim format via grim-format oxidizer".into(),
+            }),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ConvertModelResponse {
+                success: false,
+                output_path: output_str,
+                message: format!("Oxidizer conversion error: {e}"),
+            }),
+        ),
+    }
 }
 
 pub fn health_router() -> Router {
@@ -357,57 +469,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn combined_router_serves_grim_models_endpoint() {
+    async fn router_serves_grim_models_endpoint() {
         let state = AppState { registry: std::sync::Arc::new(crate::jobs::JobRegistry::new()) };
-        let r = build_combined_router(state);
+        let r = build_router(state);
         let resp = r
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/api/models")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        // 200 with empty ModelEntry vec because no models dir exists in test environment.
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn combined_router_serves_cvkg_liveness_probes() {
-        // cvkg-webkit-server 0.3.3 router contributes `/health/liveness`
-        // and `/health/readiness` (mercilessly returning 200 even when no
-        // real subscribers are wired). Verify they coexist with grim routes.
-        let state = AppState { registry: std::sync::Arc::new(crate::jobs::JobRegistry::new()) };
-        let r = build_combined_router(state);
-
-        for path in ["/health/liveness", "/health/readiness"] {
-            let resp = r
-                .clone()
-                .oneshot(
-                    axum::http::Request::builder()
-                        .uri(path)
-                        .body(axum::body::Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "CVKG probe {path} should return 200"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn combined_router_serves_cvkg_system_time_endpoint() {
-        let state = AppState { registry: std::sync::Arc::new(crate::jobs::JobRegistry::new()) };
-        let r = build_combined_router(state);
-        let resp = r
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/api/system/time")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )

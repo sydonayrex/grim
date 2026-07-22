@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AMD ROCm Hardware Acceleration Explained — GRIM Docs</title>
+  <link rel="stylesheet" href="/app.css">
+  <style>
+    body { padding: 40px; max-width: 900px; margin: 0 auto; }
+    h1 { font-size: 28px; margin-bottom: 16px; color: var(--primary); }
+    h2 { font-size: 20px; margin-top: 24px; margin-bottom: 12px; }
+    p, li { font-size: 15px; line-height: 1.7; color: var(--text-main); margin-bottom: 12px; }
+    code { background: var(--bg-card); padding: 2px 6px; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 13px; }
+    .back-btn { display: inline-block; margin-bottom: 24px; color: var(--primary); text-decoration: none; font-weight: 600; }
+  </style>
+</head>
+<body class="dark-theme">
+  <a href="/" class="back-btn">← Back to Grim's Garage Dashboard</a>
+  <h1>🎮 AMD ROCm Hardware Acceleration Explained</h1>
+  
+  <p>GRIM is built from the ground up to leverage <strong>AMD ROCm HIP (Heterogeneous-computing Interface for Portability)</strong> for high-throughput GPU inference and QLoRA fine-tuning.</p>
+  
+  <h2>Architecture Features</h2>
+  <ul>
+    <li><strong>WMMA & MFMA Acceleration:</strong> Employs Wave Matrix Multiply Accumulate (RDNA3) and Matrix Fused Multiply Add (CDNA) hardware matrix cores for GEMM operations.</li>
+    <li><strong>Fused Dequantization GEMM Kernels:</strong> <code>grim_fused_dequant_backward_gemm_f16</code> dequantizes weights on-the-fly inside GPU vector registers, eliminating unnecessary VRAM allocations.</li>
+    <li><strong>Wavefront Execution:</strong> Supports Wave32 (RDNA architecture) and Wave64 (CDNA architecture) warp execution profiles.</li>
+  </ul>
+</body>
+</html>

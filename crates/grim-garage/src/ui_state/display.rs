@@ -117,10 +117,15 @@ mod tests {
         }]);
         s.set_devices(vec![RocmDeviceInfo {
             ordinal: 0,
+            name: "AMD Radeon RX 7900 XTX".into(),
             gcn_arch: "gfx1100".into(),
             vram_bytes: 16 * 1024 * 1024 * 1024,
             wavefront_size: 32,
+            wmma_supported: true,
+            mfma_supported: false,
             xnack_enabled: false,
+            compute_units: 84,
+            max_threads_per_block: 1024,
         }]);
         s.upsert_job(UiJob {
             job_id: "abc".into(),

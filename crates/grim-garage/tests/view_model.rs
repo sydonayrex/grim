@@ -82,10 +82,15 @@ fn rocm_toggles_reflect_state_when_devices_present() {
     let mut s = DisplayState::new();
     s.set_devices(vec![grim_garage::RocmDeviceInfo {
         ordinal: 0,
+        name: "AMD Instinct MI300X".into(),
         gcn_arch: "gfx942".into(), // MI300X — CDNA3, W64
         vram_bytes: 192 * 1024 * 1024 * 1024,
         wavefront_size: 64,
+        wmma_supported: true,
+        mfma_supported: true,
         xnack_enabled: true,
+        compute_units: 304,
+        max_threads_per_block: 1024,
     }]);
     let panel = RocmTogglesV1::default_for(&s);
     // MI300X should auto-enable waves-per-eu since RDNA-style is irrelevant.

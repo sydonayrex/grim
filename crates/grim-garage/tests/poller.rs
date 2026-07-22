@@ -27,7 +27,7 @@ async fn spawn_combined_router() -> SocketAddr {
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
         let state = AppState { registry: Arc::new(JobRegistry::new()) };
-        let router = routes::build_combined_router(state);
+        let router = routes::build_router(state);
         let _ = axum::serve(listener, router).await;
     });
     addr
