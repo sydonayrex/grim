@@ -261,25 +261,55 @@ fn load_model_with_providers(
 
 /// Convenience wrapper: detect the best available device and load a GGUF or GRIM model.
 ///
-/// Device priority: ROCm → CUDA → CPU.  This is the entry point called by
+/// Device priority: ROCm → CUDA → Metal → CPU.  This is the entry point called by
 /// `grim-server`'s on-demand model loader so callers don't need to manage
 /// device selection themselves.
 pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
     let is_grim = path.ends_with(".grim");
 
-    // Attempt ROCm first (AMD GPU — primary grim target).
-    if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
-        if let Some(first) = rocm_devices.first() {
-            eprintln!("[model_loader] Using ROCm device {}", first.ordinal());
-            let dev = Device::Rocm(first.ordinal());
-            return if is_grim {
-                load_model_from_grim(path, dev)
-            } else {
-                load_model_from_gguf(path, dev)
-            };
+    // Check for forced device first
+    if let Ok(s) = std::env::var("GRIM_FORCE_DEVICE") {
+        match s.as_str() {
+            "cuda" => {
+                if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
+                    if let Some(first) = cuda_devices.first() {
+                        eprintln!("[model_loader] Using CUDA device {} (forced)", first.ordinal());
+                        let dev = Device::Cuda(first.ordinal());
+                        return if is_grim {
+                            load_model_from_grim(path, dev)
+                        } else {
+                            load_model_from_gguf(path, dev)
+                        };
+                    }
+                }
+            }
+            "rocm" => {
+                if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
+                    if let Some(first) = rocm_devices.first() {
+                        eprintln!("[model_loader] Using ROCm device {} (forced)", first.ordinal());
+                        let dev = Device::Rocm(first.ordinal());
+                        return if is_grim {
+                            load_model_from_grim(path, dev)
+                        } else {
+                            load_model_from_gguf(path, dev)
+                        };
+                    }
+                }
+            }
+            "cpu" => {
+                eprintln!("[model_loader] Using CPU (forced)");
+                let dev = Device::Cpu;
+                return if is_grim {
+                    load_model_from_grim(path, dev)
+                } else {
+                    load_model_from_gguf(path, dev)
+                };
+            }
+            _ => {}
         }
     }
-    // Fall back to CUDA.
+
+    // Attempt ROCm first (AMD GPU — primary grim target).
     if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
         if let Some(first) = cuda_devices.first() {
             eprintln!("[model_loader] Using CUDA device {}", first.ordinal());

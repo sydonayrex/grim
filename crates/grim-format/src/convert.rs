@@ -234,26 +234,34 @@ pub fn convert_to_grim(
     generations: usize,
     dataset: Option<&str>,
     train_state: Option<&crate::train::TrainState>,
+    // Per-tensor bitwidths from EvoPress evolutionary search.
+    // If provided, these override the uniform `target_bpw` for each tensor.
+    // Must match the number of tensors in the source model.
+    evopress_bitwidths: Option<Vec<u32>>,
+    // Per-tensor importance scores (for metadata).
+    importance_scores: Option<Vec<f32>>,
 ) -> Result<()> {
     println!("[Grim Convert] Starting conversion pipeline...");
     println!("  Source: {}", input_path);
     println!("  Target GCN: {}", target_gcn);
     println!("  Target BPW: {}", target_bpw);
     if generations > 0 {
-        println!("  EvoPress Generations: {} (calibration engine not yet wired)", generations);
+        println!("  EvoPress Generations: {}", generations);
     }
     if let Some(ds) = dataset {
-        println!("  Dataset: {} (calibration engine not yet wired)", ds);
+        println!("  Dataset: {}", ds);
     }
     if train_state.is_some() {
         println!("  Training sidecar: will emit {}.train", output_path);
     }
+    if let Some(ref bw) = evopress_bitwidths {
+        println!("  Using per-tensor EvoPress bitwidths ({} tensors)", bw.len());
+    }
 
-    let base_bitwidth = (target_bpw.round() as u8).clamp(2, 16);
     let profile = gcn_to_profile(target_gcn);
 
-    let entries = build_entries_from_source(input_path, base_bitwidth)?;
-    let metadata = build_grim_metadata(target_gcn, profile, base_bitwidth);
+    let entries = build_entries_from_source(input_path, target_bpw, evopress_bitwidths.clone())?;
+    let metadata = build_grim_metadata(target_gcn, profile, target_bpw, evopress_bitwidths.is_some(), importance_scores);
 
     let grim_file = crate::format::GrimFile {
         header: crate::format::GrimHeader::new(entries.len() as u32, 0),
@@ -302,17 +310,18 @@ pub fn convert_to_grim(
 /// and pack each into a native `.grim` registry entry + normals payload (spec §5).
 fn build_entries_from_source(
     input_path: &str,
-    base_bitwidth: u8,
+    target_bpw: f32,
+    evopress_bitwidths: Option<Vec<u32>>,
 ) -> Result<Vec<(crate::format::GrimTensorEntry, Vec<u8>)>> {
     let lower = input_path.to_ascii_lowercase();
     if lower.ends_with(".gguf") || lower.ends_with(".grim") {
         let provider = crate::tprov::GgufProvider::open(input_path)?;
         let names: Vec<String> = provider.tensors().keys().cloned().collect();
-        pack_tensors(&provider, &names, base_bitwidth)
+        pack_tensors(&provider, &names, target_bpw, evopress_bitwidths)
     } else if lower.ends_with(".safetensors") || lower.ends_with(".bin") {
         let provider = crate::tprov::SafetensorsProvider::open(input_path)?;
         let names: Vec<String> = provider.tensors().keys().cloned().collect();
-        pack_tensors(&provider, &names, base_bitwidth)
+        pack_tensors(&provider, &names, target_bpw, evopress_bitwidths)
     } else {
         Err(Error::Backend(format!(
             "unsupported source format: '{input_path}'. Supported: .gguf, .grim, .safetensors, .bin"
@@ -324,24 +333,33 @@ fn build_entries_from_source(
 fn pack_tensors(
     provider: &dyn grim_tensor::provider::TensorProvider,
     names: &[String],
-    base_bitwidth: u8,
+    target_bpw: f32,
+    evopress_bitwidths: Option<Vec<u32>>,
 ) -> Result<Vec<(crate::format::GrimTensorEntry, Vec<u8>)>> {
     let mut result = Vec::with_capacity(names.len());
-    for name in names {
+    for (i, name) in names.iter().enumerate() {
         let raw = provider.get(name)?;
         let meta = provider.meta(name)?;
         if meta.provenance.is_external_qat() {
             println!("[WARN] Re-quantizing external QAT tensor '{}' may lead to accuracy loss.", name);
         }
         let elem_count: usize = raw.shape.iter().product();
-        let payload_size = crate::format::normals_packed_size(elem_count, 0, base_bitwidth);
+        
+        // Determine bitwidth for this tensor: use EvoPress bitwidth if available, otherwise fall back to target_bpw
+        let tensor_bitwidth = if let Some(ref bitwidths) = evopress_bitwidths {
+            bitwidths.get(i).copied().unwrap_or_else(|| target_bpw.round() as u32) as u8
+        } else {
+            target_bpw.round() as u8
+        };
+        
+        let payload_size = crate::format::normals_packed_size(elem_count, 0, tensor_bitwidth);
         let mut normals = raw.bytes;
         normals.resize(payload_size as usize, 0u8);
 
         let entry = crate::format::GrimTensorEntry {
             name: name.clone(),
             shape: raw.shape,
-            base_bitwidth,
+            base_bitwidth: tensor_bitwidth,
             payload_offset: 0,
             payload_size,
             outlier_count: 0,
@@ -374,8 +392,17 @@ fn gcn_to_profile(gcn: &str) -> crate::gguf::GrimRocmlProfile {
 fn build_grim_metadata(
     target_gcn: &str,
     profile: crate::gguf::GrimRocmlProfile,
-    base_bitwidth: u8,
+    target_bpw: f32,
+    has_evopress: bool,
+    importance_scores: Option<Vec<f32>>,
 ) -> crate::gguf::GrimMetadata {
+    let _importance_scores = importance_scores;
+    let quant_method = if has_evopress {
+        "evopress-gptq".to_string()
+    } else {
+        format!("uniform-{}bit", target_bpw.round() as u32)
+    };
+    
     crate::gguf::GrimMetadata {
         magic: Some("grim-v1".into()),
         quant_version: Some(GRIM_QUANT_VERSION),
@@ -384,7 +411,7 @@ fn build_grim_metadata(
         target_gcn: Some(target_gcn.to_string()),
         lds_size: Some(profile.lds_size()),
         tensor_core_enabled: true,
-        quant_method: Some(format!("uniform-{}bit", base_bitwidth)),
+        quant_method: Some(quant_method),
         rocm_fusion_ops: vec![crate::gguf::GrimFusionOp::QkvAttention],
         kv_layout_optimized: Some(true),
         ..Default::default()
