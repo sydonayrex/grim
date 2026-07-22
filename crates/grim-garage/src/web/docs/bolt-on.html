@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>What are Bolt-On Sidecar Adapters? — GRIM Docs</title>
+  <link rel="stylesheet" href="/app.css">
+  <style>
+    body { padding: 40px; max-width: 900px; margin: 0 auto; }
+    h1 { font-size: 28px; margin-bottom: 16px; color: var(--primary); }
+    h2 { font-size: 20px; margin-top: 24px; margin-bottom: 12px; }
+    p, li { font-size: 15px; line-height: 1.7; color: var(--text-main); margin-bottom: 12px; }
+    code { background: var(--bg-card); padding: 2px 6px; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 13px; }
+    .back-btn { display: inline-block; margin-bottom: 24px; color: var(--primary); text-decoration: none; font-weight: 600; }
+  </style>
+</head>
+<body class="dark-theme">
+  <a href="/" class="back-btn">← Back to Grim's Garage Dashboard</a>
+  <h1>⚡ What are Bolt-On Sidecar Adapters?</h1>
+  
+  <p>In GRIM, <strong>Bolt-On Adapters</strong> allow attaching and detaching fine-tuned LoRA weights directly into model files in-place using the <code>backup2</code> residual slot without rewriting or duplicating base model weights.</p>
+  
+  <h2>Why Bolt-On Adapters?</h2>
+  <ul>
+    <li><strong>Zero Model Duplication:</strong> Swap specialized domain adapters (coding, medical, roleplay) instantly onto a single base model file.</li>
+    <li><strong>Reversible Detach:</strong> Detaching a bolt-on adapter zero-fills the <code>backup2</code> residual slot without altering file structure or metadata shape.</li>
+    <li><strong>Sidecar File Format:</strong> Training outputs are saved as lightweight <code>.grim.train</code> sidecar files containing adapter matrices and AdamW moments.</li>
+  </ul>
+</body>
+</html>

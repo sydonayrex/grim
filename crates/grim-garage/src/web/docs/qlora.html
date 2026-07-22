@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Beginner's Guide to QLoRA Fine-Tuning — GRIM Docs</title>
+  <link rel="stylesheet" href="/app.css">
+  <style>
+    body { padding: 40px; max-width: 900px; margin: 0 auto; }
+    h1 { font-size: 28px; margin-bottom: 16px; color: var(--primary); }
+    h2 { font-size: 20px; margin-top: 24px; margin-bottom: 12px; }
+    p, li { font-size: 15px; line-height: 1.7; color: var(--text-main); margin-bottom: 12px; }
+    code { background: var(--bg-card); padding: 2px 6px; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 13px; }
+    .back-btn { display: inline-block; margin-bottom: 24px; color: var(--primary); text-decoration: none; font-weight: 600; }
+  </style>
+</head>
+<body class="dark-theme">
+  <a href="/" class="back-btn">← Back to Grim's Garage Dashboard</a>
+  <h1>📖 Beginner's Guide to QLoRA Fine-Tuning</h1>
+  
+  <p><strong>QLoRA (Quantized Low-Rank Adaptation)</strong> is a revolutionary fine-tuning technique that enables training massive foundation models (like Qwen, Nemotron, GLM, or Gemini) on standard consumer GPUs with minimal memory usage.</p>
+  
+  <h2>Key Concepts</h2>
+  <ul>
+    <li><strong>Frozen 4-Bit Base Model:</strong> The base model weights remain 100% frozen on disk or memory in 4-bit NormalFloat (NF4) format. Base weights are never updated during backpropagation.</li>
+    <li><strong>Trainable Adapter Matrices (A & B):</strong> Low-rank decomposition matrices ($W = W_0 + \frac{\alpha}{r} B \cdot A$) are injected alongside attention and MLP linear projections. Only parameters in $A$ and $B$ receive gradients.</li>
+    <li><strong>Zero-Copy Memory Stream:</strong> GRIM streams base weights lazily from disk per transformer block, running just-in-time dequantization directly inside ROCm HIP registers.</li>
+  </ul>
+
+  <h2>Memory Comparison</h2>
+  <p>Full 16-bit fine-tuning of an 8B model requires over <strong>64 GB VRAM</strong>. QLoRA reduces peak memory footprint to under <strong>6 GB VRAM</strong> without degrading fine-tuning accuracy.</p>
+</body>
+</html>

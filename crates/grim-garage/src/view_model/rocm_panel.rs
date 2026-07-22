@@ -122,20 +122,30 @@ mod tests {
     fn cdna_device() -> RocmDeviceInfo {
         RocmDeviceInfo {
             ordinal: 0,
+            name: "AMD Instinct MI300X".into(),
             gcn_arch: "gfx942".into(),
             vram_bytes: 192 * 1024 * 1024 * 1024,
             wavefront_size: 64,
+            wmma_supported: true,
+            mfma_supported: true,
             xnack_enabled: true,
+            compute_units: 304,
+            max_threads_per_block: 1024,
         }
     }
 
     fn rdna_device() -> RocmDeviceInfo {
         RocmDeviceInfo {
             ordinal: 0,
+            name: "AMD Radeon RX 7900 XTX".into(),
             gcn_arch: "gfx1100".into(),
             vram_bytes: 16 * 1024 * 1024 * 1024,
             wavefront_size: 32,
+            wmma_supported: true,
+            mfma_supported: false,
             xnack_enabled: false,
+            compute_units: 84,
+            max_threads_per_block: 1024,
         }
     }
 

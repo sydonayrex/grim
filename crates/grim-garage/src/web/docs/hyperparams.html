@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hyperparameter Tuning 101 — GRIM Docs</title>
+  <link rel="stylesheet" href="/app.css">
+  <style>
+    body { padding: 40px; max-width: 900px; margin: 0 auto; }
+    h1 { font-size: 28px; margin-bottom: 16px; color: var(--primary); }
+    h2 { font-size: 20px; margin-top: 24px; margin-bottom: 12px; }
+    p, li { font-size: 15px; line-height: 1.7; color: var(--text-main); margin-bottom: 12px; }
+    code { background: var(--bg-card); padding: 2px 6px; border-radius: 4px; font-family: 'JetBrains Mono', monospace; font-size: 13px; }
+    .back-btn { display: inline-block; margin-bottom: 24px; color: var(--primary); text-decoration: none; font-weight: 600; }
+  </style>
+</head>
+<body class="dark-theme">
+  <a href="/" class="back-btn">← Back to Grim's Garage Dashboard</a>
+  <h1>💡 Hyperparameter Tuning 101: Rank, Alpha & Learning Rate</h1>
+  
+  <p>Understanding the key hyperparameters for fine-tuning LLMs with QLoRA:</p>
+  
+  <h2>1. LoRA Rank ($r$)</h2>
+  <p>Determines the inner dimension of the adapter matrices $A \in \mathbb{R}^{r \times d_{in}}$ and $B \in \mathbb{R}^{d_{out} \times r}$.</p>
+  <ul>
+    <li><strong>Rank 8–16:</strong> Ideal for style adaptations, domain vocabulary, or general instruction-following. Minimal VRAM overhead.</li>
+    <li><strong>Rank 32–64:</strong> Best for complex reasoning, code generation, or heavy domain adaptation. Uses moderately more VRAM.</li>
+  </ul>
+
+  <h2>2. LoRA Alpha ($\alpha$)</h2>
+  <p>Scaling factor applied to adapter gradient updates ($\Delta W = \frac{\alpha}{r} B \cdot A$).</p>
+  <ul>
+    <li>Standard rule of thumb: set <strong>$\alpha = 2 \times r$</strong> (e.g. Rank 16 $\rightarrow$ Alpha 32).</li>
+  </ul>
+
+  <h2>3. Learning Rate ($lr$)</h2>
+  <p>Step size for parameter updates. Standard QLoRA recommendation is <strong>0.0001 to 0.0003</strong> (1e-4 to 3e-4).</p>
+</body>
+</html>

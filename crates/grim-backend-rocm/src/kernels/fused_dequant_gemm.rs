@@ -103,6 +103,59 @@ extern "C" {
 
         C[row * stride_c + col] = (_Float16)acc;
     }
+
+    __global__ void grim_fused_dequant_backward_gemm_f16(
+        const _Float16* __restrict__ dY,
+        const unsigned char* __restrict__ B_codes,
+        const unsigned char* __restrict__ B_scales,
+        _Float16* __restrict__ dX,
+        int M, int N, int K,
+        int stride_dy, int stride_dx,
+        int default_bpw,
+        int outlier_count,
+        const unsigned int* __restrict__ outlier_indices,
+        const float* __restrict__ outlier_values,
+        int backup_bpw,
+        int backup_codes_offset,
+        int backup_scale_offset)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int total = M * K;
+        if (idx >= total) return;
+
+        const int row = idx / K;
+        const int k = idx % K;
+
+        float acc = 0.0f;
+        for (int col = 0; col < N; ++col) {
+            float dy_val = (float)dY[row * stride_dy + col];
+
+            float scale = 1.0f;
+            if (B_scales != nullptr) {
+                scale = (float)B_scales[col] / 255.0f;
+            }
+
+            float w_val = 0.0f;
+            int flat_weight_idx = col * K + k;
+            if (!find_outlier(flat_weight_idx, outlier_count, outlier_indices, outlier_values, w_val)) {
+                w_val = unpack_weight(B_codes, col, k, K, default_bpw) * scale;
+                if (backup_bpw > 0) {
+                    const unsigned char* backup_codes = B_codes + backup_codes_offset;
+                    float b_val = unpack_weight(backup_codes, col, k, K, backup_bpw);
+
+                    float b_scale = 1.0f;
+                    if (backup_scale_offset > 0) {
+                        b_scale = (float)B_codes[backup_scale_offset + col] / 255.0f;
+                    }
+                    w_val += b_val * b_scale;
+                }
+            }
+
+            acc += dy_val * w_val;
+        }
+
+        dX[row * stride_dx + k] = (_Float16)acc;
+    }
 }
 "#;
 
@@ -115,6 +168,10 @@ mod self_tests {
         assert!(
             KERNEL_SOURCE.contains("grim_fused_dequant_gemm_f16"),
             "Fused dequant GEMM entry must be JIT-discoverable by name"
+        );
+        assert!(
+            KERNEL_SOURCE.contains("grim_fused_dequant_backward_gemm_f16"),
+            "Fused dequant backward GEMM entry must be JIT-discoverable by name"
         );
     }
 }

@@ -455,6 +455,11 @@ impl Default for GrimMetadata {
 }
 
 impl GrimMetadata {
+    /// Retrieve per-tensor extension capabilities for a named tensor if present.
+    pub fn get_tensor_ext(&self, tensor_name: &str) -> Option<&crate::spec::GrimTensorExt> {
+        self.ext_entries.iter().find(|e| e.tensor_name == tensor_name)
+    }
+
     /// Build a `GrimMetadata` by scanning `metadata` for `grim.` keys.
     pub fn from_gguf_metadata(metadata: &HashMap<String, GgufValue>) -> Self {
         let magic = metadata.get("grim.magic").and_then(|v| v.as_str()).map(String::from);

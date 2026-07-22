@@ -1,13 +1,26 @@
-//! OKLCH design tokens for Grim's Garage.
+//! OKLCH design tokens for Grim's Garage (WI-T9).
 //!
-//! CVKG-themes provides the OKLCH foundation; this module wraps the
-//! `ThemeBuilder` with Grim's Garage-specific chunk choices so the
-//! entire UI surface consumes one consistent token set.
+//! Provides OKLCH color structures and theme tokens for CSS styling and layout configuration.
 
-use cvkg_themes::{OklchColor, Theme, ThemeBuilder};
+use serde::{Deserialize, Serialize};
 
-/// Pilot-blue OKLCH seed that anchors the whole theme. Glass tints and
-/// KPI cards derive from this base.
+/// OKLCH color token representation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OklchColor {
+    pub l: f32,
+    pub c: f32,
+    pub h: f32,
+    pub a: f32,
+}
+
+impl OklchColor {
+    /// Format as CSS `oklch(L C H / A)` string.
+    pub fn to_css(&self) -> String {
+        format!("oklch({:.2} {:.3} {:.1} / {:.2})", self.l, self.c, self.h, self.a)
+    }
+}
+
+/// Pilot-blue OKLCH seed that anchors the whole theme.
 pub const GARAGE_SEED_OKLCH: OklchColor = OklchColor {
     l: 0.62,
     c: 0.10,
@@ -15,13 +28,8 @@ pub const GARAGE_SEED_OKLCH: OklchColor = OklchColor {
     a: 1.0,
 };
 
-/// Default light theme used across Grim's Garage panels.
-pub fn grim_garage_default_theme() -> Theme {
-    ThemeBuilder::from_seed(GARAGE_SEED_OKLCH).build()
-}
-
-/// Plain glassmorphic surface token used by the sidebar / main shell / KPI cards.
-#[derive(Debug, Clone, Copy)]
+/// Plain surface token used by the sidebar / main shell / KPI cards.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GarageSurface {
     pub oklch: OklchColor,
 }
@@ -38,8 +46,8 @@ impl GarageSurface {
     };
 }
 
-/// Aggregate that the CVKG `View` implementors read from.
-#[derive(Debug, Clone, Copy)]
+/// Aggregate layout theme.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ThemingLayout {
     pub base_seed: OklchColor,
     pub sidebar: GarageSurface,
@@ -68,11 +76,6 @@ mod tests {
     #[test]
     fn garage_seed_lightness_in_oklch_perceptual_range() {
         assert!(GARAGE_SEED_OKLCH.l >= 0.0 && GARAGE_SEED_OKLCH.l <= 1.0);
-    }
-
-    #[test]
-    fn default_theme_builds_without_panic() {
-        let _theme = grim_garage_default_theme();
     }
 
     #[test]

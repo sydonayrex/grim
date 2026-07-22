@@ -9,6 +9,7 @@ pub mod format;
 pub mod spec;
 /// WI-R6: training-state `.grim.train` sidecar (adapters, optimizer, error matrix).
 pub mod train;
+pub mod bolt_on;
 
 pub use gguf::{
     GrimFusionOp, GrimLayoutHint, GrimMetadata, GrimQuantOverride, GrimRocmlProfile,

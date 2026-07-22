@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::Path;
 
 use grim_format::gguf::{GgufFile, GgufTensorInfo, GgufValue, GGUF_MAGIC, GGUF_VERSION};
-use grim_garage::discovery::{discover_datasets, discover_models, ModelEntry};
+use grim_garage::discovery::{discover_convertible_models, discover_datasets, discover_models, ModelEntry};
 use grim_garage::jobs::{JobId, JobRegistry, JobStatus, Metric, TrainingJob, TrainingMode};
 use grim_garage::rocm::{probe_rocm_devices, RocmDeviceInfo};
 use tempfile::tempdir;
@@ -86,12 +86,12 @@ fn write_minimal_gguf(path: &Path, tensor_name: &str, payload_bytes: Vec<u8>) {
 // ----- discover_models -----
 
 #[test]
-fn discover_models_finds_gguf_in_directory() {
+fn discover_convertible_models_finds_gguf_in_directory() {
     let dir = tempdir().unwrap();
     let model_path = dir.path().join("tiny.gguf");
     write_minimal_gguf(&model_path, "blk.0.w", vec![0u8; 16]);
 
-    let models = discover_models(dir.path()).expect("discover");
+    let models = discover_convertible_models(dir.path()).expect("discover");
     assert_eq!(models.len(), 1);
     let m = &models[0];
     assert_eq!(m.id, "tiny.gguf");
@@ -273,10 +273,15 @@ fn job_metrics_append_and_read_back() {
 fn roc_mdevice_info_serializes_name_fields() {
     let info = RocmDeviceInfo {
         ordinal: 0,
+        name: "AMD Radeon RX 7900 XTX".into(),
         gcn_arch: "gfx1100".into(),
         vram_bytes: 16 * 1024 * 1024 * 1024,
         wavefront_size: 32,
+        wmma_supported: true,
+        mfma_supported: false,
         xnack_enabled: false,
+        compute_units: 84,
+        max_threads_per_block: 1024,
     };
     assert_eq!(info.ordinal, 0);
     assert_eq!(info.wavefront_size, 32);
