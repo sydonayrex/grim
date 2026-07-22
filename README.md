@@ -77,7 +77,3 @@ GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --features rocm-aiter  # op
 
 - The workspace uses Thin LTO, single codegen unit in release profile (`Cargo.toml` lines 72–75).
 - Every dependency is pinned either via the `workspace.dependencies` table (internal crates) or directly (external crates like `thiserror = "1"`, `parking_lot = "0.12"`).
-
-## TODO: confirm with maintainer
-
-- No CHANGELOG, release-please config, or versioning convention exists in this repo; confirm semver or any other convention (per `old/doc.md` item 13 condition).
