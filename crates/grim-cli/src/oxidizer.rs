@@ -224,6 +224,18 @@ pub fn cmd_oxidizer_convert(
         })
         .collect::<Vec<usize>>();
     let bitwidths = cmd_oxidizer_search(&importance_scores, &tensor_sizes, target_bpw, generations);
+    eprintln!("[DEBUG] EvoPress bitwidths: {:?}", bitwidths);
+
+    // Create full bitwidths array for ALL tensors in the model
+    // Tensors with importance scores get their EvoPress bitwidth, others get target_bpw
+    let default_bw = target_bpw.round() as u32;
+    let full_bitwidths: Vec<u32> = names.iter().map(|name| {
+        if let Some(idx) = tensor_names.iter().position(|n| n == name) {
+            bitwidths[idx]
+        } else {
+            default_bw
+        }
+    }).collect();
 
     grim_meta.magic = Some("grim-v1".into());
     grim_meta.quant_version = Some(OXIDIZER_VERSION);
@@ -234,11 +246,11 @@ pub fn cmd_oxidizer_convert(
     grim_meta.lds_size = Some(grim_meta.rocml_profile.lds_size());
     grim_meta.quant_method = Some("evopress-gptq-sequential".into());
     grim_meta.calibration_dataset = calibration_dataset.clone();
-    grim_meta.quant_overrides = tensor_names
+    grim_meta.quant_overrides = names
         .iter()
         .enumerate()
         .map(|(i, name)| {
-            let bw = bitwidths.get(i).copied().unwrap_or(4);
+            let bw = full_bitwidths[i];
             let effective_bpw = if is_attention_projection(name) {
                 enforce_attention_precision(bw)
             } else {
@@ -268,6 +280,8 @@ pub fn cmd_oxidizer_convert(
         generations,
         calibration_dataset.as_deref(),
         None,
+        Some(full_bitwidths),
+        Some(importance_scores.layer_scores.clone()),
     ).map_err(|e| e.to_string())?;
     Ok(())
 }

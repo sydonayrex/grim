@@ -13,6 +13,7 @@ mod oxidizer;
 mod client;
 mod catalog;
 mod train;
+mod verify;
 
 /// Grim inference engine CLI.
 #[derive(Parser)]
@@ -61,6 +62,24 @@ enum Commands {
         /// conversion exists; it never forces a conversion on its own.
         #[arg(long)]
         rocml_profile: Option<String>,
+        /// Sampling temperature (0 = greedy).
+        #[arg(long, default_value = "0.7")]
+        temperature: f32,
+        /// Top-p (nucleus) sampling threshold.
+        #[arg(long, default_value = "0.9")]
+        top_p: f32,
+        /// Top-k sampling limit (0 = disabled).
+        #[arg(long, default_value = "40")]
+        top_k: u32,
+        /// Maximum tokens to generate.
+        #[arg(long, default_value = "256")]
+        max_tokens: usize,
+        /// RNG seed (0 = random).
+        #[arg(long, default_value = "0")]
+        seed: u64,
+        /// Repetition penalty (1.0 = disabled). Default 1.10 matches Ollama.
+        #[arg(long, default_value = "1.1")]
+        repeat_penalty: f32,
     },
     /// Delete a model from local cache.
     Reap {
@@ -216,6 +235,15 @@ enum Commands {
     Oxidizer {
         #[command(subcommand)]
         subcommand: OxidizerCommands,
+    },
+    /// Verify a .grim file: structure, compression, payload readability,
+    /// and QLoRA adapter presence in backup2 slots.
+    Verify {
+        /// Path to .grim file to verify.
+        path: String,
+        /// Verbose output (show per-tensor details).
+        #[arg(short, long)]
+        verbose: bool,
     },
 }
 
@@ -442,7 +470,7 @@ async fn main() -> Result<()> {
             grim_server::serve(&address, engine, None).await?;
             let _ = plugins;
         }
-        Commands::Run { model, prompt, serve, address, config: _, plugins, rocml_profile } => {
+        Commands::Run { model, prompt, serve, address, config: _, plugins, rocml_profile, temperature, top_p, top_k, max_tokens, seed, repeat_penalty } => {
             // The --rocml-profile flag documents an explicit ROCm tuning
             // preference. `resolve_model_preferring_grim` already honours an
             // existing .grim conversion automatically; if the user passed a
@@ -506,7 +534,7 @@ async fn main() -> Result<()> {
                 };
                 if let Some(p) = prompt {
                     println!("[grim run] Running prompt on: {}", resolved);
-                    run::cmd_run(resolved, Some(p), false, address, &plugins).await?;
+                    run::cmd_run(resolved, Some(p), false, address, &plugins, temperature, top_p, top_k, max_tokens, seed, repeat_penalty).await?;
                 } else {
                     println!("[grim run] Starting interactive session with: {}", model_name);
                     println!("Type your prompt below (Ctrl+C to exit):");
@@ -518,7 +546,7 @@ async fn main() -> Result<()> {
                         std::io::stdin().read_line(&mut line).unwrap();
                         let trimmed = line.trim();
                         if trimmed.is_empty() { continue; }
-                        let _ = run::cmd_run(resolved.clone(), Some(trimmed.to_string()), false, address.clone(), &plugins).await;
+                        let _ = run::cmd_run(resolved.clone(), Some(trimmed.to_string()), false, address.clone(), &plugins, temperature, top_p, top_k, max_tokens, seed, repeat_penalty).await;
                         println!();
                     }
                 }
@@ -820,6 +848,12 @@ async fn main() -> Result<()> {
                         std::process::exit(1);
                     }
                 }
+            }
+        }
+        Commands::Verify { path, verbose: _ } => {
+            if let Err(e) = verify::cmd_verify(&path) {
+                eprintln!("Verification failed: {e}");
+                std::process::exit(1);
             }
         }
     }

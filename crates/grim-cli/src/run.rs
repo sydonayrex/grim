@@ -3,7 +3,8 @@
 use grim_core::error::Result;
 use grim_core::model::CausalLm;
 use grim_core::session::Inner as SessionInner;
-use grim_engine::{Engine, EngineConfig};
+use grim_core::sampler::{SamplingParams, Sampler};
+use grim_engine::{Engine, EngineConfig, model_loader::load_model_from_grim};
 use grim_models_transformer::{Llama, LlamaConfig, Lfm2, Lfm2Config, Gpt2, Gpt2Config, Gemma, GemmaConfig, DeepSeek, DeepSeekConfig, T5, T5Config};
 use grim_models_mamba::{Rwkv, RwkvConfig};
 use grim_models_vision::{Bert, BertConfig};
@@ -15,9 +16,21 @@ use grim_backend_cpu;
 use grim_backend_cuda;
 #[cfg(feature = "rocm")]
 use grim_backend_rocm;
-use crate::catalog::resolve_model_path;
+use crate::catalog::{resolve_model_path, resolve_model_preferring_grim};
 
-pub async fn cmd_run(model_path: String, prompt: Option<String>, serve: bool, address: String, _plugins: &str) -> Result<()> {
+pub async fn cmd_run(
+    model_path: String,
+    prompt: Option<String>,
+    serve: bool,
+    address: String,
+    _plugins: &str,
+    temperature: f32,
+    top_p: f32,
+    top_k: u32,
+    max_tokens: usize,
+    seed: u64,
+    repeat_penalty: f32,
+) -> Result<()> {
     let prompt = prompt.unwrap_or_else(|| "Hello".to_string());
 
     // Resolve model name to actual file path
@@ -37,8 +50,9 @@ pub async fn cmd_run(model_path: String, prompt: Option<String>, serve: bool, ad
     // Probe for ROCm GPUs; fall back to CPU if none are available.
     // §13.2: we fail closed — if a path was given but we can't open the file,
     // we crash rather than silently running a random toy model.
-    let gguf_path = std::path::Path::new(&model_path_str);
-    let use_gguf = gguf_path.is_file() && model_path_str.to_lowercase().ends_with(".gguf");
+    let path_obj = std::path::Path::new(&model_path_str);
+    let use_gguf = path_obj.is_file() && model_path_str.to_lowercase().ends_with(".gguf");
+    let use_grim = path_obj.is_file() && model_path_str.to_lowercase().ends_with(".grim");
 
     let (device, device_name) = if let Ok(s) = std::env::var("GRIM_FORCE_DEVICE") {
         match s.as_str() {
@@ -118,11 +132,23 @@ pub async fn cmd_run(model_path: String, prompt: Option<String>, serve: bool, ad
                     return Err(e);
                 }
             }
+        } else if use_grim {
+            eprintln!("[grim] Loading GRIM model: {}", model_path_str);
+            match load_model_from_grim(&model_path_str, device.clone()) {
+                Ok(m) => {
+                    eprintln!("[grim] GRIM model loaded successfully.");
+                    m
+                }
+                Err(e) => {
+                    eprintln!("[grim] ERROR: failed to load GRIM model '{}': {}", model_path_str, e);
+                    return Err(e);
+                }
+            }
         } else {
             // Never silently run a toy model — error loudly so the user
             // knows they need to pull a real model first.
             return Err(grim_core::error::Error::Config(format!(
-                "Model '{}' is not a valid .gguf file or does not exist. \
+                "Model '{}' is not a valid .gguf or .grim file or does not exist. \
                  Run 'grim pull <name>' to download a model first.",
                 model_path_str
             )));
@@ -136,7 +162,7 @@ pub async fn cmd_run(model_path: String, prompt: Option<String>, serve: bool, ad
         return Ok(());
     }
 
-    // One-shot inference path.
+    // One-shot inference path with generation loop.
     let model: Box<dyn CausalLm> = if use_gguf {
         eprintln!("[grim] Loading GGUF model: {}", model_path_str);
         match load_model_from_gguf(&model_path_str, device.clone()) {
@@ -149,12 +175,24 @@ pub async fn cmd_run(model_path: String, prompt: Option<String>, serve: bool, ad
                 return Err(e);
             }
         }
+    } else if use_grim {
+        eprintln!("[grim] Loading GRIM model: {}", model_path_str);
+        match load_model_from_grim(&model_path_str, device.clone()) {
+            Ok(m) => {
+                eprintln!("[grim] GRIM model loaded successfully.");
+                m
+            }
+            Err(e) => {
+                eprintln!("[grim] ERROR: failed to load GRIM model '{}': {}", model_path_str, e);
+                return Err(e);
+            }
+        }
     } else {
         // Fail loudly — never generate from a toy model.
         return Err(grim_core::error::Error::Config(format!(
-            "Model '{}' is not a valid .gguf file or could not be found.\n\
+            "Model '{}' is not a valid .gguf or .grim file or could not be found.\n\
              Run 'grim pull <name>' to download a model, or provide an\n\
-             explicit path to a .gguf file.",
+             explicit path to a .gguf or .grim file.",
             model_path_str
         )));
     };
@@ -162,59 +200,36 @@ pub async fn cmd_run(model_path: String, prompt: Option<String>, serve: bool, ad
     let tokenizer = if use_gguf {
         let provider = grim_format::GgufProvider::open(&model_path_str)?;
         Some(provider.tokenizer()?)
+    } else if use_grim {
+        // For .grim files, get tokenizer from sibling .gguf file
+        let gguf_path = path_obj.with_extension("gguf");
+        if gguf_path.exists() {
+            let provider = grim_format::GgufProvider::open(gguf_path.to_str().unwrap())?;
+            Some(provider.tokenizer()?)
+        } else {
+            None
+        }
     } else {
         None
     };
 
-    println!("Prompt: {prompt}");
-    println!("Device: {device_name}");
+    // Create sampler based on parameters
+    let sampling_params = SamplingParams {
+        temperature,
+        top_p,
+        top_k,
+        repeat_penalty,
+    };
+    let sampler: Box<dyn Sampler> = sampling_params.into_sampler(seed);
 
-    // Simple tokenization: use GgufTokenizer if available, fallback to byte-level
-    let tokens: Vec<u32> = if let Some(tok) = &tokenizer {
+    // Tokenize prompt
+    let mut tokens: Vec<u32> = if let Some(tok) = &tokenizer {
         tok.encode(&prompt)
     } else {
         prompt.bytes().map(|b| b as u32 % 512).collect()
     };
-    
-    // Create input tensor on the same device as the model
-    let shape = grim_tensor::Shape::new(vec![tokens.len()]);
-    let float_tokens: Vec<f32> = tokens.iter().map(|t| *t as f32).collect();
-    let dtype = grim_tensor::dtype::DType::F32;
-    let storage: Arc<dyn grim_tensor::BackendStorage> = match device {
-        grim_tensor::Device::Cpu => {
-            let dev = grim_backend_cpu::CpuDevice::new();
-            Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
-        }
-        grim_tensor::Device::Cuda(ordinal) => {
-            let dev = grim_backend_cuda::CudaDevice::new(ordinal);
-            Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
-        }
-        grim_tensor::Device::Rocm(ordinal) => {
-            let dev = grim_backend_rocm::RocmDevice::new(ordinal);
-            Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
-        }
-        grim_tensor::Device::Vulkan => {
-            let dev = grim_backend_vulkan::VulkanDevice::new();
-            Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
-        }
-        grim_tensor::Device::Metal(ordinal) => {
-            let dev = grim_backend_metal::MetalDevice::try_new(ordinal)?;
-            Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
-        }
-    };
-    let input_tensor = grim_tensor::Tensor::new(
-        storage,
-        shape,
-        dtype,
-        grim_tensor::dtype::QuantProvenance::default(),
-        device.clone(),
-    );
-    
-    let mut session = SessionInner::new(model.device().clone());
-    let logits = CausalLm::forward(&*model, &mut session, &input_tensor, &input_tensor, &[])?;
-    let logits_vec = logits.to_vec_f32()?;
 
-    // Get the argmax of the last token.
+    // Determine vocab size
     let vocab = if let Some(cfg) = model.config().as_any().downcast_ref::<LlamaConfig>() {
         cfg.vocab_size
     } else if let Some(cfg) = model.config().as_any().downcast_ref::<grim_models_mamba::MambaConfig>() {
@@ -224,21 +239,129 @@ pub async fn cmd_run(model_path: String, prompt: Option<String>, serve: bool, ad
     } else {
         512
     };
-    let last_start = logits_vec.len().saturating_sub(vocab);
-    let last_token = logits_vec[last_start..]
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    
-    if let Some(tok) = &tokenizer {
-        let token_text = tok.decode(&[last_token as u32]);
-        println!("Next token id: {last_token} (text: {:?})", token_text);
-    } else {
-        println!("Next token id: {last_token}");
+
+    println!("Prompt: {prompt}");
+    println!("Device: {device_name}");
+    println!("Sampling: temp={}, top_p={}, top_k={}, max_tokens={}, seed={}", 
+             temperature, top_p, top_k, max_tokens, seed);
+    print!("\nResponse: ");
+    use std::io::Write;
+    std::io::stdout().flush().unwrap();
+
+    let mut session = SessionInner::new(model.device().clone());
+    let mut generated = 0;
+    let mut history: Vec<u32> = Vec::new();
+
+    // Generation loop
+    while generated < max_tokens {
+        // Create input tensor for current sequence
+        let shape = grim_tensor::Shape::new(vec![tokens.len()]);
+        let float_tokens: Vec<f32> = tokens.iter().map(|t| *t as f32).collect();
+        let dtype = grim_tensor::dtype::DType::F32;
+        let storage: Arc<dyn grim_tensor::BackendStorage> = match device {
+            grim_tensor::Device::Cpu => {
+                let dev = grim_backend_cpu::CpuDevice::new();
+                Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
+            }
+            grim_tensor::Device::Cuda(ordinal) => {
+                let dev = grim_backend_cuda::CudaDevice::new(ordinal);
+                Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
+            }
+            grim_tensor::Device::Rocm(ordinal) => {
+                let dev = grim_backend_rocm::RocmDevice::new(ordinal);
+                Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
+            }
+            grim_tensor::Device::Vulkan => {
+                let dev = grim_backend_vulkan::VulkanDevice::new();
+                Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
+            }
+            grim_tensor::Device::Metal(ordinal) => {
+                let dev = grim_backend_metal::MetalDevice::try_new(ordinal)?;
+                Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
+            }
+        };
+        let input_tensor = grim_tensor::Tensor::new(
+            storage,
+            shape,
+            dtype,
+            grim_tensor::dtype::QuantProvenance::default(),
+            device.clone(),
+        );
+
+        // Forward pass
+        let logits = CausalLm::forward(&*model, &mut session, &input_tensor, &input_tensor, &[])?;
+        
+        // Get logits for the last token position only
+        let logits_vec = logits.to_vec_f32()?;
+        let last_start = logits_vec.len().saturating_sub(vocab);
+        let last_logits = &logits_vec[last_start..];
+
+        // Build a single-position logits tensor containing only the last-token
+        // logits, so the sampler sees exactly the distribution for the next
+        // token (not every position in the sequence). This fixes the bug where
+        // `sampler.sample(&logits, &history)` sees logits for the wrong slot
+        // and returns a non-final-position argmax.
+        let last_shape = grim_tensor::Shape::new(vec![vocab]);
+        let last_storage: Arc<dyn grim_tensor::BackendStorage> = match device {
+            grim_tensor::Device::Cpu => {
+                let dev = grim_backend_cpu::CpuDevice::new();
+                Arc::from(dev.from_cpu(last_logits, &last_shape, grim_tensor::dtype::DType::F32)?)
+            }
+            grim_tensor::Device::Cuda(ordinal) => {
+                let dev = grim_backend_cuda::CudaDevice::new(ordinal);
+                Arc::from(dev.from_cpu(last_logits, &last_shape, grim_tensor::dtype::DType::F32)?)
+            }
+            grim_tensor::Device::Rocm(ordinal) => {
+                let dev = grim_backend_rocm::RocmDevice::new(ordinal);
+                Arc::from(dev.from_cpu(last_logits, &last_shape, grim_tensor::dtype::DType::F32)?)
+            }
+            grim_tensor::Device::Vulkan => {
+                let dev = grim_backend_vulkan::VulkanDevice::new();
+                Arc::from(dev.from_cpu(last_logits, &last_shape, grim_tensor::dtype::DType::F32)?)
+            }
+            grim_tensor::Device::Metal(ordinal) => {
+                let dev = grim_backend_metal::MetalDevice::try_new(ordinal)?;
+                Arc::from(dev.from_cpu(last_logits, &last_shape, grim_tensor::dtype::DType::F32)?)
+            }
+        };
+        let last_logits_tensor = grim_tensor::Tensor::new(
+            last_storage,
+            last_shape,
+            grim_tensor::dtype::DType::F32,
+            grim_tensor::dtype::QuantProvenance::default(),
+            device.clone(),
+        );
+
+        // Sample next token from the *last-position* logits, not the full tensor.
+        let next_token = sampler.sample(&last_logits_tensor, &history)?;
+        
+        // Decode and print token
+        if let Some(tok) = &tokenizer {
+            let token_text = tok.decode(&[next_token]);
+            print!("{}", token_text);
+            std::io::stdout().flush().unwrap();
+        } else {
+            // Fallback: print as raw token
+            print!("{} ", next_token);
+            std::io::stdout().flush().unwrap();
+        }
+
+        // Update state
+        tokens.push(next_token);
+        history.push(next_token);
+        generated += 1;
+
+        // Stop on EOS token: in GGUF the canonical EOS id is `vocab_size - 1`.
+        // We deliberately do NOT kill on token ids 0/1/2 — those are BOS/pad/unk
+        // for some tokenizers and legitimate content tokens for others; killing
+        // on them prematurely truncates output for LFM2-style models.
+        let vocab_u32 = vocab as u32;
+        if next_token >= vocab_u32.saturating_sub(1) {
+            break;
+        }
     }
-    println!("[grim] Done.");
+
+    println!("\n[grim] Done. Generated {} tokens.", generated);
     Ok(())
 }
 
