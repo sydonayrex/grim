@@ -114,23 +114,23 @@ impl MambaBlock {
         let in_proj_weight: Vec<f32> = (0..(2 * cfg.d_inner) * cfg.hidden_size)
             .map(|_| (rng.next_f32() - 0.5) * 0.02)
             .collect();
-        let in_proj = Linear {
-            weight: cpu_tensor(
+        let in_proj = Linear::from_tensor(
+            cpu_tensor(
                 in_proj_weight,
                 Shape::new(vec![2 * cfg.d_inner, cfg.hidden_size]),
             ),
-            bias: None,
-        };
+            None,
+        );
         let out_proj_weight: Vec<f32> = (0..cfg.hidden_size * cfg.d_inner)
             .map(|_| (rng.next_f32() - 0.5) * 0.02)
             .collect();
-        let out_proj = Linear {
-            weight: cpu_tensor(
+        let out_proj = Linear::from_tensor(
+            cpu_tensor(
                 out_proj_weight,
                 Shape::new(vec![cfg.hidden_size, cfg.d_inner]),
             ),
-            bias: None,
-        };
+            None,
+        );
         let conv: Vec<f32> = (0..cfg.d_inner * cfg.conv_kernel)
             .map(|_| (rng.next_f32() - 0.5) * 0.5)
             .collect();
@@ -231,10 +231,10 @@ impl Mamba {
         let output_data: Vec<f32> = (0..cfg.vocab_size * cfg.hidden_size)
             .map(|_| (rng.next_f32() - 0.5) * 0.02)
             .collect();
-        let output = Linear {
-            weight: cpu_tensor(output_data, Shape::new(vec![cfg.vocab_size, cfg.hidden_size])),
-            bias: None,
-        };
+        let output = Linear::from_tensor(
+            cpu_tensor(output_data, Shape::new(vec![cfg.vocab_size, cfg.hidden_size])),
+            None,
+        );
         Self {
             cfg: cfg.clone(),
             device: Device::Cpu,

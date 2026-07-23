@@ -155,3 +155,63 @@ fn get_for_training_missing_tensor_is_reported() {
         "missing tensor should produce an error"
     );
 }
+
+#[test]
+fn embedding_load_exact_shape() {
+    let data = vec![1.0f32; 40];
+    let provider = memory_provider_with(&[(
+        "weight",
+        f32_bytes(&data),
+        vec![10, 4],
+        DType::F32,
+        QuantProvenance::GrimNative,
+    )]);
+    let ws = WeightSource::root(&provider, Device::Cpu);
+    let emb = grim_nn::Embedding::load(&ws, 10, 4).expect("embedding load exact shape");
+    assert_eq!(emb.weight().shape().dims(), &[10, 4]);
+}
+
+#[test]
+fn embedding_load_transposed_shape() {
+    let data = vec![1.0f32; 40];
+    let provider = memory_provider_with(&[(
+        "weight",
+        f32_bytes(&data),
+        vec![4, 10],
+        DType::F32,
+        QuantProvenance::GrimNative,
+    )]);
+    let ws = WeightSource::root(&provider, Device::Cpu);
+    let emb = grim_nn::Embedding::load(&ws, 10, 4).expect("embedding load transposed shape");
+    assert_eq!(emb.weight().shape().dims(), &[10, 4]);
+}
+
+#[test]
+fn embedding_load_padded_vocab_shape() {
+    let data = vec![1.0f32; 64];
+    let provider = memory_provider_with(&[(
+        "weight",
+        f32_bytes(&data),
+        vec![16, 4],
+        DType::F32,
+        QuantProvenance::GrimNative,
+    )]);
+    let ws = WeightSource::root(&provider, Device::Cpu);
+    let emb = grim_nn::Embedding::load(&ws, 10, 4).expect("embedding load padded vocab shape");
+    assert_eq!(emb.weight().shape().dims(), &[16, 4]);
+}
+
+#[test]
+fn embedding_load_transposed_padded_vocab_shape() {
+    let data = vec![1.0f32; 64];
+    let provider = memory_provider_with(&[(
+        "weight",
+        f32_bytes(&data),
+        vec![4, 16],
+        DType::F32,
+        QuantProvenance::GrimNative,
+    )]);
+    let ws = WeightSource::root(&provider, Device::Cpu);
+    let emb = grim_nn::Embedding::load(&ws, 10, 4).expect("embedding load transposed padded vocab shape");
+    assert_eq!(emb.weight().shape().dims(), &[16, 4]);
+}

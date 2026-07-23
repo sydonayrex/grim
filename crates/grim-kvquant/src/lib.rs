@@ -172,11 +172,6 @@ impl CompressedKvBlock {
     }
 }
 
-/// Optimal centroids for a 3-bit Lloyd-Max quantizer under a standard normal distribution.
-const LLOYD_MAX_3BIT_CENTROIDS: [f32; 8] = [
-    -2.152, -1.344, -0.758, -0.245, 0.245, 0.758, 1.344, 2.152,
-];
-
 /// A Lloyd-Max scalar quantizer compressor.
 /// Reusable packed K/V buffer for the GPU fused-attention dispatch.
 ///
@@ -485,10 +480,6 @@ struct BitWriter {
 }
 
 impl BitWriter {
-    fn new() -> Self {
-        Self { buf: Vec::new(), bit_pos: 0 }
-    }
-
     /// Append `value` (must fit in `n_bits` bits) at the current bit position.
     fn push(&mut self, value: u32, n_bits: u8) {
         debug_assert!(n_bits > 0 && n_bits <= 8);
@@ -609,12 +600,12 @@ impl KvCompressor for LloydMaxCompressor {
         // (replaces the prior hard-coded 3-bit Lloyd-Max path so the host
         // block's bit density actually responds to the configured bitwidth).
         let group_size = self.config.group_size;
-        let mut key_bits: Vec<u8> = Vec::new();
         let mut key_meta: Vec<f32> = Vec::new();
+        let key_bits;
         {
             let bits = self.config.key_bits.max(1).min(8);
             let levels = (1u32 << bits) as f32;       // total codebook size, e.g. 8 for 3-bit
-            let inv_levels = 1.0 / (levels - 1.0).max(1.0);
+            let _inv_levels = 1.0 / (levels - 1.0).max(1.0);
             let mut writer = BitWriter { buf: Vec::new(), bit_pos: 0 };
             writer.buf.reserve(BitWriter::capacity_for(k_data.len(), bits) + 4);
 
@@ -637,7 +628,7 @@ impl KvCompressor for LloydMaxCompressor {
                     let n = n.clamp(0.0, 1.0);
                     let q = (n * (levels - 1.0)).round().clamp(0.0, levels - 1.0) as u32;
                     debug_assert_eq!(q < (1u32 << bits) as u32, true);
-                    let _ = inv_levels;
+                    let _ = _inv_levels;
                     writer.push(q, bits);
                 }
             }
@@ -648,7 +639,7 @@ impl KvCompressor for LloydMaxCompressor {
         // density (asymmetric min/max uniform). Previously hard-coded to 15
         // levels / 4-bit nibble-pair regardless of `config.value_bits`.
         let mut value_meta = Vec::new(); // Pairs of (scale, min)
-        let mut value_bits: Vec<u8> = Vec::new();
+        let value_bits;
         {
             let vb_bits = self.config.value_bits.max(1).min(8);
             let max_q = ((1u32 << vb_bits) - 1).max(1);

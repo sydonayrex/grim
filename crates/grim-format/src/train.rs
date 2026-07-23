@@ -60,6 +60,24 @@ impl TrainFpFormat {
     }
 }
 
+/// Convert raw bytes to f32 slice based on the fp_format.
+/// Only Fp32 is supported for bolt-on attach (the sidecar stores adapter weights as f32).
+fn bytes_to_f32s(data: &[u8], fmt: TrainFpFormat) -> Option<Vec<f32>> {
+    match fmt {
+        TrainFpFormat::Fp32 => {
+            if data.len() % 4 != 0 {
+                return None;
+            }
+            Some(
+                data.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            )
+        }
+        _ => None, // F16/F8/F4 conversion not yet supported for bolt-on attach
+    }
+}
+
 /// One named training-state blob (adapter weight, optimizer moment, error matrix).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrainBlob {
@@ -159,6 +177,36 @@ impl TrainState {
                 data,
             },
         );
+    }
+
+    /// Extract lora A and B raw f32 data for a given base tensor name.
+    ///
+    /// Expects blobs named `{tensor_name}.lora_A.weight` and `{tensor_name}.lora_B.weight`.
+    /// Returns `(a_data, a_shape, b_data, b_shape)` or `None` if either blob is missing.
+    pub fn lora_weights_for(
+        &self,
+        tensor_name: &str,
+    ) -> Option<(Vec<f32>, &[usize], Vec<f32>, &[usize])> {
+        let a_key = format!("{}.lora_A.weight", tensor_name);
+        let b_key = format!("{}.lora_B.weight", tensor_name);
+        let a_blob = self.blobs.get(&a_key)?;
+        let b_blob = self.blobs.get(&b_key)?;
+
+        let a_data = bytes_to_f32s(&a_blob.data, self.fp_format)?;
+        let b_data = bytes_to_f32s(&b_blob.data, self.fp_format)?;
+        Some((a_data, &a_blob.shape, b_data, &b_blob.shape))
+    }
+
+    /// List all base tensor names that have lora adapters in this sidecar.
+    pub fn lora_tensor_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .blobs
+            .keys()
+            .filter(|k| k.ends_with(".lora_A.weight"))
+            .map(|k| k.strip_suffix(".lora_A.weight").unwrap().to_string())
+            .collect();
+        names.sort();
+        names
     }
 
     /// Write the sidecar to `path` (conventionally `model.grim.train`).

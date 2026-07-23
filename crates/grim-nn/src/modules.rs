@@ -18,7 +18,15 @@ use grim_backend_rocm::RocmDevice;
 /// arithmetic ops dispatch to GPU kernels when the tensor lives on a GPU.
 /// Falls back to CPU if the requested backend is unavailable in this build.
 pub fn pick_device_for_tensor(x: &Tensor) -> Box<dyn BackendDevice> {
-    match x.device() {
+    pick_device_for_storage_device(x.device())
+}
+
+/// Pick a `BackendDevice` for a storage `Device` directly (without an
+/// owning `Tensor`), used when reconstructing a tensor from CPU-side
+/// bytes but needing to land it back on the original device.
+/// Falls back to CPU if the requested backend is unavailable in this build.
+pub fn pick_device_for_storage_device(d: &Device) -> Box<dyn BackendDevice> {
+    match d {
         Device::Cpu => Box::new(CpuDevice::new()),
         #[cfg(feature = "cuda-mem")]
         Device::Cuda(ordinal) => Box::new(CudaDevice::new(*ordinal)),
@@ -35,6 +43,7 @@ pub fn pick_device_for_tensor(x: &Tensor) -> Box<dyn BackendDevice> {
 pub struct Linear {
     pub weight: Tensor,
     pub bias: Option<Tensor>,
+    pub w_t: Tensor,
 }
 
 impl Linear {
@@ -42,19 +51,21 @@ impl Linear {
     ///
     /// GGUF stores matrix weights as `[out_dim, in_dim]` (rows = output units,
     /// columns = input units). This matches llama.cpp's convention: `y = x @ W^T`,
-    /// so `Linear::forward` transposes the stored weight before matmul.
+    /// so `Linear` pre-transposes `w_t` once during load for fast device matmuls.
     pub fn load(ws: &WeightSource<'_>, in_dim: usize, out_dim: usize, has_bias: bool) -> Result<Self> {
         let weight = ws.get([out_dim, in_dim], "weight")?;
+        let w_t = transpose_last_two(&weight)?;
         let bias = if has_bias {
             Some(ws.get([out_dim], "bias")?)
         } else {
             None
         };
-        Ok(Self { weight, bias })
+        Ok(Self { weight, bias, w_t })
     }
 
     pub fn from_tensor(weight: Tensor, bias: Option<Tensor>) -> Self {
-        Self { weight, bias }
+        let w_t = transpose_last_two(&weight).unwrap_or_else(|_| weight.clone());
+        Self { weight, bias, w_t }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -64,9 +75,8 @@ impl Linear {
         let out_dim = self.weight.shape().dim(0)?;
         let batch = x.shape().elem_count() / in_dim;
 
-        let w_t = transpose_last_two(&self.weight)?;
         let a_storage = x.storage().as_ref();
-        let b_storage = w_t.storage().as_ref();
+        let b_storage = self.w_t.storage().as_ref();
         let (out_s, h) = BackendDevice::matmul(&*dev, a_storage, b_storage, &Shape::new(vec![batch, out_dim]))?;
         h.synchronize()?;
         let mat_out = Tensor::new(
@@ -206,22 +216,67 @@ pub struct Embedding {
 }
 
 impl Embedding {
+    /// Load an embedding table, accepting layout variations and token size discrepancies.
+    ///
+    /// Standard checkpoints store `[vocab, dim]` (row-major: tokens × hidden).
+    /// Legacy GGUF checkpoints may store `[dim, vocab]` (column-major) or carry
+    /// padded vocabulary rows `[actual_vocab, dim]`.
+    /// The contract guarantees that the returned weight is normalized to
+    /// `[actual_vocab, dim]` row-major storage (rows = tokens), matching the
+    /// layout expected by downstream gathering and tied linear heads.
     pub fn load(ws: &WeightSource<'_>, vocab: usize, dim: usize) -> Result<Self> {
-        let weight = match ws.get([vocab, dim], "weight") {
-            Ok(t) => t,
-            Err(_) => {
-                let raw = ws.get([dim, vocab], "weight")?;
-                let raw_vec = raw.to_vec_f32()?;
-                let mut out = vec![0.0f32; vocab * dim];
-                for i in 0..dim {
-                    for j in 0..vocab {
-                        out[j * dim + i] = raw_vec[i * vocab + j];
-                    }
+        // Probe `[vocab, dim]`. On exact shape match, use as-is.
+        if let Ok(t) = ws.get([vocab, dim], "weight") {
+            return Ok(Self { weight: t });
+        }
+
+        // Fallback: load unconstrained tensor and normalize the layout.
+        let raw_tensor = ws.get_unconstrained("weight")?;
+        let dims = raw_tensor.shape().dims().to_vec();
+        if dims.len() != 2 {
+            return Err(Error::ShapeMismatch {
+                expected: vec![vocab, dim],
+                got: dims,
+            });
+        }
+
+        let (s0, s1) = (dims[0], dims[1]);
+
+        // Case 1: Row-major layout [actual_vocab, dim] where s1 == dim.
+        if s1 == dim {
+            return Ok(Self { weight: raw_tensor });
+        }
+
+        // Case 2: Column-major layout [dim, actual_vocab] where s0 == dim.
+        // Transpose to canonical [actual_vocab, dim] row-major layout.
+        if s0 == dim {
+            let actual_vocab = s1;
+            let src_device = raw_tensor.device().clone();
+            let src_prov = raw_tensor.provenance().clone();
+            let raw_vec = raw_tensor.to_vec_f32()?;
+            let mut out = vec![0.0f32; actual_vocab * dim];
+            // raw_tensor is [dim, actual_vocab] (row-major): element at (i, j) = raw_vec[i * actual_vocab + j].
+            // target is [actual_vocab, dim] (row-major): element at (j, i) = out[j * dim + i].
+            for i in 0..dim {
+                for j in 0..actual_vocab {
+                    out[j * dim + i] = raw_vec[i * actual_vocab + j];
                 }
-                grim_backend_cpu::cpu_tensor(out, Shape::new(vec![vocab, dim]))
             }
-        };
-        Ok(Self { weight })
+            let out_shape = Shape::new(vec![actual_vocab, dim]);
+            let weight = if src_device.is_cpu() {
+                grim_backend_cpu::cpu_tensor(out, out_shape)
+            } else {
+                let dev = pick_device_for_storage_device(&src_device);
+                let storage = dev.from_cpu(&out, &out_shape, DType::F32)?;
+                Tensor::new(Arc::from(storage), out_shape, DType::F32, src_prov, src_device)
+            };
+            return Ok(Self { weight });
+        }
+
+        Err(Error::ShapeMismatch {
+            expected: vec![vocab, dim],
+            got: dims,
+        })
     }
 
     pub fn forward(&self, indices: &[u32], seq_len: usize, dim: usize) -> Result<Tensor> {

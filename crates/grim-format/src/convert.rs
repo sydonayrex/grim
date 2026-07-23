@@ -238,8 +238,10 @@ pub fn convert_to_grim(
     // If provided, these override the uniform `target_bpw` for each tensor.
     // Must match the number of tensors in the source model.
     evopress_bitwidths: Option<Vec<u32>>,
-    // Per-tensor importance scores (for metadata).
-    importance_scores: Option<Vec<f32>>,
+    // Pre-populated metadata (caller may have set quant_overrides /
+    // ext_entries from EvoPress / calibration). When `None`, a fresh
+    // default metadata is constructed.
+    caller_metadata: Option<crate::gguf::GrimMetadata>,
 ) -> Result<()> {
     println!("[Grim Convert] Starting conversion pipeline...");
     println!("  Source: {}", input_path);
@@ -261,7 +263,37 @@ pub fn convert_to_grim(
     let profile = gcn_to_profile(target_gcn);
 
     let entries = build_entries_from_source(input_path, target_bpw, evopress_bitwidths.clone())?;
-    let metadata = build_grim_metadata(target_gcn, profile, target_bpw, evopress_bitwidths.is_some(), importance_scores);
+    let mut metadata = match caller_metadata {
+        Some(m) => m,
+        None => build_grim_metadata(target_gcn, profile, target_bpw, evopress_bitwidths.is_some()),
+    };
+    // Always ensure the basic grim-v1 stamp + target GCN + profile fields are
+    // set, even when the caller supplied a skeleton metadata.
+    if metadata.magic.is_none() {
+        metadata.magic = Some("grim-v1".into());
+    }
+    if metadata.quant_version.is_none() {
+        metadata.quant_version = Some(GRIM_QUANT_VERSION);
+    }
+    if metadata.rocml_profile == crate::gguf::GrimRocmlProfile::Unknown {
+        metadata.rocml_profile = profile;
+    }
+    if metadata.wavefront_size == 0 {
+        metadata.wavefront_size = profile.wavefront_size();
+    }
+    if metadata.target_gcn.is_none() {
+        metadata.target_gcn = Some(target_gcn.to_string());
+    }
+    if metadata.lds_size.is_none() {
+        metadata.lds_size = Some(profile.lds_size());
+    }
+    if metadata.quant_method.is_none() {
+        metadata.quant_method = Some(if evopress_bitwidths.is_some() {
+            "evopress-gptq".to_string()
+        } else {
+            format!("uniform-{}bit", target_bpw.round() as u32)
+        });
+    }
 
     let grim_file = crate::format::GrimFile {
         header: crate::format::GrimHeader::new(entries.len() as u32, 0),
@@ -389,20 +421,22 @@ fn gcn_to_profile(gcn: &str) -> crate::gguf::GrimRocmlProfile {
 }
 
 /// Build the `.grim` metadata for the output file.
+///
+/// Note: caller-supplied metadata (e.g. with `quant_overrides` pre-populated
+/// from EvoPress) should be passed to `convert_to_grim` directly via
+/// `caller_metadata`. This helper is for the uniform-quantization path only.
 fn build_grim_metadata(
     target_gcn: &str,
     profile: crate::gguf::GrimRocmlProfile,
     target_bpw: f32,
     has_evopress: bool,
-    importance_scores: Option<Vec<f32>>,
 ) -> crate::gguf::GrimMetadata {
-    let _importance_scores = importance_scores;
     let quant_method = if has_evopress {
         "evopress-gptq".to_string()
     } else {
         format!("uniform-{}bit", target_bpw.round() as u32)
     };
-    
+
     crate::gguf::GrimMetadata {
         magic: Some("grim-v1".into()),
         quant_version: Some(GRIM_QUANT_VERSION),

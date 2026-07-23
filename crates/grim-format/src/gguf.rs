@@ -158,13 +158,23 @@ impl GgufDType {
     /// Number of weights stored per quantization block. Quant layouts package
     /// N weights together with shared scales/deltas; this is the N. F32/F16/I*/BF16
     /// are stored as 1-element blocks.
+    ///
+    /// K-quants (Q2_K … Q8_K, IQ) use ggml's `QK_K = 256`-element super-block.
+    /// Q4_0/Q5_0/Q8_0-style blocks hold 32 weights. Mis-sizing either path
+    /// silently produces `size_bytes` values that don't match the on-disk
+    /// tensor, which then surfaces as `UnexpectedEof` in `read_exact`.
     pub fn block_size(self) -> u64 {
         match self {
             GgufDType::F32 | GgufDType::F16 | GgufDType::F64
             | GgufDType::I8 | GgufDType::I16 | GgufDType::I32 | GgufDType::I64
             | GgufDType::Q4_2
             | GgufDType::Q8_1Hx => 1,
-            // K-quants and Q-families: 32 weights per super-block
+            // K-quants: 256-elem super-block
+            GgufDType::Q2K | GgufDType::Q3K
+            | GgufDType::Q4K | GgufDType::Q5K
+            | GgufDType::Q6K | GgufDType::Q8K
+            | GgufDType::IQ4_NL => 256,
+            // Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1: 32-elem block
             _ => 32,
         }
     }
@@ -173,9 +183,13 @@ impl GgufDType {
     /// just `elem_size`. For block-quantized kinds it's the literal block layout
     /// size in the GGUF stream (scales + codebook + packed nibbles).
     ///
-    /// Reference: gguf-main/src/lib.rs lines 706-748 — `type_size` per dtype.
+    /// Reference: ggml-main/src/ggml/src/ggml.c `type_size` table. K-quant
+    /// super-blocks are 256 elements wide and the byte per block sizes are:
+    ///   Q2_K = 84, Q3_K = 108 (small, Q3_K_S variant), Q4_K = 144,
+    ///   Q5_K = 176, Q6_K = 210, Q8_K = 252 (matches `QK_K * 1 + scales`).
+    /// IQ4_NL is its own 32-elem block format (1-byte scale + 16-byte nibble
+    /// grid = 18 bytes/32).
     pub fn type_size_per_block(self) -> u64 {
-        let bs = self.block_size();
         match self {
             GgufDType::F32 => 4,
             GgufDType::F16 => 2,
@@ -184,20 +198,20 @@ impl GgufDType {
             GgufDType::I32 => 4,
             GgufDType::I64 => 8,
             GgufDType::F64 => 8,
-            GgufDType::Q4_0 => 2 + bs / 2,
-            GgufDType::Q4_1 => 2 + 2 + bs / 2,
+            GgufDType::Q4_0 => 2 + 32 / 2,
+            GgufDType::Q4_1 => 2 + 2 + 32 / 2,
             GgufDType::Q4_2 => 0,
-            GgufDType::Q5_0 => 2 + 4 + bs / 2,
-            GgufDType::Q5_1 => 2 + 2 + 4 + bs / 2,
-            GgufDType::Q8_0 => 2 + bs,
-            GgufDType::Q8_1 => 4 + 4 + bs,
-            GgufDType::Q2K => bs / 16 + bs / 4 + 2 + 2,
-            GgufDType::Q3K => bs / 8 + bs / 4 + 12 + 2,
-            GgufDType::Q4K => 2 + 2 + 12 + bs / 2,
-            GgufDType::Q5K => 2 + 2 + 12 + bs / 8 + bs / 2,
-            GgufDType::Q6K => bs / 2 + bs / 4 + bs / 16 + 2,
-            GgufDType::Q8K => 4 + bs + bs / 16 * 2,
-            GgufDType::IQ4_NL => 2 + 16,
+            GgufDType::Q5_0 => 2 + 4 + 32 / 2,
+            GgufDType::Q5_1 => 2 + 2 + 4 + 32 / 2,
+            GgufDType::Q8_0 => 2 + 32,
+            GgufDType::Q8_1 => 4 + 4 + 32,
+            GgufDType::Q2K => 84,
+            GgufDType::Q3K => 108,
+            GgufDType::Q4K => 144,
+            GgufDType::Q5K => 176,
+            GgufDType::Q6K => 210,
+            GgufDType::Q8K => 252,
+            GgufDType::IQ4_NL => 18,
             _ => 0,
         }
     }

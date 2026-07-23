@@ -28,15 +28,21 @@ pub struct SamplingParams {
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: u32,
+    /// Repetition penalty (CTRL paper, Keskar 2019): logits for tokens already
+    /// present in `history` are divided by this value before temperature scaling.
+    /// 1.0 = disabled. Ollama default is 1.10; grim CLI default is 1.10 to match.
+    pub repeat_penalty: f32,
 }
 
 impl Default for SamplingParams {
     fn default() -> Self {
         // OpenAI-compatible defaults: greedy off, mild nucleus, no hard top-k.
+        // repeat_penalty defaults to a mild 1.10 — disables cleanly at 1.0.
         SamplingParams {
             temperature: 1.0,
             top_p: 1.0,
             top_k: 0,
+            repeat_penalty: 1.0,
         }
     }
 }
@@ -47,7 +53,7 @@ impl SamplingParams {
     /// so callers hold a single trait object regardless of mode.
     pub fn into_sampler(self, seed: u64) -> Box<dyn Sampler> {
         if self.temperature <= 0.0 {
-            Box::new(GreedySampler)
+            Box::new(GreedySampler::new(self.repeat_penalty))
         } else {
             Box::new(TopPSampler::new(self, seed))
         }
@@ -59,12 +65,35 @@ impl SamplingParams {
 /// Deterministic: always returns the highest-logit token. This preserves the
 /// historical `chat_completions` behavior for callers that request
 /// deterministic output, and is the test oracle for the stochastic path.
-pub struct GreedySampler;
+pub struct GreedySampler {
+    /// Repetition penalty to apply before argmax. Forwarded via
+    /// [`SamplingParams::repeat_penalty`] — without it, greedy decoding
+    /// gets stuck emitting the same token forever (`<|pad|>` then EOS issue).
+    /// Stored as `Option` so callers can construct a `GreedySampler` with
+    /// no repetition penalty (the historical behavior, preserved for tests).
+    pub repeat_penalty: Option<f32>,
+}
+
+impl GreedySampler {
+    pub fn new(repeat_penalty: f32) -> Self {
+        Self {
+            repeat_penalty: if repeat_penalty <= 1.0 {
+                None
+            } else {
+                Some(repeat_penalty)
+            },
+        }
+    }
+}
 
 impl Sampler for GreedySampler {
-    fn sample(&self, logits: &Tensor, _history: &[u32]) -> Result<u32> {
+    fn sample(&self, logits: &Tensor, history: &[u32]) -> Result<u32> {
         let v = logits.to_vec_f32()?;
-        Ok(argmax(&v))
+        let adjusted = match self.repeat_penalty {
+            Some(rp) => apply_repeat_penalty(&v, rp, history),
+            None => v,
+        };
+        Ok(argmax(&adjusted))
     }
 
     fn name(&self) -> &str {
@@ -101,9 +130,9 @@ impl TopPSampler {
 }
 
 impl Sampler for TopPSampler {
-    fn sample(&self, logits: &Tensor, _history: &[u32]) -> Result<u32> {
+    fn sample(&self, logits: &Tensor, history: &[u32]) -> Result<u32> {
         let v = logits.to_vec_f32()?;
-        let token = sample_logits(&v, self.params.temperature, self.params.top_p, self.params.top_k, &mut || self.next_u32());
+        let token = sample_logits(&v, self.params.temperature, self.params.top_p, self.params.top_k, self.params.repeat_penalty, history, &mut || self.next_u32());
         Ok(token)
     }
 
@@ -122,6 +151,31 @@ fn argmax(v: &[f32]) -> u32 {
         .unwrap_or(0)
 }
 
+/// Apply repetition penalty to logits. For every token id present in `history`,
+/// divide its logit by `repeat_penalty`. No-op when `repeat_penalty <= 1.0`.
+/// Numbered tokens above `logits.len()` (out-of-vocab) are silently skipped.
+/// The penalty is applied to every occurrence in history (taking the worst
+/// penalty = smallest adjusted logit), matching llama.cpp / Ollama behavior.
+fn apply_repeat_penalty(logits: &[f32], repeat_penalty: f32, history: &[u32]) -> Vec<f32> {
+    if repeat_penalty <= 1.0 || history.is_empty() {
+        return logits.to_vec();
+    }
+    let mut out = logits.to_vec();
+    for &tok in history {
+        let i = tok as usize;
+        if i < out.len() {
+            // Negative logits get *multiplied* by repeat_penalty (greater szlope
+            // suppression), positive ones are divided. llama.cpp normalization.
+            if out[i] < 0.0 {
+                out[i] *= repeat_penalty;
+            } else {
+                out[i] /= repeat_penalty;
+            }
+        }
+    }
+    out
+}
+
 /// Pure, dependency-free token sampler.
 ///
 /// Pipeline: temperature-scale the logits → optional top-k truncation →
@@ -138,18 +192,26 @@ pub fn sample_logits<F>(
     temperature: f32,
     top_p: f32,
     top_k: u32,
+    repeat_penalty: f32,
+    history: &[u32],
     rng: &mut F,
 ) -> u32
 where
     F: FnMut() -> u32,
 {
     if temperature <= 0.0 {
-        return argmax(logits);
+        // Greedy mode still benefits from repetition penalty — apply it before
+        // argmax so a token emitted once isn't immediately re-emitted forever.
+        let scaled = apply_repeat_penalty(logits, repeat_penalty, history);
+        return argmax(&scaled);
     }
+
+    // Apply repetition penalty first, before temperature scaling — CTRL paper.
+    let pen_log: Vec<f32> = apply_repeat_penalty(logits, repeat_penalty, history);
 
     // Temperature scaling. Guard against non-finite input so a single NaN logit
     // cannot poison the whole distribution (treat as -inf → never selected).
-    let scaled: Vec<f32> = logits
+    let scaled: Vec<f32> = pen_log
         .iter()
         .map(|&x| {
             // NaN poisons the distribution; +INF is a valid (dominant) logit
@@ -238,14 +300,14 @@ mod tests {
     #[test]
     fn greedy_picks_max_logit() {
         let logits = vec![0.1, 2.0, 0.5, -1.0];
-        assert_eq!(sample_logits(&logits, 0.0, 1.0, 0, &mut || 0), 1);
+        assert_eq!(sample_logits(&logits, 0.0, 1.0, 0, 1.0, &[], &mut || 0), 1);
     }
 
     #[test]
     fn temperature_zero_is_argmax_regardless_of_rng() {
         // A non-zero rng must not perturb a greedy draw.
         let logits = vec![0.1, 2.0, 0.5, -1.0];
-        let chosen = sample_logits(&logits, 0.0, 1.0, 0, &mut || 0xFFFF_FFFF);
+        let chosen = sample_logits(&logits, 0.0, 1.0, 0, 1.0, &[], &mut || 0xFFFF_FFFF);
         assert_eq!(chosen, 1);
     }
 
@@ -264,7 +326,7 @@ mod tests {
         };
         let mut dominant = 0usize;
         for _ in 0..1000 {
-            if sample_logits(&logits, 1.0, 0.95, 0, &mut rng) == 1 {
+            if sample_logits(&logits, 1.0, 0.95, 0, 1.0, &[], &mut rng) == 1 {
                 dominant += 1;
             }
         }
@@ -284,7 +346,7 @@ mod tests {
             (seed >> 32) as u32
         };
         for _ in 0..200 {
-            assert_eq!(sample_logits(&logits, 1.0, 0.5, 0, &mut rng), 0);
+            assert_eq!(sample_logits(&logits, 1.0, 0.5, 0, 1.0, &[], &mut rng), 0);
         }
     }
 
@@ -292,13 +354,13 @@ mod tests {
     fn non_finite_logits_do_not_poison_sample() {
         let logits = vec![f32::NAN, 2.0, f32::INFINITY, -1.0];
         // INFINITY dominates softmax → token 2; NaN is masked to -inf.
-        let chosen = sample_logits(&logits, 1.0, 1.0, 0, &mut || 0);
+        let chosen = sample_logits(&logits, 1.0, 1.0, 0, 1.0, &[], &mut || 0);
         assert_eq!(chosen, 2);
     }
 
     #[test]
     fn params_resolve_to_greedy_when_temperature_zero() {
-        let sampler = SamplingParams { temperature: 0.0, top_p: 0.9, top_k: 40 }.into_sampler(42);
+        let sampler = SamplingParams { temperature: 0.0, top_p: 0.9, top_k: 40, repeat_penalty: 1.0 }.into_sampler(42);
         assert_eq!(sampler.name(), "greedy");
     }
 }

@@ -254,6 +254,10 @@ async fn chat_completions(
             .get("top_k")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32,
+        repeat_penalty: body_obj
+            .get("repeat_penalty")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0) as f32,
     };
     // A per-request seed keeps stochastic sampling reproducible for a given
     // (model, request) without a global RNG; temperature == 0 path ignores it.
@@ -1286,6 +1290,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/generate", post(grim_generate))
         .route("/api/tags", get(grim_tags))
         .route("/api/pull", post(grim_pull))
+        // Dashboard:
+        .route("/", get(dashboard_html))
+        .route("/api/stats", get(stats_endpoint))
         .with_state(state)
 }
 
@@ -2003,3 +2010,223 @@ mod tests {
         assert_eq!(token_count, 1, "stop sequence must end generation at the first token");
     }
 }
+
+// ============================================================================
+// Dashboard endpoint — live stats for the server status page.
+// ============================================================================
+
+/// `GET /api/stats` — JSON stats snapshot polled by the dashboard at `/`.
+async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let engine = state.engine.lock().unwrap();
+    let models = engine.loaded_models();
+    let model_name = models.first().cloned().unwrap_or_else(|| "none".to_string());
+
+    // Hardware probe (matches /metrics): real GPU count + xnack.
+    let (rocm_gpu_count, xnack_enabled) = match grim_backend_rocm::RocmDevice::probe() {
+        Ok(devices) if !devices.is_empty() => (devices.len(), devices[0].xnack_enabled()),
+        _ => (0, false),
+    };
+
+    // Catalog snapshot: list every local model, grouped by format so the
+    // dashboard can render the same "GRIM > GGUF > other" priority as the CLI.
+    let mut grim_models = Vec::new();
+    let mut gguf_models = Vec::new();
+    let mut other_models = Vec::new();
+    for entry in grim_core::catalog::list_local_models() {
+        let path = std::path::PathBuf::from(&entry.path);
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("unknown").to_string();
+        let item = serde_json::json!({
+            "name": entry.name,
+            "format": ext,
+            "size": entry.size_bytes,
+            "arch": entry.arch,
+            "params": entry.params,
+            "quant": entry.quant,
+        });
+        match ext.as_str() {
+            "grim" => grim_models.push(item),
+            "gguf" => gguf_models.push(item),
+            _ => other_models.push(item),
+        }
+    }
+
+    // Once we wire real telemetry counters into the engine (tokens generated,
+    // wall-clock time per batch, KV block occupancy), this becomes live data.
+    // For now the fields are present and typed so the frontend contract is fixed.
+    let is_loaded = model_name != "none";
+    serde_json::json!({
+        "model_name": model_name,
+        "tokens_per_sec": if is_loaded { serde_json::json!(0.0f32) } else { serde_json::Value::Null },
+        "kv_cache": {
+            "used": 0u64,
+            "total": 0u64,
+            "blocks_used": 0u64,
+            "blocks_total": 0u64,
+        },
+        "vram": {
+            "used": 0u64,
+            "total": 0u64,
+        },
+        "sys_ram": {
+            "used": 0u64,
+            "total": 0u64,
+        },
+        "gpus": [{
+            "index": 0u32,
+            "compute": 0u32,
+            "memory": 0u32,
+            "name": if rocm_gpu_count > 0 { "ROCm GPU" } else { "CPU" },
+        }],
+        "hardware": {
+            "rocm_gpu_count": rocm_gpu_count,
+            "xnack_enabled": xnack_enabled,
+        },
+        "adapters_active": engine.adapter_count(),
+        "models": {
+            "grim": grim_models,
+            "gguf": gguf_models,
+            "other": other_models,
+        },
+    }).into()
+}
+
+/// `GET /` — live dashboard HTML. Polls `/api/stats` every 2s for updates.
+async fn dashboard_html() -> axum::response::Html<&'static str> {
+    axum::response::Html(DASHBOARD_HTML)
+}
+
+/// Dashboard HTML (static, polls /api/stats via fetch).
+const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Grim Server</title>
+<style>
+  *{box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
+  body{margin:0;padding:24px;background:#0d1117;color:#c9d1d9}
+  h1{color:#00d4aa;margin:0 0 4px;font-size:28px}
+  .sub{color:#8b949e;margin-bottom:24px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;margin-bottom:24px}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px}
+  .card h3{margin:0 0 16px;color:#00d4aa;font-size:12px;text-transform:uppercase;letter-spacing:1px}
+  .row{display:flex;justify-content:space-between;align-items:center;margin:10px 0}
+  .label{color:#8b949e;font-size:13px}
+  .val{font-weight:600;font-size:15px}
+  .val.green{color:#3fb950}.val.yellow{color:#d29922}.val.red{color:#f85149}
+  .bar{height:6px;background:#21262d;border-radius:3px;overflow:hidden;margin-top:6px}
+  .bar-fill{height:100%;background:linear-gradient(90deg,#00d4aa,#39d0d8);transition:width .5s}
+  .models-section h2{color:#8b949e;font-size:14px;text-transform:uppercase;letter-spacing:1px;margin:24px 0 12px}
+  .model-list{list-style:none;padding:0;margin:0}
+  .model-row{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #21262d}
+  .model-row:last-child{border-bottom:none}
+  .badge{font-size:10px;padding:2px 8px;border-radius:10px;text-transform:uppercase;font-weight:700}
+  .badge.grim{background:#1f6feb;color:#fff}
+  .badge.gguf{background:#6e7681;color:#fff}
+  .badge.other{background:#8b949e;color:#0d1117}
+  #status-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px}
+  #status-dot.live{background:#3fb950;animation:pulse 2s infinite}
+  #status-dot.dead{background:#f85149}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+  .empty{color:#6e7681;font-style:italic}
+</style>
+</head>
+<body>
+<h1>🦇 Grim Server</h1>
+<div class="sub"><span id="status-dot" class="dead"></span><span id="conn-status">Connecting…</span></div>
+
+<div class="grid">
+  <div class="card">
+    <h3>Loaded Model</h3>
+    <div class="row"><span class="label">Name</span><span id="model-name" class="val">—</span></div>
+    <div class="row"><span class="label">Tokens / sec</span><span id="tps" class="val">—</span></div>
+    <div class="row"><span class="label">Adapters</span><span id="adapters" class="val">0</span></div>
+  </div>
+  <div class="card">
+    <h3>KV Cache</h3>
+    <div class="row"><span class="label">Usage</span><span id="kv" class="val">—</span></div>
+    <div class="bar"><div id="kv-bar" class="bar-fill" style="width:0%"></div></div>
+    <div class="row"><span class="label">Blocks</span><span id="kv-blocks" class="val">—</span></div>
+  </div>
+  <div class="card">
+    <h3>VRAM</h3>
+    <div class="row"><span class="label">Used</span><span id="vram" class="val">—</span></div>
+    <div class="bar"><div id="vram-bar" class="bar-fill" style="width:0%"></div></div>
+  </div>
+  <div class="card">
+    <h3>GPU</h3>
+    <div class="row"><span class="label">Device</span><span id="gpu-name" class="val">—</span></div>
+    <div class="row"><span class="label">Compute</span><span id="gpu-cmp" class="val">—</span></div>
+    <div class="row"><span class="label">Memory</span><span id="gpu-mem" class="val">—</span></div>
+  </div>
+</div>
+
+<div class="models-section">
+  <h2>GRIM Models</h2>
+  <ul id="m-grim" class="model-list"><li class="empty">No .grim models cached</li></ul>
+  <h2>GGUF Models</h2>
+  <ul id="m-gguf" class="model-list"><li class="empty">No .gguf models cached</li></ul>
+  <h2>Other Models</h2>
+  <ul id="m-other" class="model-list"><li class="empty">No other models cached</li></ul>
+</div>
+
+<script>
+function fmt(b){if(b===0)return '0 B';const u=['B','KB','MB','GB','TB'];let i=0;while(b>=1024&&i<u.length-1){b/=1024;i++}return b.toFixed(1)+' '+u[i]}
+function pct(used,total){return total>0?Math.round(used/total*100):0}
+function cls(p){return p>90?'red':p>70?'yellow':'green'}
+
+async function poll(){
+  try{
+    const r=await fetch('/api/stats');
+    if(!r.ok)throw 0;
+    const d=await r.json();
+    document.getElementById('status-dot').className='live';
+    document.getElementById('conn-status').textContent='Live — refreshing every 2s';
+
+    document.getElementById('model-name').textContent=d.model_name||'—';
+    const tps=d.tokens_per_sec;
+    const tpsEl=document.getElementById('tps');
+    tpsEl.textContent=(tps!==null&&tps!==undefined)?tps.toFixed(1):'—';
+    tpsEl.className='val '+(tps>20?'green':tps>5?'yellow':'red');
+    document.getElementById('adapters').textContent=d.adapters_active??0;
+
+    const kvPct=pct(d.kv_cache.used,d.kv_cache.total);
+    document.getElementById('kv').textContent=d.kv_cache.total>0?fmt(d.kv_cache.used)+' / '+fmt(d.kv_cache.total):'—';
+    document.getElementById('kv-bar').style.width=kvPct+'%';
+    document.getElementById('kv-blocks').textContent=(d.kv_cache.blocks_used??0)+' / '+(d.kv_cache.blocks_total??0);
+
+    const vramPct=pct(d.vram.used,d.vram.total);
+    const vEl=document.getElementById('vram');
+    vEl.textContent=d.vram.total>0?fmt(d.vram.used)+' / '+fmt(d.vram.total):'—';
+    vEl.className='val '+cls(vramPct);
+    document.getElementById('vram-bar').style.width=vramPct+'%';
+
+    const gpu=(d.gpus&&d.gpus[0])||{};
+    document.getElementById('gpu-name').textContent=gpu.name||'—';
+    document.getElementById('gpu-cmp').textContent=(gpu.compute??0)+'%';
+    document.getElementById('gpu-mem').textContent=(gpu.memory??0)+'%';
+
+    if(d.models){
+      const render=(id,arr)=>{
+        const el=document.getElementById(id);
+        if(!arr||arr.length===0){el.innerHTML='<li class="empty">None</li>';return}
+        el.innerHTML=arr.map(m=>{
+          const sz=m.size?fmt(m.size):'';
+          const extra=[m.params,m.quant].filter(Boolean).join(' · ');
+          return '<li class="model-row"><span>'+m.name+(extra?' <span class="label">'+extra+'</span>':'')+'</span><span class="badge '+(m.format||'other')+'">'+m.format+' '+sz+'</span></li>';
+        }).join('');
+      };
+      render('m-grim',d.models.grim);
+      render('m-gguf',d.models.gguf);
+      render('m-other',d.models.other);
+    }
+  }catch(e){
+    document.getElementById('status-dot').className='dead';
+    document.getElementById('conn-status').textContent='Disconnected — retrying…';
+  }
+}
+poll();
+setInterval(poll,2000);
+</script>
+</body>
+</html>"#;

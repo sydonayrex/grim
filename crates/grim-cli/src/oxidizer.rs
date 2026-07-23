@@ -140,8 +140,13 @@ impl CalibrationBatch {
 pub fn cmd_oxidizer_calibrate(
     model_path: &str,
     output_path: &str,
-    _calibration_dataset: Option<&str>,
+    calibration_dataset: Option<&str>,
 ) -> Result<ImportanceScores, String> {
+    if let Some(ds) = calibration_dataset {
+        eprintln!("[oxidizer] calibrate: using dataset '{ds}'");
+    } else {
+        eprintln!("[oxidizer] calibrate: no calibration dataset provided (CPU heuristic)");
+    }
     let (provider, names, _sizes, _meta) = open_provider(model_path)?;
     let mut tensor_data: Vec<(String, Vec<f32>, usize, usize)> = Vec::new();
 
@@ -170,6 +175,7 @@ pub fn cmd_oxidizer_calibrate(
     let out_json = serde_json::json!({
         "version": OXIDIZER_VERSION,
         "model_path": model_path,
+        "calibration_dataset": calibration_dataset,
         "tensors": result.tensor_names.iter().zip(result.layer_scores.iter()).map(|(n, s)| {
             serde_json::json!({ "name": n, "importance_score": s })
         }).collect::<Vec<_>>(),
@@ -224,7 +230,6 @@ pub fn cmd_oxidizer_convert(
         })
         .collect::<Vec<usize>>();
     let bitwidths = cmd_oxidizer_search(&importance_scores, &tensor_sizes, target_bpw, generations);
-    eprintln!("[DEBUG] EvoPress bitwidths: {:?}", bitwidths);
 
     // Create full bitwidths array for ALL tensors in the model
     // Tensors with importance scores get their EvoPress bitwidth, others get target_bpw
@@ -281,7 +286,11 @@ pub fn cmd_oxidizer_convert(
         calibration_dataset.as_deref(),
         None,
         Some(full_bitwidths),
-        Some(importance_scores.layer_scores.clone()),
+        // Pass the calibrated metadata through — `convert_to_grim` will
+        // preserve `quant_overrides` / `ext_entries` / etc. that carry
+        // per-tensor importance scores and layout hints, and stamp the
+        // grim-v1 identity + ROCm target/gcn fields on top.
+        Some(grim_meta),
     ).map_err(|e| e.to_string())?;
     Ok(())
 }

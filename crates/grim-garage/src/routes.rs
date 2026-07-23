@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tower_http::services::ServeDir;
 
+use grim_tensor::BackendDevice;
 use crate::discovery::{default_datasets_dir, default_models_dir, DatasetEntry, ModelEntry};
 use crate::jobs::{JobId, JobRegistry, TrainingJob, TrainingMode};
 use crate::rocm::{probe_rocm_devices, RocmDeviceInfo};
@@ -291,10 +292,69 @@ async fn cancel_job(
 async fn get_bolt_ons(
     AxumPath(model_id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let model_path = Path::new(&model_id);
+    if !model_path.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("model not found: {}", model_id) })),
+        ));
+    }
+
+    // Open the .grim file and check backup2 status for each tensor.
+    let file = match std::fs::File::open(model_path) {
+        Ok(f) => f,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed to open model: {e}") })),
+            ));
+        }
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let grim_file = match grim_format::format::GrimFile::read(&mut reader) {
+        Ok(g) => g,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed to parse .grim: {e}") })),
+            ));
+        }
+    };
+
+    // Check each tensor's backup2 status.
+    let mut bolt_ons = Vec::new();
+    for entry in &grim_file.tensors {
+        if let Some(ext) = grim_file.metadata.get_tensor_ext(&entry.name) {
+            if ext.backup2.is_present() {
+                // Read a byte from the backup2 codes region to check if it's non-zero (attached).
+                let codes_offset = entry.payload_offset + ext.backup2.codes_offset;
+                let is_attached = if ext.backup2.codes_size > 0 {
+                    let mut buf = [0u8; 1];
+                    let f2 = std::fs::File::open(model_path).ok();
+                    if let Some(mut f2) = f2 {
+                        use std::io::{Read, Seek, SeekFrom};
+                        f2.seek(SeekFrom::Start(codes_offset)).ok();
+                        f2.read_exact(&mut buf).ok();
+                        buf[0] != 0
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                bolt_ons.push(json!({
+                    "tensor": entry.name,
+                    "backup2_provisioned": true,
+                    "attached": is_attached,
+                }));
+            }
+        }
+    }
+
     Ok(Json(json!({
         "model_id": model_id,
         "bolt_on_slot": "backup2",
-        "attached": false,
+        "tensors": bolt_ons,
     })))
 }
 
@@ -304,12 +364,96 @@ async fn attach_bolt_on_route(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let model_path = Path::new(&model_id);
     if !model_path.exists() {
-        return Ok(Json(json!({
-            "status": "attached",
-            "model_id": model_id,
-            "adapter_path": req.adapter_path,
-            "scale": req.scale,
-        })));
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("model not found: {}", model_id) })),
+        ));
+    }
+
+    // Load the adapter sidecar.
+    let sidecar_path = format!("{}.train", req.adapter_path);
+    let sidecar = match grim_format::train::TrainState::read(&sidecar_path) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("adapter sidecar not found: {}", sidecar_path) })),
+            ));
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed to read adapter sidecar: {e}") })),
+            ));
+        }
+    };
+
+    // Find all tensors with lora adapters in the sidecar.
+    let tensor_names = sidecar.lora_tensor_names();
+    if tensor_names.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no lora adapters found in sidecar" })),
+        ));
+    }
+
+    // Create a CPU backend for tensor construction.
+    let cpu_backend = grim_backend_cpu::device::CpuDevice::new();
+
+    let mut attached = Vec::new();
+    let mut errors = Vec::new();
+
+    for tensor_name in &tensor_names {
+        match sidecar.lora_weights_for(tensor_name) {
+            Some((a_data, a_shape, b_data, b_shape)) => {
+                // Create Tensor objects from the raw f32 data.
+                let a_shape = grim_tensor::Shape::from_slice(a_shape);
+                let b_shape = grim_tensor::Shape::from_slice(b_shape);
+                let a_storage = match cpu_backend.from_cpu(&a_data, &a_shape, grim_tensor::DType::F32) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        errors.push(json!({ "tensor": tensor_name, "error": format!("failed to create A tensor: {e}") }));
+                        continue;
+                    }
+                };
+                let b_storage = match cpu_backend.from_cpu(&b_data, &b_shape, grim_tensor::DType::F32) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        errors.push(json!({ "tensor": tensor_name, "error": format!("failed to create B tensor: {e}") }));
+                        continue;
+                    }
+                };
+                let a_tensor = grim_tensor::Tensor::new(
+                    std::sync::Arc::from(a_storage),
+                    a_shape,
+                    grim_tensor::DType::F32,
+                    grim_tensor::dtype::QuantProvenance::GrimNative,
+                    grim_tensor::dtype::Device::Cpu,
+                );
+                let b_tensor = grim_tensor::Tensor::new(
+                    std::sync::Arc::from(b_storage),
+                    b_shape,
+                    grim_tensor::DType::F32,
+                    grim_tensor::dtype::QuantProvenance::GrimNative,
+                    grim_tensor::dtype::Device::Cpu,
+                );
+
+                match grim_format::bolt_on::attach_bolt_on(model_path, tensor_name, &a_tensor, &b_tensor, req.scale) {
+                    Ok(()) => attached.push(tensor_name.clone()),
+                    Err(e) => errors.push(json!({ "tensor": tensor_name, "error": format!("{e}") })),
+                }
+            }
+            None => {
+                errors.push(json!({ "tensor": tensor_name, "error": "missing lora A or B weights in sidecar" }));
+            }
+        }
+    }
+
+    if attached.is_empty() && !errors.is_empty() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "failed to attach any bolt-on adapters", "details": errors })),
+        ));
     }
 
     Ok(Json(json!({
@@ -317,6 +461,8 @@ async fn attach_bolt_on_route(
         "model_id": model_id,
         "adapter_path": req.adapter_path,
         "scale": req.scale,
+        "attached_tensors": attached,
+        "errors": errors,
     })))
 }
 
@@ -324,15 +470,25 @@ async fn detach_bolt_on_route(
     AxumPath((model_id, slot)): AxumPath<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let model_path = Path::new(&model_id);
-    if model_path.exists() {
-        let _ = grim_format::bolt_on::detach_bolt_on(model_path, "blk.0.attn_q");
+    if !model_path.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("model not found: {}", model_id) })),
+        ));
     }
 
-    Ok(Json(json!({
-        "status": "detached",
-        "model_id": model_id,
-        "slot": slot,
-    })))
+    // Use the tensor name from the URL path (slot = tensor_name).
+    match grim_format::bolt_on::detach_bolt_on(model_path, &slot) {
+        Ok(()) => Ok(Json(json!({
+            "status": "detached",
+            "model_id": model_id,
+            "tensor": slot,
+        }))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("detach failed: {e}") })),
+        )),
+    }
 }
 
 async fn sse_metrics(
@@ -411,6 +567,8 @@ async fn convert_model_route(
         &req.target_gcn,
         req.target_bpw,
         req.evopress_generations,
+        None,
+        None,
         None,
         None,
     ) {

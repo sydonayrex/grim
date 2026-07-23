@@ -4,7 +4,7 @@ use grim_core::error::Result;
 use grim_core::model::CausalLm;
 use grim_core::session::Inner as SessionInner;
 use grim_core::sampler::{SamplingParams, Sampler};
-use grim_engine::{Engine, EngineConfig, model_loader::load_model_from_grim};
+use grim_engine::{Engine, EngineConfig, model_loader::{load_model_from_grim, load_model_from_safetensors}};
 use grim_models_transformer::{Llama, LlamaConfig, Lfm2, Lfm2Config, Gpt2, Gpt2Config, Gemma, GemmaConfig, DeepSeek, DeepSeekConfig, T5, T5Config};
 use grim_models_mamba::{Rwkv, RwkvConfig};
 use grim_models_vision::{Bert, BertConfig};
@@ -53,6 +53,7 @@ pub async fn cmd_run(
     let path_obj = std::path::Path::new(&model_path_str);
     let use_gguf = path_obj.is_file() && model_path_str.to_lowercase().ends_with(".gguf");
     let use_grim = path_obj.is_file() && model_path_str.to_lowercase().ends_with(".grim");
+    let use_safetensors = path_obj.is_file() && (model_path_str.to_lowercase().ends_with(".safetensors") || model_path_str.to_lowercase().ends_with(".bin"));
 
     let (device, device_name) = if let Ok(s) = std::env::var("GRIM_FORCE_DEVICE") {
         match s.as_str() {
@@ -144,11 +145,23 @@ pub async fn cmd_run(
                     return Err(e);
                 }
             }
+        } else if use_safetensors {
+            eprintln!("[grim] Loading safetensors model: {}", model_path_str);
+            match load_model_from_safetensors(&model_path_str, device.clone()) {
+                Ok(m) => {
+                    eprintln!("[grim] safetensors model loaded successfully.");
+                    m
+                }
+                Err(e) => {
+                    eprintln!("[grim] ERROR: failed to load safetensors model '{}': {}", model_path_str, e);
+                    return Err(e);
+                }
+            }
         } else {
             // Never silently run a toy model — error loudly so the user
             // knows they need to pull a real model first.
             return Err(grim_core::error::Error::Config(format!(
-                "Model '{}' is not a valid .gguf or .grim file or does not exist. \
+                "Model '{}' is not a valid .gguf, .grim, or .safetensors file or does not exist. \
                  Run 'grim pull <name>' to download a model first.",
                 model_path_str
             )));
@@ -187,12 +200,24 @@ pub async fn cmd_run(
                 return Err(e);
             }
         }
+    } else if use_safetensors {
+        eprintln!("[grim] Loading safetensors model: {}", model_path_str);
+        match load_model_from_safetensors(&model_path_str, device.clone()) {
+            Ok(m) => {
+                eprintln!("[grim] safetensors model loaded successfully.");
+                m
+            }
+            Err(e) => {
+                eprintln!("[grim] ERROR: failed to load safetensors model '{}': {}", model_path_str, e);
+                return Err(e);
+            }
+        }
     } else {
         // Fail loudly — never generate from a toy model.
         return Err(grim_core::error::Error::Config(format!(
-            "Model '{}' is not a valid .gguf or .grim file or could not be found.\n\
+            "Model '{}' is not a valid .gguf, .grim, or .safetensors file or could not be found.\n\
              Run 'grim pull <name>' to download a model, or provide an\n\
-             explicit path to a .gguf or .grim file.",
+             explicit path to a .gguf, .grim, or .safetensors file.",
             model_path_str
         )));
     };
@@ -206,6 +231,16 @@ pub async fn cmd_run(
         if gguf_path.exists() {
             let provider = grim_format::GgufProvider::open(gguf_path.to_str().unwrap())?;
             Some(provider.tokenizer()?)
+        } else {
+            None
+        }
+    } else if use_safetensors {
+        // For safetensors, load tokenizer from the sibling tokenizer.json
+        // (HuggingFace format) in the same directory.
+        let dir = path_obj.parent().unwrap_or(std::path::Path::new("."));
+        let tokenizer_json = dir.join("tokenizer.json");
+        if tokenizer_json.exists() {
+            grim_format::GgufTokenizer::from_hf_json(tokenizer_json.to_str().unwrap()).ok()
         } else {
             None
         }
@@ -224,7 +259,24 @@ pub async fn cmd_run(
 
     // Tokenize prompt
     let mut tokens: Vec<u32> = if let Some(tok) = &tokenizer {
-        tok.encode(&prompt)
+        let mut ids = Vec::new();
+
+        // Prepend BOS token for models that expect it (e.g. <|startoftext|> for LFM2).
+        let bos_candidates = ["<|startoftext|>", "<s>", "<|im_start|>"];
+        for bos in &bos_candidates {
+            if let Some(&id) = tok.token_to_id.get(*bos) {
+                ids.push(id);
+                break;
+            }
+        }
+
+        ids.extend(tok.encode(&prompt));
+        eprintln!("[grim] Encoded prompt: {} tokens: {:?}", ids.len(), ids);
+        let decoded: Vec<&str> = ids.iter()
+            .filter_map(|&id| tok.tokens.get(id as usize).map(|s| s.as_str()))
+            .collect();
+        eprintln!("[grim] Decoded tokens: {:?}", decoded);
+        ids
     } else {
         prompt.bytes().map(|b| b as u32 % 512).collect()
     };
@@ -251,12 +303,24 @@ pub async fn cmd_run(
     let mut session = SessionInner::new(model.device().clone());
     let mut generated = 0;
     let mut history: Vec<u32> = Vec::new();
+    let mut first_pass = true;
 
     // Generation loop
     while generated < max_tokens {
-        // Create input tensor for current sequence
-        let shape = grim_tensor::Shape::new(vec![tokens.len()]);
-        let float_tokens: Vec<f32> = tokens.iter().map(|t| *t as f32).collect();
+        // First pass: prefill with all prompt tokens to populate KV/conv caches.
+        // Subsequent passes: incremental decode — only pass the latest token
+        // so the caches (KV for attention, state for ShortConv) accumulate
+        // correctly instead of seeing the same tokens repeated.
+        let input_ids: Vec<f32> = if first_pass {
+            first_pass = false;
+            tokens.iter().map(|t| *t as f32).collect()
+        } else {
+            vec![*tokens.last().unwrap() as f32]
+        };
+
+        // Build tensor from the selected token(s)
+        let shape = grim_tensor::Shape::new(vec![input_ids.len()]);
+        let float_tokens = input_ids;
         let dtype = grim_tensor::dtype::DType::F32;
         let storage: Arc<dyn grim_tensor::BackendStorage> = match device {
             grim_tensor::Device::Cpu => {
@@ -365,21 +429,6 @@ pub async fn cmd_run(
     Ok(())
 }
 
-fn random_config() -> LlamaConfig {
-    LlamaConfig {
-        vocab_size: 512,
-        hidden_size: 64,
-        num_heads: 2,
-        num_kv_heads: 1,
-        head_dim: 32,
-        num_layers: 1,
-        intermediate_size: 128,
-        rms_norm_eps: 1e-5,
-        rope_theta: 10000.0,
-        max_seq_len: 64,
-    }
-}
-
 /// Load a model from a GGUF file.
 pub fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn CausalLm>> {
     use grim_format::GgufProvider;
@@ -482,6 +531,9 @@ pub fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn Causal
         let num_kv_heads = head_count_kv_vec.iter().find(|&&n| n > 0).copied().unwrap_or(8) as usize;
         let head_dim = get_meta_u32("lfm2.attention.key_length", 64) as usize;
         let intermediate_size = get_meta_u32("lfm2.feed_forward_length", 4608) as usize;
+        let rope_theta = provider.metadata("lfm2.rope.freq_base")
+            .and_then(|v| v.as_f32())
+            .unwrap_or(1000000.0f32);
         let cfg = Lfm2Config {
             vocab_size,
             hidden_size,
@@ -491,6 +543,7 @@ pub fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn Causal
             num_layers,
             intermediate_size,
             rms_norm_eps,
+            rope_theta,
             n_shortconv_l_cache,
             is_recr: is_recr.clone(),
         };

@@ -116,6 +116,10 @@ pub fn read_safetensor_bytes<R: Read + Seek>(
     info: &SafetensorInfo,
     data_region_start: u64,
 ) -> Result<Vec<u8>> {
+    // Safetensors data_offsets in the JSON header are relative to the
+    // data section, which starts at `data_region_start` (the header length
+    // prefix + JSON header).  Add this base offset to reach the actual
+    // file position.
     let start = data_region_start + info.data_start;
     let size = (info.data_end - info.data_start) as usize;
     reader.seek(SeekFrom::Start(start))?;

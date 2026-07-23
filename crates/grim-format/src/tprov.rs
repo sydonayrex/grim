@@ -729,3 +729,38 @@ mod tests {
         assert_eq!(read_back, vec![1.0, 2.0, 3.0, 4.0]);
     }
 }
+
+// ---------- Remapping Tensor Provider ----------
+/// Wraps a `TensorProvider` and remaps tensor names using a provided
+/// mapping function. Useful for loading checkpoints with different naming
+/// conventions (e.g., Hugging Face → GGUF).
+pub struct RemappingTensorProvider<'a> {
+    inner: &'a dyn TensorProvider,
+    remap: Box<dyn Fn(&str) -> String + Send + Sync + 'a>,
+}
+
+impl<'a> RemappingTensorProvider<'a> {
+    pub fn new(inner: &'a dyn TensorProvider, remap: impl Fn(&str) -> String + Send + Sync + 'a) -> Self {
+        Self {
+            inner,
+            remap: Box::new(remap),
+        }
+    }
+}
+
+impl<'a> TensorProvider for RemappingTensorProvider<'a> {
+    fn get(&self, name: &str) -> Result<RawTensor> {
+        let mapped = (self.remap)(name);
+        self.inner.get(&mapped)
+    }
+
+    fn get_packed(&self, name: &str) -> Result<RawTensor> {
+        let mapped = (self.remap)(name);
+        self.inner.get_packed(&mapped)
+    }
+
+    fn meta(&self, name: &str) -> Result<TensorMeta> {
+        let mapped = (self.remap)(name);
+        self.inner.meta(&mapped)
+    }
+}
