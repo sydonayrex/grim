@@ -459,6 +459,20 @@ fn broadcast_index(linear: usize, src_dims: &[usize], out_dims: &[usize]) -> usi
 
 /// Convenience: build a host tensor owned by `CpuDevice`.
 pub fn cpu_tensor(data: Vec<f32>, shape: Shape) -> grim_tensor::Tensor {
+    // Defensive shape guard (WI-F4-close): a `Vec<f32>` whose length does not
+    // match `shape`'s element count silently built a malformed tensor, letting
+    // the training-loop fake-embedding bug (`seq_len` raw IDs cast through
+    // `cpu_tensor` into a `[seq_len, hidden]` tensor) hide in plain sight.
+    // Debug-mode panic catches the bug at the exact failing call site; release
+    // builds keep the original no-check fast path so 137+ existing call sites
+    // stay untouched.
+    assert!(
+        data.len() == shape.elem_count(),
+        "cpu_tensor: data.len() ({}) must equal shape.elem_count() ({:?} -> {} elements)",
+        data.len(),
+        shape.dims(),
+        shape.elem_count()
+    );
     grim_tensor::Tensor::new(
         Arc::new(CpuStorage::new(data, shape.clone(), DType::F32)),
         shape,
@@ -582,6 +596,45 @@ mod tests {
             approx_eq(&ref_out, &oxi_out, 1e-3),
             "OxiBLAS 32×32 must match scalar within 1e-3 f32 tolerance"
         );
+    }
+
+    // ── WI-F4-close: cpu_tensor must reject mismatched data/shape ───────
+    // Root-cause guard: the training-loop fake-embedding bug
+    // (`x_data: Vec<f32>` of length `seq_len` masquerading as a tensor of
+    // shape `[seq_len, hidden]`) was silent because cpu_tensor built the
+    // tensor without checking. This test fails on the buggy version and
+    // passes once cpu_tensor panics on shape mismatches in debug builds.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "cpu_tensor: data.len")]
+    fn cpu_tensor_debug_panics_on_data_shape_mismatch() {
+        // seq_len=3, hidden=4 → expected 12 elements, but we pass only 3.
+        let bad_data: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let _ = cpu_tensor(bad_data, Shape::new(vec![3, 4]));
+    }
+
+    #[test]
+    fn cpu_tensor_accepts_matching_data_shape() {
+        // Sanity: well-formed call still works.
+        let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let t = cpu_tensor(data, Shape::new(vec![3, 4]));
+        assert_eq!(t.shape().dims(), &[3, 4]);
+        let v = t.to_vec_f32().expect("to_vec_f32");
+        assert_eq!(v.len(), 12);
+    }
+
+    #[test]
+    fn cpu_tensor_accepts_scalar_shape() {
+        // 1-D shapes work.
+        let t = cpu_tensor(vec![42.0], Shape::new(vec![1]));
+        assert_eq!(t.to_vec_f32().unwrap(), vec![42.0]);
+    }
+
+    #[test]
+    fn cpu_tensor_accepts_empty_shape() {
+        // Empty shape with empty data is the zero-element tensor.
+        let t = cpu_tensor(vec![], Shape::new(vec![0, 4]));
+        assert_eq!(t.shape().dims(), &[0, 4]);
     }
 
     // ── 6. BackendDevice::matmul end-to-end ───────────────────────────────

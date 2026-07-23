@@ -93,11 +93,32 @@ impl<'a> WeightSource<'a> {
         let raw = self.tensors.get_packed(&name)?;
 
         if raw.shape != shape.dims() {
+            eprintln!(
+                "[get-trace] ShapeMismatch at name={} expected={:?} got={:?}",
+                name, shape.dims(), raw.shape
+            );
             return Err(Error::ShapeMismatch {
                 expected: shape.dims().to_vec(),
                 got: raw.shape.clone(),
             });
         }
+        let (dtype, provenance) = match self.tensors.meta(&name) {
+            Ok(m) => (m.dtype, m.provenance),
+            Err(_) => (self.default_dtype.clone(), self.default_provenance.clone()),
+        };
+
+        materialize(raw, shape, dtype, provenance, &self.device)
+    }
+
+    /// Materialize a tensor without enforcing an expected shape up-front.
+    ///
+    /// This contract enables callers to perform dynamic shape inspection and
+    /// layout normalization (for instance, [`Embedding::load`] handling
+    /// transposed weights or token dimension padding in model checkpoints).
+    pub fn get_unconstrained(&self, leaf: &str) -> Result<Tensor> {
+        let name = self.full_name(leaf);
+        let raw = self.tensors.get_packed(&name)?;
+        let shape = Shape::new(raw.shape.clone());
         let (dtype, provenance) = match self.tensors.meta(&name) {
             Ok(m) => (m.dtype, m.provenance),
             Err(_) => (self.default_dtype.clone(), self.default_provenance.clone()),

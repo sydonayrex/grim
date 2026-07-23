@@ -76,12 +76,15 @@ pub fn home_dir() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn models_dir_env_override() {
-        // SAFETY: single-threaded test process; env mutation is isolated.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("GRIM_MODELS_DIR").ok();
         unsafe {
             std::env::set_var("GRIM_MODELS_DIR", "/tmp/grim_test_models");

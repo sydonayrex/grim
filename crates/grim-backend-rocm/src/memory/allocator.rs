@@ -92,7 +92,11 @@ impl RocmCachingAllocator {
         }
 
         let mut dev_ptr_void: *mut c_void = std::ptr::null_mut();
-        check_hip("hipMalloc", unsafe { hipMalloc(&mut dev_ptr_void, cls) })?;
+        let res = check_hip("hipMalloc", unsafe { hipMalloc(&mut dev_ptr_void, cls) });
+        if res.is_err() {
+            self.empty_cache();
+            check_hip("hipMalloc", unsafe { hipMalloc(&mut dev_ptr_void, cls) })?;
+        }
         self.malloc_count.fetch_add(1, Ordering::Relaxed);
         Ok(dev_ptr_void)
     }
@@ -106,6 +110,7 @@ impl RocmCachingAllocator {
         };
         if over_cap || ptr.is_null() {
             unsafe {
+                let _ = crate::hipDeviceSynchronize();
                 let _ = hipFree(ptr);
             }
             self.free_count.fetch_add(1, Ordering::Relaxed);
@@ -121,6 +126,9 @@ impl RocmCachingAllocator {
 
     /// Release every pooled buffer back to the driver. Mirrors `torch.cuda.empty_cache()`.
     pub fn empty_cache(&self) {
+        unsafe {
+            let _ = crate::hipDeviceSynchronize();
+        }
         let mut pool = self.pool.lock().unwrap();
         for (_cls, bufs) in pool.drain() {
             for p in bufs {

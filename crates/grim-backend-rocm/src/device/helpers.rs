@@ -151,7 +151,11 @@ pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<V
 pub fn upload_device_buffer<T: Copy>(data: &[T]) -> Result<*mut c_void> {
     let bytes = data.len() * std::mem::size_of::<T>();
     let mut ptr: *mut c_void = std::ptr::null_mut();
-    let res = unsafe { hipMalloc(&mut ptr, bytes) };
+    let mut res = unsafe { hipMalloc(&mut ptr, bytes) };
+    if res != hipSuccess {
+        unsafe { crate::hipDeviceSynchronize(); }
+        res = unsafe { hipMalloc(&mut ptr, bytes) };
+    }
     if res != hipSuccess {
         return Err(Error::Backend(format!("hipMalloc (scratch) failed: {}", res)));
     }

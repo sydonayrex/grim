@@ -180,6 +180,30 @@ pub trait BackendDevice: Send + Sync {
             "kv_dequant_attention requires a GPU backend with a wired dequant-attention kernel (ROCm)".into(),
         ))
     }
+
+    /// Fused dequantized matmul backward (WI-T3 / F5).
+    ///
+    /// Computes `dX[M, K] = dY[M, N] @ B^T` where `B` is dequantized on-the-fly
+    /// from packed codes + per-column scale, mirroring the forward kernel.
+    /// Used by `grim-autograd::matmul_backward` when the frozen-weight operand
+    /// `B` is quantized and ROCm-resident. Default implementation returns
+    /// `Unimplemented` so CPU/CUDA/Vulkan/Metal fall through unchanged; only
+    /// the ROCm backend overrides this with the real HIP launch.
+    fn quantized_matmul_backward_dx(
+        &self,
+        _dy: &dyn BackendStorage,
+        _b_packed: &dyn BackendStorage,
+        _b_scales: &[f32],
+        _default_bpw: u8,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "quantized_matmul_backward_dx requires ROCm (fused_dequant_backward_gemm_f16)".into(),
+        ))
+    }
 }
 
 /// Owned tensor storage on a specific backend. Backends manage their own

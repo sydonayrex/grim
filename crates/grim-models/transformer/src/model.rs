@@ -94,10 +94,10 @@ impl Llama {
             let data: Vec<f32> = (0..out * inp)
                 .map(|_| (rng.next_f32() - 0.5) * 0.02)
                 .collect();
-            Linear {
-                weight: cpu_tensor(data, Shape::new(vec![out, inp])),
-                bias: None,
-            }
+            Linear::from_tensor(
+                cpu_tensor(data, Shape::new(vec![out, inp])),
+                None,
+            )
         };
         let rms = |dim: usize| RmsNorm {
             weight: cpu_tensor(vec![1.0; dim], Shape::new(vec![dim])),

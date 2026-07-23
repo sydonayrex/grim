@@ -66,12 +66,12 @@ extern "C" {
         int backup_codes_offset,
         int backup_scale_offset)
     {
-        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        const int total = M * N;
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * N;
         if (idx >= total) return;
 
-        const int row = idx / N;
-        const int col = idx % N;
+        const int row = (int)(idx / N);
+        const int col = (int)(idx % N);
 
         float scale = 1.0f;
         if (B_scales != nullptr) {
@@ -119,12 +119,12 @@ extern "C" {
         int backup_codes_offset,
         int backup_scale_offset)
     {
-        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        const int total = M * K;
+        const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned long long total = (unsigned long long)M * K;
         if (idx >= total) return;
 
-        const int row = idx / K;
-        const int k = idx % K;
+        const int row = (int)(idx / K);
+        const int k = (int)(idx % K);
 
         float acc = 0.0f;
         for (int col = 0; col < N; ++col) {
