@@ -83,14 +83,14 @@ impl VitBlock {
                 eps,
             },
             wq, wk, wv, wo,
-            w_fc1: Linear {
-                weight: cpu_tensor(fc1_w, Shape::new(vec![intermediate, hidden])),
-                bias: Some(cpu_tensor(vec![0.0; intermediate], Shape::new(vec![intermediate]))),
-            },
-            w_fc2: Linear {
-                weight: cpu_tensor(fc2_w, Shape::new(vec![hidden, intermediate])),
-                bias: Some(cpu_tensor(vec![0.0; hidden], Shape::new(vec![hidden]))),
-            },
+            w_fc1: Linear::from_tensor(
+                cpu_tensor(fc1_w, Shape::new(vec![intermediate, hidden])),
+                Some(cpu_tensor(vec![0.0; intermediate], Shape::new(vec![intermediate]))),
+            ),
+            w_fc2: Linear::from_tensor(
+                cpu_tensor(fc2_w, Shape::new(vec![hidden, intermediate])),
+                Some(cpu_tensor(vec![0.0; hidden], Shape::new(vec![hidden]))),
+            ),
             hidden,
             num_heads,
             head_dim,

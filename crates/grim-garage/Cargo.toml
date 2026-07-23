@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 grim-format = { workspace = true }
 grim-tensor = { workspace = true }
+grim-backend-cpu = { workspace = true }
 grim-tensor-graph = { workspace = true }
 grim-backend-rocm = { workspace = true }
 serde = { version = "1", features = ["derive"] }

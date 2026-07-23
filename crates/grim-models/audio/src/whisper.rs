@@ -75,14 +75,14 @@ impl WhisperEncoderBlock {
                 weight: cpu_tensor(vec![1.0; d_model], Shape::new(vec![d_model])),
                 eps,
             },
-            fc1: Linear {
-                weight: cpu_tensor(fc1_w, Shape::new(vec![ffn, d_model])),
-                bias: Some(cpu_tensor(vec![0.0; ffn], Shape::new(vec![ffn]))),
-            },
-            fc2: Linear {
-                weight: cpu_tensor(fc2_w, Shape::new(vec![d_model, ffn])),
-                bias: Some(cpu_tensor(vec![0.0; d_model], Shape::new(vec![d_model]))),
-            },
+            fc1: Linear::from_tensor(
+                cpu_tensor(fc1_w, Shape::new(vec![ffn, d_model])),
+                Some(cpu_tensor(vec![0.0; ffn], Shape::new(vec![ffn]))),
+            ),
+            fc2: Linear::from_tensor(
+                cpu_tensor(fc2_w, Shape::new(vec![d_model, ffn])),
+                Some(cpu_tensor(vec![0.0; d_model], Shape::new(vec![d_model]))),
+            ),
             d_model,
             _num_heads: num_heads,
             _head_dim: head_dim,
@@ -160,14 +160,14 @@ impl WhisperDecoderBlock {
                 weight: cpu_tensor(vec![1.0; d_model], Shape::new(vec![d_model])),
                 eps,
             },
-            fc1: Linear {
-                weight: cpu_tensor(fc1_w, Shape::new(vec![ffn, d_model])),
-                bias: Some(cpu_tensor(vec![0.0; ffn], Shape::new(vec![ffn]))),
-            },
-            fc2: Linear {
-                weight: cpu_tensor(fc2_w, Shape::new(vec![d_model, ffn])),
-                bias: Some(cpu_tensor(vec![0.0; d_model], Shape::new(vec![d_model]))),
-            },
+            fc1: Linear::from_tensor(
+                cpu_tensor(fc1_w, Shape::new(vec![ffn, d_model])),
+                Some(cpu_tensor(vec![0.0; ffn], Shape::new(vec![ffn]))),
+            ),
+            fc2: Linear::from_tensor(
+                cpu_tensor(fc2_w, Shape::new(vec![d_model, ffn])),
+                Some(cpu_tensor(vec![0.0; d_model], Shape::new(vec![d_model]))),
+            ),
             d_model,
             num_heads,
             head_dim,
@@ -214,10 +214,10 @@ impl Whisper {
             weight: cpu_tensor(tok_emb_w, Shape::new(vec![cfg.vocab_size, cfg.d_model])),
         };
         let enc_in_proj_w = (0..cfg.d_model * cfg.n_mels).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
-        let enc_in_proj = Linear {
-            weight: cpu_tensor(enc_in_proj_w, Shape::new(vec![cfg.d_model, cfg.n_mels])),
-            bias: Some(cpu_tensor(vec![0.0; cfg.d_model], Shape::new(vec![cfg.d_model]))),
-        };
+        let enc_in_proj = Linear::from_tensor(
+            cpu_tensor(enc_in_proj_w, Shape::new(vec![cfg.d_model, cfg.n_mels])),
+            Some(cpu_tensor(vec![0.0; cfg.d_model], Shape::new(vec![cfg.d_model]))),
+        );
         let enc_blocks = (0..cfg.num_enc_layers)
             .map(|_| WhisperEncoderBlock::new(cfg.d_model, cfg.num_heads, cfg.ffn_dim, cfg.rms_norm_eps, rng))
             .collect();
@@ -233,10 +233,10 @@ impl Whisper {
             eps: cfg.rms_norm_eps,
         };
         let output_w = (0..cfg.vocab_size * cfg.d_model).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
-        let output = Linear {
-            weight: cpu_tensor(output_w, Shape::new(vec![cfg.vocab_size, cfg.d_model])),
-            bias: Some(cpu_tensor(vec![0.0; cfg.vocab_size], Shape::new(vec![cfg.vocab_size]))),
-        };
+        let output = Linear::from_tensor(
+            cpu_tensor(output_w, Shape::new(vec![cfg.vocab_size, cfg.d_model])),
+            Some(cpu_tensor(vec![0.0; cfg.vocab_size], Shape::new(vec![cfg.vocab_size]))),
+        );
         Self {
             cfg,
             device: Device::Cpu,

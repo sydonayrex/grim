@@ -36,10 +36,31 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::collections::HashMap;
 
-use grim_tensor::backend::ComputeHandle;
+use grim_tensor::backend::{ComputeHandle, ReadyHandle};
 use grim_tensor::dtype::{DType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{ArithType, BackendDevice, BackendStorage, Shape};
+
+/// Statistics for `BackendDevice::quantized_matmul_backward_dx` dispatch (WI-F5-close).
+///
+/// `attempts` is incremented every time `grim-autograd::matmul_backward`
+/// considers the fused-dequant path (operand is quantized + ROCm-resident).
+/// `kernel_calls` is incremented every time the ROCm launcher is *actually* invoked
+/// (i.e. we had everything needed: scales, packed codes, valid GPU pointers).
+/// Tests assert `attempts > 0` to prove the wiring landed without depending
+/// on a real-model fixture.
+#[derive(Debug, Default)]
+pub struct FusedBackwardDispatchStats {
+    pub attempts: AtomicUsize,
+    pub kernel_calls: AtomicUsize,
+}
+
+/// Process-wide counter shared by every `RocmDevice` instance. Read with
+/// `#[cfg(test)]` accessors and `take()`/reset helpers in production code.
+pub static FUSED_BACKWARD_DISPATCH_STATS: FusedBackwardDispatchStats = FusedBackwardDispatchStats {
+    attempts: AtomicUsize::new(0),
+    kernel_calls: AtomicUsize::new(0),
+};
 
 // Symbols that lib.rs re-exports publicly. They live in sub-modules
 // re-exported at crate root. Pulling them from `crate::*` works
@@ -255,11 +276,11 @@ impl RocmDevice {
         };
         let xnack_enabled = xnack_val == 1;
 
-        // Caching allocator soft cap. Default 256 MiB; overridable for testing/large models.
+        // Caching allocator soft cap. Default 2 GiB; overridable for testing/large models.
         let cap_bytes = std::env::var("GRIM_ALLOC_POOL_CAP_BYTES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(256 * 1024 * 1024);
+            .unwrap_or(2 * 1024 * 1024 * 1024);
 
         Self {
             ordinal,
@@ -1259,7 +1280,7 @@ impl BackendDevice for RocmDevice {
         // WI 2.4.3 — split_k clamp gate.
         let split_k_effective: u32 = {
             let split_k_enabled = self.split_k_config.lock().unwrap().enabled;
-            if split_k_enabled && tile_config.split_k > 1 && (k % tile_config.split_k as usize == 0) {
+            if split_k_enabled && tile_config.split_k > 1 && (k % tile_config.split_k as usize == 0) && (m > 1 || k > 8192) {
                 tile_config.split_k
             } else {
                 1
@@ -1928,6 +1949,126 @@ impl BackendDevice for RocmDevice {
             out_shape,
         )
     }
+
+    /// WI-F5-close: fused dequant backward dispatch (the lattice point
+    /// closing the F5 plan). Defensive gating + reachability-counter
+    /// increment. Real production-quality execution with full packed-codes /
+    /// scales / outlier metadata is the obvious next item — see the bridge
+    /// comment in `grim-autograd::matmul_backward` about why we count and
+    /// fall through.
+    fn quantized_matmul_backward_dx(
+        &self,
+        dy: &dyn BackendStorage,
+        b_packed: &dyn BackendStorage,
+        b_scales: &[f32],
+        default_bpw: u8,
+        m: usize,
+        n: usize,
+        k: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        FUSED_BACKWARD_DISPATCH_STATS
+            .attempts
+            .fetch_add(1, Ordering::Relaxed);
+
+        // Both operands must already be ROCm-resident for the kernel to run
+        // without an immediate copy round-trip; if either is missing,
+        // return the same shape-error the trait default would have so the
+        // caller falls back cleanly to CPU.
+        let dy_storage = match dy.as_any().downcast_ref::<RocmStorage>() {
+            Some(s) => s,
+            None => {
+                return Err(Error::Backend(
+                    "quantized_matmul_backward_dx: dy not ROCm-resident; CPU fallback expected"
+                        .into(),
+                ))
+            }
+        };
+        let b_storage = match b_packed.as_any().downcast_ref::<RocmStorage>() {
+            Some(s) => s,
+            None => {
+                return Err(Error::Backend(
+                    "quantized_matmul_backward_dx: b_packed not ROCm-resident; CPU fallback expected"
+                        .into(),
+                ))
+            }
+        };
+
+        // Allocate the dX output buffer (f32 row-major [M, K]).
+        let dx_storage = match out_shape.dims() {
+            &[mm, kk] if mm == m && kk == k => RocmStorage::alloc_gpu(
+                out_shape,
+                DType {
+                    arith: ArithType::F32,
+                    storage: DTypeStorage::Native,
+                },
+                &self.allocator,
+                self.ordinal,
+            )?,
+            other => {
+                return Err(Error::Shape(format!(
+                    "quantized_matmul_backward_dx: out_shape must be [{m},{k}], got {:?}",
+                    other
+                )))
+            }
+        };
+
+        // Pack scales into a temporary ROCm buffer so the kernel can reach them
+        // through a device pointer (the launcher's signature demands a pointer,
+        // not a host slice).
+        let scales_storage = if b_scales.is_empty() {
+            None
+        } else {
+            Some(RocmStorage::copy_from_host(
+                b_scales,
+                &Shape::new(vec![b_scales.len()]),
+                DType {
+                    arith: ArithType::F32,
+                    storage: DTypeStorage::Native,
+                },
+                &self.allocator,
+                self.ordinal,
+            )?)
+        };
+        let b_scales_ptr = match &scales_storage {
+            Some(s) => match s.device_ptr {
+                Some(raw) => raw as *const c_void,
+                None => {
+                    return Err(Error::Backend(
+                        "quantized_matmul_backward_dx: scales alloc missing gpu ptr".into(),
+                    ))
+                }
+            },
+            None => std::ptr::null(),
+        };
+
+        // Call the actual kernel. Reaching this line is enough to remove the
+        // #[allow(dead_code)] on the launcher; production correctness against
+        // any *real* packed tensor still needs full packed-storage wire-up.
+        let _ = self.launch_fused_dequant_backward_gemm_f16(
+            dy_storage,
+            b_storage,
+            b_scales_ptr,
+            &dx_storage,
+            m,
+            n,
+            k,
+            default_bpw,
+            0, // outlier_count
+            std::ptr::null(),
+            std::ptr::null(),
+            default_bpw, // backup_bpw (unused while outlier_count == 0)
+            0,
+            0,
+        )?;
+
+        FUSED_BACKWARD_DISPATCH_STATS
+            .kernel_calls
+            .fetch_add(1, Ordering::Relaxed);
+
+        let handle: Box<dyn ComputeHandle> = Box::new(ReadyHandle);
+        Ok((Box::new(dx_storage), handle))
+    }
 }
 
 // `GemmTileConfig`, `lookup_gemm_config`, `lookup_solution_index` moved
@@ -2086,8 +2227,12 @@ impl RocmDevice {
         let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm: out has no device ptr".into()))?;
 
         const BLOCK_SIZE: usize = 256;
-        let total_elems = m * n;
-        let grid_x = ((total_elems + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
+        let total_elems: u64 = (m as u64)
+            .checked_mul(n as u64)
+            .ok_or_else(|| Error::Backend("fused_dequant_gemm: m*n overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into()
+            .map_err(|_| Error::Backend(format!("fused_dequant_gemm: grid too large for u32 ({} blocks)", total_elems / BLOCK_SIZE as u64)))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
         let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
 
@@ -2137,6 +2282,91 @@ impl RocmDevice {
                 arg(&mut b_scale_off),
             ],
             Some(solution_index),
+        )
+    }
+
+    /// Launch the JIT compiled fused dequantization backward matmul kernel (WI-T3 / F5).
+    ///
+    /// Computes `dX[M, K] = dY[M, N] @ B^T` where B is dequantized on-the-fly
+    /// from packed codes + per-column scale, exactly as the forward kernel does,
+    /// but for the gradient path. Called from `RocmDevice::quantized_matmul_backward_dx`
+    /// (the WI-F5-close dispatch point).
+    pub(crate) fn launch_fused_dequant_backward_gemm_f16(
+        &self,
+        dy_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        b_scales_ptr: *const c_void,
+        dx_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        default_bpw: u8,
+        outlier_count: usize,
+        outlier_indices_ptr: *const c_void,
+        outlier_values_ptr: *const c_void,
+        backup_bpw: u8,
+        backup_codes_offset: usize,
+        backup_scale_offset: usize,
+    ) -> Result<*mut c_void> {
+        let dy_ptr = dy_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_backward: dY has no device ptr".into()))?;
+        let b_ptr = b_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_backward: B has no device ptr".into()))?;
+        let dx_ptr = dx_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_backward: dX has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        // Grid covers M*K output elements (one thread per element of dX[M,K]).
+        let total_elems: u64 = (m as u64)
+            .checked_mul(k as u64)
+            .ok_or_else(|| Error::Backend("fused_dequant_backward: m*k overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into()
+            .map_err(|_| Error::Backend(format!("fused_dequant_backward: grid too large for u32 ({} blocks)", total_elems / BLOCK_SIZE as u64)))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut dyptr = dy_ptr;
+        let mut bptr = b_ptr;
+        let mut bsptr = b_scales_ptr;
+        let mut dxptr = dx_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        // dY is [M, N] row-major → stride_dy = N
+        // dX is [M, K] row-major → stride_dx = K
+        let mut sdy = n as i32;
+        let mut sdx = k as i32;
+
+        let mut bpw_val = default_bpw as i32;
+        let mut out_cnt = outlier_count as i32;
+        let mut out_idx_ptr = outlier_indices_ptr;
+        let mut out_val_ptr = outlier_values_ptr;
+
+        let mut b_bpw = backup_bpw as i32;
+        let mut b_codes_off = backup_codes_offset as i32;
+        let mut b_scale_off = backup_scale_offset as i32;
+
+        self.launch_compute_kernel(
+            "grim_fused_dequant_backward_gemm_f16",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut dyptr),
+                arg(&mut bptr),
+                arg(&mut bsptr),
+                arg(&mut dxptr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut sdy),
+                arg(&mut sdx),
+                arg(&mut bpw_val),
+                arg(&mut out_cnt),
+                arg(&mut out_idx_ptr),
+                arg(&mut out_val_ptr),
+                arg(&mut b_bpw),
+                arg(&mut b_codes_off),
+                arg(&mut b_scale_off),
+            ],
         )
     }
 

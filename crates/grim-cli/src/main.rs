@@ -14,6 +14,12 @@ mod client;
 mod catalog;
 mod train;
 mod verify;
+mod cp;
+mod rm;
+mod stop;
+mod server;
+mod start;
+mod show;
 
 /// Grim inference engine CLI.
 #[derive(Parser)]
@@ -21,6 +27,23 @@ mod verify;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Client integrations supported by `grim start`.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum ClientIntegration {
+    /// Hermes — local chat UI
+    Hermes,
+    /// OpenClaw — code generation
+    Openclaw,
+    /// Claude Code — Anthropic's coding agent
+    Claw,
+    /// Codex — OpenAI's coding agent
+    Codex,
+    /// Antigravity — workflow automation
+    Antigravity,
+    /// ZCode — zero-config coding
+    Zcode,
 }
 
 #[derive(Subcommand)]
@@ -82,13 +105,13 @@ enum Commands {
         repeat_penalty: f32,
     },
     /// Delete a model from local cache.
-    Reap {
+    Rm {
         /// Model name or path to delete.
         model: String,
     },
-    /// Unload an active model from memory.
-    Kill {
-        /// Name of the model to unload.
+    /// Stop a currently running model (unload from memory).
+    Stop {
+        /// Name of the model to stop.
         model: String,
     },
     /// Download a model from Hugging Face or Ollama.
@@ -119,6 +142,36 @@ enum Commands {
         #[arg(long)]
         rocml_profile: Option<String>,
     },
+    /// Start the inference HTTP server (alias for serve).
+    Server {
+        /// Address to bind the server.
+        #[arg(short, long, default_value = "127.0.0.1:11434")]
+        address: String,
+        /// Path to grim config file.
+        #[arg(short, long, default_value = "grim.toml")]
+        config: String,
+        /// Path to plugins directory.
+        #[arg(short, long, default_value = "plugins")]
+        plugins: String,
+    },
+    /// Start a client integration (hermes, openclaw, claude-code, codex, antigravity, zcode).
+    Start {
+        /// Client to start.
+        #[arg(value_enum)]
+        client: ClientIntegration,
+        /// Model to use (defaults to context default).
+        model: Option<String>,
+        /// Additional arguments passed to the client.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// Copy a model to a new name in the local cache.
+    Cp {
+        /// Source model name or path.
+        src: String,
+        /// Destination model name.
+        dst: String,
+    },
     /// Show active loaded models (alias for status)
     Ps,
     /// List local cached models (alias for check)
@@ -127,6 +180,12 @@ enum Commands {
     Status,
     /// Check the local model cache and report completed and partial downloads.
     Check,
+    /// Show available models organized by format (GRIM, GGUF, others).
+    Show {
+        /// Verbose output with details.
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Set a model (local or cloud-routed) as the default model point for a client context.
     Use {
         /// Context to bind (e.g. 'default', 'claude-code', 'hermes').
@@ -552,11 +611,17 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Reap { model } => {
-            client::delete_model(&model)?;
+        Commands::Rm { model } => {
+            if let Err(e) = rm::cmd_rm(&model).await {
+                eprintln!("Remove failed: {e}");
+                std::process::exit(1);
+            }
         }
-        Commands::Kill { model } => {
-            client::unload_model_from_server(&model, "127.0.0.1:11434").await?;
+        Commands::Stop { model } => {
+            if let Err(e) = stop::cmd_stop(&model, "127.0.0.1:11434").await {
+                eprintln!("Stop failed: {e}");
+                std::process::exit(1);
+            }
         }
         Commands::Dl { model, output, rocml_profile } | Commands::Pull { model, output, rocml_profile } => {
             client::download_model(&model, output).await?;
@@ -853,6 +918,42 @@ async fn main() -> Result<()> {
         Commands::Verify { path, verbose: _ } => {
             if let Err(e) = verify::cmd_verify(&path) {
                 eprintln!("Verification failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Cp { src, dst } => {
+            if let Err(e) = cp::cmd_cp(&src, &dst).await {
+                eprintln!("Copy failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Rm { model } => {
+            if let Err(e) = rm::cmd_rm(&model).await {
+                eprintln!("Remove failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Stop { model } => {
+            if let Err(e) = stop::cmd_stop(&model, "127.0.0.1:11434").await {
+                eprintln!("Stop failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Server { address, config: _, plugins } => {
+            let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+            eprintln!("[grim] server: binding to {address} (Ollama-compatible)");
+            grim_server::serve(&address, engine, None).await?;
+            let _ = plugins;
+        }
+        Commands::Start { client, model, args } => {
+            if let Err(e) = start::cmd_start(client, model.as_deref(), &args).await {
+                eprintln!("Start failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Show { verbose } => {
+            if let Err(e) = show::cmd_show(verbose).await {
+                eprintln!("Show failed: {e}");
                 std::process::exit(1);
             }
         }

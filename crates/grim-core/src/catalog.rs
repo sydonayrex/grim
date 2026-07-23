@@ -320,7 +320,7 @@ mod tests {
     /// ROCm-tuned conversion is used automatically once it exists.
     #[test]
     fn resolve_preferring_grim_chooses_grim_over_gguf() {
-        let _guard = MODELS_DIR_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("GRIM_MODELS_DIR").ok();
         let tmp = std::env::temp_dir().join(format!("grim_test_prefer_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
@@ -351,7 +351,7 @@ mod tests {
     /// WI-S6 regression: with only a `.gguf` present, resolution still finds it.
     #[test]
     fn resolve_preferring_grim_falls_back_to_gguf() {
-        let _guard = MODELS_DIR_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("GRIM_MODELS_DIR").ok();
         let tmp = std::env::temp_dir().join(format!("grim_test_fallback_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);

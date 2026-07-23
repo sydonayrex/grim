@@ -43,7 +43,11 @@ extern "C" __global__ void grim_rms_norm(float* x, float* w, float* out,
         ss += v * v;
     }
     float rms = sqrtf(ss / (float)row_len + eps);
-    out[idx] = x[idx] * w[idx] / rms;
+    // w has row_len elements; index by position within the row, not the
+    // global linear index.  Using w[idx] (the prior code) reads garbage
+    // for every row past the first and makes the hidden state explode.
+    int col = idx - row * row_len;
+    out[idx] = x[idx] * w[col] / rms;
 }
 
 extern "C" __global__ void grim_softmax(float* x, float* out, int row_len, int total) {

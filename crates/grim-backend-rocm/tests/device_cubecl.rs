@@ -165,6 +165,9 @@ fn max_err(got: &[f32], want: &[f32]) -> f32 {
 
 #[test]
 fn cubecl_lifted_kernels_match_cpu_reference() {
+    if std::env::var("GRIM_RUN_GPU_TESTS").is_err() {
+        return;
+    }
     let c = client();
     let mut all_ok = true;
 

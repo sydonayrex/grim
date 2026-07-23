@@ -290,6 +290,17 @@ mod tests {
     }
 
     #[test]
+    fn test_fused_dequant_backward_gemm_compiles() {
+        if std::env::var("GRIM_RUN_GPU_TESTS").is_err() {
+            return;
+        }
+        let kernel_source = crate::kernels::source_asm::compute_kernel_source();
+        let target = detect_gpu_arch(0);
+        let res = jit_compile_hsaco(&kernel_source, "grim_fused_dequant_backward_gemm_f16", &target);
+        assert!(res.is_ok(), "Failed to JIT compile grim_fused_dequant_backward_gemm_f16: {:?}", res.err());
+    }
+
+    #[test]
     fn test_split_k_reduction_compiles() {
         if std::env::var("GRIM_RUN_GPU_TESTS").is_err() {
             return;
@@ -1674,6 +1685,135 @@ mod tests {
         if let Some(out) = got {
             let max = max_abs_diff(&out, &cpu);
             assert!(max <= 5e-3, "wi1 skewed max_abs_diff {} too large", max);
+        }
+    }
+
+    // ── F5: fused_dequant_backward_gemm execution test ──────────────────
+
+    /// Allocate a `RocmStorage` backed by raw u8 data on the device.
+    /// Used for B_codes and B_scales which are byte arrays, not f32 tensors.
+    fn alloc_u8_storage(
+        data: &[u8],
+        shape: &[usize],
+        allocator: &Arc<RocmCachingAllocator>,
+    ) -> RocmStorage {
+        let dt = DType { arith: ArithType::U8, storage: DTypeStorage::Native };
+        let storage = RocmStorage::alloc_gpu(&Shape::from_slice(shape), dt, allocator, 0)
+            .expect("alloc_u8_storage: alloc_gpu failed");
+        unsafe {
+            hipMemcpy(
+                storage.device_ptr.unwrap() as *mut c_void,
+                data.as_ptr() as *const c_void,
+                data.len(),
+                HipMemcpyKind::HostToDevice,
+            );
+        }
+        storage
+    }
+
+    /// Pack 2-bit codes into a byte.  `codes` must have exactly 4 elements,
+    /// each in [0, 3].  Bit layout: code[0] in bits [7:6], code[3] in [1:0].
+    fn pack_bpw2_byte(codes: [u8; 4]) -> u8 {
+        assert!(codes.iter().all(|&c| c < 4));
+        (codes[0] << 6) | (codes[1] << 4) | (codes[2] << 2) | codes[3]
+    }
+
+    #[test]
+    fn fused_dequant_backward_gemm_executes() {
+        if std::env::var(GPU_TEST_ENV).is_err() {
+            return;
+        }
+        let dev = RocmDevice::new(0);
+
+        // ── Problem shape ────────────────────────────────────────────────
+        // M=2, N=2, K=4, bpw=2
+        // dY[M,N] = [[2, 1], [4, 3]]  (f16)
+        // B_codes[N, K]: row 0 = codes [3,2,1,0], row 1 = codes [0,1,2,3]
+        // B_scales[N]   = [255, 255]  (scale = 255/255 = 1.0)
+        //
+        // Dequantized values (code/3 * 2 - 1):
+        //   code 3 → 1.0,  code 2 → 1/3,  code 1 → -1/3,  code 0 → -1.0
+        //
+        // dX[row,k] = Σ_col  dY[row,col] * B_dequant[col,k] * scale[col]
+        //
+        // Row 0 (dY=[2,1]):  [1.0,  1/3, -1/3, -1.0]
+        // Row 1 (dY=[4,3]):  [1.0,  1/3, -1/3, -1.0]
+        let (m, n, k, bpw) = (2usize, 2usize, 4usize, 2u8);
+
+        // ── B_codes: pack into row_bytes-aligned buffer ───────────────────
+        let row_bytes = ((k * bpw as usize + 7) / 8 + 255) & !255;
+        let mut b_codes_host = vec![0u8; n * row_bytes];
+        // Row 0: codes [3,2,1,0]
+        b_codes_host[0] = pack_bpw2_byte([3, 2, 1, 0]);
+        // Row 1: codes [0,1,2,3]
+        b_codes_host[row_bytes] = pack_bpw2_byte([0, 1, 2, 3]);
+        let b_codes_storage = alloc_u8_storage(&b_codes_host, &[n * row_bytes], &dev.allocator);
+
+        // ── B_scales ─────────────────────────────────────────────────────
+        let b_scales_storage = alloc_u8_storage(&[255u8, 255], &[n], &dev.allocator);
+        let b_scales_ptr = b_scales_storage.device_ptr.unwrap() as *const c_void;
+
+        // ── dY (f16) ────────────────────────────────────────────────────
+        let f16_dt = DType { arith: ArithType::F16, storage: DTypeStorage::Native };
+        let dy_host: Vec<f32> = vec![2.0, 1.0, 4.0, 3.0]; // row-major [M, N]
+        let dy_storage = RocmStorage::copy_from_host(
+            &dy_host, &Shape::from_slice(&[m, n]), f16_dt.clone(),
+            &dev.allocator, 0,
+        ).expect("dY copy_from_host");
+
+        // ── dX output (f16, allocated but uninitialized) ─────────────────
+        let dx_storage = RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[m, k]), f16_dt.clone(), &dev.allocator, 0,
+        ).expect("dX alloc_gpu");
+
+        // ── Launch backward kernel ───────────────────────────────────────
+        dev.launch_fused_dequant_backward_gemm_f16(
+            &dy_storage,
+            &b_codes_storage,
+            b_scales_ptr,
+            &dx_storage,
+            m, n, k,
+            bpw,
+            0,                         // outlier_count
+            std::ptr::null(),          // outlier_indices
+            std::ptr::null(),          // outlier_values
+            0,                         // backup_bpw
+            0,                         // backup_codes_offset
+            0,                         // backup_scale_offset
+        ).expect("launch_fused_dequant_backward_gemm_f16 failed");
+
+        // ── Read back and verify ─────────────────────────────────────────
+        let got = dx_storage.to_cpu_vec_f32().expect("dX to_cpu_vec_f32");
+
+        // CPU reference: same accumulation done in f32, then f16-rounded
+        let dequant: Vec<f32> = vec![1.0, 1.0/3.0, -1.0/3.0, -1.0]; // row 0 dequant
+        // row 1 has the same dequant pattern (codes [0,1,2,3])
+        let dequant2: Vec<f32> = vec![-1.0, -1.0/3.0, 1.0/3.0, 1.0];
+        let scales: Vec<f32> = vec![1.0, 1.0];
+        let dy: Vec<Vec<f32>> = vec![vec![2.0, 1.0], vec![4.0, 3.0]];
+        let b_deq: Vec<Vec<f32>> = vec![dequant, dequant2];
+
+        let mut expected_f32 = Vec::with_capacity(m * k);
+        for row in 0..m {
+            for k_idx in 0..k {
+                let mut acc = 0.0f32;
+                for col in 0..n {
+                    acc += dy[row][col] * b_deq[col][k_idx] * scales[col];
+                }
+                // The kernel casts the f32 accumulator to f16 before storing.
+                let f16_val = half::f16::from_f32(acc);
+                expected_f32.push(f16_val.to_f32());
+            }
+        }
+
+        assert_eq!(got.len(), m * k);
+        for (i, (g, e)) in got.iter().zip(expected_f32.iter()).enumerate() {
+            let diff = (g - e).abs();
+            assert!(
+                diff < 0.01,
+                "dX[{}] mismatch: got {}, expected {} (diff {})",
+                i, g, e, diff,
+            );
         }
     }
 }

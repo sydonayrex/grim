@@ -2138,6 +2138,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "windows-service",
+ "zstd",
 ]
 
 [[package]]
@@ -2184,6 +2185,8 @@ dependencies = [
  "grim-scheduler",
  "grim-speculative",
  "grim-tensor",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 1.0.69",
 ]
@@ -2209,6 +2212,7 @@ dependencies = [
  "axum 0.8.9",
  "clap",
  "futures",
+ "grim-backend-cpu",
  "grim-backend-rocm",
  "grim-format",
  "grim-tensor",
