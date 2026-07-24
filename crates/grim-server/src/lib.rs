@@ -13,6 +13,7 @@
 //! adapter and produce unadapted output.
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::{
     extract::{Path, State},
@@ -30,6 +31,8 @@ use grim_core::session::DeterminismMode;
 use grim_engine::{Engine, model_loader};
 use grim_scheduler::Request;
 use grim_format::GgufProvider;
+
+static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Shared engine state for the HTTP server.
 ///
@@ -326,11 +329,11 @@ async fn chat_completions(
                     // Use a fixed request ID so we can always look up the outcome.
                     // The engine processes one request per tick: prefill on step 0,
                     // then decode on subsequent steps.
-                    const REQUEST_ID: u64 = 0xDEAD_0000;
+                    let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
 
                     let token_id = {
                         let mut engine = state.engine.lock().unwrap();
-                        sample_next_token(&mut engine, REQUEST_ID, step, sampler.as_ref())
+                        sample_next_token(&mut engine, request_id, step, sampler.as_ref())
                     };
 
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -363,7 +366,7 @@ async fn chat_completions(
         }))).into_response()
     } else {
         let mut content = String::new();
-        const REQUEST_ID: u64 = 0xDEAD_0001;
+        let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
         let _adapter_ids: Vec<u32> = {
             let engine = state.engine.lock().unwrap();
             adapter_names
@@ -379,7 +382,7 @@ async fn chat_completions(
         for step in 0..max_tokens {
             let token_id = {
                 let mut engine = state.engine.lock().unwrap();
-                sample_next_token(&mut engine, REQUEST_ID, step, sampler.as_ref())
+                sample_next_token(&mut engine, request_id, step, sampler.as_ref())
             };
             let token_text = if let Some(tok) = &tokenizer {
                 tok.decode(&[token_id])
