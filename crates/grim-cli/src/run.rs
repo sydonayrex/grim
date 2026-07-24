@@ -12,11 +12,9 @@ use std::sync::Arc;
 use grim_tensor::BackendDevice;
 use grim_tensor::Device;
 use grim_backend_cpu;
-#[cfg(feature = "cuda")]
-use grim_backend_cuda;
 #[cfg(feature = "rocm")]
 use grim_backend_rocm;
-use crate::catalog::{resolve_model_path, resolve_model_preferring_grim};
+use crate::catalog::resolve_model_path;
 
 pub async fn cmd_run(
     model_path: String,

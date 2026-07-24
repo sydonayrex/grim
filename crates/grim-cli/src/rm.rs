@@ -1,10 +1,9 @@
 //! grim rm - Remove a model from the local cache.
 
-use grim_core::catalog::{list_local_models, resolve_model_preferring_grim};
+use grim_core::catalog::resolve_model_preferring_grim;
 use grim_core::error::{Error, Result};
 use grim_core::grim_models_dir;
 use std::fs;
-use std::path::PathBuf;
 
 /// Remove a model from the local cache.
 pub async fn cmd_rm(model: &str) -> Result<()> {

@@ -67,6 +67,22 @@ pub fn grim_log_dir() -> PathBuf {
     PathBuf::from("/var/log/grim")
 }
 
+/// Returns the canonical plugins directory.
+pub fn grim_plugins_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("GRIM_PLUGINS_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    let system = PathBuf::from("/var/lib/grim/plugins");
+    if system.exists() {
+        return system;
+    }
+    home_dir()
+        .map(|h| h.join(".grim").join("plugins"))
+        .unwrap_or_else(|| PathBuf::from("/var/lib/grim/plugins"))
+}
+
 /// Portable home-directory probe.  
 /// Returns `None` only when neither `$HOME` nor `$USERPROFILE` is set.
 pub fn home_dir() -> Option<PathBuf> {

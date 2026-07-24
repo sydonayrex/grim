@@ -4,12 +4,11 @@
 //! device probe, and the axum HTTP routes that the React UI consumes.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::Path;
 
 use grim_format::gguf::{GgufFile, GgufTensorInfo, GgufValue, GGUF_MAGIC, GGUF_VERSION};
 use grim_garage::discovery::{discover_convertible_models, discover_datasets, discover_models, ModelEntry};
-use grim_garage::jobs::{JobId, JobRegistry, JobStatus, Metric, TrainingJob, TrainingMode};
+use grim_garage::jobs::{JobId, JobRegistry, JobStatus, TrainingJob};
 use grim_garage::rocm::{probe_rocm_devices, RocmDeviceInfo};
 use tempfile::tempdir;
 
@@ -274,6 +273,9 @@ fn roc_mdevice_info_serializes_name_fields() {
     let info = RocmDeviceInfo {
         ordinal: 0,
         name: "AMD Radeon RX 7900 XTX".into(),
+        vendor: "AMD".into(),
+        backend: "ROCm".into(),
+        is_rocm_compliant: true,
         gcn_arch: "gfx1100".into(),
         vram_bytes: 16 * 1024 * 1024 * 1024,
         wavefront_size: 32,

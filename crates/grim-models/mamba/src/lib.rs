@@ -21,8 +21,10 @@ use grim_nn::{Linear, RmsNorm};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 
 mod rng;
+pub mod configs;
 pub mod rwkv;
 
+pub use configs::*;
 pub use rwkv::{Rwkv, RwkvConfig};
 
 #[derive(Debug, Clone)]

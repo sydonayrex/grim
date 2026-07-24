@@ -503,3 +503,60 @@ input:focus, select:focus {
 .hidden {
   display: none !important;
 }
+
+/* GPU Delineation Badges & Cards */
+.item-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.vendor-tag {
+  font-size: 11px;
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.vendor-nvidia {
+  background: oklch(0.25 0.15 140 / 0.3);
+  color: oklch(0.85 0.20 140);
+  border: 1px solid oklch(0.50 0.20 140 / 0.4);
+}
+
+.vendor-amd {
+  background: oklch(0.25 0.15 260 / 0.3);
+  color: oklch(0.85 0.20 265);
+  border: 1px solid oklch(0.50 0.20 265 / 0.4);
+}
+
+.vendor-generic {
+  background: var(--border-color);
+  color: var(--text-muted);
+}
+
+.compliance-status {
+  font-weight: 600;
+}
+
+.compliance-status.compliant {
+  color: oklch(0.75 0.20 145);
+}
+
+.compliance-status.non-compliant {
+  color: oklch(0.75 0.18 60);
+}
+
+.card-nvidia {
+  border-left: 3px solid oklch(0.65 0.22 140);
+}
+
+.card-rocm {
+  border-left: 3px solid oklch(0.65 0.24 265);
+}

@@ -1,6 +1,6 @@
 //! grim cp - Copy a model to a new name in the local cache.
 
-use grim_core::catalog::{ModelEntry, list_local_models, resolve_model_preferring_grim};
+use grim_core::catalog::{ModelEntry, resolve_model_preferring_grim};
 use grim_core::error::{Error, Result};
 use grim_core::grim_models_dir;
 use std::fs;

@@ -18,6 +18,8 @@ mod cp;
 mod rm;
 mod stop;
 mod server;
+mod accept;
+mod compat;
 mod start;
 mod show;
 
@@ -303,6 +305,19 @@ enum Commands {
         /// Verbose output (show per-tensor details).
         #[arg(short, long)]
         verbose: bool,
+    },
+    /// Validate and install a model architecture plugin into system plugin directory.
+    Accept {
+        /// Path to the plugin file (e.g., ling-2.6.grimplugin).
+        plugin_path: String,
+    },
+    /// Generate a model architecture compatibility plugin (.grimplugin) from a HuggingFace config.json.
+    Compat {
+        /// Path to config.json file.
+        config_path: String,
+        /// Optional output path for the generated .grimplugin file.
+        #[arg(short, long)]
+        output: Option<String>,
     },
 }
 
@@ -927,23 +942,8 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Commands::Rm { model } => {
-            if let Err(e) = rm::cmd_rm(&model).await {
-                eprintln!("Remove failed: {e}");
-                std::process::exit(1);
-            }
-        }
-        Commands::Stop { model } => {
-            if let Err(e) = stop::cmd_stop(&model, "127.0.0.1:11434").await {
-                eprintln!("Stop failed: {e}");
-                std::process::exit(1);
-            }
-        }
-        Commands::Server { address, config: _, plugins } => {
-            let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-            eprintln!("[grim] server: binding to {address} (Ollama-compatible)");
-            grim_server::serve(&address, engine, None).await?;
-            let _ = plugins;
+        Commands::Server { address, config, plugins } => {
+            server::cmd_server(&address, &config, &plugins).await?;
         }
         Commands::Start { client, model, args } => {
             if let Err(e) = start::cmd_start(client, model.as_deref(), &args).await {
@@ -954,6 +954,18 @@ async fn main() -> Result<()> {
         Commands::Show { verbose } => {
             if let Err(e) = show::cmd_show(verbose).await {
                 eprintln!("Show failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Accept { plugin_path } => {
+            if let Err(e) = accept::cmd_accept(&plugin_path).await {
+                eprintln!("Accept failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Compat { config_path, output } => {
+            if let Err(e) = compat::cmd_compat(&config_path, output).await {
+                eprintln!("Compat generation failed: {e}");
                 std::process::exit(1);
             }
         }
