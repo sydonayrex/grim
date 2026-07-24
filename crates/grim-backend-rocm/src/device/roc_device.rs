@@ -740,12 +740,15 @@ impl RocmDevice {
         unsafe {
             let _ = rocblas_set_stream(handle, stream);
         }
+        let a_elem_size = a0.dtype.arith.byte_size();
+         let b_elem_size = b0.dtype.arith.byte_size();
+
         for i in 0..batch {
             let ai = as_rocm(a[i])?;
             let bi = as_rocm(b[i])?;
             check_hip("matmul_batched: hipMemcpyDtoD a", unsafe {
                 hipMemcpy(
-                    (a_packed.device_ptr.unwrap() as *mut c_void).add(i * stride_a * 4),
+                    (a_packed.device_ptr.unwrap() as *mut c_void).add(i * stride_a * a_elem_size),
                     ai.device_ptr.unwrap() as *mut c_void,
                     ai.bytes,
                     HipMemcpyKind::DeviceToDevice,
@@ -753,7 +756,7 @@ impl RocmDevice {
             })?;
             check_hip("matmul_batched: hipMemcpyDtoD b", unsafe {
                 hipMemcpy(
-                    (b_packed.device_ptr.unwrap() as *mut c_void).add(i * stride_b * 4),
+                    (b_packed.device_ptr.unwrap() as *mut c_void).add(i * stride_b * b_elem_size),
                     bi.device_ptr.unwrap() as *mut c_void,
                     bi.bytes,
                     HipMemcpyKind::DeviceToDevice,
@@ -1976,6 +1979,7 @@ impl BackendDevice for RocmDevice {
         n: usize,
         k: usize,
         out_shape: &Shape,
+        residuals: Option<&grim_tensor::QuantizedMatmulBackwardResiduals>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         FUSED_BACKWARD_DISPATCH_STATS
             .attempts
@@ -2003,6 +2007,21 @@ impl BackendDevice for RocmDevice {
                 ))
             }
         };
+
+        // Extract residual metadata or use defaults when absent.
+        let outlier_count = residuals.map(|r| r.outlier_count).unwrap_or(0);
+        let outlier_indices_ptr = residuals
+            .and_then(|r| if r.outlier_count > 0 { Some(r.outlier_indices_ptr) } else { None })
+            .unwrap_or(std::ptr::null());
+        let outlier_values_ptr = residuals
+            .and_then(|r| if r.outlier_count > 0 { Some(r.outlier_values_ptr) } else { None })
+            .unwrap_or(std::ptr::null());
+        let backup1_bpw = residuals.map(|r| r.backup1_bpw).unwrap_or(0);
+        let backup1_codes_offset = residuals.map(|r| r.backup1_codes_offset).unwrap_or(0);
+        let backup1_scale_offset = residuals.map(|r| r.backup1_scale_offset).unwrap_or(0);
+        let backup2_bpw = residuals.map(|r| r.backup2_bpw).unwrap_or(0);
+        let backup2_codes_offset = residuals.map(|r| r.backup2_codes_offset).unwrap_or(0);
+        let backup2_scale_offset = residuals.map(|r| r.backup2_scale_offset).unwrap_or(0);
 
         // Allocate the dX output buffer (f32 row-major [M, K]).
         let dx_storage = match out_shape.dims() {
@@ -2052,9 +2071,7 @@ impl BackendDevice for RocmDevice {
             None => std::ptr::null(),
         };
 
-        // Call the actual kernel. Reaching this line is enough to remove the
-        // #[allow(dead_code)] on the launcher; production correctness against
-        // any *real* packed tensor still needs full packed-storage wire-up.
+        // Call the actual kernel with outlier and residual parameters.
         let _ = self.launch_fused_dequant_backward_gemm_f16(
             dy_storage,
             b_storage,
@@ -2064,13 +2081,16 @@ impl BackendDevice for RocmDevice {
             n,
             k,
             default_bpw,
-            0, // outlier_count
-            std::ptr::null(),
-            std::ptr::null(),
-            default_bpw, // backup_bpw (unused while outlier_count == 0)
-            0,
-            0,
-        )?;
+            outlier_count,
+            outlier_indices_ptr,
+            outlier_values_ptr,
+            backup1_bpw,
+            backup1_codes_offset,
+            backup1_scale_offset,
+            backup2_bpw,
+            backup2_codes_offset,
+            backup2_scale_offset,
+        )        ?;
 
         FUSED_BACKWARD_DISPATCH_STATS
             .kernel_calls
@@ -2317,6 +2337,9 @@ impl RocmDevice {
         backup_bpw: u8,
         backup_codes_offset: usize,
         backup_scale_offset: usize,
+        backup2_bpw: u8,
+        backup2_codes_offset: usize,
+        backup2_scale_offset: usize,
     ) -> Result<*mut c_void> {
         let dy_ptr = dy_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_backward: dY has no device ptr".into()))?;
         let b_ptr = b_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_backward: B has no device ptr".into()))?;
@@ -2355,6 +2378,10 @@ impl RocmDevice {
         let mut b_codes_off = backup_codes_offset as i32;
         let mut b_scale_off = backup_scale_offset as i32;
 
+        let mut b2_bpw = backup2_bpw as i32;
+        let mut b2_codes_off = backup2_codes_offset as i32;
+        let mut b2_scale_off = backup2_scale_offset as i32;
+
         self.launch_compute_kernel(
             "grim_fused_dequant_backward_gemm_f16",
             grid_dim,
@@ -2376,6 +2403,9 @@ impl RocmDevice {
                 arg(&mut b_bpw),
                 arg(&mut b_codes_off),
                 arg(&mut b_scale_off),
+                arg(&mut b2_bpw),
+                arg(&mut b2_codes_off),
+                arg(&mut b2_scale_off),
             ],
         )
     }

@@ -18,6 +18,7 @@ use grim_core::session::SessionT;
 use grim_core::{CausalLm, Model, ModelConfig};
 use grim_tensor::{ArithType, Device, Tensor};
 
+
 use crate::confidence_head::ConfidenceHead;
 use crate::confidence_scheduler::{ConfidenceScheduler, SpeculationConfig, ThroughputProfile};
 use crate::draft_backbone::DraftBackbone;
@@ -207,16 +208,29 @@ impl SpeculativeCausalLm {
 
                 // Phase 5: Verification step on Target Causal LM
                 let target_logits = self.target.forward(session, input_ids, positions, adapters)?;
-
-                // Rejection-sampling validation loop
                 let target_probs = target_logits.to_vec_f32()?;
+                let vocab_size = scored.base_logits.shape().dims()[1];
+                let draft_logits = scored.base_logits.to_vec_f32()?;
+
+                // Rejection-sampling validation loop (§5.3)
+                // Correctly index logits as flat [seq, vocab_size] row-major,
+                // apply per-row softmax, and use the standard ratio test with per-request randomness.
                 let mut accepted_count = 0;
                 for i in 0..verify_len {
-                    let draft_tok = scored.tokens[i];
-                    let p_target = target_probs.get(draft_tok as usize).copied().unwrap_or(0.0);
-                    
-                    // Standard verification acceptance threshold
-                    if p_target >= 0.1 {
+                    let draft_tok = scored.tokens[i] as usize;
+
+                    let row_start = i * vocab_size;
+                    let row_end = row_start + vocab_size;
+                    let p_target = softmax_f32_row(&target_probs[row_start..row_end])[draft_tok];
+                    let p_draft = softmax_f32_row(&draft_logits[row_start..row_end])[draft_tok];
+
+                    // Ratio test: accept with min(1, p_target / p_draft).
+                    let p_accept = if p_draft > 1e-10 {
+                        (p_target / p_draft).min(1.0)
+                    } else {
+                        0.0
+                    };
+                    if rand::random::<f32>() < p_accept {
                         accepted_count += 1;
                     } else {
                         break;
@@ -288,16 +302,27 @@ impl SpeculativeCausalLm {
         let target_logits = self.target.forward(session, input_ids, positions, adapters)?;
 
         // 4. Rejection sampling / validation loop (§5.3)
-        // Checks that draft token target-probability / draft-probability ratio satisfies threshold.
-        // We use a deterministic pseudo-random fallback check for stability.
+        // Correctly index logits as flat [seq, vocab_size] row-major,
+        // apply per-row softmax, and use the standard ratio test with per-request randomness.
         let target_probs = target_logits.to_vec_f32()?;
+        let vocab_size = draft_block.base_logits.shape().dims()[1];
+        let draft_logits = draft_block.base_logits.to_vec_f32()?;
+
         let mut accepted_count = 0;
         for i in 0..verify_len {
-            let draft_tok = draft_block.tokens[i];
-            let p_target = target_probs.get(draft_tok as usize).copied().unwrap_or(0.0);
-            
-            // Standard speculative validation: accept if target probability is sufficiently high
-            if p_target >= 0.1 {
+            let draft_tok = draft_block.tokens[i] as usize;
+
+            let row_start = i * vocab_size;
+            let row_end = row_start + vocab_size;
+            let p_target = softmax_f32_row(&target_probs[row_start..row_end])[draft_tok];
+            let p_draft = softmax_f32_row(&draft_logits[row_start..row_end])[draft_tok];
+
+            let p_accept = if p_draft > 1e-10 {
+                (p_target / p_draft).min(1.0)
+            } else {
+                0.0
+            };
+            if rand::random::<f32>() < p_accept {
                 accepted_count += 1;
             } else {
                 break;
@@ -499,4 +524,19 @@ mod tests {
         };
         assert_ne!(w_head_before, w_head_after);
     }
+}
+
+/// Row-wise softmax on an f32 slice in-place.
+fn softmax_f32_row(logits: &[f32]) -> Vec<f32> {
+    let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut exp_sum = 0.0f32;
+    let exps: Vec<f32> = logits
+        .iter()
+        .map(|&x| {
+            let e = (x - max_val).exp();
+            exp_sum += e;
+            e
+        })
+        .collect();
+    exps.into_iter().map(|e| e / exp_sum).collect()
 }

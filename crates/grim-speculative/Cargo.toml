@@ -12,6 +12,7 @@ grim-core = { workspace = true }
 grim-backend-cpu = { workspace = true }
 grim-models-transformer = { workspace = true }
 thiserror = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 grim-backend-cpu = { workspace = true }

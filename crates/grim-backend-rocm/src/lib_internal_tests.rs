@@ -1780,6 +1780,9 @@ mod tests {
             0,                         // backup_bpw
             0,                         // backup_codes_offset
             0,                         // backup_scale_offset
+            0,                         // backup2_bpw
+            0,                         // backup2_codes_offset
+            0,                         // backup2_scale_offset
         ).expect("launch_fused_dequant_backward_gemm_f16 failed");
 
         // ── Read back and verify ─────────────────────────────────────────

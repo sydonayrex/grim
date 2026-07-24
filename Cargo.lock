@@ -2400,6 +2400,7 @@ dependencies = [
  "grim-core",
  "grim-models-transformer",
  "grim-tensor",
+ "rand",
  "thiserror 1.0.69",
 ]
 

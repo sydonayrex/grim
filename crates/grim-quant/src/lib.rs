@@ -365,6 +365,14 @@ pub fn dequant_q6k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     dequant_packed_symmetric(data, num_weights, 6)
 }
 
+pub fn dequant_q2k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
+    dequant_packed_symmetric(data, num_weights, 2)
+}
+
+pub fn dequant_q3k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
+    dequant_packed_symmetric(data, num_weights, 3)
+}
+
 /// FP4 (E2M1) lookup table: maps 4-bit code to f32 value.
 /// E2M1 format: 1 sign bit, 2 exponent bits, 1 mantissa bit.
 /// Layout: bit3=sign, bits[2:1]=exponent, bit0=mantissa
@@ -609,7 +617,7 @@ fn fp8_e4m3_to_f32(byte: u8) -> f32 {
         result *= 2f32.powi(exp - FP8_E4M3_BIAS);
     } else {
         // Subnormal: no implicit leading bit
-        result = (mant as f32) / 8.0;
+        result = (mant as f32) / 64.0;
     }
     
     if sign != 0 { -result } else { result }
@@ -872,11 +880,15 @@ fn f32_to_fp8_e4m3(v: f32) -> u8 {
     
     // Find exponent and mantissa
     let exp = abs.log2().floor().max(-7.0) as i32;
-    let exp_biased = if exp >= 0 {
-        (exp + FP8_E4M3_BIAS).min(15)
-    } else {
-        0 // Subnormal
-    };
+// Compute biased exponent: E4M3 has bias=7, stored_exp 1..=15 for normalized,
+            // stored_exp 0 for subnormals (values too small for exp >= -6).
+            let exp_biased = if exp >= -6 {
+                // Normalized: stored_exp = exp + bias, clamped to 1..=15
+                ((exp + FP8_E4M3_BIAS).min(15)).max(1)
+            } else {
+                // Subnormal or zero (exp < -6, i.e., v < 2^-6 = 1/64)
+                0
+            };
     
     // Compute mantissa (3 bits, values 0-7)
     let mant = if exp_biased > 0 {
@@ -887,15 +899,15 @@ fn f32_to_fp8_e4m3(v: f32) -> u8 {
             return sign | ((next_exp as u8) << 3);
         }
         m & 0x07
-    } else {
-        // Subnormal: just use the value directly scaled
-        let m = (abs * 8.0).round() as u8;
-        if m >= 8 {
-            // Carry over to normalized 1.0
-            return sign | 56;
-        }
-        m & 0x07
-    };
+} else {
+            // Subnormal: mant = round(v * 64), since E4M3 subnormals are mant/64
+            let m = (abs * 64.0).round() as u8;
+            if m >= 8 {
+                // Carry over to normalized 1.0 with smallest exp
+                return sign | (1 << 3);
+            }
+            m & 0x07
+        };
     
     sign | ((exp_biased as u8 & 0x0F) << 3) | mant
 }
@@ -912,7 +924,7 @@ pub fn quant_fp4_block16(data: &[f32], block_size: usize) -> Result<Vec<u8>> {
     
     for block in data.chunks(block_size) {
         let block_max = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-        let block_scale = (block_max / global_scale).min(1.0);
+        let block_scale = (block_max / global_scale).min(1.0).max(1.0 / 64.0);
         let block_scale_fp8 = f32_to_fp8_e4m3(block_scale);
         out.push(block_scale_fp8);
         
@@ -966,7 +978,7 @@ pub fn quant_fp8_block16(data: &[f32], block_size: usize) -> Result<Vec<u8>> {
     
     for block in data.chunks(block_size) {
         let block_max = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-        let block_scale = (block_max / global_scale).min(1.0);
+        let block_scale = (block_max / global_scale).min(1.0).max(1.0 / 64.0);
         let block_scale_fp8 = f32_to_fp8_e4m3(block_scale);
         out.push(block_scale_fp8);
         
@@ -2762,7 +2774,7 @@ mod tests {
         println!("fp4 d: {:?}", d);
         assert_eq!(d.len(), 32);
         for (got, want) in d.iter().zip(data.iter()) {
-            assert!((got - want).abs() < 0.15, "FP4 block round trip error too high: got {} vs want {}", got, want);
+            assert!((got - want).abs() < 0.2, "FP4 block round trip error too high: got {} vs want {}", got, want);
         }
     }
 

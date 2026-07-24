@@ -98,7 +98,7 @@ pub fn gemm_f32_lora_fused(
         for j in 0..n {
             let mut sum = 0.0f32;
             for r in 0..lora_rank {
-                sum += intermediate[i * lora_rank + r] * b[r * n + j];
+                sum += intermediate[i * lora_rank + r] * b[j * lora_rank + r];
             }
             y[i * n + j] += sum * scale;
         }

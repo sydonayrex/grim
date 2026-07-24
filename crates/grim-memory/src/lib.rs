@@ -439,6 +439,17 @@ impl KvCache for PagedKvCache {
         let shape = grim_tensor::Shape::new(vec![self.table.len() * BLOCK_SIZE, self.num_heads, self.head_dim]);
         Ok(grim_backend_cpu::cpu_tensor(v_data, shape))
     }
+
+    fn store_kv(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
+        let mut pool = self.pool.lock().unwrap();
+        if let Some(&id) = self.table.logical_to_physical.last() {
+            let k_flat = k.to_vec_f32()?;
+            let v_flat = v.to_vec_f32()?;
+            pool.write_keys(id, &k_flat, k.shape().dims()[0]);
+            pool.write_values(id, &v_flat);
+        }
+        Ok(())
+    }
 }
 
 /// Subtype alias for [`TransportBlockId`] so callers can use the

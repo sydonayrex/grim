@@ -47,4 +47,9 @@ pub trait KvCache: Send {
 
     /// Return the values tensor for the most recently appended slot(s).
     fn current_v(&self) -> Result<Tensor>;
+
+    /// Store key/value tensors into the most recently allocated slot.
+    /// Called by `Session::append_kv` after `append_slot()` to write
+    /// the actual K/V data into the block identified by the slot.
+    fn store_kv(&mut self, k: &Tensor, v: &Tensor) -> Result<()>;
 }
