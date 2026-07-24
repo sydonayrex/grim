@@ -230,6 +230,11 @@ fn load_model_from_config(
         })?;
     let model_arch = ModelArchitecture::from_str(&arch_str);
 
+    // Parse ArchCompatSpec from raw config.json for plugin enrichment.
+    // Fall back to an empty spec if parsing fails — we still use SafetensorsConfig fields.
+    let compat_spec = raw_config_str
+        .and_then(|s| ArchCompatSpec::from_hf_config_json(s).ok());
+
     let vocab_size = config.vocab_size;
     let hidden_size = config.hidden_size;
     let num_layers = config.num_hidden_layers;
@@ -240,6 +245,14 @@ fn load_model_from_config(
     let intermediate_size = config.intermediate_size.unwrap_or(hidden_size * 4);
     let max_seq_len = config.max_position_embeddings.unwrap_or(2048);
     let rope_theta = config.rope_theta.unwrap_or(10000.0);
+
+    // Enrich from ArchCompatSpec when available — these fields take priority
+    // over SafetensorsConfig defaults for known architectures.
+    let rms_norm_eps = compat_spec.as_ref().map(|s| s.rms_norm_eps).unwrap_or(rms_norm_eps);
+    let rope_theta = compat_spec.as_ref().map(|s| s.rope_theta).unwrap_or(rope_theta);
+    let max_seq_len = compat_spec.as_ref().map(|s| s.max_seq_len).unwrap_or(max_seq_len);
+    let expert_count = compat_spec.as_ref().and_then(|s| s.expert_count).or(config.num_local_experts).unwrap_or(8);
+    let expert_used_count = compat_spec.as_ref().and_then(|s| s.expert_used_count).or(config.num_experts_per_tok).unwrap_or(2);
 
     eprintln!(
         "[grim] Loading config from safetensors: architecture={:?}, layers={}, hidden={}, vocab={}",
@@ -366,8 +379,8 @@ fn load_model_from_config(
                 head_dim,
                 num_layers,
                 intermediate_size,
-                expert_count: config.num_local_experts.unwrap_or(8),
-                expert_used_count: config.num_experts_per_tok.unwrap_or(2),
+                expert_count,
+                expert_used_count,
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
@@ -395,8 +408,8 @@ fn load_model_from_config(
                 head_dim,
                 num_layers,
                 intermediate_size,
-                expert_count: config.num_local_experts.unwrap_or(8),
-                expert_used_count: config.num_experts_per_tok.unwrap_or(2),
+                expert_count,
+                expert_used_count,
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
@@ -448,8 +461,8 @@ fn load_model_from_config(
                 num_kv_heads,
                 num_layers,
                 intermediate_size,
-                expert_count: config.num_local_experts.unwrap_or(8),
-                expert_used_count: config.num_experts_per_tok.unwrap_or(2),
+                expert_count,
+                expert_used_count,
                 ssm_d_state: 16,
                 rms_norm_eps,
                 max_seq_len,
@@ -758,6 +771,12 @@ fn load_model_from_config(
                     "[grim] Resolved unknown architecture '{}' via ArchCompatSpec plugin (base='{}', is_moe={})",
                     arch_str, spec.base_architecture, spec.is_moe
                 );
+                let spec_clone = spec.clone();
+                let remapped_provider = RemappingTensorProvider::new(provider, move |name: &str| -> String {
+                    spec_clone.remap_tensor_name(name)
+                });
+                let ws = WeightSource::root(&remapped_provider, device_clone);
+
                 if spec.is_moe {
                     let deepseek_cfg = DeepSeekConfig {
                         vocab_size: spec.vocab_size,
@@ -843,7 +862,7 @@ fn load_model_with_providers(
         model_arch, hparams.num_layers, hparams.hidden_size, hparams.vocab_size
     );
 
-    let ws = WeightSource::root(weight_provider, device);
+    let ws = WeightSource::root(weight_provider, device.clone());
 
     match model_arch {
         ModelArchitecture::Falcon => {
@@ -1354,11 +1373,24 @@ fn load_model_with_providers(
             Ok(Box::new(m))
         }
         _ => {
-            if let Some(spec) = resolve_arch_compat_spec(arch_str, None) {
+            // Check for a sibling config.json alongside the GGUF file to
+            // enrich ArchCompatSpec resolution for known HF architectures.
+            let hf_config_json = std::path::Path::new(_path)
+                .parent()
+                .and_then(|dir| dir.join("config.json").to_str().map(|s| s.to_string()));
+            let config_raw = hf_config_json.as_deref();
+
+            if let Some(spec) = resolve_arch_compat_spec(arch_str, config_raw) {
                 eprintln!(
                     "[grim] Resolved unknown GGUF architecture '{}' via ArchCompatSpec plugin (base='{}', is_moe={})",
                     arch_str, spec.base_architecture, spec.is_moe
                 );
+                let spec_clone = spec.clone();
+                let remapped_provider = RemappingTensorProvider::new(weight_provider, move |name: &str| -> String {
+                    spec_clone.remap_tensor_name(name)
+                });
+                let ws = WeightSource::root(&remapped_provider, device.clone());
+
                 if spec.is_moe {
                     let deepseek_cfg = DeepSeekConfig {
                         vocab_size: hparams.vocab_size,
@@ -1558,5 +1590,28 @@ mod tests {
             }
             Ok(_) => panic!("non-existent .grim must not load successfully"),
         }
+    }
+
+    /// Tests that `resolve_arch_compat_spec` correctly parses a HF config string
+    /// and generates dynamic tensor remapping rules.
+    #[test]
+    fn test_arch_compat_spec_resolution_and_remapping() {
+        let sample_json = r#"{
+            "model_type": "custom_transformer",
+            "hidden_size": 2048,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 16
+        }"#;
+
+        let spec = resolve_arch_compat_spec("custom_transformer", Some(sample_json)).expect("must resolve spec");
+        assert_eq!(spec.hidden_size, 2048);
+        assert_eq!(spec.num_layers, 12);
+        assert_eq!(spec.num_heads, 16);
+
+        // Test bidirectional remapping helper
+        let hf_name = "model.layers.0.self_attn.q_proj.weight";
+        let gguf_name = "blk.0.attn_q.weight";
+        assert_eq!(spec.remap_tensor_name(hf_name), gguf_name);
+        assert_eq!(spec.remap_tensor_name(gguf_name), hf_name);
     }
 }

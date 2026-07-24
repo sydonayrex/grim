@@ -13,7 +13,7 @@ use grim_tensor::tensor::Tensor;
 use grim_tensor::{BackendDevice, RawTensor};
 
 use grim_backend_cpu::cpu_tensor;
-use grim_quant::{dequant_fp4, dequant_nf4, dequant_fp8, dequant_fp4_block16, dequant_fp8_block16, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80, dequant_iq4nl};
+use grim_quant::{dequant_fp4, dequant_nf4, dequant_fp8, dequant_fp4_block16, dequant_fp8_block16, dequant_q2k, dequant_q3k, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80, dequant_iq4nl};
 
 #[cfg(feature = "cuda-mem")]
 use grim_backend_cuda::CudaDevice;
@@ -332,12 +332,13 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             ))),
         },
         Storage::KQuant(scheme) => match scheme {
+            KQuantScheme::Q2K => dequant_q2k(&raw.bytes, n),
+            KQuantScheme::Q3K => dequant_q3k(&raw.bytes, n),
             KQuantScheme::Q4K => dequant_q4k(&raw.bytes, n),
             KQuantScheme::Q5K => dequant_q5k(&raw.bytes, n),
             KQuantScheme::Q6K => dequant_q6k(&raw.bytes, n),
             KQuantScheme::Q80 => dequant_q80(&raw.bytes, n),
             KQuantScheme::IQ4NL => dequant_iq4nl(&raw.bytes, n),
-            KQuantScheme::Q2K | KQuantScheme::Q3K => dequant_q4k(&raw.bytes, n),
         },
         Storage::FloatPack(fp) => match fp {
             FloatPackScheme::Fp4 => dequant_fp4(&raw.bytes, n),

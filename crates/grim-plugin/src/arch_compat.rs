@@ -127,6 +127,22 @@ impl ArchCompatSpec {
         toml::to_string_pretty(self)
             .map_err(|e| Error::Config(format!("Failed to serialize ArchCompatSpec to TOML: {e}")))
     }
+
+    /// Translate a tensor name using the bidirectional mapping table generated for this spec.
+    ///
+    /// Checks forward mapping (`hf -> gguf`) and reverse mapping (`gguf -> hf`). If a match
+    /// is found, returns the translated tensor name; otherwise returns the input name unchanged.
+    pub fn remap_tensor_name(&self, name: &str) -> String {
+        if let Some(mapped) = self.tensor_name_mapping.get(name) {
+            return mapped.clone();
+        }
+        for (hf_name, gguf_name) in &self.tensor_name_mapping {
+            if gguf_name == name {
+                return hf_name.clone();
+            }
+        }
+        name.to_string()
+    }
 }
 
 #[cfg(test)]

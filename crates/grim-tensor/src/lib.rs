@@ -13,7 +13,7 @@ pub mod shape;
 pub mod softmax_merge;
 pub mod tensor;
 
-pub use backend::{BackendDevice, BackendStorage, ComputeHandle, ReadyHandle, MemAdvice};
+pub use backend::{BackendDevice, BackendStorage, ComputeHandle, ReadyHandle, MemAdvice, QuantizedMatmulBackwardResiduals};
 pub use dtype::{
     ArithType, BlockDtype, Device, DType, FloatPackScheme, GpuIntConfig, GroupQuantScheme,
     KQuantScheme, QuantProvenance, Storage,

@@ -201,6 +201,7 @@ fn quant_backward_audit_rocm_q8_0_gemm_dx_numerics() {
 
     // Call ROCm fused backward kernel for dX
     let out_shape = Shape::from_slice(&[m, k]);
+    let residuals = grim_tensor::QuantizedMatmulBackwardResiduals::default();
     let (dx_rocm, _handle) = dev.quantized_matmul_backward_dx(
         dy_rocm.as_ref(),
         b_rocm.as_ref(),
@@ -210,6 +211,7 @@ fn quant_backward_audit_rocm_q8_0_gemm_dx_numerics() {
         n,
         k,
         &out_shape,
+        Some(&residuals),
     ).expect("ROCm quantized_matmul_backward_dx must succeed on a real ROCm device");
 
     // Copy result back to CPU
