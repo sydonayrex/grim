@@ -161,11 +161,13 @@ fn apply_repeat_penalty(logits: &[f32], repeat_penalty: f32, history: &[u32]) ->
         return logits.to_vec();
     }
     let mut out = logits.to_vec();
+    let mut seen = std::collections::HashSet::with_capacity(history.len().min(1024));
     for &tok in history {
+        if !seen.insert(tok) {
+            continue;
+        }
         let i = tok as usize;
         if i < out.len() {
-            // Negative logits get *multiplied* by repeat_penalty (greater szlope
-            // suppression), positive ones are divided. llama.cpp normalization.
             if out[i] < 0.0 {
                 out[i] *= repeat_penalty;
             } else {
