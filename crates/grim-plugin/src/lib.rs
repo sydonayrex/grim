@@ -197,13 +197,15 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest> {
 
     // Parse capabilities grants if present
     let mut grants = PluginGrants::default();
-    if let Some(grants_val) = tbl.get("plugin").and_then(|p| p.get("capabilities")).and_then(|c| c.get("grants")) {
-        if let Some(grants_tbl) = grants_val.as_table() {
-            grants.network = grants_tbl.get("network").and_then(|v| v.as_bool()).unwrap_or(false);
-            if let Some(fs_arr) = grants_tbl.get("filesystem").and_then(|v| v.as_array()) {
-                grants.filesystem = fs_arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+    if let Some(plugin_tbl) = tbl.get("plugin").and_then(|p| p.as_table()) {
+        if let Some(grants_val) = plugin_tbl.get("grants") {
+            if let Some(grants_tbl) = grants_val.as_table() {
+                grants.network = grants_tbl.get("network").and_then(|v| v.as_bool()).unwrap_or(false);
+                if let Some(fs_arr) = grants_tbl.get("filesystem").and_then(|v| v.as_array()) {
+                    grants.filesystem = fs_arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                }
+                grants.request_metadata = grants_tbl.get("request_metadata").and_then(|v| v.as_bool()).unwrap_or(false);
             }
-            grants.request_metadata = grants_tbl.get("request_metadata").and_then(|v| v.as_bool()).unwrap_or(false);
         }
     }
 

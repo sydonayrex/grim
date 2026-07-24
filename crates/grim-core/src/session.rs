@@ -27,6 +27,7 @@ pub trait SessionT: Send {
     fn kv_mut(&mut self) -> Option<&mut (dyn KvCache + 'static)> {
         None
     }
+    fn rollback_kv_to(&mut self, _len: usize) {}
     // Graph capture / replay hooks for §4.1 ROCm execution optimization
     fn get_hip_graph_handle(&self) -> Option<u64> {
         None
@@ -92,6 +93,11 @@ impl SessionT for Inner {
     }
     fn kv_mut(&mut self) -> Option<&mut (dyn KvCache + 'static)> {
         self.kv.as_deref_mut()
+    }
+    fn rollback_kv_to(&mut self, len: usize) {
+        if let Some(kv) = self.kv.as_deref_mut() {
+            let _ = kv.rollback_to(len);
+        }
     }
     fn get_hip_graph_handle(&self) -> Option<u64> {
         self.hip_graph_handle

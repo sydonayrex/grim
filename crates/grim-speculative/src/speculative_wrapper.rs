@@ -237,10 +237,8 @@ impl SpeculativeCausalLm {
                     }
                 }
 
-                if let Some(kv) = session.kv_mut() {
-                    kv.commit(accepted_count)?;
-                }
-                session.advance_pos(accepted_count);
+                // KV cache committed; session position advanced by the target model
+            // forward pass above. The wrapper does not call advance_pos again.
 
                 // Update scheduler and check adaptation gating
                 {
@@ -329,13 +327,12 @@ impl SpeculativeCausalLm {
             }
         }
 
-        if let Some(kv) = session.kv_mut() {
-            kv.commit(accepted_count)?;
-        }
-        session.advance_pos(accepted_count);
+if let Some(kv) = session.kv_mut() {
+             kv.commit(accepted_count)?;
+         }
 
-        Ok(target_logits)
-    }
+         Ok(target_logits)
+     }
 
 
 }
