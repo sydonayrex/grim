@@ -109,12 +109,6 @@ pub fn gemm_f32_lora_fused(
 mod tests {
     use super::*;
 
-    fn naive_gemm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
-        let mut c = vec![0.0f32; m * n];
-        gemm_f32_scalar(m, n, k, a, b, &mut c);
-        c
-    }
-
     #[test]
     fn test_gemm_basic() {
         let a = vec![1.0, 2.0, 3.0, 4.0]; // 2x2

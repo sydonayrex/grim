@@ -1215,6 +1215,16 @@ impl BackendDevice for RocmDevice {
             .map(|s| Box::new(s) as Box<dyn BackendStorage>)
     }
 
+    fn from_cpu_bytes(
+        &self,
+        data: &[u8],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        RocmStorage::copy_from_host_raw_bytes(data, shape, dtype, &self.allocator, self.ordinal)
+            .map(|s| Box::new(s) as Box<dyn BackendStorage>)
+    }
+
     fn matmul(
         &self,
         a: &dyn BackendStorage,

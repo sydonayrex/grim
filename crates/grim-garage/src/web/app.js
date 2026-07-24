@@ -9,7 +9,7 @@ document.addEventListener('DOMContentLoaded', () => {
     models: { title: 'Models & Bolt-Ons', desc: 'Manage base model files and attachable LoRA sidecars' },
     convert: { title: 'Convert Model', desc: 'Convert GGUF models or HuggingFace URLs to native .grim format via oxidizer' },
     jobs: { title: 'Training Jobs', desc: 'Active training progress and history' },
-    devices: { title: 'ROCm Devices', desc: 'GPU accelerator discovery and memory status' },
+    devices: { title: 'GPU Accelerators & Devices', desc: 'Hardware discovery, backend compliance (AMD ROCm vs NVIDIA CUDA), and VRAM telemetry' },
   };
 
   // Theme Toggle Logic
@@ -152,13 +152,13 @@ document.addEventListener('DOMContentLoaded', () => {
     
     if (!devices || devices.length === 0) {
       if (pill) {
-        pill.textContent = '🟡 CPU Fallback Mode (No ROCm GPU Detected)';
+        pill.textContent = '🟡 CPU Fallback Mode (No GPU Target Detected)';
         pill.className = 'status-pill status-warning';
       }
       container.innerHTML = `
         <div class="item-card">
           <div class="item-title">💻 Host Processor & SIMD Execution Engine</div>
-          <div class="item-detail"><strong>Telemetry Status:</strong> Active — No discrete AMD ROCm HIP GPU target currently detected.</div>
+          <div class="item-detail"><strong>Telemetry Status:</strong> Active — No discrete GPU target currently detected.</div>
           <div class="item-detail"><strong>Execution Mode:</strong> Fused SIMD Vector Kernels & Multi-Threaded Host CPU Execution</div>
           <div class="item-detail"><strong>Recommendation:</strong> Use the <strong>Convert Model</strong> tab to prepare <code>.grim</code> models optimized for your system architecture.</div>
         </div>
@@ -166,36 +166,73 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
+    const rocmDevs = devices.filter(d => d.is_rocm_compliant || d.vendor === 'AMD');
+    const cudaDevs = devices.filter(d => d.vendor === 'NVIDIA');
+
     if (pill) {
-      pill.textContent = `🟢 ${devices.length} ROCm GPU Accelerators Active`;
-      pill.className = 'status-pill status-online';
+      if (rocmDevs.length > 0 && cudaDevs.length > 0) {
+        pill.textContent = `🟢 ${devices.length} Accelerators (${rocmDevs.length} ROCm Native, ${cudaDevs.length} CUDA)`;
+        pill.className = 'status-pill status-online';
+      } else if (rocmDevs.length > 0) {
+        pill.textContent = `🟢 ${rocmDevs.length} AMD ROCm Native Accelerator(s) Active`;
+        pill.className = 'status-pill status-online';
+      } else if (cudaDevs.length > 0) {
+        pill.textContent = `🟢 ${cudaDevs.length} NVIDIA CUDA Accelerator(s) Active (Non-ROCm Hardware)`;
+        pill.className = 'status-pill status-online';
+      } else {
+        pill.textContent = `🟢 ${devices.length} GPU Accelerator(s) Active`;
+        pill.className = 'status-pill status-online';
+      }
     }
 
     container.innerHTML = devices.map(d => {
+      const isNvidia = d.vendor === 'NVIDIA' || (d.name && d.name.includes('NVIDIA'));
+      const isRocm = d.is_rocm_compliant || d.vendor === 'AMD';
+
       const totalMb = d.vram_bytes ? Math.round(d.vram_bytes / (1024 * 1024)) : (d.vram_total_mb || 24576);
       const totalGb = (totalMb / 1024).toFixed(1);
       const freeMb = d.vram_free_mb || Math.round(totalMb * 0.75);
       const usedMb = totalMb - freeMb;
       const pct = Math.min(100, Math.max(0, Math.round((usedMb / totalMb) * 100)));
-      const waveStr = d.wavefront_size === 32 ? 'Wave32 (RDNA Architecture)' : 'Wave64 (CDNA Architecture)';
-      const wmmaStr = d.wmma_supported ? '⚡ Present (Wave Matrix Multiply Accumulate)' : '❌ Not Available';
-      const mfmaStr = d.mfma_supported ? '⚡ Present (Matrix Fused Multiply Add)' : '❌ Not Available';
+
+      const badgeHtml = isNvidia
+        ? '<span class="vendor-tag vendor-nvidia">🟢 NVIDIA CUDA (Non-ROCm)</span>'
+        : (isRocm
+          ? '<span class="vendor-tag vendor-amd">⚡ AMD ROCm Native</span>'
+          : `<span class="vendor-tag vendor-generic">💻 ${d.vendor || 'Generic'} ${d.backend || 'GPU'}</span>`);
+
+      const complianceHtml = isRocm
+        ? '<div class="item-detail"><strong>ROCm HIP Compliance:</strong> <span class="compliance-status compliant">⚡ ROCm Compliant — Native AMD HIP Kernel Execution Supported</span></div>'
+        : `<div class="item-detail"><strong>ROCm HIP Compliance:</strong> <span class="compliance-status non-compliant">⚠️ Non-ROCm Hardware — NVIDIA CUDA GPU (Uses CUDA/Vulkan Backend, not AMD ROCm HIP)</span></div>`;
+
+      const archDetailsHtml = isNvidia ? `
+        <div class="item-detail"><strong>CUDA Compute Architecture:</strong> <code>${d.gcn_arch || 'nv_cuda'}</code></div>
+        <div class="item-detail"><strong>Execution Warp Size:</strong> 32 threads (NVIDIA SIMT Warp)</div>
+        <div class="item-detail"><strong>Hardware Cores:</strong> NVIDIA Tensor Cores</div>
+        <div class="item-detail"><strong>Streaming Multiprocessors (SMs):</strong> ${d.compute_units || 36} SMs</div>
+      ` : `
+        <div class="item-detail"><strong>Architecture Target:</strong> <code>${d.gcn_arch || 'gfx1100'}</code></div>
+        <div class="item-detail"><strong>Execution Mode:</strong> ${d.wavefront_size === 32 ? 'Wave32 (RDNA Architecture)' : 'Wave64 (CDNA Architecture)'}</div>
+        <div class="item-detail"><strong>WMMA Hardware Cores:</strong> ${d.wmma_supported ? '⚡ Present (Wave Matrix Multiply Accumulate)' : '❌ Not Available'}</div>
+        <div class="item-detail"><strong>MFMA Matrix Cores:</strong> ${d.mfma_supported ? '⚡ Present (Matrix Fused Multiply Add)' : '❌ Not Available'}</div>
+        <div class="item-detail"><strong>Compute Units (CUs):</strong> ${d.compute_units || 84} CUs</div>
+        <div class="item-detail"><strong>Unified Page Migration (XNACK):</strong> ${d.xnack_enabled ? 'Enabled' : 'Disabled'}</div>
+      `;
 
       return `
-        <div class="item-card">
-          <div class="item-title">🎮 Device #${d.ordinal}: ${d.name || 'AMD ROCm Accelerator'}</div>
-          <div class="item-detail"><strong>Architecture Target:</strong> <code>${d.gcn_arch || 'gfx1100'}</code></div>
+        <div class="item-card ${isNvidia ? 'card-nvidia' : 'card-rocm'}">
+          <div class="item-title-row">
+            <span class="item-title">🎮 Device #${d.ordinal}: ${d.name || 'Graphics Accelerator'}</span>
+            ${badgeHtml}
+          </div>
+          ${complianceHtml}
           <div class="item-detail"><strong>Max Memory (VRAM):</strong> ${totalMb.toLocaleString()} MB (${totalGb} GB Total)</div>
           <div class="vram-meter">
             <div class="vram-fill" style="width: ${pct}%;"></div>
           </div>
           <div class="item-detail"><strong>Memory Status:</strong> ${usedMb.toLocaleString()} MB used / ${freeMb.toLocaleString()} MB free (${pct}% allocated)</div>
-          <div class="item-detail"><strong>Execution Mode:</strong> ${waveStr}</div>
-          <div class="item-detail"><strong>WMMA Hardware Cores:</strong> ${wmmaStr}</div>
-          <div class="item-detail"><strong>MFMA Matrix Cores:</strong> ${mfmaStr}</div>
-          <div class="item-detail"><strong>Compute Units (CUs):</strong> ${d.compute_units || 84} CUs</div>
+          ${archDetailsHtml}
           <div class="item-detail"><strong>Max Threads Per Block:</strong> ${d.max_threads_per_block || 1024} threads</div>
-          <div class="item-detail"><strong>Unified Page Migration (XNACK):</strong> ${d.xnack_enabled ? 'Enabled' : 'Disabled'}</div>
         </div>
       `;
     }).join('');

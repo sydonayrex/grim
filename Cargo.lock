@@ -2182,6 +2182,7 @@ dependencies = [
  "grim-models-transformer",
  "grim-models-vision",
  "grim-nn",
+ "grim-plugin",
  "grim-scheduler",
  "grim-speculative",
  "grim-tensor",
@@ -2341,6 +2342,8 @@ dependencies = [
  "grim-core",
  "grim-tensor",
  "libloading 0.8.9",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "toml 0.8.23",
  "wasmtime",
@@ -2351,6 +2354,7 @@ name = "grim-quant"
 version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
+ "grim-backend-rocm",
  "grim-tensor",
  "thiserror 1.0.69",
 ]

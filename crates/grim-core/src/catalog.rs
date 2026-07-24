@@ -309,11 +309,6 @@ pub fn list_local_models() -> Vec<ModelEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Serialize tests that mutate the process-global `GRIM_MODELS_DIR` env var
-    // so concurrent test threads don't clobber each other's models directory.
-    static MODELS_DIR_GUARD: Mutex<()> = Mutex::new(());
 
     /// WI-S6: when both a `.gguf` and a `.grim` sibling exist for a model,
     /// `resolve_model_preferring_grim` must return the `.grim` path so the

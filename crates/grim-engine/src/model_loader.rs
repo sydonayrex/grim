@@ -1,19 +1,67 @@
 //! Model loading utilities for GGUF and safetensors files.
 
+use grim_core::architecture::{ModelArchitecture, TensorNamingRegistry};
 use grim_core::error::{Error, Result};
+use grim_core::grim_plugins_dir;
+use grim_core::hyperparams::{HyperparameterExtractor, MetadataLookup};
 use grim_core::model::CausalLm;
-use grim_format::{GgufProvider, gguf::GgufValue, tprov::{SafetensorsProvider, RemappingTensorProvider}};
-use grim_models_mamba::{Mamba, MambaConfig};
-use grim_models_transformer::{
-    Llama, LlamaConfig, Lfm2, Lfm2Config, Gpt2, Gpt2Config, Gemma, GemmaConfig, DeepSeek, DeepSeekConfig, T5, T5Config
+use grim_format::{
+    gguf::GgufValue,
+    tprov::{RemappingTensorProvider, SafetensorsProvider},
+    GgufProvider,
 };
-use grim_models_vision::{Bert, BertConfig};
-use grim_models_mamba::RwkvConfig;
+use grim_models_mamba::{
+    GraniteHybridConfig, JambaConfig, Mamba, Mamba2Config, MambaConfig, NemotronHConfig, Rwkv,
+    Rwkv6Config, Rwkv7Config, RwkvConfig,
+};
+use grim_models_transformer::{
+    BloomConfig, DeepSeek, DeepSeekConfig, FalconConfig, Gemma, GemmaConfig, Gpt2, Gpt2Config,
+    Lfm2, Lfm2Config, Llama, LlamaConfig, MoeConfig, PhiConfig, QwenConfig, T5, T5Config,
+};
+use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::WeightSource;
-use grim_tensor::{Device, TensorProvider, TensorMeta, RawTensor, DType, QuantProvenance, Shape};
+use grim_plugin::ArchCompatSpec;
+use grim_tensor::{Device, TensorProvider};
 use serde::Deserialize;
 use std::path::Path;
-use std::collections::HashMap;
+
+/// Attempt to resolve an `ArchCompatSpec` for an unknown architecture string,
+/// first from an inline HF `config.json` string, and second by searching installed
+/// `.grimplugin` manifests in `grim_plugins_dir()`.
+fn resolve_arch_compat_spec(arch_str: &str, config_raw: Option<&str>) -> Option<ArchCompatSpec> {
+    if let Some(json_str) = config_raw {
+        if let Ok(spec) = ArchCompatSpec::from_hf_config_json(json_str) {
+            if !spec.model_type.is_empty() {
+                return Some(spec);
+            }
+        }
+    }
+
+    let plugins_dir = grim_plugins_dir();
+    if plugins_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(plugins_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    if ext == "grimplugin" || ext == "json" {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if let Ok(spec) = ArchCompatSpec::from_hf_config_json(&content) {
+                                if spec.model_type.eq_ignore_ascii_case(arch_str)
+                                    || spec.name.eq_ignore_ascii_case(arch_str)
+                                {
+                                    return Some(spec);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
 
 /// Helper function to get metadata as string from GGUF provider
 fn get_meta_str(provider: &GgufProvider, key: &str) -> Option<String> {
@@ -22,20 +70,16 @@ fn get_meta_str(provider: &GgufProvider, key: &str) -> Option<String> {
         Some(val) => val,
         None => return None,
     };
-    if let Some(s) = v.as_str() { return Some(s.to_string()); }
-    if let Some(u) = v.as_u32() { return Some(u.to_string()); }
-    if let Some(f) = v.as_f32() { return Some(f.to_string()); }
-    None
-}
-
-/// Helper function to get metadata as u32 from GGUF provider
-fn get_meta_u32(provider: &GgufProvider, key: &str, default: u32) -> u32 {
-    let v: Option<&GgufValue> = provider.metadata(key);
-    if let Some(v) = v {
-        if let Some(u) = v.as_u32() { return u; }
-        if let Some(s) = v.as_str() { if let Ok(u) = s.parse::<u32>() { return u; } }
+    if let Some(s) = v.as_str() {
+        return Some(s.to_string());
     }
-    get_meta_str(provider, key).and_then(|s| s.parse::<u32>().ok()).unwrap_or(default)
+    if let Some(u) = v.as_u32() {
+        return Some(u.to_string());
+    }
+    if let Some(f) = v.as_f32() {
+        return Some(f.to_string());
+    }
+    None
 }
 
 /// Helper function to get metadata as array from GGUF provider
@@ -44,6 +88,39 @@ fn get_meta_array<'a>(provider: &'a GgufProvider, key: &str) -> Option<&'a [Gguf
     if let Some(v) = v {
         v.as_array()
     } else {
+        None
+    }
+}
+
+/// Metadata accessor implementation wrapping `GgufProvider`.
+struct GgufMetadataLookup<'a>(&'a GgufProvider);
+
+impl<'a> MetadataLookup for GgufMetadataLookup<'a> {
+    fn get_str(&self, key: &str) -> Option<String> {
+        get_meta_str(self.0, key)
+    }
+    fn get_u32(&self, key: &str) -> Option<u32> {
+        let v = self.0.metadata(key)?;
+        if let Some(u) = v.as_u32() {
+            return Some(u);
+        }
+        if let Some(s) = v.as_str() {
+            if let Ok(u) = s.parse::<u32>() {
+                return Some(u);
+            }
+        }
+        None
+    }
+    fn get_f32(&self, key: &str) -> Option<f32> {
+        let v = self.0.metadata(key)?;
+        if let Some(f) = v.as_f32() {
+            return Some(f);
+        }
+        if let Some(s) = v.as_str() {
+            if let Ok(f) = s.parse::<f32>() {
+                return Some(f);
+            }
+        }
         None
     }
 }
@@ -58,7 +135,10 @@ pub fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn Causal
 pub fn load_model_from_grim(path: &str, device: Device) -> Result<Box<dyn CausalLm>> {
     let gguf_path = std::path::Path::new(path).with_extension("gguf");
     let gguf_path_str = gguf_path.to_str().ok_or_else(|| {
-        Error::Config(format!("Invalid path for sibling GGUF file: {:?}", gguf_path))
+        Error::Config(format!(
+            "Invalid path for sibling GGUF file: {:?}",
+            gguf_path
+        ))
     })?;
     let gguf_provider = GgufProvider::open(gguf_path_str)?;
     let grim_provider = grim_format::tprov::GrimProvider::open(path)?;
@@ -70,9 +150,12 @@ pub fn load_model_from_safetensors(path: &str, device: Device) -> Result<Box<dyn
     let path_obj = Path::new(path);
     // config.json is in the same directory as the model file
     let config_path = path_obj.parent().unwrap_or(path_obj).join("config.json");
-    let config_path_str = config_path.to_str().ok_or_else(|| {
-        Error::Config(format!("Invalid path for sibling config.json: {:?}", config_path))
-    })?;
+    if config_path.to_str().is_none() {
+        return Err(Error::Config(format!(
+            "Invalid path for sibling config.json: {:?}",
+            config_path
+        )));
+    }
 
     // Read and parse config.json
     let config_str = std::fs::read_to_string(&config_path)
@@ -83,8 +166,8 @@ pub fn load_model_from_safetensors(path: &str, device: Device) -> Result<Box<dyn
     // Open safetensors provider
     let provider = SafetensorsProvider::open(path)?;
 
-    // Delegate to the config-based loader
-    load_model_from_config(config, &provider, device, path)
+    // Delegate to the config-based loader with raw config_str for ArchCompatSpec fallback
+    load_model_from_config(config, &provider, device, path, Some(&config_str))
 }
 
 /// Minimal config extracted from HF config.json for model loading.
@@ -119,54 +202,16 @@ struct SafetensorsConfig {
     shortconv_l_cache: Option<usize>,
     #[serde(rename = "conv_l_cache")]
     conv_l_cache: Option<usize>,
-    #[serde(rename = "conv_dim")]
-    conv_dim: Option<usize>,
     #[serde(rename = "attention_head_count_kv")]
     attention_head_count_kv: Option<Vec<u32>>,
     /// LFM2 layer types: "conv" (recurrent) or "full_attention".
     #[serde(default)]
     layer_types: Option<Vec<String>>,
-}
-
-fn lfm2_hf_name_mapping(num_layers: usize) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-
-    // Embeddings
-    map.insert("token_embd.weight".to_string(), "model.embed_tokens.weight".to_string());
-    map.insert("token_embd_norm.weight".to_string(), "model.embedding_norm.weight".to_string());
-    // output.weight is tied to token_embd, so no separate mapping needed
-
-    // Per-layer mappings
-    for i in 0..num_layers {
-        let gguf_prefix = format!("blk.{i}.");
-        let hf_prefix = format!("model.layers.{i}.");
-
-        // Attention norms
-        map.insert(format!("{gguf_prefix}attn_norm.weight"), format!("{hf_prefix}operator_norm.weight"));
-        
-        // Attention projections
-        map.insert(format!("{gguf_prefix}attn_q.weight"), format!("{hf_prefix}self_attn.q_proj.weight"));
-        map.insert(format!("{gguf_prefix}attn_k.weight"), format!("{hf_prefix}self_attn.k_proj.weight"));
-        map.insert(format!("{gguf_prefix}attn_v.weight"), format!("{hf_prefix}self_attn.v_proj.weight"));
-        map.insert(format!("{gguf_prefix}attn_output.weight"), format!("{hf_prefix}self_attn.out_proj.weight"));
-        
-        // Per-head RMSNorm
-        map.insert(format!("{gguf_prefix}attn_q_norm.weight"), format!("{hf_prefix}self_attn.q_layernorm.weight"));
-        map.insert(format!("{gguf_prefix}attn_k_norm.weight"), format!("{hf_prefix}self_attn.k_layernorm.weight"));
-
-        // ShortConv (recurrent)
-        map.insert(format!("{gguf_prefix}shortconv.in_proj.weight"), format!("{hf_prefix}conv.in_proj.weight"));
-        map.insert(format!("{gguf_prefix}shortconv.conv.weight"), format!("{hf_prefix}conv.conv.weight"));
-        map.insert(format!("{gguf_prefix}shortconv.out_proj.weight"), format!("{hf_prefix}conv.out_proj.weight"));
-
-        // FFN
-        map.insert(format!("{gguf_prefix}ffn_norm.weight"), format!("{hf_prefix}ffn_norm.weight"));
-        map.insert(format!("{gguf_prefix}ffn_gate.weight"), format!("{hf_prefix}feed_forward.w1.weight"));
-        map.insert(format!("{gguf_prefix}ffn_up.weight"), format!("{hf_prefix}feed_forward.w3.weight"));
-        map.insert(format!("{gguf_prefix}ffn_down.weight"), format!("{hf_prefix}feed_forward.w2.weight"));
-    }
-
-    map
+    // MoE specific
+    #[serde(rename = "num_local_experts")]
+    num_local_experts: Option<usize>,
+    #[serde(rename = "num_experts_per_tok")]
+    num_experts_per_tok: Option<usize>,
 }
 
 fn load_model_from_config(
@@ -174,192 +219,605 @@ fn load_model_from_config(
     provider: &SafetensorsProvider,
     device: Device,
     _path: &str,
+    raw_config_str: Option<&str>,
 ) -> Result<Box<dyn CausalLm>> {
     // Determine architecture
-    let arch = config
+    let arch_str = config
         .model_type
         .or_else(|| config.architectures.and_then(|a| a.first().cloned()))
-        .ok_or_else(|| Error::Config("config.json missing model_type or architectures".into()))?;
+        .ok_or_else(|| {
+            Error::Config("config.json missing model_type or architectures".into())
+        })?;
+    let model_arch = ModelArchitecture::from_str(&arch_str);
 
     let vocab_size = config.vocab_size;
     let hidden_size = config.hidden_size;
     let num_layers = config.num_hidden_layers;
     let rms_norm_eps = config.rms_norm_eps.unwrap_or(1e-5);
+    let num_heads = config.num_attention_heads.unwrap_or(32);
+    let num_kv_heads = config.num_key_value_heads.unwrap_or(num_heads);
+    let head_dim = config.head_dim.unwrap_or_else(|| if num_heads > 0 { hidden_size / num_heads } else { 128 });
+    let intermediate_size = config.intermediate_size.unwrap_or(hidden_size * 4);
+    let max_seq_len = config.max_position_embeddings.unwrap_or(2048);
+    let rope_theta = config.rope_theta.unwrap_or(10000.0);
 
     eprintln!(
-        "[grim] Loading config from safetensors: architecture={}, layers={}, hidden={}, vocab={}",
-        arch, num_layers, hidden_size, vocab_size
+        "[grim] Loading config from safetensors: architecture={:?}, layers={}, hidden={}, vocab={}",
+        model_arch, num_layers, hidden_size, vocab_size
     );
 
-    // Clone device once for reuse across architectures — each branch creates
-    // its own WeightSource, so the original must outlive all of them.
     let device_clone = device.clone();
-
     let ws = WeightSource::root(provider, device);
 
-    if arch.contains("mamba") {
-        let d_state = 16; // default
-        let d_inner = config.intermediate_size.unwrap_or(hidden_size * 2);
-        let d_conv = 4;
-        let cfg = MambaConfig {
-            vocab_size,
-            hidden_size,
-            d_state,
-            d_inner,
-            d_conv,
-            num_layers,
-            conv_kernel: d_conv,
-            rms_norm_eps,
-        };
-        let m = Mamba::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("lfm2") || arch.contains("liquid") {
-        // LFM2: wrap the SafetensorsProvider with a RemappingTensorProvider that
-        // translates GGUF tensor names (what Lfm2::load expects) to HF names
-        // (what the safetensors file actually contains), so the loader can
-        // find every weight without modifying the on-disk format.
-        let mapping = lfm2_hf_name_mapping(num_layers);
-        let remap_fn = move |name: &str| -> String {
-            if let Some(mapped) = mapping.get(name) {
-                return mapped.clone();
-            }
-            name.to_string()
-        };
-        let remapped_provider = RemappingTensorProvider::new(provider, remap_fn);
-        let ws = WeightSource::root(&remapped_provider, device_clone);
-
-        let num_heads = config.num_attention_heads.unwrap_or(16);
-        let num_kv_heads = config.num_key_value_heads.unwrap_or(8);
-        let head_dim = config.head_dim.unwrap_or(64);
-        // LFM2 config.json may report a pre-adjusted intermediate_size that
-        // doesn't match the actual checkpoint weights (block_auto_adjust_ff_dim
-        // can shrink it to the nearest multiple of block_multiple_of).
-        // Probe the actual tensor shape to get the real dimension.
-        let intermediate_size = remapped_provider
-            .meta("blk.0.ffn_gate.weight")
-            .ok()
-            .and_then(|m| m.shape.first().copied())
-            .unwrap_or_else(|| config.intermediate_size.unwrap_or(4608));
-        let rope_theta = config.rope_theta.unwrap_or(1_000_000.0);
-        let n_shortconv_l_cache = config.shortconv_l_cache.or(config.conv_l_cache).unwrap_or(3);
-
-        // Determine layer types: conv (recurrent) vs full_attention.
-        // config.json provides "layer_types" directly, or fall back to
-        // attention_head_count_kv (0 = conv/recurrent layer).
-        let mut is_recr: Vec<bool> = Vec::with_capacity(num_layers);
-        if let Some(layer_types) = &config.layer_types {
-            for lt in layer_types.iter().take(num_layers) {
-                is_recr.push(lt == "conv");
-            }
-        } else if let Some(kv_array) = &config.attention_head_count_kv {
-            for &n in kv_array.iter().take(num_layers) {
-                is_recr.push(n == 0);
-            }
+    match model_arch {
+        ModelArchitecture::Falcon => {
+            let falcon_cfg = FalconConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                max_seq_len,
+            };
+            eprintln!("[grim] Loading Falcon model with config: {:?}", falcon_cfg);
+            let llama_cfg = LlamaConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+            };
+            let m = Llama::load(&ws, llama_cfg)?;
+            Ok(Box::new(m))
         }
-        is_recr.resize(num_layers, false);
+        ModelArchitecture::Bloom => {
+            let bloom_cfg = BloomConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_layers,
+                intermediate_size,
+                layer_norm_epsilon: rms_norm_eps,
+                max_seq_len,
+            };
+            eprintln!("[grim] Loading BLOOM model with config: {:?}", bloom_cfg);
+            let gpt2_cfg = Gpt2Config {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_layers,
+                intermediate_size,
+                layer_norm_epsilon: rms_norm_eps,
+                max_seq_len,
+            };
+            let m = Gpt2::load(&ws, gpt2_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Phi2 | ModelArchitecture::Phi3 | ModelArchitecture::PhiMoe => {
+            let phi_cfg = PhiConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+            };
+            eprintln!("[grim] Loading Phi model with config: {:?}", phi_cfg);
+            let llama_cfg = LlamaConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+            };
+            let m = Llama::load(&ws, llama_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Qwen | ModelArchitecture::Qwen2 | ModelArchitecture::Qwen3 | ModelArchitecture::Qwen35 => {
+            let qwen_cfg = QwenConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+            };
+            eprintln!("[grim] Loading Qwen model with config: {:?}", qwen_cfg);
+            let llama_cfg = LlamaConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+            };
+            let m = Llama::load(&ws, llama_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Qwen2Moe | ModelArchitecture::Qwen3Moe | ModelArchitecture::Qwen35Moe | ModelArchitecture::Qwen3VlMoe => {
+            let qwen_moe_cfg = MoeConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                expert_count: config.num_local_experts.unwrap_or(8),
+                expert_used_count: config.num_experts_per_tok.unwrap_or(2),
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+            };
+            eprintln!("[grim] Loading Qwen-MoE model with config: {:?}", qwen_moe_cfg);
+            let deepseek_cfg = DeepSeekConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                q_lora_rank: num_heads,
+                kv_lora_rank: num_kv_heads * 4,
+            };
+            let m = DeepSeek::load(&ws, deepseek_cfg)?;
+            Ok(Box::new(m))
+        }
+        arch if arch.is_moe() => {
+            let moe_cfg = MoeConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                expert_count: config.num_local_experts.unwrap_or(8),
+                expert_used_count: config.num_experts_per_tok.unwrap_or(2),
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+            };
+            eprintln!("[grim] Loading MoE model with config: {:?}", moe_cfg);
+            let deepseek_cfg = DeepSeekConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                q_lora_rank: num_heads,
+                kv_lora_rank: num_kv_heads * 4,
+            };
+            let m = DeepSeek::load(&ws, deepseek_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Mamba2 => {
+            let mamba2_cfg = Mamba2Config {
+                vocab_size,
+                hidden_size,
+                d_state: 16,
+                d_inner: intermediate_size,
+                d_conv: 4,
+                num_heads,
+                num_layers,
+                rms_norm_eps,
+            };
+            eprintln!("[grim] Loading Mamba2 model with config: {:?}", mamba2_cfg);
+            let mamba_cfg = MambaConfig {
+                vocab_size,
+                hidden_size,
+                d_state: 16,
+                d_inner: intermediate_size,
+                d_conv: 4,
+                num_layers,
+                conv_kernel: 4,
+                rms_norm_eps,
+            };
+            let m = Mamba::load(&ws, mamba_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Jamba => {
+            let jamba_cfg = JambaConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                num_layers,
+                intermediate_size,
+                expert_count: config.num_local_experts.unwrap_or(8),
+                expert_used_count: config.num_experts_per_tok.unwrap_or(2),
+                ssm_d_state: 16,
+                rms_norm_eps,
+                max_seq_len,
+            };
+            eprintln!("[grim] Loading Jamba model with config: {:?}", jamba_cfg);
+            let mamba_cfg = MambaConfig {
+                vocab_size,
+                hidden_size,
+                d_state: 16,
+                d_inner: intermediate_size,
+                d_conv: 4,
+                num_layers,
+                conv_kernel: 4,
+                rms_norm_eps,
+            };
+            let m = Mamba::load(&ws, mamba_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::NemotronH => {
+            let nemotron_cfg = NemotronHConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_layers,
+                intermediate_size,
+                ssm_d_state: 16,
+                rms_norm_eps,
+                max_seq_len,
+            };
+            eprintln!("[grim] Loading NemotronH model with config: {:?}", nemotron_cfg);
+            let mamba_cfg = MambaConfig {
+                vocab_size,
+                hidden_size,
+                d_state: 16,
+                d_inner: intermediate_size,
+                d_conv: 4,
+                num_layers,
+                conv_kernel: 4,
+                rms_norm_eps,
+            };
+            let m = Mamba::load(&ws, mamba_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::GraniteHybrid => {
+            let granite_cfg = GraniteHybridConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_layers,
+                intermediate_size,
+                ssm_d_state: 16,
+                rms_norm_eps,
+                max_seq_len,
+            };
+            eprintln!("[grim] Loading GraniteHybrid model with config: {:?}", granite_cfg);
+            let mamba_cfg = MambaConfig {
+                vocab_size,
+                hidden_size,
+                d_state: 16,
+                d_inner: intermediate_size,
+                d_conv: 4,
+                num_layers,
+                conv_kernel: 4,
+                rms_norm_eps,
+            };
+            let m = Mamba::load(&ws, mamba_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::ModernBert => {
+            let modern_bert_cfg = ModernBertConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_layers,
+                intermediate_size,
+                layer_norm_eps: rms_norm_eps,
+                max_seq_len,
+            };
+            eprintln!("[grim] Loading ModernBERT model with config: {:?}", modern_bert_cfg);
+            let bert_cfg = BertConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_layers,
+                intermediate_size,
+                max_seq_len,
+            };
+            let m = Bert::load(&ws, bert_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::NomicBert | ModelArchitecture::NomicBertMoe | ModelArchitecture::NeoBert | ModelArchitecture::JinaBertV2 | ModelArchitecture::JinaBertV3 => {
+            let nomic_bert_cfg = NomicBertConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_layers,
+                intermediate_size,
+                layer_norm_eps: rms_norm_eps,
+                max_seq_len,
+            };
+            eprintln!("[grim] Loading NomicBERT model with config: {:?}", nomic_bert_cfg);
+            let bert_cfg = BertConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_layers,
+                intermediate_size,
+                max_seq_len,
+            };
+            let m = Bert::load(&ws, bert_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::T5Encoder => {
+            let t5_enc_cfg = T5EncoderConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                max_seq_len,
+            };
+            eprintln!("[grim] Loading T5Encoder model with config: {:?}", t5_enc_cfg);
+            let t5_cfg = T5Config {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+            };
+            let m = T5::load(&ws, t5_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Rwkv6 | ModelArchitecture::Rwkv6Qwen2 => {
+            let rwkv6_cfg = Rwkv6Config {
+                vocab_size,
+                hidden_size,
+                num_layers,
+                head_dim,
+                max_seq_len,
+            };
+            eprintln!("[grim] Loading RWKV6 model with config: {:?}", rwkv6_cfg);
+            let rwkv_cfg = RwkvConfig {
+                vocab_size,
+                hidden_size,
+                num_layers,
+            };
+            let m = Rwkv::load(&ws, rwkv_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Rwkv7 | ModelArchitecture::ARwkv7 => {
+            let rwkv7_cfg = Rwkv7Config {
+                vocab_size,
+                hidden_size,
+                num_layers,
+                head_dim,
+                max_seq_len,
+            };
+            eprintln!("[grim] Loading RWKV7 model with config: {:?}", rwkv7_cfg);
+            let rwkv_cfg = RwkvConfig {
+                vocab_size,
+                hidden_size,
+                num_layers,
+            };
+            let m = Rwkv::load(&ws, rwkv_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Lfm2 | ModelArchitecture::Lfm2Moe => {
+            let mapping = TensorNamingRegistry::remap_hf_to_gguf(model_arch, num_layers);
+            let remap_fn = move |name: &str| -> String {
+                if let Some(mapped) = mapping.get(name) {
+                    return mapped.clone();
+                }
+                name.to_string()
+            };
+            let remapped_provider = RemappingTensorProvider::new(provider, remap_fn);
+            let ws = WeightSource::root(&remapped_provider, device_clone);
 
-        eprintln!("[grim] LFM2 layer-type map (T=shortconv): {:?}", is_recr);
+            let intermediate_size = remapped_provider
+                .meta("blk.0.ffn_gate.weight")
+                .ok()
+                .and_then(|m| m.shape.first().copied())
+                .unwrap_or_else(|| config.intermediate_size.unwrap_or(4608));
+            let n_shortconv_l_cache = config
+                .shortconv_l_cache
+                .or(config.conv_l_cache)
+                .unwrap_or(3);
 
-        let cfg = Lfm2Config {
-            vocab_size,
-            hidden_size,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            num_layers,
-            intermediate_size,
-            rms_norm_eps,
-            rope_theta,
-            n_shortconv_l_cache,
-            is_recr,
-        };
+            let mut is_recr: Vec<bool> = Vec::with_capacity(num_layers);
+            if let Some(layer_types) = &config.layer_types {
+                for lt in layer_types.iter().take(num_layers) {
+                    is_recr.push(lt == "conv");
+                }
+            } else if let Some(kv_array) = &config.attention_head_count_kv {
+                for &n in kv_array.iter().take(num_layers) {
+                    is_recr.push(n == 0);
+                }
+            }
+            is_recr.resize(num_layers, false);
 
-        let m = Lfm2::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("gpt2") {
-        let cfg = Gpt2Config {
-            vocab_size,
-            hidden_size,
-            num_heads: config.num_attention_heads.unwrap_or(12),
-            num_layers,
-            intermediate_size: config.intermediate_size.unwrap_or(hidden_size * 4),
-            layer_norm_epsilon: rms_norm_eps,
-            max_seq_len: config.max_position_embeddings.unwrap_or(1024),
-        };
-        let m = Gpt2::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("gemma") {
-        let cfg = GemmaConfig {
-            vocab_size,
-            hidden_size,
-            num_heads: config.num_attention_heads.unwrap_or(8),
-            num_kv_heads: config.num_key_value_heads.unwrap_or(8),
-            head_dim: config.head_dim.unwrap_or(256),
-            num_layers,
-            intermediate_size: config.intermediate_size.unwrap_or(16384),
-            rms_norm_eps,
-        };
-        let m = Gemma::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("deepseek") {
-        let cfg = DeepSeekConfig {
-            vocab_size,
-            hidden_size,
-            num_heads: config.num_attention_heads.unwrap_or(128),
-            num_layers,
-            intermediate_size: config.intermediate_size.unwrap_or(7168),
-            rms_norm_eps,
-            q_lora_rank: config.num_attention_heads.unwrap_or(128),
-            kv_lora_rank: config.num_key_value_heads.unwrap_or(512),
-        };
-        let m = DeepSeek::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("bert") {
-        let cfg = BertConfig {
-            vocab_size,
-            hidden_size,
-            num_heads: config.num_attention_heads.unwrap_or(12),
-            num_layers,
-            intermediate_size: config.intermediate_size.unwrap_or(hidden_size * 4),
-            max_seq_len: config.max_position_embeddings.unwrap_or(512),
-        };
-        let m = Bert::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("t5") {
-        let cfg = T5Config {
-            vocab_size,
-            hidden_size,
-            num_heads: config.num_attention_heads.unwrap_or(8),
-            num_layers,
-            intermediate_size: config.intermediate_size.unwrap_or(hidden_size * 4),
-            rms_norm_eps,
-        };
-        let m = T5::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("rwkv") {
-        let cfg = RwkvConfig {
-            vocab_size,
-            hidden_size,
-            num_layers,
-        };
-        let m = grim_models_mamba::Rwkv::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else {
-        // Default to Llama-like
-        let cfg = LlamaConfig {
-            vocab_size,
-            hidden_size,
-            num_heads: config.num_attention_heads.unwrap_or(32),
-            num_kv_heads: config.num_key_value_heads.unwrap_or(config.num_attention_heads.unwrap_or(32)),
-            head_dim: config.head_dim.unwrap_or(128),
-            num_layers,
-            intermediate_size: config.intermediate_size.unwrap_or(11008),
-            rms_norm_eps,
-            rope_theta: config.rope_theta.unwrap_or(10000.0),
-            max_seq_len: config.max_position_embeddings.unwrap_or(2048),
-        };
-        let m = Llama::load(&ws, cfg)?;
-        Ok(Box::new(m))
+            eprintln!("[grim] LFM2 layer-type map (T=shortconv): {:?}", is_recr);
+
+            let cfg = Lfm2Config {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                n_shortconv_l_cache,
+                is_recr,
+            };
+
+            let m = Lfm2::load(&ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Mamba => {
+            let d_state = 16;
+            let d_inner = config.intermediate_size.unwrap_or(hidden_size * 2);
+            let d_conv = 4;
+            let cfg = MambaConfig {
+                vocab_size,
+                hidden_size,
+                d_state,
+                d_inner,
+                d_conv,
+                num_layers,
+                conv_kernel: d_conv,
+                rms_norm_eps,
+            };
+            let m = Mamba::load(&ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Gpt2 => {
+            let cfg = Gpt2Config {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_layers,
+                intermediate_size,
+                layer_norm_epsilon: rms_norm_eps,
+                max_seq_len,
+            };
+            let m = Gpt2::load(&ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Gemma | ModelArchitecture::Gemma2 | ModelArchitecture::Gemma3 | ModelArchitecture::Gemma4 => {
+            let cfg = GemmaConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim: config.head_dim.unwrap_or(256),
+                num_layers,
+                intermediate_size: config.intermediate_size.unwrap_or(16384),
+                rms_norm_eps,
+            };
+            let m = Gemma::load(&ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::DeepSeek | ModelArchitecture::DeepSeek2 | ModelArchitecture::DeepSeek32 | ModelArchitecture::DeepSeek4 => {
+            let cfg = DeepSeekConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                q_lora_rank: num_heads,
+                kv_lora_rank: num_kv_heads * 4,
+            };
+            let m = DeepSeek::load(&ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        arch if arch.is_encoder() => {
+            let cfg = BertConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_layers,
+                intermediate_size,
+                max_seq_len,
+            };
+            let m = Bert::load(&ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::T5 => {
+            let cfg = T5Config {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+            };
+            let m = T5::load(&ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        _ => {
+            if let Some(spec) = resolve_arch_compat_spec(&arch_str, raw_config_str) {
+                eprintln!(
+                    "[grim] Resolved unknown architecture '{}' via ArchCompatSpec plugin (base='{}', is_moe={})",
+                    arch_str, spec.base_architecture, spec.is_moe
+                );
+                if spec.is_moe {
+                    let deepseek_cfg = DeepSeekConfig {
+                        vocab_size: spec.vocab_size,
+                        hidden_size: spec.hidden_size,
+                        num_heads: spec.num_heads,
+                        num_layers: spec.num_layers,
+                        intermediate_size: spec.intermediate_size,
+                        rms_norm_eps: spec.rms_norm_eps,
+                        q_lora_rank: spec.num_heads,
+                        kv_lora_rank: spec.num_kv_heads * 4,
+                    };
+                    let m = DeepSeek::load(&ws, deepseek_cfg)?;
+                    return Ok(Box::new(m));
+                } else if spec.is_ssm {
+                    let mamba_cfg = MambaConfig {
+                        vocab_size: spec.vocab_size,
+                        hidden_size: spec.hidden_size,
+                        d_state: 16,
+                        d_inner: spec.intermediate_size,
+                        d_conv: 4,
+                        num_layers: spec.num_layers,
+                        conv_kernel: 4,
+                        rms_norm_eps: spec.rms_norm_eps,
+                    };
+                    let m = Mamba::load(&ws, mamba_cfg)?;
+                    return Ok(Box::new(m));
+                } else {
+                    let llama_cfg = LlamaConfig {
+                        vocab_size: spec.vocab_size,
+                        hidden_size: spec.hidden_size,
+                        num_heads: spec.num_heads,
+                        num_kv_heads: spec.num_kv_heads,
+                        head_dim: spec.head_dim,
+                        num_layers: spec.num_layers,
+                        intermediate_size: spec.intermediate_size,
+                        rms_norm_eps: spec.rms_norm_eps,
+                        rope_theta: spec.rope_theta,
+                        max_seq_len: spec.max_seq_len,
+                    };
+                    let m = Llama::load(&ws, llama_cfg)?;
+                    return Ok(Box::new(m));
+                }
+            }
+
+            eprintln!("[grim] Unknown architecture '{}' with no plugin compat spec found; using default Llama loader", arch_str);
+            let cfg = LlamaConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+            };
+            let m = Llama::load(&ws, cfg)?;
+            Ok(Box::new(m))
+        }
     }
 }
 
@@ -370,197 +828,597 @@ fn load_model_with_providers(
     _path: &str,
 ) -> Result<Box<dyn CausalLm>> {
     // Extract architecture from GGUF metadata
-    let arch = provider
-        .architecture()
-        .ok_or_else(|| Error::Config(
-            format!("GGUF file has no 'general.architecture' metadata; cannot determine model family")
-        ))?;
+    let arch_str = provider.architecture().ok_or_else(|| {
+        Error::Config(format!(
+            "GGUF file has no 'general.architecture' metadata; cannot determine model family"
+        ))
+    })?;
 
-    // Extract common metadata
-    let vocab_size = get_meta_str(provider, "tokenizer.ggml.vocab_size")
-        .or_else(|| get_meta_str(provider, &format!("{}.vocab_size", arch)))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(32000);
-
-    let hidden_size = get_meta_u32(provider, &format!("{}.embedding_length", arch), 4096) as usize;
-    let num_layers = get_meta_u32(provider, &format!("{}.block_count", arch), 32) as usize;
-    let rms_norm_eps = get_meta_str(provider, &format!("{}.attention.layer_norm_eps", arch))
-        .or_else(|| get_meta_str(provider, &format!("{}.attention.layernorm_rms_eps", arch)))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1e-5_f32);
+    let model_arch = ModelArchitecture::from_str(arch_str);
+    let lookup = GgufMetadataLookup(provider);
+    let hparams = HyperparameterExtractor::extract(model_arch, &lookup);
 
     eprintln!(
-        "[grim] Loading config: architecture={}, layers={}, hidden={}, vocab={}",
-        arch, num_layers, hidden_size, vocab_size
+        "[grim] Loading config: architecture={:?}, layers={}, hidden={}, vocab={}",
+        model_arch, hparams.num_layers, hparams.hidden_size, hparams.vocab_size
     );
 
     let ws = WeightSource::root(weight_provider, device);
 
-    if arch.contains("mamba") {
-        let d_state = get_meta_u32(provider, &format!("{}.ssm.state_size", arch), 16) as usize;
-        let d_inner = get_meta_u32(provider, &format!("{}.ssm.inner_size", arch), (hidden_size * 2) as u32) as usize;
-        let d_conv = get_meta_u32(provider, &format!("{}.ssm.conv_kernel", arch), 4) as usize;
-        let cfg = MambaConfig {
-            vocab_size,
-            hidden_size,
-            d_state,
-            d_inner,
-            d_conv,
-            num_layers,
-            conv_kernel: d_conv,
-            rms_norm_eps,
-        };
-        let m = Mamba::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("lfm2") {
-        // Determine layer types from per-layer head_count_kv (canonical LFM2 schema).
-        // A layer with head_count_kv == 0 is a recurrent shortconv layer; otherwise it is
-        // a full attention layer. llama.cpp reads this from `<arch>.attention.head_count_kv`
-        // which is stored (in GGUF v3) as an ARRAY of length = block_count.
-        let mut head_count_kv_vec: Vec<u32> = Vec::with_capacity(num_layers);
-        if let Some(arr_val) = get_meta_array(provider, "lfm2.attention.head_count_kv") {
-            for v in arr_val.iter().take(num_layers) {
-                let v: &grim_format::gguf::GgufValue = v;
-                let n: u32 = v.as_u32().unwrap_or_else(|| {
-                    if let Some(s) = v.as_str() { s.parse::<u32>().unwrap_or(0u32) } else { 0u32 }
-                });
-                head_count_kv_vec.push(n);
-            }
+    match model_arch {
+        ModelArchitecture::Falcon => {
+            let falcon_cfg = FalconConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading Falcon model with config: {:?}", falcon_cfg);
+            let llama_cfg = LlamaConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+            };
+            let m = Llama::load(&ws, llama_cfg)?;
+            Ok(Box::new(m))
         }
-        // Fallback per-index keys (`block_count_kv.0`, etc.) — fill gaps with 0 (recurrent).
-        for i in 0..num_layers {
-            if i < head_count_kv_vec.len() { continue; }
-            let key = format!("lfm2.attention.head_count_kv.{i}");
-            let n: u32 = if let Some(val) = provider.metadata(&key) {
-                let val: &grim_format::gguf::GgufValue = val;
-                val.as_u32().unwrap_or(0u32)
-            } else { 0u32 };
-            if (i + 1) > head_count_kv_vec.len() {
-                head_count_kv_vec.resize(i + 1, 0);
-            }
-            head_count_kv_vec[i] = n;
+        ModelArchitecture::Bloom => {
+            let bloom_cfg = BloomConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                layer_norm_epsilon: hparams.rms_norm_eps,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading BLOOM model with config: {:?}", bloom_cfg);
+            let gpt2_cfg = Gpt2Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                layer_norm_epsilon: hparams.rms_norm_eps,
+                max_seq_len: hparams.max_seq_len,
+            };
+            let m = Gpt2::load(&ws, gpt2_cfg)?;
+            Ok(Box::new(m))
         }
-        // If array shorter than num_layers, extend with 0 (recurrent default).
-        head_count_kv_vec.resize(num_layers, 0);
-        // is_recr[k] == true means shortconv (recurrent) layer.
-        let is_recr: Vec<bool> = head_count_kv_vec.iter().map(|&n| n == 0).collect();
-        eprintln!("[grim] LFM2 layer-type map (T=shortconv): {:?}", is_recr);
-        // shortconv kernel size is fixed at 3 in canonical LFM2 (conv.weight shape = [3, n_embd]).
-        let n_shortconv_l_cache = 3usize;
-        let num_heads = get_meta_u32(provider, "lfm2.attention.head_count", 16) as usize;
-        let num_kv_heads = head_count_kv_vec.iter().find(|&&n| n > 0).copied().unwrap_or(8) as usize;
-        let head_dim = get_meta_u32(provider, "lfm2.attention.key_length", 64) as usize;
-        let intermediate_size = get_meta_u32(provider, "lfm2.feed_forward_length", 4608) as usize;
-        let rope_theta = provider.metadata("lfm2.rope.freq_base")
-            .and_then(|v| v.as_f32())
-            .unwrap_or(1000000.0f32);
-        let cfg = Lfm2Config {
-            vocab_size,
-            hidden_size,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            num_layers,
-            intermediate_size,
-            rms_norm_eps,
-            rope_theta,
-            n_shortconv_l_cache,
-            is_recr: is_recr.clone(),
-        };
-        let m = Lfm2::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("gpt2") {
-        let cfg = Gpt2Config {
-            vocab_size,
-            hidden_size,
-            num_heads: get_meta_u32(provider, &format!("{}.attention.head_count", arch), 12) as usize,
-            num_layers,
-            intermediate_size: get_meta_u32(provider, &format!("{}.intermediate_size", arch), (hidden_size * 4) as u32) as usize,
-            layer_norm_epsilon: get_meta_str(provider, &format!("{}.attention.layer_norm_epsilon", arch))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1e-5_f32),
-            max_seq_len: get_meta_u32(provider, &format!("{}.context_length", arch), 1024) as usize,
-        };
-        let m = Gpt2::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("gemma") {
-        let cfg = GemmaConfig {
-            vocab_size,
-            hidden_size,
-            num_heads: get_meta_u32(provider, &format!("{}.attention.head_count", arch), 8) as usize,
-            num_kv_heads: get_meta_u32(provider, &format!("{}.attention.head_count_kv", arch), 8) as usize,
-            head_dim: get_meta_u32(provider, &format!("{}.attention.key_length", arch), 256) as usize,
-            num_layers,
-            intermediate_size: get_meta_u32(provider, &format!("{}.intermediate_size", arch), 16384) as usize,
-            rms_norm_eps,
-        };
-        let m = Gemma::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("deepseek") {
-        let cfg = DeepSeekConfig {
-            vocab_size,
-            hidden_size,
-            num_heads: get_meta_u32(provider, &format!("{}.attention.head_count", arch), 128) as usize,
-            num_layers,
-            intermediate_size: get_meta_u32(provider, &format!("{}.intermediate_size", arch), 7168) as usize,
-            rms_norm_eps,
-            q_lora_rank: get_meta_u32(provider, &format!("{}.attention.q_lora_rank", arch), 128) as usize,
-            kv_lora_rank: get_meta_u32(provider, &format!("{}.attention.kv_lora_rank", arch), 512) as usize,
-        };
-        let m = DeepSeek::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("bert") {
-        let cfg = BertConfig {
-            vocab_size,
-            hidden_size,
-            num_heads: get_meta_u32(provider, &format!("{}.attention.head_count", arch), 12) as usize,
-            num_layers,
-            intermediate_size: get_meta_u32(provider, &format!("{}.intermediate_size", arch), (hidden_size * 4) as u32) as usize,
-            max_seq_len: get_meta_u32(provider, &format!("{}.context_length", arch), 512) as usize,
-        };
-        let m = Bert::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("t5") {
-        let cfg = T5Config {
-            vocab_size,
-            hidden_size,
-            num_heads: get_meta_u32(provider, &format!("{}.attention.head_count", arch), 8) as usize,
-            num_layers,
-            intermediate_size: get_meta_u32(provider, &format!("{}.intermediate_size", arch), (hidden_size * 4) as u32) as usize,
-            rms_norm_eps,
-        };
-        let m = T5::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("rwkv") {
-        let cfg = RwkvConfig {
-            vocab_size,
-            hidden_size,
-            num_layers,
-        };
-        let m = grim_models_mamba::Rwkv::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else {
-        let intermediate_size = get_meta_u32(provider, &format!("{}.intermediate_size", arch), 11008) as usize;
-        let num_heads = get_meta_u32(provider, &format!("{}.attention.head_count", arch), 32) as usize;
-        let num_kv_heads = get_meta_u32(provider, &format!("{}.attention.head_count_kv", arch), num_heads as u32) as usize;
-        let head_dim = get_meta_u32(provider, &format!("{}.attention.key_length", arch), 128) as usize;
-        let rope_theta = get_meta_str(provider, &format!("{}.rope.freq_base", arch))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10000.0_f32);
-        let cfg = LlamaConfig {
-            vocab_size,
-            hidden_size,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            num_layers,
-            intermediate_size,
-            rms_norm_eps,
-            rope_theta,
-            max_seq_len: 2048,
-        };
-        let m = Llama::load(&ws, cfg)?;
-        Ok(Box::new(m))
+        ModelArchitecture::Phi2 | ModelArchitecture::Phi3 | ModelArchitecture::PhiMoe => {
+            let phi_cfg = PhiConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading Phi model with config: {:?}", phi_cfg);
+            let llama_cfg = LlamaConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+            };
+            let m = Llama::load(&ws, llama_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Qwen | ModelArchitecture::Qwen2 | ModelArchitecture::Qwen3 | ModelArchitecture::Qwen35 => {
+            let qwen_cfg = QwenConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading Qwen model with config: {:?}", qwen_cfg);
+            let llama_cfg = LlamaConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+            };
+            let m = Llama::load(&ws, llama_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Qwen2Moe | ModelArchitecture::Qwen3Moe | ModelArchitecture::Qwen35Moe | ModelArchitecture::Qwen3VlMoe => {
+            let qwen_moe_cfg = MoeConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                expert_count: hparams.expert_count.unwrap_or(8),
+                expert_used_count: hparams.expert_used_count.unwrap_or(2),
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading Qwen-MoE model with config: {:?}", qwen_moe_cfg);
+            let deepseek_cfg = DeepSeekConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                q_lora_rank: hparams.num_heads,
+                kv_lora_rank: hparams.num_kv_heads * 4,
+            };
+            let m = DeepSeek::load(&ws, deepseek_cfg)?;
+            Ok(Box::new(m))
+        }
+        arch if arch.is_moe() => {
+            let moe_cfg = MoeConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                expert_count: hparams.expert_count.unwrap_or(8),
+                expert_used_count: hparams.expert_used_count.unwrap_or(2),
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading MoE model with config: {:?}", moe_cfg);
+            let deepseek_cfg = DeepSeekConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                q_lora_rank: hparams.num_heads,
+                kv_lora_rank: hparams.num_kv_heads * 4,
+            };
+            let m = DeepSeek::load(&ws, deepseek_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Mamba2 => {
+            let mamba2_cfg = Mamba2Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                d_state: hparams.ssm_d_state.unwrap_or(16),
+                d_inner: hparams.ssm_d_inner.unwrap_or(hparams.hidden_size * 2),
+                d_conv: hparams.ssm_d_conv.unwrap_or(4),
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                rms_norm_eps: hparams.rms_norm_eps,
+            };
+            eprintln!("[grim] Loading Mamba2 model with config: {:?}", mamba2_cfg);
+            let mamba_cfg = MambaConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                d_state: hparams.ssm_d_state.unwrap_or(16),
+                d_inner: hparams.ssm_d_inner.unwrap_or(hparams.hidden_size * 2),
+                d_conv: hparams.ssm_d_conv.unwrap_or(4),
+                num_layers: hparams.num_layers,
+                conv_kernel: hparams.ssm_d_conv.unwrap_or(4),
+                rms_norm_eps: hparams.rms_norm_eps,
+            };
+            let m = Mamba::load(&ws, mamba_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Jamba => {
+            let jamba_cfg = JambaConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                expert_count: hparams.expert_count.unwrap_or(8),
+                expert_used_count: hparams.expert_used_count.unwrap_or(2),
+                ssm_d_state: hparams.ssm_d_state.unwrap_or(16),
+                rms_norm_eps: hparams.rms_norm_eps,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading Jamba model with config: {:?}", jamba_cfg);
+            let mamba_cfg = MambaConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                d_state: hparams.ssm_d_state.unwrap_or(16),
+                d_inner: hparams.ssm_d_inner.unwrap_or(hparams.hidden_size * 2),
+                d_conv: hparams.ssm_d_conv.unwrap_or(4),
+                num_layers: hparams.num_layers,
+                conv_kernel: hparams.ssm_d_conv.unwrap_or(4),
+                rms_norm_eps: hparams.rms_norm_eps,
+            };
+            let m = Mamba::load(&ws, mamba_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::NemotronH => {
+            let nemotron_cfg = NemotronHConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                ssm_d_state: hparams.ssm_d_state.unwrap_or(16),
+                rms_norm_eps: hparams.rms_norm_eps,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading NemotronH model with config: {:?}", nemotron_cfg);
+            let mamba_cfg = MambaConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                d_state: hparams.ssm_d_state.unwrap_or(16),
+                d_inner: hparams.ssm_d_inner.unwrap_or(hparams.hidden_size * 2),
+                d_conv: hparams.ssm_d_conv.unwrap_or(4),
+                num_layers: hparams.num_layers,
+                conv_kernel: hparams.ssm_d_conv.unwrap_or(4),
+                rms_norm_eps: hparams.rms_norm_eps,
+            };
+            let m = Mamba::load(&ws, mamba_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::GraniteHybrid => {
+            let granite_cfg = GraniteHybridConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                ssm_d_state: hparams.ssm_d_state.unwrap_or(16),
+                rms_norm_eps: hparams.rms_norm_eps,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading GraniteHybrid model with config: {:?}", granite_cfg);
+            let mamba_cfg = MambaConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                d_state: hparams.ssm_d_state.unwrap_or(16),
+                d_inner: hparams.ssm_d_inner.unwrap_or(hparams.hidden_size * 2),
+                d_conv: hparams.ssm_d_conv.unwrap_or(4),
+                num_layers: hparams.num_layers,
+                conv_kernel: hparams.ssm_d_conv.unwrap_or(4),
+                rms_norm_eps: hparams.rms_norm_eps,
+            };
+            let m = Mamba::load(&ws, mamba_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::ModernBert => {
+            let modern_bert_cfg = ModernBertConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                layer_norm_eps: hparams.rms_norm_eps,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading ModernBERT model with config: {:?}", modern_bert_cfg);
+            let bert_cfg = BertConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                max_seq_len: hparams.max_seq_len,
+            };
+            let m = Bert::load(&ws, bert_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::NomicBert | ModelArchitecture::NomicBertMoe | ModelArchitecture::NeoBert | ModelArchitecture::JinaBertV2 | ModelArchitecture::JinaBertV3 => {
+            let nomic_bert_cfg = NomicBertConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                layer_norm_eps: hparams.rms_norm_eps,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading NomicBERT model with config: {:?}", nomic_bert_cfg);
+            let bert_cfg = BertConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                max_seq_len: hparams.max_seq_len,
+            };
+            let m = Bert::load(&ws, bert_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::T5Encoder => {
+            let t5_enc_cfg = T5EncoderConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading T5Encoder model with config: {:?}", t5_enc_cfg);
+            let t5_cfg = T5Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+            };
+            let m = T5::load(&ws, t5_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Rwkv6 | ModelArchitecture::Rwkv6Qwen2 => {
+            let rwkv6_cfg = Rwkv6Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_layers: hparams.num_layers,
+                head_dim: hparams.head_dim,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading RWKV6 model with config: {:?}", rwkv6_cfg);
+            let rwkv_cfg = RwkvConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_layers: hparams.num_layers,
+            };
+            let m = Rwkv::load(&ws, rwkv_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Rwkv7 | ModelArchitecture::ARwkv7 => {
+            let rwkv7_cfg = Rwkv7Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_layers: hparams.num_layers,
+                head_dim: hparams.head_dim,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading RWKV7 model with config: {:?}", rwkv7_cfg);
+            let rwkv_cfg = RwkvConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_layers: hparams.num_layers,
+            };
+            let m = Rwkv::load(&ws, rwkv_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Lfm2 | ModelArchitecture::Lfm2Moe => {
+            let mut head_count_kv_vec: Vec<u32> = Vec::with_capacity(hparams.num_layers);
+            if let Some(arr_val) = get_meta_array(provider, "lfm2.attention.head_count_kv") {
+                for v in arr_val.iter().take(hparams.num_layers) {
+                    let v: &grim_format::gguf::GgufValue = v;
+                    let n: u32 = v.as_u32().unwrap_or_else(|| {
+                        if let Some(s) = v.as_str() {
+                            s.parse::<u32>().unwrap_or(0u32)
+                        } else {
+                            0u32
+                        }
+                    });
+                    head_count_kv_vec.push(n);
+                }
+            }
+            for i in 0..hparams.num_layers {
+                if i < head_count_kv_vec.len() {
+                    continue;
+                }
+                let key = format!("lfm2.attention.head_count_kv.{i}");
+                let n: u32 = if let Some(val) = provider.metadata(&key) {
+                    let val: &grim_format::gguf::GgufValue = val;
+                    val.as_u32().unwrap_or(0u32)
+                } else {
+                    0u32
+                };
+                if (i + 1) > head_count_kv_vec.len() {
+                    head_count_kv_vec.resize(i + 1, 0);
+                }
+                head_count_kv_vec[i] = n;
+            }
+            head_count_kv_vec.resize(hparams.num_layers, 0);
+            let is_recr: Vec<bool> = head_count_kv_vec.iter().map(|&n| n == 0).collect();
+            eprintln!("[grim] LFM2 layer-type map (T=shortconv): {:?}", is_recr);
+            let n_shortconv_l_cache = 3usize;
+            let num_kv_heads = head_count_kv_vec
+                .iter()
+                .find(|&&n| n > 0)
+                .copied()
+                .map(|n| n as usize)
+                .unwrap_or(hparams.num_kv_heads);
+            let cfg = Lfm2Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                n_shortconv_l_cache,
+                is_recr: is_recr.clone(),
+            };
+            let m = Lfm2::load(&ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Mamba => {
+            let d_state = hparams.ssm_d_state.unwrap_or(16);
+            let d_inner = hparams.ssm_d_inner.unwrap_or(hparams.hidden_size * 2);
+            let d_conv = hparams.ssm_d_conv.unwrap_or(4);
+            let cfg = MambaConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                d_state,
+                d_inner,
+                d_conv,
+                num_layers: hparams.num_layers,
+                conv_kernel: d_conv,
+                rms_norm_eps: hparams.rms_norm_eps,
+            };
+            let m = Mamba::load(&ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Gpt2 => {
+            let cfg = Gpt2Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                layer_norm_epsilon: hparams.rms_norm_eps,
+                max_seq_len: hparams.max_seq_len,
+            };
+            let m = Gpt2::load(&ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Gemma | ModelArchitecture::Gemma2 | ModelArchitecture::Gemma3 | ModelArchitecture::Gemma4 => {
+            let cfg = GemmaConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+            };
+            let m = Gemma::load(&ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::DeepSeek | ModelArchitecture::DeepSeek2 | ModelArchitecture::DeepSeek32 | ModelArchitecture::DeepSeek4 => {
+            let cfg = DeepSeekConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                q_lora_rank: hparams.num_heads,
+                kv_lora_rank: hparams.num_kv_heads * 4,
+            };
+            let m = DeepSeek::load(&ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        arch if arch.is_encoder() => {
+            let cfg = BertConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                max_seq_len: hparams.max_seq_len,
+            };
+            let m = Bert::load(&ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::T5 => {
+            let cfg = T5Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+            };
+            let m = T5::load(&ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        _ => {
+            if let Some(spec) = resolve_arch_compat_spec(arch_str, None) {
+                eprintln!(
+                    "[grim] Resolved unknown GGUF architecture '{}' via ArchCompatSpec plugin (base='{}', is_moe={})",
+                    arch_str, spec.base_architecture, spec.is_moe
+                );
+                if spec.is_moe {
+                    let deepseek_cfg = DeepSeekConfig {
+                        vocab_size: hparams.vocab_size,
+                        hidden_size: hparams.hidden_size,
+                        num_heads: hparams.num_heads,
+                        num_layers: hparams.num_layers,
+                        intermediate_size: hparams.intermediate_size,
+                        rms_norm_eps: hparams.rms_norm_eps,
+                        q_lora_rank: hparams.num_heads,
+                        kv_lora_rank: hparams.num_kv_heads * 4,
+                    };
+                    let m = DeepSeek::load(&ws, deepseek_cfg)?;
+                    return Ok(Box::new(m));
+                } else if spec.is_ssm {
+                    let mamba_cfg = MambaConfig {
+                        vocab_size: hparams.vocab_size,
+                        hidden_size: hparams.hidden_size,
+                        d_state: hparams.ssm_d_state.unwrap_or(16),
+                        d_inner: hparams.ssm_d_inner.unwrap_or(hparams.hidden_size * 2),
+                        d_conv: hparams.ssm_d_conv.unwrap_or(4),
+                        num_layers: hparams.num_layers,
+                        conv_kernel: hparams.ssm_d_conv.unwrap_or(4),
+                        rms_norm_eps: hparams.rms_norm_eps,
+                    };
+                    let m = Mamba::load(&ws, mamba_cfg)?;
+                    return Ok(Box::new(m));
+                } else {
+                    let llama_cfg = LlamaConfig {
+                        vocab_size: hparams.vocab_size,
+                        hidden_size: hparams.hidden_size,
+                        num_heads: hparams.num_heads,
+                        num_kv_heads: hparams.num_kv_heads,
+                        head_dim: hparams.head_dim,
+                        num_layers: hparams.num_layers,
+                        intermediate_size: hparams.intermediate_size,
+                        rms_norm_eps: hparams.rms_norm_eps,
+                        rope_theta: hparams.rope_theta,
+                        max_seq_len: hparams.max_seq_len,
+                    };
+                    let m = Llama::load(&ws, llama_cfg)?;
+                    return Ok(Box::new(m));
+                }
+            }
+
+            eprintln!("[grim] Unknown GGUF architecture '{}' with no plugin compat spec found; using default Llama loader", arch_str);
+            let cfg = LlamaConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+            };
+            let m = Llama::load(&ws, cfg)?;
+            Ok(Box::new(m))
+        }
     }
 }
 
@@ -679,13 +1537,6 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
 mod tests {
     use super::*;
 
-    /// `load_from_path` must route `.grim` paths through `load_model_from_grim`
-    /// and `.gguf` paths through `load_model_from_gguf`. We exercise the
-    /// extension classifier without touching disk by asserting on the result of
-    /// probing both extensions with a non-existent file: the *kind of error*
-    /// (file not found / no GPU) is the only observable signal, so this is a
-    /// minimal dispatch-routing regression test (P0-WI-3 correctness gate:
-    /// "serve .grim").
     #[test]
     fn load_from_path_picks_grim_extension() {
         let is_grim_dispatch = |p: &str| p.ends_with(".grim");
@@ -696,17 +1547,9 @@ mod tests {
 
     #[test]
     fn load_from_path_dispatches_to_grim_loader() {
-        // `.grim` must call load_model_from_grim; `.gguf` must call
-        // load_model_from_gguf. Probe via expected error messages (no GPU on
-        // CI host): both errors name the failing loader symbol.
         let r = load_from_path("/tmp/__grim_does_not_exist__.grim");
         match r {
             Err(e) => {
-                // OK: load_model_from_grim tried to open the sibling .gguf
-                // (or GPU) and reported an error naming the GGUF/grim parse
-                // path. The exact substrings differ by backend availability,
-                // so just assert we got an error (i.e., we actually routed
-                // somewhere; never panic / never return Ok on a junk path).
                 let msg = format!("{e}");
                 assert!(
                     !msg.is_empty(),

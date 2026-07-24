@@ -12,6 +12,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 grim-backend-cpu = { workspace = true }
+grim-backend-rocm = { workspace = true }
 
 [features]
 default = []

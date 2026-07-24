@@ -211,7 +211,7 @@ pub fn cmd_oxidizer_convert(
     rocml_profile: Option<&str>,
     calibration_dataset: Option<String>,
 ) -> Result<(), String> {
-    let (provider, names, sizes, mut grim_meta) = open_provider(model_path)?;
+    let (_provider, names, sizes, mut grim_meta) = open_provider(model_path)?;
     let importance_scores = if Path::new(&format!("{}.importance.json", model_path)).exists() {
         load_importance_scores(&format!("{}.importance.json", model_path))?
     } else {

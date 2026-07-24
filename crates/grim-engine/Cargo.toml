@@ -22,6 +22,7 @@ grim-models-vision = { workspace = true }
 grim-format = { workspace = true }
 grim-speculative = { workspace = true }
 grim-kvquant = { workspace = true }
+grim-plugin = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
