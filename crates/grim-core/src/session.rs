@@ -83,9 +83,10 @@ impl SessionT for Inner {
     fn has_kv(&self) -> bool {
         self.kv.is_some()
     }
-    fn append_kv(&mut self, _k: &Tensor, _v: &Tensor) -> Result<()> {
+    fn append_kv(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
         if let Some(kv) = self.kv.as_deref_mut() {
             kv.append_slot()?;
+            kv.store_kv(k, v)?;
         }
         Ok(())
     }

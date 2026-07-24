@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
 use grim_tensor::dtype::DType;
-use grim_tensor::dtype::{BlockDtype, KQuantScheme, Storage};
+use grim_tensor::dtype::{KQuantScheme, Storage};
 use grim_tensor::error::{Error, Result};
 
 pub const GGUF_MAGIC: u32 = 0x4655_4747; // "GGUF" LE
@@ -1174,26 +1174,26 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::Q3K),
         },
-        GgufDType::Q4K => DType {
-            arith: grim_tensor::ArithType::F32,
-            storage: Storage::Block(BlockDtype::Fp4),
-        },
-        GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 => DType {
-            arith: grim_tensor::ArithType::F32,
-            storage: Storage::KQuant(KQuantScheme::Q4K),
-        },
-        GgufDType::Q5K => DType {
-            arith: grim_tensor::ArithType::F32,
-            storage: Storage::Block(BlockDtype::Nf4),
-        },
-        GgufDType::Q5_0 | GgufDType::Q5_1 => DType {
-            arith: grim_tensor::ArithType::F32,
-            storage: Storage::KQuant(KQuantScheme::Q5K),
-        },
-        GgufDType::Q6K => DType {
-            arith: grim_tensor::ArithType::F32,
-            storage: Storage::Block(BlockDtype::Fp8),
-        },
+GgufDType::Q4K => DType {
+             arith: grim_tensor::ArithType::F32,
+             storage: Storage::KQuant(KQuantScheme::Q4K),
+         },
+         GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 => DType {
+             arith: grim_tensor::ArithType::F32,
+             storage: Storage::KQuant(KQuantScheme::Q4K),
+         },
+         GgufDType::Q5K => DType {
+             arith: grim_tensor::ArithType::F32,
+             storage: Storage::KQuant(KQuantScheme::Q5K),
+         },
+         GgufDType::Q5_0 | GgufDType::Q5_1 => DType {
+             arith: grim_tensor::ArithType::F32,
+             storage: Storage::KQuant(KQuantScheme::Q5K),
+         },
+         GgufDType::Q6K => DType {
+             arith: grim_tensor::ArithType::F32,
+             storage: Storage::KQuant(KQuantScheme::Q6K),
+         },
         GgufDType::Q8K | GgufDType::Q8_0 | GgufDType::Q8_1 | GgufDType::Q8_1Hx => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::Q80),

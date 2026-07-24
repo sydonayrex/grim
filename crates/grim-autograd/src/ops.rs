@@ -76,6 +76,7 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
 
         if b_quantized && b_on_rocm {
             let bpw = bpw_from_dtype(&args.b.dtype());
+            let residuals: Option<grim_tensor::QuantizedMatmulBackwardResiduals> = None;
             if let Ok((grad_a_storage, _handle)) = dev.quantized_matmul_backward_dx(
                 args.out_grad.storage().as_ref(),
                 args.b.storage().as_ref(),
@@ -85,6 +86,7 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
                 n,
                 k,
                 args.a.shape(),
+                residuals.as_ref(),
             ) {
                 let grad_a = Tensor::new(
                     Arc::from(grad_a_storage),
@@ -358,5 +360,45 @@ mod tests {
         let (ga, gb) = matmul_backward(&args).unwrap();
         assert_eq!(ga.shape().dims(), &[2, 2]);
         assert_eq!(gb.shape().dims(), &[2, 2]);
+    }
+
+    /// Tests that `QuantizedMatmulBackwardResiduals::from_tensor` correctly extracts non-default
+    /// residual and outlier metadata from a tensor carrying `QuantProvenance::WithResiduals`.
+    #[test]
+    fn test_quantized_matmul_backward_residuals_extraction_from_provenance() {
+        use grim_tensor::{QuantProvenance, Storage, DType, ArithType, Device};
+
+        let provenance = QuantProvenance::WithResiduals {
+            outlier_count: 5,
+            outlier_indices_offset: 1024,
+            outlier_values_offset: 2048,
+            backup1_bpw: 8,
+            backup1_codes_offset: 4096,
+            backup1_scale_offset: 8192,
+            backup2_bpw: 4,
+            backup2_codes_offset: 16384,
+            backup2_scale_offset: 32768,
+        };
+
+        let dummy_storage = grim_backend_cpu::cpu_tensor(vec![0.0f32; 16], Shape::new(vec![4, 4]));
+        let b_tensor = Tensor::new(
+            dummy_storage.storage().clone(),
+            Shape::new(vec![4, 4]),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::KQuant(grim_tensor::KQuantScheme::Q80),
+            },
+            provenance,
+            Device::Cpu,
+        );
+
+        let residuals = grim_tensor::QuantizedMatmulBackwardResiduals::from_tensor(&b_tensor);
+        assert_eq!(residuals.outlier_count, 5);
+        assert_eq!(residuals.backup1_bpw, 8);
+        assert_eq!(residuals.backup1_codes_offset, 4096);
+        assert_eq!(residuals.backup1_scale_offset, 8192);
+        assert_eq!(residuals.backup2_bpw, 4);
+        assert_eq!(residuals.backup2_codes_offset, 16384);
+        assert_eq!(residuals.backup2_scale_offset, 32768);
     }
 }

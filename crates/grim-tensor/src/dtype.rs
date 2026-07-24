@@ -64,6 +64,13 @@ impl ArithType {
     pub fn is_integer(&self) -> bool {
         matches!(self, ArithType::I64 | ArithType::U32 | ArithType::U8)
     }
+    pub fn byte_size(self) -> usize {
+        match self {
+            ArithType::F32 | ArithType::U32 => 4,
+            ArithType::F16 | ArithType::BF16 | ArithType::U8 => 2,
+            ArithType::I64 => 8,
+        }
+    }
 }
 
 /// Physical storage encoding. When storage differs from the arithmetic type,
@@ -178,6 +185,18 @@ pub enum QuantProvenance {
         group_size: usize,
         scheme: GroupQuantScheme,
         desc_act: bool,
+    },
+    /// Quantized tensor with outlier overrides or residual backup layers (backup1 / backup2).
+    WithResiduals {
+        outlier_count: usize,
+        outlier_indices_offset: usize,
+        outlier_values_offset: usize,
+        backup1_bpw: u8,
+        backup1_codes_offset: usize,
+        backup1_scale_offset: usize,
+        backup2_bpw: u8,
+        backup2_codes_offset: usize,
+        backup2_scale_offset: usize,
     },
 }
 

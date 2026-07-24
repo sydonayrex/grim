@@ -572,22 +572,22 @@ mod tests {
     }
 
     #[test]
-    fn test_dtype_from_gguf_block_mappings() {
-        use crate::gguf::GgufDType;
-        use grim_tensor::dtype::{BlockDtype, Storage, KQuantScheme};
-        
-        let d_q4k = super::dtype_from_gguf(GgufDType::Q4K);
-        assert_eq!(d_q4k.storage, Storage::Block(BlockDtype::Fp4));
-        
-        let d_q5k = super::dtype_from_gguf(GgufDType::Q5K);
-        assert_eq!(d_q5k.storage, Storage::Block(BlockDtype::Nf4));
+fn test_dtype_from_gguf_block_mappings() {
+         use crate::gguf::GgufDType;
+         use grim_tensor::dtype::{Storage, KQuantScheme};
+         
+         let d_q4k = super::dtype_from_gguf(GgufDType::Q4K);
+         assert_eq!(d_q4k.storage, Storage::KQuant(KQuantScheme::Q4K));
+         
+         let d_q5k = super::dtype_from_gguf(GgufDType::Q5K);
+         assert_eq!(d_q5k.storage, Storage::KQuant(KQuantScheme::Q5K));
 
-        let d_q6k = super::dtype_from_gguf(GgufDType::Q6K);
-        assert_eq!(d_q6k.storage, Storage::Block(BlockDtype::Fp8));
+         let d_q6k = super::dtype_from_gguf(GgufDType::Q6K);
+         assert_eq!(d_q6k.storage, Storage::KQuant(KQuantScheme::Q6K));
 
-        let d_q80 = super::dtype_from_gguf(GgufDType::Q8_0);
-        assert_eq!(d_q80.storage, Storage::KQuant(KQuantScheme::Q80));
-    }
+         let d_q80 = super::dtype_from_gguf(GgufDType::Q8_0);
+         assert_eq!(d_q80.storage, Storage::KQuant(KQuantScheme::Q80));
+     }
 
     /// Write a minimal native `.grim` file to a temp path, then open it
     /// with `GrimProvider` and verify `meta`/`get` round-trip the registry.

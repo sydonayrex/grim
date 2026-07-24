@@ -192,10 +192,11 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
-    /// Fused dequantized matmul backward (WI-T3 / F5).
+/// Fused dequantized matmul backward (WI-T3 / F5).
     ///
     /// Computes `dX[M, K] = dY[M, N] @ B^T` where `B` is dequantized on-the-fly
-    /// from packed codes + per-column scale, mirroring the forward kernel.
+    /// from packed codes, per-column scale, optional outlier overrides, and
+    /// optional backup1/backup2 residual layers, mirroring the forward kernel.
     /// Used by `grim-autograd::matmul_backward` when the frozen-weight operand
     /// `B` is quantized and ROCm-resident. Default implementation returns
     /// `Unimplemented` so CPU/CUDA/Vulkan/Metal fall through unchanged; only
@@ -210,12 +211,78 @@ pub trait BackendDevice: Send + Sync {
         _n: usize,
         _k: usize,
         _out_shape: &Shape,
+        _residuals: Option<&QuantizedMatmulBackwardResiduals>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         Err(crate::error::Error::Unimplemented(
             "quantized_matmul_backward_dx requires ROCm (fused_dequant_backward_gemm_f16)".into(),
         ))
     }
 }
+
+/// Residual and outlier metadata for fused quantized matmul backward dispatch.
+#[derive(Debug, Clone, Default)]
+pub struct QuantizedMatmulBackwardResiduals {
+    /// Count of index-value outlier overrides in device memory.
+    pub outlier_count: usize,
+    /// Raw device pointer to u32 outlier indices.
+    pub outlier_indices_ptr: *const std::ffi::c_void,
+    /// Raw device pointer to f32 outlier values.
+    pub outlier_values_ptr: *const std::ffi::c_void,
+    /// Bitwidth for backup1 residual layer (0 = absent).
+    pub backup1_bpw: u8,
+    /// Byte offset of packed backup1 codes.
+    pub backup1_codes_offset: usize,
+    /// Byte offset of per-row backup1 scale values.
+    pub backup1_scale_offset: usize,
+    /// Bitwidth for backup2 residual layer (0 = absent).
+    pub backup2_bpw: u8,
+    /// Byte offset of packed backup2 codes.
+    pub backup2_codes_offset: usize,
+    /// Byte offset of per-row backup2 scale values.
+    pub backup2_scale_offset: usize,
+}
+
+impl QuantizedMatmulBackwardResiduals {
+    /// Extract residual and outlier metadata from a tensor's `QuantProvenance`.
+    ///
+    /// Checks if the tensor carries `QuantProvenance::WithResiduals` and populates
+    /// bitwidths and byte offsets for backup1 and backup2 residual layers, as well as
+    /// outlier override counts.
+    pub fn from_tensor(tensor: &crate::tensor::Tensor) -> Self {
+        if let QuantProvenance::WithResiduals {
+            outlier_count,
+            backup1_bpw,
+            backup1_codes_offset,
+            backup1_scale_offset,
+            backup2_bpw,
+            backup2_codes_offset,
+            backup2_scale_offset,
+            ..
+        } = tensor.provenance()
+        {
+            Self {
+                outlier_count: *outlier_count,
+                outlier_indices_ptr: std::ptr::null(),
+                outlier_values_ptr: std::ptr::null(),
+                backup1_bpw: *backup1_bpw,
+                backup1_codes_offset: *backup1_codes_offset,
+                backup1_scale_offset: *backup1_scale_offset,
+                backup2_bpw: *backup2_bpw,
+                backup2_codes_offset: *backup2_codes_offset,
+                backup2_scale_offset: *backup2_scale_offset,
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
+
+/// # Safety Taxonomy — Tier 2 (Explicit raw pointers for GPU FFI dispatch)
+/// `QuantizedMatmulBackwardResiduals` wraps raw GPU device memory pointers that are thread-safe to pass across worker threads for HIP kernel launch.
+unsafe impl Send for QuantizedMatmulBackwardResiduals {}
+/// # Safety Taxonomy — Tier 2 (Explicit raw pointers for GPU FFI dispatch)
+/// `QuantizedMatmulBackwardResiduals` wraps raw GPU device memory pointers that are thread-safe to pass across worker threads for HIP kernel launch.
+unsafe impl Sync for QuantizedMatmulBackwardResiduals {}
 
 /// Owned tensor storage on a specific backend. Backends manage their own
 /// buffer lifetimes; tensors on the CPU store directly, GPU tensors wrap a
