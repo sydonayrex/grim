@@ -284,10 +284,10 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         let mut epoch_loss = 0.0f32;
         let mut num_batches = 0;
 
-        for (tokens, _labels) in dataset.iter() {
-            if tokens.len() < 2 { continue; }
-            let input_ids = &tokens[..tokens.len() - 1];
-            let targets = &tokens[1..];
+for (tokens, labels) in dataset.iter() {
+        if tokens.len() < 2 { continue; }
+        let input_ids = &tokens[..tokens.len() - 1];
+        let targets = &labels[1..];
 
             let seq_len = input_ids.len();
             let hidden = model_config.hidden_size;

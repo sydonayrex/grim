@@ -92,6 +92,9 @@ fn sample_next_token(
             id: request_id,
             prompt_tokens: 1,
             priority: 0,
+            consumed_tokens: 0,
+            model_id: None,
+            adapter_ids: vec![],
         };
         engine.enqueue_request(req);
     }
@@ -167,6 +170,8 @@ async fn chat_completions(
         "max_tokens",
         "temperature",
         "top_p",
+        "top_k",
+        "repeat_penalty",
         "stop",
         "determinism",
     ];
@@ -341,19 +346,21 @@ async fn chat_completions(
                     if hit_stop {
                         return None;
                     }
+                    let payload = serde_json::json!({
+                         "choices": [{"index": 0, "delta": {"content": token_text}}],
+                         "adapters_active": adapter_ids.len()
+                     }).to_string();
                     let event = axum::response::sse::Event::default()
                         .event("message")
-                        .data(format!(
-                            r#"{{"choices": [{{"index": 0, "delta": {{"content": "{}"}}}}], "adapters_active": {}}}"#,
-                            token_text.replace("\"", "\\\""),
-                            adapter_ids.len()
-                        ));
+                        .data(payload);
                     let res: std::result::Result<axum::response::sse::Event, axum::Error> = Ok(event);
                     Some((res, (step + 1, emitted)))
                 }
             },
         );
-        Sse::new(stream).into_response()
+        Sse::new(stream.chain(futures::stream::once(async {
+            Ok(axum::response::sse::Event::default().data("[DONE]"))
+        }))).into_response()
     } else {
         let mut content = String::new();
         const REQUEST_ID: u64 = 0xDEAD_0001;
