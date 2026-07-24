@@ -2,7 +2,8 @@
 //!
 //! Provides reverse-mode backward implementations for MatMul, Add, Scale, and fused LoRA application.
 
-use grim_tensor::{DType, Tensor, error::Result};
+use grim_tensor::dtype::{BlockDtype, FloatPackScheme, KQuantScheme};
+use grim_tensor::{DType, Storage, Tensor, error::Result};
 use std::sync::Arc;
 
 /// Arguments for MatMul backward evaluation.
@@ -28,6 +29,33 @@ pub struct ScaleArgs {
     pub factor: f32,
 }
 
+/// Extract bits-per-weight from a quantized DType storage variant.
+fn bpw_from_dtype(dtype: &DType) -> u8 {
+    match &dtype.storage {
+        Storage::KQuant(scheme) => match scheme {
+            KQuantScheme::Q2K => 2,
+            KQuantScheme::Q3K => 3,
+            KQuantScheme::Q4K => 4,
+            KQuantScheme::Q5K => 5,
+            KQuantScheme::Q6K => 6,
+            KQuantScheme::Q80 => 8,
+            KQuantScheme::IQ4NL => 4,
+        },
+        Storage::Block(bd) => match bd {
+            BlockDtype::Fp4 | BlockDtype::Fp4Block16 => 4,
+            BlockDtype::Nf4 => 4,
+            BlockDtype::Fp8 | BlockDtype::Fp8Block16 => 8,
+        },
+        Storage::FloatPack(scheme) => match scheme {
+            FloatPackScheme::Fp4 => 4,
+            FloatPackScheme::Nf4 => 4,
+            FloatPackScheme::Fp8 => 8,
+        },
+        Storage::GroupInt(cfg) => cfg.bits,
+        Storage::Native => 32,
+    }
+}
+
 /// Compute backward gradients for matrix multiplication `output = A @ B`.
 ///
 /// Returns `(grad_a, grad_b)`. CONTRACT: `out_grad`, `a`, and `b` must have matching dimensions.
@@ -38,6 +66,60 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
     let (m, k) = if args.transpose_a { (a_dims[1], a_dims[0]) } else { (a_dims[0], a_dims[1]) };
     let (_, n) = if args.transpose_b { (b_dims[1], b_dims[0]) } else { (b_dims[0], b_dims[1]) };
 
+    // Try GPU / ROCm fused backward dispatch when available and b is quantized.
+    if !args.transpose_a && !args.transpose_b {
+        let b_quantized = matches!(
+            args.b.dtype().storage,
+            Storage::KQuant(..) | Storage::Block(..) | Storage::FloatPack(..) | Storage::GroupInt(..)
+        );
+        let b_on_rocm = matches!(args.b.device(), grim_tensor::Device::Rocm(_));
+
+        if b_quantized && b_on_rocm {
+            let bpw = bpw_from_dtype(&args.b.dtype());
+            if let Ok((grad_a_storage, _handle)) = dev.quantized_matmul_backward_dx(
+                args.out_grad.storage().as_ref(),
+                args.b.storage().as_ref(),
+                &[],
+                bpw,
+                m,
+                n,
+                k,
+                args.a.shape(),
+            ) {
+                let grad_a = Tensor::new(
+                    Arc::from(grad_a_storage),
+                    args.a.shape().clone(),
+                    DType::F32,
+                    args.a.provenance().clone(),
+                    args.a.device().clone(),
+                );
+
+                let a_vec = args.a.to_vec_f32()?;
+                let g_vec = args.out_grad.to_vec_f32()?;
+                let mut db_vec = vec![0.0f32; b_dims[0] * b_dims[1]];
+                for i in 0..k {
+                    for j in 0..n {
+                        let mut sum = 0.0f32;
+                        for l in 0..m {
+                            sum += a_vec[l * k + i] * g_vec[l * n + j];
+                        }
+                        db_vec[i * n + j] = sum;
+                    }
+                }
+                let storage_b = dev.from_cpu(&db_vec, args.b.shape(), DType::F32)?;
+                let grad_b = Tensor::new(
+                    Arc::from(storage_b),
+                    args.b.shape().clone(),
+                    DType::F32,
+                    args.b.provenance().clone(),
+                    args.b.device().clone(),
+                );
+                return Ok((grad_a, grad_b));
+            }
+        }
+    }
+
+    // CPU fallback path
     let a_vec = args.a.to_vec_f32()?;
     let b_vec = args.b.to_vec_f32()?;
     let g_vec = args.out_grad.to_vec_f32()?;
@@ -259,5 +341,22 @@ mod tests {
         let (gl, gr) = add_backward(&args).unwrap();
         assert_eq!(gl.to_vec_f32().unwrap(), vec![1.0, 2.0]);
         assert_eq!(gr.to_vec_f32().unwrap(), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn matmul_backward_computes_gradients() {
+        let a = tensor(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let b = tensor(vec![0.5, 1.5, 2.5, 3.5], vec![2, 2]);
+        let g = tensor(vec![1.0, 1.0, 1.0, 1.0], vec![2, 2]);
+        let args = MatMulArgs {
+            a,
+            b,
+            out_grad: g,
+            transpose_a: false,
+            transpose_b: false,
+        };
+        let (ga, gb) = matmul_backward(&args).unwrap();
+        assert_eq!(ga.shape().dims(), &[2, 2]);
+        assert_eq!(gb.shape().dims(), &[2, 2]);
     }
 }

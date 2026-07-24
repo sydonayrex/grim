@@ -143,6 +143,17 @@ pub trait BackendDevice: Send + Sync {
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>>;
 
+    /// Copy raw byte slice (for packed quantized representations) from host memory to device storage.
+    fn from_cpu_bytes(
+        &self,
+        data: &[u8],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let _ = (data, shape, dtype);
+        Err(crate::error::Error::Unimplemented("from_cpu_bytes not implemented for this backend".into()))
+    }
+
     /// Provide hints about memory usage/advice patterns to the device/system.
     /// Maps to OS-level `madvise` or backend-specific APIs like `hipMemAdvise`.
     fn advise(&self, storage: &dyn BackendStorage, advice: MemAdvice) -> Result<()>;

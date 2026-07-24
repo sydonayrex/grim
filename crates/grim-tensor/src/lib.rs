@@ -15,7 +15,8 @@ pub mod tensor;
 
 pub use backend::{BackendDevice, BackendStorage, ComputeHandle, ReadyHandle, MemAdvice};
 pub use dtype::{
-    ArithType, Device, DType, GpuIntConfig, GroupQuantScheme, KQuantScheme, QuantProvenance, Storage,
+    ArithType, BlockDtype, Device, DType, FloatPackScheme, GpuIntConfig, GroupQuantScheme,
+    KQuantScheme, QuantProvenance, Storage,
 };
 pub use error::{Error, Result};
 pub use provider::{RawTensor, TensorMeta, TensorProvider};

@@ -39,14 +39,14 @@
         </button>
         <button class="nav-item" data-tab="devices">
           <span class="nav-icon">🎮</span>
-          <span>ROCm Devices</span>
+          <span>GPU Accelerators</span>
         </button>
       </nav>
 
       <div class="sidebar-footer">
         <div class="system-status">
           <span class="status-indicator online"></span>
-          <span id="backend-status">ROCm Engine Ready</span>
+          <span id="backend-status">Hardware Engine Active</span>
         </div>
       </div>
     </aside>
@@ -302,26 +302,26 @@
           </div>
         </section>
 
-        <!-- Tab 5: ROCm Devices -->
+        <!-- Tab 5: GPU Accelerators & Devices -->
         <section id="tab-devices" class="tab-page">
           <div class="card">
             <div class="card-header-flex">
-              <h3>ROCm Hardware Accelerators</h3>
-              <span class="status-pill status-online" id="rocm-status-pill">🟢 ROCm Engine Active</span>
+              <h3>GPU Accelerators & Hardware Discovery</h3>
+              <span class="status-pill status-online" id="rocm-status-pill">🟢 Hardware Engine Active</span>
             </div>
-            <p class="subtitle-text">AMD ROCm GPU accelerator discovery, VRAM allocation, and compute target monitoring.</p>
+            <p class="subtitle-text">GPU accelerator discovery, backend compliance (AMD ROCm vs NVIDIA CUDA), and memory telemetry.</p>
             <div id="devices-list" class="devices-grid"></div>
           </div>
 
-          <!-- ROCm Informational Card -->
+          <!-- Informational Card -->
           <div class="card margin-top">
-            <h3>ℹ️ Understanding ROCm Acceleration in GRIM</h3>
+            <h3>ℹ️ Understanding Hardware Acceleration in GRIM</h3>
             <div class="thesis-box">
-              <p><strong>AMD ROCm HIP Backend Features:</strong></p>
+              <p><strong>Hardware Backend Delineation:</strong></p>
               <ul>
-                <li><strong>Fused Dequantization Kernels:</strong> Performs 4-bit/8-bit dequantization directly inside GPU register files during GEMM computation.</li>
-                <li><strong>Zero-Copy Memory Stream:</strong> Reads base weights from host system memory or disk lazily, keeping peak VRAM footprint minimal.</li>
-                <li><strong>Automatic CPU Fallback:</strong> If no ROCm-compatible GPU is detected, GRIM gracefully falls back to SIMD CPU execution.</li>
+                <li><strong>AMD ROCm HIP Backend:</strong> Native fused dequantization kernels run on AMD Radeon (RDNA) and Instinct (CDNA) GPUs.</li>
+                <li><strong>NVIDIA CUDA Backend:</strong> NVIDIA GPUs execute via CUDA kernels / Vulkan backend without ROCm HIP emulation.</li>
+                <li><strong>Automatic Fallback:</strong> Systems without discrete GPUs run multi-threaded SIMD CPU kernels.</li>
               </ul>
             </div>
           </div>

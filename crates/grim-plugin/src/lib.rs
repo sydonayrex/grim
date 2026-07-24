@@ -12,9 +12,11 @@
 //!   Sandboxed; fuel + memory-limited; cannot touch host memory or make
 //!   syscalls outside a granted capability set.
 
+pub mod arch_compat;
 pub mod dylib_loader;
 pub mod wasm_loader;
 
+pub use arch_compat::ArchCompatSpec;
 pub use dylib_loader::DylibPluginLoader;
 pub use wasm_loader::WasmPluginLoader;
 
@@ -389,7 +391,6 @@ max_memory_mb = 64
     #[test]
     fn plugin_registry_basic_operations() {
         use grim_core::Sampler;
-        use grim_tensor::{ArithType, Device, DType, Storage};
 
         // Create a simple test sampler
         struct TestSampler;

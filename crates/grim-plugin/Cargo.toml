@@ -10,6 +10,8 @@ description = "Plugin system for Grim — dynamic library + WASM component loadi
 grim-tensor = { workspace = true }
 grim-core = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 toml = "0.8"
 libloading = { version = "0.8", optional = true }
 

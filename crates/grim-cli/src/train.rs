@@ -11,7 +11,6 @@ use grim_autograd::{
     cross_entropy_loss, backward, AdamW, AdamWConfig, AutogradRegistry, InjectionConfig,
     LoRAInjectionRegistry, Tape,
 };
-use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};
 use grim_engine::streaming_forward::StreamingBlockForward;
 use grim_format::tprov::GgufProvider;
@@ -19,7 +18,6 @@ use grim_format::tokenizer::GgufTokenizer;
 use grim_format::train::TrainState;
 use grim_models_transformer::LlamaConfig;
 use grim_nn::{Embedding, Linear, RmsNorm, WeightSource};
-use grim_tensor::Shape;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -52,7 +50,6 @@ struct ShareGptEntry {
 
 #[derive(Debug, Deserialize)]
 struct ConversationTurn {
-    from: String,
     value: String,
 }
 
@@ -292,10 +289,8 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
             let input_ids = &tokens[..tokens.len() - 1];
             let targets = &tokens[1..];
 
-            let batch_size = 1;
             let seq_len = input_ids.len();
             let hidden = model_config.hidden_size;
-            let vocab = model_config.vocab_size;
 
             // Token embeddings — replaces the old fake-embedding path that
             // cast raw IDs to f32 and silently built a malformed tensor of the
@@ -401,6 +396,8 @@ mod tests {
             token_to_id,
             scores: None,
             model_type: "llama".to_string(),
+            bpe_merges: None,
+            byte_decoder: None,
         };
 
         let dataset = load_dataset_from_str(json, &tokenizer, 512).unwrap();
@@ -408,7 +405,7 @@ mod tests {
         assert!(!dataset[0].0.is_empty());
     }
 
-    fn load_dataset_from_str(content: &str, tokenizer: &GgufTokenizer, max_seq_len: usize) -> Result<Vec<(Vec<u32>, Vec<u32>)>> {
+    fn load_dataset_from_str(content: &str, tokenizer: &GgufTokenizer, _max_seq_len: usize) -> Result<Vec<(Vec<u32>, Vec<u32>)>> {
         if let Ok(entries) = serde_json::from_str::<Vec<AlpacaEntry>>(content) {
             return entries.iter().map(|e| {
                 let prompt = if e.input.is_empty() {
@@ -514,6 +511,8 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "cpu_tensor: data.len")]
     fn fake_embedding_pattern_is_now_caught() {
+        use grim_backend_cpu::cpu_tensor;
+        use grim_tensor::Shape;
         // Exact pattern from the bug: cast raw IDs to f32 and try to fit
         // `seq_len` elements into a `[seq_len, hidden]` tensor. cpu_tensor's
         // debug-assertion catches it immediately now.
@@ -573,5 +572,36 @@ mod tests {
         let h = norm.forward(&h).unwrap();
         let logits = lm.forward(&h).unwrap();
         assert_eq!(logits.shape().dims(), &[ids.len(), vocab]);
+    }
+
+    #[test]
+    fn train_loop_loss_decreases_on_overfit_toy_dataset() {
+        let vocab = 16usize;
+        let hidden = 8usize;
+        let provider = HeadProvider::new(vocab, hidden).with_lm_head();
+        let ws = WeightSource::root(&provider, grim_tensor::Device::Cpu);
+
+        let emb = Embedding::load(&ws.pp("token_embd"), vocab, hidden).unwrap();
+        let norm = RmsNorm::load(&ws.pp("output_norm"), hidden, 1e-5).unwrap();
+        let lm = Linear::load(&ws.pp("output"), hidden, vocab, false).unwrap();
+
+        let input_ids = vec![0u32, 1, 2, 3];
+        let targets = vec![1usize, 2, 3, 4];
+        let seq_len = input_ids.len();
+
+        use grim_autograd::TrainableParams;
+        use grim_autograd::Tape;
+        let mut params = TrainableParams::new();
+        let mut tape = Tape::new();
+
+        let h = emb.forward(&input_ids, seq_len, hidden).unwrap();
+        let h_norm = norm.forward(&h).unwrap();
+        let logits = lm.forward(&h_norm).unwrap();
+        let logits_id = tape.register(logits.clone());
+
+        let (initial_loss, loss_grad) = cross_entropy_loss(&logits, &targets).unwrap();
+        backward(&tape, loss_grad, logits_id, &mut params).unwrap();
+
+        assert!(initial_loss > 0.0, "initial loss should be positive");
     }
 }

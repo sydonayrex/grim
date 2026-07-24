@@ -2305,7 +2305,7 @@ mod tests {
         // This is the BitBLAS/GPTQ format used by EfficientQAT
         
         // Create mock qweight: 3 u32 words
-        let mut qweight = [0u8; 12];
+        let qweight = [0u8; 12];
         // Word 0: bits 0-10 of values 0-10
         // Word 1: bits 11-21 of values 11-21  
         // Word 2: bits 22-31 of values 22-31

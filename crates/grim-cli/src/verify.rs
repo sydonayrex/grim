@@ -377,7 +377,10 @@ fn check_adapters(grim_file: &GrimFile, report: &mut VerifyReport) {
         println!("No QLoRA adapters found in backup2 slots.");
         report.warnings.push("No tensors have backup2 provisioned (no QLoRA adapters)".to_string());
     } else {
-        println!("Found {} tensor(s) with backup2 adapter capacity.", report.adapter_tensors.len());
+        println!("Found {} tensor(s) with backup2 adapter capacity:", report.adapter_tensors.len());
+        for info in &report.adapter_tensors {
+            println!("  - {}: bpw={}, codes={}B, scale={}B", info.tensor_name, info.backup2_bpw, info.backup2_codes_size, info.backup2_scale_size);
+        }
     }
 }
 

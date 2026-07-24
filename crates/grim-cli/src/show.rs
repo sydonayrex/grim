@@ -1,8 +1,7 @@
 //! grim show - Show available models organized by format (GRIM > GGUF > others).
 
 use grim_core::catalog::{list_local_models, ModelEntry};
-use grim_core::error::{Error, Result};
-use std::collections::HashMap;
+use grim_core::error::Result;
 
 /// Show available models organized by extension priority.
 pub async fn cmd_show(verbose: bool) -> Result<()> {
@@ -55,8 +54,6 @@ fn print_section(title: &str, models: &[ModelEntry], verbose: bool) {
     println!("\n=== {} ({}) ===", title, models.len());
 
     for entry in models {
-        let path = std::path::PathBuf::from(&entry.path);
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(&entry.name);
 
         if verbose {
             println!("  {}", entry.name);

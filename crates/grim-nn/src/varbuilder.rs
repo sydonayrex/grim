@@ -276,6 +276,25 @@ fn materialize(
         let f32s = dequant_to_f32(&raw, &dtype)?;
         return Ok(cpu_tensor(f32s, shape));
     }
+    if dtype.is_quantized() {
+        if let Device::Rocm(ordinal) = device {
+            #[cfg(feature = "rocm-mem")]
+            {
+                let dev = RocmDevice::new(*ordinal);
+                if let Ok(storage) = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone()) {
+                    return Ok(Tensor::new(
+                        Arc::from(storage),
+                        shape,
+                        dtype,
+                        provenance,
+                        device.clone(),
+                    ));
+                }
+            }
+            #[cfg(not(feature = "rocm-mem"))]
+            let _ = ordinal;
+        }
+    }
     let f32s = dequant_to_f32(&raw, &dtype)?;
     match device {
         Device::Cpu => {
@@ -404,5 +423,52 @@ pub(crate) fn f16_to_f32_le(bytes: &[u8]) -> f32 {
         f32::from_bits((sign << 31) | 0x7F80_0000 | (mant << 13))
     } else {
         f32::from_bits((sign << 31) | ((exp + 112) << 23) | (mant << 13))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyProvider {
+        raw: RawTensor,
+        dtype: DType,
+    }
+
+    impl grim_tensor::TensorProvider for DummyProvider {
+        fn get(&self, _name: &str) -> Result<RawTensor> {
+            Ok(self.raw.clone())
+        }
+        fn get_packed(&self, _name: &str) -> Result<RawTensor> {
+            Ok(self.raw.clone())
+        }
+        fn meta(&self, _name: &str) -> Result<grim_tensor::TensorMeta> {
+            Ok(grim_tensor::TensorMeta {
+                dtype: self.dtype.clone(),
+                provenance: QuantProvenance::GrimNative,
+                shape: self.raw.shape.clone(),
+                fusion_mask: 0,
+            })
+        }
+    }
+
+    #[test]
+    fn test_quantized_weight_cpu_dequantizes() {
+        let q8_dtype = DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q80),
+        };
+        let dummy = DummyProvider {
+            raw: RawTensor {
+                bytes: vec![0u8; 64],
+                shape: vec![2, 16],
+                dtype: q8_dtype.clone(),
+                provenance: QuantProvenance::GrimNative,
+            },
+            dtype: q8_dtype,
+        };
+        let ws = WeightSource::root(&dummy, Device::Cpu);
+        let tensor = ws.get(Shape::new(vec![2, 16]), "weight").unwrap();
+        assert_eq!(tensor.device(), &Device::Cpu);
     }
 }

@@ -150,6 +150,45 @@ impl RocmStorage {
 
         Ok(storage)
     }
+
+    /// Copies raw packed bytes (e.g. Q4_K, Q8_0, GPTQ) from host memory to GPU.
+    pub fn copy_from_host_raw_bytes(
+        host_bytes: &[u8],
+        shape: &Shape,
+        dtype: DType,
+        allocator: &Arc<RocmCachingAllocator>,
+        ordinal: usize,
+    ) -> Result<Self> {
+        let bytes = host_bytes.len();
+        let dev_ptr_void = allocator.alloc(bytes)?;
+
+        let upload_result = unsafe {
+            hipMemcpy(
+                dev_ptr_void,
+                host_bytes.as_ptr() as *const c_void,
+                bytes,
+                HipMemcpyKind::HostToDevice,
+            )
+        };
+
+        if upload_result != hipSuccess {
+            allocator.free(dev_ptr_void, bytes);
+            return Err(Error::Backend(format!(
+                "hipMemcpyHostToDevice raw bytes failed with error code {}",
+                upload_result
+            )));
+        }
+
+        Ok(RocmStorage {
+            device_ptr: Some(dev_ptr_void as u64),
+            bytes,
+            shape: shape.clone(),
+            dtype,
+            provenance: QuantProvenance::GrimNative,
+            ordinal,
+            allocator: Arc::clone(allocator),
+        })
+    }
 }
 
 impl Drop for RocmStorage {

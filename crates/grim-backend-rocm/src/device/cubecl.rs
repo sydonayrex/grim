@@ -357,7 +357,7 @@ fn qkv_attention_kernel(
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    seq_len: usize,
+    _seq_len: usize,
     kv_seq_len: usize,
     cache_offset: usize,
 ) {
@@ -595,7 +595,7 @@ fn tree_attention_kernel(
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    gamma: usize,
+    _gamma: usize,
     kv_seq_len: usize,
     cache_offset: usize,
 ) {

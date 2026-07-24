@@ -4,6 +4,7 @@
 //! on the CPU backend.
 
 pub mod block;
+pub mod configs;
 pub mod lora;
 pub mod model;
 pub mod native_mtp;
@@ -15,6 +16,7 @@ pub mod deepseek;
 pub mod t5;
 
 pub use block::{LlamaBlock, LlamaConfigRefs};
+pub use configs::{BloomConfig, FalconConfig, MoeConfig, PhiConfig, QwenConfig};
 pub use lora::apply_adapters_to_logits;
 pub use model::{Llama, LlamaConfig};
 pub use native_mtp::{LlamaMtp, MtpDepthProvider};

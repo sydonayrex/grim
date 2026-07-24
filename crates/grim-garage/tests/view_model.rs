@@ -83,6 +83,9 @@ fn rocm_toggles_reflect_state_when_devices_present() {
     s.set_devices(vec![grim_garage::RocmDeviceInfo {
         ordinal: 0,
         name: "AMD Instinct MI300X".into(),
+        vendor: "AMD".into(),
+        backend: "ROCm".into(),
+        is_rocm_compliant: true,
         gcn_arch: "gfx942".into(), // MI300X — CDNA3, W64
         vram_bytes: 192 * 1024 * 1024 * 1024,
         wavefront_size: 64,
