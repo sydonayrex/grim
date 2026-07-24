@@ -145,14 +145,18 @@ impl KvBlockPool {
     /// Prefix caching block lookup/share (§5.1)
     pub fn find_or_share_prefix(&mut self, prefix_hash: u64) -> Result<BlockId> {
         if let Some(&bid) = self.prefix_cache.get(&prefix_hash) {
-            *self.ref_counts.entry(bid).or_insert(0) += 1;
-            println!("[PrefixCache] Shared prefix block {} (hash {})", bid, prefix_hash);
-            Ok(bid)
-        } else {
-            let bid = self.alloc()?;
-            self.prefix_cache.insert(prefix_hash, bid);
-            Ok(bid)
+            if let Some(cnt) = self.ref_counts.get(&bid) {
+                if *cnt > 0 {
+                    *self.ref_counts.entry(bid).or_insert(0) += 1;
+                    println!("[PrefixCache] Shared prefix block {} (hash {})", bid, prefix_hash);
+                    return Ok(bid);
+                }
+            }
+            self.prefix_cache.remove(&prefix_hash);
         }
+        let bid = self.alloc()?;
+        self.prefix_cache.insert(prefix_hash, bid);
+        Ok(bid)
     }
 
     /// SSM State Pool management (§5.1): Retrieve a state vector by request ID.
@@ -192,6 +196,7 @@ impl KvBlockPool {
             }
             *cnt -= 1;
             if *cnt == 0 {
+                self.prefix_cache.retain(|_, v| *v != id);
                 self.ref_counts.remove(&id);
             }
         }
@@ -369,8 +374,16 @@ impl PagedKvCache {
 
     /// Token count as computed from the block table.
     fn token_count(&self) -> usize {
-        // v1 estimates: each full block = BLOCK_SIZE tokens, partial = whatever
-        self.table.len() * BLOCK_SIZE
+        let full_blocks = self.table.len().saturating_sub(1);
+        let full_tokens = full_blocks * BLOCK_SIZE;
+        let partial = self.table.logical_to_physical.last().map(|&bid| {
+            self.pool.lock().unwrap().blocks.get(bid).map_or(BLOCK_SIZE, |b| b.num_tokens)
+        }).unwrap_or(0);
+        if partial > 0 && self.table.logical_to_physical.len() > 0 {
+            full_tokens + partial
+        } else {
+            full_tokens
+        }
     }
 }
 
@@ -391,8 +404,18 @@ impl KvCache for PagedKvCache {
     }
 
     fn commit(&mut self, accepted_len: usize) -> Result<()> {
-        let to_drop = self.tentative_len.saturating_sub(accepted_len);
-        self.rollback_to(self.token_count().saturating_sub(to_drop))?;
+        let current_len = self.token_count();
+        if accepted_len >= current_len {
+            self.tentative_len = 0;
+            return Ok(());
+        }
+        let to_drop_blocks = self.tentative_len.saturating_sub(accepted_len / BLOCK_SIZE);
+        let mut pool = self.pool.lock().unwrap();
+        for _ in 0..to_drop_blocks {
+            if let Some(pid) = self.table.logical_to_physical.pop() {
+                pool.free_with_tier(pid, false).ok();
+            }
+        }
         self.tentative_len = 0;
         Ok(())
     }
@@ -402,17 +425,15 @@ impl KvCache for PagedKvCache {
         if len >= current {
             return Ok(());
         }
-        let to_remove = current - len;
-        let blocks_to_pop = (to_remove + BLOCK_SIZE - 1) / BLOCK_SIZE;
         let mut pool = self.pool.lock().unwrap();
-        for _ in 0..blocks_to_pop {
+        while self.token_count() > len {
             if let Some(pid) = self.table.logical_to_physical.pop() {
-                // Demote-before-drop: the pool's free_with_tier routes
-                // through the spill manager if one is attached.
                 pool.free_with_tier(pid, false).ok();
+            } else {
+                break;
             }
         }
-        self.tentative_len = self.tentative_len.saturating_sub(to_remove);
+        self.tentative_len = self.tentative_len.min(self.table.logical_to_physical.len());
         Ok(())
     }
 

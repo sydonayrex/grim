@@ -42,6 +42,12 @@ pub const WIT_SAMPLER_INTERFACE: &str = include_str!("wit/sampler.wit");
 /// Wrapper for a WASM-based sampler plugin.
 pub struct WasmSampler {
     name: String,
+    /// The instantiated WASM module keeps the Instance alive so
+    /// exports remain valid for the lifetime of this sampler.
+    #[cfg(feature = "wasm-sandbox")]
+    instance: Option<wasmtime::Instance>,
+    #[cfg(feature = "wasm-sandbox")]
+    store: Option<wasmtime::Store<()>>,
 }
 
 /// WASM plugin loader — enforces fuel, memory, and capability grants.
@@ -178,15 +184,12 @@ impl WasmPluginLoader {
 
         // Instantiate — any unlinked import causes a trap here, not at call time.
         // This is the correct place to fail: before the plugin runs any user code.
-        let _instance = linker.instantiate(&mut store, &module)
-            .map_err(|e| Error::Backend(format!(
-                "failed to instantiate WASM module '{}' — \
-                 check that the plugin only uses imports permitted by its grants: {e}",
-                self.name
-            )))?;
-
-        Ok(Arc::new(WasmSampler {
+Ok(Arc::new(WasmSampler {
             name: self.name.clone(),
+            #[cfg(feature = "wasm-sandbox")]
+            instance: Some(_instance),
+            #[cfg(feature = "wasm-sandbox")]
+            store: Some(store),
         }))
     }
 
@@ -231,11 +234,34 @@ impl WasmPluginLoader {
 }
 
 impl Sampler for WasmSampler {
-    fn sample(&self, _logits: &grim_tensor::Tensor, _history: &[u32]) -> Result<u32> {
-        // Full implementation would call into WASM module via wasmtime exported fn.
-        Err(Error::Unimplemented(
-            "WASM sampler execution requires wasm-sandbox feature".into()
-        ))
+    fn sample(&self, logits: &grim_tensor::Tensor, history: &[u32]) -> Result<u32> {
+        #[cfg(not(feature = "wasm-sandbox"))]
+        {
+            let _ = (logits, history);
+            Err(Error::Unimplemented(
+                "WASM sampler execution requires wasm-sandbox feature".into()
+            ))
+        }
+        #[cfg(feature = "wasm-sandbox")]
+        {
+            let store = self.store.as_ref()
+                .ok_or_else(|| Error::Backend("WasmSampler store unavailable".into()))?;
+            let memory = self.instance.as_ref()
+                .and_then(|inst| inst.get_memory(store, "memory").ok());
+            let sample_fn = self.instance.as_ref()
+                .and_then(|inst| inst.get_func(store, "sample").ok());
+            let logits_ptr: i32 = 0;
+            let logits_len: i32 = logits.shape().dims().get(0).copied().unwrap_or(0) as i32;
+            let history_ptr: i32 = 0;
+            let history_len: i32 = history.len() as i32;
+            if let (Some(_mem), Some(func)) = (memory, sample_fn) {
+                let result = func.call(store, &[logits_ptr.into(), logits_len.into(), history_ptr.into(), history_len.into()]);
+                if let Ok([token_id]) = result {
+                    return Ok(token_id as u32);
+                }
+            }
+            Err(Error::Backend("WASM sampler failed to execute sample".into()))
+        }
     }
 
     fn name(&self) -> &str {

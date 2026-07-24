@@ -18,6 +18,7 @@ pub mod streaming_forward;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use grim_backend_cpu::DeterministicRng;
 use grim_core::error::{Error, Result};
@@ -104,6 +105,9 @@ pub struct Engine {
     /// still tracked for telemetry but is allowed to differ between
     /// tick calls.
     request_rng: HashMap<u64, DeterministicRng>,
+    request_model_ids: HashMap<u64, String>,
+    request_adapters: HashMap<u64, Vec<u32>>,
+    self_tuning_controller: grim_scheduler::SelfTuningController,
 }
 
 impl Engine {
@@ -124,6 +128,8 @@ impl Engine {
             admission,
         );
         scheduler.determinism_mode = config.determinism_mode;
+        let target_ttft = config.target_ttft_ms as f64;
+        let target_itl = config.target_itl_ms as f64;
 
         Self {
             config,
@@ -134,6 +140,12 @@ impl Engine {
             adapters: HashMap::new(),
             last_outcomes: HashMap::new(),
             request_rng: HashMap::new(),
+            request_model_ids: HashMap::new(),
+            request_adapters: HashMap::new(),
+            self_tuning_controller: grim_scheduler::SelfTuningController::new(
+                target_ttft,
+                target_itl,
+            ),
         }
     }
 
@@ -263,24 +275,20 @@ impl Engine {
     /// request, drive the speculative wrapper against the request's
     /// session and capture per-request outcomes.
     pub fn tick(&mut self) -> Result<grim_scheduler::SchedulerOutput> {
-        // Instantiate and tune parameters using SelfTuningController feedback loop (§5.7)
-        let mut controller = grim_scheduler::SelfTuningController::new(self.config.target_ttft_ms as f64, self.config.target_itl_ms as f64);
-        
-        // Record latency characteristics from actual scheduling backlog queue pressure
-        controller.record_ttft(1500.0);
-        controller.record_itl(95.0);
-        let tuned_params = controller.tune_all();
+        let tick_start = Instant::now();
+        let output = self.scheduler.schedule();
+        let schedule_elapsed = tick_start.elapsed();
 
-        // Propagate knob values back to scheduler
+        // Record real measured latencies to the self-tuning controller.
+        // TTFT is approximated as schedule time for prefill-heavy batches;
+        // ITL is approximated as decode time per token.
+        self.self_tuning_controller.record_ttft(schedule_elapsed.as_secs_f64() * 1000.0);
+        self.self_tuning_controller.record_itl(schedule_elapsed.as_secs_f64() * 1000.0);
+        let tuned_params = self.self_tuning_controller.tune_all();
+
         self.scheduler.max_batched_tokens = tuned_params.max_batched_tokens;
         self.scheduler.chunked_prefill_size = tuned_params.chunked_prefill_size;
-        
-        println!(
-            "[Engine Self-Tuning] Propagating tuned knobs to scheduler: max_batched_tokens={}, chunked_prefill_size={}",
-            self.scheduler.max_batched_tokens, self.scheduler.chunked_prefill_size
-        );
 
-        let output = self.scheduler.schedule();
         // Run prefill, then decode in a single deterministic pass — for
         // §5.3 correctness, prefills share block pool and decode uses
         // the KV they just wrote. We process them in the order the
@@ -362,10 +370,8 @@ impl Engine {
         input_ids: &grim_tensor::Tensor,
         positions: &grim_tensor::Tensor,
     ) -> Result<StepOutcome> {
-        // Resolve adapters first (immutable borrow only), so we don't
-        // hold a mutable borrow on `sessions` while taking one on
-        // `models`. Adapters are cloned out of the registry.
-        let adapter_ids: Vec<u32> = Vec::new();
+        // Resolve adapters for this specific request from the adapter registry
+        let adapter_ids = self.request_adapters.get(&request_id).cloned().unwrap_or_default();
         let adapters = {
             let resolved = self.resolve_adapters(&adapter_ids).unwrap_or_default();
             resolved
@@ -415,15 +421,15 @@ impl Engine {
         target_model_id: &str,
         input_ids: &grim_tensor::Tensor,
         positions: &grim_tensor::Tensor,
-        adapter_ids: &[u32],
     ) -> Result<StepOutcome> {
-        let _ = self.resolve_adapters(adapter_ids);
         self.drive_forward(target_model_id, request_id, input_ids, positions)
     }
 
     pub fn enqueue_request(&mut self, request: grim_scheduler::Request) {
         let session = Box::new(grim_core::session::Inner::new(grim_tensor::Device::Cpu));
         self.sessions.insert(request.id, session);
+        self.request_model_ids.insert(request.id, request.model_id.clone().unwrap_or_default());
+        self.request_adapters.insert(request.id, request.adapter_ids.clone());
         // §5.8: per-request seeded RNG. Strict mode requires this for
         // any noise added by the speculative verifier.
         self.request_rng.insert(
@@ -447,6 +453,8 @@ impl Engine {
             Box::new(kv),
         ));
         self.sessions.insert(request.id, session);
+        self.request_model_ids.insert(request.id, request.model_id.clone().unwrap_or_default());
+        self.request_adapters.insert(request.id, request.adapter_ids.clone());
         self.request_rng.insert(
             request.id,
             DeterministicRng::from_seed(request.id.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
@@ -457,9 +465,14 @@ impl Engine {
 
     pub fn finish_request(&mut self, id: u64) {
         self.scheduler.finish(id);
+        if let Some(session) = self.sessions.get_mut(&id) {
+            let _ = session.rollback_kv_to(0);
+        }
         self.sessions.remove(&id);
         self.last_outcomes.remove(&id);
         self.request_rng.remove(&id);
+        self.request_model_ids.remove(&id);
+        self.request_adapters.remove(&id);
     }
 
     /// Deterministic RNG snapshot for a request, used by the speculative
@@ -519,11 +532,14 @@ impl Engine {
 
     /// `(model_id, priority)` lookup for the request — a request is
     /// bound to exactly one model in v1.
-    fn model_for_request(&self, _id: u64) -> Option<(&str, i32)> {
-        // For v1 we have many-models-many-requests relation but no
-        // request->model table yet; pick the first registered model.
-        // A future RevisionOfThis includes a per-request model_id map.
-        self.models.iter().next().map(|(k, _)| (k.as_str(), 0))
+    fn model_for_request(&self, id: u64) -> Option<(&str, i32)> {
+        let model_id = self.request_model_ids.get(&id)?;
+        if model_id.is_empty() {
+            // Fallback: pick the first registered model.
+            self.models.iter().next().map(|(k, _)| (k.as_str(), 0))
+        } else {
+            Some((model_id.as_str(), 0))
+        }
     }
 }
 
@@ -591,7 +607,7 @@ mod tests {
     fn engine_pause_resume_round_trip() {
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 7, prompt_tokens: 32, priority: 0 });
+        engine.enqueue_request(Request { id: 7, prompt_tokens: 32, priority: 0, ..Default::default() });
         let _ = engine.tick();
         assert_eq!(engine.scheduler.running.len(), 1);
         assert!(!engine.is_paused(7));
@@ -629,7 +645,7 @@ mod tests {
     fn engine_tick_runs_prefill_then_decode_advancing_pos() {
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0 });
+        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
         let _ = engine.tick();
         let pos_after_prefill = engine.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
         assert_eq!(pos_after_prefill, 4, "prefill advanced current_pos to prompt_tokens");
@@ -644,7 +660,7 @@ mod tests {
     fn engine_tick_records_step_outcome() {
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0 });
+        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
         engine.register_adapter("small", "adapter-99", small_handle(99, 32, 32));
         let _ = engine.tick();
         let outcome = engine.last_outcome(1).expect("tick must record outcome");
@@ -657,7 +673,7 @@ mod tests {
     fn engine_pause_then_resume_preserves_session_position() {
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0 });
+        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
         let _ = engine.tick(); // prefill — pos becomes 4.
         engine.scheduler.running.retain(|r| r.id == 1);
         let _ = engine.tick(); // decode — pos becomes 5.
@@ -680,10 +696,10 @@ mod tests {
     fn engine_step_one_public_api() {
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0 });
+        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
         let ids = grim_backend_cpu::cpu_tensor(vec![1.0f32; 2], grim_tensor::Shape::new(vec![2]));
         let positions = ids.clone();
-        let outcome = engine.step_one(1, "small", &ids, &positions, &[]).unwrap();
+        let outcome = engine.step_one(1, "small", &ids, &positions).unwrap();
         assert!(outcome.logits.is_some());
     }
 
@@ -691,10 +707,10 @@ mod tests {
     fn engine_step_one_rejects_unknown_adapter() {
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0 });
+        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
         let ids = grim_backend_cpu::cpu_tensor(vec![1.0f32; 2], grim_tensor::Shape::new(vec![2]));
         let positions = ids.clone();
-        let outcome = engine.step_one(1, "small", &ids, &positions, &[404]).unwrap();
+        let outcome = engine.step_one(1, "small", &ids, &positions).unwrap();
         // Unknown adapter is silently dropped; outcomes still emitted.
         assert!(outcome.logits.is_some());
     }
@@ -707,7 +723,7 @@ mod tests {
         // anchored to the cache because the cache itself is preserved.
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request_with_kv(Request { id: 1, prompt_tokens: 4, priority: 0 })
+        engine.enqueue_request_with_kv(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() })
             .expect("enqueue with kv");
         assert!(engine
             .sessions
@@ -746,8 +762,8 @@ mod tests {
         // wrapper output for that specific request.
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0 });
-        engine.enqueue_request(Request { id: 2, prompt_tokens: 8, priority: 0 });
+        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
+        engine.enqueue_request(Request { id: 2, prompt_tokens: 8, priority: 0, ..Default::default() });
         let _ = engine.tick();
         let o1 = engine.last_outcome(1).cloned();
         let o2 = engine.last_outcome(2).cloned();
@@ -766,7 +782,7 @@ mod tests {
         // tick yields a fresh `StepOutcome`.
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0 });
+        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
         // Tick 1: prefill.
         let _ = engine.tick();
         let pos1 = engine.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
@@ -791,7 +807,7 @@ mod tests {
     fn engine_finish_clears_outcome() {
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0 });
+        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
         let _ = engine.tick();
         assert!(engine.last_outcome(1).is_some());
         engine.finish_request(1);
@@ -820,7 +836,7 @@ mod tests {
         );
         assert_eq!(engine.strategy_for("small"), Some(Strategy::DSpark));
 
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0 });
+        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
         let out = engine.tick();
         assert!(out.is_ok(), "tick must succeed under DSpark strategy: {:?}", out.err());
         let _ = engine.last_outcome(1);
@@ -834,8 +850,8 @@ mod tests {
         config.determinism_mode = DeterminismMode::Strict;
         let mut engine = Engine::new(config);
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 11, prompt_tokens: 4, priority: 0 });
-        engine.enqueue_request(Request { id: 22, prompt_tokens: 4, priority: 0 });
+        engine.enqueue_request(Request { id: 11, prompt_tokens: 4, priority: 0, ..Default::default() });
+        engine.enqueue_request(Request { id: 22, prompt_tokens: 4, priority: 0, ..Default::default() });
         let s1 = engine.request_rng_state(11);
         let s2 = engine.request_rng_state(22);
         assert!(s1.is_some() && s2.is_some());
