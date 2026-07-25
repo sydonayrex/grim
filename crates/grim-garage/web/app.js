@@ -632,7 +632,13 @@ document.addEventListener('DOMContentLoaded', () => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ model_id: modelId, prompt: prompt, temperature: temp })
         });
-        const data = await res.json();
+        
+        let data = {};
+        try {
+          data = await res.json();
+        } catch (jsonErr) {
+          console.warn('Failed to parse chat API JSON response:', jsonErr);
+        }
 
         if (res.ok && data.reply) {
           const modelName = modelId.split('/').pop().split('\\').pop();
@@ -641,10 +647,12 @@ document.addEventListener('DOMContentLoaded', () => {
             <div style="white-space: pre-wrap; font-family: inherit;">${data.reply}</div>
           `;
         } else {
-          assistantBubble.innerHTML = `<span style="color: var(--danger-color);">⚠️ Error: ${data.error || 'Failed to generate response'}</span>`;
+          const errMsg = data.error || `HTTP ${res.status} ${res.statusText}`;
+          assistantBubble.innerHTML = `<span style="color: var(--danger-color);">⚠️ Error: ${errMsg}</span>`;
         }
       } catch (err) {
-        assistantBubble.innerHTML = `<span style="color: var(--danger-color);">⚠️ Failed to connect to chat API</span>`;
+        console.error('Chat API Network Error:', err);
+        assistantBubble.innerHTML = `<span style="color: var(--danger-color);">⚠️ Failed to connect to chat API (${err.message || 'Network error'})</span>`;
       } finally {
         if (sendBtn) sendBtn.disabled = false;
         chatContainer.scrollTop = chatContainer.scrollHeight;

@@ -656,16 +656,17 @@ pub struct ChatResponse {
 }
 
 async fn chat_handler(
+    State(_state): State<AppState>,
     Json(req): Json<ChatRequest>,
-) -> impl IntoResponse {
+) -> Result<Json<ChatResponse>, (StatusCode, Json<serde_json::Value>)> {
     let start_time = std::time::Instant::now();
     let prompt_clean = req.prompt.trim();
 
     if prompt_clean.is_empty() {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "Prompt cannot be empty" })),
-        ).into_response();
+        ));
     }
 
     let model_name = Path::new(&req.model_id)
@@ -680,15 +681,12 @@ async fn chat_handler(
 
     let latency_ms = start_time.elapsed().as_millis() as u64;
 
-    (
-        StatusCode::OK,
-        Json(ChatResponse {
-            reply: reply_text,
-            model_id: req.model_id,
-            tokens_generated: prompt_clean.split_whitespace().count() + 28,
-            latency_ms,
-        }),
-    ).into_response()
+    Ok(Json(ChatResponse {
+        reply: reply_text,
+        model_id: req.model_id,
+        tokens_generated: prompt_clean.split_whitespace().count() + 28,
+        latency_ms,
+    }))
 }
 
 pub fn health_router() -> Router {
