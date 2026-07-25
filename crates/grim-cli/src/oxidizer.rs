@@ -457,10 +457,44 @@ pub fn build_rewritten_tensors(
 }
 
 /// Compute per-element curvature for GPTQ re-quantization.
+pub fn cmd_oxidizer_raven(
+    model_path: &str,
+    output_path: &str,
+    target_bpw: f32,
+    calibration_dataset: Option<&str>,
+) -> Result<(), String> {
+    let (provider, names, _sizes, mut grim_meta) = open_provider(model_path)?;
+    let importance_scores = if Path::new(&format!("{}.importance.json", model_path)).exists() {
+        load_importance_scores(&format!("{}.importance.json", model_path))?
+    } else {
+        cmd_oxidizer_calibrate(model_path, output_path, calibration_dataset)?
+    };
+
+    let default_bw = target_bpw.round() as u32;
+    let full_bitwidths: Vec<u32> = vec![default_bw; names.len()];
+
+    let calibration_batch = CalibrationBatch::new(128);
+
+    grim_meta.magic = Some("grim-v1".into());
+    grim_meta.quant_version = Some(OXIDIZER_VERSION);
+    grim_meta.quant_method = Some("raven-fp8-repack".into());
+    grim_meta.calibration_dataset = calibration_dataset.map(String::from);
+
+    let rewritten = build_rewritten_tensors(
+        &provider,
+        &importance_scores,
+        &full_bitwidths,
+        &calibration_batch,
+        Some(&grim_meta),
+    )?;
+
+    write_grim_file(model_path, output_path, &grim_meta, &rewritten)
+}
+
+/// Computes a curvature representation across all tensor parameters.
 ///
 /// Uses true Fisher/GGN diagonal when `calibration_batch` has samples;
 /// otherwise falls back to the heuristic `build_curvature_proxy`.
-#[allow(dead_code)] // benchmark helper
 fn build_curvature(
     data: &[f32],
     layer_importance: f32,
@@ -476,7 +510,6 @@ fn build_curvature(
 
 /// Fallback: heuristic curvature proxy using activation magnitude as importance proxy.
 /// Used when no calibration data is available.
-#[allow(dead_code)] // benchmark helper
 fn build_curvature_proxy(data: &[f32], layer_importance: f32) -> Vec<f32> {
     let layer_scale = layer_importance.abs().max(1e-3);
     data.iter()

@@ -315,7 +315,6 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
             .zero_grads()
             .map_err(|e| Error::Session(e.to_string()))?;
 
-        let mut tape = Tape::new();
         let mut epoch_loss = 0.0f32;
         let mut num_batches = 0;
 
@@ -328,7 +327,7 @@ for (tokens, labels) in dataset.iter() {
             let hidden = model_config.hidden_size;
 
             let mut tape = Tape::new();
-            streaming.checkpoint.clear();
+            streaming.checkpoint_buffer.clear();
 
             let mut hidden_state = tok_embeddings
                 .forward(input_ids, seq_len, hidden)

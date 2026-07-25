@@ -82,50 +82,66 @@ impl AdamW {
         let bias_correction1 = 1.0 - beta1.powi(self.step_count as i32);
         let bias_correction2 = 1.0 - beta2.powi(self.step_count as i32);
 
+        use grim_tensor::backend::BackendDevice as _;
+
         for (id, param) in params.iter_mut() {
             let dev = crate::pick_device_for_tensor(&param.data);
-            let elem_count = param.data.shape().elem_count();
+            let shape = param.data.shape();
+            let elem_count = shape.elem_count();
 
+            // Seed moment buffers on first encounter (device-resident).
             if !self.m.contains_key(id) {
-                let zero_m = dev.from_cpu(&vec![0.0f32; elem_count], param.data.shape(), DType::F32)?;
-                self.m.insert(*id, zero_m);
+                let zero_m = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;                self.m.insert(*id, zero_m);
             }
             if !self.v.contains_key(id) {
-                let zero_v = dev.from_cpu(&vec![0.0f32; elem_count], param.data.shape(), DType::F32)?;
+                let zero_v = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
                 self.v.insert(*id, zero_v);
             }
 
-            let m_st = self.m.get_mut(id).unwrap();
-            let v_st = self.v.get_mut(id).unwrap();
+            let m_st_old = self.m.get_mut(id).unwrap();
+            let v_st_old = self.v.get_mut(id).unwrap();
+            let grad_st = param.grad().storage().clone();
+            let data_st = param.data.storage().clone();
 
-            let data_vec = param.data.to_vec_f32()?;
-            let grad_vec = param.grad().to_vec_f32()?;
-            let mut m_vec = m_st.to_cpu_vec_f32()?;
-            let mut v_vec = v_st.to_cpu_vec_f32()?;
+            // m_new = beta1 * m + (1-beta1) * g
+            let (m_beta1, _) = dev.mul_scalar(m_st_old.as_ref(), beta1, shape)?;
+            let (g_1mb1, _) = dev.mul_scalar(grad_st.as_ref(), 1.0 - beta1, shape)?;
+            let (m_new, _) = dev.add(m_beta1.as_ref(), g_1mb1.as_ref(), shape)?;
 
-            let mut updated_data = vec![0.0f32; elem_count];
+            // v_new = beta2 * v + (1-beta2) * g^2
+            let (g_sq, _) = dev.mul(grad_st.as_ref(), grad_st.as_ref(), shape)?;
+            let (v_beta2, _) = dev.mul_scalar(v_st_old.as_ref(), beta2, shape)?;
+            let (g_sq_1mb2, _) = dev.mul_scalar(g_sq.as_ref(), 1.0 - beta2, shape)?;
+            let (v_new, _) = dev.add(v_beta2.as_ref(), g_sq_1mb2.as_ref(), shape)?;
 
-            for i in 0..elem_count {
-                let g = grad_vec[i];
-                let w = data_vec[i];
+            // m_hat = m_new / bias_correction1,  v_hat = v_new / bias_correction2
+            let (m_hat, _) = dev.mul_scalar(m_new.as_ref(), 1.0 / bias_correction1, shape)?;
+            let (v_hat, _) = dev.mul_scalar(v_new.as_ref(), 1.0 / bias_correction2, shape)?;
 
-                m_vec[i] = beta1 * m_vec[i] + (1.0 - beta1) * g;
-                v_vec[i] = beta2 * v_vec[i] + (1.0 - beta2) * g * g;
+            // denom = sqrt(v_hat) + eps
+            let (sqrt_v, _) = dev.sqrt(v_hat.as_ref(), shape)?;
+            let eps_buf = dev.from_cpu(&vec![eps; elem_count], shape, DType::F32)?;
+            let (denom, _) = dev.add(sqrt_v.as_ref(), eps_buf.as_ref(), shape)?;
 
-                let m_hat = m_vec[i] / bias_correction1;
-                let v_hat = v_vec[i] / bias_correction2;
+            // recip_denom = 1.0 / denom
+            let (recip_denom, _) = dev.recip(denom.as_ref(), shape)?;
 
-                let step_grad = m_hat / (v_hat.sqrt() + eps) + weight_decay * w;
-                updated_data[i] = w - lr * step_grad;
-            }
+            // step_grad = m_hat * recip_denom + weight_decay * w
+            let (m_div_denom, _) = dev.mul(m_hat.as_ref(), recip_denom.as_ref(), shape)?;
+            let (wd_w, _) = dev.mul_scalar(data_st.as_ref(), weight_decay, shape)?;
+            let (step_grad, _) = dev.add(m_div_denom.as_ref(), wd_w.as_ref(), shape)?;
 
-            *m_st = dev.from_cpu(&m_vec, param.data.shape(), DType::F32)?;
-            *v_st = dev.from_cpu(&v_vec, param.data.shape(), DType::F32)?;
+            // updated = w - lr * step_grad
+            let (lr_step, _) = dev.mul_scalar(step_grad.as_ref(), lr, shape)?;
+            let (neg_lr_step, _) = dev.mul_scalar(lr_step.as_ref(), -1.0, shape)?;
+            let (updated_st, _) = dev.add(data_st.as_ref(), neg_lr_step.as_ref(), shape)?;
 
-            let storage = dev.from_cpu(&updated_data, param.data.shape(), DType::F32)?;
+            // Write back device-resident moment buffers + parameters.
+            *m_st_old = m_new;
+            *v_st_old = v_new;
             param.data = Tensor::new(
-                Arc::from(storage),
-                param.data.shape().clone(),
+                Arc::from(updated_st),
+                shape.clone(),
                 DType::F32,
                 param.data.provenance().clone(),
                 param.data.device().clone(),

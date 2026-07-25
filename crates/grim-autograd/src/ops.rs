@@ -216,6 +216,8 @@ pub fn lora_backward(
     scale: f32,
 ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
     let grad_base = out_grad.clone();
+    let dev = crate::pick_device_for_tensor(x);
+    use grim_tensor::{Shape, QuantProvenance};
 
     let x_vec = x.to_vec_f32()?;
     let a_vec = a.to_vec_f32()?;
@@ -231,15 +233,40 @@ pub fn lora_backward(
     let rank = a_dims[0];
     let out_features = b_dims[0];
 
-    let mut h_vec = vec![0.0f32; batch * rank];
-    for b_idx in 0..batch {
-        for r_idx in 0..rank {
-            let mut sum = 0.0f32;
-            for i in 0..in_features {
-                sum += x_vec[b_idx * in_features + i] * a_vec[r_idx * in_features + i];
+    if matches!(x.device(), grim_tensor::Device::Rocm(_)) {
+        let transpose_matrix = |v: &[f32], rows: usize, cols: usize| -> Vec<f32> {
+            let mut out = vec![0.0f32; rows * cols];
+            for r in 0..rows {
+                for c in 0..cols {
+                    out[c * rows + r] = v[r * cols + c];
+                }
             }
-            h_vec[b_idx * rank + r_idx] = sum;
-        }
+            out
+        };
+
+        let a_t_vec = transpose_matrix(&a_vec, rank, in_features);
+        let a_t_storage = dev.from_cpu(&a_t_vec, &Shape::new(vec![in_features, rank]), DType::F32)?;
+        let (h_storage, _) = dev.matmul(x.storage().as_ref(), a_t_storage.as_ref(), &Shape::new(vec![batch, rank]))?;
+
+        let (dh_unscaled, _) = dev.matmul(out_grad.storage().as_ref(), b.storage().as_ref(), &Shape::new(vec![batch, rank]))?;
+        let (dh_storage, _) = dev.mul_scalar(dh_unscaled.as_ref(), scale, &Shape::new(vec![batch, rank]))?;
+
+        let g_t_vec = transpose_matrix(&g_vec, batch, out_features);
+        let g_t_storage = dev.from_cpu(&g_t_vec, &Shape::new(vec![out_features, batch]), DType::F32)?;
+        let (db_unscaled, _) = dev.matmul(g_t_storage.as_ref(), h_storage.as_ref(), &Shape::new(vec![out_features, rank]))?;
+        let (db_storage, _) = dev.mul_scalar(db_unscaled.as_ref(), scale, &Shape::new(vec![out_features, rank]))?;
+
+        let dh_vec_gpu = dh_unscaled.to_cpu_vec_f32()?;
+        let dh_t_vec = transpose_matrix(&dh_vec_gpu, batch, rank);
+        let dh_t_storage = dev.from_cpu(&dh_t_vec, &Shape::new(vec![rank, batch]), DType::F32)?;
+        let (da_storage, _) = dev.matmul(dh_t_storage.as_ref(), x.storage().as_ref(), &Shape::new(vec![rank, in_features]))?;
+        let (dx_storage, _) = dev.matmul(dh_storage.as_ref(), a.storage().as_ref(), &Shape::new(vec![batch, in_features]))?;
+
+        let grad_x = Tensor::new(Arc::from(dx_storage), x.shape().clone(), DType::F32, QuantProvenance::default(), x.device().clone());
+        let grad_a = Tensor::new(Arc::from(da_storage), a.shape().clone(), DType::F32, QuantProvenance::default(), a.device().clone());
+        let grad_b = Tensor::new(Arc::from(db_storage), b.shape().clone(), DType::F32, QuantProvenance::default(), b.device().clone());
+
+        return Ok((grad_base, grad_x, grad_a, grad_b));
     }
 
     let mut dh_vec = vec![0.0f32; batch * rank];
@@ -250,6 +277,20 @@ pub fn lora_backward(
                 sum += g_vec[b_idx * out_features + o] * b_vec[o * rank + r_idx];
             }
             dh_vec[b_idx * rank + r_idx] = scale * sum;
+        }
+    }
+
+    // Hidden state `h = x @ A^T` (LoRA forward pre-activation) — needed by the
+    // `db_vec` reduction below (`db = scale * G^T @ h`). Mirrors the ROCm
+    // branch's `h_storage = dev.matmul(x, a_t, ...)` on host vectors.
+    let mut h_vec = vec![0.0f32; batch * rank];
+    for b_idx in 0..batch {
+        for r_idx in 0..rank {
+            let mut sum = 0.0f32;
+            for i in 0..in_features {
+                sum += x_vec[b_idx * in_features + i] * a_vec[r_idx * in_features + i];
+            }
+            h_vec[b_idx * rank + r_idx] = sum;
         }
     }
 

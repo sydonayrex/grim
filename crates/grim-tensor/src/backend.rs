@@ -101,6 +101,56 @@ pub trait BackendDevice: Send + Sync {
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
 
+    /// Elementwise multiply by a scalar broadcast: `out = x * scalar`.
+    ///
+    /// Used by autograd (`scale_backward`, LoRA grad scaling) and by the
+    /// device-resident AdamW optimizer step to scale moment buffers without a
+    /// host round-trip or a full broadcast buffer. Default returns
+    /// `Err(Unimplemented)` so only backends that wire a kernel override this.
+    fn mul_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (x, scalar, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "mul_scalar not implemented for this backend".into(),
+        ))
+    }
+
+    /// Elementwise square root: `out = sqrt(x)`.
+    ///
+    /// Used by the device-resident AdamW optimizer step to compute
+    /// `sqrt(v_hat) + eps` without a host round-trip. Default returns
+    /// `Err(Unimplemented)` so only backends that wire a kernel override this.
+    fn sqrt(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (x, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "sqrt not implemented for this backend".into(),
+        ))
+    }
+
+    /// Elementwise reciprocal: `out = 1.0 / x`.
+    ///
+    /// Used by the device-resident AdamW optimizer step to compute
+    /// `1.0 / (sqrt(v_hat) + eps)` without a host round-trip. Default returns
+    /// `Err(Unimplemented)` so only backends that wire a kernel override this.
+    fn recip(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (x, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "recip not implemented for this backend".into(),
+        ))
+    }
+
     /// `y = silu(x) * gate` — for LLaMA-style swiglu, fold here for now.
     fn silu_mul(
         &self,
@@ -204,6 +254,37 @@ pub trait BackendDevice: Send + Sync {
         let _ = (x, positions, dim, base, out_shape);
         Err(crate::error::Error::Unimplemented(
             "rope not implemented for this backend".into(),
+        ))
+    }
+
+    /// Fused GQA attention with causal masking.
+    ///
+    /// Phase-1 contract:
+    /// - `q`:         `[seq_len, num_heads, head_dim]` (f32)
+    /// - `k`, `v`:    `[kv_seq_len, num_kv_heads, head_dim]` (f32)
+    /// - `num_kv_heads`: real call-site parameter (GQA ratio = num_heads / num_kv_heads)
+    /// - `kv_seq_len`:  length of the K/V cache being attended to
+    /// - `cache_offset`: absolute position of `q[0, *, *]` (for causal masking)
+    /// - `out_shape`:  `[seq_len, num_heads, head_dim]`
+    /// - `out_max`/`out_sum`: optional flash-attention-style statistics buffers
+    ///
+    /// Causal masking: query at absolute position `(cache_offset + i)` attends
+    /// only to key positions `j` with `j <= cache_offset + i`.
+    fn qkv_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+        out_max: Option<&dyn BackendStorage>,
+        out_sum: Option<&dyn BackendStorage>,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (q, k, v, num_kv_heads, kv_seq_len, cache_offset, out_shape, out_max, out_sum);
+        Err(crate::error::Error::Unimplemented(
+            "qkv_attention not implemented for this backend".into(),
         ))
     }
 

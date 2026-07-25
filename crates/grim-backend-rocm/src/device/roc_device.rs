@@ -1716,6 +1716,80 @@ impl BackendDevice for RocmDevice {
         Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
     }
 
+    fn mul_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = as_rocm(x)?;
+        if !x_s.device_ptr_is_valid() {
+            return Err(Error::Backend("mul_scalar: input lacks a valid device pointer".into()));
+        }
+        let total = out.elem_count();
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut out_ptr = dev_ptr(&storage)?;
+        let mut x_ptr = dev_ptr(x_s)?;
+        let mut n = total as i32;
+        let mut s = scalar;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_mul_scalar",
+            grid,
+            block,
+            &mut [arg(&mut x_ptr), arg(&mut s), arg(&mut out_ptr), arg(&mut n)],
+        )?;
+        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+    }
+
+    fn sqrt(
+        &self,
+        x: &dyn BackendStorage,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = as_rocm(x)?;
+        if !x_s.device_ptr_is_valid() {
+            return Err(Error::Backend("sqrt: input lacks a valid device pointer".into()));
+        }
+        let total = out.elem_count();
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut out_ptr = dev_ptr(&storage)?;
+        let mut x_ptr = dev_ptr(x_s)?;
+        let mut n = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_sqrt",
+            grid,
+            block,
+            &mut [arg(&mut x_ptr), arg(&mut out_ptr), arg(&mut n)],
+        )?;
+        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+    }
+
+    fn recip(
+        &self,
+        x: &dyn BackendStorage,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = as_rocm(x)?;
+        if !x_s.device_ptr_is_valid() {
+            return Err(Error::Backend("recip: input lacks a valid device pointer".into()));
+        }
+        let total = out.elem_count();
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut out_ptr = dev_ptr(&storage)?;
+        let mut x_ptr = dev_ptr(x_s)?;
+        let mut n = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_recip",
+            grid,
+            block,
+            &mut [arg(&mut x_ptr), arg(&mut out_ptr), arg(&mut n)],
+        )?;
+        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+    }
+
     fn silu_mul(
         &self,
         gate: &dyn BackendStorage,
@@ -1999,10 +2073,10 @@ impl BackendDevice for RocmDevice {
         use grim_tensor::{KQuantScheme, BlockDtype, FloatPackScheme};
         match b_storage.dtype().storage {
             DTypeStorage::KQuant(KQuantScheme::Q4K) => {
-                let _ = self.launch_fused_dequant_gemm_q4k(a_storage, b_storage, &out_storage, m, n, k);
+                self.launch_fused_dequant_gemm_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
             }
             DTypeStorage::Block(BlockDtype::Fp8) | DTypeStorage::FloatPack(FloatPackScheme::Fp8) => {
-                let _ = self.launch_fused_dequant_gemm_fp8(a_storage, b_storage, &out_storage, m, n, k);
+                self.launch_fused_dequant_gemm_fp8(a_storage, b_storage, &out_storage, m, n, k)?;
             }
             DTypeStorage::FloatPack(FloatPackScheme::MxFp4) => {
                 let dummy_exps = RocmStorage::alloc_gpu(
@@ -2011,7 +2085,7 @@ impl BackendDevice for RocmDevice {
                     &self.allocator,
                     self.ordinal,
                 )?;
-                let _ = self.launch_fused_dequant_gemm_mxfp4(a_storage, b_storage, &dummy_exps, &out_storage, m, n, k);
+                self.launch_fused_dequant_gemm_mxfp4(a_storage, b_storage, &dummy_exps, &out_storage, m, n, k)?;
             }
             DTypeStorage::FloatPack(FloatPackScheme::MxFp8) => {
                 let dummy_exps = RocmStorage::alloc_gpu(
@@ -2020,7 +2094,7 @@ impl BackendDevice for RocmDevice {
                     &self.allocator,
                     self.ordinal,
                 )?;
-                let _ = self.launch_fused_dequant_gemm_mxfp8(a_storage, b_storage, &dummy_exps, &out_storage, m, n, k);
+                self.launch_fused_dequant_gemm_mxfp8(a_storage, b_storage, &dummy_exps, &out_storage, m, n, k)?;
             }
             _ => {
                 return self.matmul(a, b_packed, out_shape);
@@ -2139,57 +2213,263 @@ impl BackendDevice for RocmDevice {
             None => std::ptr::null(),
         };
 
-        // Call the actual kernel based on quantization type.
-        if default_bpw == 4 {
-            let _ = self.launch_fused_dequant_backward_gemm_q4k(
-                dy_storage,
-                b_storage,
-                &dx_storage,
-                m,
-                n,
-                k,
-            );
-        } else if default_bpw == 8 {
-            let _ = self.launch_fused_dequant_backward_gemm_fp8(
-                dy_storage,
-                b_storage,
-                &dx_storage,
-                m,
-                n,
-                k,
-            );
-        } else {
-            let _ = self.launch_fused_dequant_backward_gemm_f16(
-                dy_storage,
-                b_storage,
-                b_scales_ptr,
-                &dx_storage,
-                m,
-                n,
-                k,
-                default_bpw,
-                outlier_count,
-                outlier_indices_ptr,
-                outlier_values_ptr,
-                backup1_bpw,
-                backup1_codes_offset,
-                backup1_scale_offset,
-                backup2_bpw,
-                backup2_codes_offset,
-                backup2_scale_offset,
-            );
+        // Call the actual kernel based on quantization storage type (not bpw,
+        // which would mis-dispatch for non-Q4_K 4-bit formats like MxFp4/Nf4).
+        use grim_tensor::{KQuantScheme, BlockDtype, FloatPackScheme};
+        match b_storage.dtype().storage {
+            DTypeStorage::KQuant(KQuantScheme::Q4K) => {
+                self.launch_fused_dequant_backward_gemm_q4k(
+                    dy_storage,
+                    b_storage,
+                    &dx_storage,
+                    m,
+                    n,
+                    k,
+                )?;
+            }
+            DTypeStorage::Block(BlockDtype::Fp8) | DTypeStorage::FloatPack(FloatPackScheme::Fp8) => {
+                self.launch_fused_dequant_backward_gemm_fp8(
+                    dy_storage,
+                    b_storage,
+                    &dx_storage,
+                    m,
+                    n,
+                    k,
+                )?;
+            }
+            _ => {
+                self.launch_fused_dequant_backward_gemm_f16(
+                    dy_storage,
+                    b_storage,
+                    b_scales_ptr,
+                    &dx_storage,
+                    m,
+                    n,
+                    k,
+                    default_bpw,
+                    outlier_count,
+                    outlier_indices_ptr,
+                    outlier_values_ptr,
+                    backup1_bpw,
+                    backup1_codes_offset,
+                    backup1_scale_offset,
+                    backup2_bpw,
+                    backup2_codes_offset,
+                    backup2_scale_offset,
+                )?;
+            }
         }
 
         FUSED_BACKWARD_DISPATCH_STATS
             .kernel_calls
             .fetch_add(1, Ordering::Relaxed);
 
-        let handle: Box<dyn ComputeHandle> = Box::new(ReadyHandle);
-        Ok((Box::new(dx_storage), handle))
-    }
-}
+	        let handle: Box<dyn ComputeHandle> = Box::new(ReadyHandle);
+	        Ok((Box::new(dx_storage), handle))
+	    }
 
-// `GemmTileConfig`, `lookup_gemm_config`, `lookup_solution_index` moved
+	    fn qkv_attention(
+	        &self,
+	        q: &dyn BackendStorage,
+	        k: &dyn BackendStorage,
+	        v: &dyn BackendStorage,
+	        num_kv_heads: usize,
+	        kv_seq_len: usize,
+	        cache_offset: u32,
+	        out_shape: &Shape,
+	        out_max: Option<&dyn BackendStorage>,
+	        out_sum: Option<&dyn BackendStorage>,
+	    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+	        // ─── enabled gate ────────────────────────────────────────────────
+	        // Build the config up front to read its gate.
+	        let config = {
+	            let out_dims = out_shape.dims();
+	            if out_dims.len() != 3 {
+	                return Err(Error::Shape("qkv_attention expects 3-D output shape [seq_len, num_heads, head_dim]".into()));
+	            }
+	            let seq_len = out_dims[0];
+	            let num_heads = out_dims[1];
+	            let head_dim = out_dims[2];
+	            QkvAttentionFusionConfig {
+	                enabled: true,
+	                num_heads,
+	                num_kv_heads,
+	                head_dim,
+	                max_seq_len: seq_len,
+	                wavefront_size: self.props.wavefront_size as u32,
+	                quant_mode: QuantMode::Fp32,
+	            }
+	        };
+	        if !config.enabled {
+	            return Err(Error::Backend(
+	                "qkv_attention: kernel is gated (QkvAttentionFusionConfig.enabled=false)".into(),
+	            ));
+	        }
+
+	        // ─── structural validation ──────────────────────────────────────
+	        if config.num_heads == 0 || config.num_kv_heads == 0 || config.head_dim == 0 {
+	            return Err(Error::Shape(
+	                "qkv_attention: zero-sized num_heads / num_kv_heads / head_dim".into(),
+	            ));
+	        }
+	        if config.num_heads % config.num_kv_heads != 0 {
+	            return Err(Error::Shape(format!(
+	                "qkv_attention: num_heads ({}) must be a multiple of num_kv_heads ({})",
+	                config.num_heads, config.num_kv_heads
+	            )));
+	        }
+	        if config.head_dim > 256 {
+	            return Err(Error::Shape(format!(
+	                "qkv_attention Phase 2 supports head_dim <= 256 (got {})",
+	                config.head_dim
+	            )));
+	        }
+
+	        let q_s = as_rocm(q)?;
+	        let k_s = as_rocm(k)?;
+	        let v_s = as_rocm(v)?;
+	        if !q_s.device_ptr_is_valid() || !k_s.device_ptr_is_valid() || !v_s.device_ptr_is_valid() {
+	            return Err(Error::Backend("qkv_attention: inputs lack a valid device pointer".into()));
+	        }
+	        let out_dims = out_shape.dims();
+	        let seq_len = out_dims[0];
+
+	        // ─── allocate output + launch ────────────────────────────────────
+	        let launch = config.hip_launch_params();
+	        let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+	        let out_ptr = dev_ptr(&storage)?;
+	        let q_ptr = dev_ptr(q_s)?;
+	        let k_ptr = dev_ptr(k_s)?;
+	        let v_ptr = dev_ptr(v_s)?;
+
+	        let mut max_ptr: u64 = 0;
+	        if let Some(m) = out_max {
+	            let m_s = as_rocm(m)?;
+	            max_ptr = dev_ptr(m_s)?;
+	        }
+	        let mut sum_ptr: u64 = 0;
+	        if let Some(s) = out_sum {
+	            let s_s = as_rocm(s)?;
+	            sum_ptr = dev_ptr(s_s)?;
+	        }
+
+	        let num_heads_i = config.num_heads as i32;
+	        let num_kv_heads_i = config.num_kv_heads as i32;
+	        let head_dim_i = config.head_dim as i32;
+	        let seq_len_i = seq_len as i32;
+	        let kv_seq_len_i = kv_seq_len as i32;
+	        let cache_offset_i = cache_offset as i32;
+	        let inv_sqrt_d: f32 = 1.0 / (config.head_dim as f32).sqrt();
+
+	        let mut qptr = q_ptr;
+	        let mut kptr = k_ptr;
+	        let mut vptr = v_ptr;
+	        let mut optr = out_ptr;
+	        let mut nh = num_heads_i;
+	        let mut nkv = num_kv_heads_i;
+	        let mut hd = head_dim_i;
+	        let mut sl = seq_len_i;
+	        let mut ksl = kv_seq_len_i;
+	        let mut co = cache_offset_i;
+	        let mut isd = inv_sqrt_d;
+
+        let stream = self.launch_compute_kernel(
+            "grim_qkv_attention",
+            launch.grid_dim,
+            launch.block_dim,
+            &mut [
+                arg(&mut qptr),
+                arg(&mut kptr),
+                arg(&mut vptr),
+                arg(&mut optr),
+                arg(&mut max_ptr),
+	                arg(&mut sum_ptr),
+	                arg(&mut nh),
+	                arg(&mut nkv),
+	                arg(&mut hd),
+	                arg(&mut sl),
+	                arg(&mut ksl),
+	                arg(&mut co),
+	                arg(&mut isd),
+	            ],
+        )?;
+
+        let _ = (qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd);
+
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
+    }
+
+	    fn rope(
+	        &self,
+	        x: &dyn BackendStorage,
+	        positions: &[u32],
+	        dim: usize,
+	        base: f32,
+	        out_shape: &Shape,
+	    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+	        let x_s = as_rocm(x)?;
+	        if !x_s.device_ptr_is_valid() {
+	            return Err(Error::Backend("rope: input lacks a valid device pointer".into()));
+	        }
+	        let out_dims = out_shape.dims();
+	        if out_dims.len() != 3 || out_dims[2] != dim {
+	            return Err(Error::Shape(format!(
+	                "RoPE expects (B,S,D={}), got {:?}",
+	                dim, out_dims
+	            )));
+	        }
+	        let b = out_dims[0] as i32;
+	        let s = out_dims[1] as i32;
+	        let d = dim as i32;
+	        let half = d / 2;
+	        if positions.len() != s as usize {
+	            return Err(Error::Shape("rope: positions length must match seq_len".into()));
+	        }
+
+	        let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+	        let mut out_ptr = dev_ptr(&storage)?;
+	        let mut x_ptr = dev_ptr(x_s)?;
+	        let mut pos_ptr = upload_device_buffer(positions)?;
+	        let mut b_i = b;
+	        let mut s_i = s;
+	        let mut d_i = d;
+	        let mut half_i = half;
+	        let mut base_f = base;
+	        let total = (b * s * half) as usize;
+	        let (grid, block) = linear_launch(total);
+
+	        let stream = self.launch_compute_kernel(
+	            "grim_rope",
+	            grid,
+	            block,
+	            &mut [
+	                arg(&mut x_ptr),
+	                arg(&mut pos_ptr),
+	                arg(&mut out_ptr),
+	                arg(&mut b_i),
+	                arg(&mut s_i),
+	                arg(&mut d_i),
+	                arg(&mut half_i),
+	                arg(&mut base_f),
+	            ],
+	        )?;
+
+	        if self.active_capture_stream().is_none() {
+	            unsafe {
+	                let sync = hipStreamSynchronize(stream);
+	                if sync != hipSuccess {
+	                    hipFree(pos_ptr);
+	                    return Err(Error::Backend(format!("hipStreamSynchronize failed: {}", sync)));
+	                }
+	                hipFree(pos_ptr);
+	            }
+	        }
+
+	        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+	    }
+	}
+	
+	// `GemmTileConfig`, `lookup_gemm_config`, `lookup_solution_index` moved
 // to `device::gemm_tuning` — see that module.
 pub use crate::device::gemm_tuning::{
     GemmTileConfig, lookup_gemm_config, lookup_solution_index,
@@ -2984,173 +3264,9 @@ impl RocmDevice {
         Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
     }
 
-    /// Dispatch a fused QKV Projection + Attention operation onto the GPU.
-    ///
-    /// Phase-1 contract (`grim_qkv_attention_kernel_spec.md`):
-    /// - `q`: `[seq_len, num_heads, head_dim]`, f32
-    /// - `k`, `v`: `[kv_seq_len, num_kv_heads, head_dim]`, f32
-    /// - `kv_seq_len` and `cache_offset` must be supplied by the caller (the
-    ///   paged KV cache or prefill gather is responsible for materializing
-    ///   contiguous K/V buffers; this kernel does not slice).
-    /// - `num_kv_heads` is a *real* call-site parameter — never derived as
-    ///   `num_heads / 4`. Any GQA ratio (1:1, 2:1, 4:1, 8:1, ...) is valid;
-    ///   the host validates `num_heads % num_kv_heads == 0`.
-    /// - Causal masking happens **inside** the kernel against absolute
-    ///   position `j <= cache_offset + i` (no caller-side pre-slicing).
-    /// - The kernel is gated by `config.enabled`. When `false`, returns
-    ///   `Err(Error::Backend(...))` and does *not* launch — this is the
-    ///   PyTorch-parity path (`rust-gpu-discipline` §3), not a silent CPU
-    ///   fallback. The field is preserved long-term so a regression can
-    ///   be gated off without an emergency patch.
-    pub fn qkv_attention(
-        &self,
-        q: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        num_kv_heads: usize,
-        kv_seq_len: usize,
-        cache_offset: u32,
-        out_shape: &Shape,
-        out_max: Option<&dyn BackendStorage>,
-        out_sum: Option<&dyn BackendStorage>,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        // ─── enabled gate ────────────────────────────────────────────────
-        // Build the config up front to read its gate. We allow the caller
-        // to override individual fields via env-on-the-fly in a follow-up,
-        // but for now `enabled: true` is the launch path and `false` is
-        // the eager-error path. PyTorch parity: never silent CPU fallback.
-        let config = {
-            let out_dims = out_shape.dims();
-            if out_dims.len() != 3 {
-                return Err(Error::Shape("qkv_attention expects 3-D output shape [seq_len, num_heads, head_dim]".into()));
-            }
-            let seq_len = out_dims[0];
-            let num_heads = out_dims[1];
-            let head_dim = out_dims[2];
-            QkvAttentionFusionConfig {
-                enabled: true, // launch path; the gate check is below and *after* the structural validation.
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                max_seq_len: seq_len,
-                wavefront_size: self.props.wavefront_size as u32,
-                quant_mode: QuantMode::Fp32,
-            }
-        };
-        if !config.enabled {
-            return Err(Error::Backend(
-                "qkv_attention: kernel is gated (QkvAttentionFusionConfig.enabled=false) — flip to true after Step 4 tests pass".into(),
-            ));
-        }
-
-        // ─── structural validation ──────────────────────────────────────
-        if config.num_heads == 0 || config.num_kv_heads == 0 || config.head_dim == 0 {
-            return Err(Error::Shape(
-                "qkv_attention: zero-sized num_heads / num_kv_heads / head_dim".into(),
-            ));
-        }
-        if config.num_heads % config.num_kv_heads != 0 {
-            return Err(Error::Shape(format!(
-                "qkv_attention: num_heads ({}) must be a multiple of num_kv_heads ({})",
-                config.num_heads, config.num_kv_heads
-            )));
-        }
-        // Wave64 mandate: kernel block dim is 256 = 4 wavefronts of 64 on
-        // gfx1036/gfx110x/gfx1200; head_dim must fit in one wave (≤ 64)
-        // for the Phase-1 reference path (Phase 2 will tile).
-        if config.head_dim > 256 {
-            return Err(Error::Shape(format!(
-                "qkv_attention Phase 2 supports head_dim <= 256 (got {})",
-                config.head_dim
-            )));
-        }
-
-        let q_s = as_rocm(q)?;
-        let k_s = as_rocm(k)?;
-        let v_s = as_rocm(v)?;
-        if !q_s.device_ptr_is_valid() || !k_s.device_ptr_is_valid() || !v_s.device_ptr_is_valid() {
-            return Err(Error::Backend("qkv_attention: inputs lack a valid device pointer".into()));
-        }
-        let out_dims = out_shape.dims();
-        let seq_len = out_dims[0];
-
-        // ─── allocate output + launch ────────────────────────────────────
-        let launch = config.hip_launch_params();
-        let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
-        let out_ptr = dev_ptr(&storage)?;
-        let q_ptr = dev_ptr(q_s)?;
-        let k_ptr = dev_ptr(k_s)?;
-        let v_ptr = dev_ptr(v_s)?;
-
-        let mut max_ptr: u64 = 0;
-        if let Some(m) = out_max {
-            let m_s = as_rocm(m)?;
-            max_ptr = dev_ptr(m_s)?;
-        }
-        let mut sum_ptr: u64 = 0;
-        if let Some(s) = out_sum {
-            let s_s = as_rocm(s)?;
-            sum_ptr = dev_ptr(s_s)?;
-        }
-
-        let num_heads_i = config.num_heads as i32;
-        let num_kv_heads_i = config.num_kv_heads as i32;
-        let head_dim_i = config.head_dim as i32;
-        let seq_len_i = seq_len as i32;
-        let kv_seq_len_i = kv_seq_len as i32;
-        let cache_offset_i = cache_offset as i32;
-        let inv_sqrt_d: f32 = 1.0 / (config.head_dim as f32).sqrt();
-        let mut inv_sqrt_d_bits = inv_sqrt_d.to_bits();
-        // The kernel signature accepts this as a float argument; emit it via
-        // a pointer to a local float that the trampoline will pass through.
-        let inv_sqrt_d_ptr = &mut inv_sqrt_d_bits as *mut u32 as *mut f32;
-        // SAFETY: the kernel reads `inv_sqrt_d` from this pointer across the
-        // entire dispatch; the lifetime covers the launch below.
-        let inv_sqrt_d_stable = inv_sqrt_d_ptr; // keep the pointer pinned
-
-        // Build the arg slice with all 13 params in the order the kernel
-        // signature declares them.
-        let mut qptr = q_ptr;
-        let mut kptr = k_ptr;
-        let mut vptr = v_ptr;
-        let mut optr = out_ptr;
-        let mut nh = num_heads_i;
-        let mut nkv = num_kv_heads_i;
-        let mut hd = head_dim_i;
-        let mut sl = seq_len_i;
-        let mut ksl = kv_seq_len_i;
-        let mut co = cache_offset_i;
-        let mut isd = inv_sqrt_d;
-
-        self.launch_compute_kernel(
-            "grim_qkv_attention",
-            launch.grid_dim,
-            launch.block_dim,
-            &mut [
-                arg(&mut qptr),
-                arg(&mut kptr),
-                arg(&mut vptr),
-                arg(&mut optr),
-                arg(&mut max_ptr),
-                arg(&mut sum_ptr),
-                arg(&mut nh),
-                arg(&mut nkv),
-                arg(&mut hd),
-                arg(&mut sl),
-                arg(&mut ksl),
-                arg(&mut co),
-                arg(&mut isd),
-            ],
-        )?;
-
-        // Surface we used the temp pointers (suppress unused-mut warnings) and
-        // keep them alive for the duration of the kernel call.
-        let _ = (
-            qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd, inv_sqrt_d_stable,
-        );
-
-        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
-    }
+    // NOTE: `qkv_attention` was promoted to the `BackendDevice` trait
+    // (see `impl BackendDevice for RocmDevice` above). The old inherent
+    // method body lived here but is no longer needed.
 
     /// Fused KV-dequant-attention (WI-R5).
     ///
