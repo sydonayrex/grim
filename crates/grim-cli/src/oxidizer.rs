@@ -371,8 +371,7 @@ fn bitwidth_to_dtype(bw: u32) -> GgufDType {
     }
 }
 
-#[allow(dead_code)] // benchmark helper
-fn build_rewritten_tensors(
+pub fn build_rewritten_tensors(
     provider: &GgufProvider,
     importance_scores: &ImportanceScores,
     bitwidths: &[u32],

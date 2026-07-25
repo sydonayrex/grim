@@ -112,3 +112,15 @@ fn test_l0_parity_cpu_overfit_loss_decreases() {
         "CPU final loss ({final_loss}) must be strictly lower than initial loss ({initial_loss})"
     );
 }
+
+#[test]
+fn test_l0_parity_rocm_device_gated() {
+    if std::env::var("GRIM_RUN_GPU_TESTS").is_err() {
+        return;
+    }
+    let (cpu_init, cpu_final) = run_overfit_test_for_device(Device::Cpu);
+    let (rocm_init, rocm_final) = run_overfit_test_for_device(Device::Rocm(0));
+
+    assert!((cpu_init - rocm_init).abs() < 1e-3, "Initial loss mismatch CPU vs ROCm: {cpu_init} vs {rocm_init}");
+    assert!((cpu_final - rocm_final).abs() < 1e-3, "Final loss mismatch CPU vs ROCm: {cpu_final} vs {rocm_final}");
+}

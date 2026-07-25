@@ -4,9 +4,8 @@
 //! reduction primitives across consumer AMD GPUs (GFX1100 / GFX1200 / GFX1201 architecture family).
 //! Enforces bounded peak VRAM usage to fit within 16GB consumer VRAM envelopes.
 
-use std::sync::Arc;
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{DType, Shape};
+use grim_tensor::Shape;
 
 /// Configuration for Consumer Parallel GPU FSDP sharding.
 #[derive(Debug, Clone)]

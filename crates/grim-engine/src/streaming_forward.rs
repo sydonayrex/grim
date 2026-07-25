@@ -186,15 +186,48 @@ impl StreamingBlockForward {
             x_norm_base_id,
         )?;
 
-        // Attention output projection
-        let qd = q.to_vec_f32()?;
-        let kd = k.to_vec_f32()?;
+        // Apply RoPE (Rotary Position Embeddings) to Q and K
+        let mut qd = q.to_vec_f32()?;
+        let mut kd = k.to_vec_f32()?;
         let vd = v.to_vec_f32()?;
         let num_head_dims = cfg.num_heads * cfg.head_dim;
         let total_tokens = qd.len() / num_head_dims;
+        let kv_stride = cfg.num_kv_heads * cfg.head_dim;
+        let head_dim = cfg.head_dim;
+        let half_dim = head_dim / 2;
+
+        for t in 0..total_tokens {
+            let pos = t as f32;
+            // RoPE on Q
+            for h in 0..cfg.num_heads {
+                let base_idx = t * num_head_dims + h * head_dim;
+                for i in 0..half_dim {
+                    let freq = 1.0 / 10000.0f32.powf((2 * i) as f32 / head_dim as f32);
+                    let val = pos * freq;
+                    let (sin_val, cos_val) = (val.sin(), val.cos());
+                    let x1 = qd[base_idx + i];
+                    let x2 = qd[base_idx + i + half_dim];
+                    qd[base_idx + i] = x1 * cos_val - x2 * sin_val;
+                    qd[base_idx + i + half_dim] = x1 * sin_val + x2 * cos_val;
+                }
+            }
+            // RoPE on K
+            for h in 0..cfg.num_kv_heads {
+                let base_idx = t * kv_stride + h * head_dim;
+                for i in 0..half_dim {
+                    let freq = 1.0 / 10000.0f32.powf((2 * i) as f32 / head_dim as f32);
+                    let val = pos * freq;
+                    let (sin_val, cos_val) = (val.sin(), val.cos());
+                    let x1 = kd[base_idx + i];
+                    let x2 = kd[base_idx + i + half_dim];
+                    kd[base_idx + i] = x1 * cos_val - x2 * sin_val;
+                    kd[base_idx + i + half_dim] = x1 * sin_val + x2 * cos_val;
+                }
+            }
+        }
+
         let scale = 1.0 / (cfg.head_dim as f32).sqrt();
         let mut attn_raw_data = vec![0.0f32; total_tokens * num_head_dims];
-        let kv_stride = cfg.num_kv_heads * cfg.head_dim;
 
         for h in 0..cfg.num_heads {
             let kvh = (h * cfg.num_kv_heads) / cfg.num_heads;

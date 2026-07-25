@@ -111,8 +111,7 @@ impl LlamaBlock {
         let attn_out = self.prefilled_self_attention(&q, &k, &v)?;
         let attn_out = self.wo.forward(&attn_out)?;
 
-        let x_flat = x_2d;
-        let x_res1_data = x_flat.to_vec_f32()?;
+        let x_res1_data = x_2d.to_vec_f32()?;
         let attn_data = attn_out.to_vec_f32()?;
         let mut added = vec![0.0f32; x_res1_data.len()];
         for i in 0..x_res1_data.len() {

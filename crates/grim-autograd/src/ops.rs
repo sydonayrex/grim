@@ -502,4 +502,40 @@ mod tests {
         assert_eq!(residuals.backup2_codes_offset, 16384);
         assert_eq!(residuals.backup2_scale_offset, 32768);
     }
+
+    #[test]
+    fn test_apply_and_record_lora_direct() {
+        use crate::{InjectionConfig, LoRAInjectionRegistry, LoRAInjectionPoint};
+        let mut tape = crate::tape::Tape::new();
+        let inj_config = InjectionConfig {
+            hidden_size: 2,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            intermediate_size: 4,
+            vocab_size: 4,
+        };
+        let inj_reg = LoRAInjectionRegistry::standard_qlora(1, 4, 16.0, 1);
+        let registry = crate::registry::AutogradRegistry::new(inj_config, inj_reg).unwrap();
+
+        let base_tensor = grim_backend_cpu::cpu_tensor(vec![1.0f32, 2.0f32], Shape::new(vec![1, 2]));
+        let base_id = tape.register(base_tensor.clone());
+
+        let x_tensor = grim_backend_cpu::cpu_tensor(vec![0.5f32, 0.5f32], Shape::new(vec![1, 2]));
+        let x_id = tape.register(x_tensor.clone());
+
+        let (out_id, out_tensor) = apply_and_record_lora(
+            &registry,
+            &mut tape,
+            0,
+            LoRAInjectionPoint::QProj,
+            base_tensor,
+            base_id,
+            x_tensor,
+            x_id,
+        ).unwrap();
+
+        assert_eq!(out_tensor.shape().dims(), &[1, 2]);
+        assert!(tape.len() > 0);
+    }
 }
