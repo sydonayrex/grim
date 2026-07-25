@@ -181,35 +181,56 @@ pub fn detect_amd_arch(gcn_arch: &str, marketing_name: &str) -> String {
     }
 }
 
-/// Helper to extract clean user-friendly marketing product names (e.g. RX 9070, RX 7900 XTX, Radeon 680M).
+/// Helper to extract clean user-friendly marketing product names with RDNA version (e.g. Radeon 680M (RDNA 2), RX 9070 (RDNA 5)).
 pub fn user_friendly_amd_name(gcn_arch: &str, marketing_name: &str) -> String {
-    let name_trim = marketing_name.trim();
-    if !name_trim.is_empty()
-        && !name_trim.starts_with("c_")
-        && !name_trim.starts_with("Device ")
-        && name_trim != "AMD/ATI"
-        && !name_trim.eq_ignore_ascii_case("generic_amd_gpu")
+    let arch_lower = gcn_arch.to_lowercase();
+    let name_lower = marketing_name.to_lowercase();
+
+    // Determine RDNA / CDNA version tag
+    let rdna_ver = if arch_lower.contains("gfx13") || name_lower.contains("rdna5") || name_lower.contains("9070") {
+        "RDNA 5"
+    } else if arch_lower.contains("gfx12") || name_lower.contains("rdna4") || name_lower.contains("8800") {
+        "RDNA 4"
+    } else if arch_lower.contains("gfx11") || name_lower.contains("rdna3") || name_lower.contains("7900") || name_lower.contains("7800") || name_lower.contains("7700") || name_lower.contains("7600") {
+        "RDNA 3"
+    } else if arch_lower.contains("gfx103") || name_lower.contains("rdna2") || name_lower.contains("6800") || name_lower.contains("6900") || name_lower.contains("6700") || name_lower.contains("680m") || name_lower.contains("780m") || name_lower.contains("gfx1036") || name_lower.contains("rembrandt") || name_lower.contains("phoenix") {
+        "RDNA 2"
+    } else if arch_lower.contains("gfx101") || name_lower.contains("rdna1") || name_lower.contains("5700") || name_lower.contains("5600") {
+        "RDNA 1"
+    } else if arch_lower.contains("gfx94") || name_lower.contains("mi300") {
+        "CDNA 3"
+    } else if arch_lower.contains("gfx90a") || name_lower.contains("mi250") {
+        "CDNA 2"
+    } else {
+        "RDNA"
+    };
+
+    // Determine base product name
+    let product_name = if !marketing_name.is_empty()
+        && !marketing_name.starts_with("c_")
+        && !marketing_name.starts_with("Device ")
+        && marketing_name != "AMD/ATI"
+        && !marketing_name.eq_ignore_ascii_case("generic_amd_gpu")
+        && !marketing_name.eq_ignore_ascii_case("Radeon GPU")
     {
-        return name_trim.to_string();
-    }
-    let lower = gcn_arch.to_lowercase();
-    if lower.contains("gfx13") {
-        "Radeon RX 9070".to_string()
-    } else if lower.contains("gfx1200") || lower.contains("gfx1201") {
-        "Radeon RX 8800 XT".to_string()
-    } else if lower.contains("gfx1100") {
-        "Radeon RX 7900 XTX".to_string()
-    } else if lower.contains("gfx1101") || lower.contains("gfx1102") {
-        "Radeon RX 7800 XT".to_string()
-    } else if lower.contains("gfx1036") {
+        marketing_name.trim().to_string()
+    } else if arch_lower.contains("gfx1036") || name_lower.contains("rembrandt") {
         "Radeon 680M iGPU".to_string()
-    } else if lower.contains("gfx1030") {
+    } else if arch_lower.contains("gfx13") {
+        "Radeon RX 9070".to_string()
+    } else if arch_lower.contains("gfx1200") {
+        "Radeon RX 8800 XT".to_string()
+    } else if arch_lower.contains("gfx1100") {
+        "Radeon RX 7900 XTX".to_string()
+    } else if arch_lower.contains("gfx1030") {
         "Radeon RX 6800 XT".to_string()
     } else if !gcn_arch.is_empty() {
         format!("Radeon {gcn_arch}")
     } else {
         "Radeon GPU".to_string()
-    }
+    };
+
+    format!("{product_name} ({rdna_ver})")
 }
 
 /// Query official AMD `rocminfo` tool for installed ROCm HIP GPUs.
