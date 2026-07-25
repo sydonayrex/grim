@@ -642,18 +642,24 @@ mod tests {
     fn backend_matmul_correct() {
         use grim_tensor::Shape;
         let dev = CpuDevice::new();
-        let a_data = vec![1.0f32, 0.0, 0.0, 1.0]; // 2×2 identity
-        let b_data = vec![5.0f32, 6.0, 7.0, 8.0]; // 2×2
-        let a_shape = Shape::new(vec![2, 2]);
-        let b_shape = Shape::new(vec![2, 2]);
+        // Non-identity, non-symmetric matrices to expose transpose/access bugs.
+        // A: 2x3, B: 3x2, C: 2x2
+        let a_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2x3
+        let b_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // 3x2
+        let a_shape = Shape::new(vec![2, 3]);
+        let b_shape = Shape::new(vec![3, 2]);
         let out_shape = Shape::new(vec![2, 2]);
         let a_s = dev.from_cpu(&a_data, &a_shape, DType::F32).unwrap();
         let b_s = dev.from_cpu(&b_data, &b_shape, DType::F32).unwrap();
         let (out_s, handle) = dev.matmul(a_s.as_ref(), b_s.as_ref(), &out_shape).unwrap();
         assert!(handle.is_ready());
         let result = out_s.to_cpu_vec_f32().unwrap();
-        // I @ B = B
-        assert!(approx_eq(&result, &b_data, 1e-6),
-            "identity matmul must equal B, got {result:?}");
+        // Hand-computed: C[i][j] = sum_k A[i][k] * B[k][j]
+        // C[0][0] = 1*1 + 2*3 + 3*5 = 22
+        // C[0][1] = 1*2 + 2*4 + 3*6 = 28
+        // C[1][0] = 4*1 + 5*3 + 6*5 = 49
+        // C[1][1] = 4*2 + 5*4 + 6*6 = 64
+        let expected = vec![22.0, 28.0, 49.0, 64.0];
+        assert_eq!(result, expected, "matmul result mismatch");
     }
 }

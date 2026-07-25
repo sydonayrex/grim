@@ -279,7 +279,7 @@ fn check_gpu_backend(report: &mut DoctorReport) {
             // Check if the running engine is actually using it, not falling back to CPU.
             // We check the /metrics endpoint for rocm_gpu_count.
             let output = std::process::Command::new("curl")
-                .args(["-sf", "http://127.0.0.1:8080/metrics"])
+                .args(["-sf", "http://127.0.0.1:11434/metrics"])
                 .output();
 
             match output {

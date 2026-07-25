@@ -189,7 +189,8 @@ mod tests {
         let _ = r;
         assert_eq!(p.interval, Duration::from_millis(50));
     }
-    // ^ extra blank line removal marker (test only)    #[tokio::test]
+    // ^ extra blank line removal marker (test only)
+    #[tokio::test]
     async fn poller_abort_is_idempotent() {
         let client = GarageClient::new("http://localhost:9999");
         let state = Arc::new(Mutex::new(DisplayState::new()));

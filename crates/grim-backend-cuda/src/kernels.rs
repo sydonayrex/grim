@@ -47,7 +47,6 @@ extern "C" __global__ void grim_softmax(float* x, float* out, int last_dim, int 
     if (idx >= total) return;
 
     int row = idx / last_dim;
-    int col = idx % last_dim;
 
     float max_val = -1e30f;
     for (int j = 0; j < last_dim; ++j) {

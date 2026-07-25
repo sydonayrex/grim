@@ -103,7 +103,21 @@ pub enum GgufDType {
     Q4_2 = 21,
     Q8_1Hx = 22,
     #[allow(non_camel_case_types)]
+    IQ2_XXS = 23,
+    #[allow(non_camel_case_types)]
+    IQ2_XS = 24,
+    #[allow(non_camel_case_types)]
+    IQ2_S = 25,
+    #[allow(non_camel_case_types)]
+    IQ3_XXS = 26,
+    #[allow(non_camel_case_types)]
+    IQ3_S = 27,
+    #[allow(non_camel_case_types)]
+    IQ1_S = 28,
+    #[allow(non_camel_case_types)]
     IQ4_NL = 35,
+    #[allow(non_camel_case_types)]
+    IQ4_XS = 36,
 }
 
 impl GgufDType {
@@ -130,7 +144,14 @@ impl GgufDType {
             20 => Some(GgufDType::F64),
             21 => Some(GgufDType::Q4_2),
             22 => Some(GgufDType::Q8_1Hx),
+            23 => Some(GgufDType::IQ2_XXS),
+            24 => Some(GgufDType::IQ2_XS),
+            25 => Some(GgufDType::IQ2_S),
+            26 => Some(GgufDType::IQ3_XXS),
+            27 => Some(GgufDType::IQ3_S),
+            28 => Some(GgufDType::IQ1_S),
             35 => Some(GgufDType::IQ4_NL),
+            36 => Some(GgufDType::IQ4_XS),
             _ => None,
         }
     }
@@ -169,11 +190,14 @@ impl GgufDType {
             | GgufDType::I8 | GgufDType::I16 | GgufDType::I32 | GgufDType::I64
             | GgufDType::Q4_2
             | GgufDType::Q8_1Hx => 1,
-            // K-quants: 256-elem super-block
+            // K-quants and iquants: 256-elem super-block
             GgufDType::Q2K | GgufDType::Q3K
             | GgufDType::Q4K | GgufDType::Q5K
             | GgufDType::Q6K | GgufDType::Q8K
-            | GgufDType::IQ4_NL => 256,
+            | GgufDType::IQ4_NL | GgufDType::IQ4_XS
+            | GgufDType::IQ3_XXS | GgufDType::IQ3_S
+            | GgufDType::IQ2_XXS | GgufDType::IQ2_XS | GgufDType::IQ2_S
+            | GgufDType::IQ1_S => 256,
             // Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1: 32-elem block
             _ => 32,
         }
@@ -182,13 +206,6 @@ impl GgufDType {
     /// Bytes consumed by ONE quantization block. For F32/F16/I* kinds this is
     /// just `elem_size`. For block-quantized kinds it's the literal block layout
     /// size in the GGUF stream (scales + codebook + packed nibbles).
-    ///
-    /// Reference: ggml-main/src/ggml/src/ggml.c `type_size` table. K-quant
-    /// super-blocks are 256 elements wide and the byte per block sizes are:
-    ///   Q2_K = 84, Q3_K = 108 (small, Q3_K_S variant), Q4_K = 144,
-    ///   Q5_K = 176, Q6_K = 210, Q8_K = 252 (matches `QK_K * 1 + scales`).
-    /// IQ4_NL is its own 32-elem block format (1-byte scale + 16-byte nibble
-    /// grid = 18 bytes/32).
     pub fn type_size_per_block(self) -> u64 {
         match self {
             GgufDType::F32 => 4,
@@ -211,7 +228,14 @@ impl GgufDType {
             GgufDType::Q5K => 176,
             GgufDType::Q6K => 210,
             GgufDType::Q8K => 252,
-            GgufDType::IQ4_NL => 18,
+            GgufDType::IQ4_NL => 170,
+            GgufDType::IQ4_XS => 136,
+            GgufDType::IQ3_XXS => 96,
+            GgufDType::IQ3_S => 110,
+            GgufDType::IQ2_XXS => 66,
+            GgufDType::IQ2_XS => 74,
+            GgufDType::IQ2_S => 82,
+            GgufDType::IQ1_S => 50,
             _ => 0,
         }
     }
@@ -1202,6 +1226,30 @@ GgufDType::Q4K => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::IQ4NL),
         },
+        GgufDType::IQ4_XS => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::IQ4XS),
+        },
+        GgufDType::IQ3_XXS => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::IQ3XXS),
+        },
+        GgufDType::IQ3_S => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::IQ3S),
+        },
+        GgufDType::IQ2_XXS => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::IQ2XXS),
+        },
+        GgufDType::IQ2_XS => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::IQ2XS),
+        },
+        GgufDType::IQ2_S | GgufDType::IQ1_S => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::IQ2S),
+        },
     }
 }
 
@@ -1215,11 +1263,12 @@ pub fn map_gguf_dtype_to_grim(gguf_dtype: GgufDType) -> (DType, Option<u32>) {
         GgufDType::F32 | GgufDType::F64 | GgufDType::I32 | GgufDType::I64 => None,
         GgufDType::F16 | GgufDType::I16 => Some(16),
         GgufDType::I8 => Some(8),
-        GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 | GgufDType::Q4K | GgufDType::IQ4_NL => Some(4),
+        GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 | GgufDType::Q4K | GgufDType::IQ4_NL | GgufDType::IQ4_XS => Some(4),
         GgufDType::Q5_0 | GgufDType::Q5_1 | GgufDType::Q5K => Some(5),
         GgufDType::Q6K => Some(6),
-        GgufDType::Q2K => Some(2),
-        GgufDType::Q3K => Some(3),
+        GgufDType::Q2K | GgufDType::IQ2_XXS | GgufDType::IQ2_XS | GgufDType::IQ2_S => Some(2),
+        GgufDType::Q3K | GgufDType::IQ3_XXS | GgufDType::IQ3_S => Some(3),
+        GgufDType::IQ1_S => Some(1),
         GgufDType::Q8_0 | GgufDType::Q8_1 | GgufDType::Q8_1Hx | GgufDType::Q8K => Some(8),
     };
     (dtype, bpw)
@@ -1245,6 +1294,13 @@ impl GgufDType {
                 | GgufDType::Q6K
                 | GgufDType::Q8K
                 | GgufDType::IQ4_NL
+                | GgufDType::IQ4_XS
+                | GgufDType::IQ3_XXS
+                | GgufDType::IQ3_S
+                | GgufDType::IQ2_XXS
+                | GgufDType::IQ2_XS
+                | GgufDType::IQ2_S
+                | GgufDType::IQ1_S
         )
     }
 
@@ -1273,8 +1329,15 @@ impl GgufDType {
             GgufDType::Q6K => "Q6_K",
             GgufDType::Q8K => "Q8_K",
             GgufDType::IQ4_NL => "IQ4_NL",
-            }
-            }
+            GgufDType::IQ4_XS => "IQ4_XS",
+            GgufDType::IQ3_XXS => "IQ3_XXS",
+            GgufDType::IQ3_S => "IQ3_S",
+            GgufDType::IQ2_XXS => "IQ2_XXS",
+            GgufDType::IQ2_XS => "IQ2_XS",
+            GgufDType::IQ2_S => "IQ2_S",
+            GgufDType::IQ1_S => "IQ1_S",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1463,5 +1526,52 @@ mod tests {
         });
         let restored = GrimMetadata::from_json(&json);
         assert!(restored.ext_entries.is_empty());
+    }
+
+    /// Verifies binary GGUF stream reading, metadata KV parsing, and tensor info extraction.
+    #[test]
+    fn test_read_gguf_binary_parsing_and_metadata() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&GGUF_VERSION.to_le_bytes());
+        buf.extend_from_slice(&1u64.to_le_bytes()); // tensor_count = 1
+        buf.extend_from_slice(&2u64.to_le_bytes()); // metadata_kv_count = 2
+
+        // KV 1: "general.architecture" -> String "llama"
+        let key1 = "general.architecture";
+        buf.extend_from_slice(&(key1.len() as u64).to_le_bytes());
+        buf.extend_from_slice(key1.as_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes()); // String type
+        let val1 = "llama";
+        buf.extend_from_slice(&(val1.len() as u64).to_le_bytes());
+        buf.extend_from_slice(val1.as_bytes());
+
+        // KV 2: "llama.block_count" -> Uint32 32
+        let key2 = "llama.block_count";
+        buf.extend_from_slice(&(key2.len() as u64).to_le_bytes());
+        buf.extend_from_slice(key2.as_bytes());
+        buf.extend_from_slice(&4u32.to_le_bytes()); // Uint32 type
+        buf.extend_from_slice(&32u32.to_le_bytes());
+
+        // Tensor 1: "blk.0.attn_q.weight", dims [4, 4], F32 (0), offset 0
+        let t_name = "blk.0.attn_q.weight";
+        buf.extend_from_slice(&(t_name.len() as u64).to_le_bytes());
+        buf.extend_from_slice(t_name.as_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes()); // n_dims = 2
+        buf.extend_from_slice(&4u64.to_le_bytes());
+        buf.extend_from_slice(&4u64.to_le_bytes());
+        buf.extend_from_slice(&(GgufDType::F32 as u32).to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+
+        let cursor = std::io::Cursor::new(buf);
+        let gguf = read_gguf(cursor).expect("read gguf stream");
+        assert_eq!(gguf.version, GGUF_VERSION);
+        assert_eq!(gguf.tensor_count, 1);
+        assert_eq!(gguf.tensors.len(), 1);
+        assert_eq!(gguf.tensors[0].name, t_name);
+        assert_eq!(gguf.tensors[0].dims, vec![4, 4]);
+
+        let arch = gguf.metadata.get("general.architecture").and_then(|v| v.as_str());
+        assert_eq!(arch, Some("llama"));
     }
 }

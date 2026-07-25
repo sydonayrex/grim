@@ -1057,4 +1057,20 @@ mod tests {
     fn kv_cache_layout_from_non_object_returns_none() {
         assert!(KvCacheLayout::from_json(&serde_json::json!(42)).is_none());
     }
+
+    /// `GrimTensorExt::from_json` produces None on non-object JSON inputs.
+    #[test]
+    fn grim_tensor_ext_corrupt_json_returns_none() {
+        assert!(GrimTensorExt::from_json(&serde_json::json!("not an object")).is_none());
+        assert!(GrimTensorExt::from_json(&serde_json::json!([1, 2, 3])).is_none());
+    }
+
+    /// All specification enum tag parsers cleanly return None on out-of-bounds u8 values.
+    #[test]
+    fn spec_enum_tag_parsers_reject_out_of_bounds() {
+        assert_eq!(PerRowBpwMode::from_u8(255), None);
+        assert_eq!(RowScaleDtype::from_u8(255), None);
+        assert_eq!(OutlierIndexEncoding::from_u8(255), None);
+        assert_eq!(LayoutHintTag::from_u8(255), None);
+    }
 }

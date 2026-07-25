@@ -2196,6 +2196,7 @@ dependencies = [
 name = "grim-format"
 version = "0.1.0"
 dependencies = [
+ "grim-backend-cpu",
  "grim-quant",
  "grim-tensor",
  "half",

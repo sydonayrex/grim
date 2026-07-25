@@ -4,6 +4,7 @@
 
 .a0proj/*
 target/*
+**/target/
 Cargo.lock
 fixplans/*
 usr/*

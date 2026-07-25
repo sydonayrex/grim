@@ -603,6 +603,13 @@ fn gguf_dtype_for_quant_format(format: QuantFormat) -> GgufDType {
         QuantFormat::Q4K => GgufDType::Q4K,
         QuantFormat::Q5K => GgufDType::Q5K,
         QuantFormat::Q6K => GgufDType::Q6K,
+        QuantFormat::Iq4Nl => GgufDType::IQ4_NL,
+        QuantFormat::Iq4Xs => GgufDType::IQ4_XS,
+        QuantFormat::Iq3Xxs => GgufDType::IQ3_XXS,
+        QuantFormat::Iq3S => GgufDType::IQ3_S,
+        QuantFormat::Iq2Xxs => GgufDType::IQ2_XXS,
+        QuantFormat::Iq2Xs => GgufDType::IQ2_XS,
+        QuantFormat::Iq2S => GgufDType::IQ2_S,
         QuantFormat::Fp4 | QuantFormat::Nf4 | QuantFormat::Fp8 | QuantFormat::Fp4Block16 | QuantFormat::Fp8Block16 => unimplemented!("fp4/nf4/fp8 quantization not implemented in CLI"),
     }
 }
@@ -621,6 +628,13 @@ fn materialize_f32(bytes: &[u8], shape: &[usize], source_dtype: Option<GgufDType
         GgufDType::Q4K | GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 => {
             dequant_q4k(bytes, elem_count).map_err(|e| e.to_string())
         }
+        GgufDType::IQ4_NL => grim_quant::dequant_iq4nl(bytes, elem_count).map_err(|e| e.to_string()),
+        GgufDType::IQ4_XS => grim_quant::dequant_iq4xs(bytes, elem_count).map_err(|e| e.to_string()),
+        GgufDType::IQ3_XXS => grim_quant::dequant_iq3xxs(bytes, elem_count).map_err(|e| e.to_string()),
+        GgufDType::IQ3_S => grim_quant::dequant_iq3s(bytes, elem_count).map_err(|e| e.to_string()),
+        GgufDType::IQ2_XXS => grim_quant::dequant_iq2xxs(bytes, elem_count).map_err(|e| e.to_string()),
+        GgufDType::IQ2_XS => grim_quant::dequant_iq2xs(bytes, elem_count).map_err(|e| e.to_string()),
+        GgufDType::IQ2_S => grim_quant::dequant_iq2s(bytes, elem_count).map_err(|e| e.to_string()),
         _ => Err(format!("unsupported source dtype for Pass 4 materialization: {:?}", source_dtype)),
     }
 }

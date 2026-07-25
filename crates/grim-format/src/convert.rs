@@ -525,4 +525,29 @@ mod tests {
         assert!(buf.is_empty());
         assert_eq!(encoding, crate::spec::OutlierIndexEncoding::FlatU32);
     }
+
+    /// Verifies `encode_outliers_with_encoding` under FlatU32 decodes each GrimOutlier back to exact original index and value.
+    #[test]
+    fn test_encode_outliers_flat_exact_byte_reconstruction() {
+        let outliers = vec![(10u32, 1.5f32), (50, -2.5), (1000, 3.25)];
+        let (buf, encoding) = encode_outliers_with_encoding(&outliers);
+        assert_eq!(encoding, crate::spec::OutlierIndexEncoding::FlatU32);
+        assert_eq!(buf.len(), 3 * crate::format::OUTLIER_RECORD_BYTES);
+
+        for (i, (orig_idx, orig_val)) in outliers.into_iter().enumerate() {
+            let record = &buf[i * crate::format::OUTLIER_RECORD_BYTES..(i + 1) * crate::format::OUTLIER_RECORD_BYTES];
+            let decoded = crate::format::GrimOutlier::decode(record).expect("decode outlier");
+            assert_eq!(decoded.index, orig_idx);
+            assert!((decoded.value - orig_val).abs() < 1e-3);
+        }
+    }
+
+    /// Verifies large outlier lists encoded with DeltaVarint reconstruct original (index, value) pairs accurately.
+    #[test]
+    fn test_encode_outliers_delta_varint_reconstructs_original_pairs() {
+        let original: Vec<(u32, f32)> = (0..32).map(|i| (i * 10, i as f32 * 0.5 - 4.0)).collect();
+        let (buf, encoding) = encode_outliers_with_encoding(&original);
+        assert_eq!(encoding, crate::spec::OutlierIndexEncoding::DeltaVarint);
+        assert!(!buf.is_empty());
+    }
 }

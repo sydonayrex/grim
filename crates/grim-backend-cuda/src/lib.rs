@@ -96,11 +96,9 @@ static JIT_CACHE: LazyLock<Mutex<HashMap<u64, SendCmodule>>> = LazyLock::new(|| 
 
 fn compile_and_load_kernel(src: &str, device_ordinal: usize) -> Result<CUmodule> {
     let hash = seahash::hash(src.as_bytes());
-    {
-        let cache = JIT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&module) = cache.get(&hash) {
-            return Ok(module.0);
-        }
+    let mut cache = JIT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&module) = cache.get(&hash) {
+        return Ok(module.0);
     }
 
     unsafe {
@@ -170,7 +168,6 @@ fn compile_and_load_kernel(src: &str, device_ordinal: usize) -> Result<CUmodule>
         }
     }
 
-    let mut cache = JIT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     cache.insert(hash, SendCmodule(module));
     Ok(module)
 }
@@ -1238,5 +1235,73 @@ mod tests {
         h.synchronize().unwrap();
         let res_emb = out_emb.to_cpu_vec_f32().unwrap();
         assert_eq!(res_emb, vec![50.0, 60.0, 10.0, 20.0]);
+    }
+
+    #[test]
+    fn test_cuda_matmul_shape_mismatch_returns_error() {
+        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
+        let devices = CudaDevice::probe().unwrap();
+        let dev = &devices[0];
+
+        let a_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let a_shape = Shape::new(vec![2, 3]);
+        let b_shape = Shape::new(vec![4, 2]); // K mismatch: 3 != 4
+        let out_shape = Shape::new(vec![2, 2]);
+
+        let a_storage = dev.from_cpu(&a_data, &a_shape, DType::F32).unwrap();
+        let b_storage = dev.from_cpu(&b_data, &b_shape, DType::F32).unwrap();
+
+        let res = dev.matmul(a_storage.as_ref(), b_storage.as_ref(), &out_shape);
+        assert!(res.is_err(), "matmul with mismatched inner dimension K must return Err");
+    }
+
+    #[test]
+    fn test_cuda_rms_norm_exact() {
+        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
+        let devices = CudaDevice::probe().unwrap();
+        let dev = &devices[0];
+
+        let x_data = vec![3.0f32, 4.0]; // mean(x^2) = (9 + 16)/2 = 12.5
+        let weight_data = vec![1.0f32, 2.0];
+        let shape = Shape::new(vec![2]);
+
+        let x = dev.from_cpu(&x_data, &shape, DType::F32).unwrap();
+        let weight = dev.from_cpu(&weight_data, &shape, DType::F32).unwrap();
+
+        let (out_rms, h) = dev.rms_norm(x.as_ref(), weight.as_ref(), 1e-6, &shape).unwrap();
+        h.synchronize().unwrap();
+
+        let res = out_rms.to_cpu_vec_f32().unwrap();
+        let rms_val = (12.5f32 + 1e-6).sqrt();
+        let expected_0 = (3.0 / rms_val) * 1.0;
+        let expected_1 = (4.0 / rms_val) * 2.0;
+
+        assert!((res[0] - expected_0).abs() < 1e-4, "res[0] = {}, want {}", res[0], expected_0);
+        assert!((res[1] - expected_1).abs() < 1e-4, "res[1] = {}, want {}", res[1], expected_1);
+    }
+
+    #[test]
+    fn test_cuda_softmax_exact() {
+        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
+        let devices = CudaDevice::probe().unwrap();
+        let dev = &devices[0];
+
+        let x_data = vec![1.0f32, 2.0, 3.0];
+        let shape = Shape::new(vec![3]);
+        let x = dev.from_cpu(&x_data, &shape, DType::F32).unwrap();
+
+        let (out_sm, h) = dev.softmax(x.as_ref(), &shape).unwrap();
+        h.synchronize().unwrap();
+
+        let res = out_sm.to_cpu_vec_f32().unwrap();
+        let sum_exp = 1.0f32.exp() + 2.0f32.exp() + 3.0f32.exp();
+        let expected_0 = 1.0f32.exp() / sum_exp;
+        let expected_1 = 2.0f32.exp() / sum_exp;
+        let expected_2 = 3.0f32.exp() / sum_exp;
+
+        assert!((res[0] - expected_0).abs() < 1e-4);
+        assert!((res[1] - expected_1).abs() < 1e-4);
+        assert!((res[2] - expected_2).abs() < 1e-4);
     }
 }

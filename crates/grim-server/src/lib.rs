@@ -102,7 +102,9 @@ fn sample_next_token(
         engine.enqueue_request(req);
     }
 
-    let _ = engine.tick();
+    if let Err(e) = engine.tick() {
+        eprintln!("[sample_next_token] engine tick failed: {e}");
+    }
 
     let logits = engine
         .last_outcome(request_id)
@@ -591,13 +593,15 @@ async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json
 }
 
 /// Helper function to perform Model capability check routing validation (§8)
-fn validate_model_capabilities(engine: &Engine, model_id: &str, required_modality: &str) -> bool {
+fn validate_model_capabilities(engine: &Engine, model_id: &str, required_modality: &str) -> grim_core::error::Result<()> {
     if let Some(strategy) = engine.strategy_for(model_id) {
-        let _ = strategy;
-        println!("[Routing] Checking model capability requirements for: {} against {}", model_id, required_modality);
-        return true;
+        println!("[Routing] Checking model capability requirements for: {} against {} (strategy: {:?})", model_id, required_modality, strategy);
+        Ok(())
+    } else {
+        Err(grim_core::error::Error::Config(format!(
+            "model '{}' has no strategy for modality '{}'", model_id, required_modality
+        )))
     }
-    false
 }
 
 #[derive(serde::Deserialize)]
@@ -1438,7 +1442,9 @@ pub async fn serve(addr: &str, engine: Engine, model_path: Option<std::path::Pat
     });
     
     // Capability-based routing verification at server startup (§8)
-    let _ = validate_model_capabilities(&state.engine.lock().unwrap(), "default", "text");
+    if let Err(e) = validate_model_capabilities(&state.engine.lock().unwrap(), "default", "text") {
+        eprintln!("[Server] Model capability check failed: {e}");
+    }
 
     let app = build_router(state);
     
@@ -1455,7 +1461,8 @@ pub async fn serve(addr: &str, engine: Engine, model_path: Option<std::path::Pat
         .map_err(|e| grim_core::Error::Config(format!("failed to load TLS certificates: {e}")))?;
 
         eprintln!("[grim-server] Serving over HTTPS (SSL enabled) on {}", addr);
-        axum_server::bind_rustls(addr.parse().unwrap(), rustls_config)
+        let bind_addr = addr.parse().map_err(|e| grim_core::Error::Config(format!("invalid bind address {addr}: {e}")))?;
+        axum_server::bind_rustls(bind_addr, rustls_config)
             .serve(app.into_make_service())
             .await
             .map_err(|e| grim_core::Error::Config(format!("serve TLS failed: {e}")))?;

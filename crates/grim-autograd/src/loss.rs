@@ -98,4 +98,20 @@ mod tests {
         assert!(loss < 1e-4);
         assert_eq!(grad.shape().dims(), &[2, 2]);
     }
+
+    #[test]
+    fn test_cross_entropy_loss_hand_calculated() {
+        let logits = cpu_tensor(vec![1.0f32, 2.0], Shape::new(vec![1, 2]));
+        let targets = vec![1];
+        let (loss, grad) = cross_entropy_loss(&logits, &targets).expect("cross entropy");
+
+        // Softmax(1.0, 2.0) = [0.2689414, 0.7310586]
+        // Loss = -ln(0.7310586) = 0.3132617
+        assert!((loss - 0.3132617).abs() < 1e-5, "loss = {}, want 0.3132617", loss);
+
+        // Grad: p_0 / 1 = 0.2689414, (p_1 - 1) / 1 = -0.2689414
+        let g = grad.to_vec_f32().expect("to vec");
+        assert!((g[0] - 0.2689414).abs() < 1e-5, "g[0] = {}, want 0.2689414", g[0]);
+        assert!((g[1] - (-0.2689414)).abs() < 1e-5, "g[1] = {}, want -0.2689414", g[1]);
+    }
 }
