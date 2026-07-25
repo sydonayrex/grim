@@ -88,6 +88,7 @@ fn rocm_toggles_reflect_state_when_devices_present() {
         is_rocm_compliant: true,
         gcn_arch: "gfx942".into(), // MI300X — CDNA3, W64
         vram_bytes: 192 * 1024 * 1024 * 1024,
+        vram_used_bytes: 0,
         wavefront_size: 64,
         wmma_supported: true,
         mfma_supported: true,

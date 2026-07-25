@@ -27,6 +27,9 @@ pub struct RocmDeviceInfo {
     pub gcn_arch: String,
     /// Maximum VRAM size in bytes.
     pub vram_bytes: u64,
+    /// Currently allocated / used VRAM size in bytes.
+    #[serde(default)]
+    pub vram_used_bytes: u64,
     /// Wavefront / Warp execution width (32 for RDNA / NVIDIA Warp, 64 for CDNA).
     pub wavefront_size: u32,
     /// Whether WMMA (Wave Matrix Multiply Accumulate) tensor hardware is present.
@@ -129,26 +132,44 @@ pub fn extract_clean_gpu_name(raw_line: &str) -> String {
 }
 
 /// Query system `nvidia-smi` driver query interface if present.
-pub fn query_nvidia_smi_gpus() -> Vec<(String, u64)> {
+/// Returns Vec<(gpu_name, vram_used_bytes, vram_total_bytes)>.
+pub fn query_nvidia_smi_gpus() -> Vec<(String, u64, u64)> {
     let mut results = Vec::new();
     if let Ok(output) = Command::new("nvidia-smi")
-        .args(["--query-gpu=gpu_name,memory.total", "--format=csv,noheader,nounits"])
+        .args(["--query-gpu=gpu_name,memory.used,memory.total", "--format=csv,noheader,nounits"])
         .output()
     {
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout);
             for line in text.lines() {
                 let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-                if parts.len() >= 2 {
+                if parts.len() >= 3 {
                     let name = parts[0].to_string();
-                    if let Ok(mb) = parts[1].parse::<u64>() {
-                        results.push((name, mb * 1024 * 1024));
-                    }
+                    let used_mb = parts[1].parse::<u64>().unwrap_or(0);
+                    let total_mb = parts[2].parse::<u64>().unwrap_or(8192);
+                    results.push((name, used_mb * 1024 * 1024, total_mb * 1024 * 1024));
                 }
             }
         }
     }
     results
+}
+
+/// Query live AMD VRAM used bytes from Linux sysfs mem_info_vram_used interface.
+pub fn query_amd_vram_used(ordinal: u32) -> u64 {
+    let candidates = [
+        format!("/sys/class/drm/card{ordinal}/device/mem_info_vram_used"),
+        format!("/sys/class/drm/card1/device/mem_info_vram_used"),
+        format!("/sys/class/drm/card0/device/mem_info_vram_used"),
+    ];
+    for p in &candidates {
+        if let Ok(content) = std::fs::read_to_string(p) {
+            if let Ok(bytes) = content.trim().parse::<u64>() {
+                return bytes;
+            }
+        }
+    }
+    0
 }
 
 /// Helper to map AMD GCN / RDNA / CDNA target architecture strings to family names.
@@ -264,6 +285,7 @@ pub fn query_rocminfo_gpus() -> Vec<RocmDeviceInfo> {
                             is_rocm_compliant: true,
                             gcn_arch: full_arch,
                             vram_bytes,
+                            vram_used_bytes: query_amd_vram_used(ordinal),
                             wavefront_size,
                             wmma_supported: is_w32 || is_cdna,
                             mfma_supported: is_w64 || is_cdna,
@@ -322,6 +344,7 @@ pub fn query_rocminfo_gpus() -> Vec<RocmDeviceInfo> {
                     is_rocm_compliant: true,
                     gcn_arch: full_arch,
                     vram_bytes,
+                    vram_used_bytes: query_amd_vram_used(ordinal),
                     wavefront_size,
                     wmma_supported: is_w32 || is_cdna,
                     mfma_supported: is_w64 || is_cdna,
@@ -342,7 +365,7 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
 
     // 1. Query official nvidia-smi driver interface for installed NVIDIA GPUs.
     let nvidia_smi_devs = query_nvidia_smi_gpus();
-    for (gpu_name, vram_bytes) in nvidia_smi_devs {
+    for (gpu_name, vram_used_bytes, vram_total_bytes) in nvidia_smi_devs {
         let arch = detect_nvidia_arch(&gpu_name);
         devices.push(RocmDeviceInfo {
             ordinal,
@@ -351,7 +374,8 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
             backend: "CUDA".to_string(),
             is_rocm_compliant: false,
             gcn_arch: arch,
-            vram_bytes,
+            vram_bytes: vram_total_bytes,
+            vram_used_bytes,
             wavefront_size: 32,
             wmma_supported: false,
             mfma_supported: false,
@@ -366,6 +390,7 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
     let rocminfo_devs = query_rocminfo_gpus();
     for mut amd_dev in rocminfo_devs {
         amd_dev.ordinal = ordinal;
+        amd_dev.vram_used_bytes = query_amd_vram_used(ordinal);
         devices.push(amd_dev);
         ordinal += 1;
     }
@@ -395,6 +420,7 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
                             is_rocm_compliant: false,
                             gcn_arch: arch,
                             vram_bytes: 8_589_934_592u64,
+                            vram_used_bytes: 0,
                             wavefront_size: 32,
                             wmma_supported: false,
                             mfma_supported: false,
@@ -418,6 +444,7 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
                             is_rocm_compliant: true,
                             gcn_arch: arch,
                             vram_bytes: 4_294_967_296u64,
+                            vram_used_bytes: query_amd_vram_used(ordinal),
                             wavefront_size: 32,
                             wmma_supported: false,
                             mfma_supported: false,
@@ -452,6 +479,7 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
                     is_rocm_compliant: true,
                     gcn_arch: full_arch,
                     vram_bytes: 8_589_934_592,
+                    vram_used_bytes: query_amd_vram_used(ordinal),
                     wavefront_size,
                     wmma_supported: wavefront_size == 32,
                     mfma_supported: wavefront_size == 64,
@@ -488,6 +516,7 @@ mod tests {
             is_rocm_compliant: false,
             gcn_arch: detect_nvidia_arch("NVIDIA GeForce RTX 4070 Laptop GPU"),
             vram_bytes: 8 * 1024 * 1024 * 1024,
+            vram_used_bytes: 0,
             wavefront_size: 32,
             wmma_supported: false,
             mfma_supported: false,
