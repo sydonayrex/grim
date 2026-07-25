@@ -3,7 +3,6 @@
 
 use std::path::{Path, PathBuf};
 
-use grim_format::GgufProvider;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
