@@ -7,7 +7,8 @@
 use grim_core::error::{Error, Result};
 use grim_models_transformer::{LlamaBlock, LlamaConfig};
 use grim_nn::WeightSource;
-use grim_tensor::{Device, Tensor, TensorProvider};
+use grim_nn::modules::pick_device_for_tensor;
+use grim_tensor::{DType, Shape, Tensor, TensorProvider};
 use std::collections::HashMap;
 
 /// Saved activation checkpoint for a transformer block.
@@ -226,43 +227,29 @@ impl StreamingBlockForward {
             }
         }
 
-        let scale = 1.0 / (cfg.head_dim as f32).sqrt();
-        let mut attn_raw_data = vec![0.0f32; total_tokens * num_head_dims];
+        let q_shape = Shape::new(vec![total_tokens, cfg.num_heads, cfg.head_dim]);
+        let k_shape = Shape::new(vec![total_tokens, cfg.num_kv_heads, cfg.head_dim]);
+        let v_shape = k_shape.clone();
+        let out_shape = q_shape.clone();
 
-        for h in 0..cfg.num_heads {
-            let kvh = (h * cfg.num_kv_heads) / cfg.num_heads;
-            for t in 0..total_tokens {
-                let mut scores = vec![0.0f32; total_tokens];
-                for t2 in 0..total_tokens {
-                    if t2 > t {
-                        scores[t2] = f32::NEG_INFINITY;
-                    } else {
-                        let mut dot = 0.0f32;
-                        for d in 0..cfg.head_dim {
-                            dot += qd[t * num_head_dims + h * cfg.head_dim + d]
-                                * kd[t2 * kv_stride + kvh * cfg.head_dim + d];
-                        }
-                        scores[t2] = dot * scale;
-                    }
-                }
-                let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0f32;
-                for s in &mut scores {
-                    *s = (*s - mx).exp();
-                    sum += *s;
-                }
-                for s in &mut scores {
-                    *s /= sum;
-                }
-                for d in 0..cfg.head_dim {
-                    let mut acc = 0.0f32;
-                    for t2 in 0..total_tokens {
-                        acc += scores[t2] * vd[t2 * kv_stride + kvh * cfg.head_dim + d];
-                    }
-                    attn_raw_data[t * num_head_dims + h * cfg.head_dim + d] = acc;
-                }
-            }
-        }
+        let dev = pick_device_for_tensor(&q);
+        let q_rot = dev.from_cpu(&qd, &q_shape, DType::F32)?;
+        let k_rot = dev.from_cpu(&kd, &k_shape, DType::F32)?;
+        let v_dev = dev.from_cpu(&vd, &v_shape, DType::F32)?;
+
+        let (attn_storage, _handle) = dev.qkv_attention(
+            q_rot.as_ref(),
+            k_rot.as_ref(),
+            v_dev.as_ref(),
+            cfg.num_kv_heads,
+            total_tokens,
+            0,
+            &out_shape,
+            None,
+            None,
+        )?;
+
+        let attn_raw_data = attn_storage.to_cpu_vec_f32()?;
         let attn_raw = grim_backend_cpu::cpu_tensor(attn_raw_data, grim_tensor::Shape::new(vec![total_tokens, num_head_dims]));
         let attn_raw_id = tape.register(attn_raw.clone());
 
