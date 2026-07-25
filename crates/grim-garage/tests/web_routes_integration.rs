@@ -60,28 +60,29 @@ async fn test_serves_embedded_app_js() {
 }
 
 #[tokio::test]
-async fn test_serves_embedded_style_css() {
+async fn test_chat_endpoint_returns_ok() {
     let state = AppState {
         registry: Arc::new(JobRegistry::new()),
     };
     let app = build_router(state);
 
+    let payload = serde_json::json!({
+        "model_id": "/path/to/test-model.grim",
+        "prompt": "Hello, model!",
+        "temperature": 0.7
+    });
+
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/style.css")
-                .body(axum::body::Body::empty())
+                .method("POST")
+                .uri("/api/chat")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&payload).unwrap()))
                 .unwrap(),
         )
         .await
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .unwrap()
-        .to_str()
-        .unwrap();
-    assert!(content_type.contains("css"));
 }
