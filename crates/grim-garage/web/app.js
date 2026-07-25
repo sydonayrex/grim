@@ -122,9 +122,58 @@ document.addEventListener('DOMContentLoaded', () => {
           }
         }
       }
+
+      // Populate Multi-GPU Selection Box in Training Control Room
+      const gpuContainer = document.getElementById('gpu-selection-container');
+      if (gpuContainer) {
+        if (data.devices && data.devices.length > 0) {
+          gpuContainer.innerHTML = '';
+          data.devices.forEach((d, idx) => {
+            const label = document.createElement('label');
+            label.style.cssText = 'display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; color: var(--text-main);';
+            const rawArch = (d.gcn_arch || '').split(' ')[0];
+            label.innerHTML = `
+              <input type="checkbox" class="gpu-select-checkbox" data-ordinal="${d.ordinal}" data-arch="${rawArch}" ${idx === 0 ? 'checked' : ''}>
+              <span>GPU ${d.ordinal}: ${d.name} (${d.gcn_arch})</span>
+              <span class="text-muted" style="margin-left: auto;">${(d.vram_bytes / (1024*1024*1024)).toFixed(1)} GB</span>
+            `;
+            gpuContainer.appendChild(label);
+          });
+
+          document.querySelectorAll('.gpu-select-checkbox').forEach(cb => {
+            cb.addEventListener('change', validateGpuSelection);
+          });
+        } else {
+          gpuContainer.innerHTML = '<span class="text-muted" style="font-size: 12px;">Host CPU Execution Mode Active</span>';
+        }
+      }
     } catch (e) {
       console.warn('GPU Probe failed:', e);
       document.getElementById('gpu-name-display').textContent = 'Host Hardware';
+    }
+  }
+
+  function validateGpuSelection() {
+    const checked = Array.from(document.querySelectorAll('.gpu-select-checkbox:checked'));
+    const help = document.getElementById('gpu-selection-help');
+    const startBtn = document.getElementById('btn-start-job');
+
+    if (checked.length <= 1) {
+      if (help) help.innerHTML = '<span style="color: var(--text-muted);">Select single or matching architecture GPUs for FSDP parallel training.</span>';
+      if (startBtn) startBtn.disabled = false;
+      return;
+    }
+
+    const archs = checked.map(c => c.getAttribute('data-arch'));
+    const firstArch = archs[0];
+    const isMatching = archs.every(a => a === firstArch);
+
+    if (isMatching) {
+      if (help) help.innerHTML = `<span style="color: var(--success-color); font-weight: 600;">✅ Parallel Multi-GPU Training Enabled (${firstArch} x${checked.length})</span>`;
+      if (startBtn) startBtn.disabled = false;
+    } else {
+      if (help) help.innerHTML = `<span style="color: var(--danger-color); font-weight: 600;">⚠️ Multi-GPU parallel training requires matching GPU architectures (e.g. dual ${firstArch}). Cannot pair ${archs.join(' with ')}.</span>`;
+      if (startBtn) startBtn.disabled = true;
     }
   }
 
@@ -342,6 +391,24 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('input-lr').value = 0.00002;
     document.getElementById('check-fusion-rmsnorm').checked = true;
     document.getElementById('check-fusion-attn').checked = true;
-    alert('Autotune optimal preset applied!');
+
+    const box = document.getElementById('autotune-recommendation-box');
+    if (box) {
+      box.innerHTML = '<span style="color: var(--success-color); font-weight: 700; font-size: 13px;">✅ Autotune Optimal Preset Applied</span>';
+      setTimeout(() => {
+        box.style.display = 'none';
+      }, 1500);
+    }
+  }
+
+  const btnSaveSettings = document.getElementById('btn-save-settings');
+  if (btnSaveSettings) {
+    btnSaveSettings.addEventListener('click', () => {
+      const msg = document.getElementById('save-settings-msg');
+      if (msg) {
+        msg.style.display = 'inline';
+        setTimeout(() => { msg.style.display = 'none'; }, 2500);
+      }
+    });
   }
 });
