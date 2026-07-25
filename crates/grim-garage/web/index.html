@@ -39,12 +39,14 @@
       </nav>
 
       <div class="gpu-badge" id="gpu-telemetry-badge">
-        <div class="badge-title">ROCm GPU Telemetry</div>
-        <div class="gpu-name" id="gpu-name-display">Probing hardware...</div>
-        <div class="vram-bar-container">
-          <div class="vram-bar" id="gpu-vram-bar" style="width: 0%;"></div>
+        <div class="badge-title">Backend Hardware Telemetry</div>
+        <div id="gpu-telemetry-list" style="display: flex; flex-direction: column; gap: 8px; margin-top: 6px;">
+          <div class="gpu-name" id="gpu-name-display">Probing hardware...</div>
+          <div class="vram-bar-container">
+            <div class="vram-bar" id="gpu-vram-bar" style="width: 0%;"></div>
+          </div>
+          <div class="vram-text" id="gpu-vram-text">0 GB / 0 GB VRAM</div>
         </div>
-        <div class="vram-text" id="gpu-vram-text">0 GB / 0 GB VRAM</div>
       </div>
     </aside>
 
@@ -80,10 +82,43 @@
               </div>
 
               <div class="form-group">
-                <label for="select-dataset">Dataset</label>
-                <select id="select-dataset" class="form-control">
-                  <option value="">Loading datasets...</option>
-                </select>
+                <label>Dataset Source</label>
+                <div style="display: flex; gap: 14px; margin-bottom: 6px;">
+                  <label style="font-size: 12px; cursor: pointer; color: var(--text-main);"><input type="radio" name="dataset-source-type" value="local" checked id="radio-dataset-local"> Local File / Folder</label>
+                  <label style="font-size: 12px; cursor: pointer; color: var(--text-main);"><input type="radio" name="dataset-source-type" value="remote" id="radio-dataset-remote"> HuggingFace / Remote URL</label>
+                </div>
+
+                <div id="dataset-local-group">
+                  <select id="select-dataset" class="form-control">
+                    <option value="">Loading datasets...</option>
+                  </select>
+                </div>
+
+                <div id="dataset-remote-group" style="display: none;">
+                  <input type="text" id="input-dataset-url" class="form-control" placeholder="e.g. https://huggingface.co/datasets/tatsu-lab/alpaca or Parquet/JSONL URL">
+                </div>
+              </div>
+
+              <div class="form-row">
+                <div class="form-group half">
+                  <label for="select-dataset-split">Dataset Split</label>
+                  <select id="select-dataset-split" class="form-control">
+                    <option value="train">train (Default)</option>
+                    <option value="validation">validation</option>
+                    <option value="test">test</option>
+                    <option value="all">All Splits</option>
+                  </select>
+                </div>
+                <div class="form-group half">
+                  <label for="select-subsample-type">Subsample Limit</label>
+                  <div style="display: flex; gap: 6px;">
+                    <select id="select-subsample-type" class="form-control" style="width: 85px;">
+                      <option value="percent">%</option>
+                      <option value="rows">rows</option>
+                    </select>
+                    <input type="number" id="input-subsample-val" class="form-control" value="100" min="1">
+                  </div>
+                </div>
               </div>
 
               <div class="form-group">
@@ -194,6 +229,52 @@
                   <tr><td colspan="5" class="text-muted">No active training jobs</td></tr>
                 </tbody>
               </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Model Pull & Conversion Studio Card (Full Width) -->
+        <div class="card card-panel" style="margin-top: 20px;">
+          <h2>📥 Pull & Convert Models to .grim Format</h2>
+          <p class="subtitle">Pull GGUF model weights directly from HuggingFace Hub or Ollama and repack them into native Grim .grim format.</p>
+
+          <div class="form-row" style="align-items: flex-end; margin-top: 14px;">
+            <div class="form-group" style="flex: 1;">
+              <label for="select-pull-source">Model Source</label>
+              <select id="select-pull-source" class="form-control">
+                <option value="huggingface">HuggingFace Hub (GGUF Repo)</option>
+                <option value="ollama">Ollama Library</option>
+                <option value="url">Direct GGUF URL</option>
+              </select>
+            </div>
+
+            <div class="form-group" style="flex: 2;">
+              <label for="input-pull-repo">Model Repo / Identifier</label>
+              <input type="text" id="input-pull-repo" class="form-control" placeholder="e.g. Qwen/Qwen2.5-7B-Instruct-GGUF or llama3:8b">
+            </div>
+
+            <div class="form-group" style="flex: 1;">
+              <label for="select-pull-quant">Target Repack Format</label>
+              <select id="select-pull-quant" class="form-control">
+                <option value="RavenFP8">Raven FP8 (E4M3 Sequential - RDNA 4+)</option>
+                <option value="CrowQ4K">Crow Q4_K (Fused GPU Dequant)</option>
+                <option value="JayMXFP4">Jay MXFP4 (Micro-block 4-bit - RDNA 5 ONLY)</option>
+              </select>
+            </div>
+
+            <div class="form-group" style="margin-bottom: 0;">
+              <button class="btn btn-primary" id="btn-pull-convert" style="white-space: nowrap;">⚡ Pull & Convert</button>
+            </div>
+          </div>
+
+          <!-- Download & Conversion Progress Bar -->
+          <div id="pull-progress-container" style="display: none; margin-top: 16px; padding: 12px; background: rgba(15, 23, 42, 0.6); border-radius: 8px; border: 1px solid var(--border-card);">
+            <div style="display: flex; justify-content: space-between; font-size: 13px; font-weight: 600; margin-bottom: 6px;">
+              <span id="pull-progress-status" style="color: var(--text-main);">Downloading model weights...</span>
+              <span id="pull-progress-percent" style="color: var(--primary-color);">0%</span>
+            </div>
+            <div class="vram-bar-container" style="height: 12px; background: rgba(255,255,255,0.08); border-radius: 6px; overflow: hidden;">
+              <div id="pull-progress-bar" class="vram-bar" style="width: 0%; height: 100%; transition: width 0.3s ease; background: linear-gradient(90deg, #6366f1, #10b981);"></div>
             </div>
           </div>
         </div>
