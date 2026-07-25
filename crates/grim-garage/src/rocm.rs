@@ -214,7 +214,7 @@ pub fn user_friendly_amd_name(gcn_arch: &str, marketing_name: &str) -> String {
         "RDNA 4"
     } else if arch_lower.contains("gfx11") || name_lower.contains("rdna3") || name_lower.contains("7900") || name_lower.contains("7800") || name_lower.contains("7700") || name_lower.contains("7600") {
         "RDNA 3"
-    } else if arch_lower.contains("gfx103") || name_lower.contains("rdna2") || name_lower.contains("6800") || name_lower.contains("6900") || name_lower.contains("6700") || name_lower.contains("680m") || name_lower.contains("780m") || name_lower.contains("gfx1036") || name_lower.contains("rembrandt") || name_lower.contains("phoenix") {
+    } else if arch_lower.contains("gfx103") || arch_lower.contains("0300") || name_lower.contains("0300") || name_lower.contains("rdna2") || name_lower.contains("6800") || name_lower.contains("6900") || name_lower.contains("6700") || name_lower.contains("680m") || name_lower.contains("780m") || name_lower.contains("gfx1036") || name_lower.contains("rembrandt") || name_lower.contains("phoenix") {
         "RDNA 2"
     } else if arch_lower.contains("gfx101") || name_lower.contains("rdna1") || name_lower.contains("5700") || name_lower.contains("5600") {
         "RDNA 1"
@@ -227,16 +227,17 @@ pub fn user_friendly_amd_name(gcn_arch: &str, marketing_name: &str) -> String {
     };
 
     // Determine base product name
-    let product_name = if !marketing_name.is_empty()
+    let product_name = if arch_lower.contains("gfx1036") || name_lower.contains("rembrandt") || name_lower.contains("0300") || arch_lower.contains("0300") {
+        "Radeon 680M iGPU".to_string()
+    } else if !marketing_name.is_empty()
         && !marketing_name.starts_with("c_")
         && !marketing_name.starts_with("Device ")
         && marketing_name != "AMD/ATI"
+        && marketing_name != "0300"
         && !marketing_name.eq_ignore_ascii_case("generic_amd_gpu")
         && !marketing_name.eq_ignore_ascii_case("Radeon GPU")
     {
         marketing_name.trim().to_string()
-    } else if arch_lower.contains("gfx1036") || name_lower.contains("rembrandt") {
-        "Radeon 680M iGPU".to_string()
     } else if arch_lower.contains("gfx13") {
         "Radeon RX 9070".to_string()
     } else if arch_lower.contains("gfx1200") {
@@ -407,10 +408,11 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
                     }
                     
                     if raw_name.contains("NVIDIA") {
-                        let clean_name = extract_clean_gpu_name(&raw_name);
-                        if devices.iter().any(|d| d.name.eq_ignore_ascii_case(&clean_name)) {
+                        // Skip if nvidia-smi already probed NVIDIA GPUs or an NVIDIA card is already present
+                        if devices.iter().any(|d| d.vendor == "NVIDIA" || d.backend == "CUDA" || d.name.contains("4070") || d.name.contains("RTX")) {
                             continue;
                         }
+                        let clean_name = extract_clean_gpu_name(&raw_name);
                         let arch = detect_nvidia_arch(&clean_name);
                         devices.push(RocmDeviceInfo {
                             ordinal,
@@ -433,7 +435,7 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
                         let clean_name = extract_clean_gpu_name(&raw_name);
                         let arch = detect_amd_arch("", &raw_name);
                         let friendly_name = user_friendly_amd_name(&arch, &clean_name);
-                        if devices.iter().any(|d| d.name.eq_ignore_ascii_case(&friendly_name)) {
+                        if devices.iter().any(|d| d.vendor == "AMD" || d.name.eq_ignore_ascii_case(&friendly_name)) {
                             continue;
                         }
                         devices.push(RocmDeviceInfo {
