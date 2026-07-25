@@ -44,7 +44,12 @@ pub fn dpo_loss(
         rejected_rewards.push(rejected_r);
 
         let logits = chosen_r - rejected_r;
-        let loss = -sigmoid(logits).ln();
+        // `-sigmoid(logits).ln()` == `ln(1 + exp(-logits))` == softplus(-logits),
+        // but the direct form underflows to ±inf for |logits| > ~88 (sigmoid
+        // saturates to 0/1, then ln(0) = -inf). Use the numerically-stable
+        // softplus with the max trick: `max(-x,0) + ln(1+exp(-|x|))`, which is
+        // exact for all finite inputs and never produces inf/NaN here.
+        let loss = softplus(-logits);
         total_loss += loss;
     }
 
@@ -75,7 +80,8 @@ pub fn orpo_odds_ratio_loss(
         let odds_rejected = p_rejected / (1.0 - p_rejected);
 
         let log_odds_ratio = (odds_chosen / odds_rejected).ln();
-        let loss = -sigmoid(log_odds_ratio).ln();
+        // See dpo_loss: `-sigmoid(x).ln()` == softplus(-x), numerically stable.
+        let loss = softplus(-log_odds_ratio);
         total_loss += loss;
     }
 
@@ -99,8 +105,16 @@ pub fn grpo_normalize_rewards(rewards: &[f32], eps: f32) -> Vec<f32> {
     rewards.iter().map(|&r| (r - mean) / std).collect()
 }
 
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
+/// Numerically-stable softplus: `ln(1 + exp(x))` = `max(x, 0) + ln(1 + exp(-|x|))`.
+///
+/// Equivalent to `-sigmoid(-x).ln()` (and to `-sigmoid(x).ln()` when called with
+/// `-x`), but never overflows to ±inf for large |x| because the `max`/abs trick
+/// bounds the argument to `exp` to `[0, ∞)` — for very negative inputs the
+/// two-term form collapses toward 0 (the true softplus value), and for very
+/// positive inputs it collapses toward `x`.
+fn softplus(x: f32) -> f32 {
+    let max_term = x.max(0.0);
+    max_term + (1.0 + (-x.abs()).exp()).ln()
 }
 
 #[cfg(test)]
@@ -115,8 +129,11 @@ mod tests {
         let ref_r = vec![-2.0];
 
         let (loss, c_r, r_r) = dpo_loss(&pol_c, &pol_r, &ref_c, &ref_r, 0.1).unwrap();
-        assert!(loss > 0.0);
-        assert!(c_r[0] > r_r[0]);
+        // Exact rewards: chosen = 0.1 * (-1.0 - (-2.0)) = 0.1, rejected = 0.1 * (-3.0 - (-2.0)) = -0.1
+        assert!((c_r[0] - 0.1).abs() < 1e-6);
+        assert!((r_r[0] - (-0.1)).abs() < 1e-6);
+        // Exact loss: softplus(-0.2) = ln(1 + exp(-0.2)) = 0.5981424
+        assert!((loss - 0.5981424).abs() < 1e-5, "loss = {}, want 0.5981424", loss);
     }
 
     #[test]
@@ -125,5 +142,10 @@ mod tests {
         let norm = grpo_normalize_rewards(&rewards, 1e-8);
         let mean = norm.iter().sum::<f32>() / (norm.len() as f32);
         assert!(mean.abs() < 1e-6);
+
+        // Assert unit variance: std_dev of [1, 2, 3, 4, 5] = sqrt((4+1+0+1+4)/5) = sqrt(2)
+        // Normalized values must have sample variance ~1.0
+        let var = norm.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / (norm.len() as f32);
+        assert!((var - 1.0).abs() < 1e-4, "Normalized variance = {}, want 1.0", var);
     }
 }

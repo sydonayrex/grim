@@ -228,7 +228,7 @@ impl Scheduler {
         // 1. Admit from admitted queue up to budget.
         let mut total_prefill = 0usize;
         let current_running = self.running.len();
-        while let Some(mut r) = admitted.pop_front() {
+        while let Some(r) = admitted.pop_front() {
             if current_running + output.prefill_ids.len() >= self.max_num_seqs {
                 self.waiting.push_back(r);
                 continue;

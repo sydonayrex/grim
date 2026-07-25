@@ -346,4 +346,14 @@ mod tests {
         }
         assert_eq!(TrainFpFormat::from_u8(99), None);
     }
+
+    /// Verifies `TrainState::read` rejects invalid magic bytes.
+    #[test]
+    fn test_train_state_read_rejects_bad_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.grim.train");
+        std::fs::write(&path, b"BADMAGIC00000000").unwrap();
+        let res = TrainState::read(&path);
+        assert!(res.is_err());
+    }
 }

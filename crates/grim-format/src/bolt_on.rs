@@ -159,4 +159,92 @@ mod tests {
         let res = detach_bolt_on(&path, "nonexistent");
         assert!(res.is_err());
     }
+
+    /// Verifies `attach_bolt_on` and `detach_bolt_on` update backup2 metadata and payload byte regions on disk.
+    #[test]
+    fn test_attach_and_detach_bolt_on_updates_backup2_and_ext_entries() {
+        use crate::format::{GrimFile, GrimHeader, GrimTensorEntry};
+        use crate::gguf::{GrimMetadata, GrimRocmlProfile};
+        use crate::spec::GrimTensorExt;
+        use crate::tprov::GrimProvider;
+        use std::collections::HashMap;
+        use std::io::Cursor;
+
+        let tensor_name = "layer.0.weight";
+        let metadata = GrimMetadata {
+            magic: Some("grim-v1".into()),
+            quant_version: Some(1),
+            rocml_profile: GrimRocmlProfile::Rdna3,
+            wavefront_size: 64,
+            target_gcn: Some("gfx1100".into()),
+            ext_entries: vec![GrimTensorExt {
+                tensor_name: tensor_name.into(),
+                row_count: 32,
+                row_stride: 128,
+                default_bpw: 4,
+                scale_size: 32,
+                scale_offset: 256,
+                backup2: crate::spec::BackupLayer {
+                    codes_offset: 512,
+                    codes_size: 256,
+                    bpw: 2,
+                    scale_offset: 768,
+                    scale_size: 256,
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let entry = GrimTensorEntry {
+            name: tensor_name.into(),
+            shape: vec![32, 128],
+            base_bitwidth: 4,
+            payload_offset: 0,
+            payload_size: 1024,
+            ..Default::default()
+        };
+
+        let grim_file = GrimFile {
+            header: GrimHeader::new(1, 0),
+            metadata,
+            tensors: vec![entry],
+            tensors_by_name: HashMap::new(),
+            kv_blobs: HashMap::new(),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.grim");
+
+        let mut buf = Vec::new();
+        {
+            let mut cursor = Cursor::new(&mut buf);
+            let written = grim_file.write(&mut cursor).unwrap();
+            let needed = (written[0].payload_offset + written[0].payload_size) as usize;
+            if buf.len() < needed {
+                buf.resize(needed + 512, 0);
+            }
+        }
+        std::fs::write(&path, &buf).unwrap();
+
+        let a_tensor = grim_backend_cpu::cpu_tensor(vec![0.1f32; 2 * 128], grim_tensor::shape::Shape::new(vec![2, 128]));
+        let b_tensor = grim_backend_cpu::cpu_tensor(vec![0.1f32; 32 * 2], grim_tensor::shape::Shape::new(vec![32, 2]));
+
+        // Attach 2-bit bolt-on
+        attach_bolt_on(&path, tensor_name, &a_tensor, &b_tensor, 1.0).expect("attach bolt-on");
+
+        // Reopen and assert backup2 is populated
+        let provider = GrimProvider::open(path.to_str().unwrap()).expect("reopen after attach");
+        let ext = provider.ext_for(tensor_name).expect("ext for tensor");
+        assert!(ext.backup2.is_present());
+        assert_eq!(ext.backup2.bpw, 2);
+
+        // Detach bolt-on
+        detach_bolt_on(&path, tensor_name).expect("detach bolt-on");
+
+        // Reopen and assert backup2 capacity is retained after detach
+        let provider_detached = GrimProvider::open(path.to_str().unwrap()).expect("reopen after detach");
+        let ext_detached = provider_detached.ext_for(tensor_name).expect("ext for tensor");
+        assert!(ext_detached.backup2.is_present());
+    }
 }

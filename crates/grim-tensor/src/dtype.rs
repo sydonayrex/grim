@@ -113,6 +113,12 @@ pub enum KQuantScheme {
     Q80,
     /// IQ4_NL — importance-matrix-optimized 4-bit (llama.cpp `IQ4_NL`).
     IQ4NL,
+    IQ4XS,
+    IQ3XXS,
+    IQ3S,
+    IQ2XXS,
+    IQ2XS,
+    IQ2S,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -209,5 +215,80 @@ impl QuantProvenance {
 impl Default for QuantProvenance {
     fn default() -> Self {
         QuantProvenance::GrimNative
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_device_properties() {
+        let cpu = Device::Cpu;
+        let rocm = Device::Rocm(0);
+        let cuda = Device::Cuda(1);
+        let metal = Device::Metal(2);
+        let vulkan = Device::Vulkan;
+
+        assert!(cpu.is_cpu());
+        assert!(!rocm.is_cpu());
+        assert_eq!(cpu.ordinal(), None);
+        assert_eq!(rocm.ordinal(), Some(0));
+        assert_eq!(cuda.ordinal(), Some(1));
+        assert_eq!(metal.ordinal(), Some(2));
+        assert_eq!(vulkan.ordinal(), None);
+
+        assert!(rocm.same_kind(&Device::Rocm(9)));
+        assert!(!rocm.same_kind(&cuda));
+        assert_eq!(format!("{rocm}"), "rocm:0");
+        assert_eq!(format!("{cpu}"), "cpu");
+    }
+
+    #[test]
+    fn test_arith_type_properties() {
+        assert!(ArithType::F32.is_float());
+        assert!(ArithType::F16.is_float());
+        assert!(ArithType::BF16.is_float());
+        assert!(!ArithType::U8.is_float());
+
+        assert!(ArithType::I64.is_integer());
+        assert!(ArithType::U32.is_integer());
+        assert!(ArithType::U8.is_integer());
+        assert!(!ArithType::F32.is_integer());
+
+        assert_eq!(ArithType::F32.byte_size(), 4);
+        assert_eq!(ArithType::U32.byte_size(), 4);
+        assert_eq!(ArithType::F16.byte_size(), 2);
+        assert_eq!(ArithType::BF16.byte_size(), 2);
+        assert_eq!(ArithType::U8.byte_size(), 2);
+        assert_eq!(ArithType::I64.byte_size(), 8);
+    }
+
+    #[test]
+    fn test_dtype_is_quantized() {
+        assert!(!DType::F32.is_quantized());
+        assert!(!DType::F16.is_quantized());
+        assert!(!DType::BF16.is_quantized());
+
+        let q4k = DType {
+            arith: ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q4K),
+        };
+        assert!(q4k.is_quantized());
+    }
+
+    #[test]
+    fn test_quant_provenance_default_and_variants() {
+        let def = QuantProvenance::default();
+        assert_eq!(def, QuantProvenance::GrimNative);
+        assert!(!def.is_external_qat());
+
+        let qat = QuantProvenance::ExternalQat {
+            bits: 4,
+            group_size: 128,
+            scheme: GroupQuantScheme::Asymmetric,
+            desc_act: false,
+        };
+        assert!(qat.is_external_qat());
     }
 }

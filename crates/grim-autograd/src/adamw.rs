@@ -202,8 +202,12 @@ mod tests {
 
         let p_updated = params.get(id).unwrap();
         let data = p_updated.data.to_vec_f32().unwrap();
-        assert!(data[0] < 1.0);
-        assert!(data[1] < 2.0);
+        // AdamW default lr = 2e-4:
+        // w_decay: [1.0 * (1 - 2e-6), 2.0 * (1 - 2e-6)] = [0.999998, 1.999996]
+        // step: lr * bias_corrected_m / sqrt(bias_corrected_v) = 0.0002 * [1.0, 1.0] = [0.0002, 0.0002]
+        // w_new: [0.999798, 1.999796]
+        assert!((data[0] - 0.999798).abs() < 1e-4, "data[0] = {}, want 0.999798", data[0]);
+        assert!((data[1] - 1.999796).abs() < 1e-4, "data[1] = {}, want 1.999796", data[1]);
         assert_eq!(opt.step_count, 1);
     }
 

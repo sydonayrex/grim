@@ -1956,4 +1956,122 @@ mod tests {
             assert!(!raw_ptr.is_null());
         }
     }
+
+    // ===== Golden Mutation-Resistant Kernel & Op Tests =====
+
+    fn close(got: f32, want: f32, ctx: &str) {
+        let abs = (got - want).abs();
+        let denom = want.abs().max(1e-7);
+        assert!(got.is_finite(), "{ctx}: non-finite {got:?} (want {want:?})");
+        assert!(abs == 0.0 || (abs / denom) < 1e-4, "{ctx}: got {got:?} want {want:?} (abs={abs})");
+    }
+
+    #[test]
+    fn test_metal_add_golden_exact() {
+        let dev = MetalDevice::new(0);
+        let a_data = vec![1.5f32, -2.5, 0.0, 3.14159];
+        let b_data = vec![2.5f32, 3.5, -1.0, 1.0];
+        let a = dev.from_cpu(&a_data, &Shape::new(vec![4]), DType::F32).unwrap();
+        let b = dev.from_cpu(&b_data, &Shape::new(vec![4]), DType::F32).unwrap();
+        let (out, handle) = dev.add(a.as_ref(), b.as_ref(), &Shape::new(vec![4])).unwrap();
+        handle.synchronize().unwrap();
+        let res = out.to_cpu_vec_f32().unwrap();
+        assert_eq!(res.len(), 4);
+        close(res[0], 4.0, "add w0");
+        close(res[1], 1.0, "add w1");
+        close(res[2], -1.0, "add w2");
+        close(res[3], 4.14159, "add w3");
+    }
+
+    #[test]
+    fn test_metal_mul_golden_exact() {
+        let dev = MetalDevice::new(0);
+        let a_data = vec![2.0f32, -3.0, 0.5];
+        let b_data = vec![4.0f32, 2.0, -8.0];
+        let a = dev.from_cpu(&a_data, &Shape::new(vec![3]), DType::F32).unwrap();
+        let b = dev.from_cpu(&b_data, &Shape::new(vec![3]), DType::F32).unwrap();
+        let (out, handle) = dev.mul(a.as_ref(), b.as_ref(), &Shape::new(vec![3])).unwrap();
+        handle.synchronize().unwrap();
+        let res = out.to_cpu_vec_f32().unwrap();
+        assert_eq!(res.len(), 3);
+        close(res[0], 8.0, "mul w0");
+        close(res[1], -6.0, "mul w1");
+        close(res[2], -4.0, "mul w2");
+    }
+
+    #[test]
+    fn test_metal_silu_mul_golden_exact() {
+        let dev = MetalDevice::new(0);
+        let gate_data = vec![1.0f32, -1.0];
+        let up_data = vec![2.0f32, 3.0];
+        let gate = dev.from_cpu(&gate_data, &Shape::new(vec![2]), DType::F32).unwrap();
+        let up = dev.from_cpu(&up_data, &Shape::new(vec![2]), DType::F32).unwrap();
+        let (out, handle) = dev.silu_mul(gate.as_ref(), up.as_ref(), &Shape::new(vec![2])).unwrap();
+        handle.synchronize().unwrap();
+        let res = out.to_cpu_vec_f32().unwrap();
+        assert_eq!(res.len(), 2);
+
+        let sig_1 = 1.0f32 / (1.0f32 + (-1.0f32).exp());
+        let expected_0 = sig_1 * 1.0 * 2.0;
+
+        let sig_neg1 = 1.0f32 / (1.0f32 + (1.0f32).exp());
+        let expected_1 = (-1.0f32 * sig_neg1) * 3.0;
+
+        close(res[0], expected_0, "silu_mul w0");
+        close(res[1], expected_1, "silu_mul w1");
+    }
+
+    #[test]
+    fn test_metal_rms_norm_golden_exact() {
+        let dev = MetalDevice::new(0);
+        let x_data = vec![3.0f32, 4.0];
+        let w_data = vec![1.0f32, 2.0];
+        let shape = Shape::new(vec![2]);
+        let x = dev.from_cpu(&x_data, &shape, DType::F32).unwrap();
+        let w = dev.from_cpu(&w_data, &shape, DType::F32).unwrap();
+        let (out, handle) = dev.rms_norm(x.as_ref(), w.as_ref(), 1e-6, &shape).unwrap();
+        handle.synchronize().unwrap();
+        let res = out.to_cpu_vec_f32().unwrap();
+        assert_eq!(res.len(), 2);
+
+        let rms_val = (12.5f32 + 1e-6).sqrt();
+        let expected_0 = (3.0 / rms_val) * 1.0;
+        let expected_1 = (4.0 / rms_val) * 2.0;
+        close(res[0], expected_0, "rms_norm w0");
+        close(res[1], expected_1, "rms_norm w1");
+    }
+
+    #[test]
+    fn test_metal_softmax_golden_exact() {
+        let dev = MetalDevice::new(0);
+        let x_data = vec![1.0f32, 2.0, 3.0];
+        let shape = Shape::new(vec![3]);
+        let x = dev.from_cpu(&x_data, &shape, DType::F32).unwrap();
+        let (out, handle) = dev.softmax(x.as_ref(), &shape).unwrap();
+        handle.synchronize().unwrap();
+        let res = out.to_cpu_vec_f32().unwrap();
+        assert_eq!(res.len(), 3);
+
+        let sum_exp = 1.0f32.exp() + 2.0f32.exp() + 3.0f32.exp();
+        close(res[0], 1.0f32.exp() / sum_exp, "softmax w0");
+        close(res[1], 2.0f32.exp() / sum_exp, "softmax w1");
+        close(res[2], 3.0f32.exp() / sum_exp, "softmax w2");
+    }
+
+    #[test]
+    fn test_metal_embedding_golden_exact() {
+        let dev = MetalDevice::new(0);
+        let table = vec![
+            10.0f32, 20.0,
+            30.0, 40.0,
+            50.0, 60.0,
+        ];
+        let weight = dev.from_cpu(&table, &Shape::new(vec![3, 2]), DType::F32).unwrap();
+        let indices = vec![2u32, 0];
+        let out_shape = Shape::new(vec![2, 2]);
+        let (out, handle) = dev.embedding(weight.as_ref(), &indices, &out_shape).unwrap();
+        handle.synchronize().unwrap();
+        let res = out.to_cpu_vec_f32().unwrap();
+        assert_eq!(res, vec![50.0, 60.0, 10.0, 20.0]);
+    }
 }

@@ -1604,4 +1604,84 @@ mod tests {
         assert_eq!(restored.tensors[0].kv_present, 0);
         assert_eq!(restored.tensors[0].kv_compressed_size, 0);
     }
+
+    /// Asserts exact binary byte layout for `GrimHeader::write` (magic 'GRIM', LE version, LE num_tensors, LE metadata_len).
+    #[test]
+    fn test_header_exact_binary_layout() {
+        let header = GrimHeader::new(3, 100);
+        let mut buf = Vec::new();
+        header.write(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            vec![
+                b'G', b'R', b'I', b'M', 1, // Magic (5 bytes: FUCKING_SORCERY)
+                100, 0, 0, 0, 0, 0, 0, 0,   // metadata_len = 100 (u64 LE)
+                3, 0, 0, 0,                 // num_tensors = 3 (u32 LE)
+            ]
+        );
+    }
+
+    /// Verifies `GrimHeader::read` rejects invalid magic bytes.
+    #[test]
+    fn test_header_read_rejects_bad_magic() {
+        let bad_buf = vec![
+            b'B', b'A', b'D', b'M',
+            1, 0, 0, 0,
+            1, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
+        let mut reader = &bad_buf[..];
+        let err = GrimHeader::read(&mut reader);
+        assert!(err.is_err(), "Header read must reject invalid magic bytes");
+    }
+
+    /// Verifies `GrimHeader::read` rejects unsupported format versions.
+    #[test]
+    fn test_header_read_rejects_unsupported_version() {
+        let bad_ver_buf = vec![
+            b'G', b'R', b'I', b'M',
+            99, 0, 0, 0, // Unsupported version 99
+            1, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
+        let mut reader = &bad_ver_buf[..];
+        let err = GrimHeader::read(&mut reader);
+        assert!(err.is_err(), "Header read must reject unsupported format version");
+    }
+
+    /// Tests bit-exact F16 conversion in `GrimOutlier::encode` and `decode` across extreme floats.
+    #[test]
+    fn test_outlier_f16_bit_exact_encoding() {
+        let test_cases = vec![
+            (0u32, 0.0f32),
+            (100, -0.0f32),
+            (1024, 1.0f32),
+            (4096, -1.0f32),
+            (65535, 65504.0f32), // Max finite F16
+            (100000, 0.00006103515625f32), // Min positive normalized F16 (2^-14)
+        ];
+
+        for (index, val) in test_cases {
+            let outlier = GrimOutlier { index, value: val };
+            let encoded = outlier.encode();
+            assert_eq!(encoded.len(), 6);
+            let idx_read = u32::from_le_bytes(encoded[0..4].try_into().unwrap());
+            assert_eq!(idx_read, index);
+
+            let decoded = GrimOutlier::decode(&encoded).expect("decode outlier");
+            assert_eq!(decoded.index, index);
+            if val == 0.0 {
+                assert_eq!(decoded.value, 0.0);
+            } else {
+                let rel_err = (decoded.value - val).abs() / val.abs();
+                assert!(
+                    rel_err < 1e-3,
+                    "Outlier F16 round-trip error too large for {}: got {} vs want {}",
+                    val,
+                    decoded.value,
+                    val
+                );
+            }
+        }
+    }
 }

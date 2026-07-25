@@ -158,6 +158,34 @@ fn qkv_attention_reference_4x4x8_self_attention() {
     assert!(max.is_finite(), "reference must not produce NaN");
 }
 
+#[test]
+fn qkv_attention_reference_exact_hand_calculated_causal() {
+    // seq_len = 2, num_heads = 1, head_dim = 2, kv_seq_len = 2, cache_offset = 0
+    let q = vec![1.0f32, 0.0, 0.0, 1.0];
+    let k = vec![1.0f32, 0.0, 0.0, 1.0];
+    let v = vec![10.0f32, 20.0, 30.0, 40.0];
+
+    let got = reference_attention(&q, &k, &v, 2, 1, 1, 2, 2, 0);
+    assert_eq!(got.len(), 4);
+
+    // Row 0 (i=0): query [1, 0] attends only to k0=[1, 0].
+    // Softmax weight = 1.0. Output = v0 = [10.0, 20.0].
+    assert!((got[0] - 10.0).abs() < 1e-4, "got[0] = {}", got[0]);
+    assert!((got[1] - 20.0).abs() < 1e-4, "got[1] = {}", got[1]);
+
+    // Row 1 (i=1): query [0, 1] attends to k0=[1, 0] and k1=[0, 1].
+    // s0 = [0, 1] . [1, 0] / sqrt(2) = 0.0
+    // s1 = [0, 1] . [0, 1] / sqrt(2) = 1/sqrt(2) = 0.70710678
+    // w0 = exp(0) / (exp(0) + exp(0.70710678)) = 1 / (1 + 2.0281149) = 0.3302386
+    // w1 = 1 - w0 = 0.6697614
+    // expected out[0] = 0.3302386 * 10 + 0.6697614 * 30 = 3.302386 + 20.092842 = 23.395228
+    // expected out[1] = 0.3302386 * 20 + 0.6697614 * 40 = 6.604772 + 26.790456 = 33.395228
+    let expected_1_0 = 23.395228f32;
+    let expected_1_1 = 33.395228f32;
+    assert!((got[2] - expected_1_0).abs() < 1e-4, "got[2] = {}, want {}", got[2], expected_1_0);
+    assert!((got[3] - expected_1_1).abs() < 1e-4, "got[3] = {}, want {}", got[3], expected_1_1);
+}
+
 /// CPU reference: non-4:1 GQA ratio (8:1) catches a regression back to
 /// the hardcoded `num_heads / 4` bug.
 #[test]

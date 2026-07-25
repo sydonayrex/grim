@@ -39,7 +39,9 @@ fn bpw_from_dtype(dtype: &DType) -> u8 {
             KQuantScheme::Q5K => 5,
             KQuantScheme::Q6K => 6,
             KQuantScheme::Q80 => 8,
-            KQuantScheme::IQ4NL => 4,
+            KQuantScheme::IQ4NL | KQuantScheme::IQ4XS => 4,
+            KQuantScheme::IQ3XXS | KQuantScheme::IQ3S => 3,
+            KQuantScheme::IQ2XXS | KQuantScheme::IQ2XS | KQuantScheme::IQ2S => 2,
         },
         Storage::Block(bd) => match bd {
             BlockDtype::Fp4 | BlockDtype::Fp4Block16 => 4,
@@ -346,7 +348,8 @@ mod tests {
     }
 
     #[test]
-    fn matmul_backward_computes_gradients() {
+    fn test_gemm_backward() {
+        // No transpose: C = A @ B, dA = G @ B^T, dB = A^T @ G
         let a = tensor(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
         let b = tensor(vec![0.5, 1.5, 2.5, 3.5], vec![2, 2]);
         let g = tensor(vec![1.0, 1.0, 1.0, 1.0], vec![2, 2]);
@@ -358,8 +361,44 @@ mod tests {
             transpose_b: false,
         };
         let (ga, gb) = matmul_backward(&args).unwrap();
-        assert_eq!(ga.shape().dims(), &[2, 2]);
-        assert_eq!(gb.shape().dims(), &[2, 2]);
+        assert_eq!(ga.to_vec_f32().unwrap(), vec![2.0, 6.0, 2.0, 6.0]);
+        assert_eq!(gb.to_vec_f32().unwrap(), vec![4.0, 4.0, 6.0, 6.0]);
+    }
+
+    #[test]
+    fn test_gemm_backward_transpose_a() {
+        // Forward: C = A^T @ B, dA_stored = B @ G^T, dB = A @ G
+        let a = tensor(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let b = tensor(vec![0.5, 1.5, 2.5, 3.5], vec![2, 2]);
+        let g = tensor(vec![1.0, 1.0, 1.0, 1.0], vec![2, 2]);
+        let args = MatMulArgs {
+            a,
+            b,
+            out_grad: g,
+            transpose_a: true,
+            transpose_b: false,
+        };
+        let (ga, gb) = matmul_backward(&args).unwrap();
+        assert_eq!(ga.to_vec_f32().unwrap(), vec![2.0, 2.0, 6.0, 6.0]);
+        assert_eq!(gb.to_vec_f32().unwrap(), vec![3.0, 3.0, 7.0, 7.0]);
+    }
+
+    #[test]
+    fn test_gemm_backward_transpose_b() {
+        // Forward: C = A @ B^T, dA = G @ B, dB_stored = G^T @ A
+        let a = tensor(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let b = tensor(vec![0.5, 1.5, 2.5, 3.5], vec![2, 2]);
+        let g = tensor(vec![1.0, 1.0, 1.0, 1.0], vec![2, 2]);
+        let args = MatMulArgs {
+            a,
+            b,
+            out_grad: g,
+            transpose_a: false,
+            transpose_b: true,
+        };
+        let (ga, gb) = matmul_backward(&args).unwrap();
+        assert_eq!(ga.to_vec_f32().unwrap(), vec![3.0, 5.0, 3.0, 5.0]);
+        assert_eq!(gb.to_vec_f32().unwrap(), vec![4.0, 6.0, 4.0, 6.0]);
     }
 
     /// Tests that `QuantizedMatmulBackwardResiduals::from_tensor` correctly extracts non-default

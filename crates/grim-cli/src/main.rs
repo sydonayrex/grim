@@ -620,7 +620,9 @@ async fn main() -> Result<()> {
                         std::io::stdin().read_line(&mut line).unwrap();
                         let trimmed = line.trim();
                         if trimmed.is_empty() { continue; }
-                        let _ = run::cmd_run(resolved.clone(), Some(trimmed.to_string()), false, address.clone(), &plugins, temperature, top_p, top_k, max_tokens, seed, repeat_penalty).await;
+                        if let Err(e) = run::cmd_run(resolved.clone(), Some(trimmed.to_string()), false, address.clone(), &plugins, temperature, top_p, top_k, max_tokens, seed, repeat_penalty).await {
+                            eprintln!("[grim run] Command failed: {e}");
+                        }
                         println!();
                     }
                 }
@@ -766,7 +768,9 @@ async fn main() -> Result<()> {
                         println!("[Service] Running background daemon on port 11434");
                         let rt = tokio::runtime::Runtime::new().unwrap();
                         rt.block_on(async {
-                            let _ = grim_server::serve("127.0.0.1:11434", engine, None).await;
+                            if let Err(e) = grim_server::serve("127.0.0.1:11434", engine, None).await {
+                                eprintln!("[Service] Server failed: {e}");
+                            }
                         });
                     }
                 }
@@ -885,9 +889,25 @@ async fn main() -> Result<()> {
                         eprintln!("failed to parse {}: {e}", scores_path);
                         std::process::exit(1);
                     });
-                    let tensors = v["tensors"].as_array().expect("invalid scores format");
-                    let names: Vec<String> = tensors.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
-                    let scores: Vec<f32> = tensors.iter().map(|t| t["importance_score"].as_f64().unwrap() as f32).collect();
+                    let tensors = match v["tensors"].as_array() {
+                        Some(arr) => arr,
+                        None => {
+                            eprintln!("invalid scores format: missing 'tensors' array in {}", scores_path);
+                            std::process::exit(1);
+                        }
+                    };
+                    let names: Vec<String> = tensors.iter().map(|t| {
+                        t["name"].as_str().unwrap_or_else(|| {
+                            eprintln!("invalid scores format: missing 'name' string in tensor entry");
+                            std::process::exit(1);
+                        }).to_string()
+                    }).collect();
+                    let scores: Vec<f32> = tensors.iter().map(|t| {
+                        t["importance_score"].as_f64().unwrap_or_else(|| {
+                            eprintln!("invalid scores format: missing 'importance_score' number in tensor entry");
+                            std::process::exit(1);
+                        }) as f32
+                    }).collect();
                     let sizes: Vec<usize> = tensor_sizes
                         .split(',')
                         .filter_map(|s| s.trim().parse().ok())
@@ -1018,26 +1038,27 @@ fn run_service_loop() -> Result<()> {
         process_id: None,
     }).map_err(|e| grim_core::error::Error::Backend(format!("Failed to set SCM status: {e}")))?;
 
-    // Spin up tokio runtime and HTTP server
+    // Spin up tokio runtime and HTTP server, keeping runtime alive for service lifetime
     let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.spawn(async {
+    let shutdown = shutdown_rx.recv();
+    rt.block_on(async {
         let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-        let _ = grim_server::serve("127.0.0.1:11434", engine, None).await;
+        let server = grim_server::serve("127.0.0.1:11434", engine, None);
+        tokio::select! {
+            _ = server => {}
+            _ = shutdown => {
+                let _ = status_handle.set_service_status(ServiceStatus {
+                    service_type: ServiceType::OWN_PROCESS,
+                    current_state: ServiceState::Stopped,
+                    controls_accepted: ServiceControlAccept::empty(),
+                    exit_code: 0,
+                    checkpoint: 0,
+                    wait_hint: Duration::from_secs(1),
+                    process_id: None,
+                });
+            }
+        }
     });
-
-    let _ = shutdown_rx.recv();
-
-    let _ = status_handle.set_service_status(ServiceStatus {
-        service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::Stopped,
-        controls_accepted: ServiceControlAccept::empty(),
-        exit_code: 0,
-        checkpoint: 0,
-        wait_hint: Duration::from_secs(1),
-        process_id: None,
-    });
-
-    rt.shutdown_background();
     Ok(())
 }
 

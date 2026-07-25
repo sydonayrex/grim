@@ -1305,6 +1305,9 @@ impl BackendDevice for VulkanDevice {
                 got: b_dims.to_vec(),
             });
         }
+        if out_shape.dims() != &[m, n] {
+            return Err(Error::Shape(format!("expected out [{m},{n}], got {out_shape:?}")));
+        }
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
         let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
@@ -2009,6 +2012,32 @@ mod tests {
         let (out_s, _handle) = dev.matmul(a_s.as_ref(), b_s.as_ref(), &shape).unwrap();
         let res = out_s.to_cpu_vec_f32().unwrap();
         assert_eq!(res, a_data); // A @ I = A
+    }
+
+    #[test]
+    fn test_vulkan_matmul_non_identity_and_shape_mismatch() {
+        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+            return;
+        }
+        let devices = VulkanDevice::probe().unwrap();
+        let dev = &devices[0];
+
+        // 1. Non-identity matrix multiplication: [1 2; 3 4] @ [5 6; 7 8] = [19 22; 43 50]
+        let a_data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let b_data = vec![5.0f32, 6.0, 7.0, 8.0];
+        let shape = Shape::new(vec![2, 2]);
+
+        let a_s = dev.from_cpu(&a_data, &shape, DType::F32).unwrap();
+        let b_s = dev.from_cpu(&b_data, &shape, DType::F32).unwrap();
+
+        let (out_s, _handle) = dev.matmul(a_s.as_ref(), b_s.as_ref(), &shape).unwrap();
+        let res = out_s.to_cpu_vec_f32().unwrap();
+        assert_eq!(res, vec![19.0, 22.0, 43.0, 50.0]);
+
+        // 2. Shape mismatch error enforcement
+        let bad_shape = Shape::new(vec![3, 2]);
+        let err_res = dev.matmul(a_s.as_ref(), b_s.as_ref(), &bad_shape);
+        assert!(err_res.is_err(), "matmul with wrong output shape must return Err");
     }
 
     #[test]

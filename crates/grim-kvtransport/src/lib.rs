@@ -109,6 +109,14 @@ impl LocalSpillManager {
 
     /// Demotes a block from GPU memory to Host RAM.
     pub fn demote_to_host(&mut self, block_id: BlockId, k: Vec<f32>, v: Vec<f32>) -> Result<()> {
+        if k.len() != self.block_elems || v.len() != self.block_elems {
+            return Err(Error::KvCache(format!(
+                "block element length mismatch: expected {}, got k={}, v={}",
+                self.block_elems,
+                k.len(),
+                v.len()
+            )));
+        }
         self.host_ram_cache.insert(block_id, (k, v));
         self.block_tiers.insert(block_id, CacheTier::HostRam);
         Ok(())

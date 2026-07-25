@@ -427,6 +427,7 @@ pub fn packed_elem_count(shape: &[usize], bits: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grim_quant::dequant_gptq_group_int;
 
     #[test]
     fn test_packed_elem_count_2bit() {
@@ -578,5 +579,154 @@ mod tests {
 
         // Assert identical float outputs
         assert_eq!(eager_dequant, varbuilder_dequant);
+    }
+
+    /// Tests 2-bit GPTQ packing and dequantization with non-zero codes across 32-bit word boundaries.
+    #[test]
+    fn test_gptq_2bit_cross_word_packing_and_dequantization() {
+        let in_features = 16;
+        let out_features = 16;
+        let group_size = 16;
+        let bits = 2;
+        let values_per_word = 16; // 32 bits / 2 bits = 16 values per u32
+
+        let mut expected = vec![0.0f32; in_features * out_features];
+        let mut qweight = vec![0u8; (in_features / values_per_word) * out_features * 4];
+        let words_per_row_zeros = (out_features + values_per_word - 1) / values_per_word;
+        let mut qzeros = vec![0u8; (in_features / group_size) * words_per_row_zeros * 4];
+        let mut scales = vec![0u8; (in_features / group_size) * out_features * 4];
+
+        let zero_val = 1u32;
+        let scale_val = 2.0f32;
+
+        let scale_bytes = scale_val.to_le_bytes();
+        for col in 0..out_features {
+            scales[col * 4..col * 4 + 4].copy_from_slice(&scale_bytes);
+        }
+        // Pack 2-bit code '1' (01) repeated 16 times into 32-bit zero word (0x55555555)
+        let zero_word = 0x55555555u32;
+        qzeros[0..4].copy_from_slice(&zero_word.to_le_bytes());
+
+        for in_idx in 0..in_features {
+            for out_idx in 0..out_features {
+                let code = ((in_idx + out_idx) % 4) as u32;
+                expected[in_idx * out_features + out_idx] = (code as f32 - (zero_val + 1) as f32) * scale_val;
+
+                let word_idx = (in_idx / values_per_word) * out_features + out_idx;
+                let bit_offset = (in_idx % values_per_word) * bits;
+                let offset = word_idx * 4;
+                let mut word = u32::from_le_bytes([qweight[offset], qweight[offset+1], qweight[offset+2], qweight[offset+3]]);
+                word |= code << bit_offset;
+                qweight[offset..offset+4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+
+        let dequanted = dequant_gptq_group_int(
+            &qweight,
+            &qzeros,
+            &scales,
+            None,
+            &[in_features, out_features],
+            bits as u32,
+            group_size,
+        ).expect("2-bit dequant");
+
+        assert_eq!(dequanted.len(), expected.len());
+        for i in 0..dequanted.len() {
+            assert!(
+                (dequanted[i] - expected[i]).abs() < 1e-5,
+                "2-bit GPTQ mismatch at {}: got {} want {}",
+                i, dequanted[i], expected[i]
+            );
+        }
+    }
+
+    /// Tests 3-bit cross-word GPTQ packing (where 32 codes span 3 32-bit u32 words / 96 bits).
+    #[test]
+    fn test_gptq_3bit_cross_word_packing_and_dequantization() {
+        let in_features = 32;
+        let out_features = 32;
+        let group_size = 16;
+        let bits = 3;
+
+        let mut expected = vec![0.0f32; in_features * out_features];
+        let num_words = 3; // 32 values * 3 bits = 96 bits = 3 u32 words
+        let mut qweight = vec![0u8; num_words * out_features * 4];
+        let num_groups = in_features / group_size;
+        let mut qzeros = vec![0u8; num_groups * 3 * 4]; // 3 u32 words per group
+        let mut scales = vec![0u8; num_groups * out_features * 4];
+
+        let zero_val = 3u32;
+        let scale_val = 1.5f32;
+
+        for g in 0..num_groups {
+            for col in 0..out_features {
+                let idx = g * out_features + col;
+                scales[idx * 4..idx * 4 + 4].copy_from_slice(&scale_val.to_le_bytes());
+            }
+            // Pack zero_val (3) into all 32 columns of qzeros for group g using u128
+            let mut zero_u128 = 0u128;
+            for col in 0..out_features {
+                let total_bit = col * 3;
+                zero_u128 |= ((zero_val & 0x7) as u128) << total_bit;
+            }
+            let word0 = (zero_u128 & 0xFFFFFFFF) as u32;
+            let word1 = ((zero_u128 >> 32) & 0xFFFFFFFF) as u32;
+            let word2 = ((zero_u128 >> 64) & 0xFFFFFFFF) as u32;
+
+            let base = g * 12;
+            qzeros[base..base+4].copy_from_slice(&word0.to_le_bytes());
+            qzeros[base+4..base+8].copy_from_slice(&word1.to_le_bytes());
+            qzeros[base+8..base+12].copy_from_slice(&word2.to_le_bytes());
+        }
+
+        for in_idx in 0..in_features {
+            for out_idx in 0..out_features {
+                let code = ((in_idx + out_idx) % 8) as u32;
+                expected[in_idx * out_features + out_idx] = (code as f32 - (zero_val + 1) as f32) * scale_val;
+            }
+        }
+
+        // Pack 3-bit codes into qweight
+        let mut u128_cols = vec![0u128; out_features];
+        for out_idx in 0..out_features {
+            for in_idx in 0..in_features {
+                let code = ((in_idx + out_idx) % 8) as u128;
+                let total_bit = in_idx * 3;
+                u128_cols[out_idx] |= (code & 0x7) << total_bit;
+            }
+        }
+        for out_idx in 0..out_features {
+            let w0 = (u128_cols[out_idx] & 0xFFFFFFFF) as u32;
+            let w1 = ((u128_cols[out_idx] >> 32) & 0xFFFFFFFF) as u32;
+            let w2 = ((u128_cols[out_idx] >> 64) & 0xFFFFFFFF) as u32;
+
+            let idx0 = 0 * out_features + out_idx;
+            let idx1 = 1 * out_features + out_idx;
+            let idx2 = 2 * out_features + out_idx;
+
+            qweight[idx0 * 4..idx0 * 4 + 4].copy_from_slice(&w0.to_le_bytes());
+            qweight[idx1 * 4..idx1 * 4 + 4].copy_from_slice(&w1.to_le_bytes());
+            qweight[idx2 * 4..idx2 * 4 + 4].copy_from_slice(&w2.to_le_bytes());
+        }
+
+        let dequanted = dequant_gptq_group_int(
+            &qweight,
+            &qzeros,
+            &scales,
+            None,
+            &[in_features, out_features],
+            bits as u32,
+            group_size,
+        ).expect("3-bit dequant");
+
+        assert_eq!(dequanted.len(), expected.len());
+        for i in 0..dequanted.len() {
+            assert!(
+                (dequanted[i] - expected[i]).abs() < 1e-5,
+                "3-bit GPTQ cross-word mismatch at {}: got {} want {}",
+                i, dequanted[i], expected[i]
+            );
+        }
     }
 }

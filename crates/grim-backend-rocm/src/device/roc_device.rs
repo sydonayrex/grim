@@ -1568,7 +1568,7 @@ impl BackendDevice for RocmDevice {
         #[cfg(feature = "rocm-profile")]
         println!(
             "[RocmDevice] GEMM Dispatch: Shape ({}, {}, {}) resolved to autotune tile config {:?} on Wavefront {:?}",
-            m, n, k, tile_config, self.props.wavefront_size
+            m, n, k, _tile_config, self.props.wavefront_size
         );
 
         // Get rocBLAS handle and execute gemm_ex with the provided solution_index

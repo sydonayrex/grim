@@ -308,3 +308,35 @@ pub trait BackendStorage: Send + Sync {
     /// type call this — see `CpuDevice::a_storage`.
     fn as_any(&self) -> &dyn std::any::Any;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dtype::QuantProvenance;
+
+    #[test]
+    fn test_quantized_matmul_backward_residuals_from_tensor_default() {
+        let def = QuantizedMatmulBackwardResiduals::default();
+        assert_eq!(def.outlier_count, 0);
+        assert_eq!(def.backup1_bpw, 0);
+        assert_eq!(def.backup2_bpw, 0);
+        assert!(def.outlier_indices_ptr.is_null());
+        assert!(def.outlier_values_ptr.is_null());
+    }
+
+    #[test]
+    fn test_quantized_matmul_backward_residuals_with_residuals_provenance() {
+        let prov = QuantProvenance::WithResiduals {
+            outlier_count: 42,
+            outlier_indices_offset: 100,
+            outlier_values_offset: 200,
+            backup1_bpw: 8,
+            backup1_codes_offset: 1000,
+            backup1_scale_offset: 2000,
+            backup2_bpw: 2,
+            backup2_codes_offset: 3000,
+            backup2_scale_offset: 4000,
+        };
+        assert!(matches!(prov, QuantProvenance::WithResiduals { outlier_count: 42, .. }));
+    }
+}

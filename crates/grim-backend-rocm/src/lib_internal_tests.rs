@@ -181,6 +181,23 @@ mod tests {
     }
 
     #[test]
+    fn test_wavefront_tiled_layout_32_wavefront_rdna_roundtrip() {
+        let wf = WavefrontTiledLayout::new(40, 50, 32);
+        assert_eq!(wf.num_wavefronts, 2);
+        assert_eq!(wf.cols_padded, 64);
+
+        let src: Vec<f32> = (0..40 * 50).map(|i| (i as f32) * 1.5).collect();
+        let tiled = wf.tile(&src, 40, 50);
+        assert_eq!(tiled.len(), 2 * 32 * 64);
+
+        let recovered = wf.untile(&tiled, 40, 50);
+        assert_eq!(recovered.len(), 40 * 50);
+        for (i, (a, b)) in src.iter().zip(recovered.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-6, "RDNA 32-thread round-trip mismatch at index {i}: got {b} want {a}");
+        }
+    }
+
+    #[test]
     fn test_is_attention_projection() {
         let cases = &[
             ("blk.48.attn_q.weight", true),
@@ -578,6 +595,96 @@ mod tests {
         let out_shape = Shape::from_slice(&[2, 3]);
         let res = dev.embedding(w_s.as_ref(), &[0, 1, 2], &out_shape); // 3 indices vs leading dim 2
         assert!(res.is_err(), "embedding must reject indices.len() != out leading dim");
+    }
+
+    // ===== Golden Mutation-Resistant Kernel Math Contracts =====
+
+    fn close_rocm(got: f32, want: f32, ctx: &str) {
+        let abs = (got - want).abs();
+        let denom = want.abs().max(1e-7);
+        assert!(got.is_finite(), "{ctx}: non-finite {got:?} (want {want:?})");
+        assert!(abs == 0.0 || (abs / denom) < 1e-4, "{ctx}: got {got:?} want {want:?} (abs={abs})");
+    }
+
+    #[test]
+    fn test_rocm_add_golden_exact() {
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let a = [1.5f32, -2.5, 0.0, 3.14159];
+        let b = [2.5f32, 3.5, -1.0, 1.0];
+        if let Some(out) = run_binary_op(env, &a, &b, &[4], |d, x, y, s| d.add(x, y, s)) {
+            close_rocm(out[0], 4.0, "rocm_add w0");
+            close_rocm(out[1], 1.0, "rocm_add w1");
+            close_rocm(out[2], -1.0, "rocm_add w2");
+            close_rocm(out[3], 4.14159, "rocm_add w3");
+        }
+    }
+
+    #[test]
+    fn test_rocm_mul_golden_exact() {
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let a = [2.0f32, -3.0, 0.5];
+        let b = [4.0f32, 2.0, -8.0];
+        if let Some(out) = run_binary_op(env, &a, &b, &[3], |d, x, y, s| d.mul(x, y, s)) {
+            close_rocm(out[0], 8.0, "rocm_mul w0");
+            close_rocm(out[1], -6.0, "rocm_mul w1");
+            close_rocm(out[2], -4.0, "rocm_mul w2");
+        }
+    }
+
+    #[test]
+    fn test_rocm_silu_mul_golden_exact() {
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let gate = [1.0f32, -1.0];
+        let up = [2.0f32, 3.0];
+        if let Some(out) = run_binary_op(env, &gate, &up, &[2], |d, g, u, s| d.silu_mul(g, u, s)) {
+            let sig_1 = 1.0f32 / (1.0f32 + (-1.0f32).exp());
+            let exp_0 = sig_1 * 1.0 * 2.0;
+
+            let sig_neg1 = 1.0f32 / (1.0f32 + (1.0f32).exp());
+            let exp_1 = (-1.0f32 * sig_neg1) * 3.0;
+
+            close_rocm(out[0], exp_0, "rocm_silu_mul w0");
+            close_rocm(out[1], exp_1, "rocm_silu_mul w1");
+        }
+    }
+
+    #[test]
+    fn test_rocm_rms_norm_golden_exact() {
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let x = [3.0f32, 4.0];
+        let w = [1.0f32, 2.0];
+        if let Some(out) = run_rms_norm_op(env, &x, &w, &[2], 1e-6) {
+            let rms_val = (12.5f32 + 1e-6).sqrt();
+            let exp_0 = (3.0 / rms_val) * 1.0;
+            let exp_1 = (4.0 / rms_val) * 2.0;
+            close_rocm(out[0], exp_0, "rocm_rms_norm w0");
+            close_rocm(out[1], exp_1, "rocm_rms_norm w1");
+        }
+    }
+
+    #[test]
+    fn test_rocm_softmax_golden_exact() {
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let x = [1.0f32, 2.0, 3.0];
+        if let Some(out) = run_softmax_op(env, &x, &[1, 3]) {
+            let sum_exp = 1.0f32.exp() + 2.0f32.exp() + 3.0f32.exp();
+            close_rocm(out[0], 1.0f32.exp() / sum_exp, "rocm_softmax w0");
+            close_rocm(out[1], 2.0f32.exp() / sum_exp, "rocm_softmax w1");
+            close_rocm(out[2], 3.0f32.exp() / sum_exp, "rocm_softmax w2");
+        }
+    }
+
+    #[test]
+    fn test_rocm_embedding_golden_exact() {
+        let env = std::env::var(GPU_TEST_ENV).is_ok();
+        let weight = [
+            10.0f32, 20.0,
+            30.0, 40.0,
+            50.0, 60.0,
+        ];
+        if let Some(out) = run_embedding_op(env, &weight, &[2, 0], 3, 2) {
+            assert_eq!(out, vec![50.0, 60.0, 10.0, 20.0]);
+        }
     }
 
     // ------------------------------------------------------------------------

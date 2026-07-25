@@ -343,7 +343,7 @@ impl LaunchdManager {
         <string>{exec}</string>
         <string>run</string>
         <string>--serve</string>
-        <key>--config</key>
+        <string>--config</string>
         <string>{config}</string>
     </array>
     <key>RunAtLoad</key><true/>
@@ -445,7 +445,7 @@ impl ServiceManager for LaunchdManager {
 
     fn stop(&self) -> Result<()> {
         let status = std::process::Command::new("launchctl")
-            .args(["stop", "grim"])
+            .args(["stop", "com.grim"])
             .status()
             .map_err(|e| Error::Backend(format!("failed to run launchctl stop: {e}")))?;
 
@@ -462,7 +462,7 @@ impl ServiceManager for LaunchdManager {
 
     fn status(&self) -> Result<ServiceStatus> {
         let output = std::process::Command::new("launchctl")
-            .args(["print", "grim"])
+            .args(["print", "system/com.grim"])
             .output()
             .ok();
 
@@ -481,7 +481,7 @@ impl ServiceManager for LaunchdManager {
 
     fn reload_config(&self) -> Result<()> {
         let _ = std::process::Command::new("launchctl")
-            .args(["kickstart", "-k", "grim"])
+            .args(["kickstart", "-k", "system/com.grim"])
             .status();
         println!("[LaunchdManager] Reloaded configuration.");
         Ok(())
@@ -503,7 +503,7 @@ impl ServiceManager for WindowsScmManager {
         let status = std::process::Command::new("sc")
             .args([
                 "create",
-                &format!("grim_{}", cfg.name),
+                &cfg.name,
                 "binPath=",
                 &bin_path,
                 "DisplayName=",

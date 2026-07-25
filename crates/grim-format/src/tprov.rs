@@ -449,7 +449,7 @@ fn dtype_from_bitwidth(base_bitwidth: u8) -> DType {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::io::{Cursor, Write};
+    use std::io::Write;
 
     use crate::gguf::{GgufValue, GGUF_MAGIC, GGUF_VERSION};
 
@@ -592,7 +592,7 @@ fn test_dtype_from_gguf_block_mappings() {
     /// Write a minimal native `.grim` file to a temp path, then open it
     /// with `GrimProvider` and verify `meta`/`get` round-trip the registry.
     fn write_minimal_grim_file(path: &std::path::Path) {
-        use crate::format::{GrimFile, GrimHeader, GrimTensorEntry, OUTLIER_RECORD_BYTES};
+        use crate::format::{GrimFile, GrimHeader, GrimTensorEntry};
         use crate::gguf::{GrimMetadata, GrimRocmlProfile};
         use std::collections::HashMap;
         use std::io::Cursor;
@@ -727,6 +727,38 @@ fn test_dtype_from_gguf_block_mappings() {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         assert_eq!(read_back, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    /// Verifies `RemappingTensorProvider` translates tensor name queries correctly.
+    #[test]
+    fn test_remapping_tensor_provider_name_translation() {
+        let header = r#"{"model.layers.0.self_attn.q_proj.weight":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]}}"#;
+        let header_len = header.len() as u64;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&header_len.to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        for v in [1.0f32, 2.0, 3.0, 4.0] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let inner = SafetensorsProvider::open(path.to_str().unwrap()).unwrap();
+        let remapped = RemappingTensorProvider::new(&inner, |name| {
+            if name == "blk.0.attn_q.weight" {
+                "model.layers.0.self_attn.q_proj.weight".to_string()
+            } else {
+                name.to_string()
+            }
+        });
+
+        let meta = remapped.meta("blk.0.attn_q.weight").expect("mapped meta lookup");
+        assert_eq!(meta.shape, vec![2, 2]);
+
+        let raw = remapped.get("blk.0.attn_q.weight").expect("mapped get lookup");
+        assert_eq!(raw.bytes.len(), 16);
     }
 }
 
