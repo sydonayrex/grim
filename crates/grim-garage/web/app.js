@@ -38,26 +38,83 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('select-dataset').addEventListener('change', generateAutotuneRecommendation);
   document.getElementById('btn-apply-autotune').addEventListener('click', applyAutotunePreset);
 
-  function isRdna4OrNewer(gcnArch) {
+  function isRdna4(gcnArch) {
     if (!gcnArch) return false;
     const match = gcnArch.toLowerCase().match(/gfx(\d+)/);
     if (match && match[1]) {
       const num = parseInt(match[1], 10);
-      // RDNA 4 (gfx1200-gfx1201) and RDNA 5+ (gfx1300-gfx1310)
-      return num >= 1200;
+      // RDNA 4 ONLY (gfx1200-gfx1299)
+      return num >= 1200 && num < 1300;
     }
     return false;
   }
 
-  function isRdna5OrNewer(gcnArch) {
+  function isRdna5(gcnArch) {
     if (!gcnArch) return false;
     const match = gcnArch.toLowerCase().match(/gfx(\d+)/);
     if (match && match[1]) {
       const num = parseInt(match[1], 10);
-      // RDNA 5+ ONLY (gfx1300-gfx1310)
+      // RDNA 5 ONLY (gfx1300-gfx1399)
       return num >= 1300;
     }
     return false;
+  }
+
+  function updateRepackCapabilities(dev) {
+    const ravenOption = document.getElementById('option-raven-fp8');
+    const jayOption = document.getElementById('option-jay-mxfp4');
+    const repackSelect = document.getElementById('select-repack-mode');
+    const pullSelect = document.getElementById('select-pull-quant');
+
+    const arch = dev ? dev.gcn_arch || '' : '';
+    const supportsRaven = dev ? isRdna4(arch) : false;
+    const supportsJay = dev ? isRdna5(arch) : false;
+
+    // 1. Update Training / Repack Studio Select
+    if (ravenOption) {
+      if (supportsRaven) {
+        ravenOption.disabled = false;
+        ravenOption.textContent = `Raven FP8 (E4M3 - RDNA 4 HW Accelerated)`;
+      } else {
+        ravenOption.disabled = true;
+        ravenOption.textContent = `Raven FP8 (Requires RDNA 4 ONLY)`;
+        if (repackSelect && repackSelect.value === 'RavenFP8') {
+          repackSelect.value = 'CrowQ4K';
+        }
+      }
+    }
+
+    if (jayOption) {
+      if (supportsJay) {
+        jayOption.disabled = false;
+        jayOption.textContent = `Jay MXFP4 (Micro-block 4-bit - RDNA 5 HW Accelerated)`;
+      } else {
+        jayOption.disabled = true;
+        jayOption.textContent = `Jay MXFP4 (Requires RDNA 5 ONLY)`;
+        if (repackSelect && repackSelect.value === 'JayMXFP4') {
+          repackSelect.value = 'CrowQ4K';
+        }
+      }
+    }
+
+    // 2. Update Model Pull & Convert Studio Dropdown
+    if (pullSelect) {
+      Array.from(pullSelect.options).forEach(opt => {
+        if (opt.value === 'RavenFP8') {
+          opt.disabled = !supportsRaven;
+          opt.textContent = supportsRaven ? `Raven FP8 (E4M3 - RDNA 4 HW Accelerated)` : `Raven FP8 (Requires RDNA 4 ONLY)`;
+        } else if (opt.value === 'JayMXFP4') {
+          opt.disabled = !supportsJay;
+          opt.textContent = supportsJay ? `Jay MXFP4 (Micro-block 4-bit - RDNA 5 HW Accelerated)` : `Jay MXFP4 (Requires RDNA 5 ONLY)`;
+        } else if (opt.value === 'CrowQ4K') {
+          opt.disabled = false;
+          opt.textContent = `Crow Q4_K (Fused GPU Dequant - Universal)`;
+        }
+      });
+      if (pullSelect.selectedOptions[0] && pullSelect.selectedOptions[0].disabled) {
+        pullSelect.value = 'CrowQ4K';
+      }
+    }
   }
 
   // ─── API Functions ────────────────────────────────────────────────────────
@@ -66,9 +123,6 @@ document.addEventListener('DOMContentLoaded', () => {
       const res = await fetch('/api/rocm/devices');
       if (!res.ok) throw new Error('API error');
       const data = await res.json();
-      const ravenOption = document.getElementById('option-raven-fp8');
-      const jayOption = document.getElementById('option-jay-mxfp4');
-      const repackSelect = document.getElementById('select-repack-mode');
       const telemetryList = document.getElementById('gpu-telemetry-list');
 
       if (data.devices && data.devices.length > 0) {
@@ -86,7 +140,8 @@ document.addEventListener('DOMContentLoaded', () => {
               backendTag = 'ROCm';
             }
 
-            const nameStr = d.gcn_arch ? `${backendTag} ${d.gcn_arch}` : `${backendTag} (${d.name})`;
+            const productName = d.name && !d.name.includes('generic') ? d.name : d.gcn_arch;
+            const nameStr = `${backendTag} ${productName}`;
             const totalGb = (d.vram_bytes / (1024 * 1024 * 1024)).toFixed(1);
 
             const item = document.createElement('div');
@@ -103,33 +158,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         const dev = data.devices[0];
-        const supportsRaven = isRdna4OrNewer(dev.gcn_arch);
-        if (ravenOption) {
-          if (supportsRaven) {
-            ravenOption.disabled = false;
-            ravenOption.textContent = `Raven FP8 (E4M3 - ${dev.gcn_arch} HW Accelerated)`;
-          } else {
-            ravenOption.disabled = true;
-            ravenOption.textContent = `Raven FP8 (Requires RDNA 4+ / gfx1200+, detected ${dev.gcn_arch})`;
-            if (repackSelect && repackSelect.value === 'RavenFP8') {
-              repackSelect.value = 'CrowQ4K';
-            }
-          }
-        }
-
-        const supportsJay = isRdna5OrNewer(dev.gcn_arch);
-        if (jayOption) {
-          if (supportsJay) {
-            jayOption.disabled = false;
-            jayOption.textContent = `Jay MXFP4 (Micro-block 4-bit - ${dev.gcn_arch} HW Accelerated)`;
-          } else {
-            jayOption.disabled = true;
-            jayOption.textContent = `Jay MXFP4 (Requires RDNA 5 / gfx1300+, detected ${dev.gcn_arch})`;
-            if (repackSelect && repackSelect.value === 'JayMXFP4') {
-              repackSelect.value = 'CrowQ4K';
-            }
-          }
-        }
+        updateRepackCapabilities(dev);
       } else {
         if (telemetryList) {
           telemetryList.innerHTML = `
@@ -137,20 +166,7 @@ document.addEventListener('DOMContentLoaded', () => {
             <div class="vram-text">RAM Allocation Active</div>
           `;
         }
-        if (ravenOption) {
-          ravenOption.disabled = true;
-          ravenOption.textContent = 'Raven FP8 (Requires RDNA 4+ GPU / gfx1200+)';
-          if (repackSelect && repackSelect.value === 'RavenFP8') {
-            repackSelect.value = 'CrowQ4K';
-          }
-        }
-        if (jayOption) {
-          jayOption.disabled = true;
-          jayOption.textContent = 'Jay MXFP4 (Requires RDNA 5 GPU / gfx1300+)';
-          if (repackSelect && repackSelect.value === 'JayMXFP4') {
-            repackSelect.value = 'CrowQ4K';
-          }
-        }
+        updateRepackCapabilities(null);
       }
 
       // Populate Multi-GPU Selection Box in Training Control Room
