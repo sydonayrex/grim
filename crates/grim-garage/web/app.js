@@ -140,8 +140,11 @@ document.addEventListener('DOMContentLoaded', () => {
               backendTag = 'ROCm';
             }
 
-            const productName = d.name && !d.name.includes('generic') ? d.name : d.gcn_arch;
-            const nameStr = `${backendTag} ${productName}`;
+            let cleanName = (d.name || '').replace(/NVIDIA AMD\/ATI/gi, 'Radeon GPU').replace(/AMD\/ATI/gi, '').trim();
+            if (!cleanName || cleanName.toLowerCase().includes('generic')) {
+              cleanName = d.gcn_arch || 'GPU Accelerator';
+            }
+            const nameStr = `${backendTag} ${cleanName}`;
             const totalGb = (d.vram_bytes / (1024 * 1024 * 1024)).toFixed(1);
 
             const item = document.createElement('div');

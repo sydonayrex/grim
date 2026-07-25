@@ -87,24 +87,44 @@ pub fn detect_nvidia_arch(gpu_name: &str) -> String {
 
 /// Helper to parse marketing GPU names from lspci PCI strings.
 pub fn extract_clean_gpu_name(raw_line: &str) -> String {
-    if let (Some(start), Some(end)) = (raw_line.find('['), raw_line.rfind(']')) {
-        if start < end {
-            let inner = &raw_line[start + 1..end];
-            if inner.contains('[') && inner.contains(']') {
-                if let (Some(inner_start), Some(inner_end)) = (inner.find('['), inner.rfind(']')) {
-                    if inner_start < inner_end {
-                        let name = &inner[inner_start + 1..inner_end];
-                        if !name.contains(':') && name.len() > 3 {
-                            return format!("NVIDIA {name}");
-                        }
-                    }
+    let mut bracket_contents = Vec::new();
+    let mut current = String::new();
+    let mut in_bracket = false;
+
+    for c in raw_line.chars() {
+        if c == '[' {
+            in_bracket = true;
+            current.clear();
+        } else if c == ']' {
+            if in_bracket {
+                in_bracket = false;
+                let trimmed = current.trim();
+                if !trimmed.is_empty()
+                    && trimmed != "AMD/ATI"
+                    && !trimmed.starts_with("Device ")
+                    && !trimmed.contains(':')
+                    && trimmed.len() > 2
+                {
+                    bracket_contents.push(trimmed.to_string());
                 }
             }
-            if !inner.contains(':') && inner.len() > 3 {
-                return inner.to_string();
-            }
+        } else if in_bracket {
+            current.push(c);
         }
     }
+
+    if let Some(last) = bracket_contents.pop() {
+        return last;
+    }
+
+    if let Some(pos) = raw_line.find(':') {
+        let after = raw_line[pos + 1..].trim();
+        if let Some(pos2) = after.find(':') {
+            return after[pos2 + 1..].trim().to_string();
+        }
+        return after.to_string();
+    }
+
     raw_line.to_string()
 }
 
@@ -167,6 +187,7 @@ pub fn user_friendly_amd_name(gcn_arch: &str, marketing_name: &str) -> String {
     if !name_trim.is_empty()
         && !name_trim.starts_with("c_")
         && !name_trim.starts_with("Device ")
+        && name_trim != "AMD/ATI"
         && !name_trim.eq_ignore_ascii_case("generic_amd_gpu")
     {
         return name_trim.to_string();
@@ -363,13 +384,14 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
                         ordinal += 1;
                     } else if raw_name.contains("AMD") || raw_name.contains("Advanced Micro Devices") {
                         let clean_name = extract_clean_gpu_name(&raw_name);
-                        if devices.iter().any(|d| d.name.eq_ignore_ascii_case(&clean_name)) {
+                        let arch = detect_amd_arch("", &raw_name);
+                        let friendly_name = user_friendly_amd_name(&arch, &clean_name);
+                        if devices.iter().any(|d| d.name.eq_ignore_ascii_case(&friendly_name)) {
                             continue;
                         }
-                        let arch = detect_amd_arch("", &clean_name);
                         devices.push(RocmDeviceInfo {
                             ordinal,
-                            name: clean_name,
+                            name: friendly_name,
                             vendor: "AMD".to_string(),
                             backend: "ROCm".to_string(),
                             is_rocm_compliant: true,
