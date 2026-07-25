@@ -11,8 +11,8 @@
   --success-color: #10b981;
   --warning-color: #f59e0b;
   --danger-color: #ef4444;
-  --text-main: #f8fafc;
-  --text-muted: #94a3b8;
+  --text-main: #ffffff;
+  --text-muted: #888888;
   --font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
 }
 
@@ -98,13 +98,13 @@ body {
 
 .nav-item:hover {
   background: var(--bg-card-hover);
-  color: var(--text-main);
+  color: #ffffff;
 }
 
 .nav-item.active {
-  background: rgba(168, 85, 247, 0.18);
-  color: #c084fc;
-  border: 1px solid rgba(168, 85, 247, 0.35);
+  background: rgba(168, 85, 247, 0.25);
+  color: #ffffff;
+  border: 1px solid rgba(168, 85, 247, 0.45);
 }
 
 .gpu-badge {
