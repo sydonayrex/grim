@@ -187,70 +187,55 @@ impl StreamingBlockForward {
             x_norm_base_id,
         )?;
 
-        // Apply RoPE (Rotary Position Embeddings) to Q and K
-        let mut qd = q.to_vec_f32()?;
-        let mut kd = k.to_vec_f32()?;
-        let vd = v.to_vec_f32()?;
+        // Apply RoPE + qkv_attention via placement-aware BackendDevice
         let num_head_dims = cfg.num_heads * cfg.head_dim;
-        let total_tokens = qd.len() / num_head_dims;
-        let kv_stride = cfg.num_kv_heads * cfg.head_dim;
-        let head_dim = cfg.head_dim;
-        let half_dim = head_dim / 2;
-
-        for t in 0..total_tokens {
-            let pos = t as f32;
-            // RoPE on Q
-            for h in 0..cfg.num_heads {
-                let base_idx = t * num_head_dims + h * head_dim;
-                for i in 0..half_dim {
-                    let freq = 1.0 / 10000.0f32.powf((2 * i) as f32 / head_dim as f32);
-                    let val = pos * freq;
-                    let (sin_val, cos_val) = (val.sin(), val.cos());
-                    let x1 = qd[base_idx + i];
-                    let x2 = qd[base_idx + i + half_dim];
-                    qd[base_idx + i] = x1 * cos_val - x2 * sin_val;
-                    qd[base_idx + i + half_dim] = x1 * sin_val + x2 * cos_val;
-                }
-            }
-            // RoPE on K
-            for h in 0..cfg.num_kv_heads {
-                let base_idx = t * kv_stride + h * head_dim;
-                for i in 0..half_dim {
-                    let freq = 1.0 / 10000.0f32.powf((2 * i) as f32 / head_dim as f32);
-                    let val = pos * freq;
-                    let (sin_val, cos_val) = (val.sin(), val.cos());
-                    let x1 = kd[base_idx + i];
-                    let x2 = kd[base_idx + i + half_dim];
-                    kd[base_idx + i] = x1 * cos_val - x2 * sin_val;
-                    kd[base_idx + i + half_dim] = x1 * sin_val + x2 * cos_val;
-                }
-            }
-        }
-
-        let q_shape = Shape::new(vec![total_tokens, cfg.num_heads, cfg.head_dim]);
-        let k_shape = Shape::new(vec![total_tokens, cfg.num_kv_heads, cfg.head_dim]);
-        let v_shape = k_shape.clone();
-        let out_shape = q_shape.clone();
+        let total_tokens = q.shape().elem_count() / num_head_dims;
+        let positions: Vec<u32> = (0..total_tokens as u32).collect();
 
         let dev = pick_device_for_tensor(&q);
-        let q_rot = dev.from_cpu(&qd, &q_shape, DType::F32)?;
-        let k_rot = dev.from_cpu(&kd, &k_shape, DType::F32)?;
-        let v_dev = dev.from_cpu(&vd, &v_shape, DType::F32)?;
 
-        let (attn_storage, _handle) = dev.qkv_attention(
-            q_rot.as_ref(),
-            k_rot.as_ref(),
-            v_dev.as_ref(),
+        let q_shape = Shape::new(vec![1, total_tokens, num_head_dims]);
+        let k_shape = Shape::new(vec![1, total_tokens, cfg.num_kv_heads * cfg.head_dim]);
+        let out_shape_3d = Shape::new(vec![total_tokens, cfg.num_heads, cfg.head_dim]);
+        let out_shape_2d = Shape::new(vec![total_tokens, num_head_dims]);
+
+        let (q_rot_s, _) = dev.rope(q.storage().as_ref(), &positions, cfg.head_dim, 10000.0, &q_shape)?;
+        let (k_rot_s, _) = dev.rope(k.storage().as_ref(), &positions, cfg.head_dim, 10000.0, &k_shape)?;
+
+        let q_rot = Tensor::new(
+            std::sync::Arc::from(q_rot_s),
+            q_shape,
+            DType::F32,
+            q.provenance().clone(),
+            q.device().clone(),
+        );
+        let k_rot = Tensor::new(
+            std::sync::Arc::from(k_rot_s),
+            k_shape,
+            DType::F32,
+            k.provenance().clone(),
+            k.device().clone(),
+        );
+
+        let (attn_s, _) = dev.qkv_attention(
+            q_rot.storage().as_ref(),
+            k_rot.storage().as_ref(),
+            v.storage().as_ref(),
             cfg.num_kv_heads,
             total_tokens,
             0,
-            &out_shape,
+            &out_shape_3d,
             None,
             None,
         )?;
 
-        let attn_raw_data = attn_storage.to_cpu_vec_f32()?;
-        let attn_raw = grim_backend_cpu::cpu_tensor(attn_raw_data, grim_tensor::Shape::new(vec![total_tokens, num_head_dims]));
+        let attn_raw = Tensor::new(
+            std::sync::Arc::from(attn_s),
+            out_shape_2d,
+            DType::F32,
+            q.provenance().clone(),
+            q.device().clone(),
+        );
         let attn_raw_id = tape.register(attn_raw.clone());
 
         let wo_base = block.wo.forward(&attn_raw)?;
