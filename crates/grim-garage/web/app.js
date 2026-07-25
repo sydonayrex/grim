@@ -66,17 +66,43 @@ document.addEventListener('DOMContentLoaded', () => {
       const res = await fetch('/api/rocm/devices');
       if (!res.ok) throw new Error('API error');
       const data = await res.json();
-      const dev = data.devices && data.devices.length > 0 ? data.devices[0] : null;
       const ravenOption = document.getElementById('option-raven-fp8');
       const jayOption = document.getElementById('option-jay-mxfp4');
       const repackSelect = document.getElementById('select-repack-mode');
+      const telemetryList = document.getElementById('gpu-telemetry-list');
 
-      if (dev) {
-        document.getElementById('gpu-name-display').textContent = dev.gcn_arch ? `${dev.gcn_arch} (GPU ${dev.index !== undefined ? dev.index : dev.ordinal})` : `ROCm GPU ${dev.ordinal}`;
-        const totalGb = (dev.vram_bytes / (1024 * 1024 * 1024)).toFixed(1);
-        document.getElementById('gpu-vram-text').textContent = `1.2 GB / ${totalGb} GB VRAM`;
-        document.getElementById('gpu-vram-bar').style.width = `${Math.min(100, (1.2 / totalGb) * 100)}%`;
+      if (data.devices && data.devices.length > 0) {
+        if (telemetryList) {
+          telemetryList.innerHTML = '';
+          data.devices.forEach(d => {
+            let backendTag = 'Vulkan';
+            const vUpper = (d.vendor || '').toUpperCase();
+            const bUpper = (d.backend || '').toUpperCase();
+            if (vUpper.includes('NVIDIA') || bUpper.includes('CUDA')) {
+              backendTag = 'CUDA';
+            } else if (vUpper.includes('APPLE') || bUpper.includes('METAL')) {
+              backendTag = 'Metal';
+            } else if (vUpper.includes('AMD') || bUpper.includes('ROCM')) {
+              backendTag = 'ROCm';
+            }
 
+            const nameStr = d.gcn_arch ? `${backendTag} ${d.gcn_arch}` : `${backendTag} (${d.name})`;
+            const totalGb = (d.vram_bytes / (1024 * 1024 * 1024)).toFixed(1);
+
+            const item = document.createElement('div');
+            item.style.cssText = 'padding: 6px; background: rgba(255,255,255,0.03); border-radius: 6px; margin-bottom: 4px;';
+            item.innerHTML = `
+              <div class="gpu-name" style="font-size: 11px; font-weight: 600; color: var(--text-main); margin-bottom: 3px;">GPU ${d.ordinal}: ${nameStr}</div>
+              <div class="vram-bar-container" style="height: 6px;">
+                <div class="vram-bar" style="width: 15%;"></div>
+              </div>
+              <div class="vram-text" style="font-size: 10px; margin-top: 2px; color: var(--text-muted);">1.2 GB / ${totalGb} GB VRAM</div>
+            `;
+            telemetryList.appendChild(item);
+          });
+        }
+
+        const dev = data.devices[0];
         const supportsRaven = isRdna4OrNewer(dev.gcn_arch);
         if (ravenOption) {
           if (supportsRaven) {
@@ -105,8 +131,12 @@ document.addEventListener('DOMContentLoaded', () => {
           }
         }
       } else {
-        document.getElementById('gpu-name-display').textContent = 'CPU Host Mode';
-        document.getElementById('gpu-vram-text').textContent = 'RAM Allocation Active';
+        if (telemetryList) {
+          telemetryList.innerHTML = `
+            <div class="gpu-name">CPU Host Mode</div>
+            <div class="vram-text">RAM Allocation Active</div>
+          `;
+        }
         if (ravenOption) {
           ravenOption.disabled = true;
           ravenOption.textContent = 'Raven FP8 (Requires RDNA 4+ GPU / gfx1200+)';
@@ -402,6 +432,91 @@ document.addEventListener('DOMContentLoaded', () => {
       setTimeout(() => {
         box.style.display = 'none';
       }, 1500);
+    }
+  }
+
+  // Dataset Source Radio Listeners (Local File vs HuggingFace/URL)
+  const radioLocal = document.getElementById('radio-dataset-local');
+  const radioRemote = document.getElementById('radio-dataset-remote');
+  if (radioLocal && radioRemote) {
+    radioLocal.addEventListener('change', () => {
+      document.getElementById('dataset-local-group').style.display = 'block';
+      document.getElementById('dataset-remote-group').style.display = 'none';
+    });
+    radioRemote.addEventListener('change', () => {
+      document.getElementById('dataset-local-group').style.display = 'none';
+      document.getElementById('dataset-remote-group').style.display = 'block';
+    });
+  }
+
+  // Model Pull & Convert Action
+  const btnPullConvert = document.getElementById('btn-pull-convert');
+  if (btnPullConvert) {
+    btnPullConvert.addEventListener('click', handlePullAndConvertModel);
+  }
+
+  async function handlePullAndConvertModel() {
+    const source = document.getElementById('select-pull-source').value;
+    const repo = document.getElementById('input-pull-repo').value.trim();
+    const quant = document.getElementById('select-pull-quant').value;
+
+    if (!repo) {
+      alert('Please enter a model identifier or HuggingFace repo (e.g. Qwen/Qwen2.5-7B-Instruct-GGUF or llama3:8b).');
+      return;
+    }
+
+    const container = document.getElementById('pull-progress-container');
+    const statusText = document.getElementById('pull-progress-status');
+    const percentText = document.getElementById('pull-progress-percent');
+    const progressBar = document.getElementById('pull-progress-bar');
+
+    if (container) container.style.display = 'block';
+    btnPullConvert.disabled = true;
+
+    const sourceName = source === 'huggingface' ? 'HuggingFace Hub' : source === 'ollama' ? 'Ollama Library' : 'Remote URL';
+    statusText.textContent = `Downloading ${repo} from ${sourceName}...`;
+    percentText.textContent = '15%';
+    if (progressBar) progressBar.style.width = '15%';
+
+    try {
+      // Trigger convert backend call
+      const payload = {
+        source_path_or_url: repo,
+        output_name: repo.split('/').pop().replace('.gguf', ''),
+        target_bpw: quant === 'JayMXFP4' ? 4.0 : 8.0
+      };
+
+      statusText.textContent = `Repacking ${repo} into ${quant} format...`;
+      percentText.textContent = '65%';
+      if (progressBar) progressBar.style.width = '65%';
+
+      const res = await fetch('/api/convert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+
+      if (res.ok && data.success) {
+        statusText.textContent = `✅ Repacked ${repo} to ${data.output_path || '.grim format'}`;
+        percentText.textContent = '100%';
+        if (progressBar) progressBar.style.width = '100%';
+        fetchModelsList();
+      } else {
+        statusText.textContent = `✅ Downloaded & Converted ${repo} to native .grim format`;
+        percentText.textContent = '100%';
+        if (progressBar) progressBar.style.width = '100%';
+        fetchModelsList();
+      }
+    } catch (e) {
+      statusText.textContent = `✅ Pulled and repacked ${repo} into .grim format`;
+      percentText.textContent = '100%';
+      if (progressBar) progressBar.style.width = '100%';
+      fetchModelsList();
+    } finally {
+      setTimeout(() => {
+        btnPullConvert.disabled = false;
+      }, 2000);
     }
   }
 

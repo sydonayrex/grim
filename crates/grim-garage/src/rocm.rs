@@ -308,10 +308,10 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
                     }
                     
                     if raw_name.contains("NVIDIA") {
-                        if devices.iter().any(|d| d.vendor == "NVIDIA") {
+                        let clean_name = extract_clean_gpu_name(&raw_name);
+                        if devices.iter().any(|d| d.name.eq_ignore_ascii_case(&clean_name)) {
                             continue;
                         }
-                        let clean_name = extract_clean_gpu_name(&raw_name);
                         let arch = detect_nvidia_arch(&clean_name);
                         devices.push(RocmDeviceInfo {
                             ordinal,
@@ -330,10 +330,10 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
                         });
                         ordinal += 1;
                     } else if raw_name.contains("AMD") || raw_name.contains("Advanced Micro Devices") {
-                        if devices.iter().any(|d| d.vendor == "AMD") {
+                        let clean_name = extract_clean_gpu_name(&raw_name);
+                        if devices.iter().any(|d| d.name.eq_ignore_ascii_case(&clean_name)) {
                             continue;
                         }
-                        let clean_name = extract_clean_gpu_name(&raw_name);
                         let arch = detect_amd_arch("", &clean_name);
                         devices.push(RocmDeviceInfo {
                             ordinal,
