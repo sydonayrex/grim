@@ -20,3 +20,7 @@ default = ["cuda-mem", "rocm-mem", "metal-mem"]
 cuda-mem = []
 rocm-mem = []
 metal-mem = []
+
+[dev-dependencies]
+grim-quant = { workspace = true }
+

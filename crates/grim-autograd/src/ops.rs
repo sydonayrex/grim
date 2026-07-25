@@ -3,7 +3,7 @@
 //! Provides reverse-mode backward implementations for MatMul, Add, Scale, and fused LoRA application.
 
 use grim_tensor::dtype::{BlockDtype, FloatPackScheme, KQuantScheme};
-use grim_tensor::{DType, Storage, Tensor, error::Result};
+use grim_tensor::{DType, Storage, Tensor, Error, error::Result};
 use std::sync::Arc;
 
 /// Arguments for MatMul backward evaluation.
@@ -52,6 +52,8 @@ fn bpw_from_dtype(dtype: &DType) -> u8 {
             FloatPackScheme::Fp4 => 4,
             FloatPackScheme::Nf4 => 4,
             FloatPackScheme::Fp8 => 8,
+            FloatPackScheme::MxFp4 => 4,
+            FloatPackScheme::MxFp8 => 8,
         },
         Storage::GroupInt(cfg) => cfg.bits,
         Storage::Native => 32,
@@ -65,8 +67,14 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
     let dev = crate::pick_device_for_tensor(&args.out_grad);
     let (a_dims, b_dims) = (args.a.shape().dims(), args.b.shape().dims());
 
-    let (m, k) = if args.transpose_a { (a_dims[1], a_dims[0]) } else { (a_dims[0], a_dims[1]) };
-    let (_, n) = if args.transpose_b { (b_dims[1], b_dims[0]) } else { (b_dims[0], b_dims[1]) };
+    let (m, k) = match a_dims.len() {
+        1 => (1, a_dims[0]),
+        _ => if args.transpose_a { (a_dims[1], a_dims[0]) } else { (a_dims[0], a_dims[1]) },
+    };
+    let (_, n) = match b_dims.len() {
+        1 => (b_dims[0], 1),
+        _ => if args.transpose_b { (b_dims[1], b_dims[0]) } else { (b_dims[0], b_dims[1]) },
+    };
 
     // Try GPU / ROCm fused backward dispatch when available and b is quantized.
     if !args.transpose_a && !args.transpose_b {
@@ -78,11 +86,12 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
 
         if b_quantized && b_on_rocm {
             let bpw = bpw_from_dtype(&args.b.dtype());
+            let empty_scales: [f32; 0] = [];
             let residuals: Option<grim_tensor::QuantizedMatmulBackwardResiduals> = None;
             if let Ok((grad_a_storage, _handle)) = dev.quantized_matmul_backward_dx(
                 args.out_grad.storage().as_ref(),
                 args.b.storage().as_ref(),
-                &[],
+                &empty_scales,
                 bpw,
                 m,
                 n,
@@ -98,19 +107,7 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
                     args.a.device().clone(),
                 );
 
-                let a_vec = args.a.to_vec_f32()?;
-                let g_vec = args.out_grad.to_vec_f32()?;
-                let mut db_vec = vec![0.0f32; b_dims[0] * b_dims[1]];
-                for i in 0..k {
-                    for j in 0..n {
-                        let mut sum = 0.0f32;
-                        for l in 0..m {
-                            sum += a_vec[l * k + i] * g_vec[l * n + j];
-                        }
-                        db_vec[i * n + j] = sum;
-                    }
-                }
-                let storage_b = dev.from_cpu(&db_vec, args.b.shape(), DType::F32)?;
+                let (storage_b, _) = dev.matmul(args.a.storage().as_ref(), args.out_grad.storage().as_ref(), args.b.shape())?;
                 let grad_b = Tensor::new(
                     Arc::from(storage_b),
                     args.b.shape().clone(),
@@ -197,10 +194,8 @@ pub fn add_backward(args: &AddArgs) -> Result<(Tensor, Tensor)> {
 /// Returns `grad_input = out_grad * factor`.
 pub fn scale_backward(args: &ScaleArgs) -> Result<Tensor> {
     let dev = crate::pick_device_for_tensor(&args.input_grad);
-    let g_vec = args.input_grad.to_vec_f32()?;
-    let scaled_vec: Vec<f32> = g_vec.iter().map(|&v| v * args.factor).collect();
-
-    let storage = dev.from_cpu(&scaled_vec, args.input_grad.shape(), DType::F32)?;
+    let scale_buf = dev.from_cpu(&vec![args.factor; args.input_grad.shape().elem_count()], args.input_grad.shape(), DType::F32)?;
+    let (storage, _) = dev.mul(args.input_grad.storage().as_ref(), scale_buf.as_ref(), args.input_grad.shape())?;
     Ok(Tensor::new(
         Arc::from(storage),
         args.input_grad.shape().clone(),
@@ -231,8 +226,8 @@ pub fn lora_backward(
     let a_dims = a.shape().dims();
     let b_dims = b.shape().dims();
 
-    let batch = x_dims[0];
-    let in_features = x_dims[1];
+    let batch = if x_dims.len() == 1 { 1 } else { x_dims[0] };
+    let in_features = if x_dims.len() == 1 { x_dims[0] } else { x_dims[1] };
     let rank = a_dims[0];
     let out_features = b_dims[0];
 
@@ -315,6 +310,73 @@ pub fn lora_backward(
     );
 
     Ok((grad_base, grad_x, grad_a, grad_b))
+}
+
+/// Apply a LoRA adapter to a linear projection output during forward pass and record the operation on `tape`.
+///
+/// If a LoRA adapter is registered and enabled for `(layer_idx, point)` in `autograd_reg`,
+/// this function computes `output = base + scale * (x @ A^T) @ B^T`, registers trainable parameters `A` and `B`
+/// on `tape`, and records a `LoRAApply` tape entry. Returns `(output_tensor_id, output_tensor)`.
+/// If no adapter is enabled at this point, returns `(base_id, base)`.
+pub fn apply_and_record_lora(
+    autograd_reg: &crate::registry::AutogradRegistry,
+    tape: &mut crate::tape::Tape,
+    layer_idx: usize,
+    point: crate::injection::LoRAInjectionPoint,
+    base: Tensor,
+    base_id: crate::tape::TensorId,
+    x: Tensor,
+    x_id: crate::tape::TensorId,
+) -> Result<(crate::tape::TensorId, Tensor)> {
+    if let Some(cfg) = autograd_reg.injection_registry.get(layer_idx, point) {
+        if cfg.enabled {
+            let param_a = autograd_reg
+                .params
+                .get(cfg.param_id_a())
+                .ok_or_else(|| Error::Backend(format!("missing param a for layer {layer_idx} {point:?}")))?;
+            let param_b = autograd_reg
+                .params
+                .get(cfg.param_id_b())
+                .ok_or_else(|| Error::Backend(format!("missing param b for layer {layer_idx} {point:?}")))?;
+
+            let a_id = tape.register_param(cfg.param_id_a(), param_a.data.clone());
+            let b_id = tape.register_param(cfg.param_id_b(), param_b.data.clone());
+
+            let scale = cfg.scale();
+            let dev = crate::pick_device_for_tensor(&base);
+            let (out_storage, handle) = dev.lora_accumulate(
+                base.storage().as_ref(),
+                x.storage().as_ref(),
+                param_a.data.storage().as_ref(),
+                param_b.data.storage().as_ref(),
+                scale,
+                base.shape(),
+            )?;
+            handle.synchronize()?;
+
+            let out_tensor = Tensor::new(
+                std::sync::Arc::from(out_storage),
+                base.shape().clone(),
+                grim_tensor::dtype::DType::F32,
+                base.provenance().clone(),
+                base.device().clone(),
+            );
+
+            let out_id = tape.record_lora_apply(
+                base_id,
+                x_id,
+                a_id,
+                b_id,
+                out_tensor.clone(),
+                cfg.alpha,
+                cfg.rank,
+                cfg.param_id_a(),
+                cfg.param_id_b(),
+            );
+            return Ok((out_id, out_tensor));
+        }
+    }
+    Ok((base_id, base))
 }
 
 #[cfg(test)]

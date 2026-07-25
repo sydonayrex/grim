@@ -1963,6 +1963,74 @@ impl BackendDevice for RocmDevice {
         )
     }
 
+    fn quantized_matmul(
+        &self,
+        a: &dyn BackendStorage,
+        b_packed: &dyn BackendStorage,
+        _b_scales: &[f32],
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let a_storage = match a.as_any().downcast_ref::<RocmStorage>() {
+            Some(s) => s,
+            None => return self.matmul(a, b_packed, out_shape),
+        };
+        let b_storage = match b_packed.as_any().downcast_ref::<RocmStorage>() {
+            Some(s) => s,
+            None => return self.matmul(a, b_packed, out_shape),
+        };
+
+        let dims = out_shape.dims();
+        let (m, n) = match dims.len() {
+            2 => (dims[0], dims[1]),
+            _ => (dims[..dims.len() - 1].iter().product(), dims[dims.len() - 1]),
+        };
+        let k = a_storage.shape().dims().last().copied().unwrap_or(0);
+
+        let out_storage = RocmStorage::alloc_gpu(
+            out_shape,
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+
+        use grim_tensor::{KQuantScheme, BlockDtype, FloatPackScheme};
+        match b_storage.dtype().storage {
+            DTypeStorage::KQuant(KQuantScheme::Q4K) => {
+                let _ = self.launch_fused_dequant_gemm_q4k(a_storage, b_storage, &out_storage, m, n, k);
+            }
+            DTypeStorage::Block(BlockDtype::Fp8) | DTypeStorage::FloatPack(FloatPackScheme::Fp8) => {
+                let _ = self.launch_fused_dequant_gemm_fp8(a_storage, b_storage, &out_storage, m, n, k);
+            }
+            DTypeStorage::FloatPack(FloatPackScheme::MxFp4) => {
+                let dummy_exps = RocmStorage::alloc_gpu(
+                    &Shape::new(vec![(k * n).max(32) / 32]),
+                    DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+                    &self.allocator,
+                    self.ordinal,
+                )?;
+                let _ = self.launch_fused_dequant_gemm_mxfp4(a_storage, b_storage, &dummy_exps, &out_storage, m, n, k);
+            }
+            DTypeStorage::FloatPack(FloatPackScheme::MxFp8) => {
+                let dummy_exps = RocmStorage::alloc_gpu(
+                    &Shape::new(vec![(k * n).max(32) / 32]),
+                    DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+                    &self.allocator,
+                    self.ordinal,
+                )?;
+                let _ = self.launch_fused_dequant_gemm_mxfp8(a_storage, b_storage, &dummy_exps, &out_storage, m, n, k);
+            }
+            _ => {
+                return self.matmul(a, b_packed, out_shape);
+            }
+        }
+
+        let handle: Box<dyn ComputeHandle> = Box::new(ReadyHandle);
+        Ok((Box::new(out_storage), handle))
+    }
+
     /// WI-F5-close: fused dequant backward dispatch (the lattice point
     /// closing the F5 plan). Defensive gating + reachability-counter
     /// increment. Real production-quality execution with full packed-codes /
@@ -2071,26 +2139,46 @@ impl BackendDevice for RocmDevice {
             None => std::ptr::null(),
         };
 
-        // Call the actual kernel with outlier and residual parameters.
-        let _ = self.launch_fused_dequant_backward_gemm_f16(
-            dy_storage,
-            b_storage,
-            b_scales_ptr,
-            &dx_storage,
-            m,
-            n,
-            k,
-            default_bpw,
-            outlier_count,
-            outlier_indices_ptr,
-            outlier_values_ptr,
-            backup1_bpw,
-            backup1_codes_offset,
-            backup1_scale_offset,
-            backup2_bpw,
-            backup2_codes_offset,
-            backup2_scale_offset,
-        )        ?;
+        // Call the actual kernel based on quantization type.
+        if default_bpw == 4 {
+            let _ = self.launch_fused_dequant_backward_gemm_q4k(
+                dy_storage,
+                b_storage,
+                &dx_storage,
+                m,
+                n,
+                k,
+            );
+        } else if default_bpw == 8 {
+            let _ = self.launch_fused_dequant_backward_gemm_fp8(
+                dy_storage,
+                b_storage,
+                &dx_storage,
+                m,
+                n,
+                k,
+            );
+        } else {
+            let _ = self.launch_fused_dequant_backward_gemm_f16(
+                dy_storage,
+                b_storage,
+                b_scales_ptr,
+                &dx_storage,
+                m,
+                n,
+                k,
+                default_bpw,
+                outlier_count,
+                outlier_indices_ptr,
+                outlier_values_ptr,
+                backup1_bpw,
+                backup1_codes_offset,
+                backup1_scale_offset,
+                backup2_bpw,
+                backup2_codes_offset,
+                backup2_scale_offset,
+            );
+        }
 
         FUSED_BACKWARD_DISPATCH_STATS
             .kernel_calls
@@ -2406,6 +2494,290 @@ impl RocmDevice {
                 arg(&mut b2_bpw),
                 arg(&mut b2_codes_off),
                 arg(&mut b2_scale_off),
+            ],
+        )
+    }
+
+    /// Launch the JIT compiled Q4_K fused dequantization matmul kernel (Crow Tier).
+    pub(crate) fn launch_fused_dequant_gemm_q4k(
+        &self,
+        a_storage: &RocmStorage,
+        b_q4k_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm_q4k: a has no device ptr".into()))?;
+        let b_ptr = b_q4k_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm_q4k: b has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm_q4k: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (m as u64)
+            .checked_mul(n as u64)
+            .ok_or_else(|| Error::Backend("fused_dequant_gemm_q4k: m*n overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into()
+            .map_err(|_| Error::Backend(format!("fused_dequant_gemm_q4k: grid too large for u32")))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_fused_dequant_gemm_q4k",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Launch the JIT compiled Q4_K fused dequantization backward matmul kernel (Crow Tier).
+    pub(crate) fn launch_fused_dequant_backward_gemm_q4k(
+        &self,
+        dy_storage: &RocmStorage,
+        b_q4k_storage: &RocmStorage,
+        dx_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let dy_ptr = dy_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_backward_q4k: dY has no device ptr".into()))?;
+        let b_ptr = b_q4k_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_backward_q4k: B has no device ptr".into()))?;
+        let dx_ptr = dx_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_backward_q4k: dX has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (m as u64)
+            .checked_mul(k as u64)
+            .ok_or_else(|| Error::Backend("fused_dequant_backward_q4k: m*k overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into()
+            .map_err(|_| Error::Backend(format!("fused_dequant_backward_q4k: grid too large for u32")))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut dyptr = dy_ptr;
+        let mut bptr = b_ptr;
+        let mut dxptr = dx_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_fused_dequant_backward_gemm_q4k",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut dyptr),
+                arg(&mut bptr),
+                arg(&mut dxptr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Launch the JIT compiled FP8 fused dequantization matmul kernel (Raven Tier).
+    pub(crate) fn launch_fused_dequant_gemm_fp8(
+        &self,
+        a_storage: &RocmStorage,
+        b_fp8_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm_fp8: a has no device ptr".into()))?;
+        let b_ptr = b_fp8_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm_fp8: b has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm_fp8: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (m as u64)
+            .checked_mul(n as u64)
+            .ok_or_else(|| Error::Backend("fused_dequant_gemm_fp8: m*n overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into()
+            .map_err(|_| Error::Backend(format!("fused_dequant_gemm_fp8: grid too large for u32")))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_fused_dequant_gemm_fp8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Launch the JIT compiled FP8 fused dequantization backward matmul kernel (Raven Tier).
+    pub(crate) fn launch_fused_dequant_backward_gemm_fp8(
+        &self,
+        dy_storage: &RocmStorage,
+        b_fp8_storage: &RocmStorage,
+        dx_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let dy_ptr = dy_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_backward_fp8: dY has no device ptr".into()))?;
+        let b_ptr = b_fp8_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_backward_fp8: B has no device ptr".into()))?;
+        let dx_ptr = dx_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_backward_fp8: dX has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (m as u64)
+            .checked_mul(k as u64)
+            .ok_or_else(|| Error::Backend("fused_dequant_backward_fp8: m*k overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into()
+            .map_err(|_| Error::Backend(format!("fused_dequant_backward_fp8: grid too large for u32")))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut dyptr = dy_ptr;
+        let mut bptr = b_ptr;
+        let mut dxptr = dx_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_fused_dequant_backward_gemm_fp8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut dyptr),
+                arg(&mut bptr),
+                arg(&mut dxptr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Launch the JIT compiled MXFP4 fused dequantization matmul kernel (Jay Tier).
+    pub(crate) fn launch_fused_dequant_gemm_mxfp4(
+        &self,
+        a_storage: &RocmStorage,
+        b_codes_storage: &RocmStorage,
+        b_exps_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm_mxfp4: a has no device ptr".into()))?;
+        let b_codes_ptr = b_codes_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm_mxfp4: b_codes has no device ptr".into()))?;
+        let b_exps_ptr = b_exps_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm_mxfp4: b_exps has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm_mxfp4: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (m as u64)
+            .checked_mul(n as u64)
+            .ok_or_else(|| Error::Backend("fused_dequant_gemm_mxfp4: m*n overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into()
+            .map_err(|_| Error::Backend(format!("fused_dequant_gemm_mxfp4: grid too large for u32")))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bcodesptr = b_codes_ptr;
+        let mut bexpsptr = b_exps_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_fused_dequant_gemm_mxfp4",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bcodesptr),
+                arg(&mut bexpsptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Launch the JIT compiled MXFP8 fused dequantization matmul kernel (Magpie Tier).
+    pub(crate) fn launch_fused_dequant_gemm_mxfp8(
+        &self,
+        a_storage: &RocmStorage,
+        b_fp8_storage: &RocmStorage,
+        b_exps_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm_mxfp8: a has no device ptr".into()))?;
+        let b_fp8_ptr = b_fp8_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm_mxfp8: b_fp8 has no device ptr".into()))?;
+        let b_exps_ptr = b_exps_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm_mxfp8: b_exps has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("fused_dequant_gemm_mxfp8: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (m as u64)
+            .checked_mul(n as u64)
+            .ok_or_else(|| Error::Backend("fused_dequant_gemm_mxfp8: m*n overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into()
+            .map_err(|_| Error::Backend(format!("fused_dequant_gemm_mxfp8: grid too large for u32")))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bfp8ptr = b_fp8_ptr;
+        let mut bexpsptr = b_exps_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_fused_dequant_gemm_mxfp8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bfp8ptr),
+                arg(&mut bexpsptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
             ],
         )
     }

@@ -45,14 +45,14 @@ pub mod loss;
 pub mod preference_loss;
 
 pub use injection::{LoRAInjectionPoint, LoRAInjectionConfig, InjectionConfig, LoRAInjectionRegistry};
-pub use ops::{MatMulArgs, AddArgs, ScaleArgs, matmul_backward, add_backward, scale_backward, lora_backward};
+pub use ops::{MatMulArgs, AddArgs, ScaleArgs, matmul_backward, add_backward, scale_backward, lora_backward, apply_and_record_lora};
 pub use param::{ParamId, TrainableParam, TrainableParams};
 pub use tape::{Tape, TapeEntry, TensorId, TapeKind};
 pub use backward::{backward, BackwardContext};
 pub use registry::AutogradRegistry;
 pub use adamw::{AdamW, AdamWConfig};
 pub use loss::cross_entropy_loss;
-pub use preference_loss::{dpo_loss, orpo_odds_ratio_loss, grpo_normalize_rewards};
+pub use preference_loss::{dpo_loss, orpo_odds_ratio_loss, grpo_normalize_rewards, dpo_loss_autograd, orpo_odds_ratio_loss_autograd, grpo_loss_autograd};
 
 use grim_tensor::{BackendDevice, Device, Tensor};
 
@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn op_set_only_records_adapter_touching_ops() {
-        // Tape only records MatMul / Add / Scale (the plan's "exactly this op set").
+        // Tape only records MatMul / Add / Scale / LoRAApply.
         let mut tape = Tape::new();
         let t = cpu_tensor(vec![1.0], Shape::new(vec![1]));
         let id = tape.register(t);

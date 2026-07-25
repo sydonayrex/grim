@@ -45,7 +45,9 @@ pub fn cmd_verify(path: &str) -> Result<()> {
     if !report.magic_ok {
         report.errors.push("Invalid magic bytes — not a .grim file".to_string());
         print_report(&report);
-        return Ok(());
+        return Err(Error::Backend(
+            "Verification failed: invalid magic bytes — not a .grim file".into()
+        ));
     }
 
     // 2. Read and validate metadata
