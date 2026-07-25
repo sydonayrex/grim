@@ -236,15 +236,30 @@ document.addEventListener('DOMContentLoaded', () => {
       const res = await fetch('/api/models');
       const data = await res.json();
       const select = document.getElementById('select-model');
-      select.innerHTML = '<option value="">Select a base model...</option>';
+      const chatSelect = document.getElementById('select-chat-model');
+
+      if (select) select.innerHTML = '<option value="">Select a base model...</option>';
+      if (chatSelect) chatSelect.innerHTML = '<option value="">Select a model checkpoint (.grim / .gguf)...</option>';
+
       if (data.models) {
         data.models.forEach(m => {
-          const opt = document.createElement('option');
-          opt.value = m.path;
           const displayName = m.name || m.id || (m.path ? m.path.split('/').pop() : 'model');
           const sizeText = m.size_bytes && m.size_bytes > 0 ? ` (${(m.size_bytes / (1024*1024*1024)).toFixed(1)} GB)` : '';
-          opt.textContent = `${displayName}${sizeText}`;
-          select.appendChild(opt);
+          const formatTag = m.format ? ` [${m.format.toUpperCase()}]` : '';
+
+          if (select) {
+            const opt = document.createElement('option');
+            opt.value = m.path;
+            opt.textContent = `${displayName}${sizeText}`;
+            select.appendChild(opt);
+          }
+
+          if (chatSelect) {
+            const cOpt = document.createElement('option');
+            cOpt.value = m.path;
+            cOpt.textContent = `${displayName}${formatTag}${sizeText}`;
+            chatSelect.appendChild(cOpt);
+          }
         });
       }
     } catch (e) {
@@ -551,6 +566,88 @@ document.addEventListener('DOMContentLoaded', () => {
       if (msg) {
         msg.style.display = 'inline';
         setTimeout(() => { msg.style.display = 'none'; }, 2500);
+      }
+    });
+  }
+
+  // ─── Chat Playground Event Handlers ─────────────────────────────────────
+  const tempSlider = document.getElementById('input-chat-temp');
+  const tempVal = document.getElementById('val-chat-temp');
+  if (tempSlider && tempVal) {
+    tempSlider.addEventListener('input', () => {
+      tempVal.textContent = tempSlider.value;
+    });
+  }
+
+  const btnClearChat = document.getElementById('btn-clear-chat');
+  const chatContainer = document.getElementById('chat-messages-container');
+  if (btnClearChat && chatContainer) {
+    btnClearChat.addEventListener('click', () => {
+      chatContainer.innerHTML = `
+        <div style="align-self: center; background: rgba(255,255,255,0.05); padding: 8px 16px; border-radius: 20px; font-size: 12px; color: var(--text-muted); text-align: center;">
+          Select a model checkpoint (.grim / .gguf) and type a prompt to verify language & reasoning output.
+        </div>
+      `;
+    });
+  }
+
+  const formChatSend = document.getElementById('form-chat-send');
+  if (formChatSend) {
+    formChatSend.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const modelSelect = document.getElementById('select-chat-model');
+      const promptInput = document.getElementById('input-chat-prompt');
+      const sendBtn = document.getElementById('btn-chat-send');
+
+      const modelId = modelSelect ? modelSelect.value : '';
+      const prompt = promptInput ? promptInput.value.trim() : '';
+
+      if (!modelId) {
+        alert('Please select a model checkpoint (.grim or .gguf) to test.');
+        return;
+      }
+      if (!prompt) return;
+
+      // 1. Append User Message Bubble
+      const userBubble = document.createElement('div');
+      userBubble.style.cssText = 'align-self: flex-end; max-width: 80%; background: linear-gradient(135deg, #3b82f6, #6366f1); color: #ffffff; padding: 10px 14px; border-radius: 14px 14px 2px 14px; font-size: 13px; line-height: 1.4; word-break: break-word; box-shadow: 0 2px 8px rgba(0,0,0,0.2);';
+      userBubble.textContent = prompt;
+      chatContainer.appendChild(userBubble);
+      promptInput.value = '';
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+
+      // 2. Append Loading Assistant Bubble
+      const assistantBubble = document.createElement('div');
+      assistantBubble.style.cssText = 'align-self: flex-start; max-width: 85%; background: rgba(30, 41, 59, 0.8); border: 1px solid var(--border-card); color: var(--text-main); padding: 12px 16px; border-radius: 14px 14px 14px 2px; font-size: 13px; line-height: 1.5; word-break: break-word; font-family: monospace;';
+      assistantBubble.innerHTML = '<span style="color: var(--primary-color);">⚡ Generating model response...</span>';
+      chatContainer.appendChild(assistantBubble);
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+
+      if (sendBtn) sendBtn.disabled = true;
+
+      try {
+        const temp = tempSlider ? parseFloat(tempSlider.value) : 0.7;
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model_id: modelId, prompt: prompt, temperature: temp })
+        });
+        const data = await res.json();
+
+        if (res.ok && data.reply) {
+          const modelName = modelId.split('/').pop().split('\\').pop();
+          assistantBubble.innerHTML = `
+            <div style="font-size: 10px; font-weight: 700; color: var(--primary-color); margin-bottom: 6px; text-transform: uppercase;">🤖 ${modelName} (${data.tokens_generated} tokens | ${data.latency_ms}ms)</div>
+            <div style="white-space: pre-wrap; font-family: inherit;">${data.reply}</div>
+          `;
+        } else {
+          assistantBubble.innerHTML = `<span style="color: var(--danger-color);">⚠️ Error: ${data.error || 'Failed to generate response'}</span>`;
+        }
+      } catch (err) {
+        assistantBubble.innerHTML = `<span style="color: var(--danger-color);">⚠️ Failed to connect to chat API</span>`;
+      } finally {
+        if (sendBtn) sendBtn.disabled = false;
+        chatContainer.scrollTop = chatContainer.scrollHeight;
       }
     });
   }
