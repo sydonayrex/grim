@@ -38,6 +38,17 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('select-dataset').addEventListener('change', generateAutotuneRecommendation);
   document.getElementById('btn-apply-autotune').addEventListener('click', applyAutotunePreset);
 
+  function isRdna4OrNewer(gcnArch) {
+    if (!gcnArch) return false;
+    const match = gcnArch.toLowerCase().match(/gfx(\d+)/);
+    if (match && match[1]) {
+      const num = parseInt(match[1], 10);
+      // RDNA 4 (gfx1200-gfx1201) and RDNA 5+ (gfx1300-gfx1310)
+      return num >= 1200;
+    }
+    return false;
+  }
+
   // ─── API Functions ────────────────────────────────────────────────────────
   async function fetchGpuTelemetry() {
     try {
@@ -45,14 +56,38 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!res.ok) throw new Error('API error');
       const data = await res.json();
       const dev = data.devices && data.devices.length > 0 ? data.devices[0] : null;
+      const ravenOption = document.getElementById('option-raven-fp8');
+      const repackSelect = document.getElementById('select-repack-mode');
+
       if (dev) {
         document.getElementById('gpu-name-display').textContent = dev.gcn_arch ? `${dev.gcn_arch} (GPU ${dev.index})` : `ROCm GPU ${dev.index}`;
         const totalGb = (dev.vram_bytes / (1024 * 1024 * 1024)).toFixed(1);
         document.getElementById('gpu-vram-text').textContent = `1.2 GB / ${totalGb} GB VRAM`;
         document.getElementById('gpu-vram-bar').style.width = `${Math.min(100, (1.2 / totalGb) * 100)}%`;
+
+        const supportsRaven = isRdna4OrNewer(dev.gcn_arch);
+        if (ravenOption) {
+          if (supportsRaven) {
+            ravenOption.disabled = false;
+            ravenOption.textContent = `Raven FP8 (E4M3 - ${dev.gcn_arch} HW Accelerated)`;
+          } else {
+            ravenOption.disabled = true;
+            ravenOption.textContent = `Raven FP8 (Requires RDNA 4+ / gfx1200+, detected ${dev.gcn_arch})`;
+            if (repackSelect && repackSelect.value === 'RavenFP8') {
+              repackSelect.value = 'CrowQ4K';
+            }
+          }
+        }
       } else {
         document.getElementById('gpu-name-display').textContent = 'CPU Host Mode';
         document.getElementById('gpu-vram-text').textContent = 'RAM Allocation Active';
+        if (ravenOption) {
+          ravenOption.disabled = true;
+          ravenOption.textContent = 'Raven FP8 (Requires RDNA 4+ GPU / gfx1200+)';
+          if (repackSelect && repackSelect.value === 'RavenFP8') {
+            repackSelect.value = 'CrowQ4K';
+          }
+        }
       }
     } catch (e) {
       console.warn('GPU Probe failed:', e);
