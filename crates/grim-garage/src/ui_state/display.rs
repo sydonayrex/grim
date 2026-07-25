@@ -123,6 +123,7 @@ mod tests {
             is_rocm_compliant: true,
             gcn_arch: "gfx1100".into(),
             vram_bytes: 16 * 1024 * 1024 * 1024,
+            vram_used_bytes: 1024 * 1024 * 1024,
             wavefront_size: 32,
             wmma_supported: true,
             mfma_supported: false,
