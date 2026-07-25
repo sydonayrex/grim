@@ -444,6 +444,19 @@ enum OxidizerCommands {
         #[arg(long)]
         dataset: Option<String>,
     },
+    /// Raven FP8/MXFP4 repack pipeline: rewrite model tensors into FP8 format.
+    Raven {
+        /// Path to input GGUF model.
+        model: String,
+        /// Path for output .grim file.
+        output: String,
+        /// Target bits-per-weight.
+        #[arg(long, default_value = "8.0")]
+        target_bpw: Option<f32>,
+        /// Optional calibration dataset path.
+        #[arg(long)]
+        dataset: Option<String>,
+    },
     /// Prepare a training-capable `.grim` artifact from a base checkpoint.
     Prepare {
         /// Path to input GGUF or `.grim` file.
@@ -959,6 +972,12 @@ async fn main() -> Result<()> {
                         profile.as_deref(), dataset,
                     ) {
                         eprintln!("oxidizer convert failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                OxidizerCommands::Raven { model, output, target_bpw, dataset } => {
+                    if let Err(e) = oxidizer::cmd_oxidizer_raven(&model, &output, target_bpw.unwrap_or(8.0), dataset.as_deref()) {
+                        eprintln!("oxidizer raven failed: {e}");
                         std::process::exit(1);
                     }
                 }

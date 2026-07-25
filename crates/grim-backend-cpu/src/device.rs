@@ -134,6 +134,70 @@ impl BackendDevice for CpuDevice {
         ))
     }
 
+    fn mul_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x = a_storage(x)?;
+        if x.shape() != out_shape {
+            return Err(Error::Shape("mul_scalar: shape mismatch".into()));
+        }
+        let n = out_shape.elem_count();
+        let mut out = vec![0.0f32; n];
+        let xd = x.data();
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = xd[i] * scalar;
+        }
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
+    fn sqrt(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x = a_storage(x)?;
+        if x.shape() != out_shape {
+            return Err(Error::Shape("sqrt: shape mismatch".into()));
+        }
+        let n = out_shape.elem_count();
+        let mut out = vec![0.0f32; n];
+        let xd = x.data();
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = xd[i].sqrt();
+        }
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
+    fn recip(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x = a_storage(x)?;
+        if x.shape() != out_shape {
+            return Err(Error::Shape("recip: shape mismatch".into()));
+        }
+        let n = out_shape.elem_count();
+        let mut out = vec![0.0f32; n];
+        let xd = x.data();
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = 1.0 / xd[i];
+        }
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
     fn silu_mul(
         &self,
         gate: &dyn BackendStorage,
@@ -278,6 +342,91 @@ impl BackendDevice for CpuDevice {
         }
         Ok((
             Box::new(CpuStorage::new(src, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
+    fn qkv_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+        _out_max: Option<&dyn BackendStorage>,
+        _out_sum: Option<&dyn BackendStorage>,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_st = a_storage(q)?;
+        let k_st = a_storage(k)?;
+        let v_st = a_storage(v)?;
+        let q_dims = q_st.shape().dims();
+        let k_dims = k_st.shape().dims();
+        if q_dims.len() != 3 || k_dims.len() != 3 {
+            return Err(Error::Shape("qkv_attention: q/k/v must be 3-D".into()));
+        }
+        let seq_len = q_dims[0];
+        let num_heads = q_dims[1];
+        let head_dim = q_dims[2];
+        if k_dims[2] != head_dim || v_st.shape().dims() != k_dims {
+            return Err(Error::Shape("qkv_attention: k/v shape mismatch with q".into()));
+        }
+        if num_heads % num_kv_heads != 0 {
+            return Err(Error::Shape("qkv_attention: num_heads must be multiple of num_kv_heads".into()));
+        }
+        let out_dims = out_shape.dims();
+        if out_dims.len() != 3 || out_dims[0] != seq_len || out_dims[1] != num_heads || out_dims[2] != head_dim {
+            return Err(Error::Shape("qkv_attention: out_shape mismatch".into()));
+        }
+        let qd = q_st.data();
+        let kd = k_st.data();
+        let vd = v_st.data();
+        let kv_stride = num_kv_heads * head_dim;
+        let num_head_dims = num_heads * head_dim;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut out = vec![0.0f32; seq_len * num_head_dims];
+
+        for h in 0..num_heads {
+            let kvh = (h * num_kv_heads) / num_heads;
+            for t in 0..seq_len {
+                // Causal: for each key t2, compute score if t2 <= cache_offset + t
+                let q_abs = cache_offset as usize + t;
+                let mut scores = vec![0.0f32; kv_seq_len];
+                for t2 in 0..kv_seq_len {
+                    if t2 > q_abs {
+                        scores[t2] = f32::NEG_INFINITY;
+                    } else {
+                        let mut dot = 0.0f32;
+                        for d in 0..head_dim {
+                            dot += qd[t * num_head_dims + h * head_dim + d]
+                                * kd[t2 * kv_stride + kvh * head_dim + d];
+                        }
+                        scores[t2] = dot * scale;
+                    }
+                }
+                // Stable softmax
+                let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in &mut scores {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
+                for s in &mut scores {
+                    *s /= sum;
+                }
+                // Weighted V sum
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for t2 in 0..kv_seq_len {
+                        acc += scores[t2] * vd[t2 * kv_stride + kvh * head_dim + d];
+                    }
+                    out[t * num_head_dims + h * head_dim + d] = acc;
+                }
+            }
+        }
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
             Box::new(ReadyHandle),
         ))
     }
