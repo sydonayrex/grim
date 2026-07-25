@@ -142,11 +142,13 @@ pub fn detect_amd_arch(gcn_arch: &str, marketing_name: &str) -> String {
         format!("{gcn_arch} (CDNA2)")
     } else if arch_lower.starts_with("gfx908") || name_lower.contains("mi100") {
         format!("{gcn_arch} (CDNA1)")
+    } else if arch_lower.starts_with("gfx13") || name_lower.contains("rdna5") {
+        format!("{gcn_arch} (RDNA5)")
     } else if arch_lower.starts_with("gfx12") || name_lower.contains("rx 8000") || name_lower.contains("rdna4") {
         format!("{gcn_arch} (RDNA4)")
     } else if arch_lower.starts_with("gfx11") || name_lower.contains("rx 7900") || name_lower.contains("rx 7800") || name_lower.contains("rx 7700") || name_lower.contains("rx 7600") || name_lower.contains("rdna3") {
         format!("{gcn_arch} (RDNA3)")
-    } else if arch_lower.starts_with("gfx103") || name_lower.contains("610m") || name_lower.contains("rx 6900") || name_lower.contains("rx 6800") || name_lower.contains("rx 6700") || name_lower.contains("rx 6600") || name_lower.contains("raphael") || name_lower.contains("rdna2") {
+    } else if arch_lower.starts_with("gfx103") || name_lower.contains("gfx1036") || name_lower.contains("680m") || name_lower.contains("780m") || name_lower.contains("610m") || name_lower.contains("rx 6900") || name_lower.contains("rx 6800") || name_lower.contains("rx 6700") || name_lower.contains("rx 6600") || name_lower.contains("rembrandt") || name_lower.contains("phoenix") || name_lower.contains("raphael") || name_lower.contains("rdna2") {
         format!("{gcn_arch} (RDNA2)")
     } else if arch_lower.starts_with("gfx101") || name_lower.contains("rx 5700") || name_lower.contains("rx 5600") || name_lower.contains("rdna1") {
         format!("{gcn_arch} (RDNA1)")
@@ -175,7 +177,7 @@ pub fn query_rocminfo_gpus() -> Vec<RocmDeviceInfo> {
 
             for line in text.lines() {
                 let trimmed = line.trim();
-                if trimmed.starts_with("Agent ") && trimmed.ends_with('*') {
+                if trimmed.starts_with("Agent ") {
                     if is_gpu && !name.is_empty() {
                         let full_arch = detect_amd_arch(&name, &marketing_name);
                         let is_w32 = wavefront_size == 32;

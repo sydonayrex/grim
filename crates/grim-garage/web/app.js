@@ -49,6 +49,17 @@ document.addEventListener('DOMContentLoaded', () => {
     return false;
   }
 
+  function isRdna5OrNewer(gcnArch) {
+    if (!gcnArch) return false;
+    const match = gcnArch.toLowerCase().match(/gfx(\d+)/);
+    if (match && match[1]) {
+      const num = parseInt(match[1], 10);
+      // RDNA 5+ ONLY (gfx1300-gfx1310)
+      return num >= 1300;
+    }
+    return false;
+  }
+
   // ─── API Functions ────────────────────────────────────────────────────────
   async function fetchGpuTelemetry() {
     try {
@@ -57,10 +68,11 @@ document.addEventListener('DOMContentLoaded', () => {
       const data = await res.json();
       const dev = data.devices && data.devices.length > 0 ? data.devices[0] : null;
       const ravenOption = document.getElementById('option-raven-fp8');
+      const jayOption = document.getElementById('option-jay-mxfp4');
       const repackSelect = document.getElementById('select-repack-mode');
 
       if (dev) {
-        document.getElementById('gpu-name-display').textContent = dev.gcn_arch ? `${dev.gcn_arch} (GPU ${dev.index})` : `ROCm GPU ${dev.index}`;
+        document.getElementById('gpu-name-display').textContent = dev.gcn_arch ? `${dev.gcn_arch} (GPU ${dev.index !== undefined ? dev.index : dev.ordinal})` : `ROCm GPU ${dev.ordinal}`;
         const totalGb = (dev.vram_bytes / (1024 * 1024 * 1024)).toFixed(1);
         document.getElementById('gpu-vram-text').textContent = `1.2 GB / ${totalGb} GB VRAM`;
         document.getElementById('gpu-vram-bar').style.width = `${Math.min(100, (1.2 / totalGb) * 100)}%`;
@@ -78,6 +90,20 @@ document.addEventListener('DOMContentLoaded', () => {
             }
           }
         }
+
+        const supportsJay = isRdna5OrNewer(dev.gcn_arch);
+        if (jayOption) {
+          if (supportsJay) {
+            jayOption.disabled = false;
+            jayOption.textContent = `Jay MXFP4 (Micro-block 4-bit - ${dev.gcn_arch} HW Accelerated)`;
+          } else {
+            jayOption.disabled = true;
+            jayOption.textContent = `Jay MXFP4 (Requires RDNA 5 / gfx1300+, detected ${dev.gcn_arch})`;
+            if (repackSelect && repackSelect.value === 'JayMXFP4') {
+              repackSelect.value = 'CrowQ4K';
+            }
+          }
+        }
       } else {
         document.getElementById('gpu-name-display').textContent = 'CPU Host Mode';
         document.getElementById('gpu-vram-text').textContent = 'RAM Allocation Active';
@@ -85,6 +111,13 @@ document.addEventListener('DOMContentLoaded', () => {
           ravenOption.disabled = true;
           ravenOption.textContent = 'Raven FP8 (Requires RDNA 4+ GPU / gfx1200+)';
           if (repackSelect && repackSelect.value === 'RavenFP8') {
+            repackSelect.value = 'CrowQ4K';
+          }
+        }
+        if (jayOption) {
+          jayOption.disabled = true;
+          jayOption.textContent = 'Jay MXFP4 (Requires RDNA 5 GPU / gfx1300+)';
+          if (repackSelect && repackSelect.value === 'JayMXFP4') {
             repackSelect.value = 'CrowQ4K';
           }
         }
