@@ -20,11 +20,11 @@ impl OklchColor {
     }
 }
 
-/// Pilot-blue OKLCH seed that anchors the whole theme.
+/// Pilot-purple OKLCH seed that anchors the dark purple theme.
 pub const GARAGE_SEED_OKLCH: OklchColor = OklchColor {
     l: 0.62,
     c: 0.10,
-    h: 240.0,
+    h: 285.0,
     a: 1.0,
 };
 
