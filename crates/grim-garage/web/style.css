@@ -61,9 +61,7 @@ body {
   font-size: 18px;
   font-weight: 800;
   letter-spacing: 0.5px;
-  background: linear-gradient(135deg, #c084fc 0%, #a855f7 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
+  color: #ffffff;
 }
 
 .brand-subtitle {
