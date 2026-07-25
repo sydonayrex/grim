@@ -103,12 +103,12 @@ mod tests {
 
     fn sample_state() -> DisplayState {
         let mut s = DisplayState::new();
-        s.set_models(vec![ModelEntry {
-            id: "tiny.gguf".into(),
-            path: "/tmp/tiny.gguf".into(),
-            format: "gguf".into(),
-            is_grim: false,
-        }]);
+        s.set_models(vec![ModelEntry::new(
+            "tiny.gguf",
+            "/tmp/tiny.gguf",
+            "gguf",
+            false,
+        )]);
         s.set_datasets(vec![DatasetEntry {
             id: "train.jsonl".into(),
             path: "/tmp/train.jsonl".into(),

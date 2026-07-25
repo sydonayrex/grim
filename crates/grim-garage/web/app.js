@@ -187,7 +187,9 @@ document.addEventListener('DOMContentLoaded', () => {
         data.models.forEach(m => {
           const opt = document.createElement('option');
           opt.value = m.path;
-          opt.textContent = `${m.name} (${(m.size_bytes / (1024*1024*1024)).toFixed(1)} GB)`;
+          const displayName = m.name || m.id || (m.path ? m.path.split('/').pop() : 'model');
+          const sizeText = m.size_bytes && m.size_bytes > 0 ? ` (${(m.size_bytes / (1024*1024*1024)).toFixed(1)} GB)` : '';
+          opt.textContent = `${displayName}${sizeText}`;
           select.appendChild(opt);
         });
       }
@@ -206,7 +208,9 @@ document.addEventListener('DOMContentLoaded', () => {
         data.datasets.forEach(d => {
           const opt = document.createElement('option');
           opt.value = d.path;
-          opt.textContent = d.name;
+          const displayName = d.name || d.id || (d.path ? d.path.split('/').pop() : 'dataset');
+          const sizeText = d.size_bytes && d.size_bytes > 0 ? ` (${(d.size_bytes / (1024*1024)).toFixed(1)} MB)` : '';
+          opt.textContent = `${displayName}${sizeText}`;
           select.appendChild(opt);
         });
       }

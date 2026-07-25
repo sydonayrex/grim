@@ -17,21 +17,30 @@ pub enum DiscoveryError {
 pub struct ModelEntry {
     /// Filename only — used as a stable dropdown identifier.
     pub id: String,
+    /// Display name (alias for id).
+    #[serde(default)]
+    pub name: String,
     /// Absolute path on disk.
     pub path: String,
     /// `"gguf"` or `"grim"`.
     pub format: String,
     /// True when the file claims a `.grim` extension AND the GGUF header parses.
     pub is_grim: bool,
+    /// Size on disk in bytes.
+    #[serde(default)]
+    pub size_bytes: u64,
 }
 
 impl ModelEntry {
     pub fn new(id: &str, path: &str, format: &str, is_grim: bool) -> Self {
+        let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         Self {
             id: id.to_string(),
+            name: id.to_string(),
             path: path.to_string(),
             format: format.to_string(),
             is_grim,
+            size_bytes,
         }
     }
 }
