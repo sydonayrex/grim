@@ -115,14 +115,12 @@ pub fn cmd_oxidizer_info(path: &str) -> Result<(), String> {
 /// When `samples` is empty, `build_curvature` falls back to the CPU heuristic
 /// (`build_curvature_proxy`) so there's no regression for users without a
 /// calibrated model.
-#[allow(dead_code)] // benchmark helper
 #[derive(Debug, Clone, Default)]
 pub struct CalibrationBatch {
     pub samples: Vec<FisherCalibrationSample>,
     pub group_size: usize,
 }
 
-#[allow(dead_code)]
 impl CalibrationBatch {
     pub fn new(group_size: usize) -> Self {
         Self { samples: Vec::new(), group_size }
@@ -480,8 +478,12 @@ pub fn cmd_oxidizer_raven(
     grim_meta.quant_method = Some("raven-fp8-repack".into());
     grim_meta.calibration_dataset = calibration_dataset.map(String::from);
 
+    // `build_rewritten_tensors` requires a concrete `&GgufProvider` so it can
+    // `provider.get(name)` on each tensor; re-open under that type here.
+    let gguf_provider = GgufProvider::open(model_path).map_err(|e| e.to_string())?;
+    let _ = provider; // open_provider already validated the file is a GGUF/.grim
     let rewritten = build_rewritten_tensors(
-        &provider,
+        &gguf_provider,
         &importance_scores,
         &full_bitwidths,
         &calibration_batch,
