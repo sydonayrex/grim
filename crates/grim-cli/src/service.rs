@@ -9,6 +9,12 @@
 use std::path::PathBuf;
 use grim_tensor::error::{Error, Result};
 
+/// Default service name when the caller supplies none. Every platform
+/// manager carries its own resolved `name` field — there is a single
+/// source of truth per manager instance, never a `const` mixed with a
+/// per-call `cfg.name` (the shape that produced P2-7's label drift).
+pub const DEFAULT_SERVICE_NAME: &str = "grim";
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartPolicy {
@@ -29,7 +35,6 @@ pub struct HealthCheckConfig {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ServiceConfig {
-    pub name: String,
     pub exec_path: PathBuf,
     pub config_path: PathBuf,
     pub restart_policy: RestartPolicy,
@@ -126,11 +131,17 @@ determinism_mode = "relaxed"
 }
 
 /// Linux Systemd Manager implementation.
-pub struct SystemdManager;
+pub struct SystemdManager {
+    name: String,
+}
 
 impl SystemdManager {
-    fn unit_path(name: &str) -> PathBuf {
-        PathBuf::from(format!("/etc/systemd/system/{name}.service"))
+    pub fn new(name: String) -> Self {
+        Self { name }
+    }
+
+    fn unit_path(&self) -> PathBuf {
+        PathBuf::from(format!("/etc/systemd/system/{}.service", self.name))
     }
 
     fn restart_arg(policy: RestartPolicy) -> &'static str {
@@ -141,7 +152,7 @@ impl SystemdManager {
         }
     }
 
-    fn generate_unit(cfg: &ServiceConfig) -> String {
+    fn generate_unit(&self, cfg: &ServiceConfig) -> String {
         let log_target = if let Some(ref lp) = cfg.log_path {
             lp.display().to_string()
         } else {
@@ -149,7 +160,7 @@ impl SystemdManager {
         };
         format!(
             r#"[Unit]
-Description=Grim inference engine
+Description=Grim inference engine ({name})
 After=network.target
 
 [Service]
@@ -170,6 +181,8 @@ WantedBy=multi-user.target
             cfg.config_path.display(),
             cfg.run_as_user.as_deref().unwrap_or("grim"),
             Self::restart_arg(cfg.restart_policy),
+            name = self.name,
+            log_target = log_target
         )
     }
 }
@@ -177,8 +190,8 @@ WantedBy=multi-user.target
 impl ServiceManager for SystemdManager {
     fn install(&self, cfg: &ServiceConfig) -> Result<()> {
         setup_tls_and_config(cfg)?;
-        let unit_path = Self::unit_path(&cfg.name);
-        let content = Self::generate_unit(cfg);
+        let unit_path = self.unit_path();
+        let content = self.generate_unit(cfg);
 
         // §13.1: write the unit file to disk first.
         std::fs::write(&unit_path, &content).map_err(|e| {
@@ -221,7 +234,7 @@ impl ServiceManager for SystemdManager {
     }
 
     fn uninstall(&self, purge: bool) -> Result<()> {
-        let unit_path = Self::unit_path("grim");
+        let unit_path = self.unit_path();
         if unit_path.exists() {
             std::fs::remove_file(&unit_path).map_err(|e| {
                 Error::Backend(format!("failed to remove unit file: {e}"))
@@ -242,48 +255,51 @@ impl ServiceManager for SystemdManager {
     }
 
     fn start(&self) -> Result<()> {
-        let unit_path = Self::unit_path("grim");
+        let unit_path = self.unit_path();
         if !unit_path.exists() {
-            return Err(Error::Backend(
-                "cannot start: unit file does not exist. Run 'grim service install' first.".into(),
-            ));
+            return Err(Error::Backend(format!(
+                "cannot start: unit file does not exist at {}. Run 'grim service install' first.",
+                unit_path.display()
+            )));
         }
         let status = std::process::Command::new("systemctl")
-            .args(["start", "grim"])
+            .args(["start", &self.name])
             .status()
             .map_err(|e| Error::Backend(format!("failed to run systemctl start: {e}")))?;
 
         if !status.success() {
             return Err(Error::Backend(format!(
-                "systemctl start grim exited with code {:?}",
+                "systemctl start {} exited with code {:?}",
+                self.name,
                 status.code()
             )));
         }
 
-        println!("[SystemdManager] Started grim service.");
+        println!("[SystemdManager] Started {} service.", self.name);
         Ok(())
     }
 
     fn stop(&self) -> Result<()> {
         let status = std::process::Command::new("systemctl")
-            .args(["stop", "grim"])
+            .args(["stop", &self.name])
             .status()
             .map_err(|e| Error::Backend(format!("failed to run systemctl stop: {e}")))?;
 
         if !status.success() {
             return Err(Error::Backend(format!(
-                "systemctl stop grim exited with code {:?}",
+                "systemctl stop {} exited with code {:?}",
+                self.name,
                 status.code()
             )));
         }
 
-        println!("[SystemdManager] Stopped grim service.");
+        println!("[SystemdManager] Stopped {} service.", self.name);
         Ok(())
     }
 
     fn status(&self) -> Result<ServiceStatus> {
         let output = std::process::Command::new("systemctl")
-            .args(["is-active", "grim"])
+            .args(["is-active", &self.name])
             .output()
             .map_err(|e| Error::Backend(format!("failed to run systemctl is-active: {e}")))?;
 
@@ -302,31 +318,51 @@ impl ServiceManager for SystemdManager {
 
     fn reload_config(&self) -> Result<()> {
         let status = std::process::Command::new("systemctl")
-            .args(["reload", "grim"])
+            .args(["reload", &self.name])
             .status()
             .map_err(|e| Error::Backend(format!("failed to run systemctl reload: {e}")))?;
 
         if !status.success() {
             return Err(Error::Backend(format!(
-                "systemctl reload grim exited with code {:?}",
+                "systemctl reload {} exited with code {:?}",
+                self.name,
                 status.code()
             )));
         }
 
-        println!("[SystemdManager] Reloaded grim configuration.");
+        println!("[SystemdManager] Reloaded {} configuration.", self.name);
         Ok(())
     }
 }
 
 /// macOS launchd Manager implementation.
-pub struct LaunchdManager;
+pub struct LaunchdManager {
+    name: String,
+}
 
 impl LaunchdManager {
-    fn plist_path(name: &str) -> PathBuf {
-        PathBuf::from(format!("/Library/LaunchDaemons/com.{name}.plist"))
+    pub fn new(name: String) -> Self {
+        Self { name }
     }
 
-    fn generate_plist(cfg: &ServiceConfig) -> String {
+    fn plist_path(&self) -> PathBuf {
+        PathBuf::from(format!("/Library/LaunchDaemons/com.{}.plist", self.name))
+    }
+
+    /// launchd job label — `com.{name}`. Matches the plist `<key>Label</key>`
+    /// value that `generate_plist` writes, so `start`/`stop`/`status`/`reload`
+    /// always target the same job `install` registered.
+    fn label(&self) -> String {
+        format!("com.{}", self.name)
+    }
+
+    /// Fully-qualified launchd service target, `system/{label}`, for
+    /// `launchctl print` / `kickstart`.
+    fn target(&self) -> String {
+        format!("system/{}", self.label())
+    }
+
+    fn generate_plist(&self, cfg: &ServiceConfig) -> String {
         let log_target = if let Some(ref lp) = cfg.log_path {
             lp.display().to_string()
         } else {
@@ -357,7 +393,7 @@ impl LaunchdManager {
 </dict>
 </plist>
 "#,
-            name = cfg.name,
+            name = self.name,
             exec = cfg.exec_path.display(),
             config = cfg.config_path.display(),
             log = log_target
@@ -368,8 +404,8 @@ impl LaunchdManager {
 impl ServiceManager for LaunchdManager {
     fn install(&self, cfg: &ServiceConfig) -> Result<()> {
         setup_tls_and_config(cfg)?;
-        let plist_path = Self::plist_path(&cfg.name);
-        let content = Self::generate_plist(cfg);
+        let plist_path = self.plist_path();
+        let content = self.generate_plist(cfg);
 
         std::fs::write(&plist_path, &content).map_err(|e| {
             Error::Backend(format!("failed to write launchd plist to '{}': {e}", plist_path.display()))
@@ -404,7 +440,7 @@ impl ServiceManager for LaunchdManager {
     }
 
     fn uninstall(&self, purge: bool) -> Result<()> {
-        let plist_path = Self::plist_path("grim");
+        let plist_path = self.plist_path();
         if plist_path.exists() {
             let _ = std::process::Command::new("launchctl")
                 .args(["unload", &plist_path.display().to_string()])
@@ -421,14 +457,16 @@ impl ServiceManager for LaunchdManager {
     }
 
     fn start(&self) -> Result<()> {
-        let plist_path = Self::plist_path("grim");
+        let plist_path = self.plist_path();
         if !plist_path.exists() {
-            return Err(Error::Backend(
-                "cannot start: plist does not exist. Run 'grim service install' first.".into(),
-            ));
+            return Err(Error::Backend(format!(
+                "cannot start: plist does not exist at {}. Run 'grim service install' first.",
+                plist_path.display()
+            )));
         }
+        let label = self.label();
         let status = std::process::Command::new("launchctl")
-            .args(["start", &format!("com.grim")])
+            .args(["start", &label])
             .status()
             .map_err(|e| Error::Backend(format!("failed to run launchctl start: {e}")))?;
 
@@ -439,13 +477,14 @@ impl ServiceManager for LaunchdManager {
             )));
         }
 
-        println!("[LaunchdManager] Started grim service.");
+        println!("[LaunchdManager] Started {} service.", self.name);
         Ok(())
     }
 
     fn stop(&self) -> Result<()> {
+        let label = self.label();
         let status = std::process::Command::new("launchctl")
-            .args(["stop", "com.grim"])
+            .args(["stop", &label])
             .status()
             .map_err(|e| Error::Backend(format!("failed to run launchctl stop: {e}")))?;
 
@@ -456,13 +495,14 @@ impl ServiceManager for LaunchdManager {
             )));
         }
 
-        println!("[LaunchdManager] Stopped grim service.");
+        println!("[LaunchdManager] Stopped {} service.", self.name);
         Ok(())
     }
 
     fn status(&self) -> Result<ServiceStatus> {
+        let target = self.target();
         let output = std::process::Command::new("launchctl")
-            .args(["print", "system/com.grim"])
+            .args(["print", &target])
             .output()
             .ok();
 
@@ -480,8 +520,9 @@ impl ServiceManager for LaunchdManager {
     }
 
     fn reload_config(&self) -> Result<()> {
+        let target = self.target();
         let _ = std::process::Command::new("launchctl")
-            .args(["kickstart", "-k", "system/com.grim"])
+            .args(["kickstart", "-k", &target])
             .status();
         println!("[LaunchdManager] Reloaded configuration.");
         Ok(())
@@ -489,12 +530,20 @@ impl ServiceManager for LaunchdManager {
 }
 
 /// Windows Service Control Manager (SCM) implementation.
-pub struct WindowsScmManager;
+pub struct WindowsScmManager {
+    name: String,
+}
+
+impl WindowsScmManager {
+    pub fn new(name: String) -> Self {
+        Self { name }
+    }
+}
 
 impl ServiceManager for WindowsScmManager {
     fn install(&self, cfg: &ServiceConfig) -> Result<()> {
         setup_tls_and_config(cfg)?;
-        let unit_name = format!("Grim {}", cfg.name);
+        let unit_name = format!("Grim {}", self.name);
         let bin_path = format!(
             "\"{}\" service run --config \"{}\"",
             cfg.exec_path.display(),
@@ -503,7 +552,7 @@ impl ServiceManager for WindowsScmManager {
         let status = std::process::Command::new("sc")
             .args([
                 "create",
-                &cfg.name,
+                &self.name,
                 "binPath=",
                 &bin_path,
                 "DisplayName=",
@@ -514,18 +563,19 @@ impl ServiceManager for WindowsScmManager {
 
         if !status.success() {
             return Err(Error::Backend(format!(
-                "sc create grim service exited with code {:?}",
+                "sc create {} service exited with code {:?}",
+                self.name,
                 status.code()
             )));
         }
 
-        println!("[WindowsScmManager] Registered service '{}'.", cfg.name);
+        println!("[WindowsScmManager] Registered service '{}'.", self.name);
         Ok(())
     }
 
     fn uninstall(&self, purge: bool) -> Result<()> {
         let _ = std::process::Command::new("sc")
-            .args(["delete", "grim"])
+            .args(["delete", &self.name])
             .status();
         if purge {
             let _ = std::fs::remove_dir("C:\\Program Files\\Grim\\logs");
@@ -536,41 +586,43 @@ impl ServiceManager for WindowsScmManager {
 
     fn start(&self) -> Result<()> {
         let status = std::process::Command::new("sc")
-            .args(["start", "grim"])
+            .args(["start", &self.name])
             .status()
             .map_err(|e| Error::Backend(format!("failed to run sc start: {e}")))?;
 
         if !status.success() {
             return Err(Error::Backend(format!(
-                "sc start grim exited with code {:?}",
+                "sc start {} exited with code {:?}",
+                self.name,
                 status.code()
             )));
         }
 
-        println!("[WindowsScmManager] Started grim service.");
+        println!("[WindowsScmManager] Started {} service.", self.name);
         Ok(())
     }
 
     fn stop(&self) -> Result<()> {
         let status = std::process::Command::new("sc")
-            .args(["stop", "grim"])
+            .args(["stop", &self.name])
             .status()
             .map_err(|e| Error::Backend(format!("failed to run sc stop: {e}")))?;
 
         if !status.success() {
             return Err(Error::Backend(format!(
-                "sc stop grim exited with code {:?}",
+                "sc stop {} exited with code {:?}",
+                self.name,
                 status.code()
             )));
         }
 
-        println!("[WindowsScmManager] Stopped grim service.");
+        println!("[WindowsScmManager] Stopped {} service.", self.name);
         Ok(())
     }
 
     fn status(&self) -> Result<ServiceStatus> {
         let output = std::process::Command::new("sc")
-            .args(["query", "grim"])
+            .args(["query", &self.name])
             .output()
             .map_err(|e| Error::Backend(format!("failed to run sc query: {e}")))?;
 
@@ -586,7 +638,7 @@ impl ServiceManager for WindowsScmManager {
 
     fn reload_config(&self) -> Result<()> {
         let status = std::process::Command::new("sc")
-            .args(["config", "grim", "type=", "own"])
+            .args(["config", &self.name, "type=", "own"])
             .status()
             .map_err(|e| Error::Backend(format!("failed to run sc config: {e}")))?;
 
@@ -599,5 +651,111 @@ impl ServiceManager for WindowsScmManager {
 
         println!("[WindowsScmManager] Reloaded configuration.");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_cfg() -> ServiceConfig {
+        ServiceConfig {
+            exec_path: PathBuf::from("/usr/local/bin/grim"),
+            config_path: PathBuf::from("/etc/grim/grim.toml"),
+            restart_policy: RestartPolicy::OnFailure,
+            run_as_user: Some("grim".to_string()),
+            health_check: HealthCheckConfig {
+                endpoint: "/healthz".to_string(),
+                interval_secs: 10,
+                timeout_secs: 3,
+                failure_threshold: 3,
+            },
+            log_path: None,
+        }
+    }
+
+    /// P2-7: the unit-file path must honor the manager's resolved name, not a
+    /// hardcoded `grim`/`SERVICE_NAME` constant. A `--name grimed` install
+    /// writes to `grimed.service`; a `start --name grimed` must then target the
+    /// same path. This pins the generalization of the original P2-7 fix.
+    #[test]
+    fn systemd_unit_path_honors_name() {
+        let mgr = SystemdManager::new("grimed".to_string());
+        assert_eq!(
+            mgr.unit_path(),
+            PathBuf::from("/etc/systemd/system/grimed.service"),
+            "unit path must use the manager's name, not a hardcoded 'grim'"
+        );
+        // And the default name still resolves identically to the old constant.
+        assert_eq!(
+            SystemdManager::new(DEFAULT_SERVICE_NAME.to_string()).unit_path(),
+            PathBuf::from("/etc/systemd/system/grim.service"),
+            "default name must preserve prior behavior"
+        );
+    }
+
+    #[test]
+    fn launchd_plist_path_honors_name() {
+        let mgr = LaunchdManager::new("grimed".to_string());
+        assert_eq!(
+            mgr.plist_path(),
+            PathBuf::from("/Library/LaunchDaemons/com.grimed.plist"),
+            "plist path must use com.<name>, not a hardcoded com.grim"
+        );
+        assert_eq!(
+            LaunchdManager::new(DEFAULT_SERVICE_NAME.to_string()).plist_path(),
+            PathBuf::from("/Library/LaunchDaemons/com.grim.plist"),
+            "default name must preserve prior behavior"
+        );
+    }
+
+    /// P2-7 (literal finding): the launchd job label and the `systemctl print` /
+    /// `kickstart` target must agree with the plist `<key>Label</key>` written by
+    /// `install`. `start`/`stop`/`status`/`reload_config` all derive from these
+    /// helpers, so this single assertion pins the cross-command agreement.
+    #[test]
+    fn launchd_label_and_target_honors_name() {
+        let mgr = LaunchdManager::new("grimed".to_string());
+        assert_eq!(mgr.label(), "com.grimed");
+        assert_eq!(mgr.target(), "system/com.grimed");
+    }
+
+    /// The generated plist body must carry the `com.{name}` label, not a
+    /// hardcoded `com.grim`. This is the test that fails if anyone reverts
+    /// `name = self.name` in `generate_plist` back to a `SERVICE_NAME`-style
+    /// constant — i.e. it pins the *generalized* fix, not just the path helpers.
+    #[test]
+    fn generated_plist_label_honors_self_name() {
+        let mgr = LaunchdManager::new("grimed".to_string());
+        let plist = mgr.generate_plist(&minimal_cfg());
+        // The plist Label line must name the resolved service, never a
+        // literal "grim". Both assertions: positive (grimed present) and
+        // negative (no bare com.grim) so a regression that emits both fails.
+        assert!(
+            plist.contains("<key>Label</key><string>com.grimed</string>"),
+            "plist Label must be com.grimed, got: {plist}"
+        );
+        assert!(
+            !plist.contains("com.grim</string>"),
+            "plist Label must not fall back to hardcoded com.grim: {plist}"
+        );
+    }
+
+    /// Symmetric guard for the systemd unit — the Description line carries the
+    /// resolved name so a multi-instance install is never silently aliased to
+    /// `grim`. (ExecStart itself is name-independent; the Description is the
+    /// name-bearing field.)
+    #[test]
+    fn generated_unit_description_honors_self_name() {
+        let mgr = SystemdManager::new("grimed".to_string());
+        let unit = mgr.generate_unit(&minimal_cfg());
+        assert!(
+            unit.contains("Description=Grim inference engine (grimed)"),
+            "unit Description must carry the resolved name, got: {unit}"
+        );
+        assert!(
+            !unit.contains("Description=Grim inference engine\n"),
+            "unit Description must not be the bare pre-fix string (would imply name ignored): {unit}"
+        );
     }
 }

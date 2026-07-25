@@ -354,6 +354,8 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             FloatPackScheme::Fp4 => dequant_fp4(&raw.bytes, n),
             FloatPackScheme::Nf4 => dequant_nf4(&raw.bytes, n),
             FloatPackScheme::Fp8 => dequant_fp8(&raw.bytes, n),
+            FloatPackScheme::MxFp4 => dequant_fp4(&raw.bytes, n),
+            FloatPackScheme::MxFp8 => dequant_fp8(&raw.bytes, n),
         },
         Storage::Block(block_type) => match block_type {
             BlockDtype::Fp4 => dequant_fp4(&raw.bytes, n),

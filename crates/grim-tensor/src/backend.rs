@@ -192,7 +192,122 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
-/// Fused dequantized matmul backward (WI-T3 / F5).
+    /// Rotary position embedding (RoPE) application on Q or K tensor.
+    fn rope(
+        &self,
+        x: &dyn BackendStorage,
+        positions: &[u32],
+        dim: usize,
+        base: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (x, positions, dim, base, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "rope not implemented for this backend".into(),
+        ))
+    }
+
+    /// Fused LoRA accumulator: `out = base + scale * (x @ A^T) @ B^T`.
+    fn lora_accumulate(
+        &self,
+        base: &dyn BackendStorage,
+        x: &dyn BackendStorage,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        scale: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_dims = x.shape().dims();
+        let (batch, in_features) = match x_dims.len() {
+            1 => (1, x_dims[0]),
+            2 => (x_dims[0], x_dims[1]),
+            _ => (x_dims[..x_dims.len() - 1].iter().product(), x_dims[x_dims.len() - 1]),
+        };
+        let (rank, in_features_a) = (a.shape().dims()[0], a.shape().dims()[1]);
+        let (out_features, rank_b) = (b.shape().dims()[0], b.shape().dims()[1]);
+
+        let owned_x_2d;
+        let x_storage_2d: &dyn BackendStorage = if x_dims.len() == 2 {
+            x
+        } else {
+            let vec_x = x.to_cpu_vec_f32()?;
+            owned_x_2d = self.from_cpu(&vec_x, &Shape::new(vec![batch, in_features]), DType::F32)?;
+            owned_x_2d.as_ref()
+        };
+
+        // A is [rank, in_features], A^T is [in_features, rank].
+        // x @ A^T requires A_T of shape [in_features, rank].
+        let vec_a = a.to_cpu_vec_f32()?;
+        let mut vec_a_t = vec![0.0f32; in_features_a * rank];
+        for r in 0..rank {
+            for i in 0..in_features_a {
+                vec_a_t[i * rank + r] = vec_a[r * in_features_a + i];
+            }
+        }
+        let a_t_storage = self.from_cpu(&vec_a_t, &Shape::new(vec![in_features_a, rank]), DType::F32)?;
+
+        let h_2d_shape = Shape::new(vec![batch, rank]);
+        let (h_storage, h_handle) = self.matmul(x_storage_2d, a_t_storage.as_ref(), &h_2d_shape)?;
+        h_handle.synchronize()?;
+
+        // B is [out_features, rank], B^T is [rank, out_features].
+        let vec_b = b.to_cpu_vec_f32()?;
+        let mut vec_b_t = vec![0.0f32; rank_b * out_features];
+        for o in 0..out_features {
+            for r in 0..rank_b {
+                vec_b_t[r * out_features + o] = vec_b[o * rank_b + r];
+            }
+        }
+        let b_t_storage = self.from_cpu(&vec_b_t, &Shape::new(vec![rank_b, out_features]), DType::F32)?;
+
+        let delta_2d_shape = Shape::new(vec![batch, out_features]);
+        let (delta_storage, delta_handle) = self.matmul(h_storage.as_ref(), b_t_storage.as_ref(), &delta_2d_shape)?;
+        delta_handle.synchronize()?;
+
+        let scale_buf = self.from_cpu(
+            &vec![scale; out_shape.elem_count()],
+            &delta_2d_shape,
+            DType::F32,
+        )?;
+        let (scaled_delta_storage, scaled_delta_handle) =
+            self.mul(delta_storage.as_ref(), scale_buf.as_ref(), &delta_2d_shape)?;
+        scaled_delta_handle.synchronize()?;
+
+        let owned_base_2d;
+        let base_storage_2d: &dyn BackendStorage = if base.shape().dims().len() == 2 {
+            base
+        } else {
+            let vec_base = base.to_cpu_vec_f32()?;
+            owned_base_2d = self.from_cpu(&vec_base, &delta_2d_shape, DType::F32)?;
+            owned_base_2d.as_ref()
+        };
+
+        let (out_storage_2d, add_handle) = self.add(base_storage_2d, scaled_delta_storage.as_ref(), &delta_2d_shape)?;
+        add_handle.synchronize()?;
+
+        if base.shape().dims().len() == 2 {
+            Ok((out_storage_2d, Box::new(ReadyHandle)))
+        } else {
+            let vec_out = out_storage_2d.to_cpu_vec_f32()?;
+            Ok((self.from_cpu(&vec_out, out_shape, DType::F32)?, Box::new(ReadyHandle)))
+        }
+    }
+
+    /// Fused dequantized matmul forward (`C = A @ B_dequant^T`).
+    ///
+    /// Computes matrix multiplication where `B` is a quantized tensor (Q4_K, FP8, MXFP4, MXFP8, etc.).
+    /// Default implementation falls back to `matmul`.
+    fn quantized_matmul(
+        &self,
+        a: &dyn BackendStorage,
+        b_packed: &dyn BackendStorage,
+        _b_scales: &[f32],
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.matmul(a, b_packed, out_shape)
+    }
+
+    /// Fused dequantized matmul backward (WI-T3 / F5).
     ///
     /// Computes `dX[M, K] = dY[M, N] @ B^T` where `B` is dequantized on-the-fly
     /// from packed codes, per-column scale, optional outlier overrides, and

@@ -31,6 +31,7 @@ pub struct TrainOptions {
     pub lr: f32,
     pub rank: usize,
     pub alpha: f32,
+    pub device: String,
 }
 
 /// Dataset entry in Alpaca format.
@@ -46,6 +47,31 @@ struct AlpacaEntry {
 #[derive(Debug, Deserialize)]
 struct ShareGptEntry {
     conversations: Vec<ConversationTurn>,
+}
+
+/// Pack short dataset token sequences into unified target sequence buffers up to `max_seq_len`.
+pub fn pack_dataset_tokens(token_sequences: &[Vec<u32>], max_seq_len: usize) -> Vec<Vec<u32>> {
+    let mut packed_batches = Vec::new();
+    let mut current_pack = Vec::new();
+
+    for seq in token_sequences {
+        if current_pack.len() + seq.len() <= max_seq_len {
+            current_pack.extend_from_slice(seq);
+        } else {
+            if !current_pack.is_empty() {
+                packed_batches.push(current_pack);
+            }
+            if seq.len() <= max_seq_len {
+                current_pack = seq.clone();
+            } else {
+                current_pack = seq[..max_seq_len].to_vec();
+            }
+        }
+    }
+    if !current_pack.is_empty() {
+        packed_batches.push(current_pack);
+    }
+    packed_batches
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,7 +282,16 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
     // (see `transformer/src/lfm2.rs`); for plain Llama, it's a separate
     // `output.weight` tensor. Detect by trying to load `output.weight` first
     // and falling back to tied embedding reuse.
-    let ws = WeightSource::root(&provider, grim_tensor::Device::Cpu);
+    let target_device = match opts.device.as_str() {
+        "cpu" => grim_tensor::Device::Cpu,
+        d if d.starts_with("rocm") => {
+            let ordinal = d.strip_prefix("rocm:").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+            grim_tensor::Device::Rocm(ordinal)
+        }
+        other => return Err(Error::Session(format!("unsupported training device '{other}'"))),
+    };
+
+    let ws = WeightSource::root(&provider, target_device);
     let tok_embeddings = Embedding::load(&ws.pp("token_embd"), model_config.vocab_size, model_config.hidden_size)
         .map_err(|e| Error::Session(format!("failed to load token_embd: {e}")))?;
     let output_norm = RmsNorm::load(&ws.pp("output_norm"), model_config.hidden_size, llama_config.rms_norm_eps)
@@ -298,23 +333,37 @@ for (tokens, labels) in dataset.iter() {
             let mut hidden_state = tok_embeddings
                 .forward(input_ids, seq_len, hidden)
                 .map_err(|e| Error::Session(format!("token embedding forward failed: {e}")))?;
-            let _x_id = tape.register(hidden_state.clone());
+            let mut x_id = tape.register(hidden_state.clone());
 
-            // Run streaming forward through all layers (kept verbatim — the
-            // gap was around the head, not the body).
+            // Run streaming forward through all layers with autograd tape recording.
             for layer_idx in 0..num_layers {
-                hidden_state = streaming.forward_block(&provider, &llama_config, layer_idx, &hidden_state)
+                let (next_id, next_h) = streaming
+                    .forward_block_with_autograd(&provider, &llama_config, &autograd_reg, &mut tape, layer_idx, &hidden_state, x_id)
                     .map_err(|e| Error::Session(format!("layer {} forward failed: {}", layer_idx, e)))?;
+                hidden_state = next_h;
+                x_id = next_id;
             }
 
             // Final norm + lm_head → real vocabulary logits.
             hidden_state = output_norm
                 .forward(&hidden_state)
                 .map_err(|e| Error::Session(format!("output_norm forward failed: {e}")))?;
-            let logits_out = lm_head
+            let logits_base = lm_head
                 .forward(&hidden_state)
                 .map_err(|e| Error::Session(format!("lm_head forward failed: {e}")))?;
-            let logits_id = tape.register(logits_out.clone());
+            let logits_base_id = tape.register(logits_base.clone());
+
+            let (logits_id, logits_out) = grim_autograd::apply_and_record_lora(
+                &autograd_reg,
+                &mut tape,
+                num_layers,
+                grim_autograd::LoRAInjectionPoint::Logits,
+                logits_base,
+                logits_base_id,
+                hidden_state.clone(),
+                x_id,
+            )
+            .map_err(|e| Error::Session(format!("lm_head lora forward failed: {e}")))?;
 
             let targets_usize: Vec<usize> = targets.iter().map(|&t| t as usize).collect();
             let (loss_val, loss_grad) = cross_entropy_loss(&logits_out, &targets_usize)
@@ -453,17 +502,36 @@ mod tests {
 
     impl HeadProvider {
         fn new(vocab: usize, hidden: usize) -> Self {
+            let mut embed_bytes = vec![0u8; hidden * vocab * 4];
+            for i in 0..(hidden * vocab) {
+                let v = ((i % 17) as f32 / 17.0) + 0.1;
+                let bytes = v.to_le_bytes();
+                embed_bytes[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
+            }
+
+            let mut norm_bytes = vec![0u8; hidden * 4];
+            for i in 0..hidden {
+                let bytes = 1.0f32.to_le_bytes();
+                norm_bytes[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
+            }
+
             Self {
                 vocab,
                 hidden,
-                embed_bytes: vec![0u8; hidden * vocab * 4],
-                norm_bytes: vec![0u8; hidden * 4],
+                embed_bytes,
+                norm_bytes,
                 lmhead_bytes: None,
-                embed_shape: vec![hidden, vocab],
+                embed_shape: vec![vocab, hidden],
             }
         }
         fn with_lm_head(mut self) -> Self {
-            self.lmhead_bytes = Some(vec![0u8; self.vocab * self.hidden * 4]);
+            let mut lmhead_bytes = vec![0u8; self.vocab * self.hidden * 4];
+            for i in 0..(self.vocab * self.hidden) {
+                let v = ((i % 13) as f32 / 13.0) - 0.5;
+                let bytes = v.to_le_bytes();
+                lmhead_bytes[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
+            }
+            self.lmhead_bytes = Some(lmhead_bytes);
             self
         }
     }
@@ -589,19 +657,82 @@ mod tests {
         let targets = vec![1usize, 2, 3, 4];
         let seq_len = input_ids.len();
 
-        use grim_autograd::TrainableParams;
-        use grim_autograd::Tape;
-        let mut params = TrainableParams::new();
-        let mut tape = Tape::new();
+        use grim_autograd::{AdamW, AdamWConfig, AutogradRegistry, InjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry, Tape, apply_and_record_lora};
 
-        let h = emb.forward(&input_ids, seq_len, hidden).unwrap();
-        let h_norm = norm.forward(&h).unwrap();
-        let logits = lm.forward(&h_norm).unwrap();
-        let logits_id = tape.register(logits.clone());
+        let inj_cfg = InjectionConfig {
+            hidden_size: hidden,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 4,
+            intermediate_size: 16,
+            vocab_size: vocab,
+        };
+        let mut inj_reg = LoRAInjectionRegistry::new();
+        inj_reg.add(grim_autograd::LoRAInjectionConfig::new(
+            LoRAInjectionPoint::Logits,
+            0,
+            1,
+            4,
+            8.0,
+        ));
 
-        let (initial_loss, loss_grad) = cross_entropy_loss(&logits, &targets).unwrap();
-        backward(&tape, loss_grad, logits_id, &mut params).unwrap();
+        let mut autograd_reg = AutogradRegistry::new(inj_cfg, inj_reg).unwrap();
+        let mut optimizer = AdamW::new(AdamWConfig {
+            lr: 0.1,
+            ..AdamWConfig::default()
+        });
+
+        let mut initial_loss = 0.0f32;
+        let mut final_loss = 0.0f32;
+
+        for step in 0..10 {
+            autograd_reg.zero_grads().unwrap();
+            let mut tape = Tape::new();
+
+            let h = emb.forward(&input_ids, seq_len, hidden).unwrap();
+            let h_norm = norm.forward(&h).unwrap();
+            let logits_base = lm.forward(&h_norm).unwrap();
+            let h_norm_id = tape.register(h_norm.clone());
+            let logits_base_id = tape.register(logits_base.clone());
+
+            let (logits_id, logits_out) = apply_and_record_lora(
+                &autograd_reg,
+                &mut tape,
+                0,
+                LoRAInjectionPoint::Logits,
+                logits_base,
+                logits_base_id,
+                h_norm,
+                h_norm_id,
+            ).unwrap();
+
+            let (loss_val, loss_grad) = cross_entropy_loss(&logits_out, &targets).unwrap();
+            if step == 0 {
+                initial_loss = loss_val;
+            }
+            final_loss = loss_val;
+
+            backward(&tape, loss_grad, logits_id, &mut autograd_reg.params).unwrap();
+            optimizer.step(&mut autograd_reg.params).unwrap();
+        }
 
         assert!(initial_loss > 0.0, "initial loss should be positive");
+        assert!(
+            final_loss < initial_loss,
+            "final loss ({final_loss}) must be strictly lower than initial loss ({initial_loss}) after training steps"
+        );
+    }
+
+    #[test]
+    fn test_pack_dataset_tokens_golden_mutation_resistant() {
+        let seqs = vec![
+            vec![1, 2, 3],
+            vec![4, 5],
+            vec![6, 7, 8, 9],
+        ];
+        let packed = pack_dataset_tokens(&seqs, 5);
+        assert_eq!(packed.len(), 2);
+        assert_eq!(packed[0], vec![1, 2, 3, 4, 5]);
+        assert_eq!(packed[1], vec![6, 7, 8, 9]);
     }
 }

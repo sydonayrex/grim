@@ -23,9 +23,7 @@ use crate::{hipSuccess, HiprtcProgram};
 /// Each HIP thread corrects one element of the weight matrix using the
 /// diagonal Fisher preconditioner. Threads within a wavefront cooperate
 /// via shuffle to reduce LDS bank pressure during the correction pass.
-// TODO(Phase-4): Wire compile_gptq_kernel() call site for GPTQ GPU acceleration.
-#[allow(dead_code)]
-const GPTQ_CORRECTION_KERNEL: &str = r#"
+pub const GPTQ_CORRECTION_KERNEL: &str = r#"
 extern "C" __global__
 void gptq_wavefront_correction_kernel(
     float* __restrict__ weight_approx,
@@ -67,9 +65,7 @@ void gptq_wavefront_correction_kernel(
 /// One HIP thread per quantization block. Each thread evaluates all 7
 /// scale multipliers and picks the one with lowest weighted quantization error.
 /// This replaces `fit_block_quantization` on CPU.
-// TODO(Phase-4): Wire compile_gptq_kernel() call site for GPTQ GPU acceleration.
-#[allow(dead_code)]
-const GPTQ_SCALE_FIT_KERNEL: &str = r#"
+pub const GPTQ_SCALE_FIT_KERNEL: &str = r#"
 extern "C" __global__
 void gptq_scale_fit_kernel(
     const float* __restrict__ block_data,
@@ -100,6 +96,15 @@ void gptq_scale_fit_kernel(
     int signed_limit = max_code / 2;
 
     float absmax_val = fabsf(val);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other_abs = __shfl_down(absmax_val, offset);
+        if (tid + offset < lane_count) {
+            absmax_val = fmaxf(absmax_val, other_abs);
+        }
+    }
+    absmax_val = __shfl(absmax_val, 0);
+
     for (int mi = 0; mi < 7; mi++) {
         float base_scale = (absmax_val > 1e-7f) ? (absmax_val / (float)signed_limit) : 1.0f;
         float scale = base_scale * multipliers[mi];
@@ -164,7 +169,7 @@ pub fn compile_gptq_kernel(kernel_name: &str, source: &str, gcn: &str) -> Result
     }
 
     let target = match gcn {
-        "gfx90a" => "gfx900",
+        "gfx90a" => "gfx90a",
         "gfx942" => "gfx942",
         "gfx1100" => "gfx1100",
         "gfx11" => "gfx1100",
@@ -226,10 +231,43 @@ pub fn compile_gptq_kernel(kernel_name: &str, source: &str, gcn: &str) -> Result
             return Err(crate::Error::Backend(format!("hiprtcGetCode failed: {}", code_status)));
         }
 
-        let _ = crate::hiprtcDestroyProgram(&mut prog);
-        
         let _ = cache.cache_kernel(&cache_key, source, &code_bytes);
         Ok(code_bytes)
+    }
+}
+
+/// Compile the wavefront correction HIP kernel for a target GCN architecture.
+pub fn compile_gptq_correction_kernel(gcn: &str) -> Result<Vec<u8>, crate::Error> {
+    compile_gptq_kernel("gptq_wavefront_correction_kernel", GPTQ_CORRECTION_KERNEL, gcn)
+}
+
+/// Compile the scale fitting HIP kernel for a target GCN architecture.
+pub fn compile_gptq_scale_fit_kernel(gcn: &str) -> Result<Vec<u8>, crate::Error> {
+    compile_gptq_kernel("gptq_scale_fit_kernel", GPTQ_SCALE_FIT_KERNEL, gcn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gptq_correction_kernel_source_is_non_empty_and_valid() {
+        assert!(GPTQ_CORRECTION_KERNEL.contains("gptq_wavefront_correction_kernel"));
+        assert!(GPTQ_CORRECTION_KERNEL.contains("weight_approx"));
+    }
+
+    #[test]
+    fn gptq_scale_fit_kernel_source_is_non_empty_and_valid() {
+        assert!(GPTQ_SCALE_FIT_KERNEL.contains("gptq_scale_fit_kernel"));
+        assert!(GPTQ_SCALE_FIT_KERNEL.contains("importance_weights"));
+    }
+
+    #[test]
+    fn wavefront_size_classification_matches_gcn_architectures() {
+        assert_eq!(wavefront_size_for_gcn("gfx90a"), 64);
+        assert_eq!(wavefront_size_for_gcn("gfx942"), 64);
+        assert_eq!(wavefront_size_for_gcn("gfx1100"), 32);
+        assert_eq!(wavefront_size_for_gcn("gfx1030"), 32);
     }
 }
 

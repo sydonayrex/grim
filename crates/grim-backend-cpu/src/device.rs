@@ -235,6 +235,53 @@ impl BackendDevice for CpuDevice {
         ))
     }
 
+    fn rope(
+        &self,
+        x: &dyn BackendStorage,
+        positions: &[u32],
+        dim: usize,
+        base: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_st = a_storage(x)?;
+        let dims = x_st.shape().dims().to_vec();
+        if dims.len() != 3 || dims[2] != dim {
+            return Err(Error::Shape(format!(
+                "RoPE expects (B,S,D={}), got {:?}",
+                dim, dims
+            )));
+        }
+        let (b, s, d) = (dims[0], dims[1], dims[2]);
+        let half = d / 2;
+        let inv_freq: Vec<f32> = (0..half)
+            .map(|i| 1.0 / base.powf((2 * i) as f32 / d as f32))
+            .collect();
+        let mut src = x_st.data().to_vec();
+        for bi in 0..b {
+            for si in 0..s {
+                let pos = positions[si] as f32;
+                let base_index = (bi * s + si) * d;
+                let mut cos_p = vec![0.0f32; half];
+                let mut sin_p = vec![0.0f32; half];
+                for i in 0..half {
+                    let a = pos * inv_freq[i];
+                    cos_p[i] = a.cos();
+                    sin_p[i] = a.sin();
+                }
+                for i in 0..half {
+                    let x1 = src[base_index + i];
+                    let x2 = src[base_index + half + i];
+                    src[base_index + i] = x1 * cos_p[i] - x2 * sin_p[i];
+                    src[base_index + half + i] = x1 * sin_p[i] + x2 * cos_p[i];
+                }
+            }
+        }
+        Ok((
+            Box::new(CpuStorage::new(src, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
     fn embedding(
         &self,
         weight: &dyn BackendStorage,

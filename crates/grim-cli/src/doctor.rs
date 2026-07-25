@@ -97,7 +97,7 @@ fn check_unit_file(report: &mut DoctorReport, service_name: &str, _exec_path: &s
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             report.unit_file_exists = Some(false);
             report.unit_file_verifies = Some(false);
-            report.warnings.push("Systemd unit file not found at /etc/systemd/system/grim.service".into());
+            report.warnings.push(format!("Systemd unit file not found at {path}"));
             eprintln!("[WARN] Systemd unit file not found at {}.", path);
             eprintln!("      Run 'grim service install --config /etc/grim/grim.toml' to install.");
         }

@@ -88,8 +88,8 @@ impl StreamingBlockForward {
         // Save input checkpoint for recomputation during backward pass
         self.checkpoint_buffer.save(layer_idx, x.clone());
 
-        // Load block weights lazily from provider, run real forward
-        let ws = WeightSource::root(provider, Device::Cpu);
+        // Load block weights lazily from provider on target tensor device, run real forward
+        let ws = WeightSource::root(provider, x.device().clone());
         let block_ws = ws.pp("layers").pp(&layer_idx.to_string());
         let block = LlamaBlock::load(&block_ws, cfg)?;
         block.forward(x)
@@ -108,11 +108,221 @@ impl StreamingBlockForward {
             .get(layer_idx)
             .ok_or_else(|| Error::Config(format!("missing activation checkpoint for layer {}", layer_idx)))?;
 
-        // Reload block weights from provider, run real forward from saved input
-        let ws = WeightSource::root(provider, Device::Cpu);
+        // Reload block weights from provider on target tensor device, run real forward from saved input
+        let ws = WeightSource::root(provider, input_x.device().clone());
         let block_ws = ws.pp("layers").pp(&layer_idx.to_string());
         let block = LlamaBlock::load(&block_ws, cfg)?;
         block.forward(input_x)
+    }
+
+    /// Run streaming block-wise forward pass for `layer_idx` with autograd tape recording.
+    ///
+    /// Loads block weights lazily from `provider`, executes pre-norm attention and SwiGLU FFN,
+    /// applies enabled LoRA adapters via `apply_and_record_lora`, and records `LoRAApply` and `Add`
+    /// entries on `tape`. Returns `(output_tensor_id, output_tensor)`.
+    pub fn forward_block_with_autograd(
+        &mut self,
+        provider: &dyn TensorProvider,
+        cfg: &LlamaConfig,
+        autograd_reg: &grim_autograd::AutogradRegistry,
+        tape: &mut grim_autograd::Tape,
+        layer_idx: usize,
+        x: &Tensor,
+        x_id: grim_autograd::TensorId,
+    ) -> Result<(grim_autograd::TensorId, Tensor)> {
+        if layer_idx >= self.num_layers {
+            return Err(Error::Config(format!(
+                "layer_idx {} out of bounds for num_layers {}",
+                layer_idx, self.num_layers
+            )));
+        }
+
+        self.checkpoint_buffer.save(layer_idx, x.clone());
+
+        let ws = WeightSource::root(provider, x.device().clone());
+        let block_ws = ws.pp("layers").pp(&layer_idx.to_string());
+        let block = LlamaBlock::load(&block_ws, cfg)?;
+
+        // Pre-attention norm & Q/K/V projections
+        let x_norm = block.attn_norm.forward(x)?;
+        let x_norm_base_id = tape.register(x_norm.clone());
+
+        let q_base = block.wq.forward(&x_norm)?;
+        let q_base_id = tape.register(q_base.clone());
+        let (_q_id, q) = grim_autograd::apply_and_record_lora(
+            autograd_reg,
+            tape,
+            layer_idx,
+            grim_autograd::LoRAInjectionPoint::QProj,
+            q_base,
+            q_base_id,
+            x_norm.clone(),
+            x_norm_base_id,
+        )?;
+
+        let k_base = block.wk.forward(&x_norm)?;
+        let k_base_id = tape.register(k_base.clone());
+        let (_k_id, k) = grim_autograd::apply_and_record_lora(
+            autograd_reg,
+            tape,
+            layer_idx,
+            grim_autograd::LoRAInjectionPoint::KProj,
+            k_base,
+            k_base_id,
+            x_norm.clone(),
+            x_norm_base_id,
+        )?;
+
+        let v_base = block.wv.forward(&x_norm)?;
+        let v_base_id = tape.register(v_base.clone());
+        let (_v_id, v) = grim_autograd::apply_and_record_lora(
+            autograd_reg,
+            tape,
+            layer_idx,
+            grim_autograd::LoRAInjectionPoint::VProj,
+            v_base,
+            v_base_id,
+            x_norm.clone(),
+            x_norm_base_id,
+        )?;
+
+        // Attention output projection
+        let qd = q.to_vec_f32()?;
+        let kd = k.to_vec_f32()?;
+        let vd = v.to_vec_f32()?;
+        let num_head_dims = cfg.num_heads * cfg.head_dim;
+        let total_tokens = qd.len() / num_head_dims;
+        let scale = 1.0 / (cfg.head_dim as f32).sqrt();
+        let mut attn_raw_data = vec![0.0f32; total_tokens * num_head_dims];
+        let kv_stride = cfg.num_kv_heads * cfg.head_dim;
+
+        for h in 0..cfg.num_heads {
+            let kvh = (h * cfg.num_kv_heads) / cfg.num_heads;
+            for t in 0..total_tokens {
+                let mut scores = vec![0.0f32; total_tokens];
+                for t2 in 0..total_tokens {
+                    if t2 > t {
+                        scores[t2] = f32::NEG_INFINITY;
+                    } else {
+                        let mut dot = 0.0f32;
+                        for d in 0..cfg.head_dim {
+                            dot += qd[t * num_head_dims + h * cfg.head_dim + d]
+                                * kd[t2 * kv_stride + kvh * cfg.head_dim + d];
+                        }
+                        scores[t2] = dot * scale;
+                    }
+                }
+                let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in &mut scores {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
+                for s in &mut scores {
+                    *s /= sum;
+                }
+                for d in 0..cfg.head_dim {
+                    let mut acc = 0.0f32;
+                    for t2 in 0..total_tokens {
+                        acc += scores[t2] * vd[t2 * kv_stride + kvh * cfg.head_dim + d];
+                    }
+                    attn_raw_data[t * num_head_dims + h * cfg.head_dim + d] = acc;
+                }
+            }
+        }
+        let attn_raw = grim_backend_cpu::cpu_tensor(attn_raw_data, grim_tensor::Shape::new(vec![total_tokens, num_head_dims]));
+        let attn_raw_id = tape.register(attn_raw.clone());
+
+        let wo_base = block.wo.forward(&attn_raw)?;
+        let wo_base_id = tape.register(wo_base.clone());
+        let (wo_id, wo_out) = grim_autograd::apply_and_record_lora(
+            autograd_reg,
+            tape,
+            layer_idx,
+            grim_autograd::LoRAInjectionPoint::OProj,
+            wo_base,
+            wo_base_id,
+            attn_raw,
+            attn_raw_id,
+        )?;
+
+        // Residual addition 1
+        let dev = grim_autograd::pick_device_for_tensor(&x);
+        let (res1_storage, _) = dev.add(x.storage().as_ref(), wo_out.storage().as_ref(), x.shape())?;
+        let res1 = Tensor::new(
+            std::sync::Arc::from(res1_storage),
+            x.shape().clone(),
+            grim_tensor::DType::F32,
+            x.provenance().clone(),
+            x.device().clone(),
+        );
+        let res1_id = tape.record_add(x_id, wo_id, res1.clone(), None);
+
+        // FFN pre-norm & Gate/Up/Down projections
+        let ffn_norm_out = block.ffn_norm.forward(&res1)?;
+        let ffn_norm_id = tape.register(ffn_norm_out.clone());
+
+        let gate_base = block.w_gate.forward(&ffn_norm_out)?;
+        let gate_base_id = tape.register(gate_base.clone());
+        let (_gate_id, gate) = grim_autograd::apply_and_record_lora(
+            autograd_reg,
+            tape,
+            layer_idx,
+            grim_autograd::LoRAInjectionPoint::GateProj,
+            gate_base,
+            gate_base_id,
+            ffn_norm_out.clone(),
+            ffn_norm_id,
+        )?;
+
+        let up_base = block.w_up.forward(&ffn_norm_out)?;
+        let up_base_id = tape.register(up_base.clone());
+        let (_up_id, up) = grim_autograd::apply_and_record_lora(
+            autograd_reg,
+            tape,
+            layer_idx,
+            grim_autograd::LoRAInjectionPoint::UpProj,
+            up_base,
+            up_base_id,
+            ffn_norm_out.clone(),
+            ffn_norm_id,
+        )?;
+
+        let (silu_storage, _) = dev.silu_mul(gate.storage().as_ref(), up.storage().as_ref(), gate.shape())?;
+        let silu_tensor = Tensor::new(
+            std::sync::Arc::from(silu_storage),
+            gate.shape().clone(),
+            grim_tensor::DType::F32,
+            gate.provenance().clone(),
+            gate.device().clone(),
+        );
+        let silu_id = tape.register(silu_tensor.clone());
+
+        let down_base = block.w_down.forward(&silu_tensor)?;
+        let down_base_id = tape.register(down_base.clone());
+        let (down_id, down_out) = grim_autograd::apply_and_record_lora(
+            autograd_reg,
+            tape,
+            layer_idx,
+            grim_autograd::LoRAInjectionPoint::DownProj,
+            down_base,
+            down_base_id,
+            silu_tensor,
+            silu_id,
+        )?;
+
+        // Residual addition 2
+        let (res2_storage, _) = dev.add(res1.storage().as_ref(), down_out.storage().as_ref(), x.shape())?;
+        let res2 = Tensor::new(
+            std::sync::Arc::from(res2_storage),
+            x.shape().clone(),
+            grim_tensor::DType::F32,
+            x.provenance().clone(),
+            x.device().clone(),
+        );
+        let res2_id = tape.record_add(res1_id, down_id, res2.clone(), None);
+
+        Ok((res2_id, res2))
     }
 }
 
