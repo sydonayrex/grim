@@ -1,5 +1,5 @@
-//! HIP/C++ source for the six compute ops (add / mul / silu_mul / rms_norm /
-//! softmax / embedding / rmsnorm_matmul).
+//! HIP/C++ source for the six compute ops (add / mul / mul_scalar / sqrt /
+//! silu_mul / rms_norm / softmax / embedding / rmsnorm_matmul / rope).
 //!
 //! Each entry point is `extern "C"` so `hipModuleGetFunction` resolves it
 //! without name mangling.  The Phase-1 QKV attention kernel lives in
@@ -22,6 +22,51 @@ extern "C" __global__ void grim_mul(float* a, float* b, float* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     c[i] = a[i] * b[i];
+}
+
+extern "C" __global__ void grim_mul_scalar(const float* x, float s, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = x[i] * s;
+}
+
+extern "C" __global__ void grim_sqrt(const float* x, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = sqrtf(x[i]);
+}
+
+extern "C" __global__ void grim_recip(const float* x, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = 1.0f / x[i];
+}
+
+extern "C" __global__ void grim_rope(const float* x, const unsigned int* positions,
+                                     float* out,
+                                     int b, int s, int d, int half, float base) {
+    // One thread per (batch, step, dim-half-pair) element. Matches the CPU
+    // `BackendDevice::rope` semantics: 3-D input [B, S, D] with positions[si]
+    // per step, applying the rotation x1=x[i], x2=x[i+half] per pair.
+    int total = b * s * half;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int bi = idx / (s * half);
+    int rem = idx - bi * (s * half);
+    int si = rem / half;
+    int i = rem - si * half;
+    float pos = (float)positions[si];
+    float freq = 1.0f / powf(base, (2.0f * (float)i) / (float)d);
+    float val = pos * freq;
+    float sin_val = sinf(val);
+    float cos_val = cosf(val);
+    int base_idx = (bi * s + si) * d;
+    int a_idx = base_idx + i;
+    int b_idx = base_idx + half + i;
+    float x1 = x[a_idx];
+    float x2 = x[b_idx];
+    out[a_idx] = x1 * cos_val - x2 * sin_val;
+    out[b_idx] = x1 * sin_val + x2 * cos_val;
 }
 
 extern "C" __global__ void grim_silu_mul(float* gate, float* up, float* out, int n) {
