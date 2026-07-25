@@ -141,8 +141,8 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             let cleanName = (d.name || '').replace(/NVIDIA AMD\/ATI/gi, 'Radeon GPU').replace(/AMD\/ATI/gi, '').trim();
-            if (!cleanName || cleanName.toLowerCase().includes('generic')) {
-              cleanName = d.gcn_arch || 'GPU Accelerator';
+            if (!cleanName || cleanName.toLowerCase().includes('generic') || cleanName === 'Radeon GPU') {
+              cleanName = d.gcn_arch ? `Radeon GPU (${d.gcn_arch})` : 'GPU Accelerator';
             }
             const nameStr = `${backendTag} ${cleanName}`;
             const totalGb = (d.vram_bytes / (1024 * 1024 * 1024)).toFixed(1);
