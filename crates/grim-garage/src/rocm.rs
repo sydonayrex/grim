@@ -161,6 +161,36 @@ pub fn detect_amd_arch(gcn_arch: &str, marketing_name: &str) -> String {
     }
 }
 
+/// Helper to extract clean user-friendly marketing product names (e.g. RX 9070, RX 7900 XTX, Radeon 680M).
+pub fn user_friendly_amd_name(gcn_arch: &str, marketing_name: &str) -> String {
+    let name_trim = marketing_name.trim();
+    if !name_trim.is_empty()
+        && !name_trim.starts_with("c_")
+        && !name_trim.starts_with("Device ")
+        && !name_trim.eq_ignore_ascii_case("generic_amd_gpu")
+    {
+        return name_trim.to_string();
+    }
+    let lower = gcn_arch.to_lowercase();
+    if lower.contains("gfx13") {
+        "Radeon RX 9070".to_string()
+    } else if lower.contains("gfx1200") || lower.contains("gfx1201") {
+        "Radeon RX 8800 XT".to_string()
+    } else if lower.contains("gfx1100") {
+        "Radeon RX 7900 XTX".to_string()
+    } else if lower.contains("gfx1101") || lower.contains("gfx1102") {
+        "Radeon RX 7800 XT".to_string()
+    } else if lower.contains("gfx1036") {
+        "Radeon 680M iGPU".to_string()
+    } else if lower.contains("gfx1030") {
+        "Radeon RX 6800 XT".to_string()
+    } else if !gcn_arch.is_empty() {
+        format!("Radeon {gcn_arch}")
+    } else {
+        "Radeon GPU".to_string()
+    }
+}
+
 /// Query official AMD `rocminfo` tool for installed ROCm HIP GPUs.
 pub fn query_rocminfo_gpus() -> Vec<RocmDeviceInfo> {
     let mut devices = Vec::new();
@@ -178,14 +208,15 @@ pub fn query_rocminfo_gpus() -> Vec<RocmDeviceInfo> {
             for line in text.lines() {
                 let trimmed = line.trim();
                 if trimmed.starts_with("Agent ") {
-                    if is_gpu && !name.is_empty() {
+                    if is_gpu && (!name.is_empty() || !marketing_name.is_empty()) {
                         let full_arch = detect_amd_arch(&name, &marketing_name);
+                        let friendly_name = user_friendly_amd_name(&name, &marketing_name);
                         let is_w32 = wavefront_size == 32;
                         let is_w64 = wavefront_size == 64;
                         let is_cdna = name.starts_with("gfx94") || name.starts_with("gfx90");
                         devices.push(RocmDeviceInfo {
                             ordinal,
-                            name: if marketing_name.is_empty() { format!("AMD GPU ({name})") } else { marketing_name.clone() },
+                            name: friendly_name,
                             vendor: "AMD".to_string(),
                             backend: "ROCm".to_string(),
                             is_rocm_compliant: true,
@@ -235,14 +266,15 @@ pub fn query_rocminfo_gpus() -> Vec<RocmDeviceInfo> {
                 }
             }
 
-            if is_gpu && !name.is_empty() {
+            if is_gpu && (!name.is_empty() || !marketing_name.is_empty()) {
                 let full_arch = detect_amd_arch(&name, &marketing_name);
+                let friendly_name = user_friendly_amd_name(&name, &marketing_name);
                 let is_w32 = wavefront_size == 32;
                 let is_w64 = wavefront_size == 64;
                 let is_cdna = name.starts_with("gfx94") || name.starts_with("gfx90");
                 devices.push(RocmDeviceInfo {
                     ordinal,
-                    name: if marketing_name.is_empty() { format!("AMD GPU ({name})") } else { marketing_name.clone() },
+                    name: friendly_name,
                     vendor: "AMD".to_string(),
                     backend: "ROCm".to_string(),
                     is_rocm_compliant: true,
