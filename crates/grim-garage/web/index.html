@@ -36,6 +36,9 @@
         <button class="nav-item" data-tab="settings" id="nav-settings">
           <span class="icon">⚙️</span> Expert Settings
         </button>
+        <button class="nav-item" data-tab="chat" id="nav-chat">
+          <span class="icon">💬</span> Interactive Chat
+        </button>
       </nav>
 
       <div class="gpu-badge" id="gpu-telemetry-badge">
@@ -372,6 +375,49 @@
             <button class="btn btn-primary" id="btn-save-settings">💾 Save Expert Engine Settings</button>
             <span id="save-settings-msg" style="font-size: 13px; color: var(--success-color); margin-left: 12px; display: none;">✅ Settings Saved</span>
           </div>
+        </div>
+      </section>
+
+      <!-- TAB 6: Interactive Chat Playground -->
+      <section class="tab-page" id="page-chat">
+        <div class="card card-panel" style="display: flex; flex-direction: column; min-height: 580px; padding: 20px;">
+          <!-- Top Model & Parameter Controls Bar -->
+          <div style="display: flex; gap: 16px; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border-card); padding-bottom: 16px; margin-bottom: 16px; flex-wrap: wrap;">
+            <div>
+              <h2 style="margin-bottom: 4px;">💬 Interactive Model Chat Playground</h2>
+              <p class="subtitle" style="margin-bottom: 0;">Test model inference & language responses before and after fine-tuning. Accepts both .grim and .gguf checkpoints.</p>
+            </div>
+
+            <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+              <div>
+                <label for="select-chat-model" style="font-size: 11px; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 4px;">Selected Model Checkpoint</label>
+                <select id="select-chat-model" class="form-control" style="width: 260px;">
+                  <option value="">Loading models...</option>
+                </select>
+              </div>
+
+              <div>
+                <label for="input-chat-temp" style="font-size: 11px; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 4px;">Temperature: <span id="val-chat-temp">0.7</span></label>
+                <input type="range" id="input-chat-temp" min="0.1" max="1.5" step="0.05" value="0.7" style="width: 110px;">
+              </div>
+
+              <button type="button" class="btn btn-secondary btn-sm" id="btn-clear-chat" style="margin-top: 14px;">🗑️ Clear Chat</button>
+            </div>
+          </div>
+
+          <!-- Main Message Thread Box -->
+          <div id="chat-messages-container" style="flex: 1; overflow-y: auto; max-height: 420px; min-height: 320px; padding: 12px; background: rgba(15, 23, 42, 0.4); border-radius: 8px; border: 1px solid var(--border-card); margin-bottom: 16px; display: flex; flex-direction: column; gap: 12px;">
+            <!-- Welcome System Message -->
+            <div style="align-self: center; background: rgba(255,255,255,0.05); padding: 8px 16px; border-radius: 20px; font-size: 12px; color: var(--text-muted); text-align: center;">
+              Select a model checkpoint (.grim / .gguf) and type a prompt to verify language & reasoning output.
+            </div>
+          </div>
+
+          <!-- Bottom Message Input Dock -->
+          <form id="form-chat-send" onsubmit="return false;" style="display: flex; gap: 10px; align-items: flex-end;">
+            <textarea id="input-chat-prompt" class="form-control" rows="2" placeholder="Type prompt or question to verify model response..." style="flex: 1; resize: none; border-radius: 8px;"></textarea>
+            <button type="submit" class="btn btn-primary" id="btn-chat-send" style="height: 46px; padding: 0 24px; font-weight: 600;">🚀 Send</button>
+          </form>
         </div>
       </section>
     </main>
