@@ -327,9 +327,9 @@ for (tokens, labels) in dataset.iter() {
             let seq_len = input_ids.len();
             let hidden = model_config.hidden_size;
 
-            // Token embeddings — replaces the old fake-embedding path that
-            // cast raw IDs to f32 and silently built a malformed tensor of the
-            // wrong element count (now caught by `cpu_tensor`'s shape guard).
+            let mut tape = Tape::new();
+            streaming.checkpoint.clear();
+
             let mut hidden_state = tok_embeddings
                 .forward(input_ids, seq_len, hidden)
                 .map_err(|e| Error::Session(format!("token embedding forward failed: {e}")))?;
