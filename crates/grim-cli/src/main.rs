@@ -237,6 +237,9 @@ enum Commands {
         /// LoRA alpha.
         #[arg(long, default_value_t = 32.0)]
         alpha: f32,
+        /// Target compute device (e.g. "cpu", "rocm", "rocm:0").
+        #[arg(long, default_value = "cpu")]
+        device: String,
     },
     /// Convert a model file to ROCm-optimized .grim format using Oxidizer.
     /// Supports GGUF (.gguf), GGML (.ggml), safetensors (.safetensors), and PyTorch (.bin).
@@ -325,22 +328,38 @@ enum Commands {
 enum ServiceCommands {
     /// Install platform-native background daemon.
     Install {
-        #[arg(short, long, default_value = "grim")]
+        /// Service name registered with the OS service manager.
+        #[arg(short, long, default_value = service::DEFAULT_SERVICE_NAME)]
         name: String,
         #[arg(short, long, default_value = "grim.toml")]
         config: String,
     },
     /// Uninstall platform-native background daemon.
     Uninstall {
+        /// Service name registered with the OS service manager.
+        #[arg(short, long, default_value = service::DEFAULT_SERVICE_NAME)]
+        name: String,
         #[arg(short, long)]
         purge: bool,
     },
     /// Start service daemon.
-    Start,
+    Start {
+        /// Service name registered with the OS service manager.
+        #[arg(short, long, default_value = service::DEFAULT_SERVICE_NAME)]
+        name: String,
+    },
     /// Stop service daemon.
-    Stop,
+    Stop {
+        /// Service name registered with the OS service manager.
+        #[arg(short, long, default_value = service::DEFAULT_SERVICE_NAME)]
+        name: String,
+    },
     /// Query current service status.
-    Status,
+    Status {
+        /// Service name registered with the OS service manager.
+        #[arg(short, long, default_value = service::DEFAULT_SERVICE_NAME)]
+        name: String,
+    },
     /// Run the service process (invoked by Windows SCM/service manager).
     Run {
         #[arg(short, long, default_value = "grim.toml")]
@@ -540,9 +559,15 @@ async fn main() -> Result<()> {
             // `grim serve` — starts the HTTP server. Scans the models directory
             // for the first available model and loads its tokenizer automatically.
             let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+            if !plugins.is_empty() {
+                let mut registry = grim_plugin::PluginRegistry::new();
+                match plugin::load_plugins(&plugins, &mut registry) {
+                    Ok(n) => eprintln!("[grim] serve: loaded {n} plugin(s) from {plugins}"),
+                    Err(e) => eprintln!("[grim] serve: failed to load plugins from {plugins}: {e}"),
+                }
+            }
             eprintln!("[grim] serve: binding to {address} (Ollama-compatible)");
             grim_server::serve(&address, engine, None).await?;
-            let _ = plugins;
         }
         Commands::Run { model, prompt, serve, address, config: _, plugins, rocml_profile, temperature, top_p, top_k, max_tokens, seed, repeat_penalty } => {
             // The --rocml-profile flag documents an explicit ROCm tuning
@@ -677,7 +702,7 @@ async fn main() -> Result<()> {
         Commands::Quantize => {
             println!("Quantize command — not yet implemented (phase 2).");
         }
-        Commands::Train { model, dataset, output, epochs, lr, rank, alpha } => {
+        Commands::Train { model, dataset, output, epochs, lr, rank, alpha, device } => {
             let opts = train::TrainOptions {
                 model_path: model,
                 dataset_path: dataset,
@@ -686,6 +711,7 @@ async fn main() -> Result<()> {
                 lr,
                 rank,
                 alpha,
+                device,
             };
             if let Err(e) = train::cmd_train(opts) {
                 eprintln!("[grim train] Failed: {e}");
@@ -710,19 +736,25 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Service { subcommand } => {
-            // Select appropriate platform manager
-            let manager: Box<dyn service::ServiceManager> = if cfg!(target_os = "windows") {
-                Box::new(service::WindowsScmManager)
-            } else if cfg!(target_os = "macos") {
-                Box::new(service::LaunchdManager)
-            } else {
-                Box::new(service::SystemdManager)
+            // Build a platform service manager carrying the resolved service
+            // name. There is exactly one source of truth for the name: it
+            // flows from the `--name` flag of whichever subcommand ran, into
+            // the manager at construction. `install`'s `ServiceConfig` no
+            // longer carries a `name` field — the manager is the sole owner.
+            let build_manager = |name: String| -> Box<dyn service::ServiceManager> {
+                if cfg!(target_os = "windows") {
+                    Box::new(service::WindowsScmManager::new(name))
+                } else if cfg!(target_os = "macos") {
+                    Box::new(service::LaunchdManager::new(name))
+                } else {
+                    Box::new(service::SystemdManager::new(name))
+                }
             };
 
             match subcommand {
                 ServiceCommands::Install { name, config } => {
+                    let manager = build_manager(name);
                     let cfg = service::ServiceConfig {
-                        name,
                         exec_path: std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("grim")),
                         config_path: std::path::PathBuf::from(config),
                         restart_policy: service::RestartPolicy::OnFailure,
@@ -738,22 +770,23 @@ async fn main() -> Result<()> {
                     manager.install(&cfg)?;
                     println!("Service installation finished successfully.");
                 }
-                ServiceCommands::Uninstall { purge } => {
-                    manager.uninstall(purge)?;
+                ServiceCommands::Uninstall { name, purge } => {
+                    build_manager(name).uninstall(purge)?;
                     println!("Service uninstall finished successfully.");
                 }
-                ServiceCommands::Start => {
-                    manager.start()?;
+                ServiceCommands::Start { name } => {
+                    build_manager(name).start()?;
                 }
-                ServiceCommands::Stop => {
-                    manager.stop()?;
+                ServiceCommands::Stop { name } => {
+                    build_manager(name).stop()?;
                 }
-                ServiceCommands::Status => {
+                ServiceCommands::Status { name } => {
+                    let manager = build_manager(name.clone());
                     match manager.status()? {
-                        service::ServiceStatus::Running => println!("grim service: running"),
-                        service::ServiceStatus::Stopped => println!("grim service: stopped"),
-                        service::ServiceStatus::Failed(msg) => println!("grim service: FAILED — {msg}"),
-                        service::ServiceStatus::Unknown(s) => println!("grim service: unknown ({s})"),
+                        service::ServiceStatus::Running => println!("{name} service: running"),
+                        service::ServiceStatus::Stopped => println!("{name} service: stopped"),
+                        service::ServiceStatus::Failed(msg) => println!("{name} service: FAILED — {msg}"),
+                        service::ServiceStatus::Unknown(s) => println!("{name} service: unknown ({s})"),
                     }
                 }
                 ServiceCommands::Run { config } => {
@@ -1025,7 +1058,7 @@ fn run_service_loop() -> Result<()> {
         }
     };
 
-    let status_handle = service_control_handler::register("grim", event_handler)
+    let status_handle = service_control_handler::register(service::SERVICE_NAME, event_handler)
         .map_err(|e| grim_core::error::Error::Backend(format!("Failed to register SCM handler: {e}")))?;
 
     status_handle.set_service_status(ServiceStatus {
@@ -1065,7 +1098,7 @@ fn run_service_loop() -> Result<()> {
 #[cfg(target_os = "windows")]
 fn run_windows_service_dispatcher(_config: &str) -> Result<()> {
     use windows_service::service_dispatcher;
-    service_dispatcher::start("grim", ffi_service_main)
+    service_dispatcher::start(service::SERVICE_NAME, ffi_service_main)
         .map_err(|e| grim_core::error::Error::Backend(format!("Failed to start service dispatcher: {e}")))?;
     Ok(())
 }

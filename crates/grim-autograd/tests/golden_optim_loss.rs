@@ -89,8 +89,8 @@ fn adamw_one_step_matches_hand_computed_reference() {
     let got_w1 = params.get(id).unwrap().data.to_vec_f32().unwrap()[0];
     close(got_w1, want_w1, "adamw w1");
     assert_eq!(opt.step_count, 1, "adamw step_count");
-    let got_m = opt.m.get(&id).unwrap()[0];
-    let got_v = opt.v.get(&id).unwrap()[0];
+    let got_m = opt.m.get(&id).unwrap().to_cpu_vec_f32().unwrap()[0];
+    let got_v = opt.v.get(&id).unwrap().to_cpu_vec_f32().unwrap()[0];
     close(got_m, want_m, "adamw m");
     close(got_v, want_v, "adamw v");
 
@@ -120,8 +120,8 @@ fn adamw_one_step_matches_hand_computed_reference() {
     let got_w2 = params.get(id).unwrap().data.to_vec_f32().unwrap()[0];
     close(got_w2, want_w2, "adamw w2 (step_count=2 bias correction)");
     assert_eq!(opt.step_count, 2);
-    close(opt.m.get(&id).unwrap()[0], m2, "adamw m2");
-    close(opt.v.get(&id).unwrap()[0], v2, "adamw v2");
+    close(opt.m.get(&id).unwrap().to_cpu_vec_f32().unwrap()[0], m2, "adamw m2");
+    close(opt.v.get(&id).unwrap().to_cpu_vec_f32().unwrap()[0], v2, "adamw v2");
 }
 
 /// A mutant that drops the bias-correction (e.g. `m_hat = m` without dividing

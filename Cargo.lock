@@ -2035,6 +2035,7 @@ dependencies = [
  "grim-backend-metal",
  "grim-backend-rocm",
  "grim-format",
+ "grim-quant",
  "grim-tensor",
  "serde",
 ]
@@ -2082,6 +2083,7 @@ dependencies = [
  "grim-backend-cpu",
  "grim-format",
  "grim-kvquant",
+ "grim-quant",
  "grim-tensor",
  "half",
  "lazy_static",
@@ -2170,6 +2172,7 @@ dependencies = [
 name = "grim-engine"
 version = "0.1.0"
 dependencies = [
+ "grim-autograd",
  "grim-backend-cpu",
  "grim-backend-cuda",
  "grim-backend-metal",
@@ -2214,9 +2217,12 @@ dependencies = [
  "axum 0.8.9",
  "clap",
  "futures",
+ "grim-autograd",
  "grim-backend-cpu",
  "grim-backend-rocm",
+ "grim-engine",
  "grim-format",
+ "grim-models-transformer",
  "grim-tensor",
  "grim-tensor-graph",
  "serde",
@@ -2409,6 +2415,7 @@ dependencies = [
 name = "grim-tensor"
 version = "0.1.0"
 dependencies = [
+ "grim-backend-cpu",
  "thiserror 1.0.69",
 ]
 

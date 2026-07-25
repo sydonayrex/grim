@@ -342,8 +342,27 @@ impl BlockTable {
         self.logical_to_physical.push(block_id);
     }
 
-    pub fn truncate(&mut self, len: usize) {
-        self.logical_to_physical.truncate(len);
+    /// Truncate the logical table to `len` blocks, returning every freed
+    /// physical id to `pool`.
+    ///
+    /// `len` is a *block count* (this wraps `Vec<BlockId>::truncate`), not a
+    /// token count — there is no unit conversion here, which is deliberate to
+    /// avoid the block-vs-token arithmetic that bit the speculative
+    /// `commit`/`rollback_to` family.
+    ///
+    /// The free loop mirrors `PagedKvCache::rollback_to` exactly: pop from the
+    /// back of `logical_to_physical`, call `pool.free_with_tier(pid, false)`
+    /// per entry. Keeping both release paths structurally identical is worth
+    /// more than either being marginally more efficient in isolation.
+    pub fn truncate(&mut self, len: usize, pool: &mut KvBlockPool) {
+        if len >= self.logical_to_physical.len() {
+            return;
+        }
+        while self.logical_to_physical.len() > len {
+            if let Some(pid) = self.logical_to_physical.pop() {
+                pool.free_with_tier(pid, false).ok();
+            }
+        }
     }
 }
 
@@ -571,6 +590,73 @@ mod tests {
         } else {
             assert!(!pool.is_block_major());
         }
+    }
+
+    #[test]
+    fn block_table_truncate_returns_freed_ids_to_the_pool() {
+        // P1-2 partial: BlockTable::truncate must return the freed physical
+        // ids to the pool's free list, not merely forget them. The pre-fix
+        // body was `self.logical_to_physical.truncate(len)` (zero pool
+        // contact), so this test pins the fix and would re-leak on revert.
+        //
+        // Start with a 4-capacity pool (free_list length == 4), alloc three
+        // blocks into a table (free_list drops to 1), then truncate to 0 and
+        // require the free list to refill to 4 — the exact invariant the bare
+        // Vec::truncate version would fail.
+        let mut pool = KvBlockPool::new(4, 2, 4);
+        assert_eq!(pool.free_list.len(), 4, "fresh pool has 4 free blocks");
+
+        let mut table = BlockTable::new();
+        for _ in 0..3 {
+            let id = pool.alloc().unwrap();
+            table.push(id);
+        }
+        assert_eq!(
+            pool.free_list.len(),
+            1,
+            "three outstanding allocs leave one free block"
+        );
+        assert_eq!(table.len(), 3);
+
+        table.truncate(0, &mut pool);
+
+        assert_eq!(table.len(), 0, "table must be empty after truncate(0)");
+        assert_eq!(
+            pool.free_list.len(),
+            4,
+            "truncate must return all freed physical ids to the free list, \
+             not just drop them on the floor (the original P1-2 leak)"
+        );
+    }
+
+    #[test]
+    fn block_table_truncate_partial_keeps_prefix_and_frees_tail() {
+        // Partial truncate keeps the first `len` entries and returns only
+        // the tail ids to the pool. With 4 free, alloc 3 (leaves 1 free),
+        // truncate to 1: exactly 2 ids must come back, leaving 3 free.
+        let mut pool = KvBlockPool::new(4, 2, 4);
+        let mut table = BlockTable::new();
+        let mut pushed = Vec::new();
+        for _ in 0..3 {
+            let id = pool.alloc().unwrap();
+            pushed.push(id);
+            table.push(id);
+        }
+        assert_eq!(pool.free_list.len(), 1);
+
+        table.truncate(1, &mut pool);
+
+        assert_eq!(table.len(), 1, "prefix of one block must survive");
+        assert_eq!(
+            table.physical_ids()[0],
+            pushed[0],
+            "the surviving physical id must be the one that was pushed first"
+        );
+        assert_eq!(
+            pool.free_list.len(),
+            3,
+            "exactly the two truncated tail ids return to the free list"
+        );
     }
 
     #[test]

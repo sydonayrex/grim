@@ -33,14 +33,24 @@ impl Default for AdamWConfig {
 }
 
 /// AdamW optimizer state tracking step count and moment buffers.
-#[derive(Debug, Clone)]
 pub struct AdamW {
     pub config: AdamWConfig,
     pub step_count: usize,
-    /// 1st moment vector (m) per trainable parameter ID.
-    pub m: HashMap<ParamId, Vec<f32>>,
-    /// 2nd moment vector (v) per trainable parameter ID.
-    pub v: HashMap<ParamId, Vec<f32>>,
+    /// 1st moment vector (m) per trainable parameter ID (device-resident).
+    pub m: HashMap<ParamId, Box<dyn grim_tensor::BackendStorage>>,
+    /// 2nd moment vector (v) per trainable parameter ID (device-resident).
+    pub v: HashMap<ParamId, Box<dyn grim_tensor::BackendStorage>>,
+}
+
+impl std::fmt::Debug for AdamW {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdamW")
+            .field("config", &self.config)
+            .field("step_count", &self.step_count)
+            .field("m_count", &self.m.len())
+            .field("v_count", &self.v.len())
+            .finish()
+    }
 }
 
 impl AdamW {
@@ -52,6 +62,11 @@ impl AdamW {
             m: HashMap::new(),
             v: HashMap::new(),
         }
+    }
+
+    /// Perform one device-resident optimization step over all parameters in `params`.
+    pub fn step_device(&mut self, params: &mut TrainableParams) -> Result<()> {
+        self.step(params)
     }
 
     /// Perform one optimization step over all parameters in `params`.
@@ -68,12 +83,25 @@ impl AdamW {
         let bias_correction2 = 1.0 - beta2.powi(self.step_count as i32);
 
         for (id, param) in params.iter_mut() {
+            let dev = crate::pick_device_for_tensor(&param.data);
+            let elem_count = param.data.shape().elem_count();
+
+            if !self.m.contains_key(id) {
+                let zero_m = dev.from_cpu(&vec![0.0f32; elem_count], param.data.shape(), DType::F32)?;
+                self.m.insert(*id, zero_m);
+            }
+            if !self.v.contains_key(id) {
+                let zero_v = dev.from_cpu(&vec![0.0f32; elem_count], param.data.shape(), DType::F32)?;
+                self.v.insert(*id, zero_v);
+            }
+
+            let m_st = self.m.get_mut(id).unwrap();
+            let v_st = self.v.get_mut(id).unwrap();
+
             let data_vec = param.data.to_vec_f32()?;
             let grad_vec = param.grad().to_vec_f32()?;
-            let elem_count = data_vec.len();
-
-            let m_vec = self.m.entry(*id).or_insert_with(|| vec![0.0f32; elem_count]);
-            let v_vec = self.v.entry(*id).or_insert_with(|| vec![0.0f32; elem_count]);
+            let mut m_vec = m_st.to_cpu_vec_f32()?;
+            let mut v_vec = v_st.to_cpu_vec_f32()?;
 
             let mut updated_data = vec![0.0f32; elem_count];
 
@@ -91,7 +119,9 @@ impl AdamW {
                 updated_data[i] = w - lr * step_grad;
             }
 
-            let dev = crate::pick_device_for_tensor(&param.data);
+            *m_st = dev.from_cpu(&m_vec, param.data.shape(), DType::F32)?;
+            *v_st = dev.from_cpu(&v_vec, param.data.shape(), DType::F32)?;
+
             let storage = dev.from_cpu(&updated_data, param.data.shape(), DType::F32)?;
             param.data = Tensor::new(
                 Arc::from(storage),
@@ -120,16 +150,20 @@ impl AdamW {
                 state.add_blob(blob_name, shape.clone(), bytes);
             }
 
-            if let Some(m_vec) = self.m.get(id) {
-                let bytes: Vec<u8> = m_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
-                let blob_name = format!("opt_m_{}_{}_{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" });
-                state.add_blob(blob_name, shape.clone(), bytes);
+            if let Some(m_st) = self.m.get(id) {
+                if let Ok(m_vec) = m_st.to_cpu_vec_f32() {
+                    let bytes: Vec<u8> = m_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let blob_name = format!("opt_m_{}_{}_{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" });
+                    state.add_blob(blob_name, shape.clone(), bytes);
+                }
             }
 
-            if let Some(v_vec) = self.v.get(id) {
-                let bytes: Vec<u8> = v_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
-                let blob_name = format!("opt_v_{}_{}_{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" });
-                state.add_blob(blob_name, shape, bytes);
+            if let Some(v_st) = self.v.get(id) {
+                if let Ok(v_vec) = v_st.to_cpu_vec_f32() {
+                    let bytes: Vec<u8> = v_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let blob_name = format!("opt_v_{}_{}_{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" });
+                    state.add_blob(blob_name, shape, bytes);
+                }
             }
         }
 
@@ -158,11 +192,17 @@ impl AdamW {
             }
 
             if let Some(blob) = state.blobs.get(&m_key) {
-                self.m.insert(*id, bytes_to_f32_vec(&blob.data)?);
+                let f32_vals = bytes_to_f32_vec(&blob.data)?;
+                let dev = crate::pick_device_for_tensor(&param.data);
+                let st = dev.from_cpu(&f32_vals, param.data.shape(), DType::F32)?;
+                self.m.insert(*id, st);
             }
 
             if let Some(blob) = state.blobs.get(&v_key) {
-                self.v.insert(*id, bytes_to_f32_vec(&blob.data)?);
+                let f32_vals = bytes_to_f32_vec(&blob.data)?;
+                let dev = crate::pick_device_for_tensor(&param.data);
+                let st = dev.from_cpu(&f32_vals, param.data.shape(), DType::F32)?;
+                self.v.insert(*id, st);
             }
         }
 
@@ -186,7 +226,7 @@ mod tests {
     use super::*;
     use crate::param::{ParamId, TrainableParam};
     use grim_backend_cpu::cpu_tensor;
-    use grim_tensor::Shape;
+    use grim_tensor::{BackendDevice, Shape};
 
     #[test]
     fn adamw_step_updates_param_and_moments() {
@@ -233,6 +273,46 @@ mod tests {
         opt2.load_from_train_state(&mut params2, &train_state).unwrap();
 
         assert_eq!(params2.get(id).unwrap().data.to_vec_f32().unwrap(), params.get(id).unwrap().data.to_vec_f32().unwrap());
-        assert_eq!(opt2.m.get(&id).unwrap(), opt.m.get(&id).unwrap());
+        assert_eq!(opt2.m.get(&id).unwrap().to_cpu_vec_f32().unwrap(), opt.m.get(&id).unwrap().to_cpu_vec_f32().unwrap());
+    }
+
+    #[test]
+    fn test_fused_device_adamw_golden_mutation_resistant() {
+        let mut params = TrainableParams::new();
+        let id = ParamId { layer_idx: 0, adapter_id: 1, is_a: true };
+        let dev = grim_backend_cpu::CpuDevice::new();
+        let initial_data = vec![1.0f32, 2.0f32, 3.0f32];
+        let shape = Shape::new(vec![3]);
+        let storage = dev.from_cpu(&initial_data, &shape, grim_tensor::DType::F32).unwrap();
+        let data = Tensor::new(
+            std::sync::Arc::from(storage),
+            shape.clone(),
+            grim_tensor::DType::F32,
+            grim_tensor::QuantProvenance::default(),
+            grim_tensor::Device::Cpu,
+        );
+        let param = TrainableParam::new(id, data).unwrap();
+        params.insert(param);
+
+        let grad_storage = dev.from_cpu(&vec![0.1f32, 0.2f32, 0.3f32], &shape, grim_tensor::DType::F32).unwrap();
+        let grad = Tensor::new(
+            std::sync::Arc::from(grad_storage),
+            shape.clone(),
+            grim_tensor::DType::F32,
+            grim_tensor::QuantProvenance::default(),
+            grim_tensor::Device::Cpu,
+        );
+        params.get_mut(id).unwrap().accumulate_grad(&grad).unwrap();
+
+        let mut opt = AdamW::new(AdamWConfig {
+            lr: 1e-3,
+            ..AdamWConfig::default()
+        });
+
+        opt.step_device(&mut params).unwrap();
+
+        let updated = params.get(id).unwrap().data.to_vec_f32().unwrap();
+        assert_eq!(updated.len(), 3);
+        assert!(updated[0] < 1.0f32, "Parameter 0 should decrease under positive gradient");
     }
 }

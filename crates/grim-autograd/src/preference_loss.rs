@@ -105,6 +105,144 @@ pub fn grpo_normalize_rewards(rewards: &[f32], eps: f32) -> Vec<f32> {
     rewards.iter().map(|&r| (r - mean) / std).collect()
 }
 
+/// Compute DPO loss and gradient tensors for autograd backward traversal.
+///
+/// Returns `(avg_loss_val, chosen_grad_tensor, rejected_grad_tensor)`.
+pub fn dpo_loss_autograd(
+    policy_chosen_logps: &grim_tensor::Tensor,
+    policy_rejected_logps: &grim_tensor::Tensor,
+    ref_chosen_logps: &[f32],
+    ref_rejected_logps: &[f32],
+    beta: f32,
+) -> Result<(f32, grim_tensor::Tensor, grim_tensor::Tensor)> {
+    let chosen_vec = policy_chosen_logps.to_vec_f32()?;
+    let rejected_vec = policy_rejected_logps.to_vec_f32()?;
+    let (loss_val, _, _) = dpo_loss(&chosen_vec, &rejected_vec, ref_chosen_logps, ref_rejected_logps, beta)?;
+
+    let n = chosen_vec.len();
+    let mut g_chosen = vec![0.0f32; n];
+    let mut g_rejected = vec![0.0f32; n];
+
+    let inv_n = 1.0 / (n as f32);
+    for i in 0..n {
+        let chosen_logr = chosen_vec[i] - ref_chosen_logps[i];
+        let rejected_logr = rejected_vec[i] - ref_rejected_logps[i];
+        let logits = beta * (chosen_logr - rejected_logr);
+
+        // sigmoid(-logits) = 1 / (1 + exp(logits))
+        let sig_neg = 1.0 / (1.0 + logits.exp().min(1e10));
+        g_chosen[i] = -beta * sig_neg * inv_n;
+        g_rejected[i] = beta * sig_neg * inv_n;
+    }
+
+    let dev = crate::pick_device_for_tensor(policy_chosen_logps);
+    let grad_c = grim_tensor::Tensor::new(
+        std::sync::Arc::from(dev.from_cpu(&g_chosen, policy_chosen_logps.shape(), grim_tensor::dtype::DType::F32)?),
+        policy_chosen_logps.shape().clone(),
+        grim_tensor::dtype::DType::F32,
+        policy_chosen_logps.provenance().clone(),
+        policy_chosen_logps.device().clone(),
+    );
+    let grad_r = grim_tensor::Tensor::new(
+        std::sync::Arc::from(dev.from_cpu(&g_rejected, policy_rejected_logps.shape(), grim_tensor::dtype::DType::F32)?),
+        policy_rejected_logps.shape().clone(),
+        grim_tensor::dtype::DType::F32,
+        policy_rejected_logps.provenance().clone(),
+        policy_rejected_logps.device().clone(),
+    );
+
+    Ok((loss_val, grad_c, grad_r))
+}
+
+/// Compute ORPO odds ratio loss and gradient tensors for autograd backward traversal.
+///
+/// Returns `(loss_val, chosen_grad_tensor, rejected_grad_tensor)`.
+pub fn orpo_odds_ratio_loss_autograd(
+    policy_chosen_logps: &grim_tensor::Tensor,
+    policy_rejected_logps: &grim_tensor::Tensor,
+    lambda: f32,
+) -> Result<(f32, grim_tensor::Tensor, grim_tensor::Tensor)> {
+    let chosen_vec = policy_chosen_logps.to_vec_f32()?;
+    let rejected_vec = policy_rejected_logps.to_vec_f32()?;
+    let loss_val = orpo_odds_ratio_loss(&chosen_vec, &rejected_vec, lambda)?;
+
+    let n = chosen_vec.len();
+    let mut g_chosen = vec![0.0f32; n];
+    let mut g_rejected = vec![0.0f32; n];
+    let inv_n = lambda / (n as f32);
+
+    for i in 0..n {
+        let p_chosen = chosen_vec[i].exp().clamp(1e-7, 1.0 - 1e-7);
+        let p_rejected = rejected_vec[i].exp().clamp(1e-7, 1.0 - 1e-7);
+
+        let odds_chosen = p_chosen / (1.0 - p_chosen);
+        let odds_rejected = p_rejected / (1.0 - p_rejected);
+        let log_odds_ratio = (odds_chosen / odds_rejected).ln();
+
+        let sig_neg = 1.0 / (1.0 + log_odds_ratio.exp().min(1e10));
+        g_chosen[i] = -inv_n * sig_neg / (1.0 - p_chosen).max(1e-7);
+        g_rejected[i] = inv_n * sig_neg / (1.0 - p_rejected).max(1e-7);
+    }
+
+    let dev = crate::pick_device_for_tensor(policy_chosen_logps);
+    let grad_c = grim_tensor::Tensor::new(
+        std::sync::Arc::from(dev.from_cpu(&g_chosen, policy_chosen_logps.shape(), grim_tensor::dtype::DType::F32)?),
+        policy_chosen_logps.shape().clone(),
+        grim_tensor::dtype::DType::F32,
+        policy_chosen_logps.provenance().clone(),
+        policy_chosen_logps.device().clone(),
+    );
+    let grad_r = grim_tensor::Tensor::new(
+        std::sync::Arc::from(dev.from_cpu(&g_rejected, policy_rejected_logps.shape(), grim_tensor::dtype::DType::F32)?),
+        policy_rejected_logps.shape().clone(),
+        grim_tensor::dtype::DType::F32,
+        policy_rejected_logps.provenance().clone(),
+        policy_rejected_logps.device().clone(),
+    );
+
+    Ok((loss_val, grad_c, grad_r))
+}
+
+/// Compute GRPO policy loss and gradient tensor for autograd backward traversal.
+///
+/// Returns `(mean_loss_val, policy_grad_tensor)`.
+pub fn grpo_loss_autograd(
+    policy_logps: &grim_tensor::Tensor,
+    rewards: &[f32],
+    eps: f32,
+) -> Result<(f32, grim_tensor::Tensor)> {
+    let logps_vec = policy_logps.to_vec_f32()?;
+    let norm_advantages = grpo_normalize_rewards(rewards, eps);
+
+    let n = logps_vec.len();
+    if norm_advantages.len() != n {
+        return Err(Error::Backend("GRPO rewards length mismatch".into()));
+    }
+
+    let mut total_loss = 0.0f32;
+    let mut grads = vec![0.0f32; n];
+    let inv_n = 1.0 / (n as f32);
+
+    for i in 0..n {
+        let adv = norm_advantages[i];
+        let loss_i = -adv * logps_vec[i];
+        total_loss += loss_i;
+        grads[i] = -adv * inv_n;
+    }
+
+    let avg_loss = total_loss * inv_n;
+    let dev = crate::pick_device_for_tensor(policy_logps);
+    let grad_tensor = grim_tensor::Tensor::new(
+        std::sync::Arc::from(dev.from_cpu(&grads, policy_logps.shape(), grim_tensor::dtype::DType::F32)?),
+        policy_logps.shape().clone(),
+        grim_tensor::dtype::DType::F32,
+        policy_logps.provenance().clone(),
+        policy_logps.device().clone(),
+    );
+
+    Ok((avg_loss, grad_tensor))
+}
+
 /// Numerically-stable softplus: `ln(1 + exp(x))` = `max(x, 0) + ln(1 + exp(-|x|))`.
 ///
 /// Equivalent to `-sigmoid(-x).ln()` (and to `-sigmoid(x).ln()` when called with

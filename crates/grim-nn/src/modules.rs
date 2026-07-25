@@ -44,6 +44,7 @@ pub struct Linear {
     pub weight: Tensor,
     pub bias: Option<Tensor>,
     pub w_t: Tensor,
+    pub quant_format: Option<DType>,
 }
 
 impl Linear {
@@ -55,17 +56,19 @@ impl Linear {
     pub fn load(ws: &WeightSource<'_>, in_dim: usize, out_dim: usize, has_bias: bool) -> Result<Self> {
         let weight = ws.get([out_dim, in_dim], "weight")?;
         let w_t = transpose_last_two(&weight)?;
+        let quant_format = if weight.dtype().is_quantized() { Some(weight.dtype().clone()) } else { None };
         let bias = if has_bias {
             Some(ws.get([out_dim], "bias")?)
         } else {
             None
         };
-        Ok(Self { weight, bias, w_t })
+        Ok(Self { weight, bias, w_t, quant_format })
     }
 
     pub fn from_tensor(weight: Tensor, bias: Option<Tensor>) -> Self {
         let w_t = transpose_last_two(&weight).unwrap_or_else(|_| weight.clone());
-        Self { weight, bias, w_t }
+        let quant_format = if weight.dtype().is_quantized() { Some(weight.dtype().clone()) } else { None };
+        Self { weight, bias, w_t, quant_format }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -77,11 +80,13 @@ impl Linear {
 
         let a_storage = x.storage().as_ref();
         let b_storage = self.w_t.storage().as_ref();
-        let (out_s, h) = BackendDevice::matmul(&*dev, a_storage, b_storage, &Shape::new(vec![batch, out_dim]))?;
+
+        let out_shape = Shape::new(vec![batch, out_dim]);
+        let (out_s, h) = BackendDevice::matmul(&*dev, a_storage, b_storage, &out_shape)?;
         h.synchronize()?;
         let mat_out = Tensor::new(
             Arc::from(out_s),
-            Shape::new(vec![batch, out_dim]),
+            out_shape,
             DType::F32,
             x.provenance().clone(),
             x.device().clone(),
@@ -116,6 +121,9 @@ impl Linear {
 }
 
 fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
+    if t.dtype().is_quantized() {
+        return Ok(t.clone());
+    }
     let dims = t.shape().dims().to_vec();
     if dims.len() != 2 {
         return Err(Error::Shape("transpose_last_two: only 2-D".into()));

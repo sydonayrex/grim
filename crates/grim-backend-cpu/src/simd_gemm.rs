@@ -5,6 +5,21 @@
 
 use std::arch::x86_64::*;
 
+/// Transpose a row-major matrix from `[rows, cols]` to `[cols, rows]`.
+///
+/// `mat` is the source laid out as `[rows, cols]` row-major; the returned
+/// `Vec` is laid out as `[cols, rows]` row-major, i.e. element `(r, c)` of the
+/// input lives at `out[c * rows + r]`.
+fn transpose_row_major(mat: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = mat[r * cols + c];
+        }
+    }
+    out
+}
+
 /// SIMD GEMM: C = A * B^T
 /// A: [M, K], B: [N, K], C: [M, N]
 /// Uses AVX2 when available, falls back to scalar.
@@ -84,21 +99,29 @@ pub fn gemm_f32_lora_fused(
     scale: f32,
     y: &mut [f32],
 ) {
-    // Compute X * W
+    // Compute X * W.
+    // gemm_f32_simd reads its second argument as [N, K] row-major and returns
+    // X * W^T, so the caller supplies W in [N, K] row-major.
     gemm_f32_simd(m, n, k, x, w, y);
-    
-    // Compute X * A * B and add to result
-    // A: [K, rank], B: [rank, N]
-    // intermediate: [M, rank] = X * A
+
+    // Compute the LoRA term (X * A) * B and add it to the result.
+    // Doc contract: A is [K, rank] row-major, B is [rank, N] row-major.
+    // gemm_f32_simd computes C = LHS * RHS^T with RHS in [cols, K] row-major,
+    // so to get (X * A) we must feed it A^T, i.e. A laid out as [rank, K]
+    // row-major (a[r * k + h]).
     let mut intermediate = vec![0.0f32; m * lora_rank];
-    gemm_f32_simd(m, lora_rank, k, x, a, &mut intermediate);
-    
-    // Y += intermediate * B * scale
+    let a_t = transpose_row_major(a, k, lora_rank); // [K, rank] -> [rank, K]
+    gemm_f32_simd(m, lora_rank, k, x, &a_t, &mut intermediate);
+
+    // Y += intermediate * B * scale. gemm_f32_simd would compute
+    // intermediate * B^T and expects B in [N, rank] row-major; for the plain
+    // (intermediate * B) product with B in [rank, N] row-major we do the
+    // rank-reduction by hand instead.
     for i in 0..m {
         for j in 0..n {
             let mut sum = 0.0f32;
             for r in 0..lora_rank {
-                sum += intermediate[i * lora_rank + r] * b[j * lora_rank + r];
+                sum += intermediate[i * lora_rank + r] * b[r * n + j];
             }
             y[i * n + j] += sum * scale;
         }
@@ -172,37 +195,57 @@ mod tests {
 
     #[test]
     fn test_gemm_lora_fused() {
-        // Non-identity matrices with exact expected values.
-        // GEMM convention: C = A * B^T (B stored as N x K row-major).
-        // X: MxK = 1x2, W: NxK = 3x2, A: Kxrank = 2x1, B: rankxN = 1x3
-        let x = vec![1.0, 2.0]; // 1x2 (M=1, K=2)
+        // Exercises the fused-LoRA path with lora_rank = 2 and non-symmetric
+        // matrices so that A*B != A^T*B^T. This distinguishes three states:
+        //   - the intended Y = X*W^T + scale*((X*A)*B)         -> [21, 46, 41]
+        //   - the original yippee.md bug  Y = X*W^T + scale*(X*A^T*B)   -> [17, 40, 47]
+        //   - the partial dccc5f6 fix   Y = X*W^T + scale*(X*A^T*B^T)  -> [37, 10, 57]
+        // Only the correct implementation produces [21, 46, 41]; the test pins
+        // that exact vector so any regression back to either transposed form
+        // fails loudly.
+        //
+        // Contract: X is [M, K], W is [N, K] row-major (kernel computes X*W^T),
+        // A is [K, rank] row-major, B is [rank, N] row-major.
+        let m = 1;
+        let n = 3;
+        let k = 2;
+        let lora_rank = 2;
+        let x = vec![1.0, 2.0]; // [1, 2]
         let w = vec![
-            1.0, 2.0,  // row 0 of W (N=3, K=2)
-            3.0, 4.0,  // row 1 of W
-            5.0, 6.0,  // row 2 of W
+            1.0, 3.0, // row 0 of W (N=3, K=2)
+            2.0, 4.0, // row 1 of W
+            5.0, 6.0, // row 2 of W
         ];
-        let a = vec![0.5, 1.0]; // 2x1 (K x lora_rank)
-        let b = vec![1.0, 2.0, 3.0]; // 1x3 (rank x N)
+        let a = vec![
+            1.0, 2.0, // row 0 of A (K=2, rank=2)
+            3.0, 1.0, // row 1 of A
+        ];
+        let b = vec![
+            1.0, 2.0, 0.0, // row 0 of B (rank=2, N=3)
+            0.0, 1.0, 3.0, // row 1 of B
+        ];
         let scale = 2.0;
 
-        // Hand-computed expected: Y = X*W + scale*(X*A*B)
-        // X*W (1x3), computing C[i][j] = sum_k X[k] * W[j*K+k]
-        //   C[0] = X*W[0] = 1*1 + 2*2 = 5
-        //   C[1] = X*W[1] = 1*3 + 2*4 = 11
-        //   C[2] = X*W[2] = 1*5 + 2*6 = 17
-        // X*A (1x1): [1*0.5 + 2*1.0] = [2.5]
-        // X*A*B (1x3): [2.5*1, 2.5*2, 2.5*3] = [2.5, 5.0, 7.5]
-        // Y = [5 + 2*2.5, 11 + 2*5.0, 17 + 2*7.5] = [10.0, 21.0, 32.0]
-        let expected = vec![10.0, 21.0, 32.0];
+        // Hand-computed expected: Y = X*W^T + scale*((X*A)*B)
+        // X*W^T (1x3): C[0][j] = sum_k X[k]*W[j*K+k]
+        //   C[0] = 1*1 + 2*3 = 7
+        //   C[1] = 1*2 + 2*4 = 10
+        //   C[2] = 1*5 + 2*6 = 17
+        // X*A (1x2): [1*1 + 2*3, 1*2 + 2*1] = [7, 4]
+        // (X*A)*B (1x3): [7*1 + 4*0, 7*2 + 4*1, 7*0 + 4*3] = [7, 18, 12]
+        // Y = [7+2*7, 10+2*18, 17+2*12] = [21, 46, 41]
+        let expected = vec![21.0, 46.0, 41.0];
 
         let mut y = vec![0.0f32; 3];
-        gemm_f32_lora_fused(1, 3, 2, 1, &x, &w, &a, &b, scale, &mut y);
+        gemm_f32_lora_fused(m, n, k, lora_rank, &x, &w, &a, &b, scale, &mut y);
 
         for i in 0..3 {
             assert!(
                 (y[i] - expected[i]).abs() < 1e-5,
                 "lora fused mismatch at {}: got {} expected {}",
-                i, y[i], expected[i]
+                i,
+                y[i],
+                expected[i]
             );
         }
     }

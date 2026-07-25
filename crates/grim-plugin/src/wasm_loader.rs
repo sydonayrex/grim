@@ -46,8 +46,11 @@ pub struct WasmSampler {
     /// exports remain valid for the lifetime of this sampler.
     #[cfg(feature = "wasm-sandbox")]
     instance: Option<wasmtime::Instance>,
+    /// The store is behind a Mutex because `Func::call` and `Memory::write`
+    /// require `AsContextMut` (mutable access), but `Sampler::sample` takes
+    /// `&self`.
     #[cfg(feature = "wasm-sandbox")]
-    store: Option<wasmtime::Store<()>>,
+    store: Option<std::sync::Mutex<wasmtime::Store<()>>>,
 }
 
 /// WASM plugin loader — enforces fuel, memory, and capability grants.
@@ -184,12 +187,15 @@ impl WasmPluginLoader {
 
         // Instantiate — any unlinked import causes a trap here, not at call time.
         // This is the correct place to fail: before the plugin runs any user code.
-Ok(Arc::new(WasmSampler {
+        let instance = linker.instantiate(&mut store, &module)
+            .map_err(|e| Error::Backend(format!("failed to instantiate WASM module: {e}")))?;
+
+        Ok(Arc::new(WasmSampler {
             name: self.name.clone(),
             #[cfg(feature = "wasm-sandbox")]
-            instance: Some(_instance),
+            instance: Some(instance),
             #[cfg(feature = "wasm-sandbox")]
-            store: Some(store),
+            store: Some(std::sync::Mutex::new(store)),
         }))
     }
 
@@ -244,23 +250,59 @@ impl Sampler for WasmSampler {
         }
         #[cfg(feature = "wasm-sandbox")]
         {
-            let store = self.store.as_ref()
-                .ok_or_else(|| Error::Backend("WasmSampler store unavailable".into()))?;
-            let memory = self.instance.as_ref()
-                .and_then(|inst| inst.get_memory(store, "memory").ok());
-            let sample_fn = self.instance.as_ref()
-                .and_then(|inst| inst.get_func(store, "sample").ok());
-            let logits_ptr: i32 = 0;
-            let logits_len: i32 = logits.shape().dims().get(0).copied().unwrap_or(0) as i32;
-            let history_ptr: i32 = 0;
-            let history_len: i32 = history.len() as i32;
-            if let (Some(_mem), Some(func)) = (memory, sample_fn) {
-                let result = func.call(store, &[logits_ptr.into(), logits_len.into(), history_ptr.into(), history_len.into()]);
-                if let Ok([token_id]) = result {
-                    return Ok(token_id as u32);
-                }
+            let store_guard = self.store.as_ref()
+                .ok_or_else(|| Error::Backend("WasmSampler store unavailable".into()))?
+                .lock()
+                .map_err(|e| Error::Backend(format!("store lock poisoned: {e}")))?;
+            let mut store = store_guard;
+            let instance = self.instance.as_ref()
+                .ok_or_else(|| Error::Backend("WasmSampler instance unavailable".into()))?;
+            let memory = instance.get_memory(&mut *store, "memory")
+                .ok_or_else(|| Error::Backend("WASM plugin does not export 'memory'".into()))?;
+            let sample_fn = instance.get_func(&mut *store, "sample")
+                .ok_or_else(|| Error::Backend("WASM plugin does not export 'sample' function".into()))?;
+            let sample_typed = sample_fn.typed::<(i32, i32, i32, i32), i32>(&mut *store)
+                .map_err(|e| Error::Backend(format!("sample function has wrong signature: {e}")))?;
+
+            // Extract logits as f32 bytes and history as u32 bytes.
+            let logits_vec = logits.to_vec_f32()?;
+            let logits_bytes: Vec<u8> = logits_vec.iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            let history_bytes: Vec<u8> = history.iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+
+            let logits_len = logits_bytes.len() as i32;
+            let history_len = history_bytes.len() as i32;
+
+            // Layout in WASM linear memory:
+            //   [0 .. logits_len)           — logits f32 bytes
+            //   [logits_len .. end)         — history u32 bytes
+            let total = (logits_len + history_len) as usize;
+            let data_len = memory.data_size(&*store);
+            if total > data_len {
+                return Err(Error::Backend(format!(
+                    "WASM memory too small: need {} bytes, have {}",
+                    total, data_len
+                )));
             }
-            Err(Error::Backend("WASM sampler failed to execute sample".into()))
+
+            let logits_ptr: i32 = 0;
+            let history_ptr: i32 = logits_len;
+
+            memory.write(&mut *store, 0, &logits_bytes)
+                .map_err(|e| Error::Backend(format!("failed to write logits to WASM memory: {e}")))?;
+            memory.write(&mut *store, logits_len as usize, &history_bytes)
+                .map_err(|e| Error::Backend(format!("failed to write history to WASM memory: {e}")))?;
+
+            let token_id = sample_typed.call(
+                &mut *store,
+                (logits_ptr, logits_len, history_ptr, history_len),
+            )
+            .map_err(|e| Error::Backend(format!("WASM sample call failed: {e}")))?;
+
+            Ok(token_id)
         }
     }
 

@@ -27,6 +27,7 @@ pub use grim_tensor::{ArithType, BackendStorage};
 pub mod autotune;
 pub mod device;
 pub mod fusion;
+pub mod fsdp;
 pub mod gptq_kernel;
 pub mod graph_capture;
 pub mod kernels;

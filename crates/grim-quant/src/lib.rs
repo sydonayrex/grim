@@ -660,10 +660,14 @@ fn get_scale_min_k4(j: usize, scales: &[u8]) -> (f32, f32) {
     (sc as f32, m as f32)
 }
 
+/// Dequantize Q5_K bytes using a simplified packed symmetric fallback scale.
+/// Note: Full llama.cpp Q5_K uses complex sub-block scale unpacking (deferred per plan scope).
 pub fn dequant_q5k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     dequant_packed_symmetric(data, num_weights, 5)
 }
 
+/// Dequantize Q6_K bytes using a simplified packed symmetric fallback scale.
+/// Note: Full llama.cpp Q6_K uses complex sub-block scale unpacking (deferred per plan scope).
 pub fn dequant_q6k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     dequant_packed_symmetric(data, num_weights, 6)
 }
@@ -785,7 +789,7 @@ pub fn dequant_fp8(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     } else {
         1.0
     };
-    let data_start = if data.len() >= 8 { 4 } else { 0 };
+    let data_start = if data.len() >= 4 { 4 } else { 0 };
     for (i, &byte) in data[data_start..].iter().enumerate() {
         if i >= num_values {
             break;
@@ -898,20 +902,18 @@ const FP8_E4M3_BIAS: i32 = 7;
 
 /// Convert FP8 E4M3 (4-bit exponent, 3-bit mantissa) to f32.
 /// Layout: 1 sign | 4 exp | 3 mantissa
-fn fp8_e4m3_to_f32(byte: u8) -> f32 {
+pub fn fp8_e4m3_to_f32(byte: u8) -> f32 {
     let sign = (byte & 0x80) as i32;
     let exp = ((byte >> 3) & 0x0F) as i32;
     let mant = (byte & 0x07) as i32;
     
     if exp == 0xF {
-        // NaN or Inf (E4M3 doesn't encode Inf in standard form, treat as max)
-        if mant == 0 {
-            // Infinity
-            return if sign != 0 { f32::NEG_INFINITY } else { f32::INFINITY };
-        } else {
-            // NaN
+        if mant == 7 {
             return f32::NAN;
         }
+        // E4M3 max finite value bit pattern is 0x7E / 0xFE (exp 15, mant 6) -> ~448.0
+        let val = 448.0f32;
+        return if sign != 0 { -val } else { val };
     }
     
     let mut result = (mant as f32) / 8.0 + 1.0; // Add implicit leading 1 for normalized
@@ -1170,57 +1172,86 @@ pub fn quant_fp8(data: &[f32]) -> Result<Vec<u8>> {
 }
 
 /// Quantize f32 to FP8 E4M3 format.
-fn f32_to_fp8_e4m3(v: f32) -> u8 {
+pub fn f32_to_fp8_e4m3(v: f32) -> u8 {
     if v.is_nan() {
         return 0x7F; // NaN in E4M3
     }
-    if v.is_infinite() {
-        return if v.is_sign_positive() { 0x7E } else { 0xFE }; // Max normal or inf-like
-    }
-    
-    let sign = if v < 0.0 { 0x80 } else { 0x00 };
-    let abs = v.abs();
-    
-    if abs == 0.0 {
+    let sign = if v.is_sign_negative() { 0x80u8 } else { 0u8 };
+    let abs_v = v.abs();
+    if abs_v == 0.0 {
         return sign;
     }
-    
-    // Clamp to representable FP8 range (max ~240 for E4M3)
-    let abs = abs.min(240.0);
-    
-    // Find exponent and mantissa
-    let exp = abs.log2().floor().max(-7.0) as i32;
-// Compute biased exponent: E4M3 has bias=7, stored_exp 1..=15 for normalized,
-            // stored_exp 0 for subnormals (values too small for exp >= -6).
-            let exp_biased = if exp >= -6 {
-                // Normalized: stored_exp = exp + bias, clamped to 1..=15
-                ((exp + FP8_E4M3_BIAS).min(15)).max(1)
-            } else {
-                // Subnormal or zero (exp < -6, i.e., v < 2^-6 = 1/64)
-                0
-            };
-    
-    // Compute mantissa (3 bits, values 0-7)
-    let mant = if exp_biased > 0 {
-        let normalized = abs / 2f32.powi(exp);
-        let m = ((normalized - 1.0) * 8.0).round() as u8;
-        if m >= 8 {
-            let next_exp = (exp + 1 + FP8_E4M3_BIAS).min(15);
-            return sign | ((next_exp as u8) << 3);
+
+    let bits = abs_v.to_bits();
+    let raw_exp = ((bits >> 23) & 0xFF) as i32 - 127;
+    let raw_mant = bits & 0x007F_FFFF;
+
+    let e4m3_exp = raw_exp + 7;
+
+    if e4m3_exp <= 0 {
+        let shift = 1 - e4m3_exp;
+        if shift > 4 {
+            return sign;
         }
-        m & 0x07
-} else {
-            // Subnormal: mant = round(v * 512), since E4M3 subnormals are mant/512
-            let m = (abs * 512.0).round() as u8;
-            if m >= 8 {
-                // Carry over to normalized 1.0 with smallest exp
-                return sign | (1 << 3);
-            }
-            m & 0x07
-        };
-    
-    sign | ((exp_biased as u8 & 0x0F) << 3) | mant
+        let full_mant = 0x0080_0000 | raw_mant;
+        let mant = (full_mant >> (20 + shift)) & 0x07;
+        return sign | (mant as u8);
+    }
+
+    if e4m3_exp >= 15 {
+        return sign | 0x7E;
+    }
+
+    let mant = (raw_mant >> 20) as u8;
+    sign | ((e4m3_exp as u8) << 3) | (mant & 0x07)
 }
+
+/// Convert MXFP4 E2M1 (2-bit exp, 1-bit mantissa) + E8M0 shared exponent to f32.
+pub fn mxfp4_e2m1_to_f32(code: u8, shared_exp: u8) -> f32 {
+    let sign = ((code >> 3) & 1) != 0;
+    let exp = (code >> 1) & 3;
+    let mant = code & 1;
+    let base_val = if exp == 0 {
+        mant as f32 * 0.5
+    } else {
+        (1.0 + mant as f32 * 0.5) * (2.0f32).powi(exp as i32 - 1)
+    };
+    let signed_val = if sign { -base_val } else { base_val };
+    let scale = (2.0f32).powi(shared_exp as i32 - 127);
+    signed_val * scale
+}
+
+/// Convert f32 to MXFP4 E2M1 4-bit code with a given shared E8M0 exponent.
+pub fn f32_to_mxfp4_e2m1(v: f32, shared_exp: u8) -> u8 {
+    if v == 0.0 {
+        return 0;
+    }
+    let scale = (2.0f32).powi(shared_exp as i32 - 127);
+    let unscaled = v / scale;
+    let sign_bit = if unscaled < 0.0 { 8u8 } else { 0u8 };
+    let abs_val = unscaled.abs();
+
+    let (exp, mant) = if abs_val < 0.25 {
+        (0u8, 0u8)
+    } else if abs_val < 0.75 {
+        (0u8, 1u8)
+    } else if abs_val < 1.25 {
+        (1u8, 0u8)
+    } else if abs_val < 1.75 {
+        (1u8, 1u8)
+    } else if abs_val < 2.5 {
+        (2u8, 0u8)
+    } else if abs_val < 3.5 {
+        (2u8, 1u8)
+    } else if abs_val < 5.0 {
+        (3u8, 0u8)
+    } else {
+        (3u8, 1u8)
+    };
+
+    sign_bit | (exp << 1) | mant
+}
+    
 
 /// Quantize f32 values to block-scaled FP4 (E2M1) bytes.
 pub fn quant_fp4_block16(data: &[f32], block_size: usize) -> Result<Vec<u8>> {

@@ -129,6 +129,10 @@ pub enum FloatPackScheme {
     Nf4,
     /// FP8 (E4M3 by default; E5M2 recognized).
     Fp8,
+    /// MXFP4 (OCP Microscaling 4-bit float with shared E8M0 scale per 32 elements - Jay tier).
+    MxFp4,
+    /// MXFP8 (OCP Microscaling 8-bit float with shared scale per block - Magpie tier).
+    MxFp8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
