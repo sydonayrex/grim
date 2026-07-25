@@ -1,17 +1,18 @@
-/* Modern Dark-Mode & Glassmorphism Styling for Grim's Garage */
+/* Modern Dark-Mode & Glassmorphism Dark Purple Styling for Grim's Garage */
 
 :root {
-  --bg-dark: #0b0f19;
-  --bg-card: rgba(22, 31, 51, 0.75);
-  --bg-card-hover: rgba(30, 42, 69, 0.85);
-  --border-card: rgba(59, 130, 246, 0.18);
-  --primary-accent: #3b82f6;
-  --primary-hover: #2563eb;
+  --bg-dark: #0d0714;
+  --bg-card: rgba(28, 18, 43, 0.75);
+  --bg-card-hover: rgba(42, 26, 66, 0.85);
+  --border-card: rgba(168, 85, 247, 0.22);
+  --primary-accent: #a855f7;
+  --primary-hover: #9333ea;
+  --primary-color: #c084fc;
   --success-color: #10b981;
   --warning-color: #f59e0b;
   --danger-color: #ef4444;
-  --text-main: #f1f5f9;
-  --text-muted: #94a3b8;
+  --text-main: #f3e8ff;
+  --text-muted: #a78bfa;
   --font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
 }
 
@@ -38,7 +39,7 @@ body {
 /* Sidebar */
 .sidebar {
   width: 280px;
-  background: rgba(15, 23, 42, 0.9);
+  background: rgba(18, 10, 28, 0.95);
   border-right: 1px solid var(--border-card);
   display: flex;
   flex-direction: column;
@@ -60,7 +61,7 @@ body {
   font-size: 18px;
   font-weight: 800;
   letter-spacing: 0.5px;
-  background: linear-gradient(135deg, #60a5fa 0%, #3b82f6 100%);
+  background: linear-gradient(135deg, #c084fc 0%, #a855f7 100%);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
 }
@@ -101,13 +102,13 @@ body {
 }
 
 .nav-item.active {
-  background: rgba(59, 130, 246, 0.15);
-  color: #60a5fa;
-  border: 1px solid rgba(59, 130, 246, 0.3);
+  background: rgba(168, 85, 247, 0.18);
+  color: #c084fc;
+  border: 1px solid rgba(168, 85, 247, 0.35);
 }
 
 .gpu-badge {
-  background: rgba(30, 41, 59, 0.6);
+  background: rgba(28, 18, 43, 0.6);
   border: 1px solid var(--border-card);
   border-radius: 10px;
   padding: 14px;
@@ -137,7 +138,7 @@ body {
 
 .vram-bar {
   height: 100%;
-  background: linear-gradient(90deg, #3b82f6 0%, #10b981 100%);
+  background: linear-gradient(90deg, #a855f7 0%, #10b981 100%);
   transition: width 0.3s ease;
 }
 
@@ -161,7 +162,7 @@ body {
   align-items: center;
   justify-content: space-between;
   padding: 0 24px;
-  background: rgba(15, 23, 42, 0.5);
+  background: rgba(18, 10, 28, 0.5);
   backdrop-filter: blur(10px);
 }
 
@@ -247,7 +248,7 @@ body {
 .form-control {
   width: 100%;
   padding: 10px 14px;
-  background: rgba(15, 23, 42, 0.8);
+  background: rgba(18, 10, 28, 0.85);
   border: 1px solid var(--border-card);
   border-radius: 8px;
   color: var(--text-main);
@@ -258,6 +259,7 @@ body {
 
 .form-control:focus {
   border-color: var(--primary-accent);
+  box-shadow: 0 0 10px rgba(168, 85, 247, 0.25);
 }
 
 .form-row {
@@ -284,8 +286,8 @@ body {
 }
 
 .autotune-box {
-  background: rgba(59, 130, 246, 0.08);
-  border: 1px dashed rgba(59, 130, 246, 0.3);
+  background: rgba(168, 85, 247, 0.08);
+  border: 1px dashed rgba(168, 85, 247, 0.35);
   border-radius: 8px;
   padding: 14px;
   margin-bottom: 20px;
@@ -294,7 +296,7 @@ body {
 .autotune-title {
   font-size: 13px;
   font-weight: 700;
-  color: #60a5fa;
+  color: #c084fc;
   display: block;
   margin-bottom: 6px;
 }
@@ -335,12 +337,12 @@ body {
 }
 
 .btn-accent {
-  background: rgba(59, 130, 246, 0.2);
-  color: #60a5fa;
+  background: rgba(168, 85, 247, 0.2);
+  color: #c084fc;
 }
 
 .btn-accent:hover {
-  background: rgba(59, 130, 246, 0.3);
+  background: rgba(168, 85, 247, 0.35);
 }
 
 .btn-success { background: var(--success-color); color: white; }
@@ -358,7 +360,7 @@ body {
 
 .metric-card {
   flex: 1;
-  background: rgba(15, 23, 42, 0.6);
+  background: rgba(28, 18, 43, 0.65);
   border: 1px solid var(--border-card);
   border-radius: 8px;
   padding: 12px;
@@ -375,12 +377,12 @@ body {
 .metric-val {
   font-size: 18px;
   font-weight: 800;
-  color: #60a5fa;
+  color: #c084fc;
 }
 
 .chart-container {
   height: 180px;
-  background: rgba(15, 23, 42, 0.8);
+  background: rgba(18, 10, 28, 0.85);
   border: 1px solid var(--border-card);
   border-radius: 8px;
   margin-bottom: 20px;
@@ -391,6 +393,10 @@ body {
 #svg-loss-chart {
   width: 100%;
   height: 100%;
+}
+
+#chart-loss-path {
+  stroke: #a855f7 !important;
 }
 
 /* Tables */
