@@ -11,7 +11,9 @@
     <!-- Sidebar Navigation -->
     <aside class="sidebar">
       <div class="brand">
-        <span class="brand-icon">⚡</span>
+        <div class="logo-wrapper">
+          <img src="/logo.png" alt="Grim's Garage Logo" class="brand-logo-img" style="height: 38px; border-radius: 6px;">
+        </div>
         <div class="brand-text">
           <h1>GRIM'S GARAGE</h1>
           <span class="brand-subtitle">v0.1.0-autotune</span>
@@ -61,6 +63,9 @@
         <div class="grid-2col">
           <!-- Config Panel -->
           <div class="card card-panel">
+            <div class="hero-banner" style="margin-bottom: 16px; border-radius: 8px; overflow: hidden; max-height: 120px;">
+              <img src="/hero.jpg" alt="Grim Reaper & 1967 Impala SS 396 in Garage" class="hero-img" style="width: 100%; height: 100%; object-fit: cover;">
+            </div>
             <h2>New Training Run</h2>
             <form id="form-start-training" onsubmit="return false;">
               <div class="form-group">
@@ -205,7 +210,7 @@
                 <select id="select-repack-mode" class="form-control">
                   <option value="RavenFP8" id="option-raven-fp8">Raven FP8 (E4M3 Sequential - RDNA 4+)</option>
                   <option value="CrowQ4K" id="option-crow-q4k">Crow Q4_K (Fused GPU Dequant)</option>
-                  <option value="JayMXFP4">Jay MXFP4 (Micro-block 4-bit)</option>
+                  <option value="JayMXFP4" id="option-jay-mxfp4">Jay MXFP4 (Micro-block 4-bit - RDNA 5 ONLY)</option>
                 </select>
               </div>
               <div class="form-group half">

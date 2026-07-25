@@ -83,6 +83,10 @@ fn classify_model_format(filename: &str) -> Option<&'static str> {
     let lower = filename.to_ascii_lowercase();
     if lower.ends_with(".grim") {
         Some("grim")
+    } else if lower.ends_with(".gguf") {
+        Some("gguf")
+    } else if lower.ends_with(".safetensors") {
+        Some("safetensors")
     } else {
         None
     }
@@ -101,29 +105,68 @@ fn classify_dataset_format(filename: &str) -> Option<&'static str> {
     }
 }
 
-/// Scan `dir` exclusively for native `.grim` model files.
-/// Unconverted models (.gguf, .safetensors, etc.) are excluded — they must
-/// be converted via the Convert Model tab first.
+fn scan_dir_recursive(dir: &Path, out: &mut Vec<ModelEntry>, is_convertible_only: bool) {
+    if !dir.exists() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return; };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_dir_recursive(&path, out, is_convertible_only);
+        } else if path.is_file() {
+            let Some(filename) = path.file_name().and_then(|n| n.to_str()) else { continue; };
+            if is_convertible_only {
+                if let Some(fmt) = classify_convertible_format(filename) {
+                    let path_str = path.to_string_lossy().to_string();
+                    if !out.iter().any(|m| m.path == path_str) {
+                        out.push(ModelEntry::new(filename, &path_str, fmt, false));
+                    }
+                }
+            } else {
+                if let Some(format) = classify_model_format(filename) {
+                    let path_str = path.to_string_lossy().to_string();
+                    if !out.iter().any(|m| m.path == path_str) {
+                        let is_grim = format == "grim";
+                        out.push(ModelEntry::new(filename, &path_str, format, is_grim));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_default_dir(dir: &Path) -> bool {
+    let local = Path::new("./models");
+    if dir == local { return true; }
+    if let Some(home) = std::env::var_os("HOME") {
+        let grim_home = PathBuf::from(home).join(".grim").join("models");
+        if dir == grim_home { return true; }
+    }
+    false
+}
+
+/// Scan `dir` for all available model files (.grim, .gguf, .safetensors).
 pub fn discover_models(dir: &Path) -> Result<Vec<ModelEntry>, DiscoveryError> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
+    scan_dir_recursive(dir, &mut out, false);
+
+    if is_default_dir(dir) {
+        if let Some(home) = std::env::var_os("HOME") {
+            let grim_home = PathBuf::from(home).join(".grim").join("models");
+            if grim_home != dir && grim_home.exists() {
+                scan_dir_recursive(&grim_home, &mut out, false);
+            }
         }
-        let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if let Some(format) = classify_model_format(filename) {
-            let path_str = path.to_string_lossy().to_string();
-            let _ = GgufProvider::open(&path_str);
-            out.push(ModelEntry::new(filename, &path_str, format, true));
+        let local_models = PathBuf::from("./models");
+        if local_models != dir && local_models.exists() {
+            scan_dir_recursive(&local_models, &mut out, false);
         }
     }
+
     out.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(out)
 }
@@ -134,20 +177,21 @@ pub fn discover_convertible_models(dir: &Path) -> Result<Vec<ModelEntry>, Discov
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
+    scan_dir_recursive(dir, &mut out, true);
+
+    if is_default_dir(dir) {
+        if let Some(home) = std::env::var_os("HOME") {
+            let grim_home = PathBuf::from(home).join(".grim").join("models");
+            if grim_home != dir && grim_home.exists() {
+                scan_dir_recursive(&grim_home, &mut out, true);
+            }
         }
-        let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if let Some(fmt) = classify_convertible_format(filename) {
-            let path_str = path.to_string_lossy().to_string();
-            out.push(ModelEntry::new(filename, &path_str, fmt, false));
+        let local_models = PathBuf::from("./models");
+        if local_models != dir && local_models.exists() {
+            scan_dir_recursive(&local_models, &mut out, true);
         }
     }
+
     out.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(out)
 }
