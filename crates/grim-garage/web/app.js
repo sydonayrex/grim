@@ -148,14 +148,8 @@ document.addEventListener('DOMContentLoaded', () => {
             const usedBytes = d.vram_used_bytes || 0;
             const totalBytes = d.vram_bytes || 1;
 
-            let usedStr = '';
-            if (usedBytes >= 1024 * 1024 * 1024) {
-              usedStr = `${(usedBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-            } else {
-              usedStr = `${Math.round(usedBytes / (1024 * 1024))} MB`;
-            }
-
-            const totalStr = `${(totalBytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+            const usedGb = (usedBytes / (1024 * 1024 * 1024)).toFixed(2);
+            const totalGb = (totalBytes / (1024 * 1024 * 1024)).toFixed(1);
             const pct = Math.min(100, Math.max(0, (usedBytes / totalBytes) * 100));
 
             const item = document.createElement('div');
@@ -165,7 +159,7 @@ document.addEventListener('DOMContentLoaded', () => {
               <div class="vram-bar-container" style="height: 6px;">
                 <div class="vram-bar" style="width: ${pct.toFixed(1)}%;"></div>
               </div>
-              <div class="vram-text" style="font-size: 10px; margin-top: 2px; color: var(--text-muted);">${usedStr} / ${totalStr} VRAM</div>
+              <div class="vram-text" style="font-size: 10px; margin-top: 2px; color: var(--text-muted);">${usedGb} GB / ${totalGb} GB VRAM</div>
             `;
             telemetryList.appendChild(item);
           });

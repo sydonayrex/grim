@@ -157,16 +157,35 @@ pub fn query_nvidia_smi_gpus() -> Vec<(String, u64, u64)> {
 
 /// Query live AMD VRAM used bytes from Linux sysfs mem_info_vram_used interface.
 pub fn query_amd_vram_used(ordinal: u32) -> u64 {
-    let candidates = [
-        format!("/sys/class/drm/card{ordinal}/device/mem_info_vram_used"),
-        format!("/sys/class/drm/card1/device/mem_info_vram_used"),
-        format!("/sys/class/drm/card0/device/mem_info_vram_used"),
-    ];
-    for p in &candidates {
-        if let Ok(content) = std::fs::read_to_string(p) {
-            if let Ok(bytes) = content.trim().parse::<u64>() {
-                return bytes;
+    if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
+        let mut amd_used_bytes = Vec::new();
+        let mut card_paths: Vec<_> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with("card") && !n.to_string_lossy().contains('-'))
+                    .unwrap_or(false)
+            })
+            .collect();
+        card_paths.sort();
+
+        for path in card_paths {
+            let vendor_path = path.join("device/vendor");
+            if let Ok(v_str) = std::fs::read_to_string(&vendor_path) {
+                if v_str.trim().eq_ignore_ascii_case("0x1002") {
+                    let used_path = path.join("device/mem_info_vram_used");
+                    if let Ok(u_str) = std::fs::read_to_string(&used_path) {
+                        if let Ok(bytes) = u_str.trim().parse::<u64>() {
+                            amd_used_bytes.push(bytes);
+                        }
+                    }
+                }
             }
+        }
+        if !amd_used_bytes.is_empty() {
+            let idx = (ordinal as usize).min(amd_used_bytes.len() - 1);
+            return amd_used_bytes[idx];
         }
     }
     0
