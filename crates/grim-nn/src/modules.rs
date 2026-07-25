@@ -363,3 +363,120 @@ impl Rope {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grim_backend_cpu::cpu_tensor;
+
+    #[test]
+    fn test_linear_forward_with_bias_hand_calculated() {
+        let weight = cpu_tensor(vec![0.5, 1.5, -1.0, 2.0], Shape::new(vec![2, 2]));
+        let bias = cpu_tensor(vec![0.1, -0.2], Shape::new(vec![2]));
+        let linear = Linear::from_tensor(weight, Some(bias));
+
+        let x = cpu_tensor(vec![1.0, 2.0], Shape::new(vec![1, 2]));
+        let y = linear.forward(&x).expect("linear forward");
+
+        let out = y.to_vec_f32().expect("to vec");
+        assert_eq!(out.len(), 2);
+        assert!((out[0] - 3.6).abs() < 1e-5, "Expected 3.6, got {}", out[0]);
+        assert!((out[1] - 2.8).abs() < 1e-5, "Expected 2.8, got {}", out[1]);
+    }
+
+    #[test]
+    fn test_linear_forward_without_bias() {
+        let weight = cpu_tensor(vec![0.5, 1.5, -1.0, 2.0], Shape::new(vec![2, 2]));
+        let linear = Linear::from_tensor(weight, None);
+
+        let x = cpu_tensor(vec![1.0, 2.0], Shape::new(vec![1, 2]));
+        let y = linear.forward(&x).expect("linear forward");
+
+        let out = y.to_vec_f32().expect("to vec");
+        assert_eq!(out.len(), 2);
+        assert!((out[0] - 3.5).abs() < 1e-5, "Expected 3.5, got {}", out[0]);
+        assert!((out[1] - 3.0).abs() < 1e-5, "Expected 3.0, got {}", out[1]);
+    }
+
+    #[test]
+    fn test_rms_norm_forward_hand_calculated() {
+        let weight = cpu_tensor(vec![1.0, 1.0], Shape::new(vec![2]));
+        let rms_norm = RmsNorm { weight, eps: 1e-6 };
+
+        let x = cpu_tensor(vec![3.0, 4.0], Shape::new(vec![1, 2]));
+        let y = rms_norm.forward(&x).expect("rms norm forward");
+
+        let out = y.to_vec_f32().expect("to vec");
+        assert_eq!(out.len(), 2);
+        let expected_0 = 3.0 / (12.5f32 + 1e-6).sqrt();
+        let expected_1 = 4.0 / (12.5f32 + 1e-6).sqrt();
+        assert!((out[0] - expected_0).abs() < 1e-4, "Expected {}, got {}", expected_0, out[0]);
+        assert!((out[1] - expected_1).abs() < 1e-4, "Expected {}, got {}", expected_1, out[1]);
+    }
+
+    #[test]
+    fn test_embedding_forward_token_lookup() {
+        let table = vec![
+            0.1, 0.2, 0.3, 0.4,
+            1.0, 2.0, 3.0, 4.0,
+            5.0, 6.0, 7.0, 8.0,
+        ];
+        let weight = cpu_tensor(table, Shape::new(vec![3, 4]));
+        let emb = Embedding { weight };
+
+        let indices = vec![2u32, 0];
+        let out_tensor = emb.forward(&indices, 2, 4).expect("embedding forward");
+
+        let out = out_tensor.to_vec_f32().expect("to vec");
+        assert_eq!(out, vec![5.0, 6.0, 7.0, 8.0, 0.1, 0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn test_rope_forward_rotation_identity_at_pos0() {
+        let rope = Rope::new(4, 10000.0);
+        let input = vec![1.0, 2.0, 3.0, 4.0];
+        let x = cpu_tensor(input.clone(), Shape::new(vec![1, 1, 4]));
+
+        let y = rope.forward(&x, &[0]).expect("rope forward");
+        let out = y.to_vec_f32().expect("to vec");
+        for (i, (&a, &b)) in out.iter().zip(input.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-5, "RoPE pos 0 mismatch at index {i}: got {a} want {b}");
+        }
+    }
+
+    #[test]
+    fn test_rope_forward_pos_nonzero_rotation_hand_calculated() {
+        // dim = 2, base = 100.0 => inv_freq[0] = 1.0 / 100.0^0 = 1.0.
+        // pos = 2 => theta = 2.0 * 1.0 = 2.0 rad.
+        // cos(2.0) = -0.41614684, sin(2.0) = 0.9092974
+        // x = [1.0, 2.0]
+        // x'[0] = 1.0 * cos(2.0) - 2.0 * sin(2.0) = -0.41614684 - 1.8185948 = -2.2347416
+        // x'[1] = 1.0 * sin(2.0) + 2.0 * cos(2.0) = 0.9092974 - 0.8322937 = 0.0770037
+        let rope = Rope::new(2, 100.0);
+        let x = cpu_tensor(vec![1.0, 2.0], Shape::new(vec![1, 1, 2]));
+        let y = rope.forward(&x, &[2]).expect("rope pos 2 forward");
+        let out = y.to_vec_f32().expect("to vec");
+        assert_eq!(out.len(), 2);
+
+        let theta = 2.0f32;
+        let expected_0 = 1.0 * theta.cos() - 2.0 * theta.sin();
+        let expected_1 = 1.0 * theta.sin() + 2.0 * theta.cos();
+        assert!((out[0] - expected_0).abs() < 1e-5, "Expected {expected_0}, got {}", out[0]);
+        assert!((out[1] - expected_1).abs() < 1e-5, "Expected {expected_1}, got {}", out[1]);
+    }
+
+    #[test]
+    fn test_linear_shape_mismatch_returns_error() {
+        let weight = cpu_tensor(vec![1.0, 2.0, 3.0, 4.0], Shape::new(vec![2, 2]));
+        let linear = Linear::from_tensor(weight, None);
+        let x_bad = cpu_tensor(vec![1.0, 2.0, 3.0], Shape::new(vec![1, 3]));
+        assert!(linear.forward(&x_bad).is_err(), "mismatched in_features must error");
+    }
+
+    #[test]
+    fn test_rope_invalid_rank_returns_error() {
+        let rope = Rope::new(4, 10000.0);
+        let x_2d = cpu_tensor(vec![1.0, 2.0, 3.0, 4.0], Shape::new(vec![2, 2]));
+        assert!(rope.forward(&x_2d, &[0]).is_err(), "2D input to RoPE must return Shape error");
+    }
+}

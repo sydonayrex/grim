@@ -289,9 +289,21 @@ async fn cancel_job(
     }
 }
 
+fn sanitize_model_id(id: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if id.contains("..") || id.contains('/') || id.contains('\\') {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid model_id: path traversal forbidden" })),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 async fn get_bolt_ons(
     AxumPath(model_id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    sanitize_model_id(&model_id)?;
     let model_path = Path::new(&model_id);
     if !model_path.exists() {
         return Err((
@@ -310,42 +322,29 @@ async fn get_bolt_ons(
             ));
         }
     };
-    let mut reader = std::io::BufReader::new(file);
-    let grim_file = match grim_format::format::GrimFile::read(&mut reader) {
+
+    let gguf = match grim_format::gguf::read_gguf(file) {
         Ok(g) => g,
         Err(e) => {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("failed to parse .grim: {e}") })),
+                Json(json!({ "error": format!("failed to parse model: {e}") })),
             ));
         }
     };
 
-    // Check each tensor's backup2 status.
+    let grim_meta = grim_format::gguf::GrimMetadata::from_gguf_metadata(&gguf.metadata);
     let mut bolt_ons = Vec::new();
-    for entry in &grim_file.tensors {
-        if let Some(ext) = grim_file.metadata.get_tensor_ext(&entry.name) {
-            if ext.backup2.is_present() {
-                // Read a byte from the backup2 codes region to check if it's non-zero (attached).
-                let codes_offset = entry.payload_offset + ext.backup2.codes_offset;
-                let is_attached = if ext.backup2.codes_size > 0 {
-                    let mut buf = [0u8; 1];
-                    let f2 = std::fs::File::open(model_path).ok();
-                    if let Some(mut f2) = f2 {
-                        use std::io::{Read, Seek, SeekFrom};
-                        f2.seek(SeekFrom::Start(codes_offset)).ok();
-                        f2.read_exact(&mut buf).ok();
-                        buf[0] != 0
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
+    for entry in &gguf.tensors {
+        if let Some(ext) = grim_meta.get_tensor_ext(&entry.name) {
+            if ext.backup2.bpw > 0 {
                 bolt_ons.push(json!({
                     "tensor": entry.name,
-                    "backup2_provisioned": true,
-                    "attached": is_attached,
+                    "bpw": ext.backup2.bpw,
+                    "scale_offset": ext.backup2.scale_offset,
+                    "codes_offset": ext.backup2.codes_offset,
+                    "codes_size": ext.backup2.codes_size,
+                    "status": "attached",
                 }));
             }
         }
@@ -353,8 +352,8 @@ async fn get_bolt_ons(
 
     Ok(Json(json!({
         "model_id": model_id,
-        "bolt_on_slot": "backup2",
-        "tensors": bolt_ons,
+        "bolt_ons": bolt_ons,
+        "count": bolt_ons.len(),
     })))
 }
 
@@ -362,6 +361,7 @@ async fn attach_bolt_on_route(
     AxumPath(model_id): AxumPath<String>,
     Json(req): Json<AttachBoltOnRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    sanitize_model_id(&model_id)?;
     let model_path = Path::new(&model_id);
     if !model_path.exists() {
         return Err((
@@ -469,6 +469,7 @@ async fn attach_bolt_on_route(
 async fn detach_bolt_on_route(
     AxumPath((model_id, slot)): AxumPath<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    sanitize_model_id(&model_id)?;
     let model_path = Path::new(&model_id);
     if !model_path.exists() {
         return Err((
@@ -548,6 +549,16 @@ async fn convert_model_route(
 ) -> impl IntoResponse {
     let output_dir = default_models_dir();
     let name_clean = req.output_name.trim_end_matches(".grim");
+    if name_clean.contains("..") || name_clean.contains('/') || name_clean.contains('\\') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ConvertModelResponse {
+                success: false,
+                output_path: "".into(),
+                message: "Invalid output_name: path traversal forbidden".into(),
+            }),
+        );
+    }
     let output_path = output_dir.join(format!("{name_clean}.grim"));
     let output_str = output_path.to_string_lossy().to_string();
 

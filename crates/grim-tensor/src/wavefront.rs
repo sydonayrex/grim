@@ -39,3 +39,18 @@ pub const fn padded_dims(rows: usize, cols: usize, wavefront_size: u32) -> (usiz
     let cols_padded = (cols + wf - 1) & !(wf - 1);
     (rows_padded, cols_padded)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_padded_dims_boundary_conditions() {
+        assert_eq!(padded_dims(0, 0, 64), (0, 0));
+        assert_eq!(padded_dims(64, 64, 64), (64, 64));
+        assert_eq!(padded_dims(65, 63, 64), (128, 64));
+        assert_eq!(padded_dims(1, 1, 64), (64, 64));
+        assert_eq!(padded_dims(33, 33, 32), (64, 64));
+        assert_eq!(padded_dims(32, 32, 32), (32, 32));
+    }
+}

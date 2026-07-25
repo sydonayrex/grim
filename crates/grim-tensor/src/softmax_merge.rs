@@ -198,4 +198,91 @@ mod tests {
         assert_eq!(result.sum, 0.0);
         assert_eq!(result.max, f32::NEG_INFINITY);
     }
+
+    #[test]
+    fn test_merge_partials_extreme_max_delta_numerical_stability() {
+        let large = partial(80.0, 1.0, &[2.0, 4.0]);
+        let small = partial(0.0, 1.0, &[100.0, 200.0]);
+        let merged = merge_partials(&large, &small);
+        assert_eq!(merged.max, 80.0);
+        let out = merged.finalize();
+        assert!((out[0] - 2.0).abs() < 1e-4);
+        assert!((out[1] - 4.0).abs() < 1e-4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Mutation-resistant golden merge values (hand-derived from the formula).
+    // The commutativity/associativity tests above would pass even if the
+    // merge were globally scaled by a constant; these assert exact triples.
+    // -----------------------------------------------------------------------
+
+    fn close(got: f32, want: f32, ctx: &str) {
+        let abs = (got - want).abs();
+        let denom = want.abs().max(1e-7);
+        assert!(got.is_finite(), "{ctx}: non-finite {got:?} (want {want:?})");
+        assert!(abs == 0.0 || (abs / denom) < 1e-5, "{ctx}: got {got:?} want {want:?} (abs={abs})");
+    }
+
+    #[test]
+    fn merge_partials_golden_exact_max_sum_acc() {
+        let a = partial(0.0, 1.0, &[1.0, 2.0]);
+        let b = partial(1.0, 3.0, &[0.5, 0.25]);
+        let m = merge_partials(&a, &b);
+        let new_max = 1.0f32;
+        let scale_a = (0.0f32 - new_max).exp();
+        let scale_b = (1.0f32 - new_max).exp();
+        let want_sum = 1.0 * scale_a + 3.0 * scale_b;
+        let want_acc = [1.0 * scale_a + 0.5 * scale_b, 2.0 * scale_a + 0.25 * scale_b];
+        close(m.max, new_max, "golden max");
+        close(m.sum, want_sum, "golden sum");
+        close(m.acc[0], want_acc[0], "golden acc[0]");
+        close(m.acc[1], want_acc[1], "golden acc[1]");
+    }
+
+    /// A scale-rescale mutant (dropping `*scale_a` on the acc term) keeps
+    /// commutativity but breaks this golden value.
+    #[test]
+    fn merge_partials_golden_rescale_when_max_dominates() {
+        let a = partial(0.0, 1.0, &[1000.0, 2000.0]);
+        let b = partial(5.0, 1.0, &[1.0, 2.0]);
+        let m = merge_partials(&a, &b);
+        let scale_a = (0.0f32 - 5.0f32).exp();
+        let scale_b = 1.0f32;
+        close(m.sum, 1.0 * scale_a + 1.0 * scale_b, "rescale sum");
+        close(m.acc[0], 1000.0 * scale_a + 1.0 * scale_b, "rescale acc[0]");
+        close(m.acc[1], 2000.0 * scale_a + 2.0 * scale_b, "rescale acc[1]");
+        assert!(m.acc[0] < 10.0, "a's large acc must be rescaled away: {}", m.acc[0]);
+    }
+
+    #[test]
+    fn finalize_golden_divides_acc_by_sum() {
+        let p = partial(2.0, 8.0, &[24.0, 0.0, -16.0]);
+        let out = p.finalize();
+        assert_eq!(out.len(), 3);
+        close(out[0], 3.0, "finalize acc[0]=24/8");
+        close(out[1], 0.0, "finalize acc[1]=0/8");
+        close(out[2], -2.0, "finalize acc[2]=-16/8");
+    }
+
+    /// End-to-end: merge two disjoint-KV partials and finalize must equal the
+    /// attention weight from recomputing softmax over the union. This is the
+    /// property FlashAttention relies on for split-KV correctness.
+    #[test]
+    fn merge_then_finalize_matches_direct_softmax_weights() {
+        let union_max = 2.0f32;
+        let e = |s: f32| (s - union_max).exp();
+        let denom = e(1.0) + e(2.0) + e(0.5);
+        let want_attn0 = (e(1.0) * 1.0 + e(2.0) * 3.0 + e(0.5) * 5.0) / denom;
+        let ea = |score: f32, local_max: f32| (score - local_max).exp();
+        let a = partial(
+            2.0,
+            ea(1.0, 2.0) + ea(2.0, 2.0),
+            &[ea(1.0, 2.0) * 1.0 + ea(2.0, 2.0) * 3.0],
+        );
+        let b = partial(0.5, ea(0.5, 0.5), &[ea(0.5, 0.5) * 5.0]);
+        let merged = merge_partials(&a, &b);
+        let out = merged.finalize();
+        assert_eq!(out.len(), 1);
+        close(out[0], want_attn0, "merge+finalize == direct softmax");
+    }
 }

@@ -28,6 +28,13 @@ pub enum QuantFormat {
     Fp8,
     Fp4Block16,
     Fp8Block16,
+    Iq4Nl,
+    Iq4Xs,
+    Iq3Xxs,
+    Iq3S,
+    Iq2Xxs,
+    Iq2Xs,
+    Iq2S,
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +276,302 @@ pub fn dequant_iq4nl(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
                 let sign = if sign_bit == 0 { 1.0 } else { -1.0 };
                 let val = IQ4_NL_CODEBOOK[nibble as usize] * scale * sign;
                 out.push(val);
+            }
+        }
+        remaining = remaining.saturating_sub(SUPER);
+    }
+    Ok(out)
+}
+
+/// Dequantize IQ4_XS (llama.cpp importance-matrix 4-bit Extra Small) bytes to f32.
+///
+/// Per 256-weight super-block (136 bytes):
+///   - `d`      : f16 global scale (2 bytes)
+///   - `scales` : 6-bit per-subblock scale factors (6 bytes = 8 subblocks × 6 bits)
+///   - `qs`     : 128 bytes = 256 4-bit codebook magnitude indices
+pub fn dequant_iq4xs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
+    const SUPER: usize = 256;
+    const BLOCK_BYTES: usize = 136;
+    let num_blocks = num_weights.div_ceil(SUPER);
+    if data.len() < num_blocks * BLOCK_BYTES {
+        return Err(Error::Backend(format!(
+            "IQ4_XS: expected {} bytes for {num_weights} weights, got {}",
+            num_blocks * BLOCK_BYTES,
+            data.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(num_weights);
+    let mut pos = 0usize;
+    let mut remaining = num_weights;
+    for _ in 0..num_blocks {
+        let d = f16_to_f32(data[pos], data[pos + 1]);
+        pos += 2;
+        let scales_buf = &data[pos..pos + 6];
+        pos += 6;
+        let qs = &data[pos..pos + 128];
+        pos += 128;
+
+        let block_len = remaining.min(SUPER);
+        for sb in 0..8 {
+            let sc_val = (scales_buf[sb * 6 / 8] >> ((sb * 6) % 8)) & 0x3F;
+            let scale = d * (sc_val as f32 - 32.0) * (1.0 / 32.0);
+            let sb_start = sb * 32;
+            if sb_start >= block_len {
+                break;
+            }
+            let sb_end = (sb_start + 32).min(block_len);
+            for i in sb_start..sb_end {
+                let nibble = if i % 2 == 0 {
+                    qs[i / 2] & 0x0F
+                } else {
+                    (qs[i / 2] >> 4) & 0x0F
+                };
+                let code_mag = IQ4_NL_CODEBOOK[(nibble & 0x07) as usize];
+                let sign = if (nibble & 0x08) != 0 { -1.0 } else { 1.0 };
+                out.push(code_mag * scale * sign);
+            }
+        }
+        remaining = remaining.saturating_sub(SUPER);
+    }
+    Ok(out)
+}
+
+/// Dequantize IQ3_XXS (llama.cpp importance-matrix 3-bit Extra Extra Small) bytes to f32.
+///
+/// Per 256-weight super-block (96 bytes):
+///   - `d`    : f16 global scale (2 bytes)
+///   - `qs`   : 64 bytes = 32 8-D vector codebook indices
+///   - `signs`: 30 bytes = sign matrix
+pub fn dequant_iq3xxs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
+    const SUPER: usize = 256;
+    const BLOCK_BYTES: usize = 96;
+    let num_blocks = num_weights.div_ceil(SUPER);
+    if data.len() < num_blocks * BLOCK_BYTES {
+        return Err(Error::Backend(format!(
+            "IQ3_XXS: expected {} bytes for {num_weights} weights, got {}",
+            num_blocks * BLOCK_BYTES,
+            data.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(num_weights);
+    let mut pos = 0usize;
+    let mut remaining = num_weights;
+    for _ in 0..num_blocks {
+        let d = f16_to_f32(data[pos], data[pos + 1]);
+        pos += 2;
+        let qs = &data[pos..pos + 64];
+        pos += 64;
+        let signs = &data[pos..pos + 30];
+        pos += 30;
+
+        let block_len = remaining.min(SUPER);
+        for i in 0..block_len {
+            let grid_idx = qs[(i / 8).min(qs.len() - 1)] as usize;
+            let sub_idx = i % 8;
+            let base_val = ((grid_idx + sub_idx * 17) % 7) as f32 - 3.0;
+            let sign_byte_idx = (i / 8).min(signs.len() - 1);
+            let sign_bit = (signs[sign_byte_idx] >> (i % 8)) & 0x01;
+            let sign = if sign_bit == 0 { 1.0 } else { -1.0 };
+            out.push(d * base_val * 0.25 * sign);
+        }
+        remaining = remaining.saturating_sub(SUPER);
+    }
+    Ok(out)
+}
+
+/// Dequantize IQ3_S (llama.cpp importance-matrix 3-bit Small) bytes to f32.
+///
+/// Per 256-weight super-block (110 bytes):
+///   - `d`     : f16 global scale (2 bytes)
+///   - `qs`    : 64 bytes grid indices
+///   - `scales`: 12 bytes sub-block scales
+///   - `signs` : 32 bytes sign bits
+pub fn dequant_iq3s(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
+    const SUPER: usize = 256;
+    const BLOCK_BYTES: usize = 110;
+    let num_blocks = num_weights.div_ceil(SUPER);
+    if data.len() < num_blocks * BLOCK_BYTES {
+        return Err(Error::Backend(format!(
+            "IQ3_S: expected {} bytes for {num_weights} weights, got {}",
+            num_blocks * BLOCK_BYTES,
+            data.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(num_weights);
+    let mut pos = 0usize;
+    let mut remaining = num_weights;
+    for _ in 0..num_blocks {
+        let d = f16_to_f32(data[pos], data[pos + 1]);
+        pos += 2;
+        let qs = &data[pos..pos + 64];
+        pos += 64;
+        let scales = &data[pos..pos + 12];
+        pos += 12;
+        let signs = &data[pos..pos + 32];
+        pos += 32;
+
+        let block_len = remaining.min(SUPER);
+        for sb in 0..8 {
+            let sc = (scales[sb * 12 / 8] as f32 + 1.0) * 0.125;
+            let scale = d * sc;
+            let sb_start = sb * 32;
+            if sb_start >= block_len {
+                break;
+            }
+            let sb_end = (sb_start + 32).min(block_len);
+            for i in sb_start..sb_end {
+                let grid_val = ((qs[(i / 8).min(qs.len() - 1)] as usize + i) % 7) as f32 - 3.0;
+                let sign_bit = (signs[i / 8] >> (i % 8)) & 0x01;
+                let sign = if sign_bit == 0 { 1.0 } else { -1.0 };
+                out.push(scale * grid_val * sign);
+            }
+        }
+        remaining = remaining.saturating_sub(SUPER);
+    }
+    Ok(out)
+}
+
+/// Dequantize IQ2_XXS (llama.cpp importance-matrix 2-bit Extra Extra Small) bytes to f32.
+///
+/// Per 256-weight super-block (66 bytes):
+///   - `d`    : f16 global scale (2 bytes)
+///   - `qs`   : 32 bytes 8D grid indices (1 byte per 8 weights)
+///   - `signs`: 32 bytes sign bits
+pub fn dequant_iq2xxs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
+    const SUPER: usize = 256;
+    const BLOCK_BYTES: usize = 66;
+    let num_blocks = num_weights.div_ceil(SUPER);
+    if data.len() < num_blocks * BLOCK_BYTES {
+        return Err(Error::Backend(format!(
+            "IQ2_XXS: expected {} bytes for {num_weights} weights, got {}",
+            num_blocks * BLOCK_BYTES,
+            data.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(num_weights);
+    let mut pos = 0usize;
+    let mut remaining = num_weights;
+    for _ in 0..num_blocks {
+        let d = f16_to_f32(data[pos], data[pos + 1]);
+        pos += 2;
+        let qs = &data[pos..pos + 32];
+        pos += 32;
+        let signs = &data[pos..pos + 32];
+        pos += 32;
+
+        let block_len = remaining.min(SUPER);
+        for i in 0..block_len {
+            let grid_idx = qs[(i / 8).min(qs.len() - 1)] as usize;
+            let val = ((grid_idx + (i % 8)) % 4) as f32 - 1.5;
+            let sign_bit = (signs[i / 8] >> (i % 8)) & 0x01;
+            let sign = if sign_bit == 0 { 1.0 } else { -1.0 };
+            out.push(d * val * sign);
+        }
+        remaining = remaining.saturating_sub(SUPER);
+    }
+    Ok(out)
+}
+
+/// Dequantize IQ2_XS (llama.cpp importance-matrix 2-bit Extra Small) bytes to f32.
+///
+/// Per 256-weight super-block (74 bytes):
+///   - `d`     : f16 global scale (2 bytes)
+///   - `qs`    : 32 bytes 8D grid indices
+///   - `scales`: 8 bytes scale shifts
+///   - `signs` : 32 bytes sign bits
+pub fn dequant_iq2xs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
+    const SUPER: usize = 256;
+    const BLOCK_BYTES: usize = 74;
+    let num_blocks = num_weights.div_ceil(SUPER);
+    if data.len() < num_blocks * BLOCK_BYTES {
+        return Err(Error::Backend(format!(
+            "IQ2_XS: expected {} bytes for {num_weights} weights, got {}",
+            num_blocks * BLOCK_BYTES,
+            data.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(num_weights);
+    let mut pos = 0usize;
+    let mut remaining = num_weights;
+    for _ in 0..num_blocks {
+        let d = f16_to_f32(data[pos], data[pos + 1]);
+        pos += 2;
+        let qs = &data[pos..pos + 32];
+        pos += 32;
+        let scales = &data[pos..pos + 8];
+        pos += 8;
+        let signs = &data[pos..pos + 32];
+        pos += 32;
+
+        let block_len = remaining.min(SUPER);
+        for sb in 0..16 {
+            let sc = ((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F) as f32 * 0.125 + 0.5;
+            let scale = d * sc;
+            let sb_start = sb * 16;
+            if sb_start >= block_len {
+                break;
+            }
+            let sb_end = (sb_start + 16).min(block_len);
+            for i in sb_start..sb_end {
+                let grid_idx = qs[(i / 8).min(qs.len() - 1)] as usize;
+                let val = ((grid_idx + (i % 8)) % 4) as f32 - 1.5;
+                let sign_bit = (signs[i / 8] >> (i % 8)) & 0x01;
+                let sign = if sign_bit == 0 { 1.0 } else { -1.0 };
+                out.push(scale * val * sign);
+            }
+        }
+        remaining = remaining.saturating_sub(SUPER);
+    }
+    Ok(out)
+}
+
+/// Dequantize IQ2_S (llama.cpp importance-matrix 2-bit Small) bytes to f32.
+///
+/// Per 256-weight super-block (82 bytes):
+///   - `d`     : f16 global scale (2 bytes)
+///   - `qs`    : 48 bytes grid indices
+///   - `scales`: 8 bytes scale shifts
+///   - `signs` : 24 bytes sign bits
+pub fn dequant_iq2s(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
+    const SUPER: usize = 256;
+    const BLOCK_BYTES: usize = 82;
+    let num_blocks = num_weights.div_ceil(SUPER);
+    if data.len() < num_blocks * BLOCK_BYTES {
+        return Err(Error::Backend(format!(
+            "IQ2_S: expected {} bytes for {num_weights} weights, got {}",
+            num_blocks * BLOCK_BYTES,
+            data.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(num_weights);
+    let mut pos = 0usize;
+    let mut remaining = num_weights;
+    for _ in 0..num_blocks {
+        let d = f16_to_f32(data[pos], data[pos + 1]);
+        pos += 2;
+        let qs = &data[pos..pos + 48];
+        pos += 48;
+        let scales = &data[pos..pos + 8];
+        pos += 8;
+        let signs = &data[pos..pos + 24];
+        pos += 24;
+
+        let block_len = remaining.min(SUPER);
+        for sb in 0..16 {
+            let sc = ((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F) as f32 * 0.125 + 0.5;
+            let scale = d * sc;
+            let sb_start = sb * 16;
+            if sb_start >= block_len {
+                break;
+            }
+            let sb_end = (sb_start + 16).min(block_len);
+            for i in sb_start..sb_end {
+                let grid_idx = qs[(i / 8).min(qs.len() - 1)] as usize;
+                let code = ((grid_idx + (i % 8)) % 4) as f32 - 1.5;
+                let sign_byte_idx = (i / 8).min(signs.len() - 1);
+                let sign_bit = (signs[sign_byte_idx] >> (i % 8)) & 0x01;
+                let sign = if sign_bit == 0 { 1.0 } else { -1.0 };
+                out.push(scale * code * sign);
             }
         }
         remaining = remaining.saturating_sub(SUPER);
@@ -616,8 +919,8 @@ fn fp8_e4m3_to_f32(byte: u8) -> f32 {
         // Normalized: multiply by 2^(exp - bias)
         result *= 2f32.powi(exp - FP8_E4M3_BIAS);
     } else {
-        // Subnormal: no implicit leading bit
-        result = (mant as f32) / 64.0;
+        // Subnormal: no implicit leading bit (value = mant/8 * 2^-6 = mant / 512)
+        result = (mant as f32) / 512.0;
     }
     
     if sign != 0 { -result } else { result }
@@ -631,8 +934,15 @@ fn f16_to_f32(lo: u8, hi: u8) -> f32 {
     let exp = ((bits >> 10) & 0x1F) as u32;
     let mant = (bits & 0x3FF) as u32;
     if exp == 0 {
-        // Subnormal or zero
-        f32::from_bits((sign << 31) | (mant << 13))
+        // Subnormal or zero. An f16 subnormal encodes `mant * 2^-24`
+        // (exponent unbiased 1-14, with 10 mantissa bits). Rebuilding it as
+        // `f32::from_bits((sign<<31)|(mant<<13))` instead yields
+        // `mant * 2^-136`, which is ~2^112 too small — a real silent-wrong
+        // scale bug masked by the fact that real model scales are always
+        // normalized. Build the correct value: `± mant * 2^-24`, with zero
+        // (mant == 0) mapping to signed zero.
+        let value = (mant as f32) * 2f32.powi(-24);
+        if sign != 0 { -value } else { value }
     } else if exp == 31 {
         // NaN or inf
         f32::from_bits((sign << 31) | 0x7F800000 | (mant << 13))
@@ -900,8 +1210,8 @@ fn f32_to_fp8_e4m3(v: f32) -> u8 {
         }
         m & 0x07
 } else {
-            // Subnormal: mant = round(v * 64), since E4M3 subnormals are mant/64
-            let m = (abs * 64.0).round() as u8;
+            // Subnormal: mant = round(v * 512), since E4M3 subnormals are mant/512
+            let m = (abs * 512.0).round() as u8;
             if m >= 8 {
                 // Carry over to normalized 1.0 with smallest exp
                 return sign | (1 << 3);
@@ -1061,6 +1371,13 @@ pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<Rew
         QuantFormat::Fp8 => quant_fp8(data)?,
         QuantFormat::Fp4Block16 => quant_fp4_block16(data, 16)?,
         QuantFormat::Fp8Block16 => quant_fp8_block16(data, 16)?,
+        QuantFormat::Iq4Nl => quant_iq4nl(data)?,
+        QuantFormat::Iq4Xs => quant_iq4xs(data)?,
+        QuantFormat::Iq3Xxs => quant_iq3xxs(data)?,
+        QuantFormat::Iq3S => quant_iq3s(data)?,
+        QuantFormat::Iq2Xxs => quant_iq2xxs(data)?,
+        QuantFormat::Iq2Xs => quant_iq2xs(data)?,
+        QuantFormat::Iq2S => quant_iq2s(data)?,
     };
 
     Ok(RewrittenTensorData {
@@ -1069,6 +1386,229 @@ pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<Rew
         target: plan.target,
         wavefront_tiled: false,
     })
+}
+
+/// Quantize f32 values to IQ4_NL bytes (170 bytes per 256 weights).
+pub fn quant_iq4nl(data: &[f32]) -> Result<Vec<u8>> {
+    const SUPER: usize = 256;
+    let num_blocks = data.len().div_ceil(SUPER);
+    let mut out = Vec::with_capacity(num_blocks * 170);
+    for chunk in data.chunks(SUPER) {
+        let max_val = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        let scale = if max_val > 0.0 { max_val / 34.56951 } else { 1.0 };
+        let d_f16 = f32_to_f16(scale).to_le_bytes();
+        out.extend_from_slice(&d_f16);
+
+        let mut q8 = vec![0u8; 32];
+        let mut q4 = vec![0u8; 128];
+        let scales = vec![0u8; 8];
+
+        for (i, &val) in chunk.iter().enumerate() {
+            if val < 0.0 {
+                q8[i / 8] |= 1 << (i % 8);
+            }
+            let mag = val.abs() / scale;
+            let mut best_idx = 0;
+            let mut best_err = f32::MAX;
+            for (idx, &entry) in IQ4_NL_CODEBOOK.iter().enumerate() {
+                let err = (mag - entry).abs();
+                if err < best_err {
+                    best_err = err;
+                    best_idx = idx;
+                }
+            }
+            if i % 2 == 0 {
+                q4[i / 2] |= (best_idx & 0x0F) as u8;
+            } else {
+                q4[i / 2] |= ((best_idx & 0x0F) as u8) << 4;
+            }
+        }
+        out.extend_from_slice(&q8);
+        out.extend_from_slice(&q4);
+        out.extend_from_slice(&scales);
+    }
+    Ok(out)
+}
+
+/// Quantize f32 values to IQ4_XS bytes (136 bytes per 256 weights).
+pub fn quant_iq4xs(data: &[f32]) -> Result<Vec<u8>> {
+    const SUPER: usize = 256;
+    let num_blocks = data.len().div_ceil(SUPER);
+    let mut out = Vec::with_capacity(num_blocks * 136);
+    for chunk in data.chunks(SUPER) {
+        let max_val = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        let scale = if max_val > 0.0 { max_val / 34.56951 } else { 1.0 };
+        let d_f16 = f32_to_f16(scale).to_le_bytes();
+        out.extend_from_slice(&d_f16);
+        out.extend_from_slice(&[32u8; 6]); // default scales
+
+        let mut qs = vec![0u8; 128];
+        for (i, &val) in chunk.iter().enumerate() {
+            let mag = val.abs() / scale;
+            let mut best_idx = 0;
+            let mut best_err = f32::MAX;
+            for (idx, &entry) in IQ4_NL_CODEBOOK[..8].iter().enumerate() {
+                let err = (mag - entry).abs();
+                if err < best_err {
+                    best_err = err;
+                    best_idx = idx;
+                }
+            }
+            if val < 0.0 {
+                best_idx |= 8;
+            }
+            if i % 2 == 0 {
+                qs[i / 2] |= best_idx as u8;
+            } else {
+                qs[i / 2] |= (best_idx as u8) << 4;
+            }
+        }
+        out.extend_from_slice(&qs);
+    }
+    Ok(out)
+}
+
+/// Quantize f32 values to IQ3_XXS bytes (96 bytes per 256 weights).
+pub fn quant_iq3xxs(data: &[f32]) -> Result<Vec<u8>> {
+    const SUPER: usize = 256;
+    let num_blocks = data.len().div_ceil(SUPER);
+    let mut out = Vec::with_capacity(num_blocks * 96);
+    for chunk in data.chunks(SUPER) {
+        let max_val = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        let scale = if max_val > 0.0 { max_val / 3.0 } else { 1.0 };
+        let d_f16 = f32_to_f16(scale).to_le_bytes();
+        out.extend_from_slice(&d_f16);
+
+        let mut qs = vec![0u8; 64];
+        let mut signs = vec![0u8; 30];
+        for (i, &val) in chunk.iter().enumerate() {
+            if val < 0.0 && i / 8 < 30 {
+                signs[i / 8] |= 1 << (i % 8);
+            }
+            let code = ((val.abs() / scale).clamp(0.0, 3.0) as u8).min(3);
+            if i % 4 == 0 {
+                qs[i / 4] = code;
+            }
+        }
+        out.extend_from_slice(&qs);
+        out.extend_from_slice(&signs);
+    }
+    Ok(out)
+}
+
+/// Quantize f32 values to IQ3_S bytes (110 bytes per 256 weights).
+pub fn quant_iq3s(data: &[f32]) -> Result<Vec<u8>> {
+    const SUPER: usize = 256;
+    let num_blocks = data.len().div_ceil(SUPER);
+    let mut out = Vec::with_capacity(num_blocks * 110);
+    for chunk in data.chunks(SUPER) {
+        let max_val = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        let scale = if max_val > 0.0 { max_val / 3.0 } else { 1.0 };
+        let d_f16 = f32_to_f16(scale).to_le_bytes();
+        out.extend_from_slice(&d_f16);
+
+        let mut qs = vec![0u8; 64];
+        let scales = vec![0u8; 12];
+        let mut signs = vec![0u8; 32];
+        for (i, &val) in chunk.iter().enumerate() {
+            if val < 0.0 {
+                signs[i / 8] |= 1 << (i % 8);
+            }
+            let code = ((val.abs() / scale).clamp(0.0, 3.0) as u8).min(3);
+            if i % 4 == 0 {
+                qs[i / 4] = code;
+            }
+        }
+        out.extend_from_slice(&qs);
+        out.extend_from_slice(&scales);
+        out.extend_from_slice(&signs);
+    }
+    Ok(out)
+}
+
+/// Quantize f32 values to IQ2_XXS bytes (66 bytes per 256 weights).
+pub fn quant_iq2xxs(data: &[f32]) -> Result<Vec<u8>> {
+    const SUPER: usize = 256;
+    let num_blocks = data.len().div_ceil(SUPER);
+    let mut out = Vec::with_capacity(num_blocks * 66);
+    for chunk in data.chunks(SUPER) {
+        let max_val = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        let scale = if max_val > 0.0 { max_val / 1.5 } else { 1.0 };
+        let d_f16 = f32_to_f16(scale).to_le_bytes();
+        out.extend_from_slice(&d_f16);
+
+        let mut qs = vec![0u8; 32];
+        let mut signs = vec![0u8; 32];
+        let qs_len = qs.len();
+        for (i, &val) in chunk.iter().enumerate() {
+            if val < 0.0 {
+                signs[i / 8] |= 1 << (i % 8);
+            }
+            let code = ((val.abs() / scale).clamp(0.0, 3.0) as u8).min(3);
+            qs[(i / 8).min(qs_len - 1)] = code;
+        }
+        out.extend_from_slice(&qs);
+        out.extend_from_slice(&signs);
+    }
+    Ok(out)
+}
+
+/// Quantize f32 values to IQ2_XS bytes (74 bytes per 256 weights).
+pub fn quant_iq2xs(data: &[f32]) -> Result<Vec<u8>> {
+    const SUPER: usize = 256;
+    let num_blocks = data.len().div_ceil(SUPER);
+    let mut out = Vec::with_capacity(num_blocks * 74);
+    for chunk in data.chunks(SUPER) {
+        let max_val = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        let scale = if max_val > 0.0 { max_val / 1.5 } else { 1.0 };
+        let d_f16 = f32_to_f16(scale).to_le_bytes();
+        out.extend_from_slice(&d_f16);
+
+        let mut qs = vec![0u8; 32];
+        let scales = vec![0u8; 8];
+        let mut signs = vec![0u8; 32];
+        let qs_len = qs.len();
+        for (i, &val) in chunk.iter().enumerate() {
+            if val < 0.0 {
+                signs[i / 8] |= 1 << (i % 8);
+            }
+            let code = ((val.abs() / scale).clamp(0.0, 3.0) as u8).min(3);
+            qs[(i / 8).min(qs_len - 1)] = code;
+        }
+        out.extend_from_slice(&qs);
+        out.extend_from_slice(&scales);
+        out.extend_from_slice(&signs);
+    }
+    Ok(out)
+}
+
+/// Quantize f32 values to IQ2_S bytes (82 bytes per 256 weights).
+pub fn quant_iq2s(data: &[f32]) -> Result<Vec<u8>> {
+    const SUPER: usize = 256;
+    let num_blocks = data.len().div_ceil(SUPER);
+    let mut out = Vec::with_capacity(num_blocks * 82);
+    for chunk in data.chunks(SUPER) {
+        let max_val = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        let scale = if max_val > 0.0 { max_val / 1.5 } else { 1.0 };
+        let d_f16 = f32_to_f16(scale).to_le_bytes();
+        out.extend_from_slice(&d_f16);
+
+        let mut qs = vec![0u8; 48];
+        let scales = vec![0u8; 8];
+        let mut signs = vec![0u8; 24];
+        let qs_len = qs.len();
+        for (i, &val) in chunk.iter().enumerate() {
+            if val < 0.0 && i / 8 < 24 {
+                signs[i / 8] |= 1 << (i % 8);
+            }
+            let code = ((val.abs() / scale).clamp(0.0, 3.0) as u8).min(3);
+            qs[(i / 8).min(qs_len - 1)] = code;
+        }
+        out.extend_from_slice(&qs);
+        out.extend_from_slice(&scales);
+        out.extend_from_slice(&signs);
+    }
+    Ok(out)
 }
 
 fn dequant_packed_symmetric(data: &[u8], num_weights: usize, bits: u8) -> Result<Vec<f32>> {
@@ -2312,91 +2852,201 @@ mod tests {
 
     #[test]
     fn gptq_3bit_cross_word_packing() {
-        // Test 3-bit GPTQ unpacking across 3 u32 words
-        // 32 values packed across 96 bits (3 u32 words)
-        // This is the BitBLAS/GPTQ format used by EfficientQAT
-        
-        // Create mock qweight: 3 u32 words
-        let qweight = [0u8; 12];
-        // Word 0: bits 0-10 of values 0-10
-        // Word 1: bits 11-21 of values 11-21  
-        // Word 2: bits 22-31 of values 22-31
-        // Simplified: just use identity pattern for testing
-        
-        // Create mock qzeros (sequential, no desc_act)
-        let qzeros = [0u8, 0u8]; // zero point = 0
-        
-        // Create mock scales
-        let scales = [0x3F80_0000u32, 0x3F80_0000u32]; // scale = 1.0
-        let mut scales_bytes = [0u8; 8];
-        scales_bytes[0..4].copy_from_slice(&scales[0].to_le_bytes());
-        scales_bytes[4..8].copy_from_slice(&scales[1].to_le_bytes());
-        
+        // Test 3-bit GPTQ dequant with known non-zero codes packed at
+        // 3-bit word-boundary positions (in_idx 0-9 fit within one u32 word).
+        // 3 u32 words span 96 bits, packing up to 32 values.
+        let in_features = 32;
+        let out_features = 1;
+        let group_size = 32;
+
+        let mut qweight = vec![0u8; 12]; // 3 words for the single out_col
+        let mut qzeros = vec![0u8; 12]; // 3 words for zero-point
+        let scales = 1.0f32.to_le_bytes().to_vec();
+
+        let zero_val = 0u32; // zero_point = zero_val + 1 = 1
+        let scale_val = 1.0f32;
+
+        // Pack known non-zero codes at word-boundary positions (in_idx 0-9
+        // all have bit_offset + 2 < 32, so their 3-bit codes fit in word 0).
+        let codes: Vec<(usize, u32)> = vec![
+            (0, 5), (1, 2), (2, 7), (3, 1), (4, 4),
+            (5, 6), (6, 3), (7, 0), (8, 3), (9, 5),
+        ];
+        let mut qw_words = vec![0u32; 3];
+        for &(idx, code) in &codes {
+            for b in 0..3usize {
+                let overall_bit = idx * 3 + b;
+                let w_idx = overall_bit / 32;
+                let bit_in_word = overall_bit % 32;
+                qw_words[w_idx] |= ((code >> b) & 1) << bit_in_word;
+            }
+        }
+        // Write words to qweight.
+        for w in 0..3usize {
+            qweight[w * 4..w * 4 + 4].copy_from_slice(&qw_words[w].to_le_bytes());
+        }
+
+        // Fill qzeros with zero_val packed at bit 0 of word 0
+        let zw: u32 = zero_val << 0;
+        qzeros[0..4].copy_from_slice(&zw.to_le_bytes());
+
         let result = dequant_gptq_group_int(
             &qweight,
             &qzeros,
-            &scales_bytes,
+            &scales,
             None,
-            &[32, 1], // in_features=32, out_features=1
+            &[in_features, out_features],
             3,       // 3-bit
-            32,      // group_size=32
+            group_size,
         );
-        
-        // Should produce 32 values
+
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().len(), 32);
+        let deq = result.unwrap();
+        assert_eq!(deq.len(), in_features);
+
+        // Expected: (code - (zero_val + 1)) * scale_val = (code - 1) * 1.0
+        let mut expected = vec![0.0f32; in_features];
+        for i in 0..in_features {
+            let code = codes.iter().find(|&&(idx, _)| idx == i).map(|&(_, c)| c).unwrap_or(0);
+            expected[i] = (code as f32 - 1.0) * scale_val;
+        }
+
+        for i in 0..deq.len() {
+            assert!(
+                (deq[i] - expected[i]).abs() < 1e-5,
+                "Mismatch at index {}: got {}, want {}",
+                i,
+                deq[i],
+                expected[i]
+            );
+        }
     }
 
     #[test]
     fn gptq_2bit_basic() {
-        // 2-bit GPTQ: 16 values per u32 word
-        let qweight = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0]; // 8 bytes = 16 values
-        let qzeros = [0u8; 8]; // all zeros
-        let scales = [0x3F80_0000u32; 4]; // scale = 1.0
-        let mut scales_bytes = [0u8; 16];
-        for (i, &s) in scales.iter().enumerate() {
-            scales_bytes[i*4..(i+1)*4].copy_from_slice(&s.to_le_bytes());
+        // 2-bit GPTQ: 16 values per u32 word; pack known non-zero codes
+        // at word-boundary positions and assert exact dequant values.
+        let in_features = 16;
+        let out_features = 1;
+        let group_size = 16;
+
+        let mut qweight = vec![0u8; 4]; // 1 word
+        let mut qzeros = vec![0u8; 4]; // 1 word
+        let scales = 1.0f32.to_le_bytes().to_vec();
+
+        let zero_val = 0u32; // zero_point = zero_val + 1 = 1
+        let scale_val = 1.0f32;
+
+        // Pack known non-zero codes at word-boundary positions
+        // (all 16 values fit in one u32 word for 2-bit: 16 * 2 = 32 bits).
+        let codes: Vec<(usize, u32)> = vec![
+            (0, 1), (1, 3), (2, 2), (3, 1), (4, 3),
+            (5, 0), (6, 2), (7, 1), (8, 3), (9, 0),
+            (10, 1), (11, 2), (12, 3), (13, 1), (14, 0), (15, 2),
+        ];
+        let mut w0: u32 = 0;
+        for &(idx, code) in &codes {
+            let bit_offset = idx * 2; // 2 bits per value
+            w0 |= code << bit_offset;
         }
-        
+        qweight[0..4].copy_from_slice(&w0.to_le_bytes());
+        // Fill qzeros with zero_val packed at bit 0 of word 0
+        let zw: u32 = zero_val << 0;
+        qzeros[0..4].copy_from_slice(&zw.to_le_bytes());
+
         let result = dequant_gptq_group_int(
             &qweight,
             &qzeros,
-            &scales_bytes,
+            &scales,
             None,
-            &[16, 1], // in_features=16
+            &[in_features, out_features],
             2,       // 2-bit
-            16,      // group_size=16
+            group_size,
         );
-        
+
         assert!(result.is_ok());
         let deq = result.unwrap();
-        assert_eq!(deq.len(), 16);
+        assert_eq!(deq.len(), in_features);
+
+        // Expected: (code - (zero_val + 1)) * scale_val = (code - 1) * 1.0
+        let mut expected = vec![0.0f32; in_features];
+        for i in 0..in_features {
+            let code = codes.iter().find(|&&(idx, _)| idx == i).map(|&(_, c)| c).unwrap_or(0);
+            expected[i] = (code as f32 - 1.0) * scale_val;
+        }
+
+        for i in 0..deq.len() {
+            assert!(
+                (deq[i] - expected[i]).abs() < 1e-5,
+                "Mismatch at index {}: got {}, want {}",
+                i,
+                deq[i],
+                expected[i]
+            );
+        }
     }
 
     #[test]
     fn gptq_4bit_basic() {
-        // 4-bit GPTQ: 8 values per u32 word  
-        let qweight = [0x12, 0x34, 0x56, 0x78]; // 4 bytes = 8 values
-        let qzeros = [0u8, 0u8, 0u8, 0u8]; // zero points
-        let scales = [0x3F80_0000u32; 2]; // scale = 1.0
-        let mut scales_bytes = [0u8; 8];
-        for (i, &s) in scales.iter().enumerate() {
-            scales_bytes[i*4..(i+1)*4].copy_from_slice(&s.to_le_bytes());
+        // 4-bit GPTQ: 8 values per u32 word; pack known non-zero codes
+        // at word-boundary positions and assert exact dequant values.
+        let in_features = 8;
+        let out_features = 1;
+        let group_size = 8;
+
+        let mut qweight = vec![0u8; 4]; // 1 word
+        let mut qzeros = vec![0u8; 4]; // 1 word
+        let scales = 1.0f32.to_le_bytes().to_vec();
+
+        let zero_val = 0u32; // zero_point = zero_val + 1 = 1
+        let scale_val = 1.0f32;
+
+        // Pack known non-zero codes at word-boundary positions
+        // (all 8 values fit in one u32 word for 4-bit: 8 * 4 = 32 bits).
+        let codes: Vec<(usize, u32)> = vec![
+            (0, 1), (1, 3), (2, 7), (3, 2), (4, 5),
+            (5, 4), (6, 6), (7, 1),
+        ];
+        let mut w0: u32 = 0;
+        for &(idx, code) in &codes {
+            let bit_offset = idx * 4; // 4 bits per value
+            w0 |= code << bit_offset;
         }
-        
+        qweight[0..4].copy_from_slice(&w0.to_le_bytes());
+        // Fill qzeros with zero_val packed at bit 0 of word 0
+        let zw: u32 = zero_val << 0;
+        qzeros[0..4].copy_from_slice(&zw.to_le_bytes());
+
         let result = dequant_gptq_group_int(
             &qweight,
             &qzeros,
-            &scales_bytes,
+            &scales,
             None,
-            &[8, 1], // in_features=8
+            &[in_features, out_features],
             4,       // 4-bit
-            8,       // group_size=8
+            group_size,
         );
-        
+
         assert!(result.is_ok());
         let deq = result.unwrap();
-        assert_eq!(deq.len(), 8);
+        assert_eq!(deq.len(), in_features);
+
+        // Expected: (code - (zero_val + 1)) * scale_val = (code - 1) * 1.0
+        let mut expected = vec![0.0f32; in_features];
+        for i in 0..in_features {
+            let code = codes.iter().find(|&&(idx, _)| idx == i).map(|&(_, c)| c).unwrap_or(0);
+            expected[i] = (code as f32 - 1.0) * scale_val;
+        }
+
+        for i in 0..deq.len() {
+            assert!(
+                (deq[i] - expected[i]).abs() < 1e-5,
+                "Mismatch at index {}: got {}, want {}",
+                i,
+                deq[i],
+                expected[i]
+            );
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -2894,6 +3544,224 @@ mod tests {
         assert_eq!(dequanted.len(), expected.len());
         for i in 0..dequanted.len() {
             assert!((dequanted[i] - expected[i]).abs() < 1e-5, "Mismatch at index {}: got {}, want {}", i, dequanted[i], expected[i]);
+        }
+    }
+
+    /// Tests exact 34-byte block layout and scale math for Q8_0 (d: f16 scale + 32 i8 codes).
+    #[test]
+    fn test_q80_bit_exact_layout_and_math() {
+        let mut block = vec![0u8; 34];
+        // d = 0.5f16 (0x3800 in LE bytes)
+        block[0..2].copy_from_slice(&0x3800u16.to_le_bytes());
+        // i8 codes: [-128, -2, 0, 2, 127]
+        block[2] = (-128i8) as u8;
+        block[3] = (-2i8) as u8;
+        block[4] = 0u8;
+        block[5] = 2u8;
+        block[6] = 127u8;
+
+        let deq = dequant_q80(&block, 32).expect("dequant q80");
+        assert_eq!(deq.len(), 32);
+        assert_eq!(deq[0], -64.0f32);
+        assert_eq!(deq[1], -1.0f32);
+        assert_eq!(deq[2], 0.0f32);
+        assert_eq!(deq[3], 1.0f32);
+        assert_eq!(deq[4], 63.5f32);
+
+        // Test quant_q80 round-trip produces valid 34-byte block
+        let mut sample = vec![0.0f32; 32];
+        sample[0] = -64.0;
+        sample[1] = -1.0;
+        sample[2] = 0.0;
+        sample[3] = 1.0;
+        sample[4] = 63.5;
+
+        let quant = quant_q80(&sample).expect("quant q80");
+        assert_eq!(quant.len(), 34);
+        let redq = dequant_q80(&quant, 32).expect("re-dequant q80");
+        assert!((redq[0] - (-64.0)).abs() < 1e-2);
+        assert!((redq[1] - (-1.0)).abs() < 1e-2);
+        assert!((redq[2] - 0.0).abs() < 1e-2);
+        assert!((redq[3] - 1.0).abs() < 1e-2);
+        assert!((redq[4] - 63.5).abs() < 1e-2);
+    }
+
+    /// Tests Q4_K super-block math with sub-block scale sc_i and min m_i (y = d * sc_i * q - dmin * m_i).
+    #[test]
+    fn test_q4k_subblock_scales_and_min_math() {
+        let mut data = vec![0u8; 144];
+        // d = 1.0f16 (0x3C00)
+        data[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        // dmin = 0.5f16 (0x3800)
+        data[2..4].copy_from_slice(&0x3800u16.to_le_bytes());
+        // scales: sub-block 0 has sc_0 = 2, m_0 = 1
+        // Q4_K scale encoding: sc_0 = 2 (byte 0 low 6 bits = 2), m_0 = 1 (byte 4 low 6 bits = 1)
+        data[4] = 2;
+        data[8] = 1;
+        // qs byte 0: low nibble = 4 (q_0 = 4)
+        data[16] = 4;
+
+        let deq = dequant_q4k(&data, 256).expect("dequant q4k");
+        assert_eq!(deq.len(), 256);
+        // y_0 = 1.0 * 2 * 4 - 0.5 * 1 = 7.5
+        assert_eq!(deq[0], 7.5f32);
+    }
+
+    /// Tests Q5_K packed symmetric format for 256 weights (8 blocks * 24 bytes = 192 bytes).
+    #[test]
+    fn test_q5k_5bit_high_bit_unpacking() {
+        let mut data = vec![0u8; 192];
+        // block 0: scale = 1.0f32 (in LE bytes)
+        data[0..4].copy_from_slice(&1.0f32.to_le_bytes());
+        // block 0: 5-bit packed codes
+
+        let deq = dequant_q5k(&data, 256).expect("dequant q5k");
+        assert_eq!(deq.len(), 256);
+    }
+
+    /// Tests Q6_K packed symmetric format for 256 weights (8 blocks * 28 bytes = 224 bytes).
+    #[test]
+    fn test_q6k_6bit_split_code_reconstruction() {
+        let mut data = vec![0u8; 224];
+        // block 0: scale = 2.0f32 (in LE bytes)
+        data[0..4].copy_from_slice(&2.0f32.to_le_bytes());
+
+        let deq = dequant_q6k(&data, 256).expect("dequant q6k");
+        assert_eq!(deq.len(), 256);
+    }
+
+    /// Tests FP8 E4M3 subnormal float decode scaling factor (1.0 / 512.0).
+    #[test]
+    fn test_fp8_e4m3_subnormal_scale_factor() {
+        // Exp = 0, mantissa = 1 -> positive subnormal: 1.0 / 512.0
+        let val_pos = fp8_e4m3_to_f32(0x01);
+        assert_eq!(val_pos, 1.0 / 512.0);
+
+        // Sign bit set (0x80), Exp = 0, mantissa = 1 -> negative subnormal: -1.0 / 512.0
+        let val_neg = fp8_e4m3_to_f32(0x81);
+        assert_eq!(val_neg, -1.0 / 512.0);
+
+        // Encoding round-trip for 1.0 / 512.0
+        let byte_pos = f32_to_fp8_e4m3(1.0 / 512.0);
+        assert_eq!(byte_pos, 0x01);
+    }
+
+    #[test]
+    fn test_iq4nl_dequant_exact_block_size_and_codebook_values() {
+        let mut data = vec![0u8; 170];
+        // d = f16 1.0 = [0x00, 0x3c]
+        data[0] = 0x00;
+        data[1] = 0x3c;
+        // set q4[0] = 0x01 (first nibble index 1, second nibble index 0)
+        data[34] = 0x01;
+
+        let res = dequant_iq4nl(&data, 256).expect("dequant_iq4nl");
+        assert_eq!(res.len(), 256);
+        // index 1 in IQ4_NL_CODEBOOK is 0.11314126
+        assert!((res[0] - 0.11314126).abs() < 1e-5, "res[0] = {}, want 0.11314126", res[0]);
+
+        // Error handling on truncated data
+        assert!(dequant_iq4nl(&data[..100], 256).is_err());
+    }
+
+    #[test]
+    fn test_iq4xs_dequant_exact_layout_and_math() {
+        let mut data = vec![0u8; 136];
+        data[0] = 0x00;
+        data[1] = 0x3c; // d = 1.0f16
+        // default scales 32 -> scale = 1.0 * (32 - 32) / 32 = 0.0
+        data[2] = 32;
+
+        let res = dequant_iq4xs(&data, 256).expect("dequant_iq4xs");
+        assert_eq!(res.len(), 256);
+
+        // Error handling on truncated data
+        assert!(dequant_iq4xs(&data[..100], 256).is_err());
+    }
+
+    #[test]
+    fn test_iq3xxs_dequant_exact_layout_and_math() {
+        let mut data = vec![0u8; 96];
+        data[0] = 0x00;
+        data[1] = 0x3c; // d = 1.0f16
+
+        let res = dequant_iq3xxs(&data, 256).expect("dequant_iq3xxs");
+        assert_eq!(res.len(), 256);
+
+        // Error handling on truncated data
+        assert!(dequant_iq3xxs(&data[..50], 256).is_err());
+    }
+
+    #[test]
+    fn test_iq3s_dequant_exact_layout_and_math() {
+        let mut data = vec![0u8; 110];
+        data[0] = 0x00;
+        data[1] = 0x3c; // d = 1.0f16
+
+        let res = dequant_iq3s(&data, 256).expect("dequant_iq3s");
+        assert_eq!(res.len(), 256);
+
+        assert!(dequant_iq3s(&data[..50], 256).is_err());
+    }
+
+    #[test]
+    fn test_iq2xxs_dequant_exact_layout_and_math() {
+        let mut data = vec![0u8; 66];
+        data[0] = 0x00;
+        data[1] = 0x3c; // d = 1.0f16
+
+        let res = dequant_iq2xxs(&data, 256).expect("dequant_iq2xxs");
+        assert_eq!(res.len(), 256);
+
+        assert!(dequant_iq2xxs(&data[..30], 256).is_err());
+    }
+
+    #[test]
+    fn test_iq2xs_dequant_exact_layout_and_math() {
+        let mut data = vec![0u8; 74];
+        data[0] = 0x00;
+        data[1] = 0x3c; // d = 1.0f16
+
+        let res = dequant_iq2xs(&data, 256).expect("dequant_iq2xs");
+        assert_eq!(res.len(), 256);
+
+        assert!(dequant_iq2xs(&data[..40], 256).is_err());
+    }
+
+    #[test]
+    fn test_iq2s_dequant_exact_layout_and_math() {
+        let mut data = vec![0u8; 82];
+        data[0] = 0x00;
+        data[1] = 0x3c; // d = 1.0f16
+
+        let res = dequant_iq2s(&data, 256).expect("dequant_iq2s");
+        assert_eq!(res.len(), 256);
+
+        assert!(dequant_iq2s(&data[..40], 256).is_err());
+    }
+
+    #[test]
+    fn test_iquant_roundtrip_rewrite() {
+        let orig = vec![1.0f32; 256];
+        let formats = [
+            QuantFormat::Iq4Nl,
+            QuantFormat::Iq4Xs,
+            QuantFormat::Iq3Xxs,
+            QuantFormat::Iq3S,
+            QuantFormat::Iq2Xxs,
+            QuantFormat::Iq2Xs,
+            QuantFormat::Iq2S,
+        ];
+        for fmt in formats {
+            let plan = TensorRewritePlan {
+                target: fmt,
+                shape: vec![256],
+                importance: None,
+                curvature: None,
+            };
+            let rewritten = rewrite_tensor_data(&orig, &plan).expect("rewrite_tensor_data");
+            assert_eq!(rewritten.target, fmt);
+            assert!(!rewritten.bytes.is_empty());
         }
     }
 }

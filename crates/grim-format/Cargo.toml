@@ -19,3 +19,4 @@ default = []
 
 [dev-dependencies]
 tempfile = "3"
+grim-backend-cpu = { workspace = true }

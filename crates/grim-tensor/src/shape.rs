@@ -54,8 +54,8 @@ impl Shape {
         let b = other.dims();
         let n = a.len().max(b.len());
         for i in 0..n {
-            let ad = *a.get(a.len().saturating_sub(i + 1)).unwrap_or(&1);
-            let bd = *b.get(b.len().saturating_sub(i + 1)).unwrap_or(&1);
+            let ad = if i < a.len() { a[a.len() - 1 - i] } else { 1 };
+            let bd = if i < b.len() { b[b.len() - 1 - i] } else { 1 };
             if ad != bd && ad != 1 && bd != 1 {
                 return false;
             }
@@ -79,5 +79,56 @@ impl From<&[usize]> for Shape {
 impl<const N: usize> From<[usize; N]> for Shape {
     fn from(v: [usize; N]) -> Self {
         Self::new(v.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shape_elem_count_and_rank() {
+        let s1 = Shape::new(vec![4, 8, 16]);
+        assert_eq!(s1.rank(), 3);
+        assert_eq!(s1.elem_count(), 512);
+
+        let scalar = Shape::new(vec![]);
+        assert_eq!(scalar.rank(), 0);
+        assert_eq!(scalar.elem_count(), 1);
+
+        let empty = Shape::new(vec![4, 0, 16]);
+        assert_eq!(empty.rank(), 3);
+        assert_eq!(empty.elem_count(), 0);
+    }
+
+    #[test]
+    fn test_shape_dim_bounds_check() {
+        let s = Shape::new(vec![2, 4, 8]);
+        assert_eq!(s.dim(0).unwrap(), 2);
+        assert_eq!(s.dim(1).unwrap(), 4);
+        assert_eq!(s.dim(2).unwrap(), 8);
+        assert!(s.dim(3).is_err());
+    }
+
+    #[test]
+    fn test_shape_remove_dim() {
+        let s = Shape::new(vec![2, 4, 8]);
+        assert_eq!(s.remove_dim(1).dims(), &[2, 8]);
+        assert_eq!(s.remove_dim(0).dims(), &[4, 8]);
+        assert_eq!(s.remove_dim(2).dims(), &[2, 4]);
+        assert_eq!(s.remove_dim(99).dims(), &[2, 4, 8]);
+    }
+
+    #[test]
+    fn test_shape_broadcast_compatible() {
+        let a = Shape::new(vec![32, 1, 64]);
+        let b = Shape::new(vec![1, 16, 64]);
+        assert!(a.broadcast_compatible(&b));
+
+        let c = Shape::new(vec![64]);
+        assert!(a.broadcast_compatible(&c));
+
+        let incompatible = Shape::new(vec![32, 8, 65]);
+        assert!(!a.broadcast_compatible(&incompatible));
     }
 }

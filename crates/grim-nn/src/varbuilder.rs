@@ -13,7 +13,11 @@ use grim_tensor::tensor::Tensor;
 use grim_tensor::{BackendDevice, RawTensor};
 
 use grim_backend_cpu::cpu_tensor;
-use grim_quant::{dequant_fp4, dequant_nf4, dequant_fp8, dequant_fp4_block16, dequant_fp8_block16, dequant_q2k, dequant_q3k, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80, dequant_iq4nl};
+use grim_quant::{
+    dequant_fp4, dequant_fp4_block16, dequant_fp8, dequant_fp8_block16, dequant_iq2s,
+    dequant_iq2xs, dequant_iq2xxs, dequant_iq3s, dequant_iq3xxs, dequant_iq4nl, dequant_iq4xs,
+    dequant_nf4, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80,
+};
 
 #[cfg(feature = "cuda-mem")]
 use grim_backend_cuda::CudaDevice;
@@ -332,13 +336,19 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             ))),
         },
         Storage::KQuant(scheme) => match scheme {
-            KQuantScheme::Q2K => dequant_q2k(&raw.bytes, n),
-            KQuantScheme::Q3K => dequant_q3k(&raw.bytes, n),
+            KQuantScheme::Q2K => Err(Error::Unimplemented("Native dequantization for Q2_K not yet implemented".into())),
+            KQuantScheme::Q3K => Err(Error::Unimplemented("Native dequantization for Q3_K not yet implemented".into())),
             KQuantScheme::Q4K => dequant_q4k(&raw.bytes, n),
             KQuantScheme::Q5K => dequant_q5k(&raw.bytes, n),
             KQuantScheme::Q6K => dequant_q6k(&raw.bytes, n),
             KQuantScheme::Q80 => dequant_q80(&raw.bytes, n),
             KQuantScheme::IQ4NL => dequant_iq4nl(&raw.bytes, n),
+            KQuantScheme::IQ4XS => dequant_iq4xs(&raw.bytes, n),
+            KQuantScheme::IQ3XXS => dequant_iq3xxs(&raw.bytes, n),
+            KQuantScheme::IQ3S => dequant_iq3s(&raw.bytes, n),
+            KQuantScheme::IQ2XXS => dequant_iq2xxs(&raw.bytes, n),
+            KQuantScheme::IQ2XS => dequant_iq2xs(&raw.bytes, n),
+            KQuantScheme::IQ2S => dequant_iq2s(&raw.bytes, n),
         },
         Storage::FloatPack(fp) => match fp {
             FloatPackScheme::Fp4 => dequant_fp4(&raw.bytes, n),
@@ -419,7 +429,12 @@ pub(crate) fn f16_to_f32_le(bytes: &[u8]) -> f32 {
     let exp = ((bits >> 10) & 0x1F) as u32;
     let mant = (bits & 0x3FF) as u32;
     if exp == 0 {
-        f32::from_bits((sign << 31) | (mant << 13))
+        // Subnormal or zero. An f16 subnormal encodes `mant * 2^-24`, but
+        // `f32::from_bits((sign<<31)|(mant<<13))` instead yields
+        // `mant * 2^-136` (≈2^112 too small). Build the correct value; this
+        // mirrors the fix in grim-quant::f16_to_f32 so the two decoders agree.
+        let value = (mant as f32) * 2f32.powi(-24);
+        if sign != 0 { -value } else { value }
     } else if exp == 31 {
         f32::from_bits((sign << 31) | 0x7F80_0000 | (mant << 13))
     } else {
@@ -471,5 +486,138 @@ mod tests {
         let ws = WeightSource::root(&dummy, Device::Cpu);
         let tensor = ws.get(Shape::new(vec![2, 16]), "weight").unwrap();
         assert_eq!(tensor.device(), &Device::Cpu);
+    }
+
+    #[test]
+    fn test_weight_source_pp_path_concatenation() {
+        let dummy = DummyProvider {
+            raw: RawTensor {
+                bytes: vec![0u8; 16],
+                shape: vec![4],
+                dtype: DType::F32,
+                provenance: QuantProvenance::GrimNative,
+            },
+            dtype: DType::F32,
+        };
+        let ws = WeightSource::root(&dummy, Device::Cpu);
+        let scoped = ws.pp("model").pp("layers.0");
+        assert_eq!(scoped.full_name("weight"), "model.layers.0.weight");
+    }
+
+    // ===== golden dequant_to_f32 tests (see header below) =====
+
+    fn close(got: f32, want: f32, ctx: &str) {
+        let abs = (got - want).abs();
+        let denom = want.abs().max(1e-7);
+        assert!(got.is_finite(), "{ctx}: non-finite {got:?} (want {want:?})");
+        assert!(abs == 0.0 || (abs / denom) < 1e-5, "{ctx}: got {got:?} want {want:?} (abs={abs})");
+    }
+
+    fn raw(bytes: Vec<u8>, shape: Vec<usize>, dtype: DType) -> RawTensor {
+        RawTensor { bytes, shape, dtype, provenance: QuantProvenance::GrimNative }
+    }
+
+    #[test]
+    fn dequant_to_f32_q80_routes_and_applies_f16_scale() {
+        let dtype = DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q80),
+        };
+        let mut bytes = vec![0u8; 34];
+        bytes[0..2].copy_from_slice(&0x4000u16.to_le_bytes());
+        let codes: [i8; 32] = [
+            1, -1, 127, -128, 64, -64, 0, 5,
+            10, -10, 50, -50, 25, -25, 100, -100,
+            3, -3, 7, 7, 9, 9, 12, -12,
+            33, -33, 11, -11, 2, 4, 8, 16,
+        ];
+        for (i, &c) in codes.iter().enumerate() {
+            bytes[2 + i] = c as u8;
+        }
+        let r = raw(bytes, vec![32], dtype.clone());
+        let out = dequant_to_f32(&r, &dtype).unwrap();
+        assert_eq!(out.len(), 32);
+        for (i, &c) in codes.iter().enumerate() {
+            close(out[i], (c as f32) * 2.0, &format!("q80[{i}]"));
+        }
+    }
+
+    #[test]
+    fn dequant_to_f32_bf16_native_shifts_left_16() {
+        let dtype = DType { arith: grim_tensor::ArithType::BF16, storage: Storage::Native };
+        let bytes: Vec<u8> = vec![0x80, 0x3F, 0x00, 0xC0, 0x49, 0x40];
+        let r = raw(bytes, vec![3], dtype.clone());
+        let out = dequant_to_f32(&r, &dtype).unwrap();
+        assert_eq!(out.len(), 3);
+        close(out[0], 1.0, "bf16 1.0");
+        close(out[1], -2.0, "bf16 -2.0");
+        close(out[2], 3.140625, "bf16 ~pi");
+    }
+
+    #[test]
+    fn dequant_to_f32_f16_native_normalized_and_subnormal() {
+        let dtype = DType { arith: grim_tensor::ArithType::F16, storage: Storage::Native };
+        let bytes: Vec<u8> = vec![
+            0x00, 0x3C, 0x00, 0x40, 0x48, 0x42, 0x00, 0x02, 0x00, 0xC0,
+        ];
+        let r = raw(bytes, vec![5], dtype.clone());
+        let out = dequant_to_f32(&r, &dtype).unwrap();
+        assert_eq!(out.len(), 5);
+        close(out[0], 1.0, "f16 1.0");
+        close(out[1], 2.0, "f16 2.0");
+        close(out[2], 3.140625, "f16 ~pi");
+        close(out[3], (512.0f32) * 2f32.powi(-24), "f16 subnormal 0x0200");
+        close(out[4], -2.0, "f16 -2.0");
+    }
+
+    #[test]
+    fn bytes_to_f32_rejects_wrong_length() {
+        let dtype = DType::F32;
+        let r = raw(vec![0u8, 1, 2], vec![1], dtype.clone());
+        assert!(dequant_to_f32(&r, &dtype).is_err(), "non-f32-multiple must error");
+        let r2 = raw(vec![0u8, 0, 0x40, 0x40], vec![1], dtype.clone());
+        let out = dequant_to_f32(&r2, &dtype).unwrap();
+        assert_eq!(out.len(), 1);
+        close(out[0], 3.0, "f32 native 3.0");
+    }
+
+    #[test]
+    fn dequant_to_f32_group_int_unpacks_length_prefixed_segments() {
+        use grim_tensor::dtype::{GpuIntConfig, GroupQuantScheme};
+        let dtype = DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::GroupInt(GpuIntConfig {
+                bits: 4,
+                group_size: 8,
+                scheme: GroupQuantScheme::Asymmetric,
+                desc_act: false,
+            }),
+        };
+        let mut qw: u32 = 0;
+        for i in 0..8u32 {
+            qw |= (i & 0xF) << (i * 4);
+        }
+        let qweight = qw.to_le_bytes().to_vec();
+        let mut qz: u32 = 0;
+        for col in 0..8u32 {
+            qz |= 7u32 << (col * 4);
+        }
+        let qzeros = qz.to_le_bytes().to_vec();
+        let scales = 0.5f32.to_le_bytes().to_vec();
+        let g_idx: Vec<u8> = Vec::new();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(qweight.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&qweight);
+        bytes.extend_from_slice(&(qzeros.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&qzeros);
+        bytes.extend_from_slice(&(scales.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&scales);
+        bytes.extend_from_slice(&(g_idx.len() as u64).to_le_bytes());
+        let r = raw(bytes, vec![8, 1], dtype.clone());
+        let out = dequant_to_f32(&r, &dtype).expect("group-int dequant");
+        assert_eq!(out.len(), 8);
+        for i in 0..8 {
+            close(out[i], (i as f32 - 8.0) * 0.5, &format!("groupint[{i}]"));
+        }
     }
 }
