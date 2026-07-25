@@ -33,6 +33,9 @@
         <button class="nav-item" data-tab="dataset" id="nav-dataset">
           <span class="icon">📊</span> Dataset & Tokenizer
         </button>
+        <button class="nav-item" data-tab="settings" id="nav-settings">
+          <span class="icon">⚙️</span> Expert Settings
+        </button>
       </nav>
 
       <div class="gpu-badge" id="gpu-telemetry-badge">
@@ -81,6 +84,14 @@
                 <select id="select-dataset" class="form-control">
                   <option value="">Loading datasets...</option>
                 </select>
+              </div>
+
+              <div class="form-group">
+                <label>Target Accelerator GPU(s)</label>
+                <div id="gpu-selection-container" class="form-control" style="height: auto; min-height: 42px; display: flex; flex-direction: column; gap: 6px; padding: 10px;">
+                  <span class="text-muted" style="font-size: 12px;">Probing hardware GPUs...</span>
+                </div>
+                <div id="gpu-selection-help" style="font-size: 11px; margin-top: 4px; color: var(--text-muted);">Select single or matching architecture GPUs for FSDP parallel training.</div>
               </div>
 
               <div class="form-row">
@@ -256,6 +267,76 @@
           <p class="subtitle">Inspect sample rows, token length distributions, and sample packing density.</p>
           <div id="dataset-preview-container" class="preview-box">
             <p class="text-muted">Select a dataset in the Training Control Room to view preview samples and length histograms.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 5: Expert Settings -->
+      <section class="tab-page" id="page-settings">
+        <div class="card card-panel">
+          <h2>⚙️ Grim's Garage — Expert Engine Settings</h2>
+          <p class="subtitle">Fine-tune low-level ROCm kernel execution, FSDP sharding, quantization fallback thresholds, and memory management knobs.</p>
+
+          <div class="grid-2col" style="margin-top: 20px;">
+            <div class="card" style="background: rgba(15, 23, 42, 0.5);">
+              <h3 style="font-size: 15px; margin-bottom: 14px;">⚡ Kernel Fusions & Parallel Execution</h3>
+              <div class="form-group">
+                <label for="set-fusion-mode">ROCm Kernel Fusion Level</label>
+                <select id="set-fusion-mode" class="form-control">
+                  <option value="Aggressive">Aggressive (RMSNorm+Matmul & FlashAttention)</option>
+                  <option value="Standard">Standard (Fused RMSNorm+Matmul)</option>
+                  <option value="Strict">Strict IEEE Parity (Unfused)</option>
+                </select>
+              </div>
+
+              <div class="form-group">
+                <label for="set-fsdp-mode">Consumer FSDP Sharding Strategy</label>
+                <select id="set-fsdp-mode" class="form-control">
+                  <option value="FullShard">Full Shard (Zero3 - Peak VRAM Saving)</option>
+                  <option value="ShardGradOp">Shard Grad Op (Zero2 - Low Communication)</option>
+                  <option value="NoShard">No Shard (Replicated - Single GPU Speed)</option>
+                </select>
+              </div>
+
+              <div class="form-group">
+                <label for="set-checkpoint-freq">Activation Checkpoint Frequency</label>
+                <select id="set-checkpoint-freq" class="form-control">
+                  <option value="1">Every Transformer Block (Lowest VRAM)</option>
+                  <option value="2">Every 2 Transformer Blocks (Balanced)</option>
+                  <option value="0">Disabled (Max VRAM required)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="card" style="background: rgba(15, 23, 42, 0.5);">
+              <h3 style="font-size: 15px; margin-bottom: 14px;">📦 Precision & Quantization Policy</h3>
+              <div class="form-group">
+                <label for="set-fp8-format">FP8 Execution Format</label>
+                <select id="set-fp8-format" class="form-control">
+                  <option value="E4M3">E4M3 (Higher Precision - Recommended for Training)</option>
+                  <option value="E5M2">E5M2 (Higher Dynamic Range - Recommended for Gradients)</option>
+                </select>
+              </div>
+
+              <div class="form-group">
+                <label for="set-quant-group">Quantization Group Block Size</label>
+                <select id="set-quant-group" class="form-control">
+                  <option value="128">128 Elements / Group (Default)</option>
+                  <option value="64">64 Elements / Group (Higher Precision)</option>
+                  <option value="256">256 Elements / Group (Lower Overhead)</option>
+                </select>
+              </div>
+
+              <div class="form-group">
+                <label for="set-vram-cap">VRAM Allocation Budget Cap (%)</label>
+                <input type="number" id="set-vram-cap" class="form-control" value="90" min="50" max="98">
+              </div>
+            </div>
+          </div>
+
+          <div class="form-actions" style="margin-top: 24px;">
+            <button class="btn btn-primary" id="btn-save-settings">💾 Save Expert Engine Settings</button>
+            <span id="save-settings-msg" style="font-size: 13px; color: var(--success-color); margin-left: 12px; display: none;">✅ Settings Saved</span>
           </div>
         </div>
       </section>
