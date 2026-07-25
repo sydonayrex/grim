@@ -82,8 +82,6 @@ impl AdamW {
         let bias_correction1 = 1.0 - beta1.powi(self.step_count as i32);
         let bias_correction2 = 1.0 - beta2.powi(self.step_count as i32);
 
-        use grim_tensor::backend::BackendDevice as _;
-
         for (id, param) in params.iter_mut() {
             let dev = crate::pick_device_for_tensor(&param.data);
             let shape = param.data.shape();

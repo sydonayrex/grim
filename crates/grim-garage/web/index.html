@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Grim's Garage — Local Training & Repack Dashboard</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="app" class="dashboard-root">
+    <!-- Sidebar Navigation -->
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-icon">⚡</span>
+        <div class="brand-text">
+          <h1>GRIM'S GARAGE</h1>
+          <span class="brand-subtitle">v0.1.0-autotune</span>
+        </div>
+      </div>
+
+      <nav class="nav-menu">
+        <button class="nav-item active" data-tab="training" id="nav-training">
+          <span class="icon">🚀</span> Training Control Room
+        </button>
+        <button class="nav-item" data-tab="repack" id="nav-repack">
+          <span class="icon">📦</span> Quant Repack Studio
+        </button>
+        <button class="nav-item" data-tab="boltons" id="nav-boltons">
+          <span class="icon">🧩</span> Bolt-On Manager
+        </button>
+        <button class="nav-item" data-tab="dataset" id="nav-dataset">
+          <span class="icon">📊</span> Dataset & Tokenizer
+        </button>
+      </nav>
+
+      <div class="gpu-badge" id="gpu-telemetry-badge">
+        <div class="badge-title">ROCm GPU Telemetry</div>
+        <div class="gpu-name" id="gpu-name-display">Probing hardware...</div>
+        <div class="vram-bar-container">
+          <div class="vram-bar" id="gpu-vram-bar" style="width: 0%;"></div>
+        </div>
+        <div class="vram-text" id="gpu-vram-text">0 GB / 0 GB VRAM</div>
+      </div>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="content-area">
+      <!-- Header Bar -->
+      <header class="top-header">
+        <div class="header-status">
+          <span class="status-indicator online" id="server-status-dot"></span>
+          <span class="status-text" id="server-status-text">Server Online (0.0.0.0:8741)</span>
+        </div>
+        <div class="header-actions">
+          <button class="btn btn-secondary" id="btn-refresh-hardware">🔄 Probe GPU</button>
+        </div>
+      </header>
+
+      <!-- TAB 1: Training Control Room -->
+      <section class="tab-page active" id="page-training">
+        <div class="grid-2col">
+          <!-- Config Panel -->
+          <div class="card card-panel">
+            <h2>New Training Run</h2>
+            <form id="form-start-training" onsubmit="return false;">
+              <div class="form-group">
+                <label for="select-model">Base Model (.grim / GGUF)</label>
+                <select id="select-model" class="form-control">
+                  <option value="">Loading models...</option>
+                </select>
+              </div>
+
+              <div class="form-group">
+                <label for="select-dataset">Dataset</label>
+                <select id="select-dataset" class="form-control">
+                  <option value="">Loading datasets...</option>
+                </select>
+              </div>
+
+              <div class="form-row">
+                <div class="form-group half">
+                  <label for="input-mode">Training Mode</label>
+                  <select id="input-mode" class="form-control">
+                    <option value="Lora">LoRA Fine-tuning</option>
+                    <option value="Full">Full Parameter Training</option>
+                    <option value="DirectDPO">Direct DPO</option>
+                  </select>
+                </div>
+                <div class="form-group half">
+                  <label for="input-lora-rank">LoRA Rank (r)</label>
+                  <input type="number" id="input-lora-rank" class="form-control" value="16" min="1" max="512">
+                </div>
+              </div>
+
+              <div class="form-row">
+                <div class="form-group half">
+                  <label for="input-lr">Learning Rate</label>
+                  <input type="number" id="input-lr" class="form-control" value="0.00002" step="0.000001">
+                </div>
+                <div class="form-group half">
+                  <label for="input-epochs">Epochs</label>
+                  <input type="number" id="input-epochs" class="form-control" value="1" min="1" max="100">
+                </div>
+              </div>
+
+              <div class="form-row checkboxes">
+                <label class="checkbox-label">
+                  <input type="checkbox" id="check-fusion-rmsnorm" checked> ROCm Fused RMSNorm+Matmul
+                </label>
+                <label class="checkbox-label">
+                  <input type="checkbox" id="check-fusion-attn" checked> ROCm Fused FlashAttention
+                </label>
+              </div>
+
+              <div class="autotune-box" id="autotune-recommendation-box">
+                <span class="autotune-title">✨ Hardware Autotune Recommendation</span>
+                <p id="autotune-text">Select a model and dataset to generate optimal consumer VRAM allocations.</p>
+                <button type="button" class="btn btn-sm btn-accent" id="btn-apply-autotune">Apply Autotune Preset</button>
+              </div>
+
+              <div class="form-actions">
+                <button type="submit" class="btn btn-primary btn-block" id="btn-start-job">🚀 Start Training Job</button>
+              </div>
+            </form>
+          </div>
+
+          <!-- Live Telemetry Monitor -->
+          <div class="card card-panel">
+            <div class="card-header-flex">
+              <h2>Live Telemetry Monitor</h2>
+              <div class="job-controls" id="job-active-controls" style="display:none;">
+                <button class="btn btn-sm btn-warning" id="btn-pause-job">⏸️ Pause</button>
+                <button class="btn btn-sm btn-success" id="btn-resume-job" style="display:none;">▶️ Resume</button>
+                <button class="btn btn-sm btn-danger" id="btn-cancel-job">⏹️ Cancel</button>
+              </div>
+            </div>
+
+            <div class="metrics-summary">
+              <div class="metric-card">
+                <span class="metric-label">Training Loss</span>
+                <span class="metric-val" id="val-loss">0.0000</span>
+              </div>
+              <div class="metric-card">
+                <span class="metric-label">Allocated VRAM</span>
+                <span class="metric-val" id="val-vram">0.0 GB</span>
+              </div>
+              <div class="metric-card">
+                <span class="metric-label">Throughput</span>
+                <span class="metric-val" id="val-tokens-sec">0 tok/s</span>
+              </div>
+            </div>
+
+            <!-- SVG Loss Chart -->
+            <div class="chart-container">
+              <svg id="svg-loss-chart" viewBox="0 0 500 200" preserveAspectRatio="none">
+                <path id="chart-grid-line-1" d="M 0 50 L 500 50" stroke="#1f293d" stroke-dasharray="4"/>
+                <path id="chart-grid-line-2" d="M 0 100 L 500 100" stroke="#1f293d" stroke-dasharray="4"/>
+                <path id="chart-grid-line-3" d="M 0 150 L 500 150" stroke="#1f293d" stroke-dasharray="4"/>
+                <path id="chart-loss-path" d="M 0 200" fill="none" stroke="#3b82f6" stroke-width="3"/>
+              </svg>
+            </div>
+
+            <!-- Active Jobs Table -->
+            <h3>Job Registry</h3>
+            <div class="table-container">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Job ID</th>
+                    <th>Status</th>
+                    <th>Mode</th>
+                    <th>Model</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="table-jobs-body">
+                  <tr><td colspan="5" class="text-muted">No active training jobs</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: Quant Repack Studio -->
+      <section class="tab-page" id="page-repack">
+        <div class="card card-panel">
+          <h2>Raven FP8 / Crow Q4_K Model Repack Studio</h2>
+          <p class="subtitle">Convert raw GGUF checkpoints into high-throughput ROCm `.grim` model artifacts with integrated EvoPress bitwidth optimization.</p>
+          
+          <form id="form-repack-model" onsubmit="return false;" class="form-narrow">
+            <div class="form-group">
+              <label for="input-repack-source">Source Model Path or URL</label>
+              <input type="text" id="input-repack-source" class="form-control" placeholder="models/Llama-3-8B-Q4_K_M.gguf or https://huggingface.co/...">
+            </div>
+
+            <div class="form-group">
+              <label for="input-repack-name">Output Model Name (.grim)</label>
+              <input type="text" id="input-repack-name" class="form-control" placeholder="llama3-8b-raven-fp8.grim">
+            </div>
+
+            <div class="form-row">
+              <div class="form-group half">
+                <label for="select-repack-mode">Repack Format</label>
+                <select id="select-repack-mode" class="form-control">
+                  <option value="RavenFP8">Raven FP8 (E4M3 Sequential)</option>
+                  <option value="CrowQ4K">Crow Q4_K (Fused GPU Dequant)</option>
+                  <option value="JayMXFP4">Jay MXFP4 (Micro-block 4-bit)</option>
+                </select>
+              </div>
+              <div class="form-group half">
+                <label for="input-target-bpw">Target Bits-per-Weight (BPW)</label>
+                <input type="number" id="input-target-bpw" class="form-control" value="8.0" step="0.1" min="2.0" max="16.0">
+              </div>
+            </div>
+
+            <button type="submit" class="btn btn-primary btn-block" id="btn-run-repack">📦 Execute Repack Conversion</button>
+          </form>
+        </div>
+      </section>
+
+      <!-- TAB 3: Bolt-On Manager -->
+      <section class="tab-page" id="page-boltons">
+        <div class="card card-panel">
+          <h2>Hot-Swappable Multi-Adapter Bolt-On Studio</h2>
+          <p class="subtitle">Attach, balance, or detach LoRA adapters to active base model slots in real-time.</p>
+          <div class="table-container">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Slot ID</th>
+                  <th>Adapter Path</th>
+                  <th>Scaling Factor (α / r)</th>
+                  <th>Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="table-boltons-body">
+                <tr><td colspan="5" class="text-muted">No model loaded for bolt-on attachment</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 4: Dataset Inspector -->
+      <section class="tab-page" id="page-dataset">
+        <div class="card card-panel">
+          <h2>Dataset & Sequence Packing Visualizer</h2>
+          <p class="subtitle">Inspect sample rows, token length distributions, and sample packing density.</p>
+          <div id="dataset-preview-container" class="preview-box">
+            <p class="text-muted">Select a dataset in the Training Control Room to view preview samples and length histograms.</p>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -32,7 +32,6 @@ use axum::{
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tower_http::services::ServeDir;
 
 use grim_tensor::BackendDevice;
 use crate::discovery::{default_datasets_dir, default_models_dir, DatasetEntry, ModelEntry};
@@ -133,12 +132,49 @@ pub struct ConvertModelResponse {
     pub message: String,
 }
 
+#[derive(rust_embed::RustEmbed)]
+#[folder = "web/"]
+struct WebAssets;
+
+async fn static_index() -> impl IntoResponse {
+    embedded_asset_handler(AxumPath("index.html".to_string())).await
+}
+
+async fn embedded_asset_handler(AxumPath(path): AxumPath<String>) -> impl IntoResponse {
+    let path_str = if path.is_empty() || path == "/" { "index.html" } else { &path };
+    match WebAssets::get(path_str) {
+        Some(content) => {
+            let mime_str = if path_str.ends_with(".html") {
+                "text/html"
+            } else if path_str.ends_with(".css") {
+                "text/css"
+            } else if path_str.ends_with(".js") {
+                "application/javascript"
+            } else {
+                "application/octet-stream"
+            };
+            (
+                [(axum::http::header::CONTENT_TYPE, mime_str)],
+                content.data.into_owned(),
+            ).into_response()
+        }
+        None => match WebAssets::get("index.html") {
+            Some(index) => (
+                [(axum::http::header::CONTENT_TYPE, "text/html")],
+                index.data.into_owned(),
+            ).into_response(),
+            None => (StatusCode::NOT_FOUND, "404 Not Found").into_response(),
+        },
+    }
+}
+
 /// Build main API & web app router.
 pub fn build_router(state: AppState) -> Router {
     let api = Router::new()
         .route("/api/models", get(get_models))
         .route("/api/models/convertible", get(get_convertible_models))
         .route("/api/models/convert", post(convert_model_route))
+        .route("/api/convert", post(convert_model_route))
         .route("/api/datasets", get(get_datasets))
         .route("/api/rocm/devices", get(get_rocm_devices))
         .route("/api/train/jobs", get(list_jobs))
@@ -148,16 +184,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/models/{id}/bolt-ons", get(get_bolt_ons).post(attach_bolt_on_route))
         .route("/api/models/{id}/bolt-ons/{slot}", delete(detach_bolt_on_route))
         .route("/sse/metrics/{id}", get(sse_metrics))
+        .route("/", get(static_index))
+        .route("/{*path}", get(embedded_asset_handler))
         .with_state(state);
 
-    let web_dir = Path::new("crates/grim-garage/src/web");
-    let serve_dir = if web_dir.exists() {
-        ServeDir::new(web_dir)
-    } else {
-        ServeDir::new("src/web")
-    };
-
-    api.fallback_service(serve_dir)
+    api
 }
 
 async fn get_models() -> Json<ModelsResponse> {
