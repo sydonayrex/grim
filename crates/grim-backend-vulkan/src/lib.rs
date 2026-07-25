@@ -1514,14 +1514,15 @@ impl BackendDevice for VulkanDevice {
         let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
-        let glsl_source = generate_silu_mul_glsl(size);
-        let spirv_source = compile_glsl_to_spirv(&glsl_source)?;
+        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::SiluMul).to_vec();
 
         let buffers = [gate_s.buffer, up_s.buffer, out_storage.buffer];
         let grid_x = ((size + 255) / 256) as u32;
 
+        let push = push_params(size as u32, 0, 0, 0, 0, 0.0);
+
         let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, None) {
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push)) {
             eprintln!("[Vulkan silu_mul] GPU dispatch failed ({}); falling back to host simulation", e);
         } else {
             dispatch_success = true;
@@ -1560,15 +1561,15 @@ impl BackendDevice for VulkanDevice {
     fn rms_norm(
         &self,
         x: &dyn BackendStorage,
-        w: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
         eps: f32,
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
             Error::Backend("Vulkan rms_norm: input x is not VulkanStorage".into())
         })?;
-        let w_s = w.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan rms_norm: input w is not VulkanStorage".into())
+        let w_s = weight.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan rms_norm: input weight is not VulkanStorage".into())
         })?;
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
@@ -1579,14 +1580,15 @@ impl BackendDevice for VulkanDevice {
         let x_dims = x.shape().dims();
         let dim = x_dims[x_dims.len() - 1];
 
-        let glsl_source = generate_rms_norm_glsl(size, dim, eps);
-        let spirv_source = compile_glsl_to_spirv(&glsl_source)?;
+        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::RmsNorm).to_vec();
 
         let buffers = [x_s.buffer, w_s.buffer, out_storage.buffer];
         let grid_x = ((size + 255) / 256) as u32;
 
+        let push = push_params(size as u32, dim as u32, 0, 0, 0, eps);
+
         let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, None) {
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push)) {
             eprintln!("[Vulkan rms_norm] GPU dispatch failed ({}); falling back to host simulation", e);
         } else {
             dispatch_success = true;
@@ -1646,14 +1648,15 @@ impl BackendDevice for VulkanDevice {
         let x_dims = x.shape().dims();
         let dim = x_dims[x_dims.len() - 1];
 
-        let glsl_source = generate_softmax_glsl(size, dim);
-        let spirv_source = compile_glsl_to_spirv(&glsl_source)?;
+        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Softmax).to_vec();
 
         let buffers = [x_s.buffer, out_storage.buffer];
         let grid_x = ((size + 255) / 256) as u32;
 
+        let push = push_params(size as u32, dim as u32, 0, 0, 0, 0.0);
+
         let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, None) {
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push)) {
             eprintln!("[Vulkan softmax] GPU dispatch failed ({}); falling back to host simulation", e);
         } else {
             dispatch_success = true;
@@ -1724,14 +1727,15 @@ impl BackendDevice for VulkanDevice {
         let num_indices = indices.len();
         let size = num_indices * dim;
 
-        let glsl_source = generate_embedding_glsl(num_indices, dim);
-        let spirv_source = compile_glsl_to_spirv(&glsl_source)?;
+        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Embedding).to_vec();
 
         let buffers = [w_s.buffer, idx_storage.buffer, out_storage.buffer];
         let grid_x = ((size + 255) / 256) as u32;
 
+        let push = push_params(size as u32, dim as u32, 0, 0, 0, 0.0);
+
         let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, None) {
+        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push)) {
             eprintln!("[Vulkan embedding] GPU dispatch failed ({}); falling back to host simulation", e);
         } else {
             dispatch_success = true;
@@ -2120,5 +2124,138 @@ mod tests {
 
         let cpu_data = out_storage.to_cpu_vec_f32().unwrap();
         assert_eq!(cpu_data, vec![11.0, 22.0, 33.0, 44.0]);
+    }
+
+    // ===== Golden Mutation-Resistant Kernel Math Contracts =====
+
+    fn close_vulkan(got: f32, want: f32, ctx: &str) {
+        let abs = (got - want).abs();
+        let denom = want.abs().max(1e-7);
+        assert!(got.is_finite(), "{ctx}: non-finite {got:?} (want {want:?})");
+        assert!(abs == 0.0 || (abs / denom) < 1e-4, "{ctx}: got {got:?} want {want:?} (abs={abs})");
+    }
+
+    #[test]
+    fn test_vulkan_add_golden_exact() {
+        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+            return;
+        }
+        let dev = VulkanDevice::new();
+        let a_data = vec![1.5f32, -2.5, 0.0, 3.14159];
+        let b_data = vec![2.5f32, 3.5, -1.0, 1.0];
+        let shape = Shape::new(vec![4]);
+        let a = dev.from_cpu(&a_data, &shape, DType::F32).unwrap();
+        let b = dev.from_cpu(&b_data, &shape, DType::F32).unwrap();
+        let (out, _h) = dev.add(a.as_ref(), b.as_ref(), &shape).unwrap();
+        let res = out.to_cpu_vec_f32().unwrap();
+        assert_eq!(res.len(), 4);
+        close_vulkan(res[0], 4.0, "vulkan_add w0");
+        close_vulkan(res[1], 1.0, "vulkan_add w1");
+        close_vulkan(res[2], -1.0, "vulkan_add w2");
+        close_vulkan(res[3], 4.14159, "vulkan_add w3");
+    }
+
+    #[test]
+    fn test_vulkan_mul_golden_exact() {
+        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+            return;
+        }
+        let dev = VulkanDevice::new();
+        let a_data = vec![2.0f32, -3.0, 0.5];
+        let b_data = vec![4.0f32, 2.0, -8.0];
+        let shape = Shape::new(vec![3]);
+        let a = dev.from_cpu(&a_data, &shape, DType::F32).unwrap();
+        let b = dev.from_cpu(&b_data, &shape, DType::F32).unwrap();
+        let (out, _h) = dev.mul(a.as_ref(), b.as_ref(), &shape).unwrap();
+        let res = out.to_cpu_vec_f32().unwrap();
+        assert_eq!(res.len(), 3);
+        close_vulkan(res[0], 8.0, "vulkan_mul w0");
+        close_vulkan(res[1], -6.0, "vulkan_mul w1");
+        close_vulkan(res[2], -4.0, "vulkan_mul w2");
+    }
+
+    #[test]
+    fn test_vulkan_silu_mul_golden_exact() {
+        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+            return;
+        }
+        let dev = VulkanDevice::new();
+        let gate_data = vec![1.0f32, -1.0];
+        let up_data = vec![2.0f32, 3.0];
+        let shape = Shape::new(vec![2]);
+        let gate = dev.from_cpu(&gate_data, &shape, DType::F32).unwrap();
+        let up = dev.from_cpu(&up_data, &shape, DType::F32).unwrap();
+        let (out, _h) = dev.silu_mul(gate.as_ref(), up.as_ref(), &shape).unwrap();
+        let res = out.to_cpu_vec_f32().unwrap();
+        assert_eq!(res.len(), 2);
+
+        let sig_1 = 1.0f32 / (1.0f32 + (-1.0f32).exp());
+        let expected_0 = sig_1 * 1.0 * 2.0;
+
+        let sig_neg1 = 1.0f32 / (1.0f32 + (1.0f32).exp());
+        let expected_1 = (-1.0f32 * sig_neg1) * 3.0;
+
+        close_vulkan(res[0], expected_0, "vulkan_silu_mul w0");
+        close_vulkan(res[1], expected_1, "vulkan_silu_mul w1");
+    }
+
+    #[test]
+    fn test_vulkan_rms_norm_golden_exact() {
+        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+            return;
+        }
+        let dev = VulkanDevice::new();
+        let x_data = vec![3.0f32, 4.0];
+        let w_data = vec![1.0f32, 2.0];
+        let shape = Shape::new(vec![2]);
+        let x = dev.from_cpu(&x_data, &shape, DType::F32).unwrap();
+        let w = dev.from_cpu(&w_data, &shape, DType::F32).unwrap();
+        let (out, _h) = dev.rms_norm(x.as_ref(), w.as_ref(), 1e-6, &shape).unwrap();
+        let res = out.to_cpu_vec_f32().unwrap();
+        assert_eq!(res.len(), 2);
+
+        let rms_val = (12.5f32 + 1e-6).sqrt();
+        let expected_0 = (3.0 / rms_val) * 1.0;
+        let expected_1 = (4.0 / rms_val) * 2.0;
+        close_vulkan(res[0], expected_0, "vulkan_rms_norm w0");
+        close_vulkan(res[1], expected_1, "vulkan_rms_norm w1");
+    }
+
+    #[test]
+    fn test_vulkan_softmax_golden_exact() {
+        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+            return;
+        }
+        let dev = VulkanDevice::new();
+        let x_data = vec![1.0f32, 2.0, 3.0];
+        let shape = Shape::new(vec![3]);
+        let x = dev.from_cpu(&x_data, &shape, DType::F32).unwrap();
+        let (out, _h) = dev.softmax(x.as_ref(), &shape).unwrap();
+        let res = out.to_cpu_vec_f32().unwrap();
+        assert_eq!(res.len(), 3);
+
+        let sum_exp = 1.0f32.exp() + 2.0f32.exp() + 3.0f32.exp();
+        close_vulkan(res[0], 1.0f32.exp() / sum_exp, "vulkan_softmax w0");
+        close_vulkan(res[1], 2.0f32.exp() / sum_exp, "vulkan_softmax w1");
+        close_vulkan(res[2], 3.0f32.exp() / sum_exp, "vulkan_softmax w2");
+    }
+
+    #[test]
+    fn test_vulkan_embedding_golden_exact() {
+        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+            return;
+        }
+        let dev = VulkanDevice::new();
+        let table = vec![
+            10.0f32, 20.0,
+            30.0, 40.0,
+            50.0, 60.0,
+        ];
+        let weight = dev.from_cpu(&table, &Shape::new(vec![3, 2]), DType::F32).unwrap();
+        let indices = vec![2u32, 0];
+        let out_shape = Shape::new(vec![2, 2]);
+        let (out, _h) = dev.embedding(weight.as_ref(), &indices, &out_shape).unwrap();
+        let res = out.to_cpu_vec_f32().unwrap();
+        assert_eq!(res, vec![50.0, 60.0, 10.0, 20.0]);
     }
 }
