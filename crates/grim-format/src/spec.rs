@@ -644,9 +644,8 @@ pub fn encode_outliers_delta_varint(outliers: &[(u32, f32)]) -> Vec<u8> {
 
 /// Decode a buffer produced by [`encode_outliers_delta_varint`].
 ///
-/// Returns the reconstructed `(index, value)` pairs. Errors out if the
-/// buffer is malformed.
-pub fn decode_outliers_delta_varint(buf: &[u8]) -> Result<Vec<(u32, f32)>, String> {
+/// Returns the reconstructed `(index, value)` pairs and the number of bytes consumed.
+pub fn decode_outliers_delta_varint(buf: &[u8]) -> Result<(Vec<(u32, f32)>, usize), String> {
     if buf.is_empty() {
         return Err("empty outlier buffer".into());
     }
@@ -680,7 +679,7 @@ pub fn decode_outliers_delta_varint(buf: &[u8]) -> Result<Vec<(u32, f32)>, Strin
     let mut result = Vec::with_capacity(count);
     let mut prev_val: f32 = 0.0;
     for idx in indices {
-        if cursor >= buf.len() {
+        if cursor + 1 > buf.len() {
             return Err("outlier value stream truncated".into());
         }
         let delta = (buf[cursor] as i8) as f32;
@@ -688,7 +687,7 @@ pub fn decode_outliers_delta_varint(buf: &[u8]) -> Result<Vec<(u32, f32)>, Strin
         prev_val += delta;
         result.push((idx, prev_val));
     }
-    Ok(result)
+    Ok((result, cursor))
 }
 
 /// LEB128-style varint encoder. Writes 7 bits per byte with continuation
@@ -860,29 +859,29 @@ mod tests {
         assert!(!restored.is_legacy());
     }
 
-    /// Phase 5: outlier delta-varint codec round-trips a multi-record
-    /// sequence including a contiguous run (where delta compression wins).
-    #[test]
-    fn outlier_delta_varint_round_trips() {
-        let outliers = vec![(5u32, 1.0f32), (10, 2.0), (11, 3.0), (12, 4.0)];
-        let encoded = encode_outliers_delta_varint(&outliers);
-        let decoded = decode_outliers_delta_varint(&encoded).expect("decode");
-        assert_eq!(decoded.len(), outliers.len());
-        for (got, want) in decoded.iter().zip(outliers.iter()) {
-            assert_eq!(got.0, want.0, "index mismatch");
-            assert!((got.1 - want.1).abs() < 1.5, "value {} vs {}", got.1, want.1);
-        }
+/// Phase 5: outlier delta-varint codec round-trips a multi-record
+/// sequence including a contiguous run (where delta compression wins).
+#[test]
+fn outlier_delta_varint_round_trips() {
+    let outliers = vec![(5u32, 1.0f32), (10, 2.0), (11, 3.0), (12, 4.0)];
+    let encoded = encode_outliers_delta_varint(&outliers);
+    let (decoded, _consumed) = decode_outliers_delta_varint(&encoded).expect("decode");
+    assert_eq!(decoded.len(), outliers.len());
+    for (got, want) in decoded.iter().zip(outliers.iter()) {
+        assert_eq!(got.0, want.0, "index mismatch");
+        assert!((got.1 - want.1).abs() < 1.5, "value {} vs {}", got.1, want.1);
     }
+}
 
-    /// Phase 5: single-record round-trip (boundary case).
-    #[test]
-    fn outlier_delta_varint_single_record() {
-        let one = vec![(42u32, 7.0f32)];
-        let enc = encode_outliers_delta_varint(&one);
-        let dec = decode_outliers_delta_varint(&enc).expect("decode");
-        assert_eq!(dec.len(), 1);
-        assert_eq!(dec[0].0, 42);
-    }
+/// Phase 5: single-record round-trip (boundary case).
+#[test]
+fn outlier_delta_varint_single_record() {
+    let one = vec![(42u32, 7.0f32)];
+    let enc = encode_outliers_delta_varint(&one);
+    let (dec, _consumed) = decode_outliers_delta_varint(&enc).expect("decode");
+    assert_eq!(dec.len(), 1);
+    assert_eq!(dec[0].0, 42);
+}
 
     /// Phase 5: empty input is rejected by the decoder.
     #[test]

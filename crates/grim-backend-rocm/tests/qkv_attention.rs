@@ -430,13 +430,12 @@ fn qkv_attention_reference_earlier_query_independent_of_later_kv() {
 }
 
 /// Verify the gate semantics built into the *config*: a default-shape
-/// `QkvAttentionFusionConfig` has `enabled: false`. This is the canonical
-/// stop-sign for regression handling (a future Phase-1/2 regression can
-/// be gated off again without an emergency patch).
+/// `QkvAttentionFusionConfig` has `enabled: true`. The fused kernel
+/// runs by default; set `enabled: false` to fall back to rocBLAS.
 #[test]
-fn qkv_attention_config_default_gates_kernel_off() {
+fn qkv_attention_config_default_enables_kernel() {
     let cfg = QkvAttentionFusionConfig::default();
-    assert!(!cfg.enabled);
+    assert!(cfg.enabled);
 }
 
 /// GPU-gated end-to-end check: launch `RocmDevice::qkv_attention` and

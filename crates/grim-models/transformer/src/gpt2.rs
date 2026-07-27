@@ -33,14 +33,14 @@ impl ModelConfig for Gpt2Config {
 
 pub struct LayerNorm {
     pub weight: Tensor,
-    pub bias: Tensor,
+    pub bias: Option<Tensor>,
     pub eps: f32,
 }
 
 impl LayerNorm {
     pub fn load(ws: &grim_nn::WeightSource<'_>, dim: usize, eps: f32) -> Result<Self> {
         let weight = ws.get([dim], "weight")?;
-        let bias = ws.get([dim], "bias")?;
+        let bias = ws.get([dim], "bias").ok();
         Ok(Self { weight, bias, eps })
     }
 
@@ -54,9 +54,15 @@ impl LayerNorm {
             let variance = c.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / dim as f32;
             let inv_std = 1.0 / (variance + self.eps).sqrt();
             let w = self.weight.to_vec_f32()?;
-            let b = self.bias.to_vec_f32()?;
-            for j in 0..dim {
-                out[i * dim + j] = ((c[j] - mean) * inv_std) * w[j] + b[j];
+            if let Some(b) = &self.bias {
+                let b_vec = b.to_vec_f32()?;
+                for j in 0..dim {
+                    out[i * dim + j] = ((c[j] - mean) * inv_std) * w[j] + b_vec[j];
+                }
+            } else {
+                for j in 0..dim {
+                    out[i * dim + j] = ((c[j] - mean) * inv_std) * w[j];
+                }
             }
         }
         Ok(cpu_tensor(out, x.shape().clone()))
@@ -70,6 +76,8 @@ pub struct Gpt2Block {
     pub ln_2: LayerNorm,
     pub ffn_gate: Linear,
     pub ffn_down: Linear,
+    pub num_heads: usize,
+    pub head_dim: usize,
 }
 
 impl Gpt2Block {
@@ -88,13 +96,76 @@ impl Gpt2Block {
             ln_2,
             ffn_gate,
             ffn_down,
+            num_heads: cfg.num_heads,
+            head_dim: cfg.hidden_size / cfg.num_heads,
         })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let norm_x = self.ln_1.forward(x)?;
         let qkv = self.wqkv.forward(&norm_x)?;
-        let attn_out = self.c_proj.forward(&qkv)?;
+        
+        // Split QKV into separate Q, K, V
+        let qkv_data = qkv.to_vec_f32()?;
+        let seq_len = qkv.shape().dims()[0];
+        let hidden_size = self.num_heads * self.head_dim;
+        let mut q = vec![0.0f32; seq_len * hidden_size];
+        let mut k = vec![0.0f32; seq_len * hidden_size];
+        let mut v = vec![0.0f32; seq_len * hidden_size];
+        
+        for pos in 0..seq_len {
+            for h in 0..self.num_heads {
+                for d in 0..self.head_dim {
+                    let idx = pos * 3 * hidden_size + h * self.head_dim + d;
+                    q[pos * hidden_size + h * self.head_dim + d] = qkv_data[idx];
+                    k[pos * hidden_size + h * self.head_dim + d] = qkv_data[idx + hidden_size];
+                    v[pos * hidden_size + h * self.head_dim + d] = qkv_data[idx + 2 * hidden_size];
+                }
+            }
+        }
+        
+        // Apply causal attention computation
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let mut attn_out = vec![0.0f32; seq_len * hidden_size];
+        
+        for h in 0..self.num_heads {
+            for t in 0..seq_len {
+                let mut scores = vec![0.0f32; seq_len];
+                // Causal masking
+                for t2 in 0..=t {
+                    let mut dot = 0.0f32;
+                    for d in 0..self.head_dim {
+                        dot += q[t * hidden_size + h * self.head_dim + d] * k[t2 * hidden_size + h * self.head_dim + d];
+                    }
+                    scores[t2] = dot * scale;
+                }
+                // Mask future positions
+                for t2 in (t + 1)..seq_len {
+                    scores[t2] = f32::NEG_INFINITY;
+                }
+                // Softmax
+                let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in &mut scores {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
+                for s in &mut scores {
+                    *s /= sum;
+                }
+                // Weighted sum of V
+                for d in 0..self.head_dim {
+                    let mut acc = 0.0f32;
+                    for t2 in 0..=t {
+                        acc += scores[t2] * v[t2 * hidden_size + h * self.head_dim + d];
+                    }
+                    attn_out[t * hidden_size + h * self.head_dim + d] = acc;
+                }
+            }
+        }
+        
+        let attn_out_tensor = cpu_tensor(attn_out, grim_tensor::Shape::new(vec![seq_len, hidden_size]));
+        let attn_out = self.c_proj.forward(&attn_out_tensor)?;
         let x_res1 = add_tensors(x, &attn_out)
             .map_err(grim_core::Error::Tensor)?;
 
@@ -117,7 +188,7 @@ pub struct Gpt2 {
 }
 
 impl Gpt2 {
-    pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: Gpt2Config) -> Result<Self> {
+    pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: Gpt2Config) -> Result<Self> {
         let wte = Embedding::load(&ws.pp("wte"), cfg.vocab_size, cfg.hidden_size)?;
         let wpe = Embedding::load(&ws.pp("wpe"), cfg.max_seq_len, cfg.hidden_size)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
@@ -129,7 +200,7 @@ impl Gpt2 {
 
         Ok(Self {
             cfg,
-            device: Device::Cpu,
+            device: device.clone(),
             wte,
             wpe,
             layers,

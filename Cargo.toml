@@ -89,6 +89,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rand = "0.10"
 
+[workspace.features]
+rocm = ["grim-backend-rocm"]
+
 [profile.release]
 opt-level = 3
 lto       = "thin"

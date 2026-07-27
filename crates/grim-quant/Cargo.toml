@@ -9,10 +9,6 @@ description = "Block quantizers (Q8_0, Q4_K, Q5_K, Q6_K) for Grim. Dequant-to-f3
 [dependencies]
 grim-tensor = { workspace = true }
 thiserror = { workspace = true }
-
 [dev-dependencies]
-grim-backend-cpu = { workspace = true }
-grim-backend-rocm = { workspace = true }
 
-[features]
-default = []
+grim-backend-cpu = { workspace = true }

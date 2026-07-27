@@ -105,11 +105,11 @@ fn qkv_attention_shared_mem_clamped_to_32768() {
 }
 
 #[test]
-fn qkv_attention_default_config_disables_kernel() {
-    // Default keeps the gate closed so an unsuppressed upgrade does not
-    // auto-attach a Phase-1 kernel that hasn't passed Step 4 yet.
+fn qkv_attention_default_config_enables_kernel() {
+    // Default enables the gate so the fused kernel runs by default.
+    // Toggle to `enabled: false` to fall back to rocBLAS.
     let cfg = QkvAttentionFusionConfig::default();
-    assert!(!cfg.enabled, "QkvAttentionFusionConfig::default must gate the kernel off until Step 4 passes");
+    assert!(cfg.enabled, "QkvAttentionFusionConfig::default must enable the fused kernel");
 }
 
 #[test]

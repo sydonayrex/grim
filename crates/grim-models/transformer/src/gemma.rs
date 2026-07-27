@@ -5,7 +5,7 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
-use grim_nn::{Embedding, Linear, RmsNorm};
+use grim_nn::{Embedding, Linear, RmsNorm, Rope};
 use grim_tensor::{ArithType, Device, DType, Tensor};
 
 #[derive(Debug, Clone)]
@@ -42,6 +42,10 @@ pub struct GemmaBlock {
     pub ffn_gate: Linear,
     pub ffn_up: Linear,
     pub ffn_down: Linear,
+    pub rope: Rope,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
 }
 
 impl GemmaBlock {
@@ -57,6 +61,8 @@ impl GemmaBlock {
         let ffn_up = Linear::load(&ws.pp("ffn_up"), cfg.hidden_size, cfg.intermediate_size, false)?;
         let ffn_down = Linear::load(&ws.pp("ffn_down"), cfg.intermediate_size, cfg.hidden_size, false)?;
 
+        let rope = Rope::new(cfg.head_dim, 10000.0); // Gemma typically uses 10000
+
         Ok(Self {
             attn_norm,
             wq,
@@ -67,16 +73,26 @@ impl GemmaBlock {
             ffn_gate,
             ffn_up,
             ffn_down,
+            rope,
+            num_heads: cfg.num_heads,
+            num_kv_heads: cfg.num_kv_heads,
+            head_dim: cfg.head_dim,
         })
     }
 
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let norm_x = self.attn_norm.forward(x)?;
         let q = self.wq.forward(&norm_x)?;
-        let _k = self.wk.forward(&norm_x)?;
-        let _v = self.wv.forward(&norm_x)?;
-        // Simple attention approximation
-        let attn_out = self.wo.forward(&q)?;
+        let k = self.wk.forward(&norm_x)?;
+        let v = self.wv.forward(&norm_x)?;
+
+        // Apply RoPE
+        let q = self.rope.forward(&q, positions)?;
+        let k = self.rope.forward(&k, positions)?;
+
+        // Causal self-attention
+        let attn_out = self.causal_self_attention(&q, &k, &v)?;
+        let attn_out = self.wo.forward(&attn_out)?;
         let x_res1 = add_tensors(x, &attn_out)
             .map_err(grim_core::Error::Tensor)?;
 
@@ -88,6 +104,60 @@ impl GemmaBlock {
         add_tensors(&x_res1, &ffn_out)
             .map_err(grim_core::Error::Tensor)
     }
+    
+    fn causal_self_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        let qd = q.to_vec_f32()?;
+        let kd = k.to_vec_f32()?;
+        let vd = v.to_vec_f32()?;
+        let num_head_dims = self.num_heads * self.head_dim;
+        let total_tokens = qd.len() / num_head_dims;
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let mut out = vec![0.0f32; total_tokens * num_head_dims];
+        let kv_stride = self.num_kv_heads * self.head_dim;
+        
+        for h in 0..self.num_heads {
+            let kvh = (h * self.num_kv_heads) / self.num_heads;
+            for t in 0..total_tokens {
+                let mut scores = vec![0.0f32; total_tokens];
+                // Causal masking: only attend to current and past tokens
+                for t2 in 0..=t {
+                    let mut dot = 0.0f32;
+                    for d in 0..self.head_dim {
+                        dot += qd[t * num_head_dims + h * self.head_dim + d]
+                            * kd[t2 * kv_stride + kvh * self.head_dim + d];
+                    }
+                    scores[t2] = dot * scale;
+                }
+                // Mask future positions
+                for t2 in (t + 1)..total_tokens {
+                    scores[t2] = f32::NEG_INFINITY;
+                }
+                // Softmax
+                let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in &mut scores {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
+                for s in &mut scores {
+                    *s /= sum;
+                }
+                // Weighted sum of V
+                for d in 0..self.head_dim {
+                    let mut acc = 0.0f32;
+                    for t2 in 0..=t {
+                        acc += scores[t2] * vd[t2 * kv_stride + kvh * self.head_dim + d];
+                    }
+                    out[t * num_head_dims + h * self.head_dim + d] = acc;
+                }
+            }
+        }
+        Ok({
+            let dev = grim_nn::modules::pick_device_for_storage_device(&q.device());
+            let storage = dev.from_cpu(&out, &grim_tensor::Shape::new(vec![total_tokens, num_head_dims]), grim_tensor::DType::F32)?;
+            Tensor::new(std::sync::Arc::from(storage), grim_tensor::Shape::new(vec![total_tokens, num_head_dims]), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), q.device().clone())
+        })
+    }
 }
 
 pub struct Gemma {
@@ -96,23 +166,27 @@ pub struct Gemma {
     pub tok_embeddings: Embedding,
     pub layers: Vec<GemmaBlock>,
     pub norm: RmsNorm,
+    pub output: Linear,
 }
 
 impl Gemma {
-    pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: GemmaConfig) -> Result<Self> {
+    pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: GemmaConfig) -> Result<Self> {
         let tok_embeddings = Embedding::load(&ws.pp("token_embd"), cfg.vocab_size, cfg.hidden_size)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             layers.push(GemmaBlock::load(&ws.pp("blk").pp(&i.to_string()), &cfg)?);
         }
         let norm = RmsNorm::load(&ws.pp("output_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        // Gemma uses tied embeddings: output projection uses token embedding weights transposed
+        let output = Linear::from_tensor(tok_embeddings.weight.clone(), None);
 
         Ok(Self {
             cfg,
-            device: Device::Cpu,
+            device: device.clone(),
             tok_embeddings,
             layers,
             norm,
+            output,
         })
     }
 }
@@ -141,7 +215,7 @@ impl CausalLm for Gemma {
         &self,
         session: &mut dyn SessionT,
         input_ids: &Tensor,
-        _positions: &Tensor,
+        positions: &Tensor,
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
         let ids: Vec<u32> = match input_ids.dtype() {
@@ -152,29 +226,20 @@ impl CausalLm for Gemma {
             _ => return Err(grim_tensor::Error::Unimplemented("non-F32 inputs".into()).into()),
         };
         let seq_len = ids.len();
+        let pos_ids: Vec<u32> = match positions.dtype() {
+            d if d == DType::F32 => {
+                let v = positions.to_vec_f32()?;
+                v.into_iter().map(|x| x as u32).collect()
+            }
+            _ => (0..seq_len).map(|i| i as u32).collect(),
+        };
         let mut h = self.tok_embeddings.forward(&ids, seq_len, self.cfg.hidden_size)?;
         for layer in &self.layers {
-            h = layer.forward(&h)?;
+            h = layer.forward(&h, &pos_ids)?;
         }
         let h = self.norm.forward(&h)?;
-        // Gemma weight tying: output projection uses token embedding weights transposed
-        // logits = h @ weight.T  where weight is [vocab_size, hidden_size]
-        let weight = &self.tok_embeddings.weight;
-        let dev = grim_backend_cpu::CpuDevice::new();
-        let (s, _h) = grim_tensor::BackendDevice::matmul(
-            &dev,
-            h.storage().as_ref(),
-            weight.storage().as_ref(),
-            &grim_tensor::Shape::new(vec![seq_len, self.cfg.vocab_size]),
-        )?;
-        _h.synchronize()?;
-        let logits = Tensor::new(
-            std::sync::Arc::from(s),
-            grim_tensor::Shape::new(vec![seq_len, self.cfg.vocab_size]),
-            DType::F32,
-            h.provenance().clone(),
-            h.device().clone(),
-        );
+        // Gemma uses tied embeddings via Linear layer
+        let logits = self.output.forward(&h)?;
         session.advance_pos(seq_len);
         Ok(logits)
     }

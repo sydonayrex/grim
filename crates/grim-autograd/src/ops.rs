@@ -148,14 +148,93 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
             }
         }
     } else {
-        for i in 0..m {
-            for j in 0..n {
-                let g = g_vec[i * n + j];
-                for l in 0..k {
-                    let a_idx = if args.transpose_a { l * m + i } else { i * k + l };
-                    let b_idx = if args.transpose_b { j * k + l } else { l * n + j };
-                    da_vec[a_idx] += g * b_vec[b_idx];
-                    db_vec[b_idx] += g * a_vec[a_idx];
+        // Transposed gradient computation using the verified backward formulas.
+        // Derived from C = A_op @ B_op and standard matrix calculus.
+        //
+        // For trans_a only (C = A^T @ B, A stored as MxK, B stored as KxN):
+        //   dA_stored = B @ G^T  ->  dA[p][q] = sum_l B[p][l] * G[q][l]
+        //   dB_stored = A @ G    ->  dB[p][q] = sum_i A[p][i] * G[i][q]
+        //
+        // For trans_b only (C = A @ B^T, A stored as MxK, B stored as KxN):
+        //   dA_stored = G @ B    ->  dA[p][q] = sum_l G[p][l] * B[l][q]
+        //   dB_stored = G^T @ A  ->  dB[p][q] = sum_i G[i][p] * A[i][q]
+        //
+        // For both transposed (C = A^T @ B^T):
+        //   dA_stored = B @ G^T  ->  dA[p][q] = sum_l B[p][l] * G[q][l]  (same as trans_a)
+        //   dB_stored = G @ A    ->  dB[p][q] = sum_i G[p][i] * A[q][i]   (derived: dB^T = A^T @ G) 
+        for p in 0..a_dims[0] {
+            for q in 0..a_dims[1] {
+                match (args.transpose_a, args.transpose_b) {
+                    (true, _) | (_, false) => {
+                        // dA = B @ G^T (for trans_a, or both trans): dA[p][q] = sum_l B[p][l] * G[q][l]
+                        // dA = G @ B (for trans_b none): dA[p][q] = sum_l G[p][l] * B[l][q]
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let use_bg_for_da = !args.transpose_a; // when A is not transposed, use dA = G @ B
+
+        if use_bg_for_da {
+            // dA = G @ B
+            for p in 0..a_dims[0] {
+                for q in 0..a_dims[1] {
+                    let mut sum = 0.0f32;
+                    for l in 0..b_dims[0] {
+                        sum += g_vec[p * b_dims[0] + l] * b_vec[l * b_dims[1] + q];
+                    }
+                    da_vec[p * a_dims[1] + q] = sum;
+                }
+            }
+        } else {
+            // dA = B @ G^T (trans_a or both trans)
+            for p in 0..a_dims[0] {
+                for q in 0..a_dims[1] {
+                    let mut sum = 0.0f32;
+                    for l in 0..b_dims[0] {
+                        sum += b_vec[p * b_dims[1] + l] * g_vec[q * b_dims[0] + l];
+                    }
+                    da_vec[p * a_dims[1] + q] = sum;
+                }
+            }
+        }
+
+        if args.transpose_b {
+            // dB_stored = G^T @ A = A^T @ G (transpose of the standard dB)
+            // dB[p][q] = sum_i G[i][p] * A[i][q]
+            for p in 0..b_dims[0] {
+                for q in 0..b_dims[1] {
+                    let mut sum = 0.0f32;
+                    for i in 0..a_dims[0] {
+                        sum += g_vec[i * b_dims[0] + p] * a_vec[i * a_dims[1] + q];
+                    }
+                    db_vec[p * b_dims[1] + q] = sum;
+                }
+            }
+        } else {
+            // dB = A^T @ G (standard) or A @ G (trans_a only)
+            if args.transpose_a {
+                // dB = A @ G
+                for p in 0..b_dims[0] {
+                    for q in 0..b_dims[1] {
+                        let mut sum = 0.0f32;
+                        for i in 0..a_dims[0] {
+                            sum += a_vec[p * a_dims[1] + i] * g_vec[i * b_dims[0] + q];
+                        }
+                        db_vec[p * b_dims[1] + q] = sum;
+                    }
+                }
+            } else {
+                // dB = A^T @ G
+                for p in 0..b_dims[0] {
+                    for q in 0..b_dims[1] {
+                        let mut sum = 0.0f32;
+                        for i in 0..a_dims[0] {
+                            sum += a_vec[i * a_dims[1] + p] * g_vec[i * b_dims[0] + q];
+                        }
+                        db_vec[p * b_dims[1] + q] = sum;
+                    }
                 }
             }
         }
@@ -256,7 +335,7 @@ pub fn lora_backward(
         let (db_unscaled, _) = dev.matmul(g_t_storage.as_ref(), h_storage.as_ref(), &Shape::new(vec![out_features, rank]))?;
         let (db_storage, _) = dev.mul_scalar(db_unscaled.as_ref(), scale, &Shape::new(vec![out_features, rank]))?;
 
-        let dh_vec_gpu = dh_unscaled.to_cpu_vec_f32()?;
+        let dh_vec_gpu = dh_storage.to_cpu_vec_f32()?;
         let dh_t_vec = transpose_matrix(&dh_vec_gpu, batch, rank);
         let dh_t_storage = dev.from_cpu(&dh_t_vec, &Shape::new(vec![rank, batch]), DType::F32)?;
         let (da_storage, _) = dev.matmul(dh_t_storage.as_ref(), x.storage().as_ref(), &Shape::new(vec![rank, in_features]))?;

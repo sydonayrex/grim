@@ -2,6 +2,7 @@
 //! Uses xorshift64 — no external deps; output reproducibility across compilers
 //! is "stable enough for a default-init smoke test".
 
+#[derive(Clone, Copy)]
 pub struct SimpleRng {
     state: u64,
 }

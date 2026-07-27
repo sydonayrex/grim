@@ -93,7 +93,7 @@ impl StreamingBlockForward {
         let ws = WeightSource::root(provider, x.device().clone());
         let block_ws = ws.pp("layers").pp(&layer_idx.to_string());
         let block = LlamaBlock::load(&block_ws, cfg)?;
-        block.forward(x)
+        block.forward(x, &[])
     }
 
     /// Recompute block forward pass from saved input checkpoint during backward traversal.
@@ -113,7 +113,7 @@ impl StreamingBlockForward {
         let ws = WeightSource::root(provider, input_x.device().clone());
         let block_ws = ws.pp("layers").pp(&layer_idx.to_string());
         let block = LlamaBlock::load(&block_ws, cfg)?;
-        block.forward(input_x)
+        block.forward(input_x, &[])
     }
 
     /// Run streaming block-wise forward pass for `layer_idx` with autograd tape recording.

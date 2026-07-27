@@ -1,0 +1,119 @@
+pub fn quant_q5k(data: &[f32]) -> Result<Vec<u8>> {
+    // Q5_K format (llama.cpp): 256 weights per block = 178 bytes
+    // Structure per 256-weight block:
+    // - f16 d (2 bytes) - global scale
+    // - 8 f16 min values for each sub-block (16 bytes)
+    // - 6-bit scales for 8 sub-blocks (6 bytes = 48 bits)
+    // - 5-bit values: 256 weights = 160 bytes (5 bits each = 4 magnitude + 1 sign)
+    // Total: 2 + 16 + 6 + 160 = 178 bytes per 256 weights
+
+    const BLOCK_SIZE: usize = 256;
+    const BLOCK_BYTES: usize = 178;
+
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let num_blocks = data.len().div_ceil(BLOCK_SIZE);
+    let mut out = Vec::with_capacity(num_blocks * BLOCK_BYTES);
+
+    for block in data.chunks(BLOCK_SIZE) {
+        let max_abs = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let d = if max_abs == 0.0 { 1.0 } else { max_abs / 31.0 }; // 5-bit signed: -31 to 31
+        let d_bytes = f32_to_f16(d).to_le_bytes();
+
+        // Compute min values for each sub-block (8 sub-blocks of 32 weights)
+        let mut mins = [0.0f32; 8];
+        for (i, &val) in block.iter().enumerate() {
+            let sub_block = i / 32;
+            if sub_block < 8 {
+                mins[sub_block] = mins[sub_block].min(val);
+            }
+        }
+
+        // Write d (2 bytes)
+        out.extend_from_slice(&d_bytes);
+
+        // Write min values as f16 (16 bytes)
+        for &min in &mins {
+            let min_f16 = f32_to_f16(min);
+            out.extend_from_slice(&min_f16.to_le_bytes());
+        }
+
+        // Compute 6-bit scales for 8 sub-blocks (packed into 6 bytes)
+        let mut scales = [0u8; 6];
+        // Q5_K uses 5 bits per weight (4 magnitude + 1 sign) = 160 bytes for 256 weights
+        let mut qs = vec![0u8; 160];
+
+        for sb in 0..8 {
+            let start = sb * 32;
+            let end = (start + 32).min(block.len());
+            let sub_block = &block[start..end];
+
+            let min_val = mins[sb];
+            let max_val = sub_block.iter().fold(min_val, |m, &v| m.max(v));
+            let range = max_val - min_val;
+
+            if range == 0.0 {
+                // All zeros - use scale 0
+                let byte_idx = sb * 6 / 8;
+                let bit_offset = (sb * 6) % 8;
+                scales[byte_idx] = (scales[byte_idx] & !(0x3F << bit_offset)) | ((0u8 & 0x3F) << bit_offset);
+            } else {
+                // 6-bit scale: 63 levels (1-63)
+                let scale_val = ((range / 31.0 * 63.0).round() as u8).clamp(1, 63);
+                let bit_offset = (sb * 6) % 8;
+                let byte_idx = sb * 6 / 8;
+                if bit_offset <= 2 {
+                    scales[byte_idx] = (scales[byte_idx] & !(0x3F << bit_offset)) | ((scale_val & 0x3F) << bit_offset);
+                } else {
+                    scales[byte_idx] = (scales[byte_idx] & !(0xFF >> (8 - bit_offset))) | ((scale_val & 0x3F) << bit_offset);
+                    scales[byte_idx + 1] = (scales[byte_idx + 1] & !(0xFF << (bit_offset + 6 - 8))) | ((scale_val & 0x3F) >> (8 - bit_offset));
+                }
+            }
+
+            // Quantize: 5-bit per weight (4 magnitude + 1 sign) = 160 bytes for 256 weights
+            let d_scale = d;
+            let start = sb * 32;
+            let end = (start + 32).min(block.len());
+            let sub_block = &block[start..end];
+            let d_scale = d;
+
+            for (i, &val) in sub_block.iter().enumerate() {
+                let idx = start + i;
+                let sign = if val < 0.0 { 1u8 } else { 0u8 };
+                let mag = (val.abs() / d_scale).round().clamp(0.0, 31.0) as u8; // 5-bit magnitude (0-31)
+
+                let q_idx = start + i;
+                let byte_idx = q_idx * 5 / 8;
+                let bit_off = (q_idx * 5) % 8;
+
+                // Pack 5 bits (sign in MSB of 5-bit value)
+                let packed = (mag & 0x0F) | (sign << 4);
+                if bit_off <= 3 {
+                    qs[byte_idx] = (qs[byte_idx] & !(0x1F << bit_off)) | ((packed & 0x1F) << bit_off);
+                } else {
+                    qs[byte_idx] = (qs[byte_idx] & !(0xFF >> (8 - bit_off))) | ((packed & 0x1F) << bit_off);
+                    qs[byte_idx + 1] = (qs[byte_idx + 1] & !(0xFF << (bit_off + 5 - 8))) | ((packed & 0x1F) >> (8 - bit_off));
+                }
+            }
+        }
+
+        // Write d (2 bytes)
+        out.extend_from_slice(&d_bytes);
+
+        // Write mins as f16 (16 bytes)
+        for &min in &mins {
+            let min_f16 = f32_to_f16(min);
+            out.extend_from_slice(&min_f16.to_le_bytes());
+        }
+
+        // Write scales (6 bytes)
+        out.extend_from_slice(&scales);
+
+        // Write quantized values (160 bytes for 256 weights at 5 bits each)
+        out.extend_from_slice(&qs);
+    }
+
+    Ok(out)
+}

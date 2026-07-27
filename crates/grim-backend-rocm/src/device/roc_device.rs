@@ -501,6 +501,13 @@ impl RocmDevice {
         self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut())
     }
 
+    /// Block until all previously issued work on all streams of this device
+    /// has completed. Useful for synchronizing before reading back async
+    /// H2D/D2H transfers that did not include an internal sync point.
+    pub fn synchronize(&self) {
+        let _ = unsafe { hipDeviceSynchronize() };
+    }
+
     /// Begin a generic graph-capture session keyed by `key`. Until `end_graph_capture`
     /// is called, every op dispatched on this device is recorded onto a dedicated
     /// capture stream (the rocblas handle is rebound to it during matmul) rather than
@@ -912,18 +919,6 @@ impl RocmDevice {
                 res
             )));
         }
-        let sync = unsafe { hipStreamSynchronize(stream) };
-        if sync != hipSuccess {
-            if storage.device_ptr.is_some() {
-                unsafe {
-                    let _ = hipFree(storage.device_ptr.unwrap() as *mut c_void);
-                }
-            }
-            return Err(Error::Backend(format!(
-                "hipStreamSynchronize after async upload failed with error code {}",
-                sync
-            )));
-        }
         Ok(Box::new(storage))
     }
 
@@ -962,18 +957,6 @@ impl RocmDevice {
                 res
             )));
         }
-        let sync = unsafe { hipStreamSynchronize(stream) };
-        if sync != hipSuccess {
-            if storage.device_ptr.is_some() {
-                unsafe {
-                    let _ = hipFree(storage.device_ptr.unwrap() as *mut c_void);
-                }
-            }
-            return Err(Error::Backend(format!(
-                "hipStreamSynchronize after async upload failed with error code {}",
-                sync
-            )));
-        }
         Ok(Box::new(storage))
     }
 
@@ -1010,7 +993,11 @@ impl RocmDevice {
                 stream,
             )
         })?;
-        check_hip("hipStreamSynchronize (after async download)", unsafe { hipStreamSynchronize(stream) })?;
+        // MAJ-3 fix: synchronize the stream before reading pinned memory — the
+        // async DMA has not necessarily landed until the stream drains.
+        // ponytail: stream-sync only (not device-wide), upgrade to timeline
+        //           semaphores if overlap with compute is needed later.
+        check_hip("hipStreamSynchronize(D2H)", unsafe { hipStreamSynchronize(stream) })?;
         let mut out = vec![0.0f32; elem_count];
         out.copy_from_slice(pinned.as_slice());
         Ok(out)
@@ -1053,7 +1040,6 @@ impl RocmDevice {
                 stream,
             )
         })?;
-        check_hip("hipStreamSynchronize (after async download)", unsafe { hipStreamSynchronize(stream) })?;
         Ok(())
     }
 }
@@ -1197,26 +1183,9 @@ impl BackendDevice for RocmDevice {
         let res = if let Some(capture_stream) = self.active_capture_stream() {
             unsafe { hipMemsetAsync(dev_ptr_void, 0, storage.bytes, capture_stream) }
         } else {
-            let r = unsafe { hipMemset(dev_ptr_void, 0, storage.bytes) };
-            if r == hipSuccess {
-                // `hipMemset` is asynchronous (default stream); callers expect a
-                // fully zeroed buffer on return, so drain it before handing the
-                // storage out. This matches the old hipMemcpy(H2D) path.
-                let sync = unsafe { hipDeviceSynchronize() };
-                if sync != hipSuccess {
-                    if storage.device_ptr.is_some() {
-                        let ptr_void = storage.device_ptr.unwrap() as *mut c_void;
-                        unsafe {
-                            _ = hipFree(ptr_void);
-                        }
-                    }
-                    return Err(Error::Backend(format!(
-                        "hipDeviceSynchronize after zeros failed with error code {}",
-                        sync
-                    )));
-                }
-            }
-            r
+            // hipMemset on the default stream is synchronous (host blocks
+            // until the buffer is zeroed), so no device-wide sync is needed.
+            unsafe { hipMemset(dev_ptr_void, 0, storage.bytes) }
         };
 
         if res != hipSuccess {
@@ -1420,12 +1389,11 @@ impl BackendDevice for RocmDevice {
                 // WI 2.4.4-2(a) — thread the *real* enqueued stream into the
                 // returned handle. `launch_compute_kernel` already enqueues via
                 // `hipModuleLaunchKernel` and returns the stream; discarding it
-                // (the prior `RocmHandle::new(None)`, the Rust analog of the
-                // plan's `(void)s;`) made `ComputeHandle::synchronize` a silent
-                // no-op, so a caller that waited on this handle could read
-                // half-written decode output. Passing `Some(stream)` makes the
-                // wait real — the read-back path (`to_cpu_vec_f32`) syncing the
-                // default stream is the backstop, not the contract.
+                // made `ComputeHandle::synchronize` a silent no-op, so a caller
+                // that waited on this handle could read half-written decode output.
+                // Passing `Some(stream)` makes the wait real — the read-back path
+                // (`to_cpu_vec_f32`) syncing the default stream is the backstop,
+                // not the contract.
                 let stream = self.launch_decode_gemm_f16(a_storage, b_storage, &out_storage, m, n, k)?;
                 let compute_handle = Box::new(RocmHandle::new(Some(stream)));
                 return Ok((Box::new(out_storage), compute_handle));
@@ -1532,7 +1500,7 @@ impl BackendDevice for RocmDevice {
             }
         };
 
-        let compute_handle = Box::new(RocmHandle::new(None));
+        let compute_handle = Box::new(RocmHandle::new(Some(self.active_stream())));
         Ok((Box::new(out_storage), compute_handle))
     }
 
@@ -1689,7 +1657,7 @@ impl BackendDevice for RocmDevice {
             }
         };
 
-        let compute_handle = Box::new(RocmHandle::new(None));
+        let compute_handle = Box::new(RocmHandle::new(Some(self.active_stream())));
         Ok((Box::new(out_storage), compute_handle))
     }
 
@@ -1718,7 +1686,7 @@ impl BackendDevice for RocmDevice {
             block,
             &mut [arg(&mut a_ptr), arg(&mut b_ptr), arg(&mut out_ptr), arg(&mut n)],
         )?;
-        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     fn mul(
@@ -1745,7 +1713,7 @@ impl BackendDevice for RocmDevice {
             block,
             &mut [arg(&mut a_ptr), arg(&mut b_ptr), arg(&mut out_ptr), arg(&mut n)],
         )?;
-        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     fn mul_scalar(
@@ -1771,7 +1739,7 @@ impl BackendDevice for RocmDevice {
             block,
             &mut [arg(&mut x_ptr), arg(&mut s), arg(&mut out_ptr), arg(&mut n)],
         )?;
-        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     fn sqrt(
@@ -1795,7 +1763,7 @@ impl BackendDevice for RocmDevice {
             block,
             &mut [arg(&mut x_ptr), arg(&mut out_ptr), arg(&mut n)],
         )?;
-        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     fn recip(
@@ -1819,7 +1787,7 @@ impl BackendDevice for RocmDevice {
             block,
             &mut [arg(&mut x_ptr), arg(&mut out_ptr), arg(&mut n)],
         )?;
-        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     fn silu_mul(
@@ -1846,7 +1814,7 @@ impl BackendDevice for RocmDevice {
             block,
             &mut [arg(&mut gate_ptr), arg(&mut up_ptr), arg(&mut out_ptr), arg(&mut n)],
         )?;
-        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     fn rms_norm(
@@ -1888,7 +1856,7 @@ impl BackendDevice for RocmDevice {
                 arg(&mut total_i),
             ],
         )?;
-        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     fn softmax(
@@ -1923,7 +1891,7 @@ impl BackendDevice for RocmDevice {
                 arg(&mut total_i),
             ],
         )?;
-        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     fn embedding(
@@ -1991,7 +1959,7 @@ impl BackendDevice for RocmDevice {
                 hipFree(idx_ptr);
             }
         }
-        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     fn advise(&self, storage: &dyn BackendStorage, advice: grim_tensor::backend::MemAdvice) -> Result<()> {
@@ -2061,7 +2029,7 @@ impl BackendDevice for RocmDevice {
         quant_bits: u32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        self.kv_dequant_attention(
+        self.kv_dequant_attention_impl(
             q,
             k_tensor,
             k_scales,
@@ -2620,7 +2588,7 @@ impl BackendDevice for RocmDevice {
 	            }
 	        }
 
-	        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+	        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
 	    }
 	}
 	
@@ -3887,7 +3855,7 @@ impl RocmDevice {
             ],
         )?;
 
-        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     // NOTE: `qkv_attention` was promoted to the `BackendDevice` trait
@@ -3907,7 +3875,7 @@ impl RocmDevice {
     /// `QkvAttentionFusionConfig`). When `enabled == false` the call returns
     /// a typed error so callers fall back to the dense attention path rather
     /// than silently computing the wrong result.
-    pub fn kv_dequant_attention(
+    pub fn kv_dequant_attention_impl(
         &self,
         q: &dyn BackendStorage,
         k_tensor: &dyn BackendStorage,
@@ -4147,7 +4115,7 @@ impl RocmDevice {
             cache_offset,
         )?;
 
-        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     pub fn tree_attention(
@@ -4269,7 +4237,7 @@ impl RocmDevice {
             cache_offset,
         )?;
 
-        Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     // ─── Phase 2 BackendDevice trait methods ──────────────────────
@@ -4302,7 +4270,7 @@ impl RocmDevice {
             x_s, a_s, b_s, c_s, d_s, &out_storage,
             batch, dim_dstate, dim_dinner, seq_len,
         )?;
-        Ok((Box::new(out_storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(out_storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     fn flash_attention(
@@ -4330,7 +4298,7 @@ impl RocmDevice {
             q_s, k_s, v_s, &out_storage,
             num_heads, num_kv_heads, head_dim, seq_len, causal,
         )?;
-        Ok((Box::new(out_storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(out_storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     fn cross_attention(
@@ -4357,7 +4325,7 @@ impl RocmDevice {
             q_s, k_s, v_s, &out_storage,
             num_heads, head_dim, seq_len, kv_seq_len,
         )?;
-        Ok((Box::new(out_storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(out_storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     fn rwkv_time_mix(
@@ -4387,7 +4355,7 @@ impl RocmDevice {
             x_s, w_s, k_s, v_s, g_s, &out_storage,
             batch, dim, seq_len,
         )?;
-        Ok((Box::new(out_storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(out_storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     fn rwkv_channel_mix(
@@ -4414,7 +4382,7 @@ impl RocmDevice {
             x_s, k_s, r_s, v_s, &out_storage,
             batch, dim,
         )?;
-        Ok((Box::new(out_storage), Box::new(RocmHandle::new(None))))
+        Ok((Box::new(out_storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     // ─── Phase 2: Selective Scan ──────────────────────────────────

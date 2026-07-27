@@ -48,9 +48,11 @@ pub struct QkvAttentionFusionConfig {
 
 impl Default for QkvAttentionFusionConfig {
     fn default() -> Self {
-        // Spec: default config gates the kernel off until step 4 / benchmarking flips it.
+        // Default = true: the backend runs the QKV fused kernel inline
+        // at every call site (no external config gating). Toggle off to
+        // fall back to the de-fused rocBLAS path.
         Self {
-            enabled: false,
+            enabled: true,
             num_heads: 32,
             num_kv_heads: 8,
             head_dim: 128,
@@ -74,6 +76,11 @@ impl RmsNormMatMulFusionConfig {
 }
 
 impl QkvAttentionFusionConfig {
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
     /// Launch geometry for Phase-1 QKV attention.
     ///
     /// Phase 1 contract (see `grim_qkv_attention_kernel_spec.md`):

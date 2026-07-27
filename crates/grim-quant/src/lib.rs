@@ -283,6 +283,10 @@ pub fn dequant_iq4nl(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// IQ4_XS uses the same 16-entry codebook as IQ4_NL (llama.cpp `iq4nl_table`).
+/// The sign comes from bit 3 of the nibble; bits 0-2 index the codebook.
+/// Note: IQ4_XS has 8 subblocks, 32 weights each = 256 weights per superblock.
+
 /// Dequantize IQ4_XS (llama.cpp importance-matrix 4-bit Extra Small) bytes to f32.
 ///
 /// Per 256-weight super-block (136 bytes):
@@ -1023,6 +1027,7 @@ pub fn quant_q4k(data: &[f32]) -> Result<Vec<u8>> {
 pub fn quant_q5k(data: &[f32]) -> Result<Vec<u8>> {
     quant_packed_symmetric(data, 5, None, None, None)
 }
+
 
 pub fn quant_q6k(data: &[f32]) -> Result<Vec<u8>> {
     quant_packed_symmetric(data, 6, None, None, None)

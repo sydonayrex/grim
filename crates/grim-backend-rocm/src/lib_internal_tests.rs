@@ -1195,6 +1195,7 @@ mod tests {
 
         // Hot path: pinned buffer + async hipMemcpy.
         let async_storage = dev.copy_from_host_async(&data, &shape, DType::F32).unwrap();
+        dev.synchronize();
         let async_out = dev.read_to_host_async(async_storage.as_ref()).unwrap();
 
         assert_eq!(sync_out.len(), data.len());
@@ -1217,6 +1218,7 @@ mod tests {
         // Reusable pinned buffer path (decode-loop steady state).
         let mut pinned = RocmPinnedBuffer::<f32>::alloc(data.len()).unwrap();
         let async_storage2 = dev.copy_from_host_async(&data, &shape, DType::F32).unwrap();
+        dev.synchronize();
         dev.read_into_pinned(async_storage2.as_ref(), &mut pinned)
             .unwrap();
         assert_eq!(pinned.as_slice(), data.as_slice());
@@ -1224,6 +1226,7 @@ mod tests {
         // Reusable pinned buffer for the upload side too.
         let pinned_in = RocmPinnedBuffer::<f32>::from_slice(&data).unwrap();
         let async_storage3 = dev.upload_from_pinned(&pinned_in, &shape, DType::F32).unwrap();
+        dev.synchronize();
         let async_out3 = dev.read_to_host_async(async_storage3.as_ref()).unwrap();
         for i in 0..data.len() {
             assert!(
@@ -1268,11 +1271,13 @@ mod tests {
         let mut pinned_out = RocmPinnedBuffer::<f32>::alloc(n).unwrap();
         for _ in 0..warmup {
             let s = dev.upload_from_pinned(&pinned_in, &shape, DType::F32).unwrap();
+            dev.synchronize();
             dev.read_into_pinned(s.as_ref(), &mut pinned_out).unwrap();
         }
         let t1 = std::time::Instant::now();
         for _ in 0..iters {
             let s = dev.upload_from_pinned(&pinned_in, &shape, DType::F32).unwrap();
+            dev.synchronize();
             dev.read_into_pinned(s.as_ref(), &mut pinned_out).unwrap();
         }
         let async_elapsed = t1.elapsed();
