@@ -14,6 +14,8 @@ pub struct GgufTokenizer {
     /// GPT-2 byte-to-unicode lookup table for byte-level BPE decode.
     /// Maps unicode char code → original byte value.
     pub byte_decoder: Option<HashMap<char, u8>>,
+    /// EOS token ID if available from tokenizer metadata
+    pub eos_token_id: Option<u32>,
 }
 
 impl GgufTokenizer {
@@ -107,6 +109,7 @@ impl GgufTokenizer {
             model_type: model_type.clone(),
             bpe_merges,
             byte_decoder: if model_type == "bpe" { Some(gpt2_byte_decoder()) } else { None },
+            eos_token_id: None, // HF tokenizer.json doesn't have explicit EOS token ID in a standard way
         })
     }
 
@@ -146,6 +149,11 @@ impl GgufTokenizer {
                     .collect::<Vec<f32>>()
             });
 
+        // Extract EOS token ID from metadata (typically tokenizer.ggml.eos_token_id)
+        let eos_token_id = metadata
+            .get("tokenizer.ggml.eos_token_id")
+            .and_then(|v| v.as_u32());
+
         Ok(Self {
             tokens,
             token_to_id,
@@ -153,6 +161,7 @@ impl GgufTokenizer {
             model_type,
             bpe_merges: None,
             byte_decoder: None,
+            eos_token_id,
         })
     }
 

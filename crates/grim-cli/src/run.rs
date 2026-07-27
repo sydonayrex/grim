@@ -319,7 +319,8 @@ pub async fn cmd_run(
         };
 
         // Build tensor from the selected token(s)
-        let shape = grim_tensor::Shape::new(vec![input_ids.len()]);
+        let n_tokens = input_ids.len();
+        let shape = grim_tensor::Shape::new(vec![n_tokens]);
         let float_tokens = input_ids;
         let dtype = grim_tensor::dtype::DType::F32;
         let storage: Arc<dyn grim_tensor::BackendStorage> = match device {
@@ -353,7 +354,44 @@ pub async fn cmd_run(
         );
 
         // Forward pass
-        let logits = CausalLm::forward(&*model, &mut session, &input_tensor, &input_tensor, &[])?;
+        // CRIT-1: Need to pass proper positions tensor, not the same as input_ids
+        let positions: Vec<f32> = if first_pass {
+            (0..n_tokens).map(|i| i as f32).collect()
+        } else {
+            vec![n_tokens as f32 - 1.0]
+        };
+        let pos_shape = grim_tensor::Shape::new(vec![positions.len()]);
+        let pos_storage: Arc<dyn grim_tensor::BackendStorage> = match device {
+            grim_tensor::Device::Cpu => {
+                let dev = grim_backend_cpu::CpuDevice::new();
+                Arc::from(dev.from_cpu(&positions, &pos_shape, grim_tensor::dtype::DType::F32)?)
+            }
+            grim_tensor::Device::Cuda(ordinal) => {
+                let dev = grim_backend_cuda::CudaDevice::new(ordinal);
+                Arc::from(dev.from_cpu(&positions, &pos_shape, grim_tensor::dtype::DType::F32)?)
+            }
+            grim_tensor::Device::Rocm(ordinal) => {
+                let dev = grim_backend_rocm::RocmDevice::new(ordinal);
+                Arc::from(dev.from_cpu(&positions, &pos_shape, grim_tensor::dtype::DType::F32)?)
+            }
+            grim_tensor::Device::Vulkan => {
+                let dev = grim_backend_vulkan::VulkanDevice::new();
+                Arc::from(dev.from_cpu(&positions, &pos_shape, grim_tensor::dtype::DType::F32)?)
+            }
+            grim_tensor::Device::Metal(ordinal) => {
+                let dev = grim_backend_metal::MetalDevice::try_new(ordinal)?;
+                Arc::from(dev.from_cpu(&positions, &pos_shape, grim_tensor::dtype::DType::F32)?)
+            }
+        };
+        let positions_tensor = grim_tensor::Tensor::new(
+            pos_storage,
+            pos_shape,
+            grim_tensor::dtype::DType::F32,
+            grim_tensor::dtype::QuantProvenance::default(),
+            device.clone(),
+        );
+        
+        let logits = CausalLm::forward(&*model, &mut session, &input_tensor, &positions_tensor, &[])?;
         
         // Get logits for the last token position only
         let logits_vec = logits.to_vec_f32()?;
@@ -414,10 +452,15 @@ pub async fn cmd_run(
         history.push(next_token);
         generated += 1;
 
-        // Note: EOS handling deferred — `GgufTokenizer` does not yet expose
-        // `tokenizer.ggml.eos_token_id`, so hardcoding `vocab_size - 1`
-        // incorrectly stops LFM2-family models whose PAD id is the vocab
-        // ceiling. For now we exhaust `max_tokens` and let the caller decide.
+        // Check for EOS token to stop generation
+        if let Some(tok) = &tokenizer {
+            if let Some(eos_id) = tok.eos_token_id {
+                if next_token == eos_id {
+                    eprintln!("[grim] EOS token {} reached, stopping generation.", eos_id);
+                    break;
+                }
+            }
+        }
     }
 
     println!("\n[grim] Done. Generated {} tokens.", generated);
@@ -564,7 +607,7 @@ pub fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn Causal
                 .unwrap_or(1e-5_f32),
             max_seq_len: get_meta_u32(&format!("{}.context_length", arch), 1024) as usize,
         };
-        let m = Gpt2::load(&ws, cfg)?;
+        let m = Gpt2::load(device.clone(), &ws, cfg)?;
         Ok(Box::new(m))
     } else if arch.contains("gemma") {
         let cfg = GemmaConfig {
@@ -577,7 +620,7 @@ pub fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn Causal
             intermediate_size: get_meta_u32(&format!("{}.intermediate_size", arch), 16384) as usize,
             rms_norm_eps,
         };
-        let m = Gemma::load(&ws, cfg)?;
+        let m = Gemma::load(device.clone(), &ws, cfg)?;
         Ok(Box::new(m))
     } else if arch.contains("deepseek") {
         let cfg = DeepSeekConfig {
@@ -590,7 +633,7 @@ pub fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn Causal
             q_lora_rank: get_meta_u32(&format!("{}.attention.q_lora_rank", arch), 128) as usize,
             kv_lora_rank: get_meta_u32(&format!("{}.attention.kv_lora_rank", arch), 512) as usize,
         };
-        let m = DeepSeek::load(&ws, cfg)?;
+        let m = DeepSeek::load(device.clone(), &ws, cfg)?;
         Ok(Box::new(m))
     } else if arch.contains("bert") {
         let cfg = BertConfig {

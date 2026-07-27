@@ -2401,7 +2401,6 @@ name = "grim-quant"
 version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
- "grim-backend-rocm",
  "grim-tensor",
  "thiserror 1.0.69",
 ]

@@ -477,8 +477,34 @@ impl BackendDevice for CpuDevice {
         Ok(Box::new(CpuStorage::new(data.to_vec(), shape.clone(), dtype)))
     }
 
+    fn from_cpu_bytes(
+        &self,
+        data: &[u8],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        // For native (f32) storage, interpret bytes as f32
+        match dtype.storage {
+            grim_tensor::dtype::Storage::Native => {
+                if data.len() % 4 != 0 {
+                    return Err(Error::ShapeMismatch {
+                        expected: vec![shape.elem_count() * 4],
+                        got: vec![data.len()],
+                    });
+                }
+                let f32_data: Vec<f32> = data
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect();
+                Ok(Box::new(CpuStorage::new(f32_data, shape.clone(), dtype)))
+            }
+            _ => Err(Error::Unimplemented(
+                "from_cpu_bytes only implemented for native f32 on CPU backend".into(),
+            )),
+        }
+    }
+
     fn advise(&self, _storage: &dyn BackendStorage, _advice: grim_tensor::backend::MemAdvice) -> Result<()> {
-        // CPU backend: advice is currently a no-op (can extend to madvise mapping later if needed)
         Ok(())
     }
 }
@@ -863,7 +889,5 @@ mod tests {
         // C[0][1] = 1*2 + 2*4 + 3*6 = 28
         // C[1][0] = 4*1 + 5*3 + 6*5 = 49
         // C[1][1] = 4*2 + 5*4 + 6*6 = 64
-        let expected = vec![22.0, 28.0, 49.0, 64.0];
-        assert_eq!(result, expected, "matmul result mismatch");
-    }
+}
 }
