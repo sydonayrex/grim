@@ -1,9 +1,10 @@
 //! Transformer block: pre-norm, GQA attention, SwiGLU FFN.
 
-use grim_backend_cpu::{cpu_tensor, CpuDevice};
+use std::sync::Arc;
+
 use grim_core::error::Result;
 use grim_nn::{Linear, RmsNorm};
-use grim_tensor::{Shape, Tensor};
+use grim_tensor::{Device, Shape, Tensor};
 
 use crate::model::LlamaConfig;
 
@@ -27,7 +28,7 @@ pub struct LlamaBlock {
     pub w_gate: Linear,
     pub w_up: Linear,
     pub w_down: Linear,
-    pub(crate) _dev: CpuDevice,
+    pub(crate) _dev: Device,
     pub(crate) _cfg: LlamaConfigRefs,
 }
 
@@ -77,6 +78,7 @@ impl LlamaBlock {
             cfg.hidden_size,
             /*has_bias=*/false,
         )?;
+        let device = wq.weight.device().clone();
         Ok(Self {
             attn_norm,
             wq,
@@ -87,7 +89,7 @@ impl LlamaBlock {
             w_gate,
             w_up,
             w_down,
-            _dev: CpuDevice::new(),
+            _dev: device,
             _cfg: LlamaConfigRefs {
                 hidden_size: cfg.hidden_size,
                 num_heads: cfg.num_heads,
@@ -118,55 +120,38 @@ impl LlamaBlock {
             added[i] = x_res1_data[i] + attn_data[i];
         }
 
-
         let num_experts = 2;
         let token_count = x_res1_data.len() / hidden;
         let mut ffn_out_data = vec![0.0f32; x_res1_data.len()];
 
         for t in 0..token_count {
-            // Simulated routing gate: hash/project representation to select expert index
             let expert_idx = t % num_experts;
-            println!("[MoE Router] Routing token {} to Expert {}", t, expert_idx);
-
             let token_offset = t * hidden;
             let token_slice = &x_res1_data[token_offset..token_offset + hidden];
-            
-            // Extract the slice representation as a mini-tensor
-            let x_tok = cpu_tensor(token_slice.to_vec(), Shape::new(vec![1, hidden]));
+            let x_tok = {
+                let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
+                let storage = dev.from_cpu(token_slice, &Shape::new(vec![1, hidden]), grim_tensor::DType::F32)?;
+                Tensor::new(std::sync::Arc::from(storage), Shape::new(vec![1, hidden]), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), self._dev.clone())
+            };
             let x_tok_norm = self.ffn_norm.forward(&x_tok)?;
 
-            if expert_idx == 0 {
-                // Expert 0: standard SwiGLU FFN
-                let gate = self.w_gate.forward(&x_tok_norm)?;
-                let up = self.w_up.forward(&x_tok_norm)?;
-                let gate_data = gate.to_vec_f32()?;
-                let up_data = up.to_vec_f32()?;
-                let mut silu_data = vec![0.0f32; gate_data.len()];
-                for i in 0..gate_data.len() {
-                    let xv = gate_data[i];
-                    silu_data[i] = (xv / (1.0 + (-xv).exp())) * up_data[i];
-                }
-                let ffn_out = self.w_down.forward(&cpu_tensor(silu_data, gate.shape().clone()))?;
-                let ffn_data = ffn_out.to_vec_f32()?;
-                for i in 0..hidden {
-                    ffn_out_data[token_offset + i] = ffn_data[i];
-                }
-            } else {
-                // Expert 1: scaled fallback SwiGLU FFN
-                let gate = self.w_gate.forward(&x_tok_norm)?;
-                let up = self.w_up.forward(&x_tok_norm)?;
-                let gate_data = gate.to_vec_f32()?;
-                let up_data = up.to_vec_f32()?;
-                let mut silu_data = vec![0.0f32; gate_data.len()];
-                for i in 0..gate_data.len() {
-                    let xv = gate_data[i];
-                    silu_data[i] = (xv / (1.0 + (-xv).exp())) * up_data[i] * 0.95; // expert-specific scale factor
-                }
-                let ffn_out = self.w_down.forward(&cpu_tensor(silu_data, gate.shape().clone()))?;
-                let ffn_data = ffn_out.to_vec_f32()?;
-                for i in 0..hidden {
-                    ffn_out_data[token_offset + i] = ffn_data[i];
-                }
+            let gate = self.w_gate.forward(&x_tok_norm)?;
+            let up = self.w_up.forward(&x_tok_norm)?;
+            let gate_data = gate.to_vec_f32()?;
+            let up_data = up.to_vec_f32()?;
+            let mut silu_data = vec![0.0f32; gate_data.len()];
+            for i in 0..gate_data.len() {
+                let xv = gate_data[i];
+                silu_data[i] = (xv / (1.0 + (-xv).exp())) * up_data[i];
+            }
+            let ffn_out = self.w_down.forward(&{
+                let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
+                let storage = dev.from_cpu(&silu_data, &gate.shape().clone(), grim_tensor::DType::F32)?;
+                Tensor::new(std::sync::Arc::from(storage), gate.shape().clone(), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), self._dev.clone())
+            })?;
+            let ffn_data = ffn_out.to_vec_f32()?;
+            for i in 0..hidden {
+                ffn_out_data[token_offset + i] = ffn_data[i];
             }
         }
 
@@ -174,7 +159,11 @@ impl LlamaBlock {
         for i in 0..x_res1_data.len() {
             out[i] = added[i] + ffn_out_data[i];
         }
-        Ok(cpu_tensor(out, x.shape().clone()))
+        Ok({
+            let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
+            let storage = dev.from_cpu(&out, &x.shape().clone(), grim_tensor::DType::F32)?;
+            Tensor::new(std::sync::Arc::from(storage), x.shape().clone(), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), self._dev.clone())
+        })
     }
 
     fn prefilled_self_attention(
@@ -187,7 +176,6 @@ impl LlamaBlock {
         let qd = q.to_vec_f32()?;
         let kd = k.to_vec_f32()?;
         let vd = v.to_vec_f32()?;
-        // q, k, v are [B, H_head] where B = elem_count / head_dim
         let num_head_dims = cfg.num_heads * cfg.head_dim;
         let total_tokens = qd.len() / num_head_dims;
         let scale = 1.0 / (cfg.head_dim as f32).sqrt();
@@ -223,6 +211,10 @@ impl LlamaBlock {
                 }
             }
         }
-        Ok(cpu_tensor(out, Shape::new(vec![total_tokens, num_head_dims])))
+        Ok({
+            let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
+            let storage = dev.from_cpu(&out, &Shape::new(vec![total_tokens, num_head_dims]), grim_tensor::DType::F32)?;
+            Tensor::new(std::sync::Arc::from(storage), Shape::new(vec![total_tokens, num_head_dims]), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), self._dev.clone())
+        })
     }
 }

@@ -49,7 +49,7 @@ pub use crate::device::handles::{
     hipGetDeviceProperties, hipGraphCreate, hipGraphDestroy,
     hipGraphExecDestroy, hipGraphExtendFromGlobalStream, hipGraphInstantiate,
     hipGraphLaunch, hipGraphUpload, hipHostFree, hipHostMalloc,
-    hipMemAdvise, hipMemcpy, hipMemcpyAsync, hipMemset, hipMemsetAsync,
+    hipMemAdvise, hipMemcpy, hipMemcpyAsync, hipMemGetInfo, hipMemset, hipMemsetAsync,
     hipMalloc, hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad,
     hipModuleUnload, hipSetDevice, hipStreamBeginCapture, hipStreamCreate,
     hipStreamDestroy, hipStreamEndCapture, hipStreamSynchronize,

@@ -1,15 +1,17 @@
 //! Llama/Mistral-style dense transformer — `CausalLm` implementation.
 
+use std::sync::Arc;
+
 use grim_backend_cpu::CpuDevice;
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
-use grim_nn::{Embedding, Linear, RmsNorm, Rope};
+use grim_nn::{pick_device_for_storage_device, Embedding, Linear, RmsNorm};
 use grim_tensor::{ArithType, Device, DType, Shape, Tensor};
 
 use crate::block::{LlamaBlock, LlamaConfigRefs};
-use crate::rng::SimpleRng;
+use grim_core::rng::SimpleRng;
 
 #[derive(Debug, Clone)]
 pub struct LlamaConfig {
@@ -44,12 +46,10 @@ pub struct Llama {
     pub layers: Vec<LlamaBlock>,
     pub norm: RmsNorm,
     pub output: Linear,
-    #[allow(dead_code)]
-    rope: Rope,
 }
 
 impl Llama {
-    pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: LlamaConfig) -> Result<Self> {
+    pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: LlamaConfig) -> Result<Self> {
         let tok_embeddings = Embedding::load(
             &ws.pp("tok_embeddings"),
             cfg.vocab_size,
@@ -60,25 +60,21 @@ impl Llama {
             layers.push(LlamaBlock::load(&ws.pp("layers").pp(&i.to_string()), &cfg)?);
         }
         let norm = RmsNorm::load(&ws.pp("norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let output = Linear::load(
-            &ws.pp("output"),
-            cfg.hidden_size,
-            cfg.vocab_size,
-            false,
-        )?;
-        let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
+        let output = match Linear::load(&ws.pp("output"), cfg.hidden_size, cfg.vocab_size, false) {
+            Ok(o) => o,
+            Err(_) => Linear::from_tensor(tok_embeddings.weight.clone(), None),
+        };
         Ok(Self {
             cfg,
-            device: Device::Cpu,
+            device: device.clone(),
             tok_embeddings,
             layers,
             norm,
             output,
-            rope,
         })
     }
 
-    pub fn random(cfg: LlamaConfig) -> Self {
+    pub fn random(device: Device, cfg: LlamaConfig) -> Self {
         use grim_backend_cpu::cpu_tensor;
         let dev = CpuDevice::new();
         let mut rng = SimpleRng::new(0xDEAD_BEEF_CAFE_F00Du64);
@@ -116,7 +112,7 @@ impl Llama {
                 w_gate: linear(cfg.intermediate_size, cfg.hidden_size),
                 w_up:   linear(cfg.intermediate_size, cfg.hidden_size),
                 w_down: linear(cfg.hidden_size, cfg.intermediate_size),
-                _dev: dev.clone(),
+                _dev: Device::Cpu,
                 _cfg: LlamaConfigRefs {
                     hidden_size: cfg.hidden_size,
                     num_heads: cfg.num_heads,
@@ -129,15 +125,13 @@ impl Llama {
 
         let norm = rms(cfg.hidden_size);
         let output = linear(cfg.vocab_size, cfg.hidden_size);
-        let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
         Self {
             cfg: cfg.clone(),
-            device: Device::Cpu,
+            device,
             tok_embeddings,
             layers,
             norm,
             output,
-            rope,
         }
     }
 
@@ -165,6 +159,9 @@ impl Model for Llama {
     }
     fn param_arith(&self) -> ArithType {
         ArithType::F32
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -197,9 +194,15 @@ impl CausalLm for Llama {
             .tok_embeddings
             .forward(&ids, seq_len, self.cfg.hidden_size)?
             .to_vec_f32()?;
-        let hidden_t = grim_backend_cpu::cpu_tensor(
-            hidden,
-            Shape::new(vec![1, seq_len, self.cfg.hidden_size]),
+        let hidden_shape = Shape::new(vec![1, seq_len, self.cfg.hidden_size]);
+        let dev = pick_device_for_storage_device(&self.device);
+        let hidden_storage = dev.from_cpu(&hidden, &hidden_shape, DType::F32)?;
+        let hidden_t = Tensor::new(
+            Arc::from(hidden_storage),
+            hidden_shape.clone(),
+            DType::F32,
+            self.tok_embeddings.weight.provenance().clone(),
+            self.device.clone(),
         );
         let positions: Vec<u32> = (0..seq_len).map(|i| i as u32).collect();
         let (logits, hidden_state) = self.decode(&hidden_t, &positions)?;

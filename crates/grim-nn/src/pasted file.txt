@@ -1,0 +1,1 @@
+grim-backend-rocm/src/device/roc_device.rs — added RocmDevice::dequant_q8_0_storage(&self, storage: &RocmStorage) -> Result<RocmStorage>, a public wrapper around the existing (but crate-private) launch_dequant_q8_0, mirroring the inline pattern already used in embedding().

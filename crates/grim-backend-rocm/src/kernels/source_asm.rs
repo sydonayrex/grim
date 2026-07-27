@@ -22,18 +22,29 @@
 
 pub fn compute_kernel_source() -> String {
     let mut s = String::with_capacity(
-        crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE.len() + 4096,
+        crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE.len() + 16384,
     );
     s.push_str(crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE);
     s.push_str(crate::kernels::qkv_attention::KERNEL_SOURCE);
-    // WI 2.4.4-2 — Rust-centric decode GEMM (F16, double-buffered LDS).
-    // Opt-in via `DecodeGemmConfig::enabled` in `RocmDevice::matmul`; the
-    // source is concatenated here regardless so the JIT cache can resolve
-    // the symbol at first dispatch without rebuilding the program.
     s.push_str(crate::kernels::decode_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::fused_dequant_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::kv_dequant_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::wmma_gemm::KERNEL_SOURCE);
+    s.push_str(crate::kernels::q8_0_dequant::KERNEL_SOURCE);
+    s.push_str(crate::kernels::q4k_gemm::KERNEL_SOURCE);
+    s.push_str(crate::kernels::q5k_gemm::KERNEL_SOURCE);
+    s.push_str(crate::kernels::q6k_gemm::KERNEL_SOURCE);
+    s.push_str(crate::kernels::q2k_gemm::KERNEL_SOURCE);
+    s.push_str(crate::kernels::q3k_gemm::KERNEL_SOURCE);
+    s.push_str(crate::kernels::iq_gemm::KERNEL_SOURCE);
+    s.push_str(crate::kernels::fp8_standalone::KERNEL_SOURCE);
+    s.push_str(crate::kernels::mxfp_standalone::KERNEL_SOURCE);
+    s.push_str(crate::kernels::selective_scan::KERNEL_SOURCE);
+    s.push_str(crate::kernels::q4k_dequant::KERNEL_SOURCE);
+    s.push_str(crate::kernels::iq_dequant::KERNEL_SOURCE);
+    s.push_str(crate::kernels::flash_attn::KERNEL_SOURCE);
+    s.push_str(crate::kernels::cross_attention::KERNEL_SOURCE);
+    s.push_str(crate::kernels::rwkv::KERNEL_SOURCE);
     s
 }
 
@@ -51,6 +62,8 @@ mod source_asm_self_tests {
         assert!(src.contains("grim_qkv_attention"));
         // WMMA GEMM lives in wmma_gemm::KERNEL_SOURCE.
         assert!(src.contains("grim_wmma_gemm"));
+    // Q8_0 dequant kernel lives in q8_0_dequant::KERNEL_SOURCE.
+    assert!(src.contains("grim_dequant_q8_0"));
     }
 
     #[test]
@@ -61,5 +74,13 @@ mod source_asm_self_tests {
         // to accommodate QKV growth without realloc — but we
         // confirm it doesn't blow up.
         let _ = compute_kernel_source();
+    }
+
+    #[test]
+    fn compute_kernel_source_contains_phase2_kernels() {
+        let src = compute_kernel_source();
+        assert!(src.contains("grim_flash_attention"));
+        assert!(src.contains("grim_cross_attention"));
+        assert!(src.contains("grim_rwkv_time_mix"));
     }
 }

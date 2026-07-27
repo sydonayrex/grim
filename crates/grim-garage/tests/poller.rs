@@ -13,8 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use grim_garage::jobs::JobRegistry;
-use grim_garage::routes::{self, AppState};
+use grim_garage::routes;
 use grim_garage::ui_state::display::DisplayState;
 use grim_garage::ui_state::http_client::GarageClient;
 use grim_garage::ui_state::poller::{poll_once, Poller};
@@ -26,7 +25,7 @@ async fn spawn_combined_router() -> SocketAddr {
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
-        let state = AppState { registry: Arc::new(JobRegistry::new()) };
+        let state = routes::new_app_state();
         let router = routes::build_router(state);
         let _ = axum::serve(listener, router).await;
     });
@@ -59,10 +58,13 @@ async fn poll_once_after_start_training_records_job_in_state() {
     let client = GarageClient::new(&base);
     let mut state = DisplayState::new();
 
-    // Submit a training job via the real HTTP surface.
+    // Submit a training job via the real HTTP surface. Paths are
+    // `model.gguf` / `data.jsonl` (no leading slash) — start_training
+    // rejects any string containing '/', '\', or '..' as a path-traversal
+    // defense (M1).
     let body = GarageClient::build_start_training_request(
-        "/m.gguf",
-        "/d.jsonl",
+        "model.gguf",
+        "data.jsonl",
         grim_garage::jobs::TrainingMode::Lora,
         16,
         2e-5,
@@ -130,6 +132,37 @@ async fn poll_once_returns_error_on_unreachable_host() {
 async fn garage_client_urls_round_trip() {
     let c = GarageClient::new("http://localhost:8741/api");
     assert_eq!(c.base_url(), "http://localhost:8741/api");
+}
+
+#[tokio::test]
+async fn poller_loop_does_not_block_displaystate_on_unreachable_host() {
+    use std::time::Instant;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let state = Arc::new(tokio::sync::Mutex::new(DisplayState::new()));
+    let mut poller = Poller::new(
+        GarageClient::new(format!("http://{addr}")),
+        Arc::clone(&state),
+    );
+    poller
+        .with_interval(Duration::from_millis(30))
+        .with_fetch_timeout(Duration::from_millis(80));
+    poller.spawn();
+
+    let start = Instant::now();
+    for _ in 0..6 {
+        let snap = { state.lock().await.snapshot() };
+        let _ = snap.jobs.is_empty();
+    }
+    let elapsed = start.elapsed();
+    drop(poller);
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "DisplayState lock blocked for {elapsed:?}"
+    );
 }
 
 // ----- helpers -----

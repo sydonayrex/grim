@@ -30,6 +30,9 @@ impl grim_core::Model for LlamaMtpAdapter {
     fn config(&self) -> &dyn grim_core::ModelConfig {
         self.inner.config()
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     fn device(&self) -> &grim_tensor::Device {
         self.inner.device()
     }

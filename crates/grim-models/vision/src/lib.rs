@@ -7,7 +7,6 @@
 //! No autoregressive head; the model is `Encoder`, not `CausalLm`.
 
 pub mod vit;
-pub mod rng;
 pub mod bert;
 pub mod configs;
 

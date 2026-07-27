@@ -10,7 +10,7 @@ use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};
 use grim_core::model::{Encoder, ModalityHint};
 use grim_core::{Model, ModelConfig};
-use grim_nn::{Linear, RmsNorm};
+use grim_nn::{Linear, RmsNorm, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 
 /// ViT configuration.
@@ -59,7 +59,7 @@ struct VitBlock {
 
 impl VitBlock {
     fn new(
-        rng: &mut crate::rng::SimpleRng,
+        rng: &mut grim_core::rng::SimpleRng,
         hidden: usize,
         num_heads: usize,
         intermediate: usize,
@@ -96,6 +96,18 @@ impl VitBlock {
             head_dim,
             intermediate,
         }
+    }
+
+    fn load(ws: &WeightSource<'_>, hidden: usize, num_heads: usize, intermediate: usize, eps: f32) -> Result<Self> {
+        let head_dim = hidden / num_heads;
+        let wq = ws.get([num_heads * head_dim, hidden], "attn.q.weight")?.to_vec_f32()?;
+        let wk = ws.get([num_heads * head_dim, hidden], "attn.k.weight")?.to_vec_f32()?;
+        let wv = ws.get([num_heads * head_dim, hidden], "attn.v.weight")?.to_vec_f32()?;
+        let wo = ws.get([hidden, num_heads * head_dim], "attn.o.weight")?.to_vec_f32()?;
+        let norm1 = RmsNorm::load(&ws.pp("attn_norm"), hidden, eps)?;
+        let w_fc1 = Linear::load(&ws.pp("ffn.0"), hidden, intermediate, true)?;
+        let w_fc2 = Linear::load(&ws.pp("ffn.1"), intermediate, hidden, true)?;
+        Ok(Self { norm1, wq, wk, wv, wo, w_fc1, w_fc2, hidden, num_heads, head_dim, intermediate })
     }
 
     fn forward(&self, x: &[f32], seq: usize) -> Result<Vec<f32>> {
@@ -158,12 +170,12 @@ pub struct Vit {
 
 impl Vit {
     /// Build a randomly-initialized tiny ViT. Suitable for unit tests.
-    pub fn random(cfg: VitConfig) -> Self {
-        Self::new(cfg, &mut crate::rng::SimpleRng::new(0xC08D_E27B_71A5_F00Du64))
+    pub fn random(device: Device, cfg: VitConfig) -> Self {
+        Self::new(device, cfg, &mut grim_core::rng::SimpleRng::new(0xC08D_E27B_71A5_F00Du64))
     }
 
     /// Build the ViT given an RNG (lets callers choose a deterministic seed).
-    pub fn new(cfg: VitConfig, rng: &mut crate::rng::SimpleRng) -> Self {
+    pub fn new(device: Device, cfg: VitConfig, rng: &mut grim_core::rng::SimpleRng) -> Self {
         let patch_dim = cfg.patch_dim();
         let proj_w: Vec<f32> = (0..cfg.hidden_size * patch_dim)
             .map(|_| (rng.next_f32() - 0.5) * 0.02)
@@ -193,7 +205,7 @@ impl Vit {
         let features = cfg.hidden_size;
         Self {
             cfg,
-            device: Device::Cpu,
+            device,
             patch_proj_w: proj_w,
             patch_proj_b: proj_b,
             cls_token,
@@ -202,6 +214,31 @@ impl Vit {
             ln,
             features,
         }
+    }
+
+    pub fn load(device: Device, ws: &WeightSource<'_>, cfg: VitConfig) -> Result<Self> {
+        let patch_dim = cfg.patch_dim();
+        let proj_w = ws.get([cfg.hidden_size, patch_dim], "proj.weight")?.to_vec_f32()?;
+        let proj_b = ws.get([cfg.hidden_size], "proj.bias")?.to_vec_f32()?;
+        let cls_token = ws.get([cfg.hidden_size], "cls_token")?.to_vec_f32()?;
+        let num_patches = cfg.num_patches();
+        let pos_embed = ws.get([num_patches + 1, cfg.hidden_size], "pos_embed")?.to_vec_f32()?;
+        let mut blocks = Vec::with_capacity(cfg.num_layers);
+        for i in 0..cfg.num_layers {
+            let blk = VitBlock::load(
+                &ws.pp(&format!("blocks.{i}")),
+                cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, cfg.rms_norm_eps,
+            )?;
+            blocks.push(blk);
+        }
+        let ln = RmsNorm::load(&ws.pp("ln"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let features = cfg.hidden_size;
+        Ok(Self {
+            cfg, device,
+            patch_proj_w: proj_w, patch_proj_b: proj_b,
+            cls_token, pos_embed, blocks, ln,
+            features,
+        })
     }
 
     /// Encode a flat `(C, H, W)` tensor into a `(1, hidden_size)` feature.
@@ -279,6 +316,7 @@ impl Model for Vit {
     fn config(&self) -> &dyn ModelConfig { &self.cfg }
     fn device(&self) -> &Device { &self.device }
     fn param_arith(&self) -> ArithType { ArithType::F32 }
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 impl Encoder for Vit {
@@ -302,7 +340,7 @@ mod tests {
             intermediate_size: 32,
             rms_norm_eps: 1e-5,
         };
-        Vit::random(cfg)
+        Vit::random(Device::Cpu, cfg)
     }
 
     #[test]
@@ -345,7 +383,7 @@ mod tests {
             intermediate_size: 128,
             rms_norm_eps: 1e-5,
         };
-        let vit = Vit::random(cfg);
+        let vit = Vit::random(Device::Cpu, cfg);
         assert_eq!(vit.features, 64);
     }
 }

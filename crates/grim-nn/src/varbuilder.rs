@@ -22,7 +22,7 @@ use grim_quant::{
 #[cfg(feature = "cuda-mem")]
 use grim_backend_cuda::CudaDevice;
 #[cfg(feature = "rocm-mem")]
-use grim_backend_rocm::RocmDevice;
+use grim_backend_rocm::{RocmDevice, RocmStorage};
 #[cfg(feature = "metal-mem")]
 use grim_backend_metal::MetalDevice;
 
@@ -33,16 +33,16 @@ pub struct WeightSource<'a> {
     tensors: &'a dyn grim_tensor::TensorProvider,
     prefix: Vec<String>,
     default_dtype: DType,
-    default_provenance: QuantProvenance,
-    device: Device,
+        default_provenance: QuantProvenance,
+            device: Device,
 }
 
 impl<'a> WeightSource<'a> {
     pub fn new(
         tensors: &'a dyn grim_tensor::TensorProvider,
         default_dtype: DType,
-        default_provenance: QuantProvenance,
-        device: Device,
+            default_provenance: QuantProvenance,
+                device: Device,
     ) -> Self {
         Self {
             tensors,
@@ -74,9 +74,14 @@ impl<'a> WeightSource<'a> {
             tensors: self.tensors,
             prefix: self.prefix.clone(),
             default_dtype: self.default_dtype.clone(),
-            default_provenance: self.default_provenance.clone(),
-            device: self.device.clone(),
+                default_provenance: self.default_provenance.clone(),
+                    device: self.device.clone(),
         }
+    }
+
+    /// Returns the target device for this WeightSource (CPU or GPU).
+    pub fn device(&self) -> Device {
+        self.device.clone()
     }
 
     fn full_name(&self, leaf: &str) -> String {
@@ -103,7 +108,7 @@ impl<'a> WeightSource<'a> {
             );
             return Err(Error::ShapeMismatch {
                 expected: shape.dims().to_vec(),
-                got: raw.shape.clone(),
+                       got: raw.shape.clone(),
             });
         }
         let (dtype, provenance) = match self.tensors.meta(&name) {
@@ -143,7 +148,7 @@ impl<'a> WeightSource<'a> {
         if raw.shape != shape.dims() {
             return Err(Error::ShapeMismatch {
                 expected: shape.dims().to_vec(),
-                got: raw.shape.clone(),
+                       got: raw.shape.clone(),
             });
         }
         let (dtype, provenance) = match self.tensors.meta(&name) {
@@ -174,10 +179,10 @@ fn materialize_cuda(
     let storage = BackendDevice::from_cpu(&dev, &f32s, &shape, DType::F32)?;
     Ok(Tensor::new(
         Arc::from(storage),
-        shape,
-        DType::F32,
-        provenance,
-        device.clone(),
+                   shape,
+                   DType::F32,
+                   provenance,
+                   device.clone(),
     ))
 }
 
@@ -192,7 +197,7 @@ fn materialize_cuda(
 ) -> Result<Tensor> {
     Err(Error::Unimplemented(format!(
         "CUDA materialization: enable 'cuda-mem' feature on grim-nn (ordinal={})",
-        ordinal
+                                     ordinal
     )))
 }
 
@@ -212,10 +217,10 @@ fn materialize_rocm(
     let storage = BackendDevice::from_cpu(&dev, &f32s, &shape, DType::F32)?;
     Ok(Tensor::new(
         Arc::from(storage),
-        shape,
-        DType::F32,
-        provenance,
-        device.clone(),
+                   shape,
+                   DType::F32,
+                   provenance,
+                   device.clone(),
     ))
 }
 
@@ -230,7 +235,7 @@ fn materialize_rocm(
 ) -> Result<Tensor> {
     Err(Error::Unimplemented(format!(
         "ROCm materialization: enable 'rocm-mem' feature on grim-nn (ordinal={})",
-        ordinal
+                                     ordinal
     )))
 }
 
@@ -247,10 +252,10 @@ fn materialize_metal(
     let storage = BackendDevice::from_cpu(&dev, &f32s, &shape, DType::F32)?;
     Ok(Tensor::new(
         Arc::from(storage),
-        shape,
-        DType::F32,
-        provenance,
-        device.clone(),
+                   shape,
+                   DType::F32,
+                   provenance,
+                   device.clone(),
     ))
 }
 
@@ -265,7 +270,7 @@ fn materialize_metal(
 ) -> Result<Tensor> {
     Err(Error::Unimplemented(format!(
         "Metal materialization: enable 'metal-mem' feature on grim-nn (ordinal={})",
-        ordinal
+                                     ordinal
     )))
 }
 
@@ -281,22 +286,50 @@ fn materialize(
         return Ok(cpu_tensor(f32s, shape));
     }
     if dtype.is_quantized() {
-        if let Device::Rocm(ordinal) = device {
-            #[cfg(feature = "rocm-mem")]
-            {
-                let dev = RocmDevice::new(*ordinal);
-                if let Ok(storage) = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone()) {
-                    return Ok(Tensor::new(
-                        Arc::from(storage),
-                        shape,
-                        dtype,
-                        provenance,
-                        device.clone(),
-                    ));
+        // Q8_0 has an on-device dequant kernel on ROCm. All other KQuant
+        // formats (Q4K, Q6K, IQ*, etc.) lack on-device dequant kernels, so
+        // they must fall through to the CPU dequant path below, which
+        // produces real F32 and uploads it via materialize_rocm.
+        let is_q80 = matches!(&dtype.storage, Storage::KQuant(KQuantScheme::Q80));
+        if is_q80 {
+            if let Device::Rocm(ordinal) = device {
+                #[cfg(feature = "rocm-mem")]
+                {
+                    let dev = RocmDevice::new(*ordinal);
+                    if let Ok(storage) = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone()) {
+                        let f32_storage = {
+                            let roc_storage = storage
+                                .as_any()
+                                .downcast_ref::<RocmStorage>()
+                                .ok_or_else(|| Error::Backend("materialize: ROCm Q80 storage is not RocmStorage".into()))?;
+                            dev.dequantize_q8_0(roc_storage)?
+                        };
+                        // Free the packed buffer immediately instead of
+                        // letting it live until this function returns. On a
+                        // 4GB card, holding both the packed (~1.06 B/elem)
+                        // and freshly-dequantized F32 (4 B/elem) buffers
+                        // alive at once nearly quadruples this tensor's peak
+                        // VRAM footprint during load — across every Q8_0
+                        // tensor in the model that adds up fast enough to
+                        // OOM (`hipMalloc failed: 2`) on small consumer
+                        // cards. `roc_storage` only borrowed `storage`, so
+                        // dropping the owning `Box` here (rather than at
+                        // end-of-scope) is what actually returns the packed
+                        // allocation to the caching allocator before the
+                        // next tensor loads.
+                        drop(storage);
+                        return Ok(Tensor::new(
+                            Arc::from(f32_storage),
+                            shape,
+                            DType::F32,
+                            provenance,
+                            device.clone(),
+                        ));
+                    }
                 }
+                #[cfg(not(feature = "rocm-mem"))]
+                let _ = ordinal;
             }
-            #[cfg(not(feature = "rocm-mem"))]
-            let _ = ordinal;
         }
     }
     let f32s = dequant_to_f32(&raw, &dtype)?;
@@ -463,9 +496,9 @@ mod tests {
         fn meta(&self, _name: &str) -> Result<grim_tensor::TensorMeta> {
             Ok(grim_tensor::TensorMeta {
                 dtype: self.dtype.clone(),
-                provenance: QuantProvenance::GrimNative,
-                shape: self.raw.shape.clone(),
-                fusion_mask: 0,
+               provenance: QuantProvenance::GrimNative,
+               shape: self.raw.shape.clone(),
+               fusion_mask: 0,
             })
         }
     }

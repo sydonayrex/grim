@@ -102,13 +102,16 @@ impl<'a> MetadataLookup for GgufMetadataLookup<'a> {
     fn get_u32(&self, key: &str) -> Option<u32> {
         let v = self.0.metadata(key)?;
         if let Some(u) = v.as_u32() {
+            eprintln!("[meta-get-u32] {key} = {u} (u32)");
             return Some(u);
         }
         if let Some(s) = v.as_str() {
             if let Ok(u) = s.parse::<u32>() {
+                eprintln!("[meta-get-u32] {key} = {u} (str->u32)");
                 return Some(u);
             }
         }
+        eprintln!("[meta-get-u32] {key} = MISSING");
         None
     }
     fn get_f32(&self, key: &str) -> Option<f32> {
@@ -259,8 +262,7 @@ fn load_model_from_config(
         model_arch, num_layers, hidden_size, vocab_size
     );
 
-    let device_clone = device.clone();
-    let ws = WeightSource::root(provider, device);
+    let ws = WeightSource::root(provider, device.clone());
 
     match model_arch {
         ModelArchitecture::Falcon => {
@@ -287,7 +289,7 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            let m = Llama::load(&ws, llama_cfg)?;
+            let m = Llama::load(device.clone(), &ws, llama_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Bloom => {
@@ -338,7 +340,7 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            let m = Llama::load(&ws, llama_cfg)?;
+            let m = Llama::load(device.clone(), &ws, llama_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen | ModelArchitecture::Qwen2 | ModelArchitecture::Qwen3 | ModelArchitecture::Qwen35 => {
@@ -367,7 +369,7 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            let m = Llama::load(&ws, llama_cfg)?;
+            let m = Llama::load(device.clone(), &ws, llama_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen2Moe | ModelArchitecture::Qwen3Moe | ModelArchitecture::Qwen35Moe | ModelArchitecture::Qwen3VlMoe => {
@@ -450,7 +452,7 @@ fn load_model_from_config(
                 conv_kernel: 4,
                 rms_norm_eps,
             };
-            let m = Mamba::load(&ws, mamba_cfg)?;
+            let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Jamba => {
@@ -478,7 +480,7 @@ fn load_model_from_config(
                 conv_kernel: 4,
                 rms_norm_eps,
             };
-            let m = Mamba::load(&ws, mamba_cfg)?;
+            let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::NemotronH => {
@@ -503,7 +505,7 @@ fn load_model_from_config(
                 conv_kernel: 4,
                 rms_norm_eps,
             };
-            let m = Mamba::load(&ws, mamba_cfg)?;
+            let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::GraniteHybrid => {
@@ -528,7 +530,7 @@ fn load_model_from_config(
                 conv_kernel: 4,
                 rms_norm_eps,
             };
-            let m = Mamba::load(&ws, mamba_cfg)?;
+            let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::ModernBert => {
@@ -550,7 +552,7 @@ fn load_model_from_config(
                 intermediate_size,
                 max_seq_len,
             };
-            let m = Bert::load(&ws, bert_cfg)?;
+            let m = Bert::load(device.clone(), &ws, bert_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::NomicBert | ModelArchitecture::NomicBertMoe | ModelArchitecture::NeoBert | ModelArchitecture::JinaBertV2 | ModelArchitecture::JinaBertV3 => {
@@ -572,7 +574,7 @@ fn load_model_from_config(
                 intermediate_size,
                 max_seq_len,
             };
-            let m = Bert::load(&ws, bert_cfg)?;
+            let m = Bert::load(device.clone(), &ws, bert_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::T5Encoder => {
@@ -611,7 +613,7 @@ fn load_model_from_config(
                 hidden_size,
                 num_layers,
             };
-            let m = Rwkv::load(&ws, rwkv_cfg)?;
+            let m = Rwkv::load(&ws, rwkv_cfg, device.clone())?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Rwkv7 | ModelArchitecture::ARwkv7 => {
@@ -628,7 +630,7 @@ fn load_model_from_config(
                 hidden_size,
                 num_layers,
             };
-            let m = Rwkv::load(&ws, rwkv_cfg)?;
+            let m = Rwkv::load(&ws, rwkv_cfg, device.clone())?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Lfm2 | ModelArchitecture::Lfm2Moe => {
@@ -640,7 +642,7 @@ fn load_model_from_config(
                 name.to_string()
             };
             let remapped_provider = RemappingTensorProvider::new(provider, remap_fn);
-            let ws = WeightSource::root(&remapped_provider, device_clone);
+            let ws = WeightSource::root(&remapped_provider, device.clone());
 
             let intermediate_size = remapped_provider
                 .meta("blk.0.ffn_gate.weight")
@@ -697,7 +699,7 @@ fn load_model_from_config(
                 conv_kernel: d_conv,
                 rms_norm_eps,
             };
-            let m = Mamba::load(&ws, cfg)?;
+            let m = Mamba::load(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Gpt2 => {
@@ -750,7 +752,7 @@ fn load_model_from_config(
                 intermediate_size,
                 max_seq_len,
             };
-            let m = Bert::load(&ws, cfg)?;
+            let m = Bert::load(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::T5 => {
@@ -775,7 +777,7 @@ fn load_model_from_config(
                 let remapped_provider = RemappingTensorProvider::new(provider, move |name: &str| -> String {
                     spec_clone.remap_tensor_name(name)
                 });
-                let ws = WeightSource::root(&remapped_provider, device_clone);
+                let ws = WeightSource::root(&remapped_provider, device.clone());
 
                 if spec.is_moe {
                     let deepseek_cfg = DeepSeekConfig {
@@ -801,7 +803,7 @@ fn load_model_from_config(
                         conv_kernel: 4,
                         rms_norm_eps: spec.rms_norm_eps,
                     };
-                    let m = Mamba::load(&ws, mamba_cfg)?;
+                    let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
                     return Ok(Box::new(m));
                 } else {
                     let llama_cfg = LlamaConfig {
@@ -816,7 +818,7 @@ fn load_model_from_config(
                         rope_theta: spec.rope_theta,
                         max_seq_len: spec.max_seq_len,
                     };
-                    let m = Llama::load(&ws, llama_cfg)?;
+                    let m = Llama::load(device.clone(), &ws, llama_cfg)?;
                     return Ok(Box::new(m));
                 }
             }
@@ -834,7 +836,7 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            let m = Llama::load(&ws, cfg)?;
+            let m = Llama::load(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
         }
     }
@@ -846,6 +848,7 @@ fn load_model_with_providers(
     device: Device,
     _path: &str,
 ) -> Result<Box<dyn CausalLm>> {
+    eprintln!("[alias] load_model_with_providers called, arch={:?}", provider.architecture());
     // Extract architecture from GGUF metadata
     let arch_str = provider.architecture().ok_or_else(|| {
         Error::Config(format!(
@@ -862,7 +865,20 @@ fn load_model_with_providers(
         model_arch, hparams.num_layers, hparams.hidden_size, hparams.vocab_size
     );
 
-    let ws = WeightSource::root(weight_provider, device.clone());
+    let hf_gguf_map = TensorNamingRegistry::remap_hf_to_gguf(model_arch, hparams.num_layers);
+    eprintln!("[alias] remap map has {} entries, sample: {:?}", hf_gguf_map.len(), hf_gguf_map.get("tok_embeddings.weight"));
+    let remapped_provider = RemappingTensorProvider::new(weight_provider, {
+        let hf_gguf_map = hf_gguf_map.clone();
+        move |name| {
+            if let Some(mapped) = hf_gguf_map.get(name) {
+                eprintln!("[alias] {} -> {}", name, mapped);
+                mapped.clone()
+            } else {
+                name.to_string()
+            }
+        }
+    });
+    let ws = WeightSource::root(&remapped_provider, device.clone());
 
     match model_arch {
         ModelArchitecture::Falcon => {
@@ -889,7 +905,7 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Llama::load(&ws, llama_cfg)?;
+            let m = Llama::load(device.clone(), &ws, llama_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Bloom => {
@@ -940,7 +956,7 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Llama::load(&ws, llama_cfg)?;
+            let m = Llama::load(device.clone(), &ws, llama_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen | ModelArchitecture::Qwen2 | ModelArchitecture::Qwen3 | ModelArchitecture::Qwen35 => {
@@ -969,7 +985,7 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Llama::load(&ws, llama_cfg)?;
+            let m = Llama::load(device.clone(), &ws, llama_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen2Moe | ModelArchitecture::Qwen3Moe | ModelArchitecture::Qwen35Moe | ModelArchitecture::Qwen3VlMoe => {
@@ -1052,7 +1068,7 @@ fn load_model_with_providers(
                 conv_kernel: hparams.ssm_d_conv.unwrap_or(4),
                 rms_norm_eps: hparams.rms_norm_eps,
             };
-            let m = Mamba::load(&ws, mamba_cfg)?;
+            let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Jamba => {
@@ -1080,7 +1096,7 @@ fn load_model_with_providers(
                 conv_kernel: hparams.ssm_d_conv.unwrap_or(4),
                 rms_norm_eps: hparams.rms_norm_eps,
             };
-            let m = Mamba::load(&ws, mamba_cfg)?;
+            let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::NemotronH => {
@@ -1105,7 +1121,7 @@ fn load_model_with_providers(
                 conv_kernel: hparams.ssm_d_conv.unwrap_or(4),
                 rms_norm_eps: hparams.rms_norm_eps,
             };
-            let m = Mamba::load(&ws, mamba_cfg)?;
+            let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::GraniteHybrid => {
@@ -1130,7 +1146,7 @@ fn load_model_with_providers(
                 conv_kernel: hparams.ssm_d_conv.unwrap_or(4),
                 rms_norm_eps: hparams.rms_norm_eps,
             };
-            let m = Mamba::load(&ws, mamba_cfg)?;
+            let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::ModernBert => {
@@ -1152,7 +1168,7 @@ fn load_model_with_providers(
                 intermediate_size: hparams.intermediate_size,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Bert::load(&ws, bert_cfg)?;
+            let m = Bert::load(device.clone(), &ws, bert_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::NomicBert | ModelArchitecture::NomicBertMoe | ModelArchitecture::NeoBert | ModelArchitecture::JinaBertV2 | ModelArchitecture::JinaBertV3 => {
@@ -1174,7 +1190,7 @@ fn load_model_with_providers(
                 intermediate_size: hparams.intermediate_size,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Bert::load(&ws, bert_cfg)?;
+            let m = Bert::load(device.clone(), &ws, bert_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::T5Encoder => {
@@ -1213,7 +1229,7 @@ fn load_model_with_providers(
                 hidden_size: hparams.hidden_size,
                 num_layers: hparams.num_layers,
             };
-            let m = Rwkv::load(&ws, rwkv_cfg)?;
+            let m = Rwkv::load(&ws, rwkv_cfg, device.clone())?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Rwkv7 | ModelArchitecture::ARwkv7 => {
@@ -1230,7 +1246,7 @@ fn load_model_with_providers(
                 hidden_size: hparams.hidden_size,
                 num_layers: hparams.num_layers,
             };
-            let m = Rwkv::load(&ws, rwkv_cfg)?;
+            let m = Rwkv::load(&ws, rwkv_cfg, device.clone())?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Lfm2 | ModelArchitecture::Lfm2Moe => {
@@ -1304,7 +1320,7 @@ fn load_model_with_providers(
                 conv_kernel: d_conv,
                 rms_norm_eps: hparams.rms_norm_eps,
             };
-            let m = Mamba::load(&ws, cfg)?;
+            let m = Mamba::load(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Gpt2 => {
@@ -1357,7 +1373,7 @@ fn load_model_with_providers(
                 intermediate_size: hparams.intermediate_size,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Bert::load(&ws, cfg)?;
+            let m = Bert::load(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::T5 => {
@@ -1415,7 +1431,7 @@ fn load_model_with_providers(
                         conv_kernel: hparams.ssm_d_conv.unwrap_or(4),
                         rms_norm_eps: hparams.rms_norm_eps,
                     };
-                    let m = Mamba::load(&ws, mamba_cfg)?;
+                    let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
                     return Ok(Box::new(m));
                 } else {
                     let llama_cfg = LlamaConfig {
@@ -1430,7 +1446,7 @@ fn load_model_with_providers(
                         rope_theta: hparams.rope_theta,
                         max_seq_len: hparams.max_seq_len,
                     };
-                    let m = Llama::load(&ws, llama_cfg)?;
+                    let m = Llama::load(device.clone(), &ws, llama_cfg)?;
                     return Ok(Box::new(m));
                 }
             }
@@ -1448,7 +1464,7 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Llama::load(&ws, cfg)?;
+            let m = Llama::load(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
         }
     }

@@ -50,6 +50,9 @@ impl Model for LlamaMtp {
     fn param_arith(&self) -> ArithType {
         self.base.param_arith()
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl CausalLm for LlamaMtp {
@@ -134,7 +137,7 @@ mod tests {
             rope_theta: 10000.0,
             max_seq_len: 32,
         };
-        let base = Llama::random(base_cfg);
+        let base = Llama::random(Device::Cpu, base_cfg);
         let mtp = LlamaMtp::new_random(base, 2);
         
         assert_eq!(mtp.depth, 2);

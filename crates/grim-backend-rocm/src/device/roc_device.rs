@@ -77,6 +77,7 @@ use crate::{
     // HIP types / constants
     HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS,
     HIP_DEVICE_ATTRIBUTE_WARP_SIZE, HipDim3, HipErrorT, HipMemcpyKind,
+    hipMemGetInfo,
     hipSuccess, RocmHandle, WavefrontSize,
     // rocBLAS FFI
     arith_to_compute_dtype, arith_to_rocblas_dtype, rocblas_create_handle,
@@ -260,6 +261,25 @@ impl RocmDevice {
         Self::build(ordinal, 64, 0, None, Vec::new())
     }
 
+    /// Probe the total amount of device memory reported by the driver, in bytes.
+    ///
+    /// Uses [`hipMemGetInfo`] directly rather than parsing `hipDeviceProp_t`,
+    /// so the result is unambiguous — it reads the `total` output parameter
+    /// that the HIP runtime populates from the driver's own VRAM accounting.
+    /// Falls back to 4 GiB on failure so the rest of the init sequence is
+    /// unaffected.
+    fn query_device_vram_bytes(_ordinal: usize) -> usize {
+        unsafe {
+            let mut free_mem: usize = 0;
+            let mut total_mem: usize = 0;
+            let status = hipMemGetInfo(&mut free_mem, &mut total_mem);
+            if status == hipSuccess && total_mem > 0 {
+                return total_mem;
+            }
+        }
+        4usize * 1024 * 1024 * 1024 // probing failed: assume 4 GiB
+    }
+
     /// Shared tail of `try_new` / `fallback`: assemble the struct from
     /// already-probed fields. Pure construction, no FFI calls.
     fn build(
@@ -276,11 +296,22 @@ impl RocmDevice {
         };
         let xnack_enabled = xnack_val == 1;
 
-        // Caching allocator soft cap. Default 2 GiB; overridable for testing/large models.
-        let cap_bytes = std::env::var("GRIM_ALLOC_POOL_CAP_BYTES")
+        // Phase-aware cache cap: when the env override is absent, derive a
+        // sensible default from actual VRAM rather than a fixed 2 GiB (which
+        // OOMs a 4 GB card). Reserve 15 % of total VRAM for the allocator's
+        // free-list; the remaining 85 % is needed for the model weights,
+        // activations, and scratch. Clamped to [128 MiB, 512 MiB] so that
+        // very large cards (≥ 32 GB) don't hoard gigabytes of dead buffers
+        // and tiny cards (≤ 1 GiB) can't starve the model.
+        let cap_bytes: usize = std::env::var("GRIM_ALLOC_POOL_CAP_BYTES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2 * 1024 * 1024 * 1024);
+            .unwrap_or_else(|| {
+                let total_vram = Self::query_device_vram_bytes(ordinal);
+                let derived = total_vram / 6; // ≈ 16.7 % of VRAM
+                derived
+            })
+            .clamp(128 * 1024 * 1024, 512 * 1024 * 1024);
 
         Self {
             ordinal,
@@ -1675,6 +1706,7 @@ impl BackendDevice for RocmDevice {
         }
         let total = out.elem_count();
         let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
+
         let mut out_ptr = dev_ptr(&storage)?;
         let mut a_ptr = dev_ptr(a_s)?;
         let mut b_ptr = dev_ptr(b_s)?;
@@ -1900,7 +1932,10 @@ impl BackendDevice for RocmDevice {
         indices: &[u32],
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let w_s = as_rocm(weight)?;
+        let w_s = match as_rocm(weight) {
+            Ok(s) => s,
+            Err(_) => return Err(Error::Backend("embedding: weight is not RocmStorage".into())),
+        };
         if !w_s.device_ptr_is_valid() {
             return Err(Error::Backend("embedding: weight lacks a valid device pointer".into()));
         }
@@ -1917,6 +1952,9 @@ impl BackendDevice for RocmDevice {
                 n
             )));
         }
+
+        // materialize() already dequantizes Q8_0 to F32 before returning
+        // the tensor, so the embedding kernel can trust the weight is F32.
         let total = out.elem_count();
         let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
@@ -2075,8 +2113,69 @@ impl BackendDevice for RocmDevice {
             DTypeStorage::KQuant(KQuantScheme::Q4K) => {
                 self.launch_fused_dequant_gemm_q4k(a_storage, b_storage, &out_storage, m, n, k)?;
             }
+            DTypeStorage::KQuant(KQuantScheme::Q5K) => {
+                self.launch_fused_dequant_gemm_q5k(a_storage, b_storage, &out_storage, m, n, k)?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::Q6K) => {
+                self.launch_fused_dequant_gemm_q6k(a_storage, b_storage, &out_storage, m, n, k)?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::Q2K) => {
+                self.launch_fused_dequant_gemm_q2k(a_storage, b_storage, &out_storage, m, n, k)?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::Q3K) => {
+                self.launch_fused_dequant_gemm_q3k(a_storage, b_storage, &out_storage, m, n, k)?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ2XXS) => {
+                self.launch_fused_dequant_gemm_iq2xxs(a_storage, b_storage, &out_storage, m, n, k)?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ2XS) => {
+                self.launch_fused_dequant_gemm_iq2xs(a_storage, b_storage, &out_storage, m, n, k)?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ2S) => {
+                self.launch_fused_dequant_gemm_iq2s(a_storage, b_storage, &out_storage, m, n, k)?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ3XXS) => {
+                self.launch_fused_dequant_gemm_iq3xxs(a_storage, b_storage, &out_storage, m, n, k)?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ3S) => {
+                self.launch_fused_dequant_gemm_iq3s(a_storage, b_storage, &out_storage, m, n, k)?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ4NL) => {
+                self.launch_fused_dequant_gemm_iq4nl(a_storage, b_storage, &out_storage, m, n, k)?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ4XS) => {
+                self.launch_fused_dequant_gemm_iq4xs(a_storage, b_storage, &out_storage, m, n, k)?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::Q80) => {
+                // Q8_0 is a simple per-block dequant (34 bytes → 32 F32 values).
+                // Allocate a temporary F32 B matrix, launch the on-device
+                // dequant kernel, then run rocBLAS GEMM on real F32 data.
+                // The recursive `matmul` call is safe because `b_f32_ref` is
+                // F32 — it won't hit this Q8_0 branch again.
+                let b_n_weights = b_storage.shape().elem_count();
+                let b_dims_local = b_storage.shape().dims();
+                let (k_local, n_local) = (b_dims_local[0], b_dims_local[1]);
+                let b_f32_storage = RocmStorage::alloc_gpu(
+                    &Shape::new(vec![n_local, k_local]),
+                    DType {
+                        arith: ArithType::F32,
+                        storage: DTypeStorage::Native,
+                    },
+                    &self.allocator,
+                    self.ordinal,
+                )?;
+                let n_blocks = (b_n_weights + 31) / 32;
+                self.launch_dequant_q8_0(b_storage, &b_f32_storage, n_blocks * 32)?;
+                let b_f32_ref: &dyn BackendStorage = &b_f32_storage;
+                return self.matmul(a, b_f32_ref, out_shape);
+            }
             DTypeStorage::Block(BlockDtype::Fp8) | DTypeStorage::FloatPack(FloatPackScheme::Fp8) => {
-                self.launch_fused_dequant_gemm_fp8(a_storage, b_storage, &out_storage, m, n, k)?;
+                // gfx1200+ uses MFMA for FP8 throughput; other architectures use scalar.
+                if self.gpu_target.starts_with("gfx12") {
+                    self.launch_fused_dequant_gemm_fp8_mfma(a_storage, b_storage, &out_storage, m, n, k)?;
+                } else {
+                    self.launch_fused_dequant_gemm_fp8(a_storage, b_storage, &out_storage, m, n, k)?;
+                }
             }
             DTypeStorage::FloatPack(FloatPackScheme::MxFp4) => {
                 let dummy_exps = RocmStorage::alloc_gpu(
@@ -2219,23 +2318,79 @@ impl BackendDevice for RocmDevice {
         match b_storage.dtype().storage {
             DTypeStorage::KQuant(KQuantScheme::Q4K) => {
                 self.launch_fused_dequant_backward_gemm_q4k(
-                    dy_storage,
-                    b_storage,
-                    &dx_storage,
-                    m,
-                    n,
-                    k,
+                    dy_storage, b_storage, &dx_storage, m, n, k,
+                )?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::Q80) => {
+                self.launch_fused_dequant_backward_gemm_q8_0(
+                    dy_storage, b_storage, &dx_storage, m, n, k,
+                )?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::Q5K) => {
+                self.launch_fused_dequant_backward_gemm_q5k(
+                    dy_storage, b_storage, &dx_storage, m, n, k,
+                )?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::Q6K) => {
+                self.launch_fused_dequant_backward_gemm_q6k(
+                    dy_storage, b_storage, &dx_storage, m, n, k,
+                )?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::Q2K) => {
+                self.launch_fused_dequant_backward_gemm_q2k(
+                    dy_storage, b_storage, &dx_storage, m, n, k,
+                )?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::Q3K) => {
+                self.launch_fused_dequant_backward_gemm_q3k(
+                    dy_storage, b_storage, &dx_storage, m, n, k,
+                )?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ2XXS) => {
+                self.launch_fused_dequant_backward_gemm_iq2xxs(
+                    dy_storage, b_storage, &dx_storage, m, n, k,
+                )?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ2XS) => {
+                self.launch_fused_dequant_backward_gemm_iq2xs(
+                    dy_storage, b_storage, &dx_storage, m, n, k,
+                )?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ2S) => {
+                self.launch_fused_dequant_backward_gemm_iq2s(
+                    dy_storage, b_storage, &dx_storage, m, n, k,
+                )?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ3XXS) => {
+                self.launch_fused_dequant_backward_gemm_iq3xxs(
+                    dy_storage, b_storage, &dx_storage, m, n, k,
+                )?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ3S) => {
+                self.launch_fused_dequant_backward_gemm_iq3s(
+                    dy_storage, b_storage, &dx_storage, m, n, k,
+                )?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ4NL) => {
+                self.launch_fused_dequant_backward_gemm_iq4nl(
+                    dy_storage, b_storage, &dx_storage, m, n, k,
+                )?;
+            }
+            DTypeStorage::KQuant(KQuantScheme::IQ4XS) => {
+                self.launch_fused_dequant_backward_gemm_iq4xs(
+                    dy_storage, b_storage, &dx_storage, m, n, k,
                 )?;
             }
             DTypeStorage::Block(BlockDtype::Fp8) | DTypeStorage::FloatPack(FloatPackScheme::Fp8) => {
-                self.launch_fused_dequant_backward_gemm_fp8(
-                    dy_storage,
-                    b_storage,
-                    &dx_storage,
-                    m,
-                    n,
-                    k,
-                )?;
+                if self.gpu_target.starts_with("gfx12") {
+                    self.launch_fused_dequant_backward_gemm_fp8_mfma(
+                        dy_storage, b_storage, &dx_storage, m, n, k,
+                    )?;
+                } else {
+                    self.launch_fused_dequant_backward_gemm_fp8(
+                        dy_storage, b_storage, &dx_storage, m, n, k,
+                    )?;
+                }
             }
             _ => {
                 self.launch_fused_dequant_backward_gemm_f16(
@@ -2866,6 +3021,477 @@ impl RocmDevice {
                 arg(&mut mm),
                 arg(&mut nn),
                 arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Generic forward fused dequant GEMM launcher for simple kernels
+    /// (one kernel arg = block index, one thread = one output element).
+    fn launch_fused_deq_gemm_simple(
+        &self,
+        name: &str,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage.device_ptr.ok_or_else(|| Error::Backend(format!("{}: a has no device ptr", name)))?;
+        let b_ptr = b_storage.device_ptr.ok_or_else(|| Error::Backend(format!("{}: b has no device ptr", name)))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend(format!("{}: out has no device ptr", name)))?;
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (m as u64).checked_mul(n as u64).ok_or_else(|| Error::Backend(format!("{}: m*n overflow", name)))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into().map_err(|_| Error::Backend(format!("{}: grid overflow", name)))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(name, grid_dim, block_dim,
+            &mut [arg(&mut aptr), arg(&mut bptr), arg(&mut optr), arg(&mut mm), arg(&mut nn), arg(&mut kk)])
+    }
+
+    /// Generic backward fused dequant GEMM launcher.
+    fn launch_fused_deq_backward_gemm_simple(
+        &self,
+        name: &str,
+        dy_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        dx_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let dy_ptr = dy_storage.device_ptr.ok_or_else(|| Error::Backend(format!("{}: dY has no device ptr", name)))?;
+        let b_ptr  = b_storage.device_ptr.ok_or_else(|| Error::Backend(format!("{}: B has no device ptr", name)))?;
+        let dx_ptr = dx_storage.device_ptr.ok_or_else(|| Error::Backend(format!("{}: dX has no device ptr", name)))?;
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (m as u64).checked_mul(k as u64).ok_or_else(|| Error::Backend(format!("{}: m*k overflow", name)))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into().map_err(|_| Error::Backend(format!("{}: grid overflow", name)))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+        let mut dyptr = dy_ptr;
+        let mut bptr  = b_ptr;
+        let mut dxptr = dx_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        self.launch_compute_kernel(name, grid_dim, block_dim,
+            &mut [arg(&mut dyptr), arg(&mut bptr), arg(&mut dxptr), arg(&mut mm), arg(&mut nn), arg(&mut kk)])
+    }
+
+    // ─── Standalone dequant launchers ──────────────────────────────────────────
+
+    /// Dequantize Q4_K packed bytes to F32. `n_blocks` is derived
+    /// from `packed.bytes / 144` (each block is 144 bytes for 256 weights).
+    pub(crate) fn launch_dequant_q4k(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+    ) -> Result<*mut c_void> {
+        let packed_ptr = packed_storage.device_ptr.ok_or_else(|| Error::Backend("dequant_q4k: packed has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("dequant_q4k: out has no device ptr".into()))?;
+        const BLOCK_SIZE: usize = 256;
+        let grid_x: u32 = ((n_blocks as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into().map_err(|_| Error::Backend("dequant_q4k: grid overflow".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+        let mut packed = packed_ptr;
+        let mut out = out_ptr;
+        let mut n_blk = n_blocks as i32;
+        self.launch_compute_kernel("grim_dequant_q4k", grid_dim, block_dim,
+            &mut [arg(&mut packed), arg(&mut out), arg(&mut n_blk)])
+    }
+
+    /// Standalone FP8 dequant: convert FP8 E4M3 bytes to F32.
+    pub(crate) fn launch_dequant_fp8(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_weights: usize,
+    ) -> Result<*mut c_void> {
+        let packed_ptr = packed_storage.device_ptr.ok_or_else(|| Error::Backend("dequant_fp8: packed has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("dequant_fp8: out has no device ptr".into()))?;
+        const BLOCK_SIZE: usize = 256;
+        let grid_x: u32 = ((n_weights as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into().map_err(|_| Error::Backend("dequant_fp8: grid overflow".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+        let mut packed = packed_ptr;
+        let mut out = out_ptr;
+        let mut n_w = n_weights as i32;
+        self.launch_compute_kernel("grim_dequant_fp8", grid_dim, block_dim,
+            &mut [arg(&mut packed), arg(&mut out), arg(&mut n_w)])
+    }
+
+    /// Standalone MXFP4 dequant: decompress MXFP4 codes + shared exponents to F32.
+    pub(crate) fn launch_dequant_mxfp4(
+        &self,
+        codes_storage: &RocmStorage,
+        exps_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_weights: usize,
+    ) -> Result<*mut c_void> {
+        let codes_ptr = codes_storage.device_ptr.ok_or_else(|| Error::Backend("dequant_mxfp4: codes has no device ptr".into()))?;
+        let exps_ptr = exps_storage.device_ptr.ok_or_else(|| Error::Backend("dequant_mxfp4: exps has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("dequant_mxfp4: out has no device ptr".into()))?;
+        const BLOCK_SIZE: usize = 256;
+        let grid_x: u32 = ((n_weights as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into().map_err(|_| Error::Backend("dequant_mxfp4: grid overflow".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+        let mut codes = codes_ptr;
+        let mut exps = exps_ptr;
+        let mut out = out_ptr;
+        let mut n_w = n_weights as i32;
+        self.launch_compute_kernel("grim_dequant_mxfp4", grid_dim, block_dim,
+            &mut [arg(&mut codes), arg(&mut exps), arg(&mut out), arg(&mut n_w)])
+    }
+
+    /// Standalone MXFP8 dequant: decompress MXFP8 codes + shared exponents to F32.
+    pub(crate) fn launch_dequant_mxfp8(
+        &self,
+        codes_storage: &RocmStorage,
+        exps_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_weights: usize,
+    ) -> Result<*mut c_void> {
+        let codes_ptr = codes_storage.device_ptr.ok_or_else(|| Error::Backend("dequant_mxfp8: codes has no device ptr".into()))?;
+        let exps_ptr = exps_storage.device_ptr.ok_or_else(|| Error::Backend("dequant_mxfp8: exps has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("dequant_mxfp8: out has no device ptr".into()))?;
+        const BLOCK_SIZE: usize = 256;
+        let grid_x: u32 = ((n_weights as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into().map_err(|_| Error::Backend("dequant_mxfp8: grid overflow".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+        let mut codes = codes_ptr;
+        let mut exps = exps_ptr;
+        let mut out = out_ptr;
+        let mut n_w = n_weights as i32;
+        self.launch_compute_kernel("grim_dequant_mxfp8", grid_dim, block_dim,
+            &mut [arg(&mut codes), arg(&mut exps), arg(&mut out), arg(&mut n_w)])
+    }
+
+    // ─── Standalone IQ dequant launchers ──────────────────────────
+
+    pub(crate) fn launch_dequant_iq2xxs(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_generic_dequant("grim_dequant_iq2xxs", packed_storage, out_storage, n_blocks)
+    }
+    pub(crate) fn launch_dequant_iq2xs(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_generic_dequant("grim_dequant_iq2xs", packed_storage, out_storage, n_blocks)
+    }
+    pub(crate) fn launch_dequant_iq2s(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_generic_dequant("grim_dequant_iq2s", packed_storage, out_storage, n_blocks)
+    }
+    pub(crate) fn launch_dequant_iq3xxs(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_generic_dequant("grim_dequant_iq3xxs", packed_storage, out_storage, n_blocks)
+    }
+    pub(crate) fn launch_dequant_iq3s(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_generic_dequant("grim_dequant_iq3s", packed_storage, out_storage, n_blocks)
+    }
+    pub(crate) fn launch_dequant_iq4nl(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_generic_dequant("grim_dequant_iq4nl", packed_storage, out_storage, n_blocks)
+    }
+    pub(crate) fn launch_dequant_iq4xs(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_generic_dequant("grim_dequant_iq4xs", packed_storage, out_storage, n_blocks)
+    }
+
+    /// Generic helper for standalone dequant kernels that take (packed, out, n_blocks).
+    fn launch_generic_dequant(
+        &self,
+        name: &str,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+    ) -> Result<*mut c_void> {
+        let packed_ptr = packed_storage.device_ptr.ok_or_else(|| Error::Backend(format!("{}: packed has no device ptr", name)))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend(format!("{}: out has no device ptr", name)))?;
+        const BLOCK_SIZE: usize = 256;
+        let grid_x: u32 = ((n_blocks as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into().map_err(|_| Error::Backend(format!("{}: grid overflow", name)))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+        let mut packed = packed_ptr;
+        let mut out = out_ptr;
+        let mut n_blk = n_blocks as i32;
+        self.launch_compute_kernel(name, grid_dim, block_dim,
+            &mut [arg(&mut packed), arg(&mut out), arg(&mut n_blk)])
+    }
+
+    // ─── Fused dequant+GEMM kernels: Q5K ──────────────────────────────────────
+
+    pub(crate) fn launch_fused_dequant_gemm_q5k(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q5k", a, b, out, m, n, k)
+    }
+    pub(crate) fn launch_fused_dequant_backward_gemm_q5k(
+        &self, dy: &RocmStorage, b: &RocmStorage, dx: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_backward_gemm_simple("grim_fused_dequant_backward_gemm_q5k", dy, b, dx, m, n, k)
+    }
+
+    // ─── Fused dequant+GEMM kernels: Q6K ──────────────────────────────────────
+
+    pub(crate) fn launch_fused_dequant_gemm_q6k(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q6k", a, b, out, m, n, k)
+    }
+    pub(crate) fn launch_fused_dequant_backward_gemm_q6k(
+        &self, dy: &RocmStorage, b: &RocmStorage, dx: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_backward_gemm_simple("grim_fused_dequant_backward_gemm_q6k", dy, b, dx, m, n, k)
+    }
+
+    // ─── Fused dequant+GEMM kernels: Q2K ──────────────────────────────────────
+
+    pub(crate) fn launch_fused_dequant_gemm_q2k(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q2k", a, b, out, m, n, k)
+    }
+    pub(crate) fn launch_fused_dequant_backward_gemm_q2k(
+        &self, dy: &RocmStorage, b: &RocmStorage, dx: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_backward_gemm_simple("grim_fused_dequant_backward_gemm_q2k", dy, b, dx, m, n, k)
+    }
+
+    // ─── Fused dequant+GEMM kernels: Q3K ──────────────────────────────────────
+
+    pub(crate) fn launch_fused_dequant_gemm_q3k(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q3k", a, b, out, m, n, k)
+    }
+    pub(crate) fn launch_fused_dequant_backward_gemm_q3k(
+        &self, dy: &RocmStorage, b: &RocmStorage, dx: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_backward_gemm_simple("grim_fused_dequant_backward_gemm_q3k", dy, b, dx, m, n, k)
+    }
+
+    // ─── Fused dequant+GEMM kernels: IQ2_XXS ──────────────────────────────────
+
+    pub(crate) fn launch_fused_dequant_gemm_iq2xxs(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq2xxs", a, b, out, m, n, k)
+    }
+    pub(crate) fn launch_fused_dequant_backward_gemm_iq2xxs(
+        &self, dy: &RocmStorage, b: &RocmStorage, dx: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_backward_gemm_simple("grim_fused_dequant_backward_gemm_iq2xxs", dy, b, dx, m, n, k)
+    }
+
+    // ─── Fused dequant+GEMM kernels: IQ2_XS ───────────────────────────────────
+
+    pub(crate) fn launch_fused_dequant_gemm_iq2xs(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq2xs", a, b, out, m, n, k)
+    }
+    pub(crate) fn launch_fused_dequant_backward_gemm_iq2xs(
+        &self, dy: &RocmStorage, b: &RocmStorage, dx: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_backward_gemm_simple("grim_fused_dequant_backward_gemm_iq2xs", dy, b, dx, m, n, k)
+    }
+
+    // ─── Fused dequant+GEMM kernels: IQ2_S ────────────────────────────────────
+
+    pub(crate) fn launch_fused_dequant_gemm_iq2s(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq2s", a, b, out, m, n, k)
+    }
+    pub(crate) fn launch_fused_dequant_backward_gemm_iq2s(
+        &self, dy: &RocmStorage, b: &RocmStorage, dx: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_backward_gemm_simple("grim_fused_dequant_backward_gemm_iq2s", dy, b, dx, m, n, k)
+    }
+
+    // ─── Fused dequant+GEMM kernels: IQ3_XXS ──────────────────────────────────
+
+    pub(crate) fn launch_fused_dequant_gemm_iq3xxs(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq3xxs", a, b, out, m, n, k)
+    }
+    pub(crate) fn launch_fused_dequant_backward_gemm_iq3xxs(
+        &self, dy: &RocmStorage, b: &RocmStorage, dx: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_backward_gemm_simple("grim_fused_dequant_backward_gemm_iq3xxs", dy, b, dx, m, n, k)
+    }
+
+    // ─── Fused dequant+GEMM kernels: IQ3_S ────────────────────────────────────
+
+    pub(crate) fn launch_fused_dequant_gemm_iq3s(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq3s", a, b, out, m, n, k)
+    }
+    pub(crate) fn launch_fused_dequant_backward_gemm_iq3s(
+        &self, dy: &RocmStorage, b: &RocmStorage, dx: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_backward_gemm_simple("grim_fused_dequant_backward_gemm_iq3s", dy, b, dx, m, n, k)
+    }
+
+    // ─── Fused dequant+GEMM kernels: IQ4_NL ──────────────────────────────────
+
+    pub(crate) fn launch_fused_dequant_gemm_iq4nl(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq4nl", a, b, out, m, n, k)
+    }
+    pub(crate) fn launch_fused_dequant_backward_gemm_iq4nl(
+        &self, dy: &RocmStorage, b: &RocmStorage, dx: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_backward_gemm_simple("grim_fused_dequant_backward_gemm_iq4nl", dy, b, dx, m, n, k)
+    }
+
+    // ─── Fused dequant+GEMM kernels: IQ4_XS ──────────────────────────────────
+
+    pub(crate) fn launch_fused_dequant_gemm_iq4xs(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_iq4xs", a, b, out, m, n, k)
+    }
+    pub(crate) fn launch_fused_dequant_backward_gemm_iq4xs(
+        &self, dy: &RocmStorage, b: &RocmStorage, dx: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_backward_gemm_simple("grim_fused_dequant_backward_gemm_iq4xs", dy, b, dx, m, n, k)
+    }
+
+    // ─── Fused dequant+GEMM kernels: Q8_0 ────────────────────────────────────
+
+    pub(crate) fn launch_fused_dequant_gemm_q8_0(
+        &self, a: &RocmStorage, b: &RocmStorage, out: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_gemm_simple("grim_fused_dequant_gemm_q8_0", a, b, out, m, n, k)
+    }
+    pub(crate) fn launch_fused_dequant_backward_gemm_q8_0(
+        &self, dy: &RocmStorage, b: &RocmStorage, dx: &RocmStorage, m: usize, n: usize, k: usize,
+    ) -> Result<*mut c_void> {
+        self.launch_fused_deq_backward_gemm_simple("grim_fused_dequant_backward_gemm_q8_0", dy, b, dx, m, n, k)
+    }
+
+    /// Launch the JIT compiled Q8_0 dequantization kernel.  Reads packed
+    /// Q8_0 bytes (34 bytes per 32 weights: 2-byte f16 delta + 32× int8
+    /// codes) from `packed_storage` and writes `n_weights` F32 values to
+    /// `out_storage`.  The output must be pre-allocated with room for at
+    /// Convert a Q8_0 tensor from packed GPU storage to F32 GPU storage.
+    ///
+    /// This is the public entry point that `materialize()` and other
+    /// weight-loading sites call after `from_cpu_bytes` uploads raw Q8_0
+    /// bytes. The ROCm kernels only understand native F32, so any Q80
+    /// tensor must be dequantized before it is consumed.
+    /// Convert a Q8_0 tensor from packed GPU storage to F32 GPU storage.
+    ///
+    /// This takes a reference to `packed` so callers can dequantize while
+    /// holding the original storage in `materialize()`. When
+    /// `launch_dequant_q8_0` returns, the caller should drop the original
+    /// packed storage to reclaim VRAM — the returned `RocmStorage` is the
+    /// only tensor that should survive.
+    pub fn dequantize_q8_0(
+        &self,
+        packed: &RocmStorage,
+    ) -> Result<RocmStorage> {
+        const QK8_0: usize = 32;
+        // Q8_0 stores weights as packed bytes: each block is 34 bytes (2-byte
+        // f16 scale + 32 × int8 codes) for exactly 32 weights. Derive block
+        // count from the actual byte count to avoid over-reading the packed
+        // buffer. The dequanted output has `n_blocks * 32` F32 elements.
+        let packed_bytes = packed.bytes;
+        let n_blocks = packed_bytes / (QK8_0 + 2);
+        let n_weights = n_blocks * QK8_0;
+        let f32_storage = RocmStorage::alloc_gpu(
+            &Shape::new(vec![n_weights]),
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_dequant_q8_0(packed, &f32_storage, n_blocks)?;
+        Ok(f32_storage)
+    }
+
+    /// Dequantize Q8_0 packed bytes to F32. `n_blocks` is the number of
+    /// Q8_0 blocks (each 34 bytes) in `packed`, derived from `packed.bytes / 34`.
+    pub(crate) fn launch_dequant_q8_0(
+        &self,
+        packed_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        n_blocks: usize,
+    ) -> Result<*mut c_void> {
+        let packed_ptr = packed_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dequant_q8_0: packed has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("dequant_q8_0: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let grid_x: u32 = ((n_blocks as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into()
+            .map_err(|_| Error::Backend("dequant_q8_0: grid overflow".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut packed = packed_ptr;
+        let mut out = out_ptr;
+        let mut n_blk = n_blocks as i32;
+
+        self.launch_compute_kernel(
+            "grim_dequant_q8_0",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut packed),
+                arg(&mut out),
+                arg(&mut n_blk),
             ],
         )
     }
@@ -3644,6 +4270,533 @@ impl RocmDevice {
         )?;
 
         Ok((Box::new(storage), Box::new(RocmHandle::new(None))))
+    }
+
+    // ─── Phase 2 BackendDevice trait methods ──────────────────────
+
+    fn selective_scan(
+        &self,
+        x: &dyn BackendStorage,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        c: &dyn BackendStorage,
+        d: &dyn BackendStorage,
+        batch: usize,
+        dim_dstate: usize,
+        dim_dinner: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = as_rocm(x)?;
+        let a_s = as_rocm(a)?;
+        let b_s = as_rocm(b)?;
+        let c_s = as_rocm(c)?;
+        let d_s = as_rocm(d)?;
+        let out_storage = RocmStorage::alloc_gpu(
+            out_shape,
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_selective_scan(
+            x_s, a_s, b_s, c_s, d_s, &out_storage,
+            batch, dim_dstate, dim_dinner, seq_len,
+        )?;
+        Ok((Box::new(out_storage), Box::new(RocmHandle::new(None))))
+    }
+
+    fn flash_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        causal: bool,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_s = as_rocm(q)?;
+        let k_s = as_rocm(k)?;
+        let v_s = as_rocm(v)?;
+        let out_storage = RocmStorage::alloc_gpu(
+            out_shape,
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_flash_attention(
+            q_s, k_s, v_s, &out_storage,
+            num_heads, num_kv_heads, head_dim, seq_len, causal,
+        )?;
+        Ok((Box::new(out_storage), Box::new(RocmHandle::new(None))))
+    }
+
+    fn cross_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        kv_seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_s = as_rocm(q)?;
+        let k_s = as_rocm(k)?;
+        let v_s = as_rocm(v)?;
+        let out_storage = RocmStorage::alloc_gpu(
+            out_shape,
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_cross_attention(
+            q_s, k_s, v_s, &out_storage,
+            num_heads, head_dim, seq_len, kv_seq_len,
+        )?;
+        Ok((Box::new(out_storage), Box::new(RocmHandle::new(None))))
+    }
+
+    fn rwkv_time_mix(
+        &self,
+        x: &dyn BackendStorage,
+        w: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = as_rocm(x)?;
+        let w_s = as_rocm(w)?;
+        let k_s = as_rocm(k)?;
+        let v_s = as_rocm(v)?;
+        let g_s = as_rocm(g)?;
+        let out_storage = RocmStorage::alloc_gpu(
+            out_shape,
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_rwkv_time_mix(
+            x_s, w_s, k_s, v_s, g_s, &out_storage,
+            batch, dim, seq_len,
+        )?;
+        Ok((Box::new(out_storage), Box::new(RocmHandle::new(None))))
+    }
+
+    fn rwkv_channel_mix(
+        &self,
+        x: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        r: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = as_rocm(x)?;
+        let k_s = as_rocm(k)?;
+        let r_s = as_rocm(r)?;
+        let v_s = as_rocm(v)?;
+        let out_storage = RocmStorage::alloc_gpu(
+            out_shape,
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_rwkv_channel_mix(
+            x_s, k_s, r_s, v_s, &out_storage,
+            batch, dim,
+        )?;
+        Ok((Box::new(out_storage), Box::new(RocmHandle::new(None))))
+    }
+
+    // ─── Phase 2: Selective Scan ──────────────────────────────────
+
+    /// Launch the JIT compiled Mamba selective scan kernel (Wave64,
+    /// LDS tiling, persistent decode-step).
+    pub(crate) fn launch_selective_scan(
+        &self,
+        x_storage: &RocmStorage,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        c_storage: &RocmStorage,
+        d_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        batch: usize,
+        dim_dstate: usize,
+        dim_dinner: usize,
+        seq_len: usize,
+    ) -> Result<*mut c_void> {
+        let x_ptr = x_storage.device_ptr.ok_or_else(|| Error::Backend("selective_scan: x has no device ptr".into()))?;
+        let a_ptr = a_storage.device_ptr.ok_or_else(|| Error::Backend("selective_scan: a has no device ptr".into()))?;
+        let b_ptr = b_storage.device_ptr.ok_or_else(|| Error::Backend("selective_scan: b has no device ptr".into()))?;
+        let c_ptr = c_storage.device_ptr.ok_or_else(|| Error::Backend("selective_scan: c has no device ptr".into()))?;
+        let d_ptr = d_storage.device_ptr.ok_or_else(|| Error::Backend("selective_scan: d has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("selective_scan: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (batch as u64)
+            .checked_mul(dim_dinner as u64)
+            .ok_or_else(|| Error::Backend("selective_scan: batch*dim_dinner overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into().map_err(|_| Error::Backend("selective_scan: grid overflow".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut xptr = x_ptr;
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut cptr = c_ptr;
+        let mut dptr = d_ptr;
+        let mut optr = out_ptr;
+        let mut b_val = batch as i32;
+        let mut d_val = dim_dstate as i32;
+        let mut dd_val = dim_dinner as i32;
+        let mut s_val = seq_len as i32;
+
+        self.launch_compute_kernel(
+            "grim_selective_scan",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut xptr), arg(&mut aptr), arg(&mut bptr),
+                arg(&mut cptr), arg(&mut dptr), arg(&mut optr),
+                arg(&mut b_val), arg(&mut d_val), arg(&mut dd_val), arg(&mut s_val),
+            ],
+        )
+    }
+
+    // ─── Phase 2: FlashAttention ──────────────────────────────────
+
+    /// Launch the JIT compiled FlashAttention kernel (online softmax,
+    /// causal mask, GQA).
+    pub(crate) fn launch_flash_attention(
+        &self,
+        q_storage: &RocmStorage,
+        k_storage: &RocmStorage,
+        v_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        causal: bool,
+    ) -> Result<*mut c_void> {
+        let q_ptr = q_storage.device_ptr.ok_or_else(|| Error::Backend("flash_attention: q has no device ptr".into()))?;
+        let k_ptr = k_storage.device_ptr.ok_or_else(|| Error::Backend("flash_attention: k has no device ptr".into()))?;
+        let v_ptr = v_storage.device_ptr.ok_or_else(|| Error::Backend("flash_attention: v has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("flash_attention: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 128;
+        let grid_x: u32 = ((num_heads * seq_len + BLOCK_SIZE as usize - 1) / BLOCK_SIZE as usize)
+            .try_into().map_err(|_| Error::Backend("flash_attention: grid overflow".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut qptr = q_ptr;
+        let mut kptr = k_ptr;
+        let mut vptr = v_ptr;
+        let mut optr = out_ptr;
+        let mut nh = num_heads as i32;
+        let mut nkh = num_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sl = seq_len as i32;
+        let mut causal_val = if causal { 1 } else { 0 };
+
+        self.launch_compute_kernel(
+            "grim_flash_attention",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut qptr), arg(&mut kptr), arg(&mut vptr),
+                arg(&mut optr), arg(&mut nh), arg(&mut nkh),
+                arg(&mut hd), arg(&mut sl), arg(&mut causal_val),
+            ],
+        )
+    }
+
+    /// Launch the JIT compiled paged FlashAttention kernel (block-table
+    /// paged KV-cache for long-sequence attention).
+    pub(crate) fn launch_flash_attention_paged(
+        &self,
+        q_storage: &RocmStorage,
+        k_storage: &RocmStorage,
+        v_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        block_table_storage: &RocmStorage,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        num_blocks: usize,
+        causal: bool,
+    ) -> Result<*mut c_void> {
+        let q_ptr = q_storage.device_ptr.ok_or_else(|| Error::Backend("flash_attn_paged: q has no device ptr".into()))?;
+        let k_ptr = k_storage.device_ptr.ok_or_else(|| Error::Backend("flash_attn_paged: k has no device ptr".into()))?;
+        let v_ptr = v_storage.device_ptr.ok_or_else(|| Error::Backend("flash_attn_paged: v has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("flash_attn_paged: out has no device ptr".into()))?;
+        let bt_ptr = block_table_storage.device_ptr.ok_or_else(|| Error::Backend("flash_attn_paged: block_table has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 128;
+        let grid_x: u32 = ((num_heads * seq_len + BLOCK_SIZE as usize - 1) / BLOCK_SIZE as usize)
+            .try_into().map_err(|_| Error::Backend("flash_attn_paged: grid overflow".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut qptr = q_ptr;
+        let mut kptr = k_ptr;
+        let mut vptr = v_ptr;
+        let mut optr = out_ptr;
+        let mut btptr = bt_ptr;
+        let mut nh = num_heads as i32;
+        let mut nkh = num_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sl = seq_len as i32;
+        let mut nb = num_blocks as i32;
+        let mut causal_val = if causal { 1 } else { 0 };
+
+        self.launch_compute_kernel(
+            "grim_flash_attention_paged",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut qptr), arg(&mut kptr), arg(&mut vptr),
+                arg(&mut optr), arg(&mut btptr),
+                arg(&mut nh), arg(&mut nkh), arg(&mut hd),
+                arg(&mut sl), arg(&mut nb), arg(&mut causal_val),
+            ],
+        )
+    }
+
+    // ─── Phase 2: Cross-Attention ─────────────────────────────────
+
+    /// Launch the JIT compiled Whisper cross-attention kernel
+    /// (encoder-out projected once, reused across decoder steps).
+    pub(crate) fn launch_cross_attention(
+        &self,
+        q_storage: &RocmStorage,
+        k_storage: &RocmStorage,
+        v_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        num_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        kv_seq_len: usize,
+    ) -> Result<*mut c_void> {
+        let q_ptr = q_storage.device_ptr.ok_or_else(|| Error::Backend("cross_attention: q has no device ptr".into()))?;
+        let k_ptr = k_storage.device_ptr.ok_or_else(|| Error::Backend("cross_attention: k has no device ptr".into()))?;
+        let v_ptr = v_storage.device_ptr.ok_or_else(|| Error::Backend("cross_attention: v has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("cross_attention: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 128;
+        let grid_x: u32 = ((num_heads * seq_len + BLOCK_SIZE as usize - 1) / BLOCK_SIZE as usize)
+            .try_into().map_err(|_| Error::Backend("cross_attention: grid overflow".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut qptr = q_ptr;
+        let mut kptr = k_ptr;
+        let mut vptr = v_ptr;
+        let mut optr = out_ptr;
+        let mut nh = num_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sl = seq_len as i32;
+        let mut ksl = kv_seq_len as i32;
+
+        self.launch_compute_kernel(
+            "grim_cross_attention",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut qptr), arg(&mut kptr), arg(&mut vptr),
+                arg(&mut optr), arg(&mut nh), arg(&mut hd),
+                arg(&mut sl), arg(&mut ksl),
+            ],
+        )
+    }
+
+    // ─── Phase 2: RWKV Time-Mix ───────────────────────────────────
+
+    /// Launch the JIT compiled RWKV time-mix kernel (recurrent
+    /// linear attention with decay vector w, sigmoid gating).
+    pub(crate) fn launch_rwkv_time_mix(
+        &self,
+        x_storage: &RocmStorage,
+        w_storage: &RocmStorage,
+        k_storage: &RocmStorage,
+        v_storage: &RocmStorage,
+        g_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        batch: usize,
+        dim: usize,
+        seq_len: usize,
+    ) -> Result<*mut c_void> {
+        let x_ptr = x_storage.device_ptr.ok_or_else(|| Error::Backend("rwkv_time_mix: x has no device ptr".into()))?;
+        let w_ptr = w_storage.device_ptr.ok_or_else(|| Error::Backend("rwkv_time_mix: w has no device ptr".into()))?;
+        let k_ptr = k_storage.device_ptr.ok_or_else(|| Error::Backend("rwkv_time_mix: k has no device ptr".into()))?;
+        let v_ptr = v_storage.device_ptr.ok_or_else(|| Error::Backend("rwkv_time_mix: v has no device ptr".into()))?;
+        let g_ptr = g_storage.device_ptr.ok_or_else(|| Error::Backend("rwkv_time_mix: g has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("rwkv_time_mix: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (batch as u64)
+            .checked_mul(dim as u64)
+            .ok_or_else(|| Error::Backend("rwkv_time_mix: batch*dim overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into().map_err(|_| Error::Backend("rwkv_time_mix: grid overflow".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut xptr = x_ptr;
+        let mut wptr = w_ptr;
+        let mut kptr = k_ptr;
+        let mut vptr = v_ptr;
+        let mut gptr = g_ptr;
+        let mut optr = out_ptr;
+        let mut b_val = batch as i32;
+        let mut d_val = dim as i32;
+        let mut s_val = seq_len as i32;
+
+        self.launch_compute_kernel(
+            "grim_rwkv_time_mix",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut xptr), arg(&mut wptr), arg(&mut kptr),
+                arg(&mut vptr), arg(&mut gptr), arg(&mut optr),
+                arg(&mut b_val), arg(&mut d_val), arg(&mut s_val),
+            ],
+        )
+    }
+
+    /// Launch the JIT compiled RWKV channel-mix kernel (RWKV-5/6
+    /// FFN-like gating with sigmoid).
+    pub(crate) fn launch_rwkv_channel_mix(
+        &self,
+        x_storage: &RocmStorage,
+        k_storage: &RocmStorage,
+        r_storage: &RocmStorage,
+        v_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        batch: usize,
+        dim: usize,
+    ) -> Result<*mut c_void> {
+        let x_ptr = x_storage.device_ptr.ok_or_else(|| Error::Backend("rwkv_channel_mix: x has no device ptr".into()))?;
+        let k_ptr = k_storage.device_ptr.ok_or_else(|| Error::Backend("rwkv_channel_mix: k has no device ptr".into()))?;
+        let r_ptr = r_storage.device_ptr.ok_or_else(|| Error::Backend("rwkv_channel_mix: r has no device ptr".into()))?;
+        let v_ptr = v_storage.device_ptr.ok_or_else(|| Error::Backend("rwkv_channel_mix: v has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("rwkv_channel_mix: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (batch as u64)
+            .checked_mul(dim as u64)
+            .ok_or_else(|| Error::Backend("rwkv_channel_mix: batch*dim overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into().map_err(|_| Error::Backend("rwkv_channel_mix: grid overflow".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut xptr = x_ptr;
+        let mut kptr = k_ptr;
+        let mut rptr = r_ptr;
+        let mut vptr = v_ptr;
+        let mut optr = out_ptr;
+        let mut b_val = batch as i32;
+        let mut d_val = dim as i32;
+
+        self.launch_compute_kernel(
+            "grim_rwkv_channel_mix",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut xptr), arg(&mut kptr), arg(&mut rptr),
+                arg(&mut vptr), arg(&mut optr),
+                arg(&mut b_val), arg(&mut d_val),
+            ],
+        )
+    }
+
+    // ─── Phase 2: MFMA FP8 (gfx1200+) ────────────────────────────
+
+    /// Launch the gfx1200 MFMA FP8 fused dequant GEMM kernel.
+    /// Only valid on CDNA3 (gfx1200+) targets; callers must guard
+    /// with `should_use_wmma_path` or `rocm_device_props::gfx_level >= 12`.
+    pub(crate) fn launch_fused_dequant_gemm_fp8_mfma(
+        &self,
+        a_storage: &RocmStorage,
+        b_fp8_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage.device_ptr.ok_or_else(|| Error::Backend("fp8_mfma: a has no device ptr".into()))?;
+        let b_ptr = b_fp8_storage.device_ptr.ok_or_else(|| Error::Backend("fp8_mfma: B_fp8 has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("fp8_mfma: out has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (m as u64).checked_mul(n as u64).ok_or_else(|| Error::Backend("fp8_mfma: m*n overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into().map_err(|_| Error::Backend("fp8_mfma: grid overflow".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_fused_dequant_gemm_fp8_mfma",
+            grid_dim,
+            block_dim,
+            &mut [arg(&mut aptr), arg(&mut bptr), arg(&mut optr), arg(&mut mm), arg(&mut nn), arg(&mut kk)],
+        )
+    }
+
+    /// Launch the gfx1200 MFMA FP8 backward kernel.
+    pub(crate) fn launch_fused_dequant_backward_gemm_fp8_mfma(
+        &self,
+        dy_storage: &RocmStorage,
+        b_fp8_storage: &RocmStorage,
+        dx_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let dy_ptr = dy_storage.device_ptr.ok_or_else(|| Error::Backend("fp8_mfma_bwd: dY has no device ptr".into()))?;
+        let b_ptr = b_fp8_storage.device_ptr.ok_or_else(|| Error::Backend("fp8_mfma_bwd: B_fp8 has no device ptr".into()))?;
+        let dx_ptr = dx_storage.device_ptr.ok_or_else(|| Error::Backend("fp8_mfma_bwd: dX has no device ptr".into()))?;
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (m as u64).checked_mul(k as u64).ok_or_else(|| Error::Backend("fp8_mfma_bwd: m*k overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into().map_err(|_| Error::Backend("fp8_mfma_bwd: grid overflow".into()))?;
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut dyptr = dy_ptr;
+        let mut bptr = b_ptr;
+        let mut dxptr = dx_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_fused_dequant_backward_gemm_fp8_mfma",
+            grid_dim,
+            block_dim,
+            &mut [arg(&mut dyptr), arg(&mut bptr), arg(&mut dxptr), arg(&mut mm), arg(&mut nn), arg(&mut kk)],
+        )
     }
 }
 

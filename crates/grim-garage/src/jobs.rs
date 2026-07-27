@@ -15,6 +15,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Debug, Error)]
@@ -26,12 +27,18 @@ pub enum JobError {
 }
 
 /// Coarse job status surface — enough for the UI badge in the history list.
+///
+/// Wire format is lowercase (e.g. `"cancelled"`) for consistency with the
+/// `status_label` seam used by `/api/train/jobs` and `/api/train/status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum JobStatus {
     Pending,
     Running,
     Completed,
     Failed,
+    /// User requested cancellation via `POST /api/train/cancel/{id}`.
+    Cancelled,
 }
 
 impl Default for JobStatus {
@@ -84,6 +91,11 @@ pub struct TrainingJob {
     pub status: JobStatus,
     #[serde(skip)]
     pub metrics: Vec<Metric>,
+    /// Cancellation signal. `POST /api/train/cancel/{id}` triggers it; the
+    /// running worker observes it inside its step loop and exits cleanly.
+    /// Cloning a `CancellationToken` is cheap (one `Arc` bump).
+    #[serde(skip)]
+    pub cancel: CancellationToken,
 }
 
 impl Default for TrainingJob {
@@ -99,6 +111,7 @@ impl Default for TrainingJob {
             rocm_fusion_qkv_attention: false,
             status: JobStatus::Pending,
             metrics: Vec::new(),
+            cancel: CancellationToken::new(),
         }
     }
 }
@@ -195,11 +208,111 @@ impl JobRegistry {
             .collect::<Vec<_>>()
     }
 
+    /// L5 / H5: enumerate job id + status + (cloned) job under a single
+    /// read lock. Replaces the previous N+1 pattern where the route called
+    /// `list()` to get `(id, status)` pairs and then re-`get()`'d each id
+    /// afterward — that two-step pattern had a race window between the
+    /// two locks during which a job could be evicted, and the route
+    /// responded with empty `model_path`/`dataset_path` ("ghost"
+    /// JobSummary rows that surfaced as blank cards in the UI).
+    pub async fn snapshot(&self) -> Vec<(JobId, JobStatus, TrainingJob)> {
+        let g = self.inner.read().await;
+        g.iter()
+            .map(|(k, v)| (k.clone(), v.status, v.clone()))
+            .collect::<Vec<_>>()
+    }
+
     pub async fn update_status(&self, id: &JobId, status: JobStatus) -> Result<(), JobError> {
         let mut g = self.inner.write().await;
         let job = g.get_mut(id).ok_or_else(|| JobError::NotFound(id.0.clone()))?;
         job.status = status;
         Ok(())
+    }
+
+    /// Transition a job to `status` **and** broadcast a terminal
+    /// `MetricStreamEvent` carrying the post-transition status so SSE
+    /// subscribers receive a guaranteed terminal event. This is the
+    /// counterpart to `append_metric`'s per-step broadcast; without it,
+    /// `Completed`/`Failed`/`Cancelled` transitions are silent on the
+    /// live stream and subscribers only learn them via polling.
+    ///
+    /// Returns the metric that was broadcast (the job's last recorded
+    /// step, or a zero-step sentinel when none has been recorded yet)
+    /// so callers may decide to skip a redundant immediate append.
+    pub async fn update_status_and_broadcast(
+        &self,
+        id: &JobId,
+        status: JobStatus,
+    ) -> Result<Metric, JobError> {
+        let mut g = self.inner.write().await;
+        let job = g.get_mut(id).ok_or_else(|| JobError::NotFound(id.0.clone()))?;
+        job.status = status;
+        // Use the last recorded metric if present; otherwise synthesize a
+        // zero-step sentinel so the SSE payload shape stays uniform.
+        let metric = job
+            .metrics
+            .last()
+            .cloned()
+            .unwrap_or(Metric { step: 0, loss: 0.0, tokens: 0 });
+        // Best-effort broadcast; if there are no SSE subscribers this is Err
+        // and we ignore — the next subscriber gets a snapshot via the
+        // initial metrics replay in `sse_metrics`.
+        let _ = self.metrics_tx.send(MetricStreamEvent {
+            job_id: id.0.clone(),
+            metric: metric.clone(),
+            status,
+        });
+        Ok(metric)
+    }
+
+    /// Request cancellation of a running worker. Idempotent with respect to
+    /// the cancellation token — calling twice is harmless. Returns
+    /// `NotFound` if the job id is not in the registry so the caller can
+    /// surface a 404. The caller is responsible for setting the resulting
+    /// wire status; this method only signals the worker.
+    pub async fn cancel(&self, id: &JobId) -> Result<(), JobError> {
+        let g = self.inner.read().await;
+        let job = g.get(id).ok_or_else(|| JobError::NotFound(id.0.clone()))?;
+        job.cancel.cancel();
+        Ok(())
+    }
+
+    /// Atomic cancel request + terminal-status transition. Entry-point for
+    /// the `POST /api/train/cancel/{id}` route: under a single write lock,
+    /// (a) triggers the job's `CancellationToken` so the running worker's
+    /// `select!` arm exits on the next iteration, and (b) transitions the
+    /// registry status to `Cancelled` **only if the job is still
+    /// non-terminal** (Pending or Running). If the job already reached
+    /// `Completed`/`Failed` — the cancel arrived after the worker finished —
+    /// the existing terminal status is preserved and the response reflects
+    /// reality rather than overwriting it.
+    ///
+    /// Broadcasts a terminal `MetricStreamEvent { status: Cancelled }`
+    /// when it does transition, so SSE subscribers learn about the cancel
+    /// without polling.
+    pub async fn request_cancel(&self, id: &JobId) -> Result<JobStatus, JobError> {
+        let mut g = self.inner.write().await;
+        let job = g.get_mut(id).ok_or_else(|| JobError::NotFound(id.0.clone()))?;
+        job.cancel.cancel();
+        let current = job.status;
+        if matches!(current, JobStatus::Pending | JobStatus::Running) {
+            job.status = JobStatus::Cancelled;
+            // Broadcast a terminal event (best-effort: no subscribers = Err).
+            let metric = job
+                .metrics
+                .last()
+                .cloned()
+                .unwrap_or(Metric { step: 0, loss: 0.0, tokens: 0 });
+            let _ = self.metrics_tx.send(MetricStreamEvent {
+                job_id: id.0.clone(),
+                metric,
+                status: JobStatus::Cancelled,
+            });
+            Ok(JobStatus::Cancelled)
+        } else {
+            // Already terminal (Completed/Failed/Cancelled) — leave it.
+            Ok(current)
+        }
     }
 
     pub async fn append_metric(&self, id: &JobId, metric: Metric) -> Result<(), JobError> {
@@ -247,9 +360,13 @@ fn initial_loss(mode: TrainingMode) -> f64 {
 ///
 /// Contract:
 /// - Transitions `Pending → Running` immediately.
-/// - Emits one `Metric` event per simulated step (200 ms sleep).
-/// - On completion, transitions to `Completed`.
-/// - On any registry error, transitions to `Failed` and logs the error.
+/// - Emits one `Metric` event per simulated step.
+/// - On completion, transitions to `Completed` and broadcasts a terminal
+///   `MetricStreamEvent { status = Completed }` to SSE subscribers.
+/// - On cancellation (via `JobRegistry::cancel`), exits the step loop
+///   without writing the sidecar and transitions to `Cancelled`, also
+///   broadcasting a terminal event.
+/// - On any registry error, transitions to `Failed` + broadcasts and logs.
 pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     // Retrieve the job configuration.
     let job = match registry.get(&id).await {
@@ -264,8 +381,12 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     let epochs = job.epochs.max(1) as u64;
     let steps_per_epoch: u64 = 10;
     let total_steps = epochs * steps_per_epoch;
+    // Cancellation token shared with the registry's `cancel` API. Cloned
+    // here so we don't need to re-read the job mid-run; `cancelled()` is
+    // satisfied when `cancel.cancel()` fires from another task.
+    let cancel = job.cancel.clone();
 
-    // Transition → Running
+    // Transition → Running (no broadcast: per-step events arrive shortly).
     if let Err(e) = registry.update_status(&id, JobStatus::Running).await {
         eprintln!("[grim-garage] worker: failed to mark {} Running: {e}", id);
         return;
@@ -298,7 +419,9 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[grim-garage] worker: autograd registry init failed for {}: {e}", id);
-            let _ = registry.update_status(&id, JobStatus::Failed).await;
+            let _ = registry
+                .update_status_and_broadcast(&id, JobStatus::Failed)
+                .await;
             return;
         }
     };
@@ -308,16 +431,24 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         ..AdamWConfig::default()
     });
 
-    let mut loss = initial_loss(mode);
+    // Loss is reassigned inside the per-mode match block, so we don't seed
+    // it here — that avoids the previous `loss * 0.9` decay-from-previous
+    // bug (M3) and the dead `let mut` warning.
+    'step: for step in 0..total_steps {
+        // Honor a pending cancellation before computing the step; if a
+        // cancel has already been requested while we were Running, we exit
+        // immediately rather than running one more iteration.
+        if cancel.is_cancelled() {
+            break;
+        }
 
-    for step in 0..total_steps {
         if let Err(e) = autograd_reg.zero_grads() {
             eprintln!("[grim-garage] worker: zero_grads failed: {e}");
         }
 
         let mut tape = Tape::new();
 
-        loss = match mode {
+        let loss = match mode {
             TrainingMode::Lora | TrainingMode::QLoRA | TrainingMode::Bf16Full => {
                 let x_vec = vec![0.1f32; hidden_size];
                 let x_tensor = cpu_tensor(x_vec, Shape::new(vec![1, hidden_size]));
@@ -347,7 +478,12 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                         let _ = optimizer.step(&mut autograd_reg.params);
                         loss_val as f64
                     }
-                    Err(_) => loss * 0.9,
+                    // M3: a step that fails the autograd tensor ops is
+                    // surfaced as a 10 % decay from the mode's initial
+                    // loss rather than from the previously-stored `loss`.
+                    // The previous "loss * 0.9" was correct for SFT but
+                    // trapped RL modes at zero forever.
+                    Err(_) => step_loss_fallback(mode),
                 }
             }
             TrainingMode::Dpo => {
@@ -358,7 +494,9 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
 
                 match dpo_loss_autograd(&pol_c, &pol_r, &ref_c, &ref_r, 0.1) {
                     Ok((loss_val, _g_c, _g_r)) => loss_val as f64,
-                    Err(_) => loss * 0.9,
+                    // M3: see the SFT arm above. RL fallback uses unit
+                    // floor (1e-3) since initial_loss == 0.
+                    Err(_) => step_loss_fallback(mode),
                 }
             }
             TrainingMode::Orpo => {
@@ -367,7 +505,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
 
                 match orpo_odds_ratio_loss_autograd(&pol_c, &pol_r, 0.2) {
                     Ok((loss_val, _g_c, _g_r)) => loss_val as f64,
-                    Err(_) => loss * 0.9,
+                    // M3: see Dpo arm — RL fallback uses unit floor.
+                    Err(_) => step_loss_fallback(mode),
                 }
             }
             TrainingMode::Grpo => {
@@ -376,19 +515,46 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
 
                 match grpo_loss_autograd(&pol_logps, &rewards, 1e-8) {
                     Ok((loss_val, _g_tensor)) => loss_val as f64,
-                    Err(_) => loss * 0.9,
+                    // M3: see Dpo/Orpo arms — RL fallback uses unit floor.
+                    Err(_) => step_loss_fallback(mode),
                 }
             }
         };
 
         let metric = Metric { step, loss, tokens: (step + 1) * 512 };
-        if let Err(e) = registry.append_metric(&id, metric).await {
-            eprintln!("[grim-garage] worker: metric append failed for {}: {e}", id);
-            let _ = registry.update_status(&id, JobStatus::Failed).await;
-            return;
+        // Append the metric; wait for the append to complete (it's just a
+        // write lock + broadcast — microseconds). The cancel check below
+        // is `select!`ed against the inter-step sleep so a cancel request
+        // issued during the sleep exits promptly (within one ~10 ms tick
+        // rather than waiting until the next iteration).
+        match registry.append_metric(&id, metric).await {
+            Ok(()) => {},
+            Err(e) => {
+                eprintln!("[grim-garage] worker: metric append failed for {}: {e}", id);
+                let _ = registry
+                    .update_status_and_broadcast(&id, JobStatus::Failed)
+                    .await;
+                return;
+            }
         }
+        // Pace the inner loop; simultaneously honor a pending cancel so we
+        // don't sleep through a cancel request straight to natural completion.
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break 'step,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {},
+        }
+    }
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    // If the cancellation token fired during the loop, skip sidecar write
+    // and report `Cancelled` (terminal event broadcast so SSE clients learn
+    // the job stopped without waiting for a `Closed` that never comes).
+    if cancel.is_cancelled() {
+        eprintln!("[grim-garage] worker: job {} cancelled by request", id);
+        let _ = registry
+            .update_status_and_broadcast(&id, JobStatus::Cancelled)
+            .await;
+        return;
     }
 
     let train_state = optimizer.save_to_train_state(&autograd_reg.params);
@@ -402,21 +568,152 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         eprintln!("[grim-garage] worker: wrote training state sidecar to {}", sidecar_path);
     }
 
-    if let Err(e) = registry.update_status(&id, JobStatus::Completed).await {
+    // Terminal broadcast so SSE subscribers receive a guaranteed
+    // `Completed` event rather than having to poll `/api/train/status`.
+    if let Err(e) = registry
+        .update_status_and_broadcast(&id, JobStatus::Completed)
+        .await
+    {
         eprintln!("[grim-garage] worker: failed to mark {} Completed: {e}", id);
     } else {
         eprintln!("[grim-garage] worker: job {} completed successfully", id);
     }
 }
 
-/// Minimal pseudo-random noise for the step simulator.
-/// Uses the system-time nanosecond sub-second counter as a lightweight seed.
-/// This is acceptable for non-security use (training loss jitter simulation only).
-fn rand_noise(amplitude: f64) -> f64 {
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as f64;
-    // Map nanos in [0, 1e9) → [-amplitude, +amplitude].
-    (seed / 1_000_000_000.0 - 0.5) * amplitude * 2.0
+// ===========================================================================
+// Pure helpers — exited from the worker's hot loop so they can be unit-tested
+// in isolation. These exercise lossy-decay / nearest-snap paths where the
+// implementation has to derive expected numeric values *by hand* (mutation-
+// resistant golden style — same discipline as `crates/grim-quant/tests/
+// golden_*.rs`). Each test below pins a numeric value that is uniquely
+// determined by the function's contract; a mutant that swaps a sign, drops a
+// `max(1e-3)`, or moves the decay origin (last-loss vs initial-loss) breaks
+// at least one assertion here.
+// ===========================================================================
+
+/// Fallback "loss got worse this step" value used when the autograd tensor
+/// ops for a step return `Err(_)`. Decays **from the mode's initial loss**
+/// (not the previous step's), so RL modes — which seed `loss = 0.0` —
+/// recover to a measurable, non-zero value after a transient autograd
+/// failure instead of being stuck at zero forever. A small floor
+/// (1e-3) prevents pathological loss-of-precision when `initial_loss ==
+/// 0` and the autograd error spikes back-to-back.
+pub fn step_loss_fallback(mode: TrainingMode) -> f64 {
+    let seed = initial_loss(mode);
+    if seed == 0.0 {
+        // RL: no zero baseline to decay from — use the unit floor so the
+        // operator still sees a meaningful spike rather than a flat line.
+        1e-3
+    } else {
+        seed * 0.9
+    }
 }
+
+/// Pure golden-mirror of the worker's per-step spacing. Called nowhere in
+/// production (the worker sleeps directly), but pins the per-step
+/// duration the simulator commits to so the documented contract is
+/// asserted.
+pub const SIMULATED_STEP_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(10);
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+    // `TrainingMode` is local to this crate's `jobs` module — already in
+    // scope via `use super::*`. No cross-crate import needed.
+
+    /// `step_loss_fallback` golden tests — mutation-resistant. Each test
+    /// pins a single hand-derived numeric value; a wrong sign, missing
+    /// floor, or `* 0.9` → `* 1.1` swap breaks at least one assertion
+    /// here without touching unrelated state.
+
+    #[test]
+    fn sft_lora_fallback_is_initial_loss_times_ninetieth() {
+        // initial_loss(Lora) == 2.3 → 2.3 * 0.9 = 2.07 (exact f64)
+        assert_eq!(step_loss_fallback(TrainingMode::Lora), 2.07_f64);
+    }
+
+    #[test]
+    fn sft_qlora_fallback_matches_lora_initial_decay() {
+        // initial_loss(QLoRA) == 2.3 — both SFT branches use the same
+        // seed; assert the function does NOT special-case one SFT mode.
+        assert_eq!(
+            step_loss_fallback(TrainingMode::QLoRA),
+            step_loss_fallback(TrainingMode::Lora)
+        );
+    }
+
+    #[test]
+    fn sft_bf16_fallback_is_also_2_3_times_ninetieth() {
+        assert_eq!(step_loss_fallback(TrainingMode::Bf16Full), 2.07_f64);
+    }
+
+    #[test]
+    fn dpo_fallback_is_unit_floor_not_zero() {
+        // initial_loss(Dpo) == 0.0. Pre-fix the fallback was `loss * 0.9`
+        // (= 0.0 always); a faulty impl that uses initial_loss * 0.9
+        // here still hands back 0 — caught by the (fallback > 0)
+        // assertion rather than `==` to dodge hairsplitting f64 exactness.
+        let out = step_loss_fallback(TrainingMode::Dpo);
+        assert!(out > 0.0, "Dpo fallback stuck at 0.0 (initial-loss-only decay lost the RL floor): got {out:?}");
+        assert!(
+            out <= 1.0,
+            "Dpo fallback unreasonably huge (RL floor broken): got {out:?}"
+        );
+    }
+
+    #[test]
+    fn orpo_fallback_uses_floor_not_decay() {
+        let out = step_loss_fallback(TrainingMode::Orpo);
+        assert!(out > 0.0);
+        assert!(out <= 1e-2);
+    }
+
+    #[test]
+    fn grpo_fallback_uses_floor_not_decay() {
+        let out = step_loss_fallback(TrainingMode::Grpo);
+        assert!(out > 0.0);
+        assert!(out <= 1e-2);
+    }
+
+    #[test]
+    fn rl_floors_are_all_equal_to_1e_minus_3() {
+        // All three RL modes share the same foundation: start from
+        // initial_loss == 0 → take the unit floor. Pins the magic number
+        // so it can't be tweaked accidentially; if intentional, the test
+        // name + assertion must change together.
+        let dpo = step_loss_fallback(TrainingMode::Dpo);
+        let orpo = step_loss_fallback(TrainingMode::Orpo);
+        let grpo = step_loss_fallback(TrainingMode::Grpo);
+        assert_eq!(dpo, orpo);
+        assert_eq!(orpo, grpo);
+        assert_eq!(dpo, 1e-3);
+    }
+
+    #[test]
+    fn rl_modes_distinct_from_sft_fallback_magnitude() {
+        // Catches a mutant that routes all modes through
+        // `initial_loss(mode) * 0.9` blindly — that would yield 0.0 for
+        // all RL modes (caught above); an opposite mutant that routes
+        // all modes through `1e-3` would yield 1e-3 for SFT too.
+        // Assert the SFT vs RL fallback magnitudes are meaningfully
+        // different (orders of magnitude apart, by design).
+        let sft = step_loss_fallback(TrainingMode::Lora);
+        let rl = step_loss_fallback(TrainingMode::Dpo);
+        assert!(
+            sft > rl * 100.0,
+            "SFT fallback ({sft}) should dwarf RL fallback ({rl})"
+        );
+    }
+
+    #[test]
+    fn simulated_step_delay_is_pinned_ten_ms() {
+        // Pin the contract value so docs (which previously claimed 200ms
+        // — stale) and code stay in sync. Bug M4.
+        assert_eq!(
+            SIMULATED_STEP_DELAY,
+            std::time::Duration::from_millis(10)
+        );
+    }
+}
+

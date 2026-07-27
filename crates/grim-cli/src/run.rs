@@ -4,7 +4,9 @@ use grim_core::error::Result;
 use grim_core::model::CausalLm;
 use grim_core::session::Inner as SessionInner;
 use grim_core::sampler::{SamplingParams, Sampler};
+use grim_core::architecture::{ModelArchitecture, TensorNamingRegistry};
 use grim_engine::{Engine, EngineConfig, model_loader::{load_model_from_grim, load_model_from_safetensors}};
+use grim_format::tprov::RemappingTensorProvider;
 use grim_models_transformer::{Llama, LlamaConfig, Lfm2, Lfm2Config, Gpt2, Gpt2Config, Gemma, GemmaConfig, DeepSeek, DeepSeekConfig, T5, T5Config};
 use grim_models_mamba::{Rwkv, RwkvConfig};
 use grim_models_vision::{Bert, BertConfig};
@@ -403,7 +405,6 @@ pub async fn cmd_run(
             print!("{}", token_text);
             std::io::stdout().flush().unwrap();
         } else {
-            // Fallback: print as raw token
             print!("{} ", next_token);
             std::io::stdout().flush().unwrap();
         }
@@ -413,14 +414,10 @@ pub async fn cmd_run(
         history.push(next_token);
         generated += 1;
 
-        // Stop on EOS token: in GGUF the canonical EOS id is `vocab_size - 1`.
-        // We deliberately do NOT kill on token ids 0/1/2 — those are BOS/pad/unk
-        // for some tokenizers and legitimate content tokens for others; killing
-        // on them prematurely truncates output for LFM2-style models.
-        let vocab_u32 = vocab as u32;
-        if next_token >= vocab_u32.saturating_sub(1) {
-            break;
-        }
+        // Note: EOS handling deferred — `GgufTokenizer` does not yet expose
+        // `tokenizer.ggml.eos_token_id`, so hardcoding `vocab_size - 1`
+        // incorrectly stops LFM2-family models whose PAD id is the vocab
+        // ceiling. For now we exhaust `max_tokens` and let the caller decide.
     }
 
     println!("\n[grim] Done. Generated {} tokens.", generated);
@@ -473,7 +470,16 @@ pub fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn Causal
         arch, num_layers, hidden_size, vocab_size
     );
 
-    let ws = WeightSource::root(&provider, device);
+    // Wrap the GGUF provider with a name-remapping layer so models whose
+    // tensors use alternative HF-style names (tok_embeddings, layers.N.attn.wq,
+    // etc.) resolve through the canonical GGUF names the loaders expect.
+    let model_arch = ModelArchitecture::from_str(arch);
+    let hf_gguf_map = TensorNamingRegistry::remap_hf_to_gguf(model_arch, num_layers);
+    let remapped = RemappingTensorProvider::new(&provider, {
+        let map = hf_gguf_map.clone();
+        move |name| map.get(name).map(|s| s.clone()).unwrap_or_else(|| name.to_string())
+    });
+    let ws = WeightSource::root(&remapped, device.clone());
 
 
     if arch.contains("mamba") {
@@ -490,7 +496,7 @@ pub fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn Causal
             conv_kernel: d_conv,
             rms_norm_eps,
         };
-        let m = grim_models_mamba::Mamba::load(&ws, cfg)?;
+        let m = grim_models_mamba::Mamba::load(Device::Cpu, &ws, cfg)?;
         Ok(Box::new(m))
     } else if arch.contains("lfm2") {
         // Determine layer types from per-layer head_count_kv (canonical LFM2 schema).
@@ -522,7 +528,6 @@ pub fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn Causal
         head_count_kv_vec.resize(num_layers, 0);
         // is_recr[k] == true means shortconv (recurrent) layer.
         let is_recr: Vec<bool> = head_count_kv_vec.iter().map(|&n| n == 0).collect();
-        eprintln!("[grim] LFM2 layer-type map (T=shortconv): {:?}", is_recr);
         // shortconv kernel size is fixed at 3 in canonical LFM2 (conv.weight shape = [3, n_embd]).
         let n_shortconv_l_cache = 3usize;
         let num_heads = get_meta_u32("lfm2.attention.head_count", 16) as usize;
@@ -596,7 +601,7 @@ pub fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn Causal
             intermediate_size: get_meta_u32(&format!("{}.intermediate_size", arch), (hidden_size * 4) as u32) as usize,
             max_seq_len: get_meta_u32(&format!("{}.context_length", arch), 512) as usize,
         };
-        let m = Bert::load(&ws, cfg)?;
+        let m = Bert::load(Device::Cpu, &ws, cfg)?;
         Ok(Box::new(m))
     } else if arch.contains("t5") {
         let cfg = T5Config {
@@ -615,10 +620,10 @@ pub fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn Causal
             hidden_size,
             num_layers,
         };
-        let m = Rwkv::load(&ws, cfg)?;
+        let m = Rwkv::load(&ws, cfg, device.clone())?;
         Ok(Box::new(m))
     } else {
-        let intermediate_size = get_meta_u32(&format!("{}.intermediate_size", arch), 11008) as usize;
+        let intermediate_size = get_meta_u32(&format!("{}.feed_forward_length", arch), 11008) as usize;
         let num_heads = get_meta_u32(&format!("{}.attention.head_count", arch), 32) as usize;
         let num_kv_heads = get_meta_u32(&format!("{}.attention.head_count_kv", arch), num_heads as u32) as usize;
         let head_dim = get_meta_u32(&format!("{}.attention.key_length", arch), 128) as usize;
@@ -637,7 +642,7 @@ pub fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn Causal
             rope_theta,
             max_seq_len: 2048,
         };
-        let m = Llama::load(&ws, cfg)?;
+        let m = Llama::load(device, &ws, cfg)?;
         Ok(Box::new(m))
     }
 }

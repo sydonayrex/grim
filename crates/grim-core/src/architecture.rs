@@ -118,6 +118,7 @@ pub enum ModelArchitecture {
     HunyuanDense,
     HunyuanVl,
     HyV3,
+    SmolLm2,
     SmolLm3,
     OpenAiMoe,
     Lfm2,
@@ -262,6 +263,7 @@ impl ModelArchitecture {
             "hunyuan-dense" => Self::HunyuanDense,
             "hunyuan-vl" => Self::HunyuanVl,
             "hy-v3" => Self::HyV3,
+            "smollm2" => Self::SmolLm2,
             "smollm3" => Self::SmolLm3,
             "openai-moe" => Self::OpenAiMoe,
             "lfm2" | "liquid" => Self::Lfm2,
@@ -404,6 +406,7 @@ impl ModelArchitecture {
             Self::HunyuanDense => "hunyuan-dense",
             Self::HunyuanVl => "hunyuan-vl",
             Self::HyV3 => "hy-v3",
+            Self::SmolLm2 => "smollm2",
             Self::SmolLm3 => "smollm3",
             Self::OpenAiMoe => "openai-moe",
             Self::Lfm2 => "lfm2",
@@ -555,9 +558,16 @@ impl TensorNamingRegistry {
     pub fn remap_hf_to_gguf(arch: ModelArchitecture, num_layers: usize) -> HashMap<String, String> {
         let mut map = HashMap::new();
 
-        // Common default HF -> GGUF mappings
+        // Common default HF -> GGUF mappings.
+        // These handle the most common name variants that appear across the
+        // HF ecosystem: with/without `model.` prefix, internal canonical
+        // names from older loaders (`tok_embeddings`, `layers.N.attn.wq`
+        // style), and the standard HF naming patterns.
         map.insert("model.embed_tokens.weight".to_string(), "token_embd.weight".to_string());
+        map.insert("tok_embeddings.weight".to_string(), "token_embd.weight".to_string());
+        map.insert("token_embeddings.weight".to_string(), "token_embd.weight".to_string());
         map.insert("model.norm.weight".to_string(), "output_norm.weight".to_string());
+        map.insert("norm.weight".to_string(), "output_norm.weight".to_string());
         map.insert("lm_head.weight".to_string(), "output.weight".to_string());
 
         match arch {
@@ -608,10 +618,15 @@ impl TensorNamingRegistry {
                 }
             }
             _ => {
-                // Default Llama-style HF -> GGUF mappings per layer
+                // Default Llama-family HF -> GGUF mappings per layer.
+                // Covers both `model.layers.N.xxx` (standard HF) and
+                // `layers.N.attn.xxx` / `layers.N.ffn.xxx` (internal loader
+                // canonical names used by Grim's Llama implementation).
                 for i in 0..num_layers {
                     let hf_p = format!("model.layers.{i}.");
                     let gg_p = format!("blk.{i}.");
+                    let il_p = format!("layers.{i}.");
+                    // HF standard naming
                     map.insert(format!("{hf_p}input_layernorm.weight"), format!("{gg_p}attn_norm.weight"));
                     map.insert(format!("{hf_p}self_attn.q_proj.weight"), format!("{gg_p}attn_q.weight"));
                     map.insert(format!("{hf_p}self_attn.k_proj.weight"), format!("{gg_p}attn_k.weight"));
@@ -621,6 +636,16 @@ impl TensorNamingRegistry {
                     map.insert(format!("{hf_p}mlp.gate_proj.weight"), format!("{gg_p}ffn_gate.weight"));
                     map.insert(format!("{hf_p}mlp.up_proj.weight"), format!("{gg_p}ffn_up.weight"));
                     map.insert(format!("{hf_p}mlp.down_proj.weight"), format!("{gg_p}ffn_down.weight"));
+                    // Internal loader canonical names (no `model.` prefix, dot-separated sub-modules)
+                    map.insert(format!("{il_p}attn_norm.weight"), format!("{gg_p}attn_norm.weight"));
+                    map.insert(format!("{il_p}attn.wq.weight"), format!("{gg_p}attn_q.weight"));
+                    map.insert(format!("{il_p}attn.wk.weight"), format!("{gg_p}attn_k.weight"));
+                    map.insert(format!("{il_p}attn.wv.weight"), format!("{gg_p}attn_v.weight"));
+                    map.insert(format!("{il_p}attn.wo.weight"), format!("{gg_p}attn_output.weight"));
+                    map.insert(format!("{il_p}ffn_norm.weight"), format!("{gg_p}ffn_norm.weight"));
+                    map.insert(format!("{il_p}ffn.w_gate.weight"), format!("{gg_p}ffn_gate.weight"));
+                    map.insert(format!("{il_p}ffn.w_up.weight"), format!("{gg_p}ffn_up.weight"));
+                    map.insert(format!("{il_p}ffn.w_down.weight"), format!("{gg_p}ffn_down.weight"));
                 }
             }
         }

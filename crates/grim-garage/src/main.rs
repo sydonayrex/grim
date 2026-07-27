@@ -22,7 +22,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
-    let state = routes::AppState { registry: Arc::new(JobRegistry::new()) };
+    let state = routes::AppState {
+        registry: Arc::new(JobRegistry::new()),
+        engine: Arc::new(std::sync::Mutex::new(grim_engine::Engine::new(grim_engine::EngineConfig::default()))),
+        tokenizer: Arc::new(std::sync::Mutex::new(None)),
+        model_path: None,
+    };
     let router = routes::build_router(state);
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;

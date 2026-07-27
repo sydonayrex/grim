@@ -10,7 +10,10 @@ pub mod poller;
 
 pub use display::DisplayState;
 pub use http_client::{GarageClient, JobSummaryDto};
-pub use poller::{poll_once, PollError, Poller};
+pub use poller::{
+    merge_fetch, normalize_wire_status, poll_fetch, poll_once, PollError, Poller,
+    POLL_ENDPOINT_COUNT,
+};
 
 use std::collections::HashMap;
 

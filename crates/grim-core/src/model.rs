@@ -52,6 +52,8 @@ pub trait Model: Send + Sync {
     /// backends compute in F32 or F16 regardless of how the weights are
     /// stored — this is the compute-time type, not the storage type.
     fn param_arith(&self) -> ArithType;
+    /// Downcast to concrete type for debugging/inspection.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Autoregressive, token-level generation — dense transformers, Mamba, hybrids.

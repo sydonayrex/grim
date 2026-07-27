@@ -46,6 +46,15 @@ pub trait SessionT: Send {
         None
     }
     fn set_last_hidden_state(&mut self, _hidden: Tensor) {}
+
+    /// Model-specific per-request state (typed slot).
+    fn model_state(&self) -> Option<&(dyn std::any::Any + Send)> {
+        None
+    }
+    fn model_state_mut(&mut self) -> Option<&mut (dyn std::any::Any + Send)> {
+        None
+    }
+    fn set_model_state(&mut self, _state: Box<dyn std::any::Any + Send>) {}
 }
 
 /// Public trait-object alias used in `Model` trait DSL.
@@ -60,14 +69,19 @@ pub struct Inner {
     /// Handle to the captured HIP graph executables
     pub hip_graph_handle: Option<u64>,
     pub last_hidden_state: Option<Tensor>,
+    /// Model-specific per-request state (e.g. LFM2 layer caches).
+    /// Typed slot — each model downcasts to its own cache type.  Lives on
+    /// the session so different requests against the same model get
+    /// independent caches, matching bebelm-main's ownership model.
+    pub model_state: Option<Box<dyn std::any::Any + Send>>,
 }
 
 impl Inner {
     pub fn new(device: Device) -> Self {
-        Self { device, kv: None, current_pos: 0, hip_graph_handle: None, last_hidden_state: None }
+        Self { device, kv: None, current_pos: 0, hip_graph_handle: None, last_hidden_state: None, model_state: None }
     }
     pub fn with_kv(device: Device, kv: Box<dyn KvCache>) -> Self {
-        Self { device, kv: Some(kv), current_pos: 0, hip_graph_handle: None, last_hidden_state: None }
+        Self { device, kv: Some(kv), current_pos: 0, hip_graph_handle: None, last_hidden_state: None, model_state: None }
     }
 }
 
@@ -118,6 +132,15 @@ impl SessionT for Inner {
     }
     fn set_last_hidden_state(&mut self, hidden: Tensor) {
         self.last_hidden_state = Some(hidden);
+    }
+    fn model_state(&self) -> Option<&(dyn std::any::Any + Send)> {
+        self.model_state.as_deref()
+    }
+    fn model_state_mut(&mut self) -> Option<&mut (dyn std::any::Any + Send)> {
+        self.model_state.as_deref_mut()
+    }
+    fn set_model_state(&mut self, state: Box<dyn std::any::Any + Send>) {
+        self.model_state = Some(state);
     }
 }
 

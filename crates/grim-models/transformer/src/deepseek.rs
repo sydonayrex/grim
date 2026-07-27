@@ -1,7 +1,6 @@
 //! DeepSeek family — Multi-head Latent Attention (MLA) and expert routing.
 
-use std::sync::Arc;
-use grim_backend_cpu::cpu_tensor;
+use grim_backend_cpu::{cpu_tensor, add_tensors};
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
@@ -83,7 +82,8 @@ impl DeepSeekBlock {
         let _kv = self.kv_b_proj.forward(&kv_latent)?;
         
         let attn_out = self.wo.forward(&q)?;
-        let x_res1 = add_tensors(x, &attn_out)?;
+        let x_res1 = add_tensors(x, &attn_out)
+            .map_err(grim_core::Error::Tensor)?;
 
         let norm_x2 = self.ffn_norm.forward(&x_res1)?;
         let gate = self.ffn_gate.forward(&norm_x2)?;
@@ -91,6 +91,7 @@ impl DeepSeekBlock {
         let activated = silu_mul(&gate, &up)?;
         let ffn_out = self.ffn_down.forward(&activated)?;
         add_tensors(&x_res1, &ffn_out)
+            .map_err(grim_core::Error::Tensor)
     }
 }
 
@@ -134,6 +135,9 @@ impl Model for DeepSeek {
     fn param_arith(&self) -> ArithType {
         ArithType::F32
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl CausalLm for DeepSeek {
@@ -165,13 +169,6 @@ impl CausalLm for DeepSeek {
         session.advance_pos(seq_len);
         Ok(logits)
     }
-}
-
-fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    let dev = grim_backend_cpu::CpuDevice::new();
-    let (s, h) = grim_tensor::BackendDevice::add(&dev, a.storage().as_ref(), b.storage().as_ref(), a.shape())?;
-    h.synchronize()?;
-    Ok(Tensor::new(Arc::from(s), a.shape().clone(), DType::F32, a.provenance().clone(), a.device().clone()))
 }
 
 fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {

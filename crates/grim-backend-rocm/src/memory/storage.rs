@@ -14,13 +14,14 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use grim_tensor::backend::BackendStorage;
+use grim_tensor::dtype::KQuantScheme;
 use grim_tensor::error::{Error, Result};
 
 // Re-exports used by the type's field types. The actual type declarations
 // live in lib.rs and are reachable via the crate-root imports below.
 use crate::{
-    check_hip, hipMemcpy, DType, HipMemcpyKind, QuantProvenance, RocmCachingAllocator, Shape,
-    hipSuccess,
+    check_hip, hipMemcpy, DType, DTypeStorage, HipMemcpyKind, QuantProvenance, RocmCachingAllocator,
+    Shape, hipSuccess,
 };
 
 /// ROCm-side tensor storage. Holds a hipDeviceptr_t (as u64) plus shape/dtype/provenance metadata.
@@ -222,6 +223,25 @@ impl BackendStorage for RocmStorage {
         let dev_ptr_void = self.device_ptr.unwrap() as *mut c_void;
         let elem_count = self.shape.elem_count();
 
+        // Quantized storage (Q8_0, Q4K, …): the device buffer holds packed
+        // bytes, not native F32. We must read the exact byte count and
+        // dequantize on the host before returning f32 values. Without this
+        // branch the `_` arm would only copy `self.bytes` bytes into a
+        // `Vec<f32>` of `elem_count * 4` bytes — a silent short-read that
+        // leaves the tail as zeroed stale data.
+        if let DTypeStorage::KQuant(_scheme) = &self.dtype.storage {
+            let mut raw = vec![0u8; self.bytes];
+            check_hip("hipMemcpyDtoH (quantized)", unsafe {
+                hipMemcpy(
+                    raw.as_mut_ptr() as *mut c_void,
+                    dev_ptr_void,
+                    self.bytes,
+                    HipMemcpyKind::DeviceToHost,
+                )
+            })?;
+            return dequant_cpu(&raw, elem_count, &self.dtype);
+        }
+
         // F16/BF16 storage: the device buffer holds 2-byte elements, but the
         // caller expects f32. We can't just memcpy into a Vec<f32> (that would
         // reinterpret pairs of f16 values as single f32 values — a silent
@@ -277,5 +297,41 @@ impl BackendStorage for RocmStorage {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+/// Minimal host-side dequantizer for when a quantized tensor needs to be
+/// read back as `Vec<f32>` and no backend-specific on-device path applies.
+/// Currently handles Q8_0 (34 bytes per 32 weights: fp16 delta + int8 codes).
+fn dequant_cpu(raw: &[u8], elem_count: usize, dtype: &DType) -> Result<Vec<f32>> {
+    match &dtype.storage {
+        DTypeStorage::KQuant(KQuantScheme::Q80) => {
+            const QK8_0: usize = 32;
+            let expected = (elem_count.div_ceil(QK8_0)) * (QK8_0 + 2);
+            if raw.len() < expected {
+                return Err(Error::Backend(format!(
+                    "Q8_0 dequant: raw buffer {} bytes too small for {} elements (need {})",
+                    raw.len(),
+                    elem_count,
+                    expected
+                )));
+            }
+            let mut out = Vec::with_capacity(elem_count);
+            for blk in raw.chunks_exact(QK8_0 + 2).take(elem_count.div_ceil(QK8_0)) {
+                let d_bits = u16::from_le_bytes([blk[0], blk[1]]);
+                let d = half::f16::from_bits(d_bits).to_f32();
+                let qs = &blk[2..2 + QK8_0];
+                for &q in qs {
+                    if out.len() < elem_count {
+                        out.push(d * (q as f32));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        _ => Err(Error::Backend(format!(
+            "to_cpu_vec_f32: host dequant not yet implemented for {:?}",
+            dtype.storage
+        ))),
     }
 }

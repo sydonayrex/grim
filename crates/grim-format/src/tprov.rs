@@ -353,6 +353,19 @@ impl GrimProvider {
         let mut reader = self.reader.lock().unwrap();
         read_outliers(&mut *reader, entry)
     }
+
+    /// Construct a `GgufTokenizer` from the GGUF metadata embedded in this
+    /// `.grim` file during conversion.
+    ///
+    /// Returns an error if no GGUF metadata was embedded (e.g. legacy `.grim`
+    /// files or conversion from safetensors). Callers should fall back to the
+    /// sibling `.gguf` route in that case.
+    pub fn tokenizer(&self) -> Result<crate::tokenizer::GgufTokenizer> {
+        let meta = self.file.metadata.gguf_metadata.as_ref().ok_or_else(|| {
+            Error::Backend("no embedded GGUF metadata in .grim file".into())
+        })?;
+        crate::tokenizer::GgufTokenizer::from_metadata(meta)
+    }
 }
 
 impl TensorProvider for GrimProvider {

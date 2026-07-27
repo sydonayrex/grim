@@ -1,7 +1,6 @@
 //! Gemma family — GeGLU activations, scale-norm normalization, and soft-capping.
 
-use std::sync::Arc;
-use grim_backend_cpu::cpu_tensor;
+use grim_backend_cpu::{cpu_tensor, add_tensors};
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
@@ -78,7 +77,8 @@ impl GemmaBlock {
         let _v = self.wv.forward(&norm_x)?;
         // Simple attention approximation
         let attn_out = self.wo.forward(&q)?;
-        let x_res1 = add_tensors(x, &attn_out)?;
+        let x_res1 = add_tensors(x, &attn_out)
+            .map_err(grim_core::Error::Tensor)?;
 
         let norm_x2 = self.ffn_norm.forward(&x_res1)?;
         let gate = self.ffn_gate.forward(&norm_x2)?;
@@ -86,6 +86,7 @@ impl GemmaBlock {
         let activated = geglu(&gate, &up)?;
         let ffn_out = self.ffn_down.forward(&activated)?;
         add_tensors(&x_res1, &ffn_out)
+            .map_err(grim_core::Error::Tensor)
     }
 }
 
@@ -126,6 +127,9 @@ impl Model for Gemma {
     fn param_arith(&self) -> ArithType {
         ArithType::F32
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl CausalLm for Gemma {
@@ -153,19 +157,27 @@ impl CausalLm for Gemma {
             h = layer.forward(&h)?;
         }
         let h = self.norm.forward(&h)?;
-        // Gemma weight tying output projection
-        let logits = self.tok_embeddings.forward(&ids, seq_len, self.cfg.vocab_size)?;
-        let _ = h;
+        // Gemma weight tying: output projection uses token embedding weights transposed
+        // logits = h @ weight.T  where weight is [vocab_size, hidden_size]
+        let weight = &self.tok_embeddings.weight;
+        let dev = grim_backend_cpu::CpuDevice::new();
+        let (s, _h) = grim_tensor::BackendDevice::matmul(
+            &dev,
+            h.storage().as_ref(),
+            weight.storage().as_ref(),
+            &grim_tensor::Shape::new(vec![seq_len, self.cfg.vocab_size]),
+        )?;
+        _h.synchronize()?;
+        let logits = Tensor::new(
+            std::sync::Arc::from(s),
+            grim_tensor::Shape::new(vec![seq_len, self.cfg.vocab_size]),
+            DType::F32,
+            h.provenance().clone(),
+            h.device().clone(),
+        );
         session.advance_pos(seq_len);
         Ok(logits)
     }
-}
-
-fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    let dev = grim_backend_cpu::CpuDevice::new();
-    let (s, h) = grim_tensor::BackendDevice::add(&dev, a.storage().as_ref(), b.storage().as_ref(), a.shape())?;
-    h.synchronize()?;
-    Ok(Tensor::new(Arc::from(s), a.shape().clone(), DType::F32, a.provenance().clone(), a.device().clone()))
 }
 
 fn geglu(gate: &Tensor, up: &Tensor) -> Result<Tensor> {

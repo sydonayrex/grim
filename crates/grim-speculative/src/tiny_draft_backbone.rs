@@ -39,7 +39,7 @@ pub struct TinyDraftBackbone {
 
 impl TinyDraftBackbone {
     pub fn new(vocab_size: usize, hidden: usize, block_len: usize, seed: u64) -> Self {
-        let mut rng = crate::test_rng::SimpleRng::new(seed);
+        let mut rng = grim_core::rng::SimpleRng::new(seed);
         let mut rand_vec = |size: usize, std: f32| -> Vec<f32> {
             (0..size).map(|_| (rng.next_f32() - 0.5) * std).collect()
         };

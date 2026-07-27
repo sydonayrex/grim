@@ -1,0 +1,26 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer W { float w[]; };
+layout(std430, binding = 1) readonly buffer I { uint indices[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint total = (params.size / params.dim) * params.dim;
+    if (id >= total) return;
+    uint idx_pos = id / params.dim;
+    uint col = id % params.dim;
+    uint weight_row = indices[idx_pos];
+    y[id] = w[weight_row * params.dim + col];
+}

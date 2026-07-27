@@ -295,6 +295,20 @@ pub fn convert_to_grim(
         });
     }
 
+    // Preserve source GGUF metadata (tokenizer, architecture, etc.) so
+    // GrimProvider can reconstruct the tokenizer directly from the .grim
+    // file without a sibling .gguf fallback.
+    if metadata.gguf_metadata.is_none() {
+        let lower = input_path.to_ascii_lowercase();
+        if lower.ends_with(".gguf") {
+            if let Ok(src_file) = File::open(input_path) {
+                if let Ok(gguf) = read_gguf(&mut BufReader::new(src_file)) {
+                    metadata.gguf_metadata = Some(gguf.metadata);
+                }
+            }
+        }
+    }
+
     let grim_file = crate::format::GrimFile {
         header: crate::format::GrimHeader::new(entries.len() as u32, 0),
         metadata,

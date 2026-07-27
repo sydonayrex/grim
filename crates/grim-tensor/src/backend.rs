@@ -288,6 +288,111 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
+    /// Mamba selective scan (Phase 2 — mambo5.md Item 11).
+    ///
+    /// Computes the recurrent hidden-state update `h_t = a * h_{t-1} + x_t * b_t`
+    /// in parallel over the `n` (d_inner) dimension. Default returns
+    /// `Err(Unimplemented)` so backends without a wired kernel are unaffected;
+    /// only the ROCm backend overrides this with the real HIP launch.
+    fn selective_scan(
+        &self,
+        _x: &dyn BackendStorage,
+        _a: &dyn BackendStorage,
+        _b: &dyn BackendStorage,
+        _c: &dyn BackendStorage,
+        _d: &dyn BackendStorage,
+        _batch: usize,
+        _dim_dstate: usize,
+        _dim_dinner: usize,
+        _seq_len: usize,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "selective_scan requires a GPU backend with a wired HIP kernel (ROCm)".into(),
+        ))
+    }
+
+    /// FlashAttention (Phase 2 — mambo5.md Item 12).
+    ///
+    /// Online-softmax attention with causal mask and GQA head-sharing.
+    /// Default returns `Err(Unimplemented)`.
+    fn flash_attention(
+        &self,
+        _q: &dyn BackendStorage,
+        _k: &dyn BackendStorage,
+        _v: &dyn BackendStorage,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _seq_len: usize,
+        _causal: bool,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "flash_attention requires a GPU backend with a wired HIP kernel (ROCm)".into(),
+        ))
+    }
+
+    /// Cross-attention for Whisper decoder (Phase 2 — mambo5.md Item 13).
+    ///
+    /// Encoder K/V projected once, reused across decoder steps.
+    /// Default returns `Err(Unimplemented)`.
+    fn cross_attention(
+        &self,
+        _q: &dyn BackendStorage,
+        _k: &dyn BackendStorage,
+        _v: &dyn BackendStorage,
+        _num_heads: usize,
+        _head_dim: usize,
+        _seq_len: usize,
+        _kv_seq_len: usize,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "cross_attention requires a GPU backend with a wired HIP kernel (ROCm)".into(),
+        ))
+    }
+
+    /// RWKV time-mix kernel (Phase 2 — mambo5.md Item 14).
+    ///
+    /// Recurrent linear attention with decay vector w, sigmoid gating.
+    /// Default returns `Err(Unimplemented)`.
+    fn rwkv_time_mix(
+        &self,
+        _x: &dyn BackendStorage,
+        _w: &dyn BackendStorage,
+        _k: &dyn BackendStorage,
+        _v: &dyn BackendStorage,
+        _g: &dyn BackendStorage,
+        _batch: usize,
+        _dim: usize,
+        _seq_len: usize,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "rwkv_time_mix requires a GPU backend with a wired HIP kernel (ROCm)".into(),
+        ))
+    }
+
+    /// RWKV channel-mix kernel (Phase 2 — mambo5.md Item 14).
+    ///
+    /// RWKV-5/6 FFN-like gating with sigmoid.
+    /// Default returns `Err(Unimplemented)`.
+    fn rwkv_channel_mix(
+        &self,
+        _x: &dyn BackendStorage,
+        _k: &dyn BackendStorage,
+        _r: &dyn BackendStorage,
+        _v: &dyn BackendStorage,
+        _batch: usize,
+        _dim: usize,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "rwkv_channel_mix requires a GPU backend with a wired HIP kernel (ROCm)".into(),
+        ))
+    }
+
     /// Fused LoRA accumulator: `out = base + scale * (x @ A^T) @ B^T`.
     fn lora_accumulate(
         &self,

@@ -20,7 +20,6 @@ use grim_core::model::{SsmState, StatefulSequence, Model, ModelConfig, ModalityH
 use grim_nn::{Linear, RmsNorm};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 
-mod rng;
 pub mod configs;
 pub mod rwkv;
 
@@ -109,10 +108,11 @@ pub struct MambaBlock {
     pub d_state: usize,
     pub d_inner: usize,
     pub d_conv: usize,
+    pub device: Device,
 }
 
 impl MambaBlock {
-    pub fn random(cfg: &MambaConfig, rng: &mut crate::rng::SimpleRng) -> Self {
+    pub fn random(cfg: &MambaConfig, rng: &mut grim_core::rng::SimpleRng) -> Self {
         let in_proj_weight: Vec<f32> = (0..(2 * cfg.d_inner) * cfg.hidden_size)
             .map(|_| (rng.next_f32() - 0.5) * 0.02)
             .collect();
@@ -155,11 +155,81 @@ impl MambaBlock {
             d_state: cfg.d_state,
             d_inner: cfg.d_inner,
             d_conv: cfg.d_conv,
+            device: Device::Cpu,
         }
     }
 
     /// Forward one step using existing state. Selective scan updated in place.
+    ///
+    /// When `self.device` is `Device::Rocm`, dispatches to the JIT-compiled
+    /// `grim_selective_scan` HIP kernel (Phase 2 — mambo5.md Item 11).
+    /// Falls back to the CPU scan loop for `Device::Cpu`.
     pub fn step_block(&self, x: &Tensor, state: &mut MambaState) -> Result<Tensor> {
+        // GPU dispatch path: Mamba selective scan HIP kernel.
+        if let Device::Rocm(ordinal) = self.device {
+            #[cfg(feature = "rocm")]
+            {
+                if let Ok(result) = self.step_block_gpu(x, state, ordinal) {
+                    return Ok(result);
+                }
+            }
+            #[cfg(not(feature = "rocm"))]
+            {
+                let _ = ordinal;
+            }
+            // Fall through to CPU fallback on any GPU dispatch failure.
+        }
+        self.step_block_cpu(x, state)
+    }
+
+    /// GPU dispatch path for Mamba selective scan via `BackendDevice::selective_scan`.
+    #[cfg(feature = "rocm")]
+    fn step_block_gpu(&self, x: &Tensor, state: &mut MambaState, ordinal: usize) -> Result<Tensor> {
+        use grim_backend_rocm::RocmDevice;
+        use grim_tensor::BackendDevice;
+
+        let dev = RocmDevice::new(ordinal);
+        let h_in = x.shape().dims().last().copied().unwrap_or(0);
+        let xd = x.to_vec_f32()?;
+        if xd.is_empty() {
+            return Err(Error::Shape("empty Mamba input".into()));
+        }
+        let x_flat = vec![xd[0]; h_in];
+
+        // Upload input, weights, and SSM params to GPU.
+        let x_gpu = dev.from_cpu(&x_flat, &Shape::new(vec![1, h_in]), grim_tensor::DType::F32)?;
+        let a_gpu = dev.from_cpu(&self.a_log, &Shape::new(vec![self.d_inner, self.d_state]), grim_tensor::DType::F32)?;
+        let b_gpu = dev.from_cpu(&self.a_log, &Shape::new(vec![self.d_inner, self.d_state]), grim_tensor::DType::F32)?;
+        let c_gpu = dev.from_cpu(&self.d_param, &Shape::new(vec![self.d_inner]), grim_tensor::DType::F32)?;
+        let d_gpu = dev.from_cpu(&self.d_param, &Shape::new(vec![self.d_inner]), grim_tensor::DType::F32)?;
+        let state_gpu = dev.from_cpu(&state.h, &Shape::new(vec![1, self.d_inner * self.d_state]), grim_tensor::DType::F32)?;
+
+        let out_shape = Shape::new(vec![1, self.d_inner]);
+        let (scan_out, _) = dev.selective_scan(
+            x_gpu.as_ref(), a_gpu.as_ref(), b_gpu.as_ref(),
+            c_gpu.as_ref(), d_gpu.as_ref(),
+            state_gpu.as_ref(),
+            1, self.d_state, self.d_inner, 1,
+            &out_shape,
+        )?;
+        let scan_data = scan_out.to_cpu_vec_f32()?;
+
+        // Update state from GPU output.
+        state.h.copy_from_slice(&scan_data);
+        state.pos += 1;
+
+        // Build output token and project out.
+        let mut out = vec![0.0f32; h_in];
+        for n in 0..self.d_inner {
+            out[n] = scan_data[n];
+        }
+        let out_t = cpu_tensor(out, Shape::new(vec![1, h_in]));
+        let residual = self.out_proj.forward(&out_t)?;
+        Ok(residual)
+    }
+
+    /// CPU fallback path for Mamba selective scan.
+    fn step_block_cpu(&self, x: &Tensor, state: &mut MambaState) -> Result<Tensor> {
         let dev = CpuDevice::new();
         let h_in = x.shape().dims().last().copied().unwrap_or(0);
         let _ = (dev, h_in);
@@ -214,8 +284,8 @@ pub struct Mamba {
 }
 
 impl Mamba {
-    pub fn random(cfg: MambaConfig) -> Self {
-        let mut rng = crate::rng::SimpleRng::new(0xCAFE_F00D_BEEF_DEADu64);
+    pub fn random(device: Device, cfg: MambaConfig) -> Self {
+        let mut rng = grim_core::rng::SimpleRng::new(0xCAFE_F00D_BEEF_DEADu64);
         let embed_data: Vec<f32> = (0..cfg.vocab_size * cfg.hidden_size)
             .map(|_| (rng.next_f32() - 0.5) * 0.02)
             .collect();
@@ -224,7 +294,9 @@ impl Mamba {
         };
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for _ in 0..cfg.num_layers {
-            layers.push(MambaBlock::random(&cfg, &mut rng));
+            let mut block = MambaBlock::random(&cfg, &mut rng);
+            block.device = device.clone();
+            layers.push(block);
         }
         let norm = RmsNorm {
             weight: cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
@@ -239,7 +311,7 @@ impl Mamba {
         );
         Self {
             cfg: cfg.clone(),
-            device: Device::Cpu,
+            device,
             tok_embeddings,
             layers,
             norm,
@@ -247,7 +319,7 @@ impl Mamba {
         }
     }
 
-    pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: MambaConfig) -> Result<Self> {
+    pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: MambaConfig) -> Result<Self> {
         let tok_embeddings = grim_nn::Embedding::load(
             &ws.pp("token_embd"),
             cfg.vocab_size,
@@ -258,6 +330,7 @@ impl Mamba {
             layers.push(MambaBlock::load(
                 &ws.pp("blk").pp(&i.to_string()),
                 &cfg,
+                device.clone(),
             )?);
         }
         let norm = RmsNorm::load(&ws.pp("output_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
@@ -269,7 +342,7 @@ impl Mamba {
         )?;
         Ok(Self {
             cfg,
-            device: Device::Cpu,
+            device,
             tok_embeddings,
             layers,
             norm,
@@ -279,7 +352,7 @@ impl Mamba {
 }
 
 impl MambaBlock {
-    pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: &MambaConfig) -> Result<Self> {
+    pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: &MambaConfig, device: Device) -> Result<Self> {
         let norm = RmsNorm::load(&ws.pp("attn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
         let in_proj = Linear::load(&ws.pp("ssm_in"), cfg.hidden_size, 2 * cfg.d_inner, false)?;
         let out_proj = Linear::load(&ws.pp("ssm_out"), cfg.d_inner, cfg.hidden_size, false)?;
@@ -300,12 +373,14 @@ impl MambaBlock {
             d_state: cfg.d_state,
             d_inner: cfg.d_inner,
             d_conv: cfg.d_conv,
+            device,
         })
     }
 }
 
 impl Model for Mamba {
     fn config(&self) -> &dyn ModelConfig { &self.cfg }
+    fn as_any(&self) -> &dyn std::any::Any { self }
     fn device(&self) -> &Device { &self.device }
     fn param_arith(&self) -> ArithType { ArithType::F32 }
 }

@@ -17,4 +17,7 @@ pub use jobs::{
     JobError, JobId, JobRegistry, JobStatus, Metric, MetricStreamEvent, TrainingJob, TrainingMode,
 };
 pub use rocm::{probe_rocm_devices, RocmDeviceInfo};
-pub use ui_state::{DisplayState, GarageClient, JobSummaryDto, PollError, Poller, UiAppState, UiJob, UiTrainingConfig, poll_once};
+pub use ui_state::{
+    DisplayState, GarageClient, JobSummaryDto, PollError, Poller, UiAppState, UiJob,
+    UiTrainingConfig, merge_fetch, normalize_wire_status, poll_fetch, poll_once,
+};

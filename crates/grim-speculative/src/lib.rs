@@ -24,7 +24,7 @@ pub mod native_mtp;
 pub mod speculative_wrapper;
 pub mod distill;
 pub mod mamba_speculative;
-pub mod test_rng;
+
 pub mod tiny_draft_backbone;
 pub mod uniform_markov_head;
 

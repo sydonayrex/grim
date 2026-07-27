@@ -29,8 +29,8 @@ use grim_core::error::Result;
 use grim_core::grim_models_dir;
 use grim_core::session::DeterminismMode;
 use grim_engine::{Engine, model_loader};
-use grim_scheduler::Request;
 use grim_format::GgufProvider;
+use grim_tensor::Device;
 
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -89,15 +89,18 @@ fn sample_next_token(
     request_id: u64,
     step: u64,
     sampler: &dyn grim_core::sampler::Sampler,
+    prompt_tokens: Option<&[u32]>, // Only provided on step 0
 ) -> u32 {
     if step == 0 {
-        let req = Request {
+        let prompt_tokens = prompt_tokens.expect("prompt_tokens must be provided on step 0");
+        let req = grim_scheduler::Request {
             id: request_id,
-            prompt_tokens: 1,
+            prompt_tokens: prompt_tokens.len(),
             priority: 0,
             consumed_tokens: 0,
             model_id: None,
             adapter_ids: vec![],
+            input_ids: Some(prompt_tokens.to_vec()),
         };
         engine.enqueue_request(req);
     }
@@ -113,6 +116,10 @@ fn sample_next_token(
         Some(t) => sampler.sample(&t, &[]).unwrap_or(step as u32),
         None => step as u32,
     };
+
+    // Record the generated token so the next decode step uses the real token
+    // instead of a position index.
+    engine.record_generated_token(request_id, token);
     token
 }
 
@@ -313,10 +320,12 @@ async fn chat_completions(
         let sampler_clone = sampler.clone();
         let stop_sequences_clone = stop_sequences.clone();
         let max_tokens_clone = max_tokens;
+        // Get tokenizer for the streaming path
+        let tokenizer_clone = state.tokenizer.lock().unwrap().clone();
 
         let stream = futures::stream::unfold(
-            (0u64, String::new()), // (step, accumulated content for stop checks)
-            move |(step, mut emitted)| {
+            (0u64, String::new(), tokenizer_clone.as_ref().map(|t| t.encode("Hello")).unwrap_or_default()), // (step, accumulated content, prompt_tokens)
+            move |(step, mut emitted, prompt_tokens): (u64, String, Vec<u32>)| {
                 let state = state_clone.clone();
                 let adapter_ids = adapter_ids_clone.clone();
                 let stop_seqs = stop_sequences_clone.clone();
@@ -335,7 +344,7 @@ async fn chat_completions(
 
                     let token_id = {
                         let mut engine = state.engine.lock().unwrap();
-                        sample_next_token(&mut engine, request_id, step, sampler.as_ref())
+                        sample_next_token(&mut engine, request_id, step, sampler.as_ref(), if step == 0 { Some(&prompt_tokens) } else { None })
                     };
 
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -354,12 +363,12 @@ async fn chat_completions(
                     let payload = serde_json::json!({
                          "choices": [{"index": 0, "delta": {"content": token_text}}],
                          "adapters_active": adapter_ids.len()
-                     }).to_string();
+                      }).to_string();
                     let event = axum::response::sse::Event::default()
                         .event("message")
                         .data(payload);
                     let res: std::result::Result<axum::response::sse::Event, axum::Error> = Ok(event);
-                    Some((res, (step + 1, emitted)))
+                    Some((res, (step + 1, emitted, prompt_tokens)))
                 }
             },
         );
@@ -380,11 +389,13 @@ async fn chat_completions(
         };
 
         let tokenizer = state.tokenizer.lock().unwrap().clone();
+        // Tokenize the prompt once for prefill
+        let prompt_tokens = tokenizer.as_ref().map(|t| t.encode("Hello")).unwrap_or_default();
         // Honor `max_tokens` (was a hardcoded 5) and stop sequences.
         for step in 0..max_tokens {
             let token_id = {
                 let mut engine = state.engine.lock().unwrap();
-                sample_next_token(&mut engine, request_id, step, sampler.as_ref())
+                sample_next_token(&mut engine, request_id, step, sampler.as_ref(), if step == 0 { Some(&prompt_tokens) } else { None })
             };
             let token_text = if let Some(tok) = &tokenizer {
                 tok.decode(&[token_id])
@@ -636,7 +647,7 @@ async fn load_model(
                 "[grim-server] Model file not found for '{}', using mock model",
                 req.name
             );
-            let mock = Box::new(grim_models_transformer::Llama::random(
+            let mock = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
                 grim_models_transformer::LlamaConfig {
                     vocab_size: 32000,
                     hidden_size: 512,
@@ -1546,7 +1557,7 @@ mod tests {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
         
         // Register a mock model for testing
-        let mock_model = Box::new(grim_models_transformer::Llama::random(
+        let mock_model = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
             grim_models_transformer::LlamaConfig {
                 vocab_size: 32000,
                 hidden_size: 512,
@@ -1608,7 +1619,7 @@ mod tests {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
         
         // Register a mock model for testing
-        let mock_model = Box::new(grim_models_transformer::Llama::random(
+        let mock_model = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
             grim_models_transformer::LlamaConfig {
                 vocab_size: 32000,
                 hidden_size: 512,
@@ -1662,7 +1673,7 @@ mod tests {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
         
         // Register a mock model for testing
-        let mock_model = Box::new(grim_models_transformer::Llama::random(
+        let mock_model = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
             grim_models_transformer::LlamaConfig {
                 vocab_size: 32000,
                 hidden_size: 512,
@@ -1715,7 +1726,7 @@ mod tests {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default()); // Relaxed mode
         
         // Register a mock model for testing
-        let mock_model = Box::new(grim_models_transformer::Llama::random(
+        let mock_model = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
             grim_models_transformer::LlamaConfig {
                 vocab_size: 32000,
                 hidden_size: 512,
@@ -1768,7 +1779,7 @@ mod tests {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
         
         // Register a mock model for testing
-        let mock_model = Box::new(grim_models_transformer::Llama::random(
+        let mock_model = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
             grim_models_transformer::LlamaConfig {
                 vocab_size: 32000,
                 hidden_size: 512,
@@ -1819,7 +1830,7 @@ mod tests {
     #[tokio::test]
     async fn test_grim_compatibility_shims() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-        let mock_model = Box::new(grim_models_transformer::Llama::random(
+        let mock_model = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
             grim_models_transformer::LlamaConfig {
                 vocab_size: 32000,
                 hidden_size: 512,
@@ -1915,7 +1926,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_completions_honors_max_tokens() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-        let mock_model = Box::new(grim_models_transformer::Llama::random(
+        let mock_model = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
             grim_models_transformer::LlamaConfig {
                 vocab_size: 32000,
                 hidden_size: 512,
@@ -1973,7 +1984,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_completions_honors_stop_sequence() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-        let mock_model = Box::new(grim_models_transformer::Llama::random(
+        let mock_model = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
             grim_models_transformer::LlamaConfig {
                 vocab_size: 32000,
                 hidden_size: 512,

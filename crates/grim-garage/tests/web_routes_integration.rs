@@ -1,15 +1,12 @@
 //! Integration tests for grim-garage web app static asset serving and API endpoints.
 
 use axum::http::{Request, StatusCode};
-use grim_garage::{jobs::JobRegistry, routes::{build_router, AppState}};
-use std::sync::Arc;
+use grim_garage::routes::{build_router, new_app_state};
 use tower::ServiceExt;
 
 #[tokio::test]
 async fn test_serves_embedded_index_html() {
-    let state = AppState {
-        registry: Arc::new(JobRegistry::new()),
-    };
+    let state = new_app_state();
     let app = build_router(state);
 
     let response = app
@@ -34,9 +31,7 @@ async fn test_serves_embedded_index_html() {
 
 #[tokio::test]
 async fn test_serves_embedded_app_js() {
-    let state = AppState {
-        registry: Arc::new(JobRegistry::new()),
-    };
+    let state = new_app_state();
     let app = build_router(state);
 
     let response = app
@@ -60,10 +55,8 @@ async fn test_serves_embedded_app_js() {
 }
 
 #[tokio::test]
-async fn test_chat_endpoint_returns_ok() {
-    let state = AppState {
-        registry: Arc::new(JobRegistry::new()),
-    };
+async fn test_chat_endpoint_fails_when_model_path_does_not_exist() {
+    let state = new_app_state();
     let app = build_router(state);
 
     let payload = serde_json::json!({
@@ -84,5 +77,6 @@ async fn test_chat_endpoint_returns_ok() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    // The handler attempts on-demand model loading which fails (file not found)
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }

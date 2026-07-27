@@ -2,6 +2,7 @@
 
 use grim_core::error::Result;
 use grim_models_transformer::{Llama, LlamaConfig};
+use grim_tensor::Device;
 
 pub async fn cmd_bench(tokens: usize, concurrency: usize) -> Result<()> {
     let cfg = LlamaConfig {
@@ -16,7 +17,7 @@ pub async fn cmd_bench(tokens: usize, concurrency: usize) -> Result<()> {
         rope_theta: 10000.0,
         max_seq_len: 256,
     };
-    let model = Llama::random(cfg);
+    let model = Llama::random(Device::Cpu, cfg);
     let start = std::time::Instant::now();
 
     use grim_core::CausalLm;

@@ -18,7 +18,7 @@ pub mod deterministic_rng;
 pub mod simd_gemm;
 pub mod dequant_gemm;
 
-pub use device::{cpu_tensor, CpuDevice};
+pub use device::{cpu_tensor, add_tensors, CpuDevice};
 pub use deterministic_rng::DeterministicRng;
 pub use storage::CpuStorage;
 pub use simd_gemm::{gemm_f32_simd, gemm_f32_lora_fused};

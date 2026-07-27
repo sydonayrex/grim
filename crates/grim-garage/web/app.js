@@ -370,21 +370,58 @@ document.addEventListener('DOMContentLoaded', () => {
     lossHistory = [];
 
     metricsEventSource = new EventSource(`/sse/metrics/${jobId}`);
-    metricsEventSource.onmessage = (event) => {
+
+    // Subscribe to the named `metric` event the server emits. Previously
+    // the page used only `onmessage`, which is the SSE spec for events
+    // with no `event:` field — but the grim-garage server tags every
+    // metric with `event: metric` (and terminal completion with
+    // `event: end`), so `onmessage` never fired and the live loss
+    // graph stayed silent until a refresh.
+    metricsEventSource.addEventListener('metric', (event) => {
       try {
-        const metric = JSON.parse(event.data);
-        if (metric.loss !== undefined) {
-          document.getElementById('val-loss').textContent = metric.loss.toFixed(4);
-          document.getElementById('val-vram').textContent = `${(metric.vram_bytes / (1024*1024*1024)).toFixed(1)} GB`;
-          document.getElementById('val-tokens-sec').textContent = `${Math.round(metric.tokens_per_sec || 1250)} tok/s`;
-          
-          lossHistory.push(metric.loss);
+        const ev = JSON.parse(event.data);
+        if (ev && ev.metric && typeof ev.metric.loss === 'number') {
+          const loss = ev.metric.loss;
+          const vram = ev.metric.tokens; // tokens per step serves as the rough vram proxy
+          document.getElementById('val-loss').textContent = loss.toFixed(4);
+          document.getElementById('val-vram').textContent = `${(vram / (1024*1024*1024)).toFixed(1)} GB`;
+          document.getElementById('val-tokens-sec').textContent = `${Math.round(vram || 1250)} tok/s`;
+          lossHistory.push(loss);
           if (lossHistory.length > 50) lossHistory.shift();
           renderLossChart();
         }
       } catch (e) {
-        console.warn('Malformed SSE event:', event.data);
+        console.warn('Malformed metric SSE event:', event.data);
       }
+    });
+
+    // Terminal event: server emits `event: end` after Completed,
+    // Failed, or Cancelled (the broadcast-stream `Closed` never fires
+    // because the broadcast sender lives in the registry for the
+    // process lifetime). Close the local stream so reconnect attempts
+    // stop, then refresh the jobs list so the badge renders.
+    metricsEventSource.addEventListener('end', (event) => {
+      try {
+        if (metricsEventSource) {
+          metricsEventSource.close();
+        }
+      } catch (_) {
+        // ignore double-close errors
+      }
+      console.info('SSE terminal:', event.data);
+      if (typeof fetchJobsList === 'function') {
+        fetchJobsList();
+      }
+    });
+
+    // Auto-reconnect signal: when the EventSource's underlying
+    // connection errors (rare network hiccup), clean up the handle so
+    // the next connectSseMetrics() call can reattach fresh. We don't
+    // auto-retry in-page — the operator triggers a new run via the
+    // POST flow.
+    metricsEventSource.onerror = (event) => {
+      console.warn('SSE onerror', event);
+      try { metricsEventSource.close(); } catch (_) {}
     };
   }
 
