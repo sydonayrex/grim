@@ -391,19 +391,14 @@ pub fn read_outliers_with_encoding<R: Read + Seek>(
     if encoding == crate::spec::OutlierIndexEncoding::FlatU32 {
         return read_outliers(reader, entry);
     }
-    // DeltaVarint path: we don't know the on-disk byte length from the
-    // entry alone (it's a varint stream), so we read a generous slice
-    // from `outlier_offset` up to the next region. For the common case
-    // where the outlier stream is the last region of the tensor, read
-    // `outlier_count` records' worth of bytes as an upper bound.
-    let max_bytes = (entry.outlier_count as usize)
-        .saturating_mul(OUTLIER_RECORD_BYTES)
-        .max(OUTLIER_RECORD_BYTES);
+    // DeltaVarint path: read the entire varint stream from outlier_offset.
+    // We don't know the exact byte length upfront (varint is variable-length),
+    // so we read until EOF. The decoder will consume exactly what it needs
+    // and return the bytes consumed.
     reader.seek(SeekFrom::Start(entry.outlier_offset))?;
-    let mut buf = vec![0u8; max_bytes];
-    let read_len = reader.read(&mut buf)?;
-    buf.truncate(read_len);
-    let decoded = crate::spec::decode_outliers_delta_varint(&buf)
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf)?;
+    let (decoded, _bytes_consumed) = crate::spec::decode_outliers_delta_varint(&buf)
         .map_err(Error::Backend)?;
     Ok(decoded
         .into_iter()

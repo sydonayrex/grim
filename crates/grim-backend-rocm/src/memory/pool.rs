@@ -152,7 +152,7 @@ impl DeviceScratchPool {
     /// Free every cached pointer back to the GPU. Used by `Drop` to avoid
     /// leaking the pool's underlying hipMalloc allocations.
     fn drain(&self) {
-        let buckets = match self.buckets.lock() {
+        let mut buckets = match self.buckets.lock() {
             Ok(b) => b,
             Err(_) => return,
         };
@@ -163,6 +163,9 @@ impl DeviceScratchPool {
                 }
             }
         }
+        // MOD-1 fix: clear the bucket map so current_bytes() reflects reality.
+        buckets.clear();
+        self.current_bytes.store(0, Ordering::Relaxed);
     }
 }
 

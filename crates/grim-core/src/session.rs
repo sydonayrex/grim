@@ -8,6 +8,7 @@ use grim_tensor::{Device, Tensor};
 
 use crate::error::Result;
 use crate::kv_cache::KvCache;
+use crate::rng::SimpleRng;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeterminismMode {
@@ -55,6 +56,14 @@ pub trait SessionT: Send {
         None
     }
     fn set_model_state(&mut self, _state: Box<dyn std::any::Any + Send>) {}
+    
+    /// Per-request RNG for deterministic sampling (e.g., speculative rejection).
+    fn request_rng(&self) -> Option<&SimpleRng> {
+        None
+    }
+    fn request_rng_mut(&mut self) -> Option<&mut SimpleRng> {
+        None
+    }
 }
 
 /// Public trait-object alias used in `Model` trait DSL.
@@ -74,14 +83,16 @@ pub struct Inner {
     /// the session so different requests against the same model get
     /// independent caches, matching bebelm-main's ownership model.
     pub model_state: Option<Box<dyn std::any::Any + Send>>,
+    /// Per-request RNG for deterministic sampling (e.g., speculative rejection).
+    pub request_rng: Option<SimpleRng>,
 }
 
 impl Inner {
     pub fn new(device: Device) -> Self {
-        Self { device, kv: None, current_pos: 0, hip_graph_handle: None, last_hidden_state: None, model_state: None }
+        Self { device, kv: None, current_pos: 0, hip_graph_handle: None, last_hidden_state: None, model_state: None, request_rng: None }
     }
     pub fn with_kv(device: Device, kv: Box<dyn KvCache>) -> Self {
-        Self { device, kv: Some(kv), current_pos: 0, hip_graph_handle: None, last_hidden_state: None, model_state: None }
+        Self { device, kv: Some(kv), current_pos: 0, hip_graph_handle: None, last_hidden_state: None, model_state: None, request_rng: None }
     }
 }
 
@@ -141,6 +152,12 @@ impl SessionT for Inner {
     }
     fn set_model_state(&mut self, state: Box<dyn std::any::Any + Send>) {
         self.model_state = Some(state);
+    }
+    fn request_rng(&self) -> Option<&SimpleRng> {
+        self.request_rng.as_ref()
+    }
+    fn request_rng_mut(&mut self) -> Option<&mut SimpleRng> {
+        self.request_rng.as_mut()
     }
 }
 

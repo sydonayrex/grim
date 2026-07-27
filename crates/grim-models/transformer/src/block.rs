@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use grim_core::error::Result;
-use grim_nn::{Linear, RmsNorm};
+use grim_nn::{Linear, RmsNorm, Rope};
 use grim_tensor::{Device, Shape, Tensor};
 
 use crate::model::LlamaConfig;
@@ -28,6 +28,7 @@ pub struct LlamaBlock {
     pub w_gate: Linear,
     pub w_up: Linear,
     pub w_down: Linear,
+    pub rope: Rope,
     pub(crate) _dev: Device,
     pub(crate) _cfg: LlamaConfigRefs,
 }
@@ -79,6 +80,7 @@ impl LlamaBlock {
             /*has_bias=*/false,
         )?;
         let device = wq.weight.device().clone();
+        let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
         Ok(Self {
             attn_norm,
             wq,
@@ -89,6 +91,7 @@ impl LlamaBlock {
             w_gate,
             w_up,
             w_down,
+            rope,
             _dev: device,
             _cfg: LlamaConfigRefs {
                 hidden_size: cfg.hidden_size,
@@ -100,7 +103,7 @@ impl LlamaBlock {
         })
     }
 
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let _dims = x.shape().dims().to_vec();
         let hidden = self._cfg.hidden_size;
 
@@ -110,7 +113,7 @@ impl LlamaBlock {
         let q = self.wq.forward(&x_norm)?;
         let k = self.wk.forward(&x_norm)?;
         let v = self.wv.forward(&x_norm)?;
-        let attn_out = self.prefilled_self_attention(&q, &k, &v)?;
+        let attn_out = self.prefilled_self_attention(&q, &k, &v, positions)?;
         let attn_out = self.wo.forward(&attn_out)?;
 
         let x_res1_data = x_2d.to_vec_f32()?;
@@ -171,8 +174,14 @@ impl LlamaBlock {
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
+        positions: &[u32],
     ) -> Result<Tensor> {
         let cfg = &self._cfg;
+        
+        // Apply RoPE to Q and K
+        let q = self.rope.forward(q, positions)?;
+        let k = self.rope.forward(k, positions)?;
+        
         let qd = q.to_vec_f32()?;
         let kd = k.to_vec_f32()?;
         let vd = v.to_vec_f32()?;
@@ -181,17 +190,23 @@ impl LlamaBlock {
         let scale = 1.0 / (cfg.head_dim as f32).sqrt();
         let mut out = vec![0.0f32; total_tokens * num_head_dims];
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
+        
         for h in 0..cfg.num_heads {
             let kvh = (h * cfg.num_kv_heads) / cfg.num_heads;
             for t in 0..total_tokens {
                 let mut scores = vec![0.0f32; total_tokens];
-                for t2 in 0..total_tokens {
+                // CRIT-1: Causal masking - only attend to current and past tokens (t2 <= t)
+                for t2 in 0..=t {
                     let mut dot = 0.0f32;
                     for d in 0..cfg.head_dim {
                         dot += qd[t * num_head_dims + h * cfg.head_dim + d]
                             * kd[t2 * kv_stride + kvh * cfg.head_dim + d];
                     }
                     scores[t2] = dot * scale;
+                }
+                // Set future positions to -inf for softmax
+                for t2 in (t + 1)..total_tokens {
+                    scores[t2] = f32::NEG_INFINITY;
                 }
                 let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum = 0.0f32;
@@ -204,7 +219,8 @@ impl LlamaBlock {
                 }
                 for d in 0..cfg.head_dim {
                     let mut acc = 0.0f32;
-                    for t2 in 0..total_tokens {
+                    // Only sum over valid (non-masked) positions
+                    for t2 in 0..=t {
                         acc += scores[t2] * vd[t2 * kv_stride + kvh * cfg.head_dim + d];
                     }
                     out[t * num_head_dims + h * cfg.head_dim + d] = acc;

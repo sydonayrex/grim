@@ -312,7 +312,7 @@ fn load_model_from_config(
                 layer_norm_epsilon: rms_norm_eps,
                 max_seq_len,
             };
-            let m = Gpt2::load(&ws, gpt2_cfg)?;
+            let m = Gpt2::load(device.clone(), &ws, gpt2_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Phi2 | ModelArchitecture::Phi3 | ModelArchitecture::PhiMoe => {
@@ -398,7 +398,7 @@ fn load_model_from_config(
                 q_lora_rank: num_heads,
                 kv_lora_rank: num_kv_heads * 4,
             };
-            let m = DeepSeek::load(&ws, deepseek_cfg)?;
+            let m = DeepSeek::load(device.clone(), &ws, deepseek_cfg)?;
             Ok(Box::new(m))
         }
         arch if arch.is_moe() => {
@@ -427,7 +427,7 @@ fn load_model_from_config(
                 q_lora_rank: num_heads,
                 kv_lora_rank: num_kv_heads * 4,
             };
-            let m = DeepSeek::load(&ws, deepseek_cfg)?;
+            let m = DeepSeek::load(device.clone(), &ws, deepseek_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Mamba2 => {
@@ -712,7 +712,7 @@ fn load_model_from_config(
                 layer_norm_epsilon: rms_norm_eps,
                 max_seq_len,
             };
-            let m = Gpt2::load(&ws, cfg)?;
+            let m = Gpt2::load(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Gemma | ModelArchitecture::Gemma2 | ModelArchitecture::Gemma3 | ModelArchitecture::Gemma4 => {
@@ -726,7 +726,7 @@ fn load_model_from_config(
                 intermediate_size: config.intermediate_size.unwrap_or(16384),
                 rms_norm_eps,
             };
-            let m = Gemma::load(&ws, cfg)?;
+            let m = Gemma::load(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::DeepSeek | ModelArchitecture::DeepSeek2 | ModelArchitecture::DeepSeek32 | ModelArchitecture::DeepSeek4 => {
@@ -740,7 +740,7 @@ fn load_model_from_config(
                 q_lora_rank: num_heads,
                 kv_lora_rank: num_kv_heads * 4,
             };
-            let m = DeepSeek::load(&ws, cfg)?;
+            let m = DeepSeek::load(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
         }
         arch if arch.is_encoder() => {
@@ -790,7 +790,7 @@ fn load_model_from_config(
                         q_lora_rank: spec.num_heads,
                         kv_lora_rank: spec.num_kv_heads * 4,
                     };
-                    let m = DeepSeek::load(&ws, deepseek_cfg)?;
+                    let m = DeepSeek::load(device.clone(), &ws, deepseek_cfg)?;
                     return Ok(Box::new(m));
                 } else if spec.is_ssm {
                     let mamba_cfg = MambaConfig {
@@ -928,7 +928,7 @@ fn load_model_with_providers(
                 layer_norm_epsilon: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Gpt2::load(&ws, gpt2_cfg)?;
+            let m = Gpt2::load(device.clone(), &ws, gpt2_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Phi2 | ModelArchitecture::Phi3 | ModelArchitecture::PhiMoe => {
@@ -1014,7 +1014,7 @@ fn load_model_with_providers(
                 q_lora_rank: hparams.num_heads,
                 kv_lora_rank: hparams.num_kv_heads * 4,
             };
-            let m = DeepSeek::load(&ws, deepseek_cfg)?;
+            let m = DeepSeek::load(device.clone(), &ws, deepseek_cfg)?;
             Ok(Box::new(m))
         }
         arch if arch.is_moe() => {
@@ -1043,7 +1043,7 @@ fn load_model_with_providers(
                 q_lora_rank: hparams.num_heads,
                 kv_lora_rank: hparams.num_kv_heads * 4,
             };
-            let m = DeepSeek::load(&ws, deepseek_cfg)?;
+            let m = DeepSeek::load(device.clone(), &ws, deepseek_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Mamba2 => {
@@ -1333,7 +1333,7 @@ fn load_model_with_providers(
                 layer_norm_epsilon: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Gpt2::load(&ws, cfg)?;
+            let m = Gpt2::load(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Gemma | ModelArchitecture::Gemma2 | ModelArchitecture::Gemma3 | ModelArchitecture::Gemma4 => {
@@ -1347,7 +1347,7 @@ fn load_model_with_providers(
                 intermediate_size: hparams.intermediate_size,
                 rms_norm_eps: hparams.rms_norm_eps,
             };
-            let m = Gemma::load(&ws, cfg)?;
+            let m = Gemma::load(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::DeepSeek | ModelArchitecture::DeepSeek2 | ModelArchitecture::DeepSeek32 | ModelArchitecture::DeepSeek4 => {
@@ -1361,7 +1361,7 @@ fn load_model_with_providers(
                 q_lora_rank: hparams.num_heads,
                 kv_lora_rank: hparams.num_kv_heads * 4,
             };
-            let m = DeepSeek::load(&ws, cfg)?;
+            let m = DeepSeek::load(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
         }
         arch if arch.is_encoder() => {
@@ -1418,7 +1418,7 @@ fn load_model_with_providers(
                         q_lora_rank: hparams.num_heads,
                         kv_lora_rank: hparams.num_kv_heads * 4,
                     };
-                    let m = DeepSeek::load(&ws, deepseek_cfg)?;
+                    let m = DeepSeek::load(device.clone(), &ws, deepseek_cfg)?;
                     return Ok(Box::new(m));
                 } else if spec.is_ssm {
                     let mamba_cfg = MambaConfig {

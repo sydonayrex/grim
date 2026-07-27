@@ -398,8 +398,121 @@ fn pack_tensors(
             target_bpw.round() as u8
         };
         
+        // Dequantize raw bytes to f32 values first
+        let f32_values = match raw.dtype.storage {
+            grim_tensor::dtype::Storage::Native => {
+                // Already FP32 - just use as-is
+                raw.bytes.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect::<Vec<f32>>()
+            }
+            grim_tensor::dtype::Storage::KQuant(scheme) => {
+                // Dequantize based on scheme
+                let num_weights = elem_count;
+                match scheme {
+                    grim_tensor::dtype::KQuantScheme::Q80 => {
+                        grim_quant::dequant_q80(&raw.bytes, num_weights)?
+                    }
+                    grim_tensor::dtype::KQuantScheme::Q4K => {
+                        grim_quant::dequant_q4k(&raw.bytes, num_weights)?
+                    }
+                    grim_tensor::dtype::KQuantScheme::Q5K => {
+                        grim_quant::dequant_q5k(&raw.bytes, num_weights)?
+                    }
+                    grim_tensor::dtype::KQuantScheme::Q6K => {
+                        grim_quant::dequant_q6k(&raw.bytes, num_weights)?
+                    }
+                    grim_tensor::dtype::KQuantScheme::Q2K => {
+                        grim_quant::dequant_q2k(&raw.bytes, num_weights)?
+                    }
+                    grim_tensor::dtype::KQuantScheme::Q3K => {
+                        grim_quant::dequant_q3k(&raw.bytes, num_weights)?
+                    }
+                    grim_tensor::dtype::KQuantScheme::IQ4NL => {
+                        grim_quant::dequant_iq4nl(&raw.bytes, num_weights)?
+                    }
+                    grim_tensor::dtype::KQuantScheme::IQ4XS => {
+                        grim_quant::dequant_iq4xs(&raw.bytes, num_weights)?
+                    }
+                    grim_tensor::dtype::KQuantScheme::IQ3XXS => {
+                        grim_quant::dequant_iq3xxs(&raw.bytes, num_weights)?
+                    }
+                    grim_tensor::dtype::KQuantScheme::IQ3S => {
+                        grim_quant::dequant_iq3s(&raw.bytes, num_weights)?
+                    }
+                    grim_tensor::dtype::KQuantScheme::IQ2XXS => {
+                        grim_quant::dequant_iq2xxs(&raw.bytes, num_weights)?
+                    }
+                    grim_tensor::dtype::KQuantScheme::IQ2XS => {
+                        grim_quant::dequant_iq2xs(&raw.bytes, num_weights)?
+                    }
+                    grim_tensor::dtype::KQuantScheme::IQ2S => {
+                        grim_quant::dequant_iq2s(&raw.bytes, num_weights)?
+                    }
+                    _ => {
+                        // Fallback: treat as FP32
+                        raw.bytes.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect::<Vec<f32>>()
+                    }
+                }
+            }
+            grim_tensor::dtype::Storage::Block(bd) => {
+                match bd {
+                    grim_tensor::dtype::BlockDtype::Fp4 | grim_tensor::dtype::BlockDtype::Fp4Block16 => {
+                        grim_quant::dequant_fp4_block16(&raw.bytes, elem_count)?
+                    }
+                    grim_tensor::dtype::BlockDtype::Nf4 => {
+                        grim_quant::dequant_nf4(&raw.bytes, elem_count)?
+                    }
+                    grim_tensor::dtype::BlockDtype::Fp8 | grim_tensor::dtype::BlockDtype::Fp8Block16 => {
+                        grim_quant::dequant_fp8_block16(&raw.bytes, elem_count)?
+                    }
+                    _ => {
+                        // Fallback: treat as FP32
+                        raw.bytes.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect::<Vec<f32>>()
+                    }
+                }
+            }
+            grim_tensor::dtype::Storage::FloatPack(scheme) => {
+                match scheme {
+                    grim_tensor::dtype::FloatPackScheme::Fp4 => {
+                        grim_quant::dequant_fp4(&raw.bytes, elem_count)?
+                    }
+                    grim_tensor::dtype::FloatPackScheme::Nf4 => {
+                        grim_quant::dequant_nf4(&raw.bytes, elem_count)?
+                    }
+                    grim_tensor::dtype::FloatPackScheme::Fp8 => {
+                        grim_quant::dequant_fp8(&raw.bytes, elem_count)?
+                    }
+                    _ => {
+                        // Fallback: treat as FP32
+                        raw.bytes.chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect::<Vec<f32>>()
+                    }
+                }
+            }
+            grim_tensor::dtype::Storage::GroupInt(_) => {
+                // GroupInt not implemented - fallback
+                raw.bytes.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect::<Vec<f32>>()
+            }
+        };
+        
+        // Re-quantize to target bitwidth
         let payload_size = crate::format::normals_packed_size(elem_count, 0, tensor_bitwidth);
-        let mut normals = raw.bytes;
+        let mut normals = Vec::with_capacity(payload_size as usize);
+        
+        // Pack in rows (for now, treat entire tensor as single row)
+        // Wave64 segment = 256 bytes = 2048 bits
+        // At bpw bits per weight, that's 2048/bpw weights per segment
+        crate::format::pack_row_bpw(&mut normals, &f32_values, tensor_bitwidth);
+        
+        // Resize to exact payload size
         normals.resize(payload_size as usize, 0u8);
 
         let entry = crate::format::GrimTensorEntry {

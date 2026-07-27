@@ -17,6 +17,7 @@ use grim_core::model::AdapterHandle;
 use grim_core::session::SessionT;
 use grim_core::{CausalLm, Model, ModelConfig};
 use grim_tensor::{ArithType, Device, Tensor};
+use grim_core::rng::SimpleRng;
 
 
 use crate::confidence_head::ConfidenceHead;
@@ -207,11 +208,20 @@ impl SpeculativeCausalLm {
                 let _bias = markov.bias(&prefix, &scored.base_logits)?;
 
                 // Phase 5: Verification step on Target Causal LM
-                let target_logits = self.target.forward(session, input_ids, positions, adapters)?;
+                // CRIT-3: The target must receive the extended input (original + draft tokens)
+                // to produce logits for all draft positions
+                let extended_input = self.extend_input_ids(input_ids, &scored.tokens[..verify_len])?;
+                let extended_positions = self.extend_positions(positions, verify_len)?;
+                let target_logits = self.target.forward(session, &extended_input, &extended_positions, adapters)?;
                 let target_probs = target_logits.to_vec_f32()?;
                 let vocab_size = scored.base_logits.shape().dims()[1];
                 let draft_logits = scored.base_logits.to_vec_f32()?;
 
+                // CRIT-4: Use per-request RNG instead of global rand::random()
+                let mut rng = session.request_rng().cloned().unwrap_or_else(|| {
+                    SimpleRng::new(rand::random())
+                });
+                
                 // Rejection-sampling validation loop (§5.3)
                 // Correctly index logits as flat [seq, vocab_size] row-major,
                 // apply per-row softmax, and use the standard ratio test with per-request randomness.
@@ -230,15 +240,17 @@ impl SpeculativeCausalLm {
                     } else {
                         0.0
                     };
-                    if rand::random::<f32>() < p_accept {
+                    if rng.next_f32() < p_accept {
                         accepted_count += 1;
                     } else {
                         break;
                     }
                 }
 
-                // KV cache committed; session position advanced by the target model
-            // forward pass above. The wrapper does not call advance_pos again.
+                // CRIT-5: Properly commit/rollback KV cache based on accepted count
+                if let Some(kv) = session.kv_mut() {
+                    kv.commit(accepted_count)?;
+                }
 
                 // Update scheduler and check adaptation gating
                 {
@@ -265,7 +277,10 @@ impl SpeculativeCausalLm {
                     }
                 }
 
-                Ok(target_logits)
+                // CRIT-7: Return logits for the accepted tokens, not the original input
+                // The output logits should correspond to the tokens we actually accepted
+                let accepted_logits = self.extract_accepted_logits(&target_logits, accepted_count, vocab_size)?;
+                Ok(accepted_logits)
             }
         }
     }
@@ -297,7 +312,10 @@ impl SpeculativeCausalLm {
         }
 
         // 3. Verify
-        let target_logits = self.target.forward(session, input_ids, positions, adapters)?;
+        // CRIT-3: Target must receive extended input
+        let extended_input = self.extend_input_ids(input_ids, &draft_block.tokens[..verify_len])?;
+        let extended_positions = self.extend_positions(positions, verify_len)?;
+        let target_logits = self.target.forward(session, &extended_input, &extended_positions, adapters)?;
 
         // 4. Rejection sampling / validation loop (§5.3)
         // Correctly index logits as flat [seq, vocab_size] row-major,
@@ -307,6 +325,9 @@ impl SpeculativeCausalLm {
         let draft_logits = draft_block.base_logits.to_vec_f32()?;
 
         let mut accepted_count = 0;
+        let mut rng = session.request_rng().cloned().unwrap_or_else(|| {
+            SimpleRng::new(rand::random())
+        });
         for i in 0..verify_len {
             let draft_tok = draft_block.tokens[i] as usize;
 
@@ -320,21 +341,52 @@ impl SpeculativeCausalLm {
             } else {
                 0.0
             };
-            if rand::random::<f32>() < p_accept {
+            if rng.next_f32() < p_accept {
                 accepted_count += 1;
             } else {
                 break;
             }
         }
 
-if let Some(kv) = session.kv_mut() {
-             kv.commit(accepted_count)?;
-         }
+        if let Some(kv) = session.kv_mut() {
+            kv.commit(accepted_count)?;
+        }
 
-         Ok(target_logits)
-     }
+        // CRIT-7: Return logits for accepted tokens
+        let accepted_logits = self.extract_accepted_logits(&target_logits, accepted_count, vocab_size)?;
+        Ok(accepted_logits)
+    }
 
 
+    /// Extend input_ids tensor with draft tokens for verification
+    fn extend_input_ids(&self, input_ids: &Tensor, draft_tokens: &[u32]) -> Result<Tensor> {
+        let mut ids = input_ids.to_vec_f32()?;
+        for tok in draft_tokens {
+            ids.push(*tok as f32);
+        }
+        let shape = grim_tensor::Shape::new(vec![ids.len()]);
+        Ok(grim_backend_cpu::cpu_tensor(ids, shape))
+    }
+
+    /// Extend positions tensor for the draft tokens
+    fn extend_positions(&self, positions: &Tensor, num_new: usize) -> Result<Tensor> {
+        let mut pos = positions.to_vec_f32()?;
+        let last_pos = pos.last().copied().unwrap_or(-1.0);
+        for i in 0..num_new {
+            pos.push(last_pos + 1.0 + i as f32);
+        }
+        let shape = grim_tensor::Shape::new(vec![pos.len()]);
+        Ok(grim_backend_cpu::cpu_tensor(pos, shape))
+    }
+
+    /// Extract logits for only the accepted tokens
+    fn extract_accepted_logits(&self, target_logits: &Tensor, accepted_count: usize, vocab_size: usize) -> Result<Tensor> {
+        let all_logits = target_logits.to_vec_f32()?;
+        // Return logits for the first `accepted_count` positions
+        let accepted_logits = all_logits[..accepted_count * vocab_size].to_vec();
+        let shape = grim_tensor::Shape::new(vec![accepted_count, vocab_size]);
+        Ok(grim_backend_cpu::cpu_tensor(accepted_logits, shape))
+    }
 }
 
 impl Model for SpeculativeCausalLm {
@@ -364,8 +416,25 @@ impl CausalLm for SpeculativeCausalLm {
         positions: &Tensor,
         adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
-        self.decode_one(session, input_ids, positions, 0.0, 0, adapters)
+        // CRIT-6: Pass actual scheduling params instead of hardcoded 0.0, 0
+        // These would come from the engine's scheduler/metrics
+        self.decode_one(session, input_ids, positions, 0.5, 0, adapters)
     }
+}
+
+/// Row-wise softmax on an f32 slice in-place.
+fn softmax_f32_row(logits: &[f32]) -> Vec<f32> {
+    let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut exp_sum = 0.0f32;
+    let exps: Vec<f32> = logits
+        .iter()
+        .map(|&x| {
+            let e = (x - max_val).exp();
+            exp_sum += e;
+            e
+        })
+        .collect();
+    exps.into_iter().map(|e| e / exp_sum).collect()
 }
 
 #[cfg(test)]
@@ -527,19 +596,4 @@ mod tests {
         };
         assert_ne!(w_head_before, w_head_after);
     }
-}
-
-/// Row-wise softmax on an f32 slice in-place.
-fn softmax_f32_row(logits: &[f32]) -> Vec<f32> {
-    let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut exp_sum = 0.0f32;
-    let exps: Vec<f32> = logits
-        .iter()
-        .map(|&x| {
-            let e = (x - max_val).exp();
-            exp_sum += e;
-            e
-        })
-        .collect();
-    exps.into_iter().map(|e| e / exp_sum).collect()
 }

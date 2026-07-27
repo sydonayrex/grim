@@ -7,7 +7,7 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
-use grim_nn::{pick_device_for_storage_device, Embedding, Linear, RmsNorm};
+use grim_nn::{pick_device_for_storage_device, Embedding, Linear, RmsNorm, Rope};
 use grim_tensor::{ArithType, Device, DType, Shape, Tensor};
 
 use crate::block::{LlamaBlock, LlamaConfigRefs};
@@ -112,6 +112,7 @@ impl Llama {
                 w_gate: linear(cfg.intermediate_size, cfg.hidden_size),
                 w_up:   linear(cfg.intermediate_size, cfg.hidden_size),
                 w_down: linear(cfg.hidden_size, cfg.intermediate_size),
+                rope: Rope::new(cfg.head_dim, cfg.rope_theta),
                 _dev: Device::Cpu,
                 _cfg: LlamaConfigRefs {
                     hidden_size: cfg.hidden_size,
@@ -139,10 +140,10 @@ impl Llama {
         Ok(self.tok_embeddings.forward(&[token], 1, self.cfg.hidden_size)?)
     }
 
-    pub fn decode(&self, hidden: &Tensor, _positions: &[u32]) -> Result<(Tensor, Tensor)> {
+    pub fn decode(&self, hidden: &Tensor, positions: &[u32]) -> Result<(Tensor, Tensor)> {
         let mut h = hidden.clone();
         for layer in &self.layers {
-            h = layer.forward(&h)?;
+            h = layer.forward(&h, positions)?;
         }
         let h = self.norm.forward(&h)?;
         let logits = self.output.forward(&h)?;
