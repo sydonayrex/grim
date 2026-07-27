@@ -9,6 +9,5 @@
 //! Grim's serving layer calls in a loop until EOT.
 
 pub mod whisper;
-pub mod rng;
 
 pub use whisper::{Whisper, WhisperConfig};

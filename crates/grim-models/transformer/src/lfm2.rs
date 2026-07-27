@@ -1,14 +1,14 @@
 //! LFM2 (Liquid Foundation Model v2) — `CausalLm` implementation in 100% Rust.
 //! Includes recurrent ShortConv blocks and MoE gating logic.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
-use grim_nn::{Embedding, Linear, RmsNorm};
-use grim_tensor::{ArithType, Device, DType, Shape, Tensor};
+use grim_nn::{add_tensors, Embedding, Linear, RmsNorm};
+use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
 #[derive(Debug, Clone)]
 pub struct Lfm2Config {
@@ -198,7 +198,8 @@ impl Lfm2Block {
             }
 
             let y_tensor = device_tensor(y_out, Shape::new(vec![steps, h_dim]), norm_x.device())?;
-            self.shortconv_out_proj.as_ref().unwrap().forward(&y_tensor)?
+            let out_proj_result = self.shortconv_out_proj.as_ref().unwrap().forward(&y_tensor)?;
+            out_proj_result
         } else {
             // Full Causal Scaled Dot-Product Attention with GQA & Per-Head RMSNorm
             let q = self.wq.as_ref().unwrap().forward(&norm_x)?;
@@ -320,7 +321,8 @@ impl Lfm2Block {
         };
 
         // Residual connection
-        let x_added = add_tensors(x, &block_out)?;
+        let x_added = add_tensors(x, &block_out)
+            .map_err(grim_core::Error::Tensor)?;
 
         // FFN block
         let norm_x_ffn = self.ffn_norm.forward(&x_added)?;
@@ -330,6 +332,7 @@ impl Lfm2Block {
         let ffn_out = self.ffn_down.forward(&activated)?;
 
         add_tensors(&x_added, &ffn_out)
+            .map_err(grim_core::Error::Tensor)
     }
 }
 
@@ -340,7 +343,6 @@ pub struct Lfm2 {
     pub layers: Vec<Lfm2Block>,
     pub norm: RmsNorm,
     pub output: Linear,
-    pub caches: Mutex<Vec<Option<Lfm2LayerCache>>>,
 }
 
 impl Lfm2 {
@@ -362,7 +364,6 @@ impl Lfm2 {
         // directly as the Linear lm_head weight.
         let output = Linear::from_tensor(tok_embeddings.weight.clone(), None);
         let device = tok_embeddings.weight.device().clone();
-        let caches = Mutex::new(vec![None; cfg.num_layers]);
 
         Ok(Self {
             cfg,
@@ -371,7 +372,6 @@ impl Lfm2 {
             layers,
             norm,
             output,
-            caches,
         })
     }
 }
@@ -386,11 +386,17 @@ impl Model for Lfm2 {
     fn param_arith(&self) -> ArithType {
         ArithType::F32
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl CausalLm for Lfm2 {
     fn new_session(&self) -> Box<dyn SessionT> {
-        Box::new(Inner::new(self.device.clone()))
+        let caches: Vec<Option<Lfm2LayerCache>> = vec![None; self.layers.len()];
+        let mut session = Inner::new(self.device.clone());
+        session.set_model_state(Box::new(caches));
+        Box::new(session)
     }
 
     fn forward(
@@ -410,14 +416,19 @@ impl CausalLm for Lfm2 {
         let seq_len = ids.len();
         let mut h = self.tok_embeddings.forward(&ids, seq_len, self.cfg.hidden_size)?;
 
-        let mut caches_guard = self.caches.lock().unwrap();
-        if session.current_pos() == 0 {
-            *caches_guard = vec![None; self.layers.len()];
+        // Lazy-init per-layer cache on the session (owned by the session,
+        // not the model — matching bebelm-main's Cache-per-Agent pattern).
+        if session.model_state().is_none() {
+            session.set_model_state(Box::new(vec![None::<Lfm2LayerCache>; self.layers.len()]));
         }
-        for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, &mut caches_guard[i])?;
-        }
+        let caches = session
+            .model_state_mut()
+            .and_then(|s| s.downcast_mut::<Vec<Option<Lfm2LayerCache>>>())
+            .expect("Lfm2::forward: session.model_state must be Vec<Option<Lfm2LayerCache>>");
 
+        for (i, layer) in self.layers.iter().enumerate() {
+            h = layer.forward(&h, &mut caches[i])?;
+        }
         let h_normed = self.norm.forward(&h)?;
         let logits = self.output.forward(&h_normed)?;
 
@@ -426,7 +437,6 @@ impl CausalLm for Lfm2 {
     }
 }
 
-// Helpers
 fn device_tensor(data: Vec<f32>, shape: Shape, device: &Device) -> Result<Tensor> {
     if device == &Device::Cpu {
         Ok(cpu_tensor(data, shape))
@@ -441,13 +451,6 @@ fn device_tensor(data: Vec<f32>, shape: Shape, device: &Device) -> Result<Tensor
             device.clone(),
         ))
     }
-}
-
-fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    let dev = grim_nn::modules::pick_device_for_tensor(a);
-    let (s, h) = grim_tensor::BackendDevice::add(&*dev, a.storage().as_ref(), b.storage().as_ref(), a.shape())?;
-    h.synchronize()?;
-    Ok(Tensor::new(Arc::from(s), a.shape().clone(), DType::F32, a.provenance().clone(), a.device().clone()))
 }
 
 fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {

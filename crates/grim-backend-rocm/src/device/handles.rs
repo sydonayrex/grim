@@ -136,6 +136,7 @@ unsafe extern "C" {
     pub fn hipGetDeviceCount(count: *mut HipErrorT) -> HipErrorT;
     pub fn hipSetDevice(ordinal: HipErrorT) -> HipErrorT;
     pub fn hipGetDeviceProperties(prop: *mut c_void, device: i32) -> HipErrorT;
+    pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> HipErrorT;
     pub fn hipDeviceGetAttribute(
         value: *mut i32,
         attribute: i32,

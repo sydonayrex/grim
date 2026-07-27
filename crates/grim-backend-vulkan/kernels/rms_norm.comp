@@ -1,0 +1,30 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= params.size) return;
+    uint row = id / params.dim;
+    uint col = id % params.dim;
+    float sum_sq = 0.0;
+    for (uint i = 0u; i < params.dim; ++i) {
+        float val = x[row * params.dim + i];
+        sum_sq += val * val;
+    }
+    float rms = sqrt(sum_sq / float(params.dim) + params.eps);
+    y[id] = (x[id] / rms) * w[col];
+}

@@ -1,12 +1,11 @@
 //! T5 family — Encoder-Decoder architecture using relative position bias.
 
-use std::sync::Arc;
-use grim_backend_cpu::cpu_tensor;
+use grim_backend_cpu::{cpu_tensor, add_tensors};
 use grim_core::error::Result;
 use grim_core::model::{EncoderDecoderLm, ModalityHint, CausalLm, AdapterHandle};
 use grim_core::{Model, ModelConfig};
 use grim_nn::{Embedding, Linear, RmsNorm};
-use grim_tensor::{ArithType, Device, DType, Tensor};
+use grim_tensor::{ArithType, Device, Tensor};
 
 #[derive(Debug, Clone)]
 pub struct T5Config {
@@ -71,13 +70,16 @@ impl T5Block {
         let _k = self.wk.forward(&norm_x)?;
         let _v = self.wv.forward(&norm_x)?;
         let attn_out = self.wo.forward(&q)?;
-        let x_res1 = add_tensors(x, &attn_out)?;
+        let x_res1 = add_tensors(x, &attn_out)
+            .map_err(grim_core::Error::Tensor)?;
 
         let norm_x2 = self.ffn_norm.forward(&x_res1)?;
         let up = self.ffn_up.forward(&norm_x2)?;
         let relu_up = relu(&up)?;
         let ffn_out = self.ffn_down.forward(&relu_up)?;
+
         add_tensors(&x_res1, &ffn_out)
+            .map_err(grim_core::Error::Tensor)
     }
 }
 
@@ -123,6 +125,9 @@ impl Model for T5 {
     }
     fn param_arith(&self) -> ArithType {
         ArithType::F32
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -173,13 +178,6 @@ impl CausalLm for T5 {
         let hidden = self.encode(input_ids)?;
         self.decode_step(session, &hidden, input_ids)
     }
-}
-
-fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    let dev = grim_backend_cpu::CpuDevice::new();
-    let (s, h) = grim_tensor::BackendDevice::add(&dev, a.storage().as_ref(), b.storage().as_ref(), a.shape())?;
-    h.synchronize()?;
-    Ok(Tensor::new(Arc::from(s), a.shape().clone(), DType::F32, a.provenance().clone(), a.device().clone()))
 }
 
 fn relu(t: &Tensor) -> Result<Tensor> {

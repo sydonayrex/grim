@@ -1,4 +1,5 @@
 pub mod architecture;
+pub mod rng;
 pub mod catalog;
 pub mod client;
 pub mod config;

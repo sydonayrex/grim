@@ -28,7 +28,7 @@ impl UniformMarkovHead {
     /// length 0) applies a uniform bias; later positions bias later vocab
     /// ids more strongly.
     pub fn new(vocab_size: usize, max_block_len: usize, seed: u64) -> Self {
-        let mut rng = crate::test_rng::SimpleRng::new(seed);
+        let mut rng = grim_core::rng::SimpleRng::new(seed);
         let total = max_block_len * max_block_len * vocab_size;
         let bias_table = (0..total).map(|_| (rng.next_f32() - 0.5) * 0.05).collect();
         Self {

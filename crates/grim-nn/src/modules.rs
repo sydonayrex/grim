@@ -36,6 +36,23 @@ pub fn pick_device_for_storage_device(d: &Device) -> Box<dyn BackendDevice> {
     }
 }
 
+/// Add two tensors element-wise with broadcasting, dispatching to the
+/// device that owns `a`'s storage. This replaces the CPU-only
+/// `grim_backend_cpu::add_tensors` which hardcodes `CpuDevice` and
+/// panics ("storage is not CpuStorage") when called with ROCm tensors.
+pub fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    let dev = pick_device_for_tensor(a);
+    let (s, h) = BackendDevice::add(&*dev, a.storage().as_ref(), b.storage().as_ref(), a.shape())?;
+    h.synchronize()?;
+    Ok(Tensor::new(
+        Arc::from(s),
+        a.shape().clone(),
+        DType::F32,
+        a.provenance().clone(),
+        a.device().clone(),
+    ))
+}
+
 // ---------- Linear ----------
 
 /// Linear: `y = x @ W^T [+ b]` with weight `(out, in)`, optional bias `(out,)`.
@@ -121,9 +138,15 @@ impl Linear {
 }
 
 fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
-    if t.dtype().is_quantized() {
-        return Ok(t.clone());
-    }
+    // Dequantize first so quantized GGUF weights (Q8_0, etc.) are genuinely
+    // transposed to [in_dim, out_dim]. The previous `is_quantized()` early
+    // return left w_t as the untransposed [out_dim, in_dim] storage; on ROCm
+    // (where weights stay quantized after materialize) that made in_proj's
+    // w_t=[3072,1024] instead of [1024,3072], so the matmul's k-dim check
+    // failed with ShapeMismatch{expected:[12,1024], got:[3072,1024]}. On CPU
+    // the GGUF loader dequantizes during materialize, so the early return was
+    // simply never taken there — masking the bug. `to_vec_f32` dequantizes
+    // quantized dtypes, so the path below is correct for both F32 and quant.
     let dims = t.shape().dims().to_vec();
     if dims.len() != 2 {
         return Err(Error::Shape("transpose_last_two: only 2-D".into()));
@@ -140,8 +163,9 @@ fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
     if t.device().is_cpu() {
         Ok(grim_backend_cpu::cpu_tensor(out, new_shape))
     } else {
-        // Re-upload transposed weights back to the source device so the
-        // downstream matmul sees matching CUDA/CUDA storages.
+        // Re-upload transposed (dequantized) weights back to the source
+        // device so the downstream matmul sees matching device storages and
+        // the correct [in_dim, out_dim] layout.
         let dev = pick_device_for_tensor(t);
         let storage = dev.from_cpu(&out, &new_shape, DType::F32)?;
         Ok(Tensor::new(
@@ -235,7 +259,19 @@ impl Embedding {
     pub fn load(ws: &WeightSource<'_>, vocab: usize, dim: usize) -> Result<Self> {
         // Probe `[vocab, dim]`. On exact shape match, use as-is.
         if let Ok(t) = ws.get([vocab, dim], "weight") {
-            return Ok(Self { weight: t });
+            let weight = if t.dtype().is_quantized() {
+                // Embedding kernel expects f32 weights; dequantize if quantized.
+                eprintln!("[Embedding::load] weight is quantized: dtype={:?}, device={:?}", t.dtype(), t.device());
+                let f32s = t.to_vec_f32()?;
+                eprintln!("[Embedding::load] dequantized to f32, len={}", f32s.len());
+                let shape = t.shape().clone();
+                let dev = pick_device_for_tensor(&t);
+                let storage = dev.from_cpu(&f32s, &shape, DType::F32)?;
+                Tensor::new(Arc::from(storage), shape, DType::F32, t.provenance().clone(), t.device().clone())
+            } else {
+                t
+            };
+            return Ok(Self { weight });
         }
 
         // Fallback: load unconstrained tensor and normalize the layout.

@@ -2255,6 +2255,7 @@ dependencies = [
  "grim-autograd",
  "grim-backend-cpu",
  "grim-backend-rocm",
+ "grim-core",
  "grim-engine",
  "grim-format",
  "grim-models-transformer",
@@ -2267,6 +2268,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",
@@ -2314,6 +2316,7 @@ name = "grim-models-audio"
 version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
+ "grim-backend-rocm",
  "grim-core",
  "grim-nn",
  "grim-tensor",
@@ -2336,6 +2339,7 @@ name = "grim-models-mamba"
 version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
+ "grim-backend-rocm",
  "grim-core",
  "grim-memory",
  "grim-nn",
@@ -2461,7 +2465,6 @@ version = "0.1.0"
 dependencies = [
  "grim-format",
  "grim-tensor",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -4940,6 +4943,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

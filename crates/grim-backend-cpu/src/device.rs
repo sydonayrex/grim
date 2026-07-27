@@ -22,7 +22,7 @@ use std::sync::Arc;
 use grim_tensor::backend::{ComputeHandle, ReadyHandle};
 use grim_tensor::dtype::{DType, Device, QuantProvenance, Storage};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{BackendDevice, BackendStorage, Shape};
+use grim_tensor::{BackendDevice, BackendStorage, Shape, Tensor};
 
 use crate::storage::CpuStorage;
 
@@ -676,6 +676,14 @@ pub fn cpu_tensor(data: Vec<f32>, shape: Shape) -> grim_tensor::Tensor {
         QuantProvenance::default(),
         Device::Cpu,
     )
+}
+
+/// Add two tensors element-wise with broadcasting.
+pub fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    let dev = CpuDevice::new();
+    let (s, h) = grim_tensor::BackendDevice::add(&dev, a.storage().as_ref(), b.storage().as_ref(), a.shape())?;
+    h.synchronize()?;
+    Ok(Tensor::new(Arc::from(s), a.shape().clone(), DType::F32, a.provenance().clone(), a.device().clone()))
 }
 
 #[cfg(test)]

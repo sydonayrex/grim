@@ -465,6 +465,11 @@ pub struct GrimMetadata {
     /// backup streams, GPTQ-ORDERED, fusion mask) without changing the
     /// on-disk registry layout. See `spec.rs` for the descriptor schema.
     pub ext_entries: Vec<crate::spec::GrimTensorExt>,
+    /// Raw GGUF key-value pairs preserved from the source GGUF file during
+    /// conversion. This carries `tokenizer.ggml.*` and other metadata that
+    /// the native `.grim` format does not otherwise track. Embedded as a JSON
+    /// object under the `"_gguf_metadata"` key in the `.grim` metadata blob.
+    pub gguf_metadata: Option<HashMap<String, GgufValue>>,
 }
 
 impl Default for GrimMetadata {
@@ -488,7 +493,59 @@ impl Default for GrimMetadata {
             kv_layout_optimized: None,
             has_kv_registry: None,
             ext_entries: Vec::new(),
+            gguf_metadata: None,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GgufValue ↔ JSON conversion helpers
+// ---------------------------------------------------------------------------
+
+fn gguf_value_to_json(v: &GgufValue) -> serde_json::Value {
+    match v {
+        GgufValue::Uint8(n) => serde_json::Value::Number((*n).into()),
+        GgufValue::Int8(n) => serde_json::Value::Number((*n).into()),
+        GgufValue::Uint16(n) => serde_json::Value::Number((*n).into()),
+        GgufValue::Int16(n) => serde_json::Value::Number((*n).into()),
+        GgufValue::Uint32(n) => serde_json::Value::Number((*n).into()),
+        GgufValue::Int32(n) => serde_json::Value::Number((*n).into()),
+        GgufValue::Uint64(n) => serde_json::Value::Number((*n).into()),
+        GgufValue::Int64(n) => serde_json::Value::Number((*n).into()),
+        GgufValue::Float32(f) => serde_json::Value::Number(serde_json::Number::from_f64(*f as f64).unwrap_or(serde_json::Number::from_f64(0.0).unwrap())),
+        GgufValue::Float64(f) => serde_json::Value::Number(serde_json::Number::from_f64(*f).unwrap_or(serde_json::Number::from_f64(0.0).unwrap())),
+        GgufValue::Bool(b) => serde_json::Value::Bool(*b),
+        GgufValue::String(s) => serde_json::Value::String(s.clone()),
+        GgufValue::Array(arr) => serde_json::Value::Array(arr.iter().map(gguf_value_to_json).collect()),
+    }
+}
+
+fn gguf_value_from_json(v: &serde_json::Value) -> Option<GgufValue> {
+    match v {
+        serde_json::Value::Bool(b) => Some(GgufValue::Bool(*b)),
+        serde_json::Value::String(s) => Some(GgufValue::String(s.clone())),
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                if u <= u8::MAX as u64 { return Some(GgufValue::Uint8(u as u8)); }
+                if u <= u16::MAX as u64 { return Some(GgufValue::Uint16(u as u16)); }
+                if u <= u32::MAX as u64 { return Some(GgufValue::Uint32(u as u32)); }
+                Some(GgufValue::Uint64(u))
+            } else if let Some(i) = n.as_i64() {
+                if i >= i8::MIN as i64 && i <= i8::MAX as i64 { return Some(GgufValue::Int8(i as i8)); }
+                if i >= i16::MIN as i64 && i <= i16::MAX as i64 { return Some(GgufValue::Int16(i as i16)); }
+                if i >= i32::MIN as i64 && i <= i32::MAX as i64 { return Some(GgufValue::Int32(i as i32)); }
+                Some(GgufValue::Int64(i))
+            } else if let Some(f) = n.as_f64() {
+                Some(GgufValue::Float64(f))
+            } else {
+                None
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            let items: Vec<GgufValue> = arr.iter().filter_map(gguf_value_from_json).collect();
+            Some(GgufValue::Array(items))
+        }
+        serde_json::Value::Null | serde_json::Value::Object(_) => None,
     }
 }
 
@@ -568,6 +625,7 @@ impl GrimMetadata {
             kv_layout_optimized,
             has_kv_registry,
             ext_entries: Vec::new(),
+            gguf_metadata: None,
         }
     }
 
@@ -802,6 +860,13 @@ impl GrimMetadata {
                 ),
             );
         }
+        if let Some(ref gguf) = self.gguf_metadata {
+            let mut gguf_obj = serde_json::Map::new();
+            for (k, v) in gguf {
+                gguf_obj.insert(k.clone(), gguf_value_to_json(v));
+            }
+            obj.insert("_gguf_metadata".into(), serde_json::Value::Object(gguf_obj));
+        }
         serde_json::Value::Object(obj)
     }
 
@@ -869,6 +934,16 @@ impl GrimMetadata {
             .map(|arr| arr.iter().filter_map(crate::spec::GrimTensorExt::from_json).collect())
             .unwrap_or_default();
 
+        let gguf_metadata = obj
+            .get("_gguf_metadata")
+            .and_then(|v| v.as_object())
+            .map(|gguf_obj| {
+                gguf_obj
+                    .iter()
+                    .filter_map(|(k, v)| Some((k.clone(), gguf_value_from_json(v)?)))
+                    .collect::<HashMap<String, GgufValue>>()
+            });
+
         GrimMetadata {
             magic,
             quant_version,
@@ -888,6 +963,7 @@ impl GrimMetadata {
             kv_layout_optimized,
             has_kv_registry,
             ext_entries,
+            gguf_metadata,
         }
     }
 }
@@ -1370,6 +1446,7 @@ mod tests {
             kv_layout_optimized: Some(true),
             has_kv_registry: Some(true),
             ext_entries: Vec::new(),
+            gguf_metadata: None,
         }
     }
 

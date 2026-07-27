@@ -6,7 +6,6 @@
 //! `NoiseScheduler` (`DDIM`, `Euler`) wraps the iterative loop a real
 //! sampler runs.
 
-mod rng;
 pub mod scheduler;
 pub mod unet;
 
