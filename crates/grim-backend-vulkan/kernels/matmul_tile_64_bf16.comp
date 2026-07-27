@@ -1,0 +1,99 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufA { uint a[]; };
+layout(std430, binding = 1) readonly buffer BufB { uint b[]; };
+layout(std430, binding = 2) writeonly buffer BufC { float c[]; };
+
+// Unpack BF16 from packed uint (two BF16 per uint)
+float unpack_bf16_lo(uint packed) {
+    uint bits = packed & 0xFFFFu;
+    if (bits == 0u) return 0.0;
+    uint sign = bits >> 15u;
+    uint exp = (bits >> 7u) & 0xFFu;
+    uint mant = bits & 0x7Fu;
+    if (exp == 0u) {
+        if (mant == 0u) return 0.0;
+        int lz = 0;
+        for (int i = 6; i >= 0; --i) {
+            if ((mant >> i) & 1u) { lz = 6 - i; break; }
+        }
+        float f = float(mant << (1 - lz)) * exp2(-14.0 - float(lz));
+        return sign == 1u ? -f : f;
+    } else if (exp == 255u) {
+        return sign == 1u ? -1.0 / 0.0 : 1.0 / 0.0;
+    } else {
+        uint f32_exp = exp + 112u;
+        uint f32_bits = (sign << 31u) | (f32_exp << 23u) | (mant << 16u);
+        return asfloat(f32_bits);
+    }
+}
+
+float unpack_bf16_hi(uint packed) {
+    uint bits = packed >> 16u;
+    if (bits == 0u) return 0.0;
+    uint sign = bits >> 15u;
+    uint exp = (bits >> 7u) & 0xFFu;
+    uint mant = bits & 0x7Fu;
+    if (exp == 0u) {
+        if (mant == 0u) return 0.0;
+        int lz = 0;
+        for (int i = 6; i >= 0; --i) {
+            if ((mant >> i) & 1u) { lz = 6 - i; break; }
+        }
+        float f = float(mant << (1 - lz)) * exp2(-14.0 - float(lz));
+        return sign == 1u ? -f : f;
+    } else if (exp == 255u) {
+        return sign == 1u ? -1.0 / 0.0 : 1.0 / 0.0;
+    } else {
+        uint f32_exp = exp + 112u;
+        uint f32_bits = (sign << 31u) | (f32_exp << 23u) | (mant << 16u);
+        return asfloat(f32_bits);
+    }
+}
+
+void main() {
+    uint m = params.m;
+    uint n = params.n;
+    uint k = params.k;
+
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+
+    if (row >= m || col >= n) return;
+
+    float sum = 0.0;
+
+    for (uint p = 0u; p < k; p += 2u) {
+        // Load A[row, p] and A[row, p+1]
+        uint a_idx0 = (row * k + p) / 2u;
+        uint a_idx1 = (row * k + p + 1u) / 2u;
+
+        float a0 = ((p & 1u) == 0u) ? unpack_bf16_lo(a[a_idx0]) : unpack_bf16_hi(a[a_idx0]);
+        float a1 = ((p + 1u) & 1u) == 0u ? unpack_bf16_lo(a[a_idx1]) : unpack_bf16_hi(a[a_idx1]);
+
+        // Load B[p, col] and B[p+1, col]
+        uint b_idx0 = (p * n + col) / 2u;
+        uint b_idx1 = ((p + 1u) * n + col) / 2u;
+
+        float b0 = ((p * n + col) & 1u) == 0u ? unpack_bf16_lo(b[b_idx0]) : unpack_bf16_hi(b[b_idx0]);
+        float b1 = (((p + 1u) * n + col) & 1u) == 0u ? unpack_bf16_lo(b[b_idx1]) : unpack_bf16_hi(b[b_idx1]);
+
+        sum += a0 * b0;
+        if (p + 1u < k) {
+            sum += a1 * b1;
+        }
+    }
+
+    c[row * n + col] = sum;
+}

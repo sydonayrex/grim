@@ -32,6 +32,7 @@ impl JobCardV1 {
             "running" => "●",
             "completed" => "✓",
             "failed" => "✗",
+            "cancelled" => "⏹",
             "pending" => "○",
             other => return format!("? {other}"),
         };

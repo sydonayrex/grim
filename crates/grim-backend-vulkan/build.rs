@@ -14,195 +14,42 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Shared push-constant parameter block. Every kernel declares this exact
-/// layout so the pipeline push-constant range is identical everywhere.
-const PARAMS_GLSL: &str = r#"
-layout(push_constant) uniform Params {
-    uint size; // total element count
-    uint dim;  // inner / feature dimension (rms, softmax, embedding)
-    uint k;    // matmul K
-    uint n;    // matmul N
-    uint m;    // matmul M
-    float eps; // rms norm epsilon
-};
-"#;
+/// Load a kernel source file. The kernel .comp file already contains
+/// its own #version and PARAMS_GLSL block, so we use it as-is.
+fn load_kernel(name: &str) -> String {
+    let path = PathBuf::from("kernels").join(format!("{name}.comp"));
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("Failed to read kernel source: {}", path.display()))
+}
 
 /// (kernel name, glsl source). The name is used for the `.comp`/`.spv` file
 /// and the generated `include_bytes!` constant.
 fn kernels() -> Vec<(&'static str, String)> {
-    let mut out = Vec::new();
-
-    out.push((
-        "add",
-        format!(
-            r#"#version 450
-layout(local_size_x = 256) in;
-{params}
-layout(std430, binding = 0) readonly buffer A {{ float a[]; }};
-layout(std430, binding = 1) readonly buffer B {{ float b[]; }};
-layout(std430, binding = 2) writeonly buffer C {{ float c[]; }};
-void main() {{
-    uint id = gl_GlobalInvocationID.x;
-    if (id >= size) return;
-    c[id] = a[id] + b[id];
-}}
-"#,
-            params = PARAMS_GLSL
-        ),
-    ));
-
-    out.push((
-        "mul",
-        format!(
-            r#"#version 450
-layout(local_size_x = 256) in;
-{params}
-layout(std430, binding = 0) readonly buffer A {{ float a[]; }};
-layout(std430, binding = 1) readonly buffer B {{ float b[]; }};
-layout(std430, binding = 2) writeonly buffer C {{ float c[]; }};
-void main() {{
-    uint id = gl_GlobalInvocationID.x;
-    if (id >= size) return;
-    c[id] = a[id] * b[id];
-}}
-"#,
-            params = PARAMS_GLSL
-        ),
-    ));
-
-    out.push((
-        "silu_mul",
-        format!(
-            r#"#version 450
-layout(local_size_x = 256) in;
-{params}
-layout(std430, binding = 0) readonly buffer A {{ float a[]; }};
-layout(std430, binding = 1) readonly buffer B {{ float b[]; }};
-layout(std430, binding = 2) writeonly buffer C {{ float c[]; }};
-void main() {{
-    uint id = gl_GlobalInvocationID.x;
-    if (id >= size) return;
-    float gate = a[id];
-    float silu = gate / (1.0 + exp(-gate));
-    c[id] = silu * b[id];
-}}
-"#,
-            params = PARAMS_GLSL
-        ),
-    ));
-
-    out.push((
-        "rms_norm",
-        format!(
-            r#"#version 450
-layout(local_size_x = 256) in;
-{params}
-layout(std430, binding = 0) readonly buffer X {{ float x[]; }};
-layout(std430, binding = 1) readonly buffer W {{ float w[]; }};
-layout(std430, binding = 2) writeonly buffer Y {{ float y[]; }};
-void main() {{
-    uint id = gl_GlobalInvocationID.x;
-    if (id >= size) return;
-    uint row = id / dim;
-    uint col = id % dim;
-    float sum_sq = 0.0;
-    for (uint i = 0u; i < dim; ++i) {{
-        float val = x[row * dim + i];
-        sum_sq += val * val;
-    }}
-    float rms = sqrt(sum_sq / float(dim) + eps);
-    y[id] = (x[id] / rms) * w[col];
-}}
-"#,
-            params = PARAMS_GLSL
-        ),
-    ));
-
-    out.push((
-        "softmax",
-        format!(
-            r#"#version 450
-layout(local_size_x = 256) in;
-{params}
-layout(std430, binding = 0) readonly buffer X {{ float x[]; }};
-layout(std430, binding = 1) writeonly buffer Y {{ float y[]; }};
-void main() {{
-    uint id = gl_GlobalInvocationID.x;
-    if (id >= size) return;
-    uint row = id / dim;
-    float max_val = -1e30;
-    for (uint i = 0u; i < dim; ++i) {{
-        max_val = max(max_val, x[row * dim + i]);
-    }}
-    float sum = 0.0;
-    for (uint i = 0u; i < dim; ++i) {{
-        sum += exp(x[row * dim + i] - max_val);
-    }}
-    y[id] = exp(x[id] - max_val) / sum;
-}}
-"#,
-            params = PARAMS_GLSL
-        ),
-    ));
-
-    out.push((
-        "embedding",
-        format!(
-            r#"#version 450
-layout(local_size_x = 256) in;
-{params}
-layout(std430, binding = 0) readonly buffer W {{ float w[]; }};
-layout(std430, binding = 1) readonly buffer I {{ uint indices[]; }};
-layout(std430, binding = 2) writeonly buffer Y {{ float y[]; }};
-void main() {{
-    uint id = gl_GlobalInvocationID.x;
-    uint total = (size / dim) * dim;
-    if (id >= total) return;
-    uint idx_pos = id / dim;
-    uint col = id % dim;
-    uint weight_row = indices[idx_pos];
-    y[id] = w[weight_row * dim + col];
-}}
-"#,
-            params = PARAMS_GLSL
-        ),
-    ));
-
-    // Matmul kernels: one per autotuner tile config. The K/N/M bounds and the
-    // inner loop limit come from push constants, so a single precompiled blob
-    // serves every (m, n, k) triple for that block shape.
-    for (block, suffix) in [(64u32, "64"), (32u32, "32")] {
-        let name = format!("matmul_{suffix}");
-        let source = format!(
-            r#"#version 450
-layout(local_size_x = {b}, local_size_y = {b}, local_size_z = 1) in;
-{params}
-layout(std430, binding = 0) readonly buffer BufA {{ float a[]; }};
-layout(std430, binding = 1) readonly buffer BufB {{ float b[]; }};
-layout(std430, binding = 2) writeonly buffer BufC {{ float c[]; }};
-void main() {{
-    uint gid_x = gl_GlobalInvocationID.x;
-    uint gid_y = gl_GlobalInvocationID.y;
-    if (gid_x >= n || gid_y >= m) return;
-    float sum = 0.0;
-    for (uint p = 0u; p < k; ++p) {{
-        sum += a[gid_y * k + p] * b[p * n + gid_x];
-    }}
-    c[gid_y * n + gid_x] = sum;
-}}
-"#,
-            b = block,
-            params = PARAMS_GLSL
-        );
-        out.push((Box::leak(name.into_boxed_str()), source));
-    }
-
-    out
+vec![
+        ("add", load_kernel("add")),
+        ("mul", load_kernel("mul")),
+        ("silu_mul", load_kernel("silu_mul")),
+        ("rms_norm", load_kernel("rms_norm")),
+        ("softmax", load_kernel("softmax")),
+        ("embedding", load_kernel("embedding")),
+        ("matmul_32", load_kernel("matmul_tile_32")),
+        ("matmul_64", load_kernel("matmul_tile_64")),
+    ]
 }
 
 fn main() {
     println!("cargo:rustc-link-lib=dylib=vulkan");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=kernels/add.comp");
+    println!("cargo:rerun-if-changed=kernels/mul.comp");
+    println!("cargo:rerun-if-changed=kernels/silu_mul.comp");
+    println!("cargo:rerun-if-changed=kernels/rms_norm.comp");
+    println!("cargo:rerun-if-changed=kernels/softmax.comp");
+    println!("cargo:rerun-if-changed=kernels/embedding.comp");
+println!("cargo:rerun-if-changed=kernels/matmul_tile_32.comp");
+println!("cargo:rerun-if-changed=kernels/matmul_tile_64.comp");
+println!("cargo:rerun-if-changed=kernels/matmul_tile_32_bf16.comp");
+println!("cargo:rerun-if-changed=kernels/matmul_tile_64_bf16.comp");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
 

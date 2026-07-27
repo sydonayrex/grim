@@ -4,11 +4,6 @@ pub mod ir;
 pub use ir::{ComputationGraph, FusionSequence, GraphNode, OpType};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TensorNode {
-    pub name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FusionGroup {
     pub op: GrimFusionOp,
     pub tensors: Vec<String>,
@@ -16,7 +11,7 @@ pub struct FusionGroup {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TensorGraphIr {
-    pub nodes: Vec<TensorNode>,
+    pub nodes: Vec<String>,
     pub fusion_groups: Vec<FusionGroup>,
 }
 
@@ -37,11 +32,7 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     let names: Vec<String> = tensor_names.into_iter().map(str::to_string).collect();
-    let nodes = names
-        .iter()
-        .cloned()
-        .map(|name| TensorNode { name })
-        .collect::<Vec<_>>();
+    let nodes = names.clone();
 
     let mut fusion_groups = Vec::new();
 

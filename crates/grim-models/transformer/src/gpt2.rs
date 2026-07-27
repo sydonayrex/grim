@@ -1,7 +1,6 @@
 //! GPT2 & GPT-NeoX family — standard LayerNorm + absolute positional embeddings.
 
-use std::sync::Arc;
-use grim_backend_cpu::cpu_tensor;
+use grim_backend_cpu::{cpu_tensor, add_tensors};
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
@@ -96,12 +95,14 @@ impl Gpt2Block {
         let norm_x = self.ln_1.forward(x)?;
         let qkv = self.wqkv.forward(&norm_x)?;
         let attn_out = self.c_proj.forward(&qkv)?;
-        let x_res1 = add_tensors(x, &attn_out)?;
+        let x_res1 = add_tensors(x, &attn_out)
+            .map_err(grim_core::Error::Tensor)?;
 
         let norm_x2 = self.ln_2.forward(&x_res1)?;
         let gate = self.ffn_gate.forward(&norm_x2)?;
         let ffn_out = self.ffn_down.forward(&gate)?;
         add_tensors(&x_res1, &ffn_out)
+            .map_err(grim_core::Error::Tensor)
     }
 }
 
@@ -148,6 +149,9 @@ impl Model for Gpt2 {
     fn param_arith(&self) -> ArithType {
         ArithType::F32
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl CausalLm for Gpt2 {
@@ -174,7 +178,8 @@ impl CausalLm for Gpt2 {
         let pos_ids: Vec<u32> = (0..seq_len).map(|i| i as u32).collect();
         let pos_emb = self.wpe.forward(&pos_ids, seq_len, self.cfg.hidden_size)?;
 
-        let mut h = add_tensors(&tok_emb, &pos_emb)?;
+        let mut h = add_tensors(&tok_emb, &pos_emb)
+            .map_err(grim_core::Error::Tensor)?;
         for layer in &self.layers {
             h = layer.forward(&h)?;
         }
@@ -183,11 +188,4 @@ impl CausalLm for Gpt2 {
         session.advance_pos(seq_len);
         Ok(logits)
     }
-}
-
-fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    let dev = grim_backend_cpu::CpuDevice::new();
-    let (s, h) = grim_tensor::BackendDevice::add(&dev, a.storage().as_ref(), b.storage().as_ref(), a.shape())?;
-    h.synchronize()?;
-    Ok(Tensor::new(Arc::from(s), a.shape().clone(), DType::F32, a.provenance().clone(), a.device().clone()))
 }

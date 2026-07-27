@@ -18,6 +18,7 @@ grim-tensor-graph = { workspace = true }
 grim-backend-rocm = { workspace = true }
 grim-autograd = { workspace = true }
 grim-engine = { workspace = true }
+grim-core = { workspace = true }
 grim-models-transformer = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,6 +27,7 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # Backend HTTP layer (axum)
 axum = { version = "0.8" }

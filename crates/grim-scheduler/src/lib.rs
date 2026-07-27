@@ -27,6 +27,10 @@ pub struct Request {
     pub model_id: Option<String>,
     /// Adapter ids this request uses for LoRA/batch fusion.
     pub adapter_ids: Vec<u32>,
+    /// Actual input token IDs for the prompt. If provided, these are used
+    /// instead of synthetic position indices during prefill. Length must match
+    /// `prompt_tokens` when present.
+    pub input_ids: Option<Vec<u32>>,
 }
 
 impl Default for Request {
@@ -38,6 +42,7 @@ impl Default for Request {
             consumed_tokens: 0,
             model_id: None,
             adapter_ids: Vec::new(),
+            input_ids: None,
         }
     }
 }

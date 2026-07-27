@@ -347,6 +347,9 @@ impl Model for SpeculativeCausalLm {
     fn param_arith(&self) -> ArithType {
         self.target.param_arith()
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl CausalLm for SpeculativeCausalLm {
@@ -394,6 +397,9 @@ mod tests {
         }
         fn param_arith(&self) -> ArithType {
             ArithType::F32
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 

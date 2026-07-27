@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use tower::ServiceExt;
 use grim_format::gguf::{GgufFile, GgufTensorInfo, GgufValue, GGUF_MAGIC, GGUF_VERSION};
 use grim_garage::discovery::{discover_convertible_models, discover_datasets, discover_models, ModelEntry};
 use grim_garage::jobs::{JobId, JobRegistry, JobStatus, TrainingJob};
@@ -266,7 +267,149 @@ fn job_metrics_append_and_read_back() {
     assert_eq!(job.metrics[0].tokens, 1024);
 }
 
-// ----- ROCm probe -----
+#[test]
+fn job_status_round_trips_cancelled_through_serde_lowercase() {
+    // Verify the wire-rename: serialized as lowercase "cancelled" for
+    // parity with `status_label`/`JobSummary.status`.
+    let s = serde_json::to_string(&JobStatus::Cancelled).expect("serialize");
+    assert_eq!(s, "\"cancelled\"");
+    let back: JobStatus = serde_json::from_str("\"cancelled\"").expect("deserialize");
+    assert_eq!(back, JobStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn cancel_signals_worker_and_status_transitions_to_cancelled() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // H1: cancelling a running worker must (a) stop the worker's loop, and
+    // (b) leave the terminal status as `Cancelled` — never resurrected to
+    // `Completed` by the still-running worker's natural-completion path.
+    let reg = Arc::new(JobRegistry::new());
+    let id = reg
+        .create(TrainingJob {
+            model_path: "/tmp/cancel-test.gguf".into(),
+            dataset_path: "/tmp/cancel-test.jsonl".into(),
+            training_mode: grim_garage::jobs::TrainingMode::Lora,
+            lora_rank: 8,
+            learning_rate: 2e-5,
+            epochs: 10, // 100 steps @ ~10ms ≈ 1s — long enough for cancel to land mid-loop
+            ..Default::default()
+        })
+        .await
+        .expect("create");
+
+    // Run the worker so it transitions to Running + samples step 0.
+    let reg_clone = Arc::clone(&reg);
+    let worker_id = id.clone();
+    tokio::spawn(async move {
+        grim_garage::jobs::run_training_worker(reg_clone, worker_id).await;
+    });
+
+    // Wait for the worker to actually enter its loop (poll until status is
+    // Running with at least one metric) so we don't race the autograd
+    // init. Bounded — gives up to ~400 ms.
+    for _ in 0..40 {
+        if let Some(j) = reg.get(&id).await {
+            if j.status == JobStatus::Running && !j.metrics.is_empty() {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Fire cancellation via the atomic surface the HTTP `cancel_job` route
+    // uses (`request_cancel`).
+    let observed_status = reg.request_cancel(&id).await.expect("request_cancel");
+    assert_eq!(observed_status, JobStatus::Cancelled);
+
+    // Allow the worker's `select!` loop to observe the token and return.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    let snapshot = reg.get(&id).await.expect("job survives");
+    assert_eq!(
+        snapshot.status,
+        JobStatus::Cancelled,
+        "expected Cancelled, got {:?} (worker resurrect bug)",
+        snapshot.status
+    );
+    // A cancelled job records the metrics emitted before the cancel; it
+    // must NOT have reached the full 100 steps a 10-epoch run would emit.
+    assert!(
+        snapshot.metrics.len() < 100,
+        "worker emitted {} metrics after cancel — ran to completion",
+        snapshot.metrics.len()
+    );
+    // Sanity: at least one metric landed before the cancel (the worker
+    // had clearly entered the loop).
+    assert!(
+        !snapshot.metrics.is_empty(),
+        "worker never emitted a metric before cancel — did it start?"
+    );
+}
+
+#[tokio::test]
+async fn cancel_on_missing_job_returns_not_found() {
+    use grim_garage::jobs::JobError;
+    let reg = JobRegistry::new();
+    let bogus = JobId("does-not-exist".into());
+    match reg.cancel(&bogus).await {
+        Err(JobError::NotFound(id)) => assert_eq!(id, "does-not-exist"),
+        other => panic!("cancel: expected NotFound, got {other:?}"),
+    }
+    // The atomic surface used by the HTTP route must agree.
+    match reg.request_cancel(&bogus).await {
+        Err(JobError::NotFound(id)) => assert_eq!(id, "does-not-exist"),
+        other => panic!("request_cancel: expected NotFound, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn update_status_and_broadcast_emits_terminal_completed_event() {
+    use std::sync::Arc;
+
+    // H3: a Completed/Cancelled/Failed transition must broadcast a
+    // terminal `MetricStreamEvent` so SSE clients learn about it without
+    // having to poll `/api/train/status`. The broadcast channel's sender
+    // lives forever (held in the registry), so without this broadcast the
+    // stream would never terminate on the happy path.
+    let reg = Arc::new(JobRegistry::new());
+    let id = reg
+        .create(TrainingJob {
+            model_path: "/tmp/broadcast-test.gguf".into(),
+            dataset_path: "/tmp/broadcast-test.jsonl".into(),
+            training_mode: grim_garage::jobs::TrainingMode::Lora,
+            epochs: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("create");
+
+    // Subscribe FIRST so we observe the broadcast. A consumer subscribed
+    // to the live metrics stream will receive the metric events plus the
+    // terminal one (and the SSE handler keys off this terminal status).
+    let mut rx = reg.subscribe_metrics();
+    // Push one synthetic metric so a real terminal metric is read back.
+    reg.append_metric(
+        &id,
+        grim_garage::jobs::Metric { step: 0, loss: 2.3, tokens: 512 },
+    )
+    .await
+    .expect("append");
+    // Drain the per-step event; the next one must be the terminal.
+    let _step0 = rx.recv().await.expect("recv step 0");
+    reg.update_status_and_broadcast(&id, JobStatus::Completed)
+        .await
+        .expect("broadcast completed");
+    let terminal = rx.recv().await.expect("recv terminal");
+    assert_eq!(terminal.job_id, id.0);
+    assert_eq!(terminal.status, JobStatus::Completed);
+    // Terminal event carries the last recorded metric (step 0) — clients
+    // can render the final loss curve point from the event alone.
+    assert_eq!(terminal.metric.step, 0);
+}
+
+
 
 #[test]
 fn roc_mdevice_info_serializes_name_fields() {
@@ -289,6 +432,191 @@ fn roc_mdevice_info_serializes_name_fields() {
     assert_eq!(info.ordinal, 0);
     assert_eq!(info.wavefront_size, 32);
     let _serde = serde_json::to_string(&info).expect("serialize");
+}
+
+// ----- M1: path traversal validation in start_training -----
+
+/// Helper that mirrors the validation the start_training route must
+/// perform before accepting a `model_path` / `dataset_path` field. The
+/// helper intentionally lives at module scope (not inlined inside the
+/// handler) so we can unit-test it without spinning up an axum router.
+fn validate_job_path(value: &str) -> std::result::Result<(), String> {
+    if value.contains("..") || value.contains('/') || value.contains('\\') {
+        Err(format!("invalid path: {value:?} contains traversal or separator"))
+    } else {
+        Ok(())
+    }
+}
+
+#[test]
+fn path_traversal_validator_rejects_dotdot_in_model_path() {
+    assert!(validate_job_path("../etc/cron.d/x").is_err());
+    assert!(validate_job_path("/absolute/path").is_err());
+    assert!(validate_job_path("normal.gguf").is_ok());
+    assert!(validate_job_path("a\\b\\c.gguf").is_err());
+}
+
+#[tokio::test]
+async fn start_training_route_rejects_path_traversal_in_model_path() {
+    // M1: an `../` segment in model_path or dataset_path must be returned
+    // as 400 BAD_REQUEST — never reach the registry or the worker. Pre-fix
+    // the route accepts any string and the worker's sidecar write would
+    // create directories under arbitrary attacker-controlled paths.
+    use grim_garage::routes;
+    use tower::ServiceExt;
+
+    let state = routes::new_app_state();
+    let app = routes::build_router(state);
+    let body = serde_json::json!({
+        "model_path": "../etc/cron.d/x",
+        "dataset_path": "/data/safe.jsonl",
+        "training_mode": "Lora"
+    })
+    .to_string();
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/api/train/start")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "start_training must reject traversal in model_path"
+    );
+}
+
+#[tokio::test]
+async fn start_training_route_rejects_path_traversal_in_dataset_path() {
+    // M1 symmetric: same defense on dataset_path.
+    let state = grim_garage::routes::new_app_state();
+    let app = grim_garage::routes::build_router(state);
+    let body = serde_json::json!({
+        "model_path": "/safe/model.gguf",
+        "dataset_path": "../share/secrets.jsonl",
+        "training_mode": "Lora"
+    })
+    .to_string();
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/api/train/start")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "start_training must reject traversal in dataset_path"
+    );
+}
+
+// ----- L5: ghost JobSummary defense -----
+
+#[tokio::test]
+async fn list_jobs_filters_out_empty_model_path_rows() {
+    // L5: a job that ended up with an empty `model_path` (e.g. through a
+    // pre-M1 race window or a future code path bypassing path validation)
+    // must not be surfaced as a ghost card. The route layer filters empty
+    // rows out post-snapshot. Hand-inject two jobs, one with model_path
+    // empty, and assert only the well-formed one enters the response.
+    let state = grim_garage::routes::new_app_state();
+    let reg = &state.registry;
+    let real_id = reg
+        .create(TrainingJob {
+            model_path: "real.gguf".into(),
+            dataset_path: "data.jsonl".into(),
+            training_mode: grim_garage::jobs::TrainingMode::Lora,
+            ..Default::default()
+        })
+        .await
+        .expect("create real");
+    let ghost_id = reg
+        .create(TrainingJob {
+            model_path: String::new(),
+            dataset_path: "data.jsonl".into(),
+            training_mode: grim_garage::jobs::TrainingMode::Lora,
+            ..Default::default()
+        })
+        .await
+        .expect("create ghost");
+
+    // Hand-mutate the ghost to match almost-real paths but with empty
+    // model_path — the route filter keys on the post-M1 invariants
+    // (non-empty model_path AND non-empty dataset_path).
+    let app = grim_garage::routes::build_router(state.clone());
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/train/jobs")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    let jobs = body.get("jobs").and_then(|j| j.as_array()).expect("jobs array");
+    let ids: Vec<&str> = jobs
+        .iter()
+        .map(|j| j.get("job_id").and_then(|v| v.as_str()).unwrap_or_default())
+        .collect();
+    assert!(ids.contains(&real_id.0.as_str()), "real job missing");
+    assert!(
+        !ids.contains(&ghost_id.0.as_str()),
+        "ghost (empty model_path) leaked into response: {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn job_registry_snapshot_is_consistent_under_concurrent_eviction() {
+    // L5 race: with the OLD `list() + get()` two-step pattern, an
+    // eviction between the two calls left a "ghost" placeholder in the
+    // route response. The new `JobRegistry::snapshot` returns the full
+    // `(id, status, TrainingJob)` triple under one read lock, so there is
+    // no longer a window where an id appears in list() but vanishes
+    // before get(). Verify the snapshot is internally consistent: every
+    // returned id maps to the very TrainingJob that produced its status.
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    let reg = Arc::new(JobRegistry::new());
+    for i in 0..16 {
+        reg.create(TrainingJob {
+            model_path: format!("m{i}.gguf"),
+            dataset_path: format!("d{i}.jsonl"),
+            training_mode: grim_garage::jobs::TrainingMode::Lora,
+            lora_rank: 16,
+            learning_rate: 2e-5,
+            epochs: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("create");
+    }
+    let snap = reg.snapshot().await;
+    // Pin a specific expected count — if the snapshot ever drifts to a
+    // partial list (regression of the L5 race), this fails. We don't
+    // assert an id/job substring match because UUIDs are random and
+    // independent of insertion content.
+    assert_eq!(snap.len(), 16, "snapshot should enumerate all created jobs");
+    let mut seen: HashSet<String> = HashSet::new();
+    for (id, _status, job) in &snap {
+        assert!(!job.model_path.is_empty(), "snapshot returned a job with empty path: id={}", id.0);
+        seen.insert(id.0.clone());
+    }
+    assert_eq!(seen.len(), 16, "all snapshot ids must be unique");
 }
 
 #[test]

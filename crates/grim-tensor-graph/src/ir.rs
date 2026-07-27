@@ -10,8 +10,6 @@ use grim_tensor::{ArithType, Shape};
 pub enum OpType {
     MatMul,
     RmsNorm,
-    Silu,
-    Gelu,
     QkvProjection,
     AttentionScore,
     Linear,
@@ -44,11 +42,6 @@ pub struct FusionSequence {
 }
 
 impl ComputationGraph {
-    /// Build an empty graph. Used by callers that append nodes incrementally.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Append a node; assigns the next auto-incrementing id.
     pub fn push(&mut self, op_type: OpType, output_tensor: impl Into<String>) -> usize {
         let id = self.nodes.len();
@@ -74,41 +67,40 @@ impl ComputationGraph {
 
         for node in &self.nodes {
             match node.op_type {
-                OpType::RmsNorm => {
-                    if !current.is_empty() {
-                        current.clear();
-                    }
-                    current.push(OpType::RmsNorm);
-                }
+                OpType::RmsNorm => Self::start_sequence(&mut current, OpType::RmsNorm),
                 OpType::MatMul | OpType::Linear
                     if matches!(current.last(), Some(&OpType::RmsNorm)) =>
                 {
-                    current.push(node.op_type.clone());
-                    self.fusion_candidates.push(FusionSequence {
-                        ops: current.clone(),
-                        target_backend_op: "fused_rmsnorm_matmul_rocm".to_string(),
-                    });
-                    current.clear();
+                    Self::complete_sequence(&mut current, node.op_type.clone(), "fused_rmsnorm_matmul_rocm", &mut self.fusion_candidates);
                 }
-                OpType::QkvProjection => {
-                    if !current.is_empty() {
-                        current.clear();
-                    }
-                    current.push(OpType::QkvProjection);
-                }
+                OpType::QkvProjection => Self::start_sequence(&mut current, OpType::QkvProjection),
                 OpType::AttentionScore
                     if matches!(current.last(), Some(&OpType::QkvProjection)) =>
                 {
-                    current.push(OpType::AttentionScore);
-                    self.fusion_candidates.push(FusionSequence {
-                        ops: current.clone(),
-                        target_backend_op: "fused_qkv_attention_rocm".to_string(),
-                    });
-                    current.clear();
+                    Self::complete_sequence(&mut current, node.op_type.clone(), "fused_qkv_attention_rocm", &mut self.fusion_candidates);
                 }
                 _ => current.clear(),
             }
         }
+    }
+
+    fn start_sequence(current: &mut Vec<OpType>, starter: OpType) {
+        current.clear();
+        current.push(starter);
+    }
+
+    fn complete_sequence(
+        current: &mut Vec<OpType>,
+        follower: OpType,
+        backend_op: &str,
+        candidates: &mut Vec<FusionSequence>,
+    ) {
+        current.push(follower);
+        candidates.push(FusionSequence {
+            ops: current.clone(),
+            target_backend_op: backend_op.to_string(),
+        });
+        current.clear();
     }
 }
 
@@ -118,14 +110,14 @@ mod tests {
 
     #[test]
     fn empty_graph_has_no_fusion_candidates() {
-        let mut g = ComputationGraph::new();
+        let mut g = ComputationGraph::default();
         g.identify_fusion_sequences();
         assert!(g.fusion_candidates.is_empty());
     }
 
     #[test]
     fn rmsnorm_followed_by_matmul_is_fused() {
-        let mut g = ComputationGraph::new();
+        let mut g = ComputationGraph::default();
         g.push(OpType::RmsNorm, "normed");
         g.push(OpType::MatMul, "out");
         g.identify_fusion_sequences();
@@ -137,7 +129,7 @@ mod tests {
 
     #[test]
     fn rmsnorm_followed_by_linear_is_fused() {
-        let mut g = ComputationGraph::new();
+        let mut g = ComputationGraph::default();
         g.push(OpType::RmsNorm, "n");
         g.push(OpType::Linear, "out");
         g.identify_fusion_sequences();
@@ -147,7 +139,7 @@ mod tests {
 
     #[test]
     fn qkv_projection_followed_by_attention_is_fused() {
-        let mut g = ComputationGraph::new();
+        let mut g = ComputationGraph::default();
         g.push(OpType::QkvProjection, "qkv");
         g.push(OpType::AttentionScore, "scores");
         g.identify_fusion_sequences();
@@ -157,7 +149,7 @@ mod tests {
 
     #[test]
     fn matmul_without_rmsnorm_is_not_fused() {
-        let mut g = ComputationGraph::new();
+        let mut g = ComputationGraph::default();
         g.push(OpType::MatMul, "out");
         g.identify_fusion_sequences();
         assert!(g.fusion_candidates.is_empty());
@@ -165,16 +157,16 @@ mod tests {
 
     #[test]
     fn rmsnorm_unmatched_does_not_emit_candidate() {
-        let mut g = ComputationGraph::new();
+        let mut g = ComputationGraph::default();
         g.push(OpType::RmsNorm, "n");
-        g.push(OpType::Silu, "s");
+        g.push(OpType::QkvProjection, "s"); // Not fusable with RmsNorm
         g.identify_fusion_sequences();
         assert!(g.fusion_candidates.is_empty());
     }
 
     #[test]
     fn two_independent_rmsnorm_matmul_pairs_emit_two_candidates() {
-        let mut g = ComputationGraph::new();
+        let mut g = ComputationGraph::default();
         g.push(OpType::RmsNorm, "n1");
         g.push(OpType::MatMul, "out1");
         g.push(OpType::RmsNorm, "n2");
@@ -187,7 +179,7 @@ mod tests {
 
     #[test]
     fn push_assigns_monotonic_ids() {
-        let mut g = ComputationGraph::new();
+        let mut g = ComputationGraph::default();
         let a = g.push(OpType::RmsNorm, "n");
         let b = g.push(OpType::MatMul, "out");
         assert_eq!(a, 0);

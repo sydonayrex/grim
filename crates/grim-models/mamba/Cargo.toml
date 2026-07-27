@@ -11,8 +11,10 @@ grim-tensor = { workspace = true }
 grim-nn = { workspace = true }
 grim-core = { workspace = true }
 grim-backend-cpu = { workspace = true }
+grim-backend-rocm = { workspace = true, optional = true }
 grim-memory = { workspace = true }
 thiserror = { workspace = true }
 
 [features]
 default = []
+rocm = ["grim-backend-rocm"]

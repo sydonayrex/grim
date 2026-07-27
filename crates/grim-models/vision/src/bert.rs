@@ -5,7 +5,7 @@ use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
 use grim_core::model::{Encoder, ModalityHint, CausalLm, AdapterHandle};
 use grim_core::{Model, ModelConfig};
-use grim_nn::{Embedding, Linear};
+use grim_nn::{Embedding, Linear, RmsNorm};
 use grim_tensor::{ArithType, Device, DType, Tensor};
 
 #[derive(Debug, Clone)]
@@ -30,47 +30,15 @@ impl ModelConfig for BertConfig {
     }
 }
 
-pub struct LayerNorm {
-    pub weight: Tensor,
-    pub bias: Tensor,
-    pub eps: f32,
-}
-
-impl LayerNorm {
-    pub fn load(ws: &grim_nn::WeightSource<'_>, dim: usize) -> Result<Self> {
-        let weight = ws.get([dim], "weight")?;
-        let bias = ws.get([dim], "bias")?;
-        Ok(Self { weight, bias, eps: 1e-12 })
-    }
-
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let xv = x.to_vec_f32()?;
-        let dim = x.shape().dims().last().copied().unwrap_or(1);
-        let mut out = vec![0.0f32; xv.len()];
-        for chunk in xv.chunks(dim).enumerate() {
-            let (i, c) = chunk;
-            let mean = c.iter().sum::<f32>() / dim as f32;
-            let variance = c.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / dim as f32;
-            let inv_std = 1.0 / (variance + self.eps).sqrt();
-            let w = self.weight.to_vec_f32()?;
-            let b = self.bias.to_vec_f32()?;
-            for j in 0..dim {
-                out[i * dim + j] = ((c[j] - mean) * inv_std) * w[j] + b[j];
-            }
-        }
-        Ok(cpu_tensor(out, x.shape().clone()))
-    }
-}
-
 pub struct BertBlock {
     pub wq: Linear,
     pub wk: Linear,
     pub wv: Linear,
     pub wo: Linear,
-    pub attention_ln: LayerNorm,
+    pub attention_ln: RmsNorm,
     pub ffn_up: Linear,
     pub ffn_down: Linear,
-    pub output_ln: LayerNorm,
+    pub output_ln: RmsNorm,
 }
 
 impl BertBlock {
@@ -79,11 +47,11 @@ impl BertBlock {
         let wk = Linear::load(&ws.pp("attention.self.key"), cfg.hidden_size, cfg.hidden_size, true)?;
         let wv = Linear::load(&ws.pp("attention.self.value"), cfg.hidden_size, cfg.hidden_size, true)?;
         let wo = Linear::load(&ws.pp("attention.output.dense"), cfg.hidden_size, cfg.hidden_size, true)?;
-        let attention_ln = LayerNorm::load(&ws.pp("attention.output.LayerNorm"), cfg.hidden_size)?;
+        let attention_ln = RmsNorm::load(&ws.pp("attention.output.LayerNorm"), cfg.hidden_size, 1e-12)?;
 
         let ffn_up = Linear::load(&ws.pp("intermediate.dense"), cfg.hidden_size, cfg.intermediate_size, true)?;
         let ffn_down = Linear::load(&ws.pp("output.dense"), cfg.intermediate_size, cfg.hidden_size, true)?;
-        let output_ln = LayerNorm::load(&ws.pp("output.LayerNorm"), cfg.hidden_size)?;
+        let output_ln = RmsNorm::load(&ws.pp("output.LayerNorm"), cfg.hidden_size, 1e-12)?;
 
         Ok(Self {
             wq,
@@ -109,7 +77,7 @@ impl BertBlock {
         let gelu_up = gelu(&up)?;
         let ffn_out = self.ffn_down.forward(&gelu_up)?;
         let x_res2 = add_tensors(&norm_attn, &ffn_out)?;
-        self.output_ln.forward(&x_res2)
+        Ok(self.output_ln.forward(&x_res2)?)
     }
 }
 
@@ -119,16 +87,16 @@ pub struct Bert {
     pub word_embeddings: Embedding,
     pub position_embeddings: Embedding,
     pub token_type_embeddings: Embedding,
-    pub embeddings_ln: LayerNorm,
+    pub embeddings_ln: RmsNorm,
     pub layers: Vec<BertBlock>,
 }
 
 impl Bert {
-    pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: BertConfig) -> Result<Self> {
+    pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: BertConfig) -> Result<Self> {
         let word_embeddings = Embedding::load(&ws.pp("embeddings.word_embeddings"), cfg.vocab_size, cfg.hidden_size)?;
         let position_embeddings = Embedding::load(&ws.pp("embeddings.position_embeddings"), cfg.max_seq_len, cfg.hidden_size)?;
         let token_type_embeddings = Embedding::load(&ws.pp("embeddings.token_type_embeddings"), 2, cfg.hidden_size)?;
-        let embeddings_ln = LayerNorm::load(&ws.pp("embeddings.LayerNorm"), cfg.hidden_size)?;
+        let embeddings_ln = RmsNorm::load(&ws.pp("embeddings.LayerNorm"), cfg.hidden_size, 1e-12)?;
 
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -137,7 +105,7 @@ impl Bert {
 
         Ok(Self {
             cfg,
-            device: Device::Cpu,
+            device,
             word_embeddings,
             position_embeddings,
             token_type_embeddings,
@@ -156,6 +124,9 @@ impl Model for Bert {
     }
     fn param_arith(&self) -> ArithType {
         ArithType::F32
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

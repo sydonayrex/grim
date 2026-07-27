@@ -8,7 +8,6 @@ pub mod configs;
 pub mod lora;
 pub mod model;
 pub mod native_mtp;
-pub mod rng;
 pub mod lfm2;
 pub mod gpt2;
 pub mod gemma;
@@ -20,7 +19,7 @@ pub use configs::{BloomConfig, FalconConfig, MoeConfig, PhiConfig, QwenConfig};
 pub use lora::apply_adapters_to_logits;
 pub use model::{Llama, LlamaConfig};
 pub use native_mtp::{LlamaMtp, MtpDepthProvider};
-pub use lfm2::{Lfm2, Lfm2Config};
+pub use lfm2::{Lfm2, Lfm2Config, Lfm2LayerCache};
 pub use gpt2::{Gpt2, Gpt2Config};
 pub use gemma::{Gemma, GemmaConfig};
 pub use deepseek::{DeepSeek, DeepSeekConfig};
@@ -29,6 +28,7 @@ pub use t5::{T5, T5Config};
 #[cfg(test)]
 mod tests {
     use crate::{Llama, LlamaConfig};
+    use grim_tensor::Device;
 
     #[test]
     fn smoke_tiny_llama_logits() {
@@ -44,7 +44,7 @@ mod tests {
             rope_theta: 10000.0,
             max_seq_len: 256,
         };
-        let model = Llama::random(cfg);
+        let model = Llama::random(Device::Cpu, cfg);
         let tok = grim_backend_cpu::cpu_tensor(vec![1.0f32], grim_tensor::Shape::new(vec![1]));
         use grim_core::CausalLm;
         use grim_core::session::Inner;
@@ -73,7 +73,7 @@ mod tests {
             rope_theta: 10000.0,
             max_seq_len: 32,
         };
-        let model = Llama::random(cfg);
+        let model = Llama::random(Device::Cpu, cfg);
         let tok = grim_backend_cpu::cpu_tensor(vec![1.0f32, 2.0f32], grim_tensor::Shape::new(vec![2]));
         let mut sess_a = grim_core::session::Inner::new(model.device.clone());
         let mut sess_b = grim_core::session::Inner::new(model.device.clone());

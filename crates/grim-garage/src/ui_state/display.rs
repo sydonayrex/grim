@@ -45,6 +45,21 @@ impl DisplayState {
         self.inner.jobs.insert(job.job_id.clone(), job);
     }
 
+    /// Replace the entire jobs map wholesale and prune `live_metrics` for
+    /// any ids not present in the new set. Mirrors the semantics the poller
+    /// needs: the backend's `/api/train/jobs` is the source of truth for
+    /// the live job set, so ids that disappear from the wire (e.g. the
+    /// backend prunes completed jobs from memory) must also disappear
+    /// from the UI's display state. This is the counterpart to the
+    /// monotonic-growth problem in `upsert_job` alone.
+    pub fn set_jobs(&mut self, jobs: HashMap<String, UiJob>) {
+        // Drop live_metrics for ids no longer represented.
+        self.inner
+            .live_metrics
+            .retain(|id, _| jobs.contains_key(id));
+        self.inner.jobs = jobs;
+    }
+
     pub fn select_model(&mut self, id: String) {
         self.inner.selected_model = Some(id);
     }

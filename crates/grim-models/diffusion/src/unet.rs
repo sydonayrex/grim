@@ -12,7 +12,7 @@ use grim_core::model::{DiffusionModel, ModalityHint, NoiseScheduler};
 use grim_core::{Model, ModelConfig};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 
-use crate::rng::SimpleRng;
+use grim_core::rng::SimpleRng;
 use crate::scheduler::DdimScheduler;
 
 /// Small UNet config.
@@ -110,11 +110,11 @@ impl UpBlock {
 }
 
 impl Unet2D {
-    pub fn random(cfg: UnetConfig) -> Self {
-        Self::new(cfg, &mut SimpleRng::new(0xDEED_70E5_1A55_C0DEu64))
+    pub fn random(device: Device, cfg: UnetConfig) -> Self {
+        Self::new(device, cfg, &mut SimpleRng::new(0xDEED_70E5_1A55_C0DEu64))
     }
 
-    pub fn new(cfg: UnetConfig, rng: &mut SimpleRng) -> Self {
+    pub fn new(device: Device, cfg: UnetConfig, rng: &mut SimpleRng) -> Self {
         let in_proj_w = rand_mat(cfg.hidden, cfg.in_channels, rng);
         let in_proj_b = vec![0.0; cfg.hidden];
         let time_emb_w = rand_mat(cfg.hidden, cfg.hidden, rng);
@@ -129,7 +129,7 @@ impl Unet2D {
         let scheduler: Box<dyn NoiseScheduler> = Box::new(DdimScheduler::linear(20, 0.0001, 0.02));
         Self {
             cfg,
-            device: Device::Cpu,
+            device,
             in_proj_w,
             in_proj_b,
             time_emb_w,
@@ -158,6 +158,7 @@ impl Model for Unet2D {
     fn config(&self) -> &dyn ModelConfig { &self.cfg }
     fn device(&self) -> &Device { &self.device }
     fn param_arith(&self) -> ArithType { ArithType::F32 }
+    fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
 impl DiffusionModel for Unet2D {
@@ -292,7 +293,7 @@ mod tests {
 
     #[test]
     fn unet_denoise_step_shape_4d() {
-        let u = Unet2D::random(cfg());
+        let u = Unet2D::random(Device::Cpu, cfg());
         let lat = cpu_tensor(vec![1.0f32; 1 * 4 * 8 * 8], Shape::new(vec![1, 4, 8, 8]));
         let t = cpu_tensor(vec![500.0f32], Shape::new(vec![1]));
         let cond = cpu_tensor(vec![0.5f32; 8], Shape::new(vec![8]));
@@ -304,7 +305,7 @@ mod tests {
 
     #[test]
     fn unet_rejects_bad_channels() {
-        let u = Unet2D::random(cfg());
+        let u = Unet2D::random(Device::Cpu, cfg());
         let lat = cpu_tensor(vec![1.0f32; 1 * 3 * 8 * 8], Shape::new(vec![1, 3, 8, 8]));
         let t = cpu_tensor(vec![0.0f32], Shape::new(vec![1]));
         let cond = cpu_tensor(vec![0.0f32; 4], Shape::new(vec![4]));
@@ -318,7 +319,7 @@ mod tests {
 
     #[test]
     fn unet_scheduler_is_ddim_by_default() {
-        let u = Unet2D::random(cfg());
+        let u = Unet2D::random(Device::Cpu, cfg());
         // Memory layout of the returned scheduler is implementation-defined;
         // we just ensure it returns something and the timestep list is non-empty.
         let _ = u.scheduler();

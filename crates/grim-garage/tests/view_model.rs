@@ -117,6 +117,30 @@ fn job_card_shows_status_emoji_for_running_state() {
 }
 
 #[test]
+fn job_card_renders_stop_glyph_for_cancelled_status() {
+    // Defensive: the UI side must not silently fall through the wildcard
+    // `? cancelled` arm when the wire emits "cancelled". The badge should
+    // carry a recognizable stop glyph (U+23F9) instead of a question mark.
+    let card = JobCardV1 {
+        job_id: "abc".into(),
+        status: "cancelled".into(),
+        model_path: "/p".into(),
+        dataset_path: "/d".into(),
+        training_mode: "QLoRA".into(),
+    };
+    let label = card.badge_label();
+    assert!(
+        label.contains('\u{23F9}'),
+        "cancelled badge should embed U+23F9; got {label:?}"
+    );
+    assert!(label.contains("cancelled"));
+    assert!(
+        !label.starts_with('?'),
+        "must not hit the unknown-status wildcard; got {label:?}"
+    );
+}
+
+#[test]
 fn app_shell_layout_groups_panels_into_three_columns() {
     let layout = AppShellLayout::default();
     assert!(layout.header_height > 0);
@@ -131,6 +155,61 @@ fn viewmodel_round_trips_through_serde() {
     let back: ViewModel = serde_json::from_str(&json).expect("de");
     assert_eq!(back.models.len(), vm.models.len());
     assert_eq!(back.training_config.lora_rank, vm.training_config.lora_rank);
+}
+
+#[test]
+fn display_state_set_jobs_prunes_stale_jobs_and_metrics() {
+    // H5: the poller must replace the whole job map rather than merging
+    // per-id; otherwise completed/failed jobs the backend pruned (e.g.
+    // memory cap) linger in the UI's history forever. `set_jobs` also
+    // prunes `live_metrics` for removed ids to keep memory bounded.
+    use std::collections::HashMap;
+    use grim_garage::UiJob;
+
+    let mut s = DisplayState::new();
+
+    fn job(id: &str, status: &str) -> UiJob {
+        UiJob {
+            job_id: id.into(),
+            status: status.into(),
+            model_path: format!("/models/{id}.gguf"),
+            dataset_path: "/d.jsonl".into(),
+            training_mode: "LoRA".into(),
+        }
+    }
+
+    // Seed two jobs the long way (mimics old per-id upserts).
+    s.upsert_job(job("keep", "running"));
+    s.upsert_job(job("gone", "completed"));
+    s.push_metric("keep", 0, 2.3);
+    s.push_metric("gone", 0, 4.1);
+    s.push_metric("gone", 1, 3.9);
+    assert_eq!(s.jobs().len(), 2);
+    assert_eq!(s.metric_series("gone").len(), 2);
+
+    // Replace the job set with only "keep". "gone" must vanish from jobs
+    // AND its metric series must be pruned (else DisplayState leaks).
+    let mut next: HashMap<String, UiJob> = HashMap::new();
+    next.insert("keep".to_string(), job("keep", "completed"));
+    s.set_jobs(next);
+
+    let jobs = s.jobs();
+    assert_eq!(jobs.len(), 1, "stale job leaked through set_jobs: {jobs:?}");
+    assert!(jobs.contains_key("keep"));
+    assert!(
+        !jobs.contains_key("gone"),
+        "set_jobs did not prune absent 'gone' job"
+    );
+    assert_eq!(
+        s.metric_series("gone").len(),
+        0,
+        "live_metrics for pruned job was not garbage-collected"
+    );
+    assert_eq!(
+        s.metric_series("keep").len(),
+        1,
+        "metrics for retained job should survive set_jobs"
+    );
 }
 
 // ----- helpers -----

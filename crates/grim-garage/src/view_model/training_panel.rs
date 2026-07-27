@@ -46,6 +46,10 @@ impl TrainingPanelV1 {
                 "Training mode: QLoRA (quantized)".into(),
                 "Wider quant formats (Q5_K, Q8_0) preserve more signal but consume more VRAM.".into(),
             ),
+            "Bf16-Full" => (
+                "Training mode: BF16 full fine-tune".into(),
+                "Materialization target is whatever the model ships as; no LoRA adapter.".into(),
+            ),
             "GRPO" => (
                 "Training mode: GRPO (RL)".into(),
                 "Group Relative Policy Optimization for reinforcement learning.".into(),
@@ -58,9 +62,15 @@ impl TrainingPanelV1 {
                 "Training mode: ORPO (RL)".into(),
                 "Odds-Ratio Preference Optimization for joint SFT and alignment.".into(),
             ),
-            _ => (
-                "Training mode: BF16 full fine-tune".into(),
-                "Materialization target is whatever the model ships as; no LoRA adapter.".into(),
+            // L4: previously this arm silently masked typos / stale
+            // configs as BF16. There is no fallback family for "unknown"
+            // — the panel surfaces the unrecognized string verbatim and
+            // tells the operator to fix the config. Pre-fix, the
+            // wildcards arm quietly picked BF16 and the quant picker
+            // hid defective modes.
+            other => (
+                format!("Training mode: unknown ({other})"),
+                "Selected training_mode is not recognized; pick one from the dropdown. Quantization picker hidden until fixed.".into(),
             ),
         };
         Self {
@@ -127,6 +137,58 @@ mod tests {
         let p_orpo = TrainingPanelV1::from_form(&form);
         assert!(!p_orpo.show_quant_format_picker);
         assert!(p_orpo.help_text.contains("Odds-Ratio"));
+    }
+
+    #[test]
+    fn known_training_modes_have_specific_mode_options_strings() {
+        // L4: the canonical six modes the panel supports. Any drift
+        // from this list intentionally fails this assertion so the
+        // dropdown, the from_form match, the poller wire labels, and
+        // `jobs::TrainingMode` stay in lock-step.
+        let form = HyperparamFormV1::default();
+        let p = TrainingPanelV1::from_form(&form);
+        assert_eq!(
+            p.mode_options,
+            vec![
+                "LoRA".to_string(),
+                "QLoRA".to_string(),
+                "Bf16-Full".to_string(),
+                "GRPO".to_string(),
+                "DPO".to_string(),
+                "ORPO".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_training_mode_renders_unknown_panel_label() {
+        // L4: a stale config carrying "Lo-RA" (typo) silently trained as
+        // BF16 pre-fix (quantization picker hidden). The expected
+        // post-fix behavior is the panel rendering a recognizable
+        // `unknown (...)` title and help text that doesn't claim the
+        // mode *is* BF16.
+        let mut form = HyperparamFormV1::default();
+        form.training_mode = "Lo-RA".into();
+        let p = TrainingPanelV1::from_form(&form);
+        assert!(p.panel_title.contains("unknown"));
+        assert!(p.panel_title.contains("Lo-RA"));
+        assert!(p.help_text.contains("not recognized"));
+        assert!(
+            !p.help_text.contains("Materialization"),
+            "unknown mode must NOT inherit BF16 help text: got {p:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_rl_mode_is_explicitly_labeled() {
+        // Slot between well-known RL modes for deprecation / typo space.
+        let mut form = HyperparamFormV1::default();
+        form.training_mode = "PPO".into();
+        let p = TrainingPanelV1::from_form(&form);
+        assert!(p.panel_title.contains("unknown"));
+        // Quant picker must remain hidden: an unknown mode shouldn't
+        // appear like a quant-aware mode either way.
+        assert!(!p.show_quant_format_picker);
     }
 }
 

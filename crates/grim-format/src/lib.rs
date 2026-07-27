@@ -16,6 +16,7 @@ pub use gguf::{
     GrimTrainQuantMode,
 };
 pub use tprov::GgufProvider;
+pub use tprov::GrimProvider;
 pub use tokenizer::GgufTokenizer;
 pub use convert::{convert_gguf_to_grim, convert_to_grim};
 pub use format::{GrimHeader, GrimTensorEntry, FUCKING_SORCERY};

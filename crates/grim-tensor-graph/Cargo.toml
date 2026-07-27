@@ -9,7 +9,6 @@ description = "Checkpoint-derived tensor graph IR and fusion-pattern detection f
 [dependencies]
 grim-format = { workspace = true }
 grim-tensor = { workspace = true }
-thiserror = "1"
 
 [features]
 default = []
