@@ -8,6 +8,18 @@ use grim_core::{Model, ModelConfig};
 use grim_nn::{Embedding, Linear};
 use grim_tensor::{ArithType, Device, DType, Tensor};
 
+/// Tanh-based GELU approximation (GPT-2 paper: Gaussian Error Linear Units).
+/// GELU(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³))).
+fn gelu(t: &Tensor) -> Result<Tensor> {
+    let v = t.to_vec_f32()?;
+    let mut out = vec![0.0f32; v.len()];
+    for i in 0..v.len() {
+        let x = v[i];
+        out[i] = 0.5 * x * (1.0 + (x * 0.797884 * (1.0 + 0.044715 * x * x)).tanh());
+    }
+    Ok(cpu_tensor(out, t.shape().clone()))
+}
+
 #[derive(Debug, Clone)]
 pub struct Gpt2Config {
     pub vocab_size: usize,
@@ -171,6 +183,10 @@ impl Gpt2Block {
 
         let norm_x2 = self.ln_2.forward(&x_res1)?;
         let gate = self.ffn_gate.forward(&norm_x2)?;
+        // CRIT-2: GPT-2 MLP is Linear(c_fc) → GELU → Linear(c_proj).
+        // Without the activation the two linear layers compose to a single
+        // linear transformation, destroying model capacity.
+        let gate = gelu(&gate)?;
         let ffn_out = self.ffn_down.forward(&gate)?;
         add_tensors(&x_res1, &ffn_out)
             .map_err(grim_core::Error::Tensor)

@@ -357,9 +357,17 @@ async fn chat_completions(
         let stop_sequences_clone = stop_sequences.clone();
         let max_tokens_clone = max_tokens;
 
+        // CRIT-1: generate ONE request_id for the entire streaming session so
+        // sample_next_token enqueues a request on step 0 and can look up the
+        // outcome on every subsequent step. The previous code created a new id
+        // per step, meaning no request existed under that id on steps > 0, so
+        // engine.last_outcome() returned None and the token fell back to the
+        // step index (not a real sampled token).
+        let session_request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+
         let stream = futures::stream::unfold(
-            (0u64, String::new(), prompt_tokens.clone()), // (step, accumulated content, prompt_tokens)
-            move |(step, mut emitted, prompt_tokens): (u64, String, Vec<u32>)| {
+            (0u64, String::new(), prompt_tokens.clone(), session_request_id),
+            move |(step, mut emitted, prompt_tokens, request_id): (u64, String, Vec<u32>, u64)| {
                 let state = state_clone.clone();
                 let adapter_ids = adapter_ids_clone.clone();
                 let stop_seqs = stop_sequences_clone.clone();
@@ -370,11 +378,6 @@ async fn chat_completions(
                     if step >= max_tokens_clone {
                         return None;
                     }
-
-                    // Use a fixed request ID so we can always look up the outcome.
-                    // The engine processes one request per tick: prefill on step 0,
-                    // then decode on subsequent steps.
-                    let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
 
                     let token_id = {
                         let mut engine = state.engine.lock().unwrap();
@@ -402,7 +405,7 @@ async fn chat_completions(
                         .event("message")
                         .data(payload);
                     let res: std::result::Result<axum::response::sse::Event, axum::Error> = Ok(event);
-                    Some((res, (step + 1, emitted, prompt_tokens)))
+                    Some((res, (step + 1, emitted, prompt_tokens, request_id)))
                 }
             },
         );

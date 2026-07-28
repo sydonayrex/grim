@@ -526,7 +526,10 @@ pub fn render_messages_or_last(
             messages,
             true,
             "",
-            tokenizer.eos_token_id.map(|_| "</s>").unwrap_or("").as_ref(),
+            tokenizer.eos_token_id
+                .and_then(|id| tokenizer.tokens.get(id as usize))
+                .map(|s| s.as_str())
+                .unwrap_or(""),
         )
         .unwrap_or_else(|e| {
             eprintln!("[grim-format] chat template render failed, falling back to last message: {e}");

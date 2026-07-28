@@ -189,6 +189,19 @@ pub fn apply_adapters_to_logits(
                 "LoRA B out_dim {out_dim} != vocab {vocab}"
             )));
         }
+        // MED-5: The CPU LoRA path only has access to `logits` (shape
+        // [seq_len, vocab]), not the hidden state (shape [seq_len,
+        // hidden_size]).  When hidden_size != vocab, using logits as a
+        // surrogate silently reads the wrong element.  Reject the mismatch
+        // here rather than produce silently wrong output.
+        if in_dim != vocab {
+            return Err(Error::Shape(format!(
+                "CPU LoRA path requires hidden_size ({hidden_size}) == vocab ({vocab}) because it \
+                 uses the final logits tensor as a hidden-state surrogate. \
+                 hidden_size ({}) and vocab ({}) differ.",
+                in_dim, vocab
+            )));
+        }
         let scale = adapter.alpha / rank as f32;
         let a_data = adapter.a.to_vec_f32()?;
         let b_data = adapter.b.to_vec_f32()?;
