@@ -13,13 +13,17 @@ grim-backend-cpu = { workspace = true }
 grim-backend-rocm = { workspace = true }
 grim-backend-cuda = { workspace = true }
 grim-backend-metal = { workspace = true }
+grim-backend-vulkan = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 
 [features]
-default = ["cuda-mem", "rocm-mem", "metal-mem"]
+default = ["cuda-mem", "rocm-mem", "metal-mem", "vulkan-mem"]
 cuda-mem = []
 rocm-mem = []
 metal-mem = []
+vulkan-mem = []
+# grim-garage's gpu-selection feature turns on every GPU backend arm.
+gpu-selection = ["cuda-mem", "rocm-mem", "metal-mem", "vulkan-mem"]
 
 [dev-dependencies]
 grim-quant = { workspace = true }

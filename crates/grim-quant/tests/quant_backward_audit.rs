@@ -5,10 +5,8 @@
 //! 2. Backward GEMM gradient computation `dX = dY @ B^T` through dequantized weights
 //!    matches FP32 reference gradients within per-format tolerances (Q8_0 < 5%, Q4_K < 10%).
 //! 3. `backup2` bolt-on merged adapter weights preserve backward gradient fidelity.
-//! 4. Optional ROCm GPU path verification when `GRIM_RUN_GPU_TESTS` is set.
+//! 4. ROCm GPU path moved to `grim-backend-rocm/tests/quant_backward_gpu.rs`.
 
-#[cfg(feature = "rocm")]
-use grim_backend_rocm::RocmDevice;
 use grim_quant::{quant_q80, dequant_q80, quant_q4k, dequant_q4k};
 use grim_tensor::{backend::BackendDevice, dtype::{DType, KQuantScheme, Storage}, Shape};
 
@@ -162,71 +160,3 @@ fn quant_backward_audit_fail_check_corrupted_data() {
     );
 }
 
-/// WI-F1-close: Verify ROCm fused backward kernel `dX = dY @ B^T` for Q8_0
-/// weights against FP32 reference when running on a real ROCm device.
-///
-/// NOTE: gated with `#[cfg(any())]` because grim-quant no longer carries the
-/// `rocm` feature (removed to break the cyclic dependency grim-format →
-/// grim-quant → grim-backend-rocm → grim-format). Move this test to a
-/// workspace-level integration test or a crate that actually depends on
-/// grim-backend-rocm.
-#[cfg(any())]
-#[test]
-fn quant_backward_audit_rocm_q8_0_gemm_dx_numerics() {
-    const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
-    if std::env::var(GPU_TEST_ENV).is_err() {
-        return;
-    }
-    let rocm_devices = match RocmDevice::probe() {
-        Ok(d) if !d.is_empty() => d,
-        _ => return,
-    };
-    let dev = RocmDevice::new(rocm_devices[0].ordinal());
-
-    let (m, k, n) = (8, 16, 16);
-    let dy_host: Vec<f32> = (0..m * n).map(|i| (i as f32 * 0.05).cos()).collect();
-    let b_orig: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.1).sin() * 5.0).collect();
-
-    // Reference gradient on CPU
-    let dx_ref = compute_dx(&dy_host, &b_orig, m, n, k);
-
-    // Upload dy to ROCm as F32
-    let dy_shape = Shape::from_slice(&[m, n]);
-    let dy_rocm = dev.from_cpu(&dy_host, &dy_shape, DType::F32).unwrap();
-
-    // Quantize b to Q8_0, upload packed bytes to ROCm
-    let b_packed = quant_q80(&b_orig).unwrap();
-    let b_rocm_shape = Shape::from_slice(&[k * n]);
-    let b_rocm = dev.from_cpu_bytes(
-        &b_packed,
-        &b_rocm_shape,
-        DType {
-            arith: grim_tensor::dtype::ArithType::F32,
-            storage: Storage::KQuant(KQuantScheme::Q80),
-        },
-    ).unwrap();
-
-    // Call ROCm fused backward kernel for dX
-    let out_shape = Shape::from_slice(&[m, k]);
-    let residuals = grim_tensor::QuantizedMatmulBackwardResiduals::default();
-    let (dx_rocm, _handle) = dev.quantized_matmul_backward_dx(
-        dy_rocm.as_ref(),
-        b_rocm.as_ref(),
-        &[],
-        8, // bpw for Q8_0
-        m,
-        n,
-        k,
-        &out_shape,
-        Some(&residuals),
-    ).expect("ROCm quantized_matmul_backward_dx must succeed on a real ROCm device");
-
-    // Copy result back to CPU
-    let dx_rocm_vec = dx_rocm.to_cpu_vec_f32().expect("ROCm result must be readable");
-
-    let rms = rms_rel_err(&dx_ref, &dx_rocm_vec);
-    assert!(
-        rms <= MAX_RMS_REL_ERROR_Q8,
-        "ROCm Q8_0 backward GEMM dX RMS rel error {rms:.6} exceeds limit {MAX_RMS_REL_ERROR_Q8}"
-    );
-}

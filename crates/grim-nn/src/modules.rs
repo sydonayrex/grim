@@ -3,9 +3,13 @@
 use std::sync::Arc;
 
 use grim_backend_cpu::CpuDevice;
+#[cfg(feature = "metal-mem")]
+use grim_backend_metal::MetalDevice;
+#[cfg(feature = "vulkan-mem")]
+use grim_backend_vulkan::VulkanDevice;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::shape::Shape;
-use grim_tensor::{BackendDevice, Device, DType, Tensor};
+use grim_tensor::{BackendDevice, DType, Device, Tensor};
 
 use crate::varbuilder::WeightSource;
 
@@ -32,6 +36,10 @@ pub fn pick_device_for_storage_device(d: &Device) -> Box<dyn BackendDevice> {
         Device::Cuda(ordinal) => Box::new(CudaDevice::new(*ordinal)),
         #[cfg(feature = "rocm-mem")]
         Device::Rocm(ordinal) => Box::new(RocmDevice::new(*ordinal)),
+        #[cfg(feature = "vulkan-mem")]
+        Device::Vulkan => Box::new(VulkanDevice::new()),
+        #[cfg(feature = "metal-mem")]
+        Device::Metal(ordinal) => Box::new(MetalDevice::new(*ordinal)),
         _ => Box::new(CpuDevice::new()),
     }
 }
@@ -70,22 +78,45 @@ impl Linear {
     /// GGUF stores matrix weights as `[out_dim, in_dim]` (rows = output units,
     /// columns = input units). This matches llama.cpp's convention: `y = x @ W^T`,
     /// so `Linear` pre-transposes `w_t` once during load for fast device matmuls.
-    pub fn load(ws: &WeightSource<'_>, in_dim: usize, out_dim: usize, has_bias: bool) -> Result<Self> {
+    pub fn load(
+        ws: &WeightSource<'_>,
+        in_dim: usize,
+        out_dim: usize,
+        has_bias: bool,
+    ) -> Result<Self> {
         let weight = ws.get([out_dim, in_dim], "weight")?;
         let w_t = transpose_last_two(&weight)?;
-        let quant_format = if weight.dtype().is_quantized() { Some(weight.dtype().clone()) } else { None };
+        let quant_format = if weight.dtype().is_quantized() {
+            Some(weight.dtype().clone())
+        } else {
+            None
+        };
         let bias = if has_bias {
             Some(ws.get([out_dim], "bias")?)
         } else {
             None
         };
-        Ok(Self { weight, bias, w_t, quant_format })
+        Ok(Self {
+            weight,
+            bias,
+            w_t,
+            quant_format,
+        })
     }
 
     pub fn from_tensor(weight: Tensor, bias: Option<Tensor>) -> Self {
         let w_t = transpose_last_two(&weight).unwrap_or_else(|_| weight.clone());
-        let quant_format = if weight.dtype().is_quantized() { Some(weight.dtype().clone()) } else { None };
-        Self { weight, bias, w_t, quant_format }
+        let quant_format = if weight.dtype().is_quantized() {
+            Some(weight.dtype().clone())
+        } else {
+            None
+        };
+        Self {
+            weight,
+            bias,
+            w_t,
+            quant_format,
+        }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -261,13 +292,23 @@ impl Embedding {
         if let Ok(t) = ws.get([vocab, dim], "weight") {
             let weight = if t.dtype().is_quantized() {
                 // Embedding kernel expects f32 weights; dequantize if quantized.
-                eprintln!("[Embedding::load] weight is quantized: dtype={:?}, device={:?}", t.dtype(), t.device());
+                eprintln!(
+                    "[Embedding::load] weight is quantized: dtype={:?}, device={:?}",
+                    t.dtype(),
+                    t.device()
+                );
                 let f32s = t.to_vec_f32()?;
                 eprintln!("[Embedding::load] dequantized to f32, len={}", f32s.len());
                 let shape = t.shape().clone();
                 let dev = pick_device_for_tensor(&t);
                 let storage = dev.from_cpu(&f32s, &shape, DType::F32)?;
-                Tensor::new(Arc::from(storage), shape, DType::F32, t.provenance().clone(), t.device().clone())
+                Tensor::new(
+                    Arc::from(storage),
+                    shape,
+                    DType::F32,
+                    t.provenance().clone(),
+                    t.device().clone(),
+                )
             } else {
                 t
             };
@@ -312,7 +353,13 @@ impl Embedding {
             } else {
                 let dev = pick_device_for_storage_device(&src_device);
                 let storage = dev.from_cpu(&out, &out_shape, DType::F32)?;
-                Tensor::new(Arc::from(storage), out_shape, DType::F32, src_prov, src_device)
+                Tensor::new(
+                    Arc::from(storage),
+                    out_shape,
+                    DType::F32,
+                    src_prov,
+                    src_device,
+                )
             };
             return Ok(Self { weight });
         }
@@ -326,7 +373,8 @@ impl Embedding {
     pub fn forward(&self, indices: &[u32], seq_len: usize, dim: usize) -> Result<Tensor> {
         let dev = pick_device_for_tensor(&self.weight);
         let out_shape = Shape::new(vec![seq_len, dim]);
-        let (s, h) = BackendDevice::embedding(&*dev, self.weight.storage().as_ref(), indices, &out_shape)?;
+        let (s, h) =
+            BackendDevice::embedding(&*dev, self.weight.storage().as_ref(), indices, &out_shape)?;
         h.synchronize()?;
         Ok(Tensor::new(
             Arc::from(s),
@@ -454,17 +502,23 @@ mod tests {
         assert_eq!(out.len(), 2);
         let expected_0 = 3.0 / (12.5f32 + 1e-6).sqrt();
         let expected_1 = 4.0 / (12.5f32 + 1e-6).sqrt();
-        assert!((out[0] - expected_0).abs() < 1e-4, "Expected {}, got {}", expected_0, out[0]);
-        assert!((out[1] - expected_1).abs() < 1e-4, "Expected {}, got {}", expected_1, out[1]);
+        assert!(
+            (out[0] - expected_0).abs() < 1e-4,
+            "Expected {}, got {}",
+            expected_0,
+            out[0]
+        );
+        assert!(
+            (out[1] - expected_1).abs() < 1e-4,
+            "Expected {}, got {}",
+            expected_1,
+            out[1]
+        );
     }
 
     #[test]
     fn test_embedding_forward_token_lookup() {
-        let table = vec![
-            0.1, 0.2, 0.3, 0.4,
-            1.0, 2.0, 3.0, 4.0,
-            5.0, 6.0, 7.0, 8.0,
-        ];
+        let table = vec![0.1, 0.2, 0.3, 0.4, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let weight = cpu_tensor(table, Shape::new(vec![3, 4]));
         let emb = Embedding { weight };
 
@@ -484,7 +538,10 @@ mod tests {
         let y = rope.forward(&x, &[0]).expect("rope forward");
         let out = y.to_vec_f32().expect("to vec");
         for (i, (&a, &b)) in out.iter().zip(input.iter()).enumerate() {
-            assert!((a - b).abs() < 1e-5, "RoPE pos 0 mismatch at index {i}: got {a} want {b}");
+            assert!(
+                (a - b).abs() < 1e-5,
+                "RoPE pos 0 mismatch at index {i}: got {a} want {b}"
+            );
         }
     }
 
@@ -505,8 +562,16 @@ mod tests {
         let theta = 2.0f32;
         let expected_0 = 1.0 * theta.cos() - 2.0 * theta.sin();
         let expected_1 = 1.0 * theta.sin() + 2.0 * theta.cos();
-        assert!((out[0] - expected_0).abs() < 1e-5, "Expected {expected_0}, got {}", out[0]);
-        assert!((out[1] - expected_1).abs() < 1e-5, "Expected {expected_1}, got {}", out[1]);
+        assert!(
+            (out[0] - expected_0).abs() < 1e-5,
+            "Expected {expected_0}, got {}",
+            out[0]
+        );
+        assert!(
+            (out[1] - expected_1).abs() < 1e-5,
+            "Expected {expected_1}, got {}",
+            out[1]
+        );
     }
 
     #[test]
@@ -514,13 +579,19 @@ mod tests {
         let weight = cpu_tensor(vec![1.0, 2.0, 3.0, 4.0], Shape::new(vec![2, 2]));
         let linear = Linear::from_tensor(weight, None);
         let x_bad = cpu_tensor(vec![1.0, 2.0, 3.0], Shape::new(vec![1, 3]));
-        assert!(linear.forward(&x_bad).is_err(), "mismatched in_features must error");
+        assert!(
+            linear.forward(&x_bad).is_err(),
+            "mismatched in_features must error"
+        );
     }
 
     #[test]
     fn test_rope_invalid_rank_returns_error() {
         let rope = Rope::new(4, 10000.0);
         let x_2d = cpu_tensor(vec![1.0, 2.0, 3.0, 4.0], Shape::new(vec![2, 2]));
-        assert!(rope.forward(&x_2d, &[0]).is_err(), "2D input to RoPE must return Shape error");
+        assert!(
+            rope.forward(&x_2d, &[0]).is_err(),
+            "2D input to RoPE must return Shape error"
+        );
     }
 }

@@ -92,10 +92,7 @@ impl LoRAInjectionPoint {
 
     /// Expected base-weight shape `(out_features, in_features)` for this
     /// injection point given the model geometry.
-    pub fn base_weight_shape(
-        &self,
-        cfg: &InjectionConfig,
-    ) -> (usize, usize) {
+    pub fn base_weight_shape(&self, cfg: &InjectionConfig) -> (usize, usize) {
         match self {
             Self::QProj => (cfg.num_heads * cfg.head_dim, cfg.hidden_size),
             Self::KProj => (cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size),
@@ -189,7 +186,8 @@ impl LoRAInjectionRegistry {
     }
 
     pub fn add(&mut self, config: LoRAInjectionConfig) {
-        self.configs.insert((config.layer_idx, config.injection_point), config);
+        self.configs
+            .insert((config.layer_idx, config.injection_point), config);
     }
 
     pub fn get(&self, layer_idx: usize, point: LoRAInjectionPoint) -> Option<&LoRAInjectionConfig> {
@@ -201,7 +199,9 @@ impl LoRAInjectionRegistry {
         let mut r = Self::new();
         for layer_idx in 0..num_layers {
             for &point in LoRAInjectionPoint::all_standard_qlora() {
-                r.add(LoRAInjectionConfig::new(point, layer_idx, adapter_id, rank, alpha));
+                r.add(LoRAInjectionConfig::new(
+                    point, layer_idx, adapter_id, rank, alpha,
+                ));
             }
         }
         r
@@ -212,7 +212,9 @@ impl LoRAInjectionRegistry {
         let mut r = Self::new();
         for layer_idx in 0..num_layers {
             for &point in LoRAInjectionPoint::attention_only() {
-                r.add(LoRAInjectionConfig::new(point, layer_idx, adapter_id, rank, alpha));
+                r.add(LoRAInjectionConfig::new(
+                    point, layer_idx, adapter_id, rank, alpha,
+                ));
             }
         }
         r
@@ -223,7 +225,9 @@ impl LoRAInjectionRegistry {
         let mut r = Self::new();
         for layer_idx in 0..num_layers {
             for &point in LoRAInjectionPoint::mlp_only() {
-                r.add(LoRAInjectionConfig::new(point, layer_idx, adapter_id, rank, alpha));
+                r.add(LoRAInjectionConfig::new(
+                    point, layer_idx, adapter_id, rank, alpha,
+                ));
             }
         }
         r
@@ -294,10 +298,22 @@ mod tests {
     #[test]
     fn base_weight_shapes_for_attention_and_mlp() {
         let c = cfg();
-        assert_eq!(LoRAInjectionPoint::QProj.base_weight_shape(&c), (4096, 4096));
-        assert_eq!(LoRAInjectionPoint::KProj.base_weight_shape(&c), (1024, 4096));
-        assert_eq!(LoRAInjectionPoint::DownProj.base_weight_shape(&c), (4096, 11008));
-        assert_eq!(LoRAInjectionPoint::Logits.base_weight_shape(&c), (32000, 4096));
+        assert_eq!(
+            LoRAInjectionPoint::QProj.base_weight_shape(&c),
+            (4096, 4096)
+        );
+        assert_eq!(
+            LoRAInjectionPoint::KProj.base_weight_shape(&c),
+            (1024, 4096)
+        );
+        assert_eq!(
+            LoRAInjectionPoint::DownProj.base_weight_shape(&c),
+            (4096, 11008)
+        );
+        assert_eq!(
+            LoRAInjectionPoint::Logits.base_weight_shape(&c),
+            (32000, 4096)
+        );
     }
 
     #[test]

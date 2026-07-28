@@ -241,7 +241,6 @@ impl Tape {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,8 +293,15 @@ mod tests {
         let a = tape.register_param(a_param, t(vec![0.1, 0.1], vec![1, 2]));
         let b = tape.register_param(b_param, t(vec![0.2, 0.3], vec![2, 1]));
         let _out = tape.record_lora_apply(
-            base, x, a, b, t(vec![1.01, 2.01], vec![1, 2]),
-            1.0, 1, a_param, b_param,
+            base,
+            x,
+            a,
+            b,
+            t(vec![1.01, 2.01], vec![1, 2]),
+            1.0,
+            1,
+            a_param,
+            b_param,
         );
         assert_eq!(tape.len(), 1);
         let e = &tape.entries()[0];
@@ -307,7 +313,7 @@ mod tests {
 
     // Helper for the test above
     impl TapeEntry {
-        pub(in crate) fn outputs_check(&self, out: TensorId) -> bool {
+        pub(crate) fn outputs_check(&self, out: TensorId) -> bool {
             self.output == out
         }
     }

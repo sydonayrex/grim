@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 use super::display::DisplayState;
 use super::http_client::{GarageClient, JobSummaryDto};
 use crate::discovery::{DatasetEntry, ModelEntry};
-use crate::rocm::RocmDeviceInfo;
+use crate::backend::BackendProbe;
 use crate::ui_state::UiJob;
 
 /// Number of endpoints polled by [`poll_fetch`]. Kept as a named
@@ -36,7 +36,7 @@ pub const POLL_ENDPOINT_COUNT: usize = 4;
 pub struct PollFetch {
     pub models: Result<Vec<ModelEntry>, String>,
     pub datasets: Result<Vec<DatasetEntry>, String>,
-    pub devices: Result<Vec<RocmDeviceInfo>, String>,
+    pub devices: Result<Vec<BackendProbe>, String>,
     pub jobs: Result<Vec<JobSummaryDto>, String>,
 }
 
@@ -311,7 +311,7 @@ mod tests {
     use super::*;
     use crate::discovery::{DatasetEntry, ModelEntry};
     use crate::jobs::TrainingMode;
-    use crate::rocm::RocmDeviceInfo;
+    use crate::backend::BackendProbe;
     use crate::ui_state::{JobSummaryDto, UiJob};
 
     #[test]

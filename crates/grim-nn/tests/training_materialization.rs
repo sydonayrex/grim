@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 
 use grim_nn::WeightSource;
+use grim_tensor::ArithType;
 use grim_tensor::dtype::{DType, Device, KQuantScheme, QuantProvenance, Storage};
 use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
-use grim_tensor::ArithType;
 
 /// Minimal in-memory TensorProvider backed by a HashMap.
 struct MemProvider {
@@ -14,30 +14,45 @@ struct MemProvider {
 
 impl TensorProvider for MemProvider {
     fn get(&self, name: &str) -> Result<RawTensor, grim_tensor::error::Error> {
-        let (bytes, shape, dtype, provenance) = self
-            .tensors
-            .get(name)
-            .cloned()
-            .ok_or_else(|| grim_tensor::error::Error::Backend(format!("missing tensor: {name}")))?;
-        Ok(RawTensor { bytes, shape, dtype, provenance })
+        let (bytes, shape, dtype, provenance) =
+            self.tensors.get(name).cloned().ok_or_else(|| {
+                grim_tensor::error::Error::Backend(format!("missing tensor: {name}"))
+            })?;
+        Ok(RawTensor {
+            bytes,
+            shape,
+            dtype,
+            provenance,
+        })
     }
 
     fn meta(&self, name: &str) -> Result<TensorMeta, grim_tensor::error::Error> {
-        let (_, shape, dtype, provenance) = self
-            .tensors
-            .get(name)
-            .cloned()
-            .ok_or_else(|| grim_tensor::error::Error::Backend(format!("missing tensor: {name}")))?;
-        Ok(TensorMeta { dtype, provenance, shape, fusion_mask: 0 })
+        let (_, shape, dtype, provenance) =
+            self.tensors.get(name).cloned().ok_or_else(|| {
+                grim_tensor::error::Error::Backend(format!("missing tensor: {name}"))
+            })?;
+        Ok(TensorMeta {
+            dtype,
+            provenance,
+            shape,
+            fusion_mask: 0,
+        })
     }
 }
 
-fn memory_provider_with(entries: &[(&str, Vec<u8>, Vec<usize>, DType, QuantProvenance)]) -> MemProvider {
+fn memory_provider_with(
+    entries: &[(&str, Vec<u8>, Vec<usize>, DType, QuantProvenance)],
+) -> MemProvider {
     let mut map = HashMap::new();
     for (name, bytes, shape, dtype, provenance) in entries {
         map.insert(
             (*name).to_string(),
-            (bytes.clone(), shape.clone(), dtype.clone(), provenance.clone()),
+            (
+                bytes.clone(),
+                shape.clone(),
+                dtype.clone(),
+                provenance.clone(),
+            ),
         );
     }
     MemProvider { tensors: map }
@@ -124,7 +139,9 @@ fn get_for_training_materializes_block_fp4() {
     )]);
 
     let ws = WeightSource::root(&provider, Device::Cpu);
-    let t = ws.get_for_training(vec![num_weights], "fp4weight").expect("materialize");
+    let t = ws
+        .get_for_training(vec![num_weights], "fp4weight")
+        .expect("materialize");
     assert_eq!(t.shape().dims(), &[num_weights]);
 }
 
@@ -148,7 +165,9 @@ fn get_for_training_shape_mismatch_is_reported() {
 
 #[test]
 fn get_for_training_missing_tensor_is_reported() {
-    let provider = MemProvider { tensors: HashMap::new() };
+    let provider = MemProvider {
+        tensors: HashMap::new(),
+    };
     let ws = WeightSource::root(&provider, Device::Cpu);
     assert!(
         ws.get_for_training(vec![2, 2], "nope").is_err(),
@@ -212,6 +231,7 @@ fn embedding_load_transposed_padded_vocab_shape() {
         QuantProvenance::GrimNative,
     )]);
     let ws = WeightSource::root(&provider, Device::Cpu);
-    let emb = grim_nn::Embedding::load(&ws, 10, 4).expect("embedding load transposed padded vocab shape");
+    let emb =
+        grim_nn::Embedding::load(&ws, 10, 4).expect("embedding load transposed padded vocab shape");
     assert_eq!(emb.weight().shape().dims(), &[16, 4]);
 }

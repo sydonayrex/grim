@@ -5,7 +5,10 @@
 
 use crate::param::{ParamId, TrainableParams};
 use grim_format::train::{TrainFpFormat, TrainState};
-use grim_tensor::{DType, Tensor, error::{Error, Result}};
+use grim_tensor::{
+    DType, Tensor,
+    error::{Error, Result},
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -89,7 +92,8 @@ impl AdamW {
 
             // Seed moment buffers on first encounter (device-resident).
             if !self.m.contains_key(id) {
-                let zero_m = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;                self.m.insert(*id, zero_m);
+                let zero_m = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
+                self.m.insert(*id, zero_m);
             }
             if !self.v.contains_key(id) {
                 let zero_v = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
@@ -160,14 +164,24 @@ impl AdamW {
             let shape = param.data.shape().dims().to_vec();
             if let Ok(data) = param.data.to_vec_f32() {
                 let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-                let blob_name = format!("param_{}_{}_{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" });
+                let blob_name = format!(
+                    "param_{}_{}_{}",
+                    id.layer_idx,
+                    id.adapter_id,
+                    if id.is_a { "a" } else { "b" }
+                );
                 state.add_blob(blob_name, shape.clone(), bytes);
             }
 
             if let Some(m_st) = self.m.get(id) {
                 if let Ok(m_vec) = m_st.to_cpu_vec_f32() {
                     let bytes: Vec<u8> = m_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
-                    let blob_name = format!("opt_m_{}_{}_{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" });
+                    let blob_name = format!(
+                        "opt_m_{}_{}_{}",
+                        id.layer_idx,
+                        id.adapter_id,
+                        if id.is_a { "a" } else { "b" }
+                    );
                     state.add_blob(blob_name, shape.clone(), bytes);
                 }
             }
@@ -175,7 +189,12 @@ impl AdamW {
             if let Some(v_st) = self.v.get(id) {
                 if let Ok(v_vec) = v_st.to_cpu_vec_f32() {
                     let bytes: Vec<u8> = v_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
-                    let blob_name = format!("opt_v_{}_{}_{}", id.layer_idx, id.adapter_id, if id.is_a { "a" } else { "b" });
+                    let blob_name = format!(
+                        "opt_v_{}_{}_{}",
+                        id.layer_idx,
+                        id.adapter_id,
+                        if id.is_a { "a" } else { "b" }
+                    );
                     state.add_blob(blob_name, shape, bytes);
                 }
             }
@@ -185,7 +204,11 @@ impl AdamW {
     }
 
     /// Restore optimizer moments and parameter data from a `.grim.train` `TrainState`.
-    pub fn load_from_train_state(&mut self, params: &mut TrainableParams, state: &TrainState) -> Result<()> {
+    pub fn load_from_train_state(
+        &mut self,
+        params: &mut TrainableParams,
+        state: &TrainState,
+    ) -> Result<()> {
         for (id, param) in params.iter_mut() {
             let suffix = if id.is_a { "a" } else { "b" };
             let param_key = format!("param_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
@@ -249,8 +272,10 @@ mod tests {
         let mut params = TrainableParams::new();
 
         let id = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
-        let mut p = TrainableParam::new(id, cpu_tensor(vec![1.0, 2.0], Shape::new(vec![2, 1]))).unwrap();
-        p.accumulate_grad(&cpu_tensor(vec![0.1, 0.2], Shape::new(vec![2, 1]))).unwrap();
+        let mut p =
+            TrainableParam::new(id, cpu_tensor(vec![1.0, 2.0], Shape::new(vec![2, 1]))).unwrap();
+        p.accumulate_grad(&cpu_tensor(vec![0.1, 0.2], Shape::new(vec![2, 1])))
+            .unwrap();
         params.insert(p);
 
         opt.step(&mut params).unwrap();
@@ -261,8 +286,16 @@ mod tests {
         // w_decay: [1.0 * (1 - 2e-6), 2.0 * (1 - 2e-6)] = [0.999998, 1.999996]
         // step: lr * bias_corrected_m / sqrt(bias_corrected_v) = 0.0002 * [1.0, 1.0] = [0.0002, 0.0002]
         // w_new: [0.999798, 1.999796]
-        assert!((data[0] - 0.999798).abs() < 1e-4, "data[0] = {}, want 0.999798", data[0]);
-        assert!((data[1] - 1.999796).abs() < 1e-4, "data[1] = {}, want 1.999796", data[1]);
+        assert!(
+            (data[0] - 0.999798).abs() < 1e-4,
+            "data[0] = {}, want 0.999798",
+            data[0]
+        );
+        assert!(
+            (data[1] - 1.999796).abs() < 1e-4,
+            "data[1] = {}, want 1.999796",
+            data[1]
+        );
         assert_eq!(opt.step_count, 1);
     }
 
@@ -272,8 +305,10 @@ mod tests {
         let mut params = TrainableParams::new();
 
         let id = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
-        let mut p = TrainableParam::new(id, cpu_tensor(vec![3.0, 4.0], Shape::new(vec![2, 1]))).unwrap();
-        p.accumulate_grad(&cpu_tensor(vec![0.5, 0.5], Shape::new(vec![2, 1]))).unwrap();
+        let mut p =
+            TrainableParam::new(id, cpu_tensor(vec![3.0, 4.0], Shape::new(vec![2, 1]))).unwrap();
+        p.accumulate_grad(&cpu_tensor(vec![0.5, 0.5], Shape::new(vec![2, 1])))
+            .unwrap();
         params.insert(p);
 
         opt.step(&mut params).unwrap();
@@ -282,23 +317,38 @@ mod tests {
 
         let mut opt2 = AdamW::new(AdamWConfig::default());
         let mut params2 = TrainableParams::new();
-        let p2 = TrainableParam::new(id, cpu_tensor(vec![0.0, 0.0], Shape::new(vec![2, 1]))).unwrap();
+        let p2 =
+            TrainableParam::new(id, cpu_tensor(vec![0.0, 0.0], Shape::new(vec![2, 1]))).unwrap();
         params2.insert(p2);
 
-        opt2.load_from_train_state(&mut params2, &train_state).unwrap();
+        opt2.load_from_train_state(&mut params2, &train_state)
+            .unwrap();
 
-        assert_eq!(params2.get(id).unwrap().data.to_vec_f32().unwrap(), params.get(id).unwrap().data.to_vec_f32().unwrap());
-        assert_eq!(opt2.m.get(&id).unwrap().to_cpu_vec_f32().unwrap(), opt.m.get(&id).unwrap().to_cpu_vec_f32().unwrap());
+        assert_eq!(
+            params2.get(id).unwrap().data.to_vec_f32().unwrap(),
+            params.get(id).unwrap().data.to_vec_f32().unwrap()
+        );
+        assert_eq!(
+            opt2.m.get(&id).unwrap().to_cpu_vec_f32().unwrap(),
+            opt.m.get(&id).unwrap().to_cpu_vec_f32().unwrap()
+        );
     }
 
     #[test]
     fn test_fused_device_adamw_golden_mutation_resistant() {
         let mut params = TrainableParams::new();
-        let id = ParamId { layer_idx: 0, adapter_id: 1, point: LoRAInjectionPoint::QProj, is_a: true };
+        let id = ParamId {
+            layer_idx: 0,
+            adapter_id: 1,
+            point: LoRAInjectionPoint::QProj,
+            is_a: true,
+        };
         let dev = grim_backend_cpu::CpuDevice::new();
         let initial_data = vec![1.0f32, 2.0f32, 3.0f32];
         let shape = Shape::new(vec![3]);
-        let storage = dev.from_cpu(&initial_data, &shape, grim_tensor::DType::F32).unwrap();
+        let storage = dev
+            .from_cpu(&initial_data, &shape, grim_tensor::DType::F32)
+            .unwrap();
         let data = Tensor::new(
             std::sync::Arc::from(storage),
             shape.clone(),
@@ -309,7 +359,13 @@ mod tests {
         let param = TrainableParam::new(id, data).unwrap();
         params.insert(param);
 
-        let grad_storage = dev.from_cpu(&vec![0.1f32, 0.2f32, 0.3f32], &shape, grim_tensor::DType::F32).unwrap();
+        let grad_storage = dev
+            .from_cpu(
+                &vec![0.1f32, 0.2f32, 0.3f32],
+                &shape,
+                grim_tensor::DType::F32,
+            )
+            .unwrap();
         let grad = Tensor::new(
             std::sync::Arc::from(grad_storage),
             shape.clone(),
@@ -328,6 +384,9 @@ mod tests {
 
         let updated = params.get(id).unwrap().data.to_vec_f32().unwrap();
         assert_eq!(updated.len(), 3);
-        assert!(updated[0] < 1.0f32, "Parameter 0 should decrease under positive gradient");
+        assert!(
+            updated[0] < 1.0f32,
+            "Parameter 0 should decrease under positive gradient"
+        );
     }
 }

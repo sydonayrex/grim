@@ -84,25 +84,15 @@ fn rocm_toggles_panel_lists_all_four_options() {
 #[test]
 fn rocm_toggles_reflect_state_when_devices_present() {
     let mut s = DisplayState::new();
-    s.set_devices(vec![grim_garage::RocmDeviceInfo {
-        ordinal: 0,
-        name: "AMD Instinct MI300X".into(),
-        vendor: "AMD".into(),
-        backend: "ROCm".into(),
-        is_rocm_compliant: true,
-        gcn_arch: "gfx942".into(), // MI300X — CDNA3, W64
-        vram_bytes: 192 * 1024 * 1024 * 1024,
-        vram_used_bytes: 0,
-        wavefront_size: 64,
-        wmma_supported: true,
-        mfma_supported: true,
-        xnack_enabled: true,
-        compute_units: 304,
-        max_threads_per_block: 1024,
+    s.set_devices(vec![grim_garage::backend::BackendProbe {
+        name: "rocm".into(),
+        device_kind: "rocm:0".into(),
+        available: true,
+        detail: "AMD Instinct MI300X / AMD / 304 CU(s) / 206158430208 VRAM".into(),
     }]);
     let panel = RocmTogglesV1::default_for(&s);
     // MI300X should auto-enable waves-per-eu since RDNA-style is irrelevant.
-    assert!(panel.device_summary.contains("CDNA") || panel.device_summary.contains("W64"));
+    assert!(panel.device_summary.contains("MI300X") || panel.device_summary.contains("304"));
 
     let _ = grim_garage::ModelEntry::new("a.gguf", "/p", "gguf", false);
 }

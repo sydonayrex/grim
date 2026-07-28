@@ -55,45 +55,52 @@ impl DisaggRouter {
 
 impl DisaggRouterT for DisaggRouter {
     /// Dispatches a prefill task to a dedicated prefill execution engine.
+    ///
+    /// NOTE: The remote dispatch path is not yet wired to a real execution
+    /// engine — the network transport is a stub (see `NetworkKvClient`).
+    /// Returning `Ok(())` here previously masked the missing implementation;
+    /// callers now receive an explicit `Unimplemented` error so the gap can
+    /// never silently succeed in production.
     fn dispatch_prefill(&self, request_id: u64, _tokens: &[u32]) -> Result<()> {
-        println!(
-            "[DisaggRouter] Dispatching prefill task for Request {} to prefill node: {} (PoolRole: {:?})",
-            request_id, self.prefill_node_addr, self.pool_role
-        );
-        Ok(())
+        Err(Error::Unimplemented(format!(
+            "dispatch_prefill(request_id={request_id}) -> prefill node {} (pool role {:?}): \
+             remote prefill dispatch is not yet implemented; the NetworkKvClient is a stub.",
+            self.prefill_node_addr, self.pool_role
+        )))
     }
 
     /// Performs the KV-transfer step from the prefill engine to the decode engine
     /// utilizing the remote network-transport KV client.
+    ///
+    /// NOTE: Real KV block transfer is blocked on the `NetworkKvClient`
+    /// stub implementation (it returns hardcoded data instead of round-tripping
+    /// the actual KV tensors). Rather than shipping mock `0.5f32` values
+    /// and pretending the handoff succeeded, we surface an explicit error and
+    /// only validate the protocol-level precondition (`num_blocks > 0`).
     fn transfer_kv_cache(&self, request_id: u64, num_blocks: usize) -> Result<()> {
-        println!(
-            "[DisaggRouter] Coordinating cross-pool KV handoff (Blocks: {}) for Request {} over {}...",
-            num_blocks, request_id, if self.use_rdma { "RDMA Fallback Layer" } else { "TCP Network" }
-        );
-
-        // Handoff protocol handshake validation
+        // Handoff protocol handshake validation — this part is real.
         if num_blocks == 0 {
             return Err(Error::KvCache("Handoff protocol error: block count cannot be zero".into()));
         }
 
-        // Simulate network block transfers
-        for block_idx in 0..num_blocks {
-            let mock_data = vec![0.5f32; 1024];
-            self.kv_client.send_block_remote(block_idx, &mock_data, &mock_data, &self.decode_node_addr)?;
-            let _fetched = self.kv_client.fetch_block_remote(block_idx, &self.decode_node_addr, 1024)?;
-        }
-
-        println!("[DisaggRouter] Cross-pool KV handoff protocol exchange finished.");
-        Ok(())
+        Err(Error::Unimplemented(format!(
+            "transfer_kv_cache(request_id={request_id}, num_blocks={num_blocks}) over {}: \
+             NetworkKvClient is a stub that returns hardcoded 1.0/2.0 values instead of the \
+             transferred KV tensors; refusing to fake the handoff. not yet implemented.",
+            if self.use_rdma { "RDMA" } else { "TCP" }
+        )))
     }
 
     /// Dispatches a step-decode task to a dedicated decode execution engine.
+    ///
+    /// NOTE: Like `dispatch_prefill`, the remote decode dispatch is not yet
+    /// wired to a real engine. Returning `Ok(())` previously masked the gap.
     fn dispatch_decode(&self, request_id: u64, _last_token: u32, assignment: PoolAssignment) -> Result<()> {
-        println!(
-            "[DisaggRouter] Dispatching decode task for Request {} to decode node: {} (Prefill pool src: {})",
-            request_id, self.decode_node_addr, assignment.source_prefill_pool_addr
-        );
-        Ok(())
+        Err(Error::Unimplemented(format!(
+            "dispatch_decode(request_id={request_id}, prefill pool src {}) -> decode node {}: \
+             remote decode dispatch is not yet implemented; the NetworkKvClient is a stub.",
+            assignment.source_prefill_pool_addr, self.decode_node_addr
+        )))
     }
 }
 
@@ -110,11 +117,22 @@ mod tests {
         assert_eq!(router.decode_node_addr, "10.0.0.2:8000");
         assert_eq!(router.pool_role, PoolRole::Prefill);
 
-        // Dispatch prefill — verify it doesn't error
-        assert!(router.dispatch_prefill(42, &[101, 102, 103]).is_ok());
+        // Dispatch prefill — not yet implemented; must surface an explicit
+        // error rather than silently succeeding (sims.md issue #1).
+        let prefill_res = router.dispatch_prefill(42, &[101, 102, 103]);
+        assert!(prefill_res.is_err(), "dispatch_prefill should fail loudly, not silently Ok");
+        assert!(
+            prefill_res.unwrap_err().to_string().contains("not yet implemented"),
+            "dispatch_prefill error should mention not-implemented"
+        );
 
-        // Transfer 4 KV blocks over the simulated network
-        assert!(router.transfer_kv_cache(42, 4).is_ok());
+        // Transfer 4 KV blocks — also not implemented; must not silently ship mock data.
+        let transfer_res = router.transfer_kv_cache(42, 4);
+        assert!(transfer_res.is_err(), "transfer_kv_cache should fail loudly, not silently Ok");
+        assert!(
+            transfer_res.unwrap_err().to_string().contains("not yet implemented"),
+            "transfer_kv_cache error should mention not-implemented"
+        );
 
         // Dispatch decode carrying PoolAssignment context
         let assignment = PoolAssignment {
@@ -123,7 +141,12 @@ mod tests {
         };
         assert_eq!(assignment.request_id, 42);
         assert_eq!(assignment.source_prefill_pool_addr, "10.0.0.1:8000");
-        assert!(router.dispatch_decode(42, 104, assignment).is_ok());
+        let decode_res = router.dispatch_decode(42, 104, assignment);
+        assert!(decode_res.is_err(), "dispatch_decode should fail loudly, not silently Ok");
+        assert!(
+            decode_res.unwrap_err().to_string().contains("not yet implemented"),
+            "dispatch_decode error should mention not-implemented"
+        );
     }
 
     #[test]
@@ -159,8 +182,13 @@ mod tests {
         // Verify assignment fields are accessible and correct
         assert_eq!(assignment.source_prefill_pool_addr, "10.0.0.1:8000");
         assert_eq!(assignment.request_id, 99);
-        // Should succeed without error
-        assert!(router.dispatch_decode(99, 200, assignment).is_ok());
+        // Dispatch is a stub — should surface Unimplemented, not silently Ok.
+        let decode_res = router.dispatch_decode(99, 200, assignment);
+        assert!(decode_res.is_err());
+        assert!(
+            decode_res.unwrap_err().to_string().contains("not yet implemented"),
+            "dispatch_decode should surface the not-implemented gap"
+        );
     }
 
     #[test]

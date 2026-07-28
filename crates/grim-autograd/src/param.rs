@@ -28,7 +28,12 @@ pub struct ParamId {
 
 impl ParamId {
     pub fn new(layer_idx: usize, adapter_id: u32, point: LoRAInjectionPoint, is_a: bool) -> Self {
-        Self { layer_idx, adapter_id, point, is_a }
+        Self {
+            layer_idx,
+            adapter_id,
+            point,
+            is_a,
+        }
     }
 
     /// LoRA A matrix: `[rank, in_features]`.
@@ -205,10 +210,15 @@ mod tests {
         let mut param = TrainableParam::new(
             ParamId::a(0, 1, LoRAInjectionPoint::QProj),
             tensor(vec![1.0, 2.0], vec![2, 1]),
-        ).unwrap();
-        param.accumulate_grad(&tensor(vec![3.0, 4.0], vec![2, 1])).unwrap();
+        )
+        .unwrap();
+        param
+            .accumulate_grad(&tensor(vec![3.0, 4.0], vec![2, 1]))
+            .unwrap();
         assert_eq!(param.grad().to_vec_f32().unwrap(), vec![3.0, 4.0]);
-        param.accumulate_grad(&tensor(vec![1.0, 1.0], vec![2, 1])).unwrap();
+        param
+            .accumulate_grad(&tensor(vec![1.0, 1.0], vec![2, 1]))
+            .unwrap();
         assert_eq!(param.grad().to_vec_f32().unwrap(), vec![4.0, 5.0]);
     }
 
@@ -217,8 +227,11 @@ mod tests {
         let mut param = TrainableParam::new(
             ParamId::a(0, 1, LoRAInjectionPoint::QProj),
             tensor(vec![1.0, 2.0], vec![2, 1]),
-        ).unwrap();
-        param.accumulate_grad(&tensor(vec![5.0, 6.0], vec![2, 1])).unwrap();
+        )
+        .unwrap();
+        param
+            .accumulate_grad(&tensor(vec![5.0, 6.0], vec![2, 1]))
+            .unwrap();
         assert_eq!(param.grad().to_vec_f32().unwrap(), vec![5.0, 6.0]);
         param.zero_grad().unwrap();
         assert!(param.grad().to_vec_f32().unwrap().iter().all(|&v| v == 0.0));
@@ -227,9 +240,25 @@ mod tests {
     #[test]
     fn trainable_params_registry_zeroes_all() {
         let mut params = TrainableParams::new();
-        params.insert(TrainableParam::new(ParamId::a(0, 1, LoRAInjectionPoint::QProj), tensor(vec![1.0], vec![1])).unwrap());
-        params.insert(TrainableParam::new(ParamId::b(0, 1, LoRAInjectionPoint::QProj), tensor(vec![2.0], vec![1])).unwrap());
-        params.get_mut(ParamId::a(0, 1, LoRAInjectionPoint::QProj)).unwrap().accumulate_grad(&tensor(vec![7.0], vec![1])).unwrap();
+        params.insert(
+            TrainableParam::new(
+                ParamId::a(0, 1, LoRAInjectionPoint::QProj),
+                tensor(vec![1.0], vec![1]),
+            )
+            .unwrap(),
+        );
+        params.insert(
+            TrainableParam::new(
+                ParamId::b(0, 1, LoRAInjectionPoint::QProj),
+                tensor(vec![2.0], vec![1]),
+            )
+            .unwrap(),
+        );
+        params
+            .get_mut(ParamId::a(0, 1, LoRAInjectionPoint::QProj))
+            .unwrap()
+            .accumulate_grad(&tensor(vec![7.0], vec![1]))
+            .unwrap();
         params.zero_all_grads().unwrap();
         for (_, p) in params.iter() {
             assert!(p.grad().to_vec_f32().unwrap().iter().all(|&v| v == 0.0));

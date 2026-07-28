@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use crate::discovery::{DatasetEntry, ModelEntry};
 use crate::jobs::TrainingMode;
-use crate::rocm::RocmDeviceInfo;
+use crate::backend::BackendProbe;
 
 #[derive(Debug, Deserialize)]
 struct ModelsEnvelope {
@@ -21,7 +21,7 @@ struct DatasetsEnvelope {
 
 #[derive(Debug, Deserialize)]
 struct DevicesEnvelope {
-    devices: Vec<RocmDeviceInfo>,
+    backends: Vec<BackendProbe>,
 }
 
 /// Job summary mirroring the wire format returned by `/api/train/jobs`.
@@ -75,7 +75,7 @@ impl GarageClient {
     }
 
     /// `GET /api/rocm/devices`.
-    pub async fn get_devices(&self) -> Result<Vec<RocmDeviceInfo>, String> {
+    pub async fn get_devices(&self) -> Result<Vec<BackendProbe>, String> {
         let body = self.get_json("/api/rocm/devices").await?;
         self.parse_devices(&body).map_err(|e| e.to_string())
     }
@@ -161,9 +161,9 @@ impl GarageClient {
         Ok(env.datasets)
     }
 
-    pub fn parse_devices(&self, body: &str) -> Result<Vec<RocmDeviceInfo>, serde_json::Error> {
+    pub fn parse_devices(&self, body: &str) -> Result<Vec<BackendProbe>, serde_json::Error> {
         let env: DevicesEnvelope = serde_json::from_str(body)?;
-        Ok(env.devices)
+        Ok(env.backends)
     }
 
     /// Build the JSON body for `POST /api/train/start`.
@@ -233,10 +233,10 @@ mod tests {
     #[test]
     fn parses_devices_response() {
         let c = GarageClient::new("http://localhost:8741");
-        let body = r#"{"devices":[{"ordinal":0,"gcn_arch":"gfx1100","vram_bytes":0,"wavefront_size":32,"xnack_enabled":false}]}"#;
+        let body = r#"{"backends":[{"name":"rocm","device_kind":"rocm:0","available":true,"detail":"AMD Radeon RX 7900 XTX / AMD / 84 CU(s) / 17179869184 VRAM"}]}"#;
         let devices = c.parse_devices(body).expect("parse");
         assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].wavefront_size, 32);
+        assert!(devices[0].detail.contains("7900"));
     }
 
     #[test]

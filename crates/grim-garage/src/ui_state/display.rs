@@ -33,7 +33,7 @@ impl DisplayState {
         self.inner.datasets = datasets;
     }
 
-    pub fn set_devices(&mut self, devices: Vec<crate::rocm::RocmDeviceInfo>) {
+    pub fn set_devices(&mut self, devices: Vec<crate::backend::BackendProbe>) {
         self.inner.devices = devices;
     }
 
@@ -95,7 +95,7 @@ impl DisplayState {
     }
 
     /// Snapshot of ROCm devices — read by the ROCm toggles panel.
-    pub fn rocm_devices(&self) -> &[crate::rocm::RocmDeviceInfo] {
+    pub fn rocm_devices(&self) -> &[crate::backend::BackendProbe] {
         &self.inner.devices
     }
 
@@ -114,7 +114,7 @@ impl DisplayState {
 mod tests {
     use super::*;
     use crate::discovery::{DatasetEntry, ModelEntry};
-    use crate::rocm::RocmDeviceInfo;
+    use crate::backend::BackendProbe;
 
     fn sample_state() -> DisplayState {
         let mut s = DisplayState::new();
@@ -130,21 +130,11 @@ mod tests {
             format: "jsonl".into(),
             size_bytes: 1024,
         }]);
-        s.set_devices(vec![RocmDeviceInfo {
-            ordinal: 0,
-            name: "AMD Radeon RX 7900 XTX".into(),
-            vendor: "AMD".into(),
-            backend: "ROCm".into(),
-            is_rocm_compliant: true,
-            gcn_arch: "gfx1100".into(),
-            vram_bytes: 16 * 1024 * 1024 * 1024,
-            vram_used_bytes: 1024 * 1024 * 1024,
-            wavefront_size: 32,
-            wmma_supported: true,
-            mfma_supported: false,
-            xnack_enabled: false,
-            compute_units: 84,
-            max_threads_per_block: 1024,
+        s.set_devices(vec![BackendProbe {
+            name: "rocm".into(),
+            device_kind: "rocm:0".into(),
+            available: true,
+            detail: "AMD Radeon RX 7900 XTX / AMD / 84 CU(s) / 17179869184 VRAM".into(),
         }]);
         s.upsert_job(UiJob {
             job_id: "abc".into(),

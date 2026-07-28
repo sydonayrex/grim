@@ -1,8 +1,8 @@
 use grim_autograd::{
-    apply_and_record_lora, backward, cross_entropy_loss, AdamW, AdamWConfig, AutogradRegistry,
-    InjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry, Tape,
+    AdamW, AdamWConfig, AutogradRegistry, InjectionConfig, LoRAInjectionPoint,
+    LoRAInjectionRegistry, Tape, apply_and_record_lora, backward, cross_entropy_loss,
 };
-use grim_tensor::{backend::BackendDevice, Shape, Device};
+use grim_tensor::{Device, Shape, backend::BackendDevice};
 
 /// Parameterized property test verifying loss decrease parity across devices.
 fn run_overfit_test_for_device(device: Device) -> (f32, f32) {
@@ -57,8 +57,20 @@ fn run_overfit_test_for_device(device: Device) -> (f32, f32) {
         autograd_reg.zero_grads().unwrap();
         let mut tape = Tape::new();
 
-        let h_norm_st = dev.from_cpu(&h_data, &Shape::new(vec![batch, hidden]), grim_tensor::DType::F32).unwrap();
-        let logits_base_st = dev.from_cpu(&base_logits_data, &Shape::new(vec![batch, vocab]), grim_tensor::DType::F32).unwrap();
+        let h_norm_st = dev
+            .from_cpu(
+                &h_data,
+                &Shape::new(vec![batch, hidden]),
+                grim_tensor::DType::F32,
+            )
+            .unwrap();
+        let logits_base_st = dev
+            .from_cpu(
+                &base_logits_data,
+                &Shape::new(vec![batch, vocab]),
+                grim_tensor::DType::F32,
+            )
+            .unwrap();
 
         let h_norm = grim_tensor::Tensor::new(
             std::sync::Arc::from(h_norm_st),
@@ -88,7 +100,8 @@ fn run_overfit_test_for_device(device: Device) -> (f32, f32) {
             logits_base_id,
             h_norm,
             h_norm_id,
-        ).unwrap();
+        )
+        .unwrap();
 
         let (loss_val, loss_grad) = cross_entropy_loss(&logits_out, &targets).unwrap();
         if step == 0 {
@@ -121,6 +134,12 @@ fn test_l0_parity_rocm_device_gated() {
     let (cpu_init, cpu_final) = run_overfit_test_for_device(Device::Cpu);
     let (rocm_init, rocm_final) = run_overfit_test_for_device(Device::Rocm(0));
 
-    assert!((cpu_init - rocm_init).abs() < 1e-3, "Initial loss mismatch CPU vs ROCm: {cpu_init} vs {rocm_init}");
-    assert!((cpu_final - rocm_final).abs() < 1e-3, "Final loss mismatch CPU vs ROCm: {cpu_final} vs {rocm_final}");
+    assert!(
+        (cpu_init - rocm_init).abs() < 1e-3,
+        "Initial loss mismatch CPU vs ROCm: {cpu_init} vs {rocm_init}"
+    );
+    assert!(
+        (cpu_final - rocm_final).abs() < 1e-3,
+        "Final loss mismatch CPU vs ROCm: {cpu_final} vs {rocm_final}"
+    );
 }

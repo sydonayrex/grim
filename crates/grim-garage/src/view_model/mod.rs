@@ -15,7 +15,7 @@ pub mod rocm_panel;
 pub mod training_panel;
 
 use crate::discovery::{DatasetEntry, ModelEntry};
-use crate::rocm::RocmDeviceInfo;
+use crate::backend::BackendProbe;
 use crate::ui_state::display::DisplayState;
 
 pub use hyperparam::HyperparamFormV1;
@@ -30,7 +30,7 @@ pub use training_panel::TrainingPanelV1;
 pub struct ViewModel {
     pub models: Vec<ModelEntry>,
     pub datasets: Vec<DatasetEntry>,
-    pub rocm_devices: Vec<RocmDeviceInfo>,
+    pub rocm_devices: Vec<BackendProbe>,
     pub jobs: Vec<JobCardV1>,
     pub training_config: HyperparamFormV1,
     pub rocm_toggles: RocmTogglesV1,
