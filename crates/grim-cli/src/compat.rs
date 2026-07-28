@@ -19,6 +19,18 @@ pub async fn cmd_compat(config_path: &str, output_path: Option<String>) -> Resul
         .map_err(|e| Error::Config(format!("Failed to read config file: {e}")))?;
 
     let spec = ArchCompatSpec::from_hf_config_json(&content)?;
+
+    // Validate required fields before writing.
+    if spec.model_type.is_empty() {
+        return Err(Error::Config("model_type is required in config.json".into()));
+    }
+    if spec.num_layers == 0 {
+        return Err(Error::Config("num_hidden_layers must be > 0".into()));
+    }
+    if spec.hidden_size == 0 {
+        return Err(Error::Config("hidden_size must be > 0".into()));
+    }
+
     let json_output = spec.to_json()?;
 
     let out_filename = output_path.unwrap_or_else(|| format!("{}.grimplugin", spec.model_type));

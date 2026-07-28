@@ -280,6 +280,7 @@ impl SpeculativeCausalLm {
                 // CRIT-7: Return logits for the accepted tokens, not the original input
                 // The output logits should correspond to the tokens we actually accepted
                 let accepted_logits = self.extract_accepted_logits(&target_logits, accepted_count, vocab_size)?;
+                session.set_last_accepted_tokens(accepted_count);
                 Ok(accepted_logits)
             }
         }
@@ -354,6 +355,7 @@ impl SpeculativeCausalLm {
 
         // CRIT-7: Return logits for accepted tokens
         let accepted_logits = self.extract_accepted_logits(&target_logits, accepted_count, vocab_size)?;
+        session.set_last_accepted_tokens(accepted_count);
         Ok(accepted_logits)
     }
 
@@ -416,9 +418,10 @@ impl CausalLm for SpeculativeCausalLm {
         positions: &Tensor,
         adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
-        // CRIT-6: Pass actual scheduling params instead of hardcoded 0.0, 0
-        // These would come from the engine's scheduler/metrics
-        self.decode_one(session, input_ids, positions, 0.5, 0, adapters)
+        // CRIT-6: Derive scheduling params from the session instead of hardcoding.
+        let live_gpu_utilization = session.live_gpu_utilization();
+        let batch_pressure = session.batch_pressure();
+        self.decode_one(session, input_ids, positions, live_gpu_utilization, batch_pressure, adapters)
     }
 }
 

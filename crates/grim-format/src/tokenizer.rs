@@ -16,6 +16,9 @@ pub struct GgufTokenizer {
     pub byte_decoder: Option<HashMap<char, u8>>,
     /// EOS token ID if available from tokenizer metadata
     pub eos_token_id: Option<u32>,
+    /// Jinja chat template extracted from GGUF `tokenizer.chat_template`, if present.
+    /// Drives instruction-tuned prompt formatting in the CLI/server prompt path.
+    pub chat_template: Option<String>,
 }
 
 impl GgufTokenizer {
@@ -110,6 +113,7 @@ impl GgufTokenizer {
             bpe_merges,
             byte_decoder: if model_type == "bpe" { Some(gpt2_byte_decoder()) } else { None },
             eos_token_id: None, // HF tokenizer.json doesn't have explicit EOS token ID in a standard way
+            chat_template: None,
         })
     }
 
@@ -154,6 +158,12 @@ impl GgufTokenizer {
             .get("tokenizer.ggml.eos_token_id")
             .and_then(|v| v.as_u32());
 
+        // Extract the Jinja chat template if the GGUF embeds one.
+        let chat_template = metadata
+            .get("tokenizer.chat_template")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         Ok(Self {
             tokens,
             token_to_id,
@@ -162,6 +172,7 @@ impl GgufTokenizer {
             bpe_merges: None,
             byte_decoder: None,
             eos_token_id,
+            chat_template,
         })
     }
 
@@ -465,6 +476,66 @@ impl GgufTokenizer {
     }
 }
 
+/// A single chat message in an OpenAI-style `messages` array.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+/// Renders an OpenAI-style `messages` array through a model's Jinja chat
+/// template, producing the final prompt string ready for tokenization.
+///
+/// Covers the common HF/GGUF template variable subset (`messages`,
+/// `add_generation_prompt`, plus `bos_token`/`eos_token` when supplied). If a
+/// specific model's template references an unsupplied variable, minijinja
+/// surfaces the exact name — widen `ctx` as needed. Falls back to the raw
+/// last-message content if the template fails to render.
+pub fn render_chat_template(
+    template: &str,
+    messages: &[ChatMessage],
+    add_generation_prompt: bool,
+    bos_token: &str,
+    eos_token: &str,
+) -> Result<String> {
+    let mut env = minijinja::Environment::new();
+    // Most GGUF chat templates are self-contained; disable autoescaping.
+    env.set_auto_escape_callback(|_| minijinja::AutoEscape::None);
+    let tmpl = env
+        .template_from_str(template)
+        .map_err(|e| Error::Backend(format!("chat template parse error: {e}")))?;
+    let ctx = minijinja::context! {
+        messages => messages,
+        add_generation_prompt => add_generation_prompt,
+        bos_token => bos_token,
+        eos_token => eos_token,
+    };
+    tmpl.render(ctx)
+        .map_err(|e| Error::Backend(format!("chat template render error: {e}")))
+}
+
+/// Convenience: render `messages` through a tokenizer's embedded template when
+/// present, otherwise return the last message's content (raw fallback).
+pub fn render_messages_or_last(
+    tokenizer: &GgufTokenizer,
+    messages: &[ChatMessage],
+) -> String {
+    match &tokenizer.chat_template {
+        Some(tpl) => render_chat_template(
+            tpl,
+            messages,
+            true,
+            "",
+            tokenizer.eos_token_id.map(|_| "</s>").unwrap_or("").as_ref(),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("[grim-format] chat template render failed, falling back to last message: {e}");
+            messages.last().map(|m| m.content.clone()).unwrap_or_default()
+        }),
+        None => messages.last().map(|m| m.content.clone()).unwrap_or_default(),
+    }
+}
+
 /// GPT-2 byte-to-unicode mapping. Maps each of 256 byte values to a
 /// specific unicode character. This is the standard `bytes_to_unicode()`
 /// function from the GPT-2 implementation.
@@ -520,4 +591,41 @@ fn split_on_gpt2_pretokenize(s: &str) -> Vec<&str> {
 /// described by `chars`.
 fn char_byte_offset(chars: &[char], idx: usize) -> usize {
     chars[..idx].iter().map(|c| c.len_utf8()).sum()
+}
+
+#[cfg(test)]
+mod chat_template_tests {
+    use super::*;
+
+    #[test]
+    fn renders_chatml_template_with_messages() {
+        let tpl = "{{ bos_token }}{% for m in messages %}{{'<|im_start|>' + m['role'] + '\n' + m['content'] + '<|im_end|>\n' }}{% endfor %}".to_string();
+        let msgs = vec![
+            ChatMessage { role: "system".into(), content: "You are grim.".into() },
+            ChatMessage { role: "user".into(), content: "Hi.".into() },
+        ];
+        let rendered = render_chat_template(&tpl, &msgs, false, "", "").expect("render must succeed");
+        assert!(rendered.contains("<|im_start|>system"), "missing system role");
+        assert!(rendered.contains("You are grim."), "missing system content");
+        assert!(rendered.contains("<|im_start|>user"), "missing user role");
+        assert!(rendered.contains("Hi."), "missing user content");
+        assert!(rendered.contains("<|im_end|>"), "missing im_end marker");
+    }
+
+    #[test]
+    fn renders_single_user_turn() {
+        let tpl = "{{'<|im_start|>user\n' + messages[0]['content'] + '<|im_end|>'}}".to_string();
+        let msgs = vec![ChatMessage { role: "user".into(), content: "translate: hi".into() }];
+        let rendered = render_chat_template(&tpl, &msgs, false, "", "").expect("render must succeed");
+        assert_eq!(rendered, "<|im_start|>user\ntranslate: hi<|im_end|>");
+    }
+
+    #[test]
+    fn unparseable_template_errors() {
+        // A syntactically broken template should surface a parse error, not panic.
+        assert!(
+            render_chat_template("{% if %}", &[], false, "", "").is_err(),
+            "malformed template must error"
+        );
+    }
 }

@@ -144,18 +144,6 @@ enum Commands {
         #[arg(long)]
         rocml_profile: Option<String>,
     },
-    /// Start the inference HTTP server (alias for serve).
-    Server {
-        /// Address to bind the server.
-        #[arg(short, long, default_value = "127.0.0.1:11434")]
-        address: String,
-        /// Path to grim config file.
-        #[arg(short, long, default_value = "grim.toml")]
-        config: String,
-        /// Path to plugins directory.
-        #[arg(short, long, default_value = "plugins")]
-        plugins: String,
-    },
     /// Start a client integration (hermes, openclaw, claude-code, codex, antigravity, zcode).
     Start {
         /// Client to start.
@@ -211,6 +199,10 @@ enum Commands {
         /// Number of concurrent requests.
         #[arg(long, default_value = "1")]
         concurrency: usize,
+        /// Path to a model file (.gguf, .grim, .safetensors). If omitted,
+        /// a small random Llama is used for smoke testing.
+        #[arg(short, long)]
+        model: Option<String>,
     },
     /// Quantize a model.
     Quantize,
@@ -709,8 +701,8 @@ async fn main() -> Result<()> {
             };
             client::save_login_token(&provider, &t)?;
         }
-        Commands::Bench { tokens, concurrency } => {
-            bench::cmd_bench(tokens, concurrency).await?;
+        Commands::Bench { tokens, concurrency, model } => {
+            bench::cmd_bench(tokens, concurrency, model.as_deref()).await?;
         }
         Commands::Quantize => {
             println!("Quantize command — not yet implemented (phase 2).");
@@ -1013,9 +1005,6 @@ async fn main() -> Result<()> {
                 eprintln!("Copy failed: {e}");
                 std::process::exit(1);
             }
-        }
-        Commands::Server { address, config, plugins } => {
-            server::cmd_server(&address, &config, &plugins).await?;
         }
         Commands::Start { client, model, args } => {
             if let Err(e) = start::cmd_start(client, model.as_deref(), &args).await {

@@ -104,6 +104,14 @@ impl LlamaBlock {
     }
 
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
+        let (out, _, _) = self.forward_with_kv(x, positions)?;
+        Ok(out)
+    }
+
+    /// Like `forward` but also returns the K and V tensors (post-RoPE) so
+    /// the caller can populate the KV cache (MAJ-1: Llama CPU path was
+    /// not storing K/V, making the cache infrastructure dead code).
+    pub fn forward_with_kv(&self, x: &Tensor, positions: &[u32]) -> Result<(Tensor, Tensor, Tensor)> {
         let _dims = x.shape().dims().to_vec();
         let hidden = self._cfg.hidden_size;
 
@@ -123,50 +131,105 @@ impl LlamaBlock {
             added[i] = x_res1_data[i] + attn_data[i];
         }
 
-        let num_experts = 2;
-        let token_count = x_res1_data.len() / hidden;
-        let mut ffn_out_data = vec![0.0f32; x_res1_data.len()];
-
-        for t in 0..token_count {
-            let expert_idx = t % num_experts;
-            let token_offset = t * hidden;
-            let token_slice = &x_res1_data[token_offset..token_offset + hidden];
-            let x_tok = {
-                let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
-                let storage = dev.from_cpu(token_slice, &Shape::new(vec![1, hidden]), grim_tensor::DType::F32)?;
-                Tensor::new(std::sync::Arc::from(storage), Shape::new(vec![1, hidden]), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), self._dev.clone())
-            };
-            let x_tok_norm = self.ffn_norm.forward(&x_tok)?;
-
-            let gate = self.w_gate.forward(&x_tok_norm)?;
-            let up = self.w_up.forward(&x_tok_norm)?;
-            let gate_data = gate.to_vec_f32()?;
-            let up_data = up.to_vec_f32()?;
-            let mut silu_data = vec![0.0f32; gate_data.len()];
-            for i in 0..gate_data.len() {
-                let xv = gate_data[i];
-                silu_data[i] = (xv / (1.0 + (-xv).exp())) * up_data[i];
-            }
-            let ffn_out = self.w_down.forward(&{
-                let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
-                let storage = dev.from_cpu(&silu_data, &gate.shape().clone(), grim_tensor::DType::F32)?;
-                Tensor::new(std::sync::Arc::from(storage), gate.shape().clone(), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), self._dev.clone())
-            })?;
-            let ffn_data = ffn_out.to_vec_f32()?;
-            for i in 0..hidden {
-                ffn_out_data[token_offset + i] = ffn_data[i];
-            }
+        // FFN: standard Llama uses a single shared expert for all tokens.
+        // Process the full batch in one forward pass instead of per-token
+        // CPU roundtrips (MAJ-4/MAJ-6: removed round-robin expert dispatch
+        // and per-token device uploads).
+        let x_norm = self.ffn_norm.forward(&x_2d)?;
+        let gate = self.w_gate.forward(&x_norm)?;
+        let up = self.w_up.forward(&x_norm)?;
+        let gate_data = gate.to_vec_f32()?;
+        let up_data = up.to_vec_f32()?;
+        let mut silu_data = vec![0.0f32; gate_data.len()];
+        for i in 0..gate_data.len() {
+            let xv = gate_data[i];
+            silu_data[i] = (xv / (1.0 + (-xv).exp())) * up_data[i];
         }
+        let silu_storage = {
+            let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
+            let storage = dev.from_cpu(&silu_data, &gate.shape().clone(), grim_tensor::DType::F32)?;
+            Tensor::new(std::sync::Arc::from(storage), gate.shape().clone(), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), self._dev.clone())
+        };
+        let ffn_out = self.w_down.forward(&silu_storage)?;
+        let ffn_data = ffn_out.to_vec_f32()?;
 
         let mut out = vec![0.0f32; x_res1_data.len()];
         for i in 0..x_res1_data.len() {
-            out[i] = added[i] + ffn_out_data[i];
+            out[i] = added[i] + ffn_data[i];
         }
-        Ok({
+        let out = {
             let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
             let storage = dev.from_cpu(&out, &x.shape().clone(), grim_tensor::DType::F32)?;
             Tensor::new(std::sync::Arc::from(storage), x.shape().clone(), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), self._dev.clone())
-        })
+        };
+        Ok((out, k, v))
+    }
+
+    /// Apply RoPE to a multi-head tensor of shape (B, S, num_heads * head_dim)
+    /// or (S, num_heads * head_dim) by reshaping to (B, S * num_heads, head_dim),
+    /// repeating positions per-head, and reshaping back.
+    fn apply_rope_multi_head(&self, x: &Tensor, positions: &[u32], num_heads: usize) -> Result<Tensor> {
+        let dims = x.shape().dims().to_vec();
+        let (b, s, d) = if dims.len() == 3 {
+            (dims[0], dims[1], dims[2])
+        } else if dims.len() == 2 {
+            (1, dims[0], dims[1])
+        } else {
+            return Err(grim_core::error::Error::Shape(format!("expected 2-D or 3-D tensor, got {dims:?}")));
+        };
+        let head_dim = self._cfg.head_dim;
+        if d != num_heads * head_dim {
+            return Err(grim_core::error::Error::Shape(format!(
+                "expected last dim {num_heads}*{head_dim}={}, got {d}", num_heads * head_dim
+            )));
+        }
+        // Reshape (B, S, num_heads * head_dim) -> (B, S * num_heads, head_dim)
+        let data = x.to_vec_f32()?;
+        let mut reshaped = vec![0.0f32; b * s * num_heads * head_dim];
+        for bi in 0..b {
+            for si in 0..s {
+                for hi in 0..num_heads {
+                    for di in 0..head_dim {
+                        let src = (bi * s + si) * d + hi * head_dim + di;
+                        let dst = (bi * s * num_heads + si * num_heads + hi) * head_dim + di;
+                        reshaped[dst] = data[src];
+                    }
+                }
+            }
+        }
+        let reshaped_tensor = {
+            let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
+            let storage = dev.from_cpu(&reshaped, &Shape::new(vec![b, s * num_heads, head_dim]), grim_tensor::DType::F32)?;
+            Tensor::new(std::sync::Arc::from(storage), Shape::new(vec![b, s * num_heads, head_dim]), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), self._dev.clone())
+        };
+        // Repeat positions per-head. If positions is empty, default to
+        // sequential positions (0..s) — callers that don't track position
+        // (e.g. streaming block forward) still get valid RoPE.
+        let mut ext_positions = Vec::with_capacity(s * num_heads);
+        for si in 0..s {
+            let pos = if si < positions.len() { positions[si] } else { si as u32 };
+            for _ in 0..num_heads {
+                ext_positions.push(pos);
+            }
+        }
+        let rope_out = self.rope.forward(&reshaped_tensor, &ext_positions)?;
+        // Reshape back (B, S * num_heads, head_dim) -> (B, S, num_heads * head_dim)
+        let rope_data = rope_out.to_vec_f32()?;
+        let mut result = vec![0.0f32; b * s * d];
+        for bi in 0..b {
+            for si in 0..s {
+                for hi in 0..num_heads {
+                    for di in 0..head_dim {
+                        let src = (bi * s * num_heads + si * num_heads + hi) * head_dim + di;
+                        let dst = (bi * s + si) * d + hi * head_dim + di;
+                        result[dst] = rope_data[src];
+                    }
+                }
+            }
+        }
+        let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
+        let storage = dev.from_cpu(&result, &x.shape().clone(), grim_tensor::DType::F32)?;
+        Ok(Tensor::new(std::sync::Arc::from(storage), x.shape().clone(), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), self._dev.clone()))
     }
 
     fn prefilled_self_attention(
@@ -177,10 +240,13 @@ impl LlamaBlock {
         positions: &[u32],
     ) -> Result<Tensor> {
         let cfg = &self._cfg;
-        
-        // Apply RoPE to Q and K
-        let q = self.rope.forward(q, positions)?;
-        let k = self.rope.forward(k, positions)?;
+
+        // Apply RoPE to Q and K. The rope.forward expects (B, S, D=head_dim)
+        // but Q/K arrive as (B, S, num_heads * head_dim). Reshape to
+        // (B, S * num_heads, head_dim), repeat positions per-head, apply
+        // RoPE, then reshape back.
+        let q = self.apply_rope_multi_head(q, positions, cfg.num_heads)?;
+        let k = self.apply_rope_multi_head(k, positions, cfg.num_kv_heads)?;
         
         let qd = q.to_vec_f32()?;
         let kd = k.to_vec_f32()?;

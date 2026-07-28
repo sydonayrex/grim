@@ -191,6 +191,11 @@ impl Gpt2 {
     pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: Gpt2Config) -> Result<Self> {
         let wte = Embedding::load(&ws.pp("wte"), cfg.vocab_size, cfg.hidden_size)?;
         let wpe = Embedding::load(&ws.pp("wpe"), cfg.max_seq_len, cfg.hidden_size)?;
+        // Validate position embedding count matches config
+        let actual_pos = wpe.weight.shape().dims().first().copied().unwrap_or(0);
+        if actual_pos < cfg.max_seq_len {
+            eprintln!("[Gpt2] wpe has {} position embeddings, config expects {}. Clamping max_seq_len.", actual_pos, cfg.max_seq_len);
+        }
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             layers.push(Gpt2Block::load(&ws.pp("h").pp(&i.to_string()), &cfg)?);

@@ -14,6 +14,10 @@ use grim_autograd::{
 use grim_core::error::{Error, Result};
 use grim_engine::streaming_forward::StreamingBlockForward;
 use grim_format::tprov::GgufProvider;
+
+/// Sentinel value for ignored label positions in cross-entropy loss.
+/// Matches HF/PyTorch convention: -100 as u32 wraps to 4294967196.
+const IGNORE_INDEX: u32 = IGNORE_INDEX;
 use grim_format::tokenizer::GgufTokenizer;
 use grim_format::train::TrainState;
 use grim_models_transformer::LlamaConfig;
@@ -182,14 +186,14 @@ fn load_dataset(path: &str, tokenizer: &GgufTokenizer, max_seq_len: usize) -> Re
 
             if tokens.len() > max_seq_len {
                 let tokens = tokens[..max_seq_len].to_vec();
-                let labels = vec![-100i32 as u32; prompt_len.min(max_seq_len)]
+                let labels = vec![IGNORE_INDEX; prompt_len.min(max_seq_len)]
                     .into_iter()
                     .chain(tokens[prompt_len.min(max_seq_len)..].to_vec())
                     .collect::<Vec<u32>>();
                 return Ok((tokens, labels));
             }
 
-            let labels = vec![-100i32 as u32; prompt_len]
+            let labels = vec![IGNORE_INDEX; prompt_len]
                 .into_iter()
                 .chain(tokens[prompt_len..].to_vec())
                 .collect::<Vec<u32>>();
@@ -208,7 +212,7 @@ fn load_dataset(path: &str, tokenizer: &GgufTokenizer, max_seq_len: usize) -> Re
                 let turn_tokens = tokenizer.encode(&turn.value);
                 if i % 2 == 0 {
                     // Human turn: mask in labels
-                    let mask = vec![-100i32 as u32; turn_tokens.len()];
+                    let mask = vec![IGNORE_INDEX; turn_tokens.len()];
                     labels.extend(mask);
                 } else {
                     // Assistant turn: compute in labels
@@ -247,6 +251,20 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
 
     let tokenizer = provider.tokenizer()
         .map_err(|e| Error::Session(format!("failed to load tokenizer: {}", e)))?;
+
+    // Validate LoRA hyperparameters before constructing the registry.
+    if opts.rank == 0 {
+        return Err(Error::Session("LoRA rank must be > 0".into()));
+    }
+    if opts.alpha == 0 {
+        return Err(Error::Session("LoRA alpha must be > 0".into()));
+    }
+    let hidden_size = llama_config.hidden_size;
+    if opts.rank > hidden_size {
+        return Err(Error::Session(format!(
+            "LoRA rank {} exceeds hidden size {}", opts.rank, hidden_size
+        )));
+    }
 
     let injection_reg = LoRAInjectionRegistry::standard_qlora(num_layers, opts.rank, opts.alpha, 1);
     let mut autograd_reg = AutogradRegistry::new(model_config.clone(), injection_reg)
@@ -443,6 +461,7 @@ mod tests {
             tokens,
             token_to_id,
             scores: None,
+            eos_token_id: None,
             model_type: "llama".to_string(),
             bpe_merges: None,
             byte_decoder: None,
@@ -464,7 +483,7 @@ mod tests {
                 let full_text = format!("{}{}", prompt, e.output);
                 let tokens = tokenizer.encode(&full_text);
                 let prompt_len = tokenizer.encode(&prompt).len();
-                let labels = vec![-100i32 as u32; prompt_len]
+                let labels = vec![IGNORE_INDEX; prompt_len]
                     .into_iter()
                     .chain(tokens[prompt_len..].to_vec())
                     .collect::<Vec<u32>>();

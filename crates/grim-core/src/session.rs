@@ -64,6 +64,24 @@ pub trait SessionT: Send {
     fn request_rng_mut(&mut self) -> Option<&mut SimpleRng> {
         None
     }
+
+    /// Current live GPU utilization estimate (0.0–1.0). Used by the
+    /// confidence scheduler to pick a dynamic verify length.
+    fn live_gpu_utilization(&self) -> f32 {
+        0.5
+    }
+
+    /// Current batch pressure (queued tokens awaiting compute).
+    fn batch_pressure(&self) -> usize {
+        0
+    }
+
+    /// Last speculative accept count from the most recent `decode_one`.
+    /// Default 1 (non-speculative path always accepts exactly one token).
+    fn last_accepted_tokens(&self) -> usize {
+        1
+    }
+    fn set_last_accepted_tokens(&mut self, _n: usize) {}
 }
 
 /// Public trait-object alias used in `Model` trait DSL.
@@ -85,14 +103,16 @@ pub struct Inner {
     pub model_state: Option<Box<dyn std::any::Any + Send>>,
     /// Per-request RNG for deterministic sampling (e.g., speculative rejection).
     pub request_rng: Option<SimpleRng>,
+    /// Last speculative accept count from decode_one.
+    pub last_accepted_tokens: usize,
 }
 
 impl Inner {
     pub fn new(device: Device) -> Self {
-        Self { device, kv: None, current_pos: 0, hip_graph_handle: None, last_hidden_state: None, model_state: None, request_rng: None }
+        Self { device, kv: None, current_pos: 0, hip_graph_handle: None, last_hidden_state: None, model_state: None, request_rng: None, last_accepted_tokens: 1 }
     }
     pub fn with_kv(device: Device, kv: Box<dyn KvCache>) -> Self {
-        Self { device, kv: Some(kv), current_pos: 0, hip_graph_handle: None, last_hidden_state: None, model_state: None, request_rng: None }
+        Self { device, kv: Some(kv), current_pos: 0, hip_graph_handle: None, last_hidden_state: None, model_state: None, request_rng: None, last_accepted_tokens: 1 }
     }
 }
 
@@ -158,6 +178,12 @@ impl SessionT for Inner {
     }
     fn request_rng_mut(&mut self) -> Option<&mut SimpleRng> {
         self.request_rng.as_mut()
+    }
+    fn last_accepted_tokens(&self) -> usize {
+        self.last_accepted_tokens
+    }
+    fn set_last_accepted_tokens(&mut self, n: usize) {
+        self.last_accepted_tokens = n;
     }
 }
 
