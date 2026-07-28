@@ -323,6 +323,11 @@ pub async fn cmd_run(
         // Subsequent passes: incremental decode — only pass the latest token
         // so the caches (KV for attention, state for ShortConv) accumulate
         // correctly instead of seeing the same tokens repeated.
+        // HIGH-3: save first_pass BEFORE the input_ids block mutates it,
+        // otherwise the positions check below always reads `false` and the
+        // first forward pass uses wrong positions (decode-style single value
+        // instead of sequential 0..n).
+        let is_prefill = first_pass;
         let input_ids: Vec<f32> = if first_pass {
             first_pass = false;
             tokens.iter().map(|t| *t as f32).collect()
@@ -339,7 +344,7 @@ pub async fn cmd_run(
 
         // Forward pass
         // CRIT-1: Need to pass proper positions tensor, not the same as input_ids
-        let positions: Vec<f32> = if first_pass {
+        let positions: Vec<f32> = if is_prefill {
             (0..n_tokens).map(|i| i as f32).collect()
         } else {
             vec![n_tokens as f32 - 1.0]

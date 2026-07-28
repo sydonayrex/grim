@@ -372,7 +372,7 @@ impl Rope {
         let mut src = x.to_vec_f32()?;
         for bi in 0..b {
             for si in 0..s {
-                let pos = positions[si] as f32;
+                let pos = positions.get(si).copied().unwrap_or(si as u32) as f32;
                 let base_index = (bi * s + si) * d;
                 let mut cos_p = vec![0.0f32; half];
                 let mut sin_p = vec![0.0f32; half];
