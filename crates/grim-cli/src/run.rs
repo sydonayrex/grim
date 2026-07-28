@@ -291,14 +291,14 @@ pub async fn cmd_run(
 
     // Determine vocab size — fall back to tokenizer vocab length if model
     // config type is unknown (GPT2, Gemma, DeepSeek, etc.)
-    let vocab = if let Some(cfg) = model.config().as_any().downcast_ref::<LlamaConfig>() {
-        cfg.vocab_size
+    let vocab: usize = if let Some(cfg) = model.config().as_any().downcast_ref::<LlamaConfig>() {
+        cfg.vocab_size as usize
     } else if let Some(cfg) = model.config().as_any().downcast_ref::<grim_models_mamba::MambaConfig>() {
-        cfg.vocab_size
+        cfg.vocab_size as usize
     } else if let Some(cfg) = model.config().as_any().downcast_ref::<Lfm2Config>() {
-        cfg.vocab_size
+        cfg.vocab_size as usize
     } else if let Some(tok) = &tokenizer {
-        tok.tokens.len() as u32
+        tok.tokens.len()
     } else {
         512
     };
@@ -400,4 +400,44 @@ pub async fn cmd_run(
 
     println!("\n[grim] Done. Generated {} tokens.", generated);
     Ok(())
+}
+
+/// Build an F32 tensor from host data on the given device.
+/// Eliminates the 5-way device match duplication that was repeated
+/// for every tensor construction in the generation loop.
+fn build_tensor(
+    data: &[f32],
+    shape: &grim_tensor::Shape,
+    device: &grim_tensor::Device,
+) -> Result<grim_tensor::Tensor> {
+    let dtype = grim_tensor::dtype::DType::F32;
+    let storage: Arc<dyn grim_tensor::BackendStorage> = match device {
+        grim_tensor::Device::Cpu => {
+            let dev = grim_backend_cpu::CpuDevice::new();
+            Arc::from(dev.from_cpu(data, shape, dtype.clone())?)
+        }
+        grim_tensor::Device::Cuda(ordinal) => {
+            let dev = grim_backend_cuda::CudaDevice::new(*ordinal);
+            Arc::from(dev.from_cpu(data, shape, dtype.clone())?)
+        }
+        grim_tensor::Device::Rocm(ordinal) => {
+            let dev = grim_backend_rocm::RocmDevice::new(*ordinal);
+            Arc::from(dev.from_cpu(data, shape, dtype.clone())?)
+        }
+        grim_tensor::Device::Vulkan => {
+            let dev = grim_backend_vulkan::VulkanDevice::new();
+            Arc::from(dev.from_cpu(data, shape, dtype.clone())?)
+        }
+        grim_tensor::Device::Metal(ordinal) => {
+            let dev = grim_backend_metal::MetalDevice::try_new(*ordinal)?;
+            Arc::from(dev.from_cpu(data, shape, dtype.clone())?)
+        }
+    };
+    Ok(grim_tensor::Tensor::new(
+        storage,
+        shape.clone(),
+        dtype,
+        grim_tensor::dtype::QuantProvenance::default(),
+        device.clone(),
+    ))
 }
