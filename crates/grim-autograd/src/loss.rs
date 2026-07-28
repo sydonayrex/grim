@@ -2,7 +2,10 @@
 //!
 //! Provides `cross_entropy_loss` returning `(loss_val, loss_grad_tensor)`.
 
-use grim_tensor::{DType, Tensor, error::{Error, Result}};
+use grim_tensor::{
+    DType, Tensor,
+    error::{Error, Result},
+};
 use std::sync::Arc;
 
 /// Compute cross-entropy loss and its backward gradient w.r.t logits.
@@ -12,7 +15,9 @@ use std::sync::Arc;
 pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Result<(f32, Tensor)> {
     let dims = logits.shape().dims();
     if dims.len() != 2 {
-        return Err(Error::Backend("logits tensor must be 2D [batch_size, vocab_size]".into()));
+        return Err(Error::Backend(
+            "logits tensor must be 2D [batch_size, vocab_size]".into(),
+        ));
     }
 
     let batch_size = dims[0];
@@ -89,10 +94,7 @@ mod tests {
     #[test]
     fn cross_entropy_loss_zero_when_confident_correct() {
         // Logits heavily favor index 0 for sample 0, and index 1 for sample 1
-        let logits = cpu_tensor(
-            vec![10.0, -10.0, -10.0, 10.0],
-            Shape::new(vec![2, 2]),
-        );
+        let logits = cpu_tensor(vec![10.0, -10.0, -10.0, 10.0], Shape::new(vec![2, 2]));
         let targets = vec![0, 1];
         let (loss, grad) = cross_entropy_loss(&logits, &targets).unwrap();
         assert!(loss < 1e-4);
@@ -107,11 +109,23 @@ mod tests {
 
         // Softmax(1.0, 2.0) = [0.2689414, 0.7310586]
         // Loss = -ln(0.7310586) = 0.3132617
-        assert!((loss - 0.3132617).abs() < 1e-5, "loss = {}, want 0.3132617", loss);
+        assert!(
+            (loss - 0.3132617).abs() < 1e-5,
+            "loss = {}, want 0.3132617",
+            loss
+        );
 
         // Grad: p_0 / 1 = 0.2689414, (p_1 - 1) / 1 = -0.2689414
         let g = grad.to_vec_f32().expect("to vec");
-        assert!((g[0] - 0.2689414).abs() < 1e-5, "g[0] = {}, want 0.2689414", g[0]);
-        assert!((g[1] - (-0.2689414)).abs() < 1e-5, "g[1] = {}, want -0.2689414", g[1]);
+        assert!(
+            (g[0] - 0.2689414).abs() < 1e-5,
+            "g[0] = {}, want 0.2689414",
+            g[0]
+        );
+        assert!(
+            (g[1] - (-0.2689414)).abs() < 1e-5,
+            "g[1] = {}, want -0.2689414",
+            g[1]
+        );
     }
 }

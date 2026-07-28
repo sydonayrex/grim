@@ -3,10 +3,15 @@
 //! Iterates over the tape entries in reverse order, executing backward functions
 //! for each recorded operation and accumulating gradients into `TrainableParams`.
 
-use crate::ops::{add_backward, lora_backward, matmul_backward, scale_backward, AddArgs, MatMulArgs, ScaleArgs};
+use crate::ops::{
+    AddArgs, MatMulArgs, ScaleArgs, add_backward, lora_backward, matmul_backward, scale_backward,
+};
 use crate::param::TrainableParams;
 use crate::tape::{Tape, TapeMetadata, TensorId};
-use grim_tensor::{error::{Error, Result}, Tensor};
+use grim_tensor::{
+    Tensor,
+    error::{Error, Result},
+};
 use std::collections::HashMap;
 
 /// Context state during backward pass traversal.
@@ -51,10 +56,18 @@ pub fn backward(
 
         match &entry.metadata {
             TapeMetadata::LoRAApply { alpha, rank, a, b } => {
-                let _base = tape.get(entry.inputs[0]).ok_or_else(|| Error::Backend("missing base tensor".into()))?;
-                let x = tape.get(entry.inputs[1]).ok_or_else(|| Error::Backend("missing x tensor".into()))?;
-                let a_t = tape.get(entry.inputs[2]).ok_or_else(|| Error::Backend("missing a tensor".into()))?;
-                let b_t = tape.get(entry.inputs[3]).ok_or_else(|| Error::Backend("missing b tensor".into()))?;
+                let _base = tape
+                    .get(entry.inputs[0])
+                    .ok_or_else(|| Error::Backend("missing base tensor".into()))?;
+                let x = tape
+                    .get(entry.inputs[1])
+                    .ok_or_else(|| Error::Backend("missing x tensor".into()))?;
+                let a_t = tape
+                    .get(entry.inputs[2])
+                    .ok_or_else(|| Error::Backend("missing a tensor".into()))?;
+                let b_t = tape
+                    .get(entry.inputs[3])
+                    .ok_or_else(|| Error::Backend("missing b tensor".into()))?;
 
                 let scale = alpha / (*rank as f32);
                 let (g_base, g_x, g_a, g_b) = lora_backward(&out_grad, x, a_t, b_t, scale)?;
@@ -71,9 +84,17 @@ pub fn backward(
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], g_base)?;
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[1], g_x)?;
             }
-            TapeMetadata::MatMul { transpose_a, transpose_b, .. } => {
-                let a = tape.get(entry.inputs[0]).ok_or_else(|| Error::Backend("missing matmul input a".into()))?;
-                let b = tape.get(entry.inputs[1]).ok_or_else(|| Error::Backend("missing matmul input b".into()))?;
+            TapeMetadata::MatMul {
+                transpose_a,
+                transpose_b,
+                ..
+            } => {
+                let a = tape
+                    .get(entry.inputs[0])
+                    .ok_or_else(|| Error::Backend("missing matmul input a".into()))?;
+                let b = tape
+                    .get(entry.inputs[1])
+                    .ok_or_else(|| Error::Backend("missing matmul input b".into()))?;
 
                 let args = MatMulArgs {
                     a: a.clone(),
@@ -94,7 +115,9 @@ pub fn backward(
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[1], g_b)?;
             }
             TapeMetadata::Add => {
-                let args = AddArgs { out_grad: out_grad.clone() };
+                let args = AddArgs {
+                    out_grad: out_grad.clone(),
+                };
                 let (gl, gr) = add_backward(&args)?;
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], gl)?;
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[1], gr)?;
@@ -113,7 +136,11 @@ pub fn backward(
     Ok(ctx.grads)
 }
 
-fn accumulate_tensor_grad(grads: &mut HashMap<TensorId, Tensor>, id: TensorId, g: Tensor) -> Result<()> {
+fn accumulate_tensor_grad(
+    grads: &mut HashMap<TensorId, Tensor>,
+    id: TensorId,
+    g: Tensor,
+) -> Result<()> {
     if let Some(existing) = grads.get_mut(&id) {
         let dev = crate::pick_device_for_tensor(existing);
         let (sum_storage, handle) = grim_tensor::BackendDevice::add(
@@ -165,9 +192,15 @@ mod tests {
         params.insert(crate::param::TrainableParam::new(pid_b, b_data).unwrap());
 
         let out = tape.record_lora_apply(
-            base, x, a_id, b_id,
+            base,
+            x,
+            a_id,
+            b_id,
             cpu_tensor(vec![2.0, 3.0], Shape::new(vec![1, 2])),
-            1.0, 1, pid_a, pid_b,
+            1.0,
+            1,
+            pid_a,
+            pid_b,
         );
 
         let loss_grad = cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2]));
@@ -175,6 +208,14 @@ mod tests {
 
         assert!(grads.contains_key(&base));
         assert!(grads.contains_key(&x));
-        assert!(!params.get(pid_a).unwrap().grad().to_vec_f32().unwrap().is_empty());
+        assert!(
+            !params
+                .get(pid_a)
+                .unwrap()
+                .grad()
+                .to_vec_f32()
+                .unwrap()
+                .is_empty()
+        );
     }
 }

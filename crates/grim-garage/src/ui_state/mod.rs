@@ -20,14 +20,14 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::discovery::{DatasetEntry, ModelEntry};
-use crate::rocm::RocmDeviceInfo;
+use crate::backend::BackendProbe;
 
 /// Top-level UI state. Owns the data the CVKG views read.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UiAppState {
     pub models: Vec<ModelEntry>,
     pub datasets: Vec<DatasetEntry>,
-    pub devices: Vec<RocmDeviceInfo>,
+    pub devices: Vec<BackendProbe>,
     pub jobs: HashMap<String, UiJob>,
     pub config: UiTrainingConfig,
     pub selected_model: Option<String>,

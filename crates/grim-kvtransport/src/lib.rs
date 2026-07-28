@@ -258,34 +258,102 @@ impl NetworkKvClient {
         Self { local_ip }
     }
 
-    /// Simulates/dispatches block transfer over the network (TCP/RDMA).
+    /// Dispatches a block transfer over the network (TCP/RDMA).
+    ///
+    /// NOTE: This is an unimplemented stub (sims.md issue #2). Returning
+    /// `Ok(())` previously masked the fact that the transport is not wired,
+    /// so callers could mistake a successful call for a successful transfer.
+    /// We now surface an explicit `Unimplemented` error instead of silently
+    /// dropping the data on the floor.
     pub fn send_block_remote(
         &self,
         block_id: BlockId,
-        k: &[f32],
+        _k: &[f32],
         _v: &[f32],
         target_ip: &str,
     ) -> Result<()> {
-        println!(
-            "[NetworkKvClient] Sending KV block {} from {} to {} (Size: {} elements)",
-            block_id, self.local_ip, target_ip, k.len()
-        );
-        Ok(())
+        Err(Error::Unimplemented(format!(
+            "NetworkKvClient::send_block_remote(block_id={block_id}, target_ip={target_ip}): \
+             network transport (TCP/RDMA) is not yet implemented; no bytes have been transferred."
+        )))
     }
 
-    /// Fetches block from a remote node.
+    /// Fetches a block from a remote node.
+    ///
+    /// NOTE: This is an unimplemented stub (sims.md issue #2). The previous
+    /// implementation returned hardcoded `vec![1.0]`/`vec![2.0]` values
+    /// regardless of what was sent, making data integrity impossible and
+    /// letting any caller pass. We now surface an explicit `Unimplemented`
+    /// error instead of returning fabricated data.
     pub fn fetch_block_remote(
         &self,
         block_id: BlockId,
         target_ip: &str,
-        block_elems: usize,
+        _block_elems: usize,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
-        println!(
-            "[NetworkKvClient] Fetching KV block {} from {} to {}",
-            block_id, target_ip, self.local_ip
-        );
-        Ok((vec![1.0; block_elems], vec![2.0; block_elems]))
+        Err(Error::Unimplemented(format!(
+            "NetworkKvClient::fetch_block_remote(block_id={block_id}, target_ip={target_ip}): \
+             network transport (TCP/RDMA) is not yet implemented; no remote block is available."
+        )))
     }
+}
+
+/// Reads one layer's weights from the configured NVMe weights file.
+///
+/// The file is treated as a flat sequence of `f32` values sectioned by
+/// `LAYER_ELEMS` per layer (1024 floats = 4096 bytes per layer). Reads the
+/// layer's slice via `pread` so we don't mutate a shared file offset.
+///
+/// Returns an explicit `KvCache` error if the file is missing, too short for
+/// the requested layer, or the I/O call fails — never substitutes mock data
+/// (sims.md issue #3).
+fn read_layer_weights(
+    weights_path: &std::path::Path,
+    layer_id: usize,
+    layer_elems: usize,
+    layer_bytes: usize,
+) -> Result<Vec<f32>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if !weights_path.exists() {
+        return Err(Error::KvCache(format!(
+            "NVMe weights file not found at {:?}; cannot prefetch layer {}",
+            weights_path, layer_id
+        )));
+    }
+
+    let mut file = std::fs::File::open(weights_path)
+        .map_err(|e| Error::KvCache(format!("failed to open NVMe weights {:?}: {}", weights_path, e)))?;
+
+    let offset = layer_id as u64 * layer_bytes as u64;
+    let metadata = file
+        .metadata()
+        .map_err(|e| Error::KvCache(format!("failed to stat NVMe weights: {}", e)))?;
+    if metadata.len() < offset + layer_bytes as u64 {
+        return Err(Error::KvCache(format!(
+            "NVMe weights file {:?} too short for layer {}: have {} bytes, need {} at offset {}",
+            weights_path,
+            layer_id,
+            metadata.len(),
+            layer_bytes,
+            offset
+        )));
+    }
+
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| Error::KvCache(format!("seek failed on NVMe weights: {}", e)))?;
+
+    let mut bytes = vec![0u8; layer_bytes];
+    file.read_exact(&mut bytes)
+        .map_err(|e| Error::KvCache(format!("read failed on NVMe weights: {}", e)))?;
+
+    // Reinterpret the bytes as a little-endian f32 array.
+    let mut weights = vec![0.0f32; layer_elems];
+    for (i, w) in weights.iter_mut().enumerate() {
+        let start = i * std::mem::size_of::<f32>();
+        *w = f32::from_le_bytes([bytes[start], bytes[start + 1], bytes[start + 2], bytes[start + 3]]);
+    }
+    Ok(weights)
 }
 
 /// Double-buffered weight prefetch engine for NVMe layer streaming.
@@ -319,26 +387,48 @@ impl NvmeWeightStreamer {
         }
     }
 
-    /// Simulate prefetching a target layer weights asynchronously into pinned CPU RAM.
-    /// In a production environment under Linux, this leverages io_uring and O_DIRECT.
+    /// Prefetch a target layer's weights asynchronously into pinned CPU RAM.
+    ///
+    /// In a production environment under Linux, this leverages `io_uring` and
+    /// `O_DIRECT`; here we synchronously `pread` the weights file, since the
+    /// network/io_uring backend is not yet wired (sims.md issue #3). The
+    /// previous implementation inserted hardcoded `vec![0.5f32; 1024]` weights
+    /// instead of reading from disk, silently corrupting any computation that
+    /// consumed the cache. We now read the real bytes from `weights_path`:
+    ///
+    /// - If the file is missing or the read fails, we surface an explicit
+    ///   `KvCache` error rather than substituting mock data.
+    /// - The on-disk layout is treated as a flat stream of `f32` weights
+    ///   sectioned per layer by `LAYER_ELEMS` (1024 floats / 4096 bytes per
+    ///   layer), matching the previous mock weight length so callers that
+    ///   depend on a 1024-element layer keep working when real data is
+    ///   available.
+    ///
+    /// The LRU admission + bandwidth backpressure logic is preserved — only
+    /// the data source changes from mock to real.
     pub fn prefetch_layer_async(&self, layer_id: usize) -> Result<()> {
-        println!(
-            "[NvmeWeightStreamer] Prefetching layer {} from NVMe file: {:?}",
-            layer_id, self.weights_path
-        );
-
-        // Bandwidth Admission and Backpressure check:
-        // If simulated bandwidth usage exceeds 12.0 GB/s (representing PCIe Gen4 x8 saturation),
-        // we introduce backpressure delay or return an error/warning limit.
+        // Bandwidth Admission and Backpressure check (real logic preserved):
+        // If bandwidth usage exceeds 12.0 GB/s (~PCIe Gen4 x8 saturation),
+        // defer the prefetch instead of saturating the link.
         let cur_bandwidth = *self.bandwidth_usage.lock().unwrap();
         if cur_bandwidth > 12.0 * 1024.0 * 1024.0 * 1024.0 {
-            println!("[NvmeWeightStreamer] [BACKPRESSURE] Bandwidth limit reached ({} B/s). Deferring prefetch.", cur_bandwidth);
-            return Err(Error::KvCache("PCIe transfer bandwidth limit backpressure triggered".into()));
+            return Err(Error::KvCache(
+                "PCIe transfer bandwidth limit backpressure triggered".into(),
+            ));
         }
 
-        // Simulate io_uring submission loop
+        // Per-layer size in f32 elements (matches the previous mock length so
+        // existing callers preserve their shape when backed by a real file).
+        const LAYER_ELEMS: usize = 1024;
+        let layer_bytes = LAYER_ELEMS * std::mem::size_of::<f32>();
+
+        // Read the layer's weights from the configured NVMe path. We do this
+        // up-front (before acquiring the cache locks) so an I/O error fails
+        // loudly instead of leaving the cache half-mutated.
+        let weights = read_layer_weights(&self.weights_path, layer_id, LAYER_ELEMS, layer_bytes)?;
+
         *self.uring_submitting.lock().unwrap() = true;
-        
+
         // Populate LRU cache
         let mut cache = self.host_weight_cache.lock().unwrap();
         let mut order = self.lru_order.lock().unwrap();
@@ -349,18 +439,15 @@ impl NvmeWeightStreamer {
                 if !order.is_empty() {
                     let evicted = order.remove(0);
                     cache.remove(&evicted);
-                    println!("[NvmeWeightStreamer] [LRU] Evicted layer {} from Host RAM weight cache", evicted);
                 }
             }
 
-            // Load mock layer weights into double buffer
-            let mock_weights = vec![0.5f32; 1024];
-            cache.insert(layer_id, mock_weights.clone());
+            cache.insert(layer_id, weights.clone());
             order.push(layer_id);
 
             // Populate double buffers (async swap preparation)
             let mut buffers = self.double_buffers.lock().unwrap();
-            buffers.1 = mock_weights; // Load into transfer buffer
+            buffers.1 = weights; // Load into transfer buffer
         } else {
             // Move layer to end of access order
             if let Some(pos) = order.iter().position(|&x| x == layer_id) {
@@ -374,19 +461,17 @@ impl NvmeWeightStreamer {
     }
 
     /// Swaps the target double-buffers to update GPU memory.
-    pub fn commit_and_swap(&self, current_layer: usize, next_layer: usize) -> Result<()> {
-        println!(
-            "[NvmeWeightStreamer] Swapping buffers: GPU executing Layer {}, DMA promoting Layer {}",
-            current_layer, next_layer
-        );
+    pub fn commit_and_swap(&self, _current_layer: usize, _next_layer: usize) -> Result<()> {
         let mut buffers = self.double_buffers.lock().unwrap();
-        // Double-buffered swap: Active buffer becomes transfer buffer and vice versa
+        // Double-buffered swap: Active buffer becomes transfer buffer and vice versa.
+        // The previous implementation logged the layer ids; the swap itself is
+        // the only observable effect, so the println was just noise in logs.
         let (buf0, buf1) = &mut *buffers;
         std::mem::swap(buf0, buf1);
         Ok(())
     }
 
-    /// Update simulated transfer bandwidth usage.
+    /// Update the tracked transfer bandwidth usage (bytes/sec).
     pub fn set_bandwidth_usage(&self, bytes_per_sec: f64) {
         *self.bandwidth_usage.lock().unwrap() = bytes_per_sec;
     }
@@ -430,10 +515,22 @@ mod tests {
         let client = NetworkKvClient::new("127.0.0.1".to_string());
         let k = vec![1.0f32; 8];
         let v = vec![2.0f32; 8];
-        client.send_block_remote(100, &k, &v, "127.0.0.2").unwrap();
-        let (ret_k, ret_v) = client.fetch_block_remote(100, "127.0.0.2", 8).unwrap();
-        assert_eq!(ret_k, vec![1.0; 8]);
-        assert_eq!(ret_v, vec![2.0; 8]);
+        // The network transport is an unimplemented stub (sims.md issue #2).
+        // Both send and fetch must surface explicit `Unimplemented` errors
+        // rather than silently succeeding or returning fabricated data.
+        let send_res = client.send_block_remote(100, &k, &v, "127.0.0.2");
+        assert!(send_res.is_err(), "send_block_remote should not silently succeed");
+        assert!(
+            send_res.unwrap_err().to_string().contains("not yet implemented"),
+            "send_block_remote error should mention not-implemented"
+        );
+
+        let fetch_res = client.fetch_block_remote(100, "127.0.0.2", 8);
+        assert!(fetch_res.is_err(), "fetch_block_remote should not return fabricated data");
+        assert!(
+            fetch_res.unwrap_err().to_string().contains("not yet implemented"),
+            "fetch_block_remote error should mention not-implemented"
+        );
     }
 
     #[test]
@@ -443,12 +540,74 @@ mod tests {
         for &size in &[1usize, 16, 64, 1024] {
             let k = vec![0.5f32; size];
             let v = vec![0.25f32; size];
-            assert!(client.send_block_remote(42, &k, &v, "10.0.0.2").is_ok());
-            let (ret_k, ret_v) = client.fetch_block_remote(42, "10.0.0.2", size).unwrap();
-            assert_eq!(ret_k.len(), size, "returned k length should match requested size");
-            assert_eq!(ret_v.len(), size, "returned v length should match requested size");
-            assert!(ret_k.iter().all(|&x| x == 1.0), "k should be filled with 1.0");
-            assert!(ret_v.iter().all(|&x| x == 2.0), "v should be filled with 2.0");
+            // The transport stub must error for every requested size — it cannot
+            // silently fabricate `vec![1.0]`/`vec![2.0]` (sims.md issue #2).
+            let send_res = client.send_block_remote(42, &k, &v, "10.0.0.2");
+            assert!(send_res.is_err(), "send_block_remote(size={size}) should error");
+            let fetch_res = client.fetch_block_remote(42, "10.0.0.2", size);
+            assert!(fetch_res.is_err(), "fetch_block_remote(size={size}) should error");
         }
+    }
+
+    #[test]
+    fn test_nvme_weight_streamer_reads_real_file() {
+        // sims.md issue #3: prefetch_layer_async must read real weights from
+        // the file rather than substituting mock 0.5f32 values.
+        let dir = tempdir().unwrap();
+        let weights_path = dir.path().join("layer_weights.bin");
+
+        // Write 2 layers of 1024 f32 each (4096 bytes per layer).
+        let layer0: Vec<f32> = (0..1024).map(|i| i as f32).collect();
+        let layer1: Vec<f32> = (0..1024).map(|i| (i as f32) * 2.0).collect();
+        let mut buf = Vec::new();
+        for w in layer0.iter().chain(layer1.iter()) {
+            buf.extend_from_slice(&w.to_le_bytes());
+        }
+        std::fs::write(&weights_path, &buf).unwrap();
+
+        let streamer = NvmeWeightStreamer::new(weights_path.clone(), 4);
+
+        // Prefetch layer 0 and verify the cached weights match what we wrote.
+        streamer.prefetch_layer_async(0).expect("layer 0 should prefetch");
+        let cache = streamer.host_weight_cache.lock().unwrap();
+        let got = cache.get(&0).expect("layer 0 should be cached");
+        assert_eq!(got, &layer0, "layer 0 weights must be the real file contents, not mock 0.5");
+        drop(cache);
+
+        // Prefetch layer 1 and verify.
+        streamer.prefetch_layer_async(1).expect("layer 1 should prefetch");
+        let cache = streamer.host_weight_cache.lock().unwrap();
+        let got1 = cache.get(&1).expect("layer 1 should be cached");
+        assert_eq!(got1, &layer1, "layer 1 weights must be the real file contents");
+    }
+
+    #[test]
+    fn test_nvme_weight_streamer_missing_file_errors() {
+        // sims.md issue #3: a missing weights file must produce an explicit
+        // error, not silently insert mock 0.5f32 data.
+        let dir = tempdir().unwrap();
+        let weights_path = dir.path().join("does_not_exist.bin");
+        let streamer = NvmeWeightStreamer::new(weights_path, 4);
+
+        let res = streamer.prefetch_layer_async(0);
+        assert!(res.is_err(), "missing weights file must error, not silently use mocks");
+        let msg = res.unwrap_err().to_string();
+        assert!(msg.contains("not found"), "error should mention missing file: {}", msg);
+    }
+
+    #[test]
+    fn test_nvme_weight_streamer_short_file_errors() {
+        // sims.md issue #3: a file too short for the requested layer must
+        // error rather than silently serving mock data.
+        let dir = tempdir().unwrap();
+        let weights_path = dir.path().join("short.bin");
+        // Only 100 bytes — far too short for layer 0 (4096 bytes).
+        std::fs::write(&weights_path, &[0u8; 100]).unwrap();
+        let streamer = NvmeWeightStreamer::new(weights_path, 4);
+
+        let res = streamer.prefetch_layer_async(0);
+        assert!(res.is_err(), "short file must error for layer 0");
+        let msg = res.unwrap_err().to_string();
+        assert!(msg.contains("too short"), "error should mention short file: {}", msg);
     }
 }

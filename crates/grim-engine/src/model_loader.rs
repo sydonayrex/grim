@@ -25,6 +25,14 @@ use grim_tensor::{Device, TensorProvider};
 use serde::Deserialize;
 use std::path::Path;
 
+/// Debug-only logging macro. Compiles to a no-op in release builds so that
+/// diagnostic  calls do not pollute production stderr (sims.md issue #7).
+macro_rules! dbg_eprintln {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        { eprintln!($($arg)*) }
+    };
+}
 /// Attempt to resolve an `ArchCompatSpec` for an unknown architecture string,
 /// first from an inline HF `config.json` string, and second by searching installed
 /// `.grimplugin` manifests in `grim_plugins_dir()`.
@@ -102,16 +110,16 @@ impl<'a> MetadataLookup for GgufMetadataLookup<'a> {
     fn get_u32(&self, key: &str) -> Option<u32> {
         let v = self.0.metadata(key)?;
         if let Some(u) = v.as_u32() {
-            eprintln!("[meta-get-u32] {key} = {u} (u32)");
+            dbg_eprintln!("[meta-get-u32] {key} = {u} (u32)");
             return Some(u);
         }
         if let Some(s) = v.as_str() {
             if let Ok(u) = s.parse::<u32>() {
-                eprintln!("[meta-get-u32] {key} = {u} (str->u32)");
+                dbg_eprintln!("[meta-get-u32] {key} = {u} (str->u32)");
                 return Some(u);
             }
         }
-        eprintln!("[meta-get-u32] {key} = MISSING");
+        dbg_eprintln!("[meta-get-u32] {key} = MISSING");
         None
     }
     fn get_f32(&self, key: &str) -> Option<f32> {
@@ -257,7 +265,7 @@ fn load_model_from_config(
     let expert_count = compat_spec.as_ref().and_then(|s| s.expert_count).or(config.num_local_experts).unwrap_or(8);
     let expert_used_count = compat_spec.as_ref().and_then(|s| s.expert_used_count).or(config.num_experts_per_tok).unwrap_or(2);
 
-    eprintln!(
+    dbg_eprintln!(
         "[grim] Loading config from safetensors: architecture={:?}, layers={}, hidden={}, vocab={}",
         model_arch, num_layers, hidden_size, vocab_size
     );

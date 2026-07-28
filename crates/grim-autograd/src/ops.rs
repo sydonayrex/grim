@@ -3,7 +3,7 @@
 //! Provides reverse-mode backward implementations for MatMul, Add, Scale, and fused LoRA application.
 
 use grim_tensor::dtype::{BlockDtype, FloatPackScheme, KQuantScheme};
-use grim_tensor::{DType, Storage, Tensor, Error, error::Result};
+use grim_tensor::{DType, Error, Storage, Tensor, error::Result};
 use std::sync::Arc;
 
 /// Arguments for MatMul backward evaluation.
@@ -69,18 +69,33 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
 
     let (m, k) = match a_dims.len() {
         1 => (1, a_dims[0]),
-        _ => if args.transpose_a { (a_dims[1], a_dims[0]) } else { (a_dims[0], a_dims[1]) },
+        _ => {
+            if args.transpose_a {
+                (a_dims[1], a_dims[0])
+            } else {
+                (a_dims[0], a_dims[1])
+            }
+        }
     };
     let (_, n) = match b_dims.len() {
         1 => (b_dims[0], 1),
-        _ => if args.transpose_b { (b_dims[1], b_dims[0]) } else { (b_dims[0], b_dims[1]) },
+        _ => {
+            if args.transpose_b {
+                (b_dims[1], b_dims[0])
+            } else {
+                (b_dims[0], b_dims[1])
+            }
+        }
     };
 
     // Try GPU / ROCm fused backward dispatch when available and b is quantized.
     if !args.transpose_a && !args.transpose_b {
         let b_quantized = matches!(
             args.b.dtype().storage,
-            Storage::KQuant(..) | Storage::Block(..) | Storage::FloatPack(..) | Storage::GroupInt(..)
+            Storage::KQuant(..)
+                | Storage::Block(..)
+                | Storage::FloatPack(..)
+                | Storage::GroupInt(..)
         );
         let b_on_rocm = matches!(args.b.device(), grim_tensor::Device::Rocm(_));
 
@@ -107,7 +122,11 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
                     args.a.device().clone(),
                 );
 
-                let (storage_b, _) = dev.matmul(args.a.storage().as_ref(), args.out_grad.storage().as_ref(), args.b.shape())?;
+                let (storage_b, _) = dev.matmul(
+                    args.a.storage().as_ref(),
+                    args.out_grad.storage().as_ref(),
+                    args.b.shape(),
+                )?;
                 let grad_b = Tensor::new(
                     Arc::from(storage_b),
                     args.b.shape().clone(),
@@ -161,7 +180,7 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
         //
         // For both transposed (C = A^T @ B^T):
         //   dA_stored = B @ G^T  ->  dA[p][q] = sum_l B[p][l] * G[q][l]  (same as trans_a)
-        //   dB_stored = G @ A    ->  dB[p][q] = sum_i G[p][i] * A[q][i]   (derived: dB^T = A^T @ G) 
+        //   dB_stored = G @ A    ->  dB[p][q] = sum_i G[p][i] * A[q][i]   (derived: dB^T = A^T @ G)
         for p in 0..a_dims[0] {
             for q in 0..a_dims[1] {
                 match (args.transpose_a, args.transpose_b) {
@@ -273,8 +292,16 @@ pub fn add_backward(args: &AddArgs) -> Result<(Tensor, Tensor)> {
 /// Returns `grad_input = out_grad * factor`.
 pub fn scale_backward(args: &ScaleArgs) -> Result<Tensor> {
     let dev = crate::pick_device_for_tensor(&args.input_grad);
-    let scale_buf = dev.from_cpu(&vec![args.factor; args.input_grad.shape().elem_count()], args.input_grad.shape(), DType::F32)?;
-    let (storage, _) = dev.mul(args.input_grad.storage().as_ref(), scale_buf.as_ref(), args.input_grad.shape())?;
+    let scale_buf = dev.from_cpu(
+        &vec![args.factor; args.input_grad.shape().elem_count()],
+        args.input_grad.shape(),
+        DType::F32,
+    )?;
+    let (storage, _) = dev.mul(
+        args.input_grad.storage().as_ref(),
+        scale_buf.as_ref(),
+        args.input_grad.shape(),
+    )?;
     Ok(Tensor::new(
         Arc::from(storage),
         args.input_grad.shape().clone(),
@@ -296,7 +323,7 @@ pub fn lora_backward(
 ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
     let grad_base = out_grad.clone();
     let dev = crate::pick_device_for_tensor(x);
-    use grim_tensor::{Shape, QuantProvenance};
+    use grim_tensor::{QuantProvenance, Shape};
 
     let x_vec = x.to_vec_f32()?;
     let a_vec = a.to_vec_f32()?;
@@ -308,7 +335,11 @@ pub fn lora_backward(
     let b_dims = b.shape().dims();
 
     let batch = if x_dims.len() == 1 { 1 } else { x_dims[0] };
-    let in_features = if x_dims.len() == 1 { x_dims[0] } else { x_dims[1] };
+    let in_features = if x_dims.len() == 1 {
+        x_dims[0]
+    } else {
+        x_dims[1]
+    };
     let rank = a_dims[0];
     let out_features = b_dims[0];
 
@@ -324,26 +355,71 @@ pub fn lora_backward(
         };
 
         let a_t_vec = transpose_matrix(&a_vec, rank, in_features);
-        let a_t_storage = dev.from_cpu(&a_t_vec, &Shape::new(vec![in_features, rank]), DType::F32)?;
-        let (h_storage, _) = dev.matmul(x.storage().as_ref(), a_t_storage.as_ref(), &Shape::new(vec![batch, rank]))?;
+        let a_t_storage =
+            dev.from_cpu(&a_t_vec, &Shape::new(vec![in_features, rank]), DType::F32)?;
+        let (h_storage, _) = dev.matmul(
+            x.storage().as_ref(),
+            a_t_storage.as_ref(),
+            &Shape::new(vec![batch, rank]),
+        )?;
 
-        let (dh_unscaled, _) = dev.matmul(out_grad.storage().as_ref(), b.storage().as_ref(), &Shape::new(vec![batch, rank]))?;
-        let (dh_storage, _) = dev.mul_scalar(dh_unscaled.as_ref(), scale, &Shape::new(vec![batch, rank]))?;
+        let (dh_unscaled, _) = dev.matmul(
+            out_grad.storage().as_ref(),
+            b.storage().as_ref(),
+            &Shape::new(vec![batch, rank]),
+        )?;
+        let (dh_storage, _) =
+            dev.mul_scalar(dh_unscaled.as_ref(), scale, &Shape::new(vec![batch, rank]))?;
 
         let g_t_vec = transpose_matrix(&g_vec, batch, out_features);
-        let g_t_storage = dev.from_cpu(&g_t_vec, &Shape::new(vec![out_features, batch]), DType::F32)?;
-        let (db_unscaled, _) = dev.matmul(g_t_storage.as_ref(), h_storage.as_ref(), &Shape::new(vec![out_features, rank]))?;
-        let (db_storage, _) = dev.mul_scalar(db_unscaled.as_ref(), scale, &Shape::new(vec![out_features, rank]))?;
+        let g_t_storage =
+            dev.from_cpu(&g_t_vec, &Shape::new(vec![out_features, batch]), DType::F32)?;
+        let (db_unscaled, _) = dev.matmul(
+            g_t_storage.as_ref(),
+            h_storage.as_ref(),
+            &Shape::new(vec![out_features, rank]),
+        )?;
+        let (db_storage, _) = dev.mul_scalar(
+            db_unscaled.as_ref(),
+            scale,
+            &Shape::new(vec![out_features, rank]),
+        )?;
 
         let dh_vec_gpu = dh_storage.to_cpu_vec_f32()?;
         let dh_t_vec = transpose_matrix(&dh_vec_gpu, batch, rank);
         let dh_t_storage = dev.from_cpu(&dh_t_vec, &Shape::new(vec![rank, batch]), DType::F32)?;
-        let (da_storage, _) = dev.matmul(dh_t_storage.as_ref(), x.storage().as_ref(), &Shape::new(vec![rank, in_features]))?;
-        let (dx_storage, _) = dev.matmul(dh_storage.as_ref(), a.storage().as_ref(), &Shape::new(vec![batch, in_features]))?;
+        let (da_storage, _) = dev.matmul(
+            dh_t_storage.as_ref(),
+            x.storage().as_ref(),
+            &Shape::new(vec![rank, in_features]),
+        )?;
+        let (dx_storage, _) = dev.matmul(
+            dh_storage.as_ref(),
+            a.storage().as_ref(),
+            &Shape::new(vec![batch, in_features]),
+        )?;
 
-        let grad_x = Tensor::new(Arc::from(dx_storage), x.shape().clone(), DType::F32, QuantProvenance::default(), x.device().clone());
-        let grad_a = Tensor::new(Arc::from(da_storage), a.shape().clone(), DType::F32, QuantProvenance::default(), a.device().clone());
-        let grad_b = Tensor::new(Arc::from(db_storage), b.shape().clone(), DType::F32, QuantProvenance::default(), b.device().clone());
+        let grad_x = Tensor::new(
+            Arc::from(dx_storage),
+            x.shape().clone(),
+            DType::F32,
+            QuantProvenance::default(),
+            x.device().clone(),
+        );
+        let grad_a = Tensor::new(
+            Arc::from(da_storage),
+            a.shape().clone(),
+            DType::F32,
+            QuantProvenance::default(),
+            a.device().clone(),
+        );
+        let grad_b = Tensor::new(
+            Arc::from(db_storage),
+            b.shape().clone(),
+            DType::F32,
+            QuantProvenance::default(),
+            b.device().clone(),
+        );
 
         return Ok((grad_base, grad_x, grad_a, grad_b));
     }
@@ -450,14 +526,12 @@ pub fn apply_and_record_lora(
 ) -> Result<(crate::tape::TensorId, Tensor)> {
     if let Some(cfg) = autograd_reg.injection_registry.get(layer_idx, point) {
         if cfg.enabled {
-            let param_a = autograd_reg
-                .params
-                .get(cfg.param_id_a())
-                .ok_or_else(|| Error::Backend(format!("missing param a for layer {layer_idx} {point:?}")))?;
-            let param_b = autograd_reg
-                .params
-                .get(cfg.param_id_b())
-                .ok_or_else(|| Error::Backend(format!("missing param b for layer {layer_idx} {point:?}")))?;
+            let param_a = autograd_reg.params.get(cfg.param_id_a()).ok_or_else(|| {
+                Error::Backend(format!("missing param a for layer {layer_idx} {point:?}"))
+            })?;
+            let param_b = autograd_reg.params.get(cfg.param_id_b()).ok_or_else(|| {
+                Error::Backend(format!("missing param b for layer {layer_idx} {point:?}"))
+            })?;
 
             let a_id = tape.register_param(cfg.param_id_a(), param_a.data.clone());
             let b_id = tape.register_param(cfg.param_id_b(), param_b.data.clone());
@@ -587,7 +661,7 @@ mod tests {
     /// residual and outlier metadata from a tensor carrying `QuantProvenance::WithResiduals`.
     #[test]
     fn test_quantized_matmul_backward_residuals_extraction_from_provenance() {
-        use grim_tensor::{QuantProvenance, Storage, DType, ArithType, Device};
+        use grim_tensor::{ArithType, DType, Device, QuantProvenance, Storage};
 
         let provenance = QuantProvenance::WithResiduals {
             outlier_count: 5,
@@ -625,7 +699,7 @@ mod tests {
 
     #[test]
     fn test_apply_and_record_lora_direct() {
-        use crate::{InjectionConfig, LoRAInjectionRegistry, LoRAInjectionPoint};
+        use crate::{InjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry};
         let mut tape = crate::tape::Tape::new();
         let inj_config = InjectionConfig {
             hidden_size: 2,
@@ -638,7 +712,8 @@ mod tests {
         let inj_reg = LoRAInjectionRegistry::standard_qlora(1, 4, 16.0, 1);
         let registry = crate::registry::AutogradRegistry::new(inj_config, inj_reg).unwrap();
 
-        let base_tensor = grim_backend_cpu::cpu_tensor(vec![1.0f32, 2.0f32], Shape::new(vec![1, 2]));
+        let base_tensor =
+            grim_backend_cpu::cpu_tensor(vec![1.0f32, 2.0f32], Shape::new(vec![1, 2]));
         let base_id = tape.register(base_tensor.clone());
 
         let x_tensor = grim_backend_cpu::cpu_tensor(vec![0.5f32, 0.5f32], Shape::new(vec![1, 2]));
@@ -653,7 +728,8 @@ mod tests {
             base_id,
             x_tensor,
             x_id,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(out_tensor.shape().dims(), &[1, 2]);
         assert!(tape.len() > 0);

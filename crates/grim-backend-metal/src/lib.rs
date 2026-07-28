@@ -615,9 +615,13 @@ impl BackendDevice for MetalDevice {
                 }
                 let out_storage = self.from_cpu(&c_vec, out, a.dtype())?;
                 let ctx = MetalContext::get()?;
-                let dummy_cmd = ctx.command_queue.commandBuffer()
-                    .ok_or_else(|| Error::from(MetalError::Ffi("Failed to create dummy command buffer".into())))?;
-                return Ok((out_storage, Box::new(MetalHandle { command_buffer: dummy_cmd })));
+                // Device-absent fallback: the computation was already performed
+                // on the CPU via the Accelerate framework (cblas_sgemm above).
+                // MetalHandle requires a command_buffer field, so we create a
+                // no-op buffer here — this is a legitimate fallback, not a stub.
+                let fallback_cmd = ctx.command_queue.commandBuffer()
+                    .ok_or_else(|| Error::from(MetalError::Ffi("Failed to create fallback command buffer".into())))?;
+                return Ok((out_storage, Box::new(MetalHandle { command_buffer: fallback_cmd })));
             }
 
             if let Some(ref inner) = self.inner {
