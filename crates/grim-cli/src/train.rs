@@ -17,7 +17,7 @@ use grim_format::tprov::GgufProvider;
 
 /// Sentinel value for ignored label positions in cross-entropy loss.
 /// Matches HF/PyTorch convention: -100 as u32 wraps to 4294967196.
-const IGNORE_INDEX: u32 = IGNORE_INDEX;
+const IGNORE_INDEX: u32 = -100i32 as u32;
 use grim_format::tokenizer::GgufTokenizer;
 use grim_format::train::TrainState;
 use grim_models_transformer::LlamaConfig;
@@ -256,7 +256,7 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
     if opts.rank == 0 {
         return Err(Error::Session("LoRA rank must be > 0".into()));
     }
-    if opts.alpha == 0 {
+    if opts.alpha == 0.0 {
         return Err(Error::Session("LoRA alpha must be > 0".into()));
     }
     let hidden_size = llama_config.hidden_size;
@@ -465,6 +465,7 @@ mod tests {
             model_type: "llama".to_string(),
             bpe_merges: None,
             byte_decoder: None,
+            chat_template: None,
         };
 
         let dataset = load_dataset_from_str(json, &tokenizer, 512).unwrap();

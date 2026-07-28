@@ -491,8 +491,15 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
     // 2. Query official rocminfo tool for installed AMD ROCm GPUs.
     let rocminfo_devs = query_rocminfo_gpus();
     for mut amd_dev in rocminfo_devs {
+        // `parse_rocminfo_text` already resolved `vram_used_bytes` against the
+        // AMD-local sysfs slot (correct per-card mapping, using a 0-based ordinal
+        // that lines up with the AMD cards rocminfo enumerated). Do NOT re-query
+        // here with the *global* running `ordinal`: whenever NVIDIA GPUs precede
+        // AMD (or any non-AMD device is counted first), that ordinal is offset and
+        // `query_amd_vram_used` would return the wrong card's live usage — or 0
+        // for an out-of-range slot — silently mislabeling VRAM. Keep the parser's
+        // value; only renumber `ordinal` for display ordering.
         amd_dev.ordinal = ordinal;
-        amd_dev.vram_used_bytes = query_amd_vram_used(ordinal);
         devices.push(amd_dev);
         ordinal += 1;
     }

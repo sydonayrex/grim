@@ -168,7 +168,7 @@ impl LlamaBlock {
     /// Apply RoPE to a multi-head tensor of shape (B, S, num_heads * head_dim)
     /// or (S, num_heads * head_dim) by reshaping to (B, S * num_heads, head_dim),
     /// repeating positions per-head, and reshaping back.
-    fn apply_rope_multi_head(&self, x: &Tensor, positions: &[u32], num_heads: usize) -> Result<Tensor> {
+    pub(crate) fn apply_rope_multi_head(&self, x: &Tensor, positions: &[u32], num_heads: usize) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
         let (b, s, d) = if dims.len() == 3 {
             (dims[0], dims[1], dims[2])
@@ -232,7 +232,7 @@ impl LlamaBlock {
         Ok(Tensor::new(std::sync::Arc::from(storage), x.shape().clone(), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), self._dev.clone()))
     }
 
-    fn prefilled_self_attention(
+    pub(crate) fn prefilled_self_attention(
         &self,
         q: &Tensor,
         k: &Tensor,
@@ -298,5 +298,273 @@ impl LlamaBlock {
             let storage = dev.from_cpu(&out, &Shape::new(vec![total_tokens, num_head_dims]), grim_tensor::DType::F32)?;
             Tensor::new(std::sync::Arc::from(storage), Shape::new(vec![total_tokens, num_head_dims]), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), self._dev.clone())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grim_backend_cpu::cpu_tensor;
+    use grim_tensor::{Device, DType, Shape, Tensor};
+
+    fn small_cfg() -> LlamaConfigRefs {
+        LlamaConfigRefs {
+            hidden_size: 32,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 16,
+            intermediate_size: 64,
+        }
+    }
+
+    fn make_linear(in_dim: usize, out_dim: usize) -> Linear {
+        // Small weights to keep attention scores in a reasonable range for
+        // softmax (large weights saturate softmax and make RoPE effects
+        // invisible).
+        let w = cpu_tensor(
+            (0..out_dim * in_dim).map(|i| (i as f32 * 0.001) - 0.05).collect::<Vec<f32>>(),
+            Shape::new(vec![out_dim, in_dim]),
+        );
+        Linear::from_tensor(w, None)
+    }
+
+    fn make_rmsnorm(dim: usize) -> RmsNorm {
+        let w = cpu_tensor(
+            (0..dim).map(|_| 1.0f32).collect::<Vec<f32>>(),
+            Shape::new(vec![dim]),
+        );
+        RmsNorm { weight: w, eps: 1e-5 }
+    }
+
+    fn small_block() -> LlamaBlock {
+        let cfg = small_cfg();
+        let dev = Device::Cpu;
+        let wq = make_linear(cfg.hidden_size, cfg.num_heads * cfg.head_dim);
+        let wk = make_linear(cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim);
+        let wv = make_linear(cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim);
+        let wo = make_linear(cfg.num_heads * cfg.head_dim, cfg.hidden_size);
+        let w_gate = make_linear(cfg.hidden_size, cfg.intermediate_size);
+        let w_up = make_linear(cfg.hidden_size, cfg.intermediate_size);
+        let w_down = make_linear(cfg.intermediate_size, cfg.hidden_size);
+        let attn_norm = make_rmsnorm(cfg.hidden_size);
+        let ffn_norm = make_rmsnorm(cfg.hidden_size);
+        let rope = Rope::new(cfg.head_dim, 10000.0);
+        LlamaBlock {
+            attn_norm, wq, wk, wv, wo, ffn_norm, w_gate, w_up, w_down, rope,
+            _dev: dev, _cfg: cfg,
+        }
+    }
+
+    fn make_tensor(data: Vec<f32>, shape: &[usize]) -> Tensor {
+        let t = cpu_tensor(data, Shape::new(shape.to_vec()));
+        t
+    }
+
+    /// CRIT-1: Causal mask — token at position i must not attend to positions > i.
+    /// With a 3-token input, changing the 3rd token must not affect the output
+    /// at position 0 or 1.
+    #[test]
+    fn test_causal_mask_no_future_leakage() {
+        let block = small_block();
+        let cfg = small_cfg();
+
+        let x_data: Vec<f32> = (0..3 * cfg.hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let x = make_tensor(x_data.clone(), &[3, cfg.hidden_size]);
+
+        let out1 = block.forward(&x, &[0, 1, 2]).unwrap();
+        let out1_data = out1.to_vec_f32().unwrap();
+
+        // Change the 3rd token — positions 0 and 1 should be unaffected
+        let mut x_mod = x_data.clone();
+        for i in (2 * cfg.hidden_size)..(3 * cfg.hidden_size) {
+            x_mod[i] += 100.0;
+        }
+        let x2 = make_tensor(x_mod, &[3, cfg.hidden_size]);
+        let out2 = block.forward(&x2, &[0, 1, 2]).unwrap();
+        let out2_data = out2.to_vec_f32().unwrap();
+
+        // Positions 0 and 1 must be identical (causal mask prevents future leakage)
+        for i in 0..(2 * cfg.hidden_size) {
+            assert!(
+                (out1_data[i] - out2_data[i]).abs() < 1e-5,
+                "Position {} leaked future token: {} vs {}",
+                i, out1_data[i], out2_data[i]
+            );
+        }
+    }
+
+    /// CRIT-2: RoPE is applied — non-uniform position shifts produce
+    /// different outputs for the same input embedding. Uses 3 tokens so
+    /// attention depends on Q/K via relative positions (a uniform shift is
+    /// invariant under RoPE, so it must not be uniform).
+    #[test]
+    fn test_rope_applied_in_forward() {
+        let block = small_block();
+        let cfg = small_cfg();
+
+        let x_data: Vec<f32> = (0..3 * cfg.hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let x = make_tensor(x_data, &[3, cfg.hidden_size]);
+
+        let out_pos0 = block.forward(&x, &[0, 1, 2]).unwrap();
+        let out_pos10 = block.forward(&x, &[0, 2, 7]).unwrap();
+
+        let v0 = out_pos0.to_vec_f32().unwrap();
+        let v10 = out_pos10.to_vec_f32().unwrap();
+
+        // Non-uniform position shift should change output via RoPE
+        let diff: f32 = v0.iter().zip(v10.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 1e-3, "RoPE did not produce position-dependent output (diff={})", diff);
+    }
+
+    /// Direct test: Rope::forward with multi-token 3D input produces
+    /// position-dependent output.
+    #[test]
+    fn test_rope_multi_token_position_dependent() {
+        let rope = Rope::new(4, 10000.0);
+        let data: Vec<f32> = (0..6 * 4).map(|i| (i as f32) * 0.1).collect();
+        let x = make_tensor(data, &[1, 6, 4]);
+
+        let y0 = rope.forward(&x, &[0, 1, 2, 3, 4, 5]).unwrap();
+        let y1 = rope.forward(&x, &[10, 11, 12, 13, 14, 15]).unwrap();
+
+        let v0 = y0.to_vec_f32().unwrap();
+        let v1 = y1.to_vec_f32().unwrap();
+        let diff: f32 = v0.iter().zip(v1.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 1e-3, "RoPE multi-token diff={}", diff);
+    }
+
+    /// Direct test: apply_rope_multi_head produces position-dependent output.
+    #[test]
+    fn test_apply_rope_multi_head_position_dependent() {
+        let block = small_block();
+        let cfg = small_cfg();
+        let data: Vec<f32> = (0..3 * cfg.hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let q = make_tensor(data, &[3, cfg.hidden_size]);
+
+        let rope0 = block.apply_rope_multi_head(&q, &[0, 1, 2], cfg.num_heads).unwrap();
+        let rope10 = block.apply_rope_multi_head(&q, &[10, 11, 12], cfg.num_heads).unwrap();
+
+        let v0 = rope0.to_vec_f32().unwrap();
+        let v10 = rope10.to_vec_f32().unwrap();
+        let diff: f32 = v0.iter().zip(v10.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 1e-3, "apply_rope_multi_head diff={}", diff);
+    }
+
+    /// Debug: verify RoPE relative-encoding property. A uniform position shift
+    /// must leave the attention output invariant (Q·K depends only on pos_q -
+    /// pos_k), while a non-uniform shift must change it. This proves RoPE is
+    /// actually applied in the block forward path.
+    #[test]
+    fn test_rope_relative_encoding_property() {
+        let block = small_block();
+        let cfg = small_cfg();
+        let x_data: Vec<f32> = (0..3 * cfg.hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let x = make_tensor(x_data, &[3, cfg.hidden_size]);
+        let x_norm = block.attn_norm.forward(&x).unwrap();
+        let q = block.wq.forward(&x_norm).unwrap();
+        let k = block.wk.forward(&x_norm).unwrap();
+        let v = block.wv.forward(&x_norm).unwrap();
+
+        // Q after RoPE must differ for different absolute positions
+        let q0 = block.apply_rope_multi_head(&q, &[0, 1, 2], cfg.num_heads).unwrap();
+        let q10 = block.apply_rope_multi_head(&q, &[10, 11, 12], cfg.num_heads).unwrap();
+        let qd0 = q0.to_vec_f32().unwrap();
+        let qd10 = q10.to_vec_f32().unwrap();
+        let diff: f32 = qd0.iter().zip(qd10.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 1e-3, "Q after RoPE diff={}", diff);
+
+        // Uniform shift → attention output invariant (RoPE relative encoding)
+        let out0 = block.prefilled_self_attention(&q, &k, &v, &[0, 1, 2]).unwrap();
+        let out10 = block.prefilled_self_attention(&q, &k, &v, &[10, 11, 12]).unwrap();
+        let od0 = out0.to_vec_f32().unwrap();
+        let od10 = out10.to_vec_f32().unwrap();
+        let odiff: f32 = od0.iter().zip(od10.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(odiff < 1e-3, "Uniform shift should give identical attention (RoPE relative), diff={}", odiff);
+
+        // Non-uniform shift → attention output differs
+        let out_a = block.prefilled_self_attention(&q, &k, &v, &[0, 1, 2]).unwrap();
+        let out_b = block.prefilled_self_attention(&q, &k, &v, &[0, 2, 5]).unwrap();
+        let oa = out_a.to_vec_f32().unwrap();
+        let ob = out_b.to_vec_f32().unwrap();
+        let odiff2: f32 = oa.iter().zip(ob.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(odiff2 > 1e-3, "Non-uniform positions should change attention, diff={}", odiff2);
+    }
+
+    /// Debug: verify scores change with positions (kept as a regression guard
+    /// against softmax saturation hiding RoPE effects).
+    #[test]
+    fn test_scores_position_dependent() {
+        let block = small_block();
+        let cfg = small_cfg();
+        let x_data: Vec<f32> = (0..3 * cfg.hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let x = make_tensor(x_data, &[3, cfg.hidden_size]);
+        let x_norm = block.attn_norm.forward(&x).unwrap();
+        let q = block.wq.forward(&x_norm).unwrap();
+        let k = block.wk.forward(&x_norm).unwrap();
+
+        let num_head_dims = cfg.num_heads * cfg.head_dim;
+        let kv_stride = cfg.num_kv_heads * cfg.head_dim;
+        let scale = 1.0 / (cfg.head_dim as f32).sqrt();
+
+        let compute_scores = |positions: &[u32]| -> (f32, f32) {
+            let q_r = block.apply_rope_multi_head(&q, positions, cfg.num_heads).unwrap();
+            let k_r = block.apply_rope_multi_head(&k, positions, cfg.num_kv_heads).unwrap();
+            let qd = q_r.to_vec_f32().unwrap();
+            let kd = k_r.to_vec_f32().unwrap();
+            let h = 0; let kvh = 0; let t = 1;
+            let s0 = (0..cfg.head_dim).map(|d| {
+                qd[t * num_head_dims + h * cfg.head_dim + d] * kd[0 * kv_stride + kvh * cfg.head_dim + d]
+            }).sum::<f32>() * scale;
+            let s1 = (0..cfg.head_dim).map(|d| {
+                qd[t * num_head_dims + h * cfg.head_dim + d] * kd[1 * kv_stride + kvh * cfg.head_dim + d]
+            }).sum::<f32>() * scale;
+            (s0, s1)
+        };
+
+        let (s0_a, s1_a) = compute_scores(&[0, 1, 2]);
+        let (s0_b, s1_b) = compute_scores(&[0, 2, 5]);
+        // s0 (q1·k0) differs because relative position differs (1 vs 2)
+        assert!((s0_a - s0_b).abs() > 1e-4, "s0 identical: a={}, b={}", s0_a, s0_b);
+        // s1 (q1·k1) same because relative position identical (0 vs 0)
+        assert!((s1_a - s1_b).abs() < 1e-3, "s1 differs: a={}, b={}", s1_a, s1_b);
+    }
+
+    /// MAJ-1: forward_with_kv returns K/V tensors for KV cache population.
+    #[test]
+    fn test_forward_with_kv_returns_kv() {
+        let block = small_block();
+        let cfg = small_cfg();
+
+        let x_data: Vec<f32> = (0..2 * cfg.hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let x = make_tensor(x_data, &[2, cfg.hidden_size]);
+
+        let (out, k, v) = block.forward_with_kv(&x, &[0, 1]).unwrap();
+
+        // K shape: [2, num_kv_heads * head_dim] = [2, 16]
+        assert_eq!(k.shape().dims(), &[2, cfg.num_kv_heads * cfg.head_dim]);
+        // V shape: same as K
+        assert_eq!(v.shape().dims(), &[2, cfg.num_kv_heads * cfg.head_dim]);
+        // Output shape matches input
+        assert_eq!(out.shape().dims(), &[2, cfg.hidden_size]);
+    }
+
+    /// MAJ-3: Different positions produce different outputs (position tracking).
+    /// Uses non-uniform spacing so RoPE relative encoding produces different
+    /// attention scores (uniform shifts are invariant under RoPE).
+    #[test]
+    fn test_positions_affect_output() {
+        let block = small_block();
+        let cfg = small_cfg();
+
+        let x_data: Vec<f32> = (0..3 * cfg.hidden_size).map(|i| (i as f32) * 0.1).collect();
+        let x = make_tensor(x_data, &[3, cfg.hidden_size]);
+
+        let out_0 = block.forward(&x, &[0, 1, 2]).unwrap();
+        let out_5 = block.forward(&x, &[0, 2, 7]).unwrap();
+
+        let v0 = out_0.to_vec_f32().unwrap();
+        let v5 = out_5.to_vec_f32().unwrap();
+        let diff: f32 = v0.iter().zip(v5.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 1e-3, "Non-uniform positions produced identical output (diff={})", diff);
     }
 }

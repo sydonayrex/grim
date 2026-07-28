@@ -370,7 +370,7 @@ fn bitwidth_to_dtype(bw: u32) -> GgufDType {
         4 => GgufDType::Q4K,
         5 => GgufDType::Q5K,
         6 => GgufDType::Q6K,
-        7 => GgufDType::Q8K,
+        7 => GgufDType::Q6K,
         8 => GgufDType::Q8K,
         _ => GgufDType::Q8K,
     }

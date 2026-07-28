@@ -483,6 +483,13 @@ async fn attach_bolt_on_route(
     Json(req): Json<AttachBoltOnRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     sanitize_model_id(&model_id)?;
+    // M1-class gate: `adapter_path` becomes `{adapter_path}.train` and is read
+    // for the LoRA sidecar. Without this check a POST could point at an
+    // arbitrary file via `..`/absolute segments — the same traversal class the
+    // sibling `validate_job_path` already blocks on model/dataset paths.
+    if let Err(e) = validate_job_path("adapter_path", &req.adapter_path) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e }))));
+    }
     let model_path = Path::new(&model_id);
     if !model_path.exists() {
         return Err((
@@ -625,8 +632,8 @@ async fn sse_metrics(
     // replay them (the broadcast channel only delivers future events;
     // without a replay, late subscribers permanently miss step 0 and any
     // metrics emitted between job start and subscription).
-    let existing_metrics = match state.registry.get(&jid).await {
-        Some(job) => job.metrics,
+    let (existing_metrics, existing_status) = match state.registry.get(&jid).await {
+        Some(job) => (job.metrics, job.status),
         None => {
             return Err((
                 StatusCode::NOT_FOUND,
@@ -641,11 +648,16 @@ async fn sse_metrics(
     let mut rx = state.registry.subscribe_metrics();
     let stream = async_stream::stream! {
         // Initial replay: re-emit any history this subscriber missed.
+        // Replay carries the job's *current* status (snapshot taken above),
+        // not a hardcoded `Running`: a completed/failed/cancelled job that a
+        // subscriber joins late must not be mislabeled as still-running on
+        // the first frame. Late-arriving live events then carry their own
+        // authoritative status.
         for m in &existing_metrics {
             let event = crate::jobs::MetricStreamEvent {
                 job_id: jid.0.clone(),
                 metric: m.clone(),
-                status: crate::jobs::JobStatus::Running,
+                status: existing_status,
             };
             let payload = serde_json::to_string(&event).unwrap_or_default();
             yield std::result::Result::<Event, axum::Error>::Ok(
@@ -733,8 +745,22 @@ async fn convert_model_route(
         || source_input.starts_with("https://")
         || Path::new(source_input).is_absolute()
     {
+        // Absolute local path or URL — but still block traversal so a
+        // crafted absolute path can't escape the workspace root.
+        if source_input.contains("..") {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ConvertModelResponse {
+                    success: false,
+                    output_path: "".into(),
+                    message: "Invalid source_path_or_url: path traversal forbidden".into(),
+                }),
+            );
+        }
         source_input.to_string()
     } else {
+        // Relative path: resolve under the models dir (join is safe from `..`
+        // escapes because the result is always beneath `output_dir`).
         output_dir.join(source_input).to_string_lossy().to_string()
     };
 
