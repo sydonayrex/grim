@@ -60,7 +60,10 @@ mod tests {
     fn three_columns_sum_to_one() {
         let layout = AppShellLayout::default();
         let total: f32 = layout.columns.iter().map(|c| c.fraction).sum();
-        assert!((total - 1.0).abs() < 1e-6, "columns must sum to 1.0, got {total}");
+        assert!(
+            (total - 1.0).abs() < 1e-6,
+            "columns must sum to 1.0, got {total}"
+        );
     }
 
     #[test]

@@ -1097,16 +1097,32 @@ mod tests {
         let values = Tensor::new(v_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
 
         let compressed = compressor.compress(&keys, &values).unwrap();
+
+        // Verify compressed block metadata matches input
+        assert_eq!(compressed.num_tokens, 2);
+        assert_eq!(compressed.num_kv_heads, 4);
+        assert_eq!(compressed.head_dim, 64);
+        assert!(!compressed.key_bits.is_empty(), "key_bits should not be empty");
+        assert!(!compressed.value_bits.is_empty(), "value_bits should not be empty");
+        assert!(!compressed.key_meta.is_empty(), "key_meta should not be empty");
+        assert!(!compressed.value_meta.is_empty(), "value_meta should not be empty");
+
         let (dequant_k, dequant_v) = compressor.dequantize_for_attention(&compressed, &device, Device::Cpu).unwrap();
+
+        // Verify dequantized tensor shapes match input
+        assert_eq!(dequant_k.shape().dims(), vec![2, 4, 64]);
+        assert_eq!(dequant_v.shape().dims(), vec![2, 4, 64]);
 
         let k_rec = dequant_k.to_vec_f32().unwrap();
         let v_rec = dequant_v.to_vec_f32().unwrap();
 
+        // 3-bit key quantization (8 levels) on [-1,1] data gives step ~0.25,
+        // plus the approximate orthogonal rotation (simplified Gram-Schmidt)
+        // amplifies quantization error significantly at dim=64.
+        // 4-bit values (16 levels) give step ~0.125, no rotation applied.
+        // Bounds match the original test; the metadata/shape assertions above
+        // are the primary strengthening.
         for i in 0..512 {
-            // Uniform N-bit quantization with std-dev normalization can produce
-            // an outlier clipping error of ~|x| per element. The test assertion
-            // is a smoke test, not a quality bar — the GPU correctness test
-            // (gpu_fused_attention_matches_cpu_reference) is the firm bound.
             assert!((k_rec[i] - k_data[i]).abs() < 1.0, "k_rec[{}]={} vs {}", i, k_rec[i], k_data[i]);
             assert!((v_rec[i] - v_data[i]).abs() < 0.5, "v_rec[{}]={} vs {}", i, v_rec[i], v_data[i]);
         }
@@ -1123,13 +1139,40 @@ mod tests {
         let dim = 16;
         let count = 4;
         let seed = 0xDEAD_BEEF;
-        
+
         let rotation = random_orthogonal_matrix(dim, seed);
         assert_eq!(rotation.len(), dim * dim);
-        
+
+        // Verify orthogonality: Q^T * Q ≈ I
+        // Gram-Schmidt is numerically unstable for larger dims, so tolerance is 1e-2.
+        for i in 0..dim {
+            for j in 0..dim {
+                let dot: f32 = (0..dim).map(|r| rotation[r * dim + i] * rotation[r * dim + j]).sum();
+                if i == j {
+                    assert!((dot - 1.0).abs() < 1e-2, "Q^T*Q[{}][{}] should be ~1.0, got {}", i, j, dot);
+                } else {
+                    assert!(dot.abs() < 1e-2, "Q^T*Q[{}][{}] should be ~0.0, got {}", i, j, dot);
+                }
+            }
+        }
+
         let data: Vec<f32> = (0..count * dim).map(|i| (i as f32 * 0.01).sin()).collect();
         let rotated = apply_rotation(&data, &rotation, dim, count);
         assert_eq!(rotated.len(), count * dim);
+
+        // Orthogonal transform preserves L2 norm (isometry).
+        // Tolerance is 1e-2 because simplified Gram-Schmidt is numerically
+        // unstable for larger dimensions.
+        for i in 0..count {
+            let orig_norm: f32 = (0..dim).map(|j| data[i * dim + j].powi(2)).sum::<f32>().sqrt();
+            let rot_norm: f32 = (0..dim).map(|j| rotated[i * dim + j].powi(2)).sum::<f32>().sqrt();
+            assert!(
+                (orig_norm - rot_norm).abs() < 1e-2,
+                "L2 norm should be preserved: orig={}, rot={}",
+                orig_norm,
+                rot_norm
+            );
+        }
     }
 
     #[test]
@@ -1157,7 +1200,19 @@ mod tests {
         let keys = Tensor::new(k_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
         
         let compressed = compressor.compress(&keys, &keys).unwrap();
-        assert!(!compressed.key_bits.is_empty());
+        // Verify compressed data is non-empty
+        assert!(!compressed.key_bits.is_empty(), "key_bits should not be empty");
+        assert!(!compressed.value_bits.is_empty(), "value_bits should not be empty");
+        // Verify metadata matches input shape [1, 2, 16]
+        assert_eq!(compressed.num_tokens, 1);
+        assert_eq!(compressed.num_kv_heads, 2);
+        assert_eq!(compressed.head_dim, 16);
+        // 32 elements at 4 bits each = 16 bytes packed
+        assert_eq!(compressed.key_bits.len(), 16, "key_bits should be 16 bytes for 32 elements at 4 bits");
+        assert_eq!(compressed.value_bits.len(), 16, "value_bits should be 16 bytes for 32 elements at 4 bits");
+        // 1 group (32 elements / group_size=32) → 1 key_meta entry, 2 value_meta entries (scale, min)
+        assert_eq!(compressed.key_meta.len(), 1, "key_meta should have 1 entry per group");
+        assert_eq!(compressed.value_meta.len(), 2, "value_meta should have 2 entries (scale, min) per group");
     }
 
     /// WI-R4: a `CompressedKvBlock` round-trips byte-identically through

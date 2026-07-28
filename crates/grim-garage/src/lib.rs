@@ -3,6 +3,7 @@
 //! Backend (`discovery`, `jobs`, `rocm`, `routes`) runs an axum HTTP server
 //! on `0.0.0.0:8741` and serves `/api/*`, `/sse/metrics/:id`, and web UI.
 
+pub mod backend;
 pub mod discovery;
 pub mod jobs;
 pub mod rocm;
@@ -16,7 +17,7 @@ pub use discovery::{DatasetEntry, ModelEntry};
 pub use jobs::{
     JobError, JobId, JobRegistry, JobStatus, Metric, MetricStreamEvent, TrainingJob, TrainingMode,
 };
-pub use rocm::{probe_rocm_devices, RocmDeviceInfo};
+pub use rocm::{RocmDeviceInfo, probe_rocm_devices};
 pub use ui_state::{
     DisplayState, GarageClient, JobSummaryDto, PollError, Poller, UiAppState, UiJob,
     UiTrainingConfig, merge_fetch, normalize_wire_status, poll_fetch, poll_once,

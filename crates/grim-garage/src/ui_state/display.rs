@@ -163,7 +163,10 @@ mod tests {
         assert_eq!(snap.models.len(), 1);
         assert_eq!(snap.datasets.len(), 1);
         assert_eq!(snap.devices.len(), 1);
-        assert_eq!(snap.jobs.get("abc").map(|j| j.status.clone()), Some("running".into()));
+        assert_eq!(
+            snap.jobs.get("abc").map(|j| j.status.clone()),
+            Some("running".into())
+        );
     }
 
     #[test]
@@ -199,14 +202,20 @@ mod tests {
             status: "completed".into(),
             ..Default::default()
         });
-        assert_eq!(s.jobs().get("abc").map(|j| j.status.clone()), Some("completed".into()));
+        assert_eq!(
+            s.jobs().get("abc").map(|j| j.status.clone()),
+            Some("completed".into())
+        );
     }
 
     #[test]
     fn display_state_jobs_returns_independent_clone() {
         let mut s = sample_state();
         let jobs1 = s.jobs();
-        s.upsert_job(UiJob { job_id: "xyz".into(), ..Default::default() });
+        s.upsert_job(UiJob {
+            job_id: "xyz".into(),
+            ..Default::default()
+        });
         let jobs2 = s.jobs();
         assert_eq!(jobs1.len(), 1);
         assert_eq!(jobs2.len(), 2);

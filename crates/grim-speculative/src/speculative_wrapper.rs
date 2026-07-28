@@ -570,7 +570,10 @@ mod tests {
         // 3. Verify that the penultimate hidden state is successfully captured in the session
         let captured_hidden = session.get_last_hidden_state().unwrap();
         let hidden_shape = captured_hidden.shape();
-        assert_eq!(hidden_shape.dims(), &[1, 1, 16]); // [1, verify_len, hidden_size]
+        // Hidden state shape is [1, 1 + verify_len, hidden_size] because the
+        // target receives the extended input (original token + draft tokens).
+        // choose_verify_len enforces min_verify_len=1, so verify_len >= 1.
+        assert_eq!(hidden_shape.dims(), &[1, 2, 16]); // [1, 1+verify_len, hidden_size]
 
         // 4. Force weight update (adaptation EMA will drop below 1.5 min threshold after this step)
         let w_head_before = {

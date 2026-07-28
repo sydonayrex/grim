@@ -4,9 +4,9 @@
 //! host has no AMD GPU / HIP runtime, returns an empty Vec rather than
 //! erroring — the UI then renders the "no GPU available" path.
 
-use std::process::Command;
 use grim_backend_rocm::{RocmDevice, WavefrontSize};
 use serde::{Deserialize, Serialize};
+use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RocmDeviceInfo {
@@ -67,21 +67,60 @@ fn default_max_threads() -> u32 {
 /// Helper to map NVIDIA GPU device names or chip codes to CUDA architecture families.
 pub fn detect_nvidia_arch(gpu_name: &str) -> String {
     let name_upper = gpu_name.to_uppercase();
-    if name_upper.contains("BLACKWELL") || name_upper.contains("GB10") || name_upper.contains("B100") || name_upper.contains("B200") || name_upper.contains("RTX 50") {
+    if name_upper.contains("BLACKWELL")
+        || name_upper.contains("GB10")
+        || name_upper.contains("B100")
+        || name_upper.contains("B200")
+        || name_upper.contains("RTX 50")
+    {
         "nv_cuda (Blackwell)".to_string()
-    } else if name_upper.contains("HOPPER") || name_upper.contains("GH100") || name_upper.contains("H100") || name_upper.contains("H200") {
+    } else if name_upper.contains("HOPPER")
+        || name_upper.contains("GH100")
+        || name_upper.contains("H100")
+        || name_upper.contains("H200")
+    {
         "nv_cuda (Hopper)".to_string()
-    } else if name_upper.contains("ADA") || name_upper.contains("AD10") || name_upper.contains("RTX 40") || name_upper.contains("L4") || name_upper.contains("L40") {
+    } else if name_upper.contains("ADA")
+        || name_upper.contains("AD10")
+        || name_upper.contains("RTX 40")
+        || name_upper.contains("L4")
+        || name_upper.contains("L40")
+    {
         "nv_cuda (Ada Lovelace)".to_string()
-    } else if name_upper.contains("AMPERE") || name_upper.contains("GA10") || name_upper.contains("RTX 30") || name_upper.contains("A100") || name_upper.contains("A10") || name_upper.contains("A30") || name_upper.contains("A40") {
+    } else if name_upper.contains("AMPERE")
+        || name_upper.contains("GA10")
+        || name_upper.contains("RTX 30")
+        || name_upper.contains("A100")
+        || name_upper.contains("A10")
+        || name_upper.contains("A30")
+        || name_upper.contains("A40")
+    {
         "nv_cuda (Ampere)".to_string()
-    } else if name_upper.contains("TURING") || name_upper.contains("TU10") || name_upper.contains("RTX 20") || name_upper.contains("GTX 16") || name_upper.contains("T4") {
+    } else if name_upper.contains("TURING")
+        || name_upper.contains("TU10")
+        || name_upper.contains("RTX 20")
+        || name_upper.contains("GTX 16")
+        || name_upper.contains("T4")
+    {
         "nv_cuda (Turing)".to_string()
-    } else if name_upper.contains("VOLTA") || name_upper.contains("GV100") || name_upper.contains("V100") {
+    } else if name_upper.contains("VOLTA")
+        || name_upper.contains("GV100")
+        || name_upper.contains("V100")
+    {
         "nv_cuda (Volta)".to_string()
-    } else if name_upper.contains("PASCAL") || name_upper.contains("GP10") || name_upper.contains("GTX 10") || name_upper.contains("P100") || name_upper.contains("P40") || name_upper.contains("P4") {
+    } else if name_upper.contains("PASCAL")
+        || name_upper.contains("GP10")
+        || name_upper.contains("GTX 10")
+        || name_upper.contains("P100")
+        || name_upper.contains("P40")
+        || name_upper.contains("P4")
+    {
         "nv_cuda (Pascal)".to_string()
-    } else if name_upper.contains("MAXWELL") || name_upper.contains("GM20") || name_upper.contains("GTX 9") || name_upper.contains("M40") {
+    } else if name_upper.contains("MAXWELL")
+        || name_upper.contains("GM20")
+        || name_upper.contains("GTX 9")
+        || name_upper.contains("M40")
+    {
         "nv_cuda (Maxwell)".to_string()
     } else {
         "nv_cuda (CUDA Architecture)".to_string()
@@ -136,7 +175,10 @@ pub fn extract_clean_gpu_name(raw_line: &str) -> String {
 pub fn query_nvidia_smi_gpus() -> Vec<(String, u64, u64)> {
     let mut results = Vec::new();
     if let Ok(output) = Command::new("nvidia-smi")
-        .args(["--query-gpu=gpu_name,memory.used,memory.total", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-gpu=gpu_name,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
         .output()
     {
         if output.status.success() {
@@ -182,7 +224,10 @@ pub fn query_amd_vram_used(ordinal: u32) -> u64 {
             .map(|e| e.path())
             .filter(|p| {
                 p.file_name()
-                    .map(|n| n.to_string_lossy().starts_with("card") && !n.to_string_lossy().contains('-'))
+                    .map(|n| {
+                        n.to_string_lossy().starts_with("card")
+                            && !n.to_string_lossy().contains('-')
+                    })
                     .unwrap_or(false)
             })
             .collect();
@@ -213,21 +258,55 @@ pub fn detect_amd_arch(gcn_arch: &str, marketing_name: &str) -> String {
 
     if arch_lower.starts_with("gfx94") || name_lower.contains("mi300") {
         format!("{gcn_arch} (CDNA3)")
-    } else if arch_lower.starts_with("gfx90a") || name_lower.contains("mi250") || name_lower.contains("mi210") {
+    } else if arch_lower.starts_with("gfx90a")
+        || name_lower.contains("mi250")
+        || name_lower.contains("mi210")
+    {
         format!("{gcn_arch} (CDNA2)")
     } else if arch_lower.starts_with("gfx908") || name_lower.contains("mi100") {
         format!("{gcn_arch} (CDNA1)")
     } else if arch_lower.starts_with("gfx13") || name_lower.contains("rdna5") {
         format!("{gcn_arch} (RDNA5)")
-    } else if arch_lower.starts_with("gfx12") || name_lower.contains("rx 8000") || name_lower.contains("rdna4") {
+    } else if arch_lower.starts_with("gfx12")
+        || name_lower.contains("rx 8000")
+        || name_lower.contains("rdna4")
+    {
         format!("{gcn_arch} (RDNA4)")
-    } else if arch_lower.starts_with("gfx11") || name_lower.contains("rx 7900") || name_lower.contains("rx 7800") || name_lower.contains("rx 7700") || name_lower.contains("rx 7600") || name_lower.contains("rdna3") {
+    } else if arch_lower.starts_with("gfx11")
+        || name_lower.contains("rx 7900")
+        || name_lower.contains("rx 7800")
+        || name_lower.contains("rx 7700")
+        || name_lower.contains("rx 7600")
+        || name_lower.contains("rdna3")
+    {
         format!("{gcn_arch} (RDNA3)")
-    } else if arch_lower.starts_with("gfx103") || name_lower.contains("gfx1036") || name_lower.contains("680m") || name_lower.contains("780m") || name_lower.contains("610m") || name_lower.contains("rx 6900") || name_lower.contains("rx 6800") || name_lower.contains("rx 6700") || name_lower.contains("rx 6600") || name_lower.contains("rembrandt") || name_lower.contains("phoenix") || name_lower.contains("raphael") || name_lower.contains("rdna2") {
+    } else if arch_lower.starts_with("gfx103")
+        || name_lower.contains("gfx1036")
+        || name_lower.contains("680m")
+        || name_lower.contains("780m")
+        || name_lower.contains("610m")
+        || name_lower.contains("rx 6900")
+        || name_lower.contains("rx 6800")
+        || name_lower.contains("rx 6700")
+        || name_lower.contains("rx 6600")
+        || name_lower.contains("rembrandt")
+        || name_lower.contains("phoenix")
+        || name_lower.contains("raphael")
+        || name_lower.contains("rdna2")
+    {
         format!("{gcn_arch} (RDNA2)")
-    } else if arch_lower.starts_with("gfx101") || name_lower.contains("rx 5700") || name_lower.contains("rx 5600") || name_lower.contains("rdna1") {
+    } else if arch_lower.starts_with("gfx101")
+        || name_lower.contains("rx 5700")
+        || name_lower.contains("rx 5600")
+        || name_lower.contains("rdna1")
+    {
         format!("{gcn_arch} (RDNA1)")
-    } else if arch_lower.starts_with("gfx90") || name_lower.contains("vega") || name_lower.contains("radeon vii") || name_lower.contains("mi50") || name_lower.contains("mi60") {
+    } else if arch_lower.starts_with("gfx90")
+        || name_lower.contains("vega")
+        || name_lower.contains("radeon vii")
+        || name_lower.contains("mi50")
+        || name_lower.contains("mi60")
+    {
         format!("{gcn_arch} (Vega / GCN5)")
     } else if !gcn_arch.is_empty() {
         format!("{gcn_arch} (AMD ROCm)")
@@ -242,15 +321,43 @@ pub fn user_friendly_amd_name(gcn_arch: &str, marketing_name: &str) -> String {
     let name_lower = marketing_name.to_lowercase();
 
     // Determine RDNA / CDNA version tag
-    let rdna_ver = if arch_lower.contains("gfx13") || name_lower.contains("rdna5") || name_lower.contains("9070") {
+    let rdna_ver = if arch_lower.contains("gfx13")
+        || name_lower.contains("rdna5")
+        || name_lower.contains("9070")
+    {
         "RDNA 5"
-    } else if arch_lower.contains("gfx12") || name_lower.contains("rdna4") || name_lower.contains("8800") {
+    } else if arch_lower.contains("gfx12")
+        || name_lower.contains("rdna4")
+        || name_lower.contains("8800")
+    {
         "RDNA 4"
-    } else if arch_lower.contains("gfx11") || name_lower.contains("rdna3") || name_lower.contains("7900") || name_lower.contains("7800") || name_lower.contains("7700") || name_lower.contains("7600") {
+    } else if arch_lower.contains("gfx11")
+        || name_lower.contains("rdna3")
+        || name_lower.contains("7900")
+        || name_lower.contains("7800")
+        || name_lower.contains("7700")
+        || name_lower.contains("7600")
+    {
         "RDNA 3"
-    } else if arch_lower.contains("gfx103") || arch_lower.contains("0300") || name_lower.contains("0300") || name_lower.contains("rdna2") || name_lower.contains("6800") || name_lower.contains("6900") || name_lower.contains("6700") || name_lower.contains("680m") || name_lower.contains("780m") || name_lower.contains("gfx1036") || name_lower.contains("rembrandt") || name_lower.contains("phoenix") {
+    } else if arch_lower.contains("gfx103")
+        || arch_lower.contains("0300")
+        || name_lower.contains("0300")
+        || name_lower.contains("rdna2")
+        || name_lower.contains("6800")
+        || name_lower.contains("6900")
+        || name_lower.contains("6700")
+        || name_lower.contains("680m")
+        || name_lower.contains("780m")
+        || name_lower.contains("gfx1036")
+        || name_lower.contains("rembrandt")
+        || name_lower.contains("phoenix")
+    {
         "RDNA 2"
-    } else if arch_lower.contains("gfx101") || name_lower.contains("rdna1") || name_lower.contains("5700") || name_lower.contains("5600") {
+    } else if arch_lower.contains("gfx101")
+        || name_lower.contains("rdna1")
+        || name_lower.contains("5700")
+        || name_lower.contains("5600")
+    {
         "RDNA 1"
     } else if arch_lower.contains("gfx94") || name_lower.contains("mi300") {
         "CDNA 3"
@@ -261,7 +368,11 @@ pub fn user_friendly_amd_name(gcn_arch: &str, marketing_name: &str) -> String {
     };
 
     // Determine base product name
-    let product_name = if arch_lower.contains("gfx1036") || name_lower.contains("rembrandt") || name_lower.contains("0300") || arch_lower.contains("0300") {
+    let product_name = if arch_lower.contains("gfx1036")
+        || name_lower.contains("rembrandt")
+        || name_lower.contains("0300")
+        || arch_lower.contains("0300")
+    {
         "Radeon 680M iGPU".to_string()
     } else if !marketing_name.is_empty()
         && !marketing_name.starts_with("c_")
@@ -346,8 +457,8 @@ pub fn parse_rocminfo_text(text: &str) -> Vec<RocmDeviceInfo> {
                 let friendly = user_friendly_amd_name(&current.gcn_arch, &current.name);
                 let is_w32 = current.wavefront_size == 32;
                 let is_w64 = current.wavefront_size == 64;
-                let is_cdna = current.gcn_arch.starts_with("gfx94")
-                    || current.gcn_arch.starts_with("gfx90");
+                let is_cdna =
+                    current.gcn_arch.starts_with("gfx94") || current.gcn_arch.starts_with("gfx90");
                 let mut dev = current.clone();
                 dev.ordinal = ordinal;
                 dev.name = friendly;
@@ -434,8 +545,8 @@ pub fn parse_rocminfo_text(text: &str) -> Vec<RocmDeviceInfo> {
         let friendly = user_friendly_amd_name(&current.gcn_arch, &current.name);
         let is_w32 = current.wavefront_size == 32;
         let is_w64 = current.wavefront_size == 64;
-        let is_cdna = current.gcn_arch.starts_with("gfx94")
-            || current.gcn_arch.starts_with("gfx90");
+        let is_cdna =
+            current.gcn_arch.starts_with("gfx94") || current.gcn_arch.starts_with("gfx90");
         let mut dev = current.clone();
         dev.ordinal = ordinal;
         dev.name = friendly;
@@ -509,15 +620,23 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout);
             for line in text.lines() {
-                if line.contains("VGA compatible controller") || line.contains("3D controller") || line.contains("Display controller") {
+                if line.contains("VGA compatible controller")
+                    || line.contains("3D controller")
+                    || line.contains("Display controller")
+                {
                     let mut raw_name = line.to_string();
                     if let Some(pos) = line.find(':') {
                         raw_name = line[pos + 1..].trim().to_string();
                     }
-                    
+
                     if raw_name.contains("NVIDIA") {
                         // Skip if nvidia-smi already probed NVIDIA GPUs or an NVIDIA card is already present
-                        if devices.iter().any(|d| d.vendor == "NVIDIA" || d.backend == "CUDA" || d.name.contains("4070") || d.name.contains("RTX")) {
+                        if devices.iter().any(|d| {
+                            d.vendor == "NVIDIA"
+                                || d.backend == "CUDA"
+                                || d.name.contains("4070")
+                                || d.name.contains("RTX")
+                        }) {
                             continue;
                         }
                         let clean_name = extract_clean_gpu_name(&raw_name);
@@ -539,11 +658,15 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
                             max_threads_per_block: 1024,
                         });
                         ordinal += 1;
-                    } else if raw_name.contains("AMD") || raw_name.contains("Advanced Micro Devices") {
+                    } else if raw_name.contains("AMD")
+                        || raw_name.contains("Advanced Micro Devices")
+                    {
                         let clean_name = extract_clean_gpu_name(&raw_name);
                         let arch = detect_amd_arch("", &raw_name);
                         let friendly_name = user_friendly_amd_name(&arch, &clean_name);
-                        if devices.iter().any(|d| d.vendor == "AMD" || d.name.eq_ignore_ascii_case(&friendly_name)) {
+                        if devices.iter().any(|d| {
+                            d.vendor == "AMD" || d.name.eq_ignore_ascii_case(&friendly_name)
+                        }) {
                             continue;
                         }
                         devices.push(RocmDeviceInfo {
@@ -578,8 +701,10 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
                     WavefrontSize::W32 => 32,
                     WavefrontSize::W64 => 64,
                 };
-                let gcn_arch_env = std::env::var("GRIM_ROCM_GCN_NAME").unwrap_or_else(|_| "gfx1030".into());
-                let name = std::env::var("GRIM_ROCM_DEVICE_NAME").unwrap_or_else(|_| format!("AMD ROCm Accelerator #{ordinal}"));
+                let gcn_arch_env =
+                    std::env::var("GRIM_ROCM_GCN_NAME").unwrap_or_else(|_| "gfx1030".into());
+                let name = std::env::var("GRIM_ROCM_DEVICE_NAME")
+                    .unwrap_or_else(|_| format!("AMD ROCm Accelerator #{ordinal}"));
                 let full_arch = detect_amd_arch(&gcn_arch_env, &name);
                 devices.push(RocmDeviceInfo {
                     ordinal,
@@ -642,33 +767,99 @@ mod tests {
 
     #[test]
     fn detect_nvidia_arch_dynamically_identifies_all_cuda_generations() {
-        assert_eq!(detect_nvidia_arch("NVIDIA GeForce RTX 5090"), "nv_cuda (Blackwell)");
-        assert_eq!(detect_nvidia_arch("NVIDIA B200 SXM 180GB"), "nv_cuda (Blackwell)");
-        assert_eq!(detect_nvidia_arch("NVIDIA H100 80GB PCIe"), "nv_cuda (Hopper)");
-        assert_eq!(detect_nvidia_arch("NVIDIA GeForce RTX 4090"), "nv_cuda (Ada Lovelace)");
-        assert_eq!(detect_nvidia_arch("NVIDIA GeForce RTX 4070 Laptop GPU"), "nv_cuda (Ada Lovelace)");
-        assert_eq!(detect_nvidia_arch("NVIDIA GeForce RTX 3090"), "nv_cuda (Ampere)");
-        assert_eq!(detect_nvidia_arch("NVIDIA A100-SXM4-80GB"), "nv_cuda (Ampere)");
-        assert_eq!(detect_nvidia_arch("NVIDIA GeForce RTX 2080 Ti"), "nv_cuda (Turing)");
+        assert_eq!(
+            detect_nvidia_arch("NVIDIA GeForce RTX 5090"),
+            "nv_cuda (Blackwell)"
+        );
+        assert_eq!(
+            detect_nvidia_arch("NVIDIA B200 SXM 180GB"),
+            "nv_cuda (Blackwell)"
+        );
+        assert_eq!(
+            detect_nvidia_arch("NVIDIA H100 80GB PCIe"),
+            "nv_cuda (Hopper)"
+        );
+        assert_eq!(
+            detect_nvidia_arch("NVIDIA GeForce RTX 4090"),
+            "nv_cuda (Ada Lovelace)"
+        );
+        assert_eq!(
+            detect_nvidia_arch("NVIDIA GeForce RTX 4070 Laptop GPU"),
+            "nv_cuda (Ada Lovelace)"
+        );
+        assert_eq!(
+            detect_nvidia_arch("NVIDIA GeForce RTX 3090"),
+            "nv_cuda (Ampere)"
+        );
+        assert_eq!(
+            detect_nvidia_arch("NVIDIA A100-SXM4-80GB"),
+            "nv_cuda (Ampere)"
+        );
+        assert_eq!(
+            detect_nvidia_arch("NVIDIA GeForce RTX 2080 Ti"),
+            "nv_cuda (Turing)"
+        );
         assert_eq!(detect_nvidia_arch("NVIDIA Tesla T4"), "nv_cuda (Turing)");
-        assert_eq!(detect_nvidia_arch("NVIDIA Tesla V100-SXM2-32GB"), "nv_cuda (Volta)");
-        assert_eq!(detect_nvidia_arch("NVIDIA GeForce GTX 1080 Ti"), "nv_cuda (Pascal)");
-        assert_eq!(detect_nvidia_arch("NVIDIA Tesla P100-PCIE-16GB"), "nv_cuda (Pascal)");
-        assert_eq!(detect_nvidia_arch("NVIDIA GeForce GTX 980 Ti"), "nv_cuda (Maxwell)");
-        assert_eq!(detect_nvidia_arch("NVIDIA Unknown Accelerator"), "nv_cuda (CUDA Architecture)");
+        assert_eq!(
+            detect_nvidia_arch("NVIDIA Tesla V100-SXM2-32GB"),
+            "nv_cuda (Volta)"
+        );
+        assert_eq!(
+            detect_nvidia_arch("NVIDIA GeForce GTX 1080 Ti"),
+            "nv_cuda (Pascal)"
+        );
+        assert_eq!(
+            detect_nvidia_arch("NVIDIA Tesla P100-PCIE-16GB"),
+            "nv_cuda (Pascal)"
+        );
+        assert_eq!(
+            detect_nvidia_arch("NVIDIA GeForce GTX 980 Ti"),
+            "nv_cuda (Maxwell)"
+        );
+        assert_eq!(
+            detect_nvidia_arch("NVIDIA Unknown Accelerator"),
+            "nv_cuda (CUDA Architecture)"
+        );
     }
 
     #[test]
     fn detect_amd_arch_dynamically_identifies_all_rocm_generations() {
-        assert_eq!(detect_amd_arch("gfx942", "AMD Instinct MI300X"), "gfx942 (CDNA3)");
-        assert_eq!(detect_amd_arch("gfx90a", "AMD Instinct MI250X"), "gfx90a (CDNA2)");
-        assert_eq!(detect_amd_arch("gfx908", "AMD Instinct MI100"), "gfx908 (CDNA1)");
-        assert_eq!(detect_amd_arch("gfx1200", "AMD Radeon RX 8800 XT"), "gfx1200 (RDNA4)");
-        assert_eq!(detect_amd_arch("gfx1100", "AMD Radeon RX 7900 XTX"), "gfx1100 (RDNA3)");
-        assert_eq!(detect_amd_arch("gfx1036", "AMD Radeon 610M"), "gfx1036 (RDNA2)");
-        assert_eq!(detect_amd_arch("gfx1030", "AMD Radeon RX 6800 XT"), "gfx1030 (RDNA2)");
-        assert_eq!(detect_amd_arch("gfx1010", "AMD Radeon RX 5700 XT"), "gfx1010 (RDNA1)");
-        assert_eq!(detect_amd_arch("gfx906", "Radeon VII"), "gfx906 (Vega / GCN5)");
+        assert_eq!(
+            detect_amd_arch("gfx942", "AMD Instinct MI300X"),
+            "gfx942 (CDNA3)"
+        );
+        assert_eq!(
+            detect_amd_arch("gfx90a", "AMD Instinct MI250X"),
+            "gfx90a (CDNA2)"
+        );
+        assert_eq!(
+            detect_amd_arch("gfx908", "AMD Instinct MI100"),
+            "gfx908 (CDNA1)"
+        );
+        assert_eq!(
+            detect_amd_arch("gfx1200", "AMD Radeon RX 8800 XT"),
+            "gfx1200 (RDNA4)"
+        );
+        assert_eq!(
+            detect_amd_arch("gfx1100", "AMD Radeon RX 7900 XTX"),
+            "gfx1100 (RDNA3)"
+        );
+        assert_eq!(
+            detect_amd_arch("gfx1036", "AMD Radeon 610M"),
+            "gfx1036 (RDNA2)"
+        );
+        assert_eq!(
+            detect_amd_arch("gfx1030", "AMD Radeon RX 6800 XT"),
+            "gfx1030 (RDNA2)"
+        );
+        assert_eq!(
+            detect_amd_arch("gfx1010", "AMD Radeon RX 5700 XT"),
+            "gfx1010 (RDNA1)"
+        );
+        assert_eq!(
+            detect_amd_arch("gfx906", "Radeon VII"),
+            "gfx906 (Vega / GCN5)"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -690,11 +881,11 @@ mod tests {
         // multiple cards all visible via sysfs; indices 0..=4 are in
         // range and index >= 5 is out of range.
         let used = [
-            1_073_741_824u64,   // 1 GiB   slot 0
-            16_106_127_360u64,  // 15 GiB  slot 1
-            17_179_869_184u64,  // 16 GiB  slot 2
-            25_769_803_776u64,  // 24 GiB  slot 3
-            49_061_453_824u64,  // 45.7 GiB slot 4
+            1_073_741_824u64,  // 1 GiB   slot 0
+            16_106_127_360u64, // 15 GiB  slot 1
+            17_179_869_184u64, // 16 GiB  slot 2
+            25_769_803_776u64, // 24 GiB  slot 3
+            49_061_453_824u64, // 45.7 GiB slot 4
         ];
         // In-range: each ordinal returns its own measured value.
         assert_eq!(pick_vram_used_slot(&used, 0), 1_073_741_824);
@@ -893,8 +1084,7 @@ Agent 1
         let devs = parse_rocminfo_text(BOTH_SIZE_KEYS);
         assert_eq!(devs.len(), 1, "expected 1 GPU device in fixture");
         assert_eq!(
-            devs[0].vram_bytes,
-            8_589_934_592,
+            devs[0].vram_bytes, 8_589_934_592,
             "vram must be 8 GiB from Memory Size key, NOT 4 MiB from cache Size key"
         );
     }

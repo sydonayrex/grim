@@ -2,15 +2,18 @@
 //!
 //! Serves the browser web UI and JSON API on `GRIM_GARAGE_BIND_ADDR` (default 8741).
 
-use std::sync::Arc;
 use clap::Parser;
 use grim_garage::{
-    jobs::JobRegistry, routes,
-    ui_state::DisplayState, ui_state::GarageClient, ui_state::Poller,
+    jobs::JobRegistry, routes, ui_state::DisplayState, ui_state::GarageClient, ui_state::Poller,
 };
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(name = "grim-garage", about = "Grim's Garage — local-first training dashboard", version)]
+#[command(
+    name = "grim-garage",
+    about = "Grim's Garage — local-first training dashboard",
+    version
+)]
 struct Args {
     /// Bind address (overrides `GRIM_GARAGE_BIND_ADDR`).
     #[arg(long, env = "GRIM_GARAGE_BIND_ADDR", default_value = "0.0.0.0:8741")]
@@ -24,7 +27,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = routes::AppState {
         registry: Arc::new(JobRegistry::new()),
-        engine: Arc::new(std::sync::Mutex::new(grim_engine::Engine::new(grim_engine::EngineConfig::default()))),
+        engine: Arc::new(std::sync::Mutex::new(grim_engine::Engine::new(
+            grim_engine::EngineConfig::default(),
+        ))),
         tokenizer: Arc::new(std::sync::Mutex::new(None)),
         model_path: None,
     };

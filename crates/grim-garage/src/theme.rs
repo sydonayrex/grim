@@ -16,7 +16,10 @@ pub struct OklchColor {
 impl OklchColor {
     /// Format as CSS `oklch(L C H / A)` string.
     pub fn to_css(&self) -> String {
-        format!("oklch({:.2} {:.3} {:.1} / {:.2})", self.l, self.c, self.h, self.a)
+        format!(
+            "oklch({:.2} {:.3} {:.1} / {:.2})",
+            self.l, self.c, self.h, self.a
+        )
     }
 }
 
@@ -36,13 +39,28 @@ pub struct GarageSurface {
 
 impl GarageSurface {
     pub const SIDEBAR: GarageSurface = GarageSurface {
-        oklch: OklchColor { l: 0.96, c: 0.005, h: 240.0, a: 1.0 },
+        oklch: OklchColor {
+            l: 0.96,
+            c: 0.005,
+            h: 240.0,
+            a: 1.0,
+        },
     };
     pub const MAIN_PANEL: GarageSurface = GarageSurface {
-        oklch: OklchColor { l: 0.98, c: 0.0, h: 0.0, a: 1.0 },
+        oklch: OklchColor {
+            l: 0.98,
+            c: 0.0,
+            h: 0.0,
+            a: 1.0,
+        },
     };
     pub const KPI_CARD: GarageSurface = GarageSurface {
-        oklch: OklchColor { l: 0.92, c: 0.02, h: 240.0, a: 1.0 },
+        oklch: OklchColor {
+            l: 0.92,
+            c: 0.02,
+            h: 240.0,
+            a: 1.0,
+        },
     };
 }
 

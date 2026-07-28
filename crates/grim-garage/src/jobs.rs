@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -224,7 +224,9 @@ impl JobRegistry {
 
     pub async fn update_status(&self, id: &JobId, status: JobStatus) -> Result<(), JobError> {
         let mut g = self.inner.write().await;
-        let job = g.get_mut(id).ok_or_else(|| JobError::NotFound(id.0.clone()))?;
+        let job = g
+            .get_mut(id)
+            .ok_or_else(|| JobError::NotFound(id.0.clone()))?;
         job.status = status;
         Ok(())
     }
@@ -245,15 +247,17 @@ impl JobRegistry {
         status: JobStatus,
     ) -> Result<Metric, JobError> {
         let mut g = self.inner.write().await;
-        let job = g.get_mut(id).ok_or_else(|| JobError::NotFound(id.0.clone()))?;
+        let job = g
+            .get_mut(id)
+            .ok_or_else(|| JobError::NotFound(id.0.clone()))?;
         job.status = status;
         // Use the last recorded metric if present; otherwise synthesize a
         // zero-step sentinel so the SSE payload shape stays uniform.
-        let metric = job
-            .metrics
-            .last()
-            .cloned()
-            .unwrap_or(Metric { step: 0, loss: 0.0, tokens: 0 });
+        let metric = job.metrics.last().cloned().unwrap_or(Metric {
+            step: 0,
+            loss: 0.0,
+            tokens: 0,
+        });
         // Best-effort broadcast; if there are no SSE subscribers this is Err
         // and we ignore — the next subscriber gets a snapshot via the
         // initial metrics replay in `sse_metrics`.
@@ -292,17 +296,19 @@ impl JobRegistry {
     /// without polling.
     pub async fn request_cancel(&self, id: &JobId) -> Result<JobStatus, JobError> {
         let mut g = self.inner.write().await;
-        let job = g.get_mut(id).ok_or_else(|| JobError::NotFound(id.0.clone()))?;
+        let job = g
+            .get_mut(id)
+            .ok_or_else(|| JobError::NotFound(id.0.clone()))?;
         job.cancel.cancel();
         let current = job.status;
         if matches!(current, JobStatus::Pending | JobStatus::Running) {
             job.status = JobStatus::Cancelled;
             // Broadcast a terminal event (best-effort: no subscribers = Err).
-            let metric = job
-                .metrics
-                .last()
-                .cloned()
-                .unwrap_or(Metric { step: 0, loss: 0.0, tokens: 0 });
+            let metric = job.metrics.last().cloned().unwrap_or(Metric {
+                step: 0,
+                loss: 0.0,
+                tokens: 0,
+            });
             let _ = self.metrics_tx.send(MetricStreamEvent {
                 job_id: id.0.clone(),
                 metric,
@@ -317,7 +323,9 @@ impl JobRegistry {
 
     pub async fn append_metric(&self, id: &JobId, metric: Metric) -> Result<(), JobError> {
         let mut g = self.inner.write().await;
-        let job = g.get_mut(id).ok_or_else(|| JobError::NotFound(id.0.clone()))?;
+        let job = g
+            .get_mut(id)
+            .ok_or_else(|| JobError::NotFound(id.0.clone()))?;
         let status = job.status;
         job.push_metric(metric.step, metric.loss, metric.tokens);
         // Best-effort broadcast; if there are no subscribers (SSE clients) this returns Err
@@ -391,12 +399,15 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         eprintln!("[grim-garage] worker: failed to mark {} Running: {e}", id);
         return;
     }
-    eprintln!("[grim-garage] worker: job {} started (mode={mode:?}, epochs={epochs})", id);
+    eprintln!(
+        "[grim-garage] worker: job {} started (mode={mode:?}, epochs={epochs})",
+        id
+    );
 
     use grim_autograd::{
-        backward, cross_entropy_loss, dpo_loss_autograd, grpo_loss_autograd,
-        orpo_odds_ratio_loss_autograd, AdamW, AdamWConfig, AutogradRegistry, InjectionConfig,
-        LoRAInjectionPoint, LoRAInjectionRegistry, Tape,
+        AdamW, AdamWConfig, AutogradRegistry, InjectionConfig, LoRAInjectionPoint,
+        LoRAInjectionRegistry, Tape, backward, cross_entropy_loss, dpo_loss_autograd,
+        grpo_loss_autograd, orpo_odds_ratio_loss_autograd,
     };
     use grim_backend_cpu::cpu_tensor;
     use grim_tensor::Shape;
@@ -418,7 +429,10 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     let mut autograd_reg = match AutogradRegistry::new(inj_cfg, inj_reg) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[grim-garage] worker: autograd registry init failed for {}: {e}", id);
+            eprintln!(
+                "[grim-garage] worker: autograd registry init failed for {}: {e}",
+                id
+            );
             let _ = registry
                 .update_status_and_broadcast(&id, JobStatus::Failed)
                 .await;
@@ -454,7 +468,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 let x_tensor = cpu_tensor(x_vec, Shape::new(vec![1, hidden_size]));
                 let x_id = tape.register(x_tensor.clone());
 
-                let logits_base = cpu_tensor(vec![0.01f32; vocab_size], Shape::new(vec![1, vocab_size]));
+                let logits_base =
+                    cpu_tensor(vec![0.01f32; vocab_size], Shape::new(vec![1, vocab_size]));
                 let logits_base_id = tape.register(logits_base.clone());
 
                 let (logits_id, logits_out) = match grim_autograd::apply_and_record_lora(
@@ -468,7 +483,10 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     x_id,
                 ) {
                     Ok(res) => res,
-                    Err(_) => (logits_base_id, cpu_tensor(vec![0.01f32; vocab_size], Shape::new(vec![1, vocab_size]))),
+                    Err(_) => (
+                        logits_base_id,
+                        cpu_tensor(vec![0.01f32; vocab_size], Shape::new(vec![1, vocab_size])),
+                    ),
                 };
 
                 let targets = vec![1usize];
@@ -521,14 +539,18 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             }
         };
 
-        let metric = Metric { step, loss, tokens: (step + 1) * 512 };
+        let metric = Metric {
+            step,
+            loss,
+            tokens: (step + 1) * 512,
+        };
         // Append the metric; wait for the append to complete (it's just a
         // write lock + broadcast — microseconds). The cancel check below
         // is `select!`ed against the inter-step sleep so a cancel request
         // issued during the sleep exits promptly (within one ~10 ms tick
         // rather than waiting until the next iteration).
         match registry.append_metric(&id, metric).await {
-            Ok(()) => {},
+            Ok(()) => {}
             Err(e) => {
                 eprintln!("[grim-garage] worker: metric append failed for {}: {e}", id);
                 let _ = registry
@@ -563,9 +585,15 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Err(e) = train_state.write(&sidecar_path) {
-        eprintln!("[grim-garage] worker: failed to write training sidecar {}: {e}", sidecar_path);
+        eprintln!(
+            "[grim-garage] worker: failed to write training sidecar {}: {e}",
+            sidecar_path
+        );
     } else {
-        eprintln!("[grim-garage] worker: wrote training state sidecar to {}", sidecar_path);
+        eprintln!(
+            "[grim-garage] worker: wrote training state sidecar to {}",
+            sidecar_path
+        );
     }
 
     // Terminal broadcast so SSE subscribers receive a guaranteed
@@ -613,8 +641,7 @@ pub fn step_loss_fallback(mode: TrainingMode) -> f64 {
 /// production (the worker sleeps directly), but pins the per-step
 /// duration the simulator commits to so the documented contract is
 /// asserted.
-pub const SIMULATED_STEP_DELAY: std::time::Duration =
-    std::time::Duration::from_millis(10);
+pub const SIMULATED_STEP_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[cfg(test)]
 mod fallback_tests {
@@ -655,7 +682,10 @@ mod fallback_tests {
         // here still hands back 0 — caught by the (fallback > 0)
         // assertion rather than `==` to dodge hairsplitting f64 exactness.
         let out = step_loss_fallback(TrainingMode::Dpo);
-        assert!(out > 0.0, "Dpo fallback stuck at 0.0 (initial-loss-only decay lost the RL floor): got {out:?}");
+        assert!(
+            out > 0.0,
+            "Dpo fallback stuck at 0.0 (initial-loss-only decay lost the RL floor): got {out:?}"
+        );
         assert!(
             out <= 1.0,
             "Dpo fallback unreasonably huge (RL floor broken): got {out:?}"
@@ -710,10 +740,6 @@ mod fallback_tests {
     fn simulated_step_delay_is_pinned_ten_ms() {
         // Pin the contract value so docs (which previously claimed 200ms
         // — stale) and code stay in sync. Bug M4.
-        assert_eq!(
-            SIMULATED_STEP_DELAY,
-            std::time::Duration::from_millis(10)
-        );
+        assert_eq!(SIMULATED_STEP_DELAY, std::time::Duration::from_millis(10));
     }
 }
-

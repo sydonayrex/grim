@@ -6,12 +6,14 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use tower::ServiceExt;
-use grim_format::gguf::{GgufFile, GgufTensorInfo, GgufValue, GGUF_MAGIC, GGUF_VERSION};
-use grim_garage::discovery::{discover_convertible_models, discover_datasets, discover_models, ModelEntry};
+use grim_format::gguf::{GGUF_MAGIC, GGUF_VERSION, GgufFile, GgufTensorInfo, GgufValue};
+use grim_garage::discovery::{
+    ModelEntry, discover_convertible_models, discover_datasets, discover_models,
+};
 use grim_garage::jobs::{JobId, JobRegistry, JobStatus, TrainingJob};
-use grim_garage::rocm::{probe_rocm_devices, RocmDeviceInfo};
+use grim_garage::rocm::{RocmDeviceInfo, probe_rocm_devices};
 use tempfile::tempdir;
+use tower::ServiceExt;
 
 fn write_minimal_gguf(path: &Path, tensor_name: &str, payload_bytes: Vec<u8>) {
     let tensor = GgufTensorInfo {
@@ -37,8 +39,10 @@ fn write_minimal_gguf(path: &Path, tensor_name: &str, payload_bytes: Vec<u8>) {
     let mut buf: Vec<u8> = Vec::new();
     buf.write_all(&GGUF_MAGIC.to_le_bytes()).unwrap();
     buf.write_all(&gguf.version.to_le_bytes()).unwrap();
-    buf.write_all(&(gguf.tensor_count as u64).to_le_bytes()).unwrap();
-    buf.write_all(&(gguf.metadata.len() as u64).to_le_bytes()).unwrap();
+    buf.write_all(&(gguf.tensor_count as u64).to_le_bytes())
+        .unwrap();
+    buf.write_all(&(gguf.metadata.len() as u64).to_le_bytes())
+        .unwrap();
 
     for (k, v) in &gguf.metadata {
         let kb = k.as_bytes();
@@ -120,11 +124,7 @@ fn discover_models_ignores_non_model_files() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("readme.txt"), b"hello").unwrap();
     std::fs::create_dir(dir.path().join("not_a_model")).unwrap();
-    std::fs::write(
-        dir.path().join("not_a_model").join("weights.bin"),
-        b"\x00",
-    )
-    .unwrap();
+    std::fs::write(dir.path().join("not_a_model").join("weights.bin"), b"\x00").unwrap();
 
     let models = discover_models(dir.path()).expect("discover");
     assert!(models.is_empty());
@@ -222,7 +222,10 @@ async fn job_registry_rejects_duplicate_id_returns_err() {
         ..Default::default()
     };
     let id = reg.create(job.clone()).await.unwrap();
-    let err = reg.insert_with_id(id, job).await.expect_err("duplicate rejected");
+    let err = reg
+        .insert_with_id(id, job)
+        .await
+        .expect_err("duplicate rejected");
     let _ = err;
 }
 
@@ -392,7 +395,11 @@ async fn update_status_and_broadcast_emits_terminal_completed_event() {
     // Push one synthetic metric so a real terminal metric is read back.
     reg.append_metric(
         &id,
-        grim_garage::jobs::Metric { step: 0, loss: 2.3, tokens: 512 },
+        grim_garage::jobs::Metric {
+            step: 0,
+            loss: 2.3,
+            tokens: 512,
+        },
     )
     .await
     .expect("append");
@@ -408,8 +415,6 @@ async fn update_status_and_broadcast_emits_terminal_completed_event() {
     // can render the final loss curve point from the event alone.
     assert_eq!(terminal.metric.step, 0);
 }
-
-
 
 #[test]
 fn roc_mdevice_info_serializes_name_fields() {
@@ -442,7 +447,9 @@ fn roc_mdevice_info_serializes_name_fields() {
 /// handler) so we can unit-test it without spinning up an axum router.
 fn validate_job_path(value: &str) -> std::result::Result<(), String> {
     if value.contains("..") || value.contains('/') || value.contains('\\') {
-        Err(format!("invalid path: {value:?} contains traversal or separator"))
+        Err(format!(
+            "invalid path: {value:?} contains traversal or separator"
+        ))
     } else {
         Ok(())
     }
@@ -568,7 +575,10 @@ async fn list_jobs_filters_out_empty_model_path_rows() {
         .await
         .unwrap();
     let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-    let jobs = body.get("jobs").and_then(|j| j.as_array()).expect("jobs array");
+    let jobs = body
+        .get("jobs")
+        .and_then(|j| j.as_array())
+        .expect("jobs array");
     let ids: Vec<&str> = jobs
         .iter()
         .map(|j| j.get("job_id").and_then(|v| v.as_str()).unwrap_or_default())
@@ -613,7 +623,11 @@ async fn job_registry_snapshot_is_consistent_under_concurrent_eviction() {
     assert_eq!(snap.len(), 16, "snapshot should enumerate all created jobs");
     let mut seen: HashSet<String> = HashSet::new();
     for (id, _status, job) in &snap {
-        assert!(!job.model_path.is_empty(), "snapshot returned a job with empty path: id={}", id.0);
+        assert!(
+            !job.model_path.is_empty(),
+            "snapshot returned a job with empty path: id={}",
+            id.0
+        );
         seen.insert(id.0.clone());
     }
     assert_eq!(seen.len(), 16, "all snapshot ids must be unique");

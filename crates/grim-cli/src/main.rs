@@ -642,18 +642,10 @@ async fn main() -> Result<()> {
                 } else {
                     println!("[grim run] Starting interactive session with: {}", model_name);
                     println!("Type your prompt below (Ctrl+C to exit):");
-                    loop {
-                        print!(">>> ");
-                        use std::io::Write;
-                        std::io::stdout().flush().unwrap();
-                        let mut line = String::new();
-                        std::io::stdin().read_line(&mut line).unwrap();
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() { continue; }
-                        if let Err(e) = run::cmd_run(resolved.clone(), Some(trimmed.to_string()), false, address.clone(), &plugins, temperature, top_p, top_k, max_tokens, seed, repeat_penalty).await {
-                            eprintln!("[grim run] Command failed: {e}");
-                        }
-                        println!();
+                    // B.4: cmd_run_interactive loads the model ONCE and runs its
+                    // own REPL loop — never call this per-iteration.
+                    if let Err(e) = run::cmd_run_interactive(resolved.clone(), address.clone(), temperature, top_p, top_k, max_tokens, seed, repeat_penalty).await {
+                        eprintln!("[grim run] Command failed: {e}");
                     }
                 }
             }

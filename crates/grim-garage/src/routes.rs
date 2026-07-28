@@ -20,25 +20,25 @@ use std::path::Path;
 use std::sync::Arc;
 
 use axum::{
+    Router,
     extract::{Path as AxumPath, State},
     http::StatusCode,
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse, Json,
+        sse::{Event, KeepAlive, Sse},
     },
     routing::{delete, get, post},
-    Router,
 };
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::discovery::{DatasetEntry, ModelEntry, default_datasets_dir, default_models_dir};
+use crate::jobs::{JobId, JobRegistry, TrainingJob, TrainingMode};
+use crate::rocm::{RocmDeviceInfo, probe_rocm_devices};
 use grim_engine::{Engine, model_loader};
 use grim_format::GgufTokenizer;
 use grim_tensor::BackendDevice;
-use crate::discovery::{default_datasets_dir, default_models_dir, DatasetEntry, ModelEntry};
-use crate::jobs::{JobId, JobRegistry, TrainingJob, TrainingMode};
-use crate::rocm::{probe_rocm_devices, RocmDeviceInfo};
 
 /// Shared state passed to every handler.
 #[derive(Clone)]
@@ -77,9 +77,15 @@ pub struct StartTrainingRequest {
     pub rocm_fusion_qkv_attention: bool,
 }
 
-fn default_rank() -> u32 { 16 }
-fn default_lr() -> f64 { 2e-5 }
-fn default_epochs() -> u32 { 1 }
+fn default_rank() -> u32 {
+    16
+}
+fn default_lr() -> f64 {
+    2e-5
+}
+fn default_epochs() -> u32 {
+    1
+}
 
 #[derive(Debug, Serialize)]
 pub struct StartTrainingResponse {
@@ -123,7 +129,9 @@ pub struct AttachBoltOnRequest {
     pub scale: f32,
 }
 
-fn default_scale() -> f32 { 1.0 }
+fn default_scale() -> f32 {
+    1.0
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ConvertModelRequest {
@@ -137,9 +145,15 @@ pub struct ConvertModelRequest {
     pub evopress_generations: usize,
 }
 
-fn default_gcn() -> String { "gfx1100".into() }
-fn default_bpw() -> f32 { 4.0 }
-fn default_generations() -> usize { 10 }
+fn default_gcn() -> String {
+    "gfx1100".into()
+}
+fn default_bpw() -> f32 {
+    4.0
+}
+fn default_generations() -> usize {
+    10
+}
 
 #[derive(Debug, Serialize)]
 pub struct ConvertModelResponse {
@@ -157,7 +171,11 @@ async fn static_index() -> impl IntoResponse {
 }
 
 async fn embedded_asset_handler(AxumPath(path): AxumPath<String>) -> impl IntoResponse {
-    let path_str = if path.is_empty() || path == "/" { "index.html" } else { &path };
+    let path_str = if path.is_empty() || path == "/" {
+        "index.html"
+    } else {
+        &path
+    };
     match WebAssets::get(path_str) {
         Some(content) => {
             let mime_str = if path_str.ends_with(".html") {
@@ -172,13 +190,15 @@ async fn embedded_asset_handler(AxumPath(path): AxumPath<String>) -> impl IntoRe
             (
                 [(axum::http::header::CONTENT_TYPE, mime_str)],
                 content.data.into_owned(),
-            ).into_response()
+            )
+                .into_response()
         }
         None => match WebAssets::get("index.html") {
             Some(index) => (
                 [(axum::http::header::CONTENT_TYPE, "text/html")],
                 index.data.into_owned(),
-            ).into_response(),
+            )
+                .into_response(),
             None => (StatusCode::NOT_FOUND, "404 Not Found").into_response(),
         },
     }
@@ -197,8 +217,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/train/start", post(start_training))
         .route("/api/train/status/{id}", get(get_job_status))
         .route("/api/train/cancel/{id}", post(cancel_job))
-        .route("/api/models/{id}/bolt-ons", get(get_bolt_ons).post(attach_bolt_on_route))
-        .route("/api/models/{id}/bolt-ons/{slot}", delete(detach_bolt_on_route))
+        .route(
+            "/api/models/{id}/bolt-ons",
+            get(get_bolt_ons).post(attach_bolt_on_route),
+        )
+        .route(
+            "/api/models/{id}/bolt-ons/{slot}",
+            delete(detach_bolt_on_route),
+        )
         .route("/api/chat/load", post(load_model_handler))
         .route("/api/chat", post(chat_handler))
         .route("/sse/metrics/{id}", get(sse_metrics))
@@ -229,12 +255,16 @@ async fn get_datasets() -> Json<DatasetsResponse> {
     let dir = default_datasets_dir();
     match crate::discovery::discover_datasets(&dir) {
         Ok(datasets) => Json(DatasetsResponse { datasets }),
-        Err(_) => Json(DatasetsResponse { datasets: Vec::new() }),
+        Err(_) => Json(DatasetsResponse {
+            datasets: Vec::new(),
+        }),
     }
 }
 
 async fn get_rocm_devices() -> Json<RocmDevicesResponse> {
-    Json(RocmDevicesResponse { devices: probe_rocm_devices() })
+    Json(RocmDevicesResponse {
+        devices: probe_rocm_devices(),
+    })
 }
 
 async fn list_jobs(State(state): State<AppState>) -> Json<JobsListResponse> {
@@ -397,10 +427,7 @@ async fn cancel_job(
 /// directories. Mirrors the wire shape used by the sibling
 /// `convert_model_route` and `sanitize_model_id` helpers (those reject
 /// the same byte set on the model_id path segment).
-pub(crate) fn validate_job_path(
-    field: &str,
-    value: &str,
-) -> std::result::Result<(), String> {
+pub(crate) fn validate_job_path(field: &str, value: &str) -> std::result::Result<(), String> {
     if value.contains("..") || value.contains('/') || value.contains('\\') {
         Err(format!(
             "{field}: invalid path {value:?} (forbidden: '..', '/', backslash)"
@@ -537,14 +564,22 @@ async fn attach_bolt_on_route(
                 // Create Tensor objects from the raw f32 data.
                 let a_shape = grim_tensor::Shape::from_slice(a_shape);
                 let b_shape = grim_tensor::Shape::from_slice(b_shape);
-                let a_storage = match cpu_backend.from_cpu(&a_data, &a_shape, grim_tensor::DType::F32) {
+                let a_storage = match cpu_backend.from_cpu(
+                    &a_data,
+                    &a_shape,
+                    grim_tensor::DType::F32,
+                ) {
                     Ok(s) => s,
                     Err(e) => {
                         errors.push(json!({ "tensor": tensor_name, "error": format!("failed to create A tensor: {e}") }));
                         continue;
                     }
                 };
-                let b_storage = match cpu_backend.from_cpu(&b_data, &b_shape, grim_tensor::DType::F32) {
+                let b_storage = match cpu_backend.from_cpu(
+                    &b_data,
+                    &b_shape,
+                    grim_tensor::DType::F32,
+                ) {
                     Ok(s) => s,
                     Err(e) => {
                         errors.push(json!({ "tensor": tensor_name, "error": format!("failed to create B tensor: {e}") }));
@@ -566,9 +601,17 @@ async fn attach_bolt_on_route(
                     grim_tensor::dtype::Device::Cpu,
                 );
 
-                match grim_format::bolt_on::attach_bolt_on(model_path, tensor_name, &a_tensor, &b_tensor, req.scale) {
+                match grim_format::bolt_on::attach_bolt_on(
+                    model_path,
+                    tensor_name,
+                    &a_tensor,
+                    &b_tensor,
+                    req.scale,
+                ) {
                     Ok(()) => attached.push(tensor_name.clone()),
-                    Err(e) => errors.push(json!({ "tensor": tensor_name, "error": format!("{e}") })),
+                    Err(e) => {
+                        errors.push(json!({ "tensor": tensor_name, "error": format!("{e}") }))
+                    }
                 }
             }
             None => {
@@ -722,9 +765,7 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(json!({"status": "ok"})))
 }
 
-async fn convert_model_route(
-    Json(req): Json<ConvertModelRequest>,
-) -> impl IntoResponse {
+async fn convert_model_route(Json(req): Json<ConvertModelRequest>) -> impl IntoResponse {
     let output_dir = default_models_dir();
     let name_clean = req.output_name.trim_end_matches(".grim");
     if name_clean.contains("..") || name_clean.contains('/') || name_clean.contains('\\') {
@@ -780,7 +821,9 @@ async fn convert_model_route(
             Json(ConvertModelResponse {
                 success: true,
                 output_path: output_str,
-                message: "Model converted successfully to native .grim format via grim-format oxidizer".into(),
+                message:
+                    "Model converted successfully to native .grim format via grim-format oxidizer"
+                        .into(),
             }),
         ),
         Err(e) => (
@@ -804,8 +847,12 @@ pub struct ChatRequest {
     pub max_tokens: usize,
 }
 
-fn default_chat_temp() -> f32 { 0.7 }
-fn default_chat_max_tokens() -> usize { 256 }
+fn default_chat_temp() -> f32 {
+    0.7
+}
+fn default_chat_max_tokens() -> usize {
+    256
+}
 
 #[derive(Debug, Serialize)]
 pub struct ChatResponse {
@@ -899,7 +946,10 @@ async fn load_model_handler(
     // Load tokenizer from GGUF metadata
     let tokenizer = load_tokenizer_from_path(&req.model_path);
     if tokenizer.is_none() {
-        eprintln!("[load_model] warning: failed to load tokenizer from {}", req.model_path);
+        eprintln!(
+            "[load_model] warning: failed to load tokenizer from {}",
+            req.model_path
+        );
     }
 
     // Load the model
@@ -956,10 +1006,12 @@ async fn chat_handler(
                 }
             }
 
-            let model = model_loader::load_from_path(&req.model_id)
-                .map_err(|e| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("Failed to load model: {e}") })))
-                })?;
+            let model = model_loader::load_from_path(&req.model_id).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("Failed to load model: {e}") })),
+                )
+            })?;
             engine.register_model(&model_name, model);
         }
     }
@@ -969,7 +1021,10 @@ async fn chat_handler(
     let prompt_tokens = {
         let tok = state.tokenizer.lock().unwrap();
         let tokenizer = tok.as_ref().ok_or_else(|| {
-            (StatusCode::BAD_REQUEST, Json(json!({ "error": "No model loaded. Call POST /api/chat/load first." })))
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "No model loaded. Call POST /api/chat/load first." })),
+            )
         })?;
         let ids = tokenizer.encode(prompt_clean);
         ids.len()
@@ -1016,7 +1071,10 @@ async fn chat_handler(
             break;
         }
 
-        let token = match engine.last_outcome(request_id).and_then(|o| o.logits.as_ref().cloned()) {
+        let token = match engine
+            .last_outcome(request_id)
+            .and_then(|o| o.logits.as_ref().cloned())
+        {
             Some(logits) => sampler.sample(&logits, &generated_ids).unwrap_or(0),
             None => break,
         };
@@ -1048,7 +1106,6 @@ async fn chat_handler(
         latency_ms,
     }))
 }
-
 
 pub fn health_router() -> Router {
     Router::new().route("/healthz", get(health))

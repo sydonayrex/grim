@@ -104,8 +104,13 @@ mod tests {
     #[test]
     fn test_disaggregated_kv_routing() {
         let router = DisaggRouter::new("10.0.0.1:8000", "10.0.0.2:8000", PoolRole::Prefill);
-        
-        // Dispatch prefill
+
+        // Verify router fields are correctly stored
+        assert_eq!(router.prefill_node_addr, "10.0.0.1:8000");
+        assert_eq!(router.decode_node_addr, "10.0.0.2:8000");
+        assert_eq!(router.pool_role, PoolRole::Prefill);
+
+        // Dispatch prefill — verify it doesn't error
         assert!(router.dispatch_prefill(42, &[101, 102, 103]).is_ok());
 
         // Transfer 4 KV blocks over the simulated network
@@ -116,6 +121,57 @@ mod tests {
             source_prefill_pool_addr: "10.0.0.1:8000".to_string(),
             request_id: 42,
         };
+        assert_eq!(assignment.request_id, 42);
+        assert_eq!(assignment.source_prefill_pool_addr, "10.0.0.1:8000");
         assert!(router.dispatch_decode(42, 104, assignment).is_ok());
+    }
+
+    #[test]
+    fn test_transfer_kv_cache_rejects_zero_blocks() {
+        let router = DisaggRouter::new("10.0.0.1:8000", "10.0.0.2:8000", PoolRole::Prefill);
+        let result = router.transfer_kv_cache(42, 0);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("block count cannot be zero"),
+            "error should mention zero block count: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_rdma_toggle() {
+        let mut router = DisaggRouter::new("10.0.0.1:8000", "10.0.0.2:8000", PoolRole::Prefill);
+        assert!(!router.use_rdma);
+        router.enable_rdma(true);
+        assert!(router.use_rdma);
+        router.enable_rdma(false);
+        assert!(!router.use_rdma);
+    }
+
+    #[test]
+    fn test_dispatch_decode_preserves_assignment() {
+        let router = DisaggRouter::new("10.0.0.1:8000", "10.0.0.2:8000", PoolRole::Decode);
+        let assignment = PoolAssignment {
+            source_prefill_pool_addr: "10.0.0.1:8000".to_string(),
+            request_id: 99,
+        };
+        // Verify assignment fields are accessible and correct
+        assert_eq!(assignment.source_prefill_pool_addr, "10.0.0.1:8000");
+        assert_eq!(assignment.request_id, 99);
+        // Should succeed without error
+        assert!(router.dispatch_decode(99, 200, assignment).is_ok());
+    }
+
+    #[test]
+    fn test_pool_assignment_fields() {
+        // Verify PoolAssignment stores fields correctly — catches mutations
+        // that rename or remove fields.
+        let assignment = PoolAssignment {
+            source_prefill_pool_addr: "192.168.1.1:9000".to_string(),
+            request_id: 12345,
+        };
+        assert_eq!(assignment.source_prefill_pool_addr, "192.168.1.1:9000");
+        assert_eq!(assignment.request_id, 12345);
     }
 }
