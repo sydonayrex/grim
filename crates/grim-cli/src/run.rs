@@ -663,6 +663,15 @@ pub async fn cmd_run_interactive(
     eprintln!("[grim] Sampling: temp={temperature}, top_p={top_p}, top_k={top_k}, max_tokens={max_tokens}, seed={seed}");
     eprintln!("[grim] Type your prompt below (Ctrl+C to exit):");
 
+    // Session persists across turns so the KV cache carries forward context.
+    let mut session = SessionInner::new(model.device().clone());
+    // Accumulated conversation history for multi-turn chat templates.
+    let mut messages: Vec<grim_format::ChatMessage> = Vec::new();
+    // Repeat-penalty history persists across turns.
+    let mut history: Vec<u32> = Vec::new();
+    // Running token count for position offset across turns (KV cache persists).
+    let mut total_tokens: usize = 0;
+
     use std::io::Write;
     loop {
         print!(">>> ");
@@ -672,15 +681,15 @@ pub async fn cmd_run_interactive(
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
 
-        // Each turn gets a fresh session so the KV cache starts empty.
-        let mut session = SessionInner::new(model.device().clone());
+        // Append the user message to the conversation history.
+        messages.push(grim_format::ChatMessage {
+            role: "user".to_string(),
+            content: trimmed.to_string(),
+        });
+
         let mut tokens: Vec<u32> = if let Some(tok) = &tokenizer {
             let mut ids = Vec::new();
             let prompt_text = if tok.chat_template.is_some() {
-                let messages = vec![grim_format::ChatMessage {
-                    role: "user".to_string(),
-                    content: trimmed.to_string(),
-                }];
                 grim_format::render_messages_or_last(tok, &messages)
             } else {
                 let bos_candidates = ["<|startoftext|>", "<s>", "<|im_start|>"];
@@ -699,7 +708,6 @@ pub async fn cmd_run_interactive(
         };
 
         let mut generated = 0;
-        let mut history: Vec<u32> = Vec::new();
         let mut first_pass = true;
         let mut generated_tokens: Vec<u32> = Vec::new();
 
@@ -717,9 +725,9 @@ pub async fn cmd_run_interactive(
             let input_tensor = build_tensor(&input_ids, &shape, &device)?;
 
             let positions: Vec<f32> = if is_prefill {
-                (0..n_tokens).map(|i| i as f32).collect()
+                (0..n_tokens).map(|i| (total_tokens + i) as f32).collect()
             } else {
-                vec![n_tokens as f32 - 1.0]
+                vec![(total_tokens + n_tokens - 1) as f32]
             };
             let pos_shape = grim_tensor::Shape::new(vec![positions.len()]);
             let positions_tensor = build_tensor(&positions, &pos_shape, &device)?;
@@ -738,6 +746,7 @@ pub async fn cmd_run_interactive(
             generated_tokens.push(next_token);
             tokens.push(next_token);
             history.push(next_token);
+            total_tokens += n_tokens;
             generated += 1;
 
             if let Some(tok) = &tokenizer {
@@ -750,6 +759,12 @@ pub async fn cmd_run_interactive(
         if let Some(tok) = &tokenizer {
             let text = tok.decode(&generated_tokens);
             print!("{}", text);
+            // Record the assistant response so the next turn's chat template
+            // has full conversation history.
+            messages.push(grim_format::ChatMessage {
+                role: "assistant".to_string(),
+                content: text,
+            });
         } else {
             for t in &generated_tokens {
                 print!("{} ", t);
