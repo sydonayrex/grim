@@ -17,6 +17,7 @@
 
 use grim_autograd::{
     adamw::{AdamW, AdamWConfig},
+    injection::LoRAInjectionPoint,
     loss::cross_entropy_loss,
     param::{ParamId, TrainableParam, TrainableParams},
     preference_loss::{dpo_loss, grpo_normalize_rewards, orpo_odds_ratio_loss},
@@ -68,7 +69,7 @@ fn adamw_one_step_matches_hand_computed_reference() {
 
     let w0 = 2.0f32;
     let g = 1.0f32;
-    let id = ParamId::a(0, 1);
+    let id = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
     let mut p =
         TrainableParam::new(id, cpu_tensor(vec![w0], Shape::new(vec![1, 1]))).unwrap();
     p.accumulate_grad(&cpu_tensor(vec![g], Shape::new(vec![1, 1])))
@@ -143,7 +144,7 @@ fn adamw_decay_actually_moves_weight_to_zero_under_constant_grad() {
         ..AdamWConfig::default()
     };
     let mut opt = AdamW::new(cfg);
-    let id = ParamId::b(0, 2);
+    let id = ParamId::b(0, 2, LoRAInjectionPoint::QProj);
     let p = TrainableParam::new(id, cpu_tensor(vec![1.0], Shape::new(vec![1, 1]))).unwrap();
     let mut params = TrainableParams::new();
     params.insert(p);

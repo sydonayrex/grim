@@ -305,6 +305,42 @@ async fn chat_completions(
         })
         .unwrap_or_default();
 
+    // Parse `messages` into typed structs and render the prompt once,
+    // before the streaming / non-streaming split.  If the tokenizer
+    // carries a Jinja chat template, use it; otherwise fall back to the
+    // last message's content (best-effort, pre-existing behaviour).
+    let messages: Vec<grim_format::ChatMessage> = body_obj
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    if messages.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "request must include at least one message in 'messages'",
+                "messages": [],
+            })),
+        )
+            .into_response();
+    }
+
+    let prompt_text = {
+        let tok = state.tokenizer.lock().unwrap();
+        match tok.as_ref() {
+            Some(t) => grim_format::render_messages_or_last(t, &messages),
+            None => messages.last().map(|m| m.content.clone()).unwrap_or_default(),
+        }
+    };
+    let prompt_tokens: Vec<u32> = {
+        let tok = state.tokenizer.lock().unwrap();
+        tok.as_ref().map(|t| t.encode(&prompt_text)).unwrap_or_default()
+    };
+
     if stream_requested {
         let state_clone = state.clone();
         let adapter_ids: Vec<u32> = {
@@ -320,11 +356,9 @@ async fn chat_completions(
         let sampler_clone = sampler.clone();
         let stop_sequences_clone = stop_sequences.clone();
         let max_tokens_clone = max_tokens;
-        // Get tokenizer for the streaming path
-        let tokenizer_clone = state.tokenizer.lock().unwrap().clone();
 
         let stream = futures::stream::unfold(
-            (0u64, String::new(), tokenizer_clone.as_ref().map(|t| t.encode("Hello")).unwrap_or_default()), // (step, accumulated content, prompt_tokens)
+            (0u64, String::new(), prompt_tokens.clone()), // (step, accumulated content, prompt_tokens)
             move |(step, mut emitted, prompt_tokens): (u64, String, Vec<u32>)| {
                 let state = state_clone.clone();
                 let adapter_ids = adapter_ids_clone.clone();
@@ -389,8 +423,8 @@ async fn chat_completions(
         };
 
         let tokenizer = state.tokenizer.lock().unwrap().clone();
-        // Tokenize the prompt once for prefill
-        let prompt_tokens = tokenizer.as_ref().map(|t| t.encode("Hello")).unwrap_or_default();
+        // Tokenize the prompt once for prefill (rendered from messages above)
+        let prompt_tokens = prompt_tokens.clone();
         // Honor `max_tokens` (was a hardcoded 5) and stop sequences.
         for step in 0..max_tokens {
             let token_id = {

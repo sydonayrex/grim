@@ -54,7 +54,7 @@ fn test_q4k_gpu_gemm_golden_mutation_resistant() -> TestResult {
             arith: ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::Q4K),
         };
-        let b_dev = BackendDevice::from_cpu(&dev, &b_dequant, &b_shape, q4k_dtype)?;
+        let b_dev = BackendDevice::from_cpu_bytes(&dev, &b_packed, &b_shape, q4k_dtype)?;
 
         let (out, handle) = dev.quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &[], &out_shape)?;
         handle.synchronize()?;

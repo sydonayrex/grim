@@ -39,20 +39,35 @@ pub fn apply_adapters_to_logits(
         return Ok(logits.clone());
     }
     let shape_dims = logits.shape().dims().to_vec();
-    if shape_dims.len() != 2 {
-        // CPU structural placeholder — GPU path fuses this into the
-        // output projection. Anything other than `[seq, vocab]` is
-        // a misuse here; return the input untouched.
-        return Ok(logits.clone());
-    }
-    let (seq_len, vocab) = (shape_dims[0], shape_dims[1]);
+    // Flatten non-2D logits (e.g. [batch, seq, vocab]) to 2D [batch*seq, vocab]
+    // so LoRA applies uniformly. Reshape back after.
+    let original_dims = shape_dims.clone();
+    let needs_reshape = shape_dims.len() != 2;
+    let logits_2d = if needs_reshape {
+        let flat_len: usize = shape_dims.iter().product();
+        let vocab = shape_dims.last().copied().unwrap_or(1);
+        let seq_len = flat_len / vocab;
+        let data = logits.to_vec_f32()?;
+        let dev = grim_nn::modules::pick_device_for_tensor(logits);
+        let shape = Shape::new(vec![seq_len, vocab]);
+        Tensor::new(
+            std::sync::Arc::from(dev.from_cpu(&data, &shape, grim_tensor::dtype::DType::F32)?),
+            shape,
+            grim_tensor::dtype::DType::F32,
+            logits.provenance().clone(),
+            logits.device().clone(),
+        )
+    } else {
+        logits.clone()
+    };
+    let (seq_len, vocab) = (logits_2d.shape().dims()[0], logits_2d.shape().dims()[1]);
 
-    let dev = grim_nn::modules::pick_device_for_tensor(logits);
-    let is_cpu = matches!(logits.device(), grim_tensor::Device::Cpu);
+    let dev = grim_nn::modules::pick_device_for_tensor(&logits_2d);
+    let is_cpu = matches!(logits_2d.device(), grim_tensor::Device::Cpu);
 
     if !is_cpu {
         // GPU path: performing matmuls on-device using BackendDevice
-        let mut running_logits = logits.clone();
+        let mut running_logits = logits_2d.clone();
         for adapter in adapters {
             let rank = adapter.a.shape().dim(0).map_err(|e| Error::Shape(e.to_string()))?;
             let in_dim = adapter.a.shape().dim(1).map_err(|e| Error::Shape(e.to_string()))?;
@@ -90,8 +105,8 @@ pub fn apply_adapters_to_logits(
                 std::sync::Arc::from(temp_s),
                 Shape::new(vec![seq_len, rank]),
                 grim_tensor::dtype::DType::F32,
-                logits.provenance().clone(),
-                logits.device().clone(),
+                logits_2d.provenance().clone(),
+                logits_2d.device().clone(),
             );
 
             // adapter.b is [vocab, rank]
@@ -113,8 +128,8 @@ pub fn apply_adapters_to_logits(
                 std::sync::Arc::from(delta_s),
                 Shape::new(vec![seq_len, vocab]),
                 grim_tensor::dtype::DType::F32,
-                logits.provenance().clone(),
-                logits.device().clone(),
+                logits_2d.provenance().clone(),
+                logits_2d.device().clone(),
             );
 
             // 3. Scale and Add: running_logits = running_logits + scale * delta_tensor
@@ -131,23 +146,29 @@ pub fn apply_adapters_to_logits(
                 std::sync::Arc::from(scaled_delta_s),
                 delta_tensor.shape().clone(),
                 grim_tensor::dtype::DType::F32,
-                logits.provenance().clone(),
-                logits.device().clone(),
+                logits_2d.provenance().clone(),
+                logits_2d.device().clone(),
             );
 
             let (added_s, h3) = dev.add(
                 running_logits.storage().as_ref(),
                 scaled_delta_tensor.storage().as_ref(),
-                logits.shape(),
+                logits_2d.shape(),
             )?;
             h3.synchronize()?;
             running_logits = Tensor::new(
                 std::sync::Arc::from(added_s),
-                logits.shape().clone(),
+                logits_2d.shape().clone(),
                 grim_tensor::dtype::DType::F32,
-                logits.provenance().clone(),
-                logits.device().clone(),
+                logits_2d.provenance().clone(),
+                logits_2d.device().clone(),
             );
+        }
+        // Reshape back to original shape if we flattened
+        if needs_reshape {
+            let data = running_logits.to_vec_f32()?;
+            let shape = Shape::new(original_dims);
+            return Ok(cpu_tensor(data, shape));
         }
         return Ok(running_logits);
     }
@@ -172,7 +193,7 @@ pub fn apply_adapters_to_logits(
         let a_data = adapter.a.to_vec_f32()?;
         let b_data = adapter.b.to_vec_f32()?;
         let in_dim = adapter.a.shape().dim(1).map_err(|e| Error::Shape(e.to_string()))?;
-        let logits_data = logits.to_vec_f32()?;
+        let logits_data = logits_2d.to_vec_f32()?;
         for token in 0..seq_len {
             for vocab_j in 0..vocab {
                 let mut total = 0.0f32;
@@ -188,11 +209,15 @@ pub fn apply_adapters_to_logits(
             }
         }
     }
-    let mut base = logits.to_vec_f32()?;
+    let mut base = logits_2d.to_vec_f32()?;
     for i in 0..base.len() {
         base[i] += acc[i];
     }
-    Ok(cpu_tensor(base, Shape::new(shape_dims)))
+    if needs_reshape {
+        Ok(cpu_tensor(base, Shape::new(original_dims)))
+    } else {
+        Ok(cpu_tensor(base, Shape::new(shape_dims)))
+    }
 }
 
 /// Helper to transpose the last two dimensions of a 2D tensor.

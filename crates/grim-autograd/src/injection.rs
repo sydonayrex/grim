@@ -168,12 +168,12 @@ impl LoRAInjectionConfig {
 
     /// `ParamId` for this adapter's A matrix.
     pub fn param_id_a(&self) -> ParamId {
-        ParamId::a(self.layer_idx, self.adapter_id)
+        ParamId::a(self.layer_idx, self.adapter_id, self.injection_point)
     }
 
     /// `ParamId` for this adapter's B matrix.
     pub fn param_id_b(&self) -> ParamId {
-        ParamId::b(self.layer_idx, self.adapter_id)
+        ParamId::b(self.layer_idx, self.adapter_id, self.injection_point)
     }
 }
 

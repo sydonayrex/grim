@@ -18,7 +18,7 @@ pub mod streaming_forward;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use grim_backend_cpu::DeterministicRng;
 use grim_core::error::{Error, Result};
@@ -33,6 +33,10 @@ type DynModelPtr = Box<SpeculativeCausalLm>;
 pub struct LoadedModel {
     pub model: DynModelPtr,
     pub config: Box<dyn ModelConfig>,
+    /// Device this model's weights live on. Sessions are created on this
+    /// device so decode/GPU work actually lands on the GPU instead of
+    /// silently falling back to CPU.
+    pub device: grim_tensor::Device,
 }
 
 /// A loaded adapter bundle (one LoRA's A/B matrices + scaling). LoRA batches
@@ -116,6 +120,9 @@ pub struct Engine {
     /// previously sampled token instead of the position index.
     request_last_token: HashMap<u64, u32>,
     self_tuning_controller: grim_scheduler::SelfTuningController,
+    /// Tuned speculative params (MIN-3: applied, not discarded).
+    tuned_speculative_block_len: usize,
+    tuned_kv_compression_bit_width: u8,
 }
 
 impl Engine {
@@ -156,6 +163,8 @@ impl Engine {
                 target_ttft,
                 target_itl,
             ),
+            tuned_speculative_block_len: 5,
+            tuned_kv_compression_bit_width: 4,
         }
     }
 
@@ -196,6 +205,7 @@ impl Engine {
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
 
+        let dev = model.device().clone();
         let wrapped = SpeculativeCausalLm::auto(
             model,
             draft,
@@ -213,6 +223,7 @@ impl Engine {
             LoadedModel {
                 model: Box::new(wrapped),
                 config,
+                device: dev,
             },
         );
     }
@@ -289,35 +300,59 @@ impl Engine {
         let output = self.scheduler.schedule();
         let schedule_elapsed = tick_start.elapsed();
 
-        // Record real measured latencies to the self-tuning controller.
-        // TTFT is approximated as schedule time for prefill-heavy batches;
-        // ITL is approximated as decode time per token.
-        self.self_tuning_controller.record_ttft(schedule_elapsed.as_secs_f64() * 1000.0);
-        self.self_tuning_controller.record_itl(schedule_elapsed.as_secs_f64() * 1000.0);
-        let tuned_params = self.self_tuning_controller.tune_all();
-
-        self.scheduler.max_batched_tokens = tuned_params.max_batched_tokens;
-        self.scheduler.chunked_prefill_size = tuned_params.chunked_prefill_size;
-
         // Run prefill, then decode in a single deterministic pass — for
         // §5.3 correctness, prefills share block pool and decode uses
         // the KV they just wrote. We process them in the order the
         // scheduler produced them so a paused predicate is monotonically
         // consistent.
         let prefill = output.prefill_ids.clone();
+        let mut prefill_elapsed = Duration::ZERO;
         for id in prefill {
             if self.scheduler.is_paused(id) {
                 continue;
             }
+            let pf_start = Instant::now();
             self.drive_prefill(id)?;
+            prefill_elapsed += pf_start.elapsed();
         }
         let decode = output.decode_ids.clone();
+        let decode_count = decode.len();
+        let mut decode_elapsed = Duration::ZERO;
+        let mut total_accepted = 0usize;
         for id in decode {
             if self.scheduler.is_paused(id) {
                 continue;
             }
-            self.drive_decode(id)?;
+            let dec_start = Instant::now();
+            let outcome = self.drive_decode_with_outcome(id)?;
+            decode_elapsed += dec_start.elapsed();
+            if let Some(ref o) = outcome {
+                total_accepted += o.accepted_tokens;
+            }
         }
+
+        // MIN-4: Record actual forward-pass wall time, not schedule time.
+        // TTFT = time to first token (prefill), ITL = inter-token latency (decode).
+        let ttft_ms = prefill_elapsed.as_secs_f64() * 1000.0;
+        let itl_ms = if decode_count > 0 {
+            decode_elapsed.as_secs_f64() * 1000.0 / decode_count as f64
+        } else {
+            0.0
+        };
+        self.self_tuning_controller.record_ttft(ttft_ms);
+        self.self_tuning_controller.record_itl(itl_ms);
+
+        // MIN-3: Apply ALL tuned params, not just max_batched_tokens and
+        // chunked_prefill_size.
+        let tuned_params = self.self_tuning_controller.tune_all();
+        self.scheduler.max_batched_tokens = tuned_params.max_batched_tokens;
+        self.scheduler.chunked_prefill_size = tuned_params.chunked_prefill_size;
+        // Speculative block length and KV compression bit width are stored
+        // on the engine for the speculative wrapper to pick up at decode time.
+        self.tuned_speculative_block_len = tuned_params.speculative_block_len;
+        self.tuned_kv_compression_bit_width = tuned_params.kv_compression_bit_width;
+
+        let _ = (schedule_elapsed, total_accepted);
         Ok(output)
     }
 
@@ -358,6 +393,14 @@ impl Engine {
     }
 
     fn drive_decode(&mut self, id: u64) -> Result<()> {
+        let outcome = self.drive_decode_with_outcome(id)?;
+        if let Some(outcome) = outcome {
+            self.last_outcomes.insert(id, outcome);
+        }
+        Ok(())
+    }
+
+    fn drive_decode_with_outcome(&mut self, id: u64) -> Result<Option<StepOutcome>> {
         let start_pos = self
             .sessions
             .get(&id)
@@ -379,9 +422,10 @@ impl Engine {
             let outcome = self.drive_forward(&model_id, id, &ids, &positions)?;
             // See `drive_prefill` — position advancement is the model's
             // responsibility at this transition point.
-            self.last_outcomes.insert(id, outcome);
+            Ok(Some(outcome))
+        } else {
+            Ok(None)
         }
-        Ok(())
     }
 
     fn drive_forward(
@@ -419,15 +463,14 @@ impl Engine {
             self.scheduler.running.len(),
             &adapters,
         )?;
-        // Speculative commit/accept — the wrapper's decode_one already
-        // tapped tentative slots in its KV cache; for v1 we accept all
-        // verified positions and report it as 1 token per decode tick
-        // (the underlying count would require a sampling step, deferred
-        // to phase 5 hardening).
+        // MIN-2: Report the actual accepted token count from the session
+        // (set by the speculative wrapper's decode_one). Non-speculative
+        // paths default to 1.
+        let accepted_tokens = session.last_accepted_tokens();
         let _ = (loaded, was_speculative_path);
         Ok(StepOutcome {
             logits: Some(Arc::new(logits)),
-            accepted_tokens: 1,
+            accepted_tokens,
             speculative: was_speculative_path,
         })
     }
@@ -447,7 +490,13 @@ impl Engine {
     }
 
     pub fn enqueue_request(&mut self, request: grim_scheduler::Request) {
-        let session = Box::new(grim_core::session::Inner::new(grim_tensor::Device::Cpu));
+        // Honor the model's actual device instead of silently forcing CPU.
+        let device = self
+            .models
+            .get(request.model_id.as_deref().unwrap_or(""))
+            .map(|m| m.device.clone())
+            .unwrap_or(grim_tensor::Device::Cpu);
+        let session = Box::new(grim_core::session::Inner::new(device));
         self.sessions.insert(request.id, session);
         self.request_model_ids.insert(request.id, request.model_id.clone().unwrap_or_default());
         self.request_adapters.insert(request.id, request.adapter_ids.clone());
@@ -468,13 +517,19 @@ impl Engine {
     /// engine when speculative decoding is enabled — the wrapper writes
     /// tentative/supplemental slots into the session's KV.
     pub fn enqueue_request_with_kv(&mut self, request: grim_scheduler::Request) -> Result<()> {
+        // Honor the model's actual device instead of silently forcing CPU.
+        let device = self
+            .models
+            .get(request.model_id.as_deref().unwrap_or(""))
+            .map(|m| m.device.clone())
+            .unwrap_or(grim_tensor::Device::Cpu);
         let kv = grim_memory::PagedKvCache::new(
             self.block_pool.clone(),
             self.config.num_kv_heads,
             self.config.head_dim,
         );
         let session = Box::new(grim_core::session::Inner::with_kv(
-            grim_tensor::Device::Cpu,
+            device,
             Box::new(kv),
         ));
         self.sessions.insert(request.id, session);

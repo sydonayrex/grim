@@ -79,8 +79,8 @@ mod tests {
 
     #[test]
     fn param_id_distinguishes_a_and_b() {
-        let a = ParamId::a(0, 1);
-        let b = ParamId::b(0, 1);
+        let a = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
+        let b = ParamId::b(0, 1, LoRAInjectionPoint::QProj);
         assert!(a.is_a);
         assert!(!b.is_a);
         assert_ne!(a, b);
@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn trainable_param_initializes_zero_grad() {
-        let id = ParamId::a(0, 1);
+        let id = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
         let data = cpu_tensor(vec![1.0, 2.0, 3.0, 4.0], Shape::new(vec![2, 2]));
         let param = TrainableParam::new(id, data).unwrap();
         let g = param.grad().to_vec_f32().unwrap();

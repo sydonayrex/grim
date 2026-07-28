@@ -37,6 +37,7 @@ fn cpu_dequant(bytes: &[u8], n_weights: usize) -> Vec<f32> {
 }
 
 #[test]
+#[ignore = "requires real ROCm device; run manually with GRIM_RUN_GPU_TESTS=1 and -- --ignored"]
 fn q8_0_kernel_matches_cpu_dequant() {
     let bytes = build_q8_0_bytes();
     let n_blocks = bytes.len() / (QK8_0 + 2);

@@ -347,6 +347,12 @@ pub struct Lfm2 {
 
 impl Lfm2 {
     pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: Lfm2Config) -> Result<Self> {
+        if cfg.is_recr.len() != cfg.num_layers {
+            return Err(grim_core::error::Error::Config(format!(
+                "Lfm2Config: is_recr has {} entries but num_layers is {}",
+                cfg.is_recr.len(), cfg.num_layers
+            )));
+        }
         let tok_embeddings = Embedding::load(&ws.pp("token_embd"), cfg.vocab_size, cfg.hidden_size)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {

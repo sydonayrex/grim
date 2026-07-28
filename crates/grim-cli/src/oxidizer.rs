@@ -31,7 +31,10 @@ fn open_provider(path: &str) -> Result<(Box<dyn TensorProvider>, Vec<String>, Ve
         let provider = grim_format::tprov::SafetensorsProvider::open(path).map_err(|e| e.to_string())?;
         let names: Vec<String> = provider.tensors().keys().cloned().collect();
         let sizes = names.iter().map(|n| provider.tensors().get(n).map(|i| i.shape().iter().product()).unwrap_or(0)).collect();
-        Ok((Box::new(provider), names, sizes, GrimMetadata::default()))
+        let mut meta = GrimMetadata::default();
+        meta.train_fusion_ops = inferred_fusion_ops(&names);
+        meta.rocm_fusion_ops = inferred_fusion_ops(&names);
+        Ok((Box::new(provider), names, sizes, meta))
     } else {
         let provider = GgufProvider::open(path).map_err(|e| e.to_string())?;
         let names: Vec<String> = provider.tensors().keys().cloned().collect();
@@ -361,11 +364,15 @@ fn load_importance_scores(path: &str) -> Result<ImportanceScores, String> {
 
 fn bitwidth_to_dtype(bw: u32) -> GgufDType {
     match bw {
-        0..=2 => GgufDType::Q2K,
+        0 | 1 => GgufDType::Q2K,
+        2 => GgufDType::Q2K,
         3 => GgufDType::Q3K,
         4 => GgufDType::Q4K,
         5 => GgufDType::Q5K,
-        _ => GgufDType::Q6K,
+        6 => GgufDType::Q6K,
+        7 => GgufDType::Q8K,
+        8 => GgufDType::Q8K,
+        _ => GgufDType::Q8K,
     }
 }
 

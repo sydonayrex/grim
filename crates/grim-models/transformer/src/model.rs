@@ -140,14 +140,17 @@ impl Llama {
         Ok(self.tok_embeddings.forward(&[token], 1, self.cfg.hidden_size)?)
     }
 
-    pub fn decode(&self, hidden: &Tensor, positions: &[u32]) -> Result<(Tensor, Tensor)> {
+    pub fn decode(&self, hidden: &Tensor, positions: &[u32]) -> Result<(Tensor, Tensor, Vec<(Tensor, Tensor)>)> {
         let mut h = hidden.clone();
+        let mut kv_pairs = Vec::new();
         for layer in &self.layers {
-            h = layer.forward(&h, positions)?;
+            let (out, k, v) = layer.forward_with_kv(&h, positions)?;
+            kv_pairs.push((k, v));
+            h = out;
         }
         let h = self.norm.forward(&h)?;
         let logits = self.output.forward(&h)?;
-        Ok((logits, h))
+        Ok((logits, h, kv_pairs))
     }
 }
 
@@ -175,7 +178,7 @@ impl CausalLm for Llama {
         &self,
         session: &mut dyn SessionT,
         input_ids: &Tensor,
-        _positions: &Tensor,
+        positions: &Tensor,
         adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
         let ids: Vec<u32> = match input_ids.dtype() {
@@ -205,8 +208,20 @@ impl CausalLm for Llama {
             self.tok_embeddings.weight.provenance().clone(),
             self.device.clone(),
         );
-        let positions: Vec<u32> = (0..seq_len).map(|i| i as u32).collect();
-        let (logits, hidden_state) = self.decode(&hidden_t, &positions)?;
+        // MAJ-3: use the positions tensor passed by the engine instead of
+        // hardcoding 0..seq_len. During decode the engine passes the actual
+        // current_pos so RoPE sees the correct absolute position.
+        let pos_vec: Vec<u32> = if positions.shape().dims().iter().product::<usize>() == seq_len {
+            positions.to_vec_f32()?.into_iter().map(|x| x as u32).collect()
+        } else {
+            (0..seq_len).map(|i| i as u32).collect()
+        };
+        let (logits, hidden_state, kv_pairs) = self.decode(&hidden_t, &pos_vec)?;
+        // MAJ-1: populate the KV cache with K/V from each layer so the
+        // cache infrastructure is no longer dead code.
+        for (k, v) in &kv_pairs {
+            session.append_kv(k, v)?;
+        }
         session.set_last_hidden_state(hidden_state);
         let logits = if adapters.is_empty() {
             logits

@@ -139,6 +139,7 @@ fn accumulate_tensor_grad(grads: &mut HashMap<TensorId, Tensor>, id: TensorId, g
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::injection::LoRAInjectionPoint;
     use crate::param::ParamId;
     use grim_backend_cpu::cpu_tensor;
     use grim_tensor::Shape;
@@ -151,8 +152,8 @@ mod tests {
         let base = tape.register(cpu_tensor(vec![1.0, 2.0], Shape::new(vec![1, 2])));
         let x = tape.register(cpu_tensor(vec![1.0, 1.0], Shape::new(vec![1, 2])));
 
-        let pid_a = ParamId::a(0, 1);
-        let pid_b = ParamId::b(0, 1);
+        let pid_a = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
+        let pid_b = ParamId::b(0, 1, LoRAInjectionPoint::QProj);
 
         let a_data = cpu_tensor(vec![0.5, 0.5], Shape::new(vec![1, 2]));
         let b_data = cpu_tensor(vec![1.0, 1.0], Shape::new(vec![2, 1]));

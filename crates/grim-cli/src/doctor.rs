@@ -251,12 +251,12 @@ fn check_gpu_backend(report: &mut DoctorReport) {
                         );
                     }
                     if c.gcn.starts_with("gfx10") {
-                        report.errors.push(format!(
-                            "Host GPU architecture {} is RDNA 2. RDNA 2 does not support wave64 and is incompatible with .grim optimizations",
+                        report.warnings.push(format!(
+                            "Host GPU architecture {} is RDNA 2. RDNA 2 does not support wave64 and is incompatible with .grim optimizations. CPU backend still works.",
                             c.gcn
                         ));
                         eprintln!(
-                            "[ERR] Host GPU architecture {} is RDNA 2. RDNA 2 does not support wave64 and is incompatible with .grim optimizations",
+                            "[WARN] Host GPU architecture {} is RDNA 2. RDNA 2 does not support wave64 and is incompatible with .grim optimizations. CPU backend still works.",
                             c.gcn
                         );
                     } else if !c.gcn.starts_with("gfx11") && !c.gcn.starts_with("gfx12") {

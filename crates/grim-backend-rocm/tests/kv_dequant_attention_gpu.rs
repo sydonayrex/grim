@@ -78,6 +78,7 @@ fn float_reference(
 }
 
 #[test]
+#[ignore = "requires real ROCm device; run manually with GRIM_RUN_GPU_TESTS=1 and -- --ignored"]
 fn gpu_fused_attention_matches_cpu_reference() -> TestResult {
     // (num_heads, num_kv_heads, head_dim, key_bits, value_bits): covers 1:1
     // heads and GQA (kv_heads < heads), head_dim <= 64 vs > 64 (multi-chunk),
