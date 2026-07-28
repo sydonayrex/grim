@@ -30,7 +30,6 @@ use grim_core::grim_models_dir;
 use grim_core::session::DeterminismMode;
 use grim_engine::{Engine, model_loader};
 use grim_format::GgufProvider;
-use grim_tensor::Device;
 
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -579,34 +578,61 @@ async fn stream_state(
     Sse::new(stream)
 }
 
-/// OpenAI-compatible embeddings endpoint
-async fn embeddings() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "object": "list",
-        "data": [{
-            "object": "embedding",
-            "index": 0,
-            "embedding": [0.01, 0.02, 0.03]
-        }],
-        "model": "grim"
-    }))
+/// OpenAI-compatible embeddings endpoint.
+///
+/// Returns a 501 Not Implemented — the embeddings pipeline is not yet wired
+/// to a real encoder (sims.md issue #9). Returning hardcoded 
+/// would silently produce incorrect embeddings for every caller.
+async fn embeddings() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "object": "list",
+            "data": [],
+            "model": "grim",
+            "error": {
+                "type": "not_implemented",
+                "message": "Embeddings endpoint is not yet implemented."
+            }
+        })),
+    )
 }
 
-/// OpenAI-compatible audio transcriptions endpoint
-async fn audio_transcriptions() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "text": "Simulated audio transcription output."
-    }))
+/// OpenAI-compatible audio transcriptions endpoint.
+///
+/// Returns a 501 Not Implemented — audio transcription is not yet wired to a
+/// real ASR pipeline (sims.md issue #9). Returning a hardcoded string would
+/// silently produce incorrect transcripts.
+async fn audio_transcriptions() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "text": "",
+            "error": {
+                "type": "not_implemented",
+                "message": "Audio transcription endpoint is not yet implemented."
+            }
+        })),
+    )
 }
 
-/// OpenAI-compatible image generation endpoint
-async fn images_generations() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "created": 0,
-        "data": [{
-            "url": "http://localhost:8080/image.png"
-        }]
-    }))
+/// OpenAI-compatible image generation endpoint.
+///
+/// Returns a 501 Not Implemented — image generation is not yet wired to a real
+/// diffusion pipeline (sims.md issue #9). Returning a hardcoded localhost URL
+/// would silently produce broken image references.
+async fn images_generations() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "created": 0,
+            "data": [],
+            "error": {
+                "type": "not_implemented",
+                "message": "Image generation endpoint is not yet implemented."
+            }
+        })),
+    )
 }
 
 /// gRPC service handler placeholder / mock server path (§8)
@@ -678,42 +704,26 @@ async fn load_model(
     let model_path = match resolved_path {
         Some(p) => p,
         None => {
-            // No on-disk model — fall back to mock so `/v1/models/load` can be
-            // poked at integration time without a real artifact.
-            eprintln!(
-                "[grim-server] Model file not found for '{}', using mock model",
-                req.name
-            );
-            let mock = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
-                grim_models_transformer::LlamaConfig {
-                    vocab_size: 32000,
-                    hidden_size: 512,
-                    num_heads: 8,
-                    num_kv_heads: 2,
-                    head_dim: 64,
-                    num_layers: 4,
-                    intermediate_size: 1024,
-                    rms_norm_eps: 1e-5,
-                    rope_theta: 10000.0,
-                    max_seq_len: 2048,
-                },
-            ));
-            engine.register_model(&req.name, mock);
+            // No on-disk model found — return an explicit error rather than
+            // silently substituting a random-weight mock model (sims.md issue #8).
+            // Returning Ok with a mock would mask the missing artifact and
+            // produce garbage output without any indication of failure.
             return (
-                StatusCode::OK,
+                StatusCode::NOT_FOUND,
                 Json(serde_json::json!({
-                    "status": "success",
+                    "status": "error",
                     "message": format!(
-                        "Model '{}' not found on disk; loaded mock model for testing.",
+                        "Model '{}' not found on disk; no mock fallback is provided.",
                         req.name
                     ),
                     "resolved_path": serde_json::Value::Null,
-                    "loaded_kind": "mock",
+                    "loaded_kind": serde_json::Value::Null,
                 })),
             );
         }
     };
 
+    #[cfg(debug_assertions)]
     eprintln!(
         "[grim-server] Loading model from: {}",
         model_path.display()
@@ -1579,6 +1589,7 @@ fn load_model_for_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grim_tensor::Device;
     use axum::{
         body::Body,
         http::{Request, StatusCode},

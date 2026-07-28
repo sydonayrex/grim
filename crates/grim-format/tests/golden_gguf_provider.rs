@@ -36,17 +36,15 @@ fn build_gguf(tensors: &[(&str, &[u64], u32, u64)]) -> Vec<u8> {
 fn write_gguf_bytes(bytes: &[u8]) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join("grim_golden_gguf");
     std::fs::create_dir_all(&dir).unwrap();
-    let name = format!("golden_{:016x}.gguf", randish());
+    // Unique per call: PID + a process-global atomic counter. The nanosecond
+    // clock alone is NOT unique across parallel test threads (same ns →
+    // filename collision → one thread overwrites another's file → flaky panic).
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = format!("golden_{:x}_{:016x}.gguf", std::process::id(), seq);
     let path = dir.join(name);
     std::fs::write(&path, bytes).unwrap();
     path
-}
-
-/// A deterministic pseudo-random u64 for unique temp filenames.
-fn randish() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    d.as_nanos() as u64
 }
 
 /// Golden end-to-end: hand-construct GGUF with one F32 tensor, open via

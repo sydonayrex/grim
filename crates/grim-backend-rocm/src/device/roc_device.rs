@@ -1119,6 +1119,28 @@ impl RocmDevice {
         }
     }
 
+    /// Liveness check for a single ordinal without constructing a full
+    /// device. Returns `Ok(true)` if `hipGetDeviceCount` reports at least
+    /// `ordinal + 1` devices (and the runtime is present), `Ok(false)` if the
+    /// runtime is present but no device exists at that ordinal, and `Err` if
+    /// the HIP runtime call itself fails. Used by the grim-garage backend
+    /// selection chain to verify ROCm before committing a job to it.
+    pub fn probe_one(ordinal: usize) -> Result<bool> {
+        if let Ok(s) = std::env::var("GRIM_ROCM_ORDINAL_OVERRIDE") {
+            if let Ok(n) = s.parse::<usize>() {
+                return Ok(n == ordinal);
+            }
+        }
+        let mut count: i32 = 0;
+        let count_status = unsafe { hipGetDeviceCount(&mut count) };
+        if count_status != hipSuccess {
+            return Err(Error::Backend(format!(
+                "hipGetDeviceCount failed with code {count_status}"
+            )));
+        }
+        Ok((count as usize) > ordinal)
+    }
+
     pub fn probe() -> Result<Vec<RocmDevice>> {
         if let Ok(s) = std::env::var("GRIM_ROCM_ORDINAL_OVERRIDE") {
             if let Ok(n) = s.parse::<usize>() {

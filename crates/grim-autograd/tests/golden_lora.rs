@@ -27,20 +27,22 @@ fn test_apply_and_record_lora_golden_mutation_resistant() {
 
     // A is rank x in_features = 4 x 4
     let a_data = vec![
-        1.0, 0.0, 0.0, 0.0,
-        0.0, 1.0, 0.0, 0.0,
-        0.0, 0.0, 1.0, 0.0,
-        0.0, 0.0, 0.0, 1.0,
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
     ];
     // B is out_features x rank = 4 x 4
     let b_data = vec![
-        2.0, 0.0, 0.0, 0.0,
-        0.0, 2.0, 0.0, 0.0,
-        0.0, 0.0, 2.0, 0.0,
-        0.0, 0.0, 0.0, 2.0,
+        2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0,
     ];
-    let a_param = TrainableParam::new(lora_cfg.param_id_a(), cpu_tensor(a_data, Shape::new(vec![4, 4]))).unwrap();
-    let b_param = TrainableParam::new(lora_cfg.param_id_b(), cpu_tensor(b_data, Shape::new(vec![4, 4]))).unwrap();
+    let a_param = TrainableParam::new(
+        lora_cfg.param_id_a(),
+        cpu_tensor(a_data, Shape::new(vec![4, 4])),
+    )
+    .unwrap();
+    let b_param = TrainableParam::new(
+        lora_cfg.param_id_b(),
+        cpu_tensor(b_data, Shape::new(vec![4, 4])),
+    )
+    .unwrap();
     autograd_reg.params.insert(a_param);
     autograd_reg.params.insert(b_param);
 

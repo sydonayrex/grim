@@ -25,7 +25,10 @@ pub fn dpo_loss(
     beta: f32,
 ) -> Result<(f32, Vec<f32>, Vec<f32>)> {
     let n = policy_chosen_logps.len();
-    if policy_rejected_logps.len() != n || ref_chosen_logps.len() != n || ref_rejected_logps.len() != n {
+    if policy_rejected_logps.len() != n
+        || ref_chosen_logps.len() != n
+        || ref_rejected_logps.len() != n
+    {
         return Err(Error::Backend("DPO logps slice length mismatch".into()));
     }
 
@@ -117,7 +120,13 @@ pub fn dpo_loss_autograd(
 ) -> Result<(f32, grim_tensor::Tensor, grim_tensor::Tensor)> {
     let chosen_vec = policy_chosen_logps.to_vec_f32()?;
     let rejected_vec = policy_rejected_logps.to_vec_f32()?;
-    let (loss_val, _, _) = dpo_loss(&chosen_vec, &rejected_vec, ref_chosen_logps, ref_rejected_logps, beta)?;
+    let (loss_val, _, _) = dpo_loss(
+        &chosen_vec,
+        &rejected_vec,
+        ref_chosen_logps,
+        ref_rejected_logps,
+        beta,
+    )?;
 
     let n = chosen_vec.len();
     let mut g_chosen = vec![0.0f32; n];
@@ -137,14 +146,22 @@ pub fn dpo_loss_autograd(
 
     let dev = crate::pick_device_for_tensor(policy_chosen_logps);
     let grad_c = grim_tensor::Tensor::new(
-        std::sync::Arc::from(dev.from_cpu(&g_chosen, policy_chosen_logps.shape(), grim_tensor::dtype::DType::F32)?),
+        std::sync::Arc::from(dev.from_cpu(
+            &g_chosen,
+            policy_chosen_logps.shape(),
+            grim_tensor::dtype::DType::F32,
+        )?),
         policy_chosen_logps.shape().clone(),
         grim_tensor::dtype::DType::F32,
         policy_chosen_logps.provenance().clone(),
         policy_chosen_logps.device().clone(),
     );
     let grad_r = grim_tensor::Tensor::new(
-        std::sync::Arc::from(dev.from_cpu(&g_rejected, policy_rejected_logps.shape(), grim_tensor::dtype::DType::F32)?),
+        std::sync::Arc::from(dev.from_cpu(
+            &g_rejected,
+            policy_rejected_logps.shape(),
+            grim_tensor::dtype::DType::F32,
+        )?),
         policy_rejected_logps.shape().clone(),
         grim_tensor::dtype::DType::F32,
         policy_rejected_logps.provenance().clone(),
@@ -186,14 +203,22 @@ pub fn orpo_odds_ratio_loss_autograd(
 
     let dev = crate::pick_device_for_tensor(policy_chosen_logps);
     let grad_c = grim_tensor::Tensor::new(
-        std::sync::Arc::from(dev.from_cpu(&g_chosen, policy_chosen_logps.shape(), grim_tensor::dtype::DType::F32)?),
+        std::sync::Arc::from(dev.from_cpu(
+            &g_chosen,
+            policy_chosen_logps.shape(),
+            grim_tensor::dtype::DType::F32,
+        )?),
         policy_chosen_logps.shape().clone(),
         grim_tensor::dtype::DType::F32,
         policy_chosen_logps.provenance().clone(),
         policy_chosen_logps.device().clone(),
     );
     let grad_r = grim_tensor::Tensor::new(
-        std::sync::Arc::from(dev.from_cpu(&g_rejected, policy_rejected_logps.shape(), grim_tensor::dtype::DType::F32)?),
+        std::sync::Arc::from(dev.from_cpu(
+            &g_rejected,
+            policy_rejected_logps.shape(),
+            grim_tensor::dtype::DType::F32,
+        )?),
         policy_rejected_logps.shape().clone(),
         grim_tensor::dtype::DType::F32,
         policy_rejected_logps.provenance().clone(),
@@ -233,7 +258,11 @@ pub fn grpo_loss_autograd(
     let avg_loss = total_loss * inv_n;
     let dev = crate::pick_device_for_tensor(policy_logps);
     let grad_tensor = grim_tensor::Tensor::new(
-        std::sync::Arc::from(dev.from_cpu(&grads, policy_logps.shape(), grim_tensor::dtype::DType::F32)?),
+        std::sync::Arc::from(dev.from_cpu(
+            &grads,
+            policy_logps.shape(),
+            grim_tensor::dtype::DType::F32,
+        )?),
         policy_logps.shape().clone(),
         grim_tensor::dtype::DType::F32,
         policy_logps.provenance().clone(),
@@ -271,7 +300,11 @@ mod tests {
         assert!((c_r[0] - 0.1).abs() < 1e-6);
         assert!((r_r[0] - (-0.1)).abs() < 1e-6);
         // Exact loss: softplus(-0.2) = ln(1 + exp(-0.2)) = 0.5981424
-        assert!((loss - 0.5981424).abs() < 1e-5, "loss = {}, want 0.5981424", loss);
+        assert!(
+            (loss - 0.5981424).abs() < 1e-5,
+            "loss = {}, want 0.5981424",
+            loss
+        );
     }
 
     #[test]
@@ -284,6 +317,10 @@ mod tests {
         // Assert unit variance: std_dev of [1, 2, 3, 4, 5] = sqrt((4+1+0+1+4)/5) = sqrt(2)
         // Normalized values must have sample variance ~1.0
         let var = norm.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / (norm.len() as f32);
-        assert!((var - 1.0).abs() < 1e-4, "Normalized variance = {}, want 1.0", var);
+        assert!(
+            (var - 1.0).abs() < 1e-4,
+            "Normalized variance = {}, want 1.0",
+            var
+        );
     }
 }

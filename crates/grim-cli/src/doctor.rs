@@ -298,7 +298,7 @@ fn check_gpu_backend(report: &mut DoctorReport) {
                                 gpu_count
                             );
                         } else {
-                            report.gpu_backend_actual = Some("cpu (hardcoded 0 in /metrics)".into());
+                            report.gpu_backend_actual = Some(format!("cpu ({} devices in /metrics)", gpu_count));
                             report.warnings.push(
                                 "GPU backend appears to report 0 devices — possible CPU fallback".into(),
                             );

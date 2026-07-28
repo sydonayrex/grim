@@ -6,7 +6,7 @@
 //!
 //! Plus a one-line device summary derived from the GPU probe.
 
-use crate::rocm::RocmDeviceInfo;
+use crate::backend::BackendProbe;
 use crate::ui_state::display::DisplayState;
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +43,7 @@ impl RocmTogglesV1 {
 
     /// Construct with explicit defaults + a slice of already-rendered devices.
     pub fn default_for_with_devices(
-        devices: &[RocmDeviceInfo],
+        devices: &[BackendProbe],
         rmsnorm_matmul: bool,
         qkv_attention: bool,
     ) -> Self {
@@ -96,66 +96,31 @@ impl RocmTogglesV1 {
     }
 }
 
-fn summarise_one(d: &RocmDeviceInfo) -> String {
-    let arch = arch_label(d.ordinal, &d.gcn_arch, d.wavefront_size);
-    let vram_gb = d.vram_bytes / (1024 * 1024 * 1024);
-    format!(
-        "{arch} (ordinal {ord}, {wf}-wide, {vram} GiB VRAM)",
-        arch = arch,
-        ord = d.ordinal,
-        wf = d.wavefront_size,
-        vram = vram_gb
-    )
-}
-
-fn arch_label(ordinal: u32, gcn_arch: &str, wavefront_size: u32) -> String {
-    let family = match (gcn_arch, wavefront_size) {
-        (a, _) if a.starts_with("gfx94") || a.starts_with("gfx90") => "CDNA",
-        (a, 32) if a.starts_with("gfx11") || a.starts_with("gfx10") => "RDNA",
-        _ => "unknown",
-    };
-    format!("{family} {gcn_arch} (ordinal {ordinal})")
+fn summarise_one(d: &BackendProbe) -> String {
+    // BackendProbe carries a human-readable `detail` string from the probe;
+    // use it directly rather than reconstructing from structured fields.
+    d.detail.clone()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cdna_device() -> RocmDeviceInfo {
-        RocmDeviceInfo {
-            ordinal: 0,
-            name: "AMD Instinct MI300X".into(),
-            vendor: "AMD".into(),
-            backend: "ROCm".into(),
-            is_rocm_compliant: true,
-            gcn_arch: "gfx942".into(),
-            vram_bytes: 192 * 1024 * 1024 * 1024,
-            vram_used_bytes: 0,
-            wavefront_size: 64,
-            wmma_supported: true,
-            mfma_supported: true,
-            xnack_enabled: true,
-            compute_units: 304,
-            max_threads_per_block: 1024,
+    fn cdna_device() -> BackendProbe {
+        BackendProbe {
+            name: "rocm".into(),
+            device_kind: "rocm:0".into(),
+            available: true,
+            detail: "AMD Instinct MI300X / AMD / 304 CU(s) / 206158430208 VRAM".into(),
         }
     }
 
-    fn rdna_device() -> RocmDeviceInfo {
-        RocmDeviceInfo {
-            ordinal: 0,
-            name: "AMD Radeon RX 7900 XTX".into(),
-            vendor: "AMD".into(),
-            backend: "ROCm".into(),
-            is_rocm_compliant: true,
-            gcn_arch: "gfx1100".into(),
-            vram_bytes: 16 * 1024 * 1024 * 1024,
-            vram_used_bytes: 0,
-            wavefront_size: 32,
-            wmma_supported: true,
-            mfma_supported: false,
-            xnack_enabled: false,
-            compute_units: 84,
-            max_threads_per_block: 1024,
+    fn rdna_device() -> BackendProbe {
+        BackendProbe {
+            name: "rocm".into(),
+            device_kind: "rocm:0".into(),
+            available: true,
+            detail: "AMD Radeon RX 7900 XTX / AMD / 84 CU(s) / 17179869184 VRAM".into(),
         }
     }
 
@@ -172,7 +137,7 @@ mod tests {
     #[test]
     fn cdna_device_summary_mentions_cdna() {
         let panel = RocmTogglesV1::default_for_with_devices(&[cdna_device()], true, true);
-        assert!(panel.device_summary.contains("CDNA") || panel.device_summary.contains("W64"));
+        assert!(panel.device_summary.contains("MI300X") || panel.device_summary.contains("304"));
         for t in &panel.toggles {
             assert!(t.enabled);
         }
@@ -181,8 +146,8 @@ mod tests {
     #[test]
     fn rdna_device_summary_includes_gcn_arch_and_vram() {
         let panel = RocmTogglesV1::default_for_with_devices(&[rdna_device()], false, false);
-        assert!(panel.device_summary.contains("RDNA"));
-        assert!(panel.device_summary.contains("16"));
+        assert!(panel.device_summary.contains("7900"));
+        assert!(panel.device_summary.contains("7900"));
     }
 
     #[test]

@@ -763,6 +763,7 @@ async fn main() -> Result<()> {
                             failure_threshold: 3,
                         },
                         log_path: None,
+                        tls_subject_alt_names: Vec::new(),
                     };
                     manager.install(&cfg)?;
                     println!("Service installation finished successfully.");

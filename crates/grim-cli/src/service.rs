@@ -47,6 +47,9 @@ pub struct ServiceConfig {
     pub run_as_user: Option<String>,
     pub health_check: HealthCheckConfig,
     pub log_path: Option<PathBuf>,
+    /// Subject Alternative Names for the self-signed TLS certificate.
+    /// If empty, defaults to `["localhost", "127.0.0.1"]`.
+    pub tls_subject_alt_names: Vec<String>,
 }
 
 #[allow(dead_code)]
@@ -86,7 +89,11 @@ pub fn setup_tls_and_config(cfg: &ServiceConfig) -> Result<()> {
                 Error::Backend(format!("failed to create cert directory: {e}"))
             })?;
         }
-        let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+        let subject_alt_names = if cfg.tls_subject_alt_names.is_empty() {
+            vec!["localhost".to_string(), "127.0.0.1".to_string()]
+        } else {
+            cfg.tls_subject_alt_names.clone()
+        };
         let cert = rcgen::generate_simple_self_signed(subject_alt_names)
             .map_err(|e| Error::Backend(format!("failed to generate self-signed cert: {e}")))?;
         
@@ -677,6 +684,7 @@ mod tests {
                 failure_threshold: 3,
             },
             log_path: None,
+            tls_subject_alt_names: Vec::new(),
         }
     }
 

@@ -6,7 +6,9 @@
 
 use std::sync::Arc;
 
-use grim_tensor::dtype::{BlockDtype, DType, Device, FloatPackScheme, KQuantScheme, QuantProvenance, Storage};
+use grim_tensor::dtype::{
+    BlockDtype, DType, Device, FloatPackScheme, KQuantScheme, QuantProvenance, Storage,
+};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::shape::Shape;
 use grim_tensor::tensor::Tensor;
@@ -21,10 +23,10 @@ use grim_quant::{
 
 #[cfg(feature = "cuda-mem")]
 use grim_backend_cuda::CudaDevice;
-#[cfg(feature = "rocm-mem")]
-use grim_backend_rocm::{RocmDevice, RocmStorage};
 #[cfg(feature = "metal-mem")]
 use grim_backend_metal::MetalDevice;
+#[cfg(feature = "rocm-mem")]
+use grim_backend_rocm::{RocmDevice, RocmStorage};
 
 /// A handle that walks a `TensorProvider` by hierarchical prefix. Models
 /// call `ws.pp("model").pp("layers").pp("0").get(...)` to materialize
@@ -33,16 +35,16 @@ pub struct WeightSource<'a> {
     tensors: &'a dyn grim_tensor::TensorProvider,
     prefix: Vec<String>,
     default_dtype: DType,
-        default_provenance: QuantProvenance,
-            device: Device,
+    default_provenance: QuantProvenance,
+    device: Device,
 }
 
 impl<'a> WeightSource<'a> {
     pub fn new(
         tensors: &'a dyn grim_tensor::TensorProvider,
         default_dtype: DType,
-            default_provenance: QuantProvenance,
-                device: Device,
+        default_provenance: QuantProvenance,
+        device: Device,
     ) -> Self {
         Self {
             tensors,
@@ -54,10 +56,7 @@ impl<'a> WeightSource<'a> {
     }
 
     /// Root-level builder from a `TensorProvider`.
-    pub fn root(
-        tensors: &'a dyn grim_tensor::TensorProvider,
-        device: Device,
-    ) -> Self {
+    pub fn root(tensors: &'a dyn grim_tensor::TensorProvider, device: Device) -> Self {
         Self::new(tensors, DType::F32, QuantProvenance::GrimNative, device)
     }
 
@@ -74,8 +73,8 @@ impl<'a> WeightSource<'a> {
             tensors: self.tensors,
             prefix: self.prefix.clone(),
             default_dtype: self.default_dtype.clone(),
-                default_provenance: self.default_provenance.clone(),
-                    device: self.device.clone(),
+            default_provenance: self.default_provenance.clone(),
+            device: self.device.clone(),
         }
     }
 
@@ -104,11 +103,13 @@ impl<'a> WeightSource<'a> {
         if raw.shape != shape.dims() {
             eprintln!(
                 "[get-trace] ShapeMismatch at name={} expected={:?} got={:?}",
-                name, shape.dims(), raw.shape
+                name,
+                shape.dims(),
+                raw.shape
             );
             return Err(Error::ShapeMismatch {
                 expected: shape.dims().to_vec(),
-                       got: raw.shape.clone(),
+                got: raw.shape.clone(),
             });
         }
         let (dtype, provenance) = match self.tensors.meta(&name) {
@@ -148,7 +149,7 @@ impl<'a> WeightSource<'a> {
         if raw.shape != shape.dims() {
             return Err(Error::ShapeMismatch {
                 expected: shape.dims().to_vec(),
-                       got: raw.shape.clone(),
+                got: raw.shape.clone(),
             });
         }
         let (dtype, provenance) = match self.tensors.meta(&name) {
@@ -179,10 +180,10 @@ fn materialize_cuda(
     let storage = BackendDevice::from_cpu(&dev, &f32s, &shape, DType::F32)?;
     Ok(Tensor::new(
         Arc::from(storage),
-                   shape,
-                   DType::F32,
-                   provenance,
-                   device.clone(),
+        shape,
+        DType::F32,
+        provenance,
+        device.clone(),
     ))
 }
 
@@ -197,7 +198,7 @@ fn materialize_cuda(
 ) -> Result<Tensor> {
     Err(Error::Unimplemented(format!(
         "CUDA materialization: enable 'cuda-mem' feature on grim-nn (ordinal={})",
-                                     ordinal
+        ordinal
     )))
 }
 
@@ -217,10 +218,10 @@ fn materialize_rocm(
     let storage = BackendDevice::from_cpu(&dev, &f32s, &shape, DType::F32)?;
     Ok(Tensor::new(
         Arc::from(storage),
-                   shape,
-                   DType::F32,
-                   provenance,
-                   device.clone(),
+        shape,
+        DType::F32,
+        provenance,
+        device.clone(),
     ))
 }
 
@@ -235,7 +236,7 @@ fn materialize_rocm(
 ) -> Result<Tensor> {
     Err(Error::Unimplemented(format!(
         "ROCm materialization: enable 'rocm-mem' feature on grim-nn (ordinal={})",
-                                     ordinal
+        ordinal
     )))
 }
 
@@ -252,10 +253,10 @@ fn materialize_metal(
     let storage = BackendDevice::from_cpu(&dev, &f32s, &shape, DType::F32)?;
     Ok(Tensor::new(
         Arc::from(storage),
-                   shape,
-                   DType::F32,
-                   provenance,
-                   device.clone(),
+        shape,
+        DType::F32,
+        provenance,
+        device.clone(),
     ))
 }
 
@@ -270,7 +271,7 @@ fn materialize_metal(
 ) -> Result<Tensor> {
     Err(Error::Unimplemented(format!(
         "Metal materialization: enable 'metal-mem' feature on grim-nn (ordinal={})",
-                                     ordinal
+        ordinal
     )))
 }
 
@@ -301,7 +302,11 @@ fn materialize(
                             let roc_storage = storage
                                 .as_any()
                                 .downcast_ref::<RocmStorage>()
-                                .ok_or_else(|| Error::Backend("materialize: ROCm Q80 storage is not RocmStorage".into()))?;
+                                .ok_or_else(|| {
+                                    Error::Backend(
+                                        "materialize: ROCm Q80 storage is not RocmStorage".into(),
+                                    )
+                                })?;
                             dev.dequantize_q8_0(roc_storage)?
                         };
                         // Free the packed buffer immediately instead of
@@ -348,7 +353,9 @@ fn materialize(
                 "Vulkan materialization not yet wired up".into(),
             ))
         }
-        Device::Metal(ordinal) => materialize_metal(f32s, shape, dtype, provenance, device, *ordinal),
+        Device::Metal(ordinal) => {
+            materialize_metal(f32s, shape, dtype, provenance, device, *ordinal)
+        }
     }
 }
 
@@ -362,15 +369,23 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
     match &dtype.storage {
         Storage::Native => match dtype.arith {
             grim_tensor::ArithType::F32 => bytes_to_f32(&raw.bytes, n),
-            grim_tensor::ArithType::BF16 => Ok(raw.bytes.chunks_exact(2).map(bf16_to_f32).collect()),
-            grim_tensor::ArithType::F16 => Ok(raw.bytes.chunks_exact(2).map(f16_to_f32_le).collect()),
+            grim_tensor::ArithType::BF16 => {
+                Ok(raw.bytes.chunks_exact(2).map(bf16_to_f32).collect())
+            }
+            grim_tensor::ArithType::F16 => {
+                Ok(raw.bytes.chunks_exact(2).map(f16_to_f32_le).collect())
+            }
             other => Err(Error::Unimplemented(format!(
                 "WeightSource native materialization for arith {other:?} not supported"
             ))),
         },
         Storage::KQuant(scheme) => match scheme {
-            KQuantScheme::Q2K => Err(Error::Unimplemented("Native dequantization for Q2_K not yet implemented".into())),
-            KQuantScheme::Q3K => Err(Error::Unimplemented("Native dequantization for Q3_K not yet implemented".into())),
+            KQuantScheme::Q2K => Err(Error::Unimplemented(
+                "Native dequantization for Q2_K not yet implemented".into(),
+            )),
+            KQuantScheme::Q3K => Err(Error::Unimplemented(
+                "Native dequantization for Q3_K not yet implemented".into(),
+            )),
             KQuantScheme::Q4K => dequant_q4k(&raw.bytes, n),
             KQuantScheme::Q5K => dequant_q5k(&raw.bytes, n),
             KQuantScheme::Q6K => dequant_q6k(&raw.bytes, n),
@@ -404,14 +419,15 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
                 if *cursor + 8 > bytes.len() {
                     return Err(Error::Backend("Truncated GPTQ packed header".into()));
                 }
-                let len = u64::from_le_bytes(bytes[*cursor..*cursor+8].try_into().unwrap()) as usize;
+                let len =
+                    u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap()) as usize;
                 *cursor += 8;
                 if *cursor + len > bytes.len() {
                     return Err(Error::Backend(format!(
                         "Truncated GPTQ packed segment (expected {len} bytes)"
                     )));
                 }
-                let segment = bytes[*cursor..*cursor+len].to_vec();
+                let segment = bytes[*cursor..*cursor + len].to_vec();
                 *cursor += len;
                 Ok(segment)
             };
@@ -421,7 +437,11 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             let scales = read_segment(&raw.bytes, &mut cursor)?;
             let g_idx = read_segment(&raw.bytes, &mut cursor)?;
 
-            let g_idx_opt = if g_idx.is_empty() { None } else { Some(&g_idx[..]) };
+            let g_idx_opt = if g_idx.is_empty() {
+                None
+            } else {
+                Some(&g_idx[..])
+            };
 
             grim_quant::dequant_gptq_group_int(
                 &qweight,
@@ -496,9 +516,9 @@ mod tests {
         fn meta(&self, _name: &str) -> Result<grim_tensor::TensorMeta> {
             Ok(grim_tensor::TensorMeta {
                 dtype: self.dtype.clone(),
-               provenance: QuantProvenance::GrimNative,
-               shape: self.raw.shape.clone(),
-               fusion_mask: 0,
+                provenance: QuantProvenance::GrimNative,
+                shape: self.raw.shape.clone(),
+                fusion_mask: 0,
             })
         }
     }
@@ -545,11 +565,19 @@ mod tests {
         let abs = (got - want).abs();
         let denom = want.abs().max(1e-7);
         assert!(got.is_finite(), "{ctx}: non-finite {got:?} (want {want:?})");
-        assert!(abs == 0.0 || (abs / denom) < 1e-5, "{ctx}: got {got:?} want {want:?} (abs={abs})");
+        assert!(
+            abs == 0.0 || (abs / denom) < 1e-5,
+            "{ctx}: got {got:?} want {want:?} (abs={abs})"
+        );
     }
 
     fn raw(bytes: Vec<u8>, shape: Vec<usize>, dtype: DType) -> RawTensor {
-        RawTensor { bytes, shape, dtype, provenance: QuantProvenance::GrimNative }
+        RawTensor {
+            bytes,
+            shape,
+            dtype,
+            provenance: QuantProvenance::GrimNative,
+        }
     }
 
     #[test]
@@ -561,10 +589,8 @@ mod tests {
         let mut bytes = vec![0u8; 34];
         bytes[0..2].copy_from_slice(&0x4000u16.to_le_bytes());
         let codes: [i8; 32] = [
-            1, -1, 127, -128, 64, -64, 0, 5,
-            10, -10, 50, -50, 25, -25, 100, -100,
-            3, -3, 7, 7, 9, 9, 12, -12,
-            33, -33, 11, -11, 2, 4, 8, 16,
+            1, -1, 127, -128, 64, -64, 0, 5, 10, -10, 50, -50, 25, -25, 100, -100, 3, -3, 7, 7, 9,
+            9, 12, -12, 33, -33, 11, -11, 2, 4, 8, 16,
         ];
         for (i, &c) in codes.iter().enumerate() {
             bytes[2 + i] = c as u8;
@@ -579,7 +605,10 @@ mod tests {
 
     #[test]
     fn dequant_to_f32_bf16_native_shifts_left_16() {
-        let dtype = DType { arith: grim_tensor::ArithType::BF16, storage: Storage::Native };
+        let dtype = DType {
+            arith: grim_tensor::ArithType::BF16,
+            storage: Storage::Native,
+        };
         let bytes: Vec<u8> = vec![0x80, 0x3F, 0x00, 0xC0, 0x49, 0x40];
         let r = raw(bytes, vec![3], dtype.clone());
         let out = dequant_to_f32(&r, &dtype).unwrap();
@@ -591,10 +620,11 @@ mod tests {
 
     #[test]
     fn dequant_to_f32_f16_native_normalized_and_subnormal() {
-        let dtype = DType { arith: grim_tensor::ArithType::F16, storage: Storage::Native };
-        let bytes: Vec<u8> = vec![
-            0x00, 0x3C, 0x00, 0x40, 0x48, 0x42, 0x00, 0x02, 0x00, 0xC0,
-        ];
+        let dtype = DType {
+            arith: grim_tensor::ArithType::F16,
+            storage: Storage::Native,
+        };
+        let bytes: Vec<u8> = vec![0x00, 0x3C, 0x00, 0x40, 0x48, 0x42, 0x00, 0x02, 0x00, 0xC0];
         let r = raw(bytes, vec![5], dtype.clone());
         let out = dequant_to_f32(&r, &dtype).unwrap();
         assert_eq!(out.len(), 5);
@@ -609,7 +639,10 @@ mod tests {
     fn bytes_to_f32_rejects_wrong_length() {
         let dtype = DType::F32;
         let r = raw(vec![0u8, 1, 2], vec![1], dtype.clone());
-        assert!(dequant_to_f32(&r, &dtype).is_err(), "non-f32-multiple must error");
+        assert!(
+            dequant_to_f32(&r, &dtype).is_err(),
+            "non-f32-multiple must error"
+        );
         let r2 = raw(vec![0u8, 0, 0x40, 0x40], vec![1], dtype.clone());
         let out = dequant_to_f32(&r2, &dtype).unwrap();
         assert_eq!(out.len(), 1);

@@ -6,7 +6,7 @@
 
 use grim_tensor::{Device, Tensor};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::kv_cache::KvCache;
 use crate::rng::SimpleRng;
 
@@ -209,9 +209,17 @@ impl Graph {
     }
 
     /// Replays the captured computation graph using bound session inputs.
+    ///
+    /// NOTE: Graph replay is not yet implemented (sims.md issue #10). The
+    /// previous implementation printed the node count and returned `Ok(())`,
+    /// silently making every shape-specialized computation path a no-op. We now
+    /// surface an explicit `Unimplemented` error so callers cannot mistake a
+    /// successful return for a successful replay.
     pub fn replay(&self, _session: &mut dyn SessionT) -> Result<()> {
-        println!("[Graph] Replaying captured static computation graph with {} nodes", self.nodes.len());
-        Ok(())
+        Err(Error::Unimplemented(format!(
+            "Graph::replay: graph replay is not yet implemented ({} nodes captured).              No computation graph nodes were executed.",
+            self.nodes.len()
+        )))
     }
 }
 

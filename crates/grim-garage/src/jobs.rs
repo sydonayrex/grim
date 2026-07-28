@@ -86,6 +86,10 @@ pub struct TrainingJob {
     pub epochs: u32,
     pub rocm_fusion_rmsnorm_matmul: bool,
     pub rocm_fusion_qkv_attention: bool,
+    /// Backend the user selected for this job. `None` = auto (top of the
+    /// ROCm→CUDA→Vulkan→Metal→CPU priority chain that is actually live).
+    #[serde(default)]
+    pub preferred_backend: Option<String>,
     /// Mutable state shared with the worker task.
     #[serde(skip)]
     pub status: JobStatus,
@@ -109,6 +113,7 @@ impl Default for TrainingJob {
             epochs: 1,
             rocm_fusion_rmsnorm_matmul: false,
             rocm_fusion_qkv_attention: false,
+            preferred_backend: None,
             status: JobStatus::Pending,
             metrics: Vec::new(),
             cancel: CancellationToken::new(),
@@ -394,14 +399,30 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     // satisfied when `cancel.cancel()` fires from another task.
     let cancel = job.cancel.clone();
 
+    // Select the compute backend for this job from the user's preference,
+    // falling through the ROCm→CUDA→Vulkan→Metal→CPU priority chain. This is
+    // the single source of truth for where steps actually run — tensors are
+    // created on this device, so the autograd tape dispatches to it.
+    let preferred = job
+        .preferred_backend
+        .as_deref()
+        .map(crate::backend::PreferredBackend::from_str_opt);
+    let backend = crate::backend::select_backend(preferred.clone());
+    eprintln!(
+        "[grim-garage] worker: job {} selected backend '{}' (preferred={:?})",
+        id,
+        backend.label,
+        preferred.unwrap_or(crate::backend::PreferredBackend::Auto)
+    );
+
     // Transition → Running (no broadcast: per-step events arrive shortly).
     if let Err(e) = registry.update_status(&id, JobStatus::Running).await {
         eprintln!("[grim-garage] worker: failed to mark {} Running: {e}", id);
         return;
     }
     eprintln!(
-        "[grim-garage] worker: job {} started (mode={mode:?}, epochs={epochs})",
-        id
+        "[grim-garage] worker: job {} started (mode={mode:?}, epochs={epochs}, backend={})",
+        id, backend.label
     );
 
     use grim_autograd::{
@@ -409,7 +430,6 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         LoRAInjectionRegistry, Tape, backward, cross_entropy_loss, dpo_loss_autograd,
         grpo_loss_autograd, orpo_odds_ratio_loss_autograd,
     };
-    use grim_backend_cpu::cpu_tensor;
     use grim_tensor::Shape;
 
     let lora_rank = job.lora_rank as usize;
@@ -465,11 +485,14 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         let loss = match mode {
             TrainingMode::Lora | TrainingMode::QLoRA | TrainingMode::Bf16Full => {
                 let x_vec = vec![0.1f32; hidden_size];
-                let x_tensor = cpu_tensor(x_vec, Shape::new(vec![1, hidden_size]));
+                let x_tensor = backend
+                    .make_tensor(x_vec, Shape::new(vec![1, hidden_size]))
+                    .unwrap();
                 let x_id = tape.register(x_tensor.clone());
 
-                let logits_base =
-                    cpu_tensor(vec![0.01f32; vocab_size], Shape::new(vec![1, vocab_size]));
+                let logits_base = backend
+                    .make_tensor(vec![0.01f32; vocab_size], Shape::new(vec![1, vocab_size]))
+                    .unwrap();
                 let logits_base_id = tape.register(logits_base.clone());
 
                 let (logits_id, logits_out) = match grim_autograd::apply_and_record_lora(
@@ -485,7 +508,9 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     Ok(res) => res,
                     Err(_) => (
                         logits_base_id,
-                        cpu_tensor(vec![0.01f32; vocab_size], Shape::new(vec![1, vocab_size])),
+                        backend
+                            .make_tensor(vec![0.01f32; vocab_size], Shape::new(vec![1, vocab_size]))
+                            .unwrap(),
                     ),
                 };
 
@@ -505,8 +530,12 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 }
             }
             TrainingMode::Dpo => {
-                let pol_c = cpu_tensor(vec![-1.0f32 + (step as f32 * 0.05)], Shape::new(vec![1]));
-                let pol_r = cpu_tensor(vec![-3.0f32 - (step as f32 * 0.05)], Shape::new(vec![1]));
+                let pol_c = backend
+                    .make_tensor(vec![-1.0f32 + (step as f32 * 0.05)], Shape::new(vec![1]))
+                    .unwrap();
+                let pol_r = backend
+                    .make_tensor(vec![-3.0f32 - (step as f32 * 0.05)], Shape::new(vec![1]))
+                    .unwrap();
                 let ref_c = vec![-2.0f32];
                 let ref_r = vec![-2.0f32];
 
@@ -518,8 +547,12 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 }
             }
             TrainingMode::Orpo => {
-                let pol_c = cpu_tensor(vec![-0.5f32 + (step as f32 * 0.02)], Shape::new(vec![1]));
-                let pol_r = cpu_tensor(vec![-2.5f32 - (step as f32 * 0.02)], Shape::new(vec![1]));
+                let pol_c = backend
+                    .make_tensor(vec![-0.5f32 + (step as f32 * 0.02)], Shape::new(vec![1]))
+                    .unwrap();
+                let pol_r = backend
+                    .make_tensor(vec![-2.5f32 - (step as f32 * 0.02)], Shape::new(vec![1]))
+                    .unwrap();
 
                 match orpo_odds_ratio_loss_autograd(&pol_c, &pol_r, 0.2) {
                     Ok((loss_val, _g_c, _g_r)) => loss_val as f64,
@@ -528,7 +561,9 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 }
             }
             TrainingMode::Grpo => {
-                let pol_logps = cpu_tensor(vec![-1.0f32, -1.5f32, -2.0f32], Shape::new(vec![3]));
+                let pol_logps = backend
+                    .make_tensor(vec![-1.0f32, -1.5f32, -2.0f32], Shape::new(vec![3]))
+                    .unwrap();
                 let rewards = vec![1.0f32 + (step as f32 * 0.1), 2.0f32, 0.5f32];
 
                 match grpo_loss_autograd(&pol_logps, &rewards, 1e-8) {

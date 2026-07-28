@@ -1,9 +1,9 @@
-use grim_autograd::ops::{matmul_backward, MatMulArgs};
+use grim_autograd::ops::{MatMulArgs, matmul_backward};
 use grim_backend_cpu::cpu_tensor;
 use grim_quant::{dequant_q4k, quant_q4k};
 use grim_tensor::{
-    dtype::{ArithType, DType, KQuantScheme, Storage},
     Tensor,
+    dtype::{ArithType, DType, KQuantScheme, Storage},
 };
 
 #[test]
@@ -11,7 +11,9 @@ fn test_q4k_matmul_backward_grad_a_golden_mutation_resistant() {
     // M=2, K=256, N=256
     let (m, k, n) = (2, 256, 256);
     let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
-    let b_orig: Vec<f32> = (0..k * n).map(|i| 1.0 + (i as f32 * 0.015).cos().abs() * 8.0).collect();
+    let b_orig: Vec<f32> = (0..k * n)
+        .map(|i| 1.0 + (i as f32 * 0.015).cos().abs() * 8.0)
+        .collect();
     let out_grad_data: Vec<f32> = (0..m * n).map(|i| (i as f32 * 0.02).cos()).collect();
 
     let a_tensor = cpu_tensor(a_data, grim_tensor::Shape::new(vec![m, k]));

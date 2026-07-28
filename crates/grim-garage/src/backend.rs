@@ -28,9 +28,9 @@ use std::sync::Arc;
 
 use grim_backend_cpu::CpuDevice;
 use grim_tensor::backend::BackendDevice;
-use serde::{Deserialize, Serialize};
 use grim_tensor::dtype::{DType, QuantProvenance};
 use grim_tensor::{Device, Shape, Tensor};
+use serde::{Deserialize, Serialize};
 
 /// Which backend the user asked the scheduler to prefer.
 ///
@@ -137,7 +137,7 @@ impl std::error::Error for SelectionError {}
 /// A single candidate's live-or-dead status, for surfacing to the UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendProbe {
-    pub name: &'static str,
+    pub name: String,
     /// Human-readable device kind (e.g. "rocm:0", "cpu") — `Device` itself
     /// is not serde-derivable, so we serialize the label instead.
     pub device_kind: String,
@@ -174,26 +174,26 @@ pub fn probe_all() -> Vec<BackendProbe> {
     #[cfg(not(feature = "gpu-selection"))]
     {
         out.push(BackendProbe {
-            name: "cuda",
+            name: "cuda".into(),
             device_kind: "cuda:0".into(),
             available: false,
             detail: "not compiled (enable `gpu-selection`)".into(),
         });
         out.push(BackendProbe {
-            name: "vulkan",
+            name: "vulkan".into(),
             device_kind: "vulkan".into(),
             available: false,
             detail: "not compiled (enable `gpu-selection`)".into(),
         });
         out.push(BackendProbe {
-            name: "metal",
+            name: "metal".into(),
             device_kind: "metal:0".into(),
             available: false,
             detail: "not compiled (enable `gpu-selection`)".into(),
         });
     }
     out.push(BackendProbe {
-        name: "cpu",
+        name: "cpu".into(),
         device_kind: "cpu".into(),
         available: true,
         detail: "always available (reference fallback)".into(),
@@ -204,19 +204,19 @@ pub fn probe_all() -> Vec<BackendProbe> {
 fn probe_rocm() -> BackendProbe {
     match grim_backend_rocm::RocmDevice::probe() {
         Ok(devs) if !devs.is_empty() => BackendProbe {
-            name: "rocm",
+            name: "rocm".into(),
             device_kind: "rocm:0".into(),
             available: true,
             detail: format!("{} device(s) enumerated", devs.len()),
         },
         Ok(_) => BackendProbe {
-            name: "rocm",
+            name: "rocm".into(),
             device_kind: "rocm:0".into(),
             available: false,
             detail: "no HIP devices enumerated".into(),
         },
         Err(e) => BackendProbe {
-            name: "rocm",
+            name: "rocm".into(),
             device_kind: "rocm:0".into(),
             available: false,
             detail: format!("probe error: {e}"),
@@ -228,19 +228,19 @@ fn probe_rocm() -> BackendProbe {
 fn probe_cuda() -> BackendProbe {
     match grim_backend_cuda::CudaDevice::probe() {
         Ok(devs) if !devs.is_empty() => BackendProbe {
-            name: "cuda",
+            name: "cuda".into(),
             device_kind: "cuda:0".into(),
             available: true,
             detail: format!("{} device(s) enumerated", devs.len()),
         },
         Ok(_) => BackendProbe {
-            name: "cuda",
+            name: "cuda".into(),
             device_kind: "cuda:0".into(),
             available: false,
             detail: "no CUDA devices enumerated".into(),
         },
         Err(e) => BackendProbe {
-            name: "cuda",
+            name: "cuda".into(),
             device_kind: "cuda:0".into(),
             available: false,
             detail: format!("probe error: {e}"),
@@ -252,19 +252,19 @@ fn probe_cuda() -> BackendProbe {
 fn probe_vulkan() -> BackendProbe {
     match grim_backend_vulkan::VulkanDevice::probe() {
         Ok(devs) if !devs.is_empty() => BackendProbe {
-            name: "vulkan",
+            name: "vulkan".into(),
             device_kind: "vulkan".into(),
             available: true,
             detail: format!("{} device(s) enumerated", devs.len()),
         },
         Ok(_) => BackendProbe {
-            name: "vulkan",
+            name: "vulkan".into(),
             device_kind: "vulkan".into(),
             available: false,
             detail: "no Vulkan devices enumerated".into(),
         },
         Err(e) => BackendProbe {
-            name: "vulkan",
+            name: "vulkan".into(),
             device_kind: "vulkan".into(),
             available: false,
             detail: format!("probe error: {e}"),
@@ -278,13 +278,13 @@ fn probe_metal() -> BackendProbe {
     // vec by design; we never report it as a live GPU here.
     match grim_backend_metal::MetalDevice::probe() {
         Ok(devs) if !devs.is_empty() && cfg!(target_vendor = "apple") => BackendProbe {
-            name: "metal",
+            name: "metal".into(),
             device_kind: "metal:0".into(),
             available: true,
             detail: format!("{} device(s) enumerated", devs.len()),
         },
         _ => BackendProbe {
-            name: "metal",
+            name: "metal".into(),
             device_kind: "metal:0".into(),
             available: false,
             detail: if cfg!(target_vendor = "apple") {
@@ -310,7 +310,7 @@ fn try_build(pref: &PreferredBackend) -> Option<SelectedBackend> {
             let dev = grim_backend_rocm::RocmDevice::new(0);
             Some(SelectedBackend {
                 device: Device::Rocm(0),
-                label: "rocm:0".into(),
+                label: "rocm".into(),
                 device_impl: Arc::new(dev),
             })
         }
@@ -324,7 +324,7 @@ fn try_build(pref: &PreferredBackend) -> Option<SelectedBackend> {
                 let dev = grim_backend_cuda::CudaDevice::new(0);
                 Some(SelectedBackend {
                     device: Device::Cuda(0),
-                    label: "cuda:0".into(),
+                    label: "cuda".into(),
                     device_impl: Arc::new(dev),
                 })
             }
@@ -364,7 +364,7 @@ fn try_build(pref: &PreferredBackend) -> Option<SelectedBackend> {
                 let dev = grim_backend_metal::MetalDevice::new(0);
                 Some(SelectedBackend {
                     device: Device::Metal(0),
-                    label: "metal:0".into(),
+                    label: "metal".into(),
                     device_impl: Arc::new(dev),
                 })
             }
@@ -436,11 +436,26 @@ mod tests {
 
     #[test]
     fn preferred_from_str_roundtrip() {
-        assert_eq!(PreferredBackend::from_str_opt("rocm"), PreferredBackend::Rocm);
-        assert_eq!(PreferredBackend::from_str_opt("cuda"), PreferredBackend::Cuda);
-        assert_eq!(PreferredBackend::from_str_opt("vulkan"), PreferredBackend::Vulkan);
-        assert_eq!(PreferredBackend::from_str_opt("metal"), PreferredBackend::Metal);
+        assert_eq!(
+            PreferredBackend::from_str_opt("rocm"),
+            PreferredBackend::Rocm
+        );
+        assert_eq!(
+            PreferredBackend::from_str_opt("cuda"),
+            PreferredBackend::Cuda
+        );
+        assert_eq!(
+            PreferredBackend::from_str_opt("vulkan"),
+            PreferredBackend::Vulkan
+        );
+        assert_eq!(
+            PreferredBackend::from_str_opt("metal"),
+            PreferredBackend::Metal
+        );
         assert_eq!(PreferredBackend::from_str_opt("cpu"), PreferredBackend::Cpu);
-        assert_eq!(PreferredBackend::from_str_opt("bogus"), PreferredBackend::Auto);
+        assert_eq!(
+            PreferredBackend::from_str_opt("bogus"),
+            PreferredBackend::Auto
+        );
     }
 }

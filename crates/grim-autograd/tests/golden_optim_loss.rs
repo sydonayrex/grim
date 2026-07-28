@@ -70,8 +70,7 @@ fn adamw_one_step_matches_hand_computed_reference() {
     let w0 = 2.0f32;
     let g = 1.0f32;
     let id = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
-    let mut p =
-        TrainableParam::new(id, cpu_tensor(vec![w0], Shape::new(vec![1, 1]))).unwrap();
+    let mut p = TrainableParam::new(id, cpu_tensor(vec![w0], Shape::new(vec![1, 1]))).unwrap();
     p.accumulate_grad(&cpu_tensor(vec![g], Shape::new(vec![1, 1])))
         .unwrap();
 
@@ -121,8 +120,16 @@ fn adamw_one_step_matches_hand_computed_reference() {
     let got_w2 = params.get(id).unwrap().data.to_vec_f32().unwrap()[0];
     close(got_w2, want_w2, "adamw w2 (step_count=2 bias correction)");
     assert_eq!(opt.step_count, 2);
-    close(opt.m.get(&id).unwrap().to_cpu_vec_f32().unwrap()[0], m2, "adamw m2");
-    close(opt.v.get(&id).unwrap().to_cpu_vec_f32().unwrap()[0], v2, "adamw v2");
+    close(
+        opt.m.get(&id).unwrap().to_cpu_vec_f32().unwrap()[0],
+        m2,
+        "adamw m2",
+    );
+    close(
+        opt.v.get(&id).unwrap().to_cpu_vec_f32().unwrap()[0],
+        v2,
+        "adamw v2",
+    );
 }
 
 /// A mutant that drops the bias-correction (e.g. `m_hat = m` without dividing
@@ -205,10 +212,7 @@ fn cross_entropy_known_odds_loss_and_grad_reduce_by_batch() {
 fn cross_entropy_batch_mean_divides_loss_and_grad_by_batch() {
     // Two samples, each half of the uniform -1/+1 case: total raw loss = 2*ln2,
     // averaged = ln2; all grads scale by 1/N = 0.5 → (-0.25, 0.25) per row.
-    let logits = cpu_tensor(
-        vec![0.0f32, 0.0, 0.0, 0.0],
-        Shape::new(vec![2, 2]),
-    );
+    let logits = cpu_tensor(vec![0.0f32, 0.0, 0.0, 0.0], Shape::new(vec![2, 2]));
     let (loss, grad) = cross_entropy_loss(&logits, &[0, 1]).unwrap();
     close(loss, (2.0f32).ln(), "ce batch mean loss");
     let g = grad.to_vec_f32().unwrap();
@@ -227,10 +231,7 @@ fn cross_entropy_logsumexp_stability_huge_logits_no_nan() {
     // grad = (p - onehot) ≈ (1 - 1) = 0. The point: every value is finite, no
     // NaN, and the dominant class's grad is ≈ 0 (not -1 — it would be -1 only
     // if the target were the *minority* class).
-    let logits = cpu_tensor(
-        vec![1e9f32, -1e9, 0.0, 5e8, -5e8],
-        Shape::new(vec![1, 5]),
-    );
+    let logits = cpu_tensor(vec![1e9f32, -1e9, 0.0, 5e8, -5e8], Shape::new(vec![1, 5]));
     let (loss, grad) = cross_entropy_loss(&logits, &[0]).unwrap();
     assert!(loss.is_finite(), "ce huge logits loss finite");
     // Cross-entropy is non-negative by definition (it's -ln p_target). A
@@ -238,7 +239,10 @@ fn cross_entropy_logsumexp_stability_huge_logits_no_nan() {
     // from the loss, producing a hugely *negative* value that still passes a
     // bare `loss < 1e-3` check — so we must also lower-bound the loss at 0.
     assert!(loss >= 0.0, "ce loss must be non-negative: {loss}");
-    assert!(loss < 1e-3, "ce huge logits with target=max-class loss ≈ 0: {loss}");
+    assert!(
+        loss < 1e-3,
+        "ce huge logits with target=max-class loss ≈ 0: {loss}"
+    );
     let g = grad.to_vec_f32().unwrap();
     assert_eq!(g.len(), 5);
     for &gi in &g {
@@ -295,7 +299,11 @@ fn dpo_unsymmetric_deltas_matches_hand_formula() {
     close(c_r[0], beta * 2.0, "dpo chosen reward");
     close(r_r[0], beta * (-2.0), "dpo rejected reward");
     // And the loss's logits consistency via the reward diff:
-    close(c_r[0] - r_r[0], logits, "dpo logits = chosen_r - rejected_r");
+    close(
+        c_r[0] - r_r[0],
+        logits,
+        "dpo logits = chosen_r - rejected_r",
+    );
 }
 
 #[test]

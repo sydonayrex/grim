@@ -35,7 +35,7 @@ use serde_json::json;
 
 use crate::discovery::{DatasetEntry, ModelEntry, default_datasets_dir, default_models_dir};
 use crate::jobs::{JobId, JobRegistry, TrainingJob, TrainingMode};
-use crate::rocm::{RocmDeviceInfo, probe_rocm_devices};
+use crate::rocm::probe_rocm_devices;
 use grim_engine::{Engine, model_loader};
 use grim_format::GgufTokenizer;
 use grim_tensor::BackendDevice;
@@ -75,6 +75,10 @@ pub struct StartTrainingRequest {
     pub rocm_fusion_rmsnorm_matmul: bool,
     #[serde(default)]
     pub rocm_fusion_qkv_attention: bool,
+    /// Backend the user selected ("rocm", "cuda", "vulkan", "metal", "cpu",
+    /// or "auto"). Drives the grim-garage backend selection chain.
+    #[serde(default)]
+    pub preferred_backend: Option<String>,
 }
 
 fn default_rank() -> u32 {
@@ -104,8 +108,10 @@ pub struct DatasetsResponse {
 }
 
 #[derive(Debug, Serialize)]
-pub struct RocmDevicesResponse {
-    pub devices: Vec<RocmDeviceInfo>,
+pub struct BackendProbeResponse {
+    pub backends: Vec<crate::backend::BackendProbe>,
+    /// The backend a job with no explicit preference would select.
+    pub selected: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -213,6 +219,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/convert", post(convert_model_route))
         .route("/api/datasets", get(get_datasets))
         .route("/api/rocm/devices", get(get_rocm_devices))
+        .route("/api/backends", get(list_backends))
         .route("/api/train/jobs", get(list_jobs))
         .route("/api/train/start", post(start_training))
         .route("/api/train/status/{id}", get(get_job_status))
@@ -261,9 +268,32 @@ async fn get_datasets() -> Json<DatasetsResponse> {
     }
 }
 
-async fn get_rocm_devices() -> Json<RocmDevicesResponse> {
-    Json(RocmDevicesResponse {
-        devices: probe_rocm_devices(),
+async fn get_rocm_devices() -> Json<BackendProbeResponse> {
+    Json(BackendProbeResponse {
+        backends: probe_rocm_devices()
+            .into_iter()
+            .map(|d| crate::backend::BackendProbe {
+                name: "rocm".into(),
+                device_kind: format!("rocm:{}", d.ordinal),
+                available: d.is_rocm_compliant,
+                detail: format!(
+                    "{} / {} / {} CU(s) / {} VRAM",
+                    d.name, d.vendor, d.compute_units, d.vram_bytes
+                ),
+            })
+            .collect(),
+        selected: crate::backend::select_backend(None).label,
+    })
+}
+
+/// Probe every compute backend in the selection chain (ROCm → CUDA →
+/// Vulkan → Metal → CPU) and report which are actually live on this host.
+/// Drives the "select GPU" panel in the UI.
+async fn list_backends() -> Json<BackendProbeResponse> {
+    Json(BackendProbeResponse {
+        backends: crate::backend::probe_all(),
+        // What a job with no explicit preference would land on.
+        selected: crate::backend::select_backend(None).label,
     })
 }
 
@@ -348,6 +378,7 @@ async fn start_training(
         epochs: req.epochs,
         rocm_fusion_rmsnorm_matmul: req.rocm_fusion_rmsnorm_matmul,
         rocm_fusion_qkv_attention: req.rocm_fusion_qkv_attention,
+        preferred_backend: req.preferred_backend.clone(),
         status: crate::jobs::JobStatus::Pending,
         metrics: Vec::new(),
         cancel: tokio_util::sync::CancellationToken::new(),

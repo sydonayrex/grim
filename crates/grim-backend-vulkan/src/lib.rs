@@ -109,6 +109,25 @@ pub const VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO: u32 = 3;
 pub const VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: u32 = 12;
 pub const VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO: u32 = 5;
 
+// Physical device types. Used to reject software rasterizers (lavapipe /
+// swiftshader) so they are never reported as a live GPU tier.
+pub const VK_PHYSICAL_DEVICE_TYPE_OTHER: u32 = 0;
+pub const VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: u32 = 1;
+pub const VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: u32 = 2;
+pub const VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: u32 = 3;
+pub const VK_PHYSICAL_DEVICE_TYPE_CPU: u32 = 4;
+
+#[repr(C)]
+pub struct VkPhysicalDeviceProperties {
+    pub api_version: u32,
+    pub driver_version: u32,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub device_type: u32,
+    pub device_name: [u8; 256],
+    // Remaining fields intentionally omitted; we only read device_type.
+}
+
 pub const VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO: u32 = 39;
 pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO: u32 = 40;
 pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: u32 = 42;
@@ -359,6 +378,10 @@ unsafe extern "C" {
         pQueueFamilyPropertyCount: *mut u32,
         pQueueFamilyProperties: *mut VkQueueFamilyProperties,
     );
+    fn vkGetPhysicalDeviceProperties(
+        physicalDevice: *mut c_void,
+        pProperties: *mut VkPhysicalDeviceProperties,
+    );
     fn vkGetDeviceQueue(
         device: *mut c_void,
         queueFamilyIndex: u32,
@@ -501,11 +524,12 @@ unsafe impl Sync for VulkanContext {}
 
 impl VulkanContext {
     fn init() -> Result<Self> {
-        if std::env::var("ENABLE_PRIMUS_LAYER").is_err() {
-            unsafe {
-                std::env::set_var("ENABLE_PRIMUS_LAYER", "1");
-            }
-        }
+        // NOTE: Do NOT force `ENABLE_PRIMUS_LAYER` here. The Primus/Bumblebee
+        // layer only helps dual-GPU Optimus laptops and *requires* an X
+        // display; forcing it on headless / GPU-direct hosts breaks loader
+        // initialization ("Can't open bumblebee display"). The Vulkan loader
+        // resolves the native ICD without it, so we leave the environment
+        // untouched and let the loader pick the default.
         let instance_ci = VkInstanceCreateInfo {
             s_type: VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
             p_next: std::ptr::null(),
@@ -537,6 +561,25 @@ impl VulkanContext {
             vkEnumeratePhysicalDevices(instance, &mut gpu_count, gpus.as_mut_ptr());
         }
         let physical_device = gpus[0];
+
+        // Reject software rasterizers (lavapipe / swiftshader / llvmpipe). On a
+        // host that already has real ROCm + CUDA GPUs there is no reason to run
+        // a headless/CPU Vulkan tier; and §3 forbids reporting a fake GPU.
+        let mut props = VkPhysicalDeviceProperties {
+            api_version: 0,
+            driver_version: 0,
+            vendor_id: 0,
+            device_id: 0,
+            device_type: 0,
+            device_name: [0u8; 256],
+        };
+        unsafe { vkGetPhysicalDeviceProperties(physical_device, &mut props) };
+        if props.device_type == VK_PHYSICAL_DEVICE_TYPE_CPU {
+            unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+            return Err(Error::Backend(
+                "Vulkan physical device is a software rasterizer (CPU); refusing to use it as a GPU tier".into(),
+            ));
+        }
 
         // Find compute queue family index
         let mut qfam_count: u32 = 0;

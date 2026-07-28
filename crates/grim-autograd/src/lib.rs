@@ -34,25 +34,33 @@
 //! Backward for this exact op set is implemented; nothing more. Cross-entropy
 //! loss backward arrives with WI-T5 (it slots in as one more op).
 
+pub mod adamw;
+pub mod backward;
 pub mod injection;
+pub mod loss;
 pub mod ops;
 pub mod param;
-pub mod tape;
-pub mod backward;
-pub mod registry;
-pub mod adamw;
-pub mod loss;
 pub mod preference_loss;
+pub mod registry;
+pub mod tape;
 
-pub use injection::{LoRAInjectionPoint, LoRAInjectionConfig, InjectionConfig, LoRAInjectionRegistry};
-pub use ops::{MatMulArgs, AddArgs, ScaleArgs, matmul_backward, add_backward, scale_backward, lora_backward, apply_and_record_lora};
-pub use param::{ParamId, TrainableParam, TrainableParams};
-pub use tape::{Tape, TapeEntry, TensorId, TapeKind};
-pub use backward::{backward, BackwardContext};
-pub use registry::AutogradRegistry;
 pub use adamw::{AdamW, AdamWConfig};
+pub use backward::{BackwardContext, backward};
+pub use injection::{
+    InjectionConfig, LoRAInjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry,
+};
 pub use loss::cross_entropy_loss;
-pub use preference_loss::{dpo_loss, orpo_odds_ratio_loss, grpo_normalize_rewards, dpo_loss_autograd, orpo_odds_ratio_loss_autograd, grpo_loss_autograd};
+pub use ops::{
+    AddArgs, MatMulArgs, ScaleArgs, add_backward, apply_and_record_lora, lora_backward,
+    matmul_backward, scale_backward,
+};
+pub use param::{ParamId, TrainableParam, TrainableParams};
+pub use preference_loss::{
+    dpo_loss, dpo_loss_autograd, grpo_loss_autograd, grpo_normalize_rewards, orpo_odds_ratio_loss,
+    orpo_odds_ratio_loss_autograd,
+};
+pub use registry::AutogradRegistry;
+pub use tape::{Tape, TapeEntry, TapeKind, TensorId};
 
 use grim_tensor::{BackendDevice, Device, Tensor};
 
@@ -67,6 +75,10 @@ pub fn pick_device_for_tensor(x: &Tensor) -> Box<dyn BackendDevice> {
         Device::Cuda(ordinal) => Box::new(grim_backend_cuda::CudaDevice::new(*ordinal)),
         #[cfg(feature = "rocm-mem")]
         Device::Rocm(ordinal) => Box::new(grim_backend_rocm::RocmDevice::new(*ordinal)),
+        #[cfg(feature = "vulkan-mem")]
+        Device::Vulkan => Box::new(grim_backend_vulkan::VulkanDevice::new()),
+        #[cfg(feature = "metal-mem")]
+        Device::Metal(ordinal) => Box::new(grim_backend_metal::MetalDevice::new(*ordinal)),
         _ => Box::new(grim_backend_cpu::CpuDevice::new()),
     }
 }
