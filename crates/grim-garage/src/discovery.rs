@@ -117,13 +117,17 @@ fn scan_dir_recursive(dir: &Path, out: &mut Vec<ModelEntry>, is_convertible_only
     if !dir.exists() {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else { return; };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
             scan_dir_recursive(&path, out, is_convertible_only);
         } else if path.is_file() {
-            let Some(filename) = path.file_name().and_then(|n| n.to_str()) else { continue; };
+            let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
             if is_convertible_only {
                 if let Some(fmt) = classify_convertible_format(filename) {
                     let path_str = path.to_string_lossy().to_string();
@@ -146,10 +150,14 @@ fn scan_dir_recursive(dir: &Path, out: &mut Vec<ModelEntry>, is_convertible_only
 
 fn is_default_dir(dir: &Path) -> bool {
     let local = Path::new("./models");
-    if dir == local { return true; }
+    if dir == local {
+        return true;
+    }
     if let Some(home) = std::env::var_os("HOME") {
         let grim_home = PathBuf::from(home).join(".grim").join("models");
-        if dir == grim_home { return true; }
+        if dir == grim_home {
+            return true;
+        }
     }
     false
 }

@@ -11,9 +11,9 @@ use grim_garage::ui_state::display::DisplayState;
 use grim_garage::view_model::ViewModel;
 use grim_garage::view_model::hyperparam::HyperparamFormV1;
 use grim_garage::view_model::job_card::JobCardV1;
+use grim_garage::view_model::layout::AppShellLayout;
 use grim_garage::view_model::rocm_panel::RocmTogglesV1;
 use grim_garage::view_model::training_panel::TrainingPanelV1;
-use grim_garage::view_model::layout::AppShellLayout;
 
 #[test]
 fn viewmodel_default_state_renders_empty_lists_and_zero_devices() {
@@ -54,8 +54,12 @@ fn hyperparam_form_clamps_lora_rank_to_set() {
     let mut form = HyperparamFormV1::default();
     form.lora_rank = 99; // not in {8,16,32,64}
     let cleaned = form.normalized();
-    assert!(cleaned.lora_rank == 8 || cleaned.lora_rank == 16
-            || cleaned.lora_rank == 32 || cleaned.lora_rank == 64);
+    assert!(
+        cleaned.lora_rank == 8
+            || cleaned.lora_rank == 16
+            || cleaned.lora_rank == 32
+            || cleaned.lora_rank == 64
+    );
 }
 
 #[test]
@@ -163,8 +167,8 @@ fn display_state_set_jobs_prunes_stale_jobs_and_metrics() {
     // per-id; otherwise completed/failed jobs the backend pruned (e.g.
     // memory cap) linger in the UI's history forever. `set_jobs` also
     // prunes `live_metrics` for removed ids to keep memory bounded.
-    use std::collections::HashMap;
     use grim_garage::UiJob;
+    use std::collections::HashMap;
 
     let mut s = DisplayState::new();
 
@@ -215,12 +219,23 @@ fn display_state_set_jobs_prunes_stale_jobs_and_metrics() {
 // ----- helpers -----
 
 fn model(id: &str) -> grim_garage::ModelEntry {
-    grim_garage::ModelEntry::new(id, &format!("/tmp/{id}"),
-                                 if id.ends_with(".grim") { "grim" } else { "gguf" },
-                                 id.ends_with(".grim"))
+    grim_garage::ModelEntry::new(
+        id,
+        &format!("/tmp/{id}"),
+        if id.ends_with(".grim") {
+            "grim"
+        } else {
+            "gguf"
+        },
+        id.ends_with(".grim"),
+    )
 }
 
 fn dataset(id: &str) -> grim_garage::DatasetEntry {
-    grim_garage::DatasetEntry { id: id.into(), path: format!("/tmp/{id}"),
-                                  format: "jsonl".into(), size_bytes: 1024 }
+    grim_garage::DatasetEntry {
+        id: id.into(),
+        path: format!("/tmp/{id}"),
+        format: "jsonl".into(),
+        size_bytes: 1024,
+    }
 }

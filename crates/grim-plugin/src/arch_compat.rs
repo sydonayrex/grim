@@ -132,16 +132,28 @@ impl ArchCompatSpec {
     ///
     /// Checks forward mapping (`hf -> gguf`) and reverse mapping (`gguf -> hf`). If a match
     /// is found, returns the translated tensor name; otherwise returns the input name unchanged.
+    ///
+    /// The reverse lookup is deterministic: when multiple HF names map to the same GGUF name,
+    /// the HF standard naming (with `model.` prefix) is preferred over internal loader
+    /// canonical names.
     pub fn remap_tensor_name(&self, name: &str) -> String {
         if let Some(mapped) = self.tensor_name_mapping.get(name) {
             return mapped.clone();
         }
-        for (hf_name, gguf_name) in &self.tensor_name_mapping {
-            if gguf_name == name {
-                return hf_name.clone();
-            }
+        // Reverse lookup: prefer HF standard naming (with `model.` prefix)
+        // over internal loader canonical names for deterministic results.
+        if let Some(hf_name) = self.tensor_name_mapping
+            .iter()
+            .find(|(hf, gguf)| gguf == &name && hf.starts_with("model."))
+            .map(|(hf, _)| hf)
+        {
+            return hf_name.clone();
         }
-        name.to_string()
+        self.tensor_name_mapping
+            .iter()
+            .find(|(_, gguf)| gguf == &name)
+            .map(|(hf, _)| hf.clone())
+            .unwrap_or_else(|| name.to_string())
     }
 }
 

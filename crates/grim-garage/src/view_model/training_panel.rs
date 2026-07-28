@@ -82,7 +82,6 @@ impl TrainingPanelV1 {
             help_text,
         }
     }
-
 }
 
 #[cfg(test)]
@@ -122,7 +121,7 @@ mod tests {
     #[test]
     fn reinforcement_learning_panels_exist_and_hide_quant_picker() {
         let mut form = HyperparamFormV1::default();
-        
+
         form.training_mode = "GRPO".into();
         let p_grpo = TrainingPanelV1::from_form(&form);
         assert!(!p_grpo.show_quant_format_picker);
@@ -191,4 +190,3 @@ mod tests {
         assert!(!p.show_quant_format_picker);
     }
 }
-

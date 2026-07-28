@@ -49,7 +49,9 @@ pub struct GarageClient {
 
 impl GarageClient {
     pub fn new(base_url: impl Into<String>) -> Self {
-        Self { base_url: base_url.into() }
+        Self {
+            base_url: base_url.into(),
+        }
     }
 
     pub fn base_url(&self) -> &str {
@@ -81,8 +83,7 @@ impl GarageClient {
     /// `GET /api/train/jobs`.
     pub async fn get_jobs(&self) -> Result<Vec<JobSummaryDto>, String> {
         let body = self.get_json("/api/train/jobs").await?;
-        let env: JobsEnvelope =
-            serde_json::from_str(&body).map_err(|e| e.to_string())?;
+        let env: JobsEnvelope = serde_json::from_str(&body).map_err(|e| e.to_string())?;
         Ok(env.jobs)
     }
 
@@ -118,7 +119,10 @@ impl GarageClient {
         stream.flush().await.map_err(|e| e.to_string())?;
 
         let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).await.map_err(|e| e.to_string())?;
+        stream
+            .read_to_end(&mut raw)
+            .await
+            .map_err(|e| e.to_string())?;
 
         let head_end = raw
             .windows(4)

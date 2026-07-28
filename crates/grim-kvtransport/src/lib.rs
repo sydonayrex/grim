@@ -435,4 +435,20 @@ mod tests {
         assert_eq!(ret_k, vec![1.0; 8]);
         assert_eq!(ret_v, vec![2.0; 8]);
     }
+
+    #[test]
+    fn test_network_kv_client_various_sizes() {
+        let client = NetworkKvClient::new("10.0.0.1".to_string());
+
+        for &size in &[1usize, 16, 64, 1024] {
+            let k = vec![0.5f32; size];
+            let v = vec![0.25f32; size];
+            assert!(client.send_block_remote(42, &k, &v, "10.0.0.2").is_ok());
+            let (ret_k, ret_v) = client.fetch_block_remote(42, "10.0.0.2", size).unwrap();
+            assert_eq!(ret_k.len(), size, "returned k length should match requested size");
+            assert_eq!(ret_v.len(), size, "returned v length should match requested size");
+            assert!(ret_k.iter().all(|&x| x == 1.0), "k should be filled with 1.0");
+            assert!(ret_v.iter().all(|&x| x == 2.0), "v should be filled with 2.0");
+        }
+    }
 }

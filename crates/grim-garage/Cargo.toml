@@ -16,7 +16,10 @@ grim-tensor = { workspace = true }
 grim-backend-cpu = { workspace = true }
 grim-tensor-graph = { workspace = true }
 grim-backend-rocm = { workspace = true }
-grim-autograd = { workspace = true }
+grim-backend-cuda = { workspace = true, optional = true }
+grim-backend-vulkan = { workspace = true, optional = true }
+grim-backend-metal = { workspace = true, optional = true }
+grim-autograd = { workspace = true, features = ["rocm-mem"] }
 grim-engine = { workspace = true }
 grim-core = { workspace = true }
 grim-models-transformer = { workspace = true }
@@ -45,3 +48,9 @@ tower-http = { version = "0.6", features = ["fs"] }
 
 [features]
 default = []
+# Enables the CUDA, Vulkan, and Metal device backends in the selection
+# chain. ROCm + CPU are always available (ROCm is grim's primary GPU
+# target and the worker needs a real device to run on). Metal is
+# Apple-only: off-linux it compiles but its device is CPU-backed, so it
+# is never *selected* as a live GPU here (see backend.rs).
+gpu-selection = ["dep:grim-backend-cuda", "dep:grim-backend-vulkan", "dep:grim-backend-metal", "grim-autograd/cuda-mem", "grim-autograd/metal-mem"]

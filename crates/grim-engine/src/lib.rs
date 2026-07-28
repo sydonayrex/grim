@@ -981,18 +981,18 @@ mod tests {
         metadata.insert("llama.attention.layer_norm_eps".to_string(), GgufValue::String("0.00001".to_string()));
 
         let tensor_specs = vec![
-            ("tok_embeddings.weight", vec![32, 256]),
-            ("norm.weight", vec![32]),
+            ("token_embd.weight", vec![32, 256]),
+            ("output_norm.weight", vec![32]),
             ("output.weight", vec![32, 256]),
-            ("layers.0.attn_norm.weight", vec![32]),
-            ("layers.0.attn.wq.weight", vec![32, 32]),
-            ("layers.0.attn.wk.weight", vec![32, 16]),
-            ("layers.0.attn.wv.weight", vec![32, 16]),
-            ("layers.0.attn.wo.weight", vec![32, 32]),
-            ("layers.0.ffn_norm.weight", vec![32]),
-            ("layers.0.ffn.w_gate.weight", vec![32, 64]),
-            ("layers.0.ffn.w_down.weight", vec![64, 32]),
-            ("layers.0.ffn.w_up.weight", vec![32, 64]),
+            ("blk.0.attn_norm.weight", vec![32]),
+            ("blk.0.attn_q.weight", vec![32, 32]),
+            ("blk.0.attn_k.weight", vec![32, 16]),
+            ("blk.0.attn_v.weight", vec![32, 16]),
+            ("blk.0.attn_output.weight", vec![32, 32]),
+            ("blk.0.ffn_norm.weight", vec![32]),
+            ("blk.0.ffn_gate.weight", vec![32, 64]),
+            ("blk.0.ffn_down.weight", vec![64, 32]),
+            ("blk.0.ffn_up.weight", vec![32, 64]),
         ];
 
         let mut buf = Vec::new();
@@ -1022,8 +1022,8 @@ mod tests {
             for &d in dims {
                 buf.write_all(&(d as u64).to_le_bytes()).unwrap();
             }
-            buf.write_all(&6u32.to_le_bytes()).unwrap(); // F32 dtype
-            
+            buf.write_all(&0u32.to_le_bytes()).unwrap(); // F32 dtype (tag 0)
+
             let offset = payload.len() as u64;
             buf.write_all(&offset.to_le_bytes()).unwrap();
 
