@@ -160,10 +160,7 @@ pub fn merge_fetch(state: &mut DisplayState, fetched: PollFetch) -> Result<(), P
 /// four sequential network awaits; the background `Poller` loop instead
 /// uses [`poll_fetch`] + [`merge_fetch`] so the UI read path is not
 /// blocked on a stalled backend.
-pub async fn poll_once(
-    client: &GarageClient,
-    state: &mut DisplayState,
-) -> Result<(), PollError> {
+pub async fn poll_once(client: &GarageClient, state: &mut DisplayState) -> Result<(), PollError> {
     let fetched = poll_fetch(client).await;
     merge_fetch(state, fetched)
 }

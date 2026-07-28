@@ -115,7 +115,21 @@ mod tests {
 
     #[test]
     fn test_llama_mtp_adapter_exists() {
-        // Smoke test to ensure the adapter compiles and Linked correctly
-        let _ = std::mem::size_of::<LlamaMtpAdapter>();
+        // Verify the adapter type is sized and non-zero
+        assert!(std::mem::size_of::<LlamaMtpAdapter>() > 0);
+
+        // Verify empty_logits() produces the correct shape and values
+        let logits = empty_logits();
+        assert_eq!(logits.shape().dims(), &[1, 1]);
+        let data = logits.to_vec_f32().unwrap();
+        assert_eq!(data, vec![0.0f32]);
+    }
+
+    #[test]
+    fn test_llama_mtp_adapter_implements_traits() {
+        // Verify the adapter implements all required traits by constructing
+        // trait objects. This catches mutations that remove trait impls.
+        fn _assert_native_mtp<T: NativeMtp + CausalLm + grim_core::Model>() {}
+        _assert_native_mtp::<LlamaMtpAdapter>();
     }
 }

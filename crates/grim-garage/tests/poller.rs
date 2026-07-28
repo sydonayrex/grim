@@ -16,7 +16,7 @@ use std::time::Duration;
 use grim_garage::routes;
 use grim_garage::ui_state::display::DisplayState;
 use grim_garage::ui_state::http_client::GarageClient;
-use grim_garage::ui_state::poller::{poll_once, Poller};
+use grim_garage::ui_state::poller::{Poller, poll_once};
 
 async fn spawn_combined_router() -> SocketAddr {
     // Bind to OS-assigned port; return once listener is up.
@@ -196,7 +196,10 @@ async fn http_post(url: &str, body: &str) -> Result<RawResponse, String> {
 
     let mut raw = Vec::new();
     use tokio::io::AsyncReadExt;
-    stream.read_to_end(&mut raw).await.map_err(|e| e.to_string())?;
+    stream
+        .read_to_end(&mut raw)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let head_end = raw
         .windows(4)
@@ -223,11 +226,11 @@ struct RawResponse {
 }
 
 fn url_host(url: &str) -> &str {
-    let after_scheme = url.trim_start_matches("http://").trim_start_matches("https://");
+    let after_scheme = url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
     let host_port_path = after_scheme;
-    let host_port_end = host_port_path
-        .find('/')
-        .unwrap_or(host_port_path.len());
+    let host_port_end = host_port_path.find('/').unwrap_or(host_port_path.len());
     &host_port_path[..host_port_end]
 }
 
@@ -236,7 +239,9 @@ fn url_host_port(url: &str) -> &str {
 }
 
 fn url_path(url: &str) -> &str {
-    let after_scheme = url.trim_start_matches("http://").trim_start_matches("https://");
+    let after_scheme = url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
     let slash = after_scheme.find('/');
     match slash {
         Some(s) => &after_scheme[s..],

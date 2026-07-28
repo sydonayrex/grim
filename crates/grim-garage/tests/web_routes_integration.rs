@@ -71,7 +71,9 @@ async fn test_chat_endpoint_fails_when_model_path_does_not_exist() {
                 .method("POST")
                 .uri("/api/chat")
                 .header("content-type", "application/json")
-                .body(axum::body::Body::from(serde_json::to_vec(&payload).unwrap()))
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&payload).unwrap(),
+                ))
                 .unwrap(),
         )
         .await

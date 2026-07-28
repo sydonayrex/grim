@@ -309,7 +309,11 @@ mod tests {
         );
         // QLoRA + rank == 32 (== QLORA_MAX_RANK) is OK.
         let rank_32 = LoraRank::from_valid(32).unwrap();
-        assert!(rank_32.validate_for_mode(crate::jobs::TrainingMode::QLoRA).is_ok());
+        assert!(
+            rank_32
+                .validate_for_mode(crate::jobs::TrainingMode::QLoRA)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -317,8 +321,14 @@ mod tests {
         // Same 64-rank value must work under Lora / Bf16-Full since
         // only QLoRA has the floor memory constraint.
         let rank = LoraRank::new(64).unwrap();
-        assert!(rank.validate_for_mode(crate::jobs::TrainingMode::Lora).is_ok());
-        assert!(rank.validate_for_mode(crate::jobs::TrainingMode::Bf16Full).is_ok());
+        assert!(
+            rank.validate_for_mode(crate::jobs::TrainingMode::Lora)
+                .is_ok()
+        );
+        assert!(
+            rank.validate_for_mode(crate::jobs::TrainingMode::Bf16Full)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -383,8 +393,13 @@ mod tests {
         // Pin each value to its expected nearest tier. A reflective
         // insult that picks a different neighbor is caught:
         let cases: &[(u32, u32)] = &[
-            (4, 8), (9, 8), (11, 8),
-            (13, 16), (25, 32), (36, 32), (56, 64),
+            (4, 8),
+            (9, 8),
+            (11, 8),
+            (13, 16),
+            (25, 32),
+            (36, 32),
+            (56, 64),
         ];
         for &(value, want) in cases {
             let got = LoraRank::new(value).expect("valid rank").value();

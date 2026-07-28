@@ -36,7 +36,7 @@ impl RocmTogglesV1 {
     pub fn default_for(state: &DisplayState) -> Self {
         Self::default_for_with_devices(
             state.rocm_devices(),
-            true, // rmsnorm_matmul defaults on
+            true,  // rmsnorm_matmul defaults on
             false, // qkv_attention defaults off
         )
     }
@@ -99,11 +99,13 @@ impl RocmTogglesV1 {
 fn summarise_one(d: &RocmDeviceInfo) -> String {
     let arch = arch_label(d.ordinal, &d.gcn_arch, d.wavefront_size);
     let vram_gb = d.vram_bytes / (1024 * 1024 * 1024);
-    format!("{arch} (ordinal {ord}, {wf}-wide, {vram} GiB VRAM)",
-            arch = arch,
-            ord = d.ordinal,
-            wf = d.wavefront_size,
-            vram = vram_gb)
+    format!(
+        "{arch} (ordinal {ord}, {wf}-wide, {vram} GiB VRAM)",
+        arch = arch,
+        ord = d.ordinal,
+        wf = d.wavefront_size,
+        vram = vram_gb
+    )
 }
 
 fn arch_label(ordinal: u32, gcn_arch: &str, wavefront_size: u32) -> String {
