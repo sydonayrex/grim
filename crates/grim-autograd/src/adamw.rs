@@ -238,6 +238,7 @@ fn bytes_to_f32_vec(bytes: &[u8]) -> Result<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::injection::LoRAInjectionPoint;
     use crate::param::{ParamId, TrainableParam};
     use grim_backend_cpu::cpu_tensor;
     use grim_tensor::{BackendDevice, Shape};
@@ -247,7 +248,7 @@ mod tests {
         let mut opt = AdamW::new(AdamWConfig::default());
         let mut params = TrainableParams::new();
 
-        let id = ParamId::a(0, 1);
+        let id = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
         let mut p = TrainableParam::new(id, cpu_tensor(vec![1.0, 2.0], Shape::new(vec![2, 1]))).unwrap();
         p.accumulate_grad(&cpu_tensor(vec![0.1, 0.2], Shape::new(vec![2, 1]))).unwrap();
         params.insert(p);
@@ -270,7 +271,7 @@ mod tests {
         let mut opt = AdamW::new(AdamWConfig::default());
         let mut params = TrainableParams::new();
 
-        let id = ParamId::a(0, 1);
+        let id = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
         let mut p = TrainableParam::new(id, cpu_tensor(vec![3.0, 4.0], Shape::new(vec![2, 1]))).unwrap();
         p.accumulate_grad(&cpu_tensor(vec![0.5, 0.5], Shape::new(vec![2, 1]))).unwrap();
         params.insert(p);
@@ -293,7 +294,7 @@ mod tests {
     #[test]
     fn test_fused_device_adamw_golden_mutation_resistant() {
         let mut params = TrainableParams::new();
-        let id = ParamId { layer_idx: 0, adapter_id: 1, is_a: true };
+        let id = ParamId { layer_idx: 0, adapter_id: 1, point: LoRAInjectionPoint::QProj, is_a: true };
         let dev = grim_backend_cpu::CpuDevice::new();
         let initial_data = vec![1.0f32, 2.0f32, 3.0f32];
         let shape = Shape::new(vec![3]);

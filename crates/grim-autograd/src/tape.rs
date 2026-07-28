@@ -245,6 +245,7 @@ impl Tape {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::injection::LoRAInjectionPoint;
     use grim_backend_cpu::cpu_tensor;
     use grim_tensor::Shape;
 
@@ -288,8 +289,8 @@ mod tests {
         let mut tape = Tape::new();
         let base = tape.register(t(vec![1.0, 2.0], vec![1, 2]));
         let x = tape.register(t(vec![0.5, 0.5], vec![1, 2]));
-        let a_param = ParamId::a(0, 1);
-        let b_param = ParamId::b(0, 1);
+        let a_param = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
+        let b_param = ParamId::b(0, 1, LoRAInjectionPoint::QProj);
         let a = tape.register_param(a_param, t(vec![0.1, 0.1], vec![1, 2]));
         let b = tape.register_param(b_param, t(vec![0.2, 0.3], vec![2, 1]));
         let _out = tape.record_lora_apply(

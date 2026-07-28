@@ -55,7 +55,7 @@ fn test_jay_mxfp4_gpu_gemm_golden_mutation_resistant() -> TestResult {
             arith: ArithType::F32,
             storage: Storage::FloatPack(FloatPackScheme::MxFp4),
         };
-        let b_dev = BackendDevice::from_cpu(&dev, &b_dequant, &b_shape, mxfp4_dtype)?;
+        let b_dev = BackendDevice::from_cpu_bytes(&dev, &b_codes, &b_shape, mxfp4_dtype)?;
 
         let (out, handle) = dev.quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &[], &out_shape)?;
         handle.synchronize()?;

@@ -9,6 +9,12 @@
 use std::path::PathBuf;
 use grim_tensor::error::{Error, Result};
 
+/// Escape a Windows command-line argument by wrapping in double quotes
+/// and doubling any internal double quotes (per Windows quoting rules).
+fn escape_windows_arg(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
 /// Default service name when the caller supplies none. Every platform
 /// manager carries its own resolved `name` field — there is a single
 /// source of truth per manager instance, never a `const` mixed with a
@@ -545,9 +551,9 @@ impl ServiceManager for WindowsScmManager {
         setup_tls_and_config(cfg)?;
         let unit_name = format!("Grim {}", self.name);
         let bin_path = format!(
-            "\"{}\" service run --config \"{}\"",
-            cfg.exec_path.display(),
-            cfg.config_path.display()
+            "{} service run --config {}",
+            escape_windows_arg(&cfg.exec_path.display().to_string()),
+            escape_windows_arg(&cfg.config_path.display().to_string())
         );
         let status = std::process::Command::new("sc")
             .args([

@@ -54,7 +54,7 @@ fn test_raven_fp8_gpu_gemm_golden_mutation_resistant() -> TestResult {
             arith: ArithType::F32,
             storage: Storage::Block(BlockDtype::Fp8),
         };
-        let b_dev = BackendDevice::from_cpu(&dev, &b_dequant, &b_shape, fp8_dtype)?;
+        let b_dev = BackendDevice::from_cpu_bytes(&dev, &fp8_bytes, &b_shape, fp8_dtype)?;
 
         let (out, handle) = dev.quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &[], &out_shape)?;
         handle.synchronize()?;

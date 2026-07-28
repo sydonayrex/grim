@@ -4,15 +4,11 @@ use grim_core::error::Result;
 use grim_core::model::CausalLm;
 use grim_core::session::Inner as SessionInner;
 use grim_core::sampler::{SamplingParams, Sampler};
-use grim_core::architecture::{ModelArchitecture, TensorNamingRegistry};
-use grim_engine::{Engine, EngineConfig, model_loader::{load_model_from_grim, load_model_from_safetensors}};
-use grim_format::tprov::RemappingTensorProvider;
-use grim_models_transformer::{Llama, LlamaConfig, Lfm2, Lfm2Config, Gpt2, Gpt2Config, Gemma, GemmaConfig, DeepSeek, DeepSeekConfig, T5, T5Config};
-use grim_models_mamba::{Rwkv, RwkvConfig};
-use grim_models_vision::{Bert, BertConfig};
+use grim_engine::{Engine, EngineConfig, model_loader::{load_model_from_gguf, load_model_from_grim, load_model_from_safetensors}};
+use grim_models_transformer::{Lfm2Config, LlamaConfig};
+use grim_tensor::Device;
 use std::sync::Arc;
 use grim_tensor::BackendDevice;
-use grim_tensor::Device;
 use grim_backend_cpu;
 #[cfg(feature = "rocm")]
 use grim_backend_rocm;
@@ -261,16 +257,28 @@ pub async fn cmd_run(
     let mut tokens: Vec<u32> = if let Some(tok) = &tokenizer {
         let mut ids = Vec::new();
 
-        // Prepend BOS token for models that expect it (e.g. <|startoftext|> for LFM2).
-        let bos_candidates = ["<|startoftext|>", "<s>", "<|im_start|>"];
-        for bos in &bos_candidates {
-            if let Some(&id) = tok.token_to_id.get(*bos) {
-                ids.push(id);
-                break;
+        // If the tokenizer carries a Jinja chat template, render the
+        // single-turn prompt through it for instruction-tuned models.
+        // Otherwise fall back to raw prompt + best-effort BOS.
+        let prompt_text = if tok.chat_template.is_some() {
+            let messages = vec![grim_format::ChatMessage {
+                role: "user".to_string(),
+                content: prompt.clone(),
+            }];
+            grim_format::render_messages_or_last(tok, &messages)
+        } else {
+            // Prepend BOS token for models that expect it (e.g. <|startoftext|> for LFM2).
+            let bos_candidates = ["<|startoftext|>", "<s>", "<|im_start|>"];
+            for bos in &bos_candidates {
+                if let Some(&id) = tok.token_to_id.get(*bos) {
+                    ids.push(id);
+                    break;
+                }
             }
-        }
+            prompt.clone()
+        };
 
-        ids.extend(tok.encode(&prompt));
+        ids.extend(tok.encode(&prompt_text));
         eprintln!("[grim] Encoded prompt: {} tokens: {:?}", ids.len(), ids);
         let decoded: Vec<&str> = ids.iter()
             .filter_map(|&id| tok.tokens.get(id as usize).map(|s| s.as_str()))
@@ -281,13 +289,16 @@ pub async fn cmd_run(
         prompt.bytes().map(|b| b as u32 % 512).collect()
     };
 
-    // Determine vocab size
+    // Determine vocab size — fall back to tokenizer vocab length if model
+    // config type is unknown (GPT2, Gemma, DeepSeek, etc.)
     let vocab = if let Some(cfg) = model.config().as_any().downcast_ref::<LlamaConfig>() {
         cfg.vocab_size
     } else if let Some(cfg) = model.config().as_any().downcast_ref::<grim_models_mamba::MambaConfig>() {
         cfg.vocab_size
     } else if let Some(cfg) = model.config().as_any().downcast_ref::<Lfm2Config>() {
         cfg.vocab_size
+    } else if let Some(tok) = &tokenizer {
+        tok.tokens.len() as u32
     } else {
         512
     };
@@ -304,6 +315,7 @@ pub async fn cmd_run(
     let mut generated = 0;
     let mut history: Vec<u32> = Vec::new();
     let mut first_pass = true;
+    let mut generated_tokens: Vec<u32> = Vec::new();
 
     // Generation loop
     while generated < max_tokens {
@@ -323,35 +335,7 @@ pub async fn cmd_run(
         let shape = grim_tensor::Shape::new(vec![n_tokens]);
         let float_tokens = input_ids;
         let dtype = grim_tensor::dtype::DType::F32;
-        let storage: Arc<dyn grim_tensor::BackendStorage> = match device {
-            grim_tensor::Device::Cpu => {
-                let dev = grim_backend_cpu::CpuDevice::new();
-                Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
-            }
-            grim_tensor::Device::Cuda(ordinal) => {
-                let dev = grim_backend_cuda::CudaDevice::new(ordinal);
-                Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
-            }
-            grim_tensor::Device::Rocm(ordinal) => {
-                let dev = grim_backend_rocm::RocmDevice::new(ordinal);
-                Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
-            }
-            grim_tensor::Device::Vulkan => {
-                let dev = grim_backend_vulkan::VulkanDevice::new();
-                Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
-            }
-            grim_tensor::Device::Metal(ordinal) => {
-                let dev = grim_backend_metal::MetalDevice::try_new(ordinal)?;
-                Arc::from(dev.from_cpu(&float_tokens, &shape, dtype.clone())?)
-            }
-        };
-        let input_tensor = grim_tensor::Tensor::new(
-            storage,
-            shape,
-            dtype,
-            grim_tensor::dtype::QuantProvenance::default(),
-            device.clone(),
-        );
+        let input_tensor = build_tensor(&float_tokens, &shape, &device)?;
 
         // Forward pass
         // CRIT-1: Need to pass proper positions tensor, not the same as input_ids
@@ -361,35 +345,7 @@ pub async fn cmd_run(
             vec![n_tokens as f32 - 1.0]
         };
         let pos_shape = grim_tensor::Shape::new(vec![positions.len()]);
-        let pos_storage: Arc<dyn grim_tensor::BackendStorage> = match device {
-            grim_tensor::Device::Cpu => {
-                let dev = grim_backend_cpu::CpuDevice::new();
-                Arc::from(dev.from_cpu(&positions, &pos_shape, grim_tensor::dtype::DType::F32)?)
-            }
-            grim_tensor::Device::Cuda(ordinal) => {
-                let dev = grim_backend_cuda::CudaDevice::new(ordinal);
-                Arc::from(dev.from_cpu(&positions, &pos_shape, grim_tensor::dtype::DType::F32)?)
-            }
-            grim_tensor::Device::Rocm(ordinal) => {
-                let dev = grim_backend_rocm::RocmDevice::new(ordinal);
-                Arc::from(dev.from_cpu(&positions, &pos_shape, grim_tensor::dtype::DType::F32)?)
-            }
-            grim_tensor::Device::Vulkan => {
-                let dev = grim_backend_vulkan::VulkanDevice::new();
-                Arc::from(dev.from_cpu(&positions, &pos_shape, grim_tensor::dtype::DType::F32)?)
-            }
-            grim_tensor::Device::Metal(ordinal) => {
-                let dev = grim_backend_metal::MetalDevice::try_new(ordinal)?;
-                Arc::from(dev.from_cpu(&positions, &pos_shape, grim_tensor::dtype::DType::F32)?)
-            }
-        };
-        let positions_tensor = grim_tensor::Tensor::new(
-            pos_storage,
-            pos_shape,
-            grim_tensor::dtype::DType::F32,
-            grim_tensor::dtype::QuantProvenance::default(),
-            device.clone(),
-        );
+        let positions_tensor = build_tensor(&positions, &pos_shape, &device)?;
         
         let logits = CausalLm::forward(&*model, &mut session, &input_tensor, &positions_tensor, &[])?;
         
@@ -404,48 +360,14 @@ pub async fn cmd_run(
         // `sampler.sample(&logits, &history)` sees logits for the wrong slot
         // and returns a non-final-position argmax.
         let last_shape = grim_tensor::Shape::new(vec![vocab]);
-        let last_storage: Arc<dyn grim_tensor::BackendStorage> = match device {
-            grim_tensor::Device::Cpu => {
-                let dev = grim_backend_cpu::CpuDevice::new();
-                Arc::from(dev.from_cpu(last_logits, &last_shape, grim_tensor::dtype::DType::F32)?)
-            }
-            grim_tensor::Device::Cuda(ordinal) => {
-                let dev = grim_backend_cuda::CudaDevice::new(ordinal);
-                Arc::from(dev.from_cpu(last_logits, &last_shape, grim_tensor::dtype::DType::F32)?)
-            }
-            grim_tensor::Device::Rocm(ordinal) => {
-                let dev = grim_backend_rocm::RocmDevice::new(ordinal);
-                Arc::from(dev.from_cpu(last_logits, &last_shape, grim_tensor::dtype::DType::F32)?)
-            }
-            grim_tensor::Device::Vulkan => {
-                let dev = grim_backend_vulkan::VulkanDevice::new();
-                Arc::from(dev.from_cpu(last_logits, &last_shape, grim_tensor::dtype::DType::F32)?)
-            }
-            grim_tensor::Device::Metal(ordinal) => {
-                let dev = grim_backend_metal::MetalDevice::try_new(ordinal)?;
-                Arc::from(dev.from_cpu(last_logits, &last_shape, grim_tensor::dtype::DType::F32)?)
-            }
-        };
-        let last_logits_tensor = grim_tensor::Tensor::new(
-            last_storage,
-            last_shape,
-            grim_tensor::dtype::DType::F32,
-            grim_tensor::dtype::QuantProvenance::default(),
-            device.clone(),
-        );
+        let last_logits_tensor = build_tensor(last_logits, &last_shape, &device)?;
 
         // Sample next token from the *last-position* logits, not the full tensor.
         let next_token = sampler.sample(&last_logits_tensor, &history)?;
         
-        // Decode and print token
-        if let Some(tok) = &tokenizer {
-            let token_text = tok.decode(&[next_token]);
-            print!("{}", token_text);
-            std::io::stdout().flush().unwrap();
-        } else {
-            print!("{} ", next_token);
-            std::io::stdout().flush().unwrap();
-        }
+        // Accumulate generated tokens; decode full sequence at end for
+        // correct BPE/SentencePiece boundary handling.
+        generated_tokens.push(next_token);
 
         // Update state
         tokens.push(next_token);
@@ -463,229 +385,19 @@ pub async fn cmd_run(
         }
     }
 
+    // Decode all generated tokens together for correct BPE/SentencePiece
+    // boundary handling (single-token decode can produce incomplete output).
+    if let Some(tok) = &tokenizer {
+        let text = tok.decode(&generated_tokens);
+        print!("{}", text);
+        std::io::stdout().flush().unwrap();
+    } else {
+        for t in &generated_tokens {
+            print!("{} ", t);
+        }
+        std::io::stdout().flush().unwrap();
+    }
+
     println!("\n[grim] Done. Generated {} tokens.", generated);
     Ok(())
-}
-
-/// Load a model from a GGUF file.
-pub fn load_model_from_gguf(path: &str, device: Device) -> Result<Box<dyn CausalLm>> {
-    use grim_format::GgufProvider;
-    use grim_nn::WeightSource;
-
-    let provider = GgufProvider::open(path)?;
-
-    // Extract architecture from GGUF metadata
-    let arch = provider
-        .architecture()
-        .ok_or_else(|| grim_tensor::Error::Backend(
-            format!("GGUF file '{}' has no 'general.architecture' metadata; cannot determine model family", path)
-        ))?;
-
-    let get_meta = |key: &str| -> Option<String> {
-        let v = provider.metadata(key)?;
-        if let Some(s) = v.as_str() { return Some(s.to_string()); }
-        if let Some(u) = v.as_u32() { return Some(u.to_string()); }
-        if let Some(f) = v.as_f32() { return Some(f.to_string()); }
-        None
-    };
-    let get_meta_u32 = |key: &str, default: u32| -> u32 {
-        if let Some(v) = provider.metadata(key) {
-            if let Some(u) = v.as_u32() { return u; }
-            if let Some(s) = v.as_str() { if let Ok(u) = s.parse() { return u; } }
-        }
-        get_meta(key).and_then(|s| s.parse().ok()).unwrap_or(default)
-    };
-
-    let vocab_size = get_meta("tokenizer.ggml.vocab_size")
-        .or_else(|| get_meta(&format!("{}.vocab_size", arch)))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(32000);
-
-    let hidden_size = get_meta_u32(&format!("{}.embedding_length", arch), 4096) as usize;
-    let num_layers = get_meta_u32(&format!("{}.block_count", arch), 32) as usize;
-    let rms_norm_eps = get_meta(&format!("{}.attention.layer_norm_eps", arch))
-        .or_else(|| get_meta(&format!("{}.attention.layernorm_rms_eps", arch)))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1e-5_f32);
-
-    eprintln!(
-        "[grim] GGUF config: architecture={}, layers={}, hidden={}, vocab={}",
-        arch, num_layers, hidden_size, vocab_size
-    );
-
-    // Wrap the GGUF provider with a name-remapping layer so models whose
-    // tensors use alternative HF-style names (tok_embeddings, layers.N.attn.wq,
-    // etc.) resolve through the canonical GGUF names the loaders expect.
-    let model_arch = ModelArchitecture::from_str(arch);
-    let hf_gguf_map = TensorNamingRegistry::remap_hf_to_gguf(model_arch, num_layers);
-    let remapped = RemappingTensorProvider::new(&provider, {
-        let map = hf_gguf_map.clone();
-        move |name| map.get(name).map(|s| s.clone()).unwrap_or_else(|| name.to_string())
-    });
-    let ws = WeightSource::root(&remapped, device.clone());
-
-
-    if arch.contains("mamba") {
-        let d_state = get_meta_u32(&format!("{}.ssm.state_size", arch), 16) as usize;
-        let d_inner = get_meta_u32(&format!("{}.ssm.inner_size", arch), (hidden_size * 2) as u32) as usize;
-        let d_conv = get_meta_u32(&format!("{}.ssm.conv_kernel", arch), 4) as usize;
-        let cfg = grim_models_mamba::MambaConfig {
-            vocab_size,
-            hidden_size,
-            d_state,
-            d_inner,
-            d_conv,
-            num_layers,
-            conv_kernel: d_conv,
-            rms_norm_eps,
-        };
-        let m = grim_models_mamba::Mamba::load(Device::Cpu, &ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("lfm2") {
-        // Determine layer types from per-layer head_count_kv (canonical LFM2 schema).
-        // A layer with head_count_kv == 0 is a recurrent shortconv layer; otherwise it is
-        // a full attention layer. llama.cpp reads this from `<arch>.attention.head_count_kv`
-        // which is stored (in GGUF v3) as an ARRAY of length = block_count.
-        let mut head_count_kv_vec: Vec<u32> = Vec::with_capacity(num_layers);
-        if let Some(arr_val) = provider.metadata("lfm2.attention.head_count_kv").and_then(|v| v.as_array()) {
-            for v in arr_val.iter().take(num_layers) {
-                let n = v.as_u32().unwrap_or_else(|| {
-                    if let Some(s) = v.as_str() { s.parse().unwrap_or(0) } else { 0 }
-                });
-                head_count_kv_vec.push(n);
-            }
-        }
-        // Fallback per-index keys (`block_count_kv.0`, etc.) — fill gaps with 0 (recurrent).
-        for i in 0..num_layers {
-            if i < head_count_kv_vec.len() { continue; }
-            let key = format!("lfm2.attention.head_count_kv.{i}");
-            let n = if let Some(val) = provider.metadata(&key) {
-                val.as_u32().unwrap_or(0)
-            } else { 0 };
-            if (i + 1) > head_count_kv_vec.len() {
-                head_count_kv_vec.resize(i + 1, 0);
-            }
-            head_count_kv_vec[i] = n;
-        }
-        // If array shorter than num_layers, extend with 0 (recurrent default).
-        head_count_kv_vec.resize(num_layers, 0);
-        // is_recr[k] == true means shortconv (recurrent) layer.
-        let is_recr: Vec<bool> = head_count_kv_vec.iter().map(|&n| n == 0).collect();
-        // shortconv kernel size is fixed at 3 in canonical LFM2 (conv.weight shape = [3, n_embd]).
-        let n_shortconv_l_cache = 3usize;
-        let num_heads = get_meta_u32("lfm2.attention.head_count", 16) as usize;
-        let num_kv_heads = head_count_kv_vec.iter().find(|&&n| n > 0).copied().unwrap_or(8) as usize;
-        let head_dim = get_meta_u32("lfm2.attention.key_length", 64) as usize;
-        let intermediate_size = get_meta_u32("lfm2.feed_forward_length", 4608) as usize;
-        let rope_theta = provider.metadata("lfm2.rope.freq_base")
-            .and_then(|v| v.as_f32())
-            .unwrap_or(1000000.0f32);
-        let cfg = Lfm2Config {
-            vocab_size,
-            hidden_size,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            num_layers,
-            intermediate_size,
-            rms_norm_eps,
-            rope_theta,
-            n_shortconv_l_cache,
-            is_recr: is_recr.clone(),
-        };
-        let m = Lfm2::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("gpt2") {
-        let cfg = Gpt2Config {
-            vocab_size,
-            hidden_size,
-            num_heads: get_meta_u32(&format!("{}.attention.head_count", arch), 12) as usize,
-            num_layers,
-            intermediate_size: get_meta_u32(&format!("{}.intermediate_size", arch), (hidden_size * 4) as u32) as usize,
-            layer_norm_epsilon: get_meta(&format!("{}.attention.layer_norm_epsilon", arch))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1e-5_f32),
-            max_seq_len: get_meta_u32(&format!("{}.context_length", arch), 1024) as usize,
-        };
-        let m = Gpt2::load(device.clone(), &ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("gemma") {
-        let cfg = GemmaConfig {
-            vocab_size,
-            hidden_size,
-            num_heads: get_meta_u32(&format!("{}.attention.head_count", arch), 8) as usize,
-            num_kv_heads: get_meta_u32(&format!("{}.attention.head_count_kv", arch), 8) as usize,
-            head_dim: get_meta_u32(&format!("{}.attention.key_length", arch), 256) as usize,
-            num_layers,
-            intermediate_size: get_meta_u32(&format!("{}.intermediate_size", arch), 16384) as usize,
-            rms_norm_eps,
-        };
-        let m = Gemma::load(device.clone(), &ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("deepseek") {
-        let cfg = DeepSeekConfig {
-            vocab_size,
-            hidden_size,
-            num_heads: get_meta_u32(&format!("{}.attention.head_count", arch), 128) as usize,
-            num_layers,
-            intermediate_size: get_meta_u32(&format!("{}.intermediate_size", arch), 7168) as usize,
-            rms_norm_eps,
-            q_lora_rank: get_meta_u32(&format!("{}.attention.q_lora_rank", arch), 128) as usize,
-            kv_lora_rank: get_meta_u32(&format!("{}.attention.kv_lora_rank", arch), 512) as usize,
-        };
-        let m = DeepSeek::load(device.clone(), &ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("bert") {
-        let cfg = BertConfig {
-            vocab_size,
-            hidden_size,
-            num_heads: get_meta_u32(&format!("{}.attention.head_count", arch), 12) as usize,
-            num_layers,
-            intermediate_size: get_meta_u32(&format!("{}.intermediate_size", arch), (hidden_size * 4) as u32) as usize,
-            max_seq_len: get_meta_u32(&format!("{}.context_length", arch), 512) as usize,
-        };
-        let m = Bert::load(Device::Cpu, &ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("t5") {
-        let cfg = T5Config {
-            vocab_size,
-            hidden_size,
-            num_heads: get_meta_u32(&format!("{}.attention.head_count", arch), 8) as usize,
-            num_layers,
-            intermediate_size: get_meta_u32(&format!("{}.intermediate_size", arch), (hidden_size * 4) as u32) as usize,
-            rms_norm_eps,
-        };
-        let m = T5::load(&ws, cfg)?;
-        Ok(Box::new(m))
-    } else if arch.contains("rwkv") {
-        let cfg = RwkvConfig {
-            vocab_size,
-            hidden_size,
-            num_layers,
-        };
-        let m = Rwkv::load(&ws, cfg, device.clone())?;
-        Ok(Box::new(m))
-    } else {
-        let intermediate_size = get_meta_u32(&format!("{}.feed_forward_length", arch), 11008) as usize;
-        let num_heads = get_meta_u32(&format!("{}.attention.head_count", arch), 32) as usize;
-        let num_kv_heads = get_meta_u32(&format!("{}.attention.head_count_kv", arch), num_heads as u32) as usize;
-        let head_dim = get_meta_u32(&format!("{}.attention.key_length", arch), 128) as usize;
-        let rope_theta = get_meta(&format!("{}.rope.freq_base", arch))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10000.0_f32);
-        let cfg = LlamaConfig {
-            vocab_size,
-            hidden_size,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            num_layers,
-            intermediate_size,
-            rms_norm_eps,
-            rope_theta,
-            max_seq_len: 2048,
-        };
-        let m = Llama::load(device, &ws, cfg)?;
-        Ok(Box::new(m))
-    }
 }
