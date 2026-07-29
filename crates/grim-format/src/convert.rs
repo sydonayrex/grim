@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Seek, Write};
 
 use grim_tensor::error::{Error, Result};
+use grim_quant::evopress_search;
 use crate::gguf::{
     read_gguf, read_tensor_bytes, GgufValue, GrimFusionOp, GrimRocmlProfile, GGUF_MAGIC,
     GGUF_VERSION,
@@ -265,9 +266,45 @@ pub fn convert_to_grim(
         println!("  Target format: {}", tf);
     }
 
+    // If EvoPress generations are requested but no pre-computed bitwidths
+    // were provided, run the evolutionary search against the source tensors.
+    let evopress_bitwidths = if generations > 0 && evopress_bitwidths.is_none() {
+        let provider = crate::tprov::GgufProvider::open(input_path)
+            .map_err(|e| Error::Backend(format!("failed to open GGUF for EvoPress: {e}")))?;
+        let tensor_names: Vec<String> = provider.tensors().keys().cloned().collect();
+        let mut tensor_data: Vec<(String, Vec<f32>, usize, usize)> = Vec::with_capacity(tensor_names.len());
+        for name in &tensor_names {
+            let raw = provider.get(name)?;
+            let meta = provider.meta(name)?;
+            let rows = meta.shape.get(0).copied().unwrap_or(1);
+            let cols = meta.shape.get(1).copied().unwrap_or(1);
+            // Use the raw f32 values if available, otherwise dequantize
+            let data: Vec<f32> = match &raw.dtype.storage {
+                grim_tensor::dtype::Storage::Native => raw.bytes.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+                _ => grim_quant::dequant_q80(&raw.bytes, rows * cols).unwrap_or_default(),
+            };
+            tensor_data.push((name.clone(), data, rows, cols));
+        }
+        let importance_scores = grim_quant::compute_importance_scores(&tensor_data);
+        let tensor_sizes: Vec<usize> = tensor_data.iter()
+            .map(|(_, _, r, c)| r * c)
+            .collect();
+        let config = grim_quant::EvoPressConfig {
+            generations,
+            target_bpw,
+            ..grim_quant::EvoPressConfig::default()
+        };
+        let genes = evopress_search(&config, &importance_scores, &tensor_sizes);
+        Some(genes)
+    } else {
+        evopress_bitwidths
+    };
+
     let profile = gcn_to_profile(target_gcn);
 
-    let entries = build_entries_from_source(input_path, target_bpw, evopress_bitwidths.clone())?;
+    let (entries, ext_entries) = build_entries_from_source(input_path, target_bpw, evopress_bitwidths.clone())?;
     let mut metadata = match caller_metadata {
         Some(m) => m,
         None => build_grim_metadata(target_gcn, profile, target_bpw, evopress_bitwidths.is_some()),
@@ -294,6 +331,11 @@ pub fn convert_to_grim(
     }
     if metadata.lds_size.is_none() {
         metadata.lds_size = Some(profile.lds_size());
+    }
+    // SpQR salient indices/values from pack_tensors — wire into
+    // metadata.ext_entries so the sidecar round-trips correctly.
+    if !ext_entries.is_empty() {
+        metadata.ext_entries = ext_entries;
     }
     if metadata.quant_method.is_none() {
         metadata.quant_method = Some(if evopress_bitwidths.is_some() {
@@ -366,7 +408,7 @@ fn build_entries_from_source(
     input_path: &str,
     target_bpw: f32,
     evopress_bitwidths: Option<Vec<u32>>,
-) -> Result<Vec<(crate::format::GrimTensorEntry, Vec<u8>)>> {
+) -> Result<(Vec<(crate::format::GrimTensorEntry, Vec<u8>)>, Vec<crate::spec::GrimTensorExt>)> {
     let lower = input_path.to_ascii_lowercase();
     if lower.ends_with(".gguf") || lower.ends_with(".grim") {
         let provider = crate::tprov::GgufProvider::open(input_path)?;
@@ -384,13 +426,17 @@ fn build_entries_from_source(
 }
 
 /// Pack tensors from a provider into registry entries + normals payloads.
+///
+/// Also returns per-tensor `GrimTensorExt` entries containing SpQR
+/// salient indices/values so the caller can populate `metadata.ext_entries`.
 fn pack_tensors(
     provider: &dyn grim_tensor::provider::TensorProvider,
     names: &[String],
     target_bpw: f32,
     evopress_bitwidths: Option<Vec<u32>>,
-) -> Result<Vec<(crate::format::GrimTensorEntry, Vec<u8>)>> {
+) -> Result<(Vec<(crate::format::GrimTensorEntry, Vec<u8>)>, Vec<crate::spec::GrimTensorExt>)> {
     let mut result = Vec::with_capacity(names.len());
+    let mut ext_entries = Vec::with_capacity(names.len());
     for (i, name) in names.iter().enumerate() {
         let raw = provider.get(name)?;
         let meta = provider.meta(name)?;
@@ -398,15 +444,15 @@ fn pack_tensors(
             println!("[WARN] Re-quantizing external QAT tensor '{}' may lead to accuracy loss.", name);
         }
         let elem_count: usize = raw.shape.iter().product();
-        
+
         // Determine bitwidth for this tensor: use EvoPress bitwidth if available, otherwise fall back to target_bpw
         let tensor_bitwidth = if let Some(ref bitwidths) = evopress_bitwidths {
             bitwidths.get(i).copied().unwrap_or_else(|| target_bpw.round() as u32) as u8
         } else {
             target_bpw.round() as u8
         };
-        
-        // Dequantize raw bytes to f32 values first
+
+        // Dequantize raw bytes to f32 values first — needed for SpQR sidecar
         let f32_values = match raw.dtype.storage {
             grim_tensor::dtype::Storage::Native => {
                 // Already FP32 - just use as-is
@@ -533,9 +579,32 @@ fn pack_tensors(
             outlier_offset: 0,
             ..Default::default()
         };
+        // Compute SpQR salient residuals for this tensor (P5 Task 5.1).
+        // Identify top-K weights by curvature magnitude so the
+        // training sidecar can store/restore them separately.
+        let spqr_ext = {
+            let mut ext = crate::spec::GrimTensorExt {
+                tensor_name: name.clone(),
+                block_size: 0, // not block-quantized
+                ..Default::default()
+            };
+            // Use weight magnitude as curvature proxy for SpQR selection.
+            let threshold_multiplier = 1.0;
+            if let Ok(spqr) = grim_quant::spqr_identify_salient(
+                &f32_values,
+                &f32_values, // curvature proxy: weight magnitude
+                threshold_multiplier,
+            ) {
+                ext.spqr_indices = spqr.indices;
+                ext.spqr_values = spqr.values;
+            }
+            ext
+        };
+        ext_entries.push(spqr_ext);
+
         result.push((entry, normals));
     }
-    Ok(result)
+    Ok((result, ext_entries))
 }
 
 /// Map a GCN architecture string to a ROCm profile.
