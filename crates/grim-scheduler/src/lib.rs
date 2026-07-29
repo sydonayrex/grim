@@ -149,6 +149,8 @@ pub struct SchedulerOutput {
     pub prefill_ids: Vec<u64>,
     pub decode_ids: Vec<u64>,
     pub preempted_ids: Vec<u64>,
+    /// Grouping of running sequence IDs by primary LoRA adapter ID (0 = base model) for fused batched LoRA kernel dispatch.
+    pub adapter_batches: std::collections::HashMap<u32, Vec<u64>>,
 }
 
 impl SchedulerOutput {
@@ -283,15 +285,13 @@ if remaining_tokens > 0 {
         }
 
         // 3. Batched LoRA sub-batching grouping (§4.5 requirements)
-        // Group running sequences by hypothetical adapter properties to optimize fused kernel pipelines
+        // Group running sequences by actual adapter properties to optimize fused kernel pipelines
         let mut adapter_batches: std::collections::HashMap<u32, Vec<u64>> = std::collections::HashMap::new();
         for r in &self.running {
-            let mock_adapter_id = (r.id % 2) as u32; // Alternating mock adapter IDs
-            adapter_batches.entry(mock_adapter_id).or_default().push(r.id);
+            let primary_adapter = r.adapter_ids.first().copied().unwrap_or(0);
+            adapter_batches.entry(primary_adapter).or_default().push(r.id);
         }
-        if !adapter_batches.is_empty() {
-            println!("[Scheduler] Batched adapter sub-batches: {:?}", adapter_batches);
-        }
+        output.adapter_batches = adapter_batches;
 
         output
     }
@@ -585,5 +585,41 @@ mod tests {
         // Total active tokens (120) > max (100) -> lowest priority (id=2) preempted
         assert_eq!(out.preempted_ids, vec![2]);
         assert_eq!(sched.swapped[0].id, 2);
+    }
+
+    #[test]
+    fn test_schedule_adapter_batches_grouping() {
+        let ctrl = AdmissionController::new(1000, 1000);
+        let mut sched = Scheduler::new(4096, 8, ctrl);
+
+        sched.running.push(Request {
+            id: 10,
+            prompt_tokens: 10,
+            adapter_ids: vec![101],
+            ..Default::default()
+        });
+        sched.running.push(Request {
+            id: 20,
+            prompt_tokens: 10,
+            adapter_ids: vec![101],
+            ..Default::default()
+        });
+        sched.running.push(Request {
+            id: 30,
+            prompt_tokens: 10,
+            adapter_ids: vec![202],
+            ..Default::default()
+        });
+        sched.running.push(Request {
+            id: 40,
+            prompt_tokens: 10,
+            adapter_ids: Vec::new(),
+            ..Default::default()
+        });
+
+        let out = sched.schedule();
+        assert_eq!(out.adapter_batches.get(&101), Some(&vec![10, 20]));
+        assert_eq!(out.adapter_batches.get(&202), Some(&vec![30]));
+        assert_eq!(out.adapter_batches.get(&0), Some(&vec![40]));
     }
 }
