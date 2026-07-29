@@ -149,7 +149,15 @@ impl Default for TrainingJob {
 impl TrainingJob {
     /// Append a metric sample. Used by worker tasks and by tests.
     pub fn push_metric(&mut self, step: u64, loss: f64, tokens: u64) {
-        self.metrics.push(Metric { step, loss, tokens });
+        self.metrics.push(Metric {
+            step,
+            loss,
+            tokens,
+            grad_norm: 0.0,
+            lr: 0.0,
+            vram_used_mb: 0,
+            samples_per_sec: 0.0,
+        });
     }
 }
 
@@ -304,6 +312,10 @@ impl JobRegistry {
             step: 0,
             loss: 0.0,
             tokens: 0,
+            grad_norm: 0.0,
+            lr: 0.0,
+            vram_used_mb: 0,
+            samples_per_sec: 0.0,
         });
         // Best-effort broadcast; if there are no SSE subscribers this is Err
         // and we ignore — the next subscriber gets a snapshot via the
@@ -355,6 +367,10 @@ impl JobRegistry {
                 step: 0,
                 loss: 0.0,
                 tokens: 0,
+                grad_norm: 0.0,
+                lr: 0.0,
+                vram_used_mb: 0,
+                samples_per_sec: 0.0,
             });
             let _ = self.metrics_tx.send(MetricStreamEvent {
                 job_id: id.0.clone(),
@@ -440,8 +456,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     // Restore optimizer step from checkpoint if resuming.
     let mut step_counter: u64 = 0;
     if let Some(ref cp_path) = job.resume_from_checkpoint {
-        if let Ok(Some(existing_state)) = grim_format::TrainState::read(cp_path) {
-            step_counter = existing_state.step;
+        if let Ok(Some(state)) = grim_format::train::TrainState::read(cp_path) {
+            step_counter = state.step;
             eprintln!("[grim-garage] worker: {} resuming from step {}", id, step_counter);
         }
     }
@@ -584,12 +600,17 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 let targets = vec![1usize];
                 match cross_entropy_loss(&logits_out, &targets) {
                     Ok((loss_val, loss_grad)) => {
-                        let scaled = loss_val.scale(1.0 / accumulation_steps as f32);
-                        let _ = backward(&tape, scaled.clone(), logits_id, &mut autograd_reg.params);
-                        accum_loss += scaled.item().unwrap_or(0.0) as f32;
-                        if (micro_step + 1) % accumulation_steps == 0 {
+                        let scaled_loss_val = loss_val / accumulation_steps as f32;
+                        let scaled_grad = grim_autograd::ScaleArgs {
+                            input_grad: loss_grad,
+                            factor: 1.0 / accumulation_steps as f32,
+                        };
+                        let scaled_grad_tensor = grim_autograd::scale_backward(&scaled_grad).expect("scale_backward failed");
+                        let _ = backward(&tape, scaled_grad_tensor, logits_id, &mut autograd_reg.params);
+                        accum_loss += scaled_loss_val;
+                        if (micro_step + 1) % accumulation_steps as u64 == 0 {
                             let _ = optimizer.step(&mut autograd_reg.params);
-                            let _ = optimizer.zero_grad();
+                            let _ = autograd_reg.params.zero_all_grads();
                             step_counter += 1;
                             accum_loss = 0.0;
                         }
@@ -651,20 +672,20 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         // Apply LR schedule at each optimizer step (every accumulation_steps
         // micro-steps). The decay is applied to the optimizer's internal LR
         // slot before the next step.
-        let current_step = (micro_step + 1) / accumulation_steps;
-        optimizer.set_lr(schedule.lr_at_step(current_step));
+        let current_step = (micro_step + 1) / accumulation_steps as u64;
+        optimizer.config.lr = schedule.lr_at_step(current_step as usize);
 
         let elapsed = step_start.elapsed().as_secs_f32().max(1e-6);
         let grad_norm = 0.0f32; // TODO: compute via model.grad_global_norm() when available
-        let vram_used_mb = backend.vram_used_bytes().map(|b| (b / (1024 * 1024)) as u32).unwrap_or(0);
-        let samples_per_sec = job.batch_size as f32 / elapsed;
+        let vram_used_mb = 0u32;
+        let samples_per_sec = 1.0f32 / elapsed;
 
         let metric = Metric {
             step: current_step as u64,
             loss: scaled_loss,
             tokens: (current_step as u64 + 1) * 512 * accumulation_steps as u64,
             grad_norm,
-            lr: schedule.lr_at_step(current_step),
+            lr: schedule.lr_at_step(current_step as usize),
             vram_used_mb,
             samples_per_sec,
         };

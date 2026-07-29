@@ -13,6 +13,7 @@
 use grim_tensor::error::{Error, Result};
 
 pub mod spqr;
+
 pub use spqr::{spqr_identify_salient, SpqrSalientResidual};
 
 pub const BLOCK_SIZE_Q8: usize = 32;
@@ -2744,25 +2745,24 @@ pub fn apply_smoothquant_scale(
             out_channels,
             "calibration_acts.len() must equal out_channels"
         );
-        acts.to_vec()
+        acts.iter().map(|&a| 1.0 / a.max(1e-8)).collect()
     } else {
         let mut max_vals = vec![0.0f32; out_channels];
-        for c in 0..out_channels {
-            for r in 0..in_channels {
-                let val = weights[r * out_channels + c].abs();
-                if val > max_vals[c] {
-                    max_vals[c] = val;
+        for o in 0..out_channels {
+            for i in 0..in_channels {
+                let val = weights[o * in_channels + i].abs();
+                if val > max_vals[o] {
+                    max_vals[o] = val;
                 }
             }
         }
-        // Invert: channels with larger max get smaller scale
         for v in &mut max_vals {
             *v = 1.0 / (*v).max(1e-8);
         }
         max_vals
     };
 
-    // Normalize so max scale = 1.0 (prevent weight inflation)
+    // Normalize so max scale = 1.0
     let max_s = scales.iter().cloned().fold(0.0f32, f32::max);
     if max_s > 0.0 {
         for s in &mut scales {
@@ -2770,14 +2770,14 @@ pub fn apply_smoothquant_scale(
         }
     }
 
-    // Apply: W'[r,c] = W[r,c] * scale[c]
-    for c in 0..out_channels {
-        let s = scales[c];
+    // Apply: W'[o,i] = W[o,i] * scale[o]
+    for o in 0..out_channels {
+        let s = scales[o];
         if (s - 1.0).abs() < 1e-6 {
-            continue; // identity column — skip
+            continue; // identity channel — skip
         }
-        for r in 0..in_channels {
-            weights[r * out_channels + c] *= s;
+        for i in 0..in_channels {
+            weights[o * in_channels + i] *= s;
         }
     }
 
