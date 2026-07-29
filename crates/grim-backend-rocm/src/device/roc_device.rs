@@ -2612,9 +2612,149 @@ impl BackendDevice for RocmDevice {
 
 	        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
 	    }
-	}
-	
-	// `GemmTileConfig`, `lookup_gemm_config`, `lookup_solution_index` moved
+    fn selective_scan(
+        &self,
+        x: &dyn BackendStorage,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        c: &dyn BackendStorage,
+        d: &dyn BackendStorage,
+        batch: usize,
+        dim_dstate: usize,
+        dim_dinner: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = as_rocm(x)?;
+        let a_s = as_rocm(a)?;
+        let b_s = as_rocm(b)?;
+        let c_s = as_rocm(c)?;
+        let d_s = as_rocm(d)?;
+        let out_storage = RocmStorage::alloc_gpu(
+            out_shape,
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_selective_scan(
+            x_s, a_s, b_s, c_s, d_s, &out_storage,
+            batch, dim_dstate, dim_dinner, seq_len,
+        )?;
+        Ok((Box::new(out_storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
+    }
+
+    fn flash_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        causal: bool,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_s = as_rocm(q)?;
+        let k_s = as_rocm(k)?;
+        let v_s = as_rocm(v)?;
+        let out_storage = RocmStorage::alloc_gpu(
+            out_shape,
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_flash_attention(
+            q_s, k_s, v_s, &out_storage,
+            num_heads, num_kv_heads, head_dim, seq_len, causal,
+        )?;
+        Ok((Box::new(out_storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
+    }
+
+    fn cross_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        kv_seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_s = as_rocm(q)?;
+        let k_s = as_rocm(k)?;
+        let v_s = as_rocm(v)?;
+        let out_storage = RocmStorage::alloc_gpu(
+            out_shape,
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_cross_attention(
+            q_s, k_s, v_s, &out_storage,
+            num_heads, head_dim, seq_len, kv_seq_len,
+        )?;
+        Ok((Box::new(out_storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
+    }
+
+    fn rwkv_time_mix(
+        &self,
+        x: &dyn BackendStorage,
+        w: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = as_rocm(x)?;
+        let w_s = as_rocm(w)?;
+        let k_s = as_rocm(k)?;
+        let v_s = as_rocm(v)?;
+        let g_s = as_rocm(g)?;
+        let out_storage = RocmStorage::alloc_gpu(
+            out_shape,
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_rwkv_time_mix(
+            x_s, w_s, k_s, v_s, g_s, &out_storage,
+            batch, dim, seq_len,
+        )?;
+        Ok((Box::new(out_storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
+    }
+
+    fn rwkv_channel_mix(
+        &self,
+        x: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        r: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = as_rocm(x)?;
+        let k_s = as_rocm(k)?;
+        let r_s = as_rocm(r)?;
+        let v_s = as_rocm(v)?;
+        let out_storage = RocmStorage::alloc_gpu(
+            out_shape,
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_rwkv_channel_mix(
+            x_s, k_s, r_s, v_s, &out_storage,
+            batch, dim,
+        )?;
+        Ok((Box::new(out_storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
+    }
+}
 // to `device::gemm_tuning` — see that module.
 pub use crate::device::gemm_tuning::{
     GemmTileConfig, lookup_gemm_config, lookup_solution_index,
@@ -3969,8 +4109,8 @@ impl RocmDevice {
         let out_dims = out_shape.dims();
         let seq_len = out_dims[0];
 
-        // One block per (seq_position, head); block dim 256 = 4 waves on
-        // RDNA / 8 waves on wave32. grid_x enumerates seq*heads so
+        // One block per (seq_position, head); block dim 128 for wave32 or 256 for wave64
+        // (both produce 4 waves). grid_x enumerates seq*heads so
         // blockIdx.x is the unique (seq, head) index the kernel derives.
         let block_dim_x: u32 = if config.wavefront_size == 32 { 128 } else { 256 };
         let grid_x = (seq_len * config.num_heads) as u32;
@@ -4260,151 +4400,6 @@ impl RocmDevice {
         )?;
 
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
-    }
-
-    // ─── Phase 2 BackendDevice trait methods ──────────────────────
-
-    fn selective_scan(
-        &self,
-        x: &dyn BackendStorage,
-        a: &dyn BackendStorage,
-        b: &dyn BackendStorage,
-        c: &dyn BackendStorage,
-        d: &dyn BackendStorage,
-        batch: usize,
-        dim_dstate: usize,
-        dim_dinner: usize,
-        seq_len: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_s = as_rocm(x)?;
-        let a_s = as_rocm(a)?;
-        let b_s = as_rocm(b)?;
-        let c_s = as_rocm(c)?;
-        let d_s = as_rocm(d)?;
-        let out_storage = RocmStorage::alloc_gpu(
-            out_shape,
-            dtype_f32(),
-            &self.allocator,
-            self.ordinal,
-        )?;
-        self.launch_selective_scan(
-            x_s, a_s, b_s, c_s, d_s, &out_storage,
-            batch, dim_dstate, dim_dinner, seq_len,
-        )?;
-        Ok((Box::new(out_storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
-    }
-
-    fn flash_attention(
-        &self,
-        q: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        seq_len: usize,
-        causal: bool,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let q_s = as_rocm(q)?;
-        let k_s = as_rocm(k)?;
-        let v_s = as_rocm(v)?;
-        let out_storage = RocmStorage::alloc_gpu(
-            out_shape,
-            dtype_f32(),
-            &self.allocator,
-            self.ordinal,
-        )?;
-        self.launch_flash_attention(
-            q_s, k_s, v_s, &out_storage,
-            num_heads, num_kv_heads, head_dim, seq_len, causal,
-        )?;
-        Ok((Box::new(out_storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
-    }
-
-    fn cross_attention(
-        &self,
-        q: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        num_heads: usize,
-        head_dim: usize,
-        seq_len: usize,
-        kv_seq_len: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let q_s = as_rocm(q)?;
-        let k_s = as_rocm(k)?;
-        let v_s = as_rocm(v)?;
-        let out_storage = RocmStorage::alloc_gpu(
-            out_shape,
-            dtype_f32(),
-            &self.allocator,
-            self.ordinal,
-        )?;
-        self.launch_cross_attention(
-            q_s, k_s, v_s, &out_storage,
-            num_heads, head_dim, seq_len, kv_seq_len,
-        )?;
-        Ok((Box::new(out_storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
-    }
-
-    fn rwkv_time_mix(
-        &self,
-        x: &dyn BackendStorage,
-        w: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        g: &dyn BackendStorage,
-        batch: usize,
-        dim: usize,
-        seq_len: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_s = as_rocm(x)?;
-        let w_s = as_rocm(w)?;
-        let k_s = as_rocm(k)?;
-        let v_s = as_rocm(v)?;
-        let g_s = as_rocm(g)?;
-        let out_storage = RocmStorage::alloc_gpu(
-            out_shape,
-            dtype_f32(),
-            &self.allocator,
-            self.ordinal,
-        )?;
-        self.launch_rwkv_time_mix(
-            x_s, w_s, k_s, v_s, g_s, &out_storage,
-            batch, dim, seq_len,
-        )?;
-        Ok((Box::new(out_storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
-    }
-
-    fn rwkv_channel_mix(
-        &self,
-        x: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        r: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        batch: usize,
-        dim: usize,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_s = as_rocm(x)?;
-        let k_s = as_rocm(k)?;
-        let r_s = as_rocm(r)?;
-        let v_s = as_rocm(v)?;
-        let out_storage = RocmStorage::alloc_gpu(
-            out_shape,
-            dtype_f32(),
-            &self.allocator,
-            self.ordinal,
-        )?;
-        self.launch_rwkv_channel_mix(
-            x_s, k_s, r_s, v_s, &out_storage,
-            batch, dim,
-        )?;
-        Ok((Box::new(out_storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
 
     // ─── Phase 2: Selective Scan ──────────────────────────────────
