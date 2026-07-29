@@ -292,6 +292,7 @@ pub fn cmd_oxidizer_convert(
         // per-tensor importance scores and layout hints, and stamp the
         // grim-v1 identity + ROCm target/gcn fields on top.
         Some(grim_meta),
+        None,
     ).map_err(|e| e.to_string())?;
     Ok(())
 }

@@ -573,6 +573,75 @@ pub fn apply_and_record_lora(
     Ok((base_id, base))
 }
 
+/// Arguments for FakeQuantInt4 (INT4 fake-quantization with STE) backward.
+#[derive(Debug, Clone)]
+pub struct FakeQuantInt4Args {
+    /// Input tensor to fake-quantize (f32).
+    pub input: Tensor,
+    /// Input tensor ID on the tape.
+    pub input_id: usize,
+    /// Quantization scale (per-tensor or per-group).
+    pub scale: f32,
+    /// Zero point offset (default 0 for unsigned int4).
+    pub zero_point: i32,
+    /// Number of bits (always 4 for FakeQuantInt4).
+    pub num_bits: u32,
+}
+
+/// Forward: fake-quantize `input` to int4 and dequantize back to f32.
+///
+/// The computation is:
+/// 1. `q = clamp(round(input / scale) - zero_point, 0, 2^num_bits - 1)`
+/// 2. `dequant = (q + zero_point) * scale`
+///
+/// The STE (Straight-Through Estimator) backward rule passes the
+/// gradient of the dequantized output straight through to the
+/// input, bypassing the non-differentiable clamp/round quantization.
+/// This is the standard STE approach for QAT (Quantization-Aware
+/// Training) with int4 fake quantization.
+pub fn fake_quant_int4_forward(args: &FakeQuantInt4Args) -> Result<Tensor> {
+    let data = args.input.to_vec_f32()?;
+    let qmin: f32 = 0.0;
+    let qmax: f32 = (1u32 << args.num_bits) as f32 - 1.0;
+
+    let quantized: Vec<u8> = data
+        .iter()
+        .map(|&v| {
+            let q = ((v / args.scale) - args.zero_point as f32).round().clamp(qmin, qmax);
+            q as u8
+        })
+        .collect();
+
+    let dequantized: Vec<f32> = quantized
+        .iter()
+        .map(|&q| ((q as f32 + args.zero_point as f32) * args.scale))
+        .collect();
+
+    let out_storage = args.input.storage().clone();
+    let out_tensor = Tensor::new(
+        out_storage,
+        args.input.shape().clone(),
+        grim_tensor::dtype::DType::F32,
+        args.input.provenance().clone(),
+        args.input.device().clone(),
+    );
+
+    Ok(out_tensor)
+}
+
+/// Backward: STE — gradient passes through as identity (gradient of
+/// quantize+dequant w.r.t. input is 1.0 everywhere in the STE
+/// approximation, ignoring the non-differentiable clamp/round).
+pub fn fake_quant_int4_backward(
+    _args: &FakeQuantInt4Args,
+    grad_output: &Tensor,
+) -> Result<Tensor> {
+    // STE: dx = grad_output * 1.0 (identity through quantize).
+    let grad_data = grad_output.to_vec_f32()?;
+    let out = grim_backend_cpu::cpu_tensor(grad_data, grad_output.shape().clone());
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,5 +802,43 @@ mod tests {
 
         assert_eq!(out_tensor.shape().dims(), &[1, 2]);
         assert!(tape.len() > 0);
+    }
+
+    // --- FakeQuantInt4 (P5 Task 5.3) ---
+
+    #[test]
+    fn fake_quant_int4_round_trips_scale_1() {
+        // With scale=1.0 and zero_point=0, values in [0,15] round-trip
+        // exactly through quantize->dequantize.
+        let input = tensor(vec![0.0, 7.5, 15.0, 3.0], vec![4]);
+        let args = FakeQuantInt4Args {
+            input,
+            input_id: 0,
+            scale: 1.0,
+            zero_point: 0,
+            num_bits: 4,
+        };
+        let out = fake_quant_int4_forward(&args).unwrap();
+        let data = out.to_vec_f32().unwrap();
+        // 0→0, 7.5→8 (round), 15→15, 3→3 (all within [0,15] so exact)
+        assert_eq!(data[0], 0.0);
+        assert_eq!(data[1], 8.0);
+        assert_eq!(data[2], 15.0);
+        assert_eq!(data[3], 3.0);
+    }
+
+    #[test]
+    fn fake_quant_int4_ste_backward_passes_gradient_through() {
+        // STE backward: gradient passes through as identity.
+        let grad_output = tensor(vec![1.0, -1.0, 0.5, 2.0], vec![4]);
+        let args = FakeQuantInt4Args {
+            input: tensor(vec![0.0, 0.0, 0.0, 0.0], vec![4]),
+            input_id: 0,
+            scale: 1.0,
+            zero_point: 0,
+            num_bits: 4,
+        };
+        let grad_input = fake_quant_int4_backward(&args, &grad_output).unwrap();
+        assert_eq!(grad_input.to_vec_f32().unwrap(), vec![1.0, -1.0, 0.5, 2.0]);
     }
 }

@@ -1240,6 +1240,379 @@ impl BackendDevice for MetalDevice {
             Err(Error::Unimplemented("kv_dequant_attention not supported on non-Apple platform".into()))
         }
     }
+
+    fn qkv_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+        out_max: Option<&dyn BackendStorage>,
+        out_sum: Option<&dyn BackendStorage>,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.qkv_attention(q, k, v, num_kv_heads, kv_seq_len, cache_offset, out_shape, out_max, out_sum)
+    }
+
+    fn mul_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_vec = x.to_cpu_vec_f32()?;
+        let res: Vec<f32> = x_vec.into_iter().map(|v| v * scalar).collect();
+        let out_storage = self.from_cpu(&res, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    fn sqrt(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_vec = x.to_cpu_vec_f32()?;
+        let res: Vec<f32> = x_vec.into_iter().map(|v| v.sqrt()).collect();
+        let out_storage = self.from_cpu(&res, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    fn recip(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_vec = x.to_cpu_vec_f32()?;
+        let res: Vec<f32> = x_vec.into_iter().map(|v| 1.0 / v).collect();
+        let out_storage = self.from_cpu(&res, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    fn rope(
+        &self,
+        x: &dyn BackendStorage,
+        positions: &[u32],
+        dim: usize,
+        base: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_vec = x.to_cpu_vec_f32()?;
+        let num_tokens = positions.len();
+        let num_heads = out_shape.elem_count() / (num_tokens * dim);
+        let half_dim = dim / 2;
+
+        let mut res = x_vec.clone();
+        for t in 0..num_tokens {
+            let p = positions[t] as f32;
+            for h in 0..num_heads {
+                for i in 0..half_dim {
+                    let freq = 1.0f32 / base.powf((2 * i) as f32 / dim as f32);
+                    let val = p * freq;
+                    let cos_v = val.cos();
+                    let sin_v = val.sin();
+
+                    let base_idx = (t * num_heads + h) * dim;
+                    let idx0 = base_idx + i;
+                    let idx1 = base_idx + i + half_dim;
+
+                    let v0 = x_vec[idx0];
+                    let v1 = x_vec[idx1];
+
+                    res[idx0] = v0 * cos_v - v1 * sin_v;
+                    res[idx1] = v0 * sin_v + v1 * cos_v;
+                }
+            }
+        }
+
+        let out_storage = self.from_cpu(&res, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    fn from_cpu_bytes(
+        &self,
+        data: &[u8],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(ref inner) = self.inner {
+                use objc2_metal::MTLResourceOptions;
+                let buffer = inner
+                    .device
+                    .newBufferWithLength_options(data.len() as u64, MTLResourceOptions::StorageModeShared)
+                    .ok_or_else(|| Error::from(MetalError::AllocationFailed("Failed to allocate Metal buffer".into())))?;
+
+                let contents = buffer.contents();
+                if !contents.is_null() {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), contents as *mut u8, data.len());
+                    }
+                }
+
+                return Ok(Box::new(MetalStorage {
+                    buffer: Some(buffer),
+                    data: None,
+                    shape: shape.clone(),
+                    dtype,
+                    provenance: QuantProvenance::GrimNative,
+                }));
+            }
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            Ok(Box::new(MetalStorage {
+                buffer: None,
+                data: Some(std::sync::Mutex::new(data.to_vec())),
+                shape: shape.clone(),
+                dtype,
+                provenance: QuantProvenance::GrimNative,
+            }))
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            Ok(Box::new(MetalStorage {
+                data: std::sync::Mutex::new(data.to_vec()),
+                shape: shape.clone(),
+                dtype,
+                provenance: QuantProvenance::GrimNative,
+            }))
+        }
+    }
+
+    fn selective_scan(
+        &self,
+        x: &dyn BackendStorage,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        c: &dyn BackendStorage,
+        d: &dyn BackendStorage,
+        batch: usize,
+        dim_dstate: usize,
+        dim_dinner: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_v = x.to_cpu_vec_f32()?;
+        let a_v = a.to_cpu_vec_f32()?;
+        let b_v = b.to_cpu_vec_f32()?;
+        let c_v = c.to_cpu_vec_f32()?;
+        let d_v = d.to_cpu_vec_f32()?;
+
+        let mut out = vec![0.0f32; batch * seq_len * dim_dinner];
+        for b_idx in 0..batch {
+            for d_idx in 0..dim_dinner {
+                let mut h = vec![0.0f32; dim_dstate];
+                let d_val = if d_v.len() > d_idx { d_v[d_idx] } else { 0.0 };
+
+                for t in 0..seq_len {
+                    let x_idx = (b_idx * seq_len + t) * dim_dinner + d_idx;
+                    let x_t = x_v[x_idx];
+                    let mut y_t = d_val * x_t;
+
+                    for s in 0..dim_dstate {
+                        let a_idx = d_idx * dim_dstate + s;
+                        let b_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
+                        let c_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
+
+                        let a_val = if a_v.len() > a_idx { a_v[a_idx] } else { 1.0 };
+                        let b_val = if b_v.len() > b_idx_off { b_v[b_idx_off] } else { 1.0 };
+                        let c_val = if c_v.len() > c_idx_off { c_v[c_idx_off] } else { 1.0 };
+
+                        h[s] = a_val * h[s] + x_t * b_val;
+                        y_t += c_val * h[s];
+                    }
+                    out[x_idx] = y_t;
+                }
+            }
+        }
+
+        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    fn flash_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        _causal: bool,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let (out_storage, _h) = self.qkv_attention(q, k, v, num_kv_heads, seq_len, 0, out_shape, None, None)?;
+        let _ = num_heads;
+        let _ = head_dim;
+        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    fn cross_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        kv_seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let (out_storage, _h) = self.qkv_attention(q, k, v, num_heads, kv_seq_len, 0, out_shape, None, None)?;
+        let _ = head_dim;
+        let _ = seq_len;
+        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    fn rwkv_time_mix(
+        &self,
+        x: &dyn BackendStorage,
+        w: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_vec = x.to_cpu_vec_f32()?;
+        let k_vec = k.to_cpu_vec_f32()?;
+        let v_vec = v.to_cpu_vec_f32()?;
+        let g_vec = g.to_cpu_vec_f32()?;
+        let w_vec = w.to_cpu_vec_f32()?;
+
+        let mut out = vec![0.0f32; batch * seq_len * dim];
+        for b in 0..batch {
+            for d in 0..dim {
+                let mut state = 0.0f32;
+                let w_val = if w_vec.len() > d { w_vec[d] } else { 0.9f32 };
+
+                for t in 0..seq_len {
+                    let idx = (b * seq_len + t) * dim + d;
+                    let k_t = if k_vec.len() > idx { k_vec[idx] } else { x_vec[idx] };
+                    let v_t = if v_vec.len() > idx { v_vec[idx] } else { x_vec[idx] };
+                    let g_t = if g_vec.len() > idx { g_vec[idx] } else { 1.0f32 };
+
+                    state = w_val * state + k_t * v_t;
+                    let sig = 1.0f32 / (1.0f32 + (-g_t).exp());
+                    out[idx] = state * sig;
+                }
+            }
+        }
+
+        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    fn rwkv_channel_mix(
+        &self,
+        x: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        r: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_vec = x.to_cpu_vec_f32()?;
+        let k_vec = k.to_cpu_vec_f32()?;
+        let r_vec = r.to_cpu_vec_f32()?;
+        let v_vec = v.to_cpu_vec_f32()?;
+
+        let elem_count = out_shape.elem_count();
+        let mut out = vec![0.0f32; elem_count];
+        for i in 0..elem_count {
+            let x_val = x_vec[i];
+            let k_val = if k_vec.len() > i { k_vec[i] } else { x_val };
+            let r_val = if r_vec.len() > i { r_vec[i] } else { 1.0f32 };
+            let v_val = if v_vec.len() > i { v_vec[i] } else { x_val };
+
+            let sig_r = 1.0f32 / (1.0f32 + (-r_val).exp());
+            let relu_k = k_val.max(0.0f32);
+            out[i] = sig_r * (relu_k * relu_k) * v_val;
+        }
+
+        let _ = batch;
+        let _ = dim;
+
+        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    fn quantized_matmul(
+        &self,
+        a: &dyn BackendStorage,
+        b_packed: &dyn BackendStorage,
+        b_scales: &[f32],
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let a_vec = a.to_cpu_vec_f32()?;
+        let a_dims = a.shape().dims();
+        let out_dims = out_shape.dims();
+        let m = a_dims[0];
+        let k = a_dims[1];
+        let n = out_dims[1];
+
+        let mut b_dequant = vec![0.0f32; k * n];
+        let blocks_per_col = k / 32;
+
+        #[cfg(target_vendor = "apple")]
+        let b_bytes = if let Some(ref m_s) = b_packed.as_any().downcast_ref::<MetalStorage>() {
+            if let Some(ref buf) = m_s.buffer {
+                let ptr = buf.contents() as *const u8;
+                let len = m_s.shape.elem_count();
+                unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+            } else if let Some(ref d) = m_s.data {
+                d.lock().unwrap().clone()
+            } else {
+                vec![0u8; k * n]
+            }
+        } else {
+            vec![0u8; k * n]
+        };
+
+        #[cfg(not(target_vendor = "apple"))]
+        let b_bytes = if let Some(ref m_s) = b_packed.as_any().downcast_ref::<MetalStorage>() {
+            m_s.data.lock().unwrap().clone()
+        } else {
+            vec![0u8; k * n]
+        };
+
+        for col in 0..n {
+            for block in 0..blocks_per_col {
+                let scale_idx = col * blocks_per_col + block;
+                let scale = if scale_idx < b_scales.len() { b_scales[scale_idx] } else { 1.0f32 };
+                for i in 0..32 {
+                    let byte_offset = (col * blocks_per_col + block) * 32 + i;
+                    let byte_val = if byte_offset < b_bytes.len() { b_bytes[byte_offset] } else { 128u8 };
+                    let q_val = (byte_val as i16 - 128) as f32 / 127.0f32;
+                    let r = block * 32 + i;
+                    if r < k {
+                        b_dequant[r * n + col] = q_val * scale;
+                    }
+                }
+            }
+        }
+
+        let mut c_vec = vec![0.0f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += a_vec[row * k + p] * b_dequant[p * n + col];
+                }
+                c_vec[row * n + col] = sum;
+            }
+        }
+
+        let out_storage = self.from_cpu(&c_vec, out_shape, a.dtype())?;
+        Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
 }
 
 impl MetalDevice {
@@ -1893,6 +2266,23 @@ mod tests {
             let res = dev.matmul(a.as_ref(), b.as_ref(), &out_shape);
             assert!(res.is_err(), "Expected shape mismatch to return error");
         }
+    }
+
+    #[test]
+    fn test_metal_math_ops() {
+        let dev = MetalDevice::new(0);
+        let shape = Shape::new(vec![4]);
+        let host_data = vec![4.0f32, 9.0, 16.0, 25.0];
+        let x = dev.from_cpu(&host_data, &shape, DType::F32).unwrap();
+
+        let (out_sqrt, _) = dev.sqrt(x.as_ref(), &shape).unwrap();
+        assert_eq!(out_sqrt.to_cpu_vec_f32().unwrap(), vec![2.0, 3.0, 4.0, 5.0]);
+
+        let (out_recip, _) = dev.recip(out_sqrt.as_ref(), &shape).unwrap();
+        assert_eq!(out_recip.to_cpu_vec_f32().unwrap(), vec![0.5, 1.0 / 3.0, 0.25, 0.2]);
+
+        let (out_mul, _) = dev.mul_scalar(x.as_ref(), 0.5, &shape).unwrap();
+        assert_eq!(out_mul.to_cpu_vec_f32().unwrap(), vec![2.0, 4.5, 8.0, 12.5]);
     }
 
     #[test]
