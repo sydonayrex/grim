@@ -156,6 +156,7 @@ impl AdamW {
     /// Save optimizer moments and trainable parameter data into a `.grim.train` `TrainState`.
     pub fn save_to_train_state(&self, params: &TrainableParams) -> TrainState {
         let mut state = TrainState {
+            step: self.step_count as u64,
             fp_format: TrainFpFormat::Fp32,
             blobs: HashMap::new(),
         };

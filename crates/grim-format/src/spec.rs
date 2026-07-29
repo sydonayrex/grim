@@ -377,9 +377,10 @@ pub struct GrimTensorExt {
     /// array. Length = nnz (number of non-zero elements). The indices
     /// encode positions into the tensor's flat payload.
     pub spqr_indices: Vec<u32>,
-    /// Sparse FP16 sidecar values corresponding to each index in
-    /// `spqr_indices`. Length must equal `spqr_indices.len()`.
-    pub spqr_values: Vec<f16>,
+    /// Sparse values corresponding to each index in `spqr_indices`.
+    /// Uses f32 for full precision; quantized to f16 only if
+    /// the storage backend requires it.
+    pub spqr_values: Vec<f32>,
 
     // --- P3-WI-2: activation-quant metadata (WI-R5 enabler) ---
     /// Dtype of activation quantization for fused GEMM, or `None`.
@@ -599,6 +600,8 @@ impl GrimTensorExt {
                 .unwrap_or(ActQuantDtype::None),
             act_scale_layout: ActScaleLayout::from_u8(pick_u8("act_scale_layout", 0))
                 .unwrap_or(ActScaleLayout::None),
+            spqr_indices: Vec::new(),
+            spqr_values: Vec::new(),
         })
     }
 }

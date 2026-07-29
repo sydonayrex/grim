@@ -8,7 +8,7 @@
 //! module when `quant_mode == QuantMode::Fp8Native && arch >= "gfx1150"`.
 //! Until the kernel source is written, `gemm_rgba8_16x16()` panics.
 
-use crate::{BackendDevice, DeviceTensor, Shape};
+use grim_tensor::{BackendDevice, Shape};
 
 /// Multiply two FP16 matrices using RDNA4 BF16→FP8 fast path.
 ///
@@ -17,9 +17,9 @@ use crate::{BackendDevice, DeviceTensor, Shape};
 /// source is ready.
 pub fn gemm_rgba8_16x16(
     _device: &dyn BackendDevice,
-    _a: DeviceTensor,
-    _b: DeviceTensor,
-    _c: &mut DeviceTensor,
+    _a: &dyn grim_tensor::backend::BackendStorage,
+    _b: &dyn grim_tensor::backend::BackendStorage,
+    _c: &mut dyn grim_tensor::backend::BackendStorage,
     _m: usize,
     _n: usize,
     _k: usize,

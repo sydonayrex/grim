@@ -1,5 +1,5 @@
 use grim_format::tokenizer::GgufTokenizer;
-use grim_tensor::{DType, Tensor};
+use grim_tensor::{Shape, Tensor};
 use grim_tensor::error::Result;
 use std::io::{BufRead, BufReader};
 use std::fs::File;
@@ -51,7 +51,8 @@ impl JsonlBatchIterator {
             return Err(grim_tensor::error::Error::Backend("dataloader exhausted".into()));
         }
         let flat: Vec<u32> = self.token_buffer.drain(..needed).collect();
-        let input_ids = Tensor::from_slice_u32(&flat, &[self.batch_size, self.seq_len])?;
+        let data_f32: Vec<f32> = flat.iter().map(|&x| x as f32).collect();
+        let input_ids = grim_backend_cpu::cpu_tensor(data_f32, Shape::from_slice(&[self.batch_size, self.seq_len]));
         let labels = Self::build_labels(&flat, self.batch_size, self.seq_len, self.tokenizer.pad_token_id());
         Ok((input_ids, labels))
     }
@@ -66,7 +67,7 @@ impl JsonlBatchIterator {
                 let v: serde_json::Value = serde_json::from_str(line.trim())
                     .map_err(|e| grim_tensor::error::Error::Backend(e.to_string()))?;
                 let text = v["text"].as_str().unwrap_or("");
-                let tokens = self.tokenizer.encode(text)?;
+                let tokens = self.tokenizer.encode(text);
                 self.token_buffer.extend(tokens);
             }
             Err(e) => {
@@ -90,7 +91,8 @@ impl JsonlBatchIterator {
             }
             labels_flat[start + seq_len - 1] = pad_token_id;
         }
-        Tensor::from_slice_u32(&labels_flat, &[batch_size, seq_len]).expect("labels shape matches input")
+        let data_f32: Vec<f32> = labels_flat.iter().map(|&x| x as f32).collect();
+        grim_backend_cpu::cpu_tensor(data_f32, Shape::from_slice(&[batch_size, seq_len]))
     }
 }
 
@@ -115,7 +117,7 @@ mod tests {
             2,
         ).expect("datloader should construct");
         let (inputs, labels) = loader.next_batch().expect("first batch");
-        assert_eq!(inputs.shape(), &[2, 64]);
-        assert_eq!(labels.shape(), &[2, 64]);
+        assert_eq!(inputs.shape().dims(), &[2, 64]);
+        assert_eq!(labels.shape().dims(), &[2, 64]);
     }
 }

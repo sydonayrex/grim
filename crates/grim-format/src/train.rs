@@ -351,7 +351,6 @@ mod tests {
             assert_eq!(restored.step, step);
         }
     }
-    }
 
     #[test]
     fn train_state_read_missing_returns_none() {

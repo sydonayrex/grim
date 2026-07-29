@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Seek, Write};
 
 use grim_tensor::error::{Error, Result};
+use grim_tensor::provider::TensorProvider;
 use grim_quant::evopress_search;
 use crate::gguf::{
     read_gguf, read_tensor_bytes, GgufValue, GrimFusionOp, GrimRocmlProfile, GGUF_MAGIC,
@@ -558,6 +559,21 @@ fn pack_tensors(
         };
         
         // Re-quantize to target bitwidth
+        let mut f32_values = f32_values;
+
+        // Apply SmoothQuant channel scaling (N3b) if 2D tensor
+        if meta.shape.len() == 2 {
+            let out_channels = meta.shape[0];
+            let in_channels = meta.shape[1];
+            let _ = grim_quant::apply_smoothquant_scale(&mut f32_values, out_channels, in_channels, None);
+        }
+
+        // Apply SpinQuant Cayley rotation (N3a) if length is square and power of 2
+        let elem_sqrt = (elem_count as f64).sqrt() as usize;
+        if elem_sqrt * elem_sqrt == elem_count && elem_sqrt >= 16 && elem_sqrt.is_power_of_two() {
+            grim_quant::spinquant_rotate(&mut f32_values, elem_sqrt, 0.01, 5);
+        }
+
         let payload_size = crate::format::normals_packed_size(elem_count, 0, tensor_bitwidth);
         let mut normals = Vec::with_capacity(payload_size as usize);
         
