@@ -617,16 +617,7 @@ pub fn fake_quant_int4_forward(args: &FakeQuantInt4Args) -> Result<Tensor> {
         .map(|&q| ((q as f32 + args.zero_point as f32) * args.scale))
         .collect();
 
-    let out_storage = args.input.storage().clone();
-    let out_tensor = Tensor::new(
-        out_storage,
-        args.input.shape().clone(),
-        grim_tensor::dtype::DType::F32,
-        args.input.provenance().clone(),
-        args.input.device().clone(),
-    );
-
-    Ok(out_tensor)
+    Ok(grim_backend_cpu::cpu_tensor(dequantized, args.input.shape().clone()))
 }
 
 /// Backward: STE — gradient passes through as identity (gradient of
