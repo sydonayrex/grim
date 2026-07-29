@@ -53,8 +53,9 @@ pub use injection::{
 };
 pub use loss::cross_entropy_loss;
 pub use ops::{
-    AddArgs, MatMulArgs, ScaleArgs, add_backward, apply_and_record_lora, lora_backward,
-    matmul_backward, scale_backward,
+    AddArgs, FakeQuantInt4Args, MatMulArgs, ScaleArgs, add_backward, apply_and_record_lora,
+    fake_quant_int4_backward, fake_quant_int4_forward, lora_backward, matmul_backward,
+    scale_backward,
 };
 pub use param::{ParamId, TrainableParam, TrainableParams};
 pub use preference_loss::{

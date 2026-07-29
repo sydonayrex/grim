@@ -436,6 +436,16 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     let epochs = job.epochs.max(1) as u64;
     let steps_per_epoch: u64 = 10;
     let total_steps = epochs * steps_per_epoch;
+
+    // Restore optimizer step from checkpoint if resuming.
+    let mut step_counter: u64 = 0;
+    if let Some(ref cp_path) = job.resume_from_checkpoint {
+        if let Ok(Some(existing_state)) = grim_format::TrainState::read(cp_path) {
+            step_counter = existing_state.step;
+            eprintln!("[grim-garage] worker: {} resuming from step {}", id, step_counter);
+        }
+    }
+
     // Cancellation token shared with the registry's `cancel` API. Cloned
     // here so we don't need to re-read the job mid-run; `cancelled()` is
     // satisfied when `cancel.cancel()` fires from another task.
@@ -693,7 +703,10 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         return;
     }
 
-    let train_state = optimizer.save_to_train_state(&autograd_reg.params);
+    let mut train_state = optimizer.save_to_train_state(&autograd_reg.params);
+    // Persist the current optimizer step so resumed training
+    // picks up exactly where it left off.
+    train_state.step = step_counter;
     let sidecar_path = format!("{}.train", job.model_path);
     if let Some(parent) = std::path::Path::new(&sidecar_path).parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -705,8 +718,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         );
     } else {
         eprintln!(
-            "[grim-garage] worker: wrote training state sidecar to {}",
-            sidecar_path
+            "[grim-garage] worker: wrote training state sidecar to {} (step {})",
+            sidecar_path, step_counter,
         );
     }
 
