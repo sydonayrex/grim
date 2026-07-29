@@ -399,6 +399,10 @@ async fn update_status_and_broadcast_emits_terminal_completed_event() {
             step: 0,
             loss: 2.3,
             tokens: 512,
+            grad_norm: 0.0,
+            lr: 0.0,
+            vram_used_mb: 0,
+            samples_per_sec: 0.0,
         },
     )
     .await

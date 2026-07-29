@@ -21,7 +21,30 @@ pub struct GgufTokenizer {
     pub chat_template: Option<String>,
 }
 
+impl Default for GgufTokenizer {
+    fn default() -> Self {
+        Self {
+            tokens: Vec::new(),
+            token_to_id: HashMap::new(),
+            scores: None,
+            model_type: "bpe".into(),
+            bpe_merges: None,
+            byte_decoder: None,
+            eos_token_id: None,
+            chat_template: None,
+        }
+    }
+}
+
 impl GgufTokenizer {
+    /// Return pad token ID if found, otherwise default to 0.
+    pub fn pad_token_id(&self) -> u32 {
+        self.token_to_id.get("<|pad|>")
+            .or_else(|| self.token_to_id.get("<pad>"))
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Load a tokenizer from a HuggingFace `tokenizer.json` file.
     ///
     /// Supports BPE and WordLevel model types. Reads the vocab from
