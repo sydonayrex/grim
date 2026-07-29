@@ -98,7 +98,7 @@ pub fn mfma_dispatch(arch: &str, requested: QuantMode) -> Result<QuantMode, &'st
         Err("no MFMA matrix cores on RDNA; use WMMA/rocWMMA (GFX11+) or JIT HIP grim_* kernels")
     } else {
         match requested {
-            QuantMode::Fp8 => Err("no native fp8 MFMA on this CDNA arch; downshift via resolve_quant_mode"),
+            QuantMode::Fp8Native => Err("no native fp8 MFMA on this CDNA arch; downshift via resolve_quant_mode"),
             _ => Err("requested MFMA mode unavailable; fall back to fp32 path"),
         }
     }
@@ -131,7 +131,7 @@ pub fn wmma_dispatch(arch: &str, requested: QuantMode) -> Result<QuantMode, &'st
         Err("no WMMA matrix cores on this architecture; CDNA uses MFMA, older RDNA uses JIT HIP")
     } else {
         match requested {
-            QuantMode::Fp8 => Err("no native fp8 WMMA on this RDNA arch; downshift via resolve_quant_mode"),
+            QuantMode::Fp8Native => Err("no native fp8 WMMA on this RDNA arch; downshift via resolve_quant_mode"),
             _ => Err("requested WMMA mode unavailable; fall back to fp32 path"),
         }
     }
@@ -270,10 +270,10 @@ mod self_tests {
         // CDNA2 (MI200) has fp16/bf16/fp32 MFMA, NOT fp8.
         assert!(mfma_supported(gcn_arch("gfx908"), QuantMode::F16));
         assert!(mfma_supported(gcn_arch("gfx908"), QuantMode::Bf16));
-        assert!(!mfma_supported(gcn_arch("gfx908"), QuantMode::Fp8));
+        assert!(!mfma_supported(gcn_arch("gfx908"), QuantMode::Fp8Native));
         // CDNA3 (MI300) has fp8 MFMA.
-        assert!(mfma_supported(gcn_arch("gfx942"), QuantMode::Fp8));
-        assert!(mfma_dispatch("gfx942", QuantMode::Fp8).is_ok());
+        assert!(mfma_supported(gcn_arch("gfx942"), QuantMode::Fp8Native));
+        assert!(mfma_dispatch("gfx942", QuantMode::Fp8Native).is_ok());
     }
 
     // F8 — CK valid on RDNA (WMMA) + CDNA (MFMA); only legacy gfx900 rejected.

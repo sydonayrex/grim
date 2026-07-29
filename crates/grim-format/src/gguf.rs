@@ -470,6 +470,9 @@ pub struct GrimMetadata {
     /// the native `.grim` format does not otherwise track. Embedded as a JSON
     /// object under the `"_gguf_metadata"` key in the `.grim` metadata blob.
     pub gguf_metadata: Option<HashMap<String, GgufValue>>,
+    /// Target WeightFormat codec to use during conversion. When `None`,
+    /// `Bf16` (the default codec) is used.
+    pub target_weight_format: Option<String>,
 }
 
 impl Default for GrimMetadata {
@@ -494,6 +497,7 @@ impl Default for GrimMetadata {
             has_kv_registry: None,
             ext_entries: Vec::new(),
             gguf_metadata: None,
+            target_weight_format: None,
         }
     }
 }

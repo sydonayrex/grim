@@ -34,6 +34,11 @@ vec![
         ("embedding", load_kernel("embedding")),
         ("matmul_32", load_kernel("matmul_tile_32")),
         ("matmul_64", load_kernel("matmul_tile_64")),
+        ("qkv_attention", load_kernel("qkv_attention")),
+        ("mul_scalar", load_kernel("mul_scalar")),
+        ("sqrt", load_kernel("sqrt")),
+        ("recip", load_kernel("recip")),
+        ("rope", load_kernel("rope")),
     ]
 }
 
@@ -46,8 +51,13 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/rms_norm.comp");
     println!("cargo:rerun-if-changed=kernels/softmax.comp");
     println!("cargo:rerun-if-changed=kernels/embedding.comp");
-println!("cargo:rerun-if-changed=kernels/matmul_tile_32.comp");
-println!("cargo:rerun-if-changed=kernels/matmul_tile_64.comp");
+    println!("cargo:rerun-if-changed=kernels/matmul_tile_32.comp");
+    println!("cargo:rerun-if-changed=kernels/matmul_tile_64.comp");
+    println!("cargo:rerun-if-changed=kernels/qkv_attention.comp");
+    println!("cargo:rerun-if-changed=kernels/mul_scalar.comp");
+    println!("cargo:rerun-if-changed=kernels/sqrt.comp");
+    println!("cargo:rerun-if-changed=kernels/recip.comp");
+    println!("cargo:rerun-if-changed=kernels/rope.comp");
 println!("cargo:rerun-if-changed=kernels/matmul_tile_32_bf16.comp");
 println!("cargo:rerun-if-changed=kernels/matmul_tile_64_bf16.comp");
 

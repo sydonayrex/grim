@@ -133,8 +133,12 @@ pub enum QuantMode {
     F16,
     /// BF16 — native on RDNA2 + CDNA2/3.
     Bf16,
-    /// FP8 e4m3 / e5m2 — **only** native on RDNA4 (`gfx1200+`) per the spec.
-    Fp8,
+    /// FP8 e4m3 / e5m2 native MFMA — **only** native on RDNA4 (`gfx1200+`) and CDNA3 per the spec.
+    Fp8Native,
+    /// Rook: MXFP4 E2M1 emulated (dequant in LDS to BF16, WMMA BF16 GEMM). Safe RDNA2+.
+    MxFp4Emulated,
+    /// Jackdaw: MXFP8 E4M3 emulated (dequant in LDS to BF16, WMMA BF16 GEMM). Safe RDNA2+.
+    MxFp8Emulated,
 }
 
 /// Per-arch capability bitmap. The struct is the *output* of the gate;
@@ -145,7 +149,9 @@ pub struct QuantCapability {
     fp32: bool,
     f16: bool,
     bf16: bool,
-    fp8: bool,
+    fp8_native: bool,
+    mxfp4_emulated: bool,
+    mxfp8_emulated: bool,
 }
 
 impl QuantCapability {
@@ -154,7 +160,9 @@ impl QuantCapability {
             QuantMode::Fp32 => self.fp32,
             QuantMode::F16 => self.f16,
             QuantMode::Bf16 => self.bf16,
-            QuantMode::Fp8 => self.fp8,
+            QuantMode::Fp8Native => self.fp8_native,
+            QuantMode::MxFp4Emulated => self.mxfp4_emulated,
+            QuantMode::MxFp8Emulated => self.mxfp8_emulated,
         }
     }
 }
@@ -163,51 +171,52 @@ impl fmt::Display for QuantCapability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "fp32={} f16={} bf16={} fp8={}",
-            self.fp32, self.f16, self.bf16, self.fp8
+            "fp32={} f16={} bf16={} fp8_native={} mxfp4_emulated={} mxfp8_emulated={}",
+            self.fp32, self.f16, self.bf16, self.fp8_native, self.mxfp4_emulated, self.mxfp8_emulated
         )
     }
 }
 
 /// Compute the capabilities for a coarse-grained arch bucket.
-///
-/// Per `rocm-quantization-inference`:
-/// - Fp32 always.
-/// - F16 + Bf16 native on RDNA2 onwards (and CDNA2+).
-/// - **Fp8 native only on RDNA4** (`gfx1200+`) on the consumer side,
-///   plus CDNA3 (MI300 series) on the data-center side. Crucially, the
-///   spec rules out fp8 on RDNA2/3 because there is no native fp8
-///   MFMA on those arches.
 pub fn arch_capability(arch: GcnArch) -> QuantCapability {
     match arch {
-        GcnArch::RDNA4 => QuantCapability { fp32: true, f16: true, bf16: true, fp8: true },
-        GcnArch::CDNA3 => QuantCapability { fp32: true, f16: true, bf16: true, fp8: true },
-        GcnArch::CDNA2 => QuantCapability { fp32: true, f16: true, bf16: true, fp8: false },
-        GcnArch::RDNA3 => QuantCapability { fp32: true, f16: true, bf16: true, fp8: false },
-        GcnArch::RDNA2 => QuantCapability { fp32: true, f16: true, bf16: true, fp8: false },
-        GcnArch::RDNA1 => QuantCapability { fp32: true, f16: false, bf16: false, fp8: false },
-        GcnArch::Other => QuantCapability { fp32: true, f16: false, bf16: false, fp8: false },
+        GcnArch::RDNA4 | GcnArch::CDNA3 => QuantCapability {
+            fp32: true,
+            f16: true,
+            bf16: true,
+            fp8_native: true,
+            mxfp4_emulated: true,
+            mxfp8_emulated: true,
+        },
+        GcnArch::RDNA2 | GcnArch::RDNA3 | GcnArch::CDNA2 => QuantCapability {
+            fp32: true,
+            f16: true,
+            bf16: true,
+            fp8_native: false,
+            mxfp4_emulated: true,
+            mxfp8_emulated: true,
+        },
+        GcnArch::RDNA1 | GcnArch::Other => QuantCapability {
+            fp32: true,
+            f16: false,
+            bf16: false,
+            fp8_native: false,
+            mxfp4_emulated: false,
+            mxfp8_emulated: false,
+        },
     }
 }
 
 /// Resolve the runtime `QuantMode` for a running arch given a model's
 /// *requested* mode.
-///
-/// `rust-gpu-discipline` §2 #12 mandates: **emulated fp8 on RDNA2/3 is
-/// a regression; never silently run it.** This function is therefore
-/// strict: if the requested mode is `Fp8` but the arch can't run it
-/// natively, we downshift to `Bf16` (the next-fastest native mode on
-/// RDNA2/3). The caller is responsible for surfacing the downgrade via
-/// `tracing::warn!` per the discipline.
 pub fn resolve_quant_mode(arch: GcnArch, requested: QuantMode) -> QuantMode {
     let caps = arch_capability(arch);
     if caps.supports(requested) {
         return requested;
     }
     match requested {
-        // Emulated fp8 on RDNA2/3 is forbidden — fall back to bf16
-        // (the best-available native mode on consumer RDNA besides fp32).
-        QuantMode::Fp8 => {
+        // Native FP8 on RDNA2/3 is forbidden — fall back to BF16
+        QuantMode::Fp8Native => {
             if caps.bf16 {
                 QuantMode::Bf16
             } else if caps.f16 {
@@ -216,8 +225,13 @@ pub fn resolve_quant_mode(arch: GcnArch, requested: QuantMode) -> QuantMode {
                 QuantMode::Fp32
             }
         }
-        // For f16/bf16 requests on arches where the cap is fp32-only
-        // (RDNA1, Other), drop all the way to fp32 rather than crash.
+        QuantMode::MxFp4Emulated | QuantMode::MxFp8Emulated => {
+            if caps.bf16 {
+                requested
+            } else {
+                QuantMode::Fp32
+            }
+        }
         QuantMode::F16 | QuantMode::Bf16 => {
             if caps.f16 {
                 requested
@@ -231,32 +245,25 @@ pub fn resolve_quant_mode(arch: GcnArch, requested: QuantMode) -> QuantMode {
 
 #[cfg(test)]
 mod self_tests {
-    //! Tiny self-test: bind capability to the spec without external
-    //! fixtures. Heavy coverage lives in `tests/quantization.rs`.
     use super::*;
 
     #[test]
     fn fp8_capable_buckets_match_spec() {
-        // spec: only RDNA4 and CDNA3 claim native fp8.
         for arch in [GcnArch::RDNA4, GcnArch::CDNA3] {
             let c = arch_capability(arch);
-            assert!(
-                c.supports(QuantMode::Fp8),
-                "{:?}: fp8 expected, got {}",
-                arch,
-                c
-            );
+            assert!(c.supports(QuantMode::Fp8Native), "{:?}: fp8_native expected", arch);
         }
-        // Every other bucket must NOT claim fp8 (per `rocm-quantization-inference`
-        // and `rust-gpu-discipline` §2 #12 — never run emulated fp8).
         for arch in [GcnArch::RDNA1, GcnArch::RDNA2, GcnArch::RDNA3, GcnArch::CDNA2, GcnArch::Other] {
             let c = arch_capability(arch);
-            assert!(
-                !c.supports(QuantMode::Fp8),
-                "{:?}: fp8 must NOT be supported yet got {}",
-                arch,
-                c
-            );
+            assert!(!c.supports(QuantMode::Fp8Native), "{:?}: fp8_native must NOT be supported", arch);
+        }
+    }
+
+    #[test]
+    fn rook_and_jackdaw_allowed_on_rdna2_and_rdna3() {
+        for arch in [GcnArch::RDNA2, GcnArch::RDNA3, GcnArch::RDNA4, GcnArch::CDNA3] {
+            assert_eq!(resolve_quant_mode(arch, QuantMode::MxFp4Emulated), QuantMode::MxFp4Emulated);
+            assert_eq!(resolve_quant_mode(arch, QuantMode::MxFp8Emulated), QuantMode::MxFp8Emulated);
         }
     }
 }

@@ -4,11 +4,13 @@
 //! touching the rest of the backend. Phase-1 qkv_attention lives here.
 
 pub mod decode_gemm;
+pub mod shared_device_fns;
 pub mod qkv_attention;
 pub mod compute_kernels;
 pub mod jit_cache;
 pub mod source_asm;
 pub mod fused_dequant_gemm;
+pub mod fp8_gemm_rdna4;
 pub mod fp8_standalone;
 pub mod iq_dequant;
 pub mod iq_gemm;

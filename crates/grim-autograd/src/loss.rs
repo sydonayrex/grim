@@ -32,6 +32,13 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Result<(f32, Te
     }
 
     let logits_vec = logits.to_vec_f32()?;
+    if logits_vec.len() < batch_size * vocab_size {
+        return Err(Error::Backend(format!(
+            "logits tensor length ({}) is less than required batch_size * vocab_size ({})",
+            logits_vec.len(),
+            batch_size * vocab_size
+        )));
+    }
     let mut grad_vec = vec![0.0f32; batch_size * vocab_size];
     let mut total_loss = 0.0f32;
 

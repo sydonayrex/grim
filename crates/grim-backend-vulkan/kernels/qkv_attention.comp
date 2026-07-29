@@ -1,0 +1,71 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Params {
+    uint seq_len;
+    uint head_dim;
+    uint num_heads;
+    uint num_kv_heads;
+    uint cache_offset;
+    float inv_sqrt_d;
+} params;
+
+layout(std430, binding = 0) readonly buffer Q { float q[]; };
+layout(std430, binding = 1) readonly buffer K { float k_buf[]; };
+layout(std430, binding = 2) readonly buffer V { float v_buf[]; };
+layout(std430, binding = 3) writeonly buffer Out { float out_buf[]; };
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = params.seq_len * params.num_heads;
+    if (gid >= total) return;
+
+    uint i = gid / params.num_heads;         // query position
+    uint h = gid % params.num_heads;         // head index
+
+    uint q_per_kv = params.num_heads / params.num_kv_heads;
+    uint kv_head = h / q_per_kv;
+    uint q_offset = (i * params.num_heads + h) * params.head_dim;
+    uint abs_i = params.cache_offset + i;
+
+    uint hi = (abs_i < params.seq_len) ? (abs_i + 1u) : params.seq_len;
+    uint range_len = hi;
+
+    float running_max = -1e30;
+    float running_sum = 0.0;
+
+    // Temporary storage for output vector
+    float acc[256];
+    for (uint d = 0u; d < params.head_dim && d < 256u; ++d) {
+        acc[d] = 0.0;
+    }
+
+    uint k_head_stride = params.num_kv_heads * params.head_dim;
+
+    for (uint j = 0u; j < range_len; ++j) {
+        float score = 0.0;
+        uint k_offset = (j * params.num_kv_heads + kv_head) * params.head_dim;
+        for (uint d = 0u; d < params.head_dim; ++d) {
+            score += q[q_offset + d] * k_buf[k_offset + d];
+        }
+        score *= params.inv_sqrt_d;
+
+        float old_max = running_max;
+        running_max = max(running_max, score);
+        float scale_old = exp(old_max - running_max);
+        float scale_new = exp(score - running_max);
+
+        running_sum = running_sum * scale_old + scale_new;
+
+        uint v_offset = (j * params.num_kv_heads + kv_head) * params.head_dim;
+        for (uint d = 0u; d < params.head_dim && d < 256u; ++d) {
+            acc[d] = acc[d] * scale_old + scale_new * v_buf[v_offset + d];
+        }
+    }
+
+    float inv_sum = (running_sum > 0.0) ? (1.0 / running_sum) : 0.0;
+    for (uint d = 0u; d < params.head_dim && d < 256u; ++d) {
+        out_buf[q_offset + d] = acc[d] * inv_sum;
+    }
+}

@@ -117,9 +117,9 @@ fn capability_table_fp8_rna4_only() -> TestResult {
     let rdna2 = arch_capability(GcnArch::RDNA2);
     let rdna3 = arch_capability(GcnArch::RDNA3);
     let rdna4 = arch_capability(GcnArch::RDNA4);
-    assert!(!rdna2.supports(QuantMode::Fp8), "RDNA2 must not claim native fp8");
-    assert!(!rdna3.supports(QuantMode::Fp8), "RDNA3 must not claim native fp8");
-    assert!(rdna4.supports(QuantMode::Fp8), "RDNA4 must support native fp8");
+    assert!(!rdna2.supports(QuantMode::Fp8Native), "RDNA2 must not claim native fp8");
+    assert!(!rdna3.supports(QuantMode::Fp8Native), "RDNA3 must not claim native fp8");
+    assert!(rdna4.supports(QuantMode::Fp8Native), "RDNA4 must support native fp8");
     Ok(())
 }
 
@@ -157,7 +157,7 @@ fn capability_default_has_no_options_for_unknown_arch() -> TestResult {
     let c = arch_capability(GcnArch::Other);
     // Specifically: fp32 only. No fp8/bf16/f16/int8 silently.
     assert!(c.supports(QuantMode::Fp32));
-    assert!(!c.supports(QuantMode::Fp8));
+    assert!(!c.supports(QuantMode::Fp8Native));
     assert!(!c.supports(QuantMode::Bf16));
     Ok(())
 }
@@ -169,7 +169,7 @@ fn capability_supports_each_quant_mode_independently() -> TestResult {
     assert!(r2.supports(QuantMode::Fp32));
     assert!(r2.supports(QuantMode::F16));
     assert!(r2.supports(QuantMode::Bf16));
-    assert!(!r2.supports(QuantMode::Fp8));
+    assert!(!r2.supports(QuantMode::Fp8Native));
     Ok(())
 }
 
@@ -206,17 +206,14 @@ fn quant_capability_debug_print_does_not_panic() -> TestResult {
 
 #[test]
 fn dispatch_fp8_prefers_fp8_on_rna4() -> TestResult {
-    // (no `use` of QuantMode errors here; we just import a `u32`-typed
-    //  function-callable dispatch from elsewhere).
-    // The dispatch lives in `quantization::resolve_quant_mode`.
-    let m = grim_backend_rocm::quantization::resolve_quant_mode(GcnArch::RDNA4, QuantMode::Fp8);
-    assert_eq!(m, QuantMode::Fp8, "RDNA4 must run fp8 as requested");
+    let m = grim_backend_rocm::quantization::resolve_quant_mode(GcnArch::RDNA4, QuantMode::Fp8Native);
+    assert_eq!(m, QuantMode::Fp8Native, "RDNA4 must run fp8_native as requested");
     Ok(())
 }
 
 #[test]
 fn dispatch_fp8_downgrades_to_bf16_on_rna3() -> TestResult {
-    let m = grim_backend_rocm::quantization::resolve_quant_mode(GcnArch::RDNA3, QuantMode::Fp8);
+    let m = grim_backend_rocm::quantization::resolve_quant_mode(GcnArch::RDNA3, QuantMode::Fp8Native);
     assert_eq!(
         m,
         QuantMode::Bf16,
@@ -227,7 +224,7 @@ fn dispatch_fp8_downgrades_to_bf16_on_rna3() -> TestResult {
 
 #[test]
 fn dispatch_fp8_downgrades_to_bf16_on_rna2() -> TestResult {
-    let m = grim_backend_rocm::quantization::resolve_quant_mode(GcnArch::RDNA2, QuantMode::Fp8);
+    let m = grim_backend_rocm::quantization::resolve_quant_mode(GcnArch::RDNA2, QuantMode::Fp8Native);
     assert_eq!(m, QuantMode::Bf16);
     Ok(())
 }

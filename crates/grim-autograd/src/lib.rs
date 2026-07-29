@@ -38,6 +38,7 @@ pub mod adamw;
 pub mod backward;
 pub mod injection;
 pub mod loss;
+pub mod lr_schedule;
 pub mod ops;
 pub mod param;
 pub mod preference_loss;
@@ -45,6 +46,7 @@ pub mod registry;
 pub mod tape;
 
 pub use adamw::{AdamW, AdamWConfig};
+pub use lr_schedule::CosineWarmupSchedule;
 pub use backward::{BackwardContext, backward};
 pub use injection::{
     InjectionConfig, LoRAInjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry,
