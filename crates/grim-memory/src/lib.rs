@@ -372,7 +372,9 @@ pub struct PagedKvCache {
     pool: Arc<Mutex<KvBlockPool>>,
     num_heads: usize,
     head_dim: usize,
-    /// Number of "tentative" (speculative-draft) slots at the end.
+    /// Number of committed tokens in the sequence.
+    committed_tokens: usize,
+    /// Number of "tentative" (speculative-draft) tokens at the end.
     tentative_len: usize,
 }
 
@@ -387,77 +389,83 @@ impl PagedKvCache {
             pool,
             num_heads,
             head_dim,
+            committed_tokens: 0,
             tentative_len: 0,
-        }
-    }
-
-    /// Token count as computed from the block table.
-    fn token_count(&self) -> usize {
-        let full_blocks = self.table.len().saturating_sub(1);
-        let full_tokens = full_blocks * BLOCK_SIZE;
-        let partial = self.table.logical_to_physical.last().map(|&bid| {
-            self.pool.lock().unwrap().blocks.get(bid).map_or(BLOCK_SIZE, |b| b.num_tokens)
-        }).unwrap_or(0);
-        if partial > 0 && self.table.logical_to_physical.len() > 0 {
-            full_tokens + partial
-        } else {
-            full_tokens
         }
     }
 }
 
 impl KvCache for PagedKvCache {
     fn append_slot(&mut self) -> Result<()> {
-        let mut pool = self.pool.lock().unwrap();
-        let id = pool.alloc()?;
-        self.table.push(id);
-        Ok(())
-    }
-
-    fn tentative_append(&mut self, n: usize) -> Result<()> {
-        for _ in 0..n {
-            self.append_slot()?;
+        self.committed_tokens += 1;
+        let req_blocks = self.committed_tokens.div_ceil(BLOCK_SIZE);
+        if self.table.len() < req_blocks {
+            let mut pool = self.pool.lock().unwrap();
+            let id = pool.alloc()?;
+            self.table.push(id);
         }
-        self.tentative_len += n;
         Ok(())
     }
 
-    fn commit(&mut self, accepted_len: usize) -> Result<()> {
-        let current_len = self.token_count();
-        if accepted_len >= current_len {
-            self.tentative_len = 0;
+    fn tentative_append(&mut self, n_tokens: usize) -> Result<()> {
+        if n_tokens == 0 {
             return Ok(());
         }
-        let to_drop_blocks = self.tentative_len.saturating_sub(accepted_len / BLOCK_SIZE);
-        let mut pool = self.pool.lock().unwrap();
-        for _ in 0..to_drop_blocks {
-            if let Some(pid) = self.table.logical_to_physical.pop() {
-                pool.free_with_tier(pid, false).ok();
+        let total_tokens = self.committed_tokens + self.tentative_len + n_tokens;
+        let req_blocks = total_tokens.div_ceil(BLOCK_SIZE);
+        if self.table.len() < req_blocks {
+            let needed = req_blocks - self.table.len();
+            let mut pool = self.pool.lock().unwrap();
+            for _ in 0..needed {
+                let id = pool.alloc()?;
+                self.table.push(id);
             }
         }
-        self.tentative_len = 0;
+        self.tentative_len += n_tokens;
         Ok(())
     }
 
-    fn rollback_to(&mut self, len: usize) -> Result<()> {
-        let current = self.token_count();
-        if len >= current {
-            return Ok(());
-        }
+    fn commit(&mut self, accepted_tokens: usize) -> Result<()> {
+        let accepted = accepted_tokens.min(self.tentative_len);
+        self.committed_tokens += accepted;
+        self.tentative_len = 0;
+        let keep_blocks = if self.committed_tokens == 0 {
+            0
+        } else {
+            self.committed_tokens.div_ceil(BLOCK_SIZE)
+        };
         let mut pool = self.pool.lock().unwrap();
-        while self.token_count() > len {
+        while self.table.len() > keep_blocks {
             if let Some(pid) = self.table.logical_to_physical.pop() {
                 pool.free_with_tier(pid, false).ok();
             } else {
                 break;
             }
         }
-        self.tentative_len = self.tentative_len.min(self.table.logical_to_physical.len());
+        Ok(())
+    }
+
+    fn rollback_to(&mut self, len: usize) -> Result<()> {
+        self.committed_tokens = self.committed_tokens.min(len);
+        self.tentative_len = 0;
+        let keep_blocks = if self.committed_tokens == 0 {
+            0
+        } else {
+            self.committed_tokens.div_ceil(BLOCK_SIZE)
+        };
+        let mut pool = self.pool.lock().unwrap();
+        while self.table.len() > keep_blocks {
+            if let Some(pid) = self.table.logical_to_physical.pop() {
+                pool.free_with_tier(pid, false).ok();
+            } else {
+                break;
+            }
+        }
         Ok(())
     }
 
     fn len(&self) -> usize {
-        self.token_count()
+        self.committed_tokens + self.tentative_len
     }
 
     fn current_k(&self) -> Result<Tensor> {
@@ -664,9 +672,10 @@ mod tests {
         let pool = Arc::new(Mutex::new(KvBlockPool::new(4, 2, 4)));
         let mut cache = PagedKvCache::new(pool.clone(), 2, 4);
 
-        // Append two slots (allocates two blocks)
-        cache.append_slot().unwrap();
-        cache.append_slot().unwrap();
+        // Append two blocks of slots (32 slots = 2 blocks of BLOCK_SIZE 16)
+        for _ in 0..(2 * BLOCK_SIZE) {
+            cache.append_slot().unwrap();
+        }
 
         // Populate mock data into the pool for these physical blocks
         {
@@ -700,5 +709,33 @@ mod tests {
             assert_eq!(k_data[i], 3.0f32);
             assert_eq!(v_data[i], 4.0f32);
         }
+    }
+
+    #[test]
+    fn test_speculative_kv_rollback_units() {
+        let pool = Arc::new(Mutex::new(KvBlockPool::new(10, 2, 4)));
+        let mut cache = PagedKvCache::new(pool.clone(), 2, 4);
+
+        // 1. Append 16 committed slots (1 full block of 16 tokens)
+        for _ in 0..16 {
+            cache.append_slot().unwrap();
+        }
+        assert_eq!(cache.len(), 16);
+        assert_eq!(cache.table.len(), 1);
+
+        // 2. Tentatively append 5 tokens (requires 2nd block since 16+5=21 > 16)
+        cache.tentative_append(5).unwrap();
+        assert_eq!(cache.len(), 21);
+        assert_eq!(cache.table.len(), 2);
+
+        // 3. Commit 2 of 5 accepted tokens -> total 18 committed tokens -> requires 2 blocks
+        cache.commit(2).unwrap();
+        assert_eq!(cache.len(), 18);
+        assert_eq!(cache.table.len(), 2);
+
+        // 4. Rollback to 16 tokens -> 1 block retained, 1 block freed back to pool
+        cache.rollback_to(16).unwrap();
+        assert_eq!(cache.len(), 16);
+        assert_eq!(cache.table.len(), 1);
     }
 }

@@ -363,10 +363,16 @@ pub fn read_outliers<R: Read + Seek>(
     if entry.outlier_count == 0 {
         return Ok(Vec::new());
     }
+    if entry.outlier_count > 10_000_000 {
+        return Err(Error::Backend(format!(
+            "outlier_count {} exceeds safety limit",
+            entry.outlier_count
+        )));
+    }
     reader.seek(SeekFrom::Start(entry.outlier_offset))?;
     let mut buf = vec![0u8; entry.outlier_count as usize * OUTLIER_RECORD_BYTES];
     reader.read_exact(&mut buf)?;
-    let mut outliers = Vec::with_capacity(entry.outlier_count as usize);
+    let mut outliers = Vec::with_capacity((entry.outlier_count as usize).min(100_000));
     for chunk in buf.chunks_exact(OUTLIER_RECORD_BYTES) {
         outliers.push(GrimOutlier::decode(chunk)?);
     }
@@ -1036,8 +1042,14 @@ impl GrimFile {
         };
 
         // Tensor registry.
+        if header.num_tensors > 1_000_000 {
+            return Err(Error::Backend(format!(
+                ".grim header num_tensors {} exceeds safety limit",
+                header.num_tensors
+            )));
+        }
         let has_kv = metadata.has_kv_registry.unwrap_or(false);
-        let mut tensors = Vec::with_capacity(header.num_tensors as usize);
+        let mut tensors = Vec::with_capacity((header.num_tensors as usize).min(10_000));
         for _ in 0..header.num_tensors {
             tensors.push(GrimTensorEntry::read(reader, has_kv)?);
         }

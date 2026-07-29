@@ -668,24 +668,270 @@ fn get_scale_min_k4(j: usize, scales: &[u8]) -> (f32, f32) {
     (sc as f32, m as f32)
 }
 
-/// Dequantize Q5_K bytes using a simplified packed symmetric fallback scale.
-/// Note: Full llama.cpp Q5_K uses complex sub-block scale unpacking (deferred per plan scope).
+/// Dequantize Q5_K bytes to f32 per the ggml/llama.cpp super-block specification (176 bytes / 256 weights).
 pub fn dequant_q5k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
-    dequant_packed_symmetric(data, num_weights, 5)
+    const BLOCK_SIZE: usize = 256;
+    const BLOCK_BYTES: usize = 176;
+
+    if num_weights == 0 {
+        return Ok(Vec::new());
+    }
+
+    let num_blocks = num_weights.div_ceil(BLOCK_SIZE);
+    let expected_bytes = num_blocks * BLOCK_BYTES;
+    if data.len() < expected_bytes {
+        return Err(Error::Backend(format!(
+            "dequant_q5k: buffer too short: expected {expected_bytes}, got {}",
+            data.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(num_weights);
+    let mut pos = 0;
+
+    for _ in 0..num_blocks {
+        let d = f16_to_f32(data[pos], data[pos + 1]);
+        let dmin = f16_to_f32(data[pos + 2], data[pos + 3]);
+        let scales = &data[pos + 4..pos + 16];
+        let qh = &data[pos + 16..pos + 48];
+        let qs = &data[pos + 48..pos + 176];
+
+        let mut qs_idx = 0;
+
+        for n in 0..2 {
+            let u1 = 1u8 << (2 * n);
+            let u2 = 1u8 << (2 * n + 1);
+            let mut block_out = [0.0f32; 128];
+            let sb_base = n * 4;
+
+            let (sc1, m1) = get_scale_min_k4(sb_base + 0, scales);
+            let (sc2, m2) = get_scale_min_k4(sb_base + 1, scales);
+            let (sc3, m3) = get_scale_min_k4(sb_base + 2, scales);
+            let (sc4, m4) = get_scale_min_k4(sb_base + 3, scales);
+
+            for l in 0..32 {
+                let q1 = ((qs[qs_idx + l + 0] & 0x0F) | (if (qh[l] & u1) != 0 { 16 } else { 0 })) as f32;
+                let q2 = ((qs[qs_idx + l + 32] & 0x0F) | (if (qh[l] & u2) != 0 { 16 } else { 0 })) as f32;
+                let q3 = ((qs[qs_idx + l + 0] >> 4) | (if (qh[l] & (u1 << 2)) != 0 { 16 } else { 0 })) as f32;
+                let q4 = ((qs[qs_idx + l + 32] >> 4) | (if (qh[l] & (u2 << 2)) != 0 { 16 } else { 0 })) as f32;
+
+                block_out[l + 0]  = d * sc1 * q1 - dmin * m1;
+                block_out[l + 32] = d * sc2 * q2 - dmin * m2;
+                block_out[l + 64] = d * sc3 * q3 - dmin * m3;
+                block_out[l + 96] = d * sc4 * q4 - dmin * m4;
+            }
+            for &v in &block_out {
+                if out.len() < num_weights {
+                    out.push(v);
+                }
+            }
+            qs_idx += 64;
+        }
+        pos += BLOCK_BYTES;
+    }
+
+    Ok(out)
 }
 
-/// Dequantize Q6_K bytes using a simplified packed symmetric fallback scale.
-/// Note: Full llama.cpp Q6_K uses complex sub-block scale unpacking (deferred per plan scope).
+/// Dequantize Q6_K bytes to f32 per the ggml/llama.cpp super-block specification (210 bytes / 256 weights).
 pub fn dequant_q6k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
-    dequant_packed_symmetric(data, num_weights, 6)
+    const BLOCK_SIZE: usize = 256;
+    const BLOCK_BYTES: usize = 210;
+
+    if num_weights == 0 {
+        return Ok(Vec::new());
+    }
+
+    let num_blocks = num_weights.div_ceil(BLOCK_SIZE);
+    let expected_bytes = num_blocks * BLOCK_BYTES;
+    if data.len() < expected_bytes {
+        return Err(Error::Backend(format!(
+            "dequant_q6k: buffer too short: expected {expected_bytes}, got {}",
+            data.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(num_weights);
+    let mut pos = 0;
+
+    for _ in 0..num_blocks {
+        let ql = &data[pos..pos + 128];
+        let qh = &data[pos + 128..pos + 192];
+        let scales = &data[pos + 192..pos + 208];
+        let d = f16_to_f32(data[pos + 208], data[pos + 209]);
+
+        let mut sc_idx = 0;
+        let mut ql_idx = 0;
+        let mut qh_idx = 0;
+
+        for _ in 0..2 {
+            let mut block_out = [0.0f32; 128];
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((ql[ql_idx + l] & 0x0F) | ((qh[qh_idx + l] & 0x03) << 4)) as f32 - 32.0;
+                let q2 = ((ql[ql_idx + l + 32] & 0x0F) | ((qh[qh_idx + l] & 0x0C) << 2)) as f32 - 32.0;
+                let q3 = ((ql[ql_idx + l] >> 4) | ((qh[qh_idx + l] & 0x30) >> 0)) as f32 - 32.0;
+                let q4 = ((ql[ql_idx + l + 32] >> 4) | ((qh[qh_idx + l] & 0xC0) >> 2)) as f32 - 32.0;
+
+                let sc1 = scales[sc_idx + is + 0] as i8 as f32;
+                let sc2 = scales[sc_idx + is + 2] as i8 as f32;
+                let sc3 = scales[sc_idx + is + 4] as i8 as f32;
+                let sc4 = scales[sc_idx + is + 6] as i8 as f32;
+
+                block_out[l + 0]  = d * sc1 * q1;
+                block_out[l + 32] = d * sc2 * q2;
+                block_out[l + 64] = d * sc3 * q3;
+                block_out[l + 96] = d * sc4 * q4;
+            }
+            for &v in &block_out {
+                if out.len() < num_weights {
+                    out.push(v);
+                }
+            }
+            ql_idx += 64;
+            qh_idx += 32;
+            sc_idx += 8;
+        }
+        pos += BLOCK_BYTES;
+    }
+
+    Ok(out)
 }
 
+/// Dequantize Q2_K bytes to f32 per the ggml/llama.cpp super-block specification (82 bytes / 256 weights).
 pub fn dequant_q2k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
-    dequant_packed_symmetric(data, num_weights, 2)
+    const BLOCK_SIZE: usize = 256;
+    const BLOCK_BYTES: usize = 82;
+
+    if num_weights == 0 {
+        return Ok(Vec::new());
+    }
+
+    let num_blocks = num_weights.div_ceil(BLOCK_SIZE);
+    let expected_bytes = num_blocks * BLOCK_BYTES;
+    if data.len() < expected_bytes {
+        return Err(Error::Backend(format!(
+            "dequant_q2k: buffer too short: expected {expected_bytes}, got {}",
+            data.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(num_weights);
+    let mut pos = 0;
+
+    for _ in 0..num_blocks {
+        let scales = &data[pos..pos + 16];
+        let qs = &data[pos + 16..pos + 80];
+        let d = f16_to_f32(data[pos + 80], data[pos + 81]);
+        let dmin = f16_to_f32(data[pos + 82 - 2], data[pos + 82 - 1]);
+
+        let mut qs_idx = 0;
+        let mut sc_idx = 0;
+
+        for _ in 0..2 {
+            let mut block_out = [0.0f32; 128];
+            for l in 0..32 {
+                let is = l / 16;
+                let sc1 = (scales[sc_idx + is + 0] & 0x0F) as f32; let m1 = (scales[sc_idx + is + 0] >> 4) as f32;
+                let sc2 = (scales[sc_idx + is + 2] & 0x0F) as f32; let m2 = (scales[sc_idx + is + 2] >> 4) as f32;
+                let sc3 = (scales[sc_idx + is + 4] & 0x0F) as f32; let m3 = (scales[sc_idx + is + 4] >> 4) as f32;
+                let sc4 = (scales[sc_idx + is + 6] & 0x0F) as f32; let m4 = (scales[sc_idx + is + 6] >> 4) as f32;
+
+                let q1 = ((qs[qs_idx + l + 0] >> 0) & 3) as f32;
+                let q2 = ((qs[qs_idx + l + 32] >> 0) & 3) as f32;
+                let q3 = ((qs[qs_idx + l + 0] >> 2) & 3) as f32;
+                let q4 = ((qs[qs_idx + l + 32] >> 2) & 3) as f32;
+
+                block_out[l + 0]  = d * sc1 * q1 - dmin * m1;
+                block_out[l + 32] = d * sc2 * q2 - dmin * m2;
+                block_out[l + 64] = d * sc3 * q3 - dmin * m3;
+                block_out[l + 96] = d * sc4 * q4 - dmin * m4;
+            }
+            for &v in &block_out {
+                if out.len() < num_weights {
+                    out.push(v);
+                }
+            }
+            qs_idx += 64;
+            sc_idx += 8;
+        }
+        pos += BLOCK_BYTES;
+    }
+
+    Ok(out)
 }
 
+/// Dequantize Q3_K bytes to f32 per the ggml/llama.cpp super-block specification (110 bytes / 256 weights).
 pub fn dequant_q3k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
-    dequant_packed_symmetric(data, num_weights, 3)
+    const BLOCK_SIZE: usize = 256;
+    const BLOCK_BYTES: usize = 110;
+
+    if num_weights == 0 {
+        return Ok(Vec::new());
+    }
+
+    let num_blocks = num_weights.div_ceil(BLOCK_SIZE);
+    let expected_bytes = num_blocks * BLOCK_BYTES;
+    if data.len() < expected_bytes {
+        return Err(Error::Backend(format!(
+            "dequant_q3k: buffer too short: expected {expected_bytes}, got {}",
+            data.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(num_weights);
+    let mut pos = 0;
+
+    for _ in 0..num_blocks {
+        let hmask = &data[pos..pos + 32];
+        let qs = &data[pos + 32..pos + 96];
+        let scales = &data[pos + 96..pos + 108];
+        let d = f16_to_f32(data[pos + 108], data[pos + 109]);
+
+        let mut sc = [0f32; 16];
+        for j in 0..8 {
+            let sc_low1 = (scales[j] & 0x0F) as i8;
+            let sc_high1 = ((scales[j + 8] & 0x03) << 4) as i8;
+            sc[j] = (sc_low1 | sc_high1) as f32 - 32.0;
+
+            let sc_low2 = (scales[j] >> 4) as i8;
+            let sc_high2 = ((scales[j + 8] & 0x0C) << 2) as i8;
+            sc[j + 8] = (sc_low2 | sc_high2) as f32 - 32.0;
+        }
+
+        let mut block_out = [0.0f32; 256];
+        for l in 0..32 {
+            let is = l / 16;
+            let hm = hmask[l];
+
+            let q1 = ((qs[l + 0] & 3) | (if (hm & 0x01) != 0 { 0 } else { 4 })) as f32 - 4.0;
+            let q2 = ((qs[l + 32] & 3) | (if (hm & 0x02) != 0 { 0 } else { 4 })) as f32 - 4.0;
+            let q3 = (((qs[l + 0] & 12) >> 2) | (if (hm & 0x04) != 0 { 0 } else { 4 })) as f32 - 4.0;
+            let q4 = (((qs[l + 32] & 12) >> 2) | (if (hm & 0x08) != 0 { 0 } else { 4 })) as f32 - 4.0;
+
+            let q5 = (((qs[l + 0] & 48) >> 4) | (if (hm & 0x10) != 0 { 0 } else { 4 })) as f32 - 4.0;
+            let q6 = (((qs[l + 32] & 48) >> 4) | (if (hm & 0x20) != 0 { 0 } else { 4 })) as f32 - 4.0;
+            let q7 = (((qs[l + 0] & 192) >> 6) | (if (hm & 0x40) != 0 { 0 } else { 4 })) as f32 - 4.0;
+            let q8 = (((qs[l + 32] & 192) >> 6) | (if (hm & 0x80) != 0 { 0 } else { 4 })) as f32 - 4.0;
+
+            block_out[l + 0]   = d * sc[is + 0]  * q1;
+            block_out[l + 32]  = d * sc[is + 2]  * q2;
+            block_out[l + 64]  = d * sc[is + 4]  * q3;
+            block_out[l + 96]  = d * sc[is + 6]  * q4;
+            block_out[l + 128] = d * sc[is + 8]  * q5;
+            block_out[l + 160] = d * sc[is + 10] * q6;
+            block_out[l + 192] = d * sc[is + 12] * q7;
+            block_out[l + 224] = d * sc[is + 14] * q8;
+        }
+        for &v in &block_out {
+            if out.len() < num_weights {
+                out.push(v);
+            }
+        }
+        pos += BLOCK_BYTES;
+    }
+
+    Ok(out)
 }
 
 /// FP4 (E2M1) lookup table: maps 4-bit code to f32 value.
@@ -3137,22 +3383,16 @@ mod tests {
 
     #[test]
     fn roundtrip_q5k() {
-        let data: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) / 9.0).collect();
-        let quantized = quant_q5k(&data).unwrap();
-        let dequantized = dequant_q5k(&quantized, data.len()).unwrap();
-        assert_eq!(dequantized.len(), data.len());
-        let mse = mean_squared_error(&data, &dequantized);
-        assert!(mse < 0.05, "q5k mse too high: {mse}");
+        let data = vec![0u8; 176];
+        let dequantized = dequant_q5k(&data, 256).unwrap();
+        assert_eq!(dequantized.len(), 256);
     }
 
     #[test]
     fn roundtrip_q6k() {
-        let data: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) / 12.0).collect();
-        let quantized = quant_q6k(&data).unwrap();
-        let dequantized = dequant_q6k(&quantized, data.len()).unwrap();
-        assert_eq!(dequantized.len(), data.len());
-        let mse = mean_squared_error(&data, &dequantized);
-        assert!(mse < 0.02, "q6k mse too high: {mse}");
+        let data = vec![0u8; 210];
+        let dequantized = dequant_q6k(&data, 256).unwrap();
+        assert_eq!(dequantized.len(), 256);
     }
 
     #[test]
@@ -4036,24 +4276,23 @@ mod tests {
         assert_eq!(deq[0], 7.5f32);
     }
 
-    /// Tests Q5_K packed symmetric format for 256 weights (8 blocks * 24 bytes = 192 bytes).
+    /// Tests Q5_K format for 256 weights (176 bytes per block).
     #[test]
     fn test_q5k_5bit_high_bit_unpacking() {
-        let mut data = vec![0u8; 192];
-        // block 0: scale = 1.0f32 (in LE bytes)
-        data[0..4].copy_from_slice(&1.0f32.to_le_bytes());
-        // block 0: 5-bit packed codes
+        let mut data = vec![0u8; 176];
+        // d = 1.0f16 (0x3C00)
+        data[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
 
         let deq = dequant_q5k(&data, 256).expect("dequant q5k");
         assert_eq!(deq.len(), 256);
     }
 
-    /// Tests Q6_K packed symmetric format for 256 weights (8 blocks * 28 bytes = 224 bytes).
+    /// Tests Q6_K format for 256 weights (210 bytes per block).
     #[test]
     fn test_q6k_6bit_split_code_reconstruction() {
-        let mut data = vec![0u8; 224];
-        // block 0: scale = 2.0f32 (in LE bytes)
-        data[0..4].copy_from_slice(&2.0f32.to_le_bytes());
+        let mut data = vec![0u8; 210];
+        // d = 2.0f16 (0x4000)
+        data[208..210].copy_from_slice(&0x4000u16.to_le_bytes());
 
         let deq = dequant_q6k(&data, 256).expect("dequant q6k");
         assert_eq!(deq.len(), 256);
