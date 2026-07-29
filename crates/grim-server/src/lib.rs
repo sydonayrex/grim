@@ -1365,6 +1365,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Dashboard:
         .route("/", get(dashboard_html))
         .route("/api/stats", get(stats_endpoint))
+        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
         .with_state(state)
 }
 

@@ -17,11 +17,12 @@ fn kernel_source_has_no_duplicate_device_fns() {
         "dequant_q4k_element",
     ];
     for sym in &symbols {
-        let count = src.matches(sym).count();
+        let target = format!("float {sym}(");
+        let count = src.matches(&target).count();
         assert_eq!(
             count, 1,
-            "symbol '{}' appears {} times in concatenated kernel source; expected 1",
-            sym, count
+            "symbol definition '{}' appears {} times in concatenated kernel source; expected 1",
+            target, count
         );
     }
 }
@@ -33,10 +34,11 @@ fn kernel_source_has_no_duplicate_device_fns() {
 #[ignore = "requires GRIM_RUN_GPU_TESTS=1 and a real ROCm GPU"]
 fn rocm_trait_ops_are_reachable_via_dyn() {
     let dev: Box<dyn BackendDevice> =
-        Box::new(RocmDevice::new(0).unwrap());
-    let dummy = dev.zeros(&[1, 1], grim_tensor::DType::BF16).unwrap();
-    // Any error other than Unimplemented is acceptable for the dummy tensors.
-    let r = dev.selective_scan(&dummy, &dummy, &dummy, &dummy, &dummy);
+        Box::new(RocmDevice::new(0));
+    let shape = grim_tensor::Shape::new(vec![1, 1]);
+    let dummy = dev.zeros(&shape, grim_tensor::DType::BF16).unwrap();
+    let s = dummy.as_ref();
+    let r = dev.selective_scan(s, s, s, s, s, 1, 1, 1, 1, &shape);
     assert!(
         !matches!(r, Err(grim_tensor::error::Error::Unimplemented(_))),
         "selective_scan must not return Unimplemented when called via dyn BackendDevice"

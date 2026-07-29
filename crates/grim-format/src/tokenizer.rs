@@ -16,6 +16,8 @@ pub struct GgufTokenizer {
     pub byte_decoder: Option<HashMap<char, u8>>,
     /// EOS token ID if available from tokenizer metadata
     pub eos_token_id: Option<u32>,
+    /// UNK token ID if available from tokenizer metadata
+    pub unk_token_id: Option<u32>,
     /// Jinja chat template extracted from GGUF `tokenizer.chat_template`, if present.
     /// Drives instruction-tuned prompt formatting in the CLI/server prompt path.
     pub chat_template: Option<String>,
@@ -31,6 +33,7 @@ impl Default for GgufTokenizer {
             bpe_merges: None,
             byte_decoder: None,
             eos_token_id: None,
+            unk_token_id: None,
             chat_template: None,
         }
     }
@@ -42,6 +45,15 @@ impl GgufTokenizer {
         self.token_to_id.get("<|pad|>")
             .or_else(|| self.token_to_id.get("<pad>"))
             .copied()
+            .unwrap_or(0)
+    }
+
+    /// Return UNK token ID if configured or present in vocabulary, defaulting to 0.
+    pub fn unk_token_id(&self) -> u32 {
+        self.unk_token_id
+            .or_else(|| self.token_to_id.get("<unk>").copied())
+            .or_else(|| self.token_to_id.get("<|unk|>").copied())
+            .or_else(|| self.token_to_id.get("<|unknown|>").copied())
             .unwrap_or(0)
     }
 
@@ -128,6 +140,11 @@ impl GgufTokenizer {
                 })
         } else { None };
 
+        let unk_token_id = token_to_id.get("<unk>")
+            .or_else(|| token_to_id.get("<|unk|>"))
+            .or_else(|| token_to_id.get("<|unknown|>"))
+            .copied();
+
         Ok(Self {
             tokens: id_to_token,
             token_to_id,
@@ -136,6 +153,7 @@ impl GgufTokenizer {
             bpe_merges,
             byte_decoder: if model_type == "bpe" { Some(gpt2_byte_decoder()) } else { None },
             eos_token_id: None, // HF tokenizer.json doesn't have explicit EOS token ID in a standard way
+            unk_token_id,
             chat_template: None,
         })
     }
@@ -181,6 +199,11 @@ impl GgufTokenizer {
             .get("tokenizer.ggml.eos_token_id")
             .and_then(|v| v.as_u32());
 
+        // Extract UNK token ID from metadata (typically tokenizer.ggml.unknown_token_id)
+        let unk_token_id = metadata
+            .get("tokenizer.ggml.unknown_token_id")
+            .and_then(|v| v.as_u32());
+
         // Extract the Jinja chat template if the GGUF embeds one.
         let chat_template = metadata
             .get("tokenizer.chat_template")
@@ -195,6 +218,7 @@ impl GgufTokenizer {
             bpe_merges: None,
             byte_decoder: None,
             eos_token_id,
+            unk_token_id,
             chat_template,
         })
     }
@@ -440,7 +464,7 @@ impl GgufTokenizer {
                         if let Some(&id) = self.token_to_id.get(&cs) {
                             ids.push(id);
                         } else {
-                            ids.push(0); // unknown → pad
+                            ids.push(self.unk_token_id()); // unknown token fallback
                         }
                     }
                 }
@@ -458,7 +482,7 @@ impl GgufTokenizer {
             if let Some(&id) = self.token_to_id.get(&cs) {
                 ids.push(id);
             } else {
-                ids.push(0);
+                ids.push(self.unk_token_id());
             }
         }
         ids

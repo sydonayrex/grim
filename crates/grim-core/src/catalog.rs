@@ -81,6 +81,18 @@ impl ModelEntry {
     }
 }
 
+fn is_safe_model_path(path: &Path, models_dir: &Path) -> bool {
+    let s = path.to_string_lossy();
+    if s.contains("..") {
+        return false;
+    }
+    if let (Ok(canon_path), Ok(canon_dir)) = (path.canonicalize(), models_dir.canonicalize()) {
+        canon_path.starts_with(canon_dir)
+    } else {
+        !path.is_absolute()
+    }
+}
+
 /// Resolve a model name or alias to a file path on disk.
 ///
 /// Resolution order:
@@ -93,13 +105,13 @@ impl ModelEntry {
 /// Returns `None` when no match is found. The caller should print a helpful
 /// message directing the user to run `grim pull <name>`.
 pub fn resolve_model_path(name: &str) -> Option<PathBuf> {
-    // 1. Direct path.
+    let models_dir = grim_models_dir();
+
+    // 1. Direct path (guarded against traversal).
     let direct = Path::new(name);
-    if direct.exists() {
+    if direct.exists() && is_safe_model_path(direct, &models_dir) {
         return Some(direct.to_path_buf());
     }
-
-    let models_dir = grim_models_dir();
 
     // 2. Sidecar lookup — accurate, includes arch/name metadata.
     if let Ok(entries) = std::fs::read_dir(&models_dir) {
@@ -167,17 +179,17 @@ pub fn resolve_model_path(name: &str) -> Option<PathBuf> {
 /// a `.grim` candidate takes precedence over a `.gguf` candidate for the
 /// same stem.
 pub fn resolve_model_preferring_grim(name: &str) -> Option<PathBuf> {
-    // 1. Direct path.
+    let models_dir = grim_models_dir();
+
+    // 1. Direct path (guarded against traversal).
     let direct = Path::new(name);
-    if direct.exists() {
+    if direct.exists() && is_safe_model_path(direct, &models_dir) {
         // Prefer a `.grim` sibling if the user pointed at a `.gguf` directly.
         if let Some(grim_sibling) = grim_sibling_if_gguf(direct) {
             return Some(grim_sibling);
         }
         return Some(direct.to_path_buf());
     }
-
-    let models_dir = grim_models_dir();
 
     // 2. Sidecar lookup — accurate, includes arch/name metadata.
     if let Ok(entries) = std::fs::read_dir(&models_dir) {

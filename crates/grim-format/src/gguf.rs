@@ -1085,16 +1085,32 @@ pub fn read_gguf<R: Read + Seek>(mut reader: R) -> Result<GgufFile> {
     let tensor_count = read_u64_le(&mut reader)?;
     let metadata_kv_count = read_u64_le(&mut reader)?;
 
-    let mut metadata = HashMap::new();
+    if tensor_count > 1_000_000 {
+        return Err(Error::Backend(format!(
+            "GGUF header tensor_count {tensor_count} exceeds safety limit"
+        )));
+    }
+    if metadata_kv_count > 1_000_000 {
+        return Err(Error::Backend(format!(
+            "GGUF header metadata_kv_count {metadata_kv_count} exceeds safety limit"
+        )));
+    }
+
+    let mut metadata = HashMap::with_capacity((metadata_kv_count as usize).min(10_000));
     for _ in 0..metadata_kv_count {
         let key = read_gguf_string(&mut reader)?;
         let value = read_gguf_value(&mut reader)?;
         metadata.insert(key, value);
     }
-    let mut tensors = Vec::with_capacity(tensor_count as usize);
+    let mut tensors = Vec::with_capacity((tensor_count as usize).min(10_000));
     for _ in 0..tensor_count {
         let name = read_gguf_string(&mut reader)?;
         let n_dims = read_u32_le(&mut reader)?;
+        if n_dims > 16 {
+            return Err(Error::Backend(format!(
+                "GGUF tensor n_dims {n_dims} exceeds maximum allowed rank (16)"
+            )));
+        }
         let mut dims: Vec<u64> = Vec::with_capacity(n_dims as usize);
         for _ in 0..n_dims {
             dims.push(read_u64_le(&mut reader)?);
@@ -1124,9 +1140,26 @@ pub fn read_gguf<R: Read + Seek>(mut reader: R) -> Result<GgufFile> {
             dtype,
         });
     }
-    // data_start is at the current reader position, aligned to 32 bytes
+    // data_start is at current reader position aligned to general.alignment (default 32)
     let pos = reader.stream_position()?;
-    let data_start = (pos + 31) & !31;
+    let alignment = metadata
+        .get("general.alignment")
+        .and_then(|v| match v {
+            GgufValue::Uint32(a) => Some(*a as u64),
+            GgufValue::Uint64(a) => Some(*a),
+            GgufValue::Uint16(a) => Some(*a as u64),
+            GgufValue::Uint8(a) => Some(*a as u64),
+            GgufValue::Int32(a) if *a > 0 => Some(*a as u64),
+            GgufValue::Int64(a) if *a > 0 => Some(*a as u64),
+            _ => None,
+        })
+        .unwrap_or(32);
+    let data_start = if alignment > 0 && (alignment & (alignment - 1)) == 0 {
+        let mask = alignment - 1;
+        (pos + mask) & !mask
+    } else {
+        (pos + 31) & !31
+    };
 
     Ok(GgufFile {
         version,
@@ -1166,8 +1199,13 @@ fn read_u64_le<R: Read>(r: &mut R) -> Result<u64> {
 }
 
 fn read_gguf_string<R: Read>(r: &mut R) -> Result<String> {
-    let len = read_u64_le(r)? as usize;
-    let mut buf = vec![0u8; len];
+    let len = read_u64_le(r)?;
+    if len > 64 * 1024 * 1024 {
+        return Err(Error::Backend(format!(
+            "GGUF string length {len} exceeds safety limit of 64MB"
+        )));
+    }
+    let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf)?;
     Ok(String::from_utf8(buf).map_err(|e| {
         Error::Backend(format!("GGUF string not valid UTF-8: {e}"))
@@ -1231,7 +1269,12 @@ fn read_gguf_value_with_tag<R: Read>(r: &mut R, tag: u32) -> Result<GgufValue> {
             // themselves be arrays (nested), so recurse on the element tag.
             let elem_tag = read_u32_le(r)?;
             let count = read_u64_le(r)?;
-            let mut items = Vec::with_capacity(count as usize);
+            if count > 10_000_000 {
+                return Err(Error::Backend(format!(
+                    "GGUF array count {count} exceeds safety limit of 10M elements"
+                )));
+            }
+            let mut items = Vec::with_capacity((count as usize).min(100_000));
             for _ in 0..count {
                 items.push(read_gguf_value_with_tag(r, elem_tag)?);
             }

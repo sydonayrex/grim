@@ -462,6 +462,7 @@ mod tests {
             token_to_id,
             scores: None,
             eos_token_id: None,
+            unk_token_id: None,
             model_type: "llama".to_string(),
             bpe_merges: None,
             byte_decoder: None,

@@ -47,13 +47,17 @@ impl JsonlBatchIterator {
         while self.token_buffer.len() < needed && !self.exhausted {
             self.fill_buffer()?;
         }
-        if self.token_buffer.len() < needed {
+        if self.token_buffer.is_empty() {
             return Err(grim_tensor::error::Error::Backend("dataloader exhausted".into()));
+        }
+        let pad_id = self.tokenizer.pad_token_id();
+        while self.token_buffer.len() < needed {
+            self.token_buffer.push(pad_id);
         }
         let flat: Vec<u32> = self.token_buffer.drain(..needed).collect();
         let data_f32: Vec<f32> = flat.iter().map(|&x| x as f32).collect();
         let input_ids = grim_backend_cpu::cpu_tensor(data_f32, Shape::from_slice(&[self.batch_size, self.seq_len]));
-        let labels = Self::build_labels(&flat, self.batch_size, self.seq_len, self.tokenizer.pad_token_id());
+        let labels = Self::build_labels(&flat, self.batch_size, self.seq_len, pad_id);
         Ok((input_ids, labels))
     }
 
@@ -109,7 +113,10 @@ mod tests {
         for _ in 0..10 {
             writeln!(f, r#"{{"text": "hello world"}}"#).unwrap();
         }
-        let tokenizer = GgufTokenizer::default();
+        let mut tokenizer = GgufTokenizer::default();
+        tokenizer.tokens = vec!["hello".into(), "world".into()];
+        tokenizer.token_to_id.insert("hello".into(), 1);
+        tokenizer.token_to_id.insert("world".into(), 2);
         let mut loader = JsonlBatchIterator::new(
             path.to_str().unwrap(),
             tokenizer,

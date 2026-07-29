@@ -353,9 +353,54 @@ async fn resolve_hf_gguf_filename(org: &str, repo: &str) -> Result<String> {
     )))
 }
 
-// ---------------------------------------------------------------------------
-// Plain URL download
-// ---------------------------------------------------------------------------
+use std::net::ToSocketAddrs;
+
+fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            if octets[0] == 127 { return false; }
+            if octets[0] == 10 { return false; }
+            if octets[0] == 172 && (16..=31).contains(&octets[1]) { return false; }
+            if octets[0] == 192 && octets[1] == 168 { return false; }
+            if octets[0] == 169 && octets[1] == 254 { return false; }
+            if ipv4.is_unspecified() || ipv4.is_broadcast() { return false; }
+            true
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            if ipv6.is_loopback() || ipv6.is_unspecified() { return false; }
+            let segments = ipv6.segments();
+            if (segments[0] & 0xfe00) == 0xfc00 { return false; }
+            if (segments[0] & 0xffc0) == 0xfe80 { return false; }
+            true
+        }
+    }
+}
+
+fn validate_public_url(url_str: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url_str)
+        .map_err(|e| Error::Backend(format!("Invalid URL '{url_str}': {e}")))?;
+
+    let host = parsed.host_str().ok_or_else(|| {
+        Error::Backend(format!("URL '{url_str}' missing host"))
+    })?;
+
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addrs: Vec<_> = format!("{host}:{port}")
+        .to_socket_addrs()
+        .map_err(|e| Error::Backend(format!("Failed to resolve host '{host}': {e}")))?
+        .collect();
+
+    for addr in addrs {
+        if !is_public_ip(addr.ip()) {
+            return Err(Error::Backend(format!(
+                "SSRF blocked: Host '{host}' resolves to non-public IP ({})",
+                addr.ip()
+            )));
+        }
+    }
+    Ok(())
+}
 
 async fn download_url<F>(
     url: &str,
@@ -368,6 +413,8 @@ async fn download_url<F>(
 where
     F: Fn(DownloadProgress) + Send + Sync + Clone + 'static,
 {
+    validate_public_url(url)?;
+
     progress_fn(DownloadProgress {
         status: format!("Downloading {}...", url),
         digest: None,
