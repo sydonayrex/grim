@@ -2699,6 +2699,396 @@ impl<T> Choose<T> for [T] {
     }
 }
 
+// ===========================================================================
+// SmoothQuant channel scaling (mockdud.md §3N3b, §6P1)
+// ===========================================================================
+
+/// SmoothQuant: channel-wise activation-aware weight scaling.
+///
+/// Shifts quantization difficulty from activations to weights by
+/// scaling weight columns by the inverse of activation channel
+/// magnitudes. After scaling, weight quantization sees a more uniform
+/// distribution across channels because the activation outliers
+/// have been smoothed.
+///
+/// From: Xiao et al., "SmoothQuant: Accurate and Efficient Post-Training
+/// Quantization for Large Language Models", ICML 2023, arXiv:2211.10438.
+///
+/// # Arguments
+/// - `weights`: mutable slice `[out_channels * in_channels]`, row-major
+///   (weight[row * in_channels + col])
+/// - `out_channels`: number of output channels
+/// - `in_channels`: number of input channels
+/// - `calibration_acts`: optional `[out_channels]` pre-computed
+///   activation magnitudes (e.g. channel-wise L2 norm of calibration
+///   data). When `None`, scales are estimated from weight statistics.
+///
+/// # Returns
+/// Normalized per-output-channel scale factors (length `out_channels`).
+/// The scales are normalized so `max(scale) == 1.0`.
+pub fn apply_smoothquant_scale(
+    weights: &mut [f32],
+    out_channels: usize,
+    in_channels: usize,
+    calibration_acts: Option<&[f32]>,
+) -> Vec<f32> {
+    assert_eq!(
+        weights.len(),
+        out_channels * in_channels,
+        "weights.len() must equal out_channels * in_channels"
+    );
+
+    let mut scales: Vec<f32> = if let Some(acts) = calibration_acts {
+        assert_eq!(
+            acts.len(),
+            out_channels,
+            "calibration_acts.len() must equal out_channels"
+        );
+        acts.to_vec()
+    } else {
+        let mut max_vals = vec![0.0f32; out_channels];
+        for c in 0..out_channels {
+            for r in 0..in_channels {
+                let val = weights[r * out_channels + c].abs();
+                if val > max_vals[c] {
+                    max_vals[c] = val;
+                }
+            }
+        }
+        // Invert: channels with larger max get smaller scale
+        for v in &mut max_vals {
+            *v = 1.0 / (*v).max(1e-8);
+        }
+        max_vals
+    };
+
+    // Normalize so max scale = 1.0 (prevent weight inflation)
+    let max_s = scales.iter().cloned().fold(0.0f32, f32::max);
+    if max_s > 0.0 {
+        for s in &mut scales {
+            *s /= max_s;
+        }
+    }
+
+    // Apply: W'[r,c] = W[r,c] * scale[c]
+    for c in 0..out_channels {
+        let s = scales[c];
+        if (s - 1.0).abs() < 1e-6 {
+            continue; // identity column — skip
+        }
+        for r in 0..in_channels {
+            weights[r * out_channels + c] *= s;
+        }
+    }
+
+    scales
+}
+
+// ===========================================================================
+// SpinQuant Cayley rotation (mockdud.md §3N3a, §6P2)
+// ===========================================================================
+
+/// SpinQuant: learn rotation matrices via Cayley SGD on the Stiefel manifold.
+///
+/// Rotates weight matrices before quantization so outlier dimensions
+/// spread across all channels, producing outlier-free weights that
+/// quantize with near-FP16 accuracy.
+///
+/// From: Liu et al., "SpinQuant: LLM Quantization with Learned Rotations",
+/// ICLR 2025, arXiv:2405.16406v4.
+///
+/// # Arguments
+/// - `weights`: mutable slice of shape `[dim * dim]` (blocked square matrix)
+/// - `dim`: rotation matrix dimension (must be a positive power of 2)
+/// - `lr`: Cayley SGD learning rate (typical 0.01–0.1)
+/// - `steps`: number of Cayley SGD iterations
+///
+/// Operates entirely in-place on `weights`. Scratch buffers are
+/// allocated once and reused across all blocks.
+///
+/// # Panics
+/// Panics if `dim` is not a positive power of two, or if the
+/// caller supplies a non-square weight slice.
+pub fn spinquant_rotate(
+    weights: &mut [f32],
+    dim: usize,
+    lr: f32,
+    steps: usize,
+) {
+    assert!(dim > 0 && dim.is_power_of_two(), "SpinQuant dim must be a positive power of 2");
+    assert_eq!(
+        weights.len(),
+        dim * dim,
+        "weights.len() must equal dim * dim (a square block)"
+    );
+
+    // Scratch buffers — allocated once, reused each step.
+    let mut rotated = vec![0.0f32; dim];
+    let mut quantized = vec![0.0f32; dim];
+    let mut grad = vec![0.0f32; dim * dim];
+    let mut skew = vec![0.0f32; dim * dim];
+
+    // Initialize R = I (identity).
+    let mut r = vec![0.0f32; dim * dim];
+    for i in 0..dim {
+        r[i * dim + i] = 1.0;
+    }
+
+    for _step in 0..steps {
+        // Forward W @ R^T → rotated
+        for i in 0..dim {
+            rotated[i] = 0.0;
+            for j in 0..dim {
+                rotated[i] += weights[j * dim + i] * r[j * dim + i];
+            }
+        }
+
+        // Simulate Q4_K nearest rounding (symmetric range [-7, 7]).
+        let max_abs = rotated.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+        let scale = max_abs / 7.0;
+        let inv_scale = if scale > 1e-10 { 1.0 / scale } else { 0.0 };
+        for i in 0..dim {
+            let q = (rotated[i] * inv_scale).round().clamp(-7.0, 7.0) as i8;
+            quantized[i] = (q as f32) * scale;
+        }
+
+        // dL/dR = 2 * W^T @ (rotated - quantized)
+        for i in 0..dim {
+            let diff = rotated[i] - quantized[i];
+            for j in 0..dim {
+                grad[j * dim + i] = 2.0 * weights[j * dim + i] * diff;
+            }
+        }
+
+        // Skew-symmetric projection: G = grad^T - grad (Stiefel tangent)
+        for i in 0..dim {
+            for j in 0..dim {
+                skew[i * dim + j] = grad[j * dim + i] - grad[i * dim + j];
+            }
+        }
+
+        // Cayley first-order retraction: R -= lr * skew @ R
+        for i in 0..dim {
+            for j in 0..dim {
+                let mut sum = 0.0f32;
+                for k in 0..dim {
+                    sum += skew[i * dim + k] * r[k * dim + j];
+                }
+                r[i * dim + j] -= lr * sum;
+            }
+        }
+
+        // Gram-Schmidt re-orthogonalisation (keeps R on Stiefel).
+        for col in 0..dim {
+            for row in 0..col {
+                let dot: f32 = (0..dim)
+                    .map(|k| r[k * dim + col] * r[k * dim + row])
+                    .sum();
+                for k in 0..dim {
+                    r[k * dim + col] -= dot * r[k * dim + row];
+                }
+            }
+            let norm: f32 = (0..dim)
+                .map(|k| r[k * dim + col].powi(2))
+                .sum::<f32>()
+                .sqrt();
+            if norm > 1e-10 {
+                for k in 0..dim {
+                    r[k * dim + col] /= norm;
+                }
+            }
+        }
+    }
+
+    // Write W' = W @ R^T back into weights in-place.
+    for i in 0..dim {
+        for j in 0..dim {
+            let mut sum = 0.0f32;
+            for k in 0..dim {
+                sum += weights[k * dim + j] * r[k * dim + i];
+            }
+            weights[i * dim + j] = sum;
+        }
+    }
+}
+
+/// Convenience wrapper: apply SmoothQuant then SpinQuant in sequence.
+///
+/// Use this as the single entry point in `convert.rs` before calling
+/// `pack_tensors()`. Both transforms are in-place and discarded after
+/// conversion — no format change is needed.
+///
+/// See mockdud.md §6 for the full integration checklist.
+pub fn pre_quantize_transform(
+    weights: &mut [f32],
+    out_channels: usize,
+    in_channels: usize,
+    calibration_acts: Option<&[f32]>,
+    spinquant_dim: usize,
+    spinquant_lr: f32,
+    spinquant_steps: usize,
+) -> Vec<f32> {
+    let smooth_scales = apply_smoothquant_scale(
+        weights,
+        out_channels,
+        in_channels,
+        calibration_acts,
+    );
+
+    // SpinQuant operates on square blocks of size spinquant_dim.
+    // Apply block-wise on the weight matrix (treat as stacked dim×dim blocks).
+    if spinquant_dim.is_power_of_two() && spinquant_dim <= out_channels.max(in_channels) {
+        let total = out_channels * in_channels;
+        let blocks = total / (spinquant_dim * spinquant_dim);
+        for b in 0..blocks {
+            let off = b * spinquant_dim * spinquant_dim;
+            if off + spinquant_dim * spinquant_dim <= total {
+                spinquant_rotate(
+                    &mut weights[off..off + spinquant_dim * spinquant_dim],
+                    spinquant_dim,
+                    spinquant_lr,
+                    spinquant_steps,
+                );
+            }
+        }
+    }
+
+    smooth_scales
+}
+
+#[cfg(test)]
+mod smoothquant_tests {
+    use super::*;
+
+    #[test]
+    fn smoothquant_scale_inverts_large_columns() {
+        let out_c = 2;
+        let in_c = 3;
+        // weights are row-major: weights[row * in_c + col]
+        // col 0 (out_ch 0) has large values, col 1 (out_ch 1) has small values
+        let mut weights = vec![
+            10.0, 10.0, 10.0, // out_ch=0: all rows have 10 in this col
+            1.0, 1.0, 1.0,      // out_ch=1: all rows have 1 in this col
+        ];
+
+        let scales = apply_smoothquant_scale(&mut weights, out_c, in_c, None);
+
+        // Channel 0 max=10 → scale 1/10 = 0.1 after normalization
+        assert!((scales[0] - 0.1).abs() < 0.01);
+        // Channel 1 max=1 → scale 1.0 after normalization (unchanged)
+        assert!((scales[1] - 1.0).abs() < 0.01);
+
+        // After scaling, col 0 values should be ~1.0 (10 * 0.1)
+        assert!((weights[0] - 1.0).abs() < 0.1);
+        assert!((weights[3] - 1.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn smoothquant_identical_columns_unchanged() {
+        let mut weights = vec![5.0f32; 6]; // 2 out_ch × 3 in_ch
+        let scales = apply_smoothquant_scale(&mut weights, 2, 3, None);
+        assert_eq!(scales[0], 1.0);
+        assert_eq!(scales[1], 1.0);
+        assert_eq!(weights, vec![5.0f32; 6]);
+    }
+
+    #[test]
+    fn smoothquant_with_calibration_acts() {
+        let mut weights = vec![1.0f32; 6]; // 2 out_ch × 3 in_ch
+        let calibration = vec![2.0f32, 0.5]; // out_ch=0 is 2× larger
+
+        let scales = apply_smoothquant_scale(&mut weights, 2, 3, Some(&calibration));
+
+        // calibration inverted + normalized: [1/2=0.5, 1/0.5=2.0] → max=2 → [0.25, 1.0]
+        assert!((scales[0] - 0.25).abs() < 0.01);
+        assert!((scales[1] - 1.0).abs() < 0.01);
+        // col 0 scaled by 0.25, col 1 stays (scaled by 1.0)
+        assert!((weights[0] - 0.25).abs() < 0.01); // row 0, col 0
+        assert_eq!(weights[3], 1.0); // row 0, col 1
+    }
+
+    #[test]
+    #[should_panic(expected = "weights.len() must equal out_channels * in_channels")]
+    fn smoothquant_panics_on_wrong_size() {
+        let mut w = vec![1.0f32; 5];
+        apply_smoothquant_scale(&mut w, 3, 3, None);
+    }
+}
+
+#[cfg(test)]
+mod spinquant_tests {
+    use super::*;
+
+    #[test]
+    fn spinquant_preserves_frobenius_norm() {
+        let dim = 4;
+        let mut weights: Vec<f32> = (0..dim * dim)
+            .map(|i| (i as f32 - (dim * dim) as f32 / 2.0) * 0.1)
+            .collect();
+        let orig_norm: f32 = weights.iter().map(|v| v * v).sum::<f32>().sqrt();
+
+        spinquant_rotate(&mut weights, dim, 0.05, 2);
+
+        let new_norm: f32 = weights.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(
+            (orig_norm - new_norm).abs() < 1e-4,
+            "orthogonal transform must preserve Frobenius norm: {} != {}",
+            orig_norm,
+            new_norm,
+        );
+    }
+
+    #[test]
+    fn spinquant_produces_finite_output() {
+        let dim = 8;
+        let mut weights: Vec<f32> = (0..dim * dim)
+            .map(|i| (i as f32 - 32.0) * 10.0)
+            .collect();
+
+        spinquant_rotate(&mut weights, dim, 0.05, 5);
+
+        assert!(weights.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    #[should_panic(expected = "dim must be a positive power of 2")]
+    fn spinquant_panics_on_non_power_of_two() {
+        let mut w = vec![1.0f32; 9];
+        spinquant_rotate(&mut w, 3, 0.05, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "weights.len() must equal dim * dim")]
+    fn spinquant_panics_on_wrong_length() {
+        let mut w = vec![1.0f32; 10];
+        spinquant_rotate(&mut w, 4, 0.05, 1);
+    }
+}
+
+#[cfg(test)]
+mod pre_quantize_transform_tests {
+    use super::*;
+
+    #[test]
+    fn pre_quantize_transform_returns_scales() {
+        let out_c = 2;
+        let in_c = 3;
+        let mut weights = vec![1.0f32; out_c * in_c];
+
+        let scales = pre_quantize_transform(
+            &mut weights,
+            out_c,
+            in_c,
+            None,
+            4,
+            0.05,
+            2,
+        );
+
+        assert_eq!(scales.len(), out_c);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
