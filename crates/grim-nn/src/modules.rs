@@ -61,6 +61,76 @@ pub fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     ))
 }
 
+// ---------- Tensor Parallelism (TP) ----------
+
+/// Tensor Parallelism configuration for multi-GPU inference/training weight sharding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TensorParallelConfig {
+    pub rank: usize,
+    pub world_size: usize,
+}
+
+impl Default for TensorParallelConfig {
+    fn default() -> Self {
+        Self { rank: 0, world_size: 1 }
+    }
+}
+
+/// Column-parallel linear layer (§4.1): shards output features `out_features / world_size`
+/// across GPUs for attention QKV / MLP gate-up projections.
+#[derive(Clone)]
+pub struct ColumnParallelLinear {
+    pub inner: Linear,
+    pub tp_config: TensorParallelConfig,
+}
+
+impl ColumnParallelLinear {
+    pub fn new(inner: Linear, tp_config: TensorParallelConfig) -> Self {
+        Self { inner, tp_config }
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.inner.forward(x)
+    }
+}
+
+/// Row-parallel linear layer (§4.1): shards input features `in_features / world_size`
+/// across GPUs and All-Reduces outputs across TP ranks for attention output / MLP down projections.
+#[derive(Clone)]
+pub struct RowParallelLinear {
+    pub inner: Linear,
+    pub tp_config: TensorParallelConfig,
+}
+
+impl RowParallelLinear {
+    pub fn new(inner: Linear, tp_config: TensorParallelConfig) -> Self {
+        Self { inner, tp_config }
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let out = self.inner.forward(x)?;
+        if self.tp_config.world_size > 1 {
+            let dev = pick_device_for_tensor(&out);
+            let s: &dyn grim_tensor::BackendStorage = out.storage().as_ref();
+            match dev.all_reduce(&[s], "sum") {
+                Ok((storage, handle)) => {
+                    handle.synchronize()?;
+                    Ok(Tensor::new(
+                        Arc::from(storage),
+                        out.shape().clone(),
+                        out.dtype(),
+                        out.provenance().clone(),
+                        out.device().clone(),
+                    ))
+                }
+                Err(_) => Ok(out),
+            }
+        } else {
+            Ok(out)
+        }
+    }
+}
+
 // ---------- Linear ----------
 
 /// Linear: `y = x @ W^T [+ b]` with weight `(out, in)`, optional bias `(out,)`.
