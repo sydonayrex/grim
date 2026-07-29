@@ -149,6 +149,9 @@ impl TrainBlob {
 /// requires it; a resumed fine-tune reproduces step-N state from it.
 #[derive(Debug, Clone)]
 pub struct TrainState {
+    /// Current optimizer step number. Persisted so resumed training
+    /// picks up exactly where it left off.
+    pub step: u64,
     /// Numeric format the training-state tensors are encoded in.
     pub fp_format: TrainFpFormat,
     /// Named training-state blobs keyed by logical slot name
@@ -159,6 +162,7 @@ pub struct TrainState {
 impl Default for TrainState {
     fn default() -> Self {
         Self {
+            step: 0,
             fp_format: TrainFpFormat::Fp32,
             blobs: HashMap::new(),
         }
@@ -216,6 +220,7 @@ impl TrainState {
             .map_err(|e| Error::Backend(format!("train magic write failed: {e}")))?;
 
         let header = serde_json::json!({
+            "step": self.step,
             "fp_format": self.fp_format.as_u8(),
             "blobs": self.blobs.keys().collect::<Vec<_>>(),
         });
@@ -265,6 +270,10 @@ impl TrainState {
             .map_err(|e| Error::Backend(format!("train header read failed: {e}")))?;
         let header: Value = serde_json::from_slice(&header_bytes)
             .map_err(|e| Error::Backend(format!("train header JSON invalid: {e}")))?;
+        let step = header
+            .get("step")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let fp_format = header
             .get("fp_format")
             .and_then(|v| v.as_u64())
@@ -293,7 +302,7 @@ impl TrainState {
             blobs.insert(blob.name.clone(), blob);
         }
 
-        Ok(Some(Self { fp_format, blobs }))
+        Ok(Some(Self { step, fp_format, blobs }))
     }
 }
 
@@ -304,6 +313,7 @@ mod tests {
     #[test]
     fn train_state_round_trips_byte_identical() {
         let mut state = TrainState {
+            step: 42,
             fp_format: TrainFpFormat::Fp8E4M3,
             blobs: HashMap::new(),
         };
@@ -317,12 +327,30 @@ mod tests {
         state.write(&path).unwrap();
 
         let restored = TrainState::read(&path).unwrap().expect("should read");
+        assert_eq!(restored.step, 42);
         assert_eq!(restored.fp_format, TrainFpFormat::Fp8E4M3);
         assert_eq!(restored.blobs.len(), 4);
         assert_eq!(restored.blobs["lora_a"].data, (0u8..=127).collect::<Vec<_>>());
         assert_eq!(restored.blobs["lora_b"].data, (128u8..=255).collect::<Vec<_>>());
         assert_eq!(restored.blobs["opt_m"].data, vec![7u8; 4096]);
         assert_eq!(restored.blobs["error_matrix"].shape, vec![32, 32]);
+    }
+
+    #[test]
+    fn train_state_step_round_trips() {
+        for step in [0u64, 1, 100, 1000, u64::MAX] {
+            let state = TrainState {
+                step,
+                fp_format: TrainFpFormat::Fp32,
+                blobs: HashMap::new(),
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("step_{step}.grim.train"));
+            state.write(&path).unwrap();
+            let restored = TrainState::read(&path).unwrap().expect("should read");
+            assert_eq!(restored.step, step);
+        }
+    }
     }
 
     #[test]

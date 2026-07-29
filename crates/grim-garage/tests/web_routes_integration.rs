@@ -82,3 +82,89 @@ async fn test_chat_endpoint_fails_when_model_path_does_not_exist() {
     // The handler attempts on-demand model loading which fails (file not found)
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
+
+#[tokio::test]
+async fn test_start_training_accepts_weight_format() {
+    let state = new_app_state();
+    let app = build_router(state);
+
+    let payload = serde_json::json!({
+        "model_path": "models/test_model.grim",
+        "dataset_path": "datasets/test_data.jsonl",
+        "training_mode": "Lora",
+        "weight_format": "crow",
+        "lora_rank": 16,
+        "learning_rate": 0.0001
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/train/start")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&payload).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn cannot_exceed_max_concurrent_jobs() {
+    use grim_garage::jobs::JobRegistry;
+    let registry = std::sync::Arc::new(JobRegistry::with_max_concurrent(1));
+    let engine = std::sync::Arc::new(std::sync::Mutex::new(grim_engine::Engine::new(grim_engine::EngineConfig::default())));
+    let state = grim_garage::routes::AppState {
+        registry,
+        engine,
+        tokenizer: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        model_path: None,
+    };
+    let app = build_router(state);
+
+    let payload = serde_json::json!({
+        "model_path": "models/model1.grim",
+        "dataset_path": "datasets/data1.jsonl",
+        "training_mode": "Lora"
+    });
+
+    let resp1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/train/start")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp1.status(), StatusCode::OK);
+
+    let payload2 = serde_json::json!({
+        "model_path": "models/model2.grim",
+        "dataset_path": "datasets/data2.jsonl",
+        "training_mode": "Lora"
+    });
+
+    let resp2 = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/train/start")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&payload2).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp2.status(), StatusCode::TOO_MANY_REQUESTS);
+}

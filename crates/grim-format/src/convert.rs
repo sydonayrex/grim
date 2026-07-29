@@ -242,6 +242,8 @@ pub fn convert_to_grim(
     // ext_entries from EvoPress / calibration). When `None`, a fresh
     // default metadata is constructed.
     caller_metadata: Option<crate::gguf::GrimMetadata>,
+    // Target WeightFormat codec. When `None`, uses Bf16 (default).
+    target_format: Option<String>,
 ) -> Result<()> {
     println!("[Grim Convert] Starting conversion pipeline...");
     println!("  Source: {}", input_path);
@@ -258,6 +260,9 @@ pub fn convert_to_grim(
     }
     if let Some(ref bw) = evopress_bitwidths {
         println!("  Using per-tensor EvoPress bitwidths ({} tensors)", bw.len());
+    }
+    if let Some(ref tf) = target_format {
+        println!("  Target format: {}", tf);
     }
 
     let profile = gcn_to_profile(target_gcn);
@@ -283,6 +288,9 @@ pub fn convert_to_grim(
     }
     if metadata.target_gcn.is_none() {
         metadata.target_gcn = Some(target_gcn.to_string());
+    }
+    if metadata.target_weight_format.is_none() {
+        metadata.target_weight_format = target_format;
     }
     if metadata.lds_size.is_none() {
         metadata.lds_size = Some(profile.lds_size());

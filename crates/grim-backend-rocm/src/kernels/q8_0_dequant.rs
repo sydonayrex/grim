@@ -13,21 +13,6 @@
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
-    __device__ inline float fp16_to_float_device(unsigned short h) {
-        unsigned int sign = (h >> 15) & 1;
-        unsigned int exp  = (h >> 10) & 0x1f;
-        unsigned int mant = h & 0x3ff;
-        if (exp == 0) {
-            if (mant == 0) return sign ? -0.0f : 0.0f;
-            float res = (float)mant / 1024.0f * 0.00006103515625f;
-            return sign ? -res : res;
-        } else if (exp == 31) {
-            return sign ? -1.0f/0.0f : 1.0f/0.0f;
-        }
-        float res = (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)exp - 15.0f);
-        return sign ? -res : res;
-    }
-
     #define QK8_0 32
 
     /// Dequantize one Q8_0 block (34 bytes: 2-byte f16 delta + 32x int8 codes)

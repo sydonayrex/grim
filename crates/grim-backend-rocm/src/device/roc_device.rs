@@ -189,6 +189,16 @@ impl RocmDevice {
         }
     }
 
+    /// Select the best available ROCm device.
+    ///
+    /// Currently returns ordinal 0 (the primary GPU). When multi-GPU
+    /// topology detection is wired in (see P3 Task 3.3), this will
+    /// probe all visible devices and return the one with the highest
+    /// compute capability / most VRAM.
+    pub fn new_best() -> Self {
+        Self::new(0)
+    }
+
     /// Fallible constructor that propagates the `hipSetDevice` error.
     ///
     /// Use this in callers that want to distinguish "no GPU at this ordinal"

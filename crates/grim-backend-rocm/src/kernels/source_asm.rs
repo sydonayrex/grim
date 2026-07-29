@@ -24,6 +24,7 @@ pub fn compute_kernel_source() -> String {
     let mut s = String::with_capacity(
         crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE.len() + 16384,
     );
+    s.push_str(crate::kernels::shared_device_fns::KERNEL_SOURCE);
     s.push_str(crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE);
     s.push_str(crate::kernels::qkv_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::decode_gemm::KERNEL_SOURCE);
@@ -82,5 +83,29 @@ mod source_asm_self_tests {
         assert!(src.contains("grim_flash_attention"));
         assert!(src.contains("grim_cross_attention"));
         assert!(src.contains("grim_rwkv_time_mix"));
+    }
+
+    /// A.0 regression guard: every shared __device__ helper must be defined
+    /// exactly once across the concatenated HIPRTC translation unit.
+    /// Duplicate definitions cause symbol-collision linker errors on real hardware.
+    #[test]
+    fn kernel_source_has_no_duplicate_device_fn_definitions() {
+        let src = compute_kernel_source();
+        // These four symbols are defined in shared_device_fns::KERNEL_SOURCE only.
+        // Any other kernel module that copies their definition causes HIPRTC failure.
+        let shared_syms = [
+            "float fp16_to_float_device(",
+            "float fp8_e4m3_to_float_hip(",
+            "float mxfp4_to_float_hip(",
+            "float dequant_q4k_element(",
+        ];
+        for sym in &shared_syms {
+            let count = src.matches(sym).count();
+            assert_eq!(
+                count, 1,
+                "shared __device__ symbol defined {} times (expected 1): '{}'",
+                count, sym
+            );
+        }
     }
 }

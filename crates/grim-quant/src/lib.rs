@@ -12,6 +12,9 @@
 
 use grim_tensor::error::{Error, Result};
 
+pub mod spqr;
+pub use spqr::{spqr_identify_salient, SpqrSalientResidual};
+
 pub const BLOCK_SIZE_Q8: usize = 32;
 pub const BLOCK_SIZE_Q4_K: usize = 32;
 const BLOCK_SIZE_QK: usize = 32;

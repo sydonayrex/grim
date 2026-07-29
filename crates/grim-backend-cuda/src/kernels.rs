@@ -197,4 +197,68 @@ extern "C" __global__ void grim_qkv_attention(
         }
     }
 }
+
+extern "C" __global__ void grim_mul_scalar(const float* x, float scalar, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = x[i] * scalar;
+}
+
+extern "C" __global__ void grim_sqrt(const float* x, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = sqrtf(x[i]);
+}
+
+extern "C" __global__ void grim_recip(const float* x, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = 1.0f / x[i];
+}
+
+extern "C" __global__ void grim_rope(const float* x, const int* pos, float* out, int num_tokens, int num_heads, int head_dim, float base) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half_dim = head_dim / 2;
+    int total = num_tokens * num_heads * half_dim;
+    if (idx >= total) return;
+
+    int pair_idx = idx % half_dim;
+    int head_idx = (idx / half_dim) % num_heads;
+    int token_idx = idx / (half_dim * num_heads);
+
+    int p = pos[token_idx];
+    float freq = 1.0f / powf(base, (float)(2 * pair_idx) / (float)head_dim);
+    float val = (float)p * freq;
+    float cos_v = cosf(val);
+    float sin_v = sinf(val);
+
+    int base_offset = (token_idx * num_heads + head_idx) * head_dim;
+    int i0 = base_offset + pair_idx;
+    int i1 = base_offset + pair_idx + half_dim;
+
+    float v0 = x[i0];
+    float v1 = x[i1];
+
+    out[i0] = v0 * cos_v - v1 * sin_v;
+    out[i1] = v0 * sin_v + v1 * cos_v;
+}
+
+extern "C" __global__ void grim_quantized_matmul_q8_0(const float* a, const unsigned char* b, const float* b_scales, float* out, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= m || col >= n) return;
+
+    float sum = 0.0f;
+    int blocks_per_row = k / 32;
+    for (int b_idx = 0; b_idx < blocks_per_row; ++b_idx) {
+        float scale = b_scales[col * blocks_per_row + b_idx];
+        int b_offset = (col * blocks_per_row + b_idx) * 32;
+        int a_offset = row * k + b_idx * 32;
+        for (int i = 0; i < 32; ++i) {
+            signed char q = (signed char)b[b_offset + i];
+            sum += a[a_offset + i] * ((float)q * scale);
+        }
+    }
+    out[row * n + col] = sum;
+}
 "#;

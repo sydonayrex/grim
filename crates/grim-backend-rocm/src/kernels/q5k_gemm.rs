@@ -19,21 +19,6 @@
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
-    __device__ inline float fp16_to_float_device(unsigned short h) {
-        unsigned int sign = (h >> 15) & 1;
-        unsigned int exp  = (h >> 10) & 0x1f;
-        unsigned int mant = h & 0x3ff;
-        if (exp == 0) {
-            if (mant == 0) return sign ? -0.0f : 0.0f;
-            float res = (float)mant / 1024.0f * 0.00006103515625f;
-            return sign ? -res : res;
-        } else if (exp == 31) {
-            return sign ? -1.0f/0.0f : 1.0f/0.0f;
-        }
-        float res = (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)exp - 15.0f);
-        return sign ? -res : res;
-    }
-
     /// Dequantize one Q5_K element from a 176-byte super-block.
     /// `in_sb` is the weight index within the 256-weight super-block (0..255).
     __device__ inline float dequant_q5k_element(const unsigned char* block_ptr, int in_sb) {

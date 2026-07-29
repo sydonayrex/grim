@@ -69,21 +69,6 @@ extern "C" __global__ void grim_wmma_gemm(
 
 // ---------- Raven FP8 Kernels ----------
 
-// Helper FP8 E4M3 to Float conversion in HIP
-__device__ inline float fp8_e4m3_to_float_hip(unsigned char val) {
-    if (val == 0x7F) return 0.0f / 0.0f; // NaN
-    if (val == 0xFF) return -0.0f / 0.0f;
-    int sign = (val >> 7) & 1;
-    int exp = (val >> 3) & 0x0F;
-    int mant = val & 0x07;
-    if (exp == 0) {
-        float res = (float)mant / 8.0f * 0.000015258789f; // 2^-16
-        return sign ? -res : res;
-    }
-    float res = (1.0f + (float)mant / 8.0f) * powf(2.0f, (float)exp - 7.0f);
-    return sign ? -res : res;
-}
-
 // Native FP8 WMMA / Scalar Fallback GEMM
 extern "C" __global__ void grim_wmma_gemm_fp8(
     const unsigned char* __restrict__ A,
@@ -159,22 +144,6 @@ extern "C" __global__ void grim_fused_dequant_backward_gemm_fp8(
 
 // ---------- Jay (MXFP4) & Magpie (MXFP8) Kernels ----------
 
-// Helper MXFP4 E2M1 + E8M0 shared exponent to Float conversion
-__device__ inline float mxfp4_to_float_hip(unsigned char code, unsigned char shared_exp) {
-    int sign = (code >> 3) & 1;
-    int exp = (code >> 1) & 3;
-    int mant = code & 1;
-    float base_val = 0.0f;
-    if (exp == 0) {
-        base_val = (float)mant * 0.5f;
-    } else {
-        base_val = (1.0f + (float)mant * 0.5f) * powf(2.0f, (float)exp - 1.0f);
-    }
-    if (sign) base_val = -base_val;
-    float scale = powf(2.0f, (float)shared_exp - 127.0f);
-    return base_val * scale;
-}
-
 // Jay MXFP4 Fused Dequant GEMM Forward
 extern "C" __global__ void grim_fused_dequant_gemm_mxfp4(
     const float* __restrict__ A,
@@ -206,6 +175,40 @@ extern "C" __global__ void grim_fused_dequant_gemm_mxfp4(
     C[row * N + col] = acc;
 }
 
+// Jay MXFP4 Fused Dequant Backward GEMM
+// Computes dA = dY @ B^T, dequantizing B on-the-fly per element.
+// B is stored as 4-bit codes (2 per byte) + shared FP8 exponents (1 per 32 elements).
+extern "C" __global__ void grim_fused_dequant_backward_gemm_mxfp4(
+    const float* __restrict__ dY,
+    const unsigned char* __restrict__ B_codes,
+    const unsigned char* __restrict__ B_exps,
+    float* __restrict__ dA,
+    int M, int N, int K)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = M * K;
+    if (idx >= total) return;
+
+    const int row = idx / K;
+    const int k_idx = idx % K;
+
+    float acc = 0.0f;
+    for (int n = 0; n < N; ++n) {
+        float dy_val = dY[row * N + n];
+        // Dequantize B[n, k_idx] on-the-fly using the same layout as the forward kernel.
+        int block_idx = (n * K + k_idx) / 32;
+        unsigned char exp_val = B_exps[block_idx];
+        int elem_flat = n * K + k_idx;
+        int code_byte_idx = elem_flat / 2;
+        unsigned char packed_byte = B_codes[code_byte_idx];
+        unsigned char code = (elem_flat % 2 == 0) ? (packed_byte & 0x0F) : ((packed_byte >> 4) & 0x0F);
+        float b_val = mxfp4_to_float_hip(code, exp_val);
+        acc += dy_val * b_val;
+    }
+
+    dA[row * K + k_idx] = acc;
+}
+
 // Magpie MXFP8 Fused Dequant GEMM Forward
 extern "C" __global__ void grim_fused_dequant_gemm_mxfp8(
     const float* __restrict__ A,
@@ -232,6 +235,37 @@ extern "C" __global__ void grim_fused_dequant_gemm_mxfp8(
     }
 
     C[row * N + col] = acc;
+}
+
+// Magpie MXFP8 Fused Dequant Backward GEMM
+// Computes dA = dY @ B^T, dequantizing B on-the-fly per element.
+// B is stored as FP8 codes (1 per element) + shared FP8 exponents (1 per 32 elements).
+extern "C" __global__ void grim_fused_dequant_backward_gemm_mxfp8(
+    const float* __restrict__ dY,
+    const unsigned char* __restrict__ B_fp8,
+    const unsigned char* __restrict__ B_exps,
+    float* __restrict__ dA,
+    int M, int N, int K)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = M * K;
+    if (idx >= total) return;
+
+    const int row = idx / K;
+    const int k_idx = idx % K;
+
+    float acc = 0.0f;
+    for (int n = 0; n < N; ++n) {
+        float dy_val = dY[row * N + n];
+        // Dequantize B[n, k_idx] on-the-fly using the same layout as the forward kernel.
+        int block_idx = (n * K + k_idx) / 32;
+        unsigned char exp_val = B_exps[block_idx];
+        float scale = powf(2.0f, (float)exp_val - 127.0f);
+        float b_val = fp8_e4m3_to_float_hip(B_fp8[n * K + k_idx]) * scale;
+        acc += dy_val * b_val;
+    }
+
+    dA[row * K + k_idx] = acc;
 }
 
 // ---------- MFMA Gates (gfx1200+, CDNA3) ----------
@@ -329,5 +363,31 @@ mod self_tests {
             "WMMA GEMM kernel entry must be JIT-discoverable by name"
         );
         assert!(KERNEL_SOURCE.contains("_Float16"), "kernel must use _Float16 type");
+    }
+
+    /// Verifies Jay (MXFP4) backward kernel is present for JIT discovery.
+    #[test]
+    fn source_contains_mxfp4_backward_kernel() {
+        assert!(
+            KERNEL_SOURCE.contains("grim_fused_dequant_backward_gemm_mxfp4"),
+            "Jay MXFP4 backward GEMM must be JIT-discoverable by name"
+        );
+        assert!(
+            KERNEL_SOURCE.contains("mxfp4_to_float_hip"),
+            "MXFP4 backward must use the shared mxfp4_to_float_hip helper"
+        );
+    }
+
+    /// Verifies Magpie (MXFP8) backward kernel is present for JIT discovery.
+    #[test]
+    fn source_contains_mxfp8_backward_kernel() {
+        assert!(
+            KERNEL_SOURCE.contains("grim_fused_dequant_backward_gemm_mxfp8"),
+            "Magpie MXFP8 backward GEMM must be JIT-discoverable by name"
+        );
+        assert!(
+            KERNEL_SOURCE.contains("fp8_e4m3_to_float_hip"),
+            "MXFP8 backward must use the shared fp8_e4m3_to_float_hip helper"
+        );
     }
 }

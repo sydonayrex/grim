@@ -14,47 +14,6 @@
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
-    __device__ inline float fp16_to_float_device(unsigned short h) {
-        unsigned int sign = (h >> 15) & 1;
-        unsigned int exp  = (h >> 10) & 0x1f;
-        unsigned int mant = h & 0x3ff;
-        if (exp == 0) {
-            if (mant == 0) return sign ? -0.0f : 0.0f;
-            float res = (float)mant / 1024.0f * 0.00006103515625f;
-            return sign ? -res : res;
-        } else if (exp == 31) {
-            return sign ? -1.0f/0.0f : 1.0f/0.0f;
-        }
-        float res = (1.0f + (float)mant / 1024.0f) * powf(2.0f, (float)exp - 15.0f);
-        return sign ? -res : res;
-    }
-
-    /// Dequantize one Q4_K element from a 144-byte super-block.
-    __device__ inline float dequant_q4k_element(const unsigned char* block_ptr, int in_sb) {
-        const unsigned short* h_ptr = (const unsigned short*)block_ptr;
-        float d = fp16_to_float_device(h_ptr[0]);
-        float dmin = fp16_to_float_device(h_ptr[1]);
-
-        const unsigned char* scales = block_ptr + 4;
-        const unsigned char* qs = block_ptr + 16;
-
-        int is = in_sb / 32;
-        unsigned char sc, m;
-        if (is < 4) {
-            sc = scales[is] & 63;
-            m  = scales[is + 4] & 63;
-        } else {
-            sc = (scales[is + 4] & 0xF) | ((scales[is - 4] >> 6) << 4);
-            m  = (scales[is + 4] >> 4)  | ((scales[is] >> 6) << 4);
-        }
-
-        int q_idx = in_sb / 2;
-        unsigned char packed = qs[q_idx];
-        unsigned char q_code = (in_sb % 2 == 0) ? (packed & 0x0F) : (packed >> 4);
-
-        return d * (float)sc * (float)q_code - dmin * (float)m;
-    }
-
     /// Dequantize packed Q4_K bytes to F32. Each thread handles one group
     /// of 32 weights (one sub-block).
     __global__ void grim_dequant_q4k(

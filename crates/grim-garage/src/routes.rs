@@ -75,21 +75,32 @@ pub struct StartTrainingRequest {
     pub rocm_fusion_rmsnorm_matmul: bool,
     #[serde(default)]
     pub rocm_fusion_qkv_attention: bool,
+    /// Codec format for base weights: Bf16, Crow, Raven, Rook, Jay, Jackdaw, Magpie.
+    #[serde(default)]
+    pub weight_format: crate::weight_format::WeightFormat,
     /// Backend the user selected ("rocm", "cuda", "vulkan", "metal", "cpu",
     /// or "auto"). Drives the grim-garage backend selection chain.
     #[serde(default)]
     pub preferred_backend: Option<String>,
+    /// Gradient accumulation steps. Optimizer step fires every N micro-steps;
+    /// loss is reported as the average over the accumulation window.
+    #[serde(default = "default_accumulation_steps")]
+    pub accumulation_steps: u32,
+    /// Number of GPUs for data-parallel training. 0 or 1 = single GPU;
+    /// >1 = RCCL all-reduce across N devices.
+    #[serde(default)]
+    pub num_gpus: u32,
+    /// Optionally resume training from a checkpoint sidecar produced by a
+    /// prior run. The sidecar must exist at this path on the server and
+    /// is validated via `validate_job_path` in the route handler.
+    #[serde(default)]
+    pub resume_from_checkpoint: Option<String>,
 }
 
-fn default_rank() -> u32 {
-    16
-}
-fn default_lr() -> f64 {
-    2e-5
-}
-fn default_epochs() -> u32 {
-    1
-}
+fn default_rank() -> u32 { 16 }
+fn default_lr() -> f64 { 2e-5 }
+fn default_epochs() -> u32 { 1 }
+fn default_accumulation_steps() -> u32 { 1 }
 
 #[derive(Debug, Serialize)]
 pub struct StartTrainingResponse {
@@ -149,6 +160,11 @@ pub struct ConvertModelRequest {
     pub target_bpw: f32,
     #[serde(default = "default_generations")]
     pub evopress_generations: usize,
+    /// Target codec format: "crow", "raven", "rook", "jay", "jackdaw", "magpie".
+    /// Passes through to `grim_format::convert_to_grim()` as the `target_bpw`
+    /// equivalent after resolving each name to its bpw via `WeightFormat`.
+    #[serde(default)]
+    pub target_format: Option<String>,
 }
 
 fn default_gcn() -> String {
@@ -341,6 +357,14 @@ async fn start_training(
     if let Err(e) = validate_job_path("dataset_path", &req.dataset_path) {
         return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e }))));
     }
+    // Task 6.2: Enforce max concurrent jobs limit
+    let active_jobs = state.registry.running_count().await;
+    if active_jobs >= state.registry.max_concurrent {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": format!("max concurrent jobs ({}) reached", state.registry.max_concurrent) })),
+        ));
+    }
     // M7: refuse `lora_rank == 0` (autograd divides by rank) and
     // enforce the QLoRA×rank ceiling before the worker spawns. Without
     // this gate a non-form code path that targeted `lora_rank = 0`
@@ -378,7 +402,11 @@ async fn start_training(
         epochs: req.epochs,
         rocm_fusion_rmsnorm_matmul: req.rocm_fusion_rmsnorm_matmul,
         rocm_fusion_qkv_attention: req.rocm_fusion_qkv_attention,
+        weight_format: req.weight_format,
         preferred_backend: req.preferred_backend.clone(),
+        accumulation_steps: req.accumulation_steps,
+        num_gpus: req.num_gpus,
+        resume_from_checkpoint: req.resume_from_checkpoint,
         status: crate::jobs::JobStatus::Pending,
         metrics: Vec::new(),
         cancel: tokio_util::sync::CancellationToken::new(),
@@ -459,9 +487,12 @@ async fn cancel_job(
 /// `convert_model_route` and `sanitize_model_id` helpers (those reject
 /// the same byte set on the model_id path segment).
 pub(crate) fn validate_job_path(field: &str, value: &str) -> std::result::Result<(), String> {
-    if value.contains("..") || value.contains('/') || value.contains('\\') {
+    let has_traversal = value
+        .split('/')
+        .any(|component| component == ".." || component == ".");
+    if has_traversal || value.contains('\\') {
         Err(format!(
-            "{field}: invalid path {value:?} (forbidden: '..', '/', backslash)"
+            "{field}: invalid path {value:?} (forbidden: path traversal or backslash)"
         ))
     } else {
         Ok(())
@@ -846,6 +877,7 @@ async fn convert_model_route(Json(req): Json<ConvertModelRequest>) -> impl IntoR
         None,
         None,
         None,
+        req.target_format,
     ) {
         Ok(_) => (
             StatusCode::OK,
@@ -1199,5 +1231,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// P6 Task 6.2: when the registry has reached max_concurrent,
+    /// a new POST /api/train/start must return 429 TOO_MANY_REQUESTS.
+    #[tokio::test]
+    async fn cannot_start_more_than_max_concurrent_jobs() {
+        let mut state = new_app_state();
+        // Restrict the registry to 1 concurrent job so the
+        // second submission bumps into the guard.
+        state.registry = Arc::new(JobRegistry::with_max_concurrent(1));
+        let r = build_router(state.clone());
+
+        let start_body = serde_json::json!({
+            "model_path": "/tmp/model.grim",
+            "dataset_path": "/tmp/dataset.jsonl",
+            "training_mode": "Lora"
+        });
+
+        // First submission should be accepted (under the limit).
+        let resp = r
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/train/start")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&start_body).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "first job should start");
+
+        // Second submission while first is still running should be rejected.
+        let resp2 = r
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/train/start")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&start_body).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp2.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "second job should be rejected with 429"
+        );
     }
 }

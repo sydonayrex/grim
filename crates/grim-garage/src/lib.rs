@@ -11,12 +11,15 @@ pub mod routes;
 pub mod theme;
 pub mod ui_state;
 pub mod view_model;
+pub mod dataloader;
+pub mod weight_format;
 
 /// Re-exports for downstream consumers and tests.
 pub use discovery::{DatasetEntry, ModelEntry};
 pub use jobs::{
     JobError, JobId, JobRegistry, JobStatus, Metric, MetricStreamEvent, TrainingJob, TrainingMode,
 };
+pub use weight_format::WeightFormat;
 pub use rocm::{RocmDeviceInfo, probe_rocm_devices};
 pub use ui_state::{
     DisplayState, GarageClient, JobSummaryDto, PollError, Poller, UiAppState, UiJob,

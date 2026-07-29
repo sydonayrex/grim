@@ -485,12 +485,14 @@ pub trait BackendDevice: Send + Sync {
     /// Default implementation falls back to `matmul`.
     fn quantized_matmul(
         &self,
-        a: &dyn BackendStorage,
-        b_packed: &dyn BackendStorage,
+        _a: &dyn BackendStorage,
+        _b_packed: &dyn BackendStorage,
         _b_scales: &[f32],
-        out_shape: &Shape,
+        _out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        self.matmul(a, b_packed, out_shape)
+        Err(crate::error::Error::Unimplemented(
+            "quantized_matmul requires a backend with fused dequantized matmul kernels (ROCm)".into(),
+        ))
     }
 
     /// Fused dequantized matmul backward (WI-T3 / F5).

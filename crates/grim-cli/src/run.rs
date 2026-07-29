@@ -36,6 +36,14 @@ fn probe_device() -> (Device, String) {
                 }
                 (Device::Cpu, "cpu".into())
             }
+            "vulkan" => {
+                if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
+                    if !vulkan_devices.is_empty() {
+                        return (Device::Vulkan, "vulkan".into());
+                    }
+                }
+                (Device::Cpu, "cpu".into())
+            }
             "cpu" => (Device::Cpu, "cpu".into()),
             _ => (Device::Cpu, "cpu".into()),
         }
@@ -54,6 +62,14 @@ fn probe_device() -> (Device, String) {
                 let ordinal = first.ordinal();
                 eprintln!("[grim] CUDA GPU {} detected", ordinal);
                 (Device::Cuda(ordinal), format!("cuda:{}", ordinal))
+            } else if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
+                if !vulkan_devices.is_empty() {
+                    eprintln!("[grim] Vulkan GPU detected");
+                    (Device::Vulkan, "vulkan".into())
+                } else {
+                    eprintln!("[grim] No GPU detected; using CPU backend.");
+                    (Device::Cpu, "cpu".into())
+                }
             } else {
                 eprintln!("[grim] No GPU detected; using CPU backend.");
                 (Device::Cpu, "cpu".into())
@@ -67,6 +83,22 @@ fn probe_device() -> (Device, String) {
             let ordinal = first.ordinal();
             eprintln!("[grim] CUDA GPU {} detected", ordinal);
             (Device::Cuda(ordinal), format!("cuda:{}", ordinal))
+        } else if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
+            if !vulkan_devices.is_empty() {
+                eprintln!("[grim] Vulkan GPU detected");
+                (Device::Vulkan, "vulkan".into())
+            } else {
+                eprintln!("[grim] No GPU detected; using CPU backend.");
+                (Device::Cpu, "cpu".into())
+            }
+        } else {
+            eprintln!("[grim] No GPU detected; using CPU backend.");
+            (Device::Cpu, "cpu".into())
+        }
+    } else if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
+        if !vulkan_devices.is_empty() {
+            eprintln!("[grim] Vulkan GPU detected");
+            (Device::Vulkan, "vulkan".into())
         } else {
             eprintln!("[grim] No GPU detected; using CPU backend.");
             (Device::Cpu, "cpu".into())

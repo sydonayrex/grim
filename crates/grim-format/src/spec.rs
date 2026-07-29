@@ -372,6 +372,15 @@ pub struct GrimTensorExt {
     pub backup1: BackupLayer,
     pub backup2: BackupLayer,
 
+    // --- SpQR sparse residuals (P5 Task 5.1) ---
+    /// Sparse indices for the SpQR sidecar, stored as a flat u32
+    /// array. Length = nnz (number of non-zero elements). The indices
+    /// encode positions into the tensor's flat payload.
+    pub spqr_indices: Vec<u32>,
+    /// Sparse FP16 sidecar values corresponding to each index in
+    /// `spqr_indices`. Length must equal `spqr_indices.len()`.
+    pub spqr_values: Vec<f16>,
+
     // --- P3-WI-2: activation-quant metadata (WI-R5 enabler) ---
     /// Dtype of activation quantization for fused GEMM, or `None`.
     pub act_quant_dtype: ActQuantDtype,
@@ -424,6 +433,8 @@ impl Default for GrimTensorExt {
             layout_descriptor: LayoutDescriptor::default(),
             backup1: BackupLayer::default(),
             backup2: BackupLayer::default(),
+            spqr_indices: Vec::new(),
+            spqr_values: Vec::new(),
             act_quant_dtype: ActQuantDtype::None,
             act_scale_layout: ActScaleLayout::None,
         }

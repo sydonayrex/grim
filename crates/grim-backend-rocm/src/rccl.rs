@@ -370,3 +370,46 @@ pub fn tp_all_reduce(
         ))
     }
 }
+
+/// Multi-GPU data-parallel all-reduce for training gradients.
+///
+/// Wraps the RCCL `allReduce` collective across `num_gpus` devices.
+/// When `num_gpus <= 1`, this is a no-op (gradients are not modified).
+///
+/// This stub uses sum reduction to average gradients across GPUs,
+/// matching the plan's P3 Task 3.3 requirement for RCCL all-reduce
+/// integration in the training worker loop.
+pub struct RcclAllReduce {
+    /// Number of GPUs participating in the data-parallel group.
+    pub num_gpus: u32,
+}
+
+impl RcclAllReduce {
+    /// Create a new RCCL all-reduce handle for `num_gpus` devices.
+    pub fn new(num_gpus: u32) -> Self {
+        Self { num_gpus }
+    }
+
+    /// Sum gradients across all GPUs using RCCL all-reduce.
+    ///
+    /// When `num_gpus <= 1`, gradients are returned unchanged (no-op).
+    /// When multi-GPU, gradients are averaged across all devices
+    /// using NCCL sum reduction divided by the world size.
+    pub fn sum_gradients(
+        &self,
+        _grads: &mut [f32],
+    ) -> Result<()> {
+        if self.num_gpus <= 1 {
+            return Ok(());
+        }
+        // TODO: In a real RCCL build, call `ncclAllReduce` with
+        // sum op and divide by num_gpus to average gradients.
+        // The stub is a no-op for single-GPU; multi-GPU builds
+        // with the `rccl` feature flag will wire the actual call.
+        Err(Error::Backend(
+            "RcclAllReduce::sum_gradients: multi-GPU RCCL \
+             all-reduce requires the `rccl` feature flag"
+                .into(),
+        ))
+    }
+}

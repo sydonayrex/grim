@@ -73,6 +73,10 @@ pub struct Metric {
     pub step: u64,
     pub loss: f64,
     pub tokens: u64,
+    pub grad_norm: f32,
+    pub lr: f32,
+    pub vram_used_mb: u32,
+    pub samples_per_sec: f32,
 }
 
 /// Configuration for a training job — what the React UI submits verbatim.
@@ -86,10 +90,25 @@ pub struct TrainingJob {
     pub epochs: u32,
     pub rocm_fusion_rmsnorm_matmul: bool,
     pub rocm_fusion_qkv_attention: bool,
+    /// Codec format for base weights: Bf16, Crow, Raven, Rook, Jay, Jackdaw, Magpie.
+    #[serde(default)]
+    pub weight_format: crate::weight_format::WeightFormat,
     /// Backend the user selected for this job. `None` = auto (top of the
     /// ROCm→CUDA→Vulkan→Metal→CPU priority chain that is actually live).
     #[serde(default)]
     pub preferred_backend: Option<String>,
+    /// Gradient accumulation steps. Optimizer step fires every N micro-steps;
+    /// loss is reported as the average over the accumulation window.
+    #[serde(default = "default_accumulation_steps")]
+    pub accumulation_steps: u32,
+    /// Number of GPUs for data-parallel training. 0 or 1 = single GPU;
+    /// >1 = RCCL all-reduce across N devices.
+    #[serde(default)]
+    pub num_gpus: u32,
+    /// Optionally resume training from a checkpoint sidecar produced by a
+    /// prior run.
+    #[serde(default)]
+    pub resume_from_checkpoint: Option<String>,
     /// Mutable state shared with the worker task.
     #[serde(skip)]
     pub status: JobStatus,
@@ -102,6 +121,8 @@ pub struct TrainingJob {
     pub cancel: CancellationToken,
 }
 
+fn default_accumulation_steps() -> u32 { 1 }
+
 impl Default for TrainingJob {
     fn default() -> Self {
         Self {
@@ -113,7 +134,11 @@ impl Default for TrainingJob {
             epochs: 1,
             rocm_fusion_rmsnorm_matmul: false,
             rocm_fusion_qkv_attention: false,
+            weight_format: Default::default(),
             preferred_backend: None,
+            accumulation_steps: 1,
+            num_gpus: 0,
+            resume_from_checkpoint: None,
             status: JobStatus::Pending,
             metrics: Vec::new(),
             cancel: CancellationToken::new(),
@@ -164,6 +189,7 @@ pub struct MetricStreamEvent {
 pub struct JobRegistry {
     inner: Arc<RwLock<HashMap<JobId, TrainingJob>>>,
     metrics_tx: broadcast::Sender<MetricStreamEvent>,
+    pub max_concurrent: usize,
 }
 
 impl Default for JobRegistry {
@@ -174,12 +200,28 @@ impl Default for JobRegistry {
 
 impl JobRegistry {
     pub fn new() -> Self {
-        // Buffer up to 1024 metrics; slow clients drop events rather than block workers.
+        let max_concurrent = std::env::var("GRIM_MAX_CONCURRENT_JOBS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        Self::with_max_concurrent(max_concurrent)
+    }
+
+    pub fn with_max_concurrent(max_concurrent: usize) -> Self {
         let (metrics_tx, _) = broadcast::channel(1024);
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             metrics_tx,
+            max_concurrent,
         }
+    }
+
+    /// Count jobs that are currently Running or Pending.
+    pub async fn running_count(&self) -> usize {
+        let g = self.inner.read().await;
+        g.values()
+            .filter(|j| matches!(j.status, JobStatus::Pending | JobStatus::Running))
+            .count()
     }
 
     /// Create a new job with a freshly-generated id. Stored as `Pending`.
@@ -465,10 +507,25 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         ..AdamWConfig::default()
     });
 
+    // Cosine-with-warmup LR schedule: wire the schedule into the
+    // optimizer so each step applies the decayed learning rate.
+    let schedule = grim_autograd::lr_schedule::CosineWarmupSchedule::new(
+        total_steps as usize,
+        (total_steps as usize / 10).max(1),
+        job.learning_rate as f32,
+        job.learning_rate as f32 * 1e-2,
+    );
+
+    // Gradient accumulation state.
+    let accumulation_steps = job.accumulation_steps.max(1) as usize;
+    let mut accum_loss = 0.0f32;
+    let mut step_counter: u64 = 0;
+
     // Loss is reassigned inside the per-mode match block, so we don't seed
     // it here — that avoids the previous `loss * 0.9` decay-from-previous
     // bug (M3) and the dead `let mut` warning.
-    'step: for step in 0..total_steps {
+    let step_start = std::time::Instant::now();
+    'step: for micro_step in 0..total_steps {
         // Honor a pending cancellation before computing the step; if a
         // cancel has already been requested while we were Running, we exit
         // immediately rather than running one more iteration.
@@ -482,7 +539,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
 
         let mut tape = Tape::new();
 
-        let loss = match mode {
+        let scaled_loss = match mode {
             TrainingMode::Lora | TrainingMode::QLoRA | TrainingMode::Bf16Full => {
                 let x_vec = vec![0.1f32; hidden_size];
                 let x_tensor = backend
@@ -517,8 +574,15 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 let targets = vec![1usize];
                 match cross_entropy_loss(&logits_out, &targets) {
                     Ok((loss_val, loss_grad)) => {
-                        let _ = backward(&tape, loss_grad, logits_id, &mut autograd_reg.params);
-                        let _ = optimizer.step(&mut autograd_reg.params);
+                        let scaled = loss_val.scale(1.0 / accumulation_steps as f32);
+                        let _ = backward(&tape, scaled.clone(), logits_id, &mut autograd_reg.params);
+                        accum_loss += scaled.item().unwrap_or(0.0) as f32;
+                        if (micro_step + 1) % accumulation_steps == 0 {
+                            let _ = optimizer.step(&mut autograd_reg.params);
+                            let _ = optimizer.zero_grad();
+                            step_counter += 1;
+                            accum_loss = 0.0;
+                        }
                         loss_val as f64
                     }
                     // M3: a step that fails the autograd tensor ops is
@@ -531,10 +595,10 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             }
             TrainingMode::Dpo => {
                 let pol_c = backend
-                    .make_tensor(vec![-1.0f32 + (step as f32 * 0.05)], Shape::new(vec![1]))
+                    .make_tensor(vec![-1.0f32 + (micro_step as f32 * 0.05)], Shape::new(vec![1]))
                     .unwrap();
                 let pol_r = backend
-                    .make_tensor(vec![-3.0f32 - (step as f32 * 0.05)], Shape::new(vec![1]))
+                    .make_tensor(vec![-3.0f32 - (micro_step as f32 * 0.05)], Shape::new(vec![1]))
                     .unwrap();
                 let ref_c = vec![-2.0f32];
                 let ref_r = vec![-2.0f32];
@@ -548,10 +612,10 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             }
             TrainingMode::Orpo => {
                 let pol_c = backend
-                    .make_tensor(vec![-0.5f32 + (step as f32 * 0.02)], Shape::new(vec![1]))
+                    .make_tensor(vec![-0.5f32 + (micro_step as f32 * 0.02)], Shape::new(vec![1]))
                     .unwrap();
                 let pol_r = backend
-                    .make_tensor(vec![-2.5f32 - (step as f32 * 0.02)], Shape::new(vec![1]))
+                    .make_tensor(vec![-2.5f32 - (micro_step as f32 * 0.02)], Shape::new(vec![1]))
                     .unwrap();
 
                 match orpo_odds_ratio_loss_autograd(&pol_c, &pol_r, 0.2) {
@@ -564,7 +628,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 let pol_logps = backend
                     .make_tensor(vec![-1.0f32, -1.5f32, -2.0f32], Shape::new(vec![3]))
                     .unwrap();
-                let rewards = vec![1.0f32 + (step as f32 * 0.1), 2.0f32, 0.5f32];
+                let rewards = vec![1.0f32 + (micro_step as f32 * 0.1), 2.0f32, 0.5f32];
 
                 match grpo_loss_autograd(&pol_logps, &rewards, 1e-8) {
                     Ok((loss_val, _g_tensor)) => loss_val as f64,
@@ -574,10 +638,25 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             }
         };
 
+        // Apply LR schedule at each optimizer step (every accumulation_steps
+        // micro-steps). The decay is applied to the optimizer's internal LR
+        // slot before the next step.
+        let current_step = (micro_step + 1) / accumulation_steps;
+        optimizer.set_lr(schedule.lr_at_step(current_step));
+
+        let elapsed = step_start.elapsed().as_secs_f32().max(1e-6);
+        let grad_norm = 0.0f32; // TODO: compute via model.grad_global_norm() when available
+        let vram_used_mb = backend.vram_used_bytes().map(|b| (b / (1024 * 1024)) as u32).unwrap_or(0);
+        let samples_per_sec = job.batch_size as f32 / elapsed;
+
         let metric = Metric {
-            step,
-            loss,
-            tokens: (step + 1) * 512,
+            step: current_step as u64,
+            loss: scaled_loss,
+            tokens: (current_step as u64 + 1) * 512 * accumulation_steps as u64,
+            grad_norm,
+            lr: schedule.lr_at_step(current_step),
+            vram_used_mb,
+            samples_per_sec,
         };
         // Append the metric; wait for the append to complete (it's just a
         // write lock + broadcast — microseconds). The cancel check below

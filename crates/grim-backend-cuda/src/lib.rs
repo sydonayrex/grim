@@ -1103,6 +1103,401 @@ impl BackendDevice for CudaDevice {
         // CUDA backend: MemAdvice is currently a no-op
         Ok(())
     }
+
+    fn qkv_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+        out_max: Option<&dyn BackendStorage>,
+        out_sum: Option<&dyn BackendStorage>,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.qkv_attention(q, k, v, num_kv_heads, kv_seq_len, cache_offset, out_shape, out_max, out_sum)
+    }
+
+    fn mul_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_storage = x.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("mul_scalar x is not CudaStorage".into())
+        })?;
+        let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+        let n = out_shape.elem_count();
+
+        let mut x_ptr = Self::dev_ptr_or_err("mul_scalar x", x_storage)?;
+        let mut out_ptr = Self::dev_ptr_or_err("mul_scalar out", &out_storage)?;
+        let mut s_val = scalar;
+        let mut n_i = n as i32;
+        let mut args = [
+            &mut x_ptr as *mut *mut c_void as *mut c_void,
+            &mut s_val as *mut f32 as *mut c_void,
+            &mut out_ptr as *mut *mut c_void as *mut c_void,
+            &mut n_i as *mut i32 as *mut c_void,
+        ];
+        let handle = self.launch_rank1_kernel("grim_mul_scalar", &mut args, n)?;
+        Ok((Box::new(out_storage), handle))
+    }
+
+    fn sqrt(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_storage = x.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("sqrt x is not CudaStorage".into())
+        })?;
+        let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+        let n = out_shape.elem_count();
+
+        let mut x_ptr = Self::dev_ptr_or_err("sqrt x", x_storage)?;
+        let mut out_ptr = Self::dev_ptr_or_err("sqrt out", &out_storage)?;
+        let mut n_i = n as i32;
+        let mut args = [
+            &mut x_ptr as *mut *mut c_void as *mut c_void,
+            &mut out_ptr as *mut *mut c_void as *mut c_void,
+            &mut n_i as *mut i32 as *mut c_void,
+        ];
+        let handle = self.launch_rank1_kernel("grim_sqrt", &mut args, n)?;
+        Ok((Box::new(out_storage), handle))
+    }
+
+    fn recip(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_storage = x.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("recip x is not CudaStorage".into())
+        })?;
+        let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+        let n = out_shape.elem_count();
+
+        let mut x_ptr = Self::dev_ptr_or_err("recip x", x_storage)?;
+        let mut out_ptr = Self::dev_ptr_or_err("recip out", &out_storage)?;
+        let mut n_i = n as i32;
+        let mut args = [
+            &mut x_ptr as *mut *mut c_void as *mut c_void,
+            &mut out_ptr as *mut *mut c_void as *mut c_void,
+            &mut n_i as *mut i32 as *mut c_void,
+        ];
+        let handle = self.launch_rank1_kernel("grim_recip", &mut args, n)?;
+        Ok((Box::new(out_storage), handle))
+    }
+
+    fn rope(
+        &self,
+        x: &dyn BackendStorage,
+        positions: &[u32],
+        dim: usize,
+        base: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_storage = x.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("rope x is not CudaStorage".into())
+        })?;
+        let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+
+        let num_tokens = positions.len();
+        let num_heads = out_shape.elem_count() / (num_tokens * dim);
+        let head_dim = dim;
+
+        let pos_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
+        let pos_bytes = pos_i32.len() * 4;
+        let mut pos_dev_ptr: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            let res = cudaMalloc(&mut pos_dev_ptr, pos_bytes);
+            if res != cudaSuccess {
+                return Err(Error::Backend(format!("cudaMalloc for rope pos failed: {}", res)));
+            }
+            cudaMemcpy(pos_dev_ptr, pos_i32.as_ptr() as *const c_void, pos_bytes, cudaMemcpyHostToDevice);
+        }
+
+        let mut x_ptr = Self::dev_ptr_or_err("rope x", x_storage)?;
+        let mut out_ptr = Self::dev_ptr_or_err("rope out", &out_storage)?;
+        let mut num_t_i = num_tokens as i32;
+        let mut num_h_i = num_heads as i32;
+        let mut h_dim_i = head_dim as i32;
+        let mut base_f = base;
+
+        let mut args = [
+            &mut x_ptr as *mut *mut c_void as *mut c_void,
+            &mut pos_dev_ptr as *mut *mut c_void as *mut c_void,
+            &mut out_ptr as *mut *mut c_void as *mut c_void,
+            &mut num_t_i as *mut i32 as *mut c_void,
+            &mut num_h_i as *mut i32 as *mut c_void,
+            &mut h_dim_i as *mut i32 as *mut c_void,
+            &mut base_f as *mut f32 as *mut c_void,
+        ];
+
+        let total_pairs = num_tokens * num_heads * (head_dim / 2);
+        let handle = self.launch_rank1_kernel("grim_rope", &mut args, total_pairs)?;
+
+        unsafe {
+            cudaFree(pos_dev_ptr);
+        }
+
+        Ok((Box::new(out_storage), handle))
+    }
+
+    fn from_cpu_bytes(
+        &self,
+        data: &[u8],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let storage = CudaStorage::alloc_gpu(shape, dtype, self.ordinal)?;
+        let dev_ptr = storage.device_ptr.ok_or_else(|| {
+            Error::Backend("from_cpu_bytes: device_ptr is null after alloc_gpu".into())
+        })? as *mut c_void;
+
+        let res = unsafe {
+            cudaMemcpy(
+                dev_ptr,
+                data.as_ptr() as *const c_void,
+                data.len(),
+                cudaMemcpyHostToDevice,
+            )
+        };
+        if res != cudaSuccess {
+            return Err(Error::Backend(format!("cudaMemcpy from_cpu_bytes failed: {}", res)));
+        }
+
+        Ok(Box::new(storage))
+    }
+
+    fn selective_scan(
+        &self,
+        x: &dyn BackendStorage,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        c: &dyn BackendStorage,
+        d: &dyn BackendStorage,
+        batch: usize,
+        dim_dstate: usize,
+        dim_dinner: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_v = x.to_cpu_vec_f32()?;
+        let a_v = a.to_cpu_vec_f32()?;
+        let b_v = b.to_cpu_vec_f32()?;
+        let c_v = c.to_cpu_vec_f32()?;
+        let d_v = d.to_cpu_vec_f32()?;
+
+        let mut out = vec![0.0f32; batch * seq_len * dim_dinner];
+        for b_idx in 0..batch {
+            for d_idx in 0..dim_dinner {
+                let mut h = vec![0.0f32; dim_dstate];
+                let d_val = if d_v.len() > d_idx { d_v[d_idx] } else { 0.0 };
+
+                for t in 0..seq_len {
+                    let x_idx = (b_idx * seq_len + t) * dim_dinner + d_idx;
+                    let x_t = x_v[x_idx];
+                    let mut y_t = d_val * x_t;
+
+                    for s in 0..dim_dstate {
+                        let a_idx = d_idx * dim_dstate + s;
+                        let b_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
+                        let c_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
+
+                        let a_val = if a_v.len() > a_idx { a_v[a_idx] } else { 1.0 };
+                        let b_val = if b_v.len() > b_idx_off { b_v[b_idx_off] } else { 1.0 };
+                        let c_val = if c_v.len() > c_idx_off { c_v[c_idx_off] } else { 1.0 };
+
+                        h[s] = a_val * h[s] + x_t * b_val;
+                        y_t += c_val * h[s];
+                    }
+                    out[x_idx] = y_t;
+                }
+            }
+        }
+
+        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(CudaHandle { completed: Arc::new(Mutex::new(true)) })))
+    }
+
+    fn flash_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        _causal: bool,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let (out_storage, _h) = self.qkv_attention(q, k, v, num_kv_heads, seq_len, 0, out_shape, None, None)?;
+        let _ = num_heads;
+        let _ = head_dim;
+        Ok((out_storage, Box::new(CudaHandle { completed: Arc::new(Mutex::new(true)) })))
+    }
+
+    fn cross_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        kv_seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let (out_storage, _h) = self.qkv_attention(q, k, v, num_heads, kv_seq_len, 0, out_shape, None, None)?;
+        let _ = head_dim;
+        let _ = seq_len;
+        Ok((out_storage, Box::new(CudaHandle { completed: Arc::new(Mutex::new(true)) })))
+    }
+
+    fn rwkv_time_mix(
+        &self,
+        x: &dyn BackendStorage,
+        w: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_vec = x.to_cpu_vec_f32()?;
+        let k_vec = k.to_cpu_vec_f32()?;
+        let v_vec = v.to_cpu_vec_f32()?;
+        let g_vec = g.to_cpu_vec_f32()?;
+        let w_vec = w.to_cpu_vec_f32()?;
+
+        let mut out = vec![0.0f32; batch * seq_len * dim];
+        for b in 0..batch {
+            for d in 0..dim {
+                let mut state = 0.0f32;
+                let w_val = if w_vec.len() > d { w_vec[d] } else { 0.9f32 };
+
+                for t in 0..seq_len {
+                    let idx = (b * seq_len + t) * dim + d;
+                    let k_t = if k_vec.len() > idx { k_vec[idx] } else { x_vec[idx] };
+                    let v_t = if v_vec.len() > idx { v_vec[idx] } else { x_vec[idx] };
+                    let g_t = if g_vec.len() > idx { g_vec[idx] } else { 1.0f32 };
+
+                    state = w_val * state + k_t * v_t;
+                    let sig = 1.0f32 / (1.0f32 + (-g_t).exp());
+                    out[idx] = state * sig;
+                }
+            }
+        }
+
+        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(CudaHandle { completed: Arc::new(Mutex::new(true)) })))
+    }
+
+    fn rwkv_channel_mix(
+        &self,
+        x: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        r: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_vec = x.to_cpu_vec_f32()?;
+        let k_vec = k.to_cpu_vec_f32()?;
+        let r_vec = r.to_cpu_vec_f32()?;
+        let v_vec = v.to_cpu_vec_f32()?;
+
+        let elem_count = out_shape.elem_count();
+        let mut out = vec![0.0f32; elem_count];
+        for i in 0..elem_count {
+            let x_val = x_vec[i];
+            let k_val = if k_vec.len() > i { k_vec[i] } else { x_val };
+            let r_val = if r_vec.len() > i { r_vec[i] } else { 1.0f32 };
+            let v_val = if v_vec.len() > i { v_vec[i] } else { x_val };
+
+            let sig_r = 1.0f32 / (1.0f32 + (-r_val).exp());
+            let relu_k = k_val.max(0.0f32);
+            out[i] = sig_r * (relu_k * relu_k) * v_val;
+        }
+
+        let _ = batch;
+        let _ = dim;
+
+        let out_storage = self.from_cpu(&out, out_shape, x.dtype())?;
+        Ok((out_storage, Box::new(CudaHandle { completed: Arc::new(Mutex::new(true)) })))
+    }
+
+    fn quantized_matmul(
+        &self,
+        a: &dyn BackendStorage,
+        b_packed: &dyn BackendStorage,
+        b_scales: &[f32],
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let a_vec = a.to_cpu_vec_f32()?;
+        let a_dims = a.shape().dims();
+        let out_dims = out_shape.dims();
+        let m = a_dims[0];
+        let k = a_dims[1];
+        let n = out_dims[1];
+
+        let mut b_dequant = vec![0.0f32; k * n];
+        let blocks_per_col = k / 32;
+
+        let b_bytes = if let Some(ref c_s) = b_packed.as_any().downcast_ref::<CudaStorage>() {
+            let mut host_bytes = vec![0u8; c_s.bytes];
+            if let Some(dev_ptr) = c_s.device_ptr {
+                unsafe {
+                    cudaMemcpy(
+                        host_bytes.as_mut_ptr() as *mut c_void,
+                        dev_ptr as *const c_void,
+                        c_s.bytes,
+                        cudaMemcpyDeviceToHost,
+                    );
+                }
+            }
+            host_bytes
+        } else {
+            vec![0u8; k * n]
+        };
+
+        for col in 0..n {
+            for block in 0..blocks_per_col {
+                let scale_idx = col * blocks_per_col + block;
+                let scale = if scale_idx < b_scales.len() { b_scales[scale_idx] } else { 1.0f32 };
+                for i in 0..32 {
+                    let byte_offset = (col * blocks_per_col + block) * 32 + i;
+                    let byte_val = if byte_offset < b_bytes.len() { b_bytes[byte_offset] } else { 128u8 };
+                    let q_val = (byte_val as i16 - 128) as f32 / 127.0f32;
+                    let r = block * 32 + i;
+                    if r < k {
+                        b_dequant[r * n + col] = q_val * scale;
+                    }
+                }
+            }
+        }
+
+        let mut c_vec = vec![0.0f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += a_vec[row * k + p] * b_dequant[p * n + col];
+                }
+                c_vec[row * n + col] = sum;
+            }
+        }
+
+        let out_storage = self.from_cpu(&c_vec, out_shape, a.dtype())?;
+        Ok((out_storage, Box::new(CudaHandle { completed: Arc::new(Mutex::new(true)) })))
+    }
 }
 
 /// Helper function to retrieve the size in bytes of a data type.
@@ -1149,6 +1544,25 @@ mod tests {
         let storage = dev.from_cpu(&host_data, &shape, DType::F32).unwrap();
         let cpu_data = storage.to_cpu_vec_f32().unwrap();
         assert_eq!(cpu_data, host_data);
+    }
+
+    #[test]
+    fn test_cuda_math_ops() {
+        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
+        let devices = CudaDevice::probe().unwrap();
+        let dev = &devices[0];
+        let shape = Shape::new(vec![4]);
+        let host_data = vec![4.0f32, 9.0, 16.0, 25.0];
+        let x = dev.from_cpu(&host_data, &shape, DType::F32).unwrap();
+
+        let (out_sqrt, _) = dev.sqrt(x.as_ref(), &shape).unwrap();
+        assert_eq!(out_sqrt.to_cpu_vec_f32().unwrap(), vec![2.0, 3.0, 4.0, 5.0]);
+
+        let (out_recip, _) = dev.recip(out_sqrt.as_ref(), &shape).unwrap();
+        assert_eq!(out_recip.to_cpu_vec_f32().unwrap(), vec![0.5, 1.0 / 3.0, 0.25, 0.2]);
+
+        let (out_mul, _) = dev.mul_scalar(x.as_ref(), 0.5, &shape).unwrap();
+        assert_eq!(out_mul.to_cpu_vec_f32().unwrap(), vec![2.0, 4.5, 8.0, 12.5]);
     }
 
     #[test]

@@ -1058,6 +1058,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("conversion failed");
 
