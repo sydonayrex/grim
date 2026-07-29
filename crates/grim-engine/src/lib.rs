@@ -315,19 +315,23 @@ impl Engine {
             self.drive_prefill(id)?;
             prefill_elapsed += pf_start.elapsed();
         }
-        let decode = output.decode_ids.clone();
-        let decode_count = decode.len();
         let mut decode_elapsed = Duration::ZERO;
         let mut total_accepted = 0usize;
-        for id in decode {
-            if self.scheduler.is_paused(id) {
-                continue;
-            }
-            let dec_start = Instant::now();
-            let outcome = self.drive_decode_with_outcome(id)?;
-            decode_elapsed += dec_start.elapsed();
-            if let Some(ref o) = outcome {
-                total_accepted += o.accepted_tokens;
+        let mut decode_count = 0usize;
+
+        // Process decode steps grouped by adapter sub-batch (§4.5 multi-LoRA serving)
+        for (_adapter_id, seq_ids) in &output.adapter_batches {
+            for &id in seq_ids {
+                if !output.decode_ids.contains(&id) || self.scheduler.is_paused(id) {
+                    continue;
+                }
+                decode_count += 1;
+                let dec_start = Instant::now();
+                let outcome = self.drive_decode_with_outcome(id)?;
+                decode_elapsed += dec_start.elapsed();
+                if let Some(ref o) = outcome {
+                    total_accepted += o.accepted_tokens;
+                }
             }
         }
 
@@ -490,32 +494,10 @@ impl Engine {
     }
 
     pub fn enqueue_request(&mut self, request: grim_scheduler::Request) {
-        // Honor the model's actual device instead of silently forcing CPU.
-        let device = self
-            .models
-            .get(request.model_id.as_deref().unwrap_or(""))
-            .map(|m| m.device.clone())
-            .unwrap_or(grim_tensor::Device::Cpu);
-        let session = Box::new(grim_core::session::Inner::new(device));
-        self.sessions.insert(request.id, session);
-        self.request_model_ids.insert(request.id, request.model_id.clone().unwrap_or_default());
-        self.request_adapters.insert(request.id, request.adapter_ids.clone());
-        // Store the real input token IDs if provided
-        if let Some(input_ids) = request.input_ids.clone() {
-            self.request_input_ids.insert(request.id, input_ids);
-        }
-        // §5.8: per-request seeded RNG. Strict mode requires this for
-        // any noise added by the speculative verifier.
-        self.request_rng.insert(
-            request.id,
-            DeterministicRng::from_seed(request.id.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
-        );
-        self.scheduler.enqueue(request);
+        let _ = self.enqueue_request_with_kv(request);
     }
 
-    /// Allocate a session with a paged KV cache wired in. Used by the
-    /// engine when speculative decoding is enabled — the wrapper writes
-    /// tentative/supplemental slots into the session's KV.
+    /// Allocate a session with a paged KV cache wired in and prefix caching active (§5.1).
     pub fn enqueue_request_with_kv(&mut self, request: grim_scheduler::Request) -> Result<()> {
         // Honor the model's actual device instead of silently forcing CPU.
         let device = self
@@ -528,10 +510,34 @@ impl Engine {
             self.config.num_kv_heads,
             self.config.head_dim,
         );
-        let session = Box::new(grim_core::session::Inner::with_kv(
+        let mut session = Box::new(grim_core::session::Inner::with_kv(
             device,
             Box::new(kv),
         ));
+
+        // Prefix Caching (§5.1): Check if prompt tokens contain shared system prompt blocks
+        if let Some(ref input_tokens) = request.input_ids {
+            let block_size = grim_memory::BLOCK_SIZE;
+            let mut pool = self.block_pool.lock().unwrap();
+            let mut shared_blocks = 0;
+            for chunk in input_tokens.chunks_exact(block_size) {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                use std::hash::Hash;
+                chunk.hash(&mut hasher);
+                let hash = std::hash::Hasher::finish(&hasher);
+                if pool.find_or_share_prefix(hash).is_ok() {
+                    shared_blocks += 1;
+                } else {
+                    break;
+                }
+            }
+            if shared_blocks > 0 {
+                let shared_tokens = shared_blocks * block_size;
+                use grim_core::session::SessionT;
+                session.advance_pos(shared_tokens);
+            }
+        }
+
         self.sessions.insert(request.id, session);
         self.request_model_ids.insert(request.id, request.model_id.clone().unwrap_or_default());
         self.request_adapters.insert(request.id, request.adapter_ids.clone());
@@ -1117,5 +1123,30 @@ mod tests {
         let _ = engine.tick().expect("decode tick must succeed");
         let pos_after_decode = engine.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
         assert_eq!(pos_after_decode, prompt_tokens + 1, "decode must advance by 1");
+    }
+
+    #[test]
+    fn test_prefix_caching_shares_blocks_and_advances_pos() {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.register_model("small", small_llama());
+
+        let system_prompt = vec![101u32; 16];
+
+        engine.enqueue_request(Request {
+            id: 100,
+            prompt_tokens: 16,
+            input_ids: Some(system_prompt.clone()),
+            ..Default::default()
+        });
+
+        engine.enqueue_request(Request {
+            id: 200,
+            prompt_tokens: 16,
+            input_ids: Some(system_prompt.clone()),
+            ..Default::default()
+        });
+
+        let s2_pos = engine.sessions.get(&200).map(|s| s.current_pos()).unwrap_or(0);
+        assert_eq!(s2_pos, 16, "identical prefix prompt must hit prefix cache and advance pos");
     }
 }

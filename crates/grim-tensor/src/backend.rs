@@ -288,6 +288,18 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
+    /// All-Reduce collective operation across tensor-parallel devices (§4.1).
+    fn all_reduce(
+        &self,
+        inputs: &[&dyn BackendStorage],
+        op: &str,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (inputs, op);
+        Err(crate::error::Error::Unimplemented(
+            "all_reduce not implemented for this backend".into(),
+        ))
+    }
+
     /// Mamba selective scan (Phase 2 — mambo5.md Item 11).
     ///
     /// Computes the recurrent hidden-state update `h_t = a * h_{t-1} + x_t * b_t`
