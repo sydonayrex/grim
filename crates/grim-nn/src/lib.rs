@@ -6,5 +6,8 @@
 pub mod modules;
 pub mod varbuilder;
 
-pub use modules::{Embedding, Linear, RmsNorm, Rope, add_tensors, pick_device_for_storage_device};
+pub use modules::{
+    add_tensors, pick_device_for_storage_device, pick_device_for_tensor, ColumnParallelLinear,
+    Embedding, Linear, RmsNorm, Rope, RowParallelLinear, TensorParallelConfig,
+};
 pub use varbuilder::WeightSource;
