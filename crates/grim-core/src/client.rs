@@ -470,6 +470,8 @@ async fn stream_download<F>(
 where
     F: Fn(DownloadProgress) + Send + Sync,
 {
+    validate_public_url(url)?;
+
     let part = dest.with_extension(
         format!(
             "{}.part",
@@ -909,4 +911,19 @@ pub fn validate_model_cached(model_name: &str) -> Result<PathBuf> {
         "Model '{model_name}' not found in local cache.\n\
          Run 'grim pull {model_name}' to download it."
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ssrf_blocks_loopback_and_private_urls() {
+        assert!(validate_public_url("http://127.0.0.1:8080/model.gguf").is_err());
+        assert!(validate_public_url("http://localhost:8080/model.gguf").is_err());
+        assert!(validate_public_url("http://10.0.0.1/model.gguf").is_err());
+        assert!(validate_public_url("http://192.168.1.1/model.gguf").is_err());
+        assert!(validate_public_url("http://172.16.0.1/model.gguf").is_err());
+        assert!(validate_public_url("http://169.254.169.254/latest/meta-data/").is_err());
+    }
 }
