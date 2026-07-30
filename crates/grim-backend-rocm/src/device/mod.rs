@@ -32,3 +32,5 @@ pub mod rocblas;
 pub mod roc_device;
 pub mod util;
 pub mod cubecl;
+/// SCYTHE-2 WI-2: live GPU capability profiler.
+pub mod capability_profiler;

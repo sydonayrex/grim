@@ -8,13 +8,12 @@
 //! module when `quant_mode == QuantMode::Fp8Native && arch >= "gfx1150"`.
 //! Until the kernel source is written, `gemm_rgba8_16x16()` panics.
 
-use grim_tensor::{BackendDevice, Shape};
+use grim_tensor::BackendDevice;
 
 /// Multiply two FP16 matrices using RDNA4 BF16→FP8 fast path.
 ///
-/// **Panics** with "[fp8_gemm_rdna4] stub: not yet implemented".
-/// Replace this with the actual GEMM kernel dispatch when the HIPRTC
-/// source is ready.
+/// Returns `Err(Error::Unimplemented)` because the HIPRTC JIT kernel for RDNA4 FP8
+/// matrix cores is not yet implemented.
 pub fn gemm_rgba8_16x16(
     _device: &dyn BackendDevice,
     _a: &dyn grim_tensor::backend::BackendStorage,
@@ -23,6 +22,9 @@ pub fn gemm_rgba8_16x16(
     _m: usize,
     _n: usize,
     _k: usize,
-) {
-    panic!("[fp8_gemm_rdna4] stub: not yet implemented");
+) -> Result<(), grim_tensor::error::Error> {
+    Err(grim_tensor::error::Error::Unimplemented(
+        "[fp8_gemm_rdna4] fp8 gemm kernel on RDNA4 is not yet implemented".into(),
+    ))
 }
+

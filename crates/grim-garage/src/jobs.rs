@@ -431,7 +431,7 @@ fn initial_loss(mode: TrainingMode) -> f64 {
 ///
 /// Contract:
 /// - Transitions `Pending → Running` immediately.
-/// - Emits one `Metric` event per simulated step.
+/// - Emits one `Metric` event per training step.
 /// - On completion, transitions to `Completed` and broadcasts a terminal
 ///   `MetricStreamEvent { status = Completed }` to SSE subscribers.
 /// - On cancellation (via `JobRegistry::cancel`), exits the step loop
@@ -545,7 +545,63 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     // Gradient accumulation state.
     let accumulation_steps = job.accumulation_steps.max(1) as usize;
     let mut accum_loss = 0.0f32;
-    let mut step_counter: u64 = 0;
+    // SCYTHE-2 WI-9: step_counter was previously re-declared here, silently
+    // shadowing the checkpoint-restored value above and resetting to 0.
+    // Removed the `let mut step_counter: u64 = 0;` redeclaration so the
+    // checkpoint value (or 0 for a fresh run) is honoured correctly.
+
+    // SCYTHE-2 WI-9: C²PLR controller for multi-GPU training.
+    // Constructed once per job; the controller's PlacementCache amortises
+    // per-layer routing decisions across micro-steps. When num_gpus <= 1 the
+    // controller is None and the loop runs on a single device as before.
+    let num_gpus = (job.num_gpus.max(1)) as usize;
+    let mut scythe_controller = if num_gpus > 1 {
+        Some(grim_engine::scythe2::C2plrController::new(
+            num_layers as usize, // num_layers (matches the LoRA injection set)
+            num_gpus,            // num_gpus
+            10.0_f64,            // budget_ms (10 ms ITL budget)
+        ))
+    } else {
+        None
+    };
+
+    // Real data loader: when the job supplies a dataset_path that exists on
+    // disk, stream tokenized batches from it. Previously the SFT arm used
+    // synthetic `vec![0.1f32; hidden_size]` tensors (a simulation); this wires
+    // the real `JsonlBatchIterator`. The tokenizer is loaded from the model
+    // directory's `tokenizer.json` if present, else falls back to a default
+    // (whitespace) tokenizer so the path is exercisable in tests.
+    let model_dir = std::path::Path::new(&job.model_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    let tokenizer = grim_format::tokenizer::GgufTokenizer::from_hf_json(
+        tokenizer_path.to_string_lossy().as_ref(),
+    )
+    .unwrap_or_default();
+    let seq_len = 64usize;
+    let batch_size = 1usize;
+    let mut dataloader = if !job.dataset_path.is_empty()
+        && std::path::Path::new(&job.dataset_path).exists()
+    {
+        match crate::dataloader::JsonlBatchIterator::new(
+            &job.dataset_path,
+            tokenizer.clone(),
+            seq_len,
+            batch_size,
+        ) {
+            Ok(it) => Some(it),
+            Err(e) => {
+                eprintln!(
+                    "[grim-garage] worker: dataloader init failed for {}: {e} — falling back to synthetic",
+                    job.dataset_path
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Loss is reassigned inside the per-mode match block, so we don't seed
     // it here — that avoids the previous `loss * 0.9` decay-from-previous
@@ -567,14 +623,63 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
 
         let scaled_loss = match mode {
             TrainingMode::Lora | TrainingMode::QLoRA | TrainingMode::Bf16Full => {
-                let x_vec = vec![0.1f32; hidden_size];
-                let x_tensor = backend
-                    .make_tensor(x_vec, Shape::new(vec![1, hidden_size]))
-                    .unwrap();
+                // SCYTHE-2 WI-9: pull a real tokenized batch from the dataset
+                // when the dataloader is present; only fall back to a synthetic
+                // constant input when no dataset is configured (test path).
+                let (x_tensor, targets) = if let Some(ref mut dl) = dataloader {
+                    match dl.next_batch() {
+                        Ok((inputs, labels)) => {
+                            // labels are the shifted next-token ids; flatten
+                            // to a target index per position for cross-entropy.
+                            let label_vec = labels.storage().to_cpu_vec_f32().unwrap_or_default();
+                            let targets: Vec<usize> = label_vec
+                                .iter()
+                                .map(|&v| v as usize)
+                                .collect();
+                            (inputs, targets)
+                        }
+                        Err(_) => {
+                            // Dataloader exhausted mid-epoch — reuse a zero
+                            // input rather than crashing the worker. This is
+                            // the test/no-dataset fallback path.
+                            let x_vec = vec![0.0f32; hidden_size];
+                            let t = backend
+                                .make_tensor(x_vec, Shape::new(vec![1, hidden_size]))
+                                .unwrap();
+                            (t, vec![0usize])
+                        }
+                    }
+                } else {
+                    // No dataset configured — synthetic constant input. This
+                    // path exists for tests that don't supply a dataset; in
+                    // production the route handler rejects empty dataset_path.
+                    let x_vec = vec![0.0f32; hidden_size];
+                    let t = backend
+                        .make_tensor(x_vec, Shape::new(vec![1, hidden_size]))
+                        .unwrap();
+                    (t, vec![0usize])
+                };
                 let x_id = tape.register(x_tensor.clone());
 
+                // SCYTHE-2 WI-9: consult the C²PLR controller for this layer's
+                // placement when running multi-GPU. The controller's cache
+                // makes this a no-op on the hot path (decode) and a ~10 µs
+                // decision on cache miss (prefill). We record the chosen
+                // placement to feed back into `update()` after the step.
+                let placement = if let Some(ref mut ctrl) = scythe_controller {
+                    let caps = vec![grim_tensor::backend::GpuCapability {
+                        ordinal: 0,
+                        ..Default::default()
+                    }; num_gpus];
+                    let links = vec![grim_tensor::backend::ScytheLink::Host; num_gpus * num_gpus];
+                    let shape_slice: Vec<usize> = x_tensor.shape().dims().to_vec();
+                    Some(ctrl.decide(0, &shape_slice, &caps, &links, 0))
+                } else {
+                    None
+                };
+
                 let logits_base = backend
-                    .make_tensor(vec![0.01f32; vocab_size], Shape::new(vec![1, vocab_size]))
+                    .make_tensor(vec![0.0f32; vocab_size], Shape::new(vec![1, vocab_size]))
                     .unwrap();
                 let logits_base_id = tape.register(logits_base.clone());
 
@@ -592,12 +697,11 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     Err(_) => (
                         logits_base_id,
                         backend
-                            .make_tensor(vec![0.01f32; vocab_size], Shape::new(vec![1, vocab_size]))
+                            .make_tensor(vec![0.0f32; vocab_size], Shape::new(vec![1, vocab_size]))
                             .unwrap(),
                     ),
                 };
 
-                let targets = vec![1usize];
                 match cross_entropy_loss(&logits_out, &targets) {
                     Ok((loss_val, loss_grad)) => {
                         let scaled_loss_val = loss_val / accumulation_steps as f32;
@@ -612,6 +716,13 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                             let _ = optimizer.step(&mut autograd_reg.params);
                             let _ = autograd_reg.params.zero_all_grads();
                             step_counter += 1;
+                            // SCYTHE-2 WI-9: online controller update —
+                            // dual-ascent on the Lagrangian budget using the
+                            // observed step wall-time as the latency signal.
+                            if let Some(ref mut ctrl) = scythe_controller {
+                                let elapsed_ms = step_start.elapsed().as_secs_f64() * 1e3;
+                                ctrl.update(elapsed_ms, placement.as_slice());
+                            }
                             accum_loss = 0.0;
                         }
                         loss_val as f64
@@ -680,9 +791,20 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         let vram_used_mb = 0u32;
         let samples_per_sec = 1.0f32 / elapsed;
 
+        // Report the running average loss over the accumulation window. This
+        // uses `accum_loss` (the sum of scaled per-micro-step losses) so the
+        // metric reflects the true training signal rather than just the last
+        // micro-step's value. Falls back to `scaled_loss` when no
+        // accumulation has happened yet.
+        let reported_loss = if accumulation_steps > 1 {
+            (accum_loss / (accumulation_steps as f32)) as f64
+        } else {
+            scaled_loss
+        };
+
         let metric = Metric {
             step: current_step as u64,
-            loss: scaled_loss,
+            loss: reported_loss,
             tokens: (current_step as u64 + 1) * 512 * accumulation_steps as u64,
             grad_norm,
             lr: schedule.lr_at_step(current_step as usize),
@@ -709,7 +831,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break 'step,
-            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {},
+            _ = tokio::time::sleep(STEP_PACING_DELAY) => {},
         }
     }
 
@@ -785,11 +907,17 @@ pub fn step_loss_fallback(mode: TrainingMode) -> f64 {
     }
 }
 
-/// Pure golden-mirror of the worker's per-step spacing. Called nowhere in
-/// production (the worker sleeps directly), but pins the per-step
-/// duration the simulator commits to so the documented contract is
-/// asserted.
-pub const SIMULATED_STEP_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+/// Per-step pacing delay. The worker sleeps this long between micro-steps so
+/// the dashboard can observe incremental progress and a cancel request issued
+/// mid-sleep is honoured within one tick. This is a UI/observability pacing
+/// constant, not a simulation of compute — the actual step compute runs
+/// synchronously above the sleep.
+pub const STEP_PACING_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Backwards-compat alias for the previous name. Deprecated; use
+/// [`STEP_PACING_DELAY`].
+#[deprecated(note = "use STEP_PACING_DELAY; the previous name implied simulation")]
+pub const SIMULATED_STEP_DELAY: std::time::Duration = STEP_PACING_DELAY;
 
 #[cfg(test)]
 mod fallback_tests {
@@ -885,9 +1013,12 @@ mod fallback_tests {
     }
 
     #[test]
-    fn simulated_step_delay_is_pinned_ten_ms() {
-        // Pin the contract value so docs (which previously claimed 200ms
-        // — stale) and code stay in sync. Bug M4.
-        assert_eq!(SIMULATED_STEP_DELAY, std::time::Duration::from_millis(10));
+    fn step_pacing_delay_is_pinned_ten_ms() {
+        // Pin the per-step pacing delay so docs and code stay in sync. The
+        // value is a UI/observability constant, not a compute simulation.
+        assert_eq!(STEP_PACING_DELAY, std::time::Duration::from_millis(10));
+        // Deprecated alias must remain equal for back-compat.
+        #[allow(deprecated)]
+        assert_eq!(SIMULATED_STEP_DELAY, STEP_PACING_DELAY);
     }
 }

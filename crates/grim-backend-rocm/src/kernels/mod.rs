@@ -28,5 +28,5 @@ pub mod flash_attn;
 pub mod cross_attention;
 pub mod rwkv;
 pub mod wmma_gemm;
-
-
+/// SCYTHE-2 WI-6: CommFuse decomposed P2P fan-in.
+pub mod comm_fuse;
