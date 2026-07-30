@@ -635,9 +635,13 @@ async fn images_generations() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-/// gRPC service handler placeholder / mock server path (§8)
-async fn grpc_service_handler() -> &'static str {
-    "[gRPC Server] Tonic-compatible service pipeline running."
+/// gRPC service endpoint handler (§8).
+/// Returns 501 Not Implemented unless compiled with the `grpc` feature.
+async fn grpc_service_handler() -> (StatusCode, &'static str) {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "gRPC service pipeline requires compiling with --features grpc",
+    )
 }
 
 /// Telemetry metrics endpoint (§8)

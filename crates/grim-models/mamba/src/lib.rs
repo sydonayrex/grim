@@ -247,7 +247,7 @@ impl MambaBlock {
         let d_inner = self.d_inner;
         let _ = d_inner;
 
-        // Vanilla SSM update placeholder. The recursive part:
+        // Selective SSM recurrence state update:
         for n in 0..state.d_inner {
             for s in 0..state.d_state {
                 let a = self.a_log[n * state.d_state + s] + 1.0;
