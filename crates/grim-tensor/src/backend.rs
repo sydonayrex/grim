@@ -1,9 +1,83 @@
 //! Backend-agnostic trait surface. Each backend crate
 //! (`grim-backend-cpu`, `grim-backend-rocm`, ...) implements these.
+//!
+//! ## SCYTHE-2 types (WI-1)
+//! `GpuCapability`, `ScytheLink`, and `ScythePlacement` are the three
+//! first-class types required by the C²PLR controller (scythe2.md §5.1).
+//! They live here rather than in the ROCm crate so that `grim-engine`
+//! (which is backend-agnostic) can import them without a circular dep.
 
 use crate::dtype::{DType, QuantProvenance};
 use crate::error::Result;
 use crate::shape::Shape;
+
+// ---- SCYTHE-2 §5.1 types ---------------------------------------------------
+
+/// Per-GPU live capability snapshot, refreshed every ~100 ms by `CapabilityProfiler`.
+///
+/// Builds on existing `probe_host_gpu` (`device/probe.rs:104`) and
+/// `peer_status` (`peer_access.rs:84`). SCYTHE-2 adds a 5-ms micro-GEMM
+/// sweep (Piper-style resource modelling, `2605.05049`) to fill `tflops_fp16`.
+/// All zero-valued fields indicate "unknown" — the controller falls back
+/// to the host-only path when TFLOPS is 0.
+#[derive(Debug, Clone, Default)]
+pub struct GpuCapability {
+    /// Effective FP16 TFLOPS at this instant (may drop under throttle).
+    pub tflops_fp16: f32,
+    /// Effective FP8 TFLOPS — 0.0 if arch < RDNA 4 or un-measured.
+    pub tflops_fp8: f32,
+    /// HBM read bandwidth in GB/s.
+    pub hbm_bandwidth_gbps: f32,
+    /// Free VRAM in bytes at the time of the last profiler sweep.
+    pub vram_free_bytes: u64,
+    /// Current thermal throttle fraction (0.0 = none, 1.0 = fully throttled).
+    /// Sampled from `hipDeviceGetAttribute`/SMI at the profiler cadence.
+    pub throttle_pct: f32,
+    /// HIP ordinal of this GPU.
+    pub ordinal: usize,
+}
+
+/// Route matrix element q ∈ {PeerDirect, Pcie, Host}.
+///
+/// Maps onto the existing `P2PStatus` (`peer_access.rs:48`) and
+/// `RouteLink` (`p2p_route.rs:41`) enums in the ROCm backend.
+/// `ScytheLink` lives here (in `grim-tensor`) so the controller in
+/// `grim-engine` can use it without importing a backend-specific type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScytheLink {
+    /// Direct peer DMA (xGMI / Instinct class).  Maps to `RouteLink::PeerDirect`.
+    PeerDirect,
+    /// Peer-enabled PCIe (consumer RDNA). Maps to `RouteLink::HostBounce` for
+    /// large transfers but the controller may still choose it for latency.
+    Pcie,
+    /// No peer access; must bounce through host pinned memory.
+    Host,
+}
+
+impl Default for ScytheLink {
+    /// Conservative default: assume host-bounce until a probe confirms otherwise.
+    fn default() -> Self {
+        ScytheLink::Host
+    }
+}
+
+/// Output of the C²PLR controller for one (layer, shape) pair.
+///
+/// A `ScythePlacement` is produced by `C2plrController::decide()` on a cache
+/// miss and then stored in `PlacementCache` (array-indexed by `layer_id`).
+/// Fields follow scythe2.md §5.1 naming exactly.
+#[derive(Debug, Clone)]
+pub struct ScythePlacement {
+    /// Which GPU ordinals participate in this layer's forward pass (vector r).
+    /// May be a strict subset of all GPUs when some are off the critical path.
+    pub ranks: Vec<usize>,
+    /// Partition ratios p — parallel to `ranks`. Does NOT have to sum to 1.0:
+    /// replicated layers (RMSNorm, RoPE) sum to K; offloaded layers sum to 1.
+    pub partition: Vec<f32>,
+    /// Route matrix q (flattened K×K, row-major).
+    /// `routes[i * K + j]` is the link from rank i to rank j.
+    pub routes: Vec<ScytheLink>,
+}
 
 /// A handle to an asynchronous compute operation.
 ///
@@ -298,6 +372,50 @@ pub trait BackendDevice: Send + Sync {
         Err(crate::error::Error::Unimplemented(
             "all_reduce not implemented for this backend".into(),
         ))
+    }
+
+    /// SCYTHE-2 CommFuse decomposed P2P fan-in (WI-1 / WI-6).
+    ///
+    /// Replaces `all_reduce` for `RowParallelLinear`: instead of a
+    /// `reduce_scatter` + `all_gather` pair (two sync points), each rank
+    /// P2P-pushes its partial directly to the rank that owns that output shard.
+    /// This eliminates the tail latency identified in CommFuse (`2604.24013`).
+    ///
+    /// `partials` is a slice of `(storage, placement)` pairs — one per GPU rank
+    /// — where `storage` is that rank's partial GEMM output and `placement` is
+    /// the controller-assigned routing metadata.
+    ///
+    /// Default: returns `Err(Unimplemented)` so non-ROCm backends compile
+    /// unchanged. The ROCm backend overrides this in WI-6.
+    fn comm_fuse_reduce(
+        &self,
+        partials: &[(&dyn BackendStorage, &ScythePlacement)],
+    ) -> Result<Box<dyn BackendStorage>> {
+        let _ = partials;
+        Err(crate::error::Error::Unimplemented(
+            "comm_fuse_reduce not implemented on this backend".into(),
+        ))
+    }
+
+    /// WaveTune bilinear latency predictor (WI-1).
+    ///
+    /// Returns estimated milliseconds for a `(M, N, K)` GEMM under the given
+    /// `placement` on this device. Used by `C2plrController::decide_miss()` to
+    /// rank candidate placements — this is the *offline table-lookup* path
+    /// described in WaveTune (`2604.10187` §4.4–4.5), not a candidate-loop.
+    ///
+    /// Default: returns `f64::INFINITY` so the controller treats this backend
+    /// as infinitely expensive and routes away from it (safe fallback).
+    fn estimate_gemm_latency_ms(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        dtype: DType,
+        placement: &ScythePlacement,
+    ) -> f64 {
+        let _ = (m, n, k, dtype, placement);
+        f64::INFINITY
     }
 
     /// Mamba selective scan (Phase 2 — mambo5.md Item 11).

@@ -568,25 +568,26 @@ fn write_gguf<W: Write, R: Read + Seek>(
     let data_start = align32(unaligned_data_start);
 
     let mut current_offset = 0u64;
-    let rewritten_infos = gguf
-        .tensors
-        .iter()
-        .map(|info| {
-            let rewritten = rewritten_tensors.get(&info.name);
-            let updated = GgufTensorInfo {
-                name: info.name.clone(),
-                dims: info.dims.clone(),
-                offset: current_offset,
-                size_bytes: rewritten.map(|r| r.bytes.len() as u64).unwrap_or(info.size_bytes),
-                dtype: rewritten.map(|r| gguf_dtype_for_quant_format(r.target)).unwrap_or(info.dtype),
-            };
-            current_offset += info.size_bytes;
-            if let Some(rewritten) = rewritten {
-                current_offset = updated.offset + rewritten.bytes.len() as u64;
-            }
-            updated
-        })
-        .collect::<Vec<_>>();
+    let mut rewritten_infos = Vec::with_capacity(gguf.tensors.len());
+    for info in &gguf.tensors {
+        let rewritten = rewritten_tensors.get(&info.name);
+        let dtype = match rewritten {
+            Some(r) => gguf_dtype_for_quant_format(r.target)?,
+            None => info.dtype,
+        };
+        let updated = GgufTensorInfo {
+            name: info.name.clone(),
+            dims: info.dims.clone(),
+            offset: current_offset,
+            size_bytes: rewritten.map(|r| r.bytes.len() as u64).unwrap_or(info.size_bytes),
+            dtype,
+        };
+        current_offset += info.size_bytes;
+        if let Some(rewritten) = rewritten {
+            current_offset = updated.offset + rewritten.bytes.len() as u64;
+        }
+        rewritten_infos.push(updated);
+    }
 
     writer.write_all(&0x4655_4747u32.to_le_bytes()).map_err(|e| e.to_string())?;
     writer.write_all(&gguf.version.to_le_bytes()).map_err(|e| e.to_string())?;
@@ -639,20 +640,22 @@ fn quant_format_for_bitwidth(bw: u32) -> Option<QuantFormat> {
     }
 }
 
-fn gguf_dtype_for_quant_format(format: QuantFormat) -> GgufDType {
+fn gguf_dtype_for_quant_format(format: QuantFormat) -> Result<GgufDType, String> {
     match format {
-        QuantFormat::Q8_0 => GgufDType::Q8_0,
-        QuantFormat::Q4K => GgufDType::Q4K,
-        QuantFormat::Q5K => GgufDType::Q5K,
-        QuantFormat::Q6K => GgufDType::Q6K,
-        QuantFormat::Iq4Nl => GgufDType::IQ4_NL,
-        QuantFormat::Iq4Xs => GgufDType::IQ4_XS,
-        QuantFormat::Iq3Xxs => GgufDType::IQ3_XXS,
-        QuantFormat::Iq3S => GgufDType::IQ3_S,
-        QuantFormat::Iq2Xxs => GgufDType::IQ2_XXS,
-        QuantFormat::Iq2Xs => GgufDType::IQ2_XS,
-        QuantFormat::Iq2S => GgufDType::IQ2_S,
-        QuantFormat::Fp4 | QuantFormat::Nf4 | QuantFormat::Fp8 | QuantFormat::Fp4Block16 | QuantFormat::Fp8Block16 => unimplemented!("fp4/nf4/fp8 quantization not implemented in CLI"),
+        QuantFormat::Q8_0 => Ok(GgufDType::Q8_0),
+        QuantFormat::Q4K => Ok(GgufDType::Q4K),
+        QuantFormat::Q5K => Ok(GgufDType::Q5K),
+        QuantFormat::Q6K => Ok(GgufDType::Q6K),
+        QuantFormat::Iq4Nl => Ok(GgufDType::IQ4_NL),
+        QuantFormat::Iq4Xs => Ok(GgufDType::IQ4_XS),
+        QuantFormat::Iq3Xxs => Ok(GgufDType::IQ3_XXS),
+        QuantFormat::Iq3S => Ok(GgufDType::IQ3_S),
+        QuantFormat::Iq2Xxs => Ok(GgufDType::IQ2_XXS),
+        QuantFormat::Iq2Xs => Ok(GgufDType::IQ2_XS),
+        QuantFormat::Iq2S => Ok(GgufDType::IQ2_S),
+        QuantFormat::Fp4 | QuantFormat::Nf4 | QuantFormat::Fp8 | QuantFormat::Fp4Block16 | QuantFormat::Fp8Block16 => {
+            Err(format!("quantization format {:?} is not supported in GGUF writer", format))
+        }
     }
 }
 

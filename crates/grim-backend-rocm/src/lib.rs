@@ -40,6 +40,9 @@ pub mod rccl;
 pub mod rocm_detect;
 pub mod speculative;
 
+/// SCYTHE-2 WI-2: capability profiler re-export.
+pub use device::capability_profiler::{CapabilityProfiler, bump_epoch, current_epoch, CAPABILITY_EPOCH};
+
 // ----- Crate-root re-exports ------------------------------------
 // Existing callers (lib_internal_tests.rs + external crates) see
 // these names without needing to know which sub-module they live in.

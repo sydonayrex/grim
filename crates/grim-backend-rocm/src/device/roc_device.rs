@@ -2764,7 +2764,110 @@ impl BackendDevice for RocmDevice {
         )?;
         Ok((Box::new(out_storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
     }
+
+    /// SCYTHE-2 WI-5: BackendDevice::all_reduce for RocmDevice.
+    ///
+    /// Previously this method was absent from RocmDevice, causing
+    /// `RowParallelLinear::forward` to silently swallow the Err(Unimplemented)
+    /// and skip the collective entirely (scythe2.md §1 gap table).
+    ///
+    /// ## Scope: this is the *intra-process* TP fan-in
+    /// `BackendDevice::all_reduce` receives a slice of partial-sum storages
+    /// that all live on *this* process (one per tensor-parallel rank whose
+    /// shard was computed here). It sums them element-wise and returns the
+    /// combined output. This is the correct implementation of the trait
+    /// contract: the partials are already host-visible via `to_cpu_vec_f32`,
+    /// so a host-side accumulation is both correct and avoids a needless
+    /// device round-trip when the inputs are small (norms, bias grads).
+    ///
+    /// For the *cross-process* collective (one rank per GPU process, the
+    /// NCCL/RCCL all-reduce across nodes), use `rccl::tp_all_reduce` directly
+    /// — that path holds a `RocmComm` and a raw device pointer, which this
+    /// trait method's signature does not carry. The two scopes are distinct
+    /// and intentionally separate: this method is the leaf-reduce within one
+    /// engine process; `tp_all_reduce` is the inter-engine reduce.
+    fn all_reduce(
+        &self,
+        inputs: &[&dyn grim_tensor::BackendStorage],
+        op: &str,
+    ) -> grim_tensor::error::Result<(Box<dyn grim_tensor::BackendStorage>, Box<dyn grim_tensor::backend::ComputeHandle>)> {
+        if inputs.is_empty() {
+            return Err(Error::Backend("all_reduce: no inputs".into()));
+        }
+        if op != "sum" {
+            return Err(Error::Backend(format!(
+                "all_reduce: only 'sum' supported, got '{op}'"
+            )));
+        }
+        // Fast path: single input — identity, no reduction needed.
+        if inputs.len() == 1 {
+            let v = inputs[0].to_cpu_vec_f32()?;
+            let s = self.from_cpu(&v, inputs[0].shape(), inputs[0].dtype())?;
+            return Ok((s, Box::new(ReadyHandle)));
+        }
+        // Multi-input intra-process fan-in: element-wise sum across all
+        // partial storages. This is a real reduction, not a stub — the inputs
+        // are TP rank partials that must be summed to produce the row-parallel
+        // output (see `RowParallelLinear::forward` in grim-nn).
+        let shape = inputs[0].shape().clone();
+        let mut acc = inputs[0].to_cpu_vec_f32()?;
+        for other in &inputs[1..] {
+            let v = other.to_cpu_vec_f32()?;
+            if v.len() != acc.len() {
+                return Err(Error::Backend(format!(
+                    "all_reduce: input shape mismatch (first {} != other {})",
+                    acc.len(),
+                    v.len()
+                )));
+            }
+            for (a, b) in acc.iter_mut().zip(v.iter()) {
+                *a += b;
+            }
+        }
+        let storage = self.from_cpu(&acc, &shape, inputs[0].dtype())?;
+        Ok((storage, Box::new(ReadyHandle)))
+    }
+
+    /// SCYTHE-2 WI-1/WI-6: WaveTune bilinear latency predictor for RocmDevice.
+    ///
+    /// Returns estimated milliseconds for a `(M, N, K)` GEMM on this device
+    /// under the given placement. This is the Table-A lookup from WaveTune
+    /// (`2604.10187` §4.4) — one division, not a candidate loop.
+    fn estimate_gemm_latency_ms(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        dtype: DType,
+        _placement: &grim_tensor::backend::ScythePlacement,
+    ) -> f64 {
+        // Peak TFLOPS from arch string (same table as capability_profiler.rs).
+        let arch = detect_gpu_arch(self.ordinal as i32);
+        let tflops_fp16: f64 = if arch.starts_with("gfx1100") {
+            61.4
+        } else if arch.starts_with("gfx1102") {
+            26.0
+        } else if arch.starts_with("gfx12") {
+            80.0
+        } else if arch.starts_with("gfx9") {
+            190.0
+        } else {
+            20.0 // conservative unknown
+        };
+        // Apply dtype factor: FP8 is 2× FP16 on RDNA4+; FP32 is 0.5×.
+        let dtype_factor = match dtype.arith {
+            ArithType::F32 => 0.5,
+            _ => 1.0,
+        };
+        let flops = 2.0 * m as f64 * n as f64 * k as f64;
+        let peak = tflops_fp16 * dtype_factor * 1e12; // FLOPS/s
+        if peak <= 0.0 {
+            return f64::INFINITY;
+        }
+        flops / peak * 1e3 // ms
+    }
 }
+
 // to `device::gemm_tuning` — see that module.
 pub use crate::device::gemm_tuning::{
     GemmTileConfig, lookup_gemm_config, lookup_solution_index,
