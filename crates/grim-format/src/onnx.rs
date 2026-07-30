@@ -64,11 +64,9 @@ pub struct OnnxProvider {
 impl OnnxProvider {
     /// Load an ONNX model and extract tensor metadata.
     pub fn load(_path: &str) -> Result<Self> {
-        // Note: Full implementation would use `ort` crate to parse ONNX
-        // For now, return empty provider as placeholder
-        Ok(Self {
-            tensors: std::collections::HashMap::new(),
-        })
+        Err(Error::Unimplemented(
+            "ONNX model loading is not enabled in this build; requires ort integration".into(),
+        ))
     }
 }
 
