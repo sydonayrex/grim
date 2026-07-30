@@ -15,6 +15,8 @@
 
 pub mod model_loader;
 pub mod streaming_forward;
+/// SCYTHE-2 WI-4 + WI-7: C²PLR controller, PlacementCache, ScytheRing.
+pub mod scythe2;
 
 use std::collections::HashMap;
 use std::sync::Arc;
