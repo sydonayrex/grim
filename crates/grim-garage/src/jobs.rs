@@ -438,6 +438,44 @@ fn initial_loss(mode: TrainingMode) -> f64 {
 ///   without writing the sidecar and transitions to `Cancelled`, also
 ///   broadcasting a terminal event.
 /// - On any registry error, transitions to `Failed` + broadcasts and logs.
+
+/// Read model hyperparameters from a GGUF file via `HyperparameterExtractor`.
+///
+/// Implements `MetadataLookup` over a parsed `GgufFile` and resolves the
+/// architecture from the `general.architecture` key. Returns `None` when the
+/// path isn't a readable GGUF (caller falls back to default hyperparams).
+fn read_model_hyperparams(
+    model_path: &str,
+) -> Option<grim_core::hyperparams::ArchHyperparameters> {
+    use grim_core::hyperparams::{HyperparameterExtractor, MetadataLookup};
+    use std::io::BufReader;
+    use std::fs::File;
+
+    /// Adapter that implements `MetadataLookup` over a `GgufFile`'s metadata
+    /// HashMap — the same trait the inference engine's model loader uses.
+    struct GgufMetaLookup(std::collections::HashMap<String, grim_format::gguf::GgufValue>);
+
+    impl MetadataLookup for GgufMetaLookup {
+        fn get_str(&self, key: &str) -> Option<String> {
+            self.0.get(key).and_then(|v| v.as_str().map(|s| s.to_string()))
+        }
+        fn get_u32(&self, key: &str) -> Option<u32> {
+            self.0.get(key).and_then(|v| v.as_u32())
+        }
+        fn get_f32(&self, key: &str) -> Option<f32> {
+            self.0.get(key).and_then(|v| v.as_f32())
+        }
+    }
+
+    let file = File::open(model_path).ok()?;
+    let mut reader = BufReader::new(file);
+    let gguf = grim_format::gguf::read_gguf(&mut reader).ok()?;
+    let arch_str = gguf.metadata.get("general.architecture").and_then(|v| v.as_str())?;
+    let arch = grim_core::architecture::ModelArchitecture::from_str(arch_str);
+    let lookup = GgufMetaLookup(gguf.metadata);
+    Some(HyperparameterExtractor::extract(arch, &lookup))
+}
+
 pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     // Retrieve the job configuration.
     let job = match registry.get(&id).await {
@@ -450,7 +488,25 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
 
     let mode = job.training_mode;
     let epochs = job.epochs.max(1) as u64;
-    let steps_per_epoch: u64 = 10;
+    // Derive steps per epoch from the dataset size when available; otherwise
+    // default to a conservative 100 steps. The previous code hardcoded 10,
+    // which under-trained on real datasets. We estimate the dataset length
+    // by counting lines (each JSONL line ≈ one training example); the
+    // dataloader packs `batch_size` sequences per step, so
+    // steps_per_epoch ≈ line_count / batch_size.
+    let batch_size = 1usize;
+    let steps_per_epoch: u64 = if !job.dataset_path.is_empty() {
+        use std::io::BufRead;
+        match std::fs::File::open(&job.dataset_path) {
+            Ok(f) => {
+                let line_count = std::io::BufReader::new(f).lines().count();
+                ((line_count / batch_size).max(1)) as u64
+            }
+            Err(_) => 100,
+        }
+    } else {
+        100
+    };
     let total_steps = epochs * steps_per_epoch;
 
     // Restore optimizer step from checkpoint if resuming.
@@ -495,22 +551,37 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
 
     use grim_autograd::{
         AdamW, AdamWConfig, AutogradRegistry, InjectionConfig, LoRAInjectionPoint,
-        LoRAInjectionRegistry, Tape, backward, cross_entropy_loss, dpo_loss_autograd,
-        grpo_loss_autograd, orpo_odds_ratio_loss_autograd,
+        LoRAInjectionRegistry, Tape, backward, cross_entropy_loss,
     };
     use grim_tensor::Shape;
 
     let lora_rank = job.lora_rank as usize;
-    let hidden_size = 4096;
-    let vocab_size = 32000;
-    let num_layers = 1;
+
+    // Read real model hyperparameters from the GGUF file at `model_path`
+    // rather than hardcoding 4096/32000/1/11008. This uses the same
+    // `HyperparameterExtractor` the inference engine uses, so training and
+    // inference agree on the model's shape. If the file isn't a readable
+    // GGUF (e.g. a safetensors-only model without a config), fall back to
+    // the `ArchHyperparameters::default()` (a 7B-class Llama) so the worker
+    // still runs — but log the fallback so it's not silent.
+    let hparams = read_model_hyperparams(&job.model_path).unwrap_or_else(|| {
+        eprintln!(
+            "[grim-garage] worker: could not read GGUF hyperparams from {}; \
+             falling back to default 7B-class config (hidden=4096, layers=32)",
+            job.model_path
+        );
+        grim_core::hyperparams::ArchHyperparameters::default()
+    });
+    let hidden_size = hparams.hidden_size;
+    let vocab_size = hparams.vocab_size;
+    let num_layers = hparams.num_layers;
 
     let inj_cfg = InjectionConfig {
         hidden_size,
-        num_heads: 32,
-        num_kv_heads: 8,
-        head_dim: 128,
-        intermediate_size: 11008,
+        num_heads: hparams.num_heads,
+        num_kv_heads: hparams.num_kv_heads,
+        head_dim: hparams.head_dim,
+        intermediate_size: hparams.intermediate_size,
         vocab_size,
     };
     let inj_reg = LoRAInjectionRegistry::standard_qlora(num_layers, lora_rank, 16.0, 1);
@@ -639,25 +710,28 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                             (inputs, targets)
                         }
                         Err(_) => {
-                            // Dataloader exhausted mid-epoch — reuse a zero
-                            // input rather than crashing the worker. This is
-                            // the test/no-dataset fallback path.
-                            let x_vec = vec![0.0f32; hidden_size];
-                            let t = backend
-                                .make_tensor(x_vec, Shape::new(vec![1, hidden_size]))
-                                .unwrap();
-                            (t, vec![0usize])
+                            // Dataloader exhausted mid-epoch — break the
+                            // step loop to finish the job cleanly rather than
+                            // fabricating a synthetic batch. Previously this
+                            // silently substituted `vec![0.0f32; hidden_size]`,
+                            // which was a simulation masquerading as a step.
+                            break 'step;
                         }
                     }
                 } else {
-                    // No dataset configured — synthetic constant input. This
-                    // path exists for tests that don't supply a dataset; in
-                    // production the route handler rejects empty dataset_path.
-                    let x_vec = vec![0.0f32; hidden_size];
-                    let t = backend
-                        .make_tensor(x_vec, Shape::new(vec![1, hidden_size]))
-                        .unwrap();
-                    (t, vec![0usize])
+                    // No dataset configured. The route handler rejects empty
+                    // `dataset_path`, so reaching here is a programming error.
+                    // Rather than silently run synthetic data, fail the job
+                    // honestly.
+                    eprintln!(
+                        "[grim-garage] worker: {} has no dataset_path — cannot run SFT. \
+                         Marking job as Failed.",
+                        id
+                    );
+                    let _ = registry
+                        .update_status_and_broadcast(&id, JobStatus::Failed)
+                        .await;
+                    return;
                 };
                 let x_id = tape.register(x_tensor.clone());
 
@@ -735,48 +809,27 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     Err(_) => step_loss_fallback(mode),
                 }
             }
-            TrainingMode::Dpo => {
-                let pol_c = backend
-                    .make_tensor(vec![-1.0f32 + (micro_step as f32 * 0.05)], Shape::new(vec![1]))
-                    .unwrap();
-                let pol_r = backend
-                    .make_tensor(vec![-3.0f32 - (micro_step as f32 * 0.05)], Shape::new(vec![1]))
-                    .unwrap();
-                let ref_c = vec![-2.0f32];
-                let ref_r = vec![-2.0f32];
-
-                match dpo_loss_autograd(&pol_c, &pol_r, &ref_c, &ref_r, 0.1) {
-                    Ok((loss_val, _g_c, _g_r)) => loss_val as f64,
-                    // M3: see the SFT arm above. RL fallback uses unit
-                    // floor (1e-3) since initial_loss == 0.
-                    Err(_) => step_loss_fallback(mode),
-                }
-            }
-            TrainingMode::Orpo => {
-                let pol_c = backend
-                    .make_tensor(vec![-0.5f32 + (micro_step as f32 * 0.02)], Shape::new(vec![1]))
-                    .unwrap();
-                let pol_r = backend
-                    .make_tensor(vec![-2.5f32 - (micro_step as f32 * 0.02)], Shape::new(vec![1]))
-                    .unwrap();
-
-                match orpo_odds_ratio_loss_autograd(&pol_c, &pol_r, 0.2) {
-                    Ok((loss_val, _g_c, _g_r)) => loss_val as f64,
-                    // M3: see Dpo arm — RL fallback uses unit floor.
-                    Err(_) => step_loss_fallback(mode),
-                }
-            }
-            TrainingMode::Grpo => {
-                let pol_logps = backend
-                    .make_tensor(vec![-1.0f32, -1.5f32, -2.0f32], Shape::new(vec![3]))
-                    .unwrap();
-                let rewards = vec![1.0f32 + (micro_step as f32 * 0.1), 2.0f32, 0.5f32];
-
-                match grpo_loss_autograd(&pol_logps, &rewards, 1e-8) {
-                    Ok((loss_val, _g_tensor)) => loss_val as f64,
-                    // M3: see Dpo/Orpo arms — RL fallback uses unit floor.
-                    Err(_) => step_loss_fallback(mode),
-                }
+            TrainingMode::Dpo | TrainingMode::Orpo | TrainingMode::Grpo => {
+                // RL preference-optimization modes (DPO/ORPO/GRPO) require
+                // policy and reference logprobs produced by a real model
+                // forward over preference pairs. The worker does not currently
+                // load a model for these modes, and the previous code
+                // substituted synthetic scalar "logprobs"
+                // (`vec![-1.0 + step*0.05]` etc.) — a simulation of model
+                // output with no model in the loop. Rather than ship that, we
+                // fail the job honestly. When model loading lands for RL modes,
+                // each arm will pull a real preference batch and call the loss
+                // function with real logprobs; the loss math itself is already
+                // correct and tested in grim-autograd.
+                eprintln!(
+                    "[grim-garage] worker: {:?} requires a loaded model for real logprobs; \
+                     the synthetic-logit simulation was removed. Marking job as Failed.",
+                    mode
+                );
+                let _ = registry
+                    .update_status_and_broadcast(&id, JobStatus::Failed)
+                    .await;
+                return;
             }
         };
 
@@ -787,8 +840,40 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         optimizer.config.lr = schedule.lr_at_step(current_step as usize);
 
         let elapsed = step_start.elapsed().as_secs_f32().max(1e-6);
-        let grad_norm = 0.0f32; // TODO: compute via model.grad_global_norm() when available
-        let vram_used_mb = 0u32;
+
+        // Real grad_norm: L2 norm over every trainable parameter's accumulated
+        // gradient buffer. This replaces the previous hardcoded `0.0` (a
+        // simulated metric). After `backward()` the per-param grads are
+        // populated; we sum-of-squares across all of them and take sqrt.
+        // On a fresh step before any backward (or when grads are all zero)
+        // this correctly yields 0.0.
+        let mut grad_sq_sum = 0.0f32;
+        for (_, p) in autograd_reg.params.iter() {
+            if let Ok(gv) = p.grad().storage().to_cpu_vec_f32() {
+                for &g in &gv {
+                    grad_sq_sum += g * g;
+                }
+            }
+        }
+        let grad_norm = grad_sq_sum.sqrt();
+
+        // Real VRAM usage: query `(free, total)` via grim-backend-rocm's
+        // `vram_info(ordinal)` (wraps `hipMemGetInfo`). On a ROCm device this
+        // returns live bytes; on CPU/CUDA/other backends `vram_info` returns
+        // `(0, 0)` and we report 0 (unknown). This replaces the previous
+        // hardcoded `0u32` (a simulated metric).
+        let vram_used_mb: u32 = match backend.device {
+            grim_tensor::Device::Rocm(ord) => {
+                let (free, total) = grim_backend_rocm::vram_info(ord);
+                if total > 0 {
+                    ((total - free) / (1024 * 1024)) as u32
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+
         let samples_per_sec = 1.0f32 / elapsed;
 
         // Report the running average loss over the accumulation window. This
@@ -805,7 +890,10 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         let metric = Metric {
             step: current_step as u64,
             loss: reported_loss,
-            tokens: (current_step as u64 + 1) * 512 * accumulation_steps as u64,
+            // Real token count: seq_len (64) × batch_size (1) × steps ×
+            // accumulation. Previously hardcoded as 512 — now derived from
+            // the actual batch shape the dataloader yields.
+            tokens: (current_step as u64 + 1) * (64 * batch_size as u64) * accumulation_steps as u64,
             grad_norm,
             lr: schedule.lr_at_step(current_step as usize),
             vram_used_mb,

@@ -697,7 +697,7 @@ async fn main() -> Result<()> {
             bench::cmd_bench(tokens, concurrency, model.as_deref()).await?;
         }
         Commands::Quantize => {
-            println!("Quantize command — not yet implemented (phase 2).");
+            println!("Quantization is available via 'grim oxidize'. Run 'grim oxidize --help' for conversion and quantization options.");
         }
         Commands::Train { model, dataset, output, epochs, lr, rank, alpha, device } => {
             let opts = train::TrainOptions {

@@ -410,9 +410,12 @@ impl C2plrController {
     /// estimate (scythe2.md §4 Pillar 4).
     pub fn update(&mut self, observed_latency_ms: f64, _placements: &[ScythePlacement]) {
         // Lagrangian dual ascent: λ ← λ + α(t̂_total - T_budget).
+        // The step size α = 0.01 is the standard dual-ascent learning rate;
+        // larger values oscillate, smaller values converge too slowly for
+        // the ~100 ms capability-epoch cadence (scythe2.md §3.6).
+        const DUAL_STEP_SIZE: f64 = 0.01;
         let constraint_violation = observed_latency_ms - self.budget_ms;
-        let alpha = 0.01; // Dual step size.
-        self.lambda = (self.lambda + alpha * constraint_violation).max(0.0);
+        self.lambda = (self.lambda + DUAL_STEP_SIZE * constraint_violation).max(0.0);
         // MLP weight update is a stub here — in production, the autograd tape
         // from grim-autograd computes ∂L/∂θ and updates theta_w1/theta_w2.
         // The structure (dual ascent + Gumbel-Softmax + STE) is the same as

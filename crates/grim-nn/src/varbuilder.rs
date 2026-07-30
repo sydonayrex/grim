@@ -18,7 +18,7 @@ use grim_backend_cpu::cpu_tensor;
 use grim_quant::{
     dequant_fp4, dequant_fp4_block16, dequant_fp8, dequant_fp8_block16, dequant_iq2s,
     dequant_iq2xs, dequant_iq2xxs, dequant_iq3s, dequant_iq3xxs, dequant_iq4nl, dequant_iq4xs,
-    dequant_nf4, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80,
+    dequant_nf4, dequant_q2k, dequant_q3k, dequant_q4k, dequant_q5k, dequant_q6k, dequant_q80,
 };
 
 #[cfg(feature = "cuda-mem")]
@@ -27,6 +27,8 @@ use grim_backend_cuda::CudaDevice;
 use grim_backend_metal::MetalDevice;
 #[cfg(feature = "rocm-mem")]
 use grim_backend_rocm::{RocmDevice, RocmStorage};
+#[cfg(feature = "vulkan-mem")]
+use grim_backend_vulkan::VulkanDevice;
 
 /// A handle that walks a `TensorProvider` by hierarchical prefix. Models
 /// call `ws.pp("model").pp("layers").pp("0").get(...)` to materialize
@@ -275,6 +277,38 @@ fn materialize_metal(
     )))
 }
 
+#[cfg(feature = "vulkan-mem")]
+fn materialize_vulkan(
+    f32s: Vec<f32>,
+    shape: Shape,
+    _dtype: DType,
+    provenance: QuantProvenance,
+    device: &Device,
+) -> Result<Tensor> {
+    let dev = VulkanDevice::new();
+    let storage = BackendDevice::from_cpu(&dev, &f32s, &shape, DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        shape,
+        DType::F32,
+        provenance,
+        device.clone(),
+    ))
+}
+
+#[cfg(not(feature = "vulkan-mem"))]
+fn materialize_vulkan(
+    _f32s: Vec<f32>,
+    _shape: Shape,
+    _dtype: DType,
+    _provenance: QuantProvenance,
+    _device: &Device,
+) -> Result<Tensor> {
+    Err(Error::Unimplemented(
+        "Vulkan materialization: enable 'vulkan-mem' feature on grim-nn".into(),
+    ))
+}
+
 fn materialize(
     raw: RawTensor,
     shape: Shape,
@@ -347,12 +381,7 @@ fn materialize(
         }
         Device::Cuda(ordinal) => materialize_cuda(f32s, shape, dtype, provenance, device, *ordinal),
         Device::Rocm(ordinal) => materialize_rocm(f32s, shape, dtype, provenance, device, *ordinal),
-        Device::Vulkan => {
-            _ = f32s;
-            Err(Error::Unimplemented(
-                "Vulkan materialization not yet wired up".into(),
-            ))
-        }
+        Device::Vulkan => materialize_vulkan(f32s, shape, dtype, provenance, device),
         Device::Metal(ordinal) => {
             materialize_metal(f32s, shape, dtype, provenance, device, *ordinal)
         }
@@ -380,12 +409,8 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             ))),
         },
         Storage::KQuant(scheme) => match scheme {
-            KQuantScheme::Q2K => Err(Error::Unimplemented(
-                "Native dequantization for Q2_K not yet implemented".into(),
-            )),
-            KQuantScheme::Q3K => Err(Error::Unimplemented(
-                "Native dequantization for Q3_K not yet implemented".into(),
-            )),
+            KQuantScheme::Q2K => dequant_q2k(&raw.bytes, n),
+            KQuantScheme::Q3K => dequant_q3k(&raw.bytes, n),
             KQuantScheme::Q4K => dequant_q4k(&raw.bytes, n),
             KQuantScheme::Q5K => dequant_q5k(&raw.bytes, n),
             KQuantScheme::Q6K => dequant_q6k(&raw.bytes, n),

@@ -288,11 +288,20 @@ async fn cancel_signals_worker_and_status_transitions_to_cancelled() {
     // H1: cancelling a running worker must (a) stop the worker's loop, and
     // (b) leave the terminal status as `Cancelled` — never resurrected to
     // `Completed` by the still-running worker's natural-completion path.
+    let dataset_file = "/tmp/cancel-test.jsonl";
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(dataset_file).expect("create test dataset");
+        for i in 0..150 {
+            writeln!(f, "{{\"text\": \"sample prompt and output text number {}\"}}", i).unwrap();
+        }
+    }
+
     let reg = Arc::new(JobRegistry::new());
     let id = reg
         .create(TrainingJob {
             model_path: "/tmp/cancel-test.gguf".into(),
-            dataset_path: "/tmp/cancel-test.jsonl".into(),
+            dataset_path: dataset_file.into(),
             training_mode: grim_garage::jobs::TrainingMode::Lora,
             lora_rank: 8,
             learning_rate: 2e-5,
