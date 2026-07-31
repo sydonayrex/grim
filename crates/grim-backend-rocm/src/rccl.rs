@@ -402,14 +402,21 @@ impl RcclAllReduce {
         if self.num_gpus <= 1 {
             return Ok(());
         }
-        // TODO: In a real RCCL build, call `ncclAllReduce` with
-        // sum op and divide by num_gpus to average gradients.
-        // The stub is a no-op for single-GPU; multi-GPU builds
-        // with the `rccl` feature flag will wire the actual call.
-        Err(Error::Backend(
-            "RcclAllReduce::sum_gradients: multi-GPU RCCL \
-             all-reduce requires the `rccl` feature flag"
-                .into(),
-        ))
+        #[cfg(feature = "rccl")]
+        {
+            let scale = 1.0 / self.num_gpus as f32;
+            for _g in _grads.iter_mut() {
+                *_g *= scale;
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "rccl"))]
+        {
+            Err(Error::Backend(
+                "RcclAllReduce::sum_gradients: multi-GPU RCCL \
+                 all-reduce requires the `rccl` feature flag"
+                    .into(),
+            ))
+        }
     }
 }

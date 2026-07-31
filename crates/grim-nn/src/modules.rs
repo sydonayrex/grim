@@ -90,7 +90,37 @@ impl ColumnParallelLinear {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        self.inner.forward(x)
+        let out = self.inner.forward(x)?;
+        if self.tp_config.world_size > 1 {
+            let dims = out.shape().dims();
+            let last_dim = *dims.last().unwrap_or(&1);
+            let shard_size = last_dim / self.tp_config.world_size;
+            let start = self.tp_config.rank * shard_size;
+            let end = (start + shard_size).min(last_dim);
+            
+            let data = out.to_vec_f32()?;
+            let outer = data.len() / last_dim;
+            let mut sharded = Vec::with_capacity(outer * (end - start));
+            for row in 0..outer {
+                sharded.extend_from_slice(&data[row * last_dim + start .. row * last_dim + end]);
+            }
+            let mut new_dims = dims.to_vec();
+            if let Some(l) = new_dims.last_mut() {
+                *l = end - start;
+            }
+            let out_shape = Shape::new(new_dims);
+            let dev = pick_device_for_tensor(&out);
+            let storage = dev.from_cpu(&sharded, &out_shape, DType::F32)?;
+            Ok(Tensor::new(
+                Arc::from(storage),
+                out_shape,
+                out.dtype(),
+                out.provenance().clone(),
+                out.device().clone(),
+            ))
+        } else {
+            Ok(out)
+        }
     }
 }
 
@@ -108,7 +138,38 @@ impl RowParallelLinear {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let out = self.inner.forward(x)?;
+        let x_in = if self.tp_config.world_size > 1 {
+            let dims = x.shape().dims();
+            let last_dim = *dims.last().unwrap_or(&1);
+            let shard_size = last_dim / self.tp_config.world_size;
+            let start = self.tp_config.rank * shard_size;
+            let end = (start + shard_size).min(last_dim);
+            
+            let data = x.to_vec_f32()?;
+            let outer = data.len() / last_dim;
+            let mut sharded = Vec::with_capacity(outer * (end - start));
+            for row in 0..outer {
+                sharded.extend_from_slice(&data[row * last_dim + start .. row * last_dim + end]);
+            }
+            let mut new_dims = dims.to_vec();
+            if let Some(l) = new_dims.last_mut() {
+                *l = end - start;
+            }
+            let out_shape = Shape::new(new_dims);
+            let dev = pick_device_for_tensor(x);
+            let storage = dev.from_cpu(&sharded, &out_shape, DType::F32)?;
+            Tensor::new(
+                Arc::from(storage),
+                out_shape,
+                x.dtype(),
+                x.provenance().clone(),
+                x.device().clone(),
+            )
+        } else {
+            x.clone()
+        };
+
+        let out = self.inner.forward(&x_in)?;
         if self.tp_config.world_size > 1 {
             let dev = pick_device_for_tensor(&out);
             let s: &dyn grim_tensor::BackendStorage = out.storage().as_ref();

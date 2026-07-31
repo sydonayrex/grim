@@ -101,10 +101,14 @@ impl UpBlock {
     }
 
     fn forward(&self, x_data: &mut [f32], skip: &[f32]) -> Result<()> {
-        let _ = (&self.conv_w, &self.conv_b, self.hidden);
-        for (v, s) in x_data.iter_mut().zip(skip.iter().cycle()) {
-            *v += *s;
+        let hidden = self.hidden;
+        for i in 0..x_data.len() {
+            let s = skip.get(i % skip.len()).copied().unwrap_or(0.0);
+            let w = self.conv_w.get(i % self.conv_w.len()).copied().unwrap_or(1.0);
+            let b = self.conv_b.get(i % self.conv_b.len()).copied().unwrap_or(0.0);
+            x_data[i] = (x_data[i] + s) * w + b;
         }
+        let _ = hidden;
         Ok(())
     }
 }

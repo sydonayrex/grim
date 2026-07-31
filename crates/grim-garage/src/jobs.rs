@@ -858,29 +858,33 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     None
                 };
 
-                let logits_base = backend
-                    .make_tensor(vec![0.0f32; vocab_size], Shape::new(vec![1, vocab_size]))
-                    .unwrap();
-                let logits_base_id = tape.register(logits_base.clone());
+                let mut curr_x = x_tensor.clone();
+                let mut curr_x_id = x_id;
 
-                let (logits_id, logits_out) = match grim_autograd::apply_and_record_lora(
-                    &autograd_reg,
-                    &mut tape,
-                    0,
-                    LoRAInjectionPoint::QProj,
-                    logits_base,
-                    logits_base_id,
-                    x_tensor,
-                    x_id,
-                ) {
-                    Ok(res) => res,
-                    Err(_) => (
-                        logits_base_id,
-                        backend
-                            .make_tensor(vec![0.0f32; vocab_size], Shape::new(vec![1, vocab_size]))
-                            .unwrap(),
-                    ),
-                };
+                for layer_idx in 0..num_layers {
+                    for &point in LoRAInjectionPoint::all_standard_qlora() {
+                        if autograd_reg.injection_registry.get(layer_idx, point).is_some() {
+                            let base_tensor = backend
+                                .make_tensor(vec![0.0f32; vocab_size], Shape::new(vec![1, vocab_size]))
+                                .unwrap();
+                            let base_id = tape.register(base_tensor.clone());
+                            if let Ok((out_id, out_t)) = grim_autograd::apply_and_record_lora(
+                                &autograd_reg,
+                                &mut tape,
+                                layer_idx,
+                                point,
+                                base_tensor,
+                                base_id,
+                                curr_x.clone(),
+                                curr_x_id,
+                            ) {
+                                curr_x = out_t;
+                                curr_x_id = out_id;
+                            }
+                        }
+                    }
+                }
+                let (logits_id, logits_out) = (curr_x_id, curr_x);
 
                 match cross_entropy_loss(&logits_out, &targets) {
                     Ok((loss_val, loss_grad)) => {

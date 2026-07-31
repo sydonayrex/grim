@@ -83,6 +83,9 @@ fn now_millis() -> u64 {
 /// contract the server already relies on, plus the formerly-inline argmax
 /// extraction. Both the streaming and non-streaming paths call this so token
 /// selection (and its sampling policy) lives in exactly one place.
+static REQUEST_HISTORIES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, Vec<u32>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 fn sample_next_token(
     engine: &mut grim_engine::Engine,
     request_id: u64,
@@ -92,6 +95,9 @@ fn sample_next_token(
 ) -> u32 {
     if step == 0 {
         let prompt_tokens = prompt_tokens.expect("prompt_tokens must be provided on step 0");
+        if let Ok(mut hist) = REQUEST_HISTORIES.lock() {
+            hist.insert(request_id, prompt_tokens.to_vec());
+        }
         let req = grim_scheduler::Request {
             id: request_id,
             prompt_tokens: prompt_tokens.len(),
@@ -108,13 +114,21 @@ fn sample_next_token(
         eprintln!("[sample_next_token] engine tick failed: {e}");
     }
 
+    let history = REQUEST_HISTORIES
+        .lock()
+        .ok()
+        .and_then(|h| h.get(&request_id).cloned())
+        .unwrap_or_default();
     let logits = engine
         .last_outcome(request_id)
         .and_then(|o| o.logits.as_ref().cloned());
     let token = match logits {
-        Some(t) => sampler.sample(&t, &[]).unwrap_or(step as u32),
+        Some(t) => sampler.sample(&t, &history).unwrap_or(step as u32),
         None => step as u32,
     };
+    if let Ok(mut hist) = REQUEST_HISTORIES.lock() {
+        hist.entry(request_id).or_default().push(token);
+    }
 
     // Record the generated token so the next decode step uses the real token
     // instead of a position index.
@@ -938,6 +952,12 @@ fn translate_options(req: &serde_json::Value, payload: &mut serde_json::Value) {
         }
         if let Some(stop) = options.get("stop") {
             payload["stop"] = stop.clone();
+        }
+        if let Some(top_k) = options.get("top_k") {
+            payload["top_k"] = top_k.clone();
+        }
+        if let Some(rp) = options.get("repeat_penalty") {
+            payload["repeat_penalty"] = rp.clone();
         }
     }
 }

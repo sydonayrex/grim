@@ -6,6 +6,7 @@ use grim_core::error::{Error, Result};
 use grim_core::model::{SsmState, StatefulSequence, Model, ModelConfig, ModalityHint, CausalLm, AdapterHandle};
 use grim_nn::{Linear, RmsNorm};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
+use crate::cpu_tensor;
 
 #[derive(Debug, Clone)]
 pub struct RwkvConfig {
@@ -165,18 +166,35 @@ impl RwkvBlock {
         let k = self.time_mix_key.forward(&norm_x)?;
         let v = self.time_mix_value.forward(&norm_x)?;
         let r = self.time_mix_receptance.forward(&norm_x)?;
-        let _ = (k, v, r);
 
-        // Simulated time-mix output
-        let att_out = self.time_mix_output.forward(&norm_x)?;
+        let k_vec = k.to_vec_f32()?;
+        let v_vec = v.to_vec_f32()?;
+        let r_vec = r.to_vec_f32()?;
+        let dim = k_vec.len();
+
+        let mut time_mix_in = vec![0.0f32; dim];
+        for i in 0..dim {
+            let sig_r = 1.0 / (1.0 + (-r_vec[i]).exp());
+            time_mix_in[i] = sig_r * (k_vec[i] * v_vec[i]);
+        }
+
+        let att_out = self.time_mix_output.forward(&cpu_tensor(time_mix_in, Shape::new(vec![1, dim])))?;
         let x_res1 = add_tensors(x, &att_out).map_err(grim_core::Error::Tensor)?;
 
         let ffn_k = self.channel_mix_key.forward(&x_res1)?;
         let ffn_r = self.channel_mix_receptance.forward(&x_res1)?;
         let ffn_v = self.channel_mix_value.forward(&ffn_k)?;
-        let _ = ffn_r;
+        
+        let ffn_r_vec = ffn_r.to_vec_f32()?;
+        let ffn_v_vec = ffn_v.to_vec_f32()?;
+        let mut ffn_out = vec![0.0f32; ffn_v_vec.len()];
+        for i in 0..ffn_v_vec.len() {
+            let sig_r = 1.0 / (1.0 + (-ffn_r_vec[i]).exp());
+            ffn_out[i] = sig_r * ffn_v_vec[i];
+        }
 
-        add_tensors(&x_res1, &ffn_v).map_err(grim_core::Error::Tensor)
+        let ffn_t = cpu_tensor(ffn_out, Shape::new(vec![1, dim]));
+        add_tensors(&x_res1, &ffn_t).map_err(grim_core::Error::Tensor)
     }
 }
 

@@ -228,6 +228,71 @@ pub const GRIM_QUANT_VERSION: u32 = 1;
 /// this function performs format-correct repacking. When calibration is
 /// available it will slot in between the read and write phases without
 /// changing this function's signature.
+fn dequant_group_int_bytes(bytes: &[u8], shape: &[usize], bits: u32, group_size: usize) -> Result<Vec<f32>> {
+    let mut cursor = 0;
+    let read_segment = |bytes: &[u8], cursor: &mut usize| -> Result<Vec<u8>> {
+        if *cursor + 8 > bytes.len() {
+            return Err(Error::Backend("Truncated GPTQ packed header".into()));
+        }
+        let len = u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap()) as usize;
+        *cursor += 8;
+        if *cursor + len > bytes.len() {
+            return Err(Error::Backend(format!("Truncated GPTQ packed segment (expected {len} bytes)")));
+        }
+        let segment = bytes[*cursor..*cursor + len].to_vec();
+        *cursor += len;
+        Ok(segment)
+    };
+
+    let qweight = read_segment(bytes, &mut cursor)?;
+    let qzeros = read_segment(bytes, &mut cursor)?;
+    let scales = read_segment(bytes, &mut cursor)?;
+    let g_idx = read_segment(bytes, &mut cursor)?;
+
+    let g_idx_opt = if g_idx.is_empty() { None } else { Some(&g_idx[..]) };
+    grim_quant::dequant_gptq_group_int(&qweight, &qzeros, &scales, g_idx_opt, shape, bits, group_size)
+}
+
+fn dequant_tensor_data(raw: &grim_tensor::RawTensor, elem_count: usize) -> Result<Vec<f32>> {
+    match &raw.dtype.storage {
+        grim_tensor::dtype::Storage::Native => {
+            Ok(raw.bytes.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        }
+        grim_tensor::dtype::Storage::KQuant(scheme) => match scheme {
+            grim_tensor::dtype::KQuantScheme::Q80 => grim_quant::dequant_q80(&raw.bytes, elem_count),
+            grim_tensor::dtype::KQuantScheme::Q4K => grim_quant::dequant_q4k(&raw.bytes, elem_count),
+            grim_tensor::dtype::KQuantScheme::Q5K => grim_quant::dequant_q5k(&raw.bytes, elem_count),
+            grim_tensor::dtype::KQuantScheme::Q6K => grim_quant::dequant_q6k(&raw.bytes, elem_count),
+            grim_tensor::dtype::KQuantScheme::Q2K => grim_quant::dequant_q2k(&raw.bytes, elem_count),
+            grim_tensor::dtype::KQuantScheme::Q3K => grim_quant::dequant_q3k(&raw.bytes, elem_count),
+            grim_tensor::dtype::KQuantScheme::IQ4NL => grim_quant::dequant_iq4nl(&raw.bytes, elem_count),
+            grim_tensor::dtype::KQuantScheme::IQ4XS => grim_quant::dequant_iq4xs(&raw.bytes, elem_count),
+            grim_tensor::dtype::KQuantScheme::IQ3XXS => grim_quant::dequant_iq3xxs(&raw.bytes, elem_count),
+            grim_tensor::dtype::KQuantScheme::IQ3S => grim_quant::dequant_iq3s(&raw.bytes, elem_count),
+            grim_tensor::dtype::KQuantScheme::IQ2XXS => grim_quant::dequant_iq2xxs(&raw.bytes, elem_count),
+            grim_tensor::dtype::KQuantScheme::IQ2XS => grim_quant::dequant_iq2xs(&raw.bytes, elem_count),
+            grim_tensor::dtype::KQuantScheme::IQ2S => grim_quant::dequant_iq2s(&raw.bytes, elem_count),
+            _ => Ok(raw.bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
+        },
+        grim_tensor::dtype::Storage::Block(bd) => match bd {
+            grim_tensor::dtype::BlockDtype::Fp4 | grim_tensor::dtype::BlockDtype::Fp4Block16 => grim_quant::dequant_fp4_block16(&raw.bytes, elem_count),
+            grim_tensor::dtype::BlockDtype::Nf4 => grim_quant::dequant_nf4(&raw.bytes, elem_count),
+            grim_tensor::dtype::BlockDtype::Fp8 | grim_tensor::dtype::BlockDtype::Fp8Block16 => grim_quant::dequant_fp8_block16(&raw.bytes, elem_count),
+        },
+        grim_tensor::dtype::Storage::FloatPack(scheme) => match scheme {
+            grim_tensor::dtype::FloatPackScheme::Fp4 => grim_quant::dequant_fp4(&raw.bytes, elem_count),
+            grim_tensor::dtype::FloatPackScheme::Nf4 => grim_quant::dequant_nf4(&raw.bytes, elem_count),
+            grim_tensor::dtype::FloatPackScheme::Fp8 => grim_quant::dequant_fp8(&raw.bytes, elem_count),
+            _ => Ok(raw.bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
+        },
+        grim_tensor::dtype::Storage::GroupInt(cfg) => {
+            dequant_group_int_bytes(&raw.bytes, &raw.shape, cfg.bits as u32, cfg.group_size)
+        }
+    }
+}
+
 pub fn convert_to_grim(
     input_path: &str,
     output_path: &str,
@@ -281,10 +346,7 @@ pub fn convert_to_grim(
             let cols = meta.shape.get(1).copied().unwrap_or(1);
             // Use the raw f32 values if available, otherwise dequantize
             let data: Vec<f32> = match &raw.dtype.storage {
-                grim_tensor::dtype::Storage::Native => raw.bytes.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect(),
-                _ => grim_quant::dequant_q80(&raw.bytes, rows * cols).unwrap_or_default(),
+                _ => dequant_tensor_data(&raw, rows * cols).unwrap_or_default(),
             };
             tensor_data.push((name.clone(), data, rows, cols));
         }
@@ -550,11 +612,12 @@ fn pack_tensors(
                     }
                 }
             }
-            grim_tensor::dtype::Storage::GroupInt(_) => {
-                // GroupInt not implemented - fallback
-                raw.bytes.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect::<Vec<f32>>()
+            grim_tensor::dtype::Storage::GroupInt(cfg) => {
+                dequant_group_int_bytes(&raw.bytes, &meta.shape, cfg.bits as u32, cfg.group_size).unwrap_or_else(|_| {
+                    raw.bytes.chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect::<Vec<f32>>()
+                })
             }
         };
         

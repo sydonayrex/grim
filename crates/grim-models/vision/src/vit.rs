@@ -112,12 +112,46 @@ impl VitBlock {
 
     fn forward(&self, x: &[f32], seq: usize) -> Result<Vec<f32>> {
         let h = self.hidden;
-        let _ = (h, seq, self.num_heads, self.head_dim);
-        let _ = (&self.wq, &self.wk, &self.wv, &self.wo);
         let x_normed = rmsnorm_inplace(x, &self.norm1.weight.to_vec_f32()?, self.norm1.eps);
-        let block_in = cpu_tensor(x_normed.clone(), Shape::new(vec![seq, h]));
-        let _ = block_in;
-        let fc1_out = self.w_fc1.forward(&cpu_tensor(x_normed.clone(), Shape::new(vec![seq, h])))?;
+
+        let mut q = vec![0.0f32; seq * h];
+        let mut k = vec![0.0f32; seq * h];
+        let mut v = vec![0.0f32; seq * h];
+        for s in 0..seq {
+            for col in 0..h {
+                let mut sum_q = 0.0f32;
+                let mut sum_k = 0.0f32;
+                let mut sum_v = 0.0f32;
+                for k_idx in 0..h {
+                    let val = x_normed[s * h + k_idx];
+                    sum_q += val * self.wq[col * h + k_idx];
+                    sum_k += val * self.wk[col * h + k_idx];
+                    sum_v += val * self.wv[col * h + k_idx];
+                }
+                q[s * h + col] = sum_q;
+                k[s * h + col] = sum_k;
+                v[s * h + col] = sum_v;
+            }
+        }
+
+        let mut attn_out = vec![0.0f32; seq * h];
+        let scale = 1.0 / (self.head_dim as f32).max(1.0).sqrt();
+        for s in 0..seq {
+            for col in 0..h {
+                let mut sum_o = 0.0f32;
+                for k_idx in 0..h {
+                    sum_o += scale * q[s * h + k_idx] * self.wo[col * h + k_idx];
+                }
+                attn_out[s * h + col] = sum_o;
+            }
+        }
+
+        let mut attn_res = x_normed.clone();
+        for i in 0..attn_res.len() {
+            attn_res[i] += attn_out[i];
+        }
+
+        let fc1_out = self.w_fc1.forward(&cpu_tensor(attn_res.clone(), Shape::new(vec![seq, h])))?;
         let gate = fc1_out.to_vec_f32()?;
         let mut gelu = vec![0.0f32; gate.len()];
         for (i, g) in gate.iter().enumerate() {
