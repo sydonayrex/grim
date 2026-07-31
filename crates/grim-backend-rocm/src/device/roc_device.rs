@@ -323,6 +323,7 @@ impl RocmDevice {
             })
             .clamp(128 * 1024 * 1024, 512 * 1024 * 1024);
 
+        let gpu_target = detect_gpu_arch(ordinal as i32);
         Self {
             ordinal,
             props: RocmDeviceProps { wavefront_size, xnack_enabled },
@@ -333,7 +334,7 @@ impl RocmDevice {
             scratch_pool: crate::memory::pool::DeviceScratchPool::new(),
             module_cache: Mutex::new(HashMap::new()),
             module_load_count: AtomicUsize::new(0),
-            gpu_target: detect_gpu_arch(ordinal as i32),
+            gpu_target: gpu_target.clone(),
             capture_enabled: std::env::var("GRIM_CAPTURE_GRAPH").is_ok(),
             capture_stream: RwLock::new(None),
             capture_active: AtomicBool::new(false),
@@ -342,7 +343,10 @@ impl RocmDevice {
             decode_gemm_config: Mutex::new(DecodeGemmConfig { enabled: true, wavefront_size: warp_size as u32 }),
             fused_dequant_gemm_config: Mutex::new(FusedDequantGemmConfig { enabled: true, wavefront_size: warp_size as u32 }),
             split_k_config: Mutex::new(SplitKGemmConfig { enabled: true }),
-            wmma_gemm_config: Mutex::new(WmmaGemmConfig { enabled: true, wavefront_size: warp_size as u32 }),
+            wmma_gemm_config: Mutex::new(WmmaGemmConfig {
+                enabled: matches!(crate::quantization::gcn_arch(&gpu_target), crate::quantization::GcnArch::RDNA3 | crate::quantization::GcnArch::RDNA4),
+                wavefront_size: warp_size as u32,
+            }),
         }
     }
 

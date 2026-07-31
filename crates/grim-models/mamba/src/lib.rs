@@ -232,7 +232,7 @@ impl MambaBlock {
     fn step_block_cpu(&self, x: &Tensor, state: &mut MambaState) -> Result<Tensor> {
         let dev = CpuDevice::new();
         let h_in = x.shape().dims().last().copied().unwrap_or(0);
-        let _ = (dev, h_in);
+        let _ = dev;
         // Step-wise selective SSM scan.
         // In v1, take the next row of `x` (one token) and update state.
         let xd = x.to_vec_f32()?;

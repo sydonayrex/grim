@@ -308,7 +308,6 @@ where
         // The pickup closure is reserved for the GPU kernel pickup
         // step; in the CPU-only primitive it isn't consumed but is
         // asserted to be non-trivial so the wiring is real.
-        let _ = (self.pickup)("dummy");
 
         // 3. Accept / reject.
         let decision = self.acceptor.decide(&probs, n);
