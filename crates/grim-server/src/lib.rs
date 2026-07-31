@@ -1594,6 +1594,25 @@ fn load_model_for_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn test_probe_sys_ram_returns_tuple() {
+        let (used, total) = probe_sys_ram();
+        #[cfg(target_os = "linux")]
+        {
+            assert!(total > 0, "System RAM total should be > 0 on Linux");
+            assert!(used <= total);
+        }
+        let _ = (used, total);
+    }
+
+    #[test]
+    fn test_probe_vram_and_gpus_returns_valid_structure() {
+        let (used, total, gpus) = probe_vram_and_gpus(0);
+        assert!(!gpus.is_empty());
+        assert!(gpus[0].get("name").is_some());
+        let _ = (used, total);
+    }
+
     use grim_tensor::Device;
     use axum::{
         body::Body,
@@ -2097,6 +2116,111 @@ mod tests {
 // ============================================================================
 
 /// `GET /api/stats` — JSON stats snapshot polled by the dashboard at `/`.
+fn probe_sys_ram() -> (u64, u64) {
+    if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
+        let mut total_kb: u64 = 0;
+        let mut avail_kb: u64 = 0;
+        for line in content.lines() {
+            if line.starts_with("MemTotal:") {
+                if let Some(val) = line.split_whitespace().nth(1) {
+                    total_kb = val.parse().unwrap_or(0);
+                }
+            } else if line.starts_with("MemAvailable:") {
+                if let Some(val) = line.split_whitespace().nth(1) {
+                    avail_kb = val.parse().unwrap_or(0);
+                }
+            }
+        }
+        if total_kb > 0 {
+            let total_bytes = total_kb * 1024;
+            let used_bytes = (total_kb.saturating_sub(avail_kb)) * 1024;
+            return (used_bytes, total_bytes);
+        }
+    }
+    (0, 0)
+}
+
+fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::Value>) {
+    let mut total_vram_used: u64 = 0;
+    let mut total_vram_max: u64 = 0;
+    let mut gpus_json = Vec::new();
+
+    if rocm_gpu_count > 0 {
+        for ord in 0..rocm_gpu_count {
+            let (free, total) = grim_backend_rocm::vram_info(ord);
+            let used = total.saturating_sub(free);
+            total_vram_used += used;
+            total_vram_max += total;
+            let memory_pct = if total > 0 { ((used as f64 / total as f64) * 100.0) as u32 } else { 0 };
+            gpus_json.push(serde_json::json!({
+                "index": ord as u32,
+                "compute": 0u32,
+                "memory": memory_pct,
+                "name": format!("ROCm GPU {ord}"),
+            }));
+        }
+        return (total_vram_used, total_vram_max, gpus_json);
+    }
+
+    if let Ok(cuda_devs) = grim_backend_cuda::CudaDevice::probe() {
+        if !cuda_devs.is_empty() {
+            for ord in 0..cuda_devs.len() {
+                let (free, total) = grim_backend_cuda::vram_info(ord);
+                let used = total.saturating_sub(free);
+                total_vram_used += used;
+                total_vram_max += total;
+                let memory_pct = if total > 0 { ((used as f64 / total as f64) * 100.0) as u32 } else { 0 };
+                gpus_json.push(serde_json::json!({
+                    "index": ord as u32,
+                    "compute": 0u32,
+                    "memory": memory_pct,
+                    "name": format!("CUDA GPU {ord}"),
+                }));
+            }
+            return (total_vram_used, total_vram_max, gpus_json);
+        }
+    }
+
+    {
+        let (free, total) = grim_backend_metal::vram_info(0);
+        if total > 0 {
+            let used = total.saturating_sub(free);
+            let memory_pct = ((used as f64 / total as f64) * 100.0) as u32;
+            gpus_json.push(serde_json::json!({
+                "index": 0u32,
+                "compute": 0u32,
+                "memory": memory_pct,
+                "name": "Metal GPU",
+            }));
+            return (used, total, gpus_json);
+        }
+    }
+
+    {
+        let (free, total) = grim_backend_vulkan::vram_info(0);
+        if total > 0 {
+            let used = total.saturating_sub(free);
+            let memory_pct = ((used as f64 / total as f64) * 100.0) as u32;
+            gpus_json.push(serde_json::json!({
+                "index": 0u32,
+                "compute": 0u32,
+                "memory": memory_pct,
+                "name": "Vulkan GPU",
+            }));
+            return (used, total, gpus_json);
+        }
+    }
+
+    gpus_json.push(serde_json::json!({
+        "index": 0u32,
+        "compute": 0u32,
+        "memory": 0u32,
+        "name": "CPU",
+    }));
+
+    (0, 0, gpus_json)
+}
+
 async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let engine = state.engine.lock().unwrap();
     let models = engine.loaded_models();
@@ -2134,30 +2258,32 @@ async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::
     // Once we wire real telemetry counters into the engine (tokens generated,
     // wall-clock time per batch, KV block occupancy), this becomes live data.
     // For now the fields are present and typed so the frontend contract is fixed.
-    let is_loaded = model_name != "none";
+    let (kv_used, kv_total, kv_blocks_used, kv_blocks_total) = engine.kv_cache_telemetry();
+    let (vram_used, vram_total, gpus_json) = probe_vram_and_gpus(rocm_gpu_count);
+    let (sys_ram_used, sys_ram_total) = probe_sys_ram();
+    let tps_json = match engine.tokens_per_sec() {
+        Some(tps) => serde_json::json!(tps),
+        None => serde_json::Value::Null,
+    };
+
     serde_json::json!({
         "model_name": model_name,
-        "tokens_per_sec": if is_loaded { serde_json::json!(0.0f32) } else { serde_json::Value::Null },
+        "tokens_per_sec": tps_json,
         "kv_cache": {
-            "used": 0u64,
-            "total": 0u64,
-            "blocks_used": 0u64,
-            "blocks_total": 0u64,
+            "used": kv_used,
+            "total": kv_total,
+            "blocks_used": kv_blocks_used,
+            "blocks_total": kv_blocks_total,
         },
         "vram": {
-            "used": 0u64,
-            "total": 0u64,
+            "used": vram_used,
+            "total": vram_total,
         },
         "sys_ram": {
-            "used": 0u64,
-            "total": 0u64,
+            "used": sys_ram_used,
+            "total": sys_ram_total,
         },
-        "gpus": [{
-            "index": 0u32,
-            "compute": 0u32,
-            "memory": 0u32,
-            "name": if rocm_gpu_count > 0 { "ROCm GPU" } else { "CPU" },
-        }],
+        "gpus": gpus_json,
         "hardware": {
             "rocm_gpu_count": rocm_gpu_count,
             "xnack_enabled": xnack_enabled,
@@ -2311,3 +2437,4 @@ setInterval(poll,2000);
 </script>
 </body>
 </html>"#;
+

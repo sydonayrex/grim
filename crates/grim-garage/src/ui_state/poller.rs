@@ -205,9 +205,15 @@ fn job_summary_to_ui_job(s: JobSummaryDto) -> UiJob {
             crate::jobs::TrainingMode::Lora => "LoRA".into(),
             crate::jobs::TrainingMode::QLoRA => "QLoRA".into(),
             crate::jobs::TrainingMode::Bf16Full => "Bf16-Full".into(),
+            crate::jobs::TrainingMode::RsLora => "RoSLoRA".into(),
+            crate::jobs::TrainingMode::Dora => "DoRA".into(),
+            crate::jobs::TrainingMode::LoftQ => "LoftQ".into(),
             crate::jobs::TrainingMode::Orpo => "ORPO".into(),
             crate::jobs::TrainingMode::Dpo => "DPO".into(),
+            crate::jobs::TrainingMode::Kto => "KTO".into(),
+            crate::jobs::TrainingMode::SimPo => "SimPO".into(),
             crate::jobs::TrainingMode::Grpo => "GRPO".into(),
+            crate::jobs::TrainingMode::SoulEater => "SOUL EATER".into(),
         },
     }
 }

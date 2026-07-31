@@ -135,6 +135,8 @@ impl KvBlockPool {
         self.compressor.is_some()
     }
 
+
+
     pub fn alloc(&mut self) -> Result<BlockId> {
         let id = self.free_list.pop_front()
             .ok_or_else(|| Error::KvCache("block pool exhausted".into()))?;
@@ -251,6 +253,17 @@ impl KvBlockPool {
     }
 
     /// Block size in bytes (used for telemetry on demotions).
+    /// Total capacity of the KV block pool in blocks.
+    pub fn capacity(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Number of blocks currently allocated and in use.
+    pub fn used_count(&self) -> usize {
+        self.blocks.len().saturating_sub(self.free_list.len())
+    }
+
+    /// Size of a single block in bytes.
     pub fn block_bytes(&self) -> usize {
         self.block_bytes
     }
@@ -508,6 +521,20 @@ pub type KvTransportId = TransportBlockId;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_kv_block_pool_telemetry_accessors() {
+        let mut pool = KvBlockPool::new(10, 8, 128);
+        assert_eq!(pool.capacity(), 10);
+        assert_eq!(pool.used_count(), 0);
+        assert!(pool.block_bytes() > 0);
+
+        let id1 = pool.alloc().unwrap();
+        assert_eq!(pool.used_count(), 1);
+
+        pool.free(id1);
+        assert_eq!(pool.used_count(), 0);
+    }
     use grim_kvquant::{KvQuantConfig, LloydMaxCompressor};
     use std::sync::Arc;
     use tempfile::tempdir;

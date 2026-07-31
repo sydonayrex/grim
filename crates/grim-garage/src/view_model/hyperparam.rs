@@ -131,6 +131,13 @@ pub struct HyperparamFormV1 {
     pub rocm_fusion_qkv_attention: bool,
     pub auto_wavefront: bool,
     pub xnack_enabled: bool,
+
+    /// PiSSA: initialize adapter A/B via truncated SVD of the base weight.
+    pub use_pissa: bool,
+    /// OLoRA: add `olora_lambda * olora_orthogonality_penalty(A, B)` to the loss.
+    pub use_olora: bool,
+    /// Weight of the OLoRA orthogonality penalty term.
+    pub olora_lambda: f32,
 }
 
 impl Default for HyperparamFormV1 {
@@ -146,6 +153,9 @@ impl Default for HyperparamFormV1 {
             rocm_fusion_qkv_attention: false,
             auto_wavefront: true,
             xnack_enabled: false,
+            use_pissa: false,
+            use_olora: false,
+            olora_lambda: 0.0,
         }
     }
 }
@@ -164,6 +174,9 @@ impl HyperparamFormV1 {
             rocm_fusion_qkv_attention: c.rocm_fusion_qkv_attention,
             auto_wavefront: c.auto_wavefront,
             xnack_enabled: c.xnack_enabled,
+            use_pissa: c.use_pissa,
+            use_olora: c.use_olora,
+            olora_lambda: c.olora_lambda,
         }
     }
 

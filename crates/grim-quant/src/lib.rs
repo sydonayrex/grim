@@ -13,6 +13,7 @@
 use grim_tensor::error::{Error, Result};
 
 pub mod spqr;
+pub mod soul_eater;
 
 pub use spqr::{spqr_identify_salient, SpqrSalientResidual};
 

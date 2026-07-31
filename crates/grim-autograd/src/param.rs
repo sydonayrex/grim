@@ -45,18 +45,33 @@ impl ParamId {
     pub fn b(layer_idx: usize, adapter_id: u32, point: LoRAInjectionPoint) -> Self {
         Self::new(layer_idx, adapter_id, point, false)
     }
+
+    /// Base weight (non-LoRA) parameter ID — adapter_id is always 0;
+    /// is_a is always true since there is no A/B distinction for base weights.
+    pub fn base(layer_idx: usize, point: LoRAInjectionPoint) -> Self {
+        Self {
+            layer_idx,
+            adapter_id: 0,
+            point,
+            is_a: true,
+        }
+    }
 }
 
 /// A trainable parameter tensor paired with its gradient accumulator.
 ///
 /// `data` is the live parameter value mutated by the optimizer (WI-T4);
 /// `grad` is the accumulated gradient written by `backward` (WI-T1) and
-/// zeroed at the start of each step.
+/// zeroed at the start of each step. When `frozen == true`, the parameter is
+/// tracked (so it stays on the tape for downstream gradients) but `accumulate_grad`
+/// is a no-op and optimizers skip it — the frozen-base QLoRA mechanism where
+/// base weights are registered in `TrainableParams` but never updated.
 #[derive(Debug, Clone)]
 pub struct TrainableParam {
     pub id: ParamId,
     pub data: Tensor,
     grad: Tensor,
+    frozen: bool,
 }
 
 impl TrainableParam {
@@ -64,11 +79,31 @@ impl TrainableParam {
     /// buffer matching the parameter's shape and device.
     pub fn new(id: ParamId, data: Tensor) -> Result<Self> {
         let grad = zeros_like(&data)?;
-        Ok(Self { id, data, grad })
+        Ok(Self {
+            id,
+            data,
+            grad,
+            frozen: false,
+        })
+    }
+
+    /// Create a new parameter and mark it frozen (base-weight tracking).
+    pub fn register_base_weight(id: ParamId, data: Tensor, frozen: bool) -> Result<Self> {
+        let grad = zeros_like(&data)?;
+        Ok(Self {
+            id,
+            data,
+            grad,
+            frozen,
+        })
     }
 
     /// Accumulate `grad` into this parameter's gradient buffer (`grad += g`).
+    /// No-op for frozen parameters.
     pub fn accumulate_grad(&mut self, grad: &Tensor) -> Result<()> {
+        if self.frozen {
+            return Ok(());
+        }
         let dev = crate::pick_device_for_tensor(&self.grad);
         let (sum_storage, handle) = BackendDevice::add(
             &*dev,
@@ -91,6 +126,16 @@ impl TrainableParam {
     pub fn zero_grad(&mut self) -> Result<()> {
         self.grad = zeros_like(&self.grad)?;
         Ok(())
+    }
+
+    /// Whether this parameter is frozen (tracked but not updated).
+    pub fn is_frozen(&self) -> bool {
+        self.frozen
+    }
+
+    /// Mark this parameter frozen/unfrozen.
+    pub fn set_frozen(&mut self, frozen: bool) {
+        self.frozen = frozen;
     }
 
     /// Read-only view of the accumulated gradient.
@@ -235,6 +280,79 @@ mod tests {
         assert_eq!(param.grad().to_vec_f32().unwrap(), vec![5.0, 6.0]);
         param.zero_grad().unwrap();
         assert!(param.grad().to_vec_f32().unwrap().iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn frozen_param_accumulate_grad_is_noop() {
+        let mut param = TrainableParam::register_base_weight(
+            ParamId::a(0, 1, LoRAInjectionPoint::QProj),
+            tensor(vec![1.0, 2.0], vec![2, 1]),
+            true,
+        )
+        .unwrap();
+        assert!(param.is_frozen());
+        param
+            .accumulate_grad(&tensor(vec![3.0, 4.0], vec![2, 1]))
+            .unwrap();
+        assert_eq!(param.grad().to_vec_f32().unwrap(), vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn non_frozen_param_defaults_trainable() {
+        let param = TrainableParam::new(
+            ParamId::a(0, 1, LoRAInjectionPoint::QProj),
+            tensor(vec![1.0, 2.0], vec![2, 1]),
+        )
+        .unwrap();
+        assert!(!param.is_frozen());
+    }
+
+    #[test]
+    fn frozen_param_is_skipped_by_optimizer() {
+        let mut params = TrainableParams::new();
+        params.insert(
+            TrainableParam::register_base_weight(
+                ParamId::a(0, 1, LoRAInjectionPoint::QProj),
+                tensor(vec![1.0], vec![1]),
+                true,
+            )
+            .unwrap(),
+        );
+        params.insert(
+            TrainableParam::new(
+                ParamId::b(0, 1, LoRAInjectionPoint::QProj),
+                tensor(vec![1.0], vec![1]),
+            )
+            .unwrap(),
+        );
+
+        let mut adam = crate::adamw::AdamW::new(crate::adamw::AdamWConfig {
+            lr: 0.5,
+            ..crate::adamw::AdamWConfig::default()
+        });
+        // Give the trainable param a gradient so it gets updated.
+        params
+            .get_mut(ParamId::b(0, 1, LoRAInjectionPoint::QProj))
+            .unwrap()
+            .accumulate_grad(&tensor(vec![1.0], vec![1]))
+            .unwrap();
+        adam.step(&mut params).unwrap();
+
+        // Frozen param unchanged; trainable param moved by lr * grad.
+        let frozen_val = params
+            .get(ParamId::a(0, 1, LoRAInjectionPoint::QProj))
+            .unwrap()
+            .data
+            .to_vec_f32()
+            .unwrap()[0];
+        let trained_val = params
+            .get(ParamId::b(0, 1, LoRAInjectionPoint::QProj))
+            .unwrap()
+            .data
+            .to_vec_f32()
+            .unwrap()[0];
+        assert_eq!(frozen_val, 1.0);
+        assert!((trained_val - 1.0).abs() > 0.0);
     }
 
     #[test]

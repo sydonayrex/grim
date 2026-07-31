@@ -656,3 +656,38 @@ fn probe_rocm_devices_returns_vec_even_when_no_gpu() {
         assert!(d.ordinal <= 64);
     }
 }
+
+
+
+
+#[tokio::test]
+async fn test_garage_worker_soul_eater_mode() {
+    use std::sync::Arc;
+    use std::io::Write;
+
+    let dataset_file = "/tmp/soul-eater-test.jsonl";
+    {
+        let mut f = std::fs::File::create(dataset_file).expect("create test dataset");
+        for i in 0..10 {
+            writeln!(f, "{{\"text\": \"soul eater test prompt {}\"}}", i).unwrap();
+        }
+    }
+
+    let reg = Arc::new(JobRegistry::new());
+    let id = reg
+        .create(TrainingJob {
+            model_path: "/tmp/soul-eater-test.gguf".into(),
+            dataset_path: dataset_file.into(),
+            training_mode: grim_garage::jobs::TrainingMode::SoulEater,
+            lora_rank: 8,
+            learning_rate: 1e-3,
+            epochs: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("create job");
+
+    grim_garage::jobs::run_training_worker(reg.clone(), id.clone()).await;
+    let job = reg.get(&id).await.expect("get job");
+    assert_eq!(job.status, JobStatus::Completed);
+}

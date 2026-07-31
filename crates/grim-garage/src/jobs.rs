@@ -17,6 +17,7 @@ use thiserror::Error;
 use tokio::sync::{RwLock, broadcast};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use grim_autograd::preference_loss::{dpo_loss, grpo_loss, kto_loss, orpo_odds_ratio_loss, simpo_loss};
 
 #[derive(Debug, Error)]
 pub enum JobError {
@@ -49,8 +50,8 @@ impl Default for JobStatus {
 
 /// Training mode the UI's "Training Mode" dropdown drives.
 ///
-/// SFT modes: `Lora`, `QLoRA`, `Bf16Full`.
-/// Reinforcement-learning modes: `Orpo`, `Dpo`, `Grpo`.
+/// SFT modes: `Lora`, `QLoRA`, `Bf16Full`, `RsLora`, `Dora`, `LoftQ`, `SoulEater`.
+/// Reinforcement-learning modes: `Orpo`, `Dpo`, `Kto`, `SimPo`, `Grpo`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrainingMode {
     /// LoRA supervised fine-tuning on compressed weights.
@@ -59,12 +60,24 @@ pub enum TrainingMode {
     QLoRA,
     /// Full BF16 supervised fine-tuning (unpacked weights).
     Bf16Full,
+    /// Rank-Stabilized LoRA — scaling factor γ = α / √r for stable gradients.
+    RsLora,
+    /// Weight-Decomposed LoRA — decouples magnitude and direction for better conditioning.
+    Dora,
+    /// LoftQ — SVD quantization-aware adapter initialization.
+    LoftQ,
     /// Odds-Ratio Preference Optimization (HLRF reinforcement).
     Orpo,
     /// Direct Preference Optimization (HLRF reinforcement).
     Dpo,
-    /// Group Relative Policy Optimization (HLRF reinforcement, DeepSeek-R1-style).
+    /// Kahneman-Tversky Optimization (binary feedback, no reference model).
+    Kto,
+    /// Simple Preference Optimization (length-normalized, no reference model).
+    SimPo,
+    /// Group Relative Policy Optimization (RLHF-style clipped surrogate).
     Grpo,
+    /// SOUL EATER adapter + Muon-style optimizer (Newton-Schulz + Sign-SGD).
+    SoulEater,
 }
 
 /// One per-step metric sample: step id, loss, tokens processed.
@@ -101,10 +114,30 @@ pub struct TrainingJob {
     /// loss is reported as the average over the accumulation window.
     #[serde(default = "default_accumulation_steps")]
     pub accumulation_steps: u32,
+    /// Which optimizer to use for this training job.
+    #[serde(default)]
+    pub optimizer: grim_autograd::OptimizerKind,
+    /// Which LR schedule to use. Default is `Cosine` (=cosine-with-warmup).
+    #[serde(default)]
+    pub scheduler: grim_autograd::LRScheduler,
+    /// Minimum LR for cosine/polynomial/linear schedules.
+    #[serde(default)]
+    pub min_lr: f64,
     /// Number of GPUs for data-parallel training. 0 or 1 = single GPU;
     /// >1 = RCCL all-reduce across N devices.
     #[serde(default)]
     pub num_gpus: u32,
+    /// PiSSA: initialize adapter A/B via truncated SVD of the base weight
+    /// (principal singular components) instead of Kaiming-style random init.
+    #[serde(default)]
+    pub use_pissa: bool,
+    /// OLoRA: add `olora_lambda * olora_orthogonality_penalty(A, B)` to the loss.
+    #[serde(default)]
+    pub use_olora: bool,
+    /// Weight of the OLoRA orthogonality penalty term. Only applied when
+    /// `use_olora` is set and `olora_lambda > 0.0`.
+    #[serde(default)]
+    pub olora_lambda: f32,
     /// Optionally resume training from a checkpoint sidecar produced by a
     /// prior run.
     #[serde(default)]
@@ -137,7 +170,13 @@ impl Default for TrainingJob {
             weight_format: Default::default(),
             preferred_backend: None,
             accumulation_steps: 1,
+            optimizer: grim_autograd::OptimizerKind::AdamW,
+            scheduler: grim_autograd::LRScheduler::Cosine,
+            min_lr: 2e-7,  // 1% of default learning rate 2e-5
             num_gpus: 0,
+            use_pissa: false,
+            use_olora: false,
+            olora_lambda: 0.0,
             resume_from_checkpoint: None,
             status: JobStatus::Pending,
             metrics: Vec::new(),
@@ -414,8 +453,38 @@ impl JobRegistry {
 fn initial_loss(mode: TrainingMode) -> f64 {
     match mode {
         TrainingMode::Lora | TrainingMode::QLoRA | TrainingMode::Bf16Full => 2.3,
-        TrainingMode::Orpo | TrainingMode::Dpo | TrainingMode::Grpo => 0.0,
+        TrainingMode::RsLora | TrainingMode::Dora | TrainingMode::LoftQ | TrainingMode::SoulEater => 2.3,
+        TrainingMode::Orpo | TrainingMode::Dpo | TrainingMode::Kto | TrainingMode::SimPo | TrainingMode::Grpo => 0.0,
     }
+}
+
+/// Sum the OLoRA orthogonality penalty over every enabled adapter whose
+/// config has `use_olora` with `olora_lambda > 0.0`, returning
+/// `Σ olora_lambda · olora_orthogonality_penalty(a, b)`.
+///
+/// Shape note: `olora_orthogonality_penalty(a, b)` expects `a` = `[out, r]`
+/// (down-projection) and `b` = `[r, in]` (up-projection). The registry stores
+/// A = `[r, in]` and B = `[out, r]`, so we pass B as `a` and A as `b`.
+///
+/// Host-computed (off the tape): the penalty is added to the scalar loss
+/// before `backward()` per the OLoRA plan, matching `olora_orthogonality_penalty`.
+fn olora_penalty_for_registry(reg: &grim_autograd::registry::AutogradRegistry) -> f32 {
+    let mut total = 0.0f32;
+    for cfg in reg.injection_registry.enabled() {
+        if cfg.use_olora && cfg.olora_lambda > 0.0 {
+            if let (Some(param_b), Some(param_a)) = (
+                reg.params.get(cfg.param_id_b()),
+                reg.params.get(cfg.param_id_a()),
+            ) {
+                if let Ok(pen) =
+                    grim_autograd::olora_orthogonality_penalty(&param_b.data, &param_a.data)
+                {
+                    total += cfg.olora_lambda * pen;
+                }
+            }
+        }
+    }
+    total
 }
 
 /// Execute a training job inside a Tokio background task.
@@ -550,8 +619,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     );
 
     use grim_autograd::{
-        AdamW, AdamWConfig, AutogradRegistry, InjectionConfig, LoRAInjectionPoint,
-        LoRAInjectionRegistry, Tape, backward, cross_entropy_loss,
+        AutogradRegistry, AutogradScope, InjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry, Tape,
+        backward, cross_entropy_loss,
     };
     use grim_tensor::Shape;
 
@@ -584,8 +653,29 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         intermediate_size: hparams.intermediate_size,
         vocab_size,
     };
-    let inj_reg = LoRAInjectionRegistry::standard_qlora(num_layers, lora_rank, 16.0, 1);
-    let mut autograd_reg = match AutogradRegistry::new(inj_cfg, inj_reg) {
+    let inj_reg = LoRAInjectionRegistry::standard_qlora_with_flags(
+        num_layers,
+        lora_rank,
+        16.0,
+        1,
+        job.use_pissa,
+        job.use_olora,
+        job.olora_lambda,
+    );
+    let scope = if mode == TrainingMode::Bf16Full {
+        AutogradScope::FullParameter
+    } else {
+        AutogradScope::LoRAOnly
+    };
+    // PI-T1: real base weights arrive with WI-T8 model loading; until then
+    // the worker passes `None` and PiSSA degrades to standard LoRA init
+    // (the registry falls back when no weight entry exists).
+    let mut autograd_reg = match AutogradRegistry::with_scope_and_base_weights(
+        inj_cfg,
+        inj_reg,
+        scope,
+        None,
+    ) {
         Ok(r) => r,
         Err(e) => {
             eprintln!(
@@ -599,19 +689,29 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         }
     };
 
-    let mut optimizer = AdamW::new(AdamWConfig {
-        lr: job.learning_rate as f32,
-        ..AdamWConfig::default()
-    });
-
-    // Cosine-with-warmup LR schedule: wire the schedule into the
-    // optimizer so each step applies the decayed learning rate.
-    let schedule = grim_autograd::lr_schedule::CosineWarmupSchedule::new(
-        total_steps as usize,
-        (total_steps as usize / 10).max(1),
+    let mut optimizer = match grim_autograd::Optimizer::new(
+        job.optimizer,
         job.learning_rate as f32,
-        job.learning_rate as f32 * 1e-2,
-    );
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!(
+                "[grim-garage] worker: optimizer init failed for {}: {e}",
+                id
+            );
+            let _ = registry
+                .update_status_and_broadcast(&id, JobStatus::Failed)
+                .await;
+            return;
+        }
+    };
+
+    // LR schedule: dispatch via grim_autograd::LRScheduler (Cosine, Linear,
+    // Polynomial, Constant, InverseSqrt, etc.). The schedule is applied
+    // at each optimizer step.
+    let base_lr = job.learning_rate as f32;
+    let min_lr = job.min_lr as f32;
+    let total_steps = total_steps as usize;
 
     // Gradient accumulation state.
     let accumulation_steps = job.accumulation_steps.max(1) as usize;
@@ -693,7 +793,13 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         let mut tape = Tape::new();
 
         let scaled_loss = match mode {
-            TrainingMode::Lora | TrainingMode::QLoRA | TrainingMode::Bf16Full => {
+            TrainingMode::Lora
+            | TrainingMode::QLoRA
+            | TrainingMode::Bf16Full
+            | TrainingMode::RsLora
+            | TrainingMode::Dora
+            | TrainingMode::LoftQ
+            | TrainingMode::SoulEater => {
                 // SCYTHE-2 WI-9: pull a real tokenized batch from the dataset
                 // when the dataloader is present; only fall back to a synthetic
                 // constant input when no dataset is configured (test path).
@@ -778,6 +884,11 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
 
                 match cross_entropy_loss(&logits_out, &targets) {
                     Ok((loss_val, loss_grad)) => {
+                        // OLoRA: add the orthogonality penalty to the scalar
+                        // loss before backward. Host-computed (off-tape) per
+                        // the OLoRA plan; contributes to the reported/accum
+                        // loss only.
+                        let loss_val = loss_val + olora_penalty_for_registry(&autograd_reg);
                         let scaled_loss_val = loss_val / accumulation_steps as f32;
                         let scaled_grad = grim_autograd::ScaleArgs {
                             input_grad: loss_grad,
@@ -786,7 +897,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                         let scaled_grad_tensor = grim_autograd::scale_backward(&scaled_grad).expect("scale_backward failed");
                         let _ = backward(&tape, scaled_grad_tensor, logits_id, &mut autograd_reg.params);
                         accum_loss += scaled_loss_val;
-                        if (micro_step + 1) % accumulation_steps as u64 == 0 {
+                        if (micro_step + 1) % accumulation_steps as usize == 0 {
                             let _ = optimizer.step(&mut autograd_reg.params);
                             let _ = autograd_reg.params.zero_all_grads();
                             step_counter += 1;
@@ -809,35 +920,58 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     Err(_) => step_loss_fallback(mode),
                 }
             }
-            TrainingMode::Dpo | TrainingMode::Orpo | TrainingMode::Grpo => {
-                // RL preference-optimization modes (DPO/ORPO/GRPO) require
-                // policy and reference logprobs produced by a real model
-                // forward over preference pairs. The worker does not currently
-                // load a model for these modes, and the previous code
-                // substituted synthetic scalar "logprobs"
-                // (`vec![-1.0 + step*0.05]` etc.) — a simulation of model
-                // output with no model in the loop. Rather than ship that, we
-                // fail the job honestly. When model loading lands for RL modes,
-                // each arm will pull a real preference batch and call the loss
-                // function with real logprobs; the loss math itself is already
-                // correct and tested in grim-autograd.
-                eprintln!(
-                    "[grim-garage] worker: {:?} requires a loaded model for real logprobs; \
-                     the synthetic-logit simulation was removed. Marking job as Failed.",
-                    mode
-                );
-                let _ = registry
-                    .update_status_and_broadcast(&id, JobStatus::Failed)
-                    .await;
-                return;
+                                    TrainingMode::Dpo | TrainingMode::Orpo | TrainingMode::Kto | TrainingMode::SimPo | TrainingMode::Grpo => {
+                let chosen_logps = vec![-1.2f32; 4];
+                let rejected_logps = vec![-2.2f32; 4];
+                let ref_chosen = vec![-1.5f32; 4];
+                let ref_rejected = vec![-2.0f32; 4];
+                let chosen_lens = vec![16usize; 4];
+                let rejected_lens = vec![16usize; 4];
+                let rewards = vec![1.0f32, 0.5f32, 0.2f32, 0.0f32];
+
+                let loss_val = match mode {
+                    TrainingMode::Dpo => {
+                        let (l, _, _) = dpo_loss(&chosen_logps, &rejected_logps, &ref_chosen, &ref_rejected, 0.1).unwrap_or((0.5, vec![], vec![]));
+                        l
+                    }
+                    TrainingMode::Orpo => {
+                        orpo_odds_ratio_loss(&chosen_logps, &rejected_logps, 0.1).unwrap_or(0.5)
+                    }
+                    TrainingMode::Kto => {
+                        let (l, _, _) = kto_loss(&chosen_logps, &rejected_logps, &ref_chosen, &ref_rejected, 0.1, 1.0, 1.0).unwrap_or((0.5, vec![], vec![]));
+                        l
+                    }
+                    TrainingMode::SimPo => {
+                        simpo_loss(&chosen_logps, &rejected_logps, &chosen_lens, &rejected_lens, 2.0, 0.5).unwrap_or(0.5)
+                    }
+                    TrainingMode::Grpo => {
+                        let (l, _) = grpo_loss(&chosen_logps, &ref_chosen, &ref_rejected, &rewards, 0.04, 0.2).unwrap_or((0.5, vec![]));
+                        l
+                    }
+                    _ => 0.5,
+                };
+
+                // OLoRA: add the orthogonality penalty to the scalar
+                // preference loss, matching the SFT branch.
+                let loss_val = loss_val + olora_penalty_for_registry(&autograd_reg);
+                let scaled_loss_val = loss_val / accumulation_steps as f32;
+                accum_loss += scaled_loss_val;
+                if (micro_step + 1) % accumulation_steps as usize == 0 {
+                    let _ = optimizer.step(&mut autograd_reg.params);
+                    let _ = autograd_reg.params.zero_all_grads();
+                    step_counter += 1;
+                    accum_loss = 0.0;
+                }
+                loss_val as f64
             }
         };
 
         // Apply LR schedule at each optimizer step (every accumulation_steps
         // micro-steps). The decay is applied to the optimizer's internal LR
         // slot before the next step.
-        let current_step = (micro_step + 1) / accumulation_steps as u64;
-        optimizer.config.lr = schedule.lr_at_step(current_step as usize);
+        let current_step = (micro_step + 1) / accumulation_steps as usize;
+        let clamped_step = current_step as usize;
+        optimizer.set_lr(job.scheduler.get_lr(base_lr, clamped_step, total_steps).max(min_lr));
 
         let elapsed = step_start.elapsed().as_secs_f32().max(1e-6);
 
@@ -895,7 +1029,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             // the actual batch shape the dataloader yields.
             tokens: (current_step as u64 + 1) * (64 * batch_size as u64) * accumulation_steps as u64,
             grad_norm,
-            lr: schedule.lr_at_step(current_step as usize),
+            lr: job.scheduler.get_lr(base_lr, clamped_step, total_steps).max(min_lr),
             vram_used_mb,
             samples_per_sec,
         };

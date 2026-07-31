@@ -34,8 +34,25 @@
 //! Backward for this exact op set is implemented; nothing more. Cross-entropy
 //! loss backward arrives with WI-T5 (it slots in as one more op).
 
+/// Controls which parameters are recorded on the backward tape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutogradScope {
+    /// Only LoRA adapter + base-weight deltas at injection points (current QLoRA behavior).
+    LoRAOnly,
+    /// All trainable parameters including frozen base weights (full fine-tuning WI-T8).
+    /// Requires recording MatMul, Add, Scale ops for every weight matrix in the model.
+    FullParameter,
+}
+
+impl Default for AutogradScope {
+    fn default() -> Self {
+        AutogradScope::LoRAOnly
+    }
+}
+
 pub mod adamw;
 pub mod backward;
+pub mod collate;
 pub mod injection;
 pub mod loss;
 pub mod lr_schedule;
@@ -45,22 +62,25 @@ pub mod preference_loss;
 pub mod registry;
 pub mod tape;
 
-pub use adamw::{AdamW, AdamWConfig};
+pub use adamw::{AdamW, AdamWConfig, Optimizer, OptimizerKind, PagedAdamW, PagedAdamWConfig, Lion8Bit, Lion8BitConfig, Adafactor, AdafactorConfig, LRScheduler};
 pub use lr_schedule::CosineWarmupSchedule;
 pub use backward::{BackwardContext, backward};
+pub use collate::{VarLenCollator, TokenSequence, PackedBatch};
 pub use injection::{
     InjectionConfig, LoRAInjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry,
+    loftq_initialize, pissa_initialize,
 };
 pub use loss::cross_entropy_loss;
 pub use ops::{
     AddArgs, FakeQuantInt4Args, MatMulArgs, ScaleArgs, add_backward, apply_and_record_lora,
     fake_quant_int4_backward, fake_quant_int4_forward, lora_backward, matmul_backward,
-    scale_backward,
+    scale_backward, vera_backward, vera_forward,
 };
 pub use param::{ParamId, TrainableParam, TrainableParams};
 pub use preference_loss::{
-    dpo_loss, dpo_loss_autograd, grpo_loss_autograd, grpo_normalize_rewards, orpo_odds_ratio_loss,
-    orpo_odds_ratio_loss_autograd,
+    dpo_loss, dpo_loss_autograd, grpo_loss, grpo_loss_autograd, grpo_normalize_rewards,
+    kto_loss, olora_orthogonality_penalty, orpo_odds_ratio_loss, orpo_odds_ratio_loss_autograd,
+    simpo_loss,
 };
 pub use registry::AutogradRegistry;
 pub use tape::{Tape, TapeEntry, TapeKind, TensorId};
