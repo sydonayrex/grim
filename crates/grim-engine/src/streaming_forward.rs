@@ -4,6 +4,8 @@
 //! lazily block-by-block from a `TensorProvider`, runs fused forward operations,
 //! and manages activation recomputation buffers (`GradientCheckpointBuffer`).
 
+use crate::rope_scaling::{RopeScalingMethod, scaling_base};
+use grim_autograd::AutogradScope;
 use grim_core::error::{Error, Result};
 use grim_models_transformer::{LlamaBlock, LlamaConfig};
 use grim_nn::WeightSource;
@@ -54,6 +56,7 @@ pub struct StreamingBlockForward {
     pub num_layers: usize,
     pub hidden_size: usize,
     pub checkpoint_buffer: GradientCheckpointBuffer,
+    pub rope_scaling: Option<RopeScalingMethod>,
 }
 
 impl StreamingBlockForward {
@@ -63,7 +66,14 @@ impl StreamingBlockForward {
             num_layers,
             hidden_size,
             checkpoint_buffer: GradientCheckpointBuffer::new(),
+            rope_scaling: None,
         }
+    }
+
+    /// Configure a RoPE scaling method for long-context training.
+    pub fn with_rope_scaling(mut self, method: RopeScalingMethod) -> Self {
+        self.rope_scaling = Some(method);
+        self
     }
 
     /// Run streaming block-wise forward pass for `layer_idx`.
@@ -72,12 +82,17 @@ impl StreamingBlockForward {
     /// then loads block weights lazily from `provider` and runs real
     /// transformer block math (RMSNorm → GQA attention → residual →
     /// RMSNorm → SwiGLU FFN → residual) via `LlamaBlock`.
+    ///
+    /// `positions` carries RoPE position ids for this block (required for correct
+    /// positional encoding in loss-eval / reference-model paths). When `None`,
+    /// an empty slice is passed (RoPE not applied), matching prior behavior.
     pub fn forward_block(
         &mut self,
         provider: &dyn TensorProvider,
         cfg: &LlamaConfig,
         layer_idx: usize,
         x: &Tensor,
+        positions: Option<&[u32]>,
     ) -> Result<Tensor> {
         if layer_idx >= self.num_layers {
             return Err(Error::Config(format!(
@@ -93,7 +108,7 @@ impl StreamingBlockForward {
         let ws = WeightSource::root(provider, x.device().clone());
         let block_ws = ws.pp("layers").pp(&layer_idx.to_string());
         let block = LlamaBlock::load(&block_ws, cfg)?;
-        block.forward(x, &[])
+        block.forward(x, positions.unwrap_or(&[]))
     }
 
     /// Recompute block forward pass from saved input checkpoint during backward traversal.
@@ -103,6 +118,7 @@ impl StreamingBlockForward {
         provider: &dyn TensorProvider,
         cfg: &LlamaConfig,
         layer_idx: usize,
+        positions: Option<&[u32]>,
     ) -> Result<Tensor> {
         let input_x = self
             .checkpoint_buffer
@@ -113,7 +129,7 @@ impl StreamingBlockForward {
         let ws = WeightSource::root(provider, input_x.device().clone());
         let block_ws = ws.pp("layers").pp(&layer_idx.to_string());
         let block = LlamaBlock::load(&block_ws, cfg)?;
-        block.forward(input_x, &[])
+        block.forward(input_x, positions.unwrap_or(&[]))
     }
 
     /// Run streaming block-wise forward pass for `layer_idx` with autograd tape recording.
@@ -149,7 +165,20 @@ impl StreamingBlockForward {
         let x_norm_base_id = tape.register(x_norm.clone());
 
         let q_base = block.wq.forward(&x_norm)?;
-        let q_base_id = tape.register(q_base.clone());
+        // WI-T8 (FullParameter): record base-weight MatMul so gradients flow
+        // back through every base weight, not just LoRA adapters.
+        let q_base_id = if autograd_reg.scope == AutogradScope::FullParameter {
+            let q_m = q_base.shape().dims()[0];
+            let q_k = x_norm.shape().dims()[1];
+            let q_n = q_base.shape().dims()[1];
+            let wq_id = tape.register(block.wq.weight.clone());
+            let q_base_param = grim_autograd::ParamId::base(layer_idx, grim_autograd::LoRAInjectionPoint::QProj);
+            tape.record_matmul(
+                x_norm_base_id, wq_id, q_base.clone(), false, true, q_m, q_k, q_n, Some(q_base_param),
+            )
+        } else {
+            tape.register(q_base.clone())
+        };
         let (_q_id, q) = grim_autograd::apply_and_record_lora(
             autograd_reg,
             tape,
@@ -162,7 +191,17 @@ impl StreamingBlockForward {
         )?;
 
         let k_base = block.wk.forward(&x_norm)?;
-        let k_base_id = tape.register(k_base.clone());
+        let k_base_id = if autograd_reg.scope == AutogradScope::FullParameter {
+            let k_m = k_base.shape().dims()[0];
+            let k_k = x_norm.shape().dims()[1];
+            let k_n = k_base.shape().dims()[1];
+            let wk_id = tape.register(block.wk.weight.clone());
+            tape.record_matmul(
+                x_norm_base_id, wk_id, k_base.clone(), false, true, k_m, k_k, k_n, Some(grim_autograd::ParamId::base(layer_idx, grim_autograd::LoRAInjectionPoint::KProj)),
+            )
+        } else {
+            tape.register(k_base.clone())
+        };
         let (_k_id, k) = grim_autograd::apply_and_record_lora(
             autograd_reg,
             tape,
@@ -175,7 +214,17 @@ impl StreamingBlockForward {
         )?;
 
         let v_base = block.wv.forward(&x_norm)?;
-        let v_base_id = tape.register(v_base.clone());
+        let v_base_id = if autograd_reg.scope == AutogradScope::FullParameter {
+            let v_m = v_base.shape().dims()[0];
+            let v_k = x_norm.shape().dims()[1];
+            let v_n = v_base.shape().dims()[1];
+            let wv_id = tape.register(block.wv.weight.clone());
+            tape.record_matmul(
+                x_norm_base_id, wv_id, v_base.clone(), false, true, v_m, v_k, v_n, Some(grim_autograd::ParamId::base(layer_idx, grim_autograd::LoRAInjectionPoint::VProj)),
+            )
+        } else {
+            tape.register(v_base.clone())
+        };
         let (_v_id, v) = grim_autograd::apply_and_record_lora(
             autograd_reg,
             tape,
@@ -192,6 +241,12 @@ impl StreamingBlockForward {
         let total_tokens = q.shape().elem_count() / num_head_dims;
         let positions: Vec<u32> = (0..total_tokens as u32).collect();
 
+        // RoPE base respects config rope_theta, optionally scaled for long-context training.
+        let rope_base = self
+            .rope_scaling
+            .as_ref()
+            .map_or(cfg.rope_theta, |m| scaling_base(m, cfg.rope_theta, cfg.head_dim));
+
         let dev = pick_device_for_tensor(&q);
 
         let q_shape = Shape::new(vec![1, total_tokens, num_head_dims]);
@@ -199,8 +254,8 @@ impl StreamingBlockForward {
         let out_shape_3d = Shape::new(vec![total_tokens, cfg.num_heads, cfg.head_dim]);
         let out_shape_2d = Shape::new(vec![total_tokens, num_head_dims]);
 
-        let (q_rot_s, _) = dev.rope(q.storage().as_ref(), &positions, cfg.head_dim, 10000.0, &q_shape)?;
-        let (k_rot_s, _) = dev.rope(k.storage().as_ref(), &positions, cfg.head_dim, 10000.0, &k_shape)?;
+        let (q_rot_s, _) = dev.rope(q.storage().as_ref(), &positions, cfg.head_dim, rope_base, &q_shape)?;
+        let (k_rot_s, _) = dev.rope(k.storage().as_ref(), &positions, cfg.head_dim, rope_base, &k_shape)?;
 
         let q_rot = Tensor::new(
             std::sync::Arc::from(q_rot_s),
@@ -239,7 +294,18 @@ impl StreamingBlockForward {
         let attn_raw_id = tape.register(attn_raw.clone());
 
         let wo_base = block.wo.forward(&attn_raw)?;
-        let wo_base_id = tape.register(wo_base.clone());
+        let wo_base_id = if autograd_reg.scope == AutogradScope::FullParameter {
+            let wo_m = wo_base.shape().dims()[0];
+            let wo_k = attn_raw.shape().dims()[1];
+            let wo_n = wo_base.shape().dims()[1];
+            let wo_w_id = tape.register(block.wo.weight.clone());
+            tape.record_matmul(
+                attn_raw_id, wo_w_id, wo_base.clone(), false, true, wo_m, wo_k, wo_n,
+                Some(grim_autograd::ParamId::base(layer_idx, grim_autograd::LoRAInjectionPoint::OProj)),
+            )
+        } else {
+            tape.register(wo_base.clone())
+        };
         let (wo_id, wo_out) = grim_autograd::apply_and_record_lora(
             autograd_reg,
             tape,
@@ -268,7 +334,18 @@ impl StreamingBlockForward {
         let ffn_norm_id = tape.register(ffn_norm_out.clone());
 
         let gate_base = block.w_gate.forward(&ffn_norm_out)?;
-        let gate_base_id = tape.register(gate_base.clone());
+        let gate_base_id = if autograd_reg.scope == AutogradScope::FullParameter {
+            let g_m = gate_base.shape().dims()[0];
+            let g_k = ffn_norm_out.shape().dims()[1];
+            let g_n = gate_base.shape().dims()[1];
+            let wg_id = tape.register(block.w_gate.weight.clone());
+            tape.record_matmul(
+                ffn_norm_id, wg_id, gate_base.clone(), false, true, g_m, g_k, g_n,
+                Some(grim_autograd::ParamId::base(layer_idx, grim_autograd::LoRAInjectionPoint::GateProj)),
+            )
+        } else {
+            tape.register(gate_base.clone())
+        };
         let (_gate_id, gate) = grim_autograd::apply_and_record_lora(
             autograd_reg,
             tape,
@@ -281,7 +358,18 @@ impl StreamingBlockForward {
         )?;
 
         let up_base = block.w_up.forward(&ffn_norm_out)?;
-        let up_base_id = tape.register(up_base.clone());
+        let up_base_id = if autograd_reg.scope == AutogradScope::FullParameter {
+            let u_m = up_base.shape().dims()[0];
+            let u_k = ffn_norm_out.shape().dims()[1];
+            let u_n = up_base.shape().dims()[1];
+            let wu_id = tape.register(block.w_up.weight.clone());
+            tape.record_matmul(
+                ffn_norm_id, wu_id, up_base.clone(), false, true, u_m, u_k, u_n,
+                Some(grim_autograd::ParamId::base(layer_idx, grim_autograd::LoRAInjectionPoint::UpProj)),
+            )
+        } else {
+            tape.register(up_base.clone())
+        };
         let (_up_id, up) = grim_autograd::apply_and_record_lora(
             autograd_reg,
             tape,
@@ -304,7 +392,18 @@ impl StreamingBlockForward {
         let silu_id = tape.register(silu_tensor.clone());
 
         let down_base = block.w_down.forward(&silu_tensor)?;
-        let down_base_id = tape.register(down_base.clone());
+        let down_base_id = if autograd_reg.scope == AutogradScope::FullParameter {
+            let d_m = down_base.shape().dims()[0];
+            let d_k = silu_tensor.shape().dims()[1];
+            let d_n = down_base.shape().dims()[1];
+            let wd_id = tape.register(block.w_down.weight.clone());
+            tape.record_matmul(
+                silu_id, wd_id, down_base.clone(), false, true, d_m, d_k, d_n,
+                Some(grim_autograd::ParamId::base(layer_idx, grim_autograd::LoRAInjectionPoint::DownProj)),
+            )
+        } else {
+            tape.register(down_base.clone())
+        };
         let (down_id, down_out) = grim_autograd::apply_and_record_lora(
             autograd_reg,
             tape,
@@ -416,8 +515,9 @@ mod tests {
         let cfg = provider.cfg.clone();
         let mut forward = StreamingBlockForward::new(4, cfg.hidden_size);
         let x = cpu_tensor(vec![0.5; cfg.hidden_size], Shape::new(vec![1, cfg.hidden_size]));
+        let positions = vec![0u32];
 
-        let out = forward.forward_block(&provider, &cfg, 0, &x).unwrap();
+        let out = forward.forward_block(&provider, &cfg, 0, &x, Some(&positions)).unwrap();
 
         // Output must have same shape as input (real block forward ran without error)
         assert_eq!(out.shape().dims(), x.shape().dims());
@@ -429,9 +529,10 @@ mod tests {
         let cfg = provider.cfg.clone();
         let mut forward = StreamingBlockForward::new(4, cfg.hidden_size);
         let x = cpu_tensor(vec![0.5; cfg.hidden_size], Shape::new(vec![1, cfg.hidden_size]));
+        let positions = vec![0u32];
 
-        let out = forward.forward_block(&provider, &cfg, 0, &x).unwrap();
-        let recomputed = forward.recompute_block(&provider, &cfg, 0).unwrap();
+        let out = forward.forward_block(&provider, &cfg, 0, &x, Some(&positions)).unwrap();
+        let recomputed = forward.recompute_block(&provider, &cfg, 0, Some(&positions)).unwrap();
 
         // Recomputed output must match the original forward output
         let out_vals = out.to_vec_f32().unwrap();

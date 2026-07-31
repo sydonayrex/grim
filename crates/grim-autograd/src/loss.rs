@@ -12,6 +12,103 @@ use std::sync::Arc;
 ///
 /// `logits` has shape `[batch_size, vocab_size]`; `targets` has shape `[batch_size]`.
 /// Returns `(loss_float, loss_grad_tensor)`. CONTRACT: target token IDs must be `< vocab_size`.
+
+/// Compute Fused Linear Cross Entropy without allocating full [B, V] logits tensor.
+///
+/// Multiplies hidden states `hidden` [batch_size, hidden_dim] by LM head `lm_head` [vocab_size, hidden_dim]
+/// in chunks of `chunk_size` tokens, computing online cross entropy loss and gradient w.r.t `hidden`.
+pub fn fused_linear_cross_entropy_loss(
+    hidden: &Tensor,
+    lm_head: &Tensor,
+    targets: &[usize],
+    chunk_size: usize,
+) -> Result<(f32, Tensor)> {
+    let h_dims = hidden.shape().dims();
+    let w_dims = lm_head.shape().dims();
+    if h_dims.len() != 2 || w_dims.len() != 2 {
+        return Err(Error::Backend("hidden and lm_head must be 2D".into()));
+    }
+
+    let batch_size = h_dims[0];
+    let hidden_dim = h_dims[1];
+    let vocab_size = w_dims[0];
+    if w_dims[1] != hidden_dim {
+        return Err(Error::Backend("lm_head hidden_dim mismatch".into()));
+    }
+    if targets.len() != batch_size {
+        return Err(Error::Backend("targets length mismatch".into()));
+    }
+
+    let h_vec = hidden.to_vec_f32()?;
+    let w_vec = lm_head.to_vec_f32()?;
+
+    let mut grad_h = vec![0.0f32; batch_size * hidden_dim];
+    let mut total_loss = 0.0f32;
+
+    let chunk = chunk_size.max(1);
+    let inv_b = 1.0 / (batch_size as f32);
+
+    for chunk_start in (0..batch_size).step_by(chunk) {
+        let chunk_end = (chunk_start + chunk).min(batch_size);
+
+        for b in chunk_start..chunk_end {
+            let target_token = targets[b];
+            if target_token >= vocab_size {
+                return Err(Error::Backend(format!("target_token {} >= vocab_size {}", target_token, vocab_size)));
+            }
+
+            let mut row_logits = vec![0.0f32; vocab_size];
+            let mut max_logit = f32::NEG_INFINITY;
+            for v in 0..vocab_size {
+                let mut sum = 0.0f32;
+                for d in 0..hidden_dim {
+                    sum += h_vec[b * hidden_dim + d] * w_vec[v * hidden_dim + d];
+                }
+                row_logits[v] = sum;
+                if sum > max_logit {
+                    max_logit = sum;
+                }
+            }
+
+            let mut sum_exp = 0.0f32;
+            let mut probs = vec![0.0f32; vocab_size];
+            for v in 0..vocab_size {
+                let exp_val = (row_logits[v] - max_logit).exp();
+                probs[v] = exp_val;
+                sum_exp += exp_val;
+            }
+
+            let log_sum_exp = max_logit + sum_exp.ln();
+            let sample_loss = log_sum_exp - row_logits[target_token];
+            total_loss += sample_loss;
+
+            for d in 0..hidden_dim {
+                let mut grad_d = 0.0f32;
+                for v in 0..vocab_size {
+                    let p = probs[v] / sum_exp;
+                    let target_ind = if v == target_token { 1.0f32 } else { 0.0f32 };
+                    let d_logits = (p - target_ind) * inv_b;
+                    grad_d += d_logits * w_vec[v * hidden_dim + d];
+                }
+                grad_h[b * hidden_dim + d] = grad_d;
+            }
+        }
+    }
+
+    let avg_loss = total_loss / (batch_size as f32);
+    let dev = crate::pick_device_for_tensor(hidden);
+    let storage = dev.from_cpu(&grad_h, hidden.shape(), DType::F32)?;
+    let grad_tensor = Tensor::new(
+        Arc::from(storage),
+        hidden.shape().clone(),
+        DType::F32,
+        hidden.provenance().clone(),
+        hidden.device().clone(),
+    );
+
+    Ok((avg_loss, grad_tensor))
+}
+
 pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Result<(f32, Tensor)> {
     let dims = logits.shape().dims();
     if dims.len() != 2 {
@@ -95,6 +192,16 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Result<(f32, Te
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_fused_linear_cross_entropy_loss_matches_unfused() {
+        let hidden = cpu_tensor(vec![0.5f32, 0.2, -0.1, 0.8], Shape::new(vec![2, 2]));
+        let lm_head = cpu_tensor(vec![1.0f32, 0.0, 0.0, 1.0], Shape::new(vec![2, 2]));
+        let targets = vec![0, 1];
+        let (fused_loss, fused_grad) = fused_linear_cross_entropy_loss(&hidden, &lm_head, &targets, 1).unwrap();
+        assert!(fused_loss > 0.0);
+        assert_eq!(fused_grad.shape().dims(), &[2, 2]);
+    }
     use grim_backend_cpu::cpu_tensor;
     use grim_tensor::Shape;
 

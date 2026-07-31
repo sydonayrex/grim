@@ -232,6 +232,27 @@ enum Commands {
         /// Target compute device (e.g. "cpu", "rocm", "rocm:0").
         #[arg(long, default_value = "cpu")]
         device: String,
+        /// Training mode (e.g. "qlora", "soul-eater").
+        #[arg(long, default_value = "qlora")]
+        mode: String,
+        /// Optimizer (adamw, adamw-8bit, paged-adamw, paged-adamw-8bit, lion,
+        /// lion-8bit, adafactor, adamw-bnb, qgalore, galore, galore-8bit,
+        /// lomo, adalomo, came, sophia).
+        #[arg(long, default_value = "adamw")]
+        optimizer: grim_autograd::OptimizerKind,
+        /// LR scheduler (cosine-warmup, linear, polynomial, constant,
+        /// inverse-sqrt, yolo, one-cycle, reduce-on-plateau).
+        #[arg(long, default_value = "cosine-warmup")]
+        scheduler: grim_autograd::LRScheduler,
+        /// Initialize adapters via PiSSA (SVD-based) rather than random LoRA.
+        #[arg(long)]
+        use_pissa: bool,
+        /// Apply the OLoRA orthogonality penalty to the scalar loss.
+        #[arg(long)]
+        use_olora: bool,
+        /// Weight of the OLoRA orthogonality penalty.
+        #[arg(long, default_value_t = 1.0)]
+        olora_lambda: f32,
     },
     /// Convert a model file to ROCm-optimized .grim format using Oxidizer.
     /// Supports GGUF (.gguf), GGML (.ggml), safetensors (.safetensors), and PyTorch (.bin).
@@ -699,7 +720,7 @@ async fn main() -> Result<()> {
         Commands::Quantize => {
             println!("Quantization is available via 'grim oxidize'. Run 'grim oxidize --help' for conversion and quantization options.");
         }
-        Commands::Train { model, dataset, output, epochs, lr, rank, alpha, device } => {
+        Commands::Train { model, dataset, output, epochs, lr, rank, alpha, device, mode, optimizer, scheduler, use_pissa, use_olora, olora_lambda } => {
             let opts = train::TrainOptions {
                 model_path: model,
                 dataset_path: dataset,
@@ -709,6 +730,12 @@ async fn main() -> Result<()> {
                 rank,
                 alpha,
                 device,
+                mode,
+                optimizer,
+                scheduler,
+                use_pissa,
+                use_olora,
+                olora_lambda,
             };
             if let Err(e) = train::cmd_train(opts) {
                 eprintln!("[grim train] Failed: {e}");

@@ -14,6 +14,8 @@
 //! running request through the speculative wrapper.
 
 pub mod model_loader;
+pub mod packing;
+pub mod rope_scaling;
 pub mod streaming_forward;
 /// SCYTHE-2 WI-4 + WI-7: C²PLR controller, PlacementCache, ScytheRing.
 pub mod scythe2;
@@ -125,6 +127,8 @@ pub struct Engine {
     /// Tuned speculative params (MIN-3: applied, not discarded).
     tuned_speculative_block_len: usize,
     tuned_kv_compression_bit_width: u8,
+    tokens_per_sec_ema: f32,
+    total_tokens_generated: u64,
 }
 
 impl Engine {
@@ -167,12 +171,37 @@ impl Engine {
             ),
             tuned_speculative_block_len: 5,
             tuned_kv_compression_bit_width: 4,
+            tokens_per_sec_ema: 0.0,
+            total_tokens_generated: 0,
         }
     }
 
     /// Register a `CausalLm` auto-wrapped in `SpeculativeCausalLm::auto`.
     /// §5.3: speculative decoding is the standard decode path, not opt-in.
     /// Plain autoregressive is the unconfigured fallback.
+
+    /// Returns the exponential moving average of generated tokens per second.
+    /// Returns None if no model is loaded or no tokens have been generated yet.
+    pub fn tokens_per_sec(&self) -> Option<f32> {
+        if self.models.is_empty() || self.total_tokens_generated == 0 {
+            None
+        } else {
+            Some(self.tokens_per_sec_ema)
+        }
+    }
+
+    /// Returns KV cache telemetry stats `(used_bytes, total_bytes, blocks_used, blocks_total)`.
+    pub fn kv_cache_telemetry(&self) -> (u64, u64, u64, u64) {
+        if let Ok(pool) = self.block_pool.lock() {
+            let cap = pool.capacity() as u64;
+            let used = pool.used_count() as u64;
+            let b_bytes = pool.block_bytes() as u64;
+            (used * b_bytes, cap * b_bytes, used, cap)
+        } else {
+            (0, 0, 0, 0)
+        }
+    }
+
     pub fn register_model(&mut self, id: &str, model: Box<dyn CausalLm>) {
         self.register_speculative(id, model, None, None, None);
     }
@@ -359,6 +388,16 @@ impl Engine {
         self.tuned_kv_compression_bit_width = tuned_params.kv_compression_bit_width;
 
         let _ = (schedule_elapsed, total_accepted);
+        let tick_elapsed = tick_start.elapsed();
+        if total_accepted > 0 && tick_elapsed.as_secs_f32() > 0.0 {
+            let inst_tps = (total_accepted as f32) / tick_elapsed.as_secs_f32();
+            if self.tokens_per_sec_ema == 0.0 {
+                self.tokens_per_sec_ema = inst_tps;
+            } else {
+                self.tokens_per_sec_ema = 0.7 * self.tokens_per_sec_ema + 0.3 * inst_tps;
+            }
+            self.total_tokens_generated += total_accepted as u64;
+        }
         Ok(output)
     }
 
@@ -493,6 +532,11 @@ impl Engine {
         positions: &grim_tensor::Tensor,
     ) -> Result<StepOutcome> {
         self.drive_forward(target_model_id, request_id, input_ids, positions)
+    }
+
+    /// Check if a model is registered by name.
+    pub fn has_model(&self, id: &str) -> bool {
+        self.models.contains_key(id)
     }
 
     pub fn enqueue_request(&mut self, request: grim_scheduler::Request) {
@@ -651,6 +695,18 @@ pub use grim_scheduler::{AdmissionController, Request, Scheduler, SchedulerOutpu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_engine_telemetry_accessors() {
+        let config = EngineConfig::default();
+        let engine = Engine::new(config);
+        assert_eq!(engine.tokens_per_sec(), None);
+        let (used_b, total_b, b_used, b_total) = engine.kv_cache_telemetry();
+        assert_eq!(used_b, 0);
+        assert!(total_b > 0);
+        assert_eq!(b_used, 0);
+        assert!(b_total > 0);
+    }
     use grim_models_transformer::{Llama, LlamaConfig};
     use grim_tensor::Device;
 

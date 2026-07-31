@@ -3,8 +3,371 @@
 //! Provides reverse-mode backward implementations for MatMul, Add, Scale, and fused LoRA application.
 
 use grim_tensor::dtype::{BlockDtype, FloatPackScheme, KQuantScheme};
-use grim_tensor::{DType, Error, Storage, Tensor, error::Result};
+use grim_tensor::{DType, Error, Storage, Tensor, error::Result, Shape};
 use std::sync::Arc;
+
+/// DoRA (Weight-Decomposed LoRA) forward pass.
+///
+/// Implements the weight-decomposed LoRA from the Unsloth/DoRA paper.
+///
+/// Mathematical formulas from the plan spec:
+/// 1. Directional matrix: V = W_0 + γ * B @ A
+/// 2. Column-wise L2 norm for output row i: n_i = ||V[i,:]||_2 = sqrt(sum_j V[i,j]^2 + ε)
+/// 3. Normalized directional matrix: V_hat[i,j] = V[i,j] / n_i
+/// 4. Effective weight: W_eff[i,j] = m_i * V_hat[i,j]
+/// 5. Output for input X: Y = X @ W_eff^T
+///
+/// Returns Y = X @ W_eff^T.
+
+
+
+pub fn dora_forward(
+    x: &Tensor,
+    w_base: &Tensor,
+    a: &Tensor,
+    b: &Tensor,
+    m: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    let dev = crate::pick_device_for_tensor(x);
+
+    // Get shapes
+    let x_dims = x.shape().dims();
+    let w_dims = w_base.shape().dims();
+    let a_dims = a.shape().dims();
+    let b_dims = b.shape().dims();
+    let m_dims = m.shape().dims();
+
+    // Handle batch dimension
+    let batch = if x_dims.len() == 1 { 1 } else { x_dims[0] };
+    let in_features = if x_dims.len() == 1 { x_dims[0] } else { x_dims[1] };
+
+    // Validate dimensions
+    let out_features = w_dims[0];
+    let rank = a_dims[0];
+    let b_out_features = b_dims[0];
+
+    if out_features != b_out_features {
+        return Err(Error::Backend(format!(
+            "DoRA: w_base and b output feature mismatch: {} vs {}",
+            out_features, b_out_features
+        )));
+    }
+    if m_dims[0] != out_features {
+        return Err(Error::Backend(format!(
+            "DoRA: m size {} != out_features {}",
+            m_dims[0], out_features
+        )));
+    }
+    if a_dims[1] != in_features {
+        return Err(Error::Backend(format!(
+            "DoRA: a input feature {} != x input feature {}",
+            a_dims[1], in_features
+        )));
+    }
+
+    // Get data as vectors for CPU computation
+    let x_vec = x.to_vec_f32()?;
+    let w_vec = w_base.to_vec_f32()?;
+    let a_vec = a.to_vec_f32()?;
+    let b_vec = b.to_vec_f32()?;
+    let m_vec = m.to_vec_f32()?;
+
+    // Step 1: Compute BA = B @ A (shape: [out_features, in_features])
+    let mut ba_vec = vec![0.0f32; out_features * in_features];
+    for i in 0..out_features {
+        for j in 0..in_features {
+            let mut sum = 0.0f32;
+            for r in 0..rank {
+                sum += b_vec[i * rank + r] * a_vec[r * in_features + j];
+            }
+            ba_vec[i * in_features + j] = sum;
+        }
+    }
+
+    // Step 2: Compute V = W_0 + scale * BA
+    let v_vec: Vec<f32> = w_vec
+        .iter()
+        .zip(ba_vec.iter())
+        .map(|(&w, &ba)| w + scale * ba)
+        .collect();
+
+    // Step 3: Compute norm vector n_i = sqrt(sum_j V[i,j]^2 + eps)
+    let eps = 1e-8f32;
+    let mut n_vec = vec![0.0f32; out_features];
+    for i in 0..out_features {
+        let mut sum_sq = 0.0f32;
+        for j in 0..in_features {
+            sum_sq += v_vec[i * in_features + j] * v_vec[i * in_features + j];
+        }
+        n_vec[i] = (sum_sq + eps).sqrt();
+    }
+
+    // Step 4: Compute V_hat[i,j] = V[i,j] / n_i
+    let v_hat_vec: Vec<f32> = (0..out_features * in_features)
+        .map(|idx| {
+            let i = idx / in_features;
+            let j = idx % in_features;
+            v_vec[i * in_features + j] / n_vec[i]
+        })
+        .collect();
+
+    // Step 5: Compute W_eff[i,j] = m[i] * V_hat[i,j]
+    let w_eff_vec: Vec<f32> = v_hat_vec
+        .iter()
+        .enumerate()
+        .map(|(idx, &v_hat)| {
+            let i = idx / in_features;
+            m_vec[i] * v_hat
+        })
+        .collect();
+
+    // Step 6: Compute Y = X @ W_eff^T = (X @ W_eff^T)
+    // Output shape: [batch, out_features]
+    let mut y_vec = vec![0.0f32; batch * out_features];
+    for b_idx in 0..batch {
+        for o in 0..out_features {
+            let mut sum = 0.0f32;
+            for i in 0..in_features {
+                sum += x_vec[b_idx * in_features + i] * w_eff_vec[o * in_features + i];
+            }
+            y_vec[b_idx * out_features + o] = sum;
+        }
+    }
+
+    let out_shape = if batch == 1 {
+        Shape::new(vec![out_features])
+    } else {
+        Shape::new(vec![batch, out_features])
+    };
+
+    let storage = dev.from_cpu(&y_vec, &out_shape, DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        out_shape,
+        DType::F32,
+        x.provenance().clone(),
+        x.device().clone(),
+    ))
+}
+
+/// DoRA backward pass.
+///
+/// Computes gradients w.r.t. all inputs:
+/// - ∇W_eff = out_grad^T @ X
+/// - ∇m_i = sum_j (∇W_eff[i,j] * V_hat[i,j])
+/// - ∇V[i,j] = (m_i / n_i) * (∇W_eff[i,j] - V_hat[i,j] * sum_k(∇W_eff[i,k] * V_hat[i,k]))
+/// - ∇B = scale * (∇V @ A^T)
+/// - ∇A = scale * (B^T @ ∇V)
+/// - ∇X = out_grad @ W_eff
+pub fn dora_backward(
+    out_grad: &Tensor,
+    x: &Tensor,
+    w_base: &Tensor,
+    a: &Tensor,
+    b: &Tensor,
+    m: &Tensor,
+    scale: f32,
+) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    let dev = crate::pick_device_for_tensor(x);
+
+    // Get shapes
+    let x_dims = x.shape().dims();
+    let w_dims = w_base.shape().dims();
+    let a_dims = a.shape().dims();
+    let b_dims = b.shape().dims();
+    let m_dims = m.shape().dims();
+
+    // Handle batch dimension
+    let batch = if x_dims.len() == 1 { 1 } else { x_dims[0] };
+    let in_features = if x_dims.len() == 1 { x_dims[0] } else { x_dims[1] };
+
+    let out_features = w_dims[0];
+    let rank = a_dims[0];
+
+    // Get data as vectors
+    let x_vec = x.to_vec_f32()?;
+    let w_vec = w_base.to_vec_f32()?;
+    let a_vec = a.to_vec_f32()?;
+    let b_vec = b.to_vec_f32()?;
+    let m_vec = m.to_vec_f32()?;
+    let g_vec = out_grad.to_vec_f32()?;
+
+    // Recompute V and V_hat (needed for backward) - same as forward
+    let eps = 1e-8f32;
+
+    // Compute BA = B @ A
+    let mut ba_vec = vec![0.0f32; out_features * in_features];
+    for i in 0..out_features {
+        for j in 0..in_features {
+            let mut sum = 0.0f32;
+            for r in 0..rank {
+                sum += b_vec[i * rank + r] * a_vec[r * in_features + j];
+            }
+            ba_vec[i * in_features + j] = sum;
+        }
+    }
+
+    // V = W_0 + scale * BA
+    let v_vec: Vec<f32> = w_vec
+        .iter()
+        .zip(ba_vec.iter())
+        .map(|(&w, &ba)| w + scale * ba)
+        .collect();
+
+    // Compute norm vector n_i
+    let mut n_vec = vec![0.0f32; out_features];
+    for i in 0..out_features {
+        let mut sum_sq = 0.0f32;
+        for j in 0..in_features {
+            sum_sq += v_vec[i * in_features + j] * v_vec[i * in_features + j];
+        }
+        n_vec[i] = (sum_sq + eps).sqrt();
+    }
+
+    // V_hat[i,j] = V[i,j] / n_i
+    let v_hat_vec: Vec<f32> = (0..out_features * in_features)
+        .map(|idx| {
+            let i = idx / in_features;
+            let j = idx % in_features;
+            v_vec[i * in_features + j] / n_vec[i]
+        })
+        .collect();
+
+    // Step 1: ∇W_eff = out_grad^T @ X
+    // out_grad shape: [batch, out_features], X shape: [batch, in_features]
+    // grad_w_eff shape: [out_features, in_features]
+    let mut grad_w_eff_vec = vec![0.0f32; out_features * in_features];
+    for i in 0..out_features {
+        for j in 0..in_features {
+            let mut sum = 0.0f32;
+            for b_idx in 0..batch {
+                sum += g_vec[b_idx * out_features + i] * x_vec[b_idx * in_features + j];
+            }
+            grad_w_eff_vec[i * in_features + j] = sum;
+        }
+    }
+
+    // Step 2: ∇m_i = sum_j (∇W_eff[i,j] * V_hat[i,j])
+    let mut grad_m_vec = vec![0.0f32; out_features];
+    for i in 0..out_features {
+        let mut sum = 0.0f32;
+        for j in 0..in_features {
+            sum += grad_w_eff_vec[i * in_features + j] * v_hat_vec[i * in_features + j];
+        }
+        grad_m_vec[i] = sum;
+    }
+
+    // Step 3: ∇V[i,j] = (m_i / n_i) * (∇W_eff[i,j] - V_hat[i,j] * sum_k(∇W_eff[i,k] * V_hat[i,k]))
+    let mut grad_v_vec = vec![0.0f32; out_features * in_features];
+    for i in 0..out_features {
+        // Compute sum_k(∇W_eff[i,k] * V_hat[i,k])
+        let mut sum_k = 0.0f32;
+        for k in 0..in_features {
+            sum_k += grad_w_eff_vec[i * in_features + k] * v_hat_vec[i * in_features + k];
+        }
+        for j in 0..in_features {
+            grad_v_vec[i * in_features + j] = (m_vec[i] / n_vec[i])
+                * (grad_w_eff_vec[i * in_features + j] - v_hat_vec[i * in_features + j] * sum_k);
+        }
+    }
+
+    // Step 4: ∇B = scale * (∇V @ A^T)
+    // grad_v shape: [out_features, in_features], A shape: [rank, in_features]
+    // grad_b shape: [out_features, rank]
+    let mut grad_b_vec = vec![0.0f32; out_features * rank];
+    for i in 0..out_features {
+        for r in 0..rank {
+            let mut sum = 0.0f32;
+            for j in 0..in_features {
+                sum += grad_v_vec[i * in_features + j] * a_vec[r * in_features + j];
+            }
+            grad_b_vec[i * rank + r] = scale * sum;
+        }
+    }
+
+    // Step 5: ∇A = scale * (B^T @ ∇V)
+    // grad_v shape: [out_features, in_features], B shape: [out_features, rank]
+    // grad_a shape: [rank, in_features]
+    let mut grad_a_vec = vec![0.0f32; rank * in_features];
+    for r in 0..rank {
+        for j in 0..in_features {
+            let mut sum = 0.0f32;
+            for i in 0..out_features {
+                sum += b_vec[i * rank + r] * grad_v_vec[i * in_features + j];
+            }
+            grad_a_vec[r * in_features + j] = scale * sum;
+        }
+    }
+
+    // Step 6: ∇X = out_grad @ W_eff
+    // out_grad shape: [batch, out_features], W_eff shape: [out_features, in_features]
+    // grad_x shape: [batch, in_features]
+    let mut grad_x_vec = vec![0.0f32; batch * in_features];
+    for b_idx in 0..batch {
+        for j in 0..in_features {
+            let mut sum = 0.0f32;
+            for i in 0..out_features {
+                sum += g_vec[b_idx * out_features + i] * grad_w_eff_vec[i * in_features + j];
+            }
+            grad_x_vec[b_idx * in_features + j] = sum;
+        }
+    }
+
+    // Create output tensors
+    let out_shape_x = if batch == 1 {
+        Shape::new(vec![in_features])
+    } else {
+        Shape::new(vec![batch, in_features])
+    };
+    let out_shape_w = Shape::new(w_dims);
+    let out_shape_a = Shape::new(a_dims);
+    let out_shape_b = Shape::new(b_dims);
+    let out_shape_m = Shape::new(m_dims);
+
+    let grad_x = Tensor::new(
+        Arc::from(dev.from_cpu(&grad_x_vec, &out_shape_x, DType::F32)?),
+        out_shape_x,
+        DType::F32,
+        x.provenance().clone(),
+        x.device().clone(),
+    );
+
+    // For DoRA, the base weight w_base is frozen (not trainable), so grad_w_base is zeros
+    // matching the original stub signature: (grad_x, grad_w_base, grad_a, grad_b, grad_m)
+    let z_w_vec = vec![0.0f32; w_vec.len()];
+    let grad_w_base = Tensor::new(
+        Arc::from(dev.from_cpu(&z_w_vec, &out_shape_w, DType::F32)?),
+        out_shape_w.clone(),
+        DType::F32,
+        w_base.provenance().clone(),
+        w_base.device().clone(),
+    );
+
+    let grad_a = Tensor::new(
+        Arc::from(dev.from_cpu(&grad_a_vec, &out_shape_a, DType::F32)?),
+        out_shape_a,
+        DType::F32,
+        a.provenance().clone(),
+        a.device().clone(),
+    );
+    let grad_b = Tensor::new(
+        Arc::from(dev.from_cpu(&grad_b_vec, &out_shape_b, DType::F32)?),
+        out_shape_b,
+        DType::F32,
+        b.provenance().clone(),
+        b.device().clone(),
+    );
+    let grad_m = Tensor::new(
+        Arc::from(dev.from_cpu(&grad_m_vec, &out_shape_m, DType::F32)?),
+        out_shape_m,
+        DType::F32,
+        m.provenance().clone(),
+        m.device().clone(),
+    );
+
+    Ok((grad_x, grad_w_base, grad_a, grad_b, grad_m))
+}
 
 /// Arguments for MatMul backward evaluation.
 #[derive(Debug, Clone)]
@@ -508,6 +871,273 @@ pub fn lora_backward(
     Ok((grad_base, grad_x, grad_a, grad_b))
 }
 
+/// VeRA (Vector-quantized Representation Adaptation) forward pass.
+///
+/// Computes a codebook-quantized low-rank update. `BA = B @ A` is quantized per
+/// output row against a set of scalar codebooks before being applied, so the
+/// effective adaptation only ever reads from a small centroid table.
+///
+/// Steps:
+/// 1. `BA = B @ A`, shape `[d_out, d_in]`.
+/// 2. Each output row `i` is assigned a codebook `q(i) = i % num_codebooks`.
+/// 3. `index_ij = argmin_k |BA[i,j] - codebook[q(i)][k]|` (nearest centroid).
+/// 4. `ĥBA[i,j] = codebook[q(i)][index_ij]`.
+/// 5. `Y = scale * X @ ĥBA^T` (LoRA-style delta; the caller adds the base output).
+pub fn vera_forward(
+    x: &Tensor,
+    a: &Tensor,
+    b: &Tensor,
+    codebook: &[Vec<f32>],
+    scale: f32,
+    num_codebooks: usize,
+) -> Result<Tensor> {
+    let dev = crate::pick_device_for_tensor(x);
+
+    let x_dims = x.shape().dims();
+    let a_dims = a.shape().dims();
+    let b_dims = b.shape().dims();
+
+    let batch = if x_dims.len() == 1 { 1 } else { x_dims[0] };
+    let in_features = if x_dims.len() == 1 { x_dims[0] } else { x_dims[1] };
+    let rank = a_dims[0];
+    let out_features = b_dims[0];
+
+    if codebook.is_empty() || num_codebooks == 0 {
+        return Err(Error::Backend("VeRA: empty codebook set".into()));
+    }
+    if a_dims[1] != in_features || b_dims[1] != rank {
+        return Err(Error::Backend("VeRA: A/B shape mismatch".into()));
+    }
+
+    let x_vec = x.to_vec_f32()?;
+    let a_vec = a.to_vec_f32()?;
+    let b_vec = b.to_vec_f32()?;
+
+    // Step 1: BA = B @ A.
+    let mut ba = vec![0.0f32; out_features * in_features];
+    for i in 0..out_features {
+        for j in 0..in_features {
+            let mut sum = 0.0f32;
+            for r in 0..rank {
+                sum += b_vec[i * rank + r] * a_vec[r * in_features + j];
+            }
+            ba[i * in_features + j] = sum;
+        }
+    }
+
+    // Steps 2-4: nearest-centroid quantization per output row.
+    let ncb = num_codebooks.min(codebook.len());
+    let mut ba_hat = vec![0.0f32; out_features * in_features];
+    for i in 0..out_features {
+        let cb = &codebook[i % ncb];
+        for j in 0..in_features {
+            let v = ba[i * in_features + j];
+            let mut best = 0usize;
+            let mut best_d = f32::INFINITY;
+            for (k, &c) in cb.iter().enumerate() {
+                let d = (v - c).abs();
+                if d < best_d {
+                    best_d = d;
+                    best = k;
+                }
+            }
+            ba_hat[i * in_features + j] = cb[best];
+        }
+    }
+
+    // Step 5: Y = scale * X @ ĥBA^T.
+    let mut y_vec = vec![0.0f32; batch * out_features];
+    for b_idx in 0..batch {
+        for o in 0..out_features {
+            let mut sum = 0.0f32;
+            for j in 0..in_features {
+                sum += x_vec[b_idx * in_features + j] * ba_hat[o * in_features + j];
+            }
+            y_vec[b_idx * out_features + o] = scale * sum;
+        }
+    }
+
+    let out_shape = if batch == 1 {
+        Shape::new(vec![out_features])
+    } else {
+        Shape::new(vec![batch, out_features])
+    };
+    let storage = dev.from_cpu(&y_vec, &out_shape, DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        out_shape,
+        DType::F32,
+        x.provenance().clone(),
+        x.device().clone(),
+    ))
+}
+
+/// VeRA backward pass (straight-through estimator).
+///
+/// The quantize/dequantize step is treated as the identity for gradient flow:
+/// the gradient of the dequantized update `ĥBA` is passed straight through to
+/// `BA`, and from there to `A` and `B`. Codebook centroids receive the gradient
+/// of the elements assigned to them (the "quantize gradient before updating
+/// codebook vectors" rule).
+///
+/// Returns `(grad_base, grad_x, grad_a, grad_b, grad_codebook)` where
+/// `grad_base = out_grad` (base-weight path) and `grad_codebook` has shape
+/// `[num_codebooks, codebook_size]` (flattened centroid gradients per codebook;
+/// all used codebooks must have equal length).
+pub fn vera_backward(
+    out_grad: &Tensor,
+    x: &Tensor,
+    a: &Tensor,
+    b: &Tensor,
+    codebook: &[Vec<f32>],
+    scale: f32,
+) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    let dev = crate::pick_device_for_tensor(x);
+
+    let x_dims = x.shape().dims();
+    let a_dims = a.shape().dims();
+    let b_dims = b.shape().dims();
+    let g_dims = out_grad.shape().dims();
+
+    let batch = if x_dims.len() == 1 { 1 } else { x_dims[0] };
+    let in_features = if x_dims.len() == 1 { x_dims[0] } else { x_dims[1] };
+    let rank = a_dims[0];
+    let out_features = b_dims[0];
+    let g_out = if g_dims.len() == 1 { 1 } else { g_dims[0] };
+
+    if codebook.is_empty() {
+        return Err(Error::Backend("VeRA backward: empty codebook set".into()));
+    }
+    if g_out != batch || g_dims[g_dims.len() - 1] != out_features {
+        return Err(Error::Backend("VeRA backward: out_grad shape mismatch".into()));
+    }
+    if a_dims[1] != in_features || b_dims[1] != rank {
+        return Err(Error::Backend("VeRA backward: A/B shape mismatch".into()));
+    }
+
+    let ncb = codebook.len();
+    let codebook_size = codebook[0].len();
+    if codebook.iter().any(|cb| cb.len() != codebook_size) {
+        return Err(Error::Backend("VeRA backward: ragged codebooks".into()));
+    }
+
+    let x_vec = x.to_vec_f32()?;
+    let a_vec = a.to_vec_f32()?;
+    let b_vec = b.to_vec_f32()?;
+    let g_vec = out_grad.to_vec_f32()?;
+
+    // Recompute BA, ĥBA and centroid assignments (deterministic recompute).
+    let mut ba = vec![0.0f32; out_features * in_features];
+    for i in 0..out_features {
+        for j in 0..in_features {
+            let mut sum = 0.0f32;
+            for r in 0..rank {
+                sum += b_vec[i * rank + r] * a_vec[r * in_features + j];
+            }
+            ba[i * in_features + j] = sum;
+        }
+    }
+    let mut ba_hat = vec![0.0f32; out_features * in_features];
+    let mut assign = vec![0usize; out_features * in_features];
+    for i in 0..out_features {
+        let cb = &codebook[i % ncb];
+        for j in 0..in_features {
+            let v = ba[i * in_features + j];
+            let mut best = 0usize;
+            let mut best_d = f32::INFINITY;
+            for (k, &c) in cb.iter().enumerate() {
+                let d = (v - c).abs();
+                if d < best_d {
+                    best_d = d;
+                    best = k;
+                }
+            }
+            assign[i * in_features + j] = best;
+            ba_hat[i * in_features + j] = cb[best];
+        }
+    }
+
+    // ∇ĥBA[o,j] = scale * Σ_b X[b,j] * out_grad[b,o]. STE: ∇BA = ∇ĥBA.
+    let mut grad_ba = vec![0.0f32; out_features * in_features];
+    for o in 0..out_features {
+        for j in 0..in_features {
+            let mut sum = 0.0f32;
+            for b_idx in 0..batch {
+                sum += x_vec[b_idx * in_features + j] * g_vec[b_idx * out_features + o];
+            }
+            grad_ba[o * in_features + j] = scale * sum;
+        }
+    }
+
+    // ∇B[o,r] = Σ_j ∇BA[o,j] * A[r,j]
+    let mut grad_b = vec![0.0f32; out_features * rank];
+    for o in 0..out_features {
+        for r in 0..rank {
+            let mut sum = 0.0f32;
+            for j in 0..in_features {
+                sum += grad_ba[o * in_features + j] * a_vec[r * in_features + j];
+            }
+            grad_b[o * rank + r] = sum;
+        }
+    }
+
+    // ∇A[r,j] = Σ_o B[o,r] * ∇BA[o,j]
+    let mut grad_a = vec![0.0f32; rank * in_features];
+    for r in 0..rank {
+        for j in 0..in_features {
+            let mut sum = 0.0f32;
+            for o in 0..out_features {
+                sum += b_vec[o * rank + r] * grad_ba[o * in_features + j];
+            }
+            grad_a[r * in_features + j] = sum;
+        }
+    }
+
+    // ∇X[b,j] = scale * Σ_o out_grad[b,o] * ĥBA[o,j]
+    let mut grad_x = vec![0.0f32; batch * in_features];
+    for b_idx in 0..batch {
+        for j in 0..in_features {
+            let mut sum = 0.0f32;
+            for o in 0..out_features {
+                sum += g_vec[b_idx * out_features + o] * ba_hat[o * in_features + j];
+            }
+            grad_x[b_idx * in_features + j] = scale * sum;
+        }
+    }
+
+    // ∇codebook[g][k] = Σ over elements (i,j) assigned to centroid k of codebook g.
+    let mut grad_cb = vec![0.0f32; ncb * codebook_size];
+    for i in 0..out_features {
+        let g = i % ncb;
+        for j in 0..in_features {
+            let k = assign[i * in_features + j];
+            grad_cb[g * codebook_size + k] += grad_ba[i * in_features + j];
+        }
+    }
+
+    let mk = |v: Vec<f32>, shape: &Shape, orig: &Tensor| -> Result<Tensor> {
+        Ok(Tensor::new(
+            Arc::from(dev.from_cpu(&v, shape, DType::F32)?),
+            shape.clone(),
+            DType::F32,
+            orig.provenance().clone(),
+            orig.device().clone(),
+        ))
+    };
+
+    let grad_base = out_grad.clone();
+    let grad_x = mk(grad_x, x.shape(), x)?;
+    let grad_a = mk(grad_a, a.shape(), a)?;
+    let grad_b = mk(grad_b, b.shape(), b)?;
+    let grad_codebook = mk(
+        grad_cb,
+        &Shape::new(vec![ncb, codebook_size]),
+        out_grad,
+    )?;
+
+    Ok((grad_base, grad_x, grad_a, grad_b, grad_codebook))
+}
+
 /// Apply a LoRA adapter to a linear projection output during forward pass and record the operation on `tape`.
 ///
 /// If a LoRA adapter is registered and enabled for `(layer_idx, point)` in `autograd_reg`,
@@ -831,5 +1461,73 @@ mod tests {
         };
         let grad_input = fake_quant_int4_backward(&args, &grad_output).unwrap();
         assert_eq!(grad_input.to_vec_f32().unwrap(), vec![1.0, -1.0, 0.5, 2.0]);
+    }
+
+    // --- VeRA (Phase 9.3) ---
+
+    #[test]
+    fn vera_forward_outputs_quantized_low_rank_delta() {
+        // x: [1, 2], a: [1, 2], b: [3, 1], rank=1, d_in=2, d_out=3.
+        let x = tensor(vec![1.0, 2.0], vec![1, 2]);
+        let a = tensor(vec![0.5, -1.0], vec![1, 2]);
+        let b = tensor(vec![2.0, 1.0, -1.0], vec![3, 1]);
+
+        // BA = B·A = [[1.0, -2.0], [0.5, -1.0], [-0.5, 1.0]].
+        // Codebooks (single codebook of size 2): centroids {-2.0, 1.0}.
+        let codebook = vec![vec![-2.0, 1.0]];
+
+        let y = vera_forward(&x, &a, &b, &codebook, 1.0, 1).unwrap();
+        let data = y.to_vec_f32().unwrap();
+        // BA rows: [1,-2], [0.5,-1], [-0.5,1] → quantized with {-2,1}:
+        //   row0 [1,-2] → [1,-2]; row1 [0.5,-1] → [1,-2]; row2 [-0.5,1] → [-2,1] (tie → first).
+        // Y = x @ ĥBA^T, x=[1,2]: row0 1*1+2*(-2)=-3; row1 -3; row2 1*(-2)+2*1=0.
+        assert_eq!(data, vec![-3.0, -3.0, 0.0]);
+    }
+
+    #[test]
+    fn vera_forward_round_trips_exact_codebook_values() {
+        // When BA values land exactly on centroids, output = exact scaled matmul.
+        let x = tensor(vec![1.0, 2.0], vec![1, 2]);
+        let a = tensor(vec![1.0, 0.0], vec![1, 2]);
+        let b = tensor(vec![3.0], vec![1, 1]);
+        // BA = [[3, 0]]; centroid set {3.0, 0.0} reproduces it exactly.
+        let codebook = vec![vec![3.0, 0.0]];
+        let y = vera_forward(&x, &a, &b, &codebook, 2.0, 1).unwrap();
+        // Y = scale * x @ BA^T = 2 * (1*3 + 2*0) = 6.
+        assert_eq!(y.to_vec_f32().unwrap(), vec![6.0]);
+    }
+
+    #[test]
+    fn vera_backward_returns_five_gradients_with_st_estimator() {
+        let x = tensor(vec![1.0, 2.0], vec![1, 2]);
+        let a = tensor(vec![1.0, 0.0], vec![1, 2]);
+        let b = tensor(vec![3.0], vec![1, 1]);
+        let out_grad = tensor(vec![1.0], vec![1, 1]);
+        let codebook = vec![vec![3.0, 0.0]];
+
+        let (grad_base, grad_x, grad_a, grad_b, grad_cb) =
+            vera_backward(&out_grad, &x, &a, &b, &codebook, 2.0).unwrap();
+
+        // grad_base is a passthrough of out_grad.
+        assert_eq!(grad_base.to_vec_f32().unwrap(), vec![1.0]);
+        // ∇BA = scale * X^T @ G = 2 * [1, 2]^T * 1 = [2, 4].
+        // ∇B = Σ_j ∇BA[j] * A[j] = 2*1 + 4*0 = 2.
+        assert_eq!(grad_b.to_vec_f32().unwrap(), vec![2.0]);
+        // ∇A[j] = B * ∇BA[j] = 3 * [2, 4] = [6, 12].
+        assert_eq!(grad_a.to_vec_f32().unwrap(), vec![6.0, 12.0]);
+        // ∇X = scale * G @ ĥBA = 2 * 1 * [3, 0] = [6, 0].
+        assert_eq!(grad_x.to_vec_f32().unwrap(), vec![6.0, 0.0]);
+        // Centroid 3.0 received ∇BA[0]=2, centroid 0.0 received ∇BA[1]=4.
+        assert_eq!(grad_cb.to_vec_f32().unwrap(), vec![2.0, 4.0]);
+    }
+
+    #[test]
+    fn vera_backward_rejects_ragged_codebooks() {
+        let x = tensor(vec![1.0, 2.0], vec![1, 2]);
+        let a = tensor(vec![1.0, 0.0], vec![1, 2]);
+        let b = tensor(vec![3.0], vec![1, 1]);
+        let out_grad = tensor(vec![1.0], vec![1, 1]);
+        let codebook = vec![vec![3.0, 0.0], vec![1.0]];
+        assert!(vera_backward(&out_grad, &x, &a, &b, &codebook, 1.0).is_err());
     }
 }

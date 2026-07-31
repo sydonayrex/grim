@@ -90,6 +90,15 @@ pub struct StartTrainingRequest {
     /// >1 = RCCL all-reduce across N devices.
     #[serde(default)]
     pub num_gpus: u32,
+    /// PiSSA: initialize adapter A/B via truncated SVD of the base weight.
+    #[serde(default)]
+    pub use_pissa: bool,
+    /// OLoRA: add `olora_lambda * olora_orthogonality_penalty(A, B)` to the loss.
+    #[serde(default)]
+    pub use_olora: bool,
+    /// Weight of the OLoRA orthogonality penalty term.
+    #[serde(default)]
+    pub olora_lambda: f32,
     /// Optionally resume training from a checkpoint sidecar produced by a
     /// prior run. The sidecar must exist at this path on the server and
     /// is validated via `validate_job_path` in the route handler.
@@ -137,6 +146,9 @@ pub struct JobSummary {
     pub model_path: String,
     pub dataset_path: String,
     pub training_mode: TrainingMode,
+    pub use_pissa: bool,
+    pub use_olora: bool,
+    pub olora_lambda: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -335,6 +347,9 @@ async fn list_jobs(State(state): State<AppState>) -> Json<JobsListResponse> {
                     model_path: job.model_path,
                     dataset_path: job.dataset_path,
                     training_mode: job.training_mode,
+                    use_pissa: job.use_pissa,
+                    use_olora: job.use_olora,
+                    olora_lambda: job.olora_lambda,
                 })
             }
         })
@@ -392,6 +407,16 @@ async fn start_training(
             Json(json!({ "error": format!("lora_rank / training_mode: {e}") })),
         ));
     }
+    // OLoRA: refuse a job that enables the orthogonality penalty with a
+    // non-positive weight — the worker only applies the penalty when
+    // `olora_lambda > 0.0`, so accepting `0.0` or negative here would
+    // silently no-op a feature the user asked for.
+    if req.use_olora && req.olora_lambda <= 0.0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "use_olora requires olora_lambda > 0.0" })),
+        ));
+    }
 
     let job = TrainingJob {
         model_path: req.model_path,
@@ -405,7 +430,13 @@ async fn start_training(
         weight_format: req.weight_format,
         preferred_backend: req.preferred_backend.clone(),
         accumulation_steps: req.accumulation_steps,
+        optimizer: grim_autograd::OptimizerKind::AdamW,
+        scheduler: grim_autograd::LRScheduler::Cosine,
+        min_lr: (req.learning_rate * 1e-2).max(1e-10),
         num_gpus: req.num_gpus,
+        use_pissa: req.use_pissa,
+        use_olora: req.use_olora,
+        olora_lambda: req.olora_lambda,
         resume_from_checkpoint: req.resume_from_checkpoint,
         status: crate::jobs::JobStatus::Pending,
         metrics: Vec::new(),
@@ -445,6 +476,9 @@ async fn get_job_status(
             "lora_rank": job.lora_rank,
             "learning_rate": job.learning_rate,
             "epochs": job.epochs,
+            "use_pissa": job.use_pissa,
+            "use_olora": job.use_olora,
+            "olora_lambda": job.olora_lambda,
             "metric_count": job.metrics.len(),
         }))),
         None => Err((
@@ -1215,6 +1249,9 @@ mod tests {
         assert_eq!(parsed.epochs, 1);
         assert!(!parsed.rocm_fusion_rmsnorm_matmul);
         assert!(!parsed.rocm_fusion_qkv_attention);
+        assert!(!parsed.use_pissa);
+        assert!(!parsed.use_olora);
+        assert_eq!(parsed.olora_lambda, 0.0);
     }
 
     #[tokio::test]
