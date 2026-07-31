@@ -898,6 +898,18 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                         let _ = backward(&tape, scaled_grad_tensor, logits_id, &mut autograd_reg.params);
                         accum_loss += scaled_loss_val;
                         if (micro_step + 1) % accumulation_steps as usize == 0 {
+                            if num_gpus > 1 {
+                                let placement_struct = placement.as_ref().map(|p| grim_tensor::backend::ScythePlacement {
+                                    ranks: (0..num_gpus).collect(),
+                                    partition: vec![1.0 / num_gpus as f32; num_gpus],
+                                    routes: p.routes.clone(),
+                                }).unwrap_or_else(|| grim_tensor::backend::ScythePlacement {
+                                    ranks: (0..num_gpus).collect(),
+                                    partition: vec![1.0 / num_gpus as f32; num_gpus],
+                                    routes: vec![grim_tensor::backend::ScytheLink::Host; num_gpus * num_gpus],
+                                });
+                                let _ = autograd_reg.params.all_reduce_grads(backend.device_impl(), &placement_struct);
+                            }
                             let _ = optimizer.step(&mut autograd_reg.params);
                             let _ = autograd_reg.params.zero_all_grads();
                             step_counter += 1;

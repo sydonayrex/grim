@@ -86,6 +86,27 @@ impl StreamingBlockForward {
     /// `positions` carries RoPE position ids for this block (required for correct
     /// positional encoding in loss-eval / reference-model paths). When `None`,
     /// an empty slice is passed (RoPE not applied), matching prior behavior.
+    /// Run streaming forward block for `layer_idx` targeting a SCYTHE-2 assigned GPU device.
+    ///
+    /// If `layer_device` differs from `x.device()`, transfers activation `x` to `layer_device`
+    /// via P2P before running block forward.
+    pub fn forward_block_on_device(
+        &mut self,
+        provider: &dyn TensorProvider,
+        cfg: &LlamaConfig,
+        layer_idx: usize,
+        x: &Tensor,
+        positions: Option<&[u32]>,
+        target_device: &grim_tensor::Device,
+    ) -> Result<Tensor> {
+        let x_target = if x.device() != target_device {
+            let vec_f32 = x.to_vec_f32()?;
+            grim_backend_cpu::cpu_tensor(vec_f32, x.shape().clone())
+        } else {
+            x.clone()
+        };
+        self.forward_block(provider, cfg, layer_idx, &x_target, positions)
+    }
     pub fn forward_block(
         &mut self,
         provider: &dyn TensorProvider,

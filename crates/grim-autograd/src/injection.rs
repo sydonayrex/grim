@@ -9,6 +9,8 @@ use crate::ParamId;
 use grim_tensor::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
+fn default_device() -> grim_tensor::Device { grim_tensor::Device::Cpu }
+
 /// Standard LoRA injection points for QLoRA parity with Unsloth.
 ///
 /// Unsloth applies LoRA to all attention projections (Q/K/V/O) and MLP
@@ -171,6 +173,8 @@ pub struct LoRAInjectionConfig {
     pub codebook_dim: usize,
     /// VeRA: number of scalar codebooks used for quantization.
     pub num_codebooks: usize,
+    #[serde(skip, default = "default_device")]
+    pub target_device: grim_tensor::Device,
 }
 
 impl LoRAInjectionConfig {
@@ -197,6 +201,7 @@ impl LoRAInjectionConfig {
             codebook_size: 256,
             codebook_dim: 1,
             num_codebooks: 1,
+            target_device: grim_tensor::Device::Cpu,
         }
     }
 
@@ -233,6 +238,18 @@ impl LoRAInjectionRegistry {
         Self::default()
     }
 
+    /// Update injection configs with SCYTHE-2 layer-wise GPU device placements.
+    pub fn with_scythe2_placements(
+        mut self,
+        placements: &std::collections::HashMap<usize, grim_tensor::Device>,
+    ) -> Self {
+        for ((layer_idx, _), cfg) in self.configs.iter_mut() {
+            if let Some(dev) = placements.get(layer_idx) {
+                cfg.target_device = dev.clone();
+            }
+        }
+        self
+    }
     pub fn add(&mut self, config: LoRAInjectionConfig) {
         self.configs
             .insert((config.layer_idx, config.injection_point), config);
