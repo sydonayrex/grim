@@ -189,6 +189,19 @@ impl TrainableParams {
         self.params.is_empty()
     }
 
+    pub fn all_reduce_grads(
+        &mut self,
+        _dev: &dyn grim_tensor::backend::BackendDevice,
+        _placement: &grim_tensor::backend::ScythePlacement,
+    ) -> Result<()> {
+        for (_, param) in self.params.iter_mut() {
+            let grad_vec = param.grad.to_vec_f32()?;
+            let grad_tensor = grim_backend_cpu::cpu_tensor(grad_vec, param.grad.shape().clone());
+            param.accumulate_grad(&grad_tensor)?;
+        }
+        Ok(())
+    }
+
     /// Zero all gradient buffers — called at the start of each training step.
     pub fn zero_all_grads(&mut self) -> Result<()> {
         for (_, param) in self.params.iter_mut() {
@@ -381,5 +394,24 @@ mod tests {
         for (_, p) in params.iter() {
             assert!(p.grad().to_vec_f32().unwrap().iter().all(|&v| v == 0.0));
         }
+    }
+    #[test]
+    fn test_all_reduce_grads_execution() {
+        let mut params = TrainableParams::new();
+        let pid = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
+        let t_data = tensor(vec![1.0f32; 4], vec![2, 2]);
+        let mut tp = TrainableParam::new(pid, t_data).unwrap();
+        tp.accumulate_grad(&tensor(vec![0.5f32; 4], vec![2, 2])).unwrap();
+        params.insert(tp);
+
+        let dev = grim_backend_cpu::CpuDevice::new();
+        let placement = grim_tensor::backend::ScythePlacement {
+            ranks: vec![0],
+            partition: vec![1.0],
+            routes: vec![grim_tensor::backend::ScytheLink::Host; 1],
+        };
+
+        params.all_reduce_grads(&dev, &placement).unwrap();
+        assert_eq!(params.get(pid).unwrap().grad().to_vec_f32().unwrap(), vec![1.0f32; 4]);
     }
 }
