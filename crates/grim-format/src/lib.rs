@@ -21,3 +21,4 @@ pub use tokenizer::GgufTokenizer;
 pub use tokenizer::{ChatMessage, render_chat_template, render_messages_or_last};
 pub use convert::{convert_gguf_to_grim, convert_to_grim};
 pub use format::{GrimHeader, GrimTensorEntry, FUCKING_SORCERY};
+pub use onnx::OnnxProvider;

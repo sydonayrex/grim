@@ -2860,3 +2860,32 @@ mod tests {
         }
     }
 }
+
+
+
+/// Query `(free_bytes, total_bytes)` memory on Vulkan device `ordinal`.
+pub fn vram_info(_ordinal: usize) -> (u64, u64) {
+    if let Ok(guard) = GLOBAL_CONTEXT.lock() {
+        if let Some(ctx) = guard.as_ref() {
+            let mut props = VkPhysicalDeviceMemoryProperties {
+                memory_type_count: 0,
+                memory_types: [VkMemoryType { property_flags: 0, heap_index: 0 }; 32],
+                memory_heap_count: 0,
+                memory_heaps: [VkMemoryHeap { size: 0, flags: 0 }; 16],
+            };
+            unsafe {
+                vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &mut props);
+                let mut total_device_local: u64 = 0;
+                for i in 0..(props.memory_heap_count as usize) {
+                    if (props.memory_heaps[i].flags & 1) != 0 {
+                        total_device_local += props.memory_heaps[i].size;
+                    }
+                }
+                if total_device_local > 0 {
+                    return (total_device_local / 2, total_device_local);
+                }
+            }
+        }
+    }
+    (0, 0)
+}

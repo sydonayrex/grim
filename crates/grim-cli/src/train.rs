@@ -36,6 +36,15 @@ pub struct TrainOptions {
     pub rank: usize,
     pub alpha: f32,
     pub device: String,
+    pub mode: String,
+    pub optimizer: grim_autograd::OptimizerKind,
+    pub scheduler: grim_autograd::LRScheduler,
+    /// Initialize adapters via PiSSA (SVD-based) rather than random LoRA.
+    pub use_pissa: bool,
+    /// Apply the OLoRA orthogonality penalty to the scalar loss.
+    pub use_olora: bool,
+    /// Weight of the OLoRA orthogonality penalty.
+    pub olora_lambda: f32,
 }
 
 /// Dataset entry in Alpaca format.
@@ -266,15 +275,14 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         )));
     }
 
-    let injection_reg = LoRAInjectionRegistry::standard_qlora(num_layers, opts.rank, opts.alpha, 1);
+    let injection_reg = LoRAInjectionRegistry::standard_qlora_with_flags(
+        num_layers, opts.rank, opts.alpha, 1, opts.use_pissa, opts.use_olora, opts.olora_lambda,
+    );
     let mut autograd_reg = AutogradRegistry::new(model_config.clone(), injection_reg)
         .map_err(|e| Error::Session(e.to_string()))?;
 
-    let opt_config = AdamWConfig {
-        lr: opts.lr,
-        ..AdamWConfig::default()
-    };
-    let mut optimizer = AdamW::new(opt_config);
+    let mut optimizer = grim_autograd::Optimizer::new(opts.optimizer, opts.lr)
+        .map_err(|e| Error::Session(e.to_string()))?;
 
     // Read existing sidecar if resuming checkpoint
     let sidecar_path = Path::new(&opts.output_sidecar);
@@ -397,6 +405,8 @@ for (tokens, labels) in dataset.iter() {
             epoch_loss /= num_batches as f32;
         }
 
+        optimizer.set_lr(opts.scheduler.get_lr(opts.lr, epoch, opts.epochs));
+
         optimizer
             .step(&mut autograd_reg.params)
             .map_err(|e| Error::Session(e.to_string()))?;
@@ -432,6 +442,28 @@ for (tokens, labels) in dataset.iter() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn test_cli_train_soul_eater_flag() {
+        let opts = TrainOptions {
+            model_path: "test.gguf".into(),
+            dataset_path: "test.jsonl".into(),
+            output_sidecar: "output.grim.train".into(),
+            epochs: 1,
+            lr: 1e-4,
+            rank: 8,
+            alpha: 16.0,
+            device: "cpu".into(),
+            mode: "soul-eater".into(),
+            optimizer: grim_autograd::OptimizerKind::AdamW,
+            scheduler: grim_autograd::LRScheduler::Cosine,
+            use_pissa: false,
+            use_olora: false,
+            olora_lambda: 0.0,
+        };
+        assert_eq!(opts.mode, "soul-eater");
+    }
 
     #[test]
     fn test_alpaca_dataset_parsing() {

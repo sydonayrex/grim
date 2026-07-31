@@ -2469,3 +2469,19 @@ mod tests {
         assert_eq!(res, vec![50.0, 60.0, 10.0, 20.0]);
     }
 }
+
+
+/// Query `(free_bytes, total_bytes)` memory on Metal target.
+pub fn vram_info(_ordinal: usize) -> (u64, u64) {
+    #[cfg(target_vendor = "apple")]
+    {
+        use objc2_metal::MTLCreateSystemDefaultDevice;
+        if let Some(dev) = MTLCreateSystemDefaultDevice() {
+            let max_bytes = dev.recommendedMaxWorkingSetSize();
+            let used_bytes = dev.currentAllocatedSize();
+            let free_bytes = max_bytes.saturating_sub(used_bytes);
+            return (free_bytes as u64, max_bytes as u64);
+        }
+    }
+    (0, 0)
+}

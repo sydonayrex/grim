@@ -49,6 +49,7 @@ unsafe extern "C" {
     fn cudaDeviceSynchronize() -> i32;
     fn cudaGetDeviceCount(count: *mut i32) -> i32;
     fn cudaSetDevice(device: i32) -> i32;
+    fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
 
     fn cublasCreate_v2(handle: *mut *mut c_void) -> i32;
     fn cublasDestroy_v2(handle: *mut c_void) -> i32;
@@ -1718,4 +1719,19 @@ mod tests {
         assert!((res[1] - expected_1).abs() < 1e-4);
         assert!((res[2] - expected_2).abs() < 1e-4);
     }
+}
+
+
+/// Query `(free_bytes, total_bytes)` VRAM via `cudaMemGetInfo`.
+pub fn vram_info(ordinal: usize) -> (u64, u64) {
+    let mut free: usize = 0;
+    let mut total: usize = 0;
+    unsafe {
+        let _ = cudaSetDevice(ordinal as i32);
+        let status = cudaMemGetInfo(&mut free, &mut total);
+        if status != 0 {
+            return (0, 0);
+        }
+    }
+    (free as u64, total as u64)
 }
