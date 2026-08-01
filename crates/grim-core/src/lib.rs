@@ -21,7 +21,7 @@ pub use model::{
 };
 pub use paths::{grim_config_dir, grim_log_dir, grim_models_dir, grim_plugins_dir, home_dir};
 pub use sampler::Sampler;
-pub use session::{Session, DeterminismMode};
+pub use session::{Session, DeterminismMode, GraphBuilder};
 pub use catalog::{ModelEntry, resolve_model_path, list_local_models};
 pub use client::{download_model, download_model_with_progress, DownloadProgress};
 

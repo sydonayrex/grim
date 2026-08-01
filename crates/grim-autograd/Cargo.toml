@@ -14,6 +14,7 @@ grim-backend-rocm = { workspace = true }
 grim-backend-cuda = { workspace = true }
 grim-backend-metal = { workspace = true }
 grim-backend-vulkan = { workspace = true }
+grim-quant = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 
 [features]

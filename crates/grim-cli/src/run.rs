@@ -12,6 +12,9 @@ use grim_tensor::BackendDevice;
 use grim_backend_cpu;
 #[cfg(feature = "rocm")]
 use grim_backend_rocm;
+use grim_backend_cuda;
+use grim_backend_vulkan;
+use grim_backend_metal;
 use grim_format::GgufTokenizer;
 use crate::catalog::resolve_model_path;
 
@@ -36,6 +39,13 @@ fn probe_device() -> (Device, String) {
                 }
                 (Device::Cpu, "cpu".into())
             }
+            "metal" => {
+                let (free, total) = grim_backend_metal::vram_info(0);
+                if total > 0 {
+                    return (Device::Metal(0), "metal:0".into());
+                }
+                (Device::Cpu, "cpu".into())
+            }
             "vulkan" => {
                 if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
                     if !vulkan_devices.is_empty() {
@@ -57,11 +67,33 @@ fn probe_device() -> (Device, String) {
                 ordinal, wavefront, xnack
             );
             (Device::Rocm(ordinal), format!("rocm:{}", ordinal))
-        } else if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
-            if let Some(first) = cuda_devices.first() {
-                let ordinal = first.ordinal();
-                eprintln!("[grim] CUDA GPU {} detected", ordinal);
-                (Device::Cuda(ordinal), format!("cuda:{}", ordinal))
+        } else if let (free, total) = grim_backend_metal::vram_info(0) {
+            // Metal is only available on Apple platforms
+            #[cfg(target_vendor = "apple")]
+            {
+                if total > 0 {
+                    eprintln!("[grim] Metal GPU detected");
+                    return (Device::Metal(0), "metal:0".into());
+                }
+            }
+            // On non-Apple platforms, fall through to CUDA or Vulkan
+            if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
+                if let Some(first) = cuda_devices.first() {
+                    let ordinal = first.ordinal();
+                    eprintln!("[grim] CUDA GPU {} detected", ordinal);
+                    (Device::Cuda(ordinal), format!("cuda:{}", ordinal))
+                } else if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
+                    if !vulkan_devices.is_empty() {
+                        eprintln!("[grim] Vulkan GPU detected");
+                        (Device::Vulkan, "vulkan".into())
+                    } else {
+                        eprintln!("[grim] No GPU detected; using CPU backend.");
+                        (Device::Cpu, "cpu".into())
+                    }
+                } else {
+                    eprintln!("[grim] No GPU detected; using CPU backend.");
+                    (Device::Cpu, "cpu".into())
+                }
             } else if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
                 if !vulkan_devices.is_empty() {
                     eprintln!("[grim] Vulkan GPU detected");
@@ -74,36 +106,79 @@ fn probe_device() -> (Device, String) {
                 eprintln!("[grim] No GPU detected; using CPU backend.");
                 (Device::Cpu, "cpu".into())
             }
-        } else {
-            eprintln!("[grim] No ROCm GPU detected; using CPU backend.");
-            (Device::Cpu, "cpu".into())
+        } else if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
+            if let Some(first) = cuda_devices.first() {
+                let ordinal = first.ordinal();
+                eprintln!("[grim] CUDA GPU {} detected", ordinal);
+                (Device::Cuda(ordinal), format!("cuda:{}", ordinal))
+            } else {
+                #[cfg(target_vendor = "apple")]
+                {
+                    eprintln!("[grim] No CUDA GPU detected; using CPU backend.");
+                }
+                #[cfg(not(target_vendor = "apple"))]
+                {
+                    if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
+                        if !vulkan_devices.is_empty() {
+                            eprintln!("[grim] Vulkan GPU detected");
+                            (Device::Vulkan, "vulkan".into())
+                        } else {
+                            eprintln!("[grim] No GPU detected; using CPU backend.");
+                            (Device::Cpu, "cpu".into())
+                        }
+                    } else {
+                        eprintln!("[grim] No GPU detected; using CPU backend.");
+                        (Device::Cpu, "cpu".into())
+                    }
+                }
+            }
         }
     } else if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
         if let Some(first) = cuda_devices.first() {
             let ordinal = first.ordinal();
             eprintln!("[grim] CUDA GPU {} detected", ordinal);
             (Device::Cuda(ordinal), format!("cuda:{}", ordinal))
-        } else if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
-            if !vulkan_devices.is_empty() {
-                eprintln!("[grim] Vulkan GPU detected");
-                (Device::Vulkan, "vulkan".into())
-            } else {
-                eprintln!("[grim] No GPU detected; using CPU backend.");
-                (Device::Cpu, "cpu".into())
+        } else {
+            // Check Metal on Apple platforms, then Vulkan as fallback
+            #[cfg(target_vendor = "apple")]
+            {
+                let (free, total) = grim_backend_metal::vram_info(0);
+                if total > 0 {
+                    eprintln!("[grim] Metal GPU detected");
+                    return (Device::Metal(0), "metal:0".into());
+                }
             }
-        } else {
-            eprintln!("[grim] No GPU detected; using CPU backend.");
-            (Device::Cpu, "cpu".into())
-        }
-    } else if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
-        if !vulkan_devices.is_empty() {
-            eprintln!("[grim] Vulkan GPU detected");
-            (Device::Vulkan, "vulkan".into())
-        } else {
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
+                    if !vulkan_devices.is_empty() {
+                        eprintln!("[grim] Vulkan GPU detected");
+                        return (Device::Vulkan, "vulkan".into());
+                    }
+                }
+            }
             eprintln!("[grim] No GPU detected; using CPU backend.");
             (Device::Cpu, "cpu".into())
         }
     } else {
+        // Check Metal on Apple platforms first, then Vulkan as fallback
+        #[cfg(target_vendor = "apple")]
+        {
+            let (free, total) = grim_backend_metal::vram_info(0);
+            if total > 0 {
+                eprintln!("[grim] Metal GPU detected");
+                return (Device::Metal(0), "metal:0".into());
+            }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
+                if !vulkan_devices.is_empty() {
+                    eprintln!("[grim] Vulkan GPU detected");
+                    return (Device::Vulkan, "vulkan".into());
+                }
+            }
+        }
         eprintln!("[grim] GPU runtime not available; using CPU backend.");
         (Device::Cpu, "cpu".into())
     }
@@ -467,7 +542,6 @@ pub fn init_generation(
     repeat_penalty: f32,
     max_tokens: usize,
 ) -> Result<GenerationContext> {
-    let prompt = String::new(); // placeholder, not used for init
 
     // Resolve model name to actual file path
     let resolved_path = resolve_model_path(&model_path)

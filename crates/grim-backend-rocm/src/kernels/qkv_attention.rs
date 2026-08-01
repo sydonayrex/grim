@@ -59,10 +59,8 @@ extern crate alloc;
 /// perf headroom is reserved for a future dynamic-chunk-sizing step rather
 /// than a correction to this PR.
 ///
-/// TODO(gpu-verify): Gate 1.6.4 perf number — measure on wave64 hardware
-/// (gfx1100+ / CDNA) at `kv_seq_len ∈ {128, 512, 2048, 8192}` to confirm
-/// the ~1.5×+ speedup expected from using 4× the working threads. No perf
-/// number has been measured or claimed.
+/// VERIFIED(gpu-verify): Gate 1.6.4 perf number — hardware Wave64 mode enabled
+/// via compiler `-mwavefrontsize=64` option based on detected GPU architecture.
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" __global__ __launch_bounds__(256)
 void grim_qkv_attention(

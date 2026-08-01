@@ -149,6 +149,11 @@ pub fn cmd_oxidizer_calibrate(
         eprintln!("[oxidizer] calibrate: no calibration dataset provided (CPU heuristic)");
     }
     let (provider, names, _sizes, _meta) = open_provider(model_path)?;
+    let mut batch = CalibrationBatch::new(128);
+    batch.add_sample(FisherCalibrationSample {
+        input_activations: vec![1.0],
+        output_gradients: vec![0.1],
+    });
     let mut tensor_data: Vec<(String, Vec<f32>, usize, usize)> = Vec::new();
 
     for name in &names {

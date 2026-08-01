@@ -9,7 +9,6 @@ description = "Distributed serving and disaggregation layer for Prefill and Deco
 [dependencies]
 grim-core = { workspace = true }
 grim-kvtransport = { workspace = true }
-grim-tensor = { workspace = true }
 thiserror = { workspace = true }
 
 [features]
