@@ -264,6 +264,7 @@ where
     gamma: usize,
     draft: &'a D,
     target: &'a T,
+    #[allow(dead_code)]
     pickup: &'a P,
     acceptor: TokenAcceptor,
 }
