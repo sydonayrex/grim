@@ -3,7 +3,7 @@
 //! At compile time this script compiles every GLSL compute kernel to real SPIR-V
 //! using `glslangValidator -V` (the same tool documented in `radv_repro.rs`).
 //! The resulting `.spv` blobs are embedded into the crate at compile time via
-//! `include_bytes!`, so `compile_glsl_to_spirv` returns genuine SPIR-V with no
+//! `include_bytes!`, so `spirv_for()` returns genuine SPIR-V with no
 //! runtime dependency on an external compiler.
 //!
 //! All kernels share a single `push_constant` `Params` block so the pipeline

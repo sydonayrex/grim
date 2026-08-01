@@ -16,6 +16,7 @@
 use crate::WavefrontSize;
 use grim_format::gguf::{GrimLayoutHint, GrimMetadata};
 use grim_format::spec::LayoutHintTag;
+use grim_tensor::wavefront::padded_dims;
 
 // Block-major KV layout for attention optimization.
 // In block-major layout, keys/values are stored as [num_blocks, head_dim, block_size]
@@ -151,7 +152,7 @@ impl WavefrontTiledLayout {
     pub fn new(rows: usize, cols: usize, wavefront_size: u32) -> Self {
         let wf = wavefront_size as usize;
         let num_wavefronts = (rows + wf - 1) / wf;
-        let cols_padded = (cols + wf - 1) & !(wf - 1);
+        let cols_padded = padded_dims(0, cols, wavefront_size).1;
         Self { wavefront_size, num_wavefronts, cols_padded }
     }
 
@@ -423,11 +424,11 @@ pub fn align_tensor_for_rocm_gemm(
     wavefront_size: u32,
 ) -> (Vec<f32>, usize, usize) {
     let wf = wavefront_size as usize;
-    
-    // Compute padded dimensions
-    // Rows: pad to wavefront alignment
-    let rows_padded = (rows + wf - 1) & !(wf - 1);
-    // Cols: left unpadded to avoid wasting work and memory
+
+    // Compute padded dimensions via shared wavefront utility.
+    // Rows: pad to wavefront alignment.
+    // Cols: left unpadded to avoid wasting work and memory.
+    let (rows_padded, _) = padded_dims(rows, cols, wavefront_size);
     let cols_padded = cols;
     
     let total_elements = rows_padded * cols_padded;
@@ -477,8 +478,8 @@ pub fn align_quantized_tensor_for_rocm_gemm(
     let rows = shape[0];
     let cols = shape[1];
     
-    // Pad rows to wavefront alignment
-    let rows_padded = (rows + wf - 1) & !(wf - 1);
+    // Pad rows to wavefront alignment via shared wavefront utility
+    let (rows_padded, _) = padded_dims(rows, cols, wavefront_size);
     
     // Calculate new storage requirements - for sub-8-bit formats, we need to handle packing
     let vals_per_byte = if bitwidth >= 8 { 1 } else { 8 / bitwidth as usize };

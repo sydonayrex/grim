@@ -362,6 +362,61 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
+    /// Paged (block-table) attention for KV-cache-serving with paged memory.
+    ///
+    /// Dispatches a paged-attention kernel that reads K/V from page tables
+    /// rather than a contiguous cache. Used by the serving path when the
+    /// KV cache is managed in fixed-size pages (vLLM-style).
+    ///
+    /// `block_tables` is `[batch, max_blocks]` of page indices; `k_pages`/`v_pages`
+    /// are `[num_pages, page_size, num_kv_heads, head_dim]`.
+    ///
+    /// Default: returns `Err(Unimplemented)`. Only backends with a paged
+    /// attention kernel override this.
+    fn qkv_attention_paged(
+        &self,
+        q: &dyn BackendStorage,
+        block_tables: &dyn BackendStorage,
+        k_pages: &dyn BackendStorage,
+        v_pages: &dyn BackendStorage,
+        num_kv_heads: usize,
+        max_blocks: usize,
+        page_size: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (q, block_tables, k_pages, v_pages, num_kv_heads, max_blocks, page_size, kv_seq_len, cache_offset, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "qkv_attention_paged not implemented for this backend".into(),
+        ))
+    }
+
+    /// Tree attention for Speculative Decoding (DSpark / Medusa).
+    ///
+    /// Dispatches a tree-attention kernel that verifies multiple draft
+    /// positions against the target model's KV cache in a single kernel
+    /// launch. `tree_parents` encodes the draft tree structure.
+    ///
+    /// Default: returns `Err(Unimplemented)`. Only backends with a tree
+    /// attention kernel override this.
+    fn tree_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        tree_parents: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (q, k, v, tree_parents, num_kv_heads, kv_seq_len, cache_offset, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "tree_attention not implemented for this backend".into(),
+        ))
+    }
+
     /// All-Reduce collective operation across tensor-parallel devices (§4.1).
     fn all_reduce(
         &self,
@@ -676,12 +731,13 @@ pub struct QuantizedMatmulBackwardResiduals {
 }
 
 impl QuantizedMatmulBackwardResiduals {
-    /// Extract residual and outlier metadata from a tensor's `QuantProvenance`.
+    /// Extract residual and outlier metadata from a `QuantProvenance`.
     ///
     /// Checks if the tensor carries `QuantProvenance::WithResiduals` and populates
     /// bitwidths and byte offsets for backup1 and backup2 residual layers, as well as
-    /// outlier override counts.
-    pub fn from_tensor(tensor: &crate::tensor::Tensor) -> Self {
+    /// outlier override counts. Outlier index/value pointers are left null — they must
+    /// be supplied by the caller from device memory when outliers are actually present.
+    pub fn from_provenance(prov: &QuantProvenance) -> Self {
         if let QuantProvenance::WithResiduals {
             outlier_count,
             backup1_bpw,
@@ -691,7 +747,7 @@ impl QuantizedMatmulBackwardResiduals {
             backup2_codes_offset,
             backup2_scale_offset,
             ..
-        } = tensor.provenance()
+        } = prov
         {
             Self {
                 outlier_count: *outlier_count,
@@ -707,6 +763,11 @@ impl QuantizedMatmulBackwardResiduals {
         } else {
             Self::default()
         }
+    }
+
+    /// Extract residual and outlier metadata from a tensor's `QuantProvenance`.
+    pub fn from_tensor(tensor: &crate::tensor::Tensor) -> Self {
+        Self::from_provenance(&tensor.provenance())
     }
 }
 
@@ -740,6 +801,25 @@ pub trait BackendStorage: Send + Sync {
     /// Backend-private downcast hook. Only backends that own the storage
     /// type call this — see `CpuDevice::a_storage`.
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Device ordinal for this backend instance.
+    ///
+    /// Used by multi-GPU collective operations (RCCL all-reduce, CommFuse)
+    /// to identify which GPU this backend owns. Returns `0` for single-GPU
+    /// or non-RCCL backends.
+    fn device_ordinal(&self) -> u32 {
+        0
+    }
+
+    /// Raw GPU device pointer for this storage, if available.
+    ///
+    /// Returns `Some(ptr)` for GPU-resident storages (ROCm, CUDA, Vulkan, Metal)
+    /// and `None` for CPU storages. Used by multi-GPU collectives (RCCL
+    /// all-reduce, CommFuse) to pass device pointers directly to NCCL/HIP
+    /// without an intermediate host round-trip.
+    fn device_ptr(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -771,5 +851,41 @@ mod tests {
             backup2_scale_offset: 4000,
         };
         assert!(matches!(prov, QuantProvenance::WithResiduals { outlier_count: 42, .. }));
+    }
+
+    #[test]
+    fn test_quantized_matmul_backward_residuals_from_provenance_extracts_fields() {
+        let prov = QuantProvenance::WithResiduals {
+            outlier_count: 7,
+            outlier_indices_offset: 100,
+            outlier_values_offset: 200,
+            backup1_bpw: 8,
+            backup1_codes_offset: 1000,
+            backup1_scale_offset: 2000,
+            backup2_bpw: 2,
+            backup2_codes_offset: 3000,
+            backup2_scale_offset: 4000,
+        };
+        let res = QuantizedMatmulBackwardResiduals::from_provenance(&prov);
+        assert_eq!(res.outlier_count, 7);
+        assert_eq!(res.backup1_bpw, 8);
+        assert_eq!(res.backup1_codes_offset, 1000);
+        assert_eq!(res.backup1_scale_offset, 2000);
+        assert_eq!(res.backup2_bpw, 2);
+        assert_eq!(res.backup2_codes_offset, 3000);
+        assert_eq!(res.backup2_scale_offset, 4000);
+        assert!(res.outlier_indices_ptr.is_null());
+        assert!(res.outlier_values_ptr.is_null());
+    }
+
+    #[test]
+    fn test_quantized_matmul_backward_residuals_from_provenance_no_residuals_default() {
+        let prov = QuantProvenance::GrimNative;
+        let res = QuantizedMatmulBackwardResiduals::from_provenance(&prov);
+        assert_eq!(res.outlier_count, 0);
+        assert_eq!(res.backup1_bpw, 0);
+        assert_eq!(res.backup2_bpw, 0);
+        assert!(res.outlier_indices_ptr.is_null());
+        assert!(res.outlier_values_ptr.is_null());
     }
 }

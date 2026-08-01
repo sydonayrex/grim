@@ -3,25 +3,27 @@
 use clap::{Parser, Subcommand};
 use grim_core::error::Result;
 
-mod run;
-mod bench;
-mod spec;
-mod plugin;
-mod service;
-mod doctor;
-mod oxidizer;
-mod client;
-mod catalog;
-mod train;
-mod verify;
-mod cp;
-mod rm;
-mod stop;
-mod server;
-mod accept;
-mod compat;
-mod start;
-mod show;
+pub mod run;
+pub mod bench;
+pub mod spec;
+pub mod plugin;
+pub mod service;
+pub mod doctor;
+pub mod oxidizer;
+pub mod client;
+pub mod catalog;
+pub mod train;
+pub mod verify;
+pub mod cp;
+pub mod rm;
+pub mod stop;
+pub mod server;
+pub mod accept;
+pub mod compat;
+pub mod start;
+pub mod show;
+
+pub use service::ServiceManager;
 
 /// Grim inference engine CLI.
 #[derive(Parser)]
@@ -822,11 +824,11 @@ async fn main() -> Result<()> {
                     #[cfg(not(target_os = "windows"))]
                     {
                         let _ = config;
-                        let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+                        let _engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
                         println!("[Service] Running background daemon on port 11434");
                         let rt = tokio::runtime::Runtime::new().unwrap();
                         rt.block_on(async {
-                            if let Err(e) = grim_server::serve("127.0.0.1:11434", engine, None).await {
+                            if let Err(e) = server::cmd_server("127.0.0.1:11434", &config, "").await {
                                 eprintln!("[Service] Server failed: {e}");
                             }
                         });

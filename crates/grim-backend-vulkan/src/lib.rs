@@ -1223,126 +1223,6 @@ fn push_params(size: u32, dim: u32, k: u32, n: u32, m: u32, eps: f32) -> [u32; 6
     [size, dim, k, n, m, eps_bits]
 }
 
-pub fn generate_add_glsl(size: usize) -> String {
-    format!(
-        r#"#version 450
-layout(local_size_x = 256) in;
-layout(std430, binding = 0) readonly buffer A {{ float a[]; }};
-layout(std430, binding = 1) readonly buffer B {{ float b[]; }};
-layout(std430, binding = 2) writeonly buffer C {{ float c[]; }};
-void main() {{
-    uint id = gl_GlobalInvocationID.x;
-    if (id >= {size}) return;
-    c[id] = a[id] + b[id];
-}}
-"#
-    )
-}
-
-pub fn generate_mul_glsl(size: usize) -> String {
-    format!(
-        r#"#version 450
-layout(local_size_x = 256) in;
-layout(std430, binding = 0) readonly buffer A {{ float a[]; }};
-layout(std430, binding = 1) readonly buffer B {{ float b[]; }};
-layout(std430, binding = 2) writeonly buffer C {{ float c[]; }};
-void main() {{
-    uint id = gl_GlobalInvocationID.x;
-    if (id >= {size}) return;
-    c[id] = a[id] * b[id];
-}}
-"#
-    )
-}
-
-pub fn generate_silu_mul_glsl(size: usize) -> String {
-    format!(
-        r#"#version 450
-layout(local_size_x = 256) in;
-layout(std430, binding = 0) readonly buffer A {{ float a[]; }};
-layout(std430, binding = 1) readonly buffer B {{ float b[]; }};
-layout(std430, binding = 2) writeonly buffer C {{ float c[]; }};
-void main() {{
-    uint id = gl_GlobalInvocationID.x;
-    if (id >= {size}) return;
-    float gate = a[id];
-    float silu = gate / (1.0 + exp(-gate));
-    c[id] = silu * b[id];
-}}
-"#
-    )
-}
-
-pub fn generate_rms_norm_glsl(size: usize, dim: usize, eps: f32) -> String {
-    format!(
-        r#"#version 450
-layout(local_size_x = 256) in;
-layout(std430, binding = 0) readonly buffer X {{ float x[]; }};
-layout(std430, binding = 1) readonly buffer W {{ float w[]; }};
-layout(std430, binding = 2) writeonly buffer Y {{ float y[]; }};
-void main() {{
-    uint id = gl_GlobalInvocationID.x;
-    if (id >= {size}) return;
-    uint row = id / {dim};
-    uint col = id % {dim};
-    
-    float sum_sq = 0.0;
-    for (uint i = 0; i < {dim}; ++i) {{
-        float val = x[row * {dim} + i];
-        sum_sq += val * val;
-    }}
-    float rms = sqrt(sum_sq / {dim} + {eps});
-    y[id] = (x[id] / rms) * w[col];
-}}
-"#
-    )
-}
-
-pub fn generate_softmax_glsl(size: usize, dim: usize) -> String {
-    format!(
-        r#"#version 450
-layout(local_size_x = 256) in;
-layout(std430, binding = 0) readonly buffer X {{ float x[]; }};
-layout(std430, binding = 1) writeonly buffer Y {{ float y[]; }};
-void main() {{
-    uint id = gl_GlobalInvocationID.x;
-    if (id >= {size}) return;
-    uint row = id / {dim};
-    
-    float max_val = -1e9;
-    for (uint i = 0; i < {dim}; ++i) {{
-        max_val = max(max_val, x[row * {dim} + i]);
-    }}
-    float sum = 0.0;
-    for (uint i = 0; i < {dim}; ++i) {{
-        sum += exp(x[row * {dim} + i] - max_val);
-    }}
-    y[id] = exp(x[id] - max_val) / sum;
-}}
-"#
-    )
-}
-
-pub fn generate_embedding_glsl(num_indices: usize, dim: usize) -> String {
-    format!(
-        r#"#version 450
-layout(local_size_x = 256) in;
-layout(std430, binding = 0) readonly buffer W {{ float w[]; }};
-layout(std430, binding = 1) readonly buffer I {{ uint indices[]; }};
-layout(std430, binding = 2) writeonly buffer Y {{ float y[]; }};
-void main() {{
-    uint id = gl_GlobalInvocationID.x;
-    uint total = {num_indices} * {dim};
-    if (id >= total) return;
-    uint idx_pos = id / {dim};
-    uint col = id % {dim};
-    uint weight_row = indices[idx_pos];
-    y[id] = w[weight_row * {dim} + col];
-}}
-"#
-    )
-}
-
 impl Default for VulkanDevice {
     fn default() -> Self {
         Self::new()
@@ -1433,45 +1313,8 @@ impl BackendDevice for VulkanDevice {
 
         let push = push_params(0, 0, k as u32, n as u32, m as u32, 0.0);
 
-        let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, grid_y, 1, Some(push)) {
-            eprintln!("[Vulkan matmul] GPU dispatch failed ({}); falling back to host simulation", e);
-        } else {
-            dispatch_success = true;
-        }
-
-        // Host fallback simulation
-        if !dispatch_success {
-            let mut mapped_a: *mut c_void = std::ptr::null_mut();
-            let mut mapped_b: *mut c_void = std::ptr::null_mut();
-            let mut mapped_out: *mut c_void = std::ptr::null_mut();
-
-            unsafe {
-                _ = vkMapMemory(ctx.device, a_s.memory, 0, a_s.bytes as VkDeviceSize, 0, &mut mapped_a);
-                _ = vkMapMemory(ctx.device, b_s.memory, 0, b_s.bytes as VkDeviceSize, 0, &mut mapped_b);
-                _ = vkMapMemory(ctx.device, out_storage.memory, 0, out_storage.bytes as VkDeviceSize, 0, &mut mapped_out);
-
-                if !mapped_a.is_null() && !mapped_b.is_null() && !mapped_out.is_null() {
-                    let ptr_a = mapped_a as *const f32;
-                    let ptr_b = mapped_b as *const f32;
-                    let ptr_out = mapped_out as *mut f32;
-                    
-                    for i in 0..m {
-                        for j in 0..n {
-                            let mut sum = 0.0f32;
-                            for p in 0..k {
-                                sum += *ptr_a.add(i * k + p) * *ptr_b.add(p * n + j);
-                            }
-                            *ptr_out.add(i * n + j) = sum;
-                        }
-                    }
-                }
-
-                vkUnmapMemory(ctx.device, a_s.memory);
-                vkUnmapMemory(ctx.device, b_s.memory);
-                vkUnmapMemory(ctx.device, out_storage.memory);
-            }
-        }
+        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, grid_y, 1, Some(push))
+            .map_err(|e| grim_tensor::Error::Backend(format!("Vulkan matmul GPU dispatch failed: {e}")))?;
 
         Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
     }
@@ -1501,37 +1344,8 @@ impl BackendDevice for VulkanDevice {
 
         let push = push_params(size as u32, 0, 0, 0, 0, 0.0);
 
-        let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push)) {
-            eprintln!("[Vulkan add] GPU dispatch failed ({}); falling back to host simulation", e);
-        } else {
-            dispatch_success = true;
-        }
-
-        if !dispatch_success {
-            let mut mapped_a: *mut c_void = std::ptr::null_mut();
-            let mut mapped_b: *mut c_void = std::ptr::null_mut();
-            let mut mapped_out: *mut c_void = std::ptr::null_mut();
-
-            unsafe {
-                _ = vkMapMemory(ctx.device, a_s.memory, 0, a_s.bytes as VkDeviceSize, 0, &mut mapped_a);
-                _ = vkMapMemory(ctx.device, b_s.memory, 0, b_s.bytes as VkDeviceSize, 0, &mut mapped_b);
-                _ = vkMapMemory(ctx.device, out_storage.memory, 0, out_storage.bytes as VkDeviceSize, 0, &mut mapped_out);
-
-                if !mapped_a.is_null() && !mapped_b.is_null() && !mapped_out.is_null() {
-                    let ptr_a = mapped_a as *const f32;
-                    let ptr_b = mapped_b as *const f32;
-                    let ptr_out = mapped_out as *mut f32;
-                    for i in 0..size {
-                        *ptr_out.add(i) = *ptr_a.add(i) + *ptr_b.add(i);
-                    }
-                }
-
-                vkUnmapMemory(ctx.device, a_s.memory);
-                vkUnmapMemory(ctx.device, b_s.memory);
-                vkUnmapMemory(ctx.device, out_storage.memory);
-            }
-        }
+        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push))
+            .map_err(|e| Error::Backend(format!("Vulkan add GPU dispatch failed: {e}")))?;
 
         Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
     }
@@ -1561,37 +1375,8 @@ impl BackendDevice for VulkanDevice {
 
         let push = push_params(size as u32, 0, 0, 0, 0, 0.0);
 
-        let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push)) {
-            eprintln!("[Vulkan mul] GPU dispatch failed ({}); falling back to host simulation", e);
-        } else {
-            dispatch_success = true;
-        }
-
-        if !dispatch_success {
-            let mut mapped_a: *mut c_void = std::ptr::null_mut();
-            let mut mapped_b: *mut c_void = std::ptr::null_mut();
-            let mut mapped_out: *mut c_void = std::ptr::null_mut();
-
-            unsafe {
-                _ = vkMapMemory(ctx.device, a_s.memory, 0, a_s.bytes as VkDeviceSize, 0, &mut mapped_a);
-                _ = vkMapMemory(ctx.device, b_s.memory, 0, b_s.bytes as VkDeviceSize, 0, &mut mapped_b);
-                _ = vkMapMemory(ctx.device, out_storage.memory, 0, out_storage.bytes as VkDeviceSize, 0, &mut mapped_out);
-
-                if !mapped_a.is_null() && !mapped_b.is_null() && !mapped_out.is_null() {
-                    let ptr_a = mapped_a as *const f32;
-                    let ptr_b = mapped_b as *const f32;
-                    let ptr_out = mapped_out as *mut f32;
-                    for i in 0..size {
-                        *ptr_out.add(i) = *ptr_a.add(i) * *ptr_b.add(i);
-                    }
-                }
-
-                vkUnmapMemory(ctx.device, a_s.memory);
-                vkUnmapMemory(ctx.device, b_s.memory);
-                vkUnmapMemory(ctx.device, out_storage.memory);
-            }
-        }
+        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push))
+            .map_err(|e| Error::Backend(format!("Vulkan mul GPU dispatch failed: {e}")))?;
 
         Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
     }
@@ -1621,39 +1406,8 @@ impl BackendDevice for VulkanDevice {
 
         let push = push_params(size as u32, 0, 0, 0, 0, 0.0);
 
-        let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push)) {
-            eprintln!("[Vulkan silu_mul] GPU dispatch failed ({}); falling back to host simulation", e);
-        } else {
-            dispatch_success = true;
-        }
-
-        if !dispatch_success {
-            let mut mapped_gate: *mut c_void = std::ptr::null_mut();
-            let mut mapped_up: *mut c_void = std::ptr::null_mut();
-            let mut mapped_out: *mut c_void = std::ptr::null_mut();
-
-            unsafe {
-                _ = vkMapMemory(ctx.device, gate_s.memory, 0, gate_s.bytes as VkDeviceSize, 0, &mut mapped_gate);
-                _ = vkMapMemory(ctx.device, up_s.memory, 0, up_s.bytes as VkDeviceSize, 0, &mut mapped_up);
-                _ = vkMapMemory(ctx.device, out_storage.memory, 0, out_storage.bytes as VkDeviceSize, 0, &mut mapped_out);
-
-                if !mapped_gate.is_null() && !mapped_up.is_null() && !mapped_out.is_null() {
-                    let ptr_gate = mapped_gate as *const f32;
-                    let ptr_up = mapped_up as *const f32;
-                    let ptr_out = mapped_out as *mut f32;
-                    for i in 0..size {
-                        let g = *ptr_gate.add(i);
-                        let silu = g / (1.0 + (-g).exp());
-                        *ptr_out.add(i) = silu * *ptr_up.add(i);
-                    }
-                }
-
-                vkUnmapMemory(ctx.device, gate_s.memory);
-                vkUnmapMemory(ctx.device, up_s.memory);
-                vkUnmapMemory(ctx.device, out_storage.memory);
-            }
-        }
+        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push))
+            .map_err(|e| Error::Backend(format!("Vulkan silu_mul GPU dispatch failed: {e}")))?;
 
         Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
     }
@@ -1687,46 +1441,8 @@ impl BackendDevice for VulkanDevice {
 
         let push = push_params(size as u32, dim as u32, 0, 0, 0, eps);
 
-        let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push)) {
-            eprintln!("[Vulkan rms_norm] GPU dispatch failed ({}); falling back to host simulation", e);
-        } else {
-            dispatch_success = true;
-        }
-
-        if !dispatch_success {
-            let mut mapped_x: *mut c_void = std::ptr::null_mut();
-            let mut mapped_w: *mut c_void = std::ptr::null_mut();
-            let mut mapped_out: *mut c_void = std::ptr::null_mut();
-
-            unsafe {
-                _ = vkMapMemory(ctx.device, x_s.memory, 0, x_s.bytes as VkDeviceSize, 0, &mut mapped_x);
-                _ = vkMapMemory(ctx.device, w_s.memory, 0, w_s.bytes as VkDeviceSize, 0, &mut mapped_w);
-                _ = vkMapMemory(ctx.device, out_storage.memory, 0, out_storage.bytes as VkDeviceSize, 0, &mut mapped_out);
-
-                if !mapped_x.is_null() && !mapped_w.is_null() && !mapped_out.is_null() {
-                    let ptr_x = mapped_x as *const f32;
-                    let ptr_w = mapped_w as *const f32;
-                    let ptr_out = mapped_out as *mut f32;
-
-                    for i in 0..size {
-                        let row = i / dim;
-                        let col = i % dim;
-                        let mut sum_sq = 0.0f32;
-                        for d in 0..dim {
-                            let val = *ptr_x.add(row * dim + d);
-                            sum_sq += val * val;
-                        }
-                        let rms = (sum_sq / dim as f32 + eps).sqrt();
-                        *ptr_out.add(i) = (*ptr_x.add(i) / rms) * *ptr_w.add(col);
-                    }
-                }
-
-                vkUnmapMemory(ctx.device, x_s.memory);
-                vkUnmapMemory(ctx.device, w_s.memory);
-                vkUnmapMemory(ctx.device, out_storage.memory);
-            }
-        }
+        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push))
+            .map_err(|e| Error::Backend(format!("Vulkan rms_norm GPU dispatch failed: {e}")))?;
 
         Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
     }
@@ -1755,43 +1471,8 @@ impl BackendDevice for VulkanDevice {
 
         let push = push_params(size as u32, dim as u32, 0, 0, 0, 0.0);
 
-        let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push)) {
-            eprintln!("[Vulkan softmax] GPU dispatch failed ({}); falling back to host simulation", e);
-        } else {
-            dispatch_success = true;
-        }
-
-        if !dispatch_success {
-            let mut mapped_x: *mut c_void = std::ptr::null_mut();
-            let mut mapped_out: *mut c_void = std::ptr::null_mut();
-
-            unsafe {
-                _ = vkMapMemory(ctx.device, x_s.memory, 0, x_s.bytes as VkDeviceSize, 0, &mut mapped_x);
-                _ = vkMapMemory(ctx.device, out_storage.memory, 0, out_storage.bytes as VkDeviceSize, 0, &mut mapped_out);
-
-                if !mapped_x.is_null() && !mapped_out.is_null() {
-                    let ptr_x = mapped_x as *const f32;
-                    let ptr_out = mapped_out as *mut f32;
-
-                    for i in 0..size {
-                        let row = i / dim;
-                        let mut max_val = -1e9f32;
-                        for d in 0..dim {
-                            max_val = max_val.max(*ptr_x.add(row * dim + d));
-                        }
-                        let mut sum = 0.0f32;
-                        for d in 0..dim {
-                            sum += (*ptr_x.add(row * dim + d) - max_val).exp();
-                        }
-                        *ptr_out.add(i) = (*ptr_x.add(i) - max_val).exp() / sum;
-                    }
-                }
-
-                vkUnmapMemory(ctx.device, x_s.memory);
-                vkUnmapMemory(ctx.device, out_storage.memory);
-            }
-        }
+        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push))
+            .map_err(|e| Error::Backend(format!("Vulkan softmax GPU dispatch failed: {e}")))?;
 
         Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
     }
@@ -1834,37 +1515,8 @@ impl BackendDevice for VulkanDevice {
 
         let push = push_params(size as u32, dim as u32, 0, 0, 0, 0.0);
 
-        let mut dispatch_success = false;
-        if let Err(e) = run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push)) {
-            eprintln!("[Vulkan embedding] GPU dispatch failed ({}); falling back to host simulation", e);
-        } else {
-            dispatch_success = true;
-        }
-
-        if !dispatch_success {
-            let mut mapped_w: *mut c_void = std::ptr::null_mut();
-            let mut mapped_out: *mut c_void = std::ptr::null_mut();
-
-            unsafe {
-                _ = vkMapMemory(ctx.device, w_s.memory, 0, w_s.bytes as VkDeviceSize, 0, &mut mapped_w);
-                _ = vkMapMemory(ctx.device, out_storage.memory, 0, out_storage.bytes as VkDeviceSize, 0, &mut mapped_out);
-
-                if !mapped_w.is_null() && !mapped_out.is_null() {
-                    let ptr_w = mapped_w as *const f32;
-                    let ptr_out = mapped_out as *mut f32;
-
-                    for i in 0..size {
-                        let idx_pos = i / dim;
-                        let col = i % dim;
-                        let weight_row = indices[idx_pos] as usize;
-                        *ptr_out.add(i) = *ptr_w.add(weight_row * dim + col);
-                    }
-                }
-
-                vkUnmapMemory(ctx.device, w_s.memory);
-                vkUnmapMemory(ctx.device, out_storage.memory);
-            }
-        }
+        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push))
+            .map_err(|e| Error::Backend(format!("Vulkan embedding GPU dispatch failed: {e}")))?;
 
         Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
     }
@@ -2321,67 +1973,6 @@ impl VulkanAutotuner {
     }
 }
 
-/// Simulated CubeCL compilation flow rendering CubeCL #[cube] kernels to Vulkan SPIR-V (SPIR-V assembly string)
-/// §4.1: Full CubeCL #[cube] kernel generation with tile configuration parameters.
-pub fn compile_cube_kernel_to_spirv(m: usize, n: usize, k: usize, config: VulkanTileConfig) -> Vec<u8> {
-    let spirv_assembly = format!(
-        "; SPIR-V\n\
-         ; Version: 1.3\n\
-         ; Generator: CubeCL #[cube] to SPIR-V compiler\n\
-         ; Bound: 42\n\
-         ; Schema: matmul_tiled\n\
-         OpCapability Shader\n\
-         OpMemoryModel Logical GLSL450\n\
-         OpEntryPoint GLCompute %main \"main\"\n\
-         OpExecutionMode %main LocalSize {} {} 1\n\
-         OpDecorate %a RelaxedPrecision\n\
-         OpDecorate %b RelaxedPrecision\n\
-         OpDecorate %c RelaxedPrecision\n\
-         ; Target dimensions: M={}, N={}, K={}\n\
-         ; Tile configuration: block_m={}, block_n={}, block_k={}\n\
-         %uint = OpTypeInt 32 0\n\
-         %float = OpTypeFloat 32\n\
-         %v4float = OpTypeVector %float 4\n\
-         %ptr_uniform_v4float = OpTypePointer Uniform %v4float\n\
-         %ptr_private_float = OpTypePointer Private %float\n\
-         %main = OpFunction %void None %None\n\
-         %entry = OpLabel\n\
-         OpReturn\n\
-         OpFunctionEnd\n",
-        config.block_m, config.block_n, m, n, k, config.block_m, config.block_n, config.block_k
-    );
-    spirv_assembly.into_bytes()
-}
-
-/// Generate actual compute shader source (GLSL) for matmul
-pub fn generate_matmul_glsl(m: usize, n: usize, k: usize, config: VulkanTileConfig) -> String {
-    format!(
-        r#"#version 450
-#extension GL_ARB_compute_shader : enable
-
-layout(local_size_x = {}, local_size_y = {}, local_size_z = 1) in;
-
-layout(std430, binding = 0) readonly buffer BufA {{ float a[]; }};
-layout(std430, binding = 1) readonly buffer BufB {{ float b[]; }};
-layout(std430, binding = 2) writeonly buffer BufC {{ float c[]; }};
-
-void main() {{
-    uint gid_x = gl_GlobalInvocationID.x;
-    uint gid_y = gl_GlobalInvocationID.y;
-    
-    if (gid_x >= {n} || gid_y >= {m}) return;
-    
-    float sum = 0.0;
-    for (uint p = 0; p < {k}; ++p) {{
-        sum += a[gid_y * {k} + p] * b[p * {n} + gid_x];
-    }}
-    c[gid_y * {n} + gid_x] = sum;
-}}
-"#,
-        config.block_m, config.block_n
-    )
-}
-
 include!(concat!(env!("OUT_DIR"), "/spirv_spv.rs"));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2417,13 +2008,6 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::Recip => SPIRV_RECIP,
         VulkanKernel::Rope => SPIRV_ROPE,
     }
-}
-
-pub fn compile_glsl_to_spirv(_glsl_source: &str) -> Result<Vec<u8>> {
-    Err(Error::Backend(
-        "compile_glsl_to_spirv: runtime GLSL compilation is not supported. \
-         Use precompiled kernel blobs from build.rs via spirv_for() instead.".into(),
-    ))
 }
 
 /// Helper function to retrieve the size in bytes of a data type.
@@ -2505,11 +2089,9 @@ mod tests {
         assert_eq!(config.block_m, 64);
         assert_eq!(config.block_n, 64);
 
-        let spirv = compile_cube_kernel_to_spirv(128, 128, 64, config);
+        // Verify a precompiled SPIR-V blob is loadable for the chosen tile size.
+        let spirv = spirv_for(VulkanKernel::Matmul64);
         assert!(!spirv.is_empty());
-        let assembly_string = String::from_utf8(spirv).unwrap();
-        assert!(assembly_string.contains("OpCapability Shader"));
-        assert!(assembly_string.contains("LocalSize 64 64 1"));
     }
 
     #[test]

@@ -63,6 +63,11 @@ struct ShareGptEntry {
 }
 
 /// Pack short dataset token sequences into unified target sequence buffers up to `max_seq_len`.
+///
+/// Concatenates sequences greedily: each output batch is the concatenation of
+/// one or more input sequences, truncated to `max_seq_len`.  When a sequence
+/// does not fit into the current batch, the current batch is flushed and the
+/// sequence starts a new batch (or is truncated if it alone exceeds the limit).
 pub fn pack_dataset_tokens(token_sequences: &[Vec<u32>], max_seq_len: usize) -> Vec<Vec<u32>> {
     let mut packed_batches = Vec::new();
     let mut current_pack = Vec::new();
@@ -85,6 +90,48 @@ pub fn pack_dataset_tokens(token_sequences: &[Vec<u32>], max_seq_len: usize) -> 
         packed_batches.push(current_pack);
     }
     packed_batches
+}
+
+/// Pack aligned `(tokens, labels)` training examples into efficient batches.
+///
+/// Each example is a `(tokens, labels)` pair.  This function greedily packs
+/// consecutive examples into batches of up to `max_seq_len` tokens, keeping
+/// tokens and labels aligned so that the training loop can slice them
+/// identically (`input_ids = tokens[..n-1]`, `targets = labels[1..]`).
+fn pack_training_examples(
+    examples: Vec<(Vec<u32>, Vec<u32>)>,
+    max_seq_len: usize,
+) -> Vec<(Vec<u32>, Vec<u32>)> {
+    let mut packed = Vec::new();
+    let mut cur_tokens = Vec::new();
+    let mut cur_labels = Vec::new();
+
+    for (tokens, labels) in examples {
+        assert_eq!(
+            tokens.len(),
+            labels.len(),
+            "pack_training_examples: token/label length mismatch"
+        );
+        if cur_tokens.len() + tokens.len() <= max_seq_len {
+            cur_tokens.extend_from_slice(&tokens);
+            cur_labels.extend_from_slice(&labels);
+        } else {
+            if !cur_tokens.is_empty() {
+                packed.push((std::mem::take(&mut cur_tokens), std::mem::take(&mut cur_labels)));
+            }
+            if tokens.len() <= max_seq_len {
+                cur_tokens = tokens;
+                cur_labels = labels;
+            } else {
+                cur_tokens = tokens[..max_seq_len].to_vec();
+                cur_labels = labels[..max_seq_len].to_vec();
+            }
+        }
+    }
+    if !cur_tokens.is_empty() {
+        packed.push((cur_tokens, cur_labels));
+    }
+    packed
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,7 +230,7 @@ fn load_dataset(path: &str, tokenizer: &GgufTokenizer, max_seq_len: usize) -> Re
     // Try Alpaca format first (array of {instruction, output})
     if let Ok(entries) = serde_json::from_str::<Vec<AlpacaEntry>>(&content) {
         println!("[grim train] Loaded {} Alpaca entries", entries.len());
-        return entries.iter().map(|e| {
+        let examples: Result<Vec<_>> = entries.iter().map(|e| {
             let prompt = if e.input.is_empty() {
                 format!("### Instruction:\n{}\n\n### Response:\n", e.instruction)
             } else {
@@ -206,14 +253,15 @@ fn load_dataset(path: &str, tokenizer: &GgufTokenizer, max_seq_len: usize) -> Re
                 .into_iter()
                 .chain(tokens[prompt_len..].to_vec())
                 .collect::<Vec<u32>>();
-            Ok((tokens, labels))
-        }).collect::<Result<Vec<_>>>();
+                Ok((tokens, labels))
+        }).collect();
+        return examples.map(|exs| pack_training_examples(exs, max_seq_len));
     }
 
     // Try ShareGPT format (array of {conversations: [{from, value}]})
     if let Ok(entries) = serde_json::from_str::<Vec<ShareGptEntry>>(&content) {
         println!("[grim train] Loaded {} ShareGPT entries", entries.len());
-        return entries.iter().filter_map(|e| {
+        let examples: Vec<_> = entries.iter().filter_map(|e| {
             if e.conversations.len() < 2 { return None; }
             let mut tokens = Vec::new();
             let mut labels = Vec::new();
@@ -233,8 +281,13 @@ fn load_dataset(path: &str, tokenizer: &GgufTokenizer, max_seq_len: usize) -> Re
                 tokens.truncate(max_seq_len);
                 labels.truncate(max_seq_len);
             }
-            Some(Ok((tokens, labels)))
-        }).collect::<Result<Vec<_>>>();
+            if tokens.len() >= 2 {
+                Some((tokens, labels))
+            } else {
+                None
+            }
+        }).collect();
+        return Ok(pack_training_examples(examples, max_seq_len));
     }
 
     Err(Error::Session(format!(

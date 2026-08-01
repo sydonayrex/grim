@@ -370,6 +370,14 @@ impl BackendStorage for CudaStorage {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn device_ordinal(&self) -> u32 {
+        self.ordinal as u32
+    }
+
+    fn device_ptr(&self) -> Option<u64> {
+        self.device_ptr
+    }
 }
 
 /// Wrapper to make cuBLAS FFI types Send + Sync.
@@ -526,6 +534,78 @@ impl CudaDevice {
             if launch_res != 0 {
                 return Err(Error::Backend(format!(
                     "cuLaunchKernel({kernel_name}) failed: {launch_res}"
+                )));
+            }
+        }
+        Ok(Box::new(CudaHandle {
+            completed: Arc::new(Mutex::new(false)),
+        }))
+    }
+
+    /// Launch the fused Q8_0 quantized GEMM kernel on a 2-D grid.
+    ///
+    /// `grim_quantized_matmul_q8_0` computes `out[M,N] = a[M,K] · b_q8[K,N]`
+    /// where `b` is a flat `[N][K]` buffer of signed int8 codes (stored as raw
+    /// bytes) with per-32-element block scales in `b_scales` (a device-side
+    /// F32 buffer of `N * (K / 32)` entries). Rows map to `blockIdx.y`, columns
+    /// to `blockIdx.x`; the kernel requires `K % 32 == 0`. Runs on the default
+    /// stream; returns an async handle.
+    fn launch_quantized_matmul_q8_0(
+        &self,
+        a_ptr: *const c_void,
+        b_ptr: *const c_void,
+        b_scales_ptr: *const c_void,
+        out_ptr: *mut c_void,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+        let mut func: CUfunction = std::ptr::null_mut();
+        unsafe {
+            let func_name = std::ffi::CString::new("grim_quantized_matmul_q8_0")
+                .map_err(|e| Error::Backend(format!("invalid kernel name: {e}")))?;
+            let res = cuModuleGetFunction(&mut func, module, func_name.as_ptr());
+            if res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuModuleGetFunction(grim_quantized_matmul_q8_0) failed: {res}"
+                )));
+            }
+
+            let mut a_arg = a_ptr;
+            let mut b_arg = b_ptr;
+            let mut bs_arg = b_scales_ptr;
+            let mut out_arg = out_ptr;
+            let mut m_arg = m as i32;
+            let mut n_arg = n as i32;
+            let mut k_arg = k as i32;
+            let mut args: [*mut c_void; 7] = [
+                &mut a_arg as *mut *const c_void as *mut c_void,
+                &mut b_arg as *mut *const c_void as *mut c_void,
+                &mut bs_arg as *mut *const c_void as *mut c_void,
+                &mut out_arg as *mut *mut c_void as *mut c_void,
+                &mut m_arg as *mut i32 as *mut c_void,
+                &mut n_arg as *mut i32 as *mut c_void,
+                &mut k_arg as *mut i32 as *mut c_void,
+            ];
+
+            const BLOCK_X: u32 = 32;
+            const BLOCK_Y: u32 = 8;
+            let grid_x = (n as u32).div_ceil(BLOCK_X);
+            let grid_y = (m as u32).div_ceil(BLOCK_Y);
+
+            let launch_res = cuLaunchKernel(
+                func,
+                grid_x, grid_y, 1,
+                BLOCK_X, BLOCK_Y, 1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr() as *mut *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if launch_res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuLaunchKernel(grim_quantized_matmul_q8_0) failed: {launch_res}"
                 )));
             }
         }
@@ -1442,26 +1522,85 @@ impl BackendDevice for CudaDevice {
         b_scales: &[f32],
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let a_vec = a.to_cpu_vec_f32()?;
         let a_dims = a.shape().dims();
         let out_dims = out_shape.dims();
         let m = a_dims[0];
         let k = a_dims[1];
         let n = out_dims[1];
 
+        // Fast path: fused Q8_0 GEMM on GPU. Requires GPU-resident operands,
+        // a K that is a non-zero multiple of 32 (the kernel's fixed block
+        // width), and B packed as `n * k` raw int8 bytes.
+        let a_storage = a.as_any().downcast_ref::<CudaStorage>();
+        let b_storage = b_packed.as_any().downcast_ref::<CudaStorage>();
+        if let (Some(a_storage), Some(b_storage)) = (a_storage, b_storage) {
+            if k >= 32 && k % 32 == 0 && b_storage.bytes() >= k * n {
+                Self::ensure_f32_input("quantized_matmul a", a_storage)?;
+
+                let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+                let a_ptr = Self::dev_ptr_or_err("quantized_matmul a", a_storage)?;
+                let b_ptr = Self::dev_ptr_or_err("quantized_matmul b", b_storage)?;
+                let out_ptr = out_storage
+                    .device_ptr
+                    .ok_or_else(|| {
+                        Error::Backend("quantized_matmul: failed to allocate output buffer".into())
+                    })?
+                    as *mut c_void;
+
+                // Build the full `n * (k/32)` scales buffer. Missing entries
+                // default to 1.0, mirroring the CPU fallback below.
+                let blocks_per_col = k / 32;
+                let scale_len = n * blocks_per_col;
+                let mut scales_host = vec![1.0f32; scale_len];
+                let copy_len = b_scales.len().min(scale_len);
+                scales_host[..copy_len].copy_from_slice(&b_scales[..copy_len]);
+                let scales_storage = CudaStorage::copy_from_host(
+                    &scales_host,
+                    &Shape::new(vec![scale_len]),
+                    DType::F32,
+                    self.ordinal,
+                )?;
+                let scales_ptr = scales_storage
+                    .device_ptr
+                    .ok_or_else(|| {
+                        Error::Backend("quantized_matmul: failed to upload scales buffer".into())
+                    })?
+                    as *const c_void;
+
+                let handle = self.launch_quantized_matmul_q8_0(
+                    a_ptr,
+                    b_ptr,
+                    scales_ptr,
+                    out_ptr,
+                    m,
+                    n,
+                    k,
+                )?;
+                return Ok((Box::new(out_storage), handle));
+            }
+        }
+
+        // Fallback: CPU dequant + matmul. The dequant uses the kernel's Q8_0
+        // convention (`scale * i8`) so both paths agree numerically.
+        let a_vec = a.to_cpu_vec_f32()?;
         let mut b_dequant = vec![0.0f32; k * n];
         let blocks_per_col = k / 32;
 
         let b_bytes = if let Some(ref c_s) = b_packed.as_any().downcast_ref::<CudaStorage>() {
-            let mut host_bytes = vec![0u8; c_s.bytes];
+            let mut host_bytes = vec![0u8; c_s.bytes()];
             if let Some(dev_ptr) = c_s.device_ptr {
                 unsafe {
-                    cudaMemcpy(
+                    let res = cudaMemcpy(
                         host_bytes.as_mut_ptr() as *mut c_void,
                         dev_ptr as *const c_void,
-                        c_s.bytes,
+                        c_s.bytes(),
                         cudaMemcpyDeviceToHost,
                     );
+                    if res != 0 {
+                        return Err(Error::Backend(format!(
+                            "quantized_matmul: cudaMemcpy(B) D2H failed: {res}"
+                        )));
+                    }
                 }
             }
             host_bytes
@@ -1475,8 +1614,8 @@ impl BackendDevice for CudaDevice {
                 let scale = if scale_idx < b_scales.len() { b_scales[scale_idx] } else { 1.0f32 };
                 for i in 0..32 {
                     let byte_offset = (col * blocks_per_col + block) * 32 + i;
-                    let byte_val = if byte_offset < b_bytes.len() { b_bytes[byte_offset] } else { 128u8 };
-                    let q_val = (byte_val as i16 - 128) as f32 / 127.0f32;
+                    let byte_val = if byte_offset < b_bytes.len() { b_bytes[byte_offset] } else { 0u8 };
+                    let q_val = (byte_val as i8) as f32;
                     let r = block * 32 + i;
                     if r < k {
                         b_dequant[r * n + col] = q_val * scale;
@@ -1718,6 +1857,121 @@ mod tests {
         assert!((res[0] - expected_0).abs() < 1e-4);
         assert!((res[1] - expected_1).abs() < 1e-4);
         assert!((res[2] - expected_2).abs() < 1e-4);
+    }
+
+    /// CPU reference for `quantized_matmul` using the kernel's Q8_0 convention:
+    /// `B` is packed as `[col][block][32]` raw int8 codes (equivalently
+    /// `[col][k]` when K is a multiple of 32) and `scales` holds `n * (k/32)`
+    /// per-32-element block scales (missing entries default to 1.0).
+    fn q8_matmul_ref(a: &[f32], b: &[u8], scales: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+        let blocks = k / 32;
+        let mut out = vec![0.0f32; m * n];
+        for mi in 0..m {
+            for ni in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    let blk = p / 32;
+                    let i = p % 32;
+                    if blk >= blocks {
+                        continue;
+                    }
+                    let b_idx = (ni * blocks + blk) * 32 + i;
+                    let q = (b[b_idx] as i8) as f32;
+                    let scale = if ni * blocks + blk < scales.len() {
+                        scales[ni * blocks + blk]
+                    } else {
+                        1.0
+                    };
+                    sum += a[mi * k + p] * (q * scale);
+                }
+                out[mi * n + ni] = sum;
+            }
+        }
+        out
+    }
+
+    fn assert_q8_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        let max_err = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, e)| (a - e).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 1e-3, "Q8_0 quantized matmul max error {max_err} exceeds 1e-3");
+    }
+
+    #[test]
+    fn test_cuda_quantized_matmul_q8_0_gpu_fast_path() {
+        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
+        let devices = CudaDevice::probe().unwrap();
+        let dev = &devices[0];
+
+        let (m, k, n) = (2usize, 256usize, 8usize);
+        let blocks = k / 32;
+        let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
+        let b_bytes: Vec<u8> = (0..k * n).map(|i| ((i * 7) % 251) as u8).collect();
+        let b_scales: Vec<f32> = (0..n * blocks).map(|i| 0.5 + (i as f32 * 0.1).fract()).collect();
+        let expected = q8_matmul_ref(&a_data, &b_bytes, &b_scales, m, k, n);
+
+        let a_shape = Shape::new(vec![m, k]);
+        let b_shape = Shape::new(vec![n, k]);
+        let out_shape = Shape::new(vec![m, n]);
+        let a_dev = dev.from_cpu(&a_data, &a_shape, DType::F32).unwrap();
+        let b_dev = dev.from_cpu_bytes(&b_bytes, &b_shape, DType { arith: ArithType::U8, storage: DTypeStorage::Native }).unwrap();
+
+        let (out, handle) =
+            dev.quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &b_scales, &out_shape).unwrap();
+        handle.synchronize().unwrap();
+        assert_q8_close(&out.to_cpu_vec_f32().unwrap(), &expected);
+    }
+
+    #[test]
+    fn test_cuda_quantized_matmul_q8_0_empty_scales_defaults() {
+        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
+        let devices = CudaDevice::probe().unwrap();
+        let dev = &devices[0];
+
+        let (m, k, n) = (3usize, 64usize, 4usize);
+        let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.03).cos()).collect();
+        let b_bytes: Vec<u8> = (0..k * n).map(|i| ((i * 11) % 256) as u8).collect();
+        let expected = q8_matmul_ref(&a_data, &b_bytes, &[], m, k, n);
+
+        let a_shape = Shape::new(vec![m, k]);
+        let b_shape = Shape::new(vec![n, k]);
+        let out_shape = Shape::new(vec![m, n]);
+        let a_dev = dev.from_cpu(&a_data, &a_shape, DType::F32).unwrap();
+        let b_dev = dev.from_cpu_bytes(&b_bytes, &b_shape, DType { arith: ArithType::U8, storage: DTypeStorage::Native }).unwrap();
+
+        let (out, handle) =
+            dev.quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &[], &out_shape).unwrap();
+        handle.synchronize().unwrap();
+        assert_q8_close(&out.to_cpu_vec_f32().unwrap(), &expected);
+    }
+
+    #[test]
+    fn test_cuda_quantized_matmul_q8_0_cpu_fallback() {
+        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
+        let devices = CudaDevice::probe().unwrap();
+        let dev = &devices[0];
+
+        // K not a multiple of 32 forces the CPU fallback path.
+        let (m, k, n) = (3usize, 34usize, 5usize);
+        let blocks = k / 32;
+        let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.07).cos()).collect();
+        let b_bytes: Vec<u8> = (0..k * n).map(|i| ((i * 13) % 200) as u8).collect();
+        let b_scales: Vec<f32> = (0..n * blocks).map(|i| 1.0 + (i as f32 * 0.25).fract()).collect();
+        let expected = q8_matmul_ref(&a_data, &b_bytes, &b_scales, m, k, n);
+
+        let a_shape = Shape::new(vec![m, k]);
+        let b_shape = Shape::new(vec![n, k]);
+        let out_shape = Shape::new(vec![m, n]);
+        let a_dev = dev.from_cpu(&a_data, &a_shape, DType::F32).unwrap();
+        let b_dev = dev.from_cpu_bytes(&b_bytes, &b_shape, DType { arith: ArithType::U8, storage: DTypeStorage::Native }).unwrap();
+
+        let (out, handle) =
+            dev.quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &b_scales, &out_shape).unwrap();
+        handle.synchronize().unwrap();
+        assert_q8_close(&out.to_cpu_vec_f32().unwrap(), &expected);
     }
 }
 

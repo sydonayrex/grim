@@ -298,6 +298,14 @@ impl BackendStorage for RocmStorage {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn device_ptr(&self) -> Option<u64> {
+        self.device_ptr
+    }
+
+    fn device_ordinal(&self) -> u32 {
+        self.ordinal as u32
+    }
 }
 
 /// Minimal host-side dequantizer for when a quantized tensor needs to be

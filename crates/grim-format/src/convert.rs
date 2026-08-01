@@ -290,6 +290,11 @@ fn dequant_tensor_data(raw: &grim_tensor::RawTensor, elem_count: usize) -> Resul
         grim_tensor::dtype::Storage::GroupInt(cfg) => {
             dequant_group_int_bytes(&raw.bytes, &raw.shape, cfg.bits as u32, cfg.group_size)
         }
+        grim_tensor::dtype::Storage::ResidualPacked(cfg) => Err(Error::Unimplemented(format!(
+            "ResidualPacked (bpw {}) host dequant not implemented: this layout is dequantized \
+             on-the-fly on ROCm only (WI-T8 producer pending)",
+            cfg.bpw
+        ))),
     }
 }
 
@@ -618,6 +623,13 @@ fn pack_tensors(
                         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                         .collect::<Vec<f32>>()
                 })
+            }
+            grim_tensor::dtype::Storage::ResidualPacked(cfg) => {
+                return Err(Error::Unimplemented(format!(
+                    "ResidualPacked (bpw {}) host materialization not implemented: this layout \
+                     is dequantized on-the-fly on ROCm only (WI-T8 producer pending)",
+                    cfg.bpw
+                )));
             }
         };
         
