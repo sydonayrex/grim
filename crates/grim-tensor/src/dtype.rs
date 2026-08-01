@@ -92,6 +92,12 @@ pub enum Storage {
     FloatPack(FloatPackScheme),
     /// Block-quantized formats mapping FP4/NF4/FP8.
     Block(BlockDtype),
+    /// Generic variable-bitwidth packed codes with a per-column uint8 scale,
+    /// optional outlier overrides, and optional backup1/backup2 residual
+    /// layers — the `.grim` native packed + SpQR-residual layout consumed by
+    /// `grim_fused_dequant_gemm_f16` (WI-C / WI-T8). Outlier/backup metadata
+    /// rides in `QuantProvenance::WithResiduals`.
+    ResidualPacked(ResidualPackedConfig),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -163,6 +169,13 @@ pub struct GpuIntConfig {
     /// `false` for EfficientQAT (sequential `g_idx`), `true` for classic GPTQ
     /// with activation ordering.
     pub desc_act: bool,
+}
+
+/// Bitwidth configuration for `Storage::ResidualPacked`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResidualPackedConfig {
+    /// Bitwidth of the packed codes in `RawTensor.bytes`.
+    pub bpw: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

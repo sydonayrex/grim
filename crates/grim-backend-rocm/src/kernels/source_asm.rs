@@ -39,6 +39,7 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::q3k_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::iq_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::fp8_standalone::KERNEL_SOURCE);
+    s.push_str(crate::kernels::fp8_gemm_rdna4::KERNEL_SOURCE);
     s.push_str(crate::kernels::mxfp_standalone::KERNEL_SOURCE);
     s.push_str(crate::kernels::selective_scan::KERNEL_SOURCE);
     s.push_str(crate::kernels::q4k_dequant::KERNEL_SOURCE);
@@ -83,6 +84,7 @@ mod source_asm_self_tests {
         assert!(src.contains("grim_flash_attention"));
         assert!(src.contains("grim_cross_attention"));
         assert!(src.contains("grim_rwkv_time_mix"));
+        assert!(src.contains("grim_fp8_gemm_rdna4"));
     }
 
     /// A.0 regression guard: every shared __device__ helper must be defined

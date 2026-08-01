@@ -179,10 +179,7 @@ pub fn compile_gptq_kernel(kernel_name: &str, source: &str, gcn: &str) -> Result
         _ => "gfx900",
     };
 
-    let options = vec![
-        std::ffi::CString::new("--std=c++14").unwrap(),
-        std::ffi::CString::new(format!("--gpu-target={}", target)).unwrap(),
-    ];
+    let options = crate::device::util::hiprtc_options_for_arch(&target);
     let option_ptrs: Vec<*const i8> = options.iter().map(|c| c.as_ptr()).collect();
 
     let source_cstr = std::ffi::CString::new(source)

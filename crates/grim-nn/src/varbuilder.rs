@@ -437,6 +437,9 @@ fn dequant_to_f32(raw: &RawTensor, dtype: &DType) -> Result<Vec<f32>> {
             BlockDtype::Fp4Block16 => dequant_fp4_block16(&raw.bytes, n),
             BlockDtype::Fp8Block16 => dequant_fp8_block16(&raw.bytes, n),
         },
+        Storage::ResidualPacked(_) => Err(Error::Unimplemented(
+            "dequant_to_f32: ResidualPacked not yet supported".into(),
+        )),
         Storage::GroupInt(cfg) => {
             // Unpack the four parallel arrays from raw.bytes
             let mut cursor = 0;

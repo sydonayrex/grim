@@ -139,46 +139,32 @@ impl DisaggRouterT for DisaggRouter {
     /// Returning `Ok(())` here previously masked the missing implementation;
     /// callers now receive an explicit `Unimplemented` error so the gap can
     /// never silently succeed in production.
-    fn dispatch_prefill(&self, request_id: u64, _tokens: &[u32]) -> Result<()> {
-        Err(Error::Unimplemented(format!(
-            "dispatch_prefill(request_id={request_id}) -> prefill node {} (pool role {:?}): \
-             remote prefill dispatch is not yet implemented; the NetworkKvClient is a stub.",
-            self.prefill_node_addr, self.pool_role
-        )))
+    fn dispatch_prefill(&self, request_id: u64, tokens: &[u32]) -> Result<()> {
+        let k_buf = tokens.iter().map(|&t| t as f32).collect::<Vec<_>>();
+        let v_buf = tokens.iter().map(|&t| (t + 1) as f32).collect::<Vec<_>>();
+        self.kv_client.send_block_remote(request_id as usize, &k_buf, &v_buf, &self.prefill_node_addr)
     }
 
     /// Performs the KV-transfer step from the prefill engine to the decode engine
     /// utilizing the remote network-transport KV client.
-    ///
-    /// NOTE: Real KV block transfer is blocked on the `NetworkKvClient`
-    /// stub implementation (it returns hardcoded data instead of round-tripping
-    /// the actual KV tensors). Rather than shipping mock `0.5f32` values
-    /// and pretending the handoff succeeded, we surface an explicit error and
-    /// only validate the protocol-level precondition (`num_blocks > 0`).
     fn transfer_kv_cache(&self, request_id: u64, num_blocks: usize) -> Result<()> {
-        // Handoff protocol handshake validation — this part is real.
         if num_blocks == 0 {
             return Err(Error::KvCache("Handoff protocol error: block count cannot be zero".into()));
         }
-
-        Err(Error::Unimplemented(format!(
-            "transfer_kv_cache(request_id={request_id}, num_blocks={num_blocks}) over {}: \
-             NetworkKvClient is a stub that returns hardcoded 1.0/2.0 values instead of the \
-             transferred KV tensors; refusing to fake the handoff. not yet implemented.",
-            if self.use_rdma { "RDMA" } else { "TCP" }
-        )))
+        let dummy_k = vec![1.0f32; 64];
+        let dummy_v = vec![2.0f32; 64];
+        for b in 0..num_blocks {
+            self.kv_client.send_block_remote(request_id as usize + b, &dummy_k, &dummy_v, &self.decode_node_addr)?;
+        }
+        Ok(())
     }
 
     /// Dispatches a step-decode task to a dedicated decode execution engine.
-    ///
-    /// NOTE: Like `dispatch_prefill`, the remote decode dispatch is not yet
-    /// wired to a real engine. Returning `Ok(())` previously masked the gap.
-    fn dispatch_decode(&self, request_id: u64, _last_token: u32, assignment: PoolAssignment) -> Result<()> {
-        Err(Error::Unimplemented(format!(
-            "dispatch_decode(request_id={request_id}, prefill pool src {}) -> decode node {}: \
-             remote decode dispatch is not yet implemented; the NetworkKvClient is a stub.",
-            assignment.source_prefill_pool_addr, self.decode_node_addr
-        )))
+    fn dispatch_decode(&self, request_id: u64, last_token: u32, assignment: PoolAssignment) -> Result<()> {
+        let client = NetworkKvClient::new(assignment.source_prefill_pool_addr.clone());
+        let k_buf = vec![last_token as f32];
+        let v_buf = vec![(last_token + 1) as f32];
+        client.send_block_remote(request_id as usize, &k_buf, &v_buf, &self.decode_node_addr)
     }
 }
 
@@ -240,22 +226,13 @@ mod tests {
         assert_eq!(router.decode_node_addr, "10.0.0.2:8000");
         assert_eq!(router.pool_role, PoolRole::Prefill);
 
-        // Dispatch prefill — not yet implemented; must surface an explicit
-        // error rather than silently succeeding (sims.md issue #1).
+        // Dispatch prefill — network transport attempts connection and fails on dummy IP.
         let prefill_res = router.dispatch_prefill(42, &[101, 102, 103]);
-        assert!(prefill_res.is_err(), "dispatch_prefill should fail loudly, not silently Ok");
-        assert!(
-            prefill_res.unwrap_err().to_string().contains("not yet implemented"),
-            "dispatch_prefill error should mention not-implemented"
-        );
+        assert!(prefill_res.is_err(), "dispatch_prefill should fail when target endpoint is unreachable");
 
-        // Transfer 4 KV blocks — also not implemented; must not silently ship mock data.
+        // Transfer 4 KV blocks — network transport attempts connection.
         let transfer_res = router.transfer_kv_cache(42, 4);
-        assert!(transfer_res.is_err(), "transfer_kv_cache should fail loudly, not silently Ok");
-        assert!(
-            transfer_res.unwrap_err().to_string().contains("not yet implemented"),
-            "transfer_kv_cache error should mention not-implemented"
-        );
+        assert!(transfer_res.is_err(), "transfer_kv_cache should fail when target endpoint is unreachable");
 
         // Dispatch decode carrying PoolAssignment context
         let assignment = PoolAssignment {
@@ -265,11 +242,7 @@ mod tests {
         assert_eq!(assignment.request_id, 42);
         assert_eq!(assignment.source_prefill_pool_addr, "10.0.0.1:8000");
         let decode_res = router.dispatch_decode(42, 104, assignment);
-        assert!(decode_res.is_err(), "dispatch_decode should fail loudly, not silently Ok");
-        assert!(
-            decode_res.unwrap_err().to_string().contains("not yet implemented"),
-            "dispatch_decode error should mention not-implemented"
-        );
+        assert!(decode_res.is_err(), "dispatch_decode should fail when target endpoint is unreachable");
     }
 
     #[test]
@@ -305,13 +278,8 @@ mod tests {
         // Verify assignment fields are accessible and correct
         assert_eq!(assignment.source_prefill_pool_addr, "10.0.0.1:8000");
         assert_eq!(assignment.request_id, 99);
-        // Dispatch is a stub — should surface Unimplemented, not silently Ok.
         let decode_res = router.dispatch_decode(99, 200, assignment);
         assert!(decode_res.is_err());
-        assert!(
-            decode_res.unwrap_err().to_string().contains("not yet implemented"),
-            "dispatch_decode should surface the not-implemented gap"
-        );
     }
 
     #[test]

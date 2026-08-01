@@ -92,6 +92,10 @@ struct MetalPipelines {
     matmul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     qkv_attn: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     kv_dequant_attn: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    mul_scalar: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    sqrt: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    recip: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    rope: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 /// Global, lazy-initialized Metal compute context.
@@ -212,6 +216,10 @@ impl MetalContext {
                 matmul: get_pipeline("grim_matmul")?,
                 qkv_attn: get_pipeline("grim_qkv_attention")?,
                 kv_dequant_attn: get_pipeline("grim_kv_dequant_attention")?,
+                mul_scalar: get_pipeline("grim_mul_scalar")?,
+                sqrt: get_pipeline("grim_sqrt")?,
+                recip: get_pipeline("grim_recip")?,
+                rope: get_pipeline("grim_rope")?,
             });
 
             Ok(MetalContext {
@@ -1262,6 +1270,20 @@ impl BackendDevice for MetalDevice {
         scalar: f32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(ref inner) = self.inner {
+                return self.run_unary(
+                    inner,
+                    &inner.pipelines.mul_scalar,
+                    x,
+                    Some(scalar),
+                    out_shape,
+                    Some(1),
+                    3,
+                );
+            }
+        }
         let x_vec = x.to_cpu_vec_f32()?;
         let res: Vec<f32> = x_vec.into_iter().map(|v| v * scalar).collect();
         let out_storage = self.from_cpu(&res, out_shape, x.dtype())?;
@@ -1273,6 +1295,20 @@ impl BackendDevice for MetalDevice {
         x: &dyn BackendStorage,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(ref inner) = self.inner {
+                return self.run_unary(
+                    inner,
+                    &inner.pipelines.sqrt,
+                    x,
+                    None,
+                    out_shape,
+                    None,
+                    2,
+                );
+            }
+        }
         let x_vec = x.to_cpu_vec_f32()?;
         let res: Vec<f32> = x_vec.into_iter().map(|v| v.sqrt()).collect();
         let out_storage = self.from_cpu(&res, out_shape, x.dtype())?;
@@ -1284,6 +1320,20 @@ impl BackendDevice for MetalDevice {
         x: &dyn BackendStorage,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(ref inner) = self.inner {
+                return self.run_unary(
+                    inner,
+                    &inner.pipelines.recip,
+                    x,
+                    None,
+                    out_shape,
+                    None,
+                    2,
+                );
+            }
+        }
         let x_vec = x.to_cpu_vec_f32()?;
         let res: Vec<f32> = x_vec.into_iter().map(|v| 1.0 / v).collect();
         let out_storage = self.from_cpu(&res, out_shape, x.dtype())?;
@@ -1298,6 +1348,90 @@ impl BackendDevice for MetalDevice {
         base: f32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(ref inner) = self.inner {
+                let x_s = x.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+                    Error::Backend("Metal rope: input x is not MetalStorage".into())
+                })?;
+                let x_buf = x_s.buffer.as_ref().ok_or_else(|| Error::Backend("x has no GPU buffer".into()))?;
+
+                let out_storage = self.zeros(out_shape, x.dtype())?;
+                let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                let out_buf = out_s.buffer.as_ref().unwrap();
+
+                let num_tokens = positions.len();
+                let num_heads = (out_shape.elem_count() / (num_tokens * dim)) as i32;
+                let head_dim = dim as i32;
+
+                // Upload positions to a temporary GPU buffer.
+                let pos_data = std::sync::Arc::new(positions.to_vec());
+                let pos_buf = inner.device
+                    .newBufferWithLength_options(
+                        (positions.len() * std::mem::size_of::<u32>()) as u64,
+                        objc2_metal::MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or_else(|| Error::from(MetalError::AllocationFailed("Failed to allocate pos buffer for rope".into())))?;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        pos_data.as_ptr() as *const u8,
+                        pos_buf.contents() as *mut u8,
+                        positions.len() * std::mem::size_of::<u32>(),
+                    );
+                }
+
+                let total = out_shape.elem_count();
+
+                let cmd_buffer = self.get_or_create_command_buffer()?;
+                let encoder = cmd_buffer
+                    .computeCommandEncoder()
+                    .ok_or_else(|| Error::from(MetalError::Ffi("Failed to create compute encoder".into())))?;
+
+                encoder.setComputePipelineState(&inner.pipelines.rope);
+                encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&pos_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+
+                let num_tokens_val = num_tokens as i32;
+                let num_heads_val = num_heads;
+                let head_dim_val = head_dim;
+                let base_val = base;
+
+                unsafe {
+                    encoder.setBytes_length_atIndex(
+                        &num_tokens_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        3,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &num_heads_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        4,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &head_dim_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        5,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &base_val as *const f32 as *const std::ffi::c_void,
+                        4,
+                        6,
+                    );
+                }
+
+                let half_dim = dim / 2;
+                let total_pairs = (total / (half_dim * 2)).max(1);
+                let threads_per_group = MTLSize::new(256, 1, 1);
+                let groups = MTLSize::new(((total_pairs + 255) / 256) as u64, 1, 1);
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
+                encoder.endEncoding();
+
+                return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })));
+            }
+        }
+
+        // CPU fallback for non-Apple targets or when Metal is unavailable.
         let x_vec = x.to_cpu_vec_f32()?;
         let num_tokens = positions.len();
         let num_heads = out_shape.elem_count() / (num_tokens * dim);
@@ -1908,6 +2042,90 @@ impl MetalDevice {
         encoder.endEncoding();
 
         Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })))
+    }
+
+    #[cfg(target_vendor = "apple")]
+    /// Launch a unary GPU kernel (one input, optional scalar, one output).
+    ///
+    /// Used by `mul_scalar`, `sqrt`, `recip`, and `rope`. The MSL kernels
+    /// share a common pattern: one input buffer, one output buffer, a
+    /// scalar parameter (when present), and an element-count constant.
+    ///
+    /// `scalar_binding` is the Metal buffer index for the scalar parameter
+    /// (or `None` if the kernel has no scalar).
+    /// `n_binding` is the Metal buffer index for the element-count constant.
+    fn run_unary(
+        &self,
+        inner: &MetalDeviceInner,
+        pipeline: &Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        input: &dyn BackendStorage,
+        scalar: Option<f32>,
+        out: &Shape,
+        scalar_binding: Option<usize>,
+        n_binding: usize,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let input_s = input.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+            Error::Backend("Metal unary: input is not MetalStorage".into())
+        })?;
+        let input_buf = input_s.buffer.as_ref().ok_or_else(|| Error::Backend("input has no GPU buffer".into()))?;
+
+        let out_storage = self.zeros(out, input.dtype())?;
+        let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+        let out_buf = out_s.buffer.as_ref().unwrap();
+
+        let total = out.elem_count();
+
+        let cmd_buffer = self.get_or_create_command_buffer()?;
+        let encoder = cmd_buffer
+            .computeCommandEncoder()
+            .ok_or_else(|| Error::from(MetalError::Ffi("Failed to create compute encoder".into())))?;
+
+        encoder.setComputePipelineState(pipeline);
+        encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 1);
+
+        let total_val = total as i32;
+        if let Some(s_val) = scalar {
+            if let Some(sb) = scalar_binding {
+                unsafe {
+                    encoder.setBytes_length_atIndex(
+                        &s_val as *const f32 as *const std::ffi::c_void,
+                        4,
+                        sb as u64,
+                    );
+                }
+            }
+        }
+        unsafe {
+            encoder.setBytes_length_atIndex(
+                &total_val as *const i32 as *const std::ffi::c_void,
+                4,
+                n_binding as u64,
+            );
+        }
+
+        let threads_per_group = MTLSize::new(256, 1, 1);
+        let groups = MTLSize::new(((total + 255) / 256) as u64, 1, 1);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
+        encoder.endEncoding();
+
+        Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })))
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    fn run_unary(
+        &self,
+        _input: &dyn BackendStorage,
+        _scalar: Option<f32>,
+        out: &Shape,
+        _scalar_binding: Option<usize>,
+        _n_binding: usize,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = _scalar;
+        let _ = _scalar_binding;
+        let _ = _n_binding;
+        // Non-Apple: no Metal GPU available; caller should fall back to CPU.
+        Err(Error::Backend("Metal unary kernel not available on this platform".into()))
     }
 }
 

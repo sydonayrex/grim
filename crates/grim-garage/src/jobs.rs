@@ -618,6 +618,15 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         id, backend.label
     );
 
+    // SCYTHE-2 WI-6: RCCL all-reduce handle for multi-GPU gradient sync.
+    // Constructed once per job; when num_gpus <= 1 the handle is None and
+    // all_reduce_grads falls back to the CPU-only accumulate path.
+    let rccl_handle = if job.num_gpus > 1 && backend.label == "rocm" {
+        Some(grim_backend_rocm::rccl::RcclAllReduce::new(job.num_gpus as u32))
+    } else {
+        None
+    };
+
     use grim_autograd::{
         AutogradRegistry, AutogradScope, InjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry, Tape,
         backward, cross_entropy_loss,
@@ -912,7 +921,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                                     partition: vec![1.0 / num_gpus as f32; num_gpus],
                                     routes: vec![grim_tensor::backend::ScytheLink::Host; num_gpus * num_gpus],
                                 });
-                                let _ = autograd_reg.params.all_reduce_grads(backend.device_impl(), &placement_struct);
+                                let _ = autograd_reg.params.all_reduce_grads(backend.device_impl(), &placement_struct, rccl_handle.as_ref());
                             }
                             let _ = optimizer.step(&mut autograd_reg.params);
                             let _ = autograd_reg.params.zero_all_grads();

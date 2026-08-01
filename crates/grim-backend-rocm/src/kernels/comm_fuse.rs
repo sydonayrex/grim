@@ -82,6 +82,8 @@ extern "C" __global__ void grim_comm_fuse_p2p_epilogue(
 /// Contains the assembled output on the primary rank (rank 0). Callers that
 /// need the result on all ranks must broadcast separately (not needed for
 /// RowParallelLinear whose output is consumed locally).
+#[repr(C)]
+#[derive(Debug, Clone)]
 pub struct CommFuseResult {
     /// Assembled output data (CPU-side f32 slice).
     pub data: Vec<f32>,

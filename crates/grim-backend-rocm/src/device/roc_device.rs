@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::collections::HashMap;
 
-use grim_tensor::backend::{ComputeHandle, ReadyHandle};
+use grim_tensor::backend::{ComputeHandle, ReadyHandle, ScythePlacement};
 use grim_tensor::dtype::{DType, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{ArithType, BackendDevice, BackendStorage, Shape};
@@ -2199,6 +2199,55 @@ impl BackendDevice for RocmDevice {
                 )?;
                 self.launch_fused_dequant_gemm_mxfp8(a_storage, b_storage, &dummy_exps, &out_storage, m, n, k)?;
             }
+            DTypeStorage::ResidualPacked(cfg) => {
+                // Generic variable-bitwidth packed + residual layout (WI-C / WI-T8):
+                // row-aligned packed codes, per-column uint8 scale, optional outlier
+                // overrides, optional backup1 residual layer. Dequantized on-the-fly
+                // into an F16 output by `grim_fused_dequant_gemm_f16`. Mirrors the
+                // decode-GEMM gating pattern: config `enabled` + shape guard, not a
+                // bare `true`.
+                if !self.fused_dequant_gemm_config.lock().unwrap().enabled {
+                    return self.matmul(a, b_packed, out_shape);
+                }
+                let out_f16 = RocmStorage::alloc_gpu(
+                    out_shape,
+                    DType {
+                        arith: ArithType::F16,
+                        storage: DTypeStorage::Native,
+                    },
+                    &self.allocator,
+                    self.ordinal,
+                )?;
+                let residuals = grim_tensor::QuantizedMatmulBackwardResiduals::from_provenance(
+                    &b_storage.provenance(),
+                );
+                // `from_provenance` leaves outlier pointers null by contract, so
+                // outlier-carrying tensors cannot be fed to the kernel safely here;
+                // fall back to the dense path rather than deref null device memory.
+                if residuals.outlier_count > 0 {
+                    return self.matmul(a, b_packed, out_shape);
+                }
+                // The kernel treats a null scale pointer as scale=1.0; residuals'
+                // outlier/backup pointers come from device memory when present.
+                let stream = self.launch_fused_dequant_gemm_f16(
+                    a_storage,
+                    b_storage,
+                    std::ptr::null(),
+                    &out_f16,
+                    m,
+                    n,
+                    k,
+                    cfg.bpw,
+                    residuals.outlier_count,
+                    residuals.outlier_indices_ptr,
+                    residuals.outlier_values_ptr,
+                    residuals.backup1_bpw,
+                    residuals.backup1_codes_offset,
+                    residuals.backup1_scale_offset,
+                )?;
+                let handle: Box<dyn ComputeHandle> = Box::new(RocmHandle::new(Some(stream)));
+                return Ok((Box::new(out_f16), handle));
+            }
             _ => {
                 return self.matmul(a, b_packed, out_shape);
             }
@@ -2870,6 +2919,174 @@ impl BackendDevice for RocmDevice {
         }
         flops / peak * 1e3 // ms
     }
+
+    /// SCYTHE-2 WI-6: CommFuse decomposed P2P fan-in override.
+    ///
+    /// Delegates to `crate::comm_fuse::comm_fuse_fan_in` which orchestrates
+    /// the T0/T1/T2 transport tiers based on the placement's route matrix.
+    /// The partials are expected to be already host-visible (fetched from
+    /// GPU via `to_cpu_vec_f32` by the caller), matching the current
+    /// `comm_fuse_fan_in` contract.
+    fn comm_fuse_reduce(
+        &self,
+        partials: &[(&dyn BackendStorage, &ScythePlacement)],
+    ) -> Result<Box<dyn BackendStorage>> {
+        if partials.is_empty() {
+            return Err(Error::Backend("comm_fuse_reduce: no partials".into()));
+        }
+        // Fetch each partial's host-visible data plus its column shard width.
+        // The column width is derived from the output shape: the first
+        // partial's column count is its shape's last dimension; subsequent
+        // partials must match (validated by the caller's shard computation).
+        let m = partials[0].0.shape().dims()[0];
+        let n_shard = partials[0].0.shape().dims().get(1).copied().unwrap_or(0);
+        let n_total: usize = partials.iter().map(|(s, _)| s.shape().dims().get(1).copied().unwrap_or(0)).sum();
+
+        // Collect host-visible data as flat f32 slices; the fan-in orchestrator
+        // operates on borrowed slices so we keep the Vecs alive alongside.
+        let mut host_data: Vec<Vec<f32>> = Vec::with_capacity(partials.len());
+        let mut n_cols_list: Vec<usize> = Vec::with_capacity(partials.len());
+        for (storage, _placement) in partials {
+            let data = storage.to_cpu_vec_f32()?;
+            let n_cols = storage.shape().dims().get(1).copied().unwrap_or(0);
+            host_data.push(data);
+            n_cols_list.push(n_cols);
+        }
+        // Build the borrowed-slice view expected by comm_fuse_fan_in.
+        let slice_refs: Vec<(&[f32], usize)> = host_data
+            .iter()
+            .zip(n_cols_list.iter())
+            .map(|(d, &nc)| (d.as_slice(), nc))
+            .collect();
+
+        let result = crate::kernels::comm_fuse::comm_fuse_fan_in(
+            &slice_refs,
+            m,
+            n_total,
+            &partials[0].1, // placement from first partial (all share the same placement)
+        )?;
+
+        // Upload the assembled result back to GPU storage.
+        let out_shape = Shape::from_slice(&[result.shape.0, result.shape.1]);
+        let out_storage = self.from_cpu(&result.data, &out_shape, DType::F32)?;
+        Ok(out_storage)
+    }
+
+    /// SCYTHE-2 WI-5: Paged attention override.
+    ///
+    /// Delegates to `crate::launch_paged_attention` which dispatches the
+    /// JIT-compiled `grim_qkv_attention_paged` HIP kernel for multi-query
+    /// attention with paged KV blocks.
+    fn qkv_attention_paged(
+        &self,
+        q: &dyn BackendStorage,
+        block_tables: &dyn BackendStorage,
+        k_pages: &dyn BackendStorage,
+        v_pages: &dyn BackendStorage,
+        num_kv_heads: usize,
+        max_blocks: usize,
+        page_size: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_s = as_rocm(q)?;
+        let bt_s = as_rocm(block_tables)?;
+        let k_s = as_rocm(k_pages)?;
+        let v_s = as_rocm(v_pages)?;
+
+        if !q_s.device_ptr_is_valid() || !bt_s.device_ptr_is_valid()
+            || !k_s.device_ptr_is_valid() || !v_s.device_ptr_is_valid()
+        {
+            return Err(Error::Backend(
+                "qkv_attention_paged: inputs lack a valid device pointer".into(),
+            ));
+        }
+
+        let out_dims = out_shape.dims();
+        let batch = out_dims[0];
+        let num_heads = out_dims[1];
+        let head_dim = out_dims[2];
+
+        let mut storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+
+        crate::launch_paged_attention(
+            self,
+            q_s,
+            bt_s,
+            k_s,
+            v_s,
+            &mut storage,
+            batch as u32,
+            num_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            max_blocks as u32,
+            page_size as u32,
+            kv_seq_len as u32,
+            cache_offset,
+        )?;
+
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
+    }
+
+    /// SCYTHE-2 WI-5: Tree attention override.
+    ///
+    /// Delegates to `crate::launch_tree_attention` which dispatches the
+    /// JIT-compiled `grim_tree_attention` HIP kernel for speculative
+    /// decoding tree verification.
+    fn tree_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        tree_parents: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_s = as_rocm(q)?;
+        let k_s = as_rocm(k)?;
+        let v_s = as_rocm(v)?;
+        let tp_s = as_rocm(tree_parents)?;
+
+        if !q_s.device_ptr_is_valid()
+            || !k_s.device_ptr_is_valid()
+            || !v_s.device_ptr_is_valid()
+            || !tp_s.device_ptr_is_valid()
+        {
+            return Err(Error::Backend(
+                "tree_attention: an input lacks a valid device pointer".into(),
+            ));
+        }
+
+        let out_dims = out_shape.dims();
+        let batch = out_dims[0];
+        let one_plus_gamma = out_dims[1];
+        let num_heads = out_dims[2];
+        let head_dim = out_dims[3];
+
+        let mut storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+
+        crate::launch_tree_attention(
+            self,
+            q_s,
+            k_s,
+            v_s,
+            tp_s,
+            &mut storage,
+            batch as u32,
+            num_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            one_plus_gamma as u32,
+            kv_seq_len as u32,
+            cache_offset,
+        )?;
+
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(self.active_stream())))))
+    }
 }
 
 // to `device::gemm_tuning` — see that module.
@@ -3002,9 +3219,56 @@ impl RocmDevice {
     }
 
 
-    /// TODO(WI-C): Kernel + config exist; wire dispatch in matmul path when enabled.
-    /// Launch the JIT compiled fused dequantization matmul kernel (WI-C).
+    /// Launch the standalone FP8 GEMM kernel (gfx1200+ native MFMA,
+    /// gfx1100 F16 MFMA fallback, scalar on older arches).
+    ///
+    /// Both inputs are pre-materialised F32; the kernel performs a
+    /// tiled 16×16 GEMM using architecture-appropriate MFMA intrinsics
+    /// where available.
     #[allow(dead_code)]
+    pub(crate) fn launch_fp8_gemm_rdna4(
+        &self,
+        a_storage: &RocmStorage,
+        b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage.device_ptr.ok_or_else(|| Error::Backend("fp8_gemm_rdna4: a has no device ptr".into()))?;
+        let b_ptr = b_storage.device_ptr.ok_or_else(|| Error::Backend("fp8_gemm_rdna4: b has no device ptr".into()))?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| Error::Backend("fp8_gemm_rdna4: out has no device ptr".into()))?;
+
+        // 16×16 tiling: one thread per output element, tile = 16 threads
+        const TILE: usize = 16;
+        let grid_x = ((n + TILE - 1) / TILE) as u32;
+        let grid_y = ((m + TILE - 1) / TILE) as u32;
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+        let block_dim = HipDim3::new(TILE as u32, TILE as u32, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_fp8_gemm_rdna4",
+            grid_dim,
+            block_dim,
+            &mut [arg(&mut aptr), arg(&mut bptr), arg(&mut optr), arg(&mut mm), arg(&mut nn), arg(&mut kk)],
+        )
+    }
+
+    /// Launch the JIT compiled fused dequantization GEMM kernel for
+    /// generic variable-bitwidth packed weights (WI-C / WI-T8).
+    ///
+    /// `b_storage` is `Storage::ResidualPacked`: row-aligned packed codes
+    /// with an optional per-column uint8 scale, optional outlier overrides,
+    /// and an optional backup1 residual layer (SpQR-style). A null
+    /// `b_scales_ptr` means scale=1.0. Outlier/backup metadata is sourced
+    /// from `QuantProvenance::WithResiduals`.
     pub(crate) fn launch_fused_dequant_gemm_f16(
         &self,
         a_storage: &RocmStorage,

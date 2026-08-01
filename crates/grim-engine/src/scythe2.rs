@@ -408,18 +408,61 @@ impl C2plrController {
     /// Called every optimizer step (not every micro-batch) to update the
     /// Lagrangian dual variable and the MLP weights with a simple gradient
     /// estimate (scythe2.md §4 Pillar 4).
-    pub fn update(&mut self, observed_latency_ms: f64, _placements: &[ScythePlacement]) {
+    pub fn update(&mut self, observed_latency_ms: f64, placements: &[ScythePlacement]) {
         // Lagrangian dual ascent: λ ← λ + α(t̂_total - T_budget).
         // The step size α = 0.01 is the standard dual-ascent learning rate;
         // larger values oscillate, smaller values converge too slowly for
         // the ~100 ms capability-epoch cadence (scythe2.md §3.6).
         const DUAL_STEP_SIZE: f64 = 0.01;
+        const MLP_LR: f32 = 0.001;
         let constraint_violation = observed_latency_ms - self.budget_ms;
         self.lambda = (self.lambda + DUAL_STEP_SIZE * constraint_violation).max(0.0);
-        // MLP weight update is a stub here — in production, the autograd tape
-        // from grim-autograd computes ∂L/∂θ and updates theta_w1/theta_w2.
-        // The structure (dual ascent + Gumbel-Softmax + STE) is the same as
-        // TriRoute (`2607.06601` §3.3).
+
+        // ── MLP gradient step (scythe2.md §4 Pillar 4) ────────────────────────
+        // Approximate policy gradient: penalise weights that led to placements
+        // on GPUs contributing to budget overruns, weighted by the violation
+        // magnitude. When λ is high (chronic overruns), the penalty scales up,
+        // pushing the MLP toward lower-latency placements.
+        let penalty = (self.lambda * constraint_violation.abs().max(0.0)) as f32;
+        if penalty > 0.0 && !placements.is_empty() {
+            // Build a per-GPU blame signal: GPUs that appear more often in the
+            // placements get a larger gradient push. This is a REINFORCE-style
+            // credit assignment without the full autograd tape — the controller
+            // runs online and must be lightweight.
+            let mut gpu_blame = vec![0.0f32; self.num_gpus];
+            for p in placements {
+                for &rank in &p.ranks {
+                    if rank < gpu_blame.len() {
+                        gpu_blame[rank] += 1.0;
+                    }
+                }
+            }
+            let total_blame: f32 = gpu_blame.iter().sum();
+            if total_blame > 0.0 {
+                // Normalise blame and apply as gradient noise to W2 columns
+                // that correspond to placement logits. This nudges the MLP
+                // output distribution away from the over-used GPUs.
+                let hidden_dim = self.hidden_dim;
+                let output_dim = self.num_gpus + self.num_gpus + 3;
+                for (oi, &blame) in gpu_blame.iter().enumerate() {
+                    if oi >= output_dim {
+                        break;
+                    }
+                    let grad = -penalty * blame / total_blame;
+                    for hi in 0..hidden_dim {
+                        let wi = oi * hidden_dim + hi;
+                        if wi < self.theta_w2.len() {
+                            self.theta_w2[wi] += MLP_LR * grad;
+                        }
+                    }
+                }
+                // Also apply a small weight-decay regularisation to W1 to
+                // prevent unbounded growth of the hidden representation.
+                for w in self.theta_w1.iter_mut() {
+                    *w *= 1.0 - MLP_LR * 0.01;
+                }
+            }
+        }
     }
 
     /// Notify the cache that a GPU left the farm (mode-B safety, §3.5).

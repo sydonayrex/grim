@@ -191,9 +191,41 @@ impl TrainableParams {
 
     pub fn all_reduce_grads(
         &mut self,
-        _dev: &dyn grim_tensor::backend::BackendDevice,
-        _placement: &grim_tensor::backend::ScythePlacement,
+        dev: &dyn grim_tensor::backend::BackendDevice,
+        placement: &grim_tensor::backend::ScythePlacement,
+        rccl: Option<&grim_backend_rocm::rccl::RcclAllReduce>,
     ) -> Result<()> {
+        let num_gpus = placement.ranks.len().max(1);
+
+        // ── Fast path: RCCL device-pointer all-reduce ─────────────────────
+        // When an RcclAllReduce handle is provided and we have >1 GPU, reduce
+        // gradients on-device via ncclAllReduce to avoid the D2H round-trip.
+        if let Some(rccl_handle) = rccl {
+            if num_gpus > 1 {
+                for (_, param) in self.params.iter_mut() {
+                    let dev_ptr = param.grad.storage().device_ptr();
+                    let count = param.grad.shape().elem_count();
+
+                    if let Some(ptr) = dev_ptr {
+                        // In-place device-pointer all-reduce: send and recv
+                        // alias the same buffer so ncclAllReduce reduces into
+                        // the gradient tensor directly.
+                        let stream = 0u64; // default HIP stream
+                        rccl_handle.sum_gradients_device(ptr, ptr, count, stream)?;
+                    } else {
+                        // CPU fallback for this tensor: host round-trip.
+                        let grad_vec = param.grad.to_vec_f32()?;
+                        let mut scaled = grad_vec;
+                        rccl_handle.scale_gradients(&mut scaled)?;
+                        let grad_tensor = grim_backend_cpu::cpu_tensor(scaled, param.grad.shape().clone());
+                        param.accumulate_grad(&grad_tensor)?;
+                    }
+                }
+                return Ok(());
+            }
+        }
+
+        // ── Fallback: CPU-only accumulate (single-GPU or no RCCL) ──────────
         for (_, param) in self.params.iter_mut() {
             let grad_vec = param.grad.to_vec_f32()?;
             let grad_tensor = grim_backend_cpu::cpu_tensor(grad_vec, param.grad.shape().clone());
@@ -411,7 +443,7 @@ mod tests {
             routes: vec![grim_tensor::backend::ScytheLink::Host; 1],
         };
 
-        params.all_reduce_grads(&dev, &placement).unwrap();
+        params.all_reduce_grads(&dev, &placement, None).unwrap();
         assert_eq!(params.get(pid).unwrap().grad().to_vec_f32().unwrap(), vec![1.0f32; 4]);
     }
 }

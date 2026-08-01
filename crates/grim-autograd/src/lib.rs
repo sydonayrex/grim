@@ -60,7 +60,10 @@ pub mod ops;
 pub mod param;
 pub mod preference_loss;
 pub mod registry;
+pub mod soul_eater;
 pub mod tape;
+
+pub use soul_eater::{SoulEaterAdapter, SoulEaterOptimizer};
 
 pub use adamw::{AdamW, AdamWConfig, Optimizer, OptimizerKind, PagedAdamW, PagedAdamWConfig, Lion8Bit, Lion8BitConfig, Adafactor, AdafactorConfig, LRScheduler};
 pub use lr_schedule::CosineWarmupSchedule;

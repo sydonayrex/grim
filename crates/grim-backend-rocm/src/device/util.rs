@@ -101,6 +101,20 @@ pub fn gpu_target_flag(arch: &str) -> CString {
         .expect("GRIM_GPU_TARGET contains interior NUL")
 }
 
+/// Build compiler options list for AMD hipRTC based on detected hardware target `arch`.
+///
+/// Automatically detects RDNA2 (`gfx103x`), RDNA3 (`gfx11xx`), RDNA4 (`gfx12xx`),
+/// and CDNA (`gfx9xx`) targets and appends `-mwavefrontsize=64` to instruct the
+/// compiler backend to compile in hardware Wave64 execution mode.
+pub fn hiprtc_options_for_arch(arch: &str) -> Vec<CString> {
+    let mut opts = vec![CString::new("--std=c++14").unwrap()];
+    if arch.starts_with("gfx103") || arch.starts_with("gfx11") || arch.starts_with("gfx12") || arch.starts_with("gfx9") {
+        opts.push(CString::new("-mwavefrontsize=64").unwrap());
+    }
+    opts.push(gpu_target_flag(arch));
+    opts
+}
+
 /// Build the canonical F32 native dtype used by every compute op in this crate.
 pub fn dtype_f32() -> DType {
     DType { arith: ArithType::F32, storage: DTypeStorage::Native }

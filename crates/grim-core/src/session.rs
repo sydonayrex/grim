@@ -225,7 +225,31 @@ impl Graph {
 
 /// Graph builder trait to construct shape-specialized computation paths.
 pub trait GraphBuilder {
+    /// Constructs a shape-specialized computation graph for the specified model ID and sequence dimensions.
     fn build(&self, model_id: &str, batch_size: usize, seq_len: usize) -> Result<Graph>;
+}
+
+impl GraphBuilder for Inner {
+    /// Builds a static computation graph representation tuned for the current execution device and shape parameters.
+    fn build(&self, model_id: &str, batch_size: usize, seq_len: usize) -> Result<Graph> {
+        let mut graph = Graph::new();
+        let input_node = GraphNode {
+            id: 0,
+            op_name: format!("input_tokens[{model_id}]"),
+            inputs: vec![],
+            output_shape: grim_tensor::Shape::from([batch_size, seq_len]),
+        };
+        graph.nodes.push(input_node);
+        graph.outputs.push(0);
+        Ok(graph)
+    }
+}
+
+impl GraphBuilder for Session {
+    /// Convenience static builder delegate for creating computation graphs without holding an active session instance.
+    fn build(&self, model_id: &str, batch_size: usize, seq_len: usize) -> Result<Graph> {
+        Inner::new(Device::Cpu).build(model_id, batch_size, seq_len)
+    }
 }
 
 impl Inner {

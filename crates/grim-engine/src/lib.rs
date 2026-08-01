@@ -437,7 +437,8 @@ impl Engine {
         Ok(())
     }
 
-    fn drive_decode(&mut self, id: u64) -> Result<()> {
+    /// Drives a decode step for sequence `id`, recording the outcome step.
+    pub fn drive_decode(&mut self, id: u64) -> Result<()> {
         let outcome = self.drive_decode_with_outcome(id)?;
         if let Some(outcome) = outcome {
             self.last_outcomes.insert(id, outcome);

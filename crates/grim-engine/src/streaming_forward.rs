@@ -500,7 +500,8 @@ mod tests {
                 (c.hidden_size * c.intermediate_size,
                  vec![c.hidden_size, c.intermediate_size])
             } else {
-                return Err(grim_tensor::Error::Backend(format!("stub: unknown tensor {name}")));
+                let default_elems = c.hidden_size.max(128);
+                (default_elems, vec![default_elems])
             };
             Ok(RawTensor {
                 bytes: vec![0u8; n * 4],

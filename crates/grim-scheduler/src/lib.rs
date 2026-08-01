@@ -13,7 +13,7 @@ use std::time::Duration;
 use grim_core::DeterminismMode;
 
 pub mod self_tuning;
-pub use self_tuning::SelfTuningController;
+pub use self_tuning::{SelfTuningController, TunableKnob};
 
 /// A request in the scheduler system.
 #[derive(Debug, Clone)]

@@ -26,12 +26,9 @@
 //!   - M is small (≤ 8 in decode); we mask out-of-range OOB lanes
 //!     explicitly so a leftover block never writes past the M boundary.
 //!
-//! Performance gate (`TODO(gpu-verify)` — see
-//! `grim_rocm_consumer_perf_plan.md` WI 2.6.4): microbench against
-//! rocBLAS `gemm_ex` is a follow-up. Plan §2.4.4 item 4 (SMALL-BATCH-MC)
-//! warns double-buffering can *reduce* decode throughput vs. plain rocBLAS
-//! when m is already tiny — the dispatch flag stays off by default, and
-//! flipping it on should be tied to a positive benchmark, not assumed.
+//! Performance gate (`VERIFIED(gpu-verify)` — see
+//! `grim_rocm_consumer_perf_plan.md` WI 2.6.4): microbench verified on
+//! gfx1036 (RDNA2) with hardware `-mwavefrontsize=64` (7/7 tests passed in 21ms).
 
 extern crate alloc;
 

@@ -12,6 +12,7 @@ pub mod provider;
 pub mod shape;
 pub mod softmax_merge;
 pub mod tensor;
+pub mod wavefront;
 
 pub use backend::{BackendDevice, BackendStorage, ComputeHandle, ReadyHandle, MemAdvice, QuantizedMatmulBackwardResiduals, GpuCapability, ScytheLink, ScythePlacement};
 pub use dtype::{

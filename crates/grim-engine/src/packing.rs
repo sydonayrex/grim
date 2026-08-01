@@ -59,7 +59,6 @@ impl PackedBatch {
                 current = PackedBatch::new();
             }
 
-            let offset = current.concatenated_tokens.len();
             current.concatenated_tokens.extend_from_slice(input_ids);
             current.concatenated_tokens.extend_from_slice(target_ids);
             current.seqlen_offsets.push(current.concatenated_tokens.len());

@@ -2156,14 +2156,11 @@ dependencies = [
  "grim-core",
  "grim-engine",
  "grim-format",
- "grim-memory",
  "grim-models-mamba",
  "grim-models-transformer",
- "grim-models-vision",
  "grim-nn",
  "grim-plugin",
  "grim-quant",
- "grim-scheduler",
  "grim-server",
  "grim-speculative",
  "grim-tensor",
@@ -2184,7 +2181,6 @@ name = "grim-core"
 version = "0.1.0"
 dependencies = [
  "futures-util",
- "grim-nn",
  "grim-tensor",
  "reqwest 0.11.27",
  "serde",
@@ -2200,7 +2196,6 @@ version = "0.1.0"
 dependencies = [
  "grim-core",
  "grim-kvtransport",
- "grim-tensor",
  "thiserror 1.0.69",
 ]
 
@@ -2264,9 +2259,7 @@ dependencies = [
  "grim-core",
  "grim-engine",
  "grim-format",
- "grim-models-transformer",
  "grim-tensor",
- "grim-tensor-graph",
  "rust-embed",
  "serde",
  "serde_json",
@@ -2335,7 +2328,6 @@ version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
  "grim-core",
- "grim-nn",
  "grim-tensor",
  "thiserror 1.0.69",
 ]
@@ -2418,7 +2410,6 @@ version = "0.1.0"
 dependencies = [
  "grim-core",
  "grim-kvtransport",
- "grim-tensor",
  "thiserror 1.0.69",
 ]
 
@@ -2437,7 +2428,6 @@ dependencies = [
  "grim-engine",
  "grim-format",
  "grim-models-transformer",
- "grim-nn",
  "grim-scheduler",
  "grim-tensor",
  "rcgen",

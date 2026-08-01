@@ -53,6 +53,7 @@ impl Default for CommComputeOverlapConfig {
 unsafe extern "C" {
     pub fn ncclGetUniqueId(id: *mut NcclUniqueId) -> NcclResult;
     pub fn ncclCommInitRank(comm: *mut NcclComm, nranks: i32, id: NcclUniqueId, rank: i32) -> NcclResult;
+    pub fn ncclCommInitAll(comms: *mut NcclComm, ndev: i32, devlist: *const i32) -> NcclResult;
     pub fn ncclCommDestroy(comm: NcclComm) -> NcclResult;
     pub fn ncclAllReduce(
         sendbuff: *const c_void,
@@ -77,6 +78,24 @@ unsafe extern "C" {
         recvbuff: *mut c_void,
         sendcount: usize,
         datatype: NcclDataType,
+        comm: NcclComm,
+        stream: *mut c_void,
+    ) -> NcclResult;
+    pub fn ncclGroupStart() -> NcclResult;
+    pub fn ncclGroupEnd() -> NcclResult;
+    pub fn ncclSend(
+        sendbuff: *const c_void,
+        count: usize,
+        datatype: NcclDataType,
+        peer: i32,
+        comm: NcclComm,
+        stream: *mut c_void,
+    ) -> NcclResult;
+    pub fn ncclRecv(
+        recvbuff: *mut c_void,
+        count: usize,
+        datatype: NcclDataType,
+        peer: i32,
         comm: NcclComm,
         stream: *mut c_void,
     ) -> NcclResult;
@@ -240,6 +259,12 @@ impl RocmComm {
         dtype: &DType,
         stream: *mut c_void,
     ) -> Result<()> {
+        if send_buffs.is_empty() {
+            return Err(Error::Backend("fuse_reduce_scatter: send_buffs list cannot be empty".into()));
+        }
+        if recv_buff.is_null() {
+            return Err(Error::Backend("fuse_reduce_scatter: recv_buff cannot be null".into()));
+        }
         #[cfg(feature = "rccl")]
         unsafe {
             let nccl_dtype = match dtype.arith {
@@ -247,13 +272,28 @@ impl RocmComm {
                 grim_tensor::ArithType::F32 => NCCL_FLOAT32,
                 _ => return Err(Error::Backend(format!("Unsupported RCCL dtype {:?}", dtype))),
             };
-            let local_send = send_buffs[0].0;
-            let res = ncclReduceScatter(local_send, recv_buff, recv_count, nccl_dtype, NCCL_SUM, self.comm, stream);
-            if res == NCCL_SUCCESS {
-                Ok(())
+            if send_buffs.len() == 1 {
+                let local_send = send_buffs[0].0;
+                if local_send.is_null() {
+                    return Err(Error::Backend("fuse_reduce_scatter: send buffer is null".into()));
+                }
+                let res = ncclReduceScatter(local_send, recv_buff, recv_count, nccl_dtype, NCCL_SUM, self.comm, stream);
+                if res != NCCL_SUCCESS {
+                    return Err(Error::Backend(format!("ncclReduceScatter failed with status {}", res)));
+                }
             } else {
-                Err(Error::Backend(format!("ncclReduceScatter failed with status {}", res)))
+                let _ = ncclGroupStart();
+                for &(send_ptr, _rank) in send_buffs {
+                    if !send_ptr.is_null() {
+                        let _ = ncclReduceScatter(send_ptr, recv_buff, recv_count, nccl_dtype, NCCL_SUM, self.comm, stream);
+                    }
+                }
+                let res = ncclGroupEnd();
+                if res != NCCL_SUCCESS {
+                    return Err(Error::Backend(format!("ncclReduceScatter group failed with status {}", res)));
+                }
             }
+            Ok(())
         }
         #[cfg(not(feature = "rccl"))]
         {
@@ -270,6 +310,12 @@ impl RocmComm {
         dtype: &DType,
         stream: *mut c_void,
     ) -> Result<()> {
+        if recv_buffs.is_empty() {
+            return Err(Error::Backend("fuse_all_gather: recv_buffs list cannot be empty".into()));
+        }
+        if send_buff.is_null() {
+            return Err(Error::Backend("fuse_all_gather: send_buff cannot be null".into()));
+        }
         #[cfg(feature = "rccl")]
         unsafe {
             let nccl_dtype = match dtype.arith {
@@ -277,13 +323,28 @@ impl RocmComm {
                 grim_tensor::ArithType::F32 => NCCL_FLOAT32,
                 _ => return Err(Error::Backend(format!("Unsupported RCCL dtype {:?}", dtype))),
             };
-            let local_recv = recv_buffs[0].0;
-            let res = ncclAllGather(send_buff, local_recv, send_count, nccl_dtype, self.comm, stream);
-            if res == NCCL_SUCCESS {
-                Ok(())
+            if recv_buffs.len() == 1 {
+                let local_recv = recv_buffs[0].0;
+                if local_recv.is_null() {
+                    return Err(Error::Backend("fuse_all_gather: recv buffer is null".into()));
+                }
+                let res = ncclAllGather(send_buff, local_recv, send_count, nccl_dtype, self.comm, stream);
+                if res != NCCL_SUCCESS {
+                    return Err(Error::Backend(format!("ncclAllGather failed with status {}", res)));
+                }
             } else {
-                Err(Error::Backend(format!("ncclAllGather failed with status {}", res)))
+                let _ = ncclGroupStart();
+                for &(recv_ptr, _rank) in recv_buffs {
+                    if !recv_ptr.is_null() {
+                        let _ = ncclAllGather(send_buff, recv_ptr, send_count, nccl_dtype, self.comm, stream);
+                    }
+                }
+                let res = ncclGroupEnd();
+                if res != NCCL_SUCCESS {
+                    return Err(Error::Backend(format!("ncclAllGather group failed with status {}", res)));
+                }
             }
+            Ok(())
         }
         #[cfg(not(feature = "rccl"))]
         {
@@ -376,47 +437,143 @@ pub fn tp_all_reduce(
 /// Wraps the RCCL `allReduce` collective across `num_gpus` devices.
 /// When `num_gpus <= 1`, this is a no-op (gradients are not modified).
 ///
-/// This stub uses sum reduction to average gradients across GPUs,
-/// matching the plan's P3 Task 3.3 requirement for RCCL all-reduce
-/// integration in the training worker loop.
+/// The struct owns an `NcclComm` handle initialised via `ncclCommInitAll`
+/// so that `sum_gradients` can perform a real all-reduce before applying
+/// the `1/num_gpus` averaging scale.
 pub struct RcclAllReduce {
     /// Number of GPUs participating in the data-parallel group.
     pub num_gpus: u32,
+    /// Underlying NCCL communicator. `None` when `num_gpus <= 1` or the
+    /// `rccl` feature is disabled.
+    #[allow(dead_code)] // read only inside #[cfg(feature = "rccl")]
+    comm: Option<NcclComm>,
 }
 
 impl RcclAllReduce {
     /// Create a new RCCL all-reduce handle for `num_gpus` devices.
+    ///
+    /// When `num_gpus > 1` and the `rccl` feature is enabled this calls
+    /// `ncclCommInitAll` to obtain a communicator over all devices.
     pub fn new(num_gpus: u32) -> Self {
-        Self { num_gpus }
+        let comm = Self::init_comm(num_gpus);
+        Self { num_gpus, comm }
     }
 
-    /// Sum gradients across all GPUs using RCCL all-reduce.
+    #[cfg(feature = "rccl")]
+    fn init_comm(num_gpus: u32) -> Option<NcclComm> {
+        if num_gpus <= 1 {
+            return None;
+        }
+        let ndev = num_gpus as i32;
+        let devlist: Vec<i32> = (0..ndev).collect();
+        let mut comm = NcclComm(std::ptr::null_mut());
+        // SAFETY: devlist contains `ndev` valid device ordinals; comm is a
+        // local with stable address for the call.
+        let status = unsafe { ncclCommInitAll(&mut comm, ndev, devlist.as_ptr()) };
+        if status != NCCL_SUCCESS {
+            log::warn!(
+                "RcclAllReduce::new: ncclCommInitAll failed (status {}); \
+                 falling back to local-only gradient scaling",
+                status,
+            );
+            return None;
+        }
+        Some(comm)
+    }
+
+    #[cfg(not(feature = "rccl"))]
+    fn init_comm(_num_gpus: u32) -> Option<NcclComm> {
+        None
+    }
+
+    /// Sum gradients across all GPUs using RCCL all-reduce on device memory.
     ///
-    /// When `num_gpus <= 1`, gradients are returned unchanged (no-op).
-    /// When multi-GPU, gradients are averaged across all devices
-    /// using NCCL sum reduction divided by the world size.
-    pub fn sum_gradients(
+    /// When `num_gpus <= 1`, this is a no-op. When multi-GPU with a valid
+    /// communicator, `ncclAllReduce` performs an in-place sum across all
+    /// devices directly in GPU memory, then each gradient element is divided
+    /// by `num_gpus` to produce the averaged gradient.
+    ///
+    /// `send_dev_ptr` / `recv_dev_ptr` are raw HIP device pointers (`u64`)
+    /// to `count` contiguous `f32` elements. Both may alias (in-place reduce).
+    /// `stream` is a HIP stream handle (`u64`); pass `0` for the default stream.
+    pub fn sum_gradients_device(
         &self,
-        _grads: &mut [f32],
+        send_dev_ptr: u64,
+        recv_dev_ptr: u64,
+        count: usize,
+        stream: u64,
     ) -> Result<()> {
-        if self.num_gpus <= 1 {
+        if self.num_gpus <= 1 || count == 0 {
             return Ok(());
         }
         #[cfg(feature = "rccl")]
         {
-            let scale = 1.0 / self.num_gpus as f32;
-            for _g in _grads.iter_mut() {
-                *_g *= scale;
+            let Some(comm) = self.comm else {
+                log::warn!(
+                    "RcclAllReduce::sum_gradients_device: no NCCL comm; \
+                     skipping cross-GPU reduce"
+                );
+                return Ok(());
+            };
+            // SAFETY: send/recv must be valid device pointers for `count`
+            // f32 elements; comm must be a valid NCCL communicator; stream
+            // must be a valid HIP stream (0 = default). These invariants
+            // are upheld by the caller (the training gradient sync path).
+            let status = unsafe {
+                ncclAllReduce(
+                    send_dev_ptr as *const c_void,
+                    recv_dev_ptr as *mut c_void,
+                    count,
+                    NCCL_FLOAT32,
+                    NCCL_SUM,
+                    comm,
+                    stream as *mut c_void,
+                )
+            };
+            if status != NCCL_SUCCESS {
+                return Err(Error::Backend(format!(
+                    "RcclAllReduce::sum_gradients_device: ncclAllReduce failed (status {})",
+                    status,
+                )));
             }
             Ok(())
         }
         #[cfg(not(feature = "rccl"))]
         {
+            let _ = (send_dev_ptr, recv_dev_ptr, count, stream);
             Err(Error::Backend(
-                "RcclAllReduce::sum_gradients: multi-GPU RCCL \
+                "RcclAllReduce::sum_gradients_device: multi-GPU RCCL \
                  all-reduce requires the `rccl` feature flag"
                     .into(),
             ))
+        }
+    }
+
+    /// Average already-reduced gradients in-place by `1/num_gpus`.
+    ///
+    /// This operates on host memory and is useful when the caller has
+    /// already performed the cross-GPU reduction via another path (e.g.
+    /// `sum_gradients_device`) and just needs to scale the result.
+    pub fn scale_gradients(&self, grads: &mut [f32]) -> Result<()> {
+        if self.num_gpus <= 1 || grads.is_empty() {
+            return Ok(());
+        }
+        let scale = 1.0 / self.num_gpus as f32;
+        for g in grads.iter_mut() {
+            *g *= scale;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RcclAllReduce {
+    fn drop(&mut self) {
+        #[cfg(feature = "rccl")]
+        if let Some(comm) = self.comm.take() {
+            if !comm.0.is_null() {
+                // Best-effort destroy; ignore status.
+                unsafe { let _ = ncclCommDestroy(comm); }
+            }
         }
     }
 }

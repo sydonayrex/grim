@@ -17,7 +17,7 @@ use grim_tensor::error::{Error, Result};
 
 use crate::{
     hipFree, hipMalloc, hipMemcpy, hipMemcpyAsync, hipStreamCreate,
-    hipStreamDestroy, hipStreamSynchronize, gpu_target_flag,
+    hipStreamDestroy, hipStreamSynchronize,
     hiprtcCompileProgram, hiprtcCreateProgram, hiprtcDestroyProgram,
     hiprtcGetCode, hiprtcGetCodeSize, hiprtcGetProgramLog, hiprtcGetProgramLogSize,
     hipSuccess, HipErrorT, HipMemcpyKind, HiprtcProgram,
@@ -101,10 +101,7 @@ pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<V
             return Err(Error::Backend(format!("hiprtcCreateProgram failed: {}", status)));
         }
 
-        let options_c = vec![
-            CString::new("--std=c++14").unwrap(),
-            gpu_target_flag(arch),
-        ];
+        let options_c = crate::device::util::hiprtc_options_for_arch(arch);
         let options_ptrs: Vec<*const i8> = options_c.iter().map(|c| c.as_ptr()).collect();
 
         let status = hiprtcCompileProgram(prog, options_ptrs.len() as i32, options_ptrs.as_ptr());
