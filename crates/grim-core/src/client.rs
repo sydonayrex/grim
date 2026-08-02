@@ -740,6 +740,15 @@ pub async fn unload_model_from_server(model_name: &str, addr: &str) -> Result<()
     ))
 }
 
+/// Format milliseconds to human-readable time.
+fn format_ms(ms: f64) -> String {
+    if ms < 1000.0 {
+        format!("{:.0}ms", ms)
+    } else {
+        format!("{:.2}s", ms / 1000.0)
+    }
+}
+
 /// Query local server status.
 pub async fn query_server_status(addr: &str) -> Result<()> {
     let client = build_http_client()?;
@@ -755,38 +764,54 @@ pub async fn query_server_status(addr: &str) -> Result<()> {
     }
 
     let val = val.ok_or_else(|| Error::Backend(format!("Could not connect to {addr}")))?;
+
     println!("\n=== Grim Service Status ===");
     println!(
-        "Server Status : {}",
+        "Status            : {}",
         val["status"].as_str().unwrap_or("unknown")
     );
     println!(
-        "Hardware      : {}",
+        "Hardware          : {}",
         val["processor"].as_str().unwrap_or("unknown")
     );
     println!(
-        "Default Model : {}\n",
+        "Default Model     : {}\n",
         val["default_model"].as_str().unwrap_or("none")
     );
 
-    println!("{:<25} {:<15} {:<15}", "LOADED MODEL", "SIZE", "PROCESSOR");
-    println!("{}", "-".repeat(60));
+    // Loaded models table with all metrics in the model area
     if let Some(arr) = val["loaded_models"].as_array() {
         if arr.is_empty() {
-            println!("No models loaded.");
+            println!("No models loaded.\n");
         } else {
+            println!(
+                "{:<28} {:<8} {:<10} {:<8} {:<8} {:<6} {:<10} {:<10} {:<10} {:<12}",
+                "MODEL", "PARAMS", "VRAM(GB)", "GPU%", "RAM(GB)", "KV_GB", "KV%", "CTX", "TPS", "TTFT(ms)"
+            );
+            println!("{}", "-".repeat(120));
+
             for item in arr {
                 let name = item["name"].as_str().unwrap_or("");
-                let size = format!(
-                    "{:.1} GB",
-                    item["memory_footprint_gb"].as_f64().unwrap_or(0.0)
+                let params = item.get("params").and_then(|v| v.as_str()).unwrap_or("?");
+                let vram_gb = item.get("vram_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let gpu_util = item.get("gpu_util_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let ram_gb = item.get("sys_ram_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let kv_used_gb = item.get("kv_used_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let kv_total_gb = item.get("kv_total_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let kv_pct = if kv_total_gb > 0.0 { (kv_used_gb / kv_total_gb * 100.0) as f32 } else { 0.0 };
+                let ctx = item.get("ctx_limit").and_then(|v| v.as_u64()).unwrap_or(0);
+                let tps = item.get("decode_tps").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let ttft_ms = item.get("ttft_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+                println!(
+                    "{:<28} {:<8} {:<10.1} {:<8.0} {:<8.1} {:<10.1} {:<6.0}% {:<10} {:.1} {}",
+                    name, params, vram_gb, gpu_util, ram_gb, kv_used_gb, kv_pct, ctx, tps, format_ms(ttft_ms).as_str()
                 );
-                let proc = item["processor"].as_str().unwrap_or("unknown");
-                println!("{:<25} {:<15} {:<15}", name, size, proc);
             }
+            println!();
         }
     }
-    println!();
+
     Ok(())
 }
 

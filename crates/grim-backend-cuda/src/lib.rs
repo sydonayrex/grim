@@ -10,7 +10,10 @@ use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
 
 use grim_tensor::backend::ComputeHandle;
-use grim_tensor::dtype::{ArithType, DType, QuantProvenance, Storage as DTypeStorage};
+use grim_tensor::dtype::{
+    ArithType, BlockDtype, DType, FloatPackScheme, KQuantScheme, QuantProvenance,
+    Storage as DTypeStorage,
+};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendDevice, BackendStorage, Shape};
 
@@ -232,6 +235,39 @@ pub struct CudaStorage {
 }
 
 impl CudaStorage {
+    /// Allocates GPU memory sized to exactly `byte_len` bytes (for packed
+    /// quantized representations whose packed length is smaller than
+    /// `shape.elem_count() * dtype.arith.byte_size()`).
+    pub fn alloc_gpu_bytes(shape: &Shape, dtype: DType, byte_len: usize, device_ordinal: usize) -> Result<Self> {
+        let select_res = unsafe { cudaSetDevice(device_ordinal as i32) };
+        if select_res != cudaSuccess {
+            return Err(Error::Backend(format!(
+                "cudaSetDevice failed for device {}",
+                device_ordinal
+            )));
+        }
+
+        let mut dev_ptr: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `cudaMalloc` allocates `byte_len` bytes on the selected CUDA
+        // device. The pointer is initialized to null and checked on error.
+        let res = unsafe { cudaMalloc(&mut dev_ptr, byte_len) };
+        if res != cudaSuccess {
+            return Err(Error::Backend(format!(
+                "cudaMalloc failed to allocate {} bytes with error {}",
+                byte_len, res
+            )));
+        }
+
+        Ok(Self {
+            device_ptr: Some(dev_ptr as u64),
+            bytes: byte_len,
+            shape: shape.clone(),
+            dtype,
+            provenance: QuantProvenance::GrimNative,
+            ordinal: device_ordinal,
+        })
+    }
+
     /// Allocates GPU memory on a CUDA device.
     pub fn alloc_gpu(shape: &Shape, dtype: DType, device_ordinal: usize) -> Result<Self> {
         let bytes = shape.elem_count() * dtype_byte_size(&dtype);
@@ -275,8 +311,7 @@ impl CudaStorage {
         dtype: DType,
         device_ordinal: usize,
     ) -> Result<Self> {
-        let storage = Self::alloc_gpu(shape, dtype, device_ordinal)?;
-        let dev_ptr = storage.device_ptr.unwrap() as *mut c_void;
+        let storage = Self::alloc_gpu(shape, dtype, device_ordinal)?;        let dev_ptr = storage.device_ptr.unwrap() as *mut c_void;
 
         // SAFETY: `cudaMemcpy` copies `storage.bytes` from host to device.
         // `dev_ptr` was allocated by `cudaMalloc` in `alloc_gpu`; `host_data`
@@ -303,6 +338,45 @@ impl CudaStorage {
         Ok(storage)
     }
 
+    /// Copies raw packed bytes (e.g. Q4_K, Q8_0, GPTQ) from host memory to GPU,
+    /// sizing the device buffer to `host_bytes.len()` exactly rather than
+    /// `shape.elem_count() * dtype.arith.byte_size()`. Mirrors the ROCm
+    /// `copy_from_host_raw_bytes` contract.
+    pub fn copy_from_host_raw_bytes(
+        host_bytes: &[u8],
+        shape: &Shape,
+        dtype: DType,
+        device_ordinal: usize,
+    ) -> Result<Self> {
+        let storage = Self::alloc_gpu_bytes(shape, dtype, host_bytes.len(), device_ordinal)?;
+        let dev_ptr = storage.device_ptr.ok_or_else(|| {
+            Error::Backend("copy_from_host_raw_bytes: device_ptr is null after alloc".into())
+        })? as *mut c_void;
+
+        // SAFETY: `cudaMemcpy` copies `host_bytes.len()` bytes from host to the
+        // freshly allocated device buffer; direction matches the copy.
+        let res = unsafe {
+            cudaMemcpy(
+                dev_ptr,
+                host_bytes.as_ptr() as *const c_void,
+                host_bytes.len(),
+                cudaMemcpyHostToDevice,
+            )
+        };
+        if res != cudaSuccess {
+            // SAFETY: free the allocated buffer on upload failure to avoid a leak.
+            unsafe {
+                let _ = cudaFree(dev_ptr);
+            }
+            return Err(Error::Backend(format!(
+                "cudaMemcpyHostToDevice (raw bytes) failed with error code {}",
+                res
+            )));
+        }
+
+        Ok(storage)
+    }
+
     /// Returns the tensor shape.
     pub fn shape_metadata(&self) -> &Shape {
         &self.shape
@@ -321,6 +395,33 @@ impl CudaStorage {
     /// Returns the storage size in bytes.
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Download the raw packed bytes (regardless of arith/storage encoding)
+    /// into a host `Vec<u8>` of length `self.bytes`. Used by the host-dequant
+    /// backward path to copy quantized codes from the GPU to the host.
+    pub fn copy_to_host_raw_bytes(&self) -> Result<Vec<u8>> {
+        let dev_ptr = self
+            .device_ptr
+            .ok_or_else(|| Error::Backend("CudaStorage has no valid device pointer".into()))?
+            as *const c_void;
+        let mut host = vec![0u8; self.bytes];
+        // SAFETY: `cudaMemcpy` copies `self.bytes` from device to host.
+        let res = unsafe {
+            cudaMemcpy(
+                host.as_mut_ptr() as *mut c_void,
+                dev_ptr,
+                self.bytes,
+                cudaMemcpyDeviceToHost,
+            )
+        };
+        if res != cudaSuccess {
+            return Err(Error::Backend(format!(
+                "cudaMemcpyDeviceToHost failed with error code {}",
+                res
+            )));
+        }
+        Ok(host)
     }
 }
 
@@ -361,7 +462,43 @@ impl BackendStorage for CudaStorage {
             .ok_or_else(|| Error::Backend("CudaStorage has no valid device pointer".into()))?
             as *mut c_void;
 
-        let mut host_data = vec![0.0f32; self.shape.elem_count()];
+        let elem_count = self.shape.elem_count();
+
+        // Quantized resident storage (KQuant/FloatPack/Block): the device buffer
+        // holds packed codes smaller than `elem_count * 4` bytes. Download the
+        // raw byte payload and dequantize on the host via grim-quant, mirroring
+        // the ROCm `to_cpu_vec_f32` -> `dequant_cpu` contract so that
+        // `transpose_last_two`/`Linear::load` (which call `to_vec_f32` on the
+        // raw quantized weight) keep working now that CUDA materialization no
+        // longer pre-dequantizes these formats.
+        if self.dtype.is_quantized() {
+            let mut raw = vec![0u8; self.bytes];
+            // SAFETY: `cudaMemcpy` copies `self.bytes` from device to host.
+            let res = unsafe {
+                cudaMemcpy(
+                    raw.as_mut_ptr() as *mut c_void,
+                    dev_ptr,
+                    self.bytes,
+                    cudaMemcpyDeviceToHost,
+                )
+            };
+            if res != cudaSuccess {
+                return Err(Error::Backend(format!(
+                    "cudaMemcpyDeviceToHost (quantized) failed with error code {}",
+                    res
+                )));
+            }
+            let b_scales = <CudaStorage as BackendStorage>::quant_scales(self);
+            return cuda_dequant_quantized_storage(
+                &raw,
+                b_scales,
+                elem_count,
+                &self.dtype,
+            );
+        }
+
+        // Native F32 storage: copy `self.bytes` worth of f32 elements.
+        let mut host_data = vec![0.0f32; elem_count];
         // SAFETY: `cudaMemcpy` copies `self.bytes` from device to host.
         // `dev_ptr` is a valid device pointer; `host_data` is a valid host vector.
         let res = unsafe {
@@ -1393,9 +1530,14 @@ impl BackendDevice for CudaDevice {
         shape: &Shape,
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
-        let storage = CudaStorage::alloc_gpu(shape, dtype, self.ordinal)?;
+        // Packed quantized storage (KQuant, FloatPack, Block, GroupInt) is
+        // smaller than `elem_count * arith.byte_size`; allocate the exact byte
+        // length so `CudaStorage::bytes()` reflects the real packed payload.
+        // For Native storage `data.len()` already equals `elem_count * byte_size`,
+        // so this remains correct for both cases.
+        let storage = CudaStorage::copy_from_host_raw_bytes(data, shape, dtype, self.ordinal)?;
         let dev_ptr = storage.device_ptr.ok_or_else(|| {
-            Error::Backend("from_cpu_bytes: device_ptr is null after alloc_gpu".into())
+            Error::Backend("from_cpu_bytes: device_ptr is null after raw byte alloc".into())
         })? as *mut c_void;
 
         let res = unsafe {
@@ -1749,6 +1891,151 @@ impl BackendDevice for CudaDevice {
         ))
     }
 
+    /// Fused (non-fused first cut) dequantized matmul backward on CUDA.
+    ///
+    /// Computes `dX[M, K] = dY[M, N] @ B_dequant^T` where `B` is a quantized,
+    /// CUDA-resident weight of shape `[K, N]`. The packed codes are copied to
+    /// the host, dequantized via `grim-quant` (mirroring
+    /// `grim-format::convert::dequant_tensor_data`), re-uploaded as F32, and
+    /// multiplied with `dY` through cuBLAS. This is the CUDA counterpart of the
+    /// ROCm fused path in `RocmDevice::quantized_matmul_backward_dx`; it fires
+    /// from `grim-autograd::matmul_backward` once quantized storage is kept
+    /// resident on CUDA (see `varbuilder::materialize`).
+    fn quantized_matmul_backward_dx(
+        &self,
+        dy: &dyn BackendStorage,
+        b_packed: &dyn BackendStorage,
+        _b_scales: &[f32],
+        _default_bpw: u8,
+        m: usize,
+        n: usize,
+        k: usize,
+        out_shape: &Shape,
+        _residuals: Option<&grim_tensor::QuantizedMatmulBackwardResiduals>,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let dy_storage = dy
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("quantized_matmul_backward_dx: dy not CudaStorage".into()))?;
+
+        let b_storage = b_packed
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| {
+                Error::Backend("quantized_matmul_backward_dx: b_packed not CudaStorage".into())
+            })?;
+
+        // Validate the output shape contract (dX is [M, K]).
+        if out_shape.dims() != [m, k] {
+            return Err(Error::Shape(format!(
+                "quantized_matmul_backward_dx: out_shape must be [{m},{k}], got {:?}",
+                out_shape.dims()
+            )));
+        }
+
+        // dy must be F32 to feed cuBLAS.
+        if dy_storage.dtype.arith != ArithType::F32 {
+            return Err(Error::DTypeMismatch(format!(
+                "quantized_matmul_backward_dx: dy must be F32, got {:?}",
+                dy_storage.dtype
+            )));
+        }
+
+        // B is stored as [K, N] row-major in the packed payload.
+        let b_elem_count = k * n;
+        let b_bytes = b_storage.copy_to_host_raw_bytes()?;
+        let b_scales = b_storage.quant_scales();
+
+        // Host dequant: packed bytes -> F32 [K, N] row-major, via grim-quant.
+        let b_dequant = cuda_dequant_quantized_storage(&b_bytes, b_scales, b_elem_count, &b_storage.dtype)?;
+
+        // Re-upload B as F32, then compute dX = dY @ B^T directly via cuBLAS.
+        //
+        // The generic `matmul` cannot be reused here: its column-major
+        // transpose trick assumes the forward orientation (inner dim K is the
+        // leading dimension of B), which only holds when m == n == k and breaks
+        // for the backward shape dY[M,N] @ B^T[N,K] -> dX[M,K].
+        //
+        // Correct row-major GEMM for dX[M,K] = dY[M,N] @ B^T[N,K]:
+        //   C_col(K,M) = B_col(K,N) * A_col(N,M)
+        // where B^T row-major [N,K] read column-major is B [K,N] (lda = K), and
+        // dY row-major [M,N] read column-major is dY^T [N,M] (ldb = N).
+        let b_shape = b_storage.shape().clone();
+        let (b_rows, b_cols) = (b_shape.dims()[0], b_shape.dims()[1]);
+        let mut b_t = vec![0.0f32; b_elem_count];
+        for r in 0..b_rows {
+            for c in 0..b_cols {
+                b_t[c * b_rows + r] = b_dequant[r * b_cols + c];
+            }
+        }
+        let b_t_shape = Shape::new(vec![b_cols, b_rows]);
+        let b_t_storage = BackendDevice::from_cpu(
+            self,
+            &b_t,
+            &b_t_shape,
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+        )?;
+
+        let dx_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+
+        let handle = self.get_cublas_handle()?;
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+
+        let b_t_ptr = b_t_storage
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| {
+                Error::Backend("quantized_matmul_backward_dx: b_t not CudaStorage".into())
+            })?
+            .device_ptr
+            .ok_or_else(|| {
+                Error::Backend("quantized_matmul_backward_dx: b_t has no device pointer".into())
+            })? as *const c_void;
+        let dy_ptr = dy_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("quantized_matmul_backward_dx: dY has no device pointer".into())
+        })? as *const c_void;
+        let dx_ptr = dx_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("quantized_matmul_backward_dx: dX has no device pointer".into())
+        })? as *mut c_void;
+
+        // SAFETY: all pointers are freshly allocated/uploaded on this device;
+        // leading dims are the row counts of the column-major views, all >= 1.
+        unsafe {
+            let status = cublasSgemm_v2(
+                handle.0,
+                CUBLAS_OP_N,
+                CUBLAS_OP_N,
+                k as i32, // m_cublas = rows of B_col = K
+                m as i32, // n_cublas = cols of A_col = M
+                n as i32, // k_cublas = inner N
+                &alpha,
+                b_t_ptr as *const f32, // B^T [N,K] row-major, read col-major as B [K,N]
+                k as i32,              // lda = K
+                dy_ptr as *const f32,  // dY [M,N] row-major, read col-major as dY^T [N,M]
+                n as i32,              // ldb = N
+                &beta,
+                dx_ptr as *mut f32, // dX [M,K] row-major, read col-major as dX^T [K,M]
+                k as i32,           // ldc = K
+            );
+            if status != CUBLAS_STATUS_SUCCESS {
+                return Err(Error::Backend(format!(
+                    "cublasSgemm_v2 (backward dx) failed with status {}",
+                    status
+                )));
+            }
+        }
+
+        let compute_handle = Box::new(CudaHandle {
+            completed: Arc::new(Mutex::new(true)),
+        });
+
+        Ok((Box::new(dx_storage), compute_handle))
+    }
+
     fn estimate_gemm_latency_ms(
         &self,
         m: usize,
@@ -1774,6 +2061,67 @@ fn dtype_byte_size(dtype: &DType) -> usize {
         ArithType::F16 | ArithType::BF16 => 2,
         ArithType::I64 => 8,
         ArithType::U8 => 1,
+    }
+}
+
+/// Host-side dequantization of CUDA-resident packed storage. Dispatches on the
+/// `Storage` variant to the matching `grim_quant::dequant_*` entry point
+/// (the same family used by `grim-format::convert::dequant_tensor_data`).
+/// Returns a row-major F32 vector of length `elem_count` matching `B`'s logical
+/// `[K, N]` layout.
+fn cuda_dequant_quantized_storage(
+    b_bytes: &[u8],
+    _b_scales: Option<&[f32]>,
+    elem_count: usize,
+    dtype: &DType,
+) -> Result<Vec<f32>> {
+    match &dtype.storage {
+        DTypeStorage::KQuant(scheme) => match scheme {
+            KQuantScheme::Q2K => grim_quant::dequant_q2k(b_bytes, elem_count),
+            KQuantScheme::Q3K => grim_quant::dequant_q3k(b_bytes, elem_count),
+            KQuantScheme::Q4K => grim_quant::dequant_q4k(b_bytes, elem_count),
+            KQuantScheme::Q5K => grim_quant::dequant_q5k(b_bytes, elem_count),
+            KQuantScheme::Q6K => grim_quant::dequant_q6k(b_bytes, elem_count),
+            KQuantScheme::Q80 => grim_quant::dequant_q80(b_bytes, elem_count),
+            KQuantScheme::IQ4NL => grim_quant::dequant_iq4nl(b_bytes, elem_count),
+            KQuantScheme::IQ4XS => grim_quant::dequant_iq4xs(b_bytes, elem_count),
+            KQuantScheme::IQ3XXS => grim_quant::dequant_iq3xxs(b_bytes, elem_count),
+            KQuantScheme::IQ3S => grim_quant::dequant_iq3s(b_bytes, elem_count),
+            KQuantScheme::IQ2XXS => grim_quant::dequant_iq2xxs(b_bytes, elem_count),
+            KQuantScheme::IQ2XS => grim_quant::dequant_iq2xs(b_bytes, elem_count),
+            KQuantScheme::IQ2S => grim_quant::dequant_iq2s(b_bytes, elem_count),
+        },
+        DTypeStorage::FloatPack(scheme) => match scheme {
+            FloatPackScheme::Fp4 => grim_quant::dequant_fp4(b_bytes, elem_count),
+            FloatPackScheme::Nf4 => grim_quant::dequant_nf4(b_bytes, elem_count),
+            FloatPackScheme::Fp8 => grim_quant::dequant_fp8(b_bytes, elem_count),
+            FloatPackScheme::MxFp4 => grim_quant::dequant_mxfp4(b_bytes, elem_count),
+            FloatPackScheme::MxFp8 => grim_quant::dequant_mxfp8(b_bytes, elem_count),
+        },
+        DTypeStorage::Block(bd) => match bd {
+            BlockDtype::Fp4 | BlockDtype::Fp4Block16 => {
+                grim_quant::dequant_fp4_block16(b_bytes, elem_count)
+            }
+            BlockDtype::Nf4 => grim_quant::dequant_nf4(b_bytes, elem_count),
+            BlockDtype::Fp8 | BlockDtype::Fp8Block16 => {
+                grim_quant::dequant_fp8_block16(b_bytes, elem_count)
+            }
+        },
+        // ResidualPacked has no host dequant implementation and is intentionally
+        // not kept resident on CUDA (see varbuilder::materialize).
+        DTypeStorage::ResidualPacked(cfg) => Err(Error::Unimplemented(format!(
+            "quantized_matmul_backward_dx: ResidualPacked (bpw {}) host dequant not implemented; \
+             this layout requires a fused ROCm device kernel",
+            cfg.bpw
+        ))),
+        DTypeStorage::GroupInt(_) => Err(Error::Unimplemented(
+            "quantized_matmul_backward_dx: GroupInt storage is dequantized to F32 at load time \
+             on CUDA and does not reach the fused path".into(),
+        )),
+        DTypeStorage::Native => Err(Error::Backend(format!(
+            "quantized_matmul_backward_dx: expected quantized b, got Native ({:?})",
+            dtype
+        ))),
     }
 }
 
@@ -2168,6 +2516,76 @@ mod tests {
             .unwrap();
         handle.synchronize().unwrap();
         assert_q8_close(&out.to_cpu_vec_f32().unwrap(), &expected);
+    }
+
+    #[test]
+    fn test_cuda_quantized_matmul_backward_dx_q8_0() {
+        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
+        let devices = CudaDevice::probe().unwrap();
+        let dev = &devices[0];
+
+        let (m, k, n) = (4usize, 64usize, 8usize);
+        let dy_host: Vec<f32> = (0..m * n).map(|i| (i as f32 * 0.05).cos()).collect();
+        let b_orig: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.1).sin() * 5.0).collect();
+
+        // Host reference: dequantize B to F32, then dX = dY @ B^T.
+        let b_packed = grim_quant::quant_q80(&b_orig).unwrap();
+        let b_dequant = grim_quant::dequant_q80(&b_packed, k * n).unwrap();
+        let mut dx_ref = vec![0.0f32; m * k];
+        for i in 0..m {
+            for j in 0..k {
+                let mut sum = 0.0f32;
+                for l in 0..n {
+                    sum += dy_host[i * n + l] * b_dequant[j * n + l];
+                }
+                dx_ref[i * k + j] = sum;
+            }
+        }
+
+        // Upload dY as F32 [M, N].
+        let dy_shape = Shape::new(vec![m, n]);
+        let dy_dev = dev.from_cpu(&dy_host, &dy_shape, DType::F32).unwrap();
+
+        // Upload packed B as KQuant(Q80) [K, N] (stays quantized resident).
+        let b_shape = Shape::new(vec![k, n]);
+        let b_dev = dev
+            .from_cpu_bytes(
+                &b_packed,
+                &b_shape,
+                DType {
+                    arith: ArithType::F32,
+                    storage: DTypeStorage::KQuant(KQuantScheme::Q80),
+                },
+            )
+            .unwrap();
+
+        let out_shape = Shape::new(vec![m, k]);
+        let (dx_dev, handle) = dev
+            .quantized_matmul_backward_dx(
+                dy_dev.as_ref(),
+                b_dev.as_ref(),
+                &[],
+                8, // bpw for Q8_0
+                m,
+                n,
+                k,
+                &out_shape,
+                None,
+            )
+            .expect("CUDA quantized_matmul_backward_dx must succeed on a real CUDA device");
+        handle.synchronize().unwrap();
+
+        let dx_actual = dx_dev
+            .to_cpu_vec_f32()
+            .expect("CUDA backward result must be readable");
+        assert_eq!(dx_actual.len(), m * k);
+        for (a, e) in dx_actual.iter().zip(dx_ref.iter()) {
+            let err = (a - e).abs();
+            assert!(
+                err < 1e-3,
+                "CUDA Q8_0 backward dX error {err} at actual={a} expected={e}"
+            );
+        }
     }
 }
 

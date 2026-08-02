@@ -23,6 +23,21 @@ pub static FUSED_BACKWARD_DISPATCH_STATS: FusedBackwardDispatchStats = FusedBack
     kernel_calls: AtomicUsize::new(0),
 };
 
+#[derive(Debug, Default)]
+pub struct FusedForwardDispatchStats {
+    pub attempts: AtomicUsize,
+    pub kernel_calls: AtomicUsize,
+    pub fallback_calls: AtomicUsize,
+    pub last_backup2_bpw: AtomicUsize,
+    pub last_backup2_codes_offset: AtomicUsize,
+    pub last_backup2_scale_offset: AtomicUsize,
+}
+
+pub static FUSED_FORWARD_DISPATCH_STATS: FusedForwardDispatchStats = FusedForwardDispatchStats {
+    attempts: AtomicUsize::new(0), kernel_calls: AtomicUsize::new(0), fallback_calls: AtomicUsize::new(0),
+    last_backup2_bpw: AtomicUsize::new(0), last_backup2_codes_offset: AtomicUsize::new(0), last_backup2_scale_offset: AtomicUsize::new(0),
+};
+
 // Symbols that lib.rs re-exports publicly. They live in sub-modules [see: `crate::*`, `pub use`]
 use crate::{
     CapturedGraph,
@@ -858,6 +873,19 @@ impl RocmDevice {
             )));
         }
         Ok(Box::new(storage))
+    }
+
+    /// Upload f32 data into HIP managed memory. Managed allocations remain
+    /// valid to ordinary ROCm kernels while HIP may migrate cold pages to
+    /// system RAM, providing a transparent overflow tier for large weights.
+    pub fn from_cpu_managed(
+        &self,
+        data: &[f32],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        RocmStorage::copy_from_host_managed(data, shape, dtype, &self.allocator, self.ordinal)
+            .map(|storage| Box::new(storage) as Box<dyn BackendStorage>)
     }
 
     /// Pinned-memory + async device→host download for the per-token decode hot path. [see: `hipMemcpy`, `Vec<f32>`]
@@ -2024,6 +2052,7 @@ impl BackendDevice for RocmDevice {
         _b_scales: &[f32],
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        FUSED_FORWARD_DISPATCH_STATS.attempts.fetch_add(1, Ordering::Relaxed);
         let a_storage = match a.as_any().downcast_ref::<RocmStorage>() {
             Some(s) => s,
             None => return self.matmul(a, b_packed, out_shape),
@@ -2176,43 +2205,60 @@ impl BackendDevice for RocmDevice {
             DTypeStorage::ResidualPacked(cfg) => {
                 // Generic variable-bitwidth packed + residual layout (WI-C / WI-T8): [see: `grim_fused_dequant_gemm_f16`, `enabled`]
                 if !self.fused_dequant_gemm_config.lock().unwrap().enabled {
+                    FUSED_FORWARD_DISPATCH_STATS.fallback_calls.fetch_add(1, Ordering::Relaxed);
                     return self.matmul(a, b_packed, out_shape);
                 }
-                let out_f16 = RocmStorage::alloc_gpu(
+                let out_f32 = RocmStorage::alloc_gpu(
                     out_shape,
-                    DType {
-                        arith: ArithType::F16,
-                        storage: DTypeStorage::Native,
-                    },
+                    dtype_f32(),
                     &self.allocator,
                     self.ordinal,
                 )?;
                 let residuals = grim_tensor::QuantizedMatmulBackwardResiduals::from_provenance(
                     &b_storage.provenance(),
                 );
-                // `from_provenance` leaves outlier pointers null by contract, so
-                if residuals.outlier_count > 0 {
-                    return self.matmul(a, b_packed, out_shape);
-                }
-                // The kernel treats a null scale pointer as scale=1.0; residuals'
+                let provenance = b_storage.provenance();
+                let (primary_bytes, outlier_indices, outlier_values) = match provenance {
+                    grim_tensor::QuantProvenance::WithResiduals { primary_scale_bytes, outlier_indices, outlier_values_bits, .. } => (
+                        primary_scale_bytes,
+                        outlier_indices,
+                        outlier_values_bits.into_iter().map(f32::from_bits).collect::<Vec<_>>(),
+                    ),
+                    _ => (Vec::new(), Vec::new(), Vec::new()),
+                };
+                let scales_storage = if primary_bytes.is_empty() { None } else { Some(RocmStorage::copy_from_host_raw_bytes(&primary_bytes, &Shape::from_slice(&[primary_bytes.len()]), DType { arith: ArithType::U8, storage: DTypeStorage::Native }, &self.allocator, self.ordinal)?) };
+                let index_bytes: Vec<u8> = outlier_indices.iter().flat_map(|v| v.to_ne_bytes()).collect();
+                let value_bytes: Vec<u8> = outlier_values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+                let indices_storage = if outlier_indices.is_empty() { None } else { Some(RocmStorage::copy_from_host_raw_bytes(&index_bytes, &Shape::from_slice(&[outlier_indices.len()]), DType { arith: ArithType::U32, storage: DTypeStorage::Native }, &self.allocator, self.ordinal)?) };
+                let values_storage = if outlier_values.is_empty() { None } else { Some(RocmStorage::copy_from_host_raw_bytes(&value_bytes, &Shape::from_slice(&[outlier_values.len()]), DType::F32, &self.allocator, self.ordinal)?) };
+                let scale_ptr = scales_storage.as_ref().and_then(|s| s.device_ptr).map(|p| p as *const c_void).unwrap_or(std::ptr::null());
+                let index_ptr = indices_storage.as_ref().and_then(|s| s.device_ptr).map(|p| p as *const c_void).unwrap_or(std::ptr::null());
+                let value_ptr = values_storage.as_ref().and_then(|s| s.device_ptr).map(|p| p as *const c_void).unwrap_or(std::ptr::null());
                 let stream = self.launch_fused_dequant_gemm_f16(
                     a_storage,
                     b_storage,
-                    std::ptr::null(),
-                    &out_f16,
+                    scale_ptr,
+                    &out_f32,
                     m,
                     n,
                     k,
                     cfg.bpw,
                     residuals.outlier_count,
-                    residuals.outlier_indices_ptr,
-                    residuals.outlier_values_ptr,
+                    index_ptr,
+                    value_ptr,
                     residuals.backup1_bpw,
                     residuals.backup1_codes_offset,
                     residuals.backup1_scale_offset,
+                    residuals.backup2_bpw,
+                    residuals.backup2_codes_offset,
+                    residuals.backup2_scale_offset,
                 )?;
+                FUSED_FORWARD_DISPATCH_STATS.kernel_calls.fetch_add(1, Ordering::Relaxed);
+                FUSED_FORWARD_DISPATCH_STATS.last_backup2_bpw.store(residuals.backup2_bpw as usize, Ordering::Relaxed);
+                FUSED_FORWARD_DISPATCH_STATS.last_backup2_codes_offset.store(residuals.backup2_codes_offset, Ordering::Relaxed);
+                FUSED_FORWARD_DISPATCH_STATS.last_backup2_scale_offset.store(residuals.backup2_scale_offset, Ordering::Relaxed);
                 let handle: Box<dyn ComputeHandle> = Box::new(RocmHandle::new(Some(stream)));
-                return Ok((Box::new(out_f16), handle));
+                return Ok((Box::new(out_f32), handle));
             }
             _ => {
                 return self.matmul(a, b_packed, out_shape);
@@ -3339,6 +3385,9 @@ impl RocmDevice {
         backup_bpw: u8,
         backup_codes_offset: usize,
         backup_scale_offset: usize,
+        backup2_bpw: u8,
+        backup2_codes_offset: usize,
+        backup2_scale_offset: usize,
     ) -> Result<*mut c_void> {
         let a_ptr = a_storage
             .device_ptr
@@ -3386,6 +3435,9 @@ impl RocmDevice {
         let mut b_bpw = backup_bpw as i32;
         let mut b_codes_off = backup_codes_offset as i32;
         let mut b_scale_off = backup_scale_offset as i32;
+        let mut b2_bpw = backup2_bpw as i32;
+        let mut b2_codes_off = backup2_codes_offset as i32;
+        let mut b2_scale_off = backup2_scale_offset as i32;
 
         let solution_index = lookup_solution_index(m, n, k, ArithType::F16);
         self.launch_compute_kernel_with_solution(
@@ -3409,6 +3461,9 @@ impl RocmDevice {
                 arg(&mut b_bpw),
                 arg(&mut b_codes_off),
                 arg(&mut b_scale_off),
+                arg(&mut b2_bpw),
+                arg(&mut b2_codes_off),
+                arg(&mut b2_scale_off),
             ],
             Some(solution_index),
         )

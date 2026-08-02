@@ -14,7 +14,9 @@ layout(push_constant) uniform Params {
 layout(std430, binding = 0) readonly buffer BufQ { float Q[]; };
 layout(std430, binding = 1) readonly buffer BufK { uint K_bytes[]; };
 layout(std430, binding = 2) readonly buffer BufV { uint V_bytes[]; };
-layout(std430, binding = 3) writeonly buffer BufOut { float Out[]; };
+layout(std430, binding = 3) readonly buffer BufKScales { float K_scales[]; };
+layout(std430, binding = 4) readonly buffer BufVScales { float V_scales[]; };
+layout(std430, binding = 5) writeonly buffer BufOut { float Out[]; };
 
 uint get_byte_k(uint byte_idx) {
     uint word = K_bytes[byte_idx / 4u];
@@ -26,24 +28,6 @@ uint get_byte_v(uint byte_idx) {
     uint word = V_bytes[byte_idx / 4u];
     uint shift = (byte_idx % 4u) * 8u;
     return (word >> shift) & 0xFFu;
-}
-
-float unpack_f16_bytes(uint b0, uint b1) {
-    uint bits = b0 | (b1 << 8u);
-    if (bits == 0u) return 0.0;
-    uint sign = (bits >> 15u) & 1u;
-    uint exp = (bits >> 10u) & 0x1Fu;
-    uint mant = bits & 0x3FFu;
-    if (exp == 0u) {
-        if (mant == 0u) return 0.0;
-        float f = float(mant) / 1024.0 * exp2(-14.0);
-        return sign == 1u ? -f : f;
-    } else if (exp == 31u) {
-        return sign == 1u ? -1.0 / 0.0 : 1.0 / 0.0;
-    } else {
-        float f = (1.0 + float(mant) / 1024.0) * exp2(float(exp) - 15.0);
-        return sign == 1u ? -f : f;
-    }
 }
 
 void main() {
@@ -62,8 +46,8 @@ void main() {
 
     for (uint t = 0u; t < seq_len; ++t) {
         uint block_start = t * 34u;
-        float d_k = unpack_f16_bytes(get_byte_k(block_start), get_byte_k(block_start + 1u));
-        uint raw_k = get_byte_k(block_start + 2u + (tid % 32u));
+        float d_k = K_scales[t];
+        uint raw_k = get_byte_k(t * 32u + (tid % 32u));
         int sb_k = (raw_k >= 128u) ? int(raw_k) - 256 : int(raw_k);
         float k_val = d_k * float(sb_k);
 
@@ -75,8 +59,8 @@ void main() {
             sum_exp += exp(score - max_score);
         }
 
-        float d_v = unpack_f16_bytes(get_byte_v(block_start), get_byte_v(block_start + 1u));
-        uint raw_v = get_byte_v(block_start + 2u + (tid % 32u));
+        float d_v = V_scales[t];
+        uint raw_v = get_byte_v(t * 32u + (tid % 32u));
         int sb_v = (raw_v >= 128u) ? int(raw_v) - 256 : int(raw_v);
         float v_val = d_v * float(sb_v);
 

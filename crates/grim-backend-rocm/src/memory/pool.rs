@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use grim_tensor::error::{Error, Result};
 
-use crate::{check_hip, hipFree, hipMalloc};
+use crate::{check_hip, hipFree, hipMalloc, hipMallocManaged};
 
 /// Layout key for the scratch pool: (rounded size, alignment). [see: `hipMalloc`]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -92,9 +92,14 @@ impl DeviceScratchPool {
             Some(p) => p,
             None => {
                 let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
-                check_hip("scratch pool hipMalloc", unsafe {
-                    hipMalloc(&mut p, layout.size)
-                })?;
+                let mut status = unsafe { hipMalloc(&mut p, layout.size) };
+                if status != crate::hipSuccess {
+                    // The scratch pool also serves temporary activations. Use
+                    // managed memory as the last allocation tier when VRAM
+                    // is exhausted; hipFree remains valid for both kinds.
+                    status = unsafe { hipMallocManaged(&mut p, layout.size, 1) };
+                }
+                check_hip("scratch pool allocation", status)?;
                 self.current_bytes.fetch_add(layout.size, Ordering::Relaxed);
                 let cur = self.current_bytes.load(Ordering::Relaxed);
                 let mut peak = self.peak_bytes.load(Ordering::Relaxed);

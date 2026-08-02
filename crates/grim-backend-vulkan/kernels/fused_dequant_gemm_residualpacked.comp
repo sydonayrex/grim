@@ -1,0 +1,72 @@
+#version 450
+
+// ResidualPacked reference kernel.  The payload is byte-addressed through a
+// uint buffer; codes use the Phase 4 MSB-first packing and 256-byte row stride.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size; uint dim; uint k; uint n; uint m; float eps;
+    uint primary_bpw; uint backup1_bpw; uint backup2_bpw;
+    uint backup1_codes_offset; uint backup1_scale_offset;
+    uint backup2_codes_offset; uint backup2_scale_offset;
+    uint scale_offset; uint outlier_count;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufA { float A[]; };
+layout(std430, binding = 1) readonly buffer BufB { uint B_bytes[]; };
+layout(std430, binding = 2) writeonly buffer BufC { float C[]; };
+layout(std430, binding = 3) readonly buffer OutlierIndices { uint out_idx[]; };
+layout(std430, binding = 4) readonly buffer OutlierValues { float out_val[]; };
+
+uint byte_at(uint off) {
+    uint word = B_bytes[off / 4u];
+    return (word >> ((off % 4u) * 8u)) & 0xffu;
+}
+
+float scale_at(uint off, uint row) {
+    return float(byte_at(off + row)) / 255.0;
+}
+
+uint code_at(uint off, uint row, uint col, uint bpw) {
+    uint row_bytes = ((params.k * bpw + 7u) / 8u + 255u) & ~255u;
+    uint first_bit = col * bpw;
+    uint code = 0u;
+    for (uint b = 0u; b < 8u; ++b) {
+        if (b >= bpw) break;
+        uint bit = first_bit + b;
+        uint p = off + row * row_bytes + bit / 8u;
+        code = (code << 1u) | ((byte_at(p) >> (7u - (bit % 8u))) & 1u);
+    }
+    return code;
+}
+
+float layer_value(uint off, uint scale_off, uint row, uint col, uint bpw) {
+    if (bpw == 0u) return 0.0;
+    float scale = scale_at(scale_off, row);
+    return (float(code_at(off, row, col, bpw)) / float((1u << bpw) - 1u) * 2.0 - 1.0) * scale;
+}
+
+float outlier(uint flat_idx, float value) {
+    uint lo = 0u, hi = params.outlier_count;
+    while (lo < hi) {
+        uint mid = (lo + hi) / 2u;
+        uint idx = out_idx[mid];
+        if (idx < flat_idx) lo = mid + 1u; else hi = mid;
+    }
+    return (lo < params.outlier_count && out_idx[lo] == flat_idx) ? out_val[lo] : value;
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    if (row >= params.m || col >= params.n) return;
+    float acc = 0.0;
+    for (uint i = 0u; i < params.k; ++i) {
+        float w = layer_value(0u, params.scale_offset, col, i, params.primary_bpw);
+        w += layer_value(params.backup1_codes_offset, params.backup1_scale_offset, col, i, params.backup1_bpw);
+        w += layer_value(params.backup2_codes_offset, params.backup2_scale_offset, col, i, params.backup2_bpw);
+        w = outlier(col * params.k + i, w);
+        acc += A[row * params.k + i] * w;
+    }
+    C[row * params.n + col] = acc;
+}

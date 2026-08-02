@@ -109,6 +109,7 @@ mod tests {
             provenance: QuantProvenance::GrimNative,
             ordinal: 0,
             allocator: Arc::new(RocmCachingAllocator::new(0, 0)),
+            managed: false,
         };
         assert_eq!(dummy.bytes(), 0);
         assert_eq!(dummy.shape_metadata().elem_count(), 1);
