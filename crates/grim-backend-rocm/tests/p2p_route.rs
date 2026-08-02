@@ -30,7 +30,7 @@
 //! - `rust-ml-llm-architecture` — backend isolation: the routing
 //!   primitive lives in the ROCm crate, not core.
 
-use grim_backend_rocm::p2p_route::{to_route_link, HostStagingBuffer, RouteLink};
+use grim_backend_rocm::p2p_route::{HostStagingBuffer, RouteLink, to_route_link};
 use grim_backend_rocm::peer_access::P2PStatus;
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
@@ -91,7 +91,11 @@ fn link_decision_pcie_status_below_threshold_is_peer_direct() -> TestResult {
     let decision = to_route_link(P2PStatus::Pcie, 1024, u64::MAX);
     assert_eq!(decision, RouteLink::PeerDirect, "tiny PCIe direct");
     let decision = to_route_link(P2PStatus::Pcie, 0, u64::MAX);
-    assert_eq!(decision, RouteLink::PeerDirect, "0-byte PCIe direct is a no-op");
+    assert_eq!(
+        decision,
+        RouteLink::PeerDirect,
+        "0-byte PCIe direct is a no-op"
+    );
     Ok(())
 }
 
@@ -129,7 +133,11 @@ fn link_decision_pcie_overflow_threshold_saturates() -> TestResult {
     // possible value, the decision should still pick — HostBounce for
     // a `bytes` that exceeds the (saturated) threshold.
     let decision = to_route_link(P2PStatus::Pcie, u64::MAX, u64::MAX);
-    assert_eq!(decision, RouteLink::PeerDirect, "threshold = bytes → inclusive");
+    assert_eq!(
+        decision,
+        RouteLink::PeerDirect,
+        "threshold = bytes → inclusive"
+    );
     let decision = to_route_link(P2PStatus::Pcie, u64::MAX, u64::MAX - 1);
     assert_eq!(decision, RouteLink::HostBounce);
     Ok(())
@@ -152,7 +160,9 @@ fn host_staging_buffer_round_trips_a_short_byte_record() -> TestResult {
     let mut stage = HostStagingBuffer::new(64)?;
     // Write into the staging buffer.
     let payload = b"grim-qkv-attn".to_vec();
-    let bytes_mut = stage.bytes_mut().ok_or("staging bytes_mut() returned None")?;
+    let bytes_mut = stage
+        .bytes_mut()
+        .ok_or("staging bytes_mut() returned None")?;
     assert!(bytes_mut.len() >= payload.len());
     bytes_mut[..payload.len()].copy_from_slice(&payload);
     // The pinned device pointer is a stable `*mut c_void` exposed via
@@ -179,7 +189,10 @@ fn host_staging_buffer_zero_size_returns_err() -> TestResult {
         return Ok(());
     }
     let res = HostStagingBuffer::new(0);
-    assert!(res.is_err(), "zero-byte staging buffer is a programming mistake");
+    assert!(
+        res.is_err(),
+        "zero-byte staging buffer is a programming mistake"
+    );
     Ok(())
 }
 

@@ -65,15 +65,18 @@ pub mod tape;
 
 pub use soul_eater::{SoulEaterAdapter, SoulEaterOptimizer};
 
-pub use adamw::{AdamW, AdamWConfig, Optimizer, OptimizerKind, PagedAdamW, PagedAdamWConfig, Lion8Bit, Lion8BitConfig, Adafactor, AdafactorConfig, LRScheduler};
-pub use lr_schedule::CosineWarmupSchedule;
+pub use adamw::{
+    Adafactor, AdafactorConfig, AdamW, AdamWConfig, LRScheduler, Lion8Bit, Lion8BitConfig,
+    Optimizer, OptimizerKind, PagedAdamW, PagedAdamWConfig,
+};
 pub use backward::{BackwardContext, backward};
-pub use collate::{VarLenCollator, TokenSequence, PackedBatch};
+pub use collate::{PackedBatch, TokenSequence, VarLenCollator};
 pub use injection::{
     InjectionConfig, LoRAInjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry,
     loftq_initialize, pissa_initialize,
 };
 pub use loss::cross_entropy_loss;
+pub use lr_schedule::CosineWarmupSchedule;
 pub use ops::{
     AddArgs, FakeQuantInt4Args, MatMulArgs, ScaleArgs, add_backward, apply_and_record_lora,
     fake_quant_int4_backward, fake_quant_int4_forward, lora_backward, matmul_backward,
@@ -81,9 +84,8 @@ pub use ops::{
 };
 pub use param::{ParamId, TrainableParam, TrainableParams};
 pub use preference_loss::{
-    dpo_loss, dpo_loss_autograd, grpo_loss, grpo_loss_autograd, grpo_normalize_rewards,
-    kto_loss, olora_orthogonality_penalty, orpo_odds_ratio_loss, orpo_odds_ratio_loss_autograd,
-    simpo_loss,
+    dpo_loss, dpo_loss_autograd, grpo_loss, grpo_loss_autograd, grpo_normalize_rewards, kto_loss,
+    olora_orthogonality_penalty, orpo_odds_ratio_loss, orpo_odds_ratio_loss_autograd, simpo_loss,
 };
 pub use registry::AutogradRegistry;
 pub use tape::{Tape, TapeEntry, TapeKind, TensorId};
@@ -98,13 +100,31 @@ pub fn pick_device_for_tensor(x: &Tensor) -> Box<dyn BackendDevice> {
     match x.device() {
         Device::Cpu => Box::new(grim_backend_cpu::CpuDevice::new()),
         #[cfg(feature = "cuda-mem")]
-        Device::Cuda(ordinal) => Box::new(grim_backend_cuda::CudaDevice::new(*ordinal)),
+        Device::Cuda(ordinal) => {
+            if let Ok(dev) = grim_backend_cuda::CudaDevice::new(*ordinal) {
+                Box::new(dev)
+            } else {
+                Box::new(grim_backend_cpu::CpuDevice::new())
+            }
+        }
         #[cfg(feature = "rocm-mem")]
-        Device::Rocm(ordinal) => Box::new(grim_backend_rocm::RocmDevice::new(*ordinal)),
+        Device::Rocm(ordinal) => {
+            if let Ok(dev) = grim_backend_rocm::RocmDevice::try_new(*ordinal) {
+                Box::new(dev)
+            } else {
+                Box::new(grim_backend_cpu::CpuDevice::new())
+            }
+        }
         #[cfg(feature = "vulkan-mem")]
         Device::Vulkan => Box::new(grim_backend_vulkan::VulkanDevice::new()),
         #[cfg(feature = "metal-mem")]
-        Device::Metal(ordinal) => Box::new(grim_backend_metal::MetalDevice::new(*ordinal)),
+        Device::Metal(ordinal) => {
+            if let Ok(dev) = grim_backend_metal::MetalDevice::new(*ordinal) {
+                Box::new(dev)
+            } else {
+                Box::new(grim_backend_cpu::CpuDevice::new())
+            }
+        }
         _ => Box::new(grim_backend_cpu::CpuDevice::new()),
     }
 }

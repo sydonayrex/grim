@@ -40,44 +40,44 @@ impl LlamaBlock {
             &ws.pp("attn").pp("wq"),
             cfg.hidden_size,
             cfg.num_heads * cfg.head_dim,
-            /*has_bias=*/false,
+            /*has_bias=*/ false,
         )?;
         let wk = Linear::load(
             &ws.pp("attn").pp("wk"),
             cfg.hidden_size,
             cfg.num_kv_heads * cfg.head_dim,
-            /*has_bias=*/false,
+            /*has_bias=*/ false,
         )?;
         let wv = Linear::load(
             &ws.pp("attn").pp("wv"),
             cfg.hidden_size,
             cfg.num_kv_heads * cfg.head_dim,
-            /*has_bias=*/false,
+            /*has_bias=*/ false,
         )?;
         let wo = Linear::load(
             &ws.pp("attn").pp("wo"),
             cfg.num_heads * cfg.head_dim,
             cfg.hidden_size,
-            /*has_bias=*/false,
+            /*has_bias=*/ false,
         )?;
         let ffn_norm = RmsNorm::load(&ws.pp("ffn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
         let w_gate = Linear::load(
             &ws.pp("ffn").pp("w_gate"),
             cfg.hidden_size,
             cfg.intermediate_size,
-            /*has_bias=*/false,
+            /*has_bias=*/ false,
         )?;
         let w_up = Linear::load(
             &ws.pp("ffn").pp("w_up"),
             cfg.hidden_size,
             cfg.intermediate_size,
-            /*has_bias=*/false,
+            /*has_bias=*/ false,
         )?;
         let w_down = Linear::load(
             &ws.pp("ffn").pp("w_down"),
             cfg.intermediate_size,
             cfg.hidden_size,
-            /*has_bias=*/false,
+            /*has_bias=*/ false,
         )?;
         let device = wq.weight.device().clone();
         let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
@@ -111,7 +111,11 @@ impl LlamaBlock {
     /// Like `forward` but also returns the K and V tensors (post-RoPE) so
     /// the caller can populate the KV cache (MAJ-1: Llama CPU path was
     /// not storing K/V, making the cache infrastructure dead code).
-    pub fn forward_with_kv(&self, x: &Tensor, positions: &[u32]) -> Result<(Tensor, Tensor, Tensor)> {
+    pub fn forward_with_kv(
+        &self,
+        x: &Tensor,
+        positions: &[u32],
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let _dims = x.shape().dims().to_vec();
         let hidden = self._cfg.hidden_size;
 
@@ -124,63 +128,44 @@ impl LlamaBlock {
         let attn_out = self.prefilled_self_attention(&q, &k, &v, positions)?;
         let attn_out = self.wo.forward(&attn_out)?;
 
-        let x_res1_data = x_2d.to_vec_f32()?;
-        let attn_data = attn_out.to_vec_f32()?;
-        let mut added = vec![0.0f32; x_res1_data.len()];
-        for i in 0..x_res1_data.len() {
-            added[i] = x_res1_data[i] + attn_data[i];
-        }
+        let added = grim_nn::modules::add_on_device(&x_2d, &attn_out)?;
 
         // FFN: standard Llama uses a single shared expert for all tokens.
-        // Process the full batch in one forward pass instead of per-token
-        // CPU roundtrips (MAJ-4/MAJ-6: removed round-robin expert dispatch
-        // and per-token device uploads).
+        // Process the full batch in one forward pass on-device (zero CPU roundtrips).
         let x_norm = self.ffn_norm.forward(&x_2d)?;
         let gate = self.w_gate.forward(&x_norm)?;
         let up = self.w_up.forward(&x_norm)?;
-        let gate_data = gate.to_vec_f32()?;
-        let up_data = up.to_vec_f32()?;
-        let mut silu_data = vec![0.0f32; gate_data.len()];
-        for i in 0..gate_data.len() {
-            let xv = gate_data[i];
-            silu_data[i] = (xv / (1.0 + (-xv).exp())) * up_data[i];
-        }
-        let silu_storage = {
-            let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
-            let storage = dev.from_cpu(&silu_data, &gate.shape().clone(), grim_tensor::DType::F32)?;
-            Tensor::new(std::sync::Arc::from(storage), gate.shape().clone(), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), self._dev.clone())
-        };
+        let silu_storage = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
         let ffn_out = self.w_down.forward(&silu_storage)?;
-        let ffn_data = ffn_out.to_vec_f32()?;
 
-        let mut out = vec![0.0f32; x_res1_data.len()];
-        for i in 0..x_res1_data.len() {
-            out[i] = added[i] + ffn_data[i];
-        }
-        let out = {
-            let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
-            let storage = dev.from_cpu(&out, &x.shape().clone(), grim_tensor::DType::F32)?;
-            Tensor::new(std::sync::Arc::from(storage), x.shape().clone(), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), self._dev.clone())
-        };
+        let out = grim_nn::modules::add_on_device(&added, &ffn_out)?;
         Ok((out, k, v))
     }
 
     /// Apply RoPE to a multi-head tensor of shape (B, S, num_heads * head_dim)
     /// or (S, num_heads * head_dim) by reshaping to (B, S * num_heads, head_dim),
     /// repeating positions per-head, and reshaping back.
-    pub(crate) fn apply_rope_multi_head(&self, x: &Tensor, positions: &[u32], num_heads: usize) -> Result<Tensor> {
+    pub(crate) fn apply_rope_multi_head(
+        &self,
+        x: &Tensor,
+        positions: &[u32],
+        num_heads: usize,
+    ) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
         let (b, s, d) = if dims.len() == 3 {
             (dims[0], dims[1], dims[2])
         } else if dims.len() == 2 {
             (1, dims[0], dims[1])
         } else {
-            return Err(grim_core::error::Error::Shape(format!("expected 2-D or 3-D tensor, got {dims:?}")));
+            return Err(grim_core::error::Error::Shape(format!(
+                "expected 2-D or 3-D tensor, got {dims:?}"
+            )));
         };
         let head_dim = self._cfg.head_dim;
         if d != num_heads * head_dim {
             return Err(grim_core::error::Error::Shape(format!(
-                "expected last dim {num_heads}*{head_dim}={}, got {d}", num_heads * head_dim
+                "expected last dim {num_heads}*{head_dim}={}, got {d}",
+                num_heads * head_dim
             )));
         }
         // Reshape (B, S, num_heads * head_dim) -> (B, S * num_heads, head_dim)
@@ -199,15 +184,29 @@ impl LlamaBlock {
         }
         let reshaped_tensor = {
             let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
-            let storage = dev.from_cpu(&reshaped, &Shape::new(vec![b, s * num_heads, head_dim]), grim_tensor::DType::F32)?;
-            Tensor::new(std::sync::Arc::from(storage), Shape::new(vec![b, s * num_heads, head_dim]), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), self._dev.clone())
+            let storage = dev.from_cpu(
+                &reshaped,
+                &Shape::new(vec![b, s * num_heads, head_dim]),
+                grim_tensor::DType::F32,
+            )?;
+            Tensor::new(
+                std::sync::Arc::from(storage),
+                Shape::new(vec![b, s * num_heads, head_dim]),
+                grim_tensor::DType::F32,
+                grim_tensor::QuantProvenance::default(),
+                self._dev.clone(),
+            )
         };
         // Repeat positions per-head. If positions is empty, default to
         // sequential positions (0..s) — callers that don't track position
         // (e.g. streaming block forward) still get valid RoPE.
         let mut ext_positions = Vec::with_capacity(s * num_heads);
         for si in 0..s {
-            let pos = if si < positions.len() { positions[si] } else { si as u32 };
+            let pos = if si < positions.len() {
+                positions[si]
+            } else {
+                si as u32
+            };
             for _ in 0..num_heads {
                 ext_positions.push(pos);
             }
@@ -229,7 +228,13 @@ impl LlamaBlock {
         }
         let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
         let storage = dev.from_cpu(&result, &x.shape().clone(), grim_tensor::DType::F32)?;
-        Ok(Tensor::new(std::sync::Arc::from(storage), x.shape().clone(), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), self._dev.clone()))
+        Ok(Tensor::new(
+            std::sync::Arc::from(storage),
+            x.shape().clone(),
+            grim_tensor::DType::F32,
+            grim_tensor::QuantProvenance::default(),
+            self._dev.clone(),
+        ))
     }
 
     pub(crate) fn prefilled_self_attention(
@@ -247,7 +252,7 @@ impl LlamaBlock {
         // RoPE, then reshape back.
         let q = self.apply_rope_multi_head(q, positions, cfg.num_heads)?;
         let k = self.apply_rope_multi_head(k, positions, cfg.num_kv_heads)?;
-        
+
         let qd = q.to_vec_f32()?;
         let kd = k.to_vec_f32()?;
         let vd = v.to_vec_f32()?;
@@ -256,7 +261,7 @@ impl LlamaBlock {
         let scale = 1.0 / (cfg.head_dim as f32).sqrt();
         let mut out = vec![0.0f32; total_tokens * num_head_dims];
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
-        
+
         for h in 0..cfg.num_heads {
             let kvh = (h * cfg.num_kv_heads) / cfg.num_heads;
             for t in 0..total_tokens {
@@ -295,8 +300,18 @@ impl LlamaBlock {
         }
         Ok({
             let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
-            let storage = dev.from_cpu(&out, &Shape::new(vec![total_tokens, num_head_dims]), grim_tensor::DType::F32)?;
-            Tensor::new(std::sync::Arc::from(storage), Shape::new(vec![total_tokens, num_head_dims]), grim_tensor::DType::F32, grim_tensor::QuantProvenance::default(), self._dev.clone())
+            let storage = dev.from_cpu(
+                &out,
+                &Shape::new(vec![total_tokens, num_head_dims]),
+                grim_tensor::DType::F32,
+            )?;
+            Tensor::new(
+                std::sync::Arc::from(storage),
+                Shape::new(vec![total_tokens, num_head_dims]),
+                grim_tensor::DType::F32,
+                grim_tensor::QuantProvenance::default(),
+                self._dev.clone(),
+            )
         })
     }
 }
@@ -305,7 +320,7 @@ impl LlamaBlock {
 mod tests {
     use super::*;
     use grim_backend_cpu::cpu_tensor;
-    use grim_tensor::{Device, DType, Shape, Tensor};
+    use grim_tensor::{DType, Device, Shape, Tensor};
 
     fn small_cfg() -> LlamaConfigRefs {
         LlamaConfigRefs {
@@ -322,7 +337,9 @@ mod tests {
         // softmax (large weights saturate softmax and make RoPE effects
         // invisible).
         let w = cpu_tensor(
-            (0..out_dim * in_dim).map(|i| (i as f32 * 0.001) - 0.05).collect::<Vec<f32>>(),
+            (0..out_dim * in_dim)
+                .map(|i| (i as f32 * 0.001) - 0.05)
+                .collect::<Vec<f32>>(),
             Shape::new(vec![out_dim, in_dim]),
         );
         Linear::from_tensor(w, None)
@@ -333,7 +350,10 @@ mod tests {
             (0..dim).map(|_| 1.0f32).collect::<Vec<f32>>(),
             Shape::new(vec![dim]),
         );
-        RmsNorm { weight: w, eps: 1e-5 }
+        RmsNorm {
+            weight: w,
+            eps: 1e-5,
+        }
     }
 
     fn small_block() -> LlamaBlock {
@@ -350,8 +370,18 @@ mod tests {
         let ffn_norm = make_rmsnorm(cfg.hidden_size);
         let rope = Rope::new(cfg.head_dim, 10000.0);
         LlamaBlock {
-            attn_norm, wq, wk, wv, wo, ffn_norm, w_gate, w_up, w_down, rope,
-            _dev: dev, _cfg: cfg,
+            attn_norm,
+            wq,
+            wk,
+            wv,
+            wo,
+            ffn_norm,
+            w_gate,
+            w_up,
+            w_down,
+            rope,
+            _dev: dev,
+            _cfg: cfg,
         }
     }
 
@@ -388,7 +418,9 @@ mod tests {
             assert!(
                 (out1_data[i] - out2_data[i]).abs() < 1e-5,
                 "Position {} leaked future token: {} vs {}",
-                i, out1_data[i], out2_data[i]
+                i,
+                out1_data[i],
+                out2_data[i]
             );
         }
     }
@@ -413,7 +445,11 @@ mod tests {
 
         // Non-uniform position shift should change output via RoPE
         let diff: f32 = v0.iter().zip(v10.iter()).map(|(a, b)| (a - b).abs()).sum();
-        assert!(diff > 1e-3, "RoPE did not produce position-dependent output (diff={})", diff);
+        assert!(
+            diff > 1e-3,
+            "RoPE did not produce position-dependent output (diff={})",
+            diff
+        );
     }
 
     /// Direct test: Rope::forward with multi-token 3D input produces
@@ -441,8 +477,12 @@ mod tests {
         let data: Vec<f32> = (0..3 * cfg.hidden_size).map(|i| (i as f32) * 0.1).collect();
         let q = make_tensor(data, &[3, cfg.hidden_size]);
 
-        let rope0 = block.apply_rope_multi_head(&q, &[0, 1, 2], cfg.num_heads).unwrap();
-        let rope10 = block.apply_rope_multi_head(&q, &[10, 11, 12], cfg.num_heads).unwrap();
+        let rope0 = block
+            .apply_rope_multi_head(&q, &[0, 1, 2], cfg.num_heads)
+            .unwrap();
+        let rope10 = block
+            .apply_rope_multi_head(&q, &[10, 11, 12], cfg.num_heads)
+            .unwrap();
 
         let v0 = rope0.to_vec_f32().unwrap();
         let v10 = rope10.to_vec_f32().unwrap();
@@ -466,28 +506,56 @@ mod tests {
         let v = block.wv.forward(&x_norm).unwrap();
 
         // Q after RoPE must differ for different absolute positions
-        let q0 = block.apply_rope_multi_head(&q, &[0, 1, 2], cfg.num_heads).unwrap();
-        let q10 = block.apply_rope_multi_head(&q, &[10, 11, 12], cfg.num_heads).unwrap();
+        let q0 = block
+            .apply_rope_multi_head(&q, &[0, 1, 2], cfg.num_heads)
+            .unwrap();
+        let q10 = block
+            .apply_rope_multi_head(&q, &[10, 11, 12], cfg.num_heads)
+            .unwrap();
         let qd0 = q0.to_vec_f32().unwrap();
         let qd10 = q10.to_vec_f32().unwrap();
-        let diff: f32 = qd0.iter().zip(qd10.iter()).map(|(a, b)| (a - b).abs()).sum();
+        let diff: f32 = qd0
+            .iter()
+            .zip(qd10.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
         assert!(diff > 1e-3, "Q after RoPE diff={}", diff);
 
         // Uniform shift → attention output invariant (RoPE relative encoding)
-        let out0 = block.prefilled_self_attention(&q, &k, &v, &[0, 1, 2]).unwrap();
-        let out10 = block.prefilled_self_attention(&q, &k, &v, &[10, 11, 12]).unwrap();
+        let out0 = block
+            .prefilled_self_attention(&q, &k, &v, &[0, 1, 2])
+            .unwrap();
+        let out10 = block
+            .prefilled_self_attention(&q, &k, &v, &[10, 11, 12])
+            .unwrap();
         let od0 = out0.to_vec_f32().unwrap();
         let od10 = out10.to_vec_f32().unwrap();
-        let odiff: f32 = od0.iter().zip(od10.iter()).map(|(a, b)| (a - b).abs()).sum();
-        assert!(odiff < 1e-3, "Uniform shift should give identical attention (RoPE relative), diff={}", odiff);
+        let odiff: f32 = od0
+            .iter()
+            .zip(od10.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            odiff < 1e-3,
+            "Uniform shift should give identical attention (RoPE relative), diff={}",
+            odiff
+        );
 
         // Non-uniform shift → attention output differs
-        let out_a = block.prefilled_self_attention(&q, &k, &v, &[0, 1, 2]).unwrap();
-        let out_b = block.prefilled_self_attention(&q, &k, &v, &[0, 2, 5]).unwrap();
+        let out_a = block
+            .prefilled_self_attention(&q, &k, &v, &[0, 1, 2])
+            .unwrap();
+        let out_b = block
+            .prefilled_self_attention(&q, &k, &v, &[0, 2, 5])
+            .unwrap();
         let oa = out_a.to_vec_f32().unwrap();
         let ob = out_b.to_vec_f32().unwrap();
         let odiff2: f32 = oa.iter().zip(ob.iter()).map(|(a, b)| (a - b).abs()).sum();
-        assert!(odiff2 > 1e-3, "Non-uniform positions should change attention, diff={}", odiff2);
+        assert!(
+            odiff2 > 1e-3,
+            "Non-uniform positions should change attention, diff={}",
+            odiff2
+        );
     }
 
     /// Debug: verify scores change with positions (kept as a regression guard
@@ -507,26 +575,50 @@ mod tests {
         let scale = 1.0 / (cfg.head_dim as f32).sqrt();
 
         let compute_scores = |positions: &[u32]| -> (f32, f32) {
-            let q_r = block.apply_rope_multi_head(&q, positions, cfg.num_heads).unwrap();
-            let k_r = block.apply_rope_multi_head(&k, positions, cfg.num_kv_heads).unwrap();
+            let q_r = block
+                .apply_rope_multi_head(&q, positions, cfg.num_heads)
+                .unwrap();
+            let k_r = block
+                .apply_rope_multi_head(&k, positions, cfg.num_kv_heads)
+                .unwrap();
             let qd = q_r.to_vec_f32().unwrap();
             let kd = k_r.to_vec_f32().unwrap();
-            let h = 0; let kvh = 0; let t = 1;
-            let s0 = (0..cfg.head_dim).map(|d| {
-                qd[t * num_head_dims + h * cfg.head_dim + d] * kd[0 * kv_stride + kvh * cfg.head_dim + d]
-            }).sum::<f32>() * scale;
-            let s1 = (0..cfg.head_dim).map(|d| {
-                qd[t * num_head_dims + h * cfg.head_dim + d] * kd[1 * kv_stride + kvh * cfg.head_dim + d]
-            }).sum::<f32>() * scale;
+            let h = 0;
+            let kvh = 0;
+            let t = 1;
+            let s0 = (0..cfg.head_dim)
+                .map(|d| {
+                    qd[t * num_head_dims + h * cfg.head_dim + d]
+                        * kd[0 * kv_stride + kvh * cfg.head_dim + d]
+                })
+                .sum::<f32>()
+                * scale;
+            let s1 = (0..cfg.head_dim)
+                .map(|d| {
+                    qd[t * num_head_dims + h * cfg.head_dim + d]
+                        * kd[1 * kv_stride + kvh * cfg.head_dim + d]
+                })
+                .sum::<f32>()
+                * scale;
             (s0, s1)
         };
 
         let (s0_a, s1_a) = compute_scores(&[0, 1, 2]);
         let (s0_b, s1_b) = compute_scores(&[0, 2, 5]);
         // s0 (q1·k0) differs because relative position differs (1 vs 2)
-        assert!((s0_a - s0_b).abs() > 1e-4, "s0 identical: a={}, b={}", s0_a, s0_b);
+        assert!(
+            (s0_a - s0_b).abs() > 1e-4,
+            "s0 identical: a={}, b={}",
+            s0_a,
+            s0_b
+        );
         // s1 (q1·k1) same because relative position identical (0 vs 0)
-        assert!((s1_a - s1_b).abs() < 1e-3, "s1 differs: a={}, b={}", s1_a, s1_b);
+        assert!(
+            (s1_a - s1_b).abs() < 1e-3,
+            "s1 differs: a={}, b={}",
+            s1_a,
+            s1_b
+        );
     }
 
     /// MAJ-1: forward_with_kv returns K/V tensors for KV cache population.
@@ -565,6 +657,10 @@ mod tests {
         let v0 = out_0.to_vec_f32().unwrap();
         let v5 = out_5.to_vec_f32().unwrap();
         let diff: f32 = v0.iter().zip(v5.iter()).map(|(a, b)| (a - b).abs()).sum();
-        assert!(diff > 1e-3, "Non-uniform positions produced identical output (diff={})", diff);
+        assert!(
+            diff > 1e-3,
+            "Non-uniform positions produced identical output (diff={})",
+            diff
+        );
     }
 }

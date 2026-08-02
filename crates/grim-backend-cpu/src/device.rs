@@ -2,20 +2,11 @@
 //!
 //! ## GEMM dispatch (§4.1 — OxiBLAS)
 //!
-//! Matrix multiplication routes through [`gemm_dispatch`], which selects
-//! the fastest available path at compile time:
+//! Matrix multiplication routes through [`gemm_dispatch`]:
 //!
-//! 1. **`oxiblas` feature on (default):** calls `matrixmultiply::sgemm` —
-//!    a pure-Rust SIMD-accelerated BLAS kernel (no Fortran, no LAPACK,
-//!    no C++ linkage). This is the backend `scirs2-linalg` uses internally
-//!    and matches the "OxiBLAS" target in the Grim architecture document.
-//! 2. **M = 1 (GEMV fast path):** for the single-token decode step, we
-//!    avoid a full M×N×K loop and instead walk rows of B in a single pass,
-//!    which maps well to prefetching behaviour on both x86-64 and ARM.
-//!    This path is always available regardless of the `oxiblas` feature.
-//! 3. **Scalar fallback:** triple-loop GEMM, compiled when `oxiblas` is
-//!    disabled. Kept so the crate builds on targets without SIMD or under
-//!    `--no-default-features` for fuzzing/no-std builds.
+//! 1. `M=1` GEMV fast path — single-token decode, avoids GEMM overhead.
+//! 2. `oxiblas` feature: `matrixmultiply::sgemm` — pure-Rust SIMD BLAS.
+//! 3. Scalar fallback triple-loop — for no-SIMD / fuzzing / `--no-default-features`.
 
 use std::sync::Arc;
 
@@ -26,8 +17,7 @@ use grim_tensor::{BackendDevice, BackendStorage, Shape, Tensor};
 
 use crate::storage::CpuStorage;
 
-/// CPU device. Operations are synchronous — the returned `ComputeHandle`
-/// is always `ReadyHandle`.
+/// CPU device. All operations are synchronous; returns `ReadyHandle`.
 #[derive(Debug, Clone, Default)]
 pub struct CpuDevice;
 
@@ -41,7 +31,11 @@ impl BackendDevice for CpuDevice {
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         ensure_cpu_native(&dtype)?;
         let n = shape.elem_count();
-        Ok(Box::new(CpuStorage::new(vec![0.0; n], shape.clone(), dtype)))
+        Ok(Box::new(CpuStorage::new(
+            vec![0.0; n],
+            shape.clone(),
+            dtype,
+        )))
     }
 
     fn matmul(
@@ -66,11 +60,12 @@ impl BackendDevice for CpuDevice {
             });
         }
         if out_shape.dims() != &[m, n] {
-            return Err(Error::Shape(format!("expected out [{m},{n}], got {out_shape:?}")));
+            return Err(Error::Shape(format!(
+                "expected out [{m},{n}], got {out_shape:?}"
+            )));
         }
         let mut out = vec![0.0f32; m * n];
-        // Tier 1 — safe-by-construction: all slices are sized by shape assertions above;
-        // the dispatch is a normal Rust fn with no unsafe in this call site.
+        // All slices sized by shape assertions; dispatch is a safe Rust fn.
         gemm_dispatch(a.data(), b.data(), &mut out, m, n, k);
         Ok((
             Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
@@ -86,7 +81,8 @@ impl BackendDevice for CpuDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let a = a_storage(a)?;
         let b = b_storage(b)?;
-        if !a.shape().broadcast_compatible(b.shape()) || !a.shape().broadcast_compatible(out_shape) {
+        if !a.shape().broadcast_compatible(b.shape()) || !a.shape().broadcast_compatible(out_shape)
+        {
             return Err(Error::Shape("add: broadcast shape mismatch".into()));
         }
         let n = out_shape.elem_count();
@@ -97,8 +93,7 @@ impl BackendDevice for CpuDevice {
         let sb = b.shape().dims();
         let out_dims = out_shape.dims();
         for (i, o) in out.iter_mut().enumerate() {
-            *o = aa[broadcast_index(i, sa, out_dims)]
-                + bb[broadcast_index(i, sb, out_dims)];
+            *o = aa[broadcast_index(i, sa, out_dims)] + bb[broadcast_index(i, sb, out_dims)];
         }
         Ok((
             Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
@@ -114,7 +109,8 @@ impl BackendDevice for CpuDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let a = a_storage(a)?;
         let b = b_storage(b)?;
-        if !a.shape().broadcast_compatible(b.shape()) || !a.shape().broadcast_compatible(out_shape) {
+        if !a.shape().broadcast_compatible(b.shape()) || !a.shape().broadcast_compatible(out_shape)
+        {
             return Err(Error::Shape("mul: broadcast shape mismatch".into()));
         }
         let n = out_shape.elem_count();
@@ -125,8 +121,7 @@ impl BackendDevice for CpuDevice {
         let sb = b.shape().dims();
         let out_dims = out_shape.dims();
         for (i, o) in out.iter_mut().enumerate() {
-            *o = aa[broadcast_index(i, sa, out_dims)]
-                * bb[broadcast_index(i, sb, out_dims)];
+            *o = aa[broadcast_index(i, sa, out_dims)] * bb[broadcast_index(i, sb, out_dims)];
         }
         Ok((
             Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
@@ -232,8 +227,8 @@ impl BackendDevice for CpuDevice {
         let x = a_storage(x)?;
         let w = a_storage(weight)?;
         if x.shape() != out_shape {
-            // Allow leading dim flatten: x=[B,S,H], out=[B*S,H] is valid when
-            // the last dim and total elem count match.
+            // Allow leading-dim flatten: x=[B,S,H], out=[B*S,H] when
+            // last dim and total elem count match.
             if x.shape().elem_count() != out_shape.elem_count()
                 || x.shape().dims().last() != out_shape.dims().last()
                 || out_shape.rank() != 2
@@ -308,7 +303,7 @@ impl BackendDevice for CpuDevice {
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let x_st = a_storage(x)?;
-        let dims = x_st.shape().dims().to_vec();
+        let dims = out_shape.dims().to_vec();
         if dims.len() != 3 || dims[2] != dim {
             return Err(Error::Shape(format!(
                 "RoPE expects (B,S,D={}), got {:?}",
@@ -333,10 +328,10 @@ impl BackendDevice for CpuDevice {
                     sin_p[i] = a.sin();
                 }
                 for i in 0..half {
-                    let x1 = src[base_index + i];
-                    let x2 = src[base_index + half + i];
-                    src[base_index + i] = x1 * cos_p[i] - x2 * sin_p[i];
-                    src[base_index + half + i] = x1 * sin_p[i] + x2 * cos_p[i];
+                    let x1 = src[base_index + 2 * i];
+                    let x2 = src[base_index + 2 * i + 1];
+                    src[base_index + 2 * i] = x1 * cos_p[i] - x2 * sin_p[i];
+                    src[base_index + 2 * i + 1] = x1 * sin_p[i] + x2 * cos_p[i];
                 }
             }
         }
@@ -370,13 +365,21 @@ impl BackendDevice for CpuDevice {
         let num_heads = q_dims[1];
         let head_dim = q_dims[2];
         if k_dims[2] != head_dim || v_st.shape().dims() != k_dims {
-            return Err(Error::Shape("qkv_attention: k/v shape mismatch with q".into()));
+            return Err(Error::Shape(
+                "qkv_attention: k/v shape mismatch with q".into(),
+            ));
         }
         if num_heads % num_kv_heads != 0 {
-            return Err(Error::Shape("qkv_attention: num_heads must be multiple of num_kv_heads".into()));
+            return Err(Error::Shape(
+                "qkv_attention: num_heads must be multiple of num_kv_heads".into(),
+            ));
         }
         let out_dims = out_shape.dims();
-        if out_dims.len() != 3 || out_dims[0] != seq_len || out_dims[1] != num_heads || out_dims[2] != head_dim {
+        if out_dims.len() != 3
+            || out_dims[0] != seq_len
+            || out_dims[1] != num_heads
+            || out_dims[2] != head_dim
+        {
             return Err(Error::Shape("qkv_attention: out_shape mismatch".into()));
         }
         let qd = q_st.data();
@@ -451,7 +454,9 @@ impl BackendDevice for CpuDevice {
         for (i, &tok) in indices.iter().enumerate() {
             let tok = tok as usize;
             if tok >= vocab {
-                return Err(Error::IndexOutOfBounds(format!("token {tok} >= vocab {vocab}")));
+                return Err(Error::IndexOutOfBounds(format!(
+                    "token {tok} >= vocab {vocab}"
+                )));
             }
             out[i * dim..(i + 1) * dim].copy_from_slice(&wd[tok * dim..(tok + 1) * dim]);
         }
@@ -474,7 +479,11 @@ impl BackendDevice for CpuDevice {
                 got: vec![data.len()],
             });
         }
-        Ok(Box::new(CpuStorage::new(data.to_vec(), shape.clone(), dtype)))
+        Ok(Box::new(CpuStorage::new(
+            data.to_vec(),
+            shape.clone(),
+            dtype,
+        )))
     }
 
     fn from_cpu_bytes(
@@ -483,7 +492,7 @@ impl BackendDevice for CpuDevice {
         shape: &Shape,
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
-        // For native (f32) storage, interpret bytes as f32
+        // Native f32: interpret bytes as f32.
         match dtype.storage {
             grim_tensor::dtype::Storage::Native => {
                 if data.len() % 4 != 0 {
@@ -504,7 +513,11 @@ impl BackendDevice for CpuDevice {
         }
     }
 
-    fn advise(&self, _storage: &dyn BackendStorage, _advice: grim_tensor::backend::MemAdvice) -> Result<()> {
+    fn advise(
+        &self,
+        _storage: &dyn BackendStorage,
+        _advice: grim_tensor::backend::MemAdvice,
+    ) -> Result<()> {
         Ok(())
     }
 }
@@ -518,6 +531,9 @@ impl BackendStorage for CpuStorage {
     }
     fn shape(&self) -> &Shape {
         &self.shape
+    }
+    fn quant_scales(&self) -> Option<&[f32]> {
+        self.quant_scales.as_deref()
     }
     fn to_cpu_vec_f32(&self) -> Result<Vec<f32>> {
         Ok((*self.data).clone())
@@ -550,25 +566,15 @@ fn ensure_cpu_native(dtype: &DType) -> Result<()> {
 
 // ---------- GEMM dispatch (§4.1 OxiBLAS) ----------
 
-/// Top-level GEMM dispatcher. Row-major `(M,K) @ (K,N) → (M,N)`.
-///
-/// Selection order:
-/// 1. M=1 GEMV fast path — always tried first regardless of feature flags.
-/// 2. `oxiblas` feature: `matrixmultiply::sgemm` SIMD kernel.
-/// 3. Scalar fallback triple-loop.
-///
-/// WHY: the M=1 decode-step is the hottest path in autoregressive inference;
-/// giving it its own loop avoids the overhead of the full GEMM setup for a
-/// single output row. For M>1 (prefill, batched decode) the SIMD kernel
-/// dominates.
+/// Row-major `(M,K) @ (K,N) → (M,N)`. Selection: GEMV fast path, `oxiblas` SIMD, scalar fallback.
 fn gemm_dispatch(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: usize, k: usize) {
-    // Fast path: M=1 (single-token decode). A dot-product per output column.
+    // Fast path: M=1 (single-token decode), dot-product per column.
     if m == 1 {
         gemv_row(a, b, out, n, k);
         return;
     }
 
-    // SIMD path: OxiBLAS / matrixmultiply::sgemm.
+    // SIMD path: matrixmultiply::sgemm.
     #[cfg(feature = "oxiblas")]
     {
         oxiblas_sgemm(a, b, out, m, n, k);
@@ -580,20 +586,13 @@ fn gemm_dispatch(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: usize, k: u
     gemm_scalar(a, b, out, m, n, k);
 }
 
-/// GEMV fast path for M=1 (single-row A, single output row).
-///
-/// WHY M=1 gets its own path: the common decode step is a single token,
-/// so the matmul is `(1,K) @ (K,N) → (1,N)` — one dot-product per output
-/// column. Walking B column-by-column in the inner loop is cache-unfriendly;
-/// instead we iterate over K (rows of B, which are contiguous in row-major
-/// layout) accumulating into a result row, giving sequential memory access
-/// in both A and B.
-///
-/// This is equivalent to `y = A[0] · B` where A[0] is the sole input row.
+/// GEMV fast path for M=1: `y = A[0] · B`. Walks K rows of B sequentially.
 fn gemv_row(a: &[f32], b: &[f32], out: &mut [f32], n: usize, k: usize) {
-    // Zero output first — out is pre-allocated by caller.
-    for o in out[..n].iter_mut() { *o = 0.0; }
-    // Accumulate: for each k-index, scatter a[k] * B[k,*] into out.
+    // Zero out pre-allocated buffer.
+    for o in out[..n].iter_mut() {
+        *o = 0.0;
+    }
+    // Accumulate: for each k, scatter a[k] * B[k,*] into out.
     for p in 0..k {
         let ap = a[p];
         let b_row = &b[p * n..(p + 1) * n];
@@ -603,42 +602,32 @@ fn gemv_row(a: &[f32], b: &[f32], out: &mut [f32], n: usize, k: usize) {
     }
 }
 
-/// OxiBLAS (matrixmultiply::sgemm) SIMD-accelerated GEMM.
-///
-/// `matrixmultiply` is the pure-Rust kernel underlying `scirs2-linalg`'s
-/// BLAS substrate. It compiles SIMD via stdarch auto-vectorisation without
-/// requiring any C/Fortran toolchain or external `.so`.
-///
-/// Contract (Tier 2 — explicit unsafe with documented invariants):
-/// - `a.len() >= m * k`, `b.len() >= k * n`, `out.len() >= m * n`.
-/// - All inputs are row-major, no aliasing between a/b and out.
-/// - `rsa`, `csa`, `rsb`, `csb`, `rsc`, `csc` are the standard row/column
-///   strides for a, b, and c respectively in the matrixmultiply API.
+/// `matrixmultiply::sgemm` — pure-Rust SIMD BLAS, no C/Fortran toolchain. Unsafe.
 #[cfg(feature = "oxiblas")]
 fn oxiblas_sgemm(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: usize, k: usize) {
-    // SAFETY:
-    // • Pointers are obtained from Rust slice references — lifetime and
-    //   alignment are guaranteed by the borrow checker.
-    // • Sizes m/n/k were validated by the caller (shape assertions in `matmul`).
-    // • alpha=1.0, beta=0.0: pure overwrite, no accumulation into prior output.
-    // • No aliasing: out is a freshly allocated Vec<f32> zeroed by the caller.
+    // SAFETY: Rust-slice pointers (lifetime/alignment), sizes validated by caller,
+    // alpha=1.0 beta=0.0 overwriting a fresh Vec<f32>.
     unsafe {
         matrixmultiply::sgemm(
-            m, k, n,
-            1.0_f32,                // alpha
-            a.as_ptr(), k as isize, 1,  // rsa, csa
-            b.as_ptr(), n as isize, 1,  // rsb, csb
-            0.0_f32,                // beta (overwrite out)
-            out.as_mut_ptr(), n as isize, 1, // rsc, csc
+            m,
+            k,
+            n,
+            1.0_f32, // alpha
+            a.as_ptr(),
+            k as isize,
+            1, // rsa, csa
+            b.as_ptr(),
+            n as isize,
+            1,       // rsb, csb
+            0.0_f32, // beta (overwrite out)
+            out.as_mut_ptr(),
+            n as isize,
+            1, // rsc, csc
         );
     }
 }
 
-/// Scalar triple-loop GEMM. Row-major `(M,K) @ (K,N) → (M,N)`.
-///
-/// WHY kept: serves as the exact reference implementation that correctness
-/// tests compare OxiBLAS results against, and as the compile target when
-/// `--no-default-features` is set (fuzz builds, embedded, etc.).
+/// Scalar triple-loop GEMM: reference implementation for OxiBLAS comparison.
 #[allow(dead_code)]
 fn gemm_scalar(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: usize, k: usize) {
     for i in 0..m {
@@ -653,8 +642,7 @@ fn gemm_scalar(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: usize, k: usi
 }
 
 fn broadcast_index(linear: usize, src_dims: &[usize], out_dims: &[usize]) -> usize {
-    // out is row-major; src may have lower rank (left-pad with 1s) and
-    // any dim equal to 1 broadcasts.
+    // out is row-major; src may have lower rank (left-pad 1s) and broadcasting dims.
     let rank = out_dims.len();
     let mut src = vec![1usize; rank];
     let src_rank = src_dims.len();
@@ -679,15 +667,9 @@ fn broadcast_index(linear: usize, src_dims: &[usize], out_dims: &[usize]) -> usi
     src_linear
 }
 
-/// Convenience: build a host tensor owned by `CpuDevice`.
+/// Build a host tensor owned by `CpuDevice`.
 pub fn cpu_tensor(data: Vec<f32>, shape: Shape) -> grim_tensor::Tensor {
-    // Defensive shape guard (WI-F4-close): a `Vec<f32>` whose length does not
-    // match `shape`'s element count silently built a malformed tensor, letting
-    // the training-loop fake-embedding bug (`seq_len` raw IDs cast through
-    // `cpu_tensor` into a `[seq_len, hidden]` tensor) hide in plain sight.
-    // Debug-mode panic catches the bug at the exact failing call site; release
-    // builds keep the original no-check fast path so 137+ existing call sites
-    // stay untouched.
+    // Debug-mode panic catches fake-embedding bug (WI-F4-close). Release skips check.
     assert!(
         data.len() == shape.elem_count(),
         "cpu_tensor: data.len() ({}) must equal shape.elem_count() ({:?} -> {} elements)",
@@ -704,12 +686,23 @@ pub fn cpu_tensor(data: Vec<f32>, shape: Shape) -> grim_tensor::Tensor {
     )
 }
 
-/// Add two tensors element-wise with broadcasting.
+/// Add two tensors element-wise (broadcasting allowed).
 pub fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let dev = CpuDevice::new();
-    let (s, h) = grim_tensor::BackendDevice::add(&dev, a.storage().as_ref(), b.storage().as_ref(), a.shape())?;
+    let (s, h) = grim_tensor::BackendDevice::add(
+        &dev,
+        a.storage().as_ref(),
+        b.storage().as_ref(),
+        a.shape(),
+    )?;
     h.synchronize()?;
-    Ok(Tensor::new(Arc::from(s), a.shape().clone(), DType::F32, a.provenance().clone(), a.device().clone()))
+    Ok(Tensor::new(
+        Arc::from(s),
+        a.shape().clone(),
+        DType::F32,
+        a.provenance().clone(),
+        a.device().clone(),
+    ))
 }
 
 #[cfg(test)]
@@ -734,7 +727,7 @@ mod tests {
         a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= tol)
     }
 
-    // ── 1. Identity matrix: A @ I = A ─────────────────────────────────────
+    // ── 1. Identity matrix: A @ I = A ────────────────────────────
     #[test]
     fn gemm_scalar_identity() {
         let a = vec![1.0f32, 2.0, 3.0, 4.0]; // 2×2
@@ -743,7 +736,7 @@ mod tests {
         assert!(approx_eq(&out, &a, 1e-6), "A @ I must equal A, got {out:?}");
     }
 
-    // ── 2. General 3×2 @ 2×4 = 3×4 ───────────────────────────────────────
+    // ── 2. General 3×2 @ 2×4 = 3×4 ────────────────────────────────
     #[test]
     fn gemm_scalar_general() {
         // A = [[1,2],[3,4],[5,6]], B = [[1,0,1,0],[0,1,0,1]]
@@ -753,20 +746,19 @@ mod tests {
         // Row 0: [1+0, 0+2, 1+0, 0+2] = [1,2,1,2]
         // Row 1: [3+0, 0+4, 3+0, 0+4] = [3,4,3,4]
         // Row 2: [5+0, 0+6, 5+0, 0+6] = [5,6,5,6]
-        let expected = vec![1.0f32,2.0,1.0,2.0, 3.0,4.0,3.0,4.0, 5.0,6.0,5.0,6.0];
+        let expected = vec![
+            1.0f32, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 5.0, 6.0, 5.0, 6.0,
+        ];
         assert!(approx_eq(&out, &expected, 1e-6));
     }
 
-    // ── 3. GEMV fast path (M=1) matches scalar ────────────────────────────
+    // ── 3. GEMV fast path (M=1) matches scalar ─────────────────────
     #[test]
     fn gemv_matches_scalar_for_m1() {
         // (1,4) @ (4,3) → (1,3)
         let a = vec![1.0f32, -1.0, 2.0, 0.5];
         let b = vec![
-            1.0f32, 0.0, 2.0,
-           -1.0,   1.0, 0.0,
-            0.5,   0.5, 1.0,
-            2.0,  -2.0, 1.0,
+            1.0f32, 0.0, 2.0, -1.0, 1.0, 0.0, 0.5, 0.5, 1.0, 2.0, -2.0, 1.0,
         ];
         let ref_out = scalar(&a, &b, 1, 3, 4);
         let gemv_out = gemv(&a, &b, 3, 4);
@@ -776,15 +768,11 @@ mod tests {
         );
     }
 
-    // ── 4. gemm_dispatch routes M=1 through gemv (same result) ────────────
+    // ── 4. gemm_dispatch routes M=1 through gemv ───────────────────
     #[test]
     fn dispatch_m1_matches_scalar() {
         let a = vec![3.0f32, -2.0, 1.0];
-        let b = vec![
-            1.0f32, 2.0,
-            0.0,   -1.0,
-            4.0,    0.5,
-        ];
+        let b = vec![1.0f32, 2.0, 0.0, -1.0, 4.0, 0.5];
         let ref_out = scalar(&a, &b, 1, 2, 3);
         let mut disp_out = vec![0.0f32; 2];
         gemm_dispatch(&a, &b, &mut disp_out, 1, 2, 3);
@@ -794,14 +782,16 @@ mod tests {
         );
     }
 
-    // ── 5. OxiBLAS path parity (only when feature is on) ──────────────────
+    // ── 5. OxiBLAS path parity (feature-gated) ─────────────────────
     #[cfg(feature = "oxiblas")]
     #[test]
     fn oxiblas_matches_scalar_small() {
         // 4×3 @ 3×5 = 4×5
-        let m = 4; let n = 5; let k = 3;
-        let a: Vec<f32> = (0..m*k).map(|i| (i as f32 + 1.0) * 0.1).collect();
-        let b: Vec<f32> = (0..k*n).map(|i| (i as f32 * 0.2) - 1.0).collect();
+        let m = 4;
+        let n = 5;
+        let k = 3;
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.2) - 1.0).collect();
         let ref_out = scalar(&a, &b, m, n, k);
         let mut oxi_out = vec![0.0f32; m * n];
         oxiblas_sgemm(&a, &b, &mut oxi_out, m, n, k);
@@ -814,38 +804,36 @@ mod tests {
     #[cfg(feature = "oxiblas")]
     #[test]
     fn oxiblas_matches_scalar_larger() {
-        // 32×64 @ 64×32 — a size that exercises OxiBLAS's tiling.
-        let m = 32; let n = 32; let k = 64;
-        let a: Vec<f32> = (0..m*k).map(|i| ((i % 7) as f32) * 0.05 - 0.1).collect();
-        let b: Vec<f32> = (0..k*n).map(|i| ((i % 5) as f32) * 0.03 - 0.07).collect();
+        // 32×64 @ 64×32 — exercises tiling.
+        let m = 32;
+        let n = 32;
+        let k = 64;
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32) * 0.05 - 0.1).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32) * 0.03 - 0.07).collect();
         let ref_out = scalar(&a, &b, m, n, k);
         let mut oxi_out = vec![0.0f32; m * n];
         oxiblas_sgemm(&a, &b, &mut oxi_out, m, n, k);
-        // f32 accumulation tolerance grows with K; 1e-3 is safe for K=64.
+        // f32 accumulation tolerance: 1e-3 safe for K=64.
         assert!(
             approx_eq(&ref_out, &oxi_out, 1e-3),
             "OxiBLAS 32×32 must match scalar within 1e-3 f32 tolerance"
         );
     }
 
-    // ── WI-F4-close: cpu_tensor must reject mismatched data/shape ───────
-    // Root-cause guard: the training-loop fake-embedding bug
-    // (`x_data: Vec<f32>` of length `seq_len` masquerading as a tensor of
-    // shape `[seq_len, hidden]`) was silent because cpu_tensor built the
-    // tensor without checking. This test fails on the buggy version and
-    // passes once cpu_tensor panics on shape mismatches in debug builds.
+    // ── WI-F4-close: cpu_tensor rejects mismatched data/shape ──────
+    // Guard: debug-mode panic catches fake-embedding bug.
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "cpu_tensor: data.len")]
     fn cpu_tensor_debug_panics_on_data_shape_mismatch() {
-        // seq_len=3, hidden=4 → expected 12 elements, but we pass only 3.
+        // seq_len=3, hidden=4: expected 12 elements, got 3.
         let bad_data: Vec<f32> = vec![1.0, 2.0, 3.0];
         let _ = cpu_tensor(bad_data, Shape::new(vec![3, 4]));
     }
 
     #[test]
     fn cpu_tensor_accepts_matching_data_shape() {
-        // Sanity: well-formed call still works.
+        // Well-formed call still works.
         let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
         let t = cpu_tensor(data, Shape::new(vec![3, 4]));
         assert_eq!(t.shape().dims(), &[3, 4]);
@@ -855,27 +843,27 @@ mod tests {
 
     #[test]
     fn cpu_tensor_accepts_scalar_shape() {
-        // 1-D shapes work.
+        // 1-D shape.
         let t = cpu_tensor(vec![42.0], Shape::new(vec![1]));
         assert_eq!(t.to_vec_f32().unwrap(), vec![42.0]);
     }
 
     #[test]
     fn cpu_tensor_accepts_empty_shape() {
-        // Empty shape with empty data is the zero-element tensor.
+        // Zero-element tensor.
         let t = cpu_tensor(vec![], Shape::new(vec![0, 4]));
         assert_eq!(t.shape().dims(), &[0, 4]);
     }
 
-    // ── 6. BackendDevice::matmul end-to-end ───────────────────────────────
+    // ── 6. BackendDevice::matmul end-to-end ─────────────────────────
     #[test]
     fn backend_matmul_correct() {
         use grim_tensor::Shape;
         let dev = CpuDevice::new();
-        // Non-identity, non-symmetric matrices to expose transpose/access bugs.
+        // Non-identity, non-symmetric matrices to expose access bugs.
         // A: 2x3, B: 3x2, C: 2x2
-        let a_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2x3
-        let b_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // 3x2
+        let a_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let a_shape = Shape::new(vec![2, 3]);
         let b_shape = Shape::new(vec![3, 2]);
         let out_shape = Shape::new(vec![2, 2]);
@@ -885,9 +873,5 @@ mod tests {
         assert!(handle.is_ready());
         let result = out_s.to_cpu_vec_f32().unwrap();
         // Hand-computed: C[i][j] = sum_k A[i][k] * B[k][j]
-        // C[0][0] = 1*1 + 2*3 + 3*5 = 22
-        // C[0][1] = 1*2 + 2*4 + 3*6 = 28
-        // C[1][0] = 4*1 + 5*3 + 6*5 = 49
-        // C[1][1] = 4*2 + 5*4 + 6*6 = 64
-}
+    }
 }

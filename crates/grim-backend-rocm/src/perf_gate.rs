@@ -81,7 +81,10 @@ impl BaselineTable {
     /// Construct an empty table for a given arch. Helpers build a
     /// baseline file from a live benchmark via `set_entry` → `to_json_pretty`.
     pub fn for_arch(arch: impl Into<String>) -> Self {
-        Self { arch: arch.into(), inner: HashMap::new() }
+        Self {
+            arch: arch.into(),
+            inner: HashMap::new(),
+        }
     }
 
     pub fn arch(&self) -> &str {
@@ -134,15 +137,13 @@ impl BaselineTable {
             gpu_arch: self.arch.clone(),
             entries,
         };
-        serde_json::to_string_pretty(&wire).map_err(|e| {
-            Error::Backend(format!("BaselineTable::to_json_pretty: serde: {}", e))
-        })
+        serde_json::to_string_pretty(&wire)
+            .map_err(|e| Error::Backend(format!("BaselineTable::to_json_pretty: serde: {}", e)))
     }
 
     pub fn from_json(s: &str) -> Result<Self> {
-        let wire: BaselineTableJson = serde_json::from_str(s).map_err(|e| {
-            Error::Backend(format!("BaselineTable::from_json: serde: {}", e))
-        })?;
+        let wire: BaselineTableJson = serde_json::from_str(s)
+            .map_err(|e| Error::Backend(format!("BaselineTable::from_json: serde: {}", e)))?;
         validate_wire(&wire)?;
         let mut inner = HashMap::with_capacity(wire.entries.len());
         for e in wire.entries {
@@ -150,11 +151,17 @@ impl BaselineTable {
             if existing.is_some() {
                 return Err(Error::Backend(format!(
                     "duplicate kernel name in baseline: {}",
-                    existing.as_ref().map(|b| b.kernel.as_str()).unwrap_or("<unknown>")
+                    existing
+                        .as_ref()
+                        .map(|b| b.kernel.as_str())
+                        .unwrap_or("<unknown>")
                 )));
             }
         }
-        Ok(Self { arch: wire.gpu_arch, inner })
+        Ok(Self {
+            arch: wire.gpu_arch,
+            inner,
+        })
     }
 }
 
@@ -184,9 +191,19 @@ fn validate_wire(wire: &BaselineTableJson) -> Result<()> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
-    Within { delta_pct: f64, threshold_pct: f64 },
-    Regressed { baseline: f64, current: f64, delta_pct: f64, threshold_pct: f64 },
-    NoBaseline { reason: String },
+    Within {
+        delta_pct: f64,
+        threshold_pct: f64,
+    },
+    Regressed {
+        baseline: f64,
+        current: f64,
+        delta_pct: f64,
+        threshold_pct: f64,
+    },
+    NoBaseline {
+        reason: String,
+    },
 }
 
 impl Verdict {
@@ -202,7 +219,10 @@ impl Verdict {
                 threshold_pct,
             }
         } else {
-            Self::Within { delta_pct, threshold_pct }
+            Self::Within {
+                delta_pct,
+                threshold_pct,
+            }
         }
     }
 
@@ -212,9 +232,22 @@ impl Verdict {
         // a hypothetical baseline such that delta=(current/baseline-1)*100.
         // The caller should never rely on the round-trip identity for
         // this concession; tests cover it via the explicit fields.
-        let baseline = if threshold_pct > 0.0 { current / (1.0 + threshold_pct / 100.0) } else { 0.0 };
-        let delta_pct = if baseline > 0.0 { (current - baseline) / baseline * 100.0 } else { f64::NAN };
-        Self::Regressed { baseline, current, delta_pct, threshold_pct }
+        let baseline = if threshold_pct > 0.0 {
+            current / (1.0 + threshold_pct / 100.0)
+        } else {
+            0.0
+        };
+        let delta_pct = if baseline > 0.0 {
+            (current - baseline) / baseline * 100.0
+        } else {
+            f64::NAN
+        };
+        Self::Regressed {
+            baseline,
+            current,
+            delta_pct,
+            threshold_pct,
+        }
     }
 
     /// True when the gate should fail CI on this verdict.
@@ -265,7 +298,10 @@ impl PerfGate {
             };
         }
         if delta_pct <= entry.threshold_pct {
-            Verdict::Within { delta_pct, threshold_pct: entry.threshold_pct }
+            Verdict::Within {
+                delta_pct,
+                threshold_pct: entry.threshold_pct,
+            }
         } else {
             Verdict::Regressed {
                 baseline: entry.baseline_cycles_per_call,
@@ -291,16 +327,35 @@ mod gate_self_tests {
         let mut t = crate::perf_gate::BaselineTable::for_arch("gfx1036");
         // Insert via the test-only mutator so the self-test exercises the
         // compare path without going through the public validator.
-        t.inner_mut_for_tests()
-            .insert(
-                "k".to_string(),
-                BaselineEntry { kernel: "k".to_string(), baseline_cycles_per_call: 1.0, threshold_pct: 5.0 },
-            );
+        t.inner_mut_for_tests().insert(
+            "k".to_string(),
+            BaselineEntry {
+                kernel: "k".to_string(),
+                baseline_cycles_per_call: 1.0,
+                threshold_pct: 5.0,
+            },
+        );
         let g = PerfGate::new(t);
-        let v = g.compare("k", Measurement { cycles_per_call: 1.03 });
-        assert!(matches!(v, Verdict::Within { .. }), "+3% slower is within budget");
-        let v = g.compare("k", Measurement { cycles_per_call: 1.20 });
-        assert!(matches!(v, Verdict::Regressed { .. }), "+20% slower regresses");
+        let v = g.compare(
+            "k",
+            Measurement {
+                cycles_per_call: 1.03,
+            },
+        );
+        assert!(
+            matches!(v, Verdict::Within { .. }),
+            "+3% slower is within budget"
+        );
+        let v = g.compare(
+            "k",
+            Measurement {
+                cycles_per_call: 1.20,
+            },
+        );
+        assert!(
+            matches!(v, Verdict::Regressed { .. }),
+            "+20% slower regresses"
+        );
     }
 }
 

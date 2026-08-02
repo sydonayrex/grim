@@ -5,10 +5,10 @@
 //! Also provides `SoulEaterOptimizer` using 1-bit Sign-SGD for Σ and
 //! momentum-accelerated pre-normalized cubic Newton-Schulz for U and V.
 
-use std::collections::HashMap;
 use grim_backend_cpu::cpu_tensor;
-use grim_tensor::{Result, Shape, Tensor};
 use grim_quant::soul_eater::subspace_newton_schulz_step;
+use grim_tensor::{Result, Shape, Tensor};
+use std::collections::HashMap;
 
 /// Parameter representation for SOUL EATER adapter (U, V, Σ).
 pub struct SoulEaterAdapter {
@@ -28,7 +28,7 @@ impl SoulEaterAdapter {
     pub fn new(d_out: usize, d_in: usize, r: usize, alpha: f32) -> Result<Self> {
         let mut u_data = vec![0.0f32; d_out * r];
         let mut v_data = vec![0.0f32; d_in * r];
-        
+
         // Initialize U and V with normalized well-conditioned values
         for i in 0..d_out {
             for j in 0..r {
@@ -148,7 +148,10 @@ impl SoulEaterOptimizer {
 
         // 1. Update U momentum & run subspace Newton-Schulz step
         let key_u = format!("{name}_u");
-        let m_u_entry = self.m_u.entry(key_u).or_insert_with(|| vec![0.0f32; d_out * r]);
+        let m_u_entry = self
+            .m_u
+            .entry(key_u)
+            .or_insert_with(|| vec![0.0f32; d_out * r]);
         for i in 0..(d_out * r) {
             m_u_entry[i] = self.beta * m_u_entry[i] + (1.0 - self.beta) * g_u[i];
         }
@@ -164,7 +167,10 @@ impl SoulEaterOptimizer {
 
         // 2. Update V momentum & run subspace Newton-Schulz step
         let key_v = format!("{name}_v");
-        let m_v_entry = self.m_v.entry(key_v).or_insert_with(|| vec![0.0f32; d_in * r]);
+        let m_v_entry = self
+            .m_v
+            .entry(key_v)
+            .or_insert_with(|| vec![0.0f32; d_in * r]);
         for i in 0..(d_in * r) {
             m_v_entry[i] = self.beta * m_v_entry[i] + (1.0 - self.beta) * g_v[i];
         }
@@ -292,9 +298,21 @@ mod tests {
                 }
             }
 
-            opt.step("layer0", &mut adapter.u, &mut adapter.v, &mut adapter.sigma, &g_u, &g_v, &g_sigma).unwrap();
+            opt.step(
+                "layer0",
+                &mut adapter.u,
+                &mut adapter.v,
+                &mut adapter.sigma,
+                &g_u,
+                &g_v,
+                &g_sigma,
+            )
+            .unwrap();
         }
 
-        assert!(final_loss <= initial_loss, "Loss must not increase: initial {initial_loss}, final {final_loss}");
+        assert!(
+            final_loss <= initial_loss,
+            "Loss must not increase: initial {initial_loss}, final {final_loss}"
+        );
     }
 }

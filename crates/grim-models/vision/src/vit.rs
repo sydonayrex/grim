@@ -37,9 +37,15 @@ impl VitConfig {
 }
 
 impl ModelConfig for VitConfig {
-    fn name(&self) -> &str { "vit" }
-    fn modality(&self) -> ModalityHint { ModalityHint::VisionEncoder }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str {
+        "vit"
+    }
+    fn modality(&self) -> ModalityHint {
+        ModalityHint::VisionEncoder
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// One ViT self-attention block (pre-norm).
@@ -82,10 +88,16 @@ impl VitBlock {
                 weight: cpu_tensor(vec![1.0; hidden], Shape::new(vec![hidden])),
                 eps,
             },
-            wq, wk, wv, wo,
+            wq,
+            wk,
+            wv,
+            wo,
             w_fc1: Linear::from_tensor(
                 cpu_tensor(fc1_w, Shape::new(vec![intermediate, hidden])),
-                Some(cpu_tensor(vec![0.0; intermediate], Shape::new(vec![intermediate]))),
+                Some(cpu_tensor(
+                    vec![0.0; intermediate],
+                    Shape::new(vec![intermediate]),
+                )),
             ),
             w_fc2: Linear::from_tensor(
                 cpu_tensor(fc2_w, Shape::new(vec![hidden, intermediate])),
@@ -98,16 +110,42 @@ impl VitBlock {
         }
     }
 
-    fn load(ws: &WeightSource<'_>, hidden: usize, num_heads: usize, intermediate: usize, eps: f32) -> Result<Self> {
+    fn load(
+        ws: &WeightSource<'_>,
+        hidden: usize,
+        num_heads: usize,
+        intermediate: usize,
+        eps: f32,
+    ) -> Result<Self> {
         let head_dim = hidden / num_heads;
-        let wq = ws.get([num_heads * head_dim, hidden], "attn.q.weight")?.to_vec_f32()?;
-        let wk = ws.get([num_heads * head_dim, hidden], "attn.k.weight")?.to_vec_f32()?;
-        let wv = ws.get([num_heads * head_dim, hidden], "attn.v.weight")?.to_vec_f32()?;
-        let wo = ws.get([hidden, num_heads * head_dim], "attn.o.weight")?.to_vec_f32()?;
+        let wq = ws
+            .get([num_heads * head_dim, hidden], "attn.q.weight")?
+            .to_vec_f32()?;
+        let wk = ws
+            .get([num_heads * head_dim, hidden], "attn.k.weight")?
+            .to_vec_f32()?;
+        let wv = ws
+            .get([num_heads * head_dim, hidden], "attn.v.weight")?
+            .to_vec_f32()?;
+        let wo = ws
+            .get([hidden, num_heads * head_dim], "attn.o.weight")?
+            .to_vec_f32()?;
         let norm1 = RmsNorm::load(&ws.pp("attn_norm"), hidden, eps)?;
         let w_fc1 = Linear::load(&ws.pp("ffn.0"), hidden, intermediate, true)?;
         let w_fc2 = Linear::load(&ws.pp("ffn.1"), intermediate, hidden, true)?;
-        Ok(Self { norm1, wq, wk, wv, wo, w_fc1, w_fc2, hidden, num_heads, head_dim, intermediate })
+        Ok(Self {
+            norm1,
+            wq,
+            wk,
+            wv,
+            wo,
+            w_fc1,
+            w_fc2,
+            hidden,
+            num_heads,
+            head_dim,
+            intermediate,
+        })
     }
 
     fn forward(&self, x: &[f32], seq: usize) -> Result<Vec<f32>> {
@@ -134,13 +172,47 @@ impl VitBlock {
             }
         }
 
-        let mut attn_out = vec![0.0f32; seq * h];
+        let mut attn_val = vec![0.0f32; seq * h];
         let scale = 1.0 / (self.head_dim as f32).max(1.0).sqrt();
+        let hd = self.head_dim;
+        for head in 0..self.num_heads {
+            for s in 0..seq {
+                let mut scores = vec![0.0f32; seq];
+                let mut max_score = f32::NEG_INFINITY;
+                for j in 0..seq {
+                    let mut dot = 0.0f32;
+                    for d in 0..hd {
+                        dot += q[s * h + head * hd + d] * k[j * h + head * hd + d];
+                    }
+                    scores[j] = scale * dot;
+                    if scores[j] > max_score {
+                        max_score = scores[j];
+                    }
+                }
+                let mut sum_exp = 0.0f32;
+                for j in 0..seq {
+                    scores[j] = (scores[j] - max_score).exp();
+                    sum_exp += scores[j];
+                }
+                for j in 0..seq {
+                    scores[j] /= sum_exp;
+                }
+                for d in 0..hd {
+                    let mut val = 0.0f32;
+                    for j in 0..seq {
+                        val += scores[j] * v[j * h + head * hd + d];
+                    }
+                    attn_val[s * h + head * hd + d] = val;
+                }
+            }
+        }
+
+        let mut attn_out = vec![0.0f32; seq * h];
         for s in 0..seq {
             for col in 0..h {
                 let mut sum_o = 0.0f32;
                 for k_idx in 0..h {
-                    sum_o += scale * q[s * h + k_idx] * self.wo[col * h + k_idx];
+                    sum_o += self.wo[col * h + k_idx] * attn_val[s * h + k_idx];
                 }
                 attn_out[s * h + col] = sum_o;
             }
@@ -151,13 +223,17 @@ impl VitBlock {
             attn_res[i] += attn_out[i];
         }
 
-        let fc1_out = self.w_fc1.forward(&cpu_tensor(attn_res.clone(), Shape::new(vec![seq, h])))?;
+        let fc1_out = self
+            .w_fc1
+            .forward(&cpu_tensor(attn_res.clone(), Shape::new(vec![seq, h])))?;
         let gate = fc1_out.to_vec_f32()?;
         let mut gelu = vec![0.0f32; gate.len()];
         for (i, g) in gate.iter().enumerate() {
             gelu[i] = gelu_approx(*g);
         }
-        let fc2_out = self.w_fc2.forward(&cpu_tensor(gelu, Shape::new(vec![seq, self.intermediate])))?;
+        let fc2_out = self
+            .w_fc2
+            .forward(&cpu_tensor(gelu, Shape::new(vec![seq, self.intermediate])))?;
         let mlp = fc2_out.to_vec_f32()?;
         let mut out = x.to_vec();
         for i in 0..out.len() {
@@ -205,7 +281,11 @@ pub struct Vit {
 impl Vit {
     /// Build a randomly-initialized tiny ViT. Suitable for unit tests.
     pub fn random(device: Device, cfg: VitConfig) -> Self {
-        Self::new(device, cfg, &mut grim_core::rng::SimpleRng::new(0xC08D_E27B_71A5_F00Du64))
+        Self::new(
+            device,
+            cfg,
+            &mut grim_core::rng::SimpleRng::new(0xC08D_E27B_71A5_F00Du64),
+        )
     }
 
     /// Build the ViT given an RNG (lets callers choose a deterministic seed).
@@ -233,7 +313,10 @@ impl Vit {
             ));
         }
         let ln = RmsNorm {
-            weight: cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: cpu_tensor(
+                vec![1.0; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.rms_norm_eps,
         };
         let features = cfg.hidden_size;
@@ -252,25 +335,37 @@ impl Vit {
 
     pub fn load(device: Device, ws: &WeightSource<'_>, cfg: VitConfig) -> Result<Self> {
         let patch_dim = cfg.patch_dim();
-        let proj_w = ws.get([cfg.hidden_size, patch_dim], "proj.weight")?.to_vec_f32()?;
+        let proj_w = ws
+            .get([cfg.hidden_size, patch_dim], "proj.weight")?
+            .to_vec_f32()?;
         let proj_b = ws.get([cfg.hidden_size], "proj.bias")?.to_vec_f32()?;
         let cls_token = ws.get([cfg.hidden_size], "cls_token")?.to_vec_f32()?;
         let num_patches = cfg.num_patches();
-        let pos_embed = ws.get([num_patches + 1, cfg.hidden_size], "pos_embed")?.to_vec_f32()?;
+        let pos_embed = ws
+            .get([num_patches + 1, cfg.hidden_size], "pos_embed")?
+            .to_vec_f32()?;
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             let blk = VitBlock::load(
                 &ws.pp(&format!("blocks.{i}")),
-                cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, cfg.rms_norm_eps,
+                cfg.hidden_size,
+                cfg.num_heads,
+                cfg.intermediate_size,
+                cfg.rms_norm_eps,
             )?;
             blocks.push(blk);
         }
         let ln = RmsNorm::load(&ws.pp("ln"), cfg.hidden_size, cfg.rms_norm_eps)?;
         let features = cfg.hidden_size;
         Ok(Self {
-            cfg, device,
-            patch_proj_w: proj_w, patch_proj_b: proj_b,
-            cls_token, pos_embed, blocks, ln,
+            cfg,
+            device,
+            patch_proj_w: proj_w,
+            patch_proj_b: proj_b,
+            cls_token,
+            pos_embed,
+            blocks,
+            ln,
             features,
         })
     }
@@ -330,10 +425,7 @@ impl Vit {
                 }
                 tokens[proj_offset..proj_offset + hidden]
                     .iter_mut()
-                    .zip(
-                        self.pos_embed[proj_offset..proj_offset + hidden]
-                            .iter(),
-                    )
+                    .zip(self.pos_embed[proj_offset..proj_offset + hidden].iter())
                     .for_each(|(t, p)| *t += *p);
             }
         }
@@ -347,10 +439,18 @@ impl Vit {
 }
 
 impl Model for Vit {
-    fn config(&self) -> &dyn ModelConfig { &self.cfg }
-    fn device(&self) -> &Device { &self.device }
-    fn param_arith(&self) -> ArithType { ArithType::F32 }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn config(&self) -> &dyn ModelConfig {
+        &self.cfg
+    }
+    fn device(&self) -> &Device {
+        &self.device
+    }
+    fn param_arith(&self) -> ArithType {
+        ArithType::F32
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl Encoder for Vit {

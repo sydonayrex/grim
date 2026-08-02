@@ -48,8 +48,14 @@ fn kernel_key_distinguishes_arch() -> TestResult {
         n: 4096,
         k: 4096,
     };
-    let other_arch = KernelKey { gpu_arch: "gfx1200", ..base };
-    assert_ne!(base, other_arch, "different gpu_arch must yield different cache keys");
+    let other_arch = KernelKey {
+        gpu_arch: "gfx1200",
+        ..base
+    };
+    assert_ne!(
+        base, other_arch,
+        "different gpu_arch must yield different cache keys"
+    );
     Ok(())
 }
 
@@ -63,8 +69,14 @@ fn kernel_key_distinguishes_every_field() -> TestResult {
         k: 4096,
     };
     let others = vec![
-        KernelKey { kernel: "grim_matmul", ..base },
-        KernelKey { gpu_arch: "gfx942", ..base },
+        KernelKey {
+            kernel: "grim_matmul",
+            ..base
+        },
+        KernelKey {
+            gpu_arch: "gfx942",
+            ..base
+        },
         KernelKey { m: 8, ..base },
         KernelKey { n: 11008, ..base },
         KernelKey { k: 11008, ..base },
@@ -78,7 +90,13 @@ fn kernel_key_distinguishes_every_field() -> TestResult {
 #[test]
 fn kernel_key_hash_and_eq_consistent() -> TestResult {
     use std::collections::HashMap;
-    let a = KernelKey { kernel: "grim_qkv_attention", gpu_arch: "gfx1036", m: 1, n: 4096, k: 4096 };
+    let a = KernelKey {
+        kernel: "grim_qkv_attention",
+        gpu_arch: "gfx1036",
+        m: 1,
+        n: 4096,
+        k: 4096,
+    };
     let b = a; // Copy
     let mut m = HashMap::new();
     m.insert(a, 1_u64);
@@ -90,7 +108,13 @@ fn kernel_key_hash_and_eq_consistent() -> TestResult {
 
 #[test]
 fn kernel_key_debug_doesnt_panic() -> TestResult {
-    let k = KernelKey { kernel: "x", gpu_arch: "y", m: 1, n: 2, k: 3 };
+    let k = KernelKey {
+        kernel: "x",
+        gpu_arch: "y",
+        m: 1,
+        n: 2,
+        k: 3,
+    };
     let _ = format!("{:?}", k);
     Ok(())
 }
@@ -111,7 +135,10 @@ fn autotune_config_partial_eq_when_all_fields_match() -> TestResult {
     };
     let b = a; // Copy
     assert_eq!(a, b);
-    let c = AutotuneConfig { block_dim: 128, ..a };
+    let c = AutotuneConfig {
+        block_dim: 128,
+        ..a
+    };
     assert_ne!(a, c);
     Ok(())
 }
@@ -160,36 +187,76 @@ fn autotuner_cache_dir_roundtrip() -> TestResult {
 #[test]
 fn get_or_tune_cache_hit_avoids_rerunning_benchmark() -> TestResult {
     let mut tuner = Autotuner::for_device(0, "gfx1036");
-    let key = KernelKey { kernel: "grim_qkv_attention", gpu_arch: "gfx1036", m: 1, n: 4096, k: 4096 };
+    let key = KernelKey {
+        kernel: "grim_qkv_attention",
+        gpu_arch: "gfx1036",
+        m: 1,
+        n: 4096,
+        k: 4096,
+    };
 
     let mut bench_runs = 0_u32;
     // First call: closure runs.
     let config_v1 = tuner.get_or_tune(key, |_kernel| {
         bench_runs += 1;
-        Ok(AutotuneConfig { block_dim: 256, tile_kv: 64, grid_stride: 1, cycles_per_invocation: 1 })
+        Ok(AutotuneConfig {
+            block_dim: 256,
+            tile_kv: 64,
+            grid_stride: 1,
+            cycles_per_invocation: 1,
+        })
     })?;
     assert_eq!(bench_runs, 1, "closure must run on cache miss");
     // Second call: cache hit, closure does not run.
     let config_v2 = tuner.get_or_tune(key, |_kernel| {
         bench_runs += 1;
-        Ok(AutotuneConfig { block_dim: 999, tile_kv: 99, grid_stride: 9, cycles_per_invocation: 999 })
+        Ok(AutotuneConfig {
+            block_dim: 999,
+            tile_kv: 99,
+            grid_stride: 9,
+            cycles_per_invocation: 999,
+        })
     })?;
     assert_eq!(bench_runs, 1, "closure must not run on cache hit");
-    assert_eq!(config_v1, config_v2, "cache hit returns the recorded config, never the closure's 'fresh' value");
+    assert_eq!(
+        config_v1, config_v2,
+        "cache hit returns the recorded config, never the closure's 'fresh' value"
+    );
     Ok(())
 }
 
 #[test]
 fn get_or_tune_distinct_keys_run_closure_independently() -> TestResult {
     let mut tuner = Autotuner::for_device(0, "gfx1036");
-    let key_a = KernelKey { kernel: "qkv", gpu_arch: "gfx1036", m: 1, n: 4096, k: 4096 };
-    let key_b = KernelKey { kernel: "matmul", gpu_arch: "gfx1036", m: 1, n: 4096, k: 4096 };
+    let key_a = KernelKey {
+        kernel: "qkv",
+        gpu_arch: "gfx1036",
+        m: 1,
+        n: 4096,
+        k: 4096,
+    };
+    let key_b = KernelKey {
+        kernel: "matmul",
+        gpu_arch: "gfx1036",
+        m: 1,
+        n: 4096,
+        k: 4096,
+    };
 
     // Same arity: closure returns different config; we expect each to be retained.
-    let ca = tuner.get_or_tune(key_a, |_| Ok(AutotuneConfig::default())).map_err(|e| format!("a: {}", e))?;
-    tuner.get_or_tune(key_b, |_| {
-        Ok(AutotuneConfig { block_dim: 64, tile_kv: 32, grid_stride: 1, cycles_per_invocation: 0 })
-    }).map_err(|e| format!("b: {}", e))?;
+    let ca = tuner
+        .get_or_tune(key_a, |_| Ok(AutotuneConfig::default()))
+        .map_err(|e| format!("a: {}", e))?;
+    tuner
+        .get_or_tune(key_b, |_| {
+            Ok(AutotuneConfig {
+                block_dim: 64,
+                tile_kv: 32,
+                grid_stride: 1,
+                cycles_per_invocation: 0,
+            })
+        })
+        .map_err(|e| format!("b: {}", e))?;
     // list_keys must now contain both.
     let keys = tuner.list_keys();
     assert_eq!(keys.len(), 2);
@@ -202,7 +269,13 @@ fn get_or_tune_distinct_keys_run_closure_independently() -> TestResult {
 #[test]
 fn get_or_tune_records_closure_failure_as_err_and_does_not_cache() -> TestResult {
     let mut tuner = Autotuner::for_device(0, "gfx1036");
-    let key = KernelKey { kernel: "x", gpu_arch: "gfx1036", m: 1, n: 2, k: 3 };
+    let key = KernelKey {
+        kernel: "x",
+        gpu_arch: "gfx1036",
+        m: 1,
+        n: 2,
+        k: 3,
+    };
     // First call: closure returns Err -> public Err surfaces.
     let r1 = tuner.get_or_tune(key, |_| -> Result<_, Error> {
         Err(Error::Backend("synthetic failure".into()))
@@ -243,8 +316,19 @@ fn autotune_config_serde_roundtrip() -> TestResult {
 #[test]
 fn autotuner_load_save_round_trips_via_buffer() -> TestResult {
     let mut tuner = Autotuner::for_device(0, "gfx1036");
-    let key = KernelKey { kernel: "qkv", gpu_arch: "gfx1036", m: 8, n: 4096, k: 4096 };
-    let cfg = AutotuneConfig { block_dim: 128, tile_kv: 128, grid_stride: 2, cycles_per_invocation: 1 };
+    let key = KernelKey {
+        kernel: "qkv",
+        gpu_arch: "gfx1036",
+        m: 8,
+        n: 4096,
+        k: 4096,
+    };
+    let cfg = AutotuneConfig {
+        block_dim: 128,
+        tile_kv: 128,
+        grid_stride: 2,
+        cycles_per_invocation: 1,
+    };
     tuner.record(key, cfg)?;
     let buf = tuner.to_json_bytes()?;
     let second = Autotuner::from_json_bytes(0, "gfx1036", &buf)?;
@@ -270,10 +354,28 @@ fn autotuner_reports_device_ordinal() -> TestResult {
 fn autotuner_per_arch_separation() -> TestResult {
     let mut rdn2 = Autotuner::for_device(0, "gfx1036");
     let mut rdn4 = Autotuner::for_device(0, "gfx1200");
-    let key_rdn2 = KernelKey { kernel: "qkv", gpu_arch: "gfx1036", m: 1, n: 4096, k: 4096 };
-    let key_rdn4 = KernelKey { kernel: "qkv", gpu_arch: "gfx1200", m: 1, n: 4096, k: 4096 };
+    let key_rdn2 = KernelKey {
+        kernel: "qkv",
+        gpu_arch: "gfx1036",
+        m: 1,
+        n: 4096,
+        k: 4096,
+    };
+    let key_rdn4 = KernelKey {
+        kernel: "qkv",
+        gpu_arch: "gfx1200",
+        m: 1,
+        n: 4096,
+        k: 4096,
+    };
     rdn2.record(key_rdn2, AutotuneConfig::default())?;
-    rdn4.record(key_rdn4, AutotuneConfig { block_dim: 64, ..AutotuneConfig::default() })?;
+    rdn4.record(
+        key_rdn4,
+        AutotuneConfig {
+            block_dim: 64,
+            ..AutotuneConfig::default()
+        },
+    )?;
     assert_eq!(rdn2.lookup(key_rdn2).map(|c| c.block_dim), Some(256));
     assert_eq!(rdn4.lookup(key_rdn4).map(|c| c.block_dim), Some(64));
     Ok(())
@@ -282,7 +384,13 @@ fn autotuner_per_arch_separation() -> TestResult {
 #[test]
 fn autotuner_lookup_returns_none_for_unknown_keys() -> TestResult {
     let mut tuner = Autotuner::for_device(0, "gfx1036");
-    let key = KernelKey { kernel: "missing", gpu_arch: "gfx1036", m: 1, n: 2, k: 3 };
+    let key = KernelKey {
+        kernel: "missing",
+        gpu_arch: "gfx1036",
+        m: 1,
+        n: 2,
+        k: 3,
+    };
     assert!(tuner.lookup(key).is_none());
     Ok(())
 }

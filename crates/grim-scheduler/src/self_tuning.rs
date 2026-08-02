@@ -110,7 +110,13 @@ impl KnobTuner {
     /// observed-metric supports.
     fn tune(&mut self) -> f64 {
         let sign = (self.ema_observed - self.target).signum();
-        let target_bound = if sign > 0.0 { self.floor } else if sign < 0.0 { self.ceiling } else { self.current };
+        let target_bound = if sign > 0.0 {
+            self.floor
+        } else if sign < 0.0 {
+            self.ceiling
+        } else {
+            self.current
+        };
         let mut step = self.scale_step;
         loop {
             let next = self.current + (target_bound - self.current) * step;
@@ -260,7 +266,8 @@ impl SelfTuningController {
     pub fn tune_all(&mut self) -> KnobValues {
         // chunked_prefill_size: target = TTFT
         self.chunked_prefill_size.ema_observed = self.ema_ttft_ms;
-        self.chunked_prefill_size.record(self.ema_ttft_ms, self.alpha);
+        self.chunked_prefill_size
+            .record(self.ema_ttft_ms, self.alpha);
         let cp = self.chunked_prefill_size.tune();
 
         // max_batched_tokens: target = TTFT
@@ -268,13 +275,15 @@ impl SelfTuningController {
         let mb = self.max_batched_tokens.tune();
 
         // speculative_block_len: target = ITL
-        self.speculative_block_len.record(self.ema_itl_ms, self.alpha);
+        self.speculative_block_len
+            .record(self.ema_itl_ms, self.alpha);
         let sb = self.speculative_block_len.tune();
 
         // kv_compression_bit_width: target = quality drift target.
         // Higher drift (over target) pushes bits lower; lower drift
         // (under target) leaves room to widen resolution.
-        self.kv_compression_bit_width.record(self.ema_quality, self.alpha);
+        self.kv_compression_bit_width
+            .record(self.ema_quality, self.alpha);
         let kw = self.kv_compression_bit_width.tune();
 
         KnobValues {

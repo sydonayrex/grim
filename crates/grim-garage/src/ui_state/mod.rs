@@ -1,7 +1,7 @@
-//! UI state — the shared store the CVKG reactive system observes.
+//! UI state — the shared store the reactive frontend observes.
 //!
 //! Display state is split into [`display::DisplayState`] (read-by-view) and
-//! service clients (HTTP fetcher). CVKG's reactive primitives watch
+//! service clients (HTTP fetcher). The frontend views watch
 //! `display` and re-render when fields change.
 
 pub mod display;
@@ -19,10 +19,10 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::discovery::{DatasetEntry, ModelEntry};
 use crate::backend::BackendProbe;
+use crate::discovery::{DatasetEntry, ModelEntry};
 
-/// Top-level UI state. Owns the data the CVKG views read.
+/// Top-level UI state. Owns the data the web UI views read.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UiAppState {
     pub models: Vec<ModelEntry>,

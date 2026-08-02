@@ -1,24 +1,4 @@
-//! rocBLAS FFI surface: handle type, enums (operation / datatype / algo),
-//! flag typedef, status constants, and the raw rocBLAS function
-//! declarations (`rocblas_create_handle`, `rocblas_set_stream`,
-//! `rocblas_sgemm`, `rocblas_gemm_ex`, `rocblas_gemm_strided_batched_ex`).
-//! Also hosts the small `ArithType -> rocblas_datatype` mapping
-//! helpers that convert Grim's dtype vocabulary to rocBLAS'.
-//!
-//! All of this is consumed by `RocmDevice::matmul` and friends in
-//! lib.rs (and by `device::gemm_tuning::lookup_solution_index`).
-//! Re-exported at the crate root so callers see no API change.
-//!
-//! Skill attribution:
-//! - `rust-ffi` — the SAFETY rationale for the `unsafe impl Send` /
-//!   Sync lines on `RoclabsHandle` is the same as on `RocmHandle`:
-//!   opaque platform resources, library owns the lock.
-//! - `rocm-quantization-inference` — `rocblas_datatype` /
-//!   `rocblas_gemm_algo` are the schema that Intel hipBLASLt /
-//!   rocBLAS GEMM dispatch reads at runtime; wrong discriminants
-//!   silently zero outputs (rocblas_status_invalid_value).
-//! - `rust-gpu-discipline` §3 — explicit `Result` mapping for
-//!   `rocblas_status`; no silent fallback.
+//! rocBLAS FFI surface: handle type, enums (operation / datatype / algo), [see: `rocblas_create_handle`, `rocblas_set_stream`]
 
 use std::ffi::c_void;
 
@@ -34,9 +14,9 @@ pub const rocblas_status_success: Rocblstatus = 0;
 #[repr(i32)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum RocblasOperation {
-    None = 111,                  // rocblas_operation_none
-    Transpose = 112,             // rocblas_operation_transpose
-    ConjugateTranspose = 113,    // rocblas_operation_conjugate_transpose
+    None = 111,               // rocblas_operation_none
+    Transpose = 112,          // rocblas_operation_transpose
+    ConjugateTranspose = 113, // rocblas_operation_conjugate_transpose
 }
 
 /// rocBLAS dim type (m/n/k/lda/ldb/etc.).
@@ -56,9 +36,7 @@ unsafe extern "C" {
     pub fn rocblas_destroy_handle(handle: RoclabsHandle) -> Rocblstatus;
     pub fn rocblas_set_stream(handle: RoclabsHandle, stream: *mut c_void) -> Rocblstatus;
 
-    /// Special-case FP32 GEMM (16 args). Used by the FP32-only
-    /// paths of `RocmDevice::matmul` (the legacy dispatch before
-    /// Item 0's `gemm_ex` was wired in).
+    /// Special-case FP32 GEMM (16 args). Used by the FP32-only [see: `RocmDevice::matmul`, `gemm_ex`]
     pub fn rocblas_sgemm(
         handle: RoclabsHandle,
         trans_a: RocblasOperation,
@@ -77,10 +55,7 @@ unsafe extern "C" {
     ) -> Rocblstatus;
 }
 
-/// rocBLAS data types. Discriminants match the official rocBLAS
-/// `rocblas_datatype` enum (see rocblas/rocblas-types.h). Passing the
-/// wrong integer here silently yields rocblas_status_invalid_value
-/// and zeroes the output.
+/// rocBLAS data types. Discriminants match the official rocBLAS [see: `rocblas_datatype`]
 #[repr(i32)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
@@ -120,7 +95,6 @@ pub const ROCBLAS_GEMM_FLAGS_NONE: rocblas_gemm_flags = 0x0;
 
 unsafe extern "C" {
     // gemm_ex — signature matches rocBLAS exactly (29 args). Used by
-    // RocmDevice::matmul (Item 0 / Item 7 of the spec).
     pub fn rocblas_gemm_ex(
         handle: RoclabsHandle,
         trans_a: RocblasOperation,
@@ -149,8 +123,6 @@ unsafe extern "C" {
     ) -> Rocblstatus;
 
     // gemm_strided_batched_ex — 29 args, batch_count inserted before
-    // compute_type, stride_a..stride_d inserted after each lda/ldb/ldc/ldd.
-    // rocblas_stride is int64_t.
     pub fn rocblas_gemm_strided_batched_ex(
         handle: RoclabsHandle,
         trans_a: RocblasOperation,
@@ -184,8 +156,7 @@ unsafe extern "C" {
     ) -> Rocblstatus;
 }
 
-/// Maps Grim `ArithType` to the corresponding `rocblas_datatype` enum
-/// value. Falls back to `f32_r` for unknown or unsupported types.
+/// Maps Grim `ArithType` to the corresponding `rocblas_datatype` enum [see: `f32_r`]
 pub fn arith_to_rocblas_dtype(arith: ArithType) -> rocblas_datatype {
     match arith {
         ArithType::F32 => rocblas_datatype::f32_r,
@@ -197,8 +168,6 @@ pub fn arith_to_rocblas_dtype(arith: ArithType) -> rocblas_datatype {
 }
 
 /// Maps Grim `ArithType` to the rocBLAS compute (accumulation) datatype.
-/// Mixed-precision GEMMs accumulate in FP32 regardless of the input
-/// precision (FP16/BF16 -> FP32) for numerical stability.
 pub fn arith_to_compute_dtype(_arith: ArithType) -> rocblas_datatype {
     rocblas_datatype::f32_r
 }
@@ -208,15 +177,13 @@ pub fn status_to_result(status: Rocblstatus, op: &'static str) -> Result<()> {
     if status == rocblas_status_success {
         Ok(())
     } else {
-        Err(Error::Backend(format!("rocBLAS {op} failed with status {status}")))
+        Err(Error::Backend(format!(
+            "rocBLAS {op} failed with status {status}"
+        )))
     }
 }
 
-/// Selects the appropriate rocBLAS GEMM algorithm mode based on the tuned solution index.
-///
-/// Under rocBLAS FFI specifications, passing a non-zero solution index has no effect
-/// unless the algorithm is explicitly set to `rocblas_gemm_algo::solution_index`.
-/// Otherwise, `rocblas_gemm_algo::standard` must be used for default dispatch behavior.
+/// Selects the appropriate rocBLAS GEMM algorithm mode based on the tuned solution index. [see: `rocblas_gemm_algo::solution_index`]
 pub fn select_gemm_algo(solution_index: i32) -> rocblas_gemm_algo {
     if solution_index != 0 {
         rocblas_gemm_algo::solution_index
@@ -225,29 +192,40 @@ pub fn select_gemm_algo(solution_index: i32) -> rocblas_gemm_algo {
     }
 }
 
-
 #[cfg(test)]
 mod rocblas_self_tests {
     use super::*;
 
     #[test]
     fn arith_f32_maps_to_f32_r() {
-        assert_eq!(arith_to_rocblas_dtype(ArithType::F32), rocblas_datatype::f32_r);
+        assert_eq!(
+            arith_to_rocblas_dtype(ArithType::F32),
+            rocblas_datatype::f32_r
+        );
     }
 
     #[test]
     fn arith_f16_maps_to_f16_r() {
-        assert_eq!(arith_to_rocblas_dtype(ArithType::F16), rocblas_datatype::f16_r);
+        assert_eq!(
+            arith_to_rocblas_dtype(ArithType::F16),
+            rocblas_datatype::f16_r
+        );
     }
 
     #[test]
     fn arith_bf16_maps_to_bf16_r() {
-        assert_eq!(arith_to_rocblas_dtype(ArithType::BF16), rocblas_datatype::bf16_r);
+        assert_eq!(
+            arith_to_rocblas_dtype(ArithType::BF16),
+            rocblas_datatype::bf16_r
+        );
     }
 
     #[test]
     fn arith_u8_maps_to_u8_r() {
-        assert_eq!(arith_to_rocblas_dtype(ArithType::U8), rocblas_datatype::u8_r);
+        assert_eq!(
+            arith_to_rocblas_dtype(ArithType::U8),
+            rocblas_datatype::u8_r
+        );
     }
 
     #[test]

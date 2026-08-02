@@ -26,7 +26,13 @@ impl Tensor {
         provenance: QuantProvenance,
         device: Device,
     ) -> Self {
-        Self { storage, layout, dtype, provenance, device }
+        Self {
+            storage,
+            layout,
+            dtype,
+            provenance,
+            device,
+        }
     }
 
     pub fn storage(&self) -> &Arc<dyn BackendStorage> {
@@ -46,6 +52,11 @@ impl Tensor {
     }
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Return optional quantization scales for formats carrying explicit scale arrays (`ResidualPacked`/`GroupInt`).
+    pub fn quant_scales(&self) -> Option<&[f32]> {
+        self.storage.quant_scales()
     }
 
     /// Transfer to host `Vec<f32>` — slow path, used by tests and sampling.
@@ -89,4 +100,3 @@ impl std::fmt::Debug for Tensor {
             .finish()
     }
 }
-

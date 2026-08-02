@@ -9,7 +9,7 @@ use grim_tensor::provider::TensorProvider;
 
 use grim_format::convert::convert_to_grim;
 use grim_format::format::normals_packed_size;
-use grim_format::gguf::{GgufDType, GGUF_MAGIC, GGUF_VERSION};
+use grim_format::gguf::{GGUF_MAGIC, GGUF_VERSION, GgufDType};
 use grim_format::tprov::GrimProvider;
 
 /// Write a one-tensor GGUF (F32, 16 elements) with a padded data region.
@@ -79,12 +79,26 @@ fn convert_to_grim_then_grim_provider_round_trips_tensor_payload() {
     let gguf_path_str = gguf_path.to_str().expect("utf8 gguf path");
     let grim_path_str = grim_path.to_str().expect("utf8 grim path");
 
-    convert_to_grim(gguf_path_str, grim_path_str, "gfx1100", 4.0, 0, None, None, None, None, None)
-        .expect("convert_to_grim must succeed on a valid GGUF source");
+    convert_to_grim(
+        gguf_path_str,
+        grim_path_str,
+        "gfx1100",
+        4.0,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("convert_to_grim must succeed on a valid GGUF source");
 
-    let provider = GrimProvider::open(grim_path_str).expect("GrimProvider must open the converted .grim");
+    let provider =
+        GrimProvider::open(grim_path_str).expect("GrimProvider must open the converted .grim");
 
-    let meta = provider.meta(&tensor_name).expect("tensor must be in registry");
+    let meta = provider
+        .meta(&tensor_name)
+        .expect("tensor must be in registry");
     let elem_count: usize = meta.shape.iter().product();
 
     let raw = provider.get(&tensor_name).expect("get must succeed");
@@ -131,8 +145,14 @@ fn convert_to_grim_produces_deterministic_payload_for_same_input() {
     let a_str = grim_a.to_str().unwrap();
     let b_str = grim_b.to_str().unwrap();
 
-    convert_to_grim(gguf_str, a_str, "gfx1100", 4.0, 0, None, None, None, None, None).unwrap();
-    convert_to_grim(gguf_str, b_str, "gfx1100", 4.0, 0, None, None, None, None, None).unwrap();
+    convert_to_grim(
+        gguf_str, a_str, "gfx1100", 4.0, 0, None, None, None, None, None,
+    )
+    .unwrap();
+    convert_to_grim(
+        gguf_str, b_str, "gfx1100", 4.0, 0, None, None, None, None, None,
+    )
+    .unwrap();
 
     let provider_a = GrimProvider::open(a_str).unwrap();
     let provider_b = GrimProvider::open(b_str).unwrap();
@@ -164,8 +184,8 @@ fn grim_provider_returns_extension_declaration_after_round_trip() {
     use grim_format::format::{GrimFile, GrimHeader};
     use grim_format::gguf::{GrimMetadata, GrimRocmlProfile};
     use grim_format::spec::{
-        GrimTensorExt, LayoutDescriptor, LayoutHintTag, OutlierIndexEncoding,
-        PayloadCompression, PerRowBpwMode, RowScaleDtype,
+        GrimTensorExt, LayoutDescriptor, LayoutHintTag, OutlierIndexEncoding, PayloadCompression,
+        PerRowBpwMode, RowScaleDtype,
     };
     use std::collections::HashMap;
     use std::io::Cursor;
@@ -256,7 +276,9 @@ fn grim_provider_returns_extension_declaration_after_round_trip() {
     assert_eq!(raw.shape, vec![128, 4096]);
 
     // The extension declaration round-tripped.
-    let ext = provider.ext_for(tensor_name).expect("extension must be present");
+    let ext = provider
+        .ext_for(tensor_name)
+        .expect("extension must be present");
     assert_eq!(ext.row_count, 128);
     assert_eq!(ext.row_stride, 4096);
     assert_eq!(ext.per_row_bpw_mode, PerRowBpwMode::PerRowTable);
@@ -264,7 +286,10 @@ fn grim_provider_returns_extension_declaration_after_round_trip() {
     assert_eq!(ext.scale_offset, 8192);
     assert_eq!(ext.scale_size, 128);
     assert_eq!(ext.gptq_ordered, 1);
-    assert_eq!(ext.outlier_index_encoding, OutlierIndexEncoding::DeltaVarint);
+    assert_eq!(
+        ext.outlier_index_encoding,
+        OutlierIndexEncoding::DeltaVarint
+    );
     assert_eq!(ext.outlier_residual_bpw, 8);
     assert_eq!(ext.compression, PayloadCompression::Zstd);
     assert_eq!(ext.fusion_mask, 0b11);

@@ -1,8 +1,8 @@
 use grim_format::tokenizer::GgufTokenizer;
-use grim_tensor::{Shape, Tensor};
 use grim_tensor::error::Result;
-use std::io::{BufRead, BufReader};
+use grim_tensor::{Shape, Tensor};
 use std::fs::File;
+use std::io::{BufRead, BufReader};
 
 /// Reads a `.jsonl` file where each line is `{"text": "..."}`,
 /// tokenizes each line, packs tokens into fixed-length sequences,
@@ -28,7 +28,9 @@ impl JsonlBatchIterator {
         batch_size: usize,
     ) -> Result<Self> {
         let file = File::open(path).map_err(|e| {
-            grim_tensor::error::Error::Backend(format!("failed to open dataloader path {path:?}: {e}"))
+            grim_tensor::error::Error::Backend(format!(
+                "failed to open dataloader path {path:?}: {e}"
+            ))
         })?;
         Ok(Self {
             token_buffer: Vec::new(),
@@ -48,7 +50,9 @@ impl JsonlBatchIterator {
             self.fill_buffer()?;
         }
         if self.token_buffer.is_empty() {
-            return Err(grim_tensor::error::Error::Backend("dataloader exhausted".into()));
+            return Err(grim_tensor::error::Error::Backend(
+                "dataloader exhausted".into(),
+            ));
         }
         let pad_id = self.tokenizer.pad_token_id();
         while self.token_buffer.len() < needed {
@@ -56,11 +60,14 @@ impl JsonlBatchIterator {
         }
         let flat: Vec<u32> = self.token_buffer.drain(..needed).collect();
         let data_f32: Vec<f32> = flat.iter().map(|&x| x as f32).collect();
-        let input_ids = grim_backend_cpu::cpu_tensor(data_f32, Shape::from_slice(&[self.batch_size, self.seq_len]));
+        let input_ids = grim_backend_cpu::cpu_tensor(
+            data_f32,
+            Shape::from_slice(&[self.batch_size, self.seq_len]),
+        );
         let labels = Self::build_labels(&flat, self.batch_size, self.seq_len, pad_id);
         Ok((input_ids, labels))
     }
-    
+
     /// Load the next preference optimization batch (chosen/rejected pairs).
     /// Returns `Ok(Some((chosen, rejected, is_preferred)))` when a batch is ready,
     /// `Ok(None)` when the file is exhausted, or `Err` on I/O errors.
@@ -69,33 +76,39 @@ impl JsonlBatchIterator {
         while self.token_buffer.len() < needed * 2 && !self.exhausted {
             self.fill_preference_buffer()?;
         }
-        
+
         if self.token_buffer.is_empty() {
             return Ok(None);
         }
-        
+
         let pad_id = self.tokenizer.pad_token_id();
         let total_needed = needed * 2;
         while self.token_buffer.len() < total_needed {
             self.token_buffer.push(pad_id);
         }
-        
+
         let flat: Vec<u32> = self.token_buffer.drain(..total_needed).collect();
         let chosen_flat: Vec<u32> = flat[0..needed].to_vec();
         let rejected_flat: Vec<u32> = flat[needed..total_needed].to_vec();
-        
+
         let chosen_f32: Vec<f32> = chosen_flat.iter().map(|&x| x as f32).collect();
         let rejected_f32: Vec<f32> = rejected_flat.iter().map(|&x| x as f32).collect();
-        
-        let chosen_ids = grim_backend_cpu::cpu_tensor(chosen_f32, Shape::from_slice(&[self.batch_size, self.seq_len]));
-        let rejected_ids = grim_backend_cpu::cpu_tensor(rejected_f32, Shape::from_slice(&[self.batch_size, self.seq_len]));
-        
+
+        let chosen_ids = grim_backend_cpu::cpu_tensor(
+            chosen_f32,
+            Shape::from_slice(&[self.batch_size, self.seq_len]),
+        );
+        let rejected_ids = grim_backend_cpu::cpu_tensor(
+            rejected_f32,
+            Shape::from_slice(&[self.batch_size, self.seq_len]),
+        );
+
         // For now, all are "preferred" by default
         let is_preferred = vec![true; self.batch_size];
-        
+
         Ok(Some((chosen_ids, rejected_ids, is_preferred)))
     }
-    
+
     fn fill_preference_buffer(&mut self) -> Result<()> {
         // Load preference pairs from JSONL file
         // Format: {"prompt": "...", "chosen": "...", "rejected": "...", "preferred": true/false}
@@ -111,14 +124,14 @@ impl JsonlBatchIterator {
                 }
                 let v: serde_json::Value = serde_json::from_str(trimmed)
                     .map_err(|e| grim_tensor::error::Error::Backend(e.to_string()))?;
-                
+
                 // Load chosen and rejected texts
                 let chosen_text = v["chosen"].as_str().unwrap_or("");
                 let rejected_text = v["rejected"].as_str().unwrap_or("");
-                
+
                 let chosen_tokens = self.tokenizer.encode(chosen_text);
                 let rejected_tokens = self.tokenizer.encode(rejected_text);
-                
+
                 self.token_buffer.extend(chosen_tokens);
                 self.token_buffer.extend(rejected_tokens);
             }
@@ -149,12 +162,7 @@ impl JsonlBatchIterator {
         Ok(())
     }
 
-    fn build_labels(
-        flat: &[u32],
-        batch_size: usize,
-        seq_len: usize,
-        pad_token_id: u32,
-    ) -> Tensor {
+    fn build_labels(flat: &[u32], batch_size: usize, seq_len: usize, pad_token_id: u32) -> Tensor {
         let mut labels_flat = flat.to_vec();
         for row in 0..batch_size {
             let start = row * seq_len;
@@ -185,12 +193,8 @@ mod tests {
         tokenizer.tokens = vec!["hello".into(), "world".into()];
         tokenizer.token_to_id.insert("hello".into(), 1);
         tokenizer.token_to_id.insert("world".into(), 2);
-        let mut loader = JsonlBatchIterator::new(
-            path.to_str().unwrap(),
-            tokenizer,
-            64,
-            2,
-        ).expect("datloader should construct");
+        let mut loader = JsonlBatchIterator::new(path.to_str().unwrap(), tokenizer, 64, 2)
+            .expect("datloader should construct");
         let (inputs, labels) = loader.next_batch().expect("first batch");
         assert_eq!(inputs.shape().dims(), &[2, 64]);
         assert_eq!(labels.shape().dims(), &[2, 64]);

@@ -1,4 +1,4 @@
-//! `grim accept` — Validate and install a model architecture plugin into system plugins directory.
+//! `grim accept` — Validate and install a model architecture plugin into the plugins directory.
 
 use grim_core::error::{Error, Result};
 use grim_core::grim_plugins_dir;
@@ -6,7 +6,7 @@ use grim_plugin::ArchCompatSpec;
 use std::fs;
 use std::path::Path;
 
-/// Validate a `.grimplugin` file and install it into the system plugin directory.
+/// Validate a `.grimplugin` file and install it into the plugins directory.
 pub async fn cmd_accept(plugin_path: &str) -> Result<()> {
     let src_path = Path::new(plugin_path);
     if !src_path.exists() {
@@ -21,7 +21,7 @@ pub async fn cmd_accept(plugin_path: &str) -> Result<()> {
         .and_then(|n| n.to_str())
         .ok_or_else(|| Error::Config("Invalid plugin filename".to_string()))?;
 
-    // Read and validate plugin manifest or config JSON
+    // Read and validate plugin manifest JSON
     let content = fs::read_to_string(src_path)
         .map_err(|e| Error::Config(format!("Failed to read plugin file: {e}")))?;
 
@@ -31,7 +31,7 @@ pub async fn cmd_accept(plugin_path: &str) -> Result<()> {
         spec.model_type, spec.base_architecture
     );
 
-    // Target installation directory
+    // Target plugins directory
     let target_dir = grim_plugins_dir();
     fs::create_dir_all(&target_dir)
         .map_err(|e| Error::Config(format!("Failed to create plugins directory: {e}")))?;

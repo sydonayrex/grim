@@ -1,24 +1,15 @@
-//! `grim-service` — Installation and platform-native system services.
-//! §12 of the Grim architecture.
-//!
-//! §13.1 verify-before-success: every mutating operation confirms its
-//! effect before reporting success. Service managers write unit files to
-//! disk and read them back; start/stop/status call the actual OS service
-//! manager rather than assuming the operation succeeded.
+//! `grim-service` — Platform-native system services. §13.1 verify-before-success: every mutating
+//! operation confirms its effect before reporting success.
 
-use std::path::PathBuf;
 use grim_tensor::error::{Error, Result};
+use std::path::PathBuf;
 
-/// Escape a Windows command-line argument by wrapping in double quotes
-/// and doubling any internal double quotes (per Windows quoting rules).
+/// Escape a Windows command-line argument (double-quote + double internal quotes).
 fn escape_windows_arg(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
-/// Default service name when the caller supplies none. Every platform
-/// manager carries its own resolved `name` field — there is a single
-/// source of truth per manager instance, never a `const` mixed with a
-/// per-call `cfg.name` (the shape that produced P2-7's label drift).
+/// Default service name. Each manager carries its own resolved `name` — single source of truth.
 pub const DEFAULT_SERVICE_NAME: &str = "grim";
 
 #[allow(dead_code)]
@@ -47,8 +38,7 @@ pub struct ServiceConfig {
     pub run_as_user: Option<String>,
     pub health_check: HealthCheckConfig,
     pub log_path: Option<PathBuf>,
-    /// Subject Alternative Names for the self-signed TLS certificate.
-    /// If empty, defaults to `["localhost", "127.0.0.1"]`.
+    /// Subject Alternative Names for the self-signed TLS certificate. Defaults to ["localhost", "127.0.0.1"].
     pub tls_subject_alt_names: Vec<String>,
 }
 
@@ -61,7 +51,7 @@ pub enum ServiceStatus {
     Unknown(String),
 }
 
-/// Abstracts over the three platform-native service managers so install/uninstall share one code path.
+/// Abstracts over platform-native service managers so install/uninstall share one code path.
 pub trait ServiceManager: Send + Sync {
     fn install(&self, cfg: &ServiceConfig) -> Result<()>;
     fn uninstall(&self, purge: bool) -> Result<()>;
@@ -72,22 +62,21 @@ pub trait ServiceManager: Send + Sync {
     fn reload_config(&self) -> Result<()>;
 }
 
-/// Generates self-signed certificates and updates the configuration file with TLS config.
-///
-/// This handles creating certificates for local development and registers them under the
-/// `[server.tls]` section of the configuration file.
+/// Generate self-signed certs and update config with [server.tls] section.
 pub fn setup_tls_and_config(cfg: &ServiceConfig) -> Result<()> {
-    let config_dir = cfg.config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let config_dir = cfg
+        .config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
     let cert_dir = config_dir.join("certs");
     let cert_path = cert_dir.join("cert.pem");
     let key_path = cert_dir.join("key.pem");
 
-    // Generate certificates if they don't exist
+    // Generate certificates if missing
     if !cert_path.exists() || !key_path.exists() {
         if let Some(parent) = cert_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                Error::Backend(format!("failed to create cert directory: {e}"))
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::Backend(format!("failed to create cert directory: {e}")))?;
         }
         let subject_alt_names = if cfg.tls_subject_alt_names.is_empty() {
             vec!["localhost".to_string(), "127.0.0.1".to_string()]
@@ -96,26 +85,34 @@ pub fn setup_tls_and_config(cfg: &ServiceConfig) -> Result<()> {
         };
         let cert = rcgen::generate_simple_self_signed(subject_alt_names)
             .map_err(|e| Error::Backend(format!("failed to generate self-signed cert: {e}")))?;
-        
-        let cert_pem = cert.serialize_pem().map_err(|e| {
-            Error::Backend(format!("failed to serialize cert: {e}"))
-        })?;
+
+        let cert_pem = cert
+            .serialize_pem()
+            .map_err(|e| Error::Backend(format!("failed to serialize cert: {e}")))?;
         let key_pem = cert.serialize_private_key_pem();
 
         std::fs::write(&cert_path, cert_pem).map_err(|e| {
-            Error::Backend(format!("failed to write cert to {}: {e}", cert_path.display()))
+            Error::Backend(format!(
+                "failed to write cert to {}: {e}",
+                cert_path.display()
+            ))
         })?;
         std::fs::write(&key_path, key_pem).map_err(|e| {
-            Error::Backend(format!("failed to write key to {}: {e}", key_path.display()))
+            Error::Backend(format!(
+                "failed to write key to {}: {e}",
+                key_path.display()
+            ))
         })?;
-        println!("[Service] Generated self-signed SSL/TLS certificate at {}", cert_path.display());
+        println!(
+            "[Service] Generated self-signed SSL/TLS certificate at {}",
+            cert_path.display()
+        );
     }
 
     // Ensure config directory exists
     if let Some(parent) = cfg.config_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            Error::Backend(format!("failed to create config directory: {e}"))
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Backend(format!("failed to create config directory: {e}")))?;
     }
 
     // Write/update config file with [server.tls] block
@@ -125,7 +122,8 @@ pub fn setup_tls_and_config(cfg: &ServiceConfig) -> Result<()> {
         r#"# Grim configuration file
 [engine]
 determinism_mode = "relaxed"
-"#.to_string()
+"#
+        .to_string()
     };
 
     if !content.contains("[server.tls]") {
@@ -135,9 +133,15 @@ determinism_mode = "relaxed"
             key_path.display().to_string().replace("\\", "\\\\")
         ));
         std::fs::write(&cfg.config_path, content).map_err(|e| {
-            Error::Backend(format!("failed to write config to {}: {e}", cfg.config_path.display()))
+            Error::Backend(format!(
+                "failed to write config to {}: {e}",
+                cfg.config_path.display()
+            ))
         })?;
-        println!("[Service] Updated config file at {} with SSL/TLS settings.", cfg.config_path.display());
+        println!(
+            "[Service] Updated config file at {} with SSL/TLS settings.",
+            cfg.config_path.display()
+        );
     }
 
     Ok(())
@@ -206,7 +210,7 @@ impl ServiceManager for SystemdManager {
         let unit_path = self.unit_path();
         let content = self.generate_unit(cfg);
 
-        // §13.1: write the unit file to disk first.
+        // §13.1: write unit file to disk.
         std::fs::write(&unit_path, &content).map_err(|e| {
             Error::Backend(format!(
                 "failed to write systemd unit to '{}': {e}",
@@ -214,11 +218,9 @@ impl ServiceManager for SystemdManager {
             ))
         })?;
 
-        // §13.1: verify the write succeeded by reading it back.
+        // §13.1: verify write by reading it back.
         let verify = std::fs::read_to_string(&unit_path).map_err(|e| {
-            Error::Backend(format!(
-                "unit file written but cannot be read back: {e}"
-            ))
+            Error::Backend(format!("unit file written but cannot be read back: {e}"))
         })?;
         if verify != content {
             return Err(Error::Backend(
@@ -226,7 +228,7 @@ impl ServiceManager for SystemdManager {
             ));
         }
 
-        // Tell systemd to reload its unit files so `systemctl start` finds the new unit.
+        // Reload systemd so systemctl start finds the new unit.
         let status = std::process::Command::new("systemctl")
             .args(["daemon-reload"])
             .status()
@@ -249,13 +251,15 @@ impl ServiceManager for SystemdManager {
     fn uninstall(&self, purge: bool) -> Result<()> {
         let unit_path = self.unit_path();
         if unit_path.exists() {
-            std::fs::remove_file(&unit_path).map_err(|e| {
-                Error::Backend(format!("failed to remove unit file: {e}"))
-            })?;
+            std::fs::remove_file(&unit_path)
+                .map_err(|e| Error::Backend(format!("failed to remove unit file: {e}")))?;
             let _ = std::process::Command::new("systemctl")
                 .args(["daemon-reload"])
                 .status();
-            println!("[SystemdManager] Removed unit file at {}.", unit_path.display());
+            println!(
+                "[SystemdManager] Removed unit file at {}.",
+                unit_path.display()
+            );
         }
         if purge {
             if let Some(parent) = unit_path.parent() {
@@ -362,15 +366,12 @@ impl LaunchdManager {
         PathBuf::from(format!("/Library/LaunchDaemons/com.{}.plist", self.name))
     }
 
-    /// launchd job label — `com.{name}`. Matches the plist `<key>Label</key>`
-    /// value that `generate_plist` writes, so `start`/`stop`/`status`/`reload`
-    /// always target the same job `install` registered.
+    /// launchd job label — `com.{name}`. Must match plist `<key>Label</key>` written by install.
     fn label(&self) -> String {
         format!("com.{}", self.name)
     }
 
-    /// Fully-qualified launchd service target, `system/{label}`, for
-    /// `launchctl print` / `kickstart`.
+    /// Fully-qualified launchd service target for `launchctl print` / `kickstart`.
     fn target(&self) -> String {
         format!("system/{}", self.label())
     }
@@ -421,12 +422,14 @@ impl ServiceManager for LaunchdManager {
         let content = self.generate_plist(cfg);
 
         std::fs::write(&plist_path, &content).map_err(|e| {
-            Error::Backend(format!("failed to write launchd plist to '{}': {e}", plist_path.display()))
+            Error::Backend(format!(
+                "failed to write launchd plist to '{}': {e}",
+                plist_path.display()
+            ))
         })?;
 
-        let verify = std::fs::read_to_string(&plist_path).map_err(|e| {
-            Error::Backend(format!("plist written but cannot be read back: {e}"))
-        })?;
+        let verify = std::fs::read_to_string(&plist_path)
+            .map_err(|e| Error::Backend(format!("plist written but cannot be read back: {e}")))?;
         if verify != content {
             return Err(Error::Backend(
                 "plist content mismatch after write — disk may be corrupt".into(),
@@ -458,10 +461,12 @@ impl ServiceManager for LaunchdManager {
             let _ = std::process::Command::new("launchctl")
                 .args(["unload", &plist_path.display().to_string()])
                 .status();
-            std::fs::remove_file(&plist_path).map_err(|e| {
-                Error::Backend(format!("failed to remove plist: {e}"))
-            })?;
-            println!("[LaunchdManager] Removed plist at {}.", plist_path.display());
+            std::fs::remove_file(&plist_path)
+                .map_err(|e| Error::Backend(format!("failed to remove plist: {e}")))?;
+            println!(
+                "[LaunchdManager] Removed plist at {}.",
+                plist_path.display()
+            );
         }
         if purge {
             let _ = std::fs::remove_dir("/var/log/grim");
@@ -688,10 +693,7 @@ mod tests {
         }
     }
 
-    /// P2-7: the unit-file path must honor the manager's resolved name, not a
-    /// hardcoded `grim`/`SERVICE_NAME` constant. A `--name grimed` install
-    /// writes to `grimed.service`; a `start --name grimed` must then target the
-    /// same path. This pins the generalization of the original P2-7 fix.
+    /// P2-7: unit-file path must use manager's resolved name, not hardcoded `grim`.
     #[test]
     fn systemd_unit_path_honors_name() {
         let mgr = SystemdManager::new("grimed".to_string());
@@ -700,7 +702,7 @@ mod tests {
             PathBuf::from("/etc/systemd/system/grimed.service"),
             "unit path must use the manager's name, not a hardcoded 'grim'"
         );
-        // And the default name still resolves identically to the old constant.
+        // Default name still resolves identically to the old constant.
         assert_eq!(
             SystemdManager::new(DEFAULT_SERVICE_NAME.to_string()).unit_path(),
             PathBuf::from("/etc/systemd/system/grim.service"),
@@ -723,10 +725,7 @@ mod tests {
         );
     }
 
-    /// P2-7 (literal finding): the launchd job label and the `systemctl print` /
-    /// `kickstart` target must agree with the plist `<key>Label</key>` written by
-    /// `install`. `start`/`stop`/`status`/`reload_config` all derive from these
-    /// helpers, so this single assertion pins the cross-command agreement.
+    /// P2-7: launchd label and target must agree with plist `<key>Label</key>` written by install.
     #[test]
     fn launchd_label_and_target_honors_name() {
         let mgr = LaunchdManager::new("grimed".to_string());
@@ -734,17 +733,12 @@ mod tests {
         assert_eq!(mgr.target(), "system/com.grimed");
     }
 
-    /// The generated plist body must carry the `com.{name}` label, not a
-    /// hardcoded `com.grim`. This is the test that fails if anyone reverts
-    /// `name = self.name` in `generate_plist` back to a `SERVICE_NAME`-style
-    /// constant — i.e. it pins the *generalized* fix, not just the path helpers.
+    /// Plist body must carry `com.{name}`, not hardcoded `com.grim`. Pins the generalized fix.
     #[test]
     fn generated_plist_label_honors_self_name() {
         let mgr = LaunchdManager::new("grimed".to_string());
         let plist = mgr.generate_plist(&minimal_cfg());
-        // The plist Label line must name the resolved service, never a
-        // literal "grim". Both assertions: positive (grimed present) and
-        // negative (no bare com.grim) so a regression that emits both fails.
+        // Plist Label must name resolved service, not literal "grim". Positive + negative assertions.
         assert!(
             plist.contains("<key>Label</key><string>com.grimed</string>"),
             "plist Label must be com.grimed, got: {plist}"
@@ -755,10 +749,7 @@ mod tests {
         );
     }
 
-    /// Symmetric guard for the systemd unit — the Description line carries the
-    /// resolved name so a multi-instance install is never silently aliased to
-    /// `grim`. (ExecStart itself is name-independent; the Description is the
-    /// name-bearing field.)
+    /// Systemd Description line carries resolved name so multi-install is never aliased to `grim`.
     #[test]
     fn generated_unit_description_honors_self_name() {
         let mgr = SystemdManager::new("grimed".to_string());

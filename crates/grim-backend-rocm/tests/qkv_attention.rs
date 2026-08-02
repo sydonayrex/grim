@@ -107,7 +107,8 @@ fn qkv_attention_structural_empty_call() {
     // The host launcher requires the gate to be checked first; this case
     // amply demonstrates it returns Err when the gate is closed.
     let env = std::env::var(GPU_TEST_ENV).is_ok();
-    let dev = RocmDevice::new(0);
+    let dev = RocmDevice::try_new(0)
+        .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
     let _ = env; // Reserved for future GPU-gated branches.
     let q = dev
         .from_cpu(&[0.5f32; 0], &Shape::from_slice(&[0, 0, 0]), DType::F32)
@@ -182,16 +183,25 @@ fn qkv_attention_reference_exact_hand_calculated_causal() {
     // expected out[1] = 0.3302386 * 20 + 0.6697614 * 40 = 6.604772 + 26.790456 = 33.395228
     let expected_1_0 = 23.395228f32;
     let expected_1_1 = 33.395228f32;
-    assert!((got[2] - expected_1_0).abs() < 1e-4, "got[2] = {}, want {}", got[2], expected_1_0);
-    assert!((got[3] - expected_1_1).abs() < 1e-4, "got[3] = {}, want {}", got[3], expected_1_1);
+    assert!(
+        (got[2] - expected_1_0).abs() < 1e-4,
+        "got[2] = {}, want {}",
+        got[2],
+        expected_1_0
+    );
+    assert!(
+        (got[3] - expected_1_1).abs() < 1e-4,
+        "got[3] = {}, want {}",
+        got[3],
+        expected_1_1
+    );
 }
 
 /// CPU reference: non-4:1 GQA ratio (8:1) catches a regression back to
 /// the hardcoded `num_heads / 4` bug.
 #[test]
 fn qkv_attention_reference_8_to_1_gqa() {
-    let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len, cache_offset) =
-        (4, 8, 1, 8, 4, 0); // 8 heads sharing 1 kv_head (8:1 GQA).
+    let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len, cache_offset) = (4, 8, 1, 8, 4, 0); // 8 heads sharing 1 kv_head (8:1 GQA).
     let q: Vec<f32> = (0..(seq_len * num_heads * head_dim))
         .map(|i| (i as f32 * 0.07).cos())
         .collect();
@@ -202,9 +212,15 @@ fn qkv_attention_reference_8_to_1_gqa() {
         .map(|i| (i as f32 * 0.03).tan().clamp(-10.0, 10.0))
         .collect();
     let got = reference_attention(
-        &q, &k, &v,
-        seq_len, num_heads, num_kv_heads, head_dim,
-        kv_seq_len, cache_offset,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        cache_offset,
     );
     // Strength check: the very last query attends to everything, so its
     // output norm should be larger than the first query's output (which
@@ -222,7 +238,8 @@ fn qkv_attention_reference_8_to_1_gqa() {
     assert!(
         first > 0.0 && last > 0.0,
         "expected non-zero norms; first={} last={}",
-        first, last
+        first,
+        last
     );
 }
 
@@ -243,9 +260,15 @@ fn qkv_attention_reference_decode_with_cache() {
         .map(|i| ((i as f32 * 0.17).sin() + 0.1))
         .collect();
     let got = reference_attention(
-        &q, &k, &v,
-        seq_len, num_heads, num_kv_heads, head_dim,
-        kv_seq_len, cache_offset,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        cache_offset,
     );
     // The single query attends to (kv indices 0..=cache_offset). Make sure
     // changing K[cache_offset, *, *] flips the scalar output (read sanity).
@@ -256,9 +279,15 @@ fn qkv_attention_reference_decode_with_cache() {
         k_flipped[i] += 0.5;
     }
     let got_flipped = reference_attention(
-        &q, &k_flipped, &v,
-        seq_len, num_heads, num_kv_heads, head_dim,
-        kv_seq_len, cache_offset,
+        &q,
+        &k_flipped,
+        &v,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        cache_offset,
     );
     assert_ne!(
         got, got_flipped,
@@ -282,9 +311,15 @@ fn qkv_attention_reference_chunked_prefill() {
         .map(|i| (i as f32 * 0.07).sin())
         .collect();
     let got = reference_attention(
-        &q, &k, &v,
-        seq_len, num_heads, num_kv_heads, head_dim,
-        kv_seq_len, cache_offset,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        cache_offset,
     );
     // Causal bound is `cache_offset + i`. With (`seq_len=5`, `cache_offset=4`):
     //   row 0: abs_i = 4 → attends to K[0..=4] (NOT K[5] or beyond)
@@ -299,16 +334,23 @@ fn qkv_attention_reference_chunked_prefill() {
         k_flip[idx] += 10.0;
     }
     let got2 = reference_attention(
-        &q, &k_flip, &v,
-        seq_len, num_heads, num_kv_heads, head_dim,
-        kv_seq_len, cache_offset,
+        &q,
+        &k_flip,
+        &v,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        cache_offset,
     );
     // Row 0 (the latest pre-bound row) must be unchanged by K[5].
     for d in 0..head_dim {
         let i = (0_usize * num_heads + head) * head_dim + d;
         assert!(
             (got[i] - got2[i]).abs() < 1e-5,
-            "row 0 must not depend on K[5] when cache_offset=4 (causal bound j<=4); got delta={}", got[i] - got2[i]
+            "row 0 must not depend on K[5] when cache_offset=4 (causal bound j<=4); got delta={}",
+            got[i] - got2[i]
         );
     }
     // Row 4 (the latest chunked query) is allowed to differ — sanity that the
@@ -323,7 +365,10 @@ fn qkv_attention_reference_chunked_prefill() {
             }
         }
     }
-    assert!(any_diff, "perturbation at K[5] must reach row 4 (cache_offset=4, abs_i=8 <= kv_seq_len=7)");
+    assert!(
+        any_diff,
+        "perturbation at K[5] must reach row 4 (cache_offset=4, abs_i=8 <= kv_seq_len=7)"
+    );
 }
 
 /// CPU reference: kv_seq_len large enough to exceed the 8192-float
@@ -347,15 +392,26 @@ fn qkv_attention_reference_large_kv_seq_len() {
         .map(|i| (i as f32 * 0.0033).sin())
         .collect();
     let got = reference_attention(
-        &q, &k, &v,
-        seq_len, num_heads, num_kv_heads, head_dim,
-        kv_seq_len, cache_offset,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        cache_offset,
     );
     // Don't time, don't assert exact values; just ensure the online-style
     // accumulator doesn't blow up at large kv_seq_len.
     let max = got.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let min = got.iter().cloned().fold(f32::INFINITY, f32::min);
-    assert!(max.is_finite() && min.is_finite(), "NaN at large kv_seq_len: max={} min={}", max, min);
+    assert!(
+        max.is_finite() && min.is_finite(),
+        "NaN at large kv_seq_len: max={} min={}",
+        max,
+        min
+    );
 }
 
 /// CPU reference: causal independence — later K/V cannot affect earlier
@@ -376,9 +432,15 @@ fn qkv_attention_reference_earlier_query_independent_of_later_kv() {
         .map(|i| (i as f32 * 0.27).sin())
         .collect();
     let got = reference_attention(
-        &q, &k, &v,
-        seq_len, num_heads, num_kv_heads, head_dim,
-        kv_seq_len, cache_offset,
+        &q,
+        &k,
+        &v,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        cache_offset,
     );
     // Test causal independence: pick a `mid_j` that is IN causal bound for
     // row 2 but out of bound for rows 0 and 1. With `cache_offset=0, seq_len=3`:
@@ -395,9 +457,15 @@ fn qkv_attention_reference_earlier_query_independent_of_later_kv() {
         v2[(mid_j * num_kv_heads) * head_dim + d] += 99.0;
     }
     let got2 = reference_attention(
-        &q, &k2, &v2,
-        seq_len, num_heads, num_kv_heads, head_dim,
-        kv_seq_len, cache_offset,
+        &q,
+        &k2,
+        &v2,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        cache_offset,
     );
     // Earlier queries (rows 0 and 1) are unchanged.
     for row in 0..2 {
@@ -408,7 +476,11 @@ fn qkv_attention_reference_earlier_query_independent_of_later_kv() {
                 assert!(
                     diff < 1e-5,
                     "row {} head {} dim {} changed (causal leak from K[V][{}]): {}",
-                    row, h, d, mid_j, diff
+                    row,
+                    h,
+                    d,
+                    mid_j,
+                    diff
                 );
             }
         }
@@ -426,7 +498,10 @@ fn qkv_attention_reference_earlier_query_independent_of_later_kv() {
             }
         }
     }
-    assert!(any_diff, "perturbation at K[2] must reach row 2 (causal bound includes j=2)");
+    assert!(
+        any_diff,
+        "perturbation at K[2] must reach row 2 (causal bound includes j=2)"
+    );
 }
 
 /// Verify the gate semantics built into the *config*: a default-shape
@@ -449,7 +524,8 @@ fn qkv_attention_gpu_matches_reference_when_enabled() {
     if !env {
         return;
     }
-    let dev = RocmDevice::new(0);
+    let dev = RocmDevice::try_new(0)
+        .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
 
     let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len, cache_offset) =
         (4_usize, 4, 4, 8, 4, 0);
@@ -466,8 +542,20 @@ fn qkv_attention_gpu_matches_reference_when_enabled() {
     let out_shape = Shape::from_slice(&[seq_len, num_heads, head_dim]);
 
     let q_buf = dev.from_cpu(&q_data, &out_shape, DType::F32).unwrap();
-    let k_buf = dev.from_cpu(&k_data, &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]), DType::F32).unwrap();
-    let v_buf = dev.from_cpu(&v_data, &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]), DType::F32).unwrap();
+    let k_buf = dev
+        .from_cpu(
+            &k_data,
+            &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
+    let v_buf = dev
+        .from_cpu(
+            &v_data,
+            &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
 
     let (out, _h) = dev
         .qkv_attention(
@@ -501,7 +589,10 @@ fn qkv_attention_gpu_matches_reference_when_enabled() {
             let denom = x.abs().max(y.abs()).max(1e-6);
             let diff = ((x - y) / denom).abs();
             if diff > 1e-3 {
-                panic!("GPU output diverged from CPU reference at index {}: got={}, want={}, diff={}. Full got={:?}\nFull want={:?}", i, x, y, diff, got, want);
+                panic!(
+                    "GPU output diverged from CPU reference at index {}: got={}, want={}, diff={}. Full got={:?}\nFull want={:?}",
+                    i, x, y, diff, got, want
+                );
             }
         }
     }
@@ -515,14 +606,33 @@ fn qkv_attention_gpu_rejects_bad_gqa_ratio() {
     if !env {
         return;
     }
-    let dev = RocmDevice::new(0);
+    let dev = RocmDevice::try_new(0)
+        .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
     let (seq_len, head_dim) = (4_usize, 8);
     let num_heads = 4;
     let num_kv_heads = 3; // 4 % 3 != 0
     let out_shape = Shape::from_slice(&[seq_len, num_heads, head_dim]);
-    let q_buf = dev.from_cpu(&vec![0.5f32; seq_len * num_heads * head_dim], &out_shape, DType::F32).unwrap();
-    let k_buf = dev.from_cpu(&vec![0.5f32; 8 * num_kv_heads * head_dim], &Shape::from_slice(&[8, num_kv_heads, head_dim]), DType::F32).unwrap();
-    let v_buf = dev.from_cpu(&vec![0.5f32; 8 * num_kv_heads * head_dim], &Shape::from_slice(&[8, num_kv_heads, head_dim]), DType::F32).unwrap();
+    let q_buf = dev
+        .from_cpu(
+            &vec![0.5f32; seq_len * num_heads * head_dim],
+            &out_shape,
+            DType::F32,
+        )
+        .unwrap();
+    let k_buf = dev
+        .from_cpu(
+            &vec![0.5f32; 8 * num_kv_heads * head_dim],
+            &Shape::from_slice(&[8, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
+    let v_buf = dev
+        .from_cpu(
+            &vec![0.5f32; 8 * num_kv_heads * head_dim],
+            &Shape::from_slice(&[8, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
     let res = dev.qkv_attention(
         q_buf.as_ref(),
         k_buf.as_ref(),
@@ -544,7 +654,8 @@ fn qkv_attention_gpu_zero_kv_seq_len_not_nan() {
     if !env {
         return;
     }
-    let dev = RocmDevice::new(0);
+    let dev = RocmDevice::try_new(0)
+        .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
     let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len, cache_offset) =
         (4_usize, 4, 4, 8, 0, 0);
 
@@ -554,8 +665,20 @@ fn qkv_attention_gpu_zero_kv_seq_len_not_nan() {
     let out_shape = Shape::from_slice(&[seq_len, num_heads, head_dim]);
 
     let q_buf = dev.from_cpu(&q_data, &out_shape, DType::F32).unwrap();
-    let k_buf = dev.from_cpu(&k_data, &Shape::from_slice(&[0, num_kv_heads, head_dim]), DType::F32).unwrap();
-    let v_buf = dev.from_cpu(&v_data, &Shape::from_slice(&[0, num_kv_heads, head_dim]), DType::F32).unwrap();
+    let k_buf = dev
+        .from_cpu(
+            &k_data,
+            &Shape::from_slice(&[0, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
+    let v_buf = dev
+        .from_cpu(
+            &v_data,
+            &Shape::from_slice(&[0, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
 
     let (out, _h) = dev
         .qkv_attention(
@@ -575,4 +698,3 @@ fn qkv_attention_gpu_zero_kv_seq_len_not_nan() {
         assert!(!x.is_nan(), "GPU output must not be NaN for empty KV cache");
     }
 }
-

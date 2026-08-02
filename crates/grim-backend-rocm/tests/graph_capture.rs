@@ -37,7 +37,9 @@ fn gpu_device() -> Option<RocmDevice> {
     if !std::env::var(GPU_TEST_ENV).is_ok() {
         return None;
     }
-    match std::panic::catch_unwind(|| RocmDevice::new(0)) {
+    match std::panic::catch_unwind(|| {
+        RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm")
+    }) {
         Ok(d) => Some(d),
         Err(_) => None,
     }
@@ -88,8 +90,7 @@ fn run_compute(
     let (a_dev, b_dev, c_dev, w_dev) = inputs;
     let (mm, _h1) = BackendDevice::matmul(dev, a_dev.as_ref(), b_dev.as_ref(), &out_s)?;
     let (added, _h2) = BackendDevice::add(dev, mm.as_ref(), c_dev.as_ref(), &out_s)?;
-    let (rn, _h3) =
-        BackendDevice::rms_norm(dev, added.as_ref(), w_dev.as_ref(), 1e-5_f32, &out_s)?;
+    let (rn, _h3) = BackendDevice::rms_norm(dev, added.as_ref(), w_dev.as_ref(), 1e-5_f32, &out_s)?;
     Ok(rn)
 }
 

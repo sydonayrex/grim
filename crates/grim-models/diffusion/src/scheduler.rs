@@ -22,7 +22,10 @@ pub struct DdimScheduler {
 impl DdimScheduler {
     pub fn new(timesteps: Vec<u32>, alphas_cumprod: Vec<f32>) -> Self {
         assert_eq!(timesteps.len(), alphas_cumprod.len());
-        Self { timesteps, alphas_cumprod }
+        Self {
+            timesteps,
+            alphas_cumprod,
+        }
     }
 
     /// Build a linear-schedule DDIM scheduler of `num_steps` steps.
@@ -43,12 +46,20 @@ impl DdimScheduler {
         }
         alphas.clear();
         let timesteps: Vec<u32> = (0..cumprod.len() as u32).rev().collect();
-        Self { timesteps, alphas_cumprod: cumprod }
+        Self {
+            timesteps,
+            alphas_cumprod: cumprod,
+        }
     }
 }
 
 impl NoiseScheduler for DdimScheduler {
-    fn step(&self, model_output: &grim_tensor::Tensor, latents: &grim_tensor::Tensor, timestep: u32) -> Result<grim_tensor::Tensor> {
+    fn step(
+        &self,
+        model_output: &grim_tensor::Tensor,
+        latents: &grim_tensor::Tensor,
+        timestep: u32,
+    ) -> Result<grim_tensor::Tensor> {
         let pos = self.timesteps.iter().position(|&t| t == timestep);
         if pos.is_none() {
             return Err(Error::Config(format!("DDIM unknown timestep {timestep}")));
@@ -82,12 +93,21 @@ pub struct EulerScheduler {
 
 impl EulerScheduler {
     pub fn new(timestep: u32, sigma_cur: f32, sigma_next: f32) -> Self {
-        Self { timestep, sigma_cur, sigma_next }
+        Self {
+            timestep,
+            sigma_cur,
+            sigma_next,
+        }
     }
 }
 
 impl NoiseScheduler for EulerScheduler {
-    fn step(&self, model_output: &grim_tensor::Tensor, latents: &grim_tensor::Tensor, timestep: u32) -> Result<grim_tensor::Tensor> {
+    fn step(
+        &self,
+        model_output: &grim_tensor::Tensor,
+        latents: &grim_tensor::Tensor,
+        timestep: u32,
+    ) -> Result<grim_tensor::Tensor> {
         let _ = timestep;
         let _ = self.timestep;
         let lat_shape = latents.shape().dims().to_vec();

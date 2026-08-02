@@ -26,9 +26,15 @@ fn build_test_data(
         s = lcg_f32(s);
         (s as f32 / u32::MAX as f32) * 2.0 - 1.0
     };
-    let q: Vec<f32> = (0..seq_len * num_heads * head_dim).map(|_| next()).collect();
-    let k: Vec<f32> = (0..kv_seq_len * num_kv_heads * head_dim).map(|_| next()).collect();
-    let v: Vec<f32> = (0..kv_seq_len * num_kv_heads * head_dim).map(|_| next()).collect();
+    let q: Vec<f32> = (0..seq_len * num_heads * head_dim)
+        .map(|_| next())
+        .collect();
+    let k: Vec<f32> = (0..kv_seq_len * num_kv_heads * head_dim)
+        .map(|_| next())
+        .collect();
+    let v: Vec<f32> = (0..kv_seq_len * num_kv_heads * head_dim)
+        .map(|_| next())
+        .collect();
     (q, k, v)
 }
 
@@ -49,18 +55,21 @@ fn approx_close(a: &[f32], b: &[f32], rel_tol: f32) -> bool {
 fn test_hybrid_cpu_gpu_attention_correctness() {
     let env = std::env::var(GPU_TEST_ENV).is_ok();
     if !env {
-        println!("[INFO] Skipped test_hybrid_cpu_gpu_attention_correctness (requires GRIM_RUN_GPU_TESTS)");
+        println!(
+            "[INFO] Skipped test_hybrid_cpu_gpu_attention_correctness (requires GRIM_RUN_GPU_TESTS)"
+        );
         return;
     }
 
-    let dev = RocmDevice::new(0);
+    let dev = RocmDevice::try_new(0)
+        .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
 
     // Attention parameters (Llama-shaped GQA configuration)
     let seq_len = 1_usize;
     let num_heads = 8_usize;
     let num_kv_heads = 4_usize;
     let head_dim = 64_usize;
-    
+
     // We split 48 key-value tokens (3 blocks of size 16) into:
     // - 32 device tokens (2 blocks) on GPU
     // - 16 host tokens (1 block) on CPU
@@ -71,27 +80,52 @@ fn test_hybrid_cpu_gpu_attention_correctness() {
 
     // Generate random mock KV cache blocks
     let (q_data, k_data, v_data) = build_test_data(
-        0xDEAD, seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len
+        0xDEAD,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
     );
 
     // ────────────────────────────────────────────────────────────────────────
     // 1. Full-GPU Ground Truth
     // ────────────────────────────────────────────────────────────────────────
-    let q_buf = dev.from_cpu(&q_data, &Shape::from_slice(&[seq_len, num_heads, head_dim]), DType::F32).unwrap();
-    let k_buf = dev.from_cpu(&k_data, &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]), DType::F32).unwrap();
-    let v_buf = dev.from_cpu(&v_data, &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]), DType::F32).unwrap();
-    
-    let (gpu_gt_out, _h) = dev.qkv_attention(
-        q_buf.as_ref(),
-        k_buf.as_ref(),
-        v_buf.as_ref(),
-        num_kv_heads,
-        kv_seq_len,
-        cache_offset as u32,
-        &Shape::from_slice(&[seq_len, num_heads, head_dim]),
-        None,
-        None,
-    ).unwrap();
+    let q_buf = dev
+        .from_cpu(
+            &q_data,
+            &Shape::from_slice(&[seq_len, num_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
+    let k_buf = dev
+        .from_cpu(
+            &k_data,
+            &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
+    let v_buf = dev
+        .from_cpu(
+            &v_data,
+            &Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
+
+    let (gpu_gt_out, _h) = dev
+        .qkv_attention(
+            q_buf.as_ref(),
+            k_buf.as_ref(),
+            v_buf.as_ref(),
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset as u32,
+            &Shape::from_slice(&[seq_len, num_heads, head_dim]),
+            None,
+            None,
+        )
+        .unwrap();
     let gt_vec = gpu_gt_out.to_cpu_vec_f32().unwrap();
 
     // ────────────────────────────────────────────────────────────────────────
@@ -101,10 +135,21 @@ fn test_hybrid_cpu_gpu_attention_correctness() {
     let device_k = &k_data[0..device_seq_len * num_kv_heads * head_dim];
     let device_v = &v_data[0..device_seq_len * num_kv_heads * head_dim];
 
-
     // Allocate GPU buffers for device blocks
-    let dev_k_buf = dev.from_cpu(device_k, &Shape::from_slice(&[device_seq_len, num_kv_heads, head_dim]), DType::F32).unwrap();
-    let dev_v_buf = dev.from_cpu(device_v, &Shape::from_slice(&[device_seq_len, num_kv_heads, head_dim]), DType::F32).unwrap();
+    let dev_k_buf = dev
+        .from_cpu(
+            device_k,
+            &Shape::from_slice(&[device_seq_len, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
+    let dev_v_buf = dev
+        .from_cpu(
+            device_v,
+            &Shape::from_slice(&[device_seq_len, num_kv_heads, head_dim]),
+            DType::F32,
+        )
+        .unwrap();
 
     // Allocate lightweight GPU storage to capture GPU partial metadata (max and sum)
     let meta_shape = Shape::from_slice(&[seq_len, num_heads]);
@@ -112,17 +157,19 @@ fn test_hybrid_cpu_gpu_attention_correctness() {
     let dev_sum_buf = dev.zeros(&meta_shape, DType::F32).unwrap();
 
     // Start GPU partial attention (asynchronous execution on stream 0)
-    let (dev_out_buf, _handle) = dev.qkv_attention(
-        q_buf.as_ref(),
-        dev_k_buf.as_ref(),
-        dev_v_buf.as_ref(),
-        num_kv_heads,
-        device_seq_len,
-        cache_offset as u32,
-        &Shape::from_slice(&[seq_len, num_heads, head_dim]),
-        Some(dev_max_buf.as_ref()),
-        Some(dev_sum_buf.as_ref()),
-    ).unwrap();
+    let (dev_out_buf, _handle) = dev
+        .qkv_attention(
+            q_buf.as_ref(),
+            dev_k_buf.as_ref(),
+            dev_v_buf.as_ref(),
+            num_kv_heads,
+            device_seq_len,
+            cache_offset as u32,
+            &Shape::from_slice(&[seq_len, num_heads, head_dim]),
+            Some(dev_max_buf.as_ref()),
+            Some(dev_sum_buf.as_ref()),
+        )
+        .unwrap();
 
     // CONCURRENT: Compute CPU-side partial attention on the host thread for host blocks
     let cpu_partials = grim_backend_cpu::strict_kernels::strict_attention_partial_online(
@@ -152,11 +199,11 @@ fn test_hybrid_cpu_gpu_attention_correctness() {
     for i in 0..seq_len {
         for h in 0..num_heads {
             let meta_idx = i * num_heads + h;
-            
+
             // Reconstruct the GPU partial state
             let max_val = gpu_max_vec[meta_idx];
             let sum_val = gpu_sum_vec[meta_idx];
-            
+
             let mut gpu_acc = vec![0.0f32; head_dim];
             let qh_offset = meta_idx * head_dim;
             for d in 0..head_dim {

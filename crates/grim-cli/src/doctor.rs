@@ -1,8 +1,4 @@
-//! `grim doctor` — self-diagnosis subcommand.
-//!
-//! §13.5: re-verifies every claim the engine and its services make about
-//! themselves. This is the diagnostic of last resort for exactly the
-//! failure mode §13.1–§13.4 prevent in the first place.
+//! `grim doctor` — self-diagnosis. Re-verifies every engine and service claim (§13.5).
 
 use grim_tensor::error::Result;
 
@@ -20,7 +16,12 @@ pub struct DoctorReport {
     pub warnings: Vec<String>,
 }
 
-pub fn run_doctor(addr: &str, service_name: &str, exec_path: &str, config_path: &str) -> Result<bool> {
+pub fn run_doctor(
+    addr: &str,
+    service_name: &str,
+    exec_path: &str,
+    config_path: &str,
+) -> Result<bool> {
     println!("=== Grim Doctor — Self-Diagnosis ===\n");
     let mut report = DoctorReport::default();
 
@@ -37,9 +38,13 @@ pub fn run_doctor(addr: &str, service_name: &str, exec_path: &str, config_path: 
         eprintln!("\n[grim doctor] SUGGESTIONS FOR ERRORS:");
         for err in &report.errors {
             if err.contains("grim serve") || err.contains("obsolete") {
-                eprintln!("  -> FIX ExecStart: Run 'sudo grim service install --config /etc/grim/grim.toml' to overwrite systemd service with correct ExecStart command.");
+                eprintln!(
+                    "  -> FIX ExecStart: Run 'sudo grim service install --config /etc/grim/grim.toml' to overwrite systemd service with correct ExecStart command."
+                );
             } else if err.contains("RDNA 2") || err.contains("compatibility") {
-                eprintln!("  -> RDNA 2 COMPATIBILITY: Force RDNA2 compilation by setting environment variable: export HSA_OVERRIDE_GFX_VERSION=10.3.0");
+                eprintln!(
+                    "  -> RDNA 2 COMPATIBILITY: Force RDNA2 compilation by setting environment variable: export HSA_OVERRIDE_GFX_VERSION=10.3.0"
+                );
             } else {
                 eprintln!("  -> {err}");
             }
@@ -54,26 +59,38 @@ pub fn run_doctor(addr: &str, service_name: &str, exec_path: &str, config_path: 
         eprintln!("\n[grim doctor] SUGGESTIONS FOR WARNINGS:");
         for warn in &report.warnings {
             if warn.contains("not found") || warn.contains("systemd") {
-                eprintln!("  -> INSTALL SERVICE: Run 'grim service install --config /etc/grim/grim.toml' to install a background service daemon.");
+                eprintln!(
+                    "  -> INSTALL SERVICE: Run 'grim service install --config /etc/grim/grim.toml' to install a background service daemon."
+                );
             } else if warn.contains("unreachable") {
-                eprintln!("  -> START SERVER: Start the server manually using 'grim run --serve' or via service: 'grim service start'.");
+                eprintln!(
+                    "  -> START SERVER: Start the server manually using 'grim run --serve' or via service: 'grim service start'."
+                );
             } else {
                 eprintln!("  -> {warn}");
             }
         }
-        eprintln!("\nDoctor found {} warning(s). Review above.", report.warnings.len());
+        eprintln!(
+            "\nDoctor found {} warning(s). Review above.",
+            report.warnings.len()
+        );
     }
     Ok(true)
 }
 
-fn check_unit_file(report: &mut DoctorReport, service_name: &str, _exec_path: &str, _config_path: &str) {
+fn check_unit_file(
+    report: &mut DoctorReport,
+    service_name: &str,
+    _exec_path: &str,
+    _config_path: &str,
+) {
     let path = format!("/etc/systemd/system/{service_name}.service");
     match std::fs::read_to_string(&path) {
         Ok(content) => {
             report.unit_file_exists = Some(true);
             println!("[OK]  Systemd unit file exists at {}", path);
 
-            // Verify it contains the correct ExecStart (not the old non-existent 'grim serve').
+            // Verify ExecStart uses 'grim run --serve' not obsolete 'grim serve'.
             if content.contains("grim serve") {
                 report.errors.push(format!(
                     "Systemd unit at {} contains obsolete 'grim serve' in ExecStart — \
@@ -89,7 +106,9 @@ fn check_unit_file(report: &mut DoctorReport, service_name: &str, _exec_path: &s
                 report.unit_file_verifies = Some(true);
                 println!("[OK]  Systemd unit ExecStart uses 'grim run --serve'.");
             } else {
-                report.warnings.push("Systemd unit exists but ExecStart format is unexpected".into());
+                report
+                    .warnings
+                    .push("Systemd unit exists but ExecStart format is unexpected".into());
                 eprintln!("[WARN] Systemd unit exists but ExecStart format is unexpected.");
                 report.unit_file_verifies = Some(false);
             }
@@ -97,7 +116,9 @@ fn check_unit_file(report: &mut DoctorReport, service_name: &str, _exec_path: &s
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             report.unit_file_exists = Some(false);
             report.unit_file_verifies = Some(false);
-            report.warnings.push(format!("Systemd unit file not found at {path}"));
+            report
+                .warnings
+                .push(format!("Systemd unit file not found at {path}"));
             eprintln!("[WARN] Systemd unit file not found at {}.", path);
             eprintln!("      Run 'grim service install --config /etc/grim/grim.toml' to install.");
         }
@@ -123,25 +144,33 @@ fn check_service_status(report: &mut DoctorReport, service_name: &str) {
                 }
                 "failed" => {
                     report.service_is_active = Some(false);
-                    report.errors.push("grim service is in 'failed' state".into());
-                    eprintln!("[ERR] grim service is in 'failed' state. Run 'systemctl status grim' for details.");
+                    report
+                        .errors
+                        .push("grim service is in 'failed' state".into());
+                    eprintln!(
+                        "[ERR] grim service is in 'failed' state. Run 'systemctl status grim' for details."
+                    );
                 }
                 _ => {
                     report.service_is_active = Some(false);
-                    report.warnings.push(format!("grim service is '{}' (not active)", state));
+                    report
+                        .warnings
+                        .push(format!("grim service is '{}' (not active)", state));
                     eprintln!("[WARN] grim service is '{}' (not active).", state);
                 }
             }
         }
         Err(e) => {
-            report.warnings.push(format!("Could not query systemctl is-active: {e}"));
+            report
+                .warnings
+                .push(format!("Could not query systemctl is-active: {e}"));
             eprintln!("[WARN] Could not query systemctl is-active: {e}");
         }
     }
 }
 
 fn check_process(_report: &mut DoctorReport, service_name: &str) {
-    // Find grim process by checking pids from the systemd service.
+    // Find grim process via systemd service MainPID.
     let output = std::process::Command::new("systemctl")
         .args(["show", service_name, "--property", "MainPID"])
         .output();
@@ -152,7 +181,7 @@ fn check_process(_report: &mut DoctorReport, service_name: &str) {
             if let Some(pid_str) = stdout.strip_prefix("MainPID=") {
                 let pid: u64 = pid_str.trim().parse().unwrap_or(0);
                 if pid > 0 {
-                    // Process is running — verify with kill -0.
+                    // Verify process with kill -0.
                     let verify = std::process::Command::new("kill")
                         .args(["-0", &pid.to_string()])
                         .status();
@@ -185,18 +214,32 @@ fn check_health_endpoint(report: &mut DoctorReport, addr: &str) {
                 println!("[OK]  /health endpoint responds OK at {}.", url);
             } else {
                 report.health_endpoint_ok = Some(false);
-                report.warnings.push(format!("health endpoint returned unexpected body: {}", body.trim()));
-                eprintln!("[WARN] /health at {} returned unexpected body: {}", url, body.trim());
+                report.warnings.push(format!(
+                    "health endpoint returned unexpected body: {}",
+                    body.trim()
+                ));
+                eprintln!(
+                    "[WARN] /health at {} returned unexpected body: {}",
+                    url,
+                    body.trim()
+                );
             }
         }
         Ok(_o) => {
             report.health_endpoint_ok = Some(false);
-            report.warnings.push(format!("health endpoint at {} returned HTTP error", url));
-            eprintln!("[WARN] /health at {} returned HTTP error (status not 200).", url);
+            report
+                .warnings
+                .push(format!("health endpoint at {} returned HTTP error", url));
+            eprintln!(
+                "[WARN] /health at {} returned HTTP error (status not 200).",
+                url
+            );
         }
         Err(e) => {
             report.health_endpoint_ok = Some(false);
-            report.warnings.push(format!("health endpoint at {} unreachable: {}", url, e));
+            report
+                .warnings
+                .push(format!("health endpoint at {} unreachable: {}", url, e));
             eprintln!("[WARN] /health endpoint at {} unreachable: {}", url, e);
             eprintln!("      Is 'grim run --serve' running?");
         }
@@ -204,8 +247,8 @@ fn check_health_endpoint(report: &mut DoctorReport, addr: &str) {
 }
 
 fn check_gpu_backend(report: &mut DoctorReport) {
-    // Query system ROCm path and version info
-    match grim_backend_rocm::device::probe::probe_system_rocm() {
+    // Query system ROCm path and version
+    match grim_backend_rocm::probe_system_rocm() {
         Ok(rocm) => {
             println!(
                 "[OK]  System ROCm installation detected: {} (version {})",
@@ -214,7 +257,9 @@ fn check_gpu_backend(report: &mut DoctorReport) {
             );
         }
         Err(e) => {
-            report.warnings.push(format!("No system ROCm installation detected: {e}"));
+            report
+                .warnings
+                .push(format!("No system ROCm installation detected: {e}"));
             eprintln!("[WARN] No system ROCm installation detected: {e}");
         }
     }
@@ -231,14 +276,12 @@ fn check_gpu_backend(report: &mut DoctorReport) {
                 first.xnack_enabled()
             );
 
-            // Verify if GCN target is compatible with RDNA 3 or RDNA 4
-            match grim_backend_rocm::device::probe::probe_host_gpu(first.ordinal()) {
+            // Verify GCN target is RDNA 3/4 compatible
+            match grim_backend_rocm::probe_host_gpu(first.ordinal()) {
                 Ok(c) => {
                     println!(
                         "[OK]  Host GPU hardware stats: GCN={}, Wavefront={}, LDS={} bytes",
-                        c.gcn,
-                        c.wavefront_size,
-                        c.lds_size_bytes
+                        c.gcn, c.wavefront_size, c.lds_size_bytes
                     );
                     if c.wavefront_size != 64 {
                         report.warnings.push(format!(
@@ -271,13 +314,14 @@ fn check_gpu_backend(report: &mut DoctorReport) {
                     }
                 }
                 Err(e) => {
-                    report.warnings.push(format!("Failed to query host GPU GCN capabilities: {e}"));
+                    report
+                        .warnings
+                        .push(format!("Failed to query host GPU GCN capabilities: {e}"));
                     eprintln!("[WARN] Failed to query host GPU GCN capabilities: {e}");
                 }
             }
 
-            // Check if the running engine is actually using it, not falling back to CPU.
-            // We check the /metrics endpoint for rocm_gpu_count.
+            // Check /metrics for actual GPU usage, not CPU fallback.
             let output = std::process::Command::new("curl")
                 .args(["-sf", "http://127.0.0.1:11434/metrics"])
                 .output();
@@ -292,15 +336,18 @@ fn check_gpu_backend(report: &mut DoctorReport) {
                             .and_then(|v| v.as_i64())
                             .unwrap_or(-1);
                         if gpu_count > 0 {
-                            report.gpu_backend_actual = Some(format!("rocm ({} devices)", gpu_count));
+                            report.gpu_backend_actual =
+                                Some(format!("rocm ({} devices)", gpu_count));
                             println!(
                                 "[OK]  Engine reports {} ROCm device(s) in /metrics — GPU backend active.",
                                 gpu_count
                             );
                         } else {
-                            report.gpu_backend_actual = Some(format!("cpu ({} devices in /metrics)", gpu_count));
+                            report.gpu_backend_actual =
+                                Some(format!("cpu ({} devices in /metrics)", gpu_count));
                             report.warnings.push(
-                                "GPU backend appears to report 0 devices — possible CPU fallback".into(),
+                                "GPU backend appears to report 0 devices — possible CPU fallback"
+                                    .into(),
                             );
                             eprintln!(
                                 "[WARN] /metrics reports {} GPU count — may indicate CPU fallback.",
@@ -315,18 +362,15 @@ fn check_gpu_backend(report: &mut DoctorReport) {
                     eprintln!(
                         "[INFO] /metrics endpoint not reachable — skipping in-process GPU backend check."
                     );
-                    report.gpu_backend_actual = Some("unknown (metrics endpoint unreachable)".into());
+                    report.gpu_backend_actual =
+                        Some("unknown (metrics endpoint unreachable)".into());
                 }
             }
         }
         Ok(devices) if devices.is_empty() => {
             report.gpu_detected = Some(false);
-            eprintln!(
-                "[WARN] No ROCm GPU detected on this host."
-            );
-            eprintln!(
-                "      Grim will use CPU backend. For GPU inference, install ROCm runtime."
-            );
+            eprintln!("[WARN] No ROCm GPU detected on this host.");
+            eprintln!("      Grim will use CPU backend. For GPU inference, install ROCm runtime.");
             report.gpu_backend_actual = Some("cpu (no GPU detected)".into());
         }
         Err(e) => {
@@ -339,16 +383,8 @@ fn check_gpu_backend(report: &mut DoctorReport) {
 }
 
 fn check_plugin_grants(report: &mut DoctorReport) {
-    // §13.4 + §13.5: verify that plugin grants are actually enforced at runtime.
-    // We do this by probing a synthetic denied capability — if it's refused, enforcement exists.
-    //
-    // For a basic check, we look at whether the plugin WASM loader is configured to gate
-    // the 'network' import when network=false is declared. A true enforcement test would
-    // require a test plugin with network access and a deny-granted policy.
-    //
-    // The check we can do without a test plugin: verify the plugin manifest schema includes
-    // grants and that loading fails closed when a manifest is absent.
-    // This is a shallow check — runtime enforcement requires an integration test.
+    // §13.4+§13.5: verify plugin grants are enforced at runtime.
+    // Without a test plugin, this is a shallow check — runtime enforcement requires integration test.
 
     println!("[INFO] Plugin grant enforcement check: requires integration test (Phase 5).");
     println!("      To verify enforcement manually:");
@@ -410,6 +446,10 @@ fn print_report(report: &DoctorReport) {
     } else if report.errors.is_empty() {
         println!("  Status:        {} warning(s)", report.warnings.len());
     } else {
-        println!("  Status:        {} error(s), {} warning(s)", report.errors.len(), report.warnings.len());
+        println!(
+            "  Status:        {} error(s), {} warning(s)",
+            report.errors.len(),
+            report.warnings.len()
+        );
     }
 }

@@ -23,8 +23,8 @@
 //! - `rocm-profiling-perf` - autotune cache hits only matter if
 //!   the dispatch honors them.
 
-use grim_backend_rocm::select_gemm_algo;
 use grim_backend_rocm::rocblas_gemm_algo;
+use grim_backend_rocm::select_gemm_algo;
 
 /// RED: solution_index == 0 must dispatch to `standard`, never to
 /// `solution_index`. Otherwise every GEMM call (including the
@@ -105,10 +105,7 @@ fn every_gemm_call_site_uses_select_gemm_algo() {
     let bytes = SRC.as_bytes();
 
     // Both FFI shapes that take an `algo` argument.
-    let call_openers: &[&[u8]] = &[
-        b"rocblas_gemm_ex(",
-        b"rocblas_gemm_strided_batched_ex(",
-    ];
+    let call_openers: &[&[u8]] = &[b"rocblas_gemm_ex(", b"rocblas_gemm_strided_batched_ex("];
     // Pre-flight: at least 3 call sites in matmul + matmul_batched +
     // matmul_with_solution. Catches the case where someone rewrites
     // the GEMM surface to a different FFI symbol entirely.

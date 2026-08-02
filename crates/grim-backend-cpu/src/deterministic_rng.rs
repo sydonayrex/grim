@@ -1,18 +1,8 @@
-//! Per-request seeded RNG for speculative-decoding and any other
-//! nondeterministic-by-default kernel paths.
+//! Per-request seeded RNG for speculative-decoding and non-deterministic paths (§5.8).
 //!
-//! Architecture §5.8 requires "per-request-seeded speculative-decoding
-//! RNG". The wrapper's `decode_dspark`/`decode_native_mtp` currently
-//! accept the live scheduler's nudges without depending on an RNG; for
-//! completeness, this RNG exists as a stand-alone primitive any
-//! speculative or sampling path can derive a deterministic stream
-//! from — same seed, same sequence of values, on every platform.
-//!
-//! We use a `SplitMix64`-derived stream: cheap, single-state, no SIMD
-//! dependencies, and known bit-stable across toolchains.
+//! SplitMix64 stream: cheap, single-state, no SIMD, bit-stable across toolchains.
 
-/// Per-request deterministic RNG. Seed once; consume via `next_u64`
-/// or `next_f32`.
+/// Deterministic RNG: seed once, consume via `next_u64` or `next_f32`.
 #[derive(Debug, Clone)]
 pub struct DeterministicRng {
     state: u64,
@@ -21,13 +11,13 @@ pub struct DeterministicRng {
 impl DeterministicRng {
     pub fn from_seed(seed: u64) -> Self {
         Self {
-            // non-zero state — splitmix64 tail.
+            // Non-zero state: splitmix64 tail.
             state: seed.wrapping_add(0x9E37_79B9_7F4A_7C15),
         }
     }
 
     pub fn next_u64(&mut self) -> u64 {
-        // splitmix64
+        // splitmix64.
         let mut z = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         self.state = z;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -36,11 +26,11 @@ impl DeterministicRng {
     }
 
     pub fn next_f32(&mut self) -> f32 {
-        // 24-bit mantissa fraction to stay within f32 precision.
+        // 24-bit mantissa fraction (f32 precision).
         ((self.next_u64() >> 40) as u32 as f32) / ((1u32 << 24) as f32)
     }
 
-    /// Reproducibility check.
+    /// Reproducibility check: return internal state.
     pub fn state(&self) -> u64 {
         self.state
     }
@@ -70,10 +60,7 @@ mod tests {
                 break;
             }
         }
-        assert!(
-            divergent,
-            "different seeds must produce different streams"
-        );
+        assert!(divergent, "different seeds must produce different streams");
     }
 
     #[test]

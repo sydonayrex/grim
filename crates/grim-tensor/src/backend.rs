@@ -1,25 +1,10 @@
-//! Backend-agnostic trait surface. Each backend crate
-//! (`grim-backend-cpu`, `grim-backend-rocm`, ...) implements these.
-//!
-//! ## SCYTHE-2 types (WI-1)
-//! `GpuCapability`, `ScytheLink`, and `ScythePlacement` are the three
-//! first-class types required by the C²PLR controller (scythe2.md §5.1).
-//! They live here rather than in the ROCm crate so that `grim-engine`
-//! (which is backend-agnostic) can import them without a circular dep.
+//! Backend-agnostic trait surface and device capabilities.
 
 use crate::dtype::{DType, QuantProvenance};
 use crate::error::Result;
 use crate::shape::Shape;
 
-// ---- SCYTHE-2 §5.1 types ---------------------------------------------------
-
-/// Per-GPU live capability snapshot, refreshed every ~100 ms by `CapabilityProfiler`.
-///
-/// Builds on existing `probe_host_gpu` (`device/probe.rs:104`) and
-/// `peer_status` (`peer_access.rs:84`). SCYTHE-2 adds a 5-ms micro-GEMM
-/// sweep (Piper-style resource modelling, `2605.05049`) to fill `tflops_fp16`.
-/// All zero-valued fields indicate "unknown" — the controller falls back
-/// to the host-only path when TFLOPS is 0.
+/// Per-GPU live capability snapshot and performance metrics.
 #[derive(Debug, Clone, Default)]
 pub struct GpuCapability {
     /// Effective FP16 TFLOPS at this instant (may drop under throttle).
@@ -37,12 +22,7 @@ pub struct GpuCapability {
     pub ordinal: usize,
 }
 
-/// Route matrix element q ∈ {PeerDirect, Pcie, Host}.
-///
-/// Maps onto the existing `P2PStatus` (`peer_access.rs:48`) and
-/// `RouteLink` (`p2p_route.rs:41`) enums in the ROCm backend.
-/// `ScytheLink` lives here (in `grim-tensor`) so the controller in
-/// `grim-engine` can use it without importing a backend-specific type.
+/// GPU inter-connect link type (PeerDirect, PCIe, or Host).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScytheLink {
     /// Direct peer DMA (xGMI / Instinct class).  Maps to `RouteLink::PeerDirect`.
@@ -122,7 +102,6 @@ pub enum MemAdvice {
     CoarseGrain,
     FineGrain,
 }
-
 
 /// Per-device compute primitive surface. `grim-tensor` dispatches through
 /// this trait and contains no device-specific code itself. Operations
@@ -233,6 +212,24 @@ pub trait BackendDevice: Send + Sync {
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
 
+    /// SwiGLU backward: `(df, de) = silu_mul_backward(gate, up, dw)`.
+    fn silu_mul_backward(
+        &self,
+        e: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        dw: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let _ = (e, g, dw, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "silu_mul_backward not implemented for this backend".into(),
+        ))
+    }
+
     /// RMSNorm: `y = x * rsqrt(mean(x^2) + eps) * weight`.
     fn rms_norm(
         &self,
@@ -241,6 +238,19 @@ pub trait BackendDevice: Send + Sync {
         eps: f32,
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>;
+
+    /// In-place RMSNorm: operates directly on `x` storage when supported, avoiding extra allocation.
+    /// Default implementation falls back to `rms_norm`.
+    fn rms_norm_inplace(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        eps: f32,
+        out: &Shape,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let (_storage, handle) = self.rms_norm(x, weight, eps, out)?;
+        Ok(handle)
+    }
 
     /// Softmax along the last dim.
     fn softmax(
@@ -275,7 +285,9 @@ pub trait BackendDevice: Send + Sync {
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
         let _ = (data, shape, dtype);
-        Err(crate::error::Error::Unimplemented("from_cpu_bytes not implemented for this backend".into()))
+        Err(crate::error::Error::Unimplemented(
+            "from_cpu_bytes not implemented for this backend".into(),
+        ))
     }
 
     /// Provide hints about memory usage/advice patterns to the device/system.
@@ -356,7 +368,17 @@ pub trait BackendDevice: Send + Sync {
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = (q, k, v, num_kv_heads, kv_seq_len, cache_offset, out_shape, out_max, out_sum);
+        let _ = (
+            q,
+            k,
+            v,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            out_shape,
+            out_max,
+            out_sum,
+        );
         Err(crate::error::Error::Unimplemented(
             "qkv_attention not implemented for this backend".into(),
         ))
@@ -386,7 +408,18 @@ pub trait BackendDevice: Send + Sync {
         cache_offset: u32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = (q, block_tables, k_pages, v_pages, num_kv_heads, max_blocks, page_size, kv_seq_len, cache_offset, out_shape);
+        let _ = (
+            q,
+            block_tables,
+            k_pages,
+            v_pages,
+            num_kv_heads,
+            max_blocks,
+            page_size,
+            kv_seq_len,
+            cache_offset,
+            out_shape,
+        );
         Err(crate::error::Error::Unimplemented(
             "qkv_attention_paged not implemented for this backend".into(),
         ))
@@ -411,7 +444,16 @@ pub trait BackendDevice: Send + Sync {
         cache_offset: u32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = (q, k, v, tree_parents, num_kv_heads, kv_seq_len, cache_offset, out_shape);
+        let _ = (
+            q,
+            k,
+            v,
+            tree_parents,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            out_shape,
+        );
         Err(crate::error::Error::Unimplemented(
             "tree_attention not implemented for this backend".into(),
         ))
@@ -592,7 +634,10 @@ pub trait BackendDevice: Send + Sync {
         let (batch, in_features) = match x_dims.len() {
             1 => (1, x_dims[0]),
             2 => (x_dims[0], x_dims[1]),
-            _ => (x_dims[..x_dims.len() - 1].iter().product(), x_dims[x_dims.len() - 1]),
+            _ => (
+                x_dims[..x_dims.len() - 1].iter().product(),
+                x_dims[x_dims.len() - 1],
+            ),
         };
         let (rank, in_features_a) = (a.shape().dims()[0], a.shape().dims()[1]);
         let (out_features, rank_b) = (b.shape().dims()[0], b.shape().dims()[1]);
@@ -602,7 +647,8 @@ pub trait BackendDevice: Send + Sync {
             x
         } else {
             let vec_x = x.to_cpu_vec_f32()?;
-            owned_x_2d = self.from_cpu(&vec_x, &Shape::new(vec![batch, in_features]), DType::F32)?;
+            owned_x_2d =
+                self.from_cpu(&vec_x, &Shape::new(vec![batch, in_features]), DType::F32)?;
             owned_x_2d.as_ref()
         };
 
@@ -615,7 +661,8 @@ pub trait BackendDevice: Send + Sync {
                 vec_a_t[i * rank + r] = vec_a[r * in_features_a + i];
             }
         }
-        let a_t_storage = self.from_cpu(&vec_a_t, &Shape::new(vec![in_features_a, rank]), DType::F32)?;
+        let a_t_storage =
+            self.from_cpu(&vec_a_t, &Shape::new(vec![in_features_a, rank]), DType::F32)?;
 
         let h_2d_shape = Shape::new(vec![batch, rank]);
         let (h_storage, h_handle) = self.matmul(x_storage_2d, a_t_storage.as_ref(), &h_2d_shape)?;
@@ -629,10 +676,15 @@ pub trait BackendDevice: Send + Sync {
                 vec_b_t[r * out_features + o] = vec_b[o * rank_b + r];
             }
         }
-        let b_t_storage = self.from_cpu(&vec_b_t, &Shape::new(vec![rank_b, out_features]), DType::F32)?;
+        let b_t_storage = self.from_cpu(
+            &vec_b_t,
+            &Shape::new(vec![rank_b, out_features]),
+            DType::F32,
+        )?;
 
         let delta_2d_shape = Shape::new(vec![batch, out_features]);
-        let (delta_storage, delta_handle) = self.matmul(h_storage.as_ref(), b_t_storage.as_ref(), &delta_2d_shape)?;
+        let (delta_storage, delta_handle) =
+            self.matmul(h_storage.as_ref(), b_t_storage.as_ref(), &delta_2d_shape)?;
         delta_handle.synchronize()?;
 
         let scale_buf = self.from_cpu(
@@ -653,14 +705,21 @@ pub trait BackendDevice: Send + Sync {
             owned_base_2d.as_ref()
         };
 
-        let (out_storage_2d, add_handle) = self.add(base_storage_2d, scaled_delta_storage.as_ref(), &delta_2d_shape)?;
+        let (out_storage_2d, add_handle) = self.add(
+            base_storage_2d,
+            scaled_delta_storage.as_ref(),
+            &delta_2d_shape,
+        )?;
         add_handle.synchronize()?;
 
         if base.shape().dims().len() == 2 {
             Ok((out_storage_2d, Box::new(ReadyHandle)))
         } else {
             let vec_out = out_storage_2d.to_cpu_vec_f32()?;
-            Ok((self.from_cpu(&vec_out, out_shape, DType::F32)?, Box::new(ReadyHandle)))
+            Ok((
+                self.from_cpu(&vec_out, out_shape, DType::F32)?,
+                Box::new(ReadyHandle),
+            ))
         }
     }
 
@@ -676,7 +735,8 @@ pub trait BackendDevice: Send + Sync {
         _out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         Err(crate::error::Error::Unimplemented(
-            "quantized_matmul requires a backend with fused dequantized matmul kernels (ROCm)".into(),
+            "quantized_matmul requires a backend with fused dequantized matmul kernels (ROCm)"
+                .into(),
         ))
     }
 
@@ -793,6 +853,11 @@ pub trait BackendStorage: Send + Sync {
     fn provenance(&self) -> QuantProvenance;
     fn shape(&self) -> &Shape;
 
+    /// Return optional per-column/group scales slice for explicit scale formats (`ResidualPacked`/`GroupInt`).
+    fn quant_scales(&self) -> Option<&[f32]> {
+        None
+    }
+
     /// Copy the buffer contents into a host `Vec<f32>`. Used for tests,
     /// token sampling, and inter-backend handoff. Production code paths
     /// should keep data on-device and avoid this when possible.
@@ -850,7 +915,13 @@ mod tests {
             backup2_codes_offset: 3000,
             backup2_scale_offset: 4000,
         };
-        assert!(matches!(prov, QuantProvenance::WithResiduals { outlier_count: 42, .. }));
+        assert!(matches!(
+            prov,
+            QuantProvenance::WithResiduals {
+                outlier_count: 42,
+                ..
+            }
+        ));
     }
 
     #[test]

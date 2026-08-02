@@ -17,7 +17,7 @@ pub struct TrainingPanelV1 {
     /// Quantization options to highlight when QLoRA is selected
     /// (more aggressive with VRAM, less with loss).
     pub qlora_recommended: Vec<String>,
-    /// Card title the CVKG `Card` widget uses.
+    /// Card title the panel component uses.
     pub panel_title: String,
     /// Optional helper text shown beneath the dropdown.
     pub help_text: String,

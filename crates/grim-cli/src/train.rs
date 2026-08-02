@@ -1,22 +1,14 @@
-//! `grim train` subcommand execution logic (WI-T5).
-//!
-//! Drives the SFT training loop: dataset loading, streaming forward pass,
-//! cross-entropy loss, reverse-mode autograd tape backward pass, AdamW step,
-//! and `.grim.train` sidecar checkpoint persistence.
-//!
-//! F4: Wires training to real model loading via `GrimProvider` and real
-//! dataset loading from JSON files (Alpaca/ShareGPT format).
+//! `grim train` — SFT training loop: dataset loading, streaming forward, cross-entropy loss, autograd backward, AdamW step, sidecar persistence. F4: real model loading via GrimProvider.
 
 use grim_autograd::{
-    cross_entropy_loss, backward, AdamW, AdamWConfig, AutogradRegistry, InjectionConfig,
-    LoRAInjectionRegistry, Tape,
+    AdamW, AdamWConfig, AutogradRegistry, InjectionConfig, LoRAInjectionRegistry, Tape, backward,
+    cross_entropy_loss,
 };
 use grim_core::error::{Error, Result};
 use grim_engine::streaming_forward::StreamingBlockForward;
 use grim_format::tprov::GgufProvider;
 
-/// Sentinel value for ignored label positions in cross-entropy loss.
-/// Matches HF/PyTorch convention: -100 as u32 wraps to 4294967196.
+/// IGNORE_INDEX for cross-entropy. Matches HF/PyTorch convention (-100 as u32 = 4294967196).
 const IGNORE_INDEX: u32 = -100i32 as u32;
 use grim_format::tokenizer::GgufTokenizer;
 use grim_format::train::TrainState;
@@ -39,9 +31,9 @@ pub struct TrainOptions {
     pub mode: String,
     pub optimizer: grim_autograd::OptimizerKind,
     pub scheduler: grim_autograd::LRScheduler,
-    /// Initialize adapters via PiSSA (SVD-based) rather than random LoRA.
+    /// PiSSA (SVD-based) adapter init instead of random LoRA.
     pub use_pissa: bool,
-    /// Apply the OLoRA orthogonality penalty to the scalar loss.
+    /// OLoRA orthogonality penalty on scalar loss.
     pub use_olora: bool,
     /// Weight of the OLoRA orthogonality penalty.
     pub olora_lambda: f32,
@@ -117,7 +109,10 @@ fn pack_training_examples(
             cur_labels.extend_from_slice(&labels);
         } else {
             if !cur_tokens.is_empty() {
-                packed.push((std::mem::take(&mut cur_tokens), std::mem::take(&mut cur_labels)));
+                packed.push((
+                    std::mem::take(&mut cur_tokens),
+                    std::mem::take(&mut cur_labels),
+                ));
             }
             if tokens.len() <= max_seq_len {
                 cur_tokens = tokens;
@@ -145,9 +140,14 @@ fn injection_config_from_metadata(provider: &GgufProvider) -> Result<InjectionCo
 
     let hidden_size = get_meta_u32(provider, &format!("{}.embedding_length", arch), 4096) as usize;
     let num_heads = get_meta_u32(provider, &format!("{}.attention.head_count", arch), 32) as usize;
-    let num_kv_heads = get_meta_u32(provider, &format!("{}.attention.head_count_kv", arch), num_heads as u32) as usize;
+    let num_kv_heads = get_meta_u32(
+        provider,
+        &format!("{}.attention.head_count_kv", arch),
+        num_heads as u32,
+    ) as usize;
     let head_dim = get_meta_u32(provider, &format!("{}.attention.key_length", arch), 128) as usize;
-    let intermediate_size = get_meta_u32(provider, &format!("{}.intermediate_size", arch), 11008) as usize;
+    let intermediate_size =
+        get_meta_u32(provider, &format!("{}.intermediate_size", arch), 11008) as usize;
     let vocab_size = get_meta_str(provider, "tokenizer.ggml.vocab_size")
         .or_else(|| get_meta_str(provider, &format!("{}.vocab_size", arch)))
         .and_then(|s| s.parse().ok())
@@ -178,10 +178,15 @@ fn llama_config_from_metadata(provider: &GgufProvider) -> Result<LlamaConfig> {
         .unwrap_or(32000) as usize;
     let hidden_size = get_meta_u32(provider, &format!("{}.embedding_length", arch), 4096) as usize;
     let num_heads = get_meta_u32(provider, &format!("{}.attention.head_count", arch), 32) as usize;
-    let num_kv_heads = get_meta_u32(provider, &format!("{}.attention.head_count_kv", arch), num_heads as u32) as usize;
+    let num_kv_heads = get_meta_u32(
+        provider,
+        &format!("{}.attention.head_count_kv", arch),
+        num_heads as u32,
+    ) as usize;
     let head_dim = get_meta_u32(provider, &format!("{}.attention.key_length", arch), 128) as usize;
     let num_layers = get_meta_u32(provider, &format!("{}.block_count", arch), 32) as usize;
-    let intermediate_size = get_meta_u32(provider, &format!("{}.intermediate_size", arch), 11008) as usize;
+    let intermediate_size =
+        get_meta_u32(provider, &format!("{}.intermediate_size", arch), 11008) as usize;
     let rms_norm_eps = get_meta_str(provider, &format!("{}.attention.layer_norm_eps", arch))
         .or_else(|| get_meta_str(provider, &format!("{}.attention.layernorm_rms_eps", arch)))
         .and_then(|s| s.parse().ok())
@@ -207,8 +212,14 @@ fn llama_config_from_metadata(provider: &GgufProvider) -> Result<LlamaConfig> {
 /// Helper: get metadata as u32 from provider.
 fn get_meta_u32(provider: &GgufProvider, key: &str, default: u32) -> u32 {
     if let Some(v) = provider.metadata(key) {
-        if let Some(u) = v.as_u32() { return u; }
-        if let Some(s) = v.as_str() { if let Ok(u) = s.parse::<u32>() { return u; } }
+        if let Some(u) = v.as_u32() {
+            return u;
+        }
+        if let Some(s) = v.as_str() {
+            if let Ok(u) = s.parse::<u32>() {
+                return u;
+            }
+        }
     }
     default
 }
@@ -216,77 +227,98 @@ fn get_meta_u32(provider: &GgufProvider, key: &str, default: u32) -> u32 {
 /// Helper: get metadata as string from provider.
 fn get_meta_str(provider: &GgufProvider, key: &str) -> Option<String> {
     let v = provider.metadata(key)?;
-    if let Some(s) = v.as_str() { return Some(s.to_string()); }
-    if let Some(u) = v.as_u32() { return Some(u.to_string()); }
-    if let Some(f) = v.as_f32() { return Some(f.to_string()); }
+    if let Some(s) = v.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(u) = v.as_u32() {
+        return Some(u.to_string());
+    }
+    if let Some(f) = v.as_f32() {
+        return Some(f.to_string());
+    }
     None
 }
 
 /// Load dataset from JSON file (supports Alpaca and ShareGPT formats).
-fn load_dataset(path: &str, tokenizer: &GgufTokenizer, max_seq_len: usize) -> Result<Vec<(Vec<u32>, Vec<u32>)>> {
+fn load_dataset(
+    path: &str,
+    tokenizer: &GgufTokenizer,
+    max_seq_len: usize,
+) -> Result<Vec<(Vec<u32>, Vec<u32>)>> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| Error::Session(format!("failed to read dataset '{}': {}", path, e)))?;
 
     // Try Alpaca format first (array of {instruction, output})
     if let Ok(entries) = serde_json::from_str::<Vec<AlpacaEntry>>(&content) {
         println!("[grim train] Loaded {} Alpaca entries", entries.len());
-        let examples: Result<Vec<_>> = entries.iter().map(|e| {
-            let prompt = if e.input.is_empty() {
-                format!("### Instruction:\n{}\n\n### Response:\n", e.instruction)
-            } else {
-                format!("### Instruction:\n{}\n\n### Input:\n{}\n\n### Response:\n", e.instruction, e.input)
-            };
-            let full_text = format!("{}{}", prompt, e.output);
-            let tokens = tokenizer.encode(&full_text);
-            let prompt_len = tokenizer.encode(&prompt).len();
+        let examples: Result<Vec<_>> = entries
+            .iter()
+            .map(|e| {
+                let prompt = if e.input.is_empty() {
+                    format!("### Instruction:\n{}\n\n### Response:\n", e.instruction)
+                } else {
+                    format!(
+                        "### Instruction:\n{}\n\n### Input:\n{}\n\n### Response:\n",
+                        e.instruction, e.input
+                    )
+                };
+                let full_text = format!("{}{}", prompt, e.output);
+                let tokens = tokenizer.encode(&full_text);
+                let prompt_len = tokenizer.encode(&prompt).len();
 
-            if tokens.len() > max_seq_len {
-                let tokens = tokens[..max_seq_len].to_vec();
-                let labels = vec![IGNORE_INDEX; prompt_len.min(max_seq_len)]
+                if tokens.len() > max_seq_len {
+                    let tokens = tokens[..max_seq_len].to_vec();
+                    let labels = vec![IGNORE_INDEX; prompt_len.min(max_seq_len)]
+                        .into_iter()
+                        .chain(tokens[prompt_len.min(max_seq_len)..].to_vec())
+                        .collect::<Vec<u32>>();
+                    return Ok((tokens, labels));
+                }
+
+                let labels = vec![IGNORE_INDEX; prompt_len]
                     .into_iter()
-                    .chain(tokens[prompt_len.min(max_seq_len)..].to_vec())
+                    .chain(tokens[prompt_len..].to_vec())
                     .collect::<Vec<u32>>();
-                return Ok((tokens, labels));
-            }
-
-            let labels = vec![IGNORE_INDEX; prompt_len]
-                .into_iter()
-                .chain(tokens[prompt_len..].to_vec())
-                .collect::<Vec<u32>>();
                 Ok((tokens, labels))
-        }).collect();
+            })
+            .collect();
         return examples.map(|exs| pack_training_examples(exs, max_seq_len));
     }
 
     // Try ShareGPT format (array of {conversations: [{from, value}]})
     if let Ok(entries) = serde_json::from_str::<Vec<ShareGptEntry>>(&content) {
         println!("[grim train] Loaded {} ShareGPT entries", entries.len());
-        let examples: Vec<_> = entries.iter().filter_map(|e| {
-            if e.conversations.len() < 2 { return None; }
-            let mut tokens = Vec::new();
-            let mut labels = Vec::new();
-            for (i, turn) in e.conversations.iter().enumerate() {
-                let turn_tokens = tokenizer.encode(&turn.value);
-                if i % 2 == 0 {
-                    // Human turn: mask in labels
-                    let mask = vec![IGNORE_INDEX; turn_tokens.len()];
-                    labels.extend(mask);
-                } else {
-                    // Assistant turn: compute in labels
-                    labels.extend(turn_tokens.iter().copied());
+        let examples: Vec<_> = entries
+            .iter()
+            .filter_map(|e| {
+                if e.conversations.len() < 2 {
+                    return None;
                 }
-                tokens.extend(turn_tokens);
-            }
-            if tokens.len() > max_seq_len {
-                tokens.truncate(max_seq_len);
-                labels.truncate(max_seq_len);
-            }
-            if tokens.len() >= 2 {
-                Some((tokens, labels))
-            } else {
-                None
-            }
-        }).collect();
+                let mut tokens = Vec::new();
+                let mut labels = Vec::new();
+                for (i, turn) in e.conversations.iter().enumerate() {
+                    let turn_tokens = tokenizer.encode(&turn.value);
+                    if i % 2 == 0 {
+                        // Human turn: mask in labels
+                        let mask = vec![IGNORE_INDEX; turn_tokens.len()];
+                        labels.extend(mask);
+                    } else {
+                        // Assistant turn: compute in labels
+                        labels.extend(turn_tokens.iter().copied());
+                    }
+                    tokens.extend(turn_tokens);
+                }
+                if tokens.len() > max_seq_len {
+                    tokens.truncate(max_seq_len);
+                    labels.truncate(max_seq_len);
+                }
+                if tokens.len() >= 2 {
+                    Some((tokens, labels))
+                } else {
+                    None
+                }
+            })
+            .collect();
         return Ok(pack_training_examples(examples, max_seq_len));
     }
 
@@ -304,14 +336,16 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
     println!("             Sidecar Output: {}", opts.output_sidecar);
 
     // ── F4: Load real model from .grim file ──
-    let provider = GgufProvider::open(&opts.model_path)
-        .map_err(|e| Error::Session(format!("failed to open model '{}': {}", opts.model_path, e)))?;
+    let provider = GgufProvider::open(&opts.model_path).map_err(|e| {
+        Error::Session(format!("failed to open model '{}': {}", opts.model_path, e))
+    })?;
 
     let model_config = injection_config_from_metadata(&provider)?;
     let llama_config = llama_config_from_metadata(&provider)?;
     let num_layers = llama_config.num_layers;
 
-    let tokenizer = provider.tokenizer()
+    let tokenizer = provider
+        .tokenizer()
         .map_err(|e| Error::Session(format!("failed to load tokenizer: {}", e)))?;
 
     // Validate LoRA hyperparameters before constructing the registry.
@@ -324,12 +358,19 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
     let hidden_size = llama_config.hidden_size;
     if opts.rank > hidden_size {
         return Err(Error::Session(format!(
-            "LoRA rank {} exceeds hidden size {}", opts.rank, hidden_size
+            "LoRA rank {} exceeds hidden size {}",
+            opts.rank, hidden_size
         )));
     }
 
     let injection_reg = LoRAInjectionRegistry::standard_qlora_with_flags(
-        num_layers, opts.rank, opts.alpha, 1, opts.use_pissa, opts.use_olora, opts.olora_lambda,
+        num_layers,
+        opts.rank,
+        opts.alpha,
+        1,
+        opts.use_pissa,
+        opts.use_olora,
+        opts.olora_lambda,
     );
     let mut autograd_reg = AutogradRegistry::new(model_config.clone(), injection_reg)
         .map_err(|e| Error::Session(e.to_string()))?;
@@ -364,18 +405,38 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
     let target_device = match opts.device.as_str() {
         "cpu" => grim_tensor::Device::Cpu,
         d if d.starts_with("rocm") => {
-            let ordinal = d.strip_prefix("rocm:").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+            let ordinal = d
+                .strip_prefix("rocm:")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
             grim_tensor::Device::Rocm(ordinal)
         }
-        other => return Err(Error::Session(format!("unsupported training device '{other}'"))),
+        other => {
+            return Err(Error::Session(format!(
+                "unsupported training device '{other}'"
+            )));
+        }
     };
 
     let ws = WeightSource::root(&provider, target_device);
-    let tok_embeddings = Embedding::load(&ws.pp("token_embd"), model_config.vocab_size, model_config.hidden_size)
-        .map_err(|e| Error::Session(format!("failed to load token_embd: {e}")))?;
-    let output_norm = RmsNorm::load(&ws.pp("output_norm"), model_config.hidden_size, llama_config.rms_norm_eps)
-        .map_err(|e| Error::Session(format!("failed to load output_norm: {e}")))?;
-    let lm_head = match Linear::load(&ws.pp("output"), model_config.hidden_size, model_config.vocab_size, false) {
+    let tok_embeddings = Embedding::load(
+        &ws.pp("token_embd"),
+        model_config.vocab_size,
+        model_config.hidden_size,
+    )
+    .map_err(|e| Error::Session(format!("failed to load token_embd: {e}")))?;
+    let output_norm = RmsNorm::load(
+        &ws.pp("output_norm"),
+        model_config.hidden_size,
+        llama_config.rms_norm_eps,
+    )
+    .map_err(|e| Error::Session(format!("failed to load output_norm: {e}")))?;
+    let lm_head = match Linear::load(
+        &ws.pp("output"),
+        model_config.hidden_size,
+        model_config.vocab_size,
+        false,
+    ) {
         Ok(l) => {
             println!("[grim train] Loaded separate lm_head from output.weight");
             l
@@ -397,10 +458,12 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         let mut epoch_loss = 0.0f32;
         let mut num_batches = 0;
 
-for (tokens, labels) in dataset.iter() {
-        if tokens.len() < 2 { continue; }
-        let input_ids = &tokens[..tokens.len() - 1];
-        let targets = &labels[1..];
+        for (tokens, labels) in dataset.iter() {
+            if tokens.len() < 2 {
+                continue;
+            }
+            let input_ids = &tokens[..tokens.len() - 1];
+            let targets = &labels[1..];
 
             let seq_len = input_ids.len();
             let hidden = model_config.hidden_size;
@@ -416,8 +479,18 @@ for (tokens, labels) in dataset.iter() {
             // Run streaming forward through all layers with autograd tape recording.
             for layer_idx in 0..num_layers {
                 let (next_id, next_h) = streaming
-                    .forward_block_with_autograd(&provider, &llama_config, &autograd_reg, &mut tape, layer_idx, &hidden_state, x_id)
-                    .map_err(|e| Error::Session(format!("layer {} forward failed: {}", layer_idx, e)))?;
+                    .forward_block_with_autograd(
+                        &provider,
+                        &llama_config,
+                        &autograd_reg,
+                        &mut tape,
+                        layer_idx,
+                        &hidden_state,
+                        x_id,
+                    )
+                    .map_err(|e| {
+                        Error::Session(format!("layer {} forward failed: {}", layer_idx, e))
+                    })?;
                 hidden_state = next_h;
                 x_id = next_id;
             }
@@ -496,7 +569,6 @@ for (tokens, labels) in dataset.iter() {
 mod tests {
     use super::*;
 
-
     #[test]
     fn test_cli_train_soul_eater_flag() {
         let opts = TrainOptions {
@@ -528,14 +600,36 @@ mod tests {
         // Create a minimal tokenizer mock
         let mut tokens = Vec::new();
         let mut token_to_id = std::collections::HashMap::new();
-        let specials = vec!["<s>", "</s>", "<unk>", "\n", " ", ":", "S", "u", "m", "a", "r", "i", "z", "e", "t", "h", "s", "T", "e", "x", "l", "d", "H", "o", "w", "r", "G", "F", "n", "c", "T", "r", "a", "n", "s", "i", "o", "F", "r", "e", "n", "c", "h", "B", "o", "n", "j", "u", "r"];
+        let specials = vec![
+            "<s>", "</s>", "<unk>", "\n", " ", ":", "S", "u", "m", "a", "r", "i", "z", "e", "t",
+            "h", "s", "T", "e", "x", "l", "d", "H", "o", "w", "r", "G", "F", "n", "c", "T", "r",
+            "a", "n", "s", "i", "o", "F", "r", "e", "n", "c", "h", "B", "o", "n", "j", "u", "r",
+        ];
         for (i, tok) in specials.iter().enumerate() {
             tokens.push(tok.to_string());
             token_to_id.insert(tok.to_string(), i as u32);
         }
 
         // Add word tokens
-        let words = vec!["###", "Instruction:", "Input:", "Response:", "Summarize", "this", "text", "Hello", "world", "A", "greeting", "Translate", "to", "French", "Good", "morning", "Bonjour"];
+        let words = vec![
+            "###",
+            "Instruction:",
+            "Input:",
+            "Response:",
+            "Summarize",
+            "this",
+            "text",
+            "Hello",
+            "world",
+            "A",
+            "greeting",
+            "Translate",
+            "to",
+            "French",
+            "Good",
+            "morning",
+            "Bonjour",
+        ];
         for (i, word) in words.iter().enumerate() {
             let id = (specials.len() + i) as u32;
             tokens.push(word.to_string());
@@ -559,23 +653,33 @@ mod tests {
         assert!(!dataset[0].0.is_empty());
     }
 
-    fn load_dataset_from_str(content: &str, tokenizer: &GgufTokenizer, _max_seq_len: usize) -> Result<Vec<(Vec<u32>, Vec<u32>)>> {
+    fn load_dataset_from_str(
+        content: &str,
+        tokenizer: &GgufTokenizer,
+        _max_seq_len: usize,
+    ) -> Result<Vec<(Vec<u32>, Vec<u32>)>> {
         if let Ok(entries) = serde_json::from_str::<Vec<AlpacaEntry>>(content) {
-            return entries.iter().map(|e| {
-                let prompt = if e.input.is_empty() {
-                    format!("### Instruction:\n{}\n\n### Response:\n", e.instruction)
-                } else {
-                    format!("### Instruction:\n{}\n\n### Input:\n{}\n\n### Response:\n", e.instruction, e.input)
-                };
-                let full_text = format!("{}{}", prompt, e.output);
-                let tokens = tokenizer.encode(&full_text);
-                let prompt_len = tokenizer.encode(&prompt).len();
-                let labels = vec![IGNORE_INDEX; prompt_len]
-                    .into_iter()
-                    .chain(tokens[prompt_len..].to_vec())
-                    .collect::<Vec<u32>>();
-                Ok((tokens, labels))
-            }).collect::<Result<Vec<_>>>();
+            return entries
+                .iter()
+                .map(|e| {
+                    let prompt = if e.input.is_empty() {
+                        format!("### Instruction:\n{}\n\n### Response:\n", e.instruction)
+                    } else {
+                        format!(
+                            "### Instruction:\n{}\n\n### Input:\n{}\n\n### Response:\n",
+                            e.instruction, e.input
+                        )
+                    };
+                    let full_text = format!("{}{}", prompt, e.output);
+                    let tokens = tokenizer.encode(&full_text);
+                    let prompt_len = tokenizer.encode(&prompt).len();
+                    let labels = vec![IGNORE_INDEX; prompt_len]
+                        .into_iter()
+                        .chain(tokens[prompt_len..].to_vec())
+                        .collect::<Vec<u32>>();
+                    Ok((tokens, labels))
+                })
+                .collect::<Result<Vec<_>>>();
         }
         Err(Error::Session("not Alpaca format".into()))
     }
@@ -599,8 +703,8 @@ mod tests {
     struct HeadProvider {
         vocab: usize,
         hidden: usize,
-        embed_bytes: Vec<u8>, // length = hidden * vocab * 4 (f32)
-        norm_bytes: Vec<u8>,  // length = hidden * 4
+        embed_bytes: Vec<u8>,          // length = hidden * vocab * 4 (f32)
+        norm_bytes: Vec<u8>,           // length = hidden * 4
         lmhead_bytes: Option<Vec<u8>>, // length = vocab * hidden * 4 if Some
         embed_shape: Vec<usize>,
     }
@@ -665,7 +769,9 @@ mod tests {
                     }),
                     None => Err(grim_tensor::Error::Backend("no lm_head".into())),
                 },
-                other => Err(grim_tensor::Error::Backend(format!("stub: unknown tensor {other}"))),
+                other => Err(grim_tensor::Error::Backend(format!(
+                    "stub: unknown tensor {other}"
+                ))),
             }
         }
 
@@ -711,7 +817,11 @@ mod tests {
 
         let ids = vec![0u32, 1, 2];
         let mut h = emb.forward(&ids, ids.len(), hidden).unwrap();
-        assert_eq!(h.shape().dims(), &[ids.len(), hidden], "embedding must be [seq_len, hidden]");
+        assert_eq!(
+            h.shape().dims(),
+            &[ids.len(), hidden],
+            "embedding must be [seq_len, hidden]"
+        );
         h = norm.forward(&h).unwrap();
         let logits = lm.forward(&h).unwrap();
         assert_eq!(
@@ -762,7 +872,10 @@ mod tests {
         let targets = vec![1usize, 2, 3, 4];
         let seq_len = input_ids.len();
 
-        use grim_autograd::{AdamW, AdamWConfig, AutogradRegistry, InjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry, Tape, apply_and_record_lora};
+        use grim_autograd::{
+            AdamW, AdamWConfig, AutogradRegistry, InjectionConfig, LoRAInjectionPoint,
+            LoRAInjectionRegistry, Tape, apply_and_record_lora,
+        };
 
         let inj_cfg = InjectionConfig {
             hidden_size: hidden,
@@ -809,7 +922,8 @@ mod tests {
                 logits_base_id,
                 h_norm,
                 h_norm_id,
-            ).unwrap();
+            )
+            .unwrap();
 
             let (loss_val, loss_grad) = cross_entropy_loss(&logits_out, &targets).unwrap();
             if step == 0 {
@@ -830,11 +944,7 @@ mod tests {
 
     #[test]
     fn test_pack_dataset_tokens_golden_mutation_resistant() {
-        let seqs = vec![
-            vec![1, 2, 3],
-            vec![4, 5],
-            vec![6, 7, 8, 9],
-        ];
+        let seqs = vec![vec![1, 2, 3], vec![4, 5], vec![6, 7, 8, 9]];
         let packed = pack_dataset_tokens(&seqs, 5);
         assert_eq!(packed.len(), 2);
         assert_eq!(packed[0], vec![1, 2, 3, 4, 5]);

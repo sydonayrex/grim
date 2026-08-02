@@ -69,20 +69,32 @@ pub fn apply_adapters_to_logits(
         // GPU path: performing matmuls on-device using BackendDevice
         let mut running_logits = logits_2d.clone();
         for adapter in adapters {
-            let rank = adapter.a.shape().dim(0).map_err(|e| Error::Shape(e.to_string()))?;
-            let in_dim = adapter.a.shape().dim(1).map_err(|e| Error::Shape(e.to_string()))?;
+            let rank = adapter
+                .a
+                .shape()
+                .dim(0)
+                .map_err(|e| Error::Shape(e.to_string()))?;
+            let in_dim = adapter
+                .a
+                .shape()
+                .dim(1)
+                .map_err(|e| Error::Shape(e.to_string()))?;
             if in_dim != hidden_size {
                 return Err(Error::Shape(format!(
                     "LoRA A in_dim {in_dim} != model hidden_size {hidden_size}"
                 )));
             }
-            let out_dim = adapter.b.shape().dim(0).map_err(|e| Error::Shape(e.to_string()))?;
+            let out_dim = adapter
+                .b
+                .shape()
+                .dim(0)
+                .map_err(|e| Error::Shape(e.to_string()))?;
             if out_dim != vocab {
                 return Err(Error::Shape(format!(
                     "LoRA B out_dim {out_dim} != vocab {vocab}"
                 )));
             }
-            
+
             // scale is alpha / rank
             let scale = adapter.alpha / rank as f32;
 
@@ -90,7 +102,7 @@ pub fn apply_adapters_to_logits(
             // We want last_hidden @ A^T -> last_hidden is logits [seq_len, hidden_size]
             // A^T is [hidden_size, rank]. Let's transpose adapter.a [rank, hidden_size]
             let a_t = transpose_last_two(&adapter.a)?;
-            
+
             // 1. Matmul 1: temp = logits @ a_t
             // logits is [seq_len, hidden_size]
             // a_t is [hidden_size, rank]
@@ -141,7 +153,11 @@ pub fn apply_adapters_to_logits(
             for val in &mut delta_vec {
                 *val *= scale;
             }
-            let scaled_delta_s = dev.from_cpu(&delta_vec, delta_tensor.shape(), grim_tensor::dtype::DType::F32)?;
+            let scaled_delta_s = dev.from_cpu(
+                &delta_vec,
+                delta_tensor.shape(),
+                grim_tensor::dtype::DType::F32,
+            )?;
             let scaled_delta_tensor = Tensor::new(
                 std::sync::Arc::from(scaled_delta_s),
                 delta_tensor.shape().clone(),
@@ -176,14 +192,26 @@ pub fn apply_adapters_to_logits(
     // CPU fallback path:
     let mut acc = vec![0.0f32; seq_len * vocab];
     for adapter in adapters {
-        let rank = adapter.a.shape().dim(0).map_err(|e| Error::Shape(e.to_string()))?;
-        let in_dim = adapter.a.shape().dim(1).map_err(|e| Error::Shape(e.to_string()))?;
+        let rank = adapter
+            .a
+            .shape()
+            .dim(0)
+            .map_err(|e| Error::Shape(e.to_string()))?;
+        let in_dim = adapter
+            .a
+            .shape()
+            .dim(1)
+            .map_err(|e| Error::Shape(e.to_string()))?;
         if in_dim != hidden_size {
             return Err(Error::Shape(format!(
                 "LoRA A in_dim {in_dim} != model hidden_size {hidden_size}"
             )));
         }
-        let out_dim = adapter.b.shape().dim(0).map_err(|e| Error::Shape(e.to_string()))?;
+        let out_dim = adapter
+            .b
+            .shape()
+            .dim(0)
+            .map_err(|e| Error::Shape(e.to_string()))?;
         if out_dim != vocab {
             return Err(Error::Shape(format!(
                 "LoRA B out_dim {out_dim} != vocab {vocab}"
@@ -205,7 +233,11 @@ pub fn apply_adapters_to_logits(
         let scale = adapter.alpha / rank as f32;
         let a_data = adapter.a.to_vec_f32()?;
         let b_data = adapter.b.to_vec_f32()?;
-        let in_dim = adapter.a.shape().dim(1).map_err(|e| Error::Shape(e.to_string()))?;
+        let in_dim = adapter
+            .a
+            .shape()
+            .dim(1)
+            .map_err(|e| Error::Shape(e.to_string()))?;
         let logits_data = logits_2d.to_vec_f32()?;
         for token in 0..seq_len {
             for vocab_j in 0..vocab {
@@ -213,8 +245,8 @@ pub fn apply_adapters_to_logits(
                 for r in 0..rank {
                     let mut inner = 0.0f32;
                     for h in 0..in_dim {
-                        inner += a_data[r * in_dim + h]
-                            * logits_data[token * vocab + h.min(vocab - 1)];
+                        inner +=
+                            a_data[r * in_dim + h] * logits_data[token * vocab + h.min(vocab - 1)];
                     }
                     total += b_data[vocab_j * rank + r] * inner;
                 }

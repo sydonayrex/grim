@@ -1,25 +1,16 @@
-//! `grim-backend-cpu` — the always-available reference backend for Grim.
-//!
-//! Implements `BackendDevice` and `BackendStorage` over a host `Vec<f32>`
-//! buffer. Operations are synchronous; the returned `ComputeHandle` is
-//! always `ReadyHandle`. v1 is scalar + naive GEMM — SIMD specialization
-//! (packed_simd / std::simd) is a focus area for a later phase but is
-//! structurally isolated so swapping in doesn't require changing model
-//! code.
+//! CPU reference backend: host buffers, SIMD GEMM, scalar fallback routines.
 
-pub mod device;
-pub mod storage;
-/// CPU implementations of the strict-mode mathematical primitives
-/// referenced by [`grim_core::DeterminismMode::Strict`]. Architecture
-/// §5.8.
-pub mod strict_kernels;
-pub mod deterministic_rng;
-/// SIMD-accelerated GEMM kernel (AVX2/SSE on x86_64)
-pub mod simd_gemm;
 pub mod dequant_gemm;
+pub mod deterministic_rng;
+pub mod device;
+/// SIMD GEMM kernel (AVX2/SSE on x86_64).
+pub mod simd_gemm;
+pub mod storage;
+/// Strict-mode primitives for [`grim_core::DeterminismMode::Strict`] (§5.8).
+pub mod strict_kernels;
 
-pub use device::{cpu_tensor, add_tensors, CpuDevice};
-pub use deterministic_rng::DeterministicRng;
-pub use storage::CpuStorage;
-pub use simd_gemm::{gemm_f32_simd, gemm_f32_lora_fused};
 pub use dequant_gemm::dequant_row;
+pub use deterministic_rng::DeterministicRng;
+pub use device::{CpuDevice, add_tensors, cpu_tensor};
+pub use simd_gemm::{gemm_f32_lora_fused, gemm_f32_simd};
+pub use storage::CpuStorage;

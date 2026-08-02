@@ -1,4 +1,4 @@
-//! grim rm - Remove a model from the local cache.
+//! grim rm — Remove a model from the local cache.
 
 use grim_core::catalog::resolve_model_preferring_grim;
 use grim_core::error::{Error, Result};
@@ -7,16 +7,18 @@ use std::fs;
 
 /// Remove a model from the local cache.
 pub async fn cmd_rm(model: &str) -> Result<()> {
-    // Resolve the model
+    // Resolve model
     let model_path = resolve_model_preferring_grim(model)
         .ok_or_else(|| Error::Config(format!("Model '{}' not found", model)))?;
 
     let models_dir = grim_models_dir();
-    let model_stem = model_path.file_stem()
+    let model_stem = model_path
+        .file_stem()
         .and_then(|s| s.to_str())
         .ok_or_else(|| Error::Config("Invalid model path".to_string()))?;
 
-    let model_ext = model_path.extension()
+    let model_ext = model_path
+        .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("gguf");
 
@@ -35,7 +37,7 @@ pub async fn cmd_rm(model: &str) -> Result<()> {
         println!("Removed sidecar: {}", sidecar.display());
     }
 
-    // Remove .grim sibling if .gguf was removed
+    // Remove .grim sibling if present
     if model_ext == "gguf" {
         let grim_sibling = model_path.with_extension("grim");
         if grim_sibling.exists() {
@@ -45,7 +47,7 @@ pub async fn cmd_rm(model: &str) -> Result<()> {
         }
     }
 
-    // Remove .grim.train sidecar if exists
+    // Remove .grim.train sidecar if present
     let train_sidecar = models_dir.join(format!("{}.grim.train", model_stem));
     if train_sidecar.exists() {
         fs::remove_file(&train_sidecar)

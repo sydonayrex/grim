@@ -1,11 +1,6 @@
 //! Integration tests for the ViewModel bridge — the deterministic
-//! projection of `DisplayState` into strings/structs that the CVKG
-//! widgets (and any future React/Vite/Tauri renderer) consume.
-//!
-//! The goal is to land `GrimViewModel::from(state)` and the
-//! supporting fields without depending on CVKG widget constructor
-//! specifics. When CVKG 0.3.3 surfaces a stable widget API, we add
-//! the View-impl tree in a separate commit that consumes this.
+//! projection of `DisplayState` into strings/structs that the UI components
+//! consume.
 
 use grim_garage::ui_state::display::DisplayState;
 use grim_garage::view_model::ViewModel;

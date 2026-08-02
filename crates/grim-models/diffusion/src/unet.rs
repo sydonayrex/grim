@@ -6,14 +6,14 @@
 //! The v1 model is structurally complete but uses small fixed sizes for
 //! testability. ROCm kernels arrive with phase 4.
 
-use grim_backend_cpu::{cpu_tensor, CpuDevice};
+use grim_backend_cpu::{CpuDevice, cpu_tensor};
 use grim_core::error::{Error, Result};
 use grim_core::model::{DiffusionModel, ModalityHint, NoiseScheduler};
 use grim_core::{Model, ModelConfig};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 
-use grim_core::rng::SimpleRng;
 use crate::scheduler::DdimScheduler;
+use grim_core::rng::SimpleRng;
 
 /// Small UNet config.
 #[derive(Debug, Clone)]
@@ -27,9 +27,15 @@ pub struct UnetConfig {
 }
 
 impl ModelConfig for UnetConfig {
-    fn name(&self) -> &str { "unet-2d" }
-    fn modality(&self) -> ModalityHint { ModalityHint::Diffusion }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str {
+        "unet-2d"
+    }
+    fn modality(&self) -> ModalityHint {
+        ModalityHint::Diffusion
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 pub struct Unet2D {
@@ -54,7 +60,9 @@ struct DownBlock {
 
 impl DownBlock {
     fn new(hidden: usize, pool: usize, _eps: f32, rng: &mut SimpleRng) -> Self {
-        let conv_w: Vec<f32> = (0..hidden * hidden).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
+        let conv_w: Vec<f32> = (0..hidden * hidden)
+            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .collect();
         Self {
             conv_w,
             conv_b: vec![0.0; hidden],
@@ -63,23 +71,22 @@ impl DownBlock {
         }
     }
 
-    fn forward(&self, x_data: &mut Vec<f32>, _hw: usize) -> Result<()> {
+    fn forward(&self, x_data: &mut Vec<f32>, hw: usize) -> Result<()> {
         let h = self.hidden;
-        let _ = self.pool;
+        let _pool = self.pool;
         let prev = x_data.clone();
-        let n = prev.len();
         let weights = &self.conv_w;
         let bias = &self.conv_b;
-        for i in 0..n {
-            let a = prev[i];
-            let mut acc = bias[i % h];
-            for k in 0..h {
-                acc += weights[((i % h) * h) + k] * prev[i];
+        for elem in 0..hw {
+            for ch_out in 0..h {
+                let idx = ch_out * hw + elem;
+                let mut acc = bias[ch_out];
+                for ch_in in 0..h {
+                    acc += weights[ch_out * h + ch_in] * prev[ch_in * hw + elem];
+                }
+                x_data[idx] = acc + prev[idx];
             }
-            x_data[i] = acc + a;
         }
-        let _ = weights;
-        let _ = bias;
         Ok(())
     }
 }
@@ -92,7 +99,9 @@ struct UpBlock {
 
 impl UpBlock {
     fn new(hidden: usize, _eps: f32, rng: &mut SimpleRng) -> Self {
-        let conv_w: Vec<f32> = (0..hidden * 2 * hidden).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
+        let conv_w: Vec<f32> = (0..hidden * 2 * hidden)
+            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .collect();
         Self {
             conv_w,
             conv_b: vec![0.0; hidden],
@@ -102,13 +111,25 @@ impl UpBlock {
 
     fn forward(&self, x_data: &mut [f32], skip: &[f32]) -> Result<()> {
         let hidden = self.hidden;
-        for i in 0..x_data.len() {
-            let s = skip.get(i % skip.len()).copied().unwrap_or(0.0);
-            let w = self.conv_w.get(i % self.conv_w.len()).copied().unwrap_or(1.0);
-            let b = self.conv_b.get(i % self.conv_b.len()).copied().unwrap_or(0.0);
-            x_data[i] = (x_data[i] + s) * w + b;
+        let hw = x_data.len() / hidden;
+        let prev = x_data.to_vec();
+        for elem in 0..hw {
+            for ch_out in 0..hidden {
+                let idx = ch_out * hw + elem;
+                let mut acc = self.conv_b[ch_out];
+                for ch_in in 0..hidden {
+                    acc += self.conv_w[ch_out * (hidden * 2) + ch_in] * prev[ch_in * hw + elem];
+                }
+                if !skip.is_empty() {
+                    let skip_ch_out = ch_out % hidden;
+                    for ch_in in 0..hidden {
+                        acc += self.conv_w[ch_out * (hidden * 2) + hidden + ch_in]
+                            * skip[skip_ch_out * hw + elem];
+                    }
+                }
+                x_data[idx] = acc;
+            }
         }
-        let _ = hidden;
         Ok(())
     }
 }
@@ -125,7 +146,8 @@ impl Unet2D {
         let down_blocks = (0..cfg.num_downsample)
             .map(|i| DownBlock::new(cfg.hidden, 2 * (i + 1), cfg.rms_norm_eps, rng))
             .collect();
-        let up_blocks = (0..cfg.num_downsample).rev()
+        let up_blocks = (0..cfg.num_downsample)
+            .rev()
             .map(|_| UpBlock::new(cfg.hidden, cfg.rms_norm_eps, rng))
             .collect();
         let out_proj_w = rand_mat(cfg.out_channels, cfg.hidden, rng);
@@ -159,20 +181,23 @@ impl Unet2D {
 }
 
 impl Model for Unet2D {
-    fn config(&self) -> &dyn ModelConfig { &self.cfg }
-    fn device(&self) -> &Device { &self.device }
-    fn param_arith(&self) -> ArithType { ArithType::F32 }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn config(&self) -> &dyn ModelConfig {
+        &self.cfg
+    }
+    fn device(&self) -> &Device {
+        &self.device
+    }
+    fn param_arith(&self) -> ArithType {
+        ArithType::F32
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl DiffusionModel for Unet2D {
     /// Predicts noise given current latents + timestep + conditioning.
-    fn denoise_step(
-        &self,
-        latents: &Tensor,
-        timestep: &Tensor,
-        _cond: &Tensor,
-    ) -> Result<Tensor> {
+    fn denoise_step(&self, latents: &Tensor, timestep: &Tensor, _cond: &Tensor) -> Result<Tensor> {
         let _dev = CpuDevice::new();
         let lat_shape = latents.shape().dims().to_vec();
         if lat_shape.len() != 4 {
@@ -206,7 +231,8 @@ impl DiffusionModel for Unet2D {
                     for o in 0..hd {
                         let mut acc = self.in_proj_b[o];
                         for i in 0..c {
-                            acc += self.in_proj_w[o * c + i] * lat_data[bi * c * h * w + i * h * w + yi * w + xi];
+                            acc += self.in_proj_w[o * c + i]
+                                * lat_data[bi * c * h * w + i * h * w + yi * w + xi];
                         }
                         x[bi * hd * h * w + o * h * w + yi * w + xi] = acc;
                     }
@@ -224,13 +250,15 @@ impl DiffusionModel for Unet2D {
         for bi in 0..b {
             let t = t_data[bi] as u32;
             let emb = self.sinusoidal_timestep_embed(t);
-            let proj: Vec<f32> = (0..hd).map(|o| {
-                let mut acc = 0.0f32;
-                for k in 0..hd {
-                    acc += self.time_emb_w[o * hd + k] * emb[k];
-                }
-                acc
-            }).collect();
+            let proj: Vec<f32> = (0..hd)
+                .map(|o| {
+                    let mut acc = 0.0f32;
+                    for k in 0..hd {
+                        acc += self.time_emb_w[o * hd + k] * emb[k];
+                    }
+                    acc
+                })
+                .collect();
             for o in 0..hd {
                 let s = self.cfg.num_timesteps.max(1) as f32;
                 let scale = 1.0 + (proj[o] / s);
@@ -255,7 +283,8 @@ impl DiffusionModel for Unet2D {
                     for xi in 0..w {
                         let mut acc = self.out_proj_b[o];
                         for k in 0..hd {
-                            acc += self.out_proj_w[o * hd + k] * x[bi * hd * h * w + k * h * w + yi * w + xi];
+                            acc += self.out_proj_w[o * hd + k]
+                                * x[bi * hd * h * w + k * h * w + yi * w + xi];
                         }
                         out[bi * self.cfg.out_channels * h * w + o * h * w + yi * w + xi] = acc;
                     }
@@ -277,7 +306,9 @@ fn skip_payload(x: &mut [f32], skip: &[f32]) {
 }
 
 fn rand_mat(rows: usize, cols: usize, rng: &mut SimpleRng) -> Vec<f32> {
-    (0..rows * cols).map(|_| (rng.next_f32() - 0.5) * 0.02).collect()
+    (0..rows * cols)
+        .map(|_| (rng.next_f32() - 0.5) * 0.02)
+        .collect()
 }
 
 #[cfg(test)]
@@ -313,7 +344,9 @@ mod tests {
         let lat = cpu_tensor(vec![1.0f32; 1 * 3 * 8 * 8], Shape::new(vec![1, 3, 8, 8]));
         let t = cpu_tensor(vec![0.0f32], Shape::new(vec![1]));
         let cond = cpu_tensor(vec![0.0f32; 4], Shape::new(vec![4]));
-        let err = u.denoise_step(&lat, &t, &cond).err()
+        let err = u
+            .denoise_step(&lat, &t, &cond)
+            .err()
             .expect("denoise_step should fail on bad channels");
         match err {
             Error::Shape(_) => {}

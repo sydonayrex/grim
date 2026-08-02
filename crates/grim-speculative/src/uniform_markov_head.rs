@@ -40,11 +40,7 @@ impl UniformMarkovHead {
 }
 
 impl MarkovHead for UniformMarkovHead {
-    fn bias(
-        &self,
-        prefix_within_block: &[u32],
-        base_logits: &Tensor,
-    ) -> Result<Tensor> {
+    fn bias(&self, prefix_within_block: &[u32], base_logits: &Tensor) -> Result<Tensor> {
         let prefix_len = prefix_within_block.len().min(self.max_block_len);
         let shape = base_logits.shape().dims().to_vec();
         if shape.len() != 2 || shape[1] != self.vocab_size {
@@ -60,9 +56,7 @@ impl MarkovHead for UniformMarkovHead {
             // position_within_block ranges over the bank's second axis.
             let pos_in_block = t.min(self.max_block_len - 1);
             for v in 0..self.vocab_size {
-                let idx = (pos_in_block * self.max_block_len + prefix_len)
-                    * self.vocab_size
-                    + v;
+                let idx = (pos_in_block * self.max_block_len + prefix_len) * self.vocab_size + v;
                 biased[t * self.vocab_size + v] = logits[t * self.vocab_size + v]
                     + self.bias_table[idx.min(self.bias_table.len() - 1)];
             }

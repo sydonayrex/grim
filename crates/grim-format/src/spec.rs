@@ -195,7 +195,11 @@ pub enum LayoutHintTag {
     /// GEMM path (WI-G). Tells the kernel "this tensor is N-bit packed for
     /// WMMA" so it can dispatch without re-deriving strides. RDNA3/RDNA4
     /// only (gfx110x/gfx1200); does not touch CDNA/MFMA.
-    PackedQuantWmma { bits: u8, frag_m: u8, frag_n: u8 },
+    PackedQuantWmma {
+        bits: u8,
+        frag_m: u8,
+        frag_n: u8,
+    },
 }
 
 impl LayoutHintTag {
@@ -276,7 +280,10 @@ impl BackupLayer {
             codes_offset: obj.get("codes_offset")?.as_u64()?,
             codes_size: obj.get("codes_size")?.as_u64()?,
             bpw: obj.get("bpw")?.as_u64()? as u8,
-            scale_offset: obj.get("scale_offset").and_then(|v| v.as_u64()).unwrap_or(0),
+            scale_offset: obj
+                .get("scale_offset")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
             scale_size: obj.get("scale_size").and_then(|v| v.as_u64()).unwrap_or(0),
         })
     }
@@ -515,19 +522,23 @@ impl GrimTensorExt {
         let tensor_name = obj.get("tensor_name")?.as_str()?.to_string();
 
         let pick_u8 = |k: &str, default: u8| {
-            obj.get(k).and_then(|v| v.as_u64()).map(|v| v as u8).unwrap_or(default)
+            obj.get(k)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u8)
+                .unwrap_or(default)
         };
         let pick_u64 = |k: &str| obj.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
 
-        let layout_descriptor = if let Some(arr) = obj.get("layout_descriptor").and_then(|v| v.as_array()) {
-            let mut buf = [0u32; 4];
-            for (i, slot) in arr.iter().enumerate().take(4) {
-                buf[i] = slot.as_u64().unwrap_or(0) as u32;
-            }
-            LayoutDescriptor(buf)
-        } else {
-            LayoutDescriptor::default()
-        };
+        let layout_descriptor =
+            if let Some(arr) = obj.get("layout_descriptor").and_then(|v| v.as_array()) {
+                let mut buf = [0u32; 4];
+                for (i, slot) in arr.iter().enumerate().take(4) {
+                    buf[i] = slot.as_u64().unwrap_or(0) as u32;
+                }
+                LayoutDescriptor(buf)
+            } else {
+                LayoutDescriptor::default()
+            };
 
         Some(Self {
             tensor_name,
@@ -543,9 +554,10 @@ impl GrimTensorExt {
             scale_offset: pick_u64("scale_offset"),
             scale_size: pick_u64("scale_size"),
             gptq_ordered: pick_u8("gptq_ordered", 0),
-            outlier_index_encoding: OutlierIndexEncoding::from_u8(
-                pick_u8("outlier_index_encoding", 1),
-            )
+            outlier_index_encoding: OutlierIndexEncoding::from_u8(pick_u8(
+                "outlier_index_encoding",
+                1,
+            ))
             .unwrap_or(OutlierIndexEncoding::FlatU32),
             outlier_residual_bpw: pick_u8("outlier_residual_bpw", 0),
             compression: PayloadCompression::from_u8(pick_u8("compression", 0))
@@ -555,8 +567,9 @@ impl GrimTensorExt {
                 let lh = obj.get("layout_hint");
                 match lh.and_then(|v| v.as_u64()) {
                     // Legacy flat u8 form still supported.
-                    Some(tag) => LayoutHintTag::from_u8(tag as u8)
-                        .unwrap_or(LayoutHintTag::Default),
+                    Some(tag) => {
+                        LayoutHintTag::from_u8(tag as u8).unwrap_or(LayoutHintTag::Default)
+                    }
                     None => {
                         // Object form: { tag, wmma_bits, wmma_frag_m, wmma_frag_n }.
                         let tag = lh
@@ -776,11 +789,20 @@ impl KvCacheLayout {
     pub fn from_json(value: &Value) -> Option<Self> {
         let obj = value.as_object()?;
         Some(Self {
-            kv_rotated: obj.get("kv_rotated").and_then(|v| v.as_bool()).unwrap_or(false),
+            kv_rotated: obj
+                .get("kv_rotated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             kv_bits_k: obj.get("kv_bits_k").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
             kv_bits_v: obj.get("kv_bits_v").and_then(|v| v.as_u64()).unwrap_or(0) as u8,
-            kv_eviction_map_offset: obj.get("kv_eviction_map_offset").and_then(|v| v.as_u64()).unwrap_or(0),
-            kv_sink_fp16: obj.get("kv_sink_fp16").and_then(|v| v.as_bool()).unwrap_or(false),
+            kv_eviction_map_offset: obj
+                .get("kv_eviction_map_offset")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            kv_sink_fp16: obj
+                .get("kv_sink_fp16")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         })
     }
 }
@@ -873,29 +895,34 @@ mod tests {
         assert!(!restored.is_legacy());
     }
 
-/// Phase 5: outlier delta-varint codec round-trips a multi-record
-/// sequence including a contiguous run (where delta compression wins).
-#[test]
-fn outlier_delta_varint_round_trips() {
-    let outliers = vec![(5u32, 1.0f32), (10, 2.0), (11, 3.0), (12, 4.0)];
-    let encoded = encode_outliers_delta_varint(&outliers);
-    let (decoded, _consumed) = decode_outliers_delta_varint(&encoded).expect("decode");
-    assert_eq!(decoded.len(), outliers.len());
-    for (got, want) in decoded.iter().zip(outliers.iter()) {
-        assert_eq!(got.0, want.0, "index mismatch");
-        assert!((got.1 - want.1).abs() < 1.5, "value {} vs {}", got.1, want.1);
+    /// Phase 5: outlier delta-varint codec round-trips a multi-record
+    /// sequence including a contiguous run (where delta compression wins).
+    #[test]
+    fn outlier_delta_varint_round_trips() {
+        let outliers = vec![(5u32, 1.0f32), (10, 2.0), (11, 3.0), (12, 4.0)];
+        let encoded = encode_outliers_delta_varint(&outliers);
+        let (decoded, _consumed) = decode_outliers_delta_varint(&encoded).expect("decode");
+        assert_eq!(decoded.len(), outliers.len());
+        for (got, want) in decoded.iter().zip(outliers.iter()) {
+            assert_eq!(got.0, want.0, "index mismatch");
+            assert!(
+                (got.1 - want.1).abs() < 1.5,
+                "value {} vs {}",
+                got.1,
+                want.1
+            );
+        }
     }
-}
 
-/// Phase 5: single-record round-trip (boundary case).
-#[test]
-fn outlier_delta_varint_single_record() {
-    let one = vec![(42u32, 7.0f32)];
-    let enc = encode_outliers_delta_varint(&one);
-    let (dec, _consumed) = decode_outliers_delta_varint(&enc).expect("decode");
-    assert_eq!(dec.len(), 1);
-    assert_eq!(dec[0].0, 42);
-}
+    /// Phase 5: single-record round-trip (boundary case).
+    #[test]
+    fn outlier_delta_varint_single_record() {
+        let one = vec![(42u32, 7.0f32)];
+        let enc = encode_outliers_delta_varint(&one);
+        let (dec, _consumed) = decode_outliers_delta_varint(&enc).expect("decode");
+        assert_eq!(dec.len(), 1);
+        assert_eq!(dec[0].0, 42);
+    }
 
     /// Phase 5: empty input is rejected by the decoder.
     #[test]
@@ -906,7 +933,17 @@ fn outlier_delta_varint_single_record() {
     /// Phase 5: varint primitive round-trips small and large values.
     #[test]
     fn varint_round_trips() {
-        for &v in &[0u64, 1, 127, 128, 255, 16384, 1 << 21, u32::MAX as u64, u64::MAX] {
+        for &v in &[
+            0u64,
+            1,
+            127,
+            128,
+            255,
+            16384,
+            1 << 21,
+            u32::MAX as u64,
+            u64::MAX,
+        ] {
             let mut buf = Vec::new();
             encode_varint(&mut buf, v);
             let (decoded, consumed) = decode_varint(&buf).expect("decode");

@@ -5,32 +5,50 @@ use std::fs;
 use std::io::{BufReader, BufWriter, Read, Seek, Write};
 use std::path::Path;
 
-use grim_format::gguf::{
-    read_gguf, read_tensor_bytes, GgufDType, GgufFile, GgufTensorInfo, GgufValue, GrimFusionOp,
-    GrimLayoutHint, GrimMetadata, GrimRocmlProfile, GrimTrainQuantMode,
+use grim_backend_rocm::{
+    WeightLayout, enforce_attention_precision, is_attention_projection, resolve_weight_layout,
 };
 use grim_format::GgufProvider;
-use grim_quant::{
-    compute_fisher_diagonal, compute_importance_scores,
-    dequant_q4k, dequant_q80, evopress_search, rewrite_tensor_data, EvoPressConfig,
-    FisherCalibrationSample, ImportanceScores, QuantFormat, RewrittenTensorData,
-    TensorRewritePlan,
+use grim_format::gguf::{
+    GgufDType, GgufFile, GgufTensorInfo, GgufValue, GrimFusionOp, GrimLayoutHint, GrimMetadata,
+    GrimRocmlProfile, GrimTrainQuantMode, read_gguf, read_tensor_bytes,
 };
-use grim_backend_rocm::{
-    enforce_attention_precision, is_attention_projection, resolve_weight_layout,
-    WeightLayout,
+use grim_quant::{
+    EvoPressConfig, FisherCalibrationSample, ImportanceScores, QuantFormat, RewrittenTensorData,
+    TensorRewritePlan, compute_fisher_diagonal, compute_importance_scores, dequant_q4k,
+    dequant_q80, evopress_search, rewrite_tensor_data,
 };
 use grim_tensor::provider::TensorProvider;
 use grim_tensor_graph::build_transformer_ir;
 
 const OXIDIZER_VERSION: u32 = 1;
 
-fn open_provider(path: &str) -> Result<(Box<dyn TensorProvider>, Vec<String>, Vec<usize>, GrimMetadata), String> {
+fn open_provider(
+    path: &str,
+) -> Result<
+    (
+        Box<dyn TensorProvider>,
+        Vec<String>,
+        Vec<usize>,
+        GrimMetadata,
+    ),
+    String,
+> {
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".safetensors") || lower.ends_with(".bin") {
-        let provider = grim_format::tprov::SafetensorsProvider::open(path).map_err(|e| e.to_string())?;
+        let provider =
+            grim_format::tprov::SafetensorsProvider::open(path).map_err(|e| e.to_string())?;
         let names: Vec<String> = provider.tensors().keys().cloned().collect();
-        let sizes = names.iter().map(|n| provider.tensors().get(n).map(|i| i.shape().iter().product()).unwrap_or(0)).collect();
+        let sizes = names
+            .iter()
+            .map(|n| {
+                provider
+                    .tensors()
+                    .get(n)
+                    .map(|i| i.shape().iter().product())
+                    .unwrap_or(0)
+            })
+            .collect();
         let mut meta = GrimMetadata::default();
         meta.train_fusion_ops = inferred_fusion_ops(&names);
         meta.rocm_fusion_ops = inferred_fusion_ops(&names);
@@ -38,7 +56,16 @@ fn open_provider(path: &str) -> Result<(Box<dyn TensorProvider>, Vec<String>, Ve
     } else {
         let provider = GgufProvider::open(path).map_err(|e| e.to_string())?;
         let names: Vec<String> = provider.tensors().keys().cloned().collect();
-        let sizes = names.iter().map(|n| provider.tensors().get(n).map(|i| i.shape().iter().product()).unwrap_or(0)).collect();
+        let sizes = names
+            .iter()
+            .map(|n| {
+                provider
+                    .tensors()
+                    .get(n)
+                    .map(|i| i.shape().iter().product())
+                    .unwrap_or(0)
+            })
+            .collect();
         let meta = provider.grim_metadata().clone();
         Ok((Box::new(provider), names, sizes, meta))
     }
@@ -47,7 +74,8 @@ fn open_provider(path: &str) -> Result<(Box<dyn TensorProvider>, Vec<String>, Ve
 pub fn cmd_oxidizer_info(path: &str) -> Result<(), String> {
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".safetensors") || lower.ends_with(".bin") {
-        let provider = grim_format::tprov::SafetensorsProvider::open(path).map_err(|e| e.to_string())?;
+        let provider =
+            grim_format::tprov::SafetensorsProvider::open(path).map_err(|e| e.to_string())?;
         println!("File: {path}");
         println!("Format: safetensors");
         println!("Tensors: {} entries", provider.tensors().len());
@@ -57,7 +85,14 @@ pub fn cmd_oxidizer_info(path: &str) -> Result<(), String> {
     let grim = provider.grim_metadata();
 
     println!("File: {path}");
-    println!("Format: {}", if grim.is_grim() { ".grim (ROCm-optimized)" } else { "plain GGUF" });
+    println!(
+        "Format: {}",
+        if grim.is_grim() {
+            ".grim (ROCm-optimized)"
+        } else {
+            "plain GGUF"
+        }
+    );
     if let Some(magic) = &grim.magic {
         println!("grim.magic: {magic}");
     }
@@ -103,7 +138,10 @@ pub fn cmd_oxidizer_info(path: &str) -> Result<(), String> {
                 .join(", ")
         );
     }
-    println!("grim.quant_overrides: {} entries", grim.quant_overrides.len());
+    println!(
+        "grim.quant_overrides: {} entries",
+        grim.quant_overrides.len()
+    );
     Ok(())
 }
 
@@ -111,13 +149,8 @@ pub fn cmd_oxidizer_info(path: &str) -> Result<(), String> {
 // Calibration batch for Fisher/Hessian diagonal computation
 // ---------------------------------------------------------------------------
 
-/// Holds a batch of calibration samples collected during model forward+backward
-/// passes. Each sample contains input activations and output gradients for one
-/// or more weight tensors.
-///
-/// When `samples` is empty, `build_curvature` falls back to the CPU heuristic
-/// (`build_curvature_proxy`) so there's no regression for users without a
-/// calibrated model.
+/// Holds a batch of calibration samples. Each sample has input activations and
+/// output gradients for weight tensors. Empty samples fall back to CPU heuristic.
 #[derive(Debug, Clone, Default)]
 pub struct CalibrationBatch {
     pub samples: Vec<FisherCalibrationSample>,
@@ -126,7 +159,10 @@ pub struct CalibrationBatch {
 
 impl CalibrationBatch {
     pub fn new(group_size: usize) -> Self {
-        Self { samples: Vec::new(), group_size }
+        Self {
+            samples: Vec::new(),
+            group_size,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -162,7 +198,9 @@ pub fn cmd_oxidizer_calibrate(
         if shape.len() != 2 || shape[0] == 0 || shape[1] == 0 {
             continue;
         }
-        let Ok(tensor) = provider.get(name) else { continue };
+        let Ok(tensor) = provider.get(name) else {
+            continue;
+        };
         if tensor.bytes.len() < shape[0] * shape[1] * 4 {
             continue;
         }
@@ -237,16 +275,18 @@ pub fn cmd_oxidizer_convert(
         .collect::<Vec<usize>>();
     let bitwidths = cmd_oxidizer_search(&importance_scores, &tensor_sizes, target_bpw, generations);
 
-    // Create full bitwidths array for ALL tensors in the model
-    // Tensors with importance scores get their EvoPress bitwidth, others get target_bpw
+    // Create full bitwidths array: scored tensors get EvoPress bitwidth, others get target_bpw.
     let default_bw = target_bpw.round() as u32;
-    let full_bitwidths: Vec<u32> = names.iter().map(|name| {
-        if let Some(idx) = tensor_names.iter().position(|n| n == name) {
-            bitwidths[idx]
-        } else {
-            default_bw
-        }
-    }).collect();
+    let full_bitwidths: Vec<u32> = names
+        .iter()
+        .map(|name| {
+            if let Some(idx) = tensor_names.iter().position(|n| n == name) {
+                bitwidths[idx]
+            } else {
+                default_bw
+            }
+        })
+        .collect();
 
     grim_meta.magic = Some("grim-v1".into());
     grim_meta.quant_version = Some(OXIDIZER_VERSION);
@@ -276,7 +316,11 @@ pub fn cmd_oxidizer_convert(
                 tensor_name: name.clone(),
                 effective_bpw,
                 override_dtype: bitwidth_to_dtype(effective_bpw),
-                importance_score: importance_scores.layer_scores.get(i).copied().unwrap_or(0.0),
+                importance_score: importance_scores
+                    .layer_scores
+                    .get(i)
+                    .copied()
+                    .unwrap_or(0.0),
                 layout_hint,
             }
         })
@@ -292,13 +336,11 @@ pub fn cmd_oxidizer_convert(
         calibration_dataset.as_deref(),
         None,
         Some(full_bitwidths),
-        // Pass the calibrated metadata through — `convert_to_grim` will
-        // preserve `quant_overrides` / `ext_entries` / etc. that carry
-        // per-tensor importance scores and layout hints, and stamp the
-        // grim-v1 identity + ROCm target/gcn fields on top.
+        // Pass calibrated metadata through; convert_to_grim preserves quant_overrides, ext_entries, etc.
         Some(grim_meta),
         None,
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -322,7 +364,8 @@ pub fn cmd_oxidizer_prepare(
     if train {
         grim.train_quant_mode = GrimTrainQuantMode::from_str(format);
         grim.train_fusion_ops = inferred_fusion_ops(&names);
-        grim.quant_method.get_or_insert_with(|| "train-prepare".into());
+        grim.quant_method
+            .get_or_insert_with(|| "train-prepare".into());
     }
     write_grim_file(input_path, output_path, &grim, &HashMap::new())
 }
@@ -356,7 +399,9 @@ fn inferred_fusion_ops(names: &[String]) -> Vec<GrimFusionOp> {
 fn load_importance_scores(path: &str) -> Result<ImportanceScores, String> {
     let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let v: serde_json::Value = serde_json::from_str(&content).map_err(|e| e.to_string())?;
-    let tensors = v["tensors"].as_array().ok_or("invalid cached importance format")?;
+    let tensors = v["tensors"]
+        .as_array()
+        .ok_or("invalid cached importance format")?;
     let names = tensors
         .iter()
         .map(|t| t["name"].as_str().unwrap_or_default().to_string())
@@ -411,14 +456,24 @@ pub fn build_rewritten_tensors(
             suggested_bw
         };
 
-        let Some(target) = quant_format_for_bitwidth(effective_bw) else { continue };
+        let Some(target) = quant_format_for_bitwidth(effective_bw) else {
+            continue;
+        };
 
-        let data = match materialize_f32(&raw.bytes, &raw.shape, provider.tensors().get(name).map(|t| t.dtype)) {
+        let data = match materialize_f32(
+            &raw.bytes,
+            &raw.shape,
+            provider.tensors().get(name).map(|t| t.dtype),
+        ) {
             Ok(data) => data,
             Err(_) => continue,
         };
 
-        let layer_importance = importance_scores.layer_scores.get(index).copied().unwrap_or(1.0);
+        let layer_importance = importance_scores
+            .layer_scores
+            .get(index)
+            .copied()
+            .unwrap_or(1.0);
         let importance = vec![layer_importance; data.len()];
 
         // Fisher diagonal if calibration_batch present, otherwise heuristic proxy
@@ -436,9 +491,10 @@ pub fn build_rewritten_tensors(
             Err(_) => continue,
         };
 
-        // Wavefront-tiled layout for attention projections on ROCm
+        // Wavefront-tiled layout for ROCm attention projections
         if is_attention_projection(name) {
-            let layout = resolve_weight_layout(name, grim_meta, grim_backend_rocm::WavefrontSize::W64);
+            let layout =
+                resolve_weight_layout(name, grim_meta, grim_backend_rocm::WavefrontSize::W64);
             if matches!(layout, WeightLayout::WavefrontTiled { .. }) {
                 let wf_layout = grim_backend_rocm::WavefrontTiledLayout::new(rows, cols, 64);
                 let tiled = wf_layout.tile(&data, rows, cols);
@@ -449,7 +505,13 @@ pub fn build_rewritten_tensors(
                     target,
                     shape: tiled_shape.clone(),
                     importance: Some(vec![layer_importance; tiled.len()]),
-                    curvature: Some(build_curvature(&tiled, layer_importance, nwf * wf, cpad, calibration_batch)),
+                    curvature: Some(build_curvature(
+                        &tiled,
+                        layer_importance,
+                        nwf * wf,
+                        cpad,
+                        calibration_batch,
+                    )),
                 };
                 if let Ok(retiled) = rewrite_tensor_data(&tiled, &tiled_plan) {
                     rewritten_tensor = RewrittenTensorData {
@@ -491,8 +553,7 @@ pub fn cmd_oxidizer_raven(
     grim_meta.quant_method = Some("raven-fp8-repack".into());
     grim_meta.calibration_dataset = calibration_dataset.map(String::from);
 
-    // `build_rewritten_tensors` requires a concrete `&GgufProvider` so it can
-    // `provider.get(name)` on each tensor; re-open under that type here.
+    // Re-open as GgufProvider for build_rewritten_tensors.
     let gguf_provider = GgufProvider::open(model_path).map_err(|e| e.to_string())?;
     let _ = provider; // open_provider already validated the file is a GGUF/.grim
     let rewritten = build_rewritten_tensors(
@@ -506,10 +567,7 @@ pub fn cmd_oxidizer_raven(
     write_grim_file(model_path, output_path, &grim_meta, &rewritten)
 }
 
-/// Computes a curvature representation across all tensor parameters.
-///
-/// Uses true Fisher/GGN diagonal when `calibration_batch` has samples;
-/// otherwise falls back to the heuristic `build_curvature_proxy`.
+/// Compute curvature. Uses Fisher/GGN diagonal when calibration_batch has samples, else heuristic proxy.
 fn build_curvature(
     data: &[f32],
     layer_importance: f32,
@@ -520,11 +578,16 @@ fn build_curvature(
     if calibration_batch.is_empty() {
         return build_curvature_proxy(data, layer_importance);
     }
-    compute_fisher_diagonal(data, &calibration_batch.samples, rows, cols, calibration_batch.group_size)
+    compute_fisher_diagonal(
+        data,
+        &calibration_batch.samples,
+        rows,
+        cols,
+        calibration_batch.group_size,
+    )
 }
 
-/// Fallback: heuristic curvature proxy using activation magnitude as importance proxy.
-/// Used when no calibration data is available.
+/// Fallback: heuristic curvature proxy using activation magnitude when no calibration data.
 fn build_curvature_proxy(data: &[f32], layer_importance: f32) -> Vec<f32> {
     let layer_scale = layer_importance.abs().max(1e-3);
     data.iter()
@@ -540,15 +603,23 @@ fn write_grim_file(
 ) -> Result<(), String> {
     let src = fs::File::open(src_path).map_err(|e| e.to_string())?;
     let mut src_reader = BufReader::new(src);
-    let gguf = read_gguf(BufReader::new(fs::File::open(src_path).map_err(|e| e.to_string())?))
-        .map_err(|e| e.to_string())?;
+    let gguf = read_gguf(BufReader::new(
+        fs::File::open(src_path).map_err(|e| e.to_string())?,
+    ))
+    .map_err(|e| e.to_string())?;
 
     let mut metadata = gguf.metadata.clone();
     metadata.extend(grim_meta.to_gguf_metadata());
 
     let dst = fs::File::create(dst_path).map_err(|e| e.to_string())?;
     let mut writer = BufWriter::new(dst);
-    write_gguf(&mut writer, &gguf, &metadata, rewritten_tensors, &mut src_reader)?;
+    write_gguf(
+        &mut writer,
+        &gguf,
+        &metadata,
+        rewritten_tensors,
+        &mut src_reader,
+    )?;
     writer.flush().map_err(|e| e.to_string())
 }
 
@@ -584,7 +655,9 @@ fn write_gguf<W: Write, R: Read + Seek>(
             name: info.name.clone(),
             dims: info.dims.clone(),
             offset: current_offset,
-            size_bytes: rewritten.map(|r| r.bytes.len() as u64).unwrap_or(info.size_bytes),
+            size_bytes: rewritten
+                .map(|r| r.bytes.len() as u64)
+                .unwrap_or(info.size_bytes),
             dtype,
         };
         current_offset += info.size_bytes;
@@ -594,10 +667,18 @@ fn write_gguf<W: Write, R: Read + Seek>(
         rewritten_infos.push(updated);
     }
 
-    writer.write_all(&0x4655_4747u32.to_le_bytes()).map_err(|e| e.to_string())?;
-    writer.write_all(&gguf.version.to_le_bytes()).map_err(|e| e.to_string())?;
-    writer.write_all(&(rewritten_infos.len() as u64).to_le_bytes()).map_err(|e| e.to_string())?;
-    writer.write_all(&(metadata.len() as u64).to_le_bytes()).map_err(|e| e.to_string())?;
+    writer
+        .write_all(&0x4655_4747u32.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    writer
+        .write_all(&gguf.version.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    writer
+        .write_all(&(rewritten_infos.len() as u64).to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    writer
+        .write_all(&(metadata.len() as u64).to_le_bytes())
+        .map_err(|e| e.to_string())?;
 
     let mut entries = metadata.iter().collect::<Vec<_>>();
     entries.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -609,9 +690,7 @@ fn write_gguf<W: Write, R: Read + Seek>(
         write_tensor_info(writer, tensor)?;
     }
 
-    let bytes_written = header_size
-        + metadata_size
-        + tensor_meta_size;
+    let bytes_written = header_size + metadata_size + tensor_meta_size;
     if data_start > bytes_written {
         writer
             .write_all(&vec![0u8; (data_start - bytes_written) as usize])
@@ -628,7 +707,10 @@ fn write_gguf<W: Write, R: Read + Seek>(
         let expected_end = data_start + dst_info.offset + dst_info.size_bytes;
         let actual_end = data_start + dst_info.offset + bytes.len() as u64;
         if actual_end != expected_end {
-            return Err(format!("tensor '{}' size mismatch while writing .grim", dst_info.name));
+            return Err(format!(
+                "tensor '{}' size mismatch while writing .grim",
+                dst_info.name
+            ));
         }
     }
     Ok(())
@@ -658,15 +740,23 @@ fn gguf_dtype_for_quant_format(format: QuantFormat) -> Result<GgufDType, String>
         QuantFormat::Iq2Xxs => Ok(GgufDType::IQ2_XXS),
         QuantFormat::Iq2Xs => Ok(GgufDType::IQ2_XS),
         QuantFormat::Iq2S => Ok(GgufDType::IQ2_S),
-        QuantFormat::Fp4 | QuantFormat::Nf4 | QuantFormat::Fp8 | QuantFormat::Fp4Block16 | QuantFormat::Fp8Block16 => {
-            Err(format!("quantization format {:?} is not supported in GGUF writer", format))
-        }
+        QuantFormat::Fp4
+        | QuantFormat::Nf4
+        | QuantFormat::Fp8
+        | QuantFormat::Fp4Block16
+        | QuantFormat::Fp8Block16 => Err(format!(
+            "quantization format {:?} is not supported in GGUF writer",
+            format
+        )),
     }
 }
 
-
 #[allow(dead_code)] // benchmark helper
-fn materialize_f32(bytes: &[u8], shape: &[usize], source_dtype: Option<GgufDType>) -> Result<Vec<f32>, String> {
+fn materialize_f32(
+    bytes: &[u8],
+    shape: &[usize],
+    source_dtype: Option<GgufDType>,
+) -> Result<Vec<f32>, String> {
     let elem_count = shape.iter().product::<usize>();
     match source_dtype.unwrap_or(GgufDType::F32) {
         GgufDType::F32 => Ok(bytes
@@ -678,14 +768,27 @@ fn materialize_f32(bytes: &[u8], shape: &[usize], source_dtype: Option<GgufDType
         GgufDType::Q4K | GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 => {
             dequant_q4k(bytes, elem_count).map_err(|e| e.to_string())
         }
-        GgufDType::IQ4_NL => grim_quant::dequant_iq4nl(bytes, elem_count).map_err(|e| e.to_string()),
-        GgufDType::IQ4_XS => grim_quant::dequant_iq4xs(bytes, elem_count).map_err(|e| e.to_string()),
-        GgufDType::IQ3_XXS => grim_quant::dequant_iq3xxs(bytes, elem_count).map_err(|e| e.to_string()),
+        GgufDType::IQ4_NL => {
+            grim_quant::dequant_iq4nl(bytes, elem_count).map_err(|e| e.to_string())
+        }
+        GgufDType::IQ4_XS => {
+            grim_quant::dequant_iq4xs(bytes, elem_count).map_err(|e| e.to_string())
+        }
+        GgufDType::IQ3_XXS => {
+            grim_quant::dequant_iq3xxs(bytes, elem_count).map_err(|e| e.to_string())
+        }
         GgufDType::IQ3_S => grim_quant::dequant_iq3s(bytes, elem_count).map_err(|e| e.to_string()),
-        GgufDType::IQ2_XXS => grim_quant::dequant_iq2xxs(bytes, elem_count).map_err(|e| e.to_string()),
-        GgufDType::IQ2_XS => grim_quant::dequant_iq2xs(bytes, elem_count).map_err(|e| e.to_string()),
+        GgufDType::IQ2_XXS => {
+            grim_quant::dequant_iq2xxs(bytes, elem_count).map_err(|e| e.to_string())
+        }
+        GgufDType::IQ2_XS => {
+            grim_quant::dequant_iq2xs(bytes, elem_count).map_err(|e| e.to_string())
+        }
         GgufDType::IQ2_S => grim_quant::dequant_iq2s(bytes, elem_count).map_err(|e| e.to_string()),
-        _ => Err(format!("unsupported source dtype for Pass 4 materialization: {:?}", source_dtype)),
+        _ => Err(format!(
+            "unsupported source dtype for Pass 4 materialization: {:?}",
+            source_dtype
+        )),
     }
 }
 
@@ -695,12 +798,16 @@ fn write_tensor_info<W: Write>(writer: &mut W, tensor: &GgufTensorInfo) -> Resul
         .write_all(&(tensor.dims.len() as u32).to_le_bytes())
         .map_err(|e| e.to_string())?;
     for dim in &tensor.dims {
-        writer.write_all(&dim.to_le_bytes()).map_err(|e| e.to_string())?;
+        writer
+            .write_all(&dim.to_le_bytes())
+            .map_err(|e| e.to_string())?;
     }
     writer
         .write_all(&(tensor.dtype as u32).to_le_bytes())
         .map_err(|e| e.to_string())?;
-    writer.write_all(&tensor.offset.to_le_bytes()).map_err(|e| e.to_string())
+    writer
+        .write_all(&tensor.offset.to_le_bytes())
+        .map_err(|e| e.to_string())
 }
 
 fn write_string<W: Write>(writer: &mut W, value: &str) -> Result<(), String> {
@@ -713,17 +820,31 @@ fn write_string<W: Write>(writer: &mut W, value: &str) -> Result<(), String> {
 fn write_value_raw<W: Write>(writer: &mut W, value: &GgufValue) -> Result<(), String> {
     match value {
         GgufValue::Uint8(v) => writer.write_all(&[*v]).map_err(|e| e.to_string()),
-        GgufValue::Int8(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
-        GgufValue::Uint16(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
-        GgufValue::Int16(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
-        GgufValue::Uint32(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
-        GgufValue::Int32(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
-        GgufValue::Float32(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
+        GgufValue::Int8(v) => writer
+            .write_all(&v.to_le_bytes())
+            .map_err(|e| e.to_string()),
+        GgufValue::Uint16(v) => writer
+            .write_all(&v.to_le_bytes())
+            .map_err(|e| e.to_string()),
+        GgufValue::Int16(v) => writer
+            .write_all(&v.to_le_bytes())
+            .map_err(|e| e.to_string()),
+        GgufValue::Uint32(v) => writer
+            .write_all(&v.to_le_bytes())
+            .map_err(|e| e.to_string()),
+        GgufValue::Int32(v) => writer
+            .write_all(&v.to_le_bytes())
+            .map_err(|e| e.to_string()),
+        GgufValue::Float32(v) => writer
+            .write_all(&v.to_le_bytes())
+            .map_err(|e| e.to_string()),
         GgufValue::Bool(v) => writer.write_all(&[*v as u8]).map_err(|e| e.to_string()),
         GgufValue::String(v) => write_string(writer, v),
         GgufValue::Array(values) => {
             let type_tag = values.first().map(value_type_tag).unwrap_or(8);
-            writer.write_all(&type_tag.to_le_bytes()).map_err(|e| e.to_string())?;
+            writer
+                .write_all(&type_tag.to_le_bytes())
+                .map_err(|e| e.to_string())?;
             writer
                 .write_all(&(values.len() as u64).to_le_bytes())
                 .map_err(|e| e.to_string())?;
@@ -732,15 +853,23 @@ fn write_value_raw<W: Write>(writer: &mut W, value: &GgufValue) -> Result<(), St
             }
             Ok(())
         }
-        GgufValue::Uint64(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
-        GgufValue::Int64(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
-        GgufValue::Float64(v) => writer.write_all(&v.to_le_bytes()).map_err(|e| e.to_string()),
+        GgufValue::Uint64(v) => writer
+            .write_all(&v.to_le_bytes())
+            .map_err(|e| e.to_string()),
+        GgufValue::Int64(v) => writer
+            .write_all(&v.to_le_bytes())
+            .map_err(|e| e.to_string()),
+        GgufValue::Float64(v) => writer
+            .write_all(&v.to_le_bytes())
+            .map_err(|e| e.to_string()),
     }
 }
 
 fn write_value<W: Write>(writer: &mut W, value: &GgufValue) -> Result<(), String> {
     let tag = value_type_tag(value);
-    writer.write_all(&tag.to_le_bytes()).map_err(|e| e.to_string())?;
+    writer
+        .write_all(&tag.to_le_bytes())
+        .map_err(|e| e.to_string())?;
     write_value_raw(writer, value)
 }
 
@@ -879,14 +1008,26 @@ mod tests {
 
         let file = fs::File::create(&output).unwrap();
         let mut writer = BufWriter::new(file);
-        write_gguf(&mut writer, &gguf, &gguf.metadata, &rewritten_tensors, &mut src_reader).unwrap();
+        write_gguf(
+            &mut writer,
+            &gguf,
+            &gguf.metadata,
+            &rewritten_tensors,
+            &mut src_reader,
+        )
+        .unwrap();
         writer.flush().unwrap();
 
         let rewritten_file = read_gguf(BufReader::new(fs::File::open(&output).unwrap())).unwrap();
         assert_eq!(rewritten_file.tensors[0].dtype, GgufDType::Q8_0);
 
         let mut rewritten_reader = BufReader::new(fs::File::open(&output).unwrap());
-        let rewritten_bytes = read_tensor_bytes(&mut rewritten_reader, &rewritten_file, &rewritten_file.tensors[0]).unwrap();
+        let rewritten_bytes = read_tensor_bytes(
+            &mut rewritten_reader,
+            &rewritten_file,
+            &rewritten_file.tensors[0],
+        )
+        .unwrap();
         assert_eq!(rewritten_bytes, rewritten.bytes);
     }
 
@@ -911,7 +1052,13 @@ mod tests {
         let mut src = BufReader::new(std::io::Cursor::new(vec![0u8; 128]));
         let file = fs::File::create(path).map_err(|e| e.to_string())?;
         let mut writer = BufWriter::new(file);
-        write_gguf(&mut writer, &gguf, &gguf.metadata, &HashMap::new(), &mut src)?;
+        write_gguf(
+            &mut writer,
+            &gguf,
+            &gguf.metadata,
+            &HashMap::new(),
+            &mut src,
+        )?;
         writer.flush().map_err(|e| e.to_string())
     }
 }

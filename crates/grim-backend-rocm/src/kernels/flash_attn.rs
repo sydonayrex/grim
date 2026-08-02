@@ -1,13 +1,6 @@
 //! FlashAttention / paged-attention HIP kernel (WI-R5).
-//!
-//! Fused attention: Q @ K^T → softmax → @ V, all in one kernel pass.
-//! Supports causal mask, GQA head-sharing, and paged KV-cache blocks.
-//! Wave64 mandate on RDNA2+ hardware.
 
 /// HIP source for `grim_flash_attention` — forward pass with online softmax.
-///
-/// Layout: one block handles one (seq_len_q, num_heads) pair.
-/// Each thread computes one query position's attention over all key positions.
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 

@@ -1,29 +1,8 @@
-//! Phase-3 §3.3 — fp8/int8 quantization arch gate + dispatch.
-//!
-//! This module is the **head** of §3.3 (the fp8 arch gate): the static
-//! classification of an arch string to its native quantization
-//! capabilities, plus a `resolve_quant_mode` dispatch that *never*
-//! silently runs emulated fp8 on RDNA2/3.
-//!
-//! The matmul kernel plumbing (hipBLASLt scale-pointers, scaled-MFMA
-//! intrinsics, paged attention path) is a larger surface reserved for
-//! follow-up work; this module is the precondition those depend on.
-//!
-//! Skill attribution:
-//! - `rocm-quantization-inference` — fp8 dtype ladder, per-arch gating,
-//!   hipBLASLt scale-pointers integration ahead.
-//! - `rust-gpu-discipline` §2 #12 — emulated fp8 on RDNA2/3 is a
-//!   *silent regression*; never let the kernel run silently.
-//! - `rust-ml-llm-architecture` — backend isolation: the gate lives in
-//!   the ROCm crate, not in core.
+//! Phase-3 §3.3 — fp8/int8 quantization arch gate + dispatch. [see: `resolve_quant_mode`, `rocm-quantization-inference`]
 
 use std::fmt;
 
-/// Canonical coarse-grained arch bin. The ROCm nightly headers stamp
-/// every GPU with a long `gcnArchName` string like `"gfx1036"` (with
-/// optional revision `:N`). We bucket those into the seven bins the
-/// spec names: RDNA1/RDNA2/RDNA3/RDNA4 (consumer) and CDNA1/CDNA2/CDNA3
-/// (data center); unrecognised strings fall through as `Other`.
+/// Canonical coarse-grained arch bin. The ROCm nightly headers stamp [see: `gcnArchName`, `"gfx1036"`, `:N`, `Other`]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum GcnArch {
     /// RDNA1 — gfx10xx around 5010-1012 (very old consumer).
@@ -42,15 +21,7 @@ pub enum GcnArch {
     Other,
 }
 
-/// Bucket an `hipGetDeviceProperties::gcnArchName` value into a coarse
-/// `GcnArch`. Revision suffixes (`":N"`) are tolerated and ignored.
-///
-/// Parse scheme: take the leading digits after `gfx` (e.g. `gfx1200`,
-/// `gfx1035`, `gfx1101`, `gfx908`) and read the *first one or two* as
-/// the major version. We don't try to be a full parser — the coarse
-/// floor is what matters for the capability gate. RDNA4 = `gfx12xx`,
-/// RDNA3 = `gfx11xx`, RDNA2 = `gfx10xx` (the modern triple), plus
-/// CDNA1/2/3 for data-center arches.
+/// Bucket an `hipGetDeviceProperties::gcnArchName` value into a coarse [see: `GcnArch`, `":N"`, `gfx`, `gfx1200`]
 pub fn gcn_arch(name: &str) -> GcnArch {
     // Strip the optional `:N` revision suffix.
     let raw = name.split(':').next().unwrap_or(name);
@@ -59,13 +30,10 @@ pub fn gcn_arch(name: &str) -> GcnArch {
     }
     let suffix = &raw[3..];
     // Compile-time confidence: infer the family from the leading
-    // 1-2 digits of the suffix. We accept "5", "12", "1200" etc.
-    // RDNA2 family (gfx10xx, including gfx101x-1012 RDNA1).
     if let Some(s) = strip_prefix_digits(suffix, "10") {
         return match s.chars().next().map(|c| c.to_digit(10)) {
             Some(Some(2..)) => {
                 // gfx102x..gfx1099 are RDNA2 (van Gogh 1035, 1036, etc.).
-                // gfx100x..gfx101x are RDNA1.
                 if s.chars().next().and_then(|c| c.to_digit(10)) >= Some(2) {
                     GcnArch::RDNA2
                 } else {
@@ -84,11 +52,14 @@ pub fn gcn_arch(name: &str) -> GcnArch {
     }
     if let Some(s) = strip_prefix_digits(suffix, "9") {
         // gfx908/MI200 = CDNA2, gfx940-941-942 = CDNA3.
-        // Other gfx9xx fall under Other.
         return match s {
             r if r.starts_with("08") => GcnArch::CDNA2,
-            r if r.starts_with("40") || r.starts_with("41") || r.starts_with("42")
-                || r.starts_with("43") || r.starts_with("44") || r.starts_with("50") =>
+            r if r.starts_with("40")
+                || r.starts_with("41")
+                || r.starts_with("42")
+                || r.starts_with("43")
+                || r.starts_with("44")
+                || r.starts_with("50") =>
             {
                 GcnArch::CDNA3
             }
@@ -108,7 +79,6 @@ fn strip_prefix_digits<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 
 fn family_rna3(s: &str) -> GcnArch {
     // Everything of form gfx11xx is RDNA3 in our coarse model. We do
-    // not split RDNA3.0 vs 3.5; both share the F16/BF16 mix and lack fp8.
     if s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty() {
         GcnArch::RDNA3
     } else {
@@ -141,9 +111,7 @@ pub enum QuantMode {
     MxFp8Emulated,
 }
 
-/// Per-arch capability bitmap. The struct is the *output* of the gate;
-/// callers ask `capability.supports(mode)` and get a Yes/No without
-/// having to know the arch.
+/// Per-arch capability bitmap. The struct is the *output* of the gate; [see: `capability.supports(mode)`]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct QuantCapability {
     fp32: bool,
@@ -172,7 +140,12 @@ impl fmt::Display for QuantCapability {
         write!(
             f,
             "fp32={} f16={} bf16={} fp8_native={} mxfp4_emulated={} mxfp8_emulated={}",
-            self.fp32, self.f16, self.bf16, self.fp8_native, self.mxfp4_emulated, self.mxfp8_emulated
+            self.fp32,
+            self.f16,
+            self.bf16,
+            self.fp8_native,
+            self.mxfp4_emulated,
+            self.mxfp8_emulated
         )
     }
 }
@@ -208,7 +181,6 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
 }
 
 /// Resolve the runtime `QuantMode` for a running arch given a model's
-/// *requested* mode.
 pub fn resolve_quant_mode(arch: GcnArch, requested: QuantMode) -> QuantMode {
     let caps = arch_capability(arch);
     if caps.supports(requested) {
@@ -251,19 +223,44 @@ mod self_tests {
     fn fp8_capable_buckets_match_spec() {
         for arch in [GcnArch::RDNA4, GcnArch::CDNA3] {
             let c = arch_capability(arch);
-            assert!(c.supports(QuantMode::Fp8Native), "{:?}: fp8_native expected", arch);
+            assert!(
+                c.supports(QuantMode::Fp8Native),
+                "{:?}: fp8_native expected",
+                arch
+            );
         }
-        for arch in [GcnArch::RDNA1, GcnArch::RDNA2, GcnArch::RDNA3, GcnArch::CDNA2, GcnArch::Other] {
+        for arch in [
+            GcnArch::RDNA1,
+            GcnArch::RDNA2,
+            GcnArch::RDNA3,
+            GcnArch::CDNA2,
+            GcnArch::Other,
+        ] {
             let c = arch_capability(arch);
-            assert!(!c.supports(QuantMode::Fp8Native), "{:?}: fp8_native must NOT be supported", arch);
+            assert!(
+                !c.supports(QuantMode::Fp8Native),
+                "{:?}: fp8_native must NOT be supported",
+                arch
+            );
         }
     }
 
     #[test]
     fn rook_and_jackdaw_allowed_on_rdna2_and_rdna3() {
-        for arch in [GcnArch::RDNA2, GcnArch::RDNA3, GcnArch::RDNA4, GcnArch::CDNA3] {
-            assert_eq!(resolve_quant_mode(arch, QuantMode::MxFp4Emulated), QuantMode::MxFp4Emulated);
-            assert_eq!(resolve_quant_mode(arch, QuantMode::MxFp8Emulated), QuantMode::MxFp8Emulated);
+        for arch in [
+            GcnArch::RDNA2,
+            GcnArch::RDNA3,
+            GcnArch::RDNA4,
+            GcnArch::CDNA3,
+        ] {
+            assert_eq!(
+                resolve_quant_mode(arch, QuantMode::MxFp4Emulated),
+                QuantMode::MxFp4Emulated
+            );
+            assert_eq!(
+                resolve_quant_mode(arch, QuantMode::MxFp8Emulated),
+                QuantMode::MxFp8Emulated
+            );
         }
     }
 }

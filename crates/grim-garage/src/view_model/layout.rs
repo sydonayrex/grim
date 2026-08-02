@@ -1,16 +1,16 @@
-//! Top-level dashboard layout — the column/row grid that the CVKG window
+//! Top-level dashboard layout — the column/row grid that the window
 //! renders into. Kept as data so renderers can read it without depending
-//! on any CVKG-widget-specific knowledge (e.g. `MjolnirFrame`).
+//! on any UI-framework-specific layout types.
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnSpec {
-    /// Stable id for the column; used as the CVKG `BifrostTab` group key.
+    /// Stable id for the column; used as the tab group key.
     pub id: String,
     /// Header label shown above the column.
     pub header: String,
-    /// Width in cvkg `Fraction` units (0..=1).
+    /// Width in layout fraction units (0..=1).
     pub fraction: f32,
 }
 

@@ -155,7 +155,12 @@ mod tests {
         let ab = merge_partials(&a, &b);
         let ba = merge_partials(&b, &a);
         assert!((ab.max - ba.max).abs() < 1e-6);
-        assert!((ab.sum - ba.sum).abs() < 1e-5, "sum differs: {} vs {}", ab.sum, ba.sum);
+        assert!(
+            (ab.sum - ba.sum).abs() < 1e-5,
+            "sum differs: {} vs {}",
+            ab.sum,
+            ba.sum
+        );
         for d in 0..2 {
             assert!((ab.acc[d] - ba.acc[d]).abs() < 1e-5, "acc[{d}] differs");
         }
@@ -172,7 +177,10 @@ mod tests {
         let right = merge_partials(&a, &merge_partials(&b, &c));
         assert!((left.sum - right.sum).abs() < 1e-5, "associativity: sum");
         for d in 0..2 {
-            assert!((left.acc[d] - right.acc[d]).abs() < 1e-5, "associativity: acc[{d}]");
+            assert!(
+                (left.acc[d] - right.acc[d]).abs() < 1e-5,
+                "associativity: acc[{d}]"
+            );
         }
     }
 
@@ -220,7 +228,10 @@ mod tests {
         let abs = (got - want).abs();
         let denom = want.abs().max(1e-7);
         assert!(got.is_finite(), "{ctx}: non-finite {got:?} (want {want:?})");
-        assert!(abs == 0.0 || (abs / denom) < 1e-5, "{ctx}: got {got:?} want {want:?} (abs={abs})");
+        assert!(
+            abs == 0.0 || (abs / denom) < 1e-5,
+            "{ctx}: got {got:?} want {want:?} (abs={abs})"
+        );
     }
 
     #[test]
@@ -232,7 +243,10 @@ mod tests {
         let scale_a = (0.0f32 - new_max).exp();
         let scale_b = (1.0f32 - new_max).exp();
         let want_sum = 1.0 * scale_a + 3.0 * scale_b;
-        let want_acc = [1.0 * scale_a + 0.5 * scale_b, 2.0 * scale_a + 0.25 * scale_b];
+        let want_acc = [
+            1.0 * scale_a + 0.5 * scale_b,
+            2.0 * scale_a + 0.25 * scale_b,
+        ];
         close(m.max, new_max, "golden max");
         close(m.sum, want_sum, "golden sum");
         close(m.acc[0], want_acc[0], "golden acc[0]");
@@ -251,7 +265,11 @@ mod tests {
         close(m.sum, 1.0 * scale_a + 1.0 * scale_b, "rescale sum");
         close(m.acc[0], 1000.0 * scale_a + 1.0 * scale_b, "rescale acc[0]");
         close(m.acc[1], 2000.0 * scale_a + 2.0 * scale_b, "rescale acc[1]");
-        assert!(m.acc[0] < 10.0, "a's large acc must be rescaled away: {}", m.acc[0]);
+        assert!(
+            m.acc[0] < 10.0,
+            "a's large acc must be rescaled away: {}",
+            m.acc[0]
+        );
     }
 
     #[test]

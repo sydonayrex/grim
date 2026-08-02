@@ -1,31 +1,25 @@
 //! Build script for the Vulkan backend.
 //!
-//! At compile time this script compiles every GLSL compute kernel to real SPIR-V
-//! using `glslangValidator -V` (the same tool documented in `radv_repro.rs`).
-//! The resulting `.spv` blobs are embedded into the crate at compile time via
-//! `include_bytes!`, so `spirv_for()` returns genuine SPIR-V with no
-//! runtime dependency on an external compiler.
-//!
-//! All kernels share a single `push_constant` `Params` block so the pipeline
-//! layout stays uniform across every entry point. Dynamic per-dispatch values
-//! (element count, inner dimension, matmul K, etc.) are supplied via push
-//! constants instead of being baked into the shader source.
+//! Compiles every GLSL compute kernel to SPIR-V via `glslangValidator` at
+//! compile time. The `.spv` blobs are embedded into the crate via
+//! `include_bytes!`, so `spirv_for()` returns genuine SPIR-V with no runtime
+//! dependency on an external compiler. All kernels share a single
+//! `push_constant` `Params` block, with dynamic dispatch values supplied via
+//! push constants rather than baked into shader source.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Load a kernel source file. The kernel .comp file already contains
-/// its own #version and PARAMS_GLSL block, so we use it as-is.
+/// Load a kernel source file as-is (already contains `#version` and `PARAMS_GLSL`).
 fn load_kernel(name: &str) -> String {
     let path = PathBuf::from("kernels").join(format!("{name}.comp"));
     std::fs::read_to_string(&path)
         .unwrap_or_else(|_| panic!("Failed to read kernel source: {}", path.display()))
 }
 
-/// (kernel name, glsl source). The name is used for the `.comp`/`.spv` file
-/// and the generated `include_bytes!` constant.
+/// (kernel name, glsl source) used for `.comp`/`.spv` files and `include_bytes!` constants.
 fn kernels() -> Vec<(&'static str, String)> {
-vec![
+    vec![
         ("add", load_kernel("add")),
         ("mul", load_kernel("mul")),
         ("silu_mul", load_kernel("silu_mul")),
@@ -34,11 +28,33 @@ vec![
         ("embedding", load_kernel("embedding")),
         ("matmul_32", load_kernel("matmul_tile_32")),
         ("matmul_64", load_kernel("matmul_tile_64")),
+        ("matmul_64_bf16", load_kernel("matmul_tile_64_bf16")),
         ("qkv_attention", load_kernel("qkv_attention")),
         ("mul_scalar", load_kernel("mul_scalar")),
         ("sqrt", load_kernel("sqrt")),
         ("recip", load_kernel("recip")),
         ("rope", load_kernel("rope")),
+        (
+            "fused_dequant_gemm_q4k",
+            load_kernel("fused_dequant_gemm_q4k"),
+        ),
+        (
+            "fused_dequant_gemm_q8_0",
+            load_kernel("fused_dequant_gemm_q8_0"),
+        ),
+        ("kv_dequant_attention", load_kernel("kv_dequant_attention")),
+        ("selective_scan", load_kernel("selective_scan")),
+        ("qkv_attention_paged", load_kernel("qkv_attention_paged")),
+        ("flash_attention", load_kernel("flash_attention")),
+        ("silu_mul_backward", load_kernel("silu_mul_backward")),
+        (
+            "quantized_matmul_backward_dx",
+            load_kernel("quantized_matmul_backward_dx"),
+        ),
+        ("rwkv_time_mix", load_kernel("rwkv_time_mix")),
+        ("rwkv_channel_mix", load_kernel("rwkv_channel_mix")),
+        ("all_reduce", load_kernel("all_reduce")),
+        ("comm_fuse_reduce", load_kernel("comm_fuse_reduce")),
     ]
 }
 
@@ -53,18 +69,29 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/embedding.comp");
     println!("cargo:rerun-if-changed=kernels/matmul_tile_32.comp");
     println!("cargo:rerun-if-changed=kernels/matmul_tile_64.comp");
+    println!("cargo:rerun-if-changed=kernels/matmul_tile_64_bf16.comp");
     println!("cargo:rerun-if-changed=kernels/qkv_attention.comp");
     println!("cargo:rerun-if-changed=kernels/mul_scalar.comp");
     println!("cargo:rerun-if-changed=kernels/sqrt.comp");
     println!("cargo:rerun-if-changed=kernels/recip.comp");
     println!("cargo:rerun-if-changed=kernels/rope.comp");
-println!("cargo:rerun-if-changed=kernels/matmul_tile_32_bf16.comp");
-println!("cargo:rerun-if-changed=kernels/matmul_tile_64_bf16.comp");
+    println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_q4k.comp");
+    println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_q8_0.comp");
+    println!("cargo:rerun-if-changed=kernels/kv_dequant_attention.comp");
+    println!("cargo:rerun-if-changed=kernels/selective_scan.comp");
+    println!("cargo:rerun-if-changed=kernels/qkv_attention_paged.comp");
+    println!("cargo:rerun-if-changed=kernels/flash_attention.comp");
+    println!("cargo:rerun-if-changed=kernels/silu_mul_backward.comp");
+    println!("cargo:rerun-if-changed=kernels/quantized_matmul_backward_dx.comp");
+    println!("cargo:rerun-if-changed=kernels/rwkv_time_mix.comp");
+    println!("cargo:rerun-if-changed=kernels/rwkv_channel_mix.comp");
+    println!("cargo:rerun-if-changed=kernels/all_reduce.comp");
+    println!("cargo:rerun-if-changed=kernels/comm_fuse_reduce.comp");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
 
-    let validator = std::env::var("GLSLANG_VALIDATOR")
-        .unwrap_or_else(|_| "glslangValidator".to_string());
+    let validator =
+        std::env::var("GLSLANG_VALIDATOR").unwrap_or_else(|_| "glslangValidator".to_string());
 
     let mut gen_code = String::new();
     gen_code.push_str("// @generated by build.rs — do not edit.\n");
@@ -112,7 +139,7 @@ println!("cargo:rerun-if-changed=kernels/matmul_tile_64_bf16.comp");
     std::fs::write(&gen_path, gen_code).expect("write generated spirv module");
 
     if any_failed {
-        // Surface a clear error so the failure is not silently swallowed.
+        /// Surface a clear error so compilation failure is not silently swallowed.
         panic!(
             "build.rs: one or more Vulkan kernels failed to compile to SPIR-V. \
              Ensure `glslangValidator` is installed and on PATH (or set GLSLANG_VALIDATOR)."

@@ -16,7 +16,9 @@ impl Shape {
     }
 
     pub fn from_slice(dims: &[usize]) -> Self {
-        Self { dims: dims.to_vec() }
+        Self {
+            dims: dims.to_vec(),
+        }
     }
 
     pub fn dims(&self) -> &[usize] {
@@ -32,10 +34,9 @@ impl Shape {
     }
 
     pub fn dim(&self, axis: usize) -> Result<usize> {
-        self.dims
-            .get(axis)
-            .copied()
-            .ok_or_else(|| Error::IndexOutOfBounds(format!("axis {axis} out of rank {}", self.rank())))
+        self.dims.get(axis).copied().ok_or_else(|| {
+            Error::IndexOutOfBounds(format!("axis {axis} out of rank {}", self.rank()))
+        })
     }
 
     /// Return a new shape with `axis` removed.

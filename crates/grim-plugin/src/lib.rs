@@ -20,9 +20,9 @@ pub use arch_compat::ArchCompatSpec;
 pub use dylib_loader::DylibPluginLoader;
 pub use wasm_loader::WasmPluginLoader;
 
+use grim_tensor::error::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use grim_tensor::error::Result;
 
 // Re-export Sampler trait for plugin integration
 pub use grim_core::sampler::Sampler;
@@ -65,7 +65,8 @@ pub struct GrimPluginVTable {
     pub name: extern "C" fn() -> *const std::os::raw::c_char,
     pub capabilities: extern "C" fn() -> PluginCapabilities,
     pub init: extern "C" fn(ctx: *mut std::os::raw::c_void) -> i32,
-    pub model_factory: Option<extern "C" fn(cfg: *const std::os::raw::c_char) -> *mut std::os::raw::c_void>,
+    pub model_factory:
+        Option<extern "C" fn(cfg: *const std::os::raw::c_char) -> *mut std::os::raw::c_void>,
     pub sampler_factory: Option<extern "C" fn() -> *mut std::os::raw::c_void>,
     pub teardown: extern "C" fn(),
 }
@@ -125,9 +126,9 @@ impl Default for PluginLimits {
 
 /// Parse a `plugin.grim.toml` manifest.
 pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest> {
-    let value: toml::Value = toml_text
-        .parse()
-        .map_err(|e: toml::de::Error| grim_tensor::Error::Backend(format!("manifest parse: {e}")))?;
+    let value: toml::Value = toml_text.parse().map_err(|e: toml::de::Error| {
+        grim_tensor::Error::Backend(format!("manifest parse: {e}"))
+    })?;
     let tbl = value
         .as_table()
         .ok_or_else(|| grim_tensor::Error::Backend("manifest must be a TOML table".into()))?;
@@ -182,16 +183,32 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest> {
         .unwrap_or("")
         .to_string();
 
-    let stage = plugin.get("stage").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let priority = plugin.get("priority").and_then(|v| v.as_integer()).map(|v| v as i32);
+    let stage = plugin
+        .get("stage")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let priority = plugin
+        .get("priority")
+        .and_then(|v| v.as_integer())
+        .map(|v| v as i32);
 
     // Parse limits if present
     let limits = plugin.get("limits").and_then(|limits_tbl| {
         let lt = limits_tbl.as_table()?;
         Some(PluginLimits {
-            fuel_per_invocation: lt.get("fuel_per_invocation").and_then(|v| v.as_integer()).map(|v| v as u64)
-                .or_else(|| lt.get("fuel").and_then(|v| v.as_integer()).map(|v| v as u64)),
-            max_memory_mb: lt.get("max_memory_mb").and_then(|v| v.as_integer()).map(|v| v as u32),
+            fuel_per_invocation: lt
+                .get("fuel_per_invocation")
+                .and_then(|v| v.as_integer())
+                .map(|v| v as u64)
+                .or_else(|| {
+                    lt.get("fuel")
+                        .and_then(|v| v.as_integer())
+                        .map(|v| v as u64)
+                }),
+            max_memory_mb: lt
+                .get("max_memory_mb")
+                .and_then(|v| v.as_integer())
+                .map(|v| v as u32),
         })
     });
 
@@ -200,11 +217,20 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest> {
     if let Some(plugin_tbl) = tbl.get("plugin").and_then(|p| p.as_table()) {
         if let Some(grants_val) = plugin_tbl.get("grants") {
             if let Some(grants_tbl) = grants_val.as_table() {
-                grants.network = grants_tbl.get("network").and_then(|v| v.as_bool()).unwrap_or(false);
+                grants.network = grants_tbl
+                    .get("network")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if let Some(fs_arr) = grants_tbl.get("filesystem").and_then(|v| v.as_array()) {
-                    grants.filesystem = fs_arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                    grants.filesystem = fs_arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
                 }
-                grants.request_metadata = grants_tbl.get("request_metadata").and_then(|v| v.as_bool()).unwrap_or(false);
+                grants.request_metadata = grants_tbl
+                    .get("request_metadata")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
             }
         }
     }
@@ -213,7 +239,10 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest> {
     let mut reload = PluginReload::default();
     if let Some(reload_val) = tbl.get("plugin").and_then(|p| p.get("reload")) {
         if let Some(reload_tbl) = reload_val.as_table() {
-            let hot = reload_tbl.get("hot_reload").and_then(|v| v.as_bool()).unwrap_or(false);
+            let hot = reload_tbl
+                .get("hot_reload")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if kind == PluginKind::Wasm {
                 reload.hot_reload = hot;
             } else {
@@ -293,7 +322,8 @@ impl PluginRegistry {
             }
             self.processor_chain.push(manifest.clone());
             // Maintain sorted priority order
-            self.processor_chain.sort_by_key(|p| p.priority.unwrap_or(0));
+            self.processor_chain
+                .sort_by_key(|p| p.priority.unwrap_or(0));
         }
 
         let name = manifest.name.clone();
@@ -318,15 +348,21 @@ impl PluginRegistry {
             return Ok(());
         }
         println!("[Plugin System] Scanning directory for plugins: {:?}", dir);
-        for entry in std::fs::read_dir(dir).map_err(|e| grim_tensor::Error::Backend(format!("read_dir failed: {e}")))? {
-            let entry = entry.map_err(|e| grim_tensor::Error::Backend(format!("entry failed: {e}")))?;
+        for entry in std::fs::read_dir(dir)
+            .map_err(|e| grim_tensor::Error::Backend(format!("read_dir failed: {e}")))?
+        {
+            let entry =
+                entry.map_err(|e| grim_tensor::Error::Backend(format!("entry failed: {e}")))?;
             let p = entry.path();
             if p.is_dir() {
                 let manifest_path = p.join("plugin.grim.toml");
                 if manifest_path.exists() {
                     if let Ok(toml_content) = std::fs::read_to_string(&manifest_path) {
                         if let Ok(manifest) = parse_manifest(&toml_content) {
-                            println!("[Plugin System] Discovered plugin: {} ({:?})", manifest.name, manifest.kind);
+                            println!(
+                                "[Plugin System] Discovered plugin: {} ({:?})",
+                                manifest.name, manifest.kind
+                            );
                             self.register_manifest(manifest)?;
                         }
                     }
@@ -400,7 +436,9 @@ max_memory_mb = 64
             fn sample(&self, _logits: &grim_tensor::Tensor, _history: &[u32]) -> Result<u32> {
                 Ok(42)
             }
-            fn name(&self) -> &str { "test-sampler" }
+            fn name(&self) -> &str {
+                "test-sampler"
+            }
         }
 
         let mut registry: PluginRegistry = PluginRegistry::new();

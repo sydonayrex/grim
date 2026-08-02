@@ -60,12 +60,8 @@ pub fn scaling_base(method: &RopeScalingMethod, base: f32, head_dim: usize) -> f
     let dim = head_dim.max(1) as f32;
     match method {
         RopeScalingMethod::None => base,
-        RopeScalingMethod::Linear { factor } => {
-            base * factor.powf(1.0 / dim)
-        }
-        RopeScalingMethod::Llama3 { factor } => {
-            base * (1.0 + factor * (8.0 / dim).powi(2) / 2.0)
-        }
+        RopeScalingMethod::Linear { factor } => base * factor.powf(1.0 / dim),
+        RopeScalingMethod::Llama3 { factor } => base * (1.0 + factor * (8.0 / dim).powi(2) / 2.0),
         RopeScalingMethod::LongRoPE { factor } | RopeScalingMethod::YaRN { factor, .. } => {
             // NTK-aware effective base (interpolation for low freq, extrapolation for high).
             base * factor.powf(dim / (dim - 2.0).max(1.0))
@@ -80,8 +76,14 @@ mod tests {
 
     #[test]
     fn none_returns_native_base() {
-        assert_eq!(scaling_base(&RopeScalingMethod::None, 10000.0, 128), 10000.0);
-        assert_eq!(scaling_base(&RopeScalingMethod::None, 500000.0, 128), 500000.0);
+        assert_eq!(
+            scaling_base(&RopeScalingMethod::None, 10000.0, 128),
+            10000.0
+        );
+        assert_eq!(
+            scaling_base(&RopeScalingMethod::None, 500000.0, 128),
+            500000.0
+        );
     }
 
     #[test]

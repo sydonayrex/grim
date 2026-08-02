@@ -1,14 +1,14 @@
 //! LFM2 (Liquid Foundation Model v2) — `CausalLm` implementation in 100% Rust.
 //! Includes recurrent ShortConv blocks and MoE gating logic.
 
-use std::sync::Arc;
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
-use grim_nn::{add_tensors, Embedding, Linear, RmsNorm};
+use grim_nn::{Embedding, Linear, RmsNorm, add_tensors};
 use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct Lfm2Config {
@@ -40,10 +40,7 @@ impl ModelConfig for Lfm2Config {
 #[derive(Clone)]
 pub enum Lfm2LayerCache {
     ShortConv(Vec<f32>),
-    Attention {
-        k: Vec<f32>,
-        v: Vec<f32>,
-    },
+    Attention { k: Vec<f32>, v: Vec<f32> },
 }
 
 pub struct Lfm2Block {
@@ -72,51 +69,118 @@ pub struct Lfm2Block {
 }
 
 impl Lfm2Block {
-    pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: &Lfm2Config, layer_idx: usize) -> Result<Self> {
+    pub fn load(
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: &Lfm2Config,
+        layer_idx: usize,
+    ) -> Result<Self> {
         let attn_norm = RmsNorm::load(&ws.pp("attn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
         let is_recurrent = cfg.is_recr.get(layer_idx).copied().unwrap_or(false);
 
         let (wq, wk, wv, wo, attn_q_norm, attn_k_norm) = if !is_recurrent {
-            let wq = Some(Linear::load(&ws.pp("attn_q"), cfg.hidden_size, cfg.num_heads * cfg.head_dim, false)?);
-            let wk = Some(Linear::load(&ws.pp("attn_k"), cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim, false)?);
-            let wv = Some(Linear::load(&ws.pp("attn_v"), cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim, false)?);
-            let wo = Some(Linear::load(&ws.pp("attn_output"), cfg.num_heads * cfg.head_dim, cfg.hidden_size, false)?);
-            let attn_q_norm = Some(RmsNorm::load(&ws.pp("attn_q_norm"), cfg.head_dim, cfg.rms_norm_eps)?);
-            let attn_k_norm = Some(RmsNorm::load(&ws.pp("attn_k_norm"), cfg.head_dim, cfg.rms_norm_eps)?);
+            let wq = Some(Linear::load(
+                &ws.pp("attn_q"),
+                cfg.hidden_size,
+                cfg.num_heads * cfg.head_dim,
+                false,
+            )?);
+            let wk = Some(Linear::load(
+                &ws.pp("attn_k"),
+                cfg.hidden_size,
+                cfg.num_kv_heads * cfg.head_dim,
+                false,
+            )?);
+            let wv = Some(Linear::load(
+                &ws.pp("attn_v"),
+                cfg.hidden_size,
+                cfg.num_kv_heads * cfg.head_dim,
+                false,
+            )?);
+            let wo = Some(Linear::load(
+                &ws.pp("attn_output"),
+                cfg.num_heads * cfg.head_dim,
+                cfg.hidden_size,
+                false,
+            )?);
+            let attn_q_norm = Some(RmsNorm::load(
+                &ws.pp("attn_q_norm"),
+                cfg.head_dim,
+                cfg.rms_norm_eps,
+            )?);
+            let attn_k_norm = Some(RmsNorm::load(
+                &ws.pp("attn_k_norm"),
+                cfg.head_dim,
+                cfg.rms_norm_eps,
+            )?);
             (wq, wk, wv, wo, attn_q_norm, attn_k_norm)
         } else {
             (None, None, None, None, None, None)
         };
 
-        let (shortconv_in_proj, shortconv_conv, shortconv_conv_vec, shortconv_out_proj) = if is_recurrent {
-            let in_proj = Some(Linear::load(&ws.pp("shortconv.in_proj"), cfg.hidden_size, 3 * cfg.hidden_size, false)?);
-            // Canonical LFM2 conv.weight is stored as [hidden, *, kernel] row-major:
-            //   - safetensors: 3D [hidden, 1, kernel] — the middle dim is in_channels=1.
-            //   - GGUF:        2D [hidden, kernel] — the converter squeezes the in_channels
-            //     axis, and the raw flat bytes remain in [hidden, kernel] row-major order.
-            //     Although the GGUF tensor dims are written as [3, 1024] (kernel, hidden),
-            //     the actual data layout is [hidden, kernel] row-major — verified by direct
-            //     byte-for-byte comparison with the safetensors source. So no transpose is
-            //     ever needed; the dequantized flat data is already in the canonical layout
-            //     (weight[d * kernel + k] = conv weight for channel d, kernel tap k).
-            let conv = ws.get([cfg.hidden_size, cfg.n_shortconv_l_cache], "shortconv.conv.weight")
-                .or_else(|_| ws.get([cfg.hidden_size, 1, cfg.n_shortconv_l_cache], "shortconv.conv.weight"))?;
-            let conv_vec = conv.to_vec_f32().ok().map(|raw| {
-                // The flat data is already [hidden, kernel] row-major for both formats.
-                // No transpose required (previous code incorrectly transposed the GGUF
-                // path, scrambling the conv weight and producing gibberish output).
-                raw
-            });
-            let out_proj = Some(Linear::load(&ws.pp("shortconv.out_proj"), cfg.hidden_size, cfg.hidden_size, false)?);
-            (in_proj, Some(conv), conv_vec, out_proj)
-        } else {
-            (None, None, None, None)
-        };
+        let (shortconv_in_proj, shortconv_conv, shortconv_conv_vec, shortconv_out_proj) =
+            if is_recurrent {
+                let in_proj = Some(Linear::load(
+                    &ws.pp("shortconv.in_proj"),
+                    cfg.hidden_size,
+                    3 * cfg.hidden_size,
+                    false,
+                )?);
+                // Canonical LFM2 conv.weight is stored as [hidden, *, kernel] row-major:
+                //   - safetensors: 3D [hidden, 1, kernel] — the middle dim is in_channels=1.
+                //   - GGUF:        2D [hidden, kernel] — the converter squeezes the in_channels
+                //     axis, and the raw flat bytes remain in [hidden, kernel] row-major order.
+                //     Although the GGUF tensor dims are written as [3, 1024] (kernel, hidden),
+                //     the actual data layout is [hidden, kernel] row-major — verified by direct
+                //     byte-for-byte comparison with the safetensors source. So no transpose is
+                //     ever needed; the dequantized flat data is already in the canonical layout
+                //     (weight[d * kernel + k] = conv weight for channel d, kernel tap k).
+                let conv = ws
+                    .get(
+                        [cfg.hidden_size, cfg.n_shortconv_l_cache],
+                        "shortconv.conv.weight",
+                    )
+                    .or_else(|_| {
+                        ws.get(
+                            [cfg.hidden_size, 1, cfg.n_shortconv_l_cache],
+                            "shortconv.conv.weight",
+                        )
+                    })?;
+                let conv_vec = conv.to_vec_f32().ok().map(|raw| {
+                    // The flat data is already [hidden, kernel] row-major for both formats.
+                    // No transpose required (previous code incorrectly transposed the GGUF
+                    // path, scrambling the conv weight and producing gibberish output).
+                    raw
+                });
+                let out_proj = Some(Linear::load(
+                    &ws.pp("shortconv.out_proj"),
+                    cfg.hidden_size,
+                    cfg.hidden_size,
+                    false,
+                )?);
+                (in_proj, Some(conv), conv_vec, out_proj)
+            } else {
+                (None, None, None, None)
+            };
 
         let ffn_norm = RmsNorm::load(&ws.pp("ffn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let ffn_gate = Linear::load(&ws.pp("ffn_gate"), cfg.hidden_size, cfg.intermediate_size, false)?;
-        let ffn_up = Linear::load(&ws.pp("ffn_up"), cfg.hidden_size, cfg.intermediate_size, false)?;
-        let ffn_down = Linear::load(&ws.pp("ffn_down"), cfg.intermediate_size, cfg.hidden_size, false)?;
+        let ffn_gate = Linear::load(
+            &ws.pp("ffn_gate"),
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            false,
+        )?;
+        let ffn_up = Linear::load(
+            &ws.pp("ffn_up"),
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            false,
+        )?;
+        let ffn_down = Linear::load(
+            &ws.pp("ffn_down"),
+            cfg.intermediate_size,
+            cfg.hidden_size,
+            false,
+        )?;
 
         Ok(Self {
             attn_norm,
@@ -162,12 +226,19 @@ impl Lfm2Block {
             let l_cache = *conv_shape.last().unwrap_or(&3);
 
             if cache.is_none() {
-                *cache = Some(Lfm2LayerCache::ShortConv(vec![0.0f32; h_dim * (l_cache - 1)]));
+                *cache = Some(Lfm2LayerCache::ShortConv(vec![
+                    0.0f32;
+                    h_dim * (l_cache - 1)
+                ]));
             }
 
             let state = match cache.as_mut().unwrap() {
                 Lfm2LayerCache::ShortConv(st) => st,
-                _ => return Err(grim_core::error::Error::Session("Mismatched ShortConv layer cache".into())),
+                _ => {
+                    return Err(grim_core::error::Error::Session(
+                        "Mismatched ShortConv layer cache".into(),
+                    ));
+                }
             };
 
             for step in 0..steps {
@@ -198,7 +269,11 @@ impl Lfm2Block {
             }
 
             let y_tensor = device_tensor(y_out, Shape::new(vec![steps, h_dim]), norm_x.device())?;
-            let out_proj_result = self.shortconv_out_proj.as_ref().unwrap().forward(&y_tensor)?;
+            let out_proj_result = self
+                .shortconv_out_proj
+                .as_ref()
+                .unwrap()
+                .forward(&y_tensor)?;
             out_proj_result
         } else {
             // Full Causal Scaled Dot-Product Attention with GQA & Per-Head RMSNorm
@@ -208,7 +283,8 @@ impl Lfm2Block {
 
             let steps = q.shape().dims()[0];
 
-            // Apply per-head RMSNorm on Q and K
+            // Reshape Q/K to (steps * num_heads, head_dim) / (steps * num_kv_heads, head_dim)
+            // and run per-head RMSNorm on-device via the standard RmsNorm module.
             let q_2d = device_tensor(
                 q.to_vec_f32()?,
                 Shape::new(vec![steps * self.num_heads, self.head_dim]),
@@ -222,58 +298,78 @@ impl Lfm2Block {
                 norm_x.device(),
             )?;
             let k_norm = self.attn_k_norm.as_ref().unwrap().forward(&k_2d)?;
-            let mut k_norm_vec = k_norm.to_vec_f32()?;
-            let mut q_norm_vec = q_norm.to_vec_f32()?;
+
+            // Apply RoPE through the BackendDevice trait so the rotation runs on
+            // the GPU when available instead of being computed inline on the CPU.
+            let dev = grim_nn::modules::pick_device_for_storage_device(norm_x.device());
+            let q_shape = Shape::new(vec![1, steps * self.num_heads, self.head_dim]);
+            let k_shape = Shape::new(vec![1, steps * self.num_kv_heads, self.head_dim]);
+
+            // RoPE positions must include the existing KV cache length so that
+            // incremental (decode) steps rotate at the correct absolute position.
+            // HEAD's inline RoPE used `pos = current_total + t`; the device RoPE
+            // path must replicate this to avoid numerical divergence.
+            let kv_stride = self.num_kv_heads * self.head_dim;
+            let cache_offset = match cache {
+                Some(Lfm2LayerCache::Attention { k, .. }) => k.len() / kv_stride,
+                _ => 0,
+            };
+            let q_positions: Vec<u32> = {
+                let mut v = Vec::with_capacity(steps * self.num_heads);
+                for t in 0..steps {
+                    for _ in 0..self.num_heads {
+                        v.push((cache_offset + t) as u32);
+                    }
+                }
+                v
+            };
+            let k_positions: Vec<u32> = {
+                let mut v = Vec::with_capacity(steps * self.num_kv_heads);
+                for t in 0..steps {
+                    for _ in 0..self.num_kv_heads {
+                        v.push((cache_offset + t) as u32);
+                    }
+                }
+                v
+            };
+            let (q_rot_storage, _) = dev.rope(
+                q_norm.storage().as_ref(),
+                &q_positions,
+                self.head_dim,
+                self.rope_theta,
+                &q_shape,
+            )?;
+            let (k_rot_storage, _) = dev.rope(
+                k_norm.storage().as_ref(),
+                &k_positions,
+                self.head_dim,
+                self.rope_theta,
+                &k_shape,
+            )?;
+            let q_rot_vec = q_rot_storage.to_cpu_vec_f32()?;
+            let k_rot_vec = k_rot_storage.to_cpu_vec_f32()?;
             let v_vec = v.to_vec_f32()?;
 
             if cache.is_none() {
-                *cache = Some(Lfm2LayerCache::Attention { k: vec![], v: vec![] });
+                *cache = Some(Lfm2LayerCache::Attention {
+                    k: vec![],
+                    v: vec![],
+                });
             }
 
             let (k_hist, v_hist) = match cache.as_mut().unwrap() {
                 Lfm2LayerCache::Attention { k, v } => (k, v),
-                _ => return Err(grim_core::error::Error::Session("Mismatched Attention layer cache".into())),
+                _ => {
+                    return Err(grim_core::error::Error::Session(
+                        "Mismatched Attention layer cache".into(),
+                    ));
+                }
             };
 
-            let kv_stride = self.num_kv_heads * self.head_dim;
-            let current_total = k_hist.len() / kv_stride;
-            let half = self.head_dim / 2;
-
-            // Apply RoPE (Rotary Position Embedding) to Q and K at current token positions
-            for t in 0..steps {
-                let pos = (current_total + t) as f32;
-                // RoPE for Q
-                for h in 0..self.num_heads {
-                    let head_offset = t * (self.num_heads * self.head_dim) + h * self.head_dim;
-                    for i in 0..half {
-                        let freq = 1.0 / self.rope_theta.powf((2 * i) as f32 / self.head_dim as f32);
-                        let angle = pos * freq;
-                        let (cos, sin) = (angle.cos(), angle.sin());
-                        let q0 = q_norm_vec[head_offset + 2 * i];
-                        let q1 = q_norm_vec[head_offset + 2 * i + 1];
-                        q_norm_vec[head_offset + 2 * i] = q0 * cos - q1 * sin;
-                        q_norm_vec[head_offset + 2 * i + 1] = q0 * sin + q1 * cos;
-                    }
-                }
-                // RoPE for K
-                for kvh in 0..self.num_kv_heads {
-                    let head_offset = t * (self.num_kv_heads * self.head_dim) + kvh * self.head_dim;
-                    for i in 0..half {
-                        let freq = 1.0 / self.rope_theta.powf((2 * i) as f32 / self.head_dim as f32);
-                        let angle = pos * freq;
-                        let (cos, sin) = (angle.cos(), angle.sin());
-                        let k0 = k_norm_vec[head_offset + 2 * i];
-                        let k1 = k_norm_vec[head_offset + 2 * i + 1];
-                        k_norm_vec[head_offset + 2 * i] = k0 * cos - k1 * sin;
-                        k_norm_vec[head_offset + 2 * i + 1] = k0 * sin + k1 * cos;
-                    }
-                }
-            }
-
-            k_hist.extend_from_slice(&k_norm_vec);
+            // Append the newly rotated K and raw V to the KV cache before attention.
+            k_hist.extend_from_slice(&k_rot_vec);
             v_hist.extend_from_slice(&v_vec);
 
-            let kv_stride = self.num_kv_heads * self.head_dim;
             let total_kv_tokens = k_hist.len() / kv_stride;
             let num_head_dims = self.num_heads * self.head_dim;
             let scale = 1.0 / (self.head_dim as f32).sqrt();
@@ -288,7 +384,7 @@ impl Lfm2Block {
                     for t2 in 0..=past_tokens {
                         let mut dot = 0.0f32;
                         for d in 0..self.head_dim {
-                            dot += q_norm_vec[t * num_head_dims + h * self.head_dim + d]
+                            dot += q_rot_vec[t * num_head_dims + h * self.head_dim + d]
                                 * k_hist[t2 * kv_stride + kvh * self.head_dim + d];
                         }
                         scores[t2] = dot * scale;
@@ -316,13 +412,16 @@ impl Lfm2Block {
                 }
             }
 
-            let attn_tensor = device_tensor(attn_out_vec, Shape::new(vec![steps, num_head_dims]), norm_x.device())?;
+            let attn_tensor = device_tensor(
+                attn_out_vec,
+                Shape::new(vec![steps, num_head_dims]),
+                norm_x.device(),
+            )?;
             self.wo.as_ref().unwrap().forward(&attn_tensor)?
         };
 
         // Residual connection
-        let x_added = add_tensors(x, &block_out)
-            .map_err(grim_core::Error::Tensor)?;
+        let x_added = add_tensors(x, &block_out).map_err(grim_core::Error::Tensor)?;
 
         // FFN block
         let norm_x_ffn = self.ffn_norm.forward(&x_added)?;
@@ -331,8 +430,7 @@ impl Lfm2Block {
         let activated = silu_mul(&gate, &up)?;
         let ffn_out = self.ffn_down.forward(&activated)?;
 
-        add_tensors(&x_added, &ffn_out)
-            .map_err(grim_core::Error::Tensor)
+        add_tensors(&x_added, &ffn_out).map_err(grim_core::Error::Tensor)
     }
 }
 
@@ -350,17 +448,20 @@ impl Lfm2 {
         if cfg.is_recr.len() != cfg.num_layers {
             return Err(grim_core::error::Error::Config(format!(
                 "Lfm2Config: is_recr has {} entries but num_layers is {}",
-                cfg.is_recr.len(), cfg.num_layers
+                cfg.is_recr.len(),
+                cfg.num_layers
             )));
         }
-        let tok_embeddings = Embedding::load(&ws.pp("token_embd"), cfg.vocab_size, cfg.hidden_size)?;
+        let tok_embeddings =
+            Embedding::load(&ws.pp("token_embd"), cfg.vocab_size, cfg.hidden_size)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             layers.push(Lfm2Block::load(&ws.pp("blk").pp(&i.to_string()), &cfg, i)?);
         }
         // canonical LFM2: post-norm before lm_head is fused into `token_embd_norm`
         // (an embedding pre-norm), and lm_head is tied to `token_embd`.
-        let norm = match RmsNorm::load(&ws.pp("token_embd_norm"), cfg.hidden_size, cfg.rms_norm_eps) {
+        let norm = match RmsNorm::load(&ws.pp("token_embd_norm"), cfg.hidden_size, cfg.rms_norm_eps)
+        {
             Ok(n) => n,
             Err(_) => RmsNorm::load(&ws.pp("output_norm"), cfg.hidden_size, cfg.rms_norm_eps)?,
         };
@@ -420,7 +521,9 @@ impl CausalLm for Lfm2 {
             _ => return Err(grim_tensor::Error::Unimplemented("non-F32 inputs".into()).into()),
         };
         let seq_len = ids.len();
-        let mut h = self.tok_embeddings.forward(&ids, seq_len, self.cfg.hidden_size)?;
+        let mut h = self
+            .tok_embeddings
+            .forward(&ids, seq_len, self.cfg.hidden_size)?;
 
         // Lazy-init per-layer cache on the session (owned by the session,
         // not the model — matching bebelm-main's Cache-per-Agent pattern).

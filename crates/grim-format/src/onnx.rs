@@ -74,14 +74,15 @@ impl TensorProvider for OnnxProvider {
     fn get(&self, _name: &str) -> Result<RawTensor> {
         // Full implementation would extract tensor data via ort
         Err(Error::Unimplemented(
-            "ONNX tensor extraction requires ort crate integration".into()
+            "ONNX tensor extraction requires ort crate integration".into(),
         ))
     }
 
     fn meta(&self, name: &str) -> Result<TensorMeta> {
-        let info = self.tensors.get(name).ok_or_else(|| {
-            Error::Backend(format!("tensor '{name}' not found in ONNX file"))
-        })?;
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in ONNX file")))?;
         Ok(TensorMeta {
             dtype: info.dtype.to_grim_dtype(),
             provenance: QuantProvenance::GrimNative,

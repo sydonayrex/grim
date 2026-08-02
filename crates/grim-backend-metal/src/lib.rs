@@ -1,15 +1,8 @@
-//! Metal compatibility backend for Grim.
-//!
-//! Provides the `MetalDevice` and `MetalStorage` structs implementing the `BackendDevice`
-//! and `BackendStorage` traits from `grim-tensor`, enabling Metal device target support (MSL).
-//! Implements a robust Unified Memory Architecture (UMA) zero-copy FFI and CPU-fallback execution
-//! pipeline to ensure full capability compatibility on all supported targets.
+//! Metal backend for Apple Silicon GPUs using MSL compute pipelines.
 
 use grim_tensor::backend::ComputeHandle;
 #[allow(unused_imports)]
-use grim_tensor::dtype::{DType, QuantProvenance, Storage as DTypeStorage};
-#[cfg(target_vendor = "apple")]
-use grim_tensor::dtype::ArithType;
+use grim_tensor::dtype::{ArithType, DType, QuantProvenance, Storage as DTypeStorage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendDevice, BackendStorage, Shape};
 
@@ -27,51 +20,38 @@ use objc2_metal::{
 #[cfg(embed_metallib)]
 const METALLIB_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.metallib"));
 
-/// Typed errors specific to the Metal backend.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum MetalError {
-    /// Failure during device or command queue initialization.
     #[error("Metal initialization/FFI error: {0}")]
     Ffi(String),
-    /// Failure when loading or compiling MSL code.
     #[error("Metal shader compilation failed: {0}")]
     Compilation(String),
-    /// Data type not supported by the Metal shader kernels.
     #[error("Metal only supports F32 operations, got dtype: {0:?}")]
     UnsupportedDType(DType),
-    /// Failure to allocate graphics memory.
     #[error("Metal buffer allocation failed: {0}")]
     AllocationFailed(String),
-    /// Internal context state error.
     #[error("Metal context error: {0}")]
     Context(String),
-    /// Retrieved null pointer from graphics memory mapping.
     #[error("Metal buffer contents is null")]
     NullBuffer,
-    /// Storage size or layout mismatch.
     #[error("Metal storage data mismatch: {0}")]
     DataMismatch(String),
 }
 
 impl From<MetalError> for Error {
-    /// Maps a backend-specific MetalError to the general tensor-level Error.
     fn from(err: MetalError) -> Self {
         Error::Backend(err.to_string())
     }
 }
 
-/// Target-agnostic GPU memory usage/residency profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferUsage {
-    /// Memory visible to both CPU and GPU (Shared/Host-visible).
     Shared,
-    /// Memory visible only to the GPU (Device-local/Private).
     Private,
 }
 
 #[cfg(target_vendor = "apple")]
 impl BufferUsage {
-    /// Maps our usage abstraction to the platform MTLResourceOptions.
     pub fn to_mtl_options(self) -> objc2_metal::MTLResourceOptions {
         match self {
             BufferUsage::Shared => objc2_metal::MTLResourceOptions::StorageModeShared,
@@ -96,26 +76,23 @@ struct MetalPipelines {
     sqrt: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     recip: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     rope: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    quantized_matmul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
-/// Global, lazy-initialized Metal compute context.
 #[cfg(target_vendor = "apple")]
 #[derive(Debug)]
 pub struct MetalContext {
-    /// Main platform device handle.
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
-    /// Shared execution queue.
     pub command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    /// Precompiled MSL compute pipeline kernels.
     pub pipelines: std::sync::Arc<MetalPipelines>,
 }
 
 #[cfg(target_vendor = "apple")]
-static METAL_CONTEXT: std::sync::OnceLock<std::result::Result<MetalContext, MetalError>> = std::sync::OnceLock::new();
+static METAL_CONTEXT: std::sync::OnceLock<std::result::Result<MetalContext, MetalError>> =
+    std::sync::OnceLock::new();
 
 #[cfg(target_vendor = "apple")]
 impl MetalContext {
-    /// Returns a static reference to the shared context, lazy-initializing it if necessary.
     pub fn get() -> std::result::Result<&'static MetalContext, MetalError> {
         METAL_CONTEXT.get_or_init(|| {
             use objc2_metal::MTLCreateSystemDefaultDevice;
@@ -220,6 +197,7 @@ impl MetalContext {
                 sqrt: get_pipeline("grim_sqrt")?,
                 recip: get_pipeline("grim_recip")?,
                 rope: get_pipeline("grim_rope")?,
+                quantized_matmul: get_pipeline("grim_quantized_matmul_q8_0")?,
             });
 
             Ok(MetalContext {
@@ -234,7 +212,6 @@ impl MetalContext {
 #[cfg(target_vendor = "apple")]
 #[derive(Debug)]
 pub struct MetalHandle {
-    /// Command buffer containing operations.
     pub command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
 }
 
@@ -242,9 +219,7 @@ pub struct MetalHandle {
 #[derive(Debug)]
 pub struct MetalHandle;
 
-
 impl ComputeHandle for MetalHandle {
-    /// Blocks the host thread until Metal operations tracked by this handle complete.
     fn synchronize(&self) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
@@ -253,7 +228,6 @@ impl ComputeHandle for MetalHandle {
         Ok(())
     }
 
-    /// Checks if the Metal operations tracked by this handle have finished.
     fn is_ready(&self) -> bool {
         #[cfg(target_vendor = "apple")]
         {
@@ -293,22 +267,18 @@ pub struct MetalStorage {
 }
 
 impl BackendStorage for MetalStorage {
-    /// Gets the data type of the storage.
     fn dtype(&self) -> DType {
         self.dtype.clone()
     }
 
-    /// Gets the quantization provenance of the storage.
     fn provenance(&self) -> QuantProvenance {
         self.provenance.clone()
     }
 
-    /// Gets the shape of the storage.
     fn shape(&self) -> &Shape {
         &self.shape
     }
 
-    /// Copies the GPU device buffer content back to host memory as an F32 vector.
     fn to_cpu_vec_f32(&self) -> Result<Vec<f32>> {
         #[cfg(target_vendor = "apple")]
         {
@@ -328,14 +298,22 @@ impl BackendStorage for MetalStorage {
                 let mut out = vec![0.0f32; elem_count];
                 let bytes = elem_count * dtype_byte_size(&self.dtype)?;
                 if data_guard.len() < bytes {
-                    return Err(Error::from(MetalError::DataMismatch("CPU storage buffer size mismatch".into())));
+                    return Err(Error::from(MetalError::DataMismatch(
+                        "CPU storage buffer size mismatch".into(),
+                    )));
                 }
                 unsafe {
-                    std::ptr::copy_nonoverlapping(data_guard.as_ptr(), out.as_mut_ptr() as *mut u8, bytes);
+                    std::ptr::copy_nonoverlapping(
+                        data_guard.as_ptr(),
+                        out.as_mut_ptr() as *mut u8,
+                        bytes,
+                    );
                 }
                 Ok(out)
             } else {
-                Err(Error::Backend("MetalStorage has no buffer or fallback data".into()))
+                Err(Error::Backend(
+                    "MetalStorage has no buffer or fallback data".into(),
+                ))
             }
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -345,16 +323,21 @@ impl BackendStorage for MetalStorage {
             let mut out = vec![0.0f32; elem_count];
             let bytes = elem_count * dtype_byte_size(&self.dtype)?;
             if data_guard.len() < bytes {
-                return Err(Error::from(MetalError::DataMismatch("CPU storage buffer size mismatch".into())));
+                return Err(Error::from(MetalError::DataMismatch(
+                    "CPU storage buffer size mismatch".into(),
+                )));
             }
             unsafe {
-                std::ptr::copy_nonoverlapping(data_guard.as_ptr(), out.as_mut_ptr() as *mut u8, bytes);
+                std::ptr::copy_nonoverlapping(
+                    data_guard.as_ptr(),
+                    out.as_mut_ptr() as *mut u8,
+                    bytes,
+                );
             }
             Ok(out)
         }
     }
 
-    /// Returns `self` as `Any` to allow internal downcasting in the backend.
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -382,7 +365,6 @@ pub struct MetalDevice {
     ordinal: usize,
 }
 
-#[allow(dead_code)]
 fn fnv1a_hash(s: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for &byte in s.as_bytes() {
@@ -392,40 +374,36 @@ fn fnv1a_hash(s: &str) -> u64 {
     hash
 }
 
-#[allow(dead_code)]
 fn get_cache_dir() -> Option<std::path::PathBuf> {
     if let Ok(home) = std::env::var("HOME") {
-        Some(std::path::PathBuf::from(home).join(".cache").join("grim_metal_cache"))
+        Some(
+            std::path::PathBuf::from(home)
+                .join(".cache")
+                .join("grim_metal_cache"),
+        )
     } else if let Ok(user_profile) = std::env::var("USERPROFILE") {
-        Some(std::path::PathBuf::from(user_profile).join(".cache").join("grim_metal_cache"))
+        Some(
+            std::path::PathBuf::from(user_profile)
+                .join(".cache")
+                .join("grim_metal_cache"),
+        )
     } else {
         None
     }
 }
 
 impl MetalDevice {
-    /// Constructs a new device reference for the given ordinal.
-    ///
-    /// If hardware initialization fails on Apple platforms, it logs a warning and returns
-    /// a device in fallback mode rather than panicking.
-    pub fn new(ordinal: usize) -> Self {
+    pub fn new(ordinal: usize) -> Result<Self> {
         #[cfg(target_vendor = "apple")]
         {
-            match Self::try_new(ordinal) {
-                Ok(dev) => dev,
-                Err(e) => {
-                    eprintln!("[MetalDevice::new] WARNING: Failed to initialize Metal hardware. Error: {:?}", e);
-                    Self { ordinal, inner: None }
-                }
-            }
+            Self::try_new(ordinal)
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            Self { ordinal }
+            Ok(Self { ordinal })
         }
     }
 
-    /// Fallible constructor propagating Metal FFI initialization errors.
     pub fn try_new(ordinal: usize) -> Result<Self> {
         #[cfg(target_vendor = "apple")]
         {
@@ -448,9 +426,13 @@ impl MetalDevice {
     }
 
     #[cfg(target_vendor = "apple")]
-    /// Acquires the active command buffer or creates a new one if none is active or it has been committed.
-    pub fn get_or_create_command_buffer(&self) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
-        let inner = self.inner.as_ref().ok_or_else(|| Error::from(MetalError::Context("Device inner is None".into())))?;
+    pub fn get_or_create_command_buffer(
+        &self,
+    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Error::from(MetalError::Context("Device inner is None".into())))?;
         let mut active = inner.active_command_buffer.lock().unwrap();
         if let Some(ref buf) = *active {
             use objc2_metal::MTLCommandBufferStatus;
@@ -458,13 +440,13 @@ impl MetalDevice {
                 return Ok(buf.clone());
             }
         }
-        let new_buf = inner.command_queue.commandBuffer()
-            .ok_or_else(|| Error::from(MetalError::Ffi("Failed to create command buffer".into())))?;
+        let new_buf = inner.command_queue.commandBuffer().ok_or_else(|| {
+            Error::from(MetalError::Ffi("Failed to create command buffer".into()))
+        })?;
         *active = Some(new_buf.clone());
         Ok(new_buf)
     }
 
-    /// Flushes (commits) any active deferred command buffer.
     pub fn flush(&self) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
@@ -479,9 +461,15 @@ impl MetalDevice {
     }
 
     #[cfg(target_vendor = "apple")]
-    /// Allocates a new buffer by copying data from the host.
-    pub fn new_buffer_with_bytes(&self, bytes: &[u8], usage: BufferUsage) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>> {
-        let inner = self.inner.as_ref().ok_or_else(|| Error::from(MetalError::Context("Device inner is None".into())))?;
+    pub fn new_buffer_with_bytes(
+        &self,
+        bytes: &[u8],
+        usage: BufferUsage,
+    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>> {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Error::from(MetalError::Context("Device inner is None".into())))?;
         let options = usage.to_mtl_options();
         let buffer = unsafe {
             inner.device.newBufferWithBytes_length_options(
@@ -489,23 +477,25 @@ impl MetalDevice {
                 bytes.len() as u64,
                 options,
             )
-        }.ok_or_else(|| Error::from(MetalError::AllocationFailed("Failed to allocate MTLBuffer with bytes".into())))?;
+        }
+        .ok_or_else(|| {
+            Error::from(MetalError::AllocationFailed(
+                "Failed to allocate MTLBuffer with bytes".into(),
+            ))
+        })?;
         Ok(buffer)
     }
 
-    /// Returns the ordinal of this device.
     pub fn ordinal(&self) -> usize {
         self.ordinal
     }
 
-    /// Probes the system for available Metal GPUs.
     pub fn probe() -> Result<Vec<MetalDevice>> {
         #[cfg(target_vendor = "apple")]
         {
-            if let Ok(dev) = MetalDevice::try_new(0) {
-                if dev.inner.is_some() {
-                    return Ok(vec![dev]);
-                }
+            let dev = MetalDevice::new(0)?;
+            if dev.inner.is_some() {
+                return Ok(vec![dev]);
             }
             Ok(vec![])
         }
@@ -515,19 +505,28 @@ impl MetalDevice {
 }
 
 impl BackendDevice for MetalDevice {
-    /// Allocates a zero-initialized tensor buffer on the Metal device.
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
-        let bytes = shape.elem_count()
+        let bytes = shape
+            .elem_count()
             .checked_mul(dtype_byte_size(&dtype)?)
-            .ok_or_else(|| Error::from(MetalError::AllocationFailed("Buffer size overflow".into())))?;
+            .ok_or_else(|| {
+                Error::from(MetalError::AllocationFailed("Buffer size overflow".into()))
+            })?;
         #[cfg(target_vendor = "apple")]
         {
             if let Some(ref inner) = self.inner {
                 use objc2_metal::MTLResourceOptions;
                 let buffer = inner
                     .device
-                    .newBufferWithLength_options(bytes as u64, MTLResourceOptions::StorageModeShared)
-                    .ok_or_else(|| Error::from(MetalError::AllocationFailed("Failed to allocate Metal buffer".into())))?;
+                    .newBufferWithLength_options(
+                        bytes as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or_else(|| {
+                        Error::from(MetalError::AllocationFailed(
+                            "Failed to allocate Metal buffer".into(),
+                        ))
+                    })?;
 
                 let contents = buffer.contents();
                 if !contents.is_null() {
@@ -563,8 +562,6 @@ impl BackendDevice for MetalDevice {
             }))
         }
     }
-    /// Performs matrix multiplication on the Metal device.
-    /// Performs matrix multiplication on the Metal device.
     fn matmul(
         &self,
         a: &dyn BackendStorage,
@@ -594,7 +591,7 @@ impl BackendDevice for MetalDevice {
             }
 
             if self.inner.is_none() {
-                // Device-absent fallback path via Accelerate framework sgemm
+                // Device-absent fallback via Accelerate framework sgemm
                 let a_vec = a.to_cpu_vec_f32()?;
                 let b_vec = b.to_cpu_vec_f32()?;
                 let dims_a = a.shape().dims();
@@ -623,13 +620,18 @@ impl BackendDevice for MetalDevice {
                 }
                 let out_storage = self.from_cpu(&c_vec, out, a.dtype())?;
                 let ctx = MetalContext::get()?;
-                // Device-absent fallback: the computation was already performed
-                // on the CPU via the Accelerate framework (cblas_sgemm above).
-                // MetalHandle requires a command_buffer field, so we create a
-                // no-op buffer here — this is a legitimate fallback, not a stub.
-                let fallback_cmd = ctx.command_queue.commandBuffer()
-                    .ok_or_else(|| Error::from(MetalError::Ffi("Failed to create fallback command buffer".into())))?;
-                return Ok((out_storage, Box::new(MetalHandle { command_buffer: fallback_cmd })));
+                // Device-absent fallback: computation already done via Accelerate; no-op command buffer for MetalHandle.
+                let fallback_cmd = ctx.command_queue.commandBuffer().ok_or_else(|| {
+                    Error::from(MetalError::Ffi(
+                        "Failed to create fallback command buffer".into(),
+                    ))
+                })?;
+                return Ok((
+                    out_storage,
+                    Box::new(MetalHandle {
+                        command_buffer: fallback_cmd,
+                    }),
+                ));
             }
 
             if let Some(ref inner) = self.inner {
@@ -643,8 +645,14 @@ impl BackendDevice for MetalDevice {
                 let b_s = b.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
                     Error::Backend("Metal matmul: input b is not MetalStorage".into())
                 })?;
-                let a_buf = a_s.buffer.as_ref().ok_or_else(|| Error::Backend("a has no GPU buffer".into()))?;
-                let b_buf = b_s.buffer.as_ref().ok_or_else(|| Error::Backend("b has no GPU buffer".into()))?;
+                let a_buf = a_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("a has no GPU buffer".into()))?;
+                let b_buf = b_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("b has no GPU buffer".into()))?;
 
                 let a_dims = a.shape().dims();
                 let b_dims = b.shape().dims();
@@ -669,9 +677,9 @@ impl BackendDevice for MetalDevice {
                 let out_buf = out_s.buffer.as_ref().unwrap();
 
                 let cmd_buffer = self.get_or_create_command_buffer()?;
-                let encoder = cmd_buffer
-                    .computeCommandEncoder()
-                    .ok_or_else(|| Error::from(MetalError::Ffi("Failed to create compute encoder".into())))?;
+                let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                    Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                })?;
 
                 encoder.setComputePipelineState(&inner.pipelines.matmul);
                 encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
@@ -701,7 +709,11 @@ impl BackendDevice for MetalDevice {
 
                 let tuner = Tuner::new();
                 let config = tuner.search_tile_config(m, n, k, inner);
-                let config_data = [config.block_m as i32, config.block_n as i32, config.block_k as i32];
+                let config_data = [
+                    config.block_m as i32,
+                    config.block_n as i32,
+                    config.block_k as i32,
+                ];
                 unsafe {
                     encoder.setBytes_length_atIndex(
                         config_data.as_ptr() as *const std::ffi::c_void,
@@ -710,7 +722,8 @@ impl BackendDevice for MetalDevice {
                     );
                 }
 
-                let threads_per_group = MTLSize::new(config.block_n as u64, config.block_m as u64, 1);
+                let threads_per_group =
+                    MTLSize::new(config.block_n as u64, config.block_m as u64, 1);
                 let groups = MTLSize::new(
                     ((n + (config.block_n as usize) - 1) / (config.block_n as usize)) as u64,
                     ((m + (config.block_m as usize) - 1) / (config.block_m as usize)) as u64,
@@ -719,7 +732,12 @@ impl BackendDevice for MetalDevice {
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
                 encoder.endEncoding();
 
-                Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })))
+                Ok((
+                    out_storage,
+                    Box::new(MetalHandle {
+                        command_buffer: cmd_buffer,
+                    }),
+                ))
             } else {
                 run_fallback_binary(self, a, b, out, |cpu_dev, a_cpu, b_cpu, out_shape| {
                     cpu_dev.matmul(a_cpu, b_cpu, out_shape)
@@ -734,7 +752,6 @@ impl BackendDevice for MetalDevice {
         }
     }
 
-    /// Performs elementwise addition on the Metal device.
     fn add(
         &self,
         a: &dyn BackendStorage,
@@ -762,7 +779,6 @@ impl BackendDevice for MetalDevice {
         }
     }
 
-    /// Performs elementwise multiplication on the Metal device.
     fn mul(
         &self,
         a: &dyn BackendStorage,
@@ -790,7 +806,6 @@ impl BackendDevice for MetalDevice {
         }
     }
 
-    /// Performs elementwise SiLU-multiplication (SwiGLU gate) on the Metal device.
     fn silu_mul(
         &self,
         gate: &dyn BackendStorage,
@@ -818,7 +833,6 @@ impl BackendDevice for MetalDevice {
         }
     }
 
-    /// Performs RMS Normalization on the Metal device.
     fn rms_norm(
         &self,
         x: &dyn BackendStorage,
@@ -839,8 +853,14 @@ impl BackendDevice for MetalDevice {
                 let w_s = w.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
                     Error::Backend("Metal rms_norm: input w is not MetalStorage".into())
                 })?;
-                let x_buf = x_s.buffer.as_ref().ok_or_else(|| Error::Backend("x has no GPU buffer".into()))?;
-                let w_buf = w_s.buffer.as_ref().ok_or_else(|| Error::Backend("w has no GPU buffer".into()))?;
+                let x_buf = x_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("x has no GPU buffer".into()))?;
+                let w_buf = w_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("w has no GPU buffer".into()))?;
 
                 let out_storage = self.zeros(out, x.dtype())?;
                 let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
@@ -850,9 +870,9 @@ impl BackendDevice for MetalDevice {
                 let row_len = x.shape().dims().last().copied().unwrap_or(1) as i32;
 
                 let cmd_buffer = self.get_or_create_command_buffer()?;
-                let encoder = cmd_buffer
-                    .computeCommandEncoder()
-                    .ok_or_else(|| Error::from(MetalError::Ffi("Failed to create compute encoder".into())))?;
+                let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                    Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                })?;
 
                 encoder.setComputePipelineState(&inner.pipelines.rms_norm);
                 encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
@@ -886,7 +906,12 @@ impl BackendDevice for MetalDevice {
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
                 encoder.endEncoding();
 
-                Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })))
+                Ok((
+                    out_storage,
+                    Box::new(MetalHandle {
+                        command_buffer: cmd_buffer,
+                    }),
+                ))
             } else {
                 run_fallback_binary(self, x, w, out, |cpu_dev, x_cpu, w_cpu, out_shape| {
                     cpu_dev.rms_norm(x_cpu, w_cpu, eps, out_shape)
@@ -901,7 +926,6 @@ impl BackendDevice for MetalDevice {
         }
     }
 
-    /// Performs Softmax along the last dimension on the Metal device.
     fn softmax(
         &self,
         x: &dyn BackendStorage,
@@ -917,7 +941,10 @@ impl BackendDevice for MetalDevice {
                 let x_s = x.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
                     Error::Backend("Metal softmax: input x is not MetalStorage".into())
                 })?;
-                let x_buf = x_s.buffer.as_ref().ok_or_else(|| Error::Backend("x has no GPU buffer".into()))?;
+                let x_buf = x_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("x has no GPU buffer".into()))?;
 
                 let out_storage = self.zeros(out, x.dtype())?;
                 let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
@@ -927,9 +954,9 @@ impl BackendDevice for MetalDevice {
                 let last_dim = out.dims().last().copied().unwrap_or(1) as i32;
 
                 let cmd_buffer = self.get_or_create_command_buffer()?;
-                let encoder = cmd_buffer
-                    .computeCommandEncoder()
-                    .ok_or_else(|| Error::from(MetalError::Ffi("Failed to create compute encoder".into())))?;
+                let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                    Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                })?;
 
                 encoder.setComputePipelineState(&inner.pipelines.softmax);
                 encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
@@ -956,9 +983,17 @@ impl BackendDevice for MetalDevice {
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
                 encoder.endEncoding();
 
-                Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })))
+                Ok((
+                    out_storage,
+                    Box::new(MetalHandle {
+                        command_buffer: cmd_buffer,
+                    }),
+                ))
             } else {
                 let x_vec = x.to_cpu_vec_f32()?;
+                tracing::warn!(
+                    "Metal softmax: GPU path unavailable, falling back to CPU execution"
+                );
                 let cpu_dev = CpuDevice::new();
                 let x_cpu = cpu_dev.from_cpu(&x_vec, x.shape(), x.dtype())?;
                 let x_storage = x_cpu.as_any().downcast_ref::<CpuStorage>().ok_or_else(|| {
@@ -973,11 +1008,13 @@ impl BackendDevice for MetalDevice {
         #[cfg(not(target_vendor = "apple"))]
         {
             let x_vec = x.to_cpu_vec_f32()?;
+            tracing::warn!("Metal softmax: non-Apple target, falling back to CPU execution");
             let cpu_dev = CpuDevice::new();
             let x_cpu = cpu_dev.from_cpu(&x_vec, x.shape(), x.dtype())?;
-            let x_storage = x_cpu.as_any().downcast_ref::<CpuStorage>().ok_or_else(|| {
-                Error::Backend("Failed to downcast input x to CpuStorage".into())
-            })?;
+            let x_storage = x_cpu
+                .as_any()
+                .downcast_ref::<CpuStorage>()
+                .ok_or_else(|| Error::Backend("Failed to downcast input x to CpuStorage".into()))?;
             let (res_storage, handle) = cpu_dev.softmax(x_storage, out)?;
             let res_vec = res_storage.to_cpu_vec_f32()?;
             let out_metal = self.from_cpu(&res_vec, out, x.dtype())?;
@@ -985,7 +1022,6 @@ impl BackendDevice for MetalDevice {
         }
     }
 
-    /// Performs embedding lookup on the Metal device.
     fn embedding(
         &self,
         weight: &dyn BackendStorage,
@@ -999,15 +1035,21 @@ impl BackendDevice for MetalDevice {
                     return Err(Error::from(MetalError::UnsupportedDType(weight.dtype())));
                 }
 
-                let w_s = weight.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("Metal embedding: weight is not MetalStorage".into())
-                })?;
-                let w_buf = w_s.buffer.as_ref().ok_or_else(|| Error::Backend("weight has no GPU buffer".into()))?;
+                let w_s = weight
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| {
+                        Error::Backend("Metal embedding: weight is not MetalStorage".into())
+                    })?;
+                let w_buf = w_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("weight has no GPU buffer".into()))?;
 
-                // Create a temporary buffer for indices and copy them using new_buffer_with_bytes
-                let indices_bytes = indices.len()
-                    .checked_mul(4)
-                    .ok_or_else(|| Error::from(MetalError::AllocationFailed("Indices size overflow".into())))?;
+                // Create a temporary buffer for indices.
+                let indices_bytes = indices.len().checked_mul(4).ok_or_else(|| {
+                    Error::from(MetalError::AllocationFailed("Indices size overflow".into()))
+                })?;
                 let indices_u8 = unsafe {
                     std::slice::from_raw_parts(indices.as_ptr() as *const u8, indices_bytes)
                 };
@@ -1022,9 +1064,9 @@ impl BackendDevice for MetalDevice {
                 let total = out.elem_count();
 
                 let cmd_buffer = self.get_or_create_command_buffer()?;
-                let encoder = cmd_buffer
-                    .computeCommandEncoder()
-                    .ok_or_else(|| Error::from(MetalError::Ffi("Failed to create compute encoder".into())))?;
+                let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                    Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                })?;
 
                 encoder.setComputePipelineState(&inner.pipelines.embedding);
                 encoder.setBuffer_offset_atIndex(Some(w_buf), 0, 0);
@@ -1049,9 +1091,17 @@ impl BackendDevice for MetalDevice {
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
                 encoder.endEncoding();
 
-                Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })))
+                Ok((
+                    out_storage,
+                    Box::new(MetalHandle {
+                        command_buffer: cmd_buffer,
+                    }),
+                ))
             } else {
                 let w_vec = weight.to_cpu_vec_f32()?;
+                tracing::warn!(
+                    "Metal embedding: GPU path unavailable, falling back to CPU execution"
+                );
                 let cpu_dev = CpuDevice::new();
                 let w_cpu = cpu_dev.from_cpu(&w_vec, weight.shape(), weight.dtype())?;
                 let w_storage = w_cpu.as_any().downcast_ref::<CpuStorage>().ok_or_else(|| {
@@ -1066,11 +1116,13 @@ impl BackendDevice for MetalDevice {
         #[cfg(not(target_vendor = "apple"))]
         {
             let w_vec = weight.to_cpu_vec_f32()?;
+            tracing::warn!("Metal embedding: non-Apple target, falling back to CPU execution");
             let cpu_dev = CpuDevice::new();
             let w_cpu = cpu_dev.from_cpu(&w_vec, weight.shape(), weight.dtype())?;
-            let w_storage = w_cpu.as_any().downcast_ref::<CpuStorage>().ok_or_else(|| {
-                Error::Backend("Failed to downcast weight to CpuStorage".into())
-            })?;
+            let w_storage = w_cpu
+                .as_any()
+                .downcast_ref::<CpuStorage>()
+                .ok_or_else(|| Error::Backend("Failed to downcast weight to CpuStorage".into()))?;
             let (res_storage, handle) = cpu_dev.embedding(w_storage, indices, out)?;
             let res_vec = res_storage.to_cpu_vec_f32()?;
             let out_metal = self.from_cpu(&res_vec, out, weight.dtype())?;
@@ -1078,16 +1130,18 @@ impl BackendDevice for MetalDevice {
         }
     }
 
-    /// Copies a slice of F32 values from host memory to the device storage.
     fn from_cpu(
         &self,
         data: &[f32],
         shape: &Shape,
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
-        let bytes = shape.elem_count()
+        let bytes = shape
+            .elem_count()
             .checked_mul(dtype_byte_size(&dtype)?)
-            .ok_or_else(|| Error::from(MetalError::AllocationFailed("Buffer size overflow".into())))?;
+            .ok_or_else(|| {
+                Error::from(MetalError::AllocationFailed("Buffer size overflow".into()))
+            })?;
         if data.len() * 4 < bytes {
             return Err(Error::from(MetalError::DataMismatch(format!(
                 "from_cpu: source slice ({} bytes) too small for destination ({} bytes)",
@@ -1099,9 +1153,8 @@ impl BackendDevice for MetalDevice {
         #[cfg(target_vendor = "apple")]
         {
             if let Some(ref _inner) = self.inner {
-                let data_bytes = unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes)
-                };
+                let data_bytes =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes) };
                 let buffer = self.new_buffer_with_bytes(data_bytes, BufferUsage::Shared)?;
 
                 Ok(Box::new(MetalStorage {
@@ -1114,7 +1167,11 @@ impl BackendDevice for MetalDevice {
             } else {
                 let mut fallback_data = vec![0u8; bytes];
                 unsafe {
-                    std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, fallback_data.as_mut_ptr(), bytes);
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr() as *const u8,
+                        fallback_data.as_mut_ptr(),
+                        bytes,
+                    );
                 }
                 Ok(Box::new(MetalStorage {
                     buffer: None,
@@ -1129,7 +1186,11 @@ impl BackendDevice for MetalDevice {
         {
             let mut fallback_data = vec![0u8; bytes];
             unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, fallback_data.as_mut_ptr(), bytes);
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const u8,
+                    fallback_data.as_mut_ptr(),
+                    bytes,
+                );
             }
             Ok(Box::new(MetalStorage {
                 data: std::sync::Mutex::new(fallback_data),
@@ -1140,8 +1201,11 @@ impl BackendDevice for MetalDevice {
         }
     }
 
-    /// Provide hints about memory usage/advice patterns to the device/system.
-    fn advise(&self, _storage: &dyn BackendStorage, _advice: grim_tensor::backend::MemAdvice) -> Result<()> {
+    fn advise(
+        &self,
+        _storage: &dyn BackendStorage,
+        _advice: grim_tensor::backend::MemAdvice,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -1168,24 +1232,51 @@ impl BackendDevice for MetalDevice {
                 let q_s = q.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
                     Error::Backend("kv_dequant_attention q is not MetalStorage".into())
                 })?;
-                let k_s = k_tensor.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("kv_dequant_attention k_tensor is not MetalStorage".into())
-                })?;
-                let ks_s = k_scales.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("kv_dequant_attention k_scales is not MetalStorage".into())
-                })?;
-                let v_s = v_tensor.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("kv_dequant_attention v_tensor is not MetalStorage".into())
-                })?;
-                let vs_s = v_scales.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("kv_dequant_attention v_scales is not MetalStorage".into())
-                })?;
+                let k_s = k_tensor
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| {
+                        Error::Backend("kv_dequant_attention k_tensor is not MetalStorage".into())
+                    })?;
+                let ks_s = k_scales
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| {
+                        Error::Backend("kv_dequant_attention k_scales is not MetalStorage".into())
+                    })?;
+                let v_s = v_tensor
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| {
+                        Error::Backend("kv_dequant_attention v_tensor is not MetalStorage".into())
+                    })?;
+                let vs_s = v_scales
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| {
+                        Error::Backend("kv_dequant_attention v_scales is not MetalStorage".into())
+                    })?;
 
-                let q_buf = q_s.buffer.as_ref().ok_or_else(|| Error::Backend("q has no GPU buffer".into()))?;
-                let k_buf = k_s.buffer.as_ref().ok_or_else(|| Error::Backend("k_tensor has no GPU buffer".into()))?;
-                let ks_buf = ks_s.buffer.as_ref().ok_or_else(|| Error::Backend("k_scales has no GPU buffer".into()))?;
-                let v_buf = v_s.buffer.as_ref().ok_or_else(|| Error::Backend("v_tensor has no GPU buffer".into()))?;
-                let vs_buf = vs_s.buffer.as_ref().ok_or_else(|| Error::Backend("v_scales has no GPU buffer".into()))?;
+                let q_buf = q_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("q has no GPU buffer".into()))?;
+                let k_buf = k_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("k_tensor has no GPU buffer".into()))?;
+                let ks_buf = ks_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("k_scales has no GPU buffer".into()))?;
+                let v_buf = v_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("v_tensor has no GPU buffer".into()))?;
+                let vs_buf = vs_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("v_scales has no GPU buffer".into()))?;
 
                 let out_dims = out_shape.dims();
                 if out_dims.len() != 3 {
@@ -1200,9 +1291,9 @@ impl BackendDevice for MetalDevice {
                 let out_buf = out_s.buffer.as_ref().unwrap();
 
                 let cmd_buffer = self.get_or_create_command_buffer()?;
-                let encoder = cmd_buffer
-                    .computeCommandEncoder()
-                    .ok_or_else(|| Error::from(MetalError::Ffi("Failed to create compute encoder".into())))?;
+                let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                    Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                })?;
 
                 encoder.setComputePipelineState(&inner.pipelines.kv_dequant_attn);
                 encoder.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
@@ -1222,14 +1313,46 @@ impl BackendDevice for MetalDevice {
                 let quant_bits_val = quant_bits as i32;
 
                 unsafe {
-                    encoder.setBytes_length_atIndex(&num_heads_val as *const i32 as *const std::ffi::c_void, 4, 6);
-                    encoder.setBytes_length_atIndex(&num_kv_heads_val as *const i32 as *const std::ffi::c_void, 4, 7);
-                    encoder.setBytes_length_atIndex(&head_dim_val as *const i32 as *const std::ffi::c_void, 4, 8);
-                    encoder.setBytes_length_atIndex(&seq_len_val as *const i32 as *const std::ffi::c_void, 4, 9);
-                    encoder.setBytes_length_atIndex(&kv_seq_len_val as *const i32 as *const std::ffi::c_void, 4, 10);
-                    encoder.setBytes_length_atIndex(&cache_offset_val as *const i32 as *const std::ffi::c_void, 4, 11);
-                    encoder.setBytes_length_atIndex(&inv_sqrt_d as *const f32 as *const std::ffi::c_void, 4, 12);
-                    encoder.setBytes_length_atIndex(&quant_bits_val as *const i32 as *const std::ffi::c_void, 4, 13);
+                    encoder.setBytes_length_atIndex(
+                        &num_heads_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        6,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &num_kv_heads_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        7,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &head_dim_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        8,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &seq_len_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        9,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &kv_seq_len_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        10,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &cache_offset_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        11,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &inv_sqrt_d as *const f32 as *const std::ffi::c_void,
+                        4,
+                        12,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &quant_bits_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        13,
+                    );
                 }
 
                 let threads_per_group = MTLSize::new(1, 1, 1);
@@ -1237,15 +1360,35 @@ impl BackendDevice for MetalDevice {
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
                 encoder.endEncoding();
 
-                Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })))
+                Ok((
+                    out_storage,
+                    Box::new(MetalHandle {
+                        command_buffer: cmd_buffer,
+                    }),
+                ))
             } else {
-                Err(Error::Backend("Metal device inner is None (fallback mode)".into()))
+                Err(Error::Backend(
+                    "Metal device inner is None (fallback mode)".into(),
+                ))
             }
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            let _ = (q, k_tensor, k_scales, v_tensor, v_scales, num_kv_heads, kv_seq_len, cache_offset, quant_bits, out_shape);
-            Err(Error::Unimplemented("kv_dequant_attention not supported on non-Apple platform".into()))
+            let _ = (
+                q,
+                k_tensor,
+                k_scales,
+                v_tensor,
+                v_scales,
+                num_kv_heads,
+                kv_seq_len,
+                cache_offset,
+                quant_bits,
+                out_shape,
+            );
+            Err(Error::Unimplemented(
+                "kv_dequant_attention not supported on non-Apple platform".into(),
+            ))
         }
     }
 
@@ -1261,7 +1404,17 @@ impl BackendDevice for MetalDevice {
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        self.qkv_attention(q, k, v, num_kv_heads, kv_seq_len, cache_offset, out_shape, out_max, out_sum)
+        self.qkv_attention(
+            q,
+            k,
+            v,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            out_shape,
+            out_max,
+            out_sum,
+        )
     }
 
     fn mul_scalar(
@@ -1298,15 +1451,7 @@ impl BackendDevice for MetalDevice {
         #[cfg(target_vendor = "apple")]
         {
             if let Some(ref inner) = self.inner {
-                return self.run_unary(
-                    inner,
-                    &inner.pipelines.sqrt,
-                    x,
-                    None,
-                    out_shape,
-                    None,
-                    2,
-                );
+                return self.run_unary(inner, &inner.pipelines.sqrt, x, None, out_shape, None, 2);
             }
         }
         let x_vec = x.to_cpu_vec_f32()?;
@@ -1323,15 +1468,7 @@ impl BackendDevice for MetalDevice {
         #[cfg(target_vendor = "apple")]
         {
             if let Some(ref inner) = self.inner {
-                return self.run_unary(
-                    inner,
-                    &inner.pipelines.recip,
-                    x,
-                    None,
-                    out_shape,
-                    None,
-                    2,
-                );
+                return self.run_unary(inner, &inner.pipelines.recip, x, None, out_shape, None, 2);
             }
         }
         let x_vec = x.to_cpu_vec_f32()?;
@@ -1354,7 +1491,10 @@ impl BackendDevice for MetalDevice {
                 let x_s = x.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
                     Error::Backend("Metal rope: input x is not MetalStorage".into())
                 })?;
-                let x_buf = x_s.buffer.as_ref().ok_or_else(|| Error::Backend("x has no GPU buffer".into()))?;
+                let x_buf = x_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("x has no GPU buffer".into()))?;
 
                 let out_storage = self.zeros(out_shape, x.dtype())?;
                 let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
@@ -1366,12 +1506,17 @@ impl BackendDevice for MetalDevice {
 
                 // Upload positions to a temporary GPU buffer.
                 let pos_data = std::sync::Arc::new(positions.to_vec());
-                let pos_buf = inner.device
+                let pos_buf = inner
+                    .device
                     .newBufferWithLength_options(
                         (positions.len() * std::mem::size_of::<u32>()) as u64,
                         objc2_metal::MTLResourceOptions::StorageModeShared,
                     )
-                    .ok_or_else(|| Error::from(MetalError::AllocationFailed("Failed to allocate pos buffer for rope".into())))?;
+                    .ok_or_else(|| {
+                        Error::from(MetalError::AllocationFailed(
+                            "Failed to allocate pos buffer for rope".into(),
+                        ))
+                    })?;
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         pos_data.as_ptr() as *const u8,
@@ -1383,9 +1528,9 @@ impl BackendDevice for MetalDevice {
                 let total = out_shape.elem_count();
 
                 let cmd_buffer = self.get_or_create_command_buffer()?;
-                let encoder = cmd_buffer
-                    .computeCommandEncoder()
-                    .ok_or_else(|| Error::from(MetalError::Ffi("Failed to create compute encoder".into())))?;
+                let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                    Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                })?;
 
                 encoder.setComputePipelineState(&inner.pipelines.rope);
                 encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
@@ -1427,11 +1572,16 @@ impl BackendDevice for MetalDevice {
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
                 encoder.endEncoding();
 
-                return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })));
+                return Ok((
+                    out_storage,
+                    Box::new(MetalHandle {
+                        command_buffer: cmd_buffer,
+                    }),
+                ));
             }
         }
 
-        // CPU fallback for non-Apple targets or when Metal is unavailable.
+        // CPU fallback: non-Apple target or Metal unavailable.
         let x_vec = x.to_cpu_vec_f32()?;
         let num_tokens = positions.len();
         let num_heads = out_shape.elem_count() / (num_tokens * dim);
@@ -1476,13 +1626,24 @@ impl BackendDevice for MetalDevice {
                 use objc2_metal::MTLResourceOptions;
                 let buffer = inner
                     .device
-                    .newBufferWithLength_options(data.len() as u64, MTLResourceOptions::StorageModeShared)
-                    .ok_or_else(|| Error::from(MetalError::AllocationFailed("Failed to allocate Metal buffer".into())))?;
+                    .newBufferWithLength_options(
+                        data.len() as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or_else(|| {
+                        Error::from(MetalError::AllocationFailed(
+                            "Failed to allocate Metal buffer".into(),
+                        ))
+                    })?;
 
                 let contents = buffer.contents();
                 if !contents.is_null() {
                     unsafe {
-                        std::ptr::copy_nonoverlapping(data.as_ptr(), contents as *mut u8, data.len());
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr(),
+                            contents as *mut u8,
+                            data.len(),
+                        );
                     }
                 }
 
@@ -1552,8 +1713,16 @@ impl BackendDevice for MetalDevice {
                         let c_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
 
                         let a_val = if a_v.len() > a_idx { a_v[a_idx] } else { 1.0 };
-                        let b_val = if b_v.len() > b_idx_off { b_v[b_idx_off] } else { 1.0 };
-                        let c_val = if c_v.len() > c_idx_off { c_v[c_idx_off] } else { 1.0 };
+                        let b_val = if b_v.len() > b_idx_off {
+                            b_v[b_idx_off]
+                        } else {
+                            1.0
+                        };
+                        let c_val = if c_v.len() > c_idx_off {
+                            c_v[c_idx_off]
+                        } else {
+                            1.0
+                        };
 
                         h[s] = a_val * h[s] + x_t * b_val;
                         y_t += c_val * h[s];
@@ -1579,7 +1748,8 @@ impl BackendDevice for MetalDevice {
         _causal: bool,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let (out_storage, _h) = self.qkv_attention(q, k, v, num_kv_heads, seq_len, 0, out_shape, None, None)?;
+        let (out_storage, _h) =
+            self.qkv_attention(q, k, v, num_kv_heads, seq_len, 0, out_shape, None, None)?;
         let _ = num_heads;
         let _ = head_dim;
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
@@ -1596,7 +1766,8 @@ impl BackendDevice for MetalDevice {
         kv_seq_len: usize,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let (out_storage, _h) = self.qkv_attention(q, k, v, num_heads, kv_seq_len, 0, out_shape, None, None)?;
+        let (out_storage, _h) =
+            self.qkv_attention(q, k, v, num_heads, kv_seq_len, 0, out_shape, None, None)?;
         let _ = head_dim;
         let _ = seq_len;
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
@@ -1619,7 +1790,7 @@ impl BackendDevice for MetalDevice {
         let v_vec = v.to_cpu_vec_f32()?;
         let g_vec = g.to_cpu_vec_f32()?;
         let w_vec = w.to_cpu_vec_f32()?;
-
+        tracing::warn!("Metal rwkv_time_mix: falling back to CPU execution");
         let mut out = vec![0.0f32; batch * seq_len * dim];
         for b in 0..batch {
             for d in 0..dim {
@@ -1628,9 +1799,21 @@ impl BackendDevice for MetalDevice {
 
                 for t in 0..seq_len {
                     let idx = (b * seq_len + t) * dim + d;
-                    let k_t = if k_vec.len() > idx { k_vec[idx] } else { x_vec[idx] };
-                    let v_t = if v_vec.len() > idx { v_vec[idx] } else { x_vec[idx] };
-                    let g_t = if g_vec.len() > idx { g_vec[idx] } else { 1.0f32 };
+                    let k_t = if k_vec.len() > idx {
+                        k_vec[idx]
+                    } else {
+                        x_vec[idx]
+                    };
+                    let v_t = if v_vec.len() > idx {
+                        v_vec[idx]
+                    } else {
+                        x_vec[idx]
+                    };
+                    let g_t = if g_vec.len() > idx {
+                        g_vec[idx]
+                    } else {
+                        1.0f32
+                    };
 
                     state = w_val * state + k_t * v_t;
                     let sig = 1.0f32 / (1.0f32 + (-g_t).exp());
@@ -1657,7 +1840,7 @@ impl BackendDevice for MetalDevice {
         let k_vec = k.to_cpu_vec_f32()?;
         let r_vec = r.to_cpu_vec_f32()?;
         let v_vec = v.to_cpu_vec_f32()?;
-
+        tracing::warn!("Metal rwkv_channel_mix: falling back to CPU execution");
         let elem_count = out_shape.elem_count();
         let mut out = vec![0.0f32; elem_count];
         for i in 0..elem_count {
@@ -1685,13 +1868,109 @@ impl BackendDevice for MetalDevice {
         b_scales: &[f32],
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let a_vec = a.to_cpu_vec_f32()?;
         let a_dims = a.shape().dims();
         let out_dims = out_shape.dims();
         let m = a_dims[0];
         let k = a_dims[1];
         let n = out_dims[1];
 
+        // --- Apple Silicon GPU fast-path ----------------------------------------
+        // Each thread computes one output element [row, col] by dequantizing
+        // its column of B on-the-fly inside the kernel.  Both A and B-packed
+        // must be device-resident MetalStorage buffers.
+        #[cfg(target_vendor = "apple")]
+        {
+            let a_s = a.as_any().downcast_ref::<MetalStorage>();
+            let b_s = b_packed.as_any().downcast_ref::<MetalStorage>();
+            if let (Some(a_s), Some(b_s)) = (a_s, b_s) {
+                if let (Some(a_buf), Some(b_buf)) = (a_s.buffer.as_ref(), b_s.buffer.as_ref()) {
+                    if let Ok(ctx) = MetalContext::get() {
+                        if k >= 32 && k % 32 == 0 {
+                            // Pad / truncate scales to exactly n * (k/32) entries.
+                            let blocks_per_col = k / 32;
+                            let scales_len = n * blocks_per_col;
+                            let mut scales_f32 = vec![1.0f32; scales_len];
+                            let copy_len = b_scales.len().min(scales_len);
+                            scales_f32[..copy_len].copy_from_slice(&b_scales[..copy_len]);
+
+                            let scales_buf = ctx
+                                .device
+                                .newBufferWithBytes_length_options(
+                                    scales_f32.as_ptr() as *const std::ffi::c_void,
+                                    (scales_f32.len() * 4) as u64,
+                                    MTLResourceOptions::StorageModeShared,
+                                )
+                                .ok_or_else(|| {
+                                    Error::from(MetalError::AllocationFailed(
+                                        "Failed to allocate scales buffer".into(),
+                                    ))
+                                })?;
+
+                            let out_storage = self.zeros(out_shape, DType::F32)?;
+                            let out_s =
+                                out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                            let out_buf = out_s.buffer.as_ref().unwrap();
+
+                            let cmd_buffer = self.get_or_create_command_buffer()?;
+                            let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                                Error::from(MetalError::Ffi(
+                                    "Failed to create compute encoder".into(),
+                                ))
+                            })?;
+
+                            encoder.setComputePipelineState(&ctx.pipelines.quantized_matmul);
+                            encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
+                            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+                            encoder.setBuffer_offset_atIndex(Some(&scales_buf), 0, 2);
+                            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 3);
+
+                            let m_val = m as i32;
+                            let n_val = n as i32;
+                            let k_val = k as i32;
+                            unsafe {
+                                encoder.setBytes_length_atIndex(
+                                    &m_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    4,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &n_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    5,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &k_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    6,
+                                );
+                            }
+
+                            // 16×16 threadgroup = 256 threads, matching CUDA block size.
+                            let threads_per_group = MTLSize::new(16, 16, 1);
+                            let groups =
+                                MTLSize::new(((n + 15) / 16) as u64, ((m + 15) / 16) as u64, 1);
+                            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                                groups,
+                                threads_per_group,
+                            );
+                            encoder.endEncoding();
+
+                            return Ok((
+                                out_storage,
+                                Box::new(MetalHandle {
+                                    command_buffer: cmd_buffer,
+                                }),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        // --- end GPU fast-path ---------------------------------------------------
+
+        // CPU fallback: dequant b and compute matmul on host.
+        tracing::warn!("Metal quantized_matmul: falling back to CPU execution");
+        let a_vec = a.to_cpu_vec_f32()?;
         let mut b_dequant = vec![0.0f32; k * n];
         let blocks_per_col = k / 32;
 
@@ -1720,10 +1999,18 @@ impl BackendDevice for MetalDevice {
         for col in 0..n {
             for block in 0..blocks_per_col {
                 let scale_idx = col * blocks_per_col + block;
-                let scale = if scale_idx < b_scales.len() { b_scales[scale_idx] } else { 1.0f32 };
+                let scale = if scale_idx < b_scales.len() {
+                    b_scales[scale_idx]
+                } else {
+                    1.0f32
+                };
                 for i in 0..32 {
                     let byte_offset = (col * blocks_per_col + block) * 32 + i;
-                    let byte_val = if byte_offset < b_bytes.len() { b_bytes[byte_offset] } else { 128u8 };
+                    let byte_val = if byte_offset < b_bytes.len() {
+                        b_bytes[byte_offset]
+                    } else {
+                        128u8
+                    };
                     let q_val = (byte_val as i16 - 128) as f32 / 127.0f32;
                     let r = block * 32 + i;
                     if r < k {
@@ -1747,10 +2034,26 @@ impl BackendDevice for MetalDevice {
         let out_storage = self.from_cpu(&c_vec, out_shape, a.dtype())?;
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
     }
+
+    fn estimate_gemm_latency_ms(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        dtype: DType,
+        _placement: &grim_tensor::backend::ScythePlacement,
+    ) -> f64 {
+        let flops = 2.0 * m as f64 * n as f64 * k as f64;
+        let tflops = match dtype.arith {
+            ArithType::F16 | ArithType::BF16 => 200.0,
+            ArithType::F32 => 100.0,
+            _ => 50.0,
+        };
+        (flops / (tflops * 1e12) * 1000.0).max(0.01)
+    }
 }
 
 impl MetalDevice {
-    /// Fused QKV attention matching ROCm / CUDA signatures.
     #[allow(clippy::too_many_arguments)]
     pub fn qkv_attention(
         &self,
@@ -1777,30 +2080,49 @@ impl MetalDevice {
         #[cfg(target_vendor = "apple")]
         {
             if let Some(ref inner) = self.inner {
-                if q.dtype().arith != ArithType::F32 || k.dtype().arith != ArithType::F32 || v.dtype().arith != ArithType::F32 {
+                if q.dtype().arith != ArithType::F32
+                    || k.dtype().arith != ArithType::F32
+                    || v.dtype().arith != ArithType::F32
+                {
                     return Err(Error::from(MetalError::UnsupportedDType(q.dtype())));
                 }
 
-                let q_s = q.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("qkv_attention q is not MetalStorage".into())
-                })?;
-                let k_s = k.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("qkv_attention k is not MetalStorage".into())
-                })?;
-                let v_s = v.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-                    Error::Backend("qkv_attention v is not MetalStorage".into())
-                })?;
+                let q_s = q
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| Error::Backend("qkv_attention q is not MetalStorage".into()))?;
+                let k_s = k
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| Error::Backend("qkv_attention k is not MetalStorage".into()))?;
+                let v_s = v
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| Error::Backend("qkv_attention v is not MetalStorage".into()))?;
 
-                let q_buf = q_s.buffer.as_ref().ok_or_else(|| Error::Backend("q has no GPU buffer".into()))?;
-                let k_buf = k_s.buffer.as_ref().ok_or_else(|| Error::Backend("k has no GPU buffer".into()))?;
-                let v_buf = v_s.buffer.as_ref().ok_or_else(|| Error::Backend("v has no GPU buffer".into()))?;
+                let q_buf = q_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("q has no GPU buffer".into()))?;
+                let k_buf = k_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("k has no GPU buffer".into()))?;
+                let v_buf = v_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("v has no GPU buffer".into()))?;
 
                 let max_s = match out_max {
                     Some(m) => {
                         let ms = m.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
                             Error::Backend("qkv_attention out_max is not MetalStorage".into())
                         })?;
-                        Some(ms.buffer.as_ref().ok_or_else(|| Error::Backend("out_max has no GPU buffer".into()))?)
+                        Some(
+                            ms.buffer.as_ref().ok_or_else(|| {
+                                Error::Backend("out_max has no GPU buffer".into())
+                            })?,
+                        )
                     }
                     None => None,
                 };
@@ -1809,7 +2131,11 @@ impl MetalDevice {
                         let ss = s.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
                             Error::Backend("qkv_attention out_sum is not MetalStorage".into())
                         })?;
-                        Some(ss.buffer.as_ref().ok_or_else(|| Error::Backend("out_sum has no GPU buffer".into()))?)
+                        Some(
+                            ss.buffer.as_ref().ok_or_else(|| {
+                                Error::Backend("out_sum has no GPU buffer".into())
+                            })?,
+                        )
                     }
                     None => None,
                 };
@@ -1819,9 +2145,9 @@ impl MetalDevice {
                 let out_buf = out_s.buffer.as_ref().unwrap();
 
                 let cmd_buffer = self.get_or_create_command_buffer()?;
-                let encoder = cmd_buffer
-                    .computeCommandEncoder()
-                    .ok_or_else(|| Error::from(MetalError::Ffi("Failed to create compute encoder".into())))?;
+                let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                    Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                })?;
 
                 encoder.setComputePipelineState(&inner.pipelines.qkv_attn);
                 encoder.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
@@ -1882,11 +2208,16 @@ impl MetalDevice {
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
                 encoder.endEncoding();
 
-                Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })))
+                Ok((
+                    out_storage,
+                    Box::new(MetalHandle {
+                        command_buffer: cmd_buffer,
+                    }),
+                ))
             } else {
                 let _ = out_max;
                 let _ = out_sum;
-                // Simple host-fallback simulation for unit tests
+                // Host-fallback for unit tests without Apple hardware.
                 let q_vec = q.to_cpu_vec_f32()?;
                 let k_vec = k.to_cpu_vec_f32()?;
                 let v_vec = v.to_cpu_vec_f32()?;
@@ -1900,7 +2231,11 @@ impl MetalDevice {
                         let kv_head = h / q_per_kv;
                         let q_offset = (i * num_heads + h) * head_dim;
                         let abs_i = cache_offset as usize + i;
-                        let range_len = if abs_i < kv_seq_len { abs_i + 1 } else { kv_seq_len };
+                        let range_len = if abs_i < kv_seq_len {
+                            abs_i + 1
+                        } else {
+                            kv_seq_len
+                        };
 
                         let mut running_max = -1e30_f32;
                         let mut running_sum = 0.0_f32;
@@ -1909,7 +2244,8 @@ impl MetalDevice {
                         for j in 0..range_len {
                             let mut score = 0.0_f32;
                             for d in 0..head_dim {
-                                score += q_vec[q_offset + d] * k_vec[(j * num_kv_heads + kv_head) * head_dim + d];
+                                score += q_vec[q_offset + d]
+                                    * k_vec[(j * num_kv_heads + kv_head) * head_dim + d];
                             }
                             score *= inv_sqrt_d;
                             scores[j] = score;
@@ -1925,7 +2261,12 @@ impl MetalDevice {
                         for d in 0..head_dim {
                             let mut acc = 0.0_f32;
                             for j in 0..range_len {
-                                let weight = (scores[j] - running_max).exp() / (if running_sum > 0.0_f32 { running_sum } else { 1.0_f32 });
+                                let weight = (scores[j] - running_max).exp()
+                                    / (if running_sum > 0.0_f32 {
+                                        running_sum
+                                    } else {
+                                        1.0_f32
+                                    });
                                 acc += weight * v_vec[(j * num_kv_heads + kv_head) * head_dim + d];
                             }
                             out_vec[q_offset + d] = acc;
@@ -1941,7 +2282,7 @@ impl MetalDevice {
         {
             let _ = out_max;
             let _ = out_sum;
-            // Simple host-fallback simulation for unit tests
+            // Host-fallback for unit tests without Apple hardware.
             let q_vec = q.to_cpu_vec_f32()?;
             let k_vec = k.to_cpu_vec_f32()?;
             let v_vec = v.to_cpu_vec_f32()?;
@@ -1955,7 +2296,11 @@ impl MetalDevice {
                     let kv_head = h / q_per_kv;
                     let q_offset = (i * num_heads + h) * head_dim;
                     let abs_i = cache_offset as usize + i;
-                    let range_len = if abs_i < kv_seq_len { abs_i + 1 } else { kv_seq_len };
+                    let range_len = if abs_i < kv_seq_len {
+                        abs_i + 1
+                    } else {
+                        kv_seq_len
+                    };
 
                     let mut running_max = -1e30_f32;
                     let mut running_sum = 0.0_f32;
@@ -1964,7 +2309,8 @@ impl MetalDevice {
                     for j in 0..range_len {
                         let mut score = 0.0_f32;
                         for d in 0..head_dim {
-                            score += q_vec[q_offset + d] * k_vec[(j * num_kv_heads + kv_head) * head_dim + d];
+                            score += q_vec[q_offset + d]
+                                * k_vec[(j * num_kv_heads + kv_head) * head_dim + d];
                         }
                         score *= inv_sqrt_d;
                         scores[j] = score;
@@ -1980,7 +2326,12 @@ impl MetalDevice {
                     for d in 0..head_dim {
                         let mut acc = 0.0_f32;
                         for j in 0..range_len {
-                            let weight = (scores[j] - running_max).exp() / (if running_sum > 0.0_f32 { running_sum } else { 1.0_f32 });
+                            let weight = (scores[j] - running_max).exp()
+                                / (if running_sum > 0.0_f32 {
+                                    running_sum
+                                } else {
+                                    1.0_f32
+                                });
                             acc += weight * v_vec[(j * num_kv_heads + kv_head) * head_dim + d];
                         }
                         out_vec[q_offset + d] = acc;
@@ -2008,8 +2359,14 @@ impl MetalDevice {
         let b_s = b.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
             Error::Backend("Metal elementwise: input b is not MetalStorage".into())
         })?;
-        let a_buf = a_s.buffer.as_ref().ok_or_else(|| Error::Backend("a has no GPU buffer".into()))?;
-        let b_buf = b_s.buffer.as_ref().ok_or_else(|| Error::Backend("b has no GPU buffer".into()))?;
+        let a_buf = a_s
+            .buffer
+            .as_ref()
+            .ok_or_else(|| Error::Backend("a has no GPU buffer".into()))?;
+        let b_buf = b_s
+            .buffer
+            .as_ref()
+            .ok_or_else(|| Error::Backend("b has no GPU buffer".into()))?;
 
         let out_storage = self.zeros(out, a.dtype())?;
         let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
@@ -2018,9 +2375,9 @@ impl MetalDevice {
         let total = out.elem_count();
 
         let cmd_buffer = self.get_or_create_command_buffer()?;
-        let encoder = cmd_buffer
-            .computeCommandEncoder()
-            .ok_or_else(|| Error::from(MetalError::Ffi("Failed to create compute encoder".into())))?;
+        let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+            Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+        })?;
 
         encoder.setComputePipelineState(pipeline);
         encoder.setBuffer_offset_atIndex(Some(a_buf), 0, 0);
@@ -2041,19 +2398,15 @@ impl MetalDevice {
         encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
         encoder.endEncoding();
 
-        Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })))
+        Ok((
+            out_storage,
+            Box::new(MetalHandle {
+                command_buffer: cmd_buffer,
+            }),
+        ))
     }
 
     #[cfg(target_vendor = "apple")]
-    /// Launch a unary GPU kernel (one input, optional scalar, one output).
-    ///
-    /// Used by `mul_scalar`, `sqrt`, `recip`, and `rope`. The MSL kernels
-    /// share a common pattern: one input buffer, one output buffer, a
-    /// scalar parameter (when present), and an element-count constant.
-    ///
-    /// `scalar_binding` is the Metal buffer index for the scalar parameter
-    /// (or `None` if the kernel has no scalar).
-    /// `n_binding` is the Metal buffer index for the element-count constant.
     fn run_unary(
         &self,
         inner: &MetalDeviceInner,
@@ -2064,10 +2417,14 @@ impl MetalDevice {
         scalar_binding: Option<usize>,
         n_binding: usize,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let input_s = input.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
-            Error::Backend("Metal unary: input is not MetalStorage".into())
-        })?;
-        let input_buf = input_s.buffer.as_ref().ok_or_else(|| Error::Backend("input has no GPU buffer".into()))?;
+        let input_s = input
+            .as_any()
+            .downcast_ref::<MetalStorage>()
+            .ok_or_else(|| Error::Backend("Metal unary: input is not MetalStorage".into()))?;
+        let input_buf = input_s
+            .buffer
+            .as_ref()
+            .ok_or_else(|| Error::Backend("input has no GPU buffer".into()))?;
 
         let out_storage = self.zeros(out, input.dtype())?;
         let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
@@ -2076,9 +2433,9 @@ impl MetalDevice {
         let total = out.elem_count();
 
         let cmd_buffer = self.get_or_create_command_buffer()?;
-        let encoder = cmd_buffer
-            .computeCommandEncoder()
-            .ok_or_else(|| Error::from(MetalError::Ffi("Failed to create compute encoder".into())))?;
+        let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+            Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+        })?;
 
         encoder.setComputePipelineState(pipeline);
         encoder.setBuffer_offset_atIndex(Some(input_buf), 0, 0);
@@ -2109,7 +2466,12 @@ impl MetalDevice {
         encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
         encoder.endEncoding();
 
-        Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd_buffer })))
+        Ok((
+            out_storage,
+            Box::new(MetalHandle {
+                command_buffer: cmd_buffer,
+            }),
+        ))
     }
 
     #[cfg(not(target_vendor = "apple"))]
@@ -2124,32 +2486,27 @@ impl MetalDevice {
         let _ = _scalar;
         let _ = _scalar_binding;
         let _ = _n_binding;
-        // Non-Apple: no Metal GPU available; caller should fall back to CPU.
-        Err(Error::Backend("Metal unary kernel not available on this platform".into()))
+        // Non-Apple target — callers should fall back to CPU.
+        Err(Error::Backend(
+            "Metal unary kernel not available on this platform".into(),
+        ))
     }
 }
 
-/// Layout dimensions for Metal compute block threadgroups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetalTileConfig {
-    /// Dimension size of the tiled block in the M dimension.
     pub block_m: u32,
-    /// Dimension size of the tiled block in the N dimension.
     pub block_n: u32,
-    /// Dimension size of the tiled block in the K dimension.
     pub block_k: u32,
 }
 
-/// Runtime autotuner analyzing GPU execution constraints to optimize tile shapes.
 pub struct Tuner;
 
 impl Tuner {
-    /// Creates a new Tuner instance.
     pub fn new() -> Self {
         Self
     }
 
-    /// Evaluates target GPU constraints to look up or benchmark the optimal threadgroup configuration.
     #[cfg(target_vendor = "apple")]
     pub fn search_tile_config(
         &self,
@@ -2161,10 +2518,26 @@ impl Tuner {
         let key = (m, n, k);
         self.with_persistent_cache(key, || {
             let candidates = vec![
-                MetalTileConfig { block_m: 8, block_n: 8, block_k: 8 },
-                MetalTileConfig { block_m: 16, block_n: 16, block_k: 16 },
-                MetalTileConfig { block_m: 32, block_n: 16, block_k: 16 },
-                MetalTileConfig { block_m: 16, block_n: 32, block_k: 16 },
+                MetalTileConfig {
+                    block_m: 8,
+                    block_n: 8,
+                    block_k: 8,
+                },
+                MetalTileConfig {
+                    block_m: 16,
+                    block_n: 16,
+                    block_k: 16,
+                },
+                MetalTileConfig {
+                    block_m: 32,
+                    block_n: 16,
+                    block_k: 16,
+                },
+                MetalTileConfig {
+                    block_m: 16,
+                    block_n: 32,
+                    block_k: 16,
+                },
             ];
             let mut best_config = candidates[1];
             let mut best_time = std::time::Duration::MAX;
@@ -2173,12 +2546,25 @@ impl Tuner {
             let bytes_a = m * k * 4;
             let bytes_b = k * n * 4;
             let bytes_c = m * n * 4;
-            let buf_a = inner.device.newBufferWithLength_options(bytes_a as u64, MTResourceOptions::StorageModeShared).unwrap();
-            let buf_b = inner.device.newBufferWithLength_options(bytes_b as u64, MTResourceOptions::StorageModeShared).unwrap();
-            let buf_c = inner.device.newBufferWithLength_options(bytes_c as u64, MTResourceOptions::StorageModeShared).unwrap();
+            let buf_a = inner
+                .device
+                .newBufferWithLength_options(bytes_a as u64, MTResourceOptions::StorageModeShared)
+                .unwrap();
+            let buf_b = inner
+                .device
+                .newBufferWithLength_options(bytes_b as u64, MTResourceOptions::StorageModeShared)
+                .unwrap();
+            let buf_c = inner
+                .device
+                .newBufferWithLength_options(bytes_c as u64, MTResourceOptions::StorageModeShared)
+                .unwrap();
 
             for &config in &candidates {
-                let config_data = [config.block_m as i32, config.block_n as i32, config.block_k as i32];
+                let config_data = [
+                    config.block_m as i32,
+                    config.block_n as i32,
+                    config.block_k as i32,
+                ];
                 for _ in 0..2 {
                     if let Some(cmd) = inner.command_queue.commandBuffer() {
                         if let Some(enc) = cmd.computeCommandEncoder() {
@@ -2190,13 +2576,36 @@ impl Tuner {
                             let n_val = n as i32;
                             let k_val = k as i32;
                             unsafe {
-                                enc.setBytes_length_atIndex(&m_val as *const i32 as *const std::ffi::c_void, 4, 3);
-                                enc.setBytes_length_atIndex(&n_val as *const i32 as *const std::ffi::c_void, 4, 4);
-                                enc.setBytes_length_atIndex(&k_val as *const i32 as *const std::ffi::c_void, 4, 5);
-                                enc.setBytes_length_atIndex(config_data.as_ptr() as *const std::ffi::c_void, 12, 6);
+                                enc.setBytes_length_atIndex(
+                                    &m_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    3,
+                                );
+                                enc.setBytes_length_atIndex(
+                                    &n_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    4,
+                                );
+                                enc.setBytes_length_atIndex(
+                                    &k_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    5,
+                                );
+                                enc.setBytes_length_atIndex(
+                                    config_data.as_ptr() as *const std::ffi::c_void,
+                                    12,
+                                    6,
+                                );
                             }
-                            let threads = MTLSize::new(config.block_n as u64, config.block_m as u64, 1);
-                            let groups = MTLSize::new(((n + (config.block_n as usize) - 1) / (config.block_n as usize)) as u64, ((m + (config.block_m as usize) - 1) / (config.block_m as usize)) as u64, 1);
+                            let threads =
+                                MTLSize::new(config.block_n as u64, config.block_m as u64, 1);
+                            let groups = MTLSize::new(
+                                ((n + (config.block_n as usize) - 1) / (config.block_n as usize))
+                                    as u64,
+                                ((m + (config.block_m as usize) - 1) / (config.block_m as usize))
+                                    as u64,
+                                1,
+                            );
                             enc.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
                             enc.endEncoding();
                             cmd.commit();
@@ -2218,13 +2627,36 @@ impl Tuner {
                             let n_val = n as i32;
                             let k_val = k as i32;
                             unsafe {
-                                enc.setBytes_length_atIndex(&m_val as *const i32 as *const std::ffi::c_void, 4, 3);
-                                enc.setBytes_length_atIndex(&n_val as *const i32 as *const std::ffi::c_void, 4, 4);
-                                enc.setBytes_length_atIndex(&k_val as *const i32 as *const std::ffi::c_void, 4, 5);
-                                enc.setBytes_length_atIndex(config_data.as_ptr() as *const std::ffi::c_void, 12, 6);
+                                enc.setBytes_length_atIndex(
+                                    &m_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    3,
+                                );
+                                enc.setBytes_length_atIndex(
+                                    &n_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    4,
+                                );
+                                enc.setBytes_length_atIndex(
+                                    &k_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    5,
+                                );
+                                enc.setBytes_length_atIndex(
+                                    config_data.as_ptr() as *const std::ffi::c_void,
+                                    12,
+                                    6,
+                                );
                             }
-                            let threads = MTLSize::new(config.block_n as u64, config.block_m as u64, 1);
-                            let groups = MTLSize::new(((n + (config.block_n as usize) - 1) / (config.block_n as usize)) as u64, ((m + (config.block_m as usize) - 1) / (config.block_m as usize)) as u64, 1);
+                            let threads =
+                                MTLSize::new(config.block_n as u64, config.block_m as u64, 1);
+                            let groups = MTLSize::new(
+                                ((n + (config.block_n as usize) - 1) / (config.block_n as usize))
+                                    as u64,
+                                ((m + (config.block_m as usize) - 1) / (config.block_m as usize))
+                                    as u64,
+                                1,
+                            );
                             enc.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
                             enc.endEncoding();
                             cmd.commit();
@@ -2244,19 +2676,16 @@ impl Tuner {
     }
 
     #[cfg(target_vendor = "apple")]
-    fn with_persistent_cache<F>(
-        &self,
-        key: (usize, usize, usize),
-        benchmark: F,
-    ) -> MetalTileConfig
+    fn with_persistent_cache<F>(&self, key: (usize, usize, usize), benchmark: F) -> MetalTileConfig
     where
         F: FnOnce() -> MetalTileConfig,
     {
-        use std::sync::Mutex;
         use std::collections::HashMap;
+        use std::sync::Mutex;
         use std::sync::OnceLock;
 
-        static CACHE: OnceLock<Mutex<HashMap<(usize, usize, usize), (u32, u32, u32)>>> = OnceLock::new();
+        static CACHE: OnceLock<Mutex<HashMap<(usize, usize, usize), (u32, u32, u32)>>> =
+            OnceLock::new();
         let cache_mutex = CACHE.get_or_init(|| {
             let mut map = HashMap::new();
             if let Some(cache_dir) = get_cache_dir() {
@@ -2318,7 +2747,6 @@ impl Tuner {
     }
 }
 
-/// Run binary operations on the CPU fallback pipeline.
 #[cfg(not(target_vendor = "apple"))]
 fn run_fallback_binary<F>(
     device: &MetalDevice,
@@ -2328,7 +2756,12 @@ fn run_fallback_binary<F>(
     op: F,
 ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>
 where
-    F: FnOnce(&CpuDevice, &CpuStorage, &CpuStorage, &Shape) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>,
+    F: FnOnce(
+        &CpuDevice,
+        &CpuStorage,
+        &CpuStorage,
+        &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>,
 {
     let a_vec = a.to_cpu_vec_f32()?;
     let b_vec = b.to_cpu_vec_f32()?;
@@ -2337,12 +2770,14 @@ where
     let a_cpu = cpu_dev.from_cpu(&a_vec, a.shape(), a.dtype())?;
     let b_cpu = cpu_dev.from_cpu(&b_vec, b.shape(), b.dtype())?;
 
-    let a_storage = a_cpu.as_any().downcast_ref::<CpuStorage>().ok_or_else(|| {
-        Error::Backend("Failed to downcast input a to CpuStorage".into())
-    })?;
-    let b_storage = b_cpu.as_any().downcast_ref::<CpuStorage>().ok_or_else(|| {
-        Error::Backend("Failed to downcast input b to CpuStorage".into())
-    })?;
+    let a_storage = a_cpu
+        .as_any()
+        .downcast_ref::<CpuStorage>()
+        .ok_or_else(|| Error::Backend("Failed to downcast input a to CpuStorage".into()))?;
+    let b_storage = b_cpu
+        .as_any()
+        .downcast_ref::<CpuStorage>()
+        .ok_or_else(|| Error::Backend("Failed to downcast input b to CpuStorage".into()))?;
 
     let (res_storage, handle) = op(&cpu_dev, a_storage, b_storage, out)?;
 
@@ -2352,8 +2787,6 @@ where
     Ok((out_metal, handle))
 }
 
-/// Helper function to retrieve the size in bytes of a data type.
-#[allow(dead_code)]
 fn dtype_byte_size(dtype: &DType) -> Result<usize> {
     #[cfg(target_vendor = "apple")]
     {
@@ -2371,22 +2804,20 @@ fn dtype_byte_size(dtype: &DType) -> Result<usize> {
     }
 }
 
-/// MLX integration bridge allowing zero-copy sharing of Metal allocations.
 pub struct MlxBridge;
 
 impl MlxBridge {
-    /// Creates a new MlxBridge instance.
     pub fn new() -> Self {
         Self
     }
 
-    /// Zero-copy maps a `MetalStorage` buffer to an MLX array.
-    /// Returns the raw pointer to the underlying MTLBuffer.
+    /// Zero-copy maps a MetalStorage buffer to an MLX array.
     #[cfg(target_vendor = "apple")]
     pub unsafe fn to_mlx_array(&self, storage: &MetalStorage) -> Result<*mut std::ffi::c_void> {
-        let buffer = storage.buffer.as_ref().ok_or_else(|| {
-            Error::Backend("Storage lacks an active Metal buffer".into())
-        })?;
+        let buffer = storage
+            .buffer
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Storage lacks an active Metal buffer".into()))?;
         let raw_ptr = objc2::rc::Retained::as_ptr(buffer) as *mut std::ffi::c_void;
         Ok(raw_ptr)
     }
@@ -2414,7 +2845,7 @@ mod tests {
 
     #[test]
     fn test_metal_zeros() {
-        let dev = MetalDevice::new(0);
+        let dev = MetalDevice::new(0).expect("MetalDevice::new(0) should succeed");
         let shape = Shape::new(vec![2, 4]);
         let storage = dev.zeros(&shape, DType::F32).unwrap();
         assert_eq!(storage.shape().dims(), &[2, 4]);
@@ -2424,9 +2855,13 @@ mod tests {
 
     #[test]
     fn test_metal_matmul() {
-        let dev = MetalDevice::new(0);
-        let a = dev.from_cpu(&[1.0, 2.0, 3.0, 4.0], &Shape::new(vec![2, 2]), DType::F32).unwrap();
-        let b = dev.from_cpu(&[5.0, 6.0, 7.0, 8.0], &Shape::new(vec![2, 2]), DType::F32).unwrap();
+        let dev = MetalDevice::new(0).expect("MetalDevice::new(0) should succeed");
+        let a = dev
+            .from_cpu(&[1.0, 2.0, 3.0, 4.0], &Shape::new(vec![2, 2]), DType::F32)
+            .unwrap();
+        let b = dev
+            .from_cpu(&[5.0, 6.0, 7.0, 8.0], &Shape::new(vec![2, 2]), DType::F32)
+            .unwrap();
         let out_shape = Shape::new(vec![2, 2]);
         let (out, handle) = dev.matmul(a.as_ref(), b.as_ref(), &out_shape).unwrap();
         handle.synchronize().unwrap();
@@ -2436,10 +2871,16 @@ mod tests {
 
     #[test]
     fn test_metal_add() {
-        let dev = MetalDevice::new(0);
-        let a = dev.from_cpu(&[1.0, 2.0], &Shape::new(vec![2]), DType::F32).unwrap();
-        let b = dev.from_cpu(&[3.0, 4.0], &Shape::new(vec![2]), DType::F32).unwrap();
-        let (out, handle) = dev.add(a.as_ref(), b.as_ref(), &Shape::new(vec![2])).unwrap();
+        let dev = MetalDevice::new(0).expect("MetalDevice::new(0) should succeed");
+        let a = dev
+            .from_cpu(&[1.0, 2.0], &Shape::new(vec![2]), DType::F32)
+            .unwrap();
+        let b = dev
+            .from_cpu(&[3.0, 4.0], &Shape::new(vec![2]), DType::F32)
+            .unwrap();
+        let (out, handle) = dev
+            .add(a.as_ref(), b.as_ref(), &Shape::new(vec![2]))
+            .unwrap();
         handle.synchronize().unwrap();
         let res = out.to_cpu_vec_f32().unwrap();
         assert_eq!(res, vec![4.0, 6.0]);
@@ -2447,12 +2888,42 @@ mod tests {
 
     #[test]
     fn test_metal_qkv_attention() {
-        let dev = MetalDevice::new(0);
-        let q = dev.from_cpu(&[1.0, 0.0, 0.0, 1.0], &Shape::new(vec![1, 2, 2]), DType::F32).unwrap();
-        let k = dev.from_cpu(&[1.0, 0.0, 0.0, 1.0], &Shape::new(vec![1, 2, 2]), DType::F32).unwrap();
-        let v = dev.from_cpu(&[2.0, 3.0, 4.0, 5.0], &Shape::new(vec![1, 2, 2]), DType::F32).unwrap();
+        let dev = MetalDevice::new(0).expect("MetalDevice::new(0) should succeed");
+        let q = dev
+            .from_cpu(
+                &[1.0, 0.0, 0.0, 1.0],
+                &Shape::new(vec![1, 2, 2]),
+                DType::F32,
+            )
+            .unwrap();
+        let k = dev
+            .from_cpu(
+                &[1.0, 0.0, 0.0, 1.0],
+                &Shape::new(vec![1, 2, 2]),
+                DType::F32,
+            )
+            .unwrap();
+        let v = dev
+            .from_cpu(
+                &[2.0, 3.0, 4.0, 5.0],
+                &Shape::new(vec![1, 2, 2]),
+                DType::F32,
+            )
+            .unwrap();
         let out_shape = Shape::new(vec![1, 2, 2]);
-        let (out, handle) = dev.qkv_attention(q.as_ref(), k.as_ref(), v.as_ref(), 2, 1, 0, &out_shape, None, None).unwrap();
+        let (out, handle) = dev
+            .qkv_attention(
+                q.as_ref(),
+                k.as_ref(),
+                v.as_ref(),
+                2,
+                1,
+                0,
+                &out_shape,
+                None,
+                None,
+            )
+            .unwrap();
         handle.synchronize().unwrap();
         let res = out.to_cpu_vec_f32().unwrap();
         assert_eq!(res, vec![2.0, 3.0, 4.0, 5.0]);
@@ -2462,24 +2933,35 @@ mod tests {
     #[test]
     fn test_metal_dtype_guards_negative() {
         // GPU path tests for apple Silicon (only run if hardware is available)
-        let dev = MetalDevice::new(0);
+        let dev = MetalDevice::new(0).expect("MetalDevice::new(0) should succeed");
         if dev.inner.is_some() {
             // Attempt to run matmul with a non-F32 dtype (e.g. U8 or F16)
-            let a = dev.from_cpu(&[1.0, 2.0], &Shape::new(vec![1, 2]), DType::U8).unwrap();
-            let b = dev.from_cpu(&[3.0, 4.0], &Shape::new(vec![2, 1]), DType::U8).unwrap();
+            let a = dev
+                .from_cpu(&[1.0, 2.0], &Shape::new(vec![1, 2]), DType::U8)
+                .unwrap();
+            let b = dev
+                .from_cpu(&[3.0, 4.0], &Shape::new(vec![2, 1]), DType::U8)
+                .unwrap();
             let out_shape = Shape::new(vec![1, 1]);
             let res = dev.matmul(a.as_ref(), b.as_ref(), &out_shape);
-            assert!(res.is_err(), "Expected matmul with non-F32 inputs to fail on GPU");
+            assert!(
+                res.is_err(),
+                "Expected matmul with non-F32 inputs to fail on GPU"
+            );
         }
     }
 
     #[cfg(target_vendor = "apple")]
     #[test]
     fn test_metal_shape_mismatches_negative() {
-        let dev = MetalDevice::new(0);
+        let dev = MetalDevice::new(0).expect("MetalDevice::new(0) should succeed");
         if dev.inner.is_some() {
-            let a = dev.from_cpu(&[1.0, 2.0], &Shape::new(vec![1, 2]), DType::F32).unwrap();
-            let b = dev.from_cpu(&[3.0, 4.0], &Shape::new(vec![3, 1]), DType::F32).unwrap();
+            let a = dev
+                .from_cpu(&[1.0, 2.0], &Shape::new(vec![1, 2]), DType::F32)
+                .unwrap();
+            let b = dev
+                .from_cpu(&[3.0, 4.0], &Shape::new(vec![3, 1]), DType::F32)
+                .unwrap();
             let out_shape = Shape::new(vec![1, 1]);
             let res = dev.matmul(a.as_ref(), b.as_ref(), &out_shape);
             assert!(res.is_err(), "Expected shape mismatch to return error");
@@ -2488,7 +2970,7 @@ mod tests {
 
     #[test]
     fn test_metal_math_ops() {
-        let dev = MetalDevice::new(0);
+        let dev = MetalDevice::new(0).expect("MetalDevice::new(0) should succeed");
         let shape = Shape::new(vec![4]);
         let host_data = vec![4.0f32, 9.0, 16.0, 25.0];
         let x = dev.from_cpu(&host_data, &shape, DType::F32).unwrap();
@@ -2497,7 +2979,10 @@ mod tests {
         assert_eq!(out_sqrt.to_cpu_vec_f32().unwrap(), vec![2.0, 3.0, 4.0, 5.0]);
 
         let (out_recip, _) = dev.recip(out_sqrt.as_ref(), &shape).unwrap();
-        assert_eq!(out_recip.to_cpu_vec_f32().unwrap(), vec![0.5, 1.0 / 3.0, 0.25, 0.2]);
+        assert_eq!(
+            out_recip.to_cpu_vec_f32().unwrap(),
+            vec![0.5, 1.0 / 3.0, 0.25, 0.2]
+        );
 
         let (out_mul, _) = dev.mul_scalar(x.as_ref(), 0.5, &shape).unwrap();
         assert_eq!(out_mul.to_cpu_vec_f32().unwrap(), vec![2.0, 4.5, 8.0, 12.5]);
@@ -2505,12 +2990,34 @@ mod tests {
 
     #[test]
     fn test_metal_kv_dequant_attention() {
-        let dev = MetalDevice::new(0);
-        let q = dev.from_cpu(&[1.0, 0.0, 0.0, 1.0], &Shape::new(vec![1, 2, 2]), DType::F32).unwrap();
-        let k_tensor = dev.from_cpu(&[1.0, 0.0, 0.0, 1.0], &Shape::new(vec![1, 2, 2]), DType::F32).unwrap();
-        let k_scales = dev.from_cpu(&[1.0, 1.0], &Shape::new(vec![2]), DType::F32).unwrap();
-        let v_tensor = dev.from_cpu(&[2.0, 3.0, 4.0, 5.0], &Shape::new(vec![1, 2, 2]), DType::F32).unwrap();
-        let v_scales = dev.from_cpu(&[1.0, 1.0], &Shape::new(vec![2]), DType::F32).unwrap();
+        let dev = MetalDevice::new(0).expect("MetalDevice::new(0) should succeed");
+        let q = dev
+            .from_cpu(
+                &[1.0, 0.0, 0.0, 1.0],
+                &Shape::new(vec![1, 2, 2]),
+                DType::F32,
+            )
+            .unwrap();
+        let k_tensor = dev
+            .from_cpu(
+                &[1.0, 0.0, 0.0, 1.0],
+                &Shape::new(vec![1, 2, 2]),
+                DType::F32,
+            )
+            .unwrap();
+        let k_scales = dev
+            .from_cpu(&[1.0, 1.0], &Shape::new(vec![2]), DType::F32)
+            .unwrap();
+        let v_tensor = dev
+            .from_cpu(
+                &[2.0, 3.0, 4.0, 5.0],
+                &Shape::new(vec![1, 2, 2]),
+                DType::F32,
+            )
+            .unwrap();
+        let v_scales = dev
+            .from_cpu(&[1.0, 1.0], &Shape::new(vec![2]), DType::F32)
+            .unwrap();
         let out_shape = Shape::new(vec![1, 2, 2]);
         let res = dev.kv_dequant_attention(
             q.as_ref(),
@@ -2544,15 +3051,26 @@ mod tests {
     fn test_metal_gpu_compute_coverage() {
         let dev = MetalDevice::try_new(0).unwrap();
         if dev.inner.is_some() {
-            let a = dev.from_cpu(&[1.0, 2.0, 3.0, 4.0], &Shape::new(vec![2, 2]), DType::F32).unwrap();
-            let b = dev.from_cpu(&[5.0, 6.0, 7.0, 8.0], &Shape::new(vec![2, 2]), DType::F32).unwrap();
-            let (out, handle) = dev.matmul(a.as_ref(), b.as_ref(), &Shape::new(vec![2, 2])).unwrap();
+            let a = dev
+                .from_cpu(&[1.0, 2.0, 3.0, 4.0], &Shape::new(vec![2, 2]), DType::F32)
+                .unwrap();
+            let b = dev
+                .from_cpu(&[5.0, 6.0, 7.0, 8.0], &Shape::new(vec![2, 2]), DType::F32)
+                .unwrap();
+            let (out, handle) = dev
+                .matmul(a.as_ref(), b.as_ref(), &Shape::new(vec![2, 2]))
+                .unwrap();
             handle.synchronize().unwrap();
             assert_eq!(out.to_cpu_vec_f32().unwrap(), vec![19.0, 22.0, 43.0, 50.0]);
 
-            let (out_add, handle_add) = dev.add(a.as_ref(), b.as_ref(), &Shape::new(vec![4])).unwrap();
+            let (out_add, handle_add) = dev
+                .add(a.as_ref(), b.as_ref(), &Shape::new(vec![4]))
+                .unwrap();
             handle_add.synchronize().unwrap();
-            assert_eq!(out_add.to_cpu_vec_f32().unwrap(), vec![6.0, 8.0, 10.0, 12.0]);
+            assert_eq!(
+                out_add.to_cpu_vec_f32().unwrap(),
+                vec![6.0, 8.0, 10.0, 12.0]
+            );
         }
     }
 
@@ -2561,7 +3079,9 @@ mod tests {
     fn test_metal_mlx_bridge() {
         let dev = MetalDevice::try_new(0).unwrap();
         if dev.inner.is_some() {
-            let storage = dev.from_cpu(&[1.0, 2.0], &Shape::new(vec![2]), DType::F32).unwrap();
+            let storage = dev
+                .from_cpu(&[1.0, 2.0], &Shape::new(vec![2]), DType::F32)
+                .unwrap();
             let metal_storage = storage.as_any().downcast_ref::<MetalStorage>().unwrap();
             let bridge = MlxBridge::new();
             let raw_ptr = unsafe { bridge.to_mlx_array(metal_storage).unwrap() };
@@ -2569,23 +3089,32 @@ mod tests {
         }
     }
 
-    // ===== Golden Mutation-Resistant Kernel & Op Tests =====
+    // ===== Golden Mutation-Resistant Op Tests =====
 
     fn close(got: f32, want: f32, ctx: &str) {
         let abs = (got - want).abs();
         let denom = want.abs().max(1e-7);
         assert!(got.is_finite(), "{ctx}: non-finite {got:?} (want {want:?})");
-        assert!(abs == 0.0 || (abs / denom) < 1e-4, "{ctx}: got {got:?} want {want:?} (abs={abs})");
+        assert!(
+            abs == 0.0 || (abs / denom) < 1e-4,
+            "{ctx}: got {got:?} want {want:?} (abs={abs})"
+        );
     }
 
     #[test]
     fn test_metal_add_golden_exact() {
-        let dev = MetalDevice::new(0);
+        let dev = MetalDevice::new(0).expect("MetalDevice::new(0) should succeed");
         let a_data = vec![1.5f32, -2.5, 0.0, 3.14159];
         let b_data = vec![2.5f32, 3.5, -1.0, 1.0];
-        let a = dev.from_cpu(&a_data, &Shape::new(vec![4]), DType::F32).unwrap();
-        let b = dev.from_cpu(&b_data, &Shape::new(vec![4]), DType::F32).unwrap();
-        let (out, handle) = dev.add(a.as_ref(), b.as_ref(), &Shape::new(vec![4])).unwrap();
+        let a = dev
+            .from_cpu(&a_data, &Shape::new(vec![4]), DType::F32)
+            .unwrap();
+        let b = dev
+            .from_cpu(&b_data, &Shape::new(vec![4]), DType::F32)
+            .unwrap();
+        let (out, handle) = dev
+            .add(a.as_ref(), b.as_ref(), &Shape::new(vec![4]))
+            .unwrap();
         handle.synchronize().unwrap();
         let res = out.to_cpu_vec_f32().unwrap();
         assert_eq!(res.len(), 4);
@@ -2597,12 +3126,18 @@ mod tests {
 
     #[test]
     fn test_metal_mul_golden_exact() {
-        let dev = MetalDevice::new(0);
+        let dev = MetalDevice::new(0).expect("MetalDevice::new(0) should succeed");
         let a_data = vec![2.0f32, -3.0, 0.5];
         let b_data = vec![4.0f32, 2.0, -8.0];
-        let a = dev.from_cpu(&a_data, &Shape::new(vec![3]), DType::F32).unwrap();
-        let b = dev.from_cpu(&b_data, &Shape::new(vec![3]), DType::F32).unwrap();
-        let (out, handle) = dev.mul(a.as_ref(), b.as_ref(), &Shape::new(vec![3])).unwrap();
+        let a = dev
+            .from_cpu(&a_data, &Shape::new(vec![3]), DType::F32)
+            .unwrap();
+        let b = dev
+            .from_cpu(&b_data, &Shape::new(vec![3]), DType::F32)
+            .unwrap();
+        let (out, handle) = dev
+            .mul(a.as_ref(), b.as_ref(), &Shape::new(vec![3]))
+            .unwrap();
         handle.synchronize().unwrap();
         let res = out.to_cpu_vec_f32().unwrap();
         assert_eq!(res.len(), 3);
@@ -2613,12 +3148,18 @@ mod tests {
 
     #[test]
     fn test_metal_silu_mul_golden_exact() {
-        let dev = MetalDevice::new(0);
+        let dev = MetalDevice::new(0).expect("MetalDevice::new(0) should succeed");
         let gate_data = vec![1.0f32, -1.0];
         let up_data = vec![2.0f32, 3.0];
-        let gate = dev.from_cpu(&gate_data, &Shape::new(vec![2]), DType::F32).unwrap();
-        let up = dev.from_cpu(&up_data, &Shape::new(vec![2]), DType::F32).unwrap();
-        let (out, handle) = dev.silu_mul(gate.as_ref(), up.as_ref(), &Shape::new(vec![2])).unwrap();
+        let gate = dev
+            .from_cpu(&gate_data, &Shape::new(vec![2]), DType::F32)
+            .unwrap();
+        let up = dev
+            .from_cpu(&up_data, &Shape::new(vec![2]), DType::F32)
+            .unwrap();
+        let (out, handle) = dev
+            .silu_mul(gate.as_ref(), up.as_ref(), &Shape::new(vec![2]))
+            .unwrap();
         handle.synchronize().unwrap();
         let res = out.to_cpu_vec_f32().unwrap();
         assert_eq!(res.len(), 2);
@@ -2635,7 +3176,7 @@ mod tests {
 
     #[test]
     fn test_metal_rms_norm_golden_exact() {
-        let dev = MetalDevice::new(0);
+        let dev = MetalDevice::new(0).expect("MetalDevice::new(0) should succeed");
         let x_data = vec![3.0f32, 4.0];
         let w_data = vec![1.0f32, 2.0];
         let shape = Shape::new(vec![2]);
@@ -2655,7 +3196,7 @@ mod tests {
 
     #[test]
     fn test_metal_softmax_golden_exact() {
-        let dev = MetalDevice::new(0);
+        let dev = MetalDevice::new(0).expect("MetalDevice::new(0) should succeed");
         let x_data = vec![1.0f32, 2.0, 3.0];
         let shape = Shape::new(vec![3]);
         let x = dev.from_cpu(&x_data, &shape, DType::F32).unwrap();
@@ -2672,25 +3213,23 @@ mod tests {
 
     #[test]
     fn test_metal_embedding_golden_exact() {
-        let dev = MetalDevice::new(0);
-        let table = vec![
-            10.0f32, 20.0,
-            30.0, 40.0,
-            50.0, 60.0,
-        ];
-        let weight = dev.from_cpu(&table, &Shape::new(vec![3, 2]), DType::F32).unwrap();
+        let dev = MetalDevice::new(0).expect("MetalDevice::new(0) should succeed");
+        let table = vec![10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let weight = dev
+            .from_cpu(&table, &Shape::new(vec![3, 2]), DType::F32)
+            .unwrap();
         let indices = vec![2u32, 0];
         let out_shape = Shape::new(vec![2, 2]);
-        let (out, handle) = dev.embedding(weight.as_ref(), &indices, &out_shape).unwrap();
+        let (out, handle) = dev
+            .embedding(weight.as_ref(), &indices, &out_shape)
+            .unwrap();
         handle.synchronize().unwrap();
         let res = out.to_cpu_vec_f32().unwrap();
         assert_eq!(res, vec![50.0, 60.0, 10.0, 20.0]);
     }
 }
 
-
-/// Query `(free_bytes, total_bytes)` memory on Metal target.
-pub fn vram_info(_ordinal: usize) -> (u64, u64) {
+pub fn vram_info(_ordinal: usize) -> Option<(u64, u64)> {
     #[cfg(target_vendor = "apple")]
     {
         use objc2_metal::MTLCreateSystemDefaultDevice;
@@ -2698,8 +3237,8 @@ pub fn vram_info(_ordinal: usize) -> (u64, u64) {
             let max_bytes = dev.recommendedMaxWorkingSetSize();
             let used_bytes = dev.currentAllocatedSize();
             let free_bytes = max_bytes.saturating_sub(used_bytes);
-            return (free_bytes as u64, max_bytes as u64);
+            return Some((free_bytes as u64, max_bytes as u64));
         }
     }
-    (0, 0)
+    None
 }

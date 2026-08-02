@@ -1,7 +1,7 @@
 //! Runtime poller — pulls models / datasets / devices / jobs from the
 //! local grim-garage backend and writes them into a shared `DisplayState`.
 //!
-//! The CVKG runtime owns one `Poller` per session; the mutator side of
+//! The application owns one `Poller` per session; the mutator side of
 //! the display state lives behind an `Arc<Mutex<DisplayState>>` that
 //! the UI reads. Polling is fire-and-await — if the backend is down,
 //! the call surfaces an error and the loop swallows it (no UI death).
@@ -9,7 +9,7 @@
 //! Live SSE for per-job metrics is opt-in via `subscribe_sse(...)` and
 //! uses the existing `JobRegistry::subscribe_metrics` broadcast
 //! channel — exactly the same one the axum `sse_metrics` handler
-//! drains. The CVKG view layer does not need a separate broadcast.
+//! drains. The view layer does not need a separate broadcast.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,9 +20,10 @@ use tokio::task::JoinHandle;
 
 use super::display::DisplayState;
 use super::http_client::{GarageClient, JobSummaryDto};
-use crate::discovery::{DatasetEntry, ModelEntry};
 use crate::backend::BackendProbe;
+use crate::discovery::{DatasetEntry, ModelEntry};
 use crate::ui_state::UiJob;
+use tracing::warn;
 
 /// Number of endpoints polled by [`poll_fetch`]. Kept as a named
 /// constant (rather than the magic literal it replaces) so the
@@ -281,7 +282,9 @@ impl Poller {
             };
             {
                 let mut s = state.lock().await;
-                let _ = merge_fetch(&mut s, fetched);
+                if let Err(e) = merge_fetch(&mut s, fetched) {
+                    warn!(error = ?e, "poll_round: initial fetch failed");
+                }
             }
             loop {
                 tokio::time::sleep(interval).await;
@@ -290,7 +293,9 @@ impl Poller {
                     Err(_elapsed) => PollFetch::new_failures(),
                 };
                 let mut s = state.lock().await;
-                let _ = merge_fetch(&mut s, fetched);
+                if let Err(e) = merge_fetch(&mut s, fetched) {
+                    warn!(error = ?e, "poll_round: fetch failed");
+                }
             }
         });
         self.handle = Some(h);
@@ -315,9 +320,9 @@ impl Drop for Poller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::BackendProbe;
     use crate::discovery::{DatasetEntry, ModelEntry};
     use crate::jobs::TrainingMode;
-    use crate::backend::BackendProbe;
     use crate::ui_state::{JobSummaryDto, UiJob};
 
     #[test]

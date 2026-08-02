@@ -22,10 +22,9 @@ use std::sync::{Arc, Mutex};
 use grim_tensor::error::{Error, Result};
 
 use crate::{
-    hipGraphCreate, hipGraphDestroy, hipGraphExecDestroy,
-    hipGraphInstantiate, hipGraphLaunch, hipStreamBeginCapture, hipStreamCreate,
-    hipStreamDestroy, hipStreamEndCapture, hipStreamSynchronize, hipSuccess,
-    HipErrorT, RocmDevice,
+    HipErrorT, RocmDevice, hipGraphCreate, hipGraphDestroy, hipGraphExecDestroy,
+    hipGraphInstantiate, hipGraphLaunch, hipStreamBeginCapture, hipStreamCreate, hipStreamDestroy,
+    hipStreamEndCapture, hipStreamSynchronize, hipSuccess,
 };
 
 /// Key for the cached graph: every captured kernel sequence is keyed by
@@ -64,11 +63,15 @@ impl DecodeGraph {
 impl Drop for DecodeGraph {
     fn drop(&mut self) {
         if !self.exec.is_null() {
-            unsafe { let _ = hipGraphExecDestroy(self.exec); }
+            unsafe {
+                let _ = hipGraphExecDestroy(self.exec);
+            }
             self.exec = std::ptr::null_mut();
         }
         if !self.graph.is_null() {
-            unsafe { let _ = hipGraphDestroy(self.graph); }
+            unsafe {
+                let _ = hipGraphDestroy(self.graph);
+            }
             self.graph = std::ptr::null_mut();
         }
     }
@@ -110,9 +113,11 @@ impl GraphCaptureManager {
     /// error and keeps the cache empty; callers will get `Err` again on
     /// the next call (no silent CPU fallback per `rust-gpu-discipline` §3).
     fn ensure_capture_stream(&self) -> Result<*mut c_void> {
-        if let Some(s) = *self.capture_stream.lock().map_err(|_| {
-            Error::Backend("capture_stream mutex poisoned".into())
-        })? {
+        if let Some(s) = *self
+            .capture_stream
+            .lock()
+            .map_err(|_| Error::Backend("capture_stream mutex poisoned".into()))?
+        {
             return Ok(s);
         }
         let mut stream: *mut c_void = std::ptr::null_mut();
@@ -123,9 +128,10 @@ impl GraphCaptureManager {
                 res
             )));
         }
-        *self.capture_stream.lock().map_err(|_| {
-            Error::Backend("capture_stream mutex poisoned".into())
-        })? = Some(stream);
+        *self
+            .capture_stream
+            .lock()
+            .map_err(|_| Error::Backend("capture_stream mutex poisoned".into()))? = Some(stream);
         Ok(stream)
     }
 
@@ -133,11 +139,7 @@ impl GraphCaptureManager {
     /// **at most once per key**; subsequent calls hand back the same
     /// `Arc<DecodeGraph>`. After `max_entries` unique keys are captured
     /// without reuse, older entries are evicted (LRU).
-    pub fn get_or_capture<F>(
-        &self,
-        key: DecodeGraphKey,
-        capture: F,
-    ) -> Result<Arc<DecodeGraph>>
+    pub fn get_or_capture<F>(&self, key: DecodeGraphKey, capture: F) -> Result<Arc<DecodeGraph>>
     where
         F: FnOnce(*mut c_void) -> Result<()> + Send,
     {
@@ -163,14 +165,13 @@ impl GraphCaptureManager {
 
         let res: HipErrorT = unsafe { hipGraphCreate(&mut graph, 0) };
         if res != hipSuccess {
-            return Err(Error::Backend(format!(
-                "hipGraphCreate failed: {}",
-                res
-            )));
+            return Err(Error::Backend(format!("hipGraphCreate failed: {}", res)));
         }
         let begin: HipErrorT = unsafe { hipStreamBeginCapture(stream, mode) };
         if begin != hipSuccess {
-            unsafe { let _ = hipGraphDestroy(graph); }
+            unsafe {
+                let _ = hipGraphDestroy(graph);
+            }
             return Err(Error::Backend(format!(
                 "hipStreamBeginCapture failed: {}",
                 begin
@@ -199,7 +200,9 @@ impl GraphCaptureManager {
             )
         };
         if inst_res != hipSuccess {
-            unsafe { let _ = hipGraphDestroy(graph); }
+            unsafe {
+                let _ = hipGraphDestroy(graph);
+            }
             return Err(Error::Backend(format!(
                 "hipGraphInstantiate failed: {}",
                 inst_res
@@ -209,9 +212,10 @@ impl GraphCaptureManager {
         let g = Arc::new(DecodeGraph { graph, exec });
 
         // Insert + LRU bookkeeping + optional eviction.
-        let mut cache = self.cache.lock().map_err(|_| {
-            Error::Backend("graph cache mutex poisoned".into())
-        })?;
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| Error::Backend("graph cache mutex poisoned".into()))?;
         if cache.len() >= self.max_entries {
             // Evict the least recently used entry.
             if let Ok(mut lru) = self.lru.lock() {
@@ -259,7 +263,9 @@ impl Drop for GraphCaptureManager {
         if let Ok(mut slot) = self.capture_stream.lock() {
             if let Some(s) = slot.take() {
                 if !s.is_null() {
-                    unsafe { let _ = hipStreamDestroy(s); }
+                    unsafe {
+                        let _ = hipStreamDestroy(s);
+                    }
                 }
             }
         }
@@ -346,7 +352,10 @@ impl HipGraphExecutor {
             );
             if res != hipSuccess {
                 let _ = hipStreamDestroy(stream);
-                return Err(Error::Backend(format!("hipGraphInstantiate failed: {}", res)));
+                return Err(Error::Backend(format!(
+                    "hipGraphInstantiate failed: {}",
+                    res
+                )));
             }
 
             // Now safe to take ownership — both graph instantiation and stream
@@ -371,7 +380,10 @@ impl HipGraphExecutor {
             }
             let res = hipStreamSynchronize(stream);
             if res != hipSuccess {
-                return Err(Error::Backend(format!("hipStreamSynchronize failed: {}", res)));
+                return Err(Error::Backend(format!(
+                    "hipStreamSynchronize failed: {}",
+                    res
+                )));
             }
             Ok(())
         }

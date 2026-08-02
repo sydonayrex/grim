@@ -1,19 +1,4 @@
-//! Handle / dimension / property types for the ROCm/HIP backend, plus
-//! the raw FFI declarations they call into. Everything here is a
-//! convenience-type safe wrapper around HIP runtime handles or an
-//! extern "C" function declaration; none of them carry device state
-//! of their own. By grouping the FFI declarations with the wrapper
-//! types we keep both visible at a glance — adding a wrapper is one
-//! file edit, not two.
-//!
-//! Skill attribution:
-//! - `rust-ffi` — the safety comments on each unsafe block / impl
-//!   recorder a SAFETY: line for any future audit.
-//! - `rust-ai-ml-inference-guide` Action 1 — backend handle surface is
-//!   the entry point for every other module.
-//! - `rust-gpu-discipline` §3 — handle wrappers convert HIP raw
-//!   `*mut c_void`s into typed Rust newtypes; the underlying pointer
-//!   is only dereferenced through the FFI calls declared here.
+//! Handle / dimension / property types for the ROCm/HIP backend, plus [see: `rust-ffi`, `rust-ai-ml-inference-guide`]
 
 use std::ffi::c_void;
 
@@ -25,8 +10,7 @@ use crate::device::helpers::check_hip;
 
 // ======== HIP FFI root types (kept in lib.rs's clippy namespace) ========
 
-/// Default integer error code type returned by every HIP runtime call.
-/// Re-exported at crate root via `device::handles::HipErrorT`.
+/// Default integer error code type returned by every HIP runtime call. [see: `device::handles::HipErrorT`]
 pub type HipErrorT = i32;
 
 /// Success return code for HIP runtime FFI calls.
@@ -35,9 +19,7 @@ pub const hipSuccess: HipErrorT = 0;
 
 // ======== RocmHandle: typed wrapper around an optional HIP stream ========
 
-/// A `ComputeHandle` contract — the caller submits work on a stream and
-/// receives this handle. `synchronize()` blocks until the stream's prior
-/// operations finish.
+/// A `ComputeHandle` contract — the caller submits work on a stream and [see: `synchronize()`]
 #[derive(Debug)]
 pub struct RocmHandle {
     stream: Option<*mut c_void>,
@@ -50,13 +32,14 @@ impl RocmHandle {
 }
 
 // SAFETY: HIP stream handles are opaque platform resources that can safely be
-// used from any thread. The underlying HIP runtime serializes stream operations.
 unsafe impl Send for RocmHandle {}
 
 impl ComputeHandle for RocmHandle {
     fn synchronize(&self) -> Result<()> {
         if let Some(stream) = self.stream {
-            check_hip("hipStreamSynchronize", unsafe { hipStreamSynchronize(stream) })?;
+            check_hip("hipStreamSynchronize", unsafe {
+                hipStreamSynchronize(stream)
+            })?;
         }
         Ok(())
     }
@@ -131,23 +114,20 @@ unsafe extern "C" {
         kind: HipMemcpyKind,
     ) -> HipErrorT;
     pub fn hipMemset(dst: *mut c_void, value: i32, size_bytes: usize) -> HipErrorT;
-    pub fn hipMemsetAsync(dst: *mut c_void, value: i32, size_bytes: usize, stream: *mut c_void) -> HipErrorT;
+    pub fn hipMemsetAsync(
+        dst: *mut c_void,
+        value: i32,
+        size_bytes: usize,
+        stream: *mut c_void,
+    ) -> HipErrorT;
     pub fn hipDeviceSynchronize() -> HipErrorT;
     pub fn hipGetDeviceCount(count: *mut HipErrorT) -> HipErrorT;
     pub fn hipSetDevice(ordinal: HipErrorT) -> HipErrorT;
     pub fn hipGetDeviceProperties(prop: *mut c_void, device: i32) -> HipErrorT;
     pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> HipErrorT;
-    pub fn hipDeviceGetAttribute(
-        value: *mut i32,
-        attribute: i32,
-        device: i32,
-    ) -> HipErrorT;
-    pub fn hipMemAdvise(
-        devPtr: *const c_void,
-        count: usize,
-        advice: i32,
-        device: i32,
-    ) -> HipErrorT;
+    pub fn hipDeviceGetAttribute(value: *mut i32, attribute: i32, device: i32) -> HipErrorT;
+    pub fn hipMemAdvise(devPtr: *const c_void, count: usize, advice: i32, device: i32)
+    -> HipErrorT;
 
     // Graph and Stream FFI
     pub fn hipStreamCreate(stream: *mut *mut c_void) -> HipErrorT;
@@ -189,8 +169,12 @@ unsafe extern "C" {
     ) -> HipErrorT;
     pub fn hipModuleLaunchKernel(
         func: *mut c_void,
-        gridX: u32, gridY: u32, gridZ: u32,
-        blockX: u32, blockY: u32, blockZ: u32,
+        gridX: u32,
+        gridY: u32,
+        gridZ: u32,
+        blockX: u32,
+        blockY: u32,
+        blockZ: u32,
         sharedMemBytes: u32,
         stream: *mut c_void,
         args: *mut *mut c_void,
@@ -293,11 +277,7 @@ mod handles_self_tests {
 
     #[test]
     fn hip_attribute_constants_match_hip_spec() {
-        // The values pinned here correspond to the HIP runtime's
-        // hipruntime.h attribute enum. If the upstream spec ever
-        // moves, this test will catch the drift at compile-time-ish
-        // (it checks the value matches what `hipDeviceGetAttribute`
-        // expects).
+        // The values pinned here correspond to the HIP runtime's [see: `hipDeviceGetAttribute`]
         assert_eq!(HIP_DEVICE_ATTRIBUTE_WARP_SIZE, 24);
         assert_eq!(HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS, 231);
         assert_eq!(HIP_DEVICE_ATTRIBUTE_COHERENT_DEVICE_ALLOC, 230);

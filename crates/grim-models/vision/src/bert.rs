@@ -1,12 +1,12 @@
 //! BERT family — bidirectional encoder implementing the Encoder trait.
 
-use std::sync::Arc;
 use grim_backend_cpu::cpu_tensor;
 use grim_core::error::Result;
-use grim_core::model::{Encoder, ModalityHint, CausalLm, AdapterHandle};
+use grim_core::model::{AdapterHandle, CausalLm, Encoder, ModalityHint};
 use grim_core::{Model, ModelConfig};
 use grim_nn::{Embedding, Linear, RmsNorm};
-use grim_tensor::{ArithType, Device, DType, Tensor};
+use grim_tensor::{ArithType, DType, Device, Tensor};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct BertConfig {
@@ -43,14 +43,45 @@ pub struct BertBlock {
 
 impl BertBlock {
     pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: &BertConfig) -> Result<Self> {
-        let wq = Linear::load(&ws.pp("attention.self.query"), cfg.hidden_size, cfg.hidden_size, true)?;
-        let wk = Linear::load(&ws.pp("attention.self.key"), cfg.hidden_size, cfg.hidden_size, true)?;
-        let wv = Linear::load(&ws.pp("attention.self.value"), cfg.hidden_size, cfg.hidden_size, true)?;
-        let wo = Linear::load(&ws.pp("attention.output.dense"), cfg.hidden_size, cfg.hidden_size, true)?;
-        let attention_ln = RmsNorm::load(&ws.pp("attention.output.LayerNorm"), cfg.hidden_size, 1e-12)?;
+        let wq = Linear::load(
+            &ws.pp("attention.self.query"),
+            cfg.hidden_size,
+            cfg.hidden_size,
+            true,
+        )?;
+        let wk = Linear::load(
+            &ws.pp("attention.self.key"),
+            cfg.hidden_size,
+            cfg.hidden_size,
+            true,
+        )?;
+        let wv = Linear::load(
+            &ws.pp("attention.self.value"),
+            cfg.hidden_size,
+            cfg.hidden_size,
+            true,
+        )?;
+        let wo = Linear::load(
+            &ws.pp("attention.output.dense"),
+            cfg.hidden_size,
+            cfg.hidden_size,
+            true,
+        )?;
+        let attention_ln =
+            RmsNorm::load(&ws.pp("attention.output.LayerNorm"), cfg.hidden_size, 1e-12)?;
 
-        let ffn_up = Linear::load(&ws.pp("intermediate.dense"), cfg.hidden_size, cfg.intermediate_size, true)?;
-        let ffn_down = Linear::load(&ws.pp("output.dense"), cfg.intermediate_size, cfg.hidden_size, true)?;
+        let ffn_up = Linear::load(
+            &ws.pp("intermediate.dense"),
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            true,
+        )?;
+        let ffn_down = Linear::load(
+            &ws.pp("output.dense"),
+            cfg.intermediate_size,
+            cfg.hidden_size,
+            true,
+        )?;
         let output_ln = RmsNorm::load(&ws.pp("output.LayerNorm"), cfg.hidden_size, 1e-12)?;
 
         Ok(Self {
@@ -93,14 +124,29 @@ pub struct Bert {
 
 impl Bert {
     pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: BertConfig) -> Result<Self> {
-        let word_embeddings = Embedding::load(&ws.pp("embeddings.word_embeddings"), cfg.vocab_size, cfg.hidden_size)?;
-        let position_embeddings = Embedding::load(&ws.pp("embeddings.position_embeddings"), cfg.max_seq_len, cfg.hidden_size)?;
-        let token_type_embeddings = Embedding::load(&ws.pp("embeddings.token_type_embeddings"), 2, cfg.hidden_size)?;
+        let word_embeddings = Embedding::load(
+            &ws.pp("embeddings.word_embeddings"),
+            cfg.vocab_size,
+            cfg.hidden_size,
+        )?;
+        let position_embeddings = Embedding::load(
+            &ws.pp("embeddings.position_embeddings"),
+            cfg.max_seq_len,
+            cfg.hidden_size,
+        )?;
+        let token_type_embeddings = Embedding::load(
+            &ws.pp("embeddings.token_type_embeddings"),
+            2,
+            cfg.hidden_size,
+        )?;
         let embeddings_ln = RmsNorm::load(&ws.pp("embeddings.LayerNorm"), cfg.hidden_size, 1e-12)?;
 
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            layers.push(BertBlock::load(&ws.pp("encoder.layer").pp(&i.to_string()), &cfg)?);
+            layers.push(BertBlock::load(
+                &ws.pp("encoder.layer").pp(&i.to_string()),
+                &cfg,
+            )?);
         }
 
         Ok(Self {
@@ -136,11 +182,17 @@ impl Encoder for Bert {
         let u_ids: Vec<u32> = ids.into_iter().map(|x| x as u32).collect();
         let seq_len = u_ids.len();
 
-        let w_emb = self.word_embeddings.forward(&u_ids, seq_len, self.cfg.hidden_size)?;
+        let w_emb = self
+            .word_embeddings
+            .forward(&u_ids, seq_len, self.cfg.hidden_size)?;
         let pos_ids: Vec<u32> = (0..seq_len).map(|i| i as u32).collect();
-        let p_emb = self.position_embeddings.forward(&pos_ids, seq_len, self.cfg.hidden_size)?;
+        let p_emb = self
+            .position_embeddings
+            .forward(&pos_ids, seq_len, self.cfg.hidden_size)?;
         let type_ids = vec![0u32; seq_len];
-        let t_emb = self.token_type_embeddings.forward(&type_ids, seq_len, self.cfg.hidden_size)?;
+        let t_emb = self
+            .token_type_embeddings
+            .forward(&type_ids, seq_len, self.cfg.hidden_size)?;
 
         let mut h = add_tensors(&w_emb, &p_emb)?;
         h = add_tensors(&h, &t_emb)?;
@@ -171,9 +223,20 @@ impl CausalLm for Bert {
 
 fn add_tensors(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let dev = grim_backend_cpu::CpuDevice::new();
-    let (s, h) = grim_tensor::BackendDevice::add(&dev, a.storage().as_ref(), b.storage().as_ref(), a.shape())?;
+    let (s, h) = grim_tensor::BackendDevice::add(
+        &dev,
+        a.storage().as_ref(),
+        b.storage().as_ref(),
+        a.shape(),
+    )?;
     h.synchronize()?;
-    Ok(Tensor::new(Arc::from(s), a.shape().clone(), DType::F32, a.provenance().clone(), a.device().clone()))
+    Ok(Tensor::new(
+        Arc::from(s),
+        a.shape().clone(),
+        DType::F32,
+        a.provenance().clone(),
+        a.device().clone(),
+    ))
 }
 
 fn gelu(t: &Tensor) -> Result<Tensor> {

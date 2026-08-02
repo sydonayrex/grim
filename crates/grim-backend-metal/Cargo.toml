@@ -10,6 +10,7 @@ description = "Metal compatibility backend for Grim."
 grim-tensor = { workspace = true }
 grim-backend-cpu = { workspace = true }
 thiserror = { workspace = true }
+tracing = "0.1"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = "0.5.2"

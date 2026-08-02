@@ -18,9 +18,7 @@
 //! mirrored in `crates/grim-quant/src/lib.rs`. Each test documents the exact
 //! hand-built byte region it constructs.
 
-use grim_quant::{
-    dequant_fp8, dequant_gptq_group_int, dequant_iq4nl, dequant_q4k, dequant_q80,
-};
+use grim_quant::{dequant_fp8, dequant_gptq_group_int, dequant_iq4nl, dequant_q4k, dequant_q80};
 
 /// f32 comparison that treats f32-bit-exact equal as exact, and otherwise
 /// demands relative error below 1e-5 (enough to catch wrong scale factors /
@@ -57,10 +55,8 @@ fn q80_golden_f16_scale_times_signed_codes() {
 
     // Handpicked signed codes (stored as two's-complement u8).
     let codes: [i8; 32] = [
-        1, -1, 127, -128, 64, -64, 0, 50,
-        37, -37, 100, -100, 2, -2, 12, -12,
-        3, -3, 7, 7, 9, 9, 33, -33,
-        11, -11, 25, 119, 85, 64, -63, 13,
+        1, -1, 127, -128, 64, -64, 0, 50, 37, -37, 100, -100, 2, -2, 12, -12, 3, -3, 7, 7, 9, 9,
+        33, -33, 11, -11, 25, 119, 85, 64, -63, 13,
     ];
     for (i, &c) in codes.iter().enumerate() {
         buf[2 + i] = c as u8;
@@ -158,7 +154,11 @@ fn q4k_golden_cross_byte_scale_min_subblock_offset() {
     assert_eq!(out.len(), 256);
 
     // out[128]: d1*q1 - m1_val = 5.0*10 - 0.75 = 49.25
-    assert_close(out[128], 5.0 * 10.0 - 0.75, "q4k cross-byte sc4/m4 lo weight");
+    assert_close(
+        out[128],
+        5.0 * 10.0 - 0.75,
+        "q4k cross-byte sc4/m4 lo weight",
+    );
 
     // Sanity: an earlier sub-block (iter k=0, is=0 low branch) using sc0=1,m0=0,
     // d=1.0. Put a nibble there too so the low-branch path is also exercised

@@ -3,12 +3,12 @@
 //! Handles moving KV block contents between GPU, Host RAM, and local scratch NVMe files.
 //! Sits inside the paged KV pool's eviction policy to support demote-before-drop.
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use parking_lot::RwLock;
 
 use grim_core::error::{Error, Result};
 
@@ -30,7 +30,7 @@ pub fn grimvise_advise(data: &[f32], advice: grim_tensor::MemAdvice) -> Result<(
         use std::os::raw::c_void;
         let ptr = data.as_ptr() as *mut c_void;
         let len = data.len() * std::mem::size_of::<f32>();
-        
+
         let raw_advice = match advice {
             grim_tensor::MemAdvice::Sequential => libc::MADV_SEQUENTIAL,
             grim_tensor::MemAdvice::Random => libc::MADV_RANDOM,
@@ -47,13 +47,13 @@ pub fn grimvise_advise(data: &[f32], advice: grim_tensor::MemAdvice) -> Result<(
             )));
         }
     }
-    
+
     #[cfg(target_os = "macos")]
     {
         use std::os::raw::c_void;
         let ptr = data.as_ptr() as *mut c_void;
         let len = data.len() * std::mem::size_of::<f32>();
-        
+
         let raw_advice = match advice {
             grim_tensor::MemAdvice::Sequential => libc::MADV_SEQUENTIAL,
             grim_tensor::MemAdvice::Random => libc::MADV_RANDOM,
@@ -76,7 +76,6 @@ pub fn grimvise_advise(data: &[f32], advice: grim_tensor::MemAdvice) -> Result<(
     let _ = advice;
     Ok(())
 }
-
 
 /// Manages tiered storage of KV blocks.
 pub struct LocalSpillManager {
@@ -129,15 +128,15 @@ impl LocalSpillManager {
             let mut file = File::create(&file_path).map_err(|e| Error::KvCache(e.to_string()))?;
 
             // Write keys and values as raw bytes
-            let k_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(k.as_ptr() as *const u8, k.len() * 4)
-            };
-            let v_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
-            };
+            let k_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, k.len() * 4) };
+            let v_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
 
-            file.write_all(k_bytes).map_err(|e| Error::KvCache(e.to_string()))?;
-            file.write_all(v_bytes).map_err(|e| Error::KvCache(e.to_string()))?;
+            file.write_all(k_bytes)
+                .map_err(|e| Error::KvCache(e.to_string()))?;
+            file.write_all(v_bytes)
+                .map_err(|e| Error::KvCache(e.to_string()))?;
 
             self.nvme_cache.insert(block_id, file_path);
             self.block_tiers.insert(block_id, CacheTier::NvMe);
@@ -155,9 +154,7 @@ impl LocalSpillManager {
 
         match tier {
             CacheTier::Gpu => Ok(None),
-            CacheTier::HostRam => {
-                Ok(self.host_ram_cache.get(&block_id).cloned())
-            }
+            CacheTier::HostRam => Ok(self.host_ram_cache.get(&block_id).cloned()),
             CacheTier::NvMe => {
                 if let Some(path) = self.nvme_cache.get(&block_id) {
                     let mut file = File::open(path).map_err(|e| Error::KvCache(e.to_string()))?;
@@ -171,8 +168,10 @@ impl LocalSpillManager {
                         std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4)
                     };
 
-                    file.read_exact(k_bytes).map_err(|e| Error::KvCache(e.to_string()))?;
-                    file.read_exact(v_bytes).map_err(|e| Error::KvCache(e.to_string()))?;
+                    file.read_exact(k_bytes)
+                        .map_err(|e| Error::KvCache(e.to_string()))?;
+                    file.read_exact(v_bytes)
+                        .map_err(|e| Error::KvCache(e.to_string()))?;
 
                     // Bring back to Host RAM (cache promotion)
                     self.host_ram_cache.insert(block_id, (k.clone(), v.clone()));
@@ -189,7 +188,6 @@ impl LocalSpillManager {
             }
         }
     }
-
 
     /// Evicts / deletes a block entirely from tiered caches.
     pub fn evict(&mut self, block_id: BlockId) {
@@ -268,7 +266,9 @@ impl NetworkKvClient {
         target_ip: &str,
     ) -> Result<()> {
         if k.len() != v.len() {
-            return Err(Error::KvCache("Key and Value slice lengths must match for block transport".into()));
+            return Err(Error::KvCache(
+                "Key and Value slice lengths must match for block transport".into(),
+            ));
         }
         let addr = if target_ip.contains(':') {
             target_ip.to_string()
@@ -284,14 +284,20 @@ impl NetworkKvClient {
         }
 
         match std::net::TcpStream::connect_timeout(
-            &addr.parse().map_err(|e| Error::KvCache(format!("Invalid target IP address '{target_ip}': {e}")))?,
+            &addr.parse().map_err(|e| {
+                Error::KvCache(format!("Invalid target IP address '{target_ip}': {e}"))
+            })?,
             std::time::Duration::from_millis(500),
         ) {
             Ok(mut stream) => {
-                stream.write_all(&buf).map_err(|e| Error::KvCache(format!("TCP send block error: {e}")))?;
+                stream
+                    .write_all(&buf)
+                    .map_err(|e| Error::KvCache(format!("TCP send block error: {e}")))?;
                 Ok(())
             }
-            Err(e) => Err(Error::KvCache(format!("TCP send block connection failed to {addr}: {e}"))),
+            Err(e) => Err(Error::KvCache(format!(
+                "TCP send block connection failed to {addr}: {e}"
+            ))),
         }
     }
 
@@ -312,13 +318,19 @@ impl NetworkKvClient {
         req_buf.extend_from_slice(&(block_elems as u64).to_le_bytes());
 
         match std::net::TcpStream::connect_timeout(
-            &addr.parse().map_err(|e| Error::KvCache(format!("Invalid target IP address '{target_ip}': {e}")))?,
+            &addr.parse().map_err(|e| {
+                Error::KvCache(format!("Invalid target IP address '{target_ip}': {e}"))
+            })?,
             std::time::Duration::from_millis(500),
         ) {
             Ok(mut stream) => {
-                stream.write_all(&req_buf).map_err(|e| Error::KvCache(format!("TCP fetch request error: {e}")))?;
+                stream
+                    .write_all(&req_buf)
+                    .map_err(|e| Error::KvCache(format!("TCP fetch request error: {e}")))?;
                 let mut resp_buf = vec![0u8; block_elems * 8];
-                stream.read_exact(&mut resp_buf).map_err(|e| Error::KvCache(format!("TCP fetch read error: {e}")))?;
+                stream
+                    .read_exact(&mut resp_buf)
+                    .map_err(|e| Error::KvCache(format!("TCP fetch read error: {e}")))?;
                 let mut k = Vec::with_capacity(block_elems);
                 let mut v = Vec::with_capacity(block_elems);
                 for chunk in resp_buf[..block_elems * 4].chunks_exact(4) {
@@ -361,8 +373,12 @@ fn read_layer_weights(
         )));
     }
 
-    let mut file = std::fs::File::open(weights_path)
-        .map_err(|e| Error::KvCache(format!("failed to open NVMe weights {:?}: {}", weights_path, e)))?;
+    let mut file = std::fs::File::open(weights_path).map_err(|e| {
+        Error::KvCache(format!(
+            "failed to open NVMe weights {:?}: {}",
+            weights_path, e
+        ))
+    })?;
 
     let offset = layer_id as u64 * layer_bytes as u64;
     let metadata = file
@@ -390,7 +406,12 @@ fn read_layer_weights(
     let mut weights = vec![0.0f32; layer_elems];
     for (i, w) in weights.iter_mut().enumerate() {
         let start = i * std::mem::size_of::<f32>();
-        *w = f32::from_le_bytes([bytes[start], bytes[start + 1], bytes[start + 2], bytes[start + 3]]);
+        *w = f32::from_le_bytes([
+            bytes[start],
+            bytes[start + 1],
+            bytes[start + 2],
+            bytes[start + 3],
+        ]);
     }
     Ok(weights)
 }
@@ -516,7 +537,6 @@ impl NvmeWeightStreamer {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,16 +578,28 @@ mod tests {
         // Both send and fetch must surface explicit `Unimplemented` errors
         // rather than silently succeeding or returning fabricated data.
         let send_res = client.send_block_remote(100, &k, &v, "127.0.0.2");
-        assert!(send_res.is_err(), "send_block_remote should not silently succeed");
         assert!(
-            send_res.unwrap_err().to_string().contains("not yet implemented"),
+            send_res.is_err(),
+            "send_block_remote should not silently succeed"
+        );
+        assert!(
+            send_res
+                .unwrap_err()
+                .to_string()
+                .contains("not yet implemented"),
             "send_block_remote error should mention not-implemented"
         );
 
         let fetch_res = client.fetch_block_remote(100, "127.0.0.2", 8);
-        assert!(fetch_res.is_err(), "fetch_block_remote should not return fabricated data");
         assert!(
-            fetch_res.unwrap_err().to_string().contains("not yet implemented"),
+            fetch_res.is_err(),
+            "fetch_block_remote should not return fabricated data"
+        );
+        assert!(
+            fetch_res
+                .unwrap_err()
+                .to_string()
+                .contains("not yet implemented"),
             "fetch_block_remote error should mention not-implemented"
         );
     }
@@ -582,9 +614,15 @@ mod tests {
             // The transport stub must error for every requested size — it cannot
             // silently fabricate `vec![1.0]`/`vec![2.0]` (sims.md issue #2).
             let send_res = client.send_block_remote(42, &k, &v, "10.0.0.2");
-            assert!(send_res.is_err(), "send_block_remote(size={size}) should error");
+            assert!(
+                send_res.is_err(),
+                "send_block_remote(size={size}) should error"
+            );
             let fetch_res = client.fetch_block_remote(42, "10.0.0.2", size);
-            assert!(fetch_res.is_err(), "fetch_block_remote(size={size}) should error");
+            assert!(
+                fetch_res.is_err(),
+                "fetch_block_remote(size={size}) should error"
+            );
         }
     }
 
@@ -607,17 +645,27 @@ mod tests {
         let streamer = NvmeWeightStreamer::new(weights_path.clone(), 4);
 
         // Prefetch layer 0 and verify the cached weights match what we wrote.
-        streamer.prefetch_layer_async(0).expect("layer 0 should prefetch");
+        streamer
+            .prefetch_layer_async(0)
+            .expect("layer 0 should prefetch");
         let cache = streamer.host_weight_cache.lock().unwrap();
         let got = cache.get(&0).expect("layer 0 should be cached");
-        assert_eq!(got, &layer0, "layer 0 weights must be the real file contents, not mock 0.5");
+        assert_eq!(
+            got, &layer0,
+            "layer 0 weights must be the real file contents, not mock 0.5"
+        );
         drop(cache);
 
         // Prefetch layer 1 and verify.
-        streamer.prefetch_layer_async(1).expect("layer 1 should prefetch");
+        streamer
+            .prefetch_layer_async(1)
+            .expect("layer 1 should prefetch");
         let cache = streamer.host_weight_cache.lock().unwrap();
         let got1 = cache.get(&1).expect("layer 1 should be cached");
-        assert_eq!(got1, &layer1, "layer 1 weights must be the real file contents");
+        assert_eq!(
+            got1, &layer1,
+            "layer 1 weights must be the real file contents"
+        );
     }
 
     #[test]
@@ -629,9 +677,16 @@ mod tests {
         let streamer = NvmeWeightStreamer::new(weights_path, 4);
 
         let res = streamer.prefetch_layer_async(0);
-        assert!(res.is_err(), "missing weights file must error, not silently use mocks");
+        assert!(
+            res.is_err(),
+            "missing weights file must error, not silently use mocks"
+        );
         let msg = res.unwrap_err().to_string();
-        assert!(msg.contains("not found"), "error should mention missing file: {}", msg);
+        assert!(
+            msg.contains("not found"),
+            "error should mention missing file: {}",
+            msg
+        );
     }
 
     #[test]
@@ -647,6 +702,10 @@ mod tests {
         let res = streamer.prefetch_layer_async(0);
         assert!(res.is_err(), "short file must error for layer 0");
         let msg = res.unwrap_err().to_string();
-        assert!(msg.contains("too short"), "error should mention short file: {}", msg);
+        assert!(
+            msg.contains("too short"),
+            "error should mention short file: {}",
+            msg
+        );
     }
 }

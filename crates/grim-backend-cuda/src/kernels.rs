@@ -1,4 +1,4 @@
-//! CUDA kernel source code strings for Grim.
+//! CUDA kernel source strings for Grim.
 
 pub const KERNELS_SOURCE: &str = r#"
 #include <cuda_fp16.h>
@@ -32,7 +32,7 @@ extern "C" __global__ void grim_rms_norm(float* x, float* w, float* out,
     int row = idx / row_len;
     int col = idx % row_len;
 
-    // Calculate mean of squares
+    // mean of squares
     float ss = 0.0f;
     for (int j = 0; j < row_len; ++j) {
         float val = x[row * row_len + j];
@@ -89,8 +89,8 @@ extern "C" __global__ void grim_qkv_attention(
     int cache_offset,
     float inv_sqrt_d
 ) {
-    const int i = blockIdx.x;             // query position (0..seq_len)
-    const int h = blockIdx.y;             // head index
+    const int i = blockIdx.x;             // query pos (0..seq_len)
+    const int h = blockIdx.y;             // head idx
     if (i >= seq_len || h >= num_heads) return;
 
     const int q_per_kv = num_heads / num_kv_heads;
@@ -99,7 +99,7 @@ extern "C" __global__ void grim_qkv_attention(
     const int abs_i = cache_offset + i;
 
     const int tid = threadIdx.x;
-    const int wave_size = 32; // CUDA warp size is always 32
+    const int wave_size = 32; // warp size
     const int wave_id = tid / wave_size;
     const int lane_id = tid % wave_size;
     const int num_waves = 256 / wave_size;
@@ -233,8 +233,8 @@ extern "C" __global__ void grim_rope(const float* x, const int* pos, float* out,
     float sin_v = sinf(val);
 
     int base_offset = (token_idx * num_heads + head_idx) * head_dim;
-    int i0 = base_offset + pair_idx;
-    int i1 = base_offset + pair_idx + half_dim;
+    int i0 = base_offset + 2 * pair_idx;
+    int i1 = base_offset + 2 * pair_idx + 1;
 
     float v0 = x[i0];
     float v1 = x[i1];

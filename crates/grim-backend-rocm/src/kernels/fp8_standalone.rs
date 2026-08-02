@@ -1,8 +1,4 @@
 //! Standalone FP8 dequantization HIP kernel for ROCm.
-//!
-//! Converts FP8 E4M3 packed bytes to full F32 values.
-//! Each weight is 1 byte (FP8 E4M3 format).
-//! Useful for materializing FP8 weights to F32 on-device before standard GEMM.
 
 /// HIP source for `grim_dequant_fp8`.
 pub const KERNEL_SOURCE: &str = r#"

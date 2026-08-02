@@ -1,33 +1,4 @@
-//! SCYTHE-2 CommFuse decomposed P2P fan-in kernel (WI-6).
-//!
-//! Replaces the `reduce_scatter` + `all_gather` pair (two sync-points, tail
-//! latency) in `RowParallelLinear` with a direct P2P push from each rank to
-//! the rank that owns that output shard. Paper basis: CommFuse (`2604.24013`).
-//!
-//! ## Transport tiers (scythe2.md §3, Pillar 3)
-//!
-//! | Tier | Route | Mechanism |
-//! |------|-------|-----------|
-//! | T0   | PeerDirect (xGMI) | GEMM epilogue → peer VRAM; zero-copy. |
-//! | T1   | Pcie / HostBounce | `HostStagingBuffer` → D2H + H2D. |
-//! | T2   | Host (single GPU) | CPU-side element-wise sum (fallback). |
-//!
-//! ## Implementation note
-//! A real CommFuse kernel would be compiled via HIPRTC and launched as a
-//! fused GEMM epilogue that writes tiles directly to peer VRAM via mapped
-//! BAR1. For the current implementation we provide a host-side orchestrator
-//! that selects the T0/T1/T2 path based on the `ScytheLink` route matrix and
-//! calls the existing `p2p_route::copy_route` primitive for T0/T1.
-//!
-//! The HIPRTC JIT kernel stub for the T0 fused-GEMM-epilogue path is
-//! provided as a compile-time string constant (`COMM_FUSE_KERNEL_SOURCE`) so
-//! that the offline toolchain can verify the HIP-C syntax. The actual launch
-//! is gated by `feature = "rccl"` and a `peer_access` probe.
-//!
-//! Skill attribution:
-//! - `rust-ffi-grim` §1.1 — `#[repr(C)]` on all structs passed over FFI.
-//! - `rust-ffi-grim` §1.3 — null-pointer guards before every HIP call.
-//! - `rust-ffi-grim` §3 — `cargo check` gate after each change.
+//! SCYTHE-2 CommFuse decomposed P2P fan-in kernel (WI-6). [see: `reduce_scatter`, `all_gather`, `RowParallelLinear`, `2604.24013`]
 
 use std::ffi::c_void;
 
@@ -36,17 +7,7 @@ use grim_tensor::error::{Error, Result};
 
 // ── Kernel source (T0 fused-GEMM-epilogue, HIPRTC) ────────────────────────────
 
-/// HIP-C source for the T0 CommFuse epilogue kernel.
-///
-/// This kernel is the GPU-side half of the fused P2P write: after computing
-/// the output tile of a column-parallel GEMM (stored in registers), each
-/// thread writes its element directly into the peer GPU's output buffer via a
-/// BAR1-mapped pointer. The host never touches the data; latency is limited by
-/// HBM bandwidth, not PCIe.
-///
-/// The kernel is a stub here (the real implementation would use wave-level
-/// synchronization and 128-byte coalesced writes); it is compiled offline via
-/// `hiprtcCompileProgram` and cached in `HsacoKernelCache`.
+/// HIP-C source for the T0 CommFuse epilogue kernel. [see: `hiprtcCompileProgram`, `HsacoKernelCache`]
 pub const COMM_FUSE_KERNEL_SOURCE: &str = r#"
 // CommFuse decomposed P2P epilogue kernel (scythe2.md §3 Pillar 3, WI-6).
 // Writes the local GEMM output shard directly to the peer GPU's output buffer.
@@ -78,10 +39,6 @@ extern "C" __global__ void grim_comm_fuse_p2p_epilogue(
 // ── Host-side CommFuse orchestrator ──────────────────────────────────────────
 
 /// Result of a CommFuse reduce fan-in.
-///
-/// Contains the assembled output on the primary rank (rank 0). Callers that
-/// need the result on all ranks must broadcast separately (not needed for
-/// RowParallelLinear whose output is consumed locally).
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct CommFuseResult {
@@ -90,19 +47,10 @@ pub struct CommFuseResult {
     /// Shape of the assembled output `[M, N_total]`.
     pub shape: (usize, usize),
     /// Highest transport tier exercised across all ranks (PeerDirect > Pcie > Host).
-    /// Lets the caller observe whether a high-tier device path was available.
     pub tier_used: ScytheLink,
 }
 
-/// Fan-in partial sums from multiple GPU ranks into a single assembled output.
-///
-/// Routes each partial via T0 (PeerDirect), T1 (HostBounce), or T2 (Host
-/// fallback) based on the `ScythePlacement::routes` matrix. Returns the
-/// assembled output on the primary rank.
-///
-/// ## Correctness contract
-/// The function is always correct regardless of the route chosen. T0 is
-/// fastest; T1 is slower but still correct; T2 is a pure CPU sum (no GPU ops).
+/// Fan-in partial sums from multiple GPU ranks into a single assembled output. [see: `ScythePlacement::routes`]
 pub fn comm_fuse_fan_in(
     partials: &[(&[f32], usize)], // (data, n_cols) per rank
     m: usize,
@@ -113,14 +61,7 @@ pub fn comm_fuse_fan_in(
         return Err(Error::Backend("comm_fuse_fan_in: no partials".into()));
     }
 
-    // Assemble on the primary rank (rank 0) by placing each rank's column
-    // shard into the output buffer. At this orchestration layer the partials
-    // are already host-visible (the caller fetched them via `to_cpu_vec_f32`),
-    // so the transport distinction between T0/T1/T2 is a *policy* annotation
-    // recorded in the result, not a different code path here. The actual
-    // device-side transport (BAR1-mapped peer write for T0, HostStagingBuffer
-    // bounce for T1) happens in the kernel layer below this orchestrator when
-    // built with `--features rccl` and a real peer-access probe succeeds.
+    // Assemble on the primary rank (rank 0) by placing each rank's column [see: `to_cpu_vec_f32`, `--features rccl`]
     let mut assembled = vec![0.0f32; m * n_total];
     let mut col_offset = 0usize;
     let mut used_tier = ScytheLink::Host; // track the highest tier actually exercised
@@ -133,7 +74,6 @@ pub fn comm_fuse_fan_in(
             .unwrap_or(ScytheLink::Host);
 
         // Record the most capable tier exercised (PeerDirect > Pcie > Host).
-        // This lets the caller observe whether a high-tier path was available.
         used_tier = match (used_tier, route) {
             (ScytheLink::PeerDirect, _) | (_, ScytheLink::PeerDirect) => ScytheLink::PeerDirect,
             (ScytheLink::Pcie, _) | (_, ScytheLink::Pcie) => ScytheLink::Pcie,
@@ -141,8 +81,6 @@ pub fn comm_fuse_fan_in(
         };
 
         // All tiers converge to the same host-side assembly at this layer.
-        // The transport already happened (or was a no-op for T2); here we
-        // just place the shard into the output buffer.
         assemble_shard(&mut assembled, data, m, *n_cols, col_offset, n_total);
         col_offset += n_cols;
     }
@@ -199,16 +137,13 @@ mod tests {
         let shard1 = vec![5.0f32, 6.0, 7.0, 8.0]; // rank 1 → columns [2,3]
 
         let p = make_placement_host(2);
-        let result = comm_fuse_fan_in(
-            &[(&shard0, 2), (&shard1, 2)],
-            m,
-            n_total,
-            &p,
-        ).unwrap();
+        let result = comm_fuse_fan_in(&[(&shard0, 2), (&shard1, 2)], m, n_total, &p).unwrap();
 
         // Reference: assembled = [[1,2,5,6],[3,4,7,8]]
         let expected = vec![1.0f32, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0];
-        let max_diff = result.data.iter()
+        let max_diff = result
+            .data
+            .iter()
             .zip(expected.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);

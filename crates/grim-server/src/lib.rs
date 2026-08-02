@@ -12,17 +12,19 @@
 //! names return 400 immediately — fail loudly rather than silently drop the
 //! adapter and produce unadapted output.
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::{sse::{Event, Sse}, IntoResponse, Response},
-    routing::{get, post},
     Json, Router,
     body::Body,
-
+    extract::{Path, State},
+    http::StatusCode,
+    response::{
+        IntoResponse, Response,
+        sse::{Event, Sse},
+    },
+    routing::{get, post},
 };
 use futures::stream::{self, Stream, StreamExt};
 use grim_core::error::Result;
@@ -83,8 +85,9 @@ fn now_millis() -> u64 {
 /// contract the server already relies on, plus the formerly-inline argmax
 /// extraction. Both the streaming and non-streaming paths call this so token
 /// selection (and its sampling policy) lives in exactly one place.
-static REQUEST_HISTORIES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, Vec<u32>>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static REQUEST_HISTORIES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, Vec<u32>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 fn sample_next_token(
     engine: &mut grim_engine::Engine,
@@ -155,17 +158,26 @@ async fn chat_completions(
     // gets a clear error instead of silently running a random toy model.
     {
         let mut engine = state.engine.lock().unwrap();
-        if !engine.loaded_models().contains(&requested_model.to_string()) {
+        if !engine
+            .loaded_models()
+            .contains(&requested_model.to_string())
+        {
             match load_model_for_server(requested_model) {
                 Ok((model, maybe_tokenizer)) => {
                     engine.register_model(requested_model, model);
-                    eprintln!("[grim-server] Loaded model '{}' on demand.", requested_model);
+                    eprintln!(
+                        "[grim-server] Loaded model '{}' on demand.",
+                        requested_model
+                    );
                     if let Some(tok) = maybe_tokenizer {
                         *state.tokenizer.lock().unwrap() = Some(tok);
                     }
                 }
                 Err(e) => {
-                    eprintln!("[grim-server] Cannot load model '{}': {}", requested_model, e);
+                    eprintln!(
+                        "[grim-server] Cannot load model '{}': {}",
+                        requested_model, e
+                    );
                     return (
                         StatusCode::NOT_FOUND,
                         Json(serde_json::json!({
@@ -175,8 +187,9 @@ async fn chat_completions(
                                 requested_model, requested_model
                             ),
                             "model": requested_model,
-                        }))
-                    ).into_response();
+                        })),
+                    )
+                        .into_response();
                 }
             }
         }
@@ -239,14 +252,21 @@ async fn chat_completions(
         }
     }
 
-    let stream_requested = body_obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let stream_requested = body_obj
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // §13.3 + §4.5 — Resolve adapter names from request body.
     // Any unrecognised name is a hard 400: fail loudly, never silently degrade.
     let adapter_names: Vec<String> = body_obj
         .get("adapters")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
 
     // Validate all requested adapters exist before starting the stream.
@@ -279,11 +299,11 @@ async fn chat_completions(
             .get("temperature")
             .and_then(|v| v.as_f64())
             .unwrap_or(1.0) as f32,
-        top_p: body_obj.get("top_p").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
-        top_k: body_obj
-            .get("top_k")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32,
+        top_p: body_obj
+            .get("top_p")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0) as f32,
+        top_k: body_obj.get("top_k").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         repeat_penalty: body_obj
             .get("repeat_penalty")
             .and_then(|v| v.as_f64())
@@ -346,12 +366,17 @@ async fn chat_completions(
         let tok = state.tokenizer.lock().unwrap();
         match tok.as_ref() {
             Some(t) => grim_format::render_messages_or_last(t, &messages),
-            None => messages.last().map(|m| m.content.clone()).unwrap_or_default(),
+            None => messages
+                .last()
+                .map(|m| m.content.clone())
+                .unwrap_or_default(),
         }
     };
     let prompt_tokens: Vec<u32> = {
         let tok = state.tokenizer.lock().unwrap();
-        tok.as_ref().map(|t| t.encode(&prompt_text)).unwrap_or_default()
+        tok.as_ref()
+            .map(|t| t.encode(&prompt_text))
+            .unwrap_or_default()
     };
 
     if stream_requested {
@@ -360,9 +385,7 @@ async fn chat_completions(
             let engine = state.engine.lock().unwrap();
             adapter_names
                 .iter()
-                .filter_map(|name| {
-                    engine.get_adapter_by_name(name).map(|a| a.handle.id)
-                })
+                .filter_map(|name| engine.get_adapter_by_name(name).map(|a| a.handle.id))
                 .collect()
         };
         let adapter_ids_clone = adapter_ids.clone();
@@ -379,7 +402,12 @@ async fn chat_completions(
         let session_request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
 
         let stream = futures::stream::unfold(
-            (0u64, String::new(), prompt_tokens.clone(), session_request_id),
+            (
+                0u64,
+                String::new(),
+                prompt_tokens.clone(),
+                session_request_id,
+            ),
             move |(step, mut emitted, prompt_tokens, request_id): (u64, String, Vec<u32>, u64)| {
                 let state = state_clone.clone();
                 let adapter_ids = adapter_ids_clone.clone();
@@ -394,7 +422,17 @@ async fn chat_completions(
 
                     let token_id = {
                         let mut engine = state.engine.lock().unwrap();
-                        sample_next_token(&mut engine, request_id, step, sampler.as_ref(), if step == 0 { Some(&prompt_tokens) } else { None })
+                        sample_next_token(
+                            &mut engine,
+                            request_id,
+                            step,
+                            sampler.as_ref(),
+                            if step == 0 {
+                                Some(&prompt_tokens)
+                            } else {
+                                None
+                            },
+                        )
                     };
 
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -411,20 +449,23 @@ async fn chat_completions(
                         return None;
                     }
                     let payload = serde_json::json!({
-                         "choices": [{"index": 0, "delta": {"content": token_text}}],
-                         "adapters_active": adapter_ids.len()
-                      }).to_string();
+                       "choices": [{"index": 0, "delta": {"content": token_text}}],
+                       "adapters_active": adapter_ids.len()
+                    })
+                    .to_string();
                     let event = axum::response::sse::Event::default()
                         .event("message")
                         .data(payload);
-                    let res: std::result::Result<axum::response::sse::Event, axum::Error> = Ok(event);
+                    let res: std::result::Result<axum::response::sse::Event, axum::Error> =
+                        Ok(event);
                     Some((res, (step + 1, emitted, prompt_tokens, request_id)))
                 }
             },
         );
         Sse::new(stream.chain(futures::stream::once(async {
             Ok(axum::response::sse::Event::default().data("[DONE]"))
-        }))).into_response()
+        })))
+        .into_response()
     } else {
         let mut content = String::new();
         let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -432,9 +473,7 @@ async fn chat_completions(
             let engine = state.engine.lock().unwrap();
             adapter_names
                 .iter()
-                .filter_map(|name| {
-                    engine.get_adapter_by_name(name).map(|a| a.handle.id)
-                })
+                .filter_map(|name| engine.get_adapter_by_name(name).map(|a| a.handle.id))
                 .collect()
         };
 
@@ -445,7 +484,17 @@ async fn chat_completions(
         for step in 0..max_tokens {
             let token_id = {
                 let mut engine = state.engine.lock().unwrap();
-                sample_next_token(&mut engine, request_id, step, sampler.as_ref(), if step == 0 { Some(&prompt_tokens) } else { None })
+                sample_next_token(
+                    &mut engine,
+                    request_id,
+                    step,
+                    sampler.as_ref(),
+                    if step == 0 {
+                        Some(&prompt_tokens)
+                    } else {
+                        None
+                    },
+                )
             };
             let token_text = if let Some(tok) = &tokenizer {
                 tok.decode(&[token_id])
@@ -473,7 +522,6 @@ async fn chat_completions(
         .into_response()
     }
 }
-
 
 /// §5.2.1 — pause a running request. Idempotent: if the request is
 /// already paused (or finished), the response is `200 OK` with
@@ -509,11 +557,15 @@ fn pause_request_inner(
     state: &Arc<AppState>,
     id: u64,
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
-    let mut engine = state.engine.lock().map_err(|_| {
-        grim_core::Error::Config("engine mutex poisoned".into())
-    })?;
+    let mut engine = state
+        .engine
+        .lock()
+        .map_err(|_| grim_core::Error::Config("engine mutex poisoned".into()))?;
     if engine.is_paused(id) {
-        return Ok((StatusCode::OK, Json(serde_json::json!({"id": id, "state": "paused"}))));
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({"id": id, "state": "paused"})),
+        ));
     }
     let scheduler = &mut engine.scheduler;
     let known = scheduler.waiting.iter().any(|r| r.id == id)
@@ -521,12 +573,21 @@ fn pause_request_inner(
         || scheduler.paused.iter().any(|r| r.id == id)
         || scheduler.swapped.iter().any(|r| r.id == id);
     if !known {
-        return Ok((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown request"}))));
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown request"})),
+        ));
     }
     if engine.pause_request(id) {
-        Ok((StatusCode::OK, Json(serde_json::json!({"id": id, "state": "paused"}))))
+        Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({"id": id, "state": "paused"})),
+        ))
     } else {
-        Ok((StatusCode::CONFLICT, Json(serde_json::json!({"error": "request not running"}))))
+        Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "request not running"})),
+        ))
     }
 }
 
@@ -534,20 +595,30 @@ fn resume_request_inner(
     state: &Arc<AppState>,
     id: u64,
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
-    let mut engine = state.engine.lock().map_err(|_| {
-        grim_core::Error::Config("engine mutex poisoned".into())
-    })?;
+    let mut engine = state
+        .engine
+        .lock()
+        .map_err(|_| grim_core::Error::Config("engine mutex poisoned".into()))?;
     if !engine.scheduler.is_paused(id)
         && !engine.scheduler.running.iter().any(|r| r.id == id)
         && !engine.scheduler.waiting.iter().any(|r| r.id == id)
         && !engine.scheduler.swapped.iter().any(|r| r.id == id)
     {
-        return Ok((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown request"}))));
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown request"})),
+        ));
     }
     if engine.resume_request(id) {
-        Ok((StatusCode::OK, Json(serde_json::json!({"id": id, "state": "running"}))))
+        Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({"id": id, "state": "running"})),
+        ))
     } else {
-        Ok((StatusCode::CONFLICT, Json(serde_json::json!({"error": "request not paused"}))))
+        Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "request not paused"})),
+        ))
     }
 }
 
@@ -580,10 +651,12 @@ async fn stream_state(
                 Some((state_str, format!("tick={tick}")))
             })();
             let event = match snapshot {
-                Some((s, note)) => Ok(Event::default()
-                    .event("state")
-                    .data(format!(r#"{{"id": {id}, "state": "{s}", "note": "{note}"}}"#))),
-                None => Ok(Event::default().event("end").data(format!(r#"{{"id": {id}}}"#))),
+                Some((s, note)) => Ok(Event::default().event("state").data(format!(
+                    r#"{{"id": {id}, "state": "{s}", "note": "{note}"}}"#
+                ))),
+                None => Ok(Event::default()
+                    .event("end")
+                    .data(format!(r#"{{"id": {id}}}"#))),
             };
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             Some((event, tick.wrapping_add(1)))
@@ -595,7 +668,7 @@ async fn stream_state(
 /// OpenAI-compatible embeddings endpoint.
 ///
 /// Returns a 501 Not Implemented — the embeddings pipeline is not yet wired
-/// to a real encoder (sims.md issue #9). Returning hardcoded 
+/// to a real encoder (sims.md issue #9). Returning hardcoded
 /// would silently produce incorrect embeddings for every caller.
 async fn embeddings() -> (StatusCode, Json<serde_json::Value>) {
     (
@@ -685,13 +758,21 @@ async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json
 }
 
 /// Helper function to perform Model capability check routing validation (§8)
-fn validate_model_capabilities(engine: &Engine, model_id: &str, required_modality: &str) -> grim_core::error::Result<()> {
+fn validate_model_capabilities(
+    engine: &Engine,
+    model_id: &str,
+    required_modality: &str,
+) -> grim_core::error::Result<()> {
     if let Some(strategy) = engine.strategy_for(model_id) {
-        println!("[Routing] Checking model capability requirements for: {} against {} (strategy: {:?})", model_id, required_modality, strategy);
+        println!(
+            "[Routing] Checking model capability requirements for: {} against {} (strategy: {:?})",
+            model_id, required_modality, strategy
+        );
         Ok(())
     } else {
         Err(grim_core::error::Error::Config(format!(
-            "model '{}' has no strategy for modality '{}'", model_id, required_modality
+            "model '{}' has no strategy for modality '{}'",
+            model_id, required_modality
         )))
     }
 }
@@ -742,30 +823,26 @@ async fn load_model(
     };
 
     #[cfg(debug_assertions)]
-    eprintln!(
-        "[grim-server] Loading model from: {}",
-        model_path.display()
-    );
+    eprintln!("[grim-server] Loading model from: {}", model_path.display());
     let model_path_str = model_path.to_string_lossy().to_string();
     let loaded_kind = if model_path_str.ends_with(".grim") {
         "grim"
     } else {
         "gguf"
     };
-    match model_loader::load_from_path(&model_path_str)
-        .or_else(|_| {
-            // Defensive: load_from_path already handles .grim/.gguf routing on
-            // modern engines. fall back to the explicit GGUF loader for older
-            // binaries that did not implement the dispatch.
-            if model_path_str.ends_with(".gguf") {
-                model_loader::load_model_from_gguf(&model_path_str, device)
-            } else {
-                Err(grim_core::error::Error::Config(format!(
-                    "unsupported model extension for '{}'",
-                    model_path_str
-                )))
-            }
-        }) {
+    match model_loader::load_from_path(&model_path_str).or_else(|_| {
+        // Defensive: load_from_path already handles .grim/.gguf routing on
+        // modern engines. fall back to the explicit GGUF loader for older
+        // binaries that did not implement the dispatch.
+        if model_path_str.ends_with(".gguf") {
+            model_loader::load_model_from_gguf(&model_path_str, device)
+        } else {
+            Err(grim_core::error::Error::Config(format!(
+                "unsupported model extension for '{}'",
+                model_path_str
+            )))
+        }
+    }) {
         Ok(m) => {
             // Tokenizer lives in GGUF metadata; if a .grim is the primary model,
             // try a sibling .gguf for the tokenizer.
@@ -816,21 +893,31 @@ async fn unload_model(
     let mut engine = state.engine.lock().unwrap();
     let unloaded = engine.unload_model(&req.name);
     if unloaded {
-        (StatusCode::OK, Json(serde_json::json!({
-            "status": "success",
-            "message": format!("Model '{}' unloaded dynamically from memory.", req.name)
-        })))
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "success",
+                "message": format!("Model '{}' unloaded dynamically from memory.", req.name)
+            })),
+        )
     } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "status": "error",
-            "message": format!("Model '{}' is not loaded in memory.", req.name)
-        })))
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Model '{}' is not loaded in memory.", req.name)
+            })),
+        )
     }
 }
 
 /// Retrieve default model configured in the config file.
 fn get_default_model_from_config() -> Option<String> {
-    let paths = vec!["grim.toml", "/etc/grim/grim.toml", "C:\\Program Files\\Grim\\grim.toml"];
+    let paths = vec![
+        "grim.toml",
+        "/etc/grim/grim.toml",
+        "C:\\Program Files\\Grim\\grim.toml",
+    ];
     for path in paths {
         if let Ok(content) = std::fs::read_to_string(path) {
             for line in content.lines() {
@@ -899,7 +986,10 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
     for entry in grim_core::catalog::list_local_models() {
         if seen.insert(entry.name.clone()) {
             let path_buf = std::path::PathBuf::from(&entry.path);
-            let ext = path_buf.extension().and_then(|e| e.to_str()).unwrap_or("unknown");
+            let ext = path_buf
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("unknown");
             entries.push(serde_json::json!({
                 "id": entry.name,
                 "object": "model",
@@ -968,7 +1058,7 @@ fn translate_options(req: &serde_json::Value, payload: &mut serde_json::Value) {
 /// `gfx9xx`→`cdna2`); returns `None` when no ROCm GPU is present so callers
 /// stay silent on non-ROCm hosts.
 fn detect_host_rocml_profile() -> Option<String> {
-    match grim_backend_rocm::device::probe::probe_host_gpu(0) {
+    match grim_backend_rocm::probe_host_gpu(0) {
         Ok(caps) => {
             let gcn = &caps.gcn;
             let profile = if gcn.starts_with("gfx103") {
@@ -1016,7 +1106,20 @@ fn utc_now_rfc3339() -> String {
     }
 
     let is_leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-    let month_days = [31u64, if is_leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let month_days = [
+        31u64,
+        if is_leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut month = 1u64;
     for &md in &month_days {
         if remaining < md {
@@ -1034,10 +1137,17 @@ async fn grim_chat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let model_name = req.get("model").and_then(|v| v.as_str()).unwrap_or("grim").to_string();
-    let messages = req.get("messages").cloned().unwrap_or(serde_json::json!([]));
+    let model_name = req
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("grim")
+        .to_string();
+    let messages = req
+        .get("messages")
+        .cloned()
+        .unwrap_or(serde_json::json!([]));
     let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    
+
     let mut payload = serde_json::json!({
         "model": model_name,
         "messages": messages,
@@ -1056,7 +1166,7 @@ async fn grim_chat(
     if stream {
         let (_parts, body) = response.into_parts();
         let body_stream = body.into_data_stream();
-        
+
         let ndjson_stream = futures::stream::unfold(
             (body_stream, String::new(), false),
             move |(mut body_stream, mut buffer, done_sent)| {
@@ -1072,13 +1182,18 @@ async fn grim_chat(
                             for line in event_str.lines() {
                                 if line.starts_with("data: ") {
                                     let data_json = &line["data: ".len()..];
-                                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(data_json) {
+                                    if let Ok(val) =
+                                        serde_json::from_str::<serde_json::Value>(data_json)
+                                    {
                                         data_val = Some(val);
                                     }
                                 }
                             }
                             if let Some(val) = data_val {
-                                let content = val["choices"][0]["delta"]["content"].as_str().unwrap_or("").to_string();
+                                let content = val["choices"][0]["delta"]["content"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .to_string();
                                 let ollama_chunk = serde_json::json!({
                                     "model": model_name,
                                     "created_at": utc_now_rfc3339(),
@@ -1088,8 +1203,12 @@ async fn grim_chat(
                                     },
                                     "done": false
                                 });
-                                let chunk_str = format!("{}\n", serde_json::to_string(&ollama_chunk).unwrap());
-                                return Some((Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)), (body_stream, buffer, false)));
+                                let chunk_str =
+                                    format!("{}\n", serde_json::to_string(&ollama_chunk).unwrap());
+                                return Some((
+                                    Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)),
+                                    (body_stream, buffer, false),
+                                ));
                             }
                             continue;
                         }
@@ -1114,13 +1233,17 @@ async fn grim_chat(
                                     "eval_count": 0,
                                     "eval_duration": 0
                                 });
-                                let chunk_str = format!("{}\n", serde_json::to_string(&final_chunk).unwrap());
-                                return Some((Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)), (body_stream, buffer, true)));
+                                let chunk_str =
+                                    format!("{}\n", serde_json::to_string(&final_chunk).unwrap());
+                                return Some((
+                                    Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)),
+                                    (body_stream, buffer, true),
+                                ));
                             }
                         }
                     }
                 }
-            }
+            },
         );
         let body = Body::from_stream(ndjson_stream);
         axum::response::Response::builder()
@@ -1129,9 +1252,14 @@ async fn grim_chat(
             .unwrap()
     } else {
         let (parts, body) = response.into_parts();
-        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default();
+        let bytes = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .unwrap_or_default();
         if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-            let content = val["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string();
+            let content = val["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
             let ollama_res = serde_json::json!({
                 "model": model_name,
                 "created_at": utc_now_rfc3339(),
@@ -1146,7 +1274,10 @@ async fn grim_chat(
                 "eval_count": 0,
                 "eval_duration": 0
             });
-            let mut res = Response::from_parts(parts, Body::from(serde_json::to_string(&ollama_res).unwrap()));
+            let mut res = Response::from_parts(
+                parts,
+                Body::from(serde_json::to_string(&ollama_res).unwrap()),
+            );
             res.headers_mut().insert(
                 axum::http::header::CONTENT_TYPE,
                 axum::http::HeaderValue::from_static("application/json"),
@@ -1163,10 +1294,14 @@ async fn grim_generate(
     State(state): State<Arc<AppState>>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let model_name = req.get("model").and_then(|v| v.as_str()).unwrap_or("grim").to_string();
+    let model_name = req
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("grim")
+        .to_string();
     let prompt = req.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
     let stream = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    
+
     let mut payload = serde_json::json!({
         "model": model_name,
         "messages": [{ "role": "user", "content": prompt }],
@@ -1182,7 +1317,7 @@ async fn grim_generate(
     if stream {
         let (_parts, body) = response.into_parts();
         let body_stream = body.into_data_stream();
-        
+
         let ndjson_stream = futures::stream::unfold(
             (body_stream, String::new(), false),
             move |(mut body_stream, mut buffer, done_sent)| {
@@ -1198,21 +1333,30 @@ async fn grim_generate(
                             for line in event_str.lines() {
                                 if line.starts_with("data: ") {
                                     let data_json = &line["data: ".len()..];
-                                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(data_json) {
+                                    if let Ok(val) =
+                                        serde_json::from_str::<serde_json::Value>(data_json)
+                                    {
                                         data_val = Some(val);
                                     }
                                 }
                             }
                             if let Some(val) = data_val {
-                                let content = val["choices"][0]["delta"]["content"].as_str().unwrap_or("").to_string();
+                                let content = val["choices"][0]["delta"]["content"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .to_string();
                                 let ollama_chunk = serde_json::json!({
                                     "model": model_name,
                                     "created_at": utc_now_rfc3339(),
                                     "response": content,
                                     "done": false
                                 });
-                                let chunk_str = format!("{}\n", serde_json::to_string(&ollama_chunk).unwrap());
-                                return Some((Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)), (body_stream, buffer, false)));
+                                let chunk_str =
+                                    format!("{}\n", serde_json::to_string(&ollama_chunk).unwrap());
+                                return Some((
+                                    Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)),
+                                    (body_stream, buffer, false),
+                                ));
                             }
                             continue;
                         }
@@ -1237,13 +1381,17 @@ async fn grim_generate(
                                     "eval_count": 0,
                                     "eval_duration": 0
                                 });
-                                let chunk_str = format!("{}\n", serde_json::to_string(&final_chunk).unwrap());
-                                return Some((Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)), (body_stream, buffer, true)));
+                                let chunk_str =
+                                    format!("{}\n", serde_json::to_string(&final_chunk).unwrap());
+                                return Some((
+                                    Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)),
+                                    (body_stream, buffer, true),
+                                ));
                             }
                         }
                     }
                 }
-            }
+            },
         );
         let body = Body::from_stream(ndjson_stream);
         axum::response::Response::builder()
@@ -1252,9 +1400,14 @@ async fn grim_generate(
             .unwrap()
     } else {
         let (parts, body) = response.into_parts();
-        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default();
+        let bytes = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .unwrap_or_default();
         if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-            let content = val["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string();
+            let content = val["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
             let ollama_res = serde_json::json!({
                 "model": model_name,
                 "created_at": utc_now_rfc3339(),
@@ -1266,7 +1419,10 @@ async fn grim_generate(
                 "eval_count": 0,
                 "eval_duration": 0
             });
-            let mut res = Response::from_parts(parts, Body::from(serde_json::to_string(&ollama_res).unwrap()));
+            let mut res = Response::from_parts(
+                parts,
+                Body::from(serde_json::to_string(&ollama_res).unwrap()),
+            );
             res.headers_mut().insert(
                 axum::http::header::CONTENT_TYPE,
                 axum::http::HeaderValue::from_static("application/json"),
@@ -1286,13 +1442,29 @@ async fn grim_tags(State(_state): State<Arc<AppState>>) -> Json<serde_json::Valu
     for entry in grim_core::catalog::list_local_models() {
         if seen.insert(entry.name.clone()) {
             let path_buf = std::path::PathBuf::from(&entry.path);
-            let ext = path_buf.extension().and_then(|e| e.to_str()).unwrap_or("unknown");
-            
-            let family = if entry.arch.is_empty() { "unknown".to_string() } else { entry.arch.clone() };
-            let parameter_size = if entry.params.is_empty() { "unknown".to_string() } else { entry.params.clone() };
-            let quantization_level = if entry.quant.is_empty() { "unknown".to_string() } else { entry.quant.clone() };
+            let ext = path_buf
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("unknown");
+
+            let family = if entry.arch.is_empty() {
+                "unknown".to_string()
+            } else {
+                entry.arch.clone()
+            };
+            let parameter_size = if entry.params.is_empty() {
+                "unknown".to_string()
+            } else {
+                entry.params.clone()
+            };
+            let quantization_level = if entry.quant.is_empty() {
+                "unknown".to_string()
+            } else {
+                entry.quant.clone()
+            };
             let digest = if entry.sha256.is_empty() {
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_string()
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string()
             } else {
                 entry.sha256.clone()
             };
@@ -1327,15 +1499,20 @@ async fn grim_pull(
     State(_state): State<Arc<AppState>>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let name = req.get("name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-    
+    let name = req
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let tx_clone = tx.clone();
-    
+
     tokio::spawn(async move {
         let res = grim_core::client::download_model_with_progress(&name, None, move |p| {
             let _ = tx_clone.send(Ok(p));
-        }).await;
+        })
+        .await;
         if let Err(e) = res {
             let _ = tx.send(Err(e));
         }
@@ -1430,7 +1607,10 @@ fn load_tls_config_from_file(path: &str) -> Option<TlsConfig> {
     }
 
     if let (Some(c), Some(k)) = (cert, key) {
-        Some(TlsConfig { cert_path: c, key_path: k })
+        Some(TlsConfig {
+            cert_path: c,
+            key_path: k,
+        })
     } else {
         None
     }
@@ -1443,12 +1623,18 @@ fn load_tls_config_from_file(path: &str) -> Option<TlsConfig> {
 /// availability without waiting for the first chat request to trigger a load.
 /// When `None`, the server starts with an empty engine and loads models
 /// on demand from the local catalog when they are first requested.
-pub async fn serve(addr: &str, engine: Engine, model_path: Option<std::path::PathBuf>) -> Result<()> {
+pub async fn serve(
+    addr: &str,
+    engine: Engine,
+    model_path: Option<std::path::PathBuf>,
+) -> Result<()> {
     // Attempt to load the tokenizer from the explicitly-given model path,
     // or by scanning the models directory for the first available GGUF.
     let (tokenizer, resolved_path) = if let Some(ref p) = model_path {
         let path_str = p.display().to_string();
-        let tok = GgufProvider::open(&path_str).ok().and_then(|prov| prov.tokenizer().ok());
+        let tok = GgufProvider::open(&path_str)
+            .ok()
+            .and_then(|prov| prov.tokenizer().ok());
         (tok, Some(p.clone()))
     } else {
         // Scan the models directory for the first available model, preferring
@@ -1460,13 +1646,16 @@ pub async fn serve(addr: &str, engine: Engine, model_path: Option<std::path::Pat
             .ok()
             .and_then(|mut it| {
                 it.find(|e| {
-                    e.as_ref().ok().map(|e| {
-                        let p = e.path();
-                        matches!(
-                            p.extension().and_then(|x| x.to_str()),
-                            Some("gguf") | Some("grim")
-                        )
-                    }).unwrap_or(false)
+                    e.as_ref()
+                        .ok()
+                        .map(|e| {
+                            let p = e.path();
+                            matches!(
+                                p.extension().and_then(|x| x.to_str()),
+                                Some("gguf") | Some("grim")
+                            )
+                        })
+                        .unwrap_or(false)
                 })
             })
             .and_then(|e| e.ok())
@@ -1492,7 +1681,8 @@ pub async fn serve(addr: &str, engine: Engine, model_path: Option<std::path::Pat
             // detected local GPU profile.
             if p.extension().and_then(|x| x.to_str()) == Some("gguf") {
                 if let Some(profile) = detect_host_rocml_profile() {
-                    let name = p.file_stem()
+                    let name = p
+                        .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or("model")
                         .to_string();
@@ -1514,8 +1704,12 @@ pub async fn serve(addr: &str, engine: Engine, model_path: Option<std::path::Pat
     };
 
     if tokenizer.is_none() {
-        eprintln!("[grim-server] WARNING: No tokenizer found. Run 'grim pull <model>' to download a model.");
-        eprintln!("[grim-server]          Text responses will show raw token IDs until a model is loaded.");
+        eprintln!(
+            "[grim-server] WARNING: No tokenizer found. Run 'grim pull <model>' to download a model."
+        );
+        eprintln!(
+            "[grim-server]          Text responses will show raw token IDs until a model is loaded."
+        );
     }
 
     let state = Arc::new(AppState {
@@ -1523,34 +1717,39 @@ pub async fn serve(addr: &str, engine: Engine, model_path: Option<std::path::Pat
         tokenizer: Mutex::new(tokenizer),
         model_path: resolved_path,
     });
-    
+
     // Capability-based routing verification at server startup (§8)
     if let Err(e) = validate_model_capabilities(&state.engine.lock().unwrap(), "default", "text") {
         eprintln!("[Server] Model capability check failed: {e}");
     }
 
     let app = build_router(state);
-    
+
     let tls_config = load_tls_config_from_file("grim.toml")
         .or_else(|| load_tls_config_from_file("/etc/grim/grim.toml"))
         .or_else(|| load_tls_config_from_file("C:\\Program Files\\Grim\\grim.toml"));
 
     if let Some(cfg) = tls_config {
-        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-            &cfg.cert_path,
-            &cfg.key_path,
-        )
-        .await
-        .map_err(|e| grim_core::Error::Config(format!("failed to load TLS certificates: {e}")))?;
+        let rustls_config =
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(&cfg.cert_path, &cfg.key_path)
+                .await
+                .map_err(|e| {
+                    grim_core::Error::Config(format!("failed to load TLS certificates: {e}"))
+                })?;
 
         eprintln!("[grim-server] Serving over HTTPS (SSL enabled) on {}", addr);
-        let bind_addr = addr.parse().map_err(|e| grim_core::Error::Config(format!("invalid bind address {addr}: {e}")))?;
+        let bind_addr = addr
+            .parse()
+            .map_err(|e| grim_core::Error::Config(format!("invalid bind address {addr}: {e}")))?;
         axum_server::bind_rustls(bind_addr, rustls_config)
             .serve(app.into_make_service())
             .await
             .map_err(|e| grim_core::Error::Config(format!("serve TLS failed: {e}")))?;
     } else {
-        eprintln!("[grim-server] WARNING: No TLS config found; serving over HTTP on {}", addr);
+        eprintln!(
+            "[grim-server] WARNING: No TLS config found; serving over HTTP on {}",
+            addr
+        );
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| grim_core::Error::Config(format!("bind failed: {e}")))?;
@@ -1633,12 +1832,12 @@ mod tests {
         let _ = (used, total);
     }
 
-    use grim_tensor::Device;
     use axum::{
+        Router,
         body::Body,
         http::{Request, StatusCode},
-        Router,
     };
+    use grim_tensor::Device;
     use tower::ServiceExt;
 
     /// Integration test: grim-server endpoints wire correctly to grim-engine.
@@ -1647,9 +1846,10 @@ mod tests {
     async fn test_server_engine_end_to_end_non_streaming() {
         // Build engine with default config
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-        
+
         // Register a mock model for testing
-        let mock_model = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
             grim_models_transformer::LlamaConfig {
                 vocab_size: 32000,
                 hidden_size: 512,
@@ -1661,21 +1861,21 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            }
+            },
         ));
         engine.register_model("default", mock_model);
-        
+
         let state = Arc::new(AppState {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
         });
-        
+
         // Build router
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
             .with_state(state.clone());
-        
+
         // Send request
         let request_body = serde_json::json!({
             "model": "default",
@@ -1683,7 +1883,7 @@ mod tests {
             "stream": false,
             "max_tokens": 5
         });
-        
+
         let response = app
             .oneshot(
                 Request::builder()
@@ -1695,11 +1895,13 @@ mod tests {
             )
             .await
             .unwrap();
-        
+
         assert_eq!(response.status(), StatusCode::OK);
-        
+
         // Verify response is valid JSON
-        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert!(body.get("choices").is_some());
         assert!(body.get("adapters_active").is_some());
@@ -1709,9 +1911,10 @@ mod tests {
     #[tokio::test]
     async fn test_server_engine_end_to_end_streaming() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-        
+
         // Register a mock model for testing
-        let mock_model = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
             grim_models_transformer::LlamaConfig {
                 vocab_size: 32000,
                 hidden_size: 512,
@@ -1723,26 +1926,26 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            }
+            },
         ));
         engine.register_model("default", mock_model);
-        
+
         let state = Arc::new(AppState {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
         });
-        
+
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
             .with_state(state.clone());
-        
+
         let request_body = serde_json::json!({
             "model": "default",
             "messages": [{"role": "user", "content": "Hello"}],
             "stream": true
         });
-        
+
         let response = app
             .oneshot(
                 Request::builder()
@@ -1754,7 +1957,7 @@ mod tests {
             )
             .await
             .unwrap();
-        
+
         // Streaming returns SSE with content-type text/event-stream
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -1763,9 +1966,10 @@ mod tests {
     #[tokio::test]
     async fn test_server_strict_unknown_field_rejection() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-        
+
         // Register a mock model for testing
-        let mock_model = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
             grim_models_transformer::LlamaConfig {
                 vocab_size: 32000,
                 hidden_size: 512,
@@ -1777,26 +1981,26 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            }
+            },
         ));
         engine.register_model("default", mock_model);
-        
+
         let state = Arc::new(AppState {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
         });
-        
+
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
             .with_state(state.clone());
-        
+
         let request_body = serde_json::json!({
             "model": "default",
             "messages": [],
             "unknown_field_this_should_fail": true
         });
-        
+
         let response = app
             .oneshot(
                 Request::builder()
@@ -1808,7 +2012,7 @@ mod tests {
             )
             .await
             .unwrap();
-        
+
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -1816,9 +2020,10 @@ mod tests {
     #[tokio::test]
     async fn test_server_determinism_mismatch_strict() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default()); // Relaxed mode
-        
+
         // Register a mock model for testing
-        let mock_model = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
             grim_models_transformer::LlamaConfig {
                 vocab_size: 32000,
                 hidden_size: 512,
@@ -1830,26 +2035,26 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            }
+            },
         ));
         engine.register_model("default", mock_model);
-        
+
         let state = Arc::new(AppState {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
         });
-        
+
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
             .with_state(state.clone());
-        
+
         let request_body = serde_json::json!({
             "model": "default",
             "messages": [],
             "determinism": "strict"
         });
-        
+
         let response = app
             .oneshot(
                 Request::builder()
@@ -1861,7 +2066,7 @@ mod tests {
             )
             .await
             .unwrap();
-        
+
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -1869,9 +2074,10 @@ mod tests {
     #[tokio::test]
     async fn test_server_unknown_adapter_rejection() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-        
+
         // Register a mock model for testing
-        let mock_model = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
             grim_models_transformer::LlamaConfig {
                 vocab_size: 32000,
                 hidden_size: 512,
@@ -1883,10 +2089,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            }
+            },
         ));
         engine.register_model("default", mock_model);
-        
+
         let state = Arc::new(AppState {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
@@ -1896,13 +2102,13 @@ mod tests {
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
             .with_state(state.clone());
-        
+
         let request_body = serde_json::json!({
             "model": "default",
             "messages": [],
             "adapters": ["nonexistent_adapter"]
         });
-        
+
         let response = app
             .oneshot(
                 Request::builder()
@@ -1914,7 +2120,7 @@ mod tests {
             )
             .await
             .unwrap();
-        
+
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -1922,7 +2128,8 @@ mod tests {
     #[tokio::test]
     async fn test_grim_compatibility_shims() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-        let mock_model = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
             grim_models_transformer::LlamaConfig {
                 vocab_size: 32000,
                 hidden_size: 512,
@@ -1934,7 +2141,7 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            }
+            },
         ));
         engine.register_model("default", mock_model);
 
@@ -1947,7 +2154,8 @@ mod tests {
         let app = build_router(state);
 
         // 1. Test /api/tags
-        let res_tags = app.clone()
+        let res_tags = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -1966,7 +2174,8 @@ mod tests {
             "stream": false,
             "options": { "num_predict": 5 }
         });
-        let res_chat = app.clone()
+        let res_chat = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1978,8 +2187,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res_chat.status(), StatusCode::OK);
-        
-        let body_bytes = axum::body::to_bytes(res_chat.into_body(), usize::MAX).await.unwrap();
+
+        let body_bytes = axum::body::to_bytes(res_chat.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert!(body_val.get("choices").is_none());
         assert!(body_val.get("message").is_some());
@@ -1992,7 +2203,8 @@ mod tests {
             "stream": false,
             "options": { "num_predict": 5 }
         });
-        let res_gen = app.clone()
+        let res_gen = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -2005,7 +2217,9 @@ mod tests {
             .unwrap();
         assert_eq!(res_gen.status(), StatusCode::OK);
 
-        let body_bytes_gen = axum::body::to_bytes(res_gen.into_body(), usize::MAX).await.unwrap();
+        let body_bytes_gen = axum::body::to_bytes(res_gen.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_val_gen: serde_json::Value = serde_json::from_slice(&body_bytes_gen).unwrap();
         assert!(body_val_gen.get("choices").is_none());
         assert!(body_val_gen.get("response").is_some());
@@ -2018,7 +2232,8 @@ mod tests {
     #[tokio::test]
     async fn test_chat_completions_honors_max_tokens() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-        let mock_model = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
             grim_models_transformer::LlamaConfig {
                 vocab_size: 32000,
                 hidden_size: 512,
@@ -2063,7 +2278,9 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let content = val["choices"][0]["message"]["content"].as_str().unwrap();
         let token_count = content.matches("<tok:").count();
@@ -2076,7 +2293,8 @@ mod tests {
     #[tokio::test]
     async fn test_chat_completions_honors_stop_sequence() {
         let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-        let mock_model = Box::new(grim_models_transformer::Llama::random(Device::Cpu, 
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
             grim_models_transformer::LlamaConfig {
                 vocab_size: 32000,
                 hidden_size: 512,
@@ -2123,11 +2341,16 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let content = val["choices"][0]["message"]["content"].as_str().unwrap();
         let token_count = content.matches("<tok:").count();
-        assert_eq!(token_count, 1, "stop sequence must end generation at the first token");
+        assert_eq!(
+            token_count, 1,
+            "stop sequence must end generation at the first token"
+        );
     }
 }
 
@@ -2171,7 +2394,11 @@ fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::Valu
             let used = total.saturating_sub(free);
             total_vram_used += used;
             total_vram_max += total;
-            let memory_pct = if total > 0 { ((used as f64 / total as f64) * 100.0) as u32 } else { 0 };
+            let memory_pct = if total > 0 {
+                ((used as f64 / total as f64) * 100.0) as u32
+            } else {
+                0
+            };
             gpus_json.push(serde_json::json!({
                 "index": ord as u32,
                 "compute": 0u32,
@@ -2185,11 +2412,17 @@ fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::Valu
     if let Ok(cuda_devs) = grim_backend_cuda::CudaDevice::probe() {
         if !cuda_devs.is_empty() {
             for ord in 0..cuda_devs.len() {
-                let (free, total) = grim_backend_cuda::vram_info(ord);
+                let Some((free, total)) = grim_backend_cuda::vram_info(ord) else {
+                    continue;
+                };
                 let used = total.saturating_sub(free);
                 total_vram_used += used;
                 total_vram_max += total;
-                let memory_pct = if total > 0 { ((used as f64 / total as f64) * 100.0) as u32 } else { 0 };
+                let memory_pct = if total > 0 {
+                    ((used as f64 / total as f64) * 100.0) as u32
+                } else {
+                    0
+                };
                 gpus_json.push(serde_json::json!({
                     "index": ord as u32,
                     "compute": 0u32,
@@ -2202,7 +2435,9 @@ fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::Valu
     }
 
     {
-        let (free, total) = grim_backend_metal::vram_info(0);
+        let Some((free, total)) = grim_backend_metal::vram_info(0) else {
+            return (0, 0, gpus_json);
+        };
         if total > 0 {
             let used = total.saturating_sub(free);
             let memory_pct = ((used as f64 / total as f64) * 100.0) as u32;
@@ -2217,7 +2452,9 @@ fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::Valu
     }
 
     {
-        let (free, total) = grim_backend_vulkan::vram_info(0);
+        let Some((free, total)) = grim_backend_vulkan::vram_info(0) else {
+            return (0, 0, gpus_json);
+        };
         if total > 0 {
             let used = total.saturating_sub(free);
             let memory_pct = ((used as f64 / total as f64) * 100.0) as u32;
@@ -2244,7 +2481,10 @@ fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::Valu
 async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let engine = state.engine.lock().unwrap();
     let models = engine.loaded_models();
-    let model_name = models.first().cloned().unwrap_or_else(|| "none".to_string());
+    let model_name = models
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "none".to_string());
 
     // Hardware probe (matches /metrics): real GPU count + xnack.
     let (rocm_gpu_count, xnack_enabled) = match grim_backend_rocm::RocmDevice::probe() {
@@ -2259,7 +2499,11 @@ async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::
     let mut other_models = Vec::new();
     for entry in grim_core::catalog::list_local_models() {
         let path = std::path::PathBuf::from(&entry.path);
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("unknown").to_string();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("unknown")
+            .to_string();
         let item = serde_json::json!({
             "name": entry.name,
             "format": ext,
@@ -2314,7 +2558,8 @@ async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::
             "gguf": gguf_models,
             "other": other_models,
         },
-    }).into()
+    })
+    .into()
 }
 
 /// `GET /` — live dashboard HTML. Polls `/api/stats` every 2s for updates.
@@ -2457,4 +2702,3 @@ setInterval(poll,2000);
 </script>
 </body>
 </html>"#;
-

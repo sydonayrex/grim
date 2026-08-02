@@ -48,13 +48,12 @@ impl MambaSpeculativeEngine {
                 break;
             }
         }
-        self.state_history
-            .last()
-            .cloned()
-            .ok_or_else(|| grim_core::Error::Session(format!(
+        self.state_history.last().cloned().ok_or_else(|| {
+            grim_core::Error::Session(format!(
                 "No Mamba state recorded for step <= {}",
                 target_step
-            )))
+            ))
+        })
     }
 
     /// Clear all state history.
@@ -70,7 +69,7 @@ mod tests {
     #[test]
     fn test_mamba_speculative_rollback() {
         let mut engine = MambaSpeculativeEngine::new(16, 8, 4);
-        
+
         // Record states for steps 0, 1, 2
         engine.record_state(0, &[0.0; 128], &[0.0; 64]);
         engine.record_state(1, &[1.0; 128], &[1.0; 64]);

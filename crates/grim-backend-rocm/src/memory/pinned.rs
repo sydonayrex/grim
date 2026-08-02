@@ -1,13 +1,4 @@
-//! Pinned (`hipHostMalloc`) page-locked host buffer used by the per-token
-//! decode hot path. Pinned memory transfers over PCIe/xGMI at full bandwidth
-//! with `hipMemcpyAsync`, whereas pageable `Vec` staging forces a slower
-//! bounce buffer.
-//!
-//! Skill attribution:
-//! - `rust-ai-ml-inference-guide` Action 9 — pinned staging for repeated
-//!   small host→device / device→host transfers in the decode loop.
-//! - `rocm-profiling-perf` — host transfer is in the per-call hot path;
-//!   pre-pinning amortizes the registration cost across all subsequent calls.
+//! Pinned (`hipHostMalloc`) page-locked host buffer used by the per-token [see: `hipMemcpyAsync`, `Vec`]
 
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -16,15 +7,7 @@ use grim_tensor::error::Result;
 
 use crate::{check_hip, hipHostFree, hipHostMalloc};
 
-/// A host-side staging buffer allocated with `hipHostMalloc` (pinned / page-locked
-/// memory). Pinned buffers transfer over PCIe/xGMI at full bandwidth with
-/// `hipMemcpyAsync`, whereas pageable `Vec` staging forces a slower bounce buffer.
-///
-/// This is the building block for the per-token decode hot path (feeding a sampled
-/// token in, reading logits out): the caller keeps one `RocmPinnedBuffer` per
-/// recurring transfer and reuses it across steps instead of allocating fresh each
-/// time. Cold-path / one-off transfers continue to use plain `Vec` + synchronous
-/// `hipMemcpy`.
+/// A host-side staging buffer allocated with `hipHostMalloc` (pinned / page-locked [see: `hipMemcpyAsync`, `Vec`]
 pub struct RocmPinnedBuffer<T> {
     ptr: *mut T,
     len: usize,

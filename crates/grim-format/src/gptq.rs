@@ -11,10 +11,10 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::sync::Mutex;
 
-use grim_tensor::dtype::{DType, GroupQuantScheme, QuantProvenance, Storage, ArithType};
+use crate::safetensors::read_safetensor_bytes;
+use grim_tensor::dtype::{ArithType, DType, GroupQuantScheme, QuantProvenance, Storage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
-use crate::safetensors::read_safetensor_bytes;
 
 /// GPTQ tensor info with quantization metadata.
 #[derive(Debug, Clone)]
@@ -62,8 +62,13 @@ pub struct GptqProvider {
 }
 
 /// Reads the quantization parameters from quantize_config.json, config.json, or __metadata__.
-fn read_quant_params(path: &str, metadata: &Option<HashMap<String, String>>) -> Result<(u32, usize, bool)> {
-    let parent = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new(""));
+fn read_quant_params(
+    path: &str,
+    metadata: &Option<HashMap<String, String>>,
+) -> Result<(u32, usize, bool)> {
+    let parent = std::path::Path::new(path)
+        .parent()
+        .unwrap_or(std::path::Path::new(""));
     let quantize_config_path = parent.join("quantize_config.json");
     let config_path = parent.join("config.json");
 
@@ -77,7 +82,11 @@ fn read_quant_params(path: &str, metadata: &Option<HashMap<String, String>>) -> 
                 if let Some(b) = val.get("bits").and_then(|v| v.as_u64()).map(|v| v as u32) {
                     bits = Some(b);
                 }
-                if let Some(g) = val.get("group_size").and_then(|v| v.as_u64()).map(|v| v as usize) {
+                if let Some(g) = val
+                    .get("group_size")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                {
                     group_size = Some(g);
                 }
                 if let Some(d) = val.get("desc_act").and_then(|v| v.as_bool()) {
@@ -92,10 +101,15 @@ fn read_quant_params(path: &str, metadata: &Option<HashMap<String, String>>) -> 
             if let Ok(content) = std::fs::read_to_string(config_path) {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
                     if let Some(qcfg) = val.get("quantization_config") {
-                        if let Some(b) = qcfg.get("bits").and_then(|v| v.as_u64()).map(|v| v as u32) {
+                        if let Some(b) = qcfg.get("bits").and_then(|v| v.as_u64()).map(|v| v as u32)
+                        {
                             bits = Some(b);
                         }
-                        if let Some(g) = qcfg.get("group_size").and_then(|v| v.as_u64()).map(|v| v as usize) {
+                        if let Some(g) = qcfg
+                            .get("group_size")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                        {
                             group_size = Some(g);
                         }
                         if let Some(d) = qcfg.get("desc_act").and_then(|v| v.as_bool()) {
@@ -121,8 +135,11 @@ fn read_quant_params(path: &str, metadata: &Option<HashMap<String, String>>) -> 
         }
     }
 
-    let b = bits.ok_or_else(|| Error::Backend("Missing 'bits' in quantization config metadata".into()))?;
-    let g = group_size.ok_or_else(|| Error::Backend("Missing 'group_size' in quantization config metadata".into()))?;
+    let b = bits
+        .ok_or_else(|| Error::Backend("Missing 'bits' in quantization config metadata".into()))?;
+    let g = group_size.ok_or_else(|| {
+        Error::Backend("Missing 'group_size' in quantization config metadata".into())
+    })?;
     let d = desc_act.unwrap_or(false);
 
     Ok((b, g, d))
@@ -134,10 +151,11 @@ impl GptqProvider {
         let file = File::open(path)
             .map_err(|e| Error::Backend(format!("cannot open GPTQ file '{}': {e}", path)))?;
         let reader = BufReader::new(file);
-        
+
         // Read safetensors header to get tensor names and metadata
-        let (info, metadata, data_region_start) = crate::safetensors::read_safetensors_header(reader)?;
-        
+        let (info, metadata, data_region_start) =
+            crate::safetensors::read_safetensors_header(reader)?;
+
         let (bits, group_size, default_desc_act) = match read_quant_params(path, &metadata) {
             Ok(params) => params,
             Err(e) => return Err(e),
@@ -149,15 +167,15 @@ impl GptqProvider {
             if !name.ends_with(".qweight") {
                 continue;
             }
-            
+
             // Get base name by removing .qweight suffix
             let base_name = name.strip_suffix(".qweight").unwrap();
-            
+
             // Try to find companion tensors
             let qzeros_name = format!("{}.qzeros", base_name);
             let scales_name = format!("{}.scales", base_name);
             let g_idx_name = format!("{}.g_idx", base_name);
-            
+
             // Get base tensor shape - infer from qweight shape for now
             let qw = tensor_info.shape();
             let shape: Vec<usize> = if qw.len() >= 2 {
@@ -166,26 +184,40 @@ impl GptqProvider {
             } else {
                 qw.clone()
             };
-            
+
             let qzeros_offset = info.get(&qzeros_name).map(|i| i.data_start);
-            let qzeros_size = info.get(&qzeros_name).map(|i| i.data_end - i.data_start).unwrap_or(0);
+            let qzeros_size = info
+                .get(&qzeros_name)
+                .map(|i| i.data_end - i.data_start)
+                .unwrap_or(0);
             let scales_offset = info.get(&scales_name).map(|i| i.data_start);
-            let scales_size = info.get(&scales_name).map(|i| i.data_end - i.data_start).unwrap_or(0);
+            let scales_size = info
+                .get(&scales_name)
+                .map(|i| i.data_end - i.data_start)
+                .unwrap_or(0);
             let g_idx_offset = info.get(&g_idx_name).map(|i| i.data_start);
             let g_idx_size = info.get(&g_idx_name).map(|i| i.data_end - i.data_start);
-            
+
             let mut desc_act = default_desc_act;
             if let Some(_g_idx_off) = g_idx_offset {
                 // Read g_idx to verify monotonicity
                 let g_idx_info = info.get(&g_idx_name).unwrap();
-                let mut local_reader = BufReader::new(File::open(path).map_err(|e| Error::Backend(e.to_string()))?);
-                if let Ok(g_idx_bytes) = read_safetensor_bytes(&mut local_reader, g_idx_info, data_region_start) {
+                let mut local_reader =
+                    BufReader::new(File::open(path).map_err(|e| Error::Backend(e.to_string()))?);
+                if let Ok(g_idx_bytes) =
+                    read_safetensor_bytes(&mut local_reader, g_idx_info, data_region_start)
+                {
                     let dtype = g_idx_info.dtype_tag.as_str();
                     let mut prev = -1i64;
                     if dtype == "I32" || dtype == "U32" {
                         let elems = g_idx_bytes.len() / 4;
                         for i in 0..elems {
-                            let val = u32::from_le_bytes([g_idx_bytes[i*4], g_idx_bytes[i*4+1], g_idx_bytes[i*4+2], g_idx_bytes[i*4+3]]) as i64;
+                            let val = u32::from_le_bytes([
+                                g_idx_bytes[i * 4],
+                                g_idx_bytes[i * 4 + 1],
+                                g_idx_bytes[i * 4 + 2],
+                                g_idx_bytes[i * 4 + 3],
+                            ]) as i64;
                             if val < prev {
                                 desc_act = true;
                                 break;
@@ -196,8 +228,14 @@ impl GptqProvider {
                         let elems = g_idx_bytes.len() / 8;
                         for i in 0..elems {
                             let val = u64::from_le_bytes([
-                                g_idx_bytes[i*8], g_idx_bytes[i*8+1], g_idx_bytes[i*8+2], g_idx_bytes[i*8+3],
-                                g_idx_bytes[i*8+4], g_idx_bytes[i*8+5], g_idx_bytes[i*8+6], g_idx_bytes[i*8+7]
+                                g_idx_bytes[i * 8],
+                                g_idx_bytes[i * 8 + 1],
+                                g_idx_bytes[i * 8 + 2],
+                                g_idx_bytes[i * 8 + 3],
+                                g_idx_bytes[i * 8 + 4],
+                                g_idx_bytes[i * 8 + 5],
+                                g_idx_bytes[i * 8 + 6],
+                                g_idx_bytes[i * 8 + 7],
                             ]) as i64;
                             if val < prev {
                                 desc_act = true;
@@ -210,40 +248,48 @@ impl GptqProvider {
             }
 
             if qzeros_offset.is_some() && scales_offset.is_some() {
-                tensors.insert(base_name.to_string(), GptqTensorInfo {
-                    name: base_name.to_string(),
-                    shape,
-                    bits,
-                    group_size,
-                    desc_act,
-                    qweight_offset: Some(tensor_info.data_start),
-                    qweight_size: tensor_info.data_end - tensor_info.data_start,
-                    qzeros_offset,
-                    qzeros_size,
-                    scales_offset,
-                    scales_size,
-                    g_idx_offset,
-                    g_idx_size,
-                });
+                tensors.insert(
+                    base_name.to_string(),
+                    GptqTensorInfo {
+                        name: base_name.to_string(),
+                        shape,
+                        bits,
+                        group_size,
+                        desc_act,
+                        qweight_offset: Some(tensor_info.data_start),
+                        qweight_size: tensor_info.data_end - tensor_info.data_start,
+                        qzeros_offset,
+                        qzeros_size,
+                        scales_offset,
+                        scales_size,
+                        g_idx_offset,
+                        g_idx_size,
+                    },
+                );
             }
         }
-        
+
         let file = File::open(path)
             .map_err(|e| Error::Backend(format!("cannot reopen GPTQ file '{}': {e}", path)))?;
         let reader = Mutex::new(BufReader::new(file));
 
-        Ok(Self { tensors, reader, data_region_start })
+        Ok(Self {
+            tensors,
+            reader,
+            data_region_start,
+        })
     }
 }
 
 impl TensorProvider for GptqProvider {
     fn get(&self, name: &str) -> Result<RawTensor> {
-        let info = self.tensors.get(name).ok_or_else(|| {
-            Error::Backend(format!("tensor '{name}' not found in GPTQ file"))
-        })?;
-        
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in GPTQ file")))?;
+
         let mut reader = self.reader.lock().unwrap();
-        
+
         // Helper to read raw bytes from offsets
         let mut read_bytes = |offset: Option<u64>, size: u64| -> Result<Vec<u8>> {
             let off = offset.ok_or_else(|| Error::Backend("Missing companion offset".into()))?;
@@ -291,12 +337,13 @@ impl TensorProvider for GptqProvider {
     }
 
     fn get_packed(&self, name: &str) -> Result<RawTensor> {
-        let info = self.tensors.get(name).ok_or_else(|| {
-            Error::Backend(format!("tensor '{name}' not found in GPTQ file"))
-        })?;
-        
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in GPTQ file")))?;
+
         let mut reader = self.reader.lock().unwrap();
-        
+
         // Helper to read raw bytes from offsets
         let mut read_bytes = |offset: Option<u64>, size: u64| -> Result<Vec<u8>> {
             let off = offset.ok_or_else(|| Error::Backend("Missing companion offset".into()))?;
@@ -331,7 +378,11 @@ impl TensorProvider for GptqProvider {
         let scales_len = scales.len() as u64;
         let g_idx_len = g_idx.as_ref().map(|v| v.len()).unwrap_or(0) as u64;
 
-        let total_size = 32 + qweight_len as usize + qzeros_len as usize + scales_len as usize + g_idx_len as usize;
+        let total_size = 32
+            + qweight_len as usize
+            + qzeros_len as usize
+            + scales_len as usize
+            + g_idx_len as usize;
         let mut bytes = Vec::with_capacity(total_size);
 
         bytes.extend_from_slice(&qweight_len.to_le_bytes());
@@ -374,9 +425,10 @@ impl TensorProvider for GptqProvider {
     }
 
     fn meta(&self, name: &str) -> Result<TensorMeta> {
-        let info = self.tensors.get(name).ok_or_else(|| {
-            Error::Backend(format!("tensor '{name}' not found in GPTQ file"))
-        })?;
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in GPTQ file")))?;
         Ok(TensorMeta {
             dtype: DType::F32, // Dequantized output dtype
             provenance: QuantProvenance::ExternalQat {
@@ -416,10 +468,10 @@ pub fn dequant_gptq_tensor(
 pub fn packed_elem_count(shape: &[usize], bits: u32) -> usize {
     let elem = shape.iter().product::<usize>();
     match bits {
-        2 => (elem + 15) / 16, // 16 values per u32
+        2 => (elem + 15) / 16,     // 16 values per u32
         3 => (elem + 31) / 32 * 3, // 32 values across 3 u32 words
-        4 => (elem + 7) / 8, // 8 values per u32
-        8 => elem, // 1 value per u32
+        4 => (elem + 7) / 8,       // 8 values per u32
+        8 => elem,                 // 1 value per u32
         _ => elem,
     }
 }
@@ -460,39 +512,50 @@ mod tests {
         let group_size = 16;
         let bits = 4;
         let values_per_word = 8;
-        
+
         let mut qweight = vec![0u8; (in_features / values_per_word) * out_features * 4];
-        let mut qzeros = vec![0u8; (in_features / group_size) * (out_features / values_per_word) * 4];
+        let mut qzeros =
+            vec![0u8; (in_features / group_size) * (out_features / values_per_word) * 4];
         let mut scales = vec![0u8; (in_features / group_size) * out_features * 4];
-        
+
         let zero_val = 7u32;
         let scale_val = 0.5f32;
-        
+
         let num_groups = in_features / group_size;
         for g in 0..num_groups {
             for col in 0..out_features {
                 let scale_idx = g * out_features + col;
                 let sb = scale_val.to_le_bytes();
                 scales[scale_idx * 4..scale_idx * 4 + 4].copy_from_slice(&sb);
-                
+
                 let zero_word_idx = g * (out_features / values_per_word) + col / values_per_word;
                 let bit_offset = (col % values_per_word) * bits;
                 let offset = zero_word_idx * 4;
-                let mut word = u32::from_le_bytes([qzeros[offset], qzeros[offset+1], qzeros[offset+2], qzeros[offset+3]]);
+                let mut word = u32::from_le_bytes([
+                    qzeros[offset],
+                    qzeros[offset + 1],
+                    qzeros[offset + 2],
+                    qzeros[offset + 3],
+                ]);
                 word |= zero_val << bit_offset;
-                qzeros[offset..offset+4].copy_from_slice(&word.to_le_bytes());
+                qzeros[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
             }
         }
-        
+
         for in_idx in 0..in_features {
             for out_idx in 0..out_features {
                 let code = ((in_idx + out_idx) % 16) as u32;
                 let word_idx = (in_idx / values_per_word) * out_features + out_idx;
                 let bit_offset = (in_idx % values_per_word) * bits;
                 let offset = word_idx * 4;
-                let mut word = u32::from_le_bytes([qweight[offset], qweight[offset+1], qweight[offset+2], qweight[offset+3]]);
+                let mut word = u32::from_le_bytes([
+                    qweight[offset],
+                    qweight[offset + 1],
+                    qweight[offset + 2],
+                    qweight[offset + 3],
+                ]);
                 word |= code << bit_offset;
-                qweight[offset..offset+4].copy_from_slice(&word.to_le_bytes());
+                qweight[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
             }
         }
 
@@ -555,9 +618,9 @@ mod tests {
         // Dequantize via the new Storage::GroupInt arm logic
         let mut cursor = 0;
         let read_segment = |bytes: &[u8], cursor: &mut usize| -> Result<Vec<u8>> {
-            let len = u64::from_le_bytes(bytes[*cursor..*cursor+8].try_into().unwrap()) as usize;
+            let len = u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap()) as usize;
             *cursor += 8;
-            let segment = bytes[*cursor..*cursor+len].to_vec();
+            let segment = bytes[*cursor..*cursor + len].to_vec();
             *cursor += len;
             Ok(segment)
         };
@@ -567,7 +630,11 @@ mod tests {
         let unpacked_scales = read_segment(&raw_tensor.bytes, &mut cursor).unwrap();
         let unpacked_g_idx = read_segment(&raw_tensor.bytes, &mut cursor).unwrap();
 
-        let unpacked_g_idx_opt = if unpacked_g_idx.is_empty() { None } else { Some(&unpacked_g_idx[..]) };
+        let unpacked_g_idx_opt = if unpacked_g_idx.is_empty() {
+            None
+        } else {
+            Some(&unpacked_g_idx[..])
+        };
 
         let varbuilder_dequant = dequant_gptq_tensor(
             &info,
@@ -575,7 +642,8 @@ mod tests {
             &unpacked_qzeros,
             &unpacked_scales,
             unpacked_g_idx_opt,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Assert identical float outputs
         assert_eq!(eager_dequant, varbuilder_dequant);
@@ -610,14 +678,20 @@ mod tests {
         for in_idx in 0..in_features {
             for out_idx in 0..out_features {
                 let code = ((in_idx + out_idx) % 4) as u32;
-                expected[in_idx * out_features + out_idx] = (code as f32 - (zero_val + 1) as f32) * scale_val;
+                expected[in_idx * out_features + out_idx] =
+                    (code as f32 - (zero_val + 1) as f32) * scale_val;
 
                 let word_idx = (in_idx / values_per_word) * out_features + out_idx;
                 let bit_offset = (in_idx % values_per_word) * bits;
                 let offset = word_idx * 4;
-                let mut word = u32::from_le_bytes([qweight[offset], qweight[offset+1], qweight[offset+2], qweight[offset+3]]);
+                let mut word = u32::from_le_bytes([
+                    qweight[offset],
+                    qweight[offset + 1],
+                    qweight[offset + 2],
+                    qweight[offset + 3],
+                ]);
                 word |= code << bit_offset;
-                qweight[offset..offset+4].copy_from_slice(&word.to_le_bytes());
+                qweight[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
             }
         }
 
@@ -629,14 +703,17 @@ mod tests {
             &[in_features, out_features],
             bits as u32,
             group_size,
-        ).expect("2-bit dequant");
+        )
+        .expect("2-bit dequant");
 
         assert_eq!(dequanted.len(), expected.len());
         for i in 0..dequanted.len() {
             assert!(
                 (dequanted[i] - expected[i]).abs() < 1e-5,
                 "2-bit GPTQ mismatch at {}: got {} want {}",
-                i, dequanted[i], expected[i]
+                i,
+                dequanted[i],
+                expected[i]
             );
         }
     }
@@ -675,15 +752,16 @@ mod tests {
             let word2 = ((zero_u128 >> 64) & 0xFFFFFFFF) as u32;
 
             let base = g * 12;
-            qzeros[base..base+4].copy_from_slice(&word0.to_le_bytes());
-            qzeros[base+4..base+8].copy_from_slice(&word1.to_le_bytes());
-            qzeros[base+8..base+12].copy_from_slice(&word2.to_le_bytes());
+            qzeros[base..base + 4].copy_from_slice(&word0.to_le_bytes());
+            qzeros[base + 4..base + 8].copy_from_slice(&word1.to_le_bytes());
+            qzeros[base + 8..base + 12].copy_from_slice(&word2.to_le_bytes());
         }
 
         for in_idx in 0..in_features {
             for out_idx in 0..out_features {
                 let code = ((in_idx + out_idx) % 8) as u32;
-                expected[in_idx * out_features + out_idx] = (code as f32 - (zero_val + 1) as f32) * scale_val;
+                expected[in_idx * out_features + out_idx] =
+                    (code as f32 - (zero_val + 1) as f32) * scale_val;
             }
         }
 
@@ -718,14 +796,17 @@ mod tests {
             &[in_features, out_features],
             bits as u32,
             group_size,
-        ).expect("3-bit dequant");
+        )
+        .expect("3-bit dequant");
 
         assert_eq!(dequanted.len(), expected.len());
         for i in 0..dequanted.len() {
             assert!(
                 (dequanted[i] - expected[i]).abs() < 1e-5,
                 "3-bit GPTQ cross-word mismatch at {}: got {} want {}",
-                i, dequanted[i], expected[i]
+                i,
+                dequanted[i],
+                expected[i]
             );
         }
     }
