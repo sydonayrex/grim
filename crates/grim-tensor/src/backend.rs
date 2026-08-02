@@ -851,6 +851,10 @@ unsafe impl Sync for QuantizedMatmulBackwardResiduals {}
 pub trait BackendStorage: Send + Sync {
     fn dtype(&self) -> DType;
     fn provenance(&self) -> QuantProvenance;
+
+    /// Update load-time quantization metadata before the storage is attached
+    /// to a Tensor. Backends that do not need metadata may keep the default.
+    fn set_provenance(&mut self, _provenance: QuantProvenance) {}
     fn shape(&self) -> &Shape;
 
     /// Return optional per-column/group scales slice for explicit scale formats (`ResidualPacked`/`GroupInt`).
@@ -884,6 +888,13 @@ pub trait BackendStorage: Send + Sync {
     /// without an intermediate host round-trip.
     fn device_ptr(&self) -> Option<u64> {
         None
+    }
+
+    /// Request residency on the owning accelerator for managed storage.
+    /// Ordinary device and CPU allocations are already resident and return
+    /// success immediately.
+    fn prefetch_to_device(&self) -> Result<()> {
+        Ok(())
     }
 }
 

@@ -468,6 +468,7 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
                 | Storage::GroupInt(..)
         );
         let b_on_rocm = matches!(args.b.device(), grim_tensor::Device::Rocm(_));
+        let b_on_cuda = matches!(args.b.device(), grim_tensor::Device::Cuda(_));
 
         let empty_scales: [f32; 0] = [];
         let b_scales: &[f32] = match args.b.dtype().storage {
@@ -484,7 +485,7 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
             Storage::Native => &empty_scales,
         };
 
-        if b_quantized && b_on_rocm {
+        if b_quantized && (b_on_rocm || b_on_cuda) {
             let bpw = bpw_from_dtype(&args.b.dtype());
             let residuals = grim_tensor::QuantizedMatmulBackwardResiduals::from_tensor(&args.b);
             if let Ok((grad_a_storage, _handle)) = dev.quantized_matmul_backward_dx(

@@ -206,6 +206,25 @@ fn materialize_cuda(
 }
 
 #[cfg(feature = "rocm-mem")]
+fn rocm_managed_weight_mode(ordinal: usize, bytes: usize) -> bool {
+    match std::env::var("GRIM_ROCM_MANAGED_WEIGHTS")
+        .ok()
+        .as_deref()
+    {
+        Some("1") | Some("true") | Some("always") => true,
+        Some("auto") => {
+            let (free, total) = grim_backend_rocm::vram_info(ordinal);
+            let budget = std::env::var("GRIM_ROCM_VRAM_BUDGET_BYTES")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_else(|| total.saturating_mul(9) / 10);
+            free < bytes as u64 || total.saturating_sub(free) > budget
+        }
+        _ => false,
+    }
+}
+
+#[cfg(feature = "rocm-mem")]
 fn materialize_rocm(
     f32s: Vec<f32>,
     shape: Shape,
@@ -218,7 +237,16 @@ fn materialize_rocm(
     // Storage is F32 bytes (already dequantized in `materialize`). Mirror
     // CUDA: stamp the storage as DType::F32 so ROCm kernels that check
     // input dtype (embedding, matmul) accept the result.
-    let storage = BackendDevice::from_cpu(&dev, &f32s, &shape, DType::F32)?;
+    // Opt-in unified-memory residency for large model weights. HIP kernels
+    // can dereference this storage normally; the runtime migrates pages
+    // between VRAM and system RAM. Keep the default on ordinary VRAM until
+    // a global budget policy is selected by the caller.
+    let managed = rocm_managed_weight_mode(ordinal, f32s.len() * std::mem::size_of::<f32>());
+    let storage = if managed {
+        dev.from_cpu_managed(&f32s, &shape, DType::F32)?
+    } else {
+        BackendDevice::from_cpu(&dev, &f32s, &shape, DType::F32)?
+    };
     Ok(Tensor::new(
         Arc::from(storage),
         shape,
@@ -327,6 +355,18 @@ fn materialize(
         // they must fall through to the CPU dequant path below, which
         // produces real F32 and uploads it via materialize_rocm.
         let is_q80 = matches!(&dtype.storage, Storage::KQuant(KQuantScheme::Q80));
+        if matches!(&dtype.storage, Storage::ResidualPacked(_)) {
+            if let Device::Rocm(ordinal) = device {
+                #[cfg(feature = "rocm-mem")]
+                {
+                    let dev = RocmDevice::new(*ordinal);
+                    let mut storage = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone())?;
+                    storage.set_provenance(provenance.clone());
+                    return Ok(Tensor::new(Arc::from(storage), shape, dtype, provenance, device.clone()));
+                }
+            }
+            return Err(Error::Unimplemented("ResidualPacked inference requires a ROCm device".into()));
+        }
         if is_q80 {
             if let Device::Rocm(ordinal) = device {
                 #[cfg(feature = "rocm-mem")]
@@ -371,7 +411,35 @@ fn materialize(
                 let _ = ordinal;
             }
         }
+
+        // CUDA: keep KQuant / FloatPack / Block storage resident on-device
+        // (raw packed bytes) instead of dequantizing to F32 at load time. This
+        // mirrors ROCm's Q8_0 residency and enables the CUDA fused
+        // `quantized_matmul_backward_dx` path in `grim-autograd::matmul_backward`.
+        // ResidualPacked is excluded (no host dequant exists); GroupInt is left
+        // dequantized-to-F32 to preserve its multi-segment loader semantics.
+        #[cfg(feature = "cuda-mem")]
+        if let Device::Cuda(ordinal) = device {
+            if dtype.is_quantized()
+                && !matches!(dtype.storage, Storage::ResidualPacked(_))
+                && !matches!(dtype.storage, Storage::GroupInt(_))
+            {
+                let dev = CudaDevice::new(*ordinal)?;
+                let storage = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone())?;
+                return Ok(Tensor::new(
+                    Arc::from(storage),
+                    shape,
+                    dtype,
+                    provenance,
+                    device.clone(),
+                ));
+            }
+        }
+        #[cfg(not(feature = "cuda-mem"))]
+        let _ = device;
+
     }
+
     let f32s = dequant_to_f32(&raw, &dtype)?;
     match device {
         Device::Cpu => {

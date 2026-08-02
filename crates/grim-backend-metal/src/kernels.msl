@@ -39,6 +39,26 @@ kernel void grim_silu_mul(
     }
 }
 
+kernel void grim_silu_mul_backward(
+    device const float* e [[buffer(0)]],
+    device const float* g [[buffer(1)]],
+    device const float* dw [[buffer(2)]],
+    device float* df [[buffer(3)]],
+    device float* de [[buffer(4)]],
+    constant int& n [[buffer(5)]],
+    uint id [[thread_position_in_grid]]) {
+    if (id < uint(n)) {
+        float e_val = e[id];
+        float g_val = g[id];
+        float dw_val = dw[id];
+        float s = 1.0f / (1.0f + exp(-e_val));
+        float silu = s * e_val;
+        float dsilu = s * (1.0f + e_val * (1.0f - s));
+        df[id] = dw_val * g_val * dsilu;
+        de[id] = dw_val * silu;
+    }
+}
+
 kernel void grim_rms_norm(
     device const float* x [[buffer(0)]],
     device const float* w [[buffer(1)]],
@@ -259,6 +279,106 @@ kernel void grim_qkv_attention(
     }
 }
 
+kernel void grim_qkv_attention_paged(
+    device const float* q [[buffer(0)]],
+    device const float* k_pages [[buffer(1)]],
+    device const float* v_pages [[buffer(2)]],
+    device const uint* block_table [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant int& batch [[buffer(5)]],
+    constant int& num_heads [[buffer(6)]],
+    constant int& head_dim [[buffer(7)]],
+    constant int& page_size [[buffer(8)]],
+    constant int& max_blocks [[buffer(9)]],
+    constant int& kv_seq_len [[buffer(10)]],
+    constant int& num_kv_heads [[buffer(11)]],
+    uint3 id [[thread_position_in_grid]]) {
+    int d = int(id.x);
+    int h = int(id.y);
+    int b = int(id.z);
+    if (b >= batch || h >= num_heads || d >= head_dim) return;
+    int q_base = (b * num_heads + h) * head_dim;
+    float scale = rsqrt(float(head_dim));
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+    float acc = 0.0f;
+    for (int pos = 0; pos < kv_seq_len; ++pos) {
+        int logical_block = pos / page_size;
+        if (logical_block >= max_blocks) break;
+        int physical_block = int(block_table[b * max_blocks + logical_block]);
+        int offset = pos % page_size;
+        int kv_head = h / (num_heads / num_kv_heads);
+        int kv_base = ((physical_block * page_size + offset) * num_kv_heads + kv_head) * head_dim;
+        float score = 0.0f;
+        for (int qd = 0; qd < head_dim; ++qd) score += q[q_base + qd] * k_pages[kv_base + qd];
+        score *= scale;
+        float old_max = running_max;
+        running_max = max(running_max, score);
+        float old_weight = exp(old_max - running_max);
+        float new_weight = exp(score - running_max);
+        running_sum = running_sum * old_weight + new_weight;
+        acc = acc * old_weight + new_weight * v_pages[kv_base + d];
+    }
+    out[q_base + d] = running_sum > 0.0f ? acc / running_sum : 0.0f;
+}
+
+kernel void grim_tree_attention(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]],
+    device const uint* parents [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant int& batch [[buffer(5)]],
+    constant int& num_heads [[buffer(6)]],
+    constant int& kv_seq_len [[buffer(7)]],
+    constant int& head_dim [[buffer(8)]],
+    constant int& gamma [[buffer(9)]],
+    constant int& cache_offset [[buffer(10)]],
+    constant int& num_kv_heads [[buffer(11)]],
+    uint3 id [[thread_position_in_grid]]) {
+    int d = int(id.x);
+    int head_work = int(id.y);
+    int b = int(id.z);
+    int nodes = gamma + 1;
+    int node = head_work / num_heads;
+    int q_head = head_work % num_heads;
+    if (b >= batch || node >= nodes || d >= head_dim) return;
+    int q_base = ((b * nodes + node) * num_heads) * head_dim;
+    float scale = rsqrt(float(head_dim));
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+    float acc = 0.0f;
+    for (int pos = 0; pos < kv_seq_len; ++pos) {
+        bool attend = pos < cache_offset;
+        if (!attend) {
+            int tree_node = pos - cache_offset;
+            if (tree_node <= node) {
+                attend = tree_node == node;
+                int cursor = node;
+                for (int depth = 0; depth <= gamma && cursor > 0; ++depth) {
+                    cursor = int(parents[cursor]);
+                    if (cursor == tree_node) { attend = true; break; }
+                }
+            }
+        }
+        if (!attend) continue;
+        int q_per_kv = num_heads / num_kv_heads;
+        int kv_head = q_head / q_per_kv;
+        int q_head_base = q_base + q_head * head_dim;
+        int kv_base = ((b * kv_seq_len + pos) * num_kv_heads + kv_head) * head_dim;
+        float score = 0.0f;
+        for (int qd = 0; qd < head_dim; ++qd) score += q[q_head_base + qd] * k[kv_base + qd];
+        score *= scale;
+        float old_max = running_max;
+        running_max = max(running_max, score);
+        float old_weight = exp(old_max - running_max);
+        float new_weight = exp(score - running_max);
+        running_sum = running_sum * old_weight + new_weight;
+        acc = acc * old_weight + new_weight * v[kv_base + d];
+    }
+    out[q_base + d] = running_sum > 0.0f ? acc / running_sum : 0.0f;
+}
+
 kernel void grim_kv_dequant_attention(
     device const float* q [[buffer(0)]],
     device const uchar* k_tensor [[buffer(1)]],
@@ -444,6 +564,71 @@ kernel void grim_quantized_matmul_q8_0(
     }
 }
 
+// ResidualPacked forward GEMM.  Codes are MSB-first within each byte and each
+// logical output row has a 256-byte aligned stride.  Auxiliary arrays are
+// explicit buffers: scales are decoded host-side, while outlier indices and
+// values are uploaded as compact device arrays for a bounded lookup.
+inline uint residual_code(device const uchar* b, uint row_base, uint index, uint bpw) {
+    uint bit = index * bpw;
+    uint byte = row_base + (bit >> 3);
+    uint shift = 8u - bpw - (bit & 7u);
+    return (uint(b[byte]) >> shift) & ((1u << bpw) - 1u);
+}
+
+kernel void grim_quantized_matmul_residualpacked(
+    device const float* a [[buffer(0)]], device const uchar* b [[buffer(1)]],
+    device const float* scales [[buffer(2)]], device const uint* outlier_indices [[buffer(3)]],
+    device const float* outlier_values [[buffer(4)]], device float* out [[buffer(5)]],
+    constant int& m [[buffer(6)]], constant int& n [[buffer(7)]], constant int& k [[buffer(8)]],
+    constant int& bpw [[buffer(9)]], constant int& row_stride [[buffer(10)]],
+    constant int& scale_offset [[buffer(11)]], constant int& backup1_bpw [[buffer(12)]],
+    constant int& backup1_offset [[buffer(13)]], constant int& backup1_scale_offset [[buffer(14)]],
+    constant int& backup2_bpw [[buffer(15)]], constant int& backup2_offset [[buffer(16)]],
+    constant int& backup2_scale_offset [[buffer(17)]], constant int& outlier_count [[buffer(18)]],
+    uint2 id [[thread_position_in_grid]]) {
+    int row = int(id.y), col = int(id.x);
+    if (row >= m || col >= n) return;
+    float sum = 0.0f;
+    for (int j = 0; j < k; ++j) {
+        uint flat = uint(col * k + j);
+        float value = float(residual_code(b, uint(col * row_stride), uint(j), uint(bpw))) * scales[col];
+        if (backup1_bpw > 0)
+            value += float(residual_code(b, uint(backup1_offset + col * row_stride), uint(j), uint(backup1_bpw))) * scales[n + col];
+        if (backup2_bpw > 0)
+            value += float(residual_code(b, uint(backup2_offset + col * row_stride), uint(j), uint(backup2_bpw))) * scales[2 * n + col];
+        for (int oi = 0; oi < outlier_count; ++oi)
+            if (outlier_indices[oi] == flat) { value = outlier_values[oi]; break; }
+        sum += a[row * k + j] * value;
+    }
+    out[row * n + col] = sum;
+}
+
+kernel void grim_quantized_matmul_backward_q8_0(
+    device const float* dy [[buffer(0)]],
+    device const uchar* b [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    device float* dx [[buffer(3)]],
+    constant int& m [[buffer(4)]],
+    constant int& n [[buffer(5)]],
+    constant int& k [[buffer(6)]],
+    uint2 id [[thread_position_in_grid]]) {
+    int row = id.y;
+    int k_idx = id.x;
+    if (row < m && k_idx < k) {
+        float sum = 0.0f;
+        int blocks = k / 32;
+        int block = k_idx / 32;
+        int in_block = k_idx % 32;
+        for (int col = 0; col < n; ++col) {
+            int b_offset = (col * blocks + block) * 32 + in_block;
+            char q = (char)b[b_offset];
+            float scale = scales[col * blocks + block];
+            sum += dy[row * n + col] * (float(q) * scale);
+        }
+        dx[row * k + k_idx] = sum;
+    }
+}
+
 kernel void grim_quantized_matmul_q8_0(
     device const float* a [[buffer(0)]],
     device const uchar* b [[buffer(1)]],
@@ -471,4 +656,3 @@ kernel void grim_quantized_matmul_q8_0(
         out[row * n + col] = sum;
     }
 }
-

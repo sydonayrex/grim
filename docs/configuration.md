@@ -25,7 +25,15 @@ This document describes all environment variables and configuration options used
 | `GRIM_ROCM_GCN_NAME` | string | unset | `grim-backend-rocm` | GCN name filter |
 | `GRIM_CAPTURE_GRAPH` | flag | unset | `grim-backend-rocm` | Enable hip graph capture |
 | `GRIM_ALLOC_POOL_CAP_BYTES` | number | unset | `grim-backend-rocm` | Override allocation pool capacity |
+| `GRIM_ROCM_MANAGED_ALLOCATIONS` | `always`/`auto` | unset | `grim-backend-rocm` | Use HIP managed memory for global allocations; `auto` spills when free VRAM or the configured budget is insufficient |
+| `GRIM_ROCM_MANAGED_WEIGHTS` | `always`/`auto` | unset | `grim-nn` | Use HIP managed memory for F32 model-weight materialization only |
+| `GRIM_ROCM_VRAM_BUDGET_BYTES` | number | 90% of reported VRAM in `auto` mode | `grim-backend-rocm`, `grim-nn` | Soft per-device VRAM ceiling in bytes before new allocations use host-backed managed memory |
 | `GRIM_FORCE_DEVICE` | string | unset | Various | Force specific device |
+
+ROCm allocations also retry with HIP managed memory after an ordinary VRAM
+allocation fails, regardless of the policy variable. This last-resort path
+covers races between the VRAM probe and concurrent allocations; the variables
+above control proactive spilling before that failure occurs.
 | `GRIM_CUDA_ORDINAL_OVERRIDE` | string | unset | `grim-backend-cuda` | Override CUDA device ordinal |
 
 ### Runtime Control

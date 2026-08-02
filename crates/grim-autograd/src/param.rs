@@ -189,6 +189,23 @@ impl TrainableParams {
         self.params.is_empty()
     }
 
+    /// Deterministic checksum of live adapter values for cross-rank
+    /// consistency checks. Parameter IDs are sorted so HashMap iteration order
+    /// cannot affect the result.
+    pub fn weight_checksum(&self) -> Result<u64> {
+        let mut ids: Vec<ParamId> = self.params.keys().copied().collect();
+        ids.sort_by_key(|id| (id.layer_idx, id.adapter_id, id.point as u8, id.is_a));
+        let mut hash = 0xcbf29ce484222325u64;
+        for id in ids {
+            let param = &self.params[&id];
+            for value in param.data.to_vec_f32()? {
+                hash ^= value.to_bits() as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+        Ok(hash)
+    }
+
     pub fn all_reduce_grads(
         &mut self,
         dev: &dyn grim_tensor::backend::BackendDevice,
@@ -196,6 +213,35 @@ impl TrainableParams {
         rccl: Option<&grim_backend_rocm::RcclAllReduce>,
     ) -> Result<()> {
         let num_gpus = placement.ranks.len().max(1);
+        self.all_reduce_grads_weighted(dev, placement, rccl, 1.0 / num_gpus as f32)
+    }
+
+    /// Reduce this rank's gradients with an explicit contribution weight.
+    ///
+    /// For equal batches, callers should use [`Self::all_reduce_grads`]. For
+    /// asymmetric data-parallel batches, each rank passes
+    /// `local_examples / global_examples`; the RCCL sum then directly yields
+    /// the global-batch-weighted gradient. Dividing by rank count is wrong in
+    /// that case because it weights a small rank the same as a large rank.
+    pub fn all_reduce_grads_weighted(
+        &mut self,
+        dev: &dyn grim_tensor::backend::BackendDevice,
+        placement: &grim_tensor::backend::ScythePlacement,
+        rccl: Option<&grim_backend_rocm::RcclAllReduce>,
+        contribution_weight: f32,
+    ) -> Result<()> {
+        let num_gpus = placement.ranks.len().max(1);
+        if !contribution_weight.is_finite() || contribution_weight < 0.0 {
+            return Err(grim_tensor::error::Error::Backend(
+                "gradient contribution weight must be finite and non-negative".into(),
+            ));
+        }
+
+        if num_gpus > 1 && rccl.is_none() {
+            return Err(grim_tensor::error::Error::Backend(
+                "multi-GPU gradient synchronization requires a live RCCL communicator".into(),
+            ));
+        }
 
         // ── Fast path: RCCL device-pointer all-reduce ─────────────────────
         // When an RcclAllReduce handle is provided and we have >1 GPU, reduce
@@ -207,34 +253,36 @@ impl TrainableParams {
                     let count = param.grad.shape().elem_count();
 
                     if let Some(ptr) = dev_ptr {
+                        // Weight the local contribution before the collective;
+                        // the all-reduce sum is then already a global weighted
+                        // average and must not be divided by rank count again.
+                        if (contribution_weight - 1.0).abs() > f32::EPSILON {
+                            let (weighted_storage, handle) = dev.mul_scalar(
+                                param.grad.storage().as_ref(),
+                                contribution_weight,
+                                param.grad.shape(),
+                            )?;
+                            handle.synchronize()?;
+                            param.grad = Tensor::new(
+                                Arc::from(weighted_storage),
+                                param.grad.shape().clone(),
+                                param.grad.dtype(),
+                                param.grad.provenance().clone(),
+                                param.grad.device().clone(),
+                            );
+                        }
                         // In-place device-pointer all-reduce: send and recv
                         // alias the same buffer so ncclAllReduce reduces into
                         // the gradient tensor directly.
                         let stream = 0u64; // default HIP stream
                         rccl_handle.sum_gradients_device(ptr, ptr, count, stream)?;
-                        // ncclAllReduce with NCCL_SUM produces a sum; scale by
-                        // 1/num_gpus to get the mean. Use the backend's
-                        // mul_scalar kernel so this stays on-device — no D2H
-                        // round-trip.
-                        let scale = 1.0 / num_gpus as f32;
-                        let (scaled_storage, handle) = dev.mul_scalar(
-                            param.grad.storage().as_ref(),
-                            scale,
-                            param.grad.shape(),
-                        )?;
-                        handle.synchronize()?;
-                        param.grad = Tensor::new(
-                            Arc::from(scaled_storage),
-                            param.grad.shape().clone(),
-                            param.grad.dtype(),
-                            param.grad.provenance().clone(),
-                            param.grad.device().clone(),
-                        );
                     } else {
                         // CPU fallback for this tensor: host round-trip.
                         let grad_vec = param.grad.to_vec_f32()?;
                         let mut scaled = grad_vec;
-                        rccl_handle.scale_gradients(&mut scaled)?;
+                        for value in &mut scaled {
+                            *value *= contribution_weight;
+                        }
                         let grad_tensor =
                             grim_backend_cpu::cpu_tensor(scaled, param.grad.shape().clone());
                         param.accumulate_grad(&grad_tensor)?;
@@ -244,9 +292,14 @@ impl TrainableParams {
             }
         }
 
-        // ── Fallback: CPU-only accumulate (single-GPU or no RCCL) ──────────
+        // ── Single-rank accumulation only ─────────────────────────────────
+        // A host accumulation is not a multi-rank reduction. Multi-rank calls
+        // were rejected above so this path cannot silently diverge replicas.
         for (_, param) in self.params.iter_mut() {
-            let grad_vec = param.grad.to_vec_f32()?;
+            let mut grad_vec = param.grad.to_vec_f32()?;
+            for value in &mut grad_vec {
+                *value *= contribution_weight;
+            }
             let grad_tensor = grim_backend_cpu::cpu_tensor(grad_vec, param.grad.shape().clone());
             param.accumulate_grad(&grad_tensor)?;
         }
@@ -468,5 +521,45 @@ mod tests {
             params.get(pid).unwrap().grad().to_vec_f32().unwrap(),
             vec![1.0f32; 4]
         );
+    }
+
+    #[test]
+    fn multi_rank_without_rccl_fails_instead_of_accumulating_locally() {
+        let mut params = TrainableParams::new();
+        let pid = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
+        let mut tp = TrainableParam::new(pid, tensor(vec![1.0], vec![1])).unwrap();
+        tp.accumulate_grad(&tensor(vec![0.5], vec![1])).unwrap();
+        params.insert(tp);
+        let placement = grim_tensor::backend::ScythePlacement {
+            ranks: vec![0, 1],
+            partition: vec![0.5, 0.5],
+            routes: vec![grim_tensor::backend::ScytheLink::Host; 4],
+        };
+        let err = params
+            .all_reduce_grads(&grim_backend_cpu::CpuDevice::new(), &placement, None)
+            .expect_err("multi-rank calls must not use the local-only fallback");
+        assert!(err.to_string().contains("requires a live RCCL communicator"));
+        assert_eq!(params.get(pid).unwrap().grad().to_vec_f32().unwrap(), vec![0.5]);
+    }
+
+    #[test]
+    fn weighted_gradient_rejects_invalid_contribution() {
+        let mut params = TrainableParams::new();
+        let pid = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
+        params.insert(TrainableParam::new(pid, tensor(vec![1.0], vec![1])).unwrap());
+        let placement = grim_tensor::backend::ScythePlacement {
+            ranks: vec![0],
+            partition: vec![1.0],
+            routes: vec![grim_tensor::backend::ScytheLink::Host],
+        };
+        let err = params
+            .all_reduce_grads_weighted(
+                &grim_backend_cpu::CpuDevice::new(),
+                &placement,
+                None,
+                f32::NAN,
+            )
+            .expect_err("NaN contribution weights must fail closed");
+        assert!(err.to_string().contains("contribution weight"));
     }
 }

@@ -61,7 +61,10 @@ extern "C" {
         const float* __restrict__ outlier_values,
         int backup_bpw,
         int backup_codes_offset,
-        int backup_scale_offset)
+        int backup_scale_offset,
+        int backup2_bpw,
+        int backup2_codes_offset,
+        int backup2_scale_offset)
     {
         const unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
         const unsigned long long total = (unsigned long long)M * N;
@@ -92,6 +95,12 @@ extern "C" {
                         b_scale = (float)B_codes[backup_scale_offset + col] / 255.0f;
                     }
                     w_val += b_val * b_scale;
+                }
+                if (backup2_bpw > 0) {
+                    const unsigned char* backup2_codes = B_codes + backup2_codes_offset;
+                    float b2_val = unpack_weight(backup2_codes, col, k, K, backup2_bpw);
+                    float b2_scale = backup2_scale_offset > 0 ? (float)B_codes[backup2_scale_offset + col] / 255.0f : 1.0f;
+                    w_val += b2_val * b2_scale;
                 }
             }
             

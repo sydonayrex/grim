@@ -134,4 +134,24 @@ impl AutogradRegistry {
     pub fn zero_grads(&mut self) -> Result<()> {
         self.params.zero_all_grads()
     }
+
+    /// Clone the initialized adapter registry for another data-parallel rank.
+    /// Parameter tensors are cloned by value, so a rank can update its copy
+    /// independently while starting from identical weights.
+    pub fn fork_for_rank(&self) -> Self {
+        self.clone()
+    }
+
+    /// Verify that two rank registries have identical trainable parameter
+    /// topology and values before entering a synchronized step.
+    pub fn assert_rank_compatible(&self, other: &Self) -> Result<()> {
+        if self.params.len() != other.params.len()
+            || self.params.weight_checksum()? != other.params.weight_checksum()?
+        {
+            return Err(grim_tensor::error::Error::Backend(
+                "data-parallel rank adapter registries diverged".into(),
+            ));
+        }
+        Ok(())
+    }
 }
