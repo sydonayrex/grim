@@ -186,17 +186,29 @@ impl GgufDType {
     /// tensor, which then surfaces as `UnexpectedEof` in `read_exact`.
     pub fn block_size(self) -> u64 {
         match self {
-            GgufDType::F32 | GgufDType::F16 | GgufDType::F64
-            | GgufDType::I8 | GgufDType::I16 | GgufDType::I32 | GgufDType::I64
+            GgufDType::F32
+            | GgufDType::F16
+            | GgufDType::F64
+            | GgufDType::I8
+            | GgufDType::I16
+            | GgufDType::I32
+            | GgufDType::I64
             | GgufDType::Q4_2
             | GgufDType::Q8_1Hx => 1,
             // K-quants and iquants: 256-elem super-block
-            GgufDType::Q2K | GgufDType::Q3K
-            | GgufDType::Q4K | GgufDType::Q5K
-            | GgufDType::Q6K | GgufDType::Q8K
-            | GgufDType::IQ4_NL | GgufDType::IQ4_XS
-            | GgufDType::IQ3_XXS | GgufDType::IQ3_S
-            | GgufDType::IQ2_XXS | GgufDType::IQ2_XS | GgufDType::IQ2_S
+            GgufDType::Q2K
+            | GgufDType::Q3K
+            | GgufDType::Q4K
+            | GgufDType::Q5K
+            | GgufDType::Q6K
+            | GgufDType::Q8K
+            | GgufDType::IQ4_NL
+            | GgufDType::IQ4_XS
+            | GgufDType::IQ3_XXS
+            | GgufDType::IQ3_S
+            | GgufDType::IQ2_XXS
+            | GgufDType::IQ2_XS
+            | GgufDType::IQ2_S
             | GgufDType::IQ1_S => 256,
             // Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1: 32-elem block
             _ => 32,
@@ -516,11 +528,19 @@ fn gguf_value_to_json(v: &GgufValue) -> serde_json::Value {
         GgufValue::Int32(n) => serde_json::Value::Number((*n).into()),
         GgufValue::Uint64(n) => serde_json::Value::Number((*n).into()),
         GgufValue::Int64(n) => serde_json::Value::Number((*n).into()),
-        GgufValue::Float32(f) => serde_json::Value::Number(serde_json::Number::from_f64(*f as f64).unwrap_or(serde_json::Number::from_f64(0.0).unwrap())),
-        GgufValue::Float64(f) => serde_json::Value::Number(serde_json::Number::from_f64(*f).unwrap_or(serde_json::Number::from_f64(0.0).unwrap())),
+        GgufValue::Float32(f) => match serde_json::Number::from_f64(*f as f64) {
+            Some(n) => serde_json::Value::Number(n),
+            None => serde_json::Value::String(format!("{f}")),
+        },
+        GgufValue::Float64(f) => match serde_json::Number::from_f64(*f) {
+            Some(n) => serde_json::Value::Number(n),
+            None => serde_json::Value::String(format!("{f}")),
+        },
         GgufValue::Bool(b) => serde_json::Value::Bool(*b),
         GgufValue::String(s) => serde_json::Value::String(s.clone()),
-        GgufValue::Array(arr) => serde_json::Value::Array(arr.iter().map(gguf_value_to_json).collect()),
+        GgufValue::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(gguf_value_to_json).collect())
+        }
     }
 }
 
@@ -530,14 +550,26 @@ fn gguf_value_from_json(v: &serde_json::Value) -> Option<GgufValue> {
         serde_json::Value::String(s) => Some(GgufValue::String(s.clone())),
         serde_json::Value::Number(n) => {
             if let Some(u) = n.as_u64() {
-                if u <= u8::MAX as u64 { return Some(GgufValue::Uint8(u as u8)); }
-                if u <= u16::MAX as u64 { return Some(GgufValue::Uint16(u as u16)); }
-                if u <= u32::MAX as u64 { return Some(GgufValue::Uint32(u as u32)); }
+                if u <= u8::MAX as u64 {
+                    return Some(GgufValue::Uint8(u as u8));
+                }
+                if u <= u16::MAX as u64 {
+                    return Some(GgufValue::Uint16(u as u16));
+                }
+                if u <= u32::MAX as u64 {
+                    return Some(GgufValue::Uint32(u as u32));
+                }
                 Some(GgufValue::Uint64(u))
             } else if let Some(i) = n.as_i64() {
-                if i >= i8::MIN as i64 && i <= i8::MAX as i64 { return Some(GgufValue::Int8(i as i8)); }
-                if i >= i16::MIN as i64 && i <= i16::MAX as i64 { return Some(GgufValue::Int16(i as i16)); }
-                if i >= i32::MIN as i64 && i <= i32::MAX as i64 { return Some(GgufValue::Int32(i as i32)); }
+                if i >= i8::MIN as i64 && i <= i8::MAX as i64 {
+                    return Some(GgufValue::Int8(i as i8));
+                }
+                if i >= i16::MIN as i64 && i <= i16::MAX as i64 {
+                    return Some(GgufValue::Int16(i as i16));
+                }
+                if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
+                    return Some(GgufValue::Int32(i as i32));
+                }
                 Some(GgufValue::Int64(i))
             } else if let Some(f) = n.as_f64() {
                 Some(GgufValue::Float64(f))
@@ -556,12 +588,17 @@ fn gguf_value_from_json(v: &serde_json::Value) -> Option<GgufValue> {
 impl GrimMetadata {
     /// Retrieve per-tensor extension capabilities for a named tensor if present.
     pub fn get_tensor_ext(&self, tensor_name: &str) -> Option<&crate::spec::GrimTensorExt> {
-        self.ext_entries.iter().find(|e| e.tensor_name == tensor_name)
+        self.ext_entries
+            .iter()
+            .find(|e| e.tensor_name == tensor_name)
     }
 
     /// Build a `GrimMetadata` by scanning `metadata` for `grim.` keys.
     pub fn from_gguf_metadata(metadata: &HashMap<String, GgufValue>) -> Self {
-        let magic = metadata.get("grim.magic").and_then(|v| v.as_str()).map(String::from);
+        let magic = metadata
+            .get("grim.magic")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let quant_version = metadata.get("grim.quant_version").and_then(|v| v.as_u32());
         let rocml_profile_str = metadata.get("grim.rocml.profile").and_then(|v| v.as_str());
         let profile = rocml_profile_str
@@ -571,8 +608,13 @@ impl GrimMetadata {
             .get("grim.rocml.wavefront_size")
             .and_then(|v| v.as_u32())
             .unwrap_or_else(|| profile.wavefront_size());
-        let target_gcn = metadata.get("grim.rocml.target_gcn").and_then(|v| v.as_str()).map(String::from);
-        let block_size = metadata.get("grim.rocml.block_size").and_then(|v| v.as_u32());
+        let target_gcn = metadata
+            .get("grim.rocml.target_gcn")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let block_size = metadata
+            .get("grim.rocml.block_size")
+            .and_then(|v| v.as_u32());
         let lds_size = metadata.get("grim.rocml.lds_size").and_then(|v| v.as_u32());
         let tensor_core_enabled = metadata
             .get("grim.rocml.tensor_core_enabled")
@@ -581,7 +623,10 @@ impl GrimMetadata {
                 _ => None,
             })
             .unwrap_or(false);
-        let quant_method = metadata.get("grim.quant_method").and_then(|v| v.as_str()).map(String::from);
+        let quant_method = metadata
+            .get("grim.quant_method")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let calibration_dataset = metadata
             .get("grim.calibration_dataset")
             .and_then(|v| v.as_str())
@@ -606,9 +651,7 @@ impl GrimMetadata {
         let kv_layout_optimized = metadata
             .get("grim.rocm.kv_layout_optimized")
             .and_then(read_bool);
-        let has_kv_registry = metadata
-            .get("grim.has_kv_registry")
-            .and_then(read_bool);
+        let has_kv_registry = metadata.get("grim.has_kv_registry").and_then(read_bool);
 
         GrimMetadata {
             magic,
@@ -642,7 +685,9 @@ impl GrimMetadata {
     /// Look up a per-tensor override by tensor name. Returns `None` if the
     /// tensor has no override (use the GGUF dtype from the tensor info).
     pub fn override_for(&self, tensor_name: &str) -> Option<&GrimQuantOverride> {
-        self.quant_overrides.iter().find(|o| o.tensor_name == tensor_name)
+        self.quant_overrides
+            .iter()
+            .find(|o| o.tensor_name == tensor_name)
     }
 
     pub fn to_gguf_metadata(&self) -> HashMap<String, GgufValue> {
@@ -655,16 +700,18 @@ impl GrimMetadata {
         }
         metadata.insert(
             "grim.rocml.profile".into(),
-            GgufValue::String(match self.rocml_profile {
-                GrimRocmlProfile::Cdna2 => "cdna2",
-                GrimRocmlProfile::Cdna3 => "cdna3",
-                GrimRocmlProfile::Rdna2 => "rdna2",
-                GrimRocmlProfile::Rdna3 => "rdna3",
-                GrimRocmlProfile::Rdna4 => "rdna4",
-                GrimRocmlProfile::All => "all",
-                GrimRocmlProfile::Unknown => "unknown",
-            }
-            .to_string()),
+            GgufValue::String(
+                match self.rocml_profile {
+                    GrimRocmlProfile::Cdna2 => "cdna2",
+                    GrimRocmlProfile::Cdna3 => "cdna3",
+                    GrimRocmlProfile::Rdna2 => "rdna2",
+                    GrimRocmlProfile::Rdna3 => "rdna3",
+                    GrimRocmlProfile::Rdna4 => "rdna4",
+                    GrimRocmlProfile::All => "all",
+                    GrimRocmlProfile::Unknown => "unknown",
+                }
+                .to_string(),
+            ),
         );
         if self.wavefront_size > 0 {
             metadata.insert(
@@ -673,10 +720,16 @@ impl GrimMetadata {
             );
         }
         if let Some(target_gcn) = &self.target_gcn {
-            metadata.insert("grim.rocml.target_gcn".into(), GgufValue::String(target_gcn.clone()));
+            metadata.insert(
+                "grim.rocml.target_gcn".into(),
+                GgufValue::String(target_gcn.clone()),
+            );
         }
         if let Some(block_size) = self.block_size {
-            metadata.insert("grim.rocml.block_size".into(), GgufValue::Uint32(block_size));
+            metadata.insert(
+                "grim.rocml.block_size".into(),
+                GgufValue::Uint32(block_size),
+            );
         }
         if let Some(lds_size) = self.lds_size {
             metadata.insert("grim.rocml.lds_size".into(), GgufValue::Uint32(lds_size));
@@ -686,7 +739,10 @@ impl GrimMetadata {
             GgufValue::Bool(self.tensor_core_enabled),
         );
         if let Some(quant_method) = &self.quant_method {
-            metadata.insert("grim.quant_method".into(), GgufValue::String(quant_method.clone()));
+            metadata.insert(
+                "grim.quant_method".into(),
+                GgufValue::String(quant_method.clone()),
+            );
         }
         if let Some(calibration_dataset) = &self.calibration_dataset {
             metadata.insert(
@@ -706,12 +762,14 @@ impl GrimMetadata {
                                 GgufValue::Uint32(ov.effective_bpw),
                                 GgufValue::Uint32(ov.override_dtype as u32),
                                 GgufValue::Float32(ov.importance_score),
-                                GgufValue::String(match ov.layout_hint {
-                                    Some(GrimLayoutHint::WavefrontTiled) => "wavefront-tiled",
-                                    Some(GrimLayoutHint::BlockSparse) => "block-sparse",
-                                    None => "none",
-                                }
-                                .to_string()),
+                                GgufValue::String(
+                                    match ov.layout_hint {
+                                        Some(GrimLayoutHint::WavefrontTiled) => "wavefront-tiled",
+                                        Some(GrimLayoutHint::BlockSparse) => "block-sparse",
+                                        None => "none",
+                                    }
+                                    .to_string(),
+                                ),
                             ])
                         })
                         .collect(),
@@ -747,7 +805,10 @@ impl GrimMetadata {
             );
         }
         if let Some(xnack_enabled) = self.xnack_enabled {
-            metadata.insert("grim.rocm.xnack_enabled".into(), GgufValue::Bool(xnack_enabled));
+            metadata.insert(
+                "grim.rocm.xnack_enabled".into(),
+                GgufValue::Bool(xnack_enabled),
+            );
         }
         if let Some(kv_layout_optimized) = self.kv_layout_optimized {
             metadata.insert(
@@ -776,19 +837,25 @@ impl GrimMetadata {
             obj.insert("magic".into(), serde_json::Value::String(magic.clone()));
         }
         if let Some(version) = self.quant_version {
-            obj.insert("quant_version".into(), serde_json::Value::Number(version.into()));
+            obj.insert(
+                "quant_version".into(),
+                serde_json::Value::Number(version.into()),
+            );
         }
         obj.insert(
             "rocml_profile".into(),
-            serde_json::Value::String(match self.rocml_profile {
-                GrimRocmlProfile::Cdna2 => "cdna2",
-                GrimRocmlProfile::Cdna3 => "cdna3",
-                GrimRocmlProfile::Rdna2 => "rdna2",
-                GrimRocmlProfile::Rdna3 => "rdna3",
-                GrimRocmlProfile::Rdna4 => "rdna4",
-                GrimRocmlProfile::All => "all",
-                GrimRocmlProfile::Unknown => "unknown",
-            }.into()),
+            serde_json::Value::String(
+                match self.rocml_profile {
+                    GrimRocmlProfile::Cdna2 => "cdna2",
+                    GrimRocmlProfile::Cdna3 => "cdna3",
+                    GrimRocmlProfile::Rdna2 => "rdna2",
+                    GrimRocmlProfile::Rdna3 => "rdna3",
+                    GrimRocmlProfile::Rdna4 => "rdna4",
+                    GrimRocmlProfile::All => "all",
+                    GrimRocmlProfile::Unknown => "unknown",
+                }
+                .into(),
+            ),
         );
         if self.wavefront_size > 0 {
             obj.insert(
@@ -800,7 +867,10 @@ impl GrimMetadata {
             obj.insert("target_gcn".into(), serde_json::Value::String(gcn.clone()));
         }
         if let Some(block_size) = self.block_size {
-            obj.insert("block_size".into(), serde_json::Value::Number(block_size.into()));
+            obj.insert(
+                "block_size".into(),
+                serde_json::Value::Number(block_size.into()),
+            );
         }
         if let Some(lds) = self.lds_size {
             obj.insert("lds_size".into(), serde_json::Value::Number(lds.into()));
@@ -810,10 +880,16 @@ impl GrimMetadata {
             serde_json::Value::Bool(self.tensor_core_enabled),
         );
         if let Some(method) = &self.quant_method {
-            obj.insert("quant_method".into(), serde_json::Value::String(method.clone()));
+            obj.insert(
+                "quant_method".into(),
+                serde_json::Value::String(method.clone()),
+            );
         }
         if let Some(dataset) = &self.calibration_dataset {
-            obj.insert("calibration_dataset".into(), serde_json::Value::String(dataset.clone()));
+            obj.insert(
+                "calibration_dataset".into(),
+                serde_json::Value::String(dataset.clone()),
+            );
         }
         if !self.quant_overrides.is_empty() {
             obj.insert(
@@ -824,13 +900,19 @@ impl GrimMetadata {
             );
         }
         if let Some(mode) = self.train_quant_mode {
-            obj.insert("train_quant_mode".into(), serde_json::Value::String(mode.as_str().into()));
+            obj.insert(
+                "train_quant_mode".into(),
+                serde_json::Value::String(mode.as_str().into()),
+            );
         }
         if !self.train_fusion_ops.is_empty() {
             obj.insert(
                 "train_fusion_ops".into(),
                 serde_json::Value::Array(
-                    self.train_fusion_ops.iter().map(|o| serde_json::Value::String(o.as_str().into())).collect(),
+                    self.train_fusion_ops
+                        .iter()
+                        .map(|o| serde_json::Value::String(o.as_str().into()))
+                        .collect(),
                 ),
             );
         }
@@ -838,7 +920,10 @@ impl GrimMetadata {
             obj.insert(
                 "rocm_fusion_ops".into(),
                 serde_json::Value::Array(
-                    self.rocm_fusion_ops.iter().map(|o| serde_json::Value::String(o.as_str().into())).collect(),
+                    self.rocm_fusion_ops
+                        .iter()
+                        .map(|o| serde_json::Value::String(o.as_str().into()))
+                        .collect(),
                 ),
             );
         }
@@ -846,7 +931,10 @@ impl GrimMetadata {
             obj.insert("xnack_enabled".into(), serde_json::Value::Bool(xnack));
         }
         if let Some(kv_opt) = self.kv_layout_optimized {
-            obj.insert("kv_layout_optimized".into(), serde_json::Value::Bool(kv_opt));
+            obj.insert(
+                "kv_layout_optimized".into(),
+                serde_json::Value::Bool(kv_opt),
+            );
         }
         if let Some(has_kv) = self.has_kv_registry {
             obj.insert("has_kv_registry".into(), serde_json::Value::Bool(has_kv));
@@ -884,7 +972,10 @@ impl GrimMetadata {
         let obj = value.as_object().unwrap_or(&empty);
 
         let magic = obj.get("magic").and_then(|v| v.as_str()).map(String::from);
-        let quant_version = obj.get("quant_version").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let quant_version = obj
+            .get("quant_version")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
         let profile = obj
             .get("rocml_profile")
             .and_then(|v| v.as_str())
@@ -895,12 +986,30 @@ impl GrimMetadata {
             .and_then(|v| v.as_u64())
             .map(|v| v as u32)
             .unwrap_or_else(|| profile.wavefront_size());
-        let target_gcn = obj.get("target_gcn").and_then(|v| v.as_str()).map(String::from);
-        let block_size = obj.get("block_size").and_then(|v| v.as_u64()).map(|v| v as u32);
-        let lds_size = obj.get("lds_size").and_then(|v| v.as_u64()).map(|v| v as u32);
-        let tensor_core_enabled = obj.get("tensor_core_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
-        let quant_method = obj.get("quant_method").and_then(|v| v.as_str()).map(String::from);
-        let calibration_dataset = obj.get("calibration_dataset").and_then(|v| v.as_str()).map(String::from);
+        let target_gcn = obj
+            .get("target_gcn")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let block_size = obj
+            .get("block_size")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let lds_size = obj
+            .get("lds_size")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let tensor_core_enabled = obj
+            .get("tensor_core_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let quant_method = obj
+            .get("quant_method")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let calibration_dataset = obj
+            .get("calibration_dataset")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let quant_overrides = obj
             .get("quant_overrides")
             .and_then(|v| v.as_array())
@@ -936,7 +1045,11 @@ impl GrimMetadata {
         let ext_entries = obj
             .get("grim.ext.entries")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(crate::spec::GrimTensorExt::from_json).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(crate::spec::GrimTensorExt::from_json)
+                    .collect()
+            })
             .unwrap_or_default();
 
         let gguf_metadata = obj
@@ -995,12 +1108,18 @@ fn override_from_json(value: &serde_json::Value) -> Option<GrimQuantOverride> {
     let effective_bpw = value.get("effective_bpw")?.as_u64()? as u32;
     let override_dtype_tag = value.get("override_dtype")?.as_u64()? as u32;
     let override_dtype = GgufDType::from_tag(override_dtype_tag)?;
-    let importance_score = value.get("importance_score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-    let layout_hint = value.get("layout_hint").and_then(|v| v.as_str()).and_then(|s| match s {
-        "wavefront-tiled" => Some(GrimLayoutHint::WavefrontTiled),
-        "block-sparse" => Some(GrimLayoutHint::BlockSparse),
-        _ => None,
-    });
+    let importance_score = value
+        .get("importance_score")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as f32;
+    let layout_hint = value
+        .get("layout_hint")
+        .and_then(|v| v.as_str())
+        .and_then(|s| match s {
+            "wavefront-tiled" => Some(GrimLayoutHint::WavefrontTiled),
+            "block-sparse" => Some(GrimLayoutHint::BlockSparse),
+            _ => None,
+        });
 
     Some(GrimQuantOverride {
         tensor_name,
@@ -1027,12 +1146,10 @@ fn read_grim_quant_overrides(value: &GgufValue) -> Option<Vec<GrimQuantOverride>
         let override_dtype = GgufDType::from_tag(override_dtype_tag)?;
         let importance_score = inner[3].as_f32().unwrap_or(0.0);
 
-        let layout_hint = inner.get(4).and_then(|v| v.as_str()).and_then(|s| {
-            match s {
-                "wavefront-tiled" => Some(GrimLayoutHint::WavefrontTiled),
-                "block-sparse" => Some(GrimLayoutHint::BlockSparse),
-                _ => None,
-            }
+        let layout_hint = inner.get(4).and_then(|v| v.as_str()).and_then(|s| match s {
+            "wavefront-tiled" => Some(GrimLayoutHint::WavefrontTiled),
+            "block-sparse" => Some(GrimLayoutHint::BlockSparse),
+            _ => None,
         });
 
         overrides.push(GrimQuantOverride {
@@ -1207,9 +1324,8 @@ fn read_gguf_string<R: Read>(r: &mut R) -> Result<String> {
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf)?;
-    Ok(String::from_utf8(buf).map_err(|e| {
-        Error::Backend(format!("GGUF string not valid UTF-8: {e}"))
-    })?)
+    Ok(String::from_utf8(buf)
+        .map_err(|e| Error::Backend(format!("GGUF string not valid UTF-8: {e}")))?)
 }
 
 fn read_gguf_value<R: Read>(r: &mut R) -> Result<GgufValue> {
@@ -1323,26 +1439,26 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::Q3K),
         },
-GgufDType::Q4K => DType {
-             arith: grim_tensor::ArithType::F32,
-             storage: Storage::KQuant(KQuantScheme::Q4K),
-         },
-         GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 => DType {
-             arith: grim_tensor::ArithType::F32,
-             storage: Storage::KQuant(KQuantScheme::Q4K),
-         },
-         GgufDType::Q5K => DType {
-             arith: grim_tensor::ArithType::F32,
-             storage: Storage::KQuant(KQuantScheme::Q5K),
-         },
-         GgufDType::Q5_0 | GgufDType::Q5_1 => DType {
-             arith: grim_tensor::ArithType::F32,
-             storage: Storage::KQuant(KQuantScheme::Q5K),
-         },
-         GgufDType::Q6K => DType {
-             arith: grim_tensor::ArithType::F32,
-             storage: Storage::KQuant(KQuantScheme::Q6K),
-         },
+        GgufDType::Q4K => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q4K),
+        },
+        GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q4K),
+        },
+        GgufDType::Q5K => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q5K),
+        },
+        GgufDType::Q5_0 | GgufDType::Q5_1 => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q5K),
+        },
+        GgufDType::Q6K => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q6K),
+        },
         GgufDType::Q8K | GgufDType::Q8_0 | GgufDType::Q8_1 | GgufDType::Q8_1Hx => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::Q80),
@@ -1388,7 +1504,12 @@ pub fn map_gguf_dtype_to_grim(gguf_dtype: GgufDType) -> (DType, Option<u32>) {
         GgufDType::F32 | GgufDType::F64 | GgufDType::I32 | GgufDType::I64 => None,
         GgufDType::F16 | GgufDType::I16 => Some(16),
         GgufDType::I8 => Some(8),
-        GgufDType::Q4_0 | GgufDType::Q4_1 | GgufDType::Q4_2 | GgufDType::Q4K | GgufDType::IQ4_NL | GgufDType::IQ4_XS => Some(4),
+        GgufDType::Q4_0
+        | GgufDType::Q4_1
+        | GgufDType::Q4_2
+        | GgufDType::Q4K
+        | GgufDType::IQ4_NL
+        | GgufDType::IQ4_XS => Some(4),
         GgufDType::Q5_0 | GgufDType::Q5_1 | GgufDType::Q5K => Some(5),
         GgufDType::Q6K => Some(6),
         GgufDType::Q2K | GgufDType::IQ2_XXS | GgufDType::IQ2_XS | GgufDType::IQ2_S => Some(2),
@@ -1515,12 +1636,32 @@ mod tests {
         assert_eq!(original.tensor_core_enabled, restored.tensor_core_enabled);
         assert_eq!(original.quant_method, restored.quant_method);
         assert_eq!(original.calibration_dataset, restored.calibration_dataset);
-        assert_eq!(original.quant_overrides.len(), restored.quant_overrides.len());
-        assert_eq!(original.quant_overrides[0].tensor_name, restored.quant_overrides[0].tensor_name);
-        assert_eq!(original.quant_overrides[0].effective_bpw, restored.quant_overrides[0].effective_bpw);
-        assert_eq!(original.quant_overrides[0].override_dtype, restored.quant_overrides[0].override_dtype);
-        assert!((original.quant_overrides[0].importance_score - restored.quant_overrides[0].importance_score).abs() < 1e-6);
-        assert_eq!(original.quant_overrides[0].layout_hint, restored.quant_overrides[0].layout_hint);
+        assert_eq!(
+            original.quant_overrides.len(),
+            restored.quant_overrides.len()
+        );
+        assert_eq!(
+            original.quant_overrides[0].tensor_name,
+            restored.quant_overrides[0].tensor_name
+        );
+        assert_eq!(
+            original.quant_overrides[0].effective_bpw,
+            restored.quant_overrides[0].effective_bpw
+        );
+        assert_eq!(
+            original.quant_overrides[0].override_dtype,
+            restored.quant_overrides[0].override_dtype
+        );
+        assert!(
+            (original.quant_overrides[0].importance_score
+                - restored.quant_overrides[0].importance_score)
+                .abs()
+                < 1e-6
+        );
+        assert_eq!(
+            original.quant_overrides[0].layout_hint,
+            restored.quant_overrides[0].layout_hint
+        );
         assert_eq!(original.train_quant_mode, restored.train_quant_mode);
         assert_eq!(original.train_fusion_ops, restored.train_fusion_ops);
         assert_eq!(original.rocm_fusion_ops, restored.rocm_fusion_ops);
@@ -1557,7 +1698,10 @@ mod tests {
     #[test]
     fn rocml_profile_rdna2_parses_aliases_and_round_trips() {
         assert_eq!(GrimRocmlProfile::from_str("rdna2"), GrimRocmlProfile::Rdna2);
-        assert_eq!(GrimRocmlProfile::from_str("gfx1036"), GrimRocmlProfile::Rdna2);
+        assert_eq!(
+            GrimRocmlProfile::from_str("gfx1036"),
+            GrimRocmlProfile::Rdna2
+        );
         assert_eq!(GrimRocmlProfile::from_str("RDNA2"), GrimRocmlProfile::Rdna2);
         assert_eq!(GrimRocmlProfile::Rdna2.wavefront_size(), 64);
         assert_eq!(GrimRocmlProfile::Rdna2.lds_size(), 32768);
@@ -1584,36 +1728,34 @@ mod tests {
         };
 
         let original = GrimMetadata {
-            ext_entries: vec![
-                GrimTensorExt {
-                    tensor_name: "layer.0.weight".into(),
-                    row_count: 128,
-                    row_stride: 4096,
-                    block_size: 0,
-                    per_row_bpw_mode: PerRowBpwMode::PerRowTable,
-                    default_bpw: 4,
-                    own_bpw_table: 1,
-                    row_scale_dtype: RowScaleDtype::U8,
-                    scale_offset: 8192,
-                    scale_size: 128,
-                    gptq_ordered: 1,
-                    outlier_index_encoding: OutlierIndexEncoding::DeltaVarint,
-                    outlier_residual_bpw: 8,
-                    compression: PayloadCompression::Zstd,
-                    fusion_mask: 0b11,
-                    layout_hint: LayoutHintTag::WavefrontTiled,
-                    layout_descriptor: LayoutDescriptor([1, 2, 3, 4]),
-                    backup1: crate::spec::BackupLayer {
-                        codes_offset: 16384,
-                        codes_size: 4096,
-                        bpw: 8,
-                        scale_offset: 20480,
-                        scale_size: 64,
-                    },
-                    backup2: crate::spec::BackupLayer::default(),
-                    ..Default::default()
+            ext_entries: vec![GrimTensorExt {
+                tensor_name: "layer.0.weight".into(),
+                row_count: 128,
+                row_stride: 4096,
+                block_size: 0,
+                per_row_bpw_mode: PerRowBpwMode::PerRowTable,
+                default_bpw: 4,
+                own_bpw_table: 1,
+                row_scale_dtype: RowScaleDtype::U8,
+                scale_offset: 8192,
+                scale_size: 128,
+                gptq_ordered: 1,
+                outlier_index_encoding: OutlierIndexEncoding::DeltaVarint,
+                outlier_residual_bpw: 8,
+                compression: PayloadCompression::Zstd,
+                fusion_mask: 0b11,
+                layout_hint: LayoutHintTag::WavefrontTiled,
+                layout_descriptor: LayoutDescriptor([1, 2, 3, 4]),
+                backup1: crate::spec::BackupLayer {
+                    codes_offset: 16384,
+                    codes_size: 4096,
+                    bpw: 8,
+                    scale_offset: 20480,
+                    scale_size: 64,
                 },
-            ],
+                backup2: crate::spec::BackupLayer::default(),
+                ..Default::default()
+            }],
             ..Default::default()
         };
 
@@ -1631,7 +1773,10 @@ mod tests {
         assert_eq!(ext.scale_offset, 8192);
         assert_eq!(ext.scale_size, 128);
         assert_eq!(ext.gptq_ordered, 1);
-        assert_eq!(ext.outlier_index_encoding, OutlierIndexEncoding::DeltaVarint);
+        assert_eq!(
+            ext.outlier_index_encoding,
+            OutlierIndexEncoding::DeltaVarint
+        );
         assert_eq!(ext.outlier_residual_bpw, 8);
         assert_eq!(ext.compression, PayloadCompression::Zstd);
         assert_eq!(ext.fusion_mask, 0b11);
@@ -1698,7 +1843,10 @@ mod tests {
         assert_eq!(gguf.tensors[0].name, t_name);
         assert_eq!(gguf.tensors[0].dims, vec![4, 4]);
 
-        let arch = gguf.metadata.get("general.architecture").and_then(|v| v.as_str());
+        let arch = gguf
+            .metadata
+            .get("general.architecture")
+            .and_then(|v| v.as_str());
         assert_eq!(arch, Some("llama"));
     }
 }

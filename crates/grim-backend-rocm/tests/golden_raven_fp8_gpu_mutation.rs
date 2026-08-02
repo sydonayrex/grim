@@ -1,12 +1,12 @@
 //! Golden mutation-resistant test for Raven FP8 GPU dequantization GEMM forward and backward paths.
 
-use std::panic;
 use grim_backend_rocm::RocmDevice;
 use grim_quant::dequant_fp8;
 use grim_tensor::{
-    dtype::{ArithType, BlockDtype, DType, Storage},
     BackendDevice, Shape,
+    dtype::{ArithType, BlockDtype, DType, Storage},
 };
+use std::panic;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -16,7 +16,9 @@ fn gpu_device() -> Option<RocmDevice> {
     if std::env::var(GPU_TEST_ENV).is_err() {
         return None;
     }
-    match panic::catch_unwind(|| RocmDevice::new(0)) {
+    match panic::catch_unwind(|| {
+        RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm")
+    }) {
         Ok(d) => Some(d),
         Err(_) => None,
     }
@@ -56,7 +58,8 @@ fn test_raven_fp8_gpu_gemm_golden_mutation_resistant() -> TestResult {
         };
         let b_dev = BackendDevice::from_cpu_bytes(&dev, &fp8_bytes, &b_shape, fp8_dtype)?;
 
-        let (out, handle) = dev.quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &[], &out_shape)?;
+        let (out, handle) =
+            dev.quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &[], &out_shape)?;
         handle.synchronize()?;
         let actual_c = out.to_cpu_vec_f32()?;
 
@@ -68,7 +71,10 @@ fn test_raven_fp8_gpu_gemm_golden_mutation_resistant() -> TestResult {
                 max_err = err;
             }
         }
-        assert!(max_err < 1e-3, "Raven FP8 GPU matmul max error {max_err} exceeds 1e-3 threshold");
+        assert!(
+            max_err < 1e-3,
+            "Raven FP8 GPU matmul max error {max_err} exceeds 1e-3 threshold"
+        );
     }
 
     Ok(())

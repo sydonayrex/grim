@@ -118,7 +118,9 @@ async fn test_start_training_accepts_weight_format() {
 async fn cannot_exceed_max_concurrent_jobs() {
     use grim_garage::jobs::JobRegistry;
     let registry = std::sync::Arc::new(JobRegistry::with_max_concurrent(1));
-    let engine = std::sync::Arc::new(std::sync::Mutex::new(grim_engine::Engine::new(grim_engine::EngineConfig::default())));
+    let engine = std::sync::Arc::new(std::sync::Mutex::new(grim_engine::Engine::new(
+        grim_engine::EngineConfig::default(),
+    )));
     let state = grim_garage::routes::AppState {
         registry,
         engine,
@@ -140,7 +142,9 @@ async fn cannot_exceed_max_concurrent_jobs() {
                 .method("POST")
                 .uri("/api/train/start")
                 .header("content-type", "application/json")
-                .body(axum::body::Body::from(serde_json::to_vec(&payload).unwrap()))
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&payload).unwrap(),
+                ))
                 .unwrap(),
         )
         .await
@@ -160,7 +164,9 @@ async fn cannot_exceed_max_concurrent_jobs() {
                 .method("POST")
                 .uri("/api/train/start")
                 .header("content-type", "application/json")
-                .body(axum::body::Body::from(serde_json::to_vec(&payload2).unwrap()))
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&payload2).unwrap(),
+                ))
                 .unwrap(),
         )
         .await

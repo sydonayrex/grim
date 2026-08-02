@@ -1,48 +1,22 @@
-//! Implementation of `RocmCachingAllocator` — a size-bucketed free-list
-//! allocator that avoids `hipMalloc`/`hipFree` round-trips on the decode
-//! hot path.
-//!
-//! Items 1 and 7 of the ROCm spec: power-of-two bucketization with a byte-cap,
-//! per-device state, full-drop semantics on `RocmStorage::drop`. The struct
-//! keeps `Send + Sync` by storing device pointers as `u64` (numeric identity
-//! is sufficient for the free-list — we don't dereference the pointer on the
-//! CPU side, only pass it back to `hipFree` later).
-//!
-//! Skill attribution:
-//! - `rust-ai-ml-inference-guide` Action 3 — Memory pool (the alloc hot path)
-//! - `rocm-profiling-perf` — measurable per-call `hipMalloc` cost is what
-//!   motivated the pool
-//! - `rust-gpu-discipline` §3 — never silently fall back to a CPU path; on
-//!   allocation failure we return `Err` so the caller can decide.
+//! Implementation of `RocmCachingAllocator` — a size-bucketed free-list [see: `hipMalloc`, `hipFree`, `RocmStorage::drop`, `Send + Sync`]
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use grim_tensor::error::Result;
 
 use crate::{check_hip, hipFree, hipMalloc};
 
-/// Size-bucketed caching allocator for device memory.
-///
-/// `hipMalloc`/`hipFree` are effectively device-synchronizing driver calls, so
-/// calling them per-op in a decode loop is the dominant fixed per-token cost.
-/// This allocator keeps a free-list of device buffers keyed by power-of-two size
-/// class per device and reuses them across allocations, only falling back to the
-/// real `hipMalloc`/`hipFree` when the pool is empty or over its soft cap.
-///
-/// Buffers are returned to the pool by `Drop for RocmStorage` (which holds an
-/// `Arc` to this allocator), so callers do not need to manage reuse explicitly.
+/// Size-bucketed caching allocator for device memory. [see: `hipMalloc`, `hipFree`, `Drop for RocmStorage`, `Arc`]
 #[derive(Debug)]
 pub struct RocmCachingAllocator {
-    /// Free-list: size class -> available device pointers (stored as `u64` so the
-    /// pool stays `Send + Sync`; device pointers are just integers).
+    /// Free-list: size class -> available device pointers (stored as `u64` so the [see: `Send + Sync`]
     pool: Mutex<HashMap<usize, Vec<u64>>>,
     /// Total bytes currently held in `pool` (not returned to the driver).
     cached_bytes: Mutex<usize>,
-    /// Soft cap on `cached_bytes`. Once exceeded, freed buffers are actually
-    /// `hipFree`'d instead of retained, bounding steady-state memory use.
+    /// Soft cap on `cached_bytes`. Once exceeded, freed buffers are actually [see: `hipFree`]
     cap_bytes: usize,
     /// Device ordinal this allocator serves.
     #[allow(dead_code)]
@@ -65,8 +39,7 @@ impl RocmCachingAllocator {
         }
     }
 
-    /// Round a byte size up to the next power of two. Class 0 is treated as 1 to
-    /// avoid a zero-sized `hipMalloc`.
+    /// Round a byte size up to the next power of two. Class 0 is treated as 1 to [see: `hipMalloc`]
     fn size_class(bytes: usize) -> usize {
         if bytes <= 1 {
             1
@@ -76,7 +49,6 @@ impl RocmCachingAllocator {
     }
 
     /// Allocate a device buffer of at least `bytes` usable bytes, reusing a pooled
-    /// buffer when one is available.
     pub fn alloc(&self, bytes: usize) -> Result<*mut c_void> {
         let cls = Self::size_class(bytes);
         let reused = {

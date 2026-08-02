@@ -1,13 +1,4 @@
-//! Q8_0 dequantization HIP kernel for ROCm.
-//!
-//! Each Q8_0 block is 34 bytes on disk: 2-byte FP16 delta (scale) followed
-//! by 32 signed int8 codes. After dequantization each block produces 32 F32
-//! values = `delta * code`.
-//!
-//! Layout matches llama.cpp's `block_q8_0` exactly (see ggml-common.h):
-//! ```c
-//! typedef struct { ggml_half d; int8_t qs[QK8_0]; } block_q8_0;
-//! ```
+//! Q8_0 dequantization HIP kernel for ROCm. [see: `delta * code`, `block_q8_0`]
 
 /// HIP source for `grim_dequant_q8_0` — flat Q8_0 → F32 dequant.
 pub const KERNEL_SOURCE: &str = r#"

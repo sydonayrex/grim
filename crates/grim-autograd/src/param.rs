@@ -193,7 +193,7 @@ impl TrainableParams {
         &mut self,
         dev: &dyn grim_tensor::backend::BackendDevice,
         placement: &grim_tensor::backend::ScythePlacement,
-        rccl: Option<&grim_backend_rocm::rccl::RcclAllReduce>,
+        rccl: Option<&grim_backend_rocm::RcclAllReduce>,
     ) -> Result<()> {
         let num_gpus = placement.ranks.len().max(1);
 
@@ -212,12 +212,31 @@ impl TrainableParams {
                         // the gradient tensor directly.
                         let stream = 0u64; // default HIP stream
                         rccl_handle.sum_gradients_device(ptr, ptr, count, stream)?;
+                        // ncclAllReduce with NCCL_SUM produces a sum; scale by
+                        // 1/num_gpus to get the mean. Use the backend's
+                        // mul_scalar kernel so this stays on-device — no D2H
+                        // round-trip.
+                        let scale = 1.0 / num_gpus as f32;
+                        let (scaled_storage, handle) = dev.mul_scalar(
+                            param.grad.storage().as_ref(),
+                            scale,
+                            param.grad.shape(),
+                        )?;
+                        handle.synchronize()?;
+                        param.grad = Tensor::new(
+                            Arc::from(scaled_storage),
+                            param.grad.shape().clone(),
+                            param.grad.dtype(),
+                            param.grad.provenance().clone(),
+                            param.grad.device().clone(),
+                        );
                     } else {
                         // CPU fallback for this tensor: host round-trip.
                         let grad_vec = param.grad.to_vec_f32()?;
                         let mut scaled = grad_vec;
                         rccl_handle.scale_gradients(&mut scaled)?;
-                        let grad_tensor = grim_backend_cpu::cpu_tensor(scaled, param.grad.shape().clone());
+                        let grad_tensor =
+                            grim_backend_cpu::cpu_tensor(scaled, param.grad.shape().clone());
                         param.accumulate_grad(&grad_tensor)?;
                     }
                 }
@@ -433,7 +452,8 @@ mod tests {
         let pid = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
         let t_data = tensor(vec![1.0f32; 4], vec![2, 2]);
         let mut tp = TrainableParam::new(pid, t_data).unwrap();
-        tp.accumulate_grad(&tensor(vec![0.5f32; 4], vec![2, 2])).unwrap();
+        tp.accumulate_grad(&tensor(vec![0.5f32; 4], vec![2, 2]))
+            .unwrap();
         params.insert(tp);
 
         let dev = grim_backend_cpu::CpuDevice::new();
@@ -444,6 +464,9 @@ mod tests {
         };
 
         params.all_reduce_grads(&dev, &placement, None).unwrap();
-        assert_eq!(params.get(pid).unwrap().grad().to_vec_f32().unwrap(), vec![1.0f32; 4]);
+        assert_eq!(
+            params.get(pid).unwrap().grad().to_vec_f32().unwrap(),
+            vec![1.0f32; 4]
+        );
     }
 }

@@ -17,8 +17,8 @@
 //! `type_size`/`type_traits` tables.
 
 use grim_format::gguf::{
-    GgufDType, GGUF_MAGIC, GGUF_VERSION, map_gguf_dtype_to_grim,
-    map_gguf_dtype_to_storage, read_gguf,
+    GGUF_MAGIC, GGUF_VERSION, GgufDType, map_gguf_dtype_to_grim, map_gguf_dtype_to_storage,
+    read_gguf,
 };
 use grim_tensor::{ArithType, DType, Storage, dtype::KQuantScheme};
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -44,7 +44,14 @@ fn push_tensor(buf: &mut Vec<u8>, name: &str, dims: &[u64], dtype_tag: u32, offs
 }
 
 /// Build a minimal GGUF v3 stream with no metadata and `tensors` tensor infos.
-fn build_gguf(tensors: &[(/*name*/ &str, /*dims*/ &[u64], /*dtype*/ u32, /*offset*/ u64)]) -> Vec<u8> {
+fn build_gguf(
+    tensors: &[(
+        /*name*/ &str,
+        /*dims*/ &[u64],
+        /*dtype*/ u32,
+        /*offset*/ u64,
+    )],
+) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
     buf.extend_from_slice(&GGUF_VERSION.to_le_bytes());
@@ -86,7 +93,11 @@ fn gguf_size_bytes_q8_0_uses_34_byte_blocks() {
     let g = read_gguf(Cursor::new(buf)).expect("read gguf");
     assert_eq!(g.tensors[0].size_bytes, 34, "Q8_0 32 params = 1 block");
     assert_eq!(g.tensors[1].size_bytes, 68, "Q8_0 64 params = 2 blocks");
-    assert_eq!(g.tensors[2].size_bytes, (33 * 34) / 32, "Q8_0 33 params = formula");
+    assert_eq!(
+        g.tensors[2].size_bytes,
+        (33 * 34) / 32,
+        "Q8_0 33 params = formula"
+    );
 }
 
 #[test]
@@ -128,7 +139,10 @@ fn gguf_size_bytes_k_quant_superblock_constants_are_exact() {
     // (512*210)/32 = 3360, way off.
     let buf2 = build_gguf(&[("q6k.512", &[512], GgufDType::Q6K as u32, 0)]);
     let g2 = read_gguf(Cursor::new(buf2)).expect("read gguf 2");
-    assert_eq!(g2.tensors[0].size_bytes, 420, "Q6_K 512 params = 2 super-blocks");
+    assert_eq!(
+        g2.tensors[0].size_bytes, 420,
+        "Q6_K 512 params = 2 super-blocks"
+    );
 }
 
 #[test]
@@ -147,7 +161,10 @@ fn gguf_data_start_is_32_byte_aligned_after_tensor_infos() {
          pick a layout that is not",
     );
     let g = read_gguf(Cursor::new(buf)).expect("read gguf");
-    assert_eq!(g.data_start, expected_data_start, "data_start 32-byte round-up");
+    assert_eq!(
+        g.data_start, expected_data_start,
+        "data_start 32-byte round-up"
+    );
     assert_eq!(g.data_start % 32, 0, "data_start must be 32-aligned");
     assert!(g.data_start >= info_end, "data_start must not round DOWN");
 }
@@ -169,12 +186,18 @@ fn gguf_read_tensor_bytes_uses_data_start_plus_offset() {
     assert_eq!(info.size_bytes, 4, "F32 1 param = 4 bytes");
     let mut cur = Cursor::new(buf);
     let bytes = grim_format::gguf::read_tensor_bytes(&mut cur, &g, info).expect("read tensor");
-    assert_eq!(bytes, payload, "tensor payload round-trip via data_start+offset");
+    assert_eq!(
+        bytes, payload,
+        "tensor payload round-trip via data_start+offset"
+    );
     // Sanity: reading from the wrong offset (data_start-1) would give garbage.
     let _ = cur.seek(SeekFrom::Start((data_start - 1) as u64));
     let mut wrong = vec![0u8; 4];
     let _ = cur.read_exact(&mut wrong);
-    assert_ne!(wrong, payload, "offset sanity: one byte earlier is NOT the payload");
+    assert_ne!(
+        wrong, payload,
+        "offset sanity: one byte earlier is NOT the payload"
+    );
 }
 
 // ===========================================================================

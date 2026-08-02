@@ -10,6 +10,7 @@ description = "ROCm (hip/rocBLAS) backend for Grim — primary GPU target per ar
 grim-tensor = { workspace = true }
 grim-format = { workspace = true }
 thiserror = { workspace = true }
+log = "0.4"
 half = "2.0"
 seahash = "4.1"
 lazy_static = "1.4"
@@ -40,8 +41,6 @@ cc = "1.0"
 default = []
 rocm-profile = []
 rocm-aiter = []
-# hip-graph-capture feature temporarily disabled
-rocm-kernel-macros = []
 # grim-sonnet F8 — Composable Kernel (ck_tile) GEMM used to expose a
 # `ck` cargo feature that built src/device/ck_gemm.cpp + a C FFI surface
 # against the vendored CK headers. grim is Rust-centric now: the

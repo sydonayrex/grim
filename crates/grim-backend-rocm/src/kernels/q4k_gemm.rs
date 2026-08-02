@@ -1,7 +1,4 @@
-//! Q4_K Fused Dequantization GEMM HIP kernel (Crow Tier).
-//!
-//! Dequantizes llama.cpp `block_q4_K` super-blocks (256 weights, 6-bit scales, 4-bit codes)
-//! on-the-fly inside HIP GEMM loops for forward and backward passes.
+//! Q4_K Fused Dequantization GEMM HIP kernel (Crow Tier). [see: `block_q4_K`]
 
 /// HIP source for `grim_fused_dequant_gemm_q4k` and `grim_fused_dequant_backward_gemm_q4k`.
 pub const KERNEL_SOURCE: &str = r#"

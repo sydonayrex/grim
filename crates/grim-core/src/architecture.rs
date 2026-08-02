@@ -4,8 +4,8 @@
 //! `TensorNamingRegistry` for translating tensor names across GGUF, HuggingFace,
 //! and Grim internal representations.
 
-use std::collections::HashMap;
 use crate::model::ModalityHint;
+use std::collections::HashMap;
 
 /// Comprehensive enumeration of model architectures supported by llama.cpp and Grim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -441,7 +441,15 @@ impl ModelArchitecture {
     /// Return coarse modality hint for architecture.
     pub fn modality(&self) -> ModalityHint {
         match self {
-            Self::Bert | Self::ModernBert | Self::NomicBert | Self::NeoBert | Self::JinaBertV2 | Self::JinaBertV3 | Self::GemmaEmbedding | Self::PanguEmbed | Self::LlamaEmbed => ModalityHint::VisionEncoder,
+            Self::Bert
+            | Self::ModernBert
+            | Self::NomicBert
+            | Self::NeoBert
+            | Self::JinaBertV2
+            | Self::JinaBertV3
+            | Self::GemmaEmbedding
+            | Self::PanguEmbed
+            | Self::LlamaEmbed => ModalityHint::VisionEncoder,
             Self::T5 | Self::T5Encoder => ModalityHint::TextInTextOut,
             _ => ModalityHint::TextInTextOut,
         }
@@ -451,25 +459,64 @@ impl ModelArchitecture {
     pub fn is_moe(&self) -> bool {
         matches!(
             self,
-            Self::Qwen2Moe | Self::Qwen3Moe | Self::Qwen3VlMoe | Self::Qwen35Moe | Self::PhiMoe | Self::Cohere2Moe | Self::Dbrx | Self::Olmoe | Self::DeepSeek2 | Self::DeepSeek32 | Self::DeepSeek4 | Self::Glm4Moe | Self::NemotronHMoe | Self::ExaoneMoe | Self::GraniteMoe | Self::BailingMoe | Self::BailingMoe2 | Self::AfMoe | Self::Ernie45Moe | Self::HunyuanMoe | Self::OpenAiMoe | Self::Lfm2Moe | Self::LladaMoe | Self::GroveMoe
+            Self::Qwen2Moe
+                | Self::Qwen3Moe
+                | Self::Qwen3VlMoe
+                | Self::Qwen35Moe
+                | Self::PhiMoe
+                | Self::Cohere2Moe
+                | Self::Dbrx
+                | Self::Olmoe
+                | Self::DeepSeek2
+                | Self::DeepSeek32
+                | Self::DeepSeek4
+                | Self::Glm4Moe
+                | Self::NemotronHMoe
+                | Self::ExaoneMoe
+                | Self::GraniteMoe
+                | Self::BailingMoe
+                | Self::BailingMoe2
+                | Self::AfMoe
+                | Self::Ernie45Moe
+                | Self::HunyuanMoe
+                | Self::OpenAiMoe
+                | Self::Lfm2Moe
+                | Self::LladaMoe
+                | Self::GroveMoe
         )
     }
 
     /// Returns `true` if architecture is an SSM/Mamba variant.
     pub fn is_ssm(&self) -> bool {
-        matches!(self, Self::Mamba | Self::Mamba2 | Self::Jamba | Self::NemotronH | Self::GraniteHybrid)
+        matches!(
+            self,
+            Self::Mamba | Self::Mamba2 | Self::Jamba | Self::NemotronH | Self::GraniteHybrid
+        )
     }
 
     /// Returns `true` if architecture is an RWKV variant.
     pub fn is_rwkv(&self) -> bool {
-        matches!(self, Self::Rwkv6 | Self::Rwkv6Qwen2 | Self::Rwkv7 | Self::ARwkv7)
+        matches!(
+            self,
+            Self::Rwkv6 | Self::Rwkv6Qwen2 | Self::Rwkv7 | Self::ARwkv7
+        )
     }
 
     /// Returns `true` if architecture is an encoder-only model.
     pub fn is_encoder(&self) -> bool {
         matches!(
             self,
-            Self::Bert | Self::ModernBert | Self::NomicBert | Self::NomicBertMoe | Self::NeoBert | Self::JinaBertV2 | Self::JinaBertV3 | Self::Eurobert | Self::GemmaEmbedding | Self::PanguEmbed | Self::LlamaEmbed
+            Self::Bert
+                | Self::ModernBert
+                | Self::NomicBert
+                | Self::NomicBertMoe
+                | Self::NeoBert
+                | Self::JinaBertV2
+                | Self::JinaBertV3
+                | Self::Eurobert
+                | Self::GemmaEmbedding
+                | Self::PanguEmbed
+                | Self::LlamaEmbed
         )
     }
 }
@@ -514,7 +561,11 @@ pub struct TensorNamingRegistry;
 
 impl TensorNamingRegistry {
     /// Return the canonical GGUF tensor name for a given role and layer index.
-    pub fn gguf_name(_arch: ModelArchitecture, role: TensorRole, layer_idx: Option<usize>) -> String {
+    pub fn gguf_name(
+        _arch: ModelArchitecture,
+        role: TensorRole,
+        layer_idx: Option<usize>,
+    ) -> String {
         let prefix = match layer_idx {
             Some(i) => format!("blk.{i}."),
             None => String::new(),
@@ -563,58 +614,154 @@ impl TensorNamingRegistry {
         // HF ecosystem: with/without `model.` prefix, internal canonical
         // names from older loaders (`tok_embeddings`, `layers.N.attn.wq`
         // style), and the standard HF naming patterns.
-        map.insert("model.embed_tokens.weight".to_string(), "token_embd.weight".to_string());
-        map.insert("tok_embeddings.weight".to_string(), "token_embd.weight".to_string());
-        map.insert("token_embeddings.weight".to_string(), "token_embd.weight".to_string());
-        map.insert("model.norm.weight".to_string(), "output_norm.weight".to_string());
+        map.insert(
+            "model.embed_tokens.weight".to_string(),
+            "token_embd.weight".to_string(),
+        );
+        map.insert(
+            "tok_embeddings.weight".to_string(),
+            "token_embd.weight".to_string(),
+        );
+        map.insert(
+            "token_embeddings.weight".to_string(),
+            "token_embd.weight".to_string(),
+        );
+        map.insert(
+            "model.norm.weight".to_string(),
+            "output_norm.weight".to_string(),
+        );
         map.insert("norm.weight".to_string(), "output_norm.weight".to_string());
         map.insert("lm_head.weight".to_string(), "output.weight".to_string());
 
         match arch {
             ModelArchitecture::Lfm2 => {
-                map.insert("model.embedding_norm.weight".to_string(), "token_embd_norm.weight".to_string());
+                map.insert(
+                    "model.embedding_norm.weight".to_string(),
+                    "token_embd_norm.weight".to_string(),
+                );
                 for i in 0..num_layers {
                     let hf_p = format!("model.layers.{i}.");
                     let gg_p = format!("blk.{i}.");
-                    map.insert(format!("{hf_p}operator_norm.weight"), format!("{gg_p}attn_norm.weight"));
-                    map.insert(format!("{hf_p}self_attn.q_proj.weight"), format!("{gg_p}attn_q.weight"));
-                    map.insert(format!("{hf_p}self_attn.k_proj.weight"), format!("{gg_p}attn_k.weight"));
-                    map.insert(format!("{hf_p}self_attn.v_proj.weight"), format!("{gg_p}attn_v.weight"));
-                    map.insert(format!("{hf_p}self_attn.out_proj.weight"), format!("{gg_p}attn_output.weight"));
-                    map.insert(format!("{hf_p}self_attn.q_layernorm.weight"), format!("{gg_p}attn_q_norm.weight"));
-                    map.insert(format!("{hf_p}self_attn.k_layernorm.weight"), format!("{gg_p}attn_k_norm.weight"));
-                    map.insert(format!("{hf_p}conv.in_proj.weight"), format!("{gg_p}shortconv.in_proj.weight"));
-                    map.insert(format!("{hf_p}conv.conv.weight"), format!("{gg_p}shortconv.conv.weight"));
-                    map.insert(format!("{hf_p}conv.out_proj.weight"), format!("{gg_p}shortconv.out_proj.weight"));
-                    map.insert(format!("{hf_p}ffn_norm.weight"), format!("{gg_p}ffn_norm.weight"));
-                    map.insert(format!("{hf_p}feed_forward.w1.weight"), format!("{gg_p}ffn_gate.weight"));
-                    map.insert(format!("{hf_p}feed_forward.w3.weight"), format!("{gg_p}ffn_up.weight"));
-                    map.insert(format!("{hf_p}feed_forward.w2.weight"), format!("{gg_p}ffn_down.weight"));
+                    map.insert(
+                        format!("{hf_p}operator_norm.weight"),
+                        format!("{gg_p}attn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.q_proj.weight"),
+                        format!("{gg_p}attn_q.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.k_proj.weight"),
+                        format!("{gg_p}attn_k.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.v_proj.weight"),
+                        format!("{gg_p}attn_v.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.out_proj.weight"),
+                        format!("{gg_p}attn_output.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.q_layernorm.weight"),
+                        format!("{gg_p}attn_q_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.k_layernorm.weight"),
+                        format!("{gg_p}attn_k_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}conv.in_proj.weight"),
+                        format!("{gg_p}shortconv.in_proj.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}conv.conv.weight"),
+                        format!("{gg_p}shortconv.conv.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}conv.out_proj.weight"),
+                        format!("{gg_p}shortconv.out_proj.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}ffn_norm.weight"),
+                        format!("{gg_p}ffn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}feed_forward.w1.weight"),
+                        format!("{gg_p}ffn_gate.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}feed_forward.w3.weight"),
+                        format!("{gg_p}ffn_up.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}feed_forward.w2.weight"),
+                        format!("{gg_p}ffn_down.weight"),
+                    );
                 }
             }
             ModelArchitecture::Falcon => {
                 for i in 0..num_layers {
                     let hf_p = format!("transformer.h.{i}.");
                     let gg_p = format!("blk.{i}.");
-                    map.insert(format!("{hf_p}input_layernorm.weight"), format!("{gg_p}attn_norm.weight"));
-                    map.insert(format!("{hf_p}self_attention.query_key_value.weight"), format!("{gg_p}attn_qkv.weight"));
-                    map.insert(format!("{hf_p}self_attention.dense.weight"), format!("{gg_p}attn_output.weight"));
-                    map.insert(format!("{hf_p}mlp.dense_h_to_4h.weight"), format!("{gg_p}ffn_up.weight"));
-                    map.insert(format!("{hf_p}mlp.dense_4h_to_h.weight"), format!("{gg_p}ffn_down.weight"));
+                    map.insert(
+                        format!("{hf_p}input_layernorm.weight"),
+                        format!("{gg_p}attn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attention.query_key_value.weight"),
+                        format!("{gg_p}attn_qkv.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attention.dense.weight"),
+                        format!("{gg_p}attn_output.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.dense_h_to_4h.weight"),
+                        format!("{gg_p}ffn_up.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.dense_4h_to_h.weight"),
+                        format!("{gg_p}ffn_down.weight"),
+                    );
                 }
             }
             ModelArchitecture::Gpt2 => {
-                map.insert("transformer.wte.weight".to_string(), "token_embd.weight".to_string());
-                map.insert("transformer.ln_f.weight".to_string(), "output_norm.weight".to_string());
+                map.insert(
+                    "transformer.wte.weight".to_string(),
+                    "token_embd.weight".to_string(),
+                );
+                map.insert(
+                    "transformer.ln_f.weight".to_string(),
+                    "output_norm.weight".to_string(),
+                );
                 for i in 0..num_layers {
                     let hf_p = format!("transformer.h.{i}.");
                     let gg_p = format!("blk.{i}.");
-                    map.insert(format!("{hf_p}ln_1.weight"), format!("{gg_p}attn_norm.weight"));
-                    map.insert(format!("{hf_p}attn.c_attn.weight"), format!("{gg_p}attn_qkv.weight"));
-                    map.insert(format!("{hf_p}attn.c_proj.weight"), format!("{gg_p}attn_output.weight"));
-                    map.insert(format!("{hf_p}ln_2.weight"), format!("{gg_p}ffn_norm.weight"));
-                    map.insert(format!("{hf_p}mlp.c_fc.weight"), format!("{gg_p}ffn_up.weight"));
-                    map.insert(format!("{hf_p}mlp.c_proj.weight"), format!("{gg_p}ffn_down.weight"));
+                    map.insert(
+                        format!("{hf_p}ln_1.weight"),
+                        format!("{gg_p}attn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}attn.c_attn.weight"),
+                        format!("{gg_p}attn_qkv.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}attn.c_proj.weight"),
+                        format!("{gg_p}attn_output.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}ln_2.weight"),
+                        format!("{gg_p}ffn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.c_fc.weight"),
+                        format!("{gg_p}ffn_up.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.c_proj.weight"),
+                        format!("{gg_p}ffn_down.weight"),
+                    );
                 }
             }
             _ => {
@@ -627,25 +774,79 @@ impl TensorNamingRegistry {
                     let gg_p = format!("blk.{i}.");
                     let il_p = format!("layers.{i}.");
                     // HF standard naming
-                    map.insert(format!("{hf_p}input_layernorm.weight"), format!("{gg_p}attn_norm.weight"));
-                    map.insert(format!("{hf_p}self_attn.q_proj.weight"), format!("{gg_p}attn_q.weight"));
-                    map.insert(format!("{hf_p}self_attn.k_proj.weight"), format!("{gg_p}attn_k.weight"));
-                    map.insert(format!("{hf_p}self_attn.v_proj.weight"), format!("{gg_p}attn_v.weight"));
-                    map.insert(format!("{hf_p}self_attn.o_proj.weight"), format!("{gg_p}attn_output.weight"));
-                    map.insert(format!("{hf_p}post_attention_layernorm.weight"), format!("{gg_p}ffn_norm.weight"));
-                    map.insert(format!("{hf_p}mlp.gate_proj.weight"), format!("{gg_p}ffn_gate.weight"));
-                    map.insert(format!("{hf_p}mlp.up_proj.weight"), format!("{gg_p}ffn_up.weight"));
-                    map.insert(format!("{hf_p}mlp.down_proj.weight"), format!("{gg_p}ffn_down.weight"));
+                    map.insert(
+                        format!("{hf_p}input_layernorm.weight"),
+                        format!("{gg_p}attn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.q_proj.weight"),
+                        format!("{gg_p}attn_q.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.k_proj.weight"),
+                        format!("{gg_p}attn_k.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.v_proj.weight"),
+                        format!("{gg_p}attn_v.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.o_proj.weight"),
+                        format!("{gg_p}attn_output.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}post_attention_layernorm.weight"),
+                        format!("{gg_p}ffn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.gate_proj.weight"),
+                        format!("{gg_p}ffn_gate.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.up_proj.weight"),
+                        format!("{gg_p}ffn_up.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.down_proj.weight"),
+                        format!("{gg_p}ffn_down.weight"),
+                    );
                     // Internal loader canonical names (no `model.` prefix, dot-separated sub-modules)
-                    map.insert(format!("{il_p}attn_norm.weight"), format!("{gg_p}attn_norm.weight"));
-                    map.insert(format!("{il_p}attn.wq.weight"), format!("{gg_p}attn_q.weight"));
-                    map.insert(format!("{il_p}attn.wk.weight"), format!("{gg_p}attn_k.weight"));
-                    map.insert(format!("{il_p}attn.wv.weight"), format!("{gg_p}attn_v.weight"));
-                    map.insert(format!("{il_p}attn.wo.weight"), format!("{gg_p}attn_output.weight"));
-                    map.insert(format!("{il_p}ffn_norm.weight"), format!("{gg_p}ffn_norm.weight"));
-                    map.insert(format!("{il_p}ffn.w_gate.weight"), format!("{gg_p}ffn_gate.weight"));
-                    map.insert(format!("{il_p}ffn.w_up.weight"), format!("{gg_p}ffn_up.weight"));
-                    map.insert(format!("{il_p}ffn.w_down.weight"), format!("{gg_p}ffn_down.weight"));
+                    map.insert(
+                        format!("{il_p}attn_norm.weight"),
+                        format!("{gg_p}attn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}attn.wq.weight"),
+                        format!("{gg_p}attn_q.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}attn.wk.weight"),
+                        format!("{gg_p}attn_k.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}attn.wv.weight"),
+                        format!("{gg_p}attn_v.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}attn.wo.weight"),
+                        format!("{gg_p}attn_output.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn_norm.weight"),
+                        format!("{gg_p}ffn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn.w_gate.weight"),
+                        format!("{gg_p}ffn_gate.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn.w_up.weight"),
+                        format!("{gg_p}ffn_up.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn.w_down.weight"),
+                        format!("{gg_p}ffn_down.weight"),
+                    );
                 }
             }
         }
@@ -660,21 +861,43 @@ mod tests {
 
     #[test]
     fn test_model_architecture_parsing() {
-        assert_eq!(ModelArchitecture::from_str("llama"), ModelArchitecture::Llama);
-        assert_eq!(ModelArchitecture::from_str("qwen2"), ModelArchitecture::Qwen2);
+        assert_eq!(
+            ModelArchitecture::from_str("llama"),
+            ModelArchitecture::Llama
+        );
+        assert_eq!(
+            ModelArchitecture::from_str("qwen2"),
+            ModelArchitecture::Qwen2
+        );
         assert_eq!(ModelArchitecture::from_str("lfm2"), ModelArchitecture::Lfm2);
-        assert_eq!(ModelArchitecture::from_str("rwkv6"), ModelArchitecture::Rwkv6);
-        assert_eq!(ModelArchitecture::from_str("mamba2"), ModelArchitecture::Mamba2);
-        assert_eq!(ModelArchitecture::from_str("modern-bert"), ModelArchitecture::ModernBert);
-        assert_eq!(ModelArchitecture::from_str("unknown_arch"), ModelArchitecture::Unknown);
+        assert_eq!(
+            ModelArchitecture::from_str("rwkv6"),
+            ModelArchitecture::Rwkv6
+        );
+        assert_eq!(
+            ModelArchitecture::from_str("mamba2"),
+            ModelArchitecture::Mamba2
+        );
+        assert_eq!(
+            ModelArchitecture::from_str("modern-bert"),
+            ModelArchitecture::ModernBert
+        );
+        assert_eq!(
+            ModelArchitecture::from_str("unknown_arch"),
+            ModelArchitecture::Unknown
+        );
     }
 
     #[test]
     fn test_tensor_naming_registry() {
-        let name = TensorNamingRegistry::gguf_name(ModelArchitecture::Llama, TensorRole::AttnQ, Some(0));
+        let name =
+            TensorNamingRegistry::gguf_name(ModelArchitecture::Llama, TensorRole::AttnQ, Some(0));
         assert_eq!(name, "blk.0.attn_q.weight");
 
         let remap = TensorNamingRegistry::remap_hf_to_gguf(ModelArchitecture::Lfm2, 1);
-        assert_eq!(remap.get("model.layers.0.self_attn.q_proj.weight").unwrap(), "blk.0.attn_q.weight");
+        assert_eq!(
+            remap.get("model.layers.0.self_attn.q_proj.weight").unwrap(),
+            "blk.0.attn_q.weight"
+        );
     }
 }

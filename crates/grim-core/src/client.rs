@@ -15,8 +15,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use futures_util::StreamExt;
 use crate::grim_models_dir;
+use futures_util::StreamExt;
 use grim_tensor::error::{Error, Result};
 use sha2::{Digest, Sha256};
 
@@ -83,7 +83,8 @@ pub async fn download_model(model_ref: &str, output: Option<String>) -> Result<(
             }
             println!("[grim] {}", p.status);
         }
-    }).await
+    })
+    .await
 }
 
 /// Download a model while invoking the specified progress callback for updates.
@@ -99,14 +100,32 @@ where
 {
     // Ensure the destination directory exists.
     let models_dir = grim_models_dir();
-    fs::create_dir_all(&models_dir)
-        .map_err(|e| Error::Backend(format!("cannot create models dir {}: {e}", models_dir.display())))?;
+    fs::create_dir_all(&models_dir).map_err(|e| {
+        Error::Backend(format!(
+            "cannot create models dir {}: {e}",
+            models_dir.display()
+        ))
+    })?;
 
     // Dispatch based on the reference format.
     if model_ref.starts_with("hf:") {
-        download_huggingface(model_ref.trim_start_matches("hf:"), &models_dir, output, progress_fn).await
+        download_huggingface(
+            model_ref.trim_start_matches("hf:"),
+            &models_dir,
+            output,
+            progress_fn,
+        )
+        .await
     } else if model_ref.contains("huggingface.co") || model_ref.contains("hf.co") {
-        download_url(model_ref, derive_filename_from_url(model_ref), &models_dir, output, "huggingface", progress_fn).await
+        download_url(
+            model_ref,
+            derive_filename_from_url(model_ref),
+            &models_dir,
+            output,
+            "huggingface",
+            progress_fn,
+        )
+        .await
     } else if model_ref.starts_with("https://") || model_ref.starts_with("http://") {
         let fname = derive_filename_from_url(model_ref);
         download_url(model_ref, fname, &models_dir, output, "url", progress_fn).await
@@ -132,7 +151,10 @@ where
     let (ns, name, tag) = parse_grim_registry_ref(model_ref);
 
     progress_fn(DownloadProgress {
-        status: format!("Pulling {} from Ollama registry (tag: {})...", model_ref, tag),
+        status: format!(
+            "Pulling {} from Ollama registry (tag: {})...",
+            model_ref, tag
+        ),
         digest: None,
         total: None,
         completed: None,
@@ -151,7 +173,10 @@ where
 
     let manifest_resp = client
         .get(&manifest_url)
-        .header("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+        .header(
+            "Accept",
+            "application/vnd.docker.distribution.manifest.v2+json",
+        )
         .send()
         .await
         .map_err(|e| Error::Backend(format!("manifest fetch failed: {e}")))?;
@@ -201,7 +226,15 @@ where
         .unwrap_or_else(|| models_dir.join(&dest_name));
 
     // 4. Stream download with progress + digest.
-    let sha256_hex = stream_download(&client, &blob_url, &dest_path, size, digest.to_string(), &progress_fn).await?;
+    let sha256_hex = stream_download(
+        &client,
+        &blob_url,
+        &dest_path,
+        size,
+        digest.to_string(),
+        &progress_fn,
+    )
+    .await?;
 
     // 5. Write catalog sidecar.
     let entry = ModelEntry {
@@ -284,7 +317,15 @@ where
         .map(PathBuf::from)
         .unwrap_or_else(|| models_dir.join(&dest_name));
 
-    let sha256_hex = stream_download(&client, &url, &dest_path, size, filename.clone(), &progress_fn).await?;
+    let sha256_hex = stream_download(
+        &client,
+        &url,
+        &dest_path,
+        size,
+        filename.clone(),
+        &progress_fn,
+    )
+    .await?;
 
     let entry = ModelEntry {
         name: format!("{org}/{repo}/{filename}"),
@@ -322,7 +363,8 @@ async fn resolve_hf_gguf_filename(org: &str, repo: &str) -> Result<String> {
 
     if !resp.status().is_success() {
         return Err(Error::Backend(format!(
-            "HF API returned {} for {org}/{repo}", resp.status()
+            "HF API returned {} for {org}/{repo}",
+            resp.status()
         )));
     }
 
@@ -338,7 +380,10 @@ async fn resolve_hf_gguf_filename(org: &str, repo: &str) -> Result<String> {
             .collect();
 
         for pref in &["Q4_K_M", "Q5_K_M", "Q4_K_S", "Q8_0", "F16"] {
-            if let Some(f) = filenames.iter().find(|n| n.contains(pref) && n.ends_with(".gguf")) {
+            if let Some(f) = filenames
+                .iter()
+                .find(|n| n.contains(pref) && n.ends_with(".gguf"))
+            {
                 return Ok(f.to_string());
             }
         }
@@ -359,19 +404,37 @@ fn is_public_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ipv4) => {
             let octets = ipv4.octets();
-            if octets[0] == 127 { return false; }
-            if octets[0] == 10 { return false; }
-            if octets[0] == 172 && (16..=31).contains(&octets[1]) { return false; }
-            if octets[0] == 192 && octets[1] == 168 { return false; }
-            if octets[0] == 169 && octets[1] == 254 { return false; }
-            if ipv4.is_unspecified() || ipv4.is_broadcast() { return false; }
+            if octets[0] == 127 {
+                return false;
+            }
+            if octets[0] == 10 {
+                return false;
+            }
+            if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+                return false;
+            }
+            if octets[0] == 192 && octets[1] == 168 {
+                return false;
+            }
+            if octets[0] == 169 && octets[1] == 254 {
+                return false;
+            }
+            if ipv4.is_unspecified() || ipv4.is_broadcast() {
+                return false;
+            }
             true
         }
         std::net::IpAddr::V6(ipv6) => {
-            if ipv6.is_loopback() || ipv6.is_unspecified() { return false; }
+            if ipv6.is_loopback() || ipv6.is_unspecified() {
+                return false;
+            }
             let segments = ipv6.segments();
-            if (segments[0] & 0xfe00) == 0xfc00 { return false; }
-            if (segments[0] & 0xffc0) == 0xfe80 { return false; }
+            if (segments[0] & 0xfe00) == 0xfc00 {
+                return false;
+            }
+            if (segments[0] & 0xffc0) == 0xfe80 {
+                return false;
+            }
             true
         }
     }
@@ -381,9 +444,9 @@ fn validate_public_url(url_str: &str) -> Result<()> {
     let parsed = reqwest::Url::parse(url_str)
         .map_err(|e| Error::Backend(format!("Invalid URL '{url_str}': {e}")))?;
 
-    let host = parsed.host_str().ok_or_else(|| {
-        Error::Backend(format!("URL '{url_str}' missing host"))
-    })?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| Error::Backend(format!("URL '{url_str}' missing host")))?;
 
     let port = parsed.port_or_known_default().unwrap_or(80);
     let addrs: Vec<_> = format!("{host}:{port}")
@@ -428,7 +491,8 @@ where
         .map(PathBuf::from)
         .unwrap_or_else(|| models_dir.join(&fname));
 
-    let sha256_hex = stream_download(&client, url, &dest_path, size, fname.clone(), &progress_fn).await?;
+    let sha256_hex =
+        stream_download(&client, url, &dest_path, size, fname.clone(), &progress_fn).await?;
 
     let entry = ModelEntry {
         name: fname,
@@ -472,12 +536,10 @@ where
 {
     validate_public_url(url)?;
 
-    let part = dest.with_extension(
-        format!(
-            "{}.part",
-            dest.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
-        )
-    );
+    let part = dest.with_extension(format!(
+        "{}.part",
+        dest.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
+    ));
 
     let resp = client
         .get(url)
@@ -529,8 +591,7 @@ where
         completed: None,
     });
 
-    fs::rename(&part, dest)
-        .map_err(|e| Error::Backend(format!("rename failed: {e}")))?;
+    fs::rename(&part, dest).map_err(|e| Error::Backend(format!("rename failed: {e}")))?;
 
     let sha256_hex = format!("{:x}", hasher.finalize());
     Ok(sha256_hex)
@@ -575,7 +636,11 @@ pub fn save_login_token(provider: &str, token: &str) -> Result<()> {
 
     fs::write(&cred_path, content)
         .map_err(|e| Error::Backend(format!("failed to write credentials: {e}")))?;
-    println!("[grim] Stored credentials for {} in {}", provider, cred_path.display());
+    println!(
+        "[grim] Stored credentials for {} in {}",
+        provider,
+        cred_path.display()
+    );
     Ok(())
 }
 
@@ -670,7 +735,9 @@ pub async fn unload_model_from_server(model_name: &str, addr: &str) -> Result<()
             }
         }
     }
-    Err(Error::Backend("Failed to connect to local server.".to_string()))
+    Err(Error::Backend(
+        "Failed to connect to local server.".to_string(),
+    ))
 }
 
 /// Query local server status.
@@ -689,9 +756,18 @@ pub async fn query_server_status(addr: &str) -> Result<()> {
 
     let val = val.ok_or_else(|| Error::Backend(format!("Could not connect to {addr}")))?;
     println!("\n=== Grim Service Status ===");
-    println!("Server Status : {}", val["status"].as_str().unwrap_or("unknown"));
-    println!("Hardware      : {}", val["processor"].as_str().unwrap_or("unknown"));
-    println!("Default Model : {}\n", val["default_model"].as_str().unwrap_or("none"));
+    println!(
+        "Server Status : {}",
+        val["status"].as_str().unwrap_or("unknown")
+    );
+    println!(
+        "Hardware      : {}",
+        val["processor"].as_str().unwrap_or("unknown")
+    );
+    println!(
+        "Default Model : {}\n",
+        val["default_model"].as_str().unwrap_or("none")
+    );
 
     println!("{:<25} {:<15} {:<15}", "LOADED MODEL", "SIZE", "PROCESSOR");
     println!("{}", "-".repeat(60));
@@ -701,7 +777,10 @@ pub async fn query_server_status(addr: &str) -> Result<()> {
         } else {
             for item in arr {
                 let name = item["name"].as_str().unwrap_or("");
-                let size = format!("{:.1} GB", item["memory_footprint_gb"].as_f64().unwrap_or(0.0));
+                let size = format!(
+                    "{:.1} GB",
+                    item["memory_footprint_gb"].as_f64().unwrap_or(0.0)
+                );
                 let proc = item["processor"].as_str().unwrap_or("unknown");
                 println!("{:<25} {:<15} {:<15}", name, size, proc);
             }
@@ -716,9 +795,15 @@ pub fn model_search_paths() -> Vec<(String, PathBuf)> {
     let mut paths = vec![("Grim".to_string(), grim_models_dir())];
     if let Some(home) = crate::home_dir() {
         paths.push(("Ollama".to_string(), home.join(".ollama").join("models")));
-        paths.push(("HuggingFace".to_string(), home.join(".cache").join("huggingface").join("hub")));
+        paths.push((
+            "HuggingFace".to_string(),
+            home.join(".cache").join("huggingface").join("hub"),
+        ));
         #[cfg(target_os = "linux")]
-        paths.push(("Ollama System".to_string(), PathBuf::from("/usr/share/ollama/.ollama/models")));
+        paths.push((
+            "Ollama System".to_string(),
+            PathBuf::from("/usr/share/ollama/.ollama/models"),
+        ));
     }
     paths
 }
@@ -726,7 +811,10 @@ pub fn model_search_paths() -> Vec<(String, PathBuf)> {
 /// Scan the local cache and print a summary table.
 pub fn check_model_cache() -> Result<()> {
     println!("\n=== Grim Model Cache ===");
-    println!("{:<40} {:<10} {:<12} {:<20}", "MODEL", "STATUS", "SIZE", "SOURCE");
+    println!(
+        "{:<40} {:<10} {:<12} {:<20}",
+        "MODEL", "STATUS", "SIZE", "SOURCE"
+    );
     println!("{}", "-".repeat(85));
 
     let mut found = false;
@@ -742,9 +830,20 @@ pub fn check_model_cache() -> Result<()> {
                     continue;
                 }
                 found = true;
-                let size_gb = entry.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1_073_741_824.0;
-                let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").replace('_', "/");
-                println!("{:<40} {:<10} {:<12} {:<20}", name, "OK", format!("{size_gb:.2} GB"), source_name);
+                let size_gb =
+                    entry.metadata().map(|m| m.len()).unwrap_or(0) as f64 / 1_073_741_824.0;
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .replace('_', "/");
+                println!(
+                    "{:<40} {:<10} {:<12} {:<20}",
+                    name,
+                    "OK",
+                    format!("{size_gb:.2} GB"),
+                    source_name
+                );
             }
         }
     }
@@ -798,7 +897,11 @@ fn parse_grim_registry_ref(model_ref: &str) -> (String, String, String) {
 
     if let Some(pos) = ns_name.find('/') {
         let (ns, name) = ns_name.split_at(pos);
-        (ns.to_string(), name.trim_start_matches('/').to_string(), tag)
+        (
+            ns.to_string(),
+            name.trim_start_matches('/').to_string(),
+            tag,
+        )
     } else {
         (GRIM_LIBRARY_NS.to_string(), ns_name.to_string(), tag)
     }
@@ -851,7 +954,20 @@ fn epoch_to_parts(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
         year += 1;
     }
 
-    let month_days = [31u64, if is_leap(year) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let month_days = [
+        31u64,
+        if is_leap(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut month = 1u64;
     for &md in &month_days {
         if remaining < md {

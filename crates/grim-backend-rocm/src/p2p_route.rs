@@ -63,11 +63,7 @@ impl Default for RouteLink {
 /// is `u64::MAX` (treat every PCIe transfer as PeerDirect); a tuned
 /// grim-server caller would override to a smaller value based on
 /// observed PCIe bandwidth on the deployment box.
-pub const fn to_route_link(
-    status: P2PStatus,
-    bytes: u64,
-    pcie_threshold_bytes: u64,
-) -> RouteLink {
+pub const fn to_route_link(status: P2PStatus, bytes: u64, pcie_threshold_bytes: u64) -> RouteLink {
     match status {
         // Native peer DMA (xGMI class): always PeerDirect.
         P2PStatus::P2P => RouteLink::PeerDirect,
@@ -114,10 +110,9 @@ impl HostStagingBuffer {
             ));
         }
         let mut ptr: *mut c_void = std::ptr::null_mut();
-        crate::device::helpers::check_hip(
-            "hipHostMalloc",
-            unsafe { hipHostMalloc(&mut ptr, size, 0) },
-        )?;
+        crate::device::helpers::check_hip("hipHostMalloc", unsafe {
+            hipHostMalloc(&mut ptr, size, 0)
+        })?;
         Ok(Self { ptr, size })
     }
 
@@ -157,7 +152,12 @@ impl HostStagingBuffer {
         // host allocation to be page-locked, not for the contents to
         // be `u8`-readable without copying. This is fine for the
         // host-bounce path (no GPU view).
-        unsafe { Some(std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.size)) }
+        unsafe {
+            Some(std::slice::from_raw_parts_mut(
+                self.ptr as *mut u8,
+                self.size,
+            ))
+        }
     }
 
     /// Host-side immutable view of the staging buffer.
@@ -183,7 +183,7 @@ impl Drop for HostStagingBuffer {
 
 // HIP symbols we call directly. The crate root's `hipHostMalloc` already
 // declares this; we shadow locally to keep the module self-contained.
-use crate::{hipHostFree, hipHostMalloc, hipMemcpyAsync, HipMemcpyKind};
+use crate::{HipMemcpyKind, hipHostFree, hipHostMalloc, hipMemcpyAsync};
 
 /// Performs inter-device copy routing either via direct peer copies or host bounce staging.
 pub fn copy_route(
@@ -201,30 +201,24 @@ pub fn copy_route(
         }
         RouteLink::HostBounce => {
             let staging = HostStagingBuffer::new(len)?;
-            crate::device::helpers::check_hip(
-                "copy_route: D2H copy to staging",
-                unsafe {
-                    hipMemcpyAsync(
-                        staging.as_device_ptr(),
-                        src_ptr,
-                        len,
-                        HipMemcpyKind::DeviceToHost,
-                        stream,
-                    )
-                },
-            )?;
-            crate::device::helpers::check_hip(
-                "copy_route: H2D copy from staging",
-                unsafe {
-                    hipMemcpyAsync(
-                        dst_ptr,
-                        staging.as_device_ptr(),
-                        len,
-                        HipMemcpyKind::HostToDevice,
-                        stream,
-                    )
-                },
-            )?;
+            crate::device::helpers::check_hip("copy_route: D2H copy to staging", unsafe {
+                hipMemcpyAsync(
+                    staging.as_device_ptr(),
+                    src_ptr,
+                    len,
+                    HipMemcpyKind::DeviceToHost,
+                    stream,
+                )
+            })?;
+            crate::device::helpers::check_hip("copy_route: H2D copy from staging", unsafe {
+                hipMemcpyAsync(
+                    dst_ptr,
+                    staging.as_device_ptr(),
+                    len,
+                    HipMemcpyKind::HostToDevice,
+                    stream,
+                )
+            })?;
         }
     }
     Ok(())

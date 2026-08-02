@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use grim_tensor::error::{Result, Error};
 use crate::gguf::GgufValue;
+use grim_tensor::error::{Error, Result};
+use std::collections::HashMap;
 
 #[derive(Clone)]
 pub struct GgufTokenizer {
@@ -42,7 +42,8 @@ impl Default for GgufTokenizer {
 impl GgufTokenizer {
     /// Return pad token ID if found, otherwise default to 0.
     pub fn pad_token_id(&self) -> u32 {
-        self.token_to_id.get("<|pad|>")
+        self.token_to_id
+            .get("<|pad|>")
             .or_else(|| self.token_to_id.get("<pad>"))
             .copied()
             .unwrap_or(0)
@@ -70,14 +71,17 @@ impl GgufTokenizer {
         let root: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| Error::Backend(format!("failed to parse tokenizer.json: {e}")))?;
 
-        let model = root.get("model")
+        let model = root
+            .get("model")
             .ok_or_else(|| Error::Backend("tokenizer.json missing 'model' key".into()))?;
-        let model_type = model.get("type")
+        let model_type = model
+            .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("bpe")
             .to_lowercase();
 
-        let vocab_obj = model.get("vocab")
+        let vocab_obj = model
+            .get("vocab")
             .and_then(|v| v.as_object())
             .ok_or_else(|| Error::Backend("tokenizer.json missing model.vocab".into()))?;
 
@@ -86,8 +90,10 @@ impl GgufTokenizer {
         let mut token_to_id = HashMap::with_capacity(vocab_size);
 
         for (token, id_val) in vocab_obj {
-            let id = id_val.as_u64()
-                .ok_or_else(|| Error::Backend("vocab ID is not an integer".into()))? as usize;
+            let id = id_val
+                .as_u64()
+                .ok_or_else(|| Error::Backend("vocab ID is not an integer".into()))?
+                as usize;
             if id < vocab_size {
                 id_to_token[id] = token.clone();
             }
@@ -118,29 +124,36 @@ impl GgufTokenizer {
         // Parse BPE merges from HF tokenizer.json (for BPE model type).
         // Merges are stored as an array of [tokenA, tokenB] pairs.
         let bpe_merges = if model_type == "bpe" {
-            model.get("merges")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    let mut map = HashMap::with_capacity(arr.len());
-                    for (rank, entry) in arr.iter().enumerate() {
-                        // Merges can be either ["tokenA", "tokenB"] arrays
-                        // or "tokenA tokenB" strings.
-                        let pair = if let Some(pair_arr) = entry.as_array() {
-                            if pair_arr.len() == 2 {
-                                format!("{} {}",
-                                    pair_arr[0].as_str().unwrap_or(""),
-                                    pair_arr[1].as_str().unwrap_or(""))
-                            } else { continue }
-                        } else if let Some(s) = entry.as_str() {
-                            s.to_string()
-                        } else { continue };
-                        map.insert(pair, rank as u32);
-                    }
-                    map
-                })
-        } else { None };
+            model.get("merges").and_then(|v| v.as_array()).map(|arr| {
+                let mut map = HashMap::with_capacity(arr.len());
+                for (rank, entry) in arr.iter().enumerate() {
+                    // Merges can be either ["tokenA", "tokenB"] arrays
+                    // or "tokenA tokenB" strings.
+                    let pair = if let Some(pair_arr) = entry.as_array() {
+                        if pair_arr.len() == 2 {
+                            format!(
+                                "{} {}",
+                                pair_arr[0].as_str().unwrap_or(""),
+                                pair_arr[1].as_str().unwrap_or("")
+                            )
+                        } else {
+                            continue;
+                        }
+                    } else if let Some(s) = entry.as_str() {
+                        s.to_string()
+                    } else {
+                        continue;
+                    };
+                    map.insert(pair, rank as u32);
+                }
+                map
+            })
+        } else {
+            None
+        };
 
-        let unk_token_id = token_to_id.get("<unk>")
+        let unk_token_id = token_to_id
+            .get("<unk>")
             .or_else(|| token_to_id.get("<|unk|>"))
             .or_else(|| token_to_id.get("<|unknown|>"))
             .copied();
@@ -151,7 +164,11 @@ impl GgufTokenizer {
             scores: None,
             model_type: model_type.clone(),
             bpe_merges,
-            byte_decoder: if model_type == "bpe" { Some(gpt2_byte_decoder()) } else { None },
+            byte_decoder: if model_type == "bpe" {
+                Some(gpt2_byte_decoder())
+            } else {
+                None
+            },
             eos_token_id: None, // HF tokenizer.json doesn't have explicit EOS token ID in a standard way
             unk_token_id,
             chat_template: None,
@@ -165,9 +182,9 @@ impl GgufTokenizer {
             .unwrap_or("llama")
             .to_string();
 
-        let tokens_val = metadata
-            .get("tokenizer.ggml.tokens")
-            .ok_or_else(|| Error::Backend("tokenizer.ggml.tokens not found in GGUF metadata".into()))?;
+        let tokens_val = metadata.get("tokenizer.ggml.tokens").ok_or_else(|| {
+            Error::Backend("tokenizer.ggml.tokens not found in GGUF metadata".into())
+        })?;
 
         let array_tokens = tokens_val
             .as_array()
@@ -179,7 +196,9 @@ impl GgufTokenizer {
         for (id, val) in array_tokens.iter().enumerate() {
             let t = val
                 .as_str()
-                .ok_or_else(|| Error::Backend("tokenizer.ggml.tokens contains non-string element".into()))?
+                .ok_or_else(|| {
+                    Error::Backend("tokenizer.ggml.tokens contains non-string element".into())
+                })?
                 .to_string();
             token_to_id.insert(t.clone(), id as u32);
             tokens.push(t);
@@ -230,9 +249,14 @@ impl GgufTokenizer {
 
         // Special tokens that should pass through directly
         let special_tokens = [
-            "<|startoftext|>", "<|endoftext|>", "<|pad|>",
-            "<|im_start|>", "<|im_end|>",
-            "<|system|>", "<|user|>", "<|assistant|>",
+            "<|startoftext|>",
+            "<|endoftext|>",
+            "<|pad|>",
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|system|>",
+            "<|user|>",
+            "<|assistant|>",
         ];
 
         // For byte-level BPE tokenizers (model_type == "bpe"), use the GPT-2
@@ -311,7 +335,11 @@ impl GgufTokenizer {
                 let t2_str = &self.tokens[t2 as usize];
                 let merged_str = format!("{}{}", t1_str, t2_str);
                 if let Some(&merged_id) = self.token_to_id.get(&merged_str) {
-                    let score = self.scores.as_ref().map(|s| s[merged_id as usize]).unwrap_or(-(merged_id as f32));
+                    let score = self
+                        .scores
+                        .as_ref()
+                        .map(|s| s[merged_id as usize])
+                        .unwrap_or(-(merged_id as f32));
                     if score > best_score {
                         best_score = score;
                         best_pair = Some((t1, t2));
@@ -324,7 +352,7 @@ impl GgufTokenizer {
                 let mut next_ids = Vec::with_capacity(ids.len());
                 let mut idx = 0;
                 while idx < ids.len() {
-                    if idx + 1 < ids.len() && ids[idx] == pair.0 && ids[idx+1] == pair.1 {
+                    if idx + 1 < ids.len() && ids[idx] == pair.0 && ids[idx + 1] == pair.1 {
                         next_ids.push(merged_id);
                         idx += 2;
                     } else {
@@ -406,7 +434,8 @@ impl GgufTokenizer {
         let mut ids: Vec<u32> = Vec::new();
 
         // Byte-encode the entire text: map each byte to its unicode char
-        let byte_str: String = text.bytes()
+        let byte_str: String = text
+            .bytes()
             .map(|b| encoder.get(&b).copied().unwrap_or(b as char))
             .collect();
 
@@ -416,7 +445,9 @@ impl GgufTokenizer {
         let words: Vec<&str> = split_on_gpt2_pretokenize(&byte_str);
 
         for word in words {
-            if word.is_empty() { continue; }
+            if word.is_empty() {
+                continue;
+            }
 
             // Check if the whole word is a single token
             if let Some(&id) = self.token_to_id.get(word) {
@@ -501,7 +532,8 @@ impl GgufTokenizer {
                 }
             }
             // Map byte-level unicode chars back to actual bytes
-            let bytes: Vec<u8> = text.chars()
+            let bytes: Vec<u8> = text
+                .chars()
                 .filter_map(|c| decoder.get(&c).copied())
                 .collect();
             return String::from_utf8_lossy(&bytes).into_owned();
@@ -563,26 +595,32 @@ pub fn render_chat_template(
 
 /// Convenience: render `messages` through a tokenizer's embedded template when
 /// present, otherwise return the last message's content (raw fallback).
-pub fn render_messages_or_last(
-    tokenizer: &GgufTokenizer,
-    messages: &[ChatMessage],
-) -> String {
+pub fn render_messages_or_last(tokenizer: &GgufTokenizer, messages: &[ChatMessage]) -> String {
     match &tokenizer.chat_template {
         Some(tpl) => render_chat_template(
             tpl,
             messages,
             true,
             "",
-            tokenizer.eos_token_id
+            tokenizer
+                .eos_token_id
                 .and_then(|id| tokenizer.tokens.get(id as usize))
                 .map(|s| s.as_str())
                 .unwrap_or(""),
         )
         .unwrap_or_else(|e| {
-            eprintln!("[grim-format] chat template render failed, falling back to last message: {e}");
-            messages.last().map(|m| m.content.clone()).unwrap_or_default()
+            eprintln!(
+                "[grim-format] chat template render failed, falling back to last message: {e}"
+            );
+            messages
+                .last()
+                .map(|m| m.content.clone())
+                .unwrap_or_default()
         }),
-        None => messages.last().map(|m| m.content.clone()).unwrap_or_default(),
+        None => messages
+            .last()
+            .map(|m| m.content.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -594,9 +632,15 @@ pub fn render_messages_or_last(
 /// Everything else maps to U+0100 + offset.
 fn gpt2_byte_encoder() -> HashMap<u8, char> {
     let mut bs: Vec<u8> = Vec::new();
-    for b in 33..=126 { bs.push(b); }
-    for b in 161..=172 { bs.push(b); }
-    for b in 174..=255 { bs.push(b); }
+    for b in 33..=126 {
+        bs.push(b);
+    }
+    for b in 161..=172 {
+        bs.push(b);
+    }
+    for b in 174..=255 {
+        bs.push(b);
+    }
     let mut map = HashMap::new();
     let mut c: u32 = 0;
     for b in 0..=255u8 {
@@ -612,7 +656,10 @@ fn gpt2_byte_encoder() -> HashMap<u8, char> {
 
 /// Reverse of `gpt2_byte_encoder`: maps unicode chars back to byte values.
 fn gpt2_byte_decoder() -> HashMap<char, u8> {
-    gpt2_byte_encoder().into_iter().map(|(k, v)| (v, k)).collect()
+    gpt2_byte_encoder()
+        .into_iter()
+        .map(|(k, v)| (v, k))
+        .collect()
 }
 
 /// GPT-2-style pre-tokenization. Splits the byte-level encoded string into
@@ -651,11 +698,21 @@ mod chat_template_tests {
     fn renders_chatml_template_with_messages() {
         let tpl = "{{ bos_token }}{% for m in messages %}{{'<|im_start|>' + m['role'] + '\n' + m['content'] + '<|im_end|>\n' }}{% endfor %}".to_string();
         let msgs = vec![
-            ChatMessage { role: "system".into(), content: "You are grim.".into() },
-            ChatMessage { role: "user".into(), content: "Hi.".into() },
+            ChatMessage {
+                role: "system".into(),
+                content: "You are grim.".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hi.".into(),
+            },
         ];
-        let rendered = render_chat_template(&tpl, &msgs, false, "", "").expect("render must succeed");
-        assert!(rendered.contains("<|im_start|>system"), "missing system role");
+        let rendered =
+            render_chat_template(&tpl, &msgs, false, "", "").expect("render must succeed");
+        assert!(
+            rendered.contains("<|im_start|>system"),
+            "missing system role"
+        );
         assert!(rendered.contains("You are grim."), "missing system content");
         assert!(rendered.contains("<|im_start|>user"), "missing user role");
         assert!(rendered.contains("Hi."), "missing user content");
@@ -665,8 +722,12 @@ mod chat_template_tests {
     #[test]
     fn renders_single_user_turn() {
         let tpl = "{{'<|im_start|>user\n' + messages[0]['content'] + '<|im_end|>'}}".to_string();
-        let msgs = vec![ChatMessage { role: "user".into(), content: "translate: hi".into() }];
-        let rendered = render_chat_template(&tpl, &msgs, false, "", "").expect("render must succeed");
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "translate: hi".into(),
+        }];
+        let rendered =
+            render_chat_template(&tpl, &msgs, false, "", "").expect("render must succeed");
         assert_eq!(rendered, "<|im_start|>user\ntranslate: hi<|im_end|>");
     }
 

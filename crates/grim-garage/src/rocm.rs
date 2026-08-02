@@ -7,6 +7,7 @@
 use grim_backend_rocm::{RocmDevice, WavefrontSize};
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+use tracing::warn;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RocmDeviceInfo {
@@ -193,6 +194,9 @@ pub fn query_nvidia_smi_gpus() -> Vec<(String, u64, u64)> {
                 }
             }
         }
+    }
+    if results.is_empty() {
+        warn!("nvidia-smi not found or returned no GPUs; CUDA device probe returned empty");
     }
     results
 }
@@ -568,6 +572,7 @@ pub fn query_rocminfo_gpus() -> Vec<RocmDeviceInfo> {
             return parse_rocminfo_text(&text);
         }
     }
+    warn!("rocminfo not found or failed; ROCm device probe returned empty");
     Vec::new()
 }
 

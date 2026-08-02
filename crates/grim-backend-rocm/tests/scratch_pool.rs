@@ -22,8 +22,8 @@
 
 use std::sync::Arc;
 
-use grim_backend_rocm::memory::pool::{DeviceScratchPool, PoolLayout};
 use grim_backend_rocm::RocmDevice;
+use grim_backend_rocm::memory::pool::{DeviceScratchPool, PoolLayout};
 use grim_tensor::{DType, Shape};
 
 /// Thread-safe boxed error type for tests that bubble errors across
@@ -75,9 +75,10 @@ fn pool_alloc_tracks_peak_and_current() -> TestResult {
     if !env {
         return Ok(()); // Pool math is purely CPU-side bookkeeping.
     }
-    let dev = std::panic::catch_unwind(|| RocmDevice::new(0));
+    let dev = std::panic::catch_unwind(|| RocmDevice::try_new(0));
     let dev = match dev {
-        Ok(d) => d,
+        Ok(Ok(d)) => d,
+        Ok(Err(_)) => return Ok(()),
         Err(_) => return Ok(()),
     };
 
@@ -91,7 +92,11 @@ fn pool_alloc_tracks_peak_and_current() -> TestResult {
     // After drop, the bucket returns the buffer to the pool, so current_bytes
     // is non-zero but peak_bytes is at least 1024.
     let after_drop = pool.current_bytes();
-    assert!(after_drop >= 1024, "current_bytes must reflect allocations, got {}", after_drop);
+    assert!(
+        after_drop >= 1024,
+        "current_bytes must reflect allocations, got {}",
+        after_drop
+    );
     Ok(())
 }
 
@@ -106,9 +111,10 @@ fn pool_drops_recycle_pointer_for_same_bucket() -> TestResult {
     if !env {
         return Ok(());
     }
-    let dev = std::panic::catch_unwind(|| RocmDevice::new(0));
+    let dev = std::panic::catch_unwind(|| RocmDevice::try_new(0));
     let dev = match dev {
-        Ok(d) => d,
+        Ok(Ok(d)) => d,
+        Ok(Err(_)) => return Ok(()),
         Err(_) => return Ok(()),
     };
 
@@ -136,9 +142,10 @@ fn pool_uses_distinct_buckets_per_size() -> TestResult {
     if !env {
         return Ok(());
     }
-    let dev = std::panic::catch_unwind(|| RocmDevice::new(0));
+    let dev = std::panic::catch_unwind(|| RocmDevice::try_new(0));
     let dev = match dev {
-        Ok(d) => d,
+        Ok(Ok(d)) => d,
+        Ok(Err(_)) => return Ok(()),
         Err(_) => return Ok(()),
     };
 
@@ -167,9 +174,10 @@ fn pool_handle_concurrent_allocs() -> TestResult {
     if !env {
         return Ok(());
     }
-    let dev = std::panic::catch_unwind(|| RocmDevice::new(0));
+    let dev = std::panic::catch_unwind(|| RocmDevice::try_new(0));
     let dev = match dev {
-        Ok(d) => d,
+        Ok(Ok(d)) => d,
+        Ok(Err(_)) => return Ok(()),
         Err(_) => return Ok(()),
     };
 
@@ -206,9 +214,10 @@ fn pool_peak_monotonic_under_concurrent_load() -> TestResult {
     if !env {
         return Ok(());
     }
-    let dev = std::panic::catch_unwind(|| RocmDevice::new(0));
+    let dev = std::panic::catch_unwind(|| RocmDevice::try_new(0));
     let dev = match dev {
-        Ok(d) => d,
+        Ok(Ok(d)) => d,
+        Ok(Err(_)) => return Ok(()),
         Err(_) => return Ok(()),
     };
 
@@ -222,7 +231,11 @@ fn pool_peak_monotonic_under_concurrent_load() -> TestResult {
                 let _ = dev.get_scratch(2048, 16)?;
                 let _ = dev.get_scratch(8192, 16)?;
                 let peak = dev.scratch_pool_peak_bytes();
-                assert!(peak >= 2048, "peak must keep up with allocations, got {}", peak);
+                assert!(
+                    peak >= 2048,
+                    "peak must keep up with allocations, got {}",
+                    peak
+                );
                 Ok(())
             })
         })
@@ -256,13 +269,17 @@ fn pool_buffer_as_ptr_is_nonnull() -> TestResult {
     if !env {
         return Ok(());
     }
-    let dev = std::panic::catch_unwind(|| RocmDevice::new(0));
+    let dev = std::panic::catch_unwind(|| RocmDevice::try_new(0));
     let dev = match dev {
-        Ok(d) => d,
+        Ok(Ok(d)) => d,
+        Ok(Err(_)) => return Ok(()),
         Err(_) => return Ok(()),
     };
     let buf = dev.get_scratch(4096, 16)?;
-    assert!(!buf.as_ptr().is_null(), "as_ptr must be non-null after get()");
+    assert!(
+        !buf.as_ptr().is_null(),
+        "as_ptr must be non-null after get()"
+    );
     Ok(())
 }
 
@@ -275,9 +292,10 @@ fn pool_buffer_can_be_uploaded_to() -> TestResult {
     if !env {
         return Ok(());
     }
-    let dev = std::panic::catch_unwind(|| RocmDevice::new(0));
+    let dev = std::panic::catch_unwind(|| RocmDevice::try_new(0));
     let dev = match dev {
-        Ok(d) => d,
+        Ok(Ok(d)) => d,
+        Ok(Err(_)) => return Ok(()),
         Err(_) => return Ok(()),
     };
 
@@ -298,7 +316,8 @@ fn pool_buffer_can_be_uploaded_to() -> TestResult {
     // the pool's `Drop` recycle path actually fires from `RocmDevice`.
     let buf2 = dev.get_scratch(1024, 16)?;
     assert_eq!(
-        buf2.as_ptr() as usize, slot_addr,
+        buf2.as_ptr() as usize,
+        slot_addr,
         "RocmDevice::get_scratch must route through the pool and recycle"
     );
     Ok(())
@@ -323,9 +342,10 @@ fn upload_to_scratch_recycles_slot() -> TestResult {
     if !env {
         return Ok(());
     }
-    let dev = std::panic::catch_unwind(|| RocmDevice::new(0));
+    let dev = std::panic::catch_unwind(|| RocmDevice::try_new(0));
     let dev = match dev {
-        Ok(d) => d,
+        Ok(Ok(d)) => d,
+        Ok(Err(_)) => return Ok(()),
         Err(_) => return Ok(()),
     };
 
@@ -333,12 +353,14 @@ fn upload_to_scratch_recycles_slot() -> TestResult {
     let shape = Shape::from_slice(&[64]);
 
     let slot_addr = {
-        let buf = grim_backend_rocm::RocmDevice::upload_to_scratch(&dev, &data, &shape, DType::F32)?;
+        let buf =
+            grim_backend_rocm::RocmDevice::upload_to_scratch(&dev, &data, &shape, DType::F32)?;
         buf.as_ptr() as usize
     };
     let buf2 = grim_backend_rocm::RocmDevice::upload_to_scratch(&dev, &data, &shape, DType::F32)?;
     assert_eq!(
-        buf2.as_ptr() as usize, slot_addr,
+        buf2.as_ptr() as usize,
+        slot_addr,
         "upload_to_scratch must route through DeviceScratchPool and recycle the slot"
     );
     Ok(())
@@ -353,9 +375,10 @@ fn upload_to_scratch_bytes_match_data() -> TestResult {
     if !env {
         return Ok(());
     }
-    let dev = std::panic::catch_unwind(|| RocmDevice::new(0));
+    let dev = std::panic::catch_unwind(|| RocmDevice::try_new(0));
     let dev = match dev {
-        Ok(d) => d,
+        Ok(Ok(d)) => d,
+        Ok(Err(_)) => return Ok(()),
         Err(_) => return Ok(()),
     };
 
@@ -365,4 +388,3 @@ fn upload_to_scratch_bytes_match_data() -> TestResult {
     assert_eq!(buf.layout().size, 128 * 4);
     Ok(())
 }
-

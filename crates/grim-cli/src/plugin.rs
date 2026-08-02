@@ -1,10 +1,10 @@
 //! Plugin management CLI commands.
 
+use grim_plugin::{PluginKind, PluginRegistry, WasmPluginLoader, parse_manifest, validate_abi};
 use grim_tensor::error::Result;
-use grim_plugin::{parse_manifest, validate_abi, PluginRegistry, PluginKind, WasmPluginLoader};
 use std::path::Path;
 
-/// Load plugins from a directory and populate the registry.
+/// Load plugins from a directory into the registry.
 pub fn load_plugins(plugin_dir: &str, registry: &mut PluginRegistry) -> Result<usize> {
     let plugins_path = Path::new(plugin_dir);
     if !plugins_path.exists() {
@@ -13,11 +13,11 @@ pub fn load_plugins(plugin_dir: &str, registry: &mut PluginRegistry) -> Result<u
 
     let mut count = 0;
 
-    // Scan for plugin.grim.toml files
+    // Scan for plugin.grim.toml manifests
     for entry in std::fs::read_dir(plugins_path)? {
         let entry = entry?;
         let plugin_subdir = entry.path();
-        
+
         if !plugin_subdir.is_dir() {
             continue;
         }
@@ -30,18 +30,20 @@ pub fn load_plugins(plugin_dir: &str, registry: &mut PluginRegistry) -> Result<u
         let manifest_text = std::fs::read_to_string(&manifest_path)
             .map_err(|e| grim_tensor::Error::Backend(format!("Failed to read manifest: {e}")))?;
         let manifest = parse_manifest(&manifest_text)?;
-        validate_abi(&manifest, 1).map_err(|e| grim_tensor::Error::Backend(format!("ABI validation failed: {e}")))?;
+        validate_abi(&manifest, 1)
+            .map_err(|e| grim_tensor::Error::Backend(format!("ABI validation failed: {e}")))?;
 
         // Load based on plugin kind
         match manifest.kind {
             PluginKind::Wasm => {
                 let wasm_path = plugin_subdir.join(&manifest.entry);
                 if wasm_path.exists() {
-                    let wasm_bytes = std::fs::read(&wasm_path)
-                        .map_err(|e| grim_tensor::Error::Backend(format!("Failed to read WASM: {e}")))?;
+                    let wasm_bytes = std::fs::read(&wasm_path).map_err(|e| {
+                        grim_tensor::Error::Backend(format!("Failed to read WASM: {e}"))
+                    })?;
                     let limits = manifest.limits.clone().unwrap_or_default();
                     let loader = WasmPluginLoader::new(&manifest.name, limits);
-                    
+
                     match loader.create_sampler(&wasm_bytes) {
                         Ok(sampler) => {
                             registry.register_sampler(manifest.name.clone(), sampler);
@@ -49,14 +51,16 @@ pub fn load_plugins(plugin_dir: &str, registry: &mut PluginRegistry) -> Result<u
                             count += 1;
                         }
                         Err(e) => {
-                            eprintln!("Warning: Failed to load WASM plugin '{}': {}", manifest.name, e);
+                            eprintln!(
+                                "Warning: Failed to load WASM plugin '{}': {}",
+                                manifest.name, e
+                            );
                         }
                     }
                 }
             }
             PluginKind::Dylib => {
-                // Dylib plugins would be loaded differently - require runtime support
-                // For now, just register the manifest for discovery
+                // Dylib plugins require runtime support; register manifest for discovery.
                 let _ = registry.register_manifest(manifest);
             }
         }

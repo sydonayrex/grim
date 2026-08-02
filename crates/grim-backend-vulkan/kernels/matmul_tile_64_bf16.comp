@@ -26,7 +26,7 @@ float unpack_bf16_lo(uint packed) {
         if (mant == 0u) return 0.0;
         int lz = 0;
         for (int i = 6; i >= 0; --i) {
-            if ((mant >> i) & 1u) { lz = 6 - i; break; }
+            if (((mant >> i) & 1u) != 0u) { lz = 6 - i; break; }
         }
         float f = float(mant << (1 - lz)) * exp2(-14.0 - float(lz));
         return sign == 1u ? -f : f;
@@ -35,7 +35,7 @@ float unpack_bf16_lo(uint packed) {
     } else {
         uint f32_exp = exp + 112u;
         uint f32_bits = (sign << 31u) | (f32_exp << 23u) | (mant << 16u);
-        return asfloat(f32_bits);
+        return uintBitsToFloat(f32_bits);
     }
 }
 
@@ -49,7 +49,7 @@ float unpack_bf16_hi(uint packed) {
         if (mant == 0u) return 0.0;
         int lz = 0;
         for (int i = 6; i >= 0; --i) {
-            if ((mant >> i) & 1u) { lz = 6 - i; break; }
+            if (((mant >> i) & 1u) != 0u) { lz = 6 - i; break; }
         }
         float f = float(mant << (1 - lz)) * exp2(-14.0 - float(lz));
         return sign == 1u ? -f : f;
@@ -58,7 +58,7 @@ float unpack_bf16_hi(uint packed) {
     } else {
         uint f32_exp = exp + 112u;
         uint f32_bits = (sign << 31u) | (f32_exp << 23u) | (mant << 16u);
-        return asfloat(f32_bits);
+        return uintBitsToFloat(f32_bits);
     }
 }
 

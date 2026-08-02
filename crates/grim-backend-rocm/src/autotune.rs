@@ -1,21 +1,4 @@
-//! Phase-3 §3.6 — runtime autotuner.
-//!
-//! The autotuner caches `(kernel_name, gpu_arch, problem_shape) ->
-//! AutotuneConfig` in memory and (optionally) on disk as JSON, so the
-//! fused-decode scheduler can pull a tuned launch config without
-//! re-benchmarking every process invocation.
-//!
-//! Skill attribution:
-//! - `rocm-profiling-perf` — autotune loop methodology, runtime
-//!   `rocblas_gemm_ex_get_solutions` enumeration (this module is the
-//!   generic wrapper; the GEMM-specific enumerator in
-//!   `lib.rs::lookup_solution_index` is its companion).
-//! - `rust-gpu-discipline` §4 — every benchmark closure must return a
-//!   *measured* number; no synthesized "fast" config sneaks into the
-//!   cache on a synthetic closure.
-//! - `rust-ai-ml-inference-guide` Action 8 — evaluate under controlled
-//!   shapes before deploying (this is the cache that holds the result
-//!   of those evaluations).
+//! Phase-3 §3.6 — runtime autotuner. [see: `rocm-profiling-perf`, `rocblas_gemm_ex_get_solutions`]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -24,16 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use grim_tensor::error::{Error, Result};
 
-/// Cache slot identity.
-///
-/// Fields:
-/// - `kernel`     — `extern "C"` entry name (e.g. `"grim_qkv_attention"`).
-/// - `gpu_arch`   — the rocBLAS / `--offload-arch` target (e.g.
-///                  `"gfx1036"`, `"gfx942"`, `"gfx1200"`). Configs are
-///                  never reused across arches.
-/// - `m, n, k`    — the launch shape this config was tuned for. At
-///                  minimum we distinguish these three; callers may use
-///                  `m == 0` and any of n/k == 0 to mean "doesn't apply".
+/// Cache slot identity. [see: `kernel`, `extern "C"`, `"grim_qkv_attention"`, `gpu_arch`]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct KernelKey {
     #[serde(default)]
@@ -48,19 +22,7 @@ pub struct KernelKey {
     pub k: usize,
 }
 
-/// Tuned launch parameters for a `(kernel, arch, shape)` slot.
-///
-/// Field semantics mirror the spec's §3.6 starter:
-/// - `block_dim`              — launch block size (multiple of 64 on RDNA;
-///                              see `rocm-hip-kernels` Wave64 mandate).
-/// - `tile_kv`                 — KV-tile size for attention-style kernels.
-/// - `grid_stride`             — persistent-kernel grid stride.
-/// - `cycles_per_invocation`   — measured median cycles (host cycles;
-///                              can be obtained from `rocprof` counters
-///                              per `rocm-profiling-perf`).
-///
-/// `Default` chooses a sane-ish mid-range config that the caller can
-/// override — *not* a synthesized "fast" value per `rust-gpu-discipline`.
+/// Tuned launch parameters for a `(kernel, arch, shape)` slot. [see: `block_dim`, `rocm-hip-kernels`, `tile_kv`, `grid_stride`]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutotuneConfig {
     #[serde(default = "AutotuneConfig::default_block_dim")]
@@ -74,9 +36,15 @@ pub struct AutotuneConfig {
 }
 
 impl AutotuneConfig {
-    fn default_block_dim() -> u32 { 256 }
-    fn default_tile_kv() -> u32 { 64 }
-    fn default_grid_stride() -> u32 { 1 }
+    fn default_block_dim() -> u32 {
+        256
+    }
+    fn default_tile_kv() -> u32 {
+        64
+    }
+    fn default_grid_stride() -> u32 {
+        1
+    }
 }
 
 impl Default for AutotuneConfig {
@@ -93,15 +61,7 @@ impl Default for AutotuneConfig {
 /// Type alias for benchmark closures.
 pub type BenchFn<'a> = dyn FnOnce(KernelKey) -> Result<AutotuneConfig> + Send + 'a;
 
-/// Tuned-config cache:
-/// - in-memory `HashMap<KernelKey, AutotuneConfig>` for hot-path lookups,
-/// - optional `cache_dir` shadow file at `{dir}/{gpu_arch}.json` for
-///   process restart (per spec §3.6 starter).
-///
-/// The autotuner does NOT touch the GPU on construction — no `hipMemcpy`,
-/// no `rocblas_gemm_ex_get_solutions` until `get_or_tune` runs a closure
-/// that itself runs those calls. Building a tuner is a free operation
-/// (`rust-gpu-discipline` §0: no synthetic GPU state).
+/// Tuned-config cache: [see: `HashMap<KernelKey, AutotuneConfig>`, `cache_dir`, `{dir}/{gpu_arch}.json`, `hipMemcpy`]
 #[derive(Debug)]
 pub struct Autotuner {
     device_ordinal: usize,
@@ -113,8 +73,7 @@ pub struct Autotuner {
 }
 
 impl Autotuner {
-    /// Construct a tuner for a device on a specific arch. Infallible.
-    /// The actual benchmark loop runs in `get_or_tune`.
+    /// Construct a tuner for a device on a specific arch. Infallible. [see: `get_or_tune`]
     pub fn for_device(device_ordinal: usize, gpu_arch: &'static str) -> Self {
         Self {
             device_ordinal,
@@ -130,14 +89,11 @@ impl Autotuner {
     }
 
     /// Device ordinal that this tuner was created for. Diagnostics /
-    /// logging only — never used to influence the cache content.
     pub fn device_ordinal(&self) -> usize {
         self.device_ordinal
     }
 
-    /// Configure the on-disk shadow directory. The autotuner does
-    /// *not* create the directory on construction — call `save()` to
-    /// flush, or rely on `record()` + `save()` for symmetric writes.
+    /// Configure the on-disk shadow directory. The autotuner does [see: `save()`, `record()`]
     pub fn set_cache_dir(&mut self, dir: PathBuf) {
         self.cache_dir = Some(dir);
     }
@@ -153,13 +109,11 @@ impl Autotuner {
     }
 
     /// List of keys currently cached (in arbitrary HashMap order).
-    /// Useful for diagnostics / debugging.
     pub fn list_keys(&self) -> Vec<KernelKey> {
         self.cache.keys().copied().collect()
     }
 
-    /// Insert a config directly. Used by `get_or_tune` on cache miss.
-    /// Returns `Err` if the cache is poisoned (shouldn't happen).
+    /// Insert a config directly. Used by `get_or_tune` on cache miss. [see: `Err`]
     pub fn record(&mut self, key: KernelKey, config: AutotuneConfig) -> Result<()> {
         if key.gpu_arch != self.gpu_arch {
             return Err(Error::Backend(format!(
@@ -172,15 +126,7 @@ impl Autotuner {
         Ok(())
     }
 
-    /// Read-through cache: returns the recorded config; if absent, runs
-    /// `bench` exactly once and records its result. A bench failure is
-    /// *not* cached — the next call retries.
-    ///
-    /// Per `rust-gpu-discipline`: a bench closure is the only legitimate
-    /// path into the cache. Repeated identical keys (e.g. two callers
-    /// in the same process racing on the same key) must not both run
-    /// the bench; we serialize through a single-threaded path because
-    /// tuning is by design infrequent.
+    /// Read-through cache: returns the recorded config; if absent, runs [see: `bench`, `rust-gpu-discipline`]
     pub fn get_or_tune<F>(&mut self, key: KernelKey, bench: F) -> Result<AutotuneConfig>
     where
         F: FnOnce(KernelKey) -> Result<AutotuneConfig>,
@@ -194,9 +140,7 @@ impl Autotuner {
     }
 }
 
-/// On-disk JSON shape. Uses owned `String`s for kernel/arch so a
-/// deserialize doesn't have to thread a lifetime through every
-/// `HashMap` lookup.
+/// On-disk JSON shape. Uses owned `String`s for kernel/arch so a [see: `HashMap`]
 #[derive(Debug, Serialize, Deserialize)]
 struct AutotuneSnapshotOwned {
     gpu_arch: String,
@@ -249,24 +193,23 @@ impl Autotuner {
         })?)
     }
 
-    /// Restore from a JSON snapshot. Keys whose `gpu_arch` does not
-    /// equal the constructor's `gpu_arch` are dropped (static
-    /// protection against cross-arch contamination).
+    /// Restore from a JSON snapshot. Keys whose `gpu_arch` does not [see: `gpu_arch`]
     pub fn from_json_bytes(
         device_ordinal: usize,
         gpu_arch: &'static str,
         bytes: &[u8],
     ) -> Result<Self> {
         let snap: AutotuneSnapshotOwned = serde_json::from_slice(bytes).map_err(|e| {
-            Error::Backend(format!("Autotuner::from_json_bytes: serde_json error: {}", e))
+            Error::Backend(format!(
+                "Autotuner::from_json_bytes: serde_json error: {}",
+                e
+            ))
         })?;
         let mut t = Self::for_device(device_ordinal, gpu_arch);
         for e in snap.entries {
             if e.key.gpu_arch == gpu_arch {
-                let kernel_str: &'static str =
-                    Box::leak(e.key.kernel.into_boxed_str()); // cache lifetime only.
-                let arch_str: &'static str =
-                    Box::leak(e.key.gpu_arch.into_boxed_str());
+                let kernel_str: &'static str = Box::leak(e.key.kernel.into_boxed_str()); // cache lifetime only.
+                let arch_str: &'static str = Box::leak(e.key.gpu_arch.into_boxed_str());
                 let key = KernelKey {
                     kernel: kernel_str,
                     gpu_arch: arch_str,

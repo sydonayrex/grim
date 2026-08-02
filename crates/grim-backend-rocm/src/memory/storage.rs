@@ -1,14 +1,4 @@
-//! `RocmStorage`: ROCm-side device buffer + metadata, plus its
-//! `BackendStorage` trait impl and the canonical allocation helpers
-//! (`alloc_gpu`, `copy_from_host`). The helpers take
-//! `Arc<RocmCachingAllocator> + ordinal` rather than `&RocmDevice`
-//! so this module stays free of any circular import with whatever
-//! module ends up housing `RocmDevice`.
-//!
-//! Skill attribution:
-//! - `rust-ai-ml-inference-guide` Action 3 — `BackendStorage` integration
-//! - `rust-gpu-discipline` §3 — explicit `Result` on every GPU touch, no
-//!   silent CPU fallback
+//! `RocmStorage`: ROCm-side device buffer + metadata, plus its [see: `BackendStorage`, `alloc_gpu`]
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -18,10 +8,9 @@ use grim_tensor::dtype::KQuantScheme;
 use grim_tensor::error::{Error, Result};
 
 // Re-exports used by the type's field types. The actual type declarations
-// live in lib.rs and are reachable via the crate-root imports below.
 use crate::{
-    check_hip, hipMemcpy, DType, DTypeStorage, HipMemcpyKind, QuantProvenance, RocmCachingAllocator,
-    Shape, hipSuccess,
+    DType, DTypeStorage, HipMemcpyKind, QuantProvenance, RocmCachingAllocator, Shape, check_hip,
+    hipMemcpy, hipSuccess,
 };
 
 /// ROCm-side tensor storage. Holds a hipDeviceptr_t (as u64) plus shape/dtype/provenance metadata.
@@ -34,8 +23,7 @@ pub struct RocmStorage {
     pub(crate) dtype: DType,
     pub(crate) provenance: QuantProvenance,
     pub(crate) ordinal: usize,
-    /// Back-reference to the owning device allocator; used by `Drop` to return the
-    /// buffer to the free-list instead of calling `hipFree`.
+    /// Back-reference to the owning device allocator; used by `Drop` to return the [see: `hipFree`]
     pub(crate) allocator: Arc<RocmCachingAllocator>,
 }
 
@@ -56,13 +44,7 @@ impl RocmStorage {
         self.bytes
     }
 
-    /// Allocates GPU memory via a caching allocator. Returns the storage on success.
-    ///
-    /// Takes the components needed for allocation (`Arc<RocmCachingAllocator>` +
-    /// ordinal) rather than a `&RocmDevice` reference. This breaks the circular
-    /// module import between `memory::storage` and wherever `RocmDevice` lives,
-    /// so the helper stays next to the `RocmStorage` type even after the device
-    /// is extracted.
+    /// Allocates GPU memory via a caching allocator. Returns the storage on success. [see: `Arc<RocmCachingAllocator>`, `&RocmDevice`]
     pub fn alloc_gpu(
         shape: &Shape,
         dtype: DType,
@@ -83,11 +65,7 @@ impl RocmStorage {
         })
     }
 
-    /// Copies data from host to GPU using the caching allocator + `hipMemcpy`.
-    ///
-    /// Same parameter-shape rationale as [`alloc_gpu`]: pulls the bytes from a
-    /// `&[f32]` (the only dtype currently wired through), routing the
-    /// allocation through the caching allocator passed in.
+    /// Copies data from host to GPU using the caching allocator + `hipMemcpy`. [see: `alloc_gpu`, `&[f32]`]
     pub fn copy_from_host(
         host_data: &[f32],
         shape: &Shape,
@@ -100,8 +78,6 @@ impl RocmStorage {
         let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
 
         // F16/BF16: the host provides f32 values but the device buffer holds
-        // 2-byte elements. Convert before uploading so the kernel reads valid
-        // quantized data, not raw f32 bit-pairs misinterpreted as f16.
         let upload_result = match arith {
             grim_tensor::ArithType::F16 => {
                 let f16_vec: Vec<half::f16> =
@@ -223,12 +199,7 @@ impl BackendStorage for RocmStorage {
         let dev_ptr_void = self.device_ptr.unwrap() as *mut c_void;
         let elem_count = self.shape.elem_count();
 
-        // Quantized storage (Q8_0, Q4K, …): the device buffer holds packed
-        // bytes, not native F32. We must read the exact byte count and
-        // dequantize on the host before returning f32 values. Without this
-        // branch the `_` arm would only copy `self.bytes` bytes into a
-        // `Vec<f32>` of `elem_count * 4` bytes — a silent short-read that
-        // leaves the tail as zeroed stale data.
+        // Quantized storage (Q8_0, Q4K, …): the device buffer holds packed [see: `_`, `self.bytes`, `Vec<f32>`, `elem_count * 4`]
         if let DTypeStorage::KQuant(_scheme) = &self.dtype.storage {
             let mut raw = vec![0u8; self.bytes];
             check_hip("hipMemcpyDtoH (quantized)", unsafe {
@@ -243,10 +214,6 @@ impl BackendStorage for RocmStorage {
         }
 
         // F16/BF16 storage: the device buffer holds 2-byte elements, but the
-        // caller expects f32. We can't just memcpy into a Vec<f32> (that would
-        // reinterpret pairs of f16 values as single f32 values — a silent
-        // correctness bug). Instead, read the raw 2-byte elements into a byte
-        // buffer, then convert each to f32.
         match self.dtype.arith {
             grim_tensor::ArithType::F16 => {
                 let mut raw = vec![0u8; elem_count * 2];
@@ -308,9 +275,7 @@ impl BackendStorage for RocmStorage {
     }
 }
 
-/// Minimal host-side dequantizer for when a quantized tensor needs to be
-/// read back as `Vec<f32>` and no backend-specific on-device path applies.
-/// Currently handles Q8_0 (34 bytes per 32 weights: fp16 delta + int8 codes).
+/// Minimal host-side dequantizer for when a quantized tensor needs to be [see: `Vec<f32>`]
 fn dequant_cpu(raw: &[u8], elem_count: usize, dtype: &DType) -> Result<Vec<f32>> {
     match &dtype.storage {
         DTypeStorage::KQuant(KQuantScheme::Q80) => {

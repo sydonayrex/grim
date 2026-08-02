@@ -29,4 +29,3 @@ fn test_solution_index_for_f16_bf16() -> Result<()> {
     assert_ne!(bf16_idx, 0, "BF16 must return a tuned solution index");
     Ok(())
 }
-

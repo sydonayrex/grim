@@ -67,7 +67,8 @@ impl ArithType {
     pub fn byte_size(self) -> usize {
         match self {
             ArithType::F32 | ArithType::U32 => 4,
-            ArithType::F16 | ArithType::BF16 | ArithType::U8 => 2,
+            ArithType::F16 | ArithType::BF16 => 2,
+            ArithType::U8 => 1,
             ArithType::I64 => 8,
         }
     }
@@ -136,8 +137,29 @@ pub enum FloatPackScheme {
     /// FP8 (E4M3 by default; E5M2 recognized).
     Fp8,
     /// MXFP4 (OCP Microscaling 4-bit float with shared E8M0 scale per 32 elements - Jay tier).
+    ///
+    /// ### Packed Byte Layout for `RawTensor.bytes` (concatenation convention):
+    /// Two length-prefixed segments, matching the kernel in
+    /// `grim-backend-rocm/src/kernels/mxfp_standalone.rs` (codes packed
+    /// 2-per-byte, even element in the low nibble; one E8M0 shared exponent
+    /// byte per 32-element group):
+    ///
+    /// ```text
+    /// [u64 LE: codes_len] [codes...]
+    /// [u64 LE: exps_len]  [exps...]
+    /// ```
     MxFp4,
     /// MXFP8 (OCP Microscaling 8-bit float with shared scale per block - Magpie tier).
+    ///
+    /// ### Packed Byte Layout for `RawTensor.bytes` (concatenation convention):
+    /// Two length-prefixed segments, matching the kernel in
+    /// `grim-backend-rocm/src/kernels/mxfp_standalone.rs` (one E4M3 code byte
+    /// per element; one E8M0 shared exponent byte per 32-element group):
+    ///
+    /// ```text
+    /// [u64 LE: codes_len] [codes...]
+    /// [u64 LE: exps_len]  [exps...]
+    /// ```
     MxFp8,
 }
 
@@ -172,6 +194,47 @@ pub struct GpuIntConfig {
 }
 
 /// Bitwidth configuration for `Storage::ResidualPacked`.
+///
+/// # Packed residual layout contract
+///
+/// `ResidualPacked` is a column-major weight view as consumed by
+/// `grim_fused_dequant_gemm_f16`: for a logical `[K, N]` weight, the packed
+/// stream contains `N` rows, each containing `K` codes.  A code is an unsigned
+/// `bpw`-bit integer, written most-significant-bit first within each byte; a
+/// code which crosses a byte boundary takes its high bits from the low bits of
+/// the first byte and its low bits from the high bits of the next byte.  The
+/// code is normalized as `code / (2^bpw - 1) * 2 - 1`.
+///
+/// Each packed layer has a 256-byte row stride:
+///
+/// ```text
+/// row_bytes(bpw, K) = align_up(ceil(K * bpw / 8), 256)
+/// row_start(layer, row) = layer_codes_offset + row * row_bytes(bpw, K)
+/// ```
+///
+/// The primary code region starts at byte offset zero of the `B_codes`
+/// allocation.  Its per-output-row scale is supplied separately through the
+/// `B_scales` pointer and is one `u8` per output row, decoded as
+/// `scale_byte / 255.0`; a null pointer means scale `1.0` for every row.
+///
+/// `QuantProvenance::WithResiduals` records optional backup regions by byte
+/// offsets.  `backup{1,2}_codes_offset` points to another independently
+/// 256-byte-row-aligned code region using its recorded bitwidth and the same
+/// MSB-first packing rule.  `backup{1,2}_scale_offset` points into the same
+/// `B_codes` allocation at an array of one `u8` scale per output row,
+/// decoded as `/ 255.0`; an offset of zero means unit scale in the ROCm
+/// kernel.  A present backup is added to the primary decoded value.  The
+/// forward kernel consumes backup1; the backward kernel consumes backup1 and
+/// backup2.
+///
+/// Outliers are not stored in the packed code stream.  The provenance carries
+/// their count and the execution path supplies two external arrays: sorted
+/// `u32` flat indices and matching `f32` replacement values.  An index is
+/// `row * K + k` in the logical `[N, K]` packed view.  The replacement value
+/// takes precedence over the primary and backup reconstruction.
+///
+/// This documents the consumer-side ABI; it does not imply that a host-side
+/// writer or dequantizer is implemented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResidualPackedConfig {
     /// Bitwidth of the packed codes in `RawTensor.bytes`.
@@ -185,9 +248,18 @@ pub struct DType {
 }
 
 impl DType {
-    pub const F32: DType = DType { arith: ArithType::F32, storage: Storage::Native };
-    pub const BF16: DType = DType { arith: ArithType::BF16, storage: Storage::Native };
-    pub const F16: DType = DType { arith: ArithType::F16, storage: Storage::Native };
+    pub const F32: DType = DType {
+        arith: ArithType::F32,
+        storage: Storage::Native,
+    };
+    pub const BF16: DType = DType {
+        arith: ArithType::BF16,
+        storage: Storage::Native,
+    };
+    pub const F16: DType = DType {
+        arith: ArithType::F16,
+        storage: Storage::Native,
+    };
 
     pub fn is_quantized(&self) -> bool {
         !matches!(self.storage, Storage::Native)
@@ -277,7 +349,7 @@ mod tests {
         assert_eq!(ArithType::U32.byte_size(), 4);
         assert_eq!(ArithType::F16.byte_size(), 2);
         assert_eq!(ArithType::BF16.byte_size(), 2);
-        assert_eq!(ArithType::U8.byte_size(), 2);
+        assert_eq!(ArithType::U8.byte_size(), 1);
         assert_eq!(ArithType::I64.byte_size(), 8);
     }
 

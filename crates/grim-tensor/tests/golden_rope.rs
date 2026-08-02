@@ -1,5 +1,5 @@
 use grim_backend_cpu::cpu_tensor;
-use grim_tensor::{backend::BackendDevice, Shape};
+use grim_tensor::{Shape, backend::BackendDevice};
 
 #[test]
 fn test_rope_golden_mutation_resistant() {
@@ -19,15 +19,16 @@ fn test_rope_golden_mutation_resistant() {
 
     let x_data = vec![
         // Batch 0, Pos 0
-        1.0, 2.0, 3.0, 4.0,
-        // Batch 0, Pos 1
+        1.0, 2.0, 3.0, 4.0, // Batch 0, Pos 1
         1.0, 2.0, 3.0, 4.0,
     ];
 
     let x = cpu_tensor(x_data, Shape::new(vec![1, 2, 4]));
     let positions = vec![0u32, 1u32];
 
-    let (out_st, _) = dev.rope(x.storage().as_ref(), &positions, 4, 10000.0, x.shape()).expect("rope");
+    let (out_st, _) = dev
+        .rope(x.storage().as_ref(), &positions, 4, 10000.0, x.shape())
+        .expect("rope");
     let out_data = out_st.to_cpu_vec_f32().expect("to_cpu_vec_f32");
 
     // Pos 0 output must match input [1.0, 2.0, 3.0, 4.0]
@@ -43,6 +44,12 @@ fn test_rope_golden_mutation_resistant() {
     let expected_pos1_i0_low = 1.0 * (1.0f32).cos() - 3.0 * (1.0f32).sin();
     let expected_pos1_i0_high = 1.0 * (1.0f32).sin() + 3.0 * (1.0f32).cos();
 
-    assert!((out_data[4] - expected_pos1_i0_low).abs() < 1e-4, "Pos 1 low dim match");
-    assert!((out_data[6] - expected_pos1_i0_high).abs() < 1e-4, "Pos 1 high dim match");
+    assert!(
+        (out_data[4] - expected_pos1_i0_low).abs() < 1e-4,
+        "Pos 1 low dim match"
+    );
+    assert!(
+        (out_data[6] - expected_pos1_i0_high).abs() < 1e-4,
+        "Pos 1 high dim match"
+    );
 }

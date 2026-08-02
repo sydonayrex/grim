@@ -1,12 +1,14 @@
 //! RWKV RNN family — Time-Mix & Channel-Mix recurrent layers.
 
-use std::any::Any;
+use crate::cpu_tensor;
 use grim_backend_cpu::add_tensors;
 use grim_core::error::{Error, Result};
-use grim_core::model::{SsmState, StatefulSequence, Model, ModelConfig, ModalityHint, CausalLm, AdapterHandle};
+use grim_core::model::{
+    AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig, SsmState, StatefulSequence,
+};
 use grim_nn::{Linear, RmsNorm};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
-use crate::cpu_tensor;
+use std::any::Any;
 
 #[derive(Debug, Clone)]
 pub struct RwkvConfig {
@@ -37,12 +39,19 @@ impl SsmState for RwkvState {
         Ok(Box::new(self.clone()))
     }
     fn restore_snapshot(&mut self, snap: &dyn SsmState) -> Result<()> {
-        let other = snap.as_any().downcast_ref::<RwkvState>().ok_or_else(|| Error::Session("downcast failed".into()))?;
+        let other = snap
+            .as_any()
+            .downcast_ref::<RwkvState>()
+            .ok_or_else(|| Error::Session("downcast failed".into()))?;
         self.state_xy.copy_from_slice(&other.state_xy);
         Ok(())
     }
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 pub struct RwkvBlock {
@@ -60,14 +69,33 @@ pub struct RwkvBlock {
 impl RwkvBlock {
     pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: &RwkvConfig, device: Device) -> Result<Self> {
         let norm = RmsNorm::load(&ws.pp("ln_x"), cfg.hidden_size, 1e-5)?;
-        let time_mix_key = Linear::load(&ws.pp("att.key"), cfg.hidden_size, cfg.hidden_size, false)?;
-        let time_mix_value = Linear::load(&ws.pp("att.value"), cfg.hidden_size, cfg.hidden_size, false)?;
-        let time_mix_receptance = Linear::load(&ws.pp("att.receptance"), cfg.hidden_size, cfg.hidden_size, false)?;
-        let time_mix_output = Linear::load(&ws.pp("att.output"), cfg.hidden_size, cfg.hidden_size, false)?;
+        let time_mix_key =
+            Linear::load(&ws.pp("att.key"), cfg.hidden_size, cfg.hidden_size, false)?;
+        let time_mix_value =
+            Linear::load(&ws.pp("att.value"), cfg.hidden_size, cfg.hidden_size, false)?;
+        let time_mix_receptance = Linear::load(
+            &ws.pp("att.receptance"),
+            cfg.hidden_size,
+            cfg.hidden_size,
+            false,
+        )?;
+        let time_mix_output = Linear::load(
+            &ws.pp("att.output"),
+            cfg.hidden_size,
+            cfg.hidden_size,
+            false,
+        )?;
 
-        let channel_mix_key = Linear::load(&ws.pp("ffn.key"), cfg.hidden_size, cfg.hidden_size, false)?;
-        let channel_mix_receptance = Linear::load(&ws.pp("ffn.receptance"), cfg.hidden_size, cfg.hidden_size, false)?;
-        let channel_mix_value = Linear::load(&ws.pp("ffn.value"), cfg.hidden_size, cfg.hidden_size, false)?;
+        let channel_mix_key =
+            Linear::load(&ws.pp("ffn.key"), cfg.hidden_size, cfg.hidden_size, false)?;
+        let channel_mix_receptance = Linear::load(
+            &ws.pp("ffn.receptance"),
+            cfg.hidden_size,
+            cfg.hidden_size,
+            false,
+        )?;
+        let channel_mix_value =
+            Linear::load(&ws.pp("ffn.value"), cfg.hidden_size, cfg.hidden_size, false)?;
 
         Ok(Self {
             norm,
@@ -110,7 +138,7 @@ impl RwkvBlock {
         use grim_backend_rocm::RocmDevice;
         use grim_tensor::BackendDevice;
 
-        let dev = RocmDevice::new(ordinal);
+        let dev = RocmDevice::try_new(ordinal)?;
         let dim = x.shape().dims().last().copied().unwrap_or(0);
         let x_data = x.to_vec_f32()?;
         if x_data.is_empty() {
@@ -126,14 +154,38 @@ impl RwkvBlock {
 
         // Upload to GPU for time-mix kernel dispatch.
         let x_gpu = dev.from_cpu(&x_data, &Shape::new(vec![1, dim]), grim_tensor::DType::F32)?;
-        let k_gpu = dev.from_cpu(&k.to_vec_f32()?, &Shape::new(vec![1, dim]), grim_tensor::DType::F32)?;
-        let v_gpu = dev.from_cpu(&v.to_vec_f32()?, &Shape::new(vec![1, dim]), grim_tensor::DType::F32)?;
-        let r_gpu = dev.from_cpu(&r.to_vec_f32()?, &Shape::new(vec![1, dim]), grim_tensor::DType::F32)?;
+        let k_gpu = dev.from_cpu(
+            &k.to_vec_f32()?,
+            &Shape::new(vec![1, dim]),
+            grim_tensor::DType::F32,
+        )?;
+        let v_gpu = dev.from_cpu(
+            &v.to_vec_f32()?,
+            &Shape::new(vec![1, dim]),
+            grim_tensor::DType::F32,
+        )?;
+        let r_gpu = dev.from_cpu(
+            &r.to_vec_f32()?,
+            &Shape::new(vec![1, dim]),
+            grim_tensor::DType::F32,
+        )?;
+        let w_gpu = dev.from_cpu(
+            &att_out.to_vec_f32()?,
+            &Shape::new(vec![1, dim]),
+            grim_tensor::DType::F32,
+        )?;
 
         let out_shape = Shape::new(vec![1, dim]);
         let (tm_out, _) = dev.rwkv_time_mix(
-            x_gpu.as_ref(), k_gpu.as_ref(), v_gpu.as_ref(), r_gpu.as_ref(),
-            1, dim, 1, &out_shape,
+            x_gpu.as_ref(),
+            w_gpu.as_ref(),
+            k_gpu.as_ref(),
+            v_gpu.as_ref(),
+            r_gpu.as_ref(),
+            1,
+            dim,
+            1,
+            &out_shape,
         )?;
         let tm_data = tm_out.to_cpu_vec_f32()?;
 
@@ -145,14 +197,35 @@ impl RwkvBlock {
         let ffn_r = self.channel_mix_receptance.forward(&x_res1)?;
         let ffn_v = self.channel_mix_value.forward(&ffn_k)?;
 
-        let x_res1_gpu = dev.from_cpu(&x_res1_data, &Shape::new(vec![1, dim]), grim_tensor::DType::F32)?;
-        let ffn_k_gpu = dev.from_cpu(&ffn_k.to_vec_f32()?, &Shape::new(vec![1, dim]), grim_tensor::DType::F32)?;
-        let ffn_r_gpu = dev.from_cpu(&ffn_r.to_vec_f32()?, &Shape::new(vec![1, dim]), grim_tensor::DType::F32)?;
-        let ffn_v_gpu = dev.from_cpu(&ffn_v.to_vec_f32()?, &Shape::new(vec![1, dim]), grim_tensor::DType::F32)?;
+        let x_res1_gpu = dev.from_cpu(
+            &x_res1_data,
+            &Shape::new(vec![1, dim]),
+            grim_tensor::DType::F32,
+        )?;
+        let ffn_k_gpu = dev.from_cpu(
+            &ffn_k.to_vec_f32()?,
+            &Shape::new(vec![1, dim]),
+            grim_tensor::DType::F32,
+        )?;
+        let ffn_r_gpu = dev.from_cpu(
+            &ffn_r.to_vec_f32()?,
+            &Shape::new(vec![1, dim]),
+            grim_tensor::DType::F32,
+        )?;
+        let ffn_v_gpu = dev.from_cpu(
+            &ffn_v.to_vec_f32()?,
+            &Shape::new(vec![1, dim]),
+            grim_tensor::DType::F32,
+        )?;
 
         let (cm_out, _) = dev.rwkv_channel_mix(
-            x_res1_gpu.as_ref(), ffn_k_gpu.as_ref(), ffn_r_gpu.as_ref(), ffn_v_gpu.as_ref(),
-            1, dim, &out_shape,
+            x_res1_gpu.as_ref(),
+            ffn_k_gpu.as_ref(),
+            ffn_r_gpu.as_ref(),
+            ffn_v_gpu.as_ref(),
+            1,
+            dim,
+            &out_shape,
         )?;
         let cm_data = cm_out.to_cpu_vec_f32()?;
 
@@ -178,13 +251,15 @@ impl RwkvBlock {
             time_mix_in[i] = sig_r * (k_vec[i] * v_vec[i]);
         }
 
-        let att_out = self.time_mix_output.forward(&cpu_tensor(time_mix_in, Shape::new(vec![1, dim])))?;
+        let att_out = self
+            .time_mix_output
+            .forward(&cpu_tensor(time_mix_in, Shape::new(vec![1, dim])))?;
         let x_res1 = add_tensors(x, &att_out).map_err(grim_core::Error::Tensor)?;
 
         let ffn_k = self.channel_mix_key.forward(&x_res1)?;
         let ffn_r = self.channel_mix_receptance.forward(&x_res1)?;
         let ffn_v = self.channel_mix_value.forward(&ffn_k)?;
-        
+
         let ffn_r_vec = ffn_r.to_vec_f32()?;
         let ffn_v_vec = ffn_v.to_vec_f32()?;
         let mut ffn_out = vec![0.0f32; ffn_v_vec.len()];
@@ -212,7 +287,11 @@ impl Rwkv {
         let emb = Linear::load(&ws.pp("emb"), cfg.vocab_size, cfg.hidden_size, false)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            layers.push(RwkvBlock::load(&ws.pp("blocks").pp(&i.to_string()), &cfg, device.clone())?);
+            layers.push(RwkvBlock::load(
+                &ws.pp("blocks").pp(&i.to_string()),
+                &cfg,
+                device.clone(),
+            )?);
         }
         let ln_out = RmsNorm::load(&ws.pp("ln_out"), cfg.hidden_size, 1e-5)?;
         let head = Linear::load(&ws.pp("head"), cfg.hidden_size, cfg.vocab_size, false)?;
@@ -251,7 +330,10 @@ impl StatefulSequence for Rwkv {
     }
 
     fn step(&self, state: &mut dyn SsmState, input: &Tensor) -> Result<Tensor> {
-        let s = state.as_any_mut().downcast_mut::<RwkvState>().ok_or_else(|| Error::Session("downcast failed".into()))?;
+        let s = state
+            .as_any_mut()
+            .downcast_mut::<RwkvState>()
+            .ok_or_else(|| Error::Session("downcast failed".into()))?;
         let emb_out = self.emb.forward(input)?;
         let mut h = emb_out;
         for layer in &self.layers {

@@ -14,13 +14,15 @@ path = "src/main.rs"
 grim-format = { workspace = true }
 grim-tensor = { workspace = true }
 grim-backend-cpu = { workspace = true }
-grim-backend-rocm = { workspace = true }
+grim-backend-rocm = { workspace = true, features = ["rccl"] }
 grim-backend-cuda = { workspace = true, optional = true }
 grim-backend-vulkan = { workspace = true, optional = true }
 grim-backend-metal = { workspace = true, optional = true }
 grim-autograd = { workspace = true, features = ["rocm-mem"] }
 grim-engine = { workspace = true }
 grim-core = { workspace = true }
+grim-nn = { workspace = true }
+grim-models-transformer = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = { workspace = true }

@@ -1,9 +1,4 @@
-//! Shared HIP device helper functions for all ROCm kernel translation units.
-//!
-//! Exposes a single `KERNEL_SOURCE` prelude containing common `__device__` helpers
-//! (`fp16_to_float_device`, `fp8_e4m3_to_float_hip`, `mxfp4_to_float_hip`, `dequant_q4k_element`)
-//! wrapped in `extern "C"`. This prevents symbol redefinition and linkage collision errors
-//! when JIT-compiling concatenated HIP RTC kernel source strings across multiple kernel modules.
+//! Shared HIP device helper functions for all ROCm kernel translation units. [see: `KERNEL_SOURCE`, `__device__`]
 
 /// Shared HIP device helper source code prepended to all compute kernel assemblies.
 pub const KERNEL_SOURCE: &str = r#"

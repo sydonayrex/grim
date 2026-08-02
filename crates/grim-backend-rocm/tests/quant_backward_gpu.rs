@@ -11,10 +11,8 @@
 
 use grim_quant::quant_q80;
 use grim_tensor::{
-    BackendDevice, BackendStorage,
+    BackendDevice, BackendStorage, QuantizedMatmulBackwardResiduals, Shape,
     dtype::{ArithType, DType, KQuantScheme, Storage},
-    QuantizedMatmulBackwardResiduals,
-    Shape,
 };
 
 /// Maximum allowed RMS relative error for Q8_0 (8-bit).
@@ -23,7 +21,9 @@ const MAX_RMS_REL_ERROR_Q8: f32 = 0.05;
 /// RMS relative error: sqrt(mean((orig-recon)^2 / orig^2)).
 fn rms_rel_err(orig: &[f32], recon: &[f32]) -> f32 {
     assert_eq!(orig.len(), recon.len());
-    let sum_sq: f32 = orig.iter().zip(recon.iter())
+    let sum_sq: f32 = orig
+        .iter()
+        .zip(recon.iter())
         .map(|(o, r)| {
             let denom = o.abs().max(1e-3);
             ((o - r) / denom).powi(2)
@@ -54,7 +54,8 @@ fn quant_backward_rocm_q8_0_gemm_dx_numerics() {
         Ok(d) if !d.is_empty() => d,
         _ => return,
     };
-    let dev = grim_backend_rocm::RocmDevice::new(rocm_devices[0].ordinal());
+    let dev = grim_backend_rocm::RocmDevice::try_new(rocm_devices[0].ordinal())
+        .expect("RocmDevice::try_new should succeed for probed device");
 
     let (m, k, n) = (8, 16, 16);
     let dy_host: Vec<f32> = (0..m * n).map(|i| (i as f32 * 0.05).cos()).collect();
@@ -70,14 +71,16 @@ fn quant_backward_rocm_q8_0_gemm_dx_numerics() {
     // Quantize b to Q8_0, upload packed bytes to ROCm
     let b_packed = quant_q80(&b_orig).unwrap();
     let b_rocm_shape = Shape::from_slice(&[k * n]);
-    let b_rocm = dev.from_cpu_bytes(
-        &b_packed,
-        &b_rocm_shape,
-        DType {
-            arith: ArithType::F32,
-            storage: Storage::KQuant(KQuantScheme::Q80),
-        },
-    ).unwrap();
+    let b_rocm = dev
+        .from_cpu_bytes(
+            &b_packed,
+            &b_rocm_shape,
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::KQuant(KQuantScheme::Q80),
+            },
+        )
+        .unwrap();
 
     // Call ROCm fused backward kernel for dX
     let out_shape = Shape::from_slice(&[m, k]);

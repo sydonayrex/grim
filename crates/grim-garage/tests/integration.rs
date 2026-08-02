@@ -87,6 +87,179 @@ fn write_minimal_gguf(path: &Path, tensor_name: &str, payload_bytes: Vec<u8>) {
     f.write_all(&buf).unwrap();
 }
 
+/// Write a complete tiny Llama GGUF (vocab=64, hidden=16, heads=4, kv=4,
+/// head_dim=4, layers=1, ffn=32) that `GgufProvider::open` can read and the
+/// SFT worker can actually run real forward steps against. Every tensor that
+/// the head loaders and `LlamaBlock::load` ask for is present with the exact
+/// expected shape (`WeightSource::get` compares raw shape to expected shape;
+/// GGUF stores dims reversed, so we write `shape.reverse()`). Linear weights
+/// are GGUF-native `[out, in]` row-major, matching `Linear::load(ws, in, out)`
+/// which calls `get([out, in])`: `wq/wk/wv` = `[hidden, n_heads*head_dim]`,
+/// `wo` = `[n_heads*head_dim, hidden]`, `w_gate/w_up` = `[ffn, hidden]`,
+/// `w_down` = `[hidden, ffn]`, `token_embd`/`output` = `[vocab, hidden]`.
+fn write_tiny_llama_gguf(path: &Path) {
+    use grim_format::gguf::GgufValue;
+
+    const VOCAB: u64 = 64;
+    const HIDDEN: u64 = 16;
+    const HEADS: u64 = 4;
+    const KV_HEADS: u64 = 4;
+    const HEAD_DIM: u64 = 4;
+    const FFN: u64 = 32;
+    const LAYERS: u64 = 1;
+
+    let metadata: HashMap<String, GgufValue> = HashMap::from([
+        (
+            "general.architecture".into(),
+            GgufValue::String("llama".into()),
+        ),
+        (
+            "tokenizer.ggml.vocab_size".into(),
+            GgufValue::Uint32(VOCAB as u32),
+        ),
+        (
+            "llama.embedding_length".into(),
+            GgufValue::Uint32(HIDDEN as u32),
+        ),
+        ("llama.block_count".into(), GgufValue::Uint32(LAYERS as u32)),
+        (
+            "llama.attention.head_count".into(),
+            GgufValue::Uint32(HEADS as u32),
+        ),
+        (
+            "llama.attention.head_count_kv".into(),
+            GgufValue::Uint32(KV_HEADS as u32),
+        ),
+        (
+            "llama.attention.key_length".into(),
+            GgufValue::Uint32(HEAD_DIM as u32),
+        ),
+        (
+            "llama.feed_forward_length".into(),
+            GgufValue::Uint32(FFN as u32),
+        ),
+        ("llama.context_length".into(), GgufValue::Uint32(128)),
+        (
+            "llama.attention.layer_norm_rms_eps".into(),
+            GgufValue::Float32(1e-5),
+        ),
+        ("llama.rope.freq_base".into(), GgufValue::Float32(10000.0)),
+    ]);
+
+    // (name, row-major dims, fill value). Dims are reversed when written.
+    let tensors: Vec<(&str, Vec<u64>, f32)> = vec![
+        ("token_embd.weight", vec![VOCAB, HIDDEN], 0.001),
+        ("output_norm.weight", vec![HIDDEN], 1.0),
+        ("output.weight", vec![VOCAB, HIDDEN], 0.001),
+        ("layers.0.attn_norm.weight", vec![HIDDEN], 1.0),
+        (
+            "layers.0.attn.wq.weight",
+            vec![HIDDEN, HEADS * HEAD_DIM],
+            0.01,
+        ),
+        (
+            "layers.0.attn.wk.weight",
+            vec![HIDDEN, KV_HEADS * HEAD_DIM],
+            0.01,
+        ),
+        (
+            "layers.0.attn.wv.weight",
+            vec![HIDDEN, KV_HEADS * HEAD_DIM],
+            0.01,
+        ),
+        (
+            "layers.0.attn.wo.weight",
+            vec![HEADS * HEAD_DIM, HIDDEN],
+            0.01,
+        ),
+        ("layers.0.ffn_norm.weight", vec![HIDDEN], 1.0),
+        ("layers.0.ffn.w_gate.weight", vec![FFN, HIDDEN], 0.01),
+        ("layers.0.ffn.w_up.weight", vec![FFN, HIDDEN], 0.01),
+        ("layers.0.ffn.w_down.weight", vec![HIDDEN, FFN], 0.01),
+    ];
+
+    let align32 = |n: u64| (n + 31) & !31;
+
+    use std::io::Write;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&GGUF_VERSION.to_le_bytes());
+    buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+
+    for (k, v) in &metadata {
+        let kb = k.as_bytes();
+        buf.extend_from_slice(&(kb.len() as u64).to_le_bytes());
+        buf.extend_from_slice(kb);
+        match v {
+            GgufValue::String(s) => {
+                buf.extend_from_slice(&8u32.to_le_bytes());
+                let sb = s.as_bytes();
+                buf.extend_from_slice(&(sb.len() as u64).to_le_bytes());
+                buf.extend_from_slice(sb);
+            }
+            GgufValue::Uint32(u) => {
+                buf.extend_from_slice(&4u32.to_le_bytes());
+                buf.extend_from_slice(&u.to_le_bytes());
+            }
+            GgufValue::Float32(f) => {
+                buf.extend_from_slice(&6u32.to_le_bytes());
+                buf.extend_from_slice(&f.to_le_bytes());
+            }
+            _ => panic!("unsupported metadata value in tiny-llama fixture"),
+        }
+    }
+
+    // Data region is aligned to 32 and tensor offsets are relative to it.
+    let infos_size: u64 = tensors
+        .iter()
+        .map(|(name, dims, _)| 8 + name.len() as u64 + 4 + 8 * dims.len() as u64 + 4 + 8)
+        .sum();
+    let data_start = align32(buf.len() as u64 + infos_size);
+
+    let mut cursor = 0u64;
+    let mut offsets = Vec::with_capacity(tensors.len());
+    let mut sizes = Vec::with_capacity(tensors.len());
+    for (_, dims, _) in &tensors {
+        let bytes = dims.iter().product::<u64>() * 4; // F32
+        cursor = align32(cursor);
+        offsets.push(cursor);
+        sizes.push(bytes);
+        cursor += bytes;
+    }
+
+    for ((name, dims, _), &offset) in tensors.iter().zip(&offsets) {
+        let nb = name.as_bytes();
+        buf.extend_from_slice(&(nb.len() as u64).to_le_bytes());
+        buf.extend_from_slice(nb);
+        let disk_dims: Vec<u64> = dims.iter().rev().copied().collect();
+        buf.extend_from_slice(&(disk_dims.len() as u32).to_le_bytes());
+        for d in &disk_dims {
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        buf.extend_from_slice(&0u32.to_le_bytes()); // GGUF dtype tag: F32
+        buf.extend_from_slice(&offset.to_le_bytes());
+    }
+
+    while (buf.len() as u64) < data_start {
+        buf.push(0);
+    }
+
+    for ((_, _, fill), (&offset, &bytes)) in tensors.iter().zip(offsets.iter().zip(&sizes)) {
+        assert_eq!(
+            buf.len() as u64,
+            data_start + offset,
+            "tensor layout mismatch"
+        );
+        for _ in 0..bytes / 4 {
+            buf.extend_from_slice(&fill.to_le_bytes());
+        }
+    }
+
+    let mut f = std::fs::File::create(path).unwrap();
+    f.write_all(&buf).unwrap();
+}
+
 // ----- discover_models -----
 
 #[test]
@@ -288,12 +461,19 @@ async fn cancel_signals_worker_and_status_transitions_to_cancelled() {
     // H1: cancelling a running worker must (a) stop the worker's loop, and
     // (b) leave the terminal status as `Cancelled` — never resurrected to
     // `Completed` by the still-running worker's natural-completion path.
+    // SFT modes open the real base model, so provide a readable tiny Llama GGUF.
+    write_tiny_llama_gguf(Path::new("/tmp/cancel-test.gguf"));
     let dataset_file = "/tmp/cancel-test.jsonl";
     {
         use std::io::Write;
         let mut f = std::fs::File::create(dataset_file).expect("create test dataset");
         for i in 0..150 {
-            writeln!(f, "{{\"text\": \"sample prompt and output text number {}\"}}", i).unwrap();
+            writeln!(
+                f,
+                "{{\"text\": \"sample prompt and output text number {}\"}}",
+                i
+            )
+            .unwrap();
         }
     }
 
@@ -657,13 +837,10 @@ fn probe_rocm_devices_returns_vec_even_when_no_gpu() {
     }
 }
 
-
-
-
 #[tokio::test]
 async fn test_garage_worker_soul_eater_mode() {
-    use std::sync::Arc;
     use std::io::Write;
+    use std::sync::Arc;
 
     let dataset_file = "/tmp/soul-eater-test.jsonl";
     {
@@ -672,6 +849,7 @@ async fn test_garage_worker_soul_eater_mode() {
             writeln!(f, "{{\"text\": \"soul eater test prompt {}\"}}", i).unwrap();
         }
     }
+    write_tiny_llama_gguf(Path::new("/tmp/soul-eater-test.gguf"));
 
     let reg = Arc::new(JobRegistry::new());
     let id = reg

@@ -106,10 +106,18 @@ pub struct StartTrainingRequest {
     pub resume_from_checkpoint: Option<String>,
 }
 
-fn default_rank() -> u32 { 16 }
-fn default_lr() -> f64 { 2e-5 }
-fn default_epochs() -> u32 { 1 }
-fn default_accumulation_steps() -> u32 { 1 }
+fn default_rank() -> u32 {
+    16
+}
+fn default_lr() -> f64 {
+    2e-5
+}
+fn default_epochs() -> u32 {
+    1
+}
+fn default_accumulation_steps() -> u32 {
+    1
+}
 
 #[derive(Debug, Serialize)]
 pub struct StartTrainingResponse {
@@ -377,7 +385,9 @@ async fn start_training(
     if active_jobs >= state.registry.max_concurrent {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({ "error": format!("max concurrent jobs ({}) reached", state.registry.max_concurrent) })),
+            Json(
+                json!({ "error": format!("max concurrent jobs ({}) reached", state.registry.max_concurrent) }),
+            ),
         ));
     }
     // M7: refuse `lora_rank == 0` (autograd divides by rank) and
@@ -518,7 +528,7 @@ async fn cancel_job(
 /// `{model_path}.train` and `create_dir_all`s the parent, which would
 /// otherwise let an HTTP POST write `.train` files into arbitrary
 /// directories. Mirrors the wire shape used by the sibling
-/// `convert_model_route` and `sanitize_model_id` helpers (those reject
+/// `convert_model_route` and `prevent_path_traversal` helpers (those reject
 /// the same byte set on the model_id path segment).
 pub(crate) fn validate_job_path(field: &str, value: &str) -> std::result::Result<(), String> {
     let has_traversal = value
@@ -533,7 +543,10 @@ pub(crate) fn validate_job_path(field: &str, value: &str) -> std::result::Result
     }
 }
 
-fn sanitize_model_id(id: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+/// Prevent path traversal in model_id. Only blocks `..`, `/`, and `\`;
+/// does NOT validate existence or non-emptiness. Callers must check those
+/// separately after this guard.
+fn prevent_path_traversal(id: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     if id.contains("..") || id.contains('/') || id.contains('\\') {
         Err((
             StatusCode::BAD_REQUEST,
@@ -547,7 +560,7 @@ fn sanitize_model_id(id: &str) -> Result<(), (StatusCode, Json<serde_json::Value
 async fn get_bolt_ons(
     AxumPath(model_id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    sanitize_model_id(&model_id)?;
+    prevent_path_traversal(&model_id)?;
     let model_path = Path::new(&model_id);
     if !model_path.exists() {
         return Err((
@@ -605,7 +618,7 @@ async fn attach_bolt_on_route(
     AxumPath(model_id): AxumPath<String>,
     Json(req): Json<AttachBoltOnRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    sanitize_model_id(&model_id)?;
+    prevent_path_traversal(&model_id)?;
     // M1-class gate: `adapter_path` becomes `{adapter_path}.train` and is read
     // for the LoRA sidecar. Without this check a POST could point at an
     // arbitrary file via `..`/absolute segments — the same traversal class the
@@ -736,7 +749,7 @@ async fn attach_bolt_on_route(
 async fn detach_bolt_on_route(
     AxumPath((model_id, slot)): AxumPath<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    sanitize_model_id(&model_id)?;
+    prevent_path_traversal(&model_id)?;
     let model_path = Path::new(&model_id);
     if !model_path.exists() {
         return Err((

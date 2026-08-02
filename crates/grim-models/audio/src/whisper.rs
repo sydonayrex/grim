@@ -8,7 +8,7 @@
 //! For phase 7 the modeling is structural and F32/CPU. ROCm kernels for
 //! the cross-attention path land in phase 4.
 
-use grim_backend_cpu::{cpu_tensor, CpuDevice};
+use grim_backend_cpu::{CpuDevice, cpu_tensor};
 use grim_core::error::{Error, Result};
 use grim_core::model::{EncoderDecoderLm, ModalityHint};
 use grim_core::{Model, ModelConfig};
@@ -33,9 +33,15 @@ pub struct WhisperConfig {
 }
 
 impl ModelConfig for WhisperConfig {
-    fn name(&self) -> &str { "whisper" }
-    fn modality(&self) -> ModalityHint { ModalityHint::AudioEncoderDecoder }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str {
+        "whisper"
+    }
+    fn modality(&self) -> ModalityHint {
+        ModalityHint::AudioEncoderDecoder
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Encoder block: pre-norm self-attention + MLP.
@@ -56,12 +62,24 @@ struct WhisperEncoderBlock {
 impl WhisperEncoderBlock {
     fn new(d_model: usize, num_heads: usize, ffn: usize, eps: f32, rng: &mut SimpleRng) -> Self {
         let head_dim = d_model / num_heads;
-        let wq = (0..num_heads * head_dim * d_model).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
-        let wk = (0..num_heads * head_dim * d_model).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
-        let wv = (0..num_heads * head_dim * d_model).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
-        let wo = (0..d_model * num_heads * head_dim).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
-        let fc1_w = (0..ffn * d_model).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
-        let fc2_w = (0..d_model * ffn).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
+        let wq = (0..num_heads * head_dim * d_model)
+            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .collect();
+        let wk = (0..num_heads * head_dim * d_model)
+            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .collect();
+        let wv = (0..num_heads * head_dim * d_model)
+            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .collect();
+        let wo = (0..d_model * num_heads * head_dim)
+            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .collect();
+        let fc1_w = (0..ffn * d_model)
+            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .collect();
+        let fc2_w = (0..d_model * ffn)
+            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .collect();
         Self {
             norm1: RmsNorm {
                 weight: cpu_tensor(vec![1.0; d_model], Shape::new(vec![d_model])),
@@ -89,17 +107,43 @@ impl WhisperEncoderBlock {
         }
     }
 
-    fn load(ws: &WeightSource<'_>, d_model: usize, num_heads: usize, ffn: usize, eps: f32) -> Result<Self> {
+    fn load(
+        ws: &WeightSource<'_>,
+        d_model: usize,
+        num_heads: usize,
+        ffn: usize,
+        eps: f32,
+    ) -> Result<Self> {
         let head_dim = d_model / num_heads;
-        let wq = ws.get([num_heads * head_dim, d_model], "attn.q.weight")?.to_vec_f32()?;
-        let wk = ws.get([num_heads * head_dim, d_model], "attn.k.weight")?.to_vec_f32()?;
-        let wv = ws.get([num_heads * head_dim, d_model], "attn.v.weight")?.to_vec_f32()?;
-        let wo = ws.get([d_model, num_heads * head_dim], "attn.o.weight")?.to_vec_f32()?;
+        let wq = ws
+            .get([num_heads * head_dim, d_model], "attn.q.weight")?
+            .to_vec_f32()?;
+        let wk = ws
+            .get([num_heads * head_dim, d_model], "attn.k.weight")?
+            .to_vec_f32()?;
+        let wv = ws
+            .get([num_heads * head_dim, d_model], "attn.v.weight")?
+            .to_vec_f32()?;
+        let wo = ws
+            .get([d_model, num_heads * head_dim], "attn.o.weight")?
+            .to_vec_f32()?;
         let norm1 = RmsNorm::load(&ws.pp("attn_norm"), d_model, eps)?;
         let norm2 = RmsNorm::load(&ws.pp("ffn_norm"), d_model, eps)?;
         let fc1 = Linear::load(&ws.pp("ffn.0"), d_model, ffn, true)?;
         let fc2 = Linear::load(&ws.pp("ffn.1"), ffn, d_model, true)?;
-        Ok(Self { norm1, wq, wk, wv, wo, norm2, fc1, fc2, d_model, num_heads, head_dim })
+        Ok(Self {
+            norm1,
+            wq,
+            wk,
+            wv,
+            wo,
+            norm2,
+            fc1,
+            fc2,
+            d_model,
+            num_heads,
+            head_dim,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -114,15 +158,28 @@ impl WhisperEncoderBlock {
         let normed = self.norm1.forward(x)?;
         let normed_data = normed.to_vec_f32()?;
 
-        let attn_out = self_attn(&normed_data, seq, d, nh, hd, sqrt_hd,
-            &self.wq, &self.wk, &self.wv, &self.wo, false);
+        let attn_out = self_attn(
+            &normed_data,
+            seq,
+            d,
+            nh,
+            hd,
+            sqrt_hd,
+            &self.wq,
+            &self.wk,
+            &self.wv,
+            &self.wo,
+            false,
+        );
 
         let mut after_attn = vec![0.0f32; seq * d];
         for i in 0..seq * d {
             after_attn[i] = x_data[i] + attn_out[i];
         }
 
-        let ffn_in = self.norm2.forward(&cpu_tensor(after_attn.clone(), Shape::new(vec![seq, d])))?;
+        let ffn_in = self
+            .norm2
+            .forward(&cpu_tensor(after_attn.clone(), Shape::new(vec![seq, d])))?;
         let ffn1 = self.fc1.forward(&ffn_in)?;
         let ffn1_gelu = gelu(&ffn1)?;
         let ffn2 = self.fc2.forward(&ffn1_gelu)?;
@@ -145,8 +202,19 @@ fn gelu(t: &Tensor) -> Result<Tensor> {
     Ok(cpu_tensor(out, t.shape().clone()))
 }
 
-fn self_attn(x: &[f32], seq: usize, d: usize, nh: usize, hd: usize, sqrt_hd: f32,
-    wq: &[f32], wk: &[f32], wv: &[f32], wo: &[f32], causal: bool) -> Vec<f32> {
+fn self_attn(
+    x: &[f32],
+    seq: usize,
+    d: usize,
+    nh: usize,
+    hd: usize,
+    sqrt_hd: f32,
+    wq: &[f32],
+    wk: &[f32],
+    wv: &[f32],
+    wo: &[f32],
+    causal: bool,
+) -> Vec<f32> {
     let project = |out: &mut [f32], w: &[f32]| {
         for pos in 0..seq {
             for o_idx in 0..d {
@@ -189,7 +257,9 @@ fn self_attn(x: &[f32], seq: usize, d: usize, nh: usize, hd: usize, sqrt_hd: f32
         for i in 0..seq {
             let mut max_v = scores[i * seq];
             for j in 1..seq {
-                if scores[i * seq + j] > max_v { max_v = scores[i * seq + j]; }
+                if scores[i * seq + j] > max_v {
+                    max_v = scores[i * seq + j];
+                }
             }
             let mut sum_e = 0.0;
             for j in 0..seq {
@@ -197,7 +267,9 @@ fn self_attn(x: &[f32], seq: usize, d: usize, nh: usize, hd: usize, sqrt_hd: f32
                 scores[i * seq + j] = e;
                 sum_e += e;
             }
-            for j in 0..seq { scores[i * seq + j] /= sum_e; }
+            for j in 0..seq {
+                scores[i * seq + j] /= sum_e;
+            }
         }
         for i in 0..seq {
             for hk in 0..hd {
@@ -223,9 +295,20 @@ fn self_attn(x: &[f32], seq: usize, d: usize, nh: usize, hd: usize, sqrt_hd: f32
     result
 }
 
-fn cross_attn(q_hidden: &[f32], enc_out: &[f32], seq: usize, enc_seq: usize,
-    d: usize, nh: usize, hd: usize, sqrt_hd: f32,
-    wq: &[f32], wk: &[f32], wv: &[f32], wo: &[f32]) -> Vec<f32> {
+fn cross_attn(
+    q_hidden: &[f32],
+    enc_out: &[f32],
+    seq: usize,
+    enc_seq: usize,
+    d: usize,
+    nh: usize,
+    hd: usize,
+    sqrt_hd: f32,
+    wq: &[f32],
+    wk: &[f32],
+    wv: &[f32],
+    wo: &[f32],
+) -> Vec<f32> {
     let project_q = |out: &mut [f32]| {
         for pos in 0..seq {
             for o_idx in 0..d {
@@ -272,7 +355,9 @@ fn cross_attn(q_hidden: &[f32], enc_out: &[f32], seq: usize, enc_seq: usize,
         for i in 0..seq {
             let mut max_v = scores[i * enc_seq];
             for j in 1..enc_seq {
-                if scores[i * enc_seq + j] > max_v { max_v = scores[i * enc_seq + j]; }
+                if scores[i * enc_seq + j] > max_v {
+                    max_v = scores[i * enc_seq + j];
+                }
             }
             let mut sum_e = 0.0;
             for j in 0..enc_seq {
@@ -280,7 +365,9 @@ fn cross_attn(q_hidden: &[f32], enc_out: &[f32], seq: usize, enc_seq: usize,
                 scores[i * enc_seq + j] = e;
                 sum_e += e;
             }
-            for j in 0..enc_seq { scores[i * enc_seq + j] /= sum_e; }
+            for j in 0..enc_seq {
+                scores[i * enc_seq + j] /= sum_e;
+            }
         }
         for i in 0..seq {
             for hk in 0..hd {
@@ -327,7 +414,14 @@ struct WhisperDecoderBlock {
 }
 
 impl WhisperDecoderBlock {
-    fn new(d_model: usize, num_heads: usize, ffn: usize, eps: f32, rng: &mut SimpleRng, device: Device) -> Self {
+    fn new(
+        d_model: usize,
+        num_heads: usize,
+        ffn: usize,
+        eps: f32,
+        rng: &mut SimpleRng,
+        device: Device,
+    ) -> Self {
         let head_dim = d_model / num_heads;
         let n = d_model;
         let self_q = (0..n * n).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
@@ -338,19 +432,29 @@ impl WhisperDecoderBlock {
         let cross_k = (0..n * n).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
         let cross_v = (0..n * n).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
         let cross_o = (0..n * n).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
-        let fc1_w = (0..ffn * d_model).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
-        let fc2_w = (0..d_model * ffn).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
+        let fc1_w = (0..ffn * d_model)
+            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .collect();
+        let fc2_w = (0..d_model * ffn)
+            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .collect();
         Self {
             self_norm: RmsNorm {
                 weight: cpu_tensor(vec![1.0; d_model], Shape::new(vec![d_model])),
                 eps,
             },
-            self_q, self_k, self_v, self_o,
+            self_q,
+            self_k,
+            self_v,
+            self_o,
             cross_norm: RmsNorm {
                 weight: cpu_tensor(vec![1.0; d_model], Shape::new(vec![d_model])),
                 eps,
             },
-            cross_q, cross_k, cross_v, cross_o,
+            cross_q,
+            cross_k,
+            cross_v,
+            cross_o,
             fc1: Linear::from_tensor(
                 cpu_tensor(fc1_w, Shape::new(vec![ffn, d_model])),
                 Some(cpu_tensor(vec![0.0; ffn], Shape::new(vec![ffn]))),
@@ -366,7 +470,14 @@ impl WhisperDecoderBlock {
         }
     }
 
-    fn load(ws: &WeightSource<'_>, d_model: usize, num_heads: usize, ffn: usize, eps: f32, device: Device) -> Result<Self> {
+    fn load(
+        ws: &WeightSource<'_>,
+        d_model: usize,
+        num_heads: usize,
+        ffn: usize,
+        eps: f32,
+        device: Device,
+    ) -> Result<Self> {
         let head_dim = d_model / num_heads;
         let n = d_model;
         let self_q = ws.get([n, n], "self_attn.q.weight")?.to_vec_f32()?;
@@ -381,7 +492,24 @@ impl WhisperDecoderBlock {
         let cross_norm = RmsNorm::load(&ws.pp("cross_attn_norm"), d_model, eps)?;
         let fc1 = Linear::load(&ws.pp("ffn.0"), d_model, ffn, true)?;
         let fc2 = Linear::load(&ws.pp("ffn.1"), ffn, d_model, true)?;
-        Ok(Self { self_norm, self_q, self_k, self_v, self_o, cross_norm, cross_q, cross_k, cross_v, cross_o, fc1, fc2, d_model, num_heads, head_dim, device })
+        Ok(Self {
+            self_norm,
+            self_q,
+            self_k,
+            self_v,
+            self_o,
+            cross_norm,
+            cross_q,
+            cross_k,
+            cross_v,
+            cross_o,
+            fc1,
+            fc2,
+            d_model,
+            num_heads,
+            head_dim,
+            device,
+        })
     }
 
     fn decode_step(&self, x: &Tensor, enc_out: &Tensor) -> Result<Tensor> {
@@ -397,15 +525,28 @@ impl WhisperDecoderBlock {
 
         let normed = self.self_norm.forward(x)?;
         let normed_data = normed.to_vec_f32()?;
-        let self_attn_out = self_attn(&normed_data, seq, d, nh, hd, sqrt_hd,
-            &self.self_q, &self.self_k, &self.self_v, &self.self_o, true);
+        let self_attn_out = self_attn(
+            &normed_data,
+            seq,
+            d,
+            nh,
+            hd,
+            sqrt_hd,
+            &self.self_q,
+            &self.self_k,
+            &self.self_v,
+            &self.self_o,
+            true,
+        );
 
         let mut after_self = vec![0.0f32; seq * d];
         for i in 0..seq * d {
             after_self[i] = x_data[i] + self_attn_out[i];
         }
 
-        let cross_normed = self.cross_norm.forward(&cpu_tensor(after_self.clone(), Shape::new(vec![seq, d])))?;
+        let cross_normed = self
+            .cross_norm
+            .forward(&cpu_tensor(after_self.clone(), Shape::new(vec![seq, d])))?;
         let cross_normed_data = cross_normed.to_vec_f32()?;
 
         // GPU dispatch path: cross-attention HIP kernel (Phase 2 — mambo5.md Item 13).
@@ -414,21 +555,67 @@ impl WhisperDecoderBlock {
         let cross_attn_out = if let Device::Rocm(ordinal) = self.device {
             #[cfg(feature = "rocm")]
             {
-                self.cross_attention_gpu(&cross_normed_data, &enc_data, seq, enc_seq, d, nh, hd, sqrt_hd, ordinal)
-                    .unwrap_or_else(|_| {
-                        cross_attn(&cross_normed_data, &enc_data, seq, enc_seq, d, nh, hd, sqrt_hd,
-                            &self.cross_q, &self.cross_k, &self.cross_v, &self.cross_o)
-                    })
+                self.cross_attention_gpu(
+                    &cross_normed_data,
+                    &enc_data,
+                    seq,
+                    enc_seq,
+                    d,
+                    nh,
+                    hd,
+                    sqrt_hd,
+                    ordinal,
+                )
+                .unwrap_or_else(|_| {
+                    cross_attn(
+                        &cross_normed_data,
+                        &enc_data,
+                        seq,
+                        enc_seq,
+                        d,
+                        nh,
+                        hd,
+                        sqrt_hd,
+                        &self.cross_q,
+                        &self.cross_k,
+                        &self.cross_v,
+                        &self.cross_o,
+                    )
+                })
             }
             #[cfg(not(feature = "rocm"))]
             {
                 let _ = ordinal;
-                cross_attn(&cross_normed_data, &enc_data, seq, enc_seq, d, nh, hd, sqrt_hd,
-                    &self.cross_q, &self.cross_k, &self.cross_v, &self.cross_o)
+                cross_attn(
+                    &cross_normed_data,
+                    &enc_data,
+                    seq,
+                    enc_seq,
+                    d,
+                    nh,
+                    hd,
+                    sqrt_hd,
+                    &self.cross_q,
+                    &self.cross_k,
+                    &self.cross_v,
+                    &self.cross_o,
+                )
             }
         } else {
-            cross_attn(&cross_normed_data, &enc_data, seq, enc_seq, d, nh, hd, sqrt_hd,
-                &self.cross_q, &self.cross_k, &self.cross_v, &self.cross_o)
+            cross_attn(
+                &cross_normed_data,
+                &enc_data,
+                seq,
+                enc_seq,
+                d,
+                nh,
+                hd,
+                sqrt_hd,
+                &self.cross_q,
+                &self.cross_k,
+                &self.cross_v,
+                &self.cross_o,
+            )
         };
 
         let mut after_cross = vec![0.0f32; seq * d];
@@ -436,7 +623,9 @@ impl WhisperDecoderBlock {
             after_cross[i] = after_self[i] + cross_attn_out[i];
         }
 
-        let ffn1 = self.fc1.forward(&cpu_tensor(after_cross.clone(), Shape::new(vec![seq, d])))?;
+        let ffn1 = self
+            .fc1
+            .forward(&cpu_tensor(after_cross.clone(), Shape::new(vec![seq, d])))?;
         let ffn1_gelu = gelu(&ffn1)?;
         let ffn2 = self.fc2.forward(&ffn1_gelu)?;
         let ffn_out = ffn2.to_vec_f32()?;
@@ -466,7 +655,7 @@ impl WhisperDecoderBlock {
         use grim_backend_rocm::RocmDevice;
         use grim_tensor::BackendDevice;
 
-        let dev = RocmDevice::new(ordinal);
+        let dev = RocmDevice::try_new(ordinal)?;
 
         // Project Q/K/V on CPU, then upload to GPU for cross-attention kernel.
         let q_data: Vec<f32> = (0..seq * d).map(|_| 0.0f32).collect();
@@ -474,13 +663,27 @@ impl WhisperDecoderBlock {
         let v_data: Vec<f32> = (0..enc_seq * d).map(|_| 0.0f32).collect();
 
         let q_gpu = dev.from_cpu(&q_data, &Shape::new(vec![seq, d]), grim_tensor::DType::F32)?;
-        let k_gpu = dev.from_cpu(&k_data, &Shape::new(vec![enc_seq, d]), grim_tensor::DType::F32)?;
-        let v_gpu = dev.from_cpu(&v_data, &Shape::new(vec![enc_seq, d]), grim_tensor::DType::F32)?;
+        let k_gpu = dev.from_cpu(
+            &k_data,
+            &Shape::new(vec![enc_seq, d]),
+            grim_tensor::DType::F32,
+        )?;
+        let v_gpu = dev.from_cpu(
+            &v_data,
+            &Shape::new(vec![enc_seq, d]),
+            grim_tensor::DType::F32,
+        )?;
 
         let out_shape = Shape::new(vec![seq, d]);
         let (attn_out, _) = dev.cross_attention(
-            q_gpu.as_ref(), k_gpu.as_ref(), v_gpu.as_ref(),
-            nh, hd, seq, enc_seq, &out_shape,
+            q_gpu.as_ref(),
+            k_gpu.as_ref(),
+            v_gpu.as_ref(),
+            nh,
+            hd,
+            seq,
+            enc_seq,
+            &out_shape,
         )?;
         attn_out.to_cpu_vec_f32()
     }
@@ -504,33 +707,62 @@ impl Whisper {
     }
 
     pub fn new(device: Device, cfg: WhisperConfig, rng: &mut SimpleRng) -> Self {
-        let tok_emb_w = (0..cfg.vocab_size * cfg.d_model).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
+        let tok_emb_w = (0..cfg.vocab_size * cfg.d_model)
+            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .collect();
         let tok_emb = Embedding {
             weight: cpu_tensor(tok_emb_w, Shape::new(vec![cfg.vocab_size, cfg.d_model])),
         };
-        let enc_in_proj_w = (0..cfg.d_model * cfg.n_mels).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
+        let enc_in_proj_w = (0..cfg.d_model * cfg.n_mels)
+            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .collect();
         let enc_in_proj = Linear::from_tensor(
             cpu_tensor(enc_in_proj_w, Shape::new(vec![cfg.d_model, cfg.n_mels])),
-            Some(cpu_tensor(vec![0.0; cfg.d_model], Shape::new(vec![cfg.d_model]))),
+            Some(cpu_tensor(
+                vec![0.0; cfg.d_model],
+                Shape::new(vec![cfg.d_model]),
+            )),
         );
         let enc_blocks = (0..cfg.num_enc_layers)
-            .map(|_| WhisperEncoderBlock::new(cfg.d_model, cfg.num_heads, cfg.ffn_dim, cfg.rms_norm_eps, rng))
+            .map(|_| {
+                WhisperEncoderBlock::new(
+                    cfg.d_model,
+                    cfg.num_heads,
+                    cfg.ffn_dim,
+                    cfg.rms_norm_eps,
+                    rng,
+                )
+            })
             .collect();
         let enc_norm = RmsNorm {
             weight: cpu_tensor(vec![1.0; cfg.d_model], Shape::new(vec![cfg.d_model])),
             eps: cfg.rms_norm_eps,
         };
         let dec_blocks = (0..cfg.num_dec_layers)
-            .map(|_| WhisperDecoderBlock::new(cfg.d_model, cfg.num_heads, cfg.ffn_dim, cfg.rms_norm_eps, rng, device.clone()))
+            .map(|_| {
+                WhisperDecoderBlock::new(
+                    cfg.d_model,
+                    cfg.num_heads,
+                    cfg.ffn_dim,
+                    cfg.rms_norm_eps,
+                    rng,
+                    device.clone(),
+                )
+            })
             .collect();
         let dec_norm = RmsNorm {
             weight: cpu_tensor(vec![1.0; cfg.d_model], Shape::new(vec![cfg.d_model])),
             eps: cfg.rms_norm_eps,
         };
-        let output_w = (0..cfg.vocab_size * cfg.d_model).map(|_| (rng.next_f32() - 0.5) * 0.02).collect();
+        let output_w = (0..cfg.vocab_size * cfg.d_model)
+            .map(|_| (rng.next_f32() - 0.5) * 0.02)
+            .collect();
         let output = Linear::from_tensor(
             cpu_tensor(output_w, Shape::new(vec![cfg.vocab_size, cfg.d_model])),
-            Some(cpu_tensor(vec![0.0; cfg.vocab_size], Shape::new(vec![cfg.vocab_size]))),
+            Some(cpu_tensor(
+                vec![0.0; cfg.vocab_size],
+                Shape::new(vec![cfg.vocab_size]),
+            )),
         );
         Self {
             cfg,
@@ -552,7 +784,10 @@ impl Whisper {
         for i in 0..cfg.num_enc_layers {
             enc_blocks.push(WhisperEncoderBlock::load(
                 &ws.pp(&format!("encoder.blocks.{i}")),
-                cfg.d_model, cfg.num_heads, cfg.ffn_dim, cfg.rms_norm_eps,
+                cfg.d_model,
+                cfg.num_heads,
+                cfg.ffn_dim,
+                cfg.rms_norm_eps,
             )?);
         }
         let enc_norm = RmsNorm::load(&ws.pp("encoder.norm"), cfg.d_model, cfg.rms_norm_eps)?;
@@ -560,20 +795,36 @@ impl Whisper {
         for i in 0..cfg.num_dec_layers {
             dec_blocks.push(WhisperDecoderBlock::load(
                 &ws.pp(&format!("decoder.blocks.{i}")),
-                cfg.d_model, cfg.num_heads, cfg.ffn_dim, cfg.rms_norm_eps,
+                cfg.d_model,
+                cfg.num_heads,
+                cfg.ffn_dim,
+                cfg.rms_norm_eps,
                 device.clone(),
             )?);
         }
         let dec_norm = RmsNorm::load(&ws.pp("decoder.norm"), cfg.d_model, cfg.rms_norm_eps)?;
         let output = Linear::load(&ws.pp("output"), cfg.d_model, cfg.vocab_size, true)?;
-        Ok(Self { cfg, device, tok_emb, enc_in_proj, enc_blocks, enc_norm, dec_blocks, dec_norm, output })
+        Ok(Self {
+            cfg,
+            device,
+            tok_emb,
+            enc_in_proj,
+            enc_blocks,
+            enc_norm,
+            dec_blocks,
+            dec_norm,
+            output,
+        })
     }
 
     /// Mel features over T frames → encoder_out (T, d_model).
     pub fn encode(&self, mel: &Tensor) -> Result<Tensor> {
         let shape = mel.shape().dims().to_vec();
         if shape.len() != 2 {
-            return Err(Error::Shape(format!("Whisper encode expects (n_mels, T), got {:?}", shape)));
+            return Err(Error::Shape(format!(
+                "Whisper encode expects (n_mels, T), got {:?}",
+                shape
+            )));
         }
         let (mel_bins, frames) = (shape[0], shape[1]);
         if mel_bins != self.cfg.n_mels {
@@ -606,7 +857,9 @@ impl Whisper {
     pub fn decode_step(&self, _enc_out: &Tensor, input_ids: &Tensor) -> Result<Tensor> {
         let ids_shape = input_ids.shape().dims().to_vec();
         if ids_shape.is_empty() || ids_shape[ids_shape.len() - 1] == 0 {
-            return Err(Error::Shape("Whisper decode_step expects non-empty ids".into()));
+            return Err(Error::Shape(
+                "Whisper decode_step expects non-empty ids".into(),
+            ));
         }
         let ids_data = input_ids.to_vec_f32()?;
         let ids: Vec<u32> = ids_data.iter().map(|x| *x as u32).collect();
@@ -623,10 +876,18 @@ impl Whisper {
 }
 
 impl Model for Whisper {
-    fn config(&self) -> &dyn ModelConfig { &self.cfg }
-    fn device(&self) -> &Device { &self.device }
-    fn param_arith(&self) -> ArithType { ArithType::F32 }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn config(&self) -> &dyn ModelConfig {
+        &self.cfg
+    }
+    fn device(&self) -> &Device {
+        &self.device
+    }
+    fn param_arith(&self) -> ArithType {
+        ArithType::F32
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl EncoderDecoderLm for Whisper {
@@ -755,7 +1016,10 @@ mod golden_attention {
             wv: identity_w(d_model),
             wo: identity_w(d_model),
             norm2: RmsNorm {
-                weight: cpu_tensor(vec![rms(&[2.0, 4.0, -2.0, -4.0]); d_model], Shape::new(vec![d_model])),
+                weight: cpu_tensor(
+                    vec![rms(&[2.0, 4.0, -2.0, -4.0]); d_model],
+                    Shape::new(vec![d_model]),
+                ),
                 eps,
             },
             fc1: zero_linear(d_model, ffn_dim),
@@ -814,7 +1078,10 @@ mod golden_attention {
             self_v: identity_w(d_model),
             self_o: identity_w(d_model),
             cross_norm: RmsNorm {
-                weight: cpu_tensor(vec![rms(&after_self_val); d_model], Shape::new(vec![d_model])),
+                weight: cpu_tensor(
+                    vec![rms(&after_self_val); d_model],
+                    Shape::new(vec![d_model]),
+                ),
                 eps,
             },
             cross_q: identity_w(d_model),
@@ -907,10 +1174,17 @@ mod golden_attention {
         };
 
         // Expected: x + 0.5 * gelu(2*x) — computed via same gelu().
-        let fc0_t = cpu_tensor(x.iter().map(|v| v * 2.0).collect(), Shape::new(vec![1, d_model]));
+        let fc0_t = cpu_tensor(
+            x.iter().map(|v| v * 2.0).collect(),
+            Shape::new(vec![1, d_model]),
+        );
         let gelu_t = gelu(&fc0_t).unwrap();
         let gelu_v = gelu_t.to_vec_f32().unwrap();
-        let expected: Vec<f32> = x.iter().enumerate().map(|(i, v)| v + 0.5 * gelu_v[i]).collect();
+        let expected: Vec<f32> = x
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v + 0.5 * gelu_v[i])
+            .collect();
 
         let input_t = cpu_tensor(x, Shape::new(vec![1, d_model]));
         let output_t = block.forward(&input_t).unwrap();

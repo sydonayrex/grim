@@ -112,12 +112,7 @@ pub trait EncoderDecoderLm: Model {
 pub trait DiffusionModel: Model {
     /// One denoising step. Returns the predicted noise (epsilon-prediction),
     /// velocity (v-prediction), or sample, depending on scheduler.
-    fn denoise_step(
-        &self,
-        latents: &Tensor,
-        timestep: &Tensor,
-        cond: &Tensor,
-    ) -> Result<Tensor>;
+    fn denoise_step(&self, latents: &Tensor, timestep: &Tensor, cond: &Tensor) -> Result<Tensor>;
     fn scheduler(&self) -> &dyn crate::model::NoiseScheduler;
 }
 

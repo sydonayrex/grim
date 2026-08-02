@@ -1,27 +1,4 @@
-//! SCYTHE-2 Capability Profiler (WI-2).
-//!
-//! Periodically sweeps every visible ROCm device with a 5-ms micro-GEMM
-//! benchmark to fill a live `GpuCapability` snapshot. The snapshot is cached
-//! for ~100 ms (the capability-epoch cadence derived in scythe2.md §3.6 from
-//! PowerTune thermal-hysteresis onset ~50–100 ms and micro-GEMM noise floor).
-//!
-//! The 100 ms figure is the geometric mean of the valid window and matches
-//! grim's existing `SelfTuningController` EMA cadence. Sub-50 ms thermal
-//! transients are filtered by AMD's firmware; sampling faster than 50 ms
-//! chases hysteresis noise. Sampling slower than 200 ms risks serving a stale
-//! placement for >1 throttle event.
-//!
-//! ## Staleness safety (scythe2.md §3.5)
-//! - Stale `tflops_fp16` / `throttle_pct` → suboptimal load-balance only;
-//!   never a correctness fault.
-//! - A GPU *leaving* (OOM / hot-unplug) → caller must call `bump_epoch` from
-//!   the device-lost handler before the next `PlacementCache` lookup. That
-//!   path is implemented in `grim-engine/src/scythe2.rs` (WI-4).
-//!
-//! Skill attribution:
-//! - `rust-ffi-grim` §2 — dynamic ROCm discovery via `probe_host_gpu`.
-//! - `rust-ffi-grim` §1.3 — null-pointer guard before every FFI call.
-//! - `rust-ffi-grim` §3 — `cargo check` gate after every change.
+//! SCYTHE-2 Capability Profiler (WI-2). [see: `GpuCapability`, `SelfTuningController`, `tflops_fp16`, `throttle_pct`]
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,13 +8,11 @@ use grim_tensor::backend::{GpuCapability, ScytheLink};
 use grim_tensor::error::Result;
 
 use crate::device::probe::{probe_host_gpu, probe_xnack};
-use crate::peer_access::{enumerate_devices, peer_status, P2PStatus};
+use crate::peer_access::{P2PStatus, enumerate_devices, peer_status};
 
 // ── HIP attributes needed for VRAM free / throttle ──────────────────────────
 
-/// HIP device attribute: active clock throttle reasons.
-/// Attribute 74 = `hipDeviceAttributeCurrentThermalThrottlePercent` on ROCm 6+.
-/// Falls back to 0 when the driver version is too old.
+/// HIP device attribute: active clock throttle reasons. [see: `hipDeviceAttributeCurrentThermalThrottlePercent`]
 const HIP_DEVICE_ATTR_THROTTLE: i32 = 74;
 
 /// HIP attribute: total global memory (bytes). Attribute 23.
@@ -45,23 +20,10 @@ const HIP_DEVICE_ATTR_TOTAL_MEM: i32 = 23; // hipDeviceAttributeTotalConstantMem
 
 // ── Public surface ────────────────────────────────────────────────────────────
 
-/// SCYTHE-2 capability epoch counter.
-///
-/// Bumped by `CapabilityProfiler::bump_epoch` when a GPU joins or leaves the
-/// farm, or when a >10% throttle delta is detected between two ticks (the
-/// out-of-band escape hatch from scythe2.md §3.6). The engine's
-/// `PlacementCache` clears its fast array on an epoch bump, triggering a
-/// fresh `decide_miss()` on the next forward pass.
-///
-/// Global so that the device-lost path in `grim-disagg` can bump it without
-/// holding a reference to the `CapabilityProfiler`.
+/// SCYTHE-2 capability epoch counter. [see: `CapabilityProfiler::bump_epoch`, `PlacementCache`, `decide_miss()`, `grim-disagg`]
 pub static CAPABILITY_EPOCH: AtomicU32 = AtomicU32::new(0);
 
-/// Bump the global capability epoch.
-///
-/// Must be called from the ROCm device-lost / OOM-recovery path (WI-8)
-/// *before* the next `PlacementCache::get()` returns, so that `r` (placement
-/// vector) is never dispatched to a gone GPU. See scythe2.md §3.5 mode B.
+/// Bump the global capability epoch. [see: `PlacementCache::get()`, `r`]
 pub fn bump_epoch() {
     CAPABILITY_EPOCH.fetch_add(1, Ordering::Release);
 }
@@ -71,13 +33,7 @@ pub fn current_epoch() -> u32 {
     CAPABILITY_EPOCH.load(Ordering::Acquire)
 }
 
-/// Per-GPU live capability snapshot builder and epoch manager.
-///
-/// Usage:
-/// 1. Call `CapabilityProfiler::new()` once at startup.
-/// 2. Spawn a background thread that calls `tick()` every 100 ms.
-/// 3. Call `capabilities()` from the controller to get the latest snapshot.
-/// 4. Call `bump_epoch()` (free function) from the device-lost path.
+/// Per-GPU live capability snapshot builder and epoch manager. [see: `CapabilityProfiler::new()`, `tick()`, `capabilities()`, `bump_epoch()`]
 pub struct CapabilityProfiler {
     inner: Arc<Mutex<ProfilerState>>,
 }
@@ -108,11 +64,7 @@ impl CapabilityProfiler {
         }
     }
 
-    /// Refresh the capability snapshot for every GPU.
-    ///
-    /// Expected call cadence: every 100 ms. If `throttle_pct` delta exceeds
-    /// 10% for any GPU since the last tick, triggers an out-of-band
-    /// `bump_epoch()` immediately (scythe2.md §3.6 escape hatch).
+    /// Refresh the capability snapshot for every GPU. [see: `throttle_pct`, `bump_epoch()`]
     pub fn tick(&self) {
         let num_gpus = enumerate_devices().unwrap_or(0);
         let mut state = self.inner.lock().expect("CapabilityProfiler lock poisoned");
@@ -142,16 +94,16 @@ impl CapabilityProfiler {
         }
     }
 
-    /// Return a snapshot of current capabilities for all visible GPUs.
-    ///
-    /// Used by `C2plrController::decide_miss()` to populate the MLP input.
+    /// Return a snapshot of current capabilities for all visible GPUs. [see: `C2plrController::decide_miss()`]
     pub fn capabilities(&self) -> Vec<GpuCapability> {
-        self.inner.lock().expect("CapabilityProfiler lock poisoned").caps.clone()
+        self.inner
+            .lock()
+            .expect("CapabilityProfiler lock poisoned")
+            .caps
+            .clone()
     }
 
-    /// Build a K×K link matrix using the existing `peer_status` probe.
-    ///
-    /// Returns a flattened `Vec<ScytheLink>` suitable for `ScythePlacement::routes`.
+    /// Build a K×K link matrix using the existing `peer_status` probe. [see: `Vec<ScytheLink>`, `ScythePlacement::routes`]
     pub fn link_matrix(num_gpus: usize) -> Vec<ScytheLink> {
         let k = num_gpus;
         let mut matrix = vec![ScytheLink::Host; k * k];
@@ -172,31 +124,32 @@ impl CapabilityProfiler {
     }
 
     /// Duration since the last `tick()`. Useful for callers that manage their
-    /// own tick scheduling and want to check staleness.
     pub fn age(&self) -> Duration {
-        self.inner.lock().expect("CapabilityProfiler lock poisoned").last_tick.elapsed()
+        self.inner
+            .lock()
+            .expect("CapabilityProfiler lock poisoned")
+            .last_tick
+            .elapsed()
     }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// Measure one GPU's capability snapshot via HIP attributes + micro-GEMM.
-///
-/// The 5-ms micro-GEMM (Piper-style resource modelling, `2605.05049`) is the
-/// primary TFLOPS estimator. `hipDeviceGetAttribute` fills in the rest.
+/// Measure one GPU's capability snapshot via HIP attributes + micro-GEMM. [see: `2605.05049`, `hipDeviceGetAttribute`]
 fn measure_capability(ordinal: usize) -> GpuCapability {
     // Base probe from the existing infrastructure.
     let host_cap = match probe_host_gpu(ordinal) {
         Ok(c) => c,
         Err(_) => {
             // GPU disappeared between `enumerate_devices` and this probe.
-            // Return a zeroed capability so the controller avoids this GPU.
-            return GpuCapability { ordinal, ..Default::default() };
+            return GpuCapability {
+                ordinal,
+                ..Default::default()
+            };
         }
     };
 
     // Wavefront size → estimate peak FLOPS from clock * CUs.
-    // Real estimate requires VRAM info; we use a heuristic table keyed on arch.
     let (tflops_fp16, tflops_fp8, hbm_gbps) = arch_tflops_table(&host_cap.gcn);
 
     // Throttle percentage via HIP attribute.
@@ -218,13 +171,7 @@ fn measure_capability(ordinal: usize) -> GpuCapability {
     }
 }
 
-/// Architecture TFLOPS table — offline values per GCN arch string.
-///
-/// This is the "structural coefficient table" analogous to WaveTune's Table-A
-/// (`2604.10187` §4.4): a tiny lookup, not a candidate-loop. Values are
-/// conservative nominal throughputs; `throttle_pct` is applied on top.
-///
-/// Returns `(tflops_fp16, tflops_fp8, hbm_gbps)`.
+/// Architecture TFLOPS table — offline values per GCN arch string. [see: `2604.10187`, `throttle_pct`]
 fn arch_tflops_table(gcn: &str) -> (f32, f32, f32) {
     // RDNA 3 / GFX11xx — RX 7900 XTX ≈ 61 TFLOPS FP16, 8 GB/s per mm²
     if gcn.starts_with("gfx11") {
@@ -253,15 +200,11 @@ fn arch_tflops_table(gcn: &str) -> (f32, f32, f32) {
 }
 
 /// Query the thermal throttle fraction [0, 1] for `ordinal`.
-///
-/// Returns 0.0 if the attribute is unavailable (old driver / GPU-less box).
 fn query_throttle_pct(ordinal: usize) -> f32 {
     let mut val: i32 = 0;
     // SAFETY: `hipDeviceGetAttribute` is safe to call with a valid ordinal.
-    // The attribute ID 74 may not exist on old ROCm — the return code is
-    // checked and we fall back to 0.0 (no throttle assumed).
     unsafe {
-        use crate::device::handles::{hipSetDevice, hipDeviceGetAttribute};
+        use crate::device::handles::{hipDeviceGetAttribute, hipSetDevice};
         let _ = hipSetDevice(ordinal as i32);
         let status = hipDeviceGetAttribute(&mut val, HIP_DEVICE_ATTR_THROTTLE, ordinal as i32);
         if status != 0 {
@@ -273,23 +216,16 @@ fn query_throttle_pct(ordinal: usize) -> f32 {
 }
 
 /// Query free VRAM in bytes via `hipMemGetInfo`.
-///
-/// Returns 0 on error (GPU-less box, or not the active context).
 fn query_vram_free(ordinal: usize) -> u64 {
     vram_info(ordinal).0
 }
 
-/// Query `(free_bytes, total_bytes)` VRAM via `hipMemGetInfo`.
-///
-/// This is the public entry point for callers outside the profiler (e.g. the
-/// training worker's metric reporting) that need live VRAM usage. Returns
-/// `(0, 0)` on a GPU-less box or when the HIP call fails — callers should
-/// treat 0 as "unknown" rather than "empty".
+/// Query `(free_bytes, total_bytes)` VRAM via `hipMemGetInfo`. [see: `(0, 0)`]
 pub fn vram_info(ordinal: usize) -> (u64, u64) {
     let mut free: usize = 0;
     let mut total: usize = 0;
     unsafe {
-        use crate::device::handles::{hipSetDevice, hipMemGetInfo};
+        use crate::device::handles::{hipMemGetInfo, hipSetDevice};
         let _ = hipSetDevice(ordinal as i32);
         let status = hipMemGetInfo(&mut free, &mut total);
         if status != 0 {
@@ -318,14 +254,15 @@ mod tests {
     /// Arch table must never return zero TFLOPS (avoid division-by-zero in controller).
     #[test]
     fn test_arch_tflops_nonzero() {
-        for gcn in &["gfx1100", "gfx1102", "gfx1200", "gfx942", "gfx1036", "gfx0000"] {
+        for gcn in &[
+            "gfx1100", "gfx1102", "gfx1200", "gfx942", "gfx1036", "gfx0000",
+        ] {
             let (fp16, _, _) = arch_tflops_table(gcn);
             assert!(fp16 > 0.0, "arch_tflops_table({gcn}) returned 0 TFLOPS");
         }
     }
 
     /// `CapabilityProfiler::new()` must not panic on a GPU-less box.
-    /// The returned capability list may be empty, but the call must succeed.
     #[test]
     fn test_profiler_new_gpu_less() {
         let profiler = CapabilityProfiler::new();
@@ -346,7 +283,11 @@ mod tests {
         let matrix = CapabilityProfiler::link_matrix(n);
         assert_eq!(matrix.len(), n * n);
         for i in 0..n {
-            assert_eq!(matrix[i * n + i], ScytheLink::PeerDirect, "self-link for GPU {i}");
+            assert_eq!(
+                matrix[i * n + i],
+                ScytheLink::PeerDirect,
+                "self-link for GPU {i}"
+            );
         }
     }
 

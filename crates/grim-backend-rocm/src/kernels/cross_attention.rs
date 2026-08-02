@@ -1,14 +1,4 @@
 //! Cross-attention kernel for Whisper decoder (Item 13).
-//!
-//! Whisper cross-attention computes Q @ K_encoder^T where K/V come from the
-//! encoder output (projected once, reused across all decoder steps).
-//! One block per (dec_step, num_heads). Each thread computes one
-//! encoder position's attention weight for one query position.
-//!
-//! Layout references (from grim-models/audio/src/whisper.rs):
-//! W_q ∈ R^{d_model × d_model}, W_k ∈ R^{d_model × d_model},
-//! W_v ∈ R^{d_model × d_model}, W_o ∈ R^{d_model × d_model}.
-//! Encoder output: enc_out ∈ R^{enc_seq × d_model}.
 
 /// HIP source for `grim_cross_attention` (Whisper decoder cross-attention).
 pub const KERNEL_SOURCE: &str = r#"

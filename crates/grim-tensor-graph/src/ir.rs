@@ -1,7 +1,4 @@
-//! Computation Graph Intermediate Representation for Grim model fusion.
-//!
-//! This is a Burn-inspired IR that splits a model into typed `GraphNode`s and
-//! then identifies fusable sequences (e.g. RmsNorm + MatMul -> fused_rmsnorm_matmul_rocm).
+//! Burn-inspired IR: splits models into `GraphNode`s, identifies fusable sequences (e.g. RmsNorm + MatMul -> fused_rmsnorm_matmul_rocm).
 
 use grim_tensor::{ArithType, Shape};
 
@@ -34,7 +31,7 @@ pub struct ComputationGraph {
     pub fusion_candidates: Vec<FusionSequence>,
 }
 
-/// A contiguous sequence of graph ops that can be fused into one backend operation.
+/// A contiguous sequence of ops fused into one backend op.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FusionSequence {
     pub ops: Vec<OpType>,
@@ -56,11 +53,7 @@ impl ComputationGraph {
         id
     }
 
-    /// Identify fusable operation sequences from the graph in node order.
-    ///
-    /// Detects:
-    /// - `RmsNorm` followed by `MatMul` or `Linear` -> `fused_rmsnorm_matmul_rocm`
-    /// - `QkvProjection` followed by `AttentionScore` -> `fused_qkv_attention_rocm`
+    /// Identifies fusable op sequences in node order: RmsNorm→(MatMul|Linear)→fused_rmsnorm_matmul_rocm; QkvProjection→AttentionScore→fused_qkv_attention_rocm.
     pub fn identify_fusion_sequences(&mut self) {
         self.fusion_candidates.clear();
         let mut current: Vec<OpType> = Vec::new();
@@ -71,13 +64,23 @@ impl ComputationGraph {
                 OpType::MatMul | OpType::Linear
                     if matches!(current.last(), Some(&OpType::RmsNorm)) =>
                 {
-                    Self::complete_sequence(&mut current, node.op_type.clone(), "fused_rmsnorm_matmul_rocm", &mut self.fusion_candidates);
+                    Self::complete_sequence(
+                        &mut current,
+                        node.op_type.clone(),
+                        "fused_rmsnorm_matmul_rocm",
+                        &mut self.fusion_candidates,
+                    );
                 }
                 OpType::QkvProjection => Self::start_sequence(&mut current, OpType::QkvProjection),
                 OpType::AttentionScore
                     if matches!(current.last(), Some(&OpType::QkvProjection)) =>
                 {
-                    Self::complete_sequence(&mut current, node.op_type.clone(), "fused_qkv_attention_rocm", &mut self.fusion_candidates);
+                    Self::complete_sequence(
+                        &mut current,
+                        node.op_type.clone(),
+                        "fused_qkv_attention_rocm",
+                        &mut self.fusion_candidates,
+                    );
                 }
                 _ => current.clear(),
             }
@@ -144,7 +147,10 @@ mod tests {
         g.push(OpType::AttentionScore, "scores");
         g.identify_fusion_sequences();
         assert_eq!(g.fusion_candidates.len(), 1);
-        assert_eq!(g.fusion_candidates[0].target_backend_op, "fused_qkv_attention_rocm");
+        assert_eq!(
+            g.fusion_candidates[0].target_backend_op,
+            "fused_qkv_attention_rocm"
+        );
     }
 
     #[test]
@@ -173,8 +179,14 @@ mod tests {
         g.push(OpType::MatMul, "out2");
         g.identify_fusion_sequences();
         assert_eq!(g.fusion_candidates.len(), 2);
-        assert_eq!(g.fusion_candidates[0].target_backend_op, "fused_rmsnorm_matmul_rocm");
-        assert_eq!(g.fusion_candidates[1].target_backend_op, "fused_rmsnorm_matmul_rocm");
+        assert_eq!(
+            g.fusion_candidates[0].target_backend_op,
+            "fused_rmsnorm_matmul_rocm"
+        );
+        assert_eq!(
+            g.fusion_candidates[1].target_backend_op,
+            "fused_rmsnorm_matmul_rocm"
+        );
     }
 
     #[test]

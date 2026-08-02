@@ -1,8 +1,6 @@
+use grim_backend_rocm::{BlockTableEntry, RocmDevice, launch_paged_attention};
+use grim_tensor::{BackendDevice, BackendStorage, DType, Shape};
 use std::sync::Arc;
-use grim_backend_rocm::{
-    RocmDevice, BlockTableEntry, launch_paged_attention,
-};
-use grim_tensor::{Shape, DType, BackendDevice, BackendStorage};
 
 #[test]
 fn test_paged_attention_gpu_matches_reference() {
@@ -11,7 +9,10 @@ fn test_paged_attention_gpu_matches_reference() {
         return;
     }
 
-    let dev = Arc::new(RocmDevice::new(0));
+    let dev = Arc::new(
+        RocmDevice::try_new(0)
+            .expect("RocmDevice::try_new(0) should succeed on a system with ROCm"),
+    );
 
     let batch = 1u32;
     let num_heads = 2u32;
@@ -45,8 +46,14 @@ fn test_paged_attention_gpu_matches_reference() {
 
     // Create block table
     let table_entries = vec![
-        BlockTableEntry { block_id: 0, page_size: 4 },
-        BlockTableEntry { block_id: 1, page_size: 4 },
+        BlockTableEntry {
+            block_id: 0,
+            page_size: 4,
+        },
+        BlockTableEntry {
+            block_id: 1,
+            page_size: 4,
+        },
     ];
     // Cast the struct slice to an f32 slice to copy via RocmDevice::from_cpu
     let table_f32: &[f32] = unsafe {
@@ -55,11 +62,13 @@ fn test_paged_attention_gpu_matches_reference() {
             table_entries.len() * 2,
         )
     };
-    let table_storage = dev.from_cpu(
-        table_f32,
-        &Shape::new(vec![batch as usize, max_blocks as usize, 2]),
-        DType::F32,
-    ).unwrap();
+    let table_storage = dev
+        .from_cpu(
+            table_f32,
+            &Shape::new(vec![batch as usize, max_blocks as usize, 2]),
+            DType::F32,
+        )
+        .unwrap();
 
     // Launch
     let res = launch_paged_attention(
@@ -79,7 +88,11 @@ fn test_paged_attention_gpu_matches_reference() {
         cache_offset,
     );
 
-    assert!(res.is_ok(), "launch_paged_attention failed: {:?}", res.err());
+    assert!(
+        res.is_ok(),
+        "launch_paged_attention failed: {:?}",
+        res.err()
+    );
 
     // Read back output
     let out_cpu = out_storage.to_cpu_vec_f32().unwrap();
@@ -88,17 +101,21 @@ fn test_paged_attention_gpu_matches_reference() {
     // Reconstruct flat K and V from pages
     let mut k_flat = vec![0.0f32; (kv_seq_len * num_kv_heads * head_dim) as usize];
     let mut v_flat = vec![0.0f32; (kv_seq_len * num_kv_heads * head_dim) as usize];
-    
+
     for b in 0..max_blocks {
         let entry = table_entries[b as usize];
         for t in 0..entry.page_size {
             let j = (b * page_size + t) as usize;
-            if j >= kv_seq_len as usize { break; }
+            if j >= kv_seq_len as usize {
+                break;
+            }
             let physical_token = entry.block_id * page_size + t;
-            
+
             for h_kv in 0..num_kv_heads as usize {
                 for d in 0..head_dim as usize {
-                    let page_offset = ((physical_token as usize * num_kv_heads as usize + h_kv) * head_dim as usize) + d;
+                    let page_offset = ((physical_token as usize * num_kv_heads as usize + h_kv)
+                        * head_dim as usize)
+                        + d;
                     let flat_offset = ((j * num_kv_heads as usize + h_kv) * head_dim as usize) + d;
                     k_flat[flat_offset] = k_cpu[page_offset];
                     v_flat[flat_offset] = v_cpu[page_offset];
@@ -110,13 +127,13 @@ fn test_paged_attention_gpu_matches_reference() {
     // CPU reference attention logic
     let mut want_out = vec![0.0f32; 16];
     let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
-    
+
     for h in 0..num_heads as usize {
         let kv_head = h / (num_heads as usize / num_kv_heads as usize);
-        
+
         let mut scores = vec![0.0f32; kv_seq_len as usize];
         let mut max_score = -1e30f32;
-        
+
         for j in 0..kv_seq_len as usize {
             let mut dot = 0.0f32;
             for d in 0..head_dim as usize {
@@ -130,7 +147,7 @@ fn test_paged_attention_gpu_matches_reference() {
                 max_score = score;
             }
         }
-        
+
         let mut sum_exp = 0.0f32;
         let mut exp_scores = vec![0.0f32; kv_seq_len as usize];
         for j in 0..kv_seq_len as usize {
@@ -138,7 +155,7 @@ fn test_paged_attention_gpu_matches_reference() {
             exp_scores[j] = val;
             sum_exp += val;
         }
-        
+
         for d in 0..head_dim as usize {
             let mut val_acc = 0.0f32;
             for j in 0..kv_seq_len as usize {
@@ -158,7 +175,10 @@ fn test_paged_attention_gpu_matches_reference() {
         assert!(
             diff / denom < 1e-3,
             "Divergence at index {}: got {}, want {} (rel diff: {})",
-            i, got, want, diff / denom
+            i,
+            got,
+            want,
+            diff / denom
         );
     }
 }

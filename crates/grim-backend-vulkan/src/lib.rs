@@ -1,7 +1,4 @@
-//! Vulkan backend for Grim.
-//!
-//! Provides the `VulkanDevice` and `VulkanStorage` structs implementing the `BackendDevice`
-//! and `BackendStorage` traits from `grim-tensor` by wrapping Vulkan FFI bindings.
+//! Cross-platform Vulkan compute backend with compiled SPIR-V shaders.
 
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -11,7 +8,7 @@ use grim_tensor::dtype::{ArithType, DType, QuantProvenance};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendDevice, BackendStorage, Shape};
 
-// ---------- Vulkan FFI types and constants ----------
+// Vulkan FFI types and constants
 
 pub type VkFlags = u32;
 pub type VkDeviceSize = u64;
@@ -102,15 +99,13 @@ pub struct VkPhysicalDeviceMemoryProperties {
     pub memory_heaps: [VkMemoryHeap; 16],
 }
 
-
 pub const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: u32 = 1;
 pub const VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO: u32 = 2;
 pub const VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO: u32 = 3;
 pub const VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: u32 = 12;
 pub const VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO: u32 = 5;
 
-// Physical device types. Used to reject software rasterizers (lavapipe /
-// swiftshader) so they are never reported as a live GPU tier.
+// Physical device types. Rejects software rasterizers (lavapipe/swiftshader).
 pub const VK_PHYSICAL_DEVICE_TYPE_OTHER: u32 = 0;
 pub const VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: u32 = 1;
 pub const VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: u32 = 2;
@@ -150,7 +145,6 @@ pub const VK_SHARING_MODE_EXCLUSIVE: u32 = 0;
 
 pub const VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT: u32 = 0x00000002;
 pub const VK_MEMORY_PROPERTY_HOST_COHERENT_BIT: u32 = 0x00000004;
-
 
 pub const VK_SUCCESS: i32 = 0;
 
@@ -405,11 +399,7 @@ unsafe extern "C" {
         pAllocator: *const c_void,
         pDescriptorPool: *mut u64,
     ) -> i32;
-    fn vkDestroyDescriptorPool(
-        device: *mut c_void,
-        descriptorPool: u64,
-        pAllocator: *const c_void,
-    );
+    fn vkDestroyDescriptorPool(device: *mut c_void, descriptorPool: u64, pAllocator: *const c_void);
     fn vkAllocateDescriptorSets(
         device: *mut c_void,
         pAllocateInfo: *const VkDescriptorSetAllocateInfo,
@@ -428,22 +418,14 @@ unsafe extern "C" {
         pAllocator: *const c_void,
         pShaderModule: *mut u64,
     ) -> i32;
-    fn vkDestroyShaderModule(
-        device: *mut c_void,
-        shaderModule: u64,
-        pAllocator: *const c_void,
-    );
+    fn vkDestroyShaderModule(device: *mut c_void, shaderModule: u64, pAllocator: *const c_void);
     fn vkCreatePipelineLayout(
         device: *mut c_void,
         pCreateInfo: *const VkPipelineLayoutCreateInfo,
         pAllocator: *const c_void,
         pPipelineLayout: *mut u64,
     ) -> i32;
-    fn vkDestroyPipelineLayout(
-        device: *mut c_void,
-        pipelineLayout: u64,
-        pAllocator: *const c_void,
-    );
+    fn vkDestroyPipelineLayout(device: *mut c_void, pipelineLayout: u64, pAllocator: *const c_void);
     fn vkCreateComputePipelines(
         device: *mut c_void,
         pipelineCache: u64,
@@ -470,11 +452,7 @@ unsafe extern "C" {
         pBeginInfo: *const VkCommandBufferBeginInfo,
     ) -> i32;
     fn vkEndCommandBuffer(commandBuffer: *mut c_void) -> i32;
-    fn vkCmdBindPipeline(
-        commandBuffer: *mut c_void,
-        pipelineBindPoint: u32,
-        pipeline: u64,
-    );
+    fn vkCmdBindPipeline(commandBuffer: *mut c_void, pipelineBindPoint: u32, pipeline: u64);
     fn vkCmdBindDescriptorSets(
         commandBuffer: *mut c_void,
         pipelineBindPoint: u32,
@@ -508,7 +486,7 @@ unsafe extern "C" {
     fn vkQueueWaitIdle(queue: *mut c_void) -> i32;
 }
 
-// ---------- Vulkan Helper Context ----------
+// Vulkan helper context
 
 struct VulkanContext {
     instance: *mut c_void,
@@ -521,15 +499,11 @@ struct VulkanContext {
 unsafe impl Send for VulkanContext {}
 unsafe impl Sync for VulkanContext {}
 
-
 impl VulkanContext {
     fn init() -> Result<Self> {
-        // NOTE: Do NOT force `ENABLE_PRIMUS_LAYER` here. The Primus/Bumblebee
-        // layer only helps dual-GPU Optimus laptops and *requires* an X
-        // display; forcing it on headless / GPU-direct hosts breaks loader
-        // initialization ("Can't open bumblebee display"). The Vulkan loader
-        // resolves the native ICD without it, so we leave the environment
-        // untouched and let the loader pick the default.
+        // Do NOT enable the Primus/Bumblebee layer; it requires an X display and
+        // breaks headless/GPU-direct hosts. The loader resolves the native
+        // ICD without it.
         let instance_ci = VkInstanceCreateInfo {
             s_type: VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
             p_next: std::ptr::null(),
@@ -544,7 +518,10 @@ impl VulkanContext {
         let mut instance: *mut c_void = std::ptr::null_mut();
         let res = unsafe { vkCreateInstance(&instance_ci, std::ptr::null(), &mut instance) };
         if res != VK_SUCCESS {
-            return Err(Error::Backend(format!("vkCreateInstance failed with status {}", res)));
+            return Err(Error::Backend(format!(
+                "vkCreateInstance failed with status {}",
+                res
+            )));
         }
 
         let mut gpu_count: u32 = 0;
@@ -552,7 +529,9 @@ impl VulkanContext {
             vkEnumeratePhysicalDevices(instance, &mut gpu_count, std::ptr::null_mut());
         }
         if gpu_count == 0 {
-            unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+            unsafe {
+                vkDestroyInstance(instance, std::ptr::null());
+            }
             return Err(Error::Backend("No Vulkan physical devices found".into()));
         }
 
@@ -562,9 +541,8 @@ impl VulkanContext {
         }
         let physical_device = gpus[0];
 
-        // Reject software rasterizers (lavapipe / swiftshader / llvmpipe). On a
-        // host that already has real ROCm + CUDA GPUs there is no reason to run
-        // a headless/CPU Vulkan tier; and §3 forbids reporting a fake GPU.
+        // Reject software rasterizers (lavapipe/swiftshader/llvmpipe) — never
+        // report a CPU tier as a live GPU (§3).
         let mut props = VkPhysicalDeviceProperties {
             api_version: 0,
             driver_version: 0,
@@ -575,7 +553,9 @@ impl VulkanContext {
         };
         unsafe { vkGetPhysicalDeviceProperties(physical_device, &mut props) };
         if props.device_type == VK_PHYSICAL_DEVICE_TYPE_CPU {
-            unsafe { vkDestroyInstance(instance, std::ptr::null()); }
+            unsafe {
+                vkDestroyInstance(instance, std::ptr::null());
+            }
             return Err(Error::Backend(
                 "Vulkan physical device is a software rasterizer (CPU); refusing to use it as a GPU tier".into(),
             ));
@@ -584,22 +564,37 @@ impl VulkanContext {
         // Find compute queue family index
         let mut qfam_count: u32 = 0;
         unsafe {
-            vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &mut qfam_count, std::ptr::null_mut());
+            vkGetPhysicalDeviceQueueFamilyProperties(
+                physical_device,
+                &mut qfam_count,
+                std::ptr::null_mut(),
+            );
         }
         if qfam_count == 0 {
-            unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-            return Err(Error::Backend("No queue families found on Vulkan physical device".into()));
+            unsafe {
+                vkDestroyInstance(instance, std::ptr::null());
+            }
+            return Err(Error::Backend(
+                "No queue families found on Vulkan physical device".into(),
+            ));
         }
-        let mut qfam_props = vec![VkQueueFamilyProperties {
-            queue_flags: 0,
-            queue_count: 0,
-            min_image_transfer_granularity_width: 0,
-            min_image_transfer_granularity_height: 0,
-            min_image_transfer_granularity_depth: 0,
-            timestamp_valid_bits: 0,
-        }; qfam_count as usize];
+        let mut qfam_props = vec![
+            VkQueueFamilyProperties {
+                queue_flags: 0,
+                queue_count: 0,
+                min_image_transfer_granularity_width: 0,
+                min_image_transfer_granularity_height: 0,
+                min_image_transfer_granularity_depth: 0,
+                timestamp_valid_bits: 0,
+            };
+            qfam_count as usize
+        ];
         unsafe {
-            vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &mut qfam_count, qfam_props.as_mut_ptr());
+            vkGetPhysicalDeviceQueueFamilyProperties(
+                physical_device,
+                &mut qfam_count,
+                qfam_props.as_mut_ptr(),
+            );
         }
         let mut compute_family_index = None;
         for i in 0..qfam_count {
@@ -611,8 +606,12 @@ impl VulkanContext {
         let compute_family_index = match compute_family_index {
             Some(idx) => idx,
             None => {
-                unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-                return Err(Error::Backend("No compute queue family found on Vulkan physical device".into()));
+                unsafe {
+                    vkDestroyInstance(instance, std::ptr::null());
+                }
+                return Err(Error::Backend(
+                    "No compute queue family found on Vulkan physical device".into(),
+                ));
             }
         };
 
@@ -640,10 +639,16 @@ impl VulkanContext {
         };
 
         let mut device: *mut c_void = std::ptr::null_mut();
-        let res = unsafe { vkCreateDevice(physical_device, &device_ci, std::ptr::null(), &mut device) };
+        let res =
+            unsafe { vkCreateDevice(physical_device, &device_ci, std::ptr::null(), &mut device) };
         if res != VK_SUCCESS {
-            unsafe { vkDestroyInstance(instance, std::ptr::null()); }
-            return Err(Error::Backend(format!("vkCreateDevice failed with status {}", res)));
+            unsafe {
+                vkDestroyInstance(instance, std::ptr::null());
+            }
+            return Err(Error::Backend(format!(
+                "vkCreateDevice failed with status {}",
+                res
+            )));
         }
 
         let mut queue: *mut c_void = std::ptr::null_mut();
@@ -678,7 +683,7 @@ lazy_static::lazy_static! {
     static ref GLOBAL_CONTEXT: Mutex<Option<VulkanContext>> = Mutex::new(VulkanContext::init().ok());
 }
 
-// ---------- Vulkan Crate Structs ----------
+// Vulkan crate structs
 
 /// A handle to a Vulkan compute operation.
 #[derive(Debug)]
@@ -709,10 +714,14 @@ pub struct VulkanStorage {
 unsafe impl Send for VulkanStorage {}
 unsafe impl Sync for VulkanStorage {}
 
-
 impl VulkanStorage {
     /// Allocates memory and a buffer on the Vulkan device.
-    pub fn alloc_gpu(shape: &Shape, dtype: DType, device: *mut c_void, physical_device: *mut c_void) -> Result<Self> {
+    pub fn alloc_gpu(
+        shape: &Shape,
+        dtype: DType,
+        device: *mut c_void,
+        physical_device: *mut c_void,
+    ) -> Result<Self> {
         let bytes = shape.elem_count() * dtype_byte_size(&dtype);
 
         let buffer_ci = VkBufferCreateInfo {
@@ -729,7 +738,10 @@ impl VulkanStorage {
         let mut buffer: u64 = 0;
         let res = unsafe { vkCreateBuffer(device, &buffer_ci, std::ptr::null(), &mut buffer) };
         if res != VK_SUCCESS {
-            return Err(Error::Backend(format!("vkCreateBuffer failed with status {}", res)));
+            return Err(Error::Backend(format!(
+                "vkCreateBuffer failed with status {}",
+                res
+            )));
         }
 
         let mut reqs = VkMemoryRequirements {
@@ -745,25 +757,33 @@ impl VulkanStorage {
         let memory_type_index = {
             let mut mem_properties = VkPhysicalDeviceMemoryProperties {
                 memory_type_count: 0,
-                memory_types: [VkMemoryType { property_flags: 0, heap_index: 0 }; 32],
+                memory_types: [VkMemoryType {
+                    property_flags: 0,
+                    heap_index: 0,
+                }; 32],
                 memory_heap_count: 0,
                 memory_heaps: [VkMemoryHeap { size: 0, flags: 0 }; 16],
             };
             unsafe {
                 vkGetPhysicalDeviceMemoryProperties(physical_device, &mut mem_properties);
             }
-            
-            let required_properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+            let required_properties =
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
             let mut found_type = None;
             for i in 0..mem_properties.memory_type_count {
                 if (reqs.memory_type_bits & (1 << i)) != 0
-                    && (mem_properties.memory_types[i as usize].property_flags & required_properties) == required_properties
+                    && (mem_properties.memory_types[i as usize].property_flags
+                        & required_properties)
+                        == required_properties
                 {
                     found_type = Some(i);
                     break;
                 }
             }
-            found_type.ok_or_else(|| Error::Backend("Failed to find suitable Vulkan memory type".into()))?
+            found_type.ok_or_else(|| {
+                Error::Backend("Failed to find suitable Vulkan memory type".into())
+            })?
         };
 
         let alloc_info = VkMemoryAllocateInfo {
@@ -776,8 +796,13 @@ impl VulkanStorage {
         let mut memory: u64 = 0;
         let res = unsafe { vkAllocateMemory(device, &alloc_info, std::ptr::null(), &mut memory) };
         if res != VK_SUCCESS {
-            unsafe { vkDestroyBuffer(device, buffer, std::ptr::null()); }
-            return Err(Error::Backend(format!("vkAllocateMemory failed with status {}", res)));
+            unsafe {
+                vkDestroyBuffer(device, buffer, std::ptr::null());
+            }
+            return Err(Error::Backend(format!(
+                "vkAllocateMemory failed with status {}",
+                res
+            )));
         }
 
         let res = unsafe { vkBindBufferMemory(device, buffer, memory, 0) };
@@ -786,7 +811,10 @@ impl VulkanStorage {
                 vkFreeMemory(device, memory, std::ptr::null());
                 vkDestroyBuffer(device, buffer, std::ptr::null());
             }
-            return Err(Error::Backend(format!("vkBindBufferMemory failed with status {}", res)));
+            return Err(Error::Backend(format!(
+                "vkBindBufferMemory failed with status {}",
+                res
+            )));
         }
 
         Ok(Self {
@@ -836,7 +864,10 @@ impl BackendStorage for VulkanStorage {
             )
         };
         if res != VK_SUCCESS {
-            return Err(Error::Backend(format!("vkMapMemory failed with status {}", res)));
+            return Err(Error::Backend(format!(
+                "vkMapMemory failed with status {}",
+                res
+            )));
         }
 
         let mut out = vec![0.0f32; self.shape.elem_count()];
@@ -874,7 +905,7 @@ impl VulkanDevice {
     }
 
     /// Fused QKV attention compute shader dispatch on Vulkan GPU.
-    pub fn qkv_attention(
+    pub fn qkv_attention_inner(
         &self,
         q: &dyn BackendStorage,
         k: &dyn BackendStorage,
@@ -896,19 +927,25 @@ impl VulkanDevice {
         let num_heads = out_dims[1];
         let head_dim = out_dims[2];
 
-        let q_s = q.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("qkv_attention q is not VulkanStorage".into())
-        })?;
-        let k_s = k.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("qkv_attention k is not VulkanStorage".into())
-        })?;
-        let v_s = v.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("qkv_attention v is not VulkanStorage".into())
-        })?;
+        let q_s = q
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("qkv_attention q is not VulkanStorage".into()))?;
+        let k_s = k
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("qkv_attention k is not VulkanStorage".into()))?;
+        let v_s = v
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("qkv_attention v is not VulkanStorage".into()))?;
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage =
+            VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::QkvAttention).to_vec();
         let buffers = [q_s.buffer, k_s.buffer, v_s.buffer, out_storage.buffer];
@@ -927,7 +964,10 @@ impl VulkanDevice {
 
         run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push))?;
 
-        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 }
 
@@ -959,9 +999,16 @@ fn run_compute_shader(
             p_bindings: bindings.as_ptr(),
         };
         let mut ds_layout = 0u64;
-        let res = vkCreateDescriptorSetLayout(ctx.device, &ds_layout_ci, std::ptr::null(), &mut ds_layout);
+        let res = vkCreateDescriptorSetLayout(
+            ctx.device,
+            &ds_layout_ci,
+            std::ptr::null(),
+            &mut ds_layout,
+        );
         if res != VK_SUCCESS {
-            return Err(Error::Backend(format!("vkCreateDescriptorSetLayout failed: {res}")));
+            return Err(Error::Backend(format!(
+                "vkCreateDescriptorSetLayout failed: {res}"
+            )));
         }
 
         struct Cleanup {
@@ -983,7 +1030,11 @@ fn run_compute_shader(
                         vkDestroyPipeline(self.device, self.pipeline, std::ptr::null());
                     }
                     if self.pipeline_layout != 0 {
-                        vkDestroyPipelineLayout(self.device, self.pipeline_layout, std::ptr::null());
+                        vkDestroyPipelineLayout(
+                            self.device,
+                            self.pipeline_layout,
+                            std::ptr::null(),
+                        );
                     }
                     if self.shader_module != 0 {
                         vkDestroyShaderModule(self.device, self.shader_module, std::ptr::null());
@@ -1022,7 +1073,9 @@ fn run_compute_shader(
         let mut ds_pool = 0u64;
         let res = vkCreateDescriptorPool(ctx.device, &ds_pool_ci, std::ptr::null(), &mut ds_pool);
         if res != VK_SUCCESS {
-            return Err(Error::Backend(format!("vkCreateDescriptorPool failed: {res}")));
+            return Err(Error::Backend(format!(
+                "vkCreateDescriptorPool failed: {res}"
+            )));
         }
         cleanup.ds_pool = ds_pool;
 
@@ -1036,7 +1089,9 @@ fn run_compute_shader(
         let mut ds = 0u64;
         let res = vkAllocateDescriptorSets(ctx.device, &ds_alloc_info, &mut ds);
         if res != VK_SUCCESS {
-            return Err(Error::Backend(format!("vkAllocateDescriptorSets failed: {res}")));
+            return Err(Error::Backend(format!(
+                "vkAllocateDescriptorSets failed: {res}"
+            )));
         }
 
         let mut buf_infos = Vec::with_capacity(buffers.len());
@@ -1062,10 +1117,18 @@ fn run_compute_shader(
                 p_texel_buffer_view: std::ptr::null(),
             });
         }
-        vkUpdateDescriptorSets(ctx.device, writes.len() as u32, writes.as_ptr(), 0, std::ptr::null());
+        vkUpdateDescriptorSets(
+            ctx.device,
+            writes.len() as u32,
+            writes.as_ptr(),
+            0,
+            std::ptr::null(),
+        );
 
         if spirv_code.len() % 4 != 0 {
-            return Err(Error::Backend("SPIR-V code size must be a multiple of 4 bytes".into()));
+            return Err(Error::Backend(
+                "SPIR-V code size must be a multiple of 4 bytes".into(),
+            ));
         }
         let shader_ci = VkShaderModuleCreateInfo {
             s_type: VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -1075,14 +1138,16 @@ fn run_compute_shader(
             p_code: spirv_code.as_ptr() as *const u32,
         };
         let mut shader_module = 0u64;
-        let res = vkCreateShaderModule(ctx.device, &shader_ci, std::ptr::null(), &mut shader_module);
+        let res =
+            vkCreateShaderModule(ctx.device, &shader_ci, std::ptr::null(), &mut shader_module);
         if res != VK_SUCCESS {
-            return Err(Error::Backend(format!("vkCreateShaderModule failed: {res}")));
+            return Err(Error::Backend(format!(
+                "vkCreateShaderModule failed: {res}"
+            )));
         }
         cleanup.shader_module = shader_module;
 
-        // Push-constant block (the precompiled kernels declare a `Params`
-        // uniform: { size:u32, dim:u32, k:u32, n:u32, m:u32, eps:f32 } = 24 bytes).
+        // Push-constant block: { size:u32, dim:u32, k:u32, n:u32, m:u32, eps:f32 } = 24 bytes.
         let push_range = VkPushConstantRange {
             stage_flags: VK_SHADER_STAGE_COMPUTE_BIT,
             offset: 0,
@@ -1102,9 +1167,16 @@ fn run_compute_shader(
             },
         };
         let mut pipeline_layout = 0u64;
-        let res = vkCreatePipelineLayout(ctx.device, &pipe_layout_ci, std::ptr::null(), &mut pipeline_layout);
+        let res = vkCreatePipelineLayout(
+            ctx.device,
+            &pipe_layout_ci,
+            std::ptr::null(),
+            &mut pipeline_layout,
+        );
         if res != VK_SUCCESS {
-            return Err(Error::Backend(format!("vkCreatePipelineLayout failed: {res}")));
+            return Err(Error::Backend(format!(
+                "vkCreatePipelineLayout failed: {res}"
+            )));
         }
         cleanup.pipeline_layout = pipeline_layout;
 
@@ -1128,9 +1200,12 @@ fn run_compute_shader(
             base_pipeline_index: 0,
         };
         let mut pipeline = 0u64;
-        let res = vkCreateComputePipelines(ctx.device, 0, 1, &pipe_ci, std::ptr::null(), &mut pipeline);
+        let res =
+            vkCreateComputePipelines(ctx.device, 0, 1, &pipe_ci, std::ptr::null(), &mut pipeline);
         if res != VK_SUCCESS {
-            return Err(Error::Backend(format!("vkCreateComputePipelines failed: {res}")));
+            return Err(Error::Backend(format!(
+                "vkCreateComputePipelines failed: {res}"
+            )));
         }
         cleanup.pipeline = pipeline;
 
@@ -1157,7 +1232,9 @@ fn run_compute_shader(
         let mut command_buffer: *mut c_void = std::ptr::null_mut();
         let res = vkAllocateCommandBuffers(ctx.device, &cmd_alloc_info, &mut command_buffer);
         if res != VK_SUCCESS {
-            return Err(Error::Backend(format!("vkAllocateCommandBuffers failed: {res}")));
+            return Err(Error::Backend(format!(
+                "vkAllocateCommandBuffers failed: {res}"
+            )));
         }
 
         let begin_info = VkCommandBufferBeginInfo {
@@ -1168,11 +1245,22 @@ fn run_compute_shader(
         };
         let res = vkBeginCommandBuffer(command_buffer, &begin_info);
         if res != VK_SUCCESS {
-            return Err(Error::Backend(format!("vkBeginCommandBuffer failed: {res}")));
+            return Err(Error::Backend(format!(
+                "vkBeginCommandBuffer failed: {res}"
+            )));
         }
 
         vkCmdBindPipeline(command_buffer, 1, pipeline);
-        vkCmdBindDescriptorSets(command_buffer, 1, pipeline_layout, 0, 1, &ds, 0, std::ptr::null());
+        vkCmdBindDescriptorSets(
+            command_buffer,
+            1,
+            pipeline_layout,
+            0,
+            1,
+            &ds,
+            0,
+            std::ptr::null(),
+        );
         if let Some(pc) = push_constants {
             vkCmdPushConstants(
                 command_buffer,
@@ -1232,7 +1320,9 @@ impl Default for VulkanDevice {
 impl BackendDevice for VulkanDevice {
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
         let storage = VulkanStorage::alloc_gpu(shape, dtype, ctx.device, ctx.physical_device)?;
 
         // Map and zero-fill
@@ -1248,7 +1338,10 @@ impl BackendDevice for VulkanDevice {
             )
         };
         if res != VK_SUCCESS {
-            return Err(Error::Backend(format!("vkMapMemory failed with status {}", res)));
+            return Err(Error::Backend(format!(
+                "vkMapMemory failed with status {}",
+                res
+            )));
         }
 
         unsafe {
@@ -1265,12 +1358,14 @@ impl BackendDevice for VulkanDevice {
         b: &dyn BackendStorage,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let a_s = a.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan matmul: input a is not VulkanStorage".into())
-        })?;
-        let b_s = b.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan matmul: input b is not VulkanStorage".into())
-        })?;
+        let a_s = a
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan matmul: input a is not VulkanStorage".into()))?;
+        let b_s = b
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan matmul: input b is not VulkanStorage".into()))?;
 
         let a_dims = a.shape().dims();
         let b_dims = b.shape().dims();
@@ -1286,25 +1381,34 @@ impl BackendDevice for VulkanDevice {
             });
         }
         if out_shape.dims() != &[m, n] {
-            return Err(Error::Shape(format!("expected out [{m},{n}], got {out_shape:?}")));
+            return Err(Error::Shape(format!(
+                "expected out [{m},{n}], got {out_shape:?}"
+            )));
         }
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
 
         // 1. autotuner search (Phase 4 requirement)
         let autotuner = VulkanAutotuner::new();
         let tile_config = autotuner.search_tile_config(m, n, k);
 
-        // Use the precompiled, autotuner-matched matmul blob (block size 64 or 32).
-        let kernel = if tile_config.block_m == 64 {
+        // Use the precompiled, autotuner-matched matmul blob (block size 64 or 32, or BF16).
+        let kernel = if (a.dtype().arith == ArithType::BF16 || b.dtype().arith == ArithType::BF16)
+            && a_s.bytes == m * k * 2
+        {
+            VulkanKernel::Matmul64Bf16
+        } else if tile_config.block_m == 64 {
             VulkanKernel::Matmul64
         } else {
             VulkanKernel::Matmul32
         };
         let spirv_source: Vec<u8> = spirv_for(kernel).to_vec();
 
-        let out_storage = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let out_storage =
+            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
 
         // Try GPU dispatch first
         let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
@@ -1313,10 +1417,14 @@ impl BackendDevice for VulkanDevice {
 
         let push = push_params(0, 0, k as u32, n as u32, m as u32, 0.0);
 
-        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, grid_y, 1, Some(push))
-            .map_err(|e| grim_tensor::Error::Backend(format!("Vulkan matmul GPU dispatch failed: {e}")))?;
+        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, grid_y, 1, Some(push)).map_err(
+            |e| grim_tensor::Error::Backend(format!("Vulkan matmul GPU dispatch failed: {e}")),
+        )?;
 
-        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 
     fn add(
@@ -1325,16 +1433,21 @@ impl BackendDevice for VulkanDevice {
         b: &dyn BackendStorage,
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let a_s = a.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan add: input a is not VulkanStorage".into())
-        })?;
-        let b_s = b.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan add: input b is not VulkanStorage".into())
-        })?;
+        let a_s = a
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan add: input a is not VulkanStorage".into()))?;
+        let b_s = b
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan add: input b is not VulkanStorage".into()))?;
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage =
+            VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Add).to_vec();
@@ -1347,7 +1460,10 @@ impl BackendDevice for VulkanDevice {
         run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push))
             .map_err(|e| Error::Backend(format!("Vulkan add GPU dispatch failed: {e}")))?;
 
-        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 
     fn mul(
@@ -1356,16 +1472,21 @@ impl BackendDevice for VulkanDevice {
         b: &dyn BackendStorage,
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let a_s = a.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan mul: input a is not VulkanStorage".into())
-        })?;
-        let b_s = b.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan mul: input b is not VulkanStorage".into())
-        })?;
+        let a_s = a
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan mul: input a is not VulkanStorage".into()))?;
+        let b_s = b
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan mul: input b is not VulkanStorage".into()))?;
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage =
+            VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Mul).to_vec();
@@ -1378,7 +1499,10 @@ impl BackendDevice for VulkanDevice {
         run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push))
             .map_err(|e| Error::Backend(format!("Vulkan mul GPU dispatch failed: {e}")))?;
 
-        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 
     fn silu_mul(
@@ -1387,16 +1511,22 @@ impl BackendDevice for VulkanDevice {
         up: &dyn BackendStorage,
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let gate_s = gate.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan silu_mul: input gate is not VulkanStorage".into())
-        })?;
+        let gate_s = gate
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan silu_mul: input gate is not VulkanStorage".into())
+            })?;
         let up_s = up.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
             Error::Backend("Vulkan silu_mul: input up is not VulkanStorage".into())
         })?;
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage =
+            VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::SiluMul).to_vec();
@@ -1409,7 +1539,10 @@ impl BackendDevice for VulkanDevice {
         run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push))
             .map_err(|e| Error::Backend(format!("Vulkan silu_mul GPU dispatch failed: {e}")))?;
 
-        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 
     fn rms_norm(
@@ -1422,13 +1555,19 @@ impl BackendDevice for VulkanDevice {
         let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
             Error::Backend("Vulkan rms_norm: input x is not VulkanStorage".into())
         })?;
-        let w_s = weight.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan rms_norm: input weight is not VulkanStorage".into())
-        })?;
+        let w_s = weight
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan rms_norm: input weight is not VulkanStorage".into())
+            })?;
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage =
+            VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
         let x_dims = x.shape().dims();
@@ -1444,7 +1583,10 @@ impl BackendDevice for VulkanDevice {
         run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push))
             .map_err(|e| Error::Backend(format!("Vulkan rms_norm GPU dispatch failed: {e}")))?;
 
-        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 
     fn softmax(
@@ -1452,13 +1594,17 @@ impl BackendDevice for VulkanDevice {
         x: &dyn BackendStorage,
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan softmax: input x is not VulkanStorage".into())
-        })?;
+        let x_s = x
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan softmax: input x is not VulkanStorage".into()))?;
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage =
+            VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
         let x_dims = x.shape().dims();
@@ -1474,7 +1620,10 @@ impl BackendDevice for VulkanDevice {
         run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push))
             .map_err(|e| Error::Backend(format!("Vulkan softmax GPU dispatch failed: {e}")))?;
 
-        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 
     fn embedding(
@@ -1483,24 +1632,49 @@ impl BackendDevice for VulkanDevice {
         indices: &[u32],
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let w_s = weight.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan embedding: weight is not VulkanStorage".into())
-        })?;
+        let w_s = weight
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan embedding: weight is not VulkanStorage".into())
+            })?;
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage =
+            VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         // Upload indices to GPU buffer temp
         let idx_shape = Shape::new(vec![indices.len()]);
-        let idx_storage = VulkanStorage::alloc_gpu(&idx_shape, DType { arith: ArithType::U32, storage: grim_tensor::dtype::Storage::Native }, ctx.device, ctx.physical_device)?;
+        let idx_storage = VulkanStorage::alloc_gpu(
+            &idx_shape,
+            DType {
+                arith: ArithType::U32,
+                storage: grim_tensor::dtype::Storage::Native,
+            },
+            ctx.device,
+            ctx.physical_device,
+        )?;
         let mut mapped_idx: *mut c_void = std::ptr::null_mut();
         unsafe {
-            let res = vkMapMemory(ctx.device, idx_storage.memory, 0, idx_storage.bytes as VkDeviceSize, 0, &mut mapped_idx);
-            if res == VK_SUCCESS {
-                std::ptr::copy_nonoverlapping(indices.as_ptr(), mapped_idx as *mut u32, indices.len());
-                vkUnmapMemory(ctx.device, idx_storage.memory);
+            let res = vkMapMemory(
+                ctx.device,
+                idx_storage.memory,
+                0,
+                idx_storage.bytes as VkDeviceSize,
+                0,
+                &mut mapped_idx,
+            );
+            if res != VK_SUCCESS {
+                return Err(Error::Backend(format!(
+                    "vkMapMemory failed for indices buffer: {}",
+                    res
+                )));
             }
+            std::ptr::copy_nonoverlapping(indices.as_ptr(), mapped_idx as *mut u32, indices.len());
+            vkUnmapMemory(ctx.device, idx_storage.memory);
         }
 
         let w_dims = weight.shape().dims();
@@ -1518,7 +1692,10 @@ impl BackendDevice for VulkanDevice {
         run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push))
             .map_err(|e| Error::Backend(format!("Vulkan embedding GPU dispatch failed: {e}")))?;
 
-        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 
     fn from_cpu(
@@ -1528,8 +1705,11 @@ impl BackendDevice for VulkanDevice {
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let storage = VulkanStorage::alloc_gpu(shape, dtype.clone(), ctx.device, ctx.physical_device)?;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let storage =
+            VulkanStorage::alloc_gpu(shape, dtype.clone(), ctx.device, ctx.physical_device)?;
 
         let mut mapped: *mut c_void = std::ptr::null_mut();
         let res = unsafe {
@@ -1543,14 +1723,16 @@ impl BackendDevice for VulkanDevice {
             )
         };
         if res != VK_SUCCESS {
-            return Err(Error::Backend(format!("vkMapMemory failed with status {}", res)));
+            return Err(Error::Backend(format!(
+                "vkMapMemory failed with status {}",
+                res
+            )));
         }
 
         unsafe {
             match dtype.arith {
                 ArithType::BF16 => {
-                    // Convert f32 to BF16 (u16) then back to f32 for storage
-                    // This simulates BF16 precision while using FP32 kernels
+                    // Simulate BF16 precision via f32 round-trip while using FP32 kernels.
                     let dst = mapped as *mut f32;
                     for (i, &val) in data.iter().enumerate() {
                         *dst.add(i) = f32_to_bf16_to_f32(val);
@@ -1566,7 +1748,11 @@ impl BackendDevice for VulkanDevice {
         Ok(Box::new(storage))
     }
 
-    fn advise(&self, _storage: &dyn BackendStorage, _advice: grim_tensor::backend::MemAdvice) -> Result<()> {
+    fn advise(
+        &self,
+        _storage: &dyn BackendStorage,
+        _advice: grim_tensor::backend::MemAdvice,
+    ) -> Result<()> {
         // Vulkan backend: MemAdvice is currently a no-op
         Ok(())
     }
@@ -1583,7 +1769,17 @@ impl BackendDevice for VulkanDevice {
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        self.qkv_attention(q, k, v, num_kv_heads, kv_seq_len, cache_offset, out_shape, out_max, out_sum)
+        self.qkv_attention_inner(
+            q,
+            k,
+            v,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            out_shape,
+            out_max,
+            out_sum,
+        )
     }
 
     fn mul_scalar(
@@ -1592,12 +1788,16 @@ impl BackendDevice for VulkanDevice {
         scalar: f32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan mul_scalar x is not VulkanStorage".into())
-        })?;
+        let x_s = x
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan mul_scalar x is not VulkanStorage".into()))?;
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage =
+            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
 
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::MulScalar).to_vec();
         let buffers = [x_s.buffer, out_storage.buffer];
@@ -1607,7 +1807,10 @@ impl BackendDevice for VulkanDevice {
         let push = push_params(n as u32, 0, 0, 0, 0, scalar);
         run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push))?;
 
-        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 
     fn sqrt(
@@ -1615,12 +1818,16 @@ impl BackendDevice for VulkanDevice {
         x: &dyn BackendStorage,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan sqrt x is not VulkanStorage".into())
-        })?;
+        let x_s = x
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan sqrt x is not VulkanStorage".into()))?;
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage =
+            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
 
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Sqrt).to_vec();
         let buffers = [x_s.buffer, out_storage.buffer];
@@ -1630,7 +1837,10 @@ impl BackendDevice for VulkanDevice {
         let push = push_params(n as u32, 0, 0, 0, 0, 0.0);
         run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push))?;
 
-        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 
     fn recip(
@@ -1638,12 +1848,16 @@ impl BackendDevice for VulkanDevice {
         x: &dyn BackendStorage,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan recip x is not VulkanStorage".into())
-        })?;
+        let x_s = x
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan recip x is not VulkanStorage".into()))?;
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage =
+            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
 
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Recip).to_vec();
         let buffers = [x_s.buffer, out_storage.buffer];
@@ -1653,7 +1867,10 @@ impl BackendDevice for VulkanDevice {
         let push = push_params(n as u32, 0, 0, 0, 0, 0.0);
         run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push))?;
 
-        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 
     fn rope(
@@ -1664,25 +1881,48 @@ impl BackendDevice for VulkanDevice {
         base: f32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan rope x is not VulkanStorage".into())
-        })?;
+        let x_s = x
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan rope x is not VulkanStorage".into()))?;
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let out_storage = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage =
+            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
 
         let num_tokens = positions.len();
         let num_heads = out_shape.elem_count() / (num_tokens * dim);
 
         let pos_shape = Shape::new(vec![num_tokens]);
-        let pos_storage = VulkanStorage::alloc_gpu(&pos_shape, DType { arith: ArithType::U32, storage: grim_tensor::dtype::Storage::Native }, ctx.device, ctx.physical_device)?;
+        let pos_storage = VulkanStorage::alloc_gpu(
+            &pos_shape,
+            DType {
+                arith: ArithType::U32,
+                storage: grim_tensor::dtype::Storage::Native,
+            },
+            ctx.device,
+            ctx.physical_device,
+        )?;
         let mut mapped_pos: *mut c_void = std::ptr::null_mut();
         unsafe {
-            let res = vkMapMemory(ctx.device, pos_storage.memory, 0, pos_storage.bytes as VkDeviceSize, 0, &mut mapped_pos);
-            if res == VK_SUCCESS {
-                std::ptr::copy_nonoverlapping(positions.as_ptr(), mapped_pos as *mut u32, num_tokens);
-                vkUnmapMemory(ctx.device, pos_storage.memory);
+            let res = vkMapMemory(
+                ctx.device,
+                pos_storage.memory,
+                0,
+                pos_storage.bytes as VkDeviceSize,
+                0,
+                &mut mapped_pos,
+            );
+            if res != VK_SUCCESS {
+                return Err(Error::Backend(format!(
+                    "vkMapMemory failed for positions buffer: {}",
+                    res
+                )));
             }
+            std::ptr::copy_nonoverlapping(positions.as_ptr(), mapped_pos as *mut u32, num_tokens);
+            vkUnmapMemory(ctx.device, pos_storage.memory);
         }
 
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Rope).to_vec();
@@ -1693,7 +1933,10 @@ impl BackendDevice for VulkanDevice {
         let push = push_params(num_tokens as u32, dim as u32, num_heads as u32, 0, 0, base);
         run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(push))?;
 
-        Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)))
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 
     fn from_cpu_bytes(
@@ -1703,7 +1946,9 @@ impl BackendDevice for VulkanDevice {
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-        let ctx = ctx_guard.as_ref().ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
         let storage = VulkanStorage::alloc_gpu(shape, dtype, ctx.device, ctx.physical_device)?;
 
         let mut mapped: *mut c_void = std::ptr::null_mut();
@@ -1718,7 +1963,10 @@ impl BackendDevice for VulkanDevice {
             )
         };
         if res != VK_SUCCESS {
-            return Err(Error::Backend(format!("vkMapMemory failed in from_cpu_bytes: {}", res)));
+            return Err(Error::Backend(format!(
+                "vkMapMemory failed in from_cpu_bytes: {}",
+                res
+            )));
         }
 
         unsafe {
@@ -1742,6 +1990,7 @@ impl BackendDevice for VulkanDevice {
         seq_len: usize,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        tracing::warn!("Vulkan selective_scan: falling back to CPU execution");
         let x_v = x.to_cpu_vec_f32()?;
         let a_v = a.to_cpu_vec_f32()?;
         let b_v = b.to_cpu_vec_f32()?;
@@ -1765,8 +2014,16 @@ impl BackendDevice for VulkanDevice {
                         let c_idx_off = (b_idx * seq_len + t) * dim_dstate + s;
 
                         let a_val = if a_v.len() > a_idx { a_v[a_idx] } else { 1.0 };
-                        let b_val = if b_v.len() > b_idx_off { b_v[b_idx_off] } else { 1.0 };
-                        let c_val = if c_v.len() > c_idx_off { c_v[c_idx_off] } else { 1.0 };
+                        let b_val = if b_v.len() > b_idx_off {
+                            b_v[b_idx_off]
+                        } else {
+                            1.0
+                        };
+                        let c_val = if c_v.len() > c_idx_off {
+                            c_v[c_idx_off]
+                        } else {
+                            1.0
+                        };
 
                         h[s] = a_val * h[s] + x_t * b_val;
                         y_t += c_val * h[s];
@@ -1792,9 +2049,31 @@ impl BackendDevice for VulkanDevice {
         _causal: bool,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let (out_storage, _h) = self.qkv_attention(q, k, v, num_kv_heads, seq_len, 0, out_shape, None, None)?;
-        let _ = num_heads;
-        let _ = head_dim;
+        let _ = _causal;
+        let out_dims = out_shape.dims();
+        if out_dims.len() == 3 {
+            let inferred_heads = out_dims[1];
+            let inferred_dim = out_dims[2];
+            if inferred_heads != num_heads {
+                tracing::warn!(
+                    "Vulkan flash_attention: out_shape head dim ({inferred_heads}) != num_heads ({num_heads})"
+                );
+            }
+            if inferred_dim != head_dim {
+                tracing::warn!(
+                    "Vulkan flash_attention: out_shape head_dim ({inferred_dim}) != head_dim ({head_dim})"
+                );
+            }
+        }
+        if num_heads != num_kv_heads {
+            tracing::warn!(
+                "Vulkan flash_attention: GQA detected (num_heads={num_heads}, num_kv_heads={num_kv_heads}); \
+                 kernel repeats KV heads to match query heads"
+            );
+        }
+        // Pass num_kv_heads for GQA head-repeat; num_heads comes from out_shape.
+        let (out_storage, _h) =
+            self.qkv_attention(q, k, v, num_kv_heads, seq_len, 0, out_shape, None, None)?;
         Ok((out_storage, Box::new(VulkanHandle)))
     }
 
@@ -1809,9 +2088,21 @@ impl BackendDevice for VulkanDevice {
         kv_seq_len: usize,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let (out_storage, _h) = self.qkv_attention(q, k, v, num_heads, kv_seq_len, 0, out_shape, None, None)?;
-        let _ = head_dim;
-        let _ = seq_len;
+        let out_dims = out_shape.dims();
+        if out_dims.len() == 3 {
+            let inferred_dim = out_dims[2];
+            if inferred_dim != head_dim {
+                tracing::warn!(
+                    "Vulkan cross_attention: out_shape head_dim ({inferred_dim}) != head_dim ({head_dim})"
+                );
+            }
+        }
+        tracing::warn!(
+            "Vulkan cross_attention: seq_len={seq_len}, kv_seq_len={kv_seq_len}, num_heads={num_heads}, head_dim={head_dim}"
+        );
+        // Cross-attention: Q and KV share num_heads, so pass it as KV-head count.
+        let (out_storage, _h) =
+            self.qkv_attention(q, k, v, num_heads, kv_seq_len, 0, out_shape, None, None)?;
         Ok((out_storage, Box::new(VulkanHandle)))
     }
 
@@ -1827,6 +2118,7 @@ impl BackendDevice for VulkanDevice {
         seq_len: usize,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        tracing::warn!("Vulkan rwkv_time_mix: falling back to CPU execution");
         let x_vec = x.to_cpu_vec_f32()?;
         let k_vec = k.to_cpu_vec_f32()?;
         let v_vec = v.to_cpu_vec_f32()?;
@@ -1841,9 +2133,21 @@ impl BackendDevice for VulkanDevice {
 
                 for t in 0..seq_len {
                     let idx = (b * seq_len + t) * dim + d;
-                    let k_t = if k_vec.len() > idx { k_vec[idx] } else { x_vec[idx] };
-                    let v_t = if v_vec.len() > idx { v_vec[idx] } else { x_vec[idx] };
-                    let g_t = if g_vec.len() > idx { g_vec[idx] } else { 1.0f32 };
+                    let k_t = if k_vec.len() > idx {
+                        k_vec[idx]
+                    } else {
+                        x_vec[idx]
+                    };
+                    let v_t = if v_vec.len() > idx {
+                        v_vec[idx]
+                    } else {
+                        x_vec[idx]
+                    };
+                    let g_t = if g_vec.len() > idx {
+                        g_vec[idx]
+                    } else {
+                        1.0f32
+                    };
 
                     state = w_val * state + k_t * v_t;
                     let sig = 1.0f32 / (1.0f32 + (-g_t).exp());
@@ -1866,6 +2170,7 @@ impl BackendDevice for VulkanDevice {
         dim: usize,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        tracing::warn!("Vulkan rwkv_channel_mix: falling back to CPU execution");
         let x_vec = x.to_cpu_vec_f32()?;
         let k_vec = k.to_cpu_vec_f32()?;
         let r_vec = r.to_cpu_vec_f32()?;
@@ -1898,25 +2203,79 @@ impl BackendDevice for VulkanDevice {
         b_scales: &[f32],
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let a_vec = a.to_cpu_vec_f32()?;
         let a_dims = a.shape().dims();
         let out_dims = out_shape.dims();
         let m = a_dims[0];
         let k = a_dims[1];
         let n = out_dims[1];
 
+        // Try GPU fused dequant dispatch if both inputs are VulkanStorage
+        if let (Some(a_s), Some(b_s)) = (
+            a.as_any().downcast_ref::<VulkanStorage>(),
+            b_packed.as_any().downcast_ref::<VulkanStorage>(),
+        ) {
+            let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+            if let Some(ctx) = ctx_guard.as_ref() {
+                if let Ok(out_storage) =
+                    VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)
+                {
+                    let kernel = if k % 256 == 0 {
+                        VulkanKernel::FusedDequantGemmQ4K
+                    } else {
+                        VulkanKernel::FusedDequantGemmQ80
+                    };
+                    let spirv_source: Vec<u8> = spirv_for(kernel).to_vec();
+                    let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
+                    let grid_x = ((n + 15) / 16) as u32;
+                    let grid_y = ((m + 15) / 16) as u32;
+                    let push = push_params(0, 0, k as u32, n as u32, m as u32, 0.0);
+
+                    if run_compute_shader(
+                        ctx,
+                        &spirv_source,
+                        &buffers,
+                        grid_x,
+                        grid_y,
+                        1,
+                        Some(push),
+                    )
+                    .is_ok()
+                    {
+                        return Ok((
+                            Box::new(out_storage),
+                            Box::new(grim_tensor::backend::ReadyHandle),
+                        ));
+                    }
+                }
+            }
+        }
+
+        tracing::warn!("Vulkan quantized_matmul: falling back to CPU execution");
+        let a_vec = a.to_cpu_vec_f32()?;
         let mut b_dequant = vec![0.0f32; k * n];
         let blocks_per_col = k / 32;
 
-        let b_bytes = b_packed.to_cpu_vec_f32().ok().map(|v| v.iter().map(|&f| f as u8).collect()).unwrap_or_else(|| vec![0u8; k * n]);
+        let b_bytes = b_packed
+            .to_cpu_vec_f32()
+            .ok()
+            .map(|v| v.iter().map(|&f| f as u8).collect())
+            .unwrap_or_else(|| vec![0u8; k * n]);
 
         for col in 0..n {
             for block in 0..blocks_per_col {
                 let scale_idx = col * blocks_per_col + block;
-                let scale = if scale_idx < b_scales.len() { b_scales[scale_idx] } else { 1.0f32 };
+                let scale = if scale_idx < b_scales.len() {
+                    b_scales[scale_idx]
+                } else {
+                    1.0f32
+                };
                 for i in 0..32 {
                     let byte_offset = (col * blocks_per_col + block) * 32 + i;
-                    let byte_val = if byte_offset < b_bytes.len() { b_bytes[byte_offset] } else { 128u8 };
+                    let byte_val = if byte_offset < b_bytes.len() {
+                        b_bytes[byte_offset]
+                    } else {
+                        128u8
+                    };
                     let q_val = (byte_val as i16 - 128) as f32 / 127.0f32;
                     let r = block * 32 + i;
                     if r < k {
@@ -1957,19 +2316,45 @@ impl VulkanAutotuner {
         Self
     }
 
-    /// Evaluates target GPU layout constraints and runs a simulated benchmarking
-    /// pass to autotune the best CubeCL tile block parameters.
+    /// Autotunes CubeCL tile block parameters via simulated benchmarking.
     pub fn search_tile_config(&self, m: usize, n: usize, k: usize) -> VulkanTileConfig {
-        println!(
+        tracing::info!(
             "[VulkanAutotuner] Running autotune search for shape ({}, {}, {})...",
-            m, n, k
+            m,
+            n,
+            k
         );
         // Autotuning heuristic based on common powers of 2 for GPU compute blocks
         if m % 64 == 0 && n % 64 == 0 {
-            VulkanTileConfig { block_m: 64, block_n: 64, block_k: 16 }
+            VulkanTileConfig {
+                block_m: 64,
+                block_n: 64,
+                block_k: 16,
+            }
         } else {
-            VulkanTileConfig { block_m: 32, block_n: 32, block_k: 8 }
+            VulkanTileConfig {
+                block_m: 32,
+                block_n: 32,
+                block_k: 8,
+            }
         }
+    }
+
+    fn estimate_gemm_latency_ms(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        dtype: DType,
+        _placement: &grim_tensor::backend::ScythePlacement,
+    ) -> f64 {
+        let flops = 2.0 * m as f64 * n as f64 * k as f64;
+        let tflops = match dtype.arith {
+            ArithType::F16 | ArithType::BF16 => 100.0,
+            ArithType::F32 => 50.0,
+            _ => 30.0,
+        };
+        (flops / (tflops * 1e12) * 1000.0).max(0.01)
     }
 }
 
@@ -1985,11 +2370,24 @@ pub enum VulkanKernel {
     Embedding,
     Matmul64,
     Matmul32,
+    Matmul64Bf16,
     QkvAttention,
     MulScalar,
     Sqrt,
     Recip,
     Rope,
+    FusedDequantGemmQ4K,
+    FusedDequantGemmQ80,
+    KvDequantAttention,
+    SelectiveScan,
+    QkvAttentionPaged,
+    FlashAttention,
+    SiluMulBackward,
+    QuantizedMatmulBackwardDx,
+    RwkvTimeMix,
+    RwkvChannelMix,
+    AllReduce,
+    CommFuseReduce,
 }
 
 pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
@@ -2002,11 +2400,24 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::Embedding => SPIRV_EMBEDDING,
         VulkanKernel::Matmul64 => SPIRV_MATMUL_64,
         VulkanKernel::Matmul32 => SPIRV_MATMUL_32,
+        VulkanKernel::Matmul64Bf16 => SPIRV_MATMUL_64_BF16,
         VulkanKernel::QkvAttention => SPIRV_QKV_ATTENTION,
         VulkanKernel::MulScalar => SPIRV_MUL_SCALAR,
         VulkanKernel::Sqrt => SPIRV_SQRT,
         VulkanKernel::Recip => SPIRV_RECIP,
         VulkanKernel::Rope => SPIRV_ROPE,
+        VulkanKernel::FusedDequantGemmQ4K => SPIRV_FUSED_DEQUANT_GEMM_Q4K,
+        VulkanKernel::FusedDequantGemmQ80 => SPIRV_FUSED_DEQUANT_GEMM_Q8_0,
+        VulkanKernel::KvDequantAttention => SPIRV_KV_DEQUANT_ATTENTION,
+        VulkanKernel::SelectiveScan => SPIRV_SELECTIVE_SCAN,
+        VulkanKernel::QkvAttentionPaged => SPIRV_QKV_ATTENTION_PAGED,
+        VulkanKernel::FlashAttention => SPIRV_FLASH_ATTENTION,
+        VulkanKernel::SiluMulBackward => SPIRV_SILU_MUL_BACKWARD,
+        VulkanKernel::QuantizedMatmulBackwardDx => SPIRV_QUANTIZED_MATMUL_BACKWARD_DX,
+        VulkanKernel::RwkvTimeMix => SPIRV_RWKV_TIME_MIX,
+        VulkanKernel::RwkvChannelMix => SPIRV_RWKV_CHANNEL_MIX,
+        VulkanKernel::AllReduce => SPIRV_ALL_REDUCE,
+        VulkanKernel::CommFuseReduce => SPIRV_COMM_FUSE_REDUCE,
     }
 }
 
@@ -2015,7 +2426,7 @@ fn dtype_byte_size(dtype: &DType) -> usize {
     match dtype.arith {
         ArithType::F32 | ArithType::U32 => 4,
         ArithType::F16 => 2,
-        ArithType::BF16 => 4, // Stored as f32 for kernel compatibility
+        ArithType::BF16 => 4, // BF16 simulated via f32 round-trip; 4 bytes for kernel compatibility.
         ArithType::I64 => 8,
         ArithType::U8 => 1,
     }
@@ -2137,7 +2548,10 @@ mod tests {
         // 2. Shape mismatch error enforcement
         let bad_shape = Shape::new(vec![3, 2]);
         let err_res = dev.matmul(a_s.as_ref(), b_s.as_ref(), &bad_shape);
-        assert!(err_res.is_err(), "matmul with wrong output shape must return Err");
+        assert!(
+            err_res.is_err(),
+            "matmul with wrong output shape must return Err"
+        );
     }
 
     #[test]
@@ -2158,61 +2572,65 @@ mod tests {
             Some(c) => c,
             None => return,
         };
-        let out_storage = VulkanStorage::alloc_gpu(&shape, DType::F32, ctx.device, ctx.physical_device).unwrap();
+        let out_storage =
+            VulkanStorage::alloc_gpu(&shape, DType::F32, ctx.device, ctx.physical_device).unwrap();
 
         // Standard precompiled add SPIR-V binary from radv_repro.rs
         let spirv_add_u32: &[u32] = &[
-            0x07230203, 0x00010000, 0x0008000b, 0x00000033, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
-            0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
-            0x0006000f, 0x00000005, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000b, 0x00060010, 0x00000004,
-            0x00000011, 0x00000040, 0x00000001, 0x00000001, 0x00030003, 0x00000002, 0x000001c2, 0x00040005,
-            0x00000004, 0x6e69616d, 0x00000000, 0x00030005, 0x00000008, 0x00000069, 0x00080005, 0x0000000b,
-            0x475f6c67, 0x61626f6c, 0x766e496c, 0x7461636f, 0x496e6f69, 0x00000044, 0x00040005, 0x00000019,
-            0x43667542, 0x00000000, 0x00040006, 0x00000019, 0x00000000, 0x00000063, 0x00030005, 0x0000001b,
-            0x00000000, 0x00040005, 0x00000020, 0x41667542, 0x00000000, 0x00040006, 0x00000020, 0x00000000,
-            0x00000061, 0x00030005, 0x00000022, 0x00000000, 0x00040005, 0x00000028, 0x42667542, 0x00000000,
-            0x00040006, 0x00000028, 0x00000000, 0x00000062, 0x00030005, 0x0000002a, 0x00000000, 0x00040047,
-            0x0000000b, 0x0000000b, 0x0000001c, 0x00040047, 0x00000018, 0x00000006, 0x00000004, 0x00030047,
-            0x00000019, 0x00000003, 0x00050048, 0x00000019, 0x00000000, 0x00000023, 0x00000000, 0x00040047,
-            0x0000001b, 0x00000021, 0x00000002, 0x00040047, 0x0000001b, 0x00000022, 0x00000000, 0x00040047,
-            0x0000001f, 0x00000006, 0x00000004, 0x00030047, 0x00000020, 0x00000003, 0x00050048, 0x00000020,
-            0x00000000, 0x00000023, 0x00000000, 0x00040047, 0x00000022, 0x00000021, 0x00000000, 0x00040047,
-            0x00000022, 0x00000022, 0x00000000, 0x00040047, 0x00000027, 0x00000006, 0x00000004, 0x00030047,
-            0x00000028, 0x00000003, 0x00050048, 0x00000028, 0x00000000, 0x00000023, 0x00000000, 0x00040047,
-            0x0000002a, 0x00000021, 0x00000001, 0x00040047, 0x0000002a, 0x00000022, 0x00000000, 0x00040047,
-            0x00000032, 0x0000000b, 0x00000019, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002,
-            0x00040015, 0x00000006, 0x00000020, 0x00000000, 0x00040020, 0x00000007, 0x00000007, 0x00000006,
-            0x00040017, 0x00000009, 0x00000006, 0x00000003, 0x00040020, 0x0000000a, 0x00000001, 0x00000009,
-            0x0004003b, 0x0000000a, 0x0000000b, 0x00000001, 0x0004002b, 0x00000006, 0x0000000c, 0x00000000,
-            0x00040020, 0x0000000d, 0x00000001, 0x00000006, 0x0004002b, 0x00000006, 0x00000011, 0x00000004,
-            0x00020014, 0x00000012, 0x00030016, 0x00000017, 0x00000020, 0x0003001d, 0x00000018, 0x00000017,
-            0x0003001e, 0x00000019, 0x00000018, 0x00040020, 0x0000001a, 0x00000002, 0x00000019, 0x0004003b,
-            0x0000001a, 0x0000001b, 0x00000002, 0x00040015, 0x0000001c, 0x00000020, 0x00000001, 0x0004002b,
-            0x0000001c, 0x0000001d, 0x00000000, 0x0003001d, 0x0000001f, 0x00000017, 0x0003001e, 0x00000020,
-            0x0000001f, 0x00040020, 0x00000021, 0x00000002, 0x00000020, 0x0004003b, 0x00000021, 0x00000022,
-            0x00000002, 0x00040020, 0x00000024, 0x00000002, 0x00000017, 0x0003001d, 0x00000027, 0x00000017,
-            0x0003001e, 0x00000028, 0x00000027, 0x00040020, 0x00000029, 0x00000002, 0x00000028, 0x0004003b,
-            0x00000029, 0x0000002a, 0x00000002, 0x0004002b, 0x00000006, 0x00000030, 0x00000040, 0x0004002b,
-            0x00000006, 0x00000031, 0x00000001, 0x0006002c, 0x00000009, 0x00000032, 0x00000030, 0x00000031,
-            0x00000031, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005,
-            0x0004003b, 0x00000007, 0x00000008, 0x00000007, 0x00050041, 0x0000000d, 0x0000000e, 0x0000000b,
-            0x0000000c, 0x0004003d, 0x00000006, 0x0000000f, 0x0000000e, 0x0003003e, 0x00000008, 0x0000000f,
-            0x0004003d, 0x00000006, 0x00000010, 0x00000008, 0x000500ae, 0x00000012, 0x00000013, 0x00000010,
-            0x00000011, 0x000300f7, 0x00000015, 0x00000000, 0x000400fa, 0x00000013, 0x00000014, 0x00000015,
-            0x000200f8, 0x00000014, 0x000100fd, 0x000200f8, 0x00000015, 0x0004003d, 0x00000006, 0x0000001e,
-            0x00000008, 0x0004003d, 0x00000006, 0x00000023, 0x00000008, 0x00060041, 0x00000024, 0x00000025,
-            0x00000022, 0x0000001d, 0x00000023, 0x0004003d, 0x00000017, 0x00000026, 0x00000025, 0x0004003d,
-            0x00000006, 0x0000002b, 0x00000008, 0x00060041, 0x00000024, 0x0000002c, 0x0000002a, 0x0000001d,
-            0x0000002b, 0x0004003d, 0x00000017, 0x0000002d, 0x0000002c, 0x00050081, 0x00000017, 0x0000002e,
-            0x00000026, 0x0000002d, 0x00060041, 0x00000024, 0x0000002f, 0x0000001b, 0x0000001d, 0x0000001e,
-            0x0003003e, 0x0000002f, 0x0000002e, 0x000100fd, 0x00010038,
+            0x07230203, 0x00010000, 0x0008000b, 0x00000033, 0x00000000, 0x00020011, 0x00000001,
+            0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e,
+            0x00000000, 0x00000001, 0x0006000f, 0x00000005, 0x00000004, 0x6e69616d, 0x00000000,
+            0x0000000b, 0x00060010, 0x00000004, 0x00000011, 0x00000040, 0x00000001, 0x00000001,
+            0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d, 0x00000000,
+            0x00030005, 0x00000008, 0x00000069, 0x00080005, 0x0000000b, 0x475f6c67, 0x61626f6c,
+            0x766e496c, 0x7461636f, 0x496e6f69, 0x00000044, 0x00040005, 0x00000019, 0x43667542,
+            0x00000000, 0x00040006, 0x00000019, 0x00000000, 0x00000063, 0x00030005, 0x0000001b,
+            0x00000000, 0x00040005, 0x00000020, 0x41667542, 0x00000000, 0x00040006, 0x00000020,
+            0x00000000, 0x00000061, 0x00030005, 0x00000022, 0x00000000, 0x00040005, 0x00000028,
+            0x42667542, 0x00000000, 0x00040006, 0x00000028, 0x00000000, 0x00000062, 0x00030005,
+            0x0000002a, 0x00000000, 0x00040047, 0x0000000b, 0x0000000b, 0x0000001c, 0x00040047,
+            0x00000018, 0x00000006, 0x00000004, 0x00030047, 0x00000019, 0x00000003, 0x00050048,
+            0x00000019, 0x00000000, 0x00000023, 0x00000000, 0x00040047, 0x0000001b, 0x00000021,
+            0x00000002, 0x00040047, 0x0000001b, 0x00000022, 0x00000000, 0x00040047, 0x0000001f,
+            0x00000006, 0x00000004, 0x00030047, 0x00000020, 0x00000003, 0x00050048, 0x00000020,
+            0x00000000, 0x00000023, 0x00000000, 0x00040047, 0x00000022, 0x00000021, 0x00000000,
+            0x00040047, 0x00000022, 0x00000022, 0x00000000, 0x00040047, 0x00000027, 0x00000006,
+            0x00000004, 0x00030047, 0x00000028, 0x00000003, 0x00050048, 0x00000028, 0x00000000,
+            0x00000023, 0x00000000, 0x00040047, 0x0000002a, 0x00000021, 0x00000001, 0x00040047,
+            0x0000002a, 0x00000022, 0x00000000, 0x00040047, 0x00000032, 0x0000000b, 0x00000019,
+            0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00040015, 0x00000006,
+            0x00000020, 0x00000000, 0x00040020, 0x00000007, 0x00000007, 0x00000006, 0x00040017,
+            0x00000009, 0x00000006, 0x00000003, 0x00040020, 0x0000000a, 0x00000001, 0x00000009,
+            0x0004003b, 0x0000000a, 0x0000000b, 0x00000001, 0x0004002b, 0x00000006, 0x0000000c,
+            0x00000000, 0x00040020, 0x0000000d, 0x00000001, 0x00000006, 0x0004002b, 0x00000006,
+            0x00000011, 0x00000004, 0x00020014, 0x00000012, 0x00030016, 0x00000017, 0x00000020,
+            0x0003001d, 0x00000018, 0x00000017, 0x0003001e, 0x00000019, 0x00000018, 0x00040020,
+            0x0000001a, 0x00000002, 0x00000019, 0x0004003b, 0x0000001a, 0x0000001b, 0x00000002,
+            0x00040015, 0x0000001c, 0x00000020, 0x00000001, 0x0004002b, 0x0000001c, 0x0000001d,
+            0x00000000, 0x0003001d, 0x0000001f, 0x00000017, 0x0003001e, 0x00000020, 0x0000001f,
+            0x00040020, 0x00000021, 0x00000002, 0x00000020, 0x0004003b, 0x00000021, 0x00000022,
+            0x00000002, 0x00040020, 0x00000024, 0x00000002, 0x00000017, 0x0003001d, 0x00000027,
+            0x00000017, 0x0003001e, 0x00000028, 0x00000027, 0x00040020, 0x00000029, 0x00000002,
+            0x00000028, 0x0004003b, 0x00000029, 0x0000002a, 0x00000002, 0x0004002b, 0x00000006,
+            0x00000030, 0x00000040, 0x0004002b, 0x00000006, 0x00000031, 0x00000001, 0x0006002c,
+            0x00000009, 0x00000032, 0x00000030, 0x00000031, 0x00000031, 0x00050036, 0x00000002,
+            0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b, 0x00000007,
+            0x00000008, 0x00000007, 0x00050041, 0x0000000d, 0x0000000e, 0x0000000b, 0x0000000c,
+            0x0004003d, 0x00000006, 0x0000000f, 0x0000000e, 0x0003003e, 0x00000008, 0x0000000f,
+            0x0004003d, 0x00000006, 0x00000010, 0x00000008, 0x000500ae, 0x00000012, 0x00000013,
+            0x00000010, 0x00000011, 0x000300f7, 0x00000015, 0x00000000, 0x000400fa, 0x00000013,
+            0x00000014, 0x00000015, 0x000200f8, 0x00000014, 0x000100fd, 0x000200f8, 0x00000015,
+            0x0004003d, 0x00000006, 0x0000001e, 0x00000008, 0x0004003d, 0x00000006, 0x00000023,
+            0x00000008, 0x00060041, 0x00000024, 0x00000025, 0x00000022, 0x0000001d, 0x00000023,
+            0x0004003d, 0x00000017, 0x00000026, 0x00000025, 0x0004003d, 0x00000006, 0x0000002b,
+            0x00000008, 0x00060041, 0x00000024, 0x0000002c, 0x0000002a, 0x0000001d, 0x0000002b,
+            0x0004003d, 0x00000017, 0x0000002d, 0x0000002c, 0x00050081, 0x00000017, 0x0000002e,
+            0x00000026, 0x0000002d, 0x00060041, 0x00000024, 0x0000002f, 0x0000001b, 0x0000001d,
+            0x0000001e, 0x0003003e, 0x0000002f, 0x0000002e, 0x000100fd, 0x00010038,
         ];
 
         let spirv_bytes = unsafe {
-            std::slice::from_raw_parts(
-                spirv_add_u32.as_ptr() as *const u8,
-                spirv_add_u32.len() * 4,
-            )
+            std::slice::from_raw_parts(spirv_add_u32.as_ptr() as *const u8, spirv_add_u32.len() * 4)
         };
 
         let buffers = [a_storage.buffer, b_storage.buffer, out_storage.buffer];
@@ -2222,13 +2640,16 @@ mod tests {
         assert_eq!(cpu_data, vec![11.0, 22.0, 33.0, 44.0]);
     }
 
-    // ===== Golden Mutation-Resistant Kernel Math Contracts =====
+    // ===== Mutation-resistant kernel math contracts =====
 
     fn close_vulkan(got: f32, want: f32, ctx: &str) {
         let abs = (got - want).abs();
         let denom = want.abs().max(1e-7);
         assert!(got.is_finite(), "{ctx}: non-finite {got:?} (want {want:?})");
-        assert!(abs == 0.0 || (abs / denom) < 1e-4, "{ctx}: got {got:?} want {want:?} (abs={abs})");
+        assert!(
+            abs == 0.0 || (abs / denom) < 1e-4,
+            "{ctx}: got {got:?} want {want:?} (abs={abs})"
+        );
     }
 
     #[test]
@@ -2265,7 +2686,10 @@ mod tests {
         assert_eq!(out_sqrt.to_cpu_vec_f32().unwrap(), vec![2.0, 3.0, 4.0, 5.0]);
 
         let (out_recip, _) = dev.recip(out_sqrt.as_ref(), &shape).unwrap();
-        assert_eq!(out_recip.to_cpu_vec_f32().unwrap(), vec![0.5, 1.0 / 3.0, 0.25, 0.2]);
+        assert_eq!(
+            out_recip.to_cpu_vec_f32().unwrap(),
+            vec![0.5, 1.0 / 3.0, 0.25, 0.2]
+        );
 
         let (out_mul, _) = dev.mul_scalar(x.as_ref(), 0.5, &shape).unwrap();
         assert_eq!(out_mul.to_cpu_vec_f32().unwrap(), vec![2.0, 4.5, 8.0, 12.5]);
@@ -2343,26 +2767,21 @@ mod tests {
             return;
         }
         let dev = VulkanDevice::new();
-        let table = vec![
-            10.0f32, 20.0,
-            30.0, 40.0,
-            50.0, 60.0,
-        ];
-        let weight = dev.from_cpu(&table, &Shape::new(vec![3, 2]), DType::F32).unwrap();
+        let table = vec![10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let weight = dev
+            .from_cpu(&table, &Shape::new(vec![3, 2]), DType::F32)
+            .unwrap();
         let indices = vec![2u32, 0];
         let out_shape = Shape::new(vec![2, 2]);
-        let (out, _h) = dev.embedding(weight.as_ref(), &indices, &out_shape).unwrap();
+        let (out, _h) = dev
+            .embedding(weight.as_ref(), &indices, &out_shape)
+            .unwrap();
         let res = out.to_cpu_vec_f32().unwrap();
         assert_eq!(res, vec![50.0, 60.0, 10.0, 20.0]);
     }
 
-    // ===========================================================================
-    // BF16 matmul golden test — hand-constructed BF16 inputs, exact FP32 reference
-    // ===========================================================================
-    //
-    // BF16 layout: 1 sign bit | 8 exponent bits | 7 mantissa bits (truncated from FP32)
-    // We hand-craft BF16 values by converting known FP32 values via IEEE-754 rounding.
-    // Test: A @ B^T where A=[2x2], B=[2x2], both in BF16, accumulation in FP32.
+    // BF16 matmul golden test — hand-crafted BF16 inputs, exact FP32 reference.
+    // BF16: 1 sign | 8 exponent | 7 mantissa. Accumulates in FP32.
 
     #[test]
     fn test_vulkan_matmul_bf16_golden_exact() {
@@ -2372,8 +2791,7 @@ mod tests {
         let dev = VulkanDevice::new();
         let shape = Shape::new(vec![2, 2]);
 
-        // Hand-crafted BF16 values: 1.0, 2.0, 3.0, 4.0 exactly representable in BF16
-        // 1.0_f32 as bf16 = 0x3F80; 2.0 = 0x4000; 3.0 = 0x4040; 4.0 = 0x4080
+        // Hand-crafted BF16: 1.0=0x3F80, 2.0=0x4000, 3.0=0x4040, 4.0=0x4080
         let a_data = vec![1.0f32, 2.0, 3.0, 4.0];
         let b_data = vec![5.0f32, 6.0, 7.0, 8.0];
 
@@ -2382,21 +2800,15 @@ mod tests {
         let (out, _h) = dev.matmul(a.as_ref(), b.as_ref(), &shape).unwrap();
         let res = out.to_cpu_vec_f32().unwrap();
 
-        // Reference: [1 2; 3 4] @ [5 6; 7 8] = [19 22; 43 50]
-        // Accumulated in FP32 per gemm spec
+        // Reference: [1 2; 3 4] @ [5 6; 7 8] = [19 22; 43 50], FP32 accumulation.
         close_vulkan(res[0], 19.0, "bf16_matmul[0,0]");
         close_vulkan(res[1], 22.0, "bf16_matmul[0,1]");
         close_vulkan(res[2], 43.0, "bf16_matmul[1,0]");
         close_vulkan(res[3], 50.0, "bf16_matmul[1,1]");
     }
 
-    // ===========================================================================
-    // QKV Attention golden test — hand-constructed Q/K/V, exact FP32 ref
-    // ===========================================================================
-    //
-    // Tests multi-head attention with causal masking using qkv_attention.
-    // Q: [seq_len=2, num_heads=2, head_dim=2]
-    // K/V: [kv_seq_len=4, num_kv_heads=1, head_dim=2]
+    // QKV attention golden test — hand-crafted Q/K/V, exact FP32 reference.
+    // Q: [seq=2, heads=2, dim=2]; K/V: [kv_seq=4, kv_heads=1, dim=2].
     #[test]
     fn test_vulkan_qkv_attention_exact() {
         if GLOBAL_CONTEXT.lock().unwrap().is_none() {
@@ -2423,17 +2835,19 @@ mod tests {
         let k_buf = dev.from_cpu(&k_data, &k_shape, DType::F32).unwrap();
         let v_buf = dev.from_cpu(&v_data, &v_shape, DType::F32).unwrap();
 
-        let (out, _h) = dev.qkv_attention(
-            q_buf.as_ref(),
-            k_buf.as_ref(),
-            v_buf.as_ref(),
-            num_kv_heads,
-            kv_seq_len,
-            0,
-            &out_shape,
-            None,
-            None,
-        ).unwrap();
+        let (out, _h) = dev
+            .qkv_attention(
+                q_buf.as_ref(),
+                k_buf.as_ref(),
+                v_buf.as_ref(),
+                num_kv_heads,
+                kv_seq_len,
+                0,
+                &out_shape,
+                None,
+                None,
+            )
+            .unwrap();
 
         let res = out.to_cpu_vec_f32().unwrap();
         assert_eq!(res.len(), seq_len * num_heads * head_dim);
@@ -2443,31 +2857,39 @@ mod tests {
     }
 }
 
-
-
 /// Query `(free_bytes, total_bytes)` memory on Vulkan device `ordinal`.
-pub fn vram_info(_ordinal: usize) -> (u64, u64) {
+pub fn vram_info(_ordinal: usize) -> Option<(u64, u64)> {
     if let Ok(guard) = GLOBAL_CONTEXT.lock() {
         if let Some(ctx) = guard.as_ref() {
-            let mut props = VkPhysicalDeviceMemoryProperties {
-                memory_type_count: 0,
-                memory_types: [VkMemoryType { property_flags: 0, heap_index: 0 }; 32],
-                memory_heap_count: 0,
-                memory_heaps: [VkMemoryHeap { size: 0, flags: 0 }; 16],
-            };
             unsafe {
+                let mut props = VkPhysicalDeviceMemoryProperties {
+                    memory_type_count: 0,
+                    memory_types: [VkMemoryType {
+                        property_flags: 0,
+                        heap_index: 0,
+                    }; 32],
+                    memory_heap_count: 0,
+                    memory_heaps: [VkMemoryHeap { size: 0, flags: 0 }; 16],
+                };
                 vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &mut props);
+
+                // Sum all device-local heaps (VK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 0x1).
                 let mut total_device_local: u64 = 0;
                 for i in 0..(props.memory_heap_count as usize) {
                     if (props.memory_heaps[i].flags & 1) != 0 {
                         total_device_local += props.memory_heaps[i].size;
                     }
                 }
-                if total_device_local > 0 {
-                    return (total_device_local / 2, total_device_local);
+
+                if total_device_local == 0 {
+                    return None;
                 }
+
+                // Without VK_EXT_memory_budget, live free memory is unavailable.
+                // Return total for both — free is an upper bound only.
+                return Some((total_device_local, total_device_local));
             }
         }
     }
-    (0, 0)
+    None
 }

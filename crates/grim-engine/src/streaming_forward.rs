@@ -34,10 +34,8 @@ impl GradientCheckpointBuffer {
 
     /// Save input activation checkpoint for layer `layer_idx`.
     pub fn save(&mut self, layer_idx: usize, input_x: Tensor) {
-        self.checkpoints.insert(layer_idx, LayerActivationCheckpoint {
-            layer_idx,
-            input_x,
-        });
+        self.checkpoints
+            .insert(layer_idx, LayerActivationCheckpoint { layer_idx, input_x });
     }
 
     /// Retrieve input activation checkpoint for layer `layer_idx`.
@@ -141,10 +139,12 @@ impl StreamingBlockForward {
         layer_idx: usize,
         positions: Option<&[u32]>,
     ) -> Result<Tensor> {
-        let input_x = self
-            .checkpoint_buffer
-            .get(layer_idx)
-            .ok_or_else(|| Error::Config(format!("missing activation checkpoint for layer {}", layer_idx)))?;
+        let input_x = self.checkpoint_buffer.get(layer_idx).ok_or_else(|| {
+            Error::Config(format!(
+                "missing activation checkpoint for layer {}",
+                layer_idx
+            ))
+        })?;
 
         // Reload block weights from provider on target tensor device, run real forward from saved input
         let ws = WeightSource::root(provider, input_x.device().clone());
@@ -193,9 +193,18 @@ impl StreamingBlockForward {
             let q_k = x_norm.shape().dims()[1];
             let q_n = q_base.shape().dims()[1];
             let wq_id = tape.register(block.wq.weight.clone());
-            let q_base_param = grim_autograd::ParamId::base(layer_idx, grim_autograd::LoRAInjectionPoint::QProj);
+            let q_base_param =
+                grim_autograd::ParamId::base(layer_idx, grim_autograd::LoRAInjectionPoint::QProj);
             tape.record_matmul(
-                x_norm_base_id, wq_id, q_base.clone(), false, true, q_m, q_k, q_n, Some(q_base_param),
+                x_norm_base_id,
+                wq_id,
+                q_base.clone(),
+                false,
+                true,
+                q_m,
+                q_k,
+                q_n,
+                Some(q_base_param),
             )
         } else {
             tape.register(q_base.clone())
@@ -218,7 +227,18 @@ impl StreamingBlockForward {
             let k_n = k_base.shape().dims()[1];
             let wk_id = tape.register(block.wk.weight.clone());
             tape.record_matmul(
-                x_norm_base_id, wk_id, k_base.clone(), false, true, k_m, k_k, k_n, Some(grim_autograd::ParamId::base(layer_idx, grim_autograd::LoRAInjectionPoint::KProj)),
+                x_norm_base_id,
+                wk_id,
+                k_base.clone(),
+                false,
+                true,
+                k_m,
+                k_k,
+                k_n,
+                Some(grim_autograd::ParamId::base(
+                    layer_idx,
+                    grim_autograd::LoRAInjectionPoint::KProj,
+                )),
             )
         } else {
             tape.register(k_base.clone())
@@ -241,7 +261,18 @@ impl StreamingBlockForward {
             let v_n = v_base.shape().dims()[1];
             let wv_id = tape.register(block.wv.weight.clone());
             tape.record_matmul(
-                x_norm_base_id, wv_id, v_base.clone(), false, true, v_m, v_k, v_n, Some(grim_autograd::ParamId::base(layer_idx, grim_autograd::LoRAInjectionPoint::VProj)),
+                x_norm_base_id,
+                wv_id,
+                v_base.clone(),
+                false,
+                true,
+                v_m,
+                v_k,
+                v_n,
+                Some(grim_autograd::ParamId::base(
+                    layer_idx,
+                    grim_autograd::LoRAInjectionPoint::VProj,
+                )),
             )
         } else {
             tape.register(v_base.clone())
@@ -257,26 +288,61 @@ impl StreamingBlockForward {
             x_norm_base_id,
         )?;
 
-        // Apply RoPE + qkv_attention via placement-aware BackendDevice
+        // Apply RoPE + qkv_attention via placement-aware BackendDevice.
+        // Q/K arrive as [total_tokens, num_head_dims] (flat layout
+        // (i*num_heads + h)*head_dim, which is exactly what the attention
+        // kernel's q_offset/k_offset expect). RoPE operates on (B, S, D=head_dim),
+        // so we view the same storage as [1, total_tokens*num_heads, head_dim]
+        // with the token position repeated per head — a pure shape change, no
+        // data movement. V is never rotated.
         let num_head_dims = cfg.num_heads * cfg.head_dim;
         let total_tokens = q.shape().elem_count() / num_head_dims;
-        let positions: Vec<u32> = (0..total_tokens as u32).collect();
 
         // RoPE base respects config rope_theta, optionally scaled for long-context training.
-        let rope_base = self
-            .rope_scaling
-            .as_ref()
-            .map_or(cfg.rope_theta, |m| scaling_base(m, cfg.rope_theta, cfg.head_dim));
+        let rope_base = self.rope_scaling.as_ref().map_or(cfg.rope_theta, |m| {
+            scaling_base(m, cfg.rope_theta, cfg.head_dim)
+        });
 
         let dev = pick_device_for_tensor(&q);
 
-        let q_shape = Shape::new(vec![1, total_tokens, num_head_dims]);
-        let k_shape = Shape::new(vec![1, total_tokens, cfg.num_kv_heads * cfg.head_dim]);
+        let mut q_positions = Vec::with_capacity(total_tokens * cfg.num_heads);
+        for t in 0..total_tokens as u32 {
+            for _ in 0..cfg.num_heads {
+                q_positions.push(t);
+            }
+        }
+        let mut k_positions = Vec::with_capacity(total_tokens * cfg.num_kv_heads);
+        for t in 0..total_tokens as u32 {
+            for _ in 0..cfg.num_kv_heads {
+                k_positions.push(t);
+            }
+        }
+        let q_shape = Shape::new(vec![1, total_tokens * cfg.num_heads, cfg.head_dim]);
+        let k_shape = Shape::new(vec![1, total_tokens * cfg.num_kv_heads, cfg.head_dim]);
         let out_shape_3d = Shape::new(vec![total_tokens, cfg.num_heads, cfg.head_dim]);
         let out_shape_2d = Shape::new(vec![total_tokens, num_head_dims]);
 
-        let (q_rot_s, _) = dev.rope(q.storage().as_ref(), &positions, cfg.head_dim, rope_base, &q_shape)?;
-        let (k_rot_s, _) = dev.rope(k.storage().as_ref(), &positions, cfg.head_dim, rope_base, &k_shape)?;
+        // Reshape Q/K to 3D [1, total_tokens*num_heads, head_dim] so that
+        // `rope` sees the per-head split it expects. The data is already laid
+        // out as (i*num_heads + h)*head_dim, so this is a pure shape reinterpretation —
+        // the total element count is unchanged; only the dims vector differs.
+        let q_3d = dev.from_cpu(&q.to_vec_f32()?, &q_shape, DType::F32)?;
+        let k_3d = dev.from_cpu(&k.to_vec_f32()?, &k_shape, DType::F32)?;
+
+        let (q_rot_s, _) = dev.rope(
+            q_3d.as_ref(),
+            &q_positions,
+            cfg.head_dim,
+            rope_base,
+            &q_shape,
+        )?;
+        let (k_rot_s, _) = dev.rope(
+            k_3d.as_ref(),
+            &k_positions,
+            cfg.head_dim,
+            rope_base,
+            &k_shape,
+        )?;
 
         let q_rot = Tensor::new(
             std::sync::Arc::from(q_rot_s),
@@ -321,8 +387,18 @@ impl StreamingBlockForward {
             let wo_n = wo_base.shape().dims()[1];
             let wo_w_id = tape.register(block.wo.weight.clone());
             tape.record_matmul(
-                attn_raw_id, wo_w_id, wo_base.clone(), false, true, wo_m, wo_k, wo_n,
-                Some(grim_autograd::ParamId::base(layer_idx, grim_autograd::LoRAInjectionPoint::OProj)),
+                attn_raw_id,
+                wo_w_id,
+                wo_base.clone(),
+                false,
+                true,
+                wo_m,
+                wo_k,
+                wo_n,
+                Some(grim_autograd::ParamId::base(
+                    layer_idx,
+                    grim_autograd::LoRAInjectionPoint::OProj,
+                )),
             )
         } else {
             tape.register(wo_base.clone())
@@ -340,7 +416,8 @@ impl StreamingBlockForward {
 
         // Residual addition 1
         let dev = grim_autograd::pick_device_for_tensor(&x);
-        let (res1_storage, _) = dev.add(x.storage().as_ref(), wo_out.storage().as_ref(), x.shape())?;
+        let (res1_storage, _) =
+            dev.add(x.storage().as_ref(), wo_out.storage().as_ref(), x.shape())?;
         let res1 = Tensor::new(
             std::sync::Arc::from(res1_storage),
             x.shape().clone(),
@@ -361,8 +438,18 @@ impl StreamingBlockForward {
             let g_n = gate_base.shape().dims()[1];
             let wg_id = tape.register(block.w_gate.weight.clone());
             tape.record_matmul(
-                ffn_norm_id, wg_id, gate_base.clone(), false, true, g_m, g_k, g_n,
-                Some(grim_autograd::ParamId::base(layer_idx, grim_autograd::LoRAInjectionPoint::GateProj)),
+                ffn_norm_id,
+                wg_id,
+                gate_base.clone(),
+                false,
+                true,
+                g_m,
+                g_k,
+                g_n,
+                Some(grim_autograd::ParamId::base(
+                    layer_idx,
+                    grim_autograd::LoRAInjectionPoint::GateProj,
+                )),
             )
         } else {
             tape.register(gate_base.clone())
@@ -385,8 +472,18 @@ impl StreamingBlockForward {
             let u_n = up_base.shape().dims()[1];
             let wu_id = tape.register(block.w_up.weight.clone());
             tape.record_matmul(
-                ffn_norm_id, wu_id, up_base.clone(), false, true, u_m, u_k, u_n,
-                Some(grim_autograd::ParamId::base(layer_idx, grim_autograd::LoRAInjectionPoint::UpProj)),
+                ffn_norm_id,
+                wu_id,
+                up_base.clone(),
+                false,
+                true,
+                u_m,
+                u_k,
+                u_n,
+                Some(grim_autograd::ParamId::base(
+                    layer_idx,
+                    grim_autograd::LoRAInjectionPoint::UpProj,
+                )),
             )
         } else {
             tape.register(up_base.clone())
@@ -402,7 +499,8 @@ impl StreamingBlockForward {
             ffn_norm_id,
         )?;
 
-        let (silu_storage, _) = dev.silu_mul(gate.storage().as_ref(), up.storage().as_ref(), gate.shape())?;
+        let (silu_storage, _) =
+            dev.silu_mul(gate.storage().as_ref(), up.storage().as_ref(), gate.shape())?;
         let silu_tensor = Tensor::new(
             std::sync::Arc::from(silu_storage),
             gate.shape().clone(),
@@ -419,8 +517,18 @@ impl StreamingBlockForward {
             let d_n = down_base.shape().dims()[1];
             let wd_id = tape.register(block.w_down.weight.clone());
             tape.record_matmul(
-                silu_id, wd_id, down_base.clone(), false, true, d_m, d_k, d_n,
-                Some(grim_autograd::ParamId::base(layer_idx, grim_autograd::LoRAInjectionPoint::DownProj)),
+                silu_id,
+                wd_id,
+                down_base.clone(),
+                false,
+                true,
+                d_m,
+                d_k,
+                d_n,
+                Some(grim_autograd::ParamId::base(
+                    layer_idx,
+                    grim_autograd::LoRAInjectionPoint::DownProj,
+                )),
             )
         } else {
             tape.register(down_base.clone())
@@ -437,7 +545,11 @@ impl StreamingBlockForward {
         )?;
 
         // Residual addition 2
-        let (res2_storage, _) = dev.add(res1.storage().as_ref(), down_out.storage().as_ref(), x.shape())?;
+        let (res2_storage, _) = dev.add(
+            res1.storage().as_ref(),
+            down_out.storage().as_ref(),
+            x.shape(),
+        )?;
         let res2 = Tensor::new(
             std::sync::Arc::from(res2_storage),
             x.shape().clone(),
@@ -487,18 +599,32 @@ mod tests {
             let (n, shape) = if name.contains("attn_norm") || name.contains("ffn_norm") {
                 (c.hidden_size, vec![c.hidden_size])
             } else if name.contains("wq") || name.contains("wo") {
-                let rows = if name.contains("wq") { c.num_heads * c.head_dim } else { c.hidden_size };
-                let cols = if name.contains("wq") { c.hidden_size } else { c.num_heads * c.head_dim };
+                let rows = if name.contains("wq") {
+                    c.num_heads * c.head_dim
+                } else {
+                    c.hidden_size
+                };
+                let cols = if name.contains("wq") {
+                    c.hidden_size
+                } else {
+                    c.num_heads * c.head_dim
+                };
                 (rows * cols, vec![rows, cols])
             } else if name.contains("wk") || name.contains("wv") {
-                (c.num_kv_heads * c.head_dim * c.hidden_size,
-                 vec![c.num_kv_heads * c.head_dim, c.hidden_size])
+                (
+                    c.num_kv_heads * c.head_dim * c.hidden_size,
+                    vec![c.num_kv_heads * c.head_dim, c.hidden_size],
+                )
             } else if name.contains("w_gate") || name.contains("w_up") {
-                (c.intermediate_size * c.hidden_size,
-                 vec![c.intermediate_size, c.hidden_size])
+                (
+                    c.intermediate_size * c.hidden_size,
+                    vec![c.intermediate_size, c.hidden_size],
+                )
             } else if name.contains("w_down") {
-                (c.hidden_size * c.intermediate_size,
-                 vec![c.hidden_size, c.intermediate_size])
+                (
+                    c.hidden_size * c.intermediate_size,
+                    vec![c.hidden_size, c.intermediate_size],
+                )
             } else {
                 let default_elems = c.hidden_size.max(128);
                 (default_elems, vec![default_elems])
@@ -536,10 +662,15 @@ mod tests {
         let provider = StubProvider::new();
         let cfg = provider.cfg.clone();
         let mut forward = StreamingBlockForward::new(4, cfg.hidden_size);
-        let x = cpu_tensor(vec![0.5; cfg.hidden_size], Shape::new(vec![1, cfg.hidden_size]));
+        let x = cpu_tensor(
+            vec![0.5; cfg.hidden_size],
+            Shape::new(vec![1, cfg.hidden_size]),
+        );
         let positions = vec![0u32];
 
-        let out = forward.forward_block(&provider, &cfg, 0, &x, Some(&positions)).unwrap();
+        let out = forward
+            .forward_block(&provider, &cfg, 0, &x, Some(&positions))
+            .unwrap();
 
         // Output must have same shape as input (real block forward ran without error)
         assert_eq!(out.shape().dims(), x.shape().dims());
@@ -550,11 +681,18 @@ mod tests {
         let provider = StubProvider::new();
         let cfg = provider.cfg.clone();
         let mut forward = StreamingBlockForward::new(4, cfg.hidden_size);
-        let x = cpu_tensor(vec![0.5; cfg.hidden_size], Shape::new(vec![1, cfg.hidden_size]));
+        let x = cpu_tensor(
+            vec![0.5; cfg.hidden_size],
+            Shape::new(vec![1, cfg.hidden_size]),
+        );
         let positions = vec![0u32];
 
-        let out = forward.forward_block(&provider, &cfg, 0, &x, Some(&positions)).unwrap();
-        let recomputed = forward.recompute_block(&provider, &cfg, 0, Some(&positions)).unwrap();
+        let out = forward
+            .forward_block(&provider, &cfg, 0, &x, Some(&positions))
+            .unwrap();
+        let recomputed = forward
+            .recompute_block(&provider, &cfg, 0, Some(&positions))
+            .unwrap();
 
         // Recomputed output must match the original forward output
         let out_vals = out.to_vec_f32().unwrap();

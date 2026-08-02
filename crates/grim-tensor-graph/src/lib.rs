@@ -1,14 +1,18 @@
+//! IR for tensor fusion detection and subgraph optimization.
+
 use grim_format::gguf::GrimFusionOp;
 
 pub mod ir;
 pub use ir::{ComputationGraph, FusionSequence, GraphNode, OpType};
 
+/// A detected fusion group combining ops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FusionGroup {
     pub op: GrimFusionOp,
     pub tensors: Vec<String>,
 }
 
+/// IR graph with tensor nodes and fusion groups.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TensorGraphIr {
     pub nodes: Vec<String>,
@@ -16,6 +20,7 @@ pub struct TensorGraphIr {
 }
 
 impl TensorGraphIr {
+    /// Returns unique fusion ops recommended for this graph.
     pub fn recommended_fusion_ops(&self) -> Vec<GrimFusionOp> {
         let mut ops = Vec::new();
         for group in &self.fusion_groups {
@@ -43,14 +48,22 @@ where
         fusion_groups.push(group);
     }
 
-    TensorGraphIr { nodes, fusion_groups }
+    TensorGraphIr {
+        nodes,
+        fusion_groups,
+    }
 }
 
 fn detect_rmsnorm_matmul(names: &[String]) -> Option<FusionGroup> {
     let norm = find_first(names, &["input_layernorm", "attention_norm", "rms_norm"])?;
     let linear = find_first(
         names,
-        &["attn_q.weight", "attention.wq.weight", "self_attn.q_proj.weight", "feed_forward.w1.weight"],
+        &[
+            "attn_q.weight",
+            "attention.wq.weight",
+            "self_attn.q_proj.weight",
+            "feed_forward.w1.weight",
+        ],
     )?;
     Some(FusionGroup {
         op: GrimFusionOp::RmsNormMatMul,
@@ -59,9 +72,30 @@ fn detect_rmsnorm_matmul(names: &[String]) -> Option<FusionGroup> {
 }
 
 fn detect_qkv_attention(names: &[String]) -> Option<FusionGroup> {
-    let q = find_first(names, &["attn_q.weight", "attention.wq.weight", "self_attn.q_proj.weight"])?;
-    let k = find_first(names, &["attn_k.weight", "attention.wk.weight", "self_attn.k_proj.weight"])?;
-    let v = find_first(names, &["attn_v.weight", "attention.wv.weight", "self_attn.v_proj.weight"])?;
+    let q = find_first(
+        names,
+        &[
+            "attn_q.weight",
+            "attention.wq.weight",
+            "self_attn.q_proj.weight",
+        ],
+    )?;
+    let k = find_first(
+        names,
+        &[
+            "attn_k.weight",
+            "attention.wk.weight",
+            "self_attn.k_proj.weight",
+        ],
+    )?;
+    let v = find_first(
+        names,
+        &[
+            "attn_v.weight",
+            "attention.wv.weight",
+            "self_attn.v_proj.weight",
+        ],
+    )?;
     Some(FusionGroup {
         op: GrimFusionOp::QkvAttention,
         tensors: vec![q, k, v],
@@ -69,7 +103,8 @@ fn detect_qkv_attention(names: &[String]) -> Option<FusionGroup> {
 }
 
 fn find_first(names: &[String], needles: &[&str]) -> Option<String> {
-    names.iter()
+    names
+        .iter()
         .find(|name| needles.iter().any(|needle| name.contains(needle)))
         .cloned()
 }

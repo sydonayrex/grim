@@ -7,8 +7,12 @@
 //! 3. `backup2` bolt-on merged adapter weights preserve backward gradient fidelity.
 //! 4. ROCm GPU path moved to `grim-backend-rocm/tests/quant_backward_gpu.rs`.
 
-use grim_quant::{quant_q80, dequant_q80, quant_q4k, dequant_q4k};
-use grim_tensor::{backend::BackendDevice, dtype::{DType, KQuantScheme, Storage}, Shape};
+use grim_quant::{dequant_q4k, dequant_q80, quant_q4k, quant_q80};
+use grim_tensor::{
+    Shape,
+    backend::BackendDevice,
+    dtype::{DType, KQuantScheme, Storage},
+};
 
 /// Maximum allowed RMS relative error for Q8_0 (8-bit).
 const MAX_RMS_REL_ERROR_Q8: f32 = 0.05;
@@ -18,7 +22,9 @@ const MAX_RMS_REL_ERROR_Q4K: f32 = 0.20;
 /// RMS relative error: sqrt(mean((orig-recon)^2 / orig^2)).
 fn rms_rel_err(orig: &[f32], recon: &[f32]) -> f32 {
     assert_eq!(orig.len(), recon.len());
-    let sum_sq: f32 = orig.iter().zip(recon.iter())
+    let sum_sq: f32 = orig
+        .iter()
+        .zip(recon.iter())
         .map(|(o, r)| {
             let denom = o.abs().max(1e-3);
             ((o - r) / denom).powi(2)
@@ -49,19 +55,25 @@ fn quant_backward_audit_q8_0_roundtrip() {
     let dequantized = dequant_q80(&quantized, data.len()).unwrap();
     assert_eq!(dequantized.len(), data.len());
     let rms = rms_rel_err(&data, &dequantized);
-    assert!(rms <= MAX_RMS_REL_ERROR_Q8,
-        "Q8_0 RMS rel error {rms:.6} exceeds {MAX_RMS_REL_ERROR_Q8}");
+    assert!(
+        rms <= MAX_RMS_REL_ERROR_Q8,
+        "Q8_0 RMS rel error {rms:.6} exceeds {MAX_RMS_REL_ERROR_Q8}"
+    );
 }
 
 #[test]
 fn quant_backward_audit_q4_k_roundtrip() {
-    let data: Vec<f32> = (0..256).map(|i| 1.0 + (i as f32 * 0.035).sin().abs() * 9.0).collect();
+    let data: Vec<f32> = (0..256)
+        .map(|i| 1.0 + (i as f32 * 0.035).sin().abs() * 9.0)
+        .collect();
     let quantized = quant_q4k(&data).unwrap();
     let dequantized = dequant_q4k(&quantized, data.len()).unwrap();
     assert_eq!(dequantized.len(), data.len());
     let rms = rms_rel_err(&data, &dequantized);
-    assert!(rms <= MAX_RMS_REL_ERROR_Q4K,
-        "Q4_K RMS rel error {rms:.6} exceeds {MAX_RMS_REL_ERROR_Q4K}");
+    assert!(
+        rms <= MAX_RMS_REL_ERROR_Q4K,
+        "Q4_K RMS rel error {rms:.6} exceeds {MAX_RMS_REL_ERROR_Q4K}"
+    );
 }
 
 /// WI-F1-close: Audit backward GEMM gradient `dX = dY @ B^T` for Q8_0 against FP32 reference.
@@ -91,7 +103,9 @@ fn quant_backward_audit_q8_0_gemm_dx_numerics() {
 fn quant_backward_audit_q4_k_gemm_dx_numerics() {
     let (m, k, n) = (8, 256, 256);
     let dy: Vec<f32> = (0..m * n).map(|i| (i as f32 * 0.02).sin()).collect();
-    let b_orig: Vec<f32> = (0..k * n).map(|i| 1.0 + (i as f32 * 0.015).cos().abs() * 8.0).collect();
+    let b_orig: Vec<f32> = (0..k * n)
+        .map(|i| 1.0 + (i as f32 * 0.015).cos().abs() * 8.0)
+        .collect();
 
     let dx_ref = compute_dx(&dy, &b_orig, m, n, k);
 
@@ -116,7 +130,11 @@ fn quant_backward_audit_backup2_merged_gemm_dx_numerics() {
     let b_adapter: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.03).sin() * 0.5).collect();
 
     // Merged reference matrix
-    let b_merged_ref: Vec<f32> = b_base.iter().zip(b_adapter.iter()).map(|(b, a)| b + a).collect();
+    let b_merged_ref: Vec<f32> = b_base
+        .iter()
+        .zip(b_adapter.iter())
+        .map(|(b, a)| b + a)
+        .collect();
     let dx_ref = compute_dx(&dy, &b_merged_ref, m, n, k);
 
     // Quantized base and adapter matrices
@@ -126,7 +144,11 @@ fn quant_backward_audit_backup2_merged_gemm_dx_numerics() {
     let q_adapter = quant_q80(&b_adapter).unwrap();
     let dq_adapter = dequant_q80(&q_adapter, b_adapter.len()).unwrap();
 
-    let b_merged_quant: Vec<f32> = dq_base.iter().zip(dq_adapter.iter()).map(|(b, a)| b + a).collect();
+    let b_merged_quant: Vec<f32> = dq_base
+        .iter()
+        .zip(dq_adapter.iter())
+        .map(|(b, a)| b + a)
+        .collect();
     let dx_quant = compute_dx(&dy, &b_merged_quant, m, n, k);
 
     let rms = rms_rel_err(&dx_ref, &dx_quant);
@@ -159,4 +181,3 @@ fn quant_backward_audit_fail_check_corrupted_data() {
         "Q8_0 backward GEMM dX RMS rel error {rms:.6} exceeds limit {MAX_RMS_REL_ERROR_Q8}"
     );
 }
-

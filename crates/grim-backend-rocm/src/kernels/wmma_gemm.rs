@@ -1,15 +1,6 @@
 //! WMMA matrix-core GEMM HIP kernel (WI-G).
-//!
-//! Provides the JIT compilation source for Wave Matrix Multiply-Accumulate (WMMA)
-//! operations on GFX11+ (RDNA3/RDNA4) architectures. To allow compilation and testing
-//! on GFX10 (RDNA2, e.g. gfx1036), the kernel uses preprocessor guards to fall back
-//! to a scalar thread-level GEMM when compiled on non-WMMA architectures.
 
 /// HIP source for `grim_wmma_gemm`.
-///
-/// Concatenated into the crate-wide JIT compilation source. On GFX11+ targets,
-/// it compiles using Clang/HIP's rocWMMA headers or compiler builtins. On older
-/// architectures, it compiles to a scalar fallback so compilation succeeds.
 pub const KERNEL_SOURCE: &str = r#"
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1200__) || defined(__gfx1201__)
 #include <rocwmma/rocwmma.hpp>
@@ -362,7 +353,10 @@ mod self_tests {
             KERNEL_SOURCE.contains("extern \"C\" __global__ void grim_wmma_gemm"),
             "WMMA GEMM kernel entry must be JIT-discoverable by name"
         );
-        assert!(KERNEL_SOURCE.contains("_Float16"), "kernel must use _Float16 type");
+        assert!(
+            KERNEL_SOURCE.contains("_Float16"),
+            "kernel must use _Float16 type"
+        );
     }
 
     /// Verifies Jay (MXFP4) backward kernel is present for JIT discovery.

@@ -1,4 +1,4 @@
-use grim_format::gguf::{GgufDType, GGUF_MAGIC, GGUF_VERSION};
+use grim_format::gguf::{GGUF_MAGIC, GGUF_VERSION, GgufDType};
 use grim_format::tprov::GgufProvider;
 use grim_tensor::provider::TensorProvider;
 
@@ -97,7 +97,10 @@ fn golden_gguf_provider_meta_returns_expected_metadata() {
     let meta = provider.meta("foo.bar").unwrap();
 
     assert_eq!(meta.shape, vec![4, 8], "meta shape");
-    assert!(matches!(meta.dtype.storage, grim_tensor::Storage::Native), "meta dtype should be native");
+    assert!(
+        matches!(meta.dtype.storage, grim_tensor::Storage::Native),
+        "meta dtype should be native"
+    );
 }
 
 /// Golden test: GgufProvider::get rejects unknown tensor name.

@@ -6,9 +6,9 @@ use grim_core::grim_plugins_dir;
 use grim_core::hyperparams::{HyperparameterExtractor, MetadataLookup};
 use grim_core::model::CausalLm;
 use grim_format::{
+    GgufProvider,
     gguf::GgufValue,
     tprov::{RemappingTensorProvider, SafetensorsProvider},
-    GgufProvider,
 };
 use grim_models_mamba::{
     GraniteHybridConfig, JambaConfig, Mamba, Mamba2Config, MambaConfig, NemotronHConfig, Rwkv,
@@ -93,11 +93,7 @@ fn get_meta_str(provider: &GgufProvider, key: &str) -> Option<String> {
 /// Helper function to get metadata as array from GGUF provider
 fn get_meta_array<'a>(provider: &'a GgufProvider, key: &str) -> Option<&'a [GgufValue]> {
     let v: Option<&GgufValue> = provider.metadata(key);
-    if let Some(v) = v {
-        v.as_array()
-    } else {
-        None
-    }
+    if let Some(v) = v { v.as_array() } else { None }
 }
 
 /// Metadata accessor implementation wrapping `GgufProvider`.
@@ -236,15 +232,12 @@ fn load_model_from_config(
     let arch_str = config
         .model_type
         .or_else(|| config.architectures.and_then(|a| a.first().cloned()))
-        .ok_or_else(|| {
-            Error::Config("config.json missing model_type or architectures".into())
-        })?;
+        .ok_or_else(|| Error::Config("config.json missing model_type or architectures".into()))?;
     let model_arch = ModelArchitecture::from_str(&arch_str);
 
     // Parse ArchCompatSpec from raw config.json for plugin enrichment.
     // Fall back to an empty spec if parsing fails — we still use SafetensorsConfig fields.
-    let compat_spec = raw_config_str
-        .and_then(|s| ArchCompatSpec::from_hf_config_json(s).ok());
+    let compat_spec = raw_config_str.and_then(|s| ArchCompatSpec::from_hf_config_json(s).ok());
 
     let vocab_size = config.vocab_size;
     let hidden_size = config.hidden_size;
@@ -252,22 +245,48 @@ fn load_model_from_config(
     let rms_norm_eps = config.rms_norm_eps.unwrap_or(1e-5);
     let num_heads = config.num_attention_heads.unwrap_or(32);
     let num_kv_heads = config.num_key_value_heads.unwrap_or(num_heads);
-    let head_dim = config.head_dim.unwrap_or_else(|| if num_heads > 0 { hidden_size / num_heads } else { 128 });
+    let head_dim = config.head_dim.unwrap_or_else(|| {
+        if num_heads > 0 {
+            hidden_size / num_heads
+        } else {
+            128
+        }
+    });
     let intermediate_size = config.intermediate_size.unwrap_or(hidden_size * 4);
     let max_seq_len = config.max_position_embeddings.unwrap_or(2048);
     let rope_theta = config.rope_theta.unwrap_or(10000.0);
 
     // Enrich from ArchCompatSpec when available — these fields take priority
     // over SafetensorsConfig defaults for known architectures.
-    let rms_norm_eps = compat_spec.as_ref().map(|s| s.rms_norm_eps).unwrap_or(rms_norm_eps);
-    let rope_theta = compat_spec.as_ref().map(|s| s.rope_theta).unwrap_or(rope_theta);
-    let max_seq_len = compat_spec.as_ref().map(|s| s.max_seq_len).unwrap_or(max_seq_len);
-    let expert_count = compat_spec.as_ref().and_then(|s| s.expert_count).or(config.num_local_experts).unwrap_or(8);
-    let expert_used_count = compat_spec.as_ref().and_then(|s| s.expert_used_count).or(config.num_experts_per_tok).unwrap_or(2);
+    let rms_norm_eps = compat_spec
+        .as_ref()
+        .map(|s| s.rms_norm_eps)
+        .unwrap_or(rms_norm_eps);
+    let rope_theta = compat_spec
+        .as_ref()
+        .map(|s| s.rope_theta)
+        .unwrap_or(rope_theta);
+    let max_seq_len = compat_spec
+        .as_ref()
+        .map(|s| s.max_seq_len)
+        .unwrap_or(max_seq_len);
+    let expert_count = compat_spec
+        .as_ref()
+        .and_then(|s| s.expert_count)
+        .or(config.num_local_experts)
+        .unwrap_or(8);
+    let expert_used_count = compat_spec
+        .as_ref()
+        .and_then(|s| s.expert_used_count)
+        .or(config.num_experts_per_tok)
+        .unwrap_or(2);
 
     dbg_eprintln!(
         "[grim] Loading config from safetensors: architecture={:?}, layers={}, hidden={}, vocab={}",
-        model_arch, num_layers, hidden_size, vocab_size
+        model_arch,
+        num_layers,
+        hidden_size,
+        vocab_size
     );
 
     let ws = WeightSource::root(provider, device.clone());
@@ -351,7 +370,10 @@ fn load_model_from_config(
             let m = Llama::load(device.clone(), &ws, llama_cfg)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::Qwen | ModelArchitecture::Qwen2 | ModelArchitecture::Qwen3 | ModelArchitecture::Qwen35 => {
+        ModelArchitecture::Qwen
+        | ModelArchitecture::Qwen2
+        | ModelArchitecture::Qwen3
+        | ModelArchitecture::Qwen35 => {
             let qwen_cfg = QwenConfig {
                 vocab_size,
                 hidden_size,
@@ -380,7 +402,10 @@ fn load_model_from_config(
             let m = Llama::load(device.clone(), &ws, llama_cfg)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::Qwen2Moe | ModelArchitecture::Qwen3Moe | ModelArchitecture::Qwen35Moe | ModelArchitecture::Qwen3VlMoe => {
+        ModelArchitecture::Qwen2Moe
+        | ModelArchitecture::Qwen3Moe
+        | ModelArchitecture::Qwen35Moe
+        | ModelArchitecture::Qwen3VlMoe => {
             let qwen_moe_cfg = MoeConfig {
                 vocab_size,
                 hidden_size,
@@ -395,7 +420,10 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            eprintln!("[grim] Loading Qwen-MoE model with config: {:?}", qwen_moe_cfg);
+            eprintln!(
+                "[grim] Loading Qwen-MoE model with config: {:?}",
+                qwen_moe_cfg
+            );
             let deepseek_cfg = DeepSeekConfig {
                 vocab_size,
                 hidden_size,
@@ -502,7 +530,10 @@ fn load_model_from_config(
                 rms_norm_eps,
                 max_seq_len,
             };
-            eprintln!("[grim] Loading NemotronH model with config: {:?}", nemotron_cfg);
+            eprintln!(
+                "[grim] Loading NemotronH model with config: {:?}",
+                nemotron_cfg
+            );
             let mamba_cfg = MambaConfig {
                 vocab_size,
                 hidden_size,
@@ -527,7 +558,10 @@ fn load_model_from_config(
                 rms_norm_eps,
                 max_seq_len,
             };
-            eprintln!("[grim] Loading GraniteHybrid model with config: {:?}", granite_cfg);
+            eprintln!(
+                "[grim] Loading GraniteHybrid model with config: {:?}",
+                granite_cfg
+            );
             let mamba_cfg = MambaConfig {
                 vocab_size,
                 hidden_size,
@@ -551,7 +585,10 @@ fn load_model_from_config(
                 layer_norm_eps: rms_norm_eps,
                 max_seq_len,
             };
-            eprintln!("[grim] Loading ModernBERT model with config: {:?}", modern_bert_cfg);
+            eprintln!(
+                "[grim] Loading ModernBERT model with config: {:?}",
+                modern_bert_cfg
+            );
             let bert_cfg = BertConfig {
                 vocab_size,
                 hidden_size,
@@ -563,7 +600,11 @@ fn load_model_from_config(
             let m = Bert::load(device.clone(), &ws, bert_cfg)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::NomicBert | ModelArchitecture::NomicBertMoe | ModelArchitecture::NeoBert | ModelArchitecture::JinaBertV2 | ModelArchitecture::JinaBertV3 => {
+        ModelArchitecture::NomicBert
+        | ModelArchitecture::NomicBertMoe
+        | ModelArchitecture::NeoBert
+        | ModelArchitecture::JinaBertV2
+        | ModelArchitecture::JinaBertV3 => {
             let nomic_bert_cfg = NomicBertConfig {
                 vocab_size,
                 hidden_size,
@@ -573,7 +614,10 @@ fn load_model_from_config(
                 layer_norm_eps: rms_norm_eps,
                 max_seq_len,
             };
-            eprintln!("[grim] Loading NomicBERT model with config: {:?}", nomic_bert_cfg);
+            eprintln!(
+                "[grim] Loading NomicBERT model with config: {:?}",
+                nomic_bert_cfg
+            );
             let bert_cfg = BertConfig {
                 vocab_size,
                 hidden_size,
@@ -595,7 +639,10 @@ fn load_model_from_config(
                 rms_norm_eps,
                 max_seq_len,
             };
-            eprintln!("[grim] Loading T5Encoder model with config: {:?}", t5_enc_cfg);
+            eprintln!(
+                "[grim] Loading T5Encoder model with config: {:?}",
+                t5_enc_cfg
+            );
             let t5_cfg = T5Config {
                 vocab_size,
                 hidden_size,
@@ -723,7 +770,10 @@ fn load_model_from_config(
             let m = Gpt2::load(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::Gemma | ModelArchitecture::Gemma2 | ModelArchitecture::Gemma3 | ModelArchitecture::Gemma4 => {
+        ModelArchitecture::Gemma
+        | ModelArchitecture::Gemma2
+        | ModelArchitecture::Gemma3
+        | ModelArchitecture::Gemma4 => {
             let cfg = GemmaConfig {
                 vocab_size,
                 hidden_size,
@@ -737,7 +787,10 @@ fn load_model_from_config(
             let m = Gemma::load(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::DeepSeek | ModelArchitecture::DeepSeek2 | ModelArchitecture::DeepSeek32 | ModelArchitecture::DeepSeek4 => {
+        ModelArchitecture::DeepSeek
+        | ModelArchitecture::DeepSeek2
+        | ModelArchitecture::DeepSeek32
+        | ModelArchitecture::DeepSeek4 => {
             let cfg = DeepSeekConfig {
                 vocab_size,
                 hidden_size,
@@ -782,9 +835,10 @@ fn load_model_from_config(
                     arch_str, spec.base_architecture, spec.is_moe
                 );
                 let spec_clone = spec.clone();
-                let remapped_provider = RemappingTensorProvider::new(provider, move |name: &str| -> String {
-                    spec_clone.remap_tensor_name(name)
-                });
+                let remapped_provider =
+                    RemappingTensorProvider::new(provider, move |name: &str| -> String {
+                        spec_clone.remap_tensor_name(name)
+                    });
                 let ws = WeightSource::root(&remapped_provider, device.clone());
 
                 if spec.is_moe {
@@ -831,7 +885,10 @@ fn load_model_from_config(
                 }
             }
 
-            eprintln!("[grim] Unknown architecture '{}' with no plugin compat spec found; using default Llama loader", arch_str);
+            eprintln!(
+                "[grim] Unknown architecture '{}' with no plugin compat spec found; using default Llama loader",
+                arch_str
+            );
             let cfg = LlamaConfig {
                 vocab_size,
                 hidden_size,
@@ -856,7 +913,10 @@ fn load_model_with_providers(
     device: Device,
     _path: &str,
 ) -> Result<Box<dyn CausalLm>> {
-    eprintln!("[alias] load_model_with_providers called, arch={:?}", provider.architecture());
+    eprintln!(
+        "[alias] load_model_with_providers called, arch={:?}",
+        provider.architecture()
+    );
     // Extract architecture from GGUF metadata
     let arch_str = provider.architecture().ok_or_else(|| {
         Error::Config(format!(
@@ -874,7 +934,11 @@ fn load_model_with_providers(
     );
 
     let hf_gguf_map = TensorNamingRegistry::remap_hf_to_gguf(model_arch, hparams.num_layers);
-    eprintln!("[alias] remap map has {} entries, sample: {:?}", hf_gguf_map.len(), hf_gguf_map.get("tok_embeddings.weight"));
+    eprintln!(
+        "[alias] remap map has {} entries, sample: {:?}",
+        hf_gguf_map.len(),
+        hf_gguf_map.get("tok_embeddings.weight")
+    );
     let remapped_provider = RemappingTensorProvider::new(weight_provider, {
         let hf_gguf_map = hf_gguf_map.clone();
         move |name| {
@@ -967,7 +1031,10 @@ fn load_model_with_providers(
             let m = Llama::load(device.clone(), &ws, llama_cfg)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::Qwen | ModelArchitecture::Qwen2 | ModelArchitecture::Qwen3 | ModelArchitecture::Qwen35 => {
+        ModelArchitecture::Qwen
+        | ModelArchitecture::Qwen2
+        | ModelArchitecture::Qwen3
+        | ModelArchitecture::Qwen35 => {
             let qwen_cfg = QwenConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -996,7 +1063,10 @@ fn load_model_with_providers(
             let m = Llama::load(device.clone(), &ws, llama_cfg)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::Qwen2Moe | ModelArchitecture::Qwen3Moe | ModelArchitecture::Qwen35Moe | ModelArchitecture::Qwen3VlMoe => {
+        ModelArchitecture::Qwen2Moe
+        | ModelArchitecture::Qwen3Moe
+        | ModelArchitecture::Qwen35Moe
+        | ModelArchitecture::Qwen3VlMoe => {
             let qwen_moe_cfg = MoeConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -1011,7 +1081,10 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!("[grim] Loading Qwen-MoE model with config: {:?}", qwen_moe_cfg);
+            eprintln!(
+                "[grim] Loading Qwen-MoE model with config: {:?}",
+                qwen_moe_cfg
+            );
             let deepseek_cfg = DeepSeekConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -1118,7 +1191,10 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!("[grim] Loading NemotronH model with config: {:?}", nemotron_cfg);
+            eprintln!(
+                "[grim] Loading NemotronH model with config: {:?}",
+                nemotron_cfg
+            );
             let mamba_cfg = MambaConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -1143,7 +1219,10 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!("[grim] Loading GraniteHybrid model with config: {:?}", granite_cfg);
+            eprintln!(
+                "[grim] Loading GraniteHybrid model with config: {:?}",
+                granite_cfg
+            );
             let mamba_cfg = MambaConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -1167,7 +1246,10 @@ fn load_model_with_providers(
                 layer_norm_eps: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!("[grim] Loading ModernBERT model with config: {:?}", modern_bert_cfg);
+            eprintln!(
+                "[grim] Loading ModernBERT model with config: {:?}",
+                modern_bert_cfg
+            );
             let bert_cfg = BertConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -1179,7 +1261,11 @@ fn load_model_with_providers(
             let m = Bert::load(device.clone(), &ws, bert_cfg)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::NomicBert | ModelArchitecture::NomicBertMoe | ModelArchitecture::NeoBert | ModelArchitecture::JinaBertV2 | ModelArchitecture::JinaBertV3 => {
+        ModelArchitecture::NomicBert
+        | ModelArchitecture::NomicBertMoe
+        | ModelArchitecture::NeoBert
+        | ModelArchitecture::JinaBertV2
+        | ModelArchitecture::JinaBertV3 => {
             let nomic_bert_cfg = NomicBertConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -1189,7 +1275,10 @@ fn load_model_with_providers(
                 layer_norm_eps: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!("[grim] Loading NomicBERT model with config: {:?}", nomic_bert_cfg);
+            eprintln!(
+                "[grim] Loading NomicBERT model with config: {:?}",
+                nomic_bert_cfg
+            );
             let bert_cfg = BertConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -1211,7 +1300,10 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!("[grim] Loading T5Encoder model with config: {:?}", t5_enc_cfg);
+            eprintln!(
+                "[grim] Loading T5Encoder model with config: {:?}",
+                t5_enc_cfg
+            );
             let t5_cfg = T5Config {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -1344,7 +1436,10 @@ fn load_model_with_providers(
             let m = Gpt2::load(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::Gemma | ModelArchitecture::Gemma2 | ModelArchitecture::Gemma3 | ModelArchitecture::Gemma4 => {
+        ModelArchitecture::Gemma
+        | ModelArchitecture::Gemma2
+        | ModelArchitecture::Gemma3
+        | ModelArchitecture::Gemma4 => {
             let cfg = GemmaConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -1358,7 +1453,10 @@ fn load_model_with_providers(
             let m = Gemma::load(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::DeepSeek | ModelArchitecture::DeepSeek2 | ModelArchitecture::DeepSeek32 | ModelArchitecture::DeepSeek4 => {
+        ModelArchitecture::DeepSeek
+        | ModelArchitecture::DeepSeek2
+        | ModelArchitecture::DeepSeek32
+        | ModelArchitecture::DeepSeek4 => {
             let cfg = DeepSeekConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -1410,9 +1508,10 @@ fn load_model_with_providers(
                     arch_str, spec.base_architecture, spec.is_moe
                 );
                 let spec_clone = spec.clone();
-                let remapped_provider = RemappingTensorProvider::new(weight_provider, move |name: &str| -> String {
-                    spec_clone.remap_tensor_name(name)
-                });
+                let remapped_provider =
+                    RemappingTensorProvider::new(weight_provider, move |name: &str| -> String {
+                        spec_clone.remap_tensor_name(name)
+                    });
                 let ws = WeightSource::root(&remapped_provider, device.clone());
 
                 if spec.is_moe {
@@ -1459,7 +1558,10 @@ fn load_model_with_providers(
                 }
             }
 
-            eprintln!("[grim] Unknown GGUF architecture '{}' with no plugin compat spec found; using default Llama loader", arch_str);
+            eprintln!(
+                "[grim] Unknown GGUF architecture '{}' with no plugin compat spec found; using default Llama loader",
+                arch_str
+            );
             let cfg = LlamaConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -1493,7 +1595,10 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
             "cuda" => {
                 if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
                     if let Some(first) = cuda_devices.first() {
-                        eprintln!("[model_loader] Using CUDA device {} (forced)", first.ordinal());
+                        eprintln!(
+                            "[model_loader] Using CUDA device {} (forced)",
+                            first.ordinal()
+                        );
                         let dev = Device::Cuda(first.ordinal());
                         return if is_grim {
                             load_model_from_grim(path, dev)
@@ -1508,7 +1613,10 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
             "rocm" => {
                 if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
                     if let Some(first) = rocm_devices.first() {
-                        eprintln!("[model_loader] Using ROCm device {} (forced)", first.ordinal());
+                        eprintln!(
+                            "[model_loader] Using ROCm device {} (forced)",
+                            first.ordinal()
+                        );
                         let dev = Device::Rocm(first.ordinal());
                         return if is_grim {
                             load_model_from_grim(path, dev)
@@ -1627,7 +1735,8 @@ mod tests {
             "num_attention_heads": 16
         }"#;
 
-        let spec = resolve_arch_compat_spec("custom_transformer", Some(sample_json)).expect("must resolve spec");
+        let spec = resolve_arch_compat_spec("custom_transformer", Some(sample_json))
+            .expect("must resolve spec");
         assert_eq!(spec.hidden_size, 2048);
         assert_eq!(spec.num_layers, 12);
         assert_eq!(spec.num_heads, 16);

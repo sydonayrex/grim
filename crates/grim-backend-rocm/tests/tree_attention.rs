@@ -1,8 +1,6 @@
+use grim_backend_rocm::{RocmDevice, launch_tree_attention};
+use grim_tensor::{BackendDevice, BackendStorage, DType, Shape};
 use std::sync::Arc;
-use grim_backend_rocm::{
-    RocmDevice, launch_tree_attention,
-};
-use grim_tensor::{Shape, DType, BackendDevice, BackendStorage};
 
 #[test]
 fn test_tree_attention_gpu_matches_reference() {
@@ -11,7 +9,10 @@ fn test_tree_attention_gpu_matches_reference() {
         return;
     }
 
-    let dev = Arc::new(RocmDevice::new(0));
+    let dev = Arc::new(
+        RocmDevice::try_new(0)
+            .expect("RocmDevice::try_new(0) should succeed on a system with ROCm"),
+    );
 
     let batch = 1u32;
     let num_heads = 2u32;
@@ -22,17 +23,33 @@ fn test_tree_attention_gpu_matches_reference() {
     let cache_offset = 8u32;
 
     // Define shapes
-    let q_shape = Shape::new(vec![batch as usize, (1 + gamma) as usize, num_heads as usize, head_dim as usize]);
-    let kv_shape = Shape::new(vec![batch as usize, kv_seq_len as usize, num_kv_heads as usize, head_dim as usize]);
+    let q_shape = Shape::new(vec![
+        batch as usize,
+        (1 + gamma) as usize,
+        num_heads as usize,
+        head_dim as usize,
+    ]);
+    let kv_shape = Shape::new(vec![
+        batch as usize,
+        kv_seq_len as usize,
+        num_kv_heads as usize,
+        head_dim as usize,
+    ]);
     let parents_shape = Shape::new(vec![(1 + gamma) as usize]);
     let out_shape = q_shape.clone();
 
     // Generate mock Q, K, V data on CPU
-    let q_cpu: Vec<f32> = (0..q_shape.elem_count()).map(|x| (x as f32 * 0.1).sin()).collect();
-    let k_cpu: Vec<f32> = (0..kv_shape.elem_count()).map(|x| (x as f32 * 0.15).cos()).collect();
-    let v_cpu: Vec<f32> = (0..kv_shape.elem_count()).map(|x| (x as f32 * 0.2).sin()).collect();
+    let q_cpu: Vec<f32> = (0..q_shape.elem_count())
+        .map(|x| (x as f32 * 0.1).sin())
+        .collect();
+    let k_cpu: Vec<f32> = (0..kv_shape.elem_count())
+        .map(|x| (x as f32 * 0.15).cos())
+        .collect();
+    let v_cpu: Vec<f32> = (0..kv_shape.elem_count())
+        .map(|x| (x as f32 * 0.2).sin())
+        .collect();
 
-    // Tree parents: 
+    // Tree parents:
     // Node 0 is root (parent 0)
     // Node 1 parent is 0
     // Node 2 parent is 1
@@ -52,12 +69,11 @@ fn test_tree_attention_gpu_matches_reference() {
 
     // We can upload parents by casting u32 to f32 raw bits
     let parents_f32: &[f32] = unsafe {
-        std::slice::from_raw_parts(
-            parents_cpu.as_ptr() as *const f32,
-            parents_cpu.len(),
-        )
+        std::slice::from_raw_parts(parents_cpu.as_ptr() as *const f32, parents_cpu.len())
     };
-    let parents_storage = dev.from_cpu(parents_f32, &parents_shape, DType::F32).unwrap();
+    let parents_storage = dev
+        .from_cpu(parents_f32, &parents_shape, DType::F32)
+        .unwrap();
 
     // Launch
     let res = launch_tree_attention(
@@ -83,11 +99,15 @@ fn test_tree_attention_gpu_matches_reference() {
 
     // Reconstruct path verification helper
     let is_ancestor = |j_tree: usize, i_tree: usize| -> bool {
-        if j_tree == i_tree { return true; }
+        if j_tree == i_tree {
+            return true;
+        }
         let mut curr = i_tree;
         while curr > 0 {
             curr = parents_cpu[curr] as usize;
-            if curr == j_tree { return true; }
+            if curr == j_tree {
+                return true;
+            }
         }
         false
     };
@@ -95,15 +115,15 @@ fn test_tree_attention_gpu_matches_reference() {
     // CPU reference tree attention logic
     let mut want_out = vec![0.0f32; out_shape.elem_count()];
     let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
-    
+
     for b_idx in 0..batch as usize {
         for i_tree in 0..(1 + gamma) as usize {
             for h in 0..num_heads as usize {
                 let kv_head = h / (num_heads as usize / num_kv_heads as usize);
-                
+
                 let mut scores = Vec::new();
                 let mut max_score = -1e30f32;
-                
+
                 // Collect valid keys/values for this query tree node i_tree
                 for j in 0..kv_seq_len as usize {
                     let mut attend = false;
@@ -115,12 +135,20 @@ fn test_tree_attention_gpu_matches_reference() {
                             attend = true;
                         }
                     }
-                    if !attend { continue; }
+                    if !attend {
+                        continue;
+                    }
 
                     let mut dot = 0.0f32;
                     for d in 0..head_dim as usize {
-                        let q_offset = ((b_idx * (1 + gamma) as usize + i_tree) * num_heads as usize + h) * head_dim as usize + d;
-                        let kv_offset = ((b_idx * kv_seq_len as usize + j) * num_kv_heads as usize + kv_head) * head_dim as usize + d;
+                        let q_offset =
+                            ((b_idx * (1 + gamma) as usize + i_tree) * num_heads as usize + h)
+                                * head_dim as usize
+                                + d;
+                        let kv_offset = ((b_idx * kv_seq_len as usize + j) * num_kv_heads as usize
+                            + kv_head)
+                            * head_dim as usize
+                            + d;
                         dot += q_cpu[q_offset] * k_cpu[kv_offset];
                     }
                     let score = dot * inv_sqrt_d;
@@ -129,7 +157,7 @@ fn test_tree_attention_gpu_matches_reference() {
                         max_score = score;
                     }
                 }
-                
+
                 let mut sum_exp = 0.0f32;
                 let mut exp_scores = Vec::new();
                 for &(_, score) in &scores {
@@ -137,16 +165,22 @@ fn test_tree_attention_gpu_matches_reference() {
                     exp_scores.push(val);
                     sum_exp += val;
                 }
-                
+
                 for d in 0..head_dim as usize {
                     let mut val_acc = 0.0f32;
                     for idx in 0..scores.len() {
                         let j = scores[idx].0;
                         let w = exp_scores[idx];
-                        let kv_offset = ((b_idx * kv_seq_len as usize + j) * num_kv_heads as usize + kv_head) * head_dim as usize + d;
+                        let kv_offset = ((b_idx * kv_seq_len as usize + j) * num_kv_heads as usize
+                            + kv_head)
+                            * head_dim as usize
+                            + d;
                         val_acc += w * v_cpu[kv_offset];
                     }
-                    let out_offset = ((b_idx * (1 + gamma) as usize + i_tree) * num_heads as usize + h) * head_dim as usize + d;
+                    let out_offset = ((b_idx * (1 + gamma) as usize + i_tree) * num_heads as usize
+                        + h)
+                        * head_dim as usize
+                        + d;
                     want_out[out_offset] = val_acc / sum_exp;
                 }
             }
@@ -162,7 +196,10 @@ fn test_tree_attention_gpu_matches_reference() {
         assert!(
             diff / denom < 1e-3,
             "Divergence at index {}: got {}, want {} (rel diff: {})",
-            i, got, want, diff / denom
+            i,
+            got,
+            want,
+            diff / denom
         );
     }
 }

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
-use grim_tensor::dtype::{DType, Storage, ArithType};
+use grim_tensor::dtype::{ArithType, DType, Storage};
 use grim_tensor::error::{Error, Result};
 
 /// Parsed safetensors header. Each tensor entry contains its shape, dtype
@@ -40,7 +40,13 @@ impl SafetensorInfo {
 
 /// Parse the safetensors header JSON and return tensor index entries and header metadata.
 /// Does NOT read tensor data — call `read_safetensor_bytes` per tensor.
-pub fn read_safetensors_header<R: Read + Seek>(mut reader: R) -> Result<(HashMap<String, SafetensorInfo>, Option<HashMap<String, String>>, u64)> {
+pub fn read_safetensors_header<R: Read + Seek>(
+    mut reader: R,
+) -> Result<(
+    HashMap<String, SafetensorInfo>,
+    Option<HashMap<String, String>>,
+    u64,
+)> {
     let mut len_bytes = [0u8; 8];
     reader.read_exact(&mut len_bytes)?;
     let header_len = u64::from_le_bytes(len_bytes) as usize;
@@ -51,10 +57,12 @@ pub fn read_safetensors_header<R: Read + Seek>(mut reader: R) -> Result<(HashMap
     let header: serde_json::Value = serde_json::from_slice(&header_json)
         .map_err(|e| Error::Backend(format!("invalid safetensors JSON header: {e}")))?;
 
-    let header_map = header.as_object()
+    let header_map = header
+        .as_object()
         .ok_or_else(|| Error::Backend("safetensors header is not a JSON object".into()))?;
 
-    let metadata = header_map.get("__metadata__")
+    let metadata = header_map
+        .get("__metadata__")
         .and_then(|v| v.as_object())
         .map(|obj| {
             let mut map = HashMap::new();
@@ -72,22 +80,26 @@ pub fn read_safetensors_header<R: Read + Seek>(mut reader: R) -> Result<(HashMap
         if key == "__metadata__" {
             continue;
         }
-        let obj = val.as_object()
+        let obj = val
+            .as_object()
             .ok_or_else(|| Error::Backend(format!("safetensors entry '{key}' is not an object")))?;
 
-        let dtype_tag = obj.get("dtype")
+        let dtype_tag = obj
+            .get("dtype")
             .and_then(|v| v.as_str())
             .ok_or_else(|| Error::Backend(format!("missing dtype for '{key}'")))?
             .to_string();
 
-        let shape = obj.get("shape")
+        let shape = obj
+            .get("shape")
             .and_then(|v| v.as_array())
             .ok_or_else(|| Error::Backend(format!("missing shape for '{key}'")))?
             .iter()
             .map(|v| v.as_u64().unwrap_or(0) as usize)
             .collect::<Vec<_>>();
 
-        let data_offsets = obj.get("data_offsets")
+        let data_offsets = obj
+            .get("data_offsets")
             .and_then(|v| v.as_array())
             .ok_or_else(|| Error::Backend(format!("missing data_offsets for '{key}'")))?;
 
@@ -135,8 +147,13 @@ impl SafetensorInfo {
             "F32" => Ok(DType::F32),
             "BF16" => Ok(DType::BF16),
             "F16" => Ok(DType::F16),
-            "I8" | "U8" => Ok(DType { arith: ArithType::U8, storage: Storage::Native }),
-            other => Err(Error::Backend(format!("Unsupported safetensors dtype: '{other}'"))),
+            "I8" | "U8" => Ok(DType {
+                arith: ArithType::U8,
+                storage: Storage::Native,
+            }),
+            other => Err(Error::Backend(format!(
+                "Unsupported safetensors dtype: '{other}'"
+            ))),
         }
     }
 }

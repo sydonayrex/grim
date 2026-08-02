@@ -5,6 +5,7 @@
 
 use crate::ops::{
     AddArgs, MatMulArgs, ScaleArgs, add_backward, lora_backward, matmul_backward, scale_backward,
+    silu_mul_backward,
 };
 use crate::param::TrainableParams;
 use crate::tape::{Tape, TapeMetadata, TensorId};
@@ -129,6 +130,17 @@ pub fn backward(
                 };
                 let g = scale_backward(&args)?;
                 accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], g)?;
+            }
+            TapeMetadata::SiluMul => {
+                let gate = tape
+                    .get(entry.inputs[0])
+                    .ok_or_else(|| Error::Backend("missing silu_mul gate".into()))?;
+                let up = tape
+                    .get(entry.inputs[1])
+                    .ok_or_else(|| Error::Backend("missing silu_mul up".into()))?;
+                let (d_gate, d_up) = silu_mul_backward(gate, up, &out_grad)?;
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[0], d_gate)?;
+                accumulate_tensor_grad(&mut ctx.grads, entry.inputs[1], d_up)?;
             }
         }
     }

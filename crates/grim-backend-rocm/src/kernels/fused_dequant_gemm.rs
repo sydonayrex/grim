@@ -1,7 +1,4 @@
 //! Fused Dequantization and GEMM HIP kernel (WI-C).
-//!
-//! Fuses the decompression of variable bit-width weights (2-4 bit codes + row scale),
-//! outlier override logic, and optional residual backup layers into the GEMM loop.
 
 /// HIP source for `grim_fused_dequant_gemm_f16`.
 pub const KERNEL_SOURCE: &str = r#"

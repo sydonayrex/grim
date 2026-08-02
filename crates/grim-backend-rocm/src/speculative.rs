@@ -100,7 +100,11 @@ impl TokenAcceptor {
             // pt >= pd" (Leviathan-style "target cannot say draft is
             // less likely").
             let pd_safe = pd.max(f32::EPSILON);
-            let gate_pt = if self.threshold > 0.0 { self.threshold * pd_safe } else { pd_safe };
+            let gate_pt = if self.threshold > 0.0 {
+                self.threshold * pd_safe
+            } else {
+                pd_safe
+            };
             if pt + f32::EPSILON >= gate_pt {
                 accepted.push(i);
             } else {
@@ -156,7 +160,10 @@ pub struct TreeMaskBuilder {
 
 impl TreeMaskBuilder {
     pub fn new(rows: usize) -> Self {
-        Self { rows, parents: vec![-1; rows] }
+        Self {
+            rows,
+            parents: vec![-1; rows],
+        }
     }
 
     /// Default chain: row `i > 0`'s parent is `i - 1`.
@@ -176,7 +183,11 @@ impl TreeMaskBuilder {
     }
 
     /// Strict variant: rejects setting the root's parent.
-    pub fn set_parent_with_root_check(&mut self, child: usize, parent: usize) -> Result<(), String> {
+    pub fn set_parent_with_root_check(
+        &mut self,
+        child: usize,
+        parent: usize,
+    ) -> Result<(), String> {
         if child == 0 {
             return Err("root must not have a parent".into());
         }
@@ -187,7 +198,10 @@ impl TreeMaskBuilder {
     /// Build the per-row bitmask. Returns `None` if rows == 0.
     pub fn build(&self) -> Option<TreeMask> {
         if self.rows == 0 {
-            return Some(TreeMask { rows: 0, bits: Vec::new() });
+            return Some(TreeMask {
+                rows: 0,
+                bits: Vec::new(),
+            });
         }
         // Compute ancestor closure per row by walking parent chain.
         let mut bits = Vec::with_capacity(self.rows);
@@ -208,7 +222,10 @@ impl TreeMaskBuilder {
             bm |= 1u32 << i;
             bits.push(bm);
         }
-        Some(TreeMask { rows: self.rows, bits })
+        Some(TreeMask {
+            rows: self.rows,
+            bits,
+        })
     }
 }
 
@@ -233,8 +250,12 @@ pub struct StepSummary {
 }
 
 impl StepSummary {
-    pub fn accepted_count(&self) -> usize { self.accepted.len() }
-    pub fn total_emitted(&self) -> usize { self.emitted }
+    pub fn accepted_count(&self) -> usize {
+        self.accepted.len()
+    }
+    pub fn total_emitted(&self) -> usize {
+        self.emitted
+    }
 }
 
 impl fmt::Display for StepSummary {
@@ -318,11 +339,11 @@ where
                 tail_prob: tail,
                 emitted: n + 1,
             },
-            AcceptanceResult::Partial { accepted, rejected_at } => {
-                let tail_p = probs
-                    .get(rejected_at)
-                    .map(|&(_, pt)| pt)
-                    .unwrap_or(0.0);
+            AcceptanceResult::Partial {
+                accepted,
+                rejected_at,
+            } => {
+                let tail_p = probs.get(rejected_at).map(|&(_, pt)| pt).unwrap_or(0.0);
                 StepSummary {
                     accepted,
                     tail_prob: tail_p,
@@ -378,12 +399,7 @@ mod self_tests {
 /// `seed` is a `u64` used to seed the deterministic RNG. Two calls with
 /// the same `(gamma, alpha, trials, seed)` must produce identical
 /// results (regression guard).
-pub fn deterministic_accept_with_seed(
-    gamma: usize,
-    alpha: f32,
-    trials: usize,
-    seed: u64,
-) -> f32 {
+pub fn deterministic_accept_with_seed(gamma: usize, alpha: f32, trials: usize, seed: u64) -> f32 {
     let mut rng = SplitMix64::new(seed);
     let mut total_accepted: u64 = 0;
     let trials_u64 = trials as u64;

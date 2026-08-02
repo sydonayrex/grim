@@ -14,11 +14,10 @@ use std::sync::{Arc, Mutex};
 
 use grim_core::error::Result;
 use grim_core::model::AdapterHandle;
+use grim_core::rng::SimpleRng;
 use grim_core::session::SessionT;
 use grim_core::{CausalLm, Model, ModelConfig};
 use grim_tensor::{ArithType, Device, Tensor};
-use grim_core::rng::SimpleRng;
-
 
 use crate::confidence_head::ConfidenceHead;
 use crate::confidence_scheduler::{ConfidenceScheduler, SpeculationConfig, ThroughputProfile};
@@ -150,7 +149,6 @@ impl SpeculativeCausalLm {
         }
     }
 
-
     pub fn strategy(&self) -> Strategy {
         self.strategy
     }
@@ -187,11 +185,11 @@ impl SpeculativeCausalLm {
                 scored.confidence = scores;
 
                 // Phase 3: Choose verify length dynamically
-                let verify_len = self
-                    .scheduler
-                    .lock()
-                    .unwrap()
-                    .choose_verify_len(&scored, live_gpu_utilization, batch_pressure);
+                let verify_len = self.scheduler.lock().unwrap().choose_verify_len(
+                    &scored,
+                    live_gpu_utilization,
+                    batch_pressure,
+                );
                 let verify_len = verify_len.min(scored.tokens.len());
 
                 if verify_len == 0 {
@@ -210,18 +208,22 @@ impl SpeculativeCausalLm {
                 // Phase 5: Verification step on Target Causal LM
                 // CRIT-3: The target must receive the extended input (original + draft tokens)
                 // to produce logits for all draft positions
-                let extended_input = self.extend_input_ids(input_ids, &scored.tokens[..verify_len])?;
+                let extended_input =
+                    self.extend_input_ids(input_ids, &scored.tokens[..verify_len])?;
                 let extended_positions = self.extend_positions(positions, verify_len)?;
-                let target_logits = self.target.forward(session, &extended_input, &extended_positions, adapters)?;
+                let target_logits =
+                    self.target
+                        .forward(session, &extended_input, &extended_positions, adapters)?;
                 let target_probs = target_logits.to_vec_f32()?;
                 let vocab_size = scored.base_logits.shape().dims()[1];
                 let draft_logits = scored.base_logits.to_vec_f32()?;
 
                 // CRIT-4: Use per-request RNG instead of global rand::random()
-                let mut rng = session.request_rng().cloned().unwrap_or_else(|| {
-                    SimpleRng::new(rand::random())
-                });
-                
+                let mut rng = session
+                    .request_rng()
+                    .cloned()
+                    .unwrap_or_else(|| SimpleRng::new(rand::random()));
+
                 // Rejection-sampling validation loop (§5.3)
                 // Correctly index logits as flat [seq, vocab_size] row-major,
                 // apply per-row softmax, and use the standard ratio test with per-request randomness.
@@ -262,7 +264,9 @@ impl SpeculativeCausalLm {
                         for i in 0..accepted_count {
                             accepted_mask[i] = true;
                         }
-                        let target_hidden_states = session.get_last_hidden_state().and_then(|t| t.to_vec_f32().ok());
+                        let target_hidden_states = session
+                            .get_last_hidden_state()
+                            .and_then(|t| t.to_vec_f32().ok());
                         let refresh_input = crate::distill::DraftRefreshInput {
                             target_hidden_states,
                             draft_tokens: scored.tokens[..verify_len].to_vec(),
@@ -273,13 +277,15 @@ impl SpeculativeCausalLm {
                             steps_observed: sched.adaptation_state.steps_observed,
                             min_accept_rate: sched.adaptation_config.min_accept_rate,
                         };
-                        let _outcome = crate::distill::refresh_draft(&signal, &refresh_input, draft.as_ref())?;
+                        let _outcome =
+                            crate::distill::refresh_draft(&signal, &refresh_input, draft.as_ref())?;
                     }
                 }
 
                 // CRIT-7: Return logits for the accepted tokens, not the original input
                 // The output logits should correspond to the tokens we actually accepted
-                let accepted_logits = self.extract_accepted_logits(&target_logits, accepted_count, vocab_size)?;
+                let accepted_logits =
+                    self.extract_accepted_logits(&target_logits, accepted_count, vocab_size)?;
                 session.set_last_accepted_tokens(accepted_count);
                 Ok(accepted_logits)
             }
@@ -316,7 +322,9 @@ impl SpeculativeCausalLm {
         // CRIT-3: Target must receive extended input
         let extended_input = self.extend_input_ids(input_ids, &draft_block.tokens[..verify_len])?;
         let extended_positions = self.extend_positions(positions, verify_len)?;
-        let target_logits = self.target.forward(session, &extended_input, &extended_positions, adapters)?;
+        let target_logits =
+            self.target
+                .forward(session, &extended_input, &extended_positions, adapters)?;
 
         // 4. Rejection sampling / validation loop (§5.3)
         // Correctly index logits as flat [seq, vocab_size] row-major,
@@ -326,9 +334,10 @@ impl SpeculativeCausalLm {
         let draft_logits = draft_block.base_logits.to_vec_f32()?;
 
         let mut accepted_count = 0;
-        let mut rng = session.request_rng().cloned().unwrap_or_else(|| {
-            SimpleRng::new(rand::random())
-        });
+        let mut rng = session
+            .request_rng()
+            .cloned()
+            .unwrap_or_else(|| SimpleRng::new(rand::random()));
         for i in 0..verify_len {
             let draft_tok = draft_block.tokens[i] as usize;
 
@@ -354,11 +363,11 @@ impl SpeculativeCausalLm {
         }
 
         // CRIT-7: Return logits for accepted tokens
-        let accepted_logits = self.extract_accepted_logits(&target_logits, accepted_count, vocab_size)?;
+        let accepted_logits =
+            self.extract_accepted_logits(&target_logits, accepted_count, vocab_size)?;
         session.set_last_accepted_tokens(accepted_count);
         Ok(accepted_logits)
     }
-
 
     /// Extend input_ids tensor with draft tokens for verification
     fn extend_input_ids(&self, input_ids: &Tensor, draft_tokens: &[u32]) -> Result<Tensor> {
@@ -382,7 +391,12 @@ impl SpeculativeCausalLm {
     }
 
     /// Extract logits for only the accepted tokens
-    fn extract_accepted_logits(&self, target_logits: &Tensor, accepted_count: usize, vocab_size: usize) -> Result<Tensor> {
+    fn extract_accepted_logits(
+        &self,
+        target_logits: &Tensor,
+        accepted_count: usize,
+        vocab_size: usize,
+    ) -> Result<Tensor> {
         let all_logits = target_logits.to_vec_f32()?;
         // Return logits for the first `accepted_count` positions
         let accepted_logits = all_logits[..accepted_count * vocab_size].to_vec();
@@ -421,7 +435,14 @@ impl CausalLm for SpeculativeCausalLm {
         // CRIT-6: Derive scheduling params from the session instead of hardcoding.
         let live_gpu_utilization = session.live_gpu_utilization();
         let batch_pressure = session.batch_pressure();
-        self.decode_one(session, input_ids, positions, live_gpu_utilization, batch_pressure, adapters)
+        self.decode_one(
+            session,
+            input_ids,
+            positions,
+            live_gpu_utilization,
+            batch_pressure,
+            adapters,
+        )
     }
 }
 
@@ -493,7 +514,7 @@ mod tests {
                 Shape::new(vec![1, seq_len, self.cfg.hidden_size]),
             );
             session.set_last_hidden_state(hidden_state);
-            
+
             // Mock output logits: return constant values (all accepted)
             let logits = grim_backend_cpu::cpu_tensor(
                 vec![0.1f32; seq_len * self.cfg.vocab_size],
@@ -522,7 +543,7 @@ mod tests {
             cfg: cfg.clone(),
             device,
         });
-        
+
         // Mock DSpark components
         let draft = Arc::new(crate::tiny_draft_backbone::TinyDraftBackbone::new(
             100, // vocab_size
@@ -530,25 +551,20 @@ mod tests {
             5,   // block_len
             42,  // seed
         ));
-        let markov = Arc::new(crate::uniform_markov_head::UniformMarkovHead::new(100, 5, 42));
+        let markov = Arc::new(crate::uniform_markov_head::UniformMarkovHead::new(
+            100, 5, 42,
+        ));
         let confidence = Arc::new(crate::entropy_confidence_head::EntropyConfidenceHead);
 
         // Create scheduler with high trigger threshold (e.g. 1.5) to always trigger adaptation
-        let mut scheduler = ConfidenceScheduler::new(
-            ThroughputProfile::default(),
-            SpeculationConfig::default(),
-        );
+        let mut scheduler =
+            ConfidenceScheduler::new(ThroughputProfile::default(), SpeculationConfig::default());
         scheduler.adaptation_config.min_steps_before_trigger = 1;
         scheduler.adaptation_config.min_accept_rate = 1.5;
         scheduler.adaptation_config.ema_alpha = 0.5;
 
-        let spec_lm = SpeculativeCausalLm::with_dspark(
-            target,
-            draft.clone(),
-            markov,
-            confidence,
-            scheduler,
-        );
+        let spec_lm =
+            SpeculativeCausalLm::with_dspark(target, draft.clone(), markov, confidence, scheduler);
 
         let mut session = spec_lm.new_session();
         let input_ids = grim_backend_cpu::cpu_tensor(vec![1f32], Shape::new(vec![1]));
@@ -558,14 +574,9 @@ mod tests {
         assert!(session.get_last_hidden_state().is_none());
 
         // 2. Perform a speculative decode step (this will call MockCausalLm's forward pass)
-        let _logits = spec_lm.decode_one(
-            session.as_mut(),
-            &input_ids,
-            &positions,
-            0.0,
-            0,
-            &[],
-        ).unwrap();
+        let _logits = spec_lm
+            .decode_one(session.as_mut(), &input_ids, &positions, 0.0, 0, &[])
+            .unwrap();
 
         // 3. Verify that the penultimate hidden state is successfully captured in the session
         let captured_hidden = session.get_last_hidden_state().unwrap();
@@ -580,15 +591,10 @@ mod tests {
             let w = draft.weights.lock().unwrap();
             w.w_head.clone()
         };
-        
-        let _logits2 = spec_lm.decode_one(
-            session.as_mut(),
-            &input_ids,
-            &positions,
-            0.0,
-            0,
-            &[],
-        ).unwrap();
+
+        let _logits2 = spec_lm
+            .decode_one(session.as_mut(), &input_ids, &positions, 0.0, 0, &[])
+            .unwrap();
 
         // Check that the scheduler registered the step and triggered adaptation
         let sched = spec_lm.scheduler.lock().unwrap();

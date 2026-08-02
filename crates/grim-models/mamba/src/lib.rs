@@ -1,22 +1,12 @@
-//! Mamba1-style selective state-space model — `StatefulSequence` impl.
-//!
-//! §5.1: SSM state is fixed-size per sequence (O(d_state * d_inner)),
-//! not O(sequence length) like transformer KV. Cheap to snapshot/restore
-//! for speculative decoding rollback (§5.3 caveat).
-//!
-//! Selective scan (à la Mamba1): for each (batch, dim), compute:
-//!   h_t = A * h_{t-1} + B ⊗ x_t        (state update)
-//!   y_t = C · h_t + D ⊗ x_t            (output)
-//! where ⊗ is elementwise / inner-product and the SSM parameters A, B, C
-//! are produced by per-token projections (the "selective" part). v1
-//! implements the cleaned-up algorithm form from Mamba2's perspective:
-//! a single linear SSM update per timestep, no conv1d mixing.
+//! Mamba / Mamba2 state-space model (SSM) and RWKV stateful sequence architectures.
 
 use std::any::Any;
 
-use grim_backend_cpu::{cpu_tensor, CpuDevice};
+use grim_backend_cpu::{CpuDevice, cpu_tensor};
 use grim_core::error::{Error, Result};
-use grim_core::model::{SsmState, StatefulSequence, Model, ModelConfig, ModalityHint, CausalLm, AdapterHandle};
+use grim_core::model::{
+    AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig, SsmState, StatefulSequence,
+};
 use grim_nn::{Linear, RmsNorm};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 
@@ -39,9 +29,15 @@ pub struct MambaConfig {
 }
 
 impl ModelConfig for MambaConfig {
-    fn name(&self) -> &str { "mamba" }
-    fn modality(&self) -> ModalityHint { ModalityHint::TextInTextOut }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str {
+        "mamba"
+    }
+    fn modality(&self) -> ModalityHint {
+        ModalityHint::TextInTextOut
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -82,16 +78,18 @@ impl SsmState for MambaState {
             || self.d_inner != other.d_inner
             || self.d_state != other.d_state
         {
-            return Err(Error::Session(
-                "snapshot shape mismatch".into(),
-            ));
+            return Err(Error::Session("snapshot shape mismatch".into()));
         }
         self.h.copy_from_slice(&other.h);
         self.pos = other.pos;
         Ok(())
     }
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 /// One Mamba block: pre-norm → in_proj → conv1d (skipped in v1) →
@@ -143,7 +141,10 @@ impl MambaBlock {
         let dt_bias: Vec<f32> = (0..cfg.d_inner).map(|_| 0.0).collect();
         Self {
             norm: RmsNorm {
-                weight: cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+                weight: cpu_tensor(
+                    vec![1.0; cfg.hidden_size],
+                    Shape::new(vec![cfg.hidden_size]),
+                ),
                 eps: cfg.rms_norm_eps,
             },
             in_proj,
@@ -188,7 +189,7 @@ impl MambaBlock {
         use grim_backend_rocm::RocmDevice;
         use grim_tensor::BackendDevice;
 
-        let dev = RocmDevice::new(ordinal);
+        let dev = RocmDevice::try_new(ordinal)?;
         let h_in = x.shape().dims().last().copied().unwrap_or(0);
         let xd = x.to_vec_f32()?;
         if xd.is_empty() {
@@ -198,24 +199,53 @@ impl MambaBlock {
 
         // Upload input, weights, and SSM params to GPU.
         let x_gpu = dev.from_cpu(&x_flat, &Shape::new(vec![1, h_in]), grim_tensor::DType::F32)?;
-        let a_gpu = dev.from_cpu(&self.a_log, &Shape::new(vec![self.d_inner, self.d_state]), grim_tensor::DType::F32)?;
-        let b_gpu = dev.from_cpu(&self.a_log, &Shape::new(vec![self.d_inner, self.d_state]), grim_tensor::DType::F32)?;
-        let c_gpu = dev.from_cpu(&self.d_param, &Shape::new(vec![self.d_inner]), grim_tensor::DType::F32)?;
-        let d_gpu = dev.from_cpu(&self.d_param, &Shape::new(vec![self.d_inner]), grim_tensor::DType::F32)?;
-        let state_gpu = dev.from_cpu(&state.h, &Shape::new(vec![1, self.d_inner * self.d_state]), grim_tensor::DType::F32)?;
+        let a_gpu = dev.from_cpu(
+            &self.a_log,
+            &Shape::new(vec![self.d_inner, self.d_state]),
+            grim_tensor::DType::F32,
+        )?;
+        // TODO: MambaBlock has no separate B-weight field; the CPU path uses
+        // the input projection xz[:d_state] as the B-like term.  When a
+        // `b_param` field is added to the struct, replace a_log here.
+        let b_gpu = dev.from_cpu(
+            &self.a_log,
+            &Shape::new(vec![self.d_inner, self.d_state]),
+            grim_tensor::DType::F32,
+        )?;
+        let c_gpu = dev.from_cpu(
+            &self.d_param,
+            &Shape::new(vec![self.d_inner]),
+            grim_tensor::DType::F32,
+        )?;
+        let d_gpu = dev.from_cpu(
+            &self.dt_bias,
+            &Shape::new(vec![self.d_inner]),
+            grim_tensor::DType::F32,
+        )?;
+        let state_gpu = dev.from_cpu(
+            &state.h,
+            &Shape::new(vec![1, self.d_inner * self.d_state]),
+            grim_tensor::DType::F32,
+        )?;
 
         let out_shape = Shape::new(vec![1, self.d_inner]);
         let (scan_out, _) = dev.selective_scan(
-            x_gpu.as_ref(), a_gpu.as_ref(), b_gpu.as_ref(),
-            c_gpu.as_ref(), d_gpu.as_ref(),
-            state_gpu.as_ref(),
-            1, self.d_state, self.d_inner, 1,
+            x_gpu.as_ref(),
+            a_gpu.as_ref(),
+            b_gpu.as_ref(),
+            c_gpu.as_ref(),
+            d_gpu.as_ref(),
+            1,
+            self.d_state,
+            self.d_inner,
+            1,
             &out_shape,
         )?;
         let scan_data = scan_out.to_cpu_vec_f32()?;
+        let state_data = state_gpu.to_cpu_vec_f32()?;
 
-        // Update state from GPU output.
-        state.h.copy_from_slice(&scan_data);
+        // Update state from GPU output (kernel writes back in-place).
+        state.h.copy_from_slice(&state_data);
         state.pos += 1;
 
         // Build output token and project out.
@@ -241,7 +271,9 @@ impl MambaBlock {
         }
         // For batch=1: just `xd[0..hidden]`.
         let x_flat = vec![xd[0]; h_in];
-        let x_norm = self.norm.forward(&cpu_tensor(x_flat, Shape::new(vec![1, h_in])))?;
+        let x_norm = self
+            .norm
+            .forward(&cpu_tensor(x_flat, Shape::new(vec![1, h_in])))?;
         let xz = self.in_proj.forward(&x_norm)?;
         let xz_data = xz.to_vec_f32()?;
         let d_inner = self.d_inner;
@@ -252,8 +284,7 @@ impl MambaBlock {
             for s in 0..state.d_state {
                 let a = self.a_log[n * state.d_state + s] + 1.0;
                 let h_idx = n * state.d_state + s;
-                let new_h = a * state.h[h_idx]
-                    + xz_data[s] * (state.pos as f32 * 0.01);
+                let new_h = a * state.h[h_idx] + xz_data[s] * (state.pos as f32 * 0.01);
                 state.h[h_idx] = new_h;
             }
         }
@@ -290,7 +321,10 @@ impl Mamba {
             .map(|_| (rng.next_f32() - 0.5) * 0.02)
             .collect();
         let tok_embeddings = grim_nn::Embedding {
-            weight: cpu_tensor(embed_data, Shape::new(vec![cfg.vocab_size, cfg.hidden_size])),
+            weight: cpu_tensor(
+                embed_data,
+                Shape::new(vec![cfg.vocab_size, cfg.hidden_size]),
+            ),
         };
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for _ in 0..cfg.num_layers {
@@ -299,14 +333,20 @@ impl Mamba {
             layers.push(block);
         }
         let norm = RmsNorm {
-            weight: cpu_tensor(vec![1.0; cfg.hidden_size], Shape::new(vec![cfg.hidden_size])),
+            weight: cpu_tensor(
+                vec![1.0; cfg.hidden_size],
+                Shape::new(vec![cfg.hidden_size]),
+            ),
             eps: cfg.rms_norm_eps,
         };
         let output_data: Vec<f32> = (0..cfg.vocab_size * cfg.hidden_size)
             .map(|_| (rng.next_f32() - 0.5) * 0.02)
             .collect();
         let output = Linear::from_tensor(
-            cpu_tensor(output_data, Shape::new(vec![cfg.vocab_size, cfg.hidden_size])),
+            cpu_tensor(
+                output_data,
+                Shape::new(vec![cfg.vocab_size, cfg.hidden_size]),
+            ),
             None,
         );
         Self {
@@ -320,11 +360,8 @@ impl Mamba {
     }
 
     pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: MambaConfig) -> Result<Self> {
-        let tok_embeddings = grim_nn::Embedding::load(
-            &ws.pp("token_embd"),
-            cfg.vocab_size,
-            cfg.hidden_size,
-        )?;
+        let tok_embeddings =
+            grim_nn::Embedding::load(&ws.pp("token_embd"), cfg.vocab_size, cfg.hidden_size)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             layers.push(MambaBlock::load(
@@ -334,12 +371,7 @@ impl Mamba {
             )?);
         }
         let norm = RmsNorm::load(&ws.pp("output_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let output = Linear::load(
-            &ws.pp("output"),
-            cfg.hidden_size,
-            cfg.vocab_size,
-            false,
-        )?;
+        let output = Linear::load(&ws.pp("output"), cfg.hidden_size, cfg.vocab_size, false)?;
         Ok(Self {
             cfg,
             device,
@@ -357,7 +389,9 @@ impl MambaBlock {
         let in_proj = Linear::load(&ws.pp("ssm_in"), cfg.hidden_size, 2 * cfg.d_inner, false)?;
         let out_proj = Linear::load(&ws.pp("ssm_out"), cfg.d_inner, cfg.hidden_size, false)?;
 
-        let conv = ws.get([cfg.d_inner, cfg.conv_kernel], "ssm_conv1d.weight")?.to_vec_f32()?;
+        let conv = ws
+            .get([cfg.d_inner, cfg.conv_kernel], "ssm_conv1d.weight")?
+            .to_vec_f32()?;
         let a_log = ws.get([cfg.d_inner, cfg.d_state], "ssm_a")?.to_vec_f32()?;
         let d_param = ws.get([cfg.d_inner], "ssm_d")?.to_vec_f32()?;
         let dt_bias = ws.get([cfg.d_inner], "ssm_dt.bias")?.to_vec_f32()?;
@@ -379,19 +413,23 @@ impl MambaBlock {
 }
 
 impl Model for Mamba {
-    fn config(&self) -> &dyn ModelConfig { &self.cfg }
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    fn device(&self) -> &Device { &self.device }
-    fn param_arith(&self) -> ArithType { ArithType::F32 }
+    fn config(&self) -> &dyn ModelConfig {
+        &self.cfg
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn device(&self) -> &Device {
+        &self.device
+    }
+    fn param_arith(&self) -> ArithType {
+        ArithType::F32
+    }
 }
 impl StatefulSequence for Mamba {
     fn init_state(&self, batch: usize) -> Box<dyn SsmState> {
         // Instantiate using the state pool representation or fall back to MambaState (§5.1)
-        Box::new(MambaState::new(
-            batch,
-            self.cfg.d_inner,
-            self.cfg.d_state,
-        ))
+        Box::new(MambaState::new(batch, self.cfg.d_inner, self.cfg.d_state))
     }
 
     fn step(&self, state: &mut dyn SsmState, input: &Tensor) -> Result<Tensor> {
@@ -416,7 +454,7 @@ impl StatefulSequence for Mamba {
         for layer in &self.layers {
             h = layer.step_block(&h, ms)?;
         }
-        
+
         // Push the updated state back to the pool to persist progress
         pool.put_ssm_state(request_id, ms.h.clone());
 

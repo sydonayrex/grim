@@ -25,6 +25,32 @@ pub fn pick_device_for_tensor(x: &Tensor) -> Box<dyn BackendDevice> {
     pick_device_for_storage_device(x.device())
 }
 
+/// Fused SwiGLU `silu(gate) * up` dispatched on-device without CPU roundtrips.
+pub fn silu_mul_on_device(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    let dev = pick_device_for_tensor(gate);
+    let (out_storage, _handle) = dev.silu_mul(&**gate.storage(), &**up.storage(), gate.shape())?;
+    Ok(Tensor::new(
+        Arc::from(out_storage),
+        gate.shape().clone(),
+        gate.dtype(),
+        grim_tensor::dtype::QuantProvenance::default(),
+        gate.device().clone(),
+    ))
+}
+
+/// Elementwise tensor addition `a + b` dispatched on-device without CPU roundtrips.
+pub fn add_on_device(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    let dev = pick_device_for_tensor(a);
+    let (out_storage, _handle) = dev.add(&**a.storage(), &**b.storage(), a.shape())?;
+    Ok(Tensor::new(
+        Arc::from(out_storage),
+        a.shape().clone(),
+        a.dtype(),
+        grim_tensor::dtype::QuantProvenance::default(),
+        a.device().clone(),
+    ))
+}
+
 /// Pick a `BackendDevice` for a storage `Device` directly (without an
 /// owning `Tensor`), used when reconstructing a tensor from CPU-side
 /// bytes but needing to land it back on the original device.
@@ -33,13 +59,31 @@ pub fn pick_device_for_storage_device(d: &Device) -> Box<dyn BackendDevice> {
     match d {
         Device::Cpu => Box::new(CpuDevice::new()),
         #[cfg(feature = "cuda-mem")]
-        Device::Cuda(ordinal) => Box::new(CudaDevice::new(*ordinal)),
+        Device::Cuda(ordinal) => {
+            if let Ok(dev) = CudaDevice::new(*ordinal) {
+                Box::new(dev)
+            } else {
+                Box::new(CpuDevice::new())
+            }
+        }
         #[cfg(feature = "rocm-mem")]
-        Device::Rocm(ordinal) => Box::new(RocmDevice::new(*ordinal)),
+        Device::Rocm(ordinal) => {
+            if let Ok(dev) = RocmDevice::try_new(*ordinal) {
+                Box::new(dev)
+            } else {
+                Box::new(CpuDevice::new())
+            }
+        }
         #[cfg(feature = "vulkan-mem")]
         Device::Vulkan => Box::new(VulkanDevice::new()),
         #[cfg(feature = "metal-mem")]
-        Device::Metal(ordinal) => Box::new(MetalDevice::new(*ordinal)),
+        Device::Metal(ordinal) => {
+            if let Ok(dev) = MetalDevice::new(*ordinal) {
+                Box::new(dev)
+            } else {
+                Box::new(CpuDevice::new())
+            }
+        }
         _ => Box::new(CpuDevice::new()),
     }
 }
@@ -72,7 +116,10 @@ pub struct TensorParallelConfig {
 
 impl Default for TensorParallelConfig {
     fn default() -> Self {
-        Self { rank: 0, world_size: 1 }
+        Self {
+            rank: 0,
+            world_size: 1,
+        }
     }
 }
 
@@ -97,12 +144,12 @@ impl ColumnParallelLinear {
             let shard_size = last_dim / self.tp_config.world_size;
             let start = self.tp_config.rank * shard_size;
             let end = (start + shard_size).min(last_dim);
-            
+
             let data = out.to_vec_f32()?;
             let outer = data.len() / last_dim;
             let mut sharded = Vec::with_capacity(outer * (end - start));
             for row in 0..outer {
-                sharded.extend_from_slice(&data[row * last_dim + start .. row * last_dim + end]);
+                sharded.extend_from_slice(&data[row * last_dim + start..row * last_dim + end]);
             }
             let mut new_dims = dims.to_vec();
             if let Some(l) = new_dims.last_mut() {
@@ -144,12 +191,12 @@ impl RowParallelLinear {
             let shard_size = last_dim / self.tp_config.world_size;
             let start = self.tp_config.rank * shard_size;
             let end = (start + shard_size).min(last_dim);
-            
+
             let data = x.to_vec_f32()?;
             let outer = data.len() / last_dim;
             let mut sharded = Vec::with_capacity(outer * (end - start));
             for row in 0..outer {
-                sharded.extend_from_slice(&data[row * last_dim + start .. row * last_dim + end]);
+                sharded.extend_from_slice(&data[row * last_dim + start..row * last_dim + end]);
             }
             let mut new_dims = dims.to_vec();
             if let Some(l) = new_dims.last_mut() {
@@ -561,8 +608,8 @@ impl Rope {
                     sin_p[i] = a.sin();
                 }
                 for i in 0..half {
-                    let xi = base_index + i;
-                    let xj = base_index + i + half;
+                    let xi = base_index + 2 * i;
+                    let xj = base_index + 2 * i + 1;
                     let a = src[xi];
                     let bv = src[xj];
                     src[xi] = a * cos_p[i] - bv * sin_p[i];

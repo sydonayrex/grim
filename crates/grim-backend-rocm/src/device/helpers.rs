@@ -1,45 +1,18 @@
-//! Free-standing helpers used by `RocmDevice::launch_compute_kernel` and a few
-//! other impl methods. Kept module-level (not methods) because they don't need
-//! self state — moving them out of `lib.rs` cuts a chunk of lines off the giant
-//! per-device impl.
-//!
-//! Skill attribution:
-//! - `rust-gpu-discipline` §4 — every helper returns `Result` on GPU touches; no
-//!   silent fallback to a CPU path.
-//! - `rocm-profiling-perf` — `upload_device_buffer` is in the per-call hot path
-//!   (it allocates + uploads a scratch every call); pooling it is what Phase-3
-//!   §3.1 replaces.
+//! Free-standing helpers used by `RocmDevice::launch_compute_kernel` and a few [see: `lib.rs`, `rust-gpu-discipline`]
 
-use std::ffi::{c_void, CString};
+use std::ffi::{CString, c_void};
 use std::sync::Arc;
 
 use grim_tensor::error::{Error, Result};
 
 use crate::{
-    hipFree, hipMalloc, hipMemcpy, hipMemcpyAsync, hipStreamCreate,
-    hipStreamDestroy, hipStreamSynchronize,
-    hiprtcCompileProgram, hiprtcCreateProgram, hiprtcDestroyProgram,
-    hiprtcGetCode, hiprtcGetCodeSize, hiprtcGetProgramLog, hiprtcGetProgramLogSize,
-    hipSuccess, HipErrorT, HipMemcpyKind, HiprtcProgram,
+    HipErrorT, HipMemcpyKind, HiprtcProgram, hipFree, hipMalloc, hipMemcpy, hipMemcpyAsync,
+    hipStreamCreate, hipStreamDestroy, hipStreamSynchronize, hipSuccess, hiprtcCompileProgram,
+    hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode, hiprtcGetCodeSize,
+    hiprtcGetProgramLog, hiprtcGetProgramLogSize,
 };
 
-/// Convert a raw `HipErrorT` into `Result<()>`.
-///
-/// Every HIP runtime call (`hipMalloc`, `hipStreamSynchronize`, …) returns
-/// `HipErrorT`.  Before this helper every call site had a hand-written
-/// `if res != hipSuccess { return Err(...) }` block.  This function
-/// consolidates the pattern in one place so that:
-///
-/// - error messages are consistent and include the call-site label,
-/// - future additions (logging, metrics) touch one function, and
-/// - call sites shrink from 5 lines to 1.
-///
-/// # Examples
-///
-/// ```ignore
-/// let res = unsafe { hipStreamSynchronize(stream) };
-/// check_hip("hipStreamSynchronize", res)?;
-/// ```
+/// Convert a raw `HipErrorT` into `Result<()>`. [see: `hipMalloc`, `hipStreamSynchronize`]
 #[inline]
 pub fn check_hip(label: &str, res: HipErrorT) -> Result<()> {
     if res != hipSuccess {
@@ -50,7 +23,6 @@ pub fn check_hip(label: &str, res: HipErrorT) -> Result<()> {
 }
 
 /// Memory copy that handles XNACK automatically.
-/// Falls back to async copy with stream when XNACK is available.
 pub fn memcpy_with_xnack_fallback(
     dst: *mut c_void,
     src: *const c_void,
@@ -75,12 +47,7 @@ pub fn memcpy_with_xnack_fallback(
     }
 }
 
-/// JIT compile HIP source to .hsaco binary.
-///
-/// Wraps `hiprtcCreateProgram` / `hiprtcCompileProgram` / `hiprtcGetCode`.
-/// On compile failure, returns the program log via `hiprtcGetProgramLog` so the
-/// caller can see which `--offload-arch`-mismatch tripped. Caller owns the
-/// returned `Vec<u8>` (an `.hsaco` blob).
+/// JIT compile HIP source to .hsaco binary. [see: `hiprtcCreateProgram`, `hiprtcCompileProgram`, `hiprtcGetCode`, `hiprtcGetProgramLog`]
 pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<Vec<u8>> {
     let mut prog: HiprtcProgram = std::ptr::null_mut();
     let source_cstr = CString::new(source)
@@ -98,7 +65,10 @@ pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<V
             std::ptr::null(),
         );
         if status != hipSuccess {
-            return Err(Error::Backend(format!("hiprtcCreateProgram failed: {}", status)));
+            return Err(Error::Backend(format!(
+                "hiprtcCreateProgram failed: {}",
+                status
+            )));
         }
 
         let options_c = crate::device::util::hiprtc_options_for_arch(arch);
@@ -123,7 +93,10 @@ pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<V
         let status = hiprtcGetCodeSize(prog, &mut code_size);
         if status != hipSuccess {
             let _ = hiprtcDestroyProgram(&mut prog);
-            return Err(Error::Backend(format!("hiprtcGetCodeSize failed: {}", status)));
+            return Err(Error::Backend(format!(
+                "hiprtcGetCodeSize failed: {}",
+                status
+            )));
         }
 
         let mut code_bytes = vec![0u8; code_size];
@@ -139,22 +112,22 @@ pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<V
     }
 }
 
-/// Allocate a device-side scratch buffer, copy `data` into it, and return the
-/// raw device pointer. Caller is responsible for `hipFree` on the returned ptr.
-///
-/// Used by the path-RHS compute ops (matmul_batched pre-packing, etc.) where a
-/// pooled-scratch BPool would otherwise force a fresh allocation. Phase-3 §3.1
-/// `upload_to_scratch` is the spec-blessed successor that uses the pool.
+/// Allocate a device-side scratch buffer, copy `data` into it, and return the [see: `hipFree`, `upload_to_scratch`]
 pub fn upload_device_buffer<T: Copy>(data: &[T]) -> Result<*mut c_void> {
     let bytes = data.len() * std::mem::size_of::<T>();
     let mut ptr: *mut c_void = std::ptr::null_mut();
     let mut res = unsafe { hipMalloc(&mut ptr, bytes) };
     if res != hipSuccess {
-        unsafe { crate::hipDeviceSynchronize(); }
+        unsafe {
+            crate::hipDeviceSynchronize();
+        }
         res = unsafe { hipMalloc(&mut ptr, bytes) };
     }
     if res != hipSuccess {
-        return Err(Error::Backend(format!("hipMalloc (scratch) failed: {}", res)));
+        return Err(Error::Backend(format!(
+            "hipMalloc (scratch) failed: {}",
+            res
+        )));
     }
     if !data.is_empty() {
         let res = unsafe {
@@ -166,8 +139,13 @@ pub fn upload_device_buffer<T: Copy>(data: &[T]) -> Result<*mut c_void> {
             )
         };
         if res != hipSuccess {
-            unsafe { hipFree(ptr); }
-            return Err(Error::Backend(format!("hipMemcpy (scratch) failed: {}", res)));
+            unsafe {
+                hipFree(ptr);
+            }
+            return Err(Error::Backend(format!(
+                "hipMemcpy (scratch) failed: {}",
+                res
+            )));
         }
     }
     Ok(ptr)

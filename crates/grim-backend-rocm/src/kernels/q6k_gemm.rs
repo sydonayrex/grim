@@ -1,19 +1,4 @@
-//! Q6_K Fused Dequantization GEMM HIP kernel (Crow Tier).
-//!
-//! Dequantizes llama.cpp `block_q6_K` super-blocks (256 weights,
-//! 6-bit scales, 6-bit codes with two extra MSB planes) on-the-fly
-//! inside HIP GEMM loops for forward and backward passes.
-//!
-//! Layout matches llama.cpp's `block_q6_K` (see ggml-common.h):
-//! ```c
-//! typedef struct {
-//!     ggml_half d;          // 2 bytes - super-block scale
-//!     ggml_half dmin;       // 2 bytes - super-block minimum
-//!     unsigned char sc[12]; // 12 bytes  - packed 6-bit sub-block scales
-//!     unsigned char qs[128];// 128 bytes - 4-bit low-nibble codes
-//!     unsigned char qh[64]; // 64 bytes  - upper 2 bits per weight (2 bits per weight × 256 = 512 bits = 64 bytes)
-//! } block_q6_K;   // 210 bytes total per 256 weights
-//! ```
+//! Q6_K Fused Dequantization GEMM HIP kernel (Crow Tier). [see: `block_q6_K`]
 
 /// HIP source for `grim_fused_dequant_gemm_q6k` and `grim_fused_dequant_backward_gemm_q6k`.
 pub const KERNEL_SOURCE: &str = r#"

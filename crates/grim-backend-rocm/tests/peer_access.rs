@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use grim_backend_rocm::peer_access::{
-    enable_peer_access, enumerate_devices, peer_status, P2PStatus,
+    P2PStatus, enable_peer_access, enumerate_devices, peer_status,
 };
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;

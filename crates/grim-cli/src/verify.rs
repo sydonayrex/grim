@@ -1,12 +1,12 @@
 //! `grim verify` — verify a `.grim` model file for structural integrity,
 //! correct offsets/sizes, readable payloads, and QLoRA adapter presence.
 
+use grim_format::PayloadCompression;
+use grim_format::format::{FUCKING_SORCERY, GrimFile, GrimHeader};
+use grim_tensor::error::{Error, Result};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
-use grim_format::format::{GrimFile, GrimHeader, FUCKING_SORCERY};
-use grim_format::spec::PayloadCompression;
-use grim_tensor::error::{Error, Result};
 
 #[derive(Debug, Default)]
 pub struct VerifyReport {
@@ -43,10 +43,12 @@ pub fn cmd_verify(path: &str) -> Result<()> {
     // 1. Read and validate header
     let header = verify_header(&mut reader, &mut report)?;
     if !report.magic_ok {
-        report.errors.push("Invalid magic bytes — not a .grim file".to_string());
+        report
+            .errors
+            .push("Invalid magic bytes — not a .grim file".to_string());
         print_report(&report);
         return Err(Error::Backend(
-            "Verification failed: invalid magic bytes — not a .grim file".into()
+            "Verification failed: invalid magic bytes — not a .grim file".into(),
         ));
     }
 
@@ -54,7 +56,9 @@ pub fn cmd_verify(path: &str) -> Result<()> {
     verify_metadata(&mut reader, header.metadata_len, &mut report)?;
 
     // 3. Read tensor registry - seek back to start and use GrimFile::read
-    reader.seek(SeekFrom::Start(0)).map_err(|e| Error::Backend(e.to_string()))?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| Error::Backend(e.to_string()))?;
     let grim_file = verify_tensor_registry(&mut reader, header.num_tensors, &mut report)?;
 
     // 4. Verify each tensor's payload regions
@@ -76,15 +80,16 @@ pub fn cmd_verify(path: &str) -> Result<()> {
     }
 }
 
-fn verify_header<R: Read + Seek>(
-    reader: &mut R,
-    report: &mut VerifyReport,
-) -> Result<GrimHeader> {
-    let pos_before = reader.stream_position().map_err(|e| Error::Backend(e.to_string()))?;
+fn verify_header<R: Read + Seek>(reader: &mut R, report: &mut VerifyReport) -> Result<GrimHeader> {
+    let pos_before = reader
+        .stream_position()
+        .map_err(|e| Error::Backend(e.to_string()))?;
 
     let header = GrimHeader::read(reader)?;
 
-    let pos_after = reader.stream_position().map_err(|e| Error::Backend(e.to_string()))?;
+    let pos_after = reader
+        .stream_position()
+        .map_err(|e| Error::Backend(e.to_string()))?;
     let header_size = pos_after - pos_before;
 
     // Check magic bytes
@@ -114,18 +119,25 @@ fn verify_metadata<R: Read + Seek>(
     report: &mut VerifyReport,
 ) -> Result<()> {
     if metadata_len == 0 {
-        report.warnings.push("No metadata section present".to_string());
+        report
+            .warnings
+            .push("No metadata section present".to_string());
         println!("[WARN] No metadata section (length = 0)");
         return Ok(());
     }
 
-    let pos_before = reader.stream_position().map_err(|e| Error::Backend(e.to_string()))?;
+    let pos_before = reader
+        .stream_position()
+        .map_err(|e| Error::Backend(e.to_string()))?;
 
     let mut meta_buf = vec![0u8; metadata_len as usize];
-    reader.read_exact(&mut meta_buf)
+    reader
+        .read_exact(&mut meta_buf)
         .map_err(|e| Error::Backend(format!("Failed to read metadata: {e}")))?;
 
-    let pos_after = reader.stream_position().map_err(|e| Error::Backend(e.to_string()))?;
+    let pos_after = reader
+        .stream_position()
+        .map_err(|e| Error::Backend(e.to_string()))?;
     let actual_len = pos_after - pos_before;
 
     if actual_len != metadata_len {
@@ -155,12 +167,16 @@ fn verify_tensor_registry<R: Read + Seek>(
     num_tensors: u32,
     report: &mut VerifyReport,
 ) -> Result<GrimFile> {
-    let pos_before = reader.stream_position().map_err(|e| Error::Backend(e.to_string()))?;
+    let pos_before = reader
+        .stream_position()
+        .map_err(|e| Error::Backend(e.to_string()))?;
 
     // Use GrimFile::read to parse the full file
     let grim_file = GrimFile::read(reader)?;
 
-    let pos_after = reader.stream_position().map_err(|e| Error::Backend(e.to_string()))?;
+    let pos_after = reader
+        .stream_position()
+        .map_err(|e| Error::Backend(e.to_string()))?;
     let registry_size = pos_after - pos_before;
 
     if grim_file.tensors.len() != num_tensors as usize {
@@ -170,7 +186,10 @@ fn verify_tensor_registry<R: Read + Seek>(
             grim_file.tensors.len()
         ));
     } else {
-        println!("[OK]  Tensor registry: {} entries ({} bytes)", num_tensors, registry_size);
+        println!(
+            "[OK]  Tensor registry: {} entries ({} bytes)",
+            num_tensors, registry_size
+        );
     }
 
     // Print tensor names
@@ -329,7 +348,10 @@ fn verify_payload_regions<R: Read + Seek>(
                     } else {
                         println!(
                             "      [OK]  {}: KV blob readable ({} bytes, bits_k={}, bits_v={})",
-                            tensor.name, tensor.kv_compressed_size, tensor.kv_bits_k, tensor.kv_bits_v
+                            tensor.name,
+                            tensor.kv_compressed_size,
+                            tensor.kv_bits_k,
+                            tensor.kv_bits_v
                         );
                     }
                 }
@@ -377,11 +399,22 @@ fn check_adapters(grim_file: &GrimFile, report: &mut VerifyReport) {
 
     if !found {
         println!("No QLoRA adapters found in backup2 slots.");
-        report.warnings.push("No tensors have backup2 provisioned (no QLoRA adapters)".to_string());
+        report
+            .warnings
+            .push("No tensors have backup2 provisioned (no QLoRA adapters)".to_string());
     } else {
-        println!("Found {} tensor(s) with backup2 adapter capacity:", report.adapter_tensors.len());
+        println!(
+            "Found {} tensor(s) with backup2 adapter capacity:",
+            report.adapter_tensors.len()
+        );
         for info in &report.adapter_tensors {
-            println!("  - {}: bpw={}, codes={}B, scale={}B", info.tensor_name, info.backup2_bpw, info.backup2_codes_size, info.backup2_scale_size);
+            println!(
+                "  - {}: bpw={}, codes={}B, scale={}B",
+                info.tensor_name,
+                info.backup2_bpw,
+                info.backup2_codes_size,
+                info.backup2_scale_size
+            );
         }
     }
 }
@@ -389,8 +422,18 @@ fn check_adapters(grim_file: &GrimFile, report: &mut VerifyReport) {
 fn print_report(report: &VerifyReport) {
     println!("\n=== Verification Summary ===");
     println!("File size:         {} bytes", report.file_size);
-    println!("Magic:             {}", if report.magic_ok { "VALID" } else { "INVALID" });
-    println!("Metadata JSON:     {}", if report.metadata_parsed { "VALID" } else { "INVALID/MISSING" });
+    println!(
+        "Magic:             {}",
+        if report.magic_ok { "VALID" } else { "INVALID" }
+    );
+    println!(
+        "Metadata JSON:     {}",
+        if report.metadata_parsed {
+            "VALID"
+        } else {
+            "INVALID/MISSING"
+        }
+    );
     println!("Tensor count:      {}", report.tensor_count);
     println!("Adapter tensors:   {}", report.adapter_tensors.len());
     println!("Errors:            {}", report.errors.len());
@@ -413,7 +456,10 @@ fn print_report(report: &VerifyReport) {
     if report.errors.is_empty() && report.adapter_tensors.is_empty() {
         println!("\nStatus:  PASS (no adapters in backup2)");
     } else if report.errors.is_empty() {
-        println!("\nStatus:  PASS ({} adapter(s) verified in backup2)", report.adapter_tensors.len());
+        println!(
+            "\nStatus:  PASS ({} adapter(s) verified in backup2)",
+            report.adapter_tensors.len()
+        );
     } else {
         println!("\nStatus:  FAIL");
     }

@@ -28,6 +28,8 @@ pub enum TapeKind {
     Scale,
     /// Fused LoRA: `output = base + scale * (x @ A^T) @ B^T`. Arity is 4.
     LoRAApply,
+    /// SwiGLU activation: `output = silu(gate) * up`. Arity is 2.
+    SiluMul,
 }
 
 /// A single recorded operation on the tape.
@@ -72,6 +74,8 @@ pub enum TapeMetadata {
         a: ParamId,
         b: ParamId,
     },
+    /// SwiGLU activation: `output = silu(gate) * up`.
+    SiluMul,
 }
 
 #[derive(Debug, Default)]
@@ -231,6 +235,19 @@ impl Tape {
                 a: a_param,
                 b: b_param,
             },
+        });
+        out_id
+    }
+
+    /// Record a SwiGLU activation `output = silu(gate) * up`.
+    pub fn record_silu_mul(&mut self, gate: TensorId, up: TensorId, output: Tensor) -> TensorId {
+        let out_id = self.register(output);
+        self.entries.push(TapeEntry {
+            kind: TapeKind::SiluMul,
+            inputs: vec![gate, up],
+            output: out_id,
+            param_id: None,
+            metadata: TapeMetadata::SiluMul,
         });
         out_id
     }

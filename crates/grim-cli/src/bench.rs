@@ -6,8 +6,7 @@ use grim_tensor::Device;
 
 pub async fn cmd_bench(tokens: usize, concurrency: usize, model_path: Option<&str>) -> Result<()> {
     let device = Device::Cpu;
-    // Use a real model if a path is provided; otherwise fall back to a
-    // small random Llama for smoke testing.
+    // Use provided model path or fall back to a random Llama for smoke testing.
     let model: Box<dyn CausalLm> = if let Some(path) = model_path {
         let lower = path.to_lowercase();
         if lower.ends_with(".gguf") {
@@ -18,7 +17,8 @@ pub async fn cmd_bench(tokens: usize, concurrency: usize, model_path: Option<&st
             grim_engine::model_loader::load_model_from_safetensors(path, device.clone())?
         } else {
             return Err(grim_core::error::Error::Config(format!(
-                "unsupported model format for '{}'", path
+                "unsupported model format for '{}'",
+                path
             )));
         }
     } else {

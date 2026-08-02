@@ -4,7 +4,10 @@
 //! Reversibly quantizes low-rank updates `ΔW = (α/r)·B@A` into pre-allocated `backup2` capacity without format resizes.
 
 use crate::format::GrimFile;
-use grim_tensor::{Tensor, error::{Error, Result}};
+use grim_tensor::{
+    Tensor,
+    error::{Error, Result},
+};
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
@@ -33,7 +36,12 @@ pub fn attach_bolt_on(
     let ext = grim_file
         .metadata
         .get_tensor_ext(tensor_name)
-        .ok_or_else(|| Error::Backend(format!("tensor {} has no GrimTensorExt metadata", tensor_name)))?;
+        .ok_or_else(|| {
+            Error::Backend(format!(
+                "tensor {} has no GrimTensorExt metadata",
+                tensor_name
+            ))
+        })?;
 
     if !ext.backup2.is_present() {
         return Err(Error::Backend(format!(
@@ -77,7 +85,11 @@ pub fn attach_bolt_on(
         let mut row_packed = vec![0u8; row_bytes];
 
         for (c_idx, &v) in row.iter().enumerate() {
-            let norm = if eff_scale > 0.0 { (v / eff_scale).clamp(-1.0, 1.0) } else { 0.0 };
+            let norm = if eff_scale > 0.0 {
+                (v / eff_scale).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
             let code = (((norm + 1.0) * 0.5) * 15.0).round() as u32;
 
             let bit_offset = c_idx * bpw as usize;
@@ -101,11 +113,13 @@ pub fn attach_bolt_on(
     }
 
     let codes_abs_offset = entry.payload_offset + ext.backup2.codes_offset;
-    file.seek(SeekFrom::Start(codes_abs_offset)).map_err(Error::Io)?;
+    file.seek(SeekFrom::Start(codes_abs_offset))
+        .map_err(Error::Io)?;
     file.write_all(&packed_codes).map_err(Error::Io)?;
 
     let scale_abs_offset = entry.payload_offset + ext.backup2.scale_offset;
-    file.seek(SeekFrom::Start(scale_abs_offset)).map_err(Error::Io)?;
+    file.seek(SeekFrom::Start(scale_abs_offset))
+        .map_err(Error::Io)?;
     file.write_all(&row_scales).map_err(Error::Io)?;
 
     Ok(())
@@ -127,7 +141,12 @@ pub fn detach_bolt_on(grim_path: &Path, tensor_name: &str) -> Result<()> {
     let ext = grim_file
         .metadata
         .get_tensor_ext(tensor_name)
-        .ok_or_else(|| Error::Backend(format!("tensor {} has no GrimTensorExt metadata", tensor_name)))?;
+        .ok_or_else(|| {
+            Error::Backend(format!(
+                "tensor {} has no GrimTensorExt metadata",
+                tensor_name
+            ))
+        })?;
 
     if !ext.backup2.is_present() {
         return Ok(());
@@ -137,11 +156,13 @@ pub fn detach_bolt_on(grim_path: &Path, tensor_name: &str) -> Result<()> {
     let zeros_scales = vec![0u8; ext.backup2.scale_size as usize];
 
     let codes_abs_offset = entry.payload_offset + ext.backup2.codes_offset;
-    file.seek(SeekFrom::Start(codes_abs_offset)).map_err(Error::Io)?;
+    file.seek(SeekFrom::Start(codes_abs_offset))
+        .map_err(Error::Io)?;
     file.write_all(&zeros_codes).map_err(Error::Io)?;
 
     let scale_abs_offset = entry.payload_offset + ext.backup2.scale_offset;
-    file.seek(SeekFrom::Start(scale_abs_offset)).map_err(Error::Io)?;
+    file.seek(SeekFrom::Start(scale_abs_offset))
+        .map_err(Error::Io)?;
     file.write_all(&zeros_scales).map_err(Error::Io)?;
 
     Ok(())
@@ -227,8 +248,14 @@ mod tests {
         }
         std::fs::write(&path, &buf).unwrap();
 
-        let a_tensor = grim_backend_cpu::cpu_tensor(vec![0.1f32; 2 * 128], grim_tensor::shape::Shape::new(vec![2, 128]));
-        let b_tensor = grim_backend_cpu::cpu_tensor(vec![0.1f32; 32 * 2], grim_tensor::shape::Shape::new(vec![32, 2]));
+        let a_tensor = grim_backend_cpu::cpu_tensor(
+            vec![0.1f32; 2 * 128],
+            grim_tensor::shape::Shape::new(vec![2, 128]),
+        );
+        let b_tensor = grim_backend_cpu::cpu_tensor(
+            vec![0.1f32; 32 * 2],
+            grim_tensor::shape::Shape::new(vec![32, 2]),
+        );
 
         // Attach 2-bit bolt-on
         attach_bolt_on(&path, tensor_name, &a_tensor, &b_tensor, 1.0).expect("attach bolt-on");
@@ -243,8 +270,11 @@ mod tests {
         detach_bolt_on(&path, tensor_name).expect("detach bolt-on");
 
         // Reopen and assert backup2 capacity is retained after detach
-        let provider_detached = GrimProvider::open(path.to_str().unwrap()).expect("reopen after detach");
-        let ext_detached = provider_detached.ext_for(tensor_name).expect("ext for tensor");
+        let provider_detached =
+            GrimProvider::open(path.to_str().unwrap()).expect("reopen after detach");
+        let ext_detached = provider_detached
+            .ext_for(tensor_name)
+            .expect("ext for tensor");
         assert!(ext_detached.backup2.is_present());
     }
 }

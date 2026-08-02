@@ -1,24 +1,11 @@
-//! Grim engine runtime — wires scheduler + memory + model + adapter registry.
-//!
-//! The `Engine` is the top-level orchestrator. It owns:
-//! - A `Scheduler` for batching and admission control (§5.2), with first-class
-//!   pause/resume (§5.2.1).
-//! - A `KvBlockPool` for paged KV (§5.1).
-//! - A model registry (type-erased, keyed by model id). Every registered
-//!   model is auto-wrapped in `SpeculativeCausalLm` (§5.3 — speculative
-//!   decoding is default-on, not opt-in).
-//! - An adapter registry for multi-LoRA serving (§4.5).
-//!
-//! Downstream crates (`grim-server`) call `Engine::tick()` once per
-//! iteration to run the scheduler and execute the batch on every
-//! running request through the speculative wrapper.
+//! Top-level inference engine runtime orchestrating models, schedulers, paged KV pools, and LoRA adapters.
 
 pub mod model_loader;
 pub mod packing;
 pub mod rope_scaling;
-pub mod streaming_forward;
 /// SCYTHE-2 WI-4 + WI-7: C²PLR controller, PlacementCache, ScytheRing.
 pub mod scythe2;
+pub mod streaming_forward;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,7 +16,7 @@ use grim_core::error::{Error, Result};
 use grim_core::model::{AdapterHandle, CausalLm, ModelConfig};
 use grim_core::session::{DeterminismMode, SessionT};
 use grim_memory::KvBlockPool;
-use grim_speculative::{DraftBackbone, MarkovHead, ConfidenceHead, SpeculativeCausalLm, Strategy};
+use grim_speculative::{ConfidenceHead, DraftBackbone, MarkovHead, SpeculativeCausalLm, Strategy};
 
 type DynModelPtr = Box<SpeculativeCausalLm>;
 
@@ -142,7 +129,8 @@ impl Engine {
             pool.attach_compressor(comp.clone());
         }
         let block_pool = Arc::new(std::sync::Mutex::new(pool));
-        let admission = grim_scheduler::AdmissionController::new(config.target_ttft_ms, config.target_itl_ms);
+        let admission =
+            grim_scheduler::AdmissionController::new(config.target_ttft_ms, config.target_itl_ms);
         let mut scheduler = grim_scheduler::Scheduler::new(
             config.max_batched_tokens,
             config.max_num_seqs,
@@ -264,7 +252,12 @@ impl Engine {
     /// pass when callers pass `&[AdapterHandle]` that references it.
     /// `name` is the human-readable identifier used for HTTP request-body
     /// resolution — the server 400s on any name not present here.
-    pub fn register_adapter(&mut self, base_model_id: &str, name: impl Into<String>, handle: AdapterHandle) {
+    pub fn register_adapter(
+        &mut self,
+        base_model_id: &str,
+        name: impl Into<String>,
+        handle: AdapterHandle,
+    ) {
         self.adapters.insert(
             handle.id,
             LoadedAdapter {
@@ -447,22 +440,18 @@ impl Engine {
     }
 
     fn drive_decode_with_outcome(&mut self, id: u64) -> Result<Option<StepOutcome>> {
-        let start_pos = self
-            .sessions
-            .get(&id)
-            .map(|s| s.current_pos())
-            .unwrap_or(0);
+        let start_pos = self.sessions.get(&id).map(|s| s.current_pos()).unwrap_or(0);
         // Use the previously sampled token if available, otherwise fall back
         // to position index for backward compatibility.
-        let next_token = self.request_last_token.get(&id).copied().unwrap_or(start_pos as u32);
-        let ids = grim_backend_cpu::cpu_tensor(
-            vec![next_token as f32],
-            grim_tensor::Shape::new(vec![1]),
-        );
-        let positions = grim_backend_cpu::cpu_tensor(
-            vec![start_pos as f32],
-            grim_tensor::Shape::new(vec![1]),
-        );
+        let next_token = self
+            .request_last_token
+            .get(&id)
+            .copied()
+            .unwrap_or(start_pos as u32);
+        let ids =
+            grim_backend_cpu::cpu_tensor(vec![next_token as f32], grim_tensor::Shape::new(vec![1]));
+        let positions =
+            grim_backend_cpu::cpu_tensor(vec![start_pos as f32], grim_tensor::Shape::new(vec![1]));
         if let Some((model_id, _)) = self.model_for_request(id) {
             let model_id = model_id.to_string();
             let outcome = self.drive_forward(&model_id, id, &ids, &positions)?;
@@ -482,7 +471,11 @@ impl Engine {
         positions: &grim_tensor::Tensor,
     ) -> Result<StepOutcome> {
         // Resolve adapters for this specific request from the adapter registry
-        let adapter_ids = self.request_adapters.get(&request_id).cloned().unwrap_or_default();
+        let adapter_ids = self
+            .request_adapters
+            .get(&request_id)
+            .cloned()
+            .unwrap_or_default();
         let adapters = {
             let resolved = self.resolve_adapters(&adapter_ids).unwrap_or_default();
             resolved
@@ -557,10 +550,7 @@ impl Engine {
             self.config.num_kv_heads,
             self.config.head_dim,
         );
-        let mut session = Box::new(grim_core::session::Inner::with_kv(
-            device,
-            Box::new(kv),
-        ));
+        let mut session = Box::new(grim_core::session::Inner::with_kv(device, Box::new(kv)));
 
         // Prefix Caching (§5.1): Check if prompt tokens contain shared system prompt blocks
         if let Some(ref input_tokens) = request.input_ids {
@@ -586,8 +576,10 @@ impl Engine {
         }
 
         self.sessions.insert(request.id, session);
-        self.request_model_ids.insert(request.id, request.model_id.clone().unwrap_or_default());
-        self.request_adapters.insert(request.id, request.adapter_ids.clone());
+        self.request_model_ids
+            .insert(request.id, request.model_id.clone().unwrap_or_default());
+        self.request_adapters
+            .insert(request.id, request.adapter_ids.clone());
         // Store the real input token IDs if provided
         if let Some(input_ids) = request.input_ids.clone() {
             self.request_input_ids.insert(request.id, input_ids);
@@ -712,18 +704,21 @@ mod tests {
     use grim_tensor::Device;
 
     fn small_llama() -> Box<dyn CausalLm> {
-        Box::new(Llama::random(Device::Cpu, LlamaConfig {
-            vocab_size: 256,
-            hidden_size: 32,
-            num_heads: 2,
-            num_kv_heads: 1,
-            head_dim: 16,
-            num_layers: 1,
-            intermediate_size: 64,
-            rms_norm_eps: 1e-5,
-            rope_theta: 10000.0,
-            max_seq_len: 64,
-        }))
+        Box::new(Llama::random(
+            Device::Cpu,
+            LlamaConfig {
+                vocab_size: 256,
+                hidden_size: 32,
+                num_heads: 2,
+                num_kv_heads: 1,
+                head_dim: 16,
+                num_layers: 1,
+                intermediate_size: 64,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 64,
+            },
+        ))
     }
 
     fn small_handle(id: u32, in_dim: usize, out_dim: usize) -> AdapterHandle {
@@ -735,7 +730,12 @@ mod tests {
             vec![0.01f32; out_dim * 4],
             grim_tensor::Shape::new(vec![out_dim, 4]),
         );
-        AdapterHandle { id, a, b, alpha: 1.0 }
+        AdapterHandle {
+            id,
+            a,
+            b,
+            alpha: 1.0,
+        }
     }
 
     #[test]
@@ -766,7 +766,12 @@ mod tests {
     fn engine_pause_resume_round_trip() {
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 7, prompt_tokens: 32, priority: 0, ..Default::default() });
+        engine.enqueue_request(Request {
+            id: 7,
+            prompt_tokens: 32,
+            priority: 0,
+            ..Default::default()
+        });
         let _ = engine.tick();
         assert_eq!(engine.scheduler.running.len(), 1);
         assert!(!engine.is_paused(7));
@@ -804,14 +809,30 @@ mod tests {
     fn engine_tick_runs_prefill_then_decode_advancing_pos() {
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
+        engine.enqueue_request(Request {
+            id: 1,
+            prompt_tokens: 4,
+            priority: 0,
+            ..Default::default()
+        });
         let _ = engine.tick();
-        let pos_after_prefill = engine.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
-        assert_eq!(pos_after_prefill, 4, "prefill advanced current_pos to prompt_tokens");
+        let pos_after_prefill = engine
+            .sessions
+            .get(&1)
+            .map(|s| s.current_pos())
+            .unwrap_or(0);
+        assert_eq!(
+            pos_after_prefill, 4,
+            "prefill advanced current_pos to prompt_tokens"
+        );
 
         engine.scheduler.running.retain(|r| r.id == 1);
         let _ = engine.tick();
-        let pos_after_decode = engine.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
+        let pos_after_decode = engine
+            .sessions
+            .get(&1)
+            .map(|s| s.current_pos())
+            .unwrap_or(0);
         assert_eq!(pos_after_decode, 5, "decode advanced current_pos by 1");
     }
 
@@ -819,7 +840,12 @@ mod tests {
     fn engine_tick_records_step_outcome() {
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
+        engine.enqueue_request(Request {
+            id: 1,
+            prompt_tokens: 4,
+            priority: 0,
+            ..Default::default()
+        });
         engine.register_adapter("small", "adapter-99", small_handle(99, 32, 32));
         let _ = engine.tick();
         let outcome = engine.last_outcome(1).expect("tick must record outcome");
@@ -832,14 +858,23 @@ mod tests {
     fn engine_pause_then_resume_preserves_session_position() {
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
+        engine.enqueue_request(Request {
+            id: 1,
+            prompt_tokens: 4,
+            priority: 0,
+            ..Default::default()
+        });
         let _ = engine.tick(); // prefill — pos becomes 4.
         engine.scheduler.running.retain(|r| r.id == 1);
         let _ = engine.tick(); // decode — pos becomes 5.
 
         // Pause: session retains pos.
         engine.pause_request(1);
-        let pos = engine.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
+        let pos = engine
+            .sessions
+            .get(&1)
+            .map(|s| s.current_pos())
+            .unwrap_or(0);
         assert_eq!(pos, 5, "session preserved at pause");
         assert!(engine.is_paused(1));
 
@@ -847,7 +882,11 @@ mod tests {
         // speculative accepted more than one).
         engine.resume_request(1);
         let _ = engine.tick();
-        let pos = engine.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
+        let pos = engine
+            .sessions
+            .get(&1)
+            .map(|s| s.current_pos())
+            .unwrap_or(0);
         assert!(pos > 5, "tick must keep advancing after resume");
     }
 
@@ -855,7 +894,12 @@ mod tests {
     fn engine_step_one_public_api() {
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
+        engine.enqueue_request(Request {
+            id: 1,
+            prompt_tokens: 4,
+            priority: 0,
+            ..Default::default()
+        });
         let ids = grim_backend_cpu::cpu_tensor(vec![1.0f32; 2], grim_tensor::Shape::new(vec![2]));
         let positions = ids.clone();
         let outcome = engine.step_one(1, "small", &ids, &positions).unwrap();
@@ -866,7 +910,12 @@ mod tests {
     fn engine_step_one_rejects_unknown_adapter() {
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
+        engine.enqueue_request(Request {
+            id: 1,
+            prompt_tokens: 4,
+            priority: 0,
+            ..Default::default()
+        });
         let ids = grim_backend_cpu::cpu_tensor(vec![1.0f32; 2], grim_tensor::Shape::new(vec![2]));
         let positions = ids.clone();
         let outcome = engine.step_one(1, "small", &ids, &positions).unwrap();
@@ -882,33 +931,51 @@ mod tests {
         // anchored to the cache because the cache itself is preserved.
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request_with_kv(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() })
+        engine
+            .enqueue_request_with_kv(Request {
+                id: 1,
+                prompt_tokens: 4,
+                priority: 0,
+                ..Default::default()
+            })
             .expect("enqueue with kv");
-        assert!(engine
-            .sessions
-            .get(&1)
-            .map(|s| s.has_kv())
-            .unwrap_or(false));
+        assert!(engine.sessions.get(&1).map(|s| s.has_kv()).unwrap_or(false));
 
         let prefill = engine.tick().expect("prefill tick");
         assert!(prefill.prefill_ids.contains(&1));
 
         // Pause mid-decode.
-        let running_pos = engine.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
+        let running_pos = engine
+            .sessions
+            .get(&1)
+            .map(|s| s.current_pos())
+            .unwrap_or(0);
         engine.pause_request(1);
-        let paused_pos = engine.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
+        let paused_pos = engine
+            .sessions
+            .get(&1)
+            .map(|s| s.current_pos())
+            .unwrap_or(0);
         assert_eq!(running_pos, paused_pos, "pause must not change session pos");
         assert_eq!(engine.is_paused(1), true);
 
         // Resume: same position. Tick again.
         engine.resume_request(1);
-        let resumed_pos = engine.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
+        let resumed_pos = engine
+            .sessions
+            .get(&1)
+            .map(|s| s.current_pos())
+            .unwrap_or(0);
         assert_eq!(
             running_pos, resumed_pos,
             "resume must continue from paused position"
         );
         let _ = engine.tick().expect("decode tick");
-        let after_tick_pos = engine.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
+        let after_tick_pos = engine
+            .sessions
+            .get(&1)
+            .map(|s| s.current_pos())
+            .unwrap_or(0);
         assert!(
             after_tick_pos > resumed_pos,
             "decode tick after resume must advance pos"
@@ -921,8 +988,18 @@ mod tests {
         // wrapper output for that specific request.
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
-        engine.enqueue_request(Request { id: 2, prompt_tokens: 8, priority: 0, ..Default::default() });
+        engine.enqueue_request(Request {
+            id: 1,
+            prompt_tokens: 4,
+            priority: 0,
+            ..Default::default()
+        });
+        engine.enqueue_request(Request {
+            id: 2,
+            prompt_tokens: 8,
+            priority: 0,
+            ..Default::default()
+        });
         let _ = engine.tick();
         let o1 = engine.last_outcome(1).cloned();
         let o2 = engine.last_outcome(2).cloned();
@@ -941,14 +1018,27 @@ mod tests {
         // tick yields a fresh `StepOutcome`.
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
+        engine.enqueue_request(Request {
+            id: 1,
+            prompt_tokens: 4,
+            priority: 0,
+            ..Default::default()
+        });
         // Tick 1: prefill.
         let _ = engine.tick();
-        let pos1 = engine.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
+        let pos1 = engine
+            .sessions
+            .get(&1)
+            .map(|s| s.current_pos())
+            .unwrap_or(0);
         // Tick 2: decode.
         engine.scheduler.running.retain(|r| r.id == 1);
         let _ = engine.tick();
-        let pos2 = engine.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
+        let pos2 = engine
+            .sessions
+            .get(&1)
+            .map(|s| s.current_pos())
+            .unwrap_or(0);
         assert!(pos2 > pos1, "decode tick advances the session position");
 
         // Plain strategy still counts as "speculative" field = false on
@@ -966,7 +1056,12 @@ mod tests {
     fn engine_finish_clears_outcome() {
         let mut engine = Engine::new(EngineConfig::default());
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
+        engine.enqueue_request(Request {
+            id: 1,
+            prompt_tokens: 4,
+            priority: 0,
+            ..Default::default()
+        });
         let _ = engine.tick();
         assert!(engine.last_outcome(1).is_some());
         engine.finish_request(1);
@@ -995,9 +1090,18 @@ mod tests {
         );
         assert_eq!(engine.strategy_for("small"), Some(Strategy::DSpark));
 
-        engine.enqueue_request(Request { id: 1, prompt_tokens: 4, priority: 0, ..Default::default() });
+        engine.enqueue_request(Request {
+            id: 1,
+            prompt_tokens: 4,
+            priority: 0,
+            ..Default::default()
+        });
         let out = engine.tick();
-        assert!(out.is_ok(), "tick must succeed under DSpark strategy: {:?}", out.err());
+        assert!(
+            out.is_ok(),
+            "tick must succeed under DSpark strategy: {:?}",
+            out.err()
+        );
         let _ = engine.last_outcome(1);
     }
 
@@ -1009,20 +1113,37 @@ mod tests {
         config.determinism_mode = DeterminismMode::Strict;
         let mut engine = Engine::new(config);
         engine.register_model("small", small_llama());
-        engine.enqueue_request(Request { id: 11, prompt_tokens: 4, priority: 0, ..Default::default() });
-        engine.enqueue_request(Request { id: 22, prompt_tokens: 4, priority: 0, ..Default::default() });
+        engine.enqueue_request(Request {
+            id: 11,
+            prompt_tokens: 4,
+            priority: 0,
+            ..Default::default()
+        });
+        engine.enqueue_request(Request {
+            id: 22,
+            prompt_tokens: 4,
+            priority: 0,
+            ..Default::default()
+        });
         let s1 = engine.request_rng_state(11);
         let s2 = engine.request_rng_state(22);
         assert!(s1.is_some() && s2.is_some());
         // Distinct ids → distinct initial states.
-        assert_ne!(s1, s2, "different request ids must yield different rng seeds");
+        assert_ne!(
+            s1, s2,
+            "different request ids must yield different rng seeds"
+        );
 
         // Advance RNG by N for one request; the other's state is untouched.
         engine.advance_request_rng(11, 8);
         let s1_advanced = engine.request_rng_state(11).unwrap();
         let s2_unchanged = engine.request_rng_state(22).unwrap();
         assert_ne!(s1_advanced, s1.unwrap(), "RNG must be advancing");
-        assert_eq!(s2_unchanged, s2.unwrap(), "other request's RNG must not change");
+        assert_eq!(
+            s2_unchanged,
+            s2.unwrap(),
+            "other request's RNG must not change"
+        );
 
         // finish_request clears the rng slot.
         engine.finish_request(11);
@@ -1030,20 +1151,47 @@ mod tests {
     }
 
     fn write_mock_gguf_for_test(path: &std::path::Path) {
-        use std::io::Write;
+        use grim_format::gguf::{GGUF_MAGIC, GGUF_VERSION, GgufValue};
         use std::collections::HashMap;
-        use grim_format::gguf::{GgufValue, GGUF_MAGIC, GGUF_VERSION};
+        use std::io::Write;
 
         let mut metadata = HashMap::new();
-        metadata.insert("general.architecture".to_string(), GgufValue::String("llama".to_string()));
-        metadata.insert("tokenizer.ggml.vocab_size".to_string(), GgufValue::String("256".to_string()));
-        metadata.insert("llama.embedding_length".to_string(), GgufValue::String("32".to_string()));
-        metadata.insert("llama.block_count".to_string(), GgufValue::String("1".to_string()));
-        metadata.insert("llama.intermediate_size".to_string(), GgufValue::String("64".to_string()));
-        metadata.insert("llama.attention.head_count".to_string(), GgufValue::String("2".to_string()));
-        metadata.insert("llama.attention.head_count_kv".to_string(), GgufValue::String("1".to_string()));
-        metadata.insert("llama.attention.key_length".to_string(), GgufValue::String("16".to_string()));
-        metadata.insert("llama.attention.layer_norm_eps".to_string(), GgufValue::String("0.00001".to_string()));
+        metadata.insert(
+            "general.architecture".to_string(),
+            GgufValue::String("llama".to_string()),
+        );
+        metadata.insert(
+            "tokenizer.ggml.vocab_size".to_string(),
+            GgufValue::String("256".to_string()),
+        );
+        metadata.insert(
+            "llama.embedding_length".to_string(),
+            GgufValue::String("32".to_string()),
+        );
+        metadata.insert(
+            "llama.block_count".to_string(),
+            GgufValue::String("1".to_string()),
+        );
+        metadata.insert(
+            "llama.intermediate_size".to_string(),
+            GgufValue::String("64".to_string()),
+        );
+        metadata.insert(
+            "llama.attention.head_count".to_string(),
+            GgufValue::String("2".to_string()),
+        );
+        metadata.insert(
+            "llama.attention.head_count_kv".to_string(),
+            GgufValue::String("1".to_string()),
+        );
+        metadata.insert(
+            "llama.attention.key_length".to_string(),
+            GgufValue::String("16".to_string()),
+        );
+        metadata.insert(
+            "llama.attention.layer_norm_eps".to_string(),
+            GgufValue::String("0.00001".to_string()),
+        );
 
         let tensor_specs = vec![
             ("token_embd.weight", vec![32, 256]),
@@ -1063,8 +1211,10 @@ mod tests {
         let mut buf = Vec::new();
         buf.write_all(&GGUF_MAGIC.to_le_bytes()).unwrap(); // GGUF magic
         buf.write_all(&GGUF_VERSION.to_le_bytes()).unwrap(); // version
-        buf.write_all(&(tensor_specs.len() as u64).to_le_bytes()).unwrap();
-        buf.write_all(&(metadata.len() as u64).to_le_bytes()).unwrap();
+        buf.write_all(&(tensor_specs.len() as u64).to_le_bytes())
+            .unwrap();
+        buf.write_all(&(metadata.len() as u64).to_le_bytes())
+            .unwrap();
 
         for (k, v) in &metadata {
             let kb = k.as_bytes();
@@ -1170,8 +1320,15 @@ mod tests {
         // to the model would be wrong. We verify by checking that a second
         // tick (decode) uses the LAST real token as the next input, not
         // the position index.
-        let pos_after_prefill = engine.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
-        assert_eq!(pos_after_prefill, prompt_tokens, "prefill must advance by prompt_tokens");
+        let pos_after_prefill = engine
+            .sessions
+            .get(&1)
+            .map(|s| s.current_pos())
+            .unwrap_or(0);
+        assert_eq!(
+            pos_after_prefill, prompt_tokens,
+            "prefill must advance by prompt_tokens"
+        );
 
         // Keep the request in running for decode
         engine.scheduler.running.retain(|r| r.id == 1);
@@ -1180,8 +1337,16 @@ mod tests {
         // not the position index (which would be 5). We can't directly observe
         // the input_ids tensor from here, but we verify the session advances.
         let _ = engine.tick().expect("decode tick must succeed");
-        let pos_after_decode = engine.sessions.get(&1).map(|s| s.current_pos()).unwrap_or(0);
-        assert_eq!(pos_after_decode, prompt_tokens + 1, "decode must advance by 1");
+        let pos_after_decode = engine
+            .sessions
+            .get(&1)
+            .map(|s| s.current_pos())
+            .unwrap_or(0);
+        assert_eq!(
+            pos_after_decode,
+            prompt_tokens + 1,
+            "decode must advance by 1"
+        );
     }
 
     #[test]
@@ -1205,7 +1370,14 @@ mod tests {
             ..Default::default()
         });
 
-        let s2_pos = engine.sessions.get(&200).map(|s| s.current_pos()).unwrap_or(0);
-        assert_eq!(s2_pos, 16, "identical prefix prompt must hit prefix cache and advance pos");
+        let s2_pos = engine
+            .sessions
+            .get(&200)
+            .map(|s| s.current_pos())
+            .unwrap_or(0);
+        assert_eq!(
+            s2_pos, 16,
+            "identical prefix prompt must hit prefix cache and advance pos"
+        );
     }
 }

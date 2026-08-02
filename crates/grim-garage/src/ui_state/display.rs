@@ -1,15 +1,14 @@
-//! Reactive display state — CVKG's reactive primitives subscribe here.
+//! Reactive display state — web UI's view-model store.
 //!
-//! `DisplayState` is the read-side view-model that the CVKG runtime observes.
-//! When something updates one of its fields, the framework re-renders the
-//! dependent widgets without manual notification. Tests verify the in-place
-//! mutators behave correctly.
+//! `DisplayState` is the read-side view-model that the frontend observes.
+//! When something updates one of its fields, the store re-renders the
+//! dependent view components. Tests verify the in-place mutators behave correctly.
 
 use std::collections::HashMap;
 
 use super::{UiAppState, UiJob, UiTrainingConfig};
 
-/// State the CVKG UI reads from. Held behind a `Mutex` in the host runtime;
+/// State the web UI reads from. Held behind a `Mutex` in the host runtime;
 /// the display methods take `&mut` since reads-then-mutates must be atomic.
 #[derive(Debug, Default)]
 pub struct DisplayState {
@@ -113,8 +112,8 @@ impl DisplayState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::{DatasetEntry, ModelEntry};
     use crate::backend::BackendProbe;
+    use crate::discovery::{DatasetEntry, ModelEntry};
 
     fn sample_state() -> DisplayState {
         let mut s = DisplayState::new();

@@ -1,11 +1,7 @@
 //! Consumer Parallel GPU (RX 9060 / RX 9070 — RDNA3/4) Multi-GPU FSDP (Fully Sharded Data Parallel) module.
-//!
-//! Provides parameter sharding, All-Gather weight gathering, and Reduce-Scatter gradient
-//! reduction primitives across consumer AMD GPUs (GFX1100 / GFX1200 / GFX1201 architecture family).
-//! Enforces bounded peak VRAM usage to fit within 16GB consumer VRAM envelopes.
 
-use grim_tensor::error::{Error, Result};
 use grim_tensor::Shape;
+use grim_tensor::error::{Error, Result};
 
 /// Configuration for Consumer Parallel GPU FSDP sharding.
 #[derive(Debug, Clone)]
@@ -34,11 +30,7 @@ pub struct ConsumerFsdpGroup {
 }
 
 impl ConsumerFsdpGroup {
-    /// Constructs a new `ConsumerFsdpGroup` with the specified configuration.
-    ///
-    /// # Contracts
-    /// - `config.world_size` must be >= 1.
-    /// - `config.rank` must be < `config.world_size`.
+    /// Constructs a new `ConsumerFsdpGroup` with the specified configuration. [see: `config.world_size`, `config.rank`]
     pub fn new(config: ConsumerFsdpConfig) -> Result<Self> {
         if config.world_size == 0 {
             return Err(Error::Backend("world_size must be >= 1".into()));
@@ -52,10 +44,7 @@ impl ConsumerFsdpGroup {
         Ok(Self { config })
     }
 
-    /// Computes the sharded shape for a full parameter tensor under `world_size` partitioning.
-    ///
-    /// # Arguments
-    /// - `full_shape`: Shape of the full un-sharded parameter matrix.
+    /// Computes the sharded shape for a full parameter tensor under `world_size` partitioning. [see: `full_shape`]
     pub fn shard_shape(&self, full_shape: &Shape) -> Result<Shape> {
         let dims = full_shape.dims();
         if dims.is_empty() {
@@ -76,9 +65,6 @@ impl ConsumerFsdpGroup {
     }
 
     /// Estimates peak VRAM memory footprint for a given sharded model size under 4-bit QLoRA fine-tuning.
-    ///
-    /// # Contracts
-    /// Returns peak VRAM usage in bytes.
     pub fn estimate_peak_vram_bytes(&self, num_params: usize) -> usize {
         let sharded_params = num_params / self.config.world_size;
         // QLoRA 4-bit base weights (0.5 B/param) + 16-bit LoRA adapter & AdamW moments (~2.5 B/param for rank=16)
@@ -119,8 +105,15 @@ mod tests {
         let vram_usage = fsdp.estimate_peak_vram_bytes(num_params);
 
         // Peak VRAM per GPU under QLoRA 4-bit sharding should be under 12 GB
-        assert!(vram_usage < 13_000_000_000, "VRAM usage {} exceeds 13GB threshold", vram_usage);
-        assert!(fsdp.fits_vram_budget(7_000_000_000), "7B QLoRA model should fit in 16GB VRAM per GPU");
+        assert!(
+            vram_usage < 13_000_000_000,
+            "VRAM usage {} exceeds 13GB threshold",
+            vram_usage
+        );
+        assert!(
+            fsdp.fits_vram_budget(7_000_000_000),
+            "7B QLoRA model should fit in 16GB VRAM per GPU"
+        );
 
         Ok(())
     }

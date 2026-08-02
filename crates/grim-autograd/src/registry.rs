@@ -2,9 +2,9 @@
 //!
 //! Integrates model geometry configs, LoRA injection point registries, and active parameter sets.
 
+use crate::AutogradScope;
 use crate::injection::{InjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry};
 use crate::param::{ParamId, TrainableParam, TrainableParams};
-use crate::AutogradScope;
 use grim_backend_cpu::cpu_tensor;
 use grim_tensor::{Shape, error::Result};
 
@@ -78,9 +78,8 @@ impl AutogradRegistry {
             // [b_rows, a_cols]; pissa returns a = [rank, in],
             // b = [out, rank], matching the A/B layout above.
             let (a_data, b_data) = if config.use_pissa {
-                match base_weights.and_then(|m| {
-                    m.get(&(config.layer_idx, config.injection_point))
-                }) {
+                match base_weights.and_then(|m| m.get(&(config.layer_idx, config.injection_point)))
+                {
                     Some(w) => {
                         let (a, b, _quantized) =
                             crate::injection::pissa_initialize(w, b_rows, a_cols, config.rank)?;
@@ -112,10 +111,8 @@ impl AutogradRegistry {
             for point in LoRAInjectionPoint::all_points() {
                 let (rows, cols) = point.base_weight_shape(&model_config);
                 let base_id = ParamId::base(0, *point);
-                let base_tensor = cpu_tensor(
-                    vec![0.0f32; rows * cols],
-                    Shape::new(vec![rows, cols]),
-                );
+                let base_tensor =
+                    cpu_tensor(vec![0.0f32; rows * cols], Shape::new(vec![rows, cols]));
                 let base_param = TrainableParam::register_base_weight(
                     base_id,
                     base_tensor,

@@ -1,12 +1,12 @@
 //! DeepSeek family — Multi-head Latent Attention (MLA) and expert routing.
 
-use grim_backend_cpu::{cpu_tensor, add_tensors};
+use grim_backend_cpu::{add_tensors, cpu_tensor};
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
 use grim_nn::{Embedding, Linear, RmsNorm, Rope};
-use grim_tensor::{ArithType, Device, DType, Tensor};
+use grim_tensor::{ArithType, DType, Device, Tensor};
 
 #[derive(Debug, Clone)]
 pub struct DeepSeekConfig {
@@ -55,15 +55,45 @@ impl DeepSeekBlock {
     pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: &DeepSeekConfig) -> Result<Self> {
         let attn_norm = RmsNorm::load(&ws.pp("attn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
         let q_a_proj = Linear::load(&ws.pp("q_a_proj"), cfg.hidden_size, cfg.q_lora_rank, false)?;
-        let q_b_proj = Linear::load(&ws.pp("q_b_proj"), cfg.q_lora_rank, cfg.num_heads * 128, false)?;
-        let kv_a_proj = Linear::load(&ws.pp("kv_a_proj"), cfg.hidden_size, cfg.kv_lora_rank, false)?;
-        let kv_b_proj = Linear::load(&ws.pp("kv_b_proj"), cfg.kv_lora_rank, cfg.num_heads * 128, false)?;
+        let q_b_proj = Linear::load(
+            &ws.pp("q_b_proj"),
+            cfg.q_lora_rank,
+            cfg.num_heads * 128,
+            false,
+        )?;
+        let kv_a_proj = Linear::load(
+            &ws.pp("kv_a_proj"),
+            cfg.hidden_size,
+            cfg.kv_lora_rank,
+            false,
+        )?;
+        let kv_b_proj = Linear::load(
+            &ws.pp("kv_b_proj"),
+            cfg.kv_lora_rank,
+            cfg.num_heads * 128,
+            false,
+        )?;
         let wo = Linear::load(&ws.pp("wo"), cfg.num_heads * 128, cfg.hidden_size, false)?;
 
         let ffn_norm = RmsNorm::load(&ws.pp("ffn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let ffn_gate = Linear::load(&ws.pp("ffn_gate"), cfg.hidden_size, cfg.intermediate_size, false)?;
-        let ffn_up = Linear::load(&ws.pp("ffn_up"), cfg.hidden_size, cfg.intermediate_size, false)?;
-        let ffn_down = Linear::load(&ws.pp("ffn_down"), cfg.intermediate_size, cfg.hidden_size, false)?;
+        let ffn_gate = Linear::load(
+            &ws.pp("ffn_gate"),
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            false,
+        )?;
+        let ffn_up = Linear::load(
+            &ws.pp("ffn_up"),
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            false,
+        )?;
+        let ffn_down = Linear::load(
+            &ws.pp("ffn_down"),
+            cfg.intermediate_size,
+            cfg.hidden_size,
+            false,
+        )?;
 
         let rope = Rope::new(128, 10000.0); // DeepSeek uses head_dim=128
 
@@ -88,30 +118,30 @@ impl DeepSeekBlock {
 
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let norm_x = self.attn_norm.forward(x)?;
-        
+
         // MLA: Multi-head Latent Attention
         // Step 1: Project to latent space
         let q_latent = self.q_a_proj.forward(&norm_x)?;
         let kv_latent = self.kv_a_proj.forward(&norm_x)?;
-        
+
         // Step 2: Project from latent to Q, K, V
         let q = self.q_b_proj.forward(&q_latent)?;
         let kv = self.kv_b_proj.forward(&kv_latent)?;
-        
+
         // Split kv into k and v (half each)
         let seq_len = x.shape().dims()[0];
         let num_heads = self.num_heads;
         let head_dim = self.head_dim;
         let hidden = num_heads * head_dim;
-        
+
         let _ = q.to_vec_f32()?; // Q is used after RoPE
         let kv_data = kv.to_vec_f32()?;
-        
+
         // q_b_proj outputs [seq_len, num_heads * head_dim] = Q
         // kv_b_proj outputs [seq_len, num_heads * head_dim] = K and V concatenated
         let mut k = vec![0.0f32; seq_len * hidden];
         let mut v = vec![0.0f32; seq_len * hidden];
-        
+
         for pos in 0..seq_len {
             for h in 0..num_heads {
                 for d in 0..head_dim {
@@ -121,23 +151,23 @@ impl DeepSeekBlock {
                 }
             }
         }
-        
+
         // Create tensors for K and V
         let k_tensor = cpu_tensor(k, grim_tensor::Shape::new(vec![seq_len, hidden]));
         let v_tensor = cpu_tensor(v, grim_tensor::Shape::new(vec![seq_len, hidden]));
-        
+
         // Apply RoPE to Q and K
         let q = self.rope.forward(&q, positions)?;
         let k = self.rope.forward(&k_tensor, positions)?;
-        
+
         // Causal self-attention
         let qd = q.to_vec_f32()?;
         let kd = k.to_vec_f32()?;
         let vd = v_tensor.to_vec_f32()?;
-        
+
         let scale = 1.0 / (head_dim as f32).sqrt();
         let mut attn_out = vec![0.0f32; seq_len * hidden];
-        
+
         for h in 0..num_heads {
             for t in 0..seq_len {
                 let mut scores = vec![0.0f32; seq_len];
@@ -145,7 +175,8 @@ impl DeepSeekBlock {
                 for t2 in 0..=t {
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
-                        dot += qd[t * hidden + h * head_dim + d] * kd[t2 * hidden + h * head_dim + d];
+                        dot +=
+                            qd[t * hidden + h * head_dim + d] * kd[t2 * hidden + h * head_dim + d];
                     }
                     scores[t2] = dot * scale;
                 }
@@ -173,13 +204,12 @@ impl DeepSeekBlock {
                 }
             }
         }
-        
+
         let attn_out_tensor = cpu_tensor(attn_out, grim_tensor::Shape::new(vec![seq_len, hidden]));
         let attn_out = self.wo.forward(&attn_out_tensor)?;
-        
+
         // Residual
-        let x_res1 = add_tensors(x, &attn_out)
-            .map_err(grim_core::Error::Tensor)?;
+        let x_res1 = add_tensors(x, &attn_out).map_err(grim_core::Error::Tensor)?;
 
         // FFN
         let norm_x2 = self.ffn_norm.forward(&x_res1)?;
@@ -187,8 +217,7 @@ impl DeepSeekBlock {
         let up = self.ffn_up.forward(&norm_x2)?;
         let activated = silu_mul(&gate, &up)?;
         let ffn_out = self.ffn_down.forward(&activated)?;
-        add_tensors(&x_res1, &ffn_out)
-            .map_err(grim_core::Error::Tensor)
+        add_tensors(&x_res1, &ffn_out).map_err(grim_core::Error::Tensor)
     }
 }
 
@@ -202,8 +231,13 @@ pub struct DeepSeek {
 }
 
 impl DeepSeek {
-    pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: DeepSeekConfig) -> Result<Self> {
-        let tok_embeddings = Embedding::load(&ws.pp("token_embd"), cfg.vocab_size, cfg.hidden_size)?;
+    pub fn load(
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: DeepSeekConfig,
+    ) -> Result<Self> {
+        let tok_embeddings =
+            Embedding::load(&ws.pp("token_embd"), cfg.vocab_size, cfg.hidden_size)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             layers.push(DeepSeekBlock::load(&ws.pp("blk").pp(&i.to_string()), &cfg)?);
@@ -264,7 +298,9 @@ impl CausalLm for DeepSeek {
             }
             _ => (0..seq_len).map(|i| i as u32).collect(),
         };
-        let mut h = self.tok_embeddings.forward(&ids, seq_len, self.cfg.hidden_size)?;
+        let mut h = self
+            .tok_embeddings
+            .forward(&ids, seq_len, self.cfg.hidden_size)?;
         for layer in &self.layers {
             h = layer.forward(&h, &pos_ids)?;
         }

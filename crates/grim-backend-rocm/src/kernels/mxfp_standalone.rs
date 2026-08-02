@@ -1,9 +1,4 @@
 //! Standalone MXFP4 / MXFP8 dequantization HIP kernels for ROCm.
-//!
-//! Decompresses MXFP4 (Jay) and MXFP8 (Magpie) format weights to full F32 values.
-//! Each MXFP4 group of 32 elements shares a single FP8 exponent byte
-//! and stores 4-bit codes. Each MXFP8 element stores an 8-bit FP8 code
-//! and shares a per-group exponent.
 
 /// HIP source for `grim_dequant_mxfp4` and `grim_dequant_mxfp8`.
 pub const KERNEL_SOURCE: &str = r#"

@@ -21,13 +21,16 @@ use std::sync::Arc;
 
 use grim_backend_cpu::CpuDevice;
 use grim_backend_rocm::RocmDevice;
-use grim_kvquant::{KvCompressor, KvQuantConfig, KvDequantAttentionConfig, LloydMaxCompressor};
+use grim_kvquant::{KvCompressor, KvDequantAttentionConfig, KvQuantConfig, LloydMaxCompressor};
 use grim_tensor::{ArithType, BackendDevice, DType, Device, QuantProvenance, Shape, Tensor};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 fn f32_dtype() -> DType {
-    DType { arith: ArithType::F32, storage: grim_tensor::Storage::Native }
+    DType {
+        arith: ArithType::F32,
+        storage: grim_tensor::Storage::Native,
+    }
 }
 
 /// Pure-float fused attention on already-dequantized f32 K/V, matching the
@@ -35,8 +38,12 @@ fn f32_dtype() -> DType {
 /// so every query position attends the full KV cache -> effectively unmasked
 /// here). Returns `[seq, heads, head_dim]`.
 fn float_reference(
-    q: &[f32], k: &[f32], v: &[f32],
-    num_tokens: usize, num_heads: usize, head_dim: usize,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    num_tokens: usize,
+    num_heads: usize,
+    head_dim: usize,
 ) -> Vec<f32> {
     let num_kv_heads = k.len() / (num_tokens * head_dim);
     let q_per_kv = num_heads / num_kv_heads;
@@ -56,7 +63,9 @@ fn float_reference(
                 }
                 let s = dot * scale;
                 scores[kt] = s;
-                if s > max_score { max_score = s; }
+                if s > max_score {
+                    max_score = s;
+                }
             }
             let mut sum = 0.0f32;
             for s in scores.iter_mut() {
@@ -102,7 +111,8 @@ fn run_case(
     key_bits: u8,
     value_bits: u8,
 ) -> TestResult {
-    let dev = RocmDevice::new(0);
+    let dev = RocmDevice::try_new(0)
+        .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
 
     let num_tokens = 4usize;
 
@@ -124,11 +134,27 @@ fn run_case(
     let cpu = CpuDevice::new();
     let k_storage = Arc::from(cpu.from_cpu(&k_data, &shape, dtype.clone())?);
     let v_storage = Arc::from(cpu.from_cpu(&v_data, &shape, dtype.clone())?);
-    let keys = Tensor::new(k_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
-    let values = Tensor::new(v_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
+    let keys = Tensor::new(
+        k_storage,
+        shape.clone(),
+        dtype.clone(),
+        QuantProvenance::GrimNative,
+        Device::Cpu,
+    );
+    let values = Tensor::new(
+        v_storage,
+        shape.clone(),
+        dtype.clone(),
+        QuantProvenance::GrimNative,
+        Device::Cpu,
+    );
 
     let gpu_compressor = LloydMaxCompressor::with_gpu_attn(
-        KvQuantConfig { key_bits, value_bits, ..Default::default() },
+        KvQuantConfig {
+            key_bits,
+            value_bits,
+            ..Default::default()
+        },
         KvDequantAttentionConfig { enabled: true },
     );
     let block = gpu_compressor.compress(&keys, &values)?;
@@ -136,13 +162,20 @@ fn run_case(
     // Query has [num_tokens, num_heads, head_dim] layout.
     let q_shape = Shape::new(vec![num_tokens, num_heads, head_dim]);
     let q_storage = Arc::from(cpu.from_cpu(&q_data, &q_shape, dtype.clone())?);
-    let query = Tensor::new(q_storage, q_shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
+    let query = Tensor::new(
+        q_storage,
+        q_shape.clone(),
+        dtype.clone(),
+        QuantProvenance::GrimNative,
+        Device::Cpu,
+    );
 
     let gpu_dev: &dyn grim_tensor::BackendDevice = &dev;
     let gpu_out = gpu_compressor.fused_attention(&block, &query, gpu_dev, Device::Rocm(0))?;
 
     // Pure-float reference on the dequantized K/V (no INT8 simulation).
-    let (ref_keys, ref_values) = gpu_compressor.dequantize_for_attention(&block, &cpu, Device::Cpu)?;
+    let (ref_keys, ref_values) =
+        gpu_compressor.dequantize_for_attention(&block, &cpu, Device::Cpu)?;
     let ref_k = ref_keys.to_vec_f32()?;
     let ref_v = ref_values.to_vec_f32()?;
     let cpu_vec = float_reference(&q_data, &ref_k, &ref_v, num_tokens, num_heads, head_dim);

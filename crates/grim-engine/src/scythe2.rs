@@ -31,8 +31,8 @@
 //! - `rust-ffi-grim` §3 — `cargo check` gate after each WI.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use grim_tensor::backend::{GpuCapability, ScytheLink, ScythePlacement};
@@ -307,7 +307,11 @@ impl C2plrController {
         let input_dim = 16 + 4 + k * 6 + k * k + k;
         let mut input = vec![0.0f32; input_dim];
         // Layer fingerprint.
-        let fp = self.layer_fps.get(layer_id as usize).copied().unwrap_or([0.0; 16]);
+        let fp = self
+            .layer_fps
+            .get(layer_id as usize)
+            .copied()
+            .unwrap_or([0.0; 16]);
         input[..16].copy_from_slice(&fp);
         // Shape.
         for (i, &s) in shape.iter().take(4).enumerate() {
@@ -339,7 +343,13 @@ impl C2plrController {
         }
 
         let output_dim = k + k + 3;
-        let logits = mlp_forward(&self.theta_w1, &self.theta_w2, &input, self.hidden_dim, output_dim);
+        let logits = mlp_forward(
+            &self.theta_w1,
+            &self.theta_w2,
+            &input,
+            self.hidden_dim,
+            output_dim,
+        );
 
         // ── Placement selection ─────────────────────────────────────────────
         // Placement logits: argmax over first K elements.
@@ -384,17 +394,18 @@ impl C2plrController {
         // its fair share on the chosen GPU, reroute to the lowest-latency GPU.
         let num_layers = self.layer_fps.len().max(1);
         let per_layer_budget = self.budget_ms / num_layers as f64;
-        let selected = if latencies.get(best_gpu).copied().unwrap_or(f64::INFINITY) > per_layer_budget {
-            latencies
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| l.is_finite())
-                .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i)
-                .unwrap_or(0)
-        } else {
-            best_gpu
-        };
+        let selected =
+            if latencies.get(best_gpu).copied().unwrap_or(f64::INFINITY) > per_layer_budget {
+                latencies
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.is_finite())
+                    .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            } else {
+                best_gpu
+            };
 
         ScythePlacement {
             ranks: vec![selected],
@@ -597,7 +608,10 @@ pub struct ScytheRing {
 impl ScytheRing {
     /// Create a ring with `capacity` slots. Capacity must be >0 and a power of 2.
     pub fn new(capacity: u32) -> Self {
-        assert!(capacity > 0 && capacity.is_power_of_two(), "capacity must be a power of 2");
+        assert!(
+            capacity > 0 && capacity.is_power_of_two(),
+            "capacity must be a power of 2"
+        );
         Self {
             capacity,
             head: AtomicU32::new(0),
@@ -764,9 +778,21 @@ mod tests {
     /// PlacementKey equality (regression guard).
     #[test]
     fn test_placement_key_equality() {
-        let k1 = PlacementKey { layer_id: 0, shape_bucket: 3, capability_epoch: 1 };
-        let k2 = PlacementKey { layer_id: 0, shape_bucket: 3, capability_epoch: 1 };
-        let k3 = PlacementKey { layer_id: 1, shape_bucket: 3, capability_epoch: 1 };
+        let k1 = PlacementKey {
+            layer_id: 0,
+            shape_bucket: 3,
+            capability_epoch: 1,
+        };
+        let k2 = PlacementKey {
+            layer_id: 0,
+            shape_bucket: 3,
+            capability_epoch: 1,
+        };
+        let k3 = PlacementKey {
+            layer_id: 1,
+            shape_bucket: 3,
+            capability_epoch: 1,
+        };
         assert_eq!(k1, k2);
         assert_ne!(k1, k3);
     }
@@ -791,7 +817,13 @@ mod tests {
     fn test_ring_basic() {
         let ring = ScytheRing::new(4);
         assert!(ring.is_empty());
-        let desc = ScytheTaskDescriptor { opcode: 1, m: 128, n: 256, k: 512, ..Default::default() };
+        let desc = ScytheTaskDescriptor {
+            opcode: 1,
+            m: 128,
+            n: 256,
+            k: 512,
+            ..Default::default()
+        };
         assert!(ring.enqueue(desc).is_ok());
         assert_eq!(ring.len(), 1);
         let _ = ring.dequeue();
@@ -823,6 +855,9 @@ mod tests {
     fn test_task_descriptor_size() {
         // 52 bytes of fields, padded to 64 (next multiple of 32).
         let size = std::mem::size_of::<ScytheTaskDescriptor>();
-        assert!(size >= 32, "ScytheTaskDescriptor must be at least 32 bytes (got {size})");
+        assert!(
+            size >= 32,
+            "ScytheTaskDescriptor must be at least 32 bytes (got {size})"
+        );
     }
 }

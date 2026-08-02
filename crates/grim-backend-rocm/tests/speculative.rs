@@ -44,11 +44,7 @@ fn acceptor_full_match_accepts_all_drafts_and_emits_target_tail() -> TestResult 
     // the end. The summary reports the accepted count + the tail.
     let acceptor = TokenAcceptor::new(0.0_f32);
     // Per-token probabilities: draft == target (canonical pass).
-    let probs = vec![
-        (0.7_f32, 0.7_f32),
-        (0.2_f32, 0.2_f32),
-        (0.1_f32, 0.1_f32),
-    ];
+    let probs = vec![(0.7_f32, 0.7_f32), (0.2_f32, 0.2_f32), (0.1_f32, 0.1_f32)];
     let result = acceptor.decide(&probs, /* gamma= */ 3);
     match result {
         AcceptanceResult::AcceptAll { accepted, tail } => {
@@ -74,7 +70,10 @@ fn acceptor_first_mismatch_rejects_suffix_and_emits_one_target() -> TestResult {
     ];
     let result = acceptor.decide(&probs, 3);
     match result {
-        AcceptanceResult::Partial { accepted, rejected_at } => {
+        AcceptanceResult::Partial {
+            accepted,
+            rejected_at,
+        } => {
             assert_eq!(accepted.len(), 1, "first draft accepted");
             assert_eq!(rejected_at, 1, "rejected at step 1");
         }
@@ -104,7 +103,10 @@ fn acceptor_full_mismatch_rejects_first_step_with_no_drafts() -> TestResult {
     let acceptor = TokenAcceptor::new(0.0_f32);
     let probs = vec![(0.9_f32, 0.1_f32)];
     match acceptor.decide(&probs, 2) {
-        AcceptanceResult::Partial { accepted, rejected_at } => {
+        AcceptanceResult::Partial {
+            accepted,
+            rejected_at,
+        } => {
             assert!(accepted.is_empty(), "first step rejects");
             assert_eq!(rejected_at, 0);
         }
@@ -186,8 +188,14 @@ fn tree_mask_branching_creates_two_leaves_one_root() -> TestResult {
     // includes the bit for `i` itself.
     assert!(m1 & (1 << 1) == 1 << 1, "row 1 includes self");
     assert!(m2 & (1 << 2) == 1 << 2, "row 2 includes self");
-    assert!(m1 & (1 << 2) == 0, "row 1 does not include row 2 as ancestor");
-    assert!(m2 & (1 << 1) == 0, "row 2 does not include row 1 as ancestor");
+    assert!(
+        m1 & (1 << 2) == 0,
+        "row 1 does not include row 2 as ancestor"
+    );
+    assert!(
+        m2 & (1 << 1) == 0,
+        "row 2 does not include row 1 as ancestor"
+    );
     Ok(())
 }
 
@@ -234,17 +242,18 @@ fn speculative_decoder_accepts_and_returns_summary() -> TestResult {
     // `gamma=3`: the draft model emits 3 candidate tokens and the
     // target model is asked to score `input_ids ⊕ draft_tokens`. Both
     // agree on every draft → AcceptAll path.
-    let draft = |input: &[u32]| -> Vec<u32> {
-        vec![input.last().copied().unwrap_or(0) + 100; 3]
-    };
+    let draft = |input: &[u32]| -> Vec<u32> { vec![input.last().copied().unwrap_or(0) + 100; 3] };
     let target_score = |_root: &[u32], _drafts: &[u32]| -> Vec<(f32, f32)> {
         // Draft == target (every position).
         vec![(0.6_f32, 0.6_f32); 3]
     };
-    let pickup = |_rule: &str| -> u32 { 100 };
+    let pickup = |_key: &str| -> u32 { 0 };
     let mut decoder = SpeculativeDecoder::new(3, &draft, &target_score, &pickup);
     let summary: StepSummary = decoder.step(&[42, 43])?;
-    assert!(summary.accepted_count() >= 1, "speculative step produced at least 1 accepted");
+    assert!(
+        summary.accepted_count() >= 1,
+        "speculative step produced at least 1 accepted"
+    );
     let n = summary.total_emitted();
     assert!(n >= 2, "speculative step emitted at least accepted + tail");
     Ok(())
@@ -255,10 +264,8 @@ fn speculative_decoder_idempotent_under_full_agreement() -> TestResult {
     // Two back-to-back calls with the same model shapes should both
     // succeed (state doesn't carry over).
     let draft = |_: &[u32]| -> Vec<u32> { vec![1, 2, 3] };
-    let target = |_: &[u32], _: &[u32]| -> Vec<(f32, f32)> {
-        vec![(0.5_f32, 0.5_f32); 3]
-    };
-    let pickup = |_: &str| -> u32 { 9 };
+    let target = |_: &[u32], _: &[u32]| -> Vec<(f32, f32)> { vec![(0.5_f32, 0.5_f32); 3] };
+    let pickup = |_key: &str| -> u32 { 0 };
     let mut decoder = SpeculativeDecoder::new(3, &draft, &target, &pickup);
     let s1 = decoder.step(&[1])?;
     let s2 = decoder.step(&[1])?;
@@ -316,7 +323,11 @@ fn alpha_gain_does_not_win_with_useless_draft() -> TestResult {
         "alpha=0 must not exceed the root-only acceptance (mean={})",
         mean
     );
-    assert!(mean >= 0.99, "alpha=0 root must still accept 1 (got {})", mean);
+    assert!(
+        mean >= 0.99,
+        "alpha=0 root must still accept 1 (got {})",
+        mean
+    );
     Ok(())
 }
 

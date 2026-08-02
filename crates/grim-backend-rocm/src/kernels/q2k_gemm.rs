@@ -1,17 +1,4 @@
-//! Q2_K Fused Dequantization GEMM HIP kernel (Crow Tier).
-//!
-//! Dequantizes llama.cpp `block_q2_K` super-blocks (256 weights,
-//! 2-bit codes with per-sub-block scales) on-the-fly inside HIP GEMM loops.
-//! This uses a simplified layout consistent with packed-symmetric dequant:
-//! per 32-weight sub-block a uniform f32 scale followed by packed 2-bit codes.
-//!
-//! Q2_K block layout (84 bytes per 256 weights):
-//! - d (f16): 2 bytes - super-block scale
-//! - dmin (f16): 2 bytes - super-block minimum
-//! - sc (8 bytes): 8 sub-block scales, 1 byte each (2-bit values)
-//! - m (8 bytes): 8 sub-block minimums, 1 byte each (2-bit values)
-//! - qs (64 bytes): 256 2-bit codes, packed 4 per byte
-//! - qh (4 bytes): reserved/padding
+//! Q2_K Fused Dequantization GEMM HIP kernel (Crow Tier). [see: `block_q2_K`]
 //  Total: 2+2+8+8+64+4 = 88 (llama.cpp uses 84; 4 bytes are sub-block header overhead)
 
 /// HIP source for `grim_fused_dequant_gemm_q2k` and `grim_fused_dequant_backward_gemm_q2k`.

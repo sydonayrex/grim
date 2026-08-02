@@ -66,68 +66,92 @@ pub struct HyperparameterExtractor;
 
 impl HyperparameterExtractor {
     /// Extract `ArchHyperparameters` from a `MetadataLookup` provider for the specified architecture.
-    pub fn extract<M: MetadataLookup>(arch: ModelArchitecture, metadata: &M) -> ArchHyperparameters {
+    pub fn extract<M: MetadataLookup>(
+        arch: ModelArchitecture,
+        metadata: &M,
+    ) -> ArchHyperparameters {
         let arch_name = arch.as_str();
 
-        let vocab_size = metadata.get_u32("tokenizer.ggml.vocab_size")
+        let vocab_size = metadata
+            .get_u32("tokenizer.ggml.vocab_size")
             .or_else(|| metadata.get_u32(&format!("{arch_name}.vocab_size")))
             .map(|v| v as usize)
             .unwrap_or(32000);
 
-        let hidden_size = metadata.get_u32(&format!("{arch_name}.embedding_length"))
+        let hidden_size = metadata
+            .get_u32(&format!("{arch_name}.embedding_length"))
             .or_else(|| metadata.get_u32(&format!("{arch_name}.hidden_size")))
             .map(|v| v as usize)
             .unwrap_or(4096);
 
-        let num_layers = metadata.get_u32(&format!("{arch_name}.block_count"))
+        let num_layers = metadata
+            .get_u32(&format!("{arch_name}.block_count"))
             .or_else(|| metadata.get_u32(&format!("{arch_name}.num_hidden_layers")))
             .map(|v| v as usize)
             .unwrap_or(32);
 
-        let num_heads = metadata.get_u32(&format!("{arch_name}.attention.head_count"))
+        let num_heads = metadata
+            .get_u32(&format!("{arch_name}.attention.head_count"))
             .or_else(|| metadata.get_u32(&format!("{arch_name}.num_attention_heads")))
             .map(|v| v as usize)
             .unwrap_or(32);
 
-        let num_kv_heads = metadata.get_u32(&format!("{arch_name}.attention.head_count_kv"))
+        let num_kv_heads = metadata
+            .get_u32(&format!("{arch_name}.attention.head_count_kv"))
             .or_else(|| metadata.get_u32(&format!("{arch_name}.num_key_value_heads")))
             .map(|v| v as usize)
             .unwrap_or(num_heads);
 
-        let head_dim = metadata.get_u32(&format!("{arch_name}.attention.key_length"))
+        let head_dim = metadata
+            .get_u32(&format!("{arch_name}.attention.key_length"))
             .or_else(|| metadata.get_u32(&format!("{arch_name}.head_dim")))
             .map(|v| v as usize)
-            .unwrap_or_else(|| if num_heads > 0 { hidden_size / num_heads } else { 128 });
+            .unwrap_or_else(|| {
+                if num_heads > 0 {
+                    hidden_size / num_heads
+                } else {
+                    128
+                }
+            });
 
-        let intermediate_size = metadata.get_u32(&format!("{arch_name}.feed_forward_length"))
+        let intermediate_size = metadata
+            .get_u32(&format!("{arch_name}.feed_forward_length"))
             .or_else(|| metadata.get_u32(&format!("{arch_name}.intermediate_size")))
             .map(|v| v as usize)
             .unwrap_or(hidden_size * 4);
 
-        let rms_norm_eps = metadata.get_f32(&format!("{arch_name}.attention.layer_norm_rms_eps"))
+        let rms_norm_eps = metadata
+            .get_f32(&format!("{arch_name}.attention.layer_norm_rms_eps"))
             .or_else(|| metadata.get_f32(&format!("{arch_name}.attention.layer_norm_epsilon")))
             .or_else(|| metadata.get_f32(&format!("{arch_name}.rms_norm_eps")))
             .unwrap_or(1e-5);
 
-        let rope_theta = metadata.get_f32(&format!("{arch_name}.rope.freq_base"))
+        let rope_theta = metadata
+            .get_f32(&format!("{arch_name}.rope.freq_base"))
             .or_else(|| metadata.get_f32(&format!("{arch_name}.rope_theta")))
             .unwrap_or(10000.0);
 
-        let max_seq_len = metadata.get_u32(&format!("{arch_name}.context_length"))
+        let max_seq_len = metadata
+            .get_u32(&format!("{arch_name}.context_length"))
             .or_else(|| metadata.get_u32(&format!("{arch_name}.max_position_embeddings")))
             .map(|v| v as usize)
             .unwrap_or(2048);
 
-        let expert_count = metadata.get_u32(&format!("{arch_name}.expert_count"))
+        let expert_count = metadata
+            .get_u32(&format!("{arch_name}.expert_count"))
             .map(|v| v as usize);
-        let expert_used_count = metadata.get_u32(&format!("{arch_name}.expert_used_count"))
+        let expert_used_count = metadata
+            .get_u32(&format!("{arch_name}.expert_used_count"))
             .map(|v| v as usize);
 
-        let ssm_d_state = metadata.get_u32(&format!("{arch_name}.ssm.state_size"))
+        let ssm_d_state = metadata
+            .get_u32(&format!("{arch_name}.ssm.state_size"))
             .map(|v| v as usize);
-        let ssm_d_inner = metadata.get_u32(&format!("{arch_name}.ssm.inner_size"))
+        let ssm_d_inner = metadata
+            .get_u32(&format!("{arch_name}.ssm.inner_size"))
             .map(|v| v as usize);
-        let ssm_d_conv = metadata.get_u32(&format!("{arch_name}.ssm.conv_kernel"))
+        let ssm_d_conv = metadata
+            .get_u32(&format!("{arch_name}.ssm.conv_kernel"))
             .map(|v| v as usize);
 
         ArchHyperparameters {

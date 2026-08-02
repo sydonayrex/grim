@@ -7,11 +7,11 @@
 
 use crate::param::{ParamId, TrainableParams};
 use grim_format::train::{TrainFpFormat, TrainState};
+use grim_tensor::Shape;
 use grim_tensor::{
     DType, Tensor,
     error::{Error, Result},
 };
-use grim_tensor::Shape;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -49,7 +49,7 @@ impl LRScheduler {
     pub fn get_lr(&self, base_lr: f32, step: usize, total_steps: usize) -> f32 {
         let total_f = total_steps as f32;
         let step_f = step as f32;
-        
+
         match self {
             LRScheduler::Cosine => {
                 if step >= total_steps {
@@ -249,6 +249,7 @@ pub enum Optimizer {
     Lion(Lion),
     Lion8Bit(Lion8Bit),
     Adafactor(Adafactor),
+    QGaLoreAdamW8Bit(QGaLoreAdamW8Bit),
 }
 
 impl Optimizer {
@@ -262,37 +263,39 @@ impl Optimizer {
                 lr,
                 ..AdamWConfig::default()
             }))),
-            OptimizerKind::AdamW8Bit => Ok(Optimizer::AdamW8Bit(AdamW8Bit::new(
-                AdamW8BitConfig {
-                    lr,
-                    use_8bit_moments: true,
-                    ..AdamW8BitConfig::default()
-                },
-            ))),
-            OptimizerKind::PagedAdamW => Ok(Optimizer::PagedAdamW(PagedAdamW::new(
-                PagedAdamWConfig {
+            OptimizerKind::AdamW8Bit => Ok(Optimizer::AdamW8Bit(AdamW8Bit::new(AdamW8BitConfig {
+                lr,
+                use_8bit_moments: true,
+                ..AdamW8BitConfig::default()
+            }))),
+            OptimizerKind::PagedAdamW => {
+                Ok(Optimizer::PagedAdamW(PagedAdamW::new(PagedAdamWConfig {
                     lr,
                     cpu_offload: true,
                     ..PagedAdamWConfig::default()
-                },
-            ))),
+                })))
+            }
             OptimizerKind::Lion => Ok(Optimizer::Lion(Lion::new(LionConfig {
                 lr,
                 ..LionConfig::default()
             }))),
-            OptimizerKind::Lion8Bit => Ok(Optimizer::Lion8Bit(Lion8Bit::new(
-                Lion8BitConfig {
+            OptimizerKind::Lion8Bit => Ok(Optimizer::Lion8Bit(Lion8Bit::new(Lion8BitConfig {
+                lr,
+                use_8bit_moments: true,
+                ..Lion8BitConfig::default()
+            }))),
+            OptimizerKind::Adafactor => Ok(Optimizer::Adafactor(Adafactor::new(AdafactorConfig {
+                lr,
+                ..AdafactorConfig::default()
+            }))),
+            OptimizerKind::QGaLoreAdamW8Bit
+            | OptimizerKind::GaloreAdamW
+            | OptimizerKind::GaloreAdamW8Bit => Ok(Optimizer::QGaLoreAdamW8Bit(
+                QGaLoreAdamW8Bit::new(QGaLoreAdamW8BitConfig {
                     lr,
-                    use_8bit_moments: true,
-                    ..Lion8BitConfig::default()
-                },
-            ))),
-            OptimizerKind::Adafactor => Ok(Optimizer::Adafactor(Adafactor::new(
-                AdafactorConfig {
-                    lr,
-                    ..AdafactorConfig::default()
-                },
-            ))),
+                    ..QGaLoreAdamW8BitConfig::default()
+                }),
+            )),
             kind => Err(Error::Unimplemented(format!(
                 "optimizer '{kind}' is declared but not yet implemented (Phase 7)"
             ))),
@@ -307,6 +310,7 @@ impl Optimizer {
             Optimizer::Lion(o) => o.step(params),
             Optimizer::Lion8Bit(o) => o.step(params),
             Optimizer::Adafactor(o) => o.step(params),
+            Optimizer::QGaLoreAdamW8Bit(o) => o.step(params),
         }
     }
 
@@ -319,6 +323,7 @@ impl Optimizer {
             Optimizer::Lion(o) => o.config.lr = lr,
             Optimizer::Lion8Bit(o) => o.config.lr = lr,
             Optimizer::Adafactor(o) => o.config.lr = lr,
+            Optimizer::QGaLoreAdamW8Bit(o) => o.config.lr = lr,
         }
     }
 
@@ -330,6 +335,7 @@ impl Optimizer {
             Optimizer::Lion(o) => o.save_to_train_state(params),
             Optimizer::Lion8Bit(o) => o.save_to_train_state(params),
             Optimizer::Adafactor(o) => o.save_to_train_state(params),
+            Optimizer::QGaLoreAdamW8Bit(o) => o.save_to_train_state(params),
         }
     }
 
@@ -345,6 +351,7 @@ impl Optimizer {
             Optimizer::Lion(o) => o.load_from_train_state(params, state),
             Optimizer::Lion8Bit(o) => o.load_from_train_state(params, state),
             Optimizer::Adafactor(o) => o.load_from_train_state(params, state),
+            Optimizer::QGaLoreAdamW8Bit(o) => o.load_from_train_state(params, state),
         }
     }
 }
@@ -550,6 +557,7 @@ impl AdamW {
         params: &mut TrainableParams,
         state: &TrainState,
     ) -> Result<()> {
+        self.step_count = state.step as usize;
         for (id, param) in params.iter_mut() {
             let suffix = if id.is_a { "a" } else { "b" };
             let param_key = format!("param_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
@@ -1299,7 +1307,8 @@ impl Adafactor {
                 c_vec[j] = beta2 * c_vec[j] + (1.0 - beta2) * sum.sqrt().max(1e-8);
             }
 
-            let effective_v: Vec<f32> = b_vec.iter()
+            let effective_v: Vec<f32> = b_vec
+                .iter()
                 .flat_map(|&bi| c_vec.iter().map(move |&cj| bi * cj))
                 .collect();
 
@@ -1309,7 +1318,8 @@ impl Adafactor {
                 lr / effective_v[0].max(1e-8)
             };
 
-            let new_data: Vec<f32> = data.iter()
+            let new_data: Vec<f32> = data
+                .iter()
                 .zip(grad.iter())
                 .map(|(&d, &g)| d - step_scale * g)
                 .collect();
@@ -1343,6 +1353,461 @@ impl Adafactor {
     }
 }
 
+/// Halko randomized SVD for matrix decomposition mat [m, n] -> U [m, rank], S [rank], V^T [rank, n].
+pub fn randomized_svd(
+    mat: &[f32],
+    m: usize,
+    n: usize,
+    rank: usize,
+    oversample: usize,
+    niter: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let k = (rank + oversample).min(m).min(n);
+    if k == 0 || m == 0 || n == 0 {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+
+    let mut omega = vec![0.0f32; n * k];
+    for i in 0..n * k {
+        let u1 = ((i as f32 + 1.0) * 0.017).fract().max(1e-7);
+        let u2 = ((i as f32 + 1.0) * 0.031).fract();
+        omega[i] = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
+    }
+
+    let mut y = vec![0.0f32; m * k];
+    for i in 0..m {
+        for l in 0..k {
+            let mut sum = 0.0f32;
+            for j in 0..n {
+                sum += mat[i * n + j] * omega[j * k + l];
+            }
+            y[i * k + l] = sum;
+        }
+    }
+
+    for _ in 0..niter {
+        let mut y_temp = vec![0.0f32; n * k];
+        for j in 0..n {
+            for l in 0..k {
+                let mut sum = 0.0f32;
+                for i in 0..m {
+                    sum += mat[i * n + j] * y[i * k + l];
+                }
+                y_temp[j * k + l] = sum;
+            }
+        }
+        for i in 0..m {
+            for l in 0..k {
+                let mut sum = 0.0f32;
+                for j in 0..n {
+                    sum += mat[i * n + j] * y_temp[j * k + l];
+                }
+                y[i * k + l] = sum;
+            }
+        }
+    }
+
+    let mut q_qr = vec![0.0f32; m * k];
+    for l in 0..k {
+        for i in 0..m {
+            q_qr[i * k + l] = y[i * k + l];
+        }
+        for prev in 0..l {
+            let mut dot = 0.0f32;
+            for i in 0..m {
+                dot += q_qr[i * k + prev] * q_qr[i * k + l];
+            }
+            for i in 0..m {
+                q_qr[i * k + l] -= dot * q_qr[i * k + prev];
+            }
+        }
+        let mut norm = 0.0f32;
+        for i in 0..m {
+            norm += q_qr[i * k + l] * q_qr[i * k + l];
+        }
+        let norm = norm.sqrt().max(1e-10);
+        for i in 0..m {
+            q_qr[i * k + l] /= norm;
+        }
+    }
+
+    let mut b = vec![0.0f32; k * n];
+    for l in 0..k {
+        for j in 0..n {
+            let mut sum = 0.0f32;
+            for i in 0..m {
+                sum += q_qr[i * k + l] * mat[i * n + j];
+            }
+            b[l * n + j] = sum;
+        }
+    }
+
+    let mut bbt = vec![0.0f32; k * k];
+    for i in 0..k {
+        for j in 0..k {
+            let mut sum = 0.0f32;
+            for l in 0..n {
+                sum += b[i * n + l] * b[j * n + l];
+            }
+            bbt[i * k + j] = sum;
+        }
+    }
+
+    let mut v_b = vec![0.0f32; k * k];
+    for i in 0..k {
+        v_b[i * k + i] = 1.0;
+    }
+    for _ in 0..30 {
+        let mut max_off = 0.0f32;
+        let mut p = 0;
+        let mut q = 1;
+        for i in 0..k {
+            for j in i + 1..k {
+                if bbt[i * k + j].abs() > max_off {
+                    max_off = bbt[i * k + j].abs();
+                    p = i;
+                    q = j;
+                }
+            }
+        }
+        if max_off < 1e-7 {
+            break;
+        }
+        let diff = bbt[q * k + q] - bbt[p * k + p];
+        let t = if diff.abs() < 1e-10 {
+            0.5 * std::f32::consts::PI
+        } else {
+            0.5 * (2.0 * bbt[p * k + q] / diff).atan()
+        };
+        let c = t.cos();
+        let s = t.sin();
+        for i in 0..k {
+            let vip = v_b[i * k + p];
+            let viq = v_b[i * k + q];
+            v_b[i * k + p] = c * vip - s * viq;
+            v_b[i * k + q] = s * vip + c * viq;
+        }
+        let bpp = bbt[p * k + p];
+        let bqq = bbt[q * k + q];
+        let bpq = bbt[p * k + q];
+        bbt[p * k + p] = c * c * bpp - 2.0 * s * c * bpq + s * s * bqq;
+        bbt[q * k + q] = s * s * bpp + 2.0 * s * c * bpq + c * c * bqq;
+        bbt[p * k + q] = 0.0;
+        bbt[q * k + p] = 0.0;
+    }
+
+    let actual_r = rank.min(k);
+    let mut u_out = vec![0.0f32; m * actual_r];
+    let mut s_out = vec![0.0f32; actual_r];
+    let mut vt_out = vec![0.0f32; actual_r * n];
+
+    for i in 0..m {
+        for r in 0..actual_r {
+            let mut sum = 0.0f32;
+            for l in 0..k {
+                sum += q_qr[i * k + l] * v_b[l * k + r];
+            }
+            u_out[i * actual_r + r] = sum;
+        }
+    }
+
+    for r in 0..actual_r {
+        s_out[r] = bbt[r * k + r].max(0.0).sqrt();
+    }
+
+    for r in 0..actual_r {
+        let inv_s = if s_out[r] > 1e-8 { 1.0 / s_out[r] } else { 0.0 };
+        for j in 0..n {
+            let mut sum = 0.0f32;
+            for i in 0..m {
+                sum += u_out[i * actual_r + r] * mat[i * n + j];
+            }
+            vt_out[r * n + j] = sum * inv_s;
+        }
+    }
+
+    (u_out, s_out, vt_out)
+}
+
+#[derive(Debug, Clone)]
+pub struct GaloreProjector {
+    pub rank: usize,
+    pub update_proj_gap: usize,
+    pub scale: f32,
+    pub q_orth: Option<Vec<f32>>,
+    pub step: usize,
+}
+
+impl GaloreProjector {
+    pub fn new(rank: usize, update_proj_gap: usize, scale: f32) -> Self {
+        Self {
+            rank,
+            update_proj_gap,
+            scale,
+            q_orth: None,
+            step: 0,
+        }
+    }
+
+    pub fn project(&mut self, grad: &[f32], m: usize, n: usize) -> (Vec<f32>, usize, usize) {
+        let r = self.rank.min(m).min(n);
+        if self.step % self.update_proj_gap == 0 || self.q_orth.is_none() {
+            let (u, _s, vt) = randomized_svd(grad, m, n, r, 10, 2);
+            if m >= n {
+                self.q_orth = Some(u);
+            } else {
+                let mut v_orth = vec![0.0f32; n * r];
+                for j in 0..n {
+                    for r_idx in 0..r {
+                        v_orth[j * r + r_idx] = vt[r_idx * n + j];
+                    }
+                }
+                self.q_orth = Some(v_orth);
+            }
+        }
+        self.step += 1;
+
+        let q = self.q_orth.as_ref().unwrap();
+        if m >= n {
+            let mut low_grad = vec![0.0f32; m * r];
+            for i in 0..m {
+                for r_idx in 0..r {
+                    let mut sum = 0.0f32;
+                    for j in 0..n {
+                        sum += grad[i * n + j] * q[j * r + r_idx];
+                    }
+                    low_grad[i * r + r_idx] = sum * self.scale;
+                }
+            }
+            (low_grad, m, r)
+        } else {
+            let mut low_grad = vec![0.0f32; r * n];
+            for r_idx in 0..r {
+                for j in 0..n {
+                    let mut sum = 0.0f32;
+                    for i in 0..m {
+                        sum += q[i * r + r_idx] * grad[i * n + j];
+                    }
+                    low_grad[r_idx * n + j] = sum * self.scale;
+                }
+            }
+            (low_grad, r, n)
+        }
+    }
+
+    pub fn project_back(&self, low_update: &[f32], m: usize, n: usize) -> Vec<f32> {
+        let r = self.rank.min(m).min(n);
+        let q = match &self.q_orth {
+            Some(q) => q,
+            None => return low_update.to_vec(),
+        };
+        let mut full_update = vec![0.0f32; m * n];
+        if m >= n {
+            for i in 0..m {
+                for j in 0..n {
+                    let mut sum = 0.0f32;
+                    for r_idx in 0..r {
+                        sum += low_update[i * r + r_idx] * q[j * r + r_idx];
+                    }
+                    full_update[i * n + j] = sum * self.scale;
+                }
+            }
+        } else {
+            for i in 0..m {
+                for j in 0..n {
+                    let mut sum = 0.0f32;
+                    for r_idx in 0..r {
+                        sum += q[i * r + r_idx] * low_update[r_idx * n + j];
+                    }
+                    full_update[i * n + j] = sum * self.scale;
+                }
+            }
+        }
+        full_update
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QGaLoreAdamW8BitConfig {
+    pub lr: f32,
+    pub beta1: f32,
+    pub beta2: f32,
+    pub eps: f32,
+    pub weight_decay: f32,
+    pub rank: usize,
+    pub update_proj_gap: usize,
+    pub scale: f32,
+}
+
+impl Default for QGaLoreAdamW8BitConfig {
+    fn default() -> Self {
+        Self {
+            lr: 1e-3,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.01,
+            rank: 128,
+            update_proj_gap: 200,
+            scale: 0.25,
+        }
+    }
+}
+
+pub struct QGaLoreAdamW8Bit {
+    pub config: QGaLoreAdamW8BitConfig,
+    pub step_count: usize,
+    pub m_state: HashMap<ParamId, Vec<u8>>,
+    pub v_state: HashMap<ParamId, Vec<u8>>,
+    pub m_scale: HashMap<ParamId, f32>,
+    pub v_scale: HashMap<ParamId, f32>,
+    pub projectors: HashMap<ParamId, GaloreProjector>,
+}
+
+impl QGaLoreAdamW8Bit {
+    pub fn new(config: QGaLoreAdamW8BitConfig) -> Self {
+        Self {
+            config,
+            step_count: 0,
+            m_state: HashMap::new(),
+            v_state: HashMap::new(),
+            m_scale: HashMap::new(),
+            v_scale: HashMap::new(),
+            projectors: HashMap::new(),
+        }
+    }
+
+    pub fn step(&mut self, params: &mut TrainableParams) -> Result<()> {
+        self.step_count += 1;
+        let lr = self.config.lr;
+        let beta1 = self.config.beta1;
+        let beta2 = self.config.beta2;
+        let eps = self.config.eps;
+        let wd = self.config.weight_decay;
+
+        let bc1 = 1.0 - beta1.powi(self.step_count as i32);
+        let bc2 = 1.0 - beta2.powi(self.step_count as i32);
+
+        for (id, param) in params.iter_mut() {
+            if param.is_frozen() {
+                param.zero_grad()?;
+                continue;
+            }
+            let dev = crate::pick_device_for_tensor(&param.data);
+            let shape = param.data.shape();
+            let dims = shape.dims();
+
+            let mut data = param.data.to_vec_f32()?;
+            let grad = param.grad().to_vec_f32()?;
+
+            if dims.len() == 2 && dims[0].min(dims[1]) > self.config.rank {
+                let m = dims[0];
+                let n = dims[1];
+
+                let proj = self.projectors.entry(*id).or_insert_with(|| {
+                    GaloreProjector::new(
+                        self.config.rank,
+                        self.config.update_proj_gap,
+                        self.config.scale,
+                    )
+                });
+
+                let (low_grad, m_low, n_low) = proj.project(&grad, m, n);
+                let elem_count = m_low * n_low;
+
+                if !self.m_state.contains_key(id) {
+                    self.m_state.insert(*id, vec![127u8; elem_count]);
+                    self.v_state.insert(*id, vec![127u8; elem_count]);
+                    self.m_scale.insert(*id, 1.0);
+                    self.v_scale.insert(*id, 1.0);
+                }
+
+                let m_q = self.m_state.get_mut(id).unwrap();
+                let v_q = self.v_state.get_mut(id).unwrap();
+                let m_sc = self.m_scale.get_mut(id);
+                let v_sc = self.v_scale.get_mut(id);
+
+                let mut m_f32 = vec![0.0f32; elem_count];
+                let mut v_f32 = vec![0.0f32; elem_count];
+                let mut low_update = vec![0.0f32; elem_count];
+
+                let cur_m_scale = *self.m_scale.get(id).unwrap();
+                let cur_v_scale = *self.v_scale.get(id).unwrap();
+
+                for i in 0..elem_count {
+                    let m_val = (m_q[i] as f32 - 127.0) * cur_m_scale;
+                    let v_val = (v_q[i] as f32 - 127.0) * cur_v_scale;
+
+                    let new_m = beta1 * m_val + (1.0 - beta1) * low_grad[i];
+                    let new_v = beta2 * v_val + (1.0 - beta2) * low_grad[i] * low_grad[i];
+
+                    m_f32[i] = new_m;
+                    v_f32[i] = new_v;
+
+                    let m_hat = new_m / bc1;
+                    let v_hat = new_v / bc2;
+
+                    low_update[i] = m_hat / (v_hat.sqrt() + eps);
+                }
+
+                let max_m = m_f32
+                    .iter()
+                    .map(|x| x.abs())
+                    .fold(0.0f32, f32::max)
+                    .max(1e-8);
+                let max_v = v_f32
+                    .iter()
+                    .map(|x| x.abs())
+                    .fold(0.0f32, f32::max)
+                    .max(1e-8);
+                self.m_scale.insert(*id, max_m / 127.0);
+                self.v_scale.insert(*id, max_v / 127.0);
+
+                for i in 0..elem_count {
+                    m_q[i] =
+                        ((m_f32[i] / (max_m / 127.0)).round().clamp(-127.0, 127.0) + 127.0) as u8;
+                    v_q[i] =
+                        ((v_f32[i] / (max_v / 127.0)).round().clamp(-127.0, 127.0) + 127.0) as u8;
+                }
+
+                let full_update = proj.project_back(&low_update, m, n);
+
+                for i in 0..data.len() {
+                    data[i] -= lr * (full_update[i] + wd * data[i]);
+                }
+            } else {
+                for i in 0..data.len() {
+                    data[i] -= lr * (grad[i] + wd * data[i]);
+                }
+            }
+
+            let storage = dev.from_cpu(&data, shape, DType::F32)?;
+            param.data = Tensor::new(
+                Arc::from(storage),
+                shape.clone(),
+                DType::F32,
+                param.data.provenance().clone(),
+                param.data.device().clone(),
+            );
+            param.zero_grad()?;
+        }
+        Ok(())
+    }
+
+    pub fn save_to_train_state(&self, params: &TrainableParams) -> TrainState {
+        save_param_data_only(params, self.step_count)
+    }
+
+    pub fn load_from_train_state(
+        &mut self,
+        params: &mut TrainableParams,
+        state: &TrainState,
+    ) -> Result<()> {
+        self.step_count = state.step as usize;
+        load_param_data_only(params, state)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1365,7 +1830,7 @@ mod tests {
         let mut adam8 = AdamW8Bit::new(AdamW8BitConfig::default());
         adam8.step(&mut params).unwrap();
     }
-    
+
     #[test]
     fn test_paged_adamw_optimizer_step() {
         use crate::injection::LoRAInjectionPoint;
@@ -1381,7 +1846,7 @@ mod tests {
         let mut paged = PagedAdamW::new(PagedAdamWConfig::default());
         paged.step(&mut params).unwrap();
     }
-    
+
     #[test]
     fn test_lion8bit_optimizer_step() {
         use crate::injection::LoRAInjectionPoint;
@@ -1397,7 +1862,7 @@ mod tests {
         let mut lion8bit = Lion8Bit::new(Lion8BitConfig::default());
         lion8bit.step(&mut params).unwrap();
     }
-    
+
     #[test]
     fn test_adafactor_optimizer_step() {
         use crate::injection::LoRAInjectionPoint;
@@ -1413,7 +1878,7 @@ mod tests {
         let mut adafactor = Adafactor::new(AdafactorConfig::default());
         adafactor.step(&mut params).unwrap();
     }
-    
+
     #[test]
     fn test_lr_scheduler_cosine() {
         let sched = LRScheduler::Cosine;
@@ -1425,7 +1890,7 @@ mod tests {
         assert!(lr0 > lr50);
         assert!(lr50 > lr100);
     }
-    
+
     #[test]
     fn test_lr_scheduler_linear() {
         let sched = LRScheduler::Linear;
@@ -1437,7 +1902,7 @@ mod tests {
         assert!((lr0 - base_lr).abs() < 1e-10);
         assert!(lr50 > lr100);
     }
-    
+
     #[test]
     fn test_lr_scheduler_inverse_sqrt() {
         let sched = LRScheduler::InverseSqrt;
@@ -1446,5 +1911,42 @@ mod tests {
         let lr10 = sched.get_lr(base_lr, 10, 1000);
         // lr = base_lr / sqrt(step)
         assert!(lr1 > lr10);
+    }
+
+    #[test]
+    fn test_randomized_svd_decomposes_matrix() {
+        let m = 32;
+        let n = 24;
+        let rank = 4;
+        let mat: Vec<f32> = (0..m * n)
+            .map(|i| ((i as f32 * 0.05).sin() * 0.5))
+            .collect();
+        let (u, s, vt) = randomized_svd(&mat, m, n, rank, 5, 2);
+        assert_eq!(u.len(), m * rank);
+        assert_eq!(s.len(), rank);
+        assert_eq!(vt.len(), rank * n);
+    }
+
+    #[test]
+    fn test_qgalore_optimizer_build_and_step() {
+        let opt = Optimizer::new(OptimizerKind::QGaLoreAdamW8Bit, 1e-3);
+        assert!(opt.is_ok());
+        let mut opt = opt.unwrap();
+
+        let t = grim_backend_cpu::cpu_tensor(vec![0.5f32; 128 * 64], Shape::new(vec![128, 64]));
+        let mut params = TrainableParams::new();
+        let pid = ParamId::base(0, crate::injection::LoRAInjectionPoint::GateProj);
+        params.insert(crate::param::TrainableParam::new(pid, t).unwrap());
+
+        let grad = grim_backend_cpu::cpu_tensor(vec![0.1f32; 128 * 64], Shape::new(vec![128, 64]));
+        if let Some(param) = params.get_mut(pid) {
+            param.accumulate_grad(&grad).unwrap();
+        }
+
+        opt.step(&mut params).unwrap();
+        assert_eq!(
+            params.get(pid).unwrap().data.to_vec_f32().unwrap().len(),
+            128 * 64
+        );
     }
 }

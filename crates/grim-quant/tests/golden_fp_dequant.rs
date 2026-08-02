@@ -1,6 +1,4 @@
-use grim_quant::{
-    dequant_fp4, dequant_fp4_block16, dequant_fp8_block16, fp8_e4m3_to_f32,
-};
+use grim_quant::{dequant_fp4, dequant_fp4_block16, dequant_fp8_block16, fp8_e4m3_to_f32};
 
 fn close(got: f32, want: f32, ctx: &str) {
     let abs = (got - want).abs();
@@ -13,8 +11,8 @@ fn close(got: f32, want: f32, ctx: &str) {
 }
 
 const FP4_E2M1_LUT: [f32; 16] = [
-    -1.0, -0.875, -0.75, -0.625, -0.5, -0.375, -0.25, -0.125,
-    0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875,
+    -1.0, -0.875, -0.75, -0.625, -0.5, -0.375, -0.25, -0.125, 0.0, 0.125, 0.25, 0.375, 0.5, 0.625,
+    0.75, 0.875,
 ];
 
 // ===========================================================================
@@ -87,7 +85,9 @@ fn fp8_block16_golden_one_block_identity_scale() {
     buf.push(0b0_0000_001); //  1/512
     buf.push(0b1_0000_011); // -3/512
     // pad to 16 values
-    for _ in 6..16 { buf.push(0); }
+    for _ in 6..16 {
+        buf.push(0);
+    }
 
     let out = dequant_fp8_block16(&buf, 16).expect("fp8 block16");
     assert_eq!(out.len(), 16);
@@ -182,8 +182,9 @@ fn fp4_block16_golden_one_block_all_codes() {
 
     let scale = global_scale * fp8_e4m3_to_f32(0b0_1000_000); // = 1.0 * 2.0 = 2.0
     for i in 0..16 {
-        let nibble = [0xF, 0x0, 0xE, 0x1, 0xD, 0x2, 0xC, 0x3,
-                      0xB, 0x4, 0xA, 0x5, 0x9, 0x6, 0x8, 0x7][i];
+        let nibble = [
+            0xF, 0x0, 0xE, 0x1, 0xD, 0x2, 0xC, 0x3, 0xB, 0x4, 0xA, 0x5, 0x9, 0x6, 0x8, 0x7,
+        ][i];
         let want = FP4_E2M1_LUT[nibble as usize] * scale;
         close(out[i], want, &format!("fp4b16[{i}] nibble={nibble:#x}"));
     }
@@ -197,7 +198,9 @@ fn fp4_block16_golden_two_blocks_partial_last_block() {
 
     // Block 0: block_scale = 1.0, 16 values (8 bytes)
     buf.push(0b0_0111_000); // block_scale E4M3 = 1.0
-    for _ in 0..8 { buf.push(0x00); } // all nibbles = 0 (FP4[0] = -1.0)
+    for _ in 0..8 {
+        buf.push(0x00);
+    } // all nibbles = 0 (FP4[0] = -1.0)
     // Block 1: block_scale = 1.0, 8 values only (partial, 4 bytes = 8 nibbles)
     buf.push(0b0_0111_000);
     buf.push(0xF0); // hi=0xF, lo=0x0 → out[16]=(-1.0), out[17]=(0.0 after scale...)

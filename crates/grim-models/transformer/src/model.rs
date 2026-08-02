@@ -7,8 +7,8 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
-use grim_nn::{pick_device_for_storage_device, Embedding, Linear, RmsNorm, Rope};
-use grim_tensor::{ArithType, Device, DType, Shape, Tensor};
+use grim_nn::{Embedding, Linear, RmsNorm, Rope, pick_device_for_storage_device};
+use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
 use crate::block::{LlamaBlock, LlamaConfigRefs};
 use grim_core::rng::SimpleRng;
@@ -50,11 +50,8 @@ pub struct Llama {
 
 impl Llama {
     pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: LlamaConfig) -> Result<Self> {
-        let tok_embeddings = Embedding::load(
-            &ws.pp("tok_embeddings"),
-            cfg.vocab_size,
-            cfg.hidden_size,
-        )?;
+        let tok_embeddings =
+            Embedding::load(&ws.pp("tok_embeddings"), cfg.vocab_size, cfg.hidden_size)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             layers.push(LlamaBlock::load(&ws.pp("layers").pp(&i.to_string()), &cfg)?);
@@ -83,17 +80,17 @@ impl Llama {
             .map(|_| (rng.next_f32() - 0.5) * 0.02)
             .collect();
         let tok_embeddings = Embedding {
-            weight: cpu_tensor(embed_data, Shape::new(vec![cfg.vocab_size, cfg.hidden_size])),
+            weight: cpu_tensor(
+                embed_data,
+                Shape::new(vec![cfg.vocab_size, cfg.hidden_size]),
+            ),
         };
 
         let mut linear = |out: usize, inp: usize| {
             let data: Vec<f32> = (0..out * inp)
                 .map(|_| (rng.next_f32() - 0.5) * 0.02)
                 .collect();
-            Linear::from_tensor(
-                cpu_tensor(data, Shape::new(vec![out, inp])),
-                None,
-            )
+            Linear::from_tensor(cpu_tensor(data, Shape::new(vec![out, inp])), None)
         };
         let rms = |dim: usize| RmsNorm {
             weight: cpu_tensor(vec![1.0; dim], Shape::new(vec![dim])),
@@ -110,7 +107,7 @@ impl Llama {
                 wo: linear(cfg.hidden_size, cfg.num_heads * cfg.head_dim),
                 ffn_norm: rms(cfg.hidden_size),
                 w_gate: linear(cfg.intermediate_size, cfg.hidden_size),
-                w_up:   linear(cfg.intermediate_size, cfg.hidden_size),
+                w_up: linear(cfg.intermediate_size, cfg.hidden_size),
                 w_down: linear(cfg.hidden_size, cfg.intermediate_size),
                 rope: Rope::new(cfg.head_dim, cfg.rope_theta),
                 _dev: Device::Cpu,
@@ -137,10 +134,16 @@ impl Llama {
     }
 
     pub fn embed_token(&self, token: u32) -> Result<Tensor> {
-        Ok(self.tok_embeddings.forward(&[token], 1, self.cfg.hidden_size)?)
+        Ok(self
+            .tok_embeddings
+            .forward(&[token], 1, self.cfg.hidden_size)?)
     }
 
-    pub fn decode(&self, hidden: &Tensor, positions: &[u32]) -> Result<(Tensor, Tensor, Vec<(Tensor, Tensor)>)> {
+    pub fn decode(
+        &self,
+        hidden: &Tensor,
+        positions: &[u32],
+    ) -> Result<(Tensor, Tensor, Vec<(Tensor, Tensor)>)> {
         let mut h = hidden.clone();
         let mut kv_pairs = Vec::new();
         for layer in &self.layers {
@@ -212,7 +215,11 @@ impl CausalLm for Llama {
         // hardcoding 0..seq_len. During decode the engine passes the actual
         // current_pos so RoPE sees the correct absolute position.
         let pos_vec: Vec<u32> = if positions.shape().dims().iter().product::<usize>() == seq_len {
-            positions.to_vec_f32()?.into_iter().map(|x| x as u32).collect()
+            positions
+                .to_vec_f32()?
+                .into_iter()
+                .map(|x| x as u32)
+                .collect()
         } else {
             (0..seq_len).map(|i| i as u32).collect()
         };

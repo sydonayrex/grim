@@ -4,15 +4,15 @@
 //! `grim-memory`'s block pool. Distinct from `grim-quant` (which compresses
 //! model weights at save time).
 
-use std::sync::Arc;
 use grim_core::error::Result;
-use grim_tensor::{Tensor, BackendDevice, QuantProvenance, Device, Shape, BackendStorage};
+use grim_tensor::{BackendDevice, BackendStorage, Device, QuantProvenance, Shape, Tensor};
+use std::sync::Arc;
 
 /// Generate a random orthogonal matrix using QR decomposition of a random matrix.
 /// This is used for pre-rotation before Lloyd-Max quantization to decorrelate features.
 pub fn random_orthogonal_matrix(dim: usize, seed: u64) -> Vec<f32> {
     use std::f32::consts::PI;
-    
+
     // Generate random matrix using deterministic LCG
     let mut state = seed;
     let mut random_mat = vec![0.0f32; dim * dim];
@@ -23,25 +23,25 @@ pub fn random_orthogonal_matrix(dim: usize, seed: u64) -> Vec<f32> {
         // Box-Muller transform
         random_mat[i] = (-2.0 * u1.max(1e-5).ln()).sqrt() * (2.0 * PI * u2).cos();
     }
-    
+
     // Simplified Gram-Schmidt orthogonalization
     let mut q = vec![0.0f32; dim * dim];
     for col in 0..dim {
         let mut v: Vec<f32> = (0..dim).map(|r| random_mat[r * dim + col]).collect();
-        
+
         for prev in 0..col {
             let dot: f32 = (0..dim).map(|r| v[r] * q[r * dim + prev]).sum();
             for r in 0..dim {
                 v[r] -= dot * q[r * dim + prev];
             }
         }
-        
+
         let norm = (0..dim).map(|r| v[r] * v[r]).sum::<f32>().sqrt().max(1e-5);
         for r in 0..dim {
             q[r * dim + col] = v[r] / norm;
         }
     }
-    
+
     q
 }
 
@@ -63,9 +63,20 @@ pub fn apply_rotation(data: &[f32], rotation: &[f32], dim: usize, count: usize) 
 /// Compresses / decompresses KV block contents in place.
 pub trait KvCompressor: Send + Sync {
     fn compress(&self, keys: &Tensor, values: &Tensor) -> Result<CompressedKvBlock>;
-    fn dequantize_for_attention(&self, block: &CompressedKvBlock, device: &dyn BackendDevice, device_type: Device) -> Result<(Tensor, Tensor)>;
+    fn dequantize_for_attention(
+        &self,
+        block: &CompressedKvBlock,
+        device: &dyn BackendDevice,
+        device_type: Device,
+    ) -> Result<(Tensor, Tensor)>;
     /// Fused attention kernel simulation: dequantizes keys/values and computes attention product in a single step.
-    fn fused_attention(&self, block: &CompressedKvBlock, query: &Tensor, device: &dyn BackendDevice, device_type: Device) -> Result<Tensor>;
+    fn fused_attention(
+        &self,
+        block: &CompressedKvBlock,
+        query: &Tensor,
+        device: &dyn BackendDevice,
+        device_type: Device,
+    ) -> Result<Tensor>;
 }
 
 /// A compressed KV block. Holds packed, low-bit representations of keys
@@ -214,12 +225,20 @@ pub struct LloydMaxCompressor {
 impl LloydMaxCompressor {
     /// Create with default (CPU-only) config.
     pub fn new(config: KvQuantConfig) -> Self {
-        Self { config, gpu_attn: KvDequantAttentionConfig::default(), packed_kv: std::sync::Mutex::new(None) }
+        Self {
+            config,
+            gpu_attn: KvDequantAttentionConfig::default(),
+            packed_kv: std::sync::Mutex::new(None),
+        }
     }
 
     /// Create with an explicit GPU-attention dispatch config.
     pub fn with_gpu_attn(config: KvQuantConfig, gpu_attn: KvDequantAttentionConfig) -> Self {
-        Self { config, gpu_attn, packed_kv: std::sync::Mutex::new(None) }
+        Self {
+            config,
+            gpu_attn,
+            packed_kv: std::sync::Mutex::new(None),
+        }
     }
 }
 
@@ -275,7 +294,11 @@ fn dispatch_gpu_fused_attention(
     let cfg_key_bits = compressor.config.key_bits;
     let cfg_value_bits = compressor.config.value_bits;
     let both_low_bw = cfg_key_bits <= 4 && cfg_value_bits <= 4;
-    let quant_bits: u32 = if both_low_bw && head_dim % 2 == 0 { 4 } else { 8 };
+    let quant_bits: u32 = if both_low_bw && head_dim % 2 == 0 {
+        4
+    } else {
+        8
+    };
 
     // Memo key — reuse packed buffers across decode steps (same block). The
     // block's packed-byte Vec lengths reflect its identity too, so include them.
@@ -345,12 +368,21 @@ fn dispatch_gpu_fused_attention(
     // Reinterpret the u8 packed bytes as &[f32] of equal *byte* length so
     // `from_cpu` (which copies `len*4` bytes for f32) ships the exact u8
     // bytes the kernel's `unsigned char*` reads.
-    assert_eq!(k_packed_byte_len(&packed, quant_bits, kv_seq_len, num_kv_heads, head_dim), kv_byte_len);
+    assert_eq!(
+        k_packed_byte_len(&packed, quant_bits, kv_seq_len, num_kv_heads, head_dim),
+        kv_byte_len
+    );
     let k_as_f32: &[f32] = unsafe {
-        std::slice::from_raw_parts(packed.k_packed.as_ptr() as *const f32, packed.k_packed.len())
+        std::slice::from_raw_parts(
+            packed.k_packed.as_ptr() as *const f32,
+            packed.k_packed.len(),
+        )
     };
     let v_as_f32: &[f32] = unsafe {
-        std::slice::from_raw_parts(packed.v_packed.as_ptr() as *const f32, packed.v_packed.len())
+        std::slice::from_raw_parts(
+            packed.v_packed.as_ptr() as *const f32,
+            packed.v_packed.len(),
+        )
     };
 
     let q_storage: Arc<dyn BackendStorage> =
@@ -380,10 +412,22 @@ fn dispatch_gpu_fused_attention(
     handle.synchronize()?;
 
     let out_arc: Arc<dyn BackendStorage> = Arc::from(out_storage);
-    Ok(Tensor::new(out_arc, out_shape, f32_dtype, QuantProvenance::GrimNative, device_type))
+    Ok(Tensor::new(
+        out_arc,
+        out_shape,
+        f32_dtype,
+        QuantProvenance::GrimNative,
+        device_type,
+    ))
 }
 
-fn k_packed_byte_len(_: &PackedKvBuf, quant_bits: u32, seq: usize, heads: usize, dim: usize) -> usize {
+fn k_packed_byte_len(
+    _: &PackedKvBuf,
+    quant_bits: u32,
+    seq: usize,
+    heads: usize,
+    dim: usize,
+) -> usize {
     if quant_bits == 8 {
         seq * heads * dim
     } else {
@@ -413,8 +457,10 @@ fn pack_kv_buf(
     let row_len = head_dim;
 
     // Per-(token, kv_head) packed rows + scales.
-    let mut k_packed: Vec<u8> = Vec::with_capacity(kv_seq_len * num_kv_heads * (row_len + 1) / 2 + row_len);
-    let mut v_packed: Vec<u8> = Vec::with_capacity(kv_seq_len * num_kv_heads * (row_len + 1) / 2 + row_len);
+    let mut k_packed: Vec<u8> =
+        Vec::with_capacity(kv_seq_len * num_kv_heads * (row_len + 1) / 2 + row_len);
+    let mut v_packed: Vec<u8> =
+        Vec::with_capacity(kv_seq_len * num_kv_heads * (row_len + 1) / 2 + row_len);
     let mut k_scales: Vec<f32> = Vec::with_capacity(kv_seq_len * num_kv_heads);
     let mut v_scales: Vec<f32> = Vec::with_capacity(kv_seq_len * num_kv_heads);
 
@@ -505,7 +551,11 @@ impl BitWriter {
             // above bit_off are always zero on prior push boundaries, we OR directly
             // for normal cases (bit_off==0 means byte was just allocated as 0).
             let chunk = (v & mask) as u8;
-            let shifted = if bit_off == 0 { chunk } else { chunk << bit_off };
+            let shifted = if bit_off == 0 {
+                chunk
+            } else {
+                chunk << bit_off
+            };
             let new_byte = byte | shifted;
             *self.buf.get_mut(byte_idx as usize).unwrap() = new_byte;
 
@@ -591,7 +641,12 @@ impl KvCompressor for LloydMaxCompressor {
         for t in 0..num_tokens {
             for h in 0..num_kv_heads {
                 let start_idx = (t * num_kv_heads + h) * head_dim;
-                let rotated_chunk = apply_rotation(&k_data[start_idx..start_idx + head_dim], &rotation, head_dim, 1);
+                let rotated_chunk = apply_rotation(
+                    &k_data[start_idx..start_idx + head_dim],
+                    &rotation,
+                    head_dim,
+                    1,
+                );
                 k_data[start_idx..start_idx + head_dim].copy_from_slice(&rotated_chunk);
             }
         }
@@ -604,10 +659,15 @@ impl KvCompressor for LloydMaxCompressor {
         let key_bits;
         {
             let bits = self.config.key_bits.max(1).min(8);
-            let levels = (1u32 << bits) as f32;       // total codebook size, e.g. 8 for 3-bit
+            let levels = (1u32 << bits) as f32; // total codebook size, e.g. 8 for 3-bit
             let _inv_levels = 1.0 / (levels - 1.0).max(1.0);
-            let mut writer = BitWriter { buf: Vec::new(), bit_pos: 0 };
-            writer.buf.reserve(BitWriter::capacity_for(k_data.len(), bits) + 4);
+            let mut writer = BitWriter {
+                buf: Vec::new(),
+                bit_pos: 0,
+            };
+            writer
+                .buf
+                .reserve(BitWriter::capacity_for(k_data.len(), bits) + 4);
 
             for group_idx in 0..((k_data.len() + group_size - 1) / group_size) {
                 let start = group_idx * group_size;
@@ -643,8 +703,13 @@ impl KvCompressor for LloydMaxCompressor {
         {
             let vb_bits = self.config.value_bits.max(1).min(8);
             let max_q = ((1u32 << vb_bits) - 1).max(1);
-            let mut writer = BitWriter { buf: Vec::new(), bit_pos: 0 };
-            writer.buf.reserve(BitWriter::capacity_for(v_data.len(), vb_bits) + 4);
+            let mut writer = BitWriter {
+                buf: Vec::new(),
+                bit_pos: 0,
+            };
+            writer
+                .buf
+                .reserve(BitWriter::capacity_for(v_data.len(), vb_bits) + 4);
 
             for group_idx in 0..((v_data.len() + group_size - 1) / group_size) {
                 let start = group_idx * group_size;
@@ -654,8 +719,12 @@ impl KvCompressor for LloydMaxCompressor {
                 let mut min_val = slice[0];
                 let mut max_val = slice[0];
                 for &x in slice {
-                    if x < min_val { min_val = x; }
-                    if x > max_val { max_val = x; }
+                    if x < min_val {
+                        min_val = x;
+                    }
+                    if x > max_val {
+                        max_val = x;
+                    }
                 }
                 let scale = (max_val - min_val) / (max_q as f32);
                 let scale = if scale < 1e-5 { 1e-5 } else { scale };
@@ -682,7 +751,12 @@ impl KvCompressor for LloydMaxCompressor {
         })
     }
 
-    fn dequantize_for_attention(&self, block: &CompressedKvBlock, device: &dyn BackendDevice, device_type: Device) -> Result<(Tensor, Tensor)> {
+    fn dequantize_for_attention(
+        &self,
+        block: &CompressedKvBlock,
+        device: &dyn BackendDevice,
+        device_type: Device,
+    ) -> Result<(Tensor, Tensor)> {
         let total_elems = block.num_tokens * block.num_kv_heads * block.num_head_dim();
         let group_size = self.config.group_size;
 
@@ -703,9 +777,13 @@ impl KvCompressor for LloydMaxCompressor {
                 let n = q / denom;
                 let x = (n * 2.0 - 1.0) * std_dev;
                 k_data.push(x);
-                if k_data.len() >= total_elems { break; }
+                if k_data.len() >= total_elems {
+                    break;
+                }
             }
-            if k_data.len() >= total_elems { break; }
+            if k_data.len() >= total_elems {
+                break;
+            }
         }
 
         while k_data.len() < total_elems {
@@ -724,7 +802,12 @@ impl KvCompressor for LloydMaxCompressor {
         for t in 0..block.num_tokens {
             for h in 0..block.num_kv_heads {
                 let start_idx = (t * block.num_kv_heads + h) * block.head_dim;
-                let unrotated_chunk = apply_rotation(&k_data[start_idx..start_idx + block.head_dim], &inv_rotation, block.head_dim, 1);
+                let unrotated_chunk = apply_rotation(
+                    &k_data[start_idx..start_idx + block.head_dim],
+                    &inv_rotation,
+                    block.head_dim,
+                    1,
+                );
                 k_data[start_idx..start_idx + block.head_dim].copy_from_slice(&unrotated_chunk);
             }
         }
@@ -742,16 +825,21 @@ impl KvCompressor for LloydMaxCompressor {
             for _ in start..end {
                 let q = v_reader.next(vb_bits) as f32;
                 v_data.push(q * scale + min_val);
-                if v_data.len() >= total_elems { break; }
+                if v_data.len() >= total_elems {
+                    break;
+                }
             }
-            if v_data.len() >= total_elems { break; }
+            if v_data.len() >= total_elems {
+                break;
+            }
         }
 
         while v_data.len() < total_elems {
             v_data.push(0.0);
         }
 
-        let shape = grim_tensor::Shape::new(vec![block.num_tokens, block.num_kv_heads, block.head_dim]);
+        let shape =
+            grim_tensor::Shape::new(vec![block.num_tokens, block.num_kv_heads, block.head_dim]);
         let dtype = grim_tensor::DType {
             arith: grim_tensor::ArithType::F32,
             storage: grim_tensor::Storage::Native,
@@ -760,13 +848,31 @@ impl KvCompressor for LloydMaxCompressor {
         let k_storage = Arc::from(device.from_cpu(&k_data, &shape, dtype.clone())?);
         let v_storage = Arc::from(device.from_cpu(&v_data, &shape, dtype.clone())?);
 
-        let keys_tensor = Tensor::new(k_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, device_type.clone());
-        let values_tensor = Tensor::new(v_storage, shape, dtype, QuantProvenance::GrimNative, device_type);
+        let keys_tensor = Tensor::new(
+            k_storage,
+            shape.clone(),
+            dtype.clone(),
+            QuantProvenance::GrimNative,
+            device_type.clone(),
+        );
+        let values_tensor = Tensor::new(
+            v_storage,
+            shape,
+            dtype,
+            QuantProvenance::GrimNative,
+            device_type,
+        );
 
         Ok((keys_tensor, values_tensor))
     }
 
-    fn fused_attention(&self, block: &CompressedKvBlock, query: &Tensor, device: &dyn BackendDevice, device_type: Device) -> Result<Tensor> {
+    fn fused_attention(
+        &self,
+        block: &CompressedKvBlock,
+        query: &Tensor,
+        device: &dyn BackendDevice,
+        device_type: Device,
+    ) -> Result<Tensor> {
         // P1-WI-2: GPU dispatch hook. When gpu_attn is enabled AND the caller
         // provides a non-CPU device type, delegate to the GPU path. The GPU path
         // currently returns Err(Unsupported) because no HIP kernel is wired yet;
@@ -779,9 +885,12 @@ impl KvCompressor for LloydMaxCompressor {
         // SageAttention Warp Producer/Consumer Split Simulation (§5.4 / §6):
         // Producer warp reads and dequantizes block Q & K tiles on the fly
         // Consumer warp processes intermediate dot-products and accumulates results
-        println!("[Warp Producer] Dequantizing and pre-fetching INT8 Q/K tiles on-the-fly (qk_compute_bits={})", self.config.qk_compute_bits);
+        println!(
+            "[Warp Producer] Dequantizing and pre-fetching INT8 Q/K tiles on-the-fly (qk_compute_bits={})",
+            self.config.qk_compute_bits
+        );
         let (keys, values) = self.dequantize_for_attention(block, device, device_type.clone())?;
-        
+
         let q_data = query.to_vec_f32()?;
         let k_data = keys.to_vec_f32()?;
         let v_data = values.to_vec_f32()?;
@@ -794,7 +903,9 @@ impl KvCompressor for LloydMaxCompressor {
         let scale = 1.0 / f32::sqrt(head_dim as f32);
         let mut out_data = vec![0.0; num_tokens * num_heads * head_dim];
 
-        println!("[Warp Consumer] Computing fused compressed attention tiles with INT8 scaling factors.");
+        println!(
+            "[Warp Consumer] Computing fused compressed attention tiles with INT8 scaling factors."
+        );
         for t in 0..num_tokens {
             for h in 0..num_heads {
                 let mut scores = vec![0.0; block.num_tokens];
@@ -805,15 +916,15 @@ impl KvCompressor for LloydMaxCompressor {
                     for d in 0..head_dim {
                         let q_idx = (t * num_heads + h) * head_dim + d;
                         let k_idx = (kt * block.num_kv_heads + h) * head_dim + d;
-                        
+
                         // SageAttention INT8 tile path: quantize inputs to INT8 on the fly to accelerate compute
                         let q_val = q_data[q_idx];
                         let k_val = k_data[k_idx];
-                        
+
                         // Quick linear projection to simulated INT8 range:
                         let q_int8 = (q_val * 127.0).clamp(-128.0, 127.0).round() as i8;
                         let k_int8 = (k_val * 127.0).clamp(-128.0, 127.0).round() as i8;
-                        
+
                         // Accumulate using INT8 simulated math scaled back:
                         dot += (q_int8 as f32 / 127.0) * (k_int8 as f32 / 127.0);
                     }
@@ -850,7 +961,13 @@ impl KvCompressor for LloydMaxCompressor {
         let shape = query.shape().clone();
         let dtype = query.dtype();
         let storage = Arc::from(device.from_cpu(&out_data, &shape, dtype.clone())?);
-        let out_tensor = Tensor::new(storage, shape, dtype, QuantProvenance::GrimNative, device_type);
+        let out_tensor = Tensor::new(
+            storage,
+            shape,
+            dtype,
+            QuantProvenance::GrimNative,
+            device_type,
+        );
         Ok(out_tensor)
     }
 }
@@ -878,8 +995,11 @@ impl CompressedKvBlock {
     /// block bit-for-bit via [`CompressedKvBlock::from_bytes`].
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            4 * 6 + self.key_meta.len() * 4 + self.value_meta.len() * 4
-                + self.key_bits.len() + self.value_bits.len(),
+            4 * 6
+                + self.key_meta.len() * 4
+                + self.value_meta.len() * 4
+                + self.key_bits.len()
+                + self.value_bits.len(),
         );
         buf.extend_from_slice(&(self.num_tokens as u32).to_le_bytes());
         buf.extend_from_slice(&(self.num_kv_heads as u32).to_le_bytes());
@@ -929,12 +1049,22 @@ impl CompressedKvBlock {
         }
         let mut key_meta = Vec::with_capacity(key_meta_len);
         for _ in 0..key_meta_len {
-            key_meta.push(f32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]));
+            key_meta.push(f32::from_le_bytes([
+                buf[pos],
+                buf[pos + 1],
+                buf[pos + 2],
+                buf[pos + 3],
+            ]));
             pos += 4;
         }
         let mut value_meta = Vec::with_capacity(value_meta_len);
         for _ in 0..value_meta_len {
-            value_meta.push(f32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]));
+            value_meta.push(f32::from_le_bytes([
+                buf[pos],
+                buf[pos + 1],
+                buf[pos + 2],
+                buf[pos + 3],
+            ]));
             pos += 4;
         }
         let key_bits = buf[pos..pos + key_bits_len].to_vec();
@@ -976,7 +1106,12 @@ impl KvCompressor for IdentityCompressor {
         })
     }
 
-    fn dequantize_for_attention(&self, block: &CompressedKvBlock, device: &dyn BackendDevice, device_type: Device) -> Result<(Tensor, Tensor)> {
+    fn dequantize_for_attention(
+        &self,
+        block: &CompressedKvBlock,
+        device: &dyn BackendDevice,
+        device_type: Device,
+    ) -> Result<(Tensor, Tensor)> {
         let mut k_data = Vec::with_capacity(block.key_bits.len() / 4);
         for chunk in block.key_bits.chunks_exact(4) {
             k_data.push(f32::from_le_bytes(chunk.try_into().unwrap()));
@@ -986,7 +1121,8 @@ impl KvCompressor for IdentityCompressor {
             v_data.push(f32::from_le_bytes(chunk.try_into().unwrap()));
         }
 
-        let shape = grim_tensor::Shape::new(vec![block.num_tokens, block.num_kv_heads, block.head_dim]);
+        let shape =
+            grim_tensor::Shape::new(vec![block.num_tokens, block.num_kv_heads, block.head_dim]);
         let dtype = grim_tensor::DType {
             arith: grim_tensor::ArithType::F32,
             storage: grim_tensor::Storage::Native,
@@ -995,15 +1131,33 @@ impl KvCompressor for IdentityCompressor {
         let k_storage = Arc::from(device.from_cpu(&k_data, &shape, dtype.clone())?);
         let v_storage = Arc::from(device.from_cpu(&v_data, &shape, dtype.clone())?);
 
-        let keys_tensor = Tensor::new(k_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, device_type.clone());
-        let values_tensor = Tensor::new(v_storage, shape, dtype, QuantProvenance::GrimNative, device_type);
+        let keys_tensor = Tensor::new(
+            k_storage,
+            shape.clone(),
+            dtype.clone(),
+            QuantProvenance::GrimNative,
+            device_type.clone(),
+        );
+        let values_tensor = Tensor::new(
+            v_storage,
+            shape,
+            dtype,
+            QuantProvenance::GrimNative,
+            device_type,
+        );
 
         Ok((keys_tensor, values_tensor))
     }
 
-    fn fused_attention(&self, block: &CompressedKvBlock, query: &Tensor, device: &dyn BackendDevice, device_type: Device) -> Result<Tensor> {
+    fn fused_attention(
+        &self,
+        block: &CompressedKvBlock,
+        query: &Tensor,
+        device: &dyn BackendDevice,
+        device_type: Device,
+    ) -> Result<Tensor> {
         let (keys, values) = self.dequantize_for_attention(block, device, device_type.clone())?;
-        
+
         let q_data = query.to_vec_f32()?;
         let k_data = keys.to_vec_f32()?;
         let v_data = values.to_vec_f32()?;
@@ -1061,7 +1215,13 @@ impl KvCompressor for IdentityCompressor {
         let shape = query.shape().clone();
         let dtype = query.dtype();
         let storage = Arc::from(device.from_cpu(&out_data, &shape, dtype.clone())?);
-        let out_tensor = Tensor::new(storage, shape, dtype, QuantProvenance::GrimNative, device_type);
+        let out_tensor = Tensor::new(
+            storage,
+            shape,
+            dtype,
+            QuantProvenance::GrimNative,
+            device_type,
+        );
         Ok(out_tensor)
     }
 }
@@ -1069,7 +1229,7 @@ impl KvCompressor for IdentityCompressor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grim_tensor::{Shape, DType, ArithType, Storage, Device};
+    use grim_tensor::{ArithType, DType, Device, Shape, Storage};
 
     #[test]
     fn test_lloyd_max_compress_decompress() {
@@ -1093,8 +1253,20 @@ mod tests {
 
         let k_storage = Arc::from(device.from_cpu(&k_data, &shape, dtype.clone()).unwrap());
         let v_storage = Arc::from(device.from_cpu(&v_data, &shape, dtype.clone()).unwrap());
-        let keys = Tensor::new(k_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
-        let values = Tensor::new(v_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
+        let keys = Tensor::new(
+            k_storage,
+            shape.clone(),
+            dtype.clone(),
+            QuantProvenance::GrimNative,
+            Device::Cpu,
+        );
+        let values = Tensor::new(
+            v_storage,
+            shape.clone(),
+            dtype.clone(),
+            QuantProvenance::GrimNative,
+            Device::Cpu,
+        );
 
         let compressed = compressor.compress(&keys, &values).unwrap();
 
@@ -1102,12 +1274,26 @@ mod tests {
         assert_eq!(compressed.num_tokens, 2);
         assert_eq!(compressed.num_kv_heads, 4);
         assert_eq!(compressed.head_dim, 64);
-        assert!(!compressed.key_bits.is_empty(), "key_bits should not be empty");
-        assert!(!compressed.value_bits.is_empty(), "value_bits should not be empty");
-        assert!(!compressed.key_meta.is_empty(), "key_meta should not be empty");
-        assert!(!compressed.value_meta.is_empty(), "value_meta should not be empty");
+        assert!(
+            !compressed.key_bits.is_empty(),
+            "key_bits should not be empty"
+        );
+        assert!(
+            !compressed.value_bits.is_empty(),
+            "value_bits should not be empty"
+        );
+        assert!(
+            !compressed.key_meta.is_empty(),
+            "key_meta should not be empty"
+        );
+        assert!(
+            !compressed.value_meta.is_empty(),
+            "value_meta should not be empty"
+        );
 
-        let (dequant_k, dequant_v) = compressor.dequantize_for_attention(&compressed, &device, Device::Cpu).unwrap();
+        let (dequant_k, dequant_v) = compressor
+            .dequantize_for_attention(&compressed, &device, Device::Cpu)
+            .unwrap();
 
         // Verify dequantized tensor shapes match input
         assert_eq!(dequant_k.shape().dims(), vec![2, 4, 64]);
@@ -1123,14 +1309,34 @@ mod tests {
         // Bounds match the original test; the metadata/shape assertions above
         // are the primary strengthening.
         for i in 0..512 {
-            assert!((k_rec[i] - k_data[i]).abs() < 1.0, "k_rec[{}]={} vs {}", i, k_rec[i], k_data[i]);
-            assert!((v_rec[i] - v_data[i]).abs() < 0.5, "v_rec[{}]={} vs {}", i, v_rec[i], v_data[i]);
+            assert!(
+                (k_rec[i] - k_data[i]).abs() < 1.0,
+                "k_rec[{}]={} vs {}",
+                i,
+                k_rec[i],
+                k_data[i]
+            );
+            assert!(
+                (v_rec[i] - v_data[i]).abs() < 0.5,
+                "v_rec[{}]={} vs {}",
+                i,
+                v_rec[i],
+                v_data[i]
+            );
         }
 
         // Test fused attention
         let q_storage = Arc::from(device.from_cpu(&k_data, &shape, dtype.clone()).unwrap());
-        let query = Tensor::new(q_storage, shape, dtype, QuantProvenance::GrimNative, Device::Cpu);
-        let att_out = compressor.fused_attention(&compressed, &query, &device, Device::Cpu).unwrap();
+        let query = Tensor::new(
+            q_storage,
+            shape,
+            dtype,
+            QuantProvenance::GrimNative,
+            Device::Cpu,
+        );
+        let att_out = compressor
+            .fused_attention(&compressed, &query, &device, Device::Cpu)
+            .unwrap();
         assert_eq!(att_out.shape().dims(), vec![2, 4, 64]);
     }
 
@@ -1147,11 +1353,25 @@ mod tests {
         // Gram-Schmidt is numerically unstable for larger dims, so tolerance is 1e-2.
         for i in 0..dim {
             for j in 0..dim {
-                let dot: f32 = (0..dim).map(|r| rotation[r * dim + i] * rotation[r * dim + j]).sum();
+                let dot: f32 = (0..dim)
+                    .map(|r| rotation[r * dim + i] * rotation[r * dim + j])
+                    .sum();
                 if i == j {
-                    assert!((dot - 1.0).abs() < 1e-2, "Q^T*Q[{}][{}] should be ~1.0, got {}", i, j, dot);
+                    assert!(
+                        (dot - 1.0).abs() < 1e-2,
+                        "Q^T*Q[{}][{}] should be ~1.0, got {}",
+                        i,
+                        j,
+                        dot
+                    );
                 } else {
-                    assert!(dot.abs() < 1e-2, "Q^T*Q[{}][{}] should be ~0.0, got {}", i, j, dot);
+                    assert!(
+                        dot.abs() < 1e-2,
+                        "Q^T*Q[{}][{}] should be ~0.0, got {}",
+                        i,
+                        j,
+                        dot
+                    );
                 }
             }
         }
@@ -1164,8 +1384,14 @@ mod tests {
         // Tolerance is 1e-2 because simplified Gram-Schmidt is numerically
         // unstable for larger dimensions.
         for i in 0..count {
-            let orig_norm: f32 = (0..dim).map(|j| data[i * dim + j].powi(2)).sum::<f32>().sqrt();
-            let rot_norm: f32 = (0..dim).map(|j| rotated[i * dim + j].powi(2)).sum::<f32>().sqrt();
+            let orig_norm: f32 = (0..dim)
+                .map(|j| data[i * dim + j].powi(2))
+                .sum::<f32>()
+                .sqrt();
+            let rot_norm: f32 = (0..dim)
+                .map(|j| rotated[i * dim + j].powi(2))
+                .sum::<f32>()
+                .sqrt();
             assert!(
                 (orig_norm - rot_norm).abs() < 1e-2,
                 "L2 norm should be preserved: orig={}, rot={}",
@@ -1197,22 +1423,50 @@ mod tests {
             k_data.push((i as f32 * 0.01).sin());
         }
         let k_storage = Arc::from(device.from_cpu(&k_data, &shape, dtype.clone()).unwrap());
-        let keys = Tensor::new(k_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
-        
+        let keys = Tensor::new(
+            k_storage,
+            shape.clone(),
+            dtype.clone(),
+            QuantProvenance::GrimNative,
+            Device::Cpu,
+        );
+
         let compressed = compressor.compress(&keys, &keys).unwrap();
         // Verify compressed data is non-empty
-        assert!(!compressed.key_bits.is_empty(), "key_bits should not be empty");
-        assert!(!compressed.value_bits.is_empty(), "value_bits should not be empty");
+        assert!(
+            !compressed.key_bits.is_empty(),
+            "key_bits should not be empty"
+        );
+        assert!(
+            !compressed.value_bits.is_empty(),
+            "value_bits should not be empty"
+        );
         // Verify metadata matches input shape [1, 2, 16]
         assert_eq!(compressed.num_tokens, 1);
         assert_eq!(compressed.num_kv_heads, 2);
         assert_eq!(compressed.head_dim, 16);
         // 32 elements at 4 bits each = 16 bytes packed
-        assert_eq!(compressed.key_bits.len(), 16, "key_bits should be 16 bytes for 32 elements at 4 bits");
-        assert_eq!(compressed.value_bits.len(), 16, "value_bits should be 16 bytes for 32 elements at 4 bits");
+        assert_eq!(
+            compressed.key_bits.len(),
+            16,
+            "key_bits should be 16 bytes for 32 elements at 4 bits"
+        );
+        assert_eq!(
+            compressed.value_bits.len(),
+            16,
+            "value_bits should be 16 bytes for 32 elements at 4 bits"
+        );
         // 1 group (32 elements / group_size=32) → 1 key_meta entry, 2 value_meta entries (scale, min)
-        assert_eq!(compressed.key_meta.len(), 1, "key_meta should have 1 entry per group");
-        assert_eq!(compressed.value_meta.len(), 2, "value_meta should have 2 entries (scale, min) per group");
+        assert_eq!(
+            compressed.key_meta.len(),
+            1,
+            "key_meta should have 1 entry per group"
+        );
+        assert_eq!(
+            compressed.value_meta.len(),
+            2,
+            "value_meta should have 2 entries (scale, min) per group"
+        );
     }
 
     /// WI-R4: a `CompressedKvBlock` round-trips byte-identically through
@@ -1236,8 +1490,20 @@ mod tests {
         }
         let k_storage = Arc::from(device.from_cpu(&k_data, &shape, dtype.clone()).unwrap());
         let v_storage = Arc::from(device.from_cpu(&v_data, &shape, dtype.clone()).unwrap());
-        let keys = Tensor::new(k_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
-        let values = Tensor::new(v_storage, shape, dtype, QuantProvenance::GrimNative, Device::Cpu);
+        let keys = Tensor::new(
+            k_storage,
+            shape.clone(),
+            dtype.clone(),
+            QuantProvenance::GrimNative,
+            Device::Cpu,
+        );
+        let values = Tensor::new(
+            v_storage,
+            shape,
+            dtype,
+            QuantProvenance::GrimNative,
+            Device::Cpu,
+        );
 
         let block = compressor.compress(&keys, &values).unwrap();
         let bytes = block.to_bytes();
@@ -1278,22 +1544,51 @@ mod tests {
     /// With gpu_attn disabled, fused_attention runs the CPU path without error.
     #[test]
     fn fused_attention_cpu_path_runs_when_gpu_disabled() {
-        use grim_tensor::{ArithType, dtype::{Storage as DS, DType}};
-        let compressor = LloydMaxCompressor::new(KvQuantConfig { key_bits: 3, value_bits: 4, group_size: 4, qk_compute_bits: 8 });
+        use grim_tensor::{
+            ArithType,
+            dtype::{DType, Storage as DS},
+        };
+        let compressor = LloydMaxCompressor::new(KvQuantConfig {
+            key_bits: 3,
+            value_bits: 4,
+            group_size: 4,
+            qk_compute_bits: 8,
+        });
         let device = grim_backend_cpu::CpuDevice::new();
-        let dtype = DType { arith: ArithType::F32, storage: DS::Native };
+        let dtype = DType {
+            arith: ArithType::F32,
+            storage: DS::Native,
+        };
         let shape = grim_tensor::Shape::new(vec![2, 1, 4]);
         let k_data = vec![0.1f32; 8];
         let v_data = vec![0.2f32; 8];
         let k_storage = Arc::from(device.from_cpu(&k_data, &shape, dtype.clone()).unwrap());
         let v_storage = Arc::from(device.from_cpu(&v_data, &shape, dtype.clone()).unwrap());
-        let keys = Tensor::new(k_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
-        let values = Tensor::new(v_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
+        let keys = Tensor::new(
+            k_storage,
+            shape.clone(),
+            dtype.clone(),
+            QuantProvenance::GrimNative,
+            Device::Cpu,
+        );
+        let values = Tensor::new(
+            v_storage,
+            shape.clone(),
+            dtype.clone(),
+            QuantProvenance::GrimNative,
+            Device::Cpu,
+        );
         let block = compressor.compress(&keys, &values).unwrap();
 
         let q_data = vec![0.1f32; 8];
         let q_storage = Arc::from(device.from_cpu(&q_data, &shape, dtype.clone()).unwrap());
-        let query = Tensor::new(q_storage, shape, dtype, QuantProvenance::GrimNative, Device::Cpu);
+        let query = Tensor::new(
+            q_storage,
+            shape,
+            dtype,
+            QuantProvenance::GrimNative,
+            Device::Cpu,
+        );
         // CPU path should succeed (gpu_attn.enabled is false).
         let result = compressor.fused_attention(&block, &query, &device, Device::Cpu);
         assert!(result.is_ok(), "CPU fused_attention should succeed");
@@ -1302,34 +1597,67 @@ mod tests {
     /// With gpu_attn enabled, passing a non-CPU device returns Err (not panic).
     #[test]
     fn fused_attention_gpu_path_returns_err_unsupported_when_no_kernel() {
-        use grim_tensor::{ArithType, dtype::{Storage as DS, DType}};
+        use grim_tensor::{
+            ArithType,
+            dtype::{DType, Storage as DS},
+        };
         let cfg = KvDequantAttentionConfig { enabled: true };
         let compressor = LloydMaxCompressor::with_gpu_attn(
-            KvQuantConfig { key_bits: 3, value_bits: 4, group_size: 4, qk_compute_bits: 8 },
+            KvQuantConfig {
+                key_bits: 3,
+                value_bits: 4,
+                group_size: 4,
+                qk_compute_bits: 8,
+            },
             cfg,
         );
         let device = grim_backend_cpu::CpuDevice::new();
-        let dtype = DType { arith: ArithType::F32, storage: DS::Native };
+        let dtype = DType {
+            arith: ArithType::F32,
+            storage: DS::Native,
+        };
         let shape = grim_tensor::Shape::new(vec![2, 1, 4]);
         let k_data = vec![0.1f32; 8];
         let v_data = vec![0.2f32; 8];
         let k_storage = Arc::from(device.from_cpu(&k_data, &shape, dtype.clone()).unwrap());
         let v_storage = Arc::from(device.from_cpu(&v_data, &shape, dtype.clone()).unwrap());
-        let keys = Tensor::new(k_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
-        let values = Tensor::new(v_storage, shape.clone(), dtype.clone(), QuantProvenance::GrimNative, Device::Cpu);
+        let keys = Tensor::new(
+            k_storage,
+            shape.clone(),
+            dtype.clone(),
+            QuantProvenance::GrimNative,
+            Device::Cpu,
+        );
+        let values = Tensor::new(
+            v_storage,
+            shape.clone(),
+            dtype.clone(),
+            QuantProvenance::GrimNative,
+            Device::Cpu,
+        );
         let block = compressor.compress(&keys, &values).unwrap();
 
         let q_data = vec![0.1f32; 8];
         let q_storage = Arc::from(device.from_cpu(&q_data, &shape, dtype.clone()).unwrap());
-        let query = Tensor::new(q_storage, shape, dtype, QuantProvenance::GrimNative, Device::Cpu);
+        let query = Tensor::new(
+            q_storage,
+            shape,
+            dtype,
+            QuantProvenance::GrimNative,
+            Device::Cpu,
+        );
 
         // Simulate a non-CPU device_type to trigger the GPU dispatch branch.
         // The stub returns Err(Unimplemented), never panics.
         let result = compressor.fused_attention(&block, &query, &device, Device::Rocm(0));
-        assert!(result.is_err(), "GPU path must return Err until kernel is wired");
+        assert!(
+            result.is_err(),
+            "GPU path must return Err until kernel is wired"
+        );
         // Must be Unimplemented, not a panic or internal error.
         match result {
-            Err(grim_core::error::Error::Unimplemented(_)) | Err(grim_core::error::Error::Tensor(grim_tensor::Error::Unimplemented(_))) => {}
+            Err(grim_core::error::Error::Unimplemented(_))
+            | Err(grim_core::error::Error::Tensor(grim_tensor::Error::Unimplemented(_))) => {}
             Err(other) => panic!("Expected Unimplemented error, got: {:?}", other),
             Ok(_) => unreachable!(),
         }

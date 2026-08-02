@@ -1,9 +1,4 @@
-//! `grim-tensor` crate — Tensor, DType, Shape, Device, and the
-//! backend-agnostic trait surface (`BackendDevice` / `BackendStorage` /
-//! `ComputeHandle` / `TensorProvider`).
-//!
-//! Designed to mirror Candle's core data-model shape, per §4.1 of the
-//! Grim architecture doc.
+//! Core tensor abstractions, data types, shapes, and backend-agnostic trait contracts.
 
 pub mod backend;
 pub mod dtype;
@@ -14,14 +9,16 @@ pub mod softmax_merge;
 pub mod tensor;
 pub mod wavefront;
 
-pub use backend::{BackendDevice, BackendStorage, ComputeHandle, ReadyHandle, MemAdvice, QuantizedMatmulBackwardResiduals, GpuCapability, ScytheLink, ScythePlacement};
+pub use backend::{
+    BackendDevice, BackendStorage, ComputeHandle, GpuCapability, MemAdvice,
+    QuantizedMatmulBackwardResiduals, ReadyHandle, ScytheLink, ScythePlacement,
+};
 pub use dtype::{
-    ArithType, BlockDtype, Device, DType, FloatPackScheme, GpuIntConfig, GroupQuantScheme,
+    ArithType, BlockDtype, DType, Device, FloatPackScheme, GpuIntConfig, GroupQuantScheme,
     KQuantScheme, QuantProvenance, Storage,
 };
 pub use error::{Error, Result};
 pub use provider::{RawTensor, TensorMeta, TensorProvider};
 pub use shape::Shape;
-pub use softmax_merge::{merge_all, merge_partials, SoftmaxPartial};
+pub use softmax_merge::{SoftmaxPartial, merge_all, merge_partials};
 pub use tensor::Tensor;
-

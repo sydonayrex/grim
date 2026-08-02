@@ -1,25 +1,10 @@
-//! Paged KV cache implementation — `KvBlockPool`, `BlockTable`, and the
-//! `KvCache` impl that uses them.
-//!
-//! Mirrors vLLM's block-table-over-physical-blocks design (§5.1):
-//! - Sequences address KV memory through a logical block table.
-//! - Physical blocks are allocated/freed from a shared pool.
-//! - Prefix caching: identical prompt prefixes share ref-counted blocks.
-//! - Speculative decoding: draft-token KV entries use `tentative_append`,
-//!   then `commit` or `rollback_to`.
-//!
-//! Demote-before-drop policy: when a block falls out of use, the pool
-//! consults an attached `SpillPolicy`. If a spill manager is wired, the
-//! block's contents are demoted to Host RAM instead of being zeroed. If
-//! a compressor is wired, it compresses before the fresh realloc. The
-//! architecture's "demote-before-drop eviction replacing hard eviction"
-//! contract lives here.
+//! Paged KV cache memory pool, logical block tables, prefix sharing, and multi-tier spilling.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use grim_core::kv_cache::KvCache;
 use grim_core::error::{Error, Result};
+use grim_core::kv_cache::KvCache;
 use grim_kvquant::{CompressedKvBlock, KvCompressor};
 use grim_kvtransport::{BlockId as TransportBlockId, CacheTier, SharedSpillManager};
 use grim_tensor::Tensor;
@@ -135,10 +120,10 @@ impl KvBlockPool {
         self.compressor.is_some()
     }
 
-
-
     pub fn alloc(&mut self) -> Result<BlockId> {
-        let id = self.free_list.pop_front()
+        let id = self
+            .free_list
+            .pop_front()
             .ok_or_else(|| Error::KvCache("block pool exhausted".into()))?;
         self.ref_counts.insert(id, 1);
         Ok(id)
@@ -150,7 +135,10 @@ impl KvBlockPool {
             if let Some(cnt) = self.ref_counts.get(&bid) {
                 if *cnt > 0 {
                     *self.ref_counts.entry(bid).or_insert(0) += 1;
-                    println!("[PrefixCache] Shared prefix block {} (hash {})", bid, prefix_hash);
+                    println!(
+                        "[PrefixCache] Shared prefix block {} (hash {})",
+                        bid, prefix_hash
+                    );
                     return Ok(bid);
                 }
             }
@@ -247,7 +235,8 @@ impl KvBlockPool {
 
     fn snapshot_block(&self, id: BlockId) -> (Tensor, Tensor) {
         let shape = grim_tensor::Shape::new(vec![BLOCK_SIZE, self.num_heads, self.head_dim]);
-        let k_tensor = grim_backend_cpu::cpu_tensor(self.blocks[id].key_data.clone(), shape.clone());
+        let k_tensor =
+            grim_backend_cpu::cpu_tensor(self.blocks[id].key_data.clone(), shape.clone());
         let v_tensor = grim_backend_cpu::cpu_tensor(self.blocks[id].value_data.clone(), shape);
         (k_tensor, v_tensor)
     }
@@ -392,11 +381,7 @@ pub struct PagedKvCache {
 }
 
 impl PagedKvCache {
-    pub fn new(
-        pool: Arc<Mutex<KvBlockPool>>,
-        num_heads: usize,
-        head_dim: usize,
-    ) -> Self {
+    pub fn new(pool: Arc<Mutex<KvBlockPool>>, num_heads: usize, head_dim: usize) -> Self {
         Self {
             table: BlockTable::new(),
             pool,
@@ -483,21 +468,31 @@ impl KvCache for PagedKvCache {
 
     fn current_k(&self) -> Result<Tensor> {
         let pool = self.pool.lock().unwrap();
-        let mut k_data = Vec::with_capacity(self.table.len() * BLOCK_SIZE * self.num_heads * self.head_dim);
+        let mut k_data =
+            Vec::with_capacity(self.table.len() * BLOCK_SIZE * self.num_heads * self.head_dim);
         for &id in &self.table.logical_to_physical {
             k_data.extend_from_slice(pool.read_keys(id));
         }
-        let shape = grim_tensor::Shape::new(vec![self.table.len() * BLOCK_SIZE, self.num_heads, self.head_dim]);
+        let shape = grim_tensor::Shape::new(vec![
+            self.table.len() * BLOCK_SIZE,
+            self.num_heads,
+            self.head_dim,
+        ]);
         Ok(grim_backend_cpu::cpu_tensor(k_data, shape))
     }
 
     fn current_v(&self) -> Result<Tensor> {
         let pool = self.pool.lock().unwrap();
-        let mut v_data = Vec::with_capacity(self.table.len() * BLOCK_SIZE * self.num_heads * self.head_dim);
+        let mut v_data =
+            Vec::with_capacity(self.table.len() * BLOCK_SIZE * self.num_heads * self.head_dim);
         for &id in &self.table.logical_to_physical {
             v_data.extend_from_slice(pool.read_values(id));
         }
-        let shape = grim_tensor::Shape::new(vec![self.table.len() * BLOCK_SIZE, self.num_heads, self.head_dim]);
+        let shape = grim_tensor::Shape::new(vec![
+            self.table.len() * BLOCK_SIZE,
+            self.num_heads,
+            self.head_dim,
+        ]);
         Ok(grim_backend_cpu::cpu_tensor(v_data, shape))
     }
 
@@ -552,7 +547,8 @@ mod tests {
     fn pool_free_with_spill_routes_to_host_nvme() {
         let dir = tempdir().unwrap();
         let block_elems = BLOCK_SIZE * 2 * 4; // matches pool's BLOCK_SIZE × num_heads × head_dim
-        let spill = Arc::new(SharedSpillManager::new(dir.path().to_path_buf(), block_elems).unwrap());
+        let spill =
+            Arc::new(SharedSpillManager::new(dir.path().to_path_buf(), block_elems).unwrap());
         let mut pool = KvBlockPool::new(4, 2, 4);
         pool.attach_spill(spill.clone());
         let id = pool.alloc().unwrap();
@@ -567,10 +563,13 @@ mod tests {
     #[test]
     fn pool_compressor_attached_records_metadata() {
         let dir = tempdir().unwrap();
-        let spill = Arc::new(SharedSpillManager::new(dir.path().to_path_buf(), BLOCK_SIZE * 2 * 4).unwrap());
+        let spill = Arc::new(
+            SharedSpillManager::new(dir.path().to_path_buf(), BLOCK_SIZE * 2 * 4).unwrap(),
+        );
         let mut pool = KvBlockPool::new(2, 2, 4);
         pool.attach_spill(spill.clone());
-        let compressor: Arc<dyn KvCompressor> = Arc::new(LloydMaxCompressor::new(KvQuantConfig::default()));
+        let compressor: Arc<dyn KvCompressor> =
+            Arc::new(LloydMaxCompressor::new(KvQuantConfig::default()));
         pool.attach_compressor(compressor);
 
         let id = pool.alloc().unwrap();
@@ -589,7 +588,8 @@ mod tests {
     fn pool_force_tier_promotes_host_blocks_back_to_gpu() {
         let dir = tempdir().unwrap();
         let block_elems = BLOCK_SIZE * 2 * 4;
-        let spill = Arc::new(SharedSpillManager::new(dir.path().to_path_buf(), block_elems).unwrap());
+        let spill =
+            Arc::new(SharedSpillManager::new(dir.path().to_path_buf(), block_elems).unwrap());
         let mut pool = KvBlockPool::new(2, 2, 4);
         pool.attach_spill(spill.clone());
         let id = pool.alloc().unwrap();
@@ -610,7 +610,7 @@ mod tests {
     fn test_prefix_sharing_and_ssm_states() {
         let mut pool = KvBlockPool::new(4, 2, 4);
         let hash = 42u64;
-        
+
         let id1 = pool.find_or_share_prefix(hash).unwrap();
         let id2 = pool.find_or_share_prefix(hash).unwrap();
         assert_eq!(id1, id2); // Must share the same block ID
@@ -720,7 +720,7 @@ mod tests {
         // Retrieve current K and V.
         let k = cache.current_k().unwrap();
         let v = cache.current_v().unwrap();
-        
+
         assert_eq!(k.shape().dims(), &[2 * BLOCK_SIZE, 2, 4]);
         assert_eq!(v.shape().dims(), &[2 * BLOCK_SIZE, 2, 4]);
 

@@ -1,4 +1,4 @@
-//! grim cp - Copy a model to a new name in the local cache.
+//! grim cp — Copy a model to a new name in the local cache.
 
 use grim_core::catalog::{ModelEntry, resolve_model_preferring_grim};
 use grim_core::error::{Error, Result};
@@ -12,15 +12,17 @@ pub async fn cmd_cp(src: &str, dst: &str) -> Result<()> {
     let src_path = resolve_model_preferring_grim(src)
         .ok_or_else(|| Error::Config(format!("Source model '{}' not found", src)))?;
 
-    // Check if destination already exists
+    // Check destination already exists
     let models_dir = grim_models_dir();
     let dst_path_buf = PathBuf::from(dst);
-    let dst_stem = dst_path_buf.file_stem()
+    let dst_stem = dst_path_buf
+        .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or(dst);
 
-    // Find existing extension from source
-    let src_ext = src_path.extension()
+    // Get extension from source
+    let src_ext = src_path
+        .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("gguf");
 
@@ -43,8 +45,9 @@ pub async fn cmd_cp(src: &str, dst: &str) -> Result<()> {
     if src_json.exists() {
         let mut entry: ModelEntry = serde_json::from_str(
             &fs::read_to_string(&src_json)
-                .map_err(|e| Error::Config(format!("Failed to read source sidecar: {e}")))?
-        ).map_err(|e| Error::Config(format!("Failed to parse source sidecar: {e}")))?;
+                .map_err(|e| Error::Config(format!("Failed to read source sidecar: {e}")))?,
+        )
+        .map_err(|e| Error::Config(format!("Failed to parse source sidecar: {e}")))?;
         entry.name = dst.to_string();
         entry.path = dst_path.display().to_string();
         entry.save(&dst_path)?;

@@ -1,12 +1,6 @@
 //! Standalone IQ2/IQ3/IQ4 dequantization HIP kernels for ROCm.
-//!
-//! Converts packed IQ format weights to full F32 values.
-//! Each dequant kernel expands one 256-weight super-block.
 
-/// HIP source for standalone IQ-family dequant kernels:
-/// `grim_dequant_iq2xxs`, `grim_dequant_iq2xs`, `grim_dequant_iq2s`,
-/// `grim_dequant_iq3xxs`, `grim_dequant_iq3s`,
-/// `grim_dequant_iq4nl`, `grim_dequant_iq4xs`.
+/// HIP source for standalone IQ-family dequant kernels: [see: `grim_dequant_iq2xxs`, `grim_dequant_iq2xs`]
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 

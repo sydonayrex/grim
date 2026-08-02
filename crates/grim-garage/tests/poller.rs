@@ -4,10 +4,8 @@
 //! Each test spawns the combined router on an ephemeral port (via
 //! tokio::spawn) and exercises the poller against the real HTTP surface.
 //!
-//! We deliberately avoid touching CVKG widget constructors in this
-//! file: the poller is the runtime driver, not the UI tree. The UI
-//! tree is a separate concern that will be built once CVKG 0.3.3's
-//! component signatures settle.
+//! We test the poller as the backend runtime driver independently of
+//! the frontend UI layer.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

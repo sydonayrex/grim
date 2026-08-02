@@ -1,19 +1,4 @@
 //! RWKV time-mix kernel (Item 14).
-//!
-//! RWKV uses a linear attention mechanism where the attention pattern is
-//! determined by a decay vector w. The time-mix operation for one token is:
-//!
-//!   k_t = W_k @ x_t          // key projection
-//!   v_t = W_v @ x_t          // value projection
-//!   w_t = sigmoid(W_w @ x_t) // decay weights
-//!   a_t = sum_{i<=t} (w_i * k_i) * v_t    // weighted accumulation
-//!   h_t = decay * h_{t-1} + a_t           // state update
-//!   out_t = W_out @ h_t      // output projection
-//!
-//! The recurrence over time is inherently sequential (h depends on h_{t-1}),
-//! so the RWKV kernel processes one token per thread block, iterating over
-//! the time dimension within the block. This makes it well-suited for
-//! persistent GPU kernels where each block handles one timestep.
 
 /// HIP source for `grim_rwkv_time_mix` — RWKV linear attention time-mix.
 pub const KERNEL_SOURCE: &str = r#"

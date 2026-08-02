@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 
-use grim_tensor::backend::{ScythePlacement, ScytheLink};
+use grim_tensor::backend::{ScytheLink, ScythePlacement};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::shape::Shape;
 use grim_tensor::{BackendDevice, DType, Device, Tensor};
@@ -175,7 +175,9 @@ impl Scythe2Linear {
         let dev = pick_device_for_storage_device(&self.device);
 
         if placement.ranks.is_empty() {
-            return Err(Error::Backend("Scythe2Linear: placement.ranks is empty".into()));
+            return Err(Error::Backend(
+                "Scythe2Linear: placement.ranks is empty".into(),
+            ));
         }
 
         if is_row_parallel {
@@ -200,7 +202,12 @@ impl Scythe2Linear {
         let mut shard_out_dim = 0usize;
 
         for (rank_idx, &_gpu_ord) in placement.ranks.iter().enumerate() {
-            let ratio = placement.partition.get(rank_idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            let ratio = placement
+                .partition
+                .get(rank_idx)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
             let count = ((ratio * out_features as f32).floor() as usize).max(0);
             let count = count.min(out_features - col_start);
             if count == 0 {
@@ -232,7 +239,9 @@ impl Scythe2Linear {
 
         // Concatenate column shards.
         if shards.is_empty() {
-            return Err(Error::Backend("Scythe2Linear: all column shards are empty".into()));
+            return Err(Error::Backend(
+                "Scythe2Linear: all column shards are empty".into(),
+            ));
         }
         let x_dims = x.shape().dims();
         let m = x_dims[..x_dims.len() - 1].iter().product::<usize>().max(1);
@@ -241,8 +250,7 @@ impl Scythe2Linear {
         for shard in &shards {
             let n = shard.len() / m;
             for bi in 0..m {
-                concat[bi * shard_out_dim + col_offset
-                    ..bi * shard_out_dim + col_offset + n]
+                concat[bi * shard_out_dim + col_offset..bi * shard_out_dim + col_offset + n]
                     .copy_from_slice(&shard[bi * n..(bi + 1) * n]);
             }
             col_offset += n;
@@ -292,7 +300,12 @@ impl Scythe2Linear {
         let n_ranks = placement.ranks.len();
         let mut row_start = 0usize;
         for rank_idx in 0..n_ranks {
-            let ratio = placement.partition.get(rank_idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            let ratio = placement
+                .partition
+                .get(rank_idx)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
             let count = ((ratio * in_features as f32).floor() as usize).max(0);
             let count = count.min(in_features - row_start);
             if count == 0 {

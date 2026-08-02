@@ -6,9 +6,9 @@
 //! this executes the scalar fallback path within the JIT kernel, verifying full JIT compile
 //! and launch infrastructure safety.
 
-use std::panic;
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::{BackendDevice, DType, Shape};
+use std::panic;
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<R = ()> = Result<R, TestError>;
@@ -23,7 +23,9 @@ fn gpu_device() -> Option<RocmDevice> {
     if std::env::var(GPU_TEST_ENV).is_err() {
         return None;
     }
-    match panic::catch_unwind(|| RocmDevice::new(0)) {
+    match panic::catch_unwind(|| {
+        RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm")
+    }) {
         Ok(d) => Some(d),
         Err(_) => None,
     }
@@ -90,12 +92,8 @@ fn test_wmma_gemm_infrastructure_and_correctness() -> TestResult {
     };
 
     let (m, k, n) = (8usize, 128usize, 128usize);
-    let a_data: Vec<f32> = (0..m * k)
-        .map(|i| (i as f32 * 0.02).sin() * 0.5)
-        .collect();
-    let b_data: Vec<f32> = (0..k * n)
-        .map(|i| (i as f32 * 0.04).cos() * 0.5)
-        .collect();
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.02).sin() * 0.5).collect();
+    let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.04).cos() * 0.5).collect();
 
     // 1. Run with WMMA JIT kernel enabled
     let gpu_out = run_wmma_kernel(&dev, &a_data, &b_data, m, k, n)?;

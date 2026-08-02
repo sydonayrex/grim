@@ -321,7 +321,10 @@ fn try_build(pref: &PreferredBackend) -> Option<SelectedBackend> {
                 if !probe.available {
                     return None;
                 }
-                let dev = grim_backend_cuda::CudaDevice::new(0);
+                let dev = match grim_backend_cuda::CudaDevice::new(0) {
+                    Ok(d) => d,
+                    Err(_) => return None,
+                };
                 Some(SelectedBackend {
                     device: Device::Cuda(0),
                     label: "cuda".into(),
@@ -361,7 +364,10 @@ fn try_build(pref: &PreferredBackend) -> Option<SelectedBackend> {
                 if !probe.available {
                     return None;
                 }
-                let dev = grim_backend_metal::MetalDevice::new(0);
+                let dev = match grim_backend_metal::MetalDevice::new(0) {
+                    Ok(d) => d,
+                    Err(_) => return None,
+                };
                 Some(SelectedBackend {
                     device: Device::Metal(0),
                     label: "metal".into(),

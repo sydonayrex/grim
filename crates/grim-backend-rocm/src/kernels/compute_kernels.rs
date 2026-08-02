@@ -1,16 +1,6 @@
-//! HIP/C++ source for the six compute ops (add / mul / mul_scalar / sqrt /
-//! silu_mul / rms_norm / softmax / embedding / rmsnorm_matmul / rope).
-//!
-//! Each entry point is `extern "C"` so `hipModuleGetFunction` resolves it
-//! without name mangling.  The Phase-1 QKV attention kernel lives in
-//! `kernels::qkv_attention::KERNEL_SOURCE`; [`compute_kernel_source`] in
-//! `lib.rs` concatenates this string with that one at runtime for JIT
-//! compilation.
+//! HIP/C++ source for the six compute ops (add / mul / mul_scalar / sqrt / [see: `extern "C"`, `hipModuleGetFunction`]
 
-/// HIP source for the six non-QKV compute kernels.
-///
-/// Concatenated into the crate-wide kernel program via
-/// [`crate::compute_kernel_source`].
+/// HIP source for the six non-QKV compute kernels. [see: `crate::compute_kernel_source`]
 pub const OTHER_KERNEL_SOURCE: &str = r#"
 extern "C" __global__ void grim_add(float* a, float* b, float* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -47,7 +37,7 @@ extern "C" __global__ void grim_rope(const float* x, const unsigned int* positio
                                      int b, int s, int d, int half, float base) {
     // One thread per (batch, step, dim-half-pair) element. Matches the CPU
     // `BackendDevice::rope` semantics: 3-D input [B, S, D] with positions[si]
-    // per step, applying the rotation x1=x[i], x2=x[i+half] per pair.
+    // per step, applying the rotation x1=x[2i], x2=x[2i+1] per pair (interleaved).
     int total = b * s * half;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
@@ -61,8 +51,8 @@ extern "C" __global__ void grim_rope(const float* x, const unsigned int* positio
     float sin_val = sinf(val);
     float cos_val = cosf(val);
     int base_idx = (bi * s + si) * d;
-    int a_idx = base_idx + i;
-    int b_idx = base_idx + half + i;
+    int a_idx = base_idx + 2 * i;
+    int b_idx = base_idx + 2 * i + 1;
     float x1 = x[a_idx];
     float x2 = x[b_idx];
     out[a_idx] = x1 * cos_val - x2 * sin_val;

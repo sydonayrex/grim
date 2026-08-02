@@ -9,8 +9,8 @@ use std::sync::Arc;
 use grim_core::error::Result;
 use grim_core::model::CausalLm;
 use grim_core::session::SessionT;
-use grim_tensor::Tensor;
 use grim_models_transformer::{LlamaMtp, MtpDepthProvider};
+use grim_tensor::Tensor;
 
 use crate::draft_backbone::DraftBlock;
 use crate::native_mtp::NativeMtp;
@@ -72,8 +72,10 @@ impl NativeMtp for LlamaMtpAdapter {
         positions: &Tensor,
     ) -> Result<DraftBlock> {
         // Get MTP tokens from the base provider
-        let tokens = self.inner.predict_mtp_tokens(session, input_ids, positions)?;
-        
+        let tokens = self
+            .inner
+            .predict_mtp_tokens(session, input_ids, positions)?;
+
         if tokens.is_empty() {
             return Ok(DraftBlock {
                 tokens: vec![],
@@ -84,7 +86,7 @@ impl NativeMtp for LlamaMtpAdapter {
 
         // Run base forward to get base_logits
         let base_logits = self.inner.forward(session, input_ids, positions, &[])?;
-        
+
         Ok(DraftBlock {
             tokens,
             base_logits,
@@ -94,7 +96,7 @@ impl NativeMtp for LlamaMtpAdapter {
 }
 
 fn empty_logits() -> Tensor {
-    use grim_tensor::{Shape, DType, Device, QuantProvenance};
+    use grim_tensor::{DType, Device, QuantProvenance, Shape};
     let storage = Arc::new(grim_backend_cpu::CpuStorage::new(
         vec![0.0f32],
         Shape::new(vec![1, 1]),

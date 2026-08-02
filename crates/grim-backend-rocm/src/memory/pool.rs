@@ -1,18 +1,4 @@
-//! Green-phase implementation of the device scratch memory pool.
-//!
-//! Phase-3 §3.1 of the QKV spec, RED→GREEN→REFACTOR.
-//!
-//! The pool hands out `hipMalloc`-backed scratch buffers via LIFO
-//! bucketization; dropped `PooledBuffer`s return to the bucket so the
-//! next request of the same size reuses the underlying slot.
-//!
-//! Skill attribution:
-//! - `rust-ai-ml-inference-guide` Action 3 — Memory pool (KV-cache scratch)
-//! - `rust-gpu-parallelism` — Stream-ordered memory strategy
-//! - `rocm-profiling-perf` — Allocation overhead is in the optimizer's hot
-//!   path; the pool eliminates a measurable per-call cost
-//! - `rust-gpu-discipline` §3 — No silent CPU fallback for GPU-only ops.
-//!   Every allocation goes through `hipMalloc`; counters are real.
+//! Green-phase implementation of the device scratch memory pool. [see: `hipMalloc`, `PooledBuffer`]
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,11 +8,7 @@ use grim_tensor::error::{Error, Result};
 
 use crate::{check_hip, hipFree, hipMalloc};
 
-/// Layout key for the scratch pool: (rounded size, alignment).
-///
-/// Sizes bucketize to the next power of two with a 256-byte floor. The
-/// floor prevents the pool from spamming tiny (1-byte etc.) buckets that
-/// would only ever compete with `hipMalloc` overhead.
+/// Layout key for the scratch pool: (rounded size, alignment). [see: `hipMalloc`]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PoolLayout {
     pub size: usize,
@@ -35,14 +17,19 @@ pub struct PoolLayout {
 
 impl PoolLayout {
     pub fn new(size: usize, align: usize) -> Self {
-        let bucket = if size < 256 { 256 } else { size.next_power_of_two() };
-        Self { size: bucket, align }
+        let bucket = if size < 256 {
+            256
+        } else {
+            size.next_power_of_two()
+        };
+        Self {
+            size: bucket,
+            align,
+        }
     }
 }
 
-/// RAII handle for a pooled device buffer. On `Drop` the underlying
-/// pointer is returned to the matching bucket (its `hipMalloc` slot
-/// remains valid for re-use; no copy is performed).
+/// RAII handle for a pooled device buffer. On `Drop` the underlying [see: `hipMalloc`]
 pub struct PooledBuffer {
     ptr: *mut std::ffi::c_void,
     layout: PoolLayout,
@@ -54,8 +41,7 @@ impl PooledBuffer {
         self.ptr
     }
 
-    /// Borrowed view of the underlying device pointer. Used by the
-    /// upload path; the `Drop` of `PooledBuffer` is the owning destructor.
+    /// Borrowed view of the underlying device pointer. Used by the [see: `Drop`, `PooledBuffer`]
     pub fn as_device_ptr(&self) -> *mut std::ffi::c_void {
         self.ptr
     }
@@ -82,8 +68,7 @@ pub struct DeviceScratchPool {
 }
 
 impl DeviceScratchPool {
-    /// Build a new, empty pool. State lives in atomic counters and a
-    /// Mutex-wrapped bucket map; no GPU calls happen until `get()` runs.
+    /// Build a new, empty pool. State lives in atomic counters and a [see: `get()`]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             buckets: Mutex::new(HashMap::new()),
@@ -92,15 +77,14 @@ impl DeviceScratchPool {
         })
     }
 
-    /// Get a buffer of at least `size` bytes, `align`-aligned. Recycles
-    /// the most recently freed pointer in the matching bucket when one
-    /// exists; otherwise `hipMalloc`s a fresh slot and tracks the peak.
+    /// Get a buffer of at least `size` bytes, `align`-aligned. Recycles [see: `hipMalloc`]
     pub fn get(self: &Arc<Self>, size: usize, align: usize) -> Result<PooledBuffer> {
         let layout = PoolLayout::new(size, align);
         let ptr = {
-            let mut buckets = self.buckets.lock().map_err(|_| {
-                Error::Backend("DeviceScratchPool bucket mutex poisoned".into())
-            })?;
+            let mut buckets = self
+                .buckets
+                .lock()
+                .map_err(|_| Error::Backend("DeviceScratchPool bucket mutex poisoned".into()))?;
             buckets.get_mut(&layout).and_then(|v| v.pop())
         };
 
@@ -108,9 +92,10 @@ impl DeviceScratchPool {
             Some(p) => p,
             None => {
                 let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
-                check_hip("scratch pool hipMalloc", unsafe { hipMalloc(&mut p, layout.size) })?;
-                self.current_bytes
-                    .fetch_add(layout.size, Ordering::Relaxed);
+                check_hip("scratch pool hipMalloc", unsafe {
+                    hipMalloc(&mut p, layout.size)
+                })?;
+                self.current_bytes.fetch_add(layout.size, Ordering::Relaxed);
                 let cur = self.current_bytes.load(Ordering::Relaxed);
                 let mut peak = self.peak_bytes.load(Ordering::Relaxed);
                 while cur > peak {
@@ -128,7 +113,11 @@ impl DeviceScratchPool {
             }
         };
 
-        Ok(PooledBuffer { ptr, layout, pool: self.clone() })
+        Ok(PooledBuffer {
+            ptr,
+            layout,
+            pool: self.clone(),
+        })
     }
 
     /// Internal recycle. Called from `PooledBuffer::drop`.
@@ -136,9 +125,7 @@ impl DeviceScratchPool {
         if let Ok(mut buckets) = self.buckets.lock() {
             buckets.entry(layout).or_default().push(ptr);
         }
-        // Mutex-poison fallback: silent recycle failure means the next
-        // `get` will re-`hipMalloc`. Correctness preserved; perf degrades
-        // once until a `clear` restart.
+        // Mutex-poison fallback: silent recycle failure means the next [see: `get`, `hipMalloc`]
     }
 
     pub fn peak_bytes(&self) -> usize {
@@ -150,7 +137,6 @@ impl DeviceScratchPool {
     }
 
     /// Free every cached pointer back to the GPU. Used by `Drop` to avoid
-    /// leaking the pool's underlying hipMalloc allocations.
     fn drain(&self) {
         let mut buckets = match self.buckets.lock() {
             Ok(b) => b,

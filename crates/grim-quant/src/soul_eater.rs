@@ -13,8 +13,14 @@ pub enum ConditionNumberError {
 impl std::fmt::Display for ConditionNumberError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::IllConditioned { kappa } => write!(f, "Condition number kappa={kappa:.2} exceeds threshold 100.0"),
-            Self::RankDeficient { lambda_min } => write!(f, "Minimum eigenvalue lambda_min={lambda_min:e} is below threshold 1e-6"),
+            Self::IllConditioned { kappa } => write!(
+                f,
+                "Condition number kappa={kappa:.2} exceeds threshold 100.0"
+            ),
+            Self::RankDeficient { lambda_min } => write!(
+                f,
+                "Minimum eigenvalue lambda_min={lambda_min:e} is below threshold 1e-6"
+            ),
         }
     }
 }
@@ -41,7 +47,7 @@ pub fn subspace_gram_matrix(x: &[f32], d: usize, r: usize) -> Vec<f32> {
 pub fn exact_jacobi_eigenvalues(s: &[f32], r: usize) -> (f32, f32) {
     assert_eq!(s.len(), r * r, "Gram matrix size mismatch");
     let mut a = s.to_vec();
-    
+
     // Perform up to 15 sweeps of cyclic Jacobi rotations
     let max_sweeps = 15;
     for _ in 0..max_sweeps {
@@ -63,7 +69,7 @@ pub fn exact_jacobi_eigenvalues(s: &[f32], r: usize) -> (f32, f32) {
                 }
                 let a_ii = a[i * r + i];
                 let a_jj = a[j * r + j];
-                
+
                 let tau = (a_jj - a_ii) / (2.0 * a_ij);
                 let t = if tau >= 0.0 {
                     1.0 / (tau + (1.0 + tau * tau).sqrt())
@@ -99,8 +105,12 @@ pub fn exact_jacobi_eigenvalues(s: &[f32], r: usize) -> (f32, f32) {
     let mut lambda_min = f32::INFINITY;
     for i in 0..r {
         let val = a[i * r + i];
-        if val > lambda_max { lambda_max = val; }
-        if val < lambda_min { lambda_min = val; }
+        if val > lambda_max {
+            lambda_max = val;
+        }
+        if val < lambda_min {
+            lambda_min = val;
+        }
     }
     (lambda_max, lambda_min.max(0.0))
 }
@@ -199,7 +209,7 @@ mod tests {
         let d = 32;
         let r = 16;
         let mut x = vec![0.0f32; d * r];
-        
+
         // Generate a well-conditioned matrix (identity + small perturbation)
         for row in 0..d {
             for col in 0..r {
@@ -209,7 +219,8 @@ mod tests {
             }
         }
 
-        let steps = subspace_newton_schulz_step(&mut x, d, r, 15).expect("Well-conditioned matrix must succeed");
+        let steps = subspace_newton_schulz_step(&mut x, d, r, 15)
+            .expect("Well-conditioned matrix must succeed");
         assert!(steps <= 15, "Should converge within 15 steps");
 
         // Verify orthogonality: X^T * X ≈ I_r
@@ -222,7 +233,11 @@ mod tests {
                 residual_sq += diff * diff;
             }
         }
-        assert!(residual_sq.sqrt() < 1e-3, "Residual must be < 1e-3, got {}", residual_sq.sqrt());
+        assert!(
+            residual_sq.sqrt() < 1e-3,
+            "Residual must be < 1e-3, got {}",
+            residual_sq.sqrt()
+        );
     }
 
     #[test]
@@ -230,7 +245,7 @@ mod tests {
         let d = 32;
         let r = 16;
         let mut x = vec![0.0f32; d * r];
-        
+
         // Create a rank-deficient matrix (column 0 is all zeros)
         for row in 0..d {
             for col in 1..r {
@@ -239,7 +254,10 @@ mod tests {
         }
 
         let res = subspace_newton_schulz_step(&mut x, d, r, 10);
-        assert!(res.is_err(), "Rank deficient matrix must trigger error guard");
+        assert!(
+            res.is_err(),
+            "Rank deficient matrix must trigger error guard"
+        );
         let err = res.unwrap_err();
         match err {
             ConditionNumberError::RankDeficient { lambda_min } => {

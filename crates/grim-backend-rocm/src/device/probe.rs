@@ -1,33 +1,19 @@
-//! Device-feature probes — small functions that ask HIP runtime a
-//! single yes/no question about a given ordinal. Each probe is a
-//! tiny `hipDeviceGetAttribute` call wrapped in `unsafe`; we keep
-//! them next to each other so callers can spot at a glance which
-//! capabilities are query-able.
-//!
-//! Skill attribution:
-//! - `rust-ai-ml-inference-guide` Action 2 — capability-probe layer.
-//! - `rust-gpu-discipline` §4 — every probe returns `Result`-shaped
-//!   data (bool here, since "is X available" is binary) and never
-//!   silently fabricates a value.
-//! - `rocm-profiling-perf` — XNACK-feasibility check is what unblocks
-//!   the unified-memory memcpy fast path in `memcpy_with_xnack_fallback`.
+//! Device-feature probes — small functions that ask HIP runtime a [see: `hipDeviceGetAttribute`, `unsafe`]
 
-use std::path::PathBuf;
-use std::fs;
-use grim_tensor::error::{Error, Result};
 use crate::device::util::detect_gpu_arch;
+use grim_tensor::error::{Error, Result};
+use std::fs;
+use std::path::PathBuf;
 
 use super::handles::{
-    hipDeviceGetAttribute, hipSetDevice, HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS,
-    HIP_DEVICE_ATTRIBUTE_WARP_SIZE,
+    HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS, HIP_DEVICE_ATTRIBUTE_WARP_SIZE,
+    hipDeviceGetAttribute, hipSetDevice,
 };
 
 /// HIP attribute ID for maximum shared memory (LDS) per block.
 pub const HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: i32 = 3;
 
-/// XNACK probe for unified memory availability. Returns true if the
-/// device supports concurrent page faulting (so `hipMemAdvise`
-/// paths can be used safely).
+/// XNACK probe for unified memory availability. Returns true if the [see: `hipMemAdvise`]
 pub fn probe_xnack(device_ordinal: usize) -> bool {
     let mut val: i32 = 0;
     unsafe {
@@ -51,9 +37,6 @@ pub struct SystemRocmInfo {
 }
 
 /// Dynamic ROCm runtime discovery. Queries environment variables and fallbacks
-/// to return the installation path and version metadata.
-///
-/// SAFETY: Read-only environment and file system access.
 pub fn probe_system_rocm() -> Result<SystemRocmInfo> {
     let paths_to_check = [
         std::env::var("ROCM_PATH").ok(),
@@ -83,7 +66,9 @@ pub fn probe_system_rocm() -> Result<SystemRocmInfo> {
         }
     }
 
-    Err(Error::Backend("ROCm installation not found on the system. Ensure ROCM_PATH or HIP_PATH is set.".into()))
+    Err(Error::Backend(
+        "ROCm installation not found on the system. Ensure ROCM_PATH or HIP_PATH is set.".into(),
+    ))
 }
 
 /// GPU hardware capability snapshot queried dynamically from the host active device.
@@ -98,9 +83,6 @@ pub struct HostGpuCapabilities {
 }
 
 /// Query host GPU capabilities for a specific ordinal using the active system HIP FFI.
-///
-/// SAFETY: Invokes FFI capability-probing code. The caller must verify that a valid ROCm
-/// runtime is installed before calling.
 pub fn probe_host_gpu(device_ordinal: usize) -> Result<HostGpuCapabilities> {
     let gcn = detect_gpu_arch(device_ordinal as i32);
     let mut warp_val: i32 = 0;
@@ -109,7 +91,9 @@ pub fn probe_host_gpu(device_ordinal: usize) -> Result<HostGpuCapabilities> {
     unsafe {
         let set_status = hipSetDevice(device_ordinal as i32);
         if set_status != 0 {
-            return Err(Error::Backend(format!("hipSetDevice failed for ordinal {device_ordinal}: error code {set_status}")));
+            return Err(Error::Backend(format!(
+                "hipSetDevice failed for ordinal {device_ordinal}: error code {set_status}"
+            )));
         }
 
         let warp_status = hipDeviceGetAttribute(
@@ -118,7 +102,9 @@ pub fn probe_host_gpu(device_ordinal: usize) -> Result<HostGpuCapabilities> {
             device_ordinal as i32,
         );
         if warp_status != 0 {
-            return Err(Error::Backend(format!("hipDeviceGetAttribute WARP_SIZE failed: error code {warp_status}")));
+            return Err(Error::Backend(format!(
+                "hipDeviceGetAttribute WARP_SIZE failed: error code {warp_status}"
+            )));
         }
 
         let lds_status = hipDeviceGetAttribute(
@@ -127,7 +113,9 @@ pub fn probe_host_gpu(device_ordinal: usize) -> Result<HostGpuCapabilities> {
             device_ordinal as i32,
         );
         if lds_status != 0 {
-            return Err(Error::Backend(format!("hipDeviceGetAttribute MAX_SHARED_MEMORY failed: error code {lds_status}")));
+            return Err(Error::Backend(format!(
+                "hipDeviceGetAttribute MAX_SHARED_MEMORY failed: error code {lds_status}"
+            )));
         }
     }
 

@@ -1,11 +1,11 @@
-//! `grim compat` — Generate a `.grimplugin` compatibility spec file from a HuggingFace `config.json`.
+//! `grim compat` — Generate a `.grimplugin` compatibility spec from a HuggingFace `config.json`.
 
 use grim_core::error::{Error, Result};
 use grim_plugin::ArchCompatSpec;
 use std::fs;
 use std::path::Path;
 
-/// Execute the `grim compat` command: ingest `config.json` and output a `.grimplugin` manifest.
+/// Ingest `config.json` and output a `.grimplugin` manifest.
 pub async fn cmd_compat(config_path: &str, output_path: Option<String>) -> Result<()> {
     let path_obj = Path::new(config_path);
     if !path_obj.exists() {
@@ -20,9 +20,11 @@ pub async fn cmd_compat(config_path: &str, output_path: Option<String>) -> Resul
 
     let spec = ArchCompatSpec::from_hf_config_json(&content)?;
 
-    // Validate required fields before writing.
+    // Validate required fields.
     if spec.model_type.is_empty() {
-        return Err(Error::Config("model_type is required in config.json".into()));
+        return Err(Error::Config(
+            "model_type is required in config.json".into(),
+        ));
     }
     if spec.num_layers == 0 {
         return Err(Error::Config("num_hidden_layers must be > 0".into()));
@@ -36,8 +38,12 @@ pub async fn cmd_compat(config_path: &str, output_path: Option<String>) -> Resul
     let out_filename = output_path.unwrap_or_else(|| format!("{}.grimplugin", spec.model_type));
     let out_path = Path::new(&out_filename);
 
-    fs::write(out_path, json_output)
-        .map_err(|e| Error::Config(format!("Failed to write compatibility plugin to {:?}: {e}", out_path)))?;
+    fs::write(out_path, json_output).map_err(|e| {
+        Error::Config(format!(
+            "Failed to write compatibility plugin to {:?}: {e}",
+            out_path
+        ))
+    })?;
 
     println!(
         "Successfully created architecture compatibility plugin: {} (base='{}', layers={}, hidden={})",

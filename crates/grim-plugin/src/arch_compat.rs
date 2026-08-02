@@ -4,10 +4,10 @@
 //! Qwen, LFM2, custom models) and generates a structured `ArchCompatSpec` containing parameter mappings,
 //! tensor remapping rules, and architecture capability declarations for dynamic plugin registration.
 
+use grim_core::architecture::{ModelArchitecture, TensorNamingRegistry};
+use grim_core::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use grim_core::error::{Error, Result};
-use grim_core::architecture::{ModelArchitecture, TensorNamingRegistry};
 
 /// Architecture compatibility specification generated from HuggingFace `config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,7 +73,8 @@ impl ArchCompatSpec {
         let raw: RawHfConfig = serde_json::from_str(json_str)
             .map_err(|e| Error::Config(format!("Failed to parse HF config.json: {e}")))?;
 
-        let model_type = raw.model_type
+        let model_type = raw
+            .model_type
             .or_else(|| raw.architectures.and_then(|a| a.first().cloned()))
             .unwrap_or_else(|| "custom".to_string());
 
@@ -83,7 +84,13 @@ impl ArchCompatSpec {
         let vocab_size = raw.vocab_size.unwrap_or(32000);
         let num_heads = raw.num_attention_heads.unwrap_or(32);
         let num_kv_heads = raw.num_key_value_heads.unwrap_or(num_heads);
-        let head_dim = raw.head_dim.unwrap_or_else(|| if num_heads > 0 { hidden_size / num_heads } else { 128 });
+        let head_dim = raw.head_dim.unwrap_or_else(|| {
+            if num_heads > 0 {
+                hidden_size / num_heads
+            } else {
+                128
+            }
+        });
         let intermediate_size = raw.intermediate_size.unwrap_or(hidden_size * 4);
         let rms_norm_eps = raw.rms_norm_eps.or(raw.layer_norm_eps).unwrap_or(1e-5);
         let rope_theta = raw.rope_theta.unwrap_or(10000.0);
@@ -142,7 +149,8 @@ impl ArchCompatSpec {
         }
         // Reverse lookup: prefer HF standard naming (with `model.` prefix)
         // over internal loader canonical names for deterministic results.
-        if let Some(hf_name) = self.tensor_name_mapping
+        if let Some(hf_name) = self
+            .tensor_name_mapping
             .iter()
             .find(|(hf, gguf)| gguf == &name && hf.starts_with("model."))
             .map(|(hf, _)| hf)

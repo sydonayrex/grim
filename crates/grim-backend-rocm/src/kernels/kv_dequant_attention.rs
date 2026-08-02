@@ -1,7 +1,4 @@
 //! Fused KV-dequantized attention HIP kernel (WI-R5).
-//!
-//! Extends standard QKV-attention to support on-the-fly dequantization of Key and Value
-//! caches from 4-bit or 8-bit representations, minimizing LDS traffic and high-latency DRAM reads.
 
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" __global__ __launch_bounds__(256)

@@ -11,12 +11,12 @@ use grim_tensor::dtype::{DType, KQuantScheme, QuantProvenance, Storage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
 
-use crate::gguf::{
-    read_gguf, read_tensor_bytes, GgufDType, GgufFile, GgufTensorInfo, GrimFusionOp, GrimMetadata,
-    GrimQuantOverride, GrimTrainQuantMode,
-};
 use crate::format::{GrimFile, GrimTensorEntry, read_normals, read_outliers};
-use crate::safetensors::{read_safetensor_bytes, read_safetensors_header, SafetensorInfo};
+use crate::gguf::{
+    GgufDType, GgufFile, GgufTensorInfo, GrimFusionOp, GrimMetadata, GrimQuantOverride,
+    GrimTrainQuantMode, read_gguf, read_tensor_bytes,
+};
+use crate::safetensors::{SafetensorInfo, read_safetensor_bytes, read_safetensors_header};
 
 /// GGUF-backed `TensorProvider`. Holds the parsed file index and wraps a
 /// `BufReader<File>` for lazy tensor reads.
@@ -126,14 +126,24 @@ impl GgufProvider {
 
     /// `true` if RMSNorm+MatMul fusion is requested either via train or ROCm metadata.
     pub fn has_rmsnorm_matmul_fusion(&self) -> bool {
-        self.grim.train_fusion_ops.contains(&GrimFusionOp::RmsNormMatMul)
-            || self.grim.rocm_fusion_ops.contains(&GrimFusionOp::RmsNormMatMul)
+        self.grim
+            .train_fusion_ops
+            .contains(&GrimFusionOp::RmsNormMatMul)
+            || self
+                .grim
+                .rocm_fusion_ops
+                .contains(&GrimFusionOp::RmsNormMatMul)
     }
 
     /// `true` if QKV+Attention fusion is requested either via train or ROCm metadata.
     pub fn has_qkv_attention_fusion(&self) -> bool {
-        self.grim.train_fusion_ops.contains(&GrimFusionOp::QkvAttention)
-            || self.grim.rocm_fusion_ops.contains(&GrimFusionOp::QkvAttention)
+        self.grim
+            .train_fusion_ops
+            .contains(&GrimFusionOp::QkvAttention)
+            || self
+                .grim
+                .rocm_fusion_ops
+                .contains(&GrimFusionOp::QkvAttention)
     }
 }
 
@@ -156,9 +166,10 @@ fn effective_dtype(info: &GgufTensorInfo, overrides: &HashMap<String, GrimQuantO
 
 impl TensorProvider for GgufProvider {
     fn get(&self, name: &str) -> Result<RawTensor> {
-        let info = self.tensors.get(name).ok_or_else(|| {
-            Error::Backend(format!("tensor '{name}' not found in GGUF file"))
-        })?;
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in GGUF file")))?;
         let mut reader = self.reader.lock().unwrap();
         let bytes = read_tensor_bytes(&mut *reader, &self.file, info)?;
         let dtype = effective_dtype(info, &self.overrides);
@@ -171,9 +182,10 @@ impl TensorProvider for GgufProvider {
     }
 
     fn meta(&self, name: &str) -> Result<TensorMeta> {
-        let info = self.tensors.get(name).ok_or_else(|| {
-            Error::Backend(format!("tensor '{name}' not found in GGUF file"))
-        })?;
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in GGUF file")))?;
         let dtype = effective_dtype(info, &self.overrides);
         Ok(TensorMeta {
             dtype,
@@ -204,7 +216,10 @@ impl SafetensorsProvider {
         let companion_path = format!("{}.json", path);
         if std::path::Path::new(&companion_path).exists() {
             if let Ok(content) = std::fs::read_to_string(&companion_path) {
-                println!("[SafetensorsProvider] Loaded draft companion file: {} (content: {})", companion_path, content);
+                println!(
+                    "[SafetensorsProvider] Loaded draft companion file: {} (content: {})",
+                    companion_path, content
+                );
             }
         }
 
@@ -218,18 +233,24 @@ impl SafetensorsProvider {
         let mut tensors = info.clone();
         if let Some(ref g) = gptq {
             tensors.retain(|k, _| {
-                !k.ends_with(".qweight") && !k.ends_with(".qzeros") && !k.ends_with(".scales") && !k.ends_with(".g_idx")
+                !k.ends_with(".qweight")
+                    && !k.ends_with(".qzeros")
+                    && !k.ends_with(".scales")
+                    && !k.ends_with(".g_idx")
             });
             for (base_name, gptq_info) in &g.tensors {
                 let qweight_name = format!("{}.qweight", base_name);
                 if let Some(qw_info) = info.get(&qweight_name) {
-                    tensors.insert(base_name.clone(), SafetensorInfo {
-                        name: base_name.clone(),
-                        dims: gptq_info.shape.clone(),
-                        dtype_tag: qw_info.dtype_tag.clone(),
-                        data_start: qw_info.data_start,
-                        data_end: qw_info.data_end,
-                    });
+                    tensors.insert(
+                        base_name.clone(),
+                        SafetensorInfo {
+                            name: base_name.clone(),
+                            dims: gptq_info.shape.clone(),
+                            dtype_tag: qw_info.dtype_tag.clone(),
+                            data_start: qw_info.data_start,
+                            data_end: qw_info.data_end,
+                        },
+                    );
                 }
             }
         }
@@ -337,7 +358,11 @@ impl GrimProvider {
     /// declaration. Callers can use `GrimTensorExt::is_legacy()` to detect
     /// the default (zeroed) extension.
     pub fn ext_for(&self, name: &str) -> Option<&crate::spec::GrimTensorExt> {
-        self.file.metadata.ext_entries.iter().find(|e| e.tensor_name == name)
+        self.file
+            .metadata
+            .ext_entries
+            .iter()
+            .find(|e| e.tensor_name == name)
     }
 
     /// Access the tensor registry.
@@ -347,9 +372,10 @@ impl GrimProvider {
 
     /// Read the outliers stream for a tensor (lazily, from disk).
     pub fn outliers(&self, name: &str) -> Result<Vec<crate::format::GrimOutlier>> {
-        let entry = self.file.tensor(name).ok_or_else(|| {
-            Error::Backend(format!("tensor '{name}' not found in .grim file"))
-        })?;
+        let entry = self
+            .file
+            .tensor(name)
+            .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in .grim file")))?;
         let mut reader = self.reader.lock().unwrap();
         read_outliers(&mut *reader, entry)
     }
@@ -361,18 +387,22 @@ impl GrimProvider {
     /// files or conversion from safetensors). Callers should fall back to the
     /// sibling `.gguf` route in that case.
     pub fn tokenizer(&self) -> Result<crate::tokenizer::GgufTokenizer> {
-        let meta = self.file.metadata.gguf_metadata.as_ref().ok_or_else(|| {
-            Error::Backend("no embedded GGUF metadata in .grim file".into())
-        })?;
+        let meta = self
+            .file
+            .metadata
+            .gguf_metadata
+            .as_ref()
+            .ok_or_else(|| Error::Backend("no embedded GGUF metadata in .grim file".into()))?;
         crate::tokenizer::GgufTokenizer::from_metadata(meta)
     }
 }
 
 impl TensorProvider for GrimProvider {
     fn get(&self, name: &str) -> Result<RawTensor> {
-        let entry = self.file.tensor(name).ok_or_else(|| {
-            Error::Backend(format!("tensor '{name}' not found in .grim file"))
-        })?;
+        let entry = self
+            .file
+            .tensor(name)
+            .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in .grim file")))?;
         let mut reader = self.reader.lock().unwrap();
         let bytes = read_normals(&mut *reader, entry)?;
 
@@ -418,13 +448,11 @@ impl TensorProvider for GrimProvider {
     }
 
     fn meta(&self, name: &str) -> Result<TensorMeta> {
-        let entry = self.file.tensor(name).ok_or_else(|| {
-            Error::Backend(format!("tensor '{name}' not found in .grim file"))
-        })?;
-        let fusion_mask = self
-            .ext_for(name)
-            .map(|ext| ext.fusion_mask)
-            .unwrap_or(0);
+        let entry = self
+            .file
+            .tensor(name)
+            .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in .grim file")))?;
+        let fusion_mask = self.ext_for(name).map(|ext| ext.fusion_mask).unwrap_or(0);
         Ok(TensorMeta {
             dtype: dtype_from_bitwidth(entry.base_bitwidth),
             provenance: QuantProvenance::GrimNative,
@@ -464,7 +492,7 @@ mod tests {
     use std::collections::HashMap;
     use std::io::Write;
 
-    use crate::gguf::{GgufValue, GGUF_MAGIC, GGUF_VERSION};
+    use crate::gguf::{GGUF_MAGIC, GGUF_VERSION, GgufValue};
 
     /// Build a minimal GGUF byte stream with the given metadata KV pairs and zero tensors.
     /// Used by tprov accessor tests to exercise `GgufProvider::open` against real serialized bytes.
@@ -474,29 +502,36 @@ mod tests {
     /// - `GgufValue::Array(items)` — written as a GGUF array, each string element is `&str`
     fn write_minimal_gguf_bytes(metadata: &HashMap<&str, GgufValue>) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.write_all(&GGUF_MAGIC.to_le_bytes()).expect("write magic");
-        buf.write_all(&GGUF_VERSION.to_le_bytes()).expect("write version");
-        buf.write_all(&0u64.to_le_bytes()).expect("write tensor count");
+        buf.write_all(&GGUF_MAGIC.to_le_bytes())
+            .expect("write magic");
+        buf.write_all(&GGUF_VERSION.to_le_bytes())
+            .expect("write version");
+        buf.write_all(&0u64.to_le_bytes())
+            .expect("write tensor count");
         buf.write_all(&(metadata.len() as u64).to_le_bytes())
             .expect("write metadata kv count");
 
         for (key, value) in metadata {
             let key_bytes = key.as_bytes();
-            buf.write_all(&(key_bytes.len() as u64).to_le_bytes()).expect("write key len");
+            buf.write_all(&(key_bytes.len() as u64).to_le_bytes())
+                .expect("write key len");
             buf.write_all(key_bytes).expect("write key bytes");
 
             match value {
                 GgufValue::String(s) => {
-                    buf.write_all(&8u32.to_le_bytes()).expect("write string tag");
+                    buf.write_all(&8u32.to_le_bytes())
+                        .expect("write string tag");
                     let s_bytes = s.as_bytes();
-                    buf.write_all(&(s_bytes.len() as u64).to_le_bytes()).expect("write string len");
+                    buf.write_all(&(s_bytes.len() as u64).to_le_bytes())
+                        .expect("write string len");
                     buf.write_all(s_bytes).expect("write string bytes");
                 }
                 GgufValue::Array(items) => {
                     // GGUF array: tag=9, element_tag=8 (string), count=items.len(), then each string.
                     // Note: each array element re-emits its own tag (matches `read_gguf_value`).
                     buf.write_all(&9u32.to_le_bytes()).expect("write array tag");
-                    buf.write_all(&8u32.to_le_bytes()).expect("write array elem string tag");
+                    buf.write_all(&8u32.to_le_bytes())
+                        .expect("write array elem string tag");
                     buf.write_all(&(items.len() as u64).to_le_bytes())
                         .expect("write array count");
                     for item in items {
@@ -510,7 +545,9 @@ mod tests {
                         }
                     }
                 }
-                other => panic!("test helper currently supports only string/array values, got {other:?}"),
+                other => {
+                    panic!("test helper currently supports only string/array values, got {other:?}")
+                }
             }
         }
 
@@ -585,22 +622,22 @@ mod tests {
     }
 
     #[test]
-fn test_dtype_from_gguf_block_mappings() {
-         use crate::gguf::GgufDType;
-         use grim_tensor::dtype::{Storage, KQuantScheme};
-         
-         let d_q4k = super::dtype_from_gguf(GgufDType::Q4K);
-         assert_eq!(d_q4k.storage, Storage::KQuant(KQuantScheme::Q4K));
-         
-         let d_q5k = super::dtype_from_gguf(GgufDType::Q5K);
-         assert_eq!(d_q5k.storage, Storage::KQuant(KQuantScheme::Q5K));
+    fn test_dtype_from_gguf_block_mappings() {
+        use crate::gguf::GgufDType;
+        use grim_tensor::dtype::{KQuantScheme, Storage};
 
-         let d_q6k = super::dtype_from_gguf(GgufDType::Q6K);
-         assert_eq!(d_q6k.storage, Storage::KQuant(KQuantScheme::Q6K));
+        let d_q4k = super::dtype_from_gguf(GgufDType::Q4K);
+        assert_eq!(d_q4k.storage, Storage::KQuant(KQuantScheme::Q4K));
 
-         let d_q80 = super::dtype_from_gguf(GgufDType::Q8_0);
-         assert_eq!(d_q80.storage, Storage::KQuant(KQuantScheme::Q80));
-     }
+        let d_q5k = super::dtype_from_gguf(GgufDType::Q5K);
+        assert_eq!(d_q5k.storage, Storage::KQuant(KQuantScheme::Q5K));
+
+        let d_q6k = super::dtype_from_gguf(GgufDType::Q6K);
+        assert_eq!(d_q6k.storage, Storage::KQuant(KQuantScheme::Q6K));
+
+        let d_q80 = super::dtype_from_gguf(GgufDType::Q8_0);
+        assert_eq!(d_q80.storage, Storage::KQuant(KQuantScheme::Q80));
+    }
 
     /// Write a minimal native `.grim` file to a temp path, then open it
     /// with `GrimProvider` and verify `meta`/`get` round-trip the registry.
@@ -650,7 +687,10 @@ fn test_dtype_from_gguf_block_mappings() {
             buf.resize(entry.payload_offset as usize, 0u8);
         }
         buf.resize(buf.len() + normals_bytes, 0u8);
-        let outlier = crate::format::GrimOutlier { index: 0, value: 1.0 };
+        let outlier = crate::format::GrimOutlier {
+            index: 0,
+            value: 1.0,
+        };
         buf.extend_from_slice(&outlier.encode());
 
         std::fs::write(path, &buf).unwrap();
@@ -664,7 +704,10 @@ fn test_dtype_from_gguf_block_mappings() {
 
         let provider = GrimProvider::open(path.to_str().unwrap()).unwrap();
         assert_eq!(provider.grim_metadata().magic.as_deref(), Some("grim-v1"));
-        assert_eq!(provider.grim_metadata().target_gcn.as_deref(), Some("gfx1100"));
+        assert_eq!(
+            provider.grim_metadata().target_gcn.as_deref(),
+            Some("gfx1100")
+        );
 
         let meta = provider.meta("layer.0.weight").unwrap();
         assert_eq!(meta.shape, vec![4, 4]);
@@ -767,10 +810,14 @@ fn test_dtype_from_gguf_block_mappings() {
             }
         });
 
-        let meta = remapped.meta("blk.0.attn_q.weight").expect("mapped meta lookup");
+        let meta = remapped
+            .meta("blk.0.attn_q.weight")
+            .expect("mapped meta lookup");
         assert_eq!(meta.shape, vec![2, 2]);
 
-        let raw = remapped.get("blk.0.attn_q.weight").expect("mapped get lookup");
+        let raw = remapped
+            .get("blk.0.attn_q.weight")
+            .expect("mapped get lookup");
         assert_eq!(raw.bytes.len(), 16);
     }
 }
@@ -785,7 +832,10 @@ pub struct RemappingTensorProvider<'a> {
 }
 
 impl<'a> RemappingTensorProvider<'a> {
-    pub fn new(inner: &'a dyn TensorProvider, remap: impl Fn(&str) -> String + Send + Sync + 'a) -> Self {
+    pub fn new(
+        inner: &'a dyn TensorProvider,
+        remap: impl Fn(&str) -> String + Send + Sync + 'a,
+    ) -> Self {
         Self {
             inner,
             remap: Box::new(remap),

@@ -1,66 +1,8 @@
-//! Phase-1 fused QKV-attention HIP kernel.
-//!
-//! See `grim_qkv_attention_kernel_spec.md` for the contract this implements.
-//! Key points, with citation to relevant skills:
-//!   - **Wave64 mandate** on RDNA2/RDNA3/RDNA4 (gfx1036/gfx110x/gfx1200) —
-//!     block size is 256 = 4 wavefronts of 64 (`rocm-hip-kernels`).
-//!   - **Online (FlashAttention-style) softmax**: running max + running
-//!     weighted sum in registers; never materializes a per-`kv_seq_len` score
-//!     buffer. Behavior is uniform regardless of how large `kv_seq_len` is.
-//!   - **Causal mask inside the kernel**, gated by `j <= cache_offset + i`,
-//!     where `i` is the local query index and `cache_offset` shifts to the
-//!     absolute position. The kernel is the sole source of truth for what
-//!     attends to what.
-//!   - **GQA head-sharing**: `kv_head = h / (num_heads / num_kv_heads)`. The
-//!     divisor is computed with a fast integer reciprocal; we keep it inside
-//!     f32 in the host launcher and pre-check `num_heads % num_kv_heads == 0`
-//!     there.
-//!   - **f32 only** in this revision (per Step 1's hard requirement). Other
-//!     dtypes are a follow-up with a separate task and conversion design.
-//!
-//! Architectural note for future readers:
-//!   - The Phase-2 MFMA / BF16 / FP8 / paged-attention paths live elsewhere
-//!     (`rocm-quantization-inference`, `rocm-hip-kernels`). Don't fold them
-//!     into this kernel until Phase 1's CPU reference equivalence holds.
-//!   - The hot-path kernel keeps `kernel_search_score` inside the for-loop so
-//!     registers replace LDS traffic. LDS here is reserved for thread-`h`
-//!     accumulation across the wavefront (the final wave reduce).
+//! Phase-1 fused QKV-attention HIP kernel. [see: `grim_qkv_attention_kernel_spec.md`, `rocm-hip-kernels`]
 
 extern crate alloc;
 
-/// HIP source for `grim_qkv_attention`.
-///
-/// Concatenated into the crate-wide `COMPUTE_KERNEL_SOURCE` constant for JIT
-/// compilation; the kernel signature must match exactly the kernel-launch
-/// argument packing done in `lib.rs::RocmDevice::qkv_attention`.
-///
-/// WI 1.4.2 — all kernels in this source parallelize the KV walk across all 4
-/// RDNA wavefronts in the 256-thread block (one wavefront per wave_id 0..3),
-/// each owning a contiguous quarter of the valid `j`-range. Per-wavefront
-/// partial online-softmax state (max, sum, per-dim acc) is published to
-/// in-kernel `__shared__` LDS, then wave 0 merges the 4 partials pairwise and
-/// writes the final `out[d]`. See `grim_rocm_consumer_perf_plan.md` WI 1.
-///
-/// Hardware-aware corner (RDNA iGPU, e.g. gfx1036): `warpSize` resolves to 32
-/// at runtime; the host launches block = wave_size (single wavefront) since
-/// one wave covers head_dim up to wave_size. `head_dim > wave_size` throws
-/// NaN. The kernel uses `__shared__ float s_acc[8][wave_size == 64 ? 64 : 32]`
-/// so the same kernel handles wave64 (full WI 1.4.2 4-way path) and wave32
-/// (single-wavefront correctness path) without source forks. On wave32 the
-/// WI 1.4.2 KV-parallel speedup is not realized (only one wavefront runs);
-/// treat wave64 hardware (`gfx110x`, `gfx1200`, CDNA) as the optimization
-/// target.
-///
-/// Load-imbalance note (DCU-GCN §2.4.4-2 caution in WI 1.6.1): within one
-/// block, the 4 wavefronts get a static (base, rem) stride partition. If a
-/// batch mixes very different kv_seq_len sequences the *cross-block* part of
-/// the kernel is unaffected (each block has its own j_range), but per-kernel
-/// terminals can see uneven per-wave work. Correctness holds either way; the
-/// perf headroom is reserved for a future dynamic-chunk-sizing step rather
-/// than a correction to this PR.
-///
-/// VERIFIED(gpu-verify): Gate 1.6.4 perf number — hardware Wave64 mode enabled
-/// via compiler `-mwavefrontsize=64` option based on detected GPU architecture.
+/// HIP source for `grim_qkv_attention`. [see: `COMPUTE_KERNEL_SOURCE`, `lib.rs::RocmDevice::qkv_attention`, `j`, `__shared__`]
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" __global__ __launch_bounds__(256)
 void grim_qkv_attention(
@@ -581,11 +523,11 @@ fn arg<T>(v: &mut T) -> *mut std::ffi::c_void {
 
 pub fn launch_paged_attention(
     dev: &crate::RocmDevice,
-    q: &dyn BackendStorage,          // [batch, num_heads, head_dim]
+    q: &dyn BackendStorage,            // [batch, num_heads, head_dim]
     block_tables: &dyn BackendStorage, // [batch, max_blocks] of BlockTableEntry
-    k_pages: &dyn BackendStorage,     // [num_pages, page_size, num_kv_heads, head_dim]
-    v_pages: &dyn BackendStorage,     // [num_pages, page_size, num_kv_heads, head_dim]
-    out: &mut dyn BackendStorage,     // [batch, num_heads, head_dim]
+    k_pages: &dyn BackendStorage,      // [num_pages, page_size, num_kv_heads, head_dim]
+    v_pages: &dyn BackendStorage,      // [num_pages, page_size, num_kv_heads, head_dim]
+    out: &mut dyn BackendStorage,      // [batch, num_heads, head_dim]
     batch: u32,
     num_heads: u32,
     num_kv_heads: u32,
@@ -595,23 +537,46 @@ pub fn launch_paged_attention(
     kv_seq_len: u32,
     cache_offset: u32,
 ) -> Result<(), crate::Error> {
-    let q_s = q.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().ok_or_else(|| crate::Error::Backend("q must be RocmStorage".into()))?;
-    let block_tables_s = block_tables.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().ok_or_else(|| crate::Error::Backend("block_tables must be RocmStorage".into()))?;
-    let k_pages_s = k_pages.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().ok_or_else(|| crate::Error::Backend("k_pages must be RocmStorage".into()))?;
-    let v_pages_s = v_pages.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().ok_or_else(|| crate::Error::Backend("v_pages must be RocmStorage".into()))?;
-    let out_s = out.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().ok_or_else(|| crate::Error::Backend("out must be RocmStorage".into()))?;
+    let q_s = q
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("q must be RocmStorage".into()))?;
+    let block_tables_s = block_tables
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("block_tables must be RocmStorage".into()))?;
+    let k_pages_s = k_pages
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("k_pages must be RocmStorage".into()))?;
+    let v_pages_s = v_pages
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("v_pages must be RocmStorage".into()))?;
+    let out_s = out
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("out must be RocmStorage".into()))?;
 
-    let q_ptr = q_s.device_ptr.ok_or_else(|| crate::Error::Backend("q has no device ptr".into()))?;
-    let block_tables_ptr = block_tables_s.device_ptr.ok_or_else(|| crate::Error::Backend("block_tables has no device ptr".into()))?;
-    let k_pages_ptr = k_pages_s.device_ptr.ok_or_else(|| crate::Error::Backend("k_pages has no device ptr".into()))?;
-    let v_pages_ptr = v_pages_s.device_ptr.ok_or_else(|| crate::Error::Backend("v_pages has no device ptr".into()))?;
-    let out_ptr = out_s.device_ptr.ok_or_else(|| crate::Error::Backend("out has no device ptr".into()))?;
+    let q_ptr = q_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("q has no device ptr".into()))?;
+    let block_tables_ptr = block_tables_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("block_tables has no device ptr".into()))?;
+    let k_pages_ptr = k_pages_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("k_pages has no device ptr".into()))?;
+    let v_pages_ptr = v_pages_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("v_pages has no device ptr".into()))?;
+    let out_ptr = out_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out has no device ptr".into()))?;
 
     let wf = dev.wavefront_size() as u32;
     let grid_dim = crate::HipDim3::new(batch, num_heads, 1);
     let block_dim = crate::HipDim3::new(wf * 4, 1, 1);
-
-
 
     // Wavefront-aware: W32→128 threads, W64→256 threads
 
@@ -670,20 +635,45 @@ pub fn launch_tree_attention(
     kv_seq_len: u32,
     cache_offset: u32,
 ) -> Result<(), crate::Error> {
-    let q_s = q.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().ok_or_else(|| crate::Error::Backend("q must be RocmStorage".into()))?;
-    let k_s = k.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().ok_or_else(|| crate::Error::Backend("k must be RocmStorage".into()))?;
-    let v_s = v.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().ok_or_else(|| crate::Error::Backend("v must be RocmStorage".into()))?;
-    let parents_s = tree_parents.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().ok_or_else(|| crate::Error::Backend("tree_parents must be RocmStorage".into()))?;
-    let out_s = out.as_any().downcast_ref::<crate::memory::storage::RocmStorage>().ok_or_else(|| crate::Error::Backend("out must be RocmStorage".into()))?;
+    let q_s = q
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("q must be RocmStorage".into()))?;
+    let k_s = k
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("k must be RocmStorage".into()))?;
+    let v_s = v
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("v must be RocmStorage".into()))?;
+    let parents_s = tree_parents
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("tree_parents must be RocmStorage".into()))?;
+    let out_s = out
+        .as_any()
+        .downcast_ref::<crate::memory::storage::RocmStorage>()
+        .ok_or_else(|| crate::Error::Backend("out must be RocmStorage".into()))?;
 
-    let q_ptr = q_s.device_ptr.ok_or_else(|| crate::Error::Backend("q has no device ptr".into()))?;
-    let k_ptr = k_s.device_ptr.ok_or_else(|| crate::Error::Backend("k has no device ptr".into()))?;
-    let v_ptr = v_s.device_ptr.ok_or_else(|| crate::Error::Backend("v has no device ptr".into()))?;
-    let parents_ptr = parents_s.device_ptr.ok_or_else(|| crate::Error::Backend("tree_parents has no device ptr".into()))?;
-    let out_ptr = out_s.device_ptr.ok_or_else(|| crate::Error::Backend("out has no device ptr".into()))?;
+    let q_ptr = q_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("q has no device ptr".into()))?;
+    let k_ptr = k_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("k has no device ptr".into()))?;
+    let v_ptr = v_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("v has no device ptr".into()))?;
+    let parents_ptr = parents_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("tree_parents has no device ptr".into()))?;
+    let out_ptr = out_s
+        .device_ptr
+        .ok_or_else(|| crate::Error::Backend("out has no device ptr".into()))?;
 
     let wf = dev.wavefront_size() as u32;
-// Wavefront-aware: W32→128 threads, W64→256 threads
+    // Wavefront-aware: W32→128 threads, W64→256 threads
     let grid_dim = crate::HipDim3::new(1 + gamma, num_heads, batch);
     let block_dim = crate::HipDim3::new(wf * 4, 1, 1);
 

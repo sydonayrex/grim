@@ -746,9 +746,7 @@ dependencies = [
 
 [[package]]
 name = "convert_case"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
+version = "0.10.1"
 dependencies = [
  "unicode-segmentation",
 ]
@@ -1417,7 +1415,7 @@ version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "799a97264921d8623a957f6c3b9011f3b5492f557bbb7a5a19b7fa6d06ba8dcb"
 dependencies = [
- "convert_case 0.10.0",
+ "convert_case 0.10.1",
  "proc-macro2",
  "quote",
  "rustc_version",
@@ -2093,6 +2091,7 @@ dependencies = [
  "grim-tensor",
  "seahash",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
@@ -2105,6 +2104,7 @@ dependencies = [
  "objc2-metal 0.2.2",
  "tempfile",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
@@ -2124,6 +2124,7 @@ dependencies = [
  "half",
  "lazy_static",
  "libloading 0.8.9",
+ "log",
  "seahash",
  "serde",
  "serde_json",
@@ -2138,6 +2139,7 @@ dependencies = [
  "grim-tensor",
  "lazy_static",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
@@ -2259,6 +2261,8 @@ dependencies = [
  "grim-core",
  "grim-engine",
  "grim-format",
+ "grim-models-transformer",
+ "grim-nn",
  "grim-tensor",
  "rust-embed",
  "serde",

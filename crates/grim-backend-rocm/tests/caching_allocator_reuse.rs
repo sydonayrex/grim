@@ -43,7 +43,10 @@ fn copy_from_host_async_does_not_grow_malloc_count_per_call() {
         return;
     }
 
-    let dev = Arc::new(RocmDevice::new(0));
+    let dev = Arc::new(
+        RocmDevice::try_new(0)
+            .expect("RocmDevice::try_new(0) should succeed on a system with ROCm"),
+    );
     let shape = Shape::from_slice(&[64]);
     let data: Vec<f32> = (0..64).map(|i| i as f32 * 0.01).collect();
 

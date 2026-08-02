@@ -1,5 +1,5 @@
 use grim_backend_cpu::cpu_tensor;
-use grim_tensor::{backend::BackendDevice, Shape};
+use grim_tensor::{Shape, backend::BackendDevice};
 
 #[test]
 fn test_lora_accumulate_golden_mutation_resistant() {
@@ -15,19 +15,13 @@ fn test_lora_accumulate_golden_mutation_resistant() {
     let x = cpu_tensor(vec![1.0, 2.0, 3.0, 4.0], Shape::new(vec![1, 4]));
     let a = cpu_tensor(
         vec![
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ],
         Shape::new(vec![4, 4]),
     );
     let b = cpu_tensor(
         vec![
-            2.0, 0.0, 0.0, 0.0,
-            0.0, 2.0, 0.0, 0.0,
-            0.0, 0.0, 2.0, 0.0,
-            0.0, 0.0, 0.0, 2.0,
+            2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0,
         ],
         Shape::new(vec![4, 4]),
     );

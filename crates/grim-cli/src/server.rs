@@ -1,4 +1,4 @@
-//! grim server - Alias for serve, starts the HTTP server daemon.
+//! grim server — Alias for serve, starts the HTTP server daemon.
 
 use grim_core::error::Result;
 use grim_engine::Engine;

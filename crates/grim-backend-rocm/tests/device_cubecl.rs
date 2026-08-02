@@ -10,10 +10,10 @@
 
 #![cfg(feature = "cubecl")]
 
+use grim_backend_rocm::RocmDevice;
 use grim_backend_rocm::device::cubecl::{
     add, client, embedding, gptq_correction, mul, qkv_attention, silu_mul,
 };
-use grim_backend_rocm::RocmDevice;
 use grim_tensor::{BackendDevice, BackendStorage, DType, Shape};
 
 /// End-to-end check that the feature-gated A/B dispatch in `RocmDevice`
@@ -28,7 +28,8 @@ fn cubecl_ab_dispatch_through_device_methods() {
     if std::env::var("GRIM_RUN_GPU_TESTS").is_err() {
         return;
     }
-    let dev = RocmDevice::new(0);
+    let dev = RocmDevice::try_new(0)
+        .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
 
     // ---- elementwise add through RocmDevice ----
     let n = 256usize;
@@ -130,9 +131,7 @@ fn cubecl_ab_dispatch_through_device_methods() {
     let w_s = dev.from_cpu(&w, &wsh, DType::F32).unwrap();
     let indices: Vec<u32> = vec![3, 1, 2, 0];
     let osh = Shape::from_slice(&[indices.len(), edim]);
-    let (out, _) = dev
-        .embedding(w_s.as_ref(), &indices, &osh)
-        .unwrap();
+    let (out, _) = dev.embedding(w_s.as_ref(), &indices, &osh).unwrap();
     let got_emb = out.to_cpu_vec_f32().unwrap();
     let mut want_emb = vec![0.0f32; indices.len() * edim];
     for (i, &r) in indices.iter().enumerate() {
@@ -179,13 +178,21 @@ fn cubecl_lifted_kernels_match_cpu_reference() {
     let want_add: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
     let ok = max_err(&got_add, &want_add) < 1e-3;
     all_ok &= ok;
-    println!("add: max_err={:.2e} ok={}", max_err(&got_add, &want_add), ok);
+    println!(
+        "add: max_err={:.2e} ok={}",
+        max_err(&got_add, &want_add),
+        ok
+    );
 
     let got_mul = mul(c, &a, &b);
     let want_mul: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x * y).collect();
     let ok = max_err(&got_mul, &want_mul) < 1e-3;
     all_ok &= ok;
-    println!("mul: max_err={:.2e} ok={}", max_err(&got_mul, &want_mul), ok);
+    println!(
+        "mul: max_err={:.2e} ok={}",
+        max_err(&got_mul, &want_mul),
+        ok
+    );
 
     let got_silu = silu_mul(c, &a, &b);
     let want_silu: Vec<f32> = a
@@ -232,19 +239,34 @@ fn cubecl_lifted_kernels_match_cpu_reference() {
     let cache = 0usize;
     for &hd in &[16usize, 64usize, 128usize] {
         let q: Vec<f32> = (0..seq * nh * hd).map(|i| (i as f32) * 0.1 - 2.0).collect();
-        let k: Vec<f32> = (0..kvl * nkv * hd).map(|i| (i as f32) * 0.13 - 1.0).collect();
-        let v: Vec<f32> = (0..kvl * nkv * hd).map(|i| (i as f32) * 0.17 - 0.5).collect();
+        let k: Vec<f32> = (0..kvl * nkv * hd)
+            .map(|i| (i as f32) * 0.13 - 1.0)
+            .collect();
+        let v: Vec<f32> = (0..kvl * nkv * hd)
+            .map(|i| (i as f32) * 0.17 - 0.5)
+            .collect();
         let got_qkv = qkv_attention(c, &q, &k, &v, nh, nkv, hd, seq, kvl, cache);
         let want_qkv = ref_causal(&q, &k, &v, nh, nkv, hd, seq, kvl, cache);
         let ok = max_err(&got_qkv, &want_qkv) < 1e-2;
         all_ok &= ok;
-        println!("qkv_attention(hd{hd}): max_err={:.2e} ok={}", max_err(&got_qkv, &want_qkv), ok);
+        println!(
+            "qkv_attention(hd{hd}): max_err={:.2e} ok={}",
+            max_err(&got_qkv, &want_qkv),
+            ok
+        );
     }
 
     // CPU reference: causal attention, one (i, h) head (proven in spike phase3).
     fn ref_causal(
-        q: &[f32], k: &[f32], v: &[f32], nh: usize, nkv: usize, hd: usize,
-        seq: usize, kvl: usize, cache: usize,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        seq: usize,
+        kvl: usize,
+        cache: usize,
     ) -> Vec<f32> {
         let mut out = vec![0.0f32; seq * nh * hd];
         let qpk = nh / nkv;
@@ -258,30 +280,41 @@ fn cubecl_lifted_kernels_match_cpu_reference() {
                 let mut l = 0.0f32;
                 let mut acc = vec![0.0f32; hd];
                 for j in 0..kvl {
-                    if j > abs_i { continue; }
+                    if j > abs_i {
+                        continue;
+                    }
                     let kvoff = (j * nkv + kvh) * hd;
                     let mut dot = 0.0f32;
-                    for d in 0..hd { dot += q[qoff + d] * k[kvoff + d]; }
+                    for d in 0..hd {
+                        dot += q[qoff + d] * k[kvoff + d];
+                    }
                     let s = dot * inv;
                     let w = (s - m).exp();
                     if s > m {
                         let corr = (m - s).exp();
-                        for d in 0..hd { acc[d] *= corr; }
+                        for d in 0..hd {
+                            acc[d] *= corr;
+                        }
                         l *= corr;
                         m = s;
-                        for d in 0..hd { acc[d] += v[kvoff + d]; }
+                        for d in 0..hd {
+                            acc[d] += v[kvoff + d];
+                        }
                         l += 1.0;
                     } else {
-                        for d in 0..hd { acc[d] += w * v[kvoff + d]; }
+                        for d in 0..hd {
+                            acc[d] += w * v[kvoff + d];
+                        }
                         l += w;
                     }
                 }
-                for d in 0..hd { out[qoff + d] = acc[d] / l; }
+                for d in 0..hd {
+                    out[qoff + d] = acc[d] / l;
+                }
             }
         }
         out
     }
-
 
     let rows = 6usize;
     let cols = 16usize;
@@ -321,5 +354,8 @@ fn cubecl_lifted_kernels_match_cpu_reference() {
         ok
     );
 
-    assert!(all_ok, "one or more lifted cubecl kernels diverged from CPU ref");
+    assert!(
+        all_ok,
+        "one or more lifted cubecl kernels diverged from CPU ref"
+    );
 }

@@ -90,9 +90,12 @@ serde_json = "1"
 rand = "0.10"
 
 [workspace.features]
-rocm = ["grim-backend-rocm"]
+rocm = ["grim-backend-rocm/rccl"]
 
 [profile.release]
 opt-level = 3
 lto       = "thin"
 codegen-units = 1
+
+[patch.crates-io]
+convert_case = { path = "third-party/convert_case-0.10.1" }

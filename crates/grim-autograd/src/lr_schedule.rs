@@ -32,7 +32,8 @@ impl CosineWarmupSchedule {
         } else {
             let decay_steps = (self.total_steps - self.warmup_steps).max(1) as f32;
             let current_decay_step = (step - self.warmup_steps) as f32;
-            let cosine = 0.5 * (1.0 + (std::f32::consts::PI * current_decay_step / decay_steps).cos());
+            let cosine =
+                0.5 * (1.0 + (std::f32::consts::PI * current_decay_step / decay_steps).cos());
             self.min_lr + (self.base_lr - self.min_lr) * cosine
         }
     }

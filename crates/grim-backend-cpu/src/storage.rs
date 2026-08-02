@@ -1,28 +1,39 @@
-//! CPU-side tensor storage: a contiguous `Vec<f32>` on the host.
+//! CPU tensor storage: contiguous `Vec<f32>` on the host.
 
 use std::sync::Arc;
 
 use grim_tensor::dtype::QuantProvenance;
 use grim_tensor::{DType, Shape};
 
-/// CPU buffer holding contiguous `f32` data. This is the v1 storage
-/// type for the CPU backend; quantized and half-precision backends
-/// will introduce separate storage variants owned by those crates.
+/// Contiguous `f32` buffer. v1 storage; quantized/half-precision in own crates.
 #[derive(Debug, Clone)]
 pub struct CpuStorage {
     pub(crate) data: Arc<Vec<f32>>,
     pub(crate) shape: Shape,
     pub(crate) dtype: DType,
     pub(crate) provenance: QuantProvenance,
+    pub(crate) quant_scales: Option<Vec<f32>>,
 }
 
 impl CpuStorage {
     pub fn new(data: Vec<f32>, shape: Shape, dtype: DType) -> Self {
-        Self { data: Arc::new(data), shape, dtype, provenance: QuantProvenance::GrimNative }
+        Self {
+            data: Arc::new(data),
+            shape,
+            dtype,
+            provenance: QuantProvenance::GrimNative,
+            quant_scales: None,
+        }
     }
 
     pub fn from_arc(data: Arc<Vec<f32>>, shape: Shape, dtype: DType) -> Self {
-        Self { data, shape, dtype, provenance: QuantProvenance::GrimNative }
+        Self {
+            data,
+            shape,
+            dtype,
+            provenance: QuantProvenance::GrimNative,
+            quant_scales: None,
+        }
     }
 
     pub fn data(&self) -> &[f32] {
@@ -35,6 +46,11 @@ impl CpuStorage {
 
     pub fn with_provenance(mut self, provenance: QuantProvenance) -> Self {
         self.provenance = provenance;
+        self
+    }
+
+    pub fn with_quant_scales(mut self, scales: Vec<f32>) -> Self {
+        self.quant_scales = Some(scales);
         self
     }
 }

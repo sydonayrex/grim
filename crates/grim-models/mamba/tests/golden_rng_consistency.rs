@@ -12,8 +12,8 @@ fn golden_rng_deterministic_seed_identity() {
     // Seed = 0x0000_0000_DEAD_BEEF.
     // Changes here should ONLY happen if the algorithm changes deliberately.
     let expected = [
-        0.21785907, 0.08779941, 0.66758688, 0.89803026,
-        0.24182903, 0.55162399, 0.93937888, 0.38869425,
+        0.21785907, 0.08779941, 0.66758688, 0.89803026, 0.24182903, 0.55162399, 0.93937888,
+        0.38869425,
     ];
 
     for (i, (got, want)) in values.iter().zip(expected.iter()).enumerate() {
@@ -31,11 +31,7 @@ fn golden_rng_deterministic_seed_identity() {
 #[test]
 fn golden_rng_remove_duplicate_impls() {
     let output = Command::new("rg")
-        .args([
-            "-c",
-            "struct SimpleRng",
-            "crates/grim-models/",
-        ])
+        .args(["-c", "struct SimpleRng", "crates/grim-models/"])
         .current_dir(workspace_root())
         .output()
         .expect("ripgrep check");

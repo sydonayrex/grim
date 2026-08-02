@@ -1,21 +1,11 @@
-//! Block quantizers for Grim. Each format stores a block of weights as
-//! low-bit integers plus per-block scale (and optionally min for asymmetric).
-//!
-//! Q8_0: 8-bit symmetric, block size 32 — one f16 scale per 32 values.
-//! Q4_K: llama.cpp K-quant, block size 32 — 6-bit super-block scale,
-//!       4-bit sub-block values, per-sub-block scale.
-//! GPTQ Group-INT: Grouped asymmetric quantization (EfficientQAT) with 2/3/4/8-bit variants.
-//!   - 3-bit uses cross-word packing: 32 values across 3 u32 words (96 bits)
-//!
-//! Phase 2 (`.grim` oxidizer): Importance-matrix calibration and refined scale fitting.
-//! Phase 3 (`.grim` oxidizer): EvoPress evolutionary per-tensor bitwidth search.
+//! Quantization routines (Q4_K, Q8_0, NF4, FP8, MXFP4/8, GPTQ, SPQR, SoulEater, IQ1-4).
 
 use grim_tensor::error::{Error, Result};
 
-pub mod spqr;
 pub mod soul_eater;
+pub mod spqr;
 
-pub use spqr::{spqr_identify_salient, SpqrSalientResidual};
+pub use spqr::{SpqrSalientResidual, spqr_identify_salient};
 
 pub const BLOCK_SIZE_Q8: usize = 32;
 pub const BLOCK_SIZE_Q4_K: usize = 32;
@@ -61,13 +51,13 @@ pub struct RewrittenTensorData {
 }
 
 /// Dequantize grouped INT weights (EfficientQAT/GPTQ format).
-/// 
+///
 /// # Layout
 /// - `qweight`: packed low-bit weights (strided)
 /// - `qzeros`: per-group zero-points (uint16 for 2/3/4-bit, uint8 for 8-bit)
 /// - `scales`: per-group scales (f32 or f16)
 /// - `g_idx`: sequential group indices (EfficientQAT) or permutation (classic GPTQ)
-/// 
+///
 /// # 3-bit cross-word packing
 /// 32 values are packed across 3 consecutive u32 words using GPTQ/BitBLAS layout:
 /// values 0-10 in word 0, 11-21 in word 1, 22-31 in word 2
@@ -82,9 +72,9 @@ pub fn dequant_gptq_group_int(
 ) -> Result<Vec<f32>> {
     let in_features = shape[0];
     let out_features = shape[1];
-    
+
     let mut out = vec![0.0f32; in_features * out_features];
-    
+
     let values_per_word = match bits {
         2 => 16,
         3 => 32,
@@ -92,7 +82,7 @@ pub fn dequant_gptq_group_int(
         8 => 1,
         _ => return Err(Error::Backend(format!("unsupported GPTQ bits: {bits}"))),
     };
-    
+
     let read_u32 = |bytes: &[u8], word_idx: usize| -> u32 {
         let offset = word_idx * 4;
         if offset + 4 <= bytes.len() {
@@ -106,17 +96,28 @@ pub fn dequant_gptq_group_int(
             0
         }
     };
-    
+
     let get_group = |in_idx: usize| -> usize {
         if let Some(bytes) = g_idx {
             if bytes.len() == in_features * 4 {
                 let offset = in_idx * 4;
-                u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]) as usize
+                u32::from_le_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                ]) as usize
             } else if bytes.len() == in_features * 8 {
                 let offset = in_idx * 8;
                 u64::from_le_bytes([
-                    bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
-                    bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                    bytes[offset + 4],
+                    bytes[offset + 5],
+                    bytes[offset + 6],
+                    bytes[offset + 7],
                 ]) as usize
             } else {
                 in_idx / group_size
@@ -127,10 +128,10 @@ pub fn dequant_gptq_group_int(
     };
 
     let words_per_row_zeros = (out_features + values_per_word - 1) / values_per_word;
-    
+
     for in_idx in 0..in_features {
         let g = get_group(in_idx);
-        
+
         for out_idx in 0..out_features {
             // Read scale
             let scale_idx = g * out_features + out_idx;
@@ -144,7 +145,7 @@ pub fn dequant_gptq_group_int(
             } else {
                 1.0f32
             };
-            
+
             // Read zero-point
             let zero = if bits == 3 {
                 let super_idx = out_idx / 32;
@@ -163,7 +164,7 @@ pub fn dequant_gptq_group_int(
                 let zero_val = (zero_word >> bit_offset) & ((1 << bits) - 1);
                 (zero_val + 1) as f32
             };
-            
+
             // Read quantized code
             let quantized_code = if bits == 3 {
                 let super_idx = in_idx / 32;
@@ -180,11 +181,11 @@ pub fn dequant_gptq_group_int(
                 let bit_offset = (in_idx % values_per_word) * bits as usize;
                 (word >> bit_offset) & ((1 << bits) - 1)
             };
-            
+
             out[in_idx * out_features + out_idx] = (quantized_code as f32 - zero) * scale;
         }
     }
-    
+
     Ok(out)
 }
 
@@ -224,9 +225,22 @@ const BLOCK_Q8_WEIGHTS: usize = 32;
 /// The sign comes from the per-weight `q8` bit; the magnitude comes from this
 /// table indexed by the 4-bit `q4` code.
 const IQ4_NL_CODEBOOK: [f32; 16] = [
-    0.0, 0.113_141_26, 0.243_736_04, 0.397_433_65, 0.565_743_55, 0.722_941_40, 0.897_054_55,
-    1.075_762_85, 1.294_598_81, 1.528_519_04, 1.826_856_33, 2.270_011_30, 3.237_191_19,
-    5.508_296_01, 1.041_625_59_e1, 3.456_950_92_e1,
+    0.0,
+    0.113_141_26,
+    0.243_736_04,
+    0.397_433_65,
+    0.565_743_55,
+    0.722_941_40,
+    0.897_054_55,
+    1.075_762_85,
+    1.294_598_81,
+    1.528_519_04,
+    1.826_856_33,
+    2.270_011_30,
+    3.237_191_19,
+    5.508_296_01,
+    1.041_625_59_e1,
+    3.456_950_92_e1,
 ];
 
 /// Dequantize IQ4_NL (llama.cpp importance-matrix 4-bit) bytes to f32.
@@ -711,12 +725,18 @@ pub fn dequant_q5k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
             let (sc4, m4) = get_scale_min_k4(sb_base + 3, scales);
 
             for l in 0..32 {
-                let q1 = ((qs[qs_idx + l + 0] & 0x0F) | (if (qh[l] & u1) != 0 { 16 } else { 0 })) as f32;
-                let q2 = ((qs[qs_idx + l + 32] & 0x0F) | (if (qh[l] & u2) != 0 { 16 } else { 0 })) as f32;
-                let q3 = ((qs[qs_idx + l + 0] >> 4) | (if (qh[l] & (u1 << 2)) != 0 { 16 } else { 0 })) as f32;
-                let q4 = ((qs[qs_idx + l + 32] >> 4) | (if (qh[l] & (u2 << 2)) != 0 { 16 } else { 0 })) as f32;
+                let q1 =
+                    ((qs[qs_idx + l + 0] & 0x0F) | (if (qh[l] & u1) != 0 { 16 } else { 0 })) as f32;
+                let q2 = ((qs[qs_idx + l + 32] & 0x0F) | (if (qh[l] & u2) != 0 { 16 } else { 0 }))
+                    as f32;
+                let q3 = ((qs[qs_idx + l + 0] >> 4)
+                    | (if (qh[l] & (u1 << 2)) != 0 { 16 } else { 0 }))
+                    as f32;
+                let q4 = ((qs[qs_idx + l + 32] >> 4)
+                    | (if (qh[l] & (u2 << 2)) != 0 { 16 } else { 0 }))
+                    as f32;
 
-                block_out[l + 0]  = d * sc1 * q1 - dmin * m1;
+                block_out[l + 0] = d * sc1 * q1 - dmin * m1;
                 block_out[l + 32] = d * sc2 * q2 - dmin * m2;
                 block_out[l + 64] = d * sc3 * q3 - dmin * m3;
                 block_out[l + 96] = d * sc4 * q4 - dmin * m4;
@@ -770,16 +790,18 @@ pub fn dequant_q6k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
             for l in 0..32 {
                 let is = l / 16;
                 let q1 = ((ql[ql_idx + l] & 0x0F) | ((qh[qh_idx + l] & 0x03) << 4)) as f32 - 32.0;
-                let q2 = ((ql[ql_idx + l + 32] & 0x0F) | ((qh[qh_idx + l] & 0x0C) << 2)) as f32 - 32.0;
+                let q2 =
+                    ((ql[ql_idx + l + 32] & 0x0F) | ((qh[qh_idx + l] & 0x0C) << 2)) as f32 - 32.0;
                 let q3 = ((ql[ql_idx + l] >> 4) | ((qh[qh_idx + l] & 0x30) >> 0)) as f32 - 32.0;
-                let q4 = ((ql[ql_idx + l + 32] >> 4) | ((qh[qh_idx + l] & 0xC0) >> 2)) as f32 - 32.0;
+                let q4 =
+                    ((ql[ql_idx + l + 32] >> 4) | ((qh[qh_idx + l] & 0xC0) >> 2)) as f32 - 32.0;
 
                 let sc1 = scales[sc_idx + is + 0] as i8 as f32;
                 let sc2 = scales[sc_idx + is + 2] as i8 as f32;
                 let sc3 = scales[sc_idx + is + 4] as i8 as f32;
                 let sc4 = scales[sc_idx + is + 6] as i8 as f32;
 
-                block_out[l + 0]  = d * sc1 * q1;
+                block_out[l + 0] = d * sc1 * q1;
                 block_out[l + 32] = d * sc2 * q2;
                 block_out[l + 64] = d * sc3 * q3;
                 block_out[l + 96] = d * sc4 * q4;
@@ -833,17 +855,21 @@ pub fn dequant_q2k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
             let mut block_out = [0.0f32; 128];
             for l in 0..32 {
                 let is = l / 16;
-                let sc1 = (scales[sc_idx + is + 0] & 0x0F) as f32; let m1 = (scales[sc_idx + is + 0] >> 4) as f32;
-                let sc2 = (scales[sc_idx + is + 2] & 0x0F) as f32; let m2 = (scales[sc_idx + is + 2] >> 4) as f32;
-                let sc3 = (scales[sc_idx + is + 4] & 0x0F) as f32; let m3 = (scales[sc_idx + is + 4] >> 4) as f32;
-                let sc4 = (scales[sc_idx + is + 6] & 0x0F) as f32; let m4 = (scales[sc_idx + is + 6] >> 4) as f32;
+                let sc1 = (scales[sc_idx + is + 0] & 0x0F) as f32;
+                let m1 = (scales[sc_idx + is + 0] >> 4) as f32;
+                let sc2 = (scales[sc_idx + is + 2] & 0x0F) as f32;
+                let m2 = (scales[sc_idx + is + 2] >> 4) as f32;
+                let sc3 = (scales[sc_idx + is + 4] & 0x0F) as f32;
+                let m3 = (scales[sc_idx + is + 4] >> 4) as f32;
+                let sc4 = (scales[sc_idx + is + 6] & 0x0F) as f32;
+                let m4 = (scales[sc_idx + is + 6] >> 4) as f32;
 
                 let q1 = ((qs[qs_idx + l + 0] >> 0) & 3) as f32;
                 let q2 = ((qs[qs_idx + l + 32] >> 0) & 3) as f32;
                 let q3 = ((qs[qs_idx + l + 0] >> 2) & 3) as f32;
                 let q4 = ((qs[qs_idx + l + 32] >> 2) & 3) as f32;
 
-                block_out[l + 0]  = d * sc1 * q1 - dmin * m1;
+                block_out[l + 0] = d * sc1 * q1 - dmin * m1;
                 block_out[l + 32] = d * sc2 * q2 - dmin * m2;
                 block_out[l + 64] = d * sc3 * q3 - dmin * m3;
                 block_out[l + 96] = d * sc4 * q4 - dmin * m4;
@@ -907,19 +933,25 @@ pub fn dequant_q3k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 
             let q1 = ((qs[l + 0] & 3) | (if (hm & 0x01) != 0 { 0 } else { 4 })) as f32 - 4.0;
             let q2 = ((qs[l + 32] & 3) | (if (hm & 0x02) != 0 { 0 } else { 4 })) as f32 - 4.0;
-            let q3 = (((qs[l + 0] & 12) >> 2) | (if (hm & 0x04) != 0 { 0 } else { 4 })) as f32 - 4.0;
-            let q4 = (((qs[l + 32] & 12) >> 2) | (if (hm & 0x08) != 0 { 0 } else { 4 })) as f32 - 4.0;
+            let q3 =
+                (((qs[l + 0] & 12) >> 2) | (if (hm & 0x04) != 0 { 0 } else { 4 })) as f32 - 4.0;
+            let q4 =
+                (((qs[l + 32] & 12) >> 2) | (if (hm & 0x08) != 0 { 0 } else { 4 })) as f32 - 4.0;
 
-            let q5 = (((qs[l + 0] & 48) >> 4) | (if (hm & 0x10) != 0 { 0 } else { 4 })) as f32 - 4.0;
-            let q6 = (((qs[l + 32] & 48) >> 4) | (if (hm & 0x20) != 0 { 0 } else { 4 })) as f32 - 4.0;
-            let q7 = (((qs[l + 0] & 192) >> 6) | (if (hm & 0x40) != 0 { 0 } else { 4 })) as f32 - 4.0;
-            let q8 = (((qs[l + 32] & 192) >> 6) | (if (hm & 0x80) != 0 { 0 } else { 4 })) as f32 - 4.0;
+            let q5 =
+                (((qs[l + 0] & 48) >> 4) | (if (hm & 0x10) != 0 { 0 } else { 4 })) as f32 - 4.0;
+            let q6 =
+                (((qs[l + 32] & 48) >> 4) | (if (hm & 0x20) != 0 { 0 } else { 4 })) as f32 - 4.0;
+            let q7 =
+                (((qs[l + 0] & 192) >> 6) | (if (hm & 0x40) != 0 { 0 } else { 4 })) as f32 - 4.0;
+            let q8 =
+                (((qs[l + 32] & 192) >> 6) | (if (hm & 0x80) != 0 { 0 } else { 4 })) as f32 - 4.0;
 
-            block_out[l + 0]   = d * sc[is + 0]  * q1;
-            block_out[l + 32]  = d * sc[is + 2]  * q2;
-            block_out[l + 64]  = d * sc[is + 4]  * q3;
-            block_out[l + 96]  = d * sc[is + 6]  * q4;
-            block_out[l + 128] = d * sc[is + 8]  * q5;
+            block_out[l + 0] = d * sc[is + 0] * q1;
+            block_out[l + 32] = d * sc[is + 2] * q2;
+            block_out[l + 64] = d * sc[is + 4] * q3;
+            block_out[l + 96] = d * sc[is + 6] * q4;
+            block_out[l + 128] = d * sc[is + 8] * q5;
             block_out[l + 160] = d * sc[is + 10] * q6;
             block_out[l + 192] = d * sc[is + 12] * q7;
             block_out[l + 224] = d * sc[is + 14] * q8;
@@ -940,22 +972,22 @@ pub fn dequant_q3k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 /// Layout: bit3=sign, bits[2:1]=exponent, bit0=mantissa
 /// Codes 0-7 map to values -1.0 to 0.0, codes 8-15 map to values 0.125 to 0.875
 const FP4_E2M1_LUT: [f32; 16] = [
-    -1.0,      // 0000 -> -1.0
-    -0.875,    // 0001
-    -0.75,     // 0010
-    -0.625,    // 0011
-    -0.5,      // 0100
-    -0.375,    // 0101
-    -0.25,     // 0110
-    -0.125,    // 0111
-    0.0,       // 1000 -> 0.0
-    0.125,     // 1001
-    0.25,      // 1010
-    0.375,     // 1011
-    0.5,       // 1100
-    0.625,     // 1101
-    0.75,      // 1110
-    0.875,     // 1111 -> +0.875
+    -1.0,   // 0000 -> -1.0
+    -0.875, // 0001
+    -0.75,  // 0010
+    -0.625, // 0011
+    -0.5,   // 0100
+    -0.375, // 0101
+    -0.25,  // 0110
+    -0.125, // 0111
+    0.0,    // 1000 -> 0.0
+    0.125,  // 1001
+    0.25,   // 1010
+    0.375,  // 1011
+    0.5,    // 1100
+    0.625,  // 1101
+    0.75,   // 1110
+    0.875,  // 1111 -> +0.875
 ];
 
 /// Dequantize FP4 E2M1 bytes to f32.
@@ -966,12 +998,12 @@ pub fn dequant_fp4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     } else {
         1.0
     };
-    
+
     let data_start = if data.len() >= 8 { 4 } else { 0 };
     for (i, &byte) in data[data_start..].iter().enumerate() {
         let hi = FP4_E2M1_LUT[(byte >> 4) as usize] * scale;
         let lo = FP4_E2M1_LUT[(byte & 0x0F) as usize] * scale;
-        
+
         let idx = i * 2;
         if idx < num_values {
             out.push(hi);
@@ -1008,10 +1040,10 @@ pub fn dequant_fp4_block16(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
         let block_scale = fp8_e4m3_to_f32(block_scale_fp8);
         let scale = block_scale * global_scale;
         pos += 1;
-        
+
         let block_rem = num_values - b * 16;
         let block_len = block_rem.min(16);
-        
+
         for i in 0..8 {
             if pos + i >= data.len() {
                 break;
@@ -1019,7 +1051,7 @@ pub fn dequant_fp4_block16(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
             let byte = data[pos + i];
             let hi = FP4_E2M1_LUT[(byte >> 4) as usize] * scale;
             let lo = FP4_E2M1_LUT[(byte & 0x0F) as usize] * scale;
-            
+
             let idx = i * 2;
             if idx < block_len {
                 out.push(hi);
@@ -1079,10 +1111,10 @@ pub fn dequant_fp8_block16(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
         let block_scale = fp8_e4m3_to_f32(block_scale_fp8);
         let scale = block_scale * global_scale;
         pos += 1;
-        
+
         let block_rem = num_values - b * 16;
         let block_len = block_rem.min(16);
-        
+
         for i in 0..block_len {
             if pos + i >= data.len() {
                 break;
@@ -1098,26 +1130,149 @@ pub fn dequant_fp8_block16(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// NF4 (normalized float-4) lookup table.
-/// Quanto-style NF4: asymmetric 4-bit quantization optimized for normally-distributed weights.
-/// Values range from -1 to 1 with finer granularity near zero.
-const NF4_LUT: [f32; 16] = [
-    -1.0,        // 0000
-    -0.69921875, // 0001 ≈ -1/√2
-    -0.5,        // 0010 = -0.5
-    -0.400390625, // 0011
-    -0.31640625,  // 0100 ≈ -0.316
-    -0.23828125,  // 0101
-    -0.166015625, // 0110
-    -0.10009765625, // 0111
-    0.10009765625,  // 1000
-    0.166015625,    // 1001
-    0.23828125,    // 1010
-    0.31640625,    // 1011
-    0.400390625,   // 1100
-    0.5,           // 1101
-    0.69921875,    // 1110 ≈ 1/√2
-    1.0,           // 1111
+/// Dequantize MXFP4 (OCP Microscaling, Jay tier) single-buffer bytes to f32.
+///
+/// # Layout
+/// Length-prefixed segments (same framing as the GPTQ group-int fix):
+/// - `[u64 LE]` codes_len
+/// - `codes`: packed E2M1 4-bit codes, 2 per byte. Element `i` of a group is
+///   in the low nibble when `i` is even and the high nibble when odd, matching
+///   the ROCm `grim_dequant_mxfp4` kernel.
+/// - `[u64 LE]` exps_len
+/// - `exps`: one E8M0 shared exponent byte per 32-element group.
+pub fn dequant_mxfp4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
+    if num_values == 0 {
+        return Ok(Vec::new());
+    }
+    let mut cursor = 0usize;
+    let read_segment = |bytes: &[u8], cursor: &mut usize| -> Result<Vec<u8>> {
+        if bytes.len() < *cursor + 8 {
+            return Err(Error::Backend(
+                "Truncated MXFP4 segment length prefix".into(),
+            ));
+        }
+        let len = u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap()) as usize;
+        *cursor += 8;
+        if bytes.len() < *cursor + len {
+            return Err(Error::Backend(format!(
+                "Truncated MXFP4 segment (expected {len} bytes)"
+            )));
+        }
+        let segment = bytes[*cursor..*cursor + len].to_vec();
+        *cursor += len;
+        Ok(segment)
+    };
+
+    let codes = read_segment(data, &mut cursor)?;
+    let exps = read_segment(data, &mut cursor)?;
+
+    let num_groups = num_values.div_ceil(32);
+    if exps.len() < num_groups {
+        return Err(Error::Backend(format!(
+            "MXFP4: expected {num_groups} shared-exponent groups, got {}",
+            exps.len()
+        )));
+    }
+    if codes.len() < num_values.div_ceil(2) {
+        return Err(Error::Backend(format!(
+            "MXFP4: expected {} packed code bytes, got {}",
+            num_values.div_ceil(2),
+            codes.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(num_values);
+    for i in 0..num_values {
+        let group_idx = i / 32;
+        let shared_exp = exps[group_idx];
+        let code_byte = codes[i / 2];
+        let code = if i % 2 == 0 {
+            code_byte & 0x0F
+        } else {
+            (code_byte >> 4) & 0x0F
+        };
+        out.push(mxfp4_e2m1_to_f32(code, shared_exp));
+    }
+    Ok(out)
+}
+
+/// Dequantize MXFP8 (OCP Microscaling, Magpie tier) single-buffer bytes to f32.
+///
+/// # Layout
+/// Length-prefixed segments (same framing as the GPTQ group-int fix):
+/// - `[u64 LE]` codes_len
+/// - `codes`: one E4M3 FP8 code byte per element.
+/// - `[u64 LE]` exps_len
+/// - `exps`: one E8M0 shared exponent byte per 32-element group.
+pub fn dequant_mxfp8(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
+    if num_values == 0 {
+        return Ok(Vec::new());
+    }
+    let mut cursor = 0usize;
+    let read_segment = |bytes: &[u8], cursor: &mut usize| -> Result<Vec<u8>> {
+        if bytes.len() < *cursor + 8 {
+            return Err(Error::Backend(
+                "Truncated MXFP8 segment length prefix".into(),
+            ));
+        }
+        let len = u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap()) as usize;
+        *cursor += 8;
+        if bytes.len() < *cursor + len {
+            return Err(Error::Backend(format!(
+                "Truncated MXFP8 segment (expected {len} bytes)"
+            )));
+        }
+        let segment = bytes[*cursor..*cursor + len].to_vec();
+        *cursor += len;
+        Ok(segment)
+    };
+
+    let codes = read_segment(data, &mut cursor)?;
+    let exps = read_segment(data, &mut cursor)?;
+
+    let num_groups = num_values.div_ceil(32);
+    if exps.len() < num_groups {
+        return Err(Error::Backend(format!(
+            "MXFP8: expected {num_groups} shared-exponent groups, got {}",
+            exps.len()
+        )));
+    }
+    if codes.len() < num_values {
+        return Err(Error::Backend(format!(
+            "MXFP8: expected {num_values} code bytes, got {}",
+            codes.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(num_values);
+    for i in 0..num_values {
+        let group_idx = i / 32;
+        let shared_exp = exps[group_idx];
+        let exp_scale = (2.0f32).powi(shared_exp as i32 - 127);
+        out.push(fp8_e4m3_to_f32(codes[i]) * exp_scale);
+    }
+    Ok(out)
+}
+
+/// Canonical NF4 (normalized float-4) lookup table (bitsandbytes / QLoRA standard).
+/// 16 quantiles of the standard normal distribution N(0, 1) scaled to [-1, 1].
+pub const NF4_LUT: [f32; 16] = [
+    -1.0,
+    -0.6961928,
+    -0.5251143,
+    -0.3949175,
+    -0.2844414,
+    -0.18477343,
+    -0.091050036,
+    0.0,
+    0.0795803,
+    0.1609302,
+    0.2461123,
+    0.33791524,
+    0.44070983,
+    0.562617,
+    0.72295684,
+    1.0,
 ];
 
 /// Dequantize NF4 (normalized float-4) bytes to f32.
@@ -1125,19 +1280,19 @@ const NF4_LUT: [f32; 16] = [
 /// Layout: packed 4-bit values, one f32 scale per tensor.
 pub fn dequant_nf4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     let mut out = Vec::with_capacity(num_values);
-    
+
     // Read global scale from first 4 bytes (default to 1.0)
     let scale = if data.len() >= 4 {
         f32::from_le_bytes([data[0], data[1], data[2], data[3]])
     } else {
         1.0
     };
-    
+
     // Decode packed NF4 values starting at byte 4
     for (i, &byte) in data[4..].iter().enumerate() {
         let hi = NF4_LUT[(byte >> 4) as usize] * scale;
         let lo = NF4_LUT[(byte & 0x0F) as usize] * scale;
-        
+
         let idx = i * 2;
         if idx < num_values {
             out.push(hi);
@@ -1146,7 +1301,7 @@ pub fn dequant_nf4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
             out.push(lo);
         }
     }
-    
+
     Ok(out)
 }
 
@@ -1161,29 +1316,24 @@ pub fn fp8_e4m3_to_f32(byte: u8) -> f32 {
     let sign = (byte & 0x80) as i32;
     let exp = ((byte >> 3) & 0x0F) as i32;
     let mant = (byte & 0x07) as i32;
-    
+
     if exp == 0xF {
         if mant == 7 {
             return f32::NAN;
         }
-        // E4M3 max finite value bit pattern is 0x7E / 0xFE (exp 15, mant 6) -> ~448.0
         let val = 448.0f32;
         return if sign != 0 { -val } else { val };
     }
-    
-    let mut result = (mant as f32) / 8.0 + 1.0; // Add implicit leading 1 for normalized
+
+    let mut result = (mant as f32) / 8.0 + 1.0;
     if exp != 0 {
-        // Normalized: multiply by 2^(exp - bias)
         result *= 2f32.powi(exp - FP8_E4M3_BIAS);
     } else {
-        // Subnormal: no implicit leading bit (value = mant/8 * 2^-6 = mant / 512)
         result = (mant as f32) / 512.0;
     }
-    
+
     if sign != 0 { -result } else { result }
 }
-
-
 
 fn f16_to_f32(lo: u8, hi: u8) -> f32 {
     let bits = u16::from_le_bytes([lo, hi]);
@@ -1232,7 +1382,7 @@ pub fn quant_q80(data: &[f32]) -> Result<Vec<u8>> {
 
 /// Quantize a slice of f32 values to Q4_K bytes per the ggml super-block format.
 ///
-/// Encodes 256-weight blocks into 144-byte Q4_K super-blocks.
+/// Encodes 256-weight blocks into 144-byte Q4_K super-blocks using 6-bit sub-block scale and min packing.
 pub fn quant_q4k(data: &[f32]) -> Result<Vec<u8>> {
     const BLOCK_SIZE: usize = 256;
     const BLOCK_BYTES: usize = 144;
@@ -1245,28 +1395,90 @@ pub fn quant_q4k(data: &[f32]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(num_blocks * BLOCK_BYTES);
 
     for block in data.chunks(BLOCK_SIZE) {
-        let max_abs = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-        let d = if max_abs == 0.0 { 1.0 } else { max_abs / 15.0 };
-        let d_bytes = f32_to_f16(d).to_le_bytes();
-        let dmin_bytes = f32_to_f16(0.0).to_le_bytes();
-
-        out.extend_from_slice(&d_bytes);
-        out.extend_from_slice(&dmin_bytes);
-
-        // scales: sc_i = 1, m_i = 0 for i=0..7
-        let scales: [u8; 12] = [1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1];
-        out.extend_from_slice(&scales);
-
-        // 128 bytes qs for 256 weights
         let mut block_data = [0.0f32; 256];
         block_data[..block.len()].copy_from_slice(block);
+
+        let mut sub_d1 = [0.0f32; 8];
+        let mut sub_m1 = [0.0f32; 8];
+        let mut max_d1 = 0.0f32;
+        let mut max_m1 = 0.0f32;
+
+        for s in 0..8 {
+            let sub = &block_data[s * 32..(s + 1) * 32];
+            let min_v = sub.iter().copied().fold(f32::INFINITY, f32::min);
+            let max_v = sub.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+
+            let m1 = if min_v < 0.0 { -min_v } else { 0.0 };
+            let d1 = if min_v < 0.0 {
+                (max_v - min_v) / 15.0
+            } else {
+                max_v.max(0.0) / 15.0
+            };
+
+            sub_m1[s] = m1;
+            sub_d1[s] = d1;
+
+            if d1 > max_d1 {
+                max_d1 = d1;
+            }
+            if m1 > max_m1 {
+                max_m1 = m1;
+            }
+        }
+
+        let d = if max_d1 == 0.0 { 1.0 } else { max_d1 / 63.0 };
+        let min = if max_m1 == 0.0 { 0.0 } else { max_m1 / 63.0 };
+
+        let d_bytes = f32_to_f16(d).to_le_bytes();
+        let min_bytes = f32_to_f16(min).to_le_bytes();
+
+        out.extend_from_slice(&d_bytes);
+        out.extend_from_slice(&min_bytes);
+
+        let mut sc_u8 = [0u8; 8];
+        let mut m_u8 = [0u8; 8];
+        for s in 0..8 {
+            let sc_val = if d > 0.0 {
+                (sub_d1[s] / d).round().clamp(1.0, 63.0) as u8
+            } else {
+                1
+            };
+            let m_val = if min > 0.0 {
+                (sub_m1[s] / min).round().clamp(0.0, 63.0) as u8
+            } else {
+                0
+            };
+            sc_u8[s] = sc_val;
+            m_u8[s] = m_val;
+        }
+
+        let scales_bytes = pack_scale_min_k4(&sc_u8, &m_u8);
+        out.extend_from_slice(&scales_bytes);
 
         for k in 0..4 {
             for j in 0..32 {
                 let v1 = block_data[64 * k + j];
                 let v2 = block_data[64 * k + 32 + j];
-                let q1 = (v1 / d).round().clamp(0.0, 15.0) as u8;
-                let q2 = (v2 / d).round().clamp(0.0, 15.0) as u8;
+
+                let is1 = 2 * k;
+                let is2 = 2 * k + 1;
+
+                let d1 = d * sc_u8[is1] as f32;
+                let m1 = min * m_u8[is1] as f32;
+                let d2 = d * sc_u8[is2] as f32;
+                let m2 = min * m_u8[is2] as f32;
+
+                let q1 = if d1 > 0.0 {
+                    ((v1 + m1) / d1).round().clamp(0.0, 15.0) as u8
+                } else {
+                    0
+                };
+                let q2 = if d2 > 0.0 {
+                    ((v2 + m2) / d2).round().clamp(0.0, 15.0) as u8
+                } else {
+                    0
+                };
+
                 out.push(q1 | (q2 << 4));
             }
         }
@@ -1275,10 +1487,20 @@ pub fn quant_q4k(data: &[f32]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[inline]
+fn pack_scale_min_k4(scales_sc: &[u8; 8], scales_m: &[u8; 8]) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    for j in 0..4 {
+        out[j] = (scales_sc[j] & 63) | (((scales_sc[j + 4] >> 4) & 3) << 6);
+        out[j + 4] = (scales_m[j] & 63) | (((scales_m[j + 4] >> 4) & 3) << 6);
+        out[j + 8] = (scales_sc[j + 4] & 0x0F) | ((scales_m[j + 4] & 0x0F) << 4);
+    }
+    out
+}
+
 pub fn quant_q5k(data: &[f32]) -> Result<Vec<u8>> {
     quant_packed_symmetric(data, 5, None, None, None)
 }
-
 
 pub fn quant_q6k(data: &[f32]) -> Result<Vec<u8>> {
     quant_packed_symmetric(data, 6, None, None, None)
@@ -1289,15 +1511,13 @@ pub fn quant_q6k(data: &[f32]) -> Result<Vec<u8>> {
 /// Output: f32 scale followed by packed FP4 bytes.
 pub fn quant_fp4(data: &[f32]) -> Result<Vec<u8>> {
     // Find scale using max absolute value mapped to FP4 range
-    let max_abs = data.iter()
-        .map(|v| v.abs())
-        .fold(0.0f32, f32::max);
+    let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
     // FP4 max representable is 1.0 with our LUT
     let scale = if max_abs == 0.0 { 1.0 } else { max_abs };
-    
+
     let mut out = Vec::with_capacity(4 + (data.len() + 1) / 2);
     out.extend_from_slice(&scale.to_le_bytes());
-    
+
     let mut packed_byte = 0u8;
     for (i, &v) in data.iter().enumerate() {
         // Map f32 value to nearest FP4 code (using our LUT: 0=-1.0, 7=0.0, 15=+0.875)
@@ -1335,7 +1555,7 @@ pub fn quant_fp4(data: &[f32]) -> Result<Vec<u8>> {
         } else {
             0xF // +0.875
         };
-        
+
         if i % 2 == 0 {
             packed_byte = code << 4;
         } else {
@@ -1343,70 +1563,44 @@ pub fn quant_fp4(data: &[f32]) -> Result<Vec<u8>> {
             out.push(packed_byte);
         }
     }
-    
+
     Ok(out)
 }
 
 /// Quantize f32 values to NF4 (normalized float-4) bytes.
 /// NF4 is optimized for normally-distributed weights.
-/// Output: f32 scale followed by packed NF4 bytes.
+/// Output: f32 scale followed by packed NF4 bytes using canonical nearest-neighbor search.
 pub fn quant_nf4(data: &[f32]) -> Result<Vec<u8>> {
-    // Find scale using max absolute value mapped to NF4 range
-    let max_abs = data.iter()
-        .map(|v| v.abs())
-        .fold(0.0f32, f32::max);
-    let scale = if max_abs == 0.0 { 1.0 } else { max_abs }; // NF4 already normalized to [-1, 1]
-    
+    let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let scale = if max_abs == 0.0 { 1.0 } else { max_abs };
+
     let mut out = Vec::with_capacity(4 + (data.len() + 1) / 2);
     out.extend_from_slice(&scale.to_le_bytes());
-    
+
     let mut packed_byte = 0u8;
     for (i, &v) in data.iter().enumerate() {
         let normalized = (v / scale).clamp(-1.0, 1.0);
-        let code = if normalized < -0.8 {
-            0
-        } else if normalized < -0.6 {
-            1
-        } else if normalized < -0.45 {
-            2
-        } else if normalized < -0.35 {
-            3
-        } else if normalized < -0.25 {
-            4
-        } else if normalized < -0.15 {
-            5
-        } else if normalized < 0.0 {
-            6
-        } else if normalized < 0.15 {
-            7
-        } else if normalized < 0.25 {
-            8
-        } else if normalized < 0.35 {
-            9
-        } else if normalized < 0.45 {
-            10
-        } else if normalized < 0.6 {
-            11
-        } else if normalized < 0.8 {
-            12
-        } else if normalized < 1.0 {
-            13
-        } else {
-            14
-        };
-        
+        let mut min_diff = f32::MAX;
+        let mut code = 0u8;
+        for (c_idx, &quant_val) in NF4_LUT.iter().enumerate() {
+            let diff = (normalized - quant_val).abs();
+            if diff < min_diff {
+                min_diff = diff;
+                code = c_idx as u8;
+            }
+        }
+
         if i % 2 == 0 {
-            packed_byte = (code as u8) << 4;
+            packed_byte = code << 4;
         } else {
-            packed_byte |= code as u8;
+            packed_byte |= code;
             out.push(packed_byte);
         }
     }
-    
-    if data.len() % 2 == 1 {
+    if data.len() % 2 != 0 {
         out.push(packed_byte);
     }
-    
+
     Ok(out)
 }
 
@@ -1415,15 +1609,15 @@ pub fn quant_nf4(data: &[f32]) -> Result<Vec<u8>> {
 /// Output: f32 scale followed by packed FP8 bytes.
 pub fn quant_fp8(data: &[f32]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(4 + data.len());
-    
+
     // Write scale of 1.0 for now (FP8 can represent values directly in reasonable range)
     out.extend_from_slice(&1.0f32.to_le_bytes());
-    
+
     for &v in data {
         let quantized = f32_to_fp8_e4m3(v);
         out.push(quantized);
     }
-    
+
     Ok(out)
 }
 
@@ -1507,31 +1701,34 @@ pub fn f32_to_mxfp4_e2m1(v: f32, shared_exp: u8) -> u8 {
 
     sign_bit | (exp << 1) | mant
 }
-    
 
 /// Quantize f32 values to block-scaled FP4 (E2M1) bytes.
 pub fn quant_fp4_block16(data: &[f32], block_size: usize) -> Result<Vec<u8>> {
     assert_eq!(block_size, 16);
     let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
     let global_scale = if max_abs == 0.0 { 1.0 } else { max_abs };
-    
+
     let num_blocks = data.len().div_ceil(block_size);
     let mut out = Vec::with_capacity(4 + num_blocks * 9);
     out.extend_from_slice(&global_scale.to_le_bytes());
-    
+
     for block in data.chunks(block_size) {
         let block_max = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let block_scale = (block_max / global_scale).min(1.0).max(1.0 / 64.0);
         let block_scale_fp8 = f32_to_fp8_e4m3(block_scale);
         out.push(block_scale_fp8);
-        
+
         let rec_block_scale = fp8_e4m3_to_f32(block_scale_fp8);
         let effective_scale = rec_block_scale * global_scale;
-        
+
         let mut packed_byte = 0u8;
         for (i, &v) in block.iter().enumerate() {
-            let normalized = if effective_scale == 0.0 { 0.0 } else { (v / effective_scale).clamp(-1.0, 1.0) };
-            
+            let normalized = if effective_scale == 0.0 {
+                0.0
+            } else {
+                (v / effective_scale).clamp(-1.0, 1.0)
+            };
+
             // Nearest neighbor search in FP4_E2M1_LUT
             let mut code = 0;
             let mut min_diff = f32::MAX;
@@ -1542,7 +1739,7 @@ pub fn quant_fp4_block16(data: &[f32], block_size: usize) -> Result<Vec<u8>> {
                     code = c;
                 }
             }
-            
+
             if i % 2 == 0 {
                 packed_byte = (code as u8) << 4;
             } else {
@@ -1568,22 +1765,26 @@ pub fn quant_fp8_block16(data: &[f32], block_size: usize) -> Result<Vec<u8>> {
     assert_eq!(block_size, 16);
     let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
     let global_scale = if max_abs == 0.0 { 1.0 } else { max_abs };
-    
+
     let num_blocks = data.len().div_ceil(block_size);
     let mut out = Vec::with_capacity(4 + num_blocks * 17);
     out.extend_from_slice(&global_scale.to_le_bytes());
-    
+
     for block in data.chunks(block_size) {
         let block_max = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let block_scale = (block_max / global_scale).min(1.0).max(1.0 / 64.0);
         let block_scale_fp8 = f32_to_fp8_e4m3(block_scale);
         out.push(block_scale_fp8);
-        
+
         let rec_block_scale = fp8_e4m3_to_f32(block_scale_fp8);
         let effective_scale = rec_block_scale * global_scale;
-        
+
         for &v in block {
-            let val_scaled = if effective_scale == 0.0 { 0.0 } else { v / effective_scale };
+            let val_scaled = if effective_scale == 0.0 {
+                0.0
+            } else {
+                v / effective_scale
+            };
             out.push(f32_to_fp8_e4m3(val_scaled));
         }
         if block.len() < 16 {
@@ -1630,15 +1831,13 @@ fn quant_packed_symmetric(
 pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<RewrittenTensorData> {
     let rewritten_bytes = match plan.target {
         QuantFormat::Q8_0 => quant_q80(data)?,
-        QuantFormat::Q4K => {
-            quant_packed_symmetric(
-                data,
-                4,
-                plan.importance.as_deref(),
-                plan.curvature.as_deref(),
-                Some(&plan.shape),
-            )?
-        }
+        QuantFormat::Q4K => quant_packed_symmetric(
+            data,
+            4,
+            plan.importance.as_deref(),
+            plan.curvature.as_deref(),
+            Some(&plan.shape),
+        )?,
         QuantFormat::Q5K => quant_packed_symmetric(
             data,
             5,
@@ -1682,7 +1881,11 @@ pub fn quant_iq4nl(data: &[f32]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(num_blocks * 170);
     for chunk in data.chunks(SUPER) {
         let max_val = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-        let scale = if max_val > 0.0 { max_val / 34.56951 } else { 1.0 };
+        let scale = if max_val > 0.0 {
+            max_val / 34.56951
+        } else {
+            1.0
+        };
         let d_f16 = f32_to_f16(scale).to_le_bytes();
         out.extend_from_slice(&d_f16);
 
@@ -1724,7 +1927,11 @@ pub fn quant_iq4xs(data: &[f32]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(num_blocks * 136);
     for chunk in data.chunks(SUPER) {
         let max_val = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-        let scale = if max_val > 0.0 { max_val / 34.56951 } else { 1.0 };
+        let scale = if max_val > 0.0 {
+            max_val / 34.56951
+        } else {
+            1.0
+        };
         let d_f16 = f32_to_f16(scale).to_le_bytes();
         out.extend_from_slice(&d_f16);
         out.extend_from_slice(&[32u8; 6]); // default scales
@@ -1992,7 +2199,8 @@ fn prepare_gptq_proxy_tensor(
             let end = row_end.min(diag.len());
             &diag[row_start..end]
         });
-        let prepared_row = prepare_row_with_sequential_update(row, bits, row_importance, row_curvature)?;
+        let prepared_row =
+            prepare_row_with_sequential_update(row, bits, row_importance, row_curvature)?;
         prepared.extend_from_slice(&prepared_row);
     }
 
@@ -2016,7 +2224,8 @@ fn prepare_row_with_sequential_update(
         let start = block_index * BLOCK_SIZE_QK;
         let end = (start + BLOCK_SIZE_QK).min(row.len());
         let block_weights = &weights[start.min(weights.len())..end.min(weights.len())];
-        let block_curvature = &curvature_diag[start.min(curvature_diag.len())..end.min(curvature_diag.len())];
+        let block_curvature =
+            &curvature_diag[start.min(curvature_diag.len())..end.min(curvature_diag.len())];
 
         for value in &mut prepared[start..end] {
             *value += carry + residual_tail;
@@ -2058,11 +2267,7 @@ fn prepare_row_with_sequential_update(
     }
 }
 
-fn apply_block_diagonal_update(
-    block: &mut [f32],
-    weights: &[f32],
-    curvature: &[f32],
-) {
+fn apply_block_diagonal_update(block: &mut [f32], weights: &[f32], curvature: &[f32]) {
     if block.len() <= 1 {
         return;
     }
@@ -2070,8 +2275,13 @@ fn apply_block_diagonal_update(
     for group_start in (0..block.len()).step_by(GPTQ_PROXY_COLUMN_GROUP) {
         let group_end = (group_start + GPTQ_PROXY_COLUMN_GROUP).min(block.len());
         let group_weights = &weights[group_start.min(weights.len())..group_end.min(weights.len())];
-        let group_curvature = &curvature[group_start.min(curvature.len())..group_end.min(curvature.len())];
-        let mean = weighted_group_mean(&block[group_start..group_end], group_weights, group_curvature);
+        let group_curvature =
+            &curvature[group_start.min(curvature.len())..group_end.min(curvature.len())];
+        let mean = weighted_group_mean(
+            &block[group_start..group_end],
+            group_weights,
+            group_curvature,
+        );
         let coupling = block_group_coupling(group_curvature);
 
         for offset in 0..(group_end - group_start) {
@@ -2172,7 +2382,8 @@ fn weighted_curvature_error(
 fn quantize_block_linear(block: &[f32], scale: f32, bits: u8) -> Vec<u32> {
     let zero_point = quant_zero_point(bits) as f32;
     let signed_limit = signed_quant_limit(bits);
-    block.iter()
+    block
+        .iter()
         .map(|value| {
             (((value / scale).round()).clamp(-signed_limit, signed_limit) + zero_point) as u32
         })
@@ -2181,7 +2392,8 @@ fn quantize_block_linear(block: &[f32], scale: f32, bits: u8) -> Vec<u32> {
 
 fn dequantize_block_signed(block: &[u32], scale: f32, bits: u8) -> Vec<f32> {
     let zero_point = quant_zero_point(bits) as f32;
-    block.iter()
+    block
+        .iter()
         .map(|value| ((*value as f32) - zero_point) * scale)
         .collect()
 }
@@ -2210,7 +2422,10 @@ fn refine_block_residuals(
             let mut best_code = current;
             let mut best_error = current_error;
 
-            for candidate in [current.saturating_sub(1), current.saturating_add(1).min(max_code)] {
+            for candidate in [
+                current.saturating_sub(1),
+                current.saturating_add(1).min(max_code),
+            ] {
                 if candidate == current {
                     continue;
                 }
@@ -2245,11 +2460,15 @@ fn signed_quant_limit(bits: u8) -> f32 {
 }
 
 fn weighted_error(original: &[f32], dequantized: &[f32], weights: &[f32]) -> f32 {
-    original.iter().enumerate().map(|(index, lhs)| {
-        let weight = weights.get(index).copied().unwrap_or(1.0);
-        let residual = lhs - dequantized.get(index).copied().unwrap_or_default();
-        weight * residual * residual
-    }).sum()
+    original
+        .iter()
+        .enumerate()
+        .map(|(index, lhs)| {
+            let weight = weights.get(index).copied().unwrap_or(1.0);
+            let residual = lhs - dequantized.get(index).copied().unwrap_or_default();
+            weight * residual * residual
+        })
+        .sum()
 }
 
 fn pack_bits(values: &[u32], bits: u8) -> Vec<u8> {
@@ -2309,7 +2528,6 @@ fn f32_to_f16(v: f32) -> u16 {
     (sign << 15) | ((new_exp as u16) << 10) | ((mant >> 13) as u16)
 }
 
-
 /// Randomized SVD algorithm for importance matrix calculation (§0 / §19).
 /// Replicates `scirs2_linalg` randomized SVD projection strategy:
 /// Projects high-dimensional weight arrays to lower-rank spaces with Gaussian matrices.
@@ -2320,7 +2538,9 @@ pub fn randomized_svd_importance(
     target_rank: usize,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
     if target_rank == 0 || target_rank > rows.min(cols) {
-        return Err(Error::Backend("Invalid target rank for randomized SVD".into()));
+        return Err(Error::Backend(
+            "Invalid target rank for randomized SVD".into(),
+        ));
     }
     // Replicating Martinsson/Tropp Randomized SVD pattern:
     // 1. Generate random Gaussian matrix Omega of size (cols, target_rank + oversampling)
@@ -2433,7 +2653,10 @@ pub struct ImportanceScores {
 impl ImportanceScores {
     pub fn new(tensor_names: Vec<String>, layer_scores: Vec<f32>) -> Self {
         assert_eq!(tensor_names.len(), layer_scores.len());
-        Self { tensor_names, layer_scores }
+        Self {
+            tensor_names,
+            layer_scores,
+        }
     }
 
     pub fn score_for(&self, tensor_name: &str) -> f32 {
@@ -2452,9 +2675,7 @@ impl ImportanceScores {
 /// importance: the Frobenius norm of each singular vector weighted by its
 /// singular value. Tensors with higher importance scores are more
 /// quantization-sensitive and should receive higher bitwidth in EvoPress.
-pub fn compute_importance_scores(
-    tensors: &[(String, Vec<f32>, usize, usize)],
-) -> Vec<f32> {
+pub fn compute_importance_scores(tensors: &[(String, Vec<f32>, usize, usize)]) -> Vec<f32> {
     let mut scores = Vec::with_capacity(tensors.len());
     for (_name, data, rows, cols) in tensors {
         if *rows == 0 || *cols == 0 {
@@ -2462,7 +2683,13 @@ pub fn compute_importance_scores(
             continue;
         }
         let r = (*rows).min(*cols);
-        let target_rank = if r > 8 { 8 } else if r < 1 { 1 } else { r };
+        let target_rank = if r > 8 {
+            8
+        } else if r < 1 {
+            1
+        } else {
+            r
+        };
         let (_, s, vt) = match randomized_svd_importance(data, *rows, *cols, target_rank) {
             Ok(r) => r,
             Err(_) => {
@@ -2713,7 +2940,11 @@ pub fn refined_scale_fit(
             continue;
         }
         let rms = (weighted_sq_sum / weight_sum).sqrt();
-        let scale = if rms < 1e-9 { 1.0 } else { rms / (step as f32) * 2.0 };
+        let scale = if rms < 1e-9 {
+            1.0
+        } else {
+            rms / (step as f32) * 2.0
+        };
         scales.push(scale);
     }
     Ok(scales)
@@ -2797,8 +3028,11 @@ pub fn evopress_search(
                     // Higher importance → higher bitwidth (bias toward important layers)
                     let imp_sum = importance_scores.iter().sum::<f32>().max(1e-9);
                     let imp_ratio = imp / imp_sum;
-                    let target_bpw_for_tensor = (config.target_bpw * imp_ratio * 2.0).clamp(2.0, 8.0);
-                    let gene = *config.available_bpws.iter()
+                    let target_bpw_for_tensor =
+                        (config.target_bpw * imp_ratio * 2.0).clamp(2.0, 8.0);
+                    let gene = *config
+                        .available_bpws
+                        .iter()
                         .min_by(|a, b| {
                             let da = ((**a) as f32 - target_bpw_for_tensor).abs();
                             let db = ((**b) as f32 - target_bpw_for_tensor).abs();
@@ -2810,11 +3044,17 @@ pub fn evopress_search(
                 }
                 genes
             } else {
-                (0..n_tensors).map(|_| {
-                    *config.available_bpws.choose(&mut rng).unwrap_or(&4)
-                }).collect()
+                (0..n_tensors)
+                    .map(|_| *config.available_bpws.choose(&mut rng).unwrap_or(&4))
+                    .collect()
             };
-            let fitness = eval_individual(&genes, importance_scores, tensor_sizes, config.target_bpw, total_size);
+            let fitness = eval_individual(
+                &genes,
+                importance_scores,
+                tensor_sizes,
+                config.target_bpw,
+                total_size,
+            );
             Individual { genes, fitness }
         })
         .collect();
@@ -2849,8 +3089,17 @@ pub fn evopress_search(
                 }
             }
 
-            let fitness = eval_individual(&child_genes, importance_scores, tensor_sizes, config.target_bpw, total_size);
-            next_gen.push(Individual { genes: child_genes, fitness });
+            let fitness = eval_individual(
+                &child_genes,
+                importance_scores,
+                tensor_sizes,
+                config.target_bpw,
+                total_size,
+            );
+            next_gen.push(Individual {
+                genes: child_genes,
+                fitness,
+            });
         }
 
         population = next_gen;
@@ -2901,7 +3150,9 @@ fn eval_individual(
     }
 
     // Penalty for deviation from target average BPW.
-    let total_bits: usize = genes.iter().zip(tensor_sizes.iter())
+    let total_bits: usize = genes
+        .iter()
+        .zip(tensor_sizes.iter())
         .map(|(g, s)| (*g as usize) * s)
         .sum();
     let actual_bpw = total_bits as f32 / total_size as f32;
@@ -3056,13 +3307,11 @@ pub fn apply_smoothquant_scale(
 /// # Panics
 /// Panics if `dim` is not a positive power of two, or if the
 /// caller supplies a non-square weight slice.
-pub fn spinquant_rotate(
-    weights: &mut [f32],
-    dim: usize,
-    lr: f32,
-    steps: usize,
-) {
-    assert!(dim > 0 && dim.is_power_of_two(), "SpinQuant dim must be a positive power of 2");
+pub fn spinquant_rotate(weights: &mut [f32], dim: usize, lr: f32, steps: usize) {
+    assert!(
+        dim > 0 && dim.is_power_of_two(),
+        "SpinQuant dim must be a positive power of 2"
+    );
     assert_eq!(
         weights.len(),
         dim * dim,
@@ -3128,9 +3377,7 @@ pub fn spinquant_rotate(
         // Gram-Schmidt re-orthogonalisation (keeps R on Stiefel).
         for col in 0..dim {
             for row in 0..col {
-                let dot: f32 = (0..dim)
-                    .map(|k| r[k * dim + col] * r[k * dim + row])
-                    .sum();
+                let dot: f32 = (0..dim).map(|k| r[k * dim + col] * r[k * dim + row]).sum();
                 for k in 0..dim {
                     r[k * dim + col] -= dot * r[k * dim + row];
                 }
@@ -3175,12 +3422,8 @@ pub fn pre_quantize_transform(
     spinquant_lr: f32,
     spinquant_steps: usize,
 ) -> Vec<f32> {
-    let smooth_scales = apply_smoothquant_scale(
-        weights,
-        out_channels,
-        in_channels,
-        calibration_acts,
-    );
+    let smooth_scales =
+        apply_smoothquant_scale(weights, out_channels, in_channels, calibration_acts);
 
     // SpinQuant operates on square blocks of size spinquant_dim.
     // Apply block-wise on the weight matrix (treat as stacked dim×dim blocks).
@@ -3215,7 +3458,7 @@ mod smoothquant_tests {
         // col 0 (out_ch 0) has large values, col 1 (out_ch 1) has small values
         let mut weights = vec![
             10.0, 10.0, 10.0, // out_ch=0: all rows have 10 in this col
-            1.0, 1.0, 1.0,      // out_ch=1: all rows have 1 in this col
+            1.0, 1.0, 1.0, // out_ch=1: all rows have 1 in this col
         ];
 
         let scales = apply_smoothquant_scale(&mut weights, out_c, in_c, None);
@@ -3288,9 +3531,7 @@ mod spinquant_tests {
     #[test]
     fn spinquant_produces_finite_output() {
         let dim = 8;
-        let mut weights: Vec<f32> = (0..dim * dim)
-            .map(|i| (i as f32 - 32.0) * 10.0)
-            .collect();
+        let mut weights: Vec<f32> = (0..dim * dim).map(|i| (i as f32 - 32.0) * 10.0).collect();
 
         spinquant_rotate(&mut weights, dim, 0.05, 5);
 
@@ -3322,15 +3563,7 @@ mod pre_quantize_transform_tests {
         let in_c = 3;
         let mut weights = vec![1.0f32; out_c * in_c];
 
-        let scales = pre_quantize_transform(
-            &mut weights,
-            out_c,
-            in_c,
-            None,
-            4,
-            0.05,
-            2,
-        );
+        let scales = pre_quantize_transform(&mut weights, out_c, in_c, None, 4, 0.05, 2);
 
         assert_eq!(scales.len(), out_c);
     }
@@ -3349,7 +3582,13 @@ mod tests {
         // Q8_0 should be close
         for i in 0..data.len() {
             let diff = (data[i] - dequantized[i]).abs();
-            assert!(diff < 0.5, "diff at {i}: {} vs {}, diff={}", data[i], dequantized[i], diff);
+            assert!(
+                diff < 0.5,
+                "diff at {i}: {} vs {}, diff={}",
+                data[i],
+                dequantized[i],
+                diff
+            );
         }
     }
 
@@ -3416,10 +3655,12 @@ mod tests {
     #[test]
     fn residual_refinement_beats_linear_baseline() {
         let block = vec![
-            -3.2f32, -2.8, -2.1, -1.7, -1.2, -0.9, -0.3, 0.1,
-            0.25, 0.6, 0.95, 1.3, 1.8, 2.2, 2.7, 3.4,
+            -3.2f32, -2.8, -2.1, -1.7, -1.2, -0.9, -0.3, 0.1, 0.25, 0.6, 0.95, 1.3, 1.8, 2.2, 2.7,
+            3.4,
         ];
-        let weights = vec![1.0, 1.0, 1.0, 1.0, 1.5, 1.5, 2.0, 2.0, 2.0, 2.0, 1.5, 1.5, 1.0, 1.0, 1.0, 1.0];
+        let weights = vec![
+            1.0, 1.0, 1.0, 1.0, 1.5, 1.5, 2.0, 2.0, 2.0, 2.0, 1.5, 1.5, 1.0, 1.0, 1.0, 1.0,
+        ];
         let bits = 4;
         let scale = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max) / signed_quant_limit(bits);
 
@@ -3430,14 +3671,21 @@ mod tests {
 
         let linear_error = weighted_error(&block, &linear, &weights);
         let refined_error = weighted_error(&block, &refined, &weights);
-        assert!(refined_error <= linear_error, "residual refinement regressed: {refined_error} > {linear_error}");
+        assert!(
+            refined_error <= linear_error,
+            "residual refinement regressed: {refined_error} > {linear_error}"
+        );
     }
 
     #[test]
     fn sequential_row_update_improves_two_block_tensor() {
         let mut row = Vec::new();
         for i in 0..256 {
-            let base = if i < 128 { (i as f32 - 64.0) / 2.5 } else { (i as f32 - 192.0) / 4.0 };
+            let base = if i < 128 {
+                (i as f32 - 64.0) / 2.5
+            } else {
+                (i as f32 - 192.0) / 4.0
+            };
             let bias = if i >= 128 { 0.35 } else { 0.0 };
             row.push(base + bias);
         }
@@ -3471,7 +3719,8 @@ mod tests {
             .collect();
 
         let baseline_error = row_rewrite_error(&row, &row, 4, &weights, &curvature).unwrap();
-        let prepared = prepare_row_with_sequential_update(&row, 4, Some(&weights), Some(&curvature)).unwrap();
+        let prepared =
+            prepare_row_with_sequential_update(&row, 4, Some(&weights), Some(&curvature)).unwrap();
         let curved_error = row_rewrite_error(&row, &prepared, 4, &weights, &curvature).unwrap();
         assert!(
             curved_error <= baseline_error,
@@ -3508,7 +3757,7 @@ mod tests {
         let matrix = vec![1.0f32; 100]; // 10x10 matrix
         let target_rank = 3;
         let (u, s, vt) = randomized_svd_importance(&matrix, 10, 10, target_rank).unwrap();
-        
+
         assert_eq!(u.len(), 10 * target_rank);
         assert_eq!(s.len(), target_rank);
         assert_eq!(vt.len(), target_rank * 10);
@@ -3539,8 +3788,16 @@ mod tests {
         // Pack known non-zero codes at word-boundary positions (in_idx 0-9
         // all have bit_offset + 2 < 32, so their 3-bit codes fit in word 0).
         let codes: Vec<(usize, u32)> = vec![
-            (0, 5), (1, 2), (2, 7), (3, 1), (4, 4),
-            (5, 6), (6, 3), (7, 0), (8, 3), (9, 5),
+            (0, 5),
+            (1, 2),
+            (2, 7),
+            (3, 1),
+            (4, 4),
+            (5, 6),
+            (6, 3),
+            (7, 0),
+            (8, 3),
+            (9, 5),
         ];
         let mut qw_words = vec![0u32; 3];
         for &(idx, code) in &codes {
@@ -3566,7 +3823,7 @@ mod tests {
             &scales,
             None,
             &[in_features, out_features],
-            3,       // 3-bit
+            3, // 3-bit
             group_size,
         );
 
@@ -3577,7 +3834,11 @@ mod tests {
         // Expected: (code - (zero_val + 1)) * scale_val = (code - 1) * 1.0
         let mut expected = vec![0.0f32; in_features];
         for i in 0..in_features {
-            let code = codes.iter().find(|&&(idx, _)| idx == i).map(|&(_, c)| c).unwrap_or(0);
+            let code = codes
+                .iter()
+                .find(|&&(idx, _)| idx == i)
+                .map(|&(_, c)| c)
+                .unwrap_or(0);
             expected[i] = (code as f32 - 1.0) * scale_val;
         }
 
@@ -3610,9 +3871,22 @@ mod tests {
         // Pack known non-zero codes at word-boundary positions
         // (all 16 values fit in one u32 word for 2-bit: 16 * 2 = 32 bits).
         let codes: Vec<(usize, u32)> = vec![
-            (0, 1), (1, 3), (2, 2), (3, 1), (4, 3),
-            (5, 0), (6, 2), (7, 1), (8, 3), (9, 0),
-            (10, 1), (11, 2), (12, 3), (13, 1), (14, 0), (15, 2),
+            (0, 1),
+            (1, 3),
+            (2, 2),
+            (3, 1),
+            (4, 3),
+            (5, 0),
+            (6, 2),
+            (7, 1),
+            (8, 3),
+            (9, 0),
+            (10, 1),
+            (11, 2),
+            (12, 3),
+            (13, 1),
+            (14, 0),
+            (15, 2),
         ];
         let mut w0: u32 = 0;
         for &(idx, code) in &codes {
@@ -3630,7 +3904,7 @@ mod tests {
             &scales,
             None,
             &[in_features, out_features],
-            2,       // 2-bit
+            2, // 2-bit
             group_size,
         );
 
@@ -3641,7 +3915,11 @@ mod tests {
         // Expected: (code - (zero_val + 1)) * scale_val = (code - 1) * 1.0
         let mut expected = vec![0.0f32; in_features];
         for i in 0..in_features {
-            let code = codes.iter().find(|&&(idx, _)| idx == i).map(|&(_, c)| c).unwrap_or(0);
+            let code = codes
+                .iter()
+                .find(|&&(idx, _)| idx == i)
+                .map(|&(_, c)| c)
+                .unwrap_or(0);
             expected[i] = (code as f32 - 1.0) * scale_val;
         }
 
@@ -3674,8 +3952,14 @@ mod tests {
         // Pack known non-zero codes at word-boundary positions
         // (all 8 values fit in one u32 word for 4-bit: 8 * 4 = 32 bits).
         let codes: Vec<(usize, u32)> = vec![
-            (0, 1), (1, 3), (2, 7), (3, 2), (4, 5),
-            (5, 4), (6, 6), (7, 1),
+            (0, 1),
+            (1, 3),
+            (2, 7),
+            (3, 2),
+            (4, 5),
+            (5, 4),
+            (6, 6),
+            (7, 1),
         ];
         let mut w0: u32 = 0;
         for &(idx, code) in &codes {
@@ -3693,7 +3977,7 @@ mod tests {
             &scales,
             None,
             &[in_features, out_features],
-            4,       // 4-bit
+            4, // 4-bit
             group_size,
         );
 
@@ -3704,7 +3988,11 @@ mod tests {
         // Expected: (code - (zero_val + 1)) * scale_val = (code - 1) * 1.0
         let mut expected = vec![0.0f32; in_features];
         for i in 0..in_features {
-            let code = codes.iter().find(|&&(idx, _)| idx == i).map(|&(_, c)| c).unwrap_or(0);
+            let code = codes
+                .iter()
+                .find(|&&(idx, _)| idx == i)
+                .map(|&(_, c)| c)
+                .unwrap_or(0);
             expected[i] = (code as f32 - 1.0) * scale_val;
         }
 
@@ -3747,12 +4035,24 @@ mod tests {
 
         let quantized = quant_fp4(&data).unwrap();
         let deq = dequant_fp4(&quantized, 8).unwrap();
-        
+
         // FP4 has limited precision - check values are in expected range
         // Scale is computed from max value (1.0), so range should be approximately [-0.875, 0.875]
-        assert!(deq[0].abs() > 0.7, "FP4 -1.0 should map to ~-0.875: {}", deq[0]); // -1.0
-        assert!(deq[4].abs() > 0.7, "FP4 +1.0 should map to ~+0.875: {}", deq[4]); // +1.0
-        assert!((deq[2] - 0.0).abs() < 0.05, "FP4 0.0 should be near zero: {}", deq[2]);
+        assert!(
+            deq[0].abs() > 0.7,
+            "FP4 -1.0 should map to ~-0.875: {}",
+            deq[0]
+        ); // -1.0
+        assert!(
+            deq[4].abs() > 0.7,
+            "FP4 +1.0 should map to ~+0.875: {}",
+            deq[4]
+        ); // +1.0
+        assert!(
+            (deq[2] - 0.0).abs() < 0.05,
+            "FP4 0.0 should be near zero: {}",
+            deq[2]
+        );
     }
 
     #[test]
@@ -3786,7 +4086,9 @@ mod tests {
         assert_eq!(dequantized.len(), data.len());
         // FP8 has limited precision, especially for larger values
         // Check that we can recover the data within reasonable error
-        let max_diff = data.iter().zip(dequantized.iter())
+        let max_diff = data
+            .iter()
+            .zip(dequantized.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(max_diff < 10.0, "fp8 max diff too high: {}", max_diff);
@@ -3802,8 +4104,125 @@ mod tests {
         // Small values may lose precision in FP8 - just check they're close
         for i in 0..4 {
             let diff = (deq[i] - data[i]).abs();
-            assert!(diff < 0.1, "FP8 small value diff too high at {}: {}", i, diff);
+            assert!(
+                diff < 0.1,
+                "FP8 small value diff too high at {}: {}",
+                i,
+                diff
+            );
         }
+    }
+
+    fn build_mxfp4_single_buffer(codes: &[u8], exps: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(codes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(codes);
+        buf.extend_from_slice(&(exps.len() as u64).to_le_bytes());
+        buf.extend_from_slice(exps);
+        buf
+    }
+
+    fn build_mxfp8_single_buffer(codes: &[u8], exps: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(codes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(codes);
+        buf.extend_from_slice(&(exps.len() as u64).to_le_bytes());
+        buf.extend_from_slice(exps);
+        buf
+    }
+
+    #[test]
+    fn dequant_mxfp4_matches_kernel_nibble_order() {
+        // shared_exp = 127 -> scale 2^0 = 1.0. Two codes per byte:
+        // byte 0x21 -> element 0 (low nibble) = 1, element 1 (high nibble) = 2.
+        let codes = vec![0x21u8, 0x43u8];
+        let exps = vec![127u8];
+        let buf = build_mxfp4_single_buffer(&codes, &exps);
+        let deq = dequant_mxfp4(&buf, 4).unwrap();
+        assert_eq!(deq.len(), 4);
+        assert_eq!(deq[0], mxfp4_e2m1_to_f32(0x1, 127));
+        assert_eq!(deq[1], mxfp4_e2m1_to_f32(0x2, 127));
+        assert_eq!(deq[2], mxfp4_e2m1_to_f32(0x3, 127));
+        assert_eq!(deq[3], mxfp4_e2m1_to_f32(0x4, 127));
+    }
+
+    #[test]
+    fn dequant_mxfp4_applies_shared_exp_scale() {
+        // shared_exp = 130 -> scale 2^3 = 8.0. code 4 (E2M1: exp=2,mant=0) = 2.0 unscaled.
+        let codes = vec![0x04u8];
+        let exps = vec![130u8];
+        let buf = build_mxfp4_single_buffer(&codes, &exps);
+        let deq = dequant_mxfp4(&buf, 2).unwrap();
+        assert_eq!(deq.len(), 2);
+        assert!((deq[0] - 16.0).abs() < 1e-5, "deq[0] = {}", deq[0]);
+        assert!((deq[1] - 0.0).abs() < 1e-5, "deq[1] = {}", deq[1]);
+    }
+
+    #[test]
+    fn dequant_mxfp4_roundtrip() {
+        let data: Vec<f32> = (0..96).map(|i| ((i as f32 - 48.0) / 48.0) * 4.0).collect();
+        let shared_exp = 127u8;
+        let mut codes = vec![0u8; data.len().div_ceil(2)];
+        for (i, &v) in data.iter().enumerate() {
+            let code = f32_to_mxfp4_e2m1(v, shared_exp);
+            if i % 2 == 0 {
+                codes[i / 2] |= code & 0x0F;
+            } else {
+                codes[i / 2] |= (code & 0x0F) << 4;
+            }
+        }
+        let exps = vec![shared_exp; data.len().div_ceil(32)];
+        let buf = build_mxfp4_single_buffer(&codes, &exps);
+        let deq = dequant_mxfp4(&buf, data.len()).unwrap();
+        assert_eq!(deq.len(), data.len());
+        // MXFP4 has coarse precision; values chosen within E2M1 representable range
+        for i in 0..data.len() {
+            let diff = (data[i] - deq[i]).abs();
+            assert!(
+                diff < 1.5,
+                "diff at {i}: {} vs {}, diff={}",
+                data[i],
+                deq[i],
+                diff
+            );
+        }
+    }
+
+    #[test]
+    fn dequant_mxfp4_rejects_truncated_segments() {
+        let codes = vec![0x00u8];
+        let exps = vec![127u8; 8]; // need 8 exps for 256 values
+        let mut buf = build_mxfp4_single_buffer(&codes, &exps);
+        // 256 values need 128 code bytes, only 1 present -> error
+        assert!(dequant_mxfp4(&buf, 256).is_err());
+        // Truncate the length prefix itself
+        buf.truncate(4);
+        assert!(dequant_mxfp4(&buf, 256).is_err());
+    }
+
+    #[test]
+    fn dequant_mxfp8_roundtrip_and_scale() {
+        // shared_exp = 127, code 0x40 = E4M3 (exp 8, mant 0) = 2.0
+        let codes = vec![0x40u8; 4];
+        let exps = vec![127u8];
+        let buf = build_mxfp8_single_buffer(&codes, &exps);
+        let deq = dequant_mxfp8(&buf, 4).unwrap();
+        assert_eq!(deq.len(), 4);
+        assert!((deq[0] - 2.0).abs() < 1e-5, "deq[0] = {}", deq[0]);
+
+        // shared_exp = 128 -> scale 2.0, so value doubles
+        let exps2 = vec![128u8];
+        let buf2 = build_mxfp8_single_buffer(&codes, &exps2);
+        let deq2 = dequant_mxfp8(&buf2, 4).unwrap();
+        assert!((deq2[0] - 4.0).abs() < 1e-5, "deq2[0] = {}", deq2[0]);
+    }
+
+    #[test]
+    fn dequant_mxfp8_rejects_truncated_segments() {
+        let codes = vec![0x40u8];
+        let exps = vec![127u8; 8];
+        let buf = build_mxfp8_single_buffer(&codes, &exps);
+        assert!(dequant_mxfp8(&buf, 256).is_err());
     }
 
     #[test]
@@ -3951,7 +4370,9 @@ mod tests {
         // `chunks(BLOCK_Q8_WEIGHTS)` or dropped `+1` in num_blocks math
         // would corrupt the length contract.
         for &n in &[31usize, 32, 33, 63, 64, 65] {
-            let data: Vec<f32> = (0..n).map(|i| (i as f32 - (n as f32 / 2.0)) * 0.1).collect();
+            let data: Vec<f32> = (0..n)
+                .map(|i| (i as f32 - (n as f32 / 2.0)) * 0.1)
+                .collect();
             let q = quant_q80(&data).expect("quant");
             let d = dequant_q80(&q, n).expect("dequant");
             assert_eq!(d.len(), n, "Q8_0 length contract broken at n={n}");
@@ -3967,7 +4388,10 @@ mod tests {
         let q = quant_q80(&data).expect("quant");
         let d = dequant_q80(&q, 64).expect("dequant");
         assert_eq!(d.len(), 64);
-        assert!(d.iter().all(|v| v.is_finite()), "all-zero must not yield NaN");
+        assert!(
+            d.iter().all(|v| v.is_finite()),
+            "all-zero must not yield NaN"
+        );
         // Reconstruction of zero is exactly zero (q=0, scale arbitrary).
         assert!(d.iter().all(|v| v.abs() < 1e-6));
     }
@@ -3980,7 +4404,10 @@ mod tests {
         let q = quant_q80(&data).expect("quant");
         let d = dequant_q80(&q, 64).expect("dequant");
         for v in &d {
-            assert!((v - 0.5).abs() < 0.02, "constant reconstruction drifted: {v}");
+            assert!(
+                (v - 0.5).abs() < 0.02,
+                "constant reconstruction drifted: {v}"
+            );
         }
     }
 
@@ -4024,8 +4451,14 @@ mod tests {
         let d_pos = dequant_fp4(&q_pos, 16).expect("dequant pos");
         let q_neg = quant_fp4(&neg).expect("quant neg");
         let d_neg = dequant_fp4(&q_neg, 16).expect("dequant neg");
-        assert!(d_pos.iter().all(|v| *v >= 0.0), "FP4 must preserve positive sign");
-        assert!(d_neg.iter().all(|v| *v <= 0.0), "FP4 must preserve negative sign");
+        assert!(
+            d_pos.iter().all(|v| *v >= 0.0),
+            "FP4 must preserve positive sign"
+        );
+        assert!(
+            d_neg.iter().all(|v| *v <= 0.0),
+            "FP4 must preserve negative sign"
+        );
     }
 
     #[test]
@@ -4040,7 +4473,11 @@ mod tests {
         let d = dequant_nf4(&q, 16).expect("dequant");
         let has_pos = d.iter().any(|v| *v > 0.0);
         let has_neg = d.iter().any(|v| *v < 0.0);
-        assert!(has_pos && has_neg, "NF4 must preserve both signs; got {:?}", d);
+        assert!(
+            has_pos && has_neg,
+            "NF4 must preserve both signs; got {:?}",
+            d
+        );
     }
 
     #[test]
@@ -4053,8 +4490,16 @@ mod tests {
         let d = dequant_fp8(&q, 4).expect("dequant");
         // The clamped values land near the E4M3 max (~240). We assert only
         // finiteness + sign preservation — exact value depends on the LUT.
-        assert!(d[0].is_finite() && d[0] > 100.0, "large positive must clamp to ~240; got {}", d[0]);
-        assert!(d[1].is_finite() && d[1] < -100.0, "large negative must clamp to ~-240; got {}", d[1]);
+        assert!(
+            d[0].is_finite() && d[0] > 100.0,
+            "large positive must clamp to ~240; got {}",
+            d[0]
+        );
+        assert!(
+            d[1].is_finite() && d[1] < -100.0,
+            "large negative must clamp to ~-240; got {}",
+            d[1]
+        );
         assert!(d[2].abs() < 1e-6, "zero must round-trip; got {}", d[2]);
     }
 
@@ -4094,7 +4539,12 @@ mod tests {
         println!("fp4 d: {:?}", d);
         assert_eq!(d.len(), 32);
         for (got, want) in d.iter().zip(data.iter()) {
-            assert!((got - want).abs() < 0.2, "FP4 block round trip error too high: got {} vs want {}", got, want);
+            assert!(
+                (got - want).abs() < 0.2,
+                "FP4 block round trip error too high: got {} vs want {}",
+                got,
+                want
+            );
         }
     }
 
@@ -4107,7 +4557,12 @@ mod tests {
         println!("fp8 d: {:?}", d);
         assert_eq!(d.len(), 32);
         for (got, want) in d.iter().zip(data.iter()) {
-            assert!((got - want).abs() < 0.15, "FP8 block round trip error too high: got {} vs want {}", got, want);
+            assert!(
+                (got - want).abs() < 0.15,
+                "FP8 block round trip error too high: got {} vs want {}",
+                got,
+                want
+            );
         }
     }
 
@@ -4162,45 +4617,57 @@ mod tests {
         let group_size = 16;
         let bits = 4;
         let values_per_word = 8;
-        
+
         let mut expected = vec![0.0f32; in_features * out_features];
         let mut qweight = vec![0u8; (in_features / values_per_word) * out_features * 4];
-        let mut qzeros = vec![0u8; (in_features / group_size) * (out_features / values_per_word) * 4];
+        let mut qzeros =
+            vec![0u8; (in_features / group_size) * (out_features / values_per_word) * 4];
         let mut scales = vec![0u8; (in_features / group_size) * out_features * 4];
-        
+
         let zero_val = 7u32;
         let scale_val = 0.5f32;
-        
+
         let num_groups = in_features / group_size;
         for g in 0..num_groups {
             for col in 0..out_features {
                 let scale_idx = g * out_features + col;
                 let sb = scale_val.to_le_bytes();
                 scales[scale_idx * 4..scale_idx * 4 + 4].copy_from_slice(&sb);
-                
+
                 let zero_word_idx = g * (out_features / values_per_word) + col / values_per_word;
                 let bit_offset = (col % values_per_word) * bits;
                 let offset = zero_word_idx * 4;
-                let mut word = u32::from_le_bytes([qzeros[offset], qzeros[offset+1], qzeros[offset+2], qzeros[offset+3]]);
+                let mut word = u32::from_le_bytes([
+                    qzeros[offset],
+                    qzeros[offset + 1],
+                    qzeros[offset + 2],
+                    qzeros[offset + 3],
+                ]);
                 word |= zero_val << bit_offset;
-                qzeros[offset..offset+4].copy_from_slice(&word.to_le_bytes());
+                qzeros[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
             }
         }
-        
+
         for in_idx in 0..in_features {
             for out_idx in 0..out_features {
                 let code = ((in_idx + out_idx) % 16) as u32;
-                expected[in_idx * out_features + out_idx] = (code as f32 - (zero_val + 1) as f32) * scale_val;
-                
+                expected[in_idx * out_features + out_idx] =
+                    (code as f32 - (zero_val + 1) as f32) * scale_val;
+
                 let word_idx = (in_idx / values_per_word) * out_features + out_idx;
                 let bit_offset = (in_idx % values_per_word) * bits;
                 let offset = word_idx * 4;
-                let mut word = u32::from_le_bytes([qweight[offset], qweight[offset+1], qweight[offset+2], qweight[offset+3]]);
+                let mut word = u32::from_le_bytes([
+                    qweight[offset],
+                    qweight[offset + 1],
+                    qweight[offset + 2],
+                    qweight[offset + 3],
+                ]);
                 word |= code << bit_offset;
-                qweight[offset..offset+4].copy_from_slice(&word.to_le_bytes());
+                qweight[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
             }
         }
-        
+
         let dequanted = dequant_gptq_group_int(
             &qweight,
             &qzeros,
@@ -4209,11 +4676,18 @@ mod tests {
             &[in_features, out_features],
             bits as u32,
             group_size,
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         assert_eq!(dequanted.len(), expected.len());
         for i in 0..dequanted.len() {
-            assert!((dequanted[i] - expected[i]).abs() < 1e-5, "Mismatch at index {}: got {}, want {}", i, dequanted[i], expected[i]);
+            assert!(
+                (dequanted[i] - expected[i]).abs() < 1e-5,
+                "Mismatch at index {}: got {}, want {}",
+                i,
+                dequanted[i],
+                expected[i]
+            );
         }
     }
 
@@ -4327,7 +4801,11 @@ mod tests {
         let res = dequant_iq4nl(&data, 256).expect("dequant_iq4nl");
         assert_eq!(res.len(), 256);
         // index 1 in IQ4_NL_CODEBOOK is 0.11314126
-        assert!((res[0] - 0.11314126).abs() < 1e-5, "res[0] = {}, want 0.11314126", res[0]);
+        assert!(
+            (res[0] - 0.11314126).abs() < 1e-5,
+            "res[0] = {}, want 0.11314126",
+            res[0]
+        );
 
         // Error handling on truncated data
         assert!(dequant_iq4nl(&data[..100], 256).is_err());

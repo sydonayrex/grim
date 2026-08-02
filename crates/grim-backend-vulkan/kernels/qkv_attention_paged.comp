@@ -1,0 +1,64 @@
+#version 450
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufQ { float Q[]; };
+layout(std430, binding = 1) readonly buffer BufKCache { float KCache[]; };
+layout(std430, binding = 2) readonly buffer BufVCache { float VCache[]; };
+layout(std430, binding = 3) readonly buffer BufBlockTable { int BlockTable[]; };
+layout(std430, binding = 4) writeonly buffer BufOut { float Out[]; };
+
+void main() {
+    uint head_dim = params.n;
+    uint num_heads = params.m;
+    uint context_len = params.k;
+    uint page_size = params.size;
+
+    uint tid = gl_GlobalInvocationID.x;
+    uint head_idx = gl_WorkGroupID.y;
+
+    if (tid >= head_dim || head_idx >= num_heads) return;
+
+    float scale = 1.0 / sqrt(float(head_dim));
+    float q_val = Q[head_idx * head_dim + tid] * scale;
+
+    float acc_out = 0.0;
+    float sum_exp = 0.0;
+    float max_score = -1e30;
+
+    for (uint pos = 0u; pos < context_len; ++pos) {
+        uint logical_block = pos / page_size;
+        uint block_offset = pos % page_size;
+        int physical_block = BlockTable[logical_block];
+
+        uint k_idx = (uint(physical_block) * page_size + block_offset) * num_heads * head_dim + head_idx * head_dim + tid;
+        float k_val = KCache[k_idx];
+
+        float score = q_val * k_val;
+        if (score > max_score) {
+            sum_exp = sum_exp * exp(max_score - score) + 1.0;
+            max_score = score;
+        } else {
+            sum_exp += exp(score - max_score);
+        }
+
+        float v_val = VCache[k_idx];
+        float p = exp(score - max_score);
+        acc_out += p * v_val;
+    }
+
+    if (sum_exp > 0.0) {
+        Out[head_idx * head_dim + tid] = acc_out / sum_exp;
+    } else {
+        Out[head_idx * head_dim + tid] = 0.0;
+    }
+}

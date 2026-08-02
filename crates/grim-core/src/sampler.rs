@@ -3,8 +3,8 @@
 //! Concrete samplers (greedy, top-k, nucleus, mirostat, ...) implement this
 //! trait; plugins (§6) provide extensions via either the dylib or WASM path.
 
-use grim_tensor::error::Result;
 use grim_tensor::Tensor;
+use grim_tensor::error::Result;
 
 /// History-aware token sampler. The `history` argument carries the most
 /// recently emitted tokens (typically the last 64 tokens) for samplers
@@ -116,7 +116,11 @@ impl TopPSampler {
         // Avoid a zero state, which would stick xorshift at 0.
         TopPSampler {
             params,
-            rng_state: std::sync::Mutex::new(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed }),
+            rng_state: std::sync::Mutex::new(if seed == 0 {
+                0x9E37_79B9_7F4A_7C15
+            } else {
+                seed
+            }),
         }
     }
 
@@ -132,7 +136,15 @@ impl TopPSampler {
 impl Sampler for TopPSampler {
     fn sample(&self, logits: &Tensor, history: &[u32]) -> Result<u32> {
         let v = logits.to_vec_f32()?;
-        let token = sample_logits(&v, self.params.temperature, self.params.top_p, self.params.top_k, self.params.repeat_penalty, history, &mut || self.next_u32());
+        let token = sample_logits(
+            &v,
+            self.params.temperature,
+            self.params.top_p,
+            self.params.top_k,
+            self.params.repeat_penalty,
+            history,
+            &mut || self.next_u32(),
+        );
         Ok(token)
     }
 
@@ -230,7 +242,11 @@ where
     // rest to -inf. top_k == 0 means "no truncation".
     let masked = if top_k > 0 && (top_k as usize) < scaled.len() {
         let mut order: Vec<usize> = (0..scaled.len()).collect();
-        order.sort_by(|&a, &b| scaled[b].partial_cmp(&scaled[a]).unwrap_or(std::cmp::Ordering::Equal));
+        order.sort_by(|&a, &b| {
+            scaled[b]
+                .partial_cmp(&scaled[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let mut m = scaled.clone();
         for &idx in order.iter().skip(top_k as usize) {
             m[idx] = f32::NEG_INFINITY;
@@ -244,7 +260,13 @@ where
     let max = masked.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = masked
         .iter()
-        .map(|&x| if x == f32::NEG_INFINITY { 0.0 } else { (x - max).exp() })
+        .map(|&x| {
+            if x == f32::NEG_INFINITY {
+                0.0
+            } else {
+                (x - max).exp()
+            }
+        })
         .collect();
     let sum: f32 = exps.iter().sum();
     if sum <= 0.0 || !max.is_finite() {
@@ -258,7 +280,11 @@ where
     // Top-p (nucleus): sort indices by descending probability, accumulate
     // mass, and cut once we cross `top_p`. A `top_p >= 1.0` keeps everything.
     let mut order: Vec<usize> = (0..probs.len()).collect();
-    order.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&a, &b| {
+        probs[b]
+            .partial_cmp(&probs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let cutoff = if top_p >= 1.0 {
         probs.len()
@@ -332,7 +358,10 @@ mod tests {
                 dominant += 1;
             }
         }
-        assert!(dominant > 990, "dominant token should win ~always, got {dominant}");
+        assert!(
+            dominant > 990,
+            "dominant token should win ~always, got {dominant}"
+        );
     }
 
     #[test]
@@ -362,7 +391,13 @@ mod tests {
 
     #[test]
     fn params_resolve_to_greedy_when_temperature_zero() {
-        let sampler = SamplingParams { temperature: 0.0, top_p: 0.9, top_k: 40, repeat_penalty: 1.0 }.into_sampler(42);
+        let sampler = SamplingParams {
+            temperature: 0.0,
+            top_p: 0.9,
+            top_k: 40,
+            repeat_penalty: 1.0,
+        }
+        .into_sampler(42);
         assert_eq!(sampler.name(), "greedy");
     }
 }
