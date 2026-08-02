@@ -13,10 +13,8 @@
 //! Design follows the FFI pattern from `lib.rs` — safe wrappers over unsafe
 //! HIP FFI, using `jit_compile_hsaco` for on-demand kernel compilation.
 
-
-
 use crate::device::helpers::check_hip;
-use crate::{hipSuccess, HiprtcProgram};
+use crate::{HiprtcProgram, hipSuccess};
 
 /// HIP source for the GPTQ wavefront correction kernel.
 ///
@@ -147,8 +145,8 @@ pub fn wavefront_size_for_gcn(gcn: &str) -> u32 {
     match gcn {
         "gfx90a" | "gfx942" | "gfx90c" => 64, // CDNA2/3 (MI210, MI250, MI300X)
         "gfx1200" | "gfx1201" | "gfx1100" | "gfx1102" | "gfx11" => 32, // RDNA4/3/2
-        "gfx1030" => 32,                       // RDNA2 (RX 6700)
-        _ => 64,                                // safe default
+        "gfx1030" => 32,                      // RDNA2 (RX 6700)
+        _ => 64,                              // safe default
     }
 }
 
@@ -157,7 +155,11 @@ pub fn wavefront_size_for_gcn(gcn: &str) -> u32 {
 /// Uses `hiprtc` (HIP runtime compilation) for JIT compilation targeting
 /// the specified GCN architecture. Consults `HsacoKernelCache` first to
 /// bypass compilation on cache hit.
-pub fn compile_gptq_kernel(kernel_name: &str, source: &str, gcn: &str) -> Result<Vec<u8>, crate::Error> {
+pub fn compile_gptq_kernel(
+    kernel_name: &str,
+    source: &str,
+    gcn: &str,
+) -> Result<Vec<u8>, crate::Error> {
     let hash = seahash::hash(source.as_bytes());
     let cache_key = format!("{}_{:016x}", kernel_name, hash);
 
@@ -199,7 +201,8 @@ pub fn compile_gptq_kernel(kernel_name: &str, source: &str, gcn: &str) -> Result
         );
         check_hip("hiprtcCreateProgram", status)?;
 
-        let compile_status = crate::hiprtcCompileProgram(prog, options.len() as i32, option_ptrs.as_ptr());
+        let compile_status =
+            crate::hiprtcCompileProgram(prog, options.len() as i32, option_ptrs.as_ptr());
 
         if compile_status != hipSuccess {
             let mut log_size: usize = 0;
@@ -218,14 +221,20 @@ pub fn compile_gptq_kernel(kernel_name: &str, source: &str, gcn: &str) -> Result
         let size_status = crate::hiprtcGetCodeSize(prog, &mut code_size);
         if size_status != hipSuccess {
             let _ = crate::hiprtcDestroyProgram(&mut prog);
-            return Err(crate::Error::Backend(format!("hiprtcGetCodeSize failed: {}", size_status)));
+            return Err(crate::Error::Backend(format!(
+                "hiprtcGetCodeSize failed: {}",
+                size_status
+            )));
         }
 
         let mut code_bytes = vec![0u8; code_size];
         let code_status = crate::hiprtcGetCode(prog, code_bytes.as_mut_ptr() as *mut i8);
         if code_status != hipSuccess {
             let _ = crate::hiprtcDestroyProgram(&mut prog);
-            return Err(crate::Error::Backend(format!("hiprtcGetCode failed: {}", code_status)));
+            return Err(crate::Error::Backend(format!(
+                "hiprtcGetCode failed: {}",
+                code_status
+            )));
         }
 
         let _ = cache.cache_kernel(&cache_key, source, &code_bytes);
@@ -235,7 +244,11 @@ pub fn compile_gptq_kernel(kernel_name: &str, source: &str, gcn: &str) -> Result
 
 /// Compile the wavefront correction HIP kernel for a target GCN architecture.
 pub fn compile_gptq_correction_kernel(gcn: &str) -> Result<Vec<u8>, crate::Error> {
-    compile_gptq_kernel("gptq_wavefront_correction_kernel", GPTQ_CORRECTION_KERNEL, gcn)
+    compile_gptq_kernel(
+        "gptq_wavefront_correction_kernel",
+        GPTQ_CORRECTION_KERNEL,
+        gcn,
+    )
 }
 
 /// Compile the scale fitting HIP kernel for a target GCN architecture.
@@ -267,4 +280,3 @@ mod tests {
         assert_eq!(wavefront_size_for_gcn("gfx1030"), 32);
     }
 }
-

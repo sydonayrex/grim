@@ -1,10 +1,16 @@
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{ArithType, DType, Shape, dtype::Storage as DTypeStorage};
 use grim_tensor::backend::BackendDevice;
+use grim_tensor::{ArithType, DType, Shape, dtype::Storage as DTypeStorage};
 use std::time::Instant;
 
 fn main() {
-    let dev = RocmDevice::new(0);
+    let dev = match RocmDevice::try_new(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("RocmDevice::try_new(0) failed: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // We tune some representative shapes seen in Llama / Gemma models:
     let shapes_to_tune = vec![

@@ -6,9 +6,9 @@
 //! ⚠️ SECURITY NOTE: dylib plugins run in process memory. A crash takes the engine down.
 //! This is for performance-critical extensions only. First-party and reviewed plugins required.
 
-use std::path::Path;
-use grim_tensor::error::{Error, Result};
 use crate::{GrimPluginVTable, PluginCapabilities, Sampler};
+use grim_tensor::error::{Error, Result};
+use std::path::Path;
 use std::sync::Arc;
 
 /// Loaded dylib plugin with its vtable and optional sampler.
@@ -25,7 +25,9 @@ impl DylibPluginLoader {
         let _ = path;
         #[cfg(not(feature = "dylib-loading"))]
         {
-            Err(Error::Unimplemented("dylib-loading feature is disabled".into()))
+            Err(Error::Unimplemented(
+                "dylib-loading feature is disabled".into(),
+            ))
         }
         #[cfg(feature = "dylib-loading")]
         unsafe {
@@ -39,7 +41,9 @@ impl DylibPluginLoader {
 
             let raw_vtable_ptr = get_vtable();
             if raw_vtable_ptr.is_null() {
-                return Err(Error::Backend("Loaded plugin vtable pointer is null".into()));
+                return Err(Error::Backend(
+                    "Loaded plugin vtable pointer is null".into(),
+                ));
             }
 
             // Copy/dereference the ABI-stable vtable
@@ -88,8 +92,10 @@ impl DylibPluginLoader {
 
     /// Get the plugin's capabilities. Returns zero on panic.
     pub fn capabilities(&self) -> PluginCapabilities {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.vtable.capabilities)()))
-            .unwrap_or(PluginCapabilities(0))
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (self.vtable.capabilities)()
+        }))
+        .unwrap_or(PluginCapabilities(0))
     }
 
     /// Get the plugin's name. Returns "unknown" on panic.
@@ -100,26 +106,36 @@ impl DylibPluginLoader {
                 return "unknown".to_string();
             }
             // SAFETY: Plugin promises valid UTF-8 string
-            unsafe { std::ffi::CStr::from_ptr(ptr).to_str().unwrap_or("invalid-name").to_string() }
-        })).unwrap_or_else(|_| "panicked".to_string())
+            unsafe {
+                std::ffi::CStr::from_ptr(ptr)
+                    .to_str()
+                    .unwrap_or("invalid-name")
+                    .to_string()
+            }
+        }))
+        .unwrap_or_else(|_| "panicked".to_string())
     }
 
     /// Create a sampler from this plugin if it provides one.
     pub fn create_sampler(&self) -> Result<Arc<dyn Sampler>> {
         let caps = self.capabilities();
         if !caps.contains(PluginCapabilities::SAMPLER) {
-            return Err(Error::Backend("Plugin does not support sampler capability".into()));
+            return Err(Error::Backend(
+                "Plugin does not support sampler capability".into(),
+            ));
         }
 
         if self.vtable.sampler_factory.is_none() {
-            return Err(Error::Backend("Plugin missing sampler_factory symbol".into()));
+            return Err(Error::Backend(
+                "Plugin missing sampler_factory symbol".into(),
+            ));
         }
 
         // In v1, dylib samplers need to implement the Sampler trait externally.
         // The plugin provides raw data that we wrap. For now, return an error
         // indicating this needs a concrete implementation.
         Err(Error::Unimplemented(
-            "Dylib sampler creation requires custom Sampler impl wrapping vtable".into()
+            "Dylib sampler creation requires custom Sampler impl wrapping vtable".into(),
         ))
     }
 }
@@ -141,8 +157,12 @@ mod tests {
     fn test_dylib_loader_memory_layout() {
         // Verify the vtable is #[repr(C)] and ABI-stable
         let vtable_size = std::mem::size_of::<GrimPluginVTable>();
-        let expected = std::mem::size_of::<u32>() * 7 + std::mem::size_of::<Option<extern "C" fn()>>();
-        assert!(vtable_size >= expected, "vtable should have expected layout");
+        let expected =
+            std::mem::size_of::<u32>() * 7 + std::mem::size_of::<Option<extern "C" fn()>>();
+        assert!(
+            vtable_size >= expected,
+            "vtable should have expected layout"
+        );
 
         let capabilities_offset = std::mem::offset_of!(GrimPluginVTable, capabilities);
         assert!(capabilities_offset > 0, "capabilities field offset check");

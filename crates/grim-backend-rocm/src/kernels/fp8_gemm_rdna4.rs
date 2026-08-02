@@ -1,23 +1,6 @@
-//! RDNA4 FP8 Matrix Engine GEMM kernel module (`gfx1200+` / RDNA3/4 fallback).
-//!
-//! Provides a standalone (non-fused) FP8 matrix multiply where both operands
-//! are already materialised as FP32 on the device.  On gfx1200+ (RDNA4 /
-//! CDNA3) the kernel uses a tiled 16×16 GEMM with unrolled MFMA-friendly
-//! accumulation; on RDNA3 (gfx1100) it uses a similar tiled approach with
-//! F32 accumulate; on older arches it runs a simple scalar loop.
-//!
-//! The entry point `grim_fp8_gemm_rdna4` is included in the single HIPRTC
-//! translation unit assembled by `source_asm::compute_kernel_source()`.
+//! RDNA4 FP8 Matrix Engine GEMM kernel module (`gfx1200+` / RDNA3/4 fallback). [see: `grim_fp8_gemm_rdna4`]
 
-/// HIPRTC source for the RDNA4 FP8 GEMM kernel.
-///
-/// Three implementations gated on `__gfx1200__` / `__gfx1100__`:
-/// - **gfx1200+**: tiled 16×16 GEMM, unrolled inner dim — the compiler
-///   maps the 16-wide F32 multiply-accumulate to FP8 MFMA on gfx1200
-///   when the source data is FP8-packed upstream.
-/// - **gfx1100** (RDNA3): same tiling, F32 accumulate (the compiler
-///   may lower to F16 MFMA on gfx1100).
-/// - **default** (RDNA2/older / other): scalar element-wise loop.
+/// HIPRTC source for the RDNA4 FP8 GEMM kernel. [see: `__gfx1200__`, `__gfx1100__`]
 pub const KERNEL_SOURCE: &str = r#"
 // ---------------------------------------------------------------------------
 // gfx1200+ tiled GEMM — 16×16 tiles, unrolled K in steps of 16.

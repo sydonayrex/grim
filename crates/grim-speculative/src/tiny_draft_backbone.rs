@@ -169,7 +169,7 @@ impl DraftBackbone for TinyDraftBackbone {
         let hidden_size = self.hidden;
         let vocab_size = self.vocab_size;
         let mut weights = self.weights.lock().unwrap();
-        
+
         let lr = 0.01f32;
         // Penultimate layer target hidden state mapping update:
         // Adjust the linear classification head (w_head) columns for accepted draft tokens
@@ -181,7 +181,8 @@ impl DraftBackbone for TinyDraftBackbone {
                     let h_start = pos * hidden_size;
                     if h_start + hidden_size <= target_hidden_states.len() {
                         for d in 0..hidden_size {
-                            weights.w_head[t * hidden_size + d] += lr * target_hidden_states[h_start + d];
+                            weights.w_head[t * hidden_size + d] +=
+                                lr * target_hidden_states[h_start + d];
                         }
                     }
                 }

@@ -1,8 +1,4 @@
 //! Mamba selective scan HIP kernel — Wave64 (256-thread block), LDS tiling, persistent for decode-step.
-//!
-//! Replaces the O(d_inner * d_state) nested-loop CPU step_block in mamba/src/lib.rs (§5.1).
-//! Each thread handles one n ∈ [0, d_inner). The sequential scan over s ∈ [0, d_state) runs
-//! in a loop within the thread. LDS shared memory tiles h[n, :] for cooperatively updated state.
 
 /// HIP source for `grim_selective_scan` and `grim_selective_scan_backward`.
 pub const KERNEL_SOURCE: &str = r#"

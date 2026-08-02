@@ -12,12 +12,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use grim_autograd::preference_loss::{
+    dpo_loss, grpo_loss, grpo_normalize_rewards, kto_loss, orpo_odds_ratio_loss, simpo_loss,
+};
+use grim_tensor::{DType, QuantProvenance, Shape, Tensor};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{RwLock, broadcast};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use grim_autograd::preference_loss::{dpo_loss, grpo_loss, kto_loss, orpo_odds_ratio_loss, simpo_loss};
 
 #[derive(Debug, Error)]
 pub enum JobError {
@@ -154,7 +157,9 @@ pub struct TrainingJob {
     pub cancel: CancellationToken,
 }
 
-fn default_accumulation_steps() -> u32 { 1 }
+fn default_accumulation_steps() -> u32 {
+    1
+}
 
 impl Default for TrainingJob {
     fn default() -> Self {
@@ -172,7 +177,7 @@ impl Default for TrainingJob {
             accumulation_steps: 1,
             optimizer: grim_autograd::OptimizerKind::AdamW,
             scheduler: grim_autograd::LRScheduler::Cosine,
-            min_lr: 2e-7,  // 1% of default learning rate 2e-5
+            min_lr: 2e-7, // 1% of default learning rate 2e-5
             num_gpus: 0,
             use_pissa: false,
             use_olora: false,
@@ -453,8 +458,15 @@ impl JobRegistry {
 fn initial_loss(mode: TrainingMode) -> f64 {
     match mode {
         TrainingMode::Lora | TrainingMode::QLoRA | TrainingMode::Bf16Full => 2.3,
-        TrainingMode::RsLora | TrainingMode::Dora | TrainingMode::LoftQ | TrainingMode::SoulEater => 2.3,
-        TrainingMode::Orpo | TrainingMode::Dpo | TrainingMode::Kto | TrainingMode::SimPo | TrainingMode::Grpo => 0.0,
+        TrainingMode::RsLora
+        | TrainingMode::Dora
+        | TrainingMode::LoftQ
+        | TrainingMode::SoulEater => 2.3,
+        TrainingMode::Orpo
+        | TrainingMode::Dpo
+        | TrainingMode::Kto
+        | TrainingMode::SimPo
+        | TrainingMode::Grpo => 0.0,
     }
 }
 
@@ -513,12 +525,10 @@ fn olora_penalty_for_registry(reg: &grim_autograd::registry::AutogradRegistry) -
 /// Implements `MetadataLookup` over a parsed `GgufFile` and resolves the
 /// architecture from the `general.architecture` key. Returns `None` when the
 /// path isn't a readable GGUF (caller falls back to default hyperparams).
-fn read_model_hyperparams(
-    model_path: &str,
-) -> Option<grim_core::hyperparams::ArchHyperparameters> {
+fn read_model_hyperparams(model_path: &str) -> Option<grim_core::hyperparams::ArchHyperparameters> {
     use grim_core::hyperparams::{HyperparameterExtractor, MetadataLookup};
-    use std::io::BufReader;
     use std::fs::File;
+    use std::io::BufReader;
 
     /// Adapter that implements `MetadataLookup` over a `GgufFile`'s metadata
     /// HashMap — the same trait the inference engine's model loader uses.
@@ -526,7 +536,9 @@ fn read_model_hyperparams(
 
     impl MetadataLookup for GgufMetaLookup {
         fn get_str(&self, key: &str) -> Option<String> {
-            self.0.get(key).and_then(|v| v.as_str().map(|s| s.to_string()))
+            self.0
+                .get(key)
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
         }
         fn get_u32(&self, key: &str) -> Option<u32> {
             self.0.get(key).and_then(|v| v.as_u32())
@@ -539,7 +551,10 @@ fn read_model_hyperparams(
     let file = File::open(model_path).ok()?;
     let mut reader = BufReader::new(file);
     let gguf = grim_format::gguf::read_gguf(&mut reader).ok()?;
-    let arch_str = gguf.metadata.get("general.architecture").and_then(|v| v.as_str())?;
+    let arch_str = gguf
+        .metadata
+        .get("general.architecture")
+        .and_then(|v| v.as_str())?;
     let arch = grim_core::architecture::ModelArchitecture::from_str(arch_str);
     let lookup = GgufMetaLookup(gguf.metadata);
     Some(HyperparameterExtractor::extract(arch, &lookup))
@@ -583,7 +598,10 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     if let Some(ref cp_path) = job.resume_from_checkpoint {
         if let Ok(Some(state)) = grim_format::train::TrainState::read(cp_path) {
             step_counter = state.step;
-            eprintln!("[grim-garage] worker: {} resuming from step {}", id, step_counter);
+            eprintln!(
+                "[grim-garage] worker: {} resuming from step {}",
+                id, step_counter
+            );
         }
     }
 
@@ -622,16 +640,15 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     // Constructed once per job; when num_gpus <= 1 the handle is None and
     // all_reduce_grads falls back to the CPU-only accumulate path.
     let rccl_handle = if job.num_gpus > 1 && backend.label == "rocm" {
-        Some(grim_backend_rocm::rccl::RcclAllReduce::new(job.num_gpus as u32))
+        Some(grim_backend_rocm::RcclAllReduce::new(job.num_gpus as u32))
     } else {
         None
     };
 
     use grim_autograd::{
-        AutogradRegistry, AutogradScope, InjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry, Tape,
-        backward, cross_entropy_loss,
+        AutogradRegistry, AutogradScope, InjectionConfig, LoRAInjectionPoint,
+        LoRAInjectionRegistry, Tape, backward, cross_entropy_loss,
     };
-    use grim_tensor::Shape;
 
     let lora_rank = job.lora_rank as usize;
 
@@ -653,6 +670,111 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     let hidden_size = hparams.hidden_size;
     let vocab_size = hparams.vocab_size;
     let num_layers = hparams.num_layers;
+
+    // Training modes that need the real base model for forward passes:
+    // SFT modes for cross-entropy loss, RL modes for preference log-probs.
+    let needs_model = matches!(
+        mode,
+        TrainingMode::Lora
+            | TrainingMode::QLoRA
+            | TrainingMode::Bf16Full
+            | TrainingMode::RsLora
+            | TrainingMode::Dora
+            | TrainingMode::LoftQ
+            | TrainingMode::SoulEater
+            | TrainingMode::Dpo
+            | TrainingMode::Orpo
+            | TrainingMode::Kto
+            | TrainingMode::SimPo
+            | TrainingMode::Grpo
+    );
+    let mut sft_base: Option<(
+        grim_format::GgufProvider,
+        grim_nn::Embedding,
+        grim_nn::RmsNorm,
+        grim_nn::Linear,
+        grim_engine::streaming_forward::StreamingBlockForward,
+        grim_models_transformer::LlamaConfig,
+    )> = None;
+    if needs_model {
+        match grim_format::GgufProvider::open(&job.model_path) {
+            Ok(provider) => {
+                // Load the head once per job. The per-layer weights are
+                // streamed inside `forward_block_with_autograd` (which builds
+                // its own WeightSource per block), matching the CLI trainer.
+                let ws = grim_nn::WeightSource::root(&provider, backend.device.clone());
+                let head = (|| -> Result<(grim_nn::Embedding, grim_nn::RmsNorm, grim_nn::Linear, grim_models_transformer::LlamaConfig), String> {
+                    let tok_embeddings =
+                        grim_nn::Embedding::load(&ws.pp("token_embd"), vocab_size, hidden_size)
+                            .map_err(|e| format!("token_embd load failed: {e}"))?;
+                    let output_norm =
+                        grim_nn::RmsNorm::load(&ws.pp("output_norm"), hidden_size, hparams.rms_norm_eps)
+                            .map_err(|e| format!("output_norm load failed: {e}"))?;
+                    let lm_head = match grim_nn::Linear::load(
+                        &ws.pp("output"),
+                        hidden_size,
+                        vocab_size,
+                        false,
+                    ) {
+                        Ok(l) => l,
+                        Err(_) => grim_nn::Linear::from_tensor(tok_embeddings.weight().clone(), None),
+                    };
+                    let llama_cfg = grim_models_transformer::LlamaConfig {
+                        vocab_size: hparams.vocab_size,
+                        hidden_size: hparams.hidden_size,
+                        num_heads: hparams.num_heads,
+                        num_kv_heads: hparams.num_kv_heads,
+                        head_dim: hparams.head_dim,
+                        num_layers: hparams.num_layers,
+                        intermediate_size: hparams.intermediate_size,
+                        rms_norm_eps: hparams.rms_norm_eps,
+                        rope_theta: hparams.rope_theta,
+                        max_seq_len: hparams.max_seq_len,
+                    };
+                    Ok((tok_embeddings, output_norm, lm_head, llama_cfg))
+                })();
+                match head {
+                    Ok((tok_embeddings, output_norm, lm_head, llama_cfg)) => {
+                        sft_base = Some((
+                            provider,
+                            tok_embeddings,
+                            output_norm,
+                            lm_head,
+                            grim_engine::streaming_forward::StreamingBlockForward::new(
+                                num_layers,
+                                hidden_size,
+                            ),
+                            llama_cfg,
+                        ));
+                        eprintln!(
+                            "[grim-garage] worker: {} loaded real base model (layers={num_layers}, hidden={hidden_size})",
+                            id
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[grim-garage] worker: {} failed to load real base model from {}: {e}",
+                            id, job.model_path
+                        );
+                        let _ = registry
+                            .update_status_and_broadcast(&id, JobStatus::Failed)
+                            .await;
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[grim-garage] worker: {} cannot open model '{}': {e} — SFT modes require a readable GGUF model",
+                    id, job.model_path
+                );
+                let _ = registry
+                    .update_status_and_broadcast(&id, JobStatus::Failed)
+                    .await;
+                return;
+            }
+        }
+    }
 
     let inj_cfg = InjectionConfig {
         hidden_size,
@@ -679,29 +801,23 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     // PI-T1: real base weights arrive with WI-T8 model loading; until then
     // the worker passes `None` and PiSSA degrades to standard LoRA init
     // (the registry falls back when no weight entry exists).
-    let mut autograd_reg = match AutogradRegistry::with_scope_and_base_weights(
-        inj_cfg,
-        inj_reg,
-        scope,
-        None,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!(
-                "[grim-garage] worker: autograd registry init failed for {}: {e}",
-                id
-            );
-            let _ = registry
-                .update_status_and_broadcast(&id, JobStatus::Failed)
-                .await;
-            return;
-        }
-    };
+    let mut autograd_reg =
+        match AutogradRegistry::with_scope_and_base_weights(inj_cfg, inj_reg, scope, None) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "[grim-garage] worker: autograd registry init failed for {}: {e}",
+                    id
+                );
+                let _ = registry
+                    .update_status_and_broadcast(&id, JobStatus::Failed)
+                    .await;
+                return;
+            }
+        };
 
-    let mut optimizer = match grim_autograd::Optimizer::new(
-        job.optimizer,
-        job.learning_rate as f32,
-    ) {
+    let mut optimizer = match grim_autograd::Optimizer::new(job.optimizer, job.learning_rate as f32)
+    {
         Ok(o) => o,
         Err(e) => {
             eprintln!(
@@ -714,6 +830,27 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             return;
         }
     };
+
+    // Restore LoRA adapter weights and optimizer state (Adam moments)
+    // from checkpoint. Without this, resumed training starts from
+    // freshly initialized weights and zero momentum — silently
+    // discarding the accumulated training progress.
+    if let Some(ref cp_path) = job.resume_from_checkpoint {
+        if let Ok(Some(state)) = grim_format::train::TrainState::read(cp_path) {
+            if let Err(e) = optimizer.load_from_train_state(&mut autograd_reg.params, &state) {
+                eprintln!(
+                    "[grim-garage] worker: {} failed to load checkpoint state: {e}",
+                    id
+                );
+            } else {
+                eprintln!(
+                    "[grim-garage] worker: {} restored {} optimizer blobs from checkpoint",
+                    id,
+                    state.blobs.len()
+                );
+            }
+        }
+    }
 
     // LR schedule: dispatch via grim_autograd::LRScheduler (Cosine, Linear,
     // Polynomial, Constant, InverseSqrt, etc.). The schedule is applied
@@ -755,10 +892,24 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
     let tokenizer_path = model_dir.join("tokenizer.json");
-    let tokenizer = grim_format::tokenizer::GgufTokenizer::from_hf_json(
-        tokenizer_path.to_string_lossy().as_ref(),
-    )
-    .unwrap_or_default();
+    // Prefer the model's own GGUF tokenizer when the real base model was
+    // opened (SFT): its vocab is guaranteed aligned with the weights, so
+    // in-vocab token ids from the dataloader stay valid. Fall back to
+    // `tokenizer.json` and finally the whitespace default.
+    let tokenizer = if let Some((ref provider, ..)) = sft_base {
+        match provider.tokenizer() {
+            Ok(t) => t,
+            Err(_) => grim_format::tokenizer::GgufTokenizer::from_hf_json(
+                tokenizer_path.to_string_lossy().as_ref(),
+            )
+            .unwrap_or_default(),
+        }
+    } else {
+        grim_format::tokenizer::GgufTokenizer::from_hf_json(
+            tokenizer_path.to_string_lossy().as_ref(),
+        )
+        .unwrap_or_default()
+    };
     let seq_len = 64usize;
     let batch_size = 1usize;
     let mut dataloader = if !job.dataset_path.is_empty()
@@ -818,10 +969,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                             // labels are the shifted next-token ids; flatten
                             // to a target index per position for cross-entropy.
                             let label_vec = labels.storage().to_cpu_vec_f32().unwrap_or_default();
-                            let targets: Vec<usize> = label_vec
-                                .iter()
-                                .map(|&v| v as usize)
-                                .collect();
+                            let targets: Vec<usize> =
+                                label_vec.iter().map(|&v| v as usize).collect();
                             (inputs, targets)
                         }
                         Err(_) => {
@@ -848,7 +997,6 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                         .await;
                     return;
                 };
-                let x_id = tape.register(x_tensor.clone());
 
                 // SCYTHE-2 WI-9: consult the C²PLR controller for this layer's
                 // placement when running multi-GPU. The controller's cache
@@ -856,10 +1004,13 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 // decision on cache miss (prefill). We record the chosen
                 // placement to feed back into `update()` after the step.
                 let placement = if let Some(ref mut ctrl) = scythe_controller {
-                    let caps = vec![grim_tensor::backend::GpuCapability {
-                        ordinal: 0,
-                        ..Default::default()
-                    }; num_gpus];
+                    let caps = vec![
+                        grim_tensor::backend::GpuCapability {
+                            ordinal: 0,
+                            ..Default::default()
+                        };
+                        num_gpus
+                    ];
                     let links = vec![grim_tensor::backend::ScytheLink::Host; num_gpus * num_gpus];
                     let shape_slice: Vec<usize> = x_tensor.shape().dims().to_vec();
                     Some(ctrl.decide(0, &shape_slice, &caps, &links, 0))
@@ -867,36 +1018,86 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     None
                 };
 
-                let mut curr_x = x_tensor.clone();
-                let mut curr_x_id = x_id;
+                // Grim-Redux Issue 1: run the real frozen base model forward.
+                // token ids → embedding → per-layer StreamingBlockForward
+                // (which applies the LoRA adapters at every injection point
+                // inside genuine attention/MLP computation) → output_norm →
+                // lm_head → logits. This replaces the previous zero-tensor
+                // "base" loop that grounded LoRA training in garbage.
+                let forward_outcome: Result<
+                    (f32, grim_tensor::Tensor, grim_autograd::TensorId),
+                    String,
+                > = (|| {
+                    let sft = sft_base.as_mut().ok_or_else(|| {
+                        "SFT mode requires the real base model (set during setup)".to_string()
+                    })?;
+                    let &mut (
+                        ref provider,
+                        ref tok_embeddings,
+                        ref output_norm,
+                        ref lm_head,
+                        ref mut streaming,
+                        ref llama_cfg,
+                    ) = sft;
 
-                for layer_idx in 0..num_layers {
-                    for &point in LoRAInjectionPoint::all_standard_qlora() {
-                        if autograd_reg.injection_registry.get(layer_idx, point).is_some() {
-                            let base_tensor = backend
-                                .make_tensor(vec![0.0f32; vocab_size], Shape::new(vec![1, vocab_size]))
-                                .unwrap();
-                            let base_id = tape.register(base_tensor.clone());
-                            if let Ok((out_id, out_t)) = grim_autograd::apply_and_record_lora(
+                    // The dataloader stores token ids in an f32 tensor; convert
+                    // to u32 and clamp any out-of-vocab id (e.g. a pad token
+                    // from a mismatched tokenizer) into range.
+                    let ids_f32 = x_tensor.storage().to_cpu_vec_f32().unwrap_or_default();
+                    let mut input_ids: Vec<u32> = ids_f32.iter().map(|&v| v as u32).collect();
+                    for t in input_ids.iter_mut() {
+                        if *t as usize >= vocab_size {
+                            *t = (vocab_size as u32).saturating_sub(1);
+                        }
+                    }
+                    let seq_len = input_ids.len();
+
+                    let mut curr_x = tok_embeddings
+                        .forward(&input_ids, seq_len, hidden_size)
+                        .map_err(|e| format!("embedding forward: {e}"))?;
+                    let mut curr_x_id = tape.register(curr_x.clone());
+
+                    for layer_idx in 0..num_layers {
+                        let (next_id, next_h) = streaming
+                            .forward_block_with_autograd(
+                                provider,
+                                llama_cfg,
                                 &autograd_reg,
                                 &mut tape,
                                 layer_idx,
-                                point,
-                                base_tensor,
-                                base_id,
-                                curr_x.clone(),
+                                &curr_x,
                                 curr_x_id,
-                            ) {
-                                curr_x = out_t;
-                                curr_x_id = out_id;
-                            }
-                        }
+                            )
+                            .map_err(|e| format!("layer {layer_idx} forward: {e}"))?;
+                        curr_x = next_h;
+                        curr_x_id = next_id;
                     }
-                }
-                let (logits_id, logits_out) = (curr_x_id, curr_x);
 
-                match cross_entropy_loss(&logits_out, &targets) {
-                    Ok((loss_val, loss_grad)) => {
+                    curr_x = output_norm
+                        .forward(&curr_x)
+                        .map_err(|e| format!("output_norm forward: {e}"))?;
+                    let logits_base = lm_head
+                        .forward(&curr_x)
+                        .map_err(|e| format!("lm_head forward: {e}"))?;
+                    let logits_base_id = tape.register(logits_base.clone());
+                    let (logits_id, logits_out) = grim_autograd::apply_and_record_lora(
+                        &autograd_reg,
+                        &mut tape,
+                        num_layers,
+                        LoRAInjectionPoint::Logits,
+                        logits_base,
+                        logits_base_id,
+                        curr_x.clone(),
+                        curr_x_id,
+                    )
+                    .map_err(|e| format!("logits lora apply: {e}"))?;
+                    let (loss_val, loss_grad) =
+                        cross_entropy_loss(&logits_out, &targets).map_err(|e| e.to_string())?;
+                    Ok((loss_val, loss_grad, logits_id))
+                })();
+
+                match forward_outcome {
+                    Ok((loss_val, loss_grad, logits_id)) => {
                         // OLoRA: add the orthogonality penalty to the scalar
                         // loss before backward. Host-computed (off-tape) per
                         // the OLoRA plan; contributes to the reported/accum
@@ -907,21 +1108,37 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                             input_grad: loss_grad,
                             factor: 1.0 / accumulation_steps as f32,
                         };
-                        let scaled_grad_tensor = grim_autograd::scale_backward(&scaled_grad).expect("scale_backward failed");
-                        let _ = backward(&tape, scaled_grad_tensor, logits_id, &mut autograd_reg.params);
+                        let scaled_grad_tensor = grim_autograd::scale_backward(&scaled_grad)
+                            .expect("scale_backward failed");
+                        let _ = backward(
+                            &tape,
+                            scaled_grad_tensor,
+                            logits_id,
+                            &mut autograd_reg.params,
+                        );
                         accum_loss += scaled_loss_val;
                         if (micro_step + 1) % accumulation_steps as usize == 0 {
                             if num_gpus > 1 {
-                                let placement_struct = placement.as_ref().map(|p| grim_tensor::backend::ScythePlacement {
-                                    ranks: (0..num_gpus).collect(),
-                                    partition: vec![1.0 / num_gpus as f32; num_gpus],
-                                    routes: p.routes.clone(),
-                                }).unwrap_or_else(|| grim_tensor::backend::ScythePlacement {
-                                    ranks: (0..num_gpus).collect(),
-                                    partition: vec![1.0 / num_gpus as f32; num_gpus],
-                                    routes: vec![grim_tensor::backend::ScytheLink::Host; num_gpus * num_gpus],
-                                });
-                                let _ = autograd_reg.params.all_reduce_grads(backend.device_impl(), &placement_struct, rccl_handle.as_ref());
+                                let placement_struct = placement
+                                    .as_ref()
+                                    .map(|p| grim_tensor::backend::ScythePlacement {
+                                        ranks: (0..num_gpus).collect(),
+                                        partition: vec![1.0 / num_gpus as f32; num_gpus],
+                                        routes: p.routes.clone(),
+                                    })
+                                    .unwrap_or_else(|| grim_tensor::backend::ScythePlacement {
+                                        ranks: (0..num_gpus).collect(),
+                                        partition: vec![1.0 / num_gpus as f32; num_gpus],
+                                        routes: vec![
+                                            grim_tensor::backend::ScytheLink::Host;
+                                            num_gpus * num_gpus
+                                        ],
+                                    });
+                                let _ = autograd_reg.params.all_reduce_grads(
+                                    backend.device_impl(),
+                                    &placement_struct,
+                                    rccl_handle.as_ref(),
+                                );
                             }
                             let _ = optimizer.step(&mut autograd_reg.params);
                             let _ = autograd_reg.params.zero_all_grads();
@@ -937,44 +1154,383 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                         }
                         loss_val as f64
                     }
-                    // M3: a step that fails the autograd tensor ops is
-                    // surfaced as a 10 % decay from the mode's initial
-                    // loss rather than from the previously-stored `loss`.
-                    // The previous "loss * 0.9" was correct for SFT but
+                    // M3: a step that fails the autograd tensor ops (forward,
+                    // LoRA apply, or loss) is surfaced as a 10 % decay from the
+                    // mode's initial loss rather than from the previously-stored
+                    // `loss`. The previous "loss * 0.9" was correct for SFT but
                     // trapped RL modes at zero forever.
-                    Err(_) => step_loss_fallback(mode),
+                    Err(e) => {
+                        eprintln!("[grim-garage] worker: {} step failed: {e}", id);
+                        step_loss_fallback(mode)
+                    }
                 }
             }
-                                    TrainingMode::Dpo | TrainingMode::Orpo | TrainingMode::Kto | TrainingMode::SimPo | TrainingMode::Grpo => {
-                let chosen_logps = vec![-1.2f32; 4];
-                let rejected_logps = vec![-2.2f32; 4];
-                let ref_chosen = vec![-1.5f32; 4];
-                let ref_rejected = vec![-2.0f32; 4];
-                let chosen_lens = vec![16usize; 4];
-                let rejected_lens = vec![16usize; 4];
-                let rewards = vec![1.0f32, 0.5f32, 0.2f32, 0.0f32];
+            TrainingMode::Dpo
+            | TrainingMode::Orpo
+            | TrainingMode::Kto
+            | TrainingMode::SimPo
+            | TrainingMode::Grpo => {
+                // Load a real preference pair from the dataloader instead of
+                // feeding the loss functions hardcoded constant vectors.
+                let (chosen_ids, rejected_ids) = if let Some(ref mut dl) = dataloader {
+                    match dl.next_preference_batch() {
+                        Ok(Some((chosen, rejected, _))) => {
+                            let chosen_f32 = chosen.storage().to_cpu_vec_f32().unwrap_or_default();
+                            let rejected_f32 =
+                                rejected.storage().to_cpu_vec_f32().unwrap_or_default();
+                            let chosen_ids: Vec<u32> =
+                                chosen_f32.iter().map(|&v| v as u32).collect();
+                            let rejected_ids: Vec<u32> =
+                                rejected_f32.iter().map(|&v| v as u32).collect();
+                            (chosen_ids, rejected_ids)
+                        }
+                        Ok(None) => break 'step,
+                        Err(_) => break 'step,
+                    }
+                } else {
+                    break 'step;
+                };
 
-                let loss_val = match mode {
+                // Numerically-stable log-softmax over one row of logits.
+                fn log_softmax_row(logits: &[f32]) -> Vec<f32> {
+                    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let sum_exp: f32 = logits.iter().map(|&x| (x - max).exp()).sum();
+                    let log_sum = max + sum_exp.ln();
+                    logits.iter().map(|&x| x - log_sum).collect()
+                }
+
+                // Derivative of numerically-stable softplus: sigmoid(x).
+                fn softplus_grad(x: f32) -> f32 {
+                    1.0 / (1.0 + (-x).exp().min(1e10))
+                }
+
+                // Run the frozen base model forward and return per-sample
+                // log-probabilities (sum of per-token log-softmax values at the
+                // actual token positions). Also returns the raw logits and the
+                // tensor ID needed for the backward VJP.
+                let mut run_forward = |input_ids: &[u32],
+                                       tape: &mut Tape,
+                                       with_lora: bool|
+                 -> Result<
+                    (Vec<f32>, Vec<f32>, grim_autograd::TensorId),
+                    Box<dyn std::error::Error>,
+                > {
+                    let sft = sft_base.as_mut().ok_or_else(|| {
+                        "RL mode requires the real base model (set during setup)".to_string()
+                    })?;
+                    let &mut (
+                        ref provider,
+                        ref tok_embeddings,
+                        ref output_norm,
+                        ref lm_head,
+                        ref mut streaming,
+                        ref llama_cfg,
+                    ) = sft;
+
+                    let mut curr_x = tok_embeddings
+                        .forward(input_ids, input_ids.len(), hidden_size)
+                        .map_err(|e| format!("embedding forward: {e}"))?;
+                    let mut curr_x_id = tape.register(curr_x.clone());
+
+                    for layer_idx in 0..num_layers {
+                        let (next_id, next_h) = streaming
+                            .forward_block_with_autograd(
+                                provider,
+                                llama_cfg,
+                                &autograd_reg,
+                                tape,
+                                layer_idx,
+                                &curr_x,
+                                curr_x_id,
+                            )
+                            .map_err(|e| format!("layer {layer_idx} forward: {e}"))?;
+                        curr_x = next_h;
+                        curr_x_id = next_id;
+                    }
+
+                    curr_x = output_norm
+                        .forward(&curr_x)
+                        .map_err(|e| format!("output_norm forward: {e}"))?;
+                    let logits_base = lm_head
+                        .forward(&curr_x)
+                        .map_err(|e| format!("lm_head forward: {e}"))?;
+                    let logits_base_id = tape.register(logits_base.clone());
+                    let (logits_id, logits) = if with_lora {
+                        grim_autograd::apply_and_record_lora(
+                            &autograd_reg,
+                            tape,
+                            num_layers,
+                            LoRAInjectionPoint::Logits,
+                            logits_base,
+                            logits_base_id,
+                            curr_x.clone(),
+                            curr_x_id,
+                        )
+                        .map_err(|e| format!("logits lora apply: {e}"))?
+                    } else {
+                        (logits_base_id, logits_base)
+                    };
+
+                    let logits_vec = logits.to_vec_f32()?;
+                    let mut sample_logps = Vec::with_capacity(input_ids.len());
+                    for t in 0..input_ids.len() {
+                        let row_start = t * vocab_size;
+                        let row = &logits_vec[row_start..row_start + vocab_size];
+                        let logps = log_softmax_row(row);
+                        let token_id = input_ids[t] as usize;
+                        if token_id < vocab_size {
+                            sample_logps.push(logps[token_id]);
+                        }
+                    }
+                    Ok((sample_logps, logits_vec, logits_id))
+                };
+
+                // VJP of the per-sample log-probability through log-softmax:
+                // dL/d(logits_t[j]) = dL/d(sample_logp) * (δ_{j,y_t} - softmax(logits_t)[j])
+                let mut vjp_log_softmax_sum = |logits_vec: &[f32],
+                                               input_ids: &[u32],
+                                               vocab_size: usize,
+                                               dL_d_logp: f32|
+                 -> Vec<f32> {
+                    let mut grad = vec![0.0f32; logits_vec.len()];
+                    for t in 0..input_ids.len() {
+                        let row_start = t * vocab_size;
+                        let row = &logits_vec[row_start..row_start + vocab_size];
+                        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let sum_exp: f32 = row.iter().map(|&x| (x - max).exp()).sum();
+                        let softmax: Vec<f32> =
+                            row.iter().map(|&x| (x - max).exp() / sum_exp).collect();
+                        let token_id = input_ids[t] as usize;
+                        for j in 0..vocab_size.min(row.len()) {
+                            grad[row_start + j] =
+                                dL_d_logp * (softmax[j] - if j == token_id { 1.0 } else { 0.0 });
+                        }
+                    }
+                    grad
+                };
+
+                let (chosen_logps, chosen_logits_vec, chosen_logits_id) =
+                    match run_forward(&chosen_ids, &mut tape, true) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("[grim-garage] worker: {} chosen forward failed: {e}", id);
+                            break 'step;
+                        }
+                    };
+                let (rejected_logps, rejected_logits_vec, rejected_logits_id) =
+                    match run_forward(&rejected_ids, &mut tape, true) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("[grim-garage] worker: {} rejected forward failed: {e}", id);
+                            break 'step;
+                        }
+                    };
+
+                // Reference policy is the frozen base checkpoint: no LoRA
+                // injection and a separate tape that is never backpropagated.
+                let mut ref_tape = Tape::new();
+                let ref_chosen = match run_forward(&chosen_ids, &mut ref_tape, false) {
+                    Ok((logps, _, _)) => logps,
+                    Err(e) => {
+                        eprintln!("[grim-garage] worker: {id} reference chosen forward failed: {e}");
+                        break 'step;
+                    }
+                };
+                let ref_rejected = match run_forward(&rejected_ids, &mut ref_tape, false) {
+                    Ok((logps, _, _)) => logps,
+                    Err(e) => {
+                        eprintln!("[grim-garage] worker: {id} reference rejected forward failed: {e}");
+                        break 'step;
+                    }
+                };
+
+                // Simple reward signal for GRPO: chosen minus rejected logp.
+                let rewards: Vec<f32> = chosen_logps
+                    .iter()
+                    .zip(rejected_logps.iter())
+                    .map(|(&c, &r)| c - r)
+                    .collect();
+
+                let (loss_val, dL_d_chosen_logp, dL_d_rejected_logp) = match mode {
                     TrainingMode::Dpo => {
-                        let (l, _, _) = dpo_loss(&chosen_logps, &rejected_logps, &ref_chosen, &ref_rejected, 0.1).unwrap_or((0.5, vec![], vec![]));
-                        l
+                        let (l, _, _) = dpo_loss(
+                            &chosen_logps,
+                            &rejected_logps,
+                            &ref_chosen,
+                            &ref_rejected,
+                            0.1,
+                        )
+                        .unwrap_or((0.5, vec![], vec![]));
+                        // Analytical gradient: dL/d(chosen_logps_i) = -beta * sigmoid(-logits_i) / n
+                        let n = chosen_logps.len().max(1) as f32;
+                        let mut grad_c = vec![0.0f32; chosen_logps.len()];
+                        let mut grad_r = vec![0.0f32; rejected_logps.len()];
+                        for i in 0..chosen_logps.len() {
+                            let chosen_logr = chosen_logps[i] - ref_chosen[i];
+                            let rejected_logr = rejected_logps[i] - ref_rejected[i];
+                            let logits = 0.1 * (chosen_logr - rejected_logr);
+                            let sig_neg = 1.0 / (1.0 + logits.exp().min(1e10));
+                            grad_c[i] = -0.1 * sig_neg / n;
+                            grad_r[i] = 0.1 * sig_neg / n;
+                        }
+                        (l, grad_c, grad_r)
                     }
                     TrainingMode::Orpo => {
-                        orpo_odds_ratio_loss(&chosen_logps, &rejected_logps, 0.1).unwrap_or(0.5)
+                        let l = orpo_odds_ratio_loss(&chosen_logps, &rejected_logps, 0.1)
+                            .unwrap_or(0.5);
+                        // Analytical gradient for ORPO.
+                        let n = chosen_logps.len().max(1) as f32;
+                        let mut grad_c = vec![0.0f32; chosen_logps.len()];
+                        let mut grad_r = vec![0.0f32; rejected_logps.len()];
+                        for i in 0..chosen_logps.len().min(rejected_logps.len()) {
+                            let p_c = chosen_logps[i].exp().clamp(1e-7, 1.0 - 1e-7);
+                            let p_r = rejected_logps[i].exp().clamp(1e-7, 1.0 - 1e-7);
+                            let odds_c = p_c / (1.0 - p_c);
+                            let odds_r = p_r / (1.0 - p_r);
+                            let log_odds = (odds_c / odds_r).ln();
+                            let sig_neg = 1.0 / (1.0 + log_odds.exp().min(1e10));
+                            grad_c[i] = 0.1 * sig_neg / ((1.0 - p_c).max(1e-7) * n);
+                            grad_r[i] = -0.1 * sig_neg / ((1.0 - p_r).max(1e-7) * n);
+                        }
+                        (l, grad_c, grad_r)
                     }
                     TrainingMode::Kto => {
-                        let (l, _, _) = kto_loss(&chosen_logps, &rejected_logps, &ref_chosen, &ref_rejected, 0.1, 1.0, 1.0).unwrap_or((0.5, vec![], vec![]));
-                        l
+                        let (l, _, _) = kto_loss(
+                            &chosen_logps,
+                            &rejected_logps,
+                            &ref_chosen,
+                            &ref_rejected,
+                            0.1,
+                            1.0,
+                            1.0,
+                        )
+                        .unwrap_or((0.5, vec![], vec![]));
+                        let n_w = chosen_logps.len().max(1) as f32;
+                        let n_l = rejected_logps.len().max(1) as f32;
+                        let mut grad_c = vec![0.0f32; chosen_logps.len()];
+                        let mut grad_r = vec![0.0f32; rejected_logps.len()];
+                        let mut chosen_logr_sum = 0.0f32;
+                        for i in 0..chosen_logps.len() {
+                            chosen_logr_sum += chosen_logps[i] - ref_chosen[i];
+                        }
+                        let kl_est = chosen_logr_sum / n_w;
+                        for i in 0..chosen_logps.len() {
+                            let v_w = chosen_logps[i] - ref_chosen[i];
+                            grad_c[i] = 1.0 * softplus_grad(-0.1 * (v_w - kl_est)) * (-0.1) / n_w;
+                        }
+                        for j in 0..rejected_logps.len() {
+                            let v_l = rejected_logps[j] - ref_rejected[j];
+                            grad_r[j] = 1.0 * softplus_grad(-0.1 * (kl_est - v_l)) * 0.1 / n_l;
+                        }
+                        (l, grad_c, grad_r)
                     }
                     TrainingMode::SimPo => {
-                        simpo_loss(&chosen_logps, &rejected_logps, &chosen_lens, &rejected_lens, 2.0, 0.5).unwrap_or(0.5)
+                        let l = simpo_loss(
+                            &chosen_logps,
+                            &rejected_logps,
+                            &vec![1; chosen_logps.len()],
+                            &vec![1; rejected_logps.len()],
+                            2.0,
+                            0.5,
+                        )
+                        .unwrap_or(0.5);
+                        let n = chosen_logps.len().max(1) as f32;
+                        let mut grad_c = vec![0.0f32; chosen_logps.len()];
+                        let mut grad_r = vec![0.0f32; rejected_logps.len()];
+                        for i in 0..chosen_logps.len().min(rejected_logps.len()) {
+                            let p_w = chosen_logps[i];
+                            let p_l = rejected_logps[i];
+                            let margin = 2.0 * (p_w - p_l) - 0.5;
+                            let sp_grad = softplus_grad(-margin);
+                            grad_c[i] = 2.0 * sp_grad / n;
+                            grad_r[i] = -2.0 * sp_grad / n;
+                        }
+                        (l, grad_c, grad_r)
                     }
                     TrainingMode::Grpo => {
-                        let (l, _) = grpo_loss(&chosen_logps, &ref_chosen, &ref_rejected, &rewards, 0.04, 0.2).unwrap_or((0.5, vec![]));
-                        l
+                        let (l, _) = grpo_loss(
+                            &chosen_logps,
+                            &ref_chosen,
+                            &ref_rejected,
+                            &rewards,
+                            0.04,
+                            0.2,
+                        )
+                        .unwrap_or((0.5, vec![]));
+                        let norm_rewards = grpo_normalize_rewards(&rewards, 1e-8);
+                        let n = chosen_logps.len().max(1) as f32;
+                        let mut grad_c = vec![0.0f32; chosen_logps.len()];
+                        for i in 0..chosen_logps.len() {
+                            let log_ratio = chosen_logps[i] - ref_chosen[i];
+                            let ratio = log_ratio.exp();
+                            let adv = norm_rewards.get(i).copied().unwrap_or(0.0);
+                            let surr1 = ratio * adv;
+                            let surr2 = ratio.clamp(1.0 - 0.2, 1.0 + 0.2) * adv;
+                            let obj = surr1.min(surr2);
+                            let kl_div = (ref_chosen[i] - chosen_logps[i]).exp()
+                                - (ref_chosen[i] - chosen_logps[i])
+                                - 1.0;
+                            grad_c[i] = (-obj + 0.04 * kl_div) / n;
+                        }
+                        (l, grad_c, vec![0.0f32; rejected_logps.len()])
                     }
-                    _ => 0.5,
+                    _ => (
+                        0.5,
+                        vec![0.0f32; chosen_logps.len()],
+                        vec![0.0f32; rejected_logps.len()],
+                    ),
                 };
+
+                // Backward: VJP the per-sample log-probability gradients through
+                // the model's logits so the LoRA adapters receive real signals.
+                let chosen_grad_vec = vjp_log_softmax_sum(
+                    &chosen_logits_vec,
+                    &chosen_ids,
+                    vocab_size,
+                    dL_d_chosen_logp.iter().sum::<f32>(),
+                );
+                let rejected_grad_vec = vjp_log_softmax_sum(
+                    &rejected_logits_vec,
+                    &rejected_ids,
+                    vocab_size,
+                    dL_d_rejected_logp.iter().sum::<f32>(),
+                );
+
+                let dev = backend.device_impl();
+                let chosen_grad_storage = dev.from_cpu(
+                    &chosen_grad_vec,
+                    &Shape::new(vec![chosen_ids.len(), vocab_size]),
+                    DType::F32,
+                );
+                let rejected_grad_storage = dev.from_cpu(
+                    &rejected_grad_vec,
+                    &Shape::new(vec![rejected_ids.len(), vocab_size]),
+                    DType::F32,
+                );
+
+                if let (Ok(cg), Ok(rg)) = (chosen_grad_storage, rejected_grad_storage) {
+                    let cg_tensor = Tensor::new(
+                        std::sync::Arc::from(cg),
+                        Shape::new(vec![chosen_ids.len(), vocab_size]),
+                        DType::F32,
+                        QuantProvenance::GrimNative,
+                        backend.device.clone(),
+                    );
+                    let rg_tensor = Tensor::new(
+                        std::sync::Arc::from(rg),
+                        Shape::new(vec![rejected_ids.len(), vocab_size]),
+                        DType::F32,
+                        QuantProvenance::GrimNative,
+                        backend.device.clone(),
+                    );
+                    let _ = backward(&tape, cg_tensor, chosen_logits_id, &mut autograd_reg.params);
+                    let _ = backward(
+                        &tape,
+                        rg_tensor,
+                        rejected_logits_id,
+                        &mut autograd_reg.params,
+                    );
+                }
 
                 // OLoRA: add the orthogonality penalty to the scalar
                 // preference loss, matching the SFT branch.
@@ -996,7 +1552,11 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         // slot before the next step.
         let current_step = (micro_step + 1) / accumulation_steps as usize;
         let clamped_step = current_step as usize;
-        optimizer.set_lr(job.scheduler.get_lr(base_lr, clamped_step, total_steps).max(min_lr));
+        optimizer.set_lr(
+            job.scheduler
+                .get_lr(base_lr, clamped_step, total_steps)
+                .max(min_lr),
+        );
 
         let elapsed = step_start.elapsed().as_secs_f32().max(1e-6);
 
@@ -1024,11 +1584,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         let vram_used_mb: u32 = match backend.device {
             grim_tensor::Device::Rocm(ord) => {
                 let (free, total) = grim_backend_rocm::vram_info(ord);
-                if total > 0 {
-                    ((total - free) / (1024 * 1024)) as u32
-                } else {
-                    0
-                }
+                ((total - free) / (1024 * 1024)) as u32
             }
             _ => 0,
         };
@@ -1052,9 +1608,14 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             // Real token count: seq_len (64) × batch_size (1) × steps ×
             // accumulation. Previously hardcoded as 512 — now derived from
             // the actual batch shape the dataloader yields.
-            tokens: (current_step as u64 + 1) * (64 * batch_size as u64) * accumulation_steps as u64,
+            tokens: (current_step as u64 + 1)
+                * (64 * batch_size as u64)
+                * accumulation_steps as u64,
             grad_norm,
-            lr: job.scheduler.get_lr(base_lr, clamped_step, total_steps).max(min_lr),
+            lr: job
+                .scheduler
+                .get_lr(base_lr, clamped_step, total_steps)
+                .max(min_lr),
             vram_used_mb,
             samples_per_sec,
         };

@@ -11,10 +11,7 @@ fn golden_grim_export_round_trips_f32_tensor() {
 
     // Hand-construct 64 F32 values that fill exactly one Wave64 segment (256 B).
     let values: Vec<f32> = (0..64).map(|i| i as f32 * 0.125 - 4.0).collect();
-    let payload: Vec<u8> = values
-        .iter()
-        .flat_map(|v| v.to_le_bytes())
-        .collect();
+    let payload: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     assert_eq!(payload.len(), 256);
 
     let entry = GrimTensorEntry {
@@ -69,16 +66,14 @@ fn golden_grim_export_round_trips_f32_tensor() {
     assert_eq!(raw.shape, vec![8, 8]);
     assert_eq!(raw.bytes.len(), 256);
 
-    let got_values: Vec<f32> = raw.bytes.chunks_exact(4)
+    let got_values: Vec<f32> = raw
+        .bytes
+        .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
     for (i, (&got, &want)) in got_values.iter().zip(values.iter()).enumerate() {
         let abs = (got - want).abs();
-        assert!(
-            abs == 0.0,
-            "golden[{}]: got {} want {}",
-            i, got, want,
-        );
+        assert!(abs == 0.0, "golden[{}]: got {} want {}", i, got, want,);
     }
 }

@@ -1,8 +1,8 @@
 //! Wrappers and FFI bindings for system RCCL (NCCL) collectives (WI-R1, WI-R3).
 
-use std::ffi::{c_char, c_void};
-use grim_tensor::error::{Error, Result};
 use grim_tensor::DType;
+use grim_tensor::error::{Error, Result};
+use std::ffi::{c_char, c_void};
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy)]
@@ -52,7 +52,12 @@ impl Default for CommComputeOverlapConfig {
 #[link(name = "rccl", kind = "dylib")]
 unsafe extern "C" {
     pub fn ncclGetUniqueId(id: *mut NcclUniqueId) -> NcclResult;
-    pub fn ncclCommInitRank(comm: *mut NcclComm, nranks: i32, id: NcclUniqueId, rank: i32) -> NcclResult;
+    pub fn ncclCommInitRank(
+        comm: *mut NcclComm,
+        nranks: i32,
+        id: NcclUniqueId,
+        rank: i32,
+    ) -> NcclResult;
     pub fn ncclCommInitAll(comms: *mut NcclComm, ndev: i32, devlist: *const i32) -> NcclResult;
     pub fn ncclCommDestroy(comm: NcclComm) -> NcclResult;
     pub fn ncclAllReduce(
@@ -126,7 +131,10 @@ impl UniqueId {
             if res == NCCL_SUCCESS {
                 Ok(UniqueId(id))
             } else {
-                Err(Error::Backend(format!("ncclGetUniqueId failed with status {}", res)))
+                Err(Error::Backend(format!(
+                    "ncclGetUniqueId failed with status {}",
+                    res
+                )))
             }
         }
         #[cfg(not(feature = "rccl"))]
@@ -150,7 +158,10 @@ impl RocmComm {
             if res == NCCL_SUCCESS {
                 Ok(RocmComm { comm })
             } else {
-                Err(Error::Backend(format!("ncclCommInitRank failed with status {}", res)))
+                Err(Error::Backend(format!(
+                    "ncclCommInitRank failed with status {}",
+                    res
+                )))
             }
         }
         #[cfg(not(feature = "rccl"))]
@@ -177,13 +188,21 @@ impl RocmComm {
             let nccl_dtype = match dtype.arith {
                 grim_tensor::ArithType::F16 | grim_tensor::ArithType::BF16 => NCCL_FLOAT16,
                 grim_tensor::ArithType::F32 => NCCL_FLOAT32,
-                _ => return Err(Error::Backend(format!("Unsupported RCCL dtype {:?}", dtype))),
+                _ => {
+                    return Err(Error::Backend(format!(
+                        "Unsupported RCCL dtype {:?}",
+                        dtype
+                    )));
+                }
             };
             let res = ncclAllReduce(send, recv, count, nccl_dtype, NCCL_SUM, self.comm, stream);
             if res == NCCL_SUCCESS {
                 Ok(())
             } else {
-                Err(Error::Backend(format!("ncclAllReduce failed with status {}", res)))
+                Err(Error::Backend(format!(
+                    "ncclAllReduce failed with status {}",
+                    res
+                )))
             }
         }
         #[cfg(not(feature = "rccl"))]
@@ -206,13 +225,23 @@ impl RocmComm {
             let nccl_dtype = match dtype.arith {
                 grim_tensor::ArithType::F16 | grim_tensor::ArithType::BF16 => NCCL_FLOAT16,
                 grim_tensor::ArithType::F32 => NCCL_FLOAT32,
-                _ => return Err(Error::Backend(format!("Unsupported RCCL dtype {:?}", dtype))),
+                _ => {
+                    return Err(Error::Backend(format!(
+                        "Unsupported RCCL dtype {:?}",
+                        dtype
+                    )));
+                }
             };
-            let res = ncclReduceScatter(send, recv, recv_count, nccl_dtype, NCCL_SUM, self.comm, stream);
+            let res = ncclReduceScatter(
+                send, recv, recv_count, nccl_dtype, NCCL_SUM, self.comm, stream,
+            );
             if res == NCCL_SUCCESS {
                 Ok(())
             } else {
-                Err(Error::Backend(format!("ncclReduceScatter failed with status {}", res)))
+                Err(Error::Backend(format!(
+                    "ncclReduceScatter failed with status {}",
+                    res
+                )))
             }
         }
         #[cfg(not(feature = "rccl"))]
@@ -235,13 +264,21 @@ impl RocmComm {
             let nccl_dtype = match dtype.arith {
                 grim_tensor::ArithType::F16 | grim_tensor::ArithType::BF16 => NCCL_FLOAT16,
                 grim_tensor::ArithType::F32 => NCCL_FLOAT32,
-                _ => return Err(Error::Backend(format!("Unsupported RCCL dtype {:?}", dtype))),
+                _ => {
+                    return Err(Error::Backend(format!(
+                        "Unsupported RCCL dtype {:?}",
+                        dtype
+                    )));
+                }
             };
             let res = ncclAllGather(send, recv, send_count, nccl_dtype, self.comm, stream);
             if res == NCCL_SUCCESS {
                 Ok(())
             } else {
-                Err(Error::Backend(format!("ncclAllGather failed with status {}", res)))
+                Err(Error::Backend(format!(
+                    "ncclAllGather failed with status {}",
+                    res
+                )))
             }
         }
         #[cfg(not(feature = "rccl"))]
@@ -260,37 +297,59 @@ impl RocmComm {
         stream: *mut c_void,
     ) -> Result<()> {
         if send_buffs.is_empty() {
-            return Err(Error::Backend("fuse_reduce_scatter: send_buffs list cannot be empty".into()));
+            return Err(Error::Backend(
+                "fuse_reduce_scatter: send_buffs list cannot be empty".into(),
+            ));
         }
         if recv_buff.is_null() {
-            return Err(Error::Backend("fuse_reduce_scatter: recv_buff cannot be null".into()));
+            return Err(Error::Backend(
+                "fuse_reduce_scatter: recv_buff cannot be null".into(),
+            ));
         }
         #[cfg(feature = "rccl")]
         unsafe {
             let nccl_dtype = match dtype.arith {
                 grim_tensor::ArithType::F16 | grim_tensor::ArithType::BF16 => NCCL_FLOAT16,
                 grim_tensor::ArithType::F32 => NCCL_FLOAT32,
-                _ => return Err(Error::Backend(format!("Unsupported RCCL dtype {:?}", dtype))),
+                _ => {
+                    return Err(Error::Backend(format!(
+                        "Unsupported RCCL dtype {:?}",
+                        dtype
+                    )));
+                }
             };
             if send_buffs.len() == 1 {
                 let local_send = send_buffs[0].0;
                 if local_send.is_null() {
-                    return Err(Error::Backend("fuse_reduce_scatter: send buffer is null".into()));
+                    return Err(Error::Backend(
+                        "fuse_reduce_scatter: send buffer is null".into(),
+                    ));
                 }
-                let res = ncclReduceScatter(local_send, recv_buff, recv_count, nccl_dtype, NCCL_SUM, self.comm, stream);
+                let res = ncclReduceScatter(
+                    local_send, recv_buff, recv_count, nccl_dtype, NCCL_SUM, self.comm, stream,
+                );
                 if res != NCCL_SUCCESS {
-                    return Err(Error::Backend(format!("ncclReduceScatter failed with status {}", res)));
+                    return Err(Error::Backend(format!(
+                        "ncclReduceScatter failed with status {}",
+                        res
+                    )));
                 }
             } else {
                 let _ = ncclGroupStart();
                 for &(send_ptr, _rank) in send_buffs {
                     if !send_ptr.is_null() {
-                        let _ = ncclReduceScatter(send_ptr, recv_buff, recv_count, nccl_dtype, NCCL_SUM, self.comm, stream);
+                        let _ = ncclReduceScatter(
+                            send_ptr, recv_buff, recv_count, nccl_dtype, NCCL_SUM, self.comm,
+                            stream,
+                        );
                     }
                 }
                 let res = ncclGroupEnd();
                 if res != NCCL_SUCCESS {
-                    return Err(Error::Backend(format!("ncclReduceScatter group failed with status {}", res)));
+                    return Err(Error::Backend(format!(
+                        "ncclReduceScatter group failed with status {}",
+                        res
+                    )));
                 }
             }
             Ok(())
@@ -311,37 +370,58 @@ impl RocmComm {
         stream: *mut c_void,
     ) -> Result<()> {
         if recv_buffs.is_empty() {
-            return Err(Error::Backend("fuse_all_gather: recv_buffs list cannot be empty".into()));
+            return Err(Error::Backend(
+                "fuse_all_gather: recv_buffs list cannot be empty".into(),
+            ));
         }
         if send_buff.is_null() {
-            return Err(Error::Backend("fuse_all_gather: send_buff cannot be null".into()));
+            return Err(Error::Backend(
+                "fuse_all_gather: send_buff cannot be null".into(),
+            ));
         }
         #[cfg(feature = "rccl")]
         unsafe {
             let nccl_dtype = match dtype.arith {
                 grim_tensor::ArithType::F16 | grim_tensor::ArithType::BF16 => NCCL_FLOAT16,
                 grim_tensor::ArithType::F32 => NCCL_FLOAT32,
-                _ => return Err(Error::Backend(format!("Unsupported RCCL dtype {:?}", dtype))),
+                _ => {
+                    return Err(Error::Backend(format!(
+                        "Unsupported RCCL dtype {:?}",
+                        dtype
+                    )));
+                }
             };
             if recv_buffs.len() == 1 {
                 let local_recv = recv_buffs[0].0;
                 if local_recv.is_null() {
-                    return Err(Error::Backend("fuse_all_gather: recv buffer is null".into()));
+                    return Err(Error::Backend(
+                        "fuse_all_gather: recv buffer is null".into(),
+                    ));
                 }
-                let res = ncclAllGather(send_buff, local_recv, send_count, nccl_dtype, self.comm, stream);
+                let res = ncclAllGather(
+                    send_buff, local_recv, send_count, nccl_dtype, self.comm, stream,
+                );
                 if res != NCCL_SUCCESS {
-                    return Err(Error::Backend(format!("ncclAllGather failed with status {}", res)));
+                    return Err(Error::Backend(format!(
+                        "ncclAllGather failed with status {}",
+                        res
+                    )));
                 }
             } else {
                 let _ = ncclGroupStart();
                 for &(recv_ptr, _rank) in recv_buffs {
                     if !recv_ptr.is_null() {
-                        let _ = ncclAllGather(send_buff, recv_ptr, send_count, nccl_dtype, self.comm, stream);
+                        let _ = ncclAllGather(
+                            send_buff, recv_ptr, send_count, nccl_dtype, self.comm, stream,
+                        );
                     }
                 }
                 let res = ncclGroupEnd();
                 if res != NCCL_SUCCESS {
-                    return Err(Error::Backend(format!("ncclAllGather group failed with status {}", res)));
+                    return Err(Error::Backend(format!(
+                        "ncclAllGather group failed with status {}",
+                        res
+                    )));
                 }
             }
             Ok(())
@@ -386,7 +466,10 @@ pub fn p2p_memcpy_async(
         if res == 0 {
             Ok(())
         } else {
-            Err(Error::Backend(format!("hipMemcpyPeerAsync failed with status {}", res)))
+            Err(Error::Backend(format!(
+                "hipMemcpyPeerAsync failed with status {}",
+                res
+            )))
         }
     }
     #[cfg(not(feature = "rccl"))]
@@ -427,7 +510,8 @@ pub fn tp_all_reduce(
     {
         Err(Error::Backend(
             "tp_all_reduce: RCCL feature not enabled; \
-             build with --features rccl for multi-GPU TP".into(),
+             build with --features rccl for multi-GPU TP"
+                .into(),
         ))
     }
 }
@@ -572,7 +656,9 @@ impl Drop for RcclAllReduce {
         if let Some(comm) = self.comm.take() {
             if !comm.0.is_null() {
                 // Best-effort destroy; ignore status.
-                unsafe { let _ = ncclCommDestroy(comm); }
+                unsafe {
+                    let _ = ncclCommDestroy(comm);
+                }
             }
         }
     }

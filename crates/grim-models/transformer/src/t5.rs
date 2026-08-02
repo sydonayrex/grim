@@ -1,8 +1,8 @@
 //! T5 family — Encoder-Decoder architecture using relative position bias.
 
-use grim_backend_cpu::{cpu_tensor, add_tensors};
+use grim_backend_cpu::{add_tensors, cpu_tensor};
 use grim_core::error::Result;
-use grim_core::model::{EncoderDecoderLm, ModalityHint, CausalLm, AdapterHandle};
+use grim_core::model::{AdapterHandle, CausalLm, EncoderDecoderLm, ModalityHint};
 use grim_core::{Model, ModelConfig};
 use grim_nn::{Embedding, Linear, RmsNorm};
 use grim_tensor::{ArithType, Device, Tensor};
@@ -42,15 +42,53 @@ pub struct T5Block {
 
 impl T5Block {
     pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: &T5Config) -> Result<Self> {
-        let norm = RmsNorm::load(&ws.pp("layer.0.layer_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let wq = Linear::load(&ws.pp("layer.0.SelfAttention.q"), cfg.hidden_size, cfg.hidden_size, false)?;
-        let wk = Linear::load(&ws.pp("layer.0.SelfAttention.k"), cfg.hidden_size, cfg.hidden_size, false)?;
-        let wv = Linear::load(&ws.pp("layer.0.SelfAttention.v"), cfg.hidden_size, cfg.hidden_size, false)?;
-        let wo = Linear::load(&ws.pp("layer.0.SelfAttention.o"), cfg.hidden_size, cfg.hidden_size, false)?;
+        let norm = RmsNorm::load(
+            &ws.pp("layer.0.layer_norm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
+        let wq = Linear::load(
+            &ws.pp("layer.0.SelfAttention.q"),
+            cfg.hidden_size,
+            cfg.hidden_size,
+            false,
+        )?;
+        let wk = Linear::load(
+            &ws.pp("layer.0.SelfAttention.k"),
+            cfg.hidden_size,
+            cfg.hidden_size,
+            false,
+        )?;
+        let wv = Linear::load(
+            &ws.pp("layer.0.SelfAttention.v"),
+            cfg.hidden_size,
+            cfg.hidden_size,
+            false,
+        )?;
+        let wo = Linear::load(
+            &ws.pp("layer.0.SelfAttention.o"),
+            cfg.hidden_size,
+            cfg.hidden_size,
+            false,
+        )?;
 
-        let ffn_norm = RmsNorm::load(&ws.pp("layer.1.layer_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let ffn_up = Linear::load(&ws.pp("layer.1.DenseReluDense.wi"), cfg.hidden_size, cfg.intermediate_size, false)?;
-        let ffn_down = Linear::load(&ws.pp("layer.1.DenseReluDense.wo"), cfg.intermediate_size, cfg.hidden_size, false)?;
+        let ffn_norm = RmsNorm::load(
+            &ws.pp("layer.1.layer_norm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
+        let ffn_up = Linear::load(
+            &ws.pp("layer.1.DenseReluDense.wi"),
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            false,
+        )?;
+        let ffn_down = Linear::load(
+            &ws.pp("layer.1.DenseReluDense.wo"),
+            cfg.intermediate_size,
+            cfg.hidden_size,
+            false,
+        )?;
 
         Ok(Self {
             norm,
@@ -70,16 +108,14 @@ impl T5Block {
         let _k = self.wk.forward(&norm_x)?;
         let _v = self.wv.forward(&norm_x)?;
         let attn_out = self.wo.forward(&q)?;
-        let x_res1 = add_tensors(x, &attn_out)
-            .map_err(grim_core::Error::Tensor)?;
+        let x_res1 = add_tensors(x, &attn_out).map_err(grim_core::Error::Tensor)?;
 
         let norm_x2 = self.ffn_norm.forward(&x_res1)?;
         let up = self.ffn_up.forward(&norm_x2)?;
         let relu_up = relu(&up)?;
         let ffn_out = self.ffn_down.forward(&relu_up)?;
 
-        add_tensors(&x_res1, &ffn_out)
-            .map_err(grim_core::Error::Tensor)
+        add_tensors(&x_res1, &ffn_out).map_err(grim_core::Error::Tensor)
     }
 }
 
@@ -97,13 +133,23 @@ impl T5 {
         let shared = Embedding::load(&ws.pp("shared"), cfg.vocab_size, cfg.hidden_size)?;
         let mut encoder_layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            encoder_layers.push(T5Block::load(&ws.pp("encoder.block").pp(&i.to_string()), &cfg)?);
+            encoder_layers.push(T5Block::load(
+                &ws.pp("encoder.block").pp(&i.to_string()),
+                &cfg,
+            )?);
         }
         let mut decoder_layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            decoder_layers.push(T5Block::load(&ws.pp("decoder.block").pp(&i.to_string()), &cfg)?);
+            decoder_layers.push(T5Block::load(
+                &ws.pp("decoder.block").pp(&i.to_string()),
+                &cfg,
+            )?);
         }
-        let final_norm = RmsNorm::load(&ws.pp("encoder.final_layer_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let final_norm = RmsNorm::load(
+            &ws.pp("encoder.final_layer_norm"),
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
 
         Ok(Self {
             cfg,

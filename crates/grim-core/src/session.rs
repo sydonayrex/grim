@@ -38,7 +38,9 @@ pub trait SessionT: Send {
     fn eval_eager(&mut self, op: &str, inputs: &[&Tensor]) -> Result<Tensor> {
         let _ = op;
         if inputs.is_empty() {
-            return Err(crate::error::Error::Session("eval_eager: empty inputs".into()));
+            return Err(crate::error::Error::Session(
+                "eval_eager: empty inputs".into(),
+            ));
         }
         Ok(inputs[0].clone())
     }
@@ -56,7 +58,7 @@ pub trait SessionT: Send {
         None
     }
     fn set_model_state(&mut self, _state: Box<dyn std::any::Any + Send>) {}
-    
+
     /// Per-request RNG for deterministic sampling (e.g., speculative rejection).
     fn request_rng(&self) -> Option<&SimpleRng> {
         None
@@ -109,10 +111,28 @@ pub struct Inner {
 
 impl Inner {
     pub fn new(device: Device) -> Self {
-        Self { device, kv: None, current_pos: 0, hip_graph_handle: None, last_hidden_state: None, model_state: None, request_rng: None, last_accepted_tokens: 1 }
+        Self {
+            device,
+            kv: None,
+            current_pos: 0,
+            hip_graph_handle: None,
+            last_hidden_state: None,
+            model_state: None,
+            request_rng: None,
+            last_accepted_tokens: 1,
+        }
     }
     pub fn with_kv(device: Device, kv: Box<dyn KvCache>) -> Self {
-        Self { device, kv: Some(kv), current_pos: 0, hip_graph_handle: None, last_hidden_state: None, model_state: None, request_rng: None, last_accepted_tokens: 1 }
+        Self {
+            device,
+            kv: Some(kv),
+            current_pos: 0,
+            hip_graph_handle: None,
+            last_hidden_state: None,
+            model_state: None,
+            request_rng: None,
+            last_accepted_tokens: 1,
+        }
     }
 }
 
@@ -154,7 +174,9 @@ impl SessionT for Inner {
     fn eval_eager(&mut self, op: &str, inputs: &[&Tensor]) -> Result<Tensor> {
         let _ = op;
         if inputs.is_empty() {
-            return Err(crate::error::Error::Session("eval_eager: empty inputs".into()));
+            return Err(crate::error::Error::Session(
+                "eval_eager: empty inputs".into(),
+            ));
         }
         Ok(inputs[0].clone())
     }
@@ -205,7 +227,10 @@ pub struct Graph {
 
 impl Graph {
     pub fn new() -> Self {
-        Self { nodes: Vec::new(), outputs: Vec::new() }
+        Self {
+            nodes: Vec::new(),
+            outputs: Vec::new(),
+        }
     }
 
     /// Replays the captured computation graph using bound session inputs.
@@ -255,7 +280,10 @@ impl GraphBuilder for Session {
 impl Inner {
     /// Concrete-only escape hatch — call directly on `Inner` rather than
     /// through trait dispatch when you need a `&mut dyn KvCache`.
-    pub fn with_kv_mut<R>(&mut self, f: &mut dyn FnMut(&mut dyn KvCache) -> Result<R>) -> Result<Option<R>> {
+    pub fn with_kv_mut<R>(
+        &mut self,
+        f: &mut dyn FnMut(&mut dyn KvCache) -> Result<R>,
+    ) -> Result<Option<R>> {
         if let Some(kv) = self.kv.as_deref_mut() {
             Ok(Some(f(kv)?))
         } else {

@@ -1,7 +1,7 @@
 //! ViewModel — deterministic projection of `DisplayState` into the
 //! strings/structs/IDs that the UI surface consumes.
 //!
-//! The CVKG widgets (and any future React/Vite/Tauri renderer) render
+//! The UI components (and any future React/Vite/Tauri renderer) render
 //! from this layer rather than from the raw `UiAppState`. This keeps
 //! every piece of UI text testable and stable across renderer swaps.
 //!
@@ -14,8 +14,8 @@ pub mod layout;
 pub mod rocm_panel;
 pub mod training_panel;
 
-use crate::discovery::{DatasetEntry, ModelEntry};
 use crate::backend::BackendProbe;
+use crate::discovery::{DatasetEntry, ModelEntry};
 use crate::ui_state::display::DisplayState;
 
 pub use hyperparam::HyperparamFormV1;

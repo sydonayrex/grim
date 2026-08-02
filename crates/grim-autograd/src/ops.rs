@@ -3,7 +3,7 @@
 //! Provides reverse-mode backward implementations for MatMul, Add, Scale, and fused LoRA application.
 
 use grim_tensor::dtype::{BlockDtype, FloatPackScheme, KQuantScheme};
-use grim_tensor::{DType, Error, Storage, Tensor, error::Result, Shape};
+use grim_tensor::{DType, Device, Error, Shape, Storage, Tensor, error::Result};
 use std::sync::Arc;
 
 /// DoRA (Weight-Decomposed LoRA) forward pass.
@@ -18,8 +18,6 @@ use std::sync::Arc;
 /// 5. Output for input X: Y = X @ W_eff^T
 ///
 /// Returns Y = X @ W_eff^T.
-
-
 
 pub fn dora_forward(
     x: &Tensor,
@@ -40,7 +38,11 @@ pub fn dora_forward(
 
     // Handle batch dimension
     let batch = if x_dims.len() == 1 { 1 } else { x_dims[0] };
-    let in_features = if x_dims.len() == 1 { x_dims[0] } else { x_dims[1] };
+    let in_features = if x_dims.len() == 1 {
+        x_dims[0]
+    } else {
+        x_dims[1]
+    };
 
     // Validate dimensions
     let out_features = w_dims[0];
@@ -180,7 +182,11 @@ pub fn dora_backward(
 
     // Handle batch dimension
     let batch = if x_dims.len() == 1 { 1 } else { x_dims[0] };
-    let in_features = if x_dims.len() == 1 { x_dims[0] } else { x_dims[1] };
+    let in_features = if x_dims.len() == 1 {
+        x_dims[0]
+    } else {
+        x_dims[1]
+    };
 
     let out_features = w_dims[0];
     let rank = a_dims[0];
@@ -463,20 +469,34 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
         );
         let b_on_rocm = matches!(args.b.device(), grim_tensor::Device::Rocm(_));
 
+        let empty_scales: [f32; 0] = [];
+        let b_scales: &[f32] = match args.b.dtype().storage {
+            Storage::KQuant(..) | Storage::Block(..) | Storage::FloatPack(..) => &empty_scales,
+            Storage::ResidualPacked(..) | Storage::GroupInt(..) => match args.b.quant_scales() {
+                Some(s) => s,
+                None => {
+                    return Err(Error::Backend(
+                        "matmul_backward: ResidualPacked/GroupInt tensor requires explicit scales"
+                            .into(),
+                    ));
+                }
+            },
+            Storage::Native => &empty_scales,
+        };
+
         if b_quantized && b_on_rocm {
             let bpw = bpw_from_dtype(&args.b.dtype());
-            let empty_scales: [f32; 0] = [];
-            let residuals: Option<grim_tensor::QuantizedMatmulBackwardResiduals> = None;
+            let residuals = grim_tensor::QuantizedMatmulBackwardResiduals::from_tensor(&args.b);
             if let Ok((grad_a_storage, _handle)) = dev.quantized_matmul_backward_dx(
                 args.out_grad.storage().as_ref(),
                 args.b.storage().as_ref(),
-                &empty_scales,
+                b_scales,
                 bpw,
                 m,
                 n,
                 k,
                 args.a.shape(),
-                residuals.as_ref(),
+                Some(&residuals),
             ) {
                 let grad_a = Tensor::new(
                     Arc::from(grad_a_storage),
@@ -872,7 +892,77 @@ pub fn lora_backward(
     Ok((grad_base, grad_x, grad_a, grad_b))
 }
 
-/// VeRA (Vector-quantized Representation Adaptation) forward pass.
+/// SwiGLU backward: `output = silu(gate) * up`.
+///
+/// Returns `(d_gate, d_up)` where:
+/// - `d_gate = dw * up * silu'(gate)`
+/// - `d_up = dw * silu(gate)`
+///
+/// On ROCm, dispatches to the `grim_silu_mul_backward` HIP kernel for
+/// device-resident computation. Falls back to CPU vector math otherwise.
+pub fn silu_mul_backward(gate: &Tensor, up: &Tensor, dw: &Tensor) -> Result<(Tensor, Tensor)> {
+    let n = gate.shape().elem_count();
+    let dev = crate::pick_device_for_tensor(gate);
+
+    // ROCm GPU path: use the fused silu_mul_backward kernel.
+    if let Device::Rocm(_) = gate.device() {
+        let gate_s = gate.storage().as_ref();
+        let up_s = up.storage().as_ref();
+        let dw_s = dw.storage().as_ref();
+        if let Ok((df_storage, de_storage, _handle)) =
+            dev.silu_mul_backward(gate_s, up_s, dw_s, gate.shape())
+        {
+            let d_gate = Tensor::new(
+                Arc::from(df_storage),
+                gate.shape().clone(),
+                DType::F32,
+                gate.provenance().clone(),
+                gate.device().clone(),
+            );
+            let d_up = Tensor::new(
+                Arc::from(de_storage),
+                up.shape().clone(),
+                DType::F32,
+                up.provenance().clone(),
+                up.device().clone(),
+            );
+            return Ok((d_gate, d_up));
+        }
+    }
+
+    // CPU fallback: elementwise SwiGLU backward.
+    let gate_vec = gate.to_vec_f32()?;
+    let up_vec = up.to_vec_f32()?;
+    let dw_vec = dw.to_vec_f32()?;
+
+    let mut d_gate_vec = vec![0.0f32; n];
+    let mut d_up_vec = vec![0.0f32; n];
+    for i in 0..n {
+        let g = gate_vec[i];
+        let se = 1.0f32 / (1.0f32 + (-g).exp());
+        let silu_g = se * g;
+        let dsilu = se * (1.0f32 + g * (1.0f32 - se));
+        d_gate_vec[i] = dw_vec[i] * up_vec[i] * dsilu;
+        d_up_vec[i] = dw_vec[i] * silu_g;
+    }
+
+    let d_gate = Tensor::new(
+        Arc::from(dev.from_cpu(&d_gate_vec, gate.shape(), DType::F32)?),
+        gate.shape().clone(),
+        DType::F32,
+        gate.provenance().clone(),
+        gate.device().clone(),
+    );
+    let d_up = Tensor::new(
+        Arc::from(dev.from_cpu(&d_up_vec, up.shape(), DType::F32)?),
+        up.shape().clone(),
+        DType::F32,
+        up.provenance().clone(),
+        up.device().clone(),
+    );
+
+    Ok((d_gate, d_up))
+}
 ///
 /// Computes a codebook-quantized low-rank update. `BA = B @ A` is quantized per
 /// output row against a set of scalar codebooks before being applied, so the
@@ -899,7 +989,11 @@ pub fn vera_forward(
     let b_dims = b.shape().dims();
 
     let batch = if x_dims.len() == 1 { 1 } else { x_dims[0] };
-    let in_features = if x_dims.len() == 1 { x_dims[0] } else { x_dims[1] };
+    let in_features = if x_dims.len() == 1 {
+        x_dims[0]
+    } else {
+        x_dims[1]
+    };
     let rank = a_dims[0];
     let out_features = b_dims[0];
 
@@ -1001,7 +1095,11 @@ pub fn vera_backward(
     let g_dims = out_grad.shape().dims();
 
     let batch = if x_dims.len() == 1 { 1 } else { x_dims[0] };
-    let in_features = if x_dims.len() == 1 { x_dims[0] } else { x_dims[1] };
+    let in_features = if x_dims.len() == 1 {
+        x_dims[0]
+    } else {
+        x_dims[1]
+    };
     let rank = a_dims[0];
     let out_features = b_dims[0];
     let g_out = if g_dims.len() == 1 { 1 } else { g_dims[0] };
@@ -1010,7 +1108,9 @@ pub fn vera_backward(
         return Err(Error::Backend("VeRA backward: empty codebook set".into()));
     }
     if g_out != batch || g_dims[g_dims.len() - 1] != out_features {
-        return Err(Error::Backend("VeRA backward: out_grad shape mismatch".into()));
+        return Err(Error::Backend(
+            "VeRA backward: out_grad shape mismatch".into(),
+        ));
     }
     if a_dims[1] != in_features || b_dims[1] != rank {
         return Err(Error::Backend("VeRA backward: A/B shape mismatch".into()));
@@ -1130,11 +1230,7 @@ pub fn vera_backward(
     let grad_x = mk(grad_x, x.shape(), x)?;
     let grad_a = mk(grad_a, a.shape(), a)?;
     let grad_b = mk(grad_b, b.shape(), b)?;
-    let grad_codebook = mk(
-        grad_cb,
-        &Shape::new(vec![ncb, codebook_size]),
-        out_grad,
-    )?;
+    let grad_codebook = mk(grad_cb, &Shape::new(vec![ncb, codebook_size]), out_grad)?;
 
     Ok((grad_base, grad_x, grad_a, grad_b, grad_codebook))
 }
@@ -1204,6 +1300,62 @@ pub fn apply_and_record_lora(
     Ok((base_id, base))
 }
 
+/// Fused SwiGLU + LoRA MLP activation forward pass helper.
+///
+/// Evaluates Gate and Up linear projections with LoRA adapters (if registered),
+/// applies SwiGLU activation (`silu(gate) * up`), and registers the resulting activation on `tape`.
+pub fn fused_swiglu_lora_mlp(
+    autograd_reg: &crate::registry::AutogradRegistry,
+    tape: &mut crate::tape::Tape,
+    layer_idx: usize,
+    gate_base: Tensor,
+    gate_base_id: crate::tape::TensorId,
+    up_base: Tensor,
+    up_base_id: crate::tape::TensorId,
+    x: Tensor,
+    x_id: crate::tape::TensorId,
+) -> Result<(crate::tape::TensorId, Tensor)> {
+    let (gate_id, gate_out) = apply_and_record_lora(
+        autograd_reg,
+        tape,
+        layer_idx,
+        crate::injection::LoRAInjectionPoint::GateProj,
+        gate_base,
+        gate_base_id,
+        x.clone(),
+        x_id,
+    )?;
+
+    let (up_id, up_out) = apply_and_record_lora(
+        autograd_reg,
+        tape,
+        layer_idx,
+        crate::injection::LoRAInjectionPoint::UpProj,
+        up_base,
+        up_base_id,
+        x,
+        x_id,
+    )?;
+
+    let dev = crate::pick_device_for_tensor(&gate_out);
+    let (storage, _handle) = dev.silu_mul(
+        gate_out.storage().as_ref(),
+        up_out.storage().as_ref(),
+        gate_out.shape(),
+    )?;
+
+    let swiglu_tensor = Tensor::new(
+        Arc::from(storage),
+        gate_out.shape().clone(),
+        gate_out.dtype(),
+        gate_out.provenance().clone(),
+        gate_out.device().clone(),
+    );
+
+    let swiglu_id = tape.record_silu_mul(gate_id, up_id, swiglu_tensor.clone());
+    Ok((swiglu_id, swiglu_tensor))
+}
+
 /// Arguments for FakeQuantInt4 (INT4 fake-quantization with STE) backward.
 #[derive(Debug, Clone)]
 pub struct FakeQuantInt4Args {
@@ -1238,7 +1390,9 @@ pub fn fake_quant_int4_forward(args: &FakeQuantInt4Args) -> Result<Tensor> {
     let quantized: Vec<u8> = data
         .iter()
         .map(|&v| {
-            let q = ((v / args.scale) - args.zero_point as f32).round().clamp(qmin, qmax);
+            let q = ((v / args.scale) - args.zero_point as f32)
+                .round()
+                .clamp(qmin, qmax);
             q as u8
         })
         .collect();
@@ -1248,16 +1402,16 @@ pub fn fake_quant_int4_forward(args: &FakeQuantInt4Args) -> Result<Tensor> {
         .map(|&q| ((q as f32 + args.zero_point as f32) * args.scale))
         .collect();
 
-    Ok(grim_backend_cpu::cpu_tensor(dequantized, args.input.shape().clone()))
+    Ok(grim_backend_cpu::cpu_tensor(
+        dequantized,
+        args.input.shape().clone(),
+    ))
 }
 
 /// Backward: STE — gradient passes through as identity (gradient of
 /// quantize+dequant w.r.t. input is 1.0 everywhere in the STE
 /// approximation, ignoring the non-differentiable clamp/round).
-pub fn fake_quant_int4_backward(
-    _args: &FakeQuantInt4Args,
-    grad_output: &Tensor,
-) -> Result<Tensor> {
+pub fn fake_quant_int4_backward(_args: &FakeQuantInt4Args, grad_output: &Tensor) -> Result<Tensor> {
     // STE: dx = grad_output * 1.0 (identity through quantize).
     let grad_data = grad_output.to_vec_f32()?;
     let out = grim_backend_cpu::cpu_tensor(grad_data, grad_output.shape().clone());
@@ -1388,6 +1542,75 @@ mod tests {
         assert_eq!(residuals.backup2_scale_offset, 32768);
     }
 
+    /// Regression guard (WI-A): verifies that matmul_backward correctly extracts and uses explicit
+    /// per-column scales for ResidualPacked and GroupInt tensors, and rejects missing scales.
+    #[test]
+    fn test_matmul_backward_residual_packed_scales_plumbing() {
+        use grim_tensor::dtype::{
+            ArithType, DType, Device, QuantProvenance, ResidualPackedConfig, Storage,
+        };
+
+        // Construct a ResidualPacked tensor with explicit non-unit scales.
+        let storage = grim_backend_cpu::CpuStorage::new(
+            vec![1.0f32; 4],
+            Shape::new(vec![2, 2]),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::ResidualPacked(ResidualPackedConfig { bpw: 4 }),
+            },
+        )
+        .with_quant_scales(vec![2.5f32, 2.5f32]);
+
+        let b_tensor = Tensor::new(
+            Arc::new(storage),
+            Shape::new(vec![2, 2]),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::ResidualPacked(ResidualPackedConfig { bpw: 4 }),
+            },
+            QuantProvenance::GrimNative,
+            Device::Cpu,
+        );
+
+        // Verify accessor extracts scales
+        assert_eq!(b_tensor.quant_scales(), Some(&[2.5f32, 2.5f32][..]));
+
+        // Construct un-scaled ResidualPacked tensor to verify missing scales return Error
+        let unscaled_storage = grim_backend_cpu::CpuStorage::new(
+            vec![1.0f32; 4],
+            Shape::new(vec![2, 2]),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::ResidualPacked(ResidualPackedConfig { bpw: 4 }),
+            },
+        );
+        let b_unscaled_tensor = Tensor::new(
+            Arc::new(unscaled_storage),
+            Shape::new(vec![2, 2]),
+            DType {
+                arith: ArithType::F32,
+                storage: Storage::ResidualPacked(ResidualPackedConfig { bpw: 4 }),
+            },
+            QuantProvenance::GrimNative,
+            Device::Cpu,
+        );
+
+        let a = grim_backend_cpu::cpu_tensor(vec![1.0, 1.0, 1.0, 1.0], Shape::new(vec![2, 2]));
+        let out_grad =
+            grim_backend_cpu::cpu_tensor(vec![1.0, 1.0, 1.0, 1.0], Shape::new(vec![2, 2]));
+
+        let args_unscaled = MatMulArgs {
+            a: a.clone(),
+            b: b_unscaled_tensor,
+            out_grad: out_grad.clone(),
+            transpose_a: false,
+            transpose_b: false,
+        };
+
+        // matmul_backward must fail when required scales are missing
+        assert!(matmul_backward(&args_unscaled).is_err());
+    }
+
     #[test]
     fn test_apply_and_record_lora_direct() {
         use crate::{InjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry};
@@ -1423,6 +1646,43 @@ mod tests {
         .unwrap();
 
         assert_eq!(out_tensor.shape().dims(), &[1, 2]);
+        assert!(tape.len() > 0);
+    }
+
+    #[test]
+    fn test_fused_swiglu_lora_mlp_direct() {
+        use crate::{InjectionConfig, LoRAInjectionRegistry};
+        let mut tape = crate::tape::Tape::new();
+        let inj_config = InjectionConfig {
+            hidden_size: 2,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+            intermediate_size: 4,
+            vocab_size: 4,
+        };
+        let inj_reg = LoRAInjectionRegistry::standard_qlora(1, 4, 16.0, 1);
+        let registry = crate::registry::AutogradRegistry::new(inj_config, inj_reg).unwrap();
+
+        let gate_base = grim_backend_cpu::cpu_tensor(
+            vec![0.5f32, 1.0f32, 1.5f32, 2.0f32],
+            Shape::new(vec![1, 4]),
+        );
+        let gate_id = tape.register(gate_base.clone());
+        let up_base = grim_backend_cpu::cpu_tensor(
+            vec![2.0f32, 3.0f32, 4.0f32, 5.0f32],
+            Shape::new(vec![1, 4]),
+        );
+        let up_id = tape.register(up_base.clone());
+        let x = grim_backend_cpu::cpu_tensor(vec![0.5f32, 0.5f32], Shape::new(vec![1, 2]));
+        let x_id = tape.register(x.clone());
+
+        let (_out_id, out_tensor) = fused_swiglu_lora_mlp(
+            &registry, &mut tape, 0, gate_base, gate_id, up_base, up_id, x, x_id,
+        )
+        .unwrap();
+
+        assert_eq!(out_tensor.shape().dims(), &[1, 4]);
         assert!(tape.len() > 0);
     }
 

@@ -31,7 +31,6 @@ pub trait DraftBackbone: Send + Sync {
     ) -> Result<()>;
 }
 
-
 /// One drafted candidate block.
 #[derive(Clone)]
 pub struct DraftBlock {

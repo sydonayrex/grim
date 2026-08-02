@@ -48,10 +48,14 @@ fn reference_attention(
                 }
                 s *= scale;
                 scores.push(s);
-                if s > max_score { max_score = s; }
+                if s > max_score {
+                    max_score = s;
+                }
             }
             let mut denom = 0.0f32;
-            for s in &scores { denom += (s - max_score).exp(); }
+            for s in &scores {
+                denom += (s - max_score).exp();
+            }
             for d in 0..head_dim {
                 let mut acc = 0.0f32;
                 for j in 0..=max_j {
@@ -83,11 +87,26 @@ fn cpu_reference_head_dim_128_not_nan() {
         .map(|i| (i as f32 * 0.017).sin())
         .collect();
 
-    let out = reference_attention(&q, &k, &v, seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len, cache_offset);
+    let out = reference_attention(
+        &q,
+        &k,
+        &v,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        cache_offset,
+    );
 
     assert_eq!(out.len(), seq_len * num_heads * head_dim);
     for (i, &x) in out.iter().enumerate() {
-        assert!(x.is_finite(), "CPU reference produced non-finite value at index {}: {}", i, x);
+        assert!(
+            x.is_finite(),
+            "CPU reference produced non-finite value at index {}: {}",
+            i,
+            x
+        );
     }
 }
 
@@ -107,10 +126,25 @@ fn cpu_reference_head_dim_96_not_nan() {
         .map(|i| (i as f32 * 0.017).sin())
         .collect();
 
-    let out = reference_attention(&q, &k, &v, seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len, cache_offset);
+    let out = reference_attention(
+        &q,
+        &k,
+        &v,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        cache_offset,
+    );
 
     for (i, &x) in out.iter().enumerate() {
-        assert!(x.is_finite(), "CPU reference produced non-finite value at index {}: {}", i, x);
+        assert!(
+            x.is_finite(),
+            "CPU reference produced non-finite value at index {}: {}",
+            i,
+            x
+        );
     }
 }
 
@@ -139,7 +173,8 @@ fn qkv_attention_gpu_head_dim_128_not_nan() {
     let q_shape = Shape::from_slice(&[seq_len, num_heads, head_dim]);
     let kv_shape = Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]);
 
-    let dev = RocmDevice::new(0);
+    let dev = RocmDevice::try_new(0)
+        .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
     let q_buf = dev.from_cpu(&q_data, &q_shape, DType::F32).unwrap();
     let k_buf = dev.from_cpu(&k_data, &kv_shape, DType::F32).unwrap();
     let v_buf = dev.from_cpu(&v_data, &kv_shape, DType::F32).unwrap();
@@ -161,7 +196,8 @@ fn qkv_attention_gpu_head_dim_128_not_nan() {
     // This test documents the expected GREEN contract: once LDS tiling lands,
     // the GPU path must return Ok and produce non-NaN output matching the CPU reference.
     // Until then, the Err is the CORRECT safe behavior — it prevents silent NaN propagation.
-    let (out, _) = res.expect("head_dim=128 must succeed after LDS tiling is implemented (Finding 2)");
+    let (out, _) =
+        res.expect("head_dim=128 must succeed after LDS tiling is implemented (Finding 2)");
     let got = out.to_cpu_vec_f32().unwrap();
 
     for (i, &x) in got.iter().enumerate() {
@@ -169,13 +205,26 @@ fn qkv_attention_gpu_head_dim_128_not_nan() {
     }
 
     // Verify against CPU reference within atol=1e-4.
-    let want = reference_attention(&q_data, &k_data, &v_data, seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len, cache_offset);
+    let want = reference_attention(
+        &q_data,
+        &k_data,
+        &v_data,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        cache_offset,
+    );
     for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
         let diff = (g - w).abs();
         assert!(
             diff < 1e-3,
             "GPU/CPU mismatch at index {}: got={}, want={}, diff={}",
-            i, g, w, diff
+            i,
+            g,
+            w,
+            diff
         );
     }
 }
@@ -202,21 +251,47 @@ fn qkv_attention_gpu_head_dim_64_still_correct() {
     let q_shape = Shape::from_slice(&[seq_len, num_heads, head_dim]);
     let kv_shape = Shape::from_slice(&[kv_seq_len, num_kv_heads, head_dim]);
 
-    let dev = RocmDevice::new(0);
+    let dev = RocmDevice::try_new(0)
+        .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
     let q_buf = dev.from_cpu(&q_data, &q_shape, DType::F32).unwrap();
     let k_buf = dev.from_cpu(&k_data, &kv_shape, DType::F32).unwrap();
     let v_buf = dev.from_cpu(&v_data, &kv_shape, DType::F32).unwrap();
 
-    let (out, _) = dev.qkv_attention(
-        q_buf.as_ref(), k_buf.as_ref(), v_buf.as_ref(),
-        num_kv_heads, kv_seq_len, cache_offset as u32, &q_shape,
-        None, None,
-    ).expect("head_dim=64 must still succeed");
+    let (out, _) = dev
+        .qkv_attention(
+            q_buf.as_ref(),
+            k_buf.as_ref(),
+            v_buf.as_ref(),
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset as u32,
+            &q_shape,
+            None,
+            None,
+        )
+        .expect("head_dim=64 must still succeed");
 
     let got = out.to_cpu_vec_f32().unwrap();
-    let want = reference_attention(&q_data, &k_data, &v_data, seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len, cache_offset);
+    let want = reference_attention(
+        &q_data,
+        &k_data,
+        &v_data,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_seq_len,
+        cache_offset,
+    );
     for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
         let diff = (g - w).abs();
-        assert!(diff < 1e-3, "head_dim=64 regression at index {}: got={}, want={}, diff={}", i, g, w, diff);
+        assert!(
+            diff < 1e-3,
+            "head_dim=64 regression at index {}: got={}, want={}, diff={}",
+            i,
+            g,
+            w,
+            diff
+        );
     }
 }

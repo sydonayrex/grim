@@ -1,15 +1,4 @@
-//! Compile-once, cache-to-disk `.hsaco` cache for compiled HIP kernels.
-//!
-//! Item 2 of the ROCm spec: compiled binary persistence keyed by
-//! `(entry, gpu_target, seahash(source))` so a recurring kernel
-//! doesn't pay `hipModuleLoad` cost on every dispatch — the per-process
-//! `RocmDevice` keeps its own in-memory module cache on top of this.
-//!
-//! Skill attribution:
-//! - `rust-gpu-discipline` §4 — JIT cache is part of how we keep warm
-//!   launches cheap; without it every cold call would re-`hc`-compile.
-//! - `rust-ai-ml-inference-guide` Action 9 — runtime caching of compiled
-//!   artifacts across process restarts reduces first-step latency.
+//! Compile-once, cache-to-disk `.hsaco` cache for compiled HIP kernels. [see: `(entry, gpu_target, seahash(source))`, `hipModuleLoad`]
 
 use std::collections::HashMap;
 use std::fs;
@@ -84,7 +73,10 @@ impl HsacoKernelCache {
         if cache_path.exists() {
             let metadata = fs::metadata(&cache_path)?;
             let modified = metadata.modified()?;
-            self.entries.write().unwrap().insert(key.to_string(), (cache_path.clone(), modified));
+            self.entries
+                .write()
+                .unwrap()
+                .insert(key.to_string(), (cache_path.clone(), modified));
             return Ok(cache_path);
         }
 
@@ -92,7 +84,10 @@ impl HsacoKernelCache {
 
         let metadata = fs::metadata(&cache_path)?;
         let modified = metadata.modified()?;
-        self.entries.write().unwrap().insert(key.to_string(), (cache_path.clone(), modified));
+        self.entries
+            .write()
+            .unwrap()
+            .insert(key.to_string(), (cache_path.clone(), modified));
 
         Ok(cache_path)
     }

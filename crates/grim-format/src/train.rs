@@ -173,14 +173,8 @@ impl TrainState {
     /// Insert a blob under `name`.
     pub fn add_blob(&mut self, name: impl Into<String>, shape: Vec<usize>, data: Vec<u8>) {
         let name = name.into();
-        self.blobs.insert(
-            name.clone(),
-            TrainBlob {
-                name,
-                shape,
-                data,
-            },
-        );
+        self.blobs
+            .insert(name.clone(), TrainBlob { name, shape, data });
     }
 
     /// Extract lora A and B raw f32 data for a given base tensor name.
@@ -270,10 +264,7 @@ impl TrainState {
             .map_err(|e| Error::Backend(format!("train header read failed: {e}")))?;
         let header: Value = serde_json::from_slice(&header_bytes)
             .map_err(|e| Error::Backend(format!("train header JSON invalid: {e}")))?;
-        let step = header
-            .get("step")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let step = header.get("step").and_then(|v| v.as_u64()).unwrap_or(0);
         let fp_format = header
             .get("fp_format")
             .and_then(|v| v.as_u64())
@@ -302,7 +293,11 @@ impl TrainState {
             blobs.insert(blob.name.clone(), blob);
         }
 
-        Ok(Some(Self { step, fp_format, blobs }))
+        Ok(Some(Self {
+            step,
+            fp_format,
+            blobs,
+        }))
     }
 }
 
@@ -320,7 +315,11 @@ mod tests {
         state.add_blob("lora_a", vec![64, 128], (0u8..=127).collect());
         state.add_blob("lora_b", vec![128, 64], (128u8..=255).collect());
         state.add_blob("opt_m", vec![4096], vec![7u8; 4096]);
-        state.add_blob("error_matrix", vec![32, 32], (0u8..32).cycle().take(1024).collect());
+        state.add_blob(
+            "error_matrix",
+            vec![32, 32],
+            (0u8..32).cycle().take(1024).collect(),
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.grim.train");
@@ -330,8 +329,14 @@ mod tests {
         assert_eq!(restored.step, 42);
         assert_eq!(restored.fp_format, TrainFpFormat::Fp8E4M3);
         assert_eq!(restored.blobs.len(), 4);
-        assert_eq!(restored.blobs["lora_a"].data, (0u8..=127).collect::<Vec<_>>());
-        assert_eq!(restored.blobs["lora_b"].data, (128u8..=255).collect::<Vec<_>>());
+        assert_eq!(
+            restored.blobs["lora_a"].data,
+            (0u8..=127).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            restored.blobs["lora_b"].data,
+            (128u8..=255).collect::<Vec<_>>()
+        );
         assert_eq!(restored.blobs["opt_m"].data, vec![7u8; 4096]);
         assert_eq!(restored.blobs["error_matrix"].shape, vec![32, 32]);
     }

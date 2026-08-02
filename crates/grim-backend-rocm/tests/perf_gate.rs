@@ -27,8 +27,14 @@ type TestResult<R = ()> = Result<R, TestError>;
 fn verdict_within_reports_under_threshold() -> TestResult {
     let v = Verdict::within(0.95, 5.0);
     match v {
-        Verdict::Within { delta_pct, threshold_pct } => {
-            assert!(delta_pct < threshold_pct, "delta_pct must be < threshold_pct");
+        Verdict::Within {
+            delta_pct,
+            threshold_pct,
+        } => {
+            assert!(
+                delta_pct < threshold_pct,
+                "delta_pct must be < threshold_pct"
+            );
             assert_eq!(threshold_pct, 5.0);
         }
         _ => return Err("expected Within".into()),
@@ -40,7 +46,12 @@ fn verdict_within_reports_under_threshold() -> TestResult {
 fn verdict_regressed_above_threshold() -> TestResult {
     let v = Verdict::regressed(1.10, 5.0);
     match v {
-        Verdict::Regressed { delta_pct, threshold_pct, baseline, current } => {
+        Verdict::Regressed {
+            delta_pct,
+            threshold_pct,
+            baseline,
+            current,
+        } => {
             assert!(delta_pct > threshold_pct, "regression must clear threshold");
             assert!(baseline > 0.0);
             assert!(current > baseline);
@@ -52,7 +63,9 @@ fn verdict_regressed_above_threshold() -> TestResult {
 
 #[test]
 fn verdict_no_baseline_key() -> TestResult {
-    let v = Verdict::NoBaseline { reason: String::from("no entry for kernel") };
+    let v = Verdict::NoBaseline {
+        reason: String::from("no entry for kernel"),
+    };
     match v {
         Verdict::NoBaseline { reason } => assert!(reason.contains("no entry")),
         _ => return Err("expected NoBaseline".into()),
@@ -64,8 +77,15 @@ fn verdict_no_baseline_key() -> TestResult {
 fn verdict_is_debug_for_diagnostics() -> TestResult {
     let kinds = [
         Verdict::within(1.0, 5.0),
-        Verdict::Regressed { baseline: 100.0, current: 110.0, delta_pct: 10.0, threshold_pct: 5.0 },
-        Verdict::NoBaseline { reason: String::from("x") },
+        Verdict::Regressed {
+            baseline: 100.0,
+            current: 110.0,
+            delta_pct: 10.0,
+            threshold_pct: 5.0,
+        },
+        Verdict::NoBaseline {
+            reason: String::from("x"),
+        },
     ];
     for v in &kinds {
         let _ = format!("{:?}", v);
@@ -79,18 +99,26 @@ fn verdict_is_debug_for_diagnostics() -> TestResult {
 // =========================================================================
 #[test]
 fn measurement_ratio_is_baseline_normalised_percentage() -> TestResult {
-    let m = Measurement { cycles_per_call: 110.0 };
+    let m = Measurement {
+        cycles_per_call: 110.0,
+    };
     assert!((m.delta_pct_vs(100.0) - 10.0).abs() < 1e-9);
-    let m = Measurement { cycles_per_call: 100.0 };
+    let m = Measurement {
+        cycles_per_call: 100.0,
+    };
     assert!(m.delta_pct_vs(100.0).abs() < 1e-9);
-    let m = Measurement { cycles_per_call: 90.0 };
+    let m = Measurement {
+        cycles_per_call: 90.0,
+    };
     assert!((m.delta_pct_vs(100.0) + 10.0).abs() < 1e-9);
     Ok(())
 }
 
 #[test]
 fn measurement_ratio_with_zero_baseline_is_undefined() -> TestResult {
-    let m = Measurement { cycles_per_call: 1.0 };
+    let m = Measurement {
+        cycles_per_call: 1.0,
+    };
     if !m.delta_pct_vs(0.0).is_nan() {
         return Err("delta_pct_vs(0.0) must be NaN, not a finite number".into());
     }
@@ -99,7 +127,9 @@ fn measurement_ratio_with_zero_baseline_is_undefined() -> TestResult {
 
 #[test]
 fn measurement_ratio_with_zero_current_is_undefined() -> TestResult {
-    let m = Measurement { cycles_per_call: 0.0 };
+    let m = Measurement {
+        cycles_per_call: 0.0,
+    };
     if !m.delta_pct_vs(1.0).is_nan() {
         return Err("delta_pct_vs(0.0) with zero current must be NaN".into());
     }
@@ -162,9 +192,13 @@ fn baseline_table_round_trip() -> TestResult {
     let s = t.to_json_pretty()?;
     let t2 = BaselineTable::from_json(&s)?;
     assert_eq!(t2.arch(), "gfx1036");
-    let qkv = t2.entry("grim_qkv_attention").ok_or("missing qkv after roundtrip")?;
+    let qkv = t2
+        .entry("grim_qkv_attention")
+        .ok_or("missing qkv after roundtrip")?;
     assert_eq!(qkv.baseline_cycles_per_call, 5_000_000.0);
-    let mat = t2.entry("grim_matmul_f32").ok_or("missing mat after roundtrip")?;
+    let mat = t2
+        .entry("grim_matmul_f32")
+        .ok_or("missing mat after roundtrip")?;
     assert_eq!(mat.threshold_pct, 10.0);
     Ok(())
 }
@@ -172,7 +206,8 @@ fn baseline_table_round_trip() -> TestResult {
 #[test]
 fn baseline_table_corruption_returns_err() -> TestResult {
     let broken = b"{not json";
-    let res = BaselineTable::from_json(std::str::from_utf8(broken).map_err(|e| format!("utf8: {}", e))?);
+    let res =
+        BaselineTable::from_json(std::str::from_utf8(broken).map_err(|e| format!("utf8: {}", e))?);
     assert!(res.is_err(), "malformed JSON must surface as Err");
     Ok(())
 }
@@ -202,7 +237,12 @@ fn perf_gate_within_faster_measurement() -> TestResult {
     let mut t = BaselineTable::for_arch("gfx1036");
     t.set_entry("k", 100.0, 5.0)?;
     let gate = PerfGate::new(t);
-    let v = gate.compare("k", Measurement { cycles_per_call: 95.0 });
+    let v = gate.compare(
+        "k",
+        Measurement {
+            cycles_per_call: 95.0,
+        },
+    );
     match v {
         Verdict::Within { .. } => Ok(()),
         _ => Err("expected Within (faster)".into()),
@@ -216,7 +256,12 @@ fn perf_gate_within_at_threshold_boundary_is_ok() -> TestResult {
     let gate = PerfGate::new(t);
     // 105.0 -> +5% exactly. Boundary defined as: delta_pct <= threshold → Within.
     // (Strict `<` would create flakes for repeated-measurement noise.)
-    let v = gate.compare("k", Measurement { cycles_per_call: 105.0 });
+    let v = gate.compare(
+        "k",
+        Measurement {
+            cycles_per_call: 105.0,
+        },
+    );
     match v {
         Verdict::Within { delta_pct, .. } => {
             assert!((delta_pct - 5.0).abs() < 1e-9);
@@ -231,9 +276,19 @@ fn perf_gate_regressed_above_threshold() -> TestResult {
     let mut t = BaselineTable::for_arch("gfx1036");
     t.set_entry("k", 100.0, 5.0)?;
     let gate = PerfGate::new(t);
-    let v = gate.compare("k", Measurement { cycles_per_call: 110.0 });
+    let v = gate.compare(
+        "k",
+        Measurement {
+            cycles_per_call: 110.0,
+        },
+    );
     match v {
-        Verdict::Regressed { delta_pct, baseline, current, .. } => {
+        Verdict::Regressed {
+            delta_pct,
+            baseline,
+            current,
+            ..
+        } => {
             assert!((delta_pct - 10.0).abs() < 1e-9);
             assert_eq!(baseline, 100.0);
             assert!((current - 110.0).abs() < 1e-9);
@@ -247,7 +302,12 @@ fn perf_gate_regressed_above_threshold() -> TestResult {
 fn perf_gate_unknown_key_returns_no_baseline() -> TestResult {
     let t = BaselineTable::for_arch("gfx1036");
     let gate = PerfGate::new(t);
-    let v = gate.compare("not-in-baseline", Measurement { cycles_per_call: 1.0 });
+    let v = gate.compare(
+        "not-in-baseline",
+        Measurement {
+            cycles_per_call: 1.0,
+        },
+    );
     match v {
         Verdict::NoBaseline { .. } => Ok(()),
         _ => Err("expected NoBaseline".into()),
@@ -257,13 +317,29 @@ fn perf_gate_unknown_key_returns_no_baseline() -> TestResult {
 #[test]
 fn perf_gate_per_key_threshold_overrides_library_default() -> TestResult {
     let mut t = BaselineTable::for_arch("gfx1036");
-    t.set_entry("hot", 1_000.0, 5.0)?;   // hot allows 5%
-    t.set_entry("cold", 1_000.0, 50.0)?;  // cold allows 50% (looser)
+    t.set_entry("hot", 1_000.0, 5.0)?; // hot allows 5%
+    t.set_entry("cold", 1_000.0, 50.0)?; // cold allows 50% (looser)
     let gate = PerfGate::new(t);
     // Both have the same +10% measurement, but `cold` is within budget
     // and `hot` regresses above its smaller threshold.
-    assert!(matches!(gate.compare("hot", Measurement { cycles_per_call: 1_100.0 }), Verdict::Regressed { .. }));
-    assert!(matches!(gate.compare("cold", Measurement { cycles_per_call: 1_100.0 }), Verdict::Within { .. }));
+    assert!(matches!(
+        gate.compare(
+            "hot",
+            Measurement {
+                cycles_per_call: 1_100.0
+            }
+        ),
+        Verdict::Regressed { .. }
+    ));
+    assert!(matches!(
+        gate.compare(
+            "cold",
+            Measurement {
+                cycles_per_call: 1_100.0
+            }
+        ),
+        Verdict::Within { .. }
+    ));
     Ok(())
 }
 
@@ -276,7 +352,12 @@ fn perf_gate_per_key_threshold_overrides_library_default() -> TestResult {
 fn perf_gate_empty_baseline_never_panics() -> TestResult {
     let gate = PerfGate::new(BaselineTable::for_arch("gfx1036"));
     for k in &["k1", "k2", "k3"] {
-        let v = gate.compare(k, Measurement { cycles_per_call: 1.0 });
+        let v = gate.compare(
+            k,
+            Measurement {
+                cycles_per_call: 1.0,
+            },
+        );
         if !matches!(v, Verdict::NoBaseline { .. }) {
             return Err(format!("empty baseline must yield NoBaseline, got {:?}", v).into());
         }
@@ -293,17 +374,46 @@ fn perf_gate_collect_verdicts_aggregates() -> TestResult {
     // "missing" intentionally not added — must surface as NoBaseline.
     let gate = PerfGate::new(t);
     let verdicts: Vec<_> = [
-        gate.compare("ok_a", Measurement { cycles_per_call: 101.0 }),
-        gate.compare("ok_b", Measurement { cycles_per_call: 102.0 }),
-        gate.compare("bad", Measurement { cycles_per_call: 200.0 }),
-        gate.compare("missing", Measurement { cycles_per_call: 50.0 }),
+        gate.compare(
+            "ok_a",
+            Measurement {
+                cycles_per_call: 101.0,
+            },
+        ),
+        gate.compare(
+            "ok_b",
+            Measurement {
+                cycles_per_call: 102.0,
+            },
+        ),
+        gate.compare(
+            "bad",
+            Measurement {
+                cycles_per_call: 200.0,
+            },
+        ),
+        gate.compare(
+            "missing",
+            Measurement {
+                cycles_per_call: 50.0,
+            },
+        ),
     ]
     .into_iter()
     .collect();
     assert_eq!(verdicts.len(), 4);
-    let ok_count = verdicts.iter().filter(|v| matches!(v, Verdict::Within { .. })).count();
-    let bad_count = verdicts.iter().filter(|v| matches!(v, Verdict::Regressed { .. })).count();
-    let nobas_count = verdicts.iter().filter(|v| matches!(v, Verdict::NoBaseline { .. })).count();
+    let ok_count = verdicts
+        .iter()
+        .filter(|v| matches!(v, Verdict::Within { .. }))
+        .count();
+    let bad_count = verdicts
+        .iter()
+        .filter(|v| matches!(v, Verdict::Regressed { .. }))
+        .count();
+    let nobas_count = verdicts
+        .iter()
+        .filter(|v| matches!(v, Verdict::NoBaseline { .. }))
+        .count();
     assert_eq!(ok_count, 2);
     assert_eq!(bad_count, 1);
     assert_eq!(nobas_count, 1);

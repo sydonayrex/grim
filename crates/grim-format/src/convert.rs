@@ -1,13 +1,13 @@
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Seek, Write};
 
+use crate::gguf::{
+    GGUF_MAGIC, GGUF_VERSION, GgufValue, GrimFusionOp, GrimRocmlProfile, read_gguf,
+    read_tensor_bytes,
+};
+use grim_quant::evopress_search;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::provider::TensorProvider;
-use grim_quant::evopress_search;
-use crate::gguf::{
-    read_gguf, read_tensor_bytes, GgufValue, GrimFusionOp, GrimRocmlProfile, GGUF_MAGIC,
-    GGUF_VERSION,
-};
 
 /// Retrieve the type tag representing a GgufValue.
 ///
@@ -103,18 +103,30 @@ pub fn convert_gguf_to_grim(input_path: &str, output_path: &str, resolved_gcn: &
     let mut gguf = read_gguf(&mut in_reader)?;
 
     // Only allow CDNA 2/3, RDNA 2/3/4
-    if !resolved_gcn.starts_with("gfx10") && !resolved_gcn.starts_with("gfx11") && !resolved_gcn.starts_with("gfx12") && !resolved_gcn.starts_with("gfx9") {
-        println!("[WARN] GPU target {} is not recognized as standard CDNA or RDNA. Conversion will proceed but optimizations may mismatch.", resolved_gcn);
+    if !resolved_gcn.starts_with("gfx10")
+        && !resolved_gcn.starts_with("gfx11")
+        && !resolved_gcn.starts_with("gfx12")
+        && !resolved_gcn.starts_with("gfx9")
+    {
+        println!(
+            "[WARN] GPU target {} is not recognized as standard CDNA or RDNA. Conversion will proceed but optimizations may mismatch.",
+            resolved_gcn
+        );
     }
 
     // Build ROCm profile metadata properties
     let profile = gcn_to_profile(resolved_gcn);
 
-    println!("[Grim Convert] Optimization target: {} (Profile: {:?})", resolved_gcn, profile);
+    println!(
+        "[Grim Convert] Optimization target: {} (Profile: {:?})",
+        resolved_gcn, profile
+    );
 
     // Inject .grim ROCm optimized metadata keys
-    gguf.metadata.insert("grim.magic".into(), GgufValue::String("grim-v1".into()));
-    gguf.metadata.insert("grim.quant_version".into(), GgufValue::Uint32(1));
+    gguf.metadata
+        .insert("grim.magic".into(), GgufValue::String("grim-v1".into()));
+    gguf.metadata
+        .insert("grim.quant_version".into(), GgufValue::Uint32(1));
     gguf.metadata.insert(
         "grim.rocml.profile".into(),
         GgufValue::String(match profile {
@@ -127,17 +139,38 @@ pub fn convert_gguf_to_grim(input_path: &str, output_path: &str, resolved_gcn: &
             GrimRocmlProfile::Unknown => "unknown".into(),
         }),
     );
-    gguf.metadata.insert("grim.rocml.wavefront_size".into(), GgufValue::Uint32(profile.wavefront_size()));
-    gguf.metadata.insert("grim.rocml.target_gcn".into(), GgufValue::String(resolved_gcn.to_string()));
-    gguf.metadata.insert("grim.rocml.lds_size".into(), GgufValue::Uint32(profile.lds_size()));
-    gguf.metadata.insert("grim.rocml.tensor_core_enabled".into(), GgufValue::Bool(true));
-    gguf.metadata.insert("grim.rocm.kv_layout_optimized".into(), GgufValue::Bool(true));
+    gguf.metadata.insert(
+        "grim.rocml.wavefront_size".into(),
+        GgufValue::Uint32(profile.wavefront_size()),
+    );
+    gguf.metadata.insert(
+        "grim.rocml.target_gcn".into(),
+        GgufValue::String(resolved_gcn.to_string()),
+    );
+    gguf.metadata.insert(
+        "grim.rocml.lds_size".into(),
+        GgufValue::Uint32(profile.lds_size()),
+    );
+    gguf.metadata.insert(
+        "grim.rocml.tensor_core_enabled".into(),
+        GgufValue::Bool(true),
+    );
+    gguf.metadata.insert(
+        "grim.rocm.kv_layout_optimized".into(),
+        GgufValue::Bool(true),
+    );
 
     // Expose pre-fused attention ops for target backends
-    let fusion_ops = vec![GgufValue::String(GrimFusionOp::QkvAttention.as_str().into())];
-    gguf.metadata.insert("grim.rocm.fusion_ops".into(), GgufValue::Array(fusion_ops));
+    let fusion_ops = vec![GgufValue::String(
+        GrimFusionOp::QkvAttention.as_str().into(),
+    )];
+    gguf.metadata
+        .insert("grim.rocm.fusion_ops".into(), GgufValue::Array(fusion_ops));
 
-    println!("[Grim Convert] Writing target .grim GGUF file structure to {}", output_path);
+    println!(
+        "[Grim Convert] Writing target .grim GGUF file structure to {}",
+        output_path
+    );
     let mut outfile = File::create(output_path)
         .map_err(|e| Error::Backend(format!("Failed to create output file: {e}")))?;
     let mut out_writer = BufWriter::new(&mut outfile);
@@ -209,7 +242,10 @@ pub fn convert_gguf_to_grim(input_path: &str, output_path: &str, resolved_gcn: &
     }
 
     out_writer.flush()?;
-    println!("[Grim Convert] Conversion completed successfully: {}", output_path);
+    println!(
+        "[Grim Convert] Conversion completed successfully: {}",
+        output_path
+    );
     Ok(())
 }
 
@@ -228,16 +264,27 @@ pub const GRIM_QUANT_VERSION: u32 = 1;
 /// this function performs format-correct repacking. When calibration is
 /// available it will slot in between the read and write phases without
 /// changing this function's signature.
-fn dequant_group_int_bytes(bytes: &[u8], shape: &[usize], bits: u32, group_size: usize) -> Result<Vec<f32>> {
+fn dequant_group_int_bytes(
+    bytes: &[u8],
+    shape: &[usize],
+    bits: u32,
+    group_size: usize,
+) -> Result<Vec<f32>> {
     let mut cursor = 0;
     let read_segment = |bytes: &[u8], cursor: &mut usize| -> Result<Vec<u8>> {
         if *cursor + 8 > bytes.len() {
             return Err(Error::Backend("Truncated GPTQ packed header".into()));
         }
-        let len = u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap()) as usize;
+        let len = u64::from_le_bytes(
+            bytes[*cursor..*cursor + 8]
+                .try_into()
+                .map_err(|_| Error::Backend("Truncated GPTQ packed header".into()))?,
+        ) as usize;
         *cursor += 8;
         if *cursor + len > bytes.len() {
-            return Err(Error::Backend(format!("Truncated GPTQ packed segment (expected {len} bytes)")));
+            return Err(Error::Backend(format!(
+                "Truncated GPTQ packed segment (expected {len} bytes)"
+            )));
         }
         let segment = bytes[*cursor..*cursor + len].to_vec();
         *cursor += len;
@@ -249,43 +296,89 @@ fn dequant_group_int_bytes(bytes: &[u8], shape: &[usize], bits: u32, group_size:
     let scales = read_segment(bytes, &mut cursor)?;
     let g_idx = read_segment(bytes, &mut cursor)?;
 
-    let g_idx_opt = if g_idx.is_empty() { None } else { Some(&g_idx[..]) };
-    grim_quant::dequant_gptq_group_int(&qweight, &qzeros, &scales, g_idx_opt, shape, bits, group_size)
+    let g_idx_opt = if g_idx.is_empty() {
+        None
+    } else {
+        Some(&g_idx[..])
+    };
+    grim_quant::dequant_gptq_group_int(
+        &qweight, &qzeros, &scales, g_idx_opt, shape, bits, group_size,
+    )
 }
 
 fn dequant_tensor_data(raw: &grim_tensor::RawTensor, elem_count: usize) -> Result<Vec<f32>> {
     match &raw.dtype.storage {
-        grim_tensor::dtype::Storage::Native => {
-            Ok(raw.bytes.chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect())
-        }
+        grim_tensor::dtype::Storage::Native => Ok(raw
+            .bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()),
         grim_tensor::dtype::Storage::KQuant(scheme) => match scheme {
-            grim_tensor::dtype::KQuantScheme::Q80 => grim_quant::dequant_q80(&raw.bytes, elem_count),
-            grim_tensor::dtype::KQuantScheme::Q4K => grim_quant::dequant_q4k(&raw.bytes, elem_count),
-            grim_tensor::dtype::KQuantScheme::Q5K => grim_quant::dequant_q5k(&raw.bytes, elem_count),
-            grim_tensor::dtype::KQuantScheme::Q6K => grim_quant::dequant_q6k(&raw.bytes, elem_count),
-            grim_tensor::dtype::KQuantScheme::Q2K => grim_quant::dequant_q2k(&raw.bytes, elem_count),
-            grim_tensor::dtype::KQuantScheme::Q3K => grim_quant::dequant_q3k(&raw.bytes, elem_count),
-            grim_tensor::dtype::KQuantScheme::IQ4NL => grim_quant::dequant_iq4nl(&raw.bytes, elem_count),
-            grim_tensor::dtype::KQuantScheme::IQ4XS => grim_quant::dequant_iq4xs(&raw.bytes, elem_count),
-            grim_tensor::dtype::KQuantScheme::IQ3XXS => grim_quant::dequant_iq3xxs(&raw.bytes, elem_count),
-            grim_tensor::dtype::KQuantScheme::IQ3S => grim_quant::dequant_iq3s(&raw.bytes, elem_count),
-            grim_tensor::dtype::KQuantScheme::IQ2XXS => grim_quant::dequant_iq2xxs(&raw.bytes, elem_count),
-            grim_tensor::dtype::KQuantScheme::IQ2XS => grim_quant::dequant_iq2xs(&raw.bytes, elem_count),
-            grim_tensor::dtype::KQuantScheme::IQ2S => grim_quant::dequant_iq2s(&raw.bytes, elem_count),
-            _ => Ok(raw.bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
+            grim_tensor::dtype::KQuantScheme::Q80 => {
+                grim_quant::dequant_q80(&raw.bytes, elem_count)
+            }
+            grim_tensor::dtype::KQuantScheme::Q4K => {
+                grim_quant::dequant_q4k(&raw.bytes, elem_count)
+            }
+            grim_tensor::dtype::KQuantScheme::Q5K => {
+                grim_quant::dequant_q5k(&raw.bytes, elem_count)
+            }
+            grim_tensor::dtype::KQuantScheme::Q6K => {
+                grim_quant::dequant_q6k(&raw.bytes, elem_count)
+            }
+            grim_tensor::dtype::KQuantScheme::Q2K => {
+                grim_quant::dequant_q2k(&raw.bytes, elem_count)
+            }
+            grim_tensor::dtype::KQuantScheme::Q3K => {
+                grim_quant::dequant_q3k(&raw.bytes, elem_count)
+            }
+            grim_tensor::dtype::KQuantScheme::IQ4NL => {
+                grim_quant::dequant_iq4nl(&raw.bytes, elem_count)
+            }
+            grim_tensor::dtype::KQuantScheme::IQ4XS => {
+                grim_quant::dequant_iq4xs(&raw.bytes, elem_count)
+            }
+            grim_tensor::dtype::KQuantScheme::IQ3XXS => {
+                grim_quant::dequant_iq3xxs(&raw.bytes, elem_count)
+            }
+            grim_tensor::dtype::KQuantScheme::IQ3S => {
+                grim_quant::dequant_iq3s(&raw.bytes, elem_count)
+            }
+            grim_tensor::dtype::KQuantScheme::IQ2XXS => {
+                grim_quant::dequant_iq2xxs(&raw.bytes, elem_count)
+            }
+            grim_tensor::dtype::KQuantScheme::IQ2XS => {
+                grim_quant::dequant_iq2xs(&raw.bytes, elem_count)
+            }
+            grim_tensor::dtype::KQuantScheme::IQ2S => {
+                grim_quant::dequant_iq2s(&raw.bytes, elem_count)
+            }
         },
         grim_tensor::dtype::Storage::Block(bd) => match bd {
-            grim_tensor::dtype::BlockDtype::Fp4 | grim_tensor::dtype::BlockDtype::Fp4Block16 => grim_quant::dequant_fp4_block16(&raw.bytes, elem_count),
+            grim_tensor::dtype::BlockDtype::Fp4 | grim_tensor::dtype::BlockDtype::Fp4Block16 => {
+                grim_quant::dequant_fp4_block16(&raw.bytes, elem_count)
+            }
             grim_tensor::dtype::BlockDtype::Nf4 => grim_quant::dequant_nf4(&raw.bytes, elem_count),
-            grim_tensor::dtype::BlockDtype::Fp8 | grim_tensor::dtype::BlockDtype::Fp8Block16 => grim_quant::dequant_fp8_block16(&raw.bytes, elem_count),
+            grim_tensor::dtype::BlockDtype::Fp8 | grim_tensor::dtype::BlockDtype::Fp8Block16 => {
+                grim_quant::dequant_fp8_block16(&raw.bytes, elem_count)
+            }
         },
         grim_tensor::dtype::Storage::FloatPack(scheme) => match scheme {
-            grim_tensor::dtype::FloatPackScheme::Fp4 => grim_quant::dequant_fp4(&raw.bytes, elem_count),
-            grim_tensor::dtype::FloatPackScheme::Nf4 => grim_quant::dequant_nf4(&raw.bytes, elem_count),
-            grim_tensor::dtype::FloatPackScheme::Fp8 => grim_quant::dequant_fp8(&raw.bytes, elem_count),
-            _ => Ok(raw.bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
+            grim_tensor::dtype::FloatPackScheme::Fp4 => {
+                grim_quant::dequant_fp4(&raw.bytes, elem_count)
+            }
+            grim_tensor::dtype::FloatPackScheme::Nf4 => {
+                grim_quant::dequant_nf4(&raw.bytes, elem_count)
+            }
+            grim_tensor::dtype::FloatPackScheme::Fp8 => {
+                grim_quant::dequant_fp8(&raw.bytes, elem_count)
+            }
+            grim_tensor::dtype::FloatPackScheme::MxFp4 => {
+                grim_quant::dequant_mxfp4(&raw.bytes, elem_count)
+            }
+            grim_tensor::dtype::FloatPackScheme::MxFp8 => {
+                grim_quant::dequant_mxfp8(&raw.bytes, elem_count)
+            }
         },
         grim_tensor::dtype::Storage::GroupInt(cfg) => {
             dequant_group_int_bytes(&raw.bytes, &raw.shape, cfg.bits as u32, cfg.group_size)
@@ -331,7 +424,10 @@ pub fn convert_to_grim(
         println!("  Training sidecar: will emit {}.train", output_path);
     }
     if let Some(ref bw) = evopress_bitwidths {
-        println!("  Using per-tensor EvoPress bitwidths ({} tensors)", bw.len());
+        println!(
+            "  Using per-tensor EvoPress bitwidths ({} tensors)",
+            bw.len()
+        );
     }
     if let Some(ref tf) = target_format {
         println!("  Target format: {}", tf);
@@ -343,7 +439,8 @@ pub fn convert_to_grim(
         let provider = crate::tprov::GgufProvider::open(input_path)
             .map_err(|e| Error::Backend(format!("failed to open GGUF for EvoPress: {e}")))?;
         let tensor_names: Vec<String> = provider.tensors().keys().cloned().collect();
-        let mut tensor_data: Vec<(String, Vec<f32>, usize, usize)> = Vec::with_capacity(tensor_names.len());
+        let mut tensor_data: Vec<(String, Vec<f32>, usize, usize)> =
+            Vec::with_capacity(tensor_names.len());
         for name in &tensor_names {
             let raw = provider.get(name)?;
             let meta = provider.meta(name)?;
@@ -351,14 +448,12 @@ pub fn convert_to_grim(
             let cols = meta.shape.get(1).copied().unwrap_or(1);
             // Use the raw f32 values if available, otherwise dequantize
             let data: Vec<f32> = match &raw.dtype.storage {
-                _ => dequant_tensor_data(&raw, rows * cols).unwrap_or_default(),
+                _ => dequant_tensor_data(&raw, rows * cols)?,
             };
             tensor_data.push((name.clone(), data, rows, cols));
         }
         let importance_scores = grim_quant::compute_importance_scores(&tensor_data);
-        let tensor_sizes: Vec<usize> = tensor_data.iter()
-            .map(|(_, _, r, c)| r * c)
-            .collect();
+        let tensor_sizes: Vec<usize> = tensor_data.iter().map(|(_, _, r, c)| r * c).collect();
         let config = grim_quant::EvoPressConfig {
             generations,
             target_bpw,
@@ -372,10 +467,16 @@ pub fn convert_to_grim(
 
     let profile = gcn_to_profile(target_gcn);
 
-    let (entries, ext_entries) = build_entries_from_source(input_path, target_bpw, evopress_bitwidths.clone())?;
+    let (entries, ext_entries) =
+        build_entries_from_source(input_path, target_bpw, evopress_bitwidths.clone())?;
     let mut metadata = match caller_metadata {
         Some(m) => m,
-        None => build_grim_metadata(target_gcn, profile, target_bpw, evopress_bitwidths.is_some()),
+        None => build_grim_metadata(
+            target_gcn,
+            profile,
+            target_bpw,
+            evopress_bitwidths.is_some(),
+        ),
     };
     // Always ensure the basic grim-v1 stamp + target GCN + profile fields are
     // set, even when the caller supplied a skeleton metadata.
@@ -443,21 +544,29 @@ pub fn convert_to_grim(
     for (i, entry) in written_entries.iter().enumerate() {
         let (_, normals_bytes) = &entries[i];
 
-        let current_pos = writer.stream_position()
+        let current_pos = writer
+            .stream_position()
             .map_err(|e| Error::Backend(e.to_string()))?;
         if current_pos < entry.payload_offset {
             let pad = (entry.payload_offset - current_pos) as usize;
-            writer.write_all(&vec![0u8; pad])
+            writer
+                .write_all(&vec![0u8; pad])
                 .map_err(|e| Error::Backend(format!("payload pad write failed: {e}")))?;
         }
 
-        writer.write_all(normals_bytes)
+        writer
+            .write_all(normals_bytes)
             .map_err(|e| Error::Backend(format!("normals write failed: {e}")))?;
     }
 
-    writer.flush()
+    writer
+        .flush()
         .map_err(|e| Error::Backend(format!("flush failed: {e}")))?;
-    println!("[Grim Convert] Conversion completed: {} ({} tensors)", output_path, written_entries.len());
+    println!(
+        "[Grim Convert] Conversion completed: {} ({} tensors)",
+        output_path,
+        written_entries.len()
+    );
 
     // WI-R6: optionally emit the training sidecar next to the .grim file.
     // The sidecar path is `output_path` with a `.train` suffix (e.g.
@@ -476,7 +585,10 @@ fn build_entries_from_source(
     input_path: &str,
     target_bpw: f32,
     evopress_bitwidths: Option<Vec<u32>>,
-) -> Result<(Vec<(crate::format::GrimTensorEntry, Vec<u8>)>, Vec<crate::spec::GrimTensorExt>)> {
+) -> Result<(
+    Vec<(crate::format::GrimTensorEntry, Vec<u8>)>,
+    Vec<crate::spec::GrimTensorExt>,
+)> {
     let lower = input_path.to_ascii_lowercase();
     if lower.ends_with(".gguf") || lower.ends_with(".grim") {
         let provider = crate::tprov::GgufProvider::open(input_path)?;
@@ -502,20 +614,29 @@ fn pack_tensors(
     names: &[String],
     target_bpw: f32,
     evopress_bitwidths: Option<Vec<u32>>,
-) -> Result<(Vec<(crate::format::GrimTensorEntry, Vec<u8>)>, Vec<crate::spec::GrimTensorExt>)> {
+) -> Result<(
+    Vec<(crate::format::GrimTensorEntry, Vec<u8>)>,
+    Vec<crate::spec::GrimTensorExt>,
+)> {
     let mut result = Vec::with_capacity(names.len());
     let mut ext_entries = Vec::with_capacity(names.len());
     for (i, name) in names.iter().enumerate() {
         let raw = provider.get(name)?;
         let meta = provider.meta(name)?;
         if meta.provenance.is_external_qat() {
-            println!("[WARN] Re-quantizing external QAT tensor '{}' may lead to accuracy loss.", name);
+            println!(
+                "[WARN] Re-quantizing external QAT tensor '{}' may lead to accuracy loss.",
+                name
+            );
         }
         let elem_count: usize = raw.shape.iter().product();
 
         // Determine bitwidth for this tensor: use EvoPress bitwidth if available, otherwise fall back to target_bpw
         let tensor_bitwidth = if let Some(ref bitwidths) = evopress_bitwidths {
-            bitwidths.get(i).copied().unwrap_or_else(|| target_bpw.round() as u32) as u8
+            bitwidths
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| target_bpw.round() as u32) as u8
         } else {
             target_bpw.round() as u8
         };
@@ -524,7 +645,8 @@ fn pack_tensors(
         let f32_values = match raw.dtype.storage {
             grim_tensor::dtype::Storage::Native => {
                 // Already FP32 - just use as-is
-                raw.bytes.chunks_exact(4)
+                raw.bytes
+                    .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect::<Vec<f32>>()
             }
@@ -571,58 +693,40 @@ fn pack_tensors(
                     grim_tensor::dtype::KQuantScheme::IQ2S => {
                         grim_quant::dequant_iq2s(&raw.bytes, num_weights)?
                     }
-                    _ => {
-                        // Fallback: treat as FP32
-                        raw.bytes.chunks_exact(4)
-                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                            .collect::<Vec<f32>>()
-                    }
                 }
             }
-            grim_tensor::dtype::Storage::Block(bd) => {
-                match bd {
-                    grim_tensor::dtype::BlockDtype::Fp4 | grim_tensor::dtype::BlockDtype::Fp4Block16 => {
-                        grim_quant::dequant_fp4_block16(&raw.bytes, elem_count)?
-                    }
-                    grim_tensor::dtype::BlockDtype::Nf4 => {
-                        grim_quant::dequant_nf4(&raw.bytes, elem_count)?
-                    }
-                    grim_tensor::dtype::BlockDtype::Fp8 | grim_tensor::dtype::BlockDtype::Fp8Block16 => {
-                        grim_quant::dequant_fp8_block16(&raw.bytes, elem_count)?
-                    }
-                    _ => {
-                        // Fallback: treat as FP32
-                        raw.bytes.chunks_exact(4)
-                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                            .collect::<Vec<f32>>()
-                    }
+            grim_tensor::dtype::Storage::Block(bd) => match bd {
+                grim_tensor::dtype::BlockDtype::Fp4
+                | grim_tensor::dtype::BlockDtype::Fp4Block16 => {
+                    grim_quant::dequant_fp4_block16(&raw.bytes, elem_count)?
                 }
-            }
-            grim_tensor::dtype::Storage::FloatPack(scheme) => {
-                match scheme {
-                    grim_tensor::dtype::FloatPackScheme::Fp4 => {
-                        grim_quant::dequant_fp4(&raw.bytes, elem_count)?
-                    }
-                    grim_tensor::dtype::FloatPackScheme::Nf4 => {
-                        grim_quant::dequant_nf4(&raw.bytes, elem_count)?
-                    }
-                    grim_tensor::dtype::FloatPackScheme::Fp8 => {
-                        grim_quant::dequant_fp8(&raw.bytes, elem_count)?
-                    }
-                    _ => {
-                        // Fallback: treat as FP32
-                        raw.bytes.chunks_exact(4)
-                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                            .collect::<Vec<f32>>()
-                    }
+                grim_tensor::dtype::BlockDtype::Nf4 => {
+                    grim_quant::dequant_nf4(&raw.bytes, elem_count)?
                 }
-            }
+                grim_tensor::dtype::BlockDtype::Fp8
+                | grim_tensor::dtype::BlockDtype::Fp8Block16 => {
+                    grim_quant::dequant_fp8_block16(&raw.bytes, elem_count)?
+                }
+            },
+            grim_tensor::dtype::Storage::FloatPack(scheme) => match scheme {
+                grim_tensor::dtype::FloatPackScheme::Fp4 => {
+                    grim_quant::dequant_fp4(&raw.bytes, elem_count)?
+                }
+                grim_tensor::dtype::FloatPackScheme::Nf4 => {
+                    grim_quant::dequant_nf4(&raw.bytes, elem_count)?
+                }
+                grim_tensor::dtype::FloatPackScheme::Fp8 => {
+                    grim_quant::dequant_fp8(&raw.bytes, elem_count)?
+                }
+                grim_tensor::dtype::FloatPackScheme::MxFp4 => {
+                    grim_quant::dequant_mxfp4(&raw.bytes, elem_count)?
+                }
+                grim_tensor::dtype::FloatPackScheme::MxFp8 => {
+                    grim_quant::dequant_mxfp8(&raw.bytes, elem_count)?
+                }
+            },
             grim_tensor::dtype::Storage::GroupInt(cfg) => {
-                dequant_group_int_bytes(&raw.bytes, &meta.shape, cfg.bits as u32, cfg.group_size).unwrap_or_else(|_| {
-                    raw.bytes.chunks_exact(4)
-                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                        .collect::<Vec<f32>>()
-                })
+                dequant_group_int_bytes(&raw.bytes, &meta.shape, cfg.bits as u32, cfg.group_size)?
             }
             grim_tensor::dtype::Storage::ResidualPacked(cfg) => {
                 return Err(Error::Unimplemented(format!(
@@ -632,7 +736,7 @@ fn pack_tensors(
                 )));
             }
         };
-        
+
         // Re-quantize to target bitwidth
         let mut f32_values = f32_values;
 
@@ -640,7 +744,12 @@ fn pack_tensors(
         if meta.shape.len() == 2 {
             let out_channels = meta.shape[0];
             let in_channels = meta.shape[1];
-            let _ = grim_quant::apply_smoothquant_scale(&mut f32_values, out_channels, in_channels, None);
+            let _ = grim_quant::apply_smoothquant_scale(
+                &mut f32_values,
+                out_channels,
+                in_channels,
+                None,
+            );
         }
 
         // Apply SpinQuant Cayley rotation (N3a) if length is square and power of 2
@@ -651,12 +760,12 @@ fn pack_tensors(
 
         let payload_size = crate::format::normals_packed_size(elem_count, 0, tensor_bitwidth);
         let mut normals = Vec::with_capacity(payload_size as usize);
-        
+
         // Pack in rows (for now, treat entire tensor as single row)
         // Wave64 segment = 256 bytes = 2048 bits
         // At bpw bits per weight, that's 2048/bpw weights per segment
         crate::format::pack_row_bpw(&mut normals, &f32_values, tensor_bitwidth);
-        
+
         // Resize to exact payload size
         normals.resize(payload_size as usize, 0u8);
 
@@ -830,7 +939,8 @@ mod tests {
         assert_eq!(buf.len(), 3 * crate::format::OUTLIER_RECORD_BYTES);
 
         for (i, (orig_idx, orig_val)) in outliers.into_iter().enumerate() {
-            let record = &buf[i * crate::format::OUTLIER_RECORD_BYTES..(i + 1) * crate::format::OUTLIER_RECORD_BYTES];
+            let record = &buf[i * crate::format::OUTLIER_RECORD_BYTES
+                ..(i + 1) * crate::format::OUTLIER_RECORD_BYTES];
             let decoded = crate::format::GrimOutlier::decode(record).expect("decode outlier");
             assert_eq!(decoded.index, orig_idx);
             assert!((decoded.value - orig_val).abs() < 1e-3);

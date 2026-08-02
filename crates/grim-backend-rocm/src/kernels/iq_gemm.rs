@@ -1,11 +1,4 @@
 //! IQ2/IQ3/IQ4 Fused Dequantization GEMM HIP kernels (Crow Tier).
-//!
-//! Fuses on-the-fly dequantization of importance-matrix (IQ) quantized weights
-//! into HIP GEMM loops for forward and backward passes.
-//!
-//! IQ formats store 256-weight super-blocks with per-group scales, codebook
-//! indices, and sign bits.  Each variant has a different block layout and bit
-//! width (2, 3, or 4 bits per weight).
 
 /// HIP source for all IQ-family fused dequant+GEMM kernels (forward + backward).
 pub const KERNEL_SOURCE: &str = r#"
@@ -743,7 +736,10 @@ mod tests {
 
     macro_rules! check_kernel {
         ($name:literal) => {
-            assert!(KERNEL_SOURCE.contains($name), concat!("Missing kernel: ", $name));
+            assert!(
+                KERNEL_SOURCE.contains($name),
+                concat!("Missing kernel: ", $name)
+            );
         };
     }
 

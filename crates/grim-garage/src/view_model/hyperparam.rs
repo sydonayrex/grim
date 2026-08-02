@@ -1,5 +1,5 @@
 //! Hyperparam form — the data the hyperparameters panel binds to, in
-//! the exact shape the CVKG `Form`/`Input` widgets consume.
+//! the exact shape the frontend input components consume.
 
 use crate::ui_state::UiTrainingConfig;
 use serde::{Deserialize, Serialize};

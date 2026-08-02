@@ -1,0 +1,34 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufE { float E[]; };
+layout(std430, binding = 1) readonly buffer BufG { float G[]; };
+layout(std430, binding = 2) readonly buffer BufDW { float DW[]; };
+layout(std430, binding = 3) writeonly buffer BufDF { float DF[]; };
+layout(std430, binding = 4) writeonly buffer BufDE { float DE[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= params.size) return;
+
+    float e_val = E[i];
+    float g_val = G[i];
+    float dw_val = DW[i];
+
+    float se = 1.0 / (1.0 + exp(-e_val));
+    float silu_e = se * e_val;
+    float dsilu = se * (1.0 + e_val * (1.0 - se));
+
+    DF[i] = dw_val * g_val * dsilu;
+    DE[i] = dw_val * silu_e;
+}

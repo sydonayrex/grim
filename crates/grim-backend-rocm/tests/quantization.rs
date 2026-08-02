@@ -22,9 +22,7 @@
 //! - `rust-ml-llm-architecture` — backend separation; the gate lives in
 //!   the ROCm crate, not in core.
 
-use grim_backend_rocm::quantization::{
-    arch_capability, gcn_arch, GcnArch, QuantMode,
-};
+use grim_backend_rocm::quantization::{GcnArch, QuantMode, arch_capability, gcn_arch};
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<R = ()> = Result<R, TestError>;
@@ -45,9 +43,7 @@ fn gcn_arch_rounds_known_arch_strings_to_canonical_variant() -> TestResult {
     let r3 = gcn_arch("gfx1100");
     let r4 = gcn_arch("gfx1200");
     let cdna3 = gcn_arch("gfx942");
-    let _ = (
-        r2, r3, r4, cdna3,
-    ); // truthy for the lint detector.
+    let _ = (r2, r3, r4, cdna3); // truthy for the lint detector.
     Ok(())
 }
 
@@ -117,9 +113,18 @@ fn capability_table_fp8_rna4_only() -> TestResult {
     let rdna2 = arch_capability(GcnArch::RDNA2);
     let rdna3 = arch_capability(GcnArch::RDNA3);
     let rdna4 = arch_capability(GcnArch::RDNA4);
-    assert!(!rdna2.supports(QuantMode::Fp8Native), "RDNA2 must not claim native fp8");
-    assert!(!rdna3.supports(QuantMode::Fp8Native), "RDNA3 must not claim native fp8");
-    assert!(rdna4.supports(QuantMode::Fp8Native), "RDNA4 must support native fp8");
+    assert!(
+        !rdna2.supports(QuantMode::Fp8Native),
+        "RDNA2 must not claim native fp8"
+    );
+    assert!(
+        !rdna3.supports(QuantMode::Fp8Native),
+        "RDNA3 must not claim native fp8"
+    );
+    assert!(
+        rdna4.supports(QuantMode::Fp8Native),
+        "RDNA4 must support native fp8"
+    );
     Ok(())
 }
 
@@ -145,9 +150,20 @@ fn capability_table_f16_works_on_rna2_and_up() -> TestResult {
 
 #[test]
 fn capability_table_fp32_baseline_always_available() -> TestResult {
-    for arch in [GcnArch::RDNA2, GcnArch::RDNA3, GcnArch::RDNA4, GcnArch::CDNA2, GcnArch::CDNA3, GcnArch::Other] {
+    for arch in [
+        GcnArch::RDNA2,
+        GcnArch::RDNA3,
+        GcnArch::RDNA4,
+        GcnArch::CDNA2,
+        GcnArch::CDNA3,
+        GcnArch::Other,
+    ] {
         let c = arch_capability(arch);
-        assert!(c.supports(QuantMode::Fp32), "{:?}: fp32 must be the baseline", arch);
+        assert!(
+            c.supports(QuantMode::Fp32),
+            "{:?}: fp32 must be the baseline",
+            arch
+        );
     }
     Ok(())
 }
@@ -190,7 +206,12 @@ fn quant_capability_partial_eq_works() -> TestResult {
 
 #[test]
 fn quant_capability_debug_print_does_not_panic() -> TestResult {
-    for arch in [GcnArch::RDNA2, GcnArch::RDNA3, GcnArch::RDNA4, GcnArch::Other] {
+    for arch in [
+        GcnArch::RDNA2,
+        GcnArch::RDNA3,
+        GcnArch::RDNA4,
+        GcnArch::Other,
+    ] {
         let c = arch_capability(arch);
         let _ = format!("{:?}", c);
     }
@@ -206,14 +227,20 @@ fn quant_capability_debug_print_does_not_panic() -> TestResult {
 
 #[test]
 fn dispatch_fp8_prefers_fp8_on_rna4() -> TestResult {
-    let m = grim_backend_rocm::quantization::resolve_quant_mode(GcnArch::RDNA4, QuantMode::Fp8Native);
-    assert_eq!(m, QuantMode::Fp8Native, "RDNA4 must run fp8_native as requested");
+    let m =
+        grim_backend_rocm::quantization::resolve_quant_mode(GcnArch::RDNA4, QuantMode::Fp8Native);
+    assert_eq!(
+        m,
+        QuantMode::Fp8Native,
+        "RDNA4 must run fp8_native as requested"
+    );
     Ok(())
 }
 
 #[test]
 fn dispatch_fp8_downgrades_to_bf16_on_rna3() -> TestResult {
-    let m = grim_backend_rocm::quantization::resolve_quant_mode(GcnArch::RDNA3, QuantMode::Fp8Native);
+    let m =
+        grim_backend_rocm::quantization::resolve_quant_mode(GcnArch::RDNA3, QuantMode::Fp8Native);
     assert_eq!(
         m,
         QuantMode::Bf16,
@@ -224,7 +251,8 @@ fn dispatch_fp8_downgrades_to_bf16_on_rna3() -> TestResult {
 
 #[test]
 fn dispatch_fp8_downgrades_to_bf16_on_rna2() -> TestResult {
-    let m = grim_backend_rocm::quantization::resolve_quant_mode(GcnArch::RDNA2, QuantMode::Fp8Native);
+    let m =
+        grim_backend_rocm::quantization::resolve_quant_mode(GcnArch::RDNA2, QuantMode::Fp8Native);
     assert_eq!(m, QuantMode::Bf16);
     Ok(())
 }
@@ -233,17 +261,26 @@ fn dispatch_fp8_downgrades_to_bf16_on_rna2() -> TestResult {
 fn dispatch_bf16_keeps_bf16_on_rna2_and_up() -> TestResult {
     for arch in [GcnArch::RDNA2, GcnArch::RDNA3, GcnArch::RDNA4] {
         let m = grim_backend_rocm::quantization::resolve_quant_mode(arch, QuantMode::Bf16);
-        assert_eq!(m, QuantMode::Bf16, "bf16 requested on bf16-capable {:?}", arch);
+        assert_eq!(
+            m,
+            QuantMode::Bf16,
+            "bf16 requested on bf16-capable {:?}",
+            arch
+        );
     }
     Ok(())
 }
 
 #[test]
 fn dispatch_fp32_keeps_fp32_always() -> TestResult {
-    for arch in [GcnArch::RDNA2, GcnArch::RDNA3, GcnArch::RDNA4, GcnArch::Other] {
+    for arch in [
+        GcnArch::RDNA2,
+        GcnArch::RDNA3,
+        GcnArch::RDNA4,
+        GcnArch::Other,
+    ] {
         let m = grim_backend_rocm::quantization::resolve_quant_mode(arch, QuantMode::Fp32);
         assert_eq!(m, QuantMode::Fp32, "fp32 must stay fp32 on {:?}", arch);
     }
     Ok(())
 }
-

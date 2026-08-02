@@ -1,8 +1,4 @@
-//! Internal `lib.rs` unit tests. Moved here from the top-level module
-//! (which had grown to > 4,000 lines, well over the spec's 1,500-line
-//! anti-pattern ceiling). Tests still reach everything in the crate root
-//! via `use crate::*;` plus the few names that were globally imported in
-//! `lib.rs`'s `mod tests` (Error / Result from grim_tensor::error).
+//! Internal `lib.rs` unit tests. Moved here from the top-level module [see: `use crate::*;`, `lib.rs`]
 
 #[cfg(test)]
 mod tests {
@@ -12,18 +8,46 @@ mod tests {
     #[test]
     fn dtype_byte_size_layout() {
         // Verify the byte-size matrix; HIP alignment-aware alloc calls
-        // rely on these being right.
-        assert_eq!(dtype_byte_size(&DType { arith: ArithType::F32, storage: DTypeStorage::Native }), 4);
-        assert_eq!(dtype_byte_size(&DType { arith: ArithType::F16, storage: DTypeStorage::Native }), 2);
-        assert_eq!(dtype_byte_size(&DType { arith: ArithType::BF16, storage: DTypeStorage::Native }), 2);
-        assert_eq!(dtype_byte_size(&DType { arith: ArithType::I64, storage: DTypeStorage::Native }), 8);
-        assert_eq!(dtype_byte_size(&DType { arith: ArithType::U8, storage: DTypeStorage::Native }), 1);
+        assert_eq!(
+            dtype_byte_size(&DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native
+            }),
+            4
+        );
+        assert_eq!(
+            dtype_byte_size(&DType {
+                arith: ArithType::F16,
+                storage: DTypeStorage::Native
+            }),
+            2
+        );
+        assert_eq!(
+            dtype_byte_size(&DType {
+                arith: ArithType::BF16,
+                storage: DTypeStorage::Native
+            }),
+            2
+        );
+        assert_eq!(
+            dtype_byte_size(&DType {
+                arith: ArithType::I64,
+                storage: DTypeStorage::Native
+            }),
+            8
+        );
+        assert_eq!(
+            dtype_byte_size(&DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native
+            }),
+            1
+        );
     }
 
     #[test]
     fn probe_with_ordinal_override_returns_one_device() {
         // The override path always returns one device; the with_var guard
-        // reverts the env to its prior state when the closure returns.
         temp_env::with_var("GRIM_ROCM_ORDINAL_OVERRIDE", Some("0"), || {
             let devices = RocmDevice::probe().expect("probe");
             assert_eq!(devices.len(), 1);
@@ -33,28 +57,18 @@ mod tests {
     #[test]
     fn probe_without_hip_runtime_returns_empty_or_one() {
         // On a host without HIP installed, `hipSetDevice(0)` will fail
-        // and we return Vec::new(). When HIP is installed, we return
-        // one. The test asserts the contract without coupling to the
-        // host environment.
         let devices = RocmDevice::probe().expect("probe");
         assert!(devices.len() <= 1);
     }
 
     #[test]
     fn try_new_propagates_hip_set_device_error() {
-        // P0 fix: hipSetDevice failure must surface via try_new rather than
-        // being silently dropped. On a host without ROCm, an out-of-range
-        // ordinal (e.g. 9999) yields an error from hipSetDevice. On a host
-        // with ROCm, the same out-of-range ordinal also errors. Either way
-        // the contract is: try_new returns Err, never silently constructs a
-        // wrong-device RocmDevice. The infallible `new()` wraps this and
-        // builds a fallback (no-stream) device instead.
+        // P0 fix: hipSetDevice failure must surface via try_new rather than [see: `new()`]
         let res = RocmDevice::try_new(9999);
         assert!(res.is_err(), "try_new(9999) must Err on any host; got Ok");
         match res {
             Err(Error::Backend(msg)) => {
                 // The error message must name the failing call so a future
-                // debugger can trace it back to hipSetDevice.
                 assert!(
                     msg.contains("hipSetDevice"),
                     "error must mention hipSetDevice; got: {msg}"
@@ -67,8 +81,6 @@ mod tests {
     #[test]
     fn new_infallible_constructor_does_not_panic_on_bad_ordinal() {
         // The infallible `new()` must never panic — it logs and falls back
-        // to a no-stream device. We assert only that it returns; the
-        // resulting device's later ops will Err cleanly.
         let _dev = RocmDevice::new(9999);
     }
 
@@ -86,13 +98,14 @@ mod tests {
     #[test]
     fn rocm_storage_metadata_is_stable() {
         // Allocating `RocmStorage` requires HIP installed, so we only
-        // exercise the metadata methods on a defaulted instance to
-        // ensure the SurfaceType sticks together.
         let dummy = RocmStorage {
             device_ptr: None,
             bytes: 0,
             shape: Shape::new(vec![1]),
-            dtype: DType { arith: ArithType::F32, storage: DTypeStorage::Native },
+            dtype: DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
             provenance: QuantProvenance::GrimNative,
             ordinal: 0,
             allocator: Arc::new(RocmCachingAllocator::new(0, 0)),
@@ -133,15 +146,23 @@ mod tests {
         use crate::device::layout::PackedQuantLayout;
         for bits in [2, 3, 4] {
             let layout = PackedQuantLayout::new(4, 32, bits, 64);
-            let src: Vec<f32> = (0..4 * 32).map(|i| (i as f32 / 128.0) * 2.0 - 1.0).collect();
+            let src: Vec<f32> = (0..4 * 32)
+                .map(|i| (i as f32 / 128.0) * 2.0 - 1.0)
+                .collect();
             let packed = layout.pack(&src);
             let unpacked = layout.unpack(&packed);
             assert_eq!(unpacked.len(), src.len());
             // Quantization will introduce some error, but check that it's within quantization bucket size:
-            // max error = 0.5 * step_size = 0.5 * (2.0 / (2^bits - 1))
             let max_allowed_error = 1.0 / ((1 << bits) - 1) as f32 + 1e-5;
             for (a, b) in src.iter().zip(unpacked.iter()) {
-                assert!((a - b).abs() <= max_allowed_error, "Error too large for {} bits: got a={}, b={}, diff={}", bits, a, b, (a-b).abs());
+                assert!(
+                    (a - b).abs() <= max_allowed_error,
+                    "Error too large for {} bits: got a={}, b={}, diff={}",
+                    bits,
+                    a,
+                    b,
+                    (a - b).abs()
+                );
             }
         }
     }
@@ -193,7 +214,10 @@ mod tests {
         let recovered = wf.untile(&tiled, 40, 50);
         assert_eq!(recovered.len(), 40 * 50);
         for (i, (a, b)) in src.iter().zip(recovered.iter()).enumerate() {
-            assert!((a - b).abs() < 1e-6, "RDNA 32-thread round-trip mismatch at index {i}: got {b} want {a}");
+            assert!(
+                (a - b).abs() < 1e-6,
+                "RDNA 32-thread round-trip mismatch at index {i}: got {b} want {a}"
+            );
         }
     }
 
@@ -215,7 +239,11 @@ mod tests {
             ("self_attn.o_proj.weight", true),
         ];
         for (name, expected) in cases {
-            assert_eq!(is_attention_projection(name), *expected, "failed for {name}");
+            assert_eq!(
+                is_attention_projection(name),
+                *expected,
+                "failed for {name}"
+            );
         }
     }
 
@@ -235,11 +263,7 @@ mod tests {
 
     #[test]
     fn test_resolve_weight_layout_attention_defaults_to_wavefront_tiled() {
-        let layout = resolve_weight_layout(
-            "blk.48.attn_q.weight",
-            None,
-            WavefrontSize::W64,
-        );
+        let layout = resolve_weight_layout("blk.48.attn_q.weight", None, WavefrontSize::W64);
         match layout {
             WeightLayout::WavefrontTiled { wavefront_size } => assert_eq!(wavefront_size, 64),
             other => panic!("expected WavefrontTiled, got {other:?}"),
@@ -303,7 +327,11 @@ mod tests {
         let kernel_source = crate::kernels::source_asm::compute_kernel_source();
         let target = detect_gpu_arch(0);
         let res = jit_compile_hsaco(&kernel_source, "grim_fused_dequant_gemm_f16", &target);
-        assert!(res.is_ok(), "Failed to JIT compile grim_fused_dequant_gemm_f16: {:?}", res.err());
+        assert!(
+            res.is_ok(),
+            "Failed to JIT compile grim_fused_dequant_gemm_f16: {:?}",
+            res.err()
+        );
     }
 
     #[test]
@@ -313,8 +341,16 @@ mod tests {
         }
         let kernel_source = crate::kernels::source_asm::compute_kernel_source();
         let target = detect_gpu_arch(0);
-        let res = jit_compile_hsaco(&kernel_source, "grim_fused_dequant_backward_gemm_f16", &target);
-        assert!(res.is_ok(), "Failed to JIT compile grim_fused_dequant_backward_gemm_f16: {:?}", res.err());
+        let res = jit_compile_hsaco(
+            &kernel_source,
+            "grim_fused_dequant_backward_gemm_f16",
+            &target,
+        );
+        assert!(
+            res.is_ok(),
+            "Failed to JIT compile grim_fused_dequant_backward_gemm_f16: {:?}",
+            res.err()
+        );
     }
 
     #[test]
@@ -325,7 +361,11 @@ mod tests {
         let kernel_source = crate::kernels::source_asm::compute_kernel_source();
         let target = detect_gpu_arch(0);
         let res = jit_compile_hsaco(&kernel_source, "grim_split_k_reduction", &target);
-        assert!(res.is_ok(), "Failed to JIT compile grim_split_k_reduction: {:?}", res.err());
+        assert!(
+            res.is_ok(),
+            "Failed to JIT compile grim_split_k_reduction: {:?}",
+            res.err()
+        );
     }
 
     #[test]
@@ -336,18 +376,22 @@ mod tests {
         let kernel_source = crate::kernels::source_asm::compute_kernel_source();
         let target = detect_gpu_arch(0);
         let res = jit_compile_hsaco(&kernel_source, "grim_qkv_attention", &target);
-        assert!(res.is_ok(), "Failed to JIT compile grim_qkv_attention with large head_dim support: {:?}", res.err());
+        assert!(
+            res.is_ok(),
+            "Failed to JIT compile grim_qkv_attention with large head_dim support: {:?}",
+            res.err()
+        );
     }
 
     #[test]
     fn test_wmma_capability_gates() {
-        use crate::device::accel_features::{wmma_supported, wmma_dispatch};
+        use crate::device::accel_features::{wmma_dispatch, wmma_supported};
         use crate::quantization::{GcnArch, QuantMode};
 
         // RDNA3 and RDNA4 support WMMA for native modes
         assert!(wmma_supported(GcnArch::RDNA3, QuantMode::F16));
         assert!(wmma_supported(GcnArch::RDNA4, QuantMode::Fp8Native));
-        
+
         // CDNA and RDNA1/2 do not support WMMA
         assert!(!wmma_supported(GcnArch::CDNA2, QuantMode::F16));
         assert!(!wmma_supported(GcnArch::RDNA1, QuantMode::F16));
@@ -386,7 +430,11 @@ mod tests {
         // Padded values should be zero
         for row in 35..64 {
             for col in 0..40 {
-                assert_eq!(padded[row * 40 + col], 0.0, "padding should be zero at row {row}, col {col}");
+                assert_eq!(
+                    padded[row * 40 + col],
+                    0.0,
+                    "padding should be zero at row {row}, col {col}"
+                );
             }
         }
     }
@@ -410,7 +458,7 @@ mod tests {
         let data: Vec<u8> = vec![0xAB; 128 * 256 / 2]; // 4-bit = 2 values per byte
         let shape = vec![128, 256];
         let (padded, new_shape) = align_quantized_tensor_for_rocm_gemm(&data, &shape, 4, 64);
-        
+
         assert_eq!(new_shape, vec![128, 256]); // Already aligned
         assert_eq!(padded.len(), data.len());
     }
@@ -432,29 +480,40 @@ mod tests {
     // ------------------------------------------------------------------------
     // Compute op correctness (add / mul / silu_mul / rms_norm / softmax / embedding)
     // ------------------------------------------------------------------------
-    //
     // These require a live AMD GPU + ROCm. They are gated behind GRIM_RUN_GPU_TESTS
-    // so GPU-less CI does not fail; set the var to run real numerical checks.
-    // When gated off, we still build the device and assert the path does not panic.
 
     const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
 
-    /// Run a binary compute op on host f32 row vectors, returning the device result
-    /// as a host vector. Returns `None` when GPU execution is unavailable.
+    /// Run a binary compute op on host f32 row vectors, returning the device result [see: `None`]
     fn run_binary_op(
         env_present: bool,
         a: &[f32],
         b: &[f32],
         out_shape: &[usize],
-        op: impl FnOnce(&RocmDevice, &dyn BackendStorage, &dyn BackendStorage, &Shape) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>,
+        op: impl FnOnce(
+            &RocmDevice,
+            &dyn BackendStorage,
+            &dyn BackendStorage,
+            &Shape,
+        ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)>,
     ) -> Option<Vec<f32>> {
         if !env_present {
             return None;
         }
         let dev = RocmDevice::new(0);
-        let a_s = dev.from_cpu(a, &Shape::from_slice(&[a.len()]), DType::F32).ok()?;
-        let b_s = dev.from_cpu(b, &Shape::from_slice(&[b.len()]), DType::F32).ok()?;
-        let (out, _h) = op(&dev, a_s.as_ref(), b_s.as_ref(), &Shape::from_slice(out_shape)).ok()?;
+        let a_s = dev
+            .from_cpu(a, &Shape::from_slice(&[a.len()]), DType::F32)
+            .ok()?;
+        let b_s = dev
+            .from_cpu(b, &Shape::from_slice(&[b.len()]), DType::F32)
+            .ok()?;
+        let (out, _h) = op(
+            &dev,
+            a_s.as_ref(),
+            b_s.as_ref(),
+            &Shape::from_slice(out_shape),
+        )
+        .ok()?;
         out.to_cpu_vec_f32().ok()
     }
 
@@ -464,30 +523,52 @@ mod tests {
             return None;
         }
         let dev = RocmDevice::new(0);
-        let x_s = dev.from_cpu(x, &Shape::from_slice(shape), DType::F32).ok()?;
+        let x_s = dev
+            .from_cpu(x, &Shape::from_slice(shape), DType::F32)
+            .ok()?;
         let (out, _h) = dev.softmax(x_s.as_ref(), &Shape::from_slice(shape)).ok()?;
         out.to_cpu_vec_f32().ok()
     }
 
     /// Run rms_norm on a host f32 matrix with a weight vector.
-    fn run_rms_norm_op(env_present: bool, x: &[f32], w: &[f32], shape: &[usize], eps: f32) -> Option<Vec<f32>> {
+    fn run_rms_norm_op(
+        env_present: bool,
+        x: &[f32],
+        w: &[f32],
+        shape: &[usize],
+        eps: f32,
+    ) -> Option<Vec<f32>> {
         if !env_present {
             return None;
         }
         let dev = RocmDevice::new(0);
-        let x_s = dev.from_cpu(x, &Shape::from_slice(shape), DType::F32).ok()?;
-        let w_s = dev.from_cpu(w, &Shape::from_slice(&[w.len()]), DType::F32).ok()?;
-        let (out, _h) = dev.rms_norm(x_s.as_ref(), w_s.as_ref(), eps, &Shape::from_slice(shape)).ok()?;
+        let x_s = dev
+            .from_cpu(x, &Shape::from_slice(shape), DType::F32)
+            .ok()?;
+        let w_s = dev
+            .from_cpu(w, &Shape::from_slice(&[w.len()]), DType::F32)
+            .ok()?;
+        let (out, _h) = dev
+            .rms_norm(x_s.as_ref(), w_s.as_ref(), eps, &Shape::from_slice(shape))
+            .ok()?;
         out.to_cpu_vec_f32().ok()
     }
 
     /// Run embedding gather on a host f32 weight matrix [vocab, dim].
-    fn run_embedding_op(env_present: bool, weight: &[f32], indices: &[u32], vocab: usize, dim: usize) -> Option<Vec<f32>> {
+    fn run_embedding_op(
+        env_present: bool,
+        weight: &[f32],
+        indices: &[u32],
+        vocab: usize,
+        dim: usize,
+    ) -> Option<Vec<f32>> {
         if !env_present {
             return None;
         }
         let dev = RocmDevice::new(0);
-        let w_s = dev.from_cpu(weight, &Shape::from_slice(&[vocab, dim]), DType::F32).ok()?;
+        let w_s = dev
+            .from_cpu(weight, &Shape::from_slice(&[vocab, dim]), DType::F32)
+            .ok()?;
         let out_shape = Shape::from_slice(&[indices.len(), dim]);
         let (out, _h) = dev.embedding(w_s.as_ref(), indices, &out_shape).ok()?;
         out.to_cpu_vec_f32().ok()
@@ -500,24 +581,48 @@ mod tests {
     #[test]
     fn add_produces_elementwise_sum() {
         let env = std::env::var(GPU_TEST_ENV).is_ok();
-        let got = run_binary_op(env, &[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0], &[4], |d, a, b, s| {
-            d.add(a, b, s)
-        });
+        let got = run_binary_op(
+            env,
+            &[1.0, 2.0, 3.0, 4.0],
+            &[5.0, 6.0, 7.0, 8.0],
+            &[4],
+            |d, a, b, s| d.add(a, b, s),
+        );
         if let Some(out) = got {
-            assert!(approx_eq(out[0], 6.0, 1e-3), "add[0] expected 6.0 got {}", out[0]);
-            assert!(approx_eq(out[3], 12.0, 1e-3), "add[3] expected 12.0 got {}", out[3]);
+            assert!(
+                approx_eq(out[0], 6.0, 1e-3),
+                "add[0] expected 6.0 got {}",
+                out[0]
+            );
+            assert!(
+                approx_eq(out[3], 12.0, 1e-3),
+                "add[3] expected 12.0 got {}",
+                out[3]
+            );
         }
     }
 
     #[test]
     fn mul_produces_elementwise_product() {
         let env = std::env::var(GPU_TEST_ENV).is_ok();
-        let got = run_binary_op(env, &[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0], &[4], |d, a, b, s| {
-            d.mul(a, b, s)
-        });
+        let got = run_binary_op(
+            env,
+            &[1.0, 2.0, 3.0, 4.0],
+            &[5.0, 6.0, 7.0, 8.0],
+            &[4],
+            |d, a, b, s| d.mul(a, b, s),
+        );
         if let Some(out) = got {
-            assert!(approx_eq(out[0], 5.0, 1e-3), "mul[0] expected 5.0 got {}", out[0]);
-            assert!(approx_eq(out[3], 32.0, 1e-3), "mul[3] expected 32.0 got {}", out[3]);
+            assert!(
+                approx_eq(out[0], 5.0, 1e-3),
+                "mul[0] expected 5.0 got {}",
+                out[0]
+            );
+            assert!(
+                approx_eq(out[3], 32.0, 1e-3),
+                "mul[3] expected 32.0 got {}",
+                out[3]
+            );
         }
     }
 
@@ -531,7 +636,11 @@ mod tests {
         if let Some(out) = got {
             for i in 0..4 {
                 let expected = gate[i] / (1.0 + (-gate[i]).exp()) * up[i];
-                assert!(approx_eq(out[i], expected, 1e-2), "silu_mul[{i}] expected {expected} got {}", out[i]);
+                assert!(
+                    approx_eq(out[i], expected, 1e-2),
+                    "silu_mul[{i}] expected {expected} got {}",
+                    out[i]
+                );
             }
         }
     }
@@ -539,15 +648,24 @@ mod tests {
     #[test]
     fn rms_norm_normalizes_to_unit_when_weight_is_one() {
         // x = [3,4] over row_len 2, weight = 1, eps = 0:
-        // rms = sqrt((9+16)/2) = sqrt(12.5) ~= 3.5355, out = x / rms
         let env = std::env::var(GPU_TEST_ENV).is_ok();
         let x = [3.0f32, 4.0];
         let w = [1.0f32, 1.0];
         let got = run_rms_norm_op(env, &x, &w, &[2], 0.0);
         if let Some(out) = got {
             let rms = (12.5f32).sqrt();
-            assert!(approx_eq(out[0], 3.0 / rms, 1e-3), "rms_norm[0] expected {} got {}", 3.0 / rms, out[0]);
-            assert!(approx_eq(out[1], 4.0 / rms, 1e-3), "rms_norm[1] expected {} got {}", 4.0 / rms, out[1]);
+            assert!(
+                approx_eq(out[0], 3.0 / rms, 1e-3),
+                "rms_norm[0] expected {} got {}",
+                3.0 / rms,
+                out[0]
+            );
+            assert!(
+                approx_eq(out[1], 4.0 / rms, 1e-3),
+                "rms_norm[1] expected {} got {}",
+                4.0 / rms,
+                out[1]
+            );
         }
     }
 
@@ -560,10 +678,19 @@ mod tests {
         if let Some(out) = got {
             let row0_sum: f32 = out[0..3].iter().sum();
             let row1_sum: f32 = out[3..6].iter().sum();
-            assert!(approx_eq(row0_sum, 1.0, 1e-3), "softmax row0 should sum to 1, got {row0_sum}");
-            assert!(approx_eq(row1_sum, 1.0, 1e-3), "softmax row1 should sum to 1, got {row1_sum}");
+            assert!(
+                approx_eq(row0_sum, 1.0, 1e-3),
+                "softmax row0 should sum to 1, got {row0_sum}"
+            );
+            assert!(
+                approx_eq(row1_sum, 1.0, 1e-3),
+                "softmax row1 should sum to 1, got {row1_sum}"
+            );
             // argmax of row1 is index 0 (value 10)
-            assert!(out[3] > out[4] && out[3] > out[5], "softmax row1 argmax should be col 0");
+            assert!(
+                out[3] > out[4] && out[3] > out[5],
+                "softmax row1 argmax should be col 0"
+            );
         }
     }
 
@@ -576,16 +703,27 @@ mod tests {
         if let Some(out) = got {
             // indices [2,0,1] -> rows 2,0,1 of weight
             assert_eq!(out.len(), 9);
-            assert!(approx_eq(out[0], 7.0, 1e-3), "embed row0[0] expected 7.0 got {}", out[0]);
-            assert!(approx_eq(out[3], 1.0, 1e-3), "embed row1[0] expected 1.0 got {}", out[3]);
-            assert!(approx_eq(out[6], 4.0, 1e-3), "embed row2[0] expected 4.0 got {}", out[6]);
+            assert!(
+                approx_eq(out[0], 7.0, 1e-3),
+                "embed row0[0] expected 7.0 got {}",
+                out[0]
+            );
+            assert!(
+                approx_eq(out[3], 1.0, 1e-3),
+                "embed row1[0] expected 1.0 got {}",
+                out[3]
+            );
+            assert!(
+                approx_eq(out[6], 4.0, 1e-3),
+                "embed row2[0] expected 4.0 got {}",
+                out[6]
+            );
         }
     }
 
     #[test]
     fn embedding_rejects_index_count_mismatch() {
         // Without a GPU this still exercises the shape guard (no device alloc needed
-        // beyond construction, which is allowed to fail gracefully).
         let dev = RocmDevice::new(0);
         let weight = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let w_s = match dev.from_cpu(&weight, &Shape::from_slice(&[2, 3]), DType::F32) {
@@ -594,7 +732,10 @@ mod tests {
         };
         let out_shape = Shape::from_slice(&[2, 3]);
         let res = dev.embedding(w_s.as_ref(), &[0, 1, 2], &out_shape); // 3 indices vs leading dim 2
-        assert!(res.is_err(), "embedding must reject indices.len() != out leading dim");
+        assert!(
+            res.is_err(),
+            "embedding must reject indices.len() != out leading dim"
+        );
     }
 
     // ===== Golden Mutation-Resistant Kernel Math Contracts =====
@@ -603,7 +744,10 @@ mod tests {
         let abs = (got - want).abs();
         let denom = want.abs().max(1e-7);
         assert!(got.is_finite(), "{ctx}: non-finite {got:?} (want {want:?})");
-        assert!(abs == 0.0 || (abs / denom) < 1e-4, "{ctx}: got {got:?} want {want:?} (abs={abs})");
+        assert!(
+            abs == 0.0 || (abs / denom) < 1e-4,
+            "{ctx}: got {got:?} want {want:?} (abs={abs})"
+        );
     }
 
     #[test]
@@ -677,11 +821,7 @@ mod tests {
     #[test]
     fn test_rocm_embedding_golden_exact() {
         let env = std::env::var(GPU_TEST_ENV).is_ok();
-        let weight = [
-            10.0f32, 20.0,
-            30.0, 40.0,
-            50.0, 60.0,
-        ];
+        let weight = [10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0];
         if let Some(out) = run_embedding_op(env, &weight, &[2, 0], 3, 2) {
             assert_eq!(out, vec![50.0, 60.0, 10.0, 20.0]);
         }
@@ -690,13 +830,7 @@ mod tests {
     // ------------------------------------------------------------------------
     // Item 0: rocBLAS `gemm_ex` ABI correctness
     // ------------------------------------------------------------------------
-    //
-    // The original FFI used fabricated integer discriminants (RocblasOperation =
-    // 0/1/2, rocblas_datatype = 0/1/2/...) and a truncated/ reordered
-    // `rocblas_gemm_ex` argument list. rocBLAS expects the exact enum values from
-    // rocblas/rocblas-types.h, otherwise every GEMM returns invalid_value and
-    // silently zeroes the output. These tests pin the ABI constants so the bug
-    // cannot regress.
+    // The original FFI used fabricated integer discriminants (RocblasOperation = [see: `rocblas_gemm_ex`]
 
     #[test]
     fn gemm_ex_abi_constants_match_rocblas() {
@@ -721,19 +855,30 @@ mod tests {
     #[test]
     fn arith_to_rocblas_dtype_is_not_fabricated() {
         // Previously BF16 was mapped to the F16 constant and the constants were
-        // fabricated (0/1/2). These must map to the real rocBLAS discriminants.
-        assert_eq!(arith_to_rocblas_dtype(ArithType::F32), rocblas_datatype::f32_r);
-        assert_eq!(arith_to_rocblas_dtype(ArithType::F16), rocblas_datatype::f16_r);
-        assert_eq!(arith_to_rocblas_dtype(ArithType::BF16), rocblas_datatype::bf16_r);
+        assert_eq!(
+            arith_to_rocblas_dtype(ArithType::F32),
+            rocblas_datatype::f32_r
+        );
+        assert_eq!(
+            arith_to_rocblas_dtype(ArithType::F16),
+            rocblas_datatype::f16_r
+        );
+        assert_eq!(
+            arith_to_rocblas_dtype(ArithType::BF16),
+            rocblas_datatype::bf16_r
+        );
         // Mixed-precision GEMMs accumulate in FP32.
-        assert_eq!(arith_to_compute_dtype(ArithType::F16), rocblas_datatype::f32_r);
-        assert_eq!(arith_to_compute_dtype(ArithType::BF16), rocblas_datatype::f32_r);
+        assert_eq!(
+            arith_to_compute_dtype(ArithType::F16),
+            rocblas_datatype::f32_r
+        );
+        assert_eq!(
+            arith_to_compute_dtype(ArithType::BF16),
+            rocblas_datatype::f32_r
+        );
     }
 
-    /// Run a 2-D matmul on host f32 and return the device result, or `None` when
-    /// GPU execution is unavailable.
-    /// Run a matmul on an explicit device and read the result back. Used by tests
-    /// that need to share a single `RocmDevice` (and thus a single allocator).
+    /// Run a 2-D matmul on host f32 and return the device result, or `None` when [see: `RocmDevice`]
     fn run_matmul_on_dev(
         dev: &RocmDevice,
         a: &[f32],
@@ -742,8 +887,12 @@ mod tests {
         b_dims: &[usize],
         out_dims: &[usize],
     ) -> Vec<f32> {
-        let a_s = dev.from_cpu(a, &Shape::from_slice(a_dims), DType::F32).unwrap();
-        let b_s = dev.from_cpu(b, &Shape::from_slice(b_dims), DType::F32).unwrap();
+        let a_s = dev
+            .from_cpu(a, &Shape::from_slice(a_dims), DType::F32)
+            .unwrap();
+        let b_s = dev
+            .from_cpu(b, &Shape::from_slice(b_dims), DType::F32)
+            .unwrap();
         let (out, _h) = dev
             .matmul(a_s.as_ref(), b_s.as_ref(), &Shape::from_slice(out_dims))
             .unwrap();
@@ -762,14 +911,7 @@ mod tests {
             return None;
         }
         let dev = RocmDevice::new(0);
-        Some(run_matmul_on_dev(
-            &dev,
-            a,
-            a_dims,
-            b,
-            b_dims,
-            out_dims,
-        ))
+        Some(run_matmul_on_dev(&dev, a, a_dims, b, b_dims, out_dims))
     }
 
     /// Reference row-major matmul: C[m,n] = sum_k A[m,k] * B[k,n].
@@ -792,8 +934,6 @@ mod tests {
     #[test]
     fn matmul_batched_matches_loop_of_single_gemms() {
         // Item 6: a batch of same-shape GEMMs collapsed into one
-        // rocblas_gemm_strided_batched_ex call must equal running the equivalent
-        // single GEMMs (dev.matmul) in a loop, for several batch sizes.
         let env = std::env::var(GPU_TEST_ENV).is_ok();
         if !env {
             return;
@@ -806,21 +946,29 @@ mod tests {
             let mut a_storages: Vec<Box<dyn BackendStorage>> = Vec::new();
             let mut b_storages: Vec<Box<dyn BackendStorage>> = Vec::new();
             for bi in 0..batch {
-                let av: Vec<f32> =
-                    (0..m * k).map(|i| (i as f32 * 0.05) + bi as f32).collect();
-                let bv: Vec<f32> =
-                    (0..k * n).map(|i| (i as f32 * 0.05) - 0.5 + bi as f32).collect();
-                a_storages.push(dev.from_cpu(&av, &Shape::from_slice(&[m, k]), DType::F32).unwrap());
-                b_storages.push(dev.from_cpu(&bv, &Shape::from_slice(&[k, n]), DType::F32).unwrap());
+                let av: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05) + bi as f32).collect();
+                let bv: Vec<f32> = (0..k * n)
+                    .map(|i| (i as f32 * 0.05) - 0.5 + bi as f32)
+                    .collect();
+                a_storages.push(
+                    dev.from_cpu(&av, &Shape::from_slice(&[m, k]), DType::F32)
+                        .unwrap(),
+                );
+                b_storages.push(
+                    dev.from_cpu(&bv, &Shape::from_slice(&[k, n]), DType::F32)
+                        .unwrap(),
+                );
             }
-            let a_refs: Vec<&dyn BackendStorage> =
-                a_storages.iter().map(|s| s.as_ref()).collect();
-            let b_refs: Vec<&dyn BackendStorage> =
-                b_storages.iter().map(|s| s.as_ref()).collect();
+            let a_refs: Vec<&dyn BackendStorage> = a_storages.iter().map(|s| s.as_ref()).collect();
+            let b_refs: Vec<&dyn BackendStorage> = b_storages.iter().map(|s| s.as_ref()).collect();
             let batched = dev
                 .matmul_batched(&a_refs, &b_refs, &Shape::from_slice(&[m, n]))
                 .unwrap();
-            assert_eq!(batched.len(), batch, "batch count mismatch for batch={batch}");
+            assert_eq!(
+                batched.len(),
+                batch,
+                "batch count mismatch for batch={batch}"
+            );
             for bi in 0..batch {
                 let (ref_out, _h) = dev
                     .matmul(
@@ -849,7 +997,6 @@ mod tests {
     #[test]
     fn gemm_ex_f32_matches_cpu_reference() {
         // Force the gemm_ex (extended-datatype) code path even for FP32 inputs by
-        // selecting a CDNA target, which exercises the Item 0 ABI fix directly.
         temp_env::with_var("GRIM_GPU_TARGET", Some("gfx90a"), || {
             let env = std::env::var(GPU_TEST_ENV).is_ok();
             let a_dims = [4usize, 8];
@@ -881,8 +1028,6 @@ mod tests {
     #[test]
     fn caching_allocator_reuses_buffers_across_steps() {
         // After a short warmup of same-shape matmuls, the steady-state loop must
-        // reuse pooled device buffers and NOT call hipMalloc per step. This is the
-        // regression test for Item 1'sallocator reuse.
         let env = std::env::var(GPU_TEST_ENV).is_ok();
         if !env {
             return;
@@ -904,7 +1049,6 @@ mod tests {
         let (m2, _f2) = dev.allocator_stats();
 
         // Steady-state: repeated same-shape matmuls reuse pooled buffers, so new
-        // hipMalloc calls must be ~0 (allow a couple for slack).
         assert!(
             (m2 - m1) <= 2,
             "hipMalloc calls grew by {} during steady-state loop (expected ~0, proving pool reuse)",
@@ -945,31 +1089,58 @@ mod tests {
     #[test]
     fn module_cache_loads_each_kernel_once() {
         // Each unique compute kernel must be hipModuleLoad'd exactly once for the
-        // process lifetime; repeated dispatches reuse the cached module (Item 2).
         let env = std::env::var(GPU_TEST_ENV).is_ok();
         if !env {
             return;
         }
-        // The device detects its own gfx target from the driver, so kernel
-        // compilation is immune to the process-global `GRIM_GPU_TARGET` flips
-        // done by sibling tests via temp_env.
+        // The device detects its own gfx target from the driver, so kernel [see: `GRIM_GPU_TARGET`]
         let dev = RocmDevice::new(0);
 
-        let x = dev.from_cpu(&vec![1.0f32; 4*8], &Shape::from_slice(&[4,8]), DType::F32).unwrap();
-        let w_norm = dev.from_cpu(&vec![1.0f32; 8], &Shape::from_slice(&[8]), DType::F32).unwrap();
-        let w_mat = dev.from_cpu(&vec![1.0f32; 8*16], &Shape::from_slice(&[8,16]), DType::F32).unwrap();
+        let x = dev
+            .from_cpu(
+                &vec![1.0f32; 4 * 8],
+                &Shape::from_slice(&[4, 8]),
+                DType::F32,
+            )
+            .unwrap();
+        let w_norm = dev
+            .from_cpu(&vec![1.0f32; 8], &Shape::from_slice(&[8]), DType::F32)
+            .unwrap();
+        let w_mat = dev
+            .from_cpu(
+                &vec![1.0f32; 8 * 16],
+                &Shape::from_slice(&[8, 16]),
+                DType::F32,
+            )
+            .unwrap();
 
         // Warmup: load the rmsnorm_matmul module once.
         let (_o, _h) = dev
-            .rmsnorm_matmul(x.as_ref(), w_norm.as_ref(), w_mat.as_ref(), 1e-5, &Shape::from_slice(&[4, 16]))
+            .rmsnorm_matmul(
+                x.as_ref(),
+                w_norm.as_ref(),
+                w_mat.as_ref(),
+                1e-5,
+                &Shape::from_slice(&[4, 16]),
+            )
             .unwrap();
         let baseline = dev.module_load_stats();
-        assert!(baseline >= 1, "expected >=1 module loaded, got {}", baseline);
+        assert!(
+            baseline >= 1,
+            "expected >=1 module loaded, got {}",
+            baseline
+        );
 
         // Repeat many times: module load count must NOT increase.
         for _ in 0..20 {
             let (_o, _h) = dev
-                .rmsnorm_matmul(x.as_ref(), w_norm.as_ref(), w_mat.as_ref(), 1e-5, &Shape::from_slice(&[4, 16]))
+                .rmsnorm_matmul(
+                    x.as_ref(),
+                    w_norm.as_ref(),
+                    w_mat.as_ref(),
+                    1e-5,
+                    &Shape::from_slice(&[4, 16]),
+                )
                 .unwrap();
         }
         assert_eq!(
@@ -979,25 +1150,32 @@ mod tests {
         );
 
         // A second distinct kernel (qkv_attention) must load once, then reuse.
-        // num_heads=4, num_kv_heads=2 (a 2:1 GQA ratio), head_dim=64 fits the
-        // Wave64 + Phase-1 head_dim<=64 constraint. seq_len=4, kv_seq_len=4,
-        // cache_offset=0 is a degenerate identity-size prefill.
-        let q = dev.from_cpu(&vec![1.0f32; 4*4*64], &Shape::from_slice(&[4,4,64]), DType::F32).unwrap();
+        let q = dev
+            .from_cpu(
+                &vec![1.0f32; 4 * 4 * 64],
+                &Shape::from_slice(&[4, 4, 64]),
+                DType::F32,
+            )
+            .unwrap();
         let (_o, _h) = dev
             .qkv_attention(
                 q.as_ref(),
                 q.as_ref(),
                 q.as_ref(),
-                2,                // num_kv_heads: real param, not num_heads/4
-                4,                // kv_seq_len
-                0,                // cache_offset
+                2, // num_kv_heads: real param, not num_heads/4
+                4, // kv_seq_len
+                0, // cache_offset
                 &Shape::from_slice(&[4, 4, 64]),
                 None,
                 None,
             )
             .unwrap();
         let with_qkv = dev.module_load_stats();
-        assert_eq!(with_qkv, baseline + 1, "qkv_attention should load exactly 1 new module");
+        assert_eq!(
+            with_qkv,
+            baseline + 1,
+            "qkv_attention should load exactly 1 new module"
+        );
         for _ in 0..10 {
             let (_o, _h) = dev
                 .qkv_attention(
@@ -1029,9 +1207,13 @@ mod tests {
 
         let dev = RocmDevice::new(0);
 
-        let a = dev.from_cpu(&vec![1.0f32; 16], &Shape::from_slice(&[4,4]), DType::F16).unwrap();
-        let b = dev.from_cpu(&vec![1.0f32; 16], &Shape::from_slice(&[4,4]), DType::F16).unwrap();
-        let out = dev.zeros(&Shape::from_slice(&[4,4]), DType::F16).unwrap();
+        let a = dev
+            .from_cpu(&vec![1.0f32; 16], &Shape::from_slice(&[4, 4]), DType::F16)
+            .unwrap();
+        let b = dev
+            .from_cpu(&vec![1.0f32; 16], &Shape::from_slice(&[4, 4]), DType::F16)
+            .unwrap();
+        let out = dev.zeros(&Shape::from_slice(&[4, 4]), DType::F16).unwrap();
 
         let a_storage = a.as_any().downcast_ref::<RocmStorage>().unwrap();
         let b_storage = b.as_any().downcast_ref::<RocmStorage>().unwrap();
@@ -1068,7 +1250,8 @@ mod tests {
                 arg(&mut sc),
             ],
             Some(42),
-        ).unwrap();
+        )
+        .unwrap();
 
         let loads_after_sol42 = dev.module_load_stats();
         assert!(loads_after_sol42 > initial_loads);
@@ -1089,7 +1272,8 @@ mod tests {
                 arg(&mut sc),
             ],
             Some(42),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(dev.module_load_stats(), loads_after_sol42);
 
         dev.launch_compute_kernel_with_solution(
@@ -1108,25 +1292,34 @@ mod tests {
                 arg(&mut sc),
             ],
             Some(43),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(dev.module_load_stats() > loads_after_sol42);
     }
 
     #[test]
     fn embedding_frees_temp_buffer_after_launch() {
         // Regression: embedding allocated a temp idx buffer and freed it right
-        // after launch. With the per-launch sync removed (Item 2) it must still
-        // synchronize the stream before hipFree to avoid a use-after-free race.
         let env = std::env::var(GPU_TEST_ENV).is_ok();
         if !env {
             return;
         }
         let dev = RocmDevice::new(0);
-        let weight = dev.from_cpu(&vec![1.0f32; 16*8], &Shape::from_slice(&[16,8]), DType::F32).unwrap();
+        let weight = dev
+            .from_cpu(
+                &vec![1.0f32; 16 * 8],
+                &Shape::from_slice(&[16, 8]),
+                DType::F32,
+            )
+            .unwrap();
         let indices: Vec<u32> = (0..4).collect();
         let out_shape = Shape::from_slice(&[4, 8]);
         let res = dev.embedding(weight.as_ref(), &indices, &out_shape);
-        assert!(res.is_ok(), "embedding must succeed without use-after-free: {:?}", res.err());
+        assert!(
+            res.is_ok(),
+            "embedding must succeed without use-after-free: {:?}",
+            res.err()
+        );
     }
 
     // ------------------------------------------------------------------------
@@ -1136,8 +1329,6 @@ mod tests {
     #[test]
     fn zeros_uses_hipmemset_not_host_copy() {
         // zeros() must fill the device buffer with zero bytes for every dtype it
-        // supports, without allocating a host-side Vec (Item 3). hipMemset zeroes
-        // bytes, which is valid because every supported dtype's zero is all-zero bytes.
         let env = std::env::var(GPU_TEST_ENV).is_ok();
         if !env {
             return;
@@ -1147,14 +1338,26 @@ mod tests {
 
         let dtypes = [
             DType::F32,
-            DType { arith: ArithType::F16, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::F16,
+                storage: DTypeStorage::Native,
+            },
             DType::BF16,
-            DType { arith: ArithType::U32, storage: DTypeStorage::Native },
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U32,
+                storage: DTypeStorage::Native,
+            },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         ];
         for dtype in &dtypes {
             let storage = dev.zeros(&shape, dtype.clone()).unwrap();
-            let rs = storage.as_any().downcast_ref::<RocmStorage>().expect("RocmStorage");
+            let rs = storage
+                .as_any()
+                .downcast_ref::<RocmStorage>()
+                .expect("RocmStorage");
             assert!(rs.device_ptr_is_valid(), "expected valid ptr for {dtype:?}");
             let nbytes = rs.bytes();
             let mut host = vec![0xABu8; nbytes];
@@ -1178,7 +1381,6 @@ mod tests {
     #[test]
     fn host_transfer_pinned_async_matches_sync() {
         // The pinned + async host-transfer path (Item 4) must produce results
-        // identical to the cold-path synchronous pageable path.
         let env = std::env::var(GPU_TEST_ENV).is_ok();
         if !env {
             return;
@@ -1225,7 +1427,9 @@ mod tests {
 
         // Reusable pinned buffer for the upload side too.
         let pinned_in = RocmPinnedBuffer::<f32>::from_slice(&data).unwrap();
-        let async_storage3 = dev.upload_from_pinned(&pinned_in, &shape, DType::F32).unwrap();
+        let async_storage3 = dev
+            .upload_from_pinned(&pinned_in, &shape, DType::F32)
+            .unwrap();
         dev.synchronize();
         let async_out3 = dev.read_to_host_async(async_storage3.as_ref()).unwrap();
         for i in 0..data.len() {
@@ -1239,7 +1443,6 @@ mod tests {
     #[test]
     fn host_transfer_pinned_async_benchmark() {
         // Benchmark: per-token host round-trip latency, pageable+sync vs pinned+async.
-        // Mirrors the decode-loop transfer (feed a token in / read logits out).
         let env = std::env::var(GPU_TEST_ENV).is_ok();
         if !env {
             return;
@@ -1266,17 +1469,20 @@ mod tests {
         let sync_elapsed = t0.elapsed();
 
         // Pinned + async hipMemcpy round trip (reusing one pinned buffer for input
-        // and one for output, as the decode loop would across tokens).
         let pinned_in = RocmPinnedBuffer::<f32>::from_slice(&data).unwrap();
         let mut pinned_out = RocmPinnedBuffer::<f32>::alloc(n).unwrap();
         for _ in 0..warmup {
-            let s = dev.upload_from_pinned(&pinned_in, &shape, DType::F32).unwrap();
+            let s = dev
+                .upload_from_pinned(&pinned_in, &shape, DType::F32)
+                .unwrap();
             dev.synchronize();
             dev.read_into_pinned(s.as_ref(), &mut pinned_out).unwrap();
         }
         let t1 = std::time::Instant::now();
         for _ in 0..iters {
-            let s = dev.upload_from_pinned(&pinned_in, &shape, DType::F32).unwrap();
+            let s = dev
+                .upload_from_pinned(&pinned_in, &shape, DType::F32)
+                .unwrap();
             dev.synchronize();
             dev.read_into_pinned(s.as_ref(), &mut pinned_out).unwrap();
         }
@@ -1286,10 +1492,11 @@ mod tests {
         let async_us = async_elapsed.as_secs_f64() * 1e6 / iters as f64;
         println!(
             "[Item 4 benchmark] pageable+sync={:.1} us/round-trip, pinned+async={:.1} us/round-trip ({:.2}x)",
-            sync_us, async_us, sync_us / async_us.max(1e-9)
+            sync_us,
+            async_us,
+            sync_us / async_us.max(1e-9)
         );
         // Sanity: pinned+async must not be catastrophically slower (bandwidth
-        // floor is the same memory, so at worst it's parity with the sync path).
         assert!(
             async_us <= sync_us * 4.0 + 1.0,
             "pinned+async unexpectedly slower: {async_us:.1} vs {sync_us:.1} us"
@@ -1299,13 +1506,7 @@ mod tests {
     // ------------------------------------------------------------------------
     // Item 5: generic graph-capture session API (begin/end/replay, keyed cache)
     // ------------------------------------------------------------------------
-    //
     // Capture is gated by GRIM_CAPTURE_GRAPH (read once in RocmDevice::new). The
-    // API is a no-op when disabled, so these tests flip it on for the device they
-    // construct. The op sequence bracketed below is a plain matmul -> add ->
-    // rms_norm chain using only primitives that already exist in this crate; the
-    // backend does NOT bake in a "decode step" — the caller picks the key and the
-    // ops, exactly as the spec requires.
 
     #[test]
     fn graph_capture_session_replays_decode_sequence() {
@@ -1317,24 +1518,25 @@ mod tests {
             let dev = RocmDevice::new(0);
 
             // Inputs are uploaded eagerly (outside the capture bracket) so the
-            // captured graph only contains compute ops on stable device pointers.
             let m = 16usize;
             let k = 32usize;
             let n = 16usize;
             let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05) - 1.0).collect();
             let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.05) + 0.5).collect();
             let w: Vec<f32> = (0..m * n).map(|i| 1.0 + (i as f32 * 0.1)).collect();
-            let a_s = dev.from_cpu(&a, &Shape::from_slice(&[m, k]), DType::F32).unwrap();
-            let b_s = dev.from_cpu(&b, &Shape::from_slice(&[k, n]), DType::F32).unwrap();
-            let w_s = dev.from_cpu(&w, &Shape::from_slice(&[m, n]), DType::F32).unwrap();
+            let a_s = dev
+                .from_cpu(&a, &Shape::from_slice(&[m, k]), DType::F32)
+                .unwrap();
+            let b_s = dev
+                .from_cpu(&b, &Shape::from_slice(&[k, n]), DType::F32)
+                .unwrap();
+            let w_s = dev
+                .from_cpu(&w, &Shape::from_slice(&[m, n]), DType::F32)
+                .unwrap();
             let out_shape = Shape::from_slice(&[m, n]);
             let eps = 1e-5f32;
 
             // --- CPU reference (hardware-independent ground truth) ---
-            // rocBLAS may pick a different GEMM algorithm for the captured path than
-            // for an eager path, so we validate the captured graph against a pure-CPU
-            // computation of the same matmul+add+rms_norm sequence rather than against
-            // a GPU-eager run (Item 5).
             let mut c_ref = vec![0f32; m * n];
             for i in 0..m {
                 for j in 0..n {
@@ -1365,7 +1567,9 @@ mod tests {
             dev.begin_graph_capture(key).unwrap();
             let (c, _) = dev.matmul(a_s.as_ref(), b_s.as_ref(), &out_shape).unwrap();
             let (d, _) = dev.add(c.as_ref(), c.as_ref(), &out_shape).unwrap();
-            let (e, _) = dev.rms_norm(d.as_ref(), w_s.as_ref(), eps, &out_shape).unwrap();
+            let (e, _) = dev
+                .rms_norm(d.as_ref(), w_s.as_ref(), eps, &out_shape)
+                .unwrap();
             dev.end_graph_capture(key).unwrap();
             // Graph is cached; replay fills c/d/e.
             assert!(dev.replay_graph(key).unwrap());
@@ -1388,7 +1592,6 @@ mod tests {
     #[test]
     fn graph_capture_replay_miss_returns_false() {
         // Capturing under one key and then replaying a *different* key must return
-        // Ok(false) — never replay the wrong graph or error.
         temp_env::with_var("GRIM_CAPTURE_GRAPH", Some("1"), || {
             let env = std::env::var(GPU_TEST_ENV).is_ok();
             if !env {
@@ -1397,17 +1600,25 @@ mod tests {
             let dev = RocmDevice::new(0);
             let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
             let b: Vec<f32> = vec![0.5, 0.5, 0.5, 0.5];
-            let a_s = dev.from_cpu(&a, &Shape::from_slice(&[2, 2]), DType::F32).unwrap();
-            let b_s = dev.from_cpu(&b, &Shape::from_slice(&[2, 2]), DType::F32).unwrap();
+            let a_s = dev
+                .from_cpu(&a, &Shape::from_slice(&[2, 2]), DType::F32)
+                .unwrap();
+            let b_s = dev
+                .from_cpu(&b, &Shape::from_slice(&[2, 2]), DType::F32)
+                .unwrap();
 
             dev.begin_graph_capture("A").unwrap();
-            let (out_a, _) = dev.matmul(a_s.as_ref(), b_s.as_ref(), &Shape::from_slice(&[2, 2])).unwrap();
+            let (out_a, _) = dev
+                .matmul(a_s.as_ref(), b_s.as_ref(), &Shape::from_slice(&[2, 2]))
+                .unwrap();
             dev.end_graph_capture("A").unwrap();
 
             assert!(dev.replay_graph("A").unwrap(), "key A should be cached");
-            assert!(!dev.replay_graph("B").unwrap(), "key B is a miss -> Ok(false)");
+            assert!(
+                !dev.replay_graph("B").unwrap(),
+                "key B is a miss -> Ok(false)"
+            );
             // Keep the captured output alive until the test ends so the cached graph
-            // (which references its device pointer) never targets freed memory.
             drop(out_a);
         });
     }
@@ -1415,7 +1626,6 @@ mod tests {
     #[test]
     fn graph_capture_session_benchmark() {
         // Capture once, replay N times, and compare wall-clock against N eager
-        // runs of the same op sequence on real hardware.
         temp_env::with_var("GRIM_CAPTURE_GRAPH", Some("1"), || {
             let env = std::env::var(GPU_TEST_ENV).is_ok();
             if !env {
@@ -1428,9 +1638,15 @@ mod tests {
             let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.01) - 1.0).collect();
             let b: Vec<f32> = (0..k * n).map(|i| i as f32 * 0.02).collect();
             let w: Vec<f32> = (0..n).map(|i| 1.0 + (i as f32 * 0.1)).collect();
-            let a_s = dev.from_cpu(&a, &Shape::from_slice(&[m, k]), DType::F32).unwrap();
-            let b_s = dev.from_cpu(&b, &Shape::from_slice(&[k, n]), DType::F32).unwrap();
-            let w_s = dev.from_cpu(&w, &Shape::from_slice(&[n]), DType::F32).unwrap();
+            let a_s = dev
+                .from_cpu(&a, &Shape::from_slice(&[m, k]), DType::F32)
+                .unwrap();
+            let b_s = dev
+                .from_cpu(&b, &Shape::from_slice(&[k, n]), DType::F32)
+                .unwrap();
+            let w_s = dev
+                .from_cpu(&w, &Shape::from_slice(&[n]), DType::F32)
+                .unwrap();
             let out = Shape::from_slice(&[m, n]);
             let eps = 1e-5f32;
 
@@ -1474,10 +1690,11 @@ mod tests {
             let replay_us = replay_elapsed.as_secs_f64() * 1e6 / iters as f64;
             println!(
                 "[Item 5 benchmark] eager={:.1} us/seq, capture+replay={:.1} us/seq ({:.2}x)",
-                eager_us, replay_us, eager_us / replay_us.max(1e-9)
+                eager_us,
+                replay_us,
+                eager_us / replay_us.max(1e-9)
             );
             // Replay must not be catastrophically slower than eager (launch overhead
-            // is amortized into one graph launch).
             assert!(
                 replay_us <= eager_us * 3.0 + 1.0,
                 "capture+replay unexpectedly slower: {replay_us:.1} vs {eager_us:.1} us"
@@ -1486,34 +1703,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
-    // WI 1.6.1 — wavefront-parallel attention correctness (grim_rocm_consumer_perf_plan.md)
-    //
-    // The fused QKV attention kernel splits the KV walk across all 4 RDNA
-    // wavefronts in the 256-thread block, then merges the 4 partial (max, sum,
-    // acc[d]) states in wave 0 via LDS. These tests verify that the 4-way
-    // merge produces mathematically identical output to the structural
-    // CPU reference.
-    //
-    // Reference: `woody_attention_online_f32` — a CPU helper that performs
-    // the *same* online-softmax algorithm (running max + running weighted
-    // sum) with the same float32 reductions, but on a single thread per dim.
-    // This isolates correctness (merge + causal mask + GQA) from
-    // softmax-precision noise on near-uniform inputs.
-    //
-    // Tolerance rationale: f32 softmax on head_dim<=64 with normally
-    // distributed scores has ~1e-5 abs+rel error; we use 1e-3 to be
-    // generous against saturating input ranges that occasionally appear in
-    // the shape-class sweep below. The kv_seq_len==1 case (only one valid j)
-    // has zero softmax-pre-cision noise and is checked bit-exact at 1e-5.
+    // WI 1.6.1 — wavefront-parallel attention correctness (grim_rocm_consumer_perf_plan.md) [see: `woody_attention_online_f32`]
     // ------------------------------------------------------------------------
 
-    /// CPU reference for the fused QKV attention kernel.
-    ///
-    /// Mirrors the kernel algorithm: causal j ∈ [0, min(abs_i+1, kv_seq_len));
-    /// GQA via `kv_head = h / (num_heads/num_kv_heads)`; online softmax with
-    /// numerically stable running max + running sum; weighted sum against V.
-    /// Layouts: q shape `[seq_len * num_heads * head_dim]` (row-major 3-D),
-    /// k/v shape `[kv_seq_len * num_kv_heads * head_dim]` (shared across queries).
+    /// CPU reference for the fused QKV attention kernel. [see: `kv_head = h / (num_heads/num_kv_heads)`, `[seq_len * num_heads * head_dim]`]
     #[allow(clippy::too_many_arguments)]
     fn woody_attention_online_f32(
         q: &[f32],
@@ -1526,7 +1719,10 @@ mod tests {
         kv_seq_len: usize,
         cache_offset: u32,
     ) -> Vec<f32> {
-        assert!(num_heads % num_kv_heads == 0, "GQA: num_heads must be multiple of num_kv_heads");
+        assert!(
+            num_heads % num_kv_heads == 0,
+            "GQA: num_heads must be multiple of num_kv_heads"
+        );
         let q_per_kv = num_heads / num_kv_heads;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let q_stride = num_heads * head_dim;
@@ -1566,7 +1762,11 @@ mod tests {
                         acc[d] = acc[d] * scale_prev;
                         running_max[d] = new_m;
                         // Weight for this j.
-                        let w = if s == new_m { 1.0f32 } else { (s - new_m).exp() };
+                        let w = if s == new_m {
+                            1.0f32
+                        } else {
+                            (s - new_m).exp()
+                        };
                         running_sum[d] += w;
                         acc[d] += w * v[j * kv_stride + kv_head * head_dim + d];
                     }
@@ -1659,22 +1859,15 @@ mod tests {
     /// Compare two flat vectors and return the max abs diff observed.
     fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         assert_eq!(a.len(), b.len(), "len mismatch: {} vs {}", a.len(), b.len());
-        a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
     }
 
-    /// Common shape for all 5 shape-class tests.
-    ///
-    /// `head_dim = 32` keeps the tests runnable on wave32 hardware (RDNA
-    /// iGPU, e.g. gfx1036 — `RocmDevice::props.wavefront_size == 32`), where
-    /// lane_id caps at 32. On wave64 hardware (RDNA dGPU / CDNA) the SAME
-    /// fixture still exercises the WI 1.4.2 4-way partition because the
-    /// host launches block = wave_size_check(64) -> 4 wavefronts by default,
-    /// making waves 1-3 fully populated for d in [0, 32). The WI 1.4.2 merge
-    /// arithmetic run on each wave's partials, which is exactly what these
-    /// tests verify.
+    /// Common shape for all 5 shape-class tests. [see: `head_dim = 32`, `RocmDevice::props.wavefront_size == 32`]
     fn shape_fixture() -> (usize, usize, usize, usize) {
         // (num_heads, num_kv_heads, head_dim, seq_len)
-        // 2:1 GQA, 32-dim, 4 query positions.
         (8, 4, 32, 4)
     }
 
@@ -1757,11 +1950,6 @@ mod tests {
     #[test]
     fn wi1_qkv_attention_kvseq_eq_1_bit_exact() {
         // kv_seq_len=1 has zero softmax-precision noise (only one valid j and
-        // one softmax weight = 1.0). The 4-wavefront merge receives three empty
-        // partials (max=-1e30,sum=0,acc=0) plus one real partial. The structural
-        // identity test below asserts it matches the CPU reference bit-exact
-        // at 1e-5 tolerance, which is tight enough to flag any merge arithmetic
-        // bug independent of precision noise.
         let _ = approx_close;
         let (nh, nkv, hd, sl) = shape_fixture();
         let kv_seq = 1usize;
@@ -1772,17 +1960,17 @@ mod tests {
         let got = run_qkv_attention(env, &q, &k, &v, nkv, kv_seq, cache_off, sl, nh, hd);
         if let Some(out) = got {
             let max = max_abs_diff(&out, &cpu);
-            assert!(max <= 1e-5, "wi1 kv=1 (bit-exact) max_abs_diff {} too large", max);
+            assert!(
+                max <= 1e-5,
+                "wi1 kv=1 (bit-exact) max_abs_diff {} too large",
+                max
+            );
         }
     }
 
     #[test]
     fn wi1_qkv_attention_skewed_short_seq() {
         // Different head_dim (32, num_heads=4, num_kv_heads=2) and a sharply
-        // skewed layout: small head_dim, small num_heads, large kv_seq_len
-        // (1021 = 4*255+1). Confirms the 4-way split holds when individual
-        // dims don't match power-of-two boundaries. This is the most
-        // numerically hostile shape (long softmax tail, granular split).
         let _ = approx_close;
         let nh = 4usize;
         let nkv = 2usize;
@@ -1803,13 +1991,15 @@ mod tests {
     // ── F5: fused_dequant_backward_gemm execution test ──────────────────
 
     /// Allocate a `RocmStorage` backed by raw u8 data on the device.
-    /// Used for B_codes and B_scales which are byte arrays, not f32 tensors.
     fn alloc_u8_storage(
         data: &[u8],
         shape: &[usize],
         allocator: &Arc<RocmCachingAllocator>,
     ) -> RocmStorage {
-        let dt = DType { arith: ArithType::U8, storage: DTypeStorage::Native };
+        let dt = DType {
+            arith: ArithType::U8,
+            storage: DTypeStorage::Native,
+        };
         let storage = RocmStorage::alloc_gpu(&Shape::from_slice(shape), dt, allocator, 0)
             .expect("alloc_u8_storage: alloc_gpu failed");
         unsafe {
@@ -1824,7 +2014,6 @@ mod tests {
     }
 
     /// Pack 2-bit codes into a byte.  `codes` must have exactly 4 elements,
-    /// each in [0, 3].  Bit layout: code[0] in bits [7:6], code[3] in [1:0].
     fn pack_bpw2_byte(codes: [u8; 4]) -> u8 {
         assert!(codes.iter().all(|&c| c < 4));
         (codes[0] << 6) | (codes[1] << 4) | (codes[2] << 2) | codes[3]
@@ -1838,18 +2027,6 @@ mod tests {
         let dev = RocmDevice::new(0);
 
         // ── Problem shape ────────────────────────────────────────────────
-        // M=2, N=2, K=4, bpw=2
-        // dY[M,N] = [[2, 1], [4, 3]]  (f16)
-        // B_codes[N, K]: row 0 = codes [3,2,1,0], row 1 = codes [0,1,2,3]
-        // B_scales[N]   = [255, 255]  (scale = 255/255 = 1.0)
-        //
-        // Dequantized values (code/3 * 2 - 1):
-        //   code 3 → 1.0,  code 2 → 1/3,  code 1 → -1/3,  code 0 → -1.0
-        //
-        // dX[row,k] = Σ_col  dY[row,col] * B_dequant[col,k] * scale[col]
-        //
-        // Row 0 (dY=[2,1]):  [1.0,  1/3, -1/3, -1.0]
-        // Row 1 (dY=[4,3]):  [1.0,  1/3, -1/3, -1.0]
         let (m, n, k, bpw) = (2usize, 2usize, 4usize, 2u8);
 
         // ── B_codes: pack into row_bytes-aligned buffer ───────────────────
@@ -1866,17 +2043,28 @@ mod tests {
         let b_scales_ptr = b_scales_storage.device_ptr.unwrap() as *const c_void;
 
         // ── dY (f16) ────────────────────────────────────────────────────
-        let f16_dt = DType { arith: ArithType::F16, storage: DTypeStorage::Native };
+        let f16_dt = DType {
+            arith: ArithType::F16,
+            storage: DTypeStorage::Native,
+        };
         let dy_host: Vec<f32> = vec![2.0, 1.0, 4.0, 3.0]; // row-major [M, N]
         let dy_storage = RocmStorage::copy_from_host(
-            &dy_host, &Shape::from_slice(&[m, n]), f16_dt.clone(),
-            &dev.allocator, 0,
-        ).expect("dY copy_from_host");
+            &dy_host,
+            &Shape::from_slice(&[m, n]),
+            f16_dt.clone(),
+            &dev.allocator,
+            0,
+        )
+        .expect("dY copy_from_host");
 
         // ── dX output (f16, allocated but uninitialized) ─────────────────
         let dx_storage = RocmStorage::alloc_gpu(
-            &Shape::from_slice(&[m, k]), f16_dt.clone(), &dev.allocator, 0,
-        ).expect("dX alloc_gpu");
+            &Shape::from_slice(&[m, k]),
+            f16_dt.clone(),
+            &dev.allocator,
+            0,
+        )
+        .expect("dX alloc_gpu");
 
         // ── Launch backward kernel ───────────────────────────────────────
         dev.launch_fused_dequant_backward_gemm_f16(
@@ -1884,26 +2072,29 @@ mod tests {
             &b_codes_storage,
             b_scales_ptr,
             &dx_storage,
-            m, n, k,
+            m,
+            n,
+            k,
             bpw,
-            0,                         // outlier_count
-            std::ptr::null(),          // outlier_indices
-            std::ptr::null(),          // outlier_values
-            0,                         // backup_bpw
-            0,                         // backup_codes_offset
-            0,                         // backup_scale_offset
-            0,                         // backup2_bpw
-            0,                         // backup2_codes_offset
-            0,                         // backup2_scale_offset
-        ).expect("launch_fused_dequant_backward_gemm_f16 failed");
+            0,                // outlier_count
+            std::ptr::null(), // outlier_indices
+            std::ptr::null(), // outlier_values
+            0,                // backup_bpw
+            0,                // backup_codes_offset
+            0,                // backup_scale_offset
+            0,                // backup2_bpw
+            0,                // backup2_codes_offset
+            0,                // backup2_scale_offset
+        )
+        .expect("launch_fused_dequant_backward_gemm_f16 failed");
 
         // ── Read back and verify ─────────────────────────────────────────
         let got = dx_storage.to_cpu_vec_f32().expect("dX to_cpu_vec_f32");
 
         // CPU reference: same accumulation done in f32, then f16-rounded
-        let dequant: Vec<f32> = vec![1.0, 1.0/3.0, -1.0/3.0, -1.0]; // row 0 dequant
+        let dequant: Vec<f32> = vec![1.0, 1.0 / 3.0, -1.0 / 3.0, -1.0]; // row 0 dequant
         // row 1 has the same dequant pattern (codes [0,1,2,3])
-        let dequant2: Vec<f32> = vec![-1.0, -1.0/3.0, 1.0/3.0, 1.0];
+        let dequant2: Vec<f32> = vec![-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0];
         let scales: Vec<f32> = vec![1.0, 1.0];
         let dy: Vec<Vec<f32>> = vec![vec![2.0, 1.0], vec![4.0, 3.0]];
         let b_deq: Vec<Vec<f32>> = vec![dequant, dequant2];
@@ -1927,7 +2118,10 @@ mod tests {
             assert!(
                 diff < 0.01,
                 "dX[{}] mismatch: got {}, expected {} (diff {})",
-                i, g, e, diff,
+                i,
+                g,
+                e,
+                diff,
             );
         }
     }

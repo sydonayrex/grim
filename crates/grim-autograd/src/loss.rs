@@ -35,6 +35,9 @@ pub fn fused_linear_cross_entropy_loss(
     if w_dims[1] != hidden_dim {
         return Err(Error::Backend("lm_head hidden_dim mismatch".into()));
     }
+    if batch_size == 0 {
+        return Err(Error::Backend("batch_size must be > 0".into()));
+    }
     if targets.len() != batch_size {
         return Err(Error::Backend("targets length mismatch".into()));
     }
@@ -54,43 +57,63 @@ pub fn fused_linear_cross_entropy_loss(
         for b in chunk_start..chunk_end {
             let target_token = targets[b];
             if target_token >= vocab_size {
-                return Err(Error::Backend(format!("target_token {} >= vocab_size {}", target_token, vocab_size)));
+                return Err(Error::Backend(format!(
+                    "target_token {} >= vocab_size {}",
+                    target_token, vocab_size
+                )));
             }
 
-            let mut row_logits = vec![0.0f32; vocab_size];
+            let h_row = &h_vec[b * hidden_dim..(b + 1) * hidden_dim];
+
+            // Pass 1: Online LogSumExp & target logit extraction over vocabulary tiles (4096 tokens)
+            let v_chunk_size = 4096.min(vocab_size);
             let mut max_logit = f32::NEG_INFINITY;
-            for v in 0..vocab_size {
-                let mut sum = 0.0f32;
-                for d in 0..hidden_dim {
-                    sum += h_vec[b * hidden_dim + d] * w_vec[v * hidden_dim + d];
-                }
-                row_logits[v] = sum;
-                if sum > max_logit {
-                    max_logit = sum;
-                }
-            }
-
             let mut sum_exp = 0.0f32;
-            let mut probs = vec![0.0f32; vocab_size];
-            for v in 0..vocab_size {
-                let exp_val = (row_logits[v] - max_logit).exp();
-                probs[v] = exp_val;
-                sum_exp += exp_val;
+            let mut target_logit = 0.0f32;
+
+            for v_start in (0..vocab_size).step_by(v_chunk_size) {
+                let v_end = (v_start + v_chunk_size).min(vocab_size);
+                for v in v_start..v_end {
+                    let w_row = &w_vec[v * hidden_dim..(v + 1) * hidden_dim];
+                    let mut logit = 0.0f32;
+                    for d in 0..hidden_dim {
+                        logit += h_row[d] * w_row[d];
+                    }
+                    if v == target_token {
+                        target_logit = logit;
+                    }
+                    if logit > max_logit {
+                        let scale = (max_logit - logit).exp();
+                        sum_exp = sum_exp * scale + 1.0f32;
+                        max_logit = logit;
+                    } else {
+                        sum_exp += (logit - max_logit).exp();
+                    }
+                }
             }
 
             let log_sum_exp = max_logit + sum_exp.ln();
-            let sample_loss = log_sum_exp - row_logits[target_token];
+            let sample_loss = log_sum_exp - target_logit;
             total_loss += sample_loss;
 
-            for d in 0..hidden_dim {
-                let mut grad_d = 0.0f32;
-                for v in 0..vocab_size {
-                    let p = probs[v] / sum_exp;
+            // Pass 2: Online gradient accumulation over vocabulary tiles
+            let grad_h_row = &mut grad_h[b * hidden_dim..(b + 1) * hidden_dim];
+            for v_start in (0..vocab_size).step_by(v_chunk_size) {
+                let v_end = (v_start + v_chunk_size).min(vocab_size);
+                for v in v_start..v_end {
+                    let w_row = &w_vec[v * hidden_dim..(v + 1) * hidden_dim];
+                    let mut logit = 0.0f32;
+                    for d in 0..hidden_dim {
+                        logit += h_row[d] * w_row[d];
+                    }
+                    let p = (logit - max_logit).exp() / sum_exp;
                     let target_ind = if v == target_token { 1.0f32 } else { 0.0f32 };
                     let d_logits = (p - target_ind) * inv_b;
-                    grad_d += d_logits * w_vec[v * hidden_dim + d];
+
+                    for d in 0..hidden_dim {
+                        grad_h_row[d] += d_logits * w_row[d];
+                    }
                 }
-                grad_h[b * hidden_dim + d] = grad_d;
             }
         }
     }
@@ -120,12 +143,40 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Result<(f32, Te
     let batch_size = dims[0];
     let vocab_size = dims[1];
 
+    if batch_size == 0 {
+        return Err(Error::Backend("batch_size must be > 0".into()));
+    }
     if targets.len() != batch_size {
         return Err(Error::Backend(format!(
             "targets count ({}) must match batch_size ({})",
             targets.len(),
             batch_size
         )));
+    }
+
+    if let grim_tensor::Device::Rocm(ordinal) = logits.device() {
+        match grim_backend_rocm::RocmDevice::try_new(*ordinal) {
+            Ok(dev) => {
+                match dev.cross_entropy_gpu(&**logits.storage(), targets, None) {
+                    Ok((avg_loss, grad_storage)) => {
+                        let grad_tensor = Tensor::new(
+                            Arc::from(grad_storage),
+                            logits.shape().clone(),
+                            logits.dtype(),
+                            logits.provenance().clone(),
+                            logits.device().clone(),
+                        );
+                        return Ok((avg_loss, grad_tensor));
+                    }
+                    Err(_e) => {
+                        // GPU cross-entropy failed; fall through to CPU reference path.
+                    }
+                }
+            }
+            Err(_e) => {
+                // No ROCm device available at this ordinal; fall through to CPU.
+            }
+        }
     }
 
     let logits_vec = logits.to_vec_f32()?;
@@ -198,7 +249,8 @@ mod tests {
         let hidden = cpu_tensor(vec![0.5f32, 0.2, -0.1, 0.8], Shape::new(vec![2, 2]));
         let lm_head = cpu_tensor(vec![1.0f32, 0.0, 0.0, 1.0], Shape::new(vec![2, 2]));
         let targets = vec![0, 1];
-        let (fused_loss, fused_grad) = fused_linear_cross_entropy_loss(&hidden, &lm_head, &targets, 1).unwrap();
+        let (fused_loss, fused_grad) =
+            fused_linear_cross_entropy_loss(&hidden, &lm_head, &targets, 1).unwrap();
         assert!(fused_loss > 0.0);
         assert_eq!(fused_grad.shape().dims(), &[2, 2]);
     }

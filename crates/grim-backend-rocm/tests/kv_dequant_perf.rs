@@ -8,11 +8,9 @@
 
 use std::time::Instant;
 
-use grim_kvquant::{
-    KvCompressor, KvDequantAttentionConfig, KvQuantConfig, LloydMaxCompressor,
-};
 use grim_backend_cpu::CpuDevice;
-use grim_tensor::{BackendDevice, Device, DType, QuantProvenance, Shape, Tensor};
+use grim_kvquant::{KvCompressor, KvDequantAttentionConfig, KvQuantConfig, LloydMaxCompressor};
+use grim_tensor::{BackendDevice, DType, Device, QuantProvenance, Shape, Tensor};
 
 use grim_backend_rocm::RocmDevice;
 
@@ -37,8 +35,7 @@ fn dense_attn_1tok(
         for j in 0..kv_len {
             let mut dot = 0.0f32;
             for d in 0..head_dim {
-                dot += q[h * head_dim + d]
-                    * k[(j * num_kv_heads + kv_head) * head_dim + d];
+                dot += q[h * head_dim + d] * k[(j * num_kv_heads + kv_head) * head_dim + d];
             }
             let s = dot * scale;
             scores[j] = s;
@@ -111,15 +108,20 @@ fn main_config(
     );
     let block = compressor.compress(&keys, &values).unwrap();
 
-    let compressed_bytes =
-        block.key_bits.len() + block.value_bits.len() + (block.key_meta.len() + block.value_meta.len()) * 4;
+    let compressed_bytes = block.key_bits.len()
+        + block.value_bits.len()
+        + (block.key_meta.len() + block.value_meta.len()) * 4;
     let dense_bytes = cache_len * num_kv_heads * head_dim * 4 * 2;
     let host_ratio = dense_bytes as f32 / compressed_bytes as f32;
 
     // What the GPU actually ingests = the dispatcher-repacked buffer. Matches
     // dispatch_gpu_fused_attention's bitwidth selection rule (both ≤4 and even
     // head_dim -> 4-bit nibble pair, else 8-bit signed byte).
-    let quant_bits: u32 = if key_bits <= 4 && value_bits <= 4 && head_dim % 2 == 0 { 4 } else { 8 };
+    let quant_bits: u32 = if key_bits <= 4 && value_bits <= 4 && head_dim % 2 == 0 {
+        4
+    } else {
+        8
+    };
     let per_elem = if quant_bits == 8 { 1.0 } else { 0.5 };
     let k_bytes = (cache_len * num_kv_heads * head_dim) as f32 * per_elem;
     let v_bytes = k_bytes;
@@ -215,7 +217,8 @@ fn main_config(
 #[test]
 #[ignore]
 fn gpu_fused_attn_decode_throughput_vs_dense() {
-    let dev = RocmDevice::new(0);
+    let dev = RocmDevice::try_new(0)
+        .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
 
     let cache_len = 512;
     let num_heads = 32;
@@ -230,11 +233,49 @@ fn gpu_fused_attn_decode_throughput_vs_dense() {
     println!("  config | KV memory | decode throughput (vs CPU dense float baseline)\n");
 
     // Near-dense GPU reference: 8-bit K/V still flows through the fused kernel.
-    main_config(&dev, cache_len, num_heads, num_kv_heads, head_dim, 8, 8, steps);
+    main_config(
+        &dev,
+        cache_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        8,
+        8,
+        steps,
+    );
     // Aggressive low-bit (the KV-quant sweet spot).
-    main_config(&dev, cache_len, num_heads, num_kv_heads, head_dim, 4, 4, steps);
-    main_config(&dev, cache_len, num_heads, num_kv_heads, head_dim, 3, 4, steps);
-    main_config(&dev, cache_len, num_heads, num_kv_heads, head_dim, 2, 2, steps);
+    main_config(
+        &dev,
+        cache_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        4,
+        4,
+        steps,
+    );
+    main_config(
+        &dev,
+        cache_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        3,
+        4,
+        steps,
+    );
+    main_config(
+        &dev,
+        cache_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        2,
+        2,
+        steps,
+    );
 
-    println!("\n[gpu-verify] note: 8-bit GPU run is the 'dense-equivalent' compute cost; lower bits cut KV memory at ~constant kernel cost.");
+    println!(
+        "\n[gpu-verify] note: 8-bit GPU run is the 'dense-equivalent' compute cost; lower bits cut KV memory at ~constant kernel cost."
+    );
 }

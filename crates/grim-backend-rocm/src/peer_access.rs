@@ -22,7 +22,7 @@ use std::ffi::c_void;
 use grim_tensor::error::{Error, Result};
 
 use crate::device::helpers::check_hip;
-use crate::{hipSuccess, HipErrorT};
+use crate::{HipErrorT, hipSuccess};
 
 // HIP symbols we call. We declare them locally rather than going
 // through `crate::...` because the crate-root FFI declarations have
@@ -73,7 +73,9 @@ const HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED: HipErrorT = 0xb16;
 /// actually fails to query — never for "no devices found".
 pub fn enumerate_devices() -> Result<usize> {
     let mut count: i32 = 0;
-    check_hip("hipGetDeviceCount", unsafe { hipGetDeviceCount(&mut count as *mut _) })?;
+    check_hip("hipGetDeviceCount", unsafe {
+        hipGetDeviceCount(&mut count as *mut _)
+    })?;
     Ok((count.max(0)) as usize)
 }
 

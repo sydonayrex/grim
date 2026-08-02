@@ -9,7 +9,9 @@ use crate::ParamId;
 use grim_tensor::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
-fn default_device() -> grim_tensor::Device { grim_tensor::Device::Cpu }
+fn default_device() -> grim_tensor::Device {
+    grim_tensor::Device::Cpu
+}
 
 /// Standard LoRA injection points for QLoRA parity with Unsloth.
 ///
@@ -261,15 +263,7 @@ impl LoRAInjectionRegistry {
 
     /// Build the standard 7-point-per-layer QLoRA registry.
     pub fn standard_qlora(num_layers: usize, rank: usize, alpha: f32, adapter_id: u32) -> Self {
-        Self::standard_qlora_with_flags(
-            num_layers,
-            rank,
-            alpha,
-            adapter_id,
-            false,
-            false,
-            0.0,
-        )
+        Self::standard_qlora_with_flags(num_layers, rank, alpha, adapter_id, false, false, 0.0)
     }
 
     /// Build the standard 7-point-per-layer QLoRA registry, propagating
@@ -286,9 +280,7 @@ impl LoRAInjectionRegistry {
         let mut r = Self::new();
         for layer_idx in 0..num_layers {
             for &point in LoRAInjectionPoint::all_standard_qlora() {
-                let mut cfg = LoRAInjectionConfig::new(
-                    point, layer_idx, adapter_id, rank, alpha,
-                );
+                let mut cfg = LoRAInjectionConfig::new(point, layer_idx, adapter_id, rank, alpha);
                 cfg.use_pissa = use_pissa;
                 cfg.use_olora = use_olora;
                 cfg.olora_lambda = olora_lambda;
@@ -543,9 +535,9 @@ pub fn pissa_initialize(
 
     // Step 1: truncated SVD of the base weight.
     let svd = compute_truncated_svd(w_base, rows, cols, rank)?;
-    let u_r = svd.u;       // (rows, rank)
+    let u_r = svd.u; // (rows, rank)
     let sigma_r = svd.sigma; // (rank,)
-    let v_t_r = svd.v_t;   // (rank, cols)
+    let v_t_r = svd.v_t; // (rank, cols)
 
     let sqrt_sigma: Vec<f32> = sigma_r.iter().map(|s| s.sqrt().max(0.0)).collect();
 
@@ -595,14 +587,19 @@ pub fn pissa_initialize(
 
 /// Result of truncated SVD computation.
 pub struct TruncatedSvdResult {
-    pub u: Vec<f32>,      // Shape: (rows, rank)
-    pub sigma: Vec<f32>,  // Shape: (rank,)
-    pub v_t: Vec<f32>,    // Shape: (rank, cols)
+    pub u: Vec<f32>,     // Shape: (rows, rank)
+    pub sigma: Vec<f32>, // Shape: (rank,)
+    pub v_t: Vec<f32>,   // Shape: (rank, cols)
 }
 
 /// Compute truncated SVD using power iteration method.
 /// This is a CPU-based approximation suitable for LoftQ initialization.
-fn compute_truncated_svd(matrix: &[f32], rows: usize, cols: usize, rank: usize) -> Result<TruncatedSvdResult> {
+fn compute_truncated_svd(
+    matrix: &[f32],
+    rows: usize,
+    cols: usize,
+    rank: usize,
+) -> Result<TruncatedSvdResult> {
     let min_dim = rows.min(cols);
     if rank > min_dim {
         return Err(Error::Backend(format!(
@@ -890,6 +887,4 @@ mod tests {
         assert!(pissa_initialize(&w, 2, 2, 3).is_err());
         assert!(pissa_initialize(&vec![1.0], 2, 2, 1).is_err());
     }
-
-
 }

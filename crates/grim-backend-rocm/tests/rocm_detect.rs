@@ -26,12 +26,9 @@ static ENV_MUTEX: Mutex<()> = Mutex::new(());
 #[test]
 fn resolves_via_rcc_path_when_so_present() -> TestResult {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    
-    let tmp = std::env::temp_dir().join(format!(
-        "grim_rocm_detect_{}_{}",
-        std::process::id(),
-        "rcc"
-    ));
+
+    let tmp =
+        std::env::temp_dir().join(format!("grim_rocm_detect_{}_{}", std::process::id(), "rcc"));
     let lib = tmp.join("lib");
     std::fs::create_dir_all(&lib)?;
     std::fs::write(lib.join("librccl.so.1.0"), b"")?;
@@ -98,15 +95,16 @@ fn returns_none_when_no_rccl_present() -> TestResult {
         std::env::remove_var("ROCM_PATH");
     }
     // A workspace root with no .rocm-N/lib subdirs and no /opt/rocm.
-    let fake_root = std::env::temp_dir()
-        .join(format!("grim_rd_{}_norcc", std::process::id()));
+    let fake_root = std::env::temp_dir().join(format!("grim_rd_{}_norcc", std::process::id()));
     std::fs::create_dir_all(&fake_root)?;
 
     let got = resolve_rocm_lib_dir(&fake_root);
     std::fs::remove_dir_all(&fake_root).ok();
 
     if let Some(ref p) = got {
-        let has_real = p.join("librccl.so").exists() || p.join("librccl.so.1").exists() || p.join("librccl.so.1.0").exists();
+        let has_real = p.join("librccl.so").exists()
+            || p.join("librccl.so.1").exists()
+            || p.join("librccl.so.1.0").exists();
         assert!(has_real, "Got unexpected non-RCCL path {:?}", got);
     }
     Ok(())
@@ -118,8 +116,7 @@ fn returns_none_when_no_rccl_present() -> TestResult {
 fn skips_dir_without_rccl_so() -> TestResult {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
-    let tmp = std::env::temp_dir()
-        .join(format!("grim_rocm_detect_{}_empty", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("grim_rocm_detect_{}_empty", std::process::id()));
     let lib = tmp.join("lib");
     std::fs::create_dir_all(&lib)?; // empty, no .so
     unsafe {
@@ -135,7 +132,9 @@ fn skips_dir_without_rccl_so() -> TestResult {
     std::fs::remove_dir_all(&tmp).ok();
 
     if let Some(ref p) = got {
-        let has_real = p.join("librccl.so").exists() || p.join("librccl.so.1").exists() || p.join("librccl.so.1.0").exists();
+        let has_real = p.join("librccl.so").exists()
+            || p.join("librccl.so.1").exists()
+            || p.join("librccl.so.1.0").exists();
         assert!(has_real, "Empty dir must not resolve, got {:?}", got);
     }
     Ok(())

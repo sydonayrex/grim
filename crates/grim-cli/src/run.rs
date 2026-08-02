@@ -1,32 +1,37 @@
 //! `grim run` — load a model, run a prompt, or start HTTP server.
 
-use grim_core::error::Result;
-use grim_core::model::CausalLm;
-use grim_core::session::Inner as SessionInner;
-use grim_core::sampler::{SamplingParams, Sampler};
-use grim_engine::{Engine, EngineConfig, model_loader::{load_model_from_gguf, load_model_from_grim, load_model_from_safetensors}};
-use grim_models_transformer::{Lfm2Config, LlamaConfig};
-use grim_tensor::Device;
-use std::sync::Arc;
-use grim_tensor::BackendDevice;
+use crate::catalog::resolve_model_path;
 use grim_backend_cpu;
+use grim_backend_cuda;
+use grim_backend_metal;
 #[cfg(feature = "rocm")]
 use grim_backend_rocm;
-use grim_backend_cuda;
 use grim_backend_vulkan;
-use grim_backend_metal;
+use grim_core::error::Result;
+use grim_core::model::CausalLm;
+use grim_core::sampler::{Sampler, SamplingParams};
+use grim_core::session::Inner as SessionInner;
+use grim_engine::{
+    Engine, EngineConfig,
+    model_loader::{load_model_from_gguf, load_model_from_grim, load_model_from_safetensors},
+};
 use grim_format::GgufTokenizer;
-use crate::catalog::resolve_model_path;
+use grim_models_transformer::{Lfm2Config, LlamaConfig};
+use grim_tensor::BackendDevice;
+use grim_tensor::Device;
+use std::sync::Arc;
 
-/// Auto-detect the best available device.  Extracted from `cmd_run` so
-/// the interactive REPL (B.4) can probe once and reuse the result.
+/// Auto-detect best available device. Probed once, reused by interactive REPL.
 fn probe_device() -> (Device, String) {
     if let Ok(s) = std::env::var("GRIM_FORCE_DEVICE") {
         match s.as_str() {
             "cuda" => {
                 if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
                     if let Some(first) = cuda_devices.first() {
-                        return (Device::Cuda(first.ordinal()), format!("cuda:{}", first.ordinal()));
+                        return (
+                            Device::Cuda(first.ordinal()),
+                            format!("cuda:{}", first.ordinal()),
+                        );
                     }
                 }
                 (Device::Cpu, "cpu".into())
@@ -34,13 +39,18 @@ fn probe_device() -> (Device, String) {
             "rocm" => {
                 if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
                     if let Some(first) = rocm_devices.first() {
-                        return (Device::Rocm(first.ordinal()), format!("rocm:{}", first.ordinal()));
+                        return (
+                            Device::Rocm(first.ordinal()),
+                            format!("rocm:{}", first.ordinal()),
+                        );
                     }
                 }
                 (Device::Cpu, "cpu".into())
             }
             "metal" => {
-                let (free, total) = grim_backend_metal::vram_info(0);
+                let Some((free, total)) = grim_backend_metal::vram_info(0) else {
+                    return (Device::Cpu, "cpu".into());
+                };
                 if total > 0 {
                     return (Device::Metal(0), "metal:0".into());
                 }
@@ -67,16 +77,18 @@ fn probe_device() -> (Device, String) {
                 ordinal, wavefront, xnack
             );
             (Device::Rocm(ordinal), format!("rocm:{}", ordinal))
-        } else if let (free, total) = grim_backend_metal::vram_info(0) {
-            // Metal is only available on Apple platforms
+        } else {
+            // ROCm available but no devices; check Metal → CUDA → Vulkan fallback.
             #[cfg(target_vendor = "apple")]
             {
+                let Some((free, total)) = grim_backend_metal::vram_info(0) else {
+                    // vram_info failed; fall through to CUDA/Vulkan
+                };
                 if total > 0 {
                     eprintln!("[grim] Metal GPU detected");
                     return (Device::Metal(0), "metal:0".into());
                 }
             }
-            // On non-Apple platforms, fall through to CUDA or Vulkan
             if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
                 if let Some(first) = cuda_devices.first() {
                     let ordinal = first.ordinal();
@@ -106,32 +118,6 @@ fn probe_device() -> (Device, String) {
                 eprintln!("[grim] No GPU detected; using CPU backend.");
                 (Device::Cpu, "cpu".into())
             }
-        } else if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
-            if let Some(first) = cuda_devices.first() {
-                let ordinal = first.ordinal();
-                eprintln!("[grim] CUDA GPU {} detected", ordinal);
-                (Device::Cuda(ordinal), format!("cuda:{}", ordinal))
-            } else {
-                #[cfg(target_vendor = "apple")]
-                {
-                    eprintln!("[grim] No CUDA GPU detected; using CPU backend.");
-                }
-                #[cfg(not(target_vendor = "apple"))]
-                {
-                    if let Ok(vulkan_devices) = grim_backend_vulkan::VulkanDevice::probe() {
-                        if !vulkan_devices.is_empty() {
-                            eprintln!("[grim] Vulkan GPU detected");
-                            (Device::Vulkan, "vulkan".into())
-                        } else {
-                            eprintln!("[grim] No GPU detected; using CPU backend.");
-                            (Device::Cpu, "cpu".into())
-                        }
-                    } else {
-                        eprintln!("[grim] No GPU detected; using CPU backend.");
-                        (Device::Cpu, "cpu".into())
-                    }
-                }
-            }
         }
     } else if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
         if let Some(first) = cuda_devices.first() {
@@ -142,7 +128,9 @@ fn probe_device() -> (Device, String) {
             // Check Metal on Apple platforms, then Vulkan as fallback
             #[cfg(target_vendor = "apple")]
             {
-                let (free, total) = grim_backend_metal::vram_info(0);
+                let Some((free, total)) = grim_backend_metal::vram_info(0) else {
+                    return (Device::Cpu, "cpu".into());
+                };
                 if total > 0 {
                     eprintln!("[grim] Metal GPU detected");
                     return (Device::Metal(0), "metal:0".into());
@@ -164,7 +152,9 @@ fn probe_device() -> (Device, String) {
         // Check Metal on Apple platforms first, then Vulkan as fallback
         #[cfg(target_vendor = "apple")]
         {
-            let (free, total) = grim_backend_metal::vram_info(0);
+            let Some((free, total)) = grim_backend_metal::vram_info(0) else {
+                return (Device::Cpu, "cpu".into());
+            };
             if total > 0 {
                 eprintln!("[grim] Metal GPU detected");
                 return (Device::Metal(0), "metal:0".into());
@@ -199,29 +189,35 @@ pub async fn cmd_run(
 ) -> Result<()> {
     let prompt = prompt.unwrap_or_else(|| "Hello".to_string());
 
-    // Resolve model name to actual file path
+    // Resolve model name to file path
     let resolved_path = resolve_model_path(&model_path)
         .or_else(|| {
             // Accept a direct file path if it exists on disk.
             let p = std::path::Path::new(&model_path);
-            if p.exists() { Some(p.to_path_buf()) } else { None }
+            if p.exists() {
+                Some(p.to_path_buf())
+            } else {
+                None
+            }
         })
-        .ok_or_else(|| grim_core::error::Error::Config(
-            format!("Model '{}' not found. Run 'grim pull {}' to download it.",
-                model_path, model_path)
-        ))?;
+        .ok_or_else(|| {
+            grim_core::error::Error::Config(format!(
+                "Model '{}' not found. Run 'grim pull {}' to download it.",
+                model_path, model_path
+            ))
+        })?;
     let model_path_str = resolved_path.to_string_lossy().to_string();
     eprintln!("[grim] Resolved model path: {}", model_path_str);
 
-    // Probe for ROCm GPUs; fall back to CPU if none are available.
-    // §13.2: we fail closed — if a path was given but we can't open the file,
-    // we crash rather than silently running a random toy model.
+    // Probe for ROCm GPUs; fail closed if path can't be opened (§13.2).
     let path_obj = std::path::Path::new(&model_path_str);
     let use_gguf = path_obj.is_file() && model_path_str.to_lowercase().ends_with(".gguf");
     let use_grim = path_obj.is_file() && model_path_str.to_lowercase().ends_with(".grim");
-	    let use_safetensors = path_obj.is_file() && (model_path_str.to_lowercase().ends_with(".safetensors") || model_path_str.to_lowercase().ends_with(".bin"));
+    let use_safetensors = path_obj.is_file()
+        && (model_path_str.to_lowercase().ends_with(".safetensors")
+            || model_path_str.to_lowercase().ends_with(".bin"));
 
-	    let (device, device_name) = probe_device();
+    let (device, device_name) = probe_device();
 
     if serve {
         let mut engine = Engine::new(EngineConfig::default());
@@ -233,7 +229,10 @@ pub async fn cmd_run(
                     m
                 }
                 Err(e) => {
-                    eprintln!("[grim] ERROR: failed to load GGUF model '{}': {}", model_path_str, e);
+                    eprintln!(
+                        "[grim] ERROR: failed to load GGUF model '{}': {}",
+                        model_path_str, e
+                    );
                     return Err(e);
                 }
             }
@@ -245,7 +244,10 @@ pub async fn cmd_run(
                     m
                 }
                 Err(e) => {
-                    eprintln!("[grim] ERROR: failed to load GRIM model '{}': {}", model_path_str, e);
+                    eprintln!(
+                        "[grim] ERROR: failed to load GRIM model '{}': {}",
+                        model_path_str, e
+                    );
                     return Err(e);
                 }
             }
@@ -257,7 +259,10 @@ pub async fn cmd_run(
                     m
                 }
                 Err(e) => {
-                    eprintln!("[grim] ERROR: failed to load safetensors model '{}': {}", model_path_str, e);
+                    eprintln!(
+                        "[grim] ERROR: failed to load safetensors model '{}': {}",
+                        model_path_str, e
+                    );
                     return Err(e);
                 }
             }
@@ -288,7 +293,10 @@ pub async fn cmd_run(
                 m
             }
             Err(e) => {
-                eprintln!("[grim] ERROR: failed to load GGUF model '{}': {}", model_path_str, e);
+                eprintln!(
+                    "[grim] ERROR: failed to load GGUF model '{}': {}",
+                    model_path_str, e
+                );
                 return Err(e);
             }
         }
@@ -300,7 +308,10 @@ pub async fn cmd_run(
                 m
             }
             Err(e) => {
-                eprintln!("[grim] ERROR: failed to load GRIM model '{}': {}", model_path_str, e);
+                eprintln!(
+                    "[grim] ERROR: failed to load GRIM model '{}': {}",
+                    model_path_str, e
+                );
                 return Err(e);
             }
         }
@@ -312,7 +323,10 @@ pub async fn cmd_run(
                 m
             }
             Err(e) => {
-                eprintln!("[grim] ERROR: failed to load safetensors model '{}': {}", model_path_str, e);
+                eprintln!(
+                    "[grim] ERROR: failed to load safetensors model '{}': {}",
+                    model_path_str, e
+                );
                 return Err(e);
             }
         }
@@ -388,7 +402,8 @@ pub async fn cmd_run(
 
         ids.extend(tok.encode(&prompt_text));
         eprintln!("[grim] Encoded prompt: {} tokens: {:?}", ids.len(), ids);
-        let decoded: Vec<&str> = ids.iter()
+        let decoded: Vec<&str> = ids
+            .iter()
             .filter_map(|&id| tok.tokens.get(id as usize).map(|s| s.as_str()))
             .collect();
         eprintln!("[grim] Decoded tokens: {:?}", decoded);
@@ -401,7 +416,11 @@ pub async fn cmd_run(
     // config type is unknown (GPT2, Gemma, DeepSeek, etc.)
     let vocab: usize = if let Some(cfg) = model.config().as_any().downcast_ref::<LlamaConfig>() {
         cfg.vocab_size as usize
-    } else if let Some(cfg) = model.config().as_any().downcast_ref::<grim_models_mamba::MambaConfig>() {
+    } else if let Some(cfg) = model
+        .config()
+        .as_any()
+        .downcast_ref::<grim_models_mamba::MambaConfig>()
+    {
         cfg.vocab_size as usize
     } else if let Some(cfg) = model.config().as_any().downcast_ref::<Lfm2Config>() {
         cfg.vocab_size as usize
@@ -413,8 +432,10 @@ pub async fn cmd_run(
 
     println!("Prompt: {prompt}");
     println!("Device: {device_name}");
-    println!("Sampling: temp={}, top_p={}, top_k={}, max_tokens={}, seed={}", 
-             temperature, top_p, top_k, max_tokens, seed);
+    println!(
+        "Sampling: temp={}, top_p={}, top_k={}, max_tokens={}, seed={}",
+        temperature, top_p, top_k, max_tokens, seed
+    );
     print!("\nResponse: ");
     use std::io::Write;
     std::io::stdout().flush().unwrap();
@@ -427,14 +448,8 @@ pub async fn cmd_run(
 
     // Generation loop
     while generated < max_tokens {
-        // First pass: prefill with all prompt tokens to populate KV/conv caches.
-        // Subsequent passes: incremental decode — only pass the latest token
-        // so the caches (KV for attention, state for ShortConv) accumulate
-        // correctly instead of seeing the same tokens repeated.
-        // HIGH-3: save first_pass BEFORE the input_ids block mutates it,
-        // otherwise the positions check below always reads `false` and the
-        // first forward pass uses wrong positions (decode-style single value
-        // instead of sequential 0..n).
+        // Prefill on first pass to populate KV caches; decode one token at a time after.
+        // HIGH-3: save first_pass before input_ids block mutates it to avoid wrong positions.
         let is_prefill = first_pass;
         let input_ids: Vec<f32> = if first_pass {
             first_pass = false;
@@ -443,15 +458,14 @@ pub async fn cmd_run(
             vec![*tokens.last().unwrap() as f32]
         };
 
-        // Build tensor from the selected token(s)
+        // Build tensor from selected token(s)
         let n_tokens = input_ids.len();
         let shape = grim_tensor::Shape::new(vec![n_tokens]);
         let float_tokens = input_ids;
         let dtype = grim_tensor::dtype::DType::F32;
         let input_tensor = build_tensor(&float_tokens, &shape, &device)?;
 
-        // Forward pass
-        // CRIT-1: Need to pass proper positions tensor, not the same as input_ids
+        // Forward pass with proper positions tensor (CRIT-1).
         let positions: Vec<f32> = if is_prefill {
             (0..n_tokens).map(|i| i as f32).collect()
         } else {
@@ -459,27 +473,23 @@ pub async fn cmd_run(
         };
         let pos_shape = grim_tensor::Shape::new(vec![positions.len()]);
         let positions_tensor = build_tensor(&positions, &pos_shape, &device)?;
-        
-        let logits = CausalLm::forward(&*model, &mut session, &input_tensor, &positions_tensor, &[])?;
-        
-        // Get logits for the last token position only
+
+        let logits =
+            CausalLm::forward(&*model, &mut session, &input_tensor, &positions_tensor, &[])?;
+
+        // Get logits for last token position only
         let logits_vec = logits.to_vec_f32()?;
         let last_start = logits_vec.len().saturating_sub(vocab);
         let last_logits = &logits_vec[last_start..];
 
-        // Build a single-position logits tensor containing only the last-token
-        // logits, so the sampler sees exactly the distribution for the next
-        // token (not every position in the sequence). This fixes the bug where
-        // `sampler.sample(&logits, &history)` sees logits for the wrong slot
-        // and returns a non-final-position argmax.
+        // Single-position logits tensor so sampler sees next-token distribution only, not full sequence.
         let last_shape = grim_tensor::Shape::new(vec![vocab]);
         let last_logits_tensor = build_tensor(last_logits, &last_shape, &device)?;
 
-        // Sample next token from the *last-position* logits, not the full tensor.
+        // Sample from last-position logits only.
         let next_token = sampler.sample(&last_logits_tensor, &history)?;
-        
-        // Accumulate generated tokens; decode full sequence at end for
-        // correct BPE/SentencePiece boundary handling.
+
+        // Accumulate tokens; decode full sequence at end for correct BPE boundary handling.
         generated_tokens.push(next_token);
 
         // Update state
@@ -487,7 +497,7 @@ pub async fn cmd_run(
         history.push(next_token);
         generated += 1;
 
-        // Check for EOS token to stop generation
+        // Check for EOS token
         if let Some(tok) = &tokenizer {
             if let Some(eos_id) = tok.eos_token_id {
                 if next_token == eos_id {
@@ -498,8 +508,7 @@ pub async fn cmd_run(
         }
     }
 
-    // Decode all generated tokens together for correct BPE/SentencePiece
-    // boundary handling (single-token decode can produce incomplete output).
+    // Decode all tokens together for correct BPE boundary handling.
     if let Some(tok) = &tokenizer {
         let text = tok.decode(&generated_tokens);
         print!("{}", text);
@@ -515,9 +524,7 @@ pub async fn cmd_run(
     Ok(())
 }
 
-/// Holds everything needed for one or more generation runs against the same
-/// loaded model. Used by both `cmd_run` (one-shot) and the interactive REPL
-/// (B.4: avoid reloading the model from disk every turn).
+/// Holds state for one or more generation runs against the same model. Avoids reloading per turn.
 pub struct GenerationContext {
     pub model: Box<dyn CausalLm>,
     pub session: SessionInner,
@@ -528,11 +535,7 @@ pub struct GenerationContext {
     pub max_tokens: usize,
 }
 
-/// Load a model and prepare a fresh generation context.  The caller may
-/// call `run_generation_turn` repeatedly on the same context; each turn
-/// creates a *new* `SessionInner` (the model may need to re-prefill),
-/// but the model itself is loaded only once and the tokenizer/sampler
-/// are kept live between turns.
+/// Load model and prepare generation context. Model loaded once; tokenizer/sampler persist between turns.
 pub fn init_generation(
     model_path: String,
     temperature: f32,
@@ -542,17 +545,22 @@ pub fn init_generation(
     repeat_penalty: f32,
     max_tokens: usize,
 ) -> Result<GenerationContext> {
-
-    // Resolve model name to actual file path
+    // Resolve model name to file path
     let resolved_path = resolve_model_path(&model_path)
         .or_else(|| {
             let p = std::path::Path::new(&model_path);
-            if p.exists() { Some(p.to_path_buf()) } else { None }
+            if p.exists() {
+                Some(p.to_path_buf())
+            } else {
+                None
+            }
         })
-        .ok_or_else(|| grim_core::error::Error::Config(
-            format!("Model '{}' not found. Run 'grim pull {}' to download it.",
-                model_path, model_path)
-        ))?;
+        .ok_or_else(|| {
+            grim_core::error::Error::Config(format!(
+                "Model '{}' not found. Run 'grim pull {}' to download it.",
+                model_path, model_path
+            ))
+        })?;
     let model_path_str = resolved_path.to_string_lossy().to_string();
 
     let path_obj = std::path::Path::new(&model_path_str);
@@ -603,12 +611,21 @@ pub fn init_generation(
         None
     };
 
-    let sampling_params = SamplingParams { temperature, top_p, top_k, repeat_penalty };
+    let sampling_params = SamplingParams {
+        temperature,
+        top_p,
+        top_k,
+        repeat_penalty,
+    };
     let sampler: Box<dyn Sampler> = sampling_params.into_sampler(seed);
 
     let vocab: usize = if let Some(cfg) = model.config().as_any().downcast_ref::<LlamaConfig>() {
         cfg.vocab_size as usize
-    } else if let Some(cfg) = model.config().as_any().downcast_ref::<grim_models_mamba::MambaConfig>() {
+    } else if let Some(cfg) = model
+        .config()
+        .as_any()
+        .downcast_ref::<grim_models_mamba::MambaConfig>()
+    {
         cfg.vocab_size as usize
     } else if let Some(cfg) = model.config().as_any().downcast_ref::<Lfm2Config>() {
         cfg.vocab_size as usize
@@ -631,9 +648,7 @@ pub fn init_generation(
     })
 }
 
-/// Build an F32 tensor from host data on the given device.
-/// Eliminates the 5-way device match duplication that was repeated
-/// for every tensor construction in the generation loop.
+/// Build an F32 tensor from host data. Eliminates 5-way device match duplication.
 fn build_tensor(
     data: &[f32],
     shape: &grim_tensor::Shape,
@@ -646,7 +661,7 @@ fn build_tensor(
             Arc::from(dev.from_cpu(data, shape, dtype.clone())?)
         }
         grim_tensor::Device::Cuda(ordinal) => {
-            let dev = grim_backend_cuda::CudaDevice::new(*ordinal);
+            let dev = grim_backend_cuda::CudaDevice::new(*ordinal)?;
             Arc::from(dev.from_cpu(data, shape, dtype.clone())?)
         }
         grim_tensor::Device::Rocm(ordinal) => {
@@ -671,10 +686,7 @@ fn build_tensor(
     ))
 }
 
-/// Interactive REPL: loads the model ONCE, then loops reading prompts
-/// and generating responses without reloading or discarding the session.
-/// Fixes B.4: the previous code called `cmd_run` per turn, reloading the
-/// model and rebuilding the session (and its KV cache) from scratch.
+/// Interactive REPL: loads model once, loops reading prompts without reloading. Fixes B.4.
 pub async fn cmd_run_interactive(
     model_path: String,
     address: String,
@@ -689,12 +701,18 @@ pub async fn cmd_run_interactive(
     let resolved_path = resolve_model_path(&model_path)
         .or_else(|| {
             let p = std::path::Path::new(&model_path);
-            if p.exists() { Some(p.to_path_buf()) } else { None }
+            if p.exists() {
+                Some(p.to_path_buf())
+            } else {
+                None
+            }
         })
-        .ok_or_else(|| grim_core::error::Error::Config(
-            format!("Model '{}' not found. Run 'grim pull {}' to download it.",
-                model_path, model_path)
-        ))?;
+        .ok_or_else(|| {
+            grim_core::error::Error::Config(format!(
+                "Model '{}' not found. Run 'grim pull {}' to download it.",
+                model_path, model_path
+            ))
+        })?;
     let model_path_str = resolved_path.to_string_lossy().to_string();
     eprintln!("[grim] Resolved model path: {}", model_path_str);
 
@@ -749,13 +767,22 @@ pub async fn cmd_run_interactive(
     };
 
     // ---- sampler (created once) ----
-    let sampling_params = SamplingParams { temperature, top_p, top_k, repeat_penalty };
+    let sampling_params = SamplingParams {
+        temperature,
+        top_p,
+        top_k,
+        repeat_penalty,
+    };
     let sampler: Box<dyn Sampler> = sampling_params.into_sampler(seed);
 
     // ---- vocab size (computed once) ----
     let vocab: usize = if let Some(cfg) = model.config().as_any().downcast_ref::<LlamaConfig>() {
         cfg.vocab_size as usize
-    } else if let Some(cfg) = model.config().as_any().downcast_ref::<grim_models_mamba::MambaConfig>() {
+    } else if let Some(cfg) = model
+        .config()
+        .as_any()
+        .downcast_ref::<grim_models_mamba::MambaConfig>()
+    {
         cfg.vocab_size as usize
     } else if let Some(cfg) = model.config().as_any().downcast_ref::<Lfm2Config>() {
         cfg.vocab_size as usize
@@ -766,16 +793,18 @@ pub async fn cmd_run_interactive(
     };
 
     eprintln!("[grim] Device: {device_name}");
-    eprintln!("[grim] Sampling: temp={temperature}, top_p={top_p}, top_k={top_k}, max_tokens={max_tokens}, seed={seed}");
+    eprintln!(
+        "[grim] Sampling: temp={temperature}, top_p={top_p}, top_k={top_k}, max_tokens={max_tokens}, seed={seed}"
+    );
     eprintln!("[grim] Type your prompt below (Ctrl+C to exit):");
 
-    // Session persists across turns so the KV cache carries forward context.
+    // Session and KV cache persist across turns.
     let mut session = SessionInner::new(model.device().clone());
-    // Accumulated conversation history for multi-turn chat templates.
+    // Multi-turn chat template history.
     let mut messages: Vec<grim_format::ChatMessage> = Vec::new();
     // Repeat-penalty history persists across turns.
     let mut history: Vec<u32> = Vec::new();
-    // Running token count for position offset across turns (KV cache persists).
+    // Running token count for position offset across turns.
     let mut total_tokens: usize = 0;
 
     use std::io::Write;
@@ -785,7 +814,9 @@ pub async fn cmd_run_interactive(
         let mut line = String::new();
         std::io::stdin().read_line(&mut line).unwrap();
         let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
+        if trimmed.is_empty() {
+            continue;
+        }
 
         // Append the user message to the conversation history.
         messages.push(grim_format::ChatMessage {
@@ -838,7 +869,8 @@ pub async fn cmd_run_interactive(
             let pos_shape = grim_tensor::Shape::new(vec![positions.len()]);
             let positions_tensor = build_tensor(&positions, &pos_shape, &device)?;
 
-            let logits = CausalLm::forward(&*model, &mut session, &input_tensor, &positions_tensor, &[])?;
+            let logits =
+                CausalLm::forward(&*model, &mut session, &input_tensor, &positions_tensor, &[])?;
 
             let logits_vec = logits.to_vec_f32()?;
             let last_start = logits_vec.len().saturating_sub(vocab);
@@ -857,7 +889,9 @@ pub async fn cmd_run_interactive(
 
             if let Some(tok) = &tokenizer {
                 if let Some(eos_id) = tok.eos_token_id {
-                    if next_token == eos_id { break; }
+                    if next_token == eos_id {
+                        break;
+                    }
                 }
             }
         }
@@ -865,8 +899,7 @@ pub async fn cmd_run_interactive(
         if let Some(tok) = &tokenizer {
             let text = tok.decode(&generated_tokens);
             print!("{}", text);
-            // Record the assistant response so the next turn's chat template
-            // has full conversation history.
+            // Record assistant response for next turn's full conversation history.
             messages.push(grim_format::ChatMessage {
                 role: "assistant".to_string(),
                 content: text,

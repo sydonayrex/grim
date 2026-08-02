@@ -17,9 +17,15 @@ pub struct ModernBertConfig {
 }
 
 impl ModelConfig for ModernBertConfig {
-    fn name(&self) -> &str { "modern-bert" }
-    fn modality(&self) -> ModalityHint { ModalityHint::VisionEncoder }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str {
+        "modern-bert"
+    }
+    fn modality(&self) -> ModalityHint {
+        ModalityHint::VisionEncoder
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Configuration for Nomic-BERT encoder architecture.
@@ -35,9 +41,15 @@ pub struct NomicBertConfig {
 }
 
 impl ModelConfig for NomicBertConfig {
-    fn name(&self) -> &str { "nomic-bert" }
-    fn modality(&self) -> ModalityHint { ModalityHint::VisionEncoder }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str {
+        "nomic-bert"
+    }
+    fn modality(&self) -> ModalityHint {
+        ModalityHint::VisionEncoder
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Configuration for T5Encoder architecture.
@@ -53,7 +65,13 @@ pub struct T5EncoderConfig {
 }
 
 impl ModelConfig for T5EncoderConfig {
-    fn name(&self) -> &str { "t5encoder" }
-    fn modality(&self) -> ModalityHint { ModalityHint::TextInTextOut }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str {
+        "t5encoder"
+    }
+    fn modality(&self) -> ModalityHint {
+        ModalityHint::TextInTextOut
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }

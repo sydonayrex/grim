@@ -4,7 +4,9 @@
 //! pre-existing unsafe `set_var`/`remove_var` calls in the unit-test module
 //! (those require an `unsafe` block in Rust edition 2024).
 
-use grim_backend_rocm::{HipKernelLaunch, QkvAttentionFusionConfig, RmsNormMatMulFusionConfig, hipDim3};
+use grim_backend_rocm::{
+    HipKernelLaunch, QkvAttentionFusionConfig, RmsNormMatMulFusionConfig, hipDim3,
+};
 
 #[test]
 fn rmsnorm_matmul_w64_picks_256_thread_block() {
@@ -109,7 +111,10 @@ fn qkv_attention_default_config_enables_kernel() {
     // Default enables the gate so the fused kernel runs by default.
     // Toggle to `enabled: false` to fall back to rocBLAS.
     let cfg = QkvAttentionFusionConfig::default();
-    assert!(cfg.enabled, "QkvAttentionFusionConfig::default must enable the fused kernel");
+    assert!(
+        cfg.enabled,
+        "QkvAttentionFusionConfig::default must enable the fused kernel"
+    );
 }
 
 #[test]

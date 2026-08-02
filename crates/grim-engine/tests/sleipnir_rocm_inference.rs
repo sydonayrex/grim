@@ -24,9 +24,9 @@ use grim_core::sampler::{Sampler, SamplingParams};
 use grim_engine::model_loader::load_model_from_gguf;
 use grim_format::GgufProvider;
 use grim_tensor::{
+    Device, Shape, Tensor,
     backend::BackendDevice,
     dtype::{DType, QuantProvenance},
-    Device, Shape, Tensor,
 };
 
 /// `GRIM_RUN_GPU_TESTS=1` -> run on ROCm(0); otherwise CPU. Either way the
@@ -80,7 +80,7 @@ fn target_device() -> (Device, Box<dyn BackendDevice>) {
         // Construct defensively: `RocmDevice::new` falls back to a no-stream
         // device rather than panicking on a GPU-less host.
         let ordinal = 0usize;
-        let dev = grim_backend_rocm::RocmDevice::new(ordinal);
+        let dev = grim_backend_rocm::RocmDevice::try_new(ordinal).expect("RocmDevice::new failed");
         (Device::Rocm(ordinal), Box::new(dev))
     } else {
         (Device::Cpu, Box::new(CpuDevice::new()))
@@ -134,7 +134,10 @@ fn generate(dev: &dyn BackendDevice, device: &Device, path: &str, vocab: usize) 
     let tokenizer = provider.tokenizer().expect("provider.tokenizer failed");
 
     let input_ids = tokenizer.encode(PROMPT);
-    assert!(!input_ids.is_empty(), "prompt tokenization produced empty input_ids");
+    assert!(
+        !input_ids.is_empty(),
+        "prompt tokenization produced empty input_ids"
+    );
     let prompt_len = input_ids.len();
     let ids_f32: Vec<f32> = input_ids.iter().map(|&x| x as f32).collect();
     let pos_f32: Vec<f32> = (0..prompt_len).map(|i| i as f32).collect();
@@ -226,7 +229,9 @@ fn sleipnir_gguf_metadata_contract() {
     let Some(path) = model_path() else { return };
     let provider = GgufProvider::open(&path).expect("GgufProvider::open failed");
 
-    let arch = provider.architecture().expect("missing general.architecture");
+    let arch = provider
+        .architecture()
+        .expect("missing general.architecture");
     assert_eq!(arch, EXPECTED_ARCH, "unexpected architecture");
 
     let hidden = provider
@@ -281,8 +286,7 @@ fn sleipnir_gguf_prefill_logits_shape() {
     let Some(path) = model_path() else { return };
     let (device, dev) = target_device();
 
-    let model = load_model_from_gguf(&path, device.clone())
-        .expect("load_model_from_gguf failed");
+    let model = load_model_from_gguf(&path, device.clone()).expect("load_model_from_gguf failed");
     let provider = GgufProvider::open(&path).expect("open failed");
     let vocab = provider
         .metadata("lfm2.vocab_size")
@@ -376,7 +380,10 @@ fn sleipnir_gguf_tokenizer_output_clean() {
 
     let answer_text = tokenizer.decode(&GOLDEN_TOKENS);
     let full_text = format!("{PROMPT}{answer_text}");
-    assert!(!answer_text.trim().is_empty(), "decoded answer text is empty");
+    assert!(
+        !answer_text.trim().is_empty(),
+        "decoded answer text is empty"
+    );
     assert!(
         !answer_text.contains('Ġ'),
         "answer text contains unhandled BPE byte marker Ġ"

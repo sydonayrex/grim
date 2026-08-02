@@ -33,8 +33,9 @@ fn kernel_source_has_no_duplicate_device_fns() {
 #[test]
 #[ignore = "requires GRIM_RUN_GPU_TESTS=1 and a real ROCm GPU"]
 fn rocm_trait_ops_are_reachable_via_dyn() {
-    let dev: Box<dyn BackendDevice> =
-        Box::new(RocmDevice::new(0));
+    let dev: Box<dyn BackendDevice> = Box::new(
+        RocmDevice::try_new(0).expect("RocmDevice::new should succeed on a system with ROCm"),
+    );
     let shape = grim_tensor::Shape::new(vec![1, 1]);
     let dummy = dev.zeros(&shape, grim_tensor::DType::BF16).unwrap();
     let s = dummy.as_ref();

@@ -1,12 +1,12 @@
 //! GPT2 & GPT-NeoX family — standard LayerNorm + absolute positional embeddings.
 
-use grim_backend_cpu::{cpu_tensor, add_tensors};
+use grim_backend_cpu::{add_tensors, cpu_tensor};
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
 use grim_nn::{Embedding, Linear};
-use grim_tensor::{ArithType, Device, DType, Tensor};
+use grim_tensor::{ArithType, DType, Device, Tensor};
 
 /// Tanh-based GELU approximation (GPT-2 paper: Gaussian Error Linear Units).
 /// GELU(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³))).
@@ -95,11 +95,31 @@ pub struct Gpt2Block {
 impl Gpt2Block {
     pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: &Gpt2Config) -> Result<Self> {
         let ln_1 = LayerNorm::load(&ws.pp("ln_1"), cfg.hidden_size, cfg.layer_norm_epsilon)?;
-        let wqkv = Linear::load(&ws.pp("attn.wqkv"), cfg.hidden_size, 3 * cfg.hidden_size, true)?;
-        let c_proj = Linear::load(&ws.pp("attn.c_proj"), cfg.hidden_size, cfg.hidden_size, true)?;
+        let wqkv = Linear::load(
+            &ws.pp("attn.wqkv"),
+            cfg.hidden_size,
+            3 * cfg.hidden_size,
+            true,
+        )?;
+        let c_proj = Linear::load(
+            &ws.pp("attn.c_proj"),
+            cfg.hidden_size,
+            cfg.hidden_size,
+            true,
+        )?;
         let ln_2 = LayerNorm::load(&ws.pp("ln_2"), cfg.hidden_size, cfg.layer_norm_epsilon)?;
-        let ffn_gate = Linear::load(&ws.pp("mlp.c_fc"), cfg.hidden_size, cfg.intermediate_size, true)?;
-        let ffn_down = Linear::load(&ws.pp("mlp.c_proj"), cfg.intermediate_size, cfg.hidden_size, true)?;
+        let ffn_gate = Linear::load(
+            &ws.pp("mlp.c_fc"),
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            true,
+        )?;
+        let ffn_down = Linear::load(
+            &ws.pp("mlp.c_proj"),
+            cfg.intermediate_size,
+            cfg.hidden_size,
+            true,
+        )?;
 
         Ok(Self {
             ln_1,
@@ -116,7 +136,7 @@ impl Gpt2Block {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let norm_x = self.ln_1.forward(x)?;
         let qkv = self.wqkv.forward(&norm_x)?;
-        
+
         // Split QKV into separate Q, K, V
         let qkv_data = qkv.to_vec_f32()?;
         let seq_len = qkv.shape().dims()[0];
@@ -124,7 +144,7 @@ impl Gpt2Block {
         let mut q = vec![0.0f32; seq_len * hidden_size];
         let mut k = vec![0.0f32; seq_len * hidden_size];
         let mut v = vec![0.0f32; seq_len * hidden_size];
-        
+
         for pos in 0..seq_len {
             for h in 0..self.num_heads {
                 for d in 0..self.head_dim {
@@ -135,11 +155,11 @@ impl Gpt2Block {
                 }
             }
         }
-        
+
         // Apply causal attention computation
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         let mut attn_out = vec![0.0f32; seq_len * hidden_size];
-        
+
         for h in 0..self.num_heads {
             for t in 0..seq_len {
                 let mut scores = vec![0.0f32; seq_len];
@@ -147,7 +167,8 @@ impl Gpt2Block {
                 for t2 in 0..=t {
                     let mut dot = 0.0f32;
                     for d in 0..self.head_dim {
-                        dot += q[t * hidden_size + h * self.head_dim + d] * k[t2 * hidden_size + h * self.head_dim + d];
+                        dot += q[t * hidden_size + h * self.head_dim + d]
+                            * k[t2 * hidden_size + h * self.head_dim + d];
                     }
                     scores[t2] = dot * scale;
                 }
@@ -175,11 +196,13 @@ impl Gpt2Block {
                 }
             }
         }
-        
-        let attn_out_tensor = cpu_tensor(attn_out, grim_tensor::Shape::new(vec![seq_len, hidden_size]));
+
+        let attn_out_tensor = cpu_tensor(
+            attn_out,
+            grim_tensor::Shape::new(vec![seq_len, hidden_size]),
+        );
         let attn_out = self.c_proj.forward(&attn_out_tensor)?;
-        let x_res1 = add_tensors(x, &attn_out)
-            .map_err(grim_core::Error::Tensor)?;
+        let x_res1 = add_tensors(x, &attn_out).map_err(grim_core::Error::Tensor)?;
 
         let norm_x2 = self.ln_2.forward(&x_res1)?;
         let gate = self.ffn_gate.forward(&norm_x2)?;
@@ -188,8 +211,7 @@ impl Gpt2Block {
         // linear transformation, destroying model capacity.
         let gate = gelu(&gate)?;
         let ffn_out = self.ffn_down.forward(&gate)?;
-        add_tensors(&x_res1, &ffn_out)
-            .map_err(grim_core::Error::Tensor)
+        add_tensors(&x_res1, &ffn_out).map_err(grim_core::Error::Tensor)
     }
 }
 
@@ -210,7 +232,10 @@ impl Gpt2 {
         // Validate position embedding count matches config
         let actual_pos = wpe.weight.shape().dims().first().copied().unwrap_or(0);
         if actual_pos < cfg.max_seq_len {
-            eprintln!("[Gpt2] wpe has {} position embeddings, config expects {}. Clamping max_seq_len.", actual_pos, cfg.max_seq_len);
+            eprintln!(
+                "[Gpt2] wpe has {} position embeddings, config expects {}. Clamping max_seq_len.",
+                actual_pos, cfg.max_seq_len
+            );
         }
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -270,8 +295,7 @@ impl CausalLm for Gpt2 {
         let pos_ids: Vec<u32> = (0..seq_len).map(|i| i as u32).collect();
         let pos_emb = self.wpe.forward(&pos_ids, seq_len, self.cfg.hidden_size)?;
 
-        let mut h = add_tensors(&tok_emb, &pos_emb)
-            .map_err(grim_core::Error::Tensor)?;
+        let mut h = add_tensors(&tok_emb, &pos_emb).map_err(grim_core::Error::Tensor)?;
         for layer in &self.layers {
             h = layer.forward(&h)?;
         }

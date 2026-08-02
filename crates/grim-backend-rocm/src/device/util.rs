@@ -1,24 +1,13 @@
-//! Module-level utilities used by the `RocmDevice` impl blocks. None of
-//! them carry device state per se — `linear_launch` sizes a 1D grid,
-//! `as_rocm`/`dev_ptr`/`arg` are kernel-launch sugar, `gpu_target_*`
-//! and `detect_gpu_arch` resolve the offload-arch flag, `dtype_f32`
-//! and `dtype_byte_size` build the canonical f32 dtype and its size.
-//!
-//! Skill attribution:
-//! - `rust-gpu-discipline` §4 — every helper returns `Result` on GPU
-//!   touches; no silent fallback.
-//! - `rocm-profiling-perf` — `ROCM_COMPUTE_BLOCK = 256` is the
-//!   Wave64-tuned default (4 wavefronts of 64 per block).
+//! Module-level utilities used by the `RocmDevice` impl blocks. None of [see: `linear_launch`, `as_rocm`, `dev_ptr`, `arg`]
 
-use std::ffi::{c_void, CString};
+use std::ffi::{CString, c_void};
 
 use grim_tensor::dtype::{DType, Storage as DTypeStorage};
 use grim_tensor::{ArithType, BackendStorage, Error, Result};
 
-use crate::{hipGetDeviceProperties, RocmStorage};
+use crate::{RocmStorage, hipGetDeviceProperties};
 
 /// Default launch block size: 256 threads = 4 Wave64 wavefronts on
-/// RDNA. Used as the single value everywhere a 1-D grid is sized.
 pub const ROCM_COMPUTE_BLOCK: u32 = 256;
 
 /// Grid/block dims for a 1-D launch over `total` elements.
@@ -31,7 +20,6 @@ pub fn linear_launch(total: usize) -> (crate::HipDim3, crate::HipDim3) {
 }
 
 /// Helper: downcast a `BackendStorage` to `RocmStorage`, returning a
-/// clear error if the input is not ROCm-resident.
 pub fn as_rocm<'a>(s: &'a dyn BackendStorage) -> Result<&'a RocmStorage> {
     s.as_any()
         .downcast_ref::<RocmStorage>()
@@ -44,30 +32,17 @@ pub fn dev_ptr(s: &RocmStorage) -> Result<u64> {
         .ok_or_else(|| Error::Backend("RocmStorage has no device pointer".into()))
 }
 
-/// Helper: turn a mutable borrow of a kernel argument into the
-/// `*mut c_void` slot the HIP module-launch ABI expects. Each arg
-/// is passed by pointer.
+/// Helper: turn a mutable borrow of a kernel argument into the [see: `*mut c_void`]
 pub fn arg<T>(v: &mut T) -> *mut c_void {
     v as *mut T as *mut c_void
 }
 
-/// Build the AMD-clang hipRTC `--offload-arch=<arch>` option. Defaults
-/// to `gfx900` to preserve historical CDNA builds; override via
-/// `GRIM_GPU_TARGET`.
+/// Build the AMD-clang hipRTC `--offload-arch=<arch>` option. Defaults [see: `gfx900`, `GRIM_GPU_TARGET`]
 pub fn gpu_target_arch() -> String {
     std::env::var("GRIM_GPU_TARGET").unwrap_or_else(|_| "gfx900".into())
 }
 
-/// Query the device's real gfx target so JIT-compiled kernels always
-/// match the GPU, independent of the process-global `GRIM_GPU_TARGET`
-/// env (which other tests flip via `temp_env` and would otherwise race
-/// with device creation).
-///
-/// Implementation note: `hipDeviceProp_t` is version-sensitive and
-/// large; rather than redefining it, dump the properties into an
-/// over-sized zeroed buffer and scan for the `gcnArchName` token
-/// (a NUL-terminated "gfx<hex>" string). Robust to field reordering
-/// and alignment differences across ROCm releases.
+/// Query the device's real gfx target so JIT-compiled kernels always [see: `GRIM_GPU_TARGET`, `temp_env`, `hipDeviceProp_t`, `gcnArchName`]
 pub fn detect_gpu_arch(device: i32) -> String {
     let mut buf = vec![0u8; 8192];
     unsafe {
@@ -81,7 +56,10 @@ pub fn detect_gpu_arch(device: i32) -> String {
                         end += 1;
                     }
                     let s = std::str::from_utf8(&buf[start..end]).unwrap_or("");
-                    let base: String = s.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+                    let base: String = s
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric())
+                        .collect();
                     if base.starts_with("gfx") {
                         return base;
                     }
@@ -97,19 +75,18 @@ pub fn detect_gpu_arch(device: i32) -> String {
 
 /// Build `--offload-arch=<arch>` options string for AMD hipRTC.
 pub fn gpu_target_flag(arch: &str) -> CString {
-    CString::new(format!("--offload-arch={arch}"))
-        .expect("GRIM_GPU_TARGET contains interior NUL")
+    CString::new(format!("--offload-arch={arch}")).expect("GRIM_GPU_TARGET contains interior NUL")
 }
 
-/// Build compiler options list for AMD hipRTC based on detected hardware target `arch`.
-///
-/// Automatically detects RDNA2 (`gfx103x`), RDNA3 (`gfx11xx`), RDNA4 (`gfx12xx`),
-/// and CDNA (`gfx9xx`) targets and appends `-mwavefrontsize=64` to instruct the
-/// compiler backend to compile in hardware Wave64 execution mode.
+/// Build compiler options list for AMD hipRTC based on detected hardware target `arch`. [see: `gfx103x`, `gfx11xx`, `gfx12xx`, `gfx9xx`]
 pub fn hiprtc_options_for_arch(arch: &str) -> Vec<CString> {
     let mut opts = vec![CString::new("--std=c++14").unwrap()];
-    if arch.starts_with("gfx103") || arch.starts_with("gfx11") || arch.starts_with("gfx12") || arch.starts_with("gfx9") {
-        opts.push(CString::new("-mwavefrontsize=64").unwrap());
+    if arch.starts_with("gfx103")
+        || arch.starts_with("gfx11")
+        || arch.starts_with("gfx12")
+        || arch.starts_with("gfx9")
+    {
+        opts.push(CString::new("-mwavefrontsize64").unwrap());
     }
     opts.push(gpu_target_flag(arch));
     opts
@@ -117,7 +94,10 @@ pub fn hiprtc_options_for_arch(arch: &str) -> Vec<CString> {
 
 /// Build the canonical F32 native dtype used by every compute op in this crate.
 pub fn dtype_f32() -> DType {
-    DType { arith: ArithType::F32, storage: DTypeStorage::Native }
+    DType {
+        arith: ArithType::F32,
+        storage: DTypeStorage::Native,
+    }
 }
 
 /// Helper function to retrieve the size in bytes of a data type.
@@ -160,13 +140,25 @@ mod util_self_tests {
     fn dtype_byte_size_matches_arith() {
         let f32_dt = dtype_f32();
         assert_eq!(dtype_byte_size(&f32_dt), 4);
-        let f16_dt = DType { arith: ArithType::F16, storage: DTypeStorage::Native };
+        let f16_dt = DType {
+            arith: ArithType::F16,
+            storage: DTypeStorage::Native,
+        };
         assert_eq!(dtype_byte_size(&f16_dt), 2);
-        let bf16_dt = DType { arith: ArithType::BF16, storage: DTypeStorage::Native };
+        let bf16_dt = DType {
+            arith: ArithType::BF16,
+            storage: DTypeStorage::Native,
+        };
         assert_eq!(dtype_byte_size(&bf16_dt), 2);
-        let i64_dt = DType { arith: ArithType::I64, storage: DTypeStorage::Native };
+        let i64_dt = DType {
+            arith: ArithType::I64,
+            storage: DTypeStorage::Native,
+        };
         assert_eq!(dtype_byte_size(&i64_dt), 8);
-        let u8_dt = DType { arith: ArithType::U8, storage: DTypeStorage::Native };
+        let u8_dt = DType {
+            arith: ArithType::U8,
+            storage: DTypeStorage::Native,
+        };
         assert_eq!(dtype_byte_size(&u8_dt), 1);
     }
 

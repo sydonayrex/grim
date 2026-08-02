@@ -117,7 +117,11 @@ pub fn kto_loss(
     for i in 0..n_w {
         chosen_logr_sum += policy_chosen_logps[i] - ref_chosen_logps[i];
     }
-    let kl_est = if n_w > 0 { chosen_logr_sum / n_w as f32 } else { 0.0 };
+    let kl_est = if n_w > 0 {
+        chosen_logr_sum / n_w as f32
+    } else {
+        0.0
+    };
 
     let mut total_loss = 0.0f32;
     let mut chosen_losses = Vec::with_capacity(n_w);
@@ -394,7 +398,10 @@ pub fn grpo_loss_autograd(
 ///
 /// Computed on host floats (via `to_vec_f32`) so it can be added to the scalar
 /// CE/DPO/GRPO loss before `backward()` without extending the autograd tape.
-pub fn olora_orthogonality_penalty(a: &grim_tensor::Tensor, b: &grim_tensor::Tensor) -> Result<f32> {
+pub fn olora_orthogonality_penalty(
+    a: &grim_tensor::Tensor,
+    b: &grim_tensor::Tensor,
+) -> Result<f32> {
     let a_dims = a.shape().dims();
     let b_dims = b.shape().dims();
     if a_dims.len() != 2 || b_dims.len() != 2 {
@@ -563,7 +570,10 @@ mod tests {
         use grim_tensor::Shape;
 
         let a = cpu_tensor(vec![1.0, 0.0, 0.0, 1.0], Shape::new(vec![2, 2]));
-        let b = cpu_tensor(vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0], Shape::new(vec![2, 3, 1]));
+        let b = cpu_tensor(
+            vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            Shape::new(vec![2, 3, 1]),
+        );
         assert!(olora_orthogonality_penalty(&a, &b).is_err());
     }
 }

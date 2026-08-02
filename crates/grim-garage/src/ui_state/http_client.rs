@@ -1,13 +1,13 @@
 //! HTTP client — fetches models, datasets, devices, and starts jobs from
-//! the local grim-garage axum API. The CVKG runtime invokes this on
+//! the local grim-garage axum API. The client runtime invokes this on
 //! startup and on refresh; tests use the in-process mock to confirm wire
 //! formats match what the server returns.
 
 use serde::Deserialize;
 
+use crate::backend::BackendProbe;
 use crate::discovery::{DatasetEntry, ModelEntry};
 use crate::jobs::TrainingMode;
-use crate::backend::BackendProbe;
 
 #[derive(Debug, Deserialize)]
 struct ModelsEnvelope {
@@ -41,7 +41,7 @@ struct JobsEnvelope {
     jobs: Vec<JobSummaryDto>,
 }
 
-/// One-stop shop for the CVKG runtime to call against the local backend.
+/// One-stop shop for the client runtime to call against the local backend.
 #[derive(Debug, Clone)]
 pub struct GarageClient {
     base_url: String,

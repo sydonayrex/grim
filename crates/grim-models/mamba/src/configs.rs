@@ -15,9 +15,15 @@ pub struct Rwkv6Config {
 }
 
 impl ModelConfig for Rwkv6Config {
-    fn name(&self) -> &str { "rwkv6" }
-    fn modality(&self) -> ModalityHint { ModalityHint::TextInTextOut }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str {
+        "rwkv6"
+    }
+    fn modality(&self) -> ModalityHint {
+        ModalityHint::TextInTextOut
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Configuration for RWKV7 model architecture.
@@ -31,9 +37,15 @@ pub struct Rwkv7Config {
 }
 
 impl ModelConfig for Rwkv7Config {
-    fn name(&self) -> &str { "rwkv7" }
-    fn modality(&self) -> ModalityHint { ModalityHint::TextInTextOut }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str {
+        "rwkv7"
+    }
+    fn modality(&self) -> ModalityHint {
+        ModalityHint::TextInTextOut
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Configuration for Mamba-2 SSM architecture.
@@ -50,9 +62,15 @@ pub struct Mamba2Config {
 }
 
 impl ModelConfig for Mamba2Config {
-    fn name(&self) -> &str { "mamba2" }
-    fn modality(&self) -> ModalityHint { ModalityHint::TextInTextOut }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str {
+        "mamba2"
+    }
+    fn modality(&self) -> ModalityHint {
+        ModalityHint::TextInTextOut
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Configuration for Jamba hybrid SSM+Attention+MoE architecture.
@@ -72,9 +90,15 @@ pub struct JambaConfig {
 }
 
 impl ModelConfig for JambaConfig {
-    fn name(&self) -> &str { "jamba" }
-    fn modality(&self) -> ModalityHint { ModalityHint::TextInTextOut }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str {
+        "jamba"
+    }
+    fn modality(&self) -> ModalityHint {
+        ModalityHint::TextInTextOut
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Configuration for Nemotron-H hybrid architecture.
@@ -91,9 +115,15 @@ pub struct NemotronHConfig {
 }
 
 impl ModelConfig for NemotronHConfig {
-    fn name(&self) -> &str { "nemotron-h" }
-    fn modality(&self) -> ModalityHint { ModalityHint::TextInTextOut }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str {
+        "nemotron-h"
+    }
+    fn modality(&self) -> ModalityHint {
+        ModalityHint::TextInTextOut
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Configuration for Granite-Hybrid architecture.
@@ -110,7 +140,13 @@ pub struct GraniteHybridConfig {
 }
 
 impl ModelConfig for GraniteHybridConfig {
-    fn name(&self) -> &str { "granite-hybrid" }
-    fn modality(&self) -> ModalityHint { ModalityHint::TextInTextOut }
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn name(&self) -> &str {
+        "granite-hybrid"
+    }
+    fn modality(&self) -> ModalityHint {
+        ModalityHint::TextInTextOut
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }

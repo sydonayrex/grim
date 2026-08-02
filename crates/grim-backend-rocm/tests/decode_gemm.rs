@@ -32,7 +32,9 @@ fn gpu_device() -> Option<RocmDevice> {
     if !std::env::var(GPU_TEST_ENV).is_ok() {
         return None;
     }
-    match std::panic::catch_unwind(|| RocmDevice::new(0)) {
+    match std::panic::catch_unwind(|| {
+        RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm")
+    }) {
         Ok(d) => Some(d),
         Err(_) => None,
     }
@@ -57,7 +59,13 @@ fn host_gemm_f32(a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: u
 /// introducing ~1e-2 relative error for values near 1.0. We use a slightly
 /// looser tolerance for large K (more accumulation steps → more rounding).
 fn tolerance_for(k: usize) -> f32 {
-    if k >= 4096 { 0.5 } else if k >= 512 { 0.1 } else { 1e-2 }
+    if k >= 4096 {
+        0.5
+    } else if k >= 512 {
+        0.1
+    } else {
+        1e-2
+    }
 }
 
 /// Run the decode kernel on the given F16 inputs, return the output as f32.
@@ -105,7 +113,9 @@ fn try_rocblas(
         Err(_) => {
             // rocBLAS F16 may return invalid_value on some consumer hardware.
             // This is a rocBLAS limitation, not a decode-kernel bug.
-            eprintln!("[gate 2.6.4] rocBLAS F16 unavailable on this hardware — using CPU oracle only");
+            eprintln!(
+                "[gate 2.6.4] rocBLAS F16 unavailable on this hardware — using CPU oracle only"
+            );
             Ok(None)
         }
     }
@@ -234,10 +244,10 @@ fn gate_2_6_2b_decode_gemm_aligned_and_irregular_n() -> TestResult {
 
     // (m, k, n) tuples: N_TILE=64, so N=64 is aligned, N=65 exercises OOB.
     let shapes: &[(usize, usize, usize)] = &[
-        (1, 64, 64),   // N exactly one tile
-        (1, 64, 65),   // N = tile+1 — partial last block
-        (8, 64, 64),   // full M_TILE, one N tile
-        (8, 64, 128),  // full M_TILE, two N tiles
+        (1, 64, 64),  // N exactly one tile
+        (1, 64, 65),  // N = tile+1 — partial last block
+        (8, 64, 64),  // full M_TILE, one N tile
+        (8, 64, 128), // full M_TILE, two N tiles
     ];
 
     for &(m, k, n) in shapes {

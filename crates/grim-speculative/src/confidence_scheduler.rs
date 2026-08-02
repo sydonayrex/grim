@@ -120,10 +120,7 @@ impl Default for AdaptationConfig {
 }
 
 impl ConfidenceScheduler {
-    pub fn new(
-        throughput_profile: ThroughputProfile,
-        config: SpeculationConfig,
-    ) -> Self {
+    pub fn new(throughput_profile: ThroughputProfile, config: SpeculationConfig) -> Self {
         Self {
             throughput_profile,
             config,
@@ -229,29 +226,29 @@ impl ConfidenceScheduler {
         let mut len = self.config.min_verify_len.min(max_len);
         let mut cumulative_survival = 1.0f64;
         let mut cumulative_lifetime_ms = 0.0f64;
-        
+
         for i in 0..max_len {
             let conf = draft.confidence.get(i).copied().unwrap_or(0.5) as f64;
             if conf < self.config.confidence_floor as f64 {
                 break;
             }
-            
+
             // Marginal survival: cumulative likelihood that this token is reached
             cumulative_survival *= conf;
-            
+
             // Expected validation utility based on accepted throughput
             let marginal_cost = cost_per_token;
             cumulative_lifetime_ms += marginal_cost;
-            
+
             // If the cumulative cost weighted by the likelihood of reaching this token
             // exceeds our load-adjusted budget (afford_ms), we truncate the verification block here.
             if cumulative_lifetime_ms * cumulative_survival > afford_ms {
                 break;
             }
-            
+
             len = i + 1;
         }
-        
+
         len.max(self.config.min_verify_len).min(max_len)
     }
 }
@@ -295,7 +292,12 @@ mod tests {
         let draft = make_draft(vec![1.0; 5], 5);
         // Even under heavy load, never drop below min_verify_len.
         let len = sched.choose_verify_len(&draft, 0.99, 1024);
-        assert!(len >= 2, "expected at least min_verify_len={}, got {:?}", 2, sched.config.min_verify_len);
+        assert!(
+            len >= 2,
+            "expected at least min_verify_len={}, got {:?}",
+            2,
+            sched.config.min_verify_len
+        );
         assert_eq!(len, 2); // Afford_ms ≈ 0 due to high utilization
     }
 
@@ -362,10 +364,8 @@ mod tests {
 
     #[test]
     fn should_adapt_does_not_fire_during_initial_ramp() {
-        let mut sched = ConfidenceScheduler::new(
-            ThroughputProfile::default(),
-            SpeculationConfig::default(),
-        );
+        let mut sched =
+            ConfidenceScheduler::new(ThroughputProfile::default(), SpeculationConfig::default());
         sched.adaptation_config = AdaptationConfig {
             ema_alpha: 0.15,
             min_accept_rate: 0.5,
@@ -383,10 +383,8 @@ mod tests {
 
     #[test]
     fn should_adapt_fires_when_accept_rate_drifts_below_threshold() {
-        let mut sched = ConfidenceScheduler::new(
-            ThroughputProfile::default(),
-            SpeculationConfig::default(),
-        );
+        let mut sched =
+            ConfidenceScheduler::new(ThroughputProfile::default(), SpeculationConfig::default());
         sched.adaptation_config = AdaptationConfig {
             ema_alpha: 0.5, // aggressive EMA so it converges fast
             min_accept_rate: 0.4,
@@ -406,10 +404,8 @@ mod tests {
 
     #[test]
     fn should_adapt_does_not_fire_when_acceptance_is_healthy() {
-        let mut sched = ConfidenceScheduler::new(
-            ThroughputProfile::default(),
-            SpeculationConfig::default(),
-        );
+        let mut sched =
+            ConfidenceScheduler::new(ThroughputProfile::default(), SpeculationConfig::default());
         sched.adaptation_config = AdaptationConfig {
             ema_alpha: 0.15,
             min_accept_rate: 0.3,
@@ -427,10 +423,8 @@ mod tests {
 
     #[test]
     fn record_acceptance_zero_drafted_is_noop() {
-        let mut sched = ConfidenceScheduler::new(
-            ThroughputProfile::default(),
-            SpeculationConfig::default(),
-        );
+        let mut sched =
+            ConfidenceScheduler::new(ThroughputProfile::default(), SpeculationConfig::default());
         let ema_before = sched.adaptation_state.accept_rate_ema;
         sched.record_acceptance(0, 0); // no draft proposed
         assert_eq!(
@@ -447,15 +441,16 @@ mod tests {
     fn adaptation_ema_is_deterministic() {
         // Gate 4.6.3: same input sequence → same EMA, no wall-clock.
         let inputs = [(3usize, 5usize), (1, 5), (0, 5), (4, 5), (2, 5)];
-        let mut a = ConfidenceScheduler::new(ThroughputProfile::default(), SpeculationConfig::default());
-        let mut b = ConfidenceScheduler::new(ThroughputProfile::default(), SpeculationConfig::default());
+        let mut a =
+            ConfidenceScheduler::new(ThroughputProfile::default(), SpeculationConfig::default());
+        let mut b =
+            ConfidenceScheduler::new(ThroughputProfile::default(), SpeculationConfig::default());
         for (acc, drafted) in inputs {
             a.record_acceptance(acc, drafted);
             b.record_acceptance(acc, drafted);
         }
         assert_eq!(
-            a.adaptation_state.accept_rate_ema,
-            b.adaptation_state.accept_rate_ema,
+            a.adaptation_state.accept_rate_ema, b.adaptation_state.accept_rate_ema,
             "EMA must be identical for identical inputs (Gate 4.6.3)"
         );
         assert_eq!(a.should_adapt_draft(), b.should_adapt_draft());

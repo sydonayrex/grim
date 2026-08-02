@@ -102,7 +102,7 @@ impl MtpDepthProvider for LlamaMtp {
             };
             let end = (offset + vocab_size).min(logits_vec.len()).max(offset + 1);
             let slice = &logits_vec[offset.min(logits_vec.len())..end];
-            
+
             let mut best_idx = 0u32;
             let mut best_val = f32::NEG_INFINITY;
             for (i, &v) in slice.iter().enumerate() {
@@ -139,7 +139,7 @@ mod tests {
         };
         let base = Llama::random(Device::Cpu, base_cfg);
         let mtp = LlamaMtp::new_random(base, 2);
-        
+
         assert_eq!(mtp.depth, 2);
         assert_eq!(mtp.mtp_depth(), 2);
     }

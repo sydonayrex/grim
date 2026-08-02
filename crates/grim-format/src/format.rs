@@ -4,12 +4,16 @@
 //! a JSON metadata layer, a tensor registry, and a dual-stream payload
 //! (normals + outliers). See `grim_v2.md` §1 for the format specification.
 
+use grim_tensor::error::{Error, Result};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
-use grim_tensor::error::{Error, Result};
 
-/// FuckingSorcery magic bytes for `.grim`.
-pub const FUCKING_SORCERY: [u8; 5] = [0x47, 0x52, 0x49, 0x4d, 0x01]; // "GRIM\x01"
+/// Magic bytes for `.grim` format: `b"GRIM\x01"`.
+pub const FUCKING_SORCERY: [u8; 5] = [0x47, 0x52, 0x49, 0x4d, 0x01];
+
+/// Deprecated alias for [`FUCKING_SORCERY`].
+#[deprecated(note = "renamed to FUCKING_SORCERY")]
+pub const GRIM_MAGIC: [u8; 5] = FUCKING_SORCERY;
 
 /// Wave64 coalesced memory segment size in bytes.
 ///
@@ -404,8 +408,8 @@ pub fn read_outliers_with_encoding<R: Read + Seek>(
     reader.seek(SeekFrom::Start(entry.outlier_offset))?;
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
-    let (decoded, _bytes_consumed) = crate::spec::decode_outliers_delta_varint(&buf)
-        .map_err(Error::Backend)?;
+    let (decoded, _bytes_consumed) =
+        crate::spec::decode_outliers_delta_varint(&buf).map_err(Error::Backend)?;
     Ok(decoded
         .into_iter()
         .take(entry.outlier_count as usize)
@@ -423,11 +427,7 @@ pub fn read_outliers_with_encoding<R: Read + Seek>(
 /// `base_bitwidth` bits per weight and aligned to [`WAVE64_SEGMENT_BYTES`].
 /// Outlier positions are excluded (they live in the outliers stream), so
 /// the element count is `total_elements - outlier_count`.
-pub fn normals_packed_size(
-    total_elements: usize,
-    outlier_count: u32,
-    base_bitwidth: u8,
-) -> u64 {
+pub fn normals_packed_size(total_elements: usize, outlier_count: u32, base_bitwidth: u8) -> u64 {
     let normal_elements = total_elements.saturating_sub(outlier_count as usize);
     let bits = normal_elements as u64 * base_bitwidth as u64;
     let bytes = bits.div_ceil(8);
@@ -547,7 +547,9 @@ impl NormalsLayout {
                 .map(|&bpw| align_wave64(row_codes_bytes(self.row_stride, bpw)))
                 .sum()
         } else {
-            let normal_elements = self.total_elements.saturating_sub(self.outlier_count as usize);
+            let normal_elements = self
+                .total_elements
+                .saturating_sub(self.outlier_count as usize);
             let bits = normal_elements as u64 * self.base_bitwidth as u64;
             let bytes = bits.div_ceil(8);
             align_wave64(bytes)
@@ -585,7 +587,8 @@ fn row_codes_bytes(row_stride: u64, bpw: u8) -> u64 {
 
 /// Round `n` up to the next multiple of [`WAVE64_SEGMENT_BYTES`].
 fn align_wave64(n: u64) -> u64 {
-    (n + WAVE64_SEGMENT_BYTES as u64 - 1) / WAVE64_SEGMENT_BYTES as u64 * WAVE64_SEGMENT_BYTES as u64
+    (n + WAVE64_SEGMENT_BYTES as u64 - 1) / WAVE64_SEGMENT_BYTES as u64
+        * WAVE64_SEGMENT_BYTES as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -611,7 +614,11 @@ pub struct BackupLayout {
 impl BackupLayout {
     /// Construct a backup layout. `bpw == 0` means "absent".
     pub fn new(total_elements: usize, bpw: u8, row_count: u64) -> Self {
-        Self { total_elements, bpw, row_count }
+        Self {
+            total_elements,
+            bpw,
+            row_count,
+        }
     }
 
     /// `true` when this backup is present on disk.
@@ -876,10 +883,7 @@ pub fn read_normals_split<R: Read + Seek>(
 ///
 /// The caller is responsible for dequantizing the packed bits according
 /// to `entry.base_bitwidth`. This function returns the bytes verbatim.
-pub fn read_normals<R: Read + Seek>(
-    reader: &mut R,
-    entry: &GrimTensorEntry,
-) -> Result<Vec<u8>> {
+pub fn read_normals<R: Read + Seek>(reader: &mut R, entry: &GrimTensorEntry) -> Result<Vec<u8>> {
     if entry.payload_size == 0 {
         return Ok(Vec::new());
     }
@@ -907,10 +911,8 @@ pub fn read_normals_decompressing<R: Read + Seek>(
     }
     match compression {
         crate::spec::PayloadCompression::Raw => Ok(raw),
-        crate::spec::PayloadCompression::Zstd => {
-            zstd::decode_all(raw.as_slice())
-                .map_err(|e| Error::Backend(format!("zstd decompress failed: {e}")))
-        }
+        crate::spec::PayloadCompression::Zstd => zstd::decode_all(raw.as_slice())
+            .map_err(|e| Error::Backend(format!("zstd decompress failed: {e}"))),
     }
 }
 
@@ -1033,9 +1035,8 @@ impl GrimFile {
         let metadata = if header.metadata_len > 0 {
             let mut meta_buf = vec![0u8; header.metadata_len as usize];
             reader.read_exact(&mut meta_buf)?;
-            let json: serde_json::Value = serde_json::from_slice(&meta_buf).map_err(|e| {
-                Error::Backend(format!("invalid .grim metadata JSON: {e}"))
-            })?;
+            let json: serde_json::Value = serde_json::from_slice(&meta_buf)
+                .map_err(|e| Error::Backend(format!("invalid .grim metadata JSON: {e}")))?;
             crate::gguf::GrimMetadata::from_json(&json)
         } else {
             crate::gguf::GrimMetadata::default()
@@ -1072,10 +1073,7 @@ impl GrimFile {
     /// Payload offsets (`payload_offset`, `outlier_offset`) in `tensors` are
     /// recomputed relative to the start of the payload region and overwritten
     /// in the written entries, so callers can pass zeros.
-    pub fn write<W: Write + Seek>(
-        &self,
-        w: &mut W,
-    ) -> Result<Vec<GrimTensorEntry>> {
+    pub fn write<W: Write + Seek>(&self, w: &mut W) -> Result<Vec<GrimTensorEntry>> {
         let mut metadata = self.metadata.clone();
         metadata.has_kv_registry = Some(true);
         let metadata_json = metadata.to_json();
@@ -1090,7 +1088,9 @@ impl GrimFile {
 
         // Compute payload offsets relative to payload region start.
         let registry_byte_size: u64 = self.tensors.iter().map(registry_entry_size).sum();
-        let payload_region_start = w.stream_position().map_err(|e| Error::Backend(e.to_string()))?
+        let payload_region_start = w
+            .stream_position()
+            .map_err(|e| Error::Backend(e.to_string()))?
             + registry_byte_size;
 
         let mut offset = payload_region_start;
@@ -1181,12 +1181,20 @@ mod tests {
 
     #[test]
     fn outlier_encode_decode_round_trip() {
-        let o = GrimOutlier { index: 12345, value: 3.14 };
+        let o = GrimOutlier {
+            index: 12345,
+            value: 3.14,
+        };
         let encoded = o.encode();
         assert_eq!(encoded.len(), OUTLIER_RECORD_BYTES);
         let decoded = GrimOutlier::decode(&encoded).unwrap();
         assert_eq!(decoded.index, o.index);
-        assert!((decoded.value - o.value).abs() < 1e-2, "f16 round-trip: {} vs {}", decoded.value, o.value);
+        assert!(
+            (decoded.value - o.value).abs() < 1e-2,
+            "f16 round-trip: {} vs {}",
+            decoded.value,
+            o.value
+        );
     }
 
     #[test]
@@ -1306,10 +1314,7 @@ mod tests {
         let row_stride = 4096u64;
         let uniform_2 = NormalsLayout::legacy(total, 0, 2).codes_size();
         let uniform_6 = NormalsLayout::legacy(total, 0, 6).codes_size();
-        let mixed = NormalsLayout::with_mixed_bpw(
-            total, 0, 2, row_stride, vec![2, 6],
-        )
-        .codes_size();
+        let mixed = NormalsLayout::with_mixed_bpw(total, 0, 2, row_stride, vec![2, 6]).codes_size();
         assert!(
             uniform_2 <= mixed && mixed <= uniform_6,
             "mixed {} should be between uniform-2 {} and uniform-6 {}",
@@ -1528,13 +1533,13 @@ mod tests {
             ..Default::default()
         };
         tensor.set_kv_layout(
-            true,   // present
-            true,   // rotated (RotateKV-style)
-            3,      // bits_k
-            4,      // bits_v
-            0,      // eviction_map_offset
-            0,      // eviction_map_size
-            false,  // sink_fp16
+            true,  // present
+            true,  // rotated (RotateKV-style)
+            3,     // bits_k
+            4,     // bits_v
+            0,     // eviction_map_offset
+            0,     // eviction_map_size
+            false, // sink_fp16
             blob.len() as u64,
         );
 
@@ -1558,7 +1563,9 @@ mod tests {
         // The caller (matching the normals-payload pattern) writes the KV
         // blob at the assigned offset.
         let e = &written[0];
-        cursor.seek(SeekFrom::Start(e.kv_compressed_offset)).unwrap();
+        cursor
+            .seek(SeekFrom::Start(e.kv_compressed_offset))
+            .unwrap();
         write_kv_block(&mut cursor, &blob).unwrap();
 
         // Read back.
@@ -1622,8 +1629,8 @@ mod tests {
             buf,
             vec![
                 b'G', b'R', b'I', b'M', 1, // Magic (5 bytes: FUCKING_SORCERY)
-                100, 0, 0, 0, 0, 0, 0, 0,   // metadata_len = 100 (u64 LE)
-                3, 0, 0, 0,                 // num_tensors = 3 (u32 LE)
+                100, 0, 0, 0, 0, 0, 0, 0, // metadata_len = 100 (u64 LE)
+                3, 0, 0, 0, // num_tensors = 3 (u32 LE)
             ]
         );
     }
@@ -1631,12 +1638,7 @@ mod tests {
     /// Verifies `GrimHeader::read` rejects invalid magic bytes.
     #[test]
     fn test_header_read_rejects_bad_magic() {
-        let bad_buf = vec![
-            b'B', b'A', b'D', b'M',
-            1, 0, 0, 0,
-            1, 0, 0, 0,
-            0, 0, 0, 0,
-        ];
+        let bad_buf = vec![b'B', b'A', b'D', b'M', 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
         let mut reader = &bad_buf[..];
         let err = GrimHeader::read(&mut reader);
         assert!(err.is_err(), "Header read must reject invalid magic bytes");
@@ -1646,14 +1648,15 @@ mod tests {
     #[test]
     fn test_header_read_rejects_unsupported_version() {
         let bad_ver_buf = vec![
-            b'G', b'R', b'I', b'M',
-            99, 0, 0, 0, // Unsupported version 99
-            1, 0, 0, 0,
-            0, 0, 0, 0,
+            b'G', b'R', b'I', b'M', 99, 0, 0, 0, // Unsupported version 99
+            1, 0, 0, 0, 0, 0, 0, 0,
         ];
         let mut reader = &bad_ver_buf[..];
         let err = GrimHeader::read(&mut reader);
-        assert!(err.is_err(), "Header read must reject unsupported format version");
+        assert!(
+            err.is_err(),
+            "Header read must reject unsupported format version"
+        );
     }
 
     /// Tests bit-exact F16 conversion in `GrimOutlier::encode` and `decode` across extreme floats.
@@ -1664,7 +1667,7 @@ mod tests {
             (100, -0.0f32),
             (1024, 1.0f32),
             (4096, -1.0f32),
-            (65535, 65504.0f32), // Max finite F16
+            (65535, 65504.0f32),           // Max finite F16
             (100000, 0.00006103515625f32), // Min positive normalized F16 (2^-14)
         ];
 

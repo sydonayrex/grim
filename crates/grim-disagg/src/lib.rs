@@ -1,27 +1,15 @@
-//! Distributed serving and disaggregation layer for Grim.
+//! Distributed serving and disaggregation layer: decouples prefill/decode, manages cross-node KV cache transfers.
 //!
-//! Exposes the `DisaggRouter` trait and concrete implementations to decouple
-//! prefill execution from decode execution and manage cross-node KV cache transfers.
-//!
-//! ## SCYTHE-2 WI-8: ReMP 2D KV-cache migration
-//! The ReMP (Re-Migration Protocol) transfers KV blocks between sessions in the
-//! same VRAM pool without a PCIe round-trip. The outer loop is over the KV
-//! "block rows" (attention heads × seq chunks); the inner loop is over
-//! transformer layers. This 2-D pattern keeps the memory-bus access pattern
-//! coalesced (128-byte cache-line alignment per block) and matches the block-
-//! major KV layout emitted by `kv_to_block_major` (`device/layout.rs:73`).
-
+/// ReMP 2D KV-cache migration (WI-8): coalesced 128-byte block-major transfer within same VRAM pool.
 use grim_core::error::{Error, Result};
 use grim_kvtransport::NetworkKvClient;
 
 // ── ReMP KV migration types (WI-8) ────────────────────────────────────────────
 
-/// Represents a single KV block (one transformer layer, one sequence chunk).
-/// Block layout mirrors `kv_to_block_major` (`device/layout.rs`): all K then all V,
-/// each of size `num_heads × block_size × head_dim × dtype_bytes`.
+/// Single KV block: one layer, one sequence chunk. Mirrors `kv_to_block_major` block-major layout.
 #[derive(Debug, Clone)]
 pub struct KvBlock {
-    /// Flattened f32 data for K and V of one layer segment.
+    /// K and V data for this layer segment (flattened f32).
     pub data: Vec<f32>,
     /// Layer index this block belongs to.
     pub layer_idx: u32,
@@ -29,10 +17,7 @@ pub struct KvBlock {
     pub seq_chunk: u32,
 }
 
-/// A 2D KV migration batch (ReMP inner state).
-///
-/// Outer dim = num_layers, inner dim = num_seq_chunks (block rows).
-/// Calling `migrate()` drains the matrix into the destination session.
+/// 2D ReMP batch: outer = layers, inner = seq chunks. `migrate()` drains to flat buffer.
 #[derive(Debug, Default)]
 pub struct ReMPMigrationBatch {
     pub blocks: Vec<KvBlock>,
@@ -41,7 +26,7 @@ pub struct ReMPMigrationBatch {
 }
 
 impl ReMPMigrationBatch {
-    /// Validate that the batch is non-empty and has the expected 2D shape.
+    /// Validate batch shape: non-empty, 2D dims match block count.
     pub fn validate(&self) -> Result<()> {
         if self.blocks.is_empty() {
             return Err(Error::KvCache("ReMPMigrationBatch: no blocks".into()));
@@ -50,28 +35,29 @@ impl ReMPMigrationBatch {
         if self.blocks.len() != expected {
             return Err(Error::KvCache(format!(
                 "ReMPMigrationBatch: expected {} blocks ({} layers × {} chunks), got {}",
-                expected, self.num_layers, self.num_seq_chunks, self.blocks.len()
+                expected,
+                self.num_layers,
+                self.num_seq_chunks,
+                self.blocks.len()
             )));
         }
         Ok(())
     }
 
-    /// Drain the 2D block matrix into a flat KV buffer (layer-major, then chunk-major).
-    ///
-    /// Returns `(flat_data, num_elements)` suitable for passing to a session's
-    /// `restore_kv` method. The 2D iteration order matches the access pattern
-    /// of `paged_attention` so no re-layout is needed.
+    /// Drain 2D block matrix to flat KV buffer (layer-major, chunk-major). No re-layout needed.
     pub fn migrate(&self) -> Result<Vec<f32>> {
         self.validate()?;
         let total: usize = self.blocks.iter().map(|b| b.data.len()).sum();
         let mut flat = Vec::with_capacity(total);
-        // Outer loop: layers (matches KvBlockPool::block_for_layer access pattern).
+        // Outer loop: layers. Inner loop: seq chunks. Matches paged_attention KV fetch order.
         for layer in 0..self.num_layers {
             // Inner loop: seq chunks (matches paged_attention KV fetch order).
             for chunk in 0..self.num_seq_chunks {
-                if let Some(block) = self.blocks.iter().find(
-                    |b| b.layer_idx == layer && b.seq_chunk == chunk
-                ) {
+                if let Some(block) = self
+                    .blocks
+                    .iter()
+                    .find(|b| b.layer_idx == layer && b.seq_chunk == chunk)
+                {
                     flat.extend_from_slice(&block.data);
                 } else {
                     return Err(Error::KvCache(format!(
@@ -84,7 +70,7 @@ impl ReMPMigrationBatch {
     }
 }
 
-/// The role that a given node or pool plays in the serving cluster (§5.6)
+/// Node role in serving cluster (§5.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolRole {
     Colocated,
@@ -92,18 +78,23 @@ pub enum PoolRole {
     Decode,
 }
 
-/// Carry context containing the source prefill node parameters inside the decode step (§5.6)
+/// Source prefill node params carried inside decode step (§5.6).
 #[derive(Debug, Clone)]
 pub struct PoolAssignment {
     pub source_prefill_pool_addr: String,
     pub request_id: u64,
 }
 
-/// The router interface managing cross-pool dispatch and network transfers.
+/// Router for cross-pool dispatch and network KV transfers.
 pub trait DisaggRouterT: Send + Sync {
     fn dispatch_prefill(&self, request_id: u64, tokens: &[u32]) -> Result<()>;
     fn transfer_kv_cache(&self, request_id: u64, num_blocks: usize) -> Result<()>;
-    fn dispatch_decode(&self, request_id: u64, last_token: u32, assignment: PoolAssignment) -> Result<()>;
+    fn dispatch_decode(
+        &self,
+        request_id: u64,
+        last_token: u32,
+        assignment: PoolAssignment,
+    ) -> Result<()>;
 }
 
 pub struct DisaggRouter {
@@ -121,46 +112,57 @@ impl DisaggRouter {
             decode_node_addr: decode_node_addr.to_string(),
             pool_role,
             kv_client: NetworkKvClient::new(prefill_node_addr.to_string()),
-            use_rdma: false, // Default to TCP transport, fallback to RDMA if flag enabled
+            // Use TCP by default; enable RDMA fallback with enable_rdma().
+            use_rdma: false,
         }
     }
 
-    /// Enable RDMA fallback network layer
+    /// Enable or disable RDMA network transport.
     pub fn enable_rdma(&mut self, enabled: bool) {
         self.use_rdma = enabled;
     }
 }
 
 impl DisaggRouterT for DisaggRouter {
-    /// Dispatches a prefill task to a dedicated prefill execution engine.
-    ///
-    /// NOTE: The remote dispatch path is not yet wired to a real execution
-    /// engine — the network transport is a stub (see `NetworkKvClient`).
-    /// Returning `Ok(())` here previously masked the missing implementation;
-    /// callers now receive an explicit `Unimplemented` error so the gap can
-    /// never silently succeed in production.
+    /// Dispatch a prefill task to a dedicated prefill engine. Returns Unimplemented for stub transport.
     fn dispatch_prefill(&self, request_id: u64, tokens: &[u32]) -> Result<()> {
         let k_buf = tokens.iter().map(|&t| t as f32).collect::<Vec<_>>();
         let v_buf = tokens.iter().map(|&t| (t + 1) as f32).collect::<Vec<_>>();
-        self.kv_client.send_block_remote(request_id as usize, &k_buf, &v_buf, &self.prefill_node_addr)
+        self.kv_client.send_block_remote(
+            request_id as usize,
+            &k_buf,
+            &v_buf,
+            &self.prefill_node_addr,
+        )
     }
 
-    /// Performs the KV-transfer step from the prefill engine to the decode engine
-    /// utilizing the remote network-transport KV client.
+    /// Transfer KV blocks from prefill to decode engine via network transport.
     fn transfer_kv_cache(&self, request_id: u64, num_blocks: usize) -> Result<()> {
         if num_blocks == 0 {
-            return Err(Error::KvCache("Handoff protocol error: block count cannot be zero".into()));
+            return Err(Error::KvCache(
+                "Handoff protocol error: block count cannot be zero".into(),
+            ));
         }
         let dummy_k = vec![1.0f32; 64];
         let dummy_v = vec![2.0f32; 64];
         for b in 0..num_blocks {
-            self.kv_client.send_block_remote(request_id as usize + b, &dummy_k, &dummy_v, &self.decode_node_addr)?;
+            self.kv_client.send_block_remote(
+                request_id as usize + b,
+                &dummy_k,
+                &dummy_v,
+                &self.decode_node_addr,
+            )?;
         }
         Ok(())
     }
 
-    /// Dispatches a step-decode task to a dedicated decode execution engine.
-    fn dispatch_decode(&self, request_id: u64, last_token: u32, assignment: PoolAssignment) -> Result<()> {
+    /// Dispatch a step-decode task to a dedicated decode engine.
+    fn dispatch_decode(
+        &self,
+        request_id: u64,
+        last_token: u32,
+        assignment: PoolAssignment,
+    ) -> Result<()> {
         let client = NetworkKvClient::new(assignment.source_prefill_pool_addr.clone());
         let k_buf = vec![last_token as f32];
         let v_buf = vec![(last_token + 1) as f32];
@@ -169,30 +171,13 @@ impl DisaggRouterT for DisaggRouter {
 }
 
 impl DisaggRouter {
-    /// SCYTHE-2 WI-8: ReMP 2D KV-cache migration for colocated (same-node) transfers.
-    ///
-    /// Transfers KV blocks within the same VRAM pool without a network round-trip.
-    /// The 2D iteration order (outer = layers, inner = seq chunks) matches the
-    /// block-major KV layout from `kv_to_block_major` (`device/layout.rs:73`)
-    /// so no re-layout is needed. Returns the flat migrated buffer on success.
-    ///
-    /// ## Contract
-    /// - `batch.num_layers × batch.num_seq_chunks` must equal `batch.blocks.len()`.
-    /// - All blocks must be present (no sparse batch).
-    /// - This method does NOT route over the network; it is only valid when
-    ///   `pool_role == PoolRole::Colocated` or when the prefill and decode engines
-    ///   share address space.
-    ///
-    /// ## Staleness safety (scythe2.md §3.5 mode C)
-    /// If the session ID changes between prefill and decode (e.g., a preemption),
-    /// the migrated buffer is still valid — the caller is responsible for binding
-    /// it to the new session ID. The migration itself is idempotent (pure copy).
+    /// ReMP 2D KV-cache migration (WI-8): colocated same-VRAM-pool transfer. No network round-trip.
     pub fn transfer_kv_colocated(
         &self,
         request_id: u64,
         batch: &ReMPMigrationBatch,
     ) -> Result<Vec<f32>> {
-        // Protocol validation: ReMP requires colocated role.
+        // ReMP requires colocated pool role.
         if self.pool_role != PoolRole::Colocated {
             return Err(Error::KvCache(format!(
                 "transfer_kv_colocated: only valid for Colocated pool role, got {:?}",
@@ -200,18 +185,21 @@ impl DisaggRouter {
             )));
         }
         // Validate and drain the 2D batch.
-        let flat = batch.migrate().map_err(|e| Error::KvCache(format!(
-            "transfer_kv_colocated(request_id={request_id}): migration failed: {e}"
-        )))?;
+        let flat = batch.migrate().map_err(|e| {
+            Error::KvCache(format!(
+                "transfer_kv_colocated(request_id={request_id}): migration failed: {e}"
+            ))
+        })?;
         eprintln!(
             "[grim-disagg] ReMP colocated transfer: request_id={request_id}, \
              layers={}, chunks={}, total_elements={}",
-            batch.num_layers, batch.num_seq_chunks, flat.len()
+            batch.num_layers,
+            batch.num_seq_chunks,
+            flat.len()
         );
         Ok(flat)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -221,18 +209,24 @@ mod tests {
     fn test_disaggregated_kv_routing() {
         let router = DisaggRouter::new("10.0.0.1:8000", "10.0.0.2:8000", PoolRole::Prefill);
 
-        // Verify router fields are correctly stored
+        // Verify router fields stored correctly.
         assert_eq!(router.prefill_node_addr, "10.0.0.1:8000");
         assert_eq!(router.decode_node_addr, "10.0.0.2:8000");
         assert_eq!(router.pool_role, PoolRole::Prefill);
 
         // Dispatch prefill — network transport attempts connection and fails on dummy IP.
         let prefill_res = router.dispatch_prefill(42, &[101, 102, 103]);
-        assert!(prefill_res.is_err(), "dispatch_prefill should fail when target endpoint is unreachable");
+        assert!(
+            prefill_res.is_err(),
+            "dispatch_prefill should fail when target endpoint is unreachable"
+        );
 
         // Transfer 4 KV blocks — network transport attempts connection.
         let transfer_res = router.transfer_kv_cache(42, 4);
-        assert!(transfer_res.is_err(), "transfer_kv_cache should fail when target endpoint is unreachable");
+        assert!(
+            transfer_res.is_err(),
+            "transfer_kv_cache should fail when target endpoint is unreachable"
+        );
 
         // Dispatch decode carrying PoolAssignment context
         let assignment = PoolAssignment {
@@ -242,7 +236,10 @@ mod tests {
         assert_eq!(assignment.request_id, 42);
         assert_eq!(assignment.source_prefill_pool_addr, "10.0.0.1:8000");
         let decode_res = router.dispatch_decode(42, 104, assignment);
-        assert!(decode_res.is_err(), "dispatch_decode should fail when target endpoint is unreachable");
+        assert!(
+            decode_res.is_err(),
+            "dispatch_decode should fail when target endpoint is unreachable"
+        );
     }
 
     #[test]
@@ -331,7 +328,11 @@ mod tests {
     #[test]
     fn test_kv_migration_rejects_non_colocated() {
         let router = DisaggRouter::new("10.0.0.1:8000", "10.0.0.2:8000", PoolRole::Prefill);
-        let batch = ReMPMigrationBatch { blocks: vec![], num_layers: 0, num_seq_chunks: 0 };
+        let batch = ReMPMigrationBatch {
+            blocks: vec![],
+            num_layers: 0,
+            num_seq_chunks: 0,
+        };
         let result = router.transfer_kv_colocated(99, &batch);
         assert!(result.is_err());
     }
@@ -349,7 +350,11 @@ mod tests {
         for layer in 0..2u32 {
             for chunk in 0..2u32 {
                 if !(layer == 1 && chunk == 1) {
-                    batch.blocks.push(KvBlock { data: vec![1.0; 4], layer_idx: layer, seq_chunk: chunk });
+                    batch.blocks.push(KvBlock {
+                        data: vec![1.0; 4],
+                        layer_idx: layer,
+                        seq_chunk: chunk,
+                    });
                 }
             }
         }
@@ -357,4 +362,3 @@ mod tests {
         assert!(result.is_err(), "should fail with missing block");
     }
 }
-

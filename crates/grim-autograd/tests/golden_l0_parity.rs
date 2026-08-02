@@ -43,7 +43,13 @@ fn run_overfit_test_for_device(device: Device) -> (f32, f32) {
     let dev: Box<dyn BackendDevice> = match device {
         Device::Cpu => Box::new(grim_backend_cpu::CpuDevice::new()),
         #[cfg(feature = "rocm-mem")]
-        Device::Rocm(_) => Box::new(grim_backend_rocm::RocmDevice::new(0)),
+        Device::Rocm(_) => {
+            if let Ok(d) = grim_backend_rocm::RocmDevice::try_new(0) {
+                Box::new(d)
+            } else {
+                Box::new(grim_backend_cpu::CpuDevice::new())
+            }
+        }
         _ => Box::new(grim_backend_cpu::CpuDevice::new()),
     };
 

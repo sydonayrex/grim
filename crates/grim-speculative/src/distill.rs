@@ -128,7 +128,11 @@ pub fn refresh_draft(
 
 /// Runs QAT-aware distillation of a target model to produce a draft bundle
 /// (DraftBackbone + MarkovHead + ConfidenceHead).
-pub fn train_speculative_draft(target_path: &str, output_path: &str, dataset_path: &str) -> Result<()> {
+pub fn train_speculative_draft(
+    target_path: &str,
+    output_path: &str,
+    dataset_path: &str,
+) -> Result<()> {
     println!("============================================================");
     println!("Grim Speculative Distillation (DSpark Bundle Training)");
     println!("============================================================");
@@ -141,8 +145,10 @@ pub fn train_speculative_draft(target_path: &str, output_path: &str, dataset_pat
 
     use crate::draft_backbone::DraftBackbone;
 
-    let draft_backbone = crate::tiny_draft_backbone::TinyDraftBackbone::new(vocab_size, hidden, block_len, 42);
-    let _markov_head = crate::uniform_markov_head::UniformMarkovHead::new(vocab_size, block_len, 42);
+    let draft_backbone =
+        crate::tiny_draft_backbone::TinyDraftBackbone::new(vocab_size, hidden, block_len, 42);
+    let _markov_head =
+        crate::uniform_markov_head::UniformMarkovHead::new(vocab_size, block_len, 42);
     let _conf_head = crate::entropy_confidence_head::EntropyConfidenceHead;
 
     let epochs = 3;
@@ -192,9 +198,17 @@ pub fn train_speculative_draft(target_path: &str, output_path: &str, dataset_pat
     println!("Step 6: Writing finalized bundle to: {}", output_path);
 
     let metadata_path = format!("{}.json", output_path);
-    std::fs::write(&metadata_path, r#"{"strategy": "DSpark", "block_len": 5, "min_verify_len": 1}"#)
-        .map_err(|e| grim_core::Error::Session(format!("Failed to write draft companion file: {}", e)))?;
-    println!("  -> Wrote companion draft configuration metadata to: {}", metadata_path);
+    std::fs::write(
+        &metadata_path,
+        r#"{"strategy": "DSpark", "block_len": 5, "min_verify_len": 1}"#,
+    )
+    .map_err(|e| {
+        grim_core::Error::Session(format!("Failed to write draft companion file: {}", e))
+    })?;
+    println!(
+        "  -> Wrote companion draft configuration metadata to: {}",
+        metadata_path
+    );
 
     println!("Distillation completed successfully.");
     Ok(())

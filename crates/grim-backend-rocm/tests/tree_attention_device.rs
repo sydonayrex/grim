@@ -86,7 +86,9 @@ fn tree_attention_output_shape_spec_is_rank_4() {
     // dtype for the spec kernels; F16/BF16 are the follow-up
     // Phase-2 work).
     let _dtype: DType = dtype_f32_from_phantom();
-    fn dtype_f32_from_phantom() -> DType { DType::F32 }
+    fn dtype_f32_from_phantom() -> DType {
+        DType::F32
+    }
     let _ = _dtype;
 }
 
@@ -103,8 +105,7 @@ fn tree_attention_delegates_to_launcher() {
     static SRC: &str = include_str!("../src/device/roc_device.rs");
     // Must call into the spec-laundered launcher (not a CPU fallback).
     assert!(
-        SRC.contains("crate::launch_tree_attention")
-            || SRC.contains("launch_tree_attention("),
+        SRC.contains("crate::launch_tree_attention") || SRC.contains("launch_tree_attention("),
         "RocmDevice::tree_attention must delegate to \
          kernels::qkv_attention::launch_tree_attention (GPU path); \
          CPU deviation is forbidden per spec Phase-2 speculative-decoding \

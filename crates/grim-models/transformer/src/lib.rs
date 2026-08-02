@@ -1,28 +1,25 @@
-//! `grim-models-transformer` — Llama / Mistral / Qwen-style dense
-//! transformer CausalLm implementation. Phase 1 deliverable: a real
-//! (small) model that loads from a TensorProvider and runs forward
-//! on the CPU backend.
+//! Dense CausalLm transformer implementations (Llama, Mistral, Qwen, DeepSeek, Gemma, T5, MTP).
 
 pub mod block;
 pub mod configs;
+pub mod deepseek;
+pub mod gemma;
+pub mod gpt2;
+pub mod lfm2;
 pub mod lora;
 pub mod model;
 pub mod native_mtp;
-pub mod lfm2;
-pub mod gpt2;
-pub mod gemma;
-pub mod deepseek;
 pub mod t5;
 
 pub use block::{LlamaBlock, LlamaConfigRefs};
 pub use configs::{BloomConfig, FalconConfig, MoeConfig, PhiConfig, QwenConfig};
+pub use deepseek::{DeepSeek, DeepSeekConfig};
+pub use gemma::{Gemma, GemmaConfig};
+pub use gpt2::{Gpt2, Gpt2Config};
+pub use lfm2::{Lfm2, Lfm2Config, Lfm2LayerCache};
 pub use lora::apply_adapters_to_logits;
 pub use model::{Llama, LlamaConfig};
 pub use native_mtp::{LlamaMtp, MtpDepthProvider};
-pub use lfm2::{Lfm2, Lfm2Config, Lfm2LayerCache};
-pub use gpt2::{Gpt2, Gpt2Config};
-pub use gemma::{Gemma, GemmaConfig};
-pub use deepseek::{DeepSeek, DeepSeekConfig};
 pub use t5::{T5, T5Config};
 
 #[cfg(test)]
@@ -74,7 +71,8 @@ mod tests {
             max_seq_len: 32,
         };
         let model = Llama::random(Device::Cpu, cfg);
-        let tok = grim_backend_cpu::cpu_tensor(vec![1.0f32, 2.0f32], grim_tensor::Shape::new(vec![2]));
+        let tok =
+            grim_backend_cpu::cpu_tensor(vec![1.0f32, 2.0f32], grim_tensor::Shape::new(vec![2]));
         let mut sess_a = grim_core::session::Inner::new(model.device.clone());
         let mut sess_b = grim_core::session::Inner::new(model.device.clone());
         let base = grim_core::CausalLm::forward(&model, &mut sess_a, &tok, &tok, &[]).unwrap();
@@ -101,17 +99,24 @@ mod tests {
         let adapter = AdapterHandle {
             id: 1,
             a: grim_backend_cpu::cpu_tensor(
-                (0..r * hidden).map(|i| ((i as f32) - (r * hidden) as f32 / 2.0) * 0.01).collect(),
+                (0..r * hidden)
+                    .map(|i| ((i as f32) - (r * hidden) as f32 / 2.0) * 0.01)
+                    .collect(),
                 grim_tensor::Shape::new(vec![r, hidden]),
             ),
             b: grim_backend_cpu::cpu_tensor(
-                (0..32 * r).map(|i| ((i as f32) - (32 * r) as f32 / 2.0) * 0.01).collect(),
+                (0..32 * r)
+                    .map(|i| ((i as f32) - (32 * r) as f32 / 2.0) * 0.01)
+                    .collect(),
                 grim_tensor::Shape::new(vec![32, r]),
             ),
             alpha: 1.0,
         };
         let new_logits = apply_adapters_to_logits(&logits, &[adapter], hidden).unwrap();
         let v = new_logits.to_vec_f32().unwrap();
-        assert!(v.iter().any(|x| *x != 0.0), "adapters must perturb the zero baseline");
+        assert!(
+            v.iter().any(|x| *x != 0.0),
+            "adapters must perturb the zero baseline"
+        );
     }
 }

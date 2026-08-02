@@ -7,7 +7,10 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("tensor shape mismatch: expected {expected:?}, got {got:?}")]
-    ShapeMismatch { expected: Vec<usize>, got: Vec<usize> },
+    ShapeMismatch {
+        expected: Vec<usize>,
+        got: Vec<usize>,
+    },
 
     #[error("dtype mismatch: {0}")]
     DTypeMismatch(String),
