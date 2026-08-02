@@ -6,7 +6,8 @@ use std::sync::Arc;
 use grim_tensor::error::{Error, Result};
 
 use crate::{
-    HipErrorT, HipMemcpyKind, HiprtcProgram, hipFree, hipMalloc, hipMemcpy, hipMemcpyAsync,
+    HipErrorT, HipMemcpyKind, HiprtcProgram, hipFree, hipMalloc, hipMallocManaged, hipMemcpy,
+    hipMemcpyAsync,
     hipStreamCreate, hipStreamDestroy, hipStreamSynchronize, hipSuccess, hiprtcCompileProgram,
     hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode, hiprtcGetCodeSize,
     hiprtcGetProgramLog, hiprtcGetProgramLogSize,
@@ -122,6 +123,12 @@ pub fn upload_device_buffer<T: Copy>(data: &[T]) -> Result<*mut c_void> {
             crate::hipDeviceSynchronize();
         }
         res = unsafe { hipMalloc(&mut ptr, bytes) };
+    }
+    if res != hipSuccess {
+        // Scratch uploads are transient activation/auxiliary buffers. If
+        // ordinary VRAM is exhausted, managed memory keeps the operation
+        // viable and lets HIP migrate the pages used by the kernel.
+        res = unsafe { hipMallocManaged(&mut ptr, bytes, 1) };
     }
     if res != hipSuccess {
         return Err(Error::Backend(format!(

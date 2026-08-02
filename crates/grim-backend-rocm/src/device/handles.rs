@@ -104,6 +104,7 @@ pub type HiprtcProgram = *mut c_void;
 #[link(name = "hiprtc", kind = "dylib")]
 unsafe extern "C" {
     pub fn hipMalloc(devPtr: *mut *mut c_void, size: usize) -> HipErrorT;
+    pub fn hipMallocManaged(devPtr: *mut *mut c_void, size: usize, flags: u32) -> HipErrorT;
     pub fn hipFree(device: *mut c_void) -> HipErrorT;
     pub fn hipHostMalloc(devPtr: *mut *mut c_void, size: usize, flags: u32) -> HipErrorT;
     pub fn hipHostFree(ptr: *mut c_void) -> HipErrorT;
@@ -138,6 +139,12 @@ unsafe extern "C" {
         src: *const c_void,
         count: usize,
         kind: HipMemcpyKind,
+        stream: *mut c_void,
+    ) -> HipErrorT;
+    pub fn hipMemPrefetchAsync(
+        devPtr: *const c_void,
+        count: usize,
+        dstDevice: i32,
         stream: *mut c_void,
     ) -> HipErrorT;
     pub fn hipGraphCreate(graph: *mut *mut c_void, flags: u32) -> HipErrorT;

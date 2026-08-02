@@ -26,6 +26,26 @@ pub struct GradientCheckpointBuffer {
     checkpoints: HashMap<usize, LayerActivationCheckpoint>,
 }
 
+fn prefetch_block_weights(block: &LlamaBlock) -> Result<()> {
+    for tensor in [
+        &block.attn_norm.weight,
+        &block.wq.weight,
+        &block.wk.weight,
+        &block.wv.weight,
+        &block.wo.weight,
+        &block.ffn_norm.weight,
+        &block.w_gate.weight,
+        &block.w_up.weight,
+        &block.w_down.weight,
+    ] {
+        tensor
+            .storage()
+            .prefetch_to_device()
+            .map_err(|e| Error::Tensor(e))?;
+    }
+    Ok(())
+}
+
 impl GradientCheckpointBuffer {
     /// Create a new empty checkpoint buffer.
     pub fn new() -> Self {
@@ -127,6 +147,7 @@ impl StreamingBlockForward {
         let ws = WeightSource::root(provider, x.device().clone());
         let block_ws = ws.pp("layers").pp(&layer_idx.to_string());
         let block = LlamaBlock::load(&block_ws, cfg)?;
+        prefetch_block_weights(&block)?;
         block.forward(x, positions.unwrap_or(&[]))
     }
 
@@ -150,6 +171,7 @@ impl StreamingBlockForward {
         let ws = WeightSource::root(provider, input_x.device().clone());
         let block_ws = ws.pp("layers").pp(&layer_idx.to_string());
         let block = LlamaBlock::load(&block_ws, cfg)?;
+        prefetch_block_weights(&block)?;
         block.forward(input_x, positions.unwrap_or(&[]))
     }
 
@@ -180,6 +202,7 @@ impl StreamingBlockForward {
         let ws = WeightSource::root(provider, x.device().clone());
         let block_ws = ws.pp("layers").pp(&layer_idx.to_string());
         let block = LlamaBlock::load(&block_ws, cfg)?;
+        prefetch_block_weights(&block)?;
 
         // Pre-attention norm & Q/K/V projections
         let x_norm = block.attn_norm.forward(x)?;

@@ -10,7 +10,7 @@ use grim_format::gguf::{GGUF_MAGIC, GGUF_VERSION, GgufFile, GgufTensorInfo, Gguf
 use grim_garage::discovery::{
     ModelEntry, discover_convertible_models, discover_datasets, discover_models,
 };
-use grim_garage::jobs::{JobId, JobRegistry, JobStatus, TrainingJob};
+use grim_garage::jobs::{JobId, JobRegistry, JobStatus, RankMetric, TrainingJob};
 use grim_garage::rocm::{RocmDeviceInfo, probe_rocm_devices};
 use tempfile::tempdir;
 use tower::ServiceExt;
@@ -824,6 +824,34 @@ async fn job_registry_snapshot_is_consistent_under_concurrent_eviction() {
         seen.insert(id.0.clone());
     }
     assert_eq!(seen.len(), 16, "all snapshot ids must be unique");
+}
+
+#[tokio::test]
+async fn rank_metrics_are_retained_in_job_snapshots() {
+    let reg = JobRegistry::new();
+    let id = reg.create(TrainingJob::default()).await.expect("create");
+    reg.append_rank_metrics(
+        &id,
+        [RankMetric {
+            step: 7,
+            rank: 1,
+            device_ordinal: 3,
+            loss: 0.25,
+            weight_share: 0.4,
+            adapter_checksum: 0xfeed,
+            step_time_ms: 12.5,
+        }],
+    )
+    .await
+    .expect("append rank metric");
+    let snapshot = reg.snapshot().await;
+    assert_eq!(snapshot[0].2.rank_metrics.len(), 1);
+    let metric = &snapshot[0].2.rank_metrics[0];
+    assert_eq!(metric.step, 7);
+    assert_eq!(metric.rank, 1);
+    assert_eq!(metric.device_ordinal, 3);
+    assert_eq!(metric.adapter_checksum, 0xfeed);
+    assert_eq!(metric.step_time_ms, 12.5);
 }
 
 #[test]

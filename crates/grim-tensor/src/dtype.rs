@@ -286,6 +286,15 @@ pub enum QuantProvenance {
         outlier_count: usize,
         outlier_indices_offset: usize,
         outlier_values_offset: usize,
+        /// Host-decoded outlier indices/values, when the provider has already
+        /// materialized them. Empty vectors mean the offsets must be decoded
+        /// from the packed payload by the backend loader.
+        outlier_indices: Vec<u32>,
+        outlier_values_bits: Vec<u32>,
+        primary_scale_offset: usize,
+        primary_scale_size: usize,
+        primary_row_scale_dtype: u8,
+        primary_scale_bytes: Vec<u8>,
         backup1_bpw: u8,
         backup1_codes_offset: usize,
         backup1_scale_offset: usize,

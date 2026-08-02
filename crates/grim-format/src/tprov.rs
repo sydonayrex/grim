@@ -11,7 +11,7 @@ use grim_tensor::dtype::{DType, KQuantScheme, QuantProvenance, Storage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
 
-use crate::format::{GrimFile, GrimTensorEntry, read_normals, read_outliers};
+use crate::format::{GrimFile, GrimTensorEntry, read_normals, read_outliers, read_outliers_with_encoding};
 use crate::gguf::{
     GgufDType, GgufFile, GgufTensorInfo, GrimFusionOp, GrimMetadata, GrimQuantOverride,
     GrimTrainQuantMode, read_gguf, read_tensor_bytes,
@@ -405,6 +405,48 @@ impl TensorProvider for GrimProvider {
             .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in .grim file")))?;
         let mut reader = self.reader.lock().unwrap();
         let bytes = read_normals(&mut *reader, entry)?;
+
+        if let Some(ext) = self.ext_for(name) {
+            let residual = ext.scale_size != 0
+                || ext.backup1.bpw != 0
+                || ext.backup2.bpw != 0
+                || entry.outlier_count != 0;
+            if residual {
+                let outliers = if entry.outlier_count != 0 {
+                    read_outliers_with_encoding(&mut *reader, entry, ext.outlier_index_encoding)?
+                } else { Vec::new() };
+                let mut primary_scale_bytes = Vec::new();
+                if ext.scale_size != 0 {
+                    let start = ext.scale_offset as usize;
+                    let end = start.saturating_add(ext.scale_size as usize);
+                    if end > bytes.len() { return Err(Error::Backend(format!("primary scale region for '{name}' exceeds payload"))); }
+                    primary_scale_bytes.extend_from_slice(&bytes[start..end]);
+                }
+                let provenance = QuantProvenance::WithResiduals {
+                    outlier_count: outliers.len(),
+                    outlier_indices_offset: entry.outlier_offset as usize,
+                    outlier_values_offset: entry.outlier_offset as usize,
+                    outlier_indices: outliers.iter().map(|o| o.index).collect(),
+                    outlier_values_bits: outliers.iter().map(|o| o.value.to_bits()).collect(),
+                    primary_scale_offset: ext.scale_offset as usize,
+                    primary_scale_size: ext.scale_size as usize,
+                    primary_row_scale_dtype: ext.row_scale_dtype as u8,
+                    primary_scale_bytes,
+                    backup1_bpw: ext.backup1.bpw,
+                    backup1_codes_offset: ext.backup1.codes_offset as usize,
+                    backup1_scale_offset: ext.backup1.scale_offset as usize,
+                    backup2_bpw: ext.backup2.bpw,
+                    backup2_codes_offset: ext.backup2.codes_offset as usize,
+                    backup2_scale_offset: ext.backup2.scale_offset as usize,
+                };
+                return Ok(RawTensor {
+                    bytes,
+                    shape: entry.shape.clone(),
+                    dtype: DType { arith: grim_tensor::dtype::ArithType::U8, storage: Storage::ResidualPacked(grim_tensor::dtype::ResidualPackedConfig { bpw: ext.default_bpw.max(entry.base_bitwidth) }) },
+                    provenance,
+                });
+            }
+        }
 
         // P2-WI-1: if the per-tensor extension declares Fp8 block-scale mode
         // (row_scale_dtype = Fp8, block_size = 16), dequantize on the fly to F32

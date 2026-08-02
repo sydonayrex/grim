@@ -2088,6 +2088,7 @@ dependencies = [
 name = "grim-backend-cuda"
 version = "0.1.0"
 dependencies = [
+ "grim-quant",
  "grim-tensor",
  "seahash",
  "thiserror 1.0.69",

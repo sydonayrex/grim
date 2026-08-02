@@ -1545,6 +1545,53 @@ impl BackendDevice for VulkanDevice {
         ))
     }
 
+    fn silu_mul_backward(
+        &self,
+        e: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        dw: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let e_s = e
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan silu_mul_backward e is not VulkanStorage".into()))?;
+        let g_s = g
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan silu_mul_backward g is not VulkanStorage".into()))?;
+        let dw_s = dw
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan silu_mul_backward dw is not VulkanStorage".into()))?;
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let df = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let de = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let buffers = [e_s.buffer, g_s.buffer, dw_s.buffer, df.buffer, de.buffer];
+        let push = push_params(out_shape.elem_count() as u32, 0, 0, 0, 0, 0.0);
+        run_compute_shader(
+            ctx,
+            spirv_for(VulkanKernel::SiluMulBackward),
+            &buffers,
+            ((out_shape.elem_count() + 255) / 256) as u32,
+            1,
+            1,
+            Some(push),
+        )?;
+        Ok((
+            Box::new(df),
+            Box::new(de),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
+    }
+
     fn rms_norm(
         &self,
         x: &dyn BackendStorage,
@@ -1780,6 +1827,240 @@ impl BackendDevice for VulkanDevice {
             out_max,
             out_sum,
         )
+    }
+
+    fn qkv_attention_paged(
+        &self,
+        q: &dyn BackendStorage,
+        block_tables: &dyn BackendStorage,
+        k_pages: &dyn BackendStorage,
+        v_pages: &dyn BackendStorage,
+        num_kv_heads: usize,
+        _max_blocks: usize,
+        page_size: usize,
+        kv_seq_len: usize,
+        _cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let out_dims = out_shape.dims();
+        if out_dims.len() != 3 {
+            return Err(Error::Shape(
+                "qkv_attention_paged expects 3-D output shape [batch, num_heads, head_dim]"
+                    .into(),
+            ));
+        }
+        let num_heads = out_dims[1];
+        let head_dim = out_dims[2];
+        if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+            return Err(Error::Shape("qkv_attention_paged requires num_heads divisible by num_kv_heads".into()));
+        }
+        let q_s = q
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("qkv_attention_paged q is not VulkanStorage".into()))?;
+        let table_s = block_tables.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("qkv_attention_paged block_tables is not VulkanStorage".into())
+        })?;
+        let k_s = k_pages
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("qkv_attention_paged k_pages is not VulkanStorage".into()))?;
+        let v_s = v_pages
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("qkv_attention_paged v_pages is not VulkanStorage".into()))?;
+
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage =
+            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let buffers = [
+            q_s.buffer,
+            k_s.buffer,
+            v_s.buffer,
+            table_s.buffer,
+            out_storage.buffer,
+        ];
+        let push = push_params(
+            page_size as u32,
+            0,
+            kv_seq_len as u32,
+            head_dim as u32,
+            num_heads as u32,
+            num_kv_heads as f32,
+        );
+        let grid_x = ((head_dim + 31) / 32) as u32;
+        run_compute_shader(
+            ctx,
+            spirv_for(VulkanKernel::QkvAttentionPaged),
+            &buffers,
+            grid_x,
+            num_heads as u32,
+            1,
+            Some(push),
+        )?;
+
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
+    }
+
+    fn tree_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        tree_parents: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let dims = out_shape.dims();
+        if dims.len() != 4 {
+            return Err(Error::Shape(
+                "tree_attention expects [batch, 1+gamma, num_heads, head_dim]".into(),
+            ));
+        }
+        let (batch, nodes, num_heads, head_dim) = (dims[0], dims[1], dims[2], dims[3]);
+        if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+            return Err(Error::Shape("tree_attention requires num_heads divisible by num_kv_heads".into()));
+        }
+        if head_dim > 256 || nodes == 0 || tree_parents.shape().elem_count() < nodes {
+            return Err(Error::Shape(
+                "tree_attention requires 1+gamma parent entries and head_dim <= 256".into(),
+            ));
+        }
+        let q_s = q
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("tree_attention q is not VulkanStorage".into()))?;
+        let k_s = k
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("tree_attention k is not VulkanStorage".into()))?;
+        let v_s = v
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("tree_attention v is not VulkanStorage".into()))?;
+        let parents_s = tree_parents.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("tree_attention tree_parents is not VulkanStorage".into())
+        })?;
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage =
+            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let buffers = [
+            q_s.buffer,
+            k_s.buffer,
+            v_s.buffer,
+            parents_s.buffer,
+            out_storage.buffer,
+        ];
+        let push = push_params(
+            batch as u32,
+            num_heads as u32,
+            kv_seq_len as u32,
+            head_dim as u32,
+            (nodes - 1) as u32,
+            ((num_kv_heads as u32) << 16 | (cache_offset & 0xffff)) as f32,
+        );
+        run_compute_shader(
+            ctx,
+            spirv_for(VulkanKernel::TreeAttention),
+            &buffers,
+            1,
+            (nodes * num_heads) as u32,
+            batch as u32,
+            Some(push),
+        )?;
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
+    }
+
+    fn kv_dequant_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k_tensor: &dyn BackendStorage,
+        k_scales: &dyn BackendStorage,
+        v_tensor: &dyn BackendStorage,
+        v_scales: &dyn BackendStorage,
+        _num_kv_heads: usize,
+        kv_seq_len: usize,
+        _cache_offset: u32,
+        quant_bits: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        if quant_bits != 8 {
+            return Err(Error::Unimplemented(
+                "Vulkan kv_dequant_attention currently supports 8-bit K/V only".into(),
+            ));
+        }
+        let dims = out_shape.dims();
+        if dims.len() != 3 {
+            return Err(Error::Shape(
+                "kv_dequant_attention expects [seq_len, num_heads, head_dim]".into(),
+            ));
+        }
+        let q_s = q
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("kv_dequant_attention q is not VulkanStorage".into()))?;
+        let k_s = k_tensor.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("kv_dequant_attention k_tensor is not VulkanStorage".into())
+        })?;
+        let ks_s = k_scales.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("kv_dequant_attention k_scales is not VulkanStorage".into())
+        })?;
+        let v_s = v_tensor.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("kv_dequant_attention v_tensor is not VulkanStorage".into())
+        })?;
+        let vs_s = v_scales.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("kv_dequant_attention v_scales is not VulkanStorage".into())
+        })?;
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let out_storage =
+            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let buffers = [
+            q_s.buffer,
+            k_s.buffer,
+            v_s.buffer,
+            ks_s.buffer,
+            vs_s.buffer,
+            out_storage.buffer,
+        ];
+        let push = push_params(
+            kv_seq_len as u32,
+            dims[2] as u32,
+            0,
+            dims[2] as u32,
+            dims[1] as u32,
+            0.0,
+        );
+        let grid_x = ((dims[2] + 31) / 32) as u32;
+        run_compute_shader(
+            ctx,
+            spirv_for(VulkanKernel::KvDequantAttention),
+            &buffers,
+            grid_x,
+            dims[1] as u32,
+            1,
+            Some(push),
+        )?;
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
     }
 
     fn mul_scalar(
@@ -2299,6 +2580,54 @@ impl BackendDevice for VulkanDevice {
         let out_storage = self.from_cpu(&c_vec, out_shape, a.dtype())?;
         Ok((out_storage, Box::new(VulkanHandle)))
     }
+
+    fn quantized_matmul_backward_dx(
+        &self,
+        dy: &dyn BackendStorage,
+        b_packed: &dyn BackendStorage,
+        _b_scales: &[f32],
+        default_bpw: u8,
+        m: usize,
+        n: usize,
+        k: usize,
+        out_shape: &Shape,
+        residuals: Option<&grim_tensor::QuantizedMatmulBackwardResiduals>,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        if default_bpw != 8
+            || residuals.is_some_and(|r| {
+                r.outlier_count > 0 || r.backup1_bpw != 0 || r.backup2_bpw != 0
+            })
+        {
+            return Err(Error::Unimplemented(
+                "Vulkan Q8_0 backward currently supports only the plain, residual-free layout"
+                    .into(),
+            ));
+        }
+        let dy_s = dy
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan Q8_0 backward dy is not VulkanStorage".into()))?;
+        let b_s = b_packed.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan Q8_0 backward b_packed is not VulkanStorage".into())
+        })?;
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let dx = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let buffers = [dy_s.buffer, b_s.buffer, dx.buffer];
+        let push = push_params(0, 0, k as u32, n as u32, m as u32, 0.0);
+        run_compute_shader(
+            ctx,
+            spirv_for(VulkanKernel::QuantizedMatmulBackwardDxQ8_0),
+            &buffers,
+            ((k + 15) / 16) as u32,
+            ((m + 15) / 16) as u32,
+            1,
+            Some(push),
+        )?;
+        Ok((Box::new(dx), Box::new(grim_tensor::backend::ReadyHandle)))
+    }
 }
 
 /// Simulation tile shape config matching CubeCL autotuning schema (§4.1 requirements)
@@ -2381,9 +2710,11 @@ pub enum VulkanKernel {
     KvDequantAttention,
     SelectiveScan,
     QkvAttentionPaged,
+    TreeAttention,
     FlashAttention,
     SiluMulBackward,
     QuantizedMatmulBackwardDx,
+    QuantizedMatmulBackwardDxQ8_0,
     RwkvTimeMix,
     RwkvChannelMix,
     AllReduce,
@@ -2411,9 +2742,11 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::KvDequantAttention => SPIRV_KV_DEQUANT_ATTENTION,
         VulkanKernel::SelectiveScan => SPIRV_SELECTIVE_SCAN,
         VulkanKernel::QkvAttentionPaged => SPIRV_QKV_ATTENTION_PAGED,
+        VulkanKernel::TreeAttention => SPIRV_TREE_ATTENTION,
         VulkanKernel::FlashAttention => SPIRV_FLASH_ATTENTION,
         VulkanKernel::SiluMulBackward => SPIRV_SILU_MUL_BACKWARD,
         VulkanKernel::QuantizedMatmulBackwardDx => SPIRV_QUANTIZED_MATMUL_BACKWARD_DX,
+        VulkanKernel::QuantizedMatmulBackwardDxQ8_0 => SPIRV_QUANTIZED_MATMUL_BACKWARD_DX_Q8_0,
         VulkanKernel::RwkvTimeMix => SPIRV_RWKV_TIME_MIX,
         VulkanKernel::RwkvChannelMix => SPIRV_RWKV_CHANNEL_MIX,
         VulkanKernel::AllReduce => SPIRV_ALL_REDUCE,
@@ -2854,6 +3187,40 @@ mod tests {
         for &val in res.iter() {
             close_vulkan(val, 2.0, "qkv_attention out");
         }
+    }
+
+    #[test]
+    fn test_vulkan_qkv_attention_paged_gqa_exact() {
+        if GLOBAL_CONTEXT.lock().unwrap().is_none() { return; }
+        let dev = VulkanDevice::new();
+        let q_shape = Shape::new(vec![1, 2, 2]);
+        let page_shape = Shape::new(vec![1, 2, 1, 2]);
+        let table_shape = Shape::new(vec![1, 1]);
+        let q = dev.from_cpu(&vec![1.0f32; 4], &q_shape, DType::F32).unwrap();
+        let k = dev.from_cpu(&vec![1.0f32; 4], &page_shape, DType::F32).unwrap();
+        let v = dev.from_cpu(&vec![2.0f32; 4], &page_shape, DType::F32).unwrap();
+        let table = dev.from_cpu(&vec![0.0f32], &table_shape, DType::F32).unwrap();
+        let (out, _) = dev.qkv_attention_paged(
+            q.as_ref(), table.as_ref(), k.as_ref(), v.as_ref(), 1, 1, 2, 2, 0, &q_shape,
+        ).unwrap();
+        for value in out.to_cpu_vec_f32().unwrap() { close_vulkan(value, 2.0, "paged GQA"); }
+    }
+
+    #[test]
+    fn test_vulkan_tree_attention_gqa_exact() {
+        if GLOBAL_CONTEXT.lock().unwrap().is_none() { return; }
+        let dev = VulkanDevice::new();
+        let q_shape = Shape::new(vec![1, 2, 2, 2]);
+        let kv_shape = Shape::new(vec![2, 1, 2]);
+        let parent_shape = Shape::new(vec![2]);
+        let q = dev.from_cpu(&vec![1.0f32; 8], &q_shape, DType::F32).unwrap();
+        let k = dev.from_cpu(&vec![1.0f32; 4], &kv_shape, DType::F32).unwrap();
+        let v = dev.from_cpu(&vec![2.0f32; 4], &kv_shape, DType::F32).unwrap();
+        let parents = dev.from_cpu(&vec![0.0f32, 0.0], &parent_shape, DType::F32).unwrap();
+        let (out, _) = dev.tree_attention(
+            q.as_ref(), k.as_ref(), v.as_ref(), parents.as_ref(), 1, 2, 0, &q_shape,
+        ).unwrap();
+        for value in out.to_cpu_vec_f32().unwrap() { close_vulkan(value, 2.0, "tree GQA"); }
     }
 }
 

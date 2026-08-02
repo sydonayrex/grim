@@ -1,0 +1,63 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufDY { float dY[]; };
+layout(std430, binding = 1) readonly buffer BufB { uint B_bytes[]; };
+layout(std430, binding = 2) writeonly buffer BufDX { float dX[]; };
+
+uint get_byte(uint byte_idx) {
+    uint word = B_bytes[byte_idx / 4u];
+    return (word >> ((byte_idx % 4u) * 8u)) & 0xFFu;
+}
+
+float unpack_f16(uint lo, uint hi) {
+    uint bits = lo | (hi << 8u);
+    uint sign = (bits >> 15u) & 1u;
+    uint exp = (bits >> 10u) & 31u;
+    uint mant = bits & 1023u;
+    float value;
+    if (exp == 0u) {
+        value = float(mant) * exp2(-24.0);
+    } else if (exp == 31u) {
+        value = 0.0;
+    } else {
+        value = (1.0 + float(mant) / 1024.0) * exp2(float(exp) - 15.0);
+    }
+    return sign == 0u ? value : -value;
+}
+
+float dequant_q8_0(uint block_start, uint in_block) {
+    float scale = unpack_f16(get_byte(block_start), get_byte(block_start + 1u));
+    uint raw = get_byte(block_start + 2u + in_block);
+    int signed_value = raw >= 128u ? int(raw) - 256 : int(raw);
+    return scale * float(signed_value);
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint k_idx = gl_GlobalInvocationID.x;
+    uint M = params.m;
+    uint N = params.n;
+    uint K = params.k;
+    if (row >= M || k_idx >= K) return;
+
+    uint row_bytes = ((K + 31u) / 32u) * 34u;
+    uint block = k_idx / 32u;
+    uint in_block = k_idx % 32u;
+    float acc = 0.0;
+    for (uint n = 0u; n < N; ++n) {
+        uint block_start = n * row_bytes + block * 34u;
+        acc += dY[row * N + n] * dequant_q8_0(block_start, in_block);
+    }
+    dX[row * K + k_idx] = acc;
+}

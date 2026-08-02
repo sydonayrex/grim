@@ -18,6 +18,9 @@ pub struct JsonlBatchIterator {
     tokenizer: GgufTokenizer,
     reader: BufReader<File>,
     exhausted: bool,
+    rank: usize,
+    world_size: usize,
+    line_index: usize,
 }
 
 impl JsonlBatchIterator {
@@ -27,6 +30,24 @@ impl JsonlBatchIterator {
         seq_len: usize,
         batch_size: usize,
     ) -> Result<Self> {
+        Self::new_sharded(path, tokenizer, seq_len, batch_size, 0, 1)
+    }
+
+    /// Construct a deterministic data-parallel shard. Each rank consumes only
+    /// source lines where `line_index % world_size == rank`.
+    pub fn new_sharded(
+        path: &str,
+        tokenizer: GgufTokenizer,
+        seq_len: usize,
+        batch_size: usize,
+        rank: usize,
+        world_size: usize,
+    ) -> Result<Self> {
+        if world_size == 0 || rank >= world_size {
+            return Err(grim_tensor::error::Error::Backend(format!(
+                "invalid dataloader shard rank {rank}/{world_size}"
+            )));
+        }
         let file = File::open(path).map_err(|e| {
             grim_tensor::error::Error::Backend(format!(
                 "failed to open dataloader path {path:?}: {e}"
@@ -39,6 +60,9 @@ impl JsonlBatchIterator {
             tokenizer,
             reader: BufReader::new(file),
             exhausted: false,
+            rank,
+            world_size,
+            line_index: 0,
         })
     }
 
@@ -118,6 +142,11 @@ impl JsonlBatchIterator {
                 self.exhausted = true;
             }
             Ok(_) => {
+                let line_index = self.line_index;
+                self.line_index += 1;
+                if line_index % self.world_size != self.rank {
+                    return self.fill_preference_buffer();
+                }
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     return Ok(());
@@ -149,6 +178,11 @@ impl JsonlBatchIterator {
                 self.exhausted = true;
             }
             Ok(_) => {
+                let line_index = self.line_index;
+                self.line_index += 1;
+                if line_index % self.world_size != self.rank {
+                    return self.fill_buffer();
+                }
                 let v: serde_json::Value = serde_json::from_str(line.trim())
                     .map_err(|e| grim_tensor::error::Error::Backend(e.to_string()))?;
                 let text = v["text"].as_str().unwrap_or("");
@@ -198,5 +232,21 @@ mod tests {
         let (inputs, labels) = loader.next_batch().expect("first batch");
         assert_eq!(inputs.shape().dims(), &[2, 64]);
         assert_eq!(labels.shape().dims(), &[2, 64]);
+    }
+
+    #[test]
+    fn sharded_iterator_rejects_invalid_rank() {
+        let err = match JsonlBatchIterator::new_sharded(
+            "/does/not/need/to/exist",
+            GgufTokenizer::default(),
+            8,
+            1,
+            2,
+            2,
+        ) {
+            Ok(_) => panic!("rank equal to world size must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("invalid dataloader shard rank"));
     }
 }

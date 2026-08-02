@@ -534,40 +534,47 @@ pub struct RcclAllReduce {
 }
 
 impl RcclAllReduce {
-    /// Create a new RCCL all-reduce handle for `num_gpus` devices.
+    /// Create a communicator over the explicitly selected device ordinals.
     ///
-    /// When `num_gpus > 1` and the `rccl` feature is enabled this calls
-    /// `ncclCommInitAll` to obtain a communicator over all devices.
-    pub fn new(num_gpus: u32) -> Self {
-        let comm = Self::init_comm(num_gpus);
-        Self { num_gpus, comm }
+    /// The old constructor inferred ordinals as `0..num_gpus`, which is not a
+    /// valid contract once rank selection can be non-contiguous.  Multi-GPU
+    /// callers must now provide the same ordinals used to construct replicas;
+    /// initialization failure is returned instead of becoming a silent
+    /// local-only training run.
+    pub fn try_new(device_ordinals: &[usize]) -> Result<Self> {
+        let num_gpus = device_ordinals.len() as u32;
+        if num_gpus <= 1 {
+            return Ok(Self {
+                num_gpus,
+                comm: None,
+            });
+        }
+        let comm = Self::init_comm(device_ordinals)?;
+        Ok(Self { num_gpus, comm })
     }
 
     #[cfg(feature = "rccl")]
-    fn init_comm(num_gpus: u32) -> Option<NcclComm> {
-        if num_gpus <= 1 {
-            return None;
-        }
-        let ndev = num_gpus as i32;
-        let devlist: Vec<i32> = (0..ndev).collect();
+    fn init_comm(device_ordinals: &[usize]) -> Result<Option<NcclComm>> {
+        let ndev = device_ordinals.len() as i32;
+        let devlist: Vec<i32> = device_ordinals.iter().map(|&ordinal| ordinal as i32).collect();
         let mut comm = NcclComm(std::ptr::null_mut());
         // SAFETY: devlist contains `ndev` valid device ordinals; comm is a
         // local with stable address for the call.
         let status = unsafe { ncclCommInitAll(&mut comm, ndev, devlist.as_ptr()) };
         if status != NCCL_SUCCESS {
-            log::warn!(
-                "RcclAllReduce::new: ncclCommInitAll failed (status {}); \
-                 falling back to local-only gradient scaling",
-                status,
-            );
-            return None;
+            return Err(Error::Backend(format!(
+                "RCCL communicator initialization failed for ordinals {:?} (status {})",
+                device_ordinals, status
+            )));
         }
-        Some(comm)
+        Ok(Some(comm))
     }
 
     #[cfg(not(feature = "rccl"))]
-    fn init_comm(_num_gpus: u32) -> Option<NcclComm> {
-        None
+    fn init_comm(_device_ordinals: &[usize]) -> Result<Option<NcclComm>> {
+        Err(Error::Backend(
+            "multi-GPU RCCL training requires the `rccl` feature flag".into(),
+        ))
     }
 
     /// Sum gradients across all GPUs using RCCL all-reduce on device memory.
@@ -593,11 +600,9 @@ impl RcclAllReduce {
         #[cfg(feature = "rccl")]
         {
             let Some(comm) = self.comm else {
-                log::warn!(
-                    "RcclAllReduce::sum_gradients_device: no NCCL comm; \
-                     skipping cross-GPU reduce"
-                );
-                return Ok(());
+                return Err(Error::Backend(
+                    "RCCL communicator is unavailable for a multi-GPU reduction".into(),
+                ));
             };
             // SAFETY: send/recv must be valid device pointers for `count`
             // f32 elements; comm must be a valid NCCL communicator; stream

@@ -450,6 +450,7 @@ async fn start_training(
         resume_from_checkpoint: req.resume_from_checkpoint,
         status: crate::jobs::JobStatus::Pending,
         metrics: Vec::new(),
+        rank_metrics: Vec::new(),
         cancel: tokio_util::sync::CancellationToken::new(),
     };
 

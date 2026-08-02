@@ -45,11 +45,16 @@ fn kernels() -> Vec<(&'static str, String)> {
         ("kv_dequant_attention", load_kernel("kv_dequant_attention")),
         ("selective_scan", load_kernel("selective_scan")),
         ("qkv_attention_paged", load_kernel("qkv_attention_paged")),
+        ("tree_attention", load_kernel("tree_attention")),
         ("flash_attention", load_kernel("flash_attention")),
         ("silu_mul_backward", load_kernel("silu_mul_backward")),
         (
             "quantized_matmul_backward_dx",
             load_kernel("quantized_matmul_backward_dx"),
+        ),
+        (
+            "quantized_matmul_backward_dx_q8_0",
+            load_kernel("quantized_matmul_backward_dx_q8_0"),
         ),
         ("rwkv_time_mix", load_kernel("rwkv_time_mix")),
         ("rwkv_channel_mix", load_kernel("rwkv_channel_mix")),
@@ -80,9 +85,11 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/kv_dequant_attention.comp");
     println!("cargo:rerun-if-changed=kernels/selective_scan.comp");
     println!("cargo:rerun-if-changed=kernels/qkv_attention_paged.comp");
+    println!("cargo:rerun-if-changed=kernels/tree_attention.comp");
     println!("cargo:rerun-if-changed=kernels/flash_attention.comp");
     println!("cargo:rerun-if-changed=kernels/silu_mul_backward.comp");
     println!("cargo:rerun-if-changed=kernels/quantized_matmul_backward_dx.comp");
+    println!("cargo:rerun-if-changed=kernels/quantized_matmul_backward_dx_q8_0.comp");
     println!("cargo:rerun-if-changed=kernels/rwkv_time_mix.comp");
     println!("cargo:rerun-if-changed=kernels/rwkv_channel_mix.comp");
     println!("cargo:rerun-if-changed=kernels/all_reduce.comp");

@@ -1,0 +1,76 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint batch;
+    uint num_heads;
+    uint kv_seq_len;
+    uint head_dim;
+    uint gamma;
+    float packed_kv_and_offset;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufQ { float Q[]; };
+layout(std430, binding = 1) readonly buffer BufK { float K[]; };
+layout(std430, binding = 2) readonly buffer BufV { float V[]; };
+layout(std430, binding = 3) readonly buffer BufParents { uint Parents[]; };
+layout(std430, binding = 4) writeonly buffer BufOut { float Out[]; };
+
+bool is_ancestor(uint node, uint current) {
+    if (node == current) return true;
+    uint cursor = current;
+    for (uint depth = 0u; depth <= params.gamma; ++depth) {
+        if (cursor == 0u) return false;
+        cursor = Parents[cursor];
+        if (cursor == node) return true;
+    }
+    return false;
+}
+
+void main() {
+    uint d = gl_LocalInvocationID.x;
+    uint head_work = gl_WorkGroupID.y;
+    uint batch = gl_WorkGroupID.z;
+    uint nodes = params.gamma + 1u;
+    uint node = head_work / params.num_heads;
+    uint q_head = head_work % params.num_heads;
+    uint packed_kv_and_offset = uint(params.packed_kv_and_offset + 0.5);
+    uint num_kv_heads = packed_kv_and_offset >> 16u;
+    uint cache_offset = packed_kv_and_offset & 0xffffu;
+    if (d >= params.head_dim || node >= nodes || batch >= params.batch) return;
+
+    uint q_base = ((batch * nodes + node) * params.num_heads) * params.head_dim;
+    float scale = 1.0 / sqrt(float(params.head_dim));
+    float running_max = -1e30;
+    float running_sum = 0.0;
+    float acc = 0.0;
+
+    for (uint j = 0u; j < params.kv_seq_len; ++j) {
+        bool attend = false;
+        if (j < cache_offset) {
+            attend = true;
+        } else {
+            uint tree_node = j - cache_offset;
+            attend = tree_node <= node && is_ancestor(tree_node, node);
+        }
+        if (!attend) continue;
+
+        uint kv_head = q_head / (params.num_heads / num_kv_heads);
+        uint kv_base = ((batch * params.kv_seq_len + j) * num_kv_heads + kv_head) * params.head_dim;
+        float score = 0.0;
+        uint q_head_base = q_base + q_head * params.head_dim;
+        for (uint qd = 0u; qd < params.head_dim; ++qd)
+            score += Q[q_head_base + qd] * K[kv_base + qd];
+        score *= scale;
+        float old_max = running_max;
+        running_max = max(running_max, score);
+        float old_weight = exp(old_max - running_max);
+        float new_weight = exp(score - running_max);
+        running_sum = running_sum * old_weight + new_weight;
+        acc = acc * old_weight + new_weight * V[kv_base + d];
+    }
+
+    uint out_base = ((batch * nodes + node) * params.num_heads) * params.head_dim;
+    Out[out_base + q_head * params.head_dim + d] = running_sum > 0.0 ? acc / running_sum : 0.0;
+}

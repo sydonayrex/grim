@@ -60,7 +60,7 @@ pub use crate::device::handles::{
     WavefrontSize, hipDeviceGetAttribute, hipDeviceSynchronize, hipFree, hipGetDeviceCount,
     hipGetDeviceProperties, hipGraphCreate, hipGraphDestroy, hipGraphExecDestroy,
     hipGraphExtendFromGlobalStream, hipGraphInstantiate, hipGraphLaunch, hipGraphUpload,
-    hipHostFree, hipHostMalloc, hipMalloc, hipMemAdvise, hipMemGetInfo, hipMemcpy, hipMemcpyAsync,
+    hipHostFree, hipHostMalloc, hipMalloc, hipMallocManaged, hipMemAdvise, hipMemGetInfo, hipMemcpy, hipMemcpyAsync, hipMemPrefetchAsync,
     hipMemset, hipMemsetAsync, hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad,
     hipModuleUnload, hipSetDevice, hipStreamBeginCapture, hipStreamCreate, hipStreamDestroy,
     hipStreamEndCapture, hipStreamSynchronize, hipSuccess, hiprtcAddNameExpression,
@@ -126,7 +126,7 @@ pub use crate::device::util::{
 // ROCmDevice itself: large struct + every impl lives in
 // `device::roc_device`. Re-exported here so existing callers can
 // keep using `RocmDevice::new(...)` etc. unchanged.
-pub use crate::device::roc_device::RocmDevice;
+pub use crate::device::roc_device::{RocmDevice, FUSED_FORWARD_DISPATCH_STATS};
 
 pub use crate::rccl::RcclAllReduce;
 

@@ -302,6 +302,46 @@ impl Optimizer {
         }
     }
 
+    /// Return the concrete optimizer kind represented by this instance.
+    pub fn kind(&self) -> OptimizerKind {
+        match self {
+            Optimizer::AdamW(_) => OptimizerKind::AdamW,
+            Optimizer::AdamW8Bit(_) => OptimizerKind::AdamW8Bit,
+            Optimizer::PagedAdamW(_) => OptimizerKind::PagedAdamW,
+            Optimizer::Lion(_) => OptimizerKind::Lion,
+            Optimizer::Lion8Bit(_) => OptimizerKind::Lion8Bit,
+            Optimizer::Adafactor(_) => OptimizerKind::Adafactor,
+            Optimizer::QGaLoreAdamW8Bit(_) => OptimizerKind::QGaLoreAdamW8Bit,
+        }
+    }
+
+    /// Return the current learning rate used when forking a replica.
+    pub fn lr(&self) -> f32 {
+        match self {
+            Optimizer::AdamW(o) => o.config.lr,
+            Optimizer::AdamW8Bit(o) => o.config.lr,
+            Optimizer::PagedAdamW(o) => o.config.lr,
+            Optimizer::Lion(o) => o.config.lr,
+            Optimizer::Lion8Bit(o) => o.config.lr,
+            Optimizer::Adafactor(o) => o.config.lr,
+            Optimizer::QGaLoreAdamW8Bit(o) => o.config.lr,
+        }
+    }
+
+    /// Recreate this optimizer for another rank and copy its serialized
+    /// moments/state into the target parameter registry. This is the
+    /// rank-replica primitive: a new rank must not restart Adam moments.
+    pub fn fork_for_rank(
+        &self,
+        source_params: &TrainableParams,
+        target_params: &mut TrainableParams,
+    ) -> Result<Self> {
+        let mut fork = Self::new(self.kind(), self.lr())?;
+        let state = self.save_to_train_state(source_params);
+        fork.load_from_train_state(target_params, &state)?;
+        Ok(fork)
+    }
+
     pub fn step(&mut self, params: &mut TrainableParams) -> Result<()> {
         match self {
             Optimizer::AdamW(o) => o.step(params),
@@ -1948,5 +1988,33 @@ mod tests {
             params.get(pid).unwrap().data.to_vec_f32().unwrap().len(),
             128 * 64
         );
+    }
+
+    #[test]
+    fn optimizer_fork_preserves_kind_lr_and_state_contract() {
+        use crate::injection::LoRAInjectionPoint;
+        use crate::param::TrainableParam;
+
+        let pid = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
+        let mut source = TrainableParams::new();
+        let mut param = TrainableParam::new(
+            pid,
+            grim_backend_cpu::cpu_tensor(vec![1.0, 2.0], Shape::new(vec![2])),
+        )
+        .unwrap();
+        param
+            .accumulate_grad(&grim_backend_cpu::cpu_tensor(
+                vec![0.25, -0.5],
+                Shape::new(vec![2]),
+            ))
+            .unwrap();
+        source.insert(param);
+
+        let mut optimizer = Optimizer::new(OptimizerKind::AdamW, 2e-4).unwrap();
+        optimizer.step(&mut source).unwrap();
+        let mut target = source.clone();
+        let fork = optimizer.fork_for_rank(&source, &mut target).unwrap();
+        assert_eq!(fork.kind(), OptimizerKind::AdamW);
+        assert!((fork.lr() - 2e-4).abs() < 1e-8);
     }
 }

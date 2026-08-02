@@ -10,7 +10,7 @@ use grim_tensor::error::{Error, Result};
 // Re-exports used by the type's field types. The actual type declarations
 use crate::{
     DType, DTypeStorage, HipMemcpyKind, QuantProvenance, RocmCachingAllocator, Shape, check_hip,
-    hipMemcpy, hipSuccess,
+    hipMallocManaged, hipMemPrefetchAsync, hipMemcpy, hipSuccess,
 };
 
 /// ROCm-side tensor storage. Holds a hipDeviceptr_t (as u64) plus shape/dtype/provenance metadata.
@@ -25,6 +25,8 @@ pub struct RocmStorage {
     pub(crate) ordinal: usize,
     /// Back-reference to the owning device allocator; used by `Drop` to return the [see: `hipFree`]
     pub(crate) allocator: Arc<RocmCachingAllocator>,
+    /// Managed allocations may migrate between VRAM and host RAM under HIP.
+    pub(crate) managed: bool,
 }
 
 impl RocmStorage {
@@ -40,8 +42,20 @@ impl RocmStorage {
         self.device_ptr.is_some()
     }
 
+    /// Raw HIP device pointer for integrations that invoke an external
+    /// collective (for example RCCL) directly on this allocation.
+    /// Callers must keep this storage alive and use the owning device ordinal.
+    pub fn device_ptr_u64(&self) -> Option<u64> {
+        self.device_ptr
+    }
+
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Whether this storage uses HIP managed memory and may reside in host RAM.
+    pub fn is_managed(&self) -> bool {
+        self.managed
     }
 
     /// Allocates GPU memory via a caching allocator. Returns the storage on success. [see: `Arc<RocmCachingAllocator>`, `&RocmDevice`]
@@ -52,7 +66,45 @@ impl RocmStorage {
         ordinal: usize,
     ) -> Result<Self> {
         let bytes = shape.elem_count() * crate::dtype_byte_size(&dtype);
-        let dev_ptr_void = allocator.alloc(bytes)?;
+        if crate::memory::budget::use_managed_allocation(ordinal, bytes) {
+            let mut ptr = std::ptr::null_mut();
+            check_hip("hipMallocManaged", unsafe {
+                hipMallocManaged(&mut ptr, bytes, 1)
+            })?;
+            return Ok(RocmStorage {
+                device_ptr: Some(ptr as u64),
+                bytes,
+                shape: shape.clone(),
+                dtype,
+                provenance: QuantProvenance::GrimNative,
+                ordinal,
+                allocator: Arc::clone(allocator),
+                managed: true,
+            });
+        }
+        let dev_ptr_void = match allocator.alloc(bytes) {
+            Ok(ptr) => ptr,
+            Err(vram_error) => {
+                // The free-memory probe is inherently racy: another stream or
+                // rank may consume VRAM after the policy check. Preserve the
+                // allocation request by falling back to managed memory before
+                // surfacing the original device-allocation failure.
+                let mut ptr = std::ptr::null_mut();
+                if unsafe { hipMallocManaged(&mut ptr, bytes, 1) } == hipSuccess {
+                    return Ok(RocmStorage {
+                        device_ptr: Some(ptr as u64),
+                        bytes,
+                        shape: shape.clone(),
+                        dtype,
+                        provenance: QuantProvenance::GrimNative,
+                        ordinal,
+                        allocator: Arc::clone(allocator),
+                        managed: true,
+                    });
+                }
+                return Err(vram_error);
+            }
+        };
 
         Ok(RocmStorage {
             device_ptr: Some(dev_ptr_void as u64),
@@ -62,6 +114,7 @@ impl RocmStorage {
             provenance: QuantProvenance::GrimNative,
             ordinal,
             allocator: Arc::clone(allocator),
+            managed: false,
         })
     }
 
@@ -128,6 +181,54 @@ impl RocmStorage {
         Ok(storage)
     }
 
+    /// Allocate HIP managed memory and initialize it from host data. The
+    /// returned pointer is valid to ROCm kernels exactly like ordinary device
+    /// storage; HIP may page it between VRAM and system RAM. This is the
+    /// transparent overflow tier used for opt-in large model weights.
+    pub fn copy_from_host_managed(
+        host_data: &[f32],
+        shape: &Shape,
+        dtype: DType,
+        allocator: &Arc<RocmCachingAllocator>,
+        ordinal: usize,
+    ) -> Result<Self> {
+        if dtype.arith != grim_tensor::ArithType::F32 {
+            return Err(Error::Unimplemented(
+                "managed host-backed upload currently supports F32 weights only".into(),
+            ));
+        }
+        let bytes = shape.elem_count() * crate::dtype_byte_size(&dtype);
+        let mut ptr = std::ptr::null_mut();
+        check_hip("hipMallocManaged", unsafe {
+            hipMallocManaged(&mut ptr, bytes, 1)
+        })?;
+        let storage = Self {
+            device_ptr: Some(ptr as u64),
+            bytes,
+            shape: shape.clone(),
+            dtype: dtype.clone(),
+            provenance: QuantProvenance::GrimNative,
+            ordinal,
+            allocator: Arc::clone(allocator),
+            managed: true,
+        };
+        let result = unsafe {
+            hipMemcpy(
+                ptr,
+                host_data.as_ptr() as *const c_void,
+                bytes,
+                HipMemcpyKind::HostToDevice,
+            )
+        };
+        if result != hipSuccess {
+            unsafe { let _ = crate::hipFree(ptr); }
+            return Err(Error::Backend(format!(
+                "hipMemcpyHostToDevice for managed storage failed with error code {result}"
+            )));
+        }
+        Ok(storage)
+    }
+
     /// Copies raw packed bytes (e.g. Q4_K, Q8_0, GPTQ) from host memory to GPU.
     pub fn copy_from_host_raw_bytes(
         host_bytes: &[u8],
@@ -137,7 +238,66 @@ impl RocmStorage {
         ordinal: usize,
     ) -> Result<Self> {
         let bytes = host_bytes.len();
-        let dev_ptr_void = allocator.alloc(bytes)?;
+        if crate::memory::budget::use_managed_allocation(ordinal, bytes) {
+            let mut ptr = std::ptr::null_mut();
+            check_hip("hipMallocManaged", unsafe {
+                hipMallocManaged(&mut ptr, bytes, 1)
+            })?;
+            let result = unsafe {
+                hipMemcpy(
+                    ptr,
+                    host_bytes.as_ptr() as *const c_void,
+                    bytes,
+                    HipMemcpyKind::HostToDevice,
+                )
+            };
+            if result != hipSuccess {
+                unsafe { let _ = crate::hipFree(ptr); }
+                return Err(Error::Backend(format!(
+                    "hipMemcpyHostToDevice for managed raw storage failed with error code {result}"
+                )));
+            }
+            return Ok(RocmStorage {
+                device_ptr: Some(ptr as u64),
+                bytes,
+                shape: shape.clone(),
+                dtype,
+                provenance: QuantProvenance::GrimNative,
+                ordinal,
+                allocator: Arc::clone(allocator),
+                managed: true,
+            });
+        }
+        let dev_ptr_void = match allocator.alloc(bytes) {
+            Ok(ptr) => ptr,
+            Err(vram_error) => {
+                let mut ptr = std::ptr::null_mut();
+                if unsafe { hipMallocManaged(&mut ptr, bytes, 1) } == hipSuccess {
+                    let result = unsafe {
+                        hipMemcpy(
+                            ptr,
+                            host_bytes.as_ptr() as *const c_void,
+                            bytes,
+                            HipMemcpyKind::HostToDevice,
+                        )
+                    };
+                    if result == hipSuccess {
+                        return Ok(RocmStorage {
+                            device_ptr: Some(ptr as u64),
+                            bytes,
+                            shape: shape.clone(),
+                            dtype,
+                            provenance: QuantProvenance::GrimNative,
+                            ordinal,
+                            allocator: Arc::clone(allocator),
+                            managed: true,
+                        });
+                    }
+                    unsafe { let _ = crate::hipFree(ptr); }
+                }
+                return Err(vram_error);
+            }
+        };
 
         let upload_result = unsafe {
             hipMemcpy(
@@ -164,6 +324,7 @@ impl RocmStorage {
             provenance: QuantProvenance::GrimNative,
             ordinal,
             allocator: Arc::clone(allocator),
+            managed: false,
         })
     }
 }
@@ -171,7 +332,11 @@ impl RocmStorage {
 impl Drop for RocmStorage {
     fn drop(&mut self) {
         if let Some(ptr_val) = self.device_ptr {
-            self.allocator.free(ptr_val as *mut c_void, self.bytes);
+            if self.managed {
+                unsafe { let _ = crate::hipFree(ptr_val as *mut c_void); }
+            } else {
+                self.allocator.free(ptr_val as *mut c_void, self.bytes);
+            }
         }
     }
 }
@@ -183,6 +348,10 @@ impl BackendStorage for RocmStorage {
 
     fn provenance(&self) -> QuantProvenance {
         self.provenance.clone()
+    }
+
+    fn set_provenance(&mut self, provenance: QuantProvenance) {
+        self.provenance = provenance;
     }
 
     fn shape(&self) -> &Shape {
@@ -272,6 +441,23 @@ impl BackendStorage for RocmStorage {
 
     fn device_ordinal(&self) -> u32 {
         self.ordinal as u32
+    }
+
+    fn prefetch_to_device(&self) -> Result<()> {
+        if !self.managed {
+            return Ok(());
+        }
+        let ptr = self
+            .device_ptr
+            .ok_or_else(|| Error::Backend("managed storage has no device pointer".into()))?;
+        check_hip("hipMemPrefetchAsync", unsafe {
+            hipMemPrefetchAsync(
+                ptr as *const c_void,
+                self.bytes,
+                self.ordinal as i32,
+                std::ptr::null_mut(),
+            )
+        })
     }
 }
 

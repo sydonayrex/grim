@@ -66,17 +66,22 @@ struct MetalPipelines {
     add: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     mul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     silu_mul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    silu_mul_backward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     rms_norm: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     softmax: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     embedding: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     matmul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     qkv_attn: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    qkv_paged_attn: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    tree_attn: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     kv_dequant_attn: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     mul_scalar: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     sqrt: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     recip: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     rope: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     quantized_matmul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    residualpacked_matmul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    quantized_matmul_backward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -187,17 +192,22 @@ impl MetalContext {
                 add: get_pipeline("grim_add")?,
                 mul: get_pipeline("grim_mul")?,
                 silu_mul: get_pipeline("grim_silu_mul")?,
+                silu_mul_backward: get_pipeline("grim_silu_mul_backward")?,
                 rms_norm: get_pipeline("grim_rms_norm")?,
                 softmax: get_pipeline("grim_softmax")?,
                 embedding: get_pipeline("grim_embedding")?,
                 matmul: get_pipeline("grim_matmul")?,
                 qkv_attn: get_pipeline("grim_qkv_attention")?,
+                qkv_paged_attn: get_pipeline("grim_qkv_attention_paged")?,
+                tree_attn: get_pipeline("grim_tree_attention")?,
                 kv_dequant_attn: get_pipeline("grim_kv_dequant_attention")?,
                 mul_scalar: get_pipeline("grim_mul_scalar")?,
                 sqrt: get_pipeline("grim_sqrt")?,
                 recip: get_pipeline("grim_recip")?,
                 rope: get_pipeline("grim_rope")?,
                 quantized_matmul: get_pipeline("grim_quantized_matmul_q8_0")?,
+                residualpacked_matmul: get_pipeline("grim_quantized_matmul_residualpacked")?,
+                quantized_matmul_backward: get_pipeline("grim_quantized_matmul_backward_q8_0")?,
             });
 
             Ok(MetalContext {
@@ -833,6 +843,79 @@ impl BackendDevice for MetalDevice {
         }
     }
 
+    fn silu_mul_backward(
+        &self,
+        e: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        dw: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(ref inner) = self.inner {
+                let e_s = e.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+                    Error::Backend("Metal silu_mul_backward: e is not MetalStorage".into())
+                })?;
+                let g_s = g.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+                    Error::Backend("Metal silu_mul_backward: g is not MetalStorage".into())
+                })?;
+                let dw_s = dw.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+                    Error::Backend("Metal silu_mul_backward: dw is not MetalStorage".into())
+                })?;
+                let e_buf = e_s.buffer.as_ref().ok_or_else(|| Error::Backend("e has no GPU buffer".into()))?;
+                let g_buf = g_s.buffer.as_ref().ok_or_else(|| Error::Backend("g has no GPU buffer".into()))?;
+                let dw_buf = dw_s.buffer.as_ref().ok_or_else(|| Error::Backend("dw has no GPU buffer".into()))?;
+                let df_storage = self.zeros(out_shape, DType::F32)?;
+                let de_storage = self.zeros(out_shape, DType::F32)?;
+                let df_buf = df_storage.as_any().downcast_ref::<MetalStorage>().unwrap().buffer.as_ref().unwrap();
+                let de_buf = de_storage.as_any().downcast_ref::<MetalStorage>().unwrap().buffer.as_ref().unwrap();
+                let cmd = self.get_or_create_command_buffer()?;
+                let encoder = cmd.computeCommandEncoder().ok_or_else(|| Error::from(MetalError::Ffi("Failed to create compute encoder".into())))?;
+                encoder.setComputePipelineState(&inner.pipelines.silu_mul_backward);
+                encoder.setBuffer_offset_atIndex(Some(e_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(g_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(dw_buf), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(df_buf), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(de_buf), 0, 4);
+                let total = out_shape.elem_count() as i32;
+                unsafe { encoder.setBytes_length_atIndex(&total as *const i32 as *const std::ffi::c_void, 4, 5); }
+                let threads = MTLSize::new(256, 1, 1);
+                let groups = MTLSize::new(((total as usize + 255) / 256) as u64, 1, 1);
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
+                encoder.endEncoding();
+                return Ok((df_storage, de_storage, Box::new(MetalHandle { command_buffer: cmd })));
+            }
+        }
+        let cpu = CpuDevice::new();
+        let e_cpu = e.to_cpu_vec_f32()?;
+        let g_cpu = g.to_cpu_vec_f32()?;
+        let dw_cpu = dw.to_cpu_vec_f32()?;
+        let mut df = vec![0.0f32; out_shape.elem_count()];
+        let mut de = vec![0.0f32; out_shape.elem_count()];
+        for i in 0..df.len() {
+            let s = 1.0 / (1.0 + (-e_cpu[i]).exp());
+            df[i] = dw_cpu[i] * g_cpu[i] * s * (1.0 + e_cpu[i] * (1.0 - s));
+            de[i] = dw_cpu[i] * s * e_cpu[i];
+        }
+        let df_storage = cpu.from_cpu(&df, out_shape, DType::F32)?;
+        let de_storage = cpu.from_cpu(&de, out_shape, DType::F32)?;
+        #[cfg(target_vendor = "apple")]
+        {
+            let command_buffer = self.get_or_create_command_buffer()?;
+            return Ok((
+                df_storage,
+                de_storage,
+                Box::new(MetalHandle { command_buffer }),
+            ));
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        Ok((df_storage, de_storage, Box::new(MetalHandle)))
+    }
+
     fn rms_norm(
         &self,
         x: &dyn BackendStorage,
@@ -1417,6 +1500,100 @@ impl BackendDevice for MetalDevice {
         )
     }
 
+    fn qkv_attention_paged(
+        &self,
+        q: &dyn BackendStorage,
+        block_tables: &dyn BackendStorage,
+        k_pages: &dyn BackendStorage,
+        v_pages: &dyn BackendStorage,
+        num_kv_heads: usize,
+        max_blocks: usize,
+        page_size: usize,
+        kv_seq_len: usize,
+        _cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        #[cfg(target_vendor = "apple")]
+        if let Some(ref inner) = self.inner {
+            let dims = out_shape.dims();
+            if dims.len() != 3 {
+                return Err(Error::from(MetalError::DataMismatch("paged attention expects [batch, heads, dim]".into())));
+            }
+            let q_s = q.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| Error::Backend("paged q is not MetalStorage".into()))?;
+            if num_kv_heads == 0 || dims[1] % num_kv_heads != 0 { return Err(Error::from(MetalError::DataMismatch("paged attention requires num_heads divisible by num_kv_heads".into()))); }
+            let table_s = block_tables.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| Error::Backend("paged block table is not MetalStorage".into()))?;
+            let k_s = k_pages.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| Error::Backend("paged k pages is not MetalStorage".into()))?;
+            let v_s = v_pages.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| Error::Backend("paged v pages is not MetalStorage".into()))?;
+            let q_buf = q_s.buffer.as_ref().ok_or_else(|| Error::Backend("q has no GPU buffer".into()))?;
+            let table_buf = table_s.buffer.as_ref().ok_or_else(|| Error::Backend("block table has no GPU buffer".into()))?;
+            let k_buf = k_s.buffer.as_ref().ok_or_else(|| Error::Backend("k pages has no GPU buffer".into()))?;
+            let v_buf = v_s.buffer.as_ref().ok_or_else(|| Error::Backend("v pages has no GPU buffer".into()))?;
+            let out_storage = self.zeros(out_shape, DType::F32)?;
+            let out_buf = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap().buffer.as_ref().unwrap();
+            let cmd = self.get_or_create_command_buffer()?;
+            let encoder = cmd.computeCommandEncoder().ok_or_else(|| Error::from(MetalError::Ffi("Failed to create compute encoder".into())))?;
+            encoder.setComputePipelineState(&inner.pipelines.qkv_paged_attn);
+            encoder.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(k_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(v_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(table_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 4);
+            let vals = [dims[0] as i32, dims[1] as i32, dims[2] as i32, page_size as i32, max_blocks as i32, kv_seq_len as i32, num_kv_heads as i32];
+            unsafe { for (i, value) in vals.iter().enumerate() { encoder.setBytes_length_atIndex(value as *const i32 as *const std::ffi::c_void, 4, 5 + i); } }
+            encoder.dispatchThreads(MTLSize::new(dims[2] as u64, dims[1] as u64, dims[0] as u64), MTLSize::new(32, 1, 1));
+            encoder.endEncoding();
+            return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd })));
+        }
+        Err(Error::Unimplemented("Metal paged attention requires Apple Metal GPU support".into()))
+    }
+
+    fn tree_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        tree_parents: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let dims = out_shape.dims();
+        if dims.len() != 4 {
+            return Err(Error::from(MetalError::DataMismatch("tree attention expects [batch, 1+gamma, heads, dim]".into())));
+        }
+        if num_kv_heads == 0 || dims[2] % num_kv_heads != 0 {
+            return Err(Error::from(MetalError::DataMismatch("tree attention requires num_heads divisible by num_kv_heads".into())));
+        }
+        #[cfg(target_vendor = "apple")]
+        if let Some(ref inner) = self.inner {
+            let q_s = q.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| Error::Backend("tree q is not MetalStorage".into()))?;
+            let k_s = k.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| Error::Backend("tree k is not MetalStorage".into()))?;
+            let v_s = v.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| Error::Backend("tree v is not MetalStorage".into()))?;
+            let p_s = tree_parents.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| Error::Backend("tree parents is not MetalStorage".into()))?;
+            let q_buf = q_s.buffer.as_ref().ok_or_else(|| Error::Backend("q has no GPU buffer".into()))?;
+            let k_buf = k_s.buffer.as_ref().ok_or_else(|| Error::Backend("k has no GPU buffer".into()))?;
+            let v_buf = v_s.buffer.as_ref().ok_or_else(|| Error::Backend("v has no GPU buffer".into()))?;
+            let p_buf = p_s.buffer.as_ref().ok_or_else(|| Error::Backend("parents has no GPU buffer".into()))?;
+            let out_storage = self.zeros(out_shape, DType::F32)?;
+            let out_buf = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap().buffer.as_ref().unwrap();
+            let cmd = self.get_or_create_command_buffer()?;
+            let encoder = cmd.computeCommandEncoder().ok_or_else(|| Error::from(MetalError::Ffi("Failed to create compute encoder".into())))?;
+            encoder.setComputePipelineState(&inner.pipelines.tree_attn);
+            encoder.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(k_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(v_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(p_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 4);
+            let vals = [dims[0] as i32, dims[2] as i32, kv_seq_len as i32, dims[3] as i32, (dims[1] - 1) as i32, cache_offset as i32, num_kv_heads as i32];
+            unsafe { for (i, value) in vals.iter().enumerate() { encoder.setBytes_length_atIndex(value as *const i32 as *const std::ffi::c_void, 4, 5 + i); } }
+            encoder.dispatchThreads(MTLSize::new(dims[3] as u64, (dims[1] * dims[2]) as u64, dims[0] as u64), MTLSize::new(256, 1, 1));
+            encoder.endEncoding();
+            return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd })));
+        }
+        Err(Error::Unimplemented("Metal tree attention requires Apple Metal GPU support".into()))
+    }
+
     fn mul_scalar(
         &self,
         x: &dyn BackendStorage,
@@ -1885,6 +2062,52 @@ impl BackendDevice for MetalDevice {
             if let (Some(a_s), Some(b_s)) = (a_s, b_s) {
                 if let (Some(a_buf), Some(b_buf)) = (a_s.buffer.as_ref(), b_s.buffer.as_ref()) {
                     if let Ok(ctx) = MetalContext::get() {
+                        if let DTypeStorage::ResidualPacked(cfg) = b_packed.dtype().storage {
+                            let residuals = match b_packed.provenance() {
+                                QuantProvenance::WithResiduals { outlier_count, outlier_indices_offset, outlier_values_offset, backup1_bpw, backup1_codes_offset, backup1_scale_offset, backup2_bpw, backup2_codes_offset, backup2_scale_offset } =>
+                                    (outlier_count, outlier_indices_offset, outlier_values_offset, backup1_bpw, backup1_codes_offset, backup1_scale_offset, backup2_bpw, backup2_codes_offset, backup2_scale_offset),
+                                _ => return Err(Error::Unimplemented("Metal ResidualPacked requires WithResiduals provenance".into())),
+                            };
+                            if cfg.bpw == 0 || cfg.bpw > 8 || k == 0 || n == 0 { return Err(Error::Shape("invalid ResidualPacked dimensions or bitwidth".into())); }
+                            let row_stride = ((k * cfg.bpw as usize).div_ceil(8) + 255) / 256 * 256;
+                            let bytes = unsafe { std::slice::from_raw_parts(b_buf.contents() as *const u8, b_buf.length() as usize) };
+                            let decode_scales = |offset: usize| -> Vec<f32> {
+                                if offset == 0 { vec![1.0; n] } else { (0..n).map(|i| bytes.get(offset + i).copied().unwrap_or(255) as f32 / 255.0).collect() }
+                            };
+                            let (outlier_count, oi_off, ov_off, b1, b1_off, b1_scale, b2, b2_off, b2_scale) = residuals;
+                            let mut scales = vec![1.0f32; n];
+                            scales[..b_scales.len().min(n)].copy_from_slice(&b_scales[..b_scales.len().min(n)]);
+                            scales.extend(decode_scales(b1_scale));
+                            scales.extend(decode_scales(b2_scale));
+                            let mut indices = Vec::<u32>::with_capacity(outlier_count);
+                            let mut values = Vec::<f32>::with_capacity(outlier_count);
+                            for i in 0..outlier_count {
+                                let p = oi_off + i * 6;
+                                let q = ov_off + i * 6;
+                                if p + 4 > bytes.len() || q + 2 > bytes.len() { return Err(Error::Backend("ResidualPacked outlier region exceeds Metal buffer".into())); }
+                                indices.push(u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()));
+                                let h = u16::from_le_bytes(bytes[q..q + 2].try_into().unwrap());
+                                let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+                                let exp = ((h >> 10) & 0x1f) as i32;
+                                let mant = (h & 0x3ff) as u32;
+                                values.push(if exp == 0 { sign * (mant as f32) * 2.0f32.powi(-24) } else { sign * (1.0 + mant as f32 / 1024.0) * 2.0f32.powi(exp - 25) });
+                            }
+                            let make_buf = |ptr: *const std::ffi::c_void, len: usize| ctx.device.newBufferWithBytes_length_options(ptr, len as u64, MTLResourceOptions::StorageModeShared).ok().ok_or_else(|| Error::from(MetalError::AllocationFailed("ResidualPacked auxiliary buffer allocation failed".into())));
+                            let scales_buf = make_buf(scales.as_ptr() as *const _, scales.len() * 4)?;
+                            let idx_buf = make_buf(indices.as_ptr() as *const _, indices.len().max(1) * 4)?;
+                            let val_buf = make_buf(values.as_ptr() as *const _, values.len().max(1) * 4)?;
+                            let out_storage = self.zeros(out_shape, DType::F32)?;
+                            let out_buf = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap().buffer.as_ref().unwrap();
+                            let cmd = self.get_or_create_command_buffer()?;
+                            let enc = cmd.computeCommandEncoder().ok_or_else(|| Error::from(MetalError::Ffi("Failed to create compute encoder".into())))?;
+                            enc.setComputePipelineState(&ctx.pipelines.residualpacked_matmul);
+                            for (buf, idx) in [Some(a_buf), Some(b_buf), Some(&scales_buf), Some(&idx_buf), Some(&val_buf), Some(out_buf)].iter().enumerate() { enc.setBuffer_offset_atIndex(*buf, 0, idx as usize); }
+                            let vals = [m as i32, n as i32, k as i32, cfg.bpw as i32, row_stride as i32, 0, b1 as i32, b1_off as i32, b1_scale as i32, b2 as i32, b2_off as i32, b2_scale as i32, outlier_count as i32];
+                            unsafe { for (i, v) in vals.iter().enumerate() { enc.setBytes_length_atIndex(v as *const i32 as *const _, 4, 6 + i); } }
+                            enc.dispatchThreadgroups(MTLSize::new(((n + 15) / 16) as u64, ((m + 15) / 16) as u64, 1), MTLSize::new(16, 16, 1));
+                            enc.endEncoding();
+                            return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd })));
+                        }
                         if k >= 32 && k % 32 == 0 {
                             // Pad / truncate scales to exactly n * (k/32) entries.
                             let blocks_per_col = k / 32;
@@ -2033,6 +2256,156 @@ impl BackendDevice for MetalDevice {
 
         let out_storage = self.from_cpu(&c_vec, out_shape, a.dtype())?;
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    fn quantized_matmul_backward_dx(
+        &self,
+        dy: &dyn BackendStorage,
+        b_packed: &dyn BackendStorage,
+        b_scales: &[f32],
+        default_bpw: u8,
+        m: usize,
+        n: usize,
+        k: usize,
+        out_shape: &Shape,
+        residuals: Option<&grim_tensor::QuantizedMatmulBackwardResiduals>,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        // Basic validation - only Q8_0 (8-bit) supported, requires k >= 32 and block-aligned
+        if default_bpw != 8 || k < 32 || k % 32 != 0 {
+            return Err(Error::Unimplemented(
+                "Metal Q8_0 backward supports only 8-bit block-aligned tensors".into(),
+            ));
+        }
+        
+        // For residuals (outliers, backup layers), fall back to CPU
+        // This matches ROCm behavior where residuals cause a fallback path
+        if let Some(res) = residuals {
+            if res.outlier_count > 0 || res.backup1_bpw > 0 || res.backup2_bpw > 0 {
+                let dy_vec = dy.to_cpu_vec_f32()?;
+                let b_bytes = b_packed.to_cpu_vec_f32()?;
+                let mut dx = vec![0.0f32; m * k];
+                let blocks_per_col = k / 32;
+                
+                for row in 0..m {
+                    for ki in 0..k {
+                        let block = ki / 32;
+                        let in_block = ki % 32;
+                        let mut sum = 0.0f32;
+                        for col in 0..n {
+                            let idx = (col * blocks_per_col + block) * 32 + in_block;
+                            let q = b_bytes.get(idx).copied().unwrap_or(0.0);
+                            let scale = b_scales.get(col * blocks_per_col + block).copied().unwrap_or(1.0);
+                            sum += dy_vec[row * n + col] * q * scale;
+                        }
+                        dx[row * k + ki] = sum;
+                    }
+                }
+                return Ok((self.from_cpu(&dx, out_shape, DType::F32)?, Box::new(MetalHandle)));
+            }
+        }
+        
+        // Apple Metal GPU fast-path
+        #[cfg(target_vendor = "apple")]
+        if let Some(ref inner) = self.inner {
+            let dy_s = dy.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+                Error::Backend("Metal Q8_0 backward dy is not MetalStorage".into())
+            })?;
+            let b_s = b_packed.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
+                Error::Backend("Metal Q8_0 backward b is not MetalStorage".into())
+            })?;
+            
+            let dy_buf = dy_s.buffer.as_ref().ok_or_else(|| {
+                Error::Backend("Metal Q8_0 backward dy has no GPU buffer".into())
+            })?;
+            let b_buf = b_s.buffer.as_ref().ok_or_else(|| {
+                Error::Backend("Metal Q8_0 backward b has no GPU buffer".into())
+            })?;
+            
+            let ctx = MetalContext::get()?;
+            let scale_count = n * (k / 32);
+            let mut scales = vec![1.0f32; scale_count];
+            let copy_len = b_scales.len().min(scale_count);
+            scales[..copy_len].copy_from_slice(&b_scales[..copy_len]);
+            
+            let scales_buf = ctx
+                .device
+                .newBufferWithBytes_length_options(
+                    scales.as_ptr() as *const std::ffi::c_void,
+                    (scales.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .ok_or_else(|| {
+                    Error::from(MetalError::Ffi(
+                        "Failed to allocate Q8_0 scale buffer".into(),
+                    ))
+                })?;
+            
+            let dx_storage = self.zeros(out_shape, DType::F32)?;
+            let dx_s = dx_storage
+                .as_any()
+                .downcast_ref::<MetalStorage>()
+                .ok_or_else(|| Error::Backend("dx_storage is not MetalStorage".into()))?;
+            let dx_buf = dx_s.buffer.as_ref().ok_or_else(|| {
+                Error::Backend("dx storage has no GPU buffer".into())
+            })?;
+            
+            let cmd = self.get_or_create_command_buffer()?;
+            let encoder = cmd
+                .computeCommandEncoder()
+                .ok_or_else(|| {
+                    Error::from(MetalError::Ffi(
+                        "Failed to create compute encoder".into(),
+                    ))
+                })?;
+            
+            encoder.setComputePipelineState(&inner.pipelines.quantized_matmul_backward);
+            encoder.setBuffer_offset_atIndex(Some(dy_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(b_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&scales_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(dx_buf), 0, 3);
+            
+            let m_i = m as i32;
+            let n_i = n as i32;
+            let k_i = k as i32;
+            unsafe {
+                encoder.setBytes_length_atIndex(&m_i as *const i32 as *const std::ffi::c_void, 4, 4);
+                encoder.setBytes_length_atIndex(&n_i as *const i32 as *const std::ffi::c_void, 4, 5);
+                encoder.setBytes_length_atIndex(&k_i as *const i32 as *const std::ffi::c_void, 4, 6);
+            }
+            
+            // Grid: (k/16) threadgroups in x, (m/16) in y, 1 in z
+            // Each thread Computes dx[row, k_idx] for row < m, k_idx < k
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize::new(((k + 15) / 16) as u64, ((m + 15) / 16) as u64, 1),
+                MTLSize::new(16, 16, 1),
+            );
+            encoder.endEncoding();
+            
+            return Ok((dx_storage, Box::new(MetalHandle { command_buffer: cmd })));
+        }
+        
+        // Non-Apple fallback to CPU
+        // CPU fallback implementation for quantized matmul backward
+        let dy_vec = dy.to_cpu_vec_f32()?;
+        let b_bytes = b_packed.to_cpu_vec_f32()?;
+        let mut dx = vec![0.0f32; m * k];
+        let blocks_per_col = k / 32;
+        
+        for row in 0..m {
+            for ki in 0..k {
+                let block = ki / 32;
+                let in_block = ki % 32;
+                let mut sum = 0.0f32;
+                for col in 0..n {
+                    let idx = (col * blocks_per_col + block) * 32 + in_block;
+                    let q = b_bytes.get(idx).copied().unwrap_or(0.0);
+                    let scale = b_scales.get(col * blocks_per_col + block).copied().unwrap_or(1.0);
+                    sum += dy_vec[row * n + col] * q * scale;
+                }
+                dx[row * k + ki] = sum;
+            }
+        }
+        Ok((self.from_cpu(&dx, out_shape, DType::F32)?, Box::new(MetalHandle)))
     }
 
     fn estimate_gemm_latency_ms(

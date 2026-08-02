@@ -74,6 +74,222 @@ pub struct SelectedBackend {
     device_impl: Arc<dyn BackendDevice>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrainingRank {
+    pub rank: usize,
+    pub ordinal: usize,
+    pub gcn_arch: String,
+    pub vram_bytes: u64,
+    pub weight_share: f32,
+}
+
+/// Rank-local execution context. Model providers, tapes, registries, and
+/// optimizers must be owned by the rank that uses them; this type deliberately
+/// carries no shared mutable training state.
+#[derive(Debug, Clone)]
+pub struct RankContext {
+    pub rank: TrainingRank,
+    pub backend: SelectedBackend,
+    pub dataset_rank: usize,
+    pub dataset_world_size: usize,
+}
+
+impl RankContext {
+    pub fn new(rank: TrainingRank, backend: SelectedBackend, world_size: usize) -> Result<Self, SelectionError> {
+        if rank.rank >= world_size || world_size == 0 {
+            return Err(SelectionError::Tensor(format!(
+                "rank {} is invalid for world size {}",
+                rank.rank, world_size
+            )));
+        }
+        Ok(Self {
+            dataset_rank: rank.rank,
+            dataset_world_size: world_size,
+            rank,
+            backend,
+        })
+    }
+
+    /// Create the rank's deterministic JSONL shard with its capability-sized
+    /// micro-batch. `local_batch` must come from `allocate_batch_sizes`; it is
+    /// passed explicitly so independently constructed rank contexts cannot
+    /// accidentally round to a batch larger than the requested global batch.
+    pub fn make_dataloader(
+        &self,
+        path: &str,
+        tokenizer: grim_format::tokenizer::GgufTokenizer,
+        seq_len: usize,
+        local_batch: usize,
+    ) -> grim_tensor::error::Result<crate::dataloader::JsonlBatchIterator> {
+        crate::dataloader::JsonlBatchIterator::new_sharded(
+            path,
+            tokenizer,
+            seq_len,
+            local_batch,
+            self.dataset_rank,
+            self.dataset_world_size,
+        )
+    }
+}
+
+/// Allocate an exact global batch across ranks using largest-remainder
+/// rounding. This avoids dropping or duplicating samples when asymmetric
+/// shares produce fractional micro-batches.
+pub fn allocate_batch_sizes(ranks: &[TrainingRank], global_batch: usize) -> Vec<usize> {
+    if ranks.is_empty() || global_batch == 0 {
+        return vec![0; ranks.len()];
+    }
+    let mut sizes: Vec<usize> = ranks
+        .iter()
+        .map(|rank| (global_batch as f32 * rank.weight_share).floor() as usize)
+        .collect();
+    if global_batch >= ranks.len() {
+        for size in &mut sizes {
+            *size = (*size).max(1);
+        }
+    }
+    let mut assigned: usize = sizes.iter().sum();
+    let initial_assigned = assigned;
+    let mut order: Vec<(usize, f32)> = ranks
+        .iter()
+        .enumerate()
+        .map(|(i, rank)| (i, global_batch as f32 * rank.weight_share - sizes[i] as f32))
+        .collect();
+    order.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    while assigned < global_batch {
+        let index = order[(assigned - initial_assigned) % order.len()].0;
+        sizes[index] += 1;
+        assigned += 1;
+    }
+    while assigned > global_batch {
+        if let Some(index) = order.iter().rev().map(|entry| entry.0).find(|&i| sizes[i] > 0) {
+            sizes[index] -= 1;
+            assigned -= 1;
+        } else {
+            break;
+        }
+    }
+    sizes
+}
+
+/// Return the exact integer batch assigned to each rank context. Keeping this
+/// helper next to dataloader construction makes the invariant explicit:
+/// `sum(result) == global_batch` whenever the global batch can be represented.
+pub fn allocate_context_batch_sizes(
+    contexts: &[RankContext],
+    global_batch: usize,
+) -> Vec<usize> {
+    let ranks: Vec<TrainingRank> = contexts.iter().map(|context| context.rank.clone()).collect();
+    allocate_batch_sizes(&ranks, global_batch)
+}
+
+/// Execute one rank closure per OS thread and retain rank order in the
+/// results. HIP/RCCL collectives require every rank to enter the collective;
+/// sequentially iterating these closures would deadlock or silently reduce
+/// only one participant.
+pub fn run_concurrent_ranks<T, F>(jobs: Vec<F>) -> Vec<Result<T, String>>
+where
+    T: Send,
+    F: FnOnce() -> Result<T, String> + Send,
+{
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .into_iter()
+            .map(|job| scope.spawn(job))
+            .collect();
+        handles
+            .into_iter()
+            .enumerate()
+            .map(|(rank, handle)| match handle.join() {
+                Ok(result) => result,
+                Err(_) => Err(format!("rank {rank} panicked during execution")),
+            })
+            .collect()
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrainingGpu {
+    pub ordinal: usize,
+    pub gcn_arch: String,
+    pub vram_bytes: u64,
+}
+
+pub fn build_training_ranks(gpus: &[TrainingGpu]) -> Vec<TrainingRank> {
+    let total: u128 = gpus.iter().map(|gpu| gpu.vram_bytes as u128).sum();
+    let equal = 1.0 / gpus.len().max(1) as f32;
+    gpus.iter()
+        .enumerate()
+        .map(|(rank, gpu)| TrainingRank {
+            rank,
+            ordinal: gpu.ordinal,
+            gcn_arch: gpu.gcn_arch.clone(),
+            vram_bytes: gpu.vram_bytes,
+            weight_share: if total == 0 {
+                equal
+            } else {
+                gpu.vram_bytes as f32 / total as f32
+            },
+        })
+        .collect()
+}
+
+/// Enumerate the live ROCm devices and capture the capabilities used for
+/// data-parallel scheduling.  VRAM is read after selecting each ordinal so
+/// mixed cards get proportional work shares instead of assuming symmetry.
+pub fn enumerate_training_gpus() -> Result<Vec<TrainingGpu>, SelectionError> {
+    let devices = grim_backend_rocm::RocmDevice::probe()
+        .map_err(|e| SelectionError::Tensor(format!("ROCm probe failed: {e}")))?;
+    let mut gpus = Vec::with_capacity(devices.len());
+    for device in devices {
+        let ordinal = device.ordinal();
+        let gcn_arch = grim_backend_rocm::probe_host_gpu(ordinal)
+            .map(|caps| caps.gcn)
+            .unwrap_or_else(|_| "unknown".into());
+        let vram_bytes = grim_backend_rocm::vram_info(ordinal).1;
+        gpus.push(TrainingGpu {
+            ordinal,
+            gcn_arch,
+            vram_bytes,
+        });
+    }
+    Ok(gpus)
+}
+
+/// Validate and construct the rank plan requested by a training job.
+/// Multi-GPU training is ROCm-only because the gradient collective is RCCL.
+pub fn plan_training_ranks(requested: usize) -> Result<Vec<RankContext>, SelectionError> {
+    let gpus = enumerate_training_gpus()?;
+    if requested == 0 {
+        return Err(SelectionError::Tensor("requested GPU count must be greater than zero".into()));
+    }
+    if requested > gpus.len() {
+        return Err(SelectionError::Tensor(format!(
+            "requested {requested} GPUs, but only {} ROCm device(s) are available",
+            gpus.len()
+        )));
+    }
+    let ranks = build_training_ranks(&gpus[..requested]);
+    build_rank_contexts(&ranks)
+}
+
+/// Construct one rank-local backend for every planned GPU. This is intentionally
+/// separate from `select_backend`, whose contract is single-device fallback.
+pub fn build_rank_contexts(ranks: &[TrainingRank]) -> Result<Vec<RankContext>, SelectionError> {
+    let world_size = ranks.len();
+    if world_size == 0 {
+        return Err(SelectionError::Tensor("cannot build an empty rank plan".into()));
+    }
+    ranks
+        .iter()
+        .cloned()
+        .map(|rank| {
+            let backend = select_rocm_rank(rank.ordinal)?;
+            RankContext::new(rank, backend, world_size)
+        })
+        .collect()
+}
+
 impl std::fmt::Debug for SelectedBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SelectedBackend")
@@ -423,6 +639,24 @@ pub fn select_backend(preferred: Option<PreferredBackend>) -> SelectedBackend {
     try_build(&PreferredBackend::Cpu).expect("CPU backend must always be available")
 }
 
+/// Construct a concrete ROCm backend for a validated rank ordinal.
+/// `select_backend` intentionally remains the single-device UI fallback; the
+/// multi-rank worker uses this explicit constructor after admission checks.
+pub fn select_rocm_rank(ordinal: usize) -> Result<SelectedBackend, SelectionError> {
+    let devices = grim_backend_rocm::RocmDevice::probe()
+        .map_err(|e| SelectionError::Tensor(e.to_string()))?;
+    if !devices.iter().any(|device| device.ordinal() == ordinal) {
+        return Err(SelectionError::PreferredUnavailable(PreferredBackend::Rocm));
+    }
+    let device = grim_backend_rocm::RocmDevice::try_new(ordinal)
+        .map_err(|e| SelectionError::Tensor(e.to_string()))?;
+    Ok(SelectedBackend {
+        device: Device::Rocm(ordinal),
+        label: format!("rocm:{ordinal}"),
+        device_impl: Arc::new(device),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,5 +697,73 @@ mod tests {
             PreferredBackend::from_str_opt("bogus"),
             PreferredBackend::Auto
         );
+    }
+
+    #[test]
+    fn training_rank_shares_follow_vram_and_sum_to_one() {
+        let gpus = vec![
+            TrainingGpu {
+                ordinal: 0,
+                gcn_arch: "gfx1200".into(),
+                vram_bytes: 16,
+            },
+            TrainingGpu {
+                ordinal: 1,
+                gcn_arch: "gfx1200".into(),
+                vram_bytes: 8,
+            },
+        ];
+        let ranks = build_training_ranks(&gpus);
+        assert_eq!(ranks[0].weight_share, 2.0 / 3.0);
+        assert_eq!(ranks[1].weight_share, 1.0 / 3.0);
+        assert!((ranks.iter().map(|r| r.weight_share).sum::<f32>() - 1.0).abs() < 1e-6);
+        assert_eq!(allocate_batch_sizes(&ranks, 12), vec![8, 4]);
+        assert_eq!(allocate_batch_sizes(&ranks, 1), vec![1, 0]);
+    }
+
+    #[test]
+    fn context_batch_allocation_is_exact_for_asymmetric_ranks() {
+        let ranks = vec![
+            TrainingRank {
+                rank: 0,
+                ordinal: 0,
+                gcn_arch: "gfx1200".into(),
+                vram_bytes: 16,
+                weight_share: 2.0 / 3.0,
+            },
+            TrainingRank {
+                rank: 1,
+                ordinal: 1,
+                gcn_arch: "gfx1200".into(),
+                vram_bytes: 8,
+                weight_share: 1.0 / 3.0,
+            },
+        ];
+        let contexts: Vec<RankContext> = ranks
+            .into_iter()
+            .map(|rank| {
+                RankContext::new(
+                    rank,
+                    SelectedBackend {
+                        device: Device::Cpu,
+                        label: "cpu".into(),
+                        device_impl: Arc::new(CpuDevice::new()),
+                    },
+                    2,
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(allocate_context_batch_sizes(&contexts, 12), vec![8, 4]);
+        assert_eq!(allocate_context_batch_sizes(&contexts, 1), vec![1, 0]);
+    }
+
+    #[test]
+    fn concurrent_rank_runner_preserves_rank_order() {
+        let results = run_concurrent_ranks(vec![
+            || Ok::<_, String>(3usize),
+            || Ok::<_, String>(5usize),
+        ]);
+        assert_eq!(results, vec![Ok(3), Ok(5)]);
     }
 }
