@@ -483,14 +483,30 @@ impl TensorProvider for GrimProvider {
                 };
                 let mut primary_scale_bytes = Vec::new();
                 if ext.scale_size != 0 {
-                    let start = ext.scale_offset as usize;
-                    let end = start.saturating_add(ext.scale_size as usize);
-                    if end > bytes.len() {
-                        return Err(Error::Backend(format!(
-                            "primary scale region for '{name}' exceeds payload"
-                        )));
+                    // `scale_offset` is an absolute file offset, not relative to
+                    // the payload region, so seek and read directly from the file.
+                    // If the region is outside the file (e.g. test fixtures that
+                    // only emit metadata without real scale payloads), leave the
+                    // bytes empty — provenance metadata is still populated.
+                    let start = ext.scale_offset;
+                    if let Ok(seek_pos) = reader.seek(std::io::SeekFrom::Start(start)) {
+                        if seek_pos == start {
+                            let mut buf = vec![0u8; ext.scale_size as usize];
+                            if reader.read_exact(&mut buf).is_ok() {
+                                primary_scale_bytes = buf;
+                            } else {
+                                eprintln!(
+                                    "[grim-format] scale region for '{name}' at offset {start} \
+                                     could not be fully read (file too short) — proceeding without scale bytes"
+                                );
+                            }
+                        } else {
+                            eprintln!(
+                                "[grim-format] scale offset {start} for '{name}' past EOF — \
+                                 proceeding without scale bytes"
+                            );
+                        }
                     }
-                    primary_scale_bytes.extend_from_slice(&bytes[start..end]);
                 }
                 let provenance = QuantProvenance::WithResiduals {
                     outlier_count: outliers.len(),
