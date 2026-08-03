@@ -4,117 +4,105 @@
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
-    /// Whisper cross-attention: dec_step_q @ enc_K^T → softmax → @ enc_V → project.
+    /// Whisper cross-attention: softmax(Q @ K^T / sqrt(head_dim)) @ V.
     ///
-    /// Q dec_step shape: [1, num_heads, head_dim]  (one query position per block)
-    /// K/V encoder shape: [enc_seq, num_heads_k, head_dim]  (reused across decoder steps)
-    /// O projection shape: [d_model, d_model]  (applied after attention accumulation)
+    /// Q:  [seq_len_q, num_heads, head_dim]       (row-major, stride = num_heads * head_dim)
+    /// K:  [seq_len_k, num_heads_k, head_dim]     (row-major, stride = num_heads_k * head_dim)
+    /// V:  [seq_len_k, num_heads_k, head_dim]     (row-major, stride = num_heads_k * head_dim)
+    /// out: [seq_len_q, num_heads, head_dim]      (row-major, stride = num_heads * head_dim)
     ///
-    /// GQA: num_heads_k divides num_heads evenly. Cross-attention typically
-    /// uses num_heads_k == num_heads (full cross-attention) or fewer for GQA.
+    /// GQA: num_heads_k divides num_heads evenly. Each group of
+    /// (num_heads/num_heads_k) query heads shares the same K/V projection.
+    ///
+    /// Full (non-causal) cross-attention: every query attends to every
+    /// encoder position. The output projection W_o is applied on the host.
+    ///
+    /// Launch geometry: one block per (q_pos, head) row. blockIdx.x indexes
+    /// the flat (seq_len_q * num_heads) grid; blockDim.x may be any power of
+    /// two >= head_dim. Shared memory holds the raw scores [seq_len_k] plus
+    /// two per-block partial-reduction arrays of size blockDim.x.
     __global__ void grim_cross_attention(
-        const float* __restrict__ Q_dec,         // [num_heads, head_dim]  query at this dec step
-        const float* __restrict__ K_encoder,      // [enc_seq, num_heads_k, head_dim]  encoder keys
-        const float* __restrict__ V_encoder,      // [enc_seq, num_heads_k, head_dim]  encoder values
-        const float* __restrict__ W_o,            // [d_model, d_model]  output projection weights
-        float* __restrict__ out,                  // [d_model]  output projection result
-        float* __restrict__ attn_weights,         // [num_heads, enc_seq]  optional attention weights debug buffer
-        int enc_seq,                              // encoder sequence length
+        const float* __restrict__ Q,      // [seq_len_q, num_heads, head_dim]
+        const float* __restrict__ K,      // [seq_len_k, num_heads_k, head_dim]
+        const float* __restrict__ V,      // [seq_len_k, num_heads_k, head_dim]
+        float* __restrict__ out,          // [seq_len_q, num_heads, head_dim]
+        int seq_len_q,
+        int seq_len_k,
         int num_heads,
-        int num_heads_k,
+        int num_heads_k,                  // GQA: num_heads_k <= num_heads
         int head_dim,
-        float scale)                              // 1.0f / sqrt(head_dim)
+        float scale)                      // 1.0f / sqrt(head_dim)
     {
-        // One thread block per query head.
-        // ThreadIdx.x within block covers the encoder sequence dimension.
-        int head = blockIdx.x;
-        int enc_idx = threadIdx.x;
-        if (enc_idx >= enc_seq) return;
-        if (head >= num_heads) return;
-
+        // One block per (query position, head) row.
+        const int row = (int)blockIdx.x;
+        const int q_pos = row / num_heads;
+        const int head = row % num_heads;
         const int kv_head = head % num_heads_k;
-        const int q_offset = head * head_dim;
-        const int kv_offset = kv_head * head_dim;
+        const int tid = (int)threadIdx.x;
+        const int bdim = (int)blockDim.x;
 
-        // Compute Q @ K^T for this (head, enc_pos) pair.
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-            dot += Q_dec[q_offset + d] * K_encoder[enc_idx * (num_heads_k * head_dim) + kv_offset + d];
-        }
-        dot *= scale;
+        // Shared memory layout: scores[seq_len_k] | red_max[bdim] | red_sum[bdim]
+        extern __shared__ float smem[];
+        float* scores = smem;                      // [seq_len_k]
+        float* red_max = smem + seq_len_k;         // [bdim]
+        float* red_sum = red_max + bdim;           // [bdim]
 
-        // Store raw attention weight (caller handles softmax normalization across enc_seq).
-        // For this v1 kernel, we write unnormalized weights; the host or a follow-up
-        // reduction kernel softmaxes across enc_seq. Alternatively, embed online softmax
-        // if enc_seq is small enough for a single-pass approach.
-        attn_weights[head * enc_seq + enc_idx] = dot;
-    }
+        const int q_base = q_pos * (num_heads * head_dim) + head * head_dim;
+        const int kv_base = kv_head * head_dim;
 
-    /// Whisper cross-attention with inline softmax (single-pass).
-    /// One block per query head; each thread processes one encoder position.
-    /// Uses online softmax (running max + sum) across the encoder sequence dimension.
-    __global__ void grim_cross_attention_softmax(
-        const float* __restrict__ Q_dec,
-        const float* __restrict__ K_encoder,
-        const float* __restrict__ V_encoder,
-        const float* __restrict__ W_o,
-        float* __restrict__ out,
-        int enc_seq,
-        int num_heads,
-        int num_heads_k,
-        int head_dim,
-        float scale)
-    {
-        int head = blockIdx.x;
-        if (head >= num_heads) return;
-
-        const int kv_head = head % num_heads_k;
-        const int q_offset = head * head_dim;
-        const int kv_offset = kv_head * head_dim;
-
-        // Each thread block handles one head; threads cooperatively scan enc_seq.
-        // Use shared memory for partial max/sum reduction across wavefront.
-        extern __shared__ float sdata[];
-        float* s_max = sdata;           // blockDim.x elements
-        float* s_sum = sdata + blockDim.x; // blockDim.x elements
-
-        float thread_max = -1.0f / 0.0f;
-        float thread_sum = 0.0f;
-
-        // First pass: compute unnormalized attention scores and track running max/sum.
-        for (int s = threadIdx.x; s < enc_seq; s += blockDim.x) {
+        // Pass 1: scores[q_pos, j] = dot(Q[row, :], K[j, kv_head, :]) * scale
+        for (int j = tid; j < seq_len_k; j += bdim) {
+            const int kb = j * (num_heads_k * head_dim) + kv_base;
             float dot = 0.0f;
             for (int d = 0; d < head_dim; ++d) {
-                dot += Q_dec[q_offset + d] * K_encoder[s * (num_heads_k * head_dim) + kv_offset + d];
+                dot += Q[q_base + d] * K[kb + d];
             }
-            dot *= scale;
-
-            float new_max = fmaxf(thread_max, dot);
-            thread_sum = thread_sum * expf(thread_max - new_max) + expf(dot - new_max);
-            thread_max = new_max;
-
-            // Store normalized weight in shared memory for second pass.
-            sdata[threadIdx.x + (s / blockDim.x) * blockDim.x] = dot;
+            scores[j] = dot * scale;
         }
-
-        // Reduce max/sum across sub-warps (simplified: single thread block handles one head).
-        float block_max = thread_max;
-        float block_sum = thread_sum;
         __syncthreads();
 
-        float inv_sum = (block_sum > 0.0f) ? (1.0f / block_sum) : 0.0f;
-
-        // Second pass: compute weighted sum of V.
-        float acc = 0.0f;
-        for (int s = threadIdx.x; s < enc_seq; s += blockDim.x) {
-            float attn_w = expf(sdata[threadIdx.x + (s / blockDim.x) * blockDim.x] - block_max) * inv_sum;
-            float v_val = V_encoder[s * (num_heads_k * head_dim) + kv_offset + threadIdx.x % head_dim];
-            acc += attn_w * v_val;
+        // Pass 2a: block max of scores (strided partials, then tree reduction).
+        float local_max = -1.0f / 0.0f;
+        for (int j = tid; j < seq_len_k; j += bdim) {
+            local_max = fmaxf(local_max, scores[j]);
         }
+        red_max[tid] = local_max;
+        __syncthreads();
+        for (int s = bdim >> 1; s > 0; s >>= 1) {
+            if (tid < s) {
+                red_max[tid] = fmaxf(red_max[tid], red_max[tid + s]);
+            }
+            __syncthreads();
+        }
+        const float max_v = red_max[0];
+        __syncthreads();
 
-        // Write accumulated value to output (host applies W_o projection or this kernel does it inline).
-        // For this v1 kernel, we write per-head accumulations; host applies W_o.
-        out[head * head_dim + (threadIdx.x % head_dim)] = acc;
+        // Pass 2b: exp(scores - max) and block sum.
+        float local_sum = 0.0f;
+        for (int j = tid; j < seq_len_k; j += bdim) {
+            scores[j] = expf(scores[j] - max_v);
+            local_sum += scores[j];
+        }
+        red_sum[tid] = local_sum;
+        __syncthreads();
+        for (int s = bdim >> 1; s > 0; s >>= 1) {
+            if (tid < s) {
+                red_sum[tid] += red_sum[tid + s];
+            }
+            __syncthreads();
+        }
+        const float inv_sum = (red_sum[0] > 0.0f) ? (1.0f / red_sum[0]) : 0.0f;
+        __syncthreads();
+
+        // Pass 3: each thread produces one output dim of the row.
+        if (tid < head_dim) {
+            const int o_idx = q_base + tid;
+            float acc = 0.0f;
+            for (int j = 0; j < seq_len_k; ++j) {
+                acc += scores[j] * V[j * (num_heads_k * head_dim) + kv_base + tid];
+            }
+            out[o_idx] = acc * inv_sum;
+        }
     }
 
 }
@@ -127,7 +115,7 @@ mod tests {
     #[test]
     fn cross_attention_source_contains_entries() {
         assert!(KERNEL_SOURCE.contains("grim_cross_attention"));
-        assert!(KERNEL_SOURCE.contains("grim_cross_attention_softmax"));
         assert!(KERNEL_SOURCE.contains("encoder"));
+        assert!(KERNEL_SOURCE.contains("dot"));
     }
 }

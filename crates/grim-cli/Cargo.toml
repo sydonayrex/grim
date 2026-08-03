@@ -6,6 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 description = "Grim CLI — run, bench, quantize, plugin management."
 
+[[bin]]
+name = "grim-cli"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 grim-tensor = { workspace = true }
 grim-tensor-graph = { workspace = true }
@@ -36,6 +43,7 @@ sha2 = "0.10"
 zstd = "0.13"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
+rand = { workspace = true }
 
 
 [dev-dependencies]

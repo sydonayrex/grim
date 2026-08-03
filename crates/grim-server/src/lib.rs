@@ -943,50 +943,66 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     let models = engine.loaded_models();
 
     // Probe VRAM via platform-specific backend
-    let (total_vram_used, total_vram_max, gpu_info) =
-        if let Ok(rocm_devs) = grim_backend_rocm::RocmDevice::probe() {
-            if !rocm_devs.is_empty() {
-                probe_vram_and_gpus(rocm_devs.len())
-            } else if let Ok(cuda_devs) = grim_backend_cuda::CudaDevice::probe() {
-                if !cuda_devs.is_empty() {
-                    probe_cuda_vram(cuda_devs.len())
-                } else if let Some((free, total)) = grim_backend_metal::vram_info(0) {
-                    (total - free, total, vec![serde_json::json!({
-                        "name": "Metal GPU",
-                        "index": 0u32,
-                        "memory": if total > 0 { ((total - free) as f64 / total as f64 * 100.0) as u32 } else { 0 }
-                    })])
-                } else {
-                    (0, 0, vec![])
-                }
-            } else {
-                (0, 0, vec![])
-            }
+    let (total_vram_used, total_vram_max, gpu_info) = if let Ok(rocm_devs) =
+        grim_backend_rocm::RocmDevice::probe()
+    {
+        if !rocm_devs.is_empty() {
+            probe_vram_and_gpus(rocm_devs.len())
         } else if let Ok(cuda_devs) = grim_backend_cuda::CudaDevice::probe() {
             if !cuda_devs.is_empty() {
                 probe_cuda_vram(cuda_devs.len())
             } else if let Some((free, total)) = grim_backend_metal::vram_info(0) {
-                (total - free, total, vec![serde_json::json!({
-                    "name": "Metal GPU",
-                    "index": 0u32,
-                    "memory": if total > 0 { ((total - free) as f64 / total as f64 * 100.0) as u32 } else { 0 }
-                })])
+                (
+                    total - free,
+                    total,
+                    vec![serde_json::json!({
+                        "name": "Metal GPU",
+                        "index": 0u32,
+                        "memory": if total > 0 { ((total - free) as f64 / total as f64 * 100.0) as u32 } else { 0 }
+                    })],
+                )
             } else {
                 (0, 0, vec![])
             }
+        } else {
+            (0, 0, vec![])
+        }
+    } else if let Ok(cuda_devs) = grim_backend_cuda::CudaDevice::probe() {
+        if !cuda_devs.is_empty() {
+            probe_cuda_vram(cuda_devs.len())
         } else if let Some((free, total)) = grim_backend_metal::vram_info(0) {
-            (total - free, total, vec![serde_json::json!({
+            (
+                total - free,
+                total,
+                vec![serde_json::json!({
+                    "name": "Metal GPU",
+                    "index": 0u32,
+                    "memory": if total > 0 { ((total - free) as f64 / total as f64 * 100.0) as u32 } else { 0 }
+                })],
+            )
+        } else {
+            (0, 0, vec![])
+        }
+    } else if let Some((free, total)) = grim_backend_metal::vram_info(0) {
+        (
+            total - free,
+            total,
+            vec![serde_json::json!({
                 "name": "Metal GPU",
                 "index": 0u32,
                 "memory": if total > 0 { ((total - free) as f64 / total as f64 * 100.0) as u32 } else { 0 }
-            })])
-        } else {
-            (0, 0, vec![])
-        };
+            })],
+        )
+    } else {
+        (0, 0, vec![])
+    };
 
     let has_gpu = total_vram_max > 0;
     let processor = if has_gpu {
-        gpu_info.first().and_then(|g| g.get("name").and_then(|n| n.as_str())).unwrap_or("GPU")
+        gpu_info
+            .first()
+            .and_then(|g| g.get("name").and_then(|n| n.as_str()))
+            .unwrap_or("GPU")
     } else {
         "CPU"
     };
@@ -995,7 +1011,8 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     let (sys_ram_used, sys_ram_total) = probe_sys_ram();
 
     // KV cache telemetry and context limit
-    let (kv_used_bytes, kv_total_bytes, kv_blocks_used, kv_blocks_total) = engine.kv_cache_telemetry();
+    let (kv_used_bytes, kv_total_bytes, kv_blocks_used, kv_blocks_total) =
+        engine.kv_cache_telemetry();
     let ctx_limit = 8192usize;
 
     // Compute GPU utilization percentages

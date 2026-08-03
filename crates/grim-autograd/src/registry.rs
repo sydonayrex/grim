@@ -73,6 +73,32 @@ impl AutogradRegistry {
                 .collect();
             let zero_b: Vec<f32> = vec![0.0f32; b_rows * b_cols];
 
+            // SPECTRAL-QLORA override: use the well-conditioned 2D-dependent
+            // seed formula from SoulEaterAdapter instead of the flat-index
+            // default_a / zero_b, so that Newton-Schulz and Gram-Schmidt have
+            // a full-rank matrix to orthogonalize. The standard LoRA defaults
+            // are kept for non-SpectralQLoRA paths (A is Kaiming random,
+            // B is zero so the adapter starts as identity).
+            let (spectral_a, spectral_b) = if config.use_spectral_qlora {
+                let s_a: Vec<f32> = (0..(a_rows * a_cols))
+                    .map(|idx| {
+                        let row = idx / a_cols;
+                        let col = idx % a_cols;
+                        ((((row + 1) * 17 + (col + 1) * 31) % 100) as f32 / 100.0) - 0.5
+                    })
+                    .collect();
+                let s_b: Vec<f32> = (0..(b_rows * b_cols))
+                    .map(|idx| {
+                        let row = idx / b_cols;
+                        let col = idx % b_cols;
+                        ((((row + 1) * 13 + (col + 1) * 29) % 100) as f32 / 100.0) - 0.5
+                    })
+                    .collect();
+                (s_a, s_b)
+            } else {
+                (default_a.clone(), zero_b.clone())
+            };
+
             // PiSSA: initialize A/B from the base weight's principal
             // singular components. The base weight is [out, in] =
             // [b_rows, a_cols]; pissa returns a = [rank, in],
@@ -86,12 +112,74 @@ impl AutogradRegistry {
                         (a, b)
                     }
                     // No base weight yet (pre-WI-T8 worker): fall back to
-                    // the default Kaiming A / zero B rather than failing,
-                    // so training still starts with plain LoRA init.
-                    None => (default_a, zero_b),
+                    // the well-conditioned spectral seed (if SpectralQLoRA) or
+                    // the default Kaiming A / zero B otherwise.
+                    None => {
+                        if config.use_spectral_qlora {
+                            (spectral_a, spectral_b)
+                        } else {
+                            (default_a, zero_b)
+                        }
+                    }
                 }
+            } else if config.use_spectral_qlora {
+                // SpectralQLoRA: start from the well-conditioned 2D-dependent
+                // seed so Newton-Schulz has a full-rank matrix to orthogonalize.
+                (spectral_a, spectral_b)
             } else {
                 (default_a, zero_b)
+            };
+
+            // SPECTRAL-QLORA: orthogonal adapter initialization.
+            // Apply subspace Newton-Schulz orthogonalization once at adapter
+            // creation so that AB is semi-orthogonal in the dominant subspace.
+            // This reuses `grim-quant::soul_eater::subspace_newton_schulz_step`
+            // for the Gram-matrix-based orthogonality check, matching
+            // SoulEaterAdapter's init pattern. When Newton-Schulz cannot
+            // converge (ill-conditioned seed or iteration cap reached), fall
+            // back to modified Gram-Schmidt which always yields orthonormal
+            // columns.
+            let (a_data, b_data) = if config.use_spectral_qlora {
+                let mut a_data = a_data;
+                let mut b_data = b_data;
+
+                // B [b_rows, b_cols] = [out, rank] is tall/thin → Newton-Schulz
+                // directly to make columns orthonormal (B^T * B ≈ I).
+                let ns_ok = grim_quant::soul_eater::subspace_newton_schulz_step(
+                    &mut b_data,
+                    b_rows,
+                    b_cols,
+                    10,
+                );
+                if ns_ok.map_or(true, |iters| iters >= 10) {
+                    crate::injection::orthogonalize_columns(&mut b_data, b_rows, b_cols);
+                }
+
+                // A [a_rows, a_cols] = [rank, in] is wide/thin. Transpose to
+                // [in, rank] (tall/thin), orthogonalize, then transpose back so
+                // rows of A become orthonormal: A * A^T ≈ I.
+                let mut a_t = vec![0.0f32; a_cols * a_rows];
+                for row in 0..a_cols {
+                    for col in 0..a_rows {
+                        a_t[row * a_rows + col] = a_data[col * a_cols + row];
+                    }
+                }
+                let ns_ok = grim_quant::soul_eater::subspace_newton_schulz_step(
+                    &mut a_t, a_cols, a_rows, 10,
+                );
+                if ns_ok.map_or(true, |iters| iters >= 10) {
+                    crate::injection::orthogonalize_columns(&mut a_t, a_cols, a_rows);
+                }
+                // Transpose back into a_data.
+                for row in 0..a_cols {
+                    for col in 0..a_rows {
+                        a_data[col * a_cols + row] = a_t[row * a_rows + col];
+                    }
+                }
+
+                (a_data, b_data)
+            } else {
+                (a_data, b_data)
             };
 
             let a_tensor = cpu_tensor(a_data, Shape::new(vec![a_rows, a_cols]));
@@ -153,5 +241,145 @@ impl AutogradRegistry {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::injection::{
+        InjectionConfig, LoRAInjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry,
+    };
+
+    fn cfg() -> InjectionConfig {
+        InjectionConfig {
+            hidden_size: 8,
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 4,
+            intermediate_size: 16,
+            vocab_size: 32,
+        }
+    }
+
+    #[test]
+    fn spectral_qlora_init_makes_b_semi_orthogonal() {
+        // When use_spectral_qlora is true, B [out, rank] should be initialized
+        // with semi-orthogonal columns (B^T * B ≈ I).
+        let cfg = cfg();
+        let mut inj_reg = LoRAInjectionRegistry::new();
+        let mut ic = LoRAInjectionConfig::new(
+            LoRAInjectionPoint::QProj,
+            0,
+            1,
+            4, // rank
+            16.0,
+        );
+        ic.use_spectral_qlora = true;
+        inj_reg.add(ic);
+
+        let reg = AutogradRegistry::new(cfg, inj_reg).unwrap();
+
+        // Get the B param for QProj layer 0, adapter 1.
+        let pid_b = ParamId::b(0, 1, LoRAInjectionPoint::QProj);
+        let b_param = reg.params.get(pid_b).expect("B param must exist");
+        let b_data = b_param.data.to_vec_f32().unwrap();
+        let b_rows = 8; // hidden_size for QProj
+        let b_cols = 4; // rank
+
+        // Compute B^T * B (r x r Gram matrix) and check it's approximately I.
+        let mut gram = vec![0.0f32; b_cols * b_cols];
+        for i in 0..b_cols {
+            for j in 0..b_cols {
+                let mut sum = 0.0f32;
+                for k in 0..b_rows {
+                    sum += b_data[k * b_cols + i] * b_data[k * b_cols + j];
+                }
+                gram[i * b_cols + j] = sum;
+            }
+        }
+
+        // Check diagonal ≈ 1 and off-diagonal ≈ 0.
+        for i in 0..b_cols {
+            for j in 0..b_cols {
+                if i == j {
+                    assert!(
+                        (gram[i * b_cols + j] - 1.0).abs() < 0.2,
+                        "B^T*B diagonal at [{i},{j}] = {} (expected ≈1.0)",
+                        gram[i * b_cols + j]
+                    );
+                } else {
+                    assert!(
+                        gram[i * b_cols + j].abs() < 0.2,
+                        "B^T*B off-diagonal at [{i},{j}] = {} (expected ≈0.0)",
+                        gram[i * b_cols + j]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spectral_qlora_init_makes_a_semi_orthogonal() {
+        // When use_spectral_qlora is true, A [rank, in] should have
+        // orthonormal rows (A * A^T ≈ I) because A^T was orthogonalized.
+        let cfg = cfg();
+        let mut inj_reg = LoRAInjectionRegistry::new();
+        let mut ic = LoRAInjectionConfig::new(
+            LoRAInjectionPoint::QProj,
+            0,
+            1,
+            4, // rank
+            16.0,
+        );
+        ic.use_spectral_qlora = true;
+        inj_reg.add(ic);
+
+        let reg = AutogradRegistry::new(cfg, inj_reg).unwrap();
+
+        let pid_a = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
+        let a_param = reg.params.get(pid_a).expect("A param must exist");
+        let a_data = a_param.data.to_vec_f32().unwrap();
+        let a_rows = 4; // rank
+        let a_cols = 8; // hidden_size for QProj
+
+        // Compute A * A^T (r x r) — should be ≈ I for orthonormal rows.
+        let mut gram = vec![0.0f32; a_rows * a_rows];
+        for i in 0..a_rows {
+            for j in 0..a_rows {
+                let mut sum = 0.0f32;
+                for k in 0..a_cols {
+                    sum += a_data[i * a_cols + k] * a_data[j * a_cols + k];
+                }
+                gram[i * a_rows + j] = sum;
+            }
+        }
+
+        for i in 0..a_rows {
+            for j in 0..a_rows {
+                if i == j {
+                    assert!(
+                        (gram[i * a_rows + j] - 1.0).abs() < 0.2,
+                        "A*A^T diagonal at [{i},{j}] = {} (expected ≈1.0)",
+                        gram[i * a_rows + j]
+                    );
+                } else {
+                    assert!(
+                        gram[i * a_rows + j].abs() < 0.2,
+                        "A*A^T off-diagonal at [{i},{j}] = {} (expected ≈0.0)",
+                        gram[i * a_rows + j]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spectral_qlora_flag_defaults_to_false() {
+        let ic = LoRAInjectionConfig::new(LoRAInjectionPoint::QProj, 0, 1, 4, 16.0);
+        assert!(
+            !ic.use_spectral_qlora,
+            "spectral_qlora should default to false"
+        );
     }
 }

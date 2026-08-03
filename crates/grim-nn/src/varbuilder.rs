@@ -207,10 +207,7 @@ fn materialize_cuda(
 
 #[cfg(feature = "rocm-mem")]
 fn rocm_managed_weight_mode(ordinal: usize, bytes: usize) -> bool {
-    match std::env::var("GRIM_ROCM_MANAGED_WEIGHTS")
-        .ok()
-        .as_deref()
-    {
+    match std::env::var("GRIM_ROCM_MANAGED_WEIGHTS").ok().as_deref() {
         Some("1") | Some("true") | Some("always") => true,
         Some("auto") => {
             let (free, total) = grim_backend_rocm::vram_info(ordinal);
@@ -362,10 +359,18 @@ fn materialize(
                     let dev = RocmDevice::new(*ordinal);
                     let mut storage = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone())?;
                     storage.set_provenance(provenance.clone());
-                    return Ok(Tensor::new(Arc::from(storage), shape, dtype, provenance, device.clone()));
+                    return Ok(Tensor::new(
+                        Arc::from(storage),
+                        shape,
+                        dtype,
+                        provenance,
+                        device.clone(),
+                    ));
                 }
             }
-            return Err(Error::Unimplemented("ResidualPacked inference requires a ROCm device".into()));
+            return Err(Error::Unimplemented(
+                "ResidualPacked inference requires a ROCm device".into(),
+            ));
         }
         if is_q80 {
             if let Device::Rocm(ordinal) = device {
@@ -437,7 +442,6 @@ fn materialize(
         }
         #[cfg(not(feature = "cuda-mem"))]
         let _ = device;
-
     }
 
     let f32s = dequant_to_f32(&raw, &dtype)?;
