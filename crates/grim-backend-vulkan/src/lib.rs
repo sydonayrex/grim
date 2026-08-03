@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::{ArithType, DType, QuantProvenance};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::{BackendDevice, BackendStorage, Shape};
+use grim_tensor::{BackendDevice, BackendStorage, ScythePlacement, Shape};
 
 // Vulkan FFI types and constants
 
@@ -2651,6 +2651,246 @@ impl BackendDevice for VulkanDevice {
             Some(push),
         )?;
         Ok((Box::new(dx), Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    fn all_reduce(
+        &self,
+        inputs: &[&dyn BackendStorage],
+        op: &str,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        if inputs.is_empty() {
+            return Err(Error::Backend("all_reduce: no inputs".into()));
+        }
+        if op != "sum" {
+            return Err(Error::Backend(format!(
+                "all_reduce: only 'sum' supported, got '{op}'"
+            )));
+        }
+        let shape = inputs[0].shape().clone();
+        let dtype = inputs[0].dtype();
+        let total = shape.elem_count();
+        let is_f32 = dtype.arith == ArithType::F32;
+
+        // All inputs must share the same shape.
+        for s in inputs {
+            if s.shape() != &shape {
+                return Err(Error::Backend("all_reduce: input shape mismatch".into()));
+            }
+        }
+
+        // ── GPU fast path: accumulate all inputs into a pre-zeroed output buffer.
+        // The `all_reduce` accumulate kernel does Out[i] += A[i], so we zero the
+        // output once and then dispatch one pass per input tensor.
+        // `run_compute_shader` calls vkQueueWaitIdle, so each pass is synchronous.
+        {
+            let all_vulkan = inputs
+                .iter()
+                .all(|s| s.as_any().downcast_ref::<VulkanStorage>().is_some());
+            if is_f32 && total > 0 && all_vulkan {
+                let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+                if let Some(ctx) = ctx_guard.as_ref() {
+                    if let Ok(out_storage) = VulkanStorage::alloc_gpu(
+                        &shape,
+                        DType::F32,
+                        ctx.device,
+                        ctx.physical_device,
+                    ) {
+                        // Zero the output buffer (accumulation target).
+                        let zeroed = {
+                            let mut mapped: *mut c_void = std::ptr::null_mut();
+                            let res = unsafe {
+                                vkMapMemory(
+                                    ctx.device,
+                                    out_storage.memory,
+                                    0,
+                                    out_storage.bytes as VkDeviceSize,
+                                    0,
+                                    &mut mapped,
+                                )
+                            };
+                            if res == VK_SUCCESS {
+                                unsafe {
+                                    std::ptr::write_bytes(mapped, 0, out_storage.bytes);
+                                    vkUnmapMemory(ctx.device, out_storage.memory);
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if zeroed {
+                            let spirv = spirv_for(VulkanKernel::AllReduce).to_vec();
+                            let grid_x = ((total + 255) / 256) as u32;
+                            let push = push_params(total as u32, 0, 0, 0, 0, 0.0);
+                            let mut ok = true;
+                            for input in inputs {
+                                let in_s = input
+                                    .as_any()
+                                    .downcast_ref::<VulkanStorage>()
+                                    .unwrap();
+                                let buffers = [in_s.buffer, out_storage.buffer];
+                                if run_compute_shader(
+                                    ctx,
+                                    &spirv,
+                                    &buffers,
+                                    grid_x,
+                                    1,
+                                    1,
+                                    Some(push),
+                                )
+                                .is_err()
+                                {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                return Ok((
+                                    Box::new(out_storage),
+                                    Box::new(grim_tensor::backend::ReadyHandle),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        } // ctx_guard dropped — lock released before CPU fallback
+
+        // ── CPU fallback ──────────────────────────────────────────────
+        let mut acc = inputs[0].to_cpu_vec_f32()?;
+        for other in &inputs[1..] {
+            let v = other.to_cpu_vec_f32()?;
+            if v.len() != acc.len() {
+                return Err(Error::Backend(
+                    "all_reduce: input length mismatch during fallback".into(),
+                ));
+            }
+            for (a, b) in acc.iter_mut().zip(v.iter()) {
+                *a += b;
+            }
+        }
+        let storage = self.from_cpu(&acc, &shape, dtype)?;
+        Ok((storage, Box::new(grim_tensor::backend::ReadyHandle)))
+    }
+
+    fn comm_fuse_reduce(
+        &self,
+        partials: &[(&dyn BackendStorage, &ScythePlacement)],
+    ) -> Result<Box<dyn BackendStorage>> {
+        if partials.is_empty() {
+            return Err(Error::Backend("comm_fuse_reduce: no partials".into()));
+        }
+        let dims0 = partials[0].0.shape().dims();
+        let m = dims0[0];
+        let n_total: usize = partials
+            .iter()
+            .map(|(s, _)| s.shape().dims().get(1).copied().unwrap_or(0))
+            .sum();
+        let dtype = partials[0].0.dtype();
+        let is_f32 = dtype.arith == ArithType::F32;
+        let out_shape = Shape::new(vec![m, n_total]);
+
+        // ── GPU fast path: scatter each column shard to its offset.
+        // The `comm_fuse_reduce` kernel copies In[row, col] →
+        // Out[row, col_offset + col] on a pre-zeroed output buffer.
+        {
+            let all_vulkan = partials
+                .iter()
+                .all(|(s, _)| s.as_any().downcast_ref::<VulkanStorage>().is_some());
+            if is_f32 && n_total > 0 && all_vulkan {
+                let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+                if let Some(ctx) = ctx_guard.as_ref() {
+                    if let Ok(out_storage) = VulkanStorage::alloc_gpu(
+                        &out_shape,
+                        DType::F32,
+                        ctx.device,
+                        ctx.physical_device,
+                    ) {
+                        // Zero the output buffer.
+                        let zeroed = {
+                            let mut mapped: *mut c_void = std::ptr::null_mut();
+                            let res = unsafe {
+                                vkMapMemory(
+                                    ctx.device,
+                                    out_storage.memory,
+                                    0,
+                                    out_storage.bytes as VkDeviceSize,
+                                    0,
+                                    &mut mapped,
+                                )
+                            };
+                            if res == VK_SUCCESS {
+                                unsafe {
+                                    std::ptr::write_bytes(mapped, 0, out_storage.bytes);
+                                    vkUnmapMemory(ctx.device, out_storage.memory);
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if zeroed {
+                            let spirv = spirv_for(VulkanKernel::CommFuseReduce).to_vec();
+                            let mut col_offset = 0usize;
+                            let mut ok = true;
+                            for (storage, _placement) in partials {
+                                let s = storage
+                                    .as_any()
+                                    .downcast_ref::<VulkanStorage>()
+                                    .unwrap();
+                                let n_src = s.shape().dims().get(1).copied().unwrap_or(0);
+                                let buffers = [s.buffer, out_storage.buffer];
+                                let grid_x = ((n_src + 15) / 16) as u32;
+                                let grid_y = ((m + 15) / 16) as u32;
+                                let push = push_params(
+                                    n_src as u32,
+                                    col_offset as u32,
+                                    n_total as u32,
+                                    m as u32,
+                                    0,
+                                    0.0,
+                                );
+                                if run_compute_shader(
+                                    ctx,
+                                    &spirv,
+                                    &buffers,
+                                    grid_x,
+                                    grid_y,
+                                    1,
+                                    Some(push),
+                                )
+                                .is_err()
+                                {
+                                    ok = false;
+                                    break;
+                                }
+                                col_offset += n_src;
+                            }
+                            if ok {
+                                return Ok(Box::new(out_storage));
+                            }
+                        }
+                    }
+                }
+            }
+        } // ctx_guard dropped — lock released before CPU fallback
+
+        // ── CPU fallback ──────────────────────────────────────────────
+        let mut assembled = vec![0.0f32; m * n_total];
+        let mut col_offset = 0usize;
+        for (storage, _placement) in partials {
+            let data = storage.to_cpu_vec_f32()?;
+            let n_cols = storage.shape().dims().get(1).copied().unwrap_or(0);
+            for row in 0..m {
+                for col in 0..n_cols {
+                    assembled[row * n_total + col_offset + col] +=
+                        data[row * n_cols + col];
+                }
+            }
+            col_offset += n_cols;
+        }
+        let storage = self.from_cpu(&assembled, &out_shape, dtype)?;
+        Ok(storage)
     }
 }
 

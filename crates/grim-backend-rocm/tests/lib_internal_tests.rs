@@ -27,7 +27,7 @@ fn kernel_source_has_no_duplicate_device_fns() {
     }
 }
 
-/// RED-GREEN-REFACTOR Phase 0 Task 0.2: selective_scan, flash_attention,
+/// RED-GREEN-REFACTOR Phase 0 Task 0.2: selective_scan,
 /// cross_attention, rwkv_time_mix, rwkv_channel_mix must be reachable
 /// via `dyn BackendDevice`, not just the inherent `impl RocmDevice`.
 #[test]

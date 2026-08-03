@@ -1,7 +1,7 @@
 //! Phase-3 §3.5 — Speculative decoding primitives.
 //!
 //! Three CPU-only primitives land in this module, leaving the GPU
-//! kernel plumbing (tree-of-drafts flash attention kernel + the target
+//! kernel plumbing (the target
 //! verifier forward) to the next PR. Per the spec: this PR establishes
 //! the algorithm; the kernel primitives ride the existing
 //! `RocmDevice::qkv_attention` + graph-capture wires.
