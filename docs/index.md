@@ -1,11 +1,11 @@
 # Grim Documentation
 
-Welcome to the Grim documentation. This is a high-performance LLM inference system optimized for AMD GPUs (ROCm) with CUDA and CPU fallback.
+Grim is a pure-Rust inference engine optimized for AMD GPUs (ROCm) with CUDA, Vulkan, Metal, and CPU backends.
 
 ## Getting Started
 
 - **[Onboarding](onboarding.md)** — 5-minute quick start: clone, build, test, serve
-- **[Installation](howto/install-grim.md)** — Install from source or binaries
+- **[Installation Guide](howto/install-grim.md)** — Install from source
 
 ## User Guides
 
@@ -19,24 +19,45 @@ Welcome to the Grim documentation. This is a high-performance LLM inference syst
 
 - **[CLI Reference](cli.md)** — All command-line options
 - **[Configuration](configuration.md)** — Environment variables and config files
-- **[Integrations](integrations.md)** — Hugging Face, Ollama, OpenAI API compatibility
-- **[Data Model](data-model.md)** — Core data structures and formats
-- **[Troubleshoot](troubleshooting.md)** — Common errors and fixes
-- **[Glossary](glossary.md)** — Domain terms
-
-## Architecture
-
 - **[Architecture](architecture.md)** — Workspace design, dependency graph, performance strategy
+- **[Data Model](data-model.md)** — Core data structures and formats
+- **[Integrations](integrations.md)** — HuggingFace, Ollama, OpenAI API compatibility
+- **[Observability](observability.md)** — Metrics, logging, and telemetry
+- **[Troubleshooting](troubleshooting.md)** — Common errors and fixes
+- **[Glossary](glossary.md)** — Domain terms
+- **[Release & Deployment](release.md)** — Build, versioning, and CI
 
 ## Crate Documentation
 
 Each crate has its own README with detailed documentation:
 
-- `grim-core` — Model traits, Session, KvCache
-- `grim-engine` — Engine, tick(), self-tuning
-- `grim-server` — HTTP/OpenAI API server
 - `grim-tensor` — Device, DType, Shape, tensors
-- `grim-backend-*` — GPU backends (ROCm, CUDA, Vulkan, Metal, CPU)
-- `grim-kvquant` — TurboQuant KV compression
 - `grim-tensor-graph` — Fusion patterns
-- See root README for full crate list
+- `grim-quant` — Weight quantization (Q4_K, Q8_0, NF4, FP8, IQ)
+- `grim-format` — GGUF/.grim/Safetensors I/O
+- `grim-backend-cpu` — CPU backend (SIMD, OxiBLAS)
+- `grim-backend-rocm` — ROCm/HIP backend (primary GPU target)
+- `grim-backend-cuda` — CUDA backend (cuBLAS)
+- `grim-backend-vulkan` — Vulkan backend
+- `grim-backend-metal` — Metal backend (Apple)
+- `grim-nn` — Neural network modules
+- `grim-core` — Model traits, Session, KV cache, Sampler
+- `grim-models-transformer` — Transformer model architectures
+- `grim-models-mamba` — Mamba/SSM model architectures
+- `grim-models-vision` — Vision encoder models
+- `grim-models-audio` — Audio encoder models
+- `grim-models-diffusion` — Diffusion model architectures
+- `grim-memory` — Paged KV cache pool, prefix sharing, spilling
+- `grim-kvquant` — Runtime KV cache compression
+- `grim-kvtransport` — Tiered KV transport (GPU → RAM → NVMe)
+- `grim-scheduler` — Continuous-batching scheduler
+- `grim-speculative` — Speculative decoding (DSpark, Native MTP)
+- `grim-autograd` — LoRA/QLoRA backward pass
+- `grim-engine` — Runtime orchestrator
+- `grim-server` — HTTP serving layer
+- `grim-cli` — Command-line interface
+- `grim-disagg` — Disaggregation layer
+- `grim-plugin` — Plugin system
+- `grim-garage` — Training dashboard web app
+
+See root README for the full crate list and workspace map.

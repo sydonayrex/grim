@@ -134,7 +134,10 @@ clinfo  # if available
 2. Enable KV compression:
 ```rust
 // In code
-engine.config.kv_compressor = Some(Arc::new(TurboQuantCompressor::new(4.0)));
+use grim_kvquant::{OmniKvCompressor, KvModality};
+engine.config.kv_compressor = Some(Arc::new(
+    OmniKvCompressor::new(KvModality::Text, 0.5)
+));
 ```
 
 ### Permission denied on model directory
@@ -158,28 +161,30 @@ sudo chown -R $USER:$USER /var/lib/grim
 
 | Variant | Description |
 |---|---|
-| `Shape(String)` | Tensor shape mismatch |
-| `DType(String)` | Data type mismatch or unsupported |
-| `Device(String)` | Device allocation or transfer failure |
+| `ShapeMismatch { expected, got }` | Tensor shape mismatch (expected vs. actual dims) |
+| `DTypeMismatch(String)` | Data type mismatch or unsupported |
+| `DeviceMismatch(String)` | Device allocation or transfer failure |
+| `Backend(String)` | Backend operation error |
+| `Shape(String)` | Shape validation error |
 | `Unimplemented(String)` | Operation not implemented on this backend |
 
 ### grim-core::Error
 
 | Variant | Description |
 |---|---|
-| `Tensor(TensorError)` | Tensor operation failed |
+| `Tensor(TensorError)` | Tensor operation failed (wraps `grim_tensor::Error`) |
 | `Config(String)` | Configuration problem |
 | `Session(String)` | Session-related error |
 | `KvCache(String)` | KV cache operation failed |
 | `Sampler(String)` | Sampling error |
 
-### grim-engine::Error
+### grim-engine (via grim-core::Error)
 
 | Source | Description |
 |---|---|
-| Model not registered | Model ID not found in registry |
-| Adapter not found | Adapter ID not found |
-| Unknown request | Request ID not tracked |
+| `Engine::load_model` | Model not found in catalog — returns `Config` variant |
+| `Engine::register_adapter` | Adapter ID not found — returns `Config` variant |
+| `Engine::tick` | Unknown request ID — returns `Session` variant |
 
 ## Server Errors
 

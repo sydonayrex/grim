@@ -4,7 +4,7 @@ Grim is a pure-Rust inference engine designed for running autoregressive languag
 
 ## Workspace Structure
 
-The workspace contains 31 crates organized into logical layers:
+The workspace contains 28 crates organized into logical layers:
 
 - **Core layer** (`grim-tensor`, `grim-quant`, `grim-format`): Foundation types for tensors, data types, quantization, and model formats
 - **Backend layer** (`grim-backend-cpu`, `grim-backend-rocm`, `grim-backend-cuda`, `grim-backend-vulkan`, `grim-backend-metal`): Hardware-specific implementations
@@ -100,20 +100,21 @@ graph TD
     %% CLI
     U -->|Engine| Y[grim-cli]
     X -->|Server| Y
-    Y -->|CLI| Z[grim-disagg]
     W -->|Plugin| Y
     S -->|Speculative| Y
-    
+    AB -->|Graph| Y
+
     %% Disaggregation
-    O -->|Session| Z
+    O -->|Session| Z[grim-disagg]
     R -->|Transport| Z
-    
+
     %% Garage
     U -->|Engine| AA[grim-garage]
-    X -->|Server| AA
+    T -->|Autograd| AA
     
     %% Graph
-    C -->|Format| AB[grim-tensor-graph]
+    A -->|Tensor types| AB[grim-tensor-graph]
+    C -->|Format| AB
     
     %% Training
     U -->|Engine| AC[grim-speculative]
@@ -191,5 +192,5 @@ Error propagation follows the `Result<T, Error>` pattern throughout, with `thise
 - Multimodal embeddings (not implemented)
 - Audio transcription (not implemented)
 - Image generation (not implemented)
-- gRPC serving (requires `--features grpc`)
+- gRPC serving is not implemented (the `/grpc` route returns a stub)
 - Non-ROCm GPU backends are optional and may fall back to CPU

@@ -1,84 +1,93 @@
 # grim-models-diffusion
 
-Diffusion model (UNet + DDIM/Euler noise schedulers) for Grim — implements DiffusionModel per §4.4.
+Diffusion model (UNet + DDIM/Euler noise schedulers) for Grim — implements `DiffusionModel` from `grim-core`.
 
 ## Purpose
 
-Implements diffusion model architecture for image generation:
-- UNet backbone for denoising
-- DDIM and Euler sampler schedulers
-- Time embedding for step-aware processing
+Provides `Unet2D` for latent diffusion denoising and `DdimScheduler` / `EulerScheduler` for the step loop. The noise scheduler owns a sequence of denoising steps; each step takes predicted noise from the model and produces the next latent state.
 
 ## Boundaries
 
-- Does not perform image generation — only denoises latents
-- Does not manage VAE encoding/decoding
-- Does not handle model loading — see `grim-format`
+- Does **not** perform image generation end-to-end — only denoising of latent tensors.
+- Does **not** implement VAE encoding/decoding — callers provide latents.
+- Does **not** handle model loading — see `grim-format`.
 
 ## Dependency Graph
 
 ```mermaid
 graph LR
-    A[grim-models-diffusion] -->|DType, Device| B[grim-tensor]
-    A -->|Modules| C[grim-nn]
-    A -->|Model traits| D[grim-core]
-    A -->|CPU backend| E[grim-backend-cpu]
-    A -->|Scheduler| F[grim-scheduler]
-    
+    A[grim-models-diffusion] --> B[grim-tensor]
+    A --> C[grim-nn]
+    A --> D[grim-core]
+    A --> E[grim-backend-cpu]
+
     style A fill:#e1f5ea
 ```
 
 ## Public API
 
-### DiffusionUNet
-
 ```rust
-pub struct DiffusionUNet {
-    pub time_embed: TimestepEmbedding,
-    pub down_blocks: Vec<UNetBlock>,
-    pub mid_block: UNetBlock,
-    pub up_blocks: Vec<UNetBlock>,
-    pub out: Sequential,
+pub use unet::{Unet2D, UnetConfig};
+pub use scheduler::{DdimScheduler, EulerScheduler};
+
+pub struct UnetConfig {
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub hidden: usize,
+    pub num_downsample: usize,
+    pub rms_norm_eps: f32,
 }
 
-impl DiffusionModel for DiffusionUNet {
-    fn denoise(&self, latents: &Tensor, t: u32, context: Option<&Tensor>) -> Result<Tensor>;
+pub struct Unet2D {
+    pub cfg: UnetConfig,
+    pub device: grim_tensor::Device,
+    // down/mid/up blocks
+}
+
+impl Unet2D {
+    pub fn new(device: grim_tensor::Device, cfg: UnetConfig) -> Self;
+}
+
+impl grim_core::model::DiffusionModel for Unet2D {
+    fn load(&mut self, weights: &mut impl TensorProvider) -> Result<()>;
 }
 ```
 
-### NoiseScheduler
-
 ```rust
-pub trait NoiseScheduler {
+// From grim-core::model
+pub trait NoiseScheduler: Send + Sync {
     fn step(&self, model_output: &Tensor, t: u32, x: &Tensor) -> Result<Tensor>;
-    fn sigmas(&self, num_steps: usize) -> Vec<f32>;
 }
 
-pub struct DDIMScheduler { /* ... */ }
-pub struct EulerScheduler { /* ... */ }
-```
+pub struct DdimScheduler { /* fields */ }
+impl DdimScheduler {
+    pub fn new(timesteps: Vec<u32>, alphas_cumprod: Vec<f32>) -> Self;
+    pub fn linear(num_steps: usize, beta_start: f32, beta_end: f32) -> Self;
+}
 
-## Usage Example
-
-```rust
-use grim_models_diffusion::{DiffusionUNet, DDIMScheduler};
-
-let unet = DiffusionUNet::new(
-    in_channels: 4,
-    out_channels: 4,
-    hidden_dim: 128,
-    num_layers: 4,
-);
-
-let scheduler = DDIMScheduler::new(num_steps: 50);
+pub struct EulerScheduler { /* fields */ }
+impl EulerScheduler {
+    pub fn from_betas(betas: Vec<f32>) -> Self;
+}
 ```
 
 ## Feature Flags
 
 This crate has no feature flags.
 
-## Edge Cases
+## Usage Example
 
-1. **Cross-attention**: Conditions on text embeddings via context
-2. **Time embedding**: Sine/cosine positional encoding for timestep
-3. **Variance**: DDIM scheduler supports optional variance learning
+```rust
+use grim_models_diffusion::{Unet2D, UnetConfig, DdimScheduler};
+use grim_tensor::Device;
+
+let cfg = UnetConfig {
+    in_channels: 4,
+    out_channels: 4,
+    hidden: 128,
+    num_downsample: 3,
+    rms_norm_eps: 1e-5,
+};
+let model = Unet2D::new(Device::Cpu, cfg);
+let scheduler = DdimScheduler::linear(50, 0.0001, 0.02);
+```

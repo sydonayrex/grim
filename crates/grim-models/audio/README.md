@@ -1,74 +1,76 @@
 # grim-models-audio
 
-Audio encoder-decoder (Whisper-style) for Grim — implements EncoderDecoderLm per §4.4.
+Audio encoder-decoder (Whisper-style) for Grim — implements `EncoderDecoderLm` from `grim-core`.
 
 ## Purpose
 
-Implements audio encoder-decoder architecture for speech processing:
-- Whisper-style transformer encoder for audio features
-- Causal LM decoder for token generation
-- Mel-spectrogram preprocessing
+Provides the `Whisper` model struct and `WhisperConfig` — an encoder-decoder transformer for speech tasks. The encoder processes audio features (mel-spectrogram tokens), the decoder generates text tokens.
 
 ## Boundaries
 
-- Does not handle raw audio I/O — expects token IDs
-- Does not manage KV cache — that's `grim-core::KvCache`
-- Does not implement ASR — converts audio to text tokens
+- Does **not** handle raw audio file I/O — callers provide token IDs.
+- Does **not** implement ASR directly — converts audio token sequences to text token sequences.
+- Does **not** manage KV cache directly — delegates to `grim-core`'s `KvCache` trait via the decoder.
 
 ## Dependency Graph
 
 ```mermaid
 graph LR
-    A[grim-models-audio] -->|DType, Device| B[grim-tensor]
-    A -->|Modules| C[grim-nn]
-    A -->|Model traits| D[grim-core]
-    A -->|CPU backend| E[grim-backend-cpu]
-    A -->|ROCm backend| F[grim-backend-rocm]
-    
+    A[grim-models-audio] --> B[grim-tensor]
+    A --> C[grim-nn]
+    A --> D[grim-core]
+    A --> E[grim-backend-cpu]
+
     style A fill:#fff8e1
 ```
 
 ## Public API
 
-### WhisperModel
-
 ```rust
-pub struct WhisperModel {
-    pub encoder: AudioEncoder,
-    pub decoder: CausalLm,
+pub use whisper::{Whisper, WhisperConfig};
+
+pub struct WhisperConfig {
+    pub vocab_size: usize,
+    pub n_mels: usize,
+    pub d_model: usize,
+    pub num_enc_layers: usize,
+    pub num_dec_layers: usize,
+    // ... additional config fields
 }
 
-impl EncoderDecoderLm for WhisperModel { /* ... */ }
-
-pub struct AudioEncoder {
-    pub conv_in: Conv1D,
-    pub embed: PositionalEmbedding,
-    pub layers: Vec<TransformerBlock>,
-    pub conv_out: Conv1D,
+pub struct Whisper {
+    pub cfg: WhisperConfig,
+    pub device: grim_tensor::Device,
+    // encoder + decoder weights
 }
-```
 
-## Usage Example
+impl Whisper {
+    pub fn new(device: grim_tensor::Device, cfg: WhisperConfig) -> Self;
+}
 
-```rust
-use grim_models_audio::WhisperModel;
-
-let model = WhisperModel::new(
-    vocab_size: 51865,
-    hidden_dim: 1024,
-    encoder_layers: 12,
-    decoder_layers: 12,
-);
+impl grim_core::model::EncoderDecoderLm for Whisper {
+    // encode() + decode() via the Model trait
+}
 ```
 
 ## Feature Flags
 
 | Flag | Default | Description |
 |---|---|---|
-| rocm | - | Enable ROCm backend |
+| `rocm` | no | Enable ROCm backend |
 
-## Edge Cases
+## Usage Example
 
-1. **Encoder-decoder attention**: Cross-attention in decoder
-2. **Positional encoding**: Learned positional embeddings for encoder
-3. **No KV cache**: Audio transcription is single-pass in encoder
+```rust
+use grim_models_audio::{Whisper, WhisperConfig};
+use grim_tensor::Device;
+
+let cfg = WhisperConfig {
+    vocab_size: 51865,
+    n_mels: 80,
+    d_model: 1024,
+    num_enc_layers: 12,
+    num_dec_layers: 12,
+};
+let model = Whisper::new(Device::Cpu, cfg);
+```
