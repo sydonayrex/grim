@@ -182,6 +182,9 @@ pub enum OptimizerKind {
     CAME,
     /// Sophia second-order optimizer.
     Sophia,
+    /// Muon — Newton-Schulz orthogonalization for the direction matrix (B)
+    /// + 1-bit Sign-SGD for the magnitude matrix (A), with split weight decay.
+    Muon,
 }
 
 impl Default for OptimizerKind {
@@ -210,8 +213,9 @@ impl std::str::FromStr for OptimizerKind {
             "adalomo" => Ok(Self::Adalomo),
             "came" => Ok(Self::CAME),
             "sophia" => Ok(Self::Sophia),
+            "muon" => Ok(Self::Muon),
             other => Err(format!(
-                "unknown optimizer '{other}' (expected adamw, adamw-8bit, paged-adamw, paged-adamw-8bit, lion, lion-8bit, adafactor, adamw-bnb, qgalore, galore, galore-8bit, lomo, adalomo, came, sophia)"
+                "unknown optimizer '{other}' (expected adamw, adamw-8bit, paged-adamw, paged-adamw-8bit, lion, lion-8bit, adafactor, adamw-bnb, qgalore, galore, galore-8bit, lomo, adalomo, came, sophia, muon)"
             )),
         }
     }
@@ -235,6 +239,7 @@ impl std::fmt::Display for OptimizerKind {
             Self::Adalomo => "adalomo",
             Self::CAME => "came",
             Self::Sophia => "sophia",
+            Self::Muon => "muon",
         };
         f.write_str(s)
     }
@@ -250,6 +255,7 @@ pub enum Optimizer {
     Lion8Bit(Lion8Bit),
     Adafactor(Adafactor),
     QGaLoreAdamW8Bit(QGaLoreAdamW8Bit),
+    Muon(Muon),
 }
 
 impl Optimizer {
@@ -296,6 +302,10 @@ impl Optimizer {
                     ..QGaLoreAdamW8BitConfig::default()
                 }),
             )),
+            OptimizerKind::Muon => Ok(Optimizer::Muon(Muon::new(MuonConfig {
+                lr,
+                ..MuonConfig::default()
+            }))),
             kind => Err(Error::Unimplemented(format!(
                 "optimizer '{kind}' is declared but not yet implemented (Phase 7)"
             ))),
@@ -312,6 +322,7 @@ impl Optimizer {
             Optimizer::Lion8Bit(_) => OptimizerKind::Lion8Bit,
             Optimizer::Adafactor(_) => OptimizerKind::Adafactor,
             Optimizer::QGaLoreAdamW8Bit(_) => OptimizerKind::QGaLoreAdamW8Bit,
+            Optimizer::Muon(_) => OptimizerKind::Muon,
         }
     }
 
@@ -325,6 +336,7 @@ impl Optimizer {
             Optimizer::Lion8Bit(o) => o.config.lr,
             Optimizer::Adafactor(o) => o.config.lr,
             Optimizer::QGaLoreAdamW8Bit(o) => o.config.lr,
+            Optimizer::Muon(m) => m.config.lr,
         }
     }
 
@@ -351,6 +363,7 @@ impl Optimizer {
             Optimizer::Lion8Bit(o) => o.step(params),
             Optimizer::Adafactor(o) => o.step(params),
             Optimizer::QGaLoreAdamW8Bit(o) => o.step(params),
+            Optimizer::Muon(o) => o.step(params),
         }
     }
 
@@ -364,6 +377,7 @@ impl Optimizer {
             Optimizer::Lion8Bit(o) => o.config.lr = lr,
             Optimizer::Adafactor(o) => o.config.lr = lr,
             Optimizer::QGaLoreAdamW8Bit(o) => o.config.lr = lr,
+            Optimizer::Muon(m) => m.config.lr = lr,
         }
     }
 
@@ -376,6 +390,7 @@ impl Optimizer {
             Optimizer::Lion8Bit(o) => o.save_to_train_state(params),
             Optimizer::Adafactor(o) => o.save_to_train_state(params),
             Optimizer::QGaLoreAdamW8Bit(o) => o.save_to_train_state(params),
+            Optimizer::Muon(o) => o.save_to_train_state(params),
         }
     }
 
@@ -392,6 +407,7 @@ impl Optimizer {
             Optimizer::Lion8Bit(o) => o.load_from_train_state(params, state),
             Optimizer::Adafactor(o) => o.load_from_train_state(params, state),
             Optimizer::QGaLoreAdamW8Bit(o) => o.load_from_train_state(params, state),
+            Optimizer::Muon(o) => o.load_from_train_state(params, state),
         }
     }
 }
@@ -1848,6 +1864,266 @@ impl QGaLoreAdamW8Bit {
     }
 }
 
+// ============================================================================
+// Muon Optimizer (SPECTRAL-QLORA)
+// ============================================================================
+
+/// Hyperparameters for Muon optimizer.
+///
+/// Muon replaces AdamW for adapter-only training. It uses:
+/// - Newton-Schulz orthogonalization for the direction matrix (B, tall/thin)
+///   to keep it well-conditioned on the Stiefel manifold without second-moment storage.
+/// - 1-bit Sign-SGD for the magnitude matrix (A, wide/thin), with zero moment memory.
+///
+/// Split weight decay follows LoRA-Muon (2606.12921): different coefficient
+/// applied to A (is_a == true) vs B (is_a == false).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MuonConfig {
+    /// Learning rate for both matrices.
+    pub lr: f32,
+    /// Momentum coefficient for the B (direction) matrix.
+    pub beta: f32,
+    /// Weight decay for the A (magnitude / sign-SGD) matrix.
+    /// Default 0.0 — follows LoRA-Muon which applies no decay to the magnitude.
+    pub weight_decay_a: f32,
+    /// Weight decay for the B (direction / Newton-Schulz) matrix.
+    /// Default 0.01 — the primary decay target in LoRA-Muon.
+    pub weight_decay_b: f32,
+    /// Number of Newton-Schulz iterations for B-matrix gradient orthogonalization.
+    pub ns_iters: usize,
+}
+
+impl Default for MuonConfig {
+    fn default() -> Self {
+        Self {
+            lr: 1e-4,
+            beta: 0.9,
+            weight_decay_a: 0.0,
+            weight_decay_b: 0.01,
+            ns_iters: 10,
+        }
+    }
+}
+
+/// Muon optimizer: Newton-Schulz + Sign-SGD with split weight decay.
+///
+/// - **B matrices** (`is_a == false`, shape `[out, rank]`, tall/thin): the
+///   gradient is orthogonalized via `subspace_newton_schulz_step` (reusing
+///   `grim-quant::soul_eater`), then accumulated into a momentum buffer and
+///   applied as `w -= lr * (m + wd_b * w)`.
+/// - **A matrices** (`is_a == true`, shape `[rank, in]`, wide/thin): 1-bit
+///   Sign-SGD update `w -= lr * (sign(g) + wd_a * w)`. No momentum buffer needed.
+///
+/// Only B matrices carry moment state. Checkpoints serialize B's momentum
+/// buffers using the `opt_m_{layer}_{adapter}_{b}` blob convention; A matrices
+/// are data-only (like Lion).
+pub struct Muon {
+    pub config: MuonConfig,
+    pub step_count: usize,
+    /// Momentum buffer for B matrices only (`is_a == false`). A matrices use
+    /// Sign-SGD with no moment storage.
+    pub m: HashMap<ParamId, Box<dyn grim_tensor::BackendStorage>>,
+}
+
+impl std::fmt::Debug for Muon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Muon")
+            .field("config", &self.config)
+            .field("step_count", &self.step_count)
+            .field("m_count", &self.m.len())
+            .finish()
+    }
+}
+
+impl Muon {
+    /// Create a new Muon optimizer with the given configuration.
+    pub fn new(config: MuonConfig) -> Self {
+        Self {
+            config,
+            step_count: 0,
+            m: HashMap::new(),
+        }
+    }
+
+    /// Perform one optimization step over all parameters in `params`.
+    ///
+    /// B matrices (is_a == false): Newton-Schulz orthogonalization on the
+    /// gradient, then momentum update. A matrices (is_a == true): 1-bit
+    /// Sign-SGD with no momentum.
+    pub fn step(&mut self, params: &mut TrainableParams) -> Result<()> {
+        self.step_count += 1;
+
+        let lr = self.config.lr;
+        let beta = self.config.beta;
+        let wd_a = self.config.weight_decay_a;
+        let wd_b = self.config.weight_decay_b;
+        let ns_iters = self.config.ns_iters;
+
+        for (id, param) in params.iter_mut() {
+            if param.is_frozen() {
+                param.zero_grad()?;
+                continue;
+            }
+
+            let grad_vec = param.grad().to_vec_f32()?;
+            let data_vec = param.data.to_vec_f32()?;
+            let shape = param.data.shape();
+            let elem_count = shape.elem_count();
+            let dev = crate::pick_device_for_tensor(&param.data);
+
+            let new_data: Vec<f32> = if id.is_a {
+                // A matrix [rank, in]: 1-bit Sign-SGD (magnitude update, zero moment memory).
+                let mut new = Vec::with_capacity(elem_count);
+                for i in 0..elem_count {
+                    let s = if grad_vec[i] > 0.0 {
+                        1.0
+                    } else if grad_vec[i] < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    };
+                    new.push(data_vec[i] - lr * (s + wd_a * data_vec[i]));
+                }
+                new
+            } else {
+                // B matrix [out, rank]: Newton-Schulz orthogonalization + momentum.
+                // Seed momentum buffer on first encounter (device-resident).
+                if !self.m.contains_key(id) {
+                    let zero_m = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
+                    self.m.insert(*id, zero_m);
+                }
+
+                let dims = shape.dims();
+                let (rows, cols) = if dims.len() >= 2 {
+                    (dims[dims.len() - 2], dims[dims.len() - 1])
+                } else {
+                    (elem_count, 1)
+                };
+
+                // Apply Newton-Schulz to the gradient (tall/thin [rows, cols]).
+                let mut g_orth = grad_vec.clone();
+                if rows >= cols {
+                    let _ = grim_quant::soul_eater::subspace_newton_schulz_step(
+                        &mut g_orth,
+                        rows,
+                        cols,
+                        ns_iters,
+                    );
+                }
+
+                // m = beta * m_old + (1 - beta) * g_orth
+                let m_st = self.m.get_mut(id).unwrap();
+                let m_old_vec = m_st.to_cpu_vec_f32()?;
+                let m_new: Vec<f32> = (0..elem_count)
+                    .map(|i| beta * m_old_vec[i] + (1.0 - beta) * g_orth[i])
+                    .collect();
+
+                // w -= lr * (m_new + wd_b * w)
+                let mut new = Vec::with_capacity(elem_count);
+                for i in 0..elem_count {
+                    new.push(data_vec[i] - lr * (m_new[i] + wd_b * data_vec[i]));
+                }
+
+                // Write back momentum buffer (device-resident).
+                let m_storage = dev.from_cpu(&m_new, shape, DType::F32)?;
+                *m_st = m_storage;
+
+                new
+            };
+
+            // Write back updated parameter (device-resident).
+            let storage = dev.from_cpu(&new_data, shape, DType::F32)?;
+            param.data = Tensor::new(
+                Arc::from(storage),
+                shape.clone(),
+                DType::F32,
+                param.data.provenance().clone(),
+                param.data.device().clone(),
+            );
+            param.zero_grad()?;
+        }
+
+        Ok(())
+    }
+
+    /// Save parameter data + B-matrix momentum buffers to a `TrainState`.
+    ///
+    /// A matrices (sign-SGD) have no moment state and are data-only.
+    /// B matrices serialize their momentum as `opt_m_{layer}_{adapter}_b`.
+    pub fn save_to_train_state(&self, params: &TrainableParams) -> TrainState {
+        let mut state = TrainState {
+            step: self.step_count as u64,
+            fp_format: TrainFpFormat::Fp32,
+            blobs: HashMap::new(),
+        };
+
+        for (id, param) in params.iter() {
+            let shape = param.data.shape().dims().to_vec();
+            if let Ok(data) = param.data.to_vec_f32() {
+                let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let blob_name = format!(
+                    "param_{}_{}_{}",
+                    id.layer_idx,
+                    id.adapter_id,
+                    if id.is_a { "a" } else { "b" }
+                );
+                state.add_blob(blob_name, shape.clone(), bytes);
+            }
+
+            // Serialize B-matrix momentum only (A matrices have no moments).
+            if !id.is_a {
+                if let Some(m_st) = self.m.get(id) {
+                    if let Ok(m_vec) = m_st.to_cpu_vec_f32() {
+                        let bytes: Vec<u8> = m_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        let blob_name = format!("opt_m_{}_{}_b", id.layer_idx, id.adapter_id);
+                        state.add_blob(blob_name, shape, bytes);
+                    }
+                }
+            }
+        }
+
+        state
+    }
+
+    /// Restore parameter data and B-matrix momentum from a `TrainState`.
+    pub fn load_from_train_state(
+        &mut self,
+        params: &mut TrainableParams,
+        state: &TrainState,
+    ) -> Result<()> {
+        self.step_count = state.step as usize;
+        for (id, param) in params.iter_mut() {
+            let suffix = if id.is_a { "a" } else { "b" };
+            let param_key = format!("param_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
+            let m_key = format!("opt_m_{}_{}_b", id.layer_idx, id.adapter_id);
+
+            if let Some(blob) = state.blobs.get(&param_key) {
+                let f32_vals = bytes_to_f32_vec(&blob.data)?;
+                let dev = crate::pick_device_for_tensor(&param.data);
+                let storage = dev.from_cpu(&f32_vals, param.data.shape(), DType::F32)?;
+                param.data = Tensor::new(
+                    Arc::from(storage),
+                    param.data.shape().clone(),
+                    DType::F32,
+                    param.data.provenance().clone(),
+                    param.data.device().clone(),
+                );
+            }
+
+            if !id.is_a {
+                if let Some(blob) = state.blobs.get(&m_key) {
+                    let f32_vals = bytes_to_f32_vec(&blob.data)?;
+                    let dev = crate::pick_device_for_tensor(&param.data);
+                    let st = dev.from_cpu(&f32_vals, param.data.shape(), DType::F32)?;
+                    self.m.insert(*id, st);
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2016,5 +2292,112 @@ mod tests {
         let fork = optimizer.fork_for_rank(&source, &mut target).unwrap();
         assert_eq!(fork.kind(), OptimizerKind::AdamW);
         assert!((fork.lr() - 2e-4).abs() < 1e-8);
+    }
+
+    #[test]
+    fn test_muon_optimizer_step_updates_a_and_b() {
+        use crate::injection::LoRAInjectionPoint;
+        use crate::param::TrainableParam;
+
+        let mut params = TrainableParams::new();
+
+        // A matrix [rank=2, in=2] — sign-SGD (magnitude)
+        let pid_a = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
+        let mut tp_a = TrainableParam::new(
+            pid_a,
+            grim_backend_cpu::cpu_tensor(vec![0.5f32; 4], Shape::new(vec![2, 2])),
+        )
+        .unwrap();
+        tp_a.accumulate_grad(&grim_backend_cpu::cpu_tensor(
+            vec![0.3f32; 4],
+            Shape::new(vec![2, 2]),
+        ))
+        .unwrap();
+        params.insert(tp_a);
+
+        // B matrix [out=3, rank=2] — Newton-Schulz + momentum (direction)
+        let pid_b = ParamId::b(0, 1, LoRAInjectionPoint::QProj);
+        let mut tp_b = TrainableParam::new(
+            pid_b,
+            grim_backend_cpu::cpu_tensor(vec![0.5f32; 6], Shape::new(vec![3, 2])),
+        )
+        .unwrap();
+        tp_b.accumulate_grad(&grim_backend_cpu::cpu_tensor(
+            vec![0.1f32; 6],
+            Shape::new(vec![3, 2]),
+        ))
+        .unwrap();
+        params.insert(tp_b);
+
+        let mut muon = Muon::new(MuonConfig::default());
+        muon.step(&mut params).unwrap();
+
+        // A should have moved (sign update: w -= lr * (sign(g) + wd_a * w))
+        let a_after = params.get(pid_a).unwrap().data.to_vec_f32().unwrap();
+        assert_ne!(
+            a_after,
+            vec![0.5f32; 4],
+            "A matrix must update under sign-SGD"
+        );
+
+        // B should have moved (Newton-Schulz + momentum)
+        let b_after = params.get(pid_b).unwrap().data.to_vec_f32().unwrap();
+        assert_ne!(
+            b_after,
+            vec![0.5f32; 6],
+            "B matrix must update under Muon step"
+        );
+    }
+
+    #[test]
+    fn test_muon_save_load_roundtrip() {
+        use crate::injection::LoRAInjectionPoint;
+        use crate::param::TrainableParam;
+
+        let mut params = TrainableParams::new();
+        let pid_b = ParamId::b(0, 1, LoRAInjectionPoint::QProj);
+        let mut tp = TrainableParam::new(
+            pid_b,
+            grim_backend_cpu::cpu_tensor(vec![1.0f32; 12], Shape::new(vec![3, 4])),
+        )
+        .unwrap();
+        tp.accumulate_grad(&grim_backend_cpu::cpu_tensor(
+            vec![0.1f32; 12],
+            Shape::new(vec![3, 4]),
+        ))
+        .unwrap();
+        params.insert(tp);
+
+        let mut muon = Muon::new(MuonConfig::default());
+        muon.step(&mut params).unwrap();
+
+        let state = muon.save_to_train_state(&params);
+        assert_eq!(state.step, 1);
+
+        // Load into a fresh optimizer + params.
+        let mut params2 = TrainableParams::new();
+        params2.insert(
+            TrainableParam::new(
+                pid_b,
+                grim_backend_cpu::cpu_tensor(vec![0.0f32; 12], Shape::new(vec![3, 4])),
+            )
+            .unwrap(),
+        );
+        let mut muon2 = Muon::new(MuonConfig::default());
+        muon2.load_from_train_state(&mut params2, &state).unwrap();
+
+        let original = params.get(pid_b).unwrap().data.to_vec_f32().unwrap();
+        let restored = params2.get(pid_b).unwrap().data.to_vec_f32().unwrap();
+        for (a, b) in original.iter().zip(&restored) {
+            assert!((a - b).abs() < 1e-5, "param data must round-trip");
+        }
+    }
+
+    #[test]
+    fn test_muon_kind_display_and_fromstr() {
+        assert_eq!(OptimizerKind::Muon, OptimizerKind::Muon);
+        let kind: OptimizerKind = "muon".parse().unwrap();
+        assert_eq!(kind, OptimizerKind::Muon);
+        assert_eq!(format!("{}", OptimizerKind::Muon), "muon");
     }
 }

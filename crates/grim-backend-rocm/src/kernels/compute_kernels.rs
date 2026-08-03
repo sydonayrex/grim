@@ -67,6 +67,39 @@ extern "C" __global__ void grim_silu_mul(float* gate, float* up, float* out, int
     out[i] = s * up[i];
 }
 
+extern "C" __global__ void grim_silu_mul_backward(
+    float* e, float* g, float* dw, float* df, float* de, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    float ei = e[i];
+    float sig = 1.0f / (1.0f + expf(-ei));      // sigmoid(e)
+    float silu_e = ei * sig;                      // silu(e) = e * sigmoid(e)
+    float d_silu = sig * (1.0f + ei * (1.0f - sig)); // silu'(e) = sigmoid(e) * (1 + e*(1-sigmoid(e)))
+
+    df[i] = silu_e * dw[i];                      // dL/dg = silu(e) * dL/dy
+    de[i] = d_silu * g[i] * dw[i];               // dL/de = silu'(e) * g * dL/dy
+}
+
+// On-device all_reduce accumulator: out[i] = sum_k inputs[k][i].
+// `inputs` is a device array of `n_inputs` device pointers (each points to
+// `n_elements` floats on the device). One thread per output element.
+extern "C" __global__ void grim_all_reduce_accum(
+    float* out,
+    const float* const* inputs,
+    int n_inputs,
+    int n_elements
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_elements) return;
+    float acc = 0.0f;
+    for (int k = 0; k < n_inputs; ++k) {
+        acc += inputs[k][i];
+    }
+    out[i] = acc;
+}
+
 extern "C" __global__ void grim_rms_norm(float* x, float* w, float* out,
                                          int row_len, float eps, int total) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

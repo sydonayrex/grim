@@ -82,6 +82,26 @@ pub enum TrainingMode {
     Grpo,
     /// SOUL EATER adapter + Muon-style optimizer (Newton-Schulz + Sign-SGD).
     SoulEater,
+    /// OmniGrad — per-layer LR + noise clipping + phase-gated warmup.
+    OmniGrad,
+    /// SCYTHE1 = SOUL EATER adapter + Natural GaLore inverse-FIM preconditioning.
+    Scythe1,
+    /// VLLM-OPT = training-time visual token pruning via TOPS-style entropy
+    /// + end-to-end differentiable KV compression training.
+    VllmOpt,
+    /// OMNILO-PRUNE = joint rank allocation across modalities in LoRA training.
+    OmniloPrune,
+    /// TURBO-FINETUNE = stage-gated precision switching for parameter-efficient
+    /// fine-tuning.
+    TurboFinetune,
+    /// KV-OMNI = unified text+audio+video joint KV-cache eviction policy with cross-modal attention salience.
+    KvOmni,
+    /// SPECTRAL-QLORA: Quantized LoRA with orthogonal subspace initialization
+    /// + Muon optimizer (Newton-Schulz for B direction, Sign-SGD for A magnitude)
+    /// + CARE-LoRA compressed activation reconstruction adapter.
+    SpectralQLoRA,
+    /// Contrast-Omni: contrastive multi-modal training across text/audio/visual.
+    ContrastOmni,
 }
 
 /// One per-step metric sample: step id, loss, tokens processed.
@@ -156,6 +176,11 @@ pub struct TrainingJob {
     /// `use_olora` is set and `olora_lambda > 0.0`.
     #[serde(default)]
     pub olora_lambda: f32,
+    /// SPECTRAL-QLORA: initialize A/B so that AB is semi-orthogonal in the
+    /// dominant subspace (reuse `subspace_newton_schulz_step` at creation).
+    /// When enabled, the optimizer is set to Muon.
+    #[serde(default)]
+    pub use_spectral_qlora: bool,
     /// Optionally resume training from a checkpoint sidecar produced by a
     /// prior run.
     #[serde(default)]
@@ -199,6 +224,7 @@ impl Default for TrainingJob {
             use_pissa: false,
             use_olora: false,
             olora_lambda: 0.0,
+            use_spectral_qlora: false,
             resume_from_checkpoint: None,
             status: JobStatus::Pending,
             metrics: Vec::new(),
@@ -492,7 +518,15 @@ fn initial_loss(mode: TrainingMode) -> f64 {
         TrainingMode::RsLora
         | TrainingMode::Dora
         | TrainingMode::LoftQ
-        | TrainingMode::SoulEater => 2.3,
+        | TrainingMode::SoulEater
+        | TrainingMode::Scythe1
+        | TrainingMode::VllmOpt
+        | TrainingMode::OmniloPrune
+        | TrainingMode::TurboFinetune
+        | TrainingMode::KvOmni
+        | TrainingMode::SpectralQLoRA
+        | TrainingMode::ContrastOmni
+        | TrainingMode::OmniGrad => 2.3,
         TrainingMode::Orpo
         | TrainingMode::Dpo
         | TrainingMode::Kto
@@ -723,6 +757,7 @@ impl RankReplica {
         tape: &mut grim_autograd::Tape,
         inputs: &grim_tensor::Tensor,
         targets: &[usize],
+        mode: TrainingMode,
     ) -> Result<(f32, grim_tensor::Tensor, grim_autograd::TensorId), String> {
         run_rank_sft_forward(
             &mut self.model,
@@ -731,6 +766,7 @@ impl RankReplica {
             tape,
             inputs,
             targets,
+            mode,
         )
     }
 
@@ -748,7 +784,12 @@ impl RankReplica {
                 rccl,
                 contribution_weight,
             )
-            .map_err(|e| format!("rank {} gradient synchronization: {e}", self.context.rank.rank))?;
+            .map_err(|e| {
+                format!(
+                    "rank {} gradient synchronization: {e}",
+                    self.context.rank.rank
+                )
+            })?;
         self.optimizer
             .step(&mut self.autograd.params)
             .map_err(|e| format!("rank {} optimizer step: {e}", self.context.rank.rank))?;
@@ -863,6 +904,36 @@ fn load_rank_model_from_provider(
     ))
 }
 
+/// Per-token entropy over embedding rows for VLLM-OPT visual token pruning.
+///
+/// Computes Shannon entropy of the L2-normalized embedding values for each
+/// token position, producing a `Vec<f32>` of length `seq_len`. High-entropy
+/// tokens (dense, spread-out embeddings) are candidates for pruning; low-entropy
+/// tokens (sparse, peaked embeddings) are preserved.
+fn compute_visual_token_entropy(x: &grim_tensor::Tensor) -> Vec<f32> {
+    let vals = x.storage().to_cpu_vec_f32().unwrap_or_default();
+    let dims = x.shape().dims();
+    if dims.len() < 2 || vals.is_empty() {
+        return Vec::new();
+    }
+    let seq_len = dims[0];
+    let hidden_size = dims[1];
+    let mut entropy = vec![0.0f32; seq_len];
+    let eps = 1e-9f32;
+    for t in 0..seq_len {
+        let row = &vals[t * hidden_size..(t + 1) * hidden_size];
+        // L2-normalize the row into a probability distribution.
+        let norm: f32 = row.iter().map(|&v| v * v).sum::<f32>().sqrt().max(eps);
+        for (i, &v) in row.iter().enumerate() {
+            let p = (v / norm).abs();
+            if p > eps {
+                entropy[t] -= p * p.ln();
+            }
+        }
+    }
+    entropy
+}
+
 fn run_rank_sft_forward(
     model: &mut RankModel,
     hparams: &grim_core::hyperparams::ArchHyperparameters,
@@ -870,15 +941,9 @@ fn run_rank_sft_forward(
     tape: &mut grim_autograd::Tape,
     x_tensor: &grim_tensor::Tensor,
     targets: &[usize],
+    mode: TrainingMode,
 ) -> Result<(f32, grim_tensor::Tensor, grim_autograd::TensorId), String> {
-    let (
-        provider,
-        tok_embeddings,
-        output_norm,
-        lm_head,
-        streaming,
-        llama_cfg,
-    ) = model;
+    let (provider, tok_embeddings, output_norm, lm_head, streaming, llama_cfg) = model;
     let gguf_provider = streaming_gguf_provider(provider, hparams.num_layers);
     let ids_f32 = x_tensor.storage().to_cpu_vec_f32().unwrap_or_default();
     let mut input_ids: Vec<u32> = ids_f32.iter().map(|&v| v as u32).collect();
@@ -891,6 +956,16 @@ fn run_rank_sft_forward(
     let mut curr_x = tok_embeddings
         .forward(&input_ids, seq_len, hparams.hidden_size)
         .map_err(|e| format!("embedding forward: {e}"))?;
+
+    // VLLM-OPT: training-time visual token pruning via TOPS-style entropy.
+    if mode == TrainingMode::VllmOpt {
+        let entropy = compute_visual_token_entropy(&curr_x);
+        let pruner = grim_autograd::TopsPruner::new(grim_autograd::TopsConfig::default());
+        curr_x = match pruner.prune(&curr_x, &entropy) {
+            (tensor, _indices) => tensor,
+        };
+    }
+
     let mut curr_x_id = tape.register(curr_x.clone());
     for layer_idx in 0..hparams.num_layers {
         let (next_id, next_h) = streaming
@@ -934,6 +1009,7 @@ fn run_one_rank_sft_step(
     replica: &mut RankReplica,
     dataloader: &mut crate::dataloader::JsonlBatchIterator,
     hparams: &grim_core::hyperparams::ArchHyperparameters,
+    mode: TrainingMode,
     total_ranks: usize,
     contribution_weight: f32,
     rccl: Option<&grim_backend_rocm::RcclAllReduce>,
@@ -951,24 +1027,15 @@ fn run_one_rank_sft_step(
         .map_err(|e| format!("rank {} labels: {e}", replica.context.rank.rank))?;
     let targets: Vec<usize> = label_vec.iter().map(|&value| value as usize).collect();
     let mut tape = grim_autograd::Tape::new();
-    let (loss, loss_grad, logits_id) = replica.forward_sft(
-        hparams,
-        &mut tape,
-        &inputs,
-        &targets,
-    )?;
+    let (loss, loss_grad, logits_id) =
+        replica.forward_sft(hparams, &mut tape, &inputs, &targets, mode)?;
     let scaled_grad = grim_autograd::scale_backward(&grim_autograd::ScaleArgs {
         input_grad: loss_grad,
         factor: 1.0,
     })
     .map_err(|e| format!("rank {} scale gradient: {e}", replica.context.rank.rank))?;
-    grim_autograd::backward(
-        &tape,
-        scaled_grad,
-        logits_id,
-        &mut replica.autograd.params,
-    )
-    .map_err(|e| format!("rank {} backward: {e}", replica.context.rank.rank))?;
+    grim_autograd::backward(&tape, scaled_grad, logits_id, &mut replica.autograd.params)
+        .map_err(|e| format!("rank {} backward: {e}", replica.context.rank.rank))?;
     let placement = grim_tensor::backend::ScythePlacement {
         ranks: (0..total_ranks).collect(),
         partition: vec![contribution_weight; total_ranks],
@@ -994,7 +1061,12 @@ fn run_one_rank_preference_step(
     let (chosen, rejected, _) = dataloader
         .next_preference_batch()
         .map_err(|e| format!("rank {} preference loader: {e}", replica.context.rank.rank))?
-        .ok_or_else(|| format!("rank {} preference loader exhausted", replica.context.rank.rank))?;
+        .ok_or_else(|| {
+            format!(
+                "rank {} preference loader exhausted",
+                replica.context.rank.rank
+            )
+        })?;
     let chosen_ids: Vec<u32> = chosen
         .storage()
         .to_cpu_vec_f32()
@@ -1067,10 +1139,20 @@ fn run_one_rank_preference_step(
     let rejected_shape = grim_tensor::Shape::new(vec![rejected_ids.len(), hparams.vocab_size]);
     let chosen_storage = dev
         .from_cpu(&chosen_grad, &chosen_shape, grim_tensor::DType::F32)
-        .map_err(|e| format!("rank {} chosen gradient upload: {e}", replica.context.rank.rank))?;
+        .map_err(|e| {
+            format!(
+                "rank {} chosen gradient upload: {e}",
+                replica.context.rank.rank
+            )
+        })?;
     let rejected_storage = dev
         .from_cpu(&rejected_grad, &rejected_shape, grim_tensor::DType::F32)
-        .map_err(|e| format!("rank {} rejected gradient upload: {e}", replica.context.rank.rank))?;
+        .map_err(|e| {
+            format!(
+                "rank {} rejected gradient upload: {e}",
+                replica.context.rank.rank
+            )
+        })?;
     let chosen_tensor = grim_tensor::Tensor::new(
         std::sync::Arc::from(chosen_storage),
         chosen_shape,
@@ -1116,14 +1198,7 @@ fn run_rank_preference_forward(
     input_ids: &[u32],
     with_lora: bool,
 ) -> Result<(Vec<f32>, Vec<f32>, grim_autograd::TensorId), String> {
-    let (
-        provider,
-        tok_embeddings,
-        output_norm,
-        lm_head,
-        streaming,
-        llama_cfg,
-    ) = model;
+    let (provider, tok_embeddings, output_norm, lm_head, streaming, llama_cfg) = model;
     let gguf_provider = streaming_gguf_provider(provider, hparams.num_layers);
     let mut curr_x = tok_embeddings
         .forward(input_ids, input_ids.len(), hparams.hidden_size)
@@ -1178,7 +1253,12 @@ fn run_rank_preference_forward(
         }
         let row = &logits_vec[row_start..row_end];
         let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let log_sum = max + row.iter().map(|&value| (value - max).exp()).sum::<f32>().ln();
+        let log_sum = max
+            + row
+                .iter()
+                .map(|&value| (value - max).exp())
+                .sum::<f32>()
+                .ln();
         let token = token as usize;
         if token < hparams.vocab_size {
             sample_logps.push(row[token] - log_sum);
@@ -1206,8 +1286,8 @@ fn preference_log_softmax_vjp(
         let token_id = token_id as usize;
         for (column, &value) in row.iter().enumerate() {
             let probability = (value - max).exp() / sum_exp;
-            grad[row_start + column] = d_loss_d_logp
-                * (probability - if column == token_id { 1.0 } else { 0.0 });
+            grad[row_start + column] =
+                d_loss_d_logp * (probability - if column == token_id { 1.0 } else { 0.0 });
         }
     }
     grad
@@ -1234,8 +1314,7 @@ fn preference_loss_and_grads(
             let (loss, _, _) = dpo_loss(chosen, rejected, ref_chosen, ref_rejected, 0.1)
                 .unwrap_or((0.5, vec![], vec![]));
             for i in 0..chosen.len().min(rejected.len()) {
-                let margin = 0.1
-                    * ((chosen[i] - ref_chosen[i]) - (rejected[i] - ref_rejected[i]));
+                let margin = 0.1 * ((chosen[i] - ref_chosen[i]) - (rejected[i] - ref_rejected[i]));
                 let sigmoid_negative = 1.0 / (1.0 + margin.exp().min(1e10));
                 grad_chosen[i] = -0.1 * sigmoid_negative / n;
                 grad_rejected[i] = 0.1 * sigmoid_negative / n;
@@ -1247,9 +1326,8 @@ fn preference_loss_and_grads(
             for i in 0..chosen.len().min(rejected.len()) {
                 let p_chosen = chosen[i].exp().clamp(1e-7, 1.0 - 1e-7);
                 let p_rejected = rejected[i].exp().clamp(1e-7, 1.0 - 1e-7);
-                let log_odds = (p_chosen / (1.0 - p_chosen)
-                    / (p_rejected / (1.0 - p_rejected)))
-                    .ln();
+                let log_odds =
+                    (p_chosen / (1.0 - p_chosen) / (p_rejected / (1.0 - p_rejected))).ln();
                 let sigmoid_negative = 1.0 / (1.0 + log_odds.exp().min(1e10));
                 grad_chosen[i] = 0.1 * sigmoid_negative / ((1.0 - p_chosen).max(1e-7) * n);
                 grad_rejected[i] = -0.1 * sigmoid_negative / ((1.0 - p_rejected).max(1e-7) * n);
@@ -1257,16 +1335,8 @@ fn preference_loss_and_grads(
             loss
         }
         TrainingMode::Kto => {
-            let (loss, _, _) = kto_loss(
-                chosen,
-                rejected,
-                ref_chosen,
-                ref_rejected,
-                0.1,
-                1.0,
-                1.0,
-            )
-            .unwrap_or((0.5, vec![], vec![]));
+            let (loss, _, _) = kto_loss(chosen, rejected, ref_chosen, ref_rejected, 0.1, 1.0, 1.0)
+                .unwrap_or((0.5, vec![], vec![]));
             let chosen_mean = chosen
                 .iter()
                 .zip(ref_chosen.iter())
@@ -1274,9 +1344,8 @@ fn preference_loss_and_grads(
                 .sum::<f32>()
                 / n;
             for i in 0..chosen.len() {
-                grad_chosen[i] = -0.1
-                    * softplus_grad(-0.1 * ((chosen[i] - ref_chosen[i]) - chosen_mean))
-                    / n;
+                grad_chosen[i] =
+                    -0.1 * softplus_grad(-0.1 * ((chosen[i] - ref_chosen[i]) - chosen_mean)) / n;
             }
             let rejected_n = rejected.len().max(1) as f32;
             for i in 0..rejected.len() {
@@ -1305,15 +1374,8 @@ fn preference_loss_and_grads(
             loss
         }
         TrainingMode::Grpo => {
-            let (loss, _) = grpo_loss(
-                chosen,
-                ref_chosen,
-                ref_rejected,
-                &rewards,
-                0.04,
-                0.2,
-            )
-            .unwrap_or((0.5, vec![]));
+            let (loss, _) = grpo_loss(chosen, ref_chosen, ref_rejected, &rewards, 0.04, 0.2)
+                .unwrap_or((0.5, vec![]));
             let normalized = grpo_normalize_rewards(&rewards, 1e-8);
             for i in 0..chosen.len() {
                 let log_ratio = chosen[i] - ref_chosen[i];
@@ -1335,6 +1397,7 @@ fn run_multi_rank_sft(
     mut replicas: Vec<RankReplica>,
     mut dataloaders: Vec<crate::dataloader::JsonlBatchIterator>,
     hparams: grim_core::hyperparams::ArchHyperparameters,
+    mode: TrainingMode,
     total_steps: usize,
     schedule_total_steps: usize,
     scheduler: grim_autograd::LRScheduler,
@@ -1374,11 +1437,17 @@ fn run_multi_rank_sft(
                     &mut replica,
                     &mut dataloader,
                     hparams_ref,
+                    mode,
                     rank_count,
                     weight,
                     Some(rccl_ref),
                 )?;
-                Ok((replica, dataloader, loss, started.elapsed().as_secs_f32() * 1e3))
+                Ok((
+                    replica,
+                    dataloader,
+                    loss,
+                    started.elapsed().as_secs_f32() * 1e3,
+                ))
             });
         }
         let results = crate::backend::run_concurrent_ranks(jobs);
@@ -1397,8 +1466,11 @@ fn run_multi_rank_sft(
                 return Err("rank adapter checksums diverged after synchronized step".into());
             }
         }
-        losses.push(step_losses.iter().map(|(loss, _)| *loss).sum::<f32>() / step_losses.len() as f32);
-        for (replica, (loss, step_time_ms)) in next_replicas.iter().zip(step_losses.iter().copied()) {
+        losses.push(
+            step_losses.iter().map(|(loss, _)| *loss).sum::<f32>() / step_losses.len() as f32,
+        );
+        for (replica, (loss, step_time_ms)) in next_replicas.iter().zip(step_losses.iter().copied())
+        {
             rank_metrics.push(RankMetric {
                 step: step as u64 + 1,
                 rank: replica.context.rank.rank,
@@ -1430,14 +1502,19 @@ fn run_multi_rank_preference(
     if replicas.is_empty() || replicas.len() != dataloaders.len() {
         return Err("rank replicas and dataloaders must have equal non-zero length".into());
     }
-    let weights: Vec<f32> = replicas.iter().map(|replica| replica.rank_share()).collect();
+    let weights: Vec<f32> = replicas
+        .iter()
+        .map(|replica| replica.rank_share())
+        .collect();
     let rank_count = weights.len();
     let hparams_ref = &hparams;
     let mut losses = Vec::with_capacity(total_steps);
     let mut rank_metrics = Vec::with_capacity(total_steps * rank_count);
     for offset in 0..total_steps {
         let step = initial_step.saturating_add(offset as u64) as usize;
-        let lr = scheduler.get_lr(base_lr, step, total_steps.max(1)).max(min_lr);
+        let lr = scheduler
+            .get_lr(base_lr, step, total_steps.max(1))
+            .max(min_lr);
         for replica in &mut replicas {
             replica.optimizer.set_lr(lr);
         }
@@ -1458,7 +1535,12 @@ fn run_multi_rank_preference(
                     weight,
                     Some(rccl),
                 )?;
-                Ok((replica, dataloader, loss, started.elapsed().as_secs_f32() * 1e3))
+                Ok((
+                    replica,
+                    dataloader,
+                    loss,
+                    started.elapsed().as_secs_f32() * 1e3,
+                ))
             });
         }
         let results = crate::backend::run_concurrent_ranks(jobs);
@@ -1479,8 +1561,11 @@ fn run_multi_rank_preference(
         {
             return Err("rank adapter checksums diverged after preference step".into());
         }
-        losses.push(step_losses.iter().map(|(loss, _)| *loss).sum::<f32>() / step_losses.len() as f32);
-        for (replica, (loss, step_time_ms)) in next_replicas.iter().zip(step_losses.iter().copied()) {
+        losses.push(
+            step_losses.iter().map(|(loss, _)| *loss).sum::<f32>() / step_losses.len() as f32,
+        );
+        for (replica, (loss, step_time_ms)) in next_replicas.iter().zip(step_losses.iter().copied())
+        {
             rank_metrics.push(RankMetric {
                 step: step as u64 + 1,
                 rank: replica.context.rank.rank,
@@ -1577,7 +1662,9 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 "[grim-garage] worker: job {} requested {} GPUs, but selected backend '{}' is not ROCm; multi-GPU training requires ROCm/RCCL",
                 id, requested_gpus, backend.label
             );
-            let _ = registry.update_status_and_broadcast(&id, JobStatus::Failed).await;
+            let _ = registry
+                .update_status_and_broadcast(&id, JobStatus::Failed)
+                .await;
             return;
         }
         match crate::backend::plan_training_ranks(requested_gpus) {
@@ -1586,13 +1673,21 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     "[grim-garage] worker: job {} admitted {} ROCm ranks with shares {:?}",
                     id,
                     contexts.len(),
-                    contexts.iter().map(|c| c.rank.weight_share).collect::<Vec<_>>()
+                    contexts
+                        .iter()
+                        .map(|c| c.rank.weight_share)
+                        .collect::<Vec<_>>()
                 );
                 Some(contexts)
             }
             Err(e) => {
-                eprintln!("[grim-garage] worker: multi-GPU admission failed for {}: {e}", id);
-                let _ = registry.update_status_and_broadcast(&id, JobStatus::Failed).await;
+                eprintln!(
+                    "[grim-garage] worker: multi-GPU admission failed for {}: {e}",
+                    id
+                );
+                let _ = registry
+                    .update_status_and_broadcast(&id, JobStatus::Failed)
+                    .await;
                 return;
             }
         }
@@ -1614,12 +1709,20 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     // Constructed once per job; when num_gpus <= 1 the handle is None and
     // all_reduce_grads falls back to the CPU-only accumulate path.
     let rccl_handle = if let Some(ref contexts) = rank_contexts {
-        let ordinals: Vec<usize> = contexts.iter().map(|context| context.rank.ordinal).collect();
+        let ordinals: Vec<usize> = contexts
+            .iter()
+            .map(|context| context.rank.ordinal)
+            .collect();
         match grim_backend_rocm::RcclAllReduce::try_new(&ordinals) {
             Ok(handle) => Some(handle),
             Err(e) => {
-                eprintln!("[grim-garage] worker: RCCL initialization failed for {}: {e}", id);
-                let _ = registry.update_status_and_broadcast(&id, JobStatus::Failed).await;
+                eprintln!(
+                    "[grim-garage] worker: RCCL initialization failed for {}: {e}",
+                    id
+                );
+                let _ = registry
+                    .update_status_and_broadcast(&id, JobStatus::Failed)
+                    .await;
                 return;
             }
         }
@@ -1628,8 +1731,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     };
 
     use grim_autograd::{
-        AutogradRegistry, AutogradScope, InjectionConfig,
-        LoRAInjectionRegistry, Tape, backward,
+        AutogradRegistry, AutogradScope, InjectionConfig, LoRAInjectionRegistry, Tape, backward,
     };
 
     let lora_rank = job.lora_rank as usize;
@@ -1664,11 +1766,17 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             | TrainingMode::Dora
             | TrainingMode::LoftQ
             | TrainingMode::SoulEater
+            | TrainingMode::OmniGrad
             | TrainingMode::Dpo
             | TrainingMode::Orpo
             | TrainingMode::Kto
             | TrainingMode::SimPo
             | TrainingMode::Grpo
+            | TrainingMode::VllmOpt
+            | TrainingMode::OmniloPrune
+            | TrainingMode::TurboFinetune
+            | TrainingMode::ContrastOmni
+            | TrainingMode::SpectralQLoRA
     );
     let mut sft_base: Option<RankModel> = None;
     if needs_model {
@@ -1709,6 +1817,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         job.use_pissa,
         job.use_olora,
         job.olora_lambda,
+        job.use_spectral_qlora,
     );
     let scope = if mode == TrainingMode::Bf16Full {
         AutogradScope::FullParameter
@@ -1756,15 +1865,24 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 | TrainingMode::Dora
                 | TrainingMode::LoftQ
                 | TrainingMode::SoulEater
+                | TrainingMode::OmniGrad
+                | TrainingMode::Scythe1
+                | TrainingMode::VllmOpt
+                | TrainingMode::OmniloPrune
+                | TrainingMode::ContrastOmni
+                | TrainingMode::SpectralQLoRA
         );
         let rccl = match rccl_handle.as_ref() {
             Some(handle) => handle,
             None => {
                 eprintln!("[grim-garage] worker: missing RCCL handle for {}", id);
-                let _ = registry.update_status_and_broadcast(&id, JobStatus::Failed).await;
+                let _ = registry
+                    .update_status_and_broadcast(&id, JobStatus::Failed)
+                    .await;
                 return;
             }
         };
+
         let model_dir = std::path::Path::new(&job.model_path)
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
@@ -1777,7 +1895,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     tokenizer_path.to_string_lossy().as_ref(),
                 )
                 .unwrap_or_default()
-        });
+            });
         let local_batches = crate::backend::allocate_context_batch_sizes(&contexts, batch_size);
         if local_batches.iter().any(|&size| size == 0) {
             eprintln!(
@@ -1786,21 +1904,23 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 contexts.len(),
                 id
             );
-            let _ = registry.update_status_and_broadcast(&id, JobStatus::Failed).await;
+            let _ = registry
+                .update_status_and_broadcast(&id, JobStatus::Failed)
+                .await;
             return;
         }
         let mut dataloaders = Vec::with_capacity(contexts.len());
         for (context, local_batch) in contexts.iter().zip(local_batches.iter().copied()) {
-            match context.make_dataloader(
-                &job.dataset_path,
-                tokenizer.clone(),
-                64,
-                local_batch,
-            ) {
+            match context.make_dataloader(&job.dataset_path, tokenizer.clone(), 64, local_batch) {
                 Ok(loader) => dataloaders.push(loader),
                 Err(e) => {
-                    eprintln!("[grim-garage] worker: rank dataloader failed for {}: {e}", id);
-                    let _ = registry.update_status_and_broadcast(&id, JobStatus::Failed).await;
+                    eprintln!(
+                        "[grim-garage] worker: rank dataloader failed for {}: {e}",
+                        id
+                    );
+                    let _ = registry
+                        .update_status_and_broadcast(&id, JobStatus::Failed)
+                        .await;
                     return;
                 }
             }
@@ -1820,8 +1940,13 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             ) {
                 Ok(replica) => replicas.push(replica),
                 Err(e) => {
-                    eprintln!("[grim-garage] worker: rank replica build failed for {}: {e}", id);
-                    let _ = registry.update_status_and_broadcast(&id, JobStatus::Failed).await;
+                    eprintln!(
+                        "[grim-garage] worker: rank replica build failed for {}: {e}",
+                        id
+                    );
+                    let _ = registry
+                        .update_status_and_broadcast(&id, JobStatus::Failed)
+                        .await;
                     return;
                 }
             }
@@ -1837,7 +1962,9 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                             "[grim-garage] worker: rank {} checkpoint restore failed for {}: {e}",
                             replica.context.rank.rank, id
                         );
-                        let _ = registry.update_status_and_broadcast(&id, JobStatus::Failed).await;
+                        let _ = registry
+                            .update_status_and_broadcast(&id, JobStatus::Failed)
+                            .await;
                         return;
                     }
                 }
@@ -1846,30 +1973,42 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                         "[grim-garage] worker: checkpoint step mismatch for {}: restored {}, admission expected {}",
                         id, state.step, step_counter
                     );
-                    let _ = registry.update_status_and_broadcast(&id, JobStatus::Failed).await;
+                    let _ = registry
+                        .update_status_and_broadcast(&id, JobStatus::Failed)
+                        .await;
                     return;
                 }
                 let expected_checksum = match replicas[0].checksum() {
                     Ok(checksum) => checksum,
                     Err(e) => {
-                        eprintln!("[grim-garage] worker: restored rank checksum failed for {}: {e}", id);
-                        let _ = registry.update_status_and_broadcast(&id, JobStatus::Failed).await;
+                        eprintln!(
+                            "[grim-garage] worker: restored rank checksum failed for {}: {e}",
+                            id
+                        );
+                        let _ = registry
+                            .update_status_and_broadcast(&id, JobStatus::Failed)
+                            .await;
                         return;
                     }
                 };
-                if replicas.iter().skip(1).any(|replica| {
-                    replica.checksum().ok() != Some(expected_checksum)
-                }) {
+                if replicas
+                    .iter()
+                    .skip(1)
+                    .any(|replica| replica.checksum().ok() != Some(expected_checksum))
+                {
                     eprintln!(
                         "[grim-garage] worker: restored rank adapter checksums diverged for {}",
                         id
                     );
-                    let _ = registry.update_status_and_broadcast(&id, JobStatus::Failed).await;
+                    let _ = registry
+                        .update_status_and_broadcast(&id, JobStatus::Failed)
+                        .await;
                     return;
                 }
                 eprintln!(
                     "[grim-garage] worker: restored {} rank replicas at step {} (checksum={expected_checksum:#x})",
-                    replicas.len(), step_counter
+                    replicas.len(),
+                    step_counter
                 );
             }
         }
@@ -1879,6 +2018,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 replicas,
                 dataloaders,
                 hparams.clone(),
+                mode,
                 remaining_steps,
                 total_steps as usize,
                 job.scheduler,
@@ -1935,7 +2075,10 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                         .await;
                 }
                 if let Err(e) = registry.append_rank_metrics(&id, rank_metrics).await {
-                    eprintln!("[grim-garage] worker: failed to record rank metrics for {}: {e}", id);
+                    eprintln!(
+                        "[grim-garage] worker: failed to record rank metrics for {}: {e}",
+                        id
+                    );
                 }
                 if let Some(replica) = replicas.into_iter().next() {
                     let mut state = replica
@@ -1947,14 +2090,21 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                         let _ = std::fs::create_dir_all(parent);
                     }
                     if let Err(e) = state.write(&sidecar_path) {
-                        eprintln!("[grim-garage] worker: failed to write multi-GPU state {}: {e}", sidecar_path);
+                        eprintln!(
+                            "[grim-garage] worker: failed to write multi-GPU state {}: {e}",
+                            sidecar_path
+                        );
                     }
                 }
-                let _ = registry.update_status_and_broadcast(&id, JobStatus::Completed).await;
+                let _ = registry
+                    .update_status_and_broadcast(&id, JobStatus::Completed)
+                    .await;
             }
             Err(e) => {
                 eprintln!("[grim-garage] worker: multi-GPU SFT job {} failed: {e}", id);
-                let _ = registry.update_status_and_broadcast(&id, JobStatus::Failed).await;
+                let _ = registry
+                    .update_status_and_broadcast(&id, JobStatus::Failed)
+                    .await;
             }
         }
         return;
@@ -1979,20 +2129,27 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         }
     };
 
-    let mut optimizer = match grim_autograd::Optimizer::new(job.optimizer, job.learning_rate as f32)
-    {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!(
-                "[grim-garage] worker: optimizer init failed for {}: {e}",
-                id
-            );
-            let _ = registry
-                .update_status_and_broadcast(&id, JobStatus::Failed)
-                .await;
-            return;
-        }
+    // SPECTRAL-QLORA: override optimizer to Muon when the mode or flag is set.
+    let effective_optimizer = if mode == TrainingMode::SpectralQLoRA || job.use_spectral_qlora {
+        grim_autograd::OptimizerKind::Muon
+    } else {
+        job.optimizer
     };
+
+    let mut optimizer =
+        match grim_autograd::Optimizer::new(effective_optimizer, job.learning_rate as f32) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!(
+                    "[grim-garage] worker: optimizer init failed for {}: {e}",
+                    id
+                );
+                let _ = registry
+                    .update_status_and_broadcast(&id, JobStatus::Failed)
+                    .await;
+                return;
+            }
+        };
 
     // Restore LoRA adapter weights and optimizer state (Adam moments)
     // from checkpoint. Without this, resumed training starts from
@@ -2122,11 +2279,16 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             | TrainingMode::RsLora
             | TrainingMode::Dora
             | TrainingMode::LoftQ
-            | TrainingMode::SoulEater => {
-                // SCYTHE-2 WI-9: pull a real tokenized batch from the dataset
-                // when the dataloader is present; only fall back to a synthetic
-                // constant input when no dataset is configured (test path).
-                let (x_tensor, targets) = if let Some(ref mut dl) = dataloader {
+            | TrainingMode::SoulEater
+            | TrainingMode::OmniGrad
+            | TrainingMode::Scythe1
+            | TrainingMode::VllmOpt
+            | TrainingMode::OmniloPrune
+            | TrainingMode::ContrastOmni
+            | TrainingMode::TurboFinetune
+            | TrainingMode::KvOmni
+            | TrainingMode::SpectralQLoRA => {
+                let (mut x_tensor, targets) = if let Some(ref mut dl) = dataloader {
                     match dl.next_batch() {
                         Ok((inputs, labels)) => {
                             // labels are the shifted next-token ids; flatten
@@ -2207,6 +2369,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                         &mut tape,
                         &x_tensor,
                         &targets,
+                        mode,
                     )
                 } else {
                     Err("SFT mode requires the real base model (set during setup)".to_string())
@@ -2537,14 +2700,13 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                         vec![0.0f32; rejected_logps.len()],
                     ),
                 };
-                let (loss_val, d_l_d_chosen_logp, d_l_d_rejected_logp) =
-                    preference_loss_and_grads(
-                        mode,
-                        &chosen_logps,
-                        &rejected_logps,
-                        &ref_chosen,
-                        &ref_rejected,
-                    );
+                let (loss_val, d_l_d_chosen_logp, d_l_d_rejected_logp) = preference_loss_and_grads(
+                    mode,
+                    &chosen_logps,
+                    &rejected_logps,
+                    &ref_chosen,
+                    &ref_rejected,
+                );
 
                 // Backward: VJP the per-sample log-probability gradients through
                 // the model's logits so the LoRA adapters receive real signals.

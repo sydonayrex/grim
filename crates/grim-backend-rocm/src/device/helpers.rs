@@ -7,10 +7,9 @@ use grim_tensor::error::{Error, Result};
 
 use crate::{
     HipErrorT, HipMemcpyKind, HiprtcProgram, hipFree, hipMalloc, hipMallocManaged, hipMemcpy,
-    hipMemcpyAsync,
-    hipStreamCreate, hipStreamDestroy, hipStreamSynchronize, hipSuccess, hiprtcCompileProgram,
-    hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode, hiprtcGetCodeSize,
-    hiprtcGetProgramLog, hiprtcGetProgramLogSize,
+    hipMemcpyAsync, hipStreamCreate, hipStreamDestroy, hipStreamSynchronize, hipSuccess,
+    hiprtcCompileProgram, hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode,
+    hiprtcGetCodeSize, hiprtcGetProgramLog, hiprtcGetProgramLogSize,
 };
 
 /// Convert a raw `HipErrorT` into `Result<()>`. [see: `hipMalloc`, `hipStreamSynchronize`]

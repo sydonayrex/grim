@@ -8,6 +8,43 @@ use grim_core::error::Result;
 use grim_tensor::{BackendDevice, BackendStorage, Device, QuantProvenance, Shape, Tensor};
 use std::sync::Arc;
 
+pub mod kv_omni;
+pub use kv_omni::{KvOmniConfig, KvOmniEvictor, ModalityPolicy, OmniKvCompressor};
+
+/// Modality tag for KV-cache blocks, used by KV-OMNI routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KvModality {
+    Text,
+    Audio,
+    Visual,
+}
+
+impl Default for KvModality {
+    fn default() -> Self {
+        KvModality::Text
+    }
+}
+
+impl KvModality {
+    /// Encode as a u8 for on-disk serialization.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            KvModality::Text => 0,
+            KvModality::Audio => 1,
+            KvModality::Visual => 2,
+        }
+    }
+
+    /// Decode from a u8; falls back to Text for unknown values.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => KvModality::Audio,
+            2 => KvModality::Visual,
+            _ => KvModality::Text,
+        }
+    }
+}
+
 /// Generate a random orthogonal matrix using QR decomposition of a random matrix.
 /// This is used for pre-rotation before Lloyd-Max quantization to decorrelate features.
 pub fn random_orthogonal_matrix(dim: usize, seed: u64) -> Vec<f32> {
@@ -94,6 +131,8 @@ pub struct CompressedKvBlock {
     pub num_tokens: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
+    /// Modality tag for KV-OMNI per-modality dispatch (default Text).
+    pub modality: KvModality,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -154,6 +193,10 @@ pub struct KvBlockOnDisk {
     pub bits_v: u8,
     /// RotateKV-style pre-rotation applied.
     pub rotated: bool,
+    /// Modality tag (KV-OMNI, WI-R4 extension).
+    pub modality: KvModality,
+    /// Tucker/JoLT projection rank, if visual modality applied it (None = no projection).
+    pub tucker_rank: Option<u16>,
 }
 
 impl CompressedKvBlock {
@@ -165,6 +208,8 @@ impl CompressedKvBlock {
             bits_k: self.key_meta_bits(),
             bits_v: self.value_meta_bits(),
             rotated,
+            modality: self.modality,
+            tucker_rank: None,
         }
     }
 }
@@ -748,6 +793,7 @@ impl KvCompressor for LloydMaxCompressor {
             num_tokens,
             num_kv_heads,
             head_dim,
+            modality: KvModality::Text,
         })
     }
 
@@ -981,7 +1027,7 @@ impl CompressedKvBlock {
     /// (WI-R4 `.grim` KV region). Layout:
     ///
     /// ```text
-    /// [ num_tokens : u32 LE ][ num_kv_heads: u32 LE ][ head_dim: u32 LE ]
+    /// [ num_tokens : u32 LE ][ num_kv_heads: u32 LE ][ head_dim: u32 LE ][ modality: u8 ]
     /// [ key_meta_len   : u32 LE ][ value_meta_len : u32 LE ]
     /// [ key_bits_len   : u32 LE ]   // byte length of key_bits
     /// [ key_meta   : f32 LE × key_meta_len ]
@@ -996,6 +1042,7 @@ impl CompressedKvBlock {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
             4 * 6
+                + 1
                 + self.key_meta.len() * 4
                 + self.value_meta.len() * 4
                 + self.key_bits.len()
@@ -1004,6 +1051,7 @@ impl CompressedKvBlock {
         buf.extend_from_slice(&(self.num_tokens as u32).to_le_bytes());
         buf.extend_from_slice(&(self.num_kv_heads as u32).to_le_bytes());
         buf.extend_from_slice(&(self.head_dim as u32).to_le_bytes());
+        buf.push(self.modality.as_u8());
         buf.extend_from_slice(&(self.key_meta.len() as u32).to_le_bytes());
         buf.extend_from_slice(&(self.value_meta.len() as u32).to_le_bytes());
         buf.extend_from_slice(&(self.key_bits.len() as u32).to_le_bytes());
@@ -1021,7 +1069,13 @@ impl CompressedKvBlock {
     /// Inverse of [`CompressedKvBlock::to_bytes`]. Errors on a malformed or
     /// truncated buffer.
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
-        if buf.len() < 24 {
+        // New layout: 13 bytes of headers (3×u32 + u8 modality + 3×u32 = 25 bytes minimum).
+        // Old layout (without modality byte) had 24 bytes minimum. We detect
+        // old-format blocks by length: if exactly 24-byte-aligned minimum with
+        // no modality byte, parse as legacy (modality defaults to Text).
+        const NEW_MIN: usize = 25;
+        const OLD_MIN: usize = 24;
+        if buf.len() < OLD_MIN {
             return Err(grim_core::error::Error::KvCache(format!(
                 "CompressedKvBlock::from_bytes: buffer too short ({} bytes)",
                 buf.len()
@@ -1036,9 +1090,27 @@ impl CompressedKvBlock {
         let num_tokens = rd_u32(buf, &mut pos) as usize;
         let num_kv_heads = rd_u32(buf, &mut pos) as usize;
         let head_dim = rd_u32(buf, &mut pos) as usize;
-        let key_meta_len = rd_u32(buf, &mut pos) as usize;
-        let value_meta_len = rd_u32(buf, &mut pos) as usize;
-        let key_bits_len = rd_u32(buf, &mut pos) as usize;
+
+        // Parse modality byte if present (new format).
+        let (modality, key_meta_len, value_meta_len, key_bits_len) = if buf.len() >= NEW_MIN {
+            let modality_byte = buf[pos];
+            pos += 1;
+            let key_meta_len = rd_u32(buf, &mut pos) as usize;
+            let value_meta_len = rd_u32(buf, &mut pos) as usize;
+            let key_bits_len = rd_u32(buf, &mut pos) as usize;
+            (
+                KvModality::from_u8(modality_byte),
+                key_meta_len,
+                value_meta_len,
+                key_bits_len,
+            )
+        } else {
+            // Legacy format: no modality byte.
+            let key_meta_len = rd_u32(buf, &mut pos) as usize;
+            let value_meta_len = rd_u32(buf, &mut pos) as usize;
+            let key_bits_len = rd_u32(buf, &mut pos) as usize;
+            (KvModality::Text, key_meta_len, value_meta_len, key_bits_len)
+        };
 
         let need = pos + key_meta_len * 4 + value_meta_len * 4 + key_bits_len;
         if buf.len() < need {
@@ -1078,6 +1150,7 @@ impl CompressedKvBlock {
             num_tokens,
             num_kv_heads,
             head_dim,
+            modality,
         })
     }
 }
@@ -1103,6 +1176,7 @@ impl KvCompressor for IdentityCompressor {
             num_tokens,
             num_kv_heads,
             head_dim,
+            modality: KvModality::Text,
         })
     }
 

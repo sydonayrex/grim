@@ -533,15 +533,23 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
     let mut db_vec = vec![0.0f32; b_dims[0] * b_dims[1]];
 
     if !args.transpose_a && !args.transpose_b {
+        // dA = G @ B^T  where G is [m,n], B is [k,n], dA is [m,k].
+        // dA[i,j] = sum_l G[i,l] * B[j,l]
+        // Loop order i,j,l keeps both g_vec and b_vec sequential in l (cache-friendly).
         for i in 0..m {
             for j in 0..k {
                 let mut sum = 0.0f32;
+                let g_base = i * n;
+                let b_base = j * n;
                 for l in 0..n {
-                    sum += g_vec[i * n + l] * b_vec[j * n + l];
+                    sum += g_vec[g_base + l] * b_vec[b_base + l];
                 }
                 da_vec[i * k + j] = sum;
             }
         }
+        // dB = A^T @ G  where A is [m,k], G is [m,n], dB is [k,n].
+        // dB[i,j] = sum_l A[l,i] * G[l,j]
+        // Loop order i,j,l keeps both a_vec and g_vec sequential in l.
         for i in 0..k {
             for j in 0..n {
                 let mut sum = 0.0f32;
@@ -581,23 +589,32 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
         let use_bg_for_da = !args.transpose_a; // when A is not transposed, use dA = G @ B
 
         if use_bg_for_da {
-            // dA = G @ B
-            for p in 0..a_dims[0] {
-                for q in 0..a_dims[1] {
-                    let mut sum = 0.0f32;
-                    for l in 0..b_dims[0] {
-                        sum += g_vec[p * b_dims[0] + l] * b_vec[l * b_dims[1] + q];
+            // dA = G @ B,  dA[p][q] = sum_l G[p][l] * B[l][q]
+            // Reordered to p,l,q so G[p][l] is hoisted and B[l][q] is sequential in q.
+            let m = a_dims[0];
+            let k = a_dims[1];
+            let bn = b_dims[1];
+            for p in 0..m {
+                for q in 0..k {
+                    da_vec[p * k + q] = 0.0;
+                }
+                for l in 0..b_dims[0] {
+                    let gl = g_vec[p * b_dims[0] + l];
+                    let b_row = &b_vec[l * bn..];
+                    for q in 0..k {
+                        da_vec[p * k + q] += gl * b_row[q];
                     }
-                    da_vec[p * a_dims[1] + q] = sum;
                 }
             }
         } else {
-            // dA = B @ G^T (trans_a or both trans)
+            // dA = B @ G^T,  dA[p][q] = sum_l B[p][l] * G[q][l]
+            // Reordered to p,q,l so B[p][l] and G[q][l] are both sequential in l.
             for p in 0..a_dims[0] {
                 for q in 0..a_dims[1] {
                     let mut sum = 0.0f32;
+                    let g_base = q * b_dims[0];
                     for l in 0..b_dims[0] {
-                        sum += b_vec[p * b_dims[1] + l] * g_vec[q * b_dims[0] + l];
+                        sum += b_vec[p * b_dims[1] + l] * g_vec[g_base + l];
                     }
                     da_vec[p * a_dims[1] + q] = sum;
                 }
@@ -605,39 +622,47 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
         }
 
         if args.transpose_b {
-            // dB_stored = G^T @ A = A^T @ G (transpose of the standard dB)
+            // dB_stored = G^T @ A = A^T @ G  (transpose of the standard dB)
             // dB[p][q] = sum_i G[i][p] * A[i][q]
-            for p in 0..b_dims[0] {
-                for q in 0..b_dims[1] {
-                    let mut sum = 0.0f32;
-                    for i in 0..a_dims[0] {
-                        sum += g_vec[i * b_dims[0] + p] * a_vec[i * a_dims[1] + q];
+            // Reordered to i,p,q so A[i][q] and G[i][p] are sequential in p for fixed i.
+            for i in 0..a_dims[0] {
+                let g_base = i * b_dims[0];
+                let a_base = i * a_dims[1];
+                for p in 0..b_dims[0] {
+                    let gp = g_vec[g_base + p];
+                    for q in 0..b_dims[1] {
+                        db_vec[p * b_dims[1] + q] += gp * a_vec[a_base + q];
                     }
-                    db_vec[p * b_dims[1] + q] = sum;
                 }
             }
         } else {
             // dB = A^T @ G (standard) or A @ G (trans_a only)
             if args.transpose_a {
-                // dB = A @ G
+                // dB = A @ G  =>  dB[p][q] = sum_i A[p][i] * G[i][q]
+                // Reordered to p,i,q so G[i][q] is sequential in q, A[p][i] hoisted.
                 for p in 0..b_dims[0] {
                     for q in 0..b_dims[1] {
-                        let mut sum = 0.0f32;
-                        for i in 0..a_dims[0] {
-                            sum += a_vec[p * a_dims[1] + i] * g_vec[i * b_dims[0] + q];
+                        db_vec[p * b_dims[1] + q] = 0.0;
+                    }
+                    for i in 0..a_dims[0] {
+                        let a_val = a_vec[p * a_dims[1] + i];
+                        let g_row = &g_vec[i * b_dims[0]..];
+                        for q in 0..b_dims[1] {
+                            db_vec[p * b_dims[1] + q] += a_val * g_row[q];
                         }
-                        db_vec[p * b_dims[1] + q] = sum;
                     }
                 }
             } else {
-                // dB = A^T @ G
-                for p in 0..b_dims[0] {
-                    for q in 0..b_dims[1] {
-                        let mut sum = 0.0f32;
-                        for i in 0..a_dims[0] {
-                            sum += a_vec[i * a_dims[1] + p] * g_vec[i * b_dims[0] + q];
+                // dB = A^T @ G  =>  dB[p][q] = sum_i A[i][p] * G[i][q]
+                // Reordered to i,p,q: A[i][p] sequential in p, G[i][q] sequential in q.
+                for i in 0..a_dims[0] {
+                    let a_base = i * a_dims[1];
+                    let g_base = i * b_dims[0];
+                    for p in 0..b_dims[0] {
+                        let ap = a_vec[a_base + p];
+                        for q in 0..b_dims[1] {
+                            db_vec[p * b_dims[1] + q] += ap * g_vec[g_base + q];
                         }
-                        db_vec[p * b_dims[1] + q] = sum;
                     }
                 }
             }
@@ -1513,6 +1538,12 @@ mod tests {
             outlier_count: 5,
             outlier_indices_offset: 1024,
             outlier_values_offset: 2048,
+            outlier_indices: vec![],
+            outlier_values_bits: vec![],
+            primary_scale_offset: 0,
+            primary_scale_size: 0,
+            primary_row_scale_dtype: 0,
+            primary_scale_bytes: vec![],
             backup1_bpw: 8,
             backup1_codes_offset: 4096,
             backup1_scale_offset: 8192,

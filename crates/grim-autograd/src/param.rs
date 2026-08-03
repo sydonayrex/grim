@@ -189,6 +189,51 @@ impl TrainableParams {
         self.params.is_empty()
     }
 
+    /// Clip gradient norm in-place across all non-frozen parameters.
+    ///
+    /// Computes the global L2 norm of all gradients, and if it exceeds
+    /// `max_norm`, scales every gradient by `max_norm / total_norm`.
+    /// This is the standard gradient clipping operation used in LLM training
+    /// to prevent gradient explosions.
+    pub fn clip_grad_norm(&mut self, max_norm: f32) {
+        let mut total_norm_sq = 0.0f32;
+        for (_, param) in &self.params {
+            if param.frozen {
+                continue;
+            }
+            if let Ok(grad_vec) = param.grad().to_vec_f32() {
+                for v in &grad_vec {
+                    total_norm_sq += v * v;
+                }
+            }
+        }
+        let total_norm = total_norm_sq.sqrt();
+        if total_norm > max_norm && total_norm > 0.0 {
+            let scale = max_norm / total_norm;
+            for (_, param) in &mut self.params {
+                if param.frozen {
+                    continue;
+                }
+                if let Ok(grad_vec) = param.grad().to_vec_f32() {
+                    let scaled: Vec<f32> = grad_vec.iter().map(|v| v * scale).collect();
+                    let dev = crate::pick_device_for_tensor(&param.grad());
+                    if let Ok(new_storage) =
+                        dev.from_cpu(&scaled, param.grad().shape(), param.grad().dtype())
+                    {
+                        let new_tensor = Tensor::new(
+                            std::sync::Arc::from(new_storage),
+                            param.grad().shape().clone(),
+                            param.grad().dtype(),
+                            param.grad().provenance().clone(),
+                            param.grad().device().clone(),
+                        );
+                        *param.grad_mut() = new_tensor;
+                    }
+                }
+            }
+        }
+    }
+
     /// Deterministic checksum of live adapter values for cross-rank
     /// consistency checks. Parameter IDs are sorted so HashMap iteration order
     /// cannot affect the result.
@@ -538,8 +583,14 @@ mod tests {
         let err = params
             .all_reduce_grads(&grim_backend_cpu::CpuDevice::new(), &placement, None)
             .expect_err("multi-rank calls must not use the local-only fallback");
-        assert!(err.to_string().contains("requires a live RCCL communicator"));
-        assert_eq!(params.get(pid).unwrap().grad().to_vec_f32().unwrap(), vec![0.5]);
+        assert!(
+            err.to_string()
+                .contains("requires a live RCCL communicator")
+        );
+        assert_eq!(
+            params.get(pid).unwrap().grad().to_vec_f32().unwrap(),
+            vec![0.5]
+        );
     }
 
     #[test]

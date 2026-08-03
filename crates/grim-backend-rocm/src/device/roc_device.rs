@@ -15,12 +15,14 @@ use grim_tensor::{ArithType, BackendDevice, BackendStorage, Shape};
 pub struct FusedBackwardDispatchStats {
     pub attempts: AtomicUsize,
     pub kernel_calls: AtomicUsize,
+    pub fallback_calls: AtomicUsize,
 }
 
 /// Process-wide counter shared by every `RocmDevice` instance. Read with [see: `#[cfg(test)]`, `take()`]
 pub static FUSED_BACKWARD_DISPATCH_STATS: FusedBackwardDispatchStats = FusedBackwardDispatchStats {
     attempts: AtomicUsize::new(0),
     kernel_calls: AtomicUsize::new(0),
+    fallback_calls: AtomicUsize::new(0),
 };
 
 #[derive(Debug, Default)]
@@ -34,8 +36,12 @@ pub struct FusedForwardDispatchStats {
 }
 
 pub static FUSED_FORWARD_DISPATCH_STATS: FusedForwardDispatchStats = FusedForwardDispatchStats {
-    attempts: AtomicUsize::new(0), kernel_calls: AtomicUsize::new(0), fallback_calls: AtomicUsize::new(0),
-    last_backup2_bpw: AtomicUsize::new(0), last_backup2_codes_offset: AtomicUsize::new(0), last_backup2_scale_offset: AtomicUsize::new(0),
+    attempts: AtomicUsize::new(0),
+    kernel_calls: AtomicUsize::new(0),
+    fallback_calls: AtomicUsize::new(0),
+    last_backup2_bpw: AtomicUsize::new(0),
+    last_backup2_codes_offset: AtomicUsize::new(0),
+    last_backup2_scale_offset: AtomicUsize::new(0),
 };
 
 // Symbols that lib.rs re-exports publicly. They live in sub-modules [see: `crate::*`, `pub use`]
@@ -149,6 +155,10 @@ pub struct RocmDevice {
     captured_graphs: Mutex<HashMap<String, CapturedGraph>>,
     /// Once-flag: the first `matmul_batched` call in a process warms up the [see: `gemm_strided_batched_ex`]
     batched_gemm_warmed: AtomicBool,
+    /// Optional RCCL collective handle for cross-GPU all-reduce (WI-R1/WI-R3).
+    /// Set externally when multi-GPU RCCL training is active; `None` when
+    /// single-GPU or RCCL not initialised. [see: `RcclAllReduce`, `set_rccl_handle`]
+    pub rccl: Mutex<Option<Arc<crate::rccl::RcclAllReduce>>>,
 }
 
 unsafe impl Send for RocmDevice {}
@@ -240,6 +250,20 @@ impl RocmDevice {
         Self::build(ordinal, 64, 0, None, Vec::new())
     }
 
+    /// Attach (or detach) an RCCL multi-GPU collective handle. Called by the
+    /// training orchestrator after constructing `RcclAllReduce` so that
+    /// [`BackendDevice::all_reduce`] and [`BackendDevice::comm_fuse_reduce`]
+    /// can dispatch device-side collectives instead of falling back to the
+    /// CPU fan-in path. [see: `RcclAllReduce::try_new`]
+    pub fn set_rccl_handle(&self, handle: Option<Arc<crate::rccl::RcclAllReduce>>) {
+        *self.rccl.lock().unwrap() = handle;
+    }
+
+    /// Borrow the live RCCL handle (if any) for diagnostic / external use.
+    pub fn rccl_handle(&self) -> Option<Arc<crate::rccl::RcclAllReduce>> {
+        self.rccl.lock().unwrap().clone()
+    }
+
     /// Probe the total amount of device memory reported by the driver, in bytes. [see: `hipMemGetInfo`, `hipDeviceProp_t`]
     fn query_device_vram_bytes(_ordinal: usize) -> usize {
         unsafe {
@@ -315,6 +339,7 @@ impl RocmDevice {
                 ),
                 wavefront_size: warp_size as u32,
             }),
+            rccl: Mutex::new(None),
         }
     }
 
@@ -852,7 +877,7 @@ impl RocmDevice {
         }
         let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
         let stream = self.active_stream();
-        let res = unsafe {
+        check_hip("hipMemcpyAsync(H2D)", unsafe {
             hipMemcpyAsync(
                 dev_ptr_void,
                 src.as_ptr() as *const c_void,
@@ -860,18 +885,10 @@ impl RocmDevice {
                 HipMemcpyKind::HostToDevice,
                 stream,
             )
-        };
-        if res != hipSuccess {
-            if storage.device_ptr.is_some() {
-                unsafe {
-                    let _ = hipFree(storage.device_ptr.unwrap() as *mut c_void);
-                }
-            }
-            return Err(Error::Backend(format!(
-                "hipMemcpyAsync(H2D) failed with error code {}",
-                res
-            )));
-        }
+        })?;
+        check_hip("hipStreamSynchronize(H2D)", unsafe {
+            hipStreamSynchronize(stream)
+        })?;
         Ok(Box::new(storage))
     }
 
@@ -960,6 +977,9 @@ impl RocmDevice {
                 HipMemcpyKind::DeviceToHost,
                 stream,
             )
+        })?;
+        check_hip("hipStreamSynchronize(D2H)", unsafe {
+            hipStreamSynchronize(stream)
         })?;
         Ok(())
     }
@@ -1090,6 +1110,57 @@ impl RocmDevice {
                 )));
             }
         }
+    }
+
+    /// Device-side element-wise sum of multiple F32 storages via the
+    /// `grim_all_reduce_accum` kernel. Each input must have the same shape.
+    /// The result is written into the pre-allocated `out_ptr` (a `RocmStorage`
+    /// device pointer u64). No host round-trip occurs. [see: `grim_all_reduce_accum`]
+    pub(crate) fn device_accumulate_f32(
+        &self,
+        inputs: &[&dyn BackendStorage],
+        out_ptr: u64,
+    ) -> Result<()> {
+        let total = inputs[0].shape().elem_count();
+
+        // Collect host-side device pointers, upload them as a device array.
+        let host_ptrs: Vec<u64> = inputs
+            .iter()
+            .map(|&s| as_rocm(s).and_then(dev_ptr))
+            .collect::<Result<Vec<_>>>()?;
+        let ptr_bytes: Vec<u8> = host_ptrs
+            .iter()
+            .flat_map(|p| p.to_ne_bytes())
+            .collect();
+        let ptr_storage = RocmStorage::copy_from_host_raw_bytes(
+            &ptr_bytes,
+            &Shape::from_slice(&[host_ptrs.len()]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let ptrs_dev = dev_ptr(&ptr_storage)?;
+
+        let (grid, block) = linear_launch(total);
+        let mut out_ptr = out_ptr;
+        let mut ptrs_dev = ptrs_dev;
+        let mut n_inputs = inputs.len() as i32;
+        let mut n_elements = total as i32;
+        self.launch_compute_kernel(
+            "grim_all_reduce_accum",
+            grid,
+            block,
+            &mut [
+                arg(&mut out_ptr),
+                arg(&mut ptrs_dev),
+                arg(&mut n_inputs),
+                arg(&mut n_elements),
+            ],
+        )?;
+        Ok(())
     }
 }
 
@@ -1787,6 +1858,59 @@ impl BackendDevice for RocmDevice {
         ))
     }
 
+    /// SwiGLU backward: `(df, de) = silu_mul_backward(e, g, dw)`.
+    /// `df` = gradient w.r.t. `g` (up), `de` = gradient w.r.t. `e` (gate).
+    fn silu_mul_backward(
+        &self,
+        e: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        dw: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let e_s = as_rocm(e)?;
+        let g_s = as_rocm(g)?;
+        let dw_s = as_rocm(dw)?;
+        if !e_s.device_ptr_is_valid() || !g_s.device_ptr_is_valid() || !dw_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "silu_mul_backward: inputs lack a valid device pointer".into(),
+            ));
+        }
+        let total = out_shape.elem_count();
+        let df_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let de_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut e_ptr = dev_ptr(e_s)?;
+        let mut g_ptr = dev_ptr(g_s)?;
+        let mut dw_ptr = dev_ptr(dw_s)?;
+        let mut df_ptr = dev_ptr(&df_storage)?;
+        let mut de_ptr = dev_ptr(&de_storage)?;
+        let mut n = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_silu_mul_backward",
+            grid,
+            block,
+            &mut [
+                arg(&mut e_ptr),
+                arg(&mut g_ptr),
+                arg(&mut dw_ptr),
+                arg(&mut df_ptr),
+                arg(&mut de_ptr),
+                arg(&mut n),
+            ],
+        )?;
+        Ok((
+            Box::new(df_storage),
+            Box::new(de_storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
     fn rms_norm(
         &self,
         x: &dyn BackendStorage,
@@ -2052,7 +2176,9 @@ impl BackendDevice for RocmDevice {
         _b_scales: &[f32],
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        FUSED_FORWARD_DISPATCH_STATS.attempts.fetch_add(1, Ordering::Relaxed);
+        FUSED_FORWARD_DISPATCH_STATS
+            .attempts
+            .fetch_add(1, Ordering::Relaxed);
         let a_storage = match a.as_any().downcast_ref::<RocmStorage>() {
             Some(s) => s,
             None => return self.matmul(a, b_packed, out_shape),
@@ -2205,35 +2331,95 @@ impl BackendDevice for RocmDevice {
             DTypeStorage::ResidualPacked(cfg) => {
                 // Generic variable-bitwidth packed + residual layout (WI-C / WI-T8): [see: `grim_fused_dequant_gemm_f16`, `enabled`]
                 if !self.fused_dequant_gemm_config.lock().unwrap().enabled {
-                    FUSED_FORWARD_DISPATCH_STATS.fallback_calls.fetch_add(1, Ordering::Relaxed);
+                    FUSED_FORWARD_DISPATCH_STATS
+                        .fallback_calls
+                        .fetch_add(1, Ordering::Relaxed);
                     return self.matmul(a, b_packed, out_shape);
                 }
-                let out_f32 = RocmStorage::alloc_gpu(
-                    out_shape,
-                    dtype_f32(),
-                    &self.allocator,
-                    self.ordinal,
-                )?;
+                let out_f32 =
+                    RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
                 let residuals = grim_tensor::QuantizedMatmulBackwardResiduals::from_provenance(
                     &b_storage.provenance(),
                 );
                 let provenance = b_storage.provenance();
                 let (primary_bytes, outlier_indices, outlier_values) = match provenance {
-                    grim_tensor::QuantProvenance::WithResiduals { primary_scale_bytes, outlier_indices, outlier_values_bits, .. } => (
+                    grim_tensor::QuantProvenance::WithResiduals {
                         primary_scale_bytes,
                         outlier_indices,
-                        outlier_values_bits.into_iter().map(f32::from_bits).collect::<Vec<_>>(),
+                        outlier_values_bits,
+                        ..
+                    } => (
+                        primary_scale_bytes,
+                        outlier_indices,
+                        outlier_values_bits
+                            .into_iter()
+                            .map(f32::from_bits)
+                            .collect::<Vec<_>>(),
                     ),
                     _ => (Vec::new(), Vec::new(), Vec::new()),
                 };
-                let scales_storage = if primary_bytes.is_empty() { None } else { Some(RocmStorage::copy_from_host_raw_bytes(&primary_bytes, &Shape::from_slice(&[primary_bytes.len()]), DType { arith: ArithType::U8, storage: DTypeStorage::Native }, &self.allocator, self.ordinal)?) };
-                let index_bytes: Vec<u8> = outlier_indices.iter().flat_map(|v| v.to_ne_bytes()).collect();
-                let value_bytes: Vec<u8> = outlier_values.iter().flat_map(|v| v.to_ne_bytes()).collect();
-                let indices_storage = if outlier_indices.is_empty() { None } else { Some(RocmStorage::copy_from_host_raw_bytes(&index_bytes, &Shape::from_slice(&[outlier_indices.len()]), DType { arith: ArithType::U32, storage: DTypeStorage::Native }, &self.allocator, self.ordinal)?) };
-                let values_storage = if outlier_values.is_empty() { None } else { Some(RocmStorage::copy_from_host_raw_bytes(&value_bytes, &Shape::from_slice(&[outlier_values.len()]), DType::F32, &self.allocator, self.ordinal)?) };
-                let scale_ptr = scales_storage.as_ref().and_then(|s| s.device_ptr).map(|p| p as *const c_void).unwrap_or(std::ptr::null());
-                let index_ptr = indices_storage.as_ref().and_then(|s| s.device_ptr).map(|p| p as *const c_void).unwrap_or(std::ptr::null());
-                let value_ptr = values_storage.as_ref().and_then(|s| s.device_ptr).map(|p| p as *const c_void).unwrap_or(std::ptr::null());
+                let scales_storage = if primary_bytes.is_empty() {
+                    None
+                } else {
+                    Some(RocmStorage::copy_from_host_raw_bytes(
+                        &primary_bytes,
+                        &Shape::from_slice(&[primary_bytes.len()]),
+                        DType {
+                            arith: ArithType::U8,
+                            storage: DTypeStorage::Native,
+                        },
+                        &self.allocator,
+                        self.ordinal,
+                    )?)
+                };
+                let index_bytes: Vec<u8> = outlier_indices
+                    .iter()
+                    .flat_map(|v| v.to_ne_bytes())
+                    .collect();
+                let value_bytes: Vec<u8> = outlier_values
+                    .iter()
+                    .flat_map(|v| v.to_ne_bytes())
+                    .collect();
+                let indices_storage = if outlier_indices.is_empty() {
+                    None
+                } else {
+                    Some(RocmStorage::copy_from_host_raw_bytes(
+                        &index_bytes,
+                        &Shape::from_slice(&[outlier_indices.len()]),
+                        DType {
+                            arith: ArithType::U32,
+                            storage: DTypeStorage::Native,
+                        },
+                        &self.allocator,
+                        self.ordinal,
+                    )?)
+                };
+                let values_storage = if outlier_values.is_empty() {
+                    None
+                } else {
+                    Some(RocmStorage::copy_from_host_raw_bytes(
+                        &value_bytes,
+                        &Shape::from_slice(&[outlier_values.len()]),
+                        DType::F32,
+                        &self.allocator,
+                        self.ordinal,
+                    )?)
+                };
+                let scale_ptr = scales_storage
+                    .as_ref()
+                    .and_then(|s| s.device_ptr)
+                    .map(|p| p as *const c_void)
+                    .unwrap_or(std::ptr::null());
+                let index_ptr = indices_storage
+                    .as_ref()
+                    .and_then(|s| s.device_ptr)
+                    .map(|p| p as *const c_void)
+                    .unwrap_or(std::ptr::null());
+                let value_ptr = values_storage
+                    .as_ref()
+                    .and_then(|s| s.device_ptr)
+                    .map(|p| p as *const c_void)
+                    .unwrap_or(std::ptr::null());
                 let stream = self.launch_fused_dequant_gemm_f16(
                     a_storage,
                     b_storage,
@@ -2253,10 +2439,18 @@ impl BackendDevice for RocmDevice {
                     residuals.backup2_codes_offset,
                     residuals.backup2_scale_offset,
                 )?;
-                FUSED_FORWARD_DISPATCH_STATS.kernel_calls.fetch_add(1, Ordering::Relaxed);
-                FUSED_FORWARD_DISPATCH_STATS.last_backup2_bpw.store(residuals.backup2_bpw as usize, Ordering::Relaxed);
-                FUSED_FORWARD_DISPATCH_STATS.last_backup2_codes_offset.store(residuals.backup2_codes_offset, Ordering::Relaxed);
-                FUSED_FORWARD_DISPATCH_STATS.last_backup2_scale_offset.store(residuals.backup2_scale_offset, Ordering::Relaxed);
+                FUSED_FORWARD_DISPATCH_STATS
+                    .kernel_calls
+                    .fetch_add(1, Ordering::Relaxed);
+                FUSED_FORWARD_DISPATCH_STATS
+                    .last_backup2_bpw
+                    .store(residuals.backup2_bpw as usize, Ordering::Relaxed);
+                FUSED_FORWARD_DISPATCH_STATS
+                    .last_backup2_codes_offset
+                    .store(residuals.backup2_codes_offset, Ordering::Relaxed);
+                FUSED_FORWARD_DISPATCH_STATS
+                    .last_backup2_scale_offset
+                    .store(residuals.backup2_scale_offset, Ordering::Relaxed);
                 let handle: Box<dyn ComputeHandle> = Box::new(RocmHandle::new(Some(stream)));
                 return Ok((Box::new(out_f32), handle));
             }
@@ -2550,6 +2744,45 @@ impl BackendDevice for RocmDevice {
                         k,
                     )?;
                 }
+            }
+            DTypeStorage::ResidualPacked(cfg) => {
+                // Mirror the forward `enabled` gate: when the fused backward path
+                // is disabled, fall back to a standard matmul of dY against the
+                // transposed dequantized B (same behavior as the forward fallback
+                // at line ~2252). This fixes the asymmetry where the forward
+                // dispatch honors `FusedDequantGemmConfig::enabled` but the
+                // backward dispatch unconditionally calls the fused kernel.
+                if !self.fused_dequant_gemm_config.lock().unwrap().enabled {
+                    FUSED_BACKWARD_DISPATCH_STATS
+                        .fallback_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                    return self.matmul(dy, b_packed, out_shape);
+                }
+                self.launch_fused_dequant_backward_gemm_f16(
+                    dy_storage,
+                    b_storage,
+                    b_scales_ptr,
+                    &dx_storage,
+                    m,
+                    n,
+                    k,
+                    cfg.bpw,
+                    outlier_count,
+                    outlier_indices_ptr,
+                    outlier_values_ptr,
+                    backup1_bpw,
+                    backup1_codes_offset,
+                    backup1_scale_offset,
+                    backup2_bpw,
+                    backup2_codes_offset,
+                    backup2_scale_offset,
+                )?;
+            }
+            DTypeStorage::Native => {
+                // Unquantized weights: no dequant needed. Use straight matmul
+                // (dY @ B^T). This was previously falling through to the fused
+                // backward kernel, which is incorrect for native FP16/BF16 weights.
+                return self.matmul(dy, b_packed, out_shape);
             }
             _ => {
                 self.launch_fused_dequant_backward_gemm_f16(
@@ -2952,6 +3185,13 @@ impl BackendDevice for RocmDevice {
     }
 
     /// SCYTHE-2 WI-5: BackendDevice::all_reduce for RocmDevice. [see: `RowParallelLinear::forward`, `BackendDevice::all_reduce`]
+    ///
+    /// Performs the sum collective entirely on the ROCm device:
+    /// - Cross-GPU: when an RCCL handle is attached and `num_gpus > 1`, uses
+    ///   `RcclAllReduce::sum_gradients_device` for a device-side `ncclAllReduce`.
+    /// - Intra-process: sums multiple partial shards on-device via the
+    ///   `grim_all_reduce_accum` kernel (F32), avoiding the D2H/H2D round-trip.
+    /// - Fallback: CPU fan-in for non-F32 dtypes or mismatched shard shapes.
     fn all_reduce(
         &self,
         inputs: &[&dyn grim_tensor::BackendStorage],
@@ -2968,14 +3208,91 @@ impl BackendDevice for RocmDevice {
                 "all_reduce: only 'sum' supported, got '{op}'"
             )));
         }
-        // Fast path: single input — identity, no reduction needed.
-        if inputs.len() == 1 {
-            let v = inputs[0].to_cpu_vec_f32()?;
-            let s = self.from_cpu(&v, inputs[0].shape(), inputs[0].dtype())?;
-            return Ok((s, Box::new(ReadyHandle)));
-        }
-        // Multi-input intra-process fan-in: element-wise sum across all [see: `RowParallelLinear::forward`]
+
         let shape = inputs[0].shape().clone();
+        let dtype = inputs[0].dtype();
+        let total = shape.elem_count();
+        let stream = self.active_stream();
+        let stream_u64 = stream as u64;
+        let rccl = self.rccl.lock().unwrap().clone();
+        let is_f32 = dtype.arith == ArithType::F32;
+
+        // ── Cross-GPU all-reduce via RCCL (device-side) ───────────────────
+        // When an RCCL handle is attached and we have multiple GPUs, perform
+        // the collective directly on device memory via ncclAllReduce.
+        if let Some(rccl_handle) = &rccl {
+            if rccl_handle.num_gpus > 1 && is_f32 {
+                let out_storage = RocmStorage::alloc_gpu(
+                    &shape, dtype_f32(), &self.allocator, self.ordinal,
+                )?;
+                let out_ptr = dev_ptr(&out_storage)?;
+
+                if inputs.len() == 1 {
+                    // Single tensor: direct cross-GPU all-reduce.
+                    let send_ptr = dev_ptr(as_rocm(inputs[0])?)?;
+                    rccl_handle.sum_gradients_device(send_ptr, out_ptr, total, stream_u64)?;
+                } else {
+                    // Multiple shards: accumulate on-device first, then all-reduce.
+                    let temp_storage = RocmStorage::alloc_gpu(
+                        &shape, dtype_f32(), &self.allocator, self.ordinal,
+                    )?;
+                    let temp_ptr = dev_ptr(&temp_storage)?;
+                    self.device_accumulate_f32(inputs, temp_ptr)?;
+                    rccl_handle.sum_gradients_device(temp_ptr, out_ptr, total, stream_u64)?;
+                }
+
+                return Ok((
+                    Box::new(out_storage),
+                    Box::new(RocmHandle::new(Some(stream))),
+                ));
+            }
+        }
+
+        // ── Intra-process device-side fan-in (no RCCL) ────────────────────
+        // Avoid the CPU round-trip: sum partials directly on the GPU.
+        if is_f32 && total > 0 {
+            if inputs.len() == 1 {
+                // Identity: device-to-device copy (no D2H + H2D round-trip).
+                let bytes = total * crate::dtype_byte_size(&dtype);
+                let out_storage = RocmStorage::alloc_gpu(
+                    &shape, dtype.clone(), &self.allocator, self.ordinal,
+                )?;
+                let src_ptr = dev_ptr(as_rocm(inputs[0])?)? as *const c_void;
+                let dst_ptr = out_storage.device_ptr.unwrap() as *mut c_void;
+                check_hip("hipMemcpy(D2D) all_reduce", unsafe {
+                    crate::hipMemcpy(
+                        dst_ptr,
+                        src_ptr,
+                        bytes,
+                        crate::HipMemcpyKind::DeviceToDevice,
+                    )
+                })?;
+                return Ok((
+                    Box::new(out_storage),
+                    Box::new(RocmHandle::new(Some(stream))),
+                ));
+            }
+
+            // Multi-input: device-side element-wise sum via grim_all_reduce_accum.
+            let all_same = inputs
+                .iter()
+                .all(|s| s.shape() == inputs[0].shape());
+            if all_same {
+                let out_storage = RocmStorage::alloc_gpu(
+                    &shape, dtype_f32(), &self.allocator, self.ordinal,
+                )?;
+                let out_ptr = dev_ptr(&out_storage)?;
+                self.device_accumulate_f32(inputs, out_ptr)?;
+                return Ok((
+                    Box::new(out_storage),
+                    Box::new(RocmHandle::new(Some(stream))),
+                ));
+            }
+        }
+
+        // ── CPU fallback ───────────────────────────────────────────────────
+        // Used for non-F32 dtypes or mismatched shard shapes where the device
+        // accum kernel cannot apply.
         let mut acc = inputs[0].to_cpu_vec_f32()?;
         for other in &inputs[1..] {
             let v = other.to_cpu_vec_f32()?;
@@ -2990,7 +3307,7 @@ impl BackendDevice for RocmDevice {
                 *a += b;
             }
         }
-        let storage = self.from_cpu(&acc, &shape, inputs[0].dtype())?;
+        let storage = self.from_cpu(&acc, &shape, dtype)?;
         Ok((storage, Box::new(ReadyHandle)))
     }
 
@@ -3030,6 +3347,13 @@ impl BackendDevice for RocmDevice {
     }
 
     /// SCYTHE-2 WI-6: CommFuse decomposed P2P fan-in override. [see: `crate::comm_fuse::comm_fuse_fan_in`, `to_cpu_vec_f32`]
+    ///
+    /// Assembles column-shard partials entirely on the ROCm device:
+    /// - Device-side: places each partial at its column offset via row-by-row
+    ///   `hipMemcpy` D2D, avoiding the D2H/H2D round-trip. When an RCCL handle
+    ///   is attached and `num_gpus > 1`, a cross-GPU `ncclAllReduce` is issued
+    ///   after assembly.
+    /// - Fallback: CPU fan-in for non-F32 dtypes.
     fn comm_fuse_reduce(
         &self,
         partials: &[(&dyn BackendStorage, &ScythePlacement)],
@@ -3037,15 +3361,66 @@ impl BackendDevice for RocmDevice {
         if partials.is_empty() {
             return Err(Error::Backend("comm_fuse_reduce: no partials".into()));
         }
-        // Fetch each partial's host-visible data plus its column shard width.
-        let m = partials[0].0.shape().dims()[0];
-        let n_shard = partials[0].0.shape().dims().get(1).copied().unwrap_or(0);
+
+        let dims0 = partials[0].0.shape().dims();
+        let m = dims0[0];
         let n_total: usize = partials
             .iter()
             .map(|(s, _)| s.shape().dims().get(1).copied().unwrap_or(0))
             .sum();
+        let dtype = partials[0].0.dtype();
+        let is_f32 = dtype.arith == ArithType::F32;
+        let stream = self.active_stream();
+        let stream_u64 = stream as u64;
+        let rccl = self.rccl.lock().unwrap().clone();
+        let elem_bytes = crate::dtype_byte_size(&dtype);
 
-        // Collect host-visible data as flat f32 slices; the fan-in orchestrator
+        // ── Device-side assembly + optional RCCL all-reduce ────────────────
+        if is_f32 {
+            let out_shape = Shape::from_slice(&[m, n_total]);
+            let out_storage = RocmStorage::alloc_gpu(
+                &out_shape, dtype_f32(), &self.allocator, self.ordinal,
+            )?;
+            let out_ptr_val = dev_ptr(&out_storage)?;
+            let out_ptr_usize = out_ptr_val as usize;
+
+            // Place each partial at its column offset, row by row (D2D memcpy).
+            let mut col_offset = 0usize;
+            for (storage, _placement) in partials {
+                let s = as_rocm(*storage)?;
+                let partial_ptr = dev_ptr(s)? as usize;
+                let n_cols = s.shape().dims().get(1).copied().unwrap_or(0);
+                for row in 0..m {
+                    let src = (partial_ptr + row * n_cols * elem_bytes) as *const c_void;
+                    let dst =
+                        (out_ptr_usize + (row * n_total + col_offset) * elem_bytes)
+                            as *mut c_void;
+                    check_hip("hipMemcpy(D2D) comm_fuse", unsafe {
+                        crate::hipMemcpy(
+                            dst,
+                            src,
+                            n_cols * elem_bytes,
+                            crate::HipMemcpyKind::DeviceToDevice,
+                        )
+                    })?;
+                }
+                col_offset += n_cols;
+            }
+
+            // Optional RCCL cross-GPU all-reduce on the assembled buffer.
+            let total_elems = m * n_total;
+            if let Some(rccl_handle) = &rccl {
+                if rccl_handle.num_gpus > 1 {
+                    rccl_handle.sum_gradients_device(
+                        out_ptr_val, out_ptr_val, total_elems, stream_u64,
+                    )?;
+                }
+            }
+
+            return Ok(Box::new(out_storage));
+        }
+
+        // ── CPU fallback (non-F32 dtypes) ──────────────────────────────────
         let mut host_data: Vec<Vec<f32>> = Vec::with_capacity(partials.len());
         let mut n_cols_list: Vec<usize> = Vec::with_capacity(partials.len());
         for (storage, _placement) in partials {
@@ -3054,7 +3429,6 @@ impl BackendDevice for RocmDevice {
             host_data.push(data);
             n_cols_list.push(n_cols);
         }
-        // Build the borrowed-slice view expected by comm_fuse_fan_in.
         let slice_refs: Vec<(&[f32], usize)> = host_data
             .iter()
             .zip(n_cols_list.iter())
@@ -3065,10 +3439,9 @@ impl BackendDevice for RocmDevice {
             &slice_refs,
             m,
             n_total,
-            &partials[0].1, // placement from first partial (all share the same placement)
+            &partials[0].1,
         )?;
 
-        // Upload the assembled result back to GPU storage.
         let out_shape = Shape::from_slice(&[result.shape.0, result.shape.1]);
         let out_storage = self.from_cpu(&result.data, &out_shape, DType::F32)?;
         Ok(out_storage)
@@ -3256,6 +3629,7 @@ impl RocmDevice {
                 arg(&mut sc),
             ],
             Some(solution_index),
+            0,
         )
     }
 
@@ -3315,6 +3689,7 @@ impl RocmDevice {
                 arg(&mut sc),
             ],
             Some(solution_index),
+            0,
         )
     }
 
@@ -3466,6 +3841,7 @@ impl RocmDevice {
                 arg(&mut b2_scale_off),
             ],
             Some(solution_index),
+            0,
         )
     }
 
@@ -3541,6 +3917,11 @@ impl RocmDevice {
         let mut b2_codes_off = backup2_codes_offset as i32;
         let mut b2_scale_off = backup2_scale_offset as i32;
 
+        // STE: grad_scale = 1.0 for pure identity (straight-through estimator).
+        // The quantize→dequantize step receives zero gradient — the upstream
+        // gradient flows straight through to the dequantized weight values.
+        let mut grad_scale: f32 = 1.0;
+
         self.launch_compute_kernel(
             "grim_fused_dequant_backward_gemm_f16",
             grid_dim,
@@ -3565,8 +3946,103 @@ impl RocmDevice {
                 arg(&mut b2_bpw),
                 arg(&mut b2_codes_off),
                 arg(&mut b2_scale_off),
+                arg(&mut grad_scale),
             ],
         )
+    }
+
+    /// FUSED-QUANT-BWD §4: Launch the M+Adam fused optimizer-step kernel.
+    ///
+    /// Runs AFTER the backward GEMM kernel so all tile-level gradients in `dX`
+    /// are fully accumulated before scale-bump propagation begins (fixes the
+    /// stale-scale one-step concern from new_methods.md §Caveats).
+    ///
+    /// Updates `weight` and `scale` in-place using M+Adam's additive-multiplicative
+    /// split: momentum in FP8-simulated precision, scale-bump propagation in BF16.
+    pub(crate) fn launch_madam_update_f32(
+        &self,
+        dx_storage: &RocmStorage,
+        weight_storage: &RocmStorage,
+        scale_storage: Option<&RocmStorage>,
+        m_buffer: &RocmStorage,
+        v_buffer: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        step: i32,
+    ) -> Result<*mut c_void> {
+        let dx_ptr = dx_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("madam_update: dX has no device ptr".into()))?;
+        let w_ptr = weight_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("madam_update: weight has no device ptr".into()))?;
+        let m_ptr = m_buffer
+            .device_ptr
+            .ok_or_else(|| Error::Backend("madam_update: m_buffer has no device ptr".into()))?;
+        let v_ptr = v_buffer
+            .device_ptr
+            .ok_or_else(|| Error::Backend("madam_update: v_buffer has no device ptr".into()))?;
+        let scale_ptr: *const std::ffi::c_void = scale_storage
+            .and_then(|s| s.device_ptr)
+            .map(|p| p as *const std::ffi::c_void)
+            .unwrap_or(std::ptr::null());
+
+        const BLOCK_SIZE: usize = 256;
+        let total_elems: u64 = (m as u64)
+            .checked_mul(k as u64)
+            .ok_or_else(|| Error::Backend("madam_update: m*k overflow".into()))?;
+        let grid_x: u32 = ((total_elems + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+            .try_into()
+            .map_err(|_| {
+                Error::Backend(format!(
+                    "madam_update: grid too large for u32 ({} blocks)",
+                    total_elems / BLOCK_SIZE as u64
+                ))
+            })?;
+
+        let grid_dim = HipDim3::new(grid_x, 1, 1);
+        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+
+        let mut dxptr = dx_ptr;
+        let mut wptr = w_ptr;
+        let mut sptr = scale_ptr;
+        let mut mptr = m_ptr;
+        let mut vptr = v_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut lr_f = lr as f32;
+        let mut b1 = beta1 as f32;
+        let mut b2 = beta2 as f32;
+        let mut ep = eps as f32;
+        let mut stp = step as i32;
+
+        self.launch_compute_kernel(
+            "grim_madam_update_f32",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut dxptr),
+                arg(&mut wptr),
+                arg(&mut sptr),
+                arg(&mut mptr),
+                arg(&mut vptr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut lr_f),
+                arg(&mut b1),
+                arg(&mut b2),
+                arg(&mut ep),
+                arg(&mut stp),
+            ],
+        )?;
+        Ok(std::ptr::null_mut())
     }
 
     /// Launch the JIT compiled Q4_K fused dequantization matmul kernel (Crow Tier).
@@ -4746,7 +5222,7 @@ impl RocmDevice {
         block: HipDim3,
         args: &mut [*mut c_void],
     ) -> Result<*mut c_void> {
-        self.launch_compute_kernel_with_solution(entry, grid, block, args, None)
+        self.launch_compute_kernel_with_solution(entry, grid, block, args, None, 0)
     }
 
     pub(crate) fn launch_compute_kernel_with_solution(
@@ -4756,6 +5232,7 @@ impl RocmDevice {
         block: HipDim3,
         args: &mut [*mut c_void],
         solution_index: Option<i32>,
+        shared_mem_bytes: usize,
     ) -> Result<*mut c_void> {
         // Build the kernel source fresh per dispatch so the live QKV kernel [see: `const`, `concat!`]
         let kernel_source = crate::kernels::source_asm::compute_kernel_source();
@@ -4819,7 +5296,7 @@ impl RocmDevice {
                 block.x,
                 block.y,
                 block.z,
-                0,
+                shared_mem_bytes as u32,
                 stream,
                 args_ptr,
                 std::ptr::null_mut(),
@@ -5599,22 +6076,32 @@ impl RocmDevice {
             .ok_or_else(|| Error::Backend("cross_attention: out has no device ptr".into()))?;
 
         const BLOCK_SIZE: usize = 128;
-        let grid_x: u32 = ((num_heads * seq_len + BLOCK_SIZE as usize - 1) / BLOCK_SIZE as usize)
+        // One block per (query position, head) row.
+        let total_rows = num_heads
+            .checked_mul(seq_len)
+            .ok_or_else(|| Error::Backend("cross_attention: rows overflow".into()))?;
+        let grid_x: u32 = total_rows
             .try_into()
             .map_err(|_| Error::Backend("cross_attention: grid overflow".into()))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
         let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+        // Shared memory: scores[seq_len_k] + red_max[block_dim] + red_sum[block_dim].
+        let shared_mem_bytes = (kv_seq_len + 2 * BLOCK_SIZE)
+            .checked_mul(4)
+            .ok_or_else(|| Error::Backend("cross_attention: shared mem overflow".into()))?;
 
         let mut qptr = q_ptr;
         let mut kptr = k_ptr;
         let mut vptr = v_ptr;
         let mut optr = out_ptr;
+        let mut sq = seq_len as i32;
+        let mut sk = kv_seq_len as i32;
         let mut nh = num_heads as i32;
+        let mut nkh = num_heads as i32; // cross-attention uses full GQA sharing
         let mut hd = head_dim as i32;
-        let mut sl = seq_len as i32;
-        let mut ksl = kv_seq_len as i32;
+        let mut scale = 1.0f32 / (head_dim as f32).sqrt();
 
-        self.launch_compute_kernel(
+        self.launch_compute_kernel_with_solution(
             "grim_cross_attention",
             grid_dim,
             block_dim,
@@ -5623,11 +6110,15 @@ impl RocmDevice {
                 arg(&mut kptr),
                 arg(&mut vptr),
                 arg(&mut optr),
+                arg(&mut sq),
+                arg(&mut sk),
                 arg(&mut nh),
+                arg(&mut nkh),
                 arg(&mut hd),
-                arg(&mut sl),
-                arg(&mut ksl),
+                arg(&mut scale),
             ],
+            None,
+            shared_mem_bytes,
         )
     }
 

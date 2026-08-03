@@ -175,6 +175,10 @@ pub struct LoRAInjectionConfig {
     pub codebook_dim: usize,
     /// VeRA: number of scalar codebooks used for quantization.
     pub num_codebooks: usize,
+    /// SPECTRAL-QLORA: initialize A/B so that AB is semi-orthogonal in the
+    /// dominant subspace, reusing `grim-quant::soul_eater::subspace_newton_schulz_step`
+    /// at adapter creation. Replaces standard Kaiming/Zeors init.
+    pub use_spectral_qlora: bool,
     #[serde(skip, default = "default_device")]
     pub target_device: grim_tensor::Device,
 }
@@ -203,6 +207,7 @@ impl LoRAInjectionConfig {
             codebook_size: 256,
             codebook_dim: 1,
             num_codebooks: 1,
+            use_spectral_qlora: false,
             target_device: grim_tensor::Device::Cpu,
         }
     }
@@ -263,11 +268,13 @@ impl LoRAInjectionRegistry {
 
     /// Build the standard 7-point-per-layer QLoRA registry.
     pub fn standard_qlora(num_layers: usize, rank: usize, alpha: f32, adapter_id: u32) -> Self {
-        Self::standard_qlora_with_flags(num_layers, rank, alpha, adapter_id, false, false, 0.0)
+        Self::standard_qlora_with_flags(
+            num_layers, rank, alpha, adapter_id, false, false, 0.0, false,
+        )
     }
 
     /// Build the standard 7-point-per-layer QLoRA registry, propagating
-    /// the PiSSA / OLoRA adapter flags to every injection config.
+    /// the PiSSA / OLoRA / SPECTRAL-QLORA adapter flags to every injection config.
     pub fn standard_qlora_with_flags(
         num_layers: usize,
         rank: usize,
@@ -276,6 +283,7 @@ impl LoRAInjectionRegistry {
         use_pissa: bool,
         use_olora: bool,
         olora_lambda: f32,
+        use_spectral_qlora: bool,
     ) -> Self {
         let mut r = Self::new();
         for layer_idx in 0..num_layers {
@@ -284,6 +292,7 @@ impl LoRAInjectionRegistry {
                 cfg.use_pissa = use_pissa;
                 cfg.use_olora = use_olora;
                 cfg.olora_lambda = olora_lambda;
+                cfg.use_spectral_qlora = use_spectral_qlora;
                 r.add(cfg);
             }
         }
@@ -719,7 +728,7 @@ fn compute_truncated_svd(
 
 /// In-place modified Gram-Schmidt orthogonalization over the `rank` columns of
 /// a `rows x rank` row-major matrix.
-fn orthogonalize_columns(m: &mut [f32], rows: usize, rank: usize) {
+pub fn orthogonalize_columns(m: &mut [f32], rows: usize, rank: usize) {
     let eps = 1e-12f32;
     for k in 0..rank {
         // Orthogonalize against all previous columns.

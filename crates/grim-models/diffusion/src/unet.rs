@@ -291,7 +291,8 @@ impl DiffusionModel for Unet2D {
                 }
             }
         }
-        Ok(cpu_tensor(out, Shape::new(lat_shape)))
+        let out_shape = vec![b, self.cfg.out_channels, h, w];
+        Ok(cpu_tensor(out, Shape::new(out_shape)))
     }
 
     fn scheduler(&self) -> &dyn NoiseScheduler {
@@ -336,6 +337,21 @@ mod tests {
         assert_eq!(out.shape().dims(), &[1, 4, 8, 8]);
         let v = out.to_vec_f32().unwrap();
         assert!(v.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn unet_denoise_step_out_channels_reshape() {
+        // out_channels differing from in_channels must still yield a shape whose
+        // element count matches the returned tensor (this was a silent wrongness bug).
+        let mut c = cfg();
+        c.out_channels = 6;
+        let u = Unet2D::random(Device::Cpu, c);
+        let lat = cpu_tensor(vec![1.0f32; 1 * 4 * 8 * 8], Shape::new(vec![1, 4, 8, 8]));
+        let t = cpu_tensor(vec![500.0f32], Shape::new(vec![1]));
+        let cond = cpu_tensor(vec![0.5f32; 8], Shape::new(vec![8]));
+        let out = u.denoise_step(&lat, &t, &cond).unwrap();
+        assert_eq!(out.shape().dims(), &[1, 6, 8, 8]);
+        assert_eq!(out.to_vec_f32().unwrap().len(), 1 * 6 * 8 * 8);
     }
 
     #[test]
