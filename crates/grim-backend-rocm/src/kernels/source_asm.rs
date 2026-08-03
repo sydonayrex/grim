@@ -23,7 +23,6 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::selective_scan::KERNEL_SOURCE);
     s.push_str(crate::kernels::q4k_dequant::KERNEL_SOURCE);
     s.push_str(crate::kernels::iq_dequant::KERNEL_SOURCE);
-    s.push_str(crate::kernels::flash_attn::KERNEL_SOURCE);
     s.push_str(crate::kernels::cross_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::rwkv::KERNEL_SOURCE);
     s
@@ -56,7 +55,6 @@ mod source_asm_self_tests {
     #[test]
     fn compute_kernel_source_contains_phase2_kernels() {
         let src = compute_kernel_source();
-        assert!(src.contains("grim_flash_attention"));
         assert!(src.contains("grim_cross_attention"));
         assert!(src.contains("grim_rwkv_time_mix"));
         assert!(src.contains("grim_fp8_gemm_rdna4"));
