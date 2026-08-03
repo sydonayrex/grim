@@ -1,6 +1,15 @@
 #version 450
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+// comm_fuse_reduce scatter-copy kernel.
+// Copies a column shard In[row, col] → Out[row, col_offset + col],
+// where Out is [m, n_total] (pre-zeroed by the caller) and In is [m, n_src].
+//
+// push_params mapping (matching the shared Params block):
+//   size = n_src      (columns in this partial)
+//   dim  = col_offset (column offset in the assembled output)
+//   k    = n_total    (total output columns)
+//   n    = m          (number of rows)
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(push_constant) uniform Params {
     uint size;
@@ -11,13 +20,13 @@ layout(push_constant) uniform Params {
     float eps;
 } params;
 
-layout(std430, binding = 0) readonly buffer BufInput { float Input[]; };
-layout(std430, binding = 1) readonly buffer BufResidual { float Residual[]; };
-layout(std430, binding = 2) writeonly buffer BufOut { float Out[]; };
+layout(std430, binding = 0) readonly buffer BufIn { float In[]; };
+layout(std430, binding = 1) writeonly buffer BufOut { float Out[]; };
 
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= params.size) return;
-
-    Out[i] = Input[i] + Residual[i];
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    if (row < params.n && col < params.size) {
+        Out[row * params.k + params.dim + col] = In[row * params.size + col];
+    }
 }
