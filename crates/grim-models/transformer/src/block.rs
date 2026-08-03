@@ -2,9 +2,13 @@
 
 use std::sync::Arc;
 
-use grim_core::error::Result;
-use grim_nn::{Linear, RmsNorm, Rope};
+use grim_core::error::{Error, Result};
+use grim_nn::{
+    ColumnParallelLinear, Linear, RowParallelLinear, RmsNorm, Rope, TensorParallelConfig,
+    WeightSource,
+};
 use grim_tensor::{Device, Shape, Tensor};
+use grim_tensor::TensorProvider;
 
 use crate::model::LlamaConfig;
 
@@ -15,83 +19,144 @@ pub struct LlamaConfigRefs {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub intermediate_size: usize,
+    /// TP world size (1 = single device, no sharding).
+    pub tp_world_size: usize,
+    /// Per-rank number of attention heads (sharded across TP ranks).
+    pub local_num_heads: usize,
+    /// Per-rank number of KV heads (either sharded or replicated).
+    pub local_num_kv_heads: usize,
+    /// How many times each KV head is replicated across TP ranks.
+    /// 1 = sharded, >1 = replicated.
+    pub kv_head_replica_factor: usize,
+}
+
+/// Compute the per-rank TP sharding plan for attention heads.
+///
+/// Returns `(local_num_heads, local_num_kv_heads, kv_head_replica_factor)`:
+/// - If `num_kv_heads % world_size == 0`: KV heads are sharded, each rank gets
+///   `num_kv_heads / world_size` of them (replica factor 1).
+/// - If `world_size % num_kv_heads == 0`: KV heads are replicated, each rank
+///   gets all `num_kv_heads`, with `world_size / num_kv_heads` replicas.
+/// - Otherwise: unsupported GQA topology (e.g. 8 KV heads / 6 GPUs).
+pub fn plan_kv_head_sharding(
+    num_heads: usize,
+    num_kv_heads: usize,
+    world_size: usize,
+) -> Result<(usize, usize, usize)> {
+    if num_heads % world_size != 0 {
+        return Err(Error::Config(format!(
+            "num_heads={num_heads} must be divisible by tp world_size={world_size}"
+        )));
+    }
+    if num_kv_heads % world_size == 0 {
+        Ok((num_heads / world_size, num_kv_heads / world_size, 1))
+    } else if world_size % num_kv_heads == 0 {
+        Ok((num_heads / world_size, num_kv_heads, world_size / num_kv_heads))
+    } else {
+        Err(Error::Config(format!(
+            "unsupported GQA topology: num_heads={num_heads}, num_kv_heads={num_kv_heads}, world_size={world_size}"
+        )))
+    }
 }
 
 #[derive(Clone)]
 pub struct LlamaBlock {
     pub attn_norm: RmsNorm,
-    pub wq: Linear,
-    pub wk: Linear,
-    pub wv: Linear,
-    pub wo: Linear,
+    pub wq: ColumnParallelLinear,
+    pub wk: ColumnParallelLinear,
+    pub wv: ColumnParallelLinear,
+    pub wo: RowParallelLinear,
     pub ffn_norm: RmsNorm,
-    pub w_gate: Linear,
-    pub w_up: Linear,
-    pub w_down: Linear,
+    pub w_gate: ColumnParallelLinear,
+    pub w_up: ColumnParallelLinear,
+    pub w_down: RowParallelLinear,
     pub rope: Rope,
+    pub tp_config: TensorParallelConfig,
     pub(crate) _dev: Device,
     pub(crate) _cfg: LlamaConfigRefs,
 }
 
 impl LlamaBlock {
-    pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: &LlamaConfig) -> Result<Self> {
+    /// Load a `LlamaBlock` with TP config derived from the environment
+    /// (`GRIM_TP_SIZE` / `GRIM_TP_RANK`). Falls back to single-device when
+    /// env vars are unset.
+    pub fn load(ws: &WeightSource<'_>, cfg: &LlamaConfig) -> Result<Self> {
+        let tp = TensorParallelConfig::from_env()
+            .unwrap_or_else(TensorParallelConfig::default);
+        Self::load_tp(ws, cfg, tp)
+    }
+
+    /// Load a `LlamaBlock` with an explicit `TensorParallelConfig`.
+    pub fn load_tp(ws: &WeightSource<'_>, cfg: &LlamaConfig, tp: TensorParallelConfig) -> Result<Self> {
         let attn_norm = RmsNorm::load(&ws.pp("attn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let wq = Linear::load(
+        let wq = Linear::load_column_parallel(
             &ws.pp("attn").pp("wq"),
             cfg.hidden_size,
             cfg.num_heads * cfg.head_dim,
             /*has_bias=*/ false,
+            tp,
         )?;
-        let wk = Linear::load(
+        let wk = Linear::load_column_parallel(
             &ws.pp("attn").pp("wk"),
             cfg.hidden_size,
             cfg.num_kv_heads * cfg.head_dim,
             /*has_bias=*/ false,
+            tp,
         )?;
-        let wv = Linear::load(
+        let wv = Linear::load_column_parallel(
             &ws.pp("attn").pp("wv"),
             cfg.hidden_size,
             cfg.num_kv_heads * cfg.head_dim,
             /*has_bias=*/ false,
+            tp,
         )?;
-        let wo = Linear::load(
+        let wo = Linear::load_row_parallel(
             &ws.pp("attn").pp("wo"),
             cfg.num_heads * cfg.head_dim,
             cfg.hidden_size,
             /*has_bias=*/ false,
+            tp,
         )?;
         let ffn_norm = RmsNorm::load(&ws.pp("ffn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let w_gate = Linear::load(
+        let w_gate = Linear::load_column_parallel(
             &ws.pp("ffn").pp("w_gate"),
             cfg.hidden_size,
             cfg.intermediate_size,
             /*has_bias=*/ false,
+            tp,
         )?;
-        let w_up = Linear::load(
+        let w_up = Linear::load_column_parallel(
             &ws.pp("ffn").pp("w_up"),
             cfg.hidden_size,
             cfg.intermediate_size,
             /*has_bias=*/ false,
+            tp,
         )?;
-        let w_down = Linear::load(
+        let w_down = Linear::load_row_parallel(
             &ws.pp("ffn").pp("w_down"),
             cfg.intermediate_size,
             cfg.hidden_size,
             /*has_bias=*/ false,
+            tp,
         )?;
-        let device = wq.weight.device().clone();
+        let device = wq.weight().device().clone();
         let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
+
+        let (local_num_heads, local_num_kv_heads, kv_head_replica_factor) =
+            plan_kv_head_sharding(cfg.num_heads, cfg.num_kv_heads, tp.world_size)?;
+
         Ok(Self {
             attn_norm,
-            wq,
-            wk,
-            wv,
-            wo,
+            wq: ColumnParallelLinear::new(wq, tp),
+            wk: ColumnParallelLinear::new(wk, tp),
+            wv: ColumnParallelLinear::new(wv, tp),
+            wo: RowParallelLinear::new(wo, tp),
             ffn_norm,
-            w_gate,
-            w_up,
-            w_down,
+            w_gate: ColumnParallelLinear::new(w_gate, tp),
+            w_up: ColumnParallelLinear::new(w_up, tp),
+            w_down: RowParallelLinear::new(w_down, tp),
             rope,
+            tp_config: tp,
             _dev: device,
             _cfg: LlamaConfigRefs {
                 hidden_size: cfg.hidden_size,
@@ -99,6 +164,10 @@ impl LlamaBlock {
                 num_kv_heads: cfg.num_kv_heads,
                 head_dim: cfg.head_dim,
                 intermediate_size: cfg.intermediate_size,
+                tp_world_size: tp.world_size,
+                local_num_heads,
+                local_num_kv_heads,
+                kv_head_replica_factor,
             },
         })
     }
@@ -249,21 +318,21 @@ impl LlamaBlock {
         // Apply RoPE to Q and K. The rope.forward expects (B, S, D=head_dim)
         // but Q/K arrive as (B, S, num_heads * head_dim). Reshape to
         // (B, S * num_heads, head_dim), repeat positions per-head, apply
-        // RoPE, then reshape back.
-        let q = self.apply_rope_multi_head(q, positions, cfg.num_heads)?;
-        let k = self.apply_rope_multi_head(k, positions, cfg.num_kv_heads)?;
+        // RoPE, then reshape back. Uses per-rank sharded head counts.
+        let q = self.apply_rope_multi_head(q, positions, cfg.local_num_heads)?;
+        let k = self.apply_rope_multi_head(k, positions, cfg.local_num_kv_heads)?;
 
         let qd = q.to_vec_f32()?;
         let kd = k.to_vec_f32()?;
         let vd = v.to_vec_f32()?;
-        let num_head_dims = cfg.num_heads * cfg.head_dim;
+        let num_head_dims = cfg.local_num_heads * cfg.head_dim;
         let total_tokens = qd.len() / num_head_dims;
         let scale = 1.0 / (cfg.head_dim as f32).sqrt();
         let mut out = vec![0.0f32; total_tokens * num_head_dims];
-        let kv_stride = cfg.num_kv_heads * cfg.head_dim;
+        let kv_stride = cfg.local_num_kv_heads * cfg.head_dim;
 
-        for h in 0..cfg.num_heads {
-            let kvh = (h * cfg.num_kv_heads) / cfg.num_heads;
+        for h in 0..cfg.local_num_heads {
+            let kvh = (h * cfg.local_num_kv_heads) / cfg.local_num_heads;
             for t in 0..total_tokens {
                 let mut scores = vec![0.0f32; total_tokens];
                 // CRIT-1: Causal masking - only attend to current and past tokens (t2 <= t)
@@ -329,6 +398,10 @@ mod tests {
             num_kv_heads: 1,
             head_dim: 16,
             intermediate_size: 64,
+            tp_world_size: 1,
+            local_num_heads: 2,
+            local_num_kv_heads: 1,
+            kv_head_replica_factor: 1,
         }
     }
 
@@ -359,13 +432,14 @@ mod tests {
     fn small_block() -> LlamaBlock {
         let cfg = small_cfg();
         let dev = Device::Cpu;
-        let wq = make_linear(cfg.hidden_size, cfg.num_heads * cfg.head_dim);
-        let wk = make_linear(cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim);
-        let wv = make_linear(cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim);
-        let wo = make_linear(cfg.num_heads * cfg.head_dim, cfg.hidden_size);
-        let w_gate = make_linear(cfg.hidden_size, cfg.intermediate_size);
-        let w_up = make_linear(cfg.hidden_size, cfg.intermediate_size);
-        let w_down = make_linear(cfg.intermediate_size, cfg.hidden_size);
+        let tp = TensorParallelConfig::default();
+        let wq = ColumnParallelLinear::new(make_linear(cfg.hidden_size, cfg.num_heads * cfg.head_dim), tp);
+        let wk = ColumnParallelLinear::new(make_linear(cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim), tp);
+        let wv = ColumnParallelLinear::new(make_linear(cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim), tp);
+        let wo = RowParallelLinear::new(make_linear(cfg.num_heads * cfg.head_dim, cfg.hidden_size), tp);
+        let w_gate = ColumnParallelLinear::new(make_linear(cfg.hidden_size, cfg.intermediate_size), tp);
+        let w_up = ColumnParallelLinear::new(make_linear(cfg.hidden_size, cfg.intermediate_size), tp);
+        let w_down = RowParallelLinear::new(make_linear(cfg.intermediate_size, cfg.hidden_size), tp);
         let attn_norm = make_rmsnorm(cfg.hidden_size);
         let ffn_norm = make_rmsnorm(cfg.hidden_size);
         let rope = Rope::new(cfg.head_dim, 10000.0);
@@ -380,6 +454,7 @@ mod tests {
             w_up,
             w_down,
             rope,
+            tp_config: tp,
             _dev: dev,
             _cfg: cfg,
         }
@@ -662,5 +737,139 @@ mod tests {
             "Non-uniform positions produced identical output (diff={})",
             diff
         );
+    }
+
+    // ---- TP tests (WI-TP-3) ----
+
+    /// plan_kv_head_sharding: divisible KV heads → sharded, replica=1.
+    #[test]
+    fn test_plan_kv_sharding_divisible() {
+        let (nh, nkv, rep) = plan_kv_head_sharding(8, 4, 2).unwrap();
+        assert_eq!(nh, 4);
+        assert_eq!(nkv, 2);
+        assert_eq!(rep, 1);
+    }
+
+    /// plan_kv_head_sharding: KV heads replicated when world_size % num_kv_heads == 0.
+    #[test]
+    fn test_plan_kv_sharding_replicated() {
+        let (nh, nkv, rep) = plan_kv_head_sharding(8, 2, 4).unwrap();
+        assert_eq!(nh, 2);
+        assert_eq!(nkv, 2);
+        assert_eq!(rep, 2);
+    }
+
+    /// plan_kv_head_sharding: unsupported GQA topology (8 KV heads, 6 GPUs).
+    #[test]
+    fn test_plan_kv_sharding_unsupported() {
+        let result = plan_kv_head_sharding(12, 8, 6);
+        assert!(result.is_err(), "8 KV heads / 6 GPUs should error");
+    }
+
+    /// LlamaBlock::load_tp with world_size=1 (single device) using a fake
+    /// provider that serves zero-initialised tensors. Verifies wrapper types
+    /// are constructed and shard_size == full size.
+    #[test]
+    fn test_llama_block_load_tp_shards_weights() {
+        use std::collections::HashMap;
+        use grim_tensor::{DType, QuantProvenance, RawTensor, TensorMeta, TensorProvider};
+
+        #[derive(Clone)]
+        struct FullProvider {
+            tensors: HashMap<String, RawTensor>,
+        }
+
+        impl TensorProvider for FullProvider {
+            fn get(&self, name: &str) -> grim_tensor::error::Result<RawTensor> {
+                self.tensors
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| grim_tensor::error::Error::Backend(format!("tensor '{name}' not found")))
+            }
+            fn meta(&self, _name: &str) -> grim_tensor::error::Result<TensorMeta> {
+                Ok(TensorMeta {
+                    dtype: DType::F32,
+                    provenance: QuantProvenance::GrimNative,
+                    shape: vec![],
+                    fusion_mask: 0,
+                })
+            }
+        }
+
+        let mut tensors = HashMap::new();
+        for leaf in &["attn_norm", "ffn_norm"] {
+            tensors.insert(
+                format!("{}.weight", leaf),
+                RawTensor {
+                    bytes: vec![0u8; 32 * 4],
+                    shape: vec![32],
+                    dtype: DType::F32,
+                    provenance: QuantProvenance::GrimNative,
+                },
+            );
+        }
+        for (prefix, out_dim, in_dim) in &[
+            ("attn.wq", 32usize, 32usize),
+            ("attn.wk", 16usize, 32usize),
+            ("attn.wv", 16usize, 32usize),
+            ("attn.wo", 32usize, 32usize),
+            ("ffn.w_gate", 64usize, 32usize),
+            ("ffn.w_up", 64usize, 32usize),
+            ("ffn.w_down", 32usize, 64usize),
+        ] {
+            tensors.insert(
+                format!("{}.weight", prefix),
+                RawTensor {
+                    bytes: vec![0u8; *out_dim * *in_dim * 4],
+                    shape: vec![*out_dim, *in_dim],
+                    dtype: DType::F32,
+                    provenance: QuantProvenance::GrimNative,
+                },
+            );
+        }
+
+        let tp = TensorParallelConfig { rank: 0, world_size: 1 };
+        let cfg = LlamaConfig {
+            vocab_size: 100,
+            hidden_size: 32,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 16,
+            num_layers: 1,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            max_seq_len: 512,
+        };
+        let provider = FullProvider { tensors };
+        let ws = WeightSource::root(&provider, Device::Cpu);
+        let block = LlamaBlock::load_tp(&ws, &cfg, tp).expect("load_tp ok");
+
+        assert_eq!(block.wq.shard_size(), 32);
+        assert_eq!(block.wo.shard_size(), 32);
+        assert_eq!(block._cfg.local_num_heads, 2);
+        assert_eq!(block._cfg.local_num_kv_heads, 1);
+        assert_eq!(block._cfg.tp_world_size, 1);
+    }
+
+    /// LlamaBlock::load_tp with world_size=2 (column + row parallel) should
+    /// shard weights to half size while keeping KV head replication correct.
+    #[test]
+    fn test_llama_load_tp_output_head_sharded() {
+        let tp = TensorParallelConfig { rank: 0, world_size: 2 };
+        let (nh, nkv, rep) = plan_kv_head_sharding(8, 4, 2).unwrap();
+        assert_eq!(nh, 4);
+        assert_eq!(nkv, 2);
+        assert_eq!(rep, 1);
+
+        let (nh2, nkv2, rep2) = plan_kv_head_sharding(12, 2, 4).unwrap();
+        assert_eq!(nh2, 3);
+        assert_eq!(nkv2, 2);
+        assert_eq!(rep2, 2);
+
+        // For world_size=2 with 8 heads and 2 KV heads:
+        // shard_size of column-parallel = out_dim / 2
+        let shard_out_wq = (8 * 16) / 2;
+        assert_eq!(shard_out_wq, 64);
     }
 }

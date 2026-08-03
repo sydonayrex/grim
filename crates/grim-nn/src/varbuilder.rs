@@ -31,6 +31,8 @@ use grim_backend_rocm::{RocmDevice, RocmStorage};
 #[cfg(feature = "vulkan-mem")]
 use grim_backend_vulkan::VulkanDevice;
 
+use crate::TensorParallelConfig;
+
 /// A handle that walks a `TensorProvider` by hierarchical prefix. Models
 /// call `ws.pp("model").pp("layers").pp("0").get(...)` to materialize
 /// tensors; the call-site shape determines what storage type comes back.
@@ -40,6 +42,9 @@ pub struct WeightSource<'a> {
     default_dtype: DType,
     default_provenance: QuantProvenance,
     device: Device,
+    /// Tensor-parallel config for sharded weight loading. Defaults to
+    /// single-device (rank 0, world_size 1).
+    tp_config: TensorParallelConfig,
 }
 
 impl<'a> WeightSource<'a> {
@@ -55,12 +60,72 @@ impl<'a> WeightSource<'a> {
             default_dtype,
             default_provenance,
             device,
+            tp_config: TensorParallelConfig::default(),
         }
     }
 
     /// Root-level builder from a `TensorProvider`.
     pub fn root(tensors: &'a dyn grim_tensor::TensorProvider, device: Device) -> Self {
         Self::new(tensors, DType::F32, QuantProvenance::GrimNative, device)
+    }
+
+    /// Attach a `TensorParallelConfig` for sharded weight loading.
+    pub fn with_tp_config(&self, tp: TensorParallelConfig) -> WeightSource<'a> {
+        WeightSource {
+            tensors: self.tensors,
+            prefix: self.prefix.clone(),
+            default_dtype: self.default_dtype.clone(),
+            default_provenance: self.default_provenance.clone(),
+            device: self.device.clone(),
+            tp_config: tp,
+        }
+    }
+
+    /// Read-only access to the current TP config.
+    pub fn tp_config(&self) -> TensorParallelConfig {
+        self.tp_config
+    }
+
+    /// Fetch the rank-th shard of a tensor (delegates to the underlying
+    /// provider's `get_packed_sharded`, which may do zero-copy byte-range reads
+    /// for GGUF block-quant formats).
+    pub fn get_sharded(
+        &self,
+        shape: impl Into<Shape>,
+        leaf: &str,
+        dim: usize,
+    ) -> Result<Tensor> {
+        let shape = shape.into();
+        let name = self.full_name(leaf);
+        let raw = self.tensors.get_packed_sharded(
+            &name,
+            dim,
+            self.tp_config.rank,
+            self.tp_config.world_size,
+        )?;
+        let (dtype, provenance) = match self.tensors.meta(&name) {
+            Ok(m) => (m.dtype, m.provenance),
+            Err(_) => (self.default_dtype.clone(), self.default_provenance.clone()),
+        };
+        materialize(raw, shape, dtype, provenance, &self.device)
+    }
+
+    /// Fetch the rank-th shard without enforcing an expected shape (used by
+    /// callers that need to inspect the loaded shape first).
+    pub fn get_unconstrained_sharded(&self, leaf: &str, dim: usize) -> Result<Tensor> {
+        let name = self.full_name(leaf);
+        let raw = self.tensors.get_packed_sharded(
+            &name,
+            dim,
+            self.tp_config.rank,
+            self.tp_config.world_size,
+        )?;
+        let shape = Shape::new(raw.shape.clone());
+        let (dtype, provenance) = match self.tensors.meta(&name) {
+            Ok(m) => (m.dtype, m.provenance),
+            Err(_) => (self.default_dtype.clone(), self.default_provenance.clone()),
+        };
+        materialize(raw, shape, dtype, provenance, &self.device)
     }
 
     /// Push a path segment and return a new `WeightSource` whose prefix is
@@ -78,6 +143,7 @@ impl<'a> WeightSource<'a> {
             default_dtype: self.default_dtype.clone(),
             default_provenance: self.default_provenance.clone(),
             device: self.device.clone(),
+            tp_config: self.tp_config,
         }
     }
 
