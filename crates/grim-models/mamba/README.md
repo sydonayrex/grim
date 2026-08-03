@@ -1,76 +1,84 @@
 # grim-models-mamba
 
-Mamba/SSM model family for Grim — selective state-space scan + hybrid SSM+attention. Implements StatefulSequence.
+Mamba/SSM model family for Grim — selective state-space scan with optional hybrid SSM+attention layers.
 
 ## Purpose
 
-Implements Mamba architecture for sequence modeling:
-- Selective State Space Model (SSM) for linear-time sequence processing
-- Hybrid SSM + attention for long-context efficiency
-- Hardware-efficient recurrent scanning
+Provides the `Mamba` model struct and `MambaConfig` for Mamba-style selective state-space models. Implements the `StatefulSequence` trait from `grim-core`. Optionally composes attention blocks alongside SSM blocks for hybrid architectures.
 
 ## Boundaries
 
-- Does not perform tensor operations — delegates to backends
-- Does not manage KV cache — uses SSM state pool instead
-- Does not handle model loading — see `grim-format`
+- Does **not** handle HTTP serving — see `grim-server`.
+- Does **not** implement the KV cache — uses SSM state instead (managed via `grim-memory`).
+- Does **not** perform quantization — uses `grim-quant` for dequantized weight access.
 
 ## Dependency Graph
 
 ```mermaid
 graph LR
-    A[grim-models-mamba] -->|DType, Device| B[grim-tensor]
-    A -->|Modules| C[grim-nn]
-    A -->|Model traits| D[grim-core]
-    A -->|CPU backend| E[grim-backend-cpu]
-    A -->|ROCm backend| F[grim-backend-rocm]
-    A -->|Memory pool| G[grim-memory]
-    
+    A[grim-models-mamba] --> B[grim-tensor]
+    A --> C[grim-nn]
+    A --> D[grim-core]
+    A --> E[grim-backend-cpu]
+    A --> F[grim-memory]
+    A --> G[grim-backend-vulkan]
+    A --> H[grim-backend-metal]
+
     style A fill:#e8f5e8
 ```
 
 ## Public API
 
-### MambaModel
-
 ```rust
-pub struct MambaModel {
-    pub embeddings: Embedding,
-    pub layers: Vec<MambaBlock>,
-    pub norm: RmsNorm,
-    pub lm_head: Linear,
+pub use mamba::{Mamba, MambaConfig, MambaBlock};
+
+pub struct MambaConfig {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub d_state: usize,
+    pub d_inner: usize,
+    pub d_conv: usize,
+    pub num_layers: usize,
+    pub conv_kernel: usize,
+    pub rms_norm_eps: f32,
 }
 
-impl CausalLm for MambaModel { /* ... */ }
-
-pub struct MambaBlock {
-    pub norm: RmsNorm,
-    pub mamba: MambaCell,
-    pub attn: Option<Attention>,
+pub struct Mamba {
+    pub cfg: MambaConfig,
+    pub device: grim_tensor::Device,
 }
-```
 
-## Usage Example
-
-```rust
-use grim_models_mamba::MambaModel;
-
-let model = MambaModel::new(
-    vocab_size: 50257,
-    hidden_dim: 2048,
-    num_layers: 24,
-    ssm_state: 128,
-);
+impl Mamba {
+    pub fn new(config: MambaConfig) -> Self;
+}
 ```
 
 ## Feature Flags
 
 | Flag | Default | Description |
 |---|---|---|
-| rocm | - | Enable ROCm backend for Mamba kernels |
+| `rocm` | no | Enable ROCm backend for Mamba kernels |
 
-## Edge Cases
+## Usage Example
 
-1. **Selective scan**: Requires HIP kernel on ROCm for efficiency
-2. **SSM state**: Managed via `grim-memory::SsmStatePool`
-3. **Hybrid attention**: Optional attention head for short-range context
+```rust
+use grim_models_mamba::{Mamba, MambaConfig};
+use grim_tensor::Device;
+
+let config = MambaConfig {
+    vocab_size: 50257,
+    hidden_size: 2048,
+    d_state: 128,
+    d_inner: 5120,
+    d_conv: 4,
+    num_layers: 24,
+    conv_kernel: 4,
+    rms_norm_eps: 1e-5,
+};
+let model = Mamba::new(config);
+```
+
+## Edge Cases, Limitations, and Quirks
+
+- The ROCm feature enables GPU-accelerated selective scan kernels; without it, Mamba falls back to CPU execution.
+- SSM state is managed through `grim-memory`'s pooled allocation — callers should not assume state is zero-initialized between requests.

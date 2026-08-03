@@ -31,7 +31,7 @@ Grim targets researchers, machine learning engineers, and system developers who 
 git clone https://github.com/Nelsk/Grim.git
 cd Grim
 cargo build --release                # builds all 28 workspace member crates in one invocation
-cargo test                           # runs the full workspace test suite
+cargo test --workspace               # runs the full workspace test suite
 # Optional: ROCm GPU tests (set GRIM_RUN_GPU_TESTS=1)
 GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --features rocm-aiter
 ```
@@ -60,9 +60,9 @@ GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --features rocm-aiter
 | `grim-scheduler` | Continuous-batching scheduler featuring latency-aware admission control and a three-queue architecture |
 | `grim-engine` | Core runtime orchestrator integrating scheduler, memory manager, and model registry into a unified `Engine` |
 | `grim-server` | HTTP/HTTPS serving layer (Axum) with OpenAI-compatible REST endpoints, Ollama support, and SSE streaming |
-| `grim-cli` | Subcommand CLI: `serve`, `run`, `bench`, `quantize`, `plugin` |
+| `grim-cli` | Subcommand CLI: `serve`, `run`, `bench`, `convert`, `train`, `dl`/`pull`, `spec`, `oxidizer`, `service`, `plugin`, `doctor`, `verify`, `cp`, `use`, `login`, `start`, `reap`, `accept`, `compat`, `stop`, `rm`, `ps`, `list`, `check`, `show` |
 | `grim-speculative` | Speculative decoding engines (DSpark drafter, Markov n-gram head, confidence head, zero-config MTP path) |
-| `grim-kvquant` | Runtime KV-cache compression routines (TurboQuant rotation + Lloyd-Max scalar quantization) |
+| `grim-kvquant` | Runtime KV-cache compression with random-orthogonal rotation + Lloyd-Max quantization, plus KV-OMNI modalities |
 | `grim-plugin` | WebAssembly (WASM) plugin sandbox and dynamic library (`.so`/`.dylib`/`.dll`) loader |
 | `grim-kvtransport` | Multi-tiered KV cache transfer engine (GPU VRAM $\leftrightarrow$ Host System RAM $\leftrightarrow$ NVMe disk spill) |
 | `grim-disagg` | Distributed serving decoupling layer for separated Prefill and Decode GPU clusters |
@@ -76,17 +76,19 @@ GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --features rocm-aiter
 | `old/doc.md` | Legacy documentation specification prompt; contains historical checklist and rules |
 | `Cargo.toml` (workspace root) | Workspace definition with 28 members, edition 2024, Rust 1.85 minimum, MIT OR Apache-2.0 license |
 | `.github/workflows/ci.yml` | CI configuration for build, test, clippy, and cargo-mutants |
-| `docs/` | Documentation files (onboarding, architecture, how-to guides, etc.) |
+| `docs/` | Documentation (onboarding, architecture, CLI reference, configuration, data model, integrations, observability, troubleshooting, glossary, release, how-to guides) |
 | `crates/` | Crate source code, each with its own Cargo.toml |
 
 ## Links — other documentation
 
 - [Onboarding guide](docs/onboarding.md) — step-by-step development setup
 - [Architecture overview](docs/architecture.md) — workspace dependency graph and design
-- [Troubleshooting](docs/troubleshooting.md) — common issues and solutions
-- [Integration reference](docs/integrations.md) — external systems and protocols
-- [Glossary](docs/glossary.md) — domain-specific terms
-- [Configuration reference](docs/configuration.md) — env vars and config files
 - [CLI reference](docs/cli.md) — command-line interface
+- [Configuration reference](docs/configuration.md) — env vars and config files
 - [Data model](docs/data-model.md) — schemas and serialization formats
+- [Integrations](docs/integrations.md) — external systems and protocols
+- [Observability](docs/observability.md) — metrics, logging, and telemetry
+- [Troubleshooting](docs/troubleshooting.md) — common issues and solutions
+- [Glossary](docs/glossary.md) — domain-specific terms
+- [Release & Deployment](docs/release.md) — build, versioning, and CI
 - [Per-crate READMEs](crates/) — crate-specific documentation

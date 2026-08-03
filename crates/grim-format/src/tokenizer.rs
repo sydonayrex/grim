@@ -556,10 +556,147 @@ impl GgufTokenizer {
 }
 
 /// A single chat message in an OpenAI-style `messages` array.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+///
+/// `tool_calls` carries one or more tool invocations an assistant message
+/// produced (assistant-role only). `tool_call_id` / `name` carry a tool result
+/// back to the model (tool-role only). Both are `Option`al so the common
+/// user/assistant text-only messages stay the simple two-field construction
+/// callers already use — the new fields default to `None`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallMsg>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// One tool call embedded in an assistant `ChatMessage`. `arguments` is a
+/// JSON-encoded *string* matching OpenAI's wire format (the arguments are a
+/// string containing JSON, not a nested object), so it can be re-parsed by the
+/// caller without ambiguity.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ToolCallMsg {
+    pub id: String,
+    pub name: String,
+    /// JSON-encoded string of the tool's arguments, per OpenAI wire format.
+    pub arguments: String,
+}
+
+/// A tool definition accepted in a `/v1/chat/completions` request body.
+/// Serializes to the OpenAI tool-definition wire shape (`{"type":"function",
+/// "function": {...}}`) that tool-capable embedded chat templates (Hermes,
+/// Llama 3.1, Qwen2.5, …) consume directly via the `tools` Jinja variable.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ToolDef {
+    /// Always `"function"` today; OpenAI's schema carries the discriminator.
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub function: FunctionDef,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct FunctionDef {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// A JSON Schema object describing the tool's parameters. Kept as an
+    /// opaque `serde_json::Value` so we never have to model the full JSON-Schema
+    /// surface — we round-trip the schema the client gave us.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+}
+
+/// `tool_choice` controls whether tool calling happens at all for a request,
+/// matching OpenAI's semantics exactly. The custom `Serialize` impl emits the
+/// OpenAI wire forms — `"auto"` / `"none"` / `"required"` / a specific-tool
+/// object — so the enum can be injected directly into the Jinja `tool_choice`
+/// context variable and compared against the string literals real model
+/// templates test for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolChoice {
+    /// `"auto"` (the default): the model decides whether to call a tool.
+    Auto,
+    /// `"none"`: suppress tool-calling behavior entirely for this request.
+    None,
+    /// `"required"`: the model must call a tool. (Per the spec, grammar
+    /// enforcement of this is WI-TOOLS-6; in the MVP we surface it to the
+    /// template and rely on the model's own convention.)
+    Required,
+    /// A specific named tool is forced.
+    Specific {
+        r#type: String,
+        function: FunctionName,
+    },
+}
+
+impl serde::Serialize for ToolChoice {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        match self {
+            ToolChoice::Auto => serializer.serialize_str("auto"),
+            ToolChoice::None => serializer.serialize_str("none"),
+            ToolChoice::Required => serializer.serialize_str("required"),
+            ToolChoice::Specific { r#type, function } => {
+                let mut m = serializer.serialize_map(Some(2))?;
+                m.serialize_entry("type", r#type)?;
+                m.serialize_entry("function", function)?;
+                m.end()
+            }
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ToolChoice {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let v = serde_json::Value::deserialize(deserializer)?;
+        match v {
+            serde_json::Value::String(s) => match s.as_str() {
+                "auto" => Ok(ToolChoice::Auto),
+                "none" => Ok(ToolChoice::None),
+                "required" => Ok(ToolChoice::Required),
+                other => Err(serde::de::Error::unknown_variant(
+                    other,
+                    &["auto", "none", "required"],
+                )),
+            },
+            serde_json::Value::Object(obj) => {
+                let v = serde_json::Value::Object(obj);
+                let r#type = v
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| serde::de::Error::missing_field("type"))?
+                    .to_string();
+                let name = v
+                    .pointer("/function/name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| serde::de::Error::missing_field("function.name"))?
+                    .to_string();
+                Ok(ToolChoice::Specific {
+                    r#type,
+                    function: FunctionName { name },
+                })
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "expected string or object for tool_choice, got {}",
+                other
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct FunctionName {
+    pub name: String,
 }
 
 /// Renders an OpenAI-style `messages` array through a model's Jinja chat
@@ -570,12 +707,22 @@ pub struct ChatMessage {
 /// specific model's template references an unsupplied variable, minijinja
 /// surfaces the exact name — widen `ctx` as needed. Falls back to the raw
 /// last-message content if the template fails to render.
+///
+/// `tools` (when `Some`) exposes the OpenAI tool-definition array to the
+/// template's own Jinja logic under the standard `tools` variable name. The
+/// caller passes the *already-shaped* `&[ToolDef]`; we do not attempt a
+/// unified per-family templating shim — each tool-capable model's embedded
+/// template was written by its finetuner to match its own tool-call output
+/// convention, so per-family quirks are a parsing (WI-TOOLS-4) concern, not a
+/// rendering concern.
 pub fn render_chat_template(
     template: &str,
     messages: &[ChatMessage],
     add_generation_prompt: bool,
     bos_token: &str,
     eos_token: &str,
+    tools: Option<&[ToolDef]>,
+    tool_choice: Option<&ToolChoice>,
 ) -> Result<String> {
     let mut env = minijinja::Environment::new();
     // Most GGUF chat templates are self-contained; disable autoescaping.
@@ -583,19 +730,61 @@ pub fn render_chat_template(
     let tmpl = env
         .template_from_str(template)
         .map_err(|e| Error::Backend(format!("chat template parse error: {e}")))?;
+    // minijinja's `context!` macro requires every referenced variable to be
+    // named, so we build the context conditionally: `tools`/`tool_choice` are
+    // only emitted when provided. A template that never references `tools`
+    // simply ignores them; a template that does reference them expects the
+    // caller to have supplied real definitions.
     let ctx = minijinja::context! {
         messages => messages,
         add_generation_prompt => add_generation_prompt,
         bos_token => bos_token,
         eos_token => eos_token,
+        tools => tools,
+        tool_choice => tool_choice,
     };
-    tmpl.render(ctx)
-        .map_err(|e| Error::Backend(format!("chat template render error: {e}")))
+    let rendered = tmpl
+        .render(ctx)
+        .map_err(|e| Error::Backend(format!("chat template render error: {e}")))?;
+    // If the caller supplied tools but the rendered output made no use of
+    // them (i.e. the model's template isn't tool-capable), surface a loud
+    // diagnostic so operators understand why no tool calls will be produced,
+    // rather than silently returning an ordinary completion.
+    if let Some(ts) = tools {
+        if !ts.is_empty() {
+            // minijinja silently ignores unreferenced context variables, so we
+            // detect "tool-capable template" structurally: a tool-aware template
+            // references `tools` somewhere in its source text.
+            if !template.contains("tools") {
+                eprintln!(
+                    "[grim-format] WARNING: {n} tool(s) supplied but the model's chat \
+                     template does not reference a `tools` variable — this model was \
+                     not fine-tuned for tool calling; tool calls will not be produced.",
+                    n = ts.len()
+                );
+            }
+        }
+    }
+    Ok(rendered)
 }
 
 /// Convenience: render `messages` through a tokenizer's embedded template when
-/// present, otherwise return the last message's content (raw fallback).
+/// present, otherwise return the last message's content (raw fallback). No
+/// tools are exposed to the template.
 pub fn render_messages_or_last(tokenizer: &GgufTokenizer, messages: &[ChatMessage]) -> String {
+    render_messages_or_last_with_tools(tokenizer, messages, None, None)
+}
+
+/// Convenience: as [`render_messages_or_last`] but additionally exposes the
+/// provided `tools` / `tool_choice` to the template's own Jinja logic. Use this
+/// path for tool-calling requests; the tool-less overload keeps existing call
+/// sites unchanged.
+pub fn render_messages_or_last_with_tools(
+    tokenizer: &GgufTokenizer,
+    messages: &[ChatMessage],
+    tools: Option<&[ToolDef]>,
+    tool_choice: Option<&ToolChoice>,
+) -> String {
     match &tokenizer.chat_template {
         Some(tpl) => render_chat_template(
             tpl,
@@ -607,6 +796,8 @@ pub fn render_messages_or_last(tokenizer: &GgufTokenizer, messages: &[ChatMessag
                 .and_then(|id| tokenizer.tokens.get(id as usize))
                 .map(|s| s.as_str())
                 .unwrap_or(""),
+            tools,
+            tool_choice,
         )
         .unwrap_or_else(|e| {
             eprintln!(
@@ -701,14 +892,20 @@ mod chat_template_tests {
             ChatMessage {
                 role: "system".into(),
                 content: "You are grim.".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
             },
             ChatMessage {
                 role: "user".into(),
                 content: "Hi.".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
             },
         ];
-        let rendered =
-            render_chat_template(&tpl, &msgs, false, "", "").expect("render must succeed");
+        let rendered = render_chat_template(&tpl, &msgs, false, "", "", None, None)
+            .expect("render must succeed");
         assert!(
             rendered.contains("<|im_start|>system"),
             "missing system role"
@@ -725,9 +922,12 @@ mod chat_template_tests {
         let msgs = vec![ChatMessage {
             role: "user".into(),
             content: "translate: hi".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
         }];
-        let rendered =
-            render_chat_template(&tpl, &msgs, false, "", "").expect("render must succeed");
+        let rendered = render_chat_template(&tpl, &msgs, false, "", "", None, None)
+            .expect("render must succeed");
         assert_eq!(rendered, "<|im_start|>user\ntranslate: hi<|im_end|>");
     }
 
@@ -735,8 +935,131 @@ mod chat_template_tests {
     fn unparseable_template_errors() {
         // A syntactically broken template should surface a parse error, not panic.
         assert!(
-            render_chat_template("{% if %}", &[], false, "", "").is_err(),
+            render_chat_template("{% if %}", &[], false, "", "", None, None).is_err(),
             "malformed template must error"
         );
+    }
+
+    /// A tool-aware template (Hermes-2-Pro style) must receive the `tools`
+    /// array and render the function definitions into the prompt.
+    #[test]
+    fn renders_tools_for_hermes_style_template() {
+        // Simplified Hermes-2-Pro tool section: emits an XML-ish block listing
+        // each tool's function name and reads the city property from the
+        // parameters schema (minijinja has no `tojson` filter, so we drill
+        // into the nested value directly instead).
+        let tpl = "{% if tools %}<tools>{% for t in tools %}<tool>{{ t['function']['name'] }} {{ t['function']['parameters']['properties']['city']['type'] }}</tool>{% endfor %}</tools>{% endif %}{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}\n{% endfor %}".to_string();
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "What's the weather?".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let tools = vec![ToolDef {
+            r#type: "function".into(),
+            function: FunctionDef {
+                name: "get_weather".into(),
+                description: Some("Get the current weather".into()),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } },
+                    "required": ["city"]
+                })),
+            },
+        }];
+        let rendered = render_chat_template(&tpl, &msgs, false, "", "", Some(&tools), None)
+            .expect("render must succeed");
+        assert!(rendered.contains("<tools>"), "missing tools block");
+        assert!(rendered.contains("get_weather"), "missing function name");
+        assert!(
+            rendered.contains("string"),
+            "parameters schema not rendered"
+        );
+    }
+
+    /// `tool_choice == "none"` must suppress tool definitions in the prompt. A
+    /// template that honors the directive omits the tools block.
+    #[test]
+    fn tool_choice_none_suppresses_in_template() {
+        let tpl = "{% if tool_choice and tool_choice != 'none' %}<tools>{% for t in tools %}{{ t['function']['name'] }}{% endfor %}</tools>{% endif %}{{ messages[0]['content'] }}".to_string();
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let tools = vec![ToolDef {
+            r#type: "function".into(),
+            function: FunctionDef {
+                name: "f".into(),
+                description: None,
+                parameters: None,
+            },
+        }];
+        let rendered = render_chat_template(
+            &tpl,
+            &msgs,
+            false,
+            "",
+            "",
+            Some(&tools),
+            Some(&ToolChoice::None),
+        )
+        .expect("render must succeed");
+        assert!(!rendered.contains("<tools>"), "tools should be suppressed");
+        assert_eq!(rendered, "hi");
+    }
+
+    /// A message carrying an assistant tool call must serialize `tool_calls`
+    /// so a tool-aware template can render prior tool invocations.
+    #[test]
+    fn renders_assistant_tool_calls_in_message() {
+        let tpl = "{% for m in messages %}{% if m['tool_calls'] %}{% for tc in m['tool_calls'] %}<call>{{ tc['name'] }}({{ tc['arguments'] }})</call>{% endfor %}{% else %}{{ m['role'] }}: {{ m['content'] }}{% endif %}\n{% endfor %}".to_string();
+        let msgs = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "Get weather for Paris".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "".into(),
+                tool_calls: Some(vec![ToolCallMsg {
+                    id: "call_1".into(),
+                    name: "get_weather".into(),
+                    arguments: "{\"city\":\"Paris\"}".into(),
+                }]),
+                tool_call_id: None,
+                name: None,
+            },
+        ];
+        let rendered = render_chat_template(&tpl, &msgs, false, "", "", None, None)
+            .expect("render must succeed");
+        assert!(
+            rendered.contains("<call>get_weather({\"city\":\"Paris\"})</call>"),
+            "assistant tool call not rendered; got: {rendered}"
+        );
+    }
+
+    /// A tool-role message carrying a `tool_call_id` and `name` must round-trip
+    /// through the template's normal message-rendering path.
+    #[test]
+    fn renders_tool_role_message() {
+        let tpl =
+            "{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}\n{% endfor %}".to_string();
+        let msgs = vec![ChatMessage {
+            role: "tool".into(),
+            content: "72°F".into(),
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            name: Some("get_weather".into()),
+        }];
+        let rendered = render_chat_template(&tpl, &msgs, false, "", "", None, None)
+            .expect("render must succeed");
+        assert!(rendered.contains("tool: 72°F"), "tool message not rendered");
     }
 }

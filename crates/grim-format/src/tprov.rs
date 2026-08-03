@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek};
 use std::io::BufReader;
+use std::io::{Read, Seek};
 
 use grim_tensor::dtype::{DType, KQuantScheme, QuantProvenance, Storage};
 use grim_tensor::error::{Error, Result};

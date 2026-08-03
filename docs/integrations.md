@@ -110,13 +110,28 @@ No configuration required. Endpoints available at `http://127.0.0.1:11434/v1/`
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/v1/chat/completions` | POST | Chat completions with streaming |
+| `/health` | GET | Health check |
+| `/v1/chat/completions` | POST | Chat completions with SSE streaming + tool calls |
 | `/v1/completions` | POST | Text completions |
+| `/v1/embeddings` | POST | Embeddings (returns 501) |
+| `/v1/audio/transcriptions` | POST | Audio transcription (stub) |
+| `/v1/images/generations` | POST | Image generation (stub) |
 | `/v1/models` | GET | Model catalog |
-| `/v1/models/{id}/load` | POST | Dynamic model loading |
-| `/v1/models/{id}` | DELETE | Unload model |
+| `/v1/models/load` | POST | Dynamic model loading |
+| `/v1/models/unload` | POST | Unload model |
+| `/v1/requests/{id}/pause` | POST | Pause a running request (§5.2.1) |
+| `/v1/requests/{id}/resume` | POST | Resume a paused request (§5.2.1) |
+| `/v1/requests/{id}/cancel` | POST | Cancel a streaming request (WI-CANCEL) |
+| `/v1/requests/{id}/stream` | GET | Stream request state |
 | `/v1/status` | GET | Server status |
-| `/v1/metrics` | GET | Prometheus metrics |
+| `/v1/metrics` | GET | Prometheus-style metrics |
+| `/api/chat` | POST | Grim REST compat shim |
+| `/api/generate` | POST | Grim REST compat shim |
+| `/api/tags` | GET | Grim REST compat shim |
+| `/api/pull` | POST | Grim REST compat shim |
+| `/api/stats` | GET | Aggregated stats |
+| `/` | GET | Dashboard UI |
+| `/grpc` | GET | gRPC service handler (stub) |
 
 ### Sequence Diagram
 

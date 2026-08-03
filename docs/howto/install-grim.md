@@ -48,10 +48,10 @@ git clone https://github.com/poolside-ai/grim.git
 cd grim
 
 # Build in release mode
-cargo build --release -p grim-cli -p grim-server
+cargo build --release -p grim-cli
 
 # Or build the full workspace
-cargo build --release --all
+cargo build --release --workspace
 ```
 
 ## Optional: Run Tests
@@ -61,14 +61,14 @@ cargo build --release --all
 cargo test --workspace
 
 # Run GPU tests (ROCm only)
-GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm
+GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --features rocm-aiter,rccl
 ```
 
 ## Installation
 
 ```bash
-# Copy binary to PATH
-cp target/release/grim /usr/local/bin/
+# Copy binary to PATH (binary is named grim-cli)
+cp target/release/grim-cli /usr/local/bin/grim
 
 # Verify installation
 grim --version

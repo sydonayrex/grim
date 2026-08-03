@@ -13,6 +13,7 @@ pub mod doctor;
 pub mod echo;
 pub mod oxidizer;
 pub mod plugin;
+pub mod reap;
 pub mod rm;
 pub mod run;
 pub mod server;
@@ -68,7 +69,7 @@ enum Commands {
         #[arg(short, long, default_value = "grim.toml")]
         config: String,
         /// Path to plugins directory.
-        #[arg(short, long, default_value = "plugins")]
+        #[arg(long, default_value = "plugins")]
         plugins: String,
     },
     /// One-shot inference or HTTP serving.
@@ -153,6 +154,18 @@ enum Commands {
         /// Model to use (defaults to context default).
         model: Option<String>,
         /// Additional arguments passed to the client.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// Launch an external app with a grim-tracked model baked in.
+    Reap {
+        /// Client to launch.
+        #[arg(value_enum)]
+        client: ClientIntegration,
+        /// Grim-tracked model name (validated against local catalog; defaults to "default").
+        #[arg(long)]
+        model: Option<String>,
+        /// Extra arguments passed through to the launched program after `--`.
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -1222,6 +1235,16 @@ async fn main() -> Result<()> {
         } => {
             if let Err(e) = start::cmd_start(client, model.as_deref(), &args).await {
                 eprintln!("Start failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Reap {
+            client,
+            model,
+            args,
+        } => {
+            if let Err(e) = reap::cmd_reap(client, model.as_deref(), &args) {
+                eprintln!("Reap failed: {e}");
                 std::process::exit(1);
             }
         }

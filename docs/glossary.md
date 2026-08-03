@@ -190,9 +190,12 @@ SiLU GLU — activation function used in MLP layers.
 
 Splitting a model's weights across multiple GPUs. Grim implements this via the `all_reduce` operation.
 
-### TurboQuant
+### KV Quantization
 
-A quantization approach using importance-matrices for optimal bit allocation. Combines with Lloyd-Max scalar quantization.
+Runtime compression of KV cache blocks using random-orthogonal rotation + Lloyd-Max scalar
+quantization. Reduces KV memory footprint during serving, trading compute for memory.
+
+Related code: `grim-kvquant`, `grim-memory/src/lib.rs` (`KvBlockPool` stores `compressor: Option<Arc<dyn KvCompressor>>`).
 
 ## V
 

@@ -4,13 +4,15 @@ Generated from clap derive attributes in `crates/grim-cli/src/main.rs`.
 
 ## `grim serve`
 
-Starts the inference HTTP server on Ollama-compatible endpoints (default port 11434). This is the subcommand used by the systemd/launchd service unit.
+Starts the inference HTTP server on Ollama-compatible endpoints (default `127.0.0.1:11434`). This is the subcommand used by the systemd/launchd service unit.
 
 | Flag | Short | Default | Required |
 |---|---|---|---|
-| `--address` | `-a` | `127.0.0.1:11434` | No |
+| `--address` | `-a` | `""` | No |
+| `--host` | | None | No |
+| `--port` | `-p` | None | No |
 | `--config` | `-c` | `grim.toml` | No |
-| `--plugins` | `-p` | `plugins` | No |
+| `--plugins` | | `plugins` | No |
 
 ## `grim run`
 
@@ -23,8 +25,8 @@ One-shot inference or HTTP serving for a model.
 | `--serve` | - | false | No |
 | `--address` | `-a` | `127.0.0.1:11434` | No (only used with `--serve`) |
 | `--config` | `-c` | `grim.toml` | No |
-| `--plugins` | `-p` | `plugins` | No |
-| `--rocml-profile` | - | auto-detected | No |
+| `--plugins` | - | `plugins` | No |
+| `--rocml-profile` | - | None | No |
 | `--temperature` | - | `0.7` | No |
 | `--top_p` | - | `0.9` | No |
 | `--top_k` | - | `40` | No |
@@ -50,7 +52,7 @@ Download a model from Hugging Face or Ollama registry.
 |---|---|---|---|
 | `model` | - | (required) | Yes |
 | `--output` | `-o` | Local cache | No |
-| `--rocml-profile` | - | auto-detected | No |
+| `--rocml-profile` | - | None | No |
 
 ## `grim stop`
 
@@ -72,9 +74,13 @@ Delete a model from local cache.
 
 Check the local model cache and report completed and partial downloads.
 
+No arguments.
+
 ## `grim list` / `grim ps`
 
 Show loaded models, memory usage, and execution backend.
+
+No arguments.
 
 ## `grim show`
 
@@ -90,8 +96,8 @@ Set a model (local or cloud-routed) as the default model point for a client cont
 
 | Arguments | Required |
 |---|---|
-| `CONTEXT` | Yes |
-| `MODEL` | Yes |
+| `context` | Yes |
+| `model` | Yes |
 
 ## `grim login`
 
@@ -105,6 +111,79 @@ Log in to a registry or cloud provider.
 ## `grim quantize`
 
 Stub command; prints "Quantize command - not yet implemented."
+
+No arguments.
+
+## `grim convert`
+
+Convert a model file to ROCm-optimized .grim format using Oxidizer.
+
+| Flag | Short | Default | Required |
+|---|---|---|---|
+| `--input` | `-i` | (required) | Yes |
+| `--output` | `-o` | (required) | Yes |
+| `--target` | `-t` | `auto` | No |
+| `--target_bpw` | - | `4.0` | No |
+| `--generations` | - | `50` | No |
+| `--dataset` | - | None | No |
+
+## `grim train`
+
+Train / fine-tune LoRA adapters on a dataset (SFT QLoRA).
+
+| Flag | Short | Default | Required |
+|---|---|---|---|
+| `--model` | `-m` | (required) | Yes |
+| `--dataset` | `-d` | (required) | Yes |
+| `--output` | `-o` | `adapter.grim.train` | No |
+| `--epochs` | - | `3` | No |
+| `--lr` | - | `2e-4` | No |
+| `--rank` | - | `16` | No |
+| `--alpha` | - | `32.0` | No |
+| `--batch_size` | - | `2048` | No |
+| `--gradient_accumulation_steps` | - | `1` | No |
+| `--warmup_steps` | - | `0` | No |
+| `--logging_steps` | - | `0` | No |
+| `--max_grad_norm` | - | `1.0` | No |
+| `--early_stopping_patience` | - | `0` | No |
+| `--num_gpus` | - | `1` | No |
+| `--device` | - | `cpu` | No |
+| `--mode` | - | `qlora` | No |
+| `--echo_mode` | - | false | No |
+| `--optimizer` | - | `adamw` | No |
+| `--scheduler` | - | `cosine-warmup` | No |
+| `--use_pissa` | - | false | No |
+| `--use_olora` | - | false | No |
+| `--olora_lambda` | - | `1.0` | No |
+
+## `grim cp`
+
+Copy a model to a new name in the local cache.
+
+| Arguments | Required |
+|---|---|
+| `src` | Yes |
+| `dst` | Yes |
+
+## `grim start`
+
+Start a client integration.
+
+| Flag | Argument | Required |
+|---|---|---|
+| `client` | `hermes`, `openclaw`, `claw`, `codex`, `antigravity`, `zcode` | Yes |
+| `model` | - | No |
+| `args` | - | No |
+
+## `grim reap`
+
+Launch an external app with a grim-tracked model baked in.
+
+| Flag | Argument | Required |
+|---|---|---|
+| `client` | `hermes`, `openclaw`, `claw`, `codex`, `antigravity`, `zcode` | Yes |
+| `--model` | - | No (defaults to `"default"`) |
+| `args` | - | No |
 
 ## `grim spec`
 
@@ -144,7 +223,7 @@ Platform-native background daemon management.
 
 ## `grim oxidizer`
 
-ROCm-optimized GGUF conversion tool.
+ROCm-optimized GGUF conversion tool — calibrate, search, and convert.
 
 ### `grim oxidizer info`
 
@@ -160,7 +239,7 @@ Run importance-matrix calibration and cache results.
 
 | Flag | Short | Default | Required |
 |---|---|---|---|
-| `--model` | `-m` | (required) | Yes |
+| `model` | - | (required) | Yes |
 | `--output` | `-o` | (required) | Yes |
 | `--dataset` | - | None | No |
 
@@ -168,7 +247,7 @@ Run importance-matrix calibration and cache results.
 
 Run EvoPress evolutionary search on pre-computed importance scores.
 
-| Flag | Short | Default | Required |
+| Flag | Argument | Default | Required |
 |---|---|---|---|
 | `scores_path` | - | (required) | Yes |
 | `tensor_sizes` | - | (required) | Yes |
@@ -181,11 +260,22 @@ Full convert pipeline: calibrate → search → write .grim.
 
 | Flag | Short | Default | Required |
 |---|---|---|---|
-| `--model` | `-m` | (required) | Yes |
+| `model` | - | (required) | Yes |
 | `--output` | `-o` | (required) | Yes |
 | `--target_bpw` | - | `4.0` | No |
 | `--generations` | - | `50` | No |
 | `--profile` | - | None | No |
+| `--dataset` | - | None | No |
+
+### `grim oxidizer raven`
+
+Raven FP8/MXFP4 repack pipeline: rewrite model tensors into FP8 format.
+
+| Flag | Short | Default | Required |
+|---|---|---|---|
+| `model` | - | (required) | Yes |
+| `--output` | `-o` | (required) | Yes |
+| `--target_bpw` | - | `8.0` | No (optional) |
 | `--dataset` | - | None | No |
 
 ### `grim oxidizer prepare`
@@ -194,8 +284,8 @@ Prepare a training-capable `.grim` artifact from a base checkpoint.
 
 | Flag | Short | Default | Required |
 |---|---|---|---|
-| `--input` | `-i` | (required) | Yes |
-| `--output` | `-o` | (required) | Yes |
+| `input` | - | (required) | Yes |
+| `output` | - | (required) | Yes |
 | `--train` | - | `true` | No |
 | `--format` | - | `bf16` | No |
 | `--profile` | - | None | No |
@@ -207,14 +297,14 @@ Analyze a checkpoint and bake ROCm fusion hints into the output artifact.
 
 | Flag | Short | Default | Required |
 |---|---|---|---|
-| `--input` | `-i` | (required) | Yes |
-| `--output` | `-o` | (required) | Yes |
+| `input` | - | (required) | Yes |
+| `output` | - | (required) | Yes |
 | `--profile` | - | None | No |
 | `--rocm` | - | `true` | No |
 
 ## `grim doctor`
 
-Re-verify every claim Grim makes about itself.
+Re-verify every claim Grim makes about itself (§13.5). Checks: unit on disk, OS service visibility, HTTP health, GPU backend, WASM grant enforcement, and ExecStart consistency.
 
 | Flag | Short | Default | Required |
 |---|---|---|---|
@@ -225,7 +315,7 @@ Re-verify every claim Grim makes about itself.
 
 ## `grim accept`
 
-Validate and install a model architecture plugin.
+Validate and install a model architecture plugin into system plugin directory.
 
 | Argument | Required |
 |---|---|
@@ -240,50 +330,11 @@ Generate a model architecture compatibility plugin from a HuggingFace config.jso
 | `--config_path` | `-c` | (required) | Yes |
 | `--output` | `-o` | stdout | No |
 
-## `grim train`
+## `grim verify`
 
-Train / fine-tune LoRA adapters on a dataset (SFT QLoRA).
-
-| Flag | Short | Default | Required |
-|---|---|---|---|
-| `--model` | `-m` | (required) | Yes |
-| `--dataset` | `-d` | (required) | Yes |
-| `--output` | `-o` | `adapter.grim.train` | No |
-| `--epochs` | - | `3` | No |
-| `--lr` | - | `2e-4` | No |
-| `--rank` | - | `16` | No |
-| `--alpha` | - | `32.0` | No |
-| `--device` | - | `cpu` | No |
-| `--mode` | - | `qlora` | No |
-
-## `grim convert`
-
-Convert a model file to ROCm-optimized .grim format.
+Verify a .grim file: structure, compression, payload readability, and QLoRA adapter presence in backup2 slots.
 
 | Flag | Short | Default | Required |
 |---|---|---|---|
-| `--input` | `-i` | (required) | Yes |
-| `--output` | `-o` | (required) | Yes |
-| `--target` | `-t` | `auto` | No |
-| `--target_bpw` | - | `4.0` | No |
-| `--generations` | - | `50` | No |
-| `--dataset` | - | None | No |
-
-## `grim cp`
-
-Copy a model to a new name in the local cache.
-
-| Arguments | Required |
-|---|---|
-| `src` | Yes |
-| `dst` | Yes |
-
-## Client Integrations (`grim start`)
-
-Start a client integration.
-
-| Flag | Argument | Required |
-|---|---|---|
-| `client` | `hermes`, `openclaw`, `claw`, `codex`, `antigravity`, `zcode` | Yes |
-| `model` | - | No |
-| `args` | - | No |
+| `path` | - | (required) | Yes |
+| `--verbose` | `-v` | false | No |

@@ -389,6 +389,9 @@ pub async fn cmd_run(
             let messages = vec![grim_format::ChatMessage {
                 role: "user".to_string(),
                 content: prompt.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
             }];
             grim_format::render_messages_or_last(tok, &messages)
         } else {
@@ -825,6 +828,9 @@ pub async fn cmd_run_interactive(
         messages.push(grim_format::ChatMessage {
             role: "user".to_string(),
             content: trimmed.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
         });
 
         let mut tokens: Vec<u32> = if let Some(tok) = &tokenizer {
@@ -906,6 +912,9 @@ pub async fn cmd_run_interactive(
             messages.push(grim_format::ChatMessage {
                 role: "assistant".to_string(),
                 content: text,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
             });
         } else {
             for t in &generated_tokens {
