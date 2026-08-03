@@ -29,45 +29,72 @@ graph LR
 
 ## Public API
 
-### VisionEncoder
+### Vit
 
 ```rust
-pub struct VisionEncoder {
-    pub patch_embed: PatchEmbedding,
-    pub cls_token: Tensor,
-    pub pos_embed: Tensor,
-    pub blocks: Vec<ViTBlock>,
-    pub norm: RmsNorm,
+pub struct Vit {
+    pub cfg: VitConfig,
+    pub device: Device,
+    pub patch_proj_w: Vec<f32>,
+    pub patch_proj_b: Vec<f32>,
+    pub cls_token: Vec<f32>,
+    pub pos_embed: Vec<f32>,
+    blocks: Vec<VitBlock>,
+    pub ln: RmsNorm,
+    pub features: usize,
 }
 
-impl Encoder for VisionEncoder {
-    fn encode(&mut self, input_ids: &[u32], positions: &[u32]) -> Result<Tensor>;
+impl Encoder for Vit {
+    fn encode(&self, input: &Tensor) -> Result<Tensor>;
 }
 ```
 
-### VisionFeatures
+### Bert
+
+BERT-style bidirectional encoder with multi-head self-attention.
 
 ```rust
-pub struct VisionFeatures {
-    pub cls_token: Tensor,
-    pub patch_tokens: Tensor,
-    pub global_features: Tensor,
+pub struct Bert {
+    pub cfg: BertConfig,
+    pub device: Device,
+    pub word_embeddings: Embedding,
+    pub position_embeddings: Embedding,
+    pub token_type_embeddings: Embedding,
+    pub embeddings_ln: RmsNorm,
+    pub layers: Vec<BertBlock>,
+}
+
+impl Encoder for Bert {
+    fn encode(&self, input: &Tensor) -> Result<Tensor>;
+}
+
+impl CausalLm for Bert {
+    fn forward(&self, session: &mut dyn SessionT,
+               input_ids: &Tensor, positions: &Tensor,
+               adapters: &[AdapterHandle]) -> Result<Tensor>;
 }
 ```
 
 ## Usage Example
 
 ```rust
-use grim_models_vision::VisionEncoder;
+use grim_models_vision::{Vit, VitConfig, Bert, BertConfig};
+use grim_tensor::{Device, Tensor, Shape};
 
-let model = VisionEncoder::new(
-    image_size: 224,
-    patch_size: 16,
-    num_layers: 12,
-    hidden_dim: 768,
-);
+// ViT — random init for testing
+let vit_cfg = VitConfig {
+    image_size: 224, patch_size: 16, in_channels: 3,
+    hidden_size: 768, num_heads: 12, num_layers: 12,
+    intermediate_size: 3072, rms_norm_eps: 1e-6,
+};
+let vit = Vit::random(Device::Cpu, vit_cfg);
 
-let features = model.encode(&token_ids, &positions)?;
+// BERT — loaded from weights
+let bert_cfg = BertConfig {
+    vocab_size: 30522, hidden_size: 768, num_heads: 12,
+    num_layers: 12, intermediate_size: 3072, max_seq_len: 512,
+};
+let bert = Bert::load(Device::Cpu, &ws, bert_cfg)?;
 ```
 
 ## Feature Flags

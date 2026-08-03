@@ -173,7 +173,7 @@ impl VitBlock {
         }
 
         let mut attn_val = vec![0.0f32; seq * h];
-        let scale = 1.0 / (self.head_dim as f32).max(1.0).sqrt();
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
         let hd = self.head_dim;
         for head in 0..self.num_heads {
             for s in 0..seq {
@@ -397,11 +397,14 @@ impl Vit {
         let per_side = h / patch;
         let num_patches = per_side * per_side;
         let mut tokens: Vec<f32> = vec![0.0f32; (num_patches + 1) * self.cfg.hidden_size];
-        tokens[..self.cfg.hidden_size].copy_from_slice(&self.cls_token);
+        let hidden = self.cfg.hidden_size;
         let ph = patch;
         let pw = patch;
-        let hidden = self.cfg.hidden_size;
         let patch_dim = c * ph * pw;
+        // CLS token at index 0 — apply positional embedding pos_embed[0].
+        for o in 0..hidden {
+            tokens[o] = self.cls_token[o] + self.pos_embed[o];
+        }
         for py in 0..per_side {
             for px in 0..per_side {
                 let mut patch_vec = vec![0.0f32; patch_dim];
@@ -421,12 +424,9 @@ impl Vit {
                     for i in 0..patch_dim {
                         acc += self.patch_proj_w[o * patch_dim + i] * patch_vec[i];
                     }
+                    // Apply positional embedding once (pos_embed[1..] for patches).
                     tokens[proj_offset + o] = acc + self.pos_embed[proj_offset + o];
                 }
-                tokens[proj_offset..proj_offset + hidden]
-                    .iter_mut()
-                    .zip(self.pos_embed[proj_offset..proj_offset + hidden].iter())
-                    .for_each(|(t, p)| *t += *p);
             }
         }
         for b in &self.blocks {
@@ -519,5 +519,46 @@ mod tests {
         };
         let vit = Vit::random(Device::Cpu, cfg);
         assert_eq!(vit.features, 64);
+    }
+
+    #[test]
+    fn vit_pos_embed_applied_once_and_to_cls() {
+        // With zeroed weights, zeroed cls_token, and all-ones pos_embed,
+        // every token before the blocks should be 1.0 (cls + pos_embed[0],
+        // patches + pos_embed[1..]) and rmsnorm with weight=1 should preserve ~1.0.
+        // Crucially, CLS must be non-zero (proving pos_embed[0] was applied),
+        // and patches must not be doubled (proving single application).
+        let cfg = VitConfig {
+            image_size: 4,
+            patch_size: 2,
+            in_channels: 1,
+            hidden_size: 4,
+            num_heads: 2,
+            num_layers: 0,
+            intermediate_size: 8,
+            rms_norm_eps: 1e-5,
+        };
+        let mut vit = Vit::random(Device::Cpu, cfg);
+        vit.patch_proj_w = vec![0.0f32; vit.patch_proj_w.len()];
+        vit.patch_proj_b = vec![0.0f32; vit.patch_proj_b.len()];
+        vit.cls_token = vec![0.0f32; vit.cls_token.len()];
+        vit.pos_embed = vec![1.0f32; vit.pos_embed.len()];
+        vit.ln.weight = cpu_tensor(vec![1.0f32; 4], Shape::new(vec![4]));
+
+        let image_data: Vec<f32> = (0..16).map(|i| (i as f32) * 0.01).collect();
+        let img = cpu_tensor(image_data, Shape::new(vec![1, 4, 4]));
+        let feat = vit.encode_image(&img).unwrap();
+        let out = feat.to_vec_f32().unwrap();
+
+        // With all-ones pos_embed, all-zero weights/bias/cls_token:
+        // All token dims should be 1.0 (single pos_embed application).
+        // Old buggy code: CLS=0 (no pos_embed), patches=2.0 (double pos_embed).
+        assert_eq!(out.len(), 4);
+        for &v in &out {
+            assert!(
+                (v - 1.0).abs() < 0.01,
+                "CLS output should be ~1.0 (pos_embed applied once), got {v}"
+            );
+        }
     }
 }

@@ -95,7 +95,11 @@ pub struct RankContext {
 }
 
 impl RankContext {
-    pub fn new(rank: TrainingRank, backend: SelectedBackend, world_size: usize) -> Result<Self, SelectionError> {
+    pub fn new(
+        rank: TrainingRank,
+        backend: SelectedBackend,
+        world_size: usize,
+    ) -> Result<Self, SelectionError> {
         if rank.rank >= world_size || world_size == 0 {
             return Err(SelectionError::Tensor(format!(
                 "rank {} is invalid for world size {}",
@@ -162,7 +166,12 @@ pub fn allocate_batch_sizes(ranks: &[TrainingRank], global_batch: usize) -> Vec<
         assigned += 1;
     }
     while assigned > global_batch {
-        if let Some(index) = order.iter().rev().map(|entry| entry.0).find(|&i| sizes[i] > 0) {
+        if let Some(index) = order
+            .iter()
+            .rev()
+            .map(|entry| entry.0)
+            .find(|&i| sizes[i] > 0)
+        {
             sizes[index] -= 1;
             assigned -= 1;
         } else {
@@ -175,11 +184,11 @@ pub fn allocate_batch_sizes(ranks: &[TrainingRank], global_batch: usize) -> Vec<
 /// Return the exact integer batch assigned to each rank context. Keeping this
 /// helper next to dataloader construction makes the invariant explicit:
 /// `sum(result) == global_batch` whenever the global batch can be represented.
-pub fn allocate_context_batch_sizes(
-    contexts: &[RankContext],
-    global_batch: usize,
-) -> Vec<usize> {
-    let ranks: Vec<TrainingRank> = contexts.iter().map(|context| context.rank.clone()).collect();
+pub fn allocate_context_batch_sizes(contexts: &[RankContext], global_batch: usize) -> Vec<usize> {
+    let ranks: Vec<TrainingRank> = contexts
+        .iter()
+        .map(|context| context.rank.clone())
+        .collect();
     allocate_batch_sizes(&ranks, global_batch)
 }
 
@@ -193,10 +202,7 @@ where
     F: FnOnce() -> Result<T, String> + Send,
 {
     std::thread::scope(|scope| {
-        let handles: Vec<_> = jobs
-            .into_iter()
-            .map(|job| scope.spawn(job))
-            .collect();
+        let handles: Vec<_> = jobs.into_iter().map(|job| scope.spawn(job)).collect();
         handles
             .into_iter()
             .enumerate()
@@ -261,7 +267,9 @@ pub fn enumerate_training_gpus() -> Result<Vec<TrainingGpu>, SelectionError> {
 pub fn plan_training_ranks(requested: usize) -> Result<Vec<RankContext>, SelectionError> {
     let gpus = enumerate_training_gpus()?;
     if requested == 0 {
-        return Err(SelectionError::Tensor("requested GPU count must be greater than zero".into()));
+        return Err(SelectionError::Tensor(
+            "requested GPU count must be greater than zero".into(),
+        ));
     }
     if requested > gpus.len() {
         return Err(SelectionError::Tensor(format!(
@@ -278,7 +286,9 @@ pub fn plan_training_ranks(requested: usize) -> Result<Vec<RankContext>, Selecti
 pub fn build_rank_contexts(ranks: &[TrainingRank]) -> Result<Vec<RankContext>, SelectionError> {
     let world_size = ranks.len();
     if world_size == 0 {
-        return Err(SelectionError::Tensor("cannot build an empty rank plan".into()));
+        return Err(SelectionError::Tensor(
+            "cannot build an empty rank plan".into(),
+        ));
     }
     ranks
         .iter()
@@ -760,10 +770,8 @@ mod tests {
 
     #[test]
     fn concurrent_rank_runner_preserves_rank_order() {
-        let results = run_concurrent_ranks(vec![
-            || Ok::<_, String>(3usize),
-            || Ok::<_, String>(5usize),
-        ]);
+        let results =
+            run_concurrent_ranks(vec![|| Ok::<_, String>(3usize), || Ok::<_, String>(5usize)]);
         assert_eq!(results, vec![Ok(3), Ok(5)]);
     }
 }

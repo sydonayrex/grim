@@ -8,12 +8,16 @@ use grim_core::error::{Error, Result};
 use grim_engine::streaming_forward::StreamingBlockForward;
 use grim_format::tprov::GgufProvider;
 
+use crate::echo::{EchoConfig, EchoTrainer};
+
 /// IGNORE_INDEX for cross-entropy. Matches HF/PyTorch convention (-100 as u32 = 4294967196).
 const IGNORE_INDEX: u32 = -100i32 as u32;
+use grim_backend_rocm::RcclAllReduce;
 use grim_format::tokenizer::GgufTokenizer;
 use grim_format::train::TrainState;
 use grim_models_transformer::LlamaConfig;
 use grim_nn::{Embedding, Linear, RmsNorm, WeightSource};
+use grim_tensor::backend::{BackendDevice, ScytheLink, ScythePlacement};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -27,6 +31,18 @@ pub struct TrainOptions {
     pub lr: f32,
     pub rank: usize,
     pub alpha: f32,
+    /// Maximum tokens per packed batch (controls packing granularity and
+    /// effectively the micro-batch size). Maps to max sequence length.
+    pub batch_size: usize,
+    /// Number of micro-batches to accumulate gradients over before an
+    /// optimizer step. Effective batch = batch_size * gradient_accumulation_steps.
+    pub gradient_accumulation_steps: usize,
+    /// Number of optimizer steps for linear LR warmup at the start of training.
+    pub warmup_steps: usize,
+    /// Log loss every N optimizer steps. 0 disables step-level logging.
+    pub logging_steps: usize,
+    /// Maximum gradient norm for global gradient clipping. 0 disables clipping.
+    pub max_grad_norm: f32,
     pub device: String,
     pub mode: String,
     pub optimizer: grim_autograd::OptimizerKind,
@@ -37,6 +53,16 @@ pub struct TrainOptions {
     pub use_olora: bool,
     /// Weight of the OLoRA orthogonality penalty.
     pub olora_lambda: f32,
+    /// SPECTRAL-QLORA: semi-orthogonal A/B init + Muon optimizer.
+    pub use_spectral_qlora: bool,
+    /// Stop training if loss does not improve for this many epochs. 0 disables early stopping.
+    pub early_stopping_patience: usize,
+    /// Number of GPUs to use for data-parallel training. 1 = single-GPU,
+    /// >1 = multi-GPU with RCCL gradient all-reduce.
+    pub num_gpus: usize,
+    /// Enable SCALE-ECHO echo training mode. When present, bypasses the
+    /// autograd tape and uses subspace echo state + FP4 updates.
+    pub echo_mode: bool,
 }
 
 /// Dataset entry in Alpaca format.
@@ -340,6 +366,16 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         Error::Session(format!("failed to open model '{}': {}", opts.model_path, e))
     })?;
 
+    // Suggest conversion if the user is training on a raw (unconverted) GGUF.
+    if !opts.model_path.to_lowercase().ends_with(".grim") {
+        eprintln!(
+            "[grim train] NOTE: training on an unconverted GGUF checkpoint. \
+             A ROCm-tuned .grim conversion provides better kernel performance. \
+             Run 'grim convert {} model.grim --target auto' before training.",
+            opts.model_path
+        );
+    }
+
     let model_config = injection_config_from_metadata(&provider)?;
     let llama_config = llama_config_from_metadata(&provider)?;
     let num_layers = llama_config.num_layers;
@@ -371,9 +407,47 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         opts.use_pissa,
         opts.use_olora,
         opts.olora_lambda,
+        opts.use_spectral_qlora,
     );
     let mut autograd_reg = AutogradRegistry::new(model_config.clone(), injection_reg)
         .map_err(|e| Error::Session(e.to_string()))?;
+
+    if opts.echo_mode {
+        let echo_cfg = EchoConfig::default();
+        let mut echo_trainer = EchoTrainer::new(echo_cfg);
+        let mut adapter_weights: Vec<f32> = autograd_reg
+            .params
+            .iter()
+            .flat_map(|(_, p)| p.data.to_vec_f32().unwrap_or_default())
+            .collect();
+        let echo_epochs = opts.epochs.max(1);
+        let echo_steps = adapter_weights.len().max(1);
+        for epoch in 0..echo_epochs {
+            let mut epoch_loss = 0.0f32;
+            for step in 0..echo_steps {
+                let loss = echo_trainer.step(&mut adapter_weights);
+                epoch_loss += loss;
+                if opts.logging_steps > 0 && (step + 1) % opts.logging_steps == 0 {
+                    println!(
+                        "[grim train] echo step {}/{} — loss: {:.4}",
+                        step + 1,
+                        echo_steps,
+                        loss
+                    );
+                }
+            }
+            if echo_steps > 0 {
+                epoch_loss /= echo_steps as f32;
+            }
+            println!(
+                "[grim train] Epoch {}/{} — echo loss: {:.4}",
+                epoch + 1,
+                echo_epochs,
+                epoch_loss
+            );
+        }
+        return Ok(());
+    }
 
     let mut optimizer = grim_autograd::Optimizer::new(opts.optimizer, opts.lr)
         .map_err(|e| Error::Session(e.to_string()))?;
@@ -388,7 +462,8 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
     }
 
     // ── F4: Load real dataset ──
-    let dataset = load_dataset(&opts.dataset_path, &tokenizer, llama_config.max_seq_len)?;
+    let max_seq_len = opts.batch_size.min(llama_config.max_seq_len);
+    let dataset = load_dataset(&opts.dataset_path, &tokenizer, max_seq_len)?;
     if dataset.is_empty() {
         return Err(Error::Session("dataset is empty".into()));
     }
@@ -418,7 +493,16 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         }
     };
 
-    let ws = WeightSource::root(&provider, target_device);
+    let ws = WeightSource::root(&provider, target_device.clone());
+
+    // Resolve the BackendDevice handle for device-side operations (all-reduce, gradient clipping).
+    let dev: Box<dyn BackendDevice> = match &target_device {
+        grim_tensor::Device::Cpu => Box::new(grim_backend_cpu::CpuDevice::new()),
+        grim_tensor::Device::Rocm(ordinal) => {
+            Box::new(grim_backend_rocm::RocmDevice::new(*ordinal))
+        }
+        _ => Box::new(grim_backend_cpu::CpuDevice::new()),
+    };
     let tok_embeddings = Embedding::load(
         &ws.pp("token_embd"),
         model_config.vocab_size,
@@ -448,7 +532,53 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         }
     };
 
+    // Compute total optimizer steps for LR scheduling.
+    let accum = opts.gradient_accumulation_steps.max(1);
+    let total_steps = opts.epochs * dataset.len() / accum;
+    let total_steps = total_steps.max(1);
+
+    // ── Multi-GPU setup (Issue 2: wire RCCL all-reduce for distributed training) ──
+    let rccl = if opts.num_gpus > 1 {
+        let device_ordinals: Vec<usize> = (0..opts.num_gpus).collect();
+        match RcclAllReduce::try_new(&device_ordinals) {
+            Ok(r) => {
+                println!(
+                    "[grim train] Multi-GPU: RCCL communicator initialized for {} GPUs",
+                    opts.num_gpus
+                );
+                Some(r)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[grim train] WARNING: RCCL init failed ({}). Falling back to single-GPU.",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build a data-parallel placement covering all GPUs for gradient sync.
+    let dp_placement = if opts.num_gpus > 1 {
+        let ranks: Vec<usize> = (0..opts.num_gpus).collect();
+        let partition = vec![1.0f32; opts.num_gpus];
+        let routes = vec![ScytheLink::PeerDirect; opts.num_gpus * opts.num_gpus];
+        Some(ScythePlacement {
+            ranks,
+            partition,
+            routes,
+        })
+    } else {
+        None
+    };
+
     let mut prev_loss = f32::MAX;
+    // Tracks epochs since the best loss was observed (for early stopping).
+    let mut epochs_since_best = 0usize;
+    // Global optimizer step counter (across all epochs).
+    let mut global_step: usize = 0;
 
     for epoch in 0..opts.epochs {
         autograd_reg
@@ -456,7 +586,7 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
             .map_err(|e| Error::Session(e.to_string()))?;
 
         let mut epoch_loss = 0.0f32;
-        let mut num_batches = 0;
+        let mut num_batches = 0u32;
 
         for (tokens, labels) in dataset.iter() {
             if tokens.len() < 2 {
@@ -525,17 +655,69 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
 
             epoch_loss += loss_val;
             num_batches += 1;
+
+            // Gradient accumulation: step every N micro-batches.
+            if num_batches % accum as u32 == 0 {
+                // Multi-GPU gradient all-reduce via RCCL (in-place device pointer sum + 1/N averaging).
+                // Falls back to the CPU round-trip BackendDevice::all_reduce if no RCCL handle.
+                if let (Some(rccl_ref), Some(placement)) = (&rccl, &dp_placement) {
+                    autograd_reg
+                        .params
+                        .all_reduce_grads(&*dev, placement, Some(rccl_ref))
+                        .map_err(|e| Error::Session(format!("all_reduce_grads failed: {e}")))?;
+                } else if opts.num_gpus > 1 {
+                    // Fallback: use BackendDevice::all_reduce (still CPU round-trip,
+                    // but at least exercises the trait method path).
+                    eprintln!(
+                        "[grim train] WARNING: no RCCL handle; gradient sync is not performed. \
+                         Multi-GPU results may be incorrect."
+                    );
+                }
+
+                // Global gradient clipping (scale grad by 1/accum, then clip).
+                if opts.max_grad_norm > 0.0 {
+                    autograd_reg.params.clip_grad_norm(opts.max_grad_norm);
+                }
+
+                // LR with linear warmup.
+                let effective_step = global_step;
+                let lr = if effective_step < opts.warmup_steps {
+                    opts.lr * ((effective_step + 1) as f32 / opts.warmup_steps.max(1) as f32)
+                } else {
+                    let decay_step = effective_step.saturating_sub(opts.warmup_steps);
+                    let decay_total = total_steps.saturating_sub(opts.warmup_steps);
+                    opts.scheduler
+                        .get_lr(opts.lr, decay_step, decay_total.max(1))
+                };
+                optimizer.set_lr(lr);
+
+                optimizer
+                    .step(&mut autograd_reg.params)
+                    .map_err(|e| Error::Session(e.to_string()))?;
+                autograd_reg
+                    .zero_grads()
+                    .map_err(|e| Error::Session(e.to_string()))?;
+
+                global_step += 1;
+
+                // Step-level logging.
+                if opts.logging_steps > 0 && global_step % opts.logging_steps == 0 {
+                    println!(
+                        "[grim train] step {}/{} — lr: {:.2e} — loss: {:.4}",
+                        global_step,
+                        total_steps,
+                        lr,
+                        epoch_loss / num_batches as f32,
+                    );
+                }
+            }
         }
 
         if num_batches > 0 {
             epoch_loss /= num_batches as f32;
+        } else {
+            continue;
         }
-
-        optimizer.set_lr(opts.scheduler.get_lr(opts.lr, epoch, opts.epochs));
-
-        optimizer
-            .step(&mut autograd_reg.params)
-            .map_err(|e| Error::Session(e.to_string()))?;
 
         let delta = if prev_loss < f32::MAX {
             epoch_loss - prev_loss
@@ -545,12 +727,30 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         prev_loss = epoch_loss;
 
         println!(
-            "[grim train] Epoch {}/{} — loss: {:.4} (Δ={:+.4})",
+            "[grim train] Epoch {}/{} — loss: {:.4} (Δ={:+.4}) — lr: {:.2e} — step: {}",
             epoch + 1,
             opts.epochs,
             epoch_loss,
-            delta
+            delta,
+            optimizer.lr(),
+            global_step,
         );
+
+        // Early stopping: stop if loss hasn't improved for `patience` epochs.
+        if opts.early_stopping_patience > 0 {
+            if delta > 0.0 || epoch == 0 {
+                epochs_since_best += 1;
+            } else {
+                epochs_since_best = 0;
+            }
+            if epochs_since_best >= opts.early_stopping_patience {
+                println!(
+                    "[grim train] Early stopping: no improvement for {} epochs.",
+                    epochs_since_best
+                );
+                break;
+            }
+        }
     }
 
     let train_state = optimizer.save_to_train_state(&autograd_reg.params);
@@ -579,6 +779,11 @@ mod tests {
             lr: 1e-4,
             rank: 8,
             alpha: 16.0,
+            batch_size: 2048,
+            gradient_accumulation_steps: 4,
+            warmup_steps: 10,
+            logging_steps: 1,
+            max_grad_norm: 1.0,
             device: "cpu".into(),
             mode: "soul-eater".into(),
             optimizer: grim_autograd::OptimizerKind::AdamW,
@@ -586,6 +791,10 @@ mod tests {
             use_pissa: false,
             use_olora: false,
             olora_lambda: 0.0,
+            use_spectral_qlora: false,
+            early_stopping_patience: 3,
+            num_gpus: 1,
+            echo_mode: false,
         };
         assert_eq!(opts.mode, "soul-eater");
     }

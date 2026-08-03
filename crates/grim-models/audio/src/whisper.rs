@@ -8,7 +8,7 @@
 //! For phase 7 the modeling is structural and F32/CPU. ROCm kernels for
 //! the cross-attention path land in phase 4.
 
-use grim_backend_cpu::{CpuDevice, cpu_tensor};
+use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};
 use grim_core::model::{EncoderDecoderLm, ModalityHint};
 use grim_core::{Model, ModelConfig};
@@ -638,6 +638,7 @@ impl WhisperDecoderBlock {
 
     /// GPU dispatch path for Whisper cross-attention via
     /// `BackendDevice::cross_attention` (Phase 2 — mambo5.md Item 13).
+    /// Q is projected per decoder step; K/V projected once per encode pass.
     /// Encoder K/V projected once, reused across decoder steps.
     #[cfg(feature = "rocm")]
     fn cross_attention_gpu(
@@ -657,10 +658,36 @@ impl WhisperDecoderBlock {
 
         let dev = RocmDevice::try_new(ordinal)?;
 
-        // Project Q/K/V on CPU, then upload to GPU for cross-attention kernel.
-        let q_data: Vec<f32> = (0..seq * d).map(|_| 0.0f32).collect();
-        let k_data: Vec<f32> = (0..enc_seq * d).map(|_| 0.0f32).collect();
-        let v_data: Vec<f32> = (0..enc_seq * d).map(|_| 0.0f32).collect();
+        // Project Q/K/V on the host, matching the CPU cross_attn projection,
+        // then upload to the GPU for the cross-attention kernel.
+        let project_q = |out: &mut [f32]| {
+            for pos in 0..seq {
+                for o_idx in 0..d {
+                    let mut sum = 0.0;
+                    for k in 0..d {
+                        sum += cross_normed_data[pos * d + k] * self.cross_q[o_idx * d + k];
+                    }
+                    out[pos * d + o_idx] = sum;
+                }
+            }
+        };
+        let project_kv = |out: &mut [f32], w: &[f32]| {
+            for pos in 0..enc_seq {
+                for o_idx in 0..d {
+                    let mut sum = 0.0;
+                    for k in 0..d {
+                        sum += enc_data[pos * d + k] * w[o_idx * d + k];
+                    }
+                    out[pos * d + o_idx] = sum;
+                }
+            }
+        };
+        let mut q_data = vec![0.0f32; seq * d];
+        let mut k_data = vec![0.0f32; enc_seq * d];
+        let mut v_data = vec![0.0f32; enc_seq * d];
+        project_q(&mut q_data);
+        project_kv(&mut k_data, &self.cross_k);
+        project_kv(&mut v_data, &self.cross_v);
 
         let q_gpu = dev.from_cpu(&q_data, &Shape::new(vec![seq, d]), grim_tensor::DType::F32)?;
         let k_gpu = dev.from_cpu(
@@ -685,7 +712,20 @@ impl WhisperDecoderBlock {
             enc_seq,
             &out_shape,
         )?;
-        attn_out.to_cpu_vec_f32()
+        let attn = attn_out.to_cpu_vec_f32()?;
+
+        // Apply the output projection W_o on the host.
+        let mut result = vec![0.0f32; seq * d];
+        for pos in 0..seq {
+            for o_idx in 0..d {
+                let mut sum = 0.0;
+                for k in 0..d {
+                    sum += attn[pos * d + k] * self.cross_o[o_idx * d + k];
+                }
+                result[pos * d + o_idx] = sum;
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -839,7 +879,6 @@ impl Whisper {
                 frames, self.cfg.max_audio_len
             )));
         }
-        let dev = CpuDevice::new();
         let mel_data = mel.to_vec_f32()?;
         // Project each frame: (T, n_mels) @ (n_mels, d) → (T, d) via CPU backend matmul.
         let mel_t = cpu_tensor(mel_data, Shape::new(vec![frames, mel_bins]));
@@ -848,8 +887,7 @@ impl Whisper {
         for blk in &self.enc_blocks {
             cur = blk.forward(&cur)?;
         }
-        let _ = dev;
-        let _ = self.enc_norm.forward(&cur)?;
+        cur = self.enc_norm.forward(&cur)?;
         Ok(cur)
     }
 
