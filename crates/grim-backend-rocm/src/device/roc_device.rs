@@ -1128,10 +1128,7 @@ impl RocmDevice {
             .iter()
             .map(|&s| as_rocm(s).and_then(dev_ptr))
             .collect::<Result<Vec<_>>>()?;
-        let ptr_bytes: Vec<u8> = host_ptrs
-            .iter()
-            .flat_map(|p| p.to_ne_bytes())
-            .collect();
+        let ptr_bytes: Vec<u8> = host_ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
         let ptr_storage = RocmStorage::copy_from_host_raw_bytes(
             &ptr_bytes,
             &Shape::from_slice(&[host_ptrs.len()]),
@@ -3069,40 +3066,6 @@ impl BackendDevice for RocmDevice {
         ))
     }
 
-    fn flash_attention(
-        &self,
-        q: &dyn BackendStorage,
-        k: &dyn BackendStorage,
-        v: &dyn BackendStorage,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        seq_len: usize,
-        causal: bool,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let q_s = as_rocm(q)?;
-        let k_s = as_rocm(k)?;
-        let v_s = as_rocm(v)?;
-        let out_storage =
-            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
-        self.launch_flash_attention(
-            q_s,
-            k_s,
-            v_s,
-            &out_storage,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            seq_len,
-            causal,
-        )?;
-        Ok((
-            Box::new(out_storage),
-            Box::new(RocmHandle::new(Some(self.active_stream()))),
-        ))
-    }
-
     fn cross_attention(
         &self,
         q: &dyn BackendStorage,
@@ -3222,9 +3185,8 @@ impl BackendDevice for RocmDevice {
         // the collective directly on device memory via ncclAllReduce.
         if let Some(rccl_handle) = &rccl {
             if rccl_handle.num_gpus > 1 && is_f32 {
-                let out_storage = RocmStorage::alloc_gpu(
-                    &shape, dtype_f32(), &self.allocator, self.ordinal,
-                )?;
+                let out_storage =
+                    RocmStorage::alloc_gpu(&shape, dtype_f32(), &self.allocator, self.ordinal)?;
                 let out_ptr = dev_ptr(&out_storage)?;
 
                 if inputs.len() == 1 {
@@ -3233,9 +3195,8 @@ impl BackendDevice for RocmDevice {
                     rccl_handle.sum_gradients_device(send_ptr, out_ptr, total, stream_u64)?;
                 } else {
                     // Multiple shards: accumulate on-device first, then all-reduce.
-                    let temp_storage = RocmStorage::alloc_gpu(
-                        &shape, dtype_f32(), &self.allocator, self.ordinal,
-                    )?;
+                    let temp_storage =
+                        RocmStorage::alloc_gpu(&shape, dtype_f32(), &self.allocator, self.ordinal)?;
                     let temp_ptr = dev_ptr(&temp_storage)?;
                     self.device_accumulate_f32(inputs, temp_ptr)?;
                     rccl_handle.sum_gradients_device(temp_ptr, out_ptr, total, stream_u64)?;
@@ -3254,9 +3215,8 @@ impl BackendDevice for RocmDevice {
             if inputs.len() == 1 {
                 // Identity: device-to-device copy (no D2H + H2D round-trip).
                 let bytes = total * crate::dtype_byte_size(&dtype);
-                let out_storage = RocmStorage::alloc_gpu(
-                    &shape, dtype.clone(), &self.allocator, self.ordinal,
-                )?;
+                let out_storage =
+                    RocmStorage::alloc_gpu(&shape, dtype.clone(), &self.allocator, self.ordinal)?;
                 let src_ptr = dev_ptr(as_rocm(inputs[0])?)? as *const c_void;
                 let dst_ptr = out_storage.device_ptr.unwrap() as *mut c_void;
                 check_hip("hipMemcpy(D2D) all_reduce", unsafe {
@@ -3274,13 +3234,10 @@ impl BackendDevice for RocmDevice {
             }
 
             // Multi-input: device-side element-wise sum via grim_all_reduce_accum.
-            let all_same = inputs
-                .iter()
-                .all(|s| s.shape() == inputs[0].shape());
+            let all_same = inputs.iter().all(|s| s.shape() == inputs[0].shape());
             if all_same {
-                let out_storage = RocmStorage::alloc_gpu(
-                    &shape, dtype_f32(), &self.allocator, self.ordinal,
-                )?;
+                let out_storage =
+                    RocmStorage::alloc_gpu(&shape, dtype_f32(), &self.allocator, self.ordinal)?;
                 let out_ptr = dev_ptr(&out_storage)?;
                 self.device_accumulate_f32(inputs, out_ptr)?;
                 return Ok((
@@ -3378,9 +3335,8 @@ impl BackendDevice for RocmDevice {
         // ── Device-side assembly + optional RCCL all-reduce ────────────────
         if is_f32 {
             let out_shape = Shape::from_slice(&[m, n_total]);
-            let out_storage = RocmStorage::alloc_gpu(
-                &out_shape, dtype_f32(), &self.allocator, self.ordinal,
-            )?;
+            let out_storage =
+                RocmStorage::alloc_gpu(&out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
             let out_ptr_val = dev_ptr(&out_storage)?;
             let out_ptr_usize = out_ptr_val as usize;
 
@@ -3393,8 +3349,7 @@ impl BackendDevice for RocmDevice {
                 for row in 0..m {
                     let src = (partial_ptr + row * n_cols * elem_bytes) as *const c_void;
                     let dst =
-                        (out_ptr_usize + (row * n_total + col_offset) * elem_bytes)
-                            as *mut c_void;
+                        (out_ptr_usize + (row * n_total + col_offset) * elem_bytes) as *mut c_void;
                     check_hip("hipMemcpy(D2D) comm_fuse", unsafe {
                         crate::hipMemcpy(
                             dst,
@@ -3412,7 +3367,10 @@ impl BackendDevice for RocmDevice {
             if let Some(rccl_handle) = &rccl {
                 if rccl_handle.num_gpus > 1 {
                     rccl_handle.sum_gradients_device(
-                        out_ptr_val, out_ptr_val, total_elems, stream_u64,
+                        out_ptr_val,
+                        out_ptr_val,
+                        total_elems,
+                        stream_u64,
                     )?;
                 }
             }
@@ -3435,12 +3393,8 @@ impl BackendDevice for RocmDevice {
             .map(|(d, &nc)| (d.as_slice(), nc))
             .collect();
 
-        let result = crate::kernels::comm_fuse::comm_fuse_fan_in(
-            &slice_refs,
-            m,
-            n_total,
-            &partials[0].1,
-        )?;
+        let result =
+            crate::kernels::comm_fuse::comm_fuse_fan_in(&slice_refs, m, n_total, &partials[0].1)?;
 
         let out_shape = Shape::from_slice(&[result.shape.0, result.shape.1]);
         let out_storage = self.from_cpu(&result.data, &out_shape, DType::F32)?;
@@ -5915,139 +5869,7 @@ impl RocmDevice {
         )
     }
 
-    // ─── Phase 2: FlashAttention ──────────────────────────────────
-
-    /// Launch the JIT compiled FlashAttention kernel (online softmax,
-    pub(crate) fn launch_flash_attention(
-        &self,
-        q_storage: &RocmStorage,
-        k_storage: &RocmStorage,
-        v_storage: &RocmStorage,
-        out_storage: &RocmStorage,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        seq_len: usize,
-        causal: bool,
-    ) -> Result<*mut c_void> {
-        let q_ptr = q_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("flash_attention: q has no device ptr".into()))?;
-        let k_ptr = k_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("flash_attention: k has no device ptr".into()))?;
-        let v_ptr = v_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("flash_attention: v has no device ptr".into()))?;
-        let out_ptr = out_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("flash_attention: out has no device ptr".into()))?;
-
-        const BLOCK_SIZE: usize = 128;
-        let grid_x: u32 = ((num_heads * seq_len + BLOCK_SIZE as usize - 1) / BLOCK_SIZE as usize)
-            .try_into()
-            .map_err(|_| Error::Backend("flash_attention: grid overflow".into()))?;
-        let grid_dim = HipDim3::new(grid_x, 1, 1);
-        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
-
-        let mut qptr = q_ptr;
-        let mut kptr = k_ptr;
-        let mut vptr = v_ptr;
-        let mut optr = out_ptr;
-        let mut nh = num_heads as i32;
-        let mut nkh = num_kv_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut sl = seq_len as i32;
-        let mut causal_val = if causal { 1 } else { 0 };
-
-        self.launch_compute_kernel(
-            "grim_flash_attention",
-            grid_dim,
-            block_dim,
-            &mut [
-                arg(&mut qptr),
-                arg(&mut kptr),
-                arg(&mut vptr),
-                arg(&mut optr),
-                arg(&mut nh),
-                arg(&mut nkh),
-                arg(&mut hd),
-                arg(&mut sl),
-                arg(&mut causal_val),
-            ],
-        )
-    }
-
-    /// Launch the JIT compiled paged FlashAttention kernel (block-table
-    pub(crate) fn launch_flash_attention_paged(
-        &self,
-        q_storage: &RocmStorage,
-        k_storage: &RocmStorage,
-        v_storage: &RocmStorage,
-        out_storage: &RocmStorage,
-        block_table_storage: &RocmStorage,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        seq_len: usize,
-        num_blocks: usize,
-        causal: bool,
-    ) -> Result<*mut c_void> {
-        let q_ptr = q_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("flash_attn_paged: q has no device ptr".into()))?;
-        let k_ptr = k_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("flash_attn_paged: k has no device ptr".into()))?;
-        let v_ptr = v_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("flash_attn_paged: v has no device ptr".into()))?;
-        let out_ptr = out_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("flash_attn_paged: out has no device ptr".into()))?;
-        let bt_ptr = block_table_storage.device_ptr.ok_or_else(|| {
-            Error::Backend("flash_attn_paged: block_table has no device ptr".into())
-        })?;
-
-        const BLOCK_SIZE: usize = 128;
-        let grid_x: u32 = ((num_heads * seq_len + BLOCK_SIZE as usize - 1) / BLOCK_SIZE as usize)
-            .try_into()
-            .map_err(|_| Error::Backend("flash_attn_paged: grid overflow".into()))?;
-        let grid_dim = HipDim3::new(grid_x, 1, 1);
-        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
-
-        let mut qptr = q_ptr;
-        let mut kptr = k_ptr;
-        let mut vptr = v_ptr;
-        let mut optr = out_ptr;
-        let mut btptr = bt_ptr;
-        let mut nh = num_heads as i32;
-        let mut nkh = num_kv_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut sl = seq_len as i32;
-        let mut nb = num_blocks as i32;
-        let mut causal_val = if causal { 1 } else { 0 };
-
-        self.launch_compute_kernel(
-            "grim_flash_attention_paged",
-            grid_dim,
-            block_dim,
-            &mut [
-                arg(&mut qptr),
-                arg(&mut kptr),
-                arg(&mut vptr),
-                arg(&mut optr),
-                arg(&mut btptr),
-                arg(&mut nh),
-                arg(&mut nkh),
-                arg(&mut hd),
-                arg(&mut sl),
-                arg(&mut nb),
-                arg(&mut causal_val),
-            ],
-        )
-    }
-
+    // ─── Phase 2: Cross-Attention ─────────────────────────────────
     // ─── Phase 2: Cross-Attention ─────────────────────────────────
 
     /// Launch the JIT compiled Whisper cross-attention kernel
