@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::{Read, Seek};
 use std::io::BufReader;
 
 use grim_tensor::dtype::{DType, KQuantScheme, QuantProvenance, Storage};
@@ -194,6 +195,67 @@ impl TensorProvider for GgufProvider {
             provenance: QuantProvenance::GrimNative,
             shape: info.shape(),
             fusion_mask: 0,
+        })
+    }
+
+    /// Zero-copy byte-range read for column-parallel (dim==0) sharding of GGUF
+    /// block-quantised tensors. Computes the file offset of the rank's block
+    /// range instead of materialising the full tensor, so sharding costs O(1)
+    /// reads rather than O(N) CPU round-trips. Delegates to the default trait
+    /// impl for dim!=0 (which still falls back to `get_packed` + `shard_raw_tensor`).
+    fn get_packed_sharded(
+        &self,
+        name: &str,
+        dim: usize,
+        rank: usize,
+        world_size: usize,
+    ) -> Result<RawTensor> {
+        if dim != 0 {
+            return <Self as TensorProvider>::get_packed_sharded(self, name, dim, rank, world_size);
+        }
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in GGUF file")))?;
+        let dtype = effective_dtype(info, &self.overrides);
+
+        // Only block-quant formats need the zero-copy path; native dtypes are
+        // handled by the default `shard_raw_tensor`.
+        if !matches!(dtype.storage, Storage::Block(..)) {
+            return <Self as TensorProvider>::get_packed_sharded(self, name, dim, rank, world_size);
+        }
+
+        let gguf_dtype = info.dtype;
+        let out_dim = info.shape()[0];
+        let block_size = gguf_dtype.block_size() as usize;
+        if !gguf_dtype.block_boundary_valid(out_dim, world_size) {
+            return Err(Error::Backend(format!(
+                "tensor '{name}': shard boundary does not align with block size {block_size} \
+                 (out_dim={out_dim}, world_size={world_size})"
+            )));
+        }
+
+        let shard_rows = out_dim / world_size;
+        let start_row = rank * shard_rows;
+        let type_size = gguf_dtype.type_size_per_block() as usize;
+
+        // GGUF block-quant layout: each block covers `block_size` rows and occupies
+        // `type_size` bytes. Compute the byte range for this rank's blocks.
+        let blocks_per_shard = shard_rows / block_size;
+        let start_block = start_row / block_size;
+        let byte_offset = info.offset + (start_block * type_size) as u64;
+        let byte_len = blocks_per_shard * type_size;
+
+        let mut reader = self.reader.lock().unwrap();
+        reader.seek(std::io::SeekFrom::Start(byte_offset))?;
+        let mut buf = vec![0u8; byte_len];
+        reader.read_exact(&mut buf)?;
+
+        Ok(RawTensor {
+            bytes: buf,
+            shape: vec![shard_rows, info.shape()[1]],
+            dtype,
+            provenance: QuantProvenance::GrimNative,
         })
     }
 }

@@ -29,14 +29,14 @@ pub struct GradientCheckpointBuffer {
 fn prefetch_block_weights(block: &LlamaBlock) -> Result<()> {
     for tensor in [
         &block.attn_norm.weight,
-        &block.wq.weight,
-        &block.wk.weight,
-        &block.wv.weight,
-        &block.wo.weight,
+        block.wq.weight(),
+        block.wk.weight(),
+        block.wv.weight(),
+        block.wo.weight(),
         &block.ffn_norm.weight,
-        &block.w_gate.weight,
-        &block.w_up.weight,
-        &block.w_down.weight,
+        block.w_gate.weight(),
+        block.w_up.weight(),
+        block.w_down.weight(),
     ] {
         tensor
             .storage()
@@ -215,7 +215,7 @@ impl StreamingBlockForward {
             let q_m = q_base.shape().dims()[0];
             let q_k = x_norm.shape().dims()[1];
             let q_n = q_base.shape().dims()[1];
-            let wq_id = tape.register(block.wq.weight.clone());
+            let wq_id = tape.register(block.wq.weight().clone());
             let q_base_param =
                 grim_autograd::ParamId::base(layer_idx, grim_autograd::LoRAInjectionPoint::QProj);
             tape.record_matmul(
@@ -248,7 +248,7 @@ impl StreamingBlockForward {
             let k_m = k_base.shape().dims()[0];
             let k_k = x_norm.shape().dims()[1];
             let k_n = k_base.shape().dims()[1];
-            let wk_id = tape.register(block.wk.weight.clone());
+            let wk_id = tape.register(block.wk.weight().clone());
             tape.record_matmul(
                 x_norm_base_id,
                 wk_id,
@@ -282,7 +282,7 @@ impl StreamingBlockForward {
             let v_m = v_base.shape().dims()[0];
             let v_k = x_norm.shape().dims()[1];
             let v_n = v_base.shape().dims()[1];
-            let wv_id = tape.register(block.wv.weight.clone());
+            let wv_id = tape.register(block.wv.weight().clone());
             tape.record_matmul(
                 x_norm_base_id,
                 wv_id,
@@ -408,7 +408,7 @@ impl StreamingBlockForward {
             let wo_m = wo_base.shape().dims()[0];
             let wo_k = attn_raw.shape().dims()[1];
             let wo_n = wo_base.shape().dims()[1];
-            let wo_w_id = tape.register(block.wo.weight.clone());
+            let wo_w_id = tape.register(block.wo.weight().clone());
             tape.record_matmul(
                 attn_raw_id,
                 wo_w_id,
@@ -459,7 +459,7 @@ impl StreamingBlockForward {
             let g_m = gate_base.shape().dims()[0];
             let g_k = ffn_norm_out.shape().dims()[1];
             let g_n = gate_base.shape().dims()[1];
-            let wg_id = tape.register(block.w_gate.weight.clone());
+            let wg_id = tape.register(block.w_gate.weight().clone());
             tape.record_matmul(
                 ffn_norm_id,
                 wg_id,
@@ -493,7 +493,7 @@ impl StreamingBlockForward {
             let u_m = up_base.shape().dims()[0];
             let u_k = ffn_norm_out.shape().dims()[1];
             let u_n = up_base.shape().dims()[1];
-            let wu_id = tape.register(block.w_up.weight.clone());
+            let wu_id = tape.register(block.w_up.weight().clone());
             tape.record_matmul(
                 ffn_norm_id,
                 wu_id,
@@ -538,7 +538,7 @@ impl StreamingBlockForward {
             let d_m = down_base.shape().dims()[0];
             let d_k = silu_tensor.shape().dims()[1];
             let d_n = down_base.shape().dims()[1];
-            let wd_id = tape.register(block.w_down.weight.clone());
+            let wd_id = tape.register(block.w_down.weight().clone());
             tape.record_matmul(
                 silu_id,
                 wd_id,

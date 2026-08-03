@@ -7,7 +7,12 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
-use grim_nn::{Embedding, Linear, RmsNorm, Rope, pick_device_for_storage_device};
+use grim_nn::{
+    ColumnParallelLinear, Embedding, Linear, RowParallelLinear, TensorParallelConfig,
+};
+use grim_nn::RmsNorm;
+use grim_nn::Rope;
+use grim_nn::pick_device_for_storage_device;
 use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
 use crate::block::{LlamaBlock, LlamaConfigRefs};
@@ -49,17 +54,45 @@ pub struct Llama {
 }
 
 impl Llama {
+    /// Load a `Llama` model with TP config derived from the environment
+    /// (`GRIM_TP_SIZE` / `GRIM_TP_RANK`). Falls back to single-device when
+    /// env vars are unset.
     pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: LlamaConfig) -> Result<Self> {
+        let tp = TensorParallelConfig::from_env()
+            .unwrap_or_else(TensorParallelConfig::default);
+        Self::load_tp(device, ws, cfg, tp)
+    }
+
+    /// Load a `Llama` model with an explicit `TensorParallelConfig`.
+    pub fn load_tp(
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: LlamaConfig,
+        tp: TensorParallelConfig,
+    ) -> Result<Self> {
         let tok_embeddings =
             Embedding::load(&ws.pp("tok_embeddings"), cfg.vocab_size, cfg.hidden_size)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            layers.push(LlamaBlock::load(&ws.pp("layers").pp(&i.to_string()), &cfg)?);
+            layers.push(LlamaBlock::load_tp(
+                &ws.pp("layers").pp(&i.to_string()),
+                &cfg,
+                tp,
+            )?);
         }
         let norm = RmsNorm::load(&ws.pp("norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let output = match Linear::load(&ws.pp("output"), cfg.hidden_size, cfg.vocab_size, false) {
+        let output = match Linear::load_column_parallel(
+            &ws.pp("output"),
+            cfg.hidden_size,
+            cfg.vocab_size,
+            /*has_bias=*/ false,
+            tp,
+        ) {
             Ok(o) => o,
-            Err(_) => Linear::from_tensor(tok_embeddings.weight.clone(), None),
+            Err(_) => {
+                let ws_unsharded = ws.with_tp_config(TensorParallelConfig::default());
+                Linear::load(&ws_unsharded.pp("output"), cfg.hidden_size, cfg.vocab_size, false)?
+            }
         };
         Ok(Self {
             cfg,
@@ -97,19 +130,42 @@ impl Llama {
             eps: cfg.rms_norm_eps,
         };
 
+        let tp = TensorParallelConfig::default();
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for _ in 0..cfg.num_layers {
             layers.push(LlamaBlock {
                 attn_norm: rms(cfg.hidden_size),
-                wq: linear(cfg.num_heads * cfg.head_dim, cfg.hidden_size),
-                wk: linear(cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size),
-                wv: linear(cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size),
-                wo: linear(cfg.hidden_size, cfg.num_heads * cfg.head_dim),
+                wq: ColumnParallelLinear::new(
+                    linear(cfg.hidden_size, cfg.num_heads * cfg.head_dim),
+                    tp,
+                ),
+                wk: ColumnParallelLinear::new(
+                    linear(cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim),
+                    tp,
+                ),
+                wv: ColumnParallelLinear::new(
+                    linear(cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim),
+                    tp,
+                ),
+                wo: RowParallelLinear::new(
+                    linear(cfg.num_heads * cfg.head_dim, cfg.hidden_size),
+                    tp,
+                ),
                 ffn_norm: rms(cfg.hidden_size),
-                w_gate: linear(cfg.intermediate_size, cfg.hidden_size),
-                w_up: linear(cfg.intermediate_size, cfg.hidden_size),
-                w_down: linear(cfg.hidden_size, cfg.intermediate_size),
+                w_gate: ColumnParallelLinear::new(
+                    linear(cfg.hidden_size, cfg.intermediate_size),
+                    tp,
+                ),
+                w_up: ColumnParallelLinear::new(
+                    linear(cfg.hidden_size, cfg.intermediate_size),
+                    tp,
+                ),
+                w_down: RowParallelLinear::new(
+                    linear(cfg.intermediate_size, cfg.hidden_size),
+                    tp,
+                ),
                 rope: Rope::new(cfg.head_dim, cfg.rope_theta),
+                tp_config: tp,
                 _dev: Device::Cpu,
                 _cfg: LlamaConfigRefs {
                     hidden_size: cfg.hidden_size,
@@ -117,6 +173,10 @@ impl Llama {
                     num_kv_heads: cfg.num_kv_heads,
                     head_dim: cfg.head_dim,
                     intermediate_size: cfg.intermediate_size,
+                    tp_world_size: 1,
+                    local_num_heads: cfg.num_heads,
+                    local_num_kv_heads: cfg.num_kv_heads,
+                    kv_head_replica_factor: 1,
                 },
             });
         }
