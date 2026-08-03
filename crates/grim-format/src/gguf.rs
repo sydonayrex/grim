@@ -251,6 +251,22 @@ impl GgufDType {
             _ => 0,
         }
     }
+
+    /// Check whether `out_dim` can be evenly split into `world_size` shards
+    /// without breaking GGUF block-quant alignment. Returns `true` if
+    /// `out_dim % world_size == 0` AND each shard's row count is a multiple
+    /// of the block size for this dtype.
+    pub fn block_boundary_valid(self, out_dim: usize, world_size: usize) -> bool {
+        if world_size == 0 {
+            return false;
+        }
+        if out_dim % world_size != 0 {
+            return false;
+        }
+        let shard_size = out_dim / world_size;
+        let block_size = self.block_size() as usize;
+        shard_size % block_size == 0
+    }
 }
 
 /// One tensor index entry from a GGUF file.

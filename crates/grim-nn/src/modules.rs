@@ -123,10 +123,32 @@ impl Default for TensorParallelConfig {
     }
 }
 
-/// Column-parallel linear layer (§4.1): shards output features `out_features / world_size`
-/// across GPUs for attention QKV / MLP gate-up projections.
+impl TensorParallelConfig {
+    /// Read TP rank / world size from the environment.
+    ///
+    /// - `GRIM_TP_SIZE` → `world_size` (defaults to 1).
+    /// - `GRIM_TP_RANK` → `rank` (defaults to 0).
+    ///
+    /// Returns `None` when `GRIM_TP_SIZE` is unset or `1` (single-device).
+    pub fn from_env() -> Option<Self> {
+        let world_size = std::env::var("GRIM_TP_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&w| w > 1)?;
+        let rank = std::env::var("GRIM_TP_RANK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        Some(Self { rank, world_size })
+    }
+}
+
+/// Column-parallel linear layer (§4.1): weights are pre-sharded at load
+/// (each rank holds `out_features / world_size` rows), so `forward` is just
+/// the inner `Linear::forward`. No CPU output-slicing needed.
 #[derive(Clone)]
 pub struct ColumnParallelLinear {
+    /// The full Linear; its weight tensor is already the rank's shard.
     pub inner: Linear,
     pub tp_config: TensorParallelConfig,
 }
@@ -136,43 +158,37 @@ impl ColumnParallelLinear {
         Self { inner, tp_config }
     }
 
+    /// Forward: delegate to inner Linear (weights are pre-sharded at load).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let out = self.inner.forward(x)?;
-        if self.tp_config.world_size > 1 {
-            let dims = out.shape().dims();
-            let last_dim = *dims.last().unwrap_or(&1);
-            let shard_size = last_dim / self.tp_config.world_size;
-            let start = self.tp_config.rank * shard_size;
-            let end = (start + shard_size).min(last_dim);
+        self.inner.forward(x)
+    }
 
-            let data = out.to_vec_f32()?;
-            let outer = data.len() / last_dim;
-            let mut sharded = Vec::with_capacity(outer * (end - start));
-            for row in 0..outer {
-                sharded.extend_from_slice(&data[row * last_dim + start..row * last_dim + end]);
-            }
-            let mut new_dims = dims.to_vec();
-            if let Some(l) = new_dims.last_mut() {
-                *l = end - start;
-            }
-            let out_shape = Shape::new(new_dims);
-            let dev = pick_device_for_tensor(&out);
-            let storage = dev.from_cpu(&sharded, &out_shape, DType::F32)?;
-            Ok(Tensor::new(
-                Arc::from(storage),
-                out_shape,
-                out.dtype(),
-                out.provenance().clone(),
-                out.device().clone(),
-            ))
-        } else {
-            Ok(out)
-        }
+    /// Reference the underlying weight tensor (pre-sharded shard).
+    pub fn weight(&self) -> &Tensor {
+        &self.inner.weight
+    }
+
+    /// Reference the underlying bias tensor, if present (unsharded — same on all ranks).
+    pub fn bias(&self) -> Option<&Tensor> {
+        self.inner.bias.as_ref()
+    }
+
+    /// Borrow the inner `Linear`.
+    pub fn inner(&self) -> &Linear {
+        &self.inner
+    }
+
+    /// Number of output rows this rank owns.
+    pub fn shard_size(&self) -> usize {
+        self.inner.weight.shape().dims()[0]
     }
 }
 
-/// Row-parallel linear layer (§4.1): shards input features `in_features / world_size`
-/// across GPUs and All-Reduces outputs across TP ranks for attention output / MLP down projections.
+/// Row-parallel linear layer (§4.1): weights are pre-sharded at load
+/// (each rank holds `in_features / world_size` columns), so `forward` is
+/// the inner matmul + a device-side `all_reduce("sum")` to sum partial
+/// outputs across TP ranks. On CPU (no collective backend) the partial
+/// result is returned with a warning.
 #[derive(Clone)]
 pub struct RowParallelLinear {
     pub inner: Linear,
@@ -184,39 +200,9 @@ impl RowParallelLinear {
         Self { inner, tp_config }
     }
 
+    /// Forward: inner matmul of pre-sharded input + device-side `all_reduce`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x_in = if self.tp_config.world_size > 1 {
-            let dims = x.shape().dims();
-            let last_dim = *dims.last().unwrap_or(&1);
-            let shard_size = last_dim / self.tp_config.world_size;
-            let start = self.tp_config.rank * shard_size;
-            let end = (start + shard_size).min(last_dim);
-
-            let data = x.to_vec_f32()?;
-            let outer = data.len() / last_dim;
-            let mut sharded = Vec::with_capacity(outer * (end - start));
-            for row in 0..outer {
-                sharded.extend_from_slice(&data[row * last_dim + start..row * last_dim + end]);
-            }
-            let mut new_dims = dims.to_vec();
-            if let Some(l) = new_dims.last_mut() {
-                *l = end - start;
-            }
-            let out_shape = Shape::new(new_dims);
-            let dev = pick_device_for_tensor(x);
-            let storage = dev.from_cpu(&sharded, &out_shape, DType::F32)?;
-            Tensor::new(
-                Arc::from(storage),
-                out_shape,
-                x.dtype(),
-                x.provenance().clone(),
-                x.device().clone(),
-            )
-        } else {
-            x.clone()
-        };
-
-        let out = self.inner.forward(&x_in)?;
+        let out = self.inner.forward(x)?;
         if self.tp_config.world_size > 1 {
             let dev = pick_device_for_tensor(&out);
             let s: &dyn grim_tensor::BackendStorage = out.storage().as_ref();
@@ -231,11 +217,37 @@ impl RowParallelLinear {
                         out.device().clone(),
                     ))
                 }
-                Err(_) => Ok(out),
+                Err(e) => {
+                    eprintln!(
+                        "[grim-nn] RowParallelLinear::forward all_reduce failed: {e} — \
+                         returning partial output (single-device fallback)"
+                    );
+                    Ok(out)
+                }
             }
         } else {
             Ok(out)
         }
+    }
+
+    /// Reference the underlying weight tensor (pre-sharded shard).
+    pub fn weight(&self) -> &Tensor {
+        &self.inner.weight
+    }
+
+    /// Reference the underlying bias tensor, if present (unsharded — same on all ranks).
+    pub fn bias(&self) -> Option<&Tensor> {
+        self.inner.bias.as_ref()
+    }
+
+    /// Borrow the inner `Linear`.
+    pub fn inner(&self) -> &Linear {
+        &self.inner
+    }
+
+    /// Number of output rows this rank owns (same as full output for row-parallel).
+    pub fn shard_size(&self) -> usize {
+        self.inner.weight.shape().dims()[0]
     }
 }
 
@@ -263,6 +275,70 @@ impl Linear {
         has_bias: bool,
     ) -> Result<Self> {
         let weight = ws.get([out_dim, in_dim], "weight")?;
+        let w_t = transpose_last_two(&weight)?;
+        let quant_format = if weight.dtype().is_quantized() {
+            Some(weight.dtype().clone())
+        } else {
+            None
+        };
+        let bias = if has_bias {
+            Some(ws.get([out_dim], "bias")?)
+        } else {
+            None
+        };
+        Ok(Self {
+            weight,
+            bias,
+            w_t,
+            quant_format,
+        })
+    }
+
+    /// Load a column-parallel shard (dim==0): each rank gets `out_dim / world_size`
+    /// rows of the weight matrix. Bias is loaded unsharded (same on all ranks).
+    pub fn load_column_parallel(
+        ws: &WeightSource<'_>,
+        in_dim: usize,
+        out_dim: usize,
+        has_bias: bool,
+        tp: TensorParallelConfig,
+    ) -> Result<Self> {
+        let shard_out = out_dim / tp.world_size;
+        let weight = ws
+            .with_tp_config(tp)
+            .get_sharded([shard_out, in_dim], "weight", 0)?;
+        let w_t = transpose_last_two(&weight)?;
+        let quant_format = if weight.dtype().is_quantized() {
+            Some(weight.dtype().clone())
+        } else {
+            None
+        };
+        let bias = if has_bias {
+            Some(ws.get([out_dim], "bias")?)
+        } else {
+            None
+        };
+        Ok(Self {
+            weight,
+            bias,
+            w_t,
+            quant_format,
+        })
+    }
+
+    /// Load a row-parallel shard (dim==1): each rank gets `in_dim / world_size`
+    /// columns of the weight matrix. Bias is loaded unsharded.
+    pub fn load_row_parallel(
+        ws: &WeightSource<'_>,
+        in_dim: usize,
+        out_dim: usize,
+        has_bias: bool,
+        tp: TensorParallelConfig,
+    ) -> Result<Self> {
+        let shard_in = in_dim / tp.world_size;
+        let weight = ws
+            .with_tp_config(tp)
+            .get_sharded([out_dim, shard_in], "weight", 1)?;
         let w_t = transpose_last_two(&weight)?;
         let quant_format = if weight.dtype().is_quantized() {
             Some(weight.dtype().clone())
@@ -771,5 +847,65 @@ mod tests {
             rope.forward(&x_2d, &[0]).is_err(),
             "2D input to RoPE must return Shape error"
         );
+    }
+
+    /// ColumnParallelLinear forward with world_size=1 should behave identically
+    /// to the inner Linear (no sharding, no all_reduce).
+    #[test]
+    fn test_column_parallel_forward_single_device() {
+        let weight = cpu_tensor(vec![0.5, 1.5, -1.0, 2.0], Shape::new(vec![2, 2]));
+        let linear = Linear::from_tensor(weight, Some(cpu_tensor(vec![0.1, -0.2], Shape::new(vec![2]))));
+        let cp = ColumnParallelLinear::new(linear, TensorParallelConfig::default());
+
+        let x = cpu_tensor(vec![1.0, 2.0], Shape::new(vec![1, 2]));
+        let y = cp.forward(&x).expect("cp forward");
+        let out = y.to_vec_f32().expect("to vec");
+        assert_eq!(out.len(), 2);
+        // Same as Linear::forward: x@[0.5,1.5;-1,2]^T + bias
+        // row0: 1*0.5 + 2*1.5 + 0.1 = 3.6
+        // row1: 1*(-1.0) + 2*2.0 + (-0.2) = 2.8
+        assert!((out[0] - 3.6).abs() < 1e-5, "got {}", out[0]);
+        assert!((out[1] - 2.8).abs() < 1e-5, "got {}", out[1]);
+    }
+
+    /// RowParallelLinear forward with world_size=1 should behave identically
+    /// to the inner Linear (no sharding, all_reduce skipped).
+    #[test]
+    fn test_row_parallel_forward_single_device() {
+        let weight = cpu_tensor(vec![0.5, 1.5, -1.0, 2.0], Shape::new(vec![2, 2]));
+        let linear = Linear::from_tensor(weight, None);
+        let rp = RowParallelLinear::new(linear, TensorParallelConfig::default());
+
+        let x = cpu_tensor(vec![1.0, 2.0], Shape::new(vec![1, 2]));
+        let y = rp.forward(&x).expect("rp forward");
+        let out = y.to_vec_f32().expect("to vec");
+        assert_eq!(out.len(), 2);
+        // row0: 1*0.5 + 2*1.5 = 3.5
+        // row1: 1*(-1.0) + 2*2.0 = 3.0
+        assert!((out[0] - 3.5).abs() < 1e-5, "got {}", out[0]);
+        assert!((out[1] - 3.0).abs() < 1e-5, "got {}", out[1]);
+    }
+
+    /// Accessor smoke test: weight(), bias(), inner(), shard_size().
+    #[test]
+    fn test_parallel_linear_accessors() {
+        let weight = cpu_tensor(vec![0.5, 1.5, -1.0, 2.0], Shape::new(vec![2, 2]));
+        let linear = Linear::from_tensor(weight, Some(cpu_tensor(vec![0.1, -0.2], Shape::new(vec![2]))));
+        let cp = ColumnParallelLinear::new(linear, TensorParallelConfig::default());
+
+        assert_eq!(cp.shard_size(), 2);
+        assert_eq!(cp.weight().shape().dims(), &[2, 2]);
+        assert!(cp.bias().is_some());
+        assert_eq!(cp.inner().weight.shape().dims(), &[2, 2]);
+
+        let rp_linear = Linear::from_tensor(
+            cpu_tensor(vec![0.5, 1.5, -1.0, 2.0], Shape::new(vec![2, 2])),
+            None,
+        );
+        let rp = RowParallelLinear::new(rp_linear, TensorParallelConfig::default());
+        assert_eq!(rp.shard_size(), 2);
+        assert_eq!(rp.weight().shape().dims(), &[2, 2]);
+        assert!(rp.bias().is_none());
+        assert_eq!(rp.inner().weight.shape().dims(), &[2, 2]);
     }
 }

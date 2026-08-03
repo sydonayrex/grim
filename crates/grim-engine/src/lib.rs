@@ -345,7 +345,7 @@ impl Engine {
     /// Tensor-parallel configuration derived from the environment. `GRIM_TP_RANK`
     /// selects this process's shard index; `GRIM_TP_SIZE` selects the world size.
     /// Returns `None` when `GRIM_TP_SIZE` is unset or 1 (single-device).
-    pub fn tp_config(&self) -> grim_nn::TensorParallelConfig {
+    pub fn tp_config(&self) -> Option<grim_nn::TensorParallelConfig> {
         grim_nn::TensorParallelConfig::from_env()
     }
 
@@ -434,11 +434,7 @@ impl Engine {
                 model: Box::new(wrapped),
                 config,
                 device: dev,
-                tp_config: if self.tp_rank_contexts.is_some() {
-                    Some(self.tp_config())
-                } else {
-                    None
-                },
+                tp_config: self.tp_config(),
             },
         );
     }
