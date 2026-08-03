@@ -270,6 +270,15 @@ fn load_model_from_config(
         .as_ref()
         .map(|s| s.max_seq_len)
         .unwrap_or(max_seq_len);
+
+    // `GRIM_CONTEXT` lets operators cap the effective context window without
+    // re-exporting the GGUF. The model's advertised hard limit is treated as a
+    // ceiling: an override requesting more than the model supports is clamped
+    // back to the GGUF value. Only `grim-engine`'s `EngineConfig` (not the
+    // model's RoPE) reads this, so it is purely an operator hint.
+    let max_seq_len = grim_core::env_config::RuntimeEnv::from_env()
+        .context
+        .map_or(max_seq_len, |ctx| ctx.min(max_seq_len));
     let expert_count = compat_spec
         .as_ref()
         .and_then(|s| s.expert_count)

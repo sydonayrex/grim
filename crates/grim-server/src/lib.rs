@@ -1820,6 +1820,13 @@ pub async fn serve(
 
     let app = build_router(state);
 
+    // Incoming SSRF posture (§network): the server defaults to loopback
+    // (`127.0.0.1:11434`) so it is never reachable from a routable network
+    // unless the operator explicitly opts in via `GRIM_HOST`/`--address`.
+    // A user-supplied public bind is honored by design (mirrors Ollama's
+    // posture); the guard above is therefore advisory, not enforced here, and
+    // lives in `grim_core::client::is_bind_address_allowed` for callers that
+    // want a hard refusal.
     let tls_config = load_tls_config_from_file("grim.toml")
         .or_else(|| load_tls_config_from_file("/etc/grim/grim.toml"))
         .or_else(|| load_tls_config_from_file("C:\\Program Files\\Grim\\grim.toml"));

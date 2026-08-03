@@ -400,6 +400,42 @@ async fn resolve_hf_gguf_filename(org: &str, repo: &str) -> Result<String> {
 
 use std::net::ToSocketAddrs;
 
+/// Bind-time SSRF posture: incoming server listeners may only bind to
+/// loopback or RFC-1918 / link-local / ULA addresses. Public IPs and the
+/// all-interfaces wildcard (`0.0.0.0` / `::`) are refused so a `grim serve
+/// --address 0.0.0.0:11434` can never accidentally expose the inference or
+/// model-fetch endpoints to a routable network.
+///
+/// This is the *incoming* counterpart to `validate_public_url`'s *outgoing*
+/// rule (which only permits fetching public hosts).
+pub fn is_bind_address_allowed(addr: &str) -> bool {
+    let parsed: Option<std::net::SocketAddr> = addr.parse().ok();
+    let parsed = match parsed {
+        Some(p) => p,
+        None => {
+            // Unix-domain / abstract sockets or bare port (`:11434`): allow
+            // only on loopback family; defer others to the bind error.
+            return false;
+        }
+    };
+    match parsed.ip() {
+        std::net::IpAddr::V4(v4) => {
+            if v4.is_unspecified() {
+                return false;
+            }
+            // allowed iff `is_public_ip` returns false (loopback/private/
+            // link-local/broadcast).
+            !is_public_ip(parsed.ip())
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_unspecified() {
+                return false;
+            }
+            !is_public_ip(parsed.ip())
+        }
+    }
+}
+
 fn is_public_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ipv4) => {

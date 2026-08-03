@@ -888,7 +888,18 @@ pub fn dequant_q2k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// Dequantize Q3_K bytes to f32 per the ggml/llama.cpp super-block specification (110 bytes / 256 weights).
+/// Dequantize Q3_K bytes to f32 per the ggml/llama.cpp super-block specification
+/// (110 bytes / 256 weights).
+///
+/// Matches llama.cpp `dequantize_row_q3_K` byte-for-byte. The format has:
+/// - 32 bytes `hmask` at offset 0 (one sign/high-bit per weight)
+/// - 64 bytes `qs` at offset 32 (4-bit packed quants)
+/// - 12 bytes `scales` at offset 96 (16 6-bit sub-block scales packed into 12 bytes)
+/// - 2 bytes `d` (f16 super-block scale) at offset 108
+///
+/// The 12-byte `scales` field is decoded via the ggml `memcpy(aux, scales, 12)`
+/// + bit-shuffle pattern into 16 i8 values. There is no `dmin` field and no
+/// `m` (minimum) array in the real format; every value is `x = d * (sc[is] - 32) * q`.
 pub fn dequant_q3k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     const BLOCK_SIZE: usize = 256;
     const BLOCK_BYTES: usize = 110;
@@ -897,7 +908,7 @@ pub fn dequant_q3k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
         return Ok(Vec::new());
     }
 
-    let num_blocks = num_weights.div_ceil(BLOCK_SIZE);
+    let num_blocks = (num_weights + BLOCK_SIZE - 1) / BLOCK_SIZE;
     let expected_bytes = num_blocks * BLOCK_BYTES;
     if data.len() < expected_bytes {
         return Err(Error::Backend(format!(
@@ -912,50 +923,73 @@ pub fn dequant_q3k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     for _ in 0..num_blocks {
         let hmask = &data[pos..pos + 32];
         let qs = &data[pos + 32..pos + 96];
+        // ggml decodes the 12-byte `scales` field into 16 i8 values via a
+        // `memcpy` into a 16-byte `uint32_t aux[4]` and a bit shuffle. The
+        // final 4 bytes of aux are zero-extended (uninitialized in C but the
+        // shuffle only reads bits from the first 12 bytes via `tmp`, so the
+        // result is equivalent to zero-padding). We therefore slice exactly
+        // the 12 format bytes [96..108] and zero the upper aux quad.
         let scales = &data[pos + 96..pos + 108];
         let d = f16_to_f32(data[pos + 108], data[pos + 109]);
 
-        let mut sc = [0f32; 16];
-        for j in 0..8 {
-            let sc_low1 = (scales[j] & 0x0F) as i8;
-            let sc_high1 = ((scales[j + 8] & 0x03) << 4) as i8;
-            sc[j] = (sc_low1 | sc_high1) as f32 - 32.0;
-
-            let sc_low2 = (scales[j] >> 4) as i8;
-            let sc_high2 = ((scales[j + 8] & 0x0C) << 2) as i8;
-            sc[j + 8] = (sc_low2 | sc_high2) as f32 - 32.0;
+        // Decode the 12-byte `scales` into 16 i8 values using the ggml
+        // bit-shuffle (dequantize_row_q3_K):
+        //   memcpy(aux, scales, 12);
+        //   tmp = aux[2];
+        //   aux[2] = ((aux[0] >> 4) & 0x0F0F0F0F) | (((tmp >> 4) & 0x03030303) << 4);
+        //   aux[3] = ((aux[1] >> 4) & 0x0F0F0F0F) | (((tmp >> 6) & 0x03030303) << 4);
+        //   aux[0] = (aux[0]          & 0x0F0F0F0F) | (((tmp >> 0) & 0x03030303) << 4);
+        //   aux[1] = (aux[1]          & 0x0F0F0F0F) | (((tmp >> 2) & 0x03030303) << 4);
+        let kmask1: u32 = 0x0303_0303u32;
+        let kmask2: u32 = 0x0F0F_0F0Fu32;
+        let aux0 = u32::from_le_bytes([scales[0], scales[1], scales[2], scales[3]]);
+        let aux1 = u32::from_le_bytes([scales[4], scales[5], scales[6], scales[7]]);
+        let tmp  = u32::from_le_bytes([scales[8], scales[9], scales[10], scales[11]]);
+        let mut aux = [
+            (aux0 & kmask2) | (((tmp >> 0) & kmask1) << 4), // aux[0]
+            (aux1 & kmask2) | (((tmp >> 2) & kmask1) << 4), // aux[1]
+            ((aux0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4), // aux[2]
+            ((aux1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4), // aux[3]
+        ];
+        // Truncate to bytes; each aux word now holds 4 signed scale bytes.
+        let mut sc = [0i8; 16];
+        for j in 0..4 {
+            let w = aux[j];
+            sc[j * 4 + 0] = (w & 0xFF) as i8;
+            sc[j * 4 + 1] = ((w >> 8) & 0xFF) as i8;
+            sc[j * 4 + 2] = ((w >> 16) & 0xFF) as i8;
+            sc[j * 4 + 3] = ((w >> 24) & 0xFF) as i8;
         }
 
         let mut block_out = [0.0f32; 256];
-        for l in 0..32 {
-            let is = l / 16;
-            let hm = hmask[l];
+        let mut _is = 0usize;
+        let mut m: u8 = 1;
+        let mut q_off = 0;
+        for n in (0..256).step_by(128) {
+            let mut shift: i32 = 0;
+            for _j in 0..4 {
+                let dl = d * ((sc[_is] as i32 - 32) as f32);
+                _is += 1;
+                for l in 0..16 {
+                    let q_val: i32 = ((qs[q_off + l] >> shift) & 3) as i32;
+                    let hm_bit: i32 = if (hmask[l] & m) != 0 { 0 } else { 4 };
+                    block_out[n + _j * 32 + l] = dl * (q_val - hm_bit) as f32;
+                }
 
-            let q1 = ((qs[l + 0] & 3) | (if (hm & 0x01) != 0 { 0 } else { 4 })) as f32 - 4.0;
-            let q2 = ((qs[l + 32] & 3) | (if (hm & 0x02) != 0 { 0 } else { 4 })) as f32 - 4.0;
-            let q3 =
-                (((qs[l + 0] & 12) >> 2) | (if (hm & 0x04) != 0 { 0 } else { 4 })) as f32 - 4.0;
-            let q4 =
-                (((qs[l + 32] & 12) >> 2) | (if (hm & 0x08) != 0 { 0 } else { 4 })) as f32 - 4.0;
+                let dl = d * ((sc[_is] as i32 - 32) as f32);
+                _is += 1;
+                for l in 0..16 {
+                    let q_val: i32 = ((qs[q_off + l + 16] >> shift) & 3) as i32;
+                    let hm_bit: i32 = if (hmask[l + 16] & m) != 0 { 0 } else { 4 };
+                    block_out[n + _j * 32 + 16 + l] = dl * (q_val - hm_bit) as f32;
+                }
 
-            let q5 =
-                (((qs[l + 0] & 48) >> 4) | (if (hm & 0x10) != 0 { 0 } else { 4 })) as f32 - 4.0;
-            let q6 =
-                (((qs[l + 32] & 48) >> 4) | (if (hm & 0x20) != 0 { 0 } else { 4 })) as f32 - 4.0;
-            let q7 =
-                (((qs[l + 0] & 192) >> 6) | (if (hm & 0x40) != 0 { 0 } else { 4 })) as f32 - 4.0;
-            let q8 =
-                (((qs[l + 32] & 192) >> 6) | (if (hm & 0x80) != 0 { 0 } else { 4 })) as f32 - 4.0;
-
-            block_out[l + 0] = d * sc[is + 0] * q1;
-            block_out[l + 32] = d * sc[is + 2] * q2;
-            block_out[l + 64] = d * sc[is + 4] * q3;
-            block_out[l + 96] = d * sc[is + 6] * q4;
-            block_out[l + 128] = d * sc[is + 8] * q5;
-            block_out[l + 160] = d * sc[is + 10] * q6;
-            block_out[l + 192] = d * sc[is + 12] * q7;
-            block_out[l + 224] = d * sc[is + 14] * q8;
+                shift += 2;
+                m <<= 1;
+            }
+            q_off += 32;
         }
+
         for &v in &block_out {
             if out.len() < num_weights {
                 out.push(v);
