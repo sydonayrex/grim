@@ -18,8 +18,9 @@ pub struct PackedBatch {
     /// Starting offset per sequence: `seqlen_offsets[i]` = start index of
     /// sequence `i` in `concatenated_tokens`. Length `num_sequences + 1`.
     pub seqlen_offsets: Vec<usize>,
-    /// All-true mask (padding-free has no padding). Exists so downstream
-    /// code that expects a boolean mask can call uniformly.
+    /// Block-diagonal causal attention mask: `mask[i*T + j] == true` iff `i >= j`
+    /// and `i, j` belong to the same packed sequence. Computed via
+    /// [`PackedBatch::block_diagonal_causal_mask`].
     pub attention_mask: Vec<bool>,
     /// Per-sequence token count used for loss masking at the end.
     pub sequence_lengths: Vec<usize>,
@@ -49,12 +50,18 @@ impl PackedBatch {
         let mut current: PackedBatch = PackedBatch::new();
 
         for (input_ids, target_ids) in samples {
-            let seq_len = input_ids.len().max(target_ids.len());
+            // Both input_ids and target_ids are concatenated into the buffer,
+            // so the actual token count per sample is the sum, not the max.
+            // Using max here undercounts the overflow check and records an
+            // incorrect sequence_length, which breaks packed attention masks
+            // when input_ids.len() != target_ids.len().
+            let seq_len = input_ids.len() + target_ids.len();
 
             if !current.concatenated_tokens.is_empty()
                 && current.concatenated_tokens.len() + seq_len > max_packed_length
             {
                 // Current batch is full; push it and start a new one.
+                current.attention_mask = current.block_diagonal_causal_mask();
                 batches.push(current);
                 current = PackedBatch::new();
             }
@@ -68,6 +75,7 @@ impl PackedBatch {
         }
 
         if !current.concatenated_tokens.is_empty() {
+            current.attention_mask = current.block_diagonal_causal_mask();
             batches.push(current);
         }
 
@@ -113,13 +121,13 @@ impl PackedBatch {
         }
     }
 
-    /// Returns an all-true attention mask of length equal to the total
-    /// number of concatenated tokens — padding-free mode has no padding.
-    #[deprecated(
-        note = "returns all-true; use block_diagonal_causal_mask for correct packed attention"
-    )]
+    /// Returns the block-diagonal causal attention mask for this packed batch.
+    ///
+    /// `mask[i*T + j] == true` iff `i >= j` (causal) and `i, j` belong to the
+    /// same packed sequence (block-diagonal — no cross-sequence attention).
+    /// This is the correct mask for padding-free packed training.
     pub fn packing_attention_mask(&self) -> Vec<bool> {
-        vec![true; self.concatenated_tokens.len()]
+        self.block_diagonal_causal_mask()
     }
 }
 
@@ -161,20 +169,63 @@ mod tests {
     }
 
     #[test]
-    fn test_packing_attention_mask_all_true() {
+    fn test_packing_attention_mask_block_diagonal() {
         let samples = vec![(vec![1, 2, 3], vec![4, 5])];
         let batches = PackedBatch::pack_samples(&samples, 1024);
-        assert_eq!(batches[0].packing_attention_mask(), &[true; 5]);
+        // Single sequence of 5 tokens: causal mask (i >= j) should be all-true
+        // on the lower triangle, which for a single sequence is all-true.
+        let mask = batches[0].packing_attention_mask();
+        assert_eq!(mask.len(), 5 * 5);
+        // Causal: position i attends to positions 0..=i
+        for i in 0..5 {
+            for j in 0..=i {
+                assert!(mask[i * 5 + j], "expected true at ({}, {})", i, j);
+            }
+            for j in (i + 1)..5 {
+                assert!(!mask[i * 5 + j], "expected false at ({}, {})", i, j);
+            }
+        }
+
+        // Two-sequence pack: no cross-attention between sequences.
+        let samples2 = vec![
+            (vec![1, 2], vec![3]), // seq 0: offsets [0, 3]
+            (vec![4], vec![5, 6]), // seq 1: offsets [3, 6]
+        ];
+        let batches2 = PackedBatch::pack_samples(&samples2, 1024);
+        assert_eq!(batches2.len(), 1);
+        let mask2 = batches2[0].packing_attention_mask();
+        let t = 6;
+        // seq 0 is positions 0..2 (3 tokens), seq 1 is positions 3..5 (3 tokens)
+        // Position 0 in seq 1 (global idx 3) must NOT attend to position 2 (global idx 2)
+        assert!(!mask2[3 * t + 2], "seq 1 must not attend to seq 0");
+        // But must attend within its own sequence
+        assert!(mask2[3 * t + 3], "seq 1 attends to itself (causal)");
+        // Position 5 (last) must attend to all of seq 1 (indices 3, 4, 5)
+        for j in &[3, 4, 5] {
+            assert!(
+                mask2[5 * t + *j],
+                "last token attends to seq 1 position {}",
+                j
+            );
+        }
+        // Position 5 must NOT attend to seq 0 (indices 0, 1, 2)
+        for j in &[0, 1, 2] {
+            assert!(
+                !mask2[5 * t + *j],
+                "last token must not attend to seq 0 position {}",
+                j
+            );
+        }
     }
 
     #[test]
     fn test_sequence_lengths_recorded() {
         let samples = vec![
-            (vec![1, 2, 3], vec![4]), // input len 3, target len 1 -> max 3
-            (vec![5, 6], vec![7, 8]), // max 2
+            (vec![1, 2, 3], vec![4]), // input len 3, target len 1 -> sum 4
+            (vec![5, 6], vec![7, 8]), // input len 2, target len 2 -> sum 4
         ];
         let batches = PackedBatch::pack_samples(&samples, 1024);
-        assert_eq!(batches[0].sequence_lengths, &[3, 2]);
+        assert_eq!(batches[0].sequence_lengths, &[4, 4]);
     }
 
     #[test]

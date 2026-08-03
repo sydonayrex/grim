@@ -1556,18 +1556,15 @@ impl BackendDevice for VulkanDevice {
         Box<dyn BackendStorage>,
         Box<dyn ComputeHandle>,
     )> {
-        let e_s = e
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan silu_mul_backward e is not VulkanStorage".into()))?;
-        let g_s = g
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan silu_mul_backward g is not VulkanStorage".into()))?;
-        let dw_s = dw
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan silu_mul_backward dw is not VulkanStorage".into()))?;
+        let e_s = e.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan silu_mul_backward e is not VulkanStorage".into())
+        })?;
+        let g_s = g.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan silu_mul_backward g is not VulkanStorage".into())
+        })?;
+        let dw_s = dw.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan silu_mul_backward dw is not VulkanStorage".into())
+        })?;
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
         let ctx = ctx_guard
             .as_ref()
@@ -1845,30 +1842,38 @@ impl BackendDevice for VulkanDevice {
         let out_dims = out_shape.dims();
         if out_dims.len() != 3 {
             return Err(Error::Shape(
-                "qkv_attention_paged expects 3-D output shape [batch, num_heads, head_dim]"
-                    .into(),
+                "qkv_attention_paged expects 3-D output shape [batch, num_heads, head_dim]".into(),
             ));
         }
         let num_heads = out_dims[1];
         let head_dim = out_dims[2];
         if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
-            return Err(Error::Shape("qkv_attention_paged requires num_heads divisible by num_kv_heads".into()));
+            return Err(Error::Shape(
+                "qkv_attention_paged requires num_heads divisible by num_kv_heads".into(),
+            ));
         }
         let q_s = q
             .as_any()
             .downcast_ref::<VulkanStorage>()
             .ok_or_else(|| Error::Backend("qkv_attention_paged q is not VulkanStorage".into()))?;
-        let table_s = block_tables.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("qkv_attention_paged block_tables is not VulkanStorage".into())
-        })?;
+        let table_s = block_tables
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("qkv_attention_paged block_tables is not VulkanStorage".into())
+            })?;
         let k_s = k_pages
             .as_any()
             .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("qkv_attention_paged k_pages is not VulkanStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("qkv_attention_paged k_pages is not VulkanStorage".into())
+            })?;
         let v_s = v_pages
             .as_any()
             .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("qkv_attention_paged v_pages is not VulkanStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("qkv_attention_paged v_pages is not VulkanStorage".into())
+            })?;
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
         let ctx = ctx_guard
@@ -1927,7 +1932,9 @@ impl BackendDevice for VulkanDevice {
         }
         let (batch, nodes, num_heads, head_dim) = (dims[0], dims[1], dims[2], dims[3]);
         if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
-            return Err(Error::Shape("tree_attention requires num_heads divisible by num_kv_heads".into()));
+            return Err(Error::Shape(
+                "tree_attention requires num_heads divisible by num_kv_heads".into(),
+            ));
         }
         if head_dim > 256 || nodes == 0 || tree_parents.shape().elem_count() < nodes {
             return Err(Error::Shape(
@@ -1946,9 +1953,12 @@ impl BackendDevice for VulkanDevice {
             .as_any()
             .downcast_ref::<VulkanStorage>()
             .ok_or_else(|| Error::Backend("tree_attention v is not VulkanStorage".into()))?;
-        let parents_s = tree_parents.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("tree_attention tree_parents is not VulkanStorage".into())
-        })?;
+        let parents_s = tree_parents
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("tree_attention tree_parents is not VulkanStorage".into())
+            })?;
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
         let ctx = ctx_guard
             .as_ref()
@@ -2013,18 +2023,30 @@ impl BackendDevice for VulkanDevice {
             .as_any()
             .downcast_ref::<VulkanStorage>()
             .ok_or_else(|| Error::Backend("kv_dequant_attention q is not VulkanStorage".into()))?;
-        let k_s = k_tensor.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("kv_dequant_attention k_tensor is not VulkanStorage".into())
-        })?;
-        let ks_s = k_scales.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("kv_dequant_attention k_scales is not VulkanStorage".into())
-        })?;
-        let v_s = v_tensor.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("kv_dequant_attention v_tensor is not VulkanStorage".into())
-        })?;
-        let vs_s = v_scales.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("kv_dequant_attention v_scales is not VulkanStorage".into())
-        })?;
+        let k_s = k_tensor
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("kv_dequant_attention k_tensor is not VulkanStorage".into())
+            })?;
+        let ks_s = k_scales
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("kv_dequant_attention k_scales is not VulkanStorage".into())
+            })?;
+        let v_s = v_tensor
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("kv_dequant_attention v_tensor is not VulkanStorage".into())
+            })?;
+        let vs_s = v_scales
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("kv_dequant_attention v_scales is not VulkanStorage".into())
+            })?;
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
         let ctx = ctx_guard
             .as_ref()
@@ -2594,9 +2616,8 @@ impl BackendDevice for VulkanDevice {
         residuals: Option<&grim_tensor::QuantizedMatmulBackwardResiduals>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         if default_bpw != 8
-            || residuals.is_some_and(|r| {
-                r.outlier_count > 0 || r.backup1_bpw != 0 || r.backup2_bpw != 0
-            })
+            || residuals
+                .is_some_and(|r| r.outlier_count > 0 || r.backup1_bpw != 0 || r.backup2_bpw != 0)
         {
             return Err(Error::Unimplemented(
                 "Vulkan Q8_0 backward currently supports only the plain, residual-free layout"
@@ -2607,9 +2628,12 @@ impl BackendDevice for VulkanDevice {
             .as_any()
             .downcast_ref::<VulkanStorage>()
             .ok_or_else(|| Error::Backend("Vulkan Q8_0 backward dy is not VulkanStorage".into()))?;
-        let b_s = b_packed.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
-            Error::Backend("Vulkan Q8_0 backward b_packed is not VulkanStorage".into())
-        })?;
+        let b_s = b_packed
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan Q8_0 backward b_packed is not VulkanStorage".into())
+            })?;
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
         let ctx = ctx_guard
             .as_ref()
@@ -3191,36 +3215,80 @@ mod tests {
 
     #[test]
     fn test_vulkan_qkv_attention_paged_gqa_exact() {
-        if GLOBAL_CONTEXT.lock().unwrap().is_none() { return; }
+        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+            return;
+        }
         let dev = VulkanDevice::new();
         let q_shape = Shape::new(vec![1, 2, 2]);
         let page_shape = Shape::new(vec![1, 2, 1, 2]);
         let table_shape = Shape::new(vec![1, 1]);
-        let q = dev.from_cpu(&vec![1.0f32; 4], &q_shape, DType::F32).unwrap();
-        let k = dev.from_cpu(&vec![1.0f32; 4], &page_shape, DType::F32).unwrap();
-        let v = dev.from_cpu(&vec![2.0f32; 4], &page_shape, DType::F32).unwrap();
-        let table = dev.from_cpu(&vec![0.0f32], &table_shape, DType::F32).unwrap();
-        let (out, _) = dev.qkv_attention_paged(
-            q.as_ref(), table.as_ref(), k.as_ref(), v.as_ref(), 1, 1, 2, 2, 0, &q_shape,
-        ).unwrap();
-        for value in out.to_cpu_vec_f32().unwrap() { close_vulkan(value, 2.0, "paged GQA"); }
+        let q = dev
+            .from_cpu(&vec![1.0f32; 4], &q_shape, DType::F32)
+            .unwrap();
+        let k = dev
+            .from_cpu(&vec![1.0f32; 4], &page_shape, DType::F32)
+            .unwrap();
+        let v = dev
+            .from_cpu(&vec![2.0f32; 4], &page_shape, DType::F32)
+            .unwrap();
+        let table = dev
+            .from_cpu(&vec![0.0f32], &table_shape, DType::F32)
+            .unwrap();
+        let (out, _) = dev
+            .qkv_attention_paged(
+                q.as_ref(),
+                table.as_ref(),
+                k.as_ref(),
+                v.as_ref(),
+                1,
+                1,
+                2,
+                2,
+                0,
+                &q_shape,
+            )
+            .unwrap();
+        for value in out.to_cpu_vec_f32().unwrap() {
+            close_vulkan(value, 2.0, "paged GQA");
+        }
     }
 
     #[test]
     fn test_vulkan_tree_attention_gqa_exact() {
-        if GLOBAL_CONTEXT.lock().unwrap().is_none() { return; }
+        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+            return;
+        }
         let dev = VulkanDevice::new();
         let q_shape = Shape::new(vec![1, 2, 2, 2]);
         let kv_shape = Shape::new(vec![2, 1, 2]);
         let parent_shape = Shape::new(vec![2]);
-        let q = dev.from_cpu(&vec![1.0f32; 8], &q_shape, DType::F32).unwrap();
-        let k = dev.from_cpu(&vec![1.0f32; 4], &kv_shape, DType::F32).unwrap();
-        let v = dev.from_cpu(&vec![2.0f32; 4], &kv_shape, DType::F32).unwrap();
-        let parents = dev.from_cpu(&vec![0.0f32, 0.0], &parent_shape, DType::F32).unwrap();
-        let (out, _) = dev.tree_attention(
-            q.as_ref(), k.as_ref(), v.as_ref(), parents.as_ref(), 1, 2, 0, &q_shape,
-        ).unwrap();
-        for value in out.to_cpu_vec_f32().unwrap() { close_vulkan(value, 2.0, "tree GQA"); }
+        let q = dev
+            .from_cpu(&vec![1.0f32; 8], &q_shape, DType::F32)
+            .unwrap();
+        let k = dev
+            .from_cpu(&vec![1.0f32; 4], &kv_shape, DType::F32)
+            .unwrap();
+        let v = dev
+            .from_cpu(&vec![2.0f32; 4], &kv_shape, DType::F32)
+            .unwrap();
+        let parents = dev
+            .from_cpu(&vec![0.0f32, 0.0], &parent_shape, DType::F32)
+            .unwrap();
+        let (out, _) = dev
+            .tree_attention(
+                q.as_ref(),
+                k.as_ref(),
+                v.as_ref(),
+                parents.as_ref(),
+                1,
+                2,
+                0,
+                &q_shape,
+            )
+            .unwrap();
+        for value in out.to_cpu_vec_f32().unwrap() {
+            close_vulkan(value, 2.0, "tree GQA");
+        }
     }
 }
 

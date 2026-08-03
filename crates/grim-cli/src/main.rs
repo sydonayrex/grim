@@ -10,6 +10,7 @@ pub mod client;
 pub mod compat;
 pub mod cp;
 pub mod doctor;
+pub mod echo;
 pub mod oxidizer;
 pub mod plugin;
 pub mod rm;
@@ -223,12 +224,37 @@ enum Commands {
         /// LoRA alpha.
         #[arg(long, default_value_t = 32.0)]
         alpha: f32,
+        /// Maximum tokens per packed batch (micro-batch size in tokens).
+        #[arg(long, default_value_t = 2048)]
+        batch_size: usize,
+        /// Number of micro-batches to accumulate gradients over before an optimizer step.
+        #[arg(long, default_value_t = 1)]
+        gradient_accumulation_steps: usize,
+        /// Number of optimizer steps for linear LR warmup at the start of training.
+        #[arg(long, default_value_t = 0)]
+        warmup_steps: usize,
+        /// Log loss every N optimizer steps. 0 disables step-level logging.
+        #[arg(long, default_value_t = 0)]
+        logging_steps: usize,
+        /// Maximum gradient norm for global gradient clipping. 0 disables clipping.
+        #[arg(long, default_value_t = 1.0)]
+        max_grad_norm: f32,
+        /// Stop training if loss does not improve for this many epochs. 0 disables early stopping.
+        #[arg(long, default_value_t = 0)]
+        early_stopping_patience: usize,
+        /// Number of GPUs for data-parallel training. >1 enables RCCL all-reduce.
+        #[arg(long, default_value_t = 1)]
+        num_gpus: usize,
         /// Target compute device (e.g. "cpu", "rocm", "rocm:0").
         #[arg(long, default_value = "cpu")]
         device: String,
         /// Training mode (e.g. "qlora", "soul-eater").
         #[arg(long, default_value = "qlora")]
         mode: String,
+        /// Enable SCALE-ECHO echo training mode. Bypasses the autograd tape
+        /// and uses subspace echo state + FP4 updates instead.
+        #[arg(long)]
+        echo_mode: bool,
         /// Optimizer (adamw, adamw-8bit, paged-adamw, paged-adamw-8bit, lion,
         /// lion-8bit, adafactor, adamw-bnb, qgalore, galore, galore-8bit,
         /// lomo, adalomo, came, sophia).
@@ -757,6 +783,13 @@ async fn main() -> Result<()> {
             lr,
             rank,
             alpha,
+            batch_size,
+            gradient_accumulation_steps,
+            warmup_steps,
+            logging_steps,
+            max_grad_norm,
+            early_stopping_patience,
+            num_gpus,
             device,
             mode,
             optimizer,
@@ -764,6 +797,7 @@ async fn main() -> Result<()> {
             use_pissa,
             use_olora,
             olora_lambda,
+            echo_mode,
         } => {
             let opts = train::TrainOptions {
                 model_path: model,
@@ -773,6 +807,13 @@ async fn main() -> Result<()> {
                 lr,
                 rank,
                 alpha,
+                batch_size,
+                gradient_accumulation_steps,
+                warmup_steps,
+                logging_steps,
+                max_grad_norm,
+                early_stopping_patience,
+                num_gpus,
                 device,
                 mode,
                 optimizer,
@@ -780,6 +821,7 @@ async fn main() -> Result<()> {
                 use_pissa,
                 use_olora,
                 olora_lambda,
+                echo_mode,
             };
             if let Err(e) = train::cmd_train(opts) {
                 eprintln!("[grim train] Failed: {e}");

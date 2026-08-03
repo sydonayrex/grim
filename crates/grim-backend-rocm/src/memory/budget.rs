@@ -39,7 +39,13 @@ mod tests {
 
     #[test]
     fn forced_mode_uses_managed_memory() {
-        assert!(should_use_managed("always", u64::MAX, u64::MAX, 1, u64::MAX));
+        assert!(should_use_managed(
+            "always",
+            u64::MAX,
+            u64::MAX,
+            1,
+            u64::MAX
+        ));
         assert!(should_use_managed("true", u64::MAX, u64::MAX, 1, u64::MAX));
     }
 
