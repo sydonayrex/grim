@@ -656,3 +656,37 @@ kernel void grim_quantized_matmul_q8_0(
         out[row * n + col] = sum;
     }
 }
+
+// ── SCYTHE-2 all_reduce accumulate kernel ─────────────────────────────
+//   out[id] += a[id]
+// Caller pre-zeros `out`, then dispatches once per input tensor to
+// accumulate a sum across N same-shape inputs.
+kernel void grim_all_reduce(
+    device const float* a [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant int& n [[buffer(2)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id < uint(n)) {
+        out[id] += a[id];
+    }
+}
+
+// ── SCYTHE-2 comm_fuse_reduce scatter-copy kernel ──────────────────────
+// Copies a column shard In[row, col] → Out[row, col_offset + col],
+// where Out is [m, n_total] (pre-zeroed) and In is [m, n_src].
+kernel void grim_comm_fuse_reduce(
+    device const float* in [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant int& m [[buffer(2)]],
+    constant int& n_src [[buffer(3)]],
+    constant int& col_offset [[buffer(4)]],
+    constant int& n_total [[buffer(5)]],
+    uint2 id [[thread_position_in_grid]]
+) {
+    int row = int(id.y);
+    int col = int(id.x);
+    if (row < m && col < n_src) {
+        out[row * n_total + col_offset + col] = in[row * n_src + col];
+    }
+}

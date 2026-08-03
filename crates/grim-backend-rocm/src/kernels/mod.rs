@@ -5,7 +5,6 @@ pub mod comm_fuse;
 pub mod compute_kernels;
 pub mod cross_attention;
 pub mod decode_gemm;
-pub mod flash_attn;
 pub mod fp8_gemm_rdna4;
 pub mod fp8_standalone;
 pub mod fused_dequant_gemm;
