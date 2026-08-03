@@ -7,6 +7,12 @@
 use grim_tensor::{BackendDevice, Shape};
 
 fn silu_backward_ref(e: &[f32], g: &[f32], dw: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    // Forward:  y = silu(e) * g
+    //   where silu(e) = e * sigmoid(e), sigmoid(e) = 1/(1+exp(-e))
+    // Backward (dw = dL/dy):
+    //   df = dL/dg = silu(e) * dw          — gradient w.r.t. g (up)
+    //   de = dL/de = g * silu'(e) * dw     — gradient w.r.t. e (gate)
+    //         where silu'(e) = sigmoid(e) * (1 + e*(1 - sigmoid(e)))
     let n = e.len();
     let mut df = vec![0.0f32; n];
     let mut de = vec![0.0f32; n];
@@ -14,17 +20,20 @@ fn silu_backward_ref(e: &[f32], g: &[f32], dw: &[f32]) -> (Vec<f32>, Vec<f32>) {
         let se = 1.0 / (1.0 + (-e[i]).exp());
         let silu_e = se * e[i];
         let dsilu = se * (1.0 + e[i] * (1.0 - se));
-        df[i] = dw[i] * g[i] * dsilu;
-        de[i] = dw[i] * silu_e;
+        df[i] = dw[i] * silu_e;
+        de[i] = dw[i] * g[i] * dsilu;
     }
     (df, de)
 }
 
 #[test]
 fn silu_backward_analytic_zero_input() {
+    // e=0 → silu(0) = 0, sigmoid(0) = 0.5, silu'(0) = 0.5
+    // df = dL/dg = silu(0) * dw      = 0 * 1 = 0
+    // de = dL/de = g * silu'(0) * dw = 1 * 0.5 * 1 = 0.5
     let (df, de) = silu_backward_ref(&[0.0], &[1.0], &[1.0]);
-    assert!((df[0] - 0.5).abs() < 1e-6);
-    assert!((de[0] - 0.0).abs() < 1e-6);
+    assert!((df[0] - 0.0).abs() < 1e-6);
+    assert!((de[0] - 0.5).abs() < 1e-6);
 }
 
 #[test]

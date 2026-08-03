@@ -48,9 +48,7 @@ fn residual_packed_forward_passes_backup2_and_merges_it() {
 
     let b_dtype = DType {
         arith: ArithType::U8,
-        storage: Storage::ResidualPacked(
-            grim_tensor::dtype::ResidualPackedConfig { bpw: 2 },
-        ),
+        storage: Storage::ResidualPacked(grim_tensor::dtype::ResidualPackedConfig { bpw: 2 }),
     };
     let mut b = dev
         .from_cpu_bytes(&packed, &Shape::from_slice(&[packed.len()]), b_dtype)
@@ -108,24 +106,41 @@ fn residual_packed_forward_passes_backup2_and_merges_it() {
 
     let got = out.to_cpu_vec_f32().expect("read forward output")[0];
     let expected = 4.0f32 * (-1.0 / 3.0 + 1.0);
-    assert!((got - expected).abs() < 0.05, "got {got}, expected {expected}");
+    assert!(
+        (got - expected).abs() < 0.05,
+        "got {got}, expected {expected}"
+    );
 }
 
 #[test]
 #[ignore = "requires real ROCm device; run with GRIM_RUN_GPU_TESTS=1 and -- --ignored"]
 fn residual_packed_forward_applies_outlier_correction_in_fused_path() {
-    if std::env::var(GPU_TEST_ENV).is_err() { return; }
-    let devices = match RocmDevice::probe() { Ok(devices) if !devices.is_empty() => devices, _ => return };
+    if std::env::var(GPU_TEST_ENV).is_err() {
+        return;
+    }
+    let devices = match RocmDevice::probe() {
+        Ok(devices) if !devices.is_empty() => devices,
+        _ => return,
+    };
     let dev = RocmDevice::try_new(devices[0].ordinal()).expect("ROCm device");
     dev.set_fused_dequant_gemm_enabled(true);
-    FUSED_FORWARD_DISPATCH_STATS.attempts.store(0, std::sync::atomic::Ordering::Relaxed);
-    FUSED_FORWARD_DISPATCH_STATS.kernel_calls.store(0, std::sync::atomic::Ordering::Relaxed);
-    FUSED_FORWARD_DISPATCH_STATS.fallback_calls.store(0, std::sync::atomic::Ordering::Relaxed);
+    FUSED_FORWARD_DISPATCH_STATS
+        .attempts
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    FUSED_FORWARD_DISPATCH_STATS
+        .kernel_calls
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    FUSED_FORWARD_DISPATCH_STATS
+        .fallback_calls
+        .store(0, std::sync::atomic::Ordering::Relaxed);
 
     let packed = vec![pack_bpw2([1, 1, 1, 1])];
-    let b_dtype = DType { arith: ArithType::U8, storage: Storage::ResidualPacked(
-        grim_tensor::dtype::ResidualPackedConfig { bpw: 2 }) };
-    let mut b = dev.from_cpu_bytes(&packed, &Shape::from_slice(&[packed.len()]), b_dtype)
+    let b_dtype = DType {
+        arith: ArithType::U8,
+        storage: Storage::ResidualPacked(grim_tensor::dtype::ResidualPackedConfig { bpw: 2 }),
+    };
+    let mut b = dev
+        .from_cpu_bytes(&packed, &Shape::from_slice(&[packed.len()]), b_dtype)
         .expect("upload packed weights");
     b.set_provenance(QuantProvenance::WithResiduals {
         outlier_count: 1,
@@ -144,14 +159,29 @@ fn residual_packed_forward_applies_outlier_correction_in_fused_path() {
         backup2_codes_offset: 0,
         backup2_scale_offset: 0,
     });
-    let a = dev.from_cpu(&[1.0f32; 4], &Shape::from_slice(&[1, 4]), DType::F32)
+    let a = dev
+        .from_cpu(&[1.0f32; 4], &Shape::from_slice(&[1, 4]), DType::F32)
         .expect("upload activation");
-    let (out, handle) = dev.quantized_matmul(a.as_ref(), b.as_ref(), &[], &Shape::from_slice(&[1, 1]))
+    let (out, handle) = dev
+        .quantized_matmul(a.as_ref(), b.as_ref(), &[], &Shape::from_slice(&[1, 1]))
         .expect("forward ResidualPacked matmul");
     handle.synchronize().expect("synchronize forward matmul");
-    assert_eq!(FUSED_FORWARD_DISPATCH_STATS.kernel_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
-    assert_eq!(FUSED_FORWARD_DISPATCH_STATS.fallback_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(
+        FUSED_FORWARD_DISPATCH_STATS
+            .kernel_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        FUSED_FORWARD_DISPATCH_STATS
+            .fallback_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
     let got = out.to_cpu_vec_f32().expect("read forward output")[0];
     let expected = 2.0f32 + 3.0f32 * (-1.0 / 3.0);
-    assert!((got - expected).abs() < 0.05, "got {got}, expected {expected}");
+    assert!(
+        (got - expected).abs() < 0.05,
+        "got {got}, expected {expected}"
+    );
 }

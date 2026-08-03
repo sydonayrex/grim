@@ -627,16 +627,38 @@ fn oxiblas_sgemm(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: usize, k: u
     }
 }
 
-/// Scalar triple-loop GEMM: reference implementation for OxiBLAS comparison.
+/// Scalar triple-loop GEMM with cache-friendly loop order and blocking.
+///
+/// The original O(m·n·k) triple loop accessed `b` with stride-`n`, causing
+/// cache-line misses for every inner iteration. By reordering to `i, p, j`
+/// and adding an inner block over `j`, we walk `b` sequentially within each
+/// row and keep the output row in cache across the `p` reduction.
 #[allow(dead_code)]
 fn gemm_scalar(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: usize, k: usize) {
+    // Zero the output buffer first.
+    for o in out[..m * n].iter_mut() {
+        *o = 0.0;
+    }
+
+    // Cache-friendly loop order: i (row block), p (inner dim), j (col block).
+    // The `j` loop over contiguous output entries hits `b[p*n + j]` sequentially.
+    const BLOCK: usize = 64;
     for i in 0..m {
-        for j in 0..n {
-            let mut s = 0.0f32;
-            for p in 0..k {
-                s += a[i * k + p] * b[p * n + j];
+        for p in 0..k {
+            let ap = a[i * k + p];
+            if ap == 0.0 {
+                continue;
             }
-            out[i * n + j] = s;
+            let b_row = &b[p * n..];
+            let out_row = &mut out[i * n..(i + 1) * n];
+            let mut jj = 0;
+            while jj < n {
+                let end = (jj + BLOCK).min(n);
+                for j in jj..end {
+                    out_row[j] += ap * b_row[j];
+                }
+                jj = end;
+            }
         }
     }
 }

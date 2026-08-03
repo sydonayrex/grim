@@ -24,9 +24,7 @@ type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<R = ()> = Result<R, TestError>;
 
 #[cfg(feature = "rccl")]
-fn integration_ordinals(
-    devices: &[grim_backend_rocm::RocmDevice],
-) -> TestResult<Vec<usize>> {
+fn integration_ordinals(devices: &[grim_backend_rocm::RocmDevice]) -> TestResult<Vec<usize>> {
     if let Some(value) = std::env::var_os("GRIM_RCCL_ORDINALS") {
         let ordinals = value
             .to_string_lossy()
@@ -36,14 +34,19 @@ fn integration_ordinals(
         if ordinals.len() != 2 {
             return Err("GRIM_RCCL_ORDINALS must contain exactly two ordinals".into());
         }
-        if ordinals.iter().any(|ordinal| {
-            !devices.iter().any(|device| device.ordinal() == *ordinal)
-        }) {
+        if ordinals
+            .iter()
+            .any(|ordinal| !devices.iter().any(|device| device.ordinal() == *ordinal))
+        {
             return Err("GRIM_RCCL_ORDINALS contains an unavailable device".into());
         }
         return Ok(ordinals);
     }
-    Ok(devices.iter().take(2).map(|device| device.ordinal()).collect())
+    Ok(devices
+        .iter()
+        .take(2)
+        .map(|device| device.ordinal())
+        .collect())
 }
 
 #[cfg(feature = "rccl")]
@@ -98,11 +101,7 @@ fn rccl_multi_gpu_all_reduce_sums_real_device_buffers() -> TestResult {
     let mut buffers = Vec::with_capacity(ordinals.len());
     for (rank, ordinal) in ordinals.iter().copied().enumerate() {
         let device = grim_backend_rocm::RocmDevice::new(ordinal);
-        let storage = device.from_cpu(
-            &[(rank + 1) as f32; 4],
-            &shape,
-            DType::F32,
-        )?;
+        let storage = device.from_cpu(&[(rank + 1) as f32; 4], &shape, DType::F32)?;
         let ptr = storage
             .as_any()
             .downcast_ref::<grim_backend_rocm::RocmStorage>()
@@ -145,7 +144,10 @@ fn rccl_selected_pair_matches_requested_topology() -> TestResult {
     let profiles = ordinals
         .iter()
         .map(|ordinal| {
-            let device = devices.iter().find(|device| device.ordinal() == *ordinal).unwrap();
+            let device = devices
+                .iter()
+                .find(|device| device.ordinal() == *ordinal)
+                .unwrap();
             (device.ordinal(), grim_backend_rocm::vram_info(*ordinal).1)
         })
         .collect::<Vec<_>>();

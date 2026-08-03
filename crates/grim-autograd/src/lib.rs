@@ -53,21 +53,33 @@ impl Default for AutogradScope {
 pub mod adamw;
 pub mod backward;
 pub mod collate;
+pub mod contrast_omni;
 pub mod injection;
 pub mod loss;
 pub mod lr_schedule;
+pub mod mm_grpo;
+pub mod omnigrad;
 pub mod ops;
 pub mod param;
 pub mod preference_loss;
+
+pub use contrast_omni::{ContrastOmniConfig, ContrastOmniLoss};
+pub use mm_grpo::{MmGrpoConfig, MmGrpoRewardNormalizer};
+pub mod omnilo_prune;
 pub mod registry;
+pub mod scythe1;
 pub mod soul_eater;
 pub mod tape;
+pub mod tops_prune;
+pub mod turbo_finetune;
 
+pub use scythe1::{Scythe1Adapter, Scythe1Optimizer};
 pub use soul_eater::{SoulEaterAdapter, SoulEaterOptimizer};
+pub use turbo_finetune::{TrainingMode, TurboFinetuneConfig, TurboFinetuneScheduler};
 
 pub use adamw::{
-    Adafactor, AdafactorConfig, AdamW, AdamWConfig, LRScheduler, Lion8Bit, Lion8BitConfig,
-    Optimizer, OptimizerKind, PagedAdamW, PagedAdamWConfig,
+    Adafactor, AdafactorConfig, AdamW, AdamWConfig, LRScheduler, Lion8Bit, Lion8BitConfig, Muon,
+    MuonConfig, Optimizer, OptimizerKind, PagedAdamW, PagedAdamWConfig,
 };
 pub use backward::{BackwardContext, backward};
 pub use collate::{PackedBatch, TokenSequence, VarLenCollator};
@@ -77,6 +89,7 @@ pub use injection::{
 };
 pub use loss::cross_entropy_loss;
 pub use lr_schedule::CosineWarmupSchedule;
+pub use omnigrad::{OmniGradConfig, OmniGradRouter};
 pub use ops::{
     AddArgs, FakeQuantInt4Args, MatMulArgs, ScaleArgs, add_backward, apply_and_record_lora,
     fake_quant_int4_backward, fake_quant_int4_forward, lora_backward, matmul_backward,
@@ -89,6 +102,7 @@ pub use preference_loss::{
 };
 pub use registry::AutogradRegistry;
 pub use tape::{Tape, TapeEntry, TapeKind, TensorId};
+pub use tops_prune::{TopsConfig, TopsPruner, compute_entropy};
 
 use grim_tensor::{BackendDevice, Device, Tensor};
 

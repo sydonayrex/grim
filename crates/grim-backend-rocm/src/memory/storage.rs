@@ -221,7 +221,9 @@ impl RocmStorage {
             )
         };
         if result != hipSuccess {
-            unsafe { let _ = crate::hipFree(ptr); }
+            unsafe {
+                let _ = crate::hipFree(ptr);
+            }
             return Err(Error::Backend(format!(
                 "hipMemcpyHostToDevice for managed storage failed with error code {result}"
             )));
@@ -252,7 +254,9 @@ impl RocmStorage {
                 )
             };
             if result != hipSuccess {
-                unsafe { let _ = crate::hipFree(ptr); }
+                unsafe {
+                    let _ = crate::hipFree(ptr);
+                }
                 return Err(Error::Backend(format!(
                     "hipMemcpyHostToDevice for managed raw storage failed with error code {result}"
                 )));
@@ -293,7 +297,9 @@ impl RocmStorage {
                             managed: true,
                         });
                     }
-                    unsafe { let _ = crate::hipFree(ptr); }
+                    unsafe {
+                        let _ = crate::hipFree(ptr);
+                    }
                 }
                 return Err(vram_error);
             }
@@ -333,7 +339,9 @@ impl Drop for RocmStorage {
     fn drop(&mut self) {
         if let Some(ptr_val) = self.device_ptr {
             if self.managed {
-                unsafe { let _ = crate::hipFree(ptr_val as *mut c_void); }
+                unsafe {
+                    let _ = crate::hipFree(ptr_val as *mut c_void);
+                }
             } else {
                 self.allocator.free(ptr_val as *mut c_void, self.bytes);
             }

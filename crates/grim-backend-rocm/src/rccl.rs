@@ -524,6 +524,7 @@ pub fn tp_all_reduce(
 /// The struct owns an `NcclComm` handle initialised via `ncclCommInitAll`
 /// so that `sum_gradients` can perform a real all-reduce before applying
 /// the `1/num_gpus` averaging scale.
+#[derive(Debug)]
 pub struct RcclAllReduce {
     /// Number of GPUs participating in the data-parallel group.
     pub num_gpus: u32,
@@ -556,7 +557,10 @@ impl RcclAllReduce {
     #[cfg(feature = "rccl")]
     fn init_comm(device_ordinals: &[usize]) -> Result<Option<NcclComm>> {
         let ndev = device_ordinals.len() as i32;
-        let devlist: Vec<i32> = device_ordinals.iter().map(|&ordinal| ordinal as i32).collect();
+        let devlist: Vec<i32> = device_ordinals
+            .iter()
+            .map(|&ordinal| ordinal as i32)
+            .collect();
         let mut comm = NcclComm(std::ptr::null_mut());
         // SAFETY: devlist contains `ndev` valid device ordinals; comm is a
         // local with stable address for the call.

@@ -238,7 +238,12 @@ impl CudaStorage {
     /// Allocates GPU memory sized to exactly `byte_len` bytes (for packed
     /// quantized representations whose packed length is smaller than
     /// `shape.elem_count() * dtype.arith.byte_size()`).
-    pub fn alloc_gpu_bytes(shape: &Shape, dtype: DType, byte_len: usize, device_ordinal: usize) -> Result<Self> {
+    pub fn alloc_gpu_bytes(
+        shape: &Shape,
+        dtype: DType,
+        byte_len: usize,
+        device_ordinal: usize,
+    ) -> Result<Self> {
         let select_res = unsafe { cudaSetDevice(device_ordinal as i32) };
         if select_res != cudaSuccess {
             return Err(Error::Backend(format!(
@@ -311,7 +316,8 @@ impl CudaStorage {
         dtype: DType,
         device_ordinal: usize,
     ) -> Result<Self> {
-        let storage = Self::alloc_gpu(shape, dtype, device_ordinal)?;        let dev_ptr = storage.device_ptr.unwrap() as *mut c_void;
+        let storage = Self::alloc_gpu(shape, dtype, device_ordinal)?;
+        let dev_ptr = storage.device_ptr.unwrap() as *mut c_void;
 
         // SAFETY: `cudaMemcpy` copies `storage.bytes` from host to device.
         // `dev_ptr` was allocated by `cudaMalloc` in `alloc_gpu`; `host_data`
@@ -489,12 +495,7 @@ impl BackendStorage for CudaStorage {
                 )));
             }
             let b_scales = <CudaStorage as BackendStorage>::quant_scales(self);
-            return cuda_dequant_quantized_storage(
-                &raw,
-                b_scales,
-                elem_count,
-                &self.dtype,
-            );
+            return cuda_dequant_quantized_storage(&raw, b_scales, elem_count, &self.dtype);
         }
 
         // Native F32 storage: copy `self.bytes` worth of f32 elements.
@@ -1913,10 +1914,9 @@ impl BackendDevice for CudaDevice {
         out_shape: &Shape,
         _residuals: Option<&grim_tensor::QuantizedMatmulBackwardResiduals>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let dy_storage = dy
-            .as_any()
-            .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("quantized_matmul_backward_dx: dy not CudaStorage".into()))?;
+        let dy_storage = dy.as_any().downcast_ref::<CudaStorage>().ok_or_else(|| {
+            Error::Backend("quantized_matmul_backward_dx: dy not CudaStorage".into())
+        })?;
 
         let b_storage = b_packed
             .as_any()
@@ -1947,7 +1947,8 @@ impl BackendDevice for CudaDevice {
         let b_scales = b_storage.quant_scales();
 
         // Host dequant: packed bytes -> F32 [K, N] row-major, via grim-quant.
-        let b_dequant = cuda_dequant_quantized_storage(&b_bytes, b_scales, b_elem_count, &b_storage.dtype)?;
+        let b_dequant =
+            cuda_dequant_quantized_storage(&b_bytes, b_scales, b_elem_count, &b_storage.dtype)?;
 
         // Re-upload B as F32, then compute dX = dY @ B^T directly via cuBLAS.
         //
@@ -2116,7 +2117,8 @@ fn cuda_dequant_quantized_storage(
         ))),
         DTypeStorage::GroupInt(_) => Err(Error::Unimplemented(
             "quantized_matmul_backward_dx: GroupInt storage is dequantized to F32 at load time \
-             on CUDA and does not reach the fused path".into(),
+             on CUDA and does not reach the fused path"
+                .into(),
         )),
         DTypeStorage::Native => Err(Error::Backend(format!(
             "quantized_matmul_backward_dx: expected quantized b, got Native ({:?})",

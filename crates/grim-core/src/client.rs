@@ -786,7 +786,16 @@ pub async fn query_server_status(addr: &str) -> Result<()> {
         } else {
             println!(
                 "{:<28} {:<8} {:<10} {:<8} {:<8} {:<6} {:<10} {:<10} {:<10} {:<12}",
-                "MODEL", "PARAMS", "VRAM(GB)", "GPU%", "RAM(GB)", "KV_GB", "KV%", "CTX", "TPS", "TTFT(ms)"
+                "MODEL",
+                "PARAMS",
+                "VRAM(GB)",
+                "GPU%",
+                "RAM(GB)",
+                "KV_GB",
+                "KV%",
+                "CTX",
+                "TPS",
+                "TTFT(ms)"
             );
             println!("{}", "-".repeat(120));
 
@@ -794,18 +803,46 @@ pub async fn query_server_status(addr: &str) -> Result<()> {
                 let name = item["name"].as_str().unwrap_or("");
                 let params = item.get("params").and_then(|v| v.as_str()).unwrap_or("?");
                 let vram_gb = item.get("vram_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let gpu_util = item.get("gpu_util_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let ram_gb = item.get("sys_ram_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let kv_used_gb = item.get("kv_used_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let kv_total_gb = item.get("kv_total_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let kv_pct = if kv_total_gb > 0.0 { (kv_used_gb / kv_total_gb * 100.0) as f32 } else { 0.0 };
+                let gpu_util = item
+                    .get("gpu_util_pct")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let ram_gb = item
+                    .get("sys_ram_gb")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let kv_used_gb = item
+                    .get("kv_used_gb")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let kv_total_gb = item
+                    .get("kv_total_gb")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let kv_pct = if kv_total_gb > 0.0 {
+                    (kv_used_gb / kv_total_gb * 100.0) as f32
+                } else {
+                    0.0
+                };
                 let ctx = item.get("ctx_limit").and_then(|v| v.as_u64()).unwrap_or(0);
-                let tps = item.get("decode_tps").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let tps = item
+                    .get("decode_tps")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
                 let ttft_ms = item.get("ttft_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
                 println!(
                     "{:<28} {:<8} {:<10.1} {:<8.0} {:<8.1} {:<10.1} {:<6.0}% {:<10} {:.1} {}",
-                    name, params, vram_gb, gpu_util, ram_gb, kv_used_gb, kv_pct, ctx, tps, format_ms(ttft_ms).as_str()
+                    name,
+                    params,
+                    vram_gb,
+                    gpu_util,
+                    ram_gb,
+                    kv_used_gb,
+                    kv_pct,
+                    ctx,
+                    tps,
+                    format_ms(ttft_ms).as_str()
                 );
             }
             println!();
