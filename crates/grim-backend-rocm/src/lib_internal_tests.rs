@@ -1251,6 +1251,7 @@ mod tests {
                 arg(&mut sc),
             ],
             Some(42),
+            0,
         )
         .unwrap();
 
@@ -1273,6 +1274,7 @@ mod tests {
                 arg(&mut sc),
             ],
             Some(42),
+            0,
         )
         .unwrap();
         assert_eq!(dev.module_load_stats(), loads_after_sol42);
@@ -1293,6 +1295,7 @@ mod tests {
                 arg(&mut sc),
             ],
             Some(43),
+            0,
         )
         .unwrap();
         assert!(dev.module_load_stats() > loads_after_sol42);

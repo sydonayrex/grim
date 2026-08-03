@@ -11,7 +11,9 @@ use grim_tensor::dtype::{DType, KQuantScheme, QuantProvenance, Storage};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
 
-use crate::format::{GrimFile, GrimTensorEntry, read_normals, read_outliers, read_outliers_with_encoding};
+use crate::format::{
+    GrimFile, GrimTensorEntry, read_normals, read_outliers, read_outliers_with_encoding,
+};
 use crate::gguf::{
     GgufDType, GgufFile, GgufTensorInfo, GrimFusionOp, GrimMetadata, GrimQuantOverride,
     GrimTrainQuantMode, read_gguf, read_tensor_bytes,
@@ -414,12 +416,18 @@ impl TensorProvider for GrimProvider {
             if residual {
                 let outliers = if entry.outlier_count != 0 {
                     read_outliers_with_encoding(&mut *reader, entry, ext.outlier_index_encoding)?
-                } else { Vec::new() };
+                } else {
+                    Vec::new()
+                };
                 let mut primary_scale_bytes = Vec::new();
                 if ext.scale_size != 0 {
                     let start = ext.scale_offset as usize;
                     let end = start.saturating_add(ext.scale_size as usize);
-                    if end > bytes.len() { return Err(Error::Backend(format!("primary scale region for '{name}' exceeds payload"))); }
+                    if end > bytes.len() {
+                        return Err(Error::Backend(format!(
+                            "primary scale region for '{name}' exceeds payload"
+                        )));
+                    }
                     primary_scale_bytes.extend_from_slice(&bytes[start..end]);
                 }
                 let provenance = QuantProvenance::WithResiduals {
@@ -442,7 +450,14 @@ impl TensorProvider for GrimProvider {
                 return Ok(RawTensor {
                     bytes,
                     shape: entry.shape.clone(),
-                    dtype: DType { arith: grim_tensor::dtype::ArithType::U8, storage: Storage::ResidualPacked(grim_tensor::dtype::ResidualPackedConfig { bpw: ext.default_bpw.max(entry.base_bitwidth) }) },
+                    dtype: DType {
+                        arith: grim_tensor::dtype::ArithType::U8,
+                        storage: Storage::ResidualPacked(
+                            grim_tensor::dtype::ResidualPackedConfig {
+                                bpw: ext.default_bpw.max(entry.base_bitwidth),
+                            },
+                        ),
+                    },
                     provenance,
                 });
             }

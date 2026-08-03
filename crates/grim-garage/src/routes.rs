@@ -99,6 +99,9 @@ pub struct StartTrainingRequest {
     /// Weight of the OLoRA orthogonality penalty term.
     #[serde(default)]
     pub olora_lambda: f32,
+    /// SPECTRAL-QLORA: orthogonal adapter init + Muon optimizer.
+    #[serde(default)]
+    pub use_spectral_qlora: bool,
     /// Optionally resume training from a checkpoint sidecar produced by a
     /// prior run. The sidecar must exist at this path on the server and
     /// is validated via `validate_job_path` in the route handler.
@@ -447,6 +450,7 @@ async fn start_training(
         use_pissa: req.use_pissa,
         use_olora: req.use_olora,
         olora_lambda: req.olora_lambda,
+        use_spectral_qlora: req.use_spectral_qlora,
         resume_from_checkpoint: req.resume_from_checkpoint,
         status: crate::jobs::JobStatus::Pending,
         metrics: Vec::new(),

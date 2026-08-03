@@ -21,7 +21,7 @@ impl ModelConfig for ModernBertConfig {
         "modern-bert"
     }
     fn modality(&self) -> ModalityHint {
-        ModalityHint::VisionEncoder
+        ModalityHint::TextInTextOut
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -45,10 +45,60 @@ impl ModelConfig for NomicBertConfig {
         "nomic-bert"
     }
     fn modality(&self) -> ModalityHint {
-        ModalityHint::VisionEncoder
+        ModalityHint::TextInTextOut
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_modern_bert_config_modality() {
+        let cfg = ModernBertConfig {
+            vocab_size: 30522,
+            hidden_size: 768,
+            num_heads: 12,
+            num_layers: 12,
+            intermediate_size: 3072,
+            layer_norm_eps: 1e-5,
+            max_seq_len: 512,
+        };
+        assert_eq!(cfg.name(), "modern-bert");
+        assert_eq!(cfg.modality(), ModalityHint::TextInTextOut);
+    }
+
+    #[test]
+    fn test_nomic_bert_config_modality() {
+        let cfg = NomicBertConfig {
+            vocab_size: 30522,
+            hidden_size: 768,
+            num_heads: 12,
+            num_layers: 12,
+            intermediate_size: 3072,
+            layer_norm_eps: 1e-5,
+            max_seq_len: 2048,
+        };
+        assert_eq!(cfg.name(), "nomic-bert");
+        assert_eq!(cfg.modality(), ModalityHint::TextInTextOut);
+    }
+
+    #[test]
+    fn test_t5_encoder_config_modality() {
+        let cfg = T5EncoderConfig {
+            vocab_size: 32128,
+            hidden_size: 512,
+            num_heads: 8,
+            num_layers: 6,
+            intermediate_size: 2048,
+            rms_norm_eps: 1e-6,
+            max_seq_len: 512,
+        };
+        assert_eq!(cfg.name(), "t5encoder");
+        assert_eq!(cfg.modality(), ModalityHint::TextInTextOut);
     }
 }
 
