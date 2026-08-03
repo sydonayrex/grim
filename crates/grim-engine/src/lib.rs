@@ -28,6 +28,10 @@ pub struct LoadedModel {
     /// device so decode/GPU work actually lands on the GPU instead of
     /// silently falling back to CPU.
     pub device: grim_tensor::Device,
+    /// Tensor-parallel configuration stamped at registration time. `None`
+    /// means single-device; otherwise carries the per-rank `(rank, world_size)`
+    /// so callers can report or query the shard index of a loaded model.
+    pub tp_config: Option<grim_nn::TensorParallelConfig>,
 }
 
 /// A loaded adapter bundle (one LoRA's A/B matrices + scaling). LoRA batches
@@ -54,6 +58,15 @@ pub struct EngineConfig {
     pub determinism_mode: DeterminismMode,
     /// Optional KV compressor for runtime KV cache quantization.
     pub kv_compressor: Option<Arc<dyn grim_kvquant::KvCompressor>>,
+    /// Tensor-parallel world size (env `GRIM_TP_SIZE`). `0` or `1` =
+    /// single-device. Values > 1 require a backend collective (RCCL on ROCm)
+    /// and model construction that shards layers — see C2plrController
+    /// (scythe2.md §5) and the `ColumnParallelLinear`/`RowParallelLinear`
+    /// wrappers in `grim-nn`. The engine reads the env here; the comms
+    /// bootstrap is the SCYTHE-2 WI-6 entry point (roc_device.rs:3136).
+    pub tp_size: usize,
+    /// Explicit GPU ordinals for TP (`GRIM_GPUS`, empty = all visible).
+    pub tp_gpus: Vec<usize>,
 }
 
 impl Default for EngineConfig {
@@ -68,6 +81,18 @@ impl Default for EngineConfig {
             target_itl_ms: 100,
             determinism_mode: DeterminismMode::Relaxed,
             kv_compressor: None,
+            tp_size: std::env::var("GRIM_TP_SIZE")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0),
+            tp_gpus: std::env::var("GRIM_GPUS")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .filter_map(|t| t.trim().parse::<usize>().ok())
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -116,6 +141,79 @@ pub struct Engine {
     tuned_kv_compression_bit_width: u8,
     tokens_per_sec_ema: f32,
     total_tokens_generated: u64,
+    /// Tensor-parallel rank contexts. Populated in `Engine::new` when
+    /// `config.tp_size > 1`; `None` for single-device operation. Each context
+    /// owns a GPU backend + its TPC ordinal so per-rank `Llama::load_tp`
+    /// reads only its shard and `RocmDevice::all_reduce` has an RCCL handle.
+    tp_rank_contexts: Option<Vec<TpRankContext>>,
+}
+
+/// A single tensor-parallel rank's execution context. Replicates the
+/// `grim-garage::backend::RankContext` *pattern* (grim-engine cannot depend on
+/// grim-garage without forming a cycle) with just the fields the inference
+/// engine needs: shard rank/ordinal, the Rocm device, and the shared RCCL
+/// handle.
+#[derive(Clone)]
+pub struct TpRankContext {
+    /// Global TP rank (0 .. world_size-1). Selects which shard this rank owns.
+    pub rank: usize,
+    /// GPU ordinal this rank executes on.
+    pub ordinal: usize,
+    /// Concrete ROCm backend for this rank.
+    pub device: Arc<grim_backend_rocm::RocmDevice>,
+    /// Shared RCCL communicator across all TP ranks.
+    pub rccl: Arc<grim_backend_rocm::rccl::RcclAllReduce>,
+}
+
+/// Plan `tp_size` tensor-parallel ranks onto the live ROCm devices and attach
+/// a single RCCL communicator to each. Mirrors grim-garage's
+/// `plan_training_ranks`/`build_rank_contexts` admission chain but lives in
+/// grim-engine to avoid a dependency cycle. Fails if fewer than `tp_size` GPUs
+/// are visible — TP never silently degrades to CPU.
+///
+/// `tp_gpus`, when non-empty, overrides auto-selection and pins ranks to the
+/// given GPU ordinals (honouring `EngineConfig::tp_gpus`).
+pub fn plan_tp_ranks(
+    tp_size: usize,
+    tp_gpus: Option<&[usize]>,
+) -> Result<Vec<TpRankContext>> {
+    if tp_size == 0 {
+        return Err(Error::Config("tp_size must be > 0".into()));
+    }
+    let devices = grim_backend_rocm::RocmDevice::probe()
+        .map_err(|e| Error::Tensor(e))?;
+    if devices.len() < tp_size {
+        return Err(Error::Config(format!(
+            "TP requested {tp_size} ranks but only {} ROCm device(s) visible",
+            devices.len()
+        )));
+    }
+    // Honour the explicit GPU selection from EngineConfig when present.
+    let ordinals: Vec<usize> = if let Some(gpus) = tp_gpus.filter(|g| !g.is_empty()) {
+        gpus.to_vec()
+    } else {
+        devices.iter().take(tp_size).map(|d| d.ordinal()).collect()
+    };
+    if ordinals.len() < tp_size {
+        return Err(Error::Config(format!(
+            "TP requested {tp_size} ranks but only {} GPU ordinal(s) resolved",
+            ordinals.len()
+        )));
+    }
+    let rccl = Arc::new(grim_backend_rocm::rccl::RcclAllReduce::try_new(&ordinals)?);
+    let mut ranks = Vec::with_capacity(tp_size);
+    for (rank, ordinal) in ordinals.iter().enumerate() {
+        let dev = grim_backend_rocm::RocmDevice::try_new(*ordinal)
+            .map_err(|e| Error::Tensor(e))?;
+        dev.set_rccl_handle(Some(rccl.clone()));
+        ranks.push(TpRankContext {
+            rank,
+            ordinal: *ordinal,
+            device: Arc::new(dev),
+            rccl: rccl.clone(),
+        });
+    }
+    Ok(ranks)
 }
 
 impl Engine {
@@ -125,9 +223,88 @@ impl Engine {
             config.num_kv_heads,
             config.head_dim,
         );
-        if let Some(comp) = &config.kv_compressor {
+
+        // KV-cache quantization (§kv-int8). `EngineConfig.kv_compressor` takes
+        // precedence; otherwise honor `GRIM_KV_QUANT=int8` which attaches a
+        // Lloyd-Max int4/int8 compressor so the paged KV pool compresses
+        // admitted blocks before spill. Previously this defaulted to `None`,
+        // leaving the real `LloydMaxCompressor` impl (grim-kvquant) unreachable
+        // from the serving path.
+        let mut compressor: Option<Arc<dyn grim_kvquant::KvCompressor>> = config.kv_compressor.clone();
+        if compressor.is_none() {
+            if let Ok(mode) = std::env::var("GRIM_KV_QUANT") {
+                match mode.trim().to_ascii_lowercase().as_str() {
+                    "int8" => {
+                        let cfg = grim_kvquant::KvQuantConfig {
+                            key_bits: 3,
+                            value_bits: 8,
+                            group_size: 64,
+                            qk_compute_bits: 8,
+                        };
+                        compressor = Some(Arc::new(grim_kvquant::LloydMaxCompressor::new(cfg)));
+                        eprintln!(
+                            "[grim-engine] kv-int8: attached LloydMaxCompressor (key_bits=3, value_bits=8, group=64)"
+                        );
+                    }
+                    "int4" => {
+                        let cfg = grim_kvquant::KvQuantConfig {
+                            key_bits: 2,
+                            value_bits: 4,
+                            group_size: 64,
+                            qk_compute_bits: 8,
+                        };
+                        compressor = Some(Arc::new(grim_kvquant::LloydMaxCompressor::new(cfg)));
+                        eprintln!(
+                            "[grim-engine] kv-int8: attached LloydMaxCompressor (key_bits=2, value_bits=4, group=64)"
+                        );
+                    }
+                    "off" | "" => {}
+                    other => eprintln!(
+                        "[grim-engine] GRIM_KV_QUANT='{other}' not recognized (expected int8|int4|off)"
+                    ),
+                }
+            }
+        }
+        if let Some(comp) = &compressor {
             pool.attach_compressor(comp.clone());
         }
+
+        // Tensor-parallel bootstrap preview (§c-tp-scope).
+        // The RCCL/NCCL collective impls (roc_device.rs `all_reduce`,
+        // `comm_fuse_reduce`) and the `ColumnParallelLinear`/
+        // `RowParallelLinear` wrappers are present but model construction
+        // still emits plain `Linear` (no callers). Surface TP readiness so
+        // operators see whether multi-GPU TP can actually engage.
+        // Tensor-parallel bootstrap (§c-tp-scope, WI-TP-4).
+        // NOTE: grim-engine cannot depend on grim-garage (it depends on grim-
+        // engine, which would form a cycle), so we replicate the
+        // `plan_training_ranks` *pattern* here: probe ROCm, take the first
+        // `tp_size` ordinals, build one RocmDevice per rank, init a single
+        // RCCL communicator over those ordinals, and attach the handle to each
+        // RocmDevice so `BackendDevice::all_reduce` (used by
+        // `RowParallelLinear::forward`) dispatches device-side collectives.
+        let tp_rank_contexts: Option<Vec<TpRankContext>> = if config.tp_size > 1 {
+            match plan_tp_ranks(config.tp_size, Some(&config.tp_gpus)) {
+                Ok(tp) => {
+                    eprintln!(
+                        "[grim-engine] TP active: {} ranks, RCCL handle attached (ordinals {:?})",
+                        tp.len(),
+                        tp.iter().map(|c| c.ordinal).collect::<Vec<_>>()
+                    );
+                    Some(tp)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[grim-engine] TP requested (tp_size={}) but initialization failed: \
+                         {e} — falling back to single-device mode",
+                        config.tp_size
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let block_pool = Arc::new(std::sync::Mutex::new(pool));
         let admission =
             grim_scheduler::AdmissionController::new(config.target_ttft_ms, config.target_itl_ms);
@@ -161,7 +338,21 @@ impl Engine {
             tuned_kv_compression_bit_width: 4,
             tokens_per_sec_ema: 0.0,
             total_tokens_generated: 0,
+            tp_rank_contexts,
         }
+    }
+
+    /// Tensor-parallel configuration derived from the environment. `GRIM_TP_RANK`
+    /// selects this process's shard index; `GRIM_TP_SIZE` selects the world size.
+    /// Returns `None` when `GRIM_TP_SIZE` is unset or 1 (single-device).
+    pub fn tp_config(&self) -> grim_nn::TensorParallelConfig {
+        grim_nn::TensorParallelConfig::from_env()
+    }
+
+    /// Per-rank execution contexts for tensor parallelism (`None` when TP is
+    /// inactive). Each context owns a GPU backend and its TPC ordinal.
+    pub fn tp_rank_contexts(&self) -> Option<&[TpRankContext]> {
+        self.tp_rank_contexts.as_deref()
     }
 
     /// Register a `CausalLm` auto-wrapped in `SpeculativeCausalLm::auto`.
@@ -243,6 +434,11 @@ impl Engine {
                 model: Box::new(wrapped),
                 config,
                 device: dev,
+                tp_config: if self.tp_rank_contexts.is_some() {
+                    Some(self.tp_config())
+                } else {
+                    None
+                },
             },
         );
     }
@@ -699,6 +895,32 @@ mod tests {
         assert!(total_b > 0);
         assert_eq!(b_used, 0);
         assert!(b_total > 0);
+    }
+
+    /// KV-int8 wiring: `GRIM_KV_QUANT=int8` must attach a compressor to the
+    /// block pool; the default (unset) leaves it empty.
+    #[test]
+    fn test_grim_kv_quant_env_attach() {
+        // Baseline: default config attaches no compressor.
+        let engine = Engine::new(EngineConfig::default());
+        assert!(!engine.block_pool.lock().unwrap().has_compressor());
+
+        // With GRIM_KV_QUANT=int8 the pool must hold a compressor.
+        unsafe {
+            std::env::set_var("GRIM_KV_QUANT", "int8");
+        }
+        let engine = Engine::new(EngineConfig::default());
+        assert!(engine.block_pool.lock().unwrap().has_compressor());
+
+        // off / invalid → none.
+        unsafe {
+            std::env::set_var("GRIM_KV_QUANT", "off");
+        }
+        let engine = Engine::new(EngineConfig::default());
+        assert!(!engine.block_pool.lock().unwrap().has_compressor());
+        unsafe {
+            std::env::remove_var("GRIM_KV_QUANT");
+        }
     }
     use grim_models_transformer::{Llama, LlamaConfig};
     use grim_tensor::Device;

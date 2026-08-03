@@ -1,0 +1,25 @@
+#!/bin/sh
+# grim-config — print the runtime configuration the grim daemon will use.
+# Reads /etc/grim/environment if present, otherwise re-runs the install
+# script's hardware probe. Sourced env vars override detection defaults.
+ENV_FILE="/etc/grim/environment"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTALL_SH="${SCRIPT_DIR}/install.sh"
+
+if [ -r "$ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+fi
+
+if [ -x "$INSTALL_SH" ]; then
+    HOST="${GRIM_HOST:-127.0.0.1}" \
+    PORT="${GRIM_PORT:-11434}" \
+    "$INSTALL_SH" config
+else
+    # Minimal fallback if the install script is absent.
+    echo "=== Grim Runtime Configuration ==="
+    echo "  bind    = ${GRIM_HOST:-127.0.0.1}:${GRIM_PORT:-11434}"
+    echo "  backend = ${GRIM_BACKEND:-auto}"
+    echo "  gpus    = ${GRIM_GPUS:-(none)}"
+    echo "  context = ${GRIM_CONTEXT:-8192}"
+fi
