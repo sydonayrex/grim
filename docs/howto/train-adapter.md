@@ -45,7 +45,7 @@ Or for direct text:
 | `--rank` | 16 | LoRA rank dimension |
 | `--alpha` | 32.0 | Scaling factor |
 | `--device` | cpu | Training device (cpu, cuda, rocm) |
-| `--mode` | qlora | Training mode (qlora, sft) |
+| `--mode` | qlora | Training mode (qlora, soul-eater) |
 
 ## Training Process
 

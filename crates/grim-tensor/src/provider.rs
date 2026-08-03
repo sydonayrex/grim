@@ -253,8 +253,8 @@ mod tests {
         assert!(!shard_boundary_valid(255, 8, 16));
         // 256/7 → not divisible → invalid.
         assert!(!shard_boundary_valid(256, 7, 16));
-        // 256/4=64 per shard, 32 does not divide 64 → invalid.
-        assert!(!shard_boundary_valid(256, 4, 32));
+        // 256/4=64 per shard, 32 divides 64 → valid.
+        assert!(shard_boundary_valid(256, 4, 32));
         // world_size 0 → invalid.
         assert!(!shard_boundary_valid(256, 0, 16));
     }

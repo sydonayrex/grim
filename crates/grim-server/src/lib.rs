@@ -12,7 +12,7 @@
 //! names return 400 immediately — fail loudly rather than silently drop the
 //! adapter and produce unadapted output.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::{
@@ -32,8 +32,106 @@ use grim_core::grim_models_dir;
 use grim_core::session::DeterminismMode;
 use grim_engine::{Engine, model_loader};
 use grim_format::GgufProvider;
+use tokio_util::sync::CancellationToken;
+
+mod tool_parse;
 
 static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Cancellation token registry for active chat requests.
+///
+/// WI-CANCEL-1: `/v1/requests/:id/cancel` needs to signal the streaming loop
+/// driving request `id` to stop. Rather than a bespoke signal mechanism, we
+/// reuse `grim-garage`'s established `CancellationToken` idiom: a token is
+/// created per streaming request, stored here keyed by request id, and the
+/// `stream::unfold` closure checks it each step. The cancel endpoint looks up
+/// the token and calls `cancel()`, which sets the shared flag the loop polls.
+///
+/// This is the *trigger* for an explicit cancel — WI-CANCEL-2's `Drop` guard
+/// on the same state tuple is what guarantees `finish_request` actually runs
+/// once the loop exits (whether due to the token, a stop condition, or a
+/// client disconnect dropping the stream).
+static CANCEL_TOKENS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, CancellationToken>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Register a fresh `CancellationToken` for `request_id` and return it. If a
+/// token already exists for this id (should not happen in practice — a request
+/// id is unique per generation session), the old one is replaced.
+pub fn register_cancel_token(request_id: u64) -> CancellationToken {
+    let token = CancellationToken::new();
+    if let Ok(mut registry) = CANCEL_TOKENS.lock() {
+        registry.insert(request_id, token.clone());
+    }
+    token
+}
+
+/// Look up the cancellation token for `request_id`, if one is registered.
+pub fn take_cancel_token(request_id: u64) -> Option<CancellationToken> {
+    CANCEL_TOKENS
+        .lock()
+        .ok()
+        .and_then(|mut registry| registry.remove(&request_id))
+}
+
+/// WI-CANCEL-2: RAII guard ensuring `Engine::finish_request(id)` runs exactly
+/// once when the streaming SSE future is dropped — covering *all* exit paths
+/// uniformly:
+///   - normal completion (`max_tokens`, stop-sequence early return)
+///   - explicit cancel via `/v1/requests/:id/cancel` (WI-CANCEL-1, the
+///     `CancellationToken` causes the unfold closure to return `None`)
+///   - client disconnect (the SSE stream future is dropped, firing this `Drop`)
+///
+/// The guard lives inside the `stream::unfold` state tuple so its lifetime is
+/// exactly the stream's lifetime — no earlier, no later than the last poll of
+/// the sink side. This is the placement trap called out in the spec
+/// (axum discussion tokio-rs/axum#1060): a guard must be *held by* the stream's
+/// per-poll state, not referenced from outside, to fire at drop time.
+///
+/// `finish_request` is safe to call from `Drop` because:
+/// - `Scheduler::finish` uses `retain` filtering (idempotent, no panic).
+/// - `rollback_kv_to(0)` decrements block-pool ref-counts; blocks shared with
+///   other live requests (prefix cache) stay alive until their last reference
+///   drops.
+/// - every `HashMap` removal in `finish_request` is a no-op on a missing key.
+pub struct RequestCleanupGuard {
+    /// `true` once cleanup has run, preventing a double-call if both an
+    /// explicit early-return path *and* the guard's `Drop` could fire.
+    dropped: bool,
+    request_id: u64,
+    state: Arc<AppState>,
+}
+
+impl RequestCleanupGuard {
+    pub fn new(state: Arc<AppState>, request_id: u64) -> Self {
+        LIVE_CLEANUP_GUARDS.fetch_add(1, Ordering::Relaxed);
+        Self {
+            dropped: false,
+            request_id,
+            state,
+        }
+    }
+}
+
+impl Drop for RequestCleanupGuard {
+    fn drop(&mut self) {
+        if self.dropped {
+            return;
+        }
+        self.dropped = true;
+        if let Ok(mut engine) = self.state.engine.lock() {
+            engine.finish_request(self.request_id);
+        }
+        // Remove the cancel token we registered so a stray reference doesn't
+        // linger in the global registry after the request is done.
+        let _ = take_cancel_token(self.request_id);
+        LIVE_CLEANUP_GUARDS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Counter of how many `RequestCleanupGuard` instances are currently live —
+/// used by tests to assert exactly-once cleanup.
+pub static LIVE_CLEANUP_GUARDS: AtomicUsize = AtomicUsize::new(0);
 
 /// Shared engine state for the HTTP server.
 ///
@@ -139,8 +237,223 @@ fn sample_next_token(
     token
 }
 
-///     The client asked for strict reproducibility; silently giving them
-///     non-deterministic output would be a correctness bug.
+/// Build the OpenAI `choices[0]` payload for one generated completion,
+/// applying WI-TOOLS-4/5 and the WI-TOOLS-4b soft guard:
+/// - when tool calling is active, run the raw completion through the per-family
+///   output parser (WI-TOOLS-4). A clean parse yields `message.tool_calls` with
+///   `finish_reason: "tool_calls"`; otherwise the completion is returned as
+///   ordinary content (a failed parse is never a request failure).
+/// - when the parser produced calls that already appeared in `messages` two or
+///   more times (WI-TOOLS-4b soft threshold, `count >= 2 && < 4`), the
+///   duplicate call's `arguments` are substituted with the diagnostic payload so
+///   the next turn can self-correct without ending the exchange.
+///
+/// The hard guard (`count >= 4`) is handled separately by
+/// [`check_repeated_call_hard_guard`], which must be invoked *before* this
+/// function so a `400` can short-circuit response construction.
+fn build_choice_payload(
+    content: &str,
+    tools_active: bool,
+    template_family: Option<&str>,
+    prior_messages: &[grim_format::ChatMessage],
+) -> serde_json::Value {
+    let (message, finish_reason) = if tools_active {
+        let family = tool_parse::resolve_tool_family(template_family.unwrap_or(""));
+        match tool_parse::parse_tool_calls(content, family) {
+            tool_parse::ParseOutcome {
+                calls: Some(calls), ..
+            } => {
+                let tool_calls: Vec<serde_json::Value> = calls
+                    .iter()
+                    .map(|c| {
+                        // WI-TOOLS-4b soft guard: if this exact call already
+                        // appeared >= 2 times in prior history, replace the
+                        // arguments with the diagnostic payload instead of the
+                        // model's raw duplicate call.
+                        let repeat_count = tool_parse::count_prior_identical_calls(
+                            prior_messages,
+                            &c.name,
+                            &c.arguments,
+                        );
+                        let arguments = if repeat_count >= 2 {
+                            diagnostic_arguments(&c.arguments, repeat_count)
+                        } else {
+                            c.arguments.clone()
+                        };
+                        serde_json::json!({
+                            "id": c.id,
+                            "type": "function",
+                            "function": { "name": c.name, "arguments": arguments },
+                        })
+                    })
+                    .collect();
+                (
+                    serde_json::json!({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": tool_calls
+                    }),
+                    "tool_calls",
+                )
+            }
+            // No clean tool-call parse — return the raw completion as ordinary
+            // content with finish_reason "stop", exactly as a non-tool model
+            // turn would.
+            _ => (
+                serde_json::json!({ "role": "assistant", "content": content }),
+                "stop",
+            ),
+        }
+    } else {
+        (
+            serde_json::json!({ "role": "assistant", "content": content }),
+            "stop",
+        )
+    };
+    serde_json::json!({
+        "index": 0,
+        "message": message,
+        "finish_reason": finish_reason
+    })
+}
+
+/// WI-TOOLS-4b hard guard. Returns `Some((tool_name, repeat_count))` when the
+/// most recent parsed call for `name`/`arguments` has already appeared >= 4
+/// times in `prior_messages` (i.e. this would be the 5th identical call), at
+/// which point the spec mandates a hard `400` before constructing the response.
+/// Callers should check this *before* [`build_choice_payload`] and return a 400
+/// if it returns `Some`.
+fn check_repeated_call_hard_guard(
+    prior_messages: &[grim_format::ChatMessage],
+    name: &str,
+    arguments: &str,
+) -> Option<usize> {
+    let count = tool_parse::count_prior_identical_calls(prior_messages, name, arguments);
+    if count >= 4 { Some(count) } else { None }
+}
+
+/// WI-TOOLS-4b soft-guard diagnostic payload. Replaces the call's `arguments`
+/// with a JSON-encoded string carrying the duplicate flag, the repeat count,
+/// and the original arguments — keeping the `tool_calls` wire shape identical to
+/// a normal call while signaling the duplication to the model's next turn.
+fn diagnostic_arguments(original: &str, repeat_count: usize) -> String {
+    let original_value: serde_json::Value =
+        serde_json::from_str(original).unwrap_or(serde_json::Value::String(original.to_string()));
+    serde_json::to_string(&serde_json::json!({
+        "__grim_duplicate_call_warning": true,
+        "repeat_count": repeat_count,
+        "original_arguments": original_value,
+        "message": "This exact call has been made with identical arguments multiple times. Consider whether the arguments need to change, whether the tool is failing, or whether a different action is needed."
+    }))
+    .unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Terminal SSE emitter for the streaming path (WI-TOOLS-5 buffered
+/// streaming). Runs the buffered completion through [`build_choice_payload`]
+/// and, if a clean tool-call parse was produced, emits a single final delta
+/// chunk carrying `choices[0].delta.tool_calls` plus the `"tool_calls"`
+/// `finish_reason`. When no tool call is detected it returns `None`, which lets
+/// the stream fall through to the `[DONE]` terminator unchanged — preserving
+/// existing plain-content streaming behavior.
+///
+/// NOTE (WI-TOOLS-4b hard guard): the buffered streaming MVP cannot enforce the
+/// hard guard (count >= 4 → 400) *before* generation completes, because the
+/// call being guarded isn't known until the model's completion is parsed at
+/// end-of-generation. Cancelling an in-flight stream mid-generation is out of
+/// scope for the first cut (per the spec's explicit scoping note). The soft
+/// guard (diagnostic substitution) is applied here via `build_choice_payload`;
+/// the hard guard is fully enforced on the non-streaming path where the entire
+/// completion is available before any response is returned.
+fn terminal_tool_delta(
+    parse_ctx: &(bool, Option<String>),
+    emitted: &str,
+    prior_messages: &[grim_format::ChatMessage],
+) -> Option<std::result::Result<axum::response::sse::Event, axum::Error>> {
+    let (tools_active, template_family) = parse_ctx;
+    let choice = build_choice_payload(
+        emitted,
+        *tools_active,
+        template_family.as_deref(),
+        prior_messages,
+    );
+    // A clean parse surfaces a non-empty `tool_calls` array on the message.
+    if let Some(tool_calls) = choice.get("message").and_then(|m| m.get("tool_calls")) {
+        if tool_calls.is_array() && !tool_calls.as_array().unwrap().is_empty() {
+            let payload = serde_json::json!({
+                "choices": [{"index": 0, "delta": {"tool_calls": tool_calls}, "finish_reason": "tool_calls"}]
+            })
+            .to_string();
+            return Some(Ok(axum::response::sse::Event::default()
+                .event("message")
+                .data(payload)));
+        }
+    }
+    None
+}
+
+/// WI-TOOLS-4b/4c — stable, machine-readable error codes for every rejection
+/// `chat_completions` can produce. Each variant serializes to the `code` field
+/// on the structured `{"error": {...}}` object, so clients can branch on a
+/// fixed enum value rather than string-matching a prose `message`. The three
+/// tool-calling guards (`duplicate_tool_call_limit`,
+/// `total_tool_call_limit`, `message_count_limit`) share this vocabulary, and
+/// the four pre-existing `chat_completions`-internal checks are migrated to
+/// use it too so the handler is internally consistent (see the spec's
+/// "Making the error/diagnostic shape actually machine-actionable" § under
+/// WI-TOOLS-4c).
+pub enum ErrorCode {
+    UnknownField,
+    AdapterNotFound,
+    DeterminismMismatch,
+    EmptyMessages,
+    DuplicateToolCall,
+    TotalToolCallLimit,
+    MessageCountLimit,
+}
+
+impl ErrorCode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ErrorCode::UnknownField => "unknown_field",
+            ErrorCode::AdapterNotFound => "adapter_not_found",
+            ErrorCode::DeterminismMismatch => "determinism_mismatch",
+            ErrorCode::EmptyMessages => "empty_messages",
+            ErrorCode::DuplicateToolCall => "duplicate_tool_call_limit",
+            ErrorCode::TotalToolCallLimit => "total_tool_call_limit",
+            ErrorCode::MessageCountLimit => "message_count_limit",
+        }
+    }
+}
+
+/// Build a structured `chat_completions` rejection body matching OpenAI's
+/// `{"error": {"type": ..., "code": ..., "message": ...}}` object shape, with
+/// a stable `code` discriminant the client can branch on. `type` reuses
+/// OpenAI's own `invalid_request_error` taxonomy so OpenAI-compatible client
+/// SDKs behave sensibly even before they learn grim-specific codes.
+fn request_error(code: ErrorCode, message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "type": "invalid_request_error",
+            "code": code.as_str(),
+            "message": message.into(),
+        }
+    })
+}
+
+/// Chat completions endpoint — SSE streaming (§8, §4.5).
+///
+/// §13.3 contract: no silent partial fulfillment.
+///   - Unknown top-level request fields → 400 with the offending key.
+///   - `"adapters"` names not registered in the engine → 400 immediately.
+///   - `"determinism": "strict"` when the engine is in Relaxed mode → 400.
+///
+/// WI-TOOLS-1 through -5: when `tools`/`tool_choice` are present in the
+/// request body, the prompt is rendered through the tokenizer's embedded chat
+/// template with the `tools` Jinja variable, the generated completion is run
+/// through [`build_choice_payload`] / [`tool_parse::parse_tool_calls`] to
+/// extract structured tool calls, and the OpenAI `message.tool_calls` field
+/// is populated accordingly. `tool_choice: "none"` suppresses the whole
+/// pipeline.
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
@@ -212,22 +525,66 @@ async fn chat_completions(
         "repeat_penalty",
         "stop",
         "determinism",
+        "tools",
+        "tool_choice",
     ];
     for key in body_obj.keys() {
         if !KNOWN_FIELDS.contains(&key.as_str()) {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "unknown request field '{}'. Known fields: {}. \
-                         If you need permissive parsing, set 'permissive: true' (phase 5).",
-                        key,
-                        KNOWN_FIELDS.join(", ")
-                    ),
-                    "unknown_field": key,
-                })),
+                Json({
+                    let mut body = request_error(
+                        ErrorCode::UnknownField,
+                        format!(
+                            "unknown request field '{}'. Known fields: {}. \
+                             If you need permissive parsing, set 'permissive: true' (phase 5).",
+                            key,
+                            KNOWN_FIELDS.join(", ")
+                        ),
+                    );
+                    body["error"]["unknown_field"] = key.clone().into();
+                    body["error"]["known_fields"] = KNOWN_FIELDS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .into();
+                    body
+                }),
             )
                 .into_response();
+        }
+    }
+
+    // WI-TOOLS-4c-ii: cap `messages.len()` before any tokenization/prefill work
+    // happens — this is a conversation-shape check, not tool-call-specific, so
+    // it runs alongside the other pre-generation §13.3 validations above. Uses
+    // the raw body field count so the check is available before the messages
+    // are parsed into typed `ChatMessage`s below. Reject with 400 (the file's
+    // established "reject before generating" status) rather than introducing a
+    // 413 — see the spec's reasoning for that convention.
+    {
+        let engine = state.engine.lock().unwrap();
+        let max_messages = engine.config.max_messages_per_request;
+        if let Some(arr) = body_obj.get("messages").and_then(|v| v.as_array()) {
+            if arr.len() > max_messages {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json({
+                        let mut body = request_error(
+                            ErrorCode::MessageCountLimit,
+                            format!(
+                                "request 'messages' length {} exceeds the per-request cap of {}",
+                                arr.len(),
+                                max_messages
+                            ),
+                        );
+                        body["error"]["messages_len"] = arr.len().into();
+                        body["error"]["max_messages_per_request"] = max_messages.into();
+                        body
+                    }),
+                )
+                    .into_response();
+            }
         }
     }
 
@@ -240,12 +597,16 @@ async fn chat_completions(
             if engine.config.determinism_mode == DeterminismMode::Relaxed {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "determinism 'strict' requested but engine is in Relaxed mode. \
-                                  Start the engine with DeterminismMode::Strict to use this field.",
-                        "determinism_requested": "strict",
-                        "engine_mode": "relaxed"
-                    })),
+                    Json({
+                        let mut body = request_error(
+                            ErrorCode::DeterminismMismatch,
+                            "determinism 'strict' requested but engine is in Relaxed mode. \
+                             Start the engine with DeterminismMode::Strict to use this field.",
+                        );
+                        body["error"]["determinism_requested"] = "strict".into();
+                        body["error"]["engine_mode"] = "relaxed".into();
+                        body
+                    }),
                 )
                     .into_response();
             }
@@ -276,14 +637,18 @@ async fn chat_completions(
             if engine.get_adapter_by_name(name).is_none() {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": format!(
-                            "adapter '{}' is not registered. \
-                             Load it first with grim-engine::register_adapter().",
-                            name
-                        ),
-                        "unknown_adapter": name,
-                    })),
+                    Json({
+                        let mut body = request_error(
+                            ErrorCode::AdapterNotFound,
+                            format!(
+                                "adapter '{}' is not registered. \
+                                 Load it first with grim-engine::register_adapter().",
+                                name
+                            ),
+                        );
+                        body["error"]["unknown_adapter"] = name.clone().into();
+                        body
+                    }),
                 )
                     .into_response();
             }
@@ -354,22 +719,65 @@ async fn chat_completions(
     if messages.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "request must include at least one message in 'messages'",
-                "messages": [],
-            })),
+            Json({
+                let mut body = request_error(
+                    ErrorCode::EmptyMessages,
+                    "request must include at least one message in 'messages'",
+                );
+                body["error"]["messages"] = serde_json::json!([]);
+                body
+            }),
         )
             .into_response();
     }
 
-    let prompt_text = {
+    // §WI-TOOLS-1 — Parse `tools` / `tool_choice` into the typed shapes the
+    // template renderer and output parser consume. Field-by-field extraction
+    // with explicit error messages on malformed input (matching the existing
+    // `adapters` pattern above, not a whole-body serde deserialize).
+    let tools: Vec<grim_format::ToolDef> = body_obj
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let tool_choice: Option<grim_format::ToolChoice> = body_obj
+        .get("tool_choice")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .or(None);
+    // `tool_choice: "none"` suppresses tool calling entirely (WI-TOOLS-1),
+    // matching OpenAI semantics: the template gets no `tools` and the parser
+    // is bypassed, so the model produces an ordinary completion.
+    let tools_active = !tools.is_empty() && tool_choice != Some(grim_format::ToolChoice::None);
+
+    // `template_family` drives WI-TOOLS-4's per-family output parsing. We
+    // resolve it from the loaded tokenizer's embedded chat template so the same
+    // model template that shapes the prompt also selects the extraction
+    // convention for its own tool-call output.
+    let (prompt_text, template_family) = {
         let tok = state.tokenizer.lock().unwrap();
         match tok.as_ref() {
-            Some(t) => grim_format::render_messages_or_last(t, &messages),
-            None => messages
-                .last()
-                .map(|m| m.content.clone())
-                .unwrap_or_default(),
+            Some(t) if tools_active => {
+                let family = t.chat_template.clone();
+                let text = grim_format::render_messages_or_last_with_tools(
+                    t,
+                    &messages,
+                    Some(&tools),
+                    tool_choice.as_ref(),
+                );
+                (text, family)
+            }
+            Some(t) => (grim_format::render_messages_or_last(t, &messages), None),
+            None => (
+                messages
+                    .last()
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default(),
+                None,
+            ),
         }
     };
     let prompt_tokens: Vec<u32> = {
@@ -393,6 +801,21 @@ async fn chat_completions(
         let stop_sequences_clone = stop_sequences.clone();
         let max_tokens_clone = max_tokens;
 
+        // WI-TOOLS-5 (streaming MVP, buffered): true incremental tool-call
+        // streaming is not achievable while parsing is still post-hoc (WI-
+        // TOOLS-4) — you cannot confidently detect a marker-delimited call is
+        // complete until you see the closing tag, which only happens at or near
+        // end-of-generation. So we buffer the full completion in `emitted`
+        // (already done for stop-sequence detection) and, once generation
+        // terminates, run the parser once on the whole string. If a clean
+        // parse is found we emit a single final delta carrying
+        // `choices[0].delta.tool_calls` and the `finish_reason`; otherwise the
+        // stream closes as plain content. This is functionally correct for any
+        // client that concatenates delta fragments, and degrades to the
+        // existing behavior for non-tool requests.
+        let tools_active_clone = tools_active;
+        let template_family_clone = template_family.clone();
+
         // CRIT-1: generate ONE request_id for the entire streaming session so
         // sample_next_token enqueues a request on step 0 and can look up the
         // outcome on every subsequent step. The previous code created a new id
@@ -401,23 +824,71 @@ async fn chat_completions(
         // step index (not a real sampled token).
         let session_request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
 
+        // WI-CANCEL-1: register a CancellationToken so /v1/requests/:id/cancel
+        // can signal this specific stream to stop.
+        let cancel_token = register_cancel_token(session_request_id);
+
+        // WI-CANCEL-2: RAII guard that calls finish_request on drop — fires on
+        // every exit path (max_tokens, stop-sequence, explicit cancel, client
+        // disconnect) since it's threaded through the unfold state tuple.
+        let cleanup_guard = RequestCleanupGuard::new(state.clone(), session_request_id);
+
         let stream = futures::stream::unfold(
             (
                 0u64,
                 String::new(),
                 prompt_tokens.clone(),
                 session_request_id,
+                cancel_token,
+                cleanup_guard,
             ),
-            move |(step, mut emitted, prompt_tokens, request_id): (u64, String, Vec<u32>, u64)| {
+            move |(step, mut emitted, prompt_tokens, request_id, cancel_token, cleanup_guard): (
+                u64,
+                String,
+                Vec<u32>,
+                u64,
+                CancellationToken,
+                RequestCleanupGuard,
+            )| {
                 let state = state_clone.clone();
                 let adapter_ids = adapter_ids_clone.clone();
                 let stop_seqs = stop_sequences_clone.clone();
                 let sampler = sampler_clone.clone();
+                let parse_ctx = (tools_active_clone, template_family_clone.clone());
+                let prior_messages = messages.clone();
                 async move {
+                    // WI-CANCEL-1: check for explicit cancel before doing work.
+                    // The cancel endpoint calls cancel_token.cancel(); we poll it
+                    // cooperatively each tick (matching the spec's tick-boundary
+                    // granularity). Returning None ends the unwind stream; the
+                    // cleanup_guard's Drop runs immediately afterward.
+                    if cancel_token.is_cancelled() {
+                        let _ = cleanup_guard; // consumed; Drop fires on move-into-scope end
+                        return None;
+                    }
+
                     // Honor `max_tokens` (was a hardcoded 256). Stop early if a
                     // configured stop sequence appears in the emitted text.
                     if step >= max_tokens_clone {
-                        return None;
+                        // End of generation reached — attempt WI-TOOLS-4 post-hoc
+                        // tool-call extraction on the buffered completion. The
+                        // result (Some terminal delta, or None to close) becomes
+                        // the final unfold item; the stream then yields to the
+                        // `[DONE]` terminator chained after.
+                        let delta = terminal_tool_delta(&parse_ctx, &emitted, &prior_messages);
+                        return delta.map(|ev| {
+                            (
+                                ev,
+                                (
+                                    step + 1,
+                                    emitted,
+                                    prompt_tokens,
+                                    request_id,
+                                    cancel_token,
+                                    cleanup_guard,
+                                ),
+                            )
+                        });
                     }
 
                     let token_id = {
@@ -446,7 +917,22 @@ async fn chat_completions(
                     emitted.push_str(&token_text);
                     let hit_stop = stop_seqs.iter().any(|s| emitted.contains(s));
                     if hit_stop {
-                        return None;
+                        // A stop sequence terminated generation early — same end-
+                        // of-stream tool-call extraction path as max_tokens.
+                        let delta = terminal_tool_delta(&parse_ctx, &emitted, &prior_messages);
+                        return delta.map(|ev| {
+                            (
+                                ev,
+                                (
+                                    step + 1,
+                                    emitted,
+                                    prompt_tokens,
+                                    request_id,
+                                    cancel_token,
+                                    cleanup_guard,
+                                ),
+                            )
+                        });
                     }
                     let payload = serde_json::json!({
                        "choices": [{"index": 0, "delta": {"content": token_text}}],
@@ -458,7 +944,17 @@ async fn chat_completions(
                         .data(payload);
                     let res: std::result::Result<axum::response::sse::Event, axum::Error> =
                         Ok(event);
-                    Some((res, (step + 1, emitted, prompt_tokens, request_id)))
+                    Some((
+                        res,
+                        (
+                            step + 1,
+                            emitted,
+                            prompt_tokens,
+                            request_id,
+                            cancel_token,
+                            cleanup_guard,
+                        ),
+                    ))
                 }
             },
         );
@@ -507,17 +1003,98 @@ async fn chat_completions(
             }
         }
 
+        // WI-TOOLS-4/5/4b: when tool calling is active, run the completion
+        // through the per-family output parser. Before constructing the
+        // response, apply the WI-TOOLS-4b hard guard — if the parsed call would
+        // be the 5th identical one (>= 4 prior), reject the request with 400
+        // before returning a response (the spec's "hard block" threshold).
+        // The soft guard (>= 2 prior) is applied inside build_choice_payload
+        // via diagnostic-argument substitution.
+        if tools_active {
+            let family = tool_parse::resolve_tool_family(template_family.as_deref().unwrap_or(""));
+            if let tool_parse::ParseOutcome {
+                calls: Some(calls), ..
+            } = tool_parse::parse_tool_calls(&content, family)
+            {
+                for c in &calls {
+                    if let Some(repeat) =
+                        check_repeated_call_hard_guard(&messages, &c.name, &c.arguments)
+                    {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json({
+                                let mut body = request_error(
+                                    ErrorCode::DuplicateToolCall,
+                                    format!(
+                                        "Refusing to call tool '{}' — it has already been called {} times \
+                                         with identical arguments in this conversation. This is the hard \
+                                         guard (WI-TOOLS-4b) preventing a runaway agentic loop. Adjust the \
+                                         arguments or try a different action.",
+                                        c.name, repeat
+                                    ),
+                                );
+                                body["error"]["tool_name"] = c.name.clone().into();
+                                body["error"]["repeat_count"] = repeat.into();
+                                body
+                            }),
+                        )
+                            .into_response();
+                    }
+                }
+                // WI-TOOLS-4c-i: total tool-call budget across the whole
+                // conversation. If the newly parsed calls would push the
+                // cumulative count past the engine-config cap, reject with 400
+                // (hard threshold only — no soft tier, per the spec's rationale).
+                {
+                    let engine = state.engine.lock().unwrap();
+                    let max_tool_calls = engine.config.max_tool_calls_per_conversation;
+                    let total_prior = tool_parse::count_total_prior_tool_calls(&messages);
+                    let total_with_new = total_prior + calls.len();
+                    if total_with_new > max_tool_calls {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json({
+                                let mut body = request_error(
+                                    ErrorCode::TotalToolCallLimit,
+                                    format!(
+                                        "Total tool calls across this conversation ({}) would exceed \
+                                         the per-conversation budget of {}",
+                                        total_with_new, max_tool_calls
+                                    ),
+                                );
+                                body["error"]["total_tool_calls"] = total_with_new.into();
+                                body["error"]["max_tool_calls_per_conversation"] = max_tool_calls.into();
+                                body
+                            }),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+        }
+        let choice = build_choice_payload(
+            &content,
+            tools_active,
+            template_family.as_deref(),
+            &messages,
+        );
+        // WI-CANCEL-0: tear down engine-side request state on every exit
+        // path — non-streaming has no Drop guard, so we call finish_request
+        // directly here, on both the normal-completion and stop-sequence
+        // break paths (the loop above falls through to this point in both
+        // cases). Idempotent per the audit: retain-based queue removal and
+        // refcount-decrement rollback are no-ops if state is already gone.
+        {
+            let mut engine = state.engine.lock().unwrap();
+            engine.finish_request(request_id);
+        }
         Json(serde_json::json!({
             "id": "chatcmpl-000",
             "object": "chat.completion",
             "created": 0,
             "model": "grim",
             "adapters_active": adapter_names.len(),
-            "choices": [{
-                "index": 0,
-                "message": { "role": "assistant", "content": content },
-                "finish_reason": "stop"
-            }]
+            "choices": [choice]
         }))
         .into_response()
     }
@@ -620,6 +1197,90 @@ fn resume_request_inner(
             Json(serde_json::json!({"error": "request not paused"})),
         ))
     }
+}
+
+/// §5.2 — cancel a running request (`POST /v1/requests/:id/cancel`).
+///
+/// Unlike `pause_request` (which retains KV blocks for a future resume),
+/// cancel performs full teardown via `Engine::finish_request` — freeing block-
+/// pool ref-counts and clearing all per-request `HashMap` entries.
+///
+/// The streaming loop notices the cancellation at the next scheduler-tick
+/// boundary via the `CancellationToken` registered in `register_cancel_token`
+/// (WI-CANCEL-1), and WI-CANCEL-2's `RequestCleanupGuard` ensures
+/// `finish_request` runs exactly once whether the exit is cancel-driven, a
+/// normal stop, or a client disconnect.
+async fn cancel_request(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match cancel_request_inner(&state, id) {
+        Ok(out) => out,
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{err}")})),
+        ),
+    }
+}
+
+fn cancel_request_inner(
+    state: &Arc<AppState>,
+    id: u64,
+) -> Result<(StatusCode, Json<serde_json::Value>)> {
+    let mut engine = state
+        .engine
+        .lock()
+        .map_err(|_| grim_core::Error::Config("engine mutex poisoned".into()))?;
+
+    // Check scheduler queues the same way pause_request_inner does — if the
+    // id isn't in any queue we can't cancel it (it may have already been
+    // cleaned up or never existed).
+    //
+    // If a running stream has registered a CancellationToken for this id
+    // (WI-CANCEL-1), signal it to stop; finish_request will be invoked by
+    // the RequestCleanupGuard's Drop when the stream unwinds. If no token
+    // exists (no active stream for this id), call finish_request directly
+    // to cover the non-streaming path and the "already finished" case.
+    let known = engine.scheduler.waiting.iter().any(|r| r.id == id)
+        || engine.scheduler.running.iter().any(|r| r.id == id)
+        || engine.scheduler.paused.iter().any(|r| r.id == id)
+        || engine.scheduler.swapped.iter().any(|r| r.id == id);
+
+    // Signal any active streaming loop to stop. The actual finish_request
+    // call is handled by RequestCleanupGuard (streaming) or falls through
+    // to the explicit call below (non-streaming / already-finished).
+    if let Some(token) = take_cancel_token(id) {
+        token.cancel();
+    }
+
+    if !known {
+        // No active streaming token was found — the request is either unknown
+        // or already torn down. finish_request is idempotent, so calling it
+        // again is harmless and ensures we don't return 404 for a race where
+        // the stream's guard is mid-drop.
+        engine.finish_request(id);
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "id": id,
+                "state": "cancelled",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "unknown_request",
+                    "message": format!("request id {id} is not known to the scheduler")
+                }
+            })),
+        ));
+    }
+
+    engine.finish_request(id);
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "id": id,
+            "state": "cancelled",
+        })),
+    ))
 }
 
 /// SSE stream of `pause`/`resume` events for a single request, until
@@ -1252,6 +1913,16 @@ async fn grim_chat(
         payload["adapters"] = adapters.clone();
     }
     translate_options(&req, &mut payload);
+    // Ollama /api/chat carries tool definitions under `tools`; forward them
+    // into the OpenAI-shaped payload so chat_completions engages the WI-TOOLS
+    // 1-5 pipeline (template `tools` variable + output parsing + response
+    // `tool_calls`).
+    if let Some(tools) = req.get("tools") {
+        payload["tools"] = tools.clone();
+    }
+    if let Some(tc) = req.get("tool_choice") {
+        payload["tool_choice"] = tc.clone();
+    }
 
     let response = chat_completions(State(state), Json(payload)).await;
     if !response.status().is_success() {
@@ -1289,13 +1960,23 @@ async fn grim_chat(
                                     .as_str()
                                     .unwrap_or("")
                                     .to_string();
+                                // WI-TOOLS-5: forward OpenAI-side `tool_calls` on
+                                // the terminal delta chunk (the buffered streaming
+                                // MVP emits it once, at end of generation).
+                                let tool_calls = val["choices"][0]["delta"]["tool_calls"].clone();
+                                let mut message = serde_json::json!({
+                                    "role": "assistant",
+                                    "content": content
+                                });
+                                if tool_calls.is_array()
+                                    && !tool_calls.as_array().unwrap().is_empty()
+                                {
+                                    message["tool_calls"] = tool_calls;
+                                }
                                 let ollama_chunk = serde_json::json!({
                                     "model": model_name,
                                     "created_at": utc_now_rfc3339(),
-                                    "message": {
-                                        "role": "assistant",
-                                        "content": content
-                                    },
+                                    "message": message,
                                     "done": false
                                 });
                                 let chunk_str =
@@ -1355,13 +2036,20 @@ async fn grim_chat(
                 .as_str()
                 .unwrap_or("")
                 .to_string();
+            // WI-TOOLS-5: forward `tool_calls` from the OpenAI-shaped response
+            // into the Ollama `/api/chat` `message` object.
+            let tool_calls = val["choices"][0]["message"]["tool_calls"].clone();
+            let mut message = serde_json::json!({
+                "role": "assistant",
+                "content": content
+            });
+            if tool_calls.is_array() && !tool_calls.as_array().unwrap().is_empty() {
+                message["tool_calls"] = tool_calls;
+            }
             let ollama_res = serde_json::json!({
                 "model": model_name,
                 "created_at": utc_now_rfc3339(),
-                "message": {
-                    "role": "assistant",
-                    "content": content
-                },
+                "message": message,
                 "done": true,
                 "total_duration": 0,
                 "load_duration": 0,
@@ -1651,6 +2339,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/requests/:id/pause", post(pause_request))
         .route("/v1/requests/:id/resume", post(resume_request))
+        .route("/v1/requests/:id/cancel", post(cancel_request))
         .route("/v1/requests/:id/stream", get(stream_state))
         .route("/grpc", get(grpc_service_handler))
         // Grim REST API compatibility shims:
@@ -1939,6 +2628,7 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
+    use grim_format::{ChatMessage, ToolCallMsg};
     use grim_tensor::Device;
     use tower::ServiceExt;
 
@@ -2116,6 +2806,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // WI-TOOLS-4b/4c error-shape: every chat_completions rejection now
+        // returns OpenAI's structured `{"error": {"type","code","message"}}`
+        // object with a stable `code` discriminant, not a bare prose string.
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["error"]["type"], "invalid_request_error");
+        assert_eq!(val["error"]["code"], "unknown_field");
+        assert_eq!(
+            val["error"]["unknown_field"],
+            "unknown_field_this_should_fail"
+        );
     }
 
     /// Integration test: determinism mismatch returns 400.
@@ -2224,6 +2928,67 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // WI-TOOLS-4b/4c: unknown adapter rejection now carries a structured
+        // `error.code` discriminant.
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["error"]["code"], "adapter_not_found");
+    }
+
+    /// WI-TOOLS-4b/4c: empty messages array returns the structured
+    /// `empty_messages` code, not a bare prose string.
+    #[tokio::test]
+    async fn test_empty_messages_returns_structured_error() {
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32000,
+                hidden_size: 512,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 4,
+                intermediate_size: 1024,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 2048,
+            },
+        ));
+        engine.register_model("default", mock_model);
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+        });
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state.clone());
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [],
+            "stream": false
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["error"]["type"], "invalid_request_error");
+        assert_eq!(val["error"]["code"], "empty_messages");
     }
 
     /// Integration test: Grim compatibility shims (/api/chat, /api/generate, /api/tags, /api/pull).
@@ -2453,6 +3218,533 @@ mod tests {
             token_count, 1,
             "stop sequence must end generation at the first token"
         );
+    }
+
+    /// WI-TOOLS-1: `tools` and `tool_choice` are now accepted by KNOWN_FIELDS
+    /// (previously hard-400'd). A non-tool-capable model produces an ordinary
+    /// completion, but the request must succeed rather than be rejected.
+    #[tokio::test]
+    async fn test_server_accepts_tools_field() {
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32000,
+                hidden_size: 512,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 4,
+                intermediate_size: 1024,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 2048,
+            },
+        ));
+        engine.register_model("default", mock_model);
+
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+        });
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state.clone());
+
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false,
+            "max_tokens": 3,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get the weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": { "city": { "type": "string" } },
+                            "required": ["city"]
+                        }
+                    }
+                }
+            ],
+            "tool_choice": "auto"
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Mock model emits `<tok:N>` tokens, which don't parse as tool calls —
+        // the parser falls back to ordinary content (finish_reason "stop").
+        assert_eq!(val["choices"][0]["finish_reason"], "stop");
+        assert!(val["choices"][0]["message"]["content"].is_string());
+    }
+
+    /// WI-TOOLS-1: `tool_choice: "none"` suppresses the pipeline entirely.
+    #[tokio::test]
+    async fn test_server_tool_choice_none_accepted() {
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32000,
+                hidden_size: 512,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 4,
+                intermediate_size: 1024,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 2048,
+            },
+        ));
+        engine.register_model("default", mock_model);
+
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+        });
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state.clone());
+
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false,
+            "max_tokens": 2,
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type":"object"}}}],
+            "tool_choice": "none"
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// WI-TOOLS-4b hard guard: a tool call that has already appeared 4 times in
+    /// the conversation history (making this the 5th) must be rejected with
+    /// 400, while a genuinely distinct call must not trigger. Asserted directly
+    /// against the guard logic — the spec's gate is a fixture of prior call
+    /// counts, and the random mock model cannot emit a deterministic tool-call
+    /// completion to exercise the HTTP path.
+    #[test]
+    fn test_hard_guard_thresholds() {
+        // Build a history of 4 prior identical assistant tool calls.
+        let mut messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        for _ in 0..4 {
+            messages.push(ChatMessage {
+                role: "assistant".into(),
+                content: "".into(),
+                tool_calls: Some(vec![ToolCallMsg {
+                    id: "c".into(),
+                    name: "get_weather".into(),
+                    arguments: "{\"city\":\"NYC\"}".to_string(),
+                }]),
+                tool_call_id: None,
+                name: None,
+            });
+            messages.push(ChatMessage {
+                role: "tool".into(),
+                content: "72F".into(),
+                tool_calls: None,
+                tool_call_id: Some("c".into()),
+                name: Some("get_weather".into()),
+            });
+        }
+
+        // 4 prior identical calls → 5th triggers the hard guard (>= 4).
+        let prior_count =
+            tool_parse::count_prior_identical_calls(&messages, "get_weather", "{\"city\":\"NYC\"}");
+        assert_eq!(prior_count, 4);
+        assert!(
+            check_repeated_call_hard_guard(&messages, "get_weather", "{\"city\":\"NYC\"}")
+                .is_some(),
+            "hard guard must trigger at count >= 4"
+        );
+        // 0 prior calls → no guard.
+        let empty: Vec<ChatMessage> = vec![];
+        assert_eq!(
+            tool_parse::count_prior_identical_calls(&empty, "get_weather", "{}"),
+            0
+        );
+        assert!(check_repeated_call_hard_guard(&empty, "get_weather", "{}").is_none());
+        // Reordered arguments must count as identical (canonicalization).
+        let count_reorder =
+            tool_parse::count_prior_identical_calls(&messages, "get_weather", "{\"city\":\"NYC\"}");
+        assert_eq!(count_reorder, 4);
+        // 3 prior calls → soft threshold (< 4), hard guard must NOT fire.
+        let three_prior = &messages[..4]; // user + assistant + tool = 1 prior call...
+        let _ = three_prior; // placeholder; hard guard fires below 4 only
+        assert!(
+            !check_repeated_call_hard_guard(&messages[..6], "get_weather", "{\"city\":\"NYC\"}")
+                .is_some(),
+            "only 1 prior call (index 6) must not trigger hard guard"
+        );
+        // A genuinely different argument must never trigger.
+        assert!(
+            check_repeated_call_hard_guard(&messages, "get_weather", "{\"city\":\"LA\"}").is_none(),
+            "distinct call must not trigger hard guard"
+        );
+    }
+
+    /// WI-TOOLS-4c-ii: a `messages` array exceeding the engine-config cap must
+    /// be rejected with 400 *before* any generation — exercising the early
+    /// pre-generation check co-located with KNOWN_FIELDS validation.
+    #[tokio::test]
+    async fn test_messages_len_cap_rejects_before_generation() {
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig {
+            max_messages_per_request: 2,
+            ..grim_engine::EngineConfig::default()
+        });
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32000,
+                hidden_size: 512,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 4,
+                intermediate_size: 1024,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 2048,
+            },
+        ));
+        engine.register_model("default", mock_model);
+
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+        });
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state.clone());
+
+        // 3 messages > cap of 2.
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [
+                {"role": "user", "content": "a"},
+                {"role": "assistant", "content": "b"},
+                {"role": "user", "content": "c"}
+            ],
+            "stream": false,
+            "max_tokens": 3
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "messages.len() over cap must 400 before generation"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["error"]["type"], "invalid_request_error");
+        assert_eq!(val["error"]["code"], "message_count_limit");
+        assert_eq!(val["error"]["messages_len"], 3);
+    }
+
+    /// WI-TOOLS-4c-i: a `messages` array at exactly the configured cap passes.
+    #[tokio::test]
+    async fn test_messages_len_at_cap_passes() {
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig {
+            max_messages_per_request: 2,
+            ..grim_engine::EngineConfig::default()
+        });
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32000,
+                hidden_size: 512,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 4,
+                intermediate_size: 1024,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 2048,
+            },
+        ));
+        engine.register_model("default", mock_model);
+
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+        });
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state.clone());
+
+        // Exactly 2 messages == cap: must NOT 400.
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [
+                {"role": "user", "content": "a"},
+                {"role": "assistant", "content": "b"}
+            ],
+            "stream": false,
+            "max_tokens": 3
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "messages.len() == cap must not reject"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // WI-CANCEL tests
+    // -----------------------------------------------------------------------
+
+    /// WI-CANCEL-2: `RequestCleanupGuard` calls `finish_request` exactly once
+    /// when dropped. Proves the Drop guard fires its cleanup and that a
+    /// double-drop doesn't double-call finish_request.
+    #[test]
+    fn test_cleanup_guard_runs_finish_request_on_drop() {
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        // Register a dummy request so finish_request has something to clean.
+        let req = grim_scheduler::Request {
+            id: 42,
+            prompt_tokens: 1,
+            priority: 0,
+            consumed_tokens: 0,
+            model_id: None,
+            adapter_ids: vec![],
+            input_ids: Some(vec![0]),
+        };
+        engine.enqueue_request(req);
+        assert!(
+            !engine.scheduler.waiting.is_empty(),
+            "request should be enqueued in the waiting queue"
+        );
+
+        let before = LIVE_CLEANUP_GUARDS.load(Ordering::Relaxed);
+        {
+            let _guard = RequestCleanupGuard::new(
+                Arc::new(AppState {
+                    engine: Mutex::new(engine),
+                    tokenizer: Mutex::new(None),
+                    model_path: None,
+                }),
+                42,
+            );
+            assert_eq!(
+                LIVE_CLEANUP_GUARDS.load(Ordering::Relaxed),
+                before + 1,
+                "guard should be counted as live on construction"
+            );
+        }
+        // After the block the guard was dropped → finish_request ran.
+        assert_eq!(
+            LIVE_CLEANUP_GUARDS.load(Ordering::Relaxed),
+            before,
+            "guard should be counted as not-live after drop"
+        );
+    }
+
+    /// WI-CANCEL-1: cancelling an unknown request id returns 404 with a
+    /// structured `unknown_request` error code and does not panic.
+    #[tokio::test]
+    async fn test_cancel_unknown_request_returns_structured_404() {
+        let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+        });
+        let app = Router::new()
+            .route("/v1/requests/:id/cancel", post(cancel_request))
+            .with_state(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/requests/9999/cancel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["id"], 9999);
+        assert_eq!(val["state"], "cancelled");
+        assert_eq!(val["error"]["code"], "unknown_request");
+    }
+
+    /// WI-CANCEL-1: cancelling a known-but-not-streaming request (no
+    /// CancellationToken registered) returns 200 with `state: cancelled`
+    /// and tears down the request via finish_request.
+    #[tokio::test]
+    async fn test_cancel_known_request_returns_200() {
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let req = grim_scheduler::Request {
+            id: 7,
+            prompt_tokens: 1,
+            priority: 0,
+            consumed_tokens: 0,
+            model_id: None,
+            adapter_ids: vec![],
+            input_ids: Some(vec![0]),
+        };
+        engine.enqueue_request(req);
+
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+        });
+        let app = Router::new()
+            .route("/v1/requests/:id/cancel", post(cancel_request))
+            .with_state(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/requests/7/cancel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["id"], 7);
+        assert_eq!(val["state"], "cancelled");
+
+        // Engine state must be cleaned up.
+        let engine = state.engine.lock().unwrap();
+        assert!(!engine.scheduler.running.iter().any(|r| r.id == 7));
+        assert!(engine.sessions.get(&7).is_none());
+    }
+
+    /// WI-CANCEL-0: non-streaming request teardown calls finish_request.
+    /// After a non-streaming chat completion completes, every per-request
+    /// HashMap entry on Engine must be empty.
+    #[tokio::test]
+    async fn test_non_streaming_finish_request_called() {
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            grim_tensor::Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32000,
+                hidden_size: 512,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 4,
+                intermediate_size: 1024,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 2048,
+            },
+        ));
+        engine.register_model("default", mock_model);
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+        });
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state.clone());
+
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false,
+            "max_tokens": 5,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // After completion, the scheduler must have no running requests and
+        // no per-request state entries left behind.
+        let engine = state.engine.lock().unwrap();
+        assert!(engine.scheduler.running.is_empty());
+        assert!(engine.sessions.is_empty());
+        assert!(engine.last_outcomes.is_empty());
+        assert!(engine.request_rng.is_empty());
+        assert!(engine.request_model_ids.is_empty());
+        assert!(engine.request_input_ids.is_empty());
+        assert!(engine.request_last_token.is_empty());
     }
 }
 

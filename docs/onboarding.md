@@ -36,7 +36,7 @@ cd Grim
 
 ## Step 2: Build the project
 
-Build all 31 crates in release mode:
+Build all 28 crates in release mode:
 
 ```bash
 cargo build --release
@@ -94,17 +94,46 @@ cargo test -p <crate-name>
 
 ```
 grim/
-├── Cargo.toml              # Workspace definition
+├── Cargo.toml              # Workspace definition (28 crates)
 ├── crates/                 # Individual crates
-│   ├── grim-tensor/        # Core tensor abstractions
+│   ├── grim-tensor/        # Core tensor abstractions (DType, Device, Shape)
+│   ├── grim-tensor-graph/  # Fusion patterns for tensor operations
+│   ├── grim-quant/         # Weight quantization (Q4_K, Q8_0, NF4, FP8, IQ)
+│   ├── grim-format/        # GGUF/Safetensors/.grim I/O
+│   ├── grim-backend-cpu/   # CPU backend (SIMD, OxiBLAS)
+│   ├── grim-backend-rocm/  # ROCm/HIP backend (primary GPU target)
+│   ├── grim-backend-cuda/  # CUDA backend (cuBLAS)
+│   ├── grim-backend-vulkan/# Vulkan backend
+│   ├── grim-backend-metal/ # Metal backend (Apple)
+│   ├── grim-nn/            # Neural network modules (Linear, Embedding, etc.)
 │   ├── grim-core/          # Model traits, Session, KV cache, Sampler
-│   ├── grim-engine/        # Runtime orchestrator
-│   ├── grim-server/        # HTTP serving layer
+│   ├── grim-models/        # Model architecture crates
+│   │   ├── transformer/    # Transformer models (LLaMA, Mistral, etc.)
+│   │   ├── mamba/          # Mamba/SSM models
+│   │   ├── vision/         # Vision encoder models
+│   │   ├── audio/          # Audio encoder models
+│   │   └── diffusion/      # Diffusion model architectures
+│   ├── grim-memory/        # Paged KV cache pool, prefix sharing, spilling
+│   ├── grim-kvquant/       # Runtime KV cache compression (§5.4)
+│   ├── grim-kvtransport/   # Tiered KV transport (GPU→RAM→NVMe)
+│   ├── grim-scheduler/     # Continuous-batching scheduler (3-queue)
+│   ├── grim-speculative/   # Default-on speculative decoding (§5.3)
+│   ├── grim-autograd/      # LoRA/QLoRA backward pass tracing
+│   ├── grim-engine/        # Runtime orchestrator (Engine, tick)
+│   ├── grim-server/        # HTTP serving layer (OpenAI-compatible)
 │   ├── grim-cli/           # Command-line interface
-│   └── ... (26 more crates)
+│   ├── grim-disagg/        # Disaggregation layer (prefill/decode split)
+│   ├── grim-plugin/        # Plugin system (dylib + WASM)
+│   └── grim-garage/        # Training dashboard web app
 ├── docs/                   # Documentation
 │   ├── onboarding.md       # This file
 │   ├── architecture.md     # Architecture overview
+│   ├── cli.md              # CLI reference
+│   ├── configuration.md    # Configuration reference
+│   ├── data-model.md       # Data structures and formats
+│   ├── glossary.md         # Domain terms
+│   ├── integrations.md     # External integrations
+│   ├── troubleshooting.md  # Common errors and fixes
 │   └── howto/              # How-to guides
 └── models/                 # Local model cache (created on first run)
 ```
@@ -136,9 +165,16 @@ codegen-units = 1
 Key feature flags:
 
 - `rocm` - Enables the ROCm backend
-- `rocm-aiter` - ROCm AI tensor operations
-- `rocm-kernel-macros` - ROCm kernel macros
-- `wasm-sandbox` - WASM plugin sandboxing
+- `rocm` - Enables the ROCm backend (workspace-level)
+- `rocm-aiter` - ROCm AI tensor operations (grim-backend-rocm)
+- `rocm-profile` - ROCm profiling support (grim-backend-rocm)
+- `rccl` - ROCm collective communications (grim-backend-rocm)
+- `cubecl` - Cubecl HIP runtime integration (grim-backend-rocm)
+- `rocm-mem` - ROCm memory allocation (grim-nn)
+- `cuda-mem` - CUDA memory allocation (grim-nn)
+- `vulkan-mem` - Vulkan memory allocation (grim-nn)
+- `metal-mem` - Metal memory allocation (grim-nn)
+- `wasm-sandbox` - WASM plugin sandboxing (grim-plugin)
 - `gpu-selection` - All GPU backends enabled
 
 Enable features during build:
@@ -182,4 +218,4 @@ TODO: add maintainer contact
 | Format check | `cargo fmt --check` |
 | Run specific crate tests | `cargo test -p <crate-name>` |
 | Enable ROCm features | `cargo build --features rocm` |
-| Run GPU tests | `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --features rocm-aiter` |
+| Run GPU tests | `GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --features rocm-aiter,rccl` |

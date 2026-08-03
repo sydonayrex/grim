@@ -1,64 +1,102 @@
 # grim-kvtransport
 
-Tiered KV Cache local transport and spillage (GPU -> Host RAM -> NVMe). §5.5.
+Tiered KV cache local transport and spillage (GPU → Host RAM → NVMe). §5.5.
 
 ## Purpose
 
-Manages KV cache data movement between storage tiers:
-- GPU VRAM (fastest access)
-- Host RAM (spill from GPU)
-- NVMe SSD (spill from RAM for very large contexts)
-
-Enables long-context inference by spillover to slower storage tiers.
+Manages KV block data movement between storage tiers: GPU VRAM, Host RAM, and local NVMe scratch. Integrates with `grim-memory`'s `KvBlockPool` as the spill manager invoked when refcount-zero blocks need demotion. Also provides `NvmeWeightStreamer` for streaming model weights that exceed VRAM/DRAM, and `NetworkKvClient` for cross-node KV transfer in disaggregated scenarios.
 
 ## Boundaries
 
-- Does not perform computation or compression
-- Does not manage cache allocation — see `grim-memory`
-- Does not define the KV cache interface — see `grim-core::KvCache`
+- Does **not** perform computation or compression — only data movement.
+- Does **not** manage cache allocation — delegates to `grim-memory`.
+- Does **not** define the `KvCache` trait — see `grim-core`.
 
 ## Dependency Graph
 
 ```mermaid
 graph LR
-    A[grim-kvtransport] -->|DType| B[grim-tensor]
-    A -->|KvCache trait| C[grim-core]
-    
+    A[grim-kvtransport] --> B[grim-tensor]
+    A --> C[grim-core]
+
+    subgraph "reverse deps"
+        D1[grim-memory]
+        D2[grim-disagg]
+    end
+
+    D1 --> A
+    D2 --> A
+
     style A fill:#e1f5ea
 ```
 
 ## Public API
 
-### KvTransportOp
-
 ```rust
-pub enum KvTransportOp {
-    GpuToHost { block_id: BlockId, offset: usize, len: usize },
-    HostToGpu { block_id: BlockId, offset: usize, len: usize },
-    SpillToNvme { block_id: BlockId, path: PathBuf },
-    LoadFromNvme { block_id: BlockId, path: PathBuf },
+pub type BlockId = usize;
+
+pub enum CacheTier {
+    Gpu,
+    HostRam,
+    NvMe,
+    NvMeWeightStream, // NVMe weight-streaming layer
+}
+
+pub fn grimvise_advise(data: &[f32], advice: grim_tensor::MemAdvice) -> Result<()>;
+
+pub struct LocalSpillManager {
+    scratch_dir: PathBuf,
+    block_tiers: HashMap<BlockId, CacheTier>,
+    host_ram_cache: HashMap<BlockId, (Vec<f32>, Vec<f32>)>,
+    nvme_cache: HashMap<BlockId, PathBuf>,
+    block_elems: usize,
+}
+
+impl LocalSpillManager {
+    pub fn new(scratch_dir: PathBuf, block_elems: usize) -> Result<Self>;
+}
+
+pub struct SharedSpillManager {
+    inner: RwLock<LocalSpillManager>,
+}
+
+impl SharedSpillManager {
+    pub fn new(scratch_dir: PathBuf, block_elems: usize) -> Result<Self>;
+}
+
+pub struct NetworkKvClient {
+    pub local_ip: String,
+}
+
+impl NetworkKvClient {
+    pub fn new(local_ip: String) -> Self;
+}
+
+pub struct NvmeWeightStreamer {
+    pub lru_capacity_layers: usize,
+    pub weights_path: PathBuf,
+    // host_weight_cache + lru_order (private)
 }
 ```
-
-### TieredAccessor
-
-Manages data movement between storage tiers with caching.
 
 ## Usage Example
 
 ```rust
-use grim_kvtransport::TieredAccessor;
+use grim_kvtransport::{SharedSpillManager, CacheTier};
+use std::path::PathBuf;
 
-let accessor = TieredAccessor::new();
-let k_bytes = accessor.load_kv_block(&block_id, BlockType::K, current_tier);
+let spill = SharedSpillManager::new(
+    PathBuf::from("/tmp/grim-spill"),
+    16 * 32 * 64, // BLOCK_SIZE * num_heads * head_dim
+)?;
 ```
 
 ## Feature Flags
 
 This crate has no feature flags.
 
-## Edge Cases
+## Edge Cases, Limitations, and Quirks
 
-1. **NUMA awareness**: Transfers may prefer specific NUMA nodes
-2. **Page alignment**: NVMe spill files use aligned page sizes
-3. **Compression**: Spilled data may be compressed before write
+- `LocalSpillManager` uses OS-level `madvise` on Linux/macOS to hint page residency — on Windows, `grimvise_advise` is a no-op.
+- `NetworkKvClient` requires the local IP to match a network interface that can reach the target node — mismatched IPs produce connection errors at transfer time.
+- `NvmeWeightStreamer` uses LRU eviction with configurable layer cache capacity — when the cache is full, the least-recently-used layer is evicted to the NVMe scratch file.

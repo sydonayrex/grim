@@ -67,6 +67,17 @@ pub struct EngineConfig {
     pub tp_size: usize,
     /// Explicit GPU ordinals for TP (`GRIM_GPUS`, empty = all visible).
     pub tp_gpus: Vec<usize>,
+    /// WI-TOOLS-4c-i: hard cap on the total number of tool-call entries across
+    /// every assistant message in a single request's `messages` array. Rejects
+    /// the request with 400 once a conversation has made more tool calls than a
+    /// single agentic loop should reasonably need (default 20 — arbitrary
+    /// starting point; tune against real workloads once 4b's logging exists).
+    pub max_tool_calls_per_conversation: usize,
+    /// WI-TOOLS-4c-ii: hard cap on `messages.len()` per request. Catches
+    /// unbounded history growth (agentic loops or client bugs) before any
+    /// tokenization/prefill work happens (default 200 — arbitrary starting
+    /// point, not a considered number).
+    pub max_messages_per_request: usize,
 }
 
 impl Default for EngineConfig {
@@ -93,6 +104,8 @@ impl Default for EngineConfig {
                         .collect()
                 })
                 .unwrap_or_default(),
+            max_tool_calls_per_conversation: 20,
+            max_messages_per_request: 200,
         }
     }
 }
@@ -115,26 +128,26 @@ pub struct Engine {
     pub config: EngineConfig,
     pub scheduler: grim_scheduler::Scheduler,
     pub block_pool: Arc<std::sync::Mutex<KvBlockPool>>,
-    models: HashMap<String, LoadedModel>,
-    sessions: HashMap<u64, Box<dyn SessionT>>,
-    adapters: HashMap<u32, LoadedAdapter>,
+    pub models: HashMap<String, LoadedModel>,
+    pub sessions: HashMap<u64, Box<dyn SessionT>>,
+    pub adapters: HashMap<u32, LoadedAdapter>,
     /// Per-request last-emitted logs (cleared on `finish_request`).
-    last_outcomes: HashMap<u64, StepOutcome>,
+    pub last_outcomes: HashMap<u64, StepOutcome>,
     /// Per-request deterministic RNG, §5.8. Populated when
     /// `DeterminismMode::Strict` is active. When Relaxed, RNG state is
     /// still tracked for telemetry but is allowed to differ between
     /// tick calls.
-    request_rng: HashMap<u64, DeterministicRng>,
-    request_model_ids: HashMap<u64, String>,
-    request_adapters: HashMap<u64, Vec<u32>>,
+    pub request_rng: HashMap<u64, DeterministicRng>,
+    pub request_model_ids: HashMap<u64, String>,
+    pub request_adapters: HashMap<u64, Vec<u32>>,
     /// Per-request input token buffers. Populated in `enqueue_request`
     /// from `Request::input_ids`. Used by `drive_prefill` to feed real
     /// prompt tokens instead of synthetic position indices.
-    request_input_ids: HashMap<u64, Vec<u32>>,
+    pub request_input_ids: HashMap<u64, Vec<u32>>,
     /// Per-request last generated token. Updated after each decode step
     /// via `record_generated_token`. Used by `drive_decode` to feed the
     /// previously sampled token instead of the position index.
-    request_last_token: HashMap<u64, u32>,
+    pub request_last_token: HashMap<u64, u32>,
     self_tuning_controller: grim_scheduler::SelfTuningController,
     /// Tuned speculative params (MIN-3: applied, not discarded).
     tuned_speculative_block_len: usize,
@@ -173,15 +186,11 @@ pub struct TpRankContext {
 ///
 /// `tp_gpus`, when non-empty, overrides auto-selection and pins ranks to the
 /// given GPU ordinals (honouring `EngineConfig::tp_gpus`).
-pub fn plan_tp_ranks(
-    tp_size: usize,
-    tp_gpus: Option<&[usize]>,
-) -> Result<Vec<TpRankContext>> {
+pub fn plan_tp_ranks(tp_size: usize, tp_gpus: Option<&[usize]>) -> Result<Vec<TpRankContext>> {
     if tp_size == 0 {
         return Err(Error::Config("tp_size must be > 0".into()));
     }
-    let devices = grim_backend_rocm::RocmDevice::probe()
-        .map_err(|e| Error::Tensor(e))?;
+    let devices = grim_backend_rocm::RocmDevice::probe().map_err(|e| Error::Tensor(e))?;
     if devices.len() < tp_size {
         return Err(Error::Config(format!(
             "TP requested {tp_size} ranks but only {} ROCm device(s) visible",
@@ -203,8 +212,7 @@ pub fn plan_tp_ranks(
     let rccl = Arc::new(grim_backend_rocm::rccl::RcclAllReduce::try_new(&ordinals)?);
     let mut ranks = Vec::with_capacity(tp_size);
     for (rank, ordinal) in ordinals.iter().enumerate() {
-        let dev = grim_backend_rocm::RocmDevice::try_new(*ordinal)
-            .map_err(|e| Error::Tensor(e))?;
+        let dev = grim_backend_rocm::RocmDevice::try_new(*ordinal).map_err(|e| Error::Tensor(e))?;
         dev.set_rccl_handle(Some(rccl.clone()));
         ranks.push(TpRankContext {
             rank,
@@ -230,7 +238,8 @@ impl Engine {
         // admitted blocks before spill. Previously this defaulted to `None`,
         // leaving the real `LloydMaxCompressor` impl (grim-kvquant) unreachable
         // from the serving path.
-        let mut compressor: Option<Arc<dyn grim_kvquant::KvCompressor>> = config.kv_compressor.clone();
+        let mut compressor: Option<Arc<dyn grim_kvquant::KvCompressor>> =
+            config.kv_compressor.clone();
         if compressor.is_none() {
             if let Ok(mode) = std::env::var("GRIM_KV_QUANT") {
                 match mode.trim().to_ascii_lowercase().as_str() {
