@@ -55,9 +55,15 @@ pub enum ClientIntegration {
 enum Commands {
     /// Start the inference HTTP server (Ollama-compatible, default port 11434). Used by systemd/launchd.
     Serve {
-        /// Address to bind the server.
-        #[arg(short, long, default_value = "127.0.0.1:11434")]
+        /// Address to bind the server (overrides --host/--port and GRIM_HOST/GRIM_PORT).
+        #[arg(short, long, default_value = "")]
         address: String,
+        /// HTTP bind host (overrides GRIM_HOST). Defaults to 127.0.0.1.
+        #[arg(long)]
+        host: Option<String>,
+        /// HTTP bind port (overrides GRIM_PORT). Defaults to 11434.
+        #[arg(short, long)]
+        port: Option<u16>,
         /// Path to grim config file.
         #[arg(short, long, default_value = "grim.toml")]
         config: String,
@@ -587,6 +593,8 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Serve {
             address,
+            host,
+            port,
             config: _,
             plugins,
         } => {
@@ -599,8 +607,19 @@ async fn main() -> Result<()> {
                     Err(e) => eprintln!("[grim] serve: failed to load plugins from {plugins}: {e}"),
                 }
             }
-            eprintln!("[grim] serve: binding to {address} (Ollama-compatible)");
-            grim_server::serve(&address, engine, None).await?;
+            // Precedence: explicit --address > --host/--port > GRIM_HOST/GRIM_PORT > default.
+            let effective = if !address.is_empty() {
+                address.clone()
+            } else if let (Some(h), Some(p)) = (&host, &port) {
+                format!("{h}:{p}")
+            } else if let (Some(h), None) = (&host, &port) {
+                let env = grim_core::RuntimeEnv::from_env();
+                format!("{h}:{}", env.port.unwrap_or(11434))
+            } else {
+                grim_core::RuntimeEnv::resolve_bind(None)
+            };
+            eprintln!("[grim] serve: binding to {effective} (Ollama-compatible)");
+            grim_server::serve(&effective, engine, None).await?;
         }
         Commands::Run {
             model,
@@ -654,8 +673,9 @@ async fn main() -> Result<()> {
                 } else {
                     None
                 };
-                eprintln!("[grim] serve: binding to {address} (Ollama-compatible)");
-                grim_server::serve(&address, engine, model_path).await?;
+                let r_addr = grim_core::RuntimeEnv::resolve_bind(Some(&address));
+                eprintln!("[grim] serve: binding to {r_addr} (Ollama-compatible)");
+                grim_server::serve(&r_addr, engine, model_path).await?;
             } else {
                 let model_name = model.unwrap_or_else(|| "default".to_string());
                 // Bypass cache for local GGUF paths; security boundary still applies to named models.
@@ -822,6 +842,7 @@ async fn main() -> Result<()> {
                 use_olora,
                 olora_lambda,
                 echo_mode,
+                use_spectral_qlora: false,
             };
             if let Err(e) = train::cmd_train(opts) {
                 eprintln!("[grim train] Failed: {e}");

@@ -276,43 +276,38 @@ extern "C" {
     }
 
     // ===================== Q3_K standalone =====================
-
+    // Mirrors the corrected `dequant_q3k_element` in q3k_gemm.rs and the
+    // authoritative CPU reference `grim_quant::dequant_q3k`. block_q3_K is
+    // 110 bytes / 256 weights with NO `dmin` and NO `m` array; the value is
+    // x = d * sc_i * q with the high bit of each 4-bit q taken from hmask.
     __device__ inline float dequant_q3k_standalone(const unsigned char* block_ptr, int in_sb) {
-        const float d = fp16_to_float_device(((const unsigned short*)block_ptr)[0]);
-        const float dmin = fp16_to_float_device(((const unsigned short*)block_ptr)[1]);
-        const unsigned char* sc = block_ptr + 4;
-        const unsigned char* qh = block_ptr + 12;
-        const unsigned char* qs = block_ptr + 14;
-        const unsigned char* m = block_ptr + 78;
+        const unsigned char* hmask  = block_ptr + 0;
+        const unsigned char* qs     = block_ptr + 32;
+        const unsigned char* scales = block_ptr + 96;
+        float d = fp16_to_float_device(((const unsigned short*)(block_ptr + 108))[0]);
 
-        int sub = in_sb / 32;
-        int in_sub = in_sb % 32;
-
-        float sub_sc = (float)(sc[sub] & 7);
-        int qh_byte = sub / 8;
-        int qh_bit  = (sub % 8) * 3;
-        float sc_upper = (float)((qh[qh_byte] >> qh_bit) & 7);
-        float scale_total = sub_sc + sc_upper * 8.0f;
-
-        float sub_m = (float)(m[sub] & 7);
-        float m_upper = (float)((qh[qh_byte + 3] >> qh_bit) & 7);
-        float m_total = sub_m + m_upper * 8.0f;
-
-        int bit_pos = in_sub * 3;
-        int byte_idx = bit_pos / 8;
-        int bit_idx  = bit_pos % 8;
-
-        unsigned int q_value;
-        if (bit_idx <= 5) {
-            q_value = (qs[byte_idx] >> bit_idx) & 0x07;
+        int sub    = in_sb / 32;
+        int is     = (in_sb % 32) / 16;
+        int sc_idx = 2 * sub + is;
+        int j      = sc_idx & 7;
+        signed char sc_byte;
+        if (sc_idx < 8) {
+            sc_byte = (signed char)((scales[j] & 0x0F) | ((scales[j + 8] & 0x03) << 4));
         } else {
-            int bits_in_first = 8 - bit_idx;
-            int bits_in_second = 3 - bits_in_first;
-            q_value = (qs[byte_idx] >> bit_idx) & ((1 << bits_in_first) - 1);
-            q_value |= ((qs[byte_idx + 1] & ((1 << bits_in_second) - 1)) << bits_in_first);
+            sc_byte = (signed char)((scales[j] >> 4)   | ((scales[j + 8] & 0x0C) << 2));
         }
+        float sc = (float)sc_byte - 32.0f;
 
-        return d * scale_total * (float)q_value - dmin * m_total;
+        int in_sub = in_sb % 32;
+        unsigned char hm_bit = (hmask[in_sub / 8] >> (in_sub % 8)) & 0x01;
+        int col      = in_sb / 32;
+        int byte_off = (col & 1) * 32;
+        int shift    = (col & 6) >> 1;
+        unsigned char qbits = (qs[in_sub + byte_off] >> (2 * shift)) & 0x03;
+        int q_with_high = (int)qbits | (hm_bit ? 0 : 4);
+        float q = (float)q_with_high - 4.0f;
+
+        return d * sc * q;
     }
 
     // ===================== Q8_0 standalone =====================

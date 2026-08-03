@@ -23,7 +23,10 @@ use std::sync::Arc;
 
 /// Auto-detect best available device. Probed once, reused by interactive REPL.
 fn probe_device() -> (Device, String) {
-    if let Ok(s) = std::env::var("GRIM_FORCE_DEVICE") {
+    // `GRIM_BACKEND` is canonical (set by the install script); `GRIM_FORCE_DEVICE`
+    // is accepted as a legacy alias for backward compatibility.
+    let s = std::env::var("GRIM_BACKEND").or_else(|_| std::env::var("GRIM_FORCE_DEVICE"));
+    if let Ok(s) = s {
         match s.as_str() {
             "cuda" => {
                 if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
