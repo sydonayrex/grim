@@ -3034,10 +3034,16 @@ pub struct Individual {
 /// The search respects the `target_bpw` constraint while maximizing a
 /// quality proxy derived from importance scores. The returned vector maps
 /// each tensor index to its assigned bitwidth.
+///
+/// When `progress` is provided, it is invoked once per generation with
+/// `(generations_done, total_generations)` so the CLI can render a
+/// conversion progress bar. This is a pure drain callback; it must not
+/// consume arguments and has no effect on the search result.
 pub fn evopress_search(
     config: &EvoPressConfig,
     importance_scores: &[f32],
     tensor_sizes: &[usize],
+    mut progress: Option<&mut dyn FnMut(usize, usize)>,
 ) -> Vec<u32> {
     let n_tensors = importance_scores.len();
     if n_tensors == 0 {
@@ -3094,7 +3100,11 @@ pub fn evopress_search(
         .collect();
 
     // Evolutionary loop.
-    for _generation in 0..config.generations {
+    let total_generations = config.generations;
+    for generation in 0..total_generations {
+        if let Some(cb) = progress.as_deref_mut() {
+            cb(generation + 1, total_generations);
+        }
         let mut next_gen = Vec::with_capacity(config.population_size);
 
         // Elitism: keep top-2.

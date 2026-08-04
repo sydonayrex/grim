@@ -8,7 +8,6 @@
 use grim_tensor::provider::TensorProvider;
 
 use grim_format::convert::convert_to_grim;
-use grim_format::format::normals_packed_size;
 use grim_format::gguf::{GGUF_MAGIC, GGUF_VERSION, GgufDType};
 use grim_format::tprov::GrimProvider;
 
@@ -90,6 +89,8 @@ fn convert_to_grim_then_grim_provider_round_trips_tensor_payload() {
         None,
         None,
         None,
+        None,
+        None,
     )
     .expect("convert_to_grim must succeed on a valid GGUF source");
 
@@ -103,11 +104,16 @@ fn convert_to_grim_then_grim_provider_round_trips_tensor_payload() {
 
     let raw = provider.get(&tensor_name).expect("get must succeed");
 
-    let expected = normals_packed_size(elem_count, 0, 4);
+    let expected = grim_format::format::normals_packed_size_for_wave(
+        elem_count,
+        0,
+        4,
+        grim_format::format::WaveSize::from_gcn("gfx1100"),
+    );
     assert_eq!(
         raw.bytes.len() as u64,
         expected,
-        "Payload byte length must match the Wave64-aligned normals_packed_size.\n\
+        "Payload byte length must match the wave-aligned normals_packed_size.\n\
          elem_count={}, base_bitwidth=4, expected={}, got={}",
         elem_count,
         expected,
@@ -146,11 +152,11 @@ fn convert_to_grim_produces_deterministic_payload_for_same_input() {
     let b_str = grim_b.to_str().unwrap();
 
     convert_to_grim(
-        gguf_str, a_str, "gfx1100", 4.0, 0, None, None, None, None, None,
+        gguf_str, a_str, "gfx1100", 4.0, 0, None, None, None, None, None, None, None,
     )
     .unwrap();
     convert_to_grim(
-        gguf_str, b_str, "gfx1100", 4.0, 0, None, None, None, None, None,
+        gguf_str, b_str, "gfx1100", 4.0, 0, None, None, None, None, None, None, None,
     )
     .unwrap();
 
@@ -166,9 +172,15 @@ fn convert_to_grim_produces_deterministic_payload_for_same_input() {
         "Same input + same params must produce the same payload size"
     );
 
-    // Both runs must produce a Wave64-aligned payload (the size is the
-    // independently-computed normals_packed_size for the F32 source tensor).
-    let expected = normals_packed_size(raw_a.shape.iter().product::<usize>(), 0, 4);
+    // Both runs must produce a wave-aligned payload whose size matches the
+    // independently-computed wave-aware normals_packed_size for the F32
+    // source tensor under the target GCN's wavefront (gfx1100 => Wave32).
+    let expected = grim_format::format::normals_packed_size_for_wave(
+        raw_a.shape.iter().product::<usize>(),
+        0,
+        4,
+        grim_format::format::WaveSize::from_gcn("gfx1100"),
+    );
     assert_eq!(raw_a.bytes.len() as u64, expected);
     assert_eq!(raw_b.bytes.len() as u64, expected);
 }
@@ -245,6 +257,7 @@ fn grim_provider_returns_extension_declaration_after_round_trip() {
         tensors: vec![entry],
         tensors_by_name: HashMap::new(),
         kv_blobs: HashMap::new(),
+        wave: grim_format::format::WaveSize::W64,
     };
 
     let dir = tempfile::tempdir().expect("create tempdir");
@@ -337,6 +350,7 @@ fn v1_file_without_extensions_still_opens_and_ext_for_returns_none() {
         tensors: vec![entry],
         tensors_by_name: HashMap::new(),
         kv_blobs: HashMap::new(),
+        wave: grim_format::format::WaveSize::W64,
     };
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -405,6 +419,7 @@ fn grim_provider_meta_populates_fusion_mask_from_extension() {
         tensors: vec![entry],
         tensors_by_name: HashMap::new(),
         kv_blobs: HashMap::new(),
+        wave: grim_format::format::WaveSize::W64,
     };
 
     let dir = tempfile::tempdir().expect("tempdir");

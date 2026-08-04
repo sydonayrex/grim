@@ -1,6 +1,7 @@
 //! Golden mutation-resistant test for Crow Q4_K GPU dequantization GEMM forward and backward paths.
 
 use grim_backend_rocm::RocmDevice;
+use grim_format::convert::GpuDequant;
 use grim_quant::{dequant_q4k, quant_q4k};
 use grim_tensor::{
     BackendDevice, Shape,
@@ -76,6 +77,34 @@ fn test_q4k_gpu_gemm_golden_mutation_resistant() -> TestResult {
         assert!(
             max_err < 1e-3,
             "Q4_K GPU matmul max error {max_err} exceeds 1e-3 threshold"
+        );
+
+        // --- GpuDequant path (used by grim-format conversion) ---
+        // Routes `KQuant::Q4K` through `RocmDevice::dequantize` →
+        // `dequantize_q4k_host` → the `grim_dequant_q4k` HIP kernel instead of
+        // the CPU `grim_quant::dequant_q4k` fallback. Must remain bit-exact with
+        // the CPU oracle `b_dequant` (computed above).
+        let gpu_dequant = dev
+            .dequantize(
+                &Storage::KQuant(KQuantScheme::Q4K),
+                &b_packed,
+                b_orig.len(),
+            )
+            .expect("GpuDequant::dequantize Q4K");
+        assert!(
+            gpu_dequant.is_some(),
+            "GpuDequant must handle Q4K (should not fall back to CPU)"
+        );
+        let gpu_dequant = gpu_dequant.expect("checked above");
+        assert_eq!(gpu_dequant.len(), b_dequant.len());
+        let dequant_max_err = b_dequant
+            .iter()
+            .zip(gpu_dequant.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert_eq!(
+            dequant_max_err, 0.0,
+            "Q4_K GpuDequant kernel deviates from CPU oracle (max_err={dequant_max_err:e})"
         );
     }
 

@@ -140,13 +140,13 @@ void gptq_scale_fit_kernel(
 "#;
 
 /// Returns the wavefront size for a given AMD GCN architecture identifier.
-/// Returns the wavefront size for a given AMD GCN architecture identifier.
 pub fn wavefront_size_for_gcn(gcn: &str) -> u32 {
     match gcn {
         "gfx90a" | "gfx942" | "gfx90c" => 64, // CDNA2/3 (MI210, MI250, MI300X)
-        "gfx1200" | "gfx1201" | "gfx1100" | "gfx1102" | "gfx11" => 32, // RDNA4/3/2
-        "gfx1030" => 32,                      // RDNA2 (RX 6700)
-        _ => 64,                              // safe default
+        "gfx1200" | "gfx1201" | "gfx1100" | "gfx1102" | "gfx11" => 32, // RDNA4/3
+        "gfx1030" | "gfx1036" => 32,          // RDNA2 (RX 6700, RDNA2 iGPU)
+        "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" => 32, // RDNA2 variants
+        _ => 32, // safe default: this project is RDNA-first (Wave32)
     }
 }
 
@@ -276,7 +276,11 @@ mod tests {
     fn wavefront_size_classification_matches_gcn_architectures() {
         assert_eq!(wavefront_size_for_gcn("gfx90a"), 64);
         assert_eq!(wavefront_size_for_gcn("gfx942"), 64);
+        assert_eq!(wavefront_size_for_gcn("gfx90c"), 64);
         assert_eq!(wavefront_size_for_gcn("gfx1100"), 32);
+        assert_eq!(wavefront_size_for_gcn("gfx1201"), 32);
         assert_eq!(wavefront_size_for_gcn("gfx1030"), 32);
+        assert_eq!(wavefront_size_for_gcn("gfx1036"), 32);
+        assert_eq!(wavefront_size_for_gcn("gfx_unknown"), 32);
     }
 }

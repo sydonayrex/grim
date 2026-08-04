@@ -81,13 +81,11 @@ pub fn gpu_target_flag(arch: &str) -> CString {
 /// Build compiler options list for AMD hipRTC based on detected hardware target `arch`. [see: `gfx103x`, `gfx11xx`, `gfx12xx`, `gfx9xx`]
 pub fn hiprtc_options_for_arch(arch: &str) -> Vec<CString> {
     let mut opts = vec![CString::new("--std=c++14").unwrap()];
-    if arch.starts_with("gfx103")
-        || arch.starts_with("gfx11")
-        || arch.starts_with("gfx12")
-        || arch.starts_with("gfx9")
-    {
-        opts.push(CString::new("-mwavefrontsize64").unwrap());
-    }
+    // Do not force `-mwavefrontsize64`: it configures codegen for 64-wide
+    // wavefronts, but Wave32-only targets (e.g. RDNA 2 iGPUs like gfx1036)
+    // cannot execute it and fault at runtime. Let hipRTC use the native wave
+    // size for the target arch and let kernels fall back to their runtime
+    // `warpSize` logic.
     opts.push(gpu_target_flag(arch));
     opts
 }

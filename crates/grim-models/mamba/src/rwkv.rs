@@ -284,6 +284,28 @@ pub struct Rwkv {
 
 impl Rwkv {
     pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: RwkvConfig, device: Device) -> Result<Self> {
+        Self::load_tp(ws, cfg, device, ws.tp_config())
+    }
+
+    /// Tensor-parallel load entry for RWKV. RWKV is a recurrent (time-mix)
+    /// model: like Mamba, the recurrent path has no row-parallel all-reduce
+    /// semantics, so column/row sharding of the time-/channel-mix matrices
+    /// would change the recurrence rather than parallelise a matmul. A safe
+    /// `load_tp` needs a bespoke RWKV sharding plan. Refuses `world_size > 1`
+    /// until then.
+    pub fn load_tp(
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: RwkvConfig,
+        device: Device,
+        tp: grim_nn::TensorParallelConfig,
+    ) -> Result<Self> {
+        grim_nn::require_single_device(
+            tp,
+            "RWKV",
+            "the recurrent time/channel-mix path has no row-parallel all-reduce semantics; \
+             sharding needs a bespoke plan",
+        )
+        .map_err(grim_core::Error::Unimplemented)?;
         let emb = Linear::load(&ws.pp("emb"), cfg.vocab_size, cfg.hidden_size, false)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {

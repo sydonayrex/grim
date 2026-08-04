@@ -178,6 +178,7 @@ pub fn cmd_oxidizer_calibrate(
     model_path: &str,
     output_path: &str,
     calibration_dataset: Option<&str>,
+    progress: &mut Option<&mut dyn FnMut(&str, usize, usize)>,
 ) -> Result<ImportanceScores, String> {
     if let Some(ds) = calibration_dataset {
         eprintln!("[oxidizer] calibrate: using dataset '{ds}'");
@@ -191,8 +192,12 @@ pub fn cmd_oxidizer_calibrate(
         output_gradients: vec![0.1],
     });
     let mut tensor_data: Vec<(String, Vec<f32>, usize, usize)> = Vec::new();
+    let total = names.len();
 
-    for name in &names {
+    for (i, name) in names.iter().enumerate() {
+        if let Some(cb) = progress.as_deref_mut() {
+            cb("calibrate", i + 1, total);
+        }
         let meta = provider.meta(name).map_err(|e| e.to_string())?;
         let shape = meta.shape;
         if shape.len() != 2 || shape[0] == 0 || shape[1] == 0 {
@@ -235,6 +240,7 @@ pub fn cmd_oxidizer_search(
     tensor_sizes: &[usize],
     target_bpw: f32,
     generations: usize,
+    progress: Option<&mut dyn FnMut(usize, usize)>,
 ) -> Vec<u32> {
     evopress_search(
         &EvoPressConfig {
@@ -244,6 +250,7 @@ pub fn cmd_oxidizer_search(
         },
         &importance_scores.layer_scores,
         tensor_sizes,
+        progress,
     )
 }
 
@@ -254,12 +261,20 @@ pub fn cmd_oxidizer_convert(
     generations: usize,
     rocml_profile: Option<&str>,
     calibration_dataset: Option<String>,
+    wave_override: Option<grim_format::WaveSize>,
+    use_gpu: bool,
+    mut progress: Option<&mut dyn FnMut(&str, usize, usize)>,
 ) -> Result<(), String> {
     let (_provider, names, sizes, mut grim_meta) = open_provider(model_path)?;
     let importance_scores = if Path::new(&format!("{}.importance.json", model_path)).exists() {
         load_importance_scores(&format!("{}.importance.json", model_path))?
     } else {
-        cmd_oxidizer_calibrate(model_path, output_path, calibration_dataset.as_deref())?
+        cmd_oxidizer_calibrate(
+            model_path,
+            output_path,
+            calibration_dataset.as_deref(),
+            &mut progress,
+        )?
     };
 
     let tensor_names = importance_scores.tensor_names.clone();
@@ -273,7 +288,21 @@ pub fn cmd_oxidizer_convert(
             }
         })
         .collect::<Vec<usize>>();
-    let bitwidths = cmd_oxidizer_search(&importance_scores, &tensor_sizes, target_bpw, generations);
+    let bitwidths;
+    {
+        let mut cb = |done: usize, total: usize| {
+            if let Some(p) = progress.as_deref_mut() {
+                p("evopress", done, total);
+            }
+        };
+        bitwidths = cmd_oxidizer_search(
+            &importance_scores,
+            &tensor_sizes,
+            target_bpw,
+            generations,
+            Some(&mut cb),
+        );
+    }
 
     // Create full bitwidths array: scored tensors get EvoPress bitwidth, others get target_bpw.
     let default_bw = target_bpw.round() as u32;
@@ -327,20 +356,53 @@ pub fn cmd_oxidizer_convert(
         .collect();
 
     let resolved_gcn = rocml_profile.unwrap_or("gfx1100");
-    grim_format::convert_to_grim(
-        model_path,
-        output_path,
-        resolved_gcn,
-        target_bpw,
-        generations,
-        calibration_dataset.as_deref(),
-        None,
-        Some(full_bitwidths),
-        // Pass calibrated metadata through; convert_to_grim preserves quant_overrides, ext_entries, etc.
-        Some(grim_meta),
-        None,
-    )
-    .map_err(|e| e.to_string())?;
+    // Wavefront size: explicit override wins, else the profile-derived
+    // value already stamped above, else resolve from the GCN (RDNA → W32).
+    let wave = wave_override.or_else(|| {
+        if grim_meta.wavefront_size != 0 {
+            Some(grim_format::WaveSize::from_width(grim_meta.wavefront_size))
+        } else {
+            None
+        }
+    });
+    if use_gpu {
+        let device = grim_backend_rocm::RocmDevice::try_new(0)
+            .map_err(|e| format!("GPU dequant requested but no ROCm device available: {e}"))?;
+        grim_format::convert_to_grim_with_dequant(
+            model_path,
+            output_path,
+            resolved_gcn,
+            target_bpw,
+            generations,
+            calibration_dataset.as_deref(),
+            None,
+            Some(full_bitwidths),
+            // Pass calibrated metadata through; convert_to_grim preserves quant_overrides, ext_entries, etc.
+            Some(grim_meta),
+            None,
+            wave,
+            progress,
+            &device,
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        grim_format::convert_to_grim(
+            model_path,
+            output_path,
+            resolved_gcn,
+            target_bpw,
+            generations,
+            calibration_dataset.as_deref(),
+            None,
+            Some(full_bitwidths),
+            // Pass calibrated metadata through; convert_to_grim preserves quant_overrides, ext_entries, etc.
+            Some(grim_meta),
+            None,
+            wave,
+            progress,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -535,12 +597,18 @@ pub fn cmd_oxidizer_raven(
     output_path: &str,
     target_bpw: f32,
     calibration_dataset: Option<&str>,
+    mut progress: Option<&mut dyn FnMut(&str, usize, usize)>,
 ) -> Result<(), String> {
     let (provider, names, _sizes, mut grim_meta) = open_provider(model_path)?;
     let importance_scores = if Path::new(&format!("{}.importance.json", model_path)).exists() {
         load_importance_scores(&format!("{}.importance.json", model_path))?
     } else {
-        cmd_oxidizer_calibrate(model_path, output_path, calibration_dataset)?
+        cmd_oxidizer_calibrate(
+            model_path,
+            output_path,
+            calibration_dataset,
+            &mut progress,
+        )?
     };
 
     let default_bw = target_bpw.round() as u32;
