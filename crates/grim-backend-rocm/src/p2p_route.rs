@@ -1,9 +1,10 @@
 //! Phase-3 §3.8 — P2P routing + host-staging primitives.
 //!
-//! This module is the typed *decision + staging* surface. It does not
-//! call `hipMemcpyPeerAsync` directly; that bridge is the next PR's
-//! responsibility (the spec calls it a follow-up once the architecture
-//! for the consumer-RDMA path is locked in).
+//! This module is the typed *decision + staging* surface. The bridge from
+//! `RouteLink` verdict to the actual memcpy primitive lives on `RocmDevice`
+//! (`copy_via_route`) — it calls `peer_status` → `to_route_link` → `copy_route`,
+//! which dispatches `hipMemcpyPeerAsync` (PeerDirect) or a D2H→H2D
+//! `hipMemcpyAsync` pair (HostBounce).
 //!
 //! Two primitives:
 //!
