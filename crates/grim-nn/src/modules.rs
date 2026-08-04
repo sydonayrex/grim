@@ -141,6 +141,60 @@ impl TensorParallelConfig {
             .unwrap_or(0);
         Some(Self { rank, world_size })
     }
+
+    /// Validate the rank/world_size contract: `world_size >= 1` and
+    /// `rank < world_size`. Returns `Err(Unsupported)` (via the caller's
+    /// `Result`) misconfigured config rather than silently degrading.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.world_size == 0 {
+            return Err(format!(
+                "invalid TensorParallelConfig: world_size must be >= 1 (got 0)"
+            ));
+        }
+        if self.world_size == 1 {
+            if self.rank != 0 {
+                return Err(format!(
+                    "invalid TensorParallelConfig: rank must be 0 when world_size == 1 \
+                     (got rank={})",
+                    self.rank
+                ));
+            }
+            return Ok(());
+        }
+        if self.rank >= self.world_size {
+            return Err(format!(
+                "invalid TensorParallelConfig: rank ({}) must be < world_size ({})",
+                self.rank, self.world_size
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Refuse tensor parallelism for architecture `arch` when `tp.world_size > 1`.
+///
+/// Used by `Foo::load_tp` stubs for architectures whose `forward` path does
+/// not yet consume `ColumnParallelLinear`/`RowParallelLinear` (or whose
+/// attention layout — fused QKV, MLA, enc/dec cross-attn, SSM/RWKV — would
+/// require bespoke sharding math). Returns the typed `Unsupported` error the
+/// caller bubbles up so the multi-process TP path **fails loudly** rather than
+/// loading sharded-but-unreduced weights that silently corrupt output.
+///
+/// `world_size == 1` (or default) passes through.
+pub fn require_single_device(
+    tp: TensorParallelConfig,
+    arch: &str,
+    reason: &str,
+) -> std::result::Result<(), String> {
+    tp.validate()?;
+    if tp.world_size > 1 {
+        return Err(format!(
+            "tensor-parallel load for {arch} not yet implemented ({reason}); refusing \
+             world_size={} to avoid silently wrong output. Set GRIM_TP_SIZE=1.",
+            tp.world_size
+        ));
+    }
+    Ok(())
 }
 
 /// Column-parallel linear layer (§4.1): weights are pre-sharded at load

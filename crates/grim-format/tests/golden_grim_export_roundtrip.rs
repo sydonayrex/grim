@@ -40,6 +40,7 @@ fn golden_grim_export_round_trips_f32_tensor() {
         tensors: vec![entry],
         tensors_by_name: HashMap::new(),
         kv_blobs: HashMap::new(),
+        wave: grim_format::format::WaveSize::W64,
     };
 
     let dir = tempfile::tempdir().expect("tempdir");

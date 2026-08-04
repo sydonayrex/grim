@@ -334,6 +334,27 @@ impl Vit {
     }
 
     pub fn load(device: Device, ws: &WeightSource<'_>, cfg: VitConfig) -> Result<Self> {
+        Self::load_tp(device, ws, cfg, ws.tp_config())
+    }
+
+    /// Tensor-parallel load entry for ViT. ViT is a vision encoder (`Model`/
+    /// `Encoder`, not `CausalLm`); `VitBlock::forward` calls plain
+    /// `Linear::forward` with no all-reduce hook, and TP for vision encoders is
+    /// low-leverage since they don't run on the serving engine's text-out
+    /// path. Refused until a `forward` rework + an encoder consumer arrive.
+    pub fn load_tp(
+        device: Device,
+        ws: &WeightSource<'_>,
+        cfg: VitConfig,
+        tp: grim_nn::TensorParallelConfig,
+    ) -> Result<Self> {
+        grim_nn::require_single_device(
+            tp,
+            "ViT",
+            "vision encoder VitBlock::forward calls plain Linear::forward with no \
+             all-reduce hook",
+        )
+        .map_err(Error::Unimplemented)?;
         let patch_dim = cfg.patch_dim();
         let proj_w = ws
             .get([cfg.hidden_size, patch_dim], "proj.weight")?

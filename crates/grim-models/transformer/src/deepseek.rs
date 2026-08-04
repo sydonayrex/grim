@@ -236,6 +236,29 @@ impl DeepSeek {
         ws: &grim_nn::WeightSource<'_>,
         cfg: DeepSeekConfig,
     ) -> Result<Self> {
+        Self::load_tp(device, ws, cfg, ws.tp_config())
+    }
+
+    /// Tensor-parallel load entry for DeepSeek (MLA). The MLA attention uses
+    /// projected (not headed) KV via `kv_b_proj` of shape
+    /// `[2*num_heads*128, hidden]`; sharding it on the head axis requires
+    /// bespoke handling that `Linear::load_column_parallel` cannot express, and
+    /// `forward` calls plain `Linear::forward` (no all-reduce hook). Refuses
+    /// `world_size > 1` until both the sharding math and the `forward` rework
+    /// land. `world_size == 1` delegates to the plain path.
+    pub fn load_tp(
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: DeepSeekConfig,
+        tp: grim_nn::TensorParallelConfig,
+    ) -> Result<Self> {
+        grim_nn::require_single_device(
+            tp,
+            "DeepSeek",
+            "MLA projected-KV layout needs bespoke head-axis sharding and a \
+             forward rework to add the all-reduce hook",
+        )
+        .map_err(grim_core::Error::Unimplemented)?;
         let tok_embeddings =
             Embedding::load(&ws.pp("token_embd"), cfg.vocab_size, cfg.hidden_size)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);

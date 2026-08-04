@@ -930,6 +930,8 @@ async fn convert_model_route(Json(req): Json<ConvertModelRequest>) -> impl IntoR
         None,
         None,
         req.target_format,
+        None,
+        None,
     ) {
         Ok(_) => (
             StatusCode::OK,

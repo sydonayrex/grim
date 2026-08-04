@@ -818,6 +818,27 @@ impl Whisper {
     }
 
     pub fn load(device: Device, ws: &WeightSource<'_>, cfg: WhisperConfig) -> Result<Self> {
+        Self::load_tp(device, ws, cfg, ws.tp_config())
+    }
+
+    /// Tensor-parallel load entry for Whisper. Whisper is an audio
+    /// encoder–decoder with cross-attention in the decoder; like T5, the
+    /// cross-attention sharding adds symmetrical constraints beyond a plain
+    /// column/row split, and the block `forward` calls plain `Linear::forward`
+    /// with no all-reduce hook. Refused until both land.
+    pub fn load_tp(
+        device: Device,
+        ws: &WeightSource<'_>,
+        cfg: WhisperConfig,
+        tp: grim_nn::TensorParallelConfig,
+    ) -> Result<Self> {
+        grim_nn::require_single_device(
+            tp,
+            "Whisper",
+            "audio encoder–decoder cross-attention needs bespoke sharding and a \
+             forward rework to add the all-reduce hook",
+        )
+        .map_err(Error::Unimplemented)?;
         let tok_emb = Embedding::load(&ws.pp("tok_emb"), cfg.vocab_size, cfg.d_model)?;
         let enc_in_proj = Linear::load(&ws.pp("enc_in_proj"), cfg.n_mels, cfg.d_model, true)?;
         let mut enc_blocks = Vec::with_capacity(cfg.num_enc_layers);

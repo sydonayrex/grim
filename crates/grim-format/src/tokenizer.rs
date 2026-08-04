@@ -699,6 +699,66 @@ pub struct FunctionName {
     pub name: String,
 }
 
+/// Strip unsupported Jinja block directives from a chat template string.
+///
+/// minijinja supports the standard block tags (`if`, `for`, `set`, `block`,
+/// `extends`, `macro`) but not arbitrary custom tags that some model finetuners
+/// embed in GGUF metadata (e.g. `{% generation %}…{% endgeneration %}`). These
+/// cause `template_from_str` to return a parse error, which triggers a silent
+/// fallback to the last message's content. This function removes the unsupported
+/// outer tags while preserving their inner content so the remaining template is
+/// valid minijinja.
+fn sanitize_jinja_template(template: &str) -> String {
+    // Match `{% tag … %}` and `{% endtag %}`. We strip tags whose outer name
+    // minijinja doesn't recognise, keeping the text between opening and closing.
+    // The recognised set is deliberately conservative — minijinja's built-in tags.
+    let recognised: &[&str] = &[
+        "if", "elif", "else", "endif", "for", "endfor", "endcase", "case",
+        "set", "block", "endblock", "extends", "macro", "endmacro",
+        "call", "endcall", "filter", "endfilter", "raw", "endraw",
+        "with", "endwith", "trans", "endtrans", "spaceless", "endspaceless",
+        "autoescape", "endautoescape", "do", "recursive", "endif",
+    ];
+
+    // Simple line-by-line pass: collect tag names and strip unrecognised
+    // opening/closing tags while preserving their inner text.
+    let mut result = String::with_capacity(template.len());
+    let mut buf = template.chars().peekable();
+    while let Some(ch) = buf.next() {
+        if ch == '{' && buf.peek() == Some(&'%') {
+            // Capture the full tag `{% ... %}`.
+            let mut tag = String::from("{%");
+            let mut inner = String::new();
+            if buf.next() == Some('%') {
+                // Read until closing `%}`.
+                while let Some(c) = buf.next() {
+                    tag.push(c);
+                    inner.push(c);
+                    if c == '%' && buf.peek() == Some(&'}') {
+                        tag.push(buf.next().unwrap());
+                        break;
+                    }
+                }
+            }
+            // Extract the directive name (first whitespace-delimited token
+            // after stripping whitespace).
+            let name = inner
+                .trim()
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_start_matches("end");
+            if recognised.contains(&name) || name.is_empty() {
+                result.push_str(&tag);
+            }
+            // Unrecognised tags are silently removed (content preserved).
+            continue;
+        }
+        result.push(ch);
+    }
+    result
+}
+
 /// Renders an OpenAI-style `messages` array through a model's Jinja chat
 /// template, producing the final prompt string ready for tokenization.
 ///
@@ -727,8 +787,14 @@ pub fn render_chat_template(
     let mut env = minijinja::Environment::new();
     // Most GGUF chat templates are self-contained; disable autoescaping.
     env.set_auto_escape_callback(|_| minijinja::AutoEscape::None);
+    // P1-3.3: Some GGUF-embedded Jinja templates use block directives that
+    // minijinja does not support (e.g. `{% generation %}…{% endgeneration %}`).
+    // Strip those unsupported tags (keeping their inner content) so the
+    // remaining template parses and renders correctly instead of failing
+    // silently and falling back to the last message.
+    let sanitized = sanitize_jinja_template(template);
     let tmpl = env
-        .template_from_str(template)
+        .template_from_str(&sanitized)
         .map_err(|e| Error::Backend(format!("chat template parse error: {e}")))?;
     // minijinja's `context!` macro requires every referenced variable to be
     // named, so we build the context conditionally: `tools`/`tool_choice` are

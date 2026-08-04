@@ -54,13 +54,18 @@ pub struct Llama {
 }
 
 impl Llama {
-    /// Load a `Llama` model with TP config derived from the environment
-    /// (`GRIM_TP_SIZE` / `GRIM_TP_RANK`). Falls back to single-device when
-    /// env vars are unset.
+    /// Load a `Llama` model with TP config taken from the `WeightSource`.
+    ///
+    /// The `WeightSource` is the single source of truth for TP — it carries
+    /// the `(rank, world_size)` set by `model_loader` (which derives it from
+    /// `GRIM_TP_*` env once and threads it through `with_tp_config`). Re-reading
+    /// the env here would split the contract: the loader's `get_sharded` would
+    /// slice by `ws.tp_config().rank` while `load_tp` would shard by a
+    /// freshly-parsed env rank. During a transient env mutation those can
+    /// disagree, so this entry uses `ws.tp_config()` and never calls
+    /// `from_env()`.
     pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: LlamaConfig) -> Result<Self> {
-        let tp = TensorParallelConfig::from_env()
-            .unwrap_or_else(TensorParallelConfig::default);
-        Self::load_tp(device, ws, cfg, tp)
+        Self::load_tp(device, ws, cfg, ws.tp_config())
     }
 
     /// Load a `Llama` model with an explicit `TensorParallelConfig`.

@@ -21,6 +21,41 @@ use grim_tensor::BackendDevice;
 use grim_tensor::Device;
 use std::sync::Arc;
 
+/// Resolve the GPU ordinal for this TP rank's process. Only returns `Some`
+/// when multi-process TP is active (`GRIM_TP_SIZE > 1`). Mirrors the ordinal
+/// resolution in `model_loader::resolve_tp_ordinal` and
+/// `RocmDevice::auto_init_rccl` — they all read the same env vars to stay in
+/// sync. Returns `None` for single-device or when the configured ordinal isn't
+/// among the probed devices.
+fn tp_ordinal(devices: &[grim_backend_rocm::RocmDevice]) -> Option<usize> {
+    let world_size = std::env::var("GRIM_TP_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&w| w > 1)?;
+    let rank = std::env::var("GRIM_TP_RANK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    if rank >= world_size {
+        return None;
+    }
+    // GRIM_GPUS may specify ordinals per rank; fall back to rank-as-ordinal.
+    let gpus: Vec<usize> = std::env::var("GRIM_GPUS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|t| t.trim().parse::<usize>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let my_ordinal = gpus.get(rank).copied().unwrap_or(rank);
+    // Verify the ordinal is visible among the probed devices.
+    devices
+        .iter()
+        .any(|d| d.ordinal() == my_ordinal)
+        .then_some(my_ordinal)
+}
+
 /// Auto-detect best available device. Probed once, reused by interactive REPL.
 fn probe_device() -> (Device, String) {
     // `GRIM_BACKEND` is canonical (set by the install script); `GRIM_FORCE_DEVICE`
@@ -41,6 +76,11 @@ fn probe_device() -> (Device, String) {
             }
             "rocm" => {
                 if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
+                    // Under multi-process TP, pin this rank process to its own
+                    // GPU instead of always using the first visible device.
+                    if let Some(ord) = tp_ordinal(&rocm_devices) {
+                        return (Device::Rocm(ord), format!("rocm:{}", ord));
+                    }
                     if let Some(first) = rocm_devices.first() {
                         return (
                             Device::Rocm(first.ordinal()),
@@ -72,7 +112,8 @@ fn probe_device() -> (Device, String) {
         }
     } else if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
         if let Some(first) = rocm_devices.first() {
-            let ordinal = first.ordinal();
+            // Under multi-process TP, pin this rank process to its own GPU.
+            let ordinal = tp_ordinal(&rocm_devices).unwrap_or_else(|| first.ordinal());
             let wavefront = format!("{:?}", first.wavefront_size());
             let xnack = first.xnack_enabled();
             eprintln!(

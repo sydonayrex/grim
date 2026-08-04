@@ -77,13 +77,11 @@ pub struct LlamaBlock {
 }
 
 impl LlamaBlock {
-    /// Load a `LlamaBlock` with TP config derived from the environment
-    /// (`GRIM_TP_SIZE` / `GRIM_TP_RANK`). Falls back to single-device when
-    /// env vars are unset.
+    /// Load a `LlamaBlock` with TP config taken from the `WeightSource`.
+    ///
+    /// See [`crate::model::Llama::load`] for why this no longer re-reads env.
     pub fn load(ws: &WeightSource<'_>, cfg: &LlamaConfig) -> Result<Self> {
-        let tp = TensorParallelConfig::from_env()
-            .unwrap_or_else(TensorParallelConfig::default);
-        Self::load_tp(ws, cfg, tp)
+        Self::load_tp(ws, cfg, ws.tp_config())
     }
 
     /// Load a `LlamaBlock` with an explicit `TensorParallelConfig`.
@@ -871,5 +869,182 @@ mod tests {
         // shard_size of column-parallel = out_dim / 2
         let shard_out_wq = (8 * 16) / 2;
         assert_eq!(shard_out_wq, 64);
+    }
+
+    /// Part 7: TP parity — concatenating the shards from rank 0 and rank 1
+    /// (world_size=2) must reproduce the full weight matrix exactly. This
+    /// proves the sharding is a clean partition with no overlap, gap, or
+    /// off-by-one in the rank offset — the class of bug the sanity check
+    /// flagged (issue #6).
+    ///
+    /// Weight values are distinct per element (`row*1000+col` scaled), so a
+    /// wrong shard boundary or swapped rank would be caught by element-wise
+    /// inequality rather than a vacuous all-zeros match.
+    #[test]
+    fn test_llama_block_tp_parity_concat_shards_equals_full() {
+        use grim_tensor::{DType, QuantProvenance, RawTensor, TensorMeta, TensorProvider};
+        use std::collections::HashMap;
+
+        #[derive(Clone)]
+        struct FullProvider {
+            tensors: HashMap<String, RawTensor>,
+        }
+
+        impl TensorProvider for FullProvider {
+            fn get(&self, name: &str) -> grim_tensor::error::Result<RawTensor> {
+                self.tensors.get(name).cloned().ok_or_else(|| {
+                    grim_tensor::error::Error::Backend(format!("tensor '{name}' not found"))
+                })
+            }
+            fn meta(&self, _name: &str) -> grim_tensor::error::Result<TensorMeta> {
+                Ok(TensorMeta {
+                    dtype: DType::F32,
+                    provenance: QuantProvenance::GrimNative,
+                    shape: vec![],
+                    fusion_mask: 0,
+                })
+            }
+        }
+
+        fn f32_vec_to_bytes(data: &[f32]) -> Vec<u8> {
+            data.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        let cfg = LlamaConfig {
+            vocab_size: 100,
+            hidden_size: 32,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 16,
+            num_layers: 1,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            max_seq_len: 512,
+        };
+
+        // (name, out_dim, in_dim) for every weight the block loads.
+        let weight_specs: &[(&str, usize, usize)] = &[
+            ("attn.wq", cfg.num_heads * cfg.head_dim, cfg.hidden_size),    // [32, 32]
+            ("attn.wk", cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size),  // [16, 32]
+            ("attn.wv", cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size),  // [16, 32]
+            ("attn.wo", cfg.num_heads * cfg.head_dim, cfg.hidden_size),    // [32, 32]
+            ("ffn.w_gate", cfg.intermediate_size, cfg.hidden_size),          // [64, 32]
+            ("ffn.w_up", cfg.intermediate_size, cfg.hidden_size),            // [64, 32]
+            ("ffn.w_down", cfg.hidden_size, cfg.intermediate_size),          // [32, 64]
+        ];
+
+        // Build the fake provider with known, distinct float values for every
+        // weight so we can verify exact sharding/reassembly.
+        let mut tensors = HashMap::new();
+        for (name, out_dim, in_dim) in weight_specs {
+            let mut data = Vec::with_capacity(out_dim * in_dim);
+            for row in 0..*out_dim {
+                for col in 0..*in_dim {
+                    // Unique per element: row*1000 + col, scaled to a small float.
+                    data.push((row as f32 * 1000.0 + col as f32) * 0.001);
+                }
+            }
+            tensors.insert(
+                format!("{}.weight", name),
+                RawTensor {
+                    bytes: f32_vec_to_bytes(&data),
+                    shape: vec![*out_dim, *in_dim],
+                    dtype: DType::F32,
+                    provenance: QuantProvenance::GrimNative,
+                },
+            );
+        }
+        // RMS-norm weights (1D, unsharded).
+        for name in &["attn_norm", "ffn_norm"] {
+            let data = vec![0.5f32; cfg.hidden_size];
+            tensors.insert(
+                format!("{}.weight", name),
+                RawTensor {
+                    bytes: f32_vec_to_bytes(&data),
+                    shape: vec![cfg.hidden_size],
+                    dtype: DType::F32,
+                    provenance: QuantProvenance::GrimNative,
+                },
+            );
+        }
+
+        let provider = FullProvider { tensors };
+
+        // world_size=1 — full weights.
+        let tp1 = TensorParallelConfig { rank: 0, world_size: 1 };
+        let ws_full = WeightSource::root(&provider, Device::Cpu).with_tp_config(tp1);
+        let block_full = LlamaBlock::load_tp(&ws_full, &cfg, tp1).expect("full load_tp ok");
+
+        // world_size=2, rank 0.
+        let tp_r0 = TensorParallelConfig { rank: 0, world_size: 2 };
+        let ws_r0 = WeightSource::root(&provider, Device::Cpu).with_tp_config(tp_r0);
+        let block_r0 = LlamaBlock::load_tp(&ws_r0, &cfg, tp_r0).expect("rank 0 load_tp ok");
+
+        // world_size=2, rank 1.
+        let tp_r1 = TensorParallelConfig { rank: 1, world_size: 2 };
+        let ws_r1 = WeightSource::root(&provider, Device::Cpu).with_tp_config(tp_r1);
+        let block_r1 = LlamaBlock::load_tp(&ws_r1, &cfg, tp_r1).expect("rank 1 load_tp ok");
+
+        let weight_f32 = |t: &Tensor| t.to_vec_f32().expect("to_vec_f32");
+
+        // Column-parallel (dim=0): shard is a contiguous row block.
+        // Concat = r0_flat ++ r1_flat  (both row-major [shard_rows, in_dim]).
+        let check_col = |full: &Tensor, r0: &Tensor, r1: &Tensor, name: &str| {
+            let full_v = weight_f32(full);
+            let r0_v = weight_f32(r0);
+            let r1_v = weight_f32(r1);
+            let mut concat: Vec<f32> = r0_v.clone();
+            concat.extend_from_slice(&r1_v);
+            assert_eq!(
+                full_v, concat,
+                "column-parallel {name}: rank-0 + rank-1 shards must concatenate to full"
+            );
+            assert_eq!(
+                r0_v.len(), r1_v.len(),
+                "column-parallel {name}: both shards must have equal element count"
+            );
+        };
+
+        // Row-parallel (dim=1): shard is contiguous column block per row.
+        // Reconstruct = for each row: r0_cols ++ r1_cols.
+        let check_row = |full: &Tensor, r0: &Tensor, r1: &Tensor,
+                         rows: usize, cols_half: usize, name: &str| {
+            let full_v = weight_f32(full);
+            let r0_v = weight_f32(r0);
+            let r1_v = weight_f32(r1);
+            assert_eq!(
+                r0_v.len(), rows * cols_half,
+                "row-parallel {name}: rank-0 shard size mismatch"
+            );
+            assert_eq!(
+                r1_v.len(), rows * cols_half,
+                "row-parallel {name}: rank-1 shard size mismatch"
+            );
+            let mut concat = Vec::with_capacity(rows * cols_half * 2);
+            for row in 0..rows {
+                let base = row * cols_half;
+                concat.extend_from_slice(&r0_v[base..base + cols_half]);
+                concat.extend_from_slice(&r1_v[base..base + cols_half]);
+            }
+            assert_eq!(
+                full_v, concat,
+                "row-parallel {name}: rank-0 + rank-1 shards must concatenate to full"
+            );
+        };
+
+        // Column-parallel weights (sharded along dim=0, rows).
+        check_col(&block_full.wq.weight(), &block_r0.wq.weight(), &block_r1.wq.weight(), "wq");
+        check_col(&block_full.wk.weight(), &block_r0.wk.weight(), &block_r1.wk.weight(), "wk");
+        check_col(&block_full.wv.weight(), &block_r0.wv.weight(), &block_r1.wv.weight(), "wv");
+        check_col(&block_full.w_gate.weight(), &block_r0.w_gate.weight(), &block_r1.w_gate.weight(), "w_gate");
+        check_col(&block_full.w_up.weight(), &block_r0.w_up.weight(), &block_r1.w_up.weight(), "w_up");
+
+        // Row-parallel weights (sharded along dim=1, columns).
+        // wo: [32, 32] → shard [32, 16]; w_down: [32, 64] → shard [32, 32].
+        check_row(&block_full.wo.weight(), &block_r0.wo.weight(), &block_r1.wo.weight(),
+            cfg.num_heads * cfg.head_dim, cfg.hidden_size / 2, "wo");
+        check_row(&block_full.w_down.weight(), &block_r0.w_down.weight(), &block_r1.w_down.weight(),
+            cfg.hidden_size, cfg.intermediate_size / 2, "w_down");
     }
 }
