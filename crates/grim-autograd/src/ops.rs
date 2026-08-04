@@ -458,7 +458,7 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
         }
     };
 
-    // Try GPU / ROCm fused backward dispatch when available and b is quantized.
+    // Try GPU fused backward dispatch when available and b is quantized.
     if !args.transpose_a && !args.transpose_b {
         let b_quantized = matches!(
             args.b.dtype().storage,

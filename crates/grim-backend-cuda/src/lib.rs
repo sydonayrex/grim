@@ -1902,6 +1902,79 @@ impl BackendDevice for CudaDevice {
     /// ROCm fused path in `RocmDevice::quantized_matmul_backward_dx`; it fires
     /// from `grim-autograd::matmul_backward` once quantized storage is kept
     /// resident on CUDA (see `varbuilder::materialize`).
+    fn silu_mul_backward(
+        &self,
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        dw: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let gate_s = gate
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("silu_mul_backward: gate is not CudaStorage".into()))?;
+        let up_s = up
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("silu_mul_backward: up is not CudaStorage".into()))?;
+        let dw_s = dw
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("silu_mul_backward: dw is not CudaStorage".into()))?;
+
+        Self::ensure_f32_input("silu_mul_backward gate", gate_s)?;
+        Self::ensure_f32_input("silu_mul_backward up", up_s)?;
+        Self::ensure_f32_input("silu_mul_backward dw", dw_s)?;
+
+        if out_shape.dims() != gate_s.shape().dims() {
+            return Err(Error::Shape(format!(
+                "silu_mul_backward: out_shape must match gate shape, got {:?} vs {:?}",
+                out_shape.dims(),
+                gate_s.shape().dims()
+            )));
+        }
+
+        let n = out_shape.elem_count();
+        let mut gate_ptr = Self::dev_ptr_or_err("silu_mul_backward gate", gate_s)?;
+        let mut up_ptr = Self::dev_ptr_or_err("silu_mul_backward up", up_s)?;
+        let mut dw_ptr = Self::dev_ptr_or_err("silu_mul_backward dw", dw_s)?;
+
+        let df_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+        let de_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+        let mut df_ptr = Self::dev_ptr_or_err("silu_mul_backward df", &df_storage)?;
+        let mut de_ptr = Self::dev_ptr_or_err("silu_mul_backward de", &de_storage)?;
+
+        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+        let mut f: CUfunction = std::ptr::null_mut();
+        let func_name = std::ffi::CString::new("grim_silu_mul_backward")
+            .map_err(|e| Error::Backend(format!("invalid kernel name: {e}")))?;
+        let res = unsafe {
+            cuModuleGetFunction(
+                &mut f as *mut *mut c_void as *mut CUfunction,
+                module,
+                func_name.as_ptr(),
+            )
+        };
+        if res != 0 || f.is_null() {
+            return Err(Error::Backend(format!(
+                "cuModuleGetFunction(grim_silu_mul_backward) failed: {res}"
+            )));
+        }
+
+        let mut n_i = n as i32;
+        let mut args = [
+            &mut gate_ptr as *mut *mut c_void as *mut c_void,
+            &mut up_ptr as *mut *mut c_void as *mut c_void,
+            &mut dw_ptr as *mut *mut c_void as *mut c_void,
+            &mut df_ptr as *mut *mut c_void as *mut c_void,
+            &mut de_ptr as *mut *mut c_void as *mut c_void,
+            &mut n_i as *mut i32 as *mut c_void,
+        ];
+
+        let handle = self.launch_rank1_kernel("silu_mul_backward", &mut args, n)?;
+        Ok((Box::new(df_storage), Box::new(de_storage), handle))
+    }
+
     fn quantized_matmul_backward_dx(
         &self,
         dy: &dyn BackendStorage,
