@@ -286,23 +286,25 @@ mod tests {
 
     #[test]
     fn test_wavefront_size_for_gcn_w64() {
-        // "gfx1100" routes to RDNA2/3 -> W32 (gcn match expression returns 32)
-        let wf = wavefront_size_for_gcn("gfx1100");
-        assert_eq!(wf, 32);
+        // CDNA2 (gfx90a) is Wave64.
+        let wf = wavefront_size_for_gcn("gfx90a");
+        assert_eq!(wf, 64);
     }
 
     #[test]
     fn test_wavefront_size_for_gcn_w32() {
-        // "gfx1100" routes to RDNA2/3 -> W32
+        // RDNA2/3 (gfx1100, gfx1036) is Wave32.
         let wf = wavefront_size_for_gcn("gfx1100");
+        assert_eq!(wf, 32);
+        let wf = wavefront_size_for_gcn("gfx1036");
         assert_eq!(wf, 32);
     }
 
     #[test]
-    fn test_wavefront_size_for_gcn_unknown_returns_64() {
-        // Unknown GCN returns safe default of 64
+    fn test_wavefront_size_for_gcn_unknown_returns_32() {
+        // Unknown GCN returns safe default of 32 (RDNA-first project).
         let wf = wavefront_size_for_gcn("gfx_unknown");
-        assert_eq!(wf, 64);
+        assert_eq!(wf, 32);
     }
 
     #[test]

@@ -193,6 +193,7 @@ fn sample_next_token(
     step: u64,
     sampler: &dyn grim_core::sampler::Sampler,
     prompt_tokens: Option<&[u32]>, // Only provided on step 0
+    vocab_size: usize,
 ) -> u32 {
     if step == 0 {
         let prompt_tokens = prompt_tokens.expect("prompt_tokens must be provided on step 0");
@@ -223,9 +224,21 @@ fn sample_next_token(
     let logits = engine
         .last_outcome(request_id)
         .and_then(|o| o.logits.as_ref().cloned());
+    // P0-3.2: Clamp sampled tokens to `[0, vocab_size)` and use a safe fallback
+    // instead of `step as u32`. The engine's logits table is 65536 entries wide,
+    // so without clamping a model with a smaller vocab (e.g. 32000) can emit
+    // out-of-bounds token IDs that crash the tokenizer's decode path. Mirrors the
+    // logits-slicing + vocab-bounds discipline already used by `cmd_run`
+    // (run.rs) and `sample_logits` in `sampler.rs`.
     let token = match logits {
-        Some(t) => sampler.sample(&t, &history).unwrap_or(step as u32),
-        None => step as u32,
+        Some(t) => {
+            let sampled = sampler.sample(&t, &history).unwrap_or(0);
+            // Clamp to the model's actual vocab range so a too-wide logits
+            // table can never produce an out-of-vocab token.
+            let max = (vocab_size as u32).saturating_sub(1);
+            sampled.min(max)
+        }
+        None => 0,
     };
     if let Ok(mut hist) = REQUEST_HISTORIES.lock() {
         hist.entry(request_id).or_default().push(token);
@@ -787,6 +800,17 @@ async fn chat_completions(
             .unwrap_or_default()
     };
 
+    // P0-3.2: Vocab size for clamping sampled tokens into the model's actual
+    // range. The engine's internal logits table is fixed at 65536 entries; a
+    // model with a smaller vocab can otherwise emit out-of-bounds token IDs.
+    let vocab_size: usize = state
+        .tokenizer
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|t| t.tokens.len())
+        .unwrap_or(65536);
+
     if stream_requested {
         let state_clone = state.clone();
         let adapter_ids: Vec<u32> = {
@@ -903,6 +927,7 @@ async fn chat_completions(
                             } else {
                                 None
                             },
+                            vocab_size,
                         )
                     };
 
@@ -990,6 +1015,7 @@ async fn chat_completions(
                     } else {
                         None
                     },
+                    vocab_size,
                 )
             };
             let token_text = if let Some(tok) = &tokenizer {
@@ -1438,14 +1464,20 @@ fn validate_model_capabilities(
     }
 }
 
+/// P0-WI-3: OpenAI clients send the model identifier under `model`, not `name`.
+/// Accept both via serde rename so existing `grim pull`-style callers using
+/// `name` keep working while OpenAI-shaped clients (which emit `model`) also parse.
 #[derive(serde::Deserialize)]
 struct LoadModelRequest {
-    name: String,
+    #[serde(alias = "name")]
+    model: String,
 }
 
+/// Model unloading request — same field aliasing for OpenAI compatibility.
 #[derive(serde::Deserialize)]
 struct UnloadModelRequest {
-    name: String,
+    #[serde(alias = "name")]
+    model: String,
 }
 
 /// Dynamic model loading endpoint.
@@ -1456,7 +1488,7 @@ async fn load_model(
     // P0-WI-3: prefer a `.grim` sibling when both exist; centralize resolution
     // in `catalog::resolve_model_preferring_grim` so `/v1/models/load` shares
     // the same lookup logic as the CLI's on-demand model loader.
-    let resolved_path = grim_core::catalog::resolve_model_preferring_grim(&req.name);
+    let resolved_path = grim_core::catalog::resolve_model_preferring_grim(&req.model);
 
     let mut engine = state.engine.lock().unwrap();
     let device = grim_tensor::Device::Cpu;
@@ -1472,10 +1504,7 @@ async fn load_model(
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({
                     "status": "error",
-                    "message": format!(
-                        "Model '{}' not found on disk; no mock fallback is provided.",
-                        req.name
-                    ),
+                    "message": format!("Model '{}' not found on disk; no mock fallback is provided.", req.model),
                     "resolved_path": serde_json::Value::Null,
                     "loaded_kind": serde_json::Value::Null,
                 })),
@@ -1517,12 +1546,12 @@ async fn load_model(
                         .and_then(|gg| GgufProvider::open(gg).ok().and_then(|p| p.tokenizer().ok()))
                 });
             *state.tokenizer.lock().unwrap() = tokenizer;
-            engine.register_model(&req.name, m);
+            engine.register_model(&req.model, m);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "status": "success",
-                    "message": format!("Model '{}' loaded dynamically.", req.name),
+                    "message": format!("Model '{}' loaded dynamically.", req.model),
                     "resolved_path": model_path_str,
                     "loaded_kind": loaded_kind,
                 })),
@@ -1552,13 +1581,13 @@ async fn unload_model(
     Json(req): Json<UnloadModelRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let mut engine = state.engine.lock().unwrap();
-    let unloaded = engine.unload_model(&req.name);
+    let unloaded = engine.unload_model(&req.model);
     if unloaded {
         (
             StatusCode::OK,
             Json(serde_json::json!({
                 "status": "success",
-                "message": format!("Model '{}' unloaded dynamically from memory.", req.name)
+                "message": format!("Model '{}' unloaded dynamically from memory.", req.model)
             })),
         )
     } else {
@@ -1566,7 +1595,7 @@ async fn unload_model(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "status": "error",
-                "message": format!("Model '{}' is not loaded in memory.", req.name)
+                "message": format!("Model '{}' is not loaded in memory.", req.model)
             })),
         )
     }

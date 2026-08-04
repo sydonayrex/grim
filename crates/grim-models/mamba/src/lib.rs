@@ -360,6 +360,29 @@ impl Mamba {
     }
 
     pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: MambaConfig) -> Result<Self> {
+        Self::load_tp(device, ws, cfg, ws.tp_config())
+    }
+
+    /// Tensor-parallel load entry for Mamba. Mamba is a state-space model:
+    /// the recurrent SSM path has no row-parallel all-reduce semantics (there
+    /// is no matmul whose partial outputs sum across ranks — the state
+    /// evolves *per-token*), so naive column/row sharding of the `in_proj` /
+    /// `out_proj` matrices is mathematically wrong rather than merely
+    /// unfinished. A safe `load_tp` needs a bespoke SSM sharding plan. Refuses
+    /// `world_size > 1` until then.
+    pub fn load_tp(
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: MambaConfig,
+        tp: grim_nn::TensorParallelConfig,
+    ) -> Result<Self> {
+        grim_nn::require_single_device(
+            tp,
+            "Mamba",
+            "the SSM recurrent path has no row-parallel all-reduce semantics; \
+             sharding in_proj/out_proj needs a bespoke plan",
+        )
+        .map_err(grim_core::Error::Unimplemented)?;
         let tok_embeddings =
             grim_nn::Embedding::load(&ws.pp("token_embd"), cfg.vocab_size, cfg.hidden_size)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);

@@ -181,14 +181,21 @@ pub fn resolve_model_path(name: &str) -> Option<PathBuf> {
 pub fn resolve_model_preferring_grim(name: &str) -> Option<PathBuf> {
     let models_dir = grim_models_dir();
 
+    // 0. Strip explicit format suffixes (`:grim`, `:gguf`) so that
+    //    `resolve_model_preferring_grim("sleipnir:grim")` and
+    //    `resolve_model_preferring_grim("sleipnir:gguf")` resolve the bare
+    //    stem and then prefer/select the requested format.
+    let (stem, force_ext) = strip_format_suffix(name);
+
     // 1. Direct path (guarded against traversal).
-    let direct = Path::new(name);
+    let direct = Path::new(stem);
     if direct.exists() && is_safe_model_path(direct, &models_dir) {
         // Prefer a `.grim` sibling if the user pointed at a `.gguf` directly.
         if let Some(grim_sibling) = grim_sibling_if_gguf(direct) {
-            return Some(grim_sibling);
+            return Some(resolve_with_ext(&grim_sibling, force_ext)
+                .unwrap_or(grim_sibling));
         }
-        return Some(direct.to_path_buf());
+        return Some(resolve_with_ext(direct, force_ext).unwrap_or_else(|| direct.to_path_buf()));
     }
 
     // 2. Sidecar lookup — accurate, includes arch/name metadata.
@@ -202,16 +209,20 @@ pub fn resolve_model_preferring_grim(name: &str) -> Option<PathBuf> {
             if let Some(catalog) = ModelEntry::load_for(&path.with_extension("gguf"))
                 .or_else(|| ModelEntry::load_for(&path.with_extension("grim")))
             {
-                if catalog.name == name {
+                // Match against the suffix-stripped stem so `sleipnir:grim`
+                // and `sleipnir:gguf` find the same catalog entry as `sleipnir`.
+                if catalog.name == stem {
                     let p = PathBuf::from(&catalog.path);
                     if p.exists() {
-                        if let Some(grim_sibling) = grim_sibling_if_gguf(&p) {
-                            return Some(grim_sibling);
+                        // Honour an explicit `:grim`/`:gguf` suffix — otherwise
+                        // prefer a `.grim` sibling when the catalog points at `.gguf`.
+                        if let Some(resolved) = resolve_with_ext(&p, force_ext) {
+                            return Some(resolved);
                         }
                         return Some(p);
                     }
                 }
-                if catalog.name.starts_with(name) && by_prefix.is_none() {
+                if catalog.name.starts_with(stem) && by_prefix.is_none() {
                     let p = PathBuf::from(&catalog.path);
                     if p.exists() {
                         by_prefix = Some(p);
@@ -220,33 +231,78 @@ pub fn resolve_model_preferring_grim(name: &str) -> Option<PathBuf> {
             }
         }
         if let Some(p) = by_prefix {
-            if let Some(grim_sibling) = grim_sibling_if_gguf(&p) {
-                return Some(grim_sibling);
+            if let Some(resolved) = resolve_with_ext(&p, force_ext) {
+                return Some(resolved);
             }
             return Some(p);
         }
     }
 
     // 3. File scan — extension-based fallback, `.grim` wins over `.gguf`.
-    let stem = name.replace(['/', ':'], "_");
-    let gguf_candidate = models_dir.join(format!("{stem}.gguf"));
-    let grim_candidate = models_dir.join(format!("{stem}.grim"));
+    //    `stem`/`force_ext` have already had any `:grim`/`:gguf` suffix stripped
+    //    in step 0, so a bare lookup like `sleipnir:grim` resolves to
+    //    `sleipnir.grim` rather than the mangled `sleipnir_grim.grim`.
+    let file_stem = stem.replace(['/', ':'], "_");
+    let gguf_candidate = models_dir.join(format!("{file_stem}.gguf"));
+    let grim_candidate = models_dir.join(format!("{file_stem}.grim"));
     if grim_candidate.exists() {
-        return Some(grim_candidate);
+        return Some(resolve_with_ext(&grim_candidate, force_ext)
+            .unwrap_or(grim_candidate));
     }
     if gguf_candidate.exists() {
-        return Some(gguf_candidate);
+        return Some(resolve_with_ext(&gguf_candidate, force_ext)
+            .unwrap_or(gguf_candidate));
     }
-    let gguf_candidate2 = models_dir.join(format!("{name}.gguf"));
-    let grim_candidate2 = models_dir.join(format!("{name}.grim"));
+    let gguf_candidate2 = models_dir.join(format!("{stem}.gguf"));
+    let grim_candidate2 = models_dir.join(format!("{stem}.grim"));
     if grim_candidate2.exists() {
-        return Some(grim_candidate2);
+        return Some(resolve_with_ext(&grim_candidate2, force_ext)
+            .unwrap_or(grim_candidate2));
     }
     if gguf_candidate2.exists() {
-        return Some(gguf_candidate2);
+        return Some(resolve_with_ext(&gguf_candidate2, force_ext)
+            .unwrap_or(gguf_candidate2));
     }
 
     None
+}
+
+/// Strip a `:grim` or `:gguf` format suffix from a model name.
+///
+/// Returns `(stem, force_ext)` where `stem` is the name without the suffix and
+/// `force_ext` is `Some("grim")` or `Some("gguf")` when a suffix was present,
+/// or `None` when the caller left the format implicit.
+fn strip_format_suffix(name: &str) -> (&str, Option<&str>) {
+    if let Some(rest) = name.strip_suffix(":grim") {
+        (rest, Some("grim"))
+    } else if let Some(rest) = name.strip_suffix(":gguf") {
+        (rest, Some("gguf"))
+    } else {
+        (name, None)
+    }
+}
+
+/// When `force_ext` is `Some`, override the candidate's extension if a file
+/// with the *other* extension happens to be the one on disk. This lets
+/// `sleipnir:gguf` resolve the GGUF even when `.grim` also exists.
+fn resolve_with_ext(candidate: &Path, force_ext: Option<&str>) -> Option<PathBuf> {
+    let desired = match force_ext {
+        Some("grim") => "grim",
+        Some("gguf") => "gguf",
+        _ => return Some(candidate.to_path_buf()),
+    };
+    let current_ext = candidate.extension().and_then(|e| e.to_str());
+    if current_ext == Some(desired) {
+        Some(candidate.to_path_buf())
+    } else {
+        // Swap the extension to the one the user explicitly requested.
+        let swapped = candidate.with_extension(desired);
+        if swapped.exists() {
+            Some(swapped)
+        } else {
+            Some(candidate.to_path_buf())
+        }
+    }
 }
 
 /// If `path` is a `.gguf` file with an existing `.grim` sibling, return the

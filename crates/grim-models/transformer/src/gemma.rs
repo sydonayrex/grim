@@ -214,6 +214,36 @@ pub struct Gemma {
 
 impl Gemma {
     pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: GemmaConfig) -> Result<Self> {
+        Self::load_tp(device, ws, cfg, ws.tp_config())
+    }
+
+    /// Tensor-parallel load entry for Gemma.
+    ///
+    /// Gemma's attention layout (separate `wq`/`wk`/`wv`/`wo` + GQA
+    /// `num_kv_heads`) is identical to Llama's, so the *sharding math* would
+    /// reuse `plan_kv_head_sharding` cleanly. However, this module's `forward`
+    /// and `GemmaBlock::forward` call plain `Linear::forward` directly — they
+    /// do not go through `ColumnParallelLinear`/`RowParallelLinear`, so there
+    /// is no all-reduce hook to sum the row-parallel `wo`/`ffn_down` partials
+    /// across ranks. Shipping a load-side `load_tp` without reworking
+    /// `forward` would load a sharded weight whose partial output is never
+    /// reduced — silently wrong logits.
+    ///
+    /// Refuse `world_size > 1` with a typed `Unsupported` error until the
+    /// `forward` rework lands. `world_size == 1` delegates to the plain path.
+    pub fn load_tp(
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: GemmaConfig,
+        tp: grim_nn::TensorParallelConfig,
+    ) -> Result<Self> {
+        grim_nn::require_single_device(
+            tp,
+            "Gemma",
+            "GemmaBlock::forward must be reworked to consume ColumnParallelLinear/RowParallelLinear \
+             so the row-parallel partials get all-reduced",
+        )
+        .map_err(grim_core::Error::Unimplemented)?;
         let tok_embeddings =
             Embedding::load(&ws.pp("token_embd"), cfg.vocab_size, cfg.hidden_size)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);

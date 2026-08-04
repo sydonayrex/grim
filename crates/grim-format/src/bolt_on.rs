@@ -232,6 +232,7 @@ mod tests {
             tensors: vec![entry],
             tensors_by_name: HashMap::new(),
             kv_blobs: HashMap::new(),
+            wave: crate::format::WaveSize::W64,
         };
 
         let dir = tempfile::tempdir().unwrap();

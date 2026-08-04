@@ -416,6 +416,12 @@ impl GrimProvider {
         &self.file.metadata
     }
 
+    /// Target execution wavefront size (32 or 64) declared by `.grim` metadata,
+    /// mirroring [`GgufProvider::wavefront_size`] for native `.grim` files.
+    pub fn wavefront_size(&self) -> u32 {
+        self.file.metadata.wavefront_size
+    }
+
     /// Look up the per-tensor capability extension for `name`, if any.
     ///
     /// Returns `None` for plain version-1 tensors that carry no extension
@@ -808,6 +814,7 @@ mod tests {
             tensors: vec![tensor.clone()],
             tensors_by_name: HashMap::new(),
             kv_blobs: HashMap::new(),
+            wave: crate::format::WaveSize::W64,
         };
 
         let mut buf = Vec::new();

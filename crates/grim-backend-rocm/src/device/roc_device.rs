@@ -236,16 +236,19 @@ impl RocmDevice {
                 }
             }
         }
-        Ok(Self::build(
+        let dev = Self::build(
             ordinal,
             warp_size,
             xnack_val,
             handle_cache,
             streams,
-        ))
+        );
+        // Auto-init RCCL when multi-process TP is active — this rank process
+        // builds its own RcclAllReduce over the full ordinal list so
+        // `RowParallelLinear::forward`'s all_reduce has a live comm handle.
+        dev.auto_init_rccl();
+        Ok(dev)
     }
-
-    /// Build a defensive device with no streams and default props. Used by [see: `RocmDevice::new`, `try_new`, `null_stream`, `Err`]
     fn fallback(ordinal: usize) -> Self {
         Self::build(ordinal, 64, 0, None, Vec::new())
     }
@@ -262,6 +265,75 @@ impl RocmDevice {
     /// Borrow the live RCCL handle (if any) for diagnostic / external use.
     pub fn rccl_handle(&self) -> Option<Arc<crate::rccl::RcclAllReduce>> {
         self.rccl.lock().unwrap().clone()
+    }
+
+    /// Auto-init the RCCL handle from `GRIM_TP_*` env vars when multi-process
+    /// TP is active. Each rank process calls this after construction; the
+    /// handle covers the full ordinal list so every rank's `ncclAllReduce`
+    /// rendezvous with its peers. No-op when `GRIM_TP_SIZE <= 1` or when
+    /// RCCL is unavailable.
+    ///
+    /// Reads the env inline (mirrors `TensorParallelConfig::from_env`) because
+    /// `grim-backend-rocm` cannot depend on `grim-nn` (grim-nn → grim-backend-
+    /// rocm would form a cycle). Must agree with the ordinal-resolution logic
+    /// in `grim-engine`'s `model_loader` and `Engine::new`.
+    pub fn auto_init_rccl(&self) {
+        // Inline TensorParallelConfig::from_env — returns None when GRIM_TP_SIZE
+        // is unset or 1 (single-device).
+        let world_size = std::env::var("GRIM_TP_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&w| w > 1);
+        let Some(world_size) = world_size else {
+            return;
+        };
+        let rank = std::env::var("GRIM_TP_RANK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        if rank >= world_size {
+            eprintln!(
+                "[RocmDevice] invalid TP config: rank {rank} >= world_size {world_size}; \
+                 skipping RCCL init"
+            );
+            return;
+        }
+        // Build the full ordinal list: explicit GRIM_GPUS (one per rank)
+        // or fall back to 0..world_size.
+        let gpus: Vec<usize> = std::env::var("GRIM_GPUS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|t| t.trim().parse::<usize>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let all_ordinals: Vec<usize> = if !gpus.is_empty() && gpus.len() >= world_size {
+            gpus.iter().take(world_size).copied().collect()
+        } else {
+            (0..world_size).collect()
+        };
+        match crate::rccl::RcclAllReduce::try_new(&all_ordinals) {
+            Ok(rccl) => {
+                self.set_rccl_handle(Some(Arc::new(rccl)));
+                eprintln!(
+                    "[RocmDevice] auto-init RCCL: rank {rank}/{world_size} on ordinal {ordinal}, \
+                     comm over {ordinals:?}",
+                    rank = rank,
+                    world_size = world_size,
+                    ordinal = self.ordinal,
+                    ordinals = all_ordinals
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[RocmDevice] RCCL init failed for rank {rank}/{world_size}: {e}; \
+                     RowParallelLinear::forward will fall back to partial output",
+                    rank = rank,
+                    world_size = world_size
+                );
+            }
+        }
     }
 
     /// Probe the total amount of device memory reported by the driver, in bytes. [see: `hipMemGetInfo`, `hipDeviceProp_t`]
@@ -4863,6 +4935,64 @@ impl RocmDevice {
         Ok(f32_storage)
     }
 
+    /// Dequantize Q8_0 packed bytes to an f32 host Vec via the ROCm kernel.
+    fn dequantize_q8_0_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let packed = RocmStorage::copy_from_host_raw_bytes(
+            bytes,
+            &Shape::new(vec![bytes.len()]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let f32_storage = self.dequantize_q8_0(&packed)?;
+        let mut values = self.read_to_host_async(&f32_storage)?;
+        values.truncate(elem_count);
+        Ok(values)
+    }
+
+    /// Dequantize Q4_K packed bytes to F32 on the GPU. [see: `block_q4_K`]
+    /// `packed` must hold `n_blocks` × 144-byte super-blocks; `out` must hold
+    /// `n_blocks` × 256 F32 values.
+    pub fn dequantize_q4k(&self, packed: &RocmStorage) -> Result<RocmStorage> {
+        const QK4_K: usize = 256;
+        const BLOCK_BYTES: usize = 144;
+        let packed_bytes = packed.bytes;
+        let n_blocks = packed_bytes / BLOCK_BYTES;
+        let n_weights = n_blocks * QK4_K;
+        let out_storage = RocmStorage::alloc_gpu(
+            &Shape::new(vec![n_weights]),
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_dequant_q4k(packed, &out_storage, n_blocks)?;
+        Ok(out_storage)
+    }
+
+    /// Dequantize Q4_K packed bytes to an f32 host Vec via the ROCm kernel.
+    fn dequantize_q4k_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let packed = RocmStorage::copy_from_host_raw_bytes(
+            bytes,
+            &Shape::new(vec![bytes.len()]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let f32_storage = self.dequantize_q4k(&packed)?;
+        let mut values = self.read_to_host_async(&f32_storage)?;
+        values.truncate(elem_count);
+        Ok(values)
+    }
+
     /// Dequantize Q8_0 packed bytes to F32. `n_blocks` is the number of [see: `packed`, `packed.bytes / 34`]
     pub(crate) fn launch_dequant_q8_0(
         &self,
@@ -6202,6 +6332,33 @@ pub(crate) fn wmma_route_decision(
             matches!(bits, 2 | 3 | 4 | 8) && out_arith == ArithType::F16
         }
         _ => false,
+    }
+}
+
+impl grim_format::convert::GpuDequant for RocmDevice {
+    fn dequantize(
+        &self,
+        storage: &grim_tensor::dtype::Storage,
+        bytes: &[u8],
+        elem_count: usize,
+    ) -> grim_tensor::error::Result<Option<Vec<f32>>> {
+        match storage {
+            // Q8_0 is bit-exact between CPU `dequant_q80` and the ROCm
+            // `dequantize_q8_0` kernel (block-major f16 scale + 32 int8).
+            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80) => {
+                Ok(Some(self.dequantize_q8_0_host(bytes, elem_count)?))
+            }
+            // Q4_K: bit-exact between CPU `dequant_q4k` and the ROCm
+            // `dequantize_q4k` kernel (interleaved-pair nibble layout,
+            // 6-bit packed sub-block scale/min). Routed through the GPU kernel
+            // instead of the CPU fallback.
+            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K) => {
+                Ok(Some(self.dequantize_q4k_host(bytes, elem_count)?))
+            }
+            // IQ grid-decode formats and other schemes whose GPU kernels do not
+            // yet match the CPU reference layouts remain on the CPU fallback.
+            _ => Ok(None),
+        }
     }
 }
 

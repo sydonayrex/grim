@@ -1,4 +1,4 @@
-//! Custom `.grim` (Outlier-Aware Streams & Wave64) Format representation.
+//! Custom `.grim` (Outlier-Aware Streams & Wave-aware) Format representation.
 //!
 //! Defines the binary layout for native `.grim` model files: a header,
 //! a JSON metadata layer, a tensor registry, and a dual-stream payload
@@ -17,9 +17,85 @@ pub const GRIM_MAGIC: [u8; 5] = FUCKING_SORCERY;
 
 /// Wave64 coalesced memory segment size in bytes.
 ///
-/// Normals stream blocks are aligned to this boundary so that a single
-/// wavefront load fetches exactly one segment (spec §1, §4).
+/// Normals streams are aligned to a wavefront segment boundary (256 B for
+/// Wave64, 128 B for Wave32) so that a single wavefront load fetches
+/// exactly one segment (spec §1, §4).
 pub const WAVE64_SEGMENT_BYTES: usize = 256;
+
+/// Coalesced memory segment size (bytes) of a **Wave32** wavefront's load.
+///
+/// RDNA2 (gfx103x) and later discrete ADIS parts run 32-wide wavefronts, so
+/// their nominal coalesced segment is half a Wave64 segment (32 lanes × 4B).
+pub const WAVE32_SEGMENT_BYTES: usize = 128;
+
+/// Which wavefront size a `.grim` payload was packed and offset-aligned for.
+///
+/// The wave is a *build-time* property: the conversion process dictates it
+/// (RDNA → [`WaveSize::W32`] — the default; CDNA `gfx90x` → [`WaveSize::W64`];
+/// unknown / "all" → [`WaveSize::W32`]). The file is written (padding,
+/// offsets) against that segment. Most callers get W32 by default; a Wave64
+/// build is only reached via an explicit override or a CDNA GCN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaveSize {
+    /// 64-lane wavefront (CDNA), 256-byte coalesced segment. Opt-in.
+    W64,
+    /// 32-lane wavefront (RDNA / default), 128-byte coalesced segment.
+    W32,
+}
+
+impl Default for WaveSize {
+    fn default() -> Self {
+        WaveSize::W32
+    }
+}
+
+impl WaveSize {
+    /// The coalesced segment size (in bytes) this wave packs against.
+    pub fn segment_bytes(self) -> usize {
+        match self {
+            WaveSize::W64 => WAVE64_SEGMENT_BYTES,
+            WaveSize::W32 => WAVE32_SEGMENT_BYTES,
+        }
+    }
+
+    /// The wavefront width in lanes (64 for Wave64, 32 for Wave32).
+    pub fn wave_width(self) -> u32 {
+        match self {
+            WaveSize::W64 => 64,
+            WaveSize::W32 => 32,
+        }
+    }
+
+    /// Map a GCN architecture string to the wave it should be built for.
+    ///
+    /// This project is RDNA-first: RDNA (`gfx103x`, `gfx11x`, `gfx12x`) is
+    /// Wave32 and is the default for anything unrecognized ("auto", "all",
+    /// unknown). Only CDNA (`gfx90x`) resolves to Wave64. Mirrors the
+    /// `gfx` → profile → wavefront mapping used at convert time and by the
+    /// ROCm backend.
+    pub fn from_gcn(gcn: &str) -> Self {
+        let g = gcn.trim().to_ascii_lowercase();
+        if g.starts_with("gfx9") {
+            WaveSize::W64
+        } else {
+            WaveSize::W32
+        }
+    }
+
+    /// Map a stored wavefront width (from metadata) to a `WaveSize`.
+    /// 64 → Wave64; anything else (32 or unset) → Wave32 (default).
+    pub fn from_width(width: u32) -> Self {
+        match width {
+            64 => WaveSize::W64,
+            _ => WaveSize::W32,
+        }
+    }
+}
+
+/// Round `n` up to the next multiple of `segment`.
+fn align_to_segment(n: u64, segment: usize) -> u64 {
+    (n + segment as u64 - 1) / segment as u64 * segment as u64
+}
 
 /// Header of `.grim` model format.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -424,16 +500,26 @@ pub fn read_outliers_with_encoding<R: Read + Seek>(
 /// Compute the packed byte size of a normals stream for one tensor.
 ///
 /// The normals stream holds the low-bit-weight majority, packed at
-/// `base_bitwidth` bits per weight and aligned to [`WAVE64_SEGMENT_BYTES`].
-/// Outlier positions are excluded (they live in the outliers stream), so
-/// the element count is `total_elements - outlier_count`.
+/// `base_bitwidth` bits per weight and aligned to a wave segment
+/// (default [`WAVE64_SEGMENT_BYTES`]; pass a [`WaveSize`] to pack for a
+/// Wave32 host instead). Outlier positions are excluded (they live in
+/// the outliers stream), so the element count is
+/// `total_elements - outlier_count`.
 pub fn normals_packed_size(total_elements: usize, outlier_count: u32, base_bitwidth: u8) -> u64 {
+    normals_packed_size_for_wave(total_elements, outlier_count, base_bitwidth, WaveSize::W64)
+}
+
+/// Wave-aware variant of [`normals_packed_size`].
+pub fn normals_packed_size_for_wave(
+    total_elements: usize,
+    outlier_count: u32,
+    base_bitwidth: u8,
+    wave: WaveSize,
+) -> u64 {
     let normal_elements = total_elements.saturating_sub(outlier_count as usize);
     let bits = normal_elements as u64 * base_bitwidth as u64;
     let bytes = bits.div_ceil(8);
-    let aligned = (bytes + WAVE64_SEGMENT_BYTES as u64 - 1) / WAVE64_SEGMENT_BYTES as u64
-        * WAVE64_SEGMENT_BYTES as u64;
-    aligned
+    align_to_segment(bytes, wave.segment_bytes())
 }
 
 /// Layout of a single tensor's normals stream, used by the Phase 2
@@ -442,11 +528,11 @@ pub fn normals_packed_size(total_elements: usize, outlier_count: u32, base_bitwi
 /// `Legacy` (default) is codes-only — matches the original V1 layout
 /// where the per-tensor entry has no scale region. `WithScales` adds a
 /// per-row scale region of `row_count` bytes (one u8 per row) right
-/// after the codes region, both Wave64-aligned.
+/// after the codes region, both aligned to the wave segment.
 ///
 /// Phase 3 adds optional per-row mixed bitwidths: when `row_bpw_table`
 /// is non-empty, each row is packed at its own bpw and padded to a
-/// Wave64 segment independently.
+/// wave segment independently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalsLayout {
     /// Total dequantized element count of the tensor (rows × row_stride).
@@ -465,6 +551,9 @@ pub struct NormalsLayout {
     /// Per-row bitwidth table. Empty = uniform at `base_bitwidth`.
     /// Each entry must be in 2..=8.
     pub row_bpw_table: Vec<u8>,
+    /// Wavefront the packed region is aligned for. Build-time property,
+    /// defaults to [`WaveSize::W64`].
+    pub wave: WaveSize,
 }
 
 impl NormalsLayout {
@@ -478,6 +567,7 @@ impl NormalsLayout {
             row_count: 0,
             row_stride: 0,
             row_bpw_table: Vec::new(),
+            wave: WaveSize::W64,
         }
     }
 
@@ -499,6 +589,7 @@ impl NormalsLayout {
                 0
             },
             row_bpw_table: Vec::new(),
+            wave: WaveSize::W64,
         }
     }
 
@@ -522,7 +613,14 @@ impl NormalsLayout {
             row_count,
             row_stride,
             row_bpw_table,
+            wave: WaveSize::W64,
         }
+    }
+
+    /// Rebuild this layout for a different wavefront segment.
+    pub fn with_wave(mut self, wave: WaveSize) -> Self {
+        self.wave = wave;
+        self
     }
 
     /// `true` if this layout has a per-row scale region.
@@ -535,16 +633,17 @@ impl NormalsLayout {
         !self.row_bpw_table.is_empty()
     }
 
-    /// Byte size of the codes region, Wave64-aligned.
+    /// Byte size of the codes region, aligned to the layout's wave segment.
     ///
     /// In uniform mode this is the total packed-bit size aligned to one
-    /// Wave64 segment. In mixed-bpw mode each row is packed at its own
+    /// wave segment. In mixed-bpw mode each row is packed at its own
     /// bpw and aligned independently, then concatenated.
     pub fn codes_size(&self) -> u64 {
+        let seg = self.wave.segment_bytes();
         if self.is_mixed_bpw() {
             self.row_bpw_table
                 .iter()
-                .map(|&bpw| align_wave64(row_codes_bytes(self.row_stride, bpw)))
+                .map(|&bpw| align_to_segment(row_codes_bytes(self.row_stride, bpw), seg))
                 .sum()
         } else {
             let normal_elements = self
@@ -552,25 +651,26 @@ impl NormalsLayout {
                 .saturating_sub(self.outlier_count as usize);
             let bits = normal_elements as u64 * self.base_bitwidth as u64;
             let bytes = bits.div_ceil(8);
-            align_wave64(bytes)
+            align_to_segment(bytes, seg)
         }
     }
 
     /// Per-row codes byte sizes (mixed-bpw mode only). Empty in uniform mode.
     pub fn row_codes_sizes(&self) -> Vec<u64> {
+        let seg = self.wave.segment_bytes();
         self.row_bpw_table
             .iter()
-            .map(|&bpw| align_wave64(row_codes_bytes(self.row_stride, bpw)))
+            .map(|&bpw| align_to_segment(row_codes_bytes(self.row_stride, bpw), seg))
             .collect()
     }
 
-    /// Byte size of the per-row scale region, Wave64-aligned. Zero when
-    /// `has_scales()` is false.
+    /// Byte size of the per-row scale region, aligned to the layout's wave
+    /// segment. Zero when `has_scales()` is false.
     pub fn scale_size(&self) -> u64 {
         if !self.has_scales() {
             return 0;
         }
-        align_wave64(self.row_count)
+        align_to_segment(self.row_count, self.wave.segment_bytes())
     }
 
     /// Total normals payload size: codes + scales.
@@ -587,8 +687,7 @@ fn row_codes_bytes(row_stride: u64, bpw: u8) -> u64 {
 
 /// Round `n` up to the next multiple of [`WAVE64_SEGMENT_BYTES`].
 fn align_wave64(n: u64) -> u64 {
-    (n + WAVE64_SEGMENT_BYTES as u64 - 1) / WAVE64_SEGMENT_BYTES as u64
-        * WAVE64_SEGMENT_BYTES as u64
+    align_to_segment(n, WAVE64_SEGMENT_BYTES)
 }
 
 // ---------------------------------------------------------------------------
@@ -841,6 +940,39 @@ pub fn pack_row_bpw(out: &mut Vec<u8>, row_values: &[f32], bpw: u8) {
     out.resize(aligned, 0u8);
 }
 
+/// Wave-aware variant of [`pack_row_bpw`]; aligns each row to `wave`'s
+/// segment so the on-disk layout matches the target host's wavefront.
+pub fn pack_row_bpw_for_wave(out: &mut Vec<u8>, row_values: &[f32], bpw: u8, wave: WaveSize) {
+    let bits = row_values.len() as u64 * bpw as u64;
+    let bytes_needed = bits.div_ceil(8) as usize;
+    let start = out.len();
+    out.resize(start + bytes_needed, 0u8);
+
+    for (i, &v) in row_values.iter().enumerate() {
+        let code = quantize_to_bpw(v, bpw) as u32;
+        let bit_offset = i * bpw as usize;
+        let byte_offset = bit_offset / 8;
+        let in_byte_offset = bit_offset % 8;
+        let bits_left_in_byte = 8 - in_byte_offset;
+
+        if bits_left_in_byte >= bpw as usize {
+            let shift = bits_left_in_byte - bpw as usize;
+            out[start + byte_offset] |= (code << shift) as u8;
+        } else {
+            let high_bits = bits_left_in_byte;
+            let low_bits = bpw as usize - high_bits;
+            out[start + byte_offset] |= (code >> low_bits) as u8;
+            if byte_offset + 1 < bytes_needed {
+                let low_shift = 8 - low_bits;
+                out[start + byte_offset + 1] |= (code << low_shift) as u8;
+            }
+        }
+    }
+
+    let aligned = align_to_segment(out.len() as u64, wave.segment_bytes()) as usize;
+    out.resize(aligned, 0u8);
+}
+
 /// Symmetric uniform quantization of a single f32 value to `bpw` bits.
 /// Returns a code in `[0, 2^bpw - 1]`. Used by [`pack_row_bpw`].
 fn quantize_to_bpw(value: f32, bpw: u8) -> u8 {
@@ -1002,6 +1134,10 @@ pub struct GrimFile {
     pub header: GrimHeader,
     pub metadata: crate::gguf::GrimMetadata,
     pub tensors: Vec<GrimTensorEntry>,
+    /// Wavefront segment this file's payload offsets are aligned to
+    /// (build-time property; derived from metadata on read, RDNA-first
+    /// [`WaveSize::W32`] when unset).
+    pub wave: WaveSize,
     pub tensors_by_name: HashMap<String, usize>,
     /// Optional per-tensor serialized KV-cache blobs (WI-R4). Keyed by
     /// tensor name; only present when a writer attached a compressed KV
@@ -1059,12 +1195,20 @@ impl GrimFile {
             tensors_by_name.insert(t.name.clone(), i);
         }
 
+        let wave = match metadata.wavefront_size {
+            32 => WaveSize::W32,
+            64 => WaveSize::W64,
+            // Unset / unknown: RDNA-first default.
+            _ => WaveSize::W32,
+        };
+
         Ok(Self {
             header,
             metadata,
             tensors,
             tensors_by_name,
             kv_blobs: HashMap::new(),
+            wave,
         })
     }
 
@@ -1108,12 +1252,10 @@ impl GrimFile {
             if entry.kv_present != 0 && entry.kv_compressed_size > 0 {
                 entry.kv_compressed_offset = offset;
                 offset += entry.kv_compressed_size;
-                offset = (offset + WAVE64_SEGMENT_BYTES as u64 - 1) / WAVE64_SEGMENT_BYTES as u64
-                    * WAVE64_SEGMENT_BYTES as u64;
+                offset = align_to_segment(offset, self.wave.segment_bytes());
             }
-            // Align next tensor to a Wave64 segment boundary.
-            offset = (offset + WAVE64_SEGMENT_BYTES as u64 - 1) / WAVE64_SEGMENT_BYTES as u64
-                * WAVE64_SEGMENT_BYTES as u64;
+            // Align next tensor to a wave segment boundary.
+            offset = align_to_segment(offset, self.wave.segment_bytes());
             written_entries.push(entry);
         }
 
@@ -1209,6 +1351,45 @@ mod tests {
         let size = normals_packed_size(1000, 0, 4);
         assert_eq!(size, 512);
         assert_eq!(size % WAVE64_SEGMENT_BYTES as u64, 0);
+    }
+
+    #[test]
+    fn normals_packed_size_for_wave_uses_half_segment_on_wave32() {
+        // Same 1000 elements at 4 bits = 500 bytes, but a Wave32 segment is
+        // 128 bytes → ceiling is 4 segments = 512 (identical); pick a payload
+        // that differs so the Wave64/Wave32 delineation is observable.
+        let w64 = normals_packed_size(128, 0, 4); // 64 bytes → up to 256
+        let w32 = normals_packed_size_for_wave(128, 0, 4, WaveSize::W32); // → up to 128
+        assert_eq!(w64, WAVE64_SEGMENT_BYTES as u64);
+        assert_eq!(w32, WAVE32_SEGMENT_BYTES as u64);
+        assert_eq!(w32 * 2, w64);
+        // Default normals_packed_size stays Wave64.
+        assert_eq!(w64, normals_packed_size(128, 0, 4));
+    }
+
+    #[test]
+    fn wave_size_from_gcn_picks_wave32_default_and_wave64_only_for_cdna() {
+        // RDNA2/3/4 → Wave32 (the project default).
+        let w32 = WaveSize::from_gcn("gfx1036");
+        let w32b = WaveSize::from_gcn("gfx1100");
+        let w32c = WaveSize::from_gcn("gfx1201");
+        // CDNA → Wave64 (opt-in via GCN).
+        let w64 = WaveSize::from_gcn("gfx90a");
+        // Unknown / "all" / "auto" → Wave32 by default.
+        let w32d = WaveSize::from_gcn("all");
+        let w32e = WaveSize::from_gcn("auto");
+        let w32f = WaveSize::from_gcn("nonexistent-arch");
+        assert_eq!(w32, WaveSize::W32);
+        assert_eq!(w32b, WaveSize::W32);
+        assert_eq!(w32c, WaveSize::W32);
+        assert_eq!(w64, WaveSize::W64);
+        assert_eq!(w32d, WaveSize::W32);
+        assert_eq!(w32e, WaveSize::W32);
+        assert_eq!(w32f, WaveSize::W32);
+        // Wave32 maps to double the lanes of Wave64 (64 vs 32) and half the segment.
+        assert_eq!(WaveSize::W64.wave_width(), 64);
+        assert_eq!(WaveSize::W32.wave_width(), 32);
+        assert_eq!(WaveSize::W32.segment_bytes() * 2, WaveSize::W64.segment_bytes());
     }
 
     #[test]
@@ -1487,6 +1668,7 @@ mod tests {
             tensors: vec![tensor],
             tensors_by_name: HashMap::new(),
             kv_blobs: HashMap::new(),
+            wave: WaveSize::W64,
         };
 
         let mut buf = Vec::new();
@@ -1553,6 +1735,7 @@ mod tests {
             tensors: vec![tensor],
             tensors_by_name: HashMap::new(),
             kv_blobs: HashMap::new(),
+            wave: WaveSize::W64,
         };
         file.add_kv_blob("model.layers.0.self_attn.k_proj.weight", blob.clone());
 
@@ -1608,6 +1791,7 @@ mod tests {
             tensors: vec![tensor],
             tensors_by_name: HashMap::new(),
             kv_blobs: HashMap::new(),
+            wave: WaveSize::W64,
         };
         let mut buf = Vec::new();
         let mut cursor = Cursor::new(&mut buf);

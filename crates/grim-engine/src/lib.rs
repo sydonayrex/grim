@@ -154,74 +154,14 @@ pub struct Engine {
     tuned_kv_compression_bit_width: u8,
     tokens_per_sec_ema: f32,
     total_tokens_generated: u64,
-    /// Tensor-parallel rank contexts. Populated in `Engine::new` when
-    /// `config.tp_size > 1`; `None` for single-device operation. Each context
-    /// owns a GPU backend + its TPC ordinal so per-rank `Llama::load_tp`
-    /// reads only its shard and `RocmDevice::all_reduce` has an RCCL handle.
-    tp_rank_contexts: Option<Vec<TpRankContext>>,
-}
-
-/// A single tensor-parallel rank's execution context. Replicates the
-/// `grim-garage::backend::RankContext` *pattern* (grim-engine cannot depend on
-/// grim-garage without forming a cycle) with just the fields the inference
-/// engine needs: shard rank/ordinal, the Rocm device, and the shared RCCL
-/// handle.
-#[derive(Clone)]
-pub struct TpRankContext {
-    /// Global TP rank (0 .. world_size-1). Selects which shard this rank owns.
-    pub rank: usize,
-    /// GPU ordinal this rank executes on.
-    pub ordinal: usize,
-    /// Concrete ROCm backend for this rank.
-    pub device: Arc<grim_backend_rocm::RocmDevice>,
-    /// Shared RCCL communicator across all TP ranks.
-    pub rccl: Arc<grim_backend_rocm::rccl::RcclAllReduce>,
-}
-
-/// Plan `tp_size` tensor-parallel ranks onto the live ROCm devices and attach
-/// a single RCCL communicator to each. Mirrors grim-garage's
-/// `plan_training_ranks`/`build_rank_contexts` admission chain but lives in
-/// grim-engine to avoid a dependency cycle. Fails if fewer than `tp_size` GPUs
-/// are visible — TP never silently degrades to CPU.
-///
-/// `tp_gpus`, when non-empty, overrides auto-selection and pins ranks to the
-/// given GPU ordinals (honouring `EngineConfig::tp_gpus`).
-pub fn plan_tp_ranks(tp_size: usize, tp_gpus: Option<&[usize]>) -> Result<Vec<TpRankContext>> {
-    if tp_size == 0 {
-        return Err(Error::Config("tp_size must be > 0".into()));
-    }
-    let devices = grim_backend_rocm::RocmDevice::probe().map_err(|e| Error::Tensor(e))?;
-    if devices.len() < tp_size {
-        return Err(Error::Config(format!(
-            "TP requested {tp_size} ranks but only {} ROCm device(s) visible",
-            devices.len()
-        )));
-    }
-    // Honour the explicit GPU selection from EngineConfig when present.
-    let ordinals: Vec<usize> = if let Some(gpus) = tp_gpus.filter(|g| !g.is_empty()) {
-        gpus.to_vec()
-    } else {
-        devices.iter().take(tp_size).map(|d| d.ordinal()).collect()
-    };
-    if ordinals.len() < tp_size {
-        return Err(Error::Config(format!(
-            "TP requested {tp_size} ranks but only {} GPU ordinal(s) resolved",
-            ordinals.len()
-        )));
-    }
-    let rccl = Arc::new(grim_backend_rocm::rccl::RcclAllReduce::try_new(&ordinals)?);
-    let mut ranks = Vec::with_capacity(tp_size);
-    for (rank, ordinal) in ordinals.iter().enumerate() {
-        let dev = grim_backend_rocm::RocmDevice::try_new(*ordinal).map_err(|e| Error::Tensor(e))?;
-        dev.set_rccl_handle(Some(rccl.clone()));
-        ranks.push(TpRankContext {
-            rank,
-            ordinal: *ordinal,
-            device: Arc::new(dev),
-            rccl: rccl.clone(),
-        });
-    }
-    Ok(ranks)
+    /// Tensor-parallel config stamped onto each `LoadedModel`. Populated in
+    /// `Engine::new` when TP is active (one OS process per rank, Design A);
+    /// `None` for single-device operation. The actual per-rank device + RCCL
+    /// handle is built in `model_loader`'s ROCm branch and
+    /// `RocmDevice::try_new` (auto-inits RCCL from the same `GRIM_TP_*` env).
+    /// This field exists so the engine can report and re-stamp the shard index
+    /// at model registration without depending on grim-nn at the device layer.
+    tp_config: Option<grim_nn::TensorParallelConfig>,
 }
 
 impl Engine {
@@ -278,39 +218,58 @@ impl Engine {
             pool.attach_compressor(comp.clone());
         }
 
-        // Tensor-parallel bootstrap preview (§c-tp-scope).
-        // The RCCL/NCCL collective impls (roc_device.rs `all_reduce`,
-        // `comm_fuse_reduce`) and the `ColumnParallelLinear`/
-        // `RowParallelLinear` wrappers are present but model construction
-        // still emits plain `Linear` (no callers). Surface TP readiness so
-        // operators see whether multi-GPU TP can actually engage.
         // Tensor-parallel bootstrap (§c-tp-scope, WI-TP-4).
-        // NOTE: grim-engine cannot depend on grim-garage (it depends on grim-
-        // engine, which would form a cycle), so we replicate the
-        // `plan_training_ranks` *pattern* here: probe ROCm, take the first
-        // `tp_size` ordinals, build one RocmDevice per rank, init a single
-        // RCCL communicator over those ordinals, and attach the handle to each
-        // RocmDevice so `BackendDevice::all_reduce` (used by
-        // `RowParallelLinear::forward`) dispatches device-side collectives.
-        let tp_rank_contexts: Option<Vec<TpRankContext>> = if config.tp_size > 1 {
-            match plan_tp_ranks(config.tp_size, Some(&config.tp_gpus)) {
-                Ok(tp) => {
-                    eprintln!(
-                        "[grim-engine] TP active: {} ranks, RCCL handle attached (ordinals {:?})",
-                        tp.len(),
-                        tp.iter().map(|c| c.ordinal).collect::<Vec<_>>()
-                    );
-                    Some(tp)
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[grim-engine] TP requested (tp_size={}) but initialization failed: \
-                         {e} — falling back to single-device mode",
-                        config.tp_size
-                    );
-                    None
-                }
+        //
+        // Design A (multi-process): one OS process per rank. Each process sets
+        // GRIM_TP_SIZE=N + GRIM_TP_RANK=i + (optional) GRIM_GPUS. Here we
+        // resolve *this* process's ordinal from the env for logging and stamp
+        // the derived `tp_config` onto `LoadedModel` at registration time.
+        //
+        // The actual per-rank `RocmDevice` + `RcclAllReduce` is built elsewhere:
+        //   - `model_loader.rs` resolves the rank's ordinal in the ROCm branches
+        //     of `load_from_path`, constructs `Device::Rocm(my_ordinal)`, and
+        //     calls the model's `load_tp` (which shards weights by `ws.tp_config()`).
+        //   - `RocmDevice::try_new` auto-inits RCCL over the full ordinal list
+        //     via `auto_init_rccl()` (roc_device.rs:280), so every rank's
+        //     `ncclAllReduce` rendezvous with its peers.
+        //
+        // We do NOT pre-build RocmDevices or fan out devices in-process here —
+        // that would be the inert `TpRankContext`/`plan_tp_ranks` pattern, which
+        // silently shards weights on one GPU and hangs on `ncclAllReduce` waiting
+        // for peers that never started. Under TP, `Engine::new` must hard-fail
+        // if the config is structurally invalid (rank >= world_size), not
+        // silently degrade to a wrong shard.
+        let tp_config: Option<grim_nn::TensorParallelConfig> = if config.tp_size > 1 {
+            let tp = grim_nn::TensorParallelConfig::from_env().unwrap_or_default();
+            if let Err(msg) = tp.validate() {
+                // TP requested but structurally invalid — hard fail so the
+                // operator sees the mismatch immediately instead of silently
+                // loading the wrong shard. Engine::new returns Self (not Result),
+                // so we panic; this is an unrecoverable config error.
+                eprintln!(
+                    "[grim-engine] INVALID TP config (GRIM_TP_SIZE={}): {msg}",
+                    config.tp_size
+                );
+                panic!(
+                    "invalid tensor-parallel configuration (GRIM_TP_SIZE / GRIM_TP_RANK): {msg}"
+                );
             }
+            // Resolve this rank's GPU ordinal (mirrors model_loader's logic)
+            // for diagnostics — the actual device is built in the loader.
+            let gpus: Vec<usize> = std::env::var("GRIM_GPUS")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .filter_map(|t| t.trim().parse::<usize>().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let my_ordinal = gpus.get(tp.rank).copied().unwrap_or(tp.rank);
+            eprintln!(
+                "[grim-engine] TP rank {}/{} on ordinal {} (device built in model_loader)",
+                tp.rank, tp.world_size, my_ordinal
+            );
+            Some(tp)
         } else {
             None
         };
@@ -347,21 +306,16 @@ impl Engine {
             tuned_kv_compression_bit_width: 4,
             tokens_per_sec_ema: 0.0,
             total_tokens_generated: 0,
-            tp_rank_contexts,
+            tp_config,
         }
     }
 
-    /// Tensor-parallel configuration derived from the environment. `GRIM_TP_RANK`
-    /// selects this process's shard index; `GRIM_TP_SIZE` selects the world size.
-    /// Returns `None` when `GRIM_TP_SIZE` is unset or 1 (single-device).
+    /// Tensor-parallel configuration resolved once at `Engine::new` from the env.
+    /// `GRIM_TP_RANK` selects this process's shard index; `GRIM_TP_SIZE` selects
+    /// the world size. Returns `None` when `GRIM_TP_SIZE` is unset or 1
+    /// (single-device).
     pub fn tp_config(&self) -> Option<grim_nn::TensorParallelConfig> {
-        grim_nn::TensorParallelConfig::from_env()
-    }
-
-    /// Per-rank execution contexts for tensor parallelism (`None` when TP is
-    /// inactive). Each context owns a GPU backend and its TPC ordinal.
-    pub fn tp_rank_contexts(&self) -> Option<&[TpRankContext]> {
-        self.tp_rank_contexts.as_deref()
+        self.tp_config.clone()
     }
 
     /// Register a `CausalLm` auto-wrapped in `SpeculativeCausalLm::auto`.
@@ -1496,6 +1450,8 @@ mod tests {
             "gfx1100",
             16.0,
             0,
+            None,
+            None,
             None,
             None,
             None,

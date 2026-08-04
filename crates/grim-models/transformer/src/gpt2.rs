@@ -227,6 +227,39 @@ pub struct Gpt2 {
 
 impl Gpt2 {
     pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: Gpt2Config) -> Result<Self> {
+        Self::load_tp(device, ws, cfg, ws.tp_config())
+    }
+
+    /// Tensor-parallel load entry for GPT-2.
+    ///
+    /// GPT-2 stores attention as a single **fused `wqkv` projection** of shape
+    /// `[hidden, 3*hidden]` whose output dim interleaves Q, K, V per head
+    /// (`forward` reshapes by `num_heads`). Cleanly column-sharding it on
+    /// `world_size` requires reshaping the weight into `[3, num_heads,
+    /// head_dim, hidden]`, splitting along the head axis, and re-flattening —
+    /// a non-trivial transformation that `Linear::load_column_parallel`
+    /// (which shards dim 0 uniformly) cannot express. Doing the naive dim-0
+    /// split would cut across the (Q, K, V) interleaving and silently
+    /// corrupt attention — the exact bug class called out in the TP sanity
+    /// check.
+    ///
+    /// Rather than ship a wrong split, this entry honours `world_size == 1`
+    /// (delegates to the plain `load`) and **refuses `world_size > 1`** with a
+    /// typed `Unsupported` error. A full GPT-2 `load_tp` (head-axis reshape +
+    /// `ColumnParallelLinear`/`RowParallelLinear` + rewritten `forward`) is
+    /// tracked as a follow-up.
+    pub fn load_tp(
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: Gpt2Config,
+        tp: grim_nn::TensorParallelConfig,
+    ) -> Result<Self> {
+        grim_nn::require_single_device(
+            tp,
+            "GPT-2",
+            "fused QKV projection needs head-axis reshape before column-parallel sharding",
+        )
+        .map_err(grim_core::Error::Unimplemented)?;
         let wte = Embedding::load(&ws.pp("wte"), cfg.vocab_size, cfg.hidden_size)?;
         let wpe = Embedding::load(&ws.pp("wpe"), cfg.max_seq_len, cfg.hidden_size)?;
         // Validate position embedding count matches config

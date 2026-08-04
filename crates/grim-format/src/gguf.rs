@@ -501,6 +501,18 @@ pub struct GrimMetadata {
     /// Target WeightFormat codec to use during conversion. When `None`,
     /// `Bf16` (the default codec) is used.
     pub target_weight_format: Option<String>,
+    /// Rotation preprocessing identifier, e.g. `"gyrot"`.
+    pub rotation_id: Option<String>,
+    /// Raw bytes of the inverse rotation transform for runtime inversion.
+    pub rotation_inverse: Option<Vec<u8>>,
+    /// Error reconstruction method, e.g. `"serq"`.
+    pub recon_method: Option<String>,
+    /// Rank of the reconstruction residual matrix.
+    pub recon_rank: Option<u32>,
+    /// KV cache quantization method, e.g. `"rotatekv"`.
+    pub kv_method: Option<String>,
+    /// Target bits-per-weight for KV cache quantization.
+    pub kv_bpw: Option<f32>,
 }
 
 impl Default for GrimMetadata {
@@ -526,9 +538,73 @@ impl Default for GrimMetadata {
             ext_entries: Vec::new(),
             gguf_metadata: None,
             target_weight_format: None,
+            rotation_id: None,
+            rotation_inverse: None,
+            recon_method: None,
+            recon_rank: None,
+            kv_method: None,
+            kv_bpw: None,
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Format v2 extension payload helpers
+// ---------------------------------------------------------------------------
+
+/// Extension payloads for rotation, reconstruction, and KV cache metadata.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct GrimMetadataV2 {
+    pub rotation_id: Option<String>,
+    pub rotation_inverse: Option<Vec<u8>>,
+    pub recon_method: Option<String>,
+    pub recon_rank: Option<u32>,
+    pub kv_method: Option<String>,
+    pub kv_bpw: Option<f32>,
+}
+
+impl GrimMetadata {
+    /// Read format-v2 rotation id from the nested metadata object.
+    pub fn rotation_id(&self) -> Option<String> {
+        self.gguf_metadata
+            .as_ref()
+            .and_then(|m| m.get("grim.ext.v2.json"))
+            .and_then(|v| match v {
+                GgufValue::String(s) => {
+                    serde_json::from_str::<GrimMetadataV2>(s)
+                        .ok()
+                        .and_then(|v2| v2.rotation_id)
+                }
+                _ => None,
+            })
+    }
+
+    /// Write v2 payload back into the nested metadata object.
+    pub fn set_v2(&mut self, v2: GrimMetadataV2) {
+        let json = serde_json::to_string(&v2).expect("grim metadata v2 serializes");
+        let mut map = self.gguf_metadata.take().unwrap_or_default();
+        map.insert("grim.ext.v2.json".into(), GgufValue::String(json));
+        self.gguf_metadata = Some(map);
+    }
+
+    /// Read v2 payload from the nested metadata object.
+    pub fn v2(&self) -> GrimMetadataV2 {
+        self.gguf_metadata
+            .as_ref()
+            .and_then(|m| m.get("grim.ext.v2.json"))
+            .and_then(|v| match v {
+                GgufValue::String(s) => serde_json::from_str::<GrimMetadataV2>(s).ok(),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Convenience accessor for format-v2 reconstruction metadata.
+    pub fn recon_method(&self) -> Option<String> {
+        self.v2().recon_method
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // GgufValue ↔ JSON conversion helpers
@@ -690,6 +766,12 @@ impl GrimMetadata {
             has_kv_registry,
             ext_entries: Vec::new(),
             gguf_metadata: None,
+            rotation_id: None,
+            rotation_inverse: None,
+            recon_method: None,
+            recon_rank: None,
+            kv_method: None,
+            kv_bpw: None,
         }
     }
 
@@ -976,6 +1058,29 @@ impl GrimMetadata {
             }
             obj.insert("_gguf_metadata".into(), serde_json::Value::Object(gguf_obj));
         }
+        if let Some(id) = &self.rotation_id {
+            obj.insert("rotation_id".into(), serde_json::Value::String(id.clone()));
+        }
+        if let Some(bytes) = &self.rotation_inverse {
+            obj.insert(
+                "rotation_inverse".into(),
+                serde_json::Value::Array(
+                    bytes.iter().map(|b| serde_json::Value::Number((*b).into())).collect(),
+                ),
+            );
+        }
+        if let Some(method) = &self.recon_method {
+            obj.insert("recon_method".into(), serde_json::Value::String(method.clone()));
+        }
+        if let Some(rank) = self.recon_rank {
+            obj.insert("recon_rank".into(), serde_json::Value::Number(rank.into()));
+        }
+        if let Some(method) = &self.kv_method {
+            obj.insert("kv_method".into(), serde_json::Value::String(method.clone()));
+        }
+        if let Some(bpw) = self.kv_bpw {
+            obj.insert("kv_bpw".into(), serde_json::Value::Number(serde_json::Number::from_f64(bpw as f64).unwrap()));
+        }
         serde_json::Value::Object(obj)
     }
 
@@ -1058,6 +1163,15 @@ impl GrimMetadata {
         let xnack_enabled = obj.get("xnack_enabled").and_then(|v| v.as_bool());
         let kv_layout_optimized = obj.get("kv_layout_optimized").and_then(|v| v.as_bool());
         let has_kv_registry = obj.get("has_kv_registry").and_then(|v| v.as_bool());
+        let rotation_id = obj.get("rotation_id").and_then(|v| v.as_str()).map(String::from);
+        let rotation_inverse = obj
+            .get("rotation_inverse")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect());
+        let recon_method = obj.get("recon_method").and_then(|v| v.as_str()).map(String::from);
+        let recon_rank = obj.get("recon_rank").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let kv_method = obj.get("kv_method").and_then(|v| v.as_str()).map(String::from);
+        let kv_bpw = obj.get("kv_bpw").and_then(|v| v.as_f64()).map(|v| v as f32);
         let ext_entries = obj
             .get("grim.ext.entries")
             .and_then(|v| v.as_array())
@@ -1097,6 +1211,12 @@ impl GrimMetadata {
             xnack_enabled,
             kv_layout_optimized,
             has_kv_registry,
+            rotation_id,
+            rotation_inverse,
+            recon_method,
+            recon_rank,
+            kv_method,
+            kv_bpw,
             ext_entries,
             gguf_metadata,
         }
@@ -1632,6 +1752,12 @@ mod tests {
             xnack_enabled: Some(false),
             kv_layout_optimized: Some(true),
             has_kv_registry: Some(true),
+            rotation_id: Some("gyrot".into()),
+            rotation_inverse: Some(vec![1, 2, 3]),
+            recon_method: Some("serq".into()),
+            recon_rank: Some(4),
+            kv_method: Some("rotatekv".into()),
+            kv_bpw: Some(3.25),
             ext_entries: Vec::new(),
             gguf_metadata: None,
         }

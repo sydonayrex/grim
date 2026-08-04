@@ -9,6 +9,24 @@ use grim_quant::evopress_search;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::provider::TensorProvider;
 
+/// Hook for offloading tensor dequantization to an accelerator during
+/// `.grim` conversion.
+///
+/// Implemented by GPU backends (e.g. `grim-backend-rocm`). When an
+/// implementation returns `Ok(None)` the caller falls back to the CPU
+/// dequant path for that tensor's storage scheme.
+pub trait GpuDequant {
+    /// Dequantize `bytes` (a raw storage payload for `storage`) into
+    /// `elem_count` f32 values. Returning `Ok(None)` means this storage
+    /// scheme is not supported and the caller should use the CPU path.
+    fn dequantize(
+        &self,
+        storage: &grim_tensor::dtype::Storage,
+        bytes: &[u8],
+        elem_count: usize,
+    ) -> Result<Option<Vec<f32>>>;
+}
+
 /// Retrieve the type tag representing a GgufValue.
 ///
 /// SAFETY: Pure lookup function mapping enum variants.
@@ -409,6 +427,80 @@ pub fn convert_to_grim(
     caller_metadata: Option<crate::gguf::GrimMetadata>,
     // Target WeightFormat codec. When `None`, uses Bf16 (default).
     target_format: Option<String>,
+    // Build wavefront size. When `None`, resolves from `target_gcn`
+    // (RDNA → W32 default, CDNA `gfx90x` → W64).
+    wave: Option<crate::format::WaveSize>,
+    // Progress callback invoked with `(stage, done, total)` so the CLI
+    // can render a conversion percentage bar. Stages: "evopress",
+    // "pack", "write". When `None`, no progress is reported.
+    progress: Option<&mut dyn FnMut(&str, usize, usize)>,
+) -> Result<()> {
+    convert_to_grim_inner(
+        input_path,
+        output_path,
+        target_gcn,
+        target_bpw,
+        generations,
+        dataset,
+        train_state,
+        evopress_bitwidths,
+        caller_metadata,
+        target_format,
+        wave,
+        progress,
+        None,
+    )
+}
+
+/// Same as [`convert_to_grim`], but dequantizes tensors through the
+/// supplied [`GpuDequant`] hook when the storage scheme is supported.
+/// Schemes the hook does not handle fall back to the CPU path.
+pub fn convert_to_grim_with_dequant(
+    input_path: &str,
+    output_path: &str,
+    target_gcn: &str,
+    target_bpw: f32,
+    generations: usize,
+    dataset: Option<&str>,
+    train_state: Option<&crate::train::TrainState>,
+    evopress_bitwidths: Option<Vec<u32>>,
+    caller_metadata: Option<crate::gguf::GrimMetadata>,
+    target_format: Option<String>,
+    wave: Option<crate::format::WaveSize>,
+    progress: Option<&mut dyn FnMut(&str, usize, usize)>,
+    gpu_dequant: &dyn GpuDequant,
+) -> Result<()> {
+    convert_to_grim_inner(
+        input_path,
+        output_path,
+        target_gcn,
+        target_bpw,
+        generations,
+        dataset,
+        train_state,
+        evopress_bitwidths,
+        caller_metadata,
+        target_format,
+        wave,
+        progress,
+        Some(gpu_dequant),
+    )
+}
+
+fn convert_to_grim_inner(
+    input_path: &str,
+    output_path: &str,
+    target_gcn: &str,
+    target_bpw: f32,
+    generations: usize,
+    dataset: Option<&str>,
+    train_state: Option<&crate::train::TrainState>,
+    evopress_bitwidths: Option<Vec<u32>>,
+    caller_metadata: Option<crate::gguf::GrimMetadata>,
+    target_format: Option<String>,
+    wave: Option<crate::format::WaveSize>,
+    mut progress: Option<&mut dyn FnMut(&str, usize, usize)>,
+    gpu_dequant: Option<&dyn GpuDequant>,
 ) -> Result<()> {
     println!("[Grim Convert] Starting conversion pipeline...");
     println!("  Source: {}", input_path);
@@ -459,16 +551,28 @@ pub fn convert_to_grim(
             target_bpw,
             ..grim_quant::EvoPressConfig::default()
         };
-        let genes = evopress_search(&config, &importance_scores, &tensor_sizes);
+        let genes = evopress_search(
+            &config,
+            &importance_scores,
+            &tensor_sizes,
+            None, // EvoPress runs inline here; the CLI runs it separately.
+        );
         Some(genes)
     } else {
         evopress_bitwidths
     };
 
     let profile = gcn_to_profile(target_gcn);
+    let wave = wave.unwrap_or_else(|| crate::format::WaveSize::from_gcn(target_gcn));
 
-    let (entries, ext_entries) =
-        build_entries_from_source(input_path, target_bpw, evopress_bitwidths.clone())?;
+    let (entries, ext_entries) = build_entries_from_source(
+        input_path,
+        target_bpw,
+        evopress_bitwidths.clone(),
+        wave,
+        &mut progress,
+        gpu_dequant,
+    )?;
     let mut metadata = match caller_metadata {
         Some(m) => m,
         None => build_grim_metadata(
@@ -490,7 +594,7 @@ pub fn convert_to_grim(
         metadata.rocml_profile = profile;
     }
     if metadata.wavefront_size == 0 {
-        metadata.wavefront_size = profile.wavefront_size();
+        metadata.wavefront_size = wave.wave_width();
     }
     if metadata.target_gcn.is_none() {
         metadata.target_gcn = Some(target_gcn.to_string());
@@ -534,6 +638,7 @@ pub fn convert_to_grim(
         tensors: entries.iter().map(|(e, _)| e.clone()).collect(),
         tensors_by_name: std::collections::HashMap::new(),
         kv_blobs: std::collections::HashMap::new(),
+        wave,
     };
 
     let outfile = File::create(output_path)
@@ -543,6 +648,10 @@ pub fn convert_to_grim(
 
     for (i, entry) in written_entries.iter().enumerate() {
         let (_, normals_bytes) = &entries[i];
+
+        if let Some(cb) = progress.as_deref_mut() {
+            cb("write", i + 1, written_entries.len());
+        }
 
         let current_pos = writer
             .stream_position()
@@ -585,6 +694,9 @@ fn build_entries_from_source(
     input_path: &str,
     target_bpw: f32,
     evopress_bitwidths: Option<Vec<u32>>,
+    wave: crate::format::WaveSize,
+    progress: &mut Option<&mut dyn FnMut(&str, usize, usize)>,
+    gpu_dequant: Option<&dyn GpuDequant>,
 ) -> Result<(
     Vec<(crate::format::GrimTensorEntry, Vec<u8>)>,
     Vec<crate::spec::GrimTensorExt>,
@@ -593,11 +705,27 @@ fn build_entries_from_source(
     if lower.ends_with(".gguf") || lower.ends_with(".grim") {
         let provider = crate::tprov::GgufProvider::open(input_path)?;
         let names: Vec<String> = provider.tensors().keys().cloned().collect();
-        pack_tensors(&provider, &names, target_bpw, evopress_bitwidths)
+        pack_tensors(
+            &provider,
+            &names,
+            target_bpw,
+            evopress_bitwidths,
+            wave,
+            progress,
+            gpu_dequant,
+        )
     } else if lower.ends_with(".safetensors") || lower.ends_with(".bin") {
         let provider = crate::tprov::SafetensorsProvider::open(input_path)?;
         let names: Vec<String> = provider.tensors().keys().cloned().collect();
-        pack_tensors(&provider, &names, target_bpw, evopress_bitwidths)
+        pack_tensors(
+            &provider,
+            &names,
+            target_bpw,
+            evopress_bitwidths,
+            wave,
+            progress,
+            gpu_dequant,
+        )
     } else {
         Err(Error::Backend(format!(
             "unsupported source format: '{input_path}'. Supported: .gguf, .grim, .safetensors, .bin"
@@ -614,13 +742,20 @@ fn pack_tensors(
     names: &[String],
     target_bpw: f32,
     evopress_bitwidths: Option<Vec<u32>>,
+    wave: crate::format::WaveSize,
+    progress: &mut Option<&mut dyn FnMut(&str, usize, usize)>,
+    gpu_dequant: Option<&dyn GpuDequant>,
 ) -> Result<(
     Vec<(crate::format::GrimTensorEntry, Vec<u8>)>,
     Vec<crate::spec::GrimTensorExt>,
 )> {
     let mut result = Vec::with_capacity(names.len());
     let mut ext_entries = Vec::with_capacity(names.len());
+    let total = names.len();
     for (i, name) in names.iter().enumerate() {
+        if let Some(cb) = progress.as_deref_mut() {
+            cb("pack", i + 1, total);
+        }
         let raw = provider.get(name)?;
         let meta = provider.meta(name)?;
         if meta.provenance.is_external_qat() {
@@ -641,100 +776,16 @@ fn pack_tensors(
             target_bpw.round() as u8
         };
 
-        // Dequantize raw bytes to f32 values first — needed for SpQR sidecar
-        let f32_values = match raw.dtype.storage {
-            grim_tensor::dtype::Storage::Native => {
-                // Already FP32 - just use as-is
-                raw.bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect::<Vec<f32>>()
+        // Dequantize raw bytes to f32 values first — needed for SpQR sidecar.
+        // Try the GPU hook first; fall back to the CPU path when the hook
+        // does not support the tensor's storage scheme.
+        let f32_values = if let Some(gpu) = gpu_dequant {
+            match gpu.dequantize(&raw.dtype.storage, &raw.bytes, elem_count)? {
+                Some(vals) => vals,
+                None => dequant_tensor_data(&raw, elem_count)?,
             }
-            grim_tensor::dtype::Storage::KQuant(scheme) => {
-                // Dequantize based on scheme
-                let num_weights = elem_count;
-                match scheme {
-                    grim_tensor::dtype::KQuantScheme::Q80 => {
-                        grim_quant::dequant_q80(&raw.bytes, num_weights)?
-                    }
-                    grim_tensor::dtype::KQuantScheme::Q4K => {
-                        grim_quant::dequant_q4k(&raw.bytes, num_weights)?
-                    }
-                    grim_tensor::dtype::KQuantScheme::Q5K => {
-                        grim_quant::dequant_q5k(&raw.bytes, num_weights)?
-                    }
-                    grim_tensor::dtype::KQuantScheme::Q6K => {
-                        grim_quant::dequant_q6k(&raw.bytes, num_weights)?
-                    }
-                    grim_tensor::dtype::KQuantScheme::Q2K => {
-                        grim_quant::dequant_q2k(&raw.bytes, num_weights)?
-                    }
-                    grim_tensor::dtype::KQuantScheme::Q3K => {
-                        grim_quant::dequant_q3k(&raw.bytes, num_weights)?
-                    }
-                    grim_tensor::dtype::KQuantScheme::IQ4NL => {
-                        grim_quant::dequant_iq4nl(&raw.bytes, num_weights)?
-                    }
-                    grim_tensor::dtype::KQuantScheme::IQ4XS => {
-                        grim_quant::dequant_iq4xs(&raw.bytes, num_weights)?
-                    }
-                    grim_tensor::dtype::KQuantScheme::IQ3XXS => {
-                        grim_quant::dequant_iq3xxs(&raw.bytes, num_weights)?
-                    }
-                    grim_tensor::dtype::KQuantScheme::IQ3S => {
-                        grim_quant::dequant_iq3s(&raw.bytes, num_weights)?
-                    }
-                    grim_tensor::dtype::KQuantScheme::IQ2XXS => {
-                        grim_quant::dequant_iq2xxs(&raw.bytes, num_weights)?
-                    }
-                    grim_tensor::dtype::KQuantScheme::IQ2XS => {
-                        grim_quant::dequant_iq2xs(&raw.bytes, num_weights)?
-                    }
-                    grim_tensor::dtype::KQuantScheme::IQ2S => {
-                        grim_quant::dequant_iq2s(&raw.bytes, num_weights)?
-                    }
-                }
-            }
-            grim_tensor::dtype::Storage::Block(bd) => match bd {
-                grim_tensor::dtype::BlockDtype::Fp4
-                | grim_tensor::dtype::BlockDtype::Fp4Block16 => {
-                    grim_quant::dequant_fp4_block16(&raw.bytes, elem_count)?
-                }
-                grim_tensor::dtype::BlockDtype::Nf4 => {
-                    grim_quant::dequant_nf4(&raw.bytes, elem_count)?
-                }
-                grim_tensor::dtype::BlockDtype::Fp8
-                | grim_tensor::dtype::BlockDtype::Fp8Block16 => {
-                    grim_quant::dequant_fp8_block16(&raw.bytes, elem_count)?
-                }
-            },
-            grim_tensor::dtype::Storage::FloatPack(scheme) => match scheme {
-                grim_tensor::dtype::FloatPackScheme::Fp4 => {
-                    grim_quant::dequant_fp4(&raw.bytes, elem_count)?
-                }
-                grim_tensor::dtype::FloatPackScheme::Nf4 => {
-                    grim_quant::dequant_nf4(&raw.bytes, elem_count)?
-                }
-                grim_tensor::dtype::FloatPackScheme::Fp8 => {
-                    grim_quant::dequant_fp8(&raw.bytes, elem_count)?
-                }
-                grim_tensor::dtype::FloatPackScheme::MxFp4 => {
-                    grim_quant::dequant_mxfp4(&raw.bytes, elem_count)?
-                }
-                grim_tensor::dtype::FloatPackScheme::MxFp8 => {
-                    grim_quant::dequant_mxfp8(&raw.bytes, elem_count)?
-                }
-            },
-            grim_tensor::dtype::Storage::GroupInt(cfg) => {
-                dequant_group_int_bytes(&raw.bytes, &meta.shape, cfg.bits as u32, cfg.group_size)?
-            }
-            grim_tensor::dtype::Storage::ResidualPacked(cfg) => {
-                return Err(Error::Unimplemented(format!(
-                    "ResidualPacked (bpw {}) host materialization not implemented: this layout \
-                     is dequantized on-the-fly on ROCm only (WI-T8 producer pending)",
-                    cfg.bpw
-                )));
-            }
+        } else {
+            dequant_tensor_data(&raw, elem_count)?
         };
 
         // Re-quantize to target bitwidth
@@ -758,13 +809,14 @@ fn pack_tensors(
             grim_quant::spinquant_rotate(&mut f32_values, elem_sqrt, 0.01, 5);
         }
 
-        let payload_size = crate::format::normals_packed_size(elem_count, 0, tensor_bitwidth);
+        let payload_size =
+            crate::format::normals_packed_size_for_wave(elem_count, 0, tensor_bitwidth, wave);
         let mut normals = Vec::with_capacity(payload_size as usize);
 
         // Pack in rows (for now, treat entire tensor as single row)
-        // Wave64 segment = 256 bytes = 2048 bits
-        // At bpw bits per weight, that's 2048/bpw weights per segment
-        crate::format::pack_row_bpw(&mut normals, &f32_values, tensor_bitwidth);
+        // Segment size = wave.segment_bytes() bytes = wave * 32 bits
+        // At bpw bits per weight, that's segment_bits/bpw weights per segment
+        crate::format::pack_row_bpw_for_wave(&mut normals, &f32_values, tensor_bitwidth, wave);
 
         // Resize to exact payload size
         normals.resize(payload_size as usize, 0u8);

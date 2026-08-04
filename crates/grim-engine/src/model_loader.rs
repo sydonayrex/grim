@@ -19,11 +19,95 @@ use grim_models_transformer::{
     Lfm2, Lfm2Config, Llama, LlamaConfig, MoeConfig, PhiConfig, QwenConfig, T5, T5Config,
 };
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
-use grim_nn::WeightSource;
+use grim_nn::{TensorParallelConfig, WeightSource};
 use grim_plugin::ArchCompatSpec;
 use grim_tensor::{Device, TensorProvider};
 use serde::Deserialize;
 use std::path::Path;
+
+/// Resolve this process's tensor-parallel config from `GRIM_TP_*` and validate
+/// the `(rank, world_size)` contract.
+///
+/// Returns the default `{rank:0, world_size:1}` when `GRIM_TP_SIZE` is unset
+/// or `1` (single-device). Returns `Err(Config)` on a malformed contract
+/// (e.g. `rank >= world_size`, `world_size == 0`) so the loader fails loudly
+/// rather than silently loading the wrong shard — the central correctness fix
+/// from the TP sanity check.
+///
+/// This is the **single source of truth** for `(rank, world_size)` inside the
+/// loader. The derived `tp` is attached to every `WeightSource` via
+/// `with_tp_config(tp)`, so `get_sharded` slices by `tp.rank`; and it is passed
+/// by value to each `Foo::load_tp(...)` so the column/row-parallel linears
+/// shard consistently. `Llama::load` / `LlamaBlock::load` no longer re-read the
+/// env (they take `ws.tp_config()` instead), closing the split-brain where the
+/// loader's slice rank could disagree with the model's shard rank.
+fn resolve_tp_config() -> Result<TensorParallelConfig> {
+    let tp = TensorParallelConfig::from_env().unwrap_or_default();
+    if let Err(msg) = tp.validate() {
+        return Err(Error::Config(format!(
+            "invalid tensor-parallel configuration (GRIM_TP_SIZE / GRIM_TP_RANK): {msg}"
+        )));
+    }
+    if tp.world_size > 1 {
+        eprintln!(
+            "[grim-engine] TP rank {}/{} (from GRIM_TP_*); \
+             loading only this rank's shard",
+            tp.rank, tp.world_size
+        );
+    }
+    Ok(tp)
+}
+
+/// Resolve which GPU ordinal this process should load on under the
+/// multi-process TP contract.
+///
+/// - When `GRIM_TP_SIZE > 1`: the ordinal is `GRIM_GPUS[GRIM_TP_RANK]` if the
+///   env gave one ordinal per rank; otherwise it falls back to
+///   `GRIM_TP_RANK` itself as the ordinal. The full ordinal list
+///   (`all_ordinals`) is also returned so the engine can build a single
+///   `RcclAllReduce` over the whole group (`ncclCommInitAll` needs every
+///   participating ordinal, not just this rank's).
+/// - When `GRIM_TP_SIZE <= 1` (single-device): returns `(None, None)` so the
+///   caller uses its existing "pick `probe().first()`" heuristic.
+///
+/// This must agree with `resolve_tp_config()`'s validation — it reads the same
+/// `GRIM_TP_*` env vars. Kept here (and mirrored in `Engine::new`) so the
+/// loader and engine pick the same ordinal without a shared crate dependency.
+fn resolve_tp_ordinal() -> Result<(Option<usize>, Option<Vec<usize>>)> {
+    let tp = TensorParallelConfig::from_env();
+    let Some(tp) = tp else {
+        return Ok((None, None));
+    };
+    tp.validate().map_err(|msg| {
+        Error::Config(format!(
+            "invalid tensor-parallel configuration (GRIM_TP_SIZE / GRIM_TP_RANK): {msg}"
+        ))
+    })?;
+    let gpus: Vec<usize> = std::env::var("GRIM_GPUS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|t| t.trim().parse::<usize>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    // All participating ordinals for the RCCL group.
+    let all_ordinals: Vec<usize> = if !gpus.is_empty() {
+        // Honour the explicit selection; pad up to world_size with rank-as-ordinal
+        // only if the user gave a short list (defensive — the documented contract
+        // is one ordinal per rank).
+        if gpus.len() >= tp.world_size {
+            gpus.iter().take(tp.world_size).copied().collect()
+        } else {
+            (0..tp.world_size).collect()
+        }
+    } else {
+        (0..tp.world_size).collect()
+    };
+    // This rank's ordinal: explicit list indexed by rank, else rank-as-ordinal.
+    let my_ordinal = gpus.get(tp.rank).copied().unwrap_or(tp.rank);
+    Ok((Some(my_ordinal), Some(all_ordinals)))
+}
 
 /// Debug-only logging macro. Compiles to a no-op in release builds so that
 /// diagnostic  calls do not pollute production stderr (sims.md issue #7).
@@ -33,6 +117,22 @@ macro_rules! dbg_eprintln {
         { eprintln!($($arg)*) }
     };
 }
+/// Probe the host GPU's actual wavefront size for a ROCm `Device`.
+///
+/// Returns `None` when the device is not a ROCm GPU (CPU, CUDA, Metal, Vulkan)
+/// or when the HIP probe itself fails. This is used by
+/// [`load_model_from_grim`] to gate `.grim` loading on wavefront compatibility.
+fn probe_host_wavefront_size(device: &Device) -> Option<u32> {
+    match device {
+        Device::Rocm(ordinal) => {
+            grim_backend_rocm::probe_host_gpu(*ordinal)
+                .ok()
+                .map(|caps| caps.wavefront_size)
+        }
+        _ => None,
+    }
+}
+
 /// Attempt to resolve an `ArchCompatSpec` for an unknown architecture string,
 /// first from an inline HF `config.json` string, and second by searching installed
 /// `.grimplugin` manifests in `grim_plugins_dir()`.
@@ -149,6 +249,26 @@ pub fn load_model_from_grim(path: &str, device: Device) -> Result<Box<dyn Causal
     })?;
     let gguf_provider = GgufProvider::open(gguf_path_str)?;
     let grim_provider = grim_format::tprov::GrimProvider::open(path)?;
+
+    // P0-3.1: Wave64/Wave32 compatibility guard.
+    //
+    // `.grim` files may be compiled with `wavefront_size = 64` (Wave64, CDNA)
+    // but an RDNA2 host (`gfx1036` or similar) only supports Wave32. Loading
+    // a Wave64 `.grim` on a Wave32 GPU triggers GPU memory faults. If the
+    // artifact's declared wavefront size is both non-zero and incompatible with
+    // the probed host GPU, transparently fall back to the sibling GGUF which
+    // contains the same weights in a format that is always Wave32-safe.
+    let grim_wf = grim_provider.wavefront_size();
+    if let Some(host_wf) = probe_host_wavefront_size(&device) {
+        if grim_wf != 0 && host_wf != 0 && grim_wf != host_wf {
+            eprintln!(
+                "[grim] .grim wavefront_size={grim_wf} incompatible with host GPU wavefront_size={host_wf} \
+                 (RDNA2/Wave32 host); falling back to GGUF sibling '{gguf_path_str}'"
+            );
+            return load_model_from_gguf(&gguf_path_str, device);
+        }
+    }
+
     load_model_with_providers(&gguf_provider, &grim_provider, device, path)
 }
 
@@ -298,7 +418,8 @@ fn load_model_from_config(
         vocab_size
     );
 
-    let ws = WeightSource::root(provider, device.clone());
+    let tp = resolve_tp_config()?;
+    let ws = WeightSource::root(provider, device.clone()).with_tp_config(tp);
 
     match model_arch {
         ModelArchitecture::Falcon => {
@@ -325,7 +446,7 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            let m = Llama::load(device.clone(), &ws, llama_cfg)?;
+            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Bloom => {
@@ -348,7 +469,7 @@ fn load_model_from_config(
                 layer_norm_epsilon: rms_norm_eps,
                 max_seq_len,
             };
-            let m = Gpt2::load(device.clone(), &ws, gpt2_cfg)?;
+            let m = Gpt2::load_tp(device.clone(), &ws, gpt2_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Phi2 | ModelArchitecture::Phi3 | ModelArchitecture::PhiMoe => {
@@ -376,7 +497,7 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            let m = Llama::load(device.clone(), &ws, llama_cfg)?;
+            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen
@@ -408,7 +529,7 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            let m = Llama::load(device.clone(), &ws, llama_cfg)?;
+            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen2Moe
@@ -443,7 +564,7 @@ fn load_model_from_config(
                 q_lora_rank: num_heads,
                 kv_lora_rank: num_kv_heads * 4,
             };
-            let m = DeepSeek::load(device.clone(), &ws, deepseek_cfg)?;
+            let m = DeepSeek::load_tp(device.clone(), &ws, deepseek_cfg, tp)?;
             Ok(Box::new(m))
         }
         arch if arch.is_moe() => {
@@ -472,7 +593,7 @@ fn load_model_from_config(
                 q_lora_rank: num_heads,
                 kv_lora_rank: num_kv_heads * 4,
             };
-            let m = DeepSeek::load(device.clone(), &ws, deepseek_cfg)?;
+            let m = DeepSeek::load_tp(device.clone(), &ws, deepseek_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Mamba2 => {
@@ -497,7 +618,7 @@ fn load_model_from_config(
                 conv_kernel: 4,
                 rms_norm_eps,
             };
-            let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
+            let m = Mamba::load_tp(device.clone(), &ws, mamba_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Jamba => {
@@ -525,7 +646,7 @@ fn load_model_from_config(
                 conv_kernel: 4,
                 rms_norm_eps,
             };
-            let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
+            let m = Mamba::load_tp(device.clone(), &ws, mamba_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::NemotronH => {
@@ -553,7 +674,7 @@ fn load_model_from_config(
                 conv_kernel: 4,
                 rms_norm_eps,
             };
-            let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
+            let m = Mamba::load_tp(device.clone(), &ws, mamba_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::GraniteHybrid => {
@@ -581,7 +702,7 @@ fn load_model_from_config(
                 conv_kernel: 4,
                 rms_norm_eps,
             };
-            let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
+            let m = Mamba::load_tp(device.clone(), &ws, mamba_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::ModernBert => {
@@ -606,7 +727,7 @@ fn load_model_from_config(
                 intermediate_size,
                 max_seq_len,
             };
-            let m = Bert::load(device.clone(), &ws, bert_cfg)?;
+            let m = Bert::load_tp(device.clone(), &ws, bert_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::NomicBert
@@ -635,7 +756,7 @@ fn load_model_from_config(
                 intermediate_size,
                 max_seq_len,
             };
-            let m = Bert::load(device.clone(), &ws, bert_cfg)?;
+            let m = Bert::load_tp(device.clone(), &ws, bert_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::T5Encoder => {
@@ -660,7 +781,7 @@ fn load_model_from_config(
                 intermediate_size,
                 rms_norm_eps,
             };
-            let m = T5::load(&ws, t5_cfg)?;
+            let m = T5::load_tp(&ws, t5_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Rwkv6 | ModelArchitecture::Rwkv6Qwen2 => {
@@ -677,7 +798,7 @@ fn load_model_from_config(
                 hidden_size,
                 num_layers,
             };
-            let m = Rwkv::load(&ws, rwkv_cfg, device.clone())?;
+            let m = Rwkv::load_tp(&ws, rwkv_cfg, device.clone(), tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Rwkv7 | ModelArchitecture::ARwkv7 => {
@@ -694,7 +815,7 @@ fn load_model_from_config(
                 hidden_size,
                 num_layers,
             };
-            let m = Rwkv::load(&ws, rwkv_cfg, device.clone())?;
+            let m = Rwkv::load_tp(&ws, rwkv_cfg, device.clone(), tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Lfm2 | ModelArchitecture::Lfm2Moe => {
@@ -706,7 +827,7 @@ fn load_model_from_config(
                 name.to_string()
             };
             let remapped_provider = RemappingTensorProvider::new(provider, remap_fn);
-            let ws = WeightSource::root(&remapped_provider, device.clone());
+            let ws = WeightSource::root(&remapped_provider, device.clone()).with_tp_config(tp);
 
             let intermediate_size = remapped_provider
                 .meta("blk.0.ffn_gate.weight")
@@ -744,9 +865,18 @@ fn load_model_from_config(
                 rope_theta,
                 n_shortconv_l_cache,
                 is_recr,
+                n_layer_dense_lead: num_layers, // all-dense unless metadata says otherwise
+                n_expert: 0,
+                n_expert_used: 1,
+                n_ff_exp: intermediate_size,
+                expert_weights_scale: 1.0,
+                expert_gating_func: 0,
+                n_swa: 0,
+                swa_type: 0,
+                n_embd_out: 0,
             };
 
-            let m = Lfm2::load(&ws, cfg)?;
+            let m = Lfm2::load_tp(&ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Mamba => {
@@ -763,7 +893,7 @@ fn load_model_from_config(
                 conv_kernel: d_conv,
                 rms_norm_eps,
             };
-            let m = Mamba::load(device.clone(), &ws, cfg)?;
+            let m = Mamba::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Gpt2 => {
@@ -776,7 +906,7 @@ fn load_model_from_config(
                 layer_norm_epsilon: rms_norm_eps,
                 max_seq_len,
             };
-            let m = Gpt2::load(device.clone(), &ws, cfg)?;
+            let m = Gpt2::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Gemma
@@ -793,7 +923,7 @@ fn load_model_from_config(
                 intermediate_size: config.intermediate_size.unwrap_or(16384),
                 rms_norm_eps,
             };
-            let m = Gemma::load(device.clone(), &ws, cfg)?;
+            let m = Gemma::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::DeepSeek
@@ -810,7 +940,7 @@ fn load_model_from_config(
                 q_lora_rank: num_heads,
                 kv_lora_rank: num_kv_heads * 4,
             };
-            let m = DeepSeek::load(device.clone(), &ws, cfg)?;
+            let m = DeepSeek::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         arch if arch.is_encoder() => {
@@ -822,7 +952,7 @@ fn load_model_from_config(
                 intermediate_size,
                 max_seq_len,
             };
-            let m = Bert::load(device.clone(), &ws, cfg)?;
+            let m = Bert::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::T5 => {
@@ -834,7 +964,7 @@ fn load_model_from_config(
                 intermediate_size,
                 rms_norm_eps,
             };
-            let m = T5::load(&ws, cfg)?;
+            let m = T5::load_tp(&ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         _ => {
@@ -848,7 +978,7 @@ fn load_model_from_config(
                     RemappingTensorProvider::new(provider, move |name: &str| -> String {
                         spec_clone.remap_tensor_name(name)
                     });
-                let ws = WeightSource::root(&remapped_provider, device.clone());
+                let ws = WeightSource::root(&remapped_provider, device.clone()).with_tp_config(tp);
 
                 if spec.is_moe {
                     let deepseek_cfg = DeepSeekConfig {
@@ -861,7 +991,7 @@ fn load_model_from_config(
                         q_lora_rank: spec.num_heads,
                         kv_lora_rank: spec.num_kv_heads * 4,
                     };
-                    let m = DeepSeek::load(device.clone(), &ws, deepseek_cfg)?;
+                    let m = DeepSeek::load_tp(device.clone(), &ws, deepseek_cfg, tp)?;
                     return Ok(Box::new(m));
                 } else if spec.is_ssm {
                     let mamba_cfg = MambaConfig {
@@ -874,7 +1004,7 @@ fn load_model_from_config(
                         conv_kernel: 4,
                         rms_norm_eps: spec.rms_norm_eps,
                     };
-                    let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
+                    let m = Mamba::load_tp(device.clone(), &ws, mamba_cfg, tp)?;
                     return Ok(Box::new(m));
                 } else {
                     let llama_cfg = LlamaConfig {
@@ -889,7 +1019,7 @@ fn load_model_from_config(
                         rope_theta: spec.rope_theta,
                         max_seq_len: spec.max_seq_len,
                     };
-                    let m = Llama::load(device.clone(), &ws, llama_cfg)?;
+                    let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
                     return Ok(Box::new(m));
                 }
             }
@@ -910,7 +1040,7 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            let m = Llama::load(device.clone(), &ws, cfg)?;
+            let m = Llama::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
     }
@@ -959,7 +1089,8 @@ fn load_model_with_providers(
             }
         }
     });
-    let ws = WeightSource::root(&remapped_provider, device.clone());
+    let tp = resolve_tp_config()?;
+    let ws = WeightSource::root(&remapped_provider, device.clone()).with_tp_config(tp);
 
     match model_arch {
         ModelArchitecture::Falcon => {
@@ -986,7 +1117,7 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Llama::load(device.clone(), &ws, llama_cfg)?;
+            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Bloom => {
@@ -1009,7 +1140,7 @@ fn load_model_with_providers(
                 layer_norm_epsilon: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Gpt2::load(device.clone(), &ws, gpt2_cfg)?;
+            let m = Gpt2::load_tp(device.clone(), &ws, gpt2_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Phi2 | ModelArchitecture::Phi3 | ModelArchitecture::PhiMoe => {
@@ -1037,7 +1168,7 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Llama::load(device.clone(), &ws, llama_cfg)?;
+            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen
@@ -1069,7 +1200,7 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Llama::load(device.clone(), &ws, llama_cfg)?;
+            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen2Moe
@@ -1104,7 +1235,7 @@ fn load_model_with_providers(
                 q_lora_rank: hparams.num_heads,
                 kv_lora_rank: hparams.num_kv_heads * 4,
             };
-            let m = DeepSeek::load(device.clone(), &ws, deepseek_cfg)?;
+            let m = DeepSeek::load_tp(device.clone(), &ws, deepseek_cfg, tp)?;
             Ok(Box::new(m))
         }
         arch if arch.is_moe() => {
@@ -1133,7 +1264,7 @@ fn load_model_with_providers(
                 q_lora_rank: hparams.num_heads,
                 kv_lora_rank: hparams.num_kv_heads * 4,
             };
-            let m = DeepSeek::load(device.clone(), &ws, deepseek_cfg)?;
+            let m = DeepSeek::load_tp(device.clone(), &ws, deepseek_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Mamba2 => {
@@ -1158,7 +1289,7 @@ fn load_model_with_providers(
                 conv_kernel: hparams.ssm_d_conv.unwrap_or(4),
                 rms_norm_eps: hparams.rms_norm_eps,
             };
-            let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
+            let m = Mamba::load_tp(device.clone(), &ws, mamba_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Jamba => {
@@ -1186,7 +1317,7 @@ fn load_model_with_providers(
                 conv_kernel: hparams.ssm_d_conv.unwrap_or(4),
                 rms_norm_eps: hparams.rms_norm_eps,
             };
-            let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
+            let m = Mamba::load_tp(device.clone(), &ws, mamba_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::NemotronH => {
@@ -1214,7 +1345,7 @@ fn load_model_with_providers(
                 conv_kernel: hparams.ssm_d_conv.unwrap_or(4),
                 rms_norm_eps: hparams.rms_norm_eps,
             };
-            let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
+            let m = Mamba::load_tp(device.clone(), &ws, mamba_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::GraniteHybrid => {
@@ -1242,7 +1373,7 @@ fn load_model_with_providers(
                 conv_kernel: hparams.ssm_d_conv.unwrap_or(4),
                 rms_norm_eps: hparams.rms_norm_eps,
             };
-            let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
+            let m = Mamba::load_tp(device.clone(), &ws, mamba_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::ModernBert => {
@@ -1267,7 +1398,7 @@ fn load_model_with_providers(
                 intermediate_size: hparams.intermediate_size,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Bert::load(device.clone(), &ws, bert_cfg)?;
+            let m = Bert::load_tp(device.clone(), &ws, bert_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::NomicBert
@@ -1296,7 +1427,7 @@ fn load_model_with_providers(
                 intermediate_size: hparams.intermediate_size,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Bert::load(device.clone(), &ws, bert_cfg)?;
+            let m = Bert::load_tp(device.clone(), &ws, bert_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::T5Encoder => {
@@ -1321,7 +1452,7 @@ fn load_model_with_providers(
                 intermediate_size: hparams.intermediate_size,
                 rms_norm_eps: hparams.rms_norm_eps,
             };
-            let m = T5::load(&ws, t5_cfg)?;
+            let m = T5::load_tp(&ws, t5_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Rwkv6 | ModelArchitecture::Rwkv6Qwen2 => {
@@ -1338,7 +1469,7 @@ fn load_model_with_providers(
                 hidden_size: hparams.hidden_size,
                 num_layers: hparams.num_layers,
             };
-            let m = Rwkv::load(&ws, rwkv_cfg, device.clone())?;
+            let m = Rwkv::load_tp(&ws, rwkv_cfg, device.clone(), tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Rwkv7 | ModelArchitecture::ARwkv7 => {
@@ -1355,7 +1486,7 @@ fn load_model_with_providers(
                 hidden_size: hparams.hidden_size,
                 num_layers: hparams.num_layers,
             };
-            let m = Rwkv::load(&ws, rwkv_cfg, device.clone())?;
+            let m = Rwkv::load_tp(&ws, rwkv_cfg, device.clone(), tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Lfm2 | ModelArchitecture::Lfm2Moe => {
@@ -1411,8 +1542,17 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 n_shortconv_l_cache,
                 is_recr: is_recr.clone(),
+                n_layer_dense_lead: hparams.num_layers, // all-dense unless metadata says otherwise
+                n_expert: 0,
+                n_expert_used: 1,
+                n_ff_exp: hparams.intermediate_size,
+                expert_weights_scale: 1.0,
+                expert_gating_func: 0,
+                n_swa: 0,
+                swa_type: 0,
+                n_embd_out: 0,
             };
-            let m = Lfm2::load(&ws, cfg)?;
+            let m = Lfm2::load_tp(&ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Mamba => {
@@ -1429,7 +1569,7 @@ fn load_model_with_providers(
                 conv_kernel: d_conv,
                 rms_norm_eps: hparams.rms_norm_eps,
             };
-            let m = Mamba::load(device.clone(), &ws, cfg)?;
+            let m = Mamba::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Gpt2 => {
@@ -1442,7 +1582,7 @@ fn load_model_with_providers(
                 layer_norm_epsilon: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Gpt2::load(device.clone(), &ws, cfg)?;
+            let m = Gpt2::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Gemma
@@ -1459,7 +1599,7 @@ fn load_model_with_providers(
                 intermediate_size: hparams.intermediate_size,
                 rms_norm_eps: hparams.rms_norm_eps,
             };
-            let m = Gemma::load(device.clone(), &ws, cfg)?;
+            let m = Gemma::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::DeepSeek
@@ -1476,7 +1616,7 @@ fn load_model_with_providers(
                 q_lora_rank: hparams.num_heads,
                 kv_lora_rank: hparams.num_kv_heads * 4,
             };
-            let m = DeepSeek::load(device.clone(), &ws, cfg)?;
+            let m = DeepSeek::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         arch if arch.is_encoder() => {
@@ -1488,7 +1628,7 @@ fn load_model_with_providers(
                 intermediate_size: hparams.intermediate_size,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Bert::load(device.clone(), &ws, cfg)?;
+            let m = Bert::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::T5 => {
@@ -1500,7 +1640,7 @@ fn load_model_with_providers(
                 intermediate_size: hparams.intermediate_size,
                 rms_norm_eps: hparams.rms_norm_eps,
             };
-            let m = T5::load(&ws, cfg)?;
+            let m = T5::load_tp(&ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         _ => {
@@ -1521,7 +1661,7 @@ fn load_model_with_providers(
                     RemappingTensorProvider::new(weight_provider, move |name: &str| -> String {
                         spec_clone.remap_tensor_name(name)
                     });
-                let ws = WeightSource::root(&remapped_provider, device.clone());
+                let ws = WeightSource::root(&remapped_provider, device.clone()).with_tp_config(tp);
 
                 if spec.is_moe {
                     let deepseek_cfg = DeepSeekConfig {
@@ -1534,7 +1674,7 @@ fn load_model_with_providers(
                         q_lora_rank: hparams.num_heads,
                         kv_lora_rank: hparams.num_kv_heads * 4,
                     };
-                    let m = DeepSeek::load(device.clone(), &ws, deepseek_cfg)?;
+                    let m = DeepSeek::load_tp(device.clone(), &ws, deepseek_cfg, tp)?;
                     return Ok(Box::new(m));
                 } else if spec.is_ssm {
                     let mamba_cfg = MambaConfig {
@@ -1547,7 +1687,7 @@ fn load_model_with_providers(
                         conv_kernel: hparams.ssm_d_conv.unwrap_or(4),
                         rms_norm_eps: hparams.rms_norm_eps,
                     };
-                    let m = Mamba::load(device.clone(), &ws, mamba_cfg)?;
+                    let m = Mamba::load_tp(device.clone(), &ws, mamba_cfg, tp)?;
                     return Ok(Box::new(m));
                 } else {
                     let llama_cfg = LlamaConfig {
@@ -1562,7 +1702,7 @@ fn load_model_with_providers(
                         rope_theta: hparams.rope_theta,
                         max_seq_len: hparams.max_seq_len,
                     };
-                    let m = Llama::load(device.clone(), &ws, llama_cfg)?;
+                    let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
                     return Ok(Box::new(m));
                 }
             }
@@ -1583,7 +1723,7 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Llama::load(device.clone(), &ws, cfg)?;
+            let m = Llama::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
     }
@@ -1621,20 +1761,47 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
             }
             "rocm" => {
                 if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
-                    if let Some(first) = rocm_devices.first() {
-                        eprintln!(
-                            "[model_loader] Using ROCm device {} (forced)",
+                    // Under multi-process TP, pin this process to its own rank
+                    // ordinal (from GRIM_TP_RANK / GRIM_GPUS) rather than
+                    // always using the first visible device — otherwise every
+                    // rank would load onto the same GPU and the collective
+                    // would deadlock waiting for peers that never started.
+                    let (my_ordinal, _all_ordinals) = resolve_tp_ordinal()?;
+                    let rank = TensorParallelConfig::from_env().map(|t| t.rank).unwrap_or(0);
+                    let chosen = match my_ordinal {
+                        Some(ord) => {
+                            let d = rocm_devices
+                                .iter()
+                                .find(|dev| dev.ordinal() == ord)
+                                .ok_or_else(|| {
+                                    Error::Config(format!(
+                                        "TP rank {rank} needs ROCm ordinal {ord} but it is not \
+                                         visible (probe found {n} device(s))",
+                                        n = rocm_devices.len()
+                                    ))
+                                })?;
+                            eprintln!(
+                                "[model_loader] Using ROCm device {ord} (forced, TP rank {rank})"
+                            );
+                            d.ordinal()
+                        }
+                        None => {
+                            let first = rocm_devices.first().expect("checked above");
+                            eprintln!(
+                                "[model_loader] Using ROCm device {} (forced)",
+                                first.ordinal()
+                            );
                             first.ordinal()
-                        );
-                        let dev = Device::Rocm(first.ordinal());
-                        return if is_grim {
-                            load_model_from_grim(path, dev)
-                        } else if is_safetensors {
-                            load_model_from_safetensors(path, dev)
-                        } else {
-                            load_model_from_gguf(path, dev)
-                        };
-                    }
+                        }
+                    };
+                    let dev = Device::Rocm(chosen);
+                    return if is_grim {
+                        load_model_from_grim(path, dev)
+                    } else if is_safetensors {
+                        load_model_from_safetensors(path, dev)
+                    } else {
+                        load_model_from_gguf(path, dev)
+                    };
                 }
             }
             "cpu" => {
@@ -1654,17 +1821,43 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
 
     // Attempt ROCm first (AMD GPU — primary grim target).
     if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
-        if let Some(first) = rocm_devices.first() {
-            eprintln!("[model_loader] Using ROCm device {}", first.ordinal());
-            let dev = Device::Rocm(first.ordinal());
-            return if is_grim {
-                load_model_from_grim(path, dev)
-            } else if is_safetensors {
-                load_model_from_safetensors(path, dev)
-            } else {
-                load_model_from_gguf(path, dev)
-            };
-        }
+        // Same rank-ordinal pinning as the forced branch above: when multi-
+        // process TP is active, load onto THIS rank's ordinal so each peer
+        // process owns a distinct GPU and the RCCL collective can rendezvous.
+        let (my_ordinal, _all_ordinals) = resolve_tp_ordinal()?;
+        let rank = TensorParallelConfig::from_env().map(|t| t.rank).unwrap_or(0);
+        let chosen = match my_ordinal {
+            Some(ord) => {
+                let Some(d) = rocm_devices.iter().find(|dev| dev.ordinal() == ord) else {
+                    return Err(Error::Config(format!(
+                        "TP rank {rank} needs ROCm ordinal {ord} but it is not visible \
+                         (probe found {n} device(s))",
+                        n = rocm_devices.len()
+                    )));
+                };
+                eprintln!("[model_loader] Using ROCm device {ord} (TP rank {rank})");
+                d.ordinal()
+            }
+            None => {
+                let Some(first) = rocm_devices.first() else {
+                    return Err(Error::Config(
+                        "ROCm probe returned an empty device list; cannot select a default GPU. \
+                         Set GRIM_TP_GPUS to pin this rank's ordinal."
+                            .into()
+                    ));
+                };
+                eprintln!("[model_loader] Using ROCm device {}", first.ordinal());
+                first.ordinal()
+            }
+        };
+        let dev = Device::Rocm(chosen);
+        return if is_grim {
+            load_model_from_grim(path, dev)
+        } else if is_safetensors {
+            load_model_from_safetensors(path, dev)
+        } else {
+            load_model_from_gguf(path, dev)
+        };
     }
     // Fall back to CUDA.
     if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {

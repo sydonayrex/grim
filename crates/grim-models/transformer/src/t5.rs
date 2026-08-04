@@ -130,6 +130,27 @@ pub struct T5 {
 
 impl T5 {
     pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: T5Config) -> Result<Self> {
+        Self::load_tp(ws, cfg, ws.tp_config())
+    }
+
+    /// Tensor-parallel load entry for T5. T5 is an encoder–decoder model
+    /// with both self- and cross-attention in the decoder; sharding the
+    /// cross-attention correctly adds symmetrical constraints beyond the
+    /// plain column/row split, and `T5Block::forward` calls plain
+    /// `Linear::forward` (no all-reduce hook). Refuses `world_size > 1`
+    /// until the cross-attention sharding + `forward` rework land.
+    pub fn load_tp(
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: T5Config,
+        tp: grim_nn::TensorParallelConfig,
+    ) -> Result<Self> {
+        grim_nn::require_single_device(
+            tp,
+            "T5",
+            "encoder–decoder cross-attention needs bespoke sharding and a \
+             forward rework to add the all-reduce hook",
+        )
+        .map_err(grim_core::Error::Unimplemented)?;
         let shared = Embedding::load(&ws.pp("shared"), cfg.vocab_size, cfg.hidden_size)?;
         let mut encoder_layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {

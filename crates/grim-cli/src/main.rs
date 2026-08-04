@@ -13,6 +13,7 @@ pub mod doctor;
 pub mod echo;
 pub mod oxidizer;
 pub mod plugin;
+pub mod progress;
 pub mod reap;
 pub mod rm;
 pub mod run;
@@ -314,6 +315,13 @@ enum Commands {
         /// Calibration dataset name.
         #[arg(long)]
         dataset: Option<String>,
+        /// Wavefront size to build for: "auto" (derive from --target GCN,
+        /// RDNA → Wave32), "w32", or "w64" (explicit CDNA opt-in).
+        #[arg(long, default_value = "auto")]
+        wave: String,
+        /// Offload tensor dequantization to the host ROCm GPU during conversion.
+        #[arg(long)]
+        gpu: bool,
     },
     /// Speculative decoding commands.
     Spec {
@@ -495,6 +503,13 @@ enum OxidizerCommands {
         /// Calibration dataset name.
         #[arg(long)]
         dataset: Option<String>,
+        /// Wavefront size: "auto" (derive from profile; RDNA → Wave32),
+        /// "w32", or "w64" (CDNA opt-in).
+        #[arg(long, default_value = "auto")]
+        wave: String,
+        /// Offload tensor dequantization to the host ROCm GPU during conversion.
+        #[arg(long)]
+        gpu: bool,
     },
     /// Raven FP8/MXFP4 repack pipeline: rewrite model tensors into FP8 format.
     Raven {
@@ -987,6 +1002,8 @@ async fn main() -> Result<()> {
             target_bpw,
             generations,
             dataset,
+            wave,
+            gpu,
         } => {
             // Detect input format and warn the user.
             let ext = std::path::Path::new(&input)
@@ -1061,6 +1078,24 @@ async fn main() -> Result<()> {
                 "rdna3"
             };
 
+            // "auto" → let the GCN/profile resolution pick the wave (RDNA → W32);
+            // explicit w32/w64 → hard override.
+            let wave_override = match wave.to_ascii_lowercase().as_str() {
+                "w32" => Some(grim_format::WaveSize::W32),
+                "w64" => Some(grim_format::WaveSize::W64),
+                "auto" => None,
+                other => {
+                    eprintln!(
+                        "[grim convert] WARNING: unknown wave '{other}' — expected auto, w32, or w64; using auto."
+                    );
+                    None
+                }
+            };
+
+            let mut prog = progress::Progress::new();
+            let mut cb = |stage: &str, done: usize, total: usize| {
+                prog.render(stage, done, total);
+            };
             if let Err(e) = oxidizer::cmd_oxidizer_convert(
                 &input,
                 &output,
@@ -1068,10 +1103,15 @@ async fn main() -> Result<()> {
                 generations,
                 Some(profile_str),
                 dataset,
+                wave_override,
+                gpu,
+                Some(&mut cb),
             ) {
+                prog.finish();
                 eprintln!("Conversion failed: {e}");
                 std::process::exit(1);
             }
+            prog.finish();
         }
         Commands::Oxidizer { subcommand } => {
             match subcommand {
@@ -1085,13 +1125,30 @@ async fn main() -> Result<()> {
                     model,
                     output,
                     dataset,
-                } => match oxidizer::cmd_oxidizer_calibrate(&model, &output, dataset.as_deref()) {
-                    Ok(_scores) => println!("[oxidizer] calibration complete"),
-                    Err(e) => {
-                        eprintln!("oxidizer calibrate failed: {e}");
-                        std::process::exit(1);
+                } => {
+                    let mut prog = progress::Progress::new();
+                    let mut cb = |stage: &str, done: usize, total: usize| {
+                        prog.render(stage, done, total);
+                    };
+                    let mut progress: Option<&mut dyn FnMut(&str, usize, usize)> =
+                        Some(&mut cb);
+                    match oxidizer::cmd_oxidizer_calibrate(
+                        &model,
+                        &output,
+                        dataset.as_deref(),
+                        &mut progress,
+                    ) {
+                        Ok(_scores) => {
+                            prog.finish();
+                            println!("[oxidizer] calibration complete")
+                        }
+                        Err(e) => {
+                            prog.finish();
+                            eprintln!("oxidizer calibrate failed: {e}");
+                            std::process::exit(1);
+                        }
                     }
-                },
+                }
                 OxidizerCommands::Search {
                     scores_path,
                     tensor_sizes,
@@ -1133,8 +1190,18 @@ async fn main() -> Result<()> {
                         .filter_map(|s| s.trim().parse().ok())
                         .collect();
                     let imp_scores = grim_quant::ImportanceScores::new(names, scores);
-                    let bitwidths =
-                        oxidizer::cmd_oxidizer_search(&imp_scores, &sizes, target_bpw, generations);
+                    let mut prog = progress::Progress::new();
+                    let mut cb = |done: usize, total: usize| {
+                        prog.render("evopress", done, total);
+                    };
+                    let bitwidths = oxidizer::cmd_oxidizer_search(
+                        &imp_scores,
+                        &sizes,
+                        target_bpw,
+                        generations,
+                        Some(&mut cb),
+                    );
+                    prog.finish();
                     println!("EvoPress result (per-tensor bitwidths):");
                     for (i, bw) in bitwidths.iter().enumerate() {
                         let name = imp_scores
@@ -1152,7 +1219,24 @@ async fn main() -> Result<()> {
                     generations,
                     profile,
                     dataset,
+                    wave,
+                    gpu,
                 } => {
+                    let wave_override = match wave.to_ascii_lowercase().as_str() {
+                        "w32" => Some(grim_format::WaveSize::W32),
+                        "w64" => Some(grim_format::WaveSize::W64),
+                        "auto" => None,
+                        other => {
+                            eprintln!(
+                                "[oxidizer convert] WARNING: unknown wave '{other}' — expected auto, w32, or w64; using auto."
+                            );
+                            None
+                        }
+                    };
+                    let mut prog = progress::Progress::new();
+                    let mut cb = |stage: &str, done: usize, total: usize| {
+                        prog.render(stage, done, total);
+                    };
                     if let Err(e) = oxidizer::cmd_oxidizer_convert(
                         &model,
                         &output,
@@ -1160,10 +1244,15 @@ async fn main() -> Result<()> {
                         generations,
                         profile.as_deref(),
                         dataset,
+                        wave_override,
+                        gpu,
+                        Some(&mut cb),
                     ) {
+                        prog.finish();
                         eprintln!("oxidizer convert failed: {e}");
                         std::process::exit(1);
                     }
+                    prog.finish();
                 }
                 OxidizerCommands::Raven {
                     model,
@@ -1171,15 +1260,22 @@ async fn main() -> Result<()> {
                     target_bpw,
                     dataset,
                 } => {
+                    let mut prog = progress::Progress::new();
+                    let mut cb = |stage: &str, done: usize, total: usize| {
+                        prog.render(stage, done, total);
+                    };
                     if let Err(e) = oxidizer::cmd_oxidizer_raven(
                         &model,
                         &output,
                         target_bpw.unwrap_or(8.0),
                         dataset.as_deref(),
+                        Some(&mut cb),
                     ) {
+                        prog.finish();
                         eprintln!("oxidizer raven failed: {e}");
                         std::process::exit(1);
                     }
+                    prog.finish();
                 }
                 OxidizerCommands::Prepare {
                     input,

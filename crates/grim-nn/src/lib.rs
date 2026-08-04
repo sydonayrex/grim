@@ -8,6 +8,7 @@ pub mod varbuilder;
 pub use modules::{
     ColumnParallelLinear, Embedding, Linear, RmsNorm, Rope, RowParallelLinear,
     TensorParallelConfig, add_tensors, pick_device_for_storage_device, pick_device_for_tensor,
+    require_single_device,
 };
 pub use scythe2::{Scythe2Linear, slice_input_dim, slice_output_dim};
 pub use varbuilder::WeightSource;

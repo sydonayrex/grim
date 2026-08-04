@@ -40,12 +40,30 @@ pub async fn cmd_bench(tokens: usize, concurrency: usize, model_path: Option<&st
 
     use grim_core::session::Inner;
     for _ in 0..concurrency {
+        // P1-3.6: Llama `forward` expects a 1-D `[seq_len]` input_ids tensor
+        // (token IDs as f32, cast to u32 internally) and a matching positions
+        // tensor. The original bench passed a flat `[tokens]` tensor for both,
+        // which worked for `run` but caused a ShapeMismatch when the model's
+        // RmsNorm / Linear layers flattened the 3-D hidden state to 2-D
+        // `[batch, hidden]` before matmul — the residual add then saw
+        // `[tokens, hidden]` where `[head_dim, hidden]` was expected.
+        //
+        // Reshape to `[1, tokens]` (explicit batch=1) so the model's
+        // shape arithmetic (`elem_count / in_dim`) lands on the correct batch
+        // dimension instead of collapsing 3-D to a flat 2-D.
+        let input_data: Vec<f32> = (0..tokens).map(|t| (t % 512) as f32).collect();
         let inp = grim_backend_cpu::cpu_tensor(
-            (0..tokens).map(|t| (t % 512) as f32).collect(),
-            grim_tensor::Shape::new(vec![tokens]),
+            input_data,
+            grim_tensor::Shape::new(vec![1, tokens]),
+        );
+        // Separate positions tensor — values 0..seq_len, shape [1, tokens].
+        let pos_data: Vec<f32> = (0..tokens).map(|t| t as f32).collect();
+        let pos = grim_backend_cpu::cpu_tensor(
+            pos_data,
+            grim_tensor::Shape::new(vec![1, tokens]),
         );
         let mut sess = Inner::new(model.device().clone());
-        let _ = model.forward(&mut sess, &inp, &inp, &[])?;
+        let _ = model.forward(&mut sess, &inp, &pos, &[])?;
     }
 
     let elapsed = start.elapsed();

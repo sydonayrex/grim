@@ -244,6 +244,27 @@ impl Bert {
     }
 
     pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: BertConfig) -> Result<Self> {
+        Self::load_tp(device, ws, cfg, ws.tp_config())
+    }
+
+    /// Tensor-parallel load entry for BERT. BERT is an encoder (`Model`, not
+    /// `CausalLm`) and `BertBlock::forward` calls plain `Linear::forward` with
+    /// no all-reduce hook. The serving engine's text-out path does not reach
+    /// encoders, so TP here is low-leverage; refused until a `forward` rework
+    /// and an actual encoder-consumer arrive.
+    pub fn load_tp(
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: BertConfig,
+        tp: grim_nn::TensorParallelConfig,
+    ) -> Result<Self> {
+        grim_nn::require_single_device(
+            tp,
+            "BERT",
+            "encoder-only BertBlock::forward calls plain Linear::forward with no \
+             all-reduce hook",
+        )
+        .map_err(grim_core::Error::Unimplemented)?;
         let word_embeddings = Embedding::load(
             &ws.pp("embeddings.word_embeddings"),
             cfg.vocab_size,

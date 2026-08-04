@@ -110,6 +110,69 @@ Configuration is applied in the following order (later sources override earlier 
 3. Environment variables
 4. CLI flags
 
+## Multi-Process Tensor Parallelism (TP)
+
+Grim uses a **multi-process, one-OS-process-per-rank** model (Design A) for tensor
+parallelism. Each rank runs its own `grim` process; the processes rendezvous via
+RCCL (ROCm) or NCCL (CUDA) at forward time. There is no in-process fan-out — the
+engine does not spawn or orchestrate subprocesses; the operator launches N
+processes manually (or via a script).
+
+### Environment Variables
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `GRIM_TP_SIZE` | number | `0` | TP world size. `0`/`1` = single-device. Set to `N` for `N` GPUs. |
+| `GRIM_TP_RANK` | number | `0` | This process's shard index (0 to `N-1`). |
+| `GRIM_GPUS` | string | unset | Comma-separated GPU ordinals, one per rank (e.g. `0,1`). Rank `i` loads on `GRIM_GPUS[i]`; if absent, rank `i` uses ordinal `i`. |
+| `GRIM_PORT` | number | `11434` | Server bind port — each rank process must use a distinct port to avoid bind collision. |
+
+### Quick Start (2-GPU)
+
+```sh
+# Rank 0 — GPU 0
+GRIM_TP_SIZE=2 GRIM_TP_RANK=0 GRIM_GPUS=0,1 GRIM_PORT=8000 \
+  grim serve --backend rocm model.gguf
+
+# Rank 1 — GPU 1 (separate terminal / process)
+GRIM_TP_SIZE=2 GRIM_TP_RANK=1 GRIM_GPUS=0,1 GRIM_PORT=8001 \
+  grim serve --backend rocm model.gguf
+```
+
+Both ranks must load the **same model files**. Each process loads only its own
+weight shard (`ColumnParallelLinear`/`RowParallelLinear` pre-sharded at load);
+RCCL's `ncclAllReduce` in `RowParallelLinear::forward` synchronizes partial
+outputs across ranks.
+
+### Supported Architectures
+
+| Architecture | `load_tp` | Notes |
+|---|---|---|
+| Llama | Full | Column-parallel Q/K/V/Gate/Up, row-parallel O/Down. KV-head sharding via `plan_kv_head_sharding`. |
+| GPT-2 | Stub (error) | Fused QKV needs head-axis reshape; `load_tp` returns `Unsupported`. |
+| Gemma / DeepSeek / LFM2 | Stub (error) | `forward` uses plain `Linear` with no all-reduce hook — load-side sharding would be silently wrong. |
+| T5 | Full | Encoder + decoder attention sharded. |
+| Mamba / RWKV | Stub (error) | SSM/RWKV recurrent path has no all-reduce semantics. |
+| BERT / ViT / Whisper | Stub (error) | Encoder-only / encoder-decoder serving path is `CausalLm`; TP is out of scope. |
+
+### Validation
+
+- `GRIM_TP_RANK >= GRIM_TP_SIZE` → hard error at `Engine::new` (issue #6 fix).
+- `num_heads` must be divisible by `GRIM_TP_SIZE`.
+- KV-head sharding: either `num_kv_heads % world_size == 0` (shard) or
+  `world_size % num_kv_heads == 0` (replicate). Otherwise, error.
+- Fewer GPUs visible than `GRIM_TP_SIZE` → error from `RocmDevice::probe`.
+- If only one of N ranks starts, `ncclAllReduce` at first forward will block —
+  this is expected (same as `torchrun` with a missing rank).
+
+### Verification
+
+The CPU-only parity test `test_llama_block_tp_parity_concat_shards_equals_full`
+runs in CI without GPUs. It loads a tiny Llama block with `world_size=1` and with
+`world_size=2` (ranks 0+1) using a fake provider, then asserts that
+concatenating the two shards' weight matrices reproduces the full weight
+exactly — catching overlap, gap, or off-by-one sharding bugs.
+
 ## Grim Models Directory Structure
 
 ```

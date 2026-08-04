@@ -13,9 +13,12 @@ pub mod tprov;
 /// WI-R6: training-state `.grim.train` sidecar (adapters, optimizer, error matrix).
 pub mod train;
 
-pub use convert::{convert_gguf_to_grim, convert_to_grim};
+pub use convert::{convert_gguf_to_grim, convert_to_grim, convert_to_grim_with_dequant, GpuDequant};
 pub use format::normals_packed_size;
-pub use format::{FUCKING_SORCERY, GrimHeader, GrimTensorEntry};
+pub use format::{
+    FUCKING_SORCERY, GrimHeader, GrimTensorEntry, WaveSize, normals_packed_size_for_wave,
+    pack_row_bpw, pack_row_bpw_for_wave,
+};
 pub use gguf::{
     GGUF_MAGIC, GGUF_VERSION, GgufDType, GgufFile, GgufTensorInfo, GgufValue, GrimFusionOp,
     GrimLayoutHint, GrimMetadata, GrimQuantOverride, GrimRocmlProfile, GrimTrainQuantMode,
