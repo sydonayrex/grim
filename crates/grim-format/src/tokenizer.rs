@@ -317,7 +317,7 @@ impl GgufTokenizer {
                     ids.push(id);
                     i += 1;
                 } else {
-                    ids.push(0); // fallback
+                    ids.push(self.unk_token_id()); // unknown token fallback
                     i += 1;
                 }
             }
