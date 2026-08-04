@@ -8,6 +8,7 @@ description = "Vulkan compatibility backend for Grim."
 
 [dependencies]
 grim-tensor = { workspace = true }
+grim-quant = { workspace = true }
 thiserror = { workspace = true }
 lazy_static = "1.4"
 tracing = "0.1"

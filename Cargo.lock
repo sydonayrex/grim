@@ -2137,6 +2137,7 @@ dependencies = [
 name = "grim-backend-vulkan"
 version = "0.1.0"
 dependencies = [
+ "grim-quant",
  "grim-tensor",
  "lazy_static",
  "thiserror 1.0.69",
