@@ -336,6 +336,39 @@ impl RocmDevice {
         }
     }
 
+    /// P2P memcpy that routes via direct peer DMA or host-bounce staging,
+    /// bridging the typed routing decision (`P2PStatus` → `RouteLink`) to the
+    /// actual memcpy primitives.
+    ///
+    /// This is the bridge that `p2p_route.rs` defers: it calls
+    /// `peer_access::peer_status` to classify the link, `to_route_link` to
+    /// pick the route strategy, then `copy_route` to execute either
+    /// `hipMemcpyPeerAsync` (PeerDirect) or a D2H→H2D host-pin `hipMemcpyAsync`
+    /// pair (HostBounce). The stream is pulled from this device's stream pool.
+    pub fn copy_via_route(
+        &self,
+        src_device: i32,
+        dst_device: i32,
+        src_ptr: *const c_void,
+        dst_ptr: *mut c_void,
+        len: usize,
+    ) -> Result<()> {
+        let status = crate::peer_access::peer_status(src_device, dst_device)?;
+        let route = crate::p2p_route::to_route_link(status, len as u64, u64::MAX);
+        let stream = self
+            .get_stream_from_pool(0)
+            .ok_or_else(|| Error::Backend("copy_via_route: no stream available in pool".into()))?;
+        crate::p2p_route::copy_route(
+            src_device,
+            dst_device,
+            src_ptr,
+            dst_ptr,
+            len,
+            route,
+            stream,
+        )
+    }
+
     /// Probe the total amount of device memory reported by the driver, in bytes. [see: `hipMemGetInfo`, `hipDeviceProp_t`]
     fn query_device_vram_bytes(_ordinal: usize) -> usize {
         unsafe {
