@@ -20,8 +20,26 @@ extern "C" __global__ void grim_silu_mul(float* gate, float* up, float* out, int
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float g = gate[i];
-    float s = g / (1.0f + expf(-g));
-    out[i] = s * up[i];
+    float s = 1.0f / (1.0f + expf(-g));
+    out[i] = g * s * up[i];
+}
+
+extern "C" __global__ void grim_silu_mul_backward(
+    const float* gate,
+    const float* up,
+    const float* dw,
+    float* df,
+    float* de,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i];
+    float s = 1.0f / (1.0f + expf(-g));
+    float silu = g * s;
+    float dsilu = s * (1.0f + g * (1.0f - s));
+    df[i] = silu * dw[i];
+    de[i] = up[i] * dsilu * dw[i];
 }
 
 extern "C" __global__ void grim_rms_norm(float* x, float* w, float* out,

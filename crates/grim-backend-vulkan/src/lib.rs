@@ -2607,43 +2607,48 @@ impl BackendDevice for VulkanDevice {
         &self,
         dy: &dyn BackendStorage,
         b_packed: &dyn BackendStorage,
-        _b_scales: &[f32],
-        default_bpw: u8,
+        b_scales: &[f32],
+        _default_bpw: u8,
         m: usize,
         n: usize,
         k: usize,
         out_shape: &Shape,
         residuals: Option<&grim_tensor::QuantizedMatmulBackwardResiduals>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        if default_bpw != 8
-            || residuals
-                .is_some_and(|r| r.outlier_count > 0 || r.backup1_bpw != 0 || r.backup2_bpw != 0)
-        {
-            return Err(Error::Unimplemented(
-                "Vulkan Q8_0 backward currently supports only the plain, residual-free layout"
-                    .into(),
-            ));
-        }
         let dy_s = dy
             .as_any()
             .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan Q8_0 backward dy is not VulkanStorage".into()))?;
+            .ok_or_else(|| Error::Backend("Vulkan backward dx dy is not VulkanStorage".into()))?;
         let b_s = b_packed
             .as_any()
             .downcast_ref::<VulkanStorage>()
             .ok_or_else(|| {
-                Error::Backend("Vulkan Q8_0 backward b_packed is not VulkanStorage".into())
+                Error::Backend("Vulkan backward dx b_packed is not VulkanStorage".into())
             })?;
+
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
         let dx = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
         let buffers = [dy_s.buffer, b_s.buffer, dx.buffer];
-        let push = push_params(0, 0, k as u32, n as u32, m as u32, 0.0);
+        let push = push_params(
+            b_scales.len() as u32,
+            residuals
+                .map(|r| r.outlier_count)
+                .unwrap_or_default() as u32,
+            k as u32,
+            n as u32,
+            m as u32,
+            residuals
+                .and_then(|r| if r.backup1_bpw != 0 { Some(r.backup1_bpw) } else { None })
+                .map(|v| v as f32)
+                .unwrap_or(0.0),
+        );
         run_compute_shader(
             ctx,
-            spirv_for(VulkanKernel::QuantizedMatmulBackwardDxQ8_0),
+            spirv_for(VulkanKernel::QuantizedMatmulBackwardDx),
             &buffers,
             ((k + 15) / 16) as u32,
             ((m + 15) / 16) as u32,
