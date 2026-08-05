@@ -56,6 +56,10 @@ fn kernels() -> Vec<(&'static str, String)> {
             "quantized_matmul_backward_dx_q8_0",
             load_kernel("quantized_matmul_backward_dx_q8_0"),
         ),
+        (
+            "quantized_matmul_backward_dx_generic",
+            load_kernel("quantized_matmul_backward_dx_generic"),
+        ),
         ("rwkv_time_mix", load_kernel("rwkv_time_mix")),
         ("rwkv_channel_mix", load_kernel("rwkv_channel_mix")),
         ("all_reduce", load_kernel("all_reduce")),
@@ -90,6 +94,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/silu_mul_backward.comp");
     println!("cargo:rerun-if-changed=kernels/quantized_matmul_backward_dx.comp");
     println!("cargo:rerun-if-changed=kernels/quantized_matmul_backward_dx_q8_0.comp");
+    println!("cargo:rerun-if-changed=kernels/quantized_matmul_backward_dx_generic.comp");
     println!("cargo:rerun-if-changed=kernels/rwkv_time_mix.comp");
     println!("cargo:rerun-if-changed=kernels/rwkv_channel_mix.comp");
     println!("cargo:rerun-if-changed=kernels/all_reduce.comp");
