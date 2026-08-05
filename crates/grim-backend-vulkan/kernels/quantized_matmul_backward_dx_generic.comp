@@ -32,9 +32,9 @@ layout(std430, binding = 1) readonly  buffer BufB              { uint B_bytes[];
 layout(std430, binding = 2) writeonly buffer BufDX            { float dX[]; };
 layout(std430, binding = 3) readonly  buffer BufOutlierIndices { uint outlier_indices[]; };
 layout(std430, binding = 4) readonly  buffer BufOutlierValues  { float outlier_values[]; };
-// Per-column primary scale (u8-per-column, decoded as scale_byte / 255.0).
+// Per-column primary scale (f32 per column).
 // When params.pad0 > 0 the buffer is populated; otherwise unit scale.
-layout(std430, binding = 5) readonly  buffer BufScales         { uint scale_bytes[]; };
+layout(std430, binding = 5) readonly  buffer BufScales         { float scale_floats[]; };
 
 uint get_byte(uint byte_idx) {
     uint word = B_bytes[byte_idx / 4u];
@@ -119,10 +119,10 @@ void main() {
         if (find_outlier(flat_weight_idx, outlier_val)) {
             w_val = outlier_val;
         } else {
-            // Generic primary dequant: unpack_weight + per-column u8 scale.
+            // Generic primary dequant: unpack_weight + per-column f32 scale.
             float scale = 1.0;
             if (params.pad0 > 0u) {
-                scale = float(scale_bytes[col]) / 255.0;
+                scale = scale_floats[col];
             }
             w_val = unpack_weight(0u, col, k_idx, K, bpw) * scale;
 

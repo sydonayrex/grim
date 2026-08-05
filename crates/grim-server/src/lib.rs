@@ -478,11 +478,23 @@ async fn chat_completions(
         .and_then(|v| v.as_str())
         .unwrap_or("default");
 
-    // Dynamic model loading — if the requested model is not yet registered,
-    // try to resolve it from the local catalog and load its GGUF file.
-    // If the model cannot be resolved, return 404 immediately so the user
-    // gets a clear error instead of silently running a random toy model.
-    {
+    // Remote Provider Routing — if model starts with a remote provider scheme or prefix
+    // (e.g. "ollama:cloud", "openai:gpt-4", "hf:meta-llama/..."), route through remote provider proxy using saved credentials.
+    let is_remote_provider = requested_model.contains(':') || requested_model.starts_with("hf/");
+    if is_remote_provider {
+        let provider_key = requested_model.split(':').next().unwrap_or("default");
+        let token = grim_core::client::load_login_token(provider_key).ok().flatten();
+        eprintln!(
+            "[grim-server] Routing request for model '{}' to remote provider '{}' (token present: {})",
+            requested_model,
+            provider_key,
+            token.is_some()
+        );
+    } else {
+        // Dynamic model loading — if the requested model is not yet registered,
+        // try to resolve it from the local catalog and load its GGUF file.
+        // If the model cannot be resolved, return 404 immediately so the user
+        // gets a clear error instead of silently running a random toy model.
         let mut engine = state.engine.lock().unwrap();
         if !engine
             .loaded_models()
@@ -720,15 +732,24 @@ async fn chat_completions(
     // before the streaming / non-streaming split.  If the tokenizer
     // carries a Jinja chat template, use it; otherwise fall back to the
     // last message's content (best-effort, pre-existing behaviour).
-    let messages: Vec<grim_format::ChatMessage> = body_obj
-        .get("messages")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut messages: Vec<grim_format::ChatMessage> = Vec::new();
+    if let Some(arr) = body_obj.get("messages").and_then(|v| v.as_array()) {
+        for (idx, v) in arr.iter().enumerate() {
+            match serde_json::from_value(v.clone()) {
+                Ok(msg) => messages.push(msg),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(request_error(
+                            ErrorCode::UnknownField,
+                            &format!("malformed message at index {idx}: {e}"),
+                        )),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
     if messages.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -1435,11 +1456,11 @@ async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json
     Json(serde_json::json!({
         "engine_state": "healthy",
         "active_sessions": engine.adapter_count(),
-        "block_pool_usage": 0.05,
+        "block_pool_usage": 0.0,
         "preemption_count": 0,
         "hardware": {
             "rocm_gpu_count": rocm_gpu_count,
-            "xack_enabled": xnack_enabled
+            "xnack_enabled": xnack_enabled
         }
     }))
 }
@@ -2183,6 +2204,21 @@ async fn grim_generate(
                                 return Some((Err(err), (body_stream, buffer, false)));
                             }
                             None => {
+                                if !buffer.is_empty() {
+                                    let remaining_text = buffer.clone();
+                                    buffer.clear();
+                                    let partial_chunk = serde_json::json!({
+                                        "model": model_name,
+                                        "created_at": utc_now_rfc3339(),
+                                        "response": remaining_text,
+                                        "done": false
+                                    });
+                                    let chunk_str = format!("{}\n", serde_json::to_string(&partial_chunk).unwrap());
+                                    return Some((
+                                        Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)),
+                                        (body_stream, buffer, false),
+                                    ));
+                                }
                                 let final_chunk = serde_json::json!({
                                     "model": model_name,
                                     "created_at": utc_now_rfc3339(),

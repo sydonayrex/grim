@@ -688,8 +688,8 @@ impl Engine {
         self.models.contains_key(id)
     }
 
-    pub fn enqueue_request(&mut self, request: grim_scheduler::Request) {
-        let _ = self.enqueue_request_with_kv(request);
+    pub fn enqueue_request(&mut self, request: grim_scheduler::Request) -> Result<()> {
+        self.enqueue_request_with_kv(request)
     }
 
     /// Allocate a session with a paged KV cache wired in and prefix caching active (§5.1).
@@ -750,7 +750,7 @@ impl Engine {
     pub fn finish_request(&mut self, id: u64) {
         self.scheduler.finish(id);
         if let Some(session) = self.sessions.get_mut(&id) {
-            let _ = session.rollback_kv_to(0);
+            session.rollback_kv_to(0);
         }
         self.sessions.remove(&id);
         self.last_outcomes.remove(&id);

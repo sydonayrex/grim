@@ -200,11 +200,14 @@ enum Commands {
     },
     /// Log in to a registry or cloud provider.
     Login {
-        /// Provider name (e.g. 'hf.co', 'ollama').
-        provider: String,
+        /// Provider name (e.g. 'hf.co', 'ollama', 'openai').
+        provider: Option<String>,
         /// API key or Token.
         #[arg(short, long)]
         token: Option<String>,
+        /// List all saved provider credentials.
+        #[arg(short, long)]
+        list: bool,
     },
     /// Benchmark / smoke test.
     Bench {
@@ -797,19 +800,42 @@ async fn main() -> Result<()> {
         Commands::Use { context, model } => {
             client::set_default_model(&context, &model)?;
         }
-        Commands::Login { provider, token } => {
-            let t = match token {
-                Some(tk) => tk,
-                None => {
-                    print!("Enter API token for {}: ", provider);
-                    use std::io::Write;
-                    std::io::stdout().flush().unwrap();
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input).unwrap();
-                    input.trim().to_string()
+        Commands::Login {
+            provider,
+            token,
+            list,
+        } => {
+            if list {
+                let saved = client::list_login_tokens()?;
+                if saved.is_empty() {
+                    println!("[grim] No stored credentials found in ~/.grim/credentials.toml");
+                } else {
+                    println!("[grim] Stored Provider Credentials:");
+                    for (prov, tok) in saved {
+                        let masked = if tok.len() > 8 {
+                            format!("{}...{}", &tok[..4], &tok[tok.len() - 4..])
+                        } else {
+                            "********".to_string()
+                        };
+                        println!("  - {:<15} {}", prov, masked);
+                    }
                 }
-            };
-            client::save_login_token(&provider, &t)?;
+            } else if let Some(p) = provider {
+                let t = match token {
+                    Some(tk) => tk,
+                    None => {
+                        print!("Enter API token for {}: ", p);
+                        use std::io::Write;
+                        std::io::stdout().flush().unwrap();
+                        let mut input = String::new();
+                        std::io::stdin().read_line(&mut input).unwrap();
+                        input.trim().to_string()
+                    }
+                };
+                client::save_login_token(&p, &t)?;
+            } else {
+                println!("Please specify a provider (e.g. 'grim login hf.co') or run 'grim login --list'.");
+            }
         }
         Commands::Bench {
             tokens,
