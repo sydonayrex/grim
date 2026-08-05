@@ -2598,27 +2598,31 @@ impl BackendDevice for VulkanDevice {
                     } else {
                         VulkanKernel::FusedDequantGemmQ80
                     };
-                    let spirv_source: Vec<u8> = spirv_for(kernel).to_vec();
                     let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
                     let grid_x = ((n + 15) / 16) as u32;
                     let grid_y = ((m + 15) / 16) as u32;
                     let push = push_params(0, 0, k as u32, n as u32, m as u32, 0.0);
 
-                    if run_compute_shader(
+                    match run_compute_shader_kernel(
                         ctx,
-                        &spirv_source,
+                        kernel,
                         &buffers,
                         grid_x,
                         grid_y,
                         1,
                         Some(&push),
-                    )
-                    .is_ok()
-                    {
-                        return Ok((
-                            Box::new(out_storage),
-                            Box::new(grim_tensor::backend::ReadyHandle),
-                        ));
+                    ) {
+                        Ok(()) => {
+                            return Ok((
+                                Box::new(out_storage),
+                                Box::new(VulkanHandle),
+                            ));
+                        }
+                        // Surface the real Vulkan error instead of silently dropping it;
+                        // binding-count mismatches become Err here (P0-1 guard).
+                        Err(e) => tracing::warn!(
+                            "Vulkan quantized_matmul GPU dispatch failed ({e:?}); falling back to CPU"
+                        ),
                     }
                 }
             }
@@ -3183,24 +3187,6 @@ impl VulkanAutotuner {
             }
         }
     }
-
-    /// Estimate GEMM latency in ms given problem dimensions and dtype.
-    pub(crate) fn estimate_gemm_latency_ms(
-        &self,
-        m: usize,
-        n: usize,
-        k: usize,
-        dtype: DType,
-        _placement: &grim_tensor::backend::ScythePlacement,
-    ) -> f64 {
-        let flops = 2.0 * m as f64 * n as f64 * k as f64;
-        let tflops = match dtype.arith {
-            ArithType::F16 | ArithType::BF16 => 100.0,
-            ArithType::F32 => 50.0,
-            _ => 30.0,
-        };
-        (flops / (tflops * 1e12) * 1000.0).max(0.01)
-    }
 }
 
 include!(concat!(env!("OUT_DIR"), "/spirv_spv.rs"));
@@ -3272,6 +3258,74 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::AllReduce => SPIRV_ALL_REDUCE,
         VulkanKernel::CommFuseReduce => SPIRV_COMM_FUSE_REDUCE,
     }
+}
+
+/// Number of `layout(std430, binding = N)` buffers each kernel declares.
+///
+/// Single source of truth for the buffer count a caller must supply. Kept in
+/// lockstep with the `.comp` files in `kernels/`; if a kernel's bindings
+/// change, update this table or `run_compute_shader_kernel` will refuse to
+/// launch and surface the mismatch as an `Err` instead of silently binding the
+/// wrong symbols and returning corrupt output.
+pub fn binding_count(kernel: VulkanKernel) -> usize {
+    match kernel {
+        VulkanKernel::Add
+        | VulkanKernel::Mul
+        | VulkanKernel::SiluMul
+        | VulkanKernel::RmsNorm
+        | VulkanKernel::Embedding
+        | VulkanKernel::Matmul64
+        | VulkanKernel::Matmul32
+        | VulkanKernel::Matmul64Bf16
+        | VulkanKernel::Rope
+        | VulkanKernel::FusedDequantGemmQ4K
+        | VulkanKernel::FusedDequantGemmQ80
+        | VulkanKernel::SiluMulBackward => 3,
+        VulkanKernel::QkvAttention
+        | VulkanKernel::FlashAttention
+        | VulkanKernel::RwkvTimeMix => 4,
+        VulkanKernel::QkvAttentionPaged
+        | VulkanKernel::TreeAttention
+        | VulkanKernel::QuantizedMatmulBackwardDx
+        | VulkanKernel::QuantizedMatmulBackwardDxQ8_0 => 5,
+        VulkanKernel::KvDequantAttention
+        | VulkanKernel::SelectiveScan
+        | VulkanKernel::QuantizedMatmulBackwardDxGeneric => 6,
+        VulkanKernel::MulScalar
+        | VulkanKernel::Sqrt
+        | VulkanKernel::Recip
+        | VulkanKernel::Softmax
+        | VulkanKernel::AllReduce
+        | VulkanKernel::RwkvChannelMix
+        | VulkanKernel::CommFuseReduce => 2,
+    }
+}
+
+/// Dispatch a *named* kernel, first asserting that the caller supplied exactly
+/// the buffers the SPIR-V declares. Use this in place of `run_compute_shader`
+/// whenever the kernel is known up-front — it turns a binding mismatch (which
+/// `run_compute_shader` would silently accept and then corrupt) into a loud
+/// `Err` before any Vulkan handle is created.
+fn run_compute_shader_kernel(
+    ctx: &VulkanContext,
+    kernel: VulkanKernel,
+    buffers: &[u64],
+    grid_x: u32,
+    grid_y: u32,
+    grid_z: u32,
+    push_constants: Option<&[u32]>,
+) -> Result<()> {
+    let expected = binding_count(kernel);
+    if buffers.len() != expected {
+        return Err(Error::Backend(format!(
+            "{kernel:?}: binding count mismatch — caller passed {} buffer(s), \
+             kernel declares {expected}; refusing to launch to avoid silent \
+             wrong output",
+            buffers.len()
+        )));
+    }
+    let spirv_code = spirv_for(kernel);
+    run_compute_shader(ctx, spirv_code, buffers, grid_x, grid_y, grid_z, push_constants)
 }
 
 /// Helper function to retrieve the size in bytes of a data type.

@@ -13,6 +13,27 @@ pub const BLOCK_SIZE: usize = 16;
 
 pub type BlockId = usize;
 
+impl grim_kvtransport::KvBlockStore for KvBlockPool {
+    fn num_blocks(&self) -> usize {
+        self.num_blocks()
+    }
+    fn block_elem_per_token(&self) -> usize {
+        self.num_heads * self.head_dim
+    }
+    fn block_size(&self) -> usize {
+        BLOCK_SIZE
+    }
+    fn write_keys(&mut self, id: BlockId, keys: &[f32], num_tokens: usize) {
+        self.write_keys(id, keys, num_tokens);
+    }
+    fn write_values(&mut self, id: BlockId, values: &[f32]) {
+        self.write_values(id, values);
+    }
+    fn block_is_received(&self, id: BlockId) -> bool {
+        self.block_is_received(id)
+    }
+}
+
 /// One physical KV block in the pool.
 struct KvBlock {
     _id: BlockId,
@@ -21,6 +42,11 @@ struct KvBlock {
     /// Flat `[BLOCK_SIZE, num_kv_heads, head_dim]` for values.
     value_data: Vec<f32>,
     num_tokens: usize,
+    /// Whether this block has received real KV data (via `store_kv`,
+    /// network ingestion, or explicit `write_keys`). Replaces the
+    /// fragile non-zero-content sniff in the decode fetch loop: a
+    /// genuinely all-zero KV block is valid data, not "not yet arrived."
+    received: bool,
 }
 
 /// Outcome of a single demote-before-drop operation. Recorded so callers
@@ -79,6 +105,7 @@ impl KvBlockPool {
                 key_data: vec![0.0; block_elem],
                 value_data: vec![0.0; block_elem],
                 num_tokens: 0,
+                received: false,
             });
             free_list.push_back(i);
         }
@@ -204,6 +231,7 @@ impl KvBlockPool {
         } else {
             // No spill attached: zero the in-place contents directly.
             self.blocks[id].num_tokens = 0;
+            self.blocks[id].received = false;
             self.blocks[id].key_data.fill(0.0);
             self.blocks[id].value_data.fill(0.0);
         }
@@ -269,6 +297,9 @@ impl KvBlockPool {
         let len = (n * elem).min(keys.len());
         block.key_data[..len].copy_from_slice(&keys[..len]);
         block.num_tokens = n;
+        if len > 0 {
+            block.received = true;
+        }
     }
 
     pub fn write_values(&mut self, id: BlockId, values: &[f32]) {
@@ -285,6 +316,14 @@ impl KvBlockPool {
 
     pub fn read_values(&self, id: BlockId) -> &[f32] {
         &self.blocks[id].value_data
+    }
+
+    /// Whether block `id` has received real KV data (via `write_keys`
+    /// / `store_kv` / network ingestion). Replaces the fragile
+    /// non-zero-content sniff: a genuinely all-zero KV block is valid
+    /// data, not "not yet arrived."
+    pub fn block_is_received(&self, id: BlockId) -> bool {
+        id < self.blocks.len() && self.blocks[id].received
     }
 
     pub fn num_blocks(&self) -> usize {

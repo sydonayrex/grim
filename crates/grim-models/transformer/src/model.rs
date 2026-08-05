@@ -141,32 +141,32 @@ impl Llama {
             layers.push(LlamaBlock {
                 attn_norm: rms(cfg.hidden_size),
                 wq: ColumnParallelLinear::new(
-                    linear(cfg.hidden_size, cfg.num_heads * cfg.head_dim),
+                    linear(cfg.num_heads * cfg.head_dim, cfg.hidden_size),
                     tp,
                 ),
                 wk: ColumnParallelLinear::new(
-                    linear(cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim),
+                    linear(cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size),
                     tp,
                 ),
                 wv: ColumnParallelLinear::new(
-                    linear(cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim),
+                    linear(cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size),
                     tp,
                 ),
                 wo: RowParallelLinear::new(
-                    linear(cfg.num_heads * cfg.head_dim, cfg.hidden_size),
+                    linear(cfg.hidden_size, cfg.num_heads * cfg.head_dim),
                     tp,
                 ),
                 ffn_norm: rms(cfg.hidden_size),
                 w_gate: ColumnParallelLinear::new(
-                    linear(cfg.hidden_size, cfg.intermediate_size),
+                    linear(cfg.intermediate_size, cfg.hidden_size),
                     tp,
                 ),
                 w_up: ColumnParallelLinear::new(
-                    linear(cfg.hidden_size, cfg.intermediate_size),
+                    linear(cfg.intermediate_size, cfg.hidden_size),
                     tp,
                 ),
                 w_down: RowParallelLinear::new(
-                    linear(cfg.intermediate_size, cfg.hidden_size),
+                    linear(cfg.hidden_size, cfg.intermediate_size),
                     tp,
                 ),
                 rope: Rope::new(cfg.head_dim, cfg.rope_theta),
