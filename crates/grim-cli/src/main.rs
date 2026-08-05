@@ -1,5 +1,7 @@
 //! Grim CLI — main entry point for all subcommands.
 
+use std::sync::Arc;
+
 use clap::{Parser, Subcommand};
 use grim_core::error::Result;
 
@@ -72,6 +74,15 @@ enum Commands {
         /// Path to plugins directory.
         #[arg(long, default_value = "plugins")]
         plugins: String,
+        /// Disaggregation role: prefill, decode, or colocated (default: colocated).
+        #[arg(long, default_value = "colocated")]
+        disagg_role: String,
+        /// Prefill node address for decode mode (where to fetch KV from).
+        #[arg(long, default_value = "")]
+        prefill_addr: String,
+        /// Decode node address for prefill mode (where to push KV to).
+        #[arg(long, default_value = "")]
+        decode_addr: String,
     },
     /// One-shot inference or HTTP serving.
     Run {
@@ -628,16 +639,60 @@ async fn main() -> Result<()> {
             port,
             config: _,
             plugins,
+            disagg_role,
+            prefill_addr,
+            decode_addr,
         } => {
-            // Starts the HTTP server with first available model and tokenizer.
-            let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-            if !plugins.is_empty() {
+            // Build EngineConfig with optional disaggregation wiring.
+            let mut engine_config = grim_engine::EngineConfig::default();
+            let role_lower = disagg_role.to_ascii_lowercase();
+            let pool_role = match role_lower.as_str() {
+                "prefill" => grim_disagg::PoolRole::Prefill,
+                "decode" => grim_disagg::PoolRole::Decode,
+                "colocated" => grim_disagg::PoolRole::Colocated,
+                other => {
+                    eprintln!(
+                        "[grim] serve: unknown --disagg-role '{other}' (expected prefill|decode|colocated), defaulting to colocated"
+                    );
+                    grim_disagg::PoolRole::Colocated
+                }
+            };
+
+            if pool_role != grim_disagg::PoolRole::Colocated {
+                let dc = grim_disagg::DisaggConfig {
+                    role: pool_role,
+                    prefill_addr: prefill_addr.clone(),
+                    decode_addr: decode_addr.clone(),
+                };
+                // Build a router for cross-node KV transfers.  The engine
+                // supplies its own shared KvBlockPool to transfer_kv_cache_real
+                // directly; the router's `pool` field is left None for
+                // standalone trait-method use (the engine always passes the
+                // pool as a parameter).
+                let router = std::sync::Arc::new(grim_disagg::DisaggRouter::new(
+                    if prefill_addr.is_empty() { &decode_addr } else { &prefill_addr },
+                    if decode_addr.is_empty() { &prefill_addr } else { &decode_addr },
+                    pool_role,
+                ));
+                engine_config.disagg_router = Some(router);
+                engine_config.disagg_config = Some(dc);
+            }
+
+            let engine = grim_engine::Engine::new(engine_config);
+            // Load plugins into a registry that is *kept* and threaded into
+            // `serve()` so request handlers can look up registered samplers by
+            // name. Prior behavior loaded then dropped the registry before a
+            // single request was served — the whole pipeline ran for nothing.
+            let plugin_registry = if !plugins.is_empty() {
                 let mut registry = grim_plugin::PluginRegistry::new();
                 match plugin::load_plugins(&plugins, &mut registry) {
                     Ok(n) => eprintln!("[grim] serve: loaded {n} plugin(s) from {plugins}"),
                     Err(e) => eprintln!("[grim] serve: failed to load plugins from {plugins}: {e}"),
                 }
-            }
+                Some(std::sync::Arc::new(registry))
+            } else {
+                None
+            };
             // Precedence: explicit --address > --host/--port > GRIM_HOST/GRIM_PORT > default.
             let effective = if !address.is_empty() {
                 address.clone()
@@ -650,7 +705,7 @@ async fn main() -> Result<()> {
                 grim_core::RuntimeEnv::resolve_bind(None)
             };
             eprintln!("[grim] serve: binding to {effective} (Ollama-compatible)");
-            grim_server::serve(&effective, engine, None).await?;
+            grim_server::serve(&effective, engine, None, plugin_registry).await?;
         }
         Commands::Run {
             model,
@@ -705,8 +760,23 @@ async fn main() -> Result<()> {
                     None
                 };
                 let r_addr = grim_core::RuntimeEnv::resolve_bind(Some(&address));
+                // Symmetric to the `Serve` arm: honor `--plugins <dir>` here too.
+                // Prior behavior ignored `plugins` entirely in the `run --serve`
+                // path, so a plugin directory was silently dropped.
+                let plugin_registry = if !plugins.is_empty() {
+                    let mut registry = grim_plugin::PluginRegistry::new();
+                    match plugin::load_plugins(&plugins, &mut registry) {
+                        Ok(n) => eprintln!("[grim] serve: loaded {n} plugin(s) from {plugins}"),
+                        Err(e) => {
+                            eprintln!("[grim] serve: failed to load plugins from {plugins}: {e}")
+                        }
+                    }
+                    Some(std::sync::Arc::new(registry))
+                } else {
+                    None
+                };
                 eprintln!("[grim] serve: binding to {r_addr} (Ollama-compatible)");
-                grim_server::serve(&r_addr, engine, model_path).await?;
+                grim_server::serve(&r_addr, engine, model_path, plugin_registry).await?;
             } else {
                 let model_name = model.unwrap_or_else(|| "default".to_string());
                 // Bypass cache for local GGUF paths; security boundary still applies to named models.
@@ -1451,7 +1521,7 @@ fn run_service_loop() -> Result<()> {
     let shutdown = shutdown_rx.recv();
     rt.block_on(async {
         let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-        let server = grim_server::serve("127.0.0.1:11434", engine, None);
+        let server = grim_server::serve("127.0.0.1:11434", engine, None, None);
         tokio::select! {
             _ = server => {}
             _ = shutdown => {

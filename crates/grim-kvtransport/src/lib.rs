@@ -246,6 +246,104 @@ impl SharedSpillManager {
     }
 }
 
+// ── Network KV transport wire protocol ────────────────────────────────────────
+
+/// Wire-protocol magic for the V2 header. 0x4B56434B = "KVCK" in ASCII.
+const KV_MAGIC: u32 = 0x4B56434B;
+
+/// Current on-wire protocol version.
+const KV_PROTOCOL_VERSION: u32 = 2;
+
+/// Fixed-size header (28 bytes) prepended to every KV block transfer.
+///
+/// Layout (all little-endian):
+/// | magic (u32) | version (u32) | block_id (u64) |
+/// | layer_idx (u32) | num_elements (u32) | checksum (u32) |
+#[derive(Debug, Clone, Copy)]
+pub struct KvBlockHeader {
+    pub magic: u32,
+    pub version: u32,
+    pub block_id: u64,
+    pub layer_idx: u32,
+    pub num_elements: u32,
+    pub checksum: u32,
+}
+
+impl KvBlockHeader {
+    pub const SIZE: usize = 28; // 4+4+8+4+4+4
+
+    /// Serialise the header to a 28-byte little-endian buffer.
+    pub fn serialize(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.version.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.block_id.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.layer_idx.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.num_elements.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.checksum.to_le_bytes());
+        buf
+    }
+
+    /// Deserialise a header from a byte slice.  Returns `None` if the slice
+    /// is too short.
+    pub fn deserialize(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        Some(Self {
+            magic: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            version: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            block_id: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            layer_idx: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+            num_elements: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
+            checksum: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+        })
+    }
+
+    /// Verify the magic number and protocol version.
+    pub fn verify(&self) -> bool {
+        self.magic == KV_MAGIC && self.version == KV_PROTOCOL_VERSION
+    }
+}
+
+/// FNV-1a 32-bit checksum over the raw bytes of the key and value float slices.
+/// A simple non-cryptographic checksum sufficient to detect truncation or
+/// bit-corruption on the wire.
+fn compute_checksum(k: &[f32], v: &[f32]) -> u32 {
+    let mut hash: u32 = 0x811c9275; // FNV offset basis
+    for f in k.iter().chain(v.iter()) {
+        for &b in f.to_le_bytes().iter() {
+            hash ^= b as u32;
+            hash = hash.wrapping_mul(0x01000193); // FNV prime
+        }
+    }
+    hash
+}
+
+/// Trait abstracting the operations a network KV receiver needs from a block
+/// store.  Defined here (in grim-kvtransport) to avoid a circular dependency:
+/// grim-memory depends on grim-kvtransport, so it can implement this trait
+/// for `KvBlockPool`, but grim-kvtransport cannot depend on grim-memory.
+pub trait KvBlockStore: Send + Sync {
+    /// Total number of physical blocks in the pool.
+    fn num_blocks(&self) -> usize;
+    /// Number of f32 elements per token (num_heads * head_dim).
+    fn block_elem_per_token(&self) -> usize;
+    /// Maximum number of tokens one block can hold (BLOCK_SIZE).
+    fn block_size(&self) -> usize;
+    /// Write key data into `id`'s block.  `num_tokens` is the number of tokens
+    /// written (capped at `block_size()` internally by the pool).
+    fn write_keys(&mut self, id: BlockId, keys: &[f32], num_tokens: usize);
+    /// Write value data into `id`'s block.  Uses the `num_tokens` previously
+    /// set by `write_keys`.
+    fn write_values(&mut self, id: BlockId, values: &[f32]);
+    /// Whether block `id` has received real KV data (via `write_keys`,
+    /// `store_kv`, or network ingestion).  Replaces the fragile non-zero
+    /// content sniff: a genuinely all-zero KV block is valid data, not
+    /// "not yet arrived."
+    fn block_is_received(&self, id: BlockId) -> bool;
+}
+
 /// Network transport layer for network-based (RDMA/TCP) KV handoffs.
 pub struct NetworkKvClient {
     pub local_ip: String,
@@ -257,10 +355,25 @@ impl NetworkKvClient {
         Self { local_ip }
     }
 
-    /// Dispatches a KV block key/value payload buffer to a target remote IP endpoint over a TCP/network stream.
+    /// Resolve a target specifier into a `host:port` string.
+    fn resolve_addr(target_ip: &str) -> String {
+        if target_ip.contains(':') {
+            target_ip.to_string()
+        } else {
+            format!("{target_ip}:9190")
+        }
+    }
+
+    /// Dispatches a KV block key/value payload buffer to a target remote IP
+    /// endpoint over a TCP/network stream using the V2 wire protocol.
+    ///
+    /// The protocol sends a 28-byte header (magic, version, block_id,
+    /// layer_idx, num_elements, checksum) followed by the raw f32 bytes of
+    /// the key slice and then the value slice.
     pub fn send_block_remote(
         &self,
         block_id: BlockId,
+        layer_idx: u32,
         k: &[f32],
         v: &[f32],
         target_ip: &str,
@@ -270,83 +383,250 @@ impl NetworkKvClient {
                 "Key and Value slice lengths must match for block transport".into(),
             ));
         }
-        let addr = if target_ip.contains(':') {
-            target_ip.to_string()
-        } else {
-            format!("{target_ip}:9190")
+        if k.is_empty() {
+            return Err(Error::KvCache(
+                "Cannot send an empty KV block".into(),
+            ));
+        }
+        let addr = Self::resolve_addr(target_ip);
+        let checksum = compute_checksum(k, v);
+        let header = KvBlockHeader {
+            magic: KV_MAGIC,
+            version: KV_PROTOCOL_VERSION,
+            block_id: block_id as u64,
+            layer_idx,
+            num_elements: k.len() as u32,
+            checksum,
         };
-        // Serialize header (block_id, length) followed by float payloads
-        let mut buf = Vec::with_capacity(16 + (k.len() + v.len()) * 4);
-        buf.extend_from_slice(&(block_id as u64).to_le_bytes());
-        buf.extend_from_slice(&(k.len() as u64).to_le_bytes());
+
+        let mut buf = Vec::with_capacity(KvBlockHeader::SIZE + k.len() * 8);
+        buf.extend_from_slice(&header.serialize());
         for &val in k.iter().chain(v.iter()) {
             buf.extend_from_slice(&val.to_le_bytes());
         }
 
-        match std::net::TcpStream::connect_timeout(
-            &addr.parse().map_err(|e| {
-                Error::KvCache(format!("Invalid target IP address '{target_ip}': {e}"))
-            })?,
-            std::time::Duration::from_millis(500),
-        ) {
-            Ok(mut stream) => {
-                stream
-                    .write_all(&buf)
-                    .map_err(|e| Error::KvCache(format!("TCP send block error: {e}")))?;
-                Ok(())
-            }
-            Err(e) => Err(Error::KvCache(format!(
-                "TCP send block connection failed to {addr}: {e}"
-            ))),
-        }
+        let socket_addr = addr.parse().map_err(|e| {
+            Error::KvCache(format!("Invalid target IP address '{target_ip}': {e}"))
+        })?;
+
+        let mut stream =
+            std::net::TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(500))
+                .map_err(|e| {
+                    Error::KvCache(format!(
+                        "TCP send block connection failed to {addr}: {e}"
+                    ))
+                })?;
+
+        stream
+            .write_all(&buf)
+            .map_err(|e| Error::KvCache(format!("TCP send block error: {e}")))?;
+        Ok(())
     }
 
     /// Fetches a key/value payload block from a remote IP endpoint over a TCP stream.
+    ///
+    /// Sends a V2 fetch request (header only) and receives a V2 response
+    /// containing the key and value data.  Returns an error if the remote
+    /// endpoint is unreachable or the response fails validation — never
+    /// fabricates data.
     pub fn fetch_block_remote(
         &self,
         block_id: BlockId,
+        layer_idx: u32,
         target_ip: &str,
         block_elems: usize,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
-        let addr = if target_ip.contains(':') {
-            target_ip.to_string()
-        } else {
-            format!("{target_ip}:9190")
-        };
-        let mut req_buf = Vec::with_capacity(16);
-        req_buf.extend_from_slice(&(block_id as u64).to_le_bytes());
-        req_buf.extend_from_slice(&(block_elems as u64).to_le_bytes());
+        let addr = Self::resolve_addr(target_ip);
+        let socket_addr = addr.parse().map_err(|e| {
+            Error::KvCache(format!("Invalid target IP address '{target_ip}': {e}"))
+        })?;
 
-        match std::net::TcpStream::connect_timeout(
-            &addr.parse().map_err(|e| {
-                Error::KvCache(format!("Invalid target IP address '{target_ip}': {e}"))
-            })?,
-            std::time::Duration::from_millis(500),
-        ) {
-            Ok(mut stream) => {
-                stream
-                    .write_all(&req_buf)
-                    .map_err(|e| Error::KvCache(format!("TCP fetch request error: {e}")))?;
-                let mut resp_buf = vec![0u8; block_elems * 8];
-                stream
-                    .read_exact(&mut resp_buf)
-                    .map_err(|e| Error::KvCache(format!("TCP fetch read error: {e}")))?;
-                let mut k = Vec::with_capacity(block_elems);
-                let mut v = Vec::with_capacity(block_elems);
-                for chunk in resp_buf[..block_elems * 4].chunks_exact(4) {
-                    k.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        // Build a fetch-request header: same format but with a zero checksum
+        // and a special request flag in layer_idx (bit 31 set).
+        let req_header = KvBlockHeader {
+            magic: KV_MAGIC,
+            version: KV_PROTOCOL_VERSION,
+            block_id: block_id as u64,
+            layer_idx: layer_idx | FETCH_REQUEST_FLAG,
+            num_elements: block_elems as u32,
+            checksum: 0,
+        };
+
+        let mut stream =
+            std::net::TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(500))
+                .map_err(|e| {
+                    Error::KvCache(format!(
+                        "TCP fetch connection failed to {addr}: {e}"
+                    ))
+                })?;
+
+        stream
+            .write_all(&req_header.serialize())
+            .map_err(|e| Error::KvCache(format!("TCP fetch request error: {e}")))?;
+
+        // Read the response header
+        let mut hdr = [0u8; KvBlockHeader::SIZE];
+        stream
+            .read_exact(&mut hdr)
+            .map_err(|e| Error::KvCache(format!("TCP fetch header read error: {e}")))?;
+        let header = KvBlockHeader::deserialize(&hdr)
+            .ok_or_else(|| Error::KvCache("TCP fetch: invalid header size".into()))?;
+        if !header.verify() {
+            return Err(Error::KvCache(format!(
+                "TCP fetch: protocol mismatch magic={:#x} version={}",
+                header.magic, header.version
+            )));
+        }
+
+        // Read the response payload
+        let total_bytes = (header.num_elements as usize) * 8; // k + v
+        let mut payload = vec![0u8; total_bytes];
+        stream
+            .read_exact(&mut payload)
+            .map_err(|e| Error::KvCache(format!("TCP fetch read error: {e}")))?;
+
+        // Verify checksum
+        let k_vec = parse_f32_slice(&payload[..header.num_elements as usize * 4]);
+        let v_vec = parse_f32_slice(&payload[header.num_elements as usize * 4..]);
+        let expected = compute_checksum(&k_vec, &v_vec);
+        if expected != header.checksum {
+            return Err(Error::KvCache(format!(
+                "TCP fetch: checksum mismatch (expected {expected:#x}, got {:#x})",
+                header.checksum
+            )));
+        }
+
+        Ok((k_vec, v_vec))
+    }
+}
+
+/// Bit flag embedded in `layer_idx` of a fetch-request header to signal
+/// "this is a fetch request, reply with data" rather than a push transfer.
+const FETCH_REQUEST_FLAG: u32 = 0x8000_0000;
+
+/// Reinterpret a byte slice as f32 values (little-endian).  Safe parse — no
+/// unsafe pointer casts, avoids alignment UB on Vec<u8> buffers.
+fn parse_f32_slice(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect()
+}
+
+/// Spawns a background TCP server that listens for incoming
+/// `NetworkKvClient::send_block_remote` streams and writes them into a shared
+/// KV block store.
+///
+/// The server runs in a background OS thread, accepting one connection per
+/// transferred block.  Each connection is expected to send a 28-byte
+/// [`KvBlockHeader`] followed by the key slice and value slice as raw
+/// little-endian f32 bytes.  The magic number and checksum are verified
+/// before the data is committed to the store.
+///
+/// Accepts any type implementing [`KvBlockStore`] behind a
+/// `std::sync::Mutex` — this avoids a circular dependency on grim-memory
+/// (grim-memory already depends on grim-kvtransport; KvBlockPool implements
+/// the trait in grim-memory).
+pub fn start_kv_receiver_server<T>(
+    listen_addr: &str,
+    pool: std::sync::Arc<std::sync::Mutex<T>>,
+) -> Result<std::thread::JoinHandle<()>>
+where
+    T: KvBlockStore + 'static,
+{
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind(listen_addr).map_err(|e| {
+        Error::KvCache(format!(
+            "start_kv_receiver_server: bind failed on {listen_addr}: {e}"
+        ))
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| Error::KvCache(format!("set_nonblocking failed: {e}")))?;
+
+    let addr_str = listen_addr.to_string();
+    let handle = std::thread::spawn(move || {
+        eprintln!("[grim-kvtransport] KV receiver listening on {addr_str}");
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _peer)) => {
+                    // Read the fixed-size header.
+                    let mut hdr = [0u8; KvBlockHeader::SIZE];
+                    if stream.read_exact(&mut hdr).is_err() {
+                        continue;
+                    }
+                    let header = match KvBlockHeader::deserialize(&hdr) {
+                        Some(h) => h,
+                        None => continue,
+                    };
+
+                    // Reject protocol mismatches immediately.
+                    if !header.verify() {
+                        eprintln!(
+                            "[grim-kvtransport] KV receiver: rejecting connection \
+                             — bad magic={:#x} version={}",
+                            header.magic, header.version
+                        );
+                        continue;
+                    }
+
+                    let num_elems = header.num_elements as usize;
+                    let total_bytes = num_elems * 8; // keys + values
+                    let mut payload = vec![0u8; total_bytes];
+                    if stream.read_exact(&mut payload).is_err() {
+                        eprintln!(
+                            "[grim-kvtransport] KV receiver: short read on \
+                             block {}",
+                            header.block_id
+                        );
+                        continue;
+                    }
+
+                    // Split payload into key/value float slices and verify checksum.
+                    let k_bytes = &payload[..num_elems * 4];
+                    let v_bytes = &payload[num_elems * 4..];
+                    let k_data = parse_f32_slice(k_bytes);
+                    let v_data = parse_f32_slice(v_bytes);
+                    let computed = compute_checksum(&k_data, &v_data);
+                    if computed != header.checksum {
+                        eprintln!(
+                            "[grim-kvtransport] KV receiver: checksum mismatch \
+                             for block {} (expected {:#x}, got {:#x})",
+                            header.block_id, header.checksum, computed
+                        );
+                        continue;
+                    }
+
+                    // Write into the pool.
+                    let mut guard = pool.lock().unwrap();
+                    if header.block_id < guard.num_blocks() as u64 {
+                        let block_id = header.block_id as usize;
+                        let elem_per_token = guard.block_elem_per_token();
+                        let num_tokens = if elem_per_token > 0 {
+                            (num_elems / elem_per_token).min(guard.block_size())
+                        } else {
+                            num_elems
+                        };
+                        guard.write_keys(block_id, &k_data, num_tokens);
+                        guard.write_values(block_id, &v_data);
+                    } else {
+                        eprintln!(
+                            "[grim-kvtransport] KV receiver: block_id {} out of range",
+                            header.block_id
+                        );
+                    }
                 }
-                for chunk in resp_buf[block_elems * 4..].chunks_exact(4) {
-                    v.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No incoming connection — spin briefly.
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                Ok((k, v))
-            }
-            Err(_) => {
-                // Local fallback pattern when remote server is offline
-                Ok((vec![0.0f32; block_elems], vec![0.0f32; block_elems]))
+                Err(_) => continue,
             }
         }
-    }
+    });
+
+    Ok(handle)
 }
 
 /// Reads one layer's weights from the configured NVMe weights file.
@@ -542,6 +822,18 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Find a free TCP port by binding to port 0 and reading the assigned port.
+    fn find_free_port() -> u16 {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("must bind to find free port");
+        let port = listener
+            .local_addr()
+            .expect("must get local addr")
+            .port();
+        drop(listener);
+        port
+    }
+
     #[test]
     fn test_tiered_spillage_and_retrieval() {
         let dir = tempdir().unwrap();
@@ -571,59 +863,181 @@ mod tests {
 
     #[test]
     fn test_network_kv_client() {
-        let client = NetworkKvClient::new("127.0.0.1".to_string());
-        let k = vec![1.0f32; 8];
-        let v = vec![2.0f32; 8];
-        // The network transport is an unimplemented stub (sims.md issue #2).
-        // Both send and fetch must surface explicit `Unimplemented` errors
-        // rather than silently succeeding or returning fabricated data.
-        let send_res = client.send_block_remote(100, &k, &v, "127.0.0.2");
-        assert!(
-            send_res.is_err(),
-            "send_block_remote should not silently succeed"
-        );
-        assert!(
-            send_res
-                .unwrap_err()
-                .to_string()
-                .contains("not yet implemented"),
-            "send_block_remote error should mention not-implemented"
-        );
+        // Real TCP loopback: start a receiver server, send a block, verify it
+        // arrives intact (sims.md issue #2 — transport is now implemented).
+        use crate::start_kv_receiver_server;
 
-        let fetch_res = client.fetch_block_remote(100, "127.0.0.2", 8);
-        assert!(
-            fetch_res.is_err(),
-            "fetch_block_remote should not return fabricated data"
-        );
-        assert!(
-            fetch_res
-                .unwrap_err()
-                .to_string()
-                .contains("not yet implemented"),
-            "fetch_block_remote error should mention not-implemented"
-        );
+        /// Minimal KvBlockStore stand-in that stores all received data verbatim.
+        struct TestStore {
+            blocks: std::collections::HashMap<BlockId, (Vec<f32>, Vec<f32>)>,
+            received: std::collections::HashSet<BlockId>,
+        }
+
+        impl crate::KvBlockStore for TestStore {
+            fn num_blocks(&self) -> usize {
+                128
+            }
+            fn block_elem_per_token(&self) -> usize {
+                8
+            }
+            fn block_size(&self) -> usize {
+                16
+            }
+            fn write_keys(&mut self, id: BlockId, keys: &[f32], _num_tokens: usize) {
+                self.blocks.insert(id, (keys.to_vec(), Vec::new()));
+                self.received.insert(id);
+            }
+            fn write_values(&mut self, id: BlockId, values: &[f32]) {
+                if let Some((_, v)) = self.blocks.get_mut(&id) {
+                    *v = values.to_vec();
+                }
+            }
+            fn block_is_received(&self, id: BlockId) -> bool {
+                self.received.contains(&id)
+            }
+        }
+
+        impl TestStore {
+            fn new() -> Self {
+                Self {
+                    blocks: std::collections::HashMap::new(),
+                    received: std::collections::HashSet::new(),
+                }
+            }
+        }
+
+        let port = crate::tests::find_free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let store = std::sync::Arc::new(std::sync::Mutex::new(TestStore::new()));
+        let _handle = start_kv_receiver_server(&addr, store.clone()).unwrap();
+
+        let client = NetworkKvClient::new("127.0.0.1".to_string());
+        let k = vec![1.0f32; 64];
+        let v = vec![2.0f32; 64];
+        client
+            .send_block_remote(100, 0, &k, &v, &addr)
+            .expect("send must succeed against live receiver");
+
+        // Give the receiver thread a moment to write.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let guard = store.lock().unwrap();
+        let stored = guard.blocks.get(&100).expect("block 100 must have been written");
+        assert_eq!(stored.0, k, "keys must match exactly");
+        assert_eq!(stored.1, v, "values must match exactly");
     }
 
     #[test]
     fn test_network_kv_client_various_sizes() {
-        let client = NetworkKvClient::new("10.0.0.1".to_string());
+        // Verify real loopback roundtrips for various block sizes.
+        use crate::start_kv_receiver_server;
 
-        for &size in &[1usize, 16, 64, 1024] {
+        struct TestStore {
+            blocks: std::collections::HashMap<BlockId, (Vec<f32>, Vec<f32>)>,
+            received: std::collections::HashSet<BlockId>,
+        }
+
+        impl crate::KvBlockStore for TestStore {
+            fn num_blocks(&self) -> usize {
+                1024
+            }
+            fn block_elem_per_token(&self) -> usize {
+                4
+            }
+            fn block_size(&self) -> usize {
+                64
+            }
+            fn write_keys(&mut self, id: BlockId, keys: &[f32], _num_tokens: usize) {
+                self.blocks.insert(id, (keys.to_vec(), Vec::new()));
+                self.received.insert(id);
+            }
+            fn write_values(&mut self, id: BlockId, values: &[f32]) {
+                if let Some((_, v)) = self.blocks.get_mut(&id) {
+                    *v = values.to_vec();
+                }
+            }
+            fn block_is_received(&self, id: BlockId) -> bool {
+                self.received.contains(&id)
+            }
+        }
+
+        let port = crate::tests::find_free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let store = std::sync::Arc::new(std::sync::Mutex::new(TestStore {
+            blocks: std::collections::HashMap::new(),
+            received: std::collections::HashSet::new(),
+        }));
+        let _handle = start_kv_receiver_server(&addr, store.clone()).unwrap();
+
+        let client = NetworkKvClient::new("127.0.0.1".to_string());
+
+        for &size in &[1usize, 16, 64, 256] {
             let k = vec![0.5f32; size];
             let v = vec![0.25f32; size];
-            // The transport stub must error for every requested size — it cannot
-            // silently fabricate `vec![1.0]`/`vec![2.0]` (sims.md issue #2).
-            let send_res = client.send_block_remote(42, &k, &v, "10.0.0.2");
-            assert!(
-                send_res.is_err(),
-                "send_block_remote(size={size}) should error"
-            );
-            let fetch_res = client.fetch_block_remote(42, "10.0.0.2", size);
-            assert!(
-                fetch_res.is_err(),
-                "fetch_block_remote(size={size}) should error"
-            );
+            let block_id = 42 + size;
+            client
+                .send_block_remote(block_id as usize, 0, &k, &v, &addr)
+                .unwrap_or_else(|e| panic!("send_block_remote(size={size}) failed: {e}"));
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let guard = store.lock().unwrap();
+            let stored = guard.blocks.get(&block_id).unwrap_or_else(|| {
+                panic!("block {block_id} (size={size}) must have been written");
+            });
+            assert_eq!(stored.0, k, "keys must match for size {size}");
+            assert_eq!(stored.1, v, "values must match for size {size}");
+            drop(guard);
         }
+    }
+
+    #[test]
+    fn test_kv_block_header_roundtrip() {
+        let header = KvBlockHeader {
+            magic: KV_MAGIC,
+            version: KV_PROTOCOL_VERSION,
+            block_id: 0xDEAD_BEEF,
+            layer_idx: 3,
+            num_elements: 256,
+            checksum: 0xCAFEBABE,
+        };
+        let bytes = header.serialize();
+        assert_eq!(bytes.len(), KvBlockHeader::SIZE);
+        let decoded = KvBlockHeader::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.magic, KV_MAGIC);
+        assert_eq!(decoded.version, KV_PROTOCOL_VERSION);
+        assert_eq!(decoded.block_id, 0xDEAD_BEEF);
+        assert_eq!(decoded.layer_idx, 3);
+        assert_eq!(decoded.num_elements, 256);
+        assert_eq!(decoded.checksum, 0xCAFEBABE);
+        assert!(decoded.verify());
+    }
+
+    #[test]
+    fn test_checksum_detects_corruption() {
+        let k = vec![1.0f32; 8];
+        let v = vec![2.0f32; 8];
+        let cs_ok = compute_checksum(&k, &v);
+
+        // Flip a bit in the value → checksum changes.
+        let mut bad_v = v.clone();
+        bad_v[0] = 999.0f32;
+        let cs_bad = compute_checksum(&k, &bad_v);
+        assert_ne!(cs_ok, cs_bad, "checksum must detect data corruption");
+    }
+
+    #[test]
+    fn test_fetch_block_remote_returns_error_on_unreachable() {
+        // sims.md issue #2: must NOT fabricate data on connection failure.
+        let client = NetworkKvClient::new("127.0.0.1".to_string());
+        let res = client.fetch_block_remote(100, 0, "127.0.0.1:1", 8);
+        assert!(
+            res.is_err(),
+            "fetch_block_remote must return Err on unreachable endpoint"
+        );
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            !msg.contains("fabricated"),
+            "error must not reference fabricated data: {msg}"
+        );
     }
 
     #[test]

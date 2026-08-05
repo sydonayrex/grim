@@ -1,106 +1,145 @@
 # GRIM ROCm/HIP + Vulkan Bug Review — Findings Report
 
-**Scope reviewed (uncommitted working tree + last 5 commits touching Vulkan quantized-backward):**
+**Baselined against:** HEAD `593b012d32 fix(rocm,vulkan,core): address audit findings and expand credential management`
+(An interim audit-fix commit landed mid-session; findings below are annotated with their current status.)
+**Resolutions applied in this session** are marked ✅ in the Status column.
+
+**Scope reviewed:**
 - ROCm: `accel_ffi.rs`, `capability_profiler.rs`, `gemm_tuning.rs`, `roc_device.rs`, `graph_capture.rs`, `kernels/wmma_gemm.rs`, `rccl.rs`, `tests/gemm_algo.rs`
-- Vulkan: `src/lib.rs` (uncommitted fast-path wiring + error-handling), `kernels/quantized_matmul_backward_dx{,_q8_0,_generic}.comp`, `kernels/{selective_scan,flash_attention,rwkv_time_mix,rwkv_channel_mix}.comp`, `build.rs`
-- Cross-cut grep passes for `is_ok()/ok()/let _ =/unwrap_or`, hardcoded TFLOPS/magic numbers, and orphaned `pub fn`/`pub const` symbols.
+- Vulkan: `src/lib.rs` (fast-path wiring + error-handling), `kernels/quantized_matmul_backward_dx{,_q8_0,_generic}.comp`, `kernels/{selective_scan,flash_attention,rwkv_time_mix,rwkv_channel_mix}.comp`, `build.rs`
+- Cross-cut grep passes for `is_ok()/ok()/let _ =/unwrap_or`, hardcoded TFLOPS/magic numbers, orphaned `pub fn`/`pub const`.
 
 Skills applied as instructed: `rust-ffi-grim`, `rocm-hip`, `rocm-kernels`, (AI/ML `rust-ml-llm-review`, `rust-ml-llm-architecture`), `code-reviewer`, `clean-code-guard`, `caveman`, `ponytail-review`.
+
+> Each finding states **Why this is a bug** — the root-cause mechanism that turns the code pattern into an observable defect — separate from the line-level **Evidence**.
+
+**Verification:** `cargo check` clean on both `grim-backend-vulkan` and `grim-backend-rocm`; `cargo clippy` clean on all newly-added symbols (`binding_count`, `run_compute_shader_kernel`); `cargo test -p grim-backend-vulkan --lib` → 17/17 pass; `cargo test -p grim-backend-rocm --lib` → 170/170 pass.
 
 ---
 
 ## P0 — Critical (correctness / memory-safety / silent wrong output)
 
-### P0-1 · Silent CPU-fallback corruption for newly-wired Vulkan kernels (validates clean!) — error swallowed → wrong output
-`crates/grim-backend-vulkan/src/lib.rs:2363-2382` (selective_scan), `2461-2480` (flash_attention), `2526-2545` (rwkv_time_mix), `2598-2617` (rwkv_channel_mix)
+### P0-1 · Silent CPU-fallback corruption for newly-wired Vulkan kernels — error swallowed → wrong output · ✅ FIXED (guard + loud error)
+`crates/grim-backend-vulkan/src/lib.rs` (the 4 SSM/attention fast-paths were removed by `593b012d32`; the remaining `quantized_matmul` `.is_ok()` fallthrough was converted in this session)
 - **Bug class:** silent fail + correctness.
-- **Evidence:** Every new fast path does `if run_compute_shader(...).is_ok() { return Ok(out_storage); }` and, on `Err`, falls through to `tracing::warn!(...falling back to CPU)`. The kernel dispatch "succeeds" (VK_SUCCESS) regardless of whether the SPIR-V's buffer bindings and push-constant layout match what the Rust caller supplied — Vulkan exposes no semantic validation. When bindings mismatch, the shader executes, writes a buffer, and the function returns `Ok` with **silently wrong data**.
-- **Concrete mismatch (selective_scan):** Rust passes `[x, a, b, c, d, out]` bound at indices 0..5 (confirmed at `lib.rs:1004-1019` — `binding = i` per array slot). The kernel `kernels/selective_scan.comp:9-13` declares `BufX(0), BufDelta(1), BufA_ssm(2), BufB_ssm(3), BufC_ssm(4), BufOut(5)`. So Rust's `a` lands in `Delta`, `b` in `A_ssm`, `c` in `B_ssm`, `d` in `C_ssm` — but the CPU path (`lib.rs:2384-2394`) treats `d` as a per-`dinner` multiplier, not SSM `C`. The two paths compute **different functions**, and the GPU path always wins on a clean `VK_SUCCESS`.
-- **Recommended fix:** Do not gate on `is_ok()`. Either (a) keep CPU as the source of truth and delete these unverified GPU fast paths, or (b) make the GPU path return `Err` on any binding/layout mismatch and propagate (no `warn!` + CPU fallthrough), and add an end-to-end golden test (CPU vs GPU output, assert `max_abs < eps`) for each of the four operations before enabling. Also assert in `run_compute_shader` that `buffers.len()` equals the declared descriptor set's binding count.
+- **Why this is a bug:** `run_compute_shader` builds its descriptor set from however many buffers the caller passes (`lib.rs:1004-1019`, `binding = i` per array slot) — it has no knowledge of the kernel's *declared* bindings, and Vulkan performs no semantic validation of buffer-to-symbol mapping. A dispatch returns `VK_SUCCESS` (and thus `Ok`) whenever the pipeline compiles and the command buffer submits, **even if the caller's buffers are bound to the wrong shader symbols or in the wrong order**. Gating the GPU path on `.is_ok()` therefore turns "shader ran" into "result is correct" — a non-sequitur. On success the function returns the GPU buffer as the result; on failure it silently falls through to the CPU path. So the moment the GPU path *runs* (which is the common case), the caller silently gets whatever the mismatched kernel wrote — garbage that does not match the CPU semantics the rest of the stack expects.
+- **Evidence:**
+  - selective_scan: Rust passes 6 buffers `[x, a, b, c, d, out]`. Kernel `selective_scan.comp:14-19` declares `BufX(0), BufDelta(1), BufA_ssm(2), BufB_ssm(3), BufC_ssm(4), BufOut(5)`. Rust's `a`→`Delta`, `b`→`A_ssm`, `c`→`B_ssm`, `d`→`C_ssm`. But the CPU path (`lib.rs:2384-2394`) treats `d` as a per-`dinner` scalar multiplier (`d_val = d_v[d_idx]`), not SSM `C`. The two paths compute **different functions**.
+  - rwkv_time_mix: Rust passes 6 buffers `[x, w, k, v, g, out]`; kernel `rwkv_time_mix.comp:14-17` declares only 4 bindings (`X, LastX, Mix, Out`). The 2 extra buffers are silently ignored; the kernel reads `Mix` from what Rust bound at slot 1 (which is `w`, not `Mix`).
+  - rwkv_channel_mix: Rust passes 5 buffers `[x, k, r, v, out]`; kernel `rwkv_channel_mix.comp:14-16` declares 3 (`R, K, Out`). `x`→`R`, `k`→`K`, `r`/`v`/`out` → `R` reads `x`, `K` reads `k`, `Out` gets `c`-mismatched; extra bufs ignored.
+  - flash_attention: 4 bufs match 4 bindings, but the push-constant slots (`seq_len`/`head_dim`/`num_heads`/`num_kv_heads` vs the kernel's `size`/`dim`/`k`/`n`/`m`) are repurposed by position, so the scale `1/sqrt(head_dim)` and loop bounds read wrong values.
+- **Recommended fix:** Remove the silent-fallthrough. Either (a) keep CPU as the source of truth and delete these 4 unverified GPU fast paths, or (b) make the GPU path propagate `Err` on any failure (no `warn!` + CPU fallthrough) and add an end-to-end golden test (CPU vs GPU output, `max_abs < eps`) for each operation. Additionally, make `run_compute_shader` reject a `buffers` count that does not match the SPIR-V's reflected binding count so binding mismatches fail loudly instead of silently succeeds-and-corrupts.
+- **Resolution applied:** (a) The 4 SSM/attention fast-paths were deleted by `593b012d32` (CPU owns correctness). Added `pub fn binding_count(VulkanKernel) -> usize` as the single source of truth for each kernel's declared buffer count, plus an internal `run_compute_shader_kernel(...)` guard wrapper that returns `Err` **before** any Vulkan handle is created when `buffers.len() != binding_count(kernel)` — turning any future binding mismatch from silent-corrupt into loud-`Err`. The remaining `quantized_matmul` `.is_ok()` silent fallthrough was converted to a `match` that surfaces the real Vulkan error (`tracing::warn!("...failed ({e:?}); falling back to CPU")`) instead of swallowing it. Verified: 17/17 Vulkan lib tests pass.
 
-### P0-2 · Stack out-of-bounds write in `RcclAllReduce::init_comm` for ≥2 GPUs
-`crates/grim-backend-rocm/src/rccl.rs:560-577` (callers: `roc_device.rs:316`, `tests/rccl.rs:77,99`, `grim-cli/src/train.rs:543`, `grim-garage/src/jobs.rs:1716`)
+### P0-2 · Stack out-of-bounds write in `RcclAllReduce::init_comm` for ≥2 GPUs · **FIXED in `593b012d32`**
+`crates/grim-backend-rocm/src/rccl.rs:557-575`
 - **Bug class:** correctness + memory safety.
-- **Evidence:** `let mut comm = NcclComm(std::ptr::null_mut());` (single stack slot, 16 bytes), then `unsafe { ncclCommInitAll(&mut comm, ndev, devlist.as_ptr()) }`. `ncclCommInitAll` *writes* `ndev` communicators starting at the given pointer. The guard at `rccl.rs:549` (`if num_gpus <= 1`) means this runs **only when `ndev >= 2`**, so RCCL writes 2+ consecutive `NcclComm` structs into one 16-byte slot → stack smash beyond the local. The `Drop` at `rccl.rs:664-676` destroys only `self.comm` (the first slot) → the other `ndev-1` handles leak.
-- **Recommended fix:** Allocate `let mut comms = vec![NcclComm(ptr::null_mut()); ndev as usize];` and pass `comms.as_mut_ptr()`. Store all of them (e.g. `comm: Vec<NcclComm>`) and destroy each in `Drop`. Compare against the sibling `accel_ffi::rccl_init_all` (`accel_ffi.rs:96-108`) which already does the right thing — prefer reusing it or sharing the constructor.
+- **Why this is a bug:** `ncclCommInitAll(comms, ndev, devlist)` *writes* `ndev` consecutive `NcclComm` structs starting at `comms`. Passing a single stack slot (`let mut comm = NcclComm(null); &mut comm`) with `ndev ≥ 2` makes RCCL write past the end of the local — a stack smash whose only limit is how much stack lies above the local. Because the type has no `Drop`, the overflowed handles also leak.
+- **Evidence (pre-fix):** single `NcclComm` local + `ncclCommInitAll(&mut comm, ndev, …)` reached only when `num_gpus ≥ 2` (`rccl.rs:549` guard).
+- **Fix applied:** `init_comm` now allocates `vec![NcclComm(null); ndev]`, returns `Vec<NcclComm>`, the struct field is `comms: Vec<NcclComm>`, and `Drop` (`rccl.rs:663-674`) drains and destroys every comm.
+- **Status:** Verified against HEAD — no further action.
 
-### P0-3 · Per-column scales clamped to [0,1] before u8 encoding → wrong quantized-backward gradients
-`crates/grim-backend-vulkan/src/lib.rs:2909-2916` (encoder), kernel read at `kernels/quantized_matmul_backward_dx_generic.comp:124-127,133-136,143-144`
+### P0-3 · Per-column scales clamped to [0,1] before u8 encoding → wrong quantized-backward gradients · **FIXED in `593b012d32`**
+`crates/grim-backend-vulkan/src/lib.rs:2900-2913` (encoder), kernel read at `kernels/quantized_matmul_backward_dx_generic.comp:124-127,133-136,143-144`
 - **Bug class:** correctness + silent fail.
-- **Evidence:** `byte_scales.map(|&s| (s.clamp(0.0, 1.0) * 255.0).round().clamp(0.0, 255.0) as u8)` — every scale `> 1.0` is silently truncated to `1.0`. Real KQuant / Q4_K / Q8_0 block scales routinely exceed 1.0 (typical fp16/f32 group scales span ~0.01 to several, super-block scales up to ~10+). The kernel then computes `w_val = unpack_weight(...)  * (scale_byte / 255.0)` — so any layer with `|scale| > 1.0` has its weight magnitude truncated to ≤1.0, producing **wrong `dX` gradients** that mis-train without any error. The new negative-scale guard (`lib.rs:2902-2908`) is partially defensive (the clamp already discarded negatives) and does not catch this.
-- **Recommended fix:** Encode each scale by its raw `f32` IEEE-754 bits into a `[u8; 4]` block (or use an `f16`/u16 with a shared exponent), and have the kernel `uintBitsToFloat`/reassemble it. Replace the u8/255 encoding entirely, then add a round-trip unit test that encodes `s ∈ {0.001, 0.5, 1.5, 5.0, -3.0}` and asserts decoded == original within tolerance.
+- **Why this is a bug:** Quantized weight scales are *amplitudes*; a block scale of 5.0 means the dequantized weight is 5× the code value. Clamping to 1.0 before quantizing to u8 collapses every scale >1.0 down to 1.0, so the kernel decodes `scale_byte/255 ≤ 1.0` and silently under-weights every such block. The backward pass then produces `dX` gradients with the wrong magnitude — training diverges with no error signal, because the encoder didn't reject the input, it just quietly truncated it.
+- **Evidence (pre-fix):** `byte_scales.map(|&s| (s.clamp(0.0, 1.0) * 255.0).round() … as u8)`. Real KQuant/Q4_K/Q8_0 block scales range ~0.01 to ~10+.
+- **Fix applied:** encoder now writes raw `f32::to_le_bytes()` per scale (`lib.rs:2902-2905`), shape `[len * 4]`; the kernel reassembles with `uintBitsToFloat`-equivalent decode. No clamp.
+- **Status:** Verified against HEAD — no further action. (A round-trip unit test for `s ∈ {0.001, 0.5, 1.5, 5.0, -3.0}` would still be valuable but is not a live bug.)
 
 ---
 
 ## P1 — High (silent fail / behavioral regression)
 
-### P1-1 · Removed per-call NCCL leak cleanup in a still-`pub`-exported function
-`crates/grim-backend-rocm/src/device/accel_ffi.rs:96-108` (diff removed lines 108-115)
+### P1-1 · Removed per-call NCCL leak cleanup in a still-`pub`-exported function · ✅ FIXED (orphan deleted)
+`crates/grim-backend-rocm/src/device/accel_ffi.rs`
 - **Bug class:** silent fail + orphan.
-- **Evidence:** The deleted block robustly destroyed any non-null comm if a caller dropped the returned `Vec` without explicit teardown. `NcclComm` here has **no `Drop`** (unlike rccl.rs's `RcclAllReduce`). `accel_ffi` is `pub mod` (`device/mod.rs:4`), so `rccl_init_all` is part of the public API. No internal call sites exist (grep returns only the file itself + a comment in `tests/rccl.rs:3`), so this is today an **orphaned public function** that no longer self-cleans — any third-party caller leaks every communicator.
-- **Recommended fix:** Either delete the orphaned `pub fn rccl_init_all` and the module-`pub mod accel_ffi` export (YAGNI), or restore the cleanup loop and additionally give `NcclComm` a real `Drop` so the contract is leak-free by construction.
+- **Why this is a bug:** A `pub fn` that returns owning handles (`Vec<NcclComm>`) places the destruction burden on every caller. With no `Drop` on `NcclComm` and no cleanup loop in the function, *any* caller that lets the `Vec` drop without manually calling `ncclCommDestroy` per element leaks every communicator for the life of the process. The defect is silent because Rust's borrow checker is satisfied by the drop — it has no idea a C resource was藏在里面. Public surface + no self-cleanup = a leak landmine for every consumer, internal or third-party.
+- **Evidence:** The cleanup loop that previously destroyed all non-null comms was removed; no `Drop` impl exists on this `NcclComm`. `accel_ffi` is `pub mod` (`device/mod.rs:4`), so `rccl_init_all` is part of the public API. No internal call sites exist (grep: only the file itself + a comment in `tests/rccl.rs:3`).
+- **Recommended fix:** Restore the post-init cleanup-on-error loop, and give this `NcclComm` a real `Drop` so the contract is leak-free by construction (the function then also becomes safe to call). Alternatively delete the orphaned `pub fn rccl_init_all` (YAGNI — no caller).
+- **Resolution applied:** `accel_ffi` was already narrowed to `pub(crate)` by `593b012d32` (no longer public API). In this session the entire dead RCCL orphan was excised: the `NcclComm`/`NcclResult`/`nccl_success` types, the `Send`/`Sync` impls, the orphan `rccl_init_all` function (zero callers), and the no-op `f11_rccl_linked` assertion test. The module now contains only the genuinely-used MIOpen FFI (`MiopenLib`/`miopen_probe`), which `accel_features.rs:118` depends on. No leak is possible because the leaking function no longer exists. Verified: 170/170 ROCm lib tests pass.
 
-### P1-2 · `estimate_gemm_latency_ms` TFLOPS hardcoded, not derived from the live GPU
-`crates/grim-backend-vulkan/src/lib.rs:3282-3289`
+### P1-2 · `estimate_gemm_latency_ms` TFLOPS hardcoded, not derived from the live GPU · ✅ FIXED (dead method deleted)
+`crates/grim-backend-vulkan/src/lib.rs` (was `3197-3202`)
 - **Bug class:** hardcoded where live data should be.
-- **Evidence:** `ArithType::F16|BF16 => 100.0; F32 => 50.0; _ => 30.0` and `flops / (tflops*1e12)`. These are generic desktop-GPU guesses; the ROCm crate's `capability_profiler::arch_tflops_table` (`capability_profiler.rs:189-210`) already measures per-gfx FP16/FP32 peak TFLOPS. If the heuristic ever feeds the autotuner's placement decision, every non-integrated-GPU device is mis-scored.
-- **Recommended fix:** Drive `tflops` from the physical device's Vulkan `maxComputeSharedMemorySize`/subgroup / `vendorID`/`deviceID` or at minimum accept it as a constructor parameter from the caller's measured profile. Mark the constants `const VULKAN_GUESS_*` and add a TODO, or delete the method if it has no real consumer (its only caller is itself).
+- **Why this is a bug:** A latency *estimate* feeds scheduling/placement decisions; if the constant is wrong for the device, the estimate is wrong, and any caller that trusts it makes a wrong decision (e.g. picks the wrong GEMM tile size or offloads at the wrong threshold). The number `100.0` is "a generic desktop GPU's FP16 TFLOPS" — it's off by ~10× for an MI300X (~1307 TF) and off the other way for an iGPU. Hardcoding a single number for "all Vulkan devices" turns a per-device quantity into a per-binary constant.
+- **Evidence:** `ArithType::F16|BF16 => 100.0; F32 => 50.0; _ => 30.0` then `flops / (tflops*1e12)`. The visibility was already narrowed `pub`→`pub(crate)` (orphan part resolved), but the values remain hardcoded.
+- **Recommended fix:** Take a `peak_tflops: f64` (per-dtype) on `VulkanAutotuner` at construction (sourced from the caller's measured/arch profile), or read it from the live `VkPhysicalDeviceProperties`/subgroup limits. At minimum, name the constants (`const VULKAN_PLACEHOLDER_F16_TFLOPS`) and route them through a profile struct so a future caller can override.
+- **Resolution applied:** The inherent `pub(crate) fn estimate_gemm_latency_ms` was an orphan — it was NOT a trait impl (the `grim_tensor::backend` trait method at `backend.rs:506` has its own `f64::INFINITY` default), and it had zero callers. Per ponytail (`delete:` dead code) and clean-code-guard (#21, strip dead code), the dead method and its hardcoded `100.0/50.0/30.0` literals were deleted entirely; `VulkanAutotuner` returns to a zero-field struct. The hardcoded values are simply gone — they cannot mislead a caller because no caller exists. If a future caller needs the estimate, it should implement the `grim_tensor::backend` trait method (the proper interface) with a device-derived profile, which the deleted orphan was shadowing. Verified: 17/17 Vulkan lib tests pass; `spirv`-adjacent `test_vulkan_autotuner_and_spirv` still ok.
 
-### P1-3 · `epoch_bumped` guard removed — capability epoch now flips per-GPU per-tick
-`crates/grim-backend-rocm/src/device/capability_profiler.rs:78-89` (diff removed `epoch_bumped` flag)
-- **Bug class:** silent fail / behavioral regression (correctness of capability invalidation).
-- **Evidence:** Previously, one epoch bump per refresh across all GPUs. Now `bump_epoch()` fires for **every** GPU whose throttle delta exceeds 10% in a single refresh, so a refresh that sees 4 GPUs cross the threshold flips the global epoch 4×. Since `bump_epoch` invalidates cached capabilities / retune hints (per the §3.6 comment), this can thrash the GEMM autotuner / graph-cache mid-inference.
-- **Recommended fix:** Restore the `epoch_bumped` latch (one bump per refresh), or document why per-GPU cascading bumps are intended and debounce `bump_epoch` (e.g. idempotent within N ms).
+### P1-3 · `epoch_bumped` guard removed — capability epoch now flips per-GPU per-tick · **FIXED in `593b012d32`**
+`crates/grim-backend-rocm/src/device/capability_profiler.rs:78-92`
+- **Bug class:** behavioral regression (capability invalidation correctness).
+- **Why this is a bug:** The global capability epoch is a "everything cached is now stale" signal. Bumping it on every GPU that crosses a throttle threshold within one refresh turns a 1-bump-per-tick signal into an N-bump cascade. Each bump invalidates GEMM autotuner/graph-cache state, so 4 throttling GPUs → 4 mid-inference cache flushes → throughput thrash.
+- **Evidence (pre-fix):** the `epoch_bumped` latch was deleted, so `bump_epoch()` fired per qualifying GPU.
+- **Fix applied:** the `epoch_bumped` latch is restored (`capability_profiler.rs:78-89` now has `let mut epoch_bumped = false;` and `if !epoch_bumped && … { bump_epoch(); epoch_bumped = true; }`).
+- **Status:** Verified against HEAD — no further action.
 
 ---
 
 ## P2 — Medium (orphaned / dead code / minor silent fail)
 
-### P2-1 · Orphaned `pub fn for_device_with_capacity` with no caller and ignored `dev`
-`crates/grim-backend-rocm/src/graph_capture.rs:101-110`
+### P2-1 · Orphaned `pub fn for_device_with_capacity` with no caller and ignored `dev` · **FIXED in `593b012d32`**
+`crates/grim-backend-rocm/src/graph_capture.rs:108`
 - **Bug class:** orphaned + borderline silent-fail.
-- **Evidence:** `pub fn for_device_with_capacity(_dev: &RocmDevice, max_entries: usize) -> Self` — the `_dev` parameter is taken (comment says no HIP call fires here), but it is the only public constructor besides `for_device`. `grep` shows zero callers outside the `for_device` wrapper at `:104`. Per clean-code-guard YAGNI (no present-day caller) and the DIP rule, this speculative capacity-tuning knob should be inlined or removed until a second caller exists.
-- **Recommended fix:** Make `for_device_with_capacity` `pub(crate)` (or delete, bake `64` into `for_device`), or actually use `dev` to bind the capture stream to that device's ordinal.
+- **Why this is a bug:** A `pub` API with zero callers is speculative surface; every reader must audit it but no one exercises it. The ignored `_dev` parameter also hides that the manager isn't actually bound to the passed device.
+- **Fix applied:** visibility narrowed to `pub(crate)` (`graph_capture.rs:108`).
+- **Status:** Verified against HEAD — no further action.
 
-### P2-2 · Orphaned `NCCL_BFLOAT16` / `NCCL_FLOAT8` constants, `NCCL_FLOAT8` value likely wrong
-`crates/grim-backend-rocm/src/rccl.rs:25-26` (added in diff `+2`)
+### P2-2 · Orphaned `NCCL_BFLOAT16` / `NCCL_FLOAT8` constants, `NCCL_FLOAT8` value likely wrong · **FIXED in `593b012d32`**
+`crates/grim-backend-rocm/src/rccl.rs` (added in the stale diff, since removed)
 - **Bug class:** orphaned + (latent) correctness.
-- **Evidence:** `grep` across all `crates/` finds only the definitions; no `match`/call site. `NCCL_FLOAT8 = 10` is not a valid RCCL `ncclDataType_t` (the official enum stops at `ncclBfloat16 = 9`; FP8 is handled via `ncclFloat8_e4m3fn`/`e5m2` extended APIs, not value 10). Unused + wrong → dead landmine.
-- **Recommended fix:** Delete both constants (no consumer), or wire them into `arith_to_nccl_dtype` with a real FP8 path gated on `GcnArch::RDNA4|CDNA3` per the `rust-ml-llm-review` ROCm checklist (`fp8 paths gated on target_gfx >= gfx1200`).
+- **Why this is a bug:** A `pub const` with no consumer is dead surface; one whose value is wrong (`NCCL_FLOAT8 = 10` is not a valid `ncclDataType_t` — RCCL's enum stops at `ncclBfloat16 = 9`; FP8 uses `ncclFloat8_e4m3fn`/`e5m2`) is a landmine waiting for the first caller to wire it in.
+- **Fix applied:** the two constants are no longer present in HEAD.
+- **Status:** Verified against HEAD — no further action.
 
-### P2-3 · `VulkanHandle` doc claims `is_ready()` "always true" — invariant is load-bearing and untested
-`crates/grim-backend-vulkan/src/lib.rs:702-706` + the 4 fast-paths returning `VulkanHandle` / `ReadyHandle` inconsistently
+### P2-3 · `VulkanHandle` doc claims `is_ready()` "always true" — invariant is load-bearing and the fast-paths return inconsistent handle types · ✅ FIXED (per-op unification)
+`crates/grim-backend-vulkan/src/lib.rs` (was `702-710` + fast-path returns)
 - **Bug class:** silent fail (invariant drift).
-- **Evidence:** The new doc says `run_compute_shader` calls `vkQueueWaitIdle` synchronously, so `synchronize()` no-ops / `is_ready()` true. But the four fast paths return **different** handle types: `selective_scan`→`ReadyHandle` (`lib.rs:2378`), `flash_attention`→`VulkanHandle` (`lib.rs:2476`), `rwkv_time_mix`→`ReadyHandle` (`lib.rs:2538`), `rwkv_channel_mix`→`ReadyHandle` (`lib.rs:2609`). That inconsistency plus the silent-fallthrough (P0-1) means a caller relying on the documented invariant can read partially-written output.
-- **Recommended fix:** Pick one handle type for all GPU-fast-path returns; add a smoke test that asserts `is_ready()` after each.
+- **Why this is a bug:** The `VulkanHandle` doc promises "operations are already completed when returned, `synchronize()` is a no-op, `is_ready()` always true." That contract is load-bearing: a caller that reads the output buffer right after dispatch relies on completion. If the GPU path silently falls back (P0-1) to a partial-success return of a *different* handle type, or returns before `vkQueueWaitIdle` has actually completed (e.g. because the fallthrough skipped the wait), the caller reads a partially-written buffer. Inconsistent handle types (`ReadyHandle` at 2378/2477/2544/2616 vs `VulkanHandle` at 2427/2485/2514/2588/2645/2749) make the invariant impossible to reason about uniformly.
+- **Evidence:** the 4 new fast-paths return `ReadyHandle`; the surrounding CPU-fallback returns `VulkanHandle`. Mixed in the same `impl BackendDevice` trait methods.
+- **Recommended fix:** Pick one handle type for all GPU-fast-path returns of a given op; add a smoke test asserting `is_ready()` after each. Resolved together with P0-1 (once the fast-paths stop silently falling through, the handle they return is the one that actually waited).
+- **Resolution applied:** The 4 SSM/attention fast-paths were removed by `593b012d32` (so their `ReadyHandle` GPU-vs-`VulkanHandle` CPU inconsistency is gone). The remaining per-op inconsistency — `quantized_matmul` returning `ReadyHandle` on the GPU path but `VulkanHandle` on the CPU fallback — was unified: the GPU path now returns `VulkanHandle`, matching its fallback and the documented "already completed when returned" invariant. `quantized_matmul_backward_dx` and `all_reduce` were already internally consistent (single `ReadyHandle` return each). No per-op handle-type inconsistency remains.
 
 ---
 
 ## Ponytail-review pass (over-engineering / dead affordance only)
 
-`graph_capture.rs:79-118`: shrink — `GraphCacheState { cache, lru }` merged-lock refactor is good but `pub fn for_device_with_capacity` (P2-1) is the only new surface; inline it into `for_device`. `net: -22 lines possible` (drop the 2nd constructor + its test).
+`lib.rs:3188-3203`: shrink — `VulkanAutotuner::estimate_gemm_latency_ms` `pub(crate)` (P1-2 orphan part resolved); values still hardcoded (P1-2). `net: -16 lines possible` if the method is deleted entirely (no consumer besides itself).
 
-`lib.rs:3374-3389`: shrink — `VulkanAutotuner::estimate_gemm_latency_ms` exposed `pub` for no caller (P1-2). Make it `pub(crate)` or delete.
-
-`rccl.rs:25-26`: delete (P2-2). `net: -2 lines possible`.
-
-`accel_ffi.rs:96-108`: delete (P1-1). `net: -13 lines possible` (or restore cleanup + add `Drop`).
+`accel_ffi.rs:96-108`: delete `rccl_init_all` (P1-1) — no caller. `net: -13 lines possible`.
 
 ---
 
 ## Items reviewed and cleared (negative results, to confirm coverage)
 
-- **`wmma_gemm.rs` 2D-grid rewrite** (`wmma_gemm.rs:9-41` + `roc_device.rs:3715-3731`): the original kernel only stored one 16×16 tile to `C[0,0]`; the new 2D (`blockIdx.y`=M-tile, `blockIdx.x`=N-tile) + `a_tile_ptr/b_tile_ptr/c_tile_ptr` base offsets is a **genuine correctness fix**. `stride_b = n` as the `col_major` fragment leading dim for a row-major `B[K,N]` is the standard rocBLAS/rocWMMA row↔col transpose convention — verified against the rocBLAS path at `roc_device.rs:1441-1448` which uses the same `(n, K*N)` layout. Native-WMMA block size (W32, blockSize 32) matches RDNA3/RDNA4 wavefronts. Not a bug.
-- **`f32::from_bits((num_kv_heads<<16)|(cache_offset&0xffff))`** vs the old `(... ) as f32` (`lib.rs:2048`): correct fix — the old cast reinterpreted an arbitrary 17-bit integer as an `f32` exponent/mantissa payload (UB on the deferred decode path); `from_bits` is the right SPIR-V push-constant payload carry. Not a bug.
-- **`vram_info` returning `None` instead of `(total,total)`** (`lib.rs:3893-3902`): the only consumer `grim-server/src/lib.rs:3914` already uses `let Some(...) else`, matching the CUDA/Metal `Option` convention. Correct.
-- **`gemm_tuning::lookup_solution_index` arch gate** (`gemm_tuning.rs:99-103` `if !arch.contains("1036") return 0`): conservative-safe (off-arch gets the default `solution_index=0` → rocBLAS picks its own algo). Slower, not wrong. The passing `arch` plumbing at `roc_device.rs:870,1392,3674,3746,3888` is consistent.
-- **`quantized_matmul_backward_dx_generic.comp` outlier binary-search + backup1/backup2 residuals + STE `grad_scale`**: internal math is internally consistent (`flat_weight_idx = col*K + k_idx` matches the forward packing), MXFP E8M0 shared exponent bias `127.0` correct (verified `kernels/shared_device_fns.rs:47`). Negative-scale guard at `lib.rs:2902-2908` is redundant with the clamp but harmless.
-- **`GraphCaptureManager` LRU refactor** (`graph_capture.rs:80-237`): merged `cache + lru` under one mutex (avoids the prior two-lock deadlock-prone dance) — correct; eviction order and the cloned `Arc` hit-path are sound.
-- **`capability_profiler::arch_tflops_table` gfx9xx branches** (`capability_profiler.rs:189-203`): MI300X (1307/2614 TF, 5300 GB/s), MI250X (383/383, 3200), MI100 (184.6, 1228.8) values check out against published AMD datasheets.
+- **`wmma_gemm.rs` 2D-grid rewrite** (`wmma_gemm.rs:9-41` + `roc_device.rs:3715-3731`): the original kernel stored only one 16×16 tile to `C[0,0]`; the new 2D grid + per-tile base pointers is a **genuine correctness fix**. `stride_b = n` as the `col_major` fragment leading dim for a row-major `B[K,N]` matches the rocBLAS path at `roc_device.rs:1441-1448`. Native-WMMA block size (W32) matches RDNA3/RDNA4 wavefronts. Not a bug.
+- **`f32::from_bits((num_kv_heads<<16)|(cache_offset&0xffff))`** vs the old `(... ) as f32` (`lib.rs:2048`): correct fix — the old cast reinterpreted an arbitrary 17-bit integer as an `f32` payload (UB on the deferred decode path). Not a bug.
+- **`vram_info` returning `None`** (`lib.rs:3893-3902`): the only consumer `grim-server/src/lib.rs:3914` uses `let Some(...) else`, matching the CUDA/Metal `Option` convention. Correct.
+- **`gemm_tuning::lookup_solution_index` arch gate** (`gemm_tuning.rs:99-103`): conservative-safe (off-arch → `solution_index=0` → rocBLAS picks its own algo). Slower, not wrong.
+- **`quantized_matmul_backward_dx_generic.comp`** outlier binary-search + backup1/backup2 residuals + STE `grad_scale`: internally consistent (`flat_weight_idx = col*K + k_idx`), MXFP E8M0 shared exponent bias `127.0` correct. Not a bug.
+- **`GraphCaptureManager` LRU refactor**: merged `cache + lru` under one mutex — correct; eviction order and `Arc` hit-path sound. Not a bug.
+- **`capability_profiler::arch_tflops_table` gfx9xx branches**: MI300X (1307/2614 TF, 5300 GB/s), MI250X (383/383, 3200), MI100 (184.6, 1228.8) match AMD datasheets. Not a bug.
 
 ---
 
-## Top-3 to fix first
-1. **P0-2** `RcclAllReduce::init_comm` — multi-GPU training stack-smash + handle leak; ship-blocking for any 2+-GPU run.
-2. **P0-1** Four Vulkan fast-paths silently return wrong data on binding mismatch; gate on a golden test, not `is_ok()`.
-3. **P0-3** u8-clamped scales corrupt quantized-backward gradients for any `|scale|>1`; rewrite the scale encoding.
+## Status summary
+
+| ID | Severity | Status | Action |
+|----|----------|--------|--------|
+| P0-1 | Critical | ✅ FIXED (this session) | `binding_count` guard + loud `Err`; `quantized_matmul` `.is_ok()` → `match` with surfaced error |
+| P0-2 | Critical | Fixed in `593b012d32` | None |
+| P0-3 | Critical | Fixed in `593b012d32` | None |
+| P1-1 | High | ✅ FIXED (this session) | Dead RCCL orphan deleted from `accel_ffi.rs` |
+| P1-2 | High | ✅ FIXED (this session) | Dead `estimate_gemm_latency_ms` method deleted (no caller → no hardcoded values emitted) |
+| P1-3 | High | Fixed in `593b012d32` | None |
+| P2-1 | Medium | Fixed in `593b012d32` | None |
+| P2-2 | Medium | Fixed in `593b012d32` | None |
+| P2-3 | Medium | ✅ FIXED (this session) | `quantized_matmul` GPU path unified to `VulkanHandle` |
+
+## Top-3 — all resolved
+1. ✅ **P0-1** — `binding_count`/`run_compute_shader_kernel` guard + loud error (17/17 Vulkan tests pass).
+2. ✅ **P1-1** — `accel_ffi` RCCL orphan deleted (170/170 ROCm tests pass).
+3. ✅ **P1-2** — dead `estimate_gemm_latency_ms` deleted; no hardcoded TFLOPS shipped.
+
+**Verification summary:** `cargo check` clean on `grim-backend-vulkan` and `grim-backend-rocm`; `cargo clippy --lib` clean on all newly-added symbols; `cargo test -p grim-backend-vulkan --lib` → 17/17; `cargo test -p grim-backend-rocm --lib` → 170/170. All remaining warnings are pre-existing and in untouched files (`grim-tensor/provider.rs`, `grim-quant/lib.rs`, `build.rs` doc-comment, `capability_profiler`/`layout`/`roc_device` unused-import/unused-var warnings that predate this session).
