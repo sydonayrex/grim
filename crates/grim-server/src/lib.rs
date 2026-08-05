@@ -145,6 +145,13 @@ pub struct AppState {
     /// Path to the primary model file being served — used for
     /// `GET /v1/models` metadata and first-run doctor checks.
     pub model_path: Option<std::path::PathBuf>,
+    /// Plugin samplers loaded from `--plugins <dir>` at startup. Read-only at
+    /// request time via `get_sampler(name)`; `None` when no plugins were loaded.
+    /// `Arc<PluginRegistry>` is `Send + Sync` (the `Sampler` trait is
+    /// `Send + Sync` and the registry's fields are plain `HashMap`/`Vec`), so
+    /// it embeds safely in `Arc<AppState>` shared across axum tasks with no
+    /// interior locking — the registry is mutated only at load time.
+    pub plugin_registry: Option<std::sync::Arc<grim_plugin::PluginRegistry>>,
 }
 
 /// Health-check endpoint.
@@ -552,6 +559,7 @@ async fn chat_completions(
         "determinism",
         "tools",
         "tool_choice",
+        "sampler",
     ];
     for key in body_obj.keys() {
         if !KNOWN_FIELDS.contains(&key.as_str()) {
@@ -710,7 +718,27 @@ async fn chat_completions(
         hasher.finish()
     };
     let sampler: std::sync::Arc<dyn grim_core::sampler::Sampler> =
-        std::sync::Arc::from(sampling.into_sampler(sample_seed));
+        if let Some(name) = body_obj.get("sampler").and_then(|v| v.as_str()) {
+            // A named plugin sampler was requested. Look it up in the
+            // registry threaded in from `grim_server::serve()`; if the name
+            // is unknown (or no registry is attached), degrade gracefully and
+            // warn loudly rather than 400-ing — matching the repo's posture
+            // for optional features. The strict `KNOWN_FIELDS` gate above
+            // still 400s on genuinely unknown *field names*.
+            state
+                .plugin_registry
+                .as_ref()
+                .and_then(|r| r.get_sampler(name))
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "[grim-server] WARNING: sampler '{name}' not found in plugin registry; \
+                         falling back to SamplingParams-built sampler."
+                    );
+                    std::sync::Arc::from(sampling.into_sampler(sample_seed))
+                })
+        } else {
+            std::sync::Arc::from(sampling.into_sampler(sample_seed))
+        };
 
     // `max_tokens` bounds generation length; default to a sane non-infinite
     // cap. `stop` sequences end the loop when a decoded token matches.
@@ -2476,6 +2504,7 @@ pub async fn serve(
     addr: &str,
     engine: Engine,
     model_path: Option<std::path::PathBuf>,
+    plugin_registry: Option<std::sync::Arc<grim_plugin::PluginRegistry>>,
 ) -> Result<()> {
     // Attempt to load the tokenizer from the explicitly-given model path,
     // or by scanning the models directory for the first available GGUF.
@@ -2565,6 +2594,7 @@ pub async fn serve(
         engine: Mutex::new(engine),
         tokenizer: Mutex::new(tokenizer),
         model_path: resolved_path,
+        plugin_registry,
     });
 
     // Capability-based routing verification at server startup (§8)
@@ -2726,6 +2756,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
 
         // Build router
@@ -2791,6 +2822,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
 
         let app = Router::new()
@@ -2846,6 +2878,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
 
         let app = Router::new()
@@ -2914,6 +2947,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
 
         let app = Router::new()
@@ -2968,6 +3002,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
 
         let app = Router::new()
@@ -3027,6 +3062,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
@@ -3081,6 +3117,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
 
         let app = build_router(state);
@@ -3185,6 +3222,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
@@ -3246,6 +3284,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
@@ -3312,6 +3351,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
@@ -3385,6 +3425,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
@@ -3514,6 +3555,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
@@ -3583,6 +3625,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
@@ -3649,6 +3692,7 @@ mod tests {
                     engine: Mutex::new(engine),
                     tokenizer: Mutex::new(None),
                     model_path: None,
+                    plugin_registry: None,
                 }),
                 42,
             );
@@ -3675,6 +3719,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/requests/:id/cancel", post(cancel_request))
@@ -3721,6 +3766,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/requests/:id/cancel", post(cancel_request))
@@ -3776,6 +3822,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))

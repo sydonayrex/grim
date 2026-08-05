@@ -324,7 +324,7 @@ pub async fn cmd_run(
         engine.register_model(model_id, model);
         eprintln!("[grim] Starting HTTP server on {address}...");
         let serve_model_path = Some(std::path::PathBuf::from(&model_path_str));
-        grim_server::serve(&address, engine, serve_model_path).await?;
+        grim_server::serve(&address, engine, serve_model_path, None).await?;
         return Ok(());
     }
 
