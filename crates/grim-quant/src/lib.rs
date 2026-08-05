@@ -1597,6 +1597,9 @@ pub fn quant_fp4(data: &[f32]) -> Result<Vec<u8>> {
             out.push(packed_byte);
         }
     }
+    if data.len() % 2 != 0 {
+        out.push(packed_byte);
+    }
 
     Ok(out)
 }
@@ -1745,10 +1748,11 @@ pub fn quant_fp4_block16(data: &[f32], block_size: usize) -> Result<Vec<u8>> {
     let num_blocks = data.len().div_ceil(block_size);
     let mut out = Vec::with_capacity(4 + num_blocks * 9);
     out.extend_from_slice(&global_scale.to_le_bytes());
-
+    // Minimum scale clamp = 2^-6 (0.015625), derived from FP8 E4M3 minimum normal exponent
+    const MIN_FP8_SCALE: f32 = 1.0 / 64.0;
     for block in data.chunks(block_size) {
         let block_max = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-        let block_scale = (block_max / global_scale).min(1.0).max(1.0 / 64.0);
+        let block_scale = (block_max / global_scale).min(1.0).max(MIN_FP8_SCALE);
         let block_scale_fp8 = f32_to_fp8_e4m3(block_scale);
         out.push(block_scale_fp8);
 
@@ -2013,7 +2017,7 @@ pub fn quant_iq3xxs(data: &[f32]) -> Result<Vec<u8>> {
             if val < 0.0 && i / 8 < 30 {
                 signs[i / 8] |= 1 << (i % 8);
             }
-            let code = ((val.abs() / scale).clamp(0.0, 3.0) as u8).min(3);
+            let code = ((val.abs() / scale).round().clamp(0.0, 3.0) as u8).min(3);
             if i % 4 == 0 {
                 qs[i / 4] = code;
             }
@@ -2139,7 +2143,7 @@ pub fn quant_iq2s(data: &[f32]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn dequant_packed_symmetric(data: &[u8], num_weights: usize, bits: u8) -> Result<Vec<f32>> {
+pub fn dequant_packed_symmetric(data: &[u8], num_weights: usize, bits: u8) -> Result<Vec<f32>> {
     let packed_bytes_per_block = (BLOCK_SIZE_QK * bits as usize).div_ceil(8);
     let stride = 4 + packed_bytes_per_block;
     let num_blocks = num_weights.div_ceil(BLOCK_SIZE_QK);

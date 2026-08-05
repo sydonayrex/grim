@@ -14,21 +14,30 @@ extern "C" __global__ void grim_wmma_gemm(
     int stride_a, int stride_b, int stride_c)
 {
     // Wave Matrix Multiply-Accumulate implementation using rocWMMA.
-    // Coops use 16x16x16 tiles.
+    // 2D grid: blockIdx.y = tile_row (M / 16), blockIdx.x = tile_col (N / 16).
+    const int tile_row = blockIdx.y;
+    const int tile_col = blockIdx.x;
+
+    if (tile_row * 16 >= M || tile_col * 16 >= N) return;
+
     fragment<matrix_a, 16, 16, 16, _Float16, row_major> frag_a;
     fragment<matrix_b, 16, 16, 16, _Float16, col_major> frag_b;
     fragment<accumulator, 16, 16, 16, float> frag_c;
 
     fill_fragment(frag_c, 0.0f);
 
+    const _Float16* a_tile_ptr = A + tile_row * 16 * stride_a;
+    const _Float16* b_tile_ptr = B + tile_col * 16;
+
     // Loop over the K dimension in steps of 16.
     for (int k = 0; k < K; k += 16) {
-        load_matrix_coop_sync(frag_a, A + k, stride_a);
-        load_matrix_coop_sync(frag_b, B + k * stride_b, stride_b);
+        load_matrix_coop_sync(frag_a, a_tile_ptr + k, stride_a);
+        load_matrix_coop_sync(frag_b, b_tile_ptr + k * stride_b, stride_b);
         mma_sync(frag_c, frag_a, frag_b, frag_c);
     }
 
-    store_matrix_coop_sync(C, frag_c, stride_c, layout_t::mem_row_major);
+    _Float16* c_tile_ptr = C + tile_row * 16 * stride_c + tile_col * 16;
+    store_matrix_coop_sync(c_tile_ptr, frag_c, stride_c, layout_t::mem_row_major);
 }
 #else
 // Fallback path for GFX10 / RDNA2 and other architectures without native WMMA support.
