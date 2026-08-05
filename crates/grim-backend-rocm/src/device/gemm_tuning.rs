@@ -39,12 +39,7 @@ pub fn lookup_gemm_config(m: usize, n: usize, k: usize, wave: WavefrontSize) -> 
                 } else {
                     16
                 };
-                // WI 2.4.4-3 — bank-conflict pad. When the tile's K-stride is
-                let block_k = if (n % 32 == 0 || k % 32 == 0) && block_k > 16 {
-                    block_k + 1
-                } else {
-                    block_k
-                };
+
                 // split_k suggestion: a decode-shape "k-heavy" config.
                 let split_k = if k >= 4096 { 2 } else { 1 };
                 GemmTileConfig {
@@ -80,12 +75,7 @@ pub fn lookup_gemm_config(m: usize, n: usize, k: usize, wave: WavefrontSize) -> 
                 } else {
                     16
                 };
-                // WI 2.4.4-3 — bank-conflict pad (same rule as W64 decode branch).
-                let block_k = if (n % 32 == 0 || k % 32 == 0) && block_k > 16 {
-                    block_k + 1
-                } else {
-                    block_k
-                };
+
                 let split_k = if k >= 4096 { 2 } else { 1 };
                 GemmTileConfig {
                     block_m: 4,
@@ -106,7 +96,11 @@ pub fn lookup_gemm_config(m: usize, n: usize, k: usize, wave: WavefrontSize) -> 
 }
 
 /// Offline-tuned rocBLAS solution index lookup table (Item 7). [see: `(m, n, k, arith)`, `solution_index`]
-pub fn lookup_solution_index(m: usize, n: usize, k: usize, arith: ArithType) -> i32 {
+pub fn lookup_solution_index(m: usize, n: usize, k: usize, arch: &str, arith: ArithType) -> i32 {
+    // Only tuned for gfx1036 so far; other architectures return default (0).
+    if !arch.contains("1036") {
+        return 0_i32;
+    }
     // Only tuned for FP32, F16, and BF16 on gfx1036 so far; other dtypes
     if arith != ArithType::F32 && arith != ArithType::F16 && arith != ArithType::BF16 {
         return 0_i32;
@@ -150,9 +144,7 @@ pub fn resolve_gemm_solution(
     arch: &str,
     arith: ArithType,
 ) -> Result<i32, &'static str> {
-    // `arch` is accepted for call-site symmetry with the rocBLAS
-    let _ = arch;
-    let idx = lookup_solution_index(m, n, k, arith);
+    let idx = lookup_solution_index(m, n, k, arch, arith);
     if idx == 0 {
         return Err("no tuned GEMM solution for this (m,n,k,dtype) on this arch");
     }
@@ -167,17 +159,19 @@ mod loom_tests {
     #[test]
     fn lookup_solution_index_deterministic_within_shape() {
         // FP32 — every tuned shape has a non-zero solution index.
-        assert_eq!(lookup_solution_index(1, 4096, 4096, ArithType::F32), 4);
-        assert_eq!(lookup_solution_index(8, 4096, 4096, ArithType::F32), 11);
-        assert_eq!(lookup_solution_index(1, 11008, 4096, ArithType::F32), 65);
-        assert_eq!(lookup_solution_index(8, 11008, 4096, ArithType::F32), 1);
+        assert_eq!(lookup_solution_index(1, 4096, 4096, "gfx1036", ArithType::F32), 4);
+        assert_eq!(lookup_solution_index(8, 4096, 4096, "gfx1036", ArithType::F32), 11);
+        assert_eq!(lookup_solution_index(1, 11008, 4096, "gfx1036", ArithType::F32), 65);
+        assert_eq!(lookup_solution_index(8, 11008, 4096, "gfx1036", ArithType::F32), 1);
         // FP16 / BF16 now have entries too; off-table shapes still fall
-        assert_eq!(lookup_solution_index(1, 4096, 1024, ArithType::F32), 0);
-        assert_eq!(lookup_solution_index(1, 4096, 1024, ArithType::F16), 0);
-        assert_eq!(lookup_solution_index(1, 4096, 1024, ArithType::BF16), 0);
+        assert_eq!(lookup_solution_index(1, 4096, 1024, "gfx1036", ArithType::F32), 0);
+        assert_eq!(lookup_solution_index(1, 4096, 1024, "gfx1036", ArithType::F16), 0);
+        assert_eq!(lookup_solution_index(1, 4096, 1024, "gfx1036", ArithType::BF16), 0);
+        // Non-gfx1036 arch returns 0
+        assert_eq!(lookup_solution_index(1, 4096, 4096, "gfx1100", ArithType::F32), 0);
         // Now confirm F16 / BF16 hit the table for the tuned shapes:
-        assert_eq!(lookup_solution_index(1, 4096, 4096, ArithType::F16), 5);
-        assert_eq!(lookup_solution_index(1, 4096, 4096, ArithType::BF16), 6);
+        assert_eq!(lookup_solution_index(1, 4096, 4096, "gfx1036", ArithType::F16), 5);
+        assert_eq!(lookup_solution_index(1, 4096, 4096, "gfx1036", ArithType::BF16), 6);
     }
 
     #[test]
@@ -209,17 +203,17 @@ mod loom_tests {
     // WI 2.6.1 — bit-identical (block_m, block_n, block_k) for shapes whose [see: `split_k`]
     #[test]
     fn f2_lookup_gemm_config_block_dims_unchanged_for_divisor_clean_shapes() {
-        // W64 decode (1, n%64==0, k%64==0): both = 64; bank-conflict pad fires
+        // W64 decode (1, n%64==0, k%64==0): both = 64
         let a = lookup_gemm_config(1, 4096, 4096, WavefrontSize::W64);
-        assert_eq!((a.block_m, a.block_n, a.block_k), (8, 64, 65));
+        assert_eq!((a.block_m, a.block_n, a.block_k), (8, 64, 64));
 
         // W64 decode (1, n%64==0, k%32==0): n=64, k=32 (k=4064 % 64 != 0);
         let b = lookup_gemm_config(1, 4096, 4064, WavefrontSize::W64);
-        assert_eq!((b.block_m, b.block_n, b.block_k), (8, 64, 33));
+        assert_eq!((b.block_m, b.block_n, b.block_k), (8, 64, 32));
 
         // W64 decode (1, n%32==0, k%64==0): n=32, k=64 (n=4064 % 64 != 0);
         let c = lookup_gemm_config(1, 4064, 4096, WavefrontSize::W64);
-        assert_eq!((c.block_m, c.block_n, c.block_k), (8, 32, 65));
+        assert_eq!((c.block_m, c.block_n, c.block_k), (8, 32, 64));
 
         // W64 prefill (m%128==0, n%128==0): both = 128; no pad (prefill branch).
         let d = lookup_gemm_config(128, 4096, 4096, WavefrontSize::W64);
@@ -288,26 +282,16 @@ mod loom_tests {
         assert_eq!(effective, 1, "launch clamp must hold effective=1");
     }
 
-    // WI 2.4.4-3 — bank-conflict avoidance via +1 element pad on block_k.
+    // BUG-04 fix — bank-conflict pad removed to preserve power-of-2 tile size for rocBLAS.
     #[test]
     fn f2_bank_conflict_pad_fires_on_32_aligned_k_stride() {
-        // W64 decode, k%32==0, block_k > 16 → pad fires.
         let cfg = lookup_gemm_config(1, 4096, 4096, WavefrontSize::W64);
-        // 4096 % 32 == 0, block_k was 64 (before pad), now 65.
-        assert_eq!(
-            cfg.block_k, 65,
-            "bank-conflict pad must add 1 to block_k=64 when k%32==0"
-        );
+        assert_eq!(cfg.block_k, 64, "block_k must remain power-of-2");
         assert_eq!(cfg.block_m, 8);
         assert_eq!(cfg.block_n, 64);
 
-        // W64 decode, k%32==0, block_k=32 → pad fires.
         let cfg2 = lookup_gemm_config(1, 4096, 4064, WavefrontSize::W64);
-        // 4064 % 32 == 0, block_k was 32 (before pad), now 33.
-        assert_eq!(
-            cfg2.block_k, 33,
-            "bank-conflict pad must add 1 to block_k=32 when k%32==0"
-        );
+        assert_eq!(cfg2.block_k, 32, "block_k must remain power-of-2");
     }
 
     #[test]

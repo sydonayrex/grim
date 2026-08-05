@@ -2240,6 +2240,7 @@ dependencies = [
  "grim-tensor",
  "half",
  "minijinja",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",

@@ -680,6 +680,62 @@ pub fn save_login_token(provider: &str, token: &str) -> Result<()> {
     Ok(())
 }
 
+/// Retrieve a saved provider API token from `~/.grim/credentials.toml`.
+pub fn load_login_token(provider: &str) -> Result<Option<String>> {
+    let grim_dir = match crate::home_dir() {
+        Some(dir) => dir.join(".grim"),
+        None => return Ok(None),
+    };
+    let cred_path = grim_dir.join("credentials.toml");
+    if !cred_path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&cred_path)
+        .map_err(|e| Error::Backend(format!("failed to read credentials file: {e}")))?;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if let Some((p, token)) = trimmed.split_once('=') {
+            if p.trim() == provider {
+                let token_val = token.trim().trim_matches('"').to_string();
+                return Ok(Some(token_val));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// List all saved provider credential keys from `~/.grim/credentials.toml`.
+pub fn list_login_tokens() -> Result<Vec<(String, String)>> {
+    let grim_dir = match crate::home_dir() {
+        Some(dir) => dir.join(".grim"),
+        None => return Ok(Vec::new()),
+    };
+    let cred_path = grim_dir.join("credentials.toml");
+    if !cred_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let content = fs::read_to_string(&cred_path)
+        .map_err(|e| Error::Backend(format!("failed to read credentials file: {e}")))?;
+
+    let mut tokens = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if let Some((p, token)) = trimmed.split_once('=') {
+            tokens.push((p.trim().to_string(), token.trim().trim_matches('"').to_string()));
+        }
+    }
+    Ok(tokens)
+}
+
 // ---------------------------------------------------------------------------
 // Model management helpers
 // ---------------------------------------------------------------------------
@@ -749,12 +805,35 @@ determinism_mode = "relaxed"
     fs::write(&config_path, content)
         .map_err(|e| Error::Backend(format!("failed to write config: {e}")))?;
     println!(
-        "[grim] Context '{}' → model '{}' in {}",
+        "[grim] Set default model for context '{}' to '{}' in {}",
         context,
         model,
         config_path.display()
     );
     Ok(())
+}
+
+/// Get default model binding for context from `grim.toml`.
+pub fn get_default_model(_context: &str) -> Result<Option<String>> {
+    let config_paths = [
+        "grim.toml",
+        "/etc/grim/grim.toml",
+        "C:\\Program Files\\Grim\\grim.toml",
+    ];
+    for p in &config_paths {
+        if Path::new(p).exists() {
+            let content = fs::read_to_string(p).unwrap_or_default();
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("default_model =") {
+                    if let Some((_, m)) = trimmed.split_once('=') {
+                        return Ok(Some(m.trim().trim_matches('"').to_string()));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Send unload/kill request to running server.

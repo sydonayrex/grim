@@ -246,17 +246,23 @@ impl SelfTuningController {
     /// both home in on TTFT; speculative block_len homes in on ITL; KV
     /// compression bit-width homes in on quality drift.
     pub fn tune_one(&mut self, knob: KnobKind) -> f64 {
-        let _ = knob;
-        self.tune_all();
-        // Re-tunes all knobs together but the chosen knob's value is
-        // the only one returned for unit tests that want a single
-        // observable. Independence is preserved by `tune_all` not
-        // cross-referencing knobs.
         match knob {
-            KnobKind::ChunkedPrefillSize => self.chunked_prefill_size.current,
-            KnobKind::MaxBatchedTokens => self.max_batched_tokens.current,
-            KnobKind::SpeculativeBlockLen => self.speculative_block_len.current,
-            KnobKind::KvCompressionBitWidth => self.kv_compression_bit_width.current,
+            KnobKind::ChunkedPrefillSize => {
+                self.chunked_prefill_size.record(self.ema_ttft_ms, self.alpha);
+                self.chunked_prefill_size.tune()
+            }
+            KnobKind::MaxBatchedTokens => {
+                self.max_batched_tokens.record(self.ema_ttft_ms, self.alpha);
+                self.max_batched_tokens.tune()
+            }
+            KnobKind::SpeculativeBlockLen => {
+                self.speculative_block_len.record(self.ema_itl_ms, self.alpha);
+                self.speculative_block_len.tune()
+            }
+            KnobKind::KvCompressionBitWidth => {
+                self.kv_compression_bit_width.record(self.ema_quality, self.alpha);
+                self.kv_compression_bit_width.tune()
+            }
         }
     }
 

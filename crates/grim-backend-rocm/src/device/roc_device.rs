@@ -870,7 +870,7 @@ impl RocmDevice {
 
         // Look up the offline-tuned solution index for this shape/dtype, so
         // matmul_batched routes through the same autotune table as matmul.
-        let solution_index = lookup_solution_index(m, n, k, dtype_out.arith);
+        let solution_index = lookup_solution_index(m, n, k, &self.gpu_target, dtype_out.arith);
 
         // Row-major C[M,N] = A[M,K] @ B[K,N] via rocBLAS column-major recipe [see: `matmul`]
         unsafe {
@@ -1389,7 +1389,7 @@ impl BackendDevice for RocmDevice {
         // Shape-indexed GEMM dispatch lookup (Tensile-inspired layout resolution)
         let tile_config = lookup_gemm_config(m, n, k, self.props.wavefront_size);
         // Offline-tuned solution_index per (M,N,K) for FP32. Falls back to 0 for [see: `examples/tune_gemm.rs`]
-        let solution_index = lookup_solution_index(m, n, k, dtype_out.arith);
+        let solution_index = lookup_solution_index(m, n, k, &self.gpu_target, dtype_out.arith);
         // WI 2.4.3 — split_k clamp gate.
         let split_k_effective: u32 = {
             let split_k_enabled = self.split_k_config.lock().unwrap().enabled;
@@ -3671,7 +3671,7 @@ impl RocmDevice {
         let mut sb = stride_b as i32;
         let mut sc = stride_c as i32;
 
-        let solution_index = lookup_solution_index(m, n, k, ArithType::F16);
+        let solution_index = lookup_solution_index(m, n, k, &self.gpu_target, ArithType::F16);
         self.launch_compute_kernel_with_solution(
             "grim_decode_gemm_f16",
             grid_dim,
@@ -3712,11 +3712,23 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend("wmma_gemm: out has no device ptr".into()))?;
 
-        const BLOCK_SIZE: usize = 256;
-        let total_elems = m * n;
-        let grid_x = ((total_elems + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
-        let grid_dim = HipDim3::new(grid_x, 1, 1);
-        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+        let is_native_wmma = matches!(
+            crate::quantization::gcn_arch(&self.gpu_target),
+            crate::quantization::GcnArch::RDNA3 | crate::quantization::GcnArch::RDNA4
+        );
+
+        let (grid_dim, block_dim) = if is_native_wmma {
+            // Native rocWMMA path: 16x16 tile per block, 1 wavefront (32 threads for W32).
+            let grid_x = ((n + 15) / 16) as u32;
+            let grid_y = ((m + 15) / 16) as u32;
+            (HipDim3::new(grid_x, grid_y, 1), HipDim3::new(32, 1, 1))
+        } else {
+            // Scalar fallback path: 1D grid of 256 threads.
+            const BLOCK_SIZE: usize = 256;
+            let total_elems = m * n;
+            let grid_x = ((total_elems + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
+            (HipDim3::new(grid_x, 1, 1), HipDim3::new(BLOCK_SIZE as u32, 1, 1))
+        };
 
         let mut aptr = a_ptr;
         let mut bptr = b_ptr;
@@ -3731,7 +3743,7 @@ impl RocmDevice {
         let mut sb = stride_b as i32;
         let mut sc = stride_c as i32;
 
-        let solution_index = lookup_solution_index(m, n, k, ArithType::F16);
+        let solution_index = lookup_solution_index(m, n, k, &self.gpu_target, ArithType::F16);
         self.launch_compute_kernel_with_solution(
             "grim_wmma_gemm",
             grid_dim,
@@ -3873,7 +3885,7 @@ impl RocmDevice {
         let mut b2_codes_off = backup2_codes_offset as i32;
         let mut b2_scale_off = backup2_scale_offset as i32;
 
-        let solution_index = lookup_solution_index(m, n, k, ArithType::F16);
+        let solution_index = lookup_solution_index(m, n, k, &self.gpu_target, ArithType::F16);
         self.launch_compute_kernel_with_solution(
             "grim_fused_dequant_gemm_f16",
             grid_dim,

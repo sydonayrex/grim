@@ -191,22 +191,23 @@ impl KvBlockPool {
             }
         }
         // Demote-before-drop: spill manager routes to host RAM + NVMe.
-        let mut drop_zero = true;
         if let Some(spill) = self.spill.as_ref() {
             let k = self.blocks[id].key_data.clone();
             let v = self.blocks[id].value_data.clone();
-            spill.demote_to_host(id, k, v).ok();
-            let _ = spill.demote_to_nvme(id);
+            if let Err(e) = spill.demote_to_host(id, k, v) {
+                eprintln!("[BlockPool] demote_to_host failed for block {id}: {e}");
+            }
+            if let Err(e) = spill.demote_to_nvme(id) {
+                eprintln!("[BlockPool] demote_to_nvme failed for block {id}: {e}");
+            }
             self.recently_zero.push_back(id);
-            drop_zero = false;
-        }
-        if drop_zero {
+        } else {
             // No spill attached: zero the in-place contents directly.
             self.blocks[id].num_tokens = 0;
             self.blocks[id].key_data.fill(0.0);
             self.blocks[id].value_data.fill(0.0);
-            self.free_list.push_back(id);
         }
+        self.free_list.push_back(id);
         Ok(())
     }
 

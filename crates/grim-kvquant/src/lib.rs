@@ -952,8 +952,10 @@ impl KvCompressor for LloydMaxCompressor {
         println!(
             "[Warp Consumer] Computing fused compressed attention tiles with INT8 scaling factors."
         );
+        let q_per_kv = (num_heads / block.num_kv_heads.max(1)).max(1);
         for t in 0..num_tokens {
             for h in 0..num_heads {
+                let kv_h = h / q_per_kv;
                 let mut scores = vec![0.0; block.num_tokens];
                 let mut max_score = f32::NEG_INFINITY;
 
@@ -961,7 +963,7 @@ impl KvCompressor for LloydMaxCompressor {
                     let mut dot = 0.0;
                     for d in 0..head_dim {
                         let q_idx = (t * num_heads + h) * head_dim + d;
-                        let k_idx = (kt * block.num_kv_heads + h) * head_dim + d;
+                        let k_idx = (kt * block.num_kv_heads + kv_h) * head_dim + d;
 
                         // SageAttention INT8 tile path: quantize inputs to INT8 on the fly to accelerate compute
                         let q_val = q_data[q_idx];
@@ -995,7 +997,7 @@ impl KvCompressor for LloydMaxCompressor {
                 for d in 0..head_dim {
                     let mut val = 0.0;
                     for kt in 0..block.num_tokens {
-                        let v_idx = (kt * block.num_kv_heads + h) * head_dim + d;
+                        let v_idx = (kt * block.num_kv_heads + kv_h) * head_dim + d;
                         val += scores[kt] * v_data[v_idx];
                     }
                     let out_idx = (t * num_heads + h) * head_dim + d;
@@ -1244,8 +1246,10 @@ impl KvCompressor for IdentityCompressor {
         let scale = 1.0 / f32::sqrt(head_dim as f32);
         let mut out_data = vec![0.0; num_tokens * num_heads * head_dim];
 
+        let q_per_kv = (num_heads / block.num_kv_heads.max(1)).max(1);
         for t in 0..num_tokens {
             for h in 0..num_heads {
+                let kv_h = h / q_per_kv;
                 let mut scores = vec![0.0; block.num_tokens];
                 let mut max_score = f32::NEG_INFINITY;
 
@@ -1253,7 +1257,7 @@ impl KvCompressor for IdentityCompressor {
                     let mut dot = 0.0;
                     for d in 0..head_dim {
                         let q_idx = (t * num_heads + h) * head_dim + d;
-                        let k_idx = (kt * block.num_kv_heads + h) * head_dim + d;
+                        let k_idx = (kt * block.num_kv_heads + kv_h) * head_dim + d;
                         dot += q_data[q_idx] * k_data[k_idx];
                     }
                     let score = dot * scale;
@@ -1277,7 +1281,7 @@ impl KvCompressor for IdentityCompressor {
                 for d in 0..head_dim {
                     let mut val = 0.0;
                     for kt in 0..block.num_tokens {
-                        let v_idx = (kt * block.num_kv_heads + h) * head_dim + d;
+                        let v_idx = (kt * block.num_kv_heads + kv_h) * head_dim + d;
                         val += scores[kt] * v_data[v_idx];
                     }
                     let out_idx = (t * num_heads + h) * head_dim + d;

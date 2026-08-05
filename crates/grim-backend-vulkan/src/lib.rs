@@ -536,8 +536,17 @@ impl VulkanContext {
         }
 
         let mut gpus = vec![std::ptr::null_mut(); gpu_count as usize];
-        unsafe {
-            vkEnumeratePhysicalDevices(instance, &mut gpu_count, gpus.as_mut_ptr());
+        let res = unsafe {
+            vkEnumeratePhysicalDevices(instance, &mut gpu_count, gpus.as_mut_ptr())
+        };
+        if res != VK_SUCCESS || gpus.is_empty() || gpus[0].is_null() {
+            unsafe {
+                vkDestroyInstance(instance, std::ptr::null());
+            }
+            return Err(Error::Backend(format!(
+                "vkEnumeratePhysicalDevices failed or returned null device with status {}",
+                res
+            )));
         }
         let physical_device = gpus[0];
 
@@ -655,6 +664,13 @@ impl VulkanContext {
         unsafe {
             vkGetDeviceQueue(device, compute_family_index, 0, &mut queue);
         }
+        if queue.is_null() {
+            unsafe {
+                vkDestroyDevice(device, std::ptr::null());
+                vkDestroyInstance(instance, std::ptr::null());
+            }
+            return Err(Error::Backend("vkGetDeviceQueue returned null queue pointer".into()));
+        }
 
         Ok(Self {
             instance,
@@ -686,6 +702,10 @@ lazy_static::lazy_static! {
 // Vulkan crate structs
 
 /// A handle to a Vulkan compute operation.
+///
+/// INVARIANT: `run_compute_shader` calls `vkQueueWaitIdle` synchronously during dispatch.
+/// Therefore, operations associated with `VulkanHandle` are already completed when returned,
+/// making `synchronize()` a safe no-op and `is_ready()` always true.
 #[derive(Debug)]
 pub struct VulkanHandle;
 
@@ -2025,7 +2045,7 @@ impl BackendDevice for VulkanDevice {
             kv_seq_len as u32,
             head_dim as u32,
             (nodes - 1) as u32,
-            ((num_kv_heads as u32) << 16 | (cache_offset & 0xffff)) as f32,
+            f32::from_bits((num_kv_heads as u32) << 16 | (cache_offset & 0xffff)),
         );
         run_compute_shader(
             ctx,
@@ -2340,6 +2360,26 @@ impl BackendDevice for VulkanDevice {
         seq_len: usize,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        if let (Some(x_s), Some(a_s), Some(b_s), Some(c_s), Some(d_s)) = (
+            x.as_any().downcast_ref::<VulkanStorage>(),
+            a.as_any().downcast_ref::<VulkanStorage>(),
+            b.as_any().downcast_ref::<VulkanStorage>(),
+            c.as_any().downcast_ref::<VulkanStorage>(),
+            d.as_any().downcast_ref::<VulkanStorage>(),
+        ) {
+            let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+            if let Some(ctx) = ctx_guard.as_ref() {
+                if let Ok(out_storage) = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device) {
+                    let spirv_source: Vec<u8> = spirv_for(VulkanKernel::SelectiveScan).to_vec();
+                    let buffers = [x_s.buffer, a_s.buffer, b_s.buffer, c_s.buffer, d_s.buffer, out_storage.buffer];
+                    let grid_x = ((dim_dinner + 255) / 256) as u32;
+                    let push = push_params(batch as u32, dim_dstate as u32, dim_dinner as u32, seq_len as u32, 0, 0.0);
+                    if run_compute_shader(ctx, &spirv_source, &buffers, grid_x, batch as u32, 1, Some(&push)).is_ok() {
+                        return Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)));
+                    }
+                }
+            }
+        }
         tracing::warn!("Vulkan selective_scan: falling back to CPU execution");
         let x_v = x.to_cpu_vec_f32()?;
         let a_v = a.to_cpu_vec_f32()?;
@@ -2421,6 +2461,24 @@ impl BackendDevice for VulkanDevice {
                  kernel repeats KV heads to match query heads"
             );
         }
+        if let (Some(q_s), Some(k_s), Some(v_s)) = (
+            q.as_any().downcast_ref::<VulkanStorage>(),
+            k.as_any().downcast_ref::<VulkanStorage>(),
+            v.as_any().downcast_ref::<VulkanStorage>(),
+        ) {
+            let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+            if let Some(ctx) = ctx_guard.as_ref() {
+                if let Ok(out_storage) = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device) {
+                    let spirv_source: Vec<u8> = spirv_for(VulkanKernel::FlashAttention).to_vec();
+                    let buffers = [q_s.buffer, k_s.buffer, v_s.buffer, out_storage.buffer];
+                    let grid_x = ((head_dim + 31) / 32) as u32;
+                    let push = push_params(seq_len as u32, head_dim as u32, num_heads as u32, num_kv_heads as u32, 0, 1.0 / (head_dim as f32).sqrt());
+                    if run_compute_shader(ctx, &spirv_source, &buffers, grid_x, num_heads as u32, 1, Some(&push)).is_ok() {
+                        return Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)));
+                    }
+                }
+            }
+        }
         // Pass num_kv_heads for GQA head-repeat; num_heads comes from out_shape.
         let (out_storage, _h) =
             self.qkv_attention(q, k, v, num_kv_heads, seq_len, 0, out_shape, None, None)?;
@@ -2468,6 +2526,26 @@ impl BackendDevice for VulkanDevice {
         seq_len: usize,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        if let (Some(x_s), Some(w_s), Some(k_s), Some(v_s), Some(g_s)) = (
+            x.as_any().downcast_ref::<VulkanStorage>(),
+            w.as_any().downcast_ref::<VulkanStorage>(),
+            k.as_any().downcast_ref::<VulkanStorage>(),
+            v.as_any().downcast_ref::<VulkanStorage>(),
+            g.as_any().downcast_ref::<VulkanStorage>(),
+        ) {
+            let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+            if let Some(ctx) = ctx_guard.as_ref() {
+                if let Ok(out_storage) = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device) {
+                    let spirv_source: Vec<u8> = spirv_for(VulkanKernel::RwkvTimeMix).to_vec();
+                    let buffers = [x_s.buffer, w_s.buffer, k_s.buffer, v_s.buffer, g_s.buffer, out_storage.buffer];
+                    let grid_x = ((dim + 255) / 256) as u32;
+                    let push = push_params(batch as u32, dim as u32, seq_len as u32, 0, 0, 0.0);
+                    if run_compute_shader(ctx, &spirv_source, &buffers, grid_x, batch as u32, 1, Some(&push)).is_ok() {
+                        return Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle)));
+                    }
+                }
+            }
+        }
         tracing::warn!("Vulkan rwkv_time_mix: falling back to CPU execution");
         let x_vec = x.to_cpu_vec_f32()?;
         let k_vec = k.to_cpu_vec_f32()?;
@@ -2520,6 +2598,27 @@ impl BackendDevice for VulkanDevice {
         dim: usize,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        if let (Some(x_s), Some(k_s), Some(r_s), Some(v_s)) = (
+            x.as_any().downcast_ref::<VulkanStorage>(),
+            k.as_any().downcast_ref::<VulkanStorage>(),
+            r.as_any().downcast_ref::<VulkanStorage>(),
+            v.as_any().downcast_ref::<VulkanStorage>(),
+        ) {
+            let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+            if let Some(ctx) = ctx_guard.as_ref() {
+                if let Ok(out_storage) = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device) {
+                    let spirv_source: Vec<u8> = spirv_for(VulkanKernel::RwkvChannelMix).to_vec();
+                    let buffers = [x_s.buffer, k_s.buffer, r_s.buffer, v_s.buffer, out_storage.buffer];
+                    let elem_count = out_shape.elem_count();
+                    let grid_x = ((elem_count + 255) / 256) as u32;
+                    let push = push_params(elem_count as u32, dim as u32, batch as u32, 0, 0, 0.0);
+                    match run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push)) {
+                        Ok(_) => return Ok((Box::new(out_storage), Box::new(grim_tensor::backend::ReadyHandle))),
+                        Err(e) => tracing::warn!("Vulkan rwkv_channel_mix compute shader failed: {e}; falling back to CPU execution"),
+                    }
+                }
+            }
+        }
         tracing::warn!("Vulkan rwkv_channel_mix: falling back to CPU execution");
         let x_vec = x.to_cpu_vec_f32()?;
         let k_vec = k.to_cpu_vec_f32()?;
@@ -2798,19 +2897,15 @@ impl BackendDevice for VulkanDevice {
             _ => (VulkanKernel::QuantizedMatmulBackwardDxGeneric, !b_scales.is_empty()),
         };
 
-        // --- Upload per-column u8 scales for the generic shader (binding 5) ---
+        // --- Upload per-column f32 scales for the generic shader (binding 5) ---
         let scales_storage_box = if has_scales {
-            let byte_scales: Vec<u8> = b_scales
+            let f32_scale_bytes: Vec<u8> = b_scales
                 .iter()
-                .map(|&s| {
-                    (s.clamp(0.0f32, 1.0f32) * 255.0f32)
-                        .round()
-                        .clamp(0.0f32, 255.0f32) as u8
-                })
+                .flat_map(|&s| s.to_le_bytes())
                 .collect();
             Some(self.from_cpu_bytes(
-                &byte_scales,
-                &Shape::from_slice(&[byte_scales.len()]),
+                &f32_scale_bytes,
+                &Shape::from_slice(&[b_scales.len() * 4]),
                 DType {
                     arith: ArithType::U8,
                     storage: DTypeStorage::Native,
@@ -3164,7 +3259,8 @@ impl VulkanAutotuner {
         }
     }
 
-    fn estimate_gemm_latency_ms(
+    /// Estimate GEMM latency in ms given problem dimensions and dtype.
+    pub(crate) fn estimate_gemm_latency_ms(
         &self,
         m: usize,
         n: usize,
@@ -3796,8 +3892,8 @@ pub fn vram_info(_ordinal: usize) -> Option<(u64, u64)> {
                 }
 
                 // Without VK_EXT_memory_budget, live free memory is unavailable.
-                // Return total for both — free is an upper bound only.
-                return Some((total_device_local, total_device_local));
+                // Return None so callers know free memory querying is unsupported.
+                return None;
             }
         }
     }

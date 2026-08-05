@@ -105,13 +105,6 @@ pub fn rccl_init_all(devlist: &[i32]) -> Result<Vec<NcclComm>, Error> {
             "RCCL ncclCommInitAll failed: {status}"
         )));
     }
-    // Guarantee no leak if the caller drops the Vec without destroying:
-    for c in comms.iter() {
-        if c.0.is_null() {
-            continue;
-        }
-        unsafe { ncclCommDestroy(*c) };
-    }
     Ok(comms)
 }
 
