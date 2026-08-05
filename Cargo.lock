@@ -2081,6 +2081,7 @@ dependencies = [
  "grim-format",
  "grim-tensor",
  "matrixmultiply",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 

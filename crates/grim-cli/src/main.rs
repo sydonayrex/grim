@@ -337,6 +337,18 @@ enum Commands {
         #[arg(long)]
         gpu: bool,
     },
+    /// Bake a trained LoRA/QLoRA adapter sidecar permanently into a base .grim model file.
+    Merge {
+        /// Path to base .grim model file.
+        #[arg(short, long)]
+        model: String,
+        /// Path to trained adapter file (.grim.train or sidecar).
+        #[arg(short, long)]
+        adapter: String,
+        /// Optional path to save merged output file (overwrites base model if omitted).
+        #[arg(short, long)]
+        output: Option<String>,
+    },
     /// Speculative decoding commands.
     Spec {
         #[command(subcommand)]
@@ -972,6 +984,37 @@ async fn main() -> Result<()> {
                 eprintln!("[grim train] Failed: {e}");
                 std::process::exit(1);
             }
+        }
+        Commands::Merge { model, adapter, output } => {
+            let out_path = output.unwrap_or_else(|| model.clone());
+            println!("[grim] Merging adapter '{}' into model '{}'...", adapter, out_path);
+            if model != out_path {
+                std::fs::copy(&model, &out_path).map_err(|e| grim_tensor::error::Error::Backend(format!("failed to copy base model: {e}")))?;
+            }
+            // Sidecar parsing & merge invocation
+            let state = grim_format::train::TrainState::read(std::path::Path::new(&adapter))?
+                .ok_or_else(|| grim_tensor::error::Error::Backend(format!("sidecar file '{}' not found", adapter)))?;
+
+            for tensor_name in state.lora_tensor_names() {
+                if let Some((a_data, a_shape, b_data, b_shape)) = state.lora_weights_for(&tensor_name) {
+                    let shape_a = grim_tensor::shape::Shape::from_slice(a_shape);
+                    let shape_b = grim_tensor::shape::Shape::from_slice(b_shape);
+                    let a_tensor = grim_backend_cpu::cpu_tensor(a_data, shape_a);
+                    let b_tensor = grim_backend_cpu::cpu_tensor(b_data, shape_b);
+                    // Standard scaling: scale = alpha / rank (alpha=32.0, rank=b_shape[1])
+                    let rank = if b_shape.len() > 1 { b_shape[1] } else { 1 };
+                    let scale = 32.0 / (rank as f32);
+                    grim_format::bolt_on::merge_bolt_on(
+                        std::path::Path::new(&out_path),
+                        &tensor_name,
+                        &a_tensor,
+                        &b_tensor,
+                        scale,
+                    )?;
+                    println!("[grim merge] Merged tensor: {}", tensor_name);
+                }
+            }
+            println!("[grim] Permanently merged adapter into '{}'.", out_path);
         }
         Commands::Spec { subcommand } => match subcommand {
             SpecCommands::Train {

@@ -431,6 +431,41 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  const wrenchBtn = document.getElementById('btn-wrench-adapter');
+  if (wrenchBtn) {
+    wrenchBtn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const modelId = document.getElementById('bolton-model-select').value;
+      const adapterPath = document.getElementById('adapter-path').value;
+
+      if (!modelId || !adapterPath) {
+        alert('Please select a target model and specify an adapter sidecar path.');
+        return;
+      }
+
+      if (!confirm(`Are you sure you want to permanently Wrench-In (merge) adapter '${adapterPath}' into base model '${modelId}'? This action cannot be undone.`)) {
+        return;
+      }
+
+      try {
+        const res = await fetch(`/api/models/${encodeURIComponent(modelId)}/bolt-ons/merge`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ adapter_path: adapterPath })
+        });
+        if (res.ok) {
+          alert('Successfully wrenched-in (permanently merged) adapter into model file!');
+          loadData();
+        } else {
+          const errData = await res.json();
+          alert('Failed to wrench-in adapter: ' + (errData.error || 'Unknown error'));
+        }
+      } catch (err) {
+        alert('Error wrenching in adapter: ' + err);
+      }
+    });
+  }
+
   document.getElementById('refresh-btn')?.addEventListener('click', loadData);
 
   loadData();

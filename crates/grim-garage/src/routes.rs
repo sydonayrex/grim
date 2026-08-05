@@ -107,6 +107,9 @@ pub struct StartTrainingRequest {
     /// is validated via `validate_job_path` in the route handler.
     #[serde(default)]
     pub resume_from_checkpoint: Option<String>,
+    /// Permanently bake the trained adapter into the target .grim file upon job completion.
+    #[serde(default)]
+    pub bake_on_completion: bool,
 }
 
 fn default_rank() -> u32 {
@@ -267,6 +270,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/models/{id}/bolt-ons",
             get(get_bolt_ons).post(attach_bolt_on_route),
         )
+        .route("/api/models/{id}/bolt-ons/merge", post(merge_bolt_on_route))
         .route(
             "/api/models/{id}/bolt-ons/{slot}",
             delete(detach_bolt_on_route),
@@ -451,6 +455,7 @@ async fn start_training(
         use_olora: req.use_olora,
         olora_lambda: req.olora_lambda,
         use_spectral_qlora: req.use_spectral_qlora,
+        bake_on_completion: req.bake_on_completion,
         resume_from_checkpoint: req.resume_from_checkpoint,
         status: crate::jobs::JobStatus::Pending,
         metrics: Vec::new(),
@@ -747,6 +752,121 @@ async fn attach_bolt_on_route(
         "adapter_path": req.adapter_path,
         "scale": req.scale,
         "attached_tensors": attached,
+        "errors": errors,
+    })))
+}
+
+async fn merge_bolt_on_route(
+    AxumPath(model_id): AxumPath<String>,
+    Json(req): Json<AttachBoltOnRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    prevent_path_traversal(&model_id)?;
+    if let Err(e) = validate_job_path("adapter_path", &req.adapter_path) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e }))));
+    }
+    let model_path = Path::new(&model_id);
+    if !model_path.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("model not found: {}", model_id) })),
+        ));
+    }
+
+    let sidecar_path = format!("{}.train", req.adapter_path);
+    let sidecar = match grim_format::train::TrainState::read(&sidecar_path) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("adapter sidecar not found: {}", sidecar_path) })),
+            ));
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("failed to read adapter sidecar: {e}") })),
+            ));
+        }
+    };
+
+    let tensor_names = sidecar.lora_tensor_names();
+    if tensor_names.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no lora adapters found in sidecar" })),
+        ));
+    }
+
+    let cpu_backend = grim_backend_cpu::device::CpuDevice::new();
+    let mut merged = Vec::new();
+    let mut errors = Vec::new();
+
+    for tensor_name in &tensor_names {
+        match sidecar.lora_weights_for(tensor_name) {
+            Some((a_data, a_shape, b_data, b_shape)) => {
+                let a_shape = grim_tensor::Shape::from_slice(a_shape);
+                let b_shape = grim_tensor::Shape::from_slice(b_shape);
+                let a_storage = match cpu_backend.from_cpu(&a_data, &a_shape, grim_tensor::DType::F32) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        errors.push(json!({ "tensor": tensor_name, "error": format!("failed to create A tensor: {e}") }));
+                        continue;
+                    }
+                };
+                let b_storage = match cpu_backend.from_cpu(&b_data, &b_shape, grim_tensor::DType::F32) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        errors.push(json!({ "tensor": tensor_name, "error": format!("failed to create B tensor: {e}") }));
+                        continue;
+                    }
+                };
+                let a_tensor = grim_tensor::Tensor::new(
+                    std::sync::Arc::from(a_storage),
+                    a_shape,
+                    grim_tensor::DType::F32,
+                    grim_tensor::dtype::QuantProvenance::GrimNative,
+                    grim_tensor::dtype::Device::Cpu,
+                );
+                let b_tensor = grim_tensor::Tensor::new(
+                    std::sync::Arc::from(b_storage),
+                    b_shape,
+                    grim_tensor::DType::F32,
+                    grim_tensor::dtype::QuantProvenance::GrimNative,
+                    grim_tensor::dtype::Device::Cpu,
+                );
+
+                match grim_format::bolt_on::merge_bolt_on(
+                    model_path,
+                    tensor_name,
+                    &a_tensor,
+                    &b_tensor,
+                    req.scale,
+                ) {
+                    Ok(()) => merged.push(tensor_name.clone()),
+                    Err(e) => {
+                        errors.push(json!({ "tensor": tensor_name, "error": format!("{e}") }))
+                    }
+                }
+            }
+            None => {
+                errors.push(json!({ "tensor": tensor_name, "error": "missing lora A or B weights in sidecar" }));
+            }
+        }
+    }
+
+    if merged.is_empty() && !errors.is_empty() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "failed to merge any bolt-on adapters", "details": errors })),
+        ));
+    }
+
+    Ok(Json(json!({
+        "status": "merged",
+        "model_id": model_id,
+        "adapter_path": req.adapter_path,
+        "scale": req.scale,
+        "merged_tensors": merged,
         "errors": errors,
     })))
 }
