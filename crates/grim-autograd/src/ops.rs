@@ -576,8 +576,8 @@ pub fn matmul_backward(args: &MatMulArgs) -> Result<(Tensor, Tensor)> {
         // For both transposed (C = A^T @ B^T):
         //   dA_stored = B @ G^T  ->  dA[p][q] = sum_l B[p][l] * G[q][l]  (same as trans_a)
         //   dB_stored = G @ A    ->  dB[p][q] = sum_i G[p][i] * A[q][i]   (derived: dB^T = A^T @ G)
-        for p in 0..a_dims[0] {
-            for q in 0..a_dims[1] {
+        for _p in 0..a_dims[0] {
+            for _q in 0..a_dims[1] {
                 match (args.transpose_a, args.transpose_b) {
                     (true, _) | (_, false) => {
                         // dA = B @ G^T (for trans_a, or both trans): dA[p][q] = sum_l B[p][l] * G[q][l]
@@ -1427,7 +1427,7 @@ pub fn fake_quant_int4_forward(args: &FakeQuantInt4Args) -> Result<Tensor> {
 
     let dequantized: Vec<f32> = quantized
         .iter()
-        .map(|&q| ((q as f32 + args.zero_point as f32) * args.scale))
+        .map(|&q| (q as f32 + args.zero_point as f32) * args.scale)
         .collect();
 
     Ok(grim_backend_cpu::cpu_tensor(

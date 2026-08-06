@@ -8,6 +8,7 @@ pub mod gpt2;
 pub mod lfm2;
 pub mod lora;
 pub mod model;
+pub mod multimodal;
 pub mod native_mtp;
 pub mod t5;
 
@@ -19,6 +20,7 @@ pub use gpt2::{Gpt2, Gpt2Config};
 pub use lfm2::{Lfm2, Lfm2Config, Lfm2LayerCache};
 pub use lora::apply_adapters_to_logits;
 pub use model::{Llama, LlamaConfig};
+pub use multimodal::*;
 pub use native_mtp::{LlamaMtp, MtpDepthProvider};
 pub use t5::{T5, T5Config};
 

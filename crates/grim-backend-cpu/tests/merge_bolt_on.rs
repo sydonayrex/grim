@@ -95,7 +95,8 @@ fn read_rows(path: &std::path::Path) -> Vec<Vec<f32>> {
     let ext = grim.metadata.get_tensor_ext(TENSOR).expect("tensor ext");
 
     let mut payload = vec![0u8; entry.payload_size as usize];
-    file.seek(SeekFrom::Start(entry.payload_offset)).expect("seek");
+    file.seek(SeekFrom::Start(entry.payload_offset))
+        .expect("seek");
     file.read_exact(&mut payload).expect("read payload");
 
     let scales: Vec<u8> = if ext.scale_size > 0 {
@@ -108,8 +109,7 @@ fn read_rows(path: &std::path::Path) -> Vec<Vec<f32>> {
 
     let outliers = read_outliers_with_encoding(&mut file, entry, ext.outlier_index_encoding)
         .expect("read outliers");
-    let outlier_pairs: Vec<(u32, f32)> =
-        outliers.into_iter().map(|o| (o.index, o.value)).collect();
+    let outlier_pairs: Vec<(u32, f32)> = outliers.into_iter().map(|o| (o.index, o.value)).collect();
 
     (0..ext.row_count as usize)
         .map(|r| {
@@ -131,14 +131,8 @@ fn merge_bakes_adapter_and_matches_reference() {
     let (_dir, path) = build_base_file();
 
     // Attach a first adapter so backup2 holds a real residual.
-    let a1 = grim_backend_cpu::cpu_tensor(
-        vec![0.05f32; 2 * COLS],
-        Shape::new(vec![2, COLS]),
-    );
-    let b1 = grim_backend_cpu::cpu_tensor(
-        vec![0.05f32; ROWS * 2],
-        Shape::new(vec![ROWS, 2]),
-    );
+    let a1 = grim_backend_cpu::cpu_tensor(vec![0.05f32; 2 * COLS], Shape::new(vec![2, COLS]));
+    let b1 = grim_backend_cpu::cpu_tensor(vec![0.05f32; ROWS * 2], Shape::new(vec![ROWS, 2]));
     attach_bolt_on(&path, TENSOR, &a1, &b1, 1.0).expect("attach");
 
     let pre = read_rows(&path);

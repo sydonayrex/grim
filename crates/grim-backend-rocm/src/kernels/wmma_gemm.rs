@@ -31,13 +31,25 @@ extern "C" __global__ void grim_wmma_gemm(
 
     // Loop over the K dimension in steps of 16.
     for (int k = 0; k < K; k += 16) {
-        load_matrix_coop_sync(frag_a, a_tile_ptr + k, stride_a);
-        load_matrix_coop_sync(frag_b, b_tile_ptr + k * stride_b, stride_b);
+        load_matrix_sync(frag_a, a_tile_ptr + k, stride_a);
+        load_matrix_sync(frag_b, b_tile_ptr + k * stride_b, stride_b);
         mma_sync(frag_c, frag_a, frag_b, frag_c);
     }
 
+    // rocWMMA accumulators store float; store to an intermediate row-major
+    // float buffer, then cast to _Float16 for the output. Directly passing
+    // a _Float16* to store_matrix_sync triggers a type-mismatch static_assert
+    // (accumulator DataT is float, pointer DataT is _Float16). Using a flat
+    // 1-D __shared__ array so it decays to float* as rocWMMA expects.
     _Float16* c_tile_ptr = C + tile_row * 16 * stride_c + tile_col * 16;
-    store_matrix_coop_sync(c_tile_ptr, frag_c, stride_c, layout_t::mem_row_major);
+    __shared__ float c_tile_f32[256];
+    store_matrix_sync(c_tile_f32, frag_c, 16, layout_t::mem_row_major);
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        for (int j = 0; j < 16; ++j) {
+            c_tile_ptr[i * stride_c + j] = (_Float16)c_tile_f32[i * 16 + j];
+        }
+    }
 }
 #else
 // Fallback path for GFX10 / RDNA2 and other architectures without native WMMA support.

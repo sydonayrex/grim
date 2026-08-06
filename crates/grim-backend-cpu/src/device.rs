@@ -434,6 +434,112 @@ impl BackendDevice for CpuDevice {
         ))
     }
 
+    fn qkv_attention_paged(
+        &self,
+        q: &dyn BackendStorage,
+        block_tables: &dyn BackendStorage,
+        k_pages: &dyn BackendStorage,
+        v_pages: &dyn BackendStorage,
+        num_kv_heads: usize,
+        max_blocks: usize,
+        page_size: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_st = a_storage(q)?;
+        let bt_st = a_storage(block_tables)?;
+        let k_st = a_storage(k_pages)?;
+        let v_st = a_storage(v_pages)?;
+
+        let q_dims = q_st.shape().dims();
+        if q_dims.len() != 3 {
+            return Err(Error::Shape("qkv_attention_paged: q must be 3-D".into()));
+        }
+        let seq_len = q_dims[0];
+        let num_heads = q_dims[1];
+        let head_dim = q_dims[2];
+
+        if num_heads % num_kv_heads != 0 {
+            return Err(Error::Shape(
+                "qkv_attention_paged: num_heads must be multiple of num_kv_heads".into(),
+            ));
+        }
+
+        let qd = q_st.data();
+        let btd = bt_st.data();
+        let kd = k_st.data();
+        let vd = v_st.data();
+
+        let kv_stride = num_kv_heads * head_dim;
+        let num_head_dims = num_heads * head_dim;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut out = vec![0.0f32; seq_len * num_head_dims];
+
+        for h in 0..num_heads {
+            let kvh = (h * num_kv_heads) / num_heads;
+            for t in 0..seq_len {
+                let q_abs = cache_offset as usize + t;
+                let mut scores = vec![0.0f32; kv_seq_len];
+                for t2 in 0..kv_seq_len {
+                    if t2 > q_abs {
+                        scores[t2] = f32::NEG_INFINITY;
+                    } else {
+                        let block_idx_in_seq = t2 / page_size;
+                        let offset_in_block = t2 % page_size;
+                        let block_id = if block_idx_in_seq < max_blocks {
+                            btd[block_idx_in_seq] as usize
+                        } else {
+                            block_idx_in_seq
+                        };
+
+                        let k_offset =
+                            (block_id * page_size + offset_in_block) * kv_stride + kvh * head_dim;
+                        let mut dot = 0.0f32;
+                        for d in 0..head_dim {
+                            dot += qd[t * num_head_dims + h * head_dim + d] * kd[k_offset + d];
+                        }
+                        scores[t2] = dot * scale;
+                    }
+                }
+
+                let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in &mut scores {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
+                for s in &mut scores {
+                    *s /= sum;
+                }
+
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for t2 in 0..kv_seq_len {
+                        if scores[t2] > 0.0 {
+                            let block_idx_in_seq = t2 / page_size;
+                            let offset_in_block = t2 % page_size;
+                            let block_id = if block_idx_in_seq < max_blocks {
+                                btd[block_idx_in_seq] as usize
+                            } else {
+                                block_idx_in_seq
+                            };
+                            let v_offset = (block_id * page_size + offset_in_block) * kv_stride
+                                + kvh * head_dim;
+                            acc += scores[t2] * vd[v_offset + d];
+                        }
+                    }
+                    out[t * num_head_dims + h * head_dim + d] = acc;
+                }
+            }
+        }
+
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
     fn embedding(
         &self,
         weight: &dyn BackendStorage,

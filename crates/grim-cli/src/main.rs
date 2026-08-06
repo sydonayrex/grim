@@ -1,6 +1,5 @@
 //! Grim CLI — main entry point for all subcommands.
 
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use grim_core::error::Result;
@@ -687,8 +686,16 @@ async fn main() -> Result<()> {
                 // standalone trait-method use (the engine always passes the
                 // pool as a parameter).
                 let router = std::sync::Arc::new(grim_disagg::DisaggRouter::new(
-                    if prefill_addr.is_empty() { &decode_addr } else { &prefill_addr },
-                    if decode_addr.is_empty() { &prefill_addr } else { &decode_addr },
+                    if prefill_addr.is_empty() {
+                        &decode_addr
+                    } else {
+                        &prefill_addr
+                    },
+                    if decode_addr.is_empty() {
+                        &prefill_addr
+                    } else {
+                        &decode_addr
+                    },
                     pool_role,
                 ));
                 engine_config.disagg_router = Some(router);
@@ -921,7 +928,9 @@ async fn main() -> Result<()> {
                 };
                 client::save_login_token(&p, &t)?;
             } else {
-                println!("Please specify a provider (e.g. 'grim login hf.co') or run 'grim login --list'.");
+                println!(
+                    "Please specify a provider (e.g. 'grim login hf.co') or run 'grim login --list'."
+                );
             }
         }
         Commands::Bench {
@@ -990,18 +999,34 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Commands::Merge { model, adapter, output } => {
+        Commands::Merge {
+            model,
+            adapter,
+            output,
+        } => {
             let out_path = output.unwrap_or_else(|| model.clone());
-            println!("[grim] Merging adapter '{}' into model '{}'...", adapter, out_path);
+            println!(
+                "[grim] Merging adapter '{}' into model '{}'...",
+                adapter, out_path
+            );
             if model != out_path {
-                std::fs::copy(&model, &out_path).map_err(|e| grim_tensor::error::Error::Backend(format!("failed to copy base model: {e}")))?;
+                std::fs::copy(&model, &out_path).map_err(|e| {
+                    grim_tensor::error::Error::Backend(format!("failed to copy base model: {e}"))
+                })?;
             }
             // Sidecar parsing & merge invocation
             let state = grim_format::train::TrainState::read(std::path::Path::new(&adapter))?
-                .ok_or_else(|| grim_tensor::error::Error::Backend(format!("sidecar file '{}' not found", adapter)))?;
+                .ok_or_else(|| {
+                    grim_tensor::error::Error::Backend(format!(
+                        "sidecar file '{}' not found",
+                        adapter
+                    ))
+                })?;
 
             for tensor_name in state.lora_tensor_names() {
-                if let Some((a_data, a_shape, b_data, b_shape)) = state.lora_weights_for(&tensor_name) {
+                if let Some((a_data, a_shape, b_data, b_shape)) =
+                    state.lora_weights_for(&tensor_name)
+                {
                     let shape_a = grim_tensor::shape::Shape::from_slice(a_shape);
                     let shape_b = grim_tensor::shape::Shape::from_slice(b_shape);
                     let a_tensor = grim_backend_cpu::cpu_tensor(a_data, shape_a);
@@ -1276,8 +1301,7 @@ async fn main() -> Result<()> {
                     let mut cb = |stage: &str, done: usize, total: usize| {
                         prog.render(stage, done, total);
                     };
-                    let mut progress: Option<&mut dyn FnMut(&str, usize, usize)> =
-                        Some(&mut cb);
+                    let mut progress: Option<&mut dyn FnMut(&str, usize, usize)> = Some(&mut cb);
                     match oxidizer::cmd_oxidizer_calibrate(
                         &model,
                         &output,

@@ -730,7 +730,10 @@ pub fn list_login_tokens() -> Result<Vec<(String, String)>> {
             continue;
         }
         if let Some((p, token)) = trimmed.split_once('=') {
-            tokens.push((p.trim().to_string(), token.trim().trim_matches('"').to_string()));
+            tokens.push((
+                p.trim().to_string(),
+                token.trim().trim_matches('"').to_string(),
+            ));
         }
     }
     Ok(tokens)

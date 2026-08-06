@@ -927,7 +927,7 @@ fn compute_visual_token_entropy(x: &grim_tensor::Tensor) -> Vec<f32> {
         let row = &vals[t * hidden_size..(t + 1) * hidden_size];
         // L2-normalize the row into a probability distribution.
         let norm: f32 = row.iter().map(|&v| v * v).sum::<f32>().sqrt().max(eps);
-        for (i, &v) in row.iter().enumerate() {
+        for (_i, &v) in row.iter().enumerate() {
             let p = (v / norm).abs();
             if p > eps {
                 entropy[t] -= p * p.ln();
@@ -2291,7 +2291,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             | TrainingMode::TurboFinetune
             | TrainingMode::KvOmni
             | TrainingMode::SpectralQLoRA => {
-                let (mut x_tensor, targets) = if let Some(ref mut dl) = dataloader {
+                let (x_tensor, targets) = if let Some(ref mut dl) = dataloader {
                     match dl.next_batch() {
                         Ok((inputs, labels)) => {
                             // labels are the shifted next-token ids; flatten
@@ -2910,7 +2910,9 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             );
             let alpha = (job.lora_rank as f32) * 2.0; // Standard 2x scaling
             for tensor_name in train_state.lora_tensor_names() {
-                if let Some((a_data, a_shape, b_data, b_shape)) = train_state.lora_weights_for(&tensor_name) {
+                if let Some((a_data, a_shape, b_data, b_shape)) =
+                    train_state.lora_weights_for(&tensor_name)
+                {
                     let shape_a = grim_tensor::shape::Shape::from_slice(a_shape);
                     let shape_b = grim_tensor::shape::Shape::from_slice(b_shape);
                     let a_tensor = grim_backend_cpu::cpu_tensor(a_data, shape_a);

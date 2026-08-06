@@ -1,7 +1,5 @@
 //! SCYTHE-2 CommFuse decomposed P2P fan-in kernel (WI-6). [see: `reduce_scatter`, `all_gather`, `RowParallelLinear`, `2604.24013`]
 
-use std::ffi::c_void;
-
 use grim_tensor::backend::{ScytheLink, ScythePlacement};
 use grim_tensor::error::{Error, Result};
 

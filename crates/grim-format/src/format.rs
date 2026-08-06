@@ -1389,7 +1389,10 @@ mod tests {
         // Wave32 maps to double the lanes of Wave64 (64 vs 32) and half the segment.
         assert_eq!(WaveSize::W64.wave_width(), 64);
         assert_eq!(WaveSize::W32.wave_width(), 32);
-        assert_eq!(WaveSize::W32.segment_bytes() * 2, WaveSize::W64.segment_bytes());
+        assert_eq!(
+            WaveSize::W32.segment_bytes() * 2,
+            WaveSize::W64.segment_bytes()
+        );
     }
 
     #[test]

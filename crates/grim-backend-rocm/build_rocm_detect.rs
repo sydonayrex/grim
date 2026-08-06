@@ -71,3 +71,57 @@ pub fn resolve_rocm_lib_dir(workspace_root: &std::path::Path) -> Option<PathBuf>
     }
     None
 }
+
+/// Candidate ROCm include-dir roots in priority order, mirroring the
+/// lib-dir search in `candidate_lib_dirs`. HIPRTC (used by
+/// `device::util::hiprtc_options_for_arch`) does NOT automatically scan
+/// the ROCm include tree, so headers like `<rocwmma/rocwmma.hpp>` go
+/// unfound unless we inject `-I<include_dir>` into the compile options.
+fn candidate_include_dirs(workspace_root: &std::path::Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let push_env = |dirs: &mut Vec<PathBuf>, key: &str| {
+        if let Ok(val) = std::env::var(key) {
+            let p = PathBuf::from(val);
+            if p.is_dir() {
+                dirs.push(p);
+            }
+        }
+    };
+    push_env(&mut dirs, "ROCM_INCLUDE_PATH");
+    push_env(&mut dirs, "ROCM_PATH");
+    for fixed in ["/opt/rocm/include", "/usr/include/rocm"] {
+        let p = PathBuf::from(fixed);
+        if p.is_dir() {
+            dirs.push(p);
+        }
+    }
+    for rocm_n in ["rocm-2", "rocm-3", "rocm-4"] {
+        let p = workspace_root.join(rocm_n).join("include");
+        if p.is_dir() {
+            dirs.push(p);
+        }
+    }
+    dirs
+}
+
+/// Resolve the ROCm include directory that contains the header search
+/// root expected by HIPRTC JIT-compiled kernels (e.g. `rocwmma/rocwmma.hpp`).
+/// Returns `None` if no candidate directory exists. Never panics.
+pub fn resolve_rocm_include_dir(workspace_root: &std::path::Path) -> Option<PathBuf> {
+    for dir in candidate_include_dirs(workspace_root) {
+        // Prefer the `include` subdir under the ROCm prefix (the
+        // canonical layout at /opt/rocm/include), but also accept a
+        // direct path that already points at the headers.
+        let candidates = if dir.file_name().and_then(|n| n.to_str()) == Some("include") {
+            vec![dir.clone()]
+        } else {
+            vec![dir.join("include"), dir.clone()]
+        };
+        for candidate in candidates {
+            if candidate.join("rocwmma").is_dir() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}

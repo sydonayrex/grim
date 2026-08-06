@@ -1,0 +1,162 @@
+// fused_dequant_gemm_iq3s.comp
+//
+// Fused dequantize-GEMM for IQ3_S weights (llama.cpp block_iq3_s).
+//
+// Block layout (110 bytes, 256 elements per block):
+//   [0..1]     d      : f16   — global scale (2 bytes)
+//   [2..65]    qs     : 64 bytes — 8D grid indices (1 byte per weight)
+//   [66..77]   scales : 12 bytes — 8 sub-block scale factors (6 bits each)
+//   [78..109]  signs  : 32 bytes — sign bits (256 bits packed, 1 bit per weight)
+//
+// IQ3_S has 8 sub-blocks of 32 weights each. Each weight's value is:
+//   grid_val = ((qs[i] + i) % 7) - 3   →  {-3..4}
+//   sc       = (scales[sb * 12 / 8]) + 1) * 0.125   (6-bit per sub-block)
+//   sign     = (signs[i / 8] >> (i % 8)) & 1
+//   result   = d * sc * grid_val * sign
+//
+// Contract: K must be divisible by 256.
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufA   { float A[]; };
+layout(std430, binding = 1) readonly buffer BufB   { uint  B_bytes[]; };
+layout(std430, binding = 2) writeonly buffer BufC  { float C[]; };
+
+uint get_byte(uint byte_idx) {
+    uint word  = B_bytes[byte_idx / 4u];
+    uint shift = (byte_idx % 4u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+float unpack_f16_bytes(uint b0, uint b1) {
+    uint bits = b0 | (b1 << 8u);
+    if (bits == 0u) return 0.0;
+    uint sign = (bits >> 15u) & 1u;
+    uint exp  = (bits >> 10u) & 0x1Fu;
+    uint mant =  bits         & 0x3FFu;
+    if (exp == 0u) {
+        if (mant == 0u) return 0.0;
+        float f = float(mant) / 1024.0 * exp2(-14.0);
+        return sign == 1u ? -f : f;
+    } else if (exp == 31u) {
+        return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+    } else {
+        float f = (1.0 + float(mant) / 1024.0) * exp2(float(exp) - 15.0);
+        return sign == 1u ? -f : f;
+    }
+}
+
+// Extract 6-bit scale for sub-block sb (0..7) from 12-byte scale buffer.
+// Each scale is 6 bits, packed MSB-first. 8 × 6 = 48 bits = 6 bytes, but
+// llama.cpp packs into 12 bytes for alignment. The CPU code uses:
+//   scales[sb * 12 / 8] which for sb 0..7 gives byte indices 0,1,2,3,4,5,6,7
+// (12/8 = 1.5, integer division gives sb for first 8, then sb+1 for next).
+// Actually the CPU code: (scales_buf[sb * 12 / 8] as f32 + 1.0) * 0.125
+// sb*12/8: sb=0→0, 1→1, 2→3, 3→4, 4→6, 5→7, 6→9, 7→10
+// This is a bit-unpacked approach. Let me implement the 6-bit extraction:
+float iq3s_get_scale(uint scale_offset, uint sb) {
+    uint bit_offset = sb * 6u;
+    uint byte_idx   = scale_offset + bit_offset / 8u;
+    uint in_byte   = bit_offset % 8u;
+    uint raw = get_byte(byte_idx);
+    if (in_byte + 6u <= 8u) {
+        raw = (raw >> (8u - in_byte - 6u)) & 0x3Fu;
+    } else {
+        uint next_byte = get_byte(byte_idx + 1u);
+        uint bits_in_first = 8u - in_byte;
+        uint low_bits = raw & ((1u << bits_in_first) - 1u);
+        uint high_bits = (next_byte >> (8u - (6u - bits_in_first))) & ((1u << (6u - bits_in_first)) - 1u);
+        raw = (low_bits << (6u - bits_in_first)) | high_bits;
+    }
+    return (float(raw) + 1.0) * 0.125;
+}
+
+/// Dequantize one element from an IQ3_S block.
+/// block_start: byte offset of the 110-byte block.
+/// in_sb      : element index within the 256-element block (0..255).
+float dequant_iq3s_element(uint block_start, uint in_sb) {
+    float d = unpack_f16_bytes(get_byte(block_start), get_byte(block_start + 1u));
+
+    uint sb_idx     = in_sb / 32u;   // sub-block 0..7
+    uint idx_in_sub = in_sb % 32u;
+
+    float sc = iq3s_get_scale(block_start + 2u + 64u, sb_idx);
+    float scale = d * sc;
+
+    // qs: 64 bytes starting at block_start + 2. One byte per weight.
+    uint qs_byte = get_byte(block_start + 2u + in_sb);
+    uint grid_idx = uint(qs_byte);
+
+    float grid_val = float((grid_idx + in_sb) % 7u) - 3.0;
+
+    // Signs: 32 bytes starting at block_start + 2 + 64 + 12 = block_start + 78
+    uint signs_byte = get_byte(block_start + 78u + in_sb / 8u);
+    uint sign_bit = (signs_byte >> (in_sb % 8u)) & 1u;
+    float sign = sign_bit == 0u ? 1.0 : -1.0;
+
+    return scale * grid_val * sign;
+}
+
+shared float s_a[16][16];
+shared float s_b[16][16];
+
+void main() {
+    uint M = params.m;
+    uint N = params.n;
+    uint K = params.k;
+
+    uint bx = gl_WorkGroupID.x;
+    uint by = gl_WorkGroupID.y;
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+
+    uint row = by * 16u + ty;
+    uint col = bx * 16u + tx;
+
+    // IQ3_S: 256 elements per block, 110 bytes per block.
+    uint blocks_per_col = K / 256u;
+    uint col_stride     = blocks_per_col * 110u;
+
+    float acc = 0.0;
+
+    for (uint bk = 0u; bk < K; bk += 16u) {
+        if (row < M && (bk + tx) < K) {
+            s_a[ty][tx] = A[row * K + bk + tx];
+        } else {
+            s_a[ty][tx] = 0.0;
+        }
+
+        uint k_idx = bk + ty;
+        if (col < N && k_idx < K) {
+            uint sb_idx      = k_idx / 256u;
+            uint in_sb       = k_idx % 256u;
+            uint block_start = col * col_stride + sb_idx * 110u;
+            s_b[ty][tx] = dequant_iq3s_element(block_start, in_sb);
+        } else {
+            s_b[ty][tx] = 0.0;
+        }
+
+        barrier();
+
+        for (uint k = 0u; k < 16u; ++k) {
+            acc += s_a[ty][k] * s_b[k][tx];
+        }
+
+        barrier();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}

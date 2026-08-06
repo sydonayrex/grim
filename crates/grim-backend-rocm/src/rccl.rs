@@ -603,7 +603,11 @@ impl RcclAllReduce {
         }
         #[cfg(feature = "rccl")]
         {
-            let comm = self.comms.first().copied().unwrap_or(NcclComm(std::ptr::null_mut()));
+            let comm = self
+                .comms
+                .first()
+                .copied()
+                .unwrap_or(NcclComm(std::ptr::null_mut()));
             if comm.0.is_null() {
                 return Err(Error::Backend(
                     "RCCL communicator is unavailable for a multi-GPU reduction".into(),

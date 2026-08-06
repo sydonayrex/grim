@@ -15,6 +15,10 @@
 //!   never share streams across devices.
 //! - `rust-ml-llm-architecture` — backend isolation: cross-device logic
 //!   stays in the ROCm crate.
+//!
+//! Dual-GPU test results (syd-beasty, ROCm 7.2.53211):
+//!   Hardware: RX 9070 XT (gfx1201, device 0) + RX 9060 XT (gfx1200, device 1)
+//!   — all 8 tests PASS, including peer_status(0,1) symmetry and enable_peer_access(0,1)
 
 use std::sync::Arc;
 

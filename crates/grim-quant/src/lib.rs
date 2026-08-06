@@ -944,8 +944,8 @@ pub fn dequant_q3k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
         let kmask2: u32 = 0x0F0F_0F0Fu32;
         let aux0 = u32::from_le_bytes([scales[0], scales[1], scales[2], scales[3]]);
         let aux1 = u32::from_le_bytes([scales[4], scales[5], scales[6], scales[7]]);
-        let tmp  = u32::from_le_bytes([scales[8], scales[9], scales[10], scales[11]]);
-        let mut aux = [
+        let tmp = u32::from_le_bytes([scales[8], scales[9], scales[10], scales[11]]);
+        let aux = [
             (aux0 & kmask2) | (((tmp >> 0) & kmask1) << 4), // aux[0]
             (aux1 & kmask2) | (((tmp >> 2) & kmask1) << 4), // aux[1]
             ((aux0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4), // aux[2]

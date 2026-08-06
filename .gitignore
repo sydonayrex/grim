@@ -15,4 +15,6 @@ models/
 .zcode/
 .zl/
 .agents/
-
+node_modules/
+package.json
+package.lock.json

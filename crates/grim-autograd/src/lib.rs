@@ -139,6 +139,8 @@ pub fn pick_device_for_tensor(x: &Tensor) -> Box<dyn BackendDevice> {
                 Box::new(grim_backend_cpu::CpuDevice::new())
             }
         }
+        // Fallback for backends not compiled in (arms above are cfg-gated).
+        #[allow(unreachable_patterns)]
         _ => Box::new(grim_backend_cpu::CpuDevice::new()),
     }
 }

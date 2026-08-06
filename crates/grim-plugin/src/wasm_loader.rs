@@ -120,8 +120,8 @@ impl WasmPluginLoader {
         // its start function without immediately trapping.
         if let Some(fuel) = self.limits.fuel_per_invocation {
             store
-                .add_fuel(fuel)
-                .map_err(|e| Error::Backend(format!("add_fuel failed: {e}")))?;
+                .set_fuel(fuel)
+                .map_err(|e| Error::Backend(format!("set_fuel failed: {e}")))?;
         }
 
         // Build the linker. Start with nothing linked — deny-by-default.
@@ -314,7 +314,7 @@ impl Sampler for WasmSampler {
                 )
                 .map_err(|e| Error::Backend(format!("WASM sample call failed: {e}")))?;
 
-            Ok(token_id)
+            Ok(token_id as u32)
         }
     }
 
@@ -326,6 +326,8 @@ impl Sampler for WasmSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "wasm-sandbox")]
+    use grim_tensor::BackendDevice;
 
     #[test]
     fn test_wasm_sandbox_limits() {
@@ -378,8 +380,44 @@ mod tests {
             0x00, 0x61, 0x73, 0x6D, // magic
             0x01, 0x00, 0x00, 0x00, // version 1
         ];
-        let result = loader.create_sampler(&minimal_wasm);
+        let _result = loader.create_sampler(&minimal_wasm);
         #[cfg(not(feature = "wasm-sandbox"))]
-        assert!(result.is_err());
+        assert!(_result.is_err());
+    }
+
+    #[cfg(feature = "wasm-sandbox")]
+    #[test]
+    fn test_wasm_sampler_execution_with_wat() {
+        let wat_src = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "sample") (param i32 i32 i32 i32) (result i32)
+                    i32.const 99
+                )
+            )
+        "#;
+        let wasm_bytes = wat::parse_str(wat_src).expect("valid WAT");
+        let limits = PluginLimits {
+            fuel_per_invocation: Some(10000),
+            max_memory_mb: Some(16),
+        };
+        let loader = WasmPluginLoader::new("wat-sampler", limits);
+        let sampler = loader.create_sampler(&wasm_bytes).expect("create_sampler");
+        assert_eq!(sampler.name(), "wat-sampler");
+
+        let cpu_dev = grim_backend_cpu::device::CpuDevice::new();
+        let shape = grim_tensor::shape::Shape::new(vec![3]);
+        let storage = cpu_dev
+            .from_cpu(&[0.1f32, 0.9, 0.2], &shape, grim_tensor::DType::F32)
+            .unwrap();
+        let dummy_tensor = grim_tensor::Tensor::new(
+            storage.into(),
+            shape,
+            grim_tensor::DType::F32,
+            grim_tensor::dtype::QuantProvenance::default(),
+            grim_tensor::Device::Cpu,
+        );
+        let token = sampler.sample(&dummy_tensor, &[]).expect("sample call");
+        assert_eq!(token, 99);
     }
 }
