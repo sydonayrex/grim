@@ -124,11 +124,9 @@ macro_rules! dbg_eprintln {
 /// [`load_model_from_grim`] to gate `.grim` loading on wavefront compatibility.
 fn probe_host_wavefront_size(device: &Device) -> Option<u32> {
     match device {
-        Device::Rocm(ordinal) => {
-            grim_backend_rocm::probe_host_gpu(*ordinal)
-                .ok()
-                .map(|caps| caps.wavefront_size)
-        }
+        Device::Rocm(ordinal) => grim_backend_rocm::probe_host_gpu(*ordinal)
+            .ok()
+            .map(|caps| caps.wavefront_size),
         _ => None,
     }
 }
@@ -1767,7 +1765,9 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
                     // rank would load onto the same GPU and the collective
                     // would deadlock waiting for peers that never started.
                     let (my_ordinal, _all_ordinals) = resolve_tp_ordinal()?;
-                    let rank = TensorParallelConfig::from_env().map(|t| t.rank).unwrap_or(0);
+                    let rank = TensorParallelConfig::from_env()
+                        .map(|t| t.rank)
+                        .unwrap_or(0);
                     let chosen = match my_ordinal {
                         Some(ord) => {
                             let d = rocm_devices
@@ -1825,7 +1825,9 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
         // process TP is active, load onto THIS rank's ordinal so each peer
         // process owns a distinct GPU and the RCCL collective can rendezvous.
         let (my_ordinal, _all_ordinals) = resolve_tp_ordinal()?;
-        let rank = TensorParallelConfig::from_env().map(|t| t.rank).unwrap_or(0);
+        let rank = TensorParallelConfig::from_env()
+            .map(|t| t.rank)
+            .unwrap_or(0);
         let chosen = match my_ordinal {
             Some(ord) => {
                 let Some(d) = rocm_devices.iter().find(|dev| dev.ordinal() == ord) else {
@@ -1843,7 +1845,7 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
                     return Err(Error::Config(
                         "ROCm probe returned an empty device list; cannot select a default GPU. \
                          Set GRIM_TP_GPUS to pin this rank's ordinal."
-                            .into()
+                            .into(),
                     ));
                 };
                 eprintln!("[model_loader] Using ROCm device {}", first.ordinal());

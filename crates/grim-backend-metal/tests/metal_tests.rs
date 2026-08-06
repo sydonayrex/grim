@@ -34,12 +34,7 @@ fn test_metal_all_reduce_parity() {
         .collect();
     assert_eq!(result.len(), expected.len());
     for (r, e) in result.iter().zip(expected.iter()) {
-        assert!(
-            (r - e).abs() < 1e-5,
-            "all_reduce mismatch: {} != {}",
-            r,
-            e
-        );
+        assert!((r - e).abs() < 1e-5, "all_reduce mismatch: {} != {}", r, e);
     }
 }
 
@@ -93,11 +88,6 @@ fn test_metal_comm_fuse_reduce_parity() {
     let expected = vec![1.0f32, 2.0, 10.0, 20.0, 30.0, 3.0, 4.0, 40.0, 50.0, 60.0];
     assert_eq!(result.len(), expected.len());
     for (r, e) in result.iter().zip(expected.iter()) {
-        assert!(
-            (r - e).abs() < 1e-5,
-            "comm_fuse mismatch: {} != {}",
-            r,
-            e
-        );
+        assert!((r - e).abs() < 1e-5, "comm_fuse mismatch: {} != {}", r, e);
     }
 }

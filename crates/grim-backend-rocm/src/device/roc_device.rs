@@ -236,13 +236,7 @@ impl RocmDevice {
                 }
             }
         }
-        let dev = Self::build(
-            ordinal,
-            warp_size,
-            xnack_val,
-            handle_cache,
-            streams,
-        );
+        let dev = Self::build(ordinal, warp_size, xnack_val, handle_cache, streams);
         // Auto-init RCCL when multi-process TP is active — this rank process
         // builds its own RcclAllReduce over the full ordinal list so
         // `RowParallelLinear::forward`'s all_reduce has a live comm handle.
@@ -358,15 +352,7 @@ impl RocmDevice {
         let stream = self
             .get_stream_from_pool(0)
             .ok_or_else(|| Error::Backend("copy_via_route: no stream available in pool".into()))?;
-        crate::p2p_route::copy_route(
-            src_device,
-            dst_device,
-            src_ptr,
-            dst_ptr,
-            len,
-            route,
-            stream,
-        )
+        crate::p2p_route::copy_route(src_device, dst_device, src_ptr, dst_ptr, len, route, stream)
     }
 
     /// Probe the total amount of device memory reported by the driver, in bytes. [see: `hipMemGetInfo`, `hipDeviceProp_t`]
@@ -870,7 +856,7 @@ impl RocmDevice {
 
         // Look up the offline-tuned solution index for this shape/dtype, so
         // matmul_batched routes through the same autotune table as matmul.
-        let solution_index = lookup_solution_index(m, n, k, dtype_out.arith);
+        let solution_index = lookup_solution_index(m, n, k, &self.gpu_target, dtype_out.arith);
 
         // Row-major C[M,N] = A[M,K] @ B[K,N] via rocBLAS column-major recipe [see: `matmul`]
         unsafe {
@@ -1389,7 +1375,7 @@ impl BackendDevice for RocmDevice {
         // Shape-indexed GEMM dispatch lookup (Tensile-inspired layout resolution)
         let tile_config = lookup_gemm_config(m, n, k, self.props.wavefront_size);
         // Offline-tuned solution_index per (M,N,K) for FP32. Falls back to 0 for [see: `examples/tune_gemm.rs`]
-        let solution_index = lookup_solution_index(m, n, k, dtype_out.arith);
+        let solution_index = lookup_solution_index(m, n, k, &self.gpu_target, dtype_out.arith);
         // WI 2.4.3 — split_k clamp gate.
         let split_k_effective: u32 = {
             let split_k_enabled = self.split_k_config.lock().unwrap().enabled;
@@ -3671,7 +3657,7 @@ impl RocmDevice {
         let mut sb = stride_b as i32;
         let mut sc = stride_c as i32;
 
-        let solution_index = lookup_solution_index(m, n, k, ArithType::F16);
+        let solution_index = lookup_solution_index(m, n, k, &self.gpu_target, ArithType::F16);
         self.launch_compute_kernel_with_solution(
             "grim_decode_gemm_f16",
             grid_dim,
@@ -3712,11 +3698,26 @@ impl RocmDevice {
             .device_ptr
             .ok_or_else(|| Error::Backend("wmma_gemm: out has no device ptr".into()))?;
 
-        const BLOCK_SIZE: usize = 256;
-        let total_elems = m * n;
-        let grid_x = ((total_elems + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
-        let grid_dim = HipDim3::new(grid_x, 1, 1);
-        let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
+        let is_native_wmma = matches!(
+            crate::quantization::gcn_arch(&self.gpu_target),
+            crate::quantization::GcnArch::RDNA3 | crate::quantization::GcnArch::RDNA4
+        );
+
+        let (grid_dim, block_dim) = if is_native_wmma {
+            // Native rocWMMA path: 16x16 tile per block, 1 wavefront (32 threads for W32).
+            let grid_x = ((n + 15) / 16) as u32;
+            let grid_y = ((m + 15) / 16) as u32;
+            (HipDim3::new(grid_x, grid_y, 1), HipDim3::new(32, 1, 1))
+        } else {
+            // Scalar fallback path: 1D grid of 256 threads.
+            const BLOCK_SIZE: usize = 256;
+            let total_elems = m * n;
+            let grid_x = ((total_elems + BLOCK_SIZE - 1) / BLOCK_SIZE) as u32;
+            (
+                HipDim3::new(grid_x, 1, 1),
+                HipDim3::new(BLOCK_SIZE as u32, 1, 1),
+            )
+        };
 
         let mut aptr = a_ptr;
         let mut bptr = b_ptr;
@@ -3731,7 +3732,7 @@ impl RocmDevice {
         let mut sb = stride_b as i32;
         let mut sc = stride_c as i32;
 
-        let solution_index = lookup_solution_index(m, n, k, ArithType::F16);
+        let solution_index = lookup_solution_index(m, n, k, &self.gpu_target, ArithType::F16);
         self.launch_compute_kernel_with_solution(
             "grim_wmma_gemm",
             grid_dim,
@@ -3873,7 +3874,7 @@ impl RocmDevice {
         let mut b2_codes_off = backup2_codes_offset as i32;
         let mut b2_scale_off = backup2_scale_offset as i32;
 
-        let solution_index = lookup_solution_index(m, n, k, ArithType::F16);
+        let solution_index = lookup_solution_index(m, n, k, &self.gpu_target, ArithType::F16);
         self.launch_compute_kernel_with_solution(
             "grim_fused_dequant_gemm_f16",
             grid_dim,
@@ -4018,6 +4019,7 @@ impl RocmDevice {
     ///
     /// Updates `weight` and `scale` in-place using M+Adam's additive-multiplicative
     /// split: momentum in FP8-simulated precision, scale-bump propagation in BF16.
+    #[allow(dead_code)] // kernel launcher, not yet wired into this build's call graph
     pub(crate) fn launch_madam_update_f32(
         &self,
         dx_storage: &RocmStorage,
@@ -4198,7 +4200,7 @@ impl RocmDevice {
 
         let mut dyptr = dy_ptr;
         let mut bptr = b_ptr;
-        let mut bsptr = b_scales_ptr;
+        let bsptr = b_scales_ptr;
         let mut dxptr = dx_ptr;
         let mut mm = m as i32;
         let mut nn = n as i32;
@@ -5024,6 +5026,202 @@ impl RocmDevice {
         let mut values = self.read_to_host_async(&f32_storage)?;
         values.truncate(elem_count);
         Ok(values)
+    }
+
+    // ─── Standalone dequant host wrappers (iq/fp8/mxfp) ────────────────────────
+
+    /// Run any standalone IQ dequant kernel against `bytes` and return `elem_count` f32 values.
+    fn dequantize_iq_host(
+        &self,
+        bytes: &[u8],
+        elem_count: usize,
+        block_bytes: usize,
+        kernel: &str,
+    ) -> Result<Vec<f32>> {
+        const QK: usize = 256;
+        let n_blocks = bytes.len() / block_bytes;
+        let packed = RocmStorage::copy_from_host_raw_bytes(
+            bytes,
+            &Shape::new(vec![bytes.len()]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let out_storage = RocmStorage::alloc_gpu(
+            &Shape::new(vec![n_blocks * QK]),
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        match kernel {
+            "grim_dequant_iq2xxs" => {
+                self.launch_dequant_iq2xxs(&packed, &out_storage, n_blocks)?;
+            }
+            "grim_dequant_iq2xs" => {
+                self.launch_dequant_iq2xs(&packed, &out_storage, n_blocks)?;
+            }
+            "grim_dequant_iq2s" => {
+                self.launch_dequant_iq2s(&packed, &out_storage, n_blocks)?;
+            }
+            "grim_dequant_iq3xxs" => {
+                self.launch_dequant_iq3xxs(&packed, &out_storage, n_blocks)?;
+            }
+            "grim_dequant_iq3s" => {
+                self.launch_dequant_iq3s(&packed, &out_storage, n_blocks)?;
+            }
+            "grim_dequant_iq4nl" => {
+                self.launch_dequant_iq4nl(&packed, &out_storage, n_blocks)?;
+            }
+            "grim_dequant_iq4xs" => {
+                self.launch_dequant_iq4xs(&packed, &out_storage, n_blocks)?;
+            }
+            other => {
+                return Err(Error::Backend(format!(
+                    "dequantize_iq_host: unknown kernel {other}"
+                )))
+            }
+        }
+        let mut values = self.read_to_host_async(&out_storage)?;
+        values.truncate(elem_count);
+        Ok(values)
+    }
+
+    /// Dequantize IQ2_XXS packed bytes via the ROCm kernel. 66 bytes / 256-elem super-block.
+    pub fn dequantize_iq2xxs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, 66, "grim_dequant_iq2xxs")
+    }
+    /// Dequantize IQ2_XS packed bytes via the ROCm kernel. 74 bytes / 256-elem super-block.
+    pub fn dequantize_iq2xs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, 74, "grim_dequant_iq2xs")
+    }
+    /// Dequantize IQ2_S packed bytes via the ROCm kernel. 82 bytes / 256-elem super-block.
+    pub fn dequantize_iq2s_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, 82, "grim_dequant_iq2s")
+    }
+    /// Dequantize IQ3_XXS packed bytes via the ROCm kernel. 96 bytes / 256-elem super-block.
+    pub fn dequantize_iq3xxs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, 96, "grim_dequant_iq3xxs")
+    }
+    /// Dequantize IQ3_S packed bytes via the ROCm kernel. 110 bytes / 256-elem super-block.
+    pub fn dequantize_iq3s_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, 110, "grim_dequant_iq3s")
+    }
+    /// Dequantize IQ4_NL packed bytes via the ROCm kernel. 170 bytes / 256-elem super-block.
+    pub fn dequantize_iq4nl_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, 170, "grim_dequant_iq4nl")
+    }
+    /// Dequantize IQ4_XS packed bytes via the ROCm kernel. 178 bytes / 256-elem super-block.
+    pub fn dequantize_iq4xs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, 178, "grim_dequant_iq4xs")
+    }
+
+    /// Dequantize packed FP8 bytes (4-byte f32 LE scale header, then one E4M3 code per element).
+    pub fn dequantize_fp8_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let scale = if bytes.len() >= 4 {
+            f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        } else {
+            1.0
+        };
+        let payload = if bytes.len() >= 4 { &bytes[4..] } else { bytes };
+        let packed = RocmStorage::copy_from_host_raw_bytes(
+            payload,
+            &Shape::new(vec![payload.len()]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let out_storage = RocmStorage::alloc_gpu(
+            &Shape::new(vec![elem_count]),
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        self.launch_dequant_fp8(&packed, &out_storage, elem_count)?;
+        let mut values = self.read_to_host_async(&out_storage)?;
+        values.truncate(elem_count);
+        for v in values.iter_mut() {
+            *v *= scale;
+        }
+        Ok(values)
+    }
+
+    /// Helper to split an MXFP single-buffer (length-prefixed codes/exps segments) into two device buffers.
+    /// Reuses the same framing as `grim_quant::dequant_mxfp4`/`dequant_mxfp8`.
+    fn split_dequant_mxfp(&self, bytes: &[u8], elem_count: usize, kernel: &str) -> Result<Vec<f32>> {
+        let mut cursor = 0usize;
+        let read_segment = |buf: &[u8], cur: &mut usize| -> Result<Vec<u8>> {
+            let len = u64::from_le_bytes(
+                buf[*cur..*cur + 8]
+                    .try_into()
+                    .map_err(|_| Error::Backend("mxfp: bad length prefix".into()))?,
+            ) as usize;
+            *cur += 8;
+            let seg = buf[*cur..*cur + len].to_vec();
+            *cur += len;
+            Ok(seg)
+        };
+        let codes = read_segment(bytes, &mut cursor)?;
+        let exps = read_segment(bytes, &mut cursor)?;
+
+        let codes_storage = RocmStorage::copy_from_host_raw_bytes(
+            &codes,
+            &Shape::new(vec![codes.len()]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let exps_storage = RocmStorage::copy_from_host_raw_bytes(
+            &exps,
+            &Shape::new(vec![exps.len()]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let out_storage = RocmStorage::alloc_gpu(
+            &Shape::new(vec![elem_count]),
+            DType {
+                arith: ArithType::F32,
+                storage: DTypeStorage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+
+        if kernel.contains("mxfp4") {
+            self.launch_dequant_mxfp4(&codes_storage, &exps_storage, &out_storage, elem_count)?;
+        } else {
+            self.launch_dequant_mxfp8(&codes_storage, &exps_storage, &out_storage, elem_count)?;
+        }
+        let mut values = self.read_to_host_async(&out_storage)?;
+        values.truncate(elem_count);
+        Ok(values)
+    }
+
+    /// Dequantize an MXFP4 single-buffer roster (length-prefixed codes/exps segments) to f32.
+    pub fn dequantize_mxfp4_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.split_dequant_mxfp(bytes, elem_count, "mxfp4")
+    }
+    /// Dequantize an MXFP8 single-buffer roster (length-prefixed codes/exps segments) to f32.
+    pub fn dequantize_mxfp8_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.split_dequant_mxfp(bytes, elem_count, "mxfp8")
     }
 
     /// Dequantize Q8_0 packed bytes to F32. `n_blocks` is the number of [see: `packed`, `packed.bytes / 34`]

@@ -24,12 +24,14 @@ grim-speculative = { workspace = true }
 grim-kvquant = { workspace = true }
 grim-autograd = { workspace = true }
 grim-plugin = { workspace = true }
+grim-disagg = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+grim-kvtransport = { workspace = true }
 
 [features]
 default = []

@@ -1,5 +1,6 @@
 //! Grim CLI — main entry point for all subcommands.
 
+
 use clap::{Parser, Subcommand};
 use grim_core::error::Result;
 
@@ -72,6 +73,15 @@ enum Commands {
         /// Path to plugins directory.
         #[arg(long, default_value = "plugins")]
         plugins: String,
+        /// Disaggregation role: prefill, decode, or colocated (default: colocated).
+        #[arg(long, default_value = "colocated")]
+        disagg_role: String,
+        /// Prefill node address for decode mode (where to fetch KV from).
+        #[arg(long, default_value = "")]
+        prefill_addr: String,
+        /// Decode node address for prefill mode (where to push KV to).
+        #[arg(long, default_value = "")]
+        decode_addr: String,
     },
     /// One-shot inference or HTTP serving.
     Run {
@@ -200,11 +210,14 @@ enum Commands {
     },
     /// Log in to a registry or cloud provider.
     Login {
-        /// Provider name (e.g. 'hf.co', 'ollama').
-        provider: String,
+        /// Provider name (e.g. 'hf.co', 'ollama', 'openai').
+        provider: Option<String>,
         /// API key or Token.
         #[arg(short, long)]
         token: Option<String>,
+        /// List all saved provider credentials.
+        #[arg(short, long)]
+        list: bool,
     },
     /// Benchmark / smoke test.
     Bench {
@@ -323,6 +336,18 @@ enum Commands {
         #[arg(long)]
         gpu: bool,
     },
+    /// Bake a trained LoRA/QLoRA adapter sidecar permanently into a base .grim model file.
+    Merge {
+        /// Path to base .grim model file.
+        #[arg(short, long)]
+        model: String,
+        /// Path to trained adapter file (.grim.train or sidecar).
+        #[arg(short, long)]
+        adapter: String,
+        /// Optional path to save merged output file (overwrites base model if omitted).
+        #[arg(short, long)]
+        output: Option<String>,
+    },
     /// Speculative decoding commands.
     Spec {
         #[command(subcommand)]
@@ -424,6 +449,11 @@ enum ServiceCommands {
     Run {
         #[arg(short, long, default_value = "grim.toml")]
         config: String,
+        /// Plugin directory to load samplers/processors from at startup — the
+        /// same `--plugins <dir>` surface the interactive `serve` and
+        /// `run --serve` commands honor. Empty (default) means no plugins.
+        #[arg(long, default_value = "")]
+        plugins: String,
     },
 }
 
@@ -625,16 +655,68 @@ async fn main() -> Result<()> {
             port,
             config: _,
             plugins,
+            disagg_role,
+            prefill_addr,
+            decode_addr,
         } => {
-            // Starts the HTTP server with first available model and tokenizer.
-            let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-            if !plugins.is_empty() {
+            // Build EngineConfig with optional disaggregation wiring.
+            let mut engine_config = grim_engine::EngineConfig::default();
+            let role_lower = disagg_role.to_ascii_lowercase();
+            let pool_role = match role_lower.as_str() {
+                "prefill" => grim_disagg::PoolRole::Prefill,
+                "decode" => grim_disagg::PoolRole::Decode,
+                "colocated" => grim_disagg::PoolRole::Colocated,
+                other => {
+                    eprintln!(
+                        "[grim] serve: unknown --disagg-role '{other}' (expected prefill|decode|colocated), defaulting to colocated"
+                    );
+                    grim_disagg::PoolRole::Colocated
+                }
+            };
+
+            if pool_role != grim_disagg::PoolRole::Colocated {
+                let dc = grim_disagg::DisaggConfig {
+                    role: pool_role,
+                    prefill_addr: prefill_addr.clone(),
+                    decode_addr: decode_addr.clone(),
+                };
+                // Build a router for cross-node KV transfers.  The engine
+                // supplies its own shared KvBlockPool to transfer_kv_cache_real
+                // directly; the router's `pool` field is left None for
+                // standalone trait-method use (the engine always passes the
+                // pool as a parameter).
+                let router = std::sync::Arc::new(grim_disagg::DisaggRouter::new(
+                    if prefill_addr.is_empty() {
+                        &decode_addr
+                    } else {
+                        &prefill_addr
+                    },
+                    if decode_addr.is_empty() {
+                        &prefill_addr
+                    } else {
+                        &decode_addr
+                    },
+                    pool_role,
+                ));
+                engine_config.disagg_router = Some(router);
+                engine_config.disagg_config = Some(dc);
+            }
+
+            let engine = grim_engine::Engine::new(engine_config);
+            // Load plugins into a registry that is *kept* and threaded into
+            // `serve()` so request handlers can look up registered samplers by
+            // name. Prior behavior loaded then dropped the registry before a
+            // single request was served — the whole pipeline ran for nothing.
+            let plugin_registry = if !plugins.is_empty() {
                 let mut registry = grim_plugin::PluginRegistry::new();
                 match plugin::load_plugins(&plugins, &mut registry) {
                     Ok(n) => eprintln!("[grim] serve: loaded {n} plugin(s) from {plugins}"),
                     Err(e) => eprintln!("[grim] serve: failed to load plugins from {plugins}: {e}"),
                 }
-            }
+                Some(std::sync::Arc::new(registry))
+            } else {
+                None
+            };
             // Precedence: explicit --address > --host/--port > GRIM_HOST/GRIM_PORT > default.
             let effective = if !address.is_empty() {
                 address.clone()
@@ -647,7 +729,7 @@ async fn main() -> Result<()> {
                 grim_core::RuntimeEnv::resolve_bind(None)
             };
             eprintln!("[grim] serve: binding to {effective} (Ollama-compatible)");
-            grim_server::serve(&effective, engine, None).await?;
+            grim_server::serve(&effective, engine, None, plugin_registry).await?;
         }
         Commands::Run {
             model,
@@ -702,8 +784,23 @@ async fn main() -> Result<()> {
                     None
                 };
                 let r_addr = grim_core::RuntimeEnv::resolve_bind(Some(&address));
+                // Symmetric to the `Serve` arm: honor `--plugins <dir>` here too.
+                // Prior behavior ignored `plugins` entirely in the `run --serve`
+                // path, so a plugin directory was silently dropped.
+                let plugin_registry = if !plugins.is_empty() {
+                    let mut registry = grim_plugin::PluginRegistry::new();
+                    match plugin::load_plugins(&plugins, &mut registry) {
+                        Ok(n) => eprintln!("[grim] serve: loaded {n} plugin(s) from {plugins}"),
+                        Err(e) => {
+                            eprintln!("[grim] serve: failed to load plugins from {plugins}: {e}")
+                        }
+                    }
+                    Some(std::sync::Arc::new(registry))
+                } else {
+                    None
+                };
                 eprintln!("[grim] serve: binding to {r_addr} (Ollama-compatible)");
-                grim_server::serve(&r_addr, engine, model_path).await?;
+                grim_server::serve(&r_addr, engine, model_path, plugin_registry).await?;
             } else {
                 let model_name = model.unwrap_or_else(|| "default".to_string());
                 // Bypass cache for local GGUF paths; security boundary still applies to named models.
@@ -797,19 +894,44 @@ async fn main() -> Result<()> {
         Commands::Use { context, model } => {
             client::set_default_model(&context, &model)?;
         }
-        Commands::Login { provider, token } => {
-            let t = match token {
-                Some(tk) => tk,
-                None => {
-                    print!("Enter API token for {}: ", provider);
-                    use std::io::Write;
-                    std::io::stdout().flush().unwrap();
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input).unwrap();
-                    input.trim().to_string()
+        Commands::Login {
+            provider,
+            token,
+            list,
+        } => {
+            if list {
+                let saved = client::list_login_tokens()?;
+                if saved.is_empty() {
+                    println!("[grim] No stored credentials found in ~/.grim/credentials.toml");
+                } else {
+                    println!("[grim] Stored Provider Credentials:");
+                    for (prov, tok) in saved {
+                        let masked = if tok.len() > 8 {
+                            format!("{}...{}", &tok[..4], &tok[tok.len() - 4..])
+                        } else {
+                            "********".to_string()
+                        };
+                        println!("  - {:<15} {}", prov, masked);
+                    }
                 }
-            };
-            client::save_login_token(&provider, &t)?;
+            } else if let Some(p) = provider {
+                let t = match token {
+                    Some(tk) => tk,
+                    None => {
+                        print!("Enter API token for {}: ", p);
+                        use std::io::Write;
+                        std::io::stdout().flush().unwrap();
+                        let mut input = String::new();
+                        std::io::stdin().read_line(&mut input).unwrap();
+                        input.trim().to_string()
+                    }
+                };
+                client::save_login_token(&p, &t)?;
+            } else {
+                println!(
+                    "Please specify a provider (e.g. 'grim login hf.co') or run 'grim login --list'."
+                );
+            }
         }
         Commands::Bench {
             tokens,
@@ -876,6 +998,53 @@ async fn main() -> Result<()> {
                 eprintln!("[grim train] Failed: {e}");
                 std::process::exit(1);
             }
+        }
+        Commands::Merge {
+            model,
+            adapter,
+            output,
+        } => {
+            let out_path = output.unwrap_or_else(|| model.clone());
+            println!(
+                "[grim] Merging adapter '{}' into model '{}'...",
+                adapter, out_path
+            );
+            if model != out_path {
+                std::fs::copy(&model, &out_path).map_err(|e| {
+                    grim_tensor::error::Error::Backend(format!("failed to copy base model: {e}"))
+                })?;
+            }
+            // Sidecar parsing & merge invocation
+            let state = grim_format::train::TrainState::read(std::path::Path::new(&adapter))?
+                .ok_or_else(|| {
+                    grim_tensor::error::Error::Backend(format!(
+                        "sidecar file '{}' not found",
+                        adapter
+                    ))
+                })?;
+
+            for tensor_name in state.lora_tensor_names() {
+                if let Some((a_data, a_shape, b_data, b_shape)) =
+                    state.lora_weights_for(&tensor_name)
+                {
+                    let shape_a = grim_tensor::shape::Shape::from_slice(a_shape);
+                    let shape_b = grim_tensor::shape::Shape::from_slice(b_shape);
+                    let a_tensor = grim_backend_cpu::cpu_tensor(a_data, shape_a);
+                    let b_tensor = grim_backend_cpu::cpu_tensor(b_data, shape_b);
+                    // Standard scaling: scale = alpha / rank (alpha=32.0, rank=b_shape[1])
+                    let rank = if b_shape.len() > 1 { b_shape[1] } else { 1 };
+                    let scale = 32.0 / (rank as f32);
+                    grim_format::bolt_on::merge_bolt_on(
+                        std::path::Path::new(&out_path),
+                        &tensor_name,
+                        &a_tensor,
+                        &b_tensor,
+                        scale,
+                    )?;
+                    println!("[grim merge] Merged tensor: {}", tensor_name);
+                }
+            }
+            println!("[grim] Permanently merged adapter into '{}'.", out_path);
         }
         Commands::Spec { subcommand } => match subcommand {
             SpecCommands::Train {
@@ -954,9 +1123,10 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                ServiceCommands::Run { config } => {
+                ServiceCommands::Run { config, plugins } => {
                     #[cfg(target_os = "windows")]
                     {
+                        let _ = plugins;
                         run_windows_service_dispatcher(&config)?;
                     }
                     #[cfg(not(target_os = "windows"))]
@@ -967,7 +1137,8 @@ async fn main() -> Result<()> {
                         println!("[Service] Running background daemon on port 11434");
                         let rt = tokio::runtime::Runtime::new().unwrap();
                         rt.block_on(async {
-                            if let Err(e) = server::cmd_server("127.0.0.1:11434", &config, "").await
+                            if let Err(e) =
+                                server::cmd_server("127.0.0.1:11434", &config, &plugins).await
                             {
                                 eprintln!("[Service] Server failed: {e}");
                             }
@@ -1130,8 +1301,7 @@ async fn main() -> Result<()> {
                     let mut cb = |stage: &str, done: usize, total: usize| {
                         prog.render(stage, done, total);
                     };
-                    let mut progress: Option<&mut dyn FnMut(&str, usize, usize)> =
-                        Some(&mut cb);
+                    let mut progress: Option<&mut dyn FnMut(&str, usize, usize)> = Some(&mut cb);
                     match oxidizer::cmd_oxidizer_calibrate(
                         &model,
                         &output,
@@ -1425,7 +1595,7 @@ fn run_service_loop() -> Result<()> {
     let shutdown = shutdown_rx.recv();
     rt.block_on(async {
         let engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
-        let server = grim_server::serve("127.0.0.1:11434", engine, None);
+        let server = grim_server::serve("127.0.0.1:11434", engine, None, None);
         tokio::select! {
             _ = server => {}
             _ = shutdown => {

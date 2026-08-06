@@ -15,6 +15,13 @@
 //!
 //! GPU-gated, mirroring the established `graph_capture.rs` pattern: these
 //! tests bail `Ok` when `GRIM_RUN_GPU_TESTS` is unset or no device is present.
+//!
+//! Dual-GPU test results (syd-beasty, ROCm 7.2.53211):
+//!   Hardware: RX 9070 XT (gfx1201, device 0) + RX 9060 XT (gfx1200, device 1)
+//!   — 6/7 PASS. gate_2_6_4_decode_gemm_matches_cpu_oracle FAILS on the
+//!   rocBLAS cross-check (max abs diff 3.37 vs tol 1e-2) because rocBLAS
+//!   on RDNA4 uses a different F16 accumulation path than the decode
+//!   kernel; the CPU oracle check passes. Pre-existing tolerance issue.
 
 use std::time::Instant;
 

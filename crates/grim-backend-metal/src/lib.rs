@@ -379,6 +379,7 @@ pub struct MetalDevice {
     ordinal: usize,
 }
 
+#[cfg(target_vendor = "apple")]
 fn fnv1a_hash(s: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for &byte in s.as_bytes() {
@@ -388,6 +389,7 @@ fn fnv1a_hash(s: &str) -> u64 {
     hash
 }
 
+#[cfg(target_vendor = "apple")]
 fn get_cache_dir() -> Option<std::path::PathBuf> {
     if let Ok(home) = std::env::var("HOME") {
         Some(
@@ -1539,6 +1541,7 @@ impl BackendDevice for MetalDevice {
         )
     }
 
+    #[allow(unused_variables)] // params only used on the cfg-gated Apple path
     fn qkv_attention_paged(
         &self,
         q: &dyn BackendStorage,
@@ -1650,6 +1653,7 @@ impl BackendDevice for MetalDevice {
         ))
     }
 
+    #[allow(unused_variables)] // params only used on the cfg-gated Apple path
     fn tree_attention(
         &self,
         q: &dyn BackendStorage,
@@ -2734,6 +2738,7 @@ impl BackendDevice for MetalDevice {
         ))
     }
 
+    #[allow(unused_variables)] // locals only used on the cfg-gated Apple path
     fn all_reduce(
         &self,
         inputs: &[&dyn BackendStorage],
@@ -2785,10 +2790,8 @@ impl BackendDevice for MetalDevice {
                     }
                     if valid {
                         if let Ok(out_storage) = self.zeros(&shape, DType::F32) {
-                            let out_s = out_storage
-                                .as_any()
-                                .downcast_ref::<MetalStorage>()
-                                .unwrap();
+                            let out_s =
+                                out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
                             let out_buf = out_s.buffer.as_ref().unwrap();
 
                             let cmd = self.get_or_create_command_buffer()?;
@@ -2812,8 +2815,7 @@ impl BackendDevice for MetalDevice {
                             for in_buf in &input_bufs {
                                 encoder.setBuffer_offset_atIndex(Some(*in_buf), 0, 0);
                                 encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 1);
-                                encoder
-                                    .dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
+                                encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
                             }
                             encoder.endEncoding();
 
@@ -2846,17 +2848,13 @@ impl BackendDevice for MetalDevice {
         #[cfg(target_vendor = "apple")]
         {
             let command_buffer = self.get_or_create_command_buffer()?;
-            Ok((
-                storage,
-                Box::new(MetalHandle {
-                    command_buffer,
-                }),
-            ))
+            Ok((storage, Box::new(MetalHandle { command_buffer })))
         }
         #[cfg(not(target_vendor = "apple"))]
         Ok((storage, Box::new(MetalHandle)))
     }
 
+    #[allow(unused_variables)] // locals only used on the cfg-gated Apple path
     fn comm_fuse_reduce(
         &self,
         partials: &[(&dyn BackendStorage, &ScythePlacement)],
@@ -2903,10 +2901,8 @@ impl BackendDevice for MetalDevice {
                     }
                     if valid {
                         if let Ok(out_storage) = self.zeros(&out_shape, DType::F32) {
-                            let out_s = out_storage
-                                .as_any()
-                                .downcast_ref::<MetalStorage>()
-                                .unwrap();
+                            let out_s =
+                                out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
                             let out_buf = out_s.buffer.as_ref().unwrap();
 
                             let cmd = self.get_or_create_command_buffer()?;
@@ -2940,14 +2936,12 @@ impl BackendDevice for MetalDevice {
                                 let col_offset_val = col_offset as i32;
                                 unsafe {
                                     encoder.setBytes_length_atIndex(
-                                        &n_src_val as *const i32
-                                            as *const std::ffi::c_void,
+                                        &n_src_val as *const i32 as *const std::ffi::c_void,
                                         4,
                                         3,
                                     );
                                     encoder.setBytes_length_atIndex(
-                                        &col_offset_val as *const i32
-                                            as *const std::ffi::c_void,
+                                        &col_offset_val as *const i32 as *const std::ffi::c_void,
                                         4,
                                         4,
                                     );
@@ -2957,8 +2951,7 @@ impl BackendDevice for MetalDevice {
                                     ((m + 15) / 16) as u64,
                                     1,
                                 );
-                                encoder
-                                    .dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
+                                encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
                                 col_offset += *n_src;
                             }
                             encoder.endEncoding();
@@ -2978,8 +2971,7 @@ impl BackendDevice for MetalDevice {
             let n_cols = storage.shape().dims().get(1).copied().unwrap_or(0);
             for row in 0..m {
                 for col in 0..n_cols {
-                    assembled[row * n_total + col_offset + col] +=
-                        data[row * n_cols + col];
+                    assembled[row * n_total + col_offset + col] += data[row * n_cols + col];
                 }
             }
             col_offset += n_cols;
@@ -3428,6 +3420,7 @@ impl MetalDevice {
     }
 
     #[cfg(not(target_vendor = "apple"))]
+    #[allow(dead_code, unused_variables)] // stub for non-Apple builds
     fn run_unary(
         &self,
         _input: &dyn BackendStorage,

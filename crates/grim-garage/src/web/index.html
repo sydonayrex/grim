@@ -214,11 +214,13 @@
           </div>
 
           <div class="card margin-top">
-            <h3>Attach / Detach Bolt-On Adapter</h3>
+            <h3>⚡ Attach or 🔧 Wrench-In Adapter</h3>
+            <p class="subtitle-text"><strong>Attach:</strong> Dynamically loads adapter into the <code>backup2</code> residual slot without altering primary model weights.<br><strong>Wrench-In (Merge):</strong> Permanently bakes the adapter weights directly into the base <code>.grim</code> file and frees residual slots for minimum file size and zero overhead.</p>
             <form id="bolton-form" class="form-inline">
               <select id="bolton-model-select" required></select>
               <input type="text" id="adapter-path" placeholder="Sidecar Path (e.g. adapter.grim.train)" required>
-              <button type="submit" class="btn btn-secondary">⚡ Attach Bolt-On</button>
+              <button type="submit" id="btn-attach-adapter" class="btn btn-secondary">⚡ Attach Bolt-On</button>
+              <button type="button" id="btn-wrench-adapter" class="btn btn-warning">🔧 Wrench-In (Merge)</button>
             </form>
           </div>
         </section>

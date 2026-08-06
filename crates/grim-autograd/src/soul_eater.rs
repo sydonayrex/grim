@@ -12,9 +12,7 @@
 //! projected update before Newton-Schulz orthogonalization and Σ descent.
 
 use grim_backend_cpu::cpu_tensor;
-use grim_quant::soul_eater::{
-    check_rank_conditioning, subspace_gram_matrix, subspace_newton_schulz_step,
-};
+use grim_quant::soul_eater::subspace_newton_schulz_step;
 use grim_tensor::{Result, Shape, Tensor};
 use std::collections::HashMap;
 

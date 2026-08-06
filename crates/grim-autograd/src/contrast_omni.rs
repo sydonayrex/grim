@@ -153,7 +153,7 @@ impl ContrastOmniLoss {
         }
 
         // Within-modality InfoNCE contrastive loss.
-        let temp = self.config.temperature.max(1e-6);
+        let _temp = self.config.temperature.max(1e-6);
         let mut within_modality_loss = 0.0f32;
         let mut valid_pairs = 0usize;
 

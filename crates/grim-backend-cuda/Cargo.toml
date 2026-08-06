@@ -13,5 +13,9 @@ thiserror = { workspace = true }
 seahash = "4.0"
 tracing = "0.1"
 
+[dev-dependencies]
+grim-backend-cpu = { workspace = true }
+grim-quant = { workspace = true }
+
 [features]
 default = []

@@ -1,0 +1,153 @@
+// fused_dequant_gemm_iq2s.comp
+//
+// Fused dequantize-GEMM for IQ2_S weights (llama.cpp block_iq2_s).
+//
+// Block layout (82 bytes, 256 elements per block):
+//   [0..1]    d      : f16   — global scale (2 bytes)
+//   [2..49]   qs     : 48 bytes — grid indices (48 bytes for 256 weights at 2 bits each)
+//   [50..57]  scales : 8 bytes — 16 sub-block scale shifts (4 bits each)
+//   [58..81]  signs  : 24 bytes — sign bits (192 bits, but 16 sub-blocks × 16 weights = 256)
+//
+// Wait: 82 bytes total = 2 + 48 + 8 + 24 = 82. But 256 weights need 256 sign bits = 32 bytes.
+// The CPU code uses 24 bytes for signs, so signs cover 192 weights. Sub-block 15 (weights 240..255)
+// wraps around in sign access. This matches the CPU implementation.
+//
+// IQ2_S has 16 sub-blocks of 16 weights. For element i:
+//   sb       = i / 16
+//   sc_shift = ((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F)
+//   scale    = d * (sc_shift * 0.125 + 0.5)
+//   grid_idx = qs[(i / 8).min(qs.len() - 1)]   (qs is 48 bytes, i/8 ranges 0..32)
+//   val      = ((grid_idx + (i % 8)) % 4) - 1.5
+//   sign_bit = (signs[min(i / 8, 23)] >> (i % 8)) & 1
+//   result   = scale * val * sign
+//
+// Contract: K must be divisible by 256.
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufA   { float A[]; };
+layout(std430, binding = 1) readonly buffer BufB   { uint  B_bytes[]; };
+layout(std430, binding = 2) writeonly buffer BufC  { float C[]; };
+
+uint get_byte(uint byte_idx) {
+    uint word  = B_bytes[byte_idx / 4u];
+    uint shift = (byte_idx % 4u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+float unpack_f16_bytes(uint b0, uint b1) {
+    uint bits = b0 | (b1 << 8u);
+    if (bits == 0u) return 0.0;
+    uint sign = (bits >> 15u) & 1u;
+    uint exp  = (bits >> 10u) & 0x1Fu;
+    uint mant =  bits         & 0x3FFu;
+    if (exp == 0u) {
+        if (mant == 0u) return 0.0;
+        float f = float(mant) / 1024.0 * exp2(-14.0);
+        return sign == 1u ? -f : f;
+    } else if (exp == 31u) {
+        return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+    } else {
+        float f = (1.0 + float(mant) / 1024.0) * exp2(float(exp) - 15.0);
+        return sign == 1u ? -f : f;
+    }
+}
+
+/// Dequantize one element from an IQ2_S block.
+/// block_start: byte offset of the 82-byte block.
+/// in_sb      : element index within the 256-element block (0..255).
+float dequant_iq2s_element(uint block_start, uint in_sb) {
+    float d = unpack_f16_bytes(get_byte(block_start), get_byte(block_start + 1u));
+
+    uint sb_idx = in_sb / 16u;   // sub-block 0..15
+    uint bit_in_group = in_sb % 8u;
+
+    // Scale: 4-bit per sub-block, 2 sub-blocks per byte, at block_start + 50.
+    uint scale_byte = get_byte(block_start + 50u + sb_idx / 2u);
+    uint sc_shift = (scale_byte >> ((sb_idx % 2u) * 4u)) & 0x0Fu;
+    float scale = d * (float(sc_shift) * 0.125 + 0.5);
+
+    // Grid index from qs (block_start + 2), 48 bytes, i/8 ranges 0..32.
+    uint qs_idx = in_sb / 8u;
+    if (qs_idx >= 48u) {
+        qs_idx = 47u; // Clamp: matches CPU .min(qs.len() - 1)
+    }
+    uint grid_idx = uint(get_byte(block_start + 2u + qs_idx));
+    float val = float((grid_idx + bit_in_group) % 4u) - 1.5;
+
+    // Signs: 24 bytes at block_start + 50 + 8 = block_start + 58.
+    // i/8 ranges 0..32, but only 24 bytes. Clamp index.
+    uint sign_group = in_sb / 8u;
+    if (sign_group >= 24u) {
+        sign_group = 23u; // Matches CPU .min(signs.len() - 1)
+    }
+    uint signs_byte = get_byte(block_start + 58u + sign_group);
+    uint sign_bit = (signs_byte >> bit_in_group) & 1u;
+    float sign = sign_bit == 0u ? 1.0 : -1.0;
+
+    return scale * val * sign;
+}
+
+shared float s_a[16][16];
+shared float s_b[16][16];
+
+void main() {
+    uint M = params.m;
+    uint N = params.n;
+    uint K = params.k;
+
+    uint bx = gl_WorkGroupID.x;
+    uint by = gl_WorkGroupID.y;
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+
+    uint row = by * 16u + ty;
+    uint col = bx * 16u + tx;
+
+    // IQ2_S: 256 elements per block, 82 bytes per block.
+    uint blocks_per_col = K / 256u;
+    uint col_stride     = blocks_per_col * 82u;
+
+    float acc = 0.0;
+
+    for (uint bk = 0u; bk < K; bk += 16u) {
+        if (row < M && (bk + tx) < K) {
+            s_a[ty][tx] = A[row * K + bk + tx];
+        } else {
+            s_a[ty][tx] = 0.0;
+        }
+
+        uint k_idx = bk + ty;
+        if (col < N && k_idx < K) {
+            uint sb_idx      = k_idx / 256u;
+            uint in_sb       = k_idx % 256u;
+            uint block_start = col * col_stride + sb_idx * 82u;
+            s_b[ty][tx] = dequant_iq2s_element(block_start, in_sb);
+        } else {
+            s_b[ty][tx] = 0.0;
+        }
+
+        barrier();
+
+        for (uint k = 0u; k < 16u; ++k) {
+            acc += s_a[ty][k] * s_b[k][tx];
+        }
+
+        barrier();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}

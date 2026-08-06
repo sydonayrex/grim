@@ -197,6 +197,14 @@ pub struct CudaHandle {
     pub completed: Arc<Mutex<bool>>,
 }
 
+impl CudaHandle {
+    pub fn ready(_ordinal: usize) -> Self {
+        Self {
+            completed: Arc::new(Mutex::new(true)),
+        }
+    }
+}
+
 impl ComputeHandle for CudaHandle {
     /// Blocks the host thread until all tracked ops complete.
     fn synchronize(&self) -> Result<()> {
@@ -471,13 +479,39 @@ impl BackendStorage for CudaStorage {
         let elem_count = self.shape.elem_count();
 
         // Quantized resident storage (KQuant/FloatPack/Block): the device buffer
-        // holds packed codes smaller than `elem_count * 4` bytes. Download the
-        // raw byte payload and dequantize on the host via grim-quant, mirroring
-        // the ROCm `to_cpu_vec_f32` -> `dequant_cpu` contract so that
-        // `transpose_last_two`/`Linear::load` (which call `to_vec_f32` on the
-        // raw quantized weight) keep working now that CUDA materialization no
-        // longer pre-dequantizes these formats.
+        // holds packed codes smaller than `elem_count * 4` bytes. Try the GPU
+        // dequant path first (bit-accurate kernels in `kernels.rs`); if there is
+        // no device kernel for this dtype, fall back to staging the raw bytes to
+        // host and dequantizing via grim-quant — the same contract as ROCm's
+        // `to_cpu_vec_f32` → `dequant_cpu`, so `transpose_last_two`/`Linear::load`
+        // (which call `to_vec_f32` on raw quantized weights) keep working.
         if self.dtype.is_quantized() {
+            // Try the on-device dequant path first (bit-accurate kernels in
+            // `kernels.rs`): dequant to a new F32 GPU buffer, then copy back to
+            // host. Requires a real CudaDevice handle and a device ptr.
+            if self.device_ptr.is_some() {
+                if let Ok(dev) = CudaDevice::new(self.ordinal) {
+                    if let Ok(f32_storage) = dev.dequantize_on_device(self) {
+                        let mut host_data = vec![0.0f32; elem_count];
+                        // SAFETY: copy the freshly dequantized F32 buffer to host.
+                        let res = unsafe {
+                            cudaMemcpy(
+                                host_data.as_mut_ptr() as *mut c_void,
+                                CudaDevice::dev_ptr_or_err("to_cpu_vec_f32(gpu)", &f32_storage)?
+                                    as *mut c_void,
+                                f32_storage.bytes,
+                                cudaMemcpyDeviceToHost,
+                            )
+                        };
+                        if res == cudaSuccess {
+                            return Ok(host_data);
+                        }
+                    }
+                }
+            }
+
+            // Fallback: stage the raw packed bytes to host and dequant via
+            // grim-quant — the same contract as ROCm's `to_cpu_vec_f32`.
             let mut raw = vec![0u8; self.bytes];
             // SAFETY: `cudaMemcpy` copies `self.bytes` from device to host.
             let res = unsafe {
@@ -779,6 +813,292 @@ impl CudaDevice {
         Ok(Box::new(CudaHandle {
             completed: Arc::new(Mutex::new(false)),
         }))
+    }
+
+    /// Launches a standalone dequant kernel of signature
+    /// `(const u8* packed, float* out, int n_blocks)` — one thread per
+    /// 256-weight super-block. Used by the Q5_K/Q6_K/IQ4/IQ3/IQ2 family.
+    /// `n` is the number of super-blocks; grid = ceil(n/256), block = 256.
+    fn launch_dequant_generic(
+        &self,
+        kernel_name: &str,
+        packed_ptr: *const c_void,
+        out_ptr: *mut c_void,
+        n_blocks: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+        let mut func: CUfunction = std::ptr::null_mut();
+        unsafe {
+            let func_name = std::ffi::CString::new(kernel_name)
+                .map_err(|e| Error::Backend(format!("invalid kernel name {kernel_name:?}: {e}")))?;
+            let res = cuModuleGetFunction(&mut func, module, func_name.as_ptr());
+            if res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuModuleGetFunction({kernel_name}) failed: {res}"
+                )));
+            }
+
+            let mut packed = packed_ptr;
+            let mut out = out_ptr;
+            let mut n_blk = n_blocks as i32;
+            let mut args: [*mut c_void; 3] = [
+                &mut packed as *mut *const c_void as *mut c_void,
+                &mut out as *mut *mut c_void as *mut c_void,
+                &mut n_blk as *mut i32 as *mut c_void,
+            ];
+
+            const BLOCK_SIZE: u32 = 256;
+            let grid_size = ((n_blocks as u64) + (BLOCK_SIZE as u64) - 1) / (BLOCK_SIZE as u64);
+            let launch_res = cuLaunchKernel(
+                func,
+                grid_size as u32,
+                1,
+                1,
+                BLOCK_SIZE,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr() as *mut *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if launch_res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuLaunchKernel({kernel_name}) failed: {launch_res}"
+                )));
+            }
+        }
+        Ok(Box::new(CudaHandle {
+            completed: Arc::new(Mutex::new(false)),
+        }))
+    }
+
+    /// Launches `grim_dequant_fp8(packed, out, n_weights)` — one thread per
+    /// weight. The first 4 bytes of `packed` are the LE f32 global scale.
+    fn launch_dequant_fp8(
+        &self,
+        packed_ptr: *const c_void,
+        out_ptr: *mut c_void,
+        n_weights: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+        let mut func: CUfunction = std::ptr::null_mut();
+        unsafe {
+            let func_name = std::ffi::CString::new("grim_dequant_fp8")
+                .map_err(|e| Error::Backend(format!("invalid kernel name: {e}")))?;
+            let res = cuModuleGetFunction(&mut func, module, func_name.as_ptr());
+            if res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuModuleGetFunction(grim_dequant_fp8) failed: {res}"
+                )));
+            }
+            let mut packed = packed_ptr;
+            let mut out = out_ptr;
+            let mut n = n_weights as i32;
+            let mut args: [*mut c_void; 3] = [
+                &mut packed as *mut *const c_void as *mut c_void,
+                &mut out as *mut *mut c_void as *mut c_void,
+                &mut n as *mut i32 as *mut c_void,
+            ];
+            const BLOCK_SIZE: u32 = 256;
+            let grid_size = ((n_weights as u64) + (BLOCK_SIZE as u64) - 1) / (BLOCK_SIZE as u64);
+            let launch_res = cuLaunchKernel(
+                func,
+                grid_size as u32,
+                1,
+                1,
+                BLOCK_SIZE,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr() as *mut *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if launch_res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuLaunchKernel(grim_dequant_fp8) failed: {launch_res}"
+                )));
+            }
+        }
+        Ok(Box::new(CudaHandle {
+            completed: Arc::new(Mutex::new(false)),
+        }))
+    }
+
+    /// Launches `grim_dequant_mxfp4(codes, exps, out, n_values)` — one thread
+    /// per value. `codes` is packed E2M1 nibbles (2/byte); `exps` holds one
+    /// E8M0 shared exponent per 32-element group.
+    fn launch_dequant_mxfp4(
+        &self,
+        codes_ptr: *const c_void,
+        exps_ptr: *const c_void,
+        out_ptr: *mut c_void,
+        n_values: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+        let mut func: CUfunction = std::ptr::null_mut();
+        unsafe {
+            let func_name = std::ffi::CString::new("grim_dequant_mxfp4")
+                .map_err(|e| Error::Backend(format!("invalid kernel name: {e}")))?;
+            let res = cuModuleGetFunction(&mut func, module, func_name.as_ptr());
+            if res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuModuleGetFunction(grim_dequant_mxfp4) failed: {res}"
+                )));
+            }
+            let mut codes = codes_ptr;
+            let mut exps = exps_ptr;
+            let mut out = out_ptr;
+            let mut n = n_values as i32;
+            let mut args: [*mut c_void; 4] = [
+                &mut codes as *mut *const c_void as *mut c_void,
+                &mut exps as *mut *const c_void as *mut c_void,
+                &mut out as *mut *mut c_void as *mut c_void,
+                &mut n as *mut i32 as *mut c_void,
+            ];
+            const BLOCK_SIZE: u32 = 256;
+            let grid_size = ((n_values as u64) + (BLOCK_SIZE as u64) - 1) / (BLOCK_SIZE as u64);
+            let launch_res = cuLaunchKernel(
+                func,
+                grid_size as u32,
+                1,
+                1,
+                BLOCK_SIZE,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr() as *mut *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if launch_res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuLaunchKernel(grim_dequant_mxfp4) failed: {launch_res}"
+                )));
+            }
+        }
+        Ok(Box::new(CudaHandle {
+            completed: Arc::new(Mutex::new(false)),
+        }))
+    }
+
+    /// Dequantize a CUDA-resident packed `CudaStorage` to a new F32 `CudaStorage`
+    /// entirely on device, returning the F32 storage. Falls back to
+    /// `Err(Backend)` for block types without a device kernel so the caller
+    /// (`to_cpu_vec_f32`) can use the bit-accurate host path. This is the
+    /// primary mechanism by which the quantized GEMM path stays on-GPU.
+    ///
+    /// Block byte-size table (matches `grim_quant::dequant_*`):
+    ///   Q5_K=176, Q6_K=210, IQ4_NL=170, IQ4_XS=136, IQ3_XXS=96,
+    ///   IQ3_S=110, IQ2_XXS=66, IQ2_XS=74, IQ2_S=82. All are 256 weights/block.
+    pub fn dequantize_on_device(&self, packed: &CudaStorage) -> Result<CudaStorage> {
+        let elem_count = packed.shape.elem_count();
+        let packed_ptr = Self::dev_ptr_or_err("dequantize_on_device", packed)? as *const c_void;
+
+        let (kernel, block_bytes, weights_per_block): (&str, usize, usize) =
+            match &packed.dtype.storage {
+                DTypeStorage::KQuant(scheme) => match scheme {
+                    KQuantScheme::Q5K => ("grim_dequant_q5k", 176, 256),
+                    KQuantScheme::Q6K => ("grim_dequant_q6k", 210, 256),
+                    KQuantScheme::IQ4NL => ("grim_dequant_iq4nl", 170, 256),
+                    KQuantScheme::IQ4XS => ("grim_dequant_iq4xs", 136, 256),
+                    KQuantScheme::IQ3XXS => ("grim_dequant_iq3xxs", 96, 256),
+                    KQuantScheme::IQ3S => ("grim_dequant_iq3s", 110, 256),
+                    KQuantScheme::IQ2XXS => ("grim_dequant_iq2xxs", 66, 256),
+                    KQuantScheme::IQ2XS => ("grim_dequant_iq2xs", 74, 256),
+                    KQuantScheme::IQ2S => ("grim_dequant_iq2s", 82, 256),
+                    // Q2K/Q3K/Q4K/Q8_0 have no standalone GPU kernel yet — host path.
+                    _ => {
+                        return Err(Error::Backend(format!(
+                            "dequantize_on_device: no GPU kernel for KQuant {:?}",
+                            scheme
+                        )))
+                    }
+                },
+                DTypeStorage::FloatPack(FloatPackScheme::Fp8) => {
+                    // FP8: 4-byte f32 scale header + 1 byte/weight. n_weights = elem_count.
+                    let out =
+                        CudaStorage::alloc_gpu(&packed.shape, DType::F32, self.ordinal)?;
+                    let out_ptr = Self::dev_ptr_or_err("dequantize_on_device(fp8)", &out)?;
+                    let handle = self.launch_dequant_fp8(packed_ptr, out_ptr, elem_count)?;
+                    handle.synchronize()?;
+                    return Ok(out);
+                }
+                DTypeStorage::FloatPack(FloatPackScheme::MxFp4) => {
+                    // MXFP4: length-prefixed [codes][exps]. The host framing
+                    // splits the segments — do it here from the host-staged copy.
+                    // We need the raw bytes; download packed first.
+                    let raw = stage_packed_bytes(packed)?;
+                    let mut cursor = 0usize;
+                    let codes = read_length_prefixed(&raw, &mut cursor)?;
+                    let exps = read_length_prefixed(&raw, &mut cursor)?;
+                    let num_groups = elem_count.div_ceil(32);
+                    if exps.len() < num_groups {
+                        return Err(Error::Backend(format!(
+                            "dequantize_on_device(mxfp4): expected {num_groups} exp bytes, got {}",
+                            exps.len()
+                        )));
+                    }
+                    if codes.len() < elem_count.div_ceil(2) {
+                        return Err(Error::Backend(format!(
+                            "dequantize_on_device(mxfp4): expected {} code bytes, got {}",
+                            elem_count.div_ceil(2),
+                            codes.len()
+                        )));
+                    }
+                    // Upload codes + exps as two device buffers.
+                    let codes_shape_external = Shape::new(vec![codes.len()]);
+                    let codes_storage = CudaStorage::copy_from_host_raw_bytes(
+                        &codes,
+                        &codes_shape_external,
+                        DType {
+                            arith: ArithType::U8,
+                            storage: DTypeStorage::Native,
+                        },
+                        self.ordinal,
+                    )?;
+                    let exps_shape = Shape::new(vec![exps.len()]);
+                    let exps_storage = CudaStorage::copy_from_host_raw_bytes(
+                        &exps,
+                        &exps_shape,
+                        DType {
+                            arith: ArithType::U8,
+                            storage: DTypeStorage::Native,
+                        },
+                        self.ordinal,
+                    )?;
+                    let out = CudaStorage::alloc_gpu(&packed.shape, DType::F32, self.ordinal)?;
+                    let codes_ptr = Self::dev_ptr_or_err("dequantize_on_device(mxfp4 codes)", &codes_storage)?;
+                    let exps_ptr = Self::dev_ptr_or_err("dequantize_on_device(mxfp4 exps)", &exps_storage)?;
+                    let out_ptr = Self::dev_ptr_or_err("dequantize_on_device(mxfp4 out)", &out)?;
+                    let handle =
+                        self.launch_dequant_mxfp4(codes_ptr, exps_ptr, out_ptr, elem_count)?;
+                    handle.synchronize()?;
+                    return Ok(out);
+                }
+                // FP4/NF4/MXFP8 and Block(Fp4/Nf4/Fp8Block16) keep the host path.
+                _ => {
+                    return Err(Error::Backend(format!(
+                        "dequantize_on_device: no GPU kernel for dtype {:?}",
+                        packed.dtype
+                    )))
+                }
+            };
+
+        // Super-block path (Q5_K/Q6_K/IQ*).
+        let n_blocks = elem_count.div_ceil(weights_per_block);
+        if packed.bytes < n_blocks * block_bytes {
+            return Err(Error::Backend(format!(
+                "dequantize_on_device({kernel}): packed buffer too short ({} < {}*{})",
+                packed.bytes, n_blocks, block_bytes
+            )));
+        }
+        let out = CudaStorage::alloc_gpu(&packed.shape, DType::F32, self.ordinal)?;
+        let out_ptr = Self::dev_ptr_or_err("dequantize_on_device(out)", &out)?;
+        let handle = self.launch_dequant_generic(kernel, packed_ptr, out_ptr, n_blocks)?;
+        handle.synchronize()?;
+        Ok(out)
     }
 }
 
@@ -1380,6 +1700,105 @@ impl BackendDevice for CudaDevice {
         )
     }
 
+    fn qkv_attention_paged(
+        &self,
+        q: &dyn BackendStorage,
+        block_tables: &dyn BackendStorage,
+        k_pages: &dyn BackendStorage,
+        v_pages: &dyn BackendStorage,
+        num_kv_heads: usize,
+        max_blocks: usize,
+        page_size: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let qd = q.to_cpu_vec_f32()?;
+        let btd = block_tables.to_cpu_vec_f32()?;
+        let kd = k_pages.to_cpu_vec_f32()?;
+        let vd = v_pages.to_cpu_vec_f32()?;
+
+        let q_dims = q.shape().dims();
+        if q_dims.len() != 3 {
+            return Err(Error::Shape("qkv_attention_paged: q must be 3-D".into()));
+        }
+        let seq_len = q_dims[0];
+        let num_heads = q_dims[1];
+        let head_dim = q_dims[2];
+
+        if num_heads % num_kv_heads != 0 {
+            return Err(Error::Shape(
+                "qkv_attention_paged: num_heads must be multiple of num_kv_heads".into(),
+            ));
+        }
+
+        let kv_stride = num_kv_heads * head_dim;
+        let num_head_dims = num_heads * head_dim;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut out = vec![0.0f32; seq_len * num_head_dims];
+
+        for h in 0..num_heads {
+            let kvh = (h * num_kv_heads) / num_heads;
+            for t in 0..seq_len {
+                let q_abs = cache_offset as usize + t;
+                let mut scores = vec![0.0f32; kv_seq_len];
+                for t2 in 0..kv_seq_len {
+                    if t2 > q_abs {
+                        scores[t2] = f32::NEG_INFINITY;
+                    } else {
+                        let block_idx_in_seq = t2 / page_size;
+                        let offset_in_block = t2 % page_size;
+                        let block_id = if block_idx_in_seq < max_blocks {
+                            btd[block_idx_in_seq] as usize
+                        } else {
+                            block_idx_in_seq
+                        };
+
+                        let k_offset =
+                            (block_id * page_size + offset_in_block) * kv_stride + kvh * head_dim;
+                        let mut dot = 0.0f32;
+                        for d in 0..head_dim {
+                            dot += qd[t * num_head_dims + h * head_dim + d] * kd[k_offset + d];
+                        }
+                        scores[t2] = dot * scale;
+                    }
+                }
+
+                let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in &mut scores {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
+                for s in &mut scores {
+                    *s /= sum;
+                }
+
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for t2 in 0..kv_seq_len {
+                        if scores[t2] > 0.0 {
+                            let block_idx_in_seq = t2 / page_size;
+                            let offset_in_block = t2 % page_size;
+                            let block_id = if block_idx_in_seq < max_blocks {
+                                btd[block_idx_in_seq] as usize
+                            } else {
+                                block_idx_in_seq
+                            };
+                            let v_offset = (block_id * page_size + offset_in_block) * kv_stride
+                                + kvh * head_dim;
+                            acc += scores[t2] * vd[v_offset + d];
+                        }
+                    }
+                    out[t * num_head_dims + h * head_dim + d] = acc;
+                }
+            }
+        }
+
+        let gpu_out = self.from_cpu(&out, out_shape, DType::F32)?;
+        Ok((gpu_out, Box::new(CudaHandle::ready(self.ordinal))))
+    }
+
     fn mul_scalar(
         &self,
         x: &dyn BackendStorage,
@@ -1908,7 +2327,11 @@ impl BackendDevice for CudaDevice {
         up: &dyn BackendStorage,
         dw: &dyn BackendStorage,
         out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
         let gate_s = gate
             .as_any()
             .downcast_ref::<CudaStorage>()
@@ -2136,6 +2559,51 @@ fn dtype_byte_size(dtype: &DType) -> usize {
         ArithType::I64 => 8,
         ArithType::U8 => 1,
     }
+}
+
+/// Stages a CUDA-resident packed quantized buffer to a host `Vec<u8>` via
+/// `cudaMemcpy` (D→H). Used by `dequantize_on_device` for formats that need
+/// host-side framing (e.g. MXFP4 length-prefixed segments) before a device launch.
+fn stage_packed_bytes(packed: &CudaStorage) -> Result<Vec<u8>> {
+    let dev_ptr = CudaDevice::dev_ptr_or_err("stage_packed_bytes", packed)? as *const c_void;
+    let mut raw = vec![0u8; packed.bytes];
+    // SAFETY: `cudaMemcpy` copies `packed.bytes` from device to host.
+    let res = unsafe {
+        cudaMemcpy(
+            raw.as_mut_ptr() as *mut c_void,
+            dev_ptr as *mut c_void,
+            packed.bytes,
+            cudaMemcpyDeviceToHost,
+        )
+    };
+    if res != cudaSuccess {
+        return Err(Error::Backend(format!(
+            "stage_packed_bytes: cudaMemcpy D→H failed with error code {}",
+            res
+        )));
+    }
+    Ok(raw)
+}
+
+/// Reads a length-prefixed segment from `bytes` starting at `*cursor`:
+/// 8-byte LE `u64` length, then `len` payload bytes. Advances `cursor`
+/// past the segment. Mirrors `grim_quant::dequant_mxfp4`'s `read_segment`.
+fn read_length_prefixed(bytes: &[u8], cursor: &mut usize) -> Result<Vec<u8>> {
+    if bytes.len() < *cursor + 8 {
+        return Err(Error::Backend(
+            "read_length_prefixed: truncated segment length prefix".into(),
+        ));
+    }
+    let len = u64::from_le_bytes(bytes[*cursor..*cursor + 8].try_into().unwrap()) as usize;
+    *cursor += 8;
+    if bytes.len() < *cursor + len {
+        return Err(Error::Backend(format!(
+            "read_length_prefixed: truncated segment (expected {len} bytes)"
+        )));
+    }
+    let segment = bytes[*cursor..*cursor + len].to_vec();
+    *cursor += len;
+    Ok(segment)
 }
 
 /// Host-side dequantization of CUDA-resident packed storage. Dispatches on the
@@ -2661,6 +3129,252 @@ mod tests {
                 "CUDA Q8_0 backward dX error {err} at actual={a} expected={e}"
             );
         }
+    }
+
+    // ===================================================================
+    //  GPU dequant kernel golden tests — bit-accurate parity vs the
+    //  `grim_quant::dequant_*` CPU oracle. Each test:
+    //    1. Builds the packed bytes for one or more super-blocks via
+    //       `grim_quant::quant_<type>` (or hand-fabricated for MXFP4).
+    //    2. Uploads the packed bytes to a `CudaStorage` with the matching
+    //       quantized `DType.storage` (so `dequantize_on_device` dispatches).
+    //    3. Calls `dev.dequantize_on_device(as_cuda_storage(storage.as_ref()))` (GPU kernel).
+    //    4. Compares `out.to_cpu_vec_f32()` to the CPU oracle within a tight
+    //       tolerance that admits only floating-point rounding (1e-4).
+    // Skipped (not failed) when no CUDA device is present.
+    // ===================================================================
+
+    fn dequant_test_device() -> Option<CudaDevice> {
+        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
+        CudaDevice::probe().ok().filter(|d| !d.is_empty()).map(|d| d[0].clone())
+    }
+
+    fn assert_dequant_close(label: &str, actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len(), "{label}: length mismatch");
+        let max_err = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, e)| (a - e).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err < 1e-4,
+            "{label}: GPU dequant max error {max_err} exceeds 1e-4 \
+             (first 4 actual={:?} expected={:?})",
+            &actual[..actual.len().min(4)],
+            &expected[..expected.len().min(4)],
+        );
+    }
+
+    /// Upload raw packed quantized bytes with the given quantized `DType.storage`
+    /// to a device-resident `CudaStorage`, returned as `Box<dyn BackendStorage>`.
+    fn upload_packed(
+        dev: &CudaDevice,
+        bytes: &[u8],
+        shape: &Shape,
+        storage_kind: DTypeStorage,
+    ) -> Box<dyn BackendStorage> {
+        let dtype = DType {
+            arith: ArithType::U8,
+            storage: storage_kind,
+        };
+        dev.from_cpu_bytes(bytes, shape, dtype)
+            .expect("from_cpu_bytes for packed quantized storage")
+    }
+
+    /// Downcast a `BackendStorage` to `&CudaStorage` (the only concrete type
+    /// `from_cpu_bytes` produces on this backend).
+    fn as_cuda_storage(s: &dyn BackendStorage) -> &CudaStorage {
+        s.as_any()
+            .downcast_ref::<CudaStorage>()
+            .expect("expected CudaStorage from from_cpu_bytes")
+    }
+
+    fn build_mxfp4_single_buffer(codes: &[u8], exps: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(codes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(codes);
+        buf.extend_from_slice(&(exps.len() as u64).to_le_bytes());
+        buf.extend_from_slice(exps);
+        buf
+    }
+
+    #[test]
+    fn test_cuda_dequant_q5k_gpu_matches_cpu() {
+        let Some(dev) = dequant_test_device() else { return };
+        // 2 super-blocks × 256 weights = 512 weights.
+        let n = 512;
+        let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).sin() * 0.5).collect();
+        let packed = grim_quant::quant_q5k(&src).expect("quant_q5k");
+        let expected = grim_quant::dequant_q5k(&packed, n).expect("cpu oracle q5k");
+        let shape = Shape::new(vec![n]);
+        let storage = upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::Q5K));
+        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant q5k");
+        let actual = out.to_cpu_vec_f32().expect("readback q5k");
+        assert_dequant_close("q5k", &actual, &expected);
+    }
+
+    #[test]
+    fn test_cuda_dequant_q6k_gpu_matches_cpu() {
+        let Some(dev) = dequant_test_device() else { return };
+        let n = 256;
+        let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.05).cos() * 0.7).collect();
+        let packed = grim_quant::quant_q6k(&src).expect("quant_q6k");
+        let expected = grim_quant::dequant_q6k(&packed, n).expect("cpu oracle q6k");
+        let shape = Shape::new(vec![n]);
+        let storage = upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::Q6K));
+        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant q6k");
+        let actual = out.to_cpu_vec_f32().expect("readback q6k");
+        assert_dequant_close("q6k", &actual, &expected);
+    }
+
+    #[test]
+    fn test_cuda_dequant_iq4nl_gpu_matches_cpu() {
+        let Some(dev) = dequant_test_device() else { return };
+        let n = 256;
+        let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.11).sin() * 0.3).collect();
+        let packed = grim_quant::quant_iq4nl(&src).expect("quant_iq4nl");
+        let expected = grim_quant::dequant_iq4nl(&packed, n).expect("cpu oracle iq4nl");
+        let shape = Shape::new(vec![n]);
+        let storage =
+            upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::IQ4NL));
+        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant iq4nl");
+        let actual = out.to_cpu_vec_f32().expect("readback iq4nl");
+        assert_dequant_close("iq4nl", &actual, &expected);
+    }
+
+    #[test]
+    fn test_cuda_dequant_iq4xs_gpu_matches_cpu() {
+        let Some(dev) = dequant_test_device() else { return };
+        let n = 256;
+        let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.09).cos() * 0.4).collect();
+        let packed = grim_quant::quant_iq4xs(&src).expect("quant_iq4xs");
+        let expected = grim_quant::dequant_iq4xs(&packed, n).expect("cpu oracle iq4xs");
+        let shape = Shape::new(vec![n]);
+        let storage =
+            upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::IQ4XS));
+        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant iq4xs");
+        let actual = out.to_cpu_vec_f32().expect("readback iq4xs");
+        assert_dequant_close("iq4xs", &actual, &expected);
+    }
+
+    #[test]
+    fn test_cuda_dequant_iq3xxs_gpu_matches_cpu() {
+        let Some(dev) = dequant_test_device() else { return };
+        let n = 512;
+        let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.13).sin() * 0.25).collect();
+        let packed = grim_quant::quant_iq3xxs(&src).expect("quant_iq3xxs");
+        let expected = grim_quant::dequant_iq3xxs(&packed, n).expect("cpu oracle iq3xxs");
+        let shape = Shape::new(vec![n]);
+        let storage =
+            upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::IQ3XXS));
+        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant iq3xxs");
+        let actual = out.to_cpu_vec_f32().expect("readback iq3xxs");
+        assert_dequant_close("iq3xxs", &actual, &expected);
+    }
+
+    #[test]
+    fn test_cuda_dequant_iq3s_gpu_matches_cpu() {
+        let Some(dev) = dequant_test_device() else { return };
+        let n = 256;
+        let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.08).cos() * 0.6).collect();
+        let packed = grim_quant::quant_iq3s(&src).expect("quant_iq3s");
+        let expected = grim_quant::dequant_iq3s(&packed, n).expect("cpu oracle iq3s");
+        let shape = Shape::new(vec![n]);
+        let storage =
+            upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::IQ3S));
+        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant iq3s");
+        let actual = out.to_cpu_vec_f32().expect("readback iq3s");
+        assert_dequant_close("iq3s", &actual, &expected);
+    }
+
+    #[test]
+    fn test_cuda_dequant_iq2xxs_gpu_matches_cpu() {
+        let Some(dev) = dequant_test_device() else { return };
+        let n = 512;
+        let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.05).sin() * 0.2).collect();
+        let packed = grim_quant::quant_iq2xxs(&src).expect("quant_iq2xxs");
+        let expected = grim_quant::dequant_iq2xxs(&packed, n).expect("cpu oracle iq2xxs");
+        let shape = Shape::new(vec![n]);
+        let storage =
+            upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::IQ2XXS));
+        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant iq2xxs");
+        let actual = out.to_cpu_vec_f32().expect("readback iq2xxs");
+        assert_dequant_close("iq2xxs", &actual, &expected);
+    }
+
+    #[test]
+    fn test_cuda_dequant_iq2xs_gpu_matches_cpu() {
+        let Some(dev) = dequant_test_device() else { return };
+        let n = 256;
+        let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).cos() * 0.35).collect();
+        let packed = grim_quant::quant_iq2xs(&src).expect("quant_iq2xs");
+        let expected = grim_quant::dequant_iq2xs(&packed, n).expect("cpu oracle iq2xs");
+        let shape = Shape::new(vec![n]);
+        let storage =
+            upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::IQ2XS));
+        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant iq2xs");
+        let actual = out.to_cpu_vec_f32().expect("readback iq2xs");
+        assert_dequant_close("iq2xs", &actual, &expected);
+    }
+
+    #[test]
+    fn test_cuda_dequant_iq2s_gpu_matches_cpu() {
+        let Some(dev) = dequant_test_device() else { return };
+        let n = 256;
+        let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.06).sin() * 0.45).collect();
+        let packed = grim_quant::quant_iq2s(&src).expect("quant_iq2s");
+        let expected = grim_quant::dequant_iq2s(&packed, n).expect("cpu oracle iq2s");
+        let shape = Shape::new(vec![n]);
+        let storage =
+            upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::IQ2S));
+        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant iq2s");
+        let actual = out.to_cpu_vec_f32().expect("readback iq2s");
+        assert_dequant_close("iq2s", &actual, &expected);
+    }
+
+    #[test]
+    fn test_cuda_dequant_fp8_gpu_matches_cpu() {
+        let Some(dev) = dequant_test_device() else { return };
+        let n = 64;
+        let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.03).sin() * 0.5).collect();
+        let packed = grim_quant::quant_fp8(&src).expect("quant_fp8");
+        let expected = grim_quant::dequant_fp8(&packed, n).expect("cpu oracle fp8");
+        let shape = Shape::new(vec![n]);
+        let storage =
+            upload_packed(&dev, &packed, &shape, DTypeStorage::FloatPack(FloatPackScheme::Fp8));
+        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant fp8");
+        let actual = out.to_cpu_vec_f32().expect("readback fp8");
+        assert_dequant_close("fp8", &actual, &expected);
+    }
+
+    #[test]
+    fn test_cuda_dequant_mxfp4_gpu_matches_cpu() {
+        let Some(dev) = dequant_test_device() else { return };
+        // 64 values = 2 groups of 32. Hand-build codes + shared exponents so the
+        // test is independent of a MXFP4 encoder (grim-quant has none public).
+        // code i = (i % 16); shared exp = 127 + (group // ) so group 0 = 127,
+        // group 1 = 128 (scale 2^1 = 2.0). Packed nibble: low = even element.
+        let n = 64;
+        let mut codes_pairs = Vec::with_capacity(n / 2);
+        for i in 0..(n / 2) {
+            let lo = (i * 2) % 16;
+            let hi = (i * 2 + 1) % 16;
+            codes_pairs.push((lo as u8) | ((hi as u8) << 4));
+        }
+        let exps = vec![127u8, 128u8];
+        let packed = build_mxfp4_single_buffer(&codes_pairs, &exps);
+        let expected = grim_quant::dequant_mxfp4(&packed, n).expect("cpu oracle mxfp4");
+
+        let shape = Shape::new(vec![n]);
+        let storage = upload_packed(
+            &dev,
+            &packed,
+            &shape,
+            DTypeStorage::FloatPack(FloatPackScheme::MxFp4),
+        );
+        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant mxfp4");
+        let actual = out.to_cpu_vec_f32().expect("readback mxfp4");
+        assert_dequant_close("mxfp4", &actual, &expected);
     }
 }
 

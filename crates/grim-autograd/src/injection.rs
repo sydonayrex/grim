@@ -425,7 +425,7 @@ pub fn loftq_initialize(
         }
 
         // Compute residual: R = W0 - BA
-        let mut residual: Vec<f32> = w_current
+        let residual: Vec<f32> = w_current
             .iter()
             .zip(ba_output.iter())
             .map(|(&w, &ba)| w - ba)

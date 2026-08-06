@@ -84,6 +84,8 @@ pub fn pick_device_for_storage_device(d: &Device) -> Box<dyn BackendDevice> {
                 Box::new(CpuDevice::new())
             }
         }
+        // Fallback for backends not compiled in (arms above are cfg-gated).
+        #[allow(unreachable_patterns)]
         _ => Box::new(CpuDevice::new()),
     }
 }
@@ -241,8 +243,14 @@ impl ColumnParallelLinear {
 /// Row-parallel linear layer (§4.1): weights are pre-sharded at load
 /// (each rank holds `in_features / world_size` columns), so `forward` is
 /// the inner matmul + a device-side `all_reduce("sum")` to sum partial
-/// outputs across TP ranks. On CPU (no collective backend) the partial
-/// result is returned with a warning.
+/// outputs across TP ranks. If the active backend has no `all_reduce`
+/// implementation (e.g. CUDA, which inherits the trait default
+/// `Err(Unimplemented)`), `forward` **propagates the error** rather than
+/// returning the un-reduced partial output — see `require_single_device`
+/// for the rationale: returning a per-rank partial as if it were the
+/// all-reduced sum silently corrupts every downstream activation. Set
+/// `GRIM_TP_SIZE=1` (or use a backend with a real collective impl such as
+/// ROCm/RCCL, Vulkan, or Metal) to run single-device.
 #[derive(Clone)]
 pub struct RowParallelLinear {
     pub inner: Linear,
@@ -255,30 +263,34 @@ impl RowParallelLinear {
     }
 
     /// Forward: inner matmul of pre-sharded input + device-side `all_reduce`.
+    ///
+    /// On `all_reduce` failure the error is propagated (not silently
+    /// degraded) — a backend without a collective impl cannot produce a
+    /// correct TP>1 forward, so a hard error is preferable to wrong output.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let out = self.inner.forward(x)?;
         if self.tp_config.world_size > 1 {
             let dev = pick_device_for_tensor(&out);
             let s: &dyn grim_tensor::BackendStorage = out.storage().as_ref();
-            match dev.all_reduce(&[s], "sum") {
-                Ok((storage, handle)) => {
-                    handle.synchronize()?;
-                    Ok(Tensor::new(
-                        Arc::from(storage),
-                        out.shape().clone(),
-                        out.dtype(),
-                        out.provenance().clone(),
-                        out.device().clone(),
+            let (storage, handle) = dev
+                .all_reduce(&[s], "sum")
+                .map_err(|e| {
+                    Error::Backend(format!(
+                        "RowParallelLinear::forward all_reduce failed on backend {:?} with \
+                         world_size={}: {e}. This backend has no all_reduce implementation; \
+                         set GRIM_TP_SIZE=1 or use a backend with collectives (ROCm/Vulkan/Metal).",
+                        out.device(),
+                        self.tp_config.world_size,
                     ))
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[grim-nn] RowParallelLinear::forward all_reduce failed: {e} — \
-                         returning partial output (single-device fallback)"
-                    );
-                    Ok(out)
-                }
-            }
+                })?;
+            handle.synchronize()?;
+            Ok(Tensor::new(
+                Arc::from(storage),
+                out.shape().clone(),
+                out.dtype(),
+                out.provenance().clone(),
+                out.device().clone(),
+            ))
         } else {
             Ok(out)
         }
@@ -908,7 +920,10 @@ mod tests {
     #[test]
     fn test_column_parallel_forward_single_device() {
         let weight = cpu_tensor(vec![0.5, 1.5, -1.0, 2.0], Shape::new(vec![2, 2]));
-        let linear = Linear::from_tensor(weight, Some(cpu_tensor(vec![0.1, -0.2], Shape::new(vec![2]))));
+        let linear = Linear::from_tensor(
+            weight,
+            Some(cpu_tensor(vec![0.1, -0.2], Shape::new(vec![2]))),
+        );
         let cp = ColumnParallelLinear::new(linear, TensorParallelConfig::default());
 
         let x = cpu_tensor(vec![1.0, 2.0], Shape::new(vec![1, 2]));
@@ -944,7 +959,10 @@ mod tests {
     #[test]
     fn test_parallel_linear_accessors() {
         let weight = cpu_tensor(vec![0.5, 1.5, -1.0, 2.0], Shape::new(vec![2, 2]));
-        let linear = Linear::from_tensor(weight, Some(cpu_tensor(vec![0.1, -0.2], Shape::new(vec![2]))));
+        let linear = Linear::from_tensor(
+            weight,
+            Some(cpu_tensor(vec![0.1, -0.2], Shape::new(vec![2]))),
+        );
         let cp = ColumnParallelLinear::new(linear, TensorParallelConfig::default());
 
         assert_eq!(cp.shard_size(), 2);
@@ -961,5 +979,37 @@ mod tests {
         assert_eq!(rp.weight().shape().dims(), &[2, 2]);
         assert!(rp.bias().is_none());
         assert_eq!(rp.inner().weight.shape().dims(), &[2, 2]);
+    }
+
+    /// RowParallelLinear forward with world_size > 1 on a backend lacking an
+    /// `all_reduce` impl (CPU inherits the trait default `Err(Unimplemented)`)
+    /// must **propagate the error** instead of silently returning the
+    /// per-rank partial output as the all-reduced sum. Regression guard for
+    /// the silent-correctness-bug fixed alongside this test.
+    #[test]
+    fn test_row_parallel_forward_no_collective_errors_loudly() {
+        let weight = cpu_tensor(vec![0.5, 1.5, -1.0, 2.0], Shape::new(vec![2, 2]));
+        let linear = Linear::from_tensor(weight, None);
+        // world_size > 1 forces the all_reduce path; CPU has no all_reduce.
+        let tp = TensorParallelConfig { rank: 0, world_size: 2 };
+        let rp = RowParallelLinear::new(linear, tp);
+
+        let x = cpu_tensor(vec![1.0, 2.0], Shape::new(vec![1, 2]));
+        let res = rp.forward(&x);
+
+        assert!(
+            res.is_err(),
+            "RowParallelLinear::forward on a backend without all_reduce must return Err, \
+             not a partial output (got Ok)"
+        );
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("all_reduce"),
+            "error message should mention all_reduce; got: {msg}"
+        );
+        assert!(
+            msg.contains("GRIM_TP_SIZE=1"),
+            "error message should guide the user to GRIM_TP_SIZE=1; got: {msg}"
+        );
     }
 }

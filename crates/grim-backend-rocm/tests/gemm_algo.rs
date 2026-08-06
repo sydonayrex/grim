@@ -22,8 +22,8 @@ fn test_solution_index_for_f16_bf16() -> Result<()> {
     use grim_backend_rocm::lookup_solution_index;
     use grim_tensor::ArithType;
 
-    let f16_idx = lookup_solution_index(1, 4096, 4096, ArithType::F16);
-    let bf16_idx = lookup_solution_index(1, 4096, 4096, ArithType::BF16);
+    let f16_idx = lookup_solution_index(1, 4096, 4096, "gfx1036", ArithType::F16);
+    let bf16_idx = lookup_solution_index(1, 4096, 4096, "gfx1036", ArithType::BF16);
 
     assert_ne!(f16_idx, 0, "F16 must return a tuned solution index");
     assert_ne!(bf16_idx, 0, "BF16 must return a tuned solution index");

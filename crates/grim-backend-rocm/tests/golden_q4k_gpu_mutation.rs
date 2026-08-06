@@ -85,11 +85,7 @@ fn test_q4k_gpu_gemm_golden_mutation_resistant() -> TestResult {
         // the CPU `grim_quant::dequant_q4k` fallback. Must remain bit-exact with
         // the CPU oracle `b_dequant` (computed above).
         let gpu_dequant = dev
-            .dequantize(
-                &Storage::KQuant(KQuantScheme::Q4K),
-                &b_packed,
-                b_orig.len(),
-            )
+            .dequantize(&Storage::KQuant(KQuantScheme::Q4K), &b_packed, b_orig.len())
             .expect("GpuDequant::dequantize Q4K");
         assert!(
             gpu_dequant.is_some(),

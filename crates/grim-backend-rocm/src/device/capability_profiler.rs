@@ -5,9 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use grim_tensor::backend::{GpuCapability, ScytheLink};
-use grim_tensor::error::Result;
 
-use crate::device::probe::{probe_host_gpu, probe_xnack};
+use crate::device::probe::probe_host_gpu;
 use crate::peer_access::{P2PStatus, enumerate_devices, peer_status};
 
 // ── HIP attributes needed for VRAM free / throttle ──────────────────────────
@@ -15,8 +14,9 @@ use crate::peer_access::{P2PStatus, enumerate_devices, peer_status};
 /// HIP device attribute: active clock throttle reasons. [see: `hipDeviceAttributeCurrentThermalThrottlePercent`]
 const HIP_DEVICE_ATTR_THROTTLE: i32 = 74;
 
-/// HIP attribute: total global memory (bytes). Attribute 23.
-const HIP_DEVICE_ATTR_TOTAL_MEM: i32 = 23; // hipDeviceAttributeTotalConstantMemory alt
+/// HIP device attribute: constant memory in bytes (attribute 23 in hip_runtime_api.h).
+#[allow(dead_code)]
+const HIP_DEVICE_ATTR_TOTAL_CONST_MEM: i32 = 23;
 
 // ── Public surface ────────────────────────────────────────────────────────────
 
@@ -79,7 +79,7 @@ impl CapabilityProfiler {
             let cap = measure_capability(ord);
             let prev = state.prev_throttle[ord];
             // Out-of-band epoch bump: >10% throttle delta (§3.6 escape hatch).
-            if (cap.throttle_pct - prev).abs() > 0.10 && !epoch_bumped {
+            if !epoch_bumped && (cap.throttle_pct - prev).abs() > 0.10 {
                 bump_epoch();
                 epoch_bumped = true;
                 eprintln!(
@@ -189,7 +189,19 @@ fn arch_tflops_table(gcn: &str) -> (f32, f32, f32) {
     }
     // CDNA (Instinct MI-series)
     if gcn.starts_with("gfx9") {
-        return (190.0, 380.0, 3200.0); // MI300X rough
+        if gcn.contains("940") || gcn.contains("941") || gcn.contains("942") {
+            return (1307.0, 2614.0, 5300.0); // MI300X FP16 peak TFLOPS & HBM3 bandwidth
+        }
+        if gcn.contains("90a") {
+            return (383.0, 383.0, 3200.0); // MI250X
+        }
+        if gcn.contains("908") {
+            return (184.6, 184.6, 1228.8); // MI100
+        }
+        if gcn.contains("906") {
+            return (26.8, 0.0, 1024.0); // Vega20 / MI50
+        }
+        return (100.0, 200.0, 1600.0); // generic CDNA / GFX9
     }
     // APU / iGPU — very weak
     if gcn.starts_with("gfx103") || gcn.starts_with("gfx1036") {

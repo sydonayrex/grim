@@ -89,12 +89,7 @@ impl<'a> WeightSource<'a> {
     /// Fetch the rank-th shard of a tensor (delegates to the underlying
     /// provider's `get_packed_sharded`, which may do zero-copy byte-range reads
     /// for GGUF block-quant formats).
-    pub fn get_sharded(
-        &self,
-        shape: impl Into<Shape>,
-        leaf: &str,
-        dim: usize,
-    ) -> Result<Tensor> {
+    pub fn get_sharded(&self, shape: impl Into<Shape>, leaf: &str, dim: usize) -> Result<Tensor> {
         let shape = shape.into();
         let name = self.full_name(leaf);
         let raw = self.tensors.get_packed_sharded(

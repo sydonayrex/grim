@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use grim_core::error::{Error, Result};
 use grim_nn::{
-    ColumnParallelLinear, Linear, RowParallelLinear, RmsNorm, Rope, TensorParallelConfig,
+    ColumnParallelLinear, Linear, RmsNorm, Rope, RowParallelLinear, TensorParallelConfig,
     WeightSource,
 };
-use grim_tensor::{Device, Shape, Tensor};
 use grim_tensor::TensorProvider;
+use grim_tensor::{Device, Shape, Tensor};
 
 use crate::model::LlamaConfig;
 
@@ -51,7 +51,11 @@ pub fn plan_kv_head_sharding(
     if num_kv_heads % world_size == 0 {
         Ok((num_heads / world_size, num_kv_heads / world_size, 1))
     } else if world_size % num_kv_heads == 0 {
-        Ok((num_heads / world_size, num_kv_heads, world_size / num_kv_heads))
+        Ok((
+            num_heads / world_size,
+            num_kv_heads,
+            world_size / num_kv_heads,
+        ))
     } else {
         Err(Error::Config(format!(
             "unsupported GQA topology: num_heads={num_heads}, num_kv_heads={num_kv_heads}, world_size={world_size}"
@@ -85,7 +89,11 @@ impl LlamaBlock {
     }
 
     /// Load a `LlamaBlock` with an explicit `TensorParallelConfig`.
-    pub fn load_tp(ws: &WeightSource<'_>, cfg: &LlamaConfig, tp: TensorParallelConfig) -> Result<Self> {
+    pub fn load_tp(
+        ws: &WeightSource<'_>,
+        cfg: &LlamaConfig,
+        tp: TensorParallelConfig,
+    ) -> Result<Self> {
         let attn_norm = RmsNorm::load(&ws.pp("attn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
         let wq = Linear::load_column_parallel(
             &ws.pp("attn").pp("wq"),
@@ -183,16 +191,40 @@ impl LlamaBlock {
         x: &Tensor,
         positions: &[u32],
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        let _dims = x.shape().dims().to_vec();
-        let hidden = self._cfg.hidden_size;
+        self.forward_with_kv_paged(x, positions, None)
+    }
 
+    /// Forward pass with optional SessionT paged attention dispatch.
+    pub fn forward_with_kv_paged(
+        &self,
+        x: &Tensor,
+        positions: &[u32],
+        session: Option<&dyn grim_core::session::SessionT>,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let x_2d = x;
 
         let x_norm = self.attn_norm.forward(x_2d)?;
         let q = self.wq.forward(&x_norm)?;
         let k = self.wk.forward(&x_norm)?;
         let v = self.wv.forward(&x_norm)?;
-        let attn_out = self.prefilled_self_attention(&q, &k, &v, positions)?;
+
+        let paged_attn_out = if let Some(sess) = session {
+            if let (Some(bt), Some((k_pages, v_pages, page_size))) =
+                (sess.block_table(), sess.paged_kv_handles())
+            {
+                self.paged_self_attention(&q, bt, k_pages, v_pages, page_size, positions)
+                    .ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let attn_out = match paged_attn_out {
+            Some(out) => out,
+            None => self.prefilled_self_attention(&q, &k, &v, positions)?,
+        };
         let attn_out = self.wo.forward(&attn_out)?;
 
         let added = grim_nn::modules::add_on_device(&x_2d, &attn_out)?;
@@ -381,6 +413,71 @@ impl LlamaBlock {
             )
         })
     }
+
+    /// Dispatch self-attention via paged attention kernel when block table & physical KV pools are available.
+    pub fn paged_self_attention(
+        &self,
+        q: &Tensor,
+        block_table: &[u32],
+        k_pages: &Tensor,
+        v_pages: &Tensor,
+        page_size: usize,
+        positions: &[u32],
+    ) -> Result<Tensor> {
+        let cfg = &self._cfg;
+        let q_rot = self.apply_rope_multi_head(q, positions, cfg.local_num_heads)?;
+
+        let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
+
+        let q_shape = q_rot.shape().dims();
+        let total_tokens = if q_shape.len() == 3 {
+            q_shape[0] * q_shape[1]
+        } else if q_shape.len() == 2 {
+            q_shape[0]
+        } else {
+            1
+        };
+
+        let q_3d_shape = Shape::new(vec![total_tokens, cfg.local_num_heads, cfg.head_dim]);
+        let q_3d = Tensor::new(
+            q_rot.storage().clone(),
+            q_3d_shape,
+            grim_tensor::DType::F32,
+            q.provenance().clone(),
+            q.device().clone(),
+        );
+
+        let bt_f32: Vec<f32> = block_table.iter().map(|&b| b as f32).collect();
+        let bt_shape = Shape::new(vec![block_table.len()]);
+        let bt_storage = dev.from_cpu(&bt_f32, &bt_shape, grim_tensor::DType::F32)?;
+
+        let out_shape_3d = Shape::new(vec![total_tokens, cfg.local_num_heads, cfg.head_dim]);
+        let cache_offset = positions.first().copied().unwrap_or(0);
+        let kv_seq_len = cache_offset as usize + total_tokens;
+
+        let (attn_storage, _) = dev.qkv_attention_paged(
+            q_3d.storage().as_ref(),
+            bt_storage.as_ref(),
+            k_pages.storage().as_ref(),
+            v_pages.storage().as_ref(),
+            cfg.local_num_kv_heads,
+            block_table.len(),
+            page_size,
+            kv_seq_len,
+            cache_offset,
+            &out_shape_3d,
+        )?;
+
+        let num_head_dims = cfg.local_num_heads * cfg.head_dim;
+        let out_shape_2d = Shape::new(vec![total_tokens, num_head_dims]);
+        Ok(Tensor::new(
+            std::sync::Arc::from(attn_storage),
+            out_shape_2d,
+            grim_tensor::DType::F32,
+            q.provenance().clone(),
+            q.device().clone(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -431,13 +528,28 @@ mod tests {
         let cfg = small_cfg();
         let dev = Device::Cpu;
         let tp = TensorParallelConfig::default();
-        let wq = ColumnParallelLinear::new(make_linear(cfg.hidden_size, cfg.num_heads * cfg.head_dim), tp);
-        let wk = ColumnParallelLinear::new(make_linear(cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim), tp);
-        let wv = ColumnParallelLinear::new(make_linear(cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim), tp);
-        let wo = RowParallelLinear::new(make_linear(cfg.num_heads * cfg.head_dim, cfg.hidden_size), tp);
-        let w_gate = ColumnParallelLinear::new(make_linear(cfg.hidden_size, cfg.intermediate_size), tp);
-        let w_up = ColumnParallelLinear::new(make_linear(cfg.hidden_size, cfg.intermediate_size), tp);
-        let w_down = RowParallelLinear::new(make_linear(cfg.intermediate_size, cfg.hidden_size), tp);
+        let wq = ColumnParallelLinear::new(
+            make_linear(cfg.hidden_size, cfg.num_heads * cfg.head_dim),
+            tp,
+        );
+        let wk = ColumnParallelLinear::new(
+            make_linear(cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim),
+            tp,
+        );
+        let wv = ColumnParallelLinear::new(
+            make_linear(cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim),
+            tp,
+        );
+        let wo = RowParallelLinear::new(
+            make_linear(cfg.num_heads * cfg.head_dim, cfg.hidden_size),
+            tp,
+        );
+        let w_gate =
+            ColumnParallelLinear::new(make_linear(cfg.hidden_size, cfg.intermediate_size), tp);
+        let w_up =
+            ColumnParallelLinear::new(make_linear(cfg.hidden_size, cfg.intermediate_size), tp);
+        let w_down =
+            RowParallelLinear::new(make_linear(cfg.intermediate_size, cfg.hidden_size), tp);
         let attn_norm = make_rmsnorm(cfg.hidden_size);
         let ffn_norm = make_rmsnorm(cfg.hidden_size);
         let rope = Rope::new(cfg.head_dim, 10000.0);
@@ -769,8 +881,8 @@ mod tests {
     /// are constructed and shard_size == full size.
     #[test]
     fn test_llama_block_load_tp_shards_weights() {
-        use std::collections::HashMap;
         use grim_tensor::{DType, QuantProvenance, RawTensor, TensorMeta, TensorProvider};
+        use std::collections::HashMap;
 
         #[derive(Clone)]
         struct FullProvider {
@@ -779,10 +891,9 @@ mod tests {
 
         impl TensorProvider for FullProvider {
             fn get(&self, name: &str) -> grim_tensor::error::Result<RawTensor> {
-                self.tensors
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| grim_tensor::error::Error::Backend(format!("tensor '{name}' not found")))
+                self.tensors.get(name).cloned().ok_or_else(|| {
+                    grim_tensor::error::Error::Backend(format!("tensor '{name}' not found"))
+                })
             }
             fn meta(&self, _name: &str) -> grim_tensor::error::Result<TensorMeta> {
                 Ok(TensorMeta {
@@ -826,7 +937,10 @@ mod tests {
             );
         }
 
-        let tp = TensorParallelConfig { rank: 0, world_size: 1 };
+        let tp = TensorParallelConfig {
+            rank: 0,
+            world_size: 1,
+        };
         let cfg = LlamaConfig {
             vocab_size: 100,
             hidden_size: 32,
@@ -854,7 +968,10 @@ mod tests {
     /// shard weights to half size while keeping KV head replication correct.
     #[test]
     fn test_llama_load_tp_output_head_sharded() {
-        let tp = TensorParallelConfig { rank: 0, world_size: 2 };
+        let tp = TensorParallelConfig {
+            rank: 0,
+            world_size: 2,
+        };
         let (nh, nkv, rep) = plan_kv_head_sharding(8, 4, 2).unwrap();
         assert_eq!(nh, 4);
         assert_eq!(nkv, 2);
@@ -925,13 +1042,13 @@ mod tests {
 
         // (name, out_dim, in_dim) for every weight the block loads.
         let weight_specs: &[(&str, usize, usize)] = &[
-            ("attn.wq", cfg.num_heads * cfg.head_dim, cfg.hidden_size),    // [32, 32]
-            ("attn.wk", cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size),  // [16, 32]
-            ("attn.wv", cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size),  // [16, 32]
-            ("attn.wo", cfg.num_heads * cfg.head_dim, cfg.hidden_size),    // [32, 32]
-            ("ffn.w_gate", cfg.intermediate_size, cfg.hidden_size),          // [64, 32]
-            ("ffn.w_up", cfg.intermediate_size, cfg.hidden_size),            // [64, 32]
-            ("ffn.w_down", cfg.hidden_size, cfg.intermediate_size),          // [32, 64]
+            ("attn.wq", cfg.num_heads * cfg.head_dim, cfg.hidden_size), // [32, 32]
+            ("attn.wk", cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size), // [16, 32]
+            ("attn.wv", cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size), // [16, 32]
+            ("attn.wo", cfg.num_heads * cfg.head_dim, cfg.hidden_size), // [32, 32]
+            ("ffn.w_gate", cfg.intermediate_size, cfg.hidden_size),     // [64, 32]
+            ("ffn.w_up", cfg.intermediate_size, cfg.hidden_size),       // [64, 32]
+            ("ffn.w_down", cfg.hidden_size, cfg.intermediate_size),     // [32, 64]
         ];
 
         // Build the fake provider with known, distinct float values for every
@@ -972,17 +1089,26 @@ mod tests {
         let provider = FullProvider { tensors };
 
         // world_size=1 — full weights.
-        let tp1 = TensorParallelConfig { rank: 0, world_size: 1 };
+        let tp1 = TensorParallelConfig {
+            rank: 0,
+            world_size: 1,
+        };
         let ws_full = WeightSource::root(&provider, Device::Cpu).with_tp_config(tp1);
         let block_full = LlamaBlock::load_tp(&ws_full, &cfg, tp1).expect("full load_tp ok");
 
         // world_size=2, rank 0.
-        let tp_r0 = TensorParallelConfig { rank: 0, world_size: 2 };
+        let tp_r0 = TensorParallelConfig {
+            rank: 0,
+            world_size: 2,
+        };
         let ws_r0 = WeightSource::root(&provider, Device::Cpu).with_tp_config(tp_r0);
         let block_r0 = LlamaBlock::load_tp(&ws_r0, &cfg, tp_r0).expect("rank 0 load_tp ok");
 
         // world_size=2, rank 1.
-        let tp_r1 = TensorParallelConfig { rank: 1, world_size: 2 };
+        let tp_r1 = TensorParallelConfig {
+            rank: 1,
+            world_size: 2,
+        };
         let ws_r1 = WeightSource::root(&provider, Device::Cpu).with_tp_config(tp_r1);
         let block_r1 = LlamaBlock::load_tp(&ws_r1, &cfg, tp_r1).expect("rank 1 load_tp ok");
 
@@ -1001,50 +1127,90 @@ mod tests {
                 "column-parallel {name}: rank-0 + rank-1 shards must concatenate to full"
             );
             assert_eq!(
-                r0_v.len(), r1_v.len(),
+                r0_v.len(),
+                r1_v.len(),
                 "column-parallel {name}: both shards must have equal element count"
             );
         };
 
         // Row-parallel (dim=1): shard is contiguous column block per row.
         // Reconstruct = for each row: r0_cols ++ r1_cols.
-        let check_row = |full: &Tensor, r0: &Tensor, r1: &Tensor,
-                         rows: usize, cols_half: usize, name: &str| {
-            let full_v = weight_f32(full);
-            let r0_v = weight_f32(r0);
-            let r1_v = weight_f32(r1);
-            assert_eq!(
-                r0_v.len(), rows * cols_half,
-                "row-parallel {name}: rank-0 shard size mismatch"
-            );
-            assert_eq!(
-                r1_v.len(), rows * cols_half,
-                "row-parallel {name}: rank-1 shard size mismatch"
-            );
-            let mut concat = Vec::with_capacity(rows * cols_half * 2);
-            for row in 0..rows {
-                let base = row * cols_half;
-                concat.extend_from_slice(&r0_v[base..base + cols_half]);
-                concat.extend_from_slice(&r1_v[base..base + cols_half]);
-            }
-            assert_eq!(
-                full_v, concat,
-                "row-parallel {name}: rank-0 + rank-1 shards must concatenate to full"
-            );
-        };
+        let check_row =
+            |full: &Tensor, r0: &Tensor, r1: &Tensor, rows: usize, cols_half: usize, name: &str| {
+                let full_v = weight_f32(full);
+                let r0_v = weight_f32(r0);
+                let r1_v = weight_f32(r1);
+                assert_eq!(
+                    r0_v.len(),
+                    rows * cols_half,
+                    "row-parallel {name}: rank-0 shard size mismatch"
+                );
+                assert_eq!(
+                    r1_v.len(),
+                    rows * cols_half,
+                    "row-parallel {name}: rank-1 shard size mismatch"
+                );
+                let mut concat = Vec::with_capacity(rows * cols_half * 2);
+                for row in 0..rows {
+                    let base = row * cols_half;
+                    concat.extend_from_slice(&r0_v[base..base + cols_half]);
+                    concat.extend_from_slice(&r1_v[base..base + cols_half]);
+                }
+                assert_eq!(
+                    full_v, concat,
+                    "row-parallel {name}: rank-0 + rank-1 shards must concatenate to full"
+                );
+            };
 
         // Column-parallel weights (sharded along dim=0, rows).
-        check_col(&block_full.wq.weight(), &block_r0.wq.weight(), &block_r1.wq.weight(), "wq");
-        check_col(&block_full.wk.weight(), &block_r0.wk.weight(), &block_r1.wk.weight(), "wk");
-        check_col(&block_full.wv.weight(), &block_r0.wv.weight(), &block_r1.wv.weight(), "wv");
-        check_col(&block_full.w_gate.weight(), &block_r0.w_gate.weight(), &block_r1.w_gate.weight(), "w_gate");
-        check_col(&block_full.w_up.weight(), &block_r0.w_up.weight(), &block_r1.w_up.weight(), "w_up");
+        check_col(
+            &block_full.wq.weight(),
+            &block_r0.wq.weight(),
+            &block_r1.wq.weight(),
+            "wq",
+        );
+        check_col(
+            &block_full.wk.weight(),
+            &block_r0.wk.weight(),
+            &block_r1.wk.weight(),
+            "wk",
+        );
+        check_col(
+            &block_full.wv.weight(),
+            &block_r0.wv.weight(),
+            &block_r1.wv.weight(),
+            "wv",
+        );
+        check_col(
+            &block_full.w_gate.weight(),
+            &block_r0.w_gate.weight(),
+            &block_r1.w_gate.weight(),
+            "w_gate",
+        );
+        check_col(
+            &block_full.w_up.weight(),
+            &block_r0.w_up.weight(),
+            &block_r1.w_up.weight(),
+            "w_up",
+        );
 
         // Row-parallel weights (sharded along dim=1, columns).
         // wo: [32, 32] → shard [32, 16]; w_down: [32, 64] → shard [32, 32].
-        check_row(&block_full.wo.weight(), &block_r0.wo.weight(), &block_r1.wo.weight(),
-            cfg.num_heads * cfg.head_dim, cfg.hidden_size / 2, "wo");
-        check_row(&block_full.w_down.weight(), &block_r0.w_down.weight(), &block_r1.w_down.weight(),
-            cfg.hidden_size, cfg.intermediate_size / 2, "w_down");
+        check_row(
+            &block_full.wo.weight(),
+            &block_r0.wo.weight(),
+            &block_r1.wo.weight(),
+            cfg.num_heads * cfg.head_dim,
+            cfg.hidden_size / 2,
+            "wo",
+        );
+        check_row(
+            &block_full.w_down.weight(),
+            &block_r0.w_down.weight(),
+            &block_r1.w_down.weight(),
+            cfg.hidden_size,
+            cfg.intermediate_size / 2,
+            "w_down",
+        );
     }
 }

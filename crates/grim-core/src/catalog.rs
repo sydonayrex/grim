@@ -192,8 +192,7 @@ pub fn resolve_model_preferring_grim(name: &str) -> Option<PathBuf> {
     if direct.exists() && is_safe_model_path(direct, &models_dir) {
         // Prefer a `.grim` sibling if the user pointed at a `.gguf` directly.
         if let Some(grim_sibling) = grim_sibling_if_gguf(direct) {
-            return Some(resolve_with_ext(&grim_sibling, force_ext)
-                .unwrap_or(grim_sibling));
+            return Some(resolve_with_ext(&grim_sibling, force_ext).unwrap_or(grim_sibling));
         }
         return Some(resolve_with_ext(direct, force_ext).unwrap_or_else(|| direct.to_path_buf()));
     }
@@ -246,22 +245,18 @@ pub fn resolve_model_preferring_grim(name: &str) -> Option<PathBuf> {
     let gguf_candidate = models_dir.join(format!("{file_stem}.gguf"));
     let grim_candidate = models_dir.join(format!("{file_stem}.grim"));
     if grim_candidate.exists() {
-        return Some(resolve_with_ext(&grim_candidate, force_ext)
-            .unwrap_or(grim_candidate));
+        return Some(resolve_with_ext(&grim_candidate, force_ext).unwrap_or(grim_candidate));
     }
     if gguf_candidate.exists() {
-        return Some(resolve_with_ext(&gguf_candidate, force_ext)
-            .unwrap_or(gguf_candidate));
+        return Some(resolve_with_ext(&gguf_candidate, force_ext).unwrap_or(gguf_candidate));
     }
     let gguf_candidate2 = models_dir.join(format!("{stem}.gguf"));
     let grim_candidate2 = models_dir.join(format!("{stem}.grim"));
     if grim_candidate2.exists() {
-        return Some(resolve_with_ext(&grim_candidate2, force_ext)
-            .unwrap_or(grim_candidate2));
+        return Some(resolve_with_ext(&grim_candidate2, force_ext).unwrap_or(grim_candidate2));
     }
     if gguf_candidate2.exists() {
-        return Some(resolve_with_ext(&gguf_candidate2, force_ext)
-            .unwrap_or(gguf_candidate2));
+        return Some(resolve_with_ext(&gguf_candidate2, force_ext).unwrap_or(gguf_candidate2));
     }
 
     None

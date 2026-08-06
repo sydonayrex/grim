@@ -16,7 +16,9 @@ pub mod session;
 
 pub use architecture::{ModelArchitecture, TensorNamingRegistry, TensorRole};
 pub use catalog::{ModelEntry, list_local_models, resolve_model_path};
-pub use client::{DownloadProgress, download_model, download_model_with_progress, is_bind_address_allowed};
+pub use client::{
+    DownloadProgress, download_model, download_model_with_progress, is_bind_address_allowed,
+};
 pub use env_config::{Backend, RuntimeEnv};
 pub use error::{Error, Result, TensorError};
 pub use hyperparams::{ArchHyperparameters, HyperparameterExtractor, MetadataLookup};

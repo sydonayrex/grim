@@ -38,18 +38,22 @@ fn test_rope_golden_mutation_resistant() {
     assert!((out_data[3] - 4.0).abs() < 1e-4);
 
     // Pos 1 output calculations:
-    // x1 = 1.0, x2 = 3.0 (half offset = 2)
-    // out[4] = x1 * cos(1.0) - x2 * sin(1.0) = 1.0 * 0.5403023 - 3.0 * 0.84147098 = -1.9841106
-    // out[6] = x1 * sin(1.0) + x2 * cos(1.0) = 1.0 * 0.84147098 + 3.0 * 0.5403023 = 2.4623779
-    let expected_pos1_i0_low = 1.0 * (1.0f32).cos() - 3.0 * (1.0f32).sin();
-    let expected_pos1_i0_high = 1.0 * (1.0f32).sin() + 3.0 * (1.0f32).cos();
+    // x1 = 1.0 (at offset 4), x2 = 2.0 (at offset 5, half offset = 1 for adjacent pairs)
+    // out[4] = x1 * cos(1.0) - x2 * sin(1.0) = 1.0 * cos(1.0) - 2.0 * sin(1.0) = -1.1426396
+    // out[5] = x1 * sin(1.0) + x2 * cos(1.0) = 1.0 * sin(1.0) + 2.0 * cos(1.0) = 1.9220756
+    let expected_pos1_i0_low = 1.0 * (1.0f32).cos() - 2.0 * (1.0f32).sin();
+    let expected_pos1_i0_high = 1.0 * (1.0f32).sin() + 2.0 * (1.0f32).cos();
 
     assert!(
         (out_data[4] - expected_pos1_i0_low).abs() < 1e-4,
-        "Pos 1 low dim match"
+        "Pos 1 low dim match: got {}, expected {}",
+        out_data[4],
+        expected_pos1_i0_low
     );
     assert!(
-        (out_data[6] - expected_pos1_i0_high).abs() < 1e-4,
-        "Pos 1 high dim match"
+        (out_data[5] - expected_pos1_i0_high).abs() < 1e-4,
+        "Pos 1 high dim match: got {}, expected {}",
+        out_data[5],
+        expected_pos1_i0_high
     );
 }

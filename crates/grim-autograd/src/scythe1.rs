@@ -11,7 +11,6 @@
 //!   2) precondition with `FIM_inv_diag = 1 / max(FIM_diag, eps)`,
 //!   3) delegate to `SoulEaterOptimizer::step` for the actual update.
 
-use grim_backend_cpu::cpu_tensor;
 use grim_tensor::{Result, Tensor};
 
 use crate::soul_eater::{SoulEaterAdapter, SoulEaterOptimizer};

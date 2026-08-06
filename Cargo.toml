@@ -38,16 +38,17 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 
 [workspace.lints.rust]
-unsafe_op_in_unsafe_fn = "warn"
-unused_variables = "warn"
-unused_mut = "warn"
-dead_code = "warn"
-unused_imports = "warn"
-unused_parens = "warn"
-non_snake_case = "warn"
-non_upper_case_globals = "warn"
-non_camel_case_types = "warn"
-unexpected_cfgs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+unused_variables = "deny"
+unused_mut = "deny"
+dead_code = "deny"
+unused_imports = "deny"
+unused_parens = "deny"
+non_snake_case = "deny"
+non_upper_case_globals = "deny"
+non_camel_case_types = "deny"
+unexpected_cfgs = "deny"
+warnings = "deny"
 
 [workspace.lints.clippy]
 all = "warn"
@@ -88,9 +89,6 @@ parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rand = "0.10"
-
-[workspace.features]
-rocm = ["grim-backend-rocm/rccl"]
 
 [profile.release]
 opt-level = 3

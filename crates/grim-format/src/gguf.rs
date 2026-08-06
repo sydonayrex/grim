@@ -570,11 +570,9 @@ impl GrimMetadata {
             .as_ref()
             .and_then(|m| m.get("grim.ext.v2.json"))
             .and_then(|v| match v {
-                GgufValue::String(s) => {
-                    serde_json::from_str::<GrimMetadataV2>(s)
-                        .ok()
-                        .and_then(|v2| v2.rotation_id)
-                }
+                GgufValue::String(s) => serde_json::from_str::<GrimMetadataV2>(s)
+                    .ok()
+                    .and_then(|v2| v2.rotation_id),
                 _ => None,
             })
     }
@@ -604,7 +602,6 @@ impl GrimMetadata {
         self.v2().recon_method
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // GgufValue ↔ JSON conversion helpers
@@ -1065,21 +1062,33 @@ impl GrimMetadata {
             obj.insert(
                 "rotation_inverse".into(),
                 serde_json::Value::Array(
-                    bytes.iter().map(|b| serde_json::Value::Number((*b).into())).collect(),
+                    bytes
+                        .iter()
+                        .map(|b| serde_json::Value::Number((*b).into()))
+                        .collect(),
                 ),
             );
         }
         if let Some(method) = &self.recon_method {
-            obj.insert("recon_method".into(), serde_json::Value::String(method.clone()));
+            obj.insert(
+                "recon_method".into(),
+                serde_json::Value::String(method.clone()),
+            );
         }
         if let Some(rank) = self.recon_rank {
             obj.insert("recon_rank".into(), serde_json::Value::Number(rank.into()));
         }
         if let Some(method) = &self.kv_method {
-            obj.insert("kv_method".into(), serde_json::Value::String(method.clone()));
+            obj.insert(
+                "kv_method".into(),
+                serde_json::Value::String(method.clone()),
+            );
         }
         if let Some(bpw) = self.kv_bpw {
-            obj.insert("kv_bpw".into(), serde_json::Value::Number(serde_json::Number::from_f64(bpw as f64).unwrap()));
+            obj.insert(
+                "kv_bpw".into(),
+                serde_json::Value::Number(serde_json::Number::from_f64(bpw as f64).unwrap()),
+            );
         }
         serde_json::Value::Object(obj)
     }
@@ -1163,14 +1172,30 @@ impl GrimMetadata {
         let xnack_enabled = obj.get("xnack_enabled").and_then(|v| v.as_bool());
         let kv_layout_optimized = obj.get("kv_layout_optimized").and_then(|v| v.as_bool());
         let has_kv_registry = obj.get("has_kv_registry").and_then(|v| v.as_bool());
-        let rotation_id = obj.get("rotation_id").and_then(|v| v.as_str()).map(String::from);
+        let rotation_id = obj
+            .get("rotation_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let rotation_inverse = obj
             .get("rotation_inverse")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect());
-        let recon_method = obj.get("recon_method").and_then(|v| v.as_str()).map(String::from);
-        let recon_rank = obj.get("recon_rank").and_then(|v| v.as_u64()).map(|v| v as u32);
-        let kv_method = obj.get("kv_method").and_then(|v| v.as_str()).map(String::from);
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_u64().map(|n| n as u8))
+                    .collect()
+            });
+        let recon_method = obj
+            .get("recon_method")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let recon_rank = obj
+            .get("recon_rank")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let kv_method = obj
+            .get("kv_method")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let kv_bpw = obj.get("kv_bpw").and_then(|v| v.as_f64()).map(|v| v as f32);
         let ext_entries = obj
             .get("grim.ext.entries")

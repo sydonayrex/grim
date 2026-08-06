@@ -97,13 +97,13 @@ impl RuntimeEnv {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0);
-        let parallel = std::env::var("GRIM_PARALLEL")
-            .ok()
-            .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+        let parallel = std::env::var("GRIM_PARALLEL").ok().and_then(|s| {
+            match s.trim().to_ascii_lowercase().as_str() {
                 "yes" | "true" | "1" => Some(true),
                 "no" | "false" | "0" => Some(false),
                 _ => None,
-            });
+            }
+        });
         let mem_budget_mib = std::env::var("GRIM_MEM_BUDGET_MIB")
             .ok()
             .and_then(|s| s.parse::<usize>().ok());

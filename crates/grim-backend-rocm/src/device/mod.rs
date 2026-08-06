@@ -1,7 +1,7 @@
 //! ROCm device module — the `[device]` grouping the spec's anti-pattern [see: `gemm_tuning`, `lookup_gemm_config`]
 
 pub mod accel_features;
-pub mod accel_ffi;
+pub(crate) mod accel_ffi;
 /// SCYTHE-2 WI-2: live GPU capability profiler.
 pub mod capability_profiler;
 pub mod cubecl;
