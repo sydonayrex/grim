@@ -58,7 +58,12 @@ impl From<PluginCapabilities> for u32 {
 /// (Rust trait objects aren't ABI-stable across compiler versions, so the
 /// FFI boundary uses a C-compatible vtable — same pattern as `abi_stable`
 /// / `stabby`.)
-#[derive(Debug)]
+///
+/// `sampler_sample` mirrors the WASM `sample` export signature
+/// `(logits_ptr, logits_len, history_ptr, history_len) -> token_id`, keeping
+/// the dylib and WASM sampler paths symmetric. `Option<...>` so a plugin that
+/// doesn't declare the `SAMPLER` capability may leave it `None`.
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct GrimPluginVTable {
     pub abi_version: u32,
@@ -68,6 +73,19 @@ pub struct GrimPluginVTable {
     pub model_factory:
         Option<extern "C" fn(cfg: *const std::os::raw::c_char) -> *mut std::os::raw::c_void>,
     pub sampler_factory: Option<extern "C" fn() -> *mut std::os::raw::c_void>,
+    /// Invoke sampling on a handle returned by `sampler_factory`. The handle
+    /// is opaque host-owned state; the plugin reads `logits` (f32 slice of
+    /// length `logits_len`) and `history` (u32 slice of length `history_len`)
+    /// and returns a chosen token id.
+    pub sampler_sample: Option<
+        extern "C" fn(
+            handle: *mut std::os::raw::c_void,
+            logits_ptr: *const f32,
+            logits_len: u32,
+            history_ptr: *const u32,
+            history_len: u32,
+        ) -> i32,
+    >,
     pub teardown: extern "C" fn(),
 }
 /// Detection of plugin loading strategy from the manifest.
