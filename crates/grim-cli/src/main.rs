@@ -450,6 +450,11 @@ enum ServiceCommands {
     Run {
         #[arg(short, long, default_value = "grim.toml")]
         config: String,
+        /// Plugin directory to load samplers/processors from at startup — the
+        /// same `--plugins <dir>` surface the interactive `serve` and
+        /// `run --serve` commands honor. Empty (default) means no plugins.
+        #[arg(long, default_value = "")]
+        plugins: String,
     },
 }
 
@@ -1093,9 +1098,10 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                ServiceCommands::Run { config } => {
+                ServiceCommands::Run { config, plugins } => {
                     #[cfg(target_os = "windows")]
                     {
+                        let _ = plugins;
                         run_windows_service_dispatcher(&config)?;
                     }
                     #[cfg(not(target_os = "windows"))]
@@ -1106,7 +1112,8 @@ async fn main() -> Result<()> {
                         println!("[Service] Running background daemon on port 11434");
                         let rt = tokio::runtime::Runtime::new().unwrap();
                         rt.block_on(async {
-                            if let Err(e) = server::cmd_server("127.0.0.1:11434", &config, "").await
+                            if let Err(e) =
+                                server::cmd_server("127.0.0.1:11434", &config, &plugins).await
                             {
                                 eprintln!("[Service] Server failed: {e}");
                             }

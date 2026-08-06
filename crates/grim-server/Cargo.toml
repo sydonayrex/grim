@@ -31,6 +31,12 @@ serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tower = "0.5"
+wat = "1.0"
 
 [features]
 default = []
+# Enables the wasmtime-backed WASM plugin loader. When disabled,
+# `WasmPluginLoader::create_sampler` returns `Unimplemented`; the request-time
+# `sampler` field wiring is still exercised by the default-on mock-sampler E2E
+# test (`test_chat_completions_routes_through_named_plugin_sampler`).
+wasm-sandbox = ["grim-plugin/wasm-sandbox"]
