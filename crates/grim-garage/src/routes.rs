@@ -806,14 +806,22 @@ async fn merge_bolt_on_route(
             Some((a_data, a_shape, b_data, b_shape)) => {
                 let a_shape = grim_tensor::Shape::from_slice(a_shape);
                 let b_shape = grim_tensor::Shape::from_slice(b_shape);
-                let a_storage = match cpu_backend.from_cpu(&a_data, &a_shape, grim_tensor::DType::F32) {
+                let a_storage = match cpu_backend.from_cpu(
+                    &a_data,
+                    &a_shape,
+                    grim_tensor::DType::F32,
+                ) {
                     Ok(s) => s,
                     Err(e) => {
                         errors.push(json!({ "tensor": tensor_name, "error": format!("failed to create A tensor: {e}") }));
                         continue;
                     }
                 };
-                let b_storage = match cpu_backend.from_cpu(&b_data, &b_shape, grim_tensor::DType::F32) {
+                let b_storage = match cpu_backend.from_cpu(
+                    &b_data,
+                    &b_shape,
+                    grim_tensor::DType::F32,
+                ) {
                     Ok(s) => s,
                     Err(e) => {
                         errors.push(json!({ "tensor": tensor_name, "error": format!("failed to create B tensor: {e}") }));

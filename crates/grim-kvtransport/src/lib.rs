@@ -384,9 +384,7 @@ impl NetworkKvClient {
             ));
         }
         if k.is_empty() {
-            return Err(Error::KvCache(
-                "Cannot send an empty KV block".into(),
-            ));
+            return Err(Error::KvCache("Cannot send an empty KV block".into()));
         }
         let addr = Self::resolve_addr(target_ip);
         let checksum = compute_checksum(k, v);
@@ -405,17 +403,15 @@ impl NetworkKvClient {
             buf.extend_from_slice(&val.to_le_bytes());
         }
 
-        let socket_addr = addr.parse().map_err(|e| {
-            Error::KvCache(format!("Invalid target IP address '{target_ip}': {e}"))
-        })?;
+        let socket_addr = addr
+            .parse()
+            .map_err(|e| Error::KvCache(format!("Invalid target IP address '{target_ip}': {e}")))?;
 
-        let mut stream =
-            std::net::TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(500))
-                .map_err(|e| {
-                    Error::KvCache(format!(
-                        "TCP send block connection failed to {addr}: {e}"
-                    ))
-                })?;
+        let mut stream = std::net::TcpStream::connect_timeout(
+            &socket_addr,
+            std::time::Duration::from_millis(500),
+        )
+        .map_err(|e| Error::KvCache(format!("TCP send block connection failed to {addr}: {e}")))?;
 
         stream
             .write_all(&buf)
@@ -437,9 +433,9 @@ impl NetworkKvClient {
         block_elems: usize,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         let addr = Self::resolve_addr(target_ip);
-        let socket_addr = addr.parse().map_err(|e| {
-            Error::KvCache(format!("Invalid target IP address '{target_ip}': {e}"))
-        })?;
+        let socket_addr = addr
+            .parse()
+            .map_err(|e| Error::KvCache(format!("Invalid target IP address '{target_ip}': {e}")))?;
 
         // Build a fetch-request header: same format but with a zero checksum
         // and a special request flag in layer_idx (bit 31 set).
@@ -452,13 +448,11 @@ impl NetworkKvClient {
             checksum: 0,
         };
 
-        let mut stream =
-            std::net::TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(500))
-                .map_err(|e| {
-                    Error::KvCache(format!(
-                        "TCP fetch connection failed to {addr}: {e}"
-                    ))
-                })?;
+        let mut stream = std::net::TcpStream::connect_timeout(
+            &socket_addr,
+            std::time::Duration::from_millis(500),
+        )
+        .map_err(|e| Error::KvCache(format!("TCP fetch connection failed to {addr}: {e}")))?;
 
         stream
             .write_all(&req_header.serialize())
@@ -826,10 +820,7 @@ mod tests {
     fn find_free_port() -> u16 {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("must bind to find free port");
-        let port = listener
-            .local_addr()
-            .expect("must get local addr")
-            .port();
+        let port = listener.local_addr().expect("must get local addr").port();
         drop(listener);
         port
     }
@@ -921,7 +912,10 @@ mod tests {
         // Give the receiver thread a moment to write.
         std::thread::sleep(std::time::Duration::from_millis(200));
         let guard = store.lock().unwrap();
-        let stored = guard.blocks.get(&100).expect("block 100 must have been written");
+        let stored = guard
+            .blocks
+            .get(&100)
+            .expect("block 100 must have been written");
         assert_eq!(stored.0, k, "keys must match exactly");
         assert_eq!(stored.1, v, "values must match exactly");
     }

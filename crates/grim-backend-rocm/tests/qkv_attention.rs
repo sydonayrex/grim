@@ -8,6 +8,12 @@
 //! Each test reports a f32 relative error budget of `1e-3` per Step 4. The
 //! sole purpose of this module is correctness; performance tuning lives
 //! under Phase 2 / `.rocm-rocm-/...` skill guidance, not here.
+//!
+//! Dual-GPU test results (syd-beasty, ROCm 7.2.53211):
+//!   Hardware: RX 9070 XT (gfx1201, device 0) + RX 9060 XT (gfx1200, device 1)
+//!   — all 12/12 PASS (structural + GPU correctness), including
+//!   qkv_attention_gpu_matches_reference_when_enabled and
+//!   qkv_attention_gpu_head_dim_128_not_nan.
 
 use grim_backend_rocm::{QkvAttentionFusionConfig, RocmDevice};
 use grim_tensor::{BackendDevice, DType, Shape};

@@ -13,8 +13,7 @@ use grim_memory::KvBlockPool;
 
 /// Find a free TCP port on loopback.
 fn find_free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("must bind to find free port");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("must bind to find free port");
     let port = listener.local_addr().expect("must get local addr").port();
     drop(listener);
     port
@@ -40,8 +39,7 @@ fn test_disaggregated_kv_transfer_loopback() {
     // ── Start prefill node receiver ────────────────────────────────────────
     let prefill_port = find_free_port();
     let prefill_addr = format!("127.0.0.1:{prefill_port}");
-    let _prefill_receiver =
-        KvReceiverServer::new(&prefill_addr, prefill_shared.clone()).unwrap();
+    let _prefill_receiver = KvReceiverServer::new(&prefill_addr, prefill_shared.clone()).unwrap();
 
     // ── Set up decode node pool (destination) ──────────────────────────────
     let decode_pool = KvBlockPool::new(8, num_heads, head_dim);
@@ -50,8 +48,7 @@ fn test_disaggregated_kv_transfer_loopback() {
     // ── Start decode node receiver ─────────────────────────────────────────
     let decode_port = find_free_port();
     let decode_addr = format!("127.0.0.1:{decode_port}");
-    let decode_receiver =
-        KvReceiverServer::new(&decode_addr, decode_shared.clone()).unwrap();
+    let decode_receiver = KvReceiverServer::new(&decode_addr, decode_shared.clone()).unwrap();
 
     // ── Create router on the prefill node and transfer KV ──────────────────
     let router = DisaggRouter::new(&prefill_addr, &decode_addr, PoolRole::Prefill)
@@ -104,7 +101,9 @@ fn test_disaggregated_kv_transfer_multiple_blocks() {
     let mut src_pool = KvBlockPool::new(16, num_heads, head_dim);
     // Seed blocks 1, 2, 3 with distinct data.
     for &bid in &[1usize, 2, 3] {
-        let k_data: Vec<f32> = (0..elem_per_token).map(|i| (i as f32) * (bid as f32)).collect();
+        let k_data: Vec<f32> = (0..elem_per_token)
+            .map(|i| (i as f32) * (bid as f32))
+            .collect();
         let v_data: Vec<f32> = (0..elem_per_token).map(|i| (i as f32) + 100.0).collect();
         src_pool.write_keys(bid, &k_data, 1);
         src_pool.write_values(bid, &v_data);
@@ -123,8 +122,8 @@ fn test_disaggregated_kv_transfer_multiple_blocks() {
     let dest_addr = format!("127.0.0.1:{port2}");
     let _dest_receiver = KvReceiverServer::new(&dest_addr, dest_shared.clone()).unwrap();
 
-    let router = DisaggRouter::new(&src_addr, &dest_addr, PoolRole::Prefill)
-        .with_pool(src_shared.clone());
+    let router =
+        DisaggRouter::new(&src_addr, &dest_addr, PoolRole::Prefill).with_pool(src_shared.clone());
 
     let request_id = 0u64;
     // Transfer blocks 1, 2, 3 as a batch.

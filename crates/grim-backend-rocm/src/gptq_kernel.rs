@@ -146,7 +146,7 @@ pub fn wavefront_size_for_gcn(gcn: &str) -> u32 {
         "gfx1200" | "gfx1201" | "gfx1100" | "gfx1102" | "gfx11" => 32, // RDNA4/3
         "gfx1030" | "gfx1036" => 32,          // RDNA2 (RX 6700, RDNA2 iGPU)
         "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" => 32, // RDNA2 variants
-        _ => 32, // safe default: this project is RDNA-first (Wave32)
+        _ => 32,                              // safe default: this project is RDNA-first (Wave32)
     }
 }
 

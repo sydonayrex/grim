@@ -756,7 +756,12 @@ fn pack_tensors(
     let completed = AtomicUsize::new(0);
     let (tx, rx) = std::sync::mpsc::channel();
 
-    let packed_items: Result<Vec<((crate::format::GrimTensorEntry, Vec<u8>), crate::spec::GrimTensorExt)>> = names
+    let packed_items: Result<
+        Vec<(
+            (crate::format::GrimTensorEntry, Vec<u8>),
+            crate::spec::GrimTensorExt,
+        )>,
+    > = names
         .par_iter()
         .enumerate()
         .map(|(i, name)| {
@@ -802,7 +807,8 @@ fn pack_tensors(
             }
 
             let elem_sqrt = (elem_count as f64).sqrt() as usize;
-            if elem_sqrt * elem_sqrt == elem_count && elem_sqrt >= 16 && elem_sqrt.is_power_of_two() {
+            if elem_sqrt * elem_sqrt == elem_count && elem_sqrt >= 16 && elem_sqrt.is_power_of_two()
+            {
                 grim_quant::spinquant_rotate(&mut f32_values, elem_sqrt, 0.01, 5);
             }
 

@@ -111,7 +111,11 @@ mod tests {
         };
 
         let qs_byte = 32 * k + j;
-        let q = if off < 32 { qs[qs_byte] & 0x0F } else { qs[qs_byte] >> 4 };
+        let q = if off < 32 {
+            qs[qs_byte] & 0x0F
+        } else {
+            qs[qs_byte] >> 4
+        };
 
         d * (sc as f32) * (q as f32) - dmin * (m as f32)
     }
@@ -147,8 +151,9 @@ mod tests {
         let oracle = grim_quant::dequant_q4k(&buf, 256).expect("cpu dequant");
         assert_eq!(oracle.len(), 256);
 
-        let mirror: Vec<f32> =
-            (0..256).map(|w| dequant_q4k_grim_element_host(&buf, w)).collect();
+        let mirror: Vec<f32> = (0..256)
+            .map(|w| dequant_q4k_grim_element_host(&buf, w))
+            .collect();
 
         for (i, (&a, &b)) in mirror.iter().zip(oracle.iter()).enumerate() {
             assert_close(a, b, &format!("q4k mirror vs oracle at w={i}"));
@@ -161,7 +166,9 @@ mod tests {
     fn q4k_dequant_kernel_matches_cpu_oracle_random() {
         let mut rng_state: u64 = 0x9E37_79B9_5BF0_C465;
         let next = |st: &mut u64| {
-            *st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (*st >> 33) as u8
         };
         for _ in 0..32 {
@@ -183,8 +190,9 @@ mod tests {
             }
 
             let oracle = grim_quant::dequant_q4k(&buf, 256).expect("cpu dequant");
-            let mirror: Vec<f32> =
-                (0..256).map(|w| dequant_q4k_grim_element_host(&buf, w)).collect();
+            let mirror: Vec<f32> = (0..256)
+                .map(|w| dequant_q4k_grim_element_host(&buf, w))
+                .collect();
 
             for (i, (&a, &b)) in mirror.iter().zip(oracle.iter()).enumerate() {
                 assert_close(a, b, &format!("q4k random mirror vs oracle w={i}"));

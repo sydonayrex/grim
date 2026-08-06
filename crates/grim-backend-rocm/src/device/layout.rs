@@ -387,8 +387,6 @@ pub fn align_tensor_for_rocm_gemm(
     cols: usize,
     wavefront_size: u32,
 ) -> (Vec<f32>, usize, usize) {
-    let wf = wavefront_size as usize;
-
     // Compute padded dimensions via shared wavefront utility.
     let (rows_padded, _) = padded_dims(rows, cols, wavefront_size);
     let cols_padded = cols;
@@ -426,7 +424,6 @@ pub fn align_quantized_tensor_for_rocm_gemm(
         return (data.to_vec(), shape.to_vec());
     }
 
-    let wf = wavefront_size as usize;
     let rows = shape[0];
     let cols = shape[1];
 

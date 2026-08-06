@@ -1,7 +1,6 @@
 //! Distributed serving and disaggregation layer: decouples prefill/decode, manages cross-node KV cache transfers.
 //!
 /// ReMP 2D KV-cache migration (WI-8): coalesced 128-byte block-major transfer within same VRAM pool.
-
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -203,11 +202,13 @@ impl DisaggRouter {
     /// prefill node address.
     fn extract_and_send_prefill(&self, _request_id: u64, tokens: &[u32]) -> Result<()> {
         let pool = self.pool.as_ref().ok_or_else(|| {
-            Error::KvCache("dispatch_prefill: no KvBlockPool attached for real KV extraction".into())
+            Error::KvCache(
+                "dispatch_prefill: no KvBlockPool attached for real KV extraction".into(),
+            )
         })?;
-        let guard = pool.lock().map_err(|e| {
-            Error::KvCache(format!("dispatch_prefill: pool mutex poisoned: {e}"))
-        })?;
+        let guard = pool
+            .lock()
+            .map_err(|e| Error::KvCache(format!("dispatch_prefill: pool mutex poisoned: {e}")))?;
         // Iterate over all allocated blocks in the pool and stream their real
         // KV data to the prefill node.
         for block_id in 0..guard.num_blocks() {
@@ -241,9 +242,9 @@ impl DisaggRouter {
         let pool = self.pool.as_ref().ok_or_else(|| {
             Error::KvCache("dispatch_decode: no KvBlockPool attached for real KV extraction".into())
         })?;
-        let guard = pool.lock().map_err(|e| {
-            Error::KvCache(format!("dispatch_decode: pool mutex poisoned: {e}"))
-        })?;
+        let guard = pool
+            .lock()
+            .map_err(|e| Error::KvCache(format!("dispatch_decode: pool mutex poisoned: {e}")))?;
         for block_id in 0..guard.num_blocks() {
             let k_data = guard.read_keys(block_id);
             let v_data = guard.read_values(block_id);
@@ -279,7 +280,7 @@ impl DisaggRouterT for DisaggRouter {
     }
 
     /// Transfer real KV blocks to the decode node.
-    fn transfer_kv_cache(&self, request_id: u64, block_ids: &[usize]) -> Result<()> {
+    fn transfer_kv_cache(&self, _request_id: u64, block_ids: &[usize]) -> Result<()> {
         if block_ids.is_empty() {
             return Err(Error::KvCache(
                 "Handoff protocol error: block list cannot be empty".into(),
@@ -290,19 +291,14 @@ impl DisaggRouterT for DisaggRouter {
                 "transfer_kv_cache: no KvBlockPool attached for real KV extraction".into(),
             )
         })?;
-        let guard = pool.lock().map_err(|e| {
-            Error::KvCache(format!("transfer_kv_cache: pool mutex poisoned: {e}"))
-        })?;
+        let guard = pool
+            .lock()
+            .map_err(|e| Error::KvCache(format!("transfer_kv_cache: pool mutex poisoned: {e}")))?;
         for &b_id in block_ids {
             let k_data = guard.read_keys(b_id);
             let v_data = guard.read_values(b_id);
-            self.kv_client.send_block_remote(
-                b_id,
-                0,
-                k_data,
-                v_data,
-                &self.decode_node_addr,
-            )?;
+            self.kv_client
+                .send_block_remote(b_id, 0, k_data, v_data, &self.decode_node_addr)?;
         }
         Ok(())
     }
@@ -572,8 +568,7 @@ mod tests {
 
         let port = find_free_port();
         let addr = format!("127.0.0.1:{port}");
-        let _receiver =
-            crate::KvReceiverServer::new(&addr, shared_pool.clone()).unwrap();
+        let _receiver = crate::KvReceiverServer::new(&addr, shared_pool.clone()).unwrap();
 
         // Create the destination pool (receiver side).
         let dest_pool = Arc::new(Mutex::new(KvBlockPool::new(4, 2, 4)));
@@ -584,8 +579,8 @@ mod tests {
         let receiver = crate::KvReceiverServer::new(&addr2, dest_pool.clone()).unwrap();
 
         // Create router with the source pool.
-        let router = DisaggRouter::new(&addr2, &addr2, PoolRole::Prefill)
-            .with_pool(shared_pool.clone());
+        let router =
+            DisaggRouter::new(&addr2, &addr2, PoolRole::Prefill).with_pool(shared_pool.clone());
 
         // Transfer the real KV block.
         router

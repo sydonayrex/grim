@@ -201,12 +201,14 @@ impl DylibPluginLoader {
             ));
         }
 
-        let sampler_factory = self.vtable.sampler_factory.ok_or_else(|| {
-            Error::Backend("Plugin missing sampler_factory symbol".into())
-        })?;
+        let sampler_factory = self
+            .vtable
+            .sampler_factory
+            .ok_or_else(|| Error::Backend("Plugin missing sampler_factory symbol".into()))?;
         let sampler_sample = self.vtable.sampler_sample.ok_or_else(|| {
             Error::Backend(
-                "Plugin missing sampler_sample vtable entry (ABI v1 requires it for samplers)".into(),
+                "Plugin missing sampler_sample vtable entry (ABI v1 requires it for samplers)"
+                    .into(),
             )
         })?;
 
@@ -215,7 +217,9 @@ impl DylibPluginLoader {
         let handle = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sampler_factory()))
             .map_err(|_| Error::Backend("Plugin sampler_factory panicked".into()))?;
         if handle.is_null() {
-            return Err(Error::Backend("Plugin sampler_factory returned null".into()));
+            return Err(Error::Backend(
+                "Plugin sampler_factory returned null".into(),
+            ));
         }
 
         Ok(Arc::new(DylibSampler {

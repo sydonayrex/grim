@@ -15,7 +15,7 @@ use grim_backend_cpu::DeterministicRng;
 use grim_core::error::{Error, Result};
 use grim_core::model::{AdapterHandle, CausalLm, ModelConfig};
 use grim_core::session::{DeterminismMode, SessionT};
-use grim_memory::{KvBlockPool, BLOCK_SIZE};
+use grim_memory::{BLOCK_SIZE, KvBlockPool};
 use grim_speculative::{ConfidenceHead, DraftBackbone, MarkovHead, SpeculativeCausalLm, Strategy};
 
 type DynModelPtr = Box<SpeculativeCausalLm>;
@@ -544,11 +544,24 @@ impl Engine {
         let mut decode_count = 0usize;
 
         // Process decode steps grouped by adapter sub-batch (§4.5 multi-LoRA serving)
+        let mut processed_decode = std::collections::HashSet::new();
         for (_adapter_id, seq_ids) in &output.adapter_batches {
             for &id in seq_ids {
                 if !output.decode_ids.contains(&id) || self.scheduler.is_paused(id) {
                     continue;
                 }
+                processed_decode.insert(id);
+                decode_count += 1;
+                let dec_start = Instant::now();
+                let outcome = self.drive_decode_with_outcome(id)?;
+                decode_elapsed += dec_start.elapsed();
+                if let Some(ref o) = outcome {
+                    total_accepted += o.accepted_tokens;
+                }
+            }
+        }
+        for &id in &output.decode_ids {
+            if !processed_decode.contains(&id) && !self.scheduler.is_paused(id) {
                 decode_count += 1;
                 let dec_start = Instant::now();
                 let outcome = self.drive_decode_with_outcome(id)?;
@@ -634,7 +647,9 @@ impl Engine {
                     let pool_guard = self.block_pool.lock().unwrap();
                     let block_ids: Vec<usize> = (0..pool_guard.num_blocks()).collect();
                     if let Err(e) = router.transfer_kv_cache_real(id, &block_ids, &pool_guard) {
-                        eprintln!("[grim-engine] Disagg prefill KV transfer failed for req {id}: {e}");
+                        eprintln!(
+                            "[grim-engine] Disagg prefill KV transfer failed for req {id}: {e}"
+                        );
                     }
                 }
             }
@@ -788,11 +803,19 @@ impl Engine {
     /// Allocate a session with a paged KV cache wired in and prefix caching active (§5.1).
     pub fn enqueue_request_with_kv(&mut self, request: grim_scheduler::Request) -> Result<()> {
         // Honor the model's actual device instead of silently forcing CPU.
-        let device = self
-            .models
-            .get(request.model_id.as_deref().unwrap_or(""))
-            .map(|m| m.device.clone())
-            .unwrap_or(grim_tensor::Device::Cpu);
+        let device = match request.model_id.as_deref() {
+            Some(id) if !id.is_empty() => self
+                .models
+                .get(id)
+                .map(|m| m.device.clone())
+                .unwrap_or(grim_tensor::Device::Cpu),
+            _ => self
+                .models
+                .values()
+                .next()
+                .map(|m| m.device.clone())
+                .unwrap_or(grim_tensor::Device::Cpu),
+        };
         let kv = grim_memory::PagedKvCache::new(
             self.block_pool.clone(),
             self.config.num_kv_heads,

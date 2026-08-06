@@ -5,9 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use grim_tensor::backend::{GpuCapability, ScytheLink};
-use grim_tensor::error::Result;
 
-use crate::device::probe::{probe_host_gpu, probe_xnack};
+use crate::device::probe::probe_host_gpu;
 use crate::peer_access::{P2PStatus, enumerate_devices, peer_status};
 
 // ── HIP attributes needed for VRAM free / throttle ──────────────────────────

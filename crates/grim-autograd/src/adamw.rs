@@ -7,7 +7,6 @@
 
 use crate::param::{ParamId, TrainableParams};
 use grim_format::train::{TrainFpFormat, TrainState};
-use grim_tensor::Shape;
 use grim_tensor::{
     DType, Tensor,
     error::{Error, Result},
@@ -1316,7 +1315,7 @@ impl Adafactor {
 
         let beta2 = self.config.beta2;
         let lr = self.config.lr;
-        let weight_decay = self.config.weight_decay;
+        let _weight_decay = self.config.weight_decay;
 
         for (id, param) in params.iter_mut() {
             if param.is_frozen() {
@@ -1333,7 +1332,7 @@ impl Adafactor {
 
             let rows = dims[dims.len() - 2];
             let cols = dims[dims.len() - 1];
-            let elem_count = rows * cols;
+            let _elem_count = rows * cols;
 
             if !self.b.contains_key(id) {
                 self.b.insert(*id, vec![1.0f32; rows]);
@@ -1780,8 +1779,8 @@ impl QGaLoreAdamW8Bit {
 
                 let m_q = self.m_state.get_mut(id).unwrap();
                 let v_q = self.v_state.get_mut(id).unwrap();
-                let m_sc = self.m_scale.get_mut(id);
-                let v_sc = self.v_scale.get_mut(id);
+                let _m_sc = self.m_scale.get_mut(id);
+                let _v_sc = self.v_scale.get_mut(id);
 
                 let mut m_f32 = vec![0.0f32; elem_count];
                 let mut v_f32 = vec![0.0f32; elem_count];

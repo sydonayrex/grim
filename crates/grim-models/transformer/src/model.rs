@@ -7,12 +7,10 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
-use grim_nn::{
-    ColumnParallelLinear, Embedding, Linear, RowParallelLinear, TensorParallelConfig,
-};
 use grim_nn::RmsNorm;
 use grim_nn::Rope;
 use grim_nn::pick_device_for_storage_device;
+use grim_nn::{ColumnParallelLinear, Embedding, Linear, RowParallelLinear, TensorParallelConfig};
 use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
 use crate::block::{LlamaBlock, LlamaConfigRefs};
@@ -96,7 +94,12 @@ impl Llama {
             Ok(o) => o,
             Err(_) => {
                 let ws_unsharded = ws.with_tp_config(TensorParallelConfig::default());
-                Linear::load(&ws_unsharded.pp("output"), cfg.hidden_size, cfg.vocab_size, false)?
+                Linear::load(
+                    &ws_unsharded.pp("output"),
+                    cfg.hidden_size,
+                    cfg.vocab_size,
+                    false,
+                )?
             }
         };
         Ok(Self {
@@ -161,14 +164,8 @@ impl Llama {
                     linear(cfg.intermediate_size, cfg.hidden_size),
                     tp,
                 ),
-                w_up: ColumnParallelLinear::new(
-                    linear(cfg.intermediate_size, cfg.hidden_size),
-                    tp,
-                ),
-                w_down: RowParallelLinear::new(
-                    linear(cfg.hidden_size, cfg.intermediate_size),
-                    tp,
-                ),
+                w_up: ColumnParallelLinear::new(linear(cfg.intermediate_size, cfg.hidden_size), tp),
+                w_down: RowParallelLinear::new(linear(cfg.hidden_size, cfg.intermediate_size), tp),
                 rope: Rope::new(cfg.head_dim, cfg.rope_theta),
                 tp_config: tp,
                 _dev: Device::Cpu,
@@ -209,10 +206,19 @@ impl Llama {
         hidden: &Tensor,
         positions: &[u32],
     ) -> Result<(Tensor, Tensor, Vec<(Tensor, Tensor)>)> {
+        self.decode_paged(hidden, positions, None)
+    }
+
+    pub fn decode_paged(
+        &self,
+        hidden: &Tensor,
+        positions: &[u32],
+        session: Option<&dyn SessionT>,
+    ) -> Result<(Tensor, Tensor, Vec<(Tensor, Tensor)>)> {
         let mut h = hidden.clone();
         let mut kv_pairs = Vec::new();
         for layer in &self.layers {
-            let (out, k, v) = layer.forward_with_kv(&h, positions)?;
+            let (out, k, v) = layer.forward_with_kv_paged(&h, positions, session)?;
             kv_pairs.push((k, v));
             h = out;
         }
@@ -288,7 +294,8 @@ impl CausalLm for Llama {
         } else {
             (0..seq_len).map(|i| i as u32).collect()
         };
-        let (logits, hidden_state, kv_pairs) = self.decode(&hidden_t, &pos_vec)?;
+        let (logits, hidden_state, kv_pairs) =
+            self.decode_paged(&hidden_t, &pos_vec, Some(session))?;
         // MAJ-1: populate the KV cache with K/V from each layer so the
         // cache infrastructure is no longer dead code.
         for (k, v) in &kv_pairs {

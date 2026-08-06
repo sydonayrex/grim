@@ -6,7 +6,7 @@ use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
-use grim_nn::{add_tensors, Embedding, Linear, RmsNorm};
+use grim_nn::{Embedding, Linear, RmsNorm, add_tensors};
 use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 use std::sync::Arc;
 
@@ -164,85 +164,93 @@ impl Lfm2Block {
         let ffn_norm = RmsNorm::load(&ws.pp("ffn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
         let is_moe = layer_idx >= cfg.n_layer_dense_lead;
 
-        let (ffn_gate, ffn_up, ffn_down, ffn_gate_inp, ffn_gate_exps, ffn_up_exps, ffn_down_exps, ffn_exp_probs_b) =
-            if is_moe {
-                let ffn_gate_inp = Some(Linear::load(
-                    &ws.pp("ffn_gate_inp"),
-                    cfg.hidden_size,
-                    cfg.n_expert,
-                    false,
-                )?);
-                let ffn_gate_exps = Some(ws.get(
-                    [cfg.n_expert, cfg.n_ff_exp, cfg.hidden_size],
-                    "ffn_gate_exps.weight",
-                )?);
-                let ffn_up_exps = Some(ws.get(
-                    [cfg.n_expert, cfg.n_ff_exp, cfg.hidden_size],
-                    "ffn_up_exps.weight",
-                )?);
-                let ffn_down_exps = Some(ws.get(
-                    [cfg.n_ff_exp, cfg.hidden_size, cfg.n_expert],
-                    "ffn_down_exps.weight",
-                )?);
-                let ffn_exp_probs_b_val = ws.get([cfg.n_expert], "ffn_exp_probs_b.bias")?;
-                let ffn_gate = Linear::load(
-                    &ws.pp("ffn_gate"),
-                    cfg.hidden_size,
-                    cfg.intermediate_size,
-                    false,
-                )?;
-                let ffn_up = Linear::load(
-                    &ws.pp("ffn_up"),
-                    cfg.hidden_size,
-                    cfg.intermediate_size,
-                    false,
-                )?;
-                let ffn_down = Linear::load(
-                    &ws.pp("ffn_down"),
-                    cfg.intermediate_size,
-                    cfg.hidden_size,
-                    false,
-                )?;
-                (
-                    ffn_gate,
-                    ffn_up,
-                    ffn_down,
-                    ffn_gate_inp,
-                    ffn_gate_exps,
-                    ffn_up_exps,
-                    ffn_down_exps,
-                    Some(ffn_exp_probs_b_val),
-                )
-            } else {
-                let ffn_gate = Linear::load(
-                    &ws.pp("ffn_gate"),
-                    cfg.hidden_size,
-                    cfg.intermediate_size,
-                    false,
-                )?;
-                let ffn_up = Linear::load(
-                    &ws.pp("ffn_up"),
-                    cfg.hidden_size,
-                    cfg.intermediate_size,
-                    false,
-                )?;
-                let ffn_down = Linear::load(
-                    &ws.pp("ffn_down"),
-                    cfg.intermediate_size,
-                    cfg.hidden_size,
-                    false,
-                )?;
-                (
-                    ffn_gate,
-                    ffn_up,
-                    ffn_down,
-                    Option::<Linear>::None,
-                    Option::<Tensor>::None,
-                    Option::<Tensor>::None,
-                    Option::<Tensor>::None,
-                    Option::<Tensor>::None,
-                )
-            };
+        let (
+            ffn_gate,
+            ffn_up,
+            ffn_down,
+            ffn_gate_inp,
+            ffn_gate_exps,
+            ffn_up_exps,
+            ffn_down_exps,
+            ffn_exp_probs_b,
+        ) = if is_moe {
+            let ffn_gate_inp = Some(Linear::load(
+                &ws.pp("ffn_gate_inp"),
+                cfg.hidden_size,
+                cfg.n_expert,
+                false,
+            )?);
+            let ffn_gate_exps = Some(ws.get(
+                [cfg.n_expert, cfg.n_ff_exp, cfg.hidden_size],
+                "ffn_gate_exps.weight",
+            )?);
+            let ffn_up_exps = Some(ws.get(
+                [cfg.n_expert, cfg.n_ff_exp, cfg.hidden_size],
+                "ffn_up_exps.weight",
+            )?);
+            let ffn_down_exps = Some(ws.get(
+                [cfg.n_ff_exp, cfg.hidden_size, cfg.n_expert],
+                "ffn_down_exps.weight",
+            )?);
+            let ffn_exp_probs_b_val = ws.get([cfg.n_expert], "ffn_exp_probs_b.bias")?;
+            let ffn_gate = Linear::load(
+                &ws.pp("ffn_gate"),
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                false,
+            )?;
+            let ffn_up = Linear::load(
+                &ws.pp("ffn_up"),
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                false,
+            )?;
+            let ffn_down = Linear::load(
+                &ws.pp("ffn_down"),
+                cfg.intermediate_size,
+                cfg.hidden_size,
+                false,
+            )?;
+            (
+                ffn_gate,
+                ffn_up,
+                ffn_down,
+                ffn_gate_inp,
+                ffn_gate_exps,
+                ffn_up_exps,
+                ffn_down_exps,
+                Some(ffn_exp_probs_b_val),
+            )
+        } else {
+            let ffn_gate = Linear::load(
+                &ws.pp("ffn_gate"),
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                false,
+            )?;
+            let ffn_up = Linear::load(
+                &ws.pp("ffn_up"),
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                false,
+            )?;
+            let ffn_down = Linear::load(
+                &ws.pp("ffn_down"),
+                cfg.intermediate_size,
+                cfg.hidden_size,
+                false,
+            )?;
+            (
+                ffn_gate,
+                ffn_up,
+                ffn_down,
+                Option::<Linear>::None,
+                Option::<Tensor>::None,
+                Option::<Tensor>::None,
+                Option::<Tensor>::None,
+                Option::<Tensor>::None,
+            )
+        };
 
         Ok(Self {
             attn_norm,
@@ -329,7 +337,10 @@ impl Lfm2Block {
             }
 
             let y_tensor = device_tensor(y_out, Shape::new(vec![steps, h_dim]), norm_x.device())?;
-            self.shortconv_out_proj.as_ref().unwrap().forward(&y_tensor)?
+            self.shortconv_out_proj
+                .as_ref()
+                .unwrap()
+                .forward(&y_tensor)?
         } else if self.is_moe {
             self.forward_moe_ffn(&norm_x)?
         } else {
@@ -628,12 +639,7 @@ impl Lfm2 {
         let device = tok_embeddings.weight.device().clone();
 
         let (dense_2_out, dense_2_out_bias) = if cfg.n_embd_out > 0 {
-            let out = Linear::load(
-                &ws.pp("dense_2_out"),
-                cfg.hidden_size,
-                cfg.n_embd_out,
-                true,
-            )?;
+            let out = Linear::load(&ws.pp("dense_2_out"), cfg.hidden_size, cfg.n_embd_out, true)?;
             let bias = ws.get([cfg.n_embd_out], "dense_2_out.bias").ok();
             (Some(out), bias)
         } else {

@@ -30,9 +30,7 @@ impl Progress {
                 .take(filled)
                 .chain(std::iter::repeat('-').take(width - filled))
                 .collect();
-            eprint!(
-                "\r[{stage}] [{bar}] {pct:3}% ({done}/{total})"
-            );
+            eprint!("\r[{stage}] [{bar}] {pct:3}% ({done}/{total})");
             let _ = std::io::stderr().flush();
         } else {
             // Non-TTY: emit one line per integer percent point.

@@ -4,7 +4,9 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 
 use grim_tensor::backend::ComputeHandle;
-use grim_tensor::dtype::{ArithType, DType, KQuantScheme, QuantProvenance, Storage as DTypeStorage};
+use grim_tensor::dtype::{
+    ArithType, DType, KQuantScheme, QuantProvenance, Storage as DTypeStorage,
+};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendDevice, BackendStorage, ScythePlacement, Shape};
 
@@ -536,9 +538,8 @@ impl VulkanContext {
         }
 
         let mut gpus = vec![std::ptr::null_mut(); gpu_count as usize];
-        let res = unsafe {
-            vkEnumeratePhysicalDevices(instance, &mut gpu_count, gpus.as_mut_ptr())
-        };
+        let res =
+            unsafe { vkEnumeratePhysicalDevices(instance, &mut gpu_count, gpus.as_mut_ptr()) };
         if res != VK_SUCCESS || gpus.is_empty() || gpus[0].is_null() {
             unsafe {
                 vkDestroyInstance(instance, std::ptr::null());
@@ -669,7 +670,9 @@ impl VulkanContext {
                 vkDestroyDevice(device, std::ptr::null());
                 vkDestroyInstance(instance, std::ptr::null());
             }
-            return Err(Error::Backend("vkGetDeviceQueue returned null queue pointer".into()));
+            return Err(Error::Backend(
+                "vkGetDeviceQueue returned null queue pointer".into(),
+            ));
         }
 
         Ok(Self {
@@ -1381,6 +1384,42 @@ fn push_params_backward(
 impl Default for VulkanDevice {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Extract raw bytes from a VulkanStorage buffer via vkMapMemory.
+fn extract_raw_bytes(storage: &dyn BackendStorage) -> Result<Vec<u8>> {
+    if let Some(b_vk) = storage.as_any().downcast_ref::<VulkanStorage>() {
+        let mut mapped: *mut c_void = std::ptr::null_mut();
+        let res = unsafe {
+            vkMapMemory(
+                b_vk.device,
+                b_vk.memory,
+                0,
+                b_vk.bytes as VkDeviceSize,
+                0,
+                &mut mapped,
+            )
+        };
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!(
+                "extract_raw_bytes: vkMapMemory failed ({})",
+                res
+            )));
+        }
+        let bytes = unsafe {
+            let slice = std::slice::from_raw_parts(mapped as *const u8, b_vk.bytes);
+            let v = slice.to_vec();
+            vkUnmapMemory(b_vk.device, b_vk.memory);
+            v
+        };
+        Ok(bytes)
+    } else {
+        Err(Error::Backend(
+            "extract_raw_bytes: storage is not VulkanStorage; \
+             cannot extract raw bytes safely"
+                .into(),
+        ))
     }
 }
 
@@ -2583,46 +2622,80 @@ impl BackendDevice for VulkanDevice {
         let k = a_dims[1];
         let n = out_dims[1];
 
-        // Try GPU fused dequant dispatch if both inputs are VulkanStorage
+        // Try GPU fused dequant dispatch if both inputs are VulkanStorage.
+        // Kernel selection is based on the weight tensor's actual dtype — NOT on
+        // k % 256, which is only a coincidental sizing constraint and does not
+        // identify the quantization format. Routing by size instead of dtype
+        // causes GroupInt / ResidualPacked / Q4K weights with k divisible by 256
+        // to silently hit the wrong shader.
         if let (Some(a_s), Some(b_s)) = (
             a.as_any().downcast_ref::<VulkanStorage>(),
             b_packed.as_any().downcast_ref::<VulkanStorage>(),
         ) {
-            let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-            if let Some(ctx) = ctx_guard.as_ref() {
-                if let Ok(out_storage) =
-                    VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)
-                {
-                    let kernel = if k % 256 == 0 {
-                        VulkanKernel::FusedDequantGemmQ4K
-                    } else {
-                        VulkanKernel::FusedDequantGemmQ80
-                    };
-                    let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
-                    let grid_x = ((n + 15) / 16) as u32;
-                    let grid_y = ((m + 15) / 16) as u32;
-                    let push = push_params(0, 0, k as u32, n as u32, m as u32, 0.0);
-
-                    match run_compute_shader_kernel(
-                        ctx,
-                        kernel,
-                        &buffers,
-                        grid_x,
-                        grid_y,
-                        1,
-                        Some(&push),
+            use grim_tensor::dtype::{FloatPackScheme, KQuantScheme, Storage};
+            // Map the weight dtype to the kernel that knows its block layout.
+            // Formats not handled by any Vulkan fused kernel skip GPU dispatch
+            // and fall through to the CPU path below.
+            let b_weight_dtype = b_packed.dtype();
+            let maybe_kernel = match &b_weight_dtype.storage {
+                Storage::KQuant(KQuantScheme::Q4K) => Some(VulkanKernel::FusedDequantGemmQ4K),
+                Storage::KQuant(KQuantScheme::Q5K) => Some(VulkanKernel::FusedDequantGemmQ5K),
+                Storage::KQuant(KQuantScheme::Q6K) => Some(VulkanKernel::FusedDequantGemmQ6K),
+                Storage::KQuant(KQuantScheme::Q80) => Some(VulkanKernel::FusedDequantGemmQ80),
+                Storage::KQuant(KQuantScheme::IQ4NL) => Some(VulkanKernel::FusedDequantGemmIQ4NL),
+                Storage::KQuant(KQuantScheme::IQ4XS) => Some(VulkanKernel::FusedDequantGemmIQ4XS),
+                Storage::KQuant(KQuantScheme::IQ3XXS) => Some(VulkanKernel::FusedDequantGemmIQ3XXS),
+                Storage::KQuant(KQuantScheme::IQ3S) => Some(VulkanKernel::FusedDequantGemmIQ3S),
+                Storage::KQuant(KQuantScheme::IQ2XXS) => Some(VulkanKernel::FusedDequantGemmIQ2XXS),
+                Storage::KQuant(KQuantScheme::IQ2XS) => Some(VulkanKernel::FusedDequantGemmIQ2XS),
+                Storage::KQuant(KQuantScheme::IQ2S) => Some(VulkanKernel::FusedDequantGemmIQ2S),
+                Storage::FloatPack(FloatPackScheme::Fp8) => {
+                    Some(VulkanKernel::FusedDequantGemmFp8E4M3)
+                }
+                Storage::FloatPack(FloatPackScheme::MxFp4) => {
+                    Some(VulkanKernel::FusedDequantGemmMxFp4)
+                }
+                other => {
+                    tracing::warn!(
+                        "Vulkan quantized_matmul: no GPU kernel for dtype storage {:?}; \
+                         falling back to CPU",
+                        other
+                    );
+                    None
+                }
+            };
+            if let Some(kernel) = maybe_kernel {
+                let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+                if let Some(ctx) = ctx_guard.as_ref() {
+                    if let Ok(out_storage) = VulkanStorage::alloc_gpu(
+                        out_shape,
+                        DType::F32,
+                        ctx.device,
+                        ctx.physical_device,
                     ) {
-                        Ok(()) => {
-                            return Ok((
-                                Box::new(out_storage),
-                                Box::new(VulkanHandle),
-                            ));
+                        let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
+                        let grid_x = ((n + 15) / 16) as u32;
+                        let grid_y = ((m + 15) / 16) as u32;
+                        let push = push_params(0, 0, k as u32, n as u32, m as u32, 0.0);
+
+                        match run_compute_shader_kernel(
+                            ctx,
+                            kernel,
+                            &buffers,
+                            grid_x,
+                            grid_y,
+                            1,
+                            Some(&push),
+                        ) {
+                            Ok(()) => {
+                                return Ok((Box::new(out_storage), Box::new(VulkanHandle)));
+                            }
+                            // Surface the real Vulkan error instead of silently dropping it;
+                            // binding-count mismatches become Err here (P0-1 guard).
+                            Err(e) => tracing::warn!(
+                                "Vulkan quantized_matmul GPU dispatch failed ({e:?}); falling back to CPU"
+                            ),
                         }
-                        // Surface the real Vulkan error instead of silently dropping it;
-                        // binding-count mismatches become Err here (P0-1 guard).
-                        Err(e) => tracing::warn!(
-                            "Vulkan quantized_matmul GPU dispatch failed ({e:?}); falling back to CPU"
-                        ),
                     }
                 }
             }
@@ -2633,34 +2706,98 @@ impl BackendDevice for VulkanDevice {
         let mut b_dequant = vec![0.0f32; k * n];
         let blocks_per_col = k / 32;
 
-        let b_bytes = b_packed
-            .to_cpu_vec_f32()
-            .ok()
-            .map(|v| v.iter().map(|&f| f as u8).collect())
-            .unwrap_or_else(|| vec![0u8; k * n]);
+        // Safety contract for the CPU fallback dequant loop below:
+        // the loop decodes bytes as Q8_0 (signed int8, block size 32, scale from b_scales).
+        // Calling to_cpu_vec_f32() on a packed quantized buffer reinterprets the raw
+        // packed bytes as f32 — dtype-blind — then truncates back to u8, producing
+        // numerically garbage nibbles for any format that isn't Q8_0.
+        // Guard here and extract the raw bytes directly via vkMapMemory instead.
+        use grim_tensor::dtype::{BlockDtype, FloatPackScheme, KQuantScheme, Storage};
+        let b_weight_dtype = b_packed.dtype();
 
-        for col in 0..n {
-            for block in 0..blocks_per_col {
-                let scale_idx = col * blocks_per_col + block;
-                let scale = if scale_idx < b_scales.len() {
-                    b_scales[scale_idx]
-                } else {
-                    1.0f32
-                };
-                for i in 0..32 {
-                    let byte_offset = (col * blocks_per_col + block) * 32 + i;
-                    let byte_val = if byte_offset < b_bytes.len() {
-                        b_bytes[byte_offset]
+        // Use grim_quant's dequant functions for formats that have them;
+        // Q8_0 falls through to the legacy inline Q8_0 decoder below.
+        let grim_dequant: Option<Vec<f32>> = match &b_weight_dtype.storage {
+            Storage::KQuant(scheme) => {
+                let b_bytes_cpu: Vec<u8> = extract_raw_bytes(b_packed)?;
+                Some(match scheme {
+                    KQuantScheme::Q4K => grim_quant::dequant_q4k(&b_bytes_cpu, k * n)?,
+                    KQuantScheme::Q5K => grim_quant::dequant_q5k(&b_bytes_cpu, k * n)?,
+                    KQuantScheme::Q6K => grim_quant::dequant_q6k(&b_bytes_cpu, k * n)?,
+                    KQuantScheme::Q80 => grim_quant::dequant_q80(&b_bytes_cpu, k * n)?,
+                    KQuantScheme::Q2K => grim_quant::dequant_q2k(&b_bytes_cpu, k * n)?,
+                    KQuantScheme::Q3K => grim_quant::dequant_q3k(&b_bytes_cpu, k * n)?,
+                    KQuantScheme::IQ4NL => grim_quant::dequant_iq4nl(&b_bytes_cpu, k * n)?,
+                    KQuantScheme::IQ4XS => grim_quant::dequant_iq4xs(&b_bytes_cpu, k * n)?,
+                    KQuantScheme::IQ3XXS => grim_quant::dequant_iq3xxs(&b_bytes_cpu, k * n)?,
+                    KQuantScheme::IQ3S => grim_quant::dequant_iq3s(&b_bytes_cpu, k * n)?,
+                    KQuantScheme::IQ2XXS => grim_quant::dequant_iq2xxs(&b_bytes_cpu, k * n)?,
+                    KQuantScheme::IQ2XS => grim_quant::dequant_iq2xs(&b_bytes_cpu, k * n)?,
+                    KQuantScheme::IQ2S => grim_quant::dequant_iq2s(&b_bytes_cpu, k * n)?,
+                })
+            }
+            Storage::FloatPack(scheme) => {
+                let b_bytes_cpu: Vec<u8> = extract_raw_bytes(b_packed)?;
+                Some(match scheme {
+                    FloatPackScheme::Fp4 => grim_quant::dequant_fp4(&b_bytes_cpu, k * n)?,
+                    FloatPackScheme::Nf4 => grim_quant::dequant_nf4(&b_bytes_cpu, k * n)?,
+                    FloatPackScheme::Fp8 => grim_quant::dequant_fp8(&b_bytes_cpu, k * n)?,
+                    FloatPackScheme::MxFp4 => grim_quant::dequant_mxfp4(&b_bytes_cpu, k * n)?,
+                    FloatPackScheme::MxFp8 => grim_quant::dequant_mxfp8(&b_bytes_cpu, k * n)?,
+                })
+            }
+            Storage::Block(dtype) => {
+                let b_bytes_cpu: Vec<u8> = extract_raw_bytes(b_packed)?;
+                Some(match dtype {
+                    BlockDtype::Fp4 => grim_quant::dequant_fp4_block16(&b_bytes_cpu, k * n)?,
+                    BlockDtype::Nf4 => {
+                        // NF4 block-16 shares the fp4 dequant path in grim_quant.
+                        grim_quant::dequant_fp4_block16(&b_bytes_cpu, k * n)?
+                    }
+                    BlockDtype::Fp8 => grim_quant::dequant_fp8_block16(&b_bytes_cpu, k * n)?,
+                    BlockDtype::Fp4Block16 => grim_quant::dequant_fp4_block16(&b_bytes_cpu, k * n)?,
+                    BlockDtype::Fp8Block16 => grim_quant::dequant_fp8_block16(&b_bytes_cpu, k * n)?,
+                })
+            }
+            _ => None, // GroupInt, ResidualPacked, Native — handled below.
+        };
+
+        if let Some(dequantized) = grim_dequant {
+            // Copy dequantized B into b_dequant.
+            b_dequant.copy_from_slice(&dequantized);
+        } else if matches!(b_weight_dtype.storage, Storage::KQuant(KQuantScheme::Q80)) {
+            // Legacy Q8_0 inline decoder (kept for backward compatibility).
+            // Extract raw bytes from the Vulkan buffer without reinterpreting as f32.
+            let b_bytes = extract_raw_bytes(b_packed)?;
+            for col in 0..n {
+                for block in 0..blocks_per_col {
+                    let scale_idx = col * blocks_per_col + block;
+                    let scale = if scale_idx < b_scales.len() {
+                        b_scales[scale_idx]
                     } else {
-                        128u8
+                        1.0f32
                     };
-                    let q_val = (byte_val as i16 - 128) as f32 / 127.0f32;
-                    let r = block * 32 + i;
-                    if r < k {
-                        b_dequant[r * n + col] = q_val * scale;
+                    for i in 0..32 {
+                        let byte_offset = (col * blocks_per_col + block) * 32 + i;
+                        let byte_val = if byte_offset < b_bytes.len() {
+                            b_bytes[byte_offset]
+                        } else {
+                            128u8
+                        };
+                        let q_val = (byte_val as i16 - 128) as f32 / 127.0f32;
+                        let r = block * 32 + i;
+                        if r < k {
+                            b_dequant[r * n + col] = q_val * scale;
+                        }
                     }
                 }
             }
+        } else {
+            return Err(Error::Backend(format!(
+                "Vulkan quantized_matmul CPU fallback does not support weight dtype {:?}; \
+                 use the GPU path or a CPU backend.",
+                b_weight_dtype.storage
+            )));
         }
 
         let mut c_vec = vec![0.0f32; m * n];
@@ -2713,25 +2850,16 @@ impl BackendDevice for VulkanDevice {
         };
 
         // Allocate dX output [M, K] f32.
-        let dx = VulkanStorage::alloc_gpu(
-            out_shape,
-            DType::F32,
-            ctx_device,
-            ctx_physical_device,
-        )?;
+        let dx = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx_device, ctx_physical_device)?;
 
         // --- Extract residual / outlier metadata from the residuals handle ---
         let outlier_count = residuals.map(|r| r.outlier_count).unwrap_or(0);
         let backup1_bpw = residuals.map(|r| r.backup1_bpw).unwrap_or(0);
-        let backup1_codes_offset =
-            residuals.map(|r| r.backup1_codes_offset).unwrap_or(0);
-        let backup1_scale_offset =
-            residuals.map(|r| r.backup1_scale_offset).unwrap_or(0);
+        let backup1_codes_offset = residuals.map(|r| r.backup1_codes_offset).unwrap_or(0);
+        let backup1_scale_offset = residuals.map(|r| r.backup1_scale_offset).unwrap_or(0);
         let backup2_bpw = residuals.map(|r| r.backup2_bpw).unwrap_or(0);
-        let backup2_codes_offset =
-            residuals.map(|r| r.backup2_codes_offset).unwrap_or(0);
-        let backup2_scale_offset =
-            residuals.map(|r| r.backup2_scale_offset).unwrap_or(0);
+        let backup2_codes_offset = residuals.map(|r| r.backup2_codes_offset).unwrap_or(0);
+        let backup2_scale_offset = residuals.map(|r| r.backup2_scale_offset).unwrap_or(0);
 
         // --- Extract outlier index/value data from the tensor's provenance ---
         // `QuantizedMatmulBackwardResiduals::from_tensor` leaves the raw device
@@ -2803,15 +2931,11 @@ impl BackendDevice for VulkanDevice {
         let outlier_idx_s = outlier_idx_box
             .as_any()
             .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| {
-                Error::Backend("outlier indices storage is not VulkanStorage".into())
-            })?;
+            .ok_or_else(|| Error::Backend("outlier indices storage is not VulkanStorage".into()))?;
         let outlier_val_s = outlier_val_box
             .as_any()
             .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| {
-                Error::Backend("outlier values storage is not VulkanStorage".into())
-            })?;
+            .ok_or_else(|| Error::Backend("outlier values storage is not VulkanStorage".into()))?;
 
         // --- Select shader variant based on the weight's storage format ---
         let (kernel, has_scales) = match b_s.dtype().storage {
@@ -2823,15 +2947,15 @@ impl BackendDevice for VulkanDevice {
             }
             // ResidualPacked, all other KQuant (Q5K, Q6K, IQ*), FloatPack,
             // Block, GroupInt — use the generic unpack_weight path.
-            _ => (VulkanKernel::QuantizedMatmulBackwardDxGeneric, !b_scales.is_empty()),
+            _ => (
+                VulkanKernel::QuantizedMatmulBackwardDxGeneric,
+                !b_scales.is_empty(),
+            ),
         };
 
         // --- Upload per-column f32 scales for the generic shader (binding 5) ---
         let scales_storage_box = if has_scales {
-            let f32_scale_bytes: Vec<u8> = b_scales
-                .iter()
-                .flat_map(|&s| s.to_le_bytes())
-                .collect();
+            let f32_scale_bytes: Vec<u8> = b_scales.iter().flat_map(|&s| s.to_le_bytes()).collect();
             Some(self.from_cpu_bytes(
                 &f32_scale_bytes,
                 &Shape::from_slice(&[b_scales.len() * 4]),
@@ -2979,10 +3103,7 @@ impl BackendDevice for VulkanDevice {
                             let push = push_params(total as u32, 0, 0, 0, 0, 0.0);
                             let mut ok = true;
                             for input in inputs {
-                                let in_s = input
-                                    .as_any()
-                                    .downcast_ref::<VulkanStorage>()
-                                    .unwrap();
+                                let in_s = input.as_any().downcast_ref::<VulkanStorage>().unwrap();
                                 let buffers = [in_s.buffer, out_storage.buffer];
                                 if run_compute_shader(
                                     ctx,
@@ -3089,10 +3210,7 @@ impl BackendDevice for VulkanDevice {
                             let mut col_offset = 0usize;
                             let mut ok = true;
                             for (storage, _placement) in partials {
-                                let s = storage
-                                    .as_any()
-                                    .downcast_ref::<VulkanStorage>()
-                                    .unwrap();
+                                let s = storage.as_any().downcast_ref::<VulkanStorage>().unwrap();
                                 let n_src = s.shape().dims().get(1).copied().unwrap_or(0);
                                 let buffers = [s.buffer, out_storage.buffer];
                                 let grid_x = ((n_src + 15) / 16) as u32;
@@ -3138,8 +3256,7 @@ impl BackendDevice for VulkanDevice {
             let n_cols = storage.shape().dims().get(1).copied().unwrap_or(0);
             for row in 0..m {
                 for col in 0..n_cols {
-                    assembled[row * n_total + col_offset + col] +=
-                        data[row * n_cols + col];
+                    assembled[row * n_total + col_offset + col] += data[row * n_cols + col];
                 }
             }
             col_offset += n_cols;
@@ -3208,7 +3325,18 @@ pub enum VulkanKernel {
     Recip,
     Rope,
     FusedDequantGemmQ4K,
+    FusedDequantGemmQ5K,
+    FusedDequantGemmQ6K,
     FusedDequantGemmQ80,
+    FusedDequantGemmIQ4NL,
+    FusedDequantGemmIQ4XS,
+    FusedDequantGemmIQ3XXS,
+    FusedDequantGemmIQ3S,
+    FusedDequantGemmIQ2XXS,
+    FusedDequantGemmIQ2XS,
+    FusedDequantGemmIQ2S,
+    FusedDequantGemmFp8E4M3,
+    FusedDequantGemmMxFp4,
     KvDequantAttention,
     SelectiveScan,
     QkvAttentionPaged,
@@ -3241,7 +3369,18 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::Recip => SPIRV_RECIP,
         VulkanKernel::Rope => SPIRV_ROPE,
         VulkanKernel::FusedDequantGemmQ4K => SPIRV_FUSED_DEQUANT_GEMM_Q4K,
+        VulkanKernel::FusedDequantGemmQ5K => SPIRV_FUSED_DEQUANT_GEMM_Q5K,
+        VulkanKernel::FusedDequantGemmQ6K => SPIRV_FUSED_DEQUANT_GEMM_Q6K,
         VulkanKernel::FusedDequantGemmQ80 => SPIRV_FUSED_DEQUANT_GEMM_Q8_0,
+        VulkanKernel::FusedDequantGemmIQ4NL => SPIRV_FUSED_DEQUANT_GEMM_IQ4NL,
+        VulkanKernel::FusedDequantGemmIQ4XS => SPIRV_FUSED_DEQUANT_GEMM_IQ4XS,
+        VulkanKernel::FusedDequantGemmIQ3XXS => SPIRV_FUSED_DEQUANT_GEMM_IQ3XXS,
+        VulkanKernel::FusedDequantGemmIQ3S => SPIRV_FUSED_DEQUANT_GEMM_IQ3S,
+        VulkanKernel::FusedDequantGemmIQ2XXS => SPIRV_FUSED_DEQUANT_GEMM_IQ2XXS,
+        VulkanKernel::FusedDequantGemmIQ2XS => SPIRV_FUSED_DEQUANT_GEMM_IQ2XS,
+        VulkanKernel::FusedDequantGemmIQ2S => SPIRV_FUSED_DEQUANT_GEMM_IQ2S,
+        VulkanKernel::FusedDequantGemmFp8E4M3 => SPIRV_FUSED_DEQUANT_GEMM_FP8_E4M3,
+        VulkanKernel::FusedDequantGemmMxFp4 => SPIRV_FUSED_DEQUANT_GEMM_MXFP4,
         VulkanKernel::KvDequantAttention => SPIRV_KV_DEQUANT_ATTENTION,
         VulkanKernel::SelectiveScan => SPIRV_SELECTIVE_SCAN,
         VulkanKernel::QkvAttentionPaged => SPIRV_QKV_ATTENTION_PAGED,
@@ -3279,11 +3418,20 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::Matmul64Bf16
         | VulkanKernel::Rope
         | VulkanKernel::FusedDequantGemmQ4K
+        | VulkanKernel::FusedDequantGemmQ5K
+        | VulkanKernel::FusedDequantGemmQ6K
         | VulkanKernel::FusedDequantGemmQ80
+        | VulkanKernel::FusedDequantGemmIQ4NL
+        | VulkanKernel::FusedDequantGemmIQ4XS
+        | VulkanKernel::FusedDequantGemmIQ3XXS
+        | VulkanKernel::FusedDequantGemmIQ3S
+        | VulkanKernel::FusedDequantGemmIQ2XXS
+        | VulkanKernel::FusedDequantGemmIQ2XS
+        | VulkanKernel::FusedDequantGemmIQ2S
+        | VulkanKernel::FusedDequantGemmFp8E4M3
+        | VulkanKernel::FusedDequantGemmMxFp4
         | VulkanKernel::SiluMulBackward => 3,
-        VulkanKernel::QkvAttention
-        | VulkanKernel::FlashAttention
-        | VulkanKernel::RwkvTimeMix => 4,
+        VulkanKernel::QkvAttention | VulkanKernel::FlashAttention | VulkanKernel::RwkvTimeMix => 4,
         VulkanKernel::QkvAttentionPaged
         | VulkanKernel::TreeAttention
         | VulkanKernel::QuantizedMatmulBackwardDx
@@ -3325,7 +3473,15 @@ fn run_compute_shader_kernel(
         )));
     }
     let spirv_code = spirv_for(kernel);
-    run_compute_shader(ctx, spirv_code, buffers, grid_x, grid_y, grid_z, push_constants)
+    run_compute_shader(
+        ctx,
+        spirv_code,
+        buffers,
+        grid_x,
+        grid_y,
+        grid_z,
+        push_constants,
+    )
 }
 
 /// Helper function to retrieve the size in bytes of a data type.

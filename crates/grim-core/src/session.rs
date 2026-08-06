@@ -28,6 +28,14 @@ pub trait SessionT: Send {
     fn kv_mut(&mut self) -> Option<&mut (dyn KvCache + 'static)> {
         None
     }
+    /// Return the assigned block table for paged attention execution, if active.
+    fn block_table(&self) -> Option<&[u32]> {
+        None
+    }
+    /// Return the global Paged KV Cache handles (k_pages, v_pages, page_size) if active.
+    fn paged_kv_handles(&self) -> Option<(&Tensor, &Tensor, usize)> {
+        None
+    }
     fn rollback_kv_to(&mut self, len: usize);
     // Graph capture / replay hooks for §4.1 ROCm execution optimization
     fn get_hip_graph_handle(&self) -> Option<u64> {

@@ -234,7 +234,11 @@ fn sample_next_token(
         .and_then(|h| h.get(&request_id).cloned())
         .unwrap_or_default();
     let outcome = engine.last_outcome(request_id);
-    eprintln!("[sample_next_token] req {request_id} step {step} outcome is_some: {}, models: {:?}", outcome.is_some(), engine.loaded_models());
+    eprintln!(
+        "[sample_next_token] req {request_id} step {step} outcome is_some: {}, models: {:?}",
+        outcome.is_some(),
+        engine.loaded_models()
+    );
     let logits = outcome.and_then(|o| o.logits.as_ref().cloned());
     // P0-3.2: Clamp sampled tokens to `[0, vocab_size)` and use a safe fallback
     // instead of `step as u32`. The engine's logits table is 65536 entries wide,
@@ -496,7 +500,9 @@ async fn chat_completions(
     let is_remote_provider = requested_model.contains(':') || requested_model.starts_with("hf/");
     if is_remote_provider {
         let provider_key = requested_model.split(':').next().unwrap_or("default");
-        let token = grim_core::client::load_login_token(provider_key).ok().flatten();
+        let token = grim_core::client::load_login_token(provider_key)
+            .ok()
+            .flatten();
         eprintln!(
             "[grim-server] Routing request for model '{}' to remote provider '{}' (token present: {})",
             requested_model,
@@ -850,14 +856,11 @@ async fn chat_completions(
     };
     let prompt_tokens: Vec<u32> = {
         let tok = state.tokenizer.lock().unwrap();
-        let tokens = tok.as_ref()
+        let tokens = tok
+            .as_ref()
             .map(|t| t.encode(&prompt_text))
             .unwrap_or_default();
-        if tokens.is_empty() {
-            vec![1]
-        } else {
-            tokens
-        }
+        if tokens.is_empty() { vec![1] } else { tokens }
     };
 
     // P0-3.2: Vocab size for clamping sampled tokens into the model's actual
@@ -2260,7 +2263,10 @@ async fn grim_generate(
                                         "response": remaining_text,
                                         "done": false
                                     });
-                                    let chunk_str = format!("{}\n", serde_json::to_string(&partial_chunk).unwrap());
+                                    let chunk_str = format!(
+                                        "{}\n",
+                                        serde_json::to_string(&partial_chunk).unwrap()
+                                    );
                                     return Some((
                                         Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)),
                                         (body_stream, buffer, false),
@@ -2822,7 +2828,10 @@ mod tests {
     #[cfg(feature = "wasm-sandbox")]
     #[tokio::test]
     async fn test_server_wasm_plugin_sampler_routed_chat_request() {
-        use grim_plugin::{PluginLimits, PluginManifest, PluginCapabilities, PluginKind, PluginGrants, PluginReload, WasmPluginLoader};
+        use grim_plugin::{
+            PluginCapabilities, PluginGrants, PluginKind, PluginLimits, PluginManifest,
+            PluginReload, WasmPluginLoader,
+        };
 
         let wat_src = r#"
             (module
@@ -2838,7 +2847,9 @@ mod tests {
             max_memory_mb: Some(16),
         };
         let loader = WasmPluginLoader::new("wasm-wat-sampler", limits);
-        let sampler = loader.create_sampler(&wasm_bytes).expect("create WASM sampler");
+        let sampler = loader
+            .create_sampler(&wasm_bytes)
+            .expect("create WASM sampler");
 
         let mut registry = grim_plugin::PluginRegistry::new();
         registry.register_sampler("wasm-wat-sampler".to_string(), sampler);
@@ -2870,7 +2881,7 @@ mod tests {
                 intermediate_size: 1024,
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
-max_seq_len: 2048,
+                max_seq_len: 2048,
             },
         ));
         engine.register_model("default", mock_model);

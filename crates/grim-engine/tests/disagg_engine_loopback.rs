@@ -135,11 +135,12 @@ fn test_disagg_prefill_to_decode_loopback() {
         prefill_addr: prefill_addr.clone(),
         decode_addr: decode_addr.clone(),
     };
-    let decode_router = Arc::new(
-        DisaggRouter::new(&prefill_addr, &decode_addr, PoolRole::Decode),
-    );
-    let decode_engine_config =
-        make_config(2, 16, 8, Some(decode_router), Some(decode_config));
+    let decode_router = Arc::new(DisaggRouter::new(
+        &prefill_addr,
+        &decode_addr,
+        PoolRole::Decode,
+    ));
+    let decode_engine_config = make_config(2, 16, 8, Some(decode_router), Some(decode_config));
     let mut decode_engine = Engine::new(decode_engine_config);
     decode_engine.register_model("small", small_llama());
 
@@ -157,8 +158,7 @@ fn test_disagg_prefill_to_decode_loopback() {
         DisaggRouter::new(&prefill_addr, &decode_addr, PoolRole::Prefill)
             .with_pool(decode_engine.block_pool.clone()),
     );
-    let prefill_engine_config =
-        make_config(2, 16, 8, Some(prefill_router), Some(prefill_config));
+    let prefill_engine_config = make_config(2, 16, 8, Some(prefill_router), Some(prefill_config));
     let mut prefill_engine = Engine::new(prefill_engine_config);
     prefill_engine.register_model("small", small_llama());
 
@@ -224,7 +224,10 @@ fn test_block_received_bitset_semantics() {
 
     // Fresh pool: no blocks received.
     for i in 0..pool.num_blocks() {
-        assert!(!pool.block_is_received(i), "block {i} should not be received initially");
+        assert!(
+            !pool.block_is_received(i),
+            "block {i} should not be received initially"
+        );
     }
 
     // Allocate a block and write all-zero data — the edge case that
@@ -235,7 +238,10 @@ fn test_block_received_bitset_semantics() {
     pool.write_keys(id, &k, BLOCK_SIZE);
 
     // All-zero data should still be marked received.
-    assert!(pool.block_is_received(id), "block must be marked received even with all-zero KV data");
+    assert!(
+        pool.block_is_received(id),
+        "block must be marked received even with all-zero KV data"
+    );
 
     // Free the block — received should be cleared (no spill attached).
     pool.free(id);

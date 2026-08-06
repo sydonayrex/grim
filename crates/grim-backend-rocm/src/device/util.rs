@@ -79,14 +79,35 @@ pub fn gpu_target_flag(arch: &str) -> CString {
 }
 
 /// Build compiler options list for AMD hipRTC based on detected hardware target `arch`. [see: `gfx103x`, `gfx11xx`, `gfx12xx`, `gfx9xx`]
+///
+/// Injects the ROCm include directory (`-I`) so that JIT-compiled HIP
+/// kernels can `#include` third-party headers like `<rocwmma/rocwmma.hpp>`.
+/// Without this, hipRTC has no header search path for ROCm's own includes
+/// and compilation fails with "file not found" on `rocwmma`, `rccl`, etc.
 pub fn hiprtc_options_for_arch(arch: &str) -> Vec<CString> {
-    let mut opts = vec![CString::new("--std=c++14").unwrap()];
+    let mut opts = vec![
+        // rocWMMA 2.x targets C++17 (`inline constexpr`, nested namespace
+        // definitions, `namespace X::Y`), and its headers are pulled in by
+        // kernels on gfx11/gfx12 targets. Other HIP kernels in this crate
+        // are a strict subset of C++17, so --std=c++17 is safe for all.
+        CString::new("--std=c++17").unwrap(),
+    ];
     // Do not force `-mwavefrontsize64`: it configures codegen for 64-wide
     // wavefronts, but Wave32-only targets (e.g. RDNA 2 iGPUs like gfx1036)
     // cannot execute it and fault at runtime. Let hipRTC use the native wave
     // size for the target arch and let kernels fall back to their runtime
     // `warpSize` logic.
     opts.push(gpu_target_flag(arch));
+    // HIPRTC does not search the ROCm include tree by default. Add the
+    // discovered include directory so `<rocwmma/rocwmma.hpp>` and friends
+    // resolve at JIT-compile time. If discovery fails we proceed without
+    // the flag (kernels that don't need ROCm headers still compile).
+    if let Some(include_dir) = crate::rocm_detect::rocm_include_dir() {
+        let inc_flag = format!("-I{}", include_dir.display());
+        if let Ok(c) = CString::new(inc_flag) {
+            opts.push(c);
+        }
+    }
     opts
 }
 

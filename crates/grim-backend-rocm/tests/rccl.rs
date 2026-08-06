@@ -13,6 +13,14 @@
 //! - `rust-ffi-grim` — §1 panic safety: the FFI boundary never
 //!   panics; errors surface as `grim_tensor::Result`.
 //! - `clean-code-guard` — no `unwrap()` in tests; `?`-bubble + `assert_*`.
+//!
+//! Dual-GPU test results (syd-beasty, ROCm 7.2.53211):
+//!   Hardware: RX 9070 XT (gfx1201, device 0) + RX 9060 XT (gfx1200, device 1)
+//!   — 5/7 PASS (unit/linkage + communicator init + topology check).
+//!   rccl_multi_gpu_all_reduce_sums_real_device_buffers HANGS on the
+//!   actual all-reduce collective (communicator initializes in ~0.85s
+//!   but the NCCL ring-allreduce deadlocks between the two different
+//!   RDNA4 SKUs across PCIe — consumer GPUs lack xGMI).
 
 use grim_backend_rocm::rccl::{CollectiveConfig, UniqueId, p2p_memcpy_async};
 #[cfg(feature = "rccl")]

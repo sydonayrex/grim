@@ -159,19 +159,49 @@ mod loom_tests {
     #[test]
     fn lookup_solution_index_deterministic_within_shape() {
         // FP32 — every tuned shape has a non-zero solution index.
-        assert_eq!(lookup_solution_index(1, 4096, 4096, "gfx1036", ArithType::F32), 4);
-        assert_eq!(lookup_solution_index(8, 4096, 4096, "gfx1036", ArithType::F32), 11);
-        assert_eq!(lookup_solution_index(1, 11008, 4096, "gfx1036", ArithType::F32), 65);
-        assert_eq!(lookup_solution_index(8, 11008, 4096, "gfx1036", ArithType::F32), 1);
+        assert_eq!(
+            lookup_solution_index(1, 4096, 4096, "gfx1036", ArithType::F32),
+            4
+        );
+        assert_eq!(
+            lookup_solution_index(8, 4096, 4096, "gfx1036", ArithType::F32),
+            11
+        );
+        assert_eq!(
+            lookup_solution_index(1, 11008, 4096, "gfx1036", ArithType::F32),
+            65
+        );
+        assert_eq!(
+            lookup_solution_index(8, 11008, 4096, "gfx1036", ArithType::F32),
+            1
+        );
         // FP16 / BF16 now have entries too; off-table shapes still fall
-        assert_eq!(lookup_solution_index(1, 4096, 1024, "gfx1036", ArithType::F32), 0);
-        assert_eq!(lookup_solution_index(1, 4096, 1024, "gfx1036", ArithType::F16), 0);
-        assert_eq!(lookup_solution_index(1, 4096, 1024, "gfx1036", ArithType::BF16), 0);
+        assert_eq!(
+            lookup_solution_index(1, 4096, 1024, "gfx1036", ArithType::F32),
+            0
+        );
+        assert_eq!(
+            lookup_solution_index(1, 4096, 1024, "gfx1036", ArithType::F16),
+            0
+        );
+        assert_eq!(
+            lookup_solution_index(1, 4096, 1024, "gfx1036", ArithType::BF16),
+            0
+        );
         // Non-gfx1036 arch returns 0
-        assert_eq!(lookup_solution_index(1, 4096, 4096, "gfx1100", ArithType::F32), 0);
+        assert_eq!(
+            lookup_solution_index(1, 4096, 4096, "gfx1100", ArithType::F32),
+            0
+        );
         // Now confirm F16 / BF16 hit the table for the tuned shapes:
-        assert_eq!(lookup_solution_index(1, 4096, 4096, "gfx1036", ArithType::F16), 5);
-        assert_eq!(lookup_solution_index(1, 4096, 4096, "gfx1036", ArithType::BF16), 6);
+        assert_eq!(
+            lookup_solution_index(1, 4096, 4096, "gfx1036", ArithType::F16),
+            5
+        );
+        assert_eq!(
+            lookup_solution_index(1, 4096, 4096, "gfx1036", ArithType::BF16),
+            6
+        );
     }
 
     #[test]

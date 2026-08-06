@@ -215,19 +215,14 @@ pub fn merge_bolt_on(
         .tensors_by_name
         .get(tensor_name)
         .copied()
-        .ok_or_else(|| {
-            Error::Backend(format!("tensor {} not found in .grim file", tensor_name))
-        })?;
+        .ok_or_else(|| Error::Backend(format!("tensor {} not found in .grim file", tensor_name)))?;
     let entry = &src.tensors[idx];
-    let src_ext = src
-        .metadata
-        .get_tensor_ext(tensor_name)
-        .ok_or_else(|| {
-            Error::Backend(format!(
-                "tensor {} has no GrimTensorExt metadata",
-                tensor_name
-            ))
-        })?;
+    let src_ext = src.metadata.get_tensor_ext(tensor_name).ok_or_else(|| {
+        Error::Backend(format!(
+            "tensor {} has no GrimTensorExt metadata",
+            tensor_name
+        ))
+    })?;
 
     let row_count = src_ext.row_count.max(1) as usize;
     let row_stride = src_ext.row_stride as usize;
@@ -258,10 +253,7 @@ pub fn merge_bolt_on(
     // Outlier corrections; baked into the primary during the merge, then the
     // outlier stream is dropped so a position is not double-represented.
     let outliers = read_outliers_with_encoding(&mut file, entry, src_ext.outlier_index_encoding)?;
-    let outlier_pairs: Vec<(u32, f32)> = outliers
-        .into_iter()
-        .map(|o| (o.index, o.value))
-        .collect();
+    let outlier_pairs: Vec<(u32, f32)> = outliers.into_iter().map(|o| (o.index, o.value)).collect();
 
     // Effective f32 weights, mirroring the `dequant_row` combine order.
     let mut effective = Vec::with_capacity(row_count * row_stride);
@@ -300,11 +292,7 @@ pub fn merge_bolt_on(
         if primary_scales.is_empty() {
             pack_row_bpw_for_wave(&mut new_codes, row, default_bpw, WaveSize::W64);
         } else {
-            let max_abs = row
-                .iter()
-                .map(|v| v.abs())
-                .fold(0.0f32, f32::max)
-                .max(1e-6);
+            let max_abs = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
             let scale_byte = (max_abs.min(1.0) * 255.0).round() as u8;
             new_scales.push(scale_byte);
             let eff_scale = scale_byte as f32 / 255.0f32;
@@ -464,11 +452,7 @@ fn compute_delta_w(a: &Tensor, b: &Tensor, scale: f32) -> Result<Vec<f32>> {
             a_dims[0], rank
         )));
     }
-    let adj = if rank > 0 {
-        scale / rank as f32
-    } else {
-        scale
-    };
+    let adj = if rank > 0 { scale / rank as f32 } else { scale };
 
     let mut delta = vec![0.0f32; out_features * in_features];
     for o in 0..out_features {

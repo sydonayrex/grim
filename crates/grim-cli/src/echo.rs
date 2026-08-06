@@ -1,6 +1,5 @@
 //! SCALE-ECHO echo training mode — subspace echo state + FP4 updates.
 
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the SCALE-ECHO echo trainer.

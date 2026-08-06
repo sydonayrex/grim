@@ -248,7 +248,8 @@ impl SelfTuningController {
     pub fn tune_one(&mut self, knob: KnobKind) -> f64 {
         match knob {
             KnobKind::ChunkedPrefillSize => {
-                self.chunked_prefill_size.record(self.ema_ttft_ms, self.alpha);
+                self.chunked_prefill_size
+                    .record(self.ema_ttft_ms, self.alpha);
                 self.chunked_prefill_size.tune()
             }
             KnobKind::MaxBatchedTokens => {
@@ -256,11 +257,13 @@ impl SelfTuningController {
                 self.max_batched_tokens.tune()
             }
             KnobKind::SpeculativeBlockLen => {
-                self.speculative_block_len.record(self.ema_itl_ms, self.alpha);
+                self.speculative_block_len
+                    .record(self.ema_itl_ms, self.alpha);
                 self.speculative_block_len.tune()
             }
             KnobKind::KvCompressionBitWidth => {
-                self.kv_compression_bit_width.record(self.ema_quality, self.alpha);
+                self.kv_compression_bit_width
+                    .record(self.ema_quality, self.alpha);
                 self.kv_compression_bit_width.tune()
             }
         }
