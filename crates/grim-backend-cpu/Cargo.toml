@@ -22,3 +22,6 @@ matrixmultiply = { version = "0.3", optional = true }
 # useful for targets without std::simd support or fuzz/fuzzing builds.
 default = ["oxiblas"]
 oxiblas = ["dep:matrixmultiply"]
+
+[dev-dependencies]
+tempfile = "3"

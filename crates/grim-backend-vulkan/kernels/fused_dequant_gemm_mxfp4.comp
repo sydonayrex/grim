@@ -1,0 +1,154 @@
+// fused_dequant_gemm_mxfp4.comp
+//
+// Fused dequantize-GEMM for MXFP4 (OCP Microscaling 4-bit float with
+// shared E8M0 scale per 32-element group) weights.
+//
+// Packed byte layout (length-prefixed segments, matching grim-quant dequant_mxfp4):
+//   [u64 LE] codes_len
+//   codes: packed E2M1 4-bit codes, 2 per byte. Element i of a group is
+//          in the low nibble when i is even, high nibble when odd.
+//   [u64 LE] exps_len
+//   exps: one E8M0 shared exponent byte per 32-element group.
+//
+// MXFP4 E2M1 format: 1 sign | 2 exponent | 1 mantissa, bias = 1.
+//   The 4-bit code is decoded via the E2M1 table (4 levels: {-1, -0.5, 0.5, 1}).
+//   Combined with the shared E8M0 exponent: value = code_to_f32(code) * 2^(shared_exp - 127)
+//
+// For the GEMM: weight B is stored as [N, K] in column-major packed form.
+// Block stride: K must be divisible by 32 (group size for shared exponents).
+//
+// Contract: K must be divisible by 32.
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufA   { float A[]; };
+layout(std430, binding = 1) readonly buffer BufB   { uint  B_bytes[]; };
+layout(std430, binding = 2) writeonly buffer BufC  { float C[]; };
+
+uint get_byte(uint byte_idx) {
+    uint word  = B_bytes[byte_idx / 4u];
+    uint shift = (byte_idx % 4u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+uint get_u64_le(uint byte_idx) {
+    uint lo = get_byte(byte_idx);
+    uint b1 = get_byte(byte_idx + 1u);
+    uint b2 = get_byte(byte_idx + 2u);
+    uint b3 = get_byte(byte_idx + 3u);
+    uint b4 = get_byte(byte_idx + 4u);
+    uint b5 = get_byte(byte_idx + 5u);
+    uint b6 = get_byte(byte_idx + 6u);
+    uint b7 = get_byte(byte_idx + 7u);
+    // Return only low 32 bits (codes_len / exps_len are small)
+    return lo | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+}
+
+// MXFP4 E2M1 4-bit code → f32 value.
+// Format: bit3=sign, bits[2:1]=exponent, bit0=mantissa
+// Values: {-1.0, -0.5, -0.25, -0.0, 0.0, 0.25, 0.5, 1.0}
+// But the CPU mxfp4_e2m1_to_f32 uses: sign, exp(2 bits), mant(1 bit)
+float mxfp4_e2m1_to_f32(uint code) {
+    bool sign = (code & 0x08u) != 0u;
+    uint exp = (code >> 1u) & 0x03u;
+    uint mant = code & 0x01u;
+
+    float base_val;
+    if (exp == 0u) {
+        base_val = float(mant) * 0.5;
+    } else {
+        base_val = (1.0 + float(mant) * 0.5) * exp2(float(exp) - 1.0);
+    }
+
+    return sign ? -base_val : base_val;
+}
+
+// Decode the MXFP4 packed layout to find the byte offset of the codes section
+// and the exps section. Returns (codes_offset_bytes, exps_offset_bytes, codes_len, exps_len).
+// Layout: [u64 codes_len][codes...][u64 exps_len][exps...]
+void decode_layout(out uint codes_offset, out uint exps_offset, out uint codes_len, out uint exps_len) {
+    // First 8 bytes: codes_len (we only need low 32 bits)
+    codes_len = get_u64_le(0u);
+    codes_offset = 8u; // after the u64 length prefix
+    exps_len = get_u64_le(codes_offset + codes_len);
+    exps_offset = codes_offset + codes_len + 8u; // after codes + u64 length prefix
+}
+
+/// Dequantize one weight element from MXFP4 storage.
+/// flat_idx: linear index into the [N*K] weight matrix (column-major: col * K + k_idx).
+/// k       : K dimension (for group computation).
+float dequant_mxfp4_element(uint codes_offset, uint exps_offset, uint k, uint flat_idx) {
+    // Each 32-element group shares one E8M0 exponent.
+    uint group_idx = flat_idx / 32u;
+    uint shared_exp = get_byte(exps_offset + group_idx);
+    float exp_scale = exp2(float(int(shared_exp) - 127));
+
+    // Code: 4 bits per element, 2 per byte. Even element → low nibble, odd → high nibble.
+    uint byte_idx = flat_idx / 2u;
+    uint byte = get_byte(codes_offset + byte_idx);
+    uint code = (flat_idx % 2u == 0u) ? (byte & 0x0Fu) : ((byte >> 4u) & 0x0Fu);
+
+    return mxfp4_e2m1_to_f32(code) * exp_scale;
+}
+
+shared float s_a[16][16];
+shared float s_b[16][16];
+
+void main() {
+    uint M = params.m;
+    uint N = params.n;
+    uint K = params.k;
+
+    uint bx = gl_WorkGroupID.x;
+    uint by = gl_WorkGroupID.y;
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+
+    uint row = by * 16u + ty;
+    uint col = bx * 16u + tx;
+
+    // Decode the packed layout once.
+    uint codes_offset, exps_offset, codes_len, exps_len;
+    decode_layout(codes_offset, exps_offset, codes_len, exps_len);
+
+    float acc = 0.0;
+
+    for (uint bk = 0u; bk < K; bk += 16u) {
+        if (row < M && (bk + tx) < K) {
+            s_a[ty][tx] = A[row * K + bk + tx];
+        } else {
+            s_a[ty][tx] = 0.0;
+        }
+
+        uint k_idx = bk + ty;
+        if (col < N && k_idx < K) {
+            uint flat_weight_idx = col * K + k_idx;
+            s_b[ty][tx] = dequant_mxfp4_element(codes_offset, exps_offset, K, flat_weight_idx);
+        } else {
+            s_b[ty][tx] = 0.0;
+        }
+
+        barrier();
+
+        for (uint k = 0u; k < 16u; ++k) {
+            acc += s_a[ty][k] * s_b[k][tx];
+        }
+
+        barrier();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}

@@ -181,6 +181,8 @@ pub struct TrainingJob {
     /// When enabled, the optimizer is set to Muon.
     #[serde(default)]
     pub use_spectral_qlora: bool,
+    #[serde(default)]
+    pub bake_on_completion: bool,
     /// Optionally resume training from a checkpoint sidecar produced by a
     /// prior run.
     #[serde(default)]
@@ -225,6 +227,7 @@ impl Default for TrainingJob {
             use_olora: false,
             olora_lambda: 0.0,
             use_spectral_qlora: false,
+            bake_on_completion: false,
             resume_from_checkpoint: None,
             status: JobStatus::Pending,
             metrics: Vec::new(),
@@ -924,7 +927,7 @@ fn compute_visual_token_entropy(x: &grim_tensor::Tensor) -> Vec<f32> {
         let row = &vals[t * hidden_size..(t + 1) * hidden_size];
         // L2-normalize the row into a probability distribution.
         let norm: f32 = row.iter().map(|&v| v * v).sum::<f32>().sqrt().max(eps);
-        for (i, &v) in row.iter().enumerate() {
+        for (_i, &v) in row.iter().enumerate() {
             let p = (v / norm).abs();
             if p > eps {
                 entropy[t] -= p * p.ln();
@@ -2288,7 +2291,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             | TrainingMode::TurboFinetune
             | TrainingMode::KvOmni
             | TrainingMode::SpectralQLoRA => {
-                let (mut x_tensor, targets) = if let Some(ref mut dl) = dataloader {
+                let (x_tensor, targets) = if let Some(ref mut dl) = dataloader {
                     match dl.next_batch() {
                         Ok((inputs, labels)) => {
                             // labels are the shifted next-token ids; flatten
@@ -2899,6 +2902,36 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
             "[grim-garage] worker: wrote training state sidecar to {} (step {})",
             sidecar_path, step_counter,
         );
+
+        if job.bake_on_completion {
+            eprintln!(
+                "[grim-garage] worker: bake_on_completion enabled — merging adapter into {}...",
+                job.model_path
+            );
+            let alpha = (job.lora_rank as f32) * 2.0; // Standard 2x scaling
+            for tensor_name in train_state.lora_tensor_names() {
+                if let Some((a_data, a_shape, b_data, b_shape)) =
+                    train_state.lora_weights_for(&tensor_name)
+                {
+                    let shape_a = grim_tensor::shape::Shape::from_slice(a_shape);
+                    let shape_b = grim_tensor::shape::Shape::from_slice(b_shape);
+                    let a_tensor = grim_backend_cpu::cpu_tensor(a_data, shape_a);
+                    let b_tensor = grim_backend_cpu::cpu_tensor(b_data, shape_b);
+                    let scale = alpha / (job.lora_rank as f32);
+                    let _ = grim_format::bolt_on::merge_bolt_on(
+                        std::path::Path::new(&job.model_path),
+                        &tensor_name,
+                        &a_tensor,
+                        &b_tensor,
+                        scale,
+                    );
+                }
+            }
+            eprintln!(
+                "[grim-garage] worker: successfully baked adapter permanently into {}",
+                job.model_path
+            );
+        }
     }
 
     // Terminal broadcast so SSE subscribers receive a guaranteed

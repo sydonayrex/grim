@@ -39,8 +39,52 @@ fn kernels() -> Vec<(&'static str, String)> {
             load_kernel("fused_dequant_gemm_q4k"),
         ),
         (
+            "fused_dequant_gemm_q5k",
+            load_kernel("fused_dequant_gemm_q5k"),
+        ),
+        (
+            "fused_dequant_gemm_q6k",
+            load_kernel("fused_dequant_gemm_q6k"),
+        ),
+        (
             "fused_dequant_gemm_q8_0",
             load_kernel("fused_dequant_gemm_q8_0"),
+        ),
+        (
+            "fused_dequant_gemm_iq4nl",
+            load_kernel("fused_dequant_gemm_iq4nl"),
+        ),
+        (
+            "fused_dequant_gemm_iq4xs",
+            load_kernel("fused_dequant_gemm_iq4xs"),
+        ),
+        (
+            "fused_dequant_gemm_iq3xxs",
+            load_kernel("fused_dequant_gemm_iq3xxs"),
+        ),
+        (
+            "fused_dequant_gemm_iq3s",
+            load_kernel("fused_dequant_gemm_iq3s"),
+        ),
+        (
+            "fused_dequant_gemm_iq2xxs",
+            load_kernel("fused_dequant_gemm_iq2xxs"),
+        ),
+        (
+            "fused_dequant_gemm_iq2xs",
+            load_kernel("fused_dequant_gemm_iq2xs"),
+        ),
+        (
+            "fused_dequant_gemm_iq2s",
+            load_kernel("fused_dequant_gemm_iq2s"),
+        ),
+        (
+            "fused_dequant_gemm_fp8_e4m3",
+            load_kernel("fused_dequant_gemm_fp8_e4m3"),
+        ),
+        (
+            "fused_dequant_gemm_mxfp4",
+            load_kernel("fused_dequant_gemm_mxfp4"),
         ),
         ("kv_dequant_attention", load_kernel("kv_dequant_attention")),
         ("selective_scan", load_kernel("selective_scan")),
@@ -55,6 +99,10 @@ fn kernels() -> Vec<(&'static str, String)> {
         (
             "quantized_matmul_backward_dx_q8_0",
             load_kernel("quantized_matmul_backward_dx_q8_0"),
+        ),
+        (
+            "quantized_matmul_backward_dx_generic",
+            load_kernel("quantized_matmul_backward_dx_generic"),
         ),
         ("rwkv_time_mix", load_kernel("rwkv_time_mix")),
         ("rwkv_channel_mix", load_kernel("rwkv_channel_mix")),
@@ -81,7 +129,18 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/recip.comp");
     println!("cargo:rerun-if-changed=kernels/rope.comp");
     println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_q4k.comp");
+    println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_q5k.comp");
+    println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_q6k.comp");
     println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_q8_0.comp");
+    println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_iq4nl.comp");
+    println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_iq4xs.comp");
+    println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_iq3xxs.comp");
+    println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_iq3s.comp");
+    println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_iq2xxs.comp");
+    println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_iq2xs.comp");
+    println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_iq2s.comp");
+    println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_fp8_e4m3.comp");
+    println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_mxfp4.comp");
     println!("cargo:rerun-if-changed=kernels/kv_dequant_attention.comp");
     println!("cargo:rerun-if-changed=kernels/selective_scan.comp");
     println!("cargo:rerun-if-changed=kernels/qkv_attention_paged.comp");
@@ -90,6 +149,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/silu_mul_backward.comp");
     println!("cargo:rerun-if-changed=kernels/quantized_matmul_backward_dx.comp");
     println!("cargo:rerun-if-changed=kernels/quantized_matmul_backward_dx_q8_0.comp");
+    println!("cargo:rerun-if-changed=kernels/quantized_matmul_backward_dx_generic.comp");
     println!("cargo:rerun-if-changed=kernels/rwkv_time_mix.comp");
     println!("cargo:rerun-if-changed=kernels/rwkv_channel_mix.comp");
     println!("cargo:rerun-if-changed=kernels/all_reduce.comp");
@@ -146,7 +206,7 @@ fn main() {
     std::fs::write(&gen_path, gen_code).expect("write generated spirv module");
 
     if any_failed {
-        /// Surface a clear error so compilation failure is not silently swallowed.
+        // Surface a clear error so compilation failure is not silently swallowed.
         panic!(
             "build.rs: one or more Vulkan kernels failed to compile to SPIR-V. \
              Ensure `glslangValidator` is installed and on PATH (or set GLSLANG_VALIDATOR)."

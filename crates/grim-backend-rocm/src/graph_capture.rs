@@ -80,32 +80,36 @@ impl Drop for DecodeGraph {
 /// Closure type invoked once per cache miss on the capture stream.
 pub type CaptureFn = Box<dyn FnOnce(*mut c_void) -> Result<()> + Send>;
 
+#[derive(Debug, Default)]
+struct GraphCacheState {
+    cache: HashMap<DecodeGraphKey, Arc<DecodeGraph>>,
+    lru: Vec<DecodeGraphKey>,
+}
+
 /// Cache of captured decode-step graphs, keyed by `DecodeGraphKey`.
 #[derive(Debug)]
 pub struct GraphCaptureManager {
     /// Owning the stream once and reusing it for every capture avoids
     /// the cost of allocating a fresh stream per capture.
     capture_stream: Mutex<Option<*mut c_void>>,
-    cache: Mutex<HashMap<DecodeGraphKey, Arc<DecodeGraph>>>,
-    /// Last-used order for cache eviction (optional; included for the
-    /// hot-path LIFO reuse hint used by the fused-decode scheduler).
-    lru: Mutex<Vec<DecodeGraphKey>>,
+    state: Mutex<GraphCacheState>,
     /// Cache capacity — bounded by `(shape_cardinality)` in practice
     /// but exposed so callers can tune without surgery.
     pub max_entries: usize,
 }
 
 impl GraphCaptureManager {
-    /// Bind the manager to a device. No HIP / ROCm call fires here;
-    /// the capture stream is lazily allocated on the first
-    /// `get_or_capture`. Skill: `rust-ai-ml-inference-guide` Action 9
-    /// (graph capture for decode).
-    pub fn for_device(_dev: &RocmDevice) -> Self {
+    /// Bind the manager to a device with default capacity (64).
+    pub fn for_device(dev: &RocmDevice) -> Self {
+        Self::for_device_with_capacity(dev, 64)
+    }
+
+    /// Bind the manager to a device with explicit capacity.
+    pub(crate) fn for_device_with_capacity(_dev: &RocmDevice, max_entries: usize) -> Self {
         Self {
             capture_stream: Mutex::new(None),
-            cache: Mutex::new(HashMap::new()),
-            lru: Mutex::new(Vec::new()),
-            max_entries: 64,
+            state: Mutex::new(GraphCacheState::default()),
+            max_entries,
         }
     }
 
@@ -144,16 +148,14 @@ impl GraphCaptureManager {
         F: FnOnce(*mut c_void) -> Result<()> + Send,
     {
         // Fast path: cache hit.
-        if let Ok(cache) = self.cache.lock() {
-            if let Some(g) = cache.get(&key) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(g) = state.cache.get(&key).cloned() {
                 // Track LRU.
-                if let Ok(mut lru) = self.lru.lock() {
-                    if let Some(pos) = lru.iter().position(|k| k == &key) {
-                        lru.remove(pos);
-                    }
-                    lru.push(key);
+                if let Some(pos) = state.lru.iter().position(|k| k == &key) {
+                    state.lru.remove(pos);
                 }
-                return Ok(g.clone());
+                state.lru.push(key);
+                return Ok(g);
             }
         }
 
@@ -212,26 +214,22 @@ impl GraphCaptureManager {
         let g = Arc::new(DecodeGraph { graph, exec });
 
         // Insert + LRU bookkeeping + optional eviction.
-        let mut cache = self
-            .cache
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| Error::Backend("graph cache mutex poisoned".into()))?;
-        if cache.len() >= self.max_entries {
+        if state.cache.len() >= self.max_entries {
             // Evict the least recently used entry.
-            if let Ok(mut lru) = self.lru.lock() {
-                if let Some(stale) = lru.first().copied() {
-                    lru.remove(0);
-                    cache.remove(&stale);
-                }
+            if !state.lru.is_empty() {
+                let stale = state.lru.remove(0);
+                state.cache.remove(&stale);
             }
         }
-        if let Ok(mut lru) = self.lru.lock() {
-            if let Some(pos) = lru.iter().position(|k| k == &key) {
-                lru.remove(pos);
-            }
-            lru.push(key);
+        if let Some(pos) = state.lru.iter().position(|k| k == &key) {
+            state.lru.remove(pos);
         }
-        cache.insert(key, g.clone());
+        state.lru.push(key);
+        state.cache.insert(key, g.clone());
         Ok(g)
     }
 
@@ -239,9 +237,10 @@ impl GraphCaptureManager {
     /// has yet been recorded for that key.
     pub fn replay(&self, key: DecodeGraphKey) -> Result<()> {
         let exec = self
-            .cache
+            .state
             .lock()
             .map_err(|_| Error::Backend("graph cache mutex poisoned".into()))?
+            .cache
             .get(&key)
             .map(|g| g.exec)
             .ok_or_else(|| Error::Backend("no captured graph for key (replay)".into()))?;

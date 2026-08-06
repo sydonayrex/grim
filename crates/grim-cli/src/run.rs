@@ -91,7 +91,7 @@ fn probe_device() -> (Device, String) {
                 (Device::Cpu, "cpu".into())
             }
             "metal" => {
-                let Some((free, total)) = grim_backend_metal::vram_info(0) else {
+                let Some((_free, total)) = grim_backend_metal::vram_info(0) else {
                     return (Device::Cpu, "cpu".into());
                 };
                 if total > 0 {
@@ -324,7 +324,7 @@ pub async fn cmd_run(
         engine.register_model(model_id, model);
         eprintln!("[grim] Starting HTTP server on {address}...");
         let serve_model_path = Some(std::path::PathBuf::from(&model_path_str));
-        grim_server::serve(&address, engine, serve_model_path).await?;
+        grim_server::serve(&address, engine, serve_model_path, None).await?;
         return Ok(());
     }
 
@@ -509,7 +509,7 @@ pub async fn cmd_run(
         let n_tokens = input_ids.len();
         let shape = grim_tensor::Shape::new(vec![n_tokens]);
         let float_tokens = input_ids;
-        let dtype = grim_tensor::dtype::DType::F32;
+        let _dtype = grim_tensor::dtype::DType::F32;
         let input_tensor = build_tensor(&float_tokens, &shape, &device)?;
 
         // Forward pass with proper positions tensor (CRIT-1).
@@ -736,7 +736,7 @@ fn build_tensor(
 /// Interactive REPL: loads model once, loops reading prompts without reloading. Fixes B.4.
 pub async fn cmd_run_interactive(
     model_path: String,
-    address: String,
+    _address: String,
     temperature: f32,
     top_p: f32,
     top_k: u32,

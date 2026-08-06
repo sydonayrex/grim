@@ -15,7 +15,7 @@ use grim_tensor::provider::TensorProvider;
 /// Implemented by GPU backends (e.g. `grim-backend-rocm`). When an
 /// implementation returns `Ok(None)` the caller falls back to the CPU
 /// dequant path for that tensor's storage scheme.
-pub trait GpuDequant {
+pub trait GpuDequant: Send + Sync {
     /// Dequantize `bytes` (a raw storage payload for `storage`) into
     /// `elem_count` f32 values. Returning `Ok(None)` means this storage
     /// scheme is not supported and the caller should use the CPU path.
@@ -468,7 +468,7 @@ pub fn convert_to_grim_with_dequant(
     target_format: Option<String>,
     wave: Option<crate::format::WaveSize>,
     progress: Option<&mut dyn FnMut(&str, usize, usize)>,
-    gpu_dequant: &dyn GpuDequant,
+    gpu_dequant: &(dyn GpuDequant + Sync),
 ) -> Result<()> {
     convert_to_grim_inner(
         input_path,
@@ -500,7 +500,7 @@ fn convert_to_grim_inner(
     target_format: Option<String>,
     wave: Option<crate::format::WaveSize>,
     mut progress: Option<&mut dyn FnMut(&str, usize, usize)>,
-    gpu_dequant: Option<&dyn GpuDequant>,
+    gpu_dequant: Option<&(dyn GpuDequant + Sync)>,
 ) -> Result<()> {
     println!("[Grim Convert] Starting conversion pipeline...");
     println!("  Source: {}", input_path);
@@ -696,7 +696,7 @@ fn build_entries_from_source(
     evopress_bitwidths: Option<Vec<u32>>,
     wave: crate::format::WaveSize,
     progress: &mut Option<&mut dyn FnMut(&str, usize, usize)>,
-    gpu_dequant: Option<&dyn GpuDequant>,
+    gpu_dequant: Option<&(dyn GpuDequant + Sync)>,
 ) -> Result<(
     Vec<(crate::format::GrimTensorEntry, Vec<u8>)>,
     Vec<crate::spec::GrimTensorExt>,
@@ -738,124 +738,138 @@ fn build_entries_from_source(
 /// Also returns per-tensor `GrimTensorExt` entries containing SpQR
 /// salient indices/values so the caller can populate `metadata.ext_entries`.
 fn pack_tensors(
-    provider: &dyn grim_tensor::provider::TensorProvider,
+    provider: &(dyn grim_tensor::provider::TensorProvider + Sync),
     names: &[String],
     target_bpw: f32,
     evopress_bitwidths: Option<Vec<u32>>,
     wave: crate::format::WaveSize,
     progress: &mut Option<&mut dyn FnMut(&str, usize, usize)>,
-    gpu_dequant: Option<&dyn GpuDequant>,
+    gpu_dequant: Option<&(dyn GpuDequant + Sync)>,
 ) -> Result<(
     Vec<(crate::format::GrimTensorEntry, Vec<u8>)>,
     Vec<crate::spec::GrimTensorExt>,
 )> {
-    let mut result = Vec::with_capacity(names.len());
-    let mut ext_entries = Vec::with_capacity(names.len());
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     let total = names.len();
-    for (i, name) in names.iter().enumerate() {
-        if let Some(cb) = progress.as_deref_mut() {
-            cb("pack", i + 1, total);
-        }
-        let raw = provider.get(name)?;
-        let meta = provider.meta(name)?;
-        if meta.provenance.is_external_qat() {
-            println!(
-                "[WARN] Re-quantizing external QAT tensor '{}' may lead to accuracy loss.",
-                name
-            );
-        }
-        let elem_count: usize = raw.shape.iter().product();
+    let completed = AtomicUsize::new(0);
+    let (tx, rx) = std::sync::mpsc::channel();
 
-        // Determine bitwidth for this tensor: use EvoPress bitwidth if available, otherwise fall back to target_bpw
-        let tensor_bitwidth = if let Some(ref bitwidths) = evopress_bitwidths {
-            bitwidths
-                .get(i)
-                .copied()
-                .unwrap_or_else(|| target_bpw.round() as u32) as u8
-        } else {
-            target_bpw.round() as u8
-        };
-
-        // Dequantize raw bytes to f32 values first — needed for SpQR sidecar.
-        // Try the GPU hook first; fall back to the CPU path when the hook
-        // does not support the tensor's storage scheme.
-        let f32_values = if let Some(gpu) = gpu_dequant {
-            match gpu.dequantize(&raw.dtype.storage, &raw.bytes, elem_count)? {
-                Some(vals) => vals,
-                None => dequant_tensor_data(&raw, elem_count)?,
+    let packed_items: Result<
+        Vec<(
+            (crate::format::GrimTensorEntry, Vec<u8>),
+            crate::spec::GrimTensorExt,
+        )>,
+    > = names
+        .par_iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let raw = provider.get(name)?;
+            let meta = provider.meta(name)?;
+            if meta.provenance.is_external_qat() {
+                println!(
+                    "[WARN] Re-quantizing external QAT tensor '{}' may lead to accuracy loss.",
+                    name
+                );
             }
-        } else {
-            dequant_tensor_data(&raw, elem_count)?
-        };
+            let elem_count: usize = raw.shape.iter().product();
 
-        // Re-quantize to target bitwidth
-        let mut f32_values = f32_values;
+            let tensor_bitwidth = if let Some(ref bitwidths) = evopress_bitwidths {
+                bitwidths
+                    .get(i)
+                    .copied()
+                    .unwrap_or_else(|| target_bpw.round() as u32) as u8
+            } else {
+                target_bpw.round() as u8
+            };
 
-        // Apply SmoothQuant channel scaling (N3b) if 2D tensor
-        if meta.shape.len() == 2 {
-            let out_channels = meta.shape[0];
-            let in_channels = meta.shape[1];
-            let _ = grim_quant::apply_smoothquant_scale(
-                &mut f32_values,
-                out_channels,
-                in_channels,
-                None,
-            );
-        }
+            let f32_values = if let Some(gpu) = gpu_dequant {
+                match gpu.dequantize(&raw.dtype.storage, &raw.bytes, elem_count)? {
+                    Some(vals) => vals,
+                    None => dequant_tensor_data(&raw, elem_count)?,
+                }
+            } else {
+                dequant_tensor_data(&raw, elem_count)?
+            };
 
-        // Apply SpinQuant Cayley rotation (N3a) if length is square and power of 2
-        let elem_sqrt = (elem_count as f64).sqrt() as usize;
-        if elem_sqrt * elem_sqrt == elem_count && elem_sqrt >= 16 && elem_sqrt.is_power_of_two() {
-            grim_quant::spinquant_rotate(&mut f32_values, elem_sqrt, 0.01, 5);
-        }
+            let mut f32_values = f32_values;
 
-        let payload_size =
-            crate::format::normals_packed_size_for_wave(elem_count, 0, tensor_bitwidth, wave);
-        let mut normals = Vec::with_capacity(payload_size as usize);
+            if meta.shape.len() == 2 {
+                let out_channels = meta.shape[0];
+                let in_channels = meta.shape[1];
+                let _ = grim_quant::apply_smoothquant_scale(
+                    &mut f32_values,
+                    out_channels,
+                    in_channels,
+                    None,
+                );
+            }
 
-        // Pack in rows (for now, treat entire tensor as single row)
-        // Segment size = wave.segment_bytes() bytes = wave * 32 bits
-        // At bpw bits per weight, that's segment_bits/bpw weights per segment
-        crate::format::pack_row_bpw_for_wave(&mut normals, &f32_values, tensor_bitwidth, wave);
+            let elem_sqrt = (elem_count as f64).sqrt() as usize;
+            if elem_sqrt * elem_sqrt == elem_count && elem_sqrt >= 16 && elem_sqrt.is_power_of_two()
+            {
+                grim_quant::spinquant_rotate(&mut f32_values, elem_sqrt, 0.01, 5);
+            }
 
-        // Resize to exact payload size
-        normals.resize(payload_size as usize, 0u8);
+            let payload_size =
+                crate::format::normals_packed_size_for_wave(elem_count, 0, tensor_bitwidth, wave);
+            let mut normals = Vec::with_capacity(payload_size as usize);
 
-        let entry = crate::format::GrimTensorEntry {
-            name: name.clone(),
-            shape: raw.shape,
-            base_bitwidth: tensor_bitwidth,
-            payload_offset: 0,
-            payload_size,
-            outlier_count: 0,
-            outlier_offset: 0,
-            ..Default::default()
-        };
-        // Compute SpQR salient residuals for this tensor (P5 Task 5.1).
-        // Identify top-K weights by curvature magnitude so the
-        // training sidecar can store/restore them separately.
-        let spqr_ext = {
-            let mut ext = crate::spec::GrimTensorExt {
-                tensor_name: name.clone(),
-                block_size: 0, // not block-quantized
+            crate::format::pack_row_bpw_for_wave(&mut normals, &f32_values, tensor_bitwidth, wave);
+            normals.resize(payload_size as usize, 0u8);
+
+            let entry = crate::format::GrimTensorEntry {
+                name: name.clone(),
+                shape: raw.shape,
+                base_bitwidth: tensor_bitwidth,
+                payload_offset: 0,
+                payload_size,
+                outlier_count: 0,
+                outlier_offset: 0,
                 ..Default::default()
             };
-            // Use weight magnitude as curvature proxy for SpQR selection.
-            let threshold_multiplier = 1.0;
-            if let Ok(spqr) = grim_quant::spqr_identify_salient(
-                &f32_values,
-                &f32_values, // curvature proxy: weight magnitude
-                threshold_multiplier,
-            ) {
-                ext.spqr_indices = spqr.indices;
-                ext.spqr_values = spqr.values;
-            }
-            ext
-        };
-        ext_entries.push(spqr_ext);
 
-        result.push((entry, normals));
+            let spqr_ext = {
+                let mut ext = crate::spec::GrimTensorExt {
+                    tensor_name: name.clone(),
+                    block_size: 0,
+                    ..Default::default()
+                };
+                let threshold_multiplier = 1.0;
+                if let Ok(spqr) = grim_quant::spqr_identify_salient(
+                    &f32_values,
+                    &f32_values,
+                    threshold_multiplier,
+                ) {
+                    ext.spqr_indices = spqr.indices;
+                    ext.spqr_values = spqr.values;
+                }
+                ext
+            };
+
+            let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = tx.send(count);
+
+            Ok(((entry, normals), spqr_ext))
+        })
+        .collect();
+
+    if let Some(cb) = progress.as_deref_mut() {
+        while let Ok(count) = rx.try_recv() {
+            cb("pack", count, total);
+        }
     }
+
+    let packed_items = packed_items?;
+    let mut result = Vec::with_capacity(total);
+    let mut ext_entries = Vec::with_capacity(total);
+
+    for (item, ext) in packed_items {
+        result.push(item);
+        ext_entries.push(ext);
+    }
+
     Ok((result, ext_entries))
 }
 

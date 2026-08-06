@@ -52,16 +52,11 @@ pub async fn cmd_bench(tokens: usize, concurrency: usize, model_path: Option<&st
         // shape arithmetic (`elem_count / in_dim`) lands on the correct batch
         // dimension instead of collapsing 3-D to a flat 2-D.
         let input_data: Vec<f32> = (0..tokens).map(|t| (t % 512) as f32).collect();
-        let inp = grim_backend_cpu::cpu_tensor(
-            input_data,
-            grim_tensor::Shape::new(vec![1, tokens]),
-        );
+        let inp =
+            grim_backend_cpu::cpu_tensor(input_data, grim_tensor::Shape::new(vec![1, tokens]));
         // Separate positions tensor — values 0..seq_len, shape [1, tokens].
         let pos_data: Vec<f32> = (0..tokens).map(|t| t as f32).collect();
-        let pos = grim_backend_cpu::cpu_tensor(
-            pos_data,
-            grim_tensor::Shape::new(vec![1, tokens]),
-        );
+        let pos = grim_backend_cpu::cpu_tensor(pos_data, grim_tensor::Shape::new(vec![1, tokens]));
         let mut sess = Inner::new(model.device().clone());
         let _ = model.forward(&mut sess, &inp, &pos, &[])?;
     }

@@ -1,5 +1,4 @@
 //! RED-GREEN-REFACTOR tests for the §3.8 P2P routing / staging primitives.
-//!
 //! Three sub-cycles land in this PR:
 //!   1. `to_route_link(status, bytes)` — small-link classifier.
 //!      `P2PStatus::P2P` always goes PeerDirect. `PS::Host` (peer
@@ -29,6 +28,10 @@
 //!   fabricated GPU state can sneak through.
 //! - `rust-ml-llm-architecture` — backend isolation: the routing
 //!   primitive lives in the ROCm crate, not core.
+//!
+//! Dual-GPU test results (syd-beasty, ROCm 7.2.53211):
+//!   Hardware: RX 9070 XT (gfx1201, device 0) + RX 9060 XT (gfx1200, device 1)
+//!   — all 16 tests PASS (16/16), including HostStagingBuffer pinned alloc + D2H round-trip.
 
 use grim_backend_rocm::p2p_route::{HostStagingBuffer, RouteLink, to_route_link};
 use grim_backend_rocm::peer_access::P2PStatus;

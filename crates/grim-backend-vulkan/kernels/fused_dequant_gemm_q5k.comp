@@ -1,0 +1,161 @@
+// fused_dequant_gemm_q5k.comp
+//
+// Fused dequantize-GEMM for Q5_K weights (llama.cpp block_q5_K).
+//
+// Block layout (176 bytes, 256 elements per block):
+//   [0..1]   d      : f16   — super-block scale
+//   [2..3]   dmin   : f16   — super-block min
+//   [4..15]  scales : 12×u8 — 6-bit (sc, m) pairs for 8 subblocks, packed as Q4_K
+//   [16..47] qh    : 32×u8 — high bits (bit 4 of each 5-bit quant), 256 bits packed
+//   [48..175] qs   : 128×u8 — low 4 bits of each quant, 2 per byte
+//
+// Contract: K must be divisible by 256 (one full Q5_K block per 256 activations).
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufA   { float A[]; };
+layout(std430, binding = 1) readonly buffer BufB   { uint  B_bytes[]; };
+layout(std430, binding = 2) writeonly buffer BufC  { float C[]; };
+
+/// Read one byte from the packed uint buffer.
+uint get_byte(uint byte_idx) {
+    uint word  = B_bytes[byte_idx / 4u];
+    uint shift = (byte_idx % 4u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+/// Decode an IEEE 754 f16 stored as two little-endian bytes.
+float unpack_f16_bytes(uint b0, uint b1) {
+    uint bits = b0 | (b1 << 8u);
+    if (bits == 0u) return 0.0;
+    uint sign = (bits >> 15u) & 1u;
+    uint exp  = (bits >> 10u) & 0x1Fu;
+    uint mant =  bits         & 0x3FFu;
+    if (exp == 0u) {
+        if (mant == 0u) return 0.0;
+        float f = float(mant) / 1024.0 * exp2(-14.0);
+        return sign == 1u ? -f : f;
+    } else if (exp == 31u) {
+        return sign == 1u ? -1.0/0.0 : 1.0/0.0;
+    } else {
+        float f = (1.0 + float(mant) / 1024.0) * exp2(float(exp) - 15.0);
+        return sign == 1u ? -f : f;
+    }
+}
+
+/// Extract the 6-bit (scale, min) pair for sub-block j in a Q5_K block.
+/// Identical to Q4_K: same packed layout in bytes [4..15].
+void get_scale_min_k4(uint j, uint scale_offset, out float sc, out float m_val) {
+    uint sc_u;
+    uint m_u;
+    if (j < 4u) {
+        sc_u = get_byte(scale_offset + j)       & 63u;
+        m_u  = get_byte(scale_offset + j + 4u)  & 63u;
+    } else {
+        uint j4 = j - 4u;
+        sc_u = (get_byte(scale_offset + j4 + 8u) & 0x0Fu)
+             | ((get_byte(scale_offset + j4)      >> 6u) << 4u);
+        m_u  = (get_byte(scale_offset + j4 + 8u) >> 4u)
+             | ((get_byte(scale_offset + j4 + 4u) >> 6u) << 4u);
+    }
+    sc    = float(sc_u);
+    m_val = float(m_u);
+}
+
+/// Dequantize one element from a Q5_K block.
+///
+/// block_start: byte offset of the block header (d, dmin, scales, qh, qs)
+/// in_sb      : element index within the 256-element block (0..255)
+float dequant_q5k_element(uint block_start, uint in_sb) {
+    float d    = unpack_f16_bytes(get_byte(block_start),      get_byte(block_start + 1u));
+    float dmin = unpack_f16_bytes(get_byte(block_start + 2u), get_byte(block_start + 3u));
+
+    uint isb         = in_sb / 32u;   // sub-block index (0..7)
+    uint idx_in_sub  = in_sb % 32u;   // element within sub-block (0..31)
+
+    float sc, m_val;
+    get_scale_min_k4(isb, block_start + 4u, sc, m_val);
+
+    // Low 4 bits from qs (byte index within qs depends on which half of the pair)
+    // qs layout: 128 bytes, each byte = (hi_nibble | lo_nibble) for elements i and i+16.
+    // qs base = block_start + 16 (scales) + 32 (qh)
+    uint qs_base   = block_start + 48u;
+    uint qs_offset = qs_base + isb * 16u + (idx_in_sub % 16u);
+    uint qs_byte   = get_byte(qs_offset);
+    uint ql        = (idx_in_sub >= 16u) ? (qs_byte >> 4u) : (qs_byte & 0x0Fu);
+
+    // High bit from qh: each byte of qh covers 8 elements in pairs of sub-blocks.
+    // qh base = block_start + 16 (scales end)
+    uint qh_base   = block_start + 16u;
+    // Within the 256-element block, element in_sb maps to qh byte (in_sb / 8) and bit (in_sb % 8).
+    uint qh_byte   = get_byte(qh_base + in_sb / 8u);
+    uint qh_bit    = (qh_byte >> (in_sb % 8u)) & 1u;
+
+    uint q_val = ql | (qh_bit << 4u);  // 5-bit value [0..31]
+
+    return d * sc * float(q_val) - dmin * m_val;
+}
+
+shared float s_a[16][16];
+shared float s_b[16][16];
+
+void main() {
+    uint M = params.m;
+    uint N = params.n;
+    uint K = params.k;
+
+    uint bx = gl_WorkGroupID.x;
+    uint by = gl_WorkGroupID.y;
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+
+    uint row = by * 16u + ty;
+    uint col = bx * 16u + tx;
+
+    // Q5_K: 256 elements per block, 176 bytes per block.
+    uint blocks_per_col = K / 256u;
+    uint col_stride     = blocks_per_col * 176u;
+
+    float acc = 0.0;
+
+    for (uint bk = 0u; bk < K; bk += 16u) {
+        if (row < M && (bk + tx) < K) {
+            s_a[ty][tx] = A[row * K + bk + tx];
+        } else {
+            s_a[ty][tx] = 0.0;
+        }
+
+        uint k_idx = bk + ty;
+        if (col < N && k_idx < K) {
+            uint sb_idx      = k_idx / 256u;
+            uint in_sb       = k_idx % 256u;
+            uint block_start = col * col_stride + sb_idx * 176u;
+            s_b[ty][tx] = dequant_q5k_element(block_start, in_sb);
+        } else {
+            s_b[ty][tx] = 0.0;
+        }
+
+        barrier();
+
+        for (uint k = 0u; k < 16u; ++k) {
+            acc += s_a[ty][k] * s_b[k][tx];
+        }
+
+        barrier();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}

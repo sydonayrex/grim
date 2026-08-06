@@ -278,10 +278,21 @@ pub fn cmd_oxidizer_convert(
     };
 
     let tensor_names = importance_scores.tensor_names.clone();
+    let name_to_idx: std::collections::HashMap<&str, usize> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), i))
+        .collect();
+    let imp_name_to_idx: std::collections::HashMap<&str, usize> = tensor_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), i))
+        .collect();
+
     let tensor_sizes = tensor_names
         .iter()
         .map(|name| {
-            if let Some(idx) = names.iter().position(|n| n == name) {
+            if let Some(&idx) = name_to_idx.get(name.as_str()) {
                 sizes[idx]
             } else {
                 0
@@ -309,7 +320,7 @@ pub fn cmd_oxidizer_convert(
     let full_bitwidths: Vec<u32> = names
         .iter()
         .map(|name| {
-            if let Some(idx) = tensor_names.iter().position(|n| n == name) {
+            if let Some(&idx) = imp_name_to_idx.get(name.as_str()) {
                 bitwidths[idx]
             } else {
                 default_bw
@@ -603,12 +614,7 @@ pub fn cmd_oxidizer_raven(
     let importance_scores = if Path::new(&format!("{}.importance.json", model_path)).exists() {
         load_importance_scores(&format!("{}.importance.json", model_path))?
     } else {
-        cmd_oxidizer_calibrate(
-            model_path,
-            output_path,
-            calibration_dataset,
-            &mut progress,
-        )?
+        cmd_oxidizer_calibrate(model_path, output_path, calibration_dataset, &mut progress)?
     };
 
     let default_bw = target_bpw.round() as u32;

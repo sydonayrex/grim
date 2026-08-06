@@ -6,7 +6,6 @@
 //! Reference: TOPS (Token Pruning via Attention Entropy) — keep top
 //! `preservation_ratio` tokens by importance = 1 / (entropy + eps).
 
-use std::cmp::min;
 
 use grim_tensor::{Shape, Tensor};
 

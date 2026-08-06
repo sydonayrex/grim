@@ -18,6 +18,10 @@ libloading = { version = "0.8", optional = true }
 # WASM runtime for sandboxed plugin execution
 wasmtime = { version = "28", features = ["async"], optional = true }
 
+[dev-dependencies]
+grim-backend-cpu = { workspace = true }
+wat = "1.0"
+
 [features]
 default = []
 wasm-sandbox = ["wasmtime"]

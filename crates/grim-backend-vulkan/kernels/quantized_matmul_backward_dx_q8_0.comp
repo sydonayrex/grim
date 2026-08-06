@@ -1,19 +1,34 @@
+// Q8_0 quantized backward — dX[M,K] = dY[M,N] @ dequant(B)[N,K]^T
+// Residual-aware: outlier binary search, backup1/backup2 layers, STE grad_scale.
 #version 450
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+// Extended push-constant block (60 bytes = 15 × u32).
+// Fields 0–5 mirror the shared `Params` prefix; fields 6–14 are residual/STE.
 layout(push_constant) uniform Params {
-    uint size;
-    uint dim;
+    uint pad0;            // unused (kept for layout prefix compat)
+    uint pad1;            // unused (kept for layout prefix compat)
     uint k;
     uint n;
     uint m;
-    float eps;
+    float pad_eps;        // unused (kept for layout prefix compat)
+    uint default_bpw;     // bitwidth for generic unpack (backup layers)
+    uint outlier_count;   // count of outlier overrides
+    uint backup1_bpw;     // bitwidth of backup1 codes (0 = absent)
+    uint backup1_codes_offset;
+    uint backup1_scale_offset;
+    uint backup2_bpw;     // bitwidth of backup2 codes (0 = absent)
+    uint backup2_codes_offset;
+    uint backup2_scale_offset;
+    float grad_scale;     // STE gradient scale (1.0 = identity)
 } params;
 
-layout(std430, binding = 0) readonly buffer BufDY { float dY[]; };
-layout(std430, binding = 1) readonly buffer BufB { uint B_bytes[]; };
-layout(std430, binding = 2) writeonly buffer BufDX { float dX[]; };
+layout(std430, binding = 0) readonly  buffer BufDY             { float dY[]; };
+layout(std430, binding = 1) readonly  buffer BufB              { uint B_bytes[]; };
+layout(std430, binding = 2) writeonly buffer BufDX            { float dX[]; };
+layout(std430, binding = 3) readonly  buffer BufOutlierIndices { uint outlier_indices[]; };
+layout(std430, binding = 4) readonly  buffer BufOutlierValues  { float outlier_values[]; };
 
 uint get_byte(uint byte_idx) {
     uint word = B_bytes[byte_idx / 4u];
@@ -23,7 +38,7 @@ uint get_byte(uint byte_idx) {
 float unpack_f16(uint lo, uint hi) {
     uint bits = lo | (hi << 8u);
     uint sign = (bits >> 15u) & 1u;
-    uint exp = (bits >> 10u) & 31u;
+    uint exp  = (bits >> 10u) & 31u;
     uint mant = bits & 1023u;
     float value;
     if (exp == 0u) {
@@ -43,21 +58,110 @@ float dequant_q8_0(uint block_start, uint in_block) {
     return scale * float(signed_value);
 }
 
+// Generic MSB-first bit-packed dequant for backup layers (ResidualPacked convention).
+float unpack_weight(uint base_offset, uint row, uint col_idx, uint K, uint bpw) {
+    uint row_bytes = ((K * bpw + 7u) / 8u + 255u) & ~255u;
+    uint row_start = base_offset + row * row_bytes;
+
+    uint bit_offset     = col_idx * bpw;
+    uint byte_offset    = row_start + bit_offset / 8u;
+    uint in_byte_offset = bit_offset % 8u;
+    uint bits_left      = 8u - in_byte_offset;
+
+    uint code = 0u;
+    if (bits_left >= bpw) {
+        uint shift = bits_left - bpw;
+        code = (get_byte(byte_offset) >> shift) & ((1u << bpw) - 1u);
+    } else {
+        uint high_bits = bits_left;
+        uint low_bits  = bpw - high_bits;
+        uint high_part = get_byte(byte_offset) & ((1u << high_bits) - 1u);
+        uint low_part  = (get_byte(byte_offset + 1u) >> (8u - low_bits)) & ((1u << low_bits) - 1u);
+        code = (high_part << low_bits) | low_part;
+    }
+
+    float levels     = float(1u << bpw);
+    float normalized = float(code) / (levels - 1.0);
+    return normalized * 2.0 - 1.0;
+}
+
+// Binary search over sorted outlier_indices[]; sets out_val and returns true
+// when flat_idx matches. flat_idx = col * K + k_idx in the [N, K] weight view.
+bool find_outlier(uint flat_idx, out float out_val) {
+    if (params.outlier_count == 0u) {
+        out_val = 0.0;
+        return false;
+    }
+    uint low  = 0u;
+    uint high = params.outlier_count - 1u;
+    while (low <= high) {
+        uint mid = low + (high - low) / 2u;
+        uint mid_idx = outlier_indices[mid];
+        if (mid_idx == flat_idx) {
+            out_val = outlier_values[mid];
+            return true;
+        } else if (mid_idx < flat_idx) {
+            low = mid + 1u;
+        } else {
+            high = mid - 1u;
+        }
+    }
+    out_val = 0.0;
+    return false;
+}
+
 void main() {
-    uint row = gl_GlobalInvocationID.y;
+    uint M  = params.m;
+    uint N  = params.n;
+    uint K  = params.k;
+
+    uint row   = gl_GlobalInvocationID.y;
     uint k_idx = gl_GlobalInvocationID.x;
-    uint M = params.m;
-    uint N = params.n;
-    uint K = params.k;
+
     if (row >= M || k_idx >= K) return;
 
     uint row_bytes = ((K + 31u) / 32u) * 34u;
-    uint block = k_idx / 32u;
-    uint in_block = k_idx % 32u;
+    uint block     = k_idx / 32u;
+    uint in_block  = k_idx % 32u;
+
     float acc = 0.0;
-    for (uint n = 0u; n < N; ++n) {
-        uint block_start = n * row_bytes + block * 34u;
-        acc += dY[row * N + n] * dequant_q8_0(block_start, in_block);
+    for (uint col = 0u; col < N; ++col) {
+        float dy_val = dY[row * N + col];
+
+        float w_val = 0.0;
+        uint flat_weight_idx = col * K + k_idx;
+        float outlier_val;
+        if (find_outlier(flat_weight_idx, outlier_val)) {
+            w_val = outlier_val;
+        } else {
+            // Q8_0 primary dequant (scale embedded in block header).
+            uint block_start = col * row_bytes + block * 34u;
+            w_val = dequant_q8_0(block_start, in_block);
+
+            // Backup1 residual layer (generic bit-packed).
+            if (params.backup1_bpw > 0u) {
+                float b_val = unpack_weight(params.backup1_codes_offset, col, k_idx, K, params.backup1_bpw);
+                float b_scale = 1.0;
+                if (params.backup1_scale_offset > 0u) {
+                    b_scale = float(get_byte(params.backup1_scale_offset + col)) / 255.0;
+                }
+                w_val += b_val * b_scale;
+            }
+
+            // Backup2 residual layer (generic bit-packed).
+            if (params.backup2_bpw > 0u) {
+                float b2_val = unpack_weight(params.backup2_codes_offset, col, k_idx, K, params.backup2_bpw);
+                float b2_scale = 1.0;
+                if (params.backup2_scale_offset > 0u) {
+                    b2_scale = float(get_byte(params.backup2_scale_offset + col)) / 255.0;
+                }
+                w_val += b2_val * b2_scale;
+            }
+        }
+
+        // STE: scale the gradient contribution. grad_scale = 1.0 for identity.
+        acc += dy_val * w_val * params.grad_scale;
     }
+
     dX[row * K + k_idx] = acc;
 }

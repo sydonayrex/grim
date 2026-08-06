@@ -42,6 +42,17 @@ pub enum ModalityHint {
     VisionEncoder,
     AudioEncoderDecoder,
     Diffusion,
+    MultimodalInTextOut,
+}
+
+/// Inputs for multimodal causal models (text + vision patches + audio mel frames).
+#[derive(Debug, Clone)]
+pub struct MultimodalInputs {
+    pub input_ids: Tensor,
+    pub image_patches: Option<Tensor>,
+    pub mel_frames: Option<Tensor>,
+    pub image_placeholder_mask: Option<Vec<usize>>,
+    pub audio_placeholder_mask: Option<Vec<usize>>,
 }
 
 /// Every model implements this. It says nothing about modality.
@@ -63,6 +74,17 @@ pub trait CausalLm: Model {
         &self,
         session: &mut dyn crate::session::SessionT,
         input_ids: &Tensor,
+        positions: &Tensor,
+        adapters: &[AdapterHandle],
+    ) -> Result<Tensor>;
+}
+
+/// Multimodal autoregressive generation — accepts text tokens + vision/audio inputs.
+pub trait MultimodalCausalLm: CausalLm {
+    fn forward_multimodal(
+        &self,
+        session: &mut dyn crate::session::SessionT,
+        inputs: &MultimodalInputs,
         positions: &Tensor,
         adapters: &[AdapterHandle],
     ) -> Result<Tensor>;

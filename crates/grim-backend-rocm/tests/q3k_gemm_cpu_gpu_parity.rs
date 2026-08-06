@@ -80,9 +80,9 @@ fn dequant_q3k_element_host(block: &[u8; 110], in_sb: usize) -> f32 {
         sc[j * 4 + 3] = ((w >> 24) & 0xFF) as i8;
     }
 
-    let n = in_sb / 128;            // 0 or 1
-    let _j = (in_sb % 128) / 32;    // 0..3
-    let lo_hi = (in_sb % 32) / 16;  // 0 or 1
+    let n = in_sb / 128; // 0 or 1
+    let _j = (in_sb % 128) / 32; // 0..3
+    let lo_hi = (in_sb % 32) / 16; // 0 or 1
     let l = in_sb % 16;
     let sc_idx = n * 8 + _j * 2 + lo_hi;
     let dl = d * ((sc[sc_idx] as i32 - 32) as f32);
@@ -157,7 +157,9 @@ fn test_q3k_gpu_gemm_matches_cpu_dequant_reference() -> TestResult {
     assert_eq!(b_packed.len(), n * row_bytes);
 
     // A is plain fp32 (m x k).
-    let a_host: Vec<f32> = (0..(m * k) as u32).map(|i| (i as f32 * 0.07).cos()).collect();
+    let a_host: Vec<f32> = (0..(m * k) as u32)
+        .map(|i| (i as f32 * 0.07).cos())
+        .collect();
 
     let a_shape = Shape::from_slice(&[m, k]);
     let a_rocm = dev.from_cpu(&a_host, &a_shape, DType::F32)?;
@@ -171,8 +173,7 @@ fn test_q3k_gpu_gemm_matches_cpu_dequant_reference() -> TestResult {
         },
     )?;
     let out_shape = Shape::from_slice(&[m, n]);
-    let (c_rocm, _) =
-        dev.quantized_matmul(a_rocm.as_ref(), b_rocm.as_ref(), &[], &out_shape)?;
+    let (c_rocm, _) = dev.quantized_matmul(a_rocm.as_ref(), b_rocm.as_ref(), &[], &out_shape)?;
     let c_gpu = c_rocm.to_cpu_vec_f32()?;
 
     // CPU reference: c[m,n] = sum_k a[m,k] * b_f32[k,n]
@@ -192,14 +193,20 @@ fn test_q3k_gpu_gemm_matches_cpu_dequant_reference() -> TestResult {
         .zip(c_gpu.iter())
         .map(|(r, g)| (r - g).abs())
         .fold(0.0f32, f32::max);
-    let rel = if max_abs == 0.0 { max_err } else { max_err / max_abs };
+    let rel = if max_abs == 0.0 {
+        max_err
+    } else {
+        max_err / max_abs
+    };
     assert!(
         rel < 2e-5,
         "Q3_K forward GEMM max_rel_err {rel:.3e} (max_abs {max_abs}) exceeds 2e-5"
     );
 
     // ── Backward: dX = dY @ B^T, dX[m,k] = dY[m,n] @ B[k,n]^T ──────────────
-    let dy_host: Vec<f32> = (0..(m * n) as u32).map(|i| (i as f32 * 0.11).sin()).collect();
+    let dy_host: Vec<f32> = (0..(m * n) as u32)
+        .map(|i| (i as f32 * 0.11).sin())
+        .collect();
     let dy_shape = Shape::from_slice(&[m, n]);
     let dy_rocm = dev.from_cpu(&dy_host, &dy_shape, DType::F32)?;
     let dx_shape = Shape::from_slice(&[m, k]);
@@ -207,7 +214,7 @@ fn test_q3k_gpu_gemm_matches_cpu_dequant_reference() -> TestResult {
         dy_rocm.as_ref(),
         b_rocm.as_ref(),
         &[],
-        2,  // bpw hint for Q3_K (~2 bits/weight) — not used by the simple launcher
+        2, // bpw hint for Q3_K (~2 bits/weight) — not used by the simple launcher
         m,
         n,
         k,

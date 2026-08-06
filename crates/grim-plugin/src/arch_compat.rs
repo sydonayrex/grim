@@ -9,6 +9,29 @@ use grim_core::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Vision encoder sub-specification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VisionEncoderSpec {
+    pub vision_encoder_type: String,
+    pub decoder_dmodel: usize,
+    pub patch_size: usize,
+    pub temporal_patch_size: usize,
+    pub n_channels: usize,
+    pub n_layers: usize,
+    pub use_vision_norm: bool,
+}
+
+/// Audio encoder sub-specification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AudioEncoderSpec {
+    pub decoder_dmodel: usize,
+    pub n_mel_bins: usize,
+    pub mel_vocab_size: usize,
+    pub bias: bool,
+    pub use_audio_norm: bool,
+    pub audio_mode: String,
+}
+
 /// Architecture compatibility specification generated from HuggingFace `config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchCompatSpec {
@@ -27,6 +50,9 @@ pub struct ArchCompatSpec {
     pub max_seq_len: usize,
     pub is_moe: bool,
     pub is_ssm: bool,
+    pub is_multimodal: bool,
+    pub vision_spec: Option<VisionEncoderSpec>,
+    pub audio_spec: Option<AudioEncoderSpec>,
     pub expert_count: Option<usize>,
     pub expert_used_count: Option<usize>,
     pub tensor_name_mapping: HashMap<String, String>,
@@ -61,10 +87,20 @@ struct RawHfConfig {
     intermediate_size: Option<usize>,
     #[serde(rename = "max_position_embeddings")]
     max_position_embeddings: Option<usize>,
+    #[serde(rename = "model_max_length")]
+    model_max_length: Option<usize>,
     #[serde(rename = "num_local_experts")]
     num_local_experts: Option<usize>,
+    #[serde(rename = "n_routed_experts")]
+    n_routed_experts: Option<usize>,
     #[serde(rename = "num_experts_per_tok")]
     num_experts_per_tok: Option<usize>,
+    #[serde(rename = "text_config")]
+    text_config: Option<Box<RawHfConfig>>,
+    #[serde(rename = "vision_config")]
+    vision_config: Option<VisionEncoderSpec>,
+    #[serde(rename = "audio_config")]
+    audio_config: Option<AudioEncoderSpec>,
 }
 
 impl ArchCompatSpec {
@@ -73,31 +109,77 @@ impl ArchCompatSpec {
         let raw: RawHfConfig = serde_json::from_str(json_str)
             .map_err(|e| Error::Config(format!("Failed to parse HF config.json: {e}")))?;
 
+        let text = raw.text_config.as_deref();
+
         let model_type = raw
             .model_type
-            .or_else(|| raw.architectures.and_then(|a| a.first().cloned()))
+            .or_else(|| raw.architectures.as_ref().and_then(|a| a.first().cloned()))
+            .or_else(|| text.and_then(|t| t.model_type.clone()))
             .unwrap_or_else(|| "custom".to_string());
 
         let model_arch = ModelArchitecture::from_str(&model_type);
-        let hidden_size = raw.hidden_size.unwrap_or(4096);
-        let num_layers = raw.num_hidden_layers.unwrap_or(32);
-        let vocab_size = raw.vocab_size.unwrap_or(32000);
-        let num_heads = raw.num_attention_heads.unwrap_or(32);
-        let num_kv_heads = raw.num_key_value_heads.unwrap_or(num_heads);
-        let head_dim = raw.head_dim.unwrap_or_else(|| {
-            if num_heads > 0 {
-                hidden_size / num_heads
-            } else {
-                128
-            }
-        });
-        let intermediate_size = raw.intermediate_size.unwrap_or(hidden_size * 4);
-        let rms_norm_eps = raw.rms_norm_eps.or(raw.layer_norm_eps).unwrap_or(1e-5);
-        let rope_theta = raw.rope_theta.unwrap_or(10000.0);
-        let max_seq_len = raw.max_position_embeddings.unwrap_or(2048);
+        let hidden_size = raw
+            .hidden_size
+            .or_else(|| text.and_then(|t| t.hidden_size))
+            .unwrap_or(4096);
+        let num_layers = raw
+            .num_hidden_layers
+            .or_else(|| text.and_then(|t| t.num_hidden_layers))
+            .unwrap_or(32);
+        let vocab_size = raw
+            .vocab_size
+            .or_else(|| text.and_then(|t| t.vocab_size))
+            .unwrap_or(32000);
+        let num_heads = raw
+            .num_attention_heads
+            .or_else(|| text.and_then(|t| t.num_attention_heads))
+            .unwrap_or(32);
+        let num_kv_heads = raw
+            .num_key_value_heads
+            .or_else(|| text.and_then(|t| t.num_key_value_heads))
+            .unwrap_or(num_heads);
+        let head_dim = raw
+            .head_dim
+            .or_else(|| text.and_then(|t| t.head_dim))
+            .unwrap_or_else(|| {
+                if num_heads > 0 {
+                    hidden_size / num_heads
+                } else {
+                    128
+                }
+            });
+        let intermediate_size = raw
+            .intermediate_size
+            .or_else(|| text.and_then(|t| t.intermediate_size))
+            .unwrap_or(hidden_size * 4);
+        let rms_norm_eps = raw
+            .rms_norm_eps
+            .or(raw.layer_norm_eps)
+            .or_else(|| text.and_then(|t| t.rms_norm_eps.or(t.layer_norm_eps)))
+            .unwrap_or(1e-5);
+        let rope_theta = raw
+            .rope_theta
+            .or_else(|| text.and_then(|t| t.rope_theta))
+            .unwrap_or(10000.0);
+        let max_seq_len = raw
+            .max_position_embeddings
+            .or(raw.model_max_length)
+            .or_else(|| text.and_then(|t| t.max_position_embeddings.or(t.model_max_length)))
+            .unwrap_or(2048);
 
-        let is_moe = model_arch.is_moe() || raw.num_local_experts.is_some();
+        let expert_count = raw
+            .num_local_experts
+            .or(raw.n_routed_experts)
+            .or_else(|| text.and_then(|t| t.num_local_experts.or(t.n_routed_experts)));
+        let expert_used_count = raw
+            .num_experts_per_tok
+            .or_else(|| text.and_then(|t| t.num_experts_per_tok));
+
+        let is_moe = model_arch.is_moe() || expert_count.is_some();
         let is_ssm = model_arch.is_ssm();
+        let vision_spec = raw.vision_config;
+        let audio_spec = raw.audio_config;
+        let is_multimodal = vision_spec.is_some() || audio_spec.is_some();
 
         let tensor_name_mapping = TensorNamingRegistry::remap_hf_to_gguf(model_arch, num_layers);
 
@@ -117,8 +199,11 @@ impl ArchCompatSpec {
             max_seq_len,
             is_moe,
             is_ssm,
-            expert_count: raw.num_local_experts,
-            expert_used_count: raw.num_experts_per_tok,
+            is_multimodal,
+            vision_spec,
+            audio_spec,
+            expert_count,
+            expert_used_count,
             tensor_name_mapping,
         })
     }
@@ -192,5 +277,37 @@ mod tests {
 
         let json = spec.to_json().unwrap();
         assert!(json.contains("ling"));
+    }
+
+    #[test]
+    fn test_inkling_config_json_ingestion() {
+        let inkling_json =
+            std::fs::read_to_string("/D/rex/projects/grim/models/inkling/config.json")
+                .or_else(|_| std::fs::read_to_string("models/inkling/config.json"))
+                .expect("read inkling config.json");
+
+        let spec = ArchCompatSpec::from_hf_config_json(&inkling_json).unwrap();
+        assert_eq!(spec.model_type, "inkling_mm_model");
+        assert_eq!(spec.num_layers, 42);
+        assert_eq!(spec.hidden_size, 4096);
+        assert_eq!(spec.vocab_size, 201024);
+        assert_eq!(spec.num_heads, 32);
+        assert_eq!(spec.num_kv_heads, 8);
+        assert_eq!(spec.head_dim, 128);
+        assert_eq!(spec.max_seq_len, 1048576);
+        assert!(spec.is_moe);
+        assert!(spec.is_multimodal);
+        assert!(spec.vision_spec.is_some());
+        assert_eq!(spec.vision_spec.as_ref().unwrap().patch_size, 40);
+        assert!(spec.audio_spec.is_some());
+        assert_eq!(spec.audio_spec.as_ref().unwrap().n_mel_bins, 80);
+        assert_eq!(spec.expert_count, Some(256));
+        assert_eq!(spec.expert_used_count, Some(6));
+
+        let spec_json = spec.to_json().unwrap();
+        assert!(spec_json.contains("inkling_mm_model"));
+
+        let spec_toml = spec.to_toml().unwrap();
+        assert!(spec_toml.contains("inkling_mm_model"));
     }
 }

@@ -70,50 +70,8 @@ pub fn miopen_probe() -> Result<(), Error> {
     MiopenLib::load()?.probe()
 }
 
-// ---------------------------------------------------------------------------
-// F11 — RCCL (hard link; real libcrccl.so.1.0 in /opt/rocm/lib)
-// ---------------------------------------------------------------------------
-
-/// RCCL (NCCL) status code.
-pub type NcclResult = i32;
-#[allow(non_upper_case_globals)]
-pub const nccl_success: NcclResult = 0;
-
-/// Opaque RCCL communicator.
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy)]
-pub struct NcclComm(pub *mut c_void);
-unsafe impl Send for NcclComm {}
-unsafe impl Sync for NcclComm {}
-
-#[link(name = "rccl", kind = "dylib")]
-unsafe extern "C" {
-    pub fn ncclCommInitAll(comms: *mut NcclComm, ndev: i32, devlist: *const i32) -> NcclResult;
-    pub fn ncclCommDestroy(comm: NcclComm) -> NcclResult;
-}
-
-/// Initialize one communicator per device in `devlist`. `world_size` must be [see: `accel_features.rs`, `Err`, `devlist`, `ndev`]
-pub fn rccl_init_all(devlist: &[i32]) -> Result<Vec<NcclComm>, Error> {
-    if devlist.is_empty() {
-        return Err(Error::Backend("RCCL: empty devlist".into()));
-    }
-    let ndev = devlist.len() as i32;
-    let mut comms: Vec<NcclComm> = vec![NcclComm(std::ptr::null_mut()); devlist.len()];
-    let status = unsafe { ncclCommInitAll(comms.as_mut_ptr(), ndev, devlist.as_ptr()) };
-    if status != nccl_success {
-        return Err(Error::Backend(format!(
-            "RCCL ncclCommInitAll failed: {status}"
-        )));
-    }
-    // Guarantee no leak if the caller drops the Vec without destroying:
-    for c in comms.iter() {
-        if c.0.is_null() {
-            continue;
-        }
-        unsafe { ncclCommDestroy(*c) };
-    }
-    Ok(comms)
-}
+// F11 — RCCL FFI moved to its own module `rccl` (ownership + `Drop` for
+// communicators live there). Nothing RCCL-related remains in this file.
 
 // F8 — Composable Kernel (ck_tile) GEMM used to live here as a C FFI [see: `grim_ck_gemm_f16`, `src/device/ck_gemm.cpp`]
 #[cfg(test)]
@@ -125,12 +83,5 @@ mod self_tests {
     fn f9_miopen_absent_errors_cleanly() {
         let r = miopen_probe();
         assert!(r.is_err(), "MIOpen must error cleanly when .so is absent");
-    }
-
-    // F11 — RCCL symbol must resolve at link time (the lib is real in
-    #[test]
-    fn f11_rccl_linked() {
-        // A dangling symbol would be a link error, not a runtime one. The
-        assert!(true, "RCCL linked + symbols resolved (build-time check)");
     }
 }

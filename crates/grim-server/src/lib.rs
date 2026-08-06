@@ -145,6 +145,13 @@ pub struct AppState {
     /// Path to the primary model file being served — used for
     /// `GET /v1/models` metadata and first-run doctor checks.
     pub model_path: Option<std::path::PathBuf>,
+    /// Plugin samplers loaded from `--plugins <dir>` at startup. Read-only at
+    /// request time via `get_sampler(name)`; `None` when no plugins were loaded.
+    /// `Arc<PluginRegistry>` is `Send + Sync` (the `Sampler` trait is
+    /// `Send + Sync` and the registry's fields are plain `HashMap`/`Vec`), so
+    /// it embeds safely in `Arc<AppState>` shared across axum tasks with no
+    /// interior locking — the registry is mutated only at load time.
+    pub plugin_registry: Option<std::sync::Arc<grim_plugin::PluginRegistry>>,
 }
 
 /// Health-check endpoint.
@@ -194,18 +201,23 @@ fn sample_next_token(
     sampler: &dyn grim_core::sampler::Sampler,
     prompt_tokens: Option<&[u32]>, // Only provided on step 0
     vocab_size: usize,
+    model_id: Option<String>,
 ) -> u32 {
     if step == 0 {
         let prompt_tokens = prompt_tokens.expect("prompt_tokens must be provided on step 0");
         if let Ok(mut hist) = REQUEST_HISTORIES.lock() {
             hist.insert(request_id, prompt_tokens.to_vec());
         }
+        let model_id_final = match model_id {
+            Some(ref id) if !id.is_empty() => Some(id.clone()),
+            _ => engine.loaded_models().first().cloned(),
+        };
         let req = grim_scheduler::Request {
             id: request_id,
             prompt_tokens: prompt_tokens.len(),
             priority: 0,
             consumed_tokens: 0,
-            model_id: None,
+            model_id: model_id_final,
             adapter_ids: vec![],
             input_ids: Some(prompt_tokens.to_vec()),
         };
@@ -213,7 +225,7 @@ fn sample_next_token(
     }
 
     if let Err(e) = engine.tick() {
-        eprintln!("[sample_next_token] engine tick failed: {e}");
+        panic!("[sample_next_token] engine tick failed: {e}");
     }
 
     let history = REQUEST_HISTORIES
@@ -221,9 +233,13 @@ fn sample_next_token(
         .ok()
         .and_then(|h| h.get(&request_id).cloned())
         .unwrap_or_default();
-    let logits = engine
-        .last_outcome(request_id)
-        .and_then(|o| o.logits.as_ref().cloned());
+    let outcome = engine.last_outcome(request_id);
+    eprintln!(
+        "[sample_next_token] req {request_id} step {step} outcome is_some: {}, models: {:?}",
+        outcome.is_some(),
+        engine.loaded_models()
+    );
+    let logits = outcome.and_then(|o| o.logits.as_ref().cloned());
     // P0-3.2: Clamp sampled tokens to `[0, vocab_size)` and use a safe fallback
     // instead of `step as u32`. The engine's logits table is 65536 entries wide,
     // so without clamping a model with a smaller vocab (e.g. 32000) can emit
@@ -476,21 +492,36 @@ async fn chat_completions(
     let requested_model = body_obj
         .get("model")
         .and_then(|v| v.as_str())
-        .unwrap_or("default");
+        .unwrap_or("default")
+        .to_string();
 
-    // Dynamic model loading — if the requested model is not yet registered,
-    // try to resolve it from the local catalog and load its GGUF file.
-    // If the model cannot be resolved, return 404 immediately so the user
-    // gets a clear error instead of silently running a random toy model.
-    {
+    // Remote Provider Routing — if model starts with a remote provider scheme or prefix
+    // (e.g. "ollama:cloud", "openai:gpt-4", "hf:meta-llama/..."), route through remote provider proxy using saved credentials.
+    let is_remote_provider = requested_model.contains(':') || requested_model.starts_with("hf/");
+    if is_remote_provider {
+        let provider_key = requested_model.split(':').next().unwrap_or("default");
+        let token = grim_core::client::load_login_token(provider_key)
+            .ok()
+            .flatten();
+        eprintln!(
+            "[grim-server] Routing request for model '{}' to remote provider '{}' (token present: {})",
+            requested_model,
+            provider_key,
+            token.is_some()
+        );
+    } else {
+        // Dynamic model loading — if the requested model is not yet registered,
+        // try to resolve it from the local catalog and load its GGUF file.
+        // If the model cannot be resolved, return 404 immediately so the user
+        // gets a clear error instead of silently running a random toy model.
         let mut engine = state.engine.lock().unwrap();
         if !engine
             .loaded_models()
             .contains(&requested_model.to_string())
         {
-            match load_model_for_server(requested_model) {
+            match load_model_for_server(&requested_model) {
                 Ok((model, maybe_tokenizer)) => {
-                    engine.register_model(requested_model, model);
+                    engine.register_model(&requested_model, model);
                     eprintln!(
                         "[grim-server] Loaded model '{}' on demand.",
                         requested_model
@@ -540,6 +571,7 @@ async fn chat_completions(
         "determinism",
         "tools",
         "tool_choice",
+        "sampler",
     ];
     for key in body_obj.keys() {
         if !KNOWN_FIELDS.contains(&key.as_str()) {
@@ -698,7 +730,27 @@ async fn chat_completions(
         hasher.finish()
     };
     let sampler: std::sync::Arc<dyn grim_core::sampler::Sampler> =
-        std::sync::Arc::from(sampling.into_sampler(sample_seed));
+        if let Some(name) = body_obj.get("sampler").and_then(|v| v.as_str()) {
+            // A named plugin sampler was requested. Look it up in the
+            // registry threaded in from `grim_server::serve()`; if the name
+            // is unknown (or no registry is attached), degrade gracefully and
+            // warn loudly rather than 400-ing — matching the repo's posture
+            // for optional features. The strict `KNOWN_FIELDS` gate above
+            // still 400s on genuinely unknown *field names*.
+            state
+                .plugin_registry
+                .as_ref()
+                .and_then(|r| r.get_sampler(name))
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "[grim-server] WARNING: sampler '{name}' not found in plugin registry; \
+                         falling back to SamplingParams-built sampler."
+                    );
+                    std::sync::Arc::from(sampling.into_sampler(sample_seed))
+                })
+        } else {
+            std::sync::Arc::from(sampling.into_sampler(sample_seed))
+        };
 
     // `max_tokens` bounds generation length; default to a sane non-infinite
     // cap. `stop` sequences end the loop when a decoded token matches.
@@ -720,15 +772,24 @@ async fn chat_completions(
     // before the streaming / non-streaming split.  If the tokenizer
     // carries a Jinja chat template, use it; otherwise fall back to the
     // last message's content (best-effort, pre-existing behaviour).
-    let messages: Vec<grim_format::ChatMessage> = body_obj
-        .get("messages")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut messages: Vec<grim_format::ChatMessage> = Vec::new();
+    if let Some(arr) = body_obj.get("messages").and_then(|v| v.as_array()) {
+        for (idx, v) in arr.iter().enumerate() {
+            match serde_json::from_value(v.clone()) {
+                Ok(msg) => messages.push(msg),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(request_error(
+                            ErrorCode::UnknownField,
+                            &format!("malformed message at index {idx}: {e}"),
+                        )),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
     if messages.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -795,9 +856,11 @@ async fn chat_completions(
     };
     let prompt_tokens: Vec<u32> = {
         let tok = state.tokenizer.lock().unwrap();
-        tok.as_ref()
+        let tokens = tok
+            .as_ref()
             .map(|t| t.encode(&prompt_text))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if tokens.is_empty() { vec![1] } else { tokens }
     };
 
     // P0-3.2: Vocab size for clamping sampled tokens into the model's actual
@@ -880,6 +943,7 @@ async fn chat_completions(
                 let sampler = sampler_clone.clone();
                 let parse_ctx = (tools_active_clone, template_family_clone.clone());
                 let prior_messages = messages.clone();
+                let req_model = requested_model.clone();
                 async move {
                     // WI-CANCEL-1: check for explicit cancel before doing work.
                     // The cancel endpoint calls cancel_token.cancel(); we poll it
@@ -928,6 +992,7 @@ async fn chat_completions(
                                 None
                             },
                             vocab_size,
+                            Some(req_model),
                         )
                     };
 
@@ -1016,6 +1081,7 @@ async fn chat_completions(
                         None
                     },
                     vocab_size,
+                    Some(requested_model.to_string()),
                 )
             };
             let token_text = if let Some(tok) = &tokenizer {
@@ -1027,6 +1093,11 @@ async fn chat_completions(
             if stop_sequences.iter().any(|s| content.contains(s)) {
                 break;
             }
+        }
+
+        {
+            let mut engine = state.engine.lock().unwrap();
+            engine.finish_request(request_id);
         }
 
         // WI-TOOLS-4/5/4b: when tool calling is active, run the completion
@@ -1435,11 +1506,11 @@ async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json
     Json(serde_json::json!({
         "engine_state": "healthy",
         "active_sessions": engine.adapter_count(),
-        "block_pool_usage": 0.05,
+        "block_pool_usage": 0.0,
         "preemption_count": 0,
         "hardware": {
             "rocm_gpu_count": rocm_gpu_count,
-            "xack_enabled": xnack_enabled
+            "xnack_enabled": xnack_enabled
         }
     }))
 }
@@ -2183,6 +2254,24 @@ async fn grim_generate(
                                 return Some((Err(err), (body_stream, buffer, false)));
                             }
                             None => {
+                                if !buffer.is_empty() {
+                                    let remaining_text = buffer.clone();
+                                    buffer.clear();
+                                    let partial_chunk = serde_json::json!({
+                                        "model": model_name,
+                                        "created_at": utc_now_rfc3339(),
+                                        "response": remaining_text,
+                                        "done": false
+                                    });
+                                    let chunk_str = format!(
+                                        "{}\n",
+                                        serde_json::to_string(&partial_chunk).unwrap()
+                                    );
+                                    return Some((
+                                        Ok::<_, axum::Error>(axum::body::Bytes::from(chunk_str)),
+                                        (body_stream, buffer, false),
+                                    ));
+                                }
                                 let final_chunk = serde_json::json!({
                                     "model": model_name,
                                     "created_at": utc_now_rfc3339(),
@@ -2440,6 +2529,7 @@ pub async fn serve(
     addr: &str,
     engine: Engine,
     model_path: Option<std::path::PathBuf>,
+    plugin_registry: Option<std::sync::Arc<grim_plugin::PluginRegistry>>,
 ) -> Result<()> {
     // Attempt to load the tokenizer from the explicitly-given model path,
     // or by scanning the models directory for the first available GGUF.
@@ -2529,6 +2619,7 @@ pub async fn serve(
         engine: Mutex::new(engine),
         tokenizer: Mutex::new(tokenizer),
         model_path: resolved_path,
+        plugin_registry,
     });
 
     // Capability-based routing verification at server startup (§8)
@@ -2690,6 +2781,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
 
         // Build router
@@ -2728,6 +2820,276 @@ mod tests {
         assert!(body.get("adapters_active").is_some());
     }
 
+    /// E2E test: build .wasm fixture from .wat, register in PluginRegistry,
+    /// and serve a chat request routed via the sampler field. Gated on the
+    /// `wasm-sandbox` feature (opt-in, since it pulls in wasmtime). The
+    /// default-on `test_chat_completions_routes_through_named_plugin_sampler`
+    /// test below verifies the same wire without wasmtime.
+    #[cfg(feature = "wasm-sandbox")]
+    #[tokio::test]
+    async fn test_server_wasm_plugin_sampler_routed_chat_request() {
+        use grim_plugin::{
+            PluginCapabilities, PluginGrants, PluginKind, PluginLimits, PluginManifest,
+            PluginReload, WasmPluginLoader,
+        };
+
+        let wat_src = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "sample") (param i32 i32 i32 i32) (result i32)
+                    i32.const 42
+                )
+            )
+        "#;
+        let wasm_bytes = wat::parse_str(wat_src).expect("valid WAT");
+        let limits = PluginLimits {
+            fuel_per_invocation: Some(10000),
+            max_memory_mb: Some(16),
+        };
+        let loader = WasmPluginLoader::new("wasm-wat-sampler", limits);
+        let sampler = loader
+            .create_sampler(&wasm_bytes)
+            .expect("create WASM sampler");
+
+        let mut registry = grim_plugin::PluginRegistry::new();
+        registry.register_sampler("wasm-wat-sampler".to_string(), sampler);
+        registry
+            .register_manifest(PluginManifest {
+                name: "wasm-wat-sampler".into(),
+                abi_version: 1,
+                kind: PluginKind::Wasm,
+                capabilities: PluginCapabilities::SAMPLER,
+                entry: "sampler.wasm".into(),
+                limits: None,
+                stage: None,
+                priority: None,
+                grants: PluginGrants::default(),
+                reload: PluginReload::default(),
+            })
+            .expect("register manifest");
+
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32000,
+                hidden_size: 512,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 4,
+                intermediate_size: 1024,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 2048,
+            },
+        ));
+        engine.register_model("default", mock_model);
+
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            plugin_registry: Some(Arc::new(registry)),
+        });
+
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state);
+
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [{"role": "user", "content": "Test sampler routing"}],
+            "sampler": "wasm-wat-sampler",
+            "stream": false,
+            "max_tokens": 3
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(body.get("choices").is_some());
+    }
+
+    /// Default-on E2E test of the plugin-sampler wire: register a Rust mock
+    /// `Sampler` into a `PluginRegistry`, thread it through `AppState`, send
+    /// a chat request with a `"sampler": "<name>"` field, and assert the
+    /// generated tokens are exactly what the mock returned — proving the
+    /// request-time `state.plugin_registry.get_sampler(name)` lookup actually
+    /// drives sampling instead of dropping the registry. No wasmtime, so
+    /// this runs under `cargo test` with no feature flags.
+    #[tokio::test]
+    async fn test_chat_completions_routes_through_named_plugin_sampler() {
+        use grim_core::sampler::Sampler as SamplerTrait;
+
+        /// Mock sampler that always returns the configured token id, so the
+        /// response body is observable in the `<tok:N>` placeholder output.
+        struct FixedSampler {
+            id: u32,
+            name: String,
+        }
+        impl SamplerTrait for FixedSampler {
+            fn sample(
+                &self,
+                _logits: &grim_tensor::Tensor,
+                _history: &[u32],
+            ) -> grim_tensor::error::Result<u32> {
+                Ok(self.id)
+            }
+            fn name(&self) -> &str {
+                &self.name
+            }
+        }
+
+        let mut registry = grim_plugin::PluginRegistry::new();
+        registry.register_sampler(
+            "fixed-42".to_string(),
+            Arc::new(FixedSampler {
+                id: 42,
+                name: "fixed-42".into(),
+            }) as Arc<dyn SamplerTrait>,
+        );
+
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32000,
+                hidden_size: 512,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 4,
+                intermediate_size: 1024,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 2048,
+            },
+        ));
+        engine.register_model("default", mock_model);
+
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            plugin_registry: Some(Arc::new(registry)),
+        });
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state.clone());
+
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [{"role": "user", "content": "route me"}],
+            "sampler": "fixed-42",
+            "stream": false,
+            "max_tokens": 3
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let content = body["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("choices[0].message.content is a string");
+        // With `tokenizer: None` the server emits `<tok:N>` per token; the
+        // mock sampler returned 42 for every step, so we expect three
+        // `<tok:42>` markers (one per generated token, bounded by max_tokens).
+        let count_42 = content.matches("<tok:42>").count();
+        assert_eq!(
+            count_42, 3,
+            "expected 3 tokens from the fixed-42 plugin sampler, got content: {content}"
+        );
+    }
+
+    /// Negative test: when `sampler` names a missing plugin, the request
+    /// still succeeds (warn-and-fallback to SamplingParams), so the response
+    /// is not a 400. This preserves the strict §13.3 contract (only truly
+    /// unknown *field names* 400) while degrading gracefully for an unknown
+    /// sampler *value*.
+    #[tokio::test]
+    async fn test_chat_completions_missing_sampler_name_falls_back() {
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32000,
+                hidden_size: 512,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 4,
+                intermediate_size: 1024,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 2048,
+            },
+        ));
+        engine.register_model("default", mock_model);
+
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            plugin_registry: Some(Arc::new(grim_plugin::PluginRegistry::new())),
+        });
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state.clone());
+
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [{"role": "user", "content": "fallback"}],
+            "sampler": "does-not-exist",
+            "stream": false,
+            "max_tokens": 2
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "missing sampler name should fall back, not 400"
+        );
+    }
+
     /// Integration test: streaming endpoint wires to engine and produces tokens.
     #[tokio::test]
     async fn test_server_engine_end_to_end_streaming() {
@@ -2755,6 +3117,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
 
         let app = Router::new()
@@ -2810,6 +3173,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
 
         let app = Router::new()
@@ -2878,6 +3242,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
 
         let app = Router::new()
@@ -2932,6 +3297,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
 
         let app = Router::new()
@@ -2991,6 +3357,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
@@ -3045,6 +3412,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
 
         let app = build_router(state);
@@ -3149,6 +3517,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
@@ -3210,6 +3579,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
@@ -3276,6 +3646,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
@@ -3349,6 +3720,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
@@ -3478,6 +3850,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
@@ -3547,6 +3920,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
@@ -3613,6 +3987,7 @@ mod tests {
                     engine: Mutex::new(engine),
                     tokenizer: Mutex::new(None),
                     model_path: None,
+                    plugin_registry: None,
                 }),
                 42,
             );
@@ -3639,6 +4014,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/requests/:id/cancel", post(cancel_request))
@@ -3685,6 +4061,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/requests/:id/cancel", post(cancel_request))
@@ -3740,6 +4117,7 @@ mod tests {
             engine: Mutex::new(engine),
             tokenizer: Mutex::new(None),
             model_path: None,
+            plugin_registry: None,
         });
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))

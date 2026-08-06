@@ -528,17 +528,17 @@ pub fn tp_all_reduce(
 pub struct RcclAllReduce {
     /// Number of GPUs participating in the data-parallel group.
     pub num_gpus: u32,
-    /// Underlying NCCL communicator. `None` when `num_gpus <= 1` or the
-    /// `rccl` feature is disabled.
+    /// Underlying NCCL communicators (one per GPU rank). Empty when `num_gpus <= 1`
+    /// or the `rccl` feature is disabled.
     #[allow(dead_code)] // read only inside #[cfg(feature = "rccl")]
-    comm: Option<NcclComm>,
+    comms: Vec<NcclComm>,
 }
 
 impl RcclAllReduce {
     /// Create a communicator over the explicitly selected device ordinals.
     ///
     /// The old constructor inferred ordinals as `0..num_gpus`, which is not a
-    /// valid contract once rank selection can be non-contiguous.  Multi-GPU
+    /// valid contract once rank selection can be non-contiguous. Multi-GPU
     /// callers must now provide the same ordinals used to construct replicas;
     /// initialization failure is returned instead of becoming a silent
     /// local-only training run.
@@ -547,35 +547,35 @@ impl RcclAllReduce {
         if num_gpus <= 1 {
             return Ok(Self {
                 num_gpus,
-                comm: None,
+                comms: Vec::new(),
             });
         }
-        let comm = Self::init_comm(device_ordinals)?;
-        Ok(Self { num_gpus, comm })
+        let comms = Self::init_comm(device_ordinals)?;
+        Ok(Self { num_gpus, comms })
     }
 
     #[cfg(feature = "rccl")]
-    fn init_comm(device_ordinals: &[usize]) -> Result<Option<NcclComm>> {
+    fn init_comm(device_ordinals: &[usize]) -> Result<Vec<NcclComm>> {
         let ndev = device_ordinals.len() as i32;
         let devlist: Vec<i32> = device_ordinals
             .iter()
             .map(|&ordinal| ordinal as i32)
             .collect();
-        let mut comm = NcclComm(std::ptr::null_mut());
-        // SAFETY: devlist contains `ndev` valid device ordinals; comm is a
-        // local with stable address for the call.
-        let status = unsafe { ncclCommInitAll(&mut comm, ndev, devlist.as_ptr()) };
+        let mut comms = vec![NcclComm(std::ptr::null_mut()); device_ordinals.len()];
+        // SAFETY: devlist contains `ndev` valid device ordinals; comms has
+        // space allocated for `ndev` communicators.
+        let status = unsafe { ncclCommInitAll(comms.as_mut_ptr(), ndev, devlist.as_ptr()) };
         if status != NCCL_SUCCESS {
             return Err(Error::Backend(format!(
                 "RCCL communicator initialization failed for ordinals {:?} (status {})",
                 device_ordinals, status
             )));
         }
-        Ok(Some(comm))
+        Ok(comms)
     }
 
     #[cfg(not(feature = "rccl"))]
-    fn init_comm(_device_ordinals: &[usize]) -> Result<Option<NcclComm>> {
+    fn init_comm(_device_ordinals: &[usize]) -> Result<Vec<NcclComm>> {
         Err(Error::Backend(
             "multi-GPU RCCL training requires the `rccl` feature flag".into(),
         ))
@@ -603,11 +603,16 @@ impl RcclAllReduce {
         }
         #[cfg(feature = "rccl")]
         {
-            let Some(comm) = self.comm else {
+            let comm = self
+                .comms
+                .first()
+                .copied()
+                .unwrap_or(NcclComm(std::ptr::null_mut()));
+            if comm.0.is_null() {
                 return Err(Error::Backend(
                     "RCCL communicator is unavailable for a multi-GPU reduction".into(),
                 ));
-            };
+            }
             // SAFETY: send/recv must be valid device pointers for `count`
             // f32 elements; comm must be a valid NCCL communicator; stream
             // must be a valid HIP stream (0 = default). These invariants
@@ -662,7 +667,7 @@ impl RcclAllReduce {
 impl Drop for RcclAllReduce {
     fn drop(&mut self) {
         #[cfg(feature = "rccl")]
-        if let Some(comm) = self.comm.take() {
+        for comm in self.comms.drain(..) {
             if !comm.0.is_null() {
                 // Best-effort destroy; ignore status.
                 unsafe {

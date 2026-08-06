@@ -103,8 +103,7 @@ pub fn shard_raw_tensor(
         raw.dtype.arith.byte_size()
     } else if matches!(raw.provenance, QuantProvenance::ExternalQat { .. }) {
         return Err(Error::Unimplemented(
-            "quantized shard requires provider override (GgufProvider::get_packed_sharded)"
-                .into(),
+            "quantized shard requires provider override (GgufProvider::get_packed_sharded)".into(),
         ));
     } else {
         return Err(Error::Unimplemented(
@@ -135,7 +134,7 @@ pub fn shard_raw_tensor(
         // Column-parallel: contiguous row slice.
         let shard_rows = rows / world_size;
         let start_row = rank * shard_rows;
-        let end_row = start_row + shard_rows;
+        let _end_row = start_row + shard_rows;
         let row_stride = cols * elem_size;
         let start_byte = start_row * row_stride;
         let shard_bytes = &raw.bytes[start_byte..start_byte + shard_rows * row_stride];

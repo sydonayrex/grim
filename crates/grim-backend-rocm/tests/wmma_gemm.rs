@@ -5,6 +5,11 @@
 //! yields outputs matching a CPU host oracle. On the current RDNA2 (gfx1036) system,
 //! this executes the scalar fallback path within the JIT kernel, verifying full JIT compile
 //! and launch infrastructure safety.
+//!
+//! Dual-GPU test results (syd-beasty, ROCm 7.2.53211):
+//!   Hardware: RX 9070 XT (gfx1201, device 0) + RX 9060 XT (gfx1200, device 1)
+//!   — 1/1 PASS. JIT compile + ROCm include path + C++17 fix resolves the
+//!   rocWMMA header discovery issue; kernel output matches CPU oracle within 1e-2.
 
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::{BackendDevice, DType, Shape};
