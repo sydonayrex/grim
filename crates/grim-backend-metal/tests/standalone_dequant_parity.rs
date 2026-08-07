@@ -1,16 +1,9 @@
-//! GPU-vs-CPU validation for the standalone dequant launchers.
+//! GPU-vs-CPU validation for the standalone Metal dequant launchers.
 //!
 //! Run with:
-//!   cargo test -p grim-backend-rocm --test standalone_dequant_parity -- --nocapture
-//!
-//! On a real ROCm device: `GRIM_RUN_GPU_TESTS=1 ... -- --ignored`.
-//!
-//! FP8 / MXFP4 / MXFP8 kernels are expected to be bit-exact against the CPU
-//! oracles in `grim_quant`. The IQ kernels use a simplified index-as-scale model
-//! and are expected to *deviate*; we only assert they run and we record max_err
-//! so the deviation is visible in the log.
+//!   cargo test -p grim-backend-metal --test standalone_dequant_parity -- --nocapture
 
-use grim_backend_rocm::RocmDevice;
+use grim_backend_metal::MetalDevice;
 use grim_quant::{
     dequant_fp8, dequant_iq2s, dequant_iq2xs, dequant_iq2xxs, dequant_iq3s, dequant_iq3xxs,
     dequant_iq4nl, dequant_iq4xs, dequant_mxfp4, dequant_mxfp8, dequant_q4k,
@@ -82,7 +75,6 @@ fn build_fp8_bytes(n: usize, scale: f32) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(4 + n);
     bytes.extend_from_slice(&scale.to_le_bytes());
     for i in 0..n {
-        // Exercise subnormals (exp=0), normals, negatives, and one NaN.
         let code = match i % 8 {
             0 => 0x00,                    // +0 subnormal
             1 => 0x01,                    // +1*2^-9 subnormal (mant=1)
@@ -99,16 +91,13 @@ fn build_fp8_bytes(n: usize, scale: f32) -> Vec<u8> {
 }
 
 /// Build an MXFP single-buffer roster (length-prefixed codes/exps segments).
-/// `code_for` returns one code byte per element; nibble-packed for MXFP4.
 fn build_mxfp_bytes(n: usize, codes_per_2: bool, exps: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::new();
     let codes: Vec<u8> = (0..n)
         .map(|i| {
             if codes_per_2 {
-                let nib = (i % 15) as u8; // 0..=14, all valid E2M1 codes
-                nib
+                (i % 15) as u8
             } else {
-                // One full E4M3 byte per element, exercising subnormals.
                 match i % 8 {
                     0 => 0x00,
                     1 => 0x01,
@@ -141,8 +130,8 @@ fn build_mxfp_bytes(n: usize, codes_per_2: bool, exps: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn dev() -> RocmDevice {
-    RocmDevice::try_new(0).expect("RocmDevice::try_new(0) should succeed on a system with ROCm")
+fn dev() -> MetalDevice {
+    MetalDevice::new(0).expect("MetalDevice::new(0) should succeed")
 }
 
 fn assert_bit_exact(name: &str, got: &[f32], expected: &[f32]) {
@@ -170,7 +159,6 @@ fn assert_bit_exact(name: &str, got: &[f32], expected: &[f32]) {
 }
 
 #[test]
-#[ignore = "requires real ROCm device; run manually with GRIM_RUN_GPU_TESTS=1 and -- --ignored"]
 fn q8_0_kernel_matches_cpu_oracle() {
     let bytes = build_q8_0_bytes();
     let n = 64;
@@ -181,7 +169,6 @@ fn q8_0_kernel_matches_cpu_oracle() {
 }
 
 #[test]
-#[ignore = "requires real ROCm device; run manually with GRIM_RUN_GPU_TESTS=1 and -- --ignored"]
 fn q4k_kernel_matches_cpu_oracle() {
     let bytes = build_q4k_bytes();
     let n = 256;
@@ -192,7 +179,6 @@ fn q4k_kernel_matches_cpu_oracle() {
 }
 
 #[test]
-#[ignore = "requires real ROCm device; run manually with GRIM_RUN_GPU_TESTS=1 and -- --ignored"]
 fn fp8_kernel_matches_cpu_oracle() {
     let n: usize = 512;
     let scale = 2.0f32;
@@ -200,7 +186,6 @@ fn fp8_kernel_matches_cpu_oracle() {
     let expected = dequant_fp8(&bytes, n).unwrap();
     let got = dev().dequantize_fp8_host(&bytes, n).unwrap();
 
-    // Prove the subnormal fix explicitly: code 0x01 -> mant=1, exp=0 -> 1/512, *2.
     let expected_sub = (1.0f32 / 512.0) * scale;
     assert!(
         same_val(got[1], expected_sub),
@@ -213,7 +198,6 @@ fn fp8_kernel_matches_cpu_oracle() {
 }
 
 #[test]
-#[ignore = "requires real ROCm device; run manually with GRIM_RUN_GPU_TESTS=1 and -- --ignored"]
 fn mxfp4_kernel_matches_cpu_oracle() {
     let n: usize = 512;
     let exps = vec![127u8; n.div_ceil(32)];
@@ -225,7 +209,6 @@ fn mxfp4_kernel_matches_cpu_oracle() {
 }
 
 #[test]
-#[ignore = "requires real ROCm device; run manually with GRIM_RUN_GPU_TESTS=1 and -- --ignored"]
 fn mxfp8_kernel_matches_cpu_oracle() {
     let n: usize = 512;
     let exps = vec![127u8; n.div_ceil(32)];
@@ -278,7 +261,6 @@ fn run_iq(
 }
 
 #[test]
-#[ignore = "requires real ROCm device; run manually with GRIM_RUN_GPU_TESTS=1 and -- --ignored"]
 fn iq_kernels_run_and_report_deviation() {
     run_iq("iq2xxs", 66, &|b, n| dequant_iq2xxs(b, n));
     run_iq("iq2xs", 74, &|b, n| dequant_iq2xs(b, n));

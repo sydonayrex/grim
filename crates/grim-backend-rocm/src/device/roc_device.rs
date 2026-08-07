@@ -2160,6 +2160,15 @@ impl BackendDevice for RocmDevice {
         ))
     }
 
+    fn quantize(
+        &self,
+        x: &dyn BackendStorage,
+        format: grim_tensor::QuantFormat,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let (out, _handle) = self.quantize_on_device(x, format)?;
+        Ok(out)
+    }
+
     fn advise(
         &self,
         storage: &dyn BackendStorage,
@@ -2262,6 +2271,7 @@ impl BackendDevice for RocmDevice {
         a: &dyn BackendStorage,
         b_packed: &dyn BackendStorage,
         _b_scales: &[f32],
+        _format: grim_tensor::QuantFormat,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         FUSED_FORWARD_DISPATCH_STATS
@@ -2335,23 +2345,9 @@ impl BackendDevice for RocmDevice {
                 self.launch_fused_dequant_gemm_iq4xs(a_storage, b_storage, &out_storage, m, n, k)?;
             }
             DTypeStorage::KQuant(KQuantScheme::Q80) => {
-                // Q8_0 is a simple per-block dequant (34 bytes → 32 F32 values). [see: `matmul`, `b_f32_ref`]
-                let b_n_weights = b_storage.shape().elem_count();
-                let b_dims_local = b_storage.shape().dims();
-                let (k_local, n_local) = (b_dims_local[0], b_dims_local[1]);
-                let b_f32_storage = RocmStorage::alloc_gpu(
-                    &Shape::new(vec![n_local, k_local]),
-                    DType {
-                        arith: ArithType::F32,
-                        storage: DTypeStorage::Native,
-                    },
-                    &self.allocator,
-                    self.ordinal,
-                )?;
-                let n_blocks = (b_n_weights + 31) / 32;
-                self.launch_dequant_q8_0(b_storage, &b_f32_storage, n_blocks * 32)?;
-                let b_f32_ref: &dyn BackendStorage = &b_f32_storage;
-                return self.matmul(a, b_f32_ref, out_shape);
+                // Q8_0 uses the fused dequant+GEMM kernel (34-byte blocks → F32), matching
+                // the other KQuant schemes rather than falling back to dequant+matmul.
+                self.launch_fused_dequant_gemm_q8_0(a_storage, b_storage, &out_storage, m, n, k)?;
             }
             DTypeStorage::Block(BlockDtype::Fp8)
             | DTypeStorage::FloatPack(FloatPackScheme::Fp8) => {
@@ -4971,7 +4967,7 @@ impl RocmDevice {
     }
 
     /// Dequantize Q8_0 packed bytes to an f32 host Vec via the ROCm kernel.
-    fn dequantize_q8_0_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+    pub fn dequantize_q8_0_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
         let packed = RocmStorage::copy_from_host_raw_bytes(
             bytes,
             &Shape::new(vec![bytes.len()]),
@@ -5011,7 +5007,7 @@ impl RocmDevice {
     }
 
     /// Dequantize Q4_K packed bytes to an f32 host Vec via the ROCm kernel.
-    fn dequantize_q4k_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+    pub fn dequantize_q4k_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
         let packed = RocmStorage::copy_from_host_raw_bytes(
             bytes,
             &Shape::new(vec![bytes.len()]),
@@ -5084,7 +5080,7 @@ impl RocmDevice {
             other => {
                 return Err(Error::Backend(format!(
                     "dequantize_iq_host: unknown kernel {other}"
-                )))
+                )));
             }
         }
         let mut values = self.read_to_host_async(&out_storage)?;
@@ -5159,7 +5155,12 @@ impl RocmDevice {
 
     /// Helper to split an MXFP single-buffer (length-prefixed codes/exps segments) into two device buffers.
     /// Reuses the same framing as `grim_quant::dequant_mxfp4`/`dequant_mxfp8`.
-    fn split_dequant_mxfp(&self, bytes: &[u8], elem_count: usize, kernel: &str) -> Result<Vec<f32>> {
+    fn split_dequant_mxfp(
+        &self,
+        bytes: &[u8],
+        elem_count: usize,
+        kernel: &str,
+    ) -> Result<Vec<f32>> {
         let mut cursor = 0usize;
         let read_segment = |buf: &[u8], cur: &mut usize| -> Result<Vec<u8>> {
             let len = u64::from_le_bytes(
@@ -5699,6 +5700,166 @@ impl RocmDevice {
         Ok((
             Box::new(storage),
             Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
+    /// Fused Add + RMSNorm kernel.
+    /// Computes `y = x + residual` and `norm_out = RMSNorm(y, weight, eps)` in a single HIP kernel pass.
+    pub fn fused_add_rms_norm(
+        &self,
+        x: &dyn BackendStorage,
+        residual: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        eps: f32,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let x_s = as_rocm(x)?;
+        let res_s = as_rocm(residual)?;
+        let w_s = as_rocm(weight)?;
+        if !x_s.device_ptr_is_valid() || !res_s.device_ptr_is_valid() || !w_s.device_ptr_is_valid()
+        {
+            return Err(Error::Backend(
+                "fused_add_rms_norm: inputs lack a valid device pointer".into(),
+            ));
+        }
+        let x_dims = x.shape().dims();
+        if x_dims.is_empty() {
+            return Err(Error::Shape("fused_add_rms_norm: empty input".into()));
+        }
+        let row_len = *x_dims.last().unwrap();
+        let total = out_shape.elem_count();
+        let y_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let norm_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut x_ptr = dev_ptr(x_s)?;
+        let mut res_ptr = dev_ptr(res_s)?;
+        let mut w_ptr = dev_ptr(w_s)?;
+        let mut y_out_ptr = dev_ptr(&y_storage)?;
+        let mut norm_out_ptr = dev_ptr(&norm_storage)?;
+        let mut row_len_i = row_len as i32;
+        let mut eps_f = eps;
+        let mut total_i = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_add_rms_norm",
+            grid,
+            block,
+            &mut [
+                arg(&mut x_ptr),
+                arg(&mut res_ptr),
+                arg(&mut w_ptr),
+                arg(&mut y_out_ptr),
+                arg(&mut norm_out_ptr),
+                arg(&mut row_len_i),
+                arg(&mut eps_f),
+                arg(&mut total_i),
+            ],
+        )?;
+        Ok((
+            Box::new(y_storage),
+            Box::new(norm_storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
+    /// Launch standalone Q8_0 quantization HIP kernel.
+    pub fn launch_quant_q8_0(
+        &self,
+        x: &RocmStorage,
+        out: &RocmStorage,
+        total: usize,
+    ) -> Result<*mut c_void> {
+        let (grid, block) = linear_launch((total + 31) / 32);
+        let mut x_ptr = dev_ptr(x)?;
+        let mut out_ptr = dev_ptr(out)?;
+        let mut total_i = total as i32;
+
+        self.launch_compute_kernel(
+            "grim_quant_q8_0",
+            grid,
+            block,
+            &mut [arg(&mut x_ptr), arg(&mut out_ptr), arg(&mut total_i)],
+        )
+    }
+
+    /// Launch standalone FP8 E4M3 quantization HIP kernel.
+    pub fn launch_quant_fp8(
+        &self,
+        x: &RocmStorage,
+        out: &RocmStorage,
+        total: usize,
+    ) -> Result<*mut c_void> {
+        let (grid, block) = linear_launch(total);
+        let mut x_ptr = dev_ptr(x)?;
+        let mut out_ptr = dev_ptr(out)?;
+        let mut total_i = total as i32;
+
+        self.launch_compute_kernel(
+            "grim_quant_fp8",
+            grid,
+            block,
+            &mut [arg(&mut x_ptr), arg(&mut out_ptr), arg(&mut total_i)],
+        )
+    }
+
+    /// Quantize F32 tensor `x` on-device to `format`.
+    pub fn quantize_on_device(
+        &self,
+        x: &dyn BackendStorage,
+        format: grim_tensor::QuantFormat,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = as_rocm(x)?;
+        if !x_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "quantize_on_device: input lacks valid device pointer".into(),
+            ));
+        }
+        let total = x.shape().elem_count();
+        use grim_tensor::{FloatPackScheme, KQuantScheme, QuantFormat};
+        let (out_bytes, output_dtype) = match format {
+            QuantFormat::Q8_0 => {
+                let n_blocks = (total + 31) / 32;
+                (
+                    n_blocks * 34,
+                    DType {
+                        arith: ArithType::F32,
+                        storage: DTypeStorage::KQuant(KQuantScheme::Q80),
+                    },
+                )
+            }
+            QuantFormat::Fp8 => (
+                4 + total,
+                DType {
+                    arith: ArithType::F32,
+                    storage: DTypeStorage::FloatPack(FloatPackScheme::Fp8),
+                },
+            ),
+            other => {
+                return Err(Error::Backend(format!(
+                    "quantize_on_device: unsupported format {:?}",
+                    other
+                )));
+            }
+        };
+
+        let out_shape = Shape::from_slice(&[out_bytes]);
+        let out_storage =
+            RocmStorage::alloc_gpu(&out_shape, output_dtype, &self.allocator, self.ordinal)?;
+
+        let stream = match format {
+            QuantFormat::Q8_0 => self.launch_quant_q8_0(x_s, &out_storage, total)?,
+            QuantFormat::Fp8 => self.launch_quant_fp8(x_s, &out_storage, total)?,
+            _ => unreachable!(),
+        };
+
+        Ok((
+            Box::new(out_storage),
+            Box::new(RocmHandle::new(Some(stream))),
         ))
     }
 

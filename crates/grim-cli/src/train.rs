@@ -1,8 +1,7 @@
 //! `grim train` — SFT training loop: dataset loading, streaming forward, cross-entropy loss, autograd backward, AdamW step, sidecar persistence. F4: real model loading via GrimProvider.
 
 use grim_autograd::{
-    AutogradRegistry, InjectionConfig, LoRAInjectionRegistry, Tape, backward,
-    cross_entropy_loss,
+    AutogradRegistry, InjectionConfig, LoRAInjectionRegistry, Tape, backward, cross_entropy_loss,
 };
 use grim_core::error::{Error, Result};
 use grim_engine::streaming_forward::StreamingBlockForward;

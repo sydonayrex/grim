@@ -163,6 +163,32 @@ pub enum FloatPackScheme {
     MxFp8,
 }
 
+/// Target quantization format for the device-side `quantize` path.
+///
+/// Mirrors the CPU `grim_quant::quant_*` reference functions. Selected
+/// variants (Q8_0, Fp8) have device-side kernels on CUDA/Metal/ROCm/Vulkan;
+/// the rest fall back to `Err(Unimplemented)` when dispatched through
+/// `BackendDevice::quantize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuantFormat {
+    Q8_0,
+    Q4K,
+    Q5K,
+    Q6K,
+    Fp4,
+    Nf4,
+    Fp8,
+    Fp4Block16,
+    Fp8Block16,
+    Iq4Nl,
+    Iq4Xs,
+    Iq3Xxs,
+    Iq3S,
+    Iq2Xxs,
+    Iq2Xs,
+    Iq2S,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GroupQuantScheme {
     Symmetric,

@@ -6,7 +6,6 @@
 //! Reference: TOPS (Token Pruning via Attention Entropy) — keep top
 //! `preservation_ratio` tokens by importance = 1 / (entropy + eps).
 
-
 use grim_tensor::{Shape, Tensor};
 
 /// Configuration for TOPS token pruning.

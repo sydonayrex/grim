@@ -1,6 +1,6 @@
 //! Backend-agnostic trait surface and device capabilities.
 
-use crate::dtype::{DType, QuantProvenance};
+use crate::dtype::{DType, QuantFormat, QuantProvenance};
 use crate::error::Result;
 use crate::shape::Shape;
 
@@ -725,17 +725,18 @@ pub trait BackendDevice: Send + Sync {
 
     /// Fused dequantized matmul forward (`C = A @ B_dequant^T`).
     ///
-    /// Computes matrix multiplication where `B` is a quantized tensor (Q4_K, FP8, MXFP4, MXFP8, etc.).
-    /// Default implementation falls back to `matmul`.
+    /// Computes matrix multiplication where `B` is a quantized tensor with the specified `format`.
+    /// Contracts and hardware dispatches are validated against `format` specifications.
     fn quantized_matmul(
         &self,
         _a: &dyn BackendStorage,
         _b_packed: &dyn BackendStorage,
         _b_scales: &[f32],
+        _format: QuantFormat,
         _out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         Err(crate::error::Error::Unimplemented(
-            "quantized_matmul requires a backend with fused dequantized matmul kernels (ROCm)"
+            "quantized_matmul requires a backend with fused dequantized matmul kernels"
                 .into(),
         ))
     }
@@ -763,6 +764,55 @@ pub trait BackendDevice: Send + Sync {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         Err(crate::error::Error::Unimplemented(
             "quantized_matmul_backward_dx requires ROCm (fused_dequant_backward_gemm_f16)".into(),
+        ))
+    }
+
+    /// Quantize a device-resident F32 tensor into a packed quantized representation,
+    /// entirely on-device — no D2H/H2D round-trip.
+    ///
+    /// This is the device-side mirror of the CPU `grim_quant::quant_*` reference
+    /// functions. It enables per-step activation/gradient quantization inside
+    /// the training loop (e.g. for QAT or gradient compression) without
+    /// stalling on a host synchronization.
+    ///
+    /// The returned storage holds the raw packed bytes with the appropriate
+    /// `Storage` dtype (e.g. `KQuant(Q80)`, `FloatPack(Fp8)`). Backends that
+    /// do not wire a device kernel return `Err(Unimplemented)` so the caller
+    /// can fall back to the CPU reference.
+    ///
+    /// Currently supported device-side formats: `QuantFormat::Q8_0`, `QuantFormat::Fp8`.
+    fn quantize(
+        &self,
+        _x: &dyn BackendStorage,
+        _format: QuantFormat,
+    ) -> Result<Box<dyn BackendStorage>> {
+        Err(crate::error::Error::Unimplemented(
+            "quantize not implemented for this backend".into(),
+        ))
+    }
+
+    /// Fused quantize + matmul: quantize the left operand `a` on-the-fly to
+    /// `format`, then compute `out = a_quant @ b`.
+    ///
+    /// Both `a` `(M, K)` and `b` `(K, N)` are F32 device-resident tensors. The
+    /// kernel quantizes each 32-element block of `a` (per-row for Q8_0, or
+    /// per-element for FP8) inline inside the GEMM, injecting quantization
+    /// noise into the forward activations without a separate quantize pass or
+    /// host round-trip. This mirrors the existing `quantized_matmul` /
+    /// `fused_dequant_gemm` family but targets the *activations* operand rather
+    /// than the frozen *weights* operand.
+    ///
+    /// Default returns `Err(Unimplemented)`; only backends with a wired fused
+    /// kernel (CUDA, Vulkan) override this.
+    fn fused_quant_gemm(
+        &self,
+        _a: &dyn BackendStorage,
+        _b: &dyn BackendStorage,
+        _format: QuantFormat,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "fused_quant_gemm not implemented for this backend".into(),
         ))
     }
 }

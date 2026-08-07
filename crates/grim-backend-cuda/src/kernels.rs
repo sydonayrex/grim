@@ -681,4 +681,238 @@ extern "C" __global__ void grim_dequant_mxfp4(const unsigned char* __restrict__ 
     unsigned char code = (i % 2 == 0) ? (code_byte & 0x0F) : ((code_byte >> 4) & 0x0F);
     out[i] = grim_mxfp4_to_f32(code, shared_exp);
 }
+
+// ---- MXFP8 (length-prefixed codes + E8M0 shared exponents) -----------------
+extern "C" __global__ void grim_dequant_mxfp8(const unsigned char* __restrict__ codes,
+                                               const unsigned char* __restrict__ exps,
+                                               float* __restrict__ out, int n_values) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_values) return;
+    int group_idx = i / 32;
+    unsigned char shared_exp = exps[group_idx];
+    unsigned char code = codes[i];
+    float base_val = grim_fp8_e4m3_to_f32(code);
+    float scale = powf(2.0f, (float)shared_exp - 127.0f);
+    out[i] = base_val * scale;
+}
+
+// ---- Q4_K (144 B / 256 weights) ----------------------------------------------
+extern "C" __global__ void grim_dequant_q4k(const unsigned char* __restrict__ packed,
+                                             float* __restrict__ out, int n_blocks) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+
+    const unsigned char* blk = packed + b * 144;
+    const unsigned short* h_ptr = (const unsigned short*)blk;
+    float d = grim_f16_to_f32(h_ptr[0]);
+    float dmin = grim_f16_to_f32(h_ptr[1]);
+
+    const unsigned char* scales = blk + 4;
+    const unsigned char* qs = blk + 16;
+    float* o = out + b * 256;
+
+    int is = 0;
+    int qs_idx = 0;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float sc1, m1, sc2, m2;
+        grim_get_scale_min_k4(is + 0, scales, &sc1, &m1);
+        grim_get_scale_min_k4(is + 1, scales, &sc2, &m2);
+        float d_sc1 = d * sc1;
+        float d_m1 = dmin * m1;
+        float d_sc2 = d * sc2;
+        float d_m2 = dmin * m2;
+        #pragma unroll
+        for (int l = 0; l < 32; ++l) {
+            float q1 = (float)(qs[qs_idx + l] & 0x0F);
+            float q2 = (float)(qs[qs_idx + l] >> 4);
+            o[l]      = d_sc1 * q1 - d_m1;
+            o[l + 32] = d_sc2 * q2 - d_m2;
+        }
+        o += 64;
+        is += 2;
+        qs_idx += 32;
+    }
+}
+
+// ---- Q8_0 (34 B / 32 weights) ------------------------------------------------
+extern "C" __global__ void grim_dequant_q8_0(const unsigned char* __restrict__ packed,
+                                              float* __restrict__ out, int n_blocks) {
+    int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= n_blocks * 32) return;
+
+    int block_idx = id / 32;
+    int in_block = id % 32;
+    const unsigned char* block_ptr = packed + block_idx * 34;
+    const unsigned short* h_ptr = (const unsigned short*)block_ptr;
+    float d = grim_f16_to_f32(h_ptr[0]);
+    signed char q = (signed char)block_ptr[2 + in_block];
+    out[id] = d * (float)q;
+}
+
+// ===========================================================================
+//  Device-side quantization kernels — bit-accurate ports of the CPU reference
+//  `grim_quant::quant_*` (lib.rs). These enable per-step activation/gradient
+//  quantization without a D2H/H2D round-trip.
+// ===========================================================================
+
+// f32 → f16 conversion (mirrors grim_quant::f32_to_f16, lib.rs:2531).
+// Truncating rounding (no round-to-nearest), matching the CPU reference exactly.
+__device__ inline unsigned short grim_f32_to_f16(float v) {
+    unsigned int bits = __float_as_int(v);
+    unsigned int sign = (bits >> 31) & 1u;
+    int exp = (int)((bits >> 23) & 0xFFu);
+    unsigned int mant = bits & 0x7FFFFFu;
+    if (exp == 0) return (unsigned short)(sign << 15);
+    if (exp >= 0x8D) return (unsigned short)((sign << 15) | 0x7C00u); // overflow → inf
+    if (exp <= 0x70) return (unsigned short)(sign << 15);              // underflow → 0
+    int new_exp = exp - 127 + 15;
+    if (new_exp <= 0) return (unsigned short)(sign << 15);
+    return (unsigned short)((sign << 15) | ((unsigned int)new_exp << 10) | (mant >> 13));
+}
+
+// f32 → FP8 E4M3 conversion (mirrors grim_quant::f32_to_fp8_e4m3, lib.rs:1662).
+__device__ inline unsigned char grim_f32_to_fp8_e4m3(float v) {
+    if (isnan(v)) return 0x7F; // NaN in E4M3
+    unsigned char sign = signbit(v) ? 0x80u : 0u;
+    float abs_v = fabsf(v);
+    if (abs_v == 0.0f) return sign;
+
+    unsigned int bits = __float_as_int(abs_v);
+    int raw_exp = (int)((bits >> 23) & 0xFFu) - 127;
+    unsigned int raw_mant = bits & 0x007FFFFFu;
+
+    int e4m3_exp = raw_exp + 7;
+
+    if (e4m3_exp <= 0) {
+        int shift = 1 - e4m3_exp;
+        if (shift > 4) return sign;
+        unsigned int full_mant = 0x00800000u | raw_mant;
+        unsigned int mant = (full_mant >> (20 + shift)) & 0x07u;
+        return sign | (unsigned char)mant;
+    }
+    if (e4m3_exp >= 15) return sign | 0x7Eu;
+
+    unsigned char mant = (unsigned char)(raw_mant >> 20);
+    return sign | ((unsigned char)e4m3_exp << 3) | (mant & 0x07u);
+}
+
+// ---- Standalone Q8_0 quantization (34 B / 32 weights) ------------------------
+// Mirrors grim_quant::quant_q80 (lib.rs:1397). One CUDA block (32 threads) per
+// Q8_0 block. Thread 0 finds amax via warp shuffle, computes the f16 scale, and
+// writes it; all 32 threads then encode their i8 code in parallel.
+extern "C" __global__ void grim_quant_q8_0(const float* __restrict__ x,
+                                            unsigned char* __restrict__ out, int n_blocks) {
+    int blk = blockIdx.x;
+    int lane = threadIdx.x; // 0..31
+    if (blk >= n_blocks) return;
+
+    const float* bx = x + blk * 32;
+    unsigned char* bout = out + blk * 34;
+
+    // Each thread loads its value (zero-pad if the tensor tail is short).
+    float val = (blk * 32 + lane) < n_blocks * 32 ? bx[lane] : 0.0f;
+    float abs_val = fabsf(val);
+
+    // Warp-level reduction for amax (32 threads = one warp).
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other = __shfl_xor_sync(0xFFFFFFFFu, abs_val, offset);
+        if (other > abs_val) abs_val = other;
+    }
+    float amax = abs_val; // broadcast to all lanes
+
+    float scale = (amax == 0.0f) ? 1.0f : (amax / 127.0f);
+    unsigned short scale_f16 = grim_f32_to_f16(scale);
+
+    if (lane == 0) {
+        bout[0] = (unsigned char)(scale_f16 & 0xFFu);
+        bout[1] = (unsigned char)((scale_f16 >> 8) & 0xFFu);
+    }
+
+    // Encode: q = round(val / scale), clamped to [-128, 127].
+    float q_f = (scale == 0.0f) ? 0.0f : (val / scale);
+    q_f = rintf(q_f);
+    if (q_f > 127.0f) q_f = 127.0f;
+    if (q_f < -128.0f) q_f = -128.0f;
+    bout[2 + lane] = (unsigned char)(signed char)q_f;
+}
+
+// ---- Standalone FP8 E4M3 quantization (4-byte f32 scale + 1 byte/weight) -----
+// Mirrors grim_quant::quant_fp8 (lib.rs:1647). One thread per weight. The
+// scale header is always 1.0f (matching the CPU reference).
+extern "C" __global__ void grim_quant_fp8(const float* __restrict__ x,
+                                          unsigned char* __restrict__ out, int n_weights) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_weights) return;
+
+    // Thread 0 of block 0 writes the 4-byte f32 scale header (1.0f).
+    if (i == 0) {
+        unsigned int scale_bits = __float_as_int(1.0f);
+        out[0] = (unsigned char)(scale_bits & 0xFFu);
+        out[1] = (unsigned char)((scale_bits >> 8) & 0xFFu);
+        out[2] = (unsigned char)((scale_bits >> 16) & 0xFFu);
+        out[3] = (unsigned char)((scale_bits >> 24) & 0xFFu);
+    }
+
+    out[4 + i] = grim_f32_to_fp8_e4m3(x[i]);
+}
+
+// ---- Fused quantize + GEMM: Q8_0 activations ---------------------------------
+// Computes C = A_quant @ B where A is quantized to Q8_0 on-the-fly per
+// 32-element K-block. Each thread computes one output element C[row, col].
+// Grid: (ceil(N/32), ceil(M/8)), Block: (32, 8).
+extern "C" __global__ void grim_fused_quant_gemm_q8_0(const float* __restrict__ A,
+                                                       const float* __restrict__ B,
+                                                       float* __restrict__ C,
+                                                       int M, int N, int K) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    float sum = 0.0f;
+    int blocks_per_row = K / 32;
+
+    for (int b_idx = 0; b_idx < blocks_per_row; ++b_idx) {
+        // Inline Q8_0 quantization of A[row, b_idx*32 .. b_idx*32+31].
+        const float* a_block = A + row * K + b_idx * 32;
+        float amax = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            float a = fabsf(a_block[i]);
+            if (a > amax) amax = a;
+        }
+        float scale = (amax == 0.0f) ? 1.0f : (amax / 127.0f);
+
+        // Dot product: quantize-dequantize A, multiply by B.
+        const float* b_block = B + (b_idx * 32) * N + col;
+        for (int i = 0; i < 32; ++i) {
+            float q_f = (scale == 0.0f) ? 0.0f : rintf(a_block[i] / scale);
+            if (q_f > 127.0f) q_f = 127.0f;
+            if (q_f < -128.0f) q_f = -128.0f;
+            float a_deq = q_f * scale;
+            sum += a_deq * b_block[i * N];
+        }
+    }
+
+    C[row * N + col] = sum;
+}
+
+// ---- Fused quantize + GEMM: FP8 E4M3 activations -----------------------------
+// Computes C = A_quant @ B where A is quantized to FP8 E4M3 on-the-fly
+// per-element (round-trip through fp8_e4m3). Each thread computes one output.
+extern "C" __global__ void grim_fused_quant_gemm_fp8(const float* __restrict__ A,
+                                                      const float* __restrict__ B,
+                                                      float* __restrict__ C,
+                                                      int M, int N, int K) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    float sum = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        unsigned char fp8_code = grim_f32_to_fp8_e4m3(A[row * K + k]);
+        float a_deq = grim_fp8_e4m3_to_f32(fp8_code);
+        sum += a_deq * B[k * N + col];
+    }
+    C[row * N + col] = sum;
+}
 "#;

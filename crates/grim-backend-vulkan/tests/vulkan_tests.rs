@@ -97,7 +97,7 @@ fn test_vulkan_fused_dequant_gemm_q80_dispatch_accepts_q80_dtype() {
     let b_storage = dev.from_cpu_bytes(&b_bytes, &shape_b, q80_dtype).unwrap();
 
     let (out_storage, _) = dev
-        .quantized_matmul(&*a_storage, &*b_storage, &b_scales, &shape_out)
+        .quantized_matmul(&*a_storage, &*b_storage, &b_scales, grim_tensor::QuantFormat::Q8_0, &shape_out)
         .unwrap();
 
     // Verify output shape — the primary invariant for this dispatch correctness test.

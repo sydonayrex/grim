@@ -21,6 +21,7 @@ pub mod q5k_gemm;
 pub mod q6k_gemm;
 pub mod q8_0_dequant;
 pub mod qkv_attention;
+pub mod quant_standalone;
 pub mod rwkv;
 pub mod selective_scan;
 pub mod shared_device_fns;

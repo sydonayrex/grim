@@ -15,7 +15,7 @@ pub use backend::{
 };
 pub use dtype::{
     ArithType, BlockDtype, DType, Device, FloatPackScheme, GpuIntConfig, GroupQuantScheme,
-    KQuantScheme, QuantProvenance, Storage,
+    KQuantScheme, QuantFormat, QuantProvenance, Storage,
 };
 pub use error::{Error, Result};
 pub use provider::{RawTensor, TensorMeta, TensorProvider};

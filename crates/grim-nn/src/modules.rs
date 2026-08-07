@@ -272,17 +272,15 @@ impl RowParallelLinear {
         if self.tp_config.world_size > 1 {
             let dev = pick_device_for_tensor(&out);
             let s: &dyn grim_tensor::BackendStorage = out.storage().as_ref();
-            let (storage, handle) = dev
-                .all_reduce(&[s], "sum")
-                .map_err(|e| {
-                    Error::Backend(format!(
-                        "RowParallelLinear::forward all_reduce failed on backend {:?} with \
+            let (storage, handle) = dev.all_reduce(&[s], "sum").map_err(|e| {
+                Error::Backend(format!(
+                    "RowParallelLinear::forward all_reduce failed on backend {:?} with \
                          world_size={}: {e}. This backend has no all_reduce implementation; \
                          set GRIM_TP_SIZE=1 or use a backend with collectives (ROCm/Vulkan/Metal).",
-                        out.device(),
-                        self.tp_config.world_size,
-                    ))
-                })?;
+                    out.device(),
+                    self.tp_config.world_size,
+                ))
+            })?;
             handle.synchronize()?;
             Ok(Tensor::new(
                 Arc::from(storage),
@@ -991,7 +989,10 @@ mod tests {
         let weight = cpu_tensor(vec![0.5, 1.5, -1.0, 2.0], Shape::new(vec![2, 2]));
         let linear = Linear::from_tensor(weight, None);
         // world_size > 1 forces the all_reduce path; CPU has no all_reduce.
-        let tp = TensorParallelConfig { rank: 0, world_size: 2 };
+        let tp = TensorParallelConfig {
+            rank: 0,
+            world_size: 2,
+        };
         let rp = RowParallelLinear::new(linear, tp);
 
         let x = cpu_tensor(vec![1.0, 2.0], Shape::new(vec![1, 2]));

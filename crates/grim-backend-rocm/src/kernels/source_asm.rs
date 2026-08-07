@@ -25,6 +25,7 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::iq_dequant::KERNEL_SOURCE);
     s.push_str(crate::kernels::cross_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::rwkv::KERNEL_SOURCE);
+    s.push_str(crate::kernels::quant_standalone::KERNEL_SOURCE);
     s
 }
 
