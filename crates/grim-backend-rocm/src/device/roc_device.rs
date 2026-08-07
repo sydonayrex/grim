@@ -1487,9 +1487,7 @@ impl BackendDevice for RocmDevice {
 
         // ─── WI-G — WMMA GEMM dispatch (opt-in, F16-only) ─────
         {
-            let cfg = self.wmma_gemm_config.lock().unwrap();
-            if cfg.enabled && dtype_out.arith == ArithType::F16 {
-                drop(cfg); // release lock before JIT launch
+            if self.should_use_wmma_path(None, dtype_out.arith) {
                 let stream = self.launch_wmma_gemm(a_storage, b_storage, &out_storage, m, n, k)?;
                 let compute_handle = Box::new(RocmHandle::new(Some(stream)));
                 return Ok((Box::new(out_storage), compute_handle));
