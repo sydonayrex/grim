@@ -103,7 +103,7 @@ fn test_q4k_matrix_core_vs_scalar_parity() {
             a_tensor.storage().as_ref(),
             b_tensor.storage().as_ref(),
             &[],
-            grim_tensor::QuantFormat::Q4_K,
+            grim_tensor::QuantFormat::Q4K,
             &Shape::new(vec![m, n]),
         )
         .expect("scalar quantized_matmul should succeed");
@@ -119,7 +119,7 @@ fn test_q4k_matrix_core_vs_scalar_parity() {
             a_tensor.storage().as_ref(),
             b_tensor.storage().as_ref(),
             &[],
-            grim_tensor::QuantFormat::Q4_K,
+            grim_tensor::QuantFormat::Q4K,
             &Shape::new(vec![m, n]),
         )
         .expect("tiled quantized_matmul should succeed");
