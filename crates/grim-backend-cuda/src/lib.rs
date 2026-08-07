@@ -696,8 +696,9 @@ impl CudaDevice {
             Ok(h)
         } else {
             let mut handle_ptr: *mut c_void = std::ptr::null_mut();
-            // SAFETY: `cublasCreate_v2` initializes a new cuBLAS handle.
-            // `handle_ptr` is a valid null pointer that receives the new handle.
+            unsafe {
+                cudaSetDevice(self.ordinal as i32);
+            }
             let res = unsafe { cublasCreate_v2(&mut handle_ptr) };
             if res == CUBLAS_STATUS_SUCCESS {
                 let h = CublasHandle(handle_ptr);
@@ -2949,6 +2950,7 @@ impl BackendDevice for CudaDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let kernel_name = match format {
             grim_tensor::QuantFormat::Q8_0 => "grim_fused_quant_gemm_q8_0",
+            grim_tensor::QuantFormat::Q5_K => "grim_fused_quant_gemm_q5_k",
             grim_tensor::QuantFormat::Fp8 => "grim_fused_quant_gemm_fp8",
             other => {
                 return Err(Error::Backend(format!(
