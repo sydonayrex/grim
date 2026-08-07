@@ -233,7 +233,20 @@ impl MiniCpmBlock {
             None => self.prefilled_self_attention(&q_rot, &k_rot, &v, positions)?,
         };
 
-        let mut attn_out = self.wo.forward(&attn_out)?;
+        let attn_out_2d = if attn_out.shape().dims().len() == 3 {
+            let dims = attn_out.shape().dims();
+            Tensor::new(
+                attn_out.storage().clone(),
+                Shape::new(vec![dims[0] * dims[1], dims[2]]),
+                attn_out.dtype(),
+                attn_out.provenance().clone(),
+                attn_out.device().clone(),
+            )
+        } else {
+            attn_out
+        };
+
+        let mut attn_out = self.wo.forward(&attn_out_2d)?;
         if (self.cfg.scale_depth_factor - 1.0).abs() > 1e-5 {
             let data = attn_out.to_vec_f32()?;
             let scaled: Vec<f32> = data
