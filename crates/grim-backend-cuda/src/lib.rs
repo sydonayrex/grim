@@ -551,6 +551,7 @@ impl BackendStorage for CudaStorage {
                             )
                         };
                         if res == cudaSuccess {
+                            drop(f32_storage);
                             return Ok(host_data);
                         }
                     }
