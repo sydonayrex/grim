@@ -431,6 +431,58 @@ extern "C" __global__ void grim_fused_quant_gemm_q5_k(
     C[row * N + col] = sum;
 }
 
+extern "C" __global__ void grim_fused_quant_gemm_q6_k(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    float* __restrict__ C,
+    int M, int N, int K
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    int blocks_per_row = K / 256;
+    float sum = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const unsigned char* blk = B_packed + (col * blocks_per_row + b) * 210;
+        const unsigned char* ql     = blk;            // 128 bytes @0
+        const unsigned char* qh     = blk + 128;      // 64 bytes  @128
+        const unsigned char* scales = blk + 192;      // 16 bytes  @192 (i8)
+        float d = grim_f16_to_f32(*((const unsigned short*)(blk + 208)));
+
+        const float* a_ptr = A + row * K + b * 256;
+
+        int sc_idx = 0, ql_idx = 0, qh_idx = 0;
+        #pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            int a_off = n * 128;
+            #pragma unroll
+            for (int l = 0; l < 32; ++l) {
+                int is = l / 16;
+                float q1 = (float)((ql[ql_idx + l      ] & 0x0F) | ((qh[qh_idx + l] & 0x03) << 4)) - 32.0f;
+                float q2 = (float)((ql[ql_idx + l + 32 ] & 0x0F) | ((qh[qh_idx + l] & 0x0C) << 2)) - 32.0f;
+                float q3 = (float)((ql[ql_idx + l      ] >> 4)   | ((qh[qh_idx + l] & 0x30) >> 0)) - 32.0f;
+                float q4 = (float)((ql[ql_idx + l + 32 ] >> 4)   | ((qh[qh_idx + l] & 0xC0) >> 2)) - 32.0f;
+                float sc1 = (float)((signed char)scales[sc_idx + is + 0]);
+                float sc2 = (float)((signed char)scales[sc_idx + is + 2]);
+                float sc3 = (float)((signed char)scales[sc_idx + is + 4]);
+                float sc4 = (float)((signed char)scales[sc_idx + is + 6]);
+
+                sum += a_ptr[a_off + l      ] * (d * sc1 * q1);
+                sum += a_ptr[a_off + l + 32 ] * (d * sc2 * q2);
+                sum += a_ptr[a_off + l + 64 ] * (d * sc3 * q3);
+                sum += a_ptr[a_off + l + 96 ] * (d * sc4 * q4);
+            }
+            ql_idx += 64;
+            qh_idx += 32;
+            sc_idx += 8;
+        }
+    }
+
+    C[row * N + col] = sum;
+}
+
 // ---- Q5_K (176 B / 256 weights) — bit-accurate vs grim_quant::dequant_q5k ----
 extern "C" __global__ void grim_dequant_q5k(const unsigned char* __restrict__ packed,
                                              float* __restrict__ out, int n_blocks) {
