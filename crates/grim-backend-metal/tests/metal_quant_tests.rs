@@ -102,3 +102,42 @@ fn test_metal_quantize_fp8_roundtrip() {
         "Metal FP8 roundtrip max error {max_err} exceeds 0.5"
     );
 }
+
+#[test]
+fn test_metal_quantize_mxfp4_mxfp8_q4k_types() {
+    let dev = MetalDevice::new(0).unwrap();
+
+    let shape = Shape::new(vec![256]);
+    let x_data: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) / 32.0).collect();
+    let x_storage = dev.from_cpu(&x_data, &shape, DType::F32).unwrap();
+
+    // Quantize to MxFp4
+    let (mxfp4_storage, h1) = dev
+        .quantize_on_device(x_storage.as_ref(), QuantFormat::MxFp4)
+        .unwrap();
+    h1.synchronize().unwrap();
+    assert_eq!(
+        mxfp4_storage.dtype().storage,
+        Storage::FloatPack(FloatPackScheme::MxFp4)
+    );
+
+    // Quantize to MxFp8
+    let (mxfp8_storage, h2) = dev
+        .quantize_on_device(x_storage.as_ref(), QuantFormat::MxFp8)
+        .unwrap();
+    h2.synchronize().unwrap();
+    assert_eq!(
+        mxfp8_storage.dtype().storage,
+        Storage::FloatPack(FloatPackScheme::MxFp8)
+    );
+
+    // Quantize to Q4_K
+    let (q4k_storage, h3) = dev
+        .quantize_on_device(x_storage.as_ref(), QuantFormat::Q4_K)
+        .unwrap();
+    h3.synchronize().unwrap();
+    assert_eq!(
+        q4k_storage.dtype().storage,
+        Storage::KQuant(KQuantScheme::Q4K)
+    );
+}
