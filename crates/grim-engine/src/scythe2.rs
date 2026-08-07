@@ -31,9 +31,7 @@
 //! - `rust-ffi-grim` §3 — `cargo check` gate after each WI.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::Instant;
 
 use grim_tensor::backend::{GpuCapability, ScytheLink, ScythePlacement};
 

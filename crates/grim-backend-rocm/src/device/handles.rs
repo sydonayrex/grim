@@ -106,6 +106,11 @@ unsafe extern "C" {
     pub fn hipMalloc(devPtr: *mut *mut c_void, size: usize) -> HipErrorT;
     pub fn hipMallocManaged(devPtr: *mut *mut c_void, size: usize, flags: u32) -> HipErrorT;
     pub fn hipFree(device: *mut c_void) -> HipErrorT;
+    /// Enqueue an async free on `stream`; the buffer is released once all prior
+    /// work on that stream has completed. Available from ROCm 5.4+.
+    /// Pass `null_mut()` to use the default (null) stream, which serialises with
+    /// device-wide execution but avoids a full hipDeviceSynchronize stall.
+    pub fn hipFreeAsync(device: *mut c_void, stream: *mut c_void) -> HipErrorT;
     pub fn hipHostMalloc(devPtr: *mut *mut c_void, size: usize, flags: u32) -> HipErrorT;
     pub fn hipHostFree(ptr: *mut c_void) -> HipErrorT;
     pub fn hipMemcpy(

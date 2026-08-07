@@ -1,13 +1,10 @@
 //! Transformer block: pre-norm, GQA attention, SwiGLU FFN.
 
-use std::sync::Arc;
-
 use grim_core::error::{Error, Result};
 use grim_nn::{
     ColumnParallelLinear, Linear, RmsNorm, Rope, RowParallelLinear, TensorParallelConfig,
     WeightSource,
 };
-use grim_tensor::TensorProvider;
 use grim_tensor::{Device, Shape, Tensor};
 
 use crate::model::LlamaConfig;

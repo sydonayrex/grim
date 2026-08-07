@@ -1297,7 +1297,7 @@ async fn chat_handler(
     };
 
     // Enqueue prefill
-    engine.enqueue_request(grim_engine::Request {
+    if let Err(e) = engine.enqueue_request(grim_engine::Request {
         id: request_id,
         prompt_tokens,
         priority: 0,
@@ -1305,7 +1305,9 @@ async fn chat_handler(
         model_id: Some(model_name.clone()),
         adapter_ids: vec![],
         input_ids: None,
-    });
+    }) {
+        eprintln!("[chat_handler] enqueue_request failed: {e}");
+    }
 
     let max_tokens = req.max_tokens.min(4096);
     let mut generated_ids: Vec<u32> = Vec::with_capacity(max_tokens);

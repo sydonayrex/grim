@@ -81,9 +81,18 @@ impl RocmCachingAllocator {
             *cached + cls > self.cap_bytes
         };
         if over_cap || ptr.is_null() {
+            // Use hipFreeAsync on the null stream instead of hipDeviceSynchronize + hipFree.
+            // hipFreeAsync enqueues the release after all currently submitted work on the
+            // null stream, avoiding a full-device stall. Falls back to sync hipFree if the
+            // async path is unavailable (pre-ROCm-5.4 drivers return an error code).
+            // CONTRACT: ptr must not be reused by the caller after this call returns.
             unsafe {
-                let _ = crate::hipDeviceSynchronize();
-                let _ = hipFree(ptr);
+                let res = crate::hipFreeAsync(ptr, std::ptr::null_mut());
+                if res != 0 {
+                    // hipFreeAsync not supported — fall back to sync path.
+                    let _ = crate::hipDeviceSynchronize();
+                    let _ = hipFree(ptr);
+                }
             }
             self.free_count.fetch_add(1, Ordering::Relaxed);
             return;

@@ -95,7 +95,6 @@ use crate::{
     hipGraphLaunch,
     hipMemAdvise,
     hipMemGetInfo,
-    hipMemcpy,
     hipMemcpyAsync,
     hipMemset,
     hipMemsetAsync,
@@ -135,6 +134,15 @@ pub struct RocmDevice {
     pub(crate) fused_dequant_gemm_config: Mutex<FusedDequantGemmConfig>,
     pub(crate) split_k_config: Mutex<SplitKGemmConfig>,
     pub(crate) wmma_gemm_config: Mutex<WmmaGemmConfig>,
+    /// AtomicBool shadow of `decode_gemm_config.enabled` — read lock-free on every matmul
+    /// dispatch. Written by `set_decode_gemm_enabled`. [see: `decode_gemm_config`]
+    pub(crate) decode_gemm_enabled: AtomicBool,
+    /// AtomicBool shadow of `fused_dequant_gemm_config.enabled` — read lock-free on every
+    /// quantized_matmul dispatch. Written by `set_fused_dequant_gemm_enabled`.
+    pub(crate) fused_dequant_gemm_enabled: AtomicBool,
+    /// AtomicBool shadow of `wmma_gemm_config.enabled` — read lock-free by
+    /// `should_use_wmma_path`. Written by `set_wmma_gemm_enabled`.
+    pub(crate) wmma_gemm_enabled: AtomicBool,
     /// Caching device-memory allocator (size-bucketed free-list). See `RocmCachingAllocator`.
     pub(crate) allocator: Arc<RocmCachingAllocator>,
     /// Phase-3 §3.1: device scratch pool — a thread-safe, power-of-2-bucketed [see: `hipMalloc`, `get_scratch`]
@@ -430,6 +438,12 @@ impl RocmDevice {
                 ),
                 wavefront_size: warp_size as u32,
             }),
+            decode_gemm_enabled: AtomicBool::new(true),
+            fused_dequant_gemm_enabled: AtomicBool::new(true),
+            wmma_gemm_enabled: AtomicBool::new(matches!(
+                crate::quantization::gcn_arch(&gpu_target),
+                crate::quantization::GcnArch::RDNA3 | crate::quantization::GcnArch::RDNA4
+            )),
             rccl: Mutex::new(None),
         }
     }
@@ -445,18 +459,24 @@ impl RocmDevice {
         ext: Option<&grim_format::spec::GrimTensorExt>,
         out_arith: ArithType,
     ) -> bool {
-        let cfg_enabled = self.wmma_gemm_config.lock().unwrap().enabled;
+        // Lock-free read via AtomicBool shadow; the full Mutex<WmmaGemmConfig> is only
+        // consulted by the setter. [see: `wmma_gemm_enabled`, `set_wmma_gemm_enabled`]
+        let cfg_enabled = self.wmma_gemm_enabled.load(Ordering::Relaxed);
         wmma_route_decision(ext, out_arith, cfg_enabled)
     }
 
     /// WI 2.4.4-2 — opt-in flag for the JIT `grim_decode_gemm_f16`. [see: `true`, `QkvAttentionFusionConfig::enabled`]
     pub fn set_decode_gemm_enabled(&self, enabled: bool) {
+        // Write the AtomicBool shadow first (lock-free hot-path reads this).
+        self.decode_gemm_enabled.store(enabled, Ordering::Relaxed);
         let mut cfg = self.decode_gemm_config.lock().unwrap();
         cfg.enabled = enabled;
     }
 
     /// Set whether fused dequantization GEMM is enabled (WI-C).
     pub fn set_fused_dequant_gemm_enabled(&self, enabled: bool) {
+        self.fused_dequant_gemm_enabled
+            .store(enabled, Ordering::Relaxed);
         let mut cfg = self.fused_dequant_gemm_config.lock().unwrap();
         cfg.enabled = enabled;
     }
@@ -469,6 +489,7 @@ impl RocmDevice {
 
     /// Set whether the JIT compiled WMMA GEMM kernel is enabled (WI-G). [see: `grim_wmma_gemm`]
     pub fn set_wmma_gemm_enabled(&self, enabled: bool) {
+        self.wmma_gemm_enabled.store(enabled, Ordering::Relaxed);
         let mut cfg = self.wmma_gemm_config.lock().unwrap();
         cfg.enabled = enabled;
     }
@@ -830,19 +851,21 @@ impl RocmDevice {
             let ai = as_rocm(a[i])?;
             let bi = as_rocm(b[i])?;
             check_hip("matmul_batched: hipMemcpyDtoD a", unsafe {
-                hipMemcpy(
+                hipMemcpyAsync(
                     (a_packed.device_ptr.unwrap() as *mut c_void).add(i * stride_a * a_elem_size),
                     ai.device_ptr.unwrap() as *mut c_void,
                     ai.bytes,
                     HipMemcpyKind::DeviceToDevice,
+                    stream,
                 )
             })?;
             check_hip("matmul_batched: hipMemcpyDtoD b", unsafe {
-                hipMemcpy(
+                hipMemcpyAsync(
                     (b_packed.device_ptr.unwrap() as *mut c_void).add(i * stride_b * b_elem_size),
                     bi.device_ptr.unwrap() as *mut c_void,
                     bi.bytes,
                     HipMemcpyKind::DeviceToDevice,
+                    stream,
                 )
             })?;
         }
@@ -902,17 +925,36 @@ impl RocmDevice {
             }
         }
 
-        // Read the packed results back, then split into per-batch device storages. [see: `active_stream`]
-        if self.active_capture_stream().is_none() {
-            unsafe {
-                let _ = hipDeviceSynchronize();
-            }
-        }
-        let d_host = d_packed.to_cpu_vec_f32()?;
+        // Split the packed device-resident result into per-batch storages via
+        // device-to-device strided copies — no D2H/H2D round-trip. [see: `active_stream`]
+        let d_element_size = dtype_out.arith.byte_size();
         let mut out = Vec::with_capacity(batch);
         for i in 0..batch {
-            let slice = &d_host[i * stride_d..(i + 1) * stride_d];
-            out.push(self.from_cpu(slice, out_shape, dtype_out.clone())?);
+            let batch_storage = RocmStorage::alloc_gpu(
+                out_shape,
+                dtype_out.clone(),
+                &self.allocator,
+                self.ordinal,
+            )?;
+            check_hip("matmul_batched: hipMemcpyDtoD d split", unsafe {
+                hipMemcpyAsync(
+                    batch_storage.device_ptr.unwrap() as *mut c_void,
+                    (d_packed.device_ptr.unwrap() as *mut c_void)
+                        .add(i * stride_d * d_element_size),
+                    stride_d * d_element_size,
+                    HipMemcpyKind::DeviceToDevice,
+                    stream,
+                )
+            })?;
+            out.push(Box::new(batch_storage) as Box<dyn BackendStorage>);
+        }
+        // Synchronize once (only outside graph capture) so callers observe
+        // completed results; the D2D copies above share the same stream as the
+        // GEMM, so ordering is guaranteed.
+        if self.active_capture_stream().is_none() {
+            unsafe {
+                let _ = hipStreamSynchronize(stream);
+            }
         }
         Ok(out)
     }
@@ -942,11 +984,9 @@ impl RocmDevice {
             )
         };
         if res != hipSuccess {
-            if storage.device_ptr.is_some() {
-                unsafe {
-                    let _ = hipFree(storage.device_ptr.unwrap() as *mut c_void);
-                }
-            }
+            // Return the buffer to the caching allocator (not bare hipFree) so
+            // pool accounting stays correct under repeated errors. [see: `RocmCachingAllocator::free`]
+            self.allocator.free(dev_ptr_void, storage.bytes);
             return Err(Error::Backend(format!(
                 "hipMemcpyAsync(H2D) failed with error code {}",
                 res
@@ -1474,9 +1514,12 @@ impl BackendDevice for RocmDevice {
 
         // ─── WI 2.4.4-2 — decode GEMM dispatch (opt-in, F16-only, m ≤ 8) ───── [see: `ck_gemm.cpp`, `grim_decode_gemm_f16`]
         {
-            let cfg = self.decode_gemm_config.lock().unwrap();
-            if cfg.enabled && dtype_out.arith == ArithType::F16 && m <= 8 {
-                drop(cfg); // release the lock before the JIT launch
+            // Lock-free read via AtomicBool shadow — avoids Mutex acquisition on every matmul.
+            // [see: `decode_gemm_enabled`, `set_decode_gemm_enabled`]
+            if self.decode_gemm_enabled.load(Ordering::Relaxed)
+                && dtype_out.arith == ArithType::F16
+                && m <= 8
+            {
                 // WI 2.4.4-2(a) — thread the *real* enqueued stream into the [see: `launch_compute_kernel`, `hipModuleLaunchKernel`]
                 let stream =
                     self.launch_decode_gemm_f16(a_storage, b_storage, &out_storage, m, n, k)?;
@@ -2412,7 +2455,8 @@ impl BackendDevice for RocmDevice {
             }
             DTypeStorage::ResidualPacked(cfg) => {
                 // Generic variable-bitwidth packed + residual layout (WI-C / WI-T8): [see: `grim_fused_dequant_gemm_f16`, `enabled`]
-                if !self.fused_dequant_gemm_config.lock().unwrap().enabled {
+                // Lock-free enabled check via AtomicBool shadow. [see: `fused_dequant_gemm_enabled`, `set_fused_dequant_gemm_enabled`]
+                if !self.fused_dequant_gemm_enabled.load(Ordering::Relaxed) {
                     FUSED_FORWARD_DISPATCH_STATS
                         .fallback_calls
                         .fetch_add(1, Ordering::Relaxed);
@@ -2834,7 +2878,7 @@ impl BackendDevice for RocmDevice {
                 // at line ~2252). This fixes the asymmetry where the forward
                 // dispatch honors `FusedDequantGemmConfig::enabled` but the
                 // backward dispatch unconditionally calls the fused kernel.
-                if !self.fused_dequant_gemm_config.lock().unwrap().enabled {
+                if !self.fused_dequant_gemm_enabled.load(Ordering::Relaxed) {
                     FUSED_BACKWARD_DISPATCH_STATS
                         .fallback_calls
                         .fetch_add(1, Ordering::Relaxed);

@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 
-use grim_tensor::backend::{ScytheLink, ScythePlacement};
+use grim_tensor::backend::ScythePlacement;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::shape::Shape;
 use grim_tensor::{BackendDevice, DType, Device, Tensor};

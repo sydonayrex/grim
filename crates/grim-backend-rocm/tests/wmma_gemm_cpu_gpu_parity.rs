@@ -73,7 +73,14 @@ fn seeded_data(len: usize, seed: u32, scale: f32) -> Vec<f32> {
 ///
 /// Enables `wmma_gemm` through `should_use_wmma_path` (now the live dispatch
 /// gate) and disables it afterwards to avoid polluting subsequent tests.
-fn run_gpu(dev: &RocmDevice, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> TestResult<Vec<f32>> {
+fn run_gpu(
+    dev: &RocmDevice,
+    a: &[f32],
+    b: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> TestResult<Vec<f32>> {
     let a_shape = Shape::from_slice(&[m, k]);
     let b_shape = Shape::from_slice(&[k, n]);
     let out_shape = Shape::from_slice(&[m, n]);

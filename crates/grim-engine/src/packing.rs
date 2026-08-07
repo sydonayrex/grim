@@ -4,8 +4,6 @@
 //! single batch so the GPU processes real tokens only — no padding waste.
 //! This module provides the data structures and packing logic.
 
-use grim_tensor::Shape;
-
 /// A batch of token sequences concatenated back-to-back with no padding.
 ///
 /// The `seqlen_offsets` array has length `N+1` for `N` sequences, where

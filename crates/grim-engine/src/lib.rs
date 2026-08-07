@@ -363,6 +363,11 @@ impl Engine {
         self.tp_config.clone()
     }
 
+    /// Access the disaggregated KV receiver server instance if running in disaggregated decode role.
+    pub fn kv_receiver(&self) -> Option<&grim_disagg::KvReceiverServer> {
+        self.kv_receiver.as_ref()
+    }
+
     /// Register a `CausalLm` auto-wrapped in `SpeculativeCausalLm::auto`.
     /// §5.3: speculative decoding is the standard decode path, not opt-in.
     /// Plain autoregressive is the unconfigured fallback.

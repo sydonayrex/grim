@@ -75,7 +75,13 @@ fn residual_packed_forward_passes_backup2_and_merges_it() {
         .expect("upload activation");
 
     let (out, handle) = dev
-        .quantized_matmul(a.as_ref(), b.as_ref(), &[], grim_tensor::QuantFormat::Q8_0, &Shape::from_slice(&[1, n]))
+        .quantized_matmul(
+            a.as_ref(),
+            b.as_ref(),
+            &[],
+            grim_tensor::QuantFormat::Q8_0,
+            &Shape::from_slice(&[1, n]),
+        )
         .expect("forward ResidualPacked matmul");
     handle.synchronize().expect("synchronize forward matmul");
 
@@ -163,7 +169,13 @@ fn residual_packed_forward_applies_outlier_correction_in_fused_path() {
         .from_cpu(&[1.0f32; 4], &Shape::from_slice(&[1, 4]), DType::F32)
         .expect("upload activation");
     let (out, handle) = dev
-        .quantized_matmul(a.as_ref(), b.as_ref(), &[], grim_tensor::QuantFormat::Q8_0, &Shape::from_slice(&[1, 1]))
+        .quantized_matmul(
+            a.as_ref(),
+            b.as_ref(),
+            &[],
+            grim_tensor::QuantFormat::Q8_0,
+            &Shape::from_slice(&[1, 1]),
+        )
         .expect("forward ResidualPacked matmul");
     handle.synchronize().expect("synchronize forward matmul");
     assert_eq!(

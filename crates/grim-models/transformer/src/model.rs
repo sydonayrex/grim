@@ -114,7 +114,7 @@ impl Llama {
 
     pub fn random(device: Device, cfg: LlamaConfig) -> Self {
         use grim_backend_cpu::cpu_tensor;
-        let dev = CpuDevice::new();
+        let _dev = CpuDevice::new();
         let mut rng = SimpleRng::new(0xDEAD_BEEF_CAFE_F00Du64);
 
         let embed_data: Vec<f32> = (0..cfg.vocab_size * cfg.hidden_size)
