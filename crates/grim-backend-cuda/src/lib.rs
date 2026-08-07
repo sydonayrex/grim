@@ -2979,10 +2979,17 @@ impl BackendDevice for CudaDevice {
             ));
         }
         let (m, k) = (a_dims[0], a_dims[1]);
-        let (k2, n) = (b_dims[0], b_dims[1]);
+        // GGUF packed weight b is [out_dim, in_dim] = [N, K].
+        // In fused GEMM (A @ B^T), K matches b_dims[1] if b is untransposed [N, K],
+        // or b_dims[0] if b_dims was transposed to [K, N].
+        let (n, k2) = if b_dims[0] == k {
+            (b_dims[1], b_dims[0])
+        } else {
+            (b_dims[0], b_dims[1])
+        };
         if k != k2 {
             return Err(Error::Shape(format!(
-                "fused_quant_gemm: a is ({m},{k}) but b is ({k2},{n})"
+                "fused_quant_gemm: a is ({m},{k}) but b is ({n},{k2})"
             )));
         }
         if format == grim_tensor::QuantFormat::Q8_0 && k % 32 != 0 {
