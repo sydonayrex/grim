@@ -633,23 +633,18 @@ impl Embedding {
         // Probe `[vocab, dim]`. On exact shape match, use as-is.
         if let Ok(t) = ws.get([vocab, dim], "weight") {
             let weight = if t.dtype().is_quantized() {
-                // Embedding kernel expects f32 weights; dequantize if quantized.
-                eprintln!(
-                    "[Embedding::load] weight is quantized: dtype={:?}, device={:?}",
-                    t.dtype(),
-                    t.device()
-                );
+                // Embedding table (e.g. 131072 × 1536 ≈ 800MB FP32) dequantizes to F32.
+                // Keep it on CPU to save GPU VRAM, gathering tokens host-side or uploading per token.
                 let f32s = t.to_vec_f32()?;
-                eprintln!("[Embedding::load] dequantized to f32, len={}", f32s.len());
                 let shape = t.shape().clone();
-                let dev = pick_device_for_tensor(&t);
-                let storage = dev.from_cpu(&f32s, &shape, DType::F32)?;
+                let cpu_dev = grim_backend_cpu::CpuDevice::new();
+                let storage = cpu_dev.from_cpu(&f32s, &shape, DType::F32)?;
                 Tensor::new(
                     Arc::from(storage),
                     shape,
                     DType::F32,
                     t.provenance().clone(),
-                    t.device().clone(),
+                    Device::Cpu,
                 )
             } else {
                 t
@@ -725,6 +720,31 @@ impl Embedding {
             self.weight.provenance().clone(),
             self.weight.device().clone(),
         ))
+    }
+
+    pub fn forward_to_device(
+        &self,
+        indices: &[u32],
+        seq_len: usize,
+        dim: usize,
+        target_device: &Device,
+    ) -> Result<Tensor> {
+        let cpu_t = self.forward(indices, seq_len, dim)?;
+        if target_device.is_cpu() || cpu_t.device() == target_device {
+            Ok(cpu_t)
+        } else {
+            let f32s = cpu_t.to_vec_f32()?;
+            let shape = cpu_t.shape().clone();
+            let dev = pick_device_for_storage_device(target_device);
+            let storage = dev.from_cpu(&f32s, &shape, DType::F32)?;
+            Ok(Tensor::new(
+                Arc::from(storage),
+                shape,
+                DType::F32,
+                cpu_t.provenance().clone(),
+                target_device.clone(),
+            ))
+        }
     }
 
     pub fn weight(&self) -> &Tensor {
