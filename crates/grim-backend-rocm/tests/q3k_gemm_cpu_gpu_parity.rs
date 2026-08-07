@@ -173,7 +173,7 @@ fn test_q3k_gpu_gemm_matches_cpu_dequant_reference() -> TestResult {
         },
     )?;
     let out_shape = Shape::from_slice(&[m, n]);
-    let (c_rocm, _) = dev.quantized_matmul(a_rocm.as_ref(), b_rocm.as_ref(), &[], grim_tensor::QuantFormat::Q3_K, &out_shape)?;
+    let (c_rocm, _) = dev.quantized_matmul(a_rocm.as_ref(), b_rocm.as_ref(), &[], grim_tensor::QuantFormat::Q8_0, &out_shape)?;
     let c_gpu = c_rocm.to_cpu_vec_f32()?;
 
     // CPU reference: c[m,n] = sum_k a[m,k] * b_f32[k,n]

@@ -62,7 +62,7 @@ fn test_q4k_gpu_gemm_golden_mutation_resistant() -> TestResult {
         let b_dev = BackendDevice::from_cpu_bytes(&dev, &b_packed, &b_shape, q4k_dtype)?;
 
         let (out, handle) =
-            dev.quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &[], grim_tensor::QuantFormat::Q4_K, &out_shape)?;
+            dev.quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &[], grim_tensor::QuantFormat::Q4K, &out_shape)?;
         handle.synchronize()?;
         let actual_c = out.to_cpu_vec_f32()?;
 
