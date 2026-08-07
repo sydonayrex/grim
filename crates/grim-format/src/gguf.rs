@@ -65,6 +65,10 @@ impl GgufValue {
         match self {
             GgufValue::Float32(v) => Some(*v),
             GgufValue::Float64(v) => Some(*v as f32),
+            GgufValue::Uint32(v) => Some(*v as f32),
+            GgufValue::Int32(v) => Some(*v as f32),
+            GgufValue::Uint64(v) => Some(*v as f32),
+            GgufValue::Int64(v) => Some(*v as f32),
             _ => None,
         }
     }

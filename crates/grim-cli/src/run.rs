@@ -544,13 +544,15 @@ pub async fn cmd_run(
         history.push(next_token);
         generated += 1;
 
-        // Check for EOS token
+        // Check for EOS or ChatML stop tokens
         if let Some(tok) = &tokenizer {
-            if let Some(eos_id) = tok.eos_token_id {
-                if next_token == eos_id {
-                    eprintln!("[grim] EOS token {} reached, stopping generation.", eos_id);
-                    break;
-                }
+            let is_eos = tok.eos_token_id.map_or(false, |id| next_token == id)
+                || tok.token_to_id.get("<|im_end|>").copied() == Some(next_token)
+                || tok.token_to_id.get("<|endoftext|>").copied() == Some(next_token)
+                || tok.token_to_id.get("</s>").copied() == Some(next_token);
+            if is_eos {
+                eprintln!("[grim] EOS token {} reached, stopping generation.", next_token);
+                break;
             }
         }
     }
@@ -938,10 +940,12 @@ pub async fn cmd_run_interactive(
             generated += 1;
 
             if let Some(tok) = &tokenizer {
-                if let Some(eos_id) = tok.eos_token_id {
-                    if next_token == eos_id {
-                        break;
-                    }
+                let is_eos = tok.eos_token_id.map_or(false, |id| next_token == id)
+                    || tok.token_to_id.get("<|im_end|>").copied() == Some(next_token)
+                    || tok.token_to_id.get("<|endoftext|>").copied() == Some(next_token)
+                    || tok.token_to_id.get("</s>").copied() == Some(next_token);
+                if is_eos {
+                    break;
                 }
             }
         }

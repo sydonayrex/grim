@@ -128,7 +128,12 @@ impl HyperparameterExtractor {
 
         let rope_theta = metadata
             .get_f32(&format!("{arch_name}.rope.freq_base"))
+            .or_else(|| metadata.get_f32(&format!("{arch_name}.rope_freq_base")))
             .or_else(|| metadata.get_f32(&format!("{arch_name}.rope_theta")))
+            .or_else(|| metadata.get_f32(&format!("{arch_name}.rope_parameters.rope_theta")))
+            .or_else(|| metadata.get_f32("rope.freq_base"))
+            .or_else(|| metadata.get_f32("rope_freq_base"))
+            .or_else(|| metadata.get_f32("rope_theta"))
             .unwrap_or(10000.0);
 
         let max_seq_len = metadata
