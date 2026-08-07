@@ -2969,7 +2969,6 @@ impl BackendDevice for CudaDevice {
             .ok_or_else(|| Error::Backend("fused_quant_gemm: b is not CudaStorage".into()))?;
 
         Self::ensure_f32_input("fused_quant_gemm a", a_storage)?;
-        Self::ensure_f32_input("fused_quant_gemm b", b_storage)?;
 
         let a_dims = a.shape().dims();
         let b_dims = b.shape().dims();
