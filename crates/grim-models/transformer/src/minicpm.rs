@@ -76,6 +76,10 @@ impl MiniCpmBlock {
         let (local_num_heads, local_num_kv_heads, kv_head_replica_factor) =
             crate::block::plan_kv_head_sharding(cfg.num_heads, cfg.num_kv_heads, tp.world_size)?;
 
+        let scale_depth_factor = cfg.scale_depth.unwrap_or_else(|| {
+            1.4f32 / (cfg.num_layers as f32).sqrt()
+        });
+
         let refs = MiniCpmConfigRefs {
             hidden_size: cfg.hidden_size,
             num_heads: cfg.num_heads,
@@ -85,10 +89,7 @@ impl MiniCpmBlock {
             local_num_heads,
             local_num_kv_heads,
             kv_head_replica_factor,
-            scale_depth_factor: cfg
-                .scale_depth
-                .map(|sd| sd / (cfg.num_layers as f32).sqrt())
-                .unwrap_or(1.0),
+            scale_depth_factor,
         };
 
         let attn_norm = RmsNorm::load(&ws.pp("attn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
@@ -189,7 +190,24 @@ impl MiniCpmBlock {
         positions: &[u32],
         session: Option<&dyn SessionT>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        let x_norm = self.attn_norm.forward(x)?;
+        let orig_dims = x.shape().dims().to_vec();
+        let (x_2d, is_3d) = if orig_dims.len() == 3 {
+            let total_tokens = orig_dims[0] * orig_dims[1];
+            (
+                Tensor::new(
+                    x.storage().clone(),
+                    Shape::new(vec![total_tokens, orig_dims[2]]),
+                    x.dtype(),
+                    x.provenance().clone(),
+                    x.device().clone(),
+                ),
+                true,
+            )
+        } else {
+            (x.clone(), false)
+        };
+
+        let x_norm = self.attn_norm.forward(&x_2d)?;
         let q = self.wq.forward(&x_norm)?;
         let k = self.wk.forward(&x_norm)?;
         let v = self.wv.forward(&x_norm)?;
@@ -233,7 +251,7 @@ impl MiniCpmBlock {
             );
         }
 
-        let added = grim_nn::modules::add_on_device(x, &attn_out)?;
+        let added = grim_nn::modules::add_on_device(&x_2d, &attn_out)?;
 
         let x_norm = self.ffn_norm.forward(&added)?;
         let gate = self.ffn_gate.forward(&x_norm)?;
@@ -258,7 +276,19 @@ impl MiniCpmBlock {
             );
         }
 
-        let out = grim_nn::modules::add_on_device(&added, &ffn_out)?;
+        let out_2d = grim_nn::modules::add_on_device(&added, &ffn_out)?;
+        let out = if is_3d {
+            Tensor::new(
+                out_2d.storage().clone(),
+                Shape::new(orig_dims),
+                out_2d.dtype(),
+                out_2d.provenance().clone(),
+                out_2d.device().clone(),
+            )
+        } else {
+            out_2d
+        };
+
         Ok((out, k_rot, v))
     }
 
@@ -459,7 +489,10 @@ impl MiniCpmModel {
         }
 
         let norm = RmsNorm::load(&ws.pp("norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let output = Linear::load(&ws.pp("output"), cfg.hidden_size, cfg.vocab_size, false)?;
+        let output = match Linear::load(&ws.pp("output"), cfg.hidden_size, cfg.vocab_size, false) {
+            Ok(out) => out,
+            Err(_) => Linear::load(&ws.pp("tok_embeddings"), cfg.hidden_size, cfg.vocab_size, false)?,
+        };
 
         Ok(Self {
             cfg,
