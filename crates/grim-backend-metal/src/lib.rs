@@ -1,8 +1,11 @@
 //! Metal backend for Apple Silicon GPUs using MSL compute pipelines.
 
-use grim_tensor::backend::ComputeHandle;
+use grim_tensor::backend::{ComputeHandle, ReadyHandle};
 #[allow(unused_imports)]
-use grim_tensor::dtype::{ArithType, DType, QuantProvenance, Storage as DTypeStorage};
+use grim_tensor::dtype::{
+    ArithType, DType, FloatPackScheme, KQuantScheme, QuantFormat, QuantProvenance,
+    Storage as DTypeStorage,
+};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendDevice, BackendStorage, ScythePlacement, Shape};
 
@@ -84,6 +87,21 @@ struct MetalPipelines {
     quantized_matmul_backward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     all_reduce: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     comm_fuse_reduce: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    dequant_fp8: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    dequant_mxfp4: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    dequant_mxfp8: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    dequant_q4k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    dequant_q8_0: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    dequant_iq2xxs: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    dequant_iq2xs: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    dequant_iq2s: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    dequant_iq3xxs: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    dequant_iq3s: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    dequant_iq4nl: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    dequant_iq4xs: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    add_rms_norm: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    quant_q8_0: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    quant_fp8: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -212,6 +230,21 @@ impl MetalContext {
                 quantized_matmul_backward: get_pipeline("grim_quantized_matmul_backward_q8_0")?,
                 all_reduce: get_pipeline("grim_all_reduce")?,
                 comm_fuse_reduce: get_pipeline("grim_comm_fuse_reduce")?,
+                dequant_fp8: get_pipeline("grim_dequant_fp8")?,
+                dequant_mxfp4: get_pipeline("grim_dequant_mxfp4")?,
+                dequant_mxfp8: get_pipeline("grim_dequant_mxfp8")?,
+                dequant_q4k: get_pipeline("grim_dequant_q4k")?,
+                dequant_q8_0: get_pipeline("grim_dequant_q8_0")?,
+                dequant_iq2xxs: get_pipeline("grim_dequant_iq2xxs")?,
+                dequant_iq2xs: get_pipeline("grim_dequant_iq2xs")?,
+                dequant_iq2s: get_pipeline("grim_dequant_iq2s")?,
+                dequant_iq3xxs: get_pipeline("grim_dequant_iq3xxs")?,
+                dequant_iq3s: get_pipeline("grim_dequant_iq3s")?,
+                dequant_iq4nl: get_pipeline("grim_dequant_iq4nl")?,
+                dequant_iq4xs: get_pipeline("grim_dequant_iq4xs")?,
+                add_rms_norm: get_pipeline("grim_add_rms_norm")?,
+                quant_q8_0: get_pipeline("grim_quant_q8_0")?,
+                quant_fp8: get_pipeline("grim_quant_fp8")?,
             });
 
             Ok(MetalContext {
@@ -517,6 +550,601 @@ impl MetalDevice {
         }
         #[cfg(not(target_vendor = "apple"))]
         Ok(vec![])
+    }
+
+    // ─── Standalone dequant host wrappers (q8_0, q4k, iq*, fp8, mxfp) ─────────
+
+    /// Dequantize Q8_0 packed bytes to F32 on host/GPU.
+    pub fn dequantize_q8_0_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Ok(ctx) = MetalContext::get() {
+                let n_blocks = bytes.len() / 34;
+                let packed_buf = self.new_buffer_with_bytes(bytes, BufferUsage::Shared)?;
+                let out_buf = ctx
+                    .device
+                    .newBufferWithLength_options(
+                        (elem_count * 4) as u64,
+                        objc2_metal::MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or_else(|| Error::Backend("Metal dequant_q8_0: alloc out failed".into()))?;
+
+                let cmd_buffer = self.get_or_create_command_buffer()?;
+                let encoder = cmd_buffer
+                    .computeCommandEncoder()
+                    .ok_or_else(|| Error::Backend("Metal dequant: encoder failed".into()))?;
+                encoder.setComputePipelineState(&ctx.pipelines.dequant_q8_0);
+                encoder.setBuffer_offset_atIndex(Some(&packed_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&out_buf), 0, 1);
+                let n_b = n_blocks as i32;
+                unsafe {
+                    encoder.setBytes_length_atIndex(
+                        &n_b as *const i32 as *const std::ffi::c_void,
+                        4,
+                        2,
+                    );
+                }
+                let grid = objc2_metal::MTLSize::new(((n_blocks * 32 + 255) / 256) as u64, 1, 1);
+                let threads = objc2_metal::MTLSize::new(256, 1, 1);
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threads);
+                encoder.endEncoding();
+                cmd_buffer.commit();
+                cmd_buffer.waitUntilCompleted();
+
+                let ptr = out_buf.contents() as *const f32;
+                let mut values = vec![0.0f32; elem_count];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(ptr, values.as_mut_ptr(), elem_count);
+                }
+                return Ok(values);
+            }
+        }
+        let mut out = Vec::with_capacity(elem_count);
+        for blk in bytes.chunks_exact(34) {
+            let d_bits = u16::from_le_bytes([blk[0], blk[1]]);
+            let d = half::f16::from_bits(d_bits).to_f32();
+            for &q in &blk[2..34] {
+                out.push(d * (q as i8 as f32));
+            }
+        }
+        out.truncate(elem_count);
+        Ok(out)
+    }
+
+    /// Dequantize Q4_K packed bytes to F32 on host/GPU.
+    pub fn dequantize_q4k_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Ok(ctx) = MetalContext::get() {
+                let n_blocks = bytes.len() / 144;
+                let packed_buf = self.new_buffer_with_bytes(bytes, BufferUsage::Shared)?;
+                let out_buf = ctx
+                    .device
+                    .newBufferWithLength_options(
+                        (elem_count * 4) as u64,
+                        objc2_metal::MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or_else(|| Error::Backend("Metal dequant_q4k: alloc out failed".into()))?;
+
+                let cmd_buffer = self.get_or_create_command_buffer()?;
+                let encoder = cmd_buffer
+                    .computeCommandEncoder()
+                    .ok_or_else(|| Error::Backend("Metal dequant: encoder failed".into()))?;
+                encoder.setComputePipelineState(&ctx.pipelines.dequant_q4k);
+                encoder.setBuffer_offset_atIndex(Some(&packed_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&out_buf), 0, 1);
+                let n_b = n_blocks as i32;
+                unsafe {
+                    encoder.setBytes_length_atIndex(
+                        &n_b as *const i32 as *const std::ffi::c_void,
+                        4,
+                        2,
+                    );
+                }
+                let grid = objc2_metal::MTLSize::new(((n_blocks * 256 + 255) / 256) as u64, 1, 1);
+                let threads = objc2_metal::MTLSize::new(256, 1, 1);
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threads);
+                encoder.endEncoding();
+                cmd_buffer.commit();
+                cmd_buffer.waitUntilCompleted();
+
+                let ptr = out_buf.contents() as *const f32;
+                let mut values = vec![0.0f32; elem_count];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(ptr, values.as_mut_ptr(), elem_count);
+                }
+                return Ok(values);
+            }
+        }
+        grim_quant::dequant_q4k(bytes, elem_count)
+    }
+
+    /// Helper for IQ host dequant dispatches.
+    fn dequantize_iq_host(
+        &self,
+        bytes: &[u8],
+        elem_count: usize,
+        _block_bytes: usize,
+        kernel_name: &str,
+    ) -> Result<Vec<f32>> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Ok(ctx) = MetalContext::get() {
+                let n_blocks = bytes.len() / _block_bytes;
+                let pipeline = match kernel_name {
+                    "iq2xxs" => &ctx.pipelines.dequant_iq2xxs,
+                    "iq2xs" => &ctx.pipelines.dequant_iq2xs,
+                    "iq2s" => &ctx.pipelines.dequant_iq2s,
+                    "iq3xxs" => &ctx.pipelines.dequant_iq3xxs,
+                    "iq3s" => &ctx.pipelines.dequant_iq3s,
+                    "iq4nl" => &ctx.pipelines.dequant_iq4nl,
+                    "iq4xs" => &ctx.pipelines.dequant_iq4xs,
+                    _ => return Err(Error::Backend(format!("Unknown iq kernel {kernel_name}"))),
+                };
+                let packed_buf = self.new_buffer_with_bytes(bytes, BufferUsage::Shared)?;
+                let out_buf = ctx
+                    .device
+                    .newBufferWithLength_options(
+                        (elem_count * 4) as u64,
+                        objc2_metal::MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or_else(|| {
+                        Error::Backend(format!("Metal {kernel_name}: alloc out failed"))
+                    })?;
+
+                let cmd_buffer = self.get_or_create_command_buffer()?;
+                let encoder = cmd_buffer
+                    .computeCommandEncoder()
+                    .ok_or_else(|| Error::Backend("Metal dequant: encoder failed".into()))?;
+                encoder.setComputePipelineState(pipeline);
+                encoder.setBuffer_offset_atIndex(Some(&packed_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&out_buf), 0, 1);
+                let n_b = n_blocks as i32;
+                unsafe {
+                    encoder.setBytes_length_atIndex(
+                        &n_b as *const i32 as *const std::ffi::c_void,
+                        4,
+                        2,
+                    );
+                }
+                let grid = objc2_metal::MTLSize::new(((n_blocks * 256 + 255) / 256) as u64, 1, 1);
+                let threads = objc2_metal::MTLSize::new(256, 1, 1);
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threads);
+                encoder.endEncoding();
+                cmd_buffer.commit();
+                cmd_buffer.waitUntilCompleted();
+
+                let ptr = out_buf.contents() as *const f32;
+                let mut values = vec![0.0f32; elem_count];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(ptr, values.as_mut_ptr(), elem_count);
+                }
+                return Ok(values);
+            }
+        }
+        match kernel_name {
+            "iq2xxs" => grim_quant::dequant_iq2xxs(bytes, elem_count),
+            "iq2xs" => grim_quant::dequant_iq2xs(bytes, elem_count),
+            "iq2s" => grim_quant::dequant_iq2s(bytes, elem_count),
+            "iq3xxs" => grim_quant::dequant_iq3xxs(bytes, elem_count),
+            "iq3s" => grim_quant::dequant_iq3s(bytes, elem_count),
+            "iq4nl" => grim_quant::dequant_iq4nl(bytes, elem_count),
+            "iq4xs" => grim_quant::dequant_iq4xs(bytes, elem_count),
+            _ => Err(Error::Backend(format!("Unknown iq kernel {kernel_name}"))),
+        }
+    }
+
+    pub fn dequantize_iq2xxs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, 66, "iq2xxs")
+    }
+    pub fn dequantize_iq2xs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, 74, "iq2xs")
+    }
+    pub fn dequantize_iq2s_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, 82, "iq2s")
+    }
+    pub fn dequantize_iq3xxs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, 96, "iq3xxs")
+    }
+    pub fn dequantize_iq3s_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, 110, "iq3s")
+    }
+    pub fn dequantize_iq4nl_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, 170, "iq4nl")
+    }
+    pub fn dequantize_iq4xs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, 178, "iq4xs")
+    }
+
+    /// Dequantize packed FP8 bytes (4-byte f32 LE scale header + E4M3 codes).
+    pub fn dequantize_fp8_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let _scale = if bytes.len() >= 4 {
+            f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        } else {
+            1.0
+        };
+        let _payload = if bytes.len() >= 4 { &bytes[4..] } else { bytes };
+
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Ok(ctx) = MetalContext::get() {
+                let packed_buf = self.new_buffer_with_bytes(_payload, BufferUsage::Shared)?;
+                let out_buf = ctx
+                    .device
+                    .newBufferWithLength_options(
+                        (elem_count * 4) as u64,
+                        objc2_metal::MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or_else(|| Error::Backend("Metal dequant_fp8: alloc out failed".into()))?;
+
+                let cmd_buffer = self.get_or_create_command_buffer()?;
+                let encoder = cmd_buffer
+                    .computeCommandEncoder()
+                    .ok_or_else(|| Error::Backend("Metal dequant: encoder failed".into()))?;
+                encoder.setComputePipelineState(&ctx.pipelines.dequant_fp8);
+                encoder.setBuffer_offset_atIndex(Some(&packed_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&out_buf), 0, 1);
+                let count_i32 = elem_count as i32;
+                unsafe {
+                    encoder.setBytes_length_atIndex(
+                        &count_i32 as *const i32 as *const std::ffi::c_void,
+                        4,
+                        2,
+                    );
+                }
+                let grid = objc2_metal::MTLSize::new(((elem_count + 255) / 256) as u64, 1, 1);
+                let threads = objc2_metal::MTLSize::new(256, 1, 1);
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threads);
+                encoder.endEncoding();
+                cmd_buffer.commit();
+                cmd_buffer.waitUntilCompleted();
+
+                let ptr = out_buf.contents() as *const f32;
+                let mut values = vec![0.0f32; elem_count];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(ptr, values.as_mut_ptr(), elem_count);
+                }
+                for v in values.iter_mut() {
+                    *v *= _scale;
+                }
+                return Ok(values);
+            }
+        }
+        grim_quant::dequant_fp8(bytes, elem_count)
+    }
+
+    /// Helper for MXFP single-buffer dequant.
+    fn split_dequant_mxfp_host(
+        &self,
+        bytes: &[u8],
+        elem_count: usize,
+        is_mxfp4: bool,
+    ) -> Result<Vec<f32>> {
+        let mut cursor = 0usize;
+        let read_segment = |buf: &[u8], cur: &mut usize| -> Result<Vec<u8>> {
+            let len = u64::from_le_bytes(
+                buf[*cur..*cur + 8]
+                    .try_into()
+                    .map_err(|_| Error::Backend("mxfp: bad length prefix".into()))?,
+            ) as usize;
+            *cur += 8;
+            let seg = buf[*cur..*cur + len].to_vec();
+            *cur += len;
+            Ok(seg)
+        };
+        let _codes = read_segment(bytes, &mut cursor)?;
+        let _exps = read_segment(bytes, &mut cursor)?;
+
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Ok(ctx) = MetalContext::get() {
+                let codes_buf = self.new_buffer_with_bytes(&_codes, BufferUsage::Shared)?;
+                let exps_buf = self.new_buffer_with_bytes(&_exps, BufferUsage::Shared)?;
+                let out_buf = ctx
+                    .device
+                    .newBufferWithLength_options(
+                        (elem_count * 4) as u64,
+                        objc2_metal::MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or_else(|| Error::Backend("Metal dequant_mxfp: alloc out failed".into()))?;
+
+                let cmd_buffer = self.get_or_create_command_buffer()?;
+                let encoder = cmd_buffer
+                    .computeCommandEncoder()
+                    .ok_or_else(|| Error::Backend("Metal dequant: encoder failed".into()))?;
+                let pipeline = if is_mxfp4 {
+                    &ctx.pipelines.dequant_mxfp4
+                } else {
+                    &ctx.pipelines.dequant_mxfp8
+                };
+                encoder.setComputePipelineState(pipeline);
+                encoder.setBuffer_offset_atIndex(Some(&codes_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&exps_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(&out_buf), 0, 2);
+                let count_i32 = elem_count as i32;
+                unsafe {
+                    encoder.setBytes_length_atIndex(
+                        &count_i32 as *const i32 as *const std::ffi::c_void,
+                        4,
+                        3,
+                    );
+                }
+                let grid = objc2_metal::MTLSize::new(((elem_count + 255) / 256) as u64, 1, 1);
+                let threads = objc2_metal::MTLSize::new(256, 1, 1);
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threads);
+                encoder.endEncoding();
+                cmd_buffer.commit();
+                cmd_buffer.waitUntilCompleted();
+
+                let ptr = out_buf.contents() as *const f32;
+                let mut values = vec![0.0f32; elem_count];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(ptr, values.as_mut_ptr(), elem_count);
+                }
+                return Ok(values);
+            }
+        }
+        if is_mxfp4 {
+            grim_quant::dequant_mxfp4(bytes, elem_count)
+        } else {
+            grim_quant::dequant_mxfp8(bytes, elem_count)
+        }
+    }
+
+    pub fn dequantize_mxfp4_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.split_dequant_mxfp_host(bytes, elem_count, true)
+    }
+
+    pub fn dequantize_mxfp8_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.split_dequant_mxfp_host(bytes, elem_count, false)
+    }
+
+    /// Fused Add + RMSNorm kernel for Metal.
+    /// Computes `y = x + residual` and `norm_out = RMSNorm(y, weight, eps)` in a single Metal GPU pass.
+    pub fn fused_add_rms_norm(
+        &self,
+        x: &dyn BackendStorage,
+        residual: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        eps: f32,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(ref inner) = self.inner {
+                let x_s = x
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| Error::Backend("Metal x is not MetalStorage".into()))?;
+                let res_s = residual
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| Error::Backend("Metal residual is not MetalStorage".into()))?;
+                let w_s = weight
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| Error::Backend("Metal weight is not MetalStorage".into()))?;
+
+                let x_buf = x_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("x lacks buffer".into()))?;
+                let res_buf = res_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("residual lacks buffer".into()))?;
+                let w_buf = w_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("weight lacks buffer".into()))?;
+
+                let y_storage = self.zeros(out_shape, x.dtype())?;
+                let norm_storage = self.zeros(out_shape, x.dtype())?;
+
+                let y_s = y_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                let norm_s = norm_storage
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .unwrap();
+
+                let y_buf = y_s.buffer.as_ref().unwrap();
+                let norm_buf = norm_s.buffer.as_ref().unwrap();
+
+                let total = out_shape.elem_count();
+                let row_len = x.shape().dims().last().copied().unwrap_or(1) as i32;
+
+                let cmd_buffer = self.get_or_create_command_buffer()?;
+                let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                    Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                })?;
+
+                encoder.setComputePipelineState(&inner.pipelines.add_rms_norm);
+                encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(res_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(w_buf), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(y_buf), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(norm_buf), 0, 4);
+
+                let row_len_val = row_len;
+                let eps_val = eps;
+                let total_val = total as i32;
+
+                unsafe {
+                    encoder.setBytes_length_atIndex(
+                        &row_len_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        5,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &eps_val as *const f32 as *const std::ffi::c_void,
+                        4,
+                        6,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &total_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        7,
+                    );
+                }
+
+                let threads_per_group = MTLSize::new(256, 1, 1);
+                let groups = MTLSize::new(((total + 255) / 256) as u64, 1, 1);
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
+                encoder.endEncoding();
+
+                return Ok((
+                    y_storage,
+                    norm_storage,
+                    Box::new(MetalHandle {
+                        command_buffer: cmd_buffer,
+                    }),
+                ));
+            }
+        }
+
+        // CPU Fallback for non-Apple targets
+        let (y_storage, h1) = self.add(x, residual, out_shape)?;
+        h1.synchronize()?;
+        let (norm_storage, h2) = self.rms_norm(y_storage.as_ref(), weight, eps, out_shape)?;
+        h2.synchronize()?;
+        Ok((y_storage, norm_storage, h2))
+    }
+
+    /// Quantize F32 tensor `x` on-device to `format`.
+    pub fn quantize_on_device(
+        &self,
+        x: &dyn BackendStorage,
+        format: QuantFormat,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(ref inner) = self.inner {
+                let x_s = x
+                    .as_any()
+                    .downcast_ref::<MetalStorage>()
+                    .ok_or_else(|| Error::Backend("Metal x is not MetalStorage".into()))?;
+                let x_buf = x_s
+                    .buffer
+                    .as_ref()
+                    .ok_or_else(|| Error::Backend("x lacks buffer".into()))?;
+                let total = x.shape().elem_count();
+
+                let (pipeline, out_bytes, output_dtype) = match format {
+                    QuantFormat::Q8_0 => {
+                        let n_blocks = (total + 31) / 32;
+                        (
+                            &inner.pipelines.quant_q8_0,
+                            n_blocks * 34,
+                            DType {
+                                arith: ArithType::F32,
+                                storage: DTypeStorage::KQuant(KQuantScheme::Q80),
+                            },
+                        )
+                    }
+                    QuantFormat::Fp8 => (
+                        &inner.pipelines.quant_fp8,
+                        4 + total,
+                        DType {
+                            arith: ArithType::F32,
+                            storage: DTypeStorage::FloatPack(FloatPackScheme::Fp8),
+                        },
+                    ),
+                    other => {
+                        return Err(Error::Backend(format!(
+                            "Metal quantize_on_device: unsupported format {:?}",
+                            other
+                        )));
+                    }
+                };
+
+                let out_shape = Shape::from_slice(&[out_bytes]);
+                let out_storage = self.zeros(&out_shape, output_dtype)?;
+                let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                let out_buf = out_s.buffer.as_ref().unwrap();
+
+                let cmd_buffer = self.get_or_create_command_buffer()?;
+                let encoder = cmd_buffer.computeCommandEncoder().ok_or_else(|| {
+                    Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                })?;
+
+                encoder.setComputePipelineState(pipeline);
+                encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 1);
+
+                let total_val = total as i32;
+                unsafe {
+                    encoder.setBytes_length_atIndex(
+                        &total_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        2,
+                    );
+                }
+
+                match format {
+                    QuantFormat::Q8_0 => {
+                        let n_blocks = (total + 31) / 32;
+                        let threads_per_group = MTLSize::new(32, 1, 1);
+                        let groups = MTLSize::new(n_blocks as u64, 1, 1);
+                        encoder
+                            .dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
+                    }
+                    QuantFormat::Fp8 => {
+                        let threads_per_group = MTLSize::new(256, 1, 1);
+                        let groups = MTLSize::new(((total + 255) / 256) as u64, 1, 1);
+                        encoder
+                            .dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
+                    }
+                    _ => unreachable!(),
+                }
+                encoder.endEncoding();
+
+                return Ok((
+                    out_storage,
+                    Box::new(MetalHandle {
+                        command_buffer: cmd_buffer,
+                    }),
+                ));
+            }
+        }
+
+        let _total = x.shape().elem_count();
+        let x_cpu = x.to_cpu_vec_f32()?;
+        let (out_bytes, output_dtype) = match format {
+            QuantFormat::Q8_0 => {
+                let bytes = grim_quant::quant_q80(&x_cpu)?;
+                (
+                    bytes,
+                    DType {
+                        arith: ArithType::F32,
+                        storage: DTypeStorage::KQuant(KQuantScheme::Q80),
+                    },
+                )
+            }
+            QuantFormat::Fp8 => {
+                let bytes = grim_quant::quant_fp8(&x_cpu)?;
+                (
+                    bytes,
+                    DType {
+                        arith: ArithType::F32,
+                        storage: DTypeStorage::FloatPack(FloatPackScheme::Fp8),
+                    },
+                )
+            }
+            other => {
+                return Err(Error::Backend(format!(
+                    "quantize_on_device unsupported format {:?}",
+                    other
+                )));
+            }
+        };
+
+        let out_shape = Shape::from_slice(&[out_bytes.len()]);
+        let storage = self.from_cpu_bytes(&out_bytes, &out_shape, output_dtype)?;
+        Ok((storage, Box::new(ReadyHandle)))
     }
 }
 
@@ -1048,6 +1676,15 @@ impl BackendDevice for MetalDevice {
                 cpu_dev.rms_norm(x_cpu, w_cpu, eps, out_shape)
             })
         }
+    }
+
+    fn quantize(
+        &self,
+        x: &dyn BackendStorage,
+        format: QuantFormat,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let (out, _handle) = self.quantize_on_device(x, format)?;
+        Ok(out)
     }
 
     fn softmax(
@@ -2212,6 +2849,7 @@ impl BackendDevice for MetalDevice {
         a: &dyn BackendStorage,
         b_packed: &dyn BackendStorage,
         b_scales: &[f32],
+        _format: grim_tensor::QuantFormat,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let a_dims = a.shape().dims();
@@ -4187,4 +4825,23 @@ pub fn vram_info(_ordinal: usize) -> Option<(u64, u64)> {
         }
     }
     None
+}
+
+impl grim_format::convert::GpuDequant for MetalDevice {
+    fn dequantize(
+        &self,
+        storage: &grim_tensor::dtype::Storage,
+        bytes: &[u8],
+        elem_count: usize,
+    ) -> grim_tensor::error::Result<Option<Vec<f32>>> {
+        match storage {
+            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80) => {
+                Ok(Some(self.dequantize_q8_0_host(bytes, elem_count)?))
+            }
+            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K) => {
+                Ok(Some(self.dequantize_q4k_host(bytes, elem_count)?))
+            }
+            _ => Ok(None),
+        }
+    }
 }

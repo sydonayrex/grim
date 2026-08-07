@@ -1,6 +1,5 @@
 //! Grim CLI — main entry point for all subcommands.
 
-
 use clap::{Parser, Subcommand};
 use grim_core::error::Result;
 

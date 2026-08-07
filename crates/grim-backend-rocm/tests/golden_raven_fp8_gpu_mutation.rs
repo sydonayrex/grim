@@ -59,7 +59,7 @@ fn test_raven_fp8_gpu_gemm_golden_mutation_resistant() -> TestResult {
         let b_dev = BackendDevice::from_cpu_bytes(&dev, &fp8_bytes, &b_shape, fp8_dtype)?;
 
         let (out, handle) =
-            dev.quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &[], &out_shape)?;
+            dev.quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &[], grim_tensor::QuantFormat::Fp8, &out_shape)?;
         handle.synchronize()?;
         let actual_c = out.to_cpu_vec_f32()?;
 

@@ -117,9 +117,9 @@ fn compile_and_load_kernel(src: &str, device_ordinal: usize) -> Result<CUmodule>
         }
     }
 
-    let cache_dir = std::env::current_dir()
-        .unwrap_or_default()
-        .join("target")
+    let cache_dir = std::env::var("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join("target"))
         .join("grim_cuda_cache");
     fs::create_dir_all(&cache_dir).ok();
 
@@ -129,7 +129,44 @@ fn compile_and_load_kernel(src: &str, device_ordinal: usize) -> Result<CUmodule>
     fs::write(&cu_path, src)
         .map_err(|e| Error::Backend(format!("Failed to write CUDA source: {e}")))?;
 
-    let status = Command::new("nvcc")
+    /// Resolves the path to the `nvcc` executable.
+    /// Checks `NVCC`, `CUDA_PATH`, system `PATH`, Arch Linux `/opt/cuda/bin/nvcc`,
+    /// and standard Linux `/usr/local/cuda/bin/nvcc`.
+    fn resolve_nvcc_path() -> std::path::PathBuf {
+        if let Ok(env_nvcc) = std::env::var("NVCC") {
+            let p = std::path::PathBuf::from(env_nvcc);
+            if p.exists() {
+                return p;
+            }
+        }
+        if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
+            let p = std::path::PathBuf::from(cuda_path).join("bin").join("nvcc");
+            if p.exists() {
+                return p;
+            }
+        }
+
+        // Common installation paths across Linux distros (including Arch Linux /opt/cuda).
+        let candidate_paths = [
+            "/opt/cuda/bin/nvcc",
+            "/usr/local/cuda/bin/nvcc",
+            "/usr/bin/nvcc",
+        ];
+
+        for path_str in candidate_paths {
+            let p = std::path::PathBuf::from(path_str);
+            if p.exists() {
+                return p;
+            }
+        }
+
+        // Fall back to relying on PATH resolution by executable name.
+        std::path::PathBuf::from("nvcc")
+    }
+
+    let nvcc = resolve_nvcc_path();
+
+    let status = Command::new(&nvcc)
         .arg("-ptx")
         .arg("-O3")
         .arg("--gpu-architecture=sm_80")
@@ -144,7 +181,7 @@ fn compile_and_load_kernel(src: &str, device_ordinal: usize) -> Result<CUmodule>
     };
 
     if !success {
-        let status2 = Command::new("nvcc")
+        let status2 = Command::new(&nvcc)
             .arg("-ptx")
             .arg("-O3")
             .arg(&cu_path)
@@ -156,7 +193,10 @@ fn compile_and_load_kernel(src: &str, device_ordinal: usize) -> Result<CUmodule>
             Err(_) => false,
         };
         if !success2 {
-            return Err(Error::Backend("nvcc compilation failed".into()));
+            return Err(Error::Backend(format!(
+                "nvcc compilation failed (using compiler at {:?})",
+                nvcc
+            )));
         }
     }
 
@@ -936,15 +976,50 @@ impl CudaDevice {
         out_ptr: *mut c_void,
         n_values: usize,
     ) -> Result<Box<dyn ComputeHandle>> {
+        self.launch_dequant_mxfp_kernel(
+            "grim_dequant_mxfp4",
+            codes_ptr,
+            exps_ptr,
+            out_ptr,
+            n_values,
+        )
+    }
+
+    /// Launches `grim_dequant_mxfp8(codes, exps, out, n_values)` — one thread
+    /// per value. `codes` is packed E4M3 bytes; `exps` holds one E8M0 shared exponent per 32-element group.
+    fn launch_dequant_mxfp8(
+        &self,
+        codes_ptr: *const c_void,
+        exps_ptr: *const c_void,
+        out_ptr: *mut c_void,
+        n_values: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        self.launch_dequant_mxfp_kernel(
+            "grim_dequant_mxfp8",
+            codes_ptr,
+            exps_ptr,
+            out_ptr,
+            n_values,
+        )
+    }
+
+    fn launch_dequant_mxfp_kernel(
+        &self,
+        kernel_name: &str,
+        codes_ptr: *const c_void,
+        exps_ptr: *const c_void,
+        out_ptr: *mut c_void,
+        n_values: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
         let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
         let mut func: CUfunction = std::ptr::null_mut();
         unsafe {
-            let func_name = std::ffi::CString::new("grim_dequant_mxfp4")
+            let func_name = std::ffi::CString::new(kernel_name)
                 .map_err(|e| Error::Backend(format!("invalid kernel name: {e}")))?;
             let res = cuModuleGetFunction(&mut func, module, func_name.as_ptr());
             if res != 0 {
                 return Err(Error::Backend(format!(
-                    "cuModuleGetFunction(grim_dequant_mxfp4) failed: {res}"
+                    "cuModuleGetFunction({kernel_name}) failed: {res}"
                 )));
             }
             let mut codes = codes_ptr;
@@ -974,7 +1049,7 @@ impl CudaDevice {
             );
             if launch_res != 0 {
                 return Err(Error::Backend(format!(
-                    "cuLaunchKernel(grim_dequant_mxfp4) failed: {launch_res}"
+                    "cuLaunchKernel({kernel_name}) failed: {launch_res}"
                 )));
             }
         }
@@ -999,6 +1074,8 @@ impl CudaDevice {
         let (kernel, block_bytes, weights_per_block): (&str, usize, usize) =
             match &packed.dtype.storage {
                 DTypeStorage::KQuant(scheme) => match scheme {
+                    KQuantScheme::Q4K => ("grim_dequant_q4k", 144, 256),
+                    KQuantScheme::Q80 => ("grim_dequant_q8_0", 34, 32),
                     KQuantScheme::Q5K => ("grim_dequant_q5k", 176, 256),
                     KQuantScheme::Q6K => ("grim_dequant_q6k", 210, 256),
                     KQuantScheme::IQ4NL => ("grim_dequant_iq4nl", 170, 256),
@@ -1008,27 +1085,27 @@ impl CudaDevice {
                     KQuantScheme::IQ2XXS => ("grim_dequant_iq2xxs", 66, 256),
                     KQuantScheme::IQ2XS => ("grim_dequant_iq2xs", 74, 256),
                     KQuantScheme::IQ2S => ("grim_dequant_iq2s", 82, 256),
-                    // Q2K/Q3K/Q4K/Q8_0 have no standalone GPU kernel yet — host path.
                     _ => {
                         return Err(Error::Backend(format!(
                             "dequantize_on_device: no GPU kernel for KQuant {:?}",
                             scheme
-                        )))
+                        )));
                     }
                 },
                 DTypeStorage::FloatPack(FloatPackScheme::Fp8) => {
                     // FP8: 4-byte f32 scale header + 1 byte/weight. n_weights = elem_count.
-                    let out =
-                        CudaStorage::alloc_gpu(&packed.shape, DType::F32, self.ordinal)?;
+                    let out = CudaStorage::alloc_gpu(&packed.shape, DType::F32, self.ordinal)?;
                     let out_ptr = Self::dev_ptr_or_err("dequantize_on_device(fp8)", &out)?;
                     let handle = self.launch_dequant_fp8(packed_ptr, out_ptr, elem_count)?;
                     handle.synchronize()?;
                     return Ok(out);
                 }
-                DTypeStorage::FloatPack(FloatPackScheme::MxFp4) => {
-                    // MXFP4: length-prefixed [codes][exps]. The host framing
-                    // splits the segments — do it here from the host-staged copy.
-                    // We need the raw bytes; download packed first.
+                DTypeStorage::FloatPack(FloatPackScheme::MxFp4)
+                | DTypeStorage::FloatPack(FloatPackScheme::MxFp8) => {
+                    let is_mxfp4 = matches!(
+                        packed.dtype.storage,
+                        DTypeStorage::FloatPack(FloatPackScheme::MxFp4)
+                    );
                     let raw = stage_packed_bytes(packed)?;
                     let mut cursor = 0usize;
                     let codes = read_length_prefixed(&raw, &mut cursor)?;
@@ -1036,18 +1113,22 @@ impl CudaDevice {
                     let num_groups = elem_count.div_ceil(32);
                     if exps.len() < num_groups {
                         return Err(Error::Backend(format!(
-                            "dequantize_on_device(mxfp4): expected {num_groups} exp bytes, got {}",
+                            "dequantize_on_device(mxfp): expected {num_groups} exp bytes, got {}",
                             exps.len()
                         )));
                     }
-                    if codes.len() < elem_count.div_ceil(2) {
+                    let min_codes_len = if is_mxfp4 {
+                        elem_count.div_ceil(2)
+                    } else {
+                        elem_count
+                    };
+                    if codes.len() < min_codes_len {
                         return Err(Error::Backend(format!(
-                            "dequantize_on_device(mxfp4): expected {} code bytes, got {}",
-                            elem_count.div_ceil(2),
+                            "dequantize_on_device(mxfp): expected {} code bytes, got {}",
+                            min_codes_len,
                             codes.len()
                         )));
                     }
-                    // Upload codes + exps as two device buffers.
                     let codes_shape_external = Shape::new(vec![codes.len()]);
                     let codes_storage = CudaStorage::copy_from_host_raw_bytes(
                         &codes,
@@ -1069,11 +1150,16 @@ impl CudaDevice {
                         self.ordinal,
                     )?;
                     let out = CudaStorage::alloc_gpu(&packed.shape, DType::F32, self.ordinal)?;
-                    let codes_ptr = Self::dev_ptr_or_err("dequantize_on_device(mxfp4 codes)", &codes_storage)?;
-                    let exps_ptr = Self::dev_ptr_or_err("dequantize_on_device(mxfp4 exps)", &exps_storage)?;
-                    let out_ptr = Self::dev_ptr_or_err("dequantize_on_device(mxfp4 out)", &out)?;
-                    let handle =
-                        self.launch_dequant_mxfp4(codes_ptr, exps_ptr, out_ptr, elem_count)?;
+                    let codes_ptr =
+                        Self::dev_ptr_or_err("dequantize_on_device(mxfp codes)", &codes_storage)?;
+                    let exps_ptr =
+                        Self::dev_ptr_or_err("dequantize_on_device(mxfp exps)", &exps_storage)?;
+                    let out_ptr = Self::dev_ptr_or_err("dequantize_on_device(mxfp out)", &out)?;
+                    let handle = if is_mxfp4 {
+                        self.launch_dequant_mxfp4(codes_ptr, exps_ptr, out_ptr, elem_count)?
+                    } else {
+                        self.launch_dequant_mxfp8(codes_ptr, exps_ptr, out_ptr, elem_count)?
+                    };
                     handle.synchronize()?;
                     return Ok(out);
                 }
@@ -1082,7 +1168,7 @@ impl CudaDevice {
                     return Err(Error::Backend(format!(
                         "dequantize_on_device: no GPU kernel for dtype {:?}",
                         packed.dtype
-                    )))
+                    )));
                 }
             };
 
@@ -1099,6 +1185,245 @@ impl CudaDevice {
         let handle = self.launch_dequant_generic(kernel, packed_ptr, out_ptr, n_blocks)?;
         handle.synchronize()?;
         Ok(out)
+    }
+
+    /// Quantize a CUDA-resident F32 `CudaStorage` into packed quantized bytes,
+    /// entirely on-device — the device-side mirror of `grim_quant::quant_*`.
+    ///
+    /// Returns a new `CudaStorage` holding the packed bytes with the
+    /// appropriate `Storage` dtype. Currently supports Q8_0 and FP8 (E4M3).
+    pub fn quantize_on_device(
+        &self,
+        x: &CudaStorage,
+        format: grim_tensor::QuantFormat,
+    ) -> Result<CudaStorage> {
+        Self::ensure_f32_input("quantize_on_device", x)?;
+        let n_weights = x.shape.elem_count();
+        let x_ptr = Self::dev_ptr_or_err("quantize_on_device x", x)? as *const c_void;
+
+        match format {
+            grim_tensor::QuantFormat::Q8_0 => {
+                if n_weights % 32 != 0 {
+                    return Err(Error::Backend(format!(
+                        "quantize_on_device(Q8_0): n_weights ({n_weights}) must be a multiple of 32"
+                    )));
+                }
+                let n_blocks = n_weights / 32;
+                let out_bytes = n_blocks * 34;
+                let out_shape = Shape::new(vec![out_bytes]);
+                let out = CudaStorage::alloc_gpu_bytes(
+                    &out_shape,
+                    DType {
+                        arith: ArithType::U8,
+                        storage: DTypeStorage::KQuant(KQuantScheme::Q80),
+                    },
+                    out_bytes,
+                    self.ordinal,
+                )?;
+                let out_ptr = Self::dev_ptr_or_err("quantize_on_device(Q8_0 out)", &out)?;
+                let handle = self.launch_quant_q8_0(x_ptr, out_ptr, n_blocks)?;
+                handle.synchronize()?;
+                Ok(out)
+            }
+            grim_tensor::QuantFormat::Fp8 => {
+                let out_bytes = 4 + n_weights;
+                let out_shape = Shape::new(vec![out_bytes]);
+                let out = CudaStorage::alloc_gpu_bytes(
+                    &out_shape,
+                    DType {
+                        arith: ArithType::U8,
+                        storage: DTypeStorage::FloatPack(FloatPackScheme::Fp8),
+                    },
+                    out_bytes,
+                    self.ordinal,
+                )?;
+                let out_ptr = Self::dev_ptr_or_err("quantize_on_device(FP8 out)", &out)?;
+                let handle = self.launch_quant_fp8(x_ptr, out_ptr, n_weights)?;
+                handle.synchronize()?;
+                Ok(out)
+            }
+            other => Err(Error::Backend(format!(
+                "quantize_on_device: no GPU kernel for format {other:?}"
+            ))),
+        }
+    }
+
+    /// Launches `grim_quant_q8_0(x, out, n_blocks)` — one 32-thread block per
+    /// Q8_0 block. Warp shuffle reduction for amax.
+    fn launch_quant_q8_0(
+        &self,
+        x_ptr: *const c_void,
+        out_ptr: *mut c_void,
+        n_blocks: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+        let mut func: CUfunction = std::ptr::null_mut();
+        unsafe {
+            let func_name = std::ffi::CString::new("grim_quant_q8_0")
+                .map_err(|e| Error::Backend(format!("invalid kernel name: {e}")))?;
+            let res = cuModuleGetFunction(&mut func, module, func_name.as_ptr());
+            if res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuModuleGetFunction(grim_quant_q8_0) failed: {res}"
+                )));
+            }
+
+            let mut x = x_ptr;
+            let mut out = out_ptr;
+            let mut n_blk = n_blocks as i32;
+            let mut args: [*mut c_void; 3] = [
+                &mut x as *mut *const c_void as *mut c_void,
+                &mut out as *mut *mut c_void as *mut c_void,
+                &mut n_blk as *mut i32 as *mut c_void,
+            ];
+
+            // One block of 32 threads per Q8_0 block.
+            const BLOCK_SIZE: u32 = 32;
+            let launch_res = cuLaunchKernel(
+                func,
+                n_blocks as u32,
+                1,
+                1,
+                BLOCK_SIZE,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr() as *mut *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if launch_res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuLaunchKernel(grim_quant_q8_0) failed: {launch_res}"
+                )));
+            }
+        }
+        Ok(Box::new(CudaHandle {
+            completed: Arc::new(Mutex::new(false)),
+        }))
+    }
+
+    /// Launches `grim_quant_fp8(x, out, n_weights)` — one thread per weight.
+    /// The first 4 bytes of `out` are the LE f32 scale (1.0f).
+    fn launch_quant_fp8(
+        &self,
+        x_ptr: *const c_void,
+        out_ptr: *mut c_void,
+        n_weights: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+        let mut func: CUfunction = std::ptr::null_mut();
+        unsafe {
+            let func_name = std::ffi::CString::new("grim_quant_fp8")
+                .map_err(|e| Error::Backend(format!("invalid kernel name: {e}")))?;
+            let res = cuModuleGetFunction(&mut func, module, func_name.as_ptr());
+            if res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuModuleGetFunction(grim_quant_fp8) failed: {res}"
+                )));
+            }
+
+            let mut x = x_ptr;
+            let mut out = out_ptr;
+            let mut n = n_weights as i32;
+            let mut args: [*mut c_void; 3] = [
+                &mut x as *mut *const c_void as *mut c_void,
+                &mut out as *mut *mut c_void as *mut c_void,
+                &mut n as *mut i32 as *mut c_void,
+            ];
+
+            const BLOCK_SIZE: u32 = 256;
+            let grid_size = ((n_weights as u64) + (BLOCK_SIZE as u64) - 1) / (BLOCK_SIZE as u64);
+            let launch_res = cuLaunchKernel(
+                func,
+                grid_size as u32,
+                1,
+                1,
+                BLOCK_SIZE,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr() as *mut *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if launch_res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuLaunchKernel(grim_quant_fp8) failed: {launch_res}"
+                )));
+            }
+        }
+        Ok(Box::new(CudaHandle {
+            completed: Arc::new(Mutex::new(false)),
+        }))
+    }
+
+    /// Launches `grim_fused_quant_gemm_{format}(A, B, C, M, N, K)` — one thread
+    /// per output element. Grid/block match `launch_quantized_matmul_q8_0`.
+    fn launch_fused_quant_gemm(
+        &self,
+        kernel_name: &str,
+        a_ptr: *const c_void,
+        b_ptr: *const c_void,
+        out_ptr: *mut c_void,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+        let mut func: CUfunction = std::ptr::null_mut();
+        unsafe {
+            let func_name = std::ffi::CString::new(kernel_name)
+                .map_err(|e| Error::Backend(format!("invalid kernel name: {e}")))?;
+            let res = cuModuleGetFunction(&mut func, module, func_name.as_ptr());
+            if res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuModuleGetFunction({kernel_name}) failed: {res}"
+                )));
+            }
+
+            let mut a = a_ptr;
+            let mut b = b_ptr;
+            let mut out = out_ptr;
+            let mut m_arg = m as i32;
+            let mut n_arg = n as i32;
+            let mut k_arg = k as i32;
+            let mut args: [*mut c_void; 6] = [
+                &mut a as *mut *const c_void as *mut c_void,
+                &mut b as *mut *const c_void as *mut c_void,
+                &mut out as *mut *mut c_void as *mut c_void,
+                &mut m_arg as *mut i32 as *mut c_void,
+                &mut n_arg as *mut i32 as *mut c_void,
+                &mut k_arg as *mut i32 as *mut c_void,
+            ];
+
+            const BLOCK_X: u32 = 32;
+            const BLOCK_Y: u32 = 8;
+            let grid_x = (n as u32).div_ceil(BLOCK_X);
+            let grid_y = (m as u32).div_ceil(BLOCK_Y);
+
+            let launch_res = cuLaunchKernel(
+                func,
+                grid_x,
+                grid_y,
+                1,
+                BLOCK_X,
+                BLOCK_Y,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr() as *mut *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if launch_res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuLaunchKernel({kernel_name}) failed: {launch_res}"
+                )));
+            }
+        }
+        Ok(Box::new(CudaHandle {
+            completed: Arc::new(Mutex::new(false)),
+        }))
     }
 }
 
@@ -2195,8 +2520,15 @@ impl BackendDevice for CudaDevice {
         a: &dyn BackendStorage,
         b_packed: &dyn BackendStorage,
         b_scales: &[f32],
+        format: grim_tensor::QuantFormat,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        if format != grim_tensor::QuantFormat::Q8_0 {
+            return Err(Error::Backend(format!(
+                "CUDA quantized_matmul only supports Q8_0 format; got {format:?}"
+            )));
+        }
+
         let a_dims = a.shape().dims();
         let out_dims = out_shape.dims();
         let m = a_dims[0];
@@ -2548,6 +2880,78 @@ impl BackendDevice for CudaDevice {
             _ => 40.0,
         };
         (flops / (tflops * 1e12) * 1000.0).max(0.01)
+    }
+
+    fn quantize(
+        &self,
+        x: &dyn BackendStorage,
+        format: grim_tensor::QuantFormat,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let x_storage = x
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("quantize: x is not CudaStorage".into()))?;
+        let out = self.quantize_on_device(x_storage, format)?;
+        Ok(Box::new(out))
+    }
+
+    fn fused_quant_gemm(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        format: grim_tensor::QuantFormat,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let kernel_name = match format {
+            grim_tensor::QuantFormat::Q8_0 => "grim_fused_quant_gemm_q8_0",
+            grim_tensor::QuantFormat::Fp8 => "grim_fused_quant_gemm_fp8",
+            other => {
+                return Err(Error::Backend(format!(
+                    "fused_quant_gemm: no GPU kernel for format {other:?}"
+                )));
+            }
+        };
+
+        let a_storage = a
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("fused_quant_gemm: a is not CudaStorage".into()))?;
+        let b_storage = b
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("fused_quant_gemm: b is not CudaStorage".into()))?;
+
+        Self::ensure_f32_input("fused_quant_gemm a", a_storage)?;
+        Self::ensure_f32_input("fused_quant_gemm b", b_storage)?;
+
+        let a_dims = a.shape().dims();
+        let b_dims = b.shape().dims();
+        let out_dims = out_shape.dims();
+        if a_dims.len() != 2 || b_dims.len() != 2 || out_dims.len() != 2 {
+            return Err(Error::Shape(
+                "fused_quant_gemm expects 2-D a, b, out".into(),
+            ));
+        }
+        let (m, k) = (a_dims[0], a_dims[1]);
+        let (k2, n) = (b_dims[0], b_dims[1]);
+        if k != k2 {
+            return Err(Error::Shape(format!(
+                "fused_quant_gemm: a is ({m},{k}) but b is ({k2},{n})"
+            )));
+        }
+        if format == grim_tensor::QuantFormat::Q8_0 && k % 32 != 0 {
+            return Err(Error::Shape(format!(
+                "fused_quant_gemm(Q8_0): K ({k}) must be a multiple of 32"
+            )));
+        }
+
+        let a_ptr = Self::dev_ptr_or_err("fused_quant_gemm a", a_storage)?;
+        let b_ptr = Self::dev_ptr_or_err("fused_quant_gemm b", b_storage)?;
+        let out = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+        let out_ptr = Self::dev_ptr_or_err("fused_quant_gemm out", &out)?;
+
+        let handle = self.launch_fused_quant_gemm(kernel_name, a_ptr, b_ptr, out_ptr, m, n, k)?;
+        Ok((Box::new(out), handle))
     }
 }
 
@@ -2984,7 +3388,13 @@ mod tests {
             .unwrap();
 
         let (out, handle) = dev
-            .quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &b_scales, &out_shape)
+            .quantized_matmul(
+                a_dev.as_ref(),
+                b_dev.as_ref(),
+                &b_scales,
+                grim_tensor::QuantFormat::Q8_0,
+                &out_shape,
+            )
             .unwrap();
         handle.synchronize().unwrap();
         assert_q8_close(&out.to_cpu_vec_f32().unwrap(), &expected);
@@ -3017,7 +3427,13 @@ mod tests {
             .unwrap();
 
         let (out, handle) = dev
-            .quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &[], &out_shape)
+            .quantized_matmul(
+                a_dev.as_ref(),
+                b_dev.as_ref(),
+                &[],
+                grim_tensor::QuantFormat::Q8_0,
+                &out_shape,
+            )
             .unwrap();
         handle.synchronize().unwrap();
         assert_q8_close(&out.to_cpu_vec_f32().unwrap(), &expected);
@@ -3055,7 +3471,13 @@ mod tests {
             .unwrap();
 
         let (out, handle) = dev
-            .quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &b_scales, &out_shape)
+            .quantized_matmul(
+                a_dev.as_ref(),
+                b_dev.as_ref(),
+                &b_scales,
+                grim_tensor::QuantFormat::Q8_0,
+                &out_shape,
+            )
             .unwrap();
         handle.synchronize().unwrap();
         assert_q8_close(&out.to_cpu_vec_f32().unwrap(), &expected);
@@ -3146,7 +3568,10 @@ mod tests {
 
     fn dequant_test_device() -> Option<CudaDevice> {
         unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
-        CudaDevice::probe().ok().filter(|d| !d.is_empty()).map(|d| d[0].clone())
+        CudaDevice::probe()
+            .ok()
+            .filter(|d| !d.is_empty())
+            .map(|d| d[0].clone())
     }
 
     fn assert_dequant_close(label: &str, actual: &[f32], expected: &[f32]) {
@@ -3200,156 +3625,240 @@ mod tests {
 
     #[test]
     fn test_cuda_dequant_q5k_gpu_matches_cpu() {
-        let Some(dev) = dequant_test_device() else { return };
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
         // 2 super-blocks × 256 weights = 512 weights.
         let n = 512;
         let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).sin() * 0.5).collect();
         let packed = grim_quant::quant_q5k(&src).expect("quant_q5k");
         let expected = grim_quant::dequant_q5k(&packed, n).expect("cpu oracle q5k");
         let shape = Shape::new(vec![n]);
-        let storage = upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::Q5K));
-        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant q5k");
+        let storage = upload_packed(
+            &dev,
+            &packed,
+            &shape,
+            DTypeStorage::KQuant(KQuantScheme::Q5K),
+        );
+        let out = dev
+            .dequantize_on_device(as_cuda_storage(storage.as_ref()))
+            .expect("gpu dequant q5k");
         let actual = out.to_cpu_vec_f32().expect("readback q5k");
         assert_dequant_close("q5k", &actual, &expected);
     }
 
     #[test]
     fn test_cuda_dequant_q6k_gpu_matches_cpu() {
-        let Some(dev) = dequant_test_device() else { return };
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
         let n = 256;
         let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.05).cos() * 0.7).collect();
         let packed = grim_quant::quant_q6k(&src).expect("quant_q6k");
         let expected = grim_quant::dequant_q6k(&packed, n).expect("cpu oracle q6k");
         let shape = Shape::new(vec![n]);
-        let storage = upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::Q6K));
-        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant q6k");
+        let storage = upload_packed(
+            &dev,
+            &packed,
+            &shape,
+            DTypeStorage::KQuant(KQuantScheme::Q6K),
+        );
+        let out = dev
+            .dequantize_on_device(as_cuda_storage(storage.as_ref()))
+            .expect("gpu dequant q6k");
         let actual = out.to_cpu_vec_f32().expect("readback q6k");
         assert_dequant_close("q6k", &actual, &expected);
     }
 
     #[test]
     fn test_cuda_dequant_iq4nl_gpu_matches_cpu() {
-        let Some(dev) = dequant_test_device() else { return };
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
         let n = 256;
         let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.11).sin() * 0.3).collect();
         let packed = grim_quant::quant_iq4nl(&src).expect("quant_iq4nl");
         let expected = grim_quant::dequant_iq4nl(&packed, n).expect("cpu oracle iq4nl");
         let shape = Shape::new(vec![n]);
-        let storage =
-            upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::IQ4NL));
-        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant iq4nl");
+        let storage = upload_packed(
+            &dev,
+            &packed,
+            &shape,
+            DTypeStorage::KQuant(KQuantScheme::IQ4NL),
+        );
+        let out = dev
+            .dequantize_on_device(as_cuda_storage(storage.as_ref()))
+            .expect("gpu dequant iq4nl");
         let actual = out.to_cpu_vec_f32().expect("readback iq4nl");
         assert_dequant_close("iq4nl", &actual, &expected);
     }
 
     #[test]
     fn test_cuda_dequant_iq4xs_gpu_matches_cpu() {
-        let Some(dev) = dequant_test_device() else { return };
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
         let n = 256;
         let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.09).cos() * 0.4).collect();
         let packed = grim_quant::quant_iq4xs(&src).expect("quant_iq4xs");
         let expected = grim_quant::dequant_iq4xs(&packed, n).expect("cpu oracle iq4xs");
         let shape = Shape::new(vec![n]);
-        let storage =
-            upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::IQ4XS));
-        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant iq4xs");
+        let storage = upload_packed(
+            &dev,
+            &packed,
+            &shape,
+            DTypeStorage::KQuant(KQuantScheme::IQ4XS),
+        );
+        let out = dev
+            .dequantize_on_device(as_cuda_storage(storage.as_ref()))
+            .expect("gpu dequant iq4xs");
         let actual = out.to_cpu_vec_f32().expect("readback iq4xs");
         assert_dequant_close("iq4xs", &actual, &expected);
     }
 
     #[test]
     fn test_cuda_dequant_iq3xxs_gpu_matches_cpu() {
-        let Some(dev) = dequant_test_device() else { return };
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
         let n = 512;
         let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.13).sin() * 0.25).collect();
         let packed = grim_quant::quant_iq3xxs(&src).expect("quant_iq3xxs");
         let expected = grim_quant::dequant_iq3xxs(&packed, n).expect("cpu oracle iq3xxs");
         let shape = Shape::new(vec![n]);
-        let storage =
-            upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::IQ3XXS));
-        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant iq3xxs");
+        let storage = upload_packed(
+            &dev,
+            &packed,
+            &shape,
+            DTypeStorage::KQuant(KQuantScheme::IQ3XXS),
+        );
+        let out = dev
+            .dequantize_on_device(as_cuda_storage(storage.as_ref()))
+            .expect("gpu dequant iq3xxs");
         let actual = out.to_cpu_vec_f32().expect("readback iq3xxs");
         assert_dequant_close("iq3xxs", &actual, &expected);
     }
 
     #[test]
     fn test_cuda_dequant_iq3s_gpu_matches_cpu() {
-        let Some(dev) = dequant_test_device() else { return };
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
         let n = 256;
         let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.08).cos() * 0.6).collect();
         let packed = grim_quant::quant_iq3s(&src).expect("quant_iq3s");
         let expected = grim_quant::dequant_iq3s(&packed, n).expect("cpu oracle iq3s");
         let shape = Shape::new(vec![n]);
-        let storage =
-            upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::IQ3S));
-        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant iq3s");
+        let storage = upload_packed(
+            &dev,
+            &packed,
+            &shape,
+            DTypeStorage::KQuant(KQuantScheme::IQ3S),
+        );
+        let out = dev
+            .dequantize_on_device(as_cuda_storage(storage.as_ref()))
+            .expect("gpu dequant iq3s");
         let actual = out.to_cpu_vec_f32().expect("readback iq3s");
         assert_dequant_close("iq3s", &actual, &expected);
     }
 
     #[test]
     fn test_cuda_dequant_iq2xxs_gpu_matches_cpu() {
-        let Some(dev) = dequant_test_device() else { return };
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
         let n = 512;
         let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.05).sin() * 0.2).collect();
         let packed = grim_quant::quant_iq2xxs(&src).expect("quant_iq2xxs");
         let expected = grim_quant::dequant_iq2xxs(&packed, n).expect("cpu oracle iq2xxs");
         let shape = Shape::new(vec![n]);
-        let storage =
-            upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::IQ2XXS));
-        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant iq2xxs");
+        let storage = upload_packed(
+            &dev,
+            &packed,
+            &shape,
+            DTypeStorage::KQuant(KQuantScheme::IQ2XXS),
+        );
+        let out = dev
+            .dequantize_on_device(as_cuda_storage(storage.as_ref()))
+            .expect("gpu dequant iq2xxs");
         let actual = out.to_cpu_vec_f32().expect("readback iq2xxs");
         assert_dequant_close("iq2xxs", &actual, &expected);
     }
 
     #[test]
     fn test_cuda_dequant_iq2xs_gpu_matches_cpu() {
-        let Some(dev) = dequant_test_device() else { return };
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
         let n = 256;
         let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).cos() * 0.35).collect();
         let packed = grim_quant::quant_iq2xs(&src).expect("quant_iq2xs");
         let expected = grim_quant::dequant_iq2xs(&packed, n).expect("cpu oracle iq2xs");
         let shape = Shape::new(vec![n]);
-        let storage =
-            upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::IQ2XS));
-        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant iq2xs");
+        let storage = upload_packed(
+            &dev,
+            &packed,
+            &shape,
+            DTypeStorage::KQuant(KQuantScheme::IQ2XS),
+        );
+        let out = dev
+            .dequantize_on_device(as_cuda_storage(storage.as_ref()))
+            .expect("gpu dequant iq2xs");
         let actual = out.to_cpu_vec_f32().expect("readback iq2xs");
         assert_dequant_close("iq2xs", &actual, &expected);
     }
 
     #[test]
     fn test_cuda_dequant_iq2s_gpu_matches_cpu() {
-        let Some(dev) = dequant_test_device() else { return };
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
         let n = 256;
         let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.06).sin() * 0.45).collect();
         let packed = grim_quant::quant_iq2s(&src).expect("quant_iq2s");
         let expected = grim_quant::dequant_iq2s(&packed, n).expect("cpu oracle iq2s");
         let shape = Shape::new(vec![n]);
-        let storage =
-            upload_packed(&dev, &packed, &shape, DTypeStorage::KQuant(KQuantScheme::IQ2S));
-        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant iq2s");
+        let storage = upload_packed(
+            &dev,
+            &packed,
+            &shape,
+            DTypeStorage::KQuant(KQuantScheme::IQ2S),
+        );
+        let out = dev
+            .dequantize_on_device(as_cuda_storage(storage.as_ref()))
+            .expect("gpu dequant iq2s");
         let actual = out.to_cpu_vec_f32().expect("readback iq2s");
         assert_dequant_close("iq2s", &actual, &expected);
     }
 
     #[test]
     fn test_cuda_dequant_fp8_gpu_matches_cpu() {
-        let Some(dev) = dequant_test_device() else { return };
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
         let n = 64;
         let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.03).sin() * 0.5).collect();
         let packed = grim_quant::quant_fp8(&src).expect("quant_fp8");
         let expected = grim_quant::dequant_fp8(&packed, n).expect("cpu oracle fp8");
         let shape = Shape::new(vec![n]);
-        let storage =
-            upload_packed(&dev, &packed, &shape, DTypeStorage::FloatPack(FloatPackScheme::Fp8));
-        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant fp8");
+        let storage = upload_packed(
+            &dev,
+            &packed,
+            &shape,
+            DTypeStorage::FloatPack(FloatPackScheme::Fp8),
+        );
+        let out = dev
+            .dequantize_on_device(as_cuda_storage(storage.as_ref()))
+            .expect("gpu dequant fp8");
         let actual = out.to_cpu_vec_f32().expect("readback fp8");
         assert_dequant_close("fp8", &actual, &expected);
     }
 
     #[test]
     fn test_cuda_dequant_mxfp4_gpu_matches_cpu() {
-        let Some(dev) = dequant_test_device() else { return };
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
         // 64 values = 2 groups of 32. Hand-build codes + shared exponents so the
         // test is independent of a MXFP4 encoder (grim-quant has none public).
         // code i = (i % 16); shared exp = 127 + (group // ) so group 0 = 127,
@@ -3372,9 +3881,178 @@ mod tests {
             &shape,
             DTypeStorage::FloatPack(FloatPackScheme::MxFp4),
         );
-        let out = dev.dequantize_on_device(as_cuda_storage(storage.as_ref())).expect("gpu dequant mxfp4");
+        let out = dev
+            .dequantize_on_device(as_cuda_storage(storage.as_ref()))
+            .expect("gpu dequant mxfp4");
         let actual = out.to_cpu_vec_f32().expect("readback mxfp4");
         assert_dequant_close("mxfp4", &actual, &expected);
+    }
+}
+
+impl CudaDevice {
+    /// Dequantize Q8_0 packed bytes to an f32 host Vec via host / GPU.
+    pub fn dequantize_q8_0_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let packed = CudaStorage::copy_from_host_raw_bytes(
+            bytes,
+            &Shape::new(vec![elem_count]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::KQuant(KQuantScheme::Q80),
+            },
+            self.ordinal,
+        )?;
+        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
+            return f32_storage.to_cpu_vec_f32();
+        }
+        let mut out = Vec::with_capacity(elem_count);
+        for blk in bytes.chunks_exact(34) {
+            let d_bits = u16::from_le_bytes([blk[0], blk[1]]);
+            let d = half::f16::from_bits(d_bits).to_f32();
+            for &q in &blk[2..34] {
+                out.push(d * (q as i8 as f32));
+            }
+        }
+        out.truncate(elem_count);
+        Ok(out)
+    }
+
+    /// Dequantize Q4_K packed bytes to an f32 host Vec via host / GPU.
+    pub fn dequantize_q4k_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let packed = CudaStorage::copy_from_host_raw_bytes(
+            bytes,
+            &Shape::new(vec![elem_count]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::KQuant(KQuantScheme::Q4K),
+            },
+            self.ordinal,
+        )?;
+        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
+            return f32_storage.to_cpu_vec_f32();
+        }
+        grim_quant::dequant_q4k(bytes, elem_count)
+    }
+
+    fn dequantize_iq_host(
+        &self,
+        bytes: &[u8],
+        elem_count: usize,
+        scheme: KQuantScheme,
+    ) -> Result<Vec<f32>> {
+        let packed = CudaStorage::copy_from_host_raw_bytes(
+            bytes,
+            &Shape::new(vec![elem_count]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::KQuant(scheme),
+            },
+            self.ordinal,
+        )?;
+        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
+            return f32_storage.to_cpu_vec_f32();
+        }
+        match scheme {
+            KQuantScheme::IQ2XXS => grim_quant::dequant_iq2xxs(bytes, elem_count),
+            KQuantScheme::IQ2XS => grim_quant::dequant_iq2xs(bytes, elem_count),
+            KQuantScheme::IQ2S => grim_quant::dequant_iq2s(bytes, elem_count),
+            KQuantScheme::IQ3XXS => grim_quant::dequant_iq3xxs(bytes, elem_count),
+            KQuantScheme::IQ3S => grim_quant::dequant_iq3s(bytes, elem_count),
+            KQuantScheme::IQ4NL => grim_quant::dequant_iq4nl(bytes, elem_count),
+            KQuantScheme::IQ4XS => grim_quant::dequant_iq4xs(bytes, elem_count),
+            _ => Err(Error::Backend(format!("Unknown iq scheme {:?}", scheme))),
+        }
+    }
+
+    pub fn dequantize_iq2xxs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ2XXS)
+    }
+    pub fn dequantize_iq2xs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ2XS)
+    }
+    pub fn dequantize_iq2s_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ2S)
+    }
+    pub fn dequantize_iq3xxs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ3XXS)
+    }
+    pub fn dequantize_iq3s_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ3S)
+    }
+    pub fn dequantize_iq4nl_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ4NL)
+    }
+    pub fn dequantize_iq4xs_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        self.dequantize_iq_host(bytes, elem_count, KQuantScheme::IQ4XS)
+    }
+
+    /// Dequantize FP8 packed bytes.
+    pub fn dequantize_fp8_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let packed = CudaStorage::copy_from_host_raw_bytes(
+            bytes,
+            &Shape::new(vec![elem_count]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::FloatPack(FloatPackScheme::Fp8),
+            },
+            self.ordinal,
+        )?;
+        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
+            return f32_storage.to_cpu_vec_f32();
+        }
+        grim_quant::dequant_fp8(bytes, elem_count)
+    }
+
+    /// Dequantize MXFP4 packed bytes.
+    pub fn dequantize_mxfp4_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let packed = CudaStorage::copy_from_host_raw_bytes(
+            bytes,
+            &Shape::new(vec![elem_count]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::FloatPack(FloatPackScheme::MxFp4),
+            },
+            self.ordinal,
+        )?;
+        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
+            return f32_storage.to_cpu_vec_f32();
+        }
+        grim_quant::dequant_mxfp4(bytes, elem_count)
+    }
+
+    /// Dequantize MXFP8 packed bytes.
+    pub fn dequantize_mxfp8_host(&self, bytes: &[u8], elem_count: usize) -> Result<Vec<f32>> {
+        let packed = CudaStorage::copy_from_host_raw_bytes(
+            bytes,
+            &Shape::new(vec![elem_count]),
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::FloatPack(FloatPackScheme::MxFp8),
+            },
+            self.ordinal,
+        )?;
+        if let Ok(f32_storage) = self.dequantize_on_device(&packed) {
+            return f32_storage.to_cpu_vec_f32();
+        }
+        grim_quant::dequant_mxfp8(bytes, elem_count)
+    }
+}
+
+impl grim_format::convert::GpuDequant for CudaDevice {
+    fn dequantize(
+        &self,
+        storage: &grim_tensor::dtype::Storage,
+        bytes: &[u8],
+        elem_count: usize,
+    ) -> grim_tensor::error::Result<Option<Vec<f32>>> {
+        match storage {
+            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80) => {
+                Ok(Some(self.dequantize_q8_0_host(bytes, elem_count)?))
+            }
+            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K) => {
+                Ok(Some(self.dequantize_q4k_host(bytes, elem_count)?))
+            }
+            _ => Ok(None),
+        }
     }
 }
 

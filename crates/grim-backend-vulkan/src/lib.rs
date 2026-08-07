@@ -5,7 +5,8 @@ use std::sync::Mutex;
 
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::{
-    ArithType, DType, KQuantScheme, QuantProvenance, Storage as DTypeStorage,
+    ArithType, DType, FloatPackScheme, KQuantScheme, QuantFormat, QuantProvenance,
+    Storage as DTypeStorage,
 };
 use grim_tensor::error::{Error, Result};
 use grim_tensor::{BackendDevice, BackendStorage, ScythePlacement, Shape};
@@ -1388,7 +1389,7 @@ impl Default for VulkanDevice {
 }
 
 /// Extract raw bytes from a VulkanStorage buffer via vkMapMemory.
-fn extract_raw_bytes(storage: &dyn BackendStorage) -> Result<Vec<u8>> {
+pub fn extract_raw_bytes(storage: &dyn BackendStorage) -> Result<Vec<u8>> {
     if let Some(b_vk) = storage.as_any().downcast_ref::<VulkanStorage>() {
         let mut mapped: *mut c_void = std::ptr::null_mut();
         let res = unsafe {
@@ -1420,6 +1421,74 @@ fn extract_raw_bytes(storage: &dyn BackendStorage) -> Result<Vec<u8>> {
              cannot extract raw bytes safely"
                 .into(),
         ))
+    }
+}
+
+impl VulkanDevice {
+    /// On-device quantization for Vulkan.
+    pub fn quantize_on_device(
+        &self,
+        x: &dyn BackendStorage,
+        format: QuantFormat,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan quantize: input x is not VulkanStorage".into())
+        })?;
+        let total = x.shape().elem_count();
+        let (kernel, out_bytes, output_dtype) = match format {
+            QuantFormat::Q8_0 => {
+                let n_blocks = (total + 31) / 32;
+                (
+                    VulkanKernel::QuantQ80,
+                    n_blocks * 34,
+                    DType {
+                        arith: ArithType::F32,
+                        storage: DTypeStorage::KQuant(KQuantScheme::Q80),
+                    },
+                )
+            }
+            QuantFormat::Fp8 => (
+                VulkanKernel::QuantFp8,
+                4 + total,
+                DType {
+                    arith: ArithType::F32,
+                    storage: DTypeStorage::FloatPack(FloatPackScheme::Fp8),
+                },
+            ),
+            other => {
+                return Err(Error::Backend(format!(
+                    "Vulkan quantize_on_device: unsupported format {:?}",
+                    other
+                )));
+            }
+        };
+
+        let out_shape = Shape::from_slice(&[out_bytes]);
+        let (ctx_device, ctx_physical_device) = {
+            let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+            (ctx.device, ctx.physical_device)
+        };
+
+        let out_storage =
+            VulkanStorage::alloc_gpu(&out_shape, output_dtype, ctx_device, ctx_physical_device)?;
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        let buffers = [x_s.buffer, out_storage.buffer];
+        let push = push_params(total as u32, 0, 0, 0, 0, 0.0);
+        let grid_x = match kernel {
+            VulkanKernel::QuantQ80 => ((total + 31) / 32) as u32,
+            VulkanKernel::QuantFp8 => ((total + 255) / 256) as u32,
+            _ => unreachable!(),
+        };
+
+        run_compute_shader_kernel(ctx, kernel, &buffers, grid_x, 1, 1, Some(&push))?;
+        Ok((Box::new(out_storage), Box::new(VulkanHandle)))
     }
 }
 
@@ -2614,6 +2683,7 @@ impl BackendDevice for VulkanDevice {
         a: &dyn BackendStorage,
         b_packed: &dyn BackendStorage,
         b_scales: &[f32],
+        _format: grim_tensor::QuantFormat,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let a_dims = a.shape().dims();
@@ -2813,6 +2883,70 @@ impl BackendDevice for VulkanDevice {
 
         let out_storage = self.from_cpu(&c_vec, out_shape, a.dtype())?;
         Ok((out_storage, Box::new(VulkanHandle)))
+    }
+
+    fn quantize(
+        &self,
+        x: &dyn BackendStorage,
+        format: QuantFormat,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let (out, _handle) = self.quantize_on_device(x, format)?;
+        Ok(out)
+    }
+
+    fn fused_quant_gemm(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        format: QuantFormat,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let a_dims = a.shape().dims();
+        let out_dims = out_shape.dims();
+        let m = a_dims[0];
+        let k = a_dims[1];
+        let n = out_dims[1];
+
+        let a_s = a.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan fused_quant_gemm: a is not VulkanStorage".into())
+        })?;
+        let b_s = b.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan fused_quant_gemm: b is not VulkanStorage".into())
+        })?;
+
+        let kernel = match format {
+            QuantFormat::Q8_0 => VulkanKernel::FusedQuantGemmQ80,
+            QuantFormat::Fp8 => VulkanKernel::FusedQuantGemmFp8,
+            other => {
+                return Err(Error::Backend(format!(
+                    "Vulkan fused_quant_gemm: unsupported format {:?}",
+                    other
+                )));
+            }
+        };
+
+        let (ctx_device, ctx_physical_device) = {
+            let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+            (ctx.device, ctx.physical_device)
+        };
+
+        let out_storage =
+            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx_device, ctx_physical_device)?;
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
+        let grid_x = ((n + 15) / 16) as u32;
+        let grid_y = ((m + 15) / 16) as u32;
+        let push = push_params(0, 0, k as u32, n as u32, m as u32, 0.0);
+
+        run_compute_shader_kernel(ctx, kernel, &buffers, grid_x, grid_y, 1, Some(&push))?;
+        Ok((Box::new(out_storage), Box::new(VulkanHandle)))
     }
 
     fn quantized_matmul_backward_dx(
@@ -3350,6 +3484,10 @@ pub enum VulkanKernel {
     RwkvChannelMix,
     AllReduce,
     CommFuseReduce,
+    QuantQ80,
+    QuantFp8,
+    FusedQuantGemmQ80,
+    FusedQuantGemmFp8,
 }
 
 pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
@@ -3396,6 +3534,10 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::RwkvChannelMix => SPIRV_RWKV_CHANNEL_MIX,
         VulkanKernel::AllReduce => SPIRV_ALL_REDUCE,
         VulkanKernel::CommFuseReduce => SPIRV_COMM_FUSE_REDUCE,
+        VulkanKernel::QuantQ80 => SPIRV_QUANT_Q8_0,
+        VulkanKernel::QuantFp8 => SPIRV_QUANT_FP8,
+        VulkanKernel::FusedQuantGemmQ80 => SPIRV_FUSED_QUANT_GEMM_Q8_0,
+        VulkanKernel::FusedQuantGemmFp8 => SPIRV_FUSED_QUANT_GEMM_FP8,
     }
 }
 
@@ -3430,6 +3572,8 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::FusedDequantGemmIQ2S
         | VulkanKernel::FusedDequantGemmFp8E4M3
         | VulkanKernel::FusedDequantGemmMxFp4
+        | VulkanKernel::FusedQuantGemmQ80
+        | VulkanKernel::FusedQuantGemmFp8
         | VulkanKernel::SiluMulBackward => 3,
         VulkanKernel::QkvAttention | VulkanKernel::FlashAttention | VulkanKernel::RwkvTimeMix => 4,
         VulkanKernel::QkvAttentionPaged
@@ -3445,6 +3589,8 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::Softmax
         | VulkanKernel::AllReduce
         | VulkanKernel::RwkvChannelMix
+        | VulkanKernel::QuantQ80
+        | VulkanKernel::QuantFp8
         | VulkanKernel::CommFuseReduce => 2,
     }
 }

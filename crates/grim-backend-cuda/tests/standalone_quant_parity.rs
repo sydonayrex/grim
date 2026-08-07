@@ -1,0 +1,263 @@
+//! GPU-vs-CPU validation for the device-side CUDA quantize kernels.
+//!
+//! Validates that `CudaDevice::quantize_on_device` produces packed bytes that
+//! are bit-identical (Q8_0) or numerically equivalent (FP8) to the CPU
+//! reference in `grim_quant::quant_*`. Also validates the fused quantize+GEMM
+//! kernels against a manual quantize-then-matmul reference.
+//!
+//! Run with:
+//!   cargo test -p grim-backend-cuda --test standalone_quant_parity -- --nocapture
+
+use grim_backend_cuda::{CudaDevice, CudaStorage};
+use grim_tensor::dtype::{DType, KQuantScheme, QuantFormat, Storage};
+use grim_tensor::{BackendDevice, Shape};
+
+/// Skip the test gracefully if no CUDA device is available.
+fn device_or_skip() -> Option<CudaDevice> {
+    CudaDevice::new(0).ok()
+}
+
+#[test]
+fn test_quantize_q8_0_matches_cpu() {
+    let dev = match device_or_skip() {
+        Some(d) => d,
+        None => {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+    };
+
+    // 64 weights = 2 Q8_0 blocks.
+    let n = 64;
+    let input: Vec<f32> = (0..n)
+        .map(|i| ((i as f32 - 32.0) / 8.0).sin() * 3.0)
+        .collect();
+    let shape = Shape::new(vec![n]);
+    let x = dev.from_cpu(&input, &shape, DType::F32).unwrap();
+
+    // Device quantize.
+    let q = dev.quantize(x.as_ref(), QuantFormat::Q8_0).unwrap();
+    assert_eq!(q.dtype().storage, Storage::KQuant(KQuantScheme::Q80));
+
+    let q_cuda = q.as_any().downcast_ref::<CudaStorage>().unwrap();
+    let device_bytes = q_cuda.copy_to_host_raw_bytes().unwrap();
+
+    // CPU reference.
+    let cpu_bytes = grim_quant::quant_q80(&input).unwrap();
+
+    assert_eq!(
+        device_bytes.len(),
+        cpu_bytes.len(),
+        "byte length mismatch: device={} cpu={}",
+        device_bytes.len(),
+        cpu_bytes.len()
+    );
+    assert_eq!(
+        device_bytes, cpu_bytes,
+        "Q8_0 device quant bytes must be bit-identical to CPU reference"
+    );
+}
+
+#[test]
+fn test_quantize_fp8_matches_cpu() {
+    let dev = match device_or_skip() {
+        Some(d) => d,
+        None => {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+    };
+
+    let n = 64;
+    let input: Vec<f32> = (0..n)
+        .map(|i| ((i as f32 - 32.0) / 10.0).cos() * 2.0)
+        .collect();
+    let shape = Shape::new(vec![n]);
+    let x = dev.from_cpu(&input, &shape, DType::F32).unwrap();
+
+    // Device quantize.
+    let q = dev.quantize(x.as_ref(), QuantFormat::Fp8).unwrap();
+    assert!(matches!(
+        q.dtype().storage,
+        Storage::FloatPack(grim_tensor::FloatPackScheme::Fp8)
+    ));
+
+    let q_cuda = q.as_any().downcast_ref::<CudaStorage>().unwrap();
+    let device_bytes = q_cuda.copy_to_host_raw_bytes().unwrap();
+
+    // CPU reference.
+    let cpu_bytes = grim_quant::quant_fp8(&input).unwrap();
+
+    assert_eq!(device_bytes.len(), cpu_bytes.len());
+
+    // FP8 codes must be bit-identical (both use the same f32_to_fp8_e4m3 logic).
+    assert_eq!(
+        device_bytes, cpu_bytes,
+        "FP8 device quant bytes must be bit-identical to CPU reference"
+    );
+}
+
+#[test]
+fn test_quantize_q8_0_roundtrip() {
+    let dev = match device_or_skip() {
+        Some(d) => d,
+        None => {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+    };
+
+    let n = 128;
+    let input: Vec<f32> = (0..n)
+        .map(|i| {
+            let x = (i as f32 + 1.0) * 0.1;
+            if i % 2 == 0 { x } else { -x }
+        })
+        .collect();
+    let shape = Shape::new(vec![n]);
+    let x = dev.from_cpu(&input, &shape, DType::F32).unwrap();
+
+    let q = dev.quantize(x.as_ref(), QuantFormat::Q8_0).unwrap();
+    let q_cuda = q.as_any().downcast_ref::<CudaStorage>().unwrap();
+    let device_bytes = q_cuda.copy_to_host_raw_bytes().unwrap();
+
+    // Dequantize via CPU reference and compare.
+    let deq = grim_quant::dequant_q80(&device_bytes, n).unwrap();
+
+    let max_err = input
+        .iter()
+        .zip(deq.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    // Q8_0 max quantization error is scale/2 ≈ max_abs / (2 * 127).
+    let max_abs = input.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let tolerance = (max_abs / 127.0).max(1e-6);
+    assert!(
+        max_err <= tolerance,
+        "Q8_0 roundtrip max error {max_err} exceeds tolerance {tolerance}"
+    );
+}
+
+#[test]
+fn test_fused_quant_gemm_q8_0() {
+    let dev = match device_or_skip() {
+        Some(d) => d,
+        None => {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+    };
+
+    let m = 4;
+    let k = 32; // one Q8_0 block
+    let n = 8;
+
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.1 - 2.0).sin()).collect();
+    let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.05).cos()).collect();
+
+    let a_shape = Shape::new(vec![m, k]);
+    let b_shape = Shape::new(vec![k, n]);
+    let out_shape = Shape::new(vec![m, n]);
+
+    let a = dev.from_cpu(&a_data, &a_shape, DType::F32).unwrap();
+    let b = dev.from_cpu(&b_data, &b_shape, DType::F32).unwrap();
+
+    let (out, handle) = dev
+        .fused_quant_gemm(a.as_ref(), b.as_ref(), QuantFormat::Q8_0, &out_shape)
+        .unwrap();
+    handle.synchronize().unwrap();
+
+    let result = out.to_cpu_vec_f32().unwrap();
+
+    // Manual reference: quantize A per-row-block, then matmul.
+    let mut expected = vec![0.0f32; m * n];
+    for row in 0..m {
+        let a_row = &a_data[row * k..(row + 1) * k];
+        // Inline Q8_0 quantization of the 32-element row.
+        let amax = a_row.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let scale = if amax == 0.0 { 1.0 } else { amax / 127.0 };
+        let quantized: Vec<f32> = a_row
+            .iter()
+            .map(|v| {
+                let q = (v / scale).round().clamp(-128.0, 127.0);
+                q * scale
+            })
+            .collect();
+        for col in 0..n {
+            let mut sum = 0.0f32;
+            for i in 0..k {
+                sum += quantized[i] * b_data[i * n + col];
+            }
+            expected[row * n + col] = sum;
+        }
+    }
+
+    let max_err = result
+        .iter()
+        .zip(expected.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    assert!(
+        max_err < 1e-3,
+        "fused_quant_gemm_q8_0 max error {max_err} exceeds 1e-3\nresult: {result:?}\nexpected: {expected:?}"
+    );
+}
+
+#[test]
+fn test_fused_quant_gemm_fp8() {
+    let dev = match device_or_skip() {
+        Some(d) => d,
+        None => {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+    };
+
+    let m = 2;
+    let k = 16;
+    let n = 4;
+
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.3 - 1.0).tan()).collect();
+    let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.2).sin()).collect();
+
+    let a_shape = Shape::new(vec![m, k]);
+    let b_shape = Shape::new(vec![k, n]);
+    let out_shape = Shape::new(vec![m, n]);
+
+    let a = dev.from_cpu(&a_data, &a_shape, DType::F32).unwrap();
+    let b = dev.from_cpu(&b_data, &b_shape, DType::F32).unwrap();
+
+    let (out, handle) = dev
+        .fused_quant_gemm(a.as_ref(), b.as_ref(), QuantFormat::Fp8, &out_shape)
+        .unwrap();
+    handle.synchronize().unwrap();
+
+    let result = out.to_cpu_vec_f32().unwrap();
+
+    // Manual reference: FP8 round-trip on A, then matmul.
+    let mut expected = vec![0.0f32; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut sum = 0.0f32;
+            for i in 0..k {
+                let fp8_code = grim_quant::f32_to_fp8_e4m3(a_data[row * k + i]);
+                let a_deq = grim_quant::fp8_e4m3_to_f32(fp8_code);
+                sum += a_deq * b_data[i * n + col];
+            }
+            expected[row * n + col] = sum;
+        }
+    }
+
+    let max_err = result
+        .iter()
+        .zip(expected.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    assert!(
+        max_err < 0.5,
+        "fused_quant_gemm_fp8 max error {max_err} exceeds 0.5"
+    );
+}

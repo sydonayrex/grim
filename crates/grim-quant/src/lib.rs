@@ -7,30 +7,15 @@ pub mod spqr;
 
 pub use spqr::{SpqrSalientResidual, spqr_identify_salient};
 
+/// Re-exported from `grim_tensor` so the `BackendDevice::quantize` trait method
+/// (which lives in `grim-tensor`) and the CPU `quant_*` reference functions
+/// (which live here) share one canonical enum without a circular dependency.
+pub use grim_tensor::dtype::QuantFormat;
+
 pub const BLOCK_SIZE_Q8: usize = 32;
 pub const BLOCK_SIZE_Q4_K: usize = 32;
 const BLOCK_SIZE_QK: usize = 32;
 const GPTQ_PROXY_COLUMN_GROUP: usize = 4;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuantFormat {
-    Q8_0,
-    Q4K,
-    Q5K,
-    Q6K,
-    Fp4,
-    Nf4,
-    Fp8,
-    Fp4Block16,
-    Fp8Block16,
-    Iq4Nl,
-    Iq4Xs,
-    Iq3Xxs,
-    Iq3S,
-    Iq2Xxs,
-    Iq2Xs,
-    Iq2S,
-}
 
 #[derive(Debug, Clone)]
 pub struct TensorRewritePlan {

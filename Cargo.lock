@@ -2090,8 +2090,10 @@ name = "grim-backend-cuda"
 version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
+ "grim-format",
  "grim-quant",
  "grim-tensor",
+ "half",
  "seahash",
  "thiserror 1.0.69",
  "tracing",
@@ -2102,7 +2104,10 @@ name = "grim-backend-metal"
 version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
+ "grim-format",
+ "grim-quant",
  "grim-tensor",
+ "half",
  "objc2 0.5.2",
  "objc2-metal 0.2.2",
  "tempfile",

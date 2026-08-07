@@ -66,7 +66,7 @@ fn test_jay_mxfp4_gpu_gemm_golden_mutation_resistant() -> TestResult {
         let b_dev = BackendDevice::from_cpu_bytes(&dev, &b_codes, &b_shape, mxfp4_dtype)?;
 
         let (out, handle) =
-            dev.quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &[], &out_shape)?;
+            dev.quantized_matmul(a_dev.as_ref(), b_dev.as_ref(), &[], grim_tensor::QuantFormat::MxFp4, &out_shape)?;
         handle.synchronize()?;
         let actual_c = out.to_cpu_vec_f32()?;
 

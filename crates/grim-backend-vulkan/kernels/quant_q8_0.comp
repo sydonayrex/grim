@@ -1,0 +1,94 @@
+#version 450
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint size;
+    uint dim;
+    uint k;
+    uint n;
+    uint m;
+    float eps;
+} params;
+
+layout(std430, binding = 0) readonly buffer BufX { float X[]; };
+layout(std430, binding = 1) writeonly buffer BufOut { uint Out[]; };
+
+shared float s_abs[32];
+
+// Pack float16 bits into lower 16 bits
+uint f32_to_f16_bits(float val) {
+    if (val == 0.0) return 0u;
+    uint f32_bits = floatBitsToUint(val);
+    uint sign = (f32_bits >> 31u) & 1u;
+    int exp = int((f32_bits >> 23u) & 0xFFu) - 127;
+    uint mant = f32_bits & 0x7FFFFFu;
+
+    if (exp > 15) {
+        return (sign << 15u) | (31u << 10u);
+    } else if (exp < -14) {
+        return (sign << 15u);
+    } else {
+        uint new_exp = uint(exp + 15);
+        uint new_mant = mant >> 13u;
+        return (sign << 15u) | (new_exp << 10u) | new_mant;
+    }
+}
+
+void set_byte(uint byte_idx, uint val) {
+    uint word_idx = byte_idx / 4u;
+    uint shift = (byte_idx % 4u) * 8u;
+    uint mask = ~(0xFFu << shift);
+    uint new_val = (val & 0xFFu) << shift;
+    atomicAnd(Out[word_idx], mask);
+    atomicOr(Out[word_idx], new_val);
+}
+
+void main() {
+    uint block_idx = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint block_start_x = block_idx * 32u;
+    float x_val = 0.0;
+    if (block_start_x + tid < params.size) {
+        x_val = X[block_start_x + tid];
+    }
+    s_abs[tid] = abs(x_val);
+
+    barrier();
+
+    // Workgroup reduction for max absolute value
+    for (uint stride = 16u; stride > 0u; stride /= 2u) {
+        if (tid < stride) {
+            s_abs[tid] = max(s_abs[tid], s_abs[tid + stride]);
+        }
+        barrier();
+    }
+
+    float amax = s_abs[0];
+    float d = amax / 127.0;
+    float id = (d > 0.0) ? (1.0 / d) : 0.0;
+
+    uint out_block_start_bytes = block_idx * 34u;
+
+    if (tid == 0u) {
+        uint scale_f16 = f32_to_f16_bits(d);
+        // Zero the entire 34-byte block via atomic byte ops. Since block start
+        // offsets (block_idx * 34) are not always 4-byte aligned, we must use
+        // atomic byte writes to avoid corrupting adjacent blocks.
+        for (uint i = 0u; i < 34u; ++i) {
+            set_byte(out_block_start_bytes + i, 0u);
+        }
+        set_byte(out_block_start_bytes, scale_f16 & 0xFFu);
+        set_byte(out_block_start_bytes + 1u, (scale_f16 >> 8u) & 0xFFu);
+    }
+
+    barrier();
+
+    if (block_start_x + tid < params.size) {
+        int q = int(round(x_val * id));
+        q = clamp(q, -128, 127);
+        uint byte_val = uint(q) & 0xFFu;
+        set_byte(out_block_start_bytes + 2u + tid, byte_val);
+    }
+}

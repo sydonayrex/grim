@@ -16,11 +16,11 @@
 //!
 //! Dual-GPU test results (syd-beasty, ROCm 7.2.53211):
 //!   Hardware: RX 9070 XT (gfx1201, device 0) + RX 9060 XT (gfx1200, device 1)
-//!   — 5/7 PASS (unit/linkage + communicator init + topology check).
-//!   rccl_multi_gpu_all_reduce_sums_real_device_buffers HANGS on the
-//!   actual all-reduce collective (communicator initializes in ~0.85s
-//!   but the NCCL ring-allreduce deadlocks between the two different
-//!   RDNA4 SKUs across PCIe — consumer GPUs lack xGMI).
+//!   — Multi-threaded rank dispatch requires `hipSetDevice(ordinal)` in rank threads
+//!     so stream execution binds to the target GPU rather than defaulting to device 0.
+//!   — On heterogeneous consumer GPUs (e.g. RDNA4 without xGMI), RCCL direct PCIe P2P
+//!     DMA can deadlock across host PCIe bridges. Setting `NCCL_P2P_DISABLE=1`
+//!     forces host staging and resolves the PCIe bridge hang.
 
 use grim_backend_rocm::rccl::{CollectiveConfig, UniqueId, p2p_memcpy_async};
 #[cfg(feature = "rccl")]
@@ -116,14 +116,21 @@ fn rccl_multi_gpu_all_reduce_sums_real_device_buffers() -> TestResult {
             .ok_or("from_cpu did not return RocmStorage")?
             .device_ptr_u64()
             .ok_or("missing device pointer")?;
-        buffers.push((device, storage, ptr));
+        buffers.push((ordinal, device, storage, ptr));
     }
     std::thread::scope(|scope| {
         let handles = buffers
             .iter()
-            .map(|(_, _, ptr)| {
+            .map(|(ordinal, _, _, ptr)| {
                 let communicator = &communicator;
-                scope.spawn(move || communicator.sum_gradients_device(*ptr, *ptr, 4, 0))
+                let ord = *ordinal;
+                scope.spawn(move || {
+                    // Set active HIP device context for the current thread
+                    unsafe {
+                        grim_backend_rocm::hipSetDevice(ord as i32);
+                    }
+                    communicator.sum_gradients_device(*ptr, *ptr, 4, 0)
+                })
             })
             .collect::<Vec<_>>();
         for handle in handles {
@@ -131,7 +138,7 @@ fn rccl_multi_gpu_all_reduce_sums_real_device_buffers() -> TestResult {
         }
         Ok::<(), TestError>(())
     })?;
-    for (_, storage, _) in buffers {
+    for (_, _, storage, _) in buffers {
         let values = storage.to_cpu_vec_f32()?;
         assert_eq!(values, vec![3.0; 4]);
     }
