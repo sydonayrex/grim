@@ -16,7 +16,8 @@ use grim_models_mamba::{
 };
 use grim_models_transformer::{
     BloomConfig, DeepSeek, DeepSeekConfig, FalconConfig, Gemma, GemmaConfig, Gpt2, Gpt2Config,
-    Lfm2, Lfm2Config, Llama, LlamaConfig, MoeConfig, PhiConfig, QwenConfig, T5, T5Config,
+    Lfm2, Lfm2Config, Llama, LlamaConfig, MiniCpmConfig, MiniCpmModel, MoeConfig, PhiConfig,
+    QwenConfig, T5, T5Config,
 };
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::{TensorParallelConfig, WeightSource};
@@ -1061,7 +1062,7 @@ fn load_model_with_providers(
     provider: &GgufProvider,
     weight_provider: &dyn grim_tensor::TensorProvider,
     device: Device,
-    _path: &str,
+    path: &str,
 ) -> Result<Box<dyn CausalLm>> {
     eprintln!(
         "[alias] load_model_with_providers called, arch={:?}",
@@ -1074,8 +1075,19 @@ fn load_model_with_providers(
         ))
     })?;
 
-    let model_arch = ModelArchitecture::from_str(arch_str);
     let lookup = GgufMetadataLookup(provider);
+    let mut model_arch = ModelArchitecture::from_str(arch_str);
+    if model_arch == ModelArchitecture::Llama {
+        let name_lower = lookup
+            .get_str("general.name")
+            .unwrap_or_default()
+            .to_lowercase();
+        let path_lower = path.to_lowercase();
+        if name_lower.contains("minicpm") || path_lower.contains("minicpm") {
+            eprintln!("[grim] Detected MiniCPM model variant from metadata/path, promoting architecture to MiniCpm");
+            model_arch = ModelArchitecture::MiniCpm;
+        }
+    }
     let hparams = HyperparameterExtractor::extract(model_arch, &lookup);
 
     eprintln!(
@@ -1180,6 +1192,35 @@ fn load_model_with_providers(
                 max_seq_len: hparams.max_seq_len,
             };
             let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::MiniCpm | ModelArchitecture::MiniCpm3 => {
+            let scale_emb = lookup
+                .get_f32("minicpm.scale_emb")
+                .or_else(|| lookup.get_f32("scale_emb"));
+            let scale_depth = lookup
+                .get_f32("minicpm.scale_depth")
+                .or_else(|| lookup.get_f32("scale_depth"));
+            let dim_model_base = lookup
+                .get_f32("minicpm.dim_model_base")
+                .or_else(|| lookup.get_f32("dim_model_base"));
+
+            let minicpm_cfg = MiniCpmConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                scale_emb,
+                scale_depth,
+                dim_model_base,
+            };
+            eprintln!("[grim] Loading MiniCPM model with config: {:?}", minicpm_cfg);
+            let m = MiniCpmModel::load(&ws, minicpm_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen
@@ -1657,7 +1698,7 @@ fn load_model_with_providers(
         _ => {
             // Check for a sibling config.json alongside the GGUF file to
             // enrich ArchCompatSpec resolution for known HF architectures.
-            let hf_config_json = std::path::Path::new(_path)
+            let hf_config_json = std::path::Path::new(path)
                 .parent()
                 .and_then(|dir| dir.join("config.json").to_str().map(|s| s.to_string()));
             let config_raw = hf_config_json.as_deref();
