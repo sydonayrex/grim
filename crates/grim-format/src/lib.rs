@@ -30,7 +30,7 @@ pub use spec::{BackupLayer, GrimTensorExt, LayoutHintTag, PayloadCompression};
 pub use tokenizer::GgufTokenizer;
 pub use tokenizer::{
     ChatMessage, FunctionDef, FunctionName, ToolCallMsg, ToolChoice, ToolDef, render_chat_template,
-    render_messages_or_last, render_messages_or_last_with_tools,
+    render_messages_or_last, render_messages_or_last_with_tools, sanitize_jinja_template,
 };
 pub use tprov::GgufProvider;
 pub use tprov::GrimProvider;

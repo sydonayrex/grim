@@ -566,11 +566,11 @@ impl GgufTokenizer {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tool_calls: Option<Vec<ToolCallMsg>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tool_call_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub name: Option<String>,
 }
 
@@ -708,7 +708,7 @@ pub struct FunctionName {
 /// fallback to the last message's content. This function removes the unsupported
 /// outer tags while preserving their inner content so the remaining template is
 /// valid minijinja.
-fn sanitize_jinja_template(template: &str) -> String {
+pub fn sanitize_jinja_template(template: &str) -> String {
     // Match `{% tag … %}` and `{% endtag %}`. We strip tags whose outer name
     // minijinja doesn't recognise, keeping the text between opening and closing.
     // The recognised set is deliberately conservative — minijinja's built-in tags.
@@ -767,8 +767,13 @@ fn sanitize_jinja_template(template: &str) -> String {
                 }
             }
             // Extract the directive name (first whitespace-delimited token
-            // after stripping whitespace).
+            // after stripping whitespace and Jinja whitespace-control markers
+            // (`-`). Without this, `{%- set ... -%}` would extract `-` as the
+            // tag name, which is not in the recognised list, causing all
+            // whitespace-controlled tags to be silently stripped.
             let name = inner
+                .trim()
+                .trim_start_matches('-')
                 .trim()
                 .split_whitespace()
                 .next()
@@ -782,6 +787,50 @@ fn sanitize_jinja_template(template: &str) -> String {
         }
         result.push(ch);
     }
+
+    // ---- minijinja compatibility transforms ----
+    //
+    // Many HuggingFace Jinja templates use Python-dict methods that minijinja
+    // does not implement. These cause runtime render errors (`unknown method:
+    // map has no method named get/items`), which trigger a silent fallback to
+    // the last message. We patch the two most common patterns:
+    //
+    // 1. `.get('key')` / `.get("key")` → `["key"]`
+    //    minijinja returns Undefined for missing bracket keys (which is
+    //    falsy in `{% if %}`), matching the Python `.get()` semantics for
+    //    absent keys (which returns None, also falsy).
+    //
+    // 2. `.items()` → `| items`
+    //    minijinja provides an `items` filter (pipe form) but not the `.items()`
+    //    method. This is used by tool-call templates: `{% for k, v in d.items() %}`.
+
+    // Transform `.get('key')` and `.get("key")` → `["key"]`.
+    let mut result = result;
+    while let Some(pos) = result.find(".get('") {
+        if let Some(end) = result[pos..].find("')") {
+            let key = result[pos + 6..pos + end].to_string();
+            result.replace_range(pos..pos + end + 2, &format!("[\"{key}\"]"));
+        } else {
+            break;
+        }
+    }
+    while let Some(pos) = result.find(".get(\"") {
+        if let Some(end) = result[pos..].find("\")") {
+            let key = result[pos + 6..pos + end].to_string();
+            result.replace_range(pos..pos + end + 2, &format!("[\"{key}\"]"));
+        } else {
+            break;
+        }
+    }
+
+    // Transform `.items()` → `| items`.
+    // Only matches the method-call form `.items()`, not the filter `| items`.
+    let result = result.replace(".items()", " | items");
+
+    // In Jinja, `+` fails on string + undefined. `~` is Jinja's string concatenation
+    // operator which automatically coerces undefined variables to empty strings.
+    let result = result.replace(" + ", " ~ ");
+
     result
 }
 
@@ -811,8 +860,15 @@ pub fn render_chat_template(
     tool_choice: Option<&ToolChoice>,
 ) -> Result<String> {
     let mut env = minijinja::Environment::new();
-    // Most GGUF chat templates are self-contained; disable autoescaping.
+    // Most GGUF chat templates are self-contained; disable autoescaping and treat undefined variables gracefully.
     env.set_auto_escape_callback(|_| minijinja::AutoEscape::None);
+    env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
+    env.add_function("raise_exception", |_msg: Option<&str>| -> std::result::Result<String, minijinja::Error> {
+        Ok(String::new())
+    });
+    env.add_filter("tojson", |v: minijinja::Value| -> std::result::Result<String, minijinja::Error> {
+        serde_json::to_string(&v).map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))
+    });
     // P1-3.3: Some GGUF-embedded Jinja templates use block directives that
     // minijinja does not support (e.g. `{% generation %}…{% endgeneration %}`).
     // Strip those unsupported tags (keeping their inner content) so the
@@ -827,6 +883,7 @@ pub fn render_chat_template(
     // only emitted when provided. A template that never references `tools`
     // simply ignores them; a template that does reference them expects the
     // caller to have supplied real definitions.
+    let empty_str = "";
     let ctx = minijinja::context! {
         messages => messages,
         add_generation_prompt => add_generation_prompt,
@@ -834,6 +891,10 @@ pub fn render_chat_template(
         eos_token => eos_token,
         tools => tools,
         tool_choice => tool_choice,
+        system_prompt => empty_str,
+        system_message => empty_str,
+        system => empty_str,
+        extra_context => empty_str,
     };
     let rendered = tmpl
         .render(ctx)
@@ -1153,5 +1214,57 @@ mod chat_template_tests {
         let rendered = render_chat_template(&tpl, &msgs, false, "", "", None, None)
             .expect("render must succeed");
         assert!(rendered.contains("tool: 72°F"), "tool message not rendered");
+    }
+
+    /// LFM2 / HuggingFace templates use Python-dict methods (`.get()`,
+    /// `.items()`), whitespace-controlled tags (`{%- ... -%}`), and the `+`
+    /// operator for string concatenation — all of which need sanitizer
+    /// transforms to work under minijinja. This test exercises a template that
+    /// combines all three patterns (mirrors the real LFM2 chat template).
+    #[test]
+    fn renders_lfm2_style_template_with_compat_transforms() {
+        let tpl = r#"{{- bos_token -}}
+{%- set ns = namespace(s="") -%}
+{%- if messages[0]["role"] == "system" -%}
+    {%- set ns.s = messages[0]["content"] -%}
+{%- endif -%}
+{%- if ns.s -%}
+    {{- "<|im_start|>system\n" + ns.s + "<|im_end|>\n" -}}
+{%- endif -%}
+{%- for m in messages -%}
+    {{- "<|im_start|>" + m["role"] + "\n" -}}
+    {%- if m.get('tool_calls') -%}
+        {{- m["tool_calls"] | tojson -}}
+    {%- endif -%}
+    {{- m["content"] + "<|im_end|>\n" -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- "<|im_start|>assistant\n" -}}
+{%- endif -%}"#
+            .to_string();
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "Hello!".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let rendered = render_chat_template(&tpl, &msgs, true, "<bos>", "<eos>", None, None)
+            .expect("LFM2-style template must render without falling back");
+        assert!(rendered.contains("<bos>"), "missing bos_token");
+        assert!(
+            rendered.contains("<|im_start|>user"),
+            "missing user role marker"
+        );
+        assert!(rendered.contains("Hello!"), "missing user content");
+        assert!(
+            rendered.contains("<|im_start|>assistant"),
+            "missing generation prompt"
+        );
+        // No system message was provided, so the system block should be absent.
+        assert!(
+            !rendered.contains("<|im_start|>system"),
+            "system block should not appear without a system message"
+        );
     }
 }

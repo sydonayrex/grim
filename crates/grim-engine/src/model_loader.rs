@@ -847,6 +847,17 @@ fn load_model_from_config(
                     is_recr.push(n == 0);
                 }
             }
+            if is_recr.is_empty() || is_recr.iter().all(|&r| !r) {
+                is_recr.clear();
+                for i in 0..num_layers {
+                    let blk_ws = ws.pp("blk").pp(&i.to_string());
+                    let is_conv = blk_ws.get_unconstrained("conv.weight").is_ok()
+                        || blk_ws.get_unconstrained("shortconv.weight").is_ok()
+                        || blk_ws.get_unconstrained("conv_1d.weight").is_ok()
+                        || blk_ws.get_unconstrained("attn_q.weight").is_err();
+                    is_recr.push(is_conv);
+                }
+            }
             is_recr.resize(num_layers, false);
 
             eprintln!("[grim] LFM2 layer-type map (T=shortconv): {:?}", is_recr);
