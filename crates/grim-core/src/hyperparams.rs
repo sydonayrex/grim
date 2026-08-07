@@ -75,36 +75,47 @@ impl HyperparameterExtractor {
         let vocab_size = metadata
             .get_u32("tokenizer.ggml.vocab_size")
             .or_else(|| metadata.get_u32(&format!("{arch_name}.vocab_size")))
+            .or_else(|| metadata.get_u32("llama.vocab_size"))
             .map(|v| v as usize)
             .unwrap_or(32000);
 
         let hidden_size = metadata
             .get_u32(&format!("{arch_name}.embedding_length"))
             .or_else(|| metadata.get_u32(&format!("{arch_name}.hidden_size")))
+            .or_else(|| metadata.get_u32("llama.embedding_length"))
+            .or_else(|| metadata.get_u32("llama.hidden_size"))
             .map(|v| v as usize)
             .unwrap_or(4096);
 
         let num_layers = metadata
             .get_u32(&format!("{arch_name}.block_count"))
             .or_else(|| metadata.get_u32(&format!("{arch_name}.num_hidden_layers")))
+            .or_else(|| metadata.get_u32("llama.block_count"))
+            .or_else(|| metadata.get_u32("llama.num_hidden_layers"))
             .map(|v| v as usize)
             .unwrap_or(32);
 
         let num_heads = metadata
             .get_u32(&format!("{arch_name}.attention.head_count"))
             .or_else(|| metadata.get_u32(&format!("{arch_name}.num_attention_heads")))
+            .or_else(|| metadata.get_u32("llama.attention.head_count"))
+            .or_else(|| metadata.get_u32("llama.num_attention_heads"))
             .map(|v| v as usize)
             .unwrap_or(32);
 
         let num_kv_heads = metadata
             .get_u32(&format!("{arch_name}.attention.head_count_kv"))
             .or_else(|| metadata.get_u32(&format!("{arch_name}.num_key_value_heads")))
+            .or_else(|| metadata.get_u32("llama.attention.head_count_kv"))
+            .or_else(|| metadata.get_u32("llama.num_key_value_heads"))
             .map(|v| v as usize)
             .unwrap_or(num_heads);
 
         let head_dim = metadata
             .get_u32(&format!("{arch_name}.attention.key_length"))
             .or_else(|| metadata.get_u32(&format!("{arch_name}.head_dim")))
+            .or_else(|| metadata.get_u32("llama.attention.key_length"))
+            .or_else(|| metadata.get_u32("llama.head_dim"))
             .map(|v| v as usize)
             .unwrap_or_else(|| {
                 if num_heads > 0 {
@@ -117,6 +128,8 @@ impl HyperparameterExtractor {
         let intermediate_size = metadata
             .get_u32(&format!("{arch_name}.feed_forward_length"))
             .or_else(|| metadata.get_u32(&format!("{arch_name}.intermediate_size")))
+            .or_else(|| metadata.get_u32("llama.feed_forward_length"))
+            .or_else(|| metadata.get_u32("llama.intermediate_size"))
             .map(|v| v as usize)
             .unwrap_or(hidden_size * 4);
 
@@ -124,6 +137,9 @@ impl HyperparameterExtractor {
             .get_f32(&format!("{arch_name}.attention.layer_norm_rms_eps"))
             .or_else(|| metadata.get_f32(&format!("{arch_name}.attention.layer_norm_epsilon")))
             .or_else(|| metadata.get_f32(&format!("{arch_name}.rms_norm_eps")))
+            .or_else(|| metadata.get_f32("llama.attention.layer_norm_rms_eps"))
+            .or_else(|| metadata.get_f32("llama.attention.layer_norm_epsilon"))
+            .or_else(|| metadata.get_f32("llama.rms_norm_eps"))
             .unwrap_or(1e-5);
 
         let rope_theta = metadata
@@ -131,6 +147,9 @@ impl HyperparameterExtractor {
             .or_else(|| metadata.get_f32(&format!("{arch_name}.rope_freq_base")))
             .or_else(|| metadata.get_f32(&format!("{arch_name}.rope_theta")))
             .or_else(|| metadata.get_f32(&format!("{arch_name}.rope_parameters.rope_theta")))
+            .or_else(|| metadata.get_f32("llama.rope.freq_base"))
+            .or_else(|| metadata.get_f32("llama.rope_freq_base"))
+            .or_else(|| metadata.get_f32("llama.rope_theta"))
             .or_else(|| metadata.get_f32("rope.freq_base"))
             .or_else(|| metadata.get_f32("rope_freq_base"))
             .or_else(|| metadata.get_f32("rope_theta"))
@@ -139,6 +158,8 @@ impl HyperparameterExtractor {
         let max_seq_len = metadata
             .get_u32(&format!("{arch_name}.context_length"))
             .or_else(|| metadata.get_u32(&format!("{arch_name}.max_position_embeddings")))
+            .or_else(|| metadata.get_u32("llama.context_length"))
+            .or_else(|| metadata.get_u32("llama.max_position_embeddings"))
             .map(|v| v as usize)
             .unwrap_or(2048);
 
