@@ -823,6 +823,26 @@ pub fn sanitize_jinja_template(template: &str) -> String {
         }
     }
 
+    // Transform `.startswith('prefix')` and `.startswith("prefix")` → slice comparison
+    while let Some(pos) = result.find(".startswith('") {
+        if let Some(end) = result[pos..].find("')") {
+            let prefix = result[pos + 13..pos + end].to_string();
+            let len = prefix.len();
+            result.replace_range(pos..pos + end + 2, &format!("[0:{len}] == '{prefix}'"));
+        } else {
+            break;
+        }
+    }
+    while let Some(pos) = result.find(".startswith(\"") {
+        if let Some(end) = result[pos..].find("\")") {
+            let prefix = result[pos + 13..pos + end].to_string();
+            let len = prefix.len();
+            result.replace_range(pos..pos + end + 2, &format!("[0:{len}] == \"{prefix}\""));
+        } else {
+            break;
+        }
+    }
+
     // Transform `.items()` → `| items`.
     // Only matches the method-call form `.items()`, not the filter `| items`.
     let result = result.replace(".items()", " | items");

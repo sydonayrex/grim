@@ -10,7 +10,7 @@ use std::io::{Read, Seek};
 
 use grim_tensor::dtype::{DType, KQuantScheme, QuantProvenance, Storage};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
+use grim_tensor::provider::{shard_raw_tensor, RawTensor, TensorMeta, TensorProvider};
 
 use crate::format::{
     GrimFile, GrimTensorEntry, read_normals, read_outliers, read_outliers_with_encoding,
@@ -210,8 +210,12 @@ impl TensorProvider for GgufProvider {
         rank: usize,
         world_size: usize,
     ) -> Result<RawTensor> {
+        if world_size == 1 && rank == 0 {
+            return self.get_packed(name);
+        }
         if dim != 0 {
-            return <Self as TensorProvider>::get_packed_sharded(self, name, dim, rank, world_size);
+            let raw = self.get_packed(name)?;
+            return shard_raw_tensor(raw, dim, rank, world_size);
         }
         let info = self
             .tensors
@@ -219,10 +223,10 @@ impl TensorProvider for GgufProvider {
             .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in GGUF file")))?;
         let dtype = effective_dtype(info, &self.overrides);
 
-        // Only block-quant formats need the zero-copy path; native dtypes are
-        // handled by the default `shard_raw_tensor`.
-        if !matches!(dtype.storage, Storage::Block(..)) {
-            return <Self as TensorProvider>::get_packed_sharded(self, name, dim, rank, world_size);
+        // Native dtypes are handled by `shard_raw_tensor`.
+        if matches!(dtype.storage, Storage::Native) {
+            let raw = self.get_packed(name)?;
+            return shard_raw_tensor(raw, dim, rank, world_size);
         }
 
         let gguf_dtype = info.dtype;
@@ -994,6 +998,17 @@ impl<'a> TensorProvider for RemappingTensorProvider<'a> {
     fn get_packed(&self, name: &str) -> Result<RawTensor> {
         let mapped = (self.remap)(name);
         self.inner.get_packed(&mapped)
+    }
+
+    fn get_packed_sharded(
+        &self,
+        name: &str,
+        dim: usize,
+        rank: usize,
+        world_size: usize,
+    ) -> Result<RawTensor> {
+        let mapped = (self.remap)(name);
+        self.inner.get_packed_sharded(&mapped, dim, rank, world_size)
     }
 
     fn meta(&self, name: &str) -> Result<TensorMeta> {

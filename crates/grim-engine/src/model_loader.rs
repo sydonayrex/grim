@@ -219,10 +219,12 @@ impl<'a> MetadataLookup for GgufMetadataLookup<'a> {
     fn get_f32(&self, key: &str) -> Option<f32> {
         let v = self.0.metadata(key)?;
         if let Some(f) = v.as_f32() {
+            dbg_eprintln!("[meta-get-f32] {key} = {f}");
             return Some(f);
         }
         if let Some(s) = v.as_str() {
             if let Ok(f) = s.parse::<f32>() {
+                dbg_eprintln!("[meta-get-f32] {key} = {f} (str->f32)");
                 return Some(f);
             }
         }
