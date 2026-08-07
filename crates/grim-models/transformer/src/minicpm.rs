@@ -632,12 +632,13 @@ impl CausalLm for MiniCpmModel {
             .map(|_| 0.0f32)
             .collect();
 
+        let emb = self
+            .tok_embeddings
+            .weight
+            .to_vec_f32()?;
+
         for (idx, &id) in ids.iter().enumerate() {
             if (id as usize) < self.cfg.vocab_size {
-                let emb = self
-                    .tok_embeddings
-                    .weight
-                    .to_vec_f32()?;
                 let start = (id as usize) * self.cfg.hidden_size;
                 let end = start + self.cfg.hidden_size;
                 if end <= emb.len() {
