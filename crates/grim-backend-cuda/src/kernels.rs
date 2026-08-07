@@ -261,66 +261,7 @@ extern "C" __global__ void grim_rope(const float* x, const int* pos, float* out,
     out[i1] = v0 * sin_v + v1 * cos_v;
 }
 
-extern "C" __global__ void grim_fused_quant_gemm_q5_k(
-    const float* __restrict__ A,
-    const unsigned char* __restrict__ B_packed,
-    float* __restrict__ C,
-    int M, int N, int K
-) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= M || col >= N) return;
 
-    int blocks_per_row = K / 256;
-    float sum = 0.0f;
-
-    for (int b = 0; b < blocks_per_row; ++b) {
-        const unsigned char* blk = B_packed + (col * blocks_per_row + b) * 176;
-        const unsigned short* h_ptr = (const unsigned short*)blk;
-        float d    = grim_f16_to_f32(h_ptr[0]);
-        float dmin = grim_f16_to_f32(h_ptr[1]);
-        const unsigned char* scales = blk + 4;
-        const unsigned char* qh     = blk + 16;
-        const unsigned char* qs     = blk + 48;
-
-        const float* a_ptr = A + row * K + b * 256;
-
-        int qs_idx = 0;
-        #pragma unroll
-        for (int n = 0; n < 2; ++n) {
-            unsigned char u1 = 1u << (2 * n);
-            unsigned char u2 = 1u << (2 * n + 1);
-            int sb_base = n * 4;
-            float sc1, m1, sc2, m2, sc3, m3, sc4, m4;
-            grim_get_scale_min_k4(sb_base + 0, scales, &sc1, &m1);
-            grim_get_scale_min_k4(sb_base + 1, scales, &sc2, &m2);
-            grim_get_scale_min_k4(sb_base + 2, scales, &sc3, &m3);
-            grim_get_scale_min_k4(sb_base + 3, scales, &sc4, &m4);
-
-            float d_sc1 = d * sc1, d_m1 = dmin * m1;
-            float d_sc2 = d * sc2, d_m2 = dmin * m2;
-            float d_sc3 = d * sc3, d_m3 = dmin * m3;
-            float d_sc4 = d * sc4, d_m4 = dmin * m4;
-
-            int a_off = n * 128;
-            #pragma unroll
-            for (int l = 0; l < 32; ++l) {
-                float q1 = (float)((qs[qs_idx + l       ] & 0x0F) | ((qh[l] & u1        ) ? 16 : 0));
-                float q2 = (float)((qs[qs_idx + l + 32  ] & 0x0F) | ((qh[l] & u2        ) ? 16 : 0));
-                float q3 = (float)((qs[qs_idx + l       ] >> 4 )  | ((qh[l] & (u1 << 2)) ? 16 : 0));
-                float q4 = (float)((qs[qs_idx + l + 32  ] >> 4 )  | ((qh[l] & (u2 << 2)) ? 16 : 0));
-
-                sum += a_ptr[a_off + l      ] * (d_sc1 * q1 - d_m1);
-                sum += a_ptr[a_off + l + 32 ] * (d_sc2 * q2 - d_m2);
-                sum += a_ptr[a_off + l + 64 ] * (d_sc3 * q3 - d_m3);
-                sum += a_ptr[a_off + l + 96 ] * (d_sc4 * q4 - d_m4);
-            }
-            qs_idx += 64;
-        }
-    }
-
-    C[row * N + col] = sum;
-}
 
 extern "C" __global__ void grim_quantized_matmul_q8_0(const float* a, const unsigned char* b, const float* b_scales, float* out, int m, int n, int k) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -428,6 +369,67 @@ __device__ const float GRIM_IQ4_NL_CODEBOOK[16] = {
     1.29459881f, 1.52851904f, 1.82685633f, 2.27001130f,
     3.23719119f, 5.50829601f, 10.4162559f, 34.5695092f
 };
+
+extern "C" __global__ void grim_fused_quant_gemm_q5_k(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    float* __restrict__ C,
+    int M, int N, int K
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    int blocks_per_row = K / 256;
+    float sum = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const unsigned char* blk = B_packed + (col * blocks_per_row + b) * 176;
+        const unsigned short* h_ptr = (const unsigned short*)blk;
+        float d    = grim_f16_to_f32(h_ptr[0]);
+        float dmin = grim_f16_to_f32(h_ptr[1]);
+        const unsigned char* scales = blk + 4;
+        const unsigned char* qh     = blk + 16;
+        const unsigned char* qs     = blk + 48;
+
+        const float* a_ptr = A + row * K + b * 256;
+
+        int qs_idx = 0;
+        #pragma unroll
+        for (int n = 0; n < 2; ++n) {
+            unsigned char u1 = 1u << (2 * n);
+            unsigned char u2 = 1u << (2 * n + 1);
+            int sb_base = n * 4;
+            float sc1, m1, sc2, m2, sc3, m3, sc4, m4;
+            grim_get_scale_min_k4(sb_base + 0, scales, &sc1, &m1);
+            grim_get_scale_min_k4(sb_base + 1, scales, &sc2, &m2);
+            grim_get_scale_min_k4(sb_base + 2, scales, &sc3, &m3);
+            grim_get_scale_min_k4(sb_base + 3, scales, &sc4, &m4);
+
+            float d_sc1 = d * sc1, d_m1 = dmin * m1;
+            float d_sc2 = d * sc2, d_m2 = dmin * m2;
+            float d_sc3 = d * sc3, d_m3 = dmin * m3;
+            float d_sc4 = d * sc4, d_m4 = dmin * m4;
+
+            int a_off = n * 128;
+            #pragma unroll
+            for (int l = 0; l < 32; ++l) {
+                float q1 = (float)((qs[qs_idx + l       ] & 0x0F) | ((qh[l] & u1        ) ? 16 : 0));
+                float q2 = (float)((qs[qs_idx + l + 32  ] & 0x0F) | ((qh[l] & u2        ) ? 16 : 0));
+                float q3 = (float)((qs[qs_idx + l       ] >> 4 )  | ((qh[l] & (u1 << 2)) ? 16 : 0));
+                float q4 = (float)((qs[qs_idx + l + 32  ] >> 4 )  | ((qh[l] & (u2 << 2)) ? 16 : 0));
+
+                sum += a_ptr[a_off + l      ] * (d_sc1 * q1 - d_m1);
+                sum += a_ptr[a_off + l + 32 ] * (d_sc2 * q2 - d_m2);
+                sum += a_ptr[a_off + l + 64 ] * (d_sc3 * q3 - d_m3);
+                sum += a_ptr[a_off + l + 96 ] * (d_sc4 * q4 - d_m4);
+            }
+            qs_idx += 64;
+        }
+    }
+
+    C[row * N + col] = sum;
+}
 
 // ---- Q5_K (176 B / 256 weights) — bit-accurate vs grim_quant::dequant_q5k ----
 extern "C" __global__ void grim_dequant_q5k(const unsigned char* __restrict__ packed,

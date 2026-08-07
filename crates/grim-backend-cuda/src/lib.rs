@@ -2950,7 +2950,7 @@ impl BackendDevice for CudaDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let kernel_name = match format {
             grim_tensor::QuantFormat::Q8_0 => "grim_fused_quant_gemm_q8_0",
-            grim_tensor::QuantFormat::Q5_K => "grim_fused_quant_gemm_q5_k",
+            grim_tensor::QuantFormat::Q5K => "grim_fused_quant_gemm_q5_k",
             grim_tensor::QuantFormat::Fp8 => "grim_fused_quant_gemm_fp8",
             other => {
                 return Err(Error::Backend(format!(
