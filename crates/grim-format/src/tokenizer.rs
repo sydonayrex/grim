@@ -229,13 +229,19 @@ impl GgufTokenizer {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        let byte_decoder = if model_type == "bpe" || model_type == "gpt2" {
+            Some(gpt2_byte_decoder())
+        } else {
+            None
+        };
+
         Ok(Self {
             tokens,
             token_to_id,
             scores,
             model_type,
             bpe_merges: None,
-            byte_decoder: None,
+            byte_decoder,
             eos_token_id,
             unk_token_id,
             chat_template,
@@ -531,11 +537,15 @@ impl GgufTokenizer {
                     text.push_str(&self.tokens[id as usize]);
                 }
             }
-            // Map byte-level unicode chars back to actual bytes
-            let bytes: Vec<u8> = text
-                .chars()
-                .filter_map(|c| decoder.get(&c).copied())
-                .collect();
+            let mut bytes: Vec<u8> = Vec::with_capacity(text.len());
+            for c in text.chars() {
+                if let Some(&b) = decoder.get(&c) {
+                    bytes.push(b);
+                } else {
+                    let mut buf = [0u8; 4];
+                    bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+            }
             return String::from_utf8_lossy(&bytes).into_owned();
         }
 
