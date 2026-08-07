@@ -7,6 +7,7 @@ use grim_backend_cpu::CpuDevice;
 use grim_backend_metal::MetalDevice;
 #[cfg(feature = "vulkan-mem")]
 use grim_backend_vulkan::VulkanDevice;
+use grim_tensor::dtype::Storage;
 use grim_tensor::error::{Error, Result};
 use grim_tensor::shape::Shape;
 use grim_tensor::{BackendDevice, DType, Device, Tensor};
@@ -448,7 +449,22 @@ impl Linear {
         let b_storage = self.w_t.storage().as_ref();
 
         let out_shape = Shape::new(vec![batch, out_dim]);
-        let (out_s, h) = BackendDevice::matmul(&*dev, a_storage, b_storage, &out_shape)?;
+        let (out_s, h) = if self.w_t.dtype().is_quantized() {
+            let quant_fmt = match &self.w_t.dtype().storage {
+                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80) => Some(grim_tensor::QuantFormat::Q8_0),
+                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q5K) => Some(grim_tensor::QuantFormat::Q5K),
+                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K) => Some(grim_tensor::QuantFormat::Q4K),
+                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q6K) => Some(grim_tensor::QuantFormat::Q6K),
+                _ => None,
+            };
+            if let Some(fmt) = quant_fmt {
+                dev.fused_quant_gemm(a_storage, b_storage, fmt, &out_shape)?
+            } else {
+                BackendDevice::matmul(&*dev, a_storage, b_storage, &out_shape)?
+            }
+        } else {
+            BackendDevice::matmul(&*dev, a_storage, b_storage, &out_shape)?
+        };
         h.synchronize()?;
         let mat_out = Tensor::new(
             Arc::from(out_s),
@@ -501,6 +517,18 @@ fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
         return Err(Error::Shape("transpose_last_two: only 2-D".into()));
     }
     let (a, b) = (dims[0], dims[1]);
+    let new_shape = Shape::new(vec![b, a]);
+
+    if t.dtype().is_quantized() {
+        return Ok(Tensor::new(
+            t.storage().clone(),
+            new_shape,
+            t.dtype(),
+            t.provenance().clone(),
+            t.device().clone(),
+        ));
+    }
+
     let src = t.to_vec_f32()?;
     let mut out = vec![0.0f32; a * b];
     for i in 0..a {
@@ -508,13 +536,9 @@ fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
             out[j * a + i] = src[i * b + j];
         }
     }
-    let new_shape = Shape::new(vec![b, a]);
     if t.device().is_cpu() {
         Ok(grim_backend_cpu::cpu_tensor(out, new_shape))
     } else {
-        // Re-upload transposed (dequantized) weights back to the source
-        // device so the downstream matmul sees matching device storages and
-        // the correct [in_dim, out_dim] layout.
         let dev = pick_device_for_tensor(t);
         let storage = dev.from_cpu(&out, &new_shape, DType::F32)?;
         Ok(Tensor::new(
