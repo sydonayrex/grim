@@ -518,7 +518,34 @@ impl MiniCpmModel {
             h = out;
         }
         let h = self.norm.forward(&h)?;
-        let mut logits = self.output.forward(&h)?;
+        let orig_h_dims = h.shape().dims().to_vec();
+        let (h_2d, is_3d) = if orig_h_dims.len() == 3 {
+            let total_tokens = orig_h_dims[0] * orig_h_dims[1];
+            (
+                Tensor::new(
+                    h.storage().clone(),
+                    Shape::new(vec![total_tokens, orig_h_dims[2]]),
+                    h.dtype(),
+                    h.provenance().clone(),
+                    h.device().clone(),
+                ),
+                true,
+            )
+        } else {
+            (h.clone(), false)
+        };
+        let logits_2d = self.output.forward(&h_2d)?;
+        let mut logits = if is_3d {
+            Tensor::new(
+                logits_2d.storage().clone(),
+                Shape::new(vec![orig_h_dims[0], orig_h_dims[1], self.cfg.vocab_size]),
+                logits_2d.dtype(),
+                logits_2d.provenance().clone(),
+                logits_2d.device().clone(),
+            )
+        } else {
+            logits_2d
+        };
 
         if let Some(dim_base) = self.cfg.dim_model_base {
             let scale = dim_base / (self.cfg.hidden_size as f32);
