@@ -72,6 +72,12 @@ impl GgufValue {
             _ => None,
         }
     }
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            GgufValue::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
     pub fn as_array(&self) -> Option<&[GgufValue]> {
         match self {
             GgufValue::Array(v) => Some(v),

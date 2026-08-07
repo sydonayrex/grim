@@ -228,7 +228,7 @@ impl LlamaBlock {
 
         // FFN: standard Llama uses a single shared expert for all tokens.
         // Process the full batch in one forward pass on-device (zero CPU roundtrips).
-        let x_norm = self.ffn_norm.forward(&x_2d)?;
+        let x_norm = self.ffn_norm.forward(&added)?;
         let gate = self.w_gate.forward(&x_norm)?;
         let up = self.w_up.forward(&x_norm)?;
         let silu_storage = grim_nn::modules::silu_mul_on_device(&gate, &up)?;

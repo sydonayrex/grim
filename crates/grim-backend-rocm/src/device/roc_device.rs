@@ -1383,12 +1383,15 @@ impl BackendDevice for RocmDevice {
         let a_dims = a.shape().dims();
         let b_dims = b.shape().dims();
 
-        if a_dims.len() != 2 || b_dims.len() != 2 {
-            return Err(Error::Shape("matmul expects 2-D inputs".into()));
+        if a_dims.len() < 2 || b_dims.len() < 2 {
+            return Err(Error::Shape("matmul expects inputs with rank >= 2".into()));
         }
 
-        let (m, k) = (a_dims[0], a_dims[1]);
-        let (k2, n) = (b_dims[0], b_dims[1]);
+        let k = a_dims[a_dims.len() - 1];
+        let m = a.shape().elem_count() / k;
+
+        let n = b_dims[b_dims.len() - 1];
+        let k2 = b.shape().elem_count() / n;
 
         if k != k2 {
             return Err(Error::ShapeMismatch {
@@ -1397,9 +1400,10 @@ impl BackendDevice for RocmDevice {
             });
         }
 
-        if out_shape.dims() != &[m, n] {
+        if out_shape.elem_count() != m * n {
             return Err(Error::Shape(format!(
-                "expected out [{m},{n}], got {:?}",
+                "expected out elem_count {}, got {:?}",
+                m * n,
                 out_shape.dims()
             )));
         }
@@ -5685,21 +5689,23 @@ impl RocmDevice {
         }
         let x_dims = x.shape().dims();
         let w_mat_dims = weight_mat.shape().dims();
-        if x_dims.len() != 2 || w_mat_dims.len() != 2 {
-            return Err(Error::Shape("rmsnorm_matmul expects 2-D inputs".into()));
+        if x_dims.len() < 2 || w_mat_dims.len() < 2 {
+            return Err(Error::Shape("rmsnorm_matmul expects rank >= 2 inputs".into()));
         }
-        let m = x_dims[0];
-        let k = x_dims[1];
-        let n = w_mat_dims[1];
-        if w_mat_dims[0] != k {
+        let k = x_dims[x_dims.len() - 1];
+        let m = x.shape().elem_count() / k;
+        let n = w_mat_dims[w_mat_dims.len() - 1];
+        let k2 = weight_mat.shape().elem_count() / n;
+        if k != k2 {
             return Err(Error::ShapeMismatch {
                 expected: x_dims.to_vec(),
                 got: w_mat_dims.to_vec(),
             });
         }
-        if out_shape.dims() != &[m, n] {
+        if out_shape.elem_count() != m * n {
             return Err(Error::Shape(format!(
-                "expected out [{m},{n}], got {:?}",
+                "expected out elem_count {}, got {:?}",
+                m * n,
                 out_shape.dims()
             )));
         }

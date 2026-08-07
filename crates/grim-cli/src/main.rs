@@ -118,6 +118,9 @@ enum Commands {
         /// RNG seed (0 = random).
         #[arg(long, default_value = "0")]
         seed: u64,
+        /// Target compute device (e.g. cpu, cuda, rocm, vulkan, metal).
+        #[arg(long)]
+        device: Option<String>,
         /// Repetition penalty (1.0 = disabled). Default 1.10 matches Ollama.
         #[arg(long, default_value = "1.1")]
         repeat_penalty: f32,
@@ -743,8 +746,14 @@ async fn main() -> Result<()> {
             top_k,
             max_tokens,
             seed,
+            device,
             repeat_penalty,
         } => {
+            if let Some(ref dev) = device {
+                unsafe {
+                    std::env::set_var("GRIM_BACKEND", dev);
+                }
+            }
             // --rocml-profile is a hint only; existing .grim conversions are auto-preferred (WI-S6).
             if let Some(ref profile) = rocml_profile {
                 eprintln!(

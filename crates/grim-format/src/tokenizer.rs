@@ -16,6 +16,10 @@ pub struct GgufTokenizer {
     pub byte_decoder: Option<HashMap<char, u8>>,
     /// EOS token ID if available from tokenizer metadata
     pub eos_token_id: Option<u32>,
+    /// BOS token ID if available from tokenizer metadata (`tokenizer.ggml.bos_token_id`).
+    pub bos_token_id: Option<u32>,
+    /// Whether the tokenizer should prepend a BOS token (`tokenizer.ggml.add_bos_token`).
+    pub add_bos_token: bool,
     /// UNK token ID if available from tokenizer metadata
     pub unk_token_id: Option<u32>,
     /// Jinja chat template extracted from GGUF `tokenizer.chat_template`, if present.
@@ -33,6 +37,8 @@ impl Default for GgufTokenizer {
             bpe_merges: None,
             byte_decoder: None,
             eos_token_id: None,
+            bos_token_id: None,
+            add_bos_token: false,
             unk_token_id: None,
             chat_template: None,
         }
@@ -170,6 +176,8 @@ impl GgufTokenizer {
                 None
             },
             eos_token_id: None, // HF tokenizer.json doesn't have explicit EOS token ID in a standard way
+            bos_token_id: None,
+            add_bos_token: false,
             unk_token_id,
             chat_template: None,
         })
@@ -218,6 +226,15 @@ impl GgufTokenizer {
             .get("tokenizer.ggml.eos_token_id")
             .and_then(|v| v.as_u32());
 
+        // Extract BOS token ID and add_bos flag from metadata.
+        let bos_token_id = metadata
+            .get("tokenizer.ggml.bos_token_id")
+            .and_then(|v| v.as_u32());
+        let add_bos_token = metadata
+            .get("tokenizer.ggml.add_bos_token")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         // Extract UNK token ID from metadata (typically tokenizer.ggml.unknown_token_id)
         let unk_token_id = metadata
             .get("tokenizer.ggml.unknown_token_id")
@@ -243,6 +260,8 @@ impl GgufTokenizer {
             bpe_merges: None,
             byte_decoder,
             eos_token_id,
+            bos_token_id,
+            add_bos_token,
             unk_token_id,
             chat_template,
         })
@@ -853,6 +872,27 @@ pub fn sanitize_jinja_template(template: &str) -> String {
         }
     }
 
+    // Transform `.endswith('suffix')` and `.endswith("suffix")` → slice comparison.
+    // `.endswith('Y')` → `[-N:] == 'Y'` where N = len('Y').
+    while let Some(pos) = result.find(".endswith('") {
+        if let Some(end) = result[pos..].find("')") {
+            let suffix = result[pos + 11..pos + end].to_string();
+            let len = suffix.len();
+            result.replace_range(pos..pos + end + 2, &format!("[-{len}:] == '{suffix}'"));
+        } else {
+            break;
+        }
+    }
+    while let Some(pos) = result.find(".endswith(\"") {
+        if let Some(end) = result[pos..].find("\")") {
+            let suffix = result[pos + 11..pos + end].to_string();
+            let len = suffix.len();
+            result.replace_range(pos..pos + end + 2, &format!("[-{len}:] == \"{suffix}\""));
+        } else {
+            break;
+        }
+    }
+
     // Transform `.items()` → `| items`.
     // Only matches the method-call form `.items()`, not the filter `| items`.
     let result = result.replace(".items()", " | items");
@@ -1296,5 +1336,29 @@ mod chat_template_tests {
             !rendered.contains("<|im_start|>system"),
             "system block should not appear without a system message"
         );
+    }
+
+    /// HuggingFace templates (e.g. MiniCPM5, Ternary-Bonsai) use Python string
+    /// methods `.startswith()` and `.endswith()` which minijinja does not
+    /// implement. The sanitizer must transform them into slice comparisons.
+    #[test]
+    fn renders_template_with_startswith_endswith() {
+        let tpl = r#"{%- set s = "hello world" -%}
+{%- if s.startswith("hello") -%}START{% endif -%}
+{%- if s.endswith("world") -%}END{% endif -%}
+{%- if not s.startswith("xyz") -%}NOTXYZ{% endif -%}"#
+            .to_string();
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }];
+        let rendered = render_chat_template(&tpl, &msgs, false, "", "", None, None)
+            .expect("startswith/endswith template must render");
+        assert!(rendered.contains("START"), "startswith match failed");
+        assert!(rendered.contains("END"), "endswith match failed");
+        assert!(rendered.contains("NOTXYZ"), "startswith non-match failed");
     }
 }

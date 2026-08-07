@@ -644,6 +644,9 @@ unsafe impl Sync for CudaDevice {}
 impl CudaDevice {
     /// Creates a device reference for the given ordinal; returns Err if cuBLAS init fails.
     pub fn new(ordinal: usize) -> Result<Self> {
+        unsafe {
+            cudaSetDevice(ordinal as i32);
+        }
         let mut handle_ptr: *mut c_void = std::ptr::null_mut();
         let cublas_handle = unsafe {
             if cublasCreate_v2(&mut handle_ptr) == CUBLAS_STATUS_SUCCESS {

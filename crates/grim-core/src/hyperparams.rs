@@ -134,12 +134,16 @@ impl HyperparameterExtractor {
             .unwrap_or(hidden_size * 4);
 
         let rms_norm_eps = metadata
-            .get_f32(&format!("{arch_name}.attention.layer_norm_rms_eps"))
+            .get_f32(&format!("{arch_name}.attention.layer_norm_rms_epsilon"))
+            .or_else(|| metadata.get_f32(&format!("{arch_name}.attention.layer_norm_rms_eps")))
             .or_else(|| metadata.get_f32(&format!("{arch_name}.attention.layer_norm_epsilon")))
             .or_else(|| metadata.get_f32(&format!("{arch_name}.rms_norm_eps")))
+            .or_else(|| metadata.get_f32(&format!("{arch_name}.rms_norm_epsilon")))
+            .or_else(|| metadata.get_f32("llama.attention.layer_norm_rms_epsilon"))
             .or_else(|| metadata.get_f32("llama.attention.layer_norm_rms_eps"))
             .or_else(|| metadata.get_f32("llama.attention.layer_norm_epsilon"))
             .or_else(|| metadata.get_f32("llama.rms_norm_eps"))
+            .or_else(|| metadata.get_f32("llama.rms_norm_epsilon"))
             .unwrap_or(1e-5);
 
         let rope_theta = metadata
