@@ -652,9 +652,7 @@ impl CudaDevice {
             if cublasCreate_v2(&mut handle_ptr) == CUBLAS_STATUS_SUCCESS {
                 Some(CublasHandle(handle_ptr))
             } else {
-                return Err(Error::Backend(format!(
-                    "cublasCreate_v2 failed for CUDA device {ordinal}"
-                )));
+                None
             }
         };
         Ok(Self {
