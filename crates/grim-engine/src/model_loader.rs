@@ -1083,7 +1083,16 @@ fn load_model_with_providers(
             .unwrap_or_default()
             .to_lowercase();
         let path_lower = path.to_lowercase();
-        if name_lower.contains("minicpm") || path_lower.contains("minicpm") {
+        // Only promote to MiniCPM when the GGUF carries MiniCPM2/3 metadata keys.
+        // MiniCPM5 reports `general.architecture = llama` and has NO `minicpm.*`
+        // metadata keys — it is architecturally standard Llama. Promoting it to
+        // MiniCPM would apply wrong rescaling and produce gibberish output.
+        let has_minicpm_metadata = lookup.get_f32("minicpm.scale_emb").is_some()
+            || lookup.get_f32("minicpm.scale_depth").is_some()
+            || lookup.get_f32("minicpm.dim_model_base").is_some();
+        if (name_lower.contains("minicpm") || path_lower.contains("minicpm"))
+            && has_minicpm_metadata
+        {
             eprintln!("[grim] Detected MiniCPM model variant from metadata/path, promoting architecture to MiniCpm");
             model_arch = ModelArchitecture::MiniCpm;
         }

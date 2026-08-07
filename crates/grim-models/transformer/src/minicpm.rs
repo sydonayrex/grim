@@ -76,9 +76,11 @@ impl MiniCpmBlock {
         let (local_num_heads, local_num_kv_heads, kv_head_replica_factor) =
             crate::block::plan_kv_head_sharding(cfg.num_heads, cfg.num_kv_heads, tp.world_size)?;
 
-        let scale_depth_factor = cfg.scale_depth.unwrap_or_else(|| {
-            1.4f32 / (cfg.num_layers as f32).sqrt()
-        });
+        // Apply `scale_depth` rescaling only when the model metadata specifies
+        // it. MiniCPM2/3 use this per-layer scaling; MiniCPM5 does NOT. Default
+        // to 1.0 (no-op) so the `(factor - 1.0).abs() > 1e-5` guards in the
+        // forward pass skip the scaling entirely.
+        let scale_depth_factor = cfg.scale_depth.unwrap_or(1.0f32);
 
         let refs = MiniCpmConfigRefs {
             hidden_size: cfg.hidden_size,
@@ -560,10 +562,18 @@ impl MiniCpmModel {
             logits_2d
         };
 
-        if let Some(dim_base) = self.cfg.dim_model_base {
-            let scale = dim_base / (self.cfg.hidden_size as f32);
+        // Apply the MiniCPM logit scale (`dim_model_base / hidden_size`) only
+        // when the model metadata specifies `dim_model_base`. MiniCPM5 does NOT
+        // use this scaling — it is a standard Llama-style model. Default to 1.0
+        // (no-op) when absent.
+        let logit_scale = self
+            .cfg
+            .dim_model_base
+            .map(|db| db / (self.cfg.hidden_size as f32))
+            .unwrap_or(1.0f32);
+        if (logit_scale - 1.0).abs() > 1e-5 {
             let data = logits.to_vec_f32()?;
-            let scaled: Vec<f32> = data.iter().map(|v| v * scale).collect();
+            let scaled: Vec<f32> = data.iter().map(|v| v * logit_scale).collect();
             let dev = pick_device_for_storage_device(&self.device);
             let storage = dev.from_cpu(&scaled, logits.shape(), DType::F32)?;
             logits = Tensor::new(
@@ -637,6 +647,10 @@ impl CausalLm for MiniCpmModel {
             }
         }
 
+        // Apply `scale_emb` only when the model metadata specifies it. MiniCPM2/3
+        // use this rescaling (typically 12.0); MiniCPM5 does NOT — it is
+        // architecturally a standard Llama-style model. Applying the default
+        // 12.0 to a MiniCPM5 model corrupts the embeddings and produces gibberish.
         if let Some(scale_emb) = self.cfg.scale_emb {
             for val in hidden.iter_mut() {
                 *val *= scale_emb;

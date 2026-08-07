@@ -427,6 +427,14 @@ pub async fn cmd_run(
         // single-turn prompt through it for instruction-tuned models.
         // Otherwise fall back to raw prompt + best-effort BOS.
         let prompt_text = if tok.chat_template.is_some() {
+            // Some models (e.g. MiniCPM5) require a BOS token before the chat
+            // template output even though the template doesn't include it.
+            // Check the GGUF `add_bos_token` flag.
+            if tok.add_bos_token {
+                if let Some(bos_id) = tok.bos_token_id {
+                    ids.push(bos_id);
+                }
+            }
             let messages = vec![grim_format::ChatMessage {
                 role: "user".to_string(),
                 content: prompt.clone(),
@@ -879,6 +887,11 @@ pub async fn cmd_run_interactive(
         let mut tokens: Vec<u32> = if let Some(tok) = &tokenizer {
             let mut ids = Vec::new();
             let prompt_text = if tok.chat_template.is_some() {
+                if tok.add_bos_token {
+                    if let Some(bos_id) = tok.bos_token_id {
+                        ids.push(bos_id);
+                    }
+                }
                 grim_format::render_messages_or_last(tok, &messages)
             } else {
                 let bos_candidates = ["<|startoftext|>", "<s>", "<|im_start|>"];
