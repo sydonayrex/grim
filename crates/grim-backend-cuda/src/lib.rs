@@ -301,9 +301,13 @@ impl CudaStorage {
         }
 
         let mut dev_ptr: *mut c_void = std::ptr::null_mut();
-        // SAFETY: `cudaMalloc` allocates `byte_len` bytes on the selected CUDA
-        // device. The pointer is initialized to null and checked on error.
-        let res = unsafe { cudaMalloc(&mut dev_ptr, byte_len) };
+        let mut res = unsafe { cudaMalloc(&mut dev_ptr, byte_len) };
+        if res != cudaSuccess {
+            unsafe {
+                let _ = cudaDeviceSynchronize();
+            }
+            res = unsafe { cudaMalloc(&mut dev_ptr, byte_len) };
+        }
         if res != cudaSuccess {
             return Err(Error::Backend(format!(
                 "cudaMalloc failed to allocate {} bytes with error {}",
@@ -336,10 +340,13 @@ impl CudaStorage {
         }
 
         let mut dev_ptr: *mut c_void = std::ptr::null_mut();
-        // SAFETY: `cudaMalloc` allocates `bytes` bytes on the current CUDA device.
-        // The pointer is initialized to null and checked on error; the device was
-        // selected by the preceding `cudaSetDevice`.
-        let res = unsafe { cudaMalloc(&mut dev_ptr, bytes) };
+        let mut res = unsafe { cudaMalloc(&mut dev_ptr, bytes) };
+        if res != cudaSuccess {
+            unsafe {
+                let _ = cudaDeviceSynchronize();
+            }
+            res = unsafe { cudaMalloc(&mut dev_ptr, bytes) };
+        }
         if res != cudaSuccess {
             return Err(Error::Backend(format!(
                 "cudaMalloc failed to allocate {} bytes with error {}",
