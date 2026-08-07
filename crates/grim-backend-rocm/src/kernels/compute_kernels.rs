@@ -51,12 +51,12 @@ extern "C" __global__ void grim_rope(const float* x, const unsigned int* positio
     float sin_val = sinf(val);
     float cos_val = cosf(val);
     int base_idx = (bi * s + si) * d;
-    int a_idx = base_idx + 2 * i;
-    int b_idx = base_idx + 2 * i + 1;
+    int a_idx = base_idx + i;
+    int b_idx = base_idx + half + i;
     float x1 = x[a_idx];
     float x2 = x[b_idx];
     out[a_idx] = x1 * cos_val - x2 * sin_val;
-    out[b_idx] = x1 * sin_val + x2 * cos_val;
+    out[b_idx] = x2 * cos_val + x1 * sin_val;
 }
 
 extern "C" __global__ void grim_silu_mul(float* gate, float* up, float* out, int n) {
