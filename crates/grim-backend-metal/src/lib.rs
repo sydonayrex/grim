@@ -102,6 +102,9 @@ struct MetalPipelines {
     add_rms_norm: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     quant_q8_0: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     quant_fp8: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    quant_mxfp4: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    quant_mxfp8: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    quant_q4k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -245,6 +248,9 @@ impl MetalContext {
                 add_rms_norm: get_pipeline("grim_add_rms_norm")?,
                 quant_q8_0: get_pipeline("grim_quant_q8_0")?,
                 quant_fp8: get_pipeline("grim_quant_fp8")?,
+                quant_mxfp4: get_pipeline("grim_quant_mxfp4")?,
+                quant_mxfp8: get_pipeline("grim_quant_mxfp8")?,
+                quant_q4k: get_pipeline("grim_quant_q4k")?,
             });
 
             Ok(MetalContext {
@@ -1053,6 +1059,42 @@ impl MetalDevice {
                             storage: DTypeStorage::FloatPack(FloatPackScheme::Fp8),
                         },
                     ),
+                    QuantFormat::MxFp4 => {
+                        let n_groups = (total + 31) / 32;
+                        let code_bytes = (total + 1) / 2;
+                        let total_bytes = code_bytes + n_groups;
+                        (
+                            &inner.pipelines.quant_mxfp4,
+                            total_bytes,
+                            DType {
+                                arith: ArithType::F32,
+                                storage: DTypeStorage::FloatPack(FloatPackScheme::MxFp4),
+                            },
+                        )
+                    }
+                    QuantFormat::MxFp8 => {
+                        let n_groups = (total + 31) / 32;
+                        let total_bytes = total + n_groups;
+                        (
+                            &inner.pipelines.quant_mxfp8,
+                            total_bytes,
+                            DType {
+                                arith: ArithType::F32,
+                                storage: DTypeStorage::FloatPack(FloatPackScheme::MxFp8),
+                            },
+                        )
+                    }
+                    QuantFormat::Q4_K => {
+                        let n_superblocks = (total + 255) / 256;
+                        (
+                            &inner.pipelines.quant_q4k,
+                            n_superblocks * 144,
+                            DType {
+                                arith: ArithType::F32,
+                                storage: DTypeStorage::KQuant(KQuantScheme::Q4K),
+                            },
+                        )
+                    }
                     other => {
                         return Err(Error::Backend(format!(
                             "Metal quantize_on_device: unsupported format {:?}",
@@ -1095,6 +1137,20 @@ impl MetalDevice {
                     QuantFormat::Fp8 => {
                         let threads_per_group = MTLSize::new(256, 1, 1);
                         let groups = MTLSize::new(((total + 255) / 256) as u64, 1, 1);
+                        encoder
+                            .dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
+                    }
+                    QuantFormat::MxFp4 | QuantFormat::MxFp8 => {
+                        let n_groups = (total + 31) / 32;
+                        let threads_per_group = MTLSize::new(32, 1, 1);
+                        let groups = MTLSize::new(n_groups as u64, 1, 1);
+                        encoder
+                            .dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
+                    }
+                    QuantFormat::Q4_K => {
+                        let n_superblocks = (total + 255) / 256;
+                        let threads_per_group = MTLSize::new(32, 1, 1);
+                        let groups = MTLSize::new(n_superblocks as u64, 1, 1);
                         encoder
                             .dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
                     }

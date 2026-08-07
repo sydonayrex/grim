@@ -199,6 +199,205 @@ kernel void grim_quant_fp8(
     }
 }
 
+// Helper: Convert float value to 4-bit MXFP4 E2M1 code
+static inline uchar float_to_mxfp4_e2m1_code(float val, uchar shared_exp) {
+    if (isnan(val)) return 0x0u;
+    float scale = pow(2.0f, float(shared_exp) - 127.0f);
+    float unscaled = (scale > 0.0f) ? (val / scale) : 0.0f;
+    uchar sign = (unscaled < 0.0f) ? 0x8u : 0x0u;
+    float abs_val = abs(unscaled);
+
+    uchar code = 0;
+    if (abs_val < 0.25f) {
+        code = 0;
+    } else if (abs_val < 0.75f) {
+        code = 1;
+    } else if (abs_val < 1.25f) {
+        code = 2;
+    } else if (abs_val < 1.75f) {
+        code = 3;
+    } else if (abs_val < 2.5f) {
+        code = 4;
+    } else if (abs_val < 3.5f) {
+        code = 5;
+    } else if (abs_val < 5.0f) {
+        code = 6;
+    } else {
+        code = 7;
+    }
+    return sign | code;
+}
+
+kernel void grim_quant_mxfp4(
+    device const float* x [[buffer(0)]],
+    device uchar* codes [[buffer(1)]],
+    device uchar* exps [[buffer(2)]],
+    constant int& total [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint group_idx [[threadgroup_position_in_grid]]
+) {
+    threadgroup float s_abs[32];
+    uint idx = group_idx * 32u + tid;
+    float val = (idx < uint(total)) ? x[idx] : 0.0f;
+    s_abs[tid] = abs(val);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 16u; stride > 0u; stride /= 2u) {
+        if (tid < stride) {
+            s_abs[tid] = max(s_abs[tid], s_abs[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float amax = s_abs[0];
+    uchar shared_exp = 0;
+    if (amax > 0.0f) {
+        int e = int(floor(log2(amax / 6.0f))) + 127;
+        e = clamp(e, 0, 255);
+        shared_exp = uchar(e);
+    }
+
+    if (tid == 0u) {
+        exps[group_idx] = shared_exp;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uchar nib = float_to_mxfp4_e2m1_code(val, shared_exp);
+    uint pair_idx = (group_idx * 32u + tid) / 2u;
+    if (tid % 2u == 0u) {
+        codes[pair_idx] = (codes[pair_idx] & 0xF0u) | (nib & 0x0Fu);
+    } else {
+        codes[pair_idx] = (codes[pair_idx] & 0x0Fu) | ((nib & 0x0Fu) << 4u);
+    }
+}
+
+kernel void grim_quant_mxfp8(
+    device const float* x [[buffer(0)]],
+    device uchar* codes [[buffer(1)]],
+    device uchar* exps [[buffer(2)]],
+    constant int& total [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint group_idx [[threadgroup_position_in_grid]]
+) {
+    threadgroup float s_abs[32];
+    uint idx = group_idx * 32u + tid;
+    float val = (idx < uint(total)) ? x[idx] : 0.0f;
+    s_abs[tid] = abs(val);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 16u; stride > 0u; stride /= 2u) {
+        if (tid < stride) {
+            s_abs[tid] = max(s_abs[tid], s_abs[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float amax = s_abs[0];
+    uchar shared_exp = 0;
+    if (amax > 0.0f) {
+        int e = int(floor(log2(amax / 448.0f))) + 127;
+        e = clamp(e, 0, 255);
+        shared_exp = uchar(e);
+    }
+
+    if (tid == 0u) {
+        exps[group_idx] = shared_exp;
+    }
+
+    if (idx < uint(total)) {
+        float scale = pow(2.0f, float(shared_exp) - 127.0f);
+        float unscaled = (scale > 0.0f) ? (val / scale) : 0.0f;
+        codes[idx] = float_to_fp8_e4m3_msl(unscaled);
+    }
+}
+
+kernel void grim_quant_q4k(
+    device const float* x [[buffer(0)]],
+    device uchar* out [[buffer(1)]],
+    constant int& total [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint block_idx [[threadgroup_position_in_grid]]
+) {
+    device uchar* block_out = out + block_idx * 144u;
+    threadgroup float s_min[8];
+    threadgroup float s_max[8];
+
+    if (tid < 8u) {
+        float sub_min = 1e30f;
+        float sub_max = -1e30f;
+        uint base_idx = block_idx * 256u + tid * 32u;
+        for (uint i = 0u; i < 32u; ++i) {
+            uint idx = base_idx + i;
+            float val = (idx < uint(total)) ? x[idx] : 0.0f;
+            sub_min = min(sub_min, val);
+            sub_max = max(sub_max, val);
+        }
+        s_min[tid] = sub_min;
+        s_max[tid] = sub_max;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        float max_d = 0.0f;
+        float max_m = 0.0f;
+        for (int i = 0; i < 8; ++i) {
+            float range = s_max[i] - s_min[i];
+            float d_i = range / 15.0f;
+            float m_i = -s_min[i] / 15.0f;
+            if (d_i > max_d) max_d = d_i;
+            if (m_i > max_m) max_m = m_i;
+        }
+
+        half d_h = half(max_d);
+        half dmin_h = half(max_m);
+        ushort d_bits = as_type<ushort>(d_h);
+        ushort dmin_bits = as_type<ushort>(dmin_h);
+
+        block_out[0] = uchar(d_bits & 0xFFu);
+        block_out[1] = uchar((d_bits >> 8u) & 0xFFu);
+        block_out[2] = uchar(dmin_bits & 0xFFu);
+        block_out[3] = uchar((dmin_bits >> 8u) & 0xFFu);
+
+        float id = (max_d > 0.0f) ? (1.0f / max_d) : 0.0f;
+        float idmin = (max_m > 0.0f) ? (1.0f / max_m) : 0.0f;
+
+        uchar sc[8];
+        uchar m_sc[8];
+        for (int i = 0; i < 8; ++i) {
+            float range = s_max[i] - s_min[i];
+            float d_i = range / 15.0f;
+            float m_i = -s_min[i] / 15.0f;
+            sc[i] = uchar(clamp(int(round(d_i * id)), 0, 63));
+            m_sc[i] = uchar(clamp(int(round(m_i * idmin)), 0, 63));
+        }
+
+        for (int i = 0; i < 4; ++i) {
+            block_out[4 + i] = sc[i] | ((sc[i + 4] & 0x03) << 6);
+            block_out[8 + i] = m_sc[i] | ((m_sc[i + 4] & 0x03) << 6);
+            block_out[12 + (i % 2) * 2 + i / 2] = ((sc[i + 4] >> 2) & 0x0F) | (((m_sc[i + 4] >> 2) & 0x0F) << 4);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device uchar* qs = block_out + 16u;
+    for (uint i = tid; i < 128u; i += 32u) {
+        uint sb = i / 16u;
+        uint rel = (i % 16u);
+        uint idx0 = block_idx * 256u + sb * 32u + rel;
+        uint idx1 = idx0 + 16u;
+
+        float v0 = (idx0 < uint(total)) ? x[idx0] : 0.0f;
+        float v1 = (idx1 < uint(total)) ? x[idx1] : 0.0f;
+
+        int q0 = clamp(int(round((v0 + 1.0f) * 7.5f)), 0, 15);
+        int q1 = clamp(int(round((v1 + 1.0f) * 7.5f)), 0, 15);
+
+        qs[i] = uchar((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+    }
+}
+
 kernel void grim_softmax(
     device const float* x [[buffer(0)]],
     device float* out [[buffer(1)]],
