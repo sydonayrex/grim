@@ -748,12 +748,12 @@ impl Rope {
                     sin_p[i] = a.sin();
                 }
                 for i in 0..half {
-                    let xi = base_index + 2 * i;
-                    let xj = base_index + 2 * i + 1;
+                    let xi = base_index + i;
+                    let xj = base_index + half + i;
                     let a = src[xi];
                     let bv = src[xj];
                     src[xi] = a * cos_p[i] - bv * sin_p[i];
-                    src[xj] = a * sin_p[i] + bv * cos_p[i];
+                    src[xj] = bv * cos_p[i] + a * sin_p[i];
                 }
             }
         }
