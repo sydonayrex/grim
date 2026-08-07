@@ -458,7 +458,11 @@ impl Linear {
                 _ => None,
             };
             if let Some(fmt) = quant_fmt {
-                dev.fused_quant_gemm(a_storage, b_storage, fmt, &out_shape)?
+                match dev.fused_quant_gemm(a_storage, b_storage, fmt, &out_shape) {
+                    Ok(res) => res,
+                    Err(Error::Unimplemented(_)) => BackendDevice::matmul(&*dev, a_storage, b_storage, &out_shape)?,
+                    Err(e) => return Err(e),
+                }
             } else {
                 BackendDevice::matmul(&*dev, a_storage, b_storage, &out_shape)?
             }
