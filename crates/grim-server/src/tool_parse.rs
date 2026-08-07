@@ -8,7 +8,7 @@
 //! return `None` so the caller falls back to plain content. A failed parse is
 //! not a request failure.
 
-use grim_format::{ChatMessage, ToolCallMsg};
+use grim_format::ToolCallMsg;
 
 /// Which family of tool-call convention the model's chat template follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +16,7 @@ pub enum ToolFamily {
     /// Hermes-2-Pro style `<tool_call>...` marker-delimited JSON.
     TagDelimited,
     /// Bare-JSON convention (some Mistral/Qwen variants emit a raw JSON object).
+    #[allow(dead_code)]
     BareJson,
     /// Unknown template — scanner tries conventions in order.
     Auto,
@@ -81,6 +82,7 @@ pub fn parse_tool_calls(completion: &str, family: ToolFamily) -> ParseOutcome {
 
 /// WI-TOOLS-4b/4c — stable reason strings shared by both runaway-call guards so
 /// clients can distinguish a hard 400's cause without parsing free text.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunawayReason {
     /// WI-TOOLS-4b: the (name, args) tuple has already appeared >= 4 times.
@@ -94,6 +96,7 @@ pub enum RunawayReason {
 }
 
 impl RunawayReason {
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             RunawayReason::DuplicateToolCall => "duplicate_tool_call_limit",

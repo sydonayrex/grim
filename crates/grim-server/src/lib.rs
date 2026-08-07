@@ -221,7 +221,7 @@ fn sample_next_token(
             adapter_ids: vec![],
             input_ids: Some(prompt_tokens.to_vec()),
         };
-        engine.enqueue_request(req);
+        let _ = engine.enqueue_request(req);
     }
 
     if let Err(e) = engine.tick() {
@@ -4294,7 +4294,7 @@ fn probe_cuda_vram(cuda_gpu_count: usize) -> (u64, u64, Vec<serde_json::Value>) 
             total_vram_used += used;
             total_vram_max += total;
             let memory_pct = if total > 0 {
-                ((used as f64 / total as f64 * 100.0) as u32)
+                (used as f64 / total as f64 * 100.0) as u32
             } else {
                 0
             };

@@ -2537,16 +2537,11 @@ impl BackendDevice for CudaDevice {
                 if k >= 32 && k % 32 == 0 && b_storage.bytes() >= k * n {
                     Self::ensure_f32_input("quantized_matmul a", a_storage)?;
 
-                    let out_storage =
-                        CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
-                    let a_ptr =
-                        Self::dev_ptr_or_err("quantized_matmul a", a_storage)?;
-                    let b_ptr =
-                        Self::dev_ptr_or_err("quantized_matmul b", b_storage)?;
+                    let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+                    let a_ptr = Self::dev_ptr_or_err("quantized_matmul a", a_storage)?;
+                    let b_ptr = Self::dev_ptr_or_err("quantized_matmul b", b_storage)?;
                     let out_ptr = out_storage.device_ptr.ok_or_else(|| {
-                        Error::Backend(
-                            "quantized_matmul: failed to allocate output buffer".into(),
-                        )
+                        Error::Backend("quantized_matmul: failed to allocate output buffer".into())
                     })? as *mut c_void;
 
                     // Build n*(k/32) scales buffer; missing entries default to 1.0.
@@ -2562,14 +2557,11 @@ impl BackendDevice for CudaDevice {
                         self.ordinal,
                     )?;
                     let scales_ptr = scales_storage.device_ptr.ok_or_else(|| {
-                        Error::Backend(
-                            "quantized_matmul: failed to upload scales buffer".into(),
-                        )
+                        Error::Backend("quantized_matmul: failed to upload scales buffer".into())
                     })? as *const c_void;
 
-                    let handle = self.launch_quantized_matmul_q8_0(
-                        a_ptr, b_ptr, scales_ptr, out_ptr, m, n, k,
-                    )?;
+                    let handle = self
+                        .launch_quantized_matmul_q8_0(a_ptr, b_ptr, scales_ptr, out_ptr, m, n, k)?;
                     return Ok((Box::new(out_storage), handle));
                 }
             }
@@ -2587,28 +2579,27 @@ impl BackendDevice for CudaDevice {
         let a_vec = a.to_cpu_vec_f32()?;
 
         // Download packed B bytes from GPU if resident.
-        let b_bytes: Vec<u8> =
-            if let Some(cs) = b_packed.as_any().downcast_ref::<CudaStorage>() {
-                let mut host_bytes = vec![0u8; cs.bytes()];
-                if let Some(dev_ptr) = cs.device_ptr {
-                    unsafe {
-                        let res = cudaMemcpy(
-                            host_bytes.as_mut_ptr() as *mut c_void,
-                            dev_ptr as *const c_void,
-                            cs.bytes(),
-                            cudaMemcpyDeviceToHost,
-                        );
-                        if res != 0 {
-                            return Err(Error::Backend(format!(
-                                "quantized_matmul: cudaMemcpy(B) D2H failed: {res}"
-                            )));
-                        }
+        let b_bytes: Vec<u8> = if let Some(cs) = b_packed.as_any().downcast_ref::<CudaStorage>() {
+            let mut host_bytes = vec![0u8; cs.bytes()];
+            if let Some(dev_ptr) = cs.device_ptr {
+                unsafe {
+                    let res = cudaMemcpy(
+                        host_bytes.as_mut_ptr() as *mut c_void,
+                        dev_ptr as *const c_void,
+                        cs.bytes(),
+                        cudaMemcpyDeviceToHost,
+                    );
+                    if res != 0 {
+                        return Err(Error::Backend(format!(
+                            "quantized_matmul: cudaMemcpy(B) D2H failed: {res}"
+                        )));
                     }
                 }
-                host_bytes
-            } else {
-                vec![0u8; k * n]
-            };
+            }
+            host_bytes
+        } else {
+            vec![0u8; k * n]
+        };
 
         // Dequantize B using the canonical grim_quant function for `format`.
         // CONTRACT: every arm must produce exactly `k * n` f32 values in
@@ -2622,13 +2613,9 @@ impl BackendDevice for CudaDevice {
                 for col in 0..n {
                     for block in 0..blocks_per_col {
                         let scale_idx = col * blocks_per_col + block;
-                        let scale = b_scales
-                            .get(scale_idx)
-                            .copied()
-                            .unwrap_or(1.0f32);
+                        let scale = b_scales.get(scale_idx).copied().unwrap_or(1.0f32);
                         for i in 0..32 {
-                            let byte_offset =
-                                (col * blocks_per_col + block) * 32 + i;
+                            let byte_offset = (col * blocks_per_col + block) * 32 + i;
                             let q_val = b_bytes
                                 .get(byte_offset)
                                 .map(|&b| (b as i8) as f32)
@@ -2642,61 +2629,28 @@ impl BackendDevice for CudaDevice {
                 }
                 out
             }
-            grim_tensor::QuantFormat::Q4K => {
-                grim_quant::dequant_q4k(&b_bytes, k * n).map_err(|e| {
-                    Error::Backend(format!("quantized_matmul Q4K dequant: {e}"))
-                })?
-            }
-            grim_tensor::QuantFormat::Q5K => {
-                grim_quant::dequant_q5k(&b_bytes, k * n).map_err(|e| {
-                    Error::Backend(format!("quantized_matmul Q5K dequant: {e}"))
-                })?
-            }
-            grim_tensor::QuantFormat::Q6K => {
-                grim_quant::dequant_q6k(&b_bytes, k * n).map_err(|e| {
-                    Error::Backend(format!("quantized_matmul Q6K dequant: {e}"))
-                })?
-            }
-            grim_tensor::QuantFormat::Iq4Nl => {
-                grim_quant::dequant_iq4nl(&b_bytes, k * n).map_err(|e| {
-                    Error::Backend(format!("quantized_matmul IQ4NL dequant: {e}"))
-                })?
-            }
-            grim_tensor::QuantFormat::Iq4Xs => {
-                grim_quant::dequant_iq4xs(&b_bytes, k * n).map_err(|e| {
-                    Error::Backend(format!("quantized_matmul IQ4XS dequant: {e}"))
-                })?
-            }
-            grim_tensor::QuantFormat::Iq3Xxs => {
-                grim_quant::dequant_iq3xxs(&b_bytes, k * n).map_err(|e| {
-                    Error::Backend(format!("quantized_matmul IQ3XXS dequant: {e}"))
-                })?
-            }
-            grim_tensor::QuantFormat::Iq3S => {
-                grim_quant::dequant_iq3s(&b_bytes, k * n).map_err(|e| {
-                    Error::Backend(format!("quantized_matmul IQ3S dequant: {e}"))
-                })?
-            }
-            grim_tensor::QuantFormat::Iq2Xxs => {
-                grim_quant::dequant_iq2xxs(&b_bytes, k * n).map_err(|e| {
-                    Error::Backend(format!("quantized_matmul IQ2XXS dequant: {e}"))
-                })?
-            }
-            grim_tensor::QuantFormat::Iq2Xs => {
-                grim_quant::dequant_iq2xs(&b_bytes, k * n).map_err(|e| {
-                    Error::Backend(format!("quantized_matmul IQ2XS dequant: {e}"))
-                })?
-            }
-            grim_tensor::QuantFormat::Iq2S => {
-                grim_quant::dequant_iq2s(&b_bytes, k * n).map_err(|e| {
-                    Error::Backend(format!("quantized_matmul IQ2S dequant: {e}"))
-                })?
-            }
-            grim_tensor::QuantFormat::Fp4 => {
-                grim_quant::dequant_fp4(&b_bytes, k * n).map_err(|e| {
-                    Error::Backend(format!("quantized_matmul FP4 dequant: {e}"))
-                })?
-            }
+            grim_tensor::QuantFormat::Q4K => grim_quant::dequant_q4k(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("quantized_matmul Q4K dequant: {e}")))?,
+            grim_tensor::QuantFormat::Q5K => grim_quant::dequant_q5k(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("quantized_matmul Q5K dequant: {e}")))?,
+            grim_tensor::QuantFormat::Q6K => grim_quant::dequant_q6k(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("quantized_matmul Q6K dequant: {e}")))?,
+            grim_tensor::QuantFormat::Iq4Nl => grim_quant::dequant_iq4nl(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("quantized_matmul IQ4NL dequant: {e}")))?,
+            grim_tensor::QuantFormat::Iq4Xs => grim_quant::dequant_iq4xs(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("quantized_matmul IQ4XS dequant: {e}")))?,
+            grim_tensor::QuantFormat::Iq3Xxs => grim_quant::dequant_iq3xxs(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("quantized_matmul IQ3XXS dequant: {e}")))?,
+            grim_tensor::QuantFormat::Iq3S => grim_quant::dequant_iq3s(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("quantized_matmul IQ3S dequant: {e}")))?,
+            grim_tensor::QuantFormat::Iq2Xxs => grim_quant::dequant_iq2xxs(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("quantized_matmul IQ2XXS dequant: {e}")))?,
+            grim_tensor::QuantFormat::Iq2Xs => grim_quant::dequant_iq2xs(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("quantized_matmul IQ2XS dequant: {e}")))?,
+            grim_tensor::QuantFormat::Iq2S => grim_quant::dequant_iq2s(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("quantized_matmul IQ2S dequant: {e}")))?,
+            grim_tensor::QuantFormat::Fp4 => grim_quant::dequant_fp4(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("quantized_matmul FP4 dequant: {e}")))?,
             grim_tensor::QuantFormat::Fp4Block16 => {
                 grim_quant::dequant_fp4_block16(&b_bytes, k * n).map_err(|e| {
                     Error::Backend(format!("quantized_matmul FP4Block16 dequant: {e}"))
@@ -2730,8 +2684,6 @@ impl BackendDevice for CudaDevice {
             }),
         ))
     }
-
-
 
     /// Fused (non-fused first cut) dequantized matmul backward on CUDA.
     ///

@@ -53,7 +53,7 @@ impl ConfidenceHead for EntropyConfidenceHead {
                 }
             }
             // exp(-H) ∈ (0, 1], with higher = more confident.
-            out.push({ if h.is_finite() { (-h).exp() } else { 1.0 } });
+            out.push(if h.is_finite() { (-h).exp() } else { 1.0 });
         }
         out
     }

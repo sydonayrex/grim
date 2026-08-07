@@ -459,6 +459,34 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
+    /// Begin capturing execution calls into a hardware compute graph (e.g. HIP graph).
+    fn begin_graph_capture(&self, key: &str) -> Result<()> {
+        let _ = key;
+        Err(crate::error::Error::Unimplemented(
+            "graph capture not supported on this device backend".into(),
+        ))
+    }
+
+    /// End graph capture and instantiate the graph executable under `key`.
+    fn end_graph_capture(&self, key: &str) -> Result<()> {
+        let _ = key;
+        Err(crate::error::Error::Unimplemented(
+            "graph capture not supported on this device backend".into(),
+        ))
+    }
+
+    /// Replay the graph captured under `key`. Returns Ok(true) if replayed, Ok(false) if missing.
+    fn replay_graph(&self, key: &str) -> Result<bool> {
+        let _ = key;
+        Ok(false)
+    }
+
+    /// Check whether a graph executable is stored under `key`.
+    fn has_captured_graph(&self, key: &str) -> bool {
+        let _ = key;
+        false
+    }
+
     /// All-Reduce collective operation across tensor-parallel devices (§4.1).
     fn all_reduce(
         &self,
@@ -736,8 +764,7 @@ pub trait BackendDevice: Send + Sync {
         _out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         Err(crate::error::Error::Unimplemented(
-            "quantized_matmul requires a backend with fused dequantized matmul kernels"
-                .into(),
+            "quantized_matmul requires a backend with fused dequantized matmul kernels".into(),
         ))
     }
 
