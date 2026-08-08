@@ -66,6 +66,7 @@ fn grapheme_is_lowercase(c: &&str) -> bool {
 /// ```
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+#[allow(unpredictable_function_pointer_comparisons)]
 pub enum Boundary {
     Custom {
         /// A function that determines if this boundary is present at the start

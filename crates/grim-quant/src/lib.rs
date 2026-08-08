@@ -757,6 +757,7 @@ pub fn dequant_q6k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     let mut pos = 0;
 
     for _ in 0..num_blocks {
+        // ggml block_q6_K layout: ql (128B) + qh (64B) + scales (16B, i8) + d (f16, LAST).
         let ql = &data[pos..pos + 128];
         let qh = &data[pos + 128..pos + 192];
         let scales = &data[pos + 192..pos + 208];
@@ -4995,6 +4996,88 @@ mod tests {
                 "in_sb={in_sb}: GPU-mirror={gpu} != CPU-ref={cpu_v}"
             );
         }
+    }
+
+    /// Definitive check: extract a real Q4_K weight from an on-disk GGUF model
+    /// and dequantize it two ways - grim's `dequant_q4k` and an independent
+    /// ggml-faithful reimplementation. They MUST agree. Skipped if the model
+    /// file is absent.
+    #[test]
+    fn test_q4k_real_model_matches_ggml_reference() {
+        let path = std::env::var("GRIM_Q4K_MODEL").unwrap_or_else(|_| "models/MiniCPM5-1B-Q4_K_M.gguf".into());
+        let Ok(file) = std::fs::File::open(&path) else {
+            eprintln!("skip: model not found at {path}");
+            return;
+        };
+        use std::io::{Read, Seek, SeekFrom};
+        let mut reader = file;
+        let gguf = grim_format::gguf::read_gguf(&mut reader).expect("read_gguf");
+        let info = gguf
+            .tensors
+            .iter()
+            .find(|t| t.name == "token_embd.weight")
+            .expect("token_embd.weight present");
+        assert_eq!(info.dtype, grim_format::gguf::GgufDType::Q4K, "dtype must be Q4_K");
+        let bytes = grim_format::gguf::read_tensor_bytes(&mut reader, &gguf, info).expect("read bytes");
+        let n = info.elem_count();
+
+        let grim_out = dequant_q4k(&bytes, n).expect("grim dequant_q4k");
+
+        // Independent ggml-faithful reference.
+        let ref_out = dequant_q4k_ggml_ref(&bytes, n);
+
+        assert_eq!(grim_out.len(), ref_out.len());
+        let mut max_rel = 0.0f32;
+        for i in 0..ref_out.len() {
+            let denom = ref_out[i].abs().max(1.0);
+            max_rel = max_rel.max((grim_out[i] - ref_out[i]).abs() / denom);
+        }
+        assert!(max_rel < 0.02, "q4k grim vs ggml-ref max_rel={max_rel}");
+    }
+
+    /// Minimal, self-contained port of llama.cpp dequantize_row_q4_K.
+    fn dequant_q4k_ggml_ref(data: &[u8], num_weights: usize) -> Vec<f32> {
+        const QK_K: usize = 256;
+        let nb = num_weights / QK_K;
+        let mut out = Vec::with_capacity(num_weights);
+        for i in 0..nb {
+            let base = i * 144;
+            let d = f16_to_f32(data[base], data[base + 1]);
+            let min = f16_to_f32(data[base + 2], data[base + 3]);
+            let scales = &data[base + 4..base + 16];
+            let q = &data[base + 16..base + 144];
+            let mut is = 0usize;
+            let mut qoff = 0usize;
+            for _ in 0..(QK_K / 64) {
+                let (mut s, mut m) = ggml_get_scale_min_k4(is, scales);
+                let d1 = d * s;
+                let m1 = min * m;
+                let (s, m) = ggml_get_scale_min_k4(is + 1, scales);
+                let d2 = d * s;
+                let m2 = min * m;
+                for l in 0..32 {
+                    out.push(d1 * (q[qoff + l] & 0x0F) as f32 - m1);
+                }
+                for l in 0..32 {
+                    out.push(d2 * (q[qoff + l] >> 4) as f32 - m2);
+                }
+                qoff += 32;
+                is += 2;
+            }
+        }
+        out
+    }
+
+    fn ggml_get_scale_min_k4(j: usize, sc: &[u8]) -> (f32, f32) {
+        let (d, m) = if j < 4 {
+            (sc[j] & 63, sc[j + 4] & 63)
+        } else {
+            (
+                (sc[j + 4] & 0x0F) | ((sc[j - 4] >> 6) << 4),
+                (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4),
+            )
+        };
+        (d as f32, m as f32)
     }
 
     /// Tests FP8 E4M3 subnormal float decode scaling factor (1.0 / 512.0).

@@ -206,7 +206,7 @@ impl Llama {
         hidden: &Tensor,
         positions: &[u32],
     ) -> Result<(Tensor, Tensor, Vec<(Tensor, Tensor)>)> {
-        self.decode_paged(hidden, positions, None)
+        self.decode_paged(hidden, positions, None, None)
     }
 
     pub fn decode_paged(
@@ -214,11 +214,13 @@ impl Llama {
         hidden: &Tensor,
         positions: &[u32],
         session: Option<&dyn SessionT>,
+        mut caches: Option<&mut [Option<crate::block::LlamaLayerCache>]>,
     ) -> Result<(Tensor, Tensor, Vec<(Tensor, Tensor)>)> {
         let mut h = hidden.clone();
         let mut kv_pairs = Vec::new();
-        for layer in &self.layers {
-            let (out, k, v) = layer.forward_with_kv_paged(&h, positions, session)?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            let cache = caches.as_deref_mut().and_then(|c| c[i].as_mut());
+            let (out, k, v) = layer.forward_with_kv_paged(&h, positions, session, cache)?;
             kv_pairs.push((k, v));
             h = out;
         }
@@ -272,7 +274,9 @@ impl CausalLm for Llama {
             .tok_embeddings
             .forward(&ids, seq_len, self.cfg.hidden_size)?
             .to_vec_f32()?;
-        let hidden_shape = Shape::new(vec![1, seq_len, self.cfg.hidden_size]);
+        // 2-D [seq_len, hidden] (batch=1): block layers feed this straight
+        // into backend matmuls, which require storage rank 2.
+        let hidden_shape = Shape::new(vec![seq_len, self.cfg.hidden_size]);
         let dev = pick_device_for_storage_device(&self.device);
         let hidden_storage = dev.from_cpu(&hidden, &hidden_shape, DType::F32)?;
         let hidden_t = Tensor::new(
@@ -294,13 +298,33 @@ impl CausalLm for Llama {
         } else {
             (0..seq_len).map(|i| i as u32).collect()
         };
-        let (logits, hidden_state, kv_pairs) =
-            self.decode_paged(&hidden_t, &pos_vec, Some(session))?;
-        // MAJ-1: populate the KV cache with K/V from each layer so the
-        // cache infrastructure is no longer dead code.
-        for (k, v) in &kv_pairs {
-            session.append_kv(k, v)?;
+        // Initialize per-layer KV cache in model_state if not present.
+        // The cache stores post-RoPE K and raw V across decode steps so
+        // `prefilled_self_attention` can attend to the full prefix.
+        if session.model_state().is_none() {
+            session.set_model_state(Box::new(
+                (0..self.layers.len())
+                    .map(|_| Some(crate::block::LlamaLayerCache::new()))
+                    .collect::<Vec<_>>(),
+            ));
         }
+        let caches = session
+            .model_state_mut()
+            .and_then(|s| s.downcast_mut::<Vec<Option<crate::block::LlamaLayerCache>>>())
+            .expect("Llama::forward: session.model_state must be Vec<Option<LlamaLayerCache>>");
+
+        let (logits, hidden_state, _kv_pairs) = {
+            let t0 = std::time::Instant::now();
+            let r = self.decode_paged(&hidden_t, &pos_vec, None, Some(caches))?;
+            if std::env::var("GRIM_TRACE").is_ok() {
+                eprintln!(
+                    "[TRACE] decode_paged {} tok took {:.1}ms",
+                    seq_len,
+                    t0.elapsed().as_secs_f32() * 1e3
+                );
+            }
+            r
+        };
         session.set_last_hidden_state(hidden_state);
         let logits = if adapters.is_empty() {
             logits

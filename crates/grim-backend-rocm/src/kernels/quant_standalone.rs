@@ -37,7 +37,13 @@ extern "C" {
             if (mant > 7) mant = 7;
             return sign | (unsigned char)mant;
         }
-        unsigned int mant_bits = (m >> 20) & 0x7;
+        // Properly round mantissa from 23-bit to 3-bit:
+        unsigned int mant_bits = (m + 0x40000) >> 20;
+        if (mant_bits > 7) {
+            mant_bits = 0;
+            e_fp8 += 1;
+            if (e_fp8 >= 15) return sign | 0x7E;
+        }
         return sign | ((unsigned char)e_fp8 << 3) | (unsigned char)mant_bits;
     }
 

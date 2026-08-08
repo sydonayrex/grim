@@ -60,7 +60,21 @@ extern "C" {
         const unsigned char* scales = block_ptr + 4;
         const unsigned char* qs = block_ptr + 16;
 
-        int is = in_sb / 32;
+        // ggml `dequantize_row_q4_K`: four 64-weight groups. Within group g,
+        // the first 32 outputs take low nibbles (q[l] & 0xF) and the next 32
+        // take high nibbles (q[l] >> 4) of the *same* 32-byte `qs` window
+        // (q advances by 32 bytes per 64-output group). The low group uses
+        // scale sub-block `is = 2*g`, the high group uses `2*g + 1`.
+        //
+        // The previous per-element formula here read `qs[is*16 + il]`, which
+        // for the high nibble (is odd) shifted up by 16 bytes into the next
+        // group's window and so crossed group boundaries — wrong bytes,
+        // wrong results.
+        int group = in_sb / 64;           // 0..3
+        int half  = (in_sb % 64) / 32;     // 0 = low nibble, 1 = high nibble
+        int l     = in_sb % 32;           // 0..31 within the 32-byte window
+        int is    = 2 * group + half;     // 0..7 scale sub-block index
+
         unsigned char sc, m;
         if (is < 4) {
             sc = scales[is] & 63;
@@ -70,13 +84,8 @@ extern "C" {
             m  = (scales[is + 4] >> 4)  | ((scales[is] >> 6) << 4);
         }
 
-        int il = in_sb % 32;
-        unsigned char q;
-        if (il < 16) {
-            q = qs[is * 16 + il] & 0xF;
-        } else {
-            q = qs[is * 16 + il - 16] >> 4;
-        }
+        unsigned char byte = qs[group * 32 + l];
+        unsigned char q = half ? (byte >> 4) : (byte & 0xF);
 
         return d * (float)sc * (float)q - dmin * (float)m;
     }

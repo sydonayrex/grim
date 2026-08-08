@@ -533,11 +533,11 @@ fn try_build(pref: &PreferredBackend) -> Option<SelectedBackend> {
             if !probe.available {
                 return None;
             }
-            let dev = grim_backend_rocm::RocmDevice::new(0);
+            let dev = grim_backend_rocm::RocmDevice::shared(0);
             Some(SelectedBackend {
                 device: Device::Rocm(0),
                 label: "rocm".into(),
-                device_impl: Arc::new(dev),
+                device_impl: dev,
             })
         }
         PreferredBackend::Cuda => {

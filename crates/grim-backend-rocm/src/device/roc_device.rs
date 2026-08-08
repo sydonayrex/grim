@@ -363,6 +363,35 @@ impl RocmDevice {
         crate::p2p_route::copy_route(src_device, dst_device, src_ptr, dst_ptr, len, route, stream)
     }
 
+    /// Process-wide cache of constructed devices, keyed by ordinal.
+    ///
+    /// Constructing a `RocmDevice` is *not* cheap: it creates a rocBLAS handle
+    /// (which itself hipMallocs a 32–128 MiB internal workspace), four HIP
+    /// streams and a fresh caching allocator. Hot paths (weight materialisation,
+    /// per-token tensor uploads) used to call `RocmDevice::new` per tensor,
+    /// which on small-VRAM parts (e.g. gfx1036 with a 2 GiB carve-out) exhausts
+    /// device memory and makes `rocblas_create_handle` fail with status 5
+    /// (`rocblas_status_memory_error`). Use `shared` on those paths.
+    fn device_cache() -> &'static Mutex<HashMap<usize, Arc<RocmDevice>>> {
+        static CACHE: std::sync::OnceLock<Mutex<HashMap<usize, Arc<RocmDevice>>>> =
+            std::sync::OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Return the process-wide shared device for `ordinal`, constructing it on
+    /// first use. Prefer this over `RocmDevice::new` anywhere a device is
+    /// obtained repeatedly (per tensor, per token, per layer). [see: `RocmDevice::new`]
+    pub fn shared(ordinal: usize) -> Arc<RocmDevice> {
+        let cache = Self::device_cache();
+        let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(dev) = guard.get(&ordinal) {
+            return Arc::clone(dev);
+        }
+        let dev = Arc::new(Self::new(ordinal));
+        guard.insert(ordinal, Arc::clone(&dev));
+        dev
+    }
+
     /// Probe the total amount of device memory reported by the driver, in bytes. [see: `hipMemGetInfo`, `hipDeviceProp_t`]
     fn query_device_vram_bytes(_ordinal: usize) -> usize {
         unsafe {
@@ -1230,16 +1259,54 @@ impl RocmDevice {
 
         unsafe {
             let mut h: RoclabsHandle = RoclabsHandle(std::ptr::null_mut());
-            let status = rocblas_create_handle(&mut h);
+            let mut status = rocblas_create_handle(&mut h);
+            if status != rocblas_status_success {
+                // rocBLAS hipMallocs a 32-128 MiB internal workspace when the
+                // handle is created; on small-VRAM parts or under high allocator pressure,
+                // that fails with status 5 (rocblas_status_memory_error).
+                // Drain allocator memory pool and synchronize device before retrying.
+                let _ = crate::hipDeviceSynchronize();
+                self.allocator.empty_cache();
+                h = RoclabsHandle(std::ptr::null_mut());
+                status = rocblas_create_handle(&mut h);
+            }
             if status == rocblas_status_success {
                 *cache = Some(h);
                 return Ok(h);
-            } else {
-                return Err(Error::Backend(format!(
-                    "rocblas_create_handle failed with status {}",
-                    status
-                )));
             }
+
+            // Fallback: If rocBLAS workspace creation fails due to VRAM memory pressure,
+            // return a zeroed handle — our custom HIP fused GEMM kernels handle matmuls
+            // without requiring rocBLAS internal workspace allocations.
+            if status == 5 {
+                eprintln!(
+                    "[grim-backend-rocm] rocblas_create_handle failed with memory error (status 5); \
+                     falling back to custom HIP fused GEMM kernels"
+                );
+                let fallback_handle = RoclabsHandle(std::ptr::null_mut());
+                *cache = Some(fallback_handle);
+                return Ok(fallback_handle);
+            }
+
+            let (free_b, total_b) = {
+                let mut free_mem: usize = 0;
+                let mut total_mem: usize = 0;
+                let s = hipMemGetInfo(&mut free_mem, &mut total_mem);
+                if s == hipSuccess {
+                    (free_mem, total_mem)
+                } else {
+                    (0, 0)
+                }
+            };
+            Err(Error::Backend(format!(
+                "rocblas_create_handle failed with status {status} \
+                 (5 = rocblas_status_memory_error; device {} has {} MiB free of {} MiB — \
+                 rocBLAS needs a 32-128 MiB internal workspace, lower it with \
+                 ROCBLAS_DEVICE_MEMORY_SIZE)",
+                self.ordinal,
+                free_b / (1024 * 1024),
+                total_b / (1024 * 1024)
+            )))
         }
     }
 
@@ -1352,6 +1419,53 @@ impl BackendDevice for RocmDevice {
     ) -> Result<Box<dyn BackendStorage>> {
         RocmStorage::copy_from_host_raw_bytes(data, shape, dtype, &self.allocator, self.ordinal)
             .map(|s| Box::new(s) as Box<dyn BackendStorage>)
+    }
+
+    fn alloc_storage(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        RocmStorage::alloc_gpu(shape, dtype, &self.allocator, self.ordinal)
+            .map(|s| Box::new(s) as Box<dyn BackendStorage>)
+    }
+
+    fn copy_slice_into(
+        &self,
+        dst: &dyn BackendStorage,
+        src: &dyn BackendStorage,
+        dst_elem_offset: usize,
+        count: usize,
+    ) -> Result<()> {
+        let dst_s = as_rocm(dst)?;
+        let src_s = as_rocm(src)?;
+        if !dst_s.device_ptr_is_valid() || !src_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "copy_slice_into: inputs lack a valid device pointer".into(),
+            ));
+        }
+        if dst_elem_offset + count > dst_s.shape().elem_count() {
+            return Err(Error::Shape(format!(
+                "copy_slice_into: overflow (dst_elem_offset={dst_elem_offset} + count={count} > dst elems={}",
+                dst_s.shape().elem_count()
+            )));
+        }
+        let bytes = count * std::mem::size_of::<f32>();
+        let dst_ptr = unsafe {
+            (dst_s.device_ptr_u64().unwrap() as *mut c_void)
+                .add(dst_elem_offset * std::mem::size_of::<f32>())
+        };
+        let src_ptr = src_s.device_ptr_u64().unwrap() as *const c_void;
+        check_hip("copy_slice_into: hipMemcpyAsync D2D", unsafe {
+            hipMemcpyAsync(
+                dst_ptr,
+                src_ptr,
+                bytes,
+                HipMemcpyKind::DeviceToDevice,
+                self.active_stream(),
+            )
+        })?;
+        Ok(())
     }
 
     fn matmul(
@@ -1541,8 +1655,16 @@ impl BackendDevice for RocmDevice {
             }
         }
 
-        // Get rocBLAS handle and execute sgemm. The handle's stream was already bound [see: `begin_graph_capture`, `end_graph_capture`]
-        let handle = self.get_rocblas_handle()?;
+        // Get rocBLAS handle and execute sgemm. If handle is null (due to memory error fallback),
+        // execute using WMMA HIP GEMM kernel directly.
+        let handle = match self.get_rocblas_handle() {
+            Ok(h) if !h.0.is_null() => h,
+            _ => {
+                let stream = self.launch_wmma_gemm(a_storage, b_storage, &out_storage, m, n, k)?;
+                let compute_handle = Box::new(RocmHandle::new(Some(stream)));
+                return Ok((Box::new(out_storage), compute_handle));
+            }
+        };
 
         let alpha: f32 = 1.0f32;
         let beta: f32 = 0.0f32;
@@ -1616,10 +1738,11 @@ impl BackendDevice for RocmDevice {
             };
 
             if status != rocblas_status_success {
-                return Err(Error::Backend(format!(
-                    "rocblas matmul execution failed with error status {}",
-                    status
-                )));
+                // If rocBLAS matmul returns an error (e.g. status 1 = invalid handle),
+                // fall back seamlessly to WMMA HIP GEMM kernel.
+                let stream = self.launch_wmma_gemm(a_storage, b_storage, &out_storage, m, n, k)?;
+                let compute_handle = Box::new(RocmHandle::new(Some(stream)));
+                return Ok((Box::new(out_storage), compute_handle));
             }
         };
 
@@ -3054,6 +3177,10 @@ impl BackendDevice for RocmDevice {
         let mut co = cache_offset_i;
         let mut isd = inv_sqrt_d;
 
+        // Ensure all prior operations (RoPE, cache D2D copies, etc.) have
+        // completed before this kernel reads q/k/v.
+        let _ = unsafe { hipStreamSynchronize(self.active_stream()) };
+
         let stream = self.launch_compute_kernel(
             "grim_qkv_attention",
             launch.grid_dim,
@@ -3078,6 +3205,14 @@ impl BackendDevice for RocmDevice {
         let _ = (
             qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd,
         );
+
+        // Wait for the kernel to fully complete before returning. Without this
+        // the output storage can be dropped (returned to the pool) while the
+        // kernel is still writing, and a subsequent alloc_gpu may hand out the
+        // same buffer to a later op — producing silent zero or nondeterministic
+        // results. The stream-sync is microseconds; the alternative is silent
+        // corruption.
+        let _ = unsafe { hipStreamSynchronize(stream) };
 
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
     }
@@ -5822,7 +5957,9 @@ impl RocmDevice {
         out: &RocmStorage,
         total: usize,
     ) -> Result<*mut c_void> {
-        let (grid, block) = linear_launch((total + 31) / 32);
+        let n_blocks = (total + 31) / 32;
+        let grid = crate::HipDim3 { x: n_blocks as u32, y: 1, z: 1 };
+        let block = crate::HipDim3 { x: 32, y: 1, z: 1 };
         let mut x_ptr = dev_ptr(x)?;
         let mut out_ptr = dev_ptr(out)?;
         let mut total_i = total as i32;
@@ -5895,9 +6032,14 @@ impl RocmDevice {
             }
         };
 
-        let out_shape = Shape::from_slice(&[out_bytes]);
-        let out_storage =
-            RocmStorage::alloc_gpu(&out_shape, output_dtype, &self.allocator, self.ordinal)?;
+        let out_shape = x.shape().clone();
+        let out_storage = RocmStorage::alloc_gpu_with_bytes(
+            &out_shape,
+            output_dtype,
+            out_bytes,
+            &self.allocator,
+            self.ordinal,
+        )?;
 
         let stream = match format {
             QuantFormat::Q8_0 => self.launch_quant_q8_0(x_s, &out_storage, total)?,

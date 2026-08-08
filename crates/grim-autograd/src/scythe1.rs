@@ -217,7 +217,7 @@ impl Scythe1Optimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::soul_eater::SoulEaterAdapter;
+    use grim_backend_cpu::cpu_tensor;
     use grim_tensor::Shape;
 
     #[test]

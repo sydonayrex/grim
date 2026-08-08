@@ -2126,6 +2126,7 @@ impl Muon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grim_tensor::Shape;
 
     #[test]
     fn test_lion_and_8bit_adamw_optimizers_step() {

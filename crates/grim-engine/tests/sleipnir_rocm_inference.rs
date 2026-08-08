@@ -39,6 +39,7 @@ const SAMPLING: SamplingParams = SamplingParams {
     top_p: 0.95,
     top_k: 50,
     repeat_penalty: 1.5,
+    thinking_level: grim_core::sampler::ThinkingLevel::Default,
 };
 
 /// Golden token sequence captured from a deterministic CPU run (seed 42,

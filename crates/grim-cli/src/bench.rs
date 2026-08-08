@@ -38,7 +38,6 @@ pub async fn cmd_bench(tokens: usize, concurrency: usize, model_path: Option<&st
     };
     let start = std::time::Instant::now();
 
-    use grim_core::session::Inner;
     for _ in 0..concurrency {
         // P1-3.6: Llama `forward` expects a 1-D `[seq_len]` input_ids tensor
         // (token IDs as f32, cast to u32 internally) and a matching positions
@@ -57,8 +56,8 @@ pub async fn cmd_bench(tokens: usize, concurrency: usize, model_path: Option<&st
         // Separate positions tensor — values 0..seq_len, shape [1, tokens].
         let pos_data: Vec<f32> = (0..tokens).map(|t| t as f32).collect();
         let pos = grim_backend_cpu::cpu_tensor(pos_data, grim_tensor::Shape::new(vec![1, tokens]));
-        let mut sess = Inner::new(model.device().clone());
-        let _ = model.forward(&mut sess, &inp, &pos, &[])?;
+        let mut sess = model.new_session();
+        let _ = model.forward(&mut *sess, &inp, &pos, &[])?;
     }
 
     let elapsed = start.elapsed();

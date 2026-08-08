@@ -373,21 +373,37 @@ impl BackendStorage for MetalStorage {
         {
             let data_guard = self.data.lock().unwrap();
             let elem_count = self.shape.elem_count();
-            let mut out = vec![0.0f32; elem_count];
-            let bytes = elem_count * dtype_byte_size(&self.dtype)?;
-            if data_guard.len() < bytes {
-                return Err(Error::from(MetalError::DataMismatch(
-                    "CPU storage buffer size mismatch".into(),
-                )));
+            match self.dtype.storage {
+                DTypeStorage::KQuant(KQuantScheme::Q80) => {
+                    let dev = MetalDevice::new(0)?;
+                    dev.dequantize_q8_0_host(&data_guard, elem_count)
+                }
+                DTypeStorage::FloatPack(FloatPackScheme::Fp8) => {
+                    let dev = MetalDevice::new(0)?;
+                    dev.dequantize_fp8_host(&data_guard, elem_count)
+                }
+                DTypeStorage::KQuant(KQuantScheme::Q4K) => {
+                    let dev = MetalDevice::new(0)?;
+                    dev.dequantize_q4k_host(&data_guard, elem_count)
+                }
+                _ => {
+                    let mut out = vec![0.0f32; elem_count];
+                    let bytes = elem_count * dtype_byte_size(&self.dtype)?;
+                    if data_guard.len() < bytes {
+                        return Err(Error::from(MetalError::DataMismatch(
+                            "CPU storage buffer size mismatch".into(),
+                        )));
+                    }
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data_guard.as_ptr(),
+                            out.as_mut_ptr() as *mut u8,
+                            bytes,
+                        );
+                    }
+                    Ok(out)
+                }
             }
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data_guard.as_ptr(),
-                    out.as_mut_ptr() as *mut u8,
-                    bytes,
-                );
-            }
-            Ok(out)
         }
     }
 

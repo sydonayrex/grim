@@ -85,6 +85,7 @@ fn capital_word(word: &str) -> String {
 /// assert_eq!(dunder_converter.convert("ITER"), "__iter__");
 /// ```
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[allow(unpredictable_function_pointer_comparisons)]
 pub enum Pattern {
     /// The no-op pattern performs no mutations.
     /// ```

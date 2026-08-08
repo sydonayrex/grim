@@ -261,3 +261,88 @@ fn test_fused_quant_gemm_fp8() {
         "fused_quant_gemm_fp8 max error {max_err} exceeds 0.5"
     );
 }
+
+#[test]
+fn test_fused_quant_gemm_q4_k() {
+    let dev = match device_or_skip() {
+        Some(d) => d,
+        None => {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+    };
+
+    let m = 2;
+    let k = 256; // 1 Q4_K superblock
+    let n = 4;
+
+    let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
+
+    // Hand construct packed Q4_K weights for B (n_blocks * 144 = 4 * 144 = 576 bytes).
+    let mut b_packed = vec![0u8; n * 144];
+    for col in 0..n {
+        let blk = &mut b_packed[col * 144..(col + 1) * 144];
+        let d_bits = half::f16::from_f32(1.5).to_bits().to_le_bytes();
+        let min_bits = half::f16::from_f32(0.25).to_bits().to_le_bytes();
+        blk[0..2].copy_from_slice(&d_bits);
+        blk[2..4].copy_from_slice(&min_bits);
+        blk[4] = 2; // sc0 = 2
+        blk[8] = 1; // m0 = 1
+        blk[16] = 5 | (3 << 4); // lo nibble 5, hi nibble 3
+    }
+
+    let a_shape = Shape::new(vec![m, k]);
+    let b_packed_shape = Shape::new(vec![n, k]);
+    let out_shape = Shape::new(vec![m, n]);
+
+    let a = dev.from_cpu(&a_data, &a_shape, DType::F32).unwrap();
+    let b = CudaStorage::copy_from_host_raw_bytes(
+        &b_packed,
+        &b_packed_shape,
+        DType {
+            arith: grim_tensor::dtype::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q4K),
+        },
+        0,
+    )
+    .unwrap();
+
+    let (out, handle) = dev
+        .fused_quant_gemm(a.as_ref(), &b, QuantFormat::Q4K, &out_shape)
+        .unwrap();
+    handle.synchronize().unwrap();
+
+    let result = out.to_cpu_vec_f32().unwrap();
+
+    // Independent CPU oracle: dequant B per col, then matmul A @ B_deq.
+    let mut b_deq = vec![0.0f32; k * n];
+    for col in 0..n {
+        let col_bytes = &b_packed[col * 144..(col + 1) * 144];
+        let col_weights = grim_quant::dequant_q4k(col_bytes, 256).unwrap();
+        for r in 0..k {
+            b_deq[r * n + col] = col_weights[r];
+        }
+    }
+
+    let mut expected = vec![0.0f32; m * n];
+    for r in 0..m {
+        for c in 0..n {
+            let mut sum = 0.0f32;
+            for p in 0..k {
+                sum += a_data[r * k + p] * b_deq[p * n + c];
+            }
+            expected[r * n + c] = sum;
+        }
+    }
+
+    let max_err = result
+        .iter()
+        .zip(expected.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    assert!(
+        max_err < 1e-3,
+        "fused_quant_gemm_q4_k max error {max_err} exceeds 1e-3"
+    );
+}

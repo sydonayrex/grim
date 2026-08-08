@@ -14,11 +14,12 @@ use grim_models_mamba::{
     GraniteHybridConfig, JambaConfig, Mamba, Mamba2Config, MambaConfig, NemotronHConfig, Rwkv,
     Rwkv6Config, Rwkv7Config, RwkvConfig,
 };
-use grim_models_transformer::{
-    BloomConfig, DeepSeek, DeepSeekConfig, FalconConfig, Gemma, GemmaConfig, Gpt2, Gpt2Config,
-    Lfm2, Lfm2Config, Llama, LlamaConfig, MiniCpmConfig, MiniCpmModel, MoeConfig, PhiConfig,
-    QwenConfig, T5, T5Config,
-};
+ use grim_models_transformer::{
+     BloomConfig, DeepSeek, DeepSeekConfig, FalconConfig, FalconH1Config,
+     FalconH1Model, Gemma, GemmaConfig, Gpt2, Gpt2Config,
+     Lfm2, Lfm2Config, Llama, LlamaConfig, MiniCpmConfig, MiniCpmModel, MoeConfig, PhiConfig,
+     QwenConfig, T5, T5Config,
+ };
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::{TensorParallelConfig, WeightSource};
 use grim_plugin::ArchCompatSpec;
@@ -1351,6 +1352,29 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
             };
             let m = Mamba::load_tp(device.clone(), &ws, mamba_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::FalconH1 => {
+            let falcon_h1_cfg = FalconH1Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                ssm_d_state: hparams.ssm_d_state.unwrap_or(64),
+                ssm_d_inner: hparams.ssm_d_inner.unwrap_or(hparams.intermediate_size),
+                ssm_d_conv: hparams.ssm_d_conv.unwrap_or(4),
+                ssm_dt_rank: hparams.ssm_dt_rank.unwrap_or(
+                    hparams.ssm_d_inner.unwrap_or(hparams.intermediate_size) / hparams.num_heads.max(1),
+                ),
+                ssm_n_group: hparams.ssm_n_group.unwrap_or(1),
+            };
+            eprintln!("[grim] Loading Falcon-H1 model with config: {:?}", falcon_h1_cfg);
+            let m = FalconH1Model::load_tp(device.clone(), &ws, falcon_h1_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Jamba => {

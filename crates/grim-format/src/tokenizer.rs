@@ -282,6 +282,8 @@ impl GgufTokenizer {
             "<|system|>",
             "<|user|>",
             "<|assistant|>",
+            "<s>",
+            "</s>",
         ];
 
         // For byte-level BPE tokenizers (model_type == "bpe"), use the GPT-2
@@ -1013,7 +1015,11 @@ pub fn render_messages_or_last_with_tools(
             tpl,
             messages,
             true,
-            "",
+            tokenizer
+                .bos_token_id
+                .and_then(|id| tokenizer.tokens.get(id as usize))
+                .map(|s| s.as_str())
+                .unwrap_or(""),
             tokenizer
                 .eos_token_id
                 .and_then(|id| tokenizer.tokens.get(id as usize))

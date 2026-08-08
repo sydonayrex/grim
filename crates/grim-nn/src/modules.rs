@@ -69,11 +69,14 @@ pub fn pick_device_for_storage_device(d: &Device) -> Box<dyn BackendDevice> {
         }
         #[cfg(feature = "rocm-mem")]
         Device::Rocm(ordinal) => {
-            if let Ok(dev) = RocmDevice::try_new(*ordinal) {
-                Box::new(dev)
-            } else {
-                Box::new(CpuDevice::new())
-            }
+            // Use the process-wide shared device. Constructing a fresh
+            // `RocmDevice` per call and dropping it at scope exit runs the
+            // full destructor — device-wide `hipDeviceSynchronize`, cache
+            // flush, and HIP module unloads — on *every* primitive dispatch,
+            // which pins the host CPU and re-JITs kernels (amd_comgr) per op.
+            // `Arc<RocmDevice>` implements `BackendDevice` (see
+            // `grim_tensor::backend`), so dropping the box is refcount-only.
+            Box::new(RocmDevice::shared(*ordinal))
         }
         #[cfg(feature = "vulkan-mem")]
         Device::Vulkan => Box::new(VulkanDevice::new()),
@@ -460,7 +463,21 @@ impl Linear {
             if let Some(fmt) = quant_fmt {
                 match dev.fused_quant_gemm(a_storage, b_storage, fmt, &out_shape) {
                     Ok(res) => res,
-                    Err(Error::Unimplemented(_)) => BackendDevice::matmul(&*dev, a_storage, b_storage, &out_shape)?,
+                    Err(Error::Unimplemented(_)) => {
+                        // No fused kernel (e.g. CPU): fall back to the explicit
+                        // dequant + GEMM path. `quantized_matmul` reads the packed
+                        // bytes from `w_t` (GGUF [out,in] layout), dequants into a
+                        // [k,n] row-major buffer, and runs the GEMM — it does NOT
+                        // depend on `transpose_last_two` having relabeled storage.
+                        // Falling back to plain `matmul` here would pass the
+                        // still-quantized bytes to a function expecting F32 [k,n]
+                        // and trip ShapeMismatch on non-square layers (e.g.
+                        // MiniCPM5's wq is [2048,1536]). Scales are embedded in
+                        // the K-quant block layout, so an empty slice is fine for
+                        // Q4_K/Q5_K/Q6_K (the only K-quant formats we dispatch
+                        // here); Q8_0 is handled by its own block header.
+                        dev.quantized_matmul(a_storage, b_storage, &[], fmt, &out_shape)?
+                    }
                     Err(e) => return Err(e),
                 }
             } else {
@@ -507,29 +524,33 @@ impl Linear {
 }
 
 fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
-    // GGUF stores Linear weights as [in_dim, out_dim]. Backends consume this
-    // differently, so gate the relabel on the device:
-    //   * CUDA / CPU / Vulkan / Metal: keep the GGUF [in,out] layout as-is.
-    //     The CUDA fused GEMM relabels b_dims symmetrically and reads the same
-    //     packed bytes; the F32 matmul consumes [in,out] directly. (Verified:
-    //     CUDA Q4K/Q6K KATs pass.)
-    //   * ROCm: the fused dequant-GEMM kernel reads B as [out_dim, in_dim]
-    //     (it indexes `col` over the output dim), so relabel the shape to
-    //     [out,in] for quantized weights (no byte move) and genuinely
-    //     transpose the data for F32 weights (its matmul wants B=[out,in]).
-    //     Without this relabel ROCm hits ShapeMismatch (expected [16,1536]
-    //     got [2048,1536]) because the kernel writes the wrong output shape.
+    // GGUF stores Linear weights as [out_dim, in_dim] (rows = output units,
+    // columns = input units). The CPU/CUDA/Vulkan/Metal `matmul` kernels all
+    // consume B in [k, n] = [in_dim, out_dim] row-major layout (they compute
+    // `C = A @ B` with B indexed as `b[p*n + j]`), so we must transpose the
+    // GGUF [out,in] storage to [in,out].
+    //
+    // ROCm is the exception: its fused dequant-GEMM kernel reads B directly as
+    // [out_dim, in_dim] (it indexes `col` over the output dim), so for
+    // quantized weights we only relabel the shape to [out,in] without moving
+    // bytes (the kernel handles the layout).
+    //
+    // The historical comment claimed CPU "keeps GGUF [in,out] layout as-is"
+    // and "F32 matmul consumes [in,out] directly", but that is incorrect:
+    // the CPU GEMM (`gemm_scalar`/`gemv_row`) indexes `b[p*n + j]`, requiring
+    // [k,n]=[in,out]. This was silently correct for square Llama weights
+    // (num_heads*head_dim == hidden_size) where [out,in] and [in,out] share
+    // the same shape; non-square layers like MiniCPM5 (16*128=2048 != 1536)
+    // expose the bug as a ShapeMismatch (expected [15,1536] got [2048,1536]).
     let dims = t.shape().dims().to_vec();
     if dims.len() != 2 {
         return Err(Error::Shape("transpose_last_two: only 2-D".into()));
     }
-    if !matches!(t.device(), Device::Rocm(_)) {
-        return Ok(t.clone());
-    }
     let (a, b) = (dims[0], dims[1]);
     let new_shape = Shape::new(vec![b, a]);
 
-    if t.dtype().is_quantized() {
+    // ROCm quantized fast path: relabel only (kernel reads [out,in] directly).
+    if matches!(t.device(), Device::Rocm(_)) && t.dtype().is_quantized() {
         return Ok(Tensor::new(
             t.storage().clone(),
             new_shape,
@@ -539,6 +560,10 @@ fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
         ));
     }
 
+    // All other cases (CPU/CUDA/Vulkan/Metal, F32 or quantized): genuinely
+    // transpose the data so `w_t` is in [in,out]=[k,n] row-major layout.
+    // Quantized tensors reaching here are already dequantized to F32 in
+    // `WeightSource::get` for CPU, so `to_vec_f32` works uniformly.
     let src = t.to_vec_f32()?;
     let mut out = vec![0.0f32; a * b];
     for i in 0..a {
