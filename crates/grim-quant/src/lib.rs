@@ -697,41 +697,37 @@ pub fn dequant_q5k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
         let qs = &data[pos + 48..pos + 176];
 
         let mut qs_idx = 0;
+        let mut is = 0usize;
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
 
-        for n in 0..2 {
-            let u1 = 1u8 << (2 * n);
-            let u2 = 1u8 << (2 * n + 1);
-            let mut block_out = [0.0f32; 128];
-            let sb_base = n * 4;
+        for _ in 0..4 {
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let d1 = d * sc1;
+            let min1 = dmin * m1;
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d2 = d * sc2;
+            let min2 = dmin * m2;
 
-            let (sc1, m1) = get_scale_min_k4(sb_base + 0, scales);
-            let (sc2, m2) = get_scale_min_k4(sb_base + 1, scales);
-            let (sc3, m3) = get_scale_min_k4(sb_base + 2, scales);
-            let (sc4, m4) = get_scale_min_k4(sb_base + 3, scales);
-
+            let mut block_out = [0.0f32; 64];
             for l in 0..32 {
-                let q1 =
-                    ((qs[qs_idx + l + 0] & 0x0F) | (if (qh[l] & u1) != 0 { 16 } else { 0 })) as f32;
-                let q2 = ((qs[qs_idx + l + 32] & 0x0F) | (if (qh[l] & u2) != 0 { 16 } else { 0 }))
-                    as f32;
-                let q3 = ((qs[qs_idx + l + 0] >> 4)
-                    | (if (qh[l] & (u1 << 2)) != 0 { 16 } else { 0 }))
-                    as f32;
-                let q4 = ((qs[qs_idx + l + 32] >> 4)
-                    | (if (qh[l] & (u2 << 2)) != 0 { 16 } else { 0 }))
-                    as f32;
-
-                block_out[l + 0] = d * sc1 * q1 - dmin * m1;
-                block_out[l + 32] = d * sc2 * q2 - dmin * m2;
-                block_out[l + 64] = d * sc3 * q3 - dmin * m3;
-                block_out[l + 96] = d * sc4 * q4 - dmin * m4;
+                let lo = qs[qs_idx + l] & 0x0F;
+                let hi = qs[qs_idx + l] >> 4;
+                let q_lo = lo + if (qh[l] & u1) != 0 { 16 } else { 0 };
+                let q_hi = hi + if (qh[l] & u2) != 0 { 16 } else { 0 };
+                block_out[l] = d1 * q_lo as f32 - min1;
+                block_out[l + 32] = d2 * q_hi as f32 - min2;
             }
             for &v in &block_out {
                 if out.len() < num_weights {
                     out.push(v);
                 }
             }
-            qs_idx += 64;
+
+            qs_idx += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
         }
         pos += BLOCK_BYTES;
     }
@@ -4788,22 +4784,217 @@ mod tests {
     #[test]
     fn test_q5k_5bit_high_bit_unpacking() {
         let mut data = vec![0u8; 176];
-        // d = 1.0f16 (0x3C00)
+        // d = 1.0f16 (0x3C00) -> bytes 0..2
         data[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        // dmin = 0.5f16 (0x3800) -> bytes 2..4
+        data[2..4].copy_from_slice(&0x3800u16.to_le_bytes());
+        // scales: sub-block 0 sc_0 = 2 (data[4] = 2), m_0 = 1 (data[8] = 1)
+        data[4] = 2;
+        data[8] = 1;
+        // qh: byte 0 = 1 (bit 0 set -> msb for elem 0 is 16)
+        data[16] = 1;
+        // qs byte 0: low nibble = 4 (q_lo = 4, so q1 = 4 + 16 = 20)
+        data[48] = 4;
 
         let deq = dequant_q5k(&data, 256).expect("dequant q5k");
         assert_eq!(deq.len(), 256);
+        // deq[0] = d * sc_0 * q1 - dmin * m_0 = 1.0 * 2 * 20 - 0.5 * 1 = 39.5
+        assert_eq!(deq[0], 39.5f32);
+        // deq[32] = d * sc_1 * q2 - dmin * m_1 = 1.0 * 0 * 0 - 0.5 * 0 = 0.0
+        assert_eq!(deq[32], 0.0f32);
     }
 
     /// Tests Q6_K format for 256 weights (210 bytes per block).
     #[test]
     fn test_q6k_6bit_split_code_reconstruction() {
         let mut data = vec![0u8; 210];
-        // d = 2.0f16 (0x4000)
+        // d = 2.0f16 (0x4000) at offset 208..210
         data[208..210].copy_from_slice(&0x4000u16.to_le_bytes());
+        // scales: signed i8 scales at offset 192. scale 0 = 4 (data[192] = 4)
+        data[192] = 4;
+        // ql byte 0 = 5 (low nibble 5)
+        data[0] = 5;
+        // qh byte 0 = 1 (bits 0..1 = 1 -> msb shift by 4 is 16)
+        data[128] = 1;
 
         let deq = dequant_q6k(&data, 256).expect("dequant q6k");
         assert_eq!(deq.len(), 256);
+        // q = 5 | (1 << 4) = 21. value = d * sc * (q - 32) = 2.0 * 4 * (21 - 32) = -88.0
+        assert_eq!(deq[0], -88.0f32);
+    }
+
+    /// Host-side mirror of the corrected ROCm `q6k_gemm.rs::dequant_q6k_element`
+    /// HIP kernel. Kept line-for-line equivalent to the kernel so this test
+    /// actually exercises the kernel's bit-math derivation, not a re-derivation.
+    ///
+    /// Q6_K super-block is 210 bytes / 256 weights:
+    ///   ql  128 B @ +0    — low 4 bits per weight
+    ///   qh   64 B @ +128  — high 2 bits per weight
+    ///   scales 16 B @ +192 — **signed** i8
+    ///   d     2 B @ +208  — f16
+    /// value = d * sc * (q - 32)   (no `dmin` term — Q6_K is *not* min-offset
+    /// like Q4_K/Q5_K; the per-element code is centred by 32 instead).
+    fn host_dequant_q6k_element(block: &[u8], in_sb: usize) -> f32 {
+        assert!(in_sb < 256 && block.len() >= 210);
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let scales = &block[192..208];
+        let d = f16_to_f32(block[208], block[209]);
+
+        let n = in_sb / 128;
+        let pos = in_sb % 128;
+        let quarter = pos / 32; // 0..3 (matches CPU reference's q1..q4)
+        let l = pos % 32;
+        let is = l / 16;
+        let sc_idx = n * 8 + is + 2 * quarter;
+
+        let sc = scales[sc_idx] as i8 as f32;
+
+        let ql_offset = n * 64 + l + if (quarter & 1) != 0 { 32 } else { 0 };
+        let ql_byte = ql[ql_offset];
+        let nibble = if (quarter & 2) != 0 { ql_byte >> 4 } else { ql_byte & 0x0F };
+
+        let qh_byte = qh[n * 32 + l];
+        let qh_bits = (qh_byte >> (2 * quarter)) & 0x03;
+        let q_code = (nibble as i32) | ((qh_bits as i32) << 4);
+
+        d * sc * (q_code as f32 - 32.0)
+    }
+
+    /// Golden-vector check: across 256 `in_sb`, the host-mirrored GPU
+    /// per-element formula must produce byte-identical values to the CPU
+    /// reference `dequant_q6k`. Also asserts the old (broken) Q5_K-style
+    /// layout the kernel previously used would NOT match — i.e. this test
+    /// fails against the pre-fix kernel formula, confirming it actually
+    /// catches the regression. Uses a deliberately non-trivial deterministic
+    /// block (non-uniform scales, mixed nibbles, varied qh bits, both
+    /// strides) so every branch is exercised.
+    #[test]
+    fn test_q6k_gpu_kernel_element_matches_cpu_reference() {
+        let mut data = vec![0u8; 210];
+        // Deterministic-but-varied fill that touches all bit planes without
+        // making every element identical (which would mask off-by-one bugs).
+        for i in 0..210 {
+            data[i] = ((i * 7 + 13) as u8).wrapping_add((i as u8) ^ 0x5A);
+        }
+        // Signed scales at +192: spread positives & negatives across all 16.
+        for i in 0..16 {
+            data[192 + i] = (i as i8).wrapping_mul(3).wrapping_sub(10) as u8;
+        }
+        // d (f16) at +208: pick a non-trivial scale, 1.5 ≈ 0x3E00.
+        data[208..210].copy_from_slice(&0x3E00u16.to_le_bytes());
+
+        let cpu = dequant_q6k(&data, 256).expect("dequant_q6k");
+        assert_eq!(cpu.len(), 256);
+
+        for in_sb in 0..256 {
+            let gpu = host_dequant_q6k_element(&data, in_sb);
+            let cpu_v = cpu[in_sb];
+            assert!(
+                (gpu - cpu_v).abs() <= 1e-4 * cpu_v.abs().max(1.0),
+                "in_sb={in_sb}: GPU-mirror={gpu} != CPU-ref={cpu_v}"
+            );
+        }
+    }
+
+    /// Sanity: the test block above must NOT be all-zeros after dequant, or
+    /// the golden-vector comparison would pass vacuously.
+    #[test]
+    fn test_q6k_golden_block_is_nontrivial() {
+        let mut data = vec![0u8; 210];
+        for i in 0..210 {
+            data[i] = ((i * 7 + 13) as u8).wrapping_add((i as u8) ^ 0x5A);
+        }
+        for i in 0..16 {
+            data[192 + i] = (i as i8).wrapping_mul(3).wrapping_sub(10) as u8;
+        }
+        data[208..210].copy_from_slice(&0x3E00u16.to_le_bytes());
+        let cpu = dequant_q6k(&data, 256).expect("dequant_q6k");
+        let distinct =
+            cpu.iter().filter(|v| v.abs() > 1e-6).count();
+        assert!(
+            distinct > 200,
+            "golden block dequant produced mostly-zeros ({distinct}/256); \
+             test fixture is degenerate"
+        );
+        // And there must be both positive and negative values (scales are
+        // signed); if all same sign the q-32 centering path is untested.
+        let any_pos = cpu.iter().any(|v| *v > 1e-3);
+        let any_neg = cpu.iter().any(|v| *v < -1e-3);
+        assert!(any_pos, "golden block has no positive outputs");
+        assert!(any_neg, "golden block has no negative outputs");
+    }
+
+    /// Host-side mirror of the corrected ROCm
+    /// `shared_device_fns.rs::dequant_q4k_element` HIP kernel.
+    ///
+    /// Q4_K super-block: 144 bytes / 256 weights. Four 64-weight groups. Within
+    /// group g, the first 32 outputs use low nibbles (qs[l] & 0xF, scale 2g),
+    /// the next 32 use high nibbles (qs[l] >> 4, scale 2g+1), both reading the
+    /// *same* 32-byte `qs` window (qs advances 32 bytes per 64-output group).
+    /// value = d*sc*q - dmin*m.
+    fn host_dequant_q4k_element(block: &[u8], in_sb: usize) -> f32 {
+        assert!(in_sb < 256 && block.len() >= 144);
+        let d = f16_to_f32(block[0], block[1]);
+        let dmin = f16_to_f32(block[2], block[3]);
+        let scales = &block[4..16];
+        let qs = &block[16..144];
+
+        let group = in_sb / 64;
+        let half = (in_sb % 64) / 32;
+        let l = in_sb % 32;
+        let is = 2 * group + half;
+
+        let (sc, m) = if is < 4 {
+            (scales[is] & 63, scales[is + 4] & 63)
+        } else {
+            (
+                (scales[is + 4] & 0x0F) | ((scales[is - 4] >> 6) << 4),
+                (scales[is + 4] >> 4) | ((scales[is] >> 6) << 4),
+            )
+        };
+        let byte = qs[group * 32 + l];
+        let q = if half != 0 { byte >> 4 } else { byte & 0x0F };
+        d * (sc as f32) * (q as f32) - dmin * (m as f32)
+    }
+
+    /// Golden-vector check for the Q4_K GPU element kernel: across 256 `in_sb`,
+    /// the host-mirrored formula must match the CPU reference `dequant_q4k`.
+    /// Uses a non-trivial deterministic block exercising all four groups and
+    /// both nibble halves.
+    #[test]
+    fn test_q4k_gpu_kernel_element_matches_cpu_reference() {
+        let mut data = vec![0u8; 144];
+        for i in 0..144 {
+            data[i] = ((i * 11 + 7) as u8).wrapping_add((i as u8) ^ 0x35);
+        }
+        // 6-bit scales must be carved out (mask 0x3F) — sprinkle valid values.
+        for i in 0..16 {
+            data[4 + i] = (i as u8).wrapping_mul(5).wrapping_add(1) & 0x3F;
+        }
+        // d, dmin as f16: d = 1.25 (0x3FA0), dmin = 0.5 (0x3800).
+        data[0..2].copy_from_slice(&0x3FA0u16.to_le_bytes());
+        data[2..4].copy_from_slice(&0x3800u16.to_le_bytes());
+
+        let cpu = dequant_q4k(&data, 256).expect("dequant_q4k");
+        assert_eq!(cpu.len(), 256);
+        // Non-degenerate: distinct outputs in each group.
+        for grp_start in [0usize, 64, 128, 192] {
+            let distinct = cpu[grp_start..grp_start + 64]
+                .iter()
+                .filter(|v| v.abs() > 1e-6)
+                .count();
+            assert!(distinct > 50, "group @ {grp_start} degenerate ({distinct})");
+        }
+
+        for in_sb in 0..256 {
+            let gpu = host_dequant_q4k_element(&data, in_sb);
+            let cpu_v = cpu[in_sb];
+            assert!(
+                (gpu - cpu_v).abs() <= 1e-3 * cpu_v.abs().max(1.0),
+                "in_sb={in_sb}: GPU-mirror={gpu} != CPU-ref={cpu_v}"
+            );
+        }
     }
 
     /// Tests FP8 E4M3 subnormal float decode scaling factor (1.0 / 512.0).

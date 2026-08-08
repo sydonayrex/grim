@@ -370,6 +370,56 @@ __device__ const float GRIM_IQ4_NL_CODEBOOK[16] = {
     3.23719119f, 5.50829601f, 10.4162559f, 34.5695092f
 };
 
+extern "C" __global__ void grim_fused_quant_gemm_q4_k(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    float* __restrict__ C,
+    int M, int N, int K
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    int blocks_per_row = K / 256;
+    float sum = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const unsigned char* blk = B_packed + (col * blocks_per_row + b) * 144;
+        const unsigned short* h_ptr = (const unsigned short*)blk;
+        float d    = grim_f16_to_f32(h_ptr[0]);
+        float dmin = grim_f16_to_f32(h_ptr[1]);
+        const unsigned char* scales = blk + 4;
+        const unsigned char* qs     = blk + 16;
+
+        const float* a_ptr = A + row * K + b * 256;
+
+        int qs_idx = 0, is = 0;
+        #pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            float sc1, m1, sc2, m2;
+            grim_get_scale_min_k4(is + 0, scales, &sc1, &m1);
+            grim_get_scale_min_k4(is + 1, scales, &sc2, &m2);
+
+            float d_sc1 = d * sc1, d_m1 = dmin * m1;
+            float d_sc2 = d * sc2, d_m2 = dmin * m2;
+
+            int a_off = n * 64;
+            #pragma unroll
+            for (int l = 0; l < 32; ++l) {
+                float q1 = (float)(qs[qs_idx + l] & 0x0F);
+                float q2 = (float)(qs[qs_idx + l] >> 4);
+
+                sum += a_ptr[a_off + l     ] * (d_sc1 * q1 - d_m1);
+                sum += a_ptr[a_off + l + 32] * (d_sc2 * q2 - d_m2);
+            }
+            qs_idx += 32;
+            is     += 2;
+        }
+    }
+
+    C[row * N + col] = sum;
+}
+
 extern "C" __global__ void grim_fused_quant_gemm_q5_k(
     const float* __restrict__ A,
     const unsigned char* __restrict__ B_packed,
@@ -394,37 +444,32 @@ extern "C" __global__ void grim_fused_quant_gemm_q5_k(
 
         const float* a_ptr = A + row * K + b * 256;
 
-        int qs_idx = 0;
+        // ggml layout: four 64-weight groups; low nibbles of qs[n*32 + l]
+        // (high bit qh[l] & u1, scale 2n) then high nibbles (bit u2, scale 2n+1).
+        int qs_idx = 0, is = 0;
+        unsigned char u1 = 1, u2 = 2;
         #pragma unroll
-        for (int n = 0; n < 2; ++n) {
-            unsigned char u1 = 1u << (2 * n);
-            unsigned char u2 = 1u << (2 * n + 1);
-            int sb_base = n * 4;
-            float sc1, m1, sc2, m2, sc3, m3, sc4, m4;
-            grim_get_scale_min_k4(sb_base + 0, scales, &sc1, &m1);
-            grim_get_scale_min_k4(sb_base + 1, scales, &sc2, &m2);
-            grim_get_scale_min_k4(sb_base + 2, scales, &sc3, &m3);
-            grim_get_scale_min_k4(sb_base + 3, scales, &sc4, &m4);
+        for (int n = 0; n < 4; ++n) {
+            float sc1, m1, sc2, m2;
+            grim_get_scale_min_k4(is + 0, scales, &sc1, &m1);
+            grim_get_scale_min_k4(is + 1, scales, &sc2, &m2);
 
             float d_sc1 = d * sc1, d_m1 = dmin * m1;
             float d_sc2 = d * sc2, d_m2 = dmin * m2;
-            float d_sc3 = d * sc3, d_m3 = dmin * m3;
-            float d_sc4 = d * sc4, d_m4 = dmin * m4;
 
-            int a_off = n * 128;
+            int a_off = n * 64;
             #pragma unroll
             for (int l = 0; l < 32; ++l) {
-                float q1 = (float)((qs[qs_idx + l       ] & 0x0F) | ((qh[l] & u1        ) ? 16 : 0));
-                float q2 = (float)((qs[qs_idx + l + 32  ] & 0x0F) | ((qh[l] & u2        ) ? 16 : 0));
-                float q3 = (float)((qs[qs_idx + l       ] >> 4 )  | ((qh[l] & (u1 << 2)) ? 16 : 0));
-                float q4 = (float)((qs[qs_idx + l + 32  ] >> 4 )  | ((qh[l] & (u2 << 2)) ? 16 : 0));
+                float q1 = (float)((qs[qs_idx + l] & 0x0F) + ((qh[l] & u1) ? 16 : 0));
+                float q2 = (float)((qs[qs_idx + l] >> 4)   + ((qh[l] & u2) ? 16 : 0));
 
-                sum += a_ptr[a_off + l      ] * (d_sc1 * q1 - d_m1);
-                sum += a_ptr[a_off + l + 32 ] * (d_sc2 * q2 - d_m2);
-                sum += a_ptr[a_off + l + 64 ] * (d_sc3 * q3 - d_m3);
-                sum += a_ptr[a_off + l + 96 ] * (d_sc4 * q4 - d_m4);
+                sum += a_ptr[a_off + l     ] * (d_sc1 * q1 - d_m1);
+                sum += a_ptr[a_off + l + 32] * (d_sc2 * q2 - d_m2);
             }
-            qs_idx += 64;
+            qs_idx += 32;
+            is     += 2;
+            u1    <<= 2;
+            u2    <<= 2;
         }
     }
 
@@ -483,6 +528,186 @@ extern "C" __global__ void grim_fused_quant_gemm_q6_k(
     C[row * N + col] = sum;
 }
 
+extern "C" __global__ void grim_fused_quant_gemm_iq4nl(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    float* __restrict__ C,
+    int M, int N, int K
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    int blocks_per_row = K / 256;
+    float sum = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const unsigned char* blk = B_packed + (col * blocks_per_row + b) * 170;
+        float d = grim_f16_to_f32(*((const unsigned short*)blk));
+        const unsigned char* q8 = blk + 2;
+        const unsigned char* q4 = blk + 34;
+        const unsigned char* scales = blk + 162;
+
+        const float* a_ptr = A + row * K + b * 256;
+
+        #pragma unroll
+        for (int ib = 0; ib < 8; ++ib) {
+            unsigned char sc = scales[ib];
+            float scale_val = d * (float)(sc & 0x7F);
+            int a_off = ib * 32;
+            const unsigned char* q4_sub = q4 + ib * 16;
+            const unsigned char* q8_sub = q8 + ib * 4;
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                unsigned char byte_v = q4_sub[i];
+                int nib_lo = byte_v & 0x0F;
+                int nib_hi = byte_v >> 4;
+
+                int sign_lo = (q8_sub[i / 4] >> ((i % 4) * 2)) & 1;
+                int sign_hi = (q8_sub[i / 4] >> ((i % 4) * 2 + 1)) & 1;
+
+                float val_lo = GRIM_IQ4_NL_CODEBOOK[nib_lo];
+                float val_hi = GRIM_IQ4_NL_CODEBOOK[nib_hi];
+                if (sign_lo) val_lo = -val_lo;
+                if (sign_hi) val_hi = -val_hi;
+
+                sum += a_ptr[a_off + i] * (scale_val * val_lo);
+                sum += a_ptr[a_off + i + 16] * (scale_val * val_hi);
+            }
+        }
+    }
+
+    C[row * N + col] = sum;
+}
+
+extern "C" __global__ void grim_fused_quant_gemm_iq4xs(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    float* __restrict__ C,
+    int M, int N, int K
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    int blocks_per_row = K / 256;
+    float sum = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const unsigned char* blk = B_packed + (col * blocks_per_row + b) * 178;
+        float d = grim_f16_to_f32(*((const unsigned short*)blk));
+        const unsigned char* q8 = blk + 2;
+        const unsigned char* q4 = blk + 34;
+        const unsigned char* scales = blk + 162;
+
+        const float* a_ptr = A + row * K + b * 256;
+
+        #pragma unroll
+        for (int ib = 0; ib < 8; ++ib) {
+            unsigned char sc = scales[ib];
+            float scale_val = d * (float)(sc & 0x7F);
+            int a_off = ib * 32;
+            const unsigned char* q4_sub = q4 + ib * 16;
+            const unsigned char* q8_sub = q8 + ib * 4;
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                unsigned char byte_v = q4_sub[i];
+                int nib_lo = byte_v & 0x0F;
+                int nib_hi = byte_v >> 4;
+
+                int sign_lo = (q8_sub[i / 4] >> ((i % 4) * 2)) & 1;
+                int sign_hi = (q8_sub[i / 4] >> ((i % 4) * 2 + 1)) & 1;
+
+                float val_lo = GRIM_IQ4_NL_CODEBOOK[nib_lo];
+                float val_hi = GRIM_IQ4_NL_CODEBOOK[nib_hi];
+                if (sign_lo) val_lo = -val_lo;
+                if (sign_hi) val_hi = -val_hi;
+
+                sum += a_ptr[a_off + i] * (scale_val * val_lo);
+                sum += a_ptr[a_off + i + 16] * (scale_val * val_hi);
+            }
+        }
+    }
+
+    C[row * N + col] = sum;
+}
+
+extern "C" __global__ void grim_fused_quant_gemm_nvfp4(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    float* __restrict__ C,
+    int M, int N, int K
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    int blocks_per_row = K / 16;
+    float sum = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const unsigned char* blk = B_packed + (col * blocks_per_row + b) * 10;
+        const unsigned short* s_ptr = (const unsigned short*)blk;
+        float scale = grim_f16_to_f32(s_ptr[0]);
+        const unsigned char* codes = blk + 2;
+
+        const float* a_ptr = A + row * K + b * 16;
+
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            unsigned char c_byte = codes[i];
+            unsigned char code_lo = c_byte & 0x0F;
+            unsigned char code_hi = c_byte >> 4;
+
+            float w_lo = grim_mxfp4_to_f32(code_lo, 127) * scale;
+            float w_hi = grim_mxfp4_to_f32(code_hi, 127) * scale;
+
+            sum += a_ptr[i * 2] * w_lo;
+            sum += a_ptr[i * 2 + 1] * w_hi;
+        }
+    }
+
+    C[row * N + col] = sum;
+}
+
+extern "C" __global__ void grim_fused_quant_gemm_mxfp4(
+    const float* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    float* __restrict__ C,
+    int M, int N, int K
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    int blocks_per_row = K / 32;
+    float sum = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const unsigned char* blk = B_packed + (col * blocks_per_row + b) * 17;
+        unsigned char shared_exp = blk[0];
+        const unsigned char* codes = blk + 1;
+        const float* a_ptr = A + row * K + b * 32;
+
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            unsigned char c_byte = codes[i];
+            unsigned char code_lo = c_byte & 0x0F;
+            unsigned char code_hi = c_byte >> 4;
+
+            float w_lo = grim_mxfp4_to_f32(code_lo, shared_exp);
+            float w_hi = grim_mxfp4_to_f32(code_hi, shared_exp);
+
+            sum += a_ptr[i * 2] * w_lo;
+            sum += a_ptr[i * 2 + 1] * w_hi;
+        }
+    }
+
+    C[row * N + col] = sum;
+}
+
 // ---- Q5_K (176 B / 256 weights) — bit-accurate vs grim_quant::dequant_q5k ----
 extern "C" __global__ void grim_dequant_q5k(const unsigned char* __restrict__ packed,
                                              float* __restrict__ out, int n_blocks) {
@@ -497,32 +722,29 @@ extern "C" __global__ void grim_dequant_q5k(const unsigned char* __restrict__ pa
     const unsigned char* qs = blk + 48;
     float* o = out + b * 256;
 
-    int qs_idx = 0;
+    // Mirrors ggml dequantize_row_q5_K: four 64-weight groups, each reading
+    // 32 qs bytes (low nibbles then high nibbles) with u1/u2 shifting <<2.
+    int qs_idx = 0, is = 0;
+    unsigned char u1 = 1, u2 = 2;
     #pragma unroll
-    for (int n = 0; n < 2; ++n) {
-        unsigned char u1 = 1u << (2 * n);
-        unsigned char u2 = 1u << (2 * n + 1);
-        int sb_base = n * 4;
-        float sc1, m1, sc2, m2, sc3, m3, sc4, m4;
-        grim_get_scale_min_k4(sb_base + 0, scales, &sc1, &m1);
-        grim_get_scale_min_k4(sb_base + 1, scales, &sc2, &m2);
-        grim_get_scale_min_k4(sb_base + 2, scales, &sc3, &m3);
-        grim_get_scale_min_k4(sb_base + 3, scales, &sc4, &m4);
+    for (int n = 0; n < 4; ++n) {
+        float sc1, m1, sc2, m2;
+        grim_get_scale_min_k4(is + 0, scales, &sc1, &m1);
+        grim_get_scale_min_k4(is + 1, scales, &sc2, &m2);
+        float d1 = d * sc1, min1 = dmin * m1;
+        float d2 = d * sc2, min2 = dmin * m2;
         #pragma unroll
         for (int l = 0; l < 32; ++l) {
-            float q1 = (float)((qs[qs_idx + l       ] & 0x0F) | ((qh[l] & u1        ) ? 16 : 0));
-            float q2 = (float)((qs[qs_idx + l + 32  ] & 0x0F) | ((qh[l] & u2        ) ? 16 : 0));
-            float q3 = (float)((qs[qs_idx + l       ] >> 4 )  | ((qh[l] & (u1 << 2)) ? 16 : 0));
-            float q4 = (float)((qs[qs_idx + l + 32  ] >> 4 )  | ((qh[l] & (u2 << 2)) ? 16 : 0));
-            o[l      ] = d * sc1 * q1 - dmin * m1;
-            o[l + 32 ] = d * sc2 * q2 - dmin * m2;
-            o[l + 64 ] = d * sc3 * q3 - dmin * m3;
-            o[l + 96 ] = d * sc4 * q4 - dmin * m4;
+            float q1 = (float)((qs[qs_idx + l] & 0x0F) + ((qh[l] & u1) ? 16 : 0));
+            float q2 = (float)((qs[qs_idx + l] >> 4) + ((qh[l] & u2) ? 16 : 0));
+            o[l]      = d1 * q1 - min1;
+            o[l + 32] = d2 * q2 - min2;
         }
-        // Advance to the second 128-slot half for the next pass (CPU ref
-        // emits the two block_out arrays sequentially → slots 0..128, 128..256).
-        o       += 128;
-        qs_idx += 64;
+        o      += 64;
+        qs_idx += 32;
+        is     += 2;
+        u1    <<= 2;
+        u2    <<= 2;
     }
 }
 
