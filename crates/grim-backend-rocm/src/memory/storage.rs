@@ -9,7 +9,7 @@ use grim_tensor::error::{Error, Result};
 
 // Re-exports used by the type's field types. The actual type declarations
 use crate::{
-    DType, DTypeStorage, HipMemcpyKind, QuantProvenance, RocmCachingAllocator, Shape, check_hip,
+    DType, DTypeStorage, HipMemcpyKind, QuantProvenance, RocmCachingAllocator, RocmDevice, Shape, check_hip,
     hipMallocManaged, hipMemPrefetchAsync, hipMemcpy, hipSuccess,
 };
 
@@ -58,14 +58,14 @@ impl RocmStorage {
         self.managed
     }
 
-    /// Allocates GPU memory via a caching allocator. Returns the storage on success. [see: `Arc<RocmCachingAllocator>`, `&RocmDevice`]
-    pub fn alloc_gpu(
+    /// Allocates GPU memory via a caching allocator with explicit byte count.
+    pub fn alloc_gpu_with_bytes(
         shape: &Shape,
         dtype: DType,
+        bytes: usize,
         allocator: &Arc<RocmCachingAllocator>,
         ordinal: usize,
     ) -> Result<Self> {
-        let bytes = shape.elem_count() * crate::dtype_byte_size(&dtype);
         if crate::memory::budget::use_managed_allocation(ordinal, bytes) {
             let mut ptr = std::ptr::null_mut();
             check_hip("hipMallocManaged", unsafe {
@@ -85,10 +85,6 @@ impl RocmStorage {
         let dev_ptr_void = match allocator.alloc(bytes) {
             Ok(ptr) => ptr,
             Err(vram_error) => {
-                // The free-memory probe is inherently racy: another stream or
-                // rank may consume VRAM after the policy check. Preserve the
-                // allocation request by falling back to managed memory before
-                // surfacing the original device-allocation failure.
                 let mut ptr = std::ptr::null_mut();
                 if unsafe { hipMallocManaged(&mut ptr, bytes, 1) } == hipSuccess {
                     return Ok(RocmStorage {
@@ -105,7 +101,6 @@ impl RocmStorage {
                 return Err(vram_error);
             }
         };
-
         Ok(RocmStorage {
             device_ptr: Some(dev_ptr_void as u64),
             bytes,
@@ -116,6 +111,17 @@ impl RocmStorage {
             allocator: Arc::clone(allocator),
             managed: false,
         })
+    }
+
+    /// Allocates GPU memory via a caching allocator. Returns the storage on success. [see: `Arc<RocmCachingAllocator>`, `&RocmDevice`]
+    pub fn alloc_gpu(
+        shape: &Shape,
+        dtype: DType,
+        allocator: &Arc<RocmCachingAllocator>,
+        ordinal: usize,
+    ) -> Result<Self> {
+        let bytes = shape.elem_count() * crate::dtype_byte_size(&dtype);
+        Self::alloc_gpu_with_bytes(shape, dtype, bytes, allocator, ordinal)
     }
 
     /// Copies data from host to GPU using the caching allocator + `hipMemcpy`. [see: `alloc_gpu`, `&[f32]`]
@@ -372,14 +378,18 @@ impl BackendStorage for RocmStorage {
                 "RocmStorage has no valid device pointer".into(),
             ));
         }
-
         let dev_ptr_void = self.device_ptr.unwrap() as *mut c_void;
         let elem_count = self.shape.elem_count();
 
-        // Quantized storage (Q8_0, Q4K, …): the device buffer holds packed [see: `_`, `self.bytes`, `Vec<f32>`, `elem_count * 4`]
-        if let DTypeStorage::KQuant(_scheme) = &self.dtype.storage {
+        // Quantized storage (Q8_0, Q4K, …) or FloatPack (FP8): the device buffer holds packed bytes.
+        // We copy the packed bytes DToH and dequantize them on GPU using the RocmDevice launchers
+        // (or fallback to CPU dequant if GPU launch fails/unsupported).
+        if matches!(
+            &self.dtype.storage,
+            DTypeStorage::KQuant(_) | DTypeStorage::FloatPack(_)
+        ) {
             let mut raw = vec![0u8; self.bytes];
-            check_hip("hipMemcpyDtoH (quantized)", unsafe {
+            check_hip("hipMemcpyDtoH (quantized/packed)", unsafe {
                 hipMemcpy(
                     raw.as_mut_ptr() as *mut c_void,
                     dev_ptr_void,
@@ -387,7 +397,20 @@ impl BackendStorage for RocmStorage {
                     HipMemcpyKind::DeviceToHost,
                 )
             })?;
-            return dequant_cpu(&raw, elem_count, &self.dtype);
+
+            let dev = RocmDevice::shared(self.ordinal);
+            let gpu_deq = match self.dtype.storage {
+                DTypeStorage::KQuant(KQuantScheme::Q80) => dev.dequantize_q8_0_host(&raw, elem_count),
+                DTypeStorage::FloatPack(grim_tensor::FloatPackScheme::Fp8) => {
+                    dev.dequantize_fp8_host(&raw, elem_count)
+                }
+                DTypeStorage::KQuant(KQuantScheme::Q4K) => dev.dequantize_q4k_host(&raw, elem_count),
+                _ => dequant_cpu(&raw, elem_count, &self.dtype),
+            };
+
+            let mut values = gpu_deq.or_else(|_| dequant_cpu(&raw, elem_count, &self.dtype))?;
+            values.truncate(elem_count);
+            return Ok(values);
         }
 
         // F16/BF16 storage: the device buffer holds 2-byte elements, but the
@@ -490,15 +513,49 @@ fn dequant_cpu(raw: &[u8], elem_count: usize, dtype: &DType) -> Result<Vec<f32>>
                 let qs = &blk[2..2 + QK8_0];
                 for &q in qs {
                     if out.len() < elem_count {
-                        out.push(d * (q as f32));
+                        out.push(d * (q as i8 as f32));
                     }
                 }
             }
             Ok(out)
         }
+        DTypeStorage::FloatPack(grim_tensor::FloatPackScheme::Fp8) => {
+            if raw.len() < 4 + elem_count {
+                return Err(Error::Backend(format!(
+                    "FP8 dequant: raw buffer {} bytes too small for {} elements",
+                    raw.len(),
+                    elem_count
+                )));
+            }
+            let scale_bits = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            let scale = f32::from_bits(scale_bits);
+            let mut out = Vec::with_capacity(elem_count);
+            for &byte in &raw[4..4 + elem_count] {
+                let f_val = fp8_e4m3_to_f32(byte);
+                out.push(scale * f_val);
+            }
+            Ok(out)
+        }
+        DTypeStorage::KQuant(KQuantScheme::Q4K) => {
+            grim_quant::dequant_q4k(raw, elem_count)
+        }
         _ => Err(Error::Backend(format!(
             "to_cpu_vec_f32: host dequant not yet implemented for {:?}",
             dtype.storage
         ))),
+    }
+}
+
+fn fp8_e4m3_to_f32(byte: u8) -> f32 {
+    if byte == 0x7F || byte == 0xFF {
+        return f32::NAN;
+    }
+    let sign = if (byte & 0x80) != 0 { -1.0f32 } else { 1.0f32 };
+    let exp = (byte >> 3) & 0x0F;
+    let mant = byte & 0x07;
+    if exp == 0 {
+        sign * (mant as f32) * (1.0 / 512.0)
+    } else {
+        sign * ((1 << 3) | mant) as f32 * (2.0f32.powi(exp as i32 - 7 - 3))
     }
 }

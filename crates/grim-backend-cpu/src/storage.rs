@@ -13,6 +13,7 @@ pub struct CpuStorage {
     pub(crate) dtype: DType,
     pub(crate) provenance: QuantProvenance,
     pub(crate) quant_scales: Option<Vec<f32>>,
+    pub(crate) raw_bytes: Option<Arc<Vec<u8>>>,
 }
 
 impl CpuStorage {
@@ -23,6 +24,18 @@ impl CpuStorage {
             dtype,
             provenance: QuantProvenance::GrimNative,
             quant_scales: None,
+            raw_bytes: None,
+        }
+    }
+
+    pub fn from_raw_bytes(bytes: Vec<u8>, shape: Shape, dtype: DType) -> Self {
+        Self {
+            data: Arc::new(Vec::new()),
+            shape,
+            dtype,
+            provenance: QuantProvenance::GrimNative,
+            quant_scales: None,
+            raw_bytes: Some(Arc::new(bytes)),
         }
     }
 
@@ -33,6 +46,7 @@ impl CpuStorage {
             dtype,
             provenance: QuantProvenance::GrimNative,
             quant_scales: None,
+            raw_bytes: None,
         }
     }
 

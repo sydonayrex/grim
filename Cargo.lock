@@ -2079,6 +2079,7 @@ name = "grim-backend-cpu"
 version = "0.1.0"
 dependencies = [
  "grim-format",
+ "grim-quant",
  "grim-tensor",
  "matrixmultiply",
  "tempfile",

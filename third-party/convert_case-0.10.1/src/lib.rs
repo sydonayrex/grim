@@ -300,7 +300,7 @@ pub trait Casing<T: AsRef<str>> {
     /// );
     /// ```
     #[allow(clippy::wrong_self_convention)]
-    fn from_case(&self, case: Case) -> StateConverter<T>;
+    fn from_case(&self, case: Case) -> StateConverter<'_, T>;
 
     /// Creates a `StateConverter` struct initialized with the boundaries provided.
     /// ```
@@ -313,7 +313,7 @@ pub trait Casing<T: AsRef<str>> {
     ///         .to_case(Case::Snake)
     /// );
     /// ```
-    fn set_boundaries(&self, bs: &[Boundary]) -> StateConverter<T>;
+    fn set_boundaries(&self, bs: &[Boundary]) -> StateConverter<'_, T>;
 
     /// Creates a `StateConverter` struct initialized without the boundaries
     /// provided.
@@ -327,7 +327,7 @@ pub trait Casing<T: AsRef<str>> {
     ///         .to_case(Case::Snake)
     /// );
     /// ```
-    fn remove_boundaries(&self, bs: &[Boundary]) -> StateConverter<T>;
+    fn remove_boundaries(&self, bs: &[Boundary]) -> StateConverter<'_, T>;
 
     /// Determines if `self` is of the given case.  This is done simply by applying
     /// the conversion and seeing if the result is the same.
@@ -348,15 +348,15 @@ impl<T: AsRef<str>> Casing<T> for T {
         StateConverter::new(self).to_case(case)
     }
 
-    fn set_boundaries(&self, bs: &[Boundary]) -> StateConverter<T> {
+    fn set_boundaries(&self, bs: &[Boundary]) -> StateConverter<'_, T> {
         StateConverter::new(self).set_boundaries(bs)
     }
 
-    fn remove_boundaries(&self, bs: &[Boundary]) -> StateConverter<T> {
+    fn remove_boundaries(&self, bs: &[Boundary]) -> StateConverter<'_, T> {
         StateConverter::new(self).remove_boundaries(bs)
     }
 
-    fn from_case(&self, case: Case) -> StateConverter<T> {
+    fn from_case(&self, case: Case) -> StateConverter<'_, T> {
         StateConverter::new(self).from_case(case)
     }
 

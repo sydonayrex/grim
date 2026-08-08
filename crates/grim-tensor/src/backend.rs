@@ -290,6 +290,41 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
+    /// Allocate an uninitialized storage of the given shape on this backend.
+    ///
+    /// Used to pre-allocate the device-resident KV cache arena so decode
+    /// steps can append new rows with `copy_slice_into` instead of
+    /// re-uploading the whole cache through host memory. Contents are
+    /// undefined until written.
+    fn alloc_storage(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let _ = (shape, dtype);
+        Err(crate::error::Error::Unimplemented(
+            "alloc_storage not implemented for this backend".into(),
+        ))
+    }
+
+    /// Device-to-device copy of `count` contiguous F32 elements from `src`
+    /// into `dst` starting at flat element `dst_elem_offset`.
+    ///
+    /// Powers the zero-roundtrip KV cache: only the newly produced K/V rows
+    /// are copied into the device-resident cache arena; the host never sees
+    /// the cache contents.
+    fn copy_slice_into(
+        &self,
+        _dst: &dyn BackendStorage,
+        _src: &dyn BackendStorage,
+        _dst_elem_offset: usize,
+        _count: usize,
+    ) -> Result<()> {
+        Err(crate::error::Error::Unimplemented(
+            "copy_slice_into not implemented for this backend".into(),
+        ))
+    }
+
     /// Provide hints about memory usage/advice patterns to the device/system.
     /// Maps to OS-level `madvise` or backend-specific APIs like `hipMemAdvise`.
     fn advise(&self, storage: &dyn BackendStorage, advice: MemAdvice) -> Result<()>;
@@ -841,6 +876,479 @@ pub trait BackendDevice: Send + Sync {
         Err(crate::error::Error::Unimplemented(
             "fused_quant_gemm not implemented for this backend".into(),
         ))
+    }
+}
+
+/// Blanket `BackendDevice` impl for `Arc<T>`.
+///
+/// Backends construct an `Arc`-shared singleton per ordinal (e.g.
+/// `RocmDevice::shared`) and hand out cheap `Arc` clones through the
+/// `Box<dyn BackendDevice>` API. Without this impl, dropping the temporary
+/// `Box` would run the backend's full destructor per call — on ROCm that
+/// means a device-wide `hipDeviceSynchronize`, a cache flush, and HIP module
+/// unloads on *every* primitive dispatch (the per-op CPU spin/hang). With
+/// `Arc`, dropping the box only decrements the refcount and the singleton
+/// survives. Every method forwards to the inner device so backend-specific
+/// overrides are reached through dynamic dispatch.
+impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
+    fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
+        (**self).zeros(shape, dtype)
+    }
+
+    fn matmul(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).matmul(a, b, out)
+    }
+
+    fn matmul_with_solution(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &Shape,
+        solution_index: i32,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).matmul_with_solution(a, b, out, solution_index)
+    }
+
+    fn add(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).add(a, b, out)
+    }
+
+    fn mul(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).mul(a, b, out)
+    }
+
+    fn mul_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).mul_scalar(x, scalar, out_shape)
+    }
+
+    fn sqrt(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).sqrt(x, out_shape)
+    }
+
+    fn recip(
+        &self,
+        x: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).recip(x, out_shape)
+    }
+
+    fn silu_mul(
+        &self,
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).silu_mul(gate, up, out)
+    }
+
+    fn silu_mul_backward(
+        &self,
+        e: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        dw: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        (**self).silu_mul_backward(e, g, dw, out_shape)
+    }
+
+    fn rms_norm(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        eps: f32,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).rms_norm(x, weight, eps, out)
+    }
+
+    fn rms_norm_inplace(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        eps: f32,
+        out: &Shape,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        (**self).rms_norm_inplace(x, weight, eps, out)
+    }
+
+    fn softmax(
+        &self,
+        x: &dyn BackendStorage,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).softmax(x, out)
+    }
+
+    fn embedding(
+        &self,
+        weight: &dyn BackendStorage,
+        indices: &[u32],
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).embedding(weight, indices, out)
+    }
+
+    fn from_cpu(
+        &self,
+        data: &[f32],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        (**self).from_cpu(data, shape, dtype)
+    }
+
+    fn from_cpu_bytes(
+        &self,
+        data: &[u8],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        (**self).from_cpu_bytes(data, shape, dtype)
+    }
+
+    fn alloc_storage(
+        &self,
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        (**self).alloc_storage(shape, dtype)
+    }
+
+    fn copy_slice_into(
+        &self,
+        dst: &dyn BackendStorage,
+        src: &dyn BackendStorage,
+        dst_elem_offset: usize,
+        count: usize,
+    ) -> Result<()> {
+        (**self).copy_slice_into(dst, src, dst_elem_offset, count)
+    }
+
+    fn advise(&self, storage: &dyn BackendStorage, advice: MemAdvice) -> Result<()> {
+        (**self).advise(storage, advice)
+    }
+
+    fn kv_dequant_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k_tensor: &dyn BackendStorage,
+        k_scales: &dyn BackendStorage,
+        v_tensor: &dyn BackendStorage,
+        v_scales: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        quant_bits: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).kv_dequant_attention(
+            q,
+            k_tensor,
+            k_scales,
+            v_tensor,
+            v_scales,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            quant_bits,
+            out_shape,
+        )
+    }
+
+    fn rope(
+        &self,
+        x: &dyn BackendStorage,
+        positions: &[u32],
+        dim: usize,
+        base: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).rope(x, positions, dim, base, out_shape)
+    }
+
+    fn qkv_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+        out_max: Option<&dyn BackendStorage>,
+        out_sum: Option<&dyn BackendStorage>,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).qkv_attention(
+            q,
+            k,
+            v,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            out_shape,
+            out_max,
+            out_sum,
+        )
+    }
+
+    fn qkv_attention_paged(
+        &self,
+        q: &dyn BackendStorage,
+        block_tables: &dyn BackendStorage,
+        k_pages: &dyn BackendStorage,
+        v_pages: &dyn BackendStorage,
+        num_kv_heads: usize,
+        max_blocks: usize,
+        page_size: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).qkv_attention_paged(
+            q,
+            block_tables,
+            k_pages,
+            v_pages,
+            num_kv_heads,
+            max_blocks,
+            page_size,
+            kv_seq_len,
+            cache_offset,
+            out_shape,
+        )
+    }
+
+    fn tree_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        tree_parents: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).tree_attention(
+            q,
+            k,
+            v,
+            tree_parents,
+            num_kv_heads,
+            kv_seq_len,
+            cache_offset,
+            out_shape,
+        )
+    }
+
+    fn begin_graph_capture(&self, key: &str) -> Result<()> {
+        (**self).begin_graph_capture(key)
+    }
+
+    fn end_graph_capture(&self, key: &str) -> Result<()> {
+        (**self).end_graph_capture(key)
+    }
+
+    fn replay_graph(&self, key: &str) -> Result<bool> {
+        (**self).replay_graph(key)
+    }
+
+    fn has_captured_graph(&self, key: &str) -> bool {
+        (**self).has_captured_graph(key)
+    }
+
+    fn all_reduce(
+        &self,
+        inputs: &[&dyn BackendStorage],
+        op: &str,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).all_reduce(inputs, op)
+    }
+
+    fn comm_fuse_reduce(
+        &self,
+        partials: &[(&dyn BackendStorage, &ScythePlacement)],
+    ) -> Result<Box<dyn BackendStorage>> {
+        (**self).comm_fuse_reduce(partials)
+    }
+
+    fn estimate_gemm_latency_ms(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        dtype: DType,
+        placement: &ScythePlacement,
+    ) -> f64 {
+        (**self).estimate_gemm_latency_ms(m, n, k, dtype, placement)
+    }
+
+    fn selective_scan(
+        &self,
+        x: &dyn BackendStorage,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        c: &dyn BackendStorage,
+        d: &dyn BackendStorage,
+        batch: usize,
+        dim_dstate: usize,
+        dim_dinner: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).selective_scan(
+            x, a, b, c, d, batch, dim_dstate, dim_dinner, seq_len, out_shape,
+        )
+    }
+
+    fn flash_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        causal: bool,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).flash_attention(
+            q, k, v, num_heads, num_kv_heads, head_dim, seq_len, causal, out_shape,
+        )
+    }
+
+    fn cross_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        kv_seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).cross_attention(q, k, v, num_heads, head_dim, seq_len, kv_seq_len, out_shape)
+    }
+
+    fn rwkv_time_mix(
+        &self,
+        x: &dyn BackendStorage,
+        w: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).rwkv_time_mix(x, w, k, v, g, batch, dim, seq_len, out_shape)
+    }
+
+    fn rwkv_channel_mix(
+        &self,
+        x: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        r: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        batch: usize,
+        dim: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).rwkv_channel_mix(x, k, r, v, batch, dim, out_shape)
+    }
+
+    fn lora_accumulate(
+        &self,
+        base: &dyn BackendStorage,
+        x: &dyn BackendStorage,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        scale: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).lora_accumulate(base, x, a, b, scale, out_shape)
+    }
+
+    fn quantized_matmul(
+        &self,
+        a: &dyn BackendStorage,
+        b_packed: &dyn BackendStorage,
+        b_scales: &[f32],
+        format: QuantFormat,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).quantized_matmul(a, b_packed, b_scales, format, out_shape)
+    }
+
+    fn quantized_matmul_backward_dx(
+        &self,
+        dy: &dyn BackendStorage,
+        b_packed: &dyn BackendStorage,
+        b_scales: &[f32],
+        default_bpw: u8,
+        m: usize,
+        n: usize,
+        k: usize,
+        out_shape: &Shape,
+        residuals: Option<&QuantizedMatmulBackwardResiduals>,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).quantized_matmul_backward_dx(
+            dy,
+            b_packed,
+            b_scales,
+            default_bpw,
+            m,
+            n,
+            k,
+            out_shape,
+            residuals,
+        )
+    }
+
+    fn quantize(&self, x: &dyn BackendStorage, format: QuantFormat) -> Result<Box<dyn BackendStorage>> {
+        (**self).quantize(x, format)
+    }
+
+    fn fused_quant_gemm(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        format: QuantFormat,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).fused_quant_gemm(a, b, format, out_shape)
     }
 }
 

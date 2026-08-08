@@ -17,6 +17,63 @@ pub trait Sampler: Send + Sync {
     fn name(&self) -> &str;
 }
 
+/// Model thinking / reasoning effort level control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingLevel {
+    /// Explicitly disable reasoning/thinking tokens (e.g. `reasoning_effort: "none"` or `0`).
+    Off,
+    /// Default model thinking mode (enabled for models supporting on/off toggle).
+    #[default]
+    Default,
+    /// Low reasoning effort (e.g. `reasoning_effort: "low"` / ~1024 token thinking budget).
+    Low,
+    /// Medium reasoning effort (e.g. `reasoning_effort: "medium"` / ~4096 token thinking budget).
+    Medium,
+    /// High reasoning effort (e.g. `reasoning_effort: "high"` / ~16384 token thinking budget).
+    High,
+    /// Custom extended effort level above high (e.g. `reasoning_effort: "max"`, `"ultra"`, or explicit max token budget).
+    Custom(u32),
+}
+
+impl ThinkingLevel {
+    /// Parse from string (e.g. "off", "none", "0", "default", "on", "low", "medium", "high", "max", "ultra").
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "off" | "none" | "0" | "false" | "disabled" => ThinkingLevel::Off,
+            "default" | "on" | "true" | "enabled" | "auto" => ThinkingLevel::Default,
+            "low" | "minimal" => ThinkingLevel::Low,
+            "medium" | "med" | "moderate" => ThinkingLevel::Medium,
+            "high" | "max" => ThinkingLevel::High,
+            other => {
+                if let Ok(budget) = other.parse::<u32>() {
+                    match budget {
+                        0 => ThinkingLevel::Off,
+                        1..=2048 => ThinkingLevel::Low,
+                        2049..=8192 => ThinkingLevel::Medium,
+                        8193..=32768 => ThinkingLevel::High,
+                        custom => ThinkingLevel::Custom(custom),
+                    }
+                } else {
+                    // For custom named levels above high (e.g. "ultra", "extreme")
+                    ThinkingLevel::Custom(65536)
+                }
+            }
+        }
+    }
+
+    /// Returns the recommended thinking token budget (maximum reasoning tokens).
+    pub fn max_thinking_tokens(&self) -> Option<u32> {
+        match self {
+            ThinkingLevel::Off => Some(0),
+            ThinkingLevel::Default => None,
+            ThinkingLevel::Low => Some(1024),
+            ThinkingLevel::Medium => Some(4096),
+            ThinkingLevel::High => Some(16384),
+            ThinkingLevel::Custom(budget) => Some(*budget),
+        }
+    }
+}
+
 /// Sampling parameters parsed from an OpenAI/Ollama request.
 ///
 /// `temperature == 0.0` is the canonical "greedy / deterministic" signal and
@@ -32,6 +89,8 @@ pub struct SamplingParams {
     /// present in `history` are divided by this value before temperature scaling.
     /// 1.0 = disabled. Ollama default is 1.10; grim CLI default is 1.10 to match.
     pub repeat_penalty: f32,
+    /// Controls model reasoning / thinking effort (Off, Default, Low, Medium, High, Custom).
+    pub thinking_level: ThinkingLevel,
 }
 
 impl Default for SamplingParams {
@@ -43,6 +102,7 @@ impl Default for SamplingParams {
             top_p: 1.0,
             top_k: 0,
             repeat_penalty: 1.0,
+            thinking_level: ThinkingLevel::Default,
         }
     }
 }
@@ -396,8 +456,34 @@ mod tests {
             top_p: 0.9,
             top_k: 40,
             repeat_penalty: 1.0,
+            thinking_level: ThinkingLevel::Default,
         }
         .into_sampler(42);
         assert_eq!(sampler.name(), "greedy");
+    }
+
+    #[test]
+    fn test_thinking_level_parsing_and_token_budget() {
+        assert_eq!(ThinkingLevel::parse("off"), ThinkingLevel::Off);
+        assert_eq!(ThinkingLevel::parse("0"), ThinkingLevel::Off);
+        assert_eq!(ThinkingLevel::parse("none"), ThinkingLevel::Off);
+
+        assert_eq!(ThinkingLevel::parse("default"), ThinkingLevel::Default);
+        assert_eq!(ThinkingLevel::parse("on"), ThinkingLevel::Default);
+
+        assert_eq!(ThinkingLevel::parse("low"), ThinkingLevel::Low);
+        assert_eq!(ThinkingLevel::parse("medium"), ThinkingLevel::Medium);
+        assert_eq!(ThinkingLevel::parse("high"), ThinkingLevel::High);
+
+        // Custom levels above high or numeric budgets
+        assert_eq!(ThinkingLevel::parse("50000"), ThinkingLevel::Custom(50000));
+        assert_eq!(ThinkingLevel::parse("ultra"), ThinkingLevel::Custom(65536));
+
+        assert_eq!(ThinkingLevel::Off.max_thinking_tokens(), Some(0));
+        assert_eq!(ThinkingLevel::Default.max_thinking_tokens(), None);
+        assert_eq!(ThinkingLevel::Low.max_thinking_tokens(), Some(1024));
+        assert_eq!(ThinkingLevel::Medium.max_thinking_tokens(), Some(4096));
+        assert_eq!(ThinkingLevel::High.max_thinking_tokens(), Some(16384));
+        assert_eq!(ThinkingLevel::Custom(50000).max_thinking_tokens(), Some(50000));
     }
 }

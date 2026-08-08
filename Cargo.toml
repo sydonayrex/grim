@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["third-party/convert_case-0.10.1"]
 members = [
     "crates/grim-tensor",
     "crates/grim-tensor-graph",

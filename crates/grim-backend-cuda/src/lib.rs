@@ -51,6 +51,7 @@ unsafe extern "C" {
     fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
 
     fn cublasCreate_v2(handle: *mut *mut c_void) -> i32;
+    fn cublasDestroy_v2(handle: *mut c_void) -> i32;
     fn cublasSgemm_v2(
         handle: *mut c_void,
         transa: i32,
@@ -626,7 +627,7 @@ impl BackendStorage for CudaStorage {
 /// the handle between threads is safe because the underlying driver
 /// state is not thread-local — only concurrent *use* requires
 /// synchronization, which the `Mutex` provides.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct CublasHandle(pub *mut c_void);
 // SAFETY: `CublasHandle` wraps a raw CUDA driver handle. `Send` is safe because
 // the handle is bound to a specific CUDA context on one device, and the driver
@@ -634,6 +635,27 @@ pub struct CublasHandle(pub *mut c_void);
 // cuBLAS API serializes concurrent calls through its internal stream/context lock.
 unsafe impl Send for CublasHandle {}
 unsafe impl Sync for CublasHandle {}
+
+impl Drop for CublasHandle {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is a valid cuBLAS handle created via `cublasCreate_v2`.
+        // It is destroyed exactly once, when the last `CudaDevice` clone sharing
+        // this `Arc<Mutex<Option<CublasHandle>>>` is dropped. Previously the handle
+        // was leaked (one cuBLAS handle per `CudaDevice::new`, which also allocates
+        // GPU-side workspace), exhausting VRAM while loading quantized GGUF weights.
+        if !self.0.is_null() {
+            unsafe {
+                let _ = cublasDestroy_v2(self.0);
+            }
+        }
+    }
+}
+
+/// Lazily-initialized pool of one `CudaDevice` per ordinal, so every caller —
+/// in particular `to_cpu_vec_f32` on quantized weights — reuses a single cuBLAS
+/// handle per GPU instead of creating (and leaking) one per tensor.
+static DEVICE_POOL: LazyLock<Mutex<HashMap<usize, CudaDevice>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// CUDA device handle.
 #[derive(Debug, Clone)]
@@ -650,8 +672,13 @@ unsafe impl Send for CudaDevice {}
 unsafe impl Sync for CudaDevice {}
 
 impl CudaDevice {
-    /// Creates a device reference for the given ordinal; returns Err if cuBLAS init fails.
+    /// Returns a `CudaDevice` for the given ordinal, reusing a single pooled
+    /// device (and its cuBLAS handle) per ordinal.
     pub fn new(ordinal: usize) -> Result<Self> {
+        let mut pool = DEVICE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(dev) = pool.get(&ordinal) {
+            return Ok(dev.clone());
+        }
         unsafe {
             cudaSetDevice(ordinal as i32);
         }
@@ -663,10 +690,12 @@ impl CudaDevice {
                 None
             }
         };
-        Ok(Self {
+        let dev = Self {
             ordinal,
             cublas_handle: Arc::new(Mutex::new(cublas_handle)),
-        })
+        };
+        pool.insert(ordinal, dev.clone());
+        Ok(dev)
     }
 
     /// Probes for available CUDA GPUs and returns a device per instance.
@@ -695,27 +724,26 @@ impl CudaDevice {
         Ok(vec![])
     }
 
-    /// Returns the cuBLAS handle for this device, lazily initializing if needed.
-    pub fn get_cublas_handle(&self) -> Result<CublasHandle> {
+    /// Returns the raw cuBLAS handle pointer for this device, lazily initializing if needed.
+    /// The caller must not free the handle — it is owned by the pooled `CudaDevice`.
+    pub fn get_cublas_handle(&self) -> Result<*mut c_void> {
         let mut handle = self.cublas_handle.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(h) = *handle {
-            Ok(h)
+        if let Some(h) = handle.as_ref() {
+            return Ok(h.0);
+        }
+        let mut handle_ptr: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            cudaSetDevice(self.ordinal as i32);
+        }
+        let res = unsafe { cublasCreate_v2(&mut handle_ptr) };
+        if res == CUBLAS_STATUS_SUCCESS {
+            *handle = Some(CublasHandle(handle_ptr));
+            Ok(handle_ptr)
         } else {
-            let mut handle_ptr: *mut c_void = std::ptr::null_mut();
-            unsafe {
-                cudaSetDevice(self.ordinal as i32);
-            }
-            let res = unsafe { cublasCreate_v2(&mut handle_ptr) };
-            if res == CUBLAS_STATUS_SUCCESS {
-                let h = CublasHandle(handle_ptr);
-                *handle = Some(h);
-                Ok(h)
-            } else {
-                Err(Error::Backend(format!(
-                    "cublasCreate failed with status {}",
-                    res
-                )))
-            }
+            Err(Error::Backend(format!(
+                "cublasCreate failed with status {}",
+                res
+            )))
         }
     }
 
@@ -1666,6 +1694,15 @@ impl BackendDevice for CudaDevice {
         }
         let out_storage = CudaStorage::alloc_gpu(out_shape, dtype_out, self.ordinal)?;
 
+        // cuBLAS validates that A/B/C pointers belong to the *currently active*
+        // CUDA context on the calling thread. Under async/tokio inference the
+        // matmul may run on a thread that never called cudaSetDevice for this
+        // ordinal, leaving the pooled handle's context non-current and making
+        // valid pointers look foreign (cublasSgemm_v2 status 7, "illegal
+        // parameter 8"). Re-bind the context unconditionally.
+        unsafe {
+            let _ = cudaSetDevice(self.ordinal as i32);
+        }
         let handle = self.get_cublas_handle()?;
         let alpha = 1.0f32;
         let beta = 0.0f32;
@@ -1688,7 +1725,7 @@ impl BackendDevice for CudaDevice {
         // Result C_col(N,M) with ldc=N, read row-major as C_row(M,N).
         unsafe {
             let status = cublasSgemm_v2(
-                handle.0,
+                handle,
                 CUBLAS_OP_N,
                 CUBLAS_OP_N,
                 n as i32, // m_cublas = rows of op(A_c) = N
@@ -2887,7 +2924,7 @@ impl BackendDevice for CudaDevice {
         // leading dims are the row counts of the column-major views, all >= 1.
         unsafe {
             let status = cublasSgemm_v2(
-                handle.0,
+                handle,
                 CUBLAS_OP_N,
                 CUBLAS_OP_N,
                 k as i32, // m_cublas = rows of B_col = K
@@ -2956,11 +2993,16 @@ impl BackendDevice for CudaDevice {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let kernel_name = match format {
             grim_tensor::QuantFormat::Q8_0 => "grim_fused_quant_gemm_q8_0",
+            grim_tensor::QuantFormat::Q4K => "grim_fused_quant_gemm_q4_k",
             grim_tensor::QuantFormat::Q5K => "grim_fused_quant_gemm_q5_k",
             grim_tensor::QuantFormat::Q6K => "grim_fused_quant_gemm_q6_k",
+            grim_tensor::QuantFormat::Iq4Nl => "grim_fused_quant_gemm_iq4nl",
+            grim_tensor::QuantFormat::Iq4Xs => "grim_fused_quant_gemm_iq4xs",
+            grim_tensor::QuantFormat::Fp4 => "grim_fused_quant_gemm_mxfp4",
+            grim_tensor::QuantFormat::Fp4Block16 => "grim_fused_quant_gemm_nvfp4",
             grim_tensor::QuantFormat::Fp8 => "grim_fused_quant_gemm_fp8",
             other => {
-                return Err(Error::Backend(format!(
+                return Err(Error::Unimplemented(format!(
                     "fused_quant_gemm: no GPU kernel for format {other:?}"
                 )));
             }
@@ -3708,6 +3750,29 @@ mod tests {
     }
 
     #[test]
+    fn test_cuda_dequant_q4k_gpu_matches_cpu() {
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
+        let n = 512;
+        let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).sin() * 0.5).collect();
+        let packed = grim_quant::quant_q4k(&src).expect("quant_q4k");
+        let expected = grim_quant::dequant_q4k(&packed, n).expect("cpu oracle q4k");
+        let shape = Shape::new(vec![n]);
+        let storage = upload_packed(
+            &dev,
+            &packed,
+            &shape,
+            DTypeStorage::KQuant(KQuantScheme::Q4K),
+        );
+        let out = dev
+            .dequantize_on_device(as_cuda_storage(storage.as_ref()))
+            .expect("gpu dequant q4k");
+        let actual = out.to_cpu_vec_f32().expect("readback q4k");
+        assert_dequant_close("q4k", &actual, &expected);
+    }
+
+    #[test]
     fn test_cuda_dequant_q6k_gpu_matches_cpu() {
         let Some(dev) = dequant_test_device() else {
             return;
@@ -3728,6 +3793,265 @@ mod tests {
             .expect("gpu dequant q6k");
         let actual = out.to_cpu_vec_f32().expect("readback q6k");
         assert_dequant_close("q6k", &actual, &expected);
+    }
+
+    #[test]
+    fn test_cuda_fused_quant_gemm_q4k_matches_cpu() {
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
+        // K must be a multiple of 256 for the Q quantized GEMM block layout.
+        let m = 4u32;
+        let k = 512u32;
+        let n = 256u32;
+
+        let a_src: Vec<f32> = (0..(m * k)).map(|i| (i as f32 * 0.03).sin()).collect();
+        let b_src: Vec<f32> = (0..(k as usize * n as usize))
+            .map(|i| (i as f32 * 0.017).cos())
+            .collect();
+
+        let a_shape = Shape::new(vec![m as usize, k as usize]);
+        let b_shape = Shape::new(vec![n as usize, k as usize]); // [N, K] packed layout
+        let a_storage = dev.from_cpu(&a_src, &a_shape, DType::F32).expect("a from_cpu");
+        let a_cuda = as_cuda_storage(a_storage.as_ref());
+
+        let packed = grim_quant::quant_q4k(&b_src).expect("quant_q4k");
+        let b_storage = upload_packed(
+            &dev,
+            &packed,
+            &b_shape,
+            DTypeStorage::KQuant(KQuantScheme::Q4K),
+        );
+        let b_cuda = as_cuda_storage(b_storage.as_ref());
+
+        let out_shape = Shape::new(vec![m as usize, n as usize]);
+        let (fused_out, h) = dev
+            .fused_quant_gemm(a_cuda, b_cuda, grim_tensor::QuantFormat::Q4K, &out_shape)
+            .expect("fused_quant_gemm q4k");
+        h.synchronize().expect("sync");
+        let actual = fused_out.to_cpu_vec_f32().expect("readback");
+
+        // Reference: A @ B^T where B is dequantized [N, K] then transposed.
+        let b_deq = grim_quant::dequant_q4k(&packed, (k * n) as usize).expect("cpu dequant q4k");
+        let mut expected = vec![0.0f32; (m * n) as usize];
+        for i in 0..m as usize {
+            for j in 0..n as usize {
+                let mut s = 0.0f32;
+                for t in 0..k as usize {
+                    s += a_src[i * k as usize + t] * b_deq[j * k as usize + t];
+                }
+                expected[i * n as usize + j] = s;
+            }
+        }
+
+        let mut max_err = 0.0f32;
+        for i in 0..expected.len() {
+            let e = (actual[i] - expected[i]).abs();
+            let denom = expected[i].abs().max(1.0);
+            max_err = max_err.max(e / denom);
+        }
+        assert!(
+            max_err < 0.05,
+            "fused q4k GEMM mismatch: max_rel_err={max_err}"
+        );
+    }
+
+    #[test]
+    fn test_cuda_fused_quant_gemm_q6k_matches_cpu() {
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
+        // K must be a multiple of 256 for the Q quantized GEMM block layout.
+        let m = 4u32;
+        let k = 512u32;
+        let n = 256u32;
+
+        let a_src: Vec<f32> = (0..(m * k)).map(|i| (i as f32 * 0.03).sin()).collect();
+        let b_src: Vec<f32> = (0..(k as usize * n as usize))
+            .map(|i| (i as f32 * 0.017).cos())
+            .collect();
+
+        let a_shape = Shape::new(vec![m as usize, k as usize]);
+        let b_shape = Shape::new(vec![n as usize, k as usize]); // [N, K] packed layout
+        let a_storage = dev.from_cpu(&a_src, &a_shape, DType::F32).expect("a from_cpu");
+        let a_cuda = as_cuda_storage(a_storage.as_ref());
+
+        let packed = grim_quant::quant_q6k(&b_src).expect("quant_q6k");
+        let b_storage = upload_packed(
+            &dev,
+            &packed,
+            &b_shape,
+            DTypeStorage::KQuant(KQuantScheme::Q6K),
+        );
+        let b_cuda = as_cuda_storage(b_storage.as_ref());
+
+        let out_shape = Shape::new(vec![m as usize, n as usize]);
+        let (fused_out, h) = dev
+            .fused_quant_gemm(a_cuda, b_cuda, grim_tensor::QuantFormat::Q6K, &out_shape)
+            .expect("fused_quant_gemm q6k");
+        h.synchronize().expect("sync");
+        let actual = fused_out.to_cpu_vec_f32().expect("readback");
+
+        let b_deq = grim_quant::dequant_q6k(&packed, (k * n) as usize).expect("cpu dequant q6k");
+        let mut expected = vec![0.0f32; (m * n) as usize];
+        for i in 0..m as usize {
+            for j in 0..n as usize {
+                let mut s = 0.0f32;
+                for t in 0..k as usize {
+                    s += a_src[i * k as usize + t] * b_deq[j * k as usize + t];
+                }
+                expected[i * n as usize + j] = s;
+            }
+        }
+
+        let mut max_err = 0.0f32;
+        for i in 0..expected.len() {
+            let e = (actual[i] - expected[i]).abs();
+            let denom = expected[i].abs().max(1.0);
+            max_err = max_err.max(e / denom);
+        }
+        assert!(max_err < 0.05, "fused q6k GEMM mismatch: max_rel_err={max_err}");
+    }
+
+    #[test]
+    fn test_cuda_fused_quant_gemm_real_model_q4k_q6k() {
+        // Definitive check: run the actual CUDA fused GEMM kernels against
+        // REAL Q4_K / Q6_K tensors extracted from the on-disk Q4_K_M model,
+        // comparing to grim_quant::dequant_*k + a CPU A@B^T reference.
+        let Some(dev) = dequant_test_device() else {
+            return;
+        };
+        use grim_format::gguf::{read_gguf, read_tensor_bytes, GgufDType};
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .find(|p| p.join("models").is_dir())
+            .expect("repo root with models/")
+            .to_path_buf();
+        let path = repo_root.join("models/MiniCPM5-1B-Q4_K_M.gguf");
+        let Ok(f) = std::fs::File::open(&path) else {
+            eprintln!("skip: model not present");
+            return;
+        };
+        let mut reader = std::io::BufReader::new(f);
+        let file = read_gguf(&mut reader).expect("read_gguf");
+
+        let mut run_one = |dtype_want: GgufDType, name: &str| {
+            let target = file
+                .tensors
+                .iter()
+                .find(|t| t.dtype == dtype_want && t.name == name)
+                .expect("target tensor");
+            let bytes = read_tensor_bytes(&mut reader, &file, target).expect("read tensor");
+            let dims = &target.dims;
+            let (n, k) = (dims[0] as u32, dims[1] as u32);
+            let m = 8u32;
+            let a_src: Vec<f32> = (0..(m * k)).map(|i| (i as f32 * 0.013).sin()).collect();
+            let a_shape = Shape::new(vec![m as usize, k as usize]);
+            let a_storage = dev.from_cpu(&a_src, &a_shape, DType::F32).expect("a from_cpu");
+            let a_cuda = as_cuda_storage(a_storage.as_ref());
+            let b_shape = Shape::new(vec![n as usize, k as usize]);
+            let b_storage = upload_packed(
+                &dev,
+                &bytes,
+                &b_shape,
+                DTypeStorage::KQuant(match dtype_want {
+                    GgufDType::Q4K => KQuantScheme::Q4K,
+                    GgufDType::Q6K => KQuantScheme::Q6K,
+                    _ => panic!("unexpected dtype"),
+                }),
+            );
+            let b_cuda = as_cuda_storage(b_storage.as_ref());
+            let out_shape = Shape::new(vec![m as usize, n as usize]);
+            let fmt = match dtype_want {
+                GgufDType::Q4K => grim_tensor::QuantFormat::Q4K,
+                GgufDType::Q6K => grim_tensor::QuantFormat::Q6K,
+                _ => panic!("unexpected dtype"),
+            };
+            let (fused_out, h) = dev
+                .fused_quant_gemm(a_cuda, b_cuda, fmt, &out_shape)
+                .expect("fused_quant_gemm");
+            h.synchronize().expect("sync");
+            let actual = fused_out.to_cpu_vec_f32().expect("readback");
+            let elem = (n as usize) * (k as usize);
+            let b_deq = match dtype_want {
+                GgufDType::Q4K => grim_quant::dequant_q4k(&bytes, elem).expect("deq"),
+                GgufDType::Q6K => grim_quant::dequant_q6k(&bytes, elem).expect("deq"),
+                _ => panic!("unexpected dtype"),
+            };
+            let mut expected = vec![0.0f32; (m * n) as usize];
+            for i in 0..m as usize {
+                for j in 0..n as usize {
+                    let mut s = 0.0f32;
+                    for t in 0..k as usize {
+                        s += a_src[i * k as usize + t] * b_deq[j * k as usize + t];
+                    }
+                    expected[i * n as usize + j] = s;
+                }
+            }
+            let mut max_err = 0.0f32;
+            for i in 0..expected.len() {
+                let e = (actual[i] - expected[i]).abs();
+                let denom = expected[i].abs().max(1.0);
+                max_err = max_err.max(e / denom);
+            }
+            (name.to_string(), max_err)
+        };
+
+        let (n1, e1) = run_one(GgufDType::Q4K, "token_embd.weight");
+        eprintln!("[real-q4k] {n1}: max_rel_err={e1}");
+        assert!(e1 < 0.05, "real-model Q4K fused GEMM mismatch: {e1}");
+        let (n1b, e1b) = run_one(GgufDType::Q4K, "blk.0.attn_q.weight");
+        eprintln!("[real-q4k] {n1b}: max_rel_err={e1b}");
+        assert!(e1b < 0.05, "real-model Q4K attn_q fused GEMM mismatch: {e1b}");
+        let (n2, e2) = run_one(GgufDType::Q6K, "output.weight");
+        eprintln!("[real-q6k] {n2}: max_rel_err={e2}");
+        assert!(e2 < 0.05, "real-model Q6K fused GEMM mismatch: {e2}");
+        let (n2b, e2b) = run_one(GgufDType::Q6K, "blk.0.attn_v.weight");
+        eprintln!("[real-q6k] {n2b}: max_rel_err={e2b}");
+        assert!(e2b < 0.05, "real-model Q6K attn_v fused GEMM mismatch: {e2b}");
+
+        // CLI orientation: get transposes attn_v to [256, 1536]; verify the
+        // kernel on that transposed layout with several A patterns.
+        {
+            let target = file
+                .tensors
+                .iter()
+                .find(|t| t.dtype == GgufDType::Q6K && t.name == "blk.0.attn_v.weight")
+                .expect("target tensor");
+            let bytes = read_tensor_bytes(&mut reader, &file, target).expect("read tensor");
+            let (n, k) = (256u32, 1536u32); // transposed [out, in]
+            let m = 16u32;
+            let patterns: Vec<(&str, Vec<f32>)> = vec![
+                ("sin", (0..(m * k)).map(|i| (i as f32 * 0.013).sin()).collect()),
+                ("ones", vec![1.0f32; (m * k) as usize]),
+                ("realmag", (0..(m * k)).map(|i| {
+                    // mimic real x_norm range ~[-3.4, 1.7]
+                    if i % 7 == 0 { -3.37f32 } else { 1.71f32 }
+                }).collect()),
+            ];
+            for (name, a_src) in patterns {
+                let a_shape = Shape::new(vec![m as usize, k as usize]);
+                let a_storage = dev.from_cpu(&a_src, &a_shape, DType::F32).expect("a from_cpu");
+                let a_cuda = as_cuda_storage(a_storage.as_ref());
+                let b_shape = Shape::new(vec![n as usize, k as usize]);
+                let b_storage = upload_packed(
+                    &dev,
+                    &bytes,
+                    &b_shape,
+                    DTypeStorage::KQuant(KQuantScheme::Q6K),
+                );
+                let b_cuda = as_cuda_storage(b_storage.as_ref());
+                let out_shape = Shape::new(vec![m as usize, n as usize]);
+                let (fused_out, h) = dev
+                    .fused_quant_gemm(a_cuda, b_cuda, grim_tensor::QuantFormat::Q6K, &out_shape)
+                    .expect("fused_quant_gemm");
+                h.synchronize().expect("sync");
+                let actual = fused_out.to_cpu_vec_f32().expect("readback");
+                let nan = actual.iter().filter(|x| x.is_nan()).count();
+                let max_abs = actual.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                eprintln!("[cli-q6k][{name}] attn_v [256,1536]: nan={nan} max_abs={max_abs:.4}");
+            }
+        }
     }
 
     #[test]

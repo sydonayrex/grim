@@ -293,6 +293,7 @@ fn extract_call_value(v: &serde_json::Value) -> Option<ToolCallMsg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grim_format::ChatMessage;
 
     fn call(name: &str, args: &str) -> ToolCallMsg {
         ToolCallMsg {

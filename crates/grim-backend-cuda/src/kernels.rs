@@ -491,9 +491,10 @@ extern "C" __global__ void grim_fused_quant_gemm_q6_k(
 
     for (int b = 0; b < blocks_per_row; ++b) {
         const unsigned char* blk = B_packed + (col * blocks_per_row + b) * 210;
-        const unsigned char* ql     = blk;            // 128 bytes @0
-        const unsigned char* qh     = blk + 128;      // 64 bytes  @128
-        const unsigned char* scales = blk + 192;      // 16 bytes  @192 (i8)
+        // ggml block_q6_K layout: ql (128B) + qh (64B) + scales (16B) + d (f16, LAST @208).
+        const unsigned char* ql     = blk;             // 128 bytes @0
+        const unsigned char* qh     = blk + 128;       // 64 bytes  @128
+        const unsigned char* scales = blk + 192;       // 16 bytes  @192 (i8)
         float d = grim_f16_to_f32(*((const unsigned short*)(blk + 208)));
 
         const float* a_ptr = A + row * K + b * 256;
@@ -754,9 +755,10 @@ extern "C" __global__ void grim_dequant_q6k(const unsigned char* __restrict__ pa
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= n_blocks) return;
     const unsigned char* blk = packed + b * 210;
-    const unsigned char* ql     = blk;            // 128 bytes @0
-    const unsigned char* qh     = blk + 128;      // 64 bytes  @128
-    const unsigned char* scales = blk + 192;      // 16 bytes  @192 (i8)
+    // ggml block_q6_K layout: ql (128B) + qh (64B) + scales (16B) + d (f16, LAST @208).
+    const unsigned char* ql     = blk;             // 128 bytes @0
+    const unsigned char* qh     = blk + 128;       // 64 bytes  @128
+    const unsigned char* scales = blk + 192;       // 16 bytes  @192 (i8)
     float d = grim_f16_to_f32(*((const unsigned short*)(blk + 208)));
     float* o = out + b * 256;
 

@@ -2131,4 +2131,321 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_q5k_element_gpu_kernel_math_matches_cpu_reference() {
+        let mut data = vec![0u8; 176];
+        // d = 1.0f16 (0x3C00)
+        data[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        // dmin = 0.5f16 (0x3800)
+        data[2..4].copy_from_slice(&0x3800u16.to_le_bytes());
+        // scales: sub-block 0 sc_0 = 2, m_0 = 1
+        data[4] = 2;
+        data[8] = 1;
+        // qh: byte 0 = 1 (bit 0 set -> msb for elem 0 is 16)
+        data[16] = 1;
+        // qs byte 0: low nibble = 4 (q_lo = 4, so q1 = 4 + 16 = 20)
+        data[48] = 4;
+
+        let cpu_expected = grim_quant::dequant_q5k(&data, 256).expect("dequant q5k");
+
+        // Host mirror of GPU dequant_q5k_element
+        let host_dequant_q5k_element = |block_ptr: &[u8], in_sb: usize| -> f32 {
+            let d_bits = u16::from_le_bytes([block_ptr[0], block_ptr[1]]);
+            let dmin_bits = u16::from_le_bytes([block_ptr[2], block_ptr[3]]);
+            let d = half::f16::from_bits(d_bits).to_f32();
+            let dmin = half::f16::from_bits(dmin_bits).to_f32();
+
+            let scales = &block_ptr[4..16];
+            let qh = &block_ptr[16..48];
+            let qs = &block_ptr[48..176];
+
+            let n = in_sb / 64;
+            let j = in_sb % 64;
+            let l = j & 31;
+            let hi = j >> 5;
+            let is = 2 * n + hi;
+
+            let (sc, m) = if is < 4 {
+                (scales[is] & 63, scales[is + 4] & 63)
+            } else {
+                (
+                    (scales[is + 4] & 0x0F) | ((scales[is - 4] >> 6) << 4),
+                    (scales[is + 4] >> 4) | ((scales[is] >> 6) << 4),
+                )
+            };
+
+            let packed = qs[n * 32 + l];
+            let q_low = if hi != 0 { packed >> 4 } else { packed & 0x0F };
+            let msb = (qh[l] >> (2 * n + hi)) & 1;
+            let q_code = (q_low as i32) | ((msb as i32) << 4);
+
+            d * (sc as f32) * (q_code as f32) - dmin * (m as f32)
+        };
+
+        for in_sb in 0..256 {
+            let gpu_deq = host_dequant_q5k_element(&data, in_sb);
+            let cpu_deq = cpu_expected[in_sb];
+            assert!(
+                (gpu_deq - cpu_deq).abs() < 1e-4,
+                "Elem {} mismatch: GPU mirror got {}, CPU reference got {}",
+                in_sb,
+                gpu_deq,
+                cpu_deq
+            );
+        }
+    }
+
+    #[test]
+    fn test_q6k_element_gpu_kernel_math_matches_cpu_reference() {
+        let mut data = vec![0u8; 210];
+        // d = 2.0f16 (0x4000) at offset 208..210
+        data[208..210].copy_from_slice(&0x4000u16.to_le_bytes());
+        // scales: signed i8 scales at offset 192. scale 0 = 4
+        data[192] = 4;
+        // ql byte 0 = 5 (low nibble 5)
+        data[0] = 5;
+        // qh byte 0 = 1 (bits 0..1 = 1 -> msb shift by 4 is 16)
+        data[128] = 1;
+
+        let cpu_expected = grim_quant::dequant_q6k(&data, 256).expect("dequant q6k");
+
+        // Host mirror of GPU dequant_q6k_element
+        let host_dequant_q6k_element = |block_ptr: &[u8], in_sb: usize| -> f32 {
+            let ql = &block_ptr[0..128];
+            let qh = &block_ptr[128..192];
+            let scales = unsafe {
+                std::slice::from_raw_parts(block_ptr[192..208].as_ptr() as *const i8, 16)
+            };
+            let d_bits = u16::from_le_bytes([block_ptr[208], block_ptr[209]]);
+            let d = half::f16::from_bits(d_bits).to_f32();
+
+            let n = in_sb / 128;
+            let pos = in_sb % 128;
+            let quarter = pos / 32;
+            let l = pos % 32;
+            let is = l / 16;
+            let sc_idx = n * 8 + is + 2 * quarter;
+
+            let sc = scales[sc_idx];
+            let ql_offset = n * 64 + l + if (quarter & 1) != 0 { 32 } else { 0 };
+            let ql_byte = ql[ql_offset];
+            let nibble = if (quarter & 2) != 0 { ql_byte >> 4 } else { ql_byte & 0x0F };
+
+            let qh_byte = qh[n * 32 + l];
+            let qh_bits = (qh_byte >> (2 * quarter)) & 0x03;
+
+            let q_code = (nibble as i32) | ((qh_bits as i32) << 4);
+
+            d * (sc as f32) * (q_code as f32 - 32.0f32)
+        };
+
+        for in_sb in 0..256 {
+            let gpu_deq = host_dequant_q6k_element(&data, in_sb);
+            let cpu_deq = cpu_expected[in_sb];
+            assert!(
+                (gpu_deq - cpu_deq).abs() < 1e-4,
+                "Elem {} mismatch: GPU Q6_K mirror got {}, CPU reference got {}",
+                in_sb,
+                gpu_deq,
+                cpu_deq
+            );
+        }
+    }
 }
+
+mod ab_tests {
+    //! Temporary A/B: ROCm qkv_attention vs CPU reference on identical inputs.
+    use grim_backend_cpu::CpuDevice;
+    use grim_tensor::dtype::DType;
+    use grim_tensor::shape::Shape;
+    use grim_tensor::BackendDevice;
+
+    fn close(a: f32, b: f32, tol: f32) -> bool {
+        (a - b).abs() <= tol * (1.0 + b.abs())
+    }
+
+    #[test]
+    fn qkv_attention_rocm_matches_cpu_reference() {
+        let only = std::env::var("GRIM_RUN_GPU_TESTS").is_ok();
+        if !only {
+            return;
+        }
+        let (seq_len, num_heads, num_kv_heads, head_dim) = (16usize, 16usize, 2usize, 128usize);
+        let kv_len = 16usize;
+        let cache_offset = 0u32;
+
+        // Deterministic pseudo-random data (same seed both sides).
+        let mut seed: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut rand = |lo: f32, hi: f32| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let u = ((seed >> 33) as f64) / ((1u64 << 31) as f64);
+            lo + (hi - lo) * u as f32
+        };
+
+        let mut qv: Vec<f32> = (0..seq_len * num_heads * head_dim).map(|_| rand(-1.0, 1.0)).collect();
+        let mut kv: Vec<f32> = (0..kv_len * num_kv_heads * head_dim).map(|_| rand(-1.0, 1.0)).collect();
+        let mut vv: Vec<f32> = (0..kv_len * num_kv_heads * head_dim).map(|_| rand(-1.0, 1.0)).collect();
+
+        let q_shape = Shape::new(vec![seq_len, num_heads, head_dim]);
+        let kv_shape = Shape::new(vec![kv_len, num_kv_heads, head_dim]);
+        let out_shape = Shape::new(vec![seq_len, num_heads, head_dim]);
+
+        // CPU reference.
+        let cpu = CpuDevice::new();
+        let qc = cpu.from_cpu(&qv, &q_shape, DType::F32).unwrap();
+        let kc = cpu.from_cpu(&kv, &kv_shape, DType::F32).unwrap();
+        let vc = cpu.from_cpu(&vv, &kv_shape, DType::F32).unwrap();
+        let (out_c, _hc) = cpu
+            .qkv_attention(
+                qc.as_ref(),
+                kc.as_ref(),
+                vc.as_ref(),
+                num_kv_heads,
+                kv_len,
+                cache_offset,
+                &out_shape,
+                None,
+                None,
+            )
+            .unwrap();
+        let expect = out_c.to_cpu_vec_f32().unwrap();
+
+        // ROCm.
+        let dev = crate::RocmDevice::new(0);
+        let qr = dev.from_cpu(&qv, &q_shape, DType::F32).unwrap();
+        let kr = dev.from_cpu(&kv, &kv_shape, DType::F32).unwrap();
+        let vr = dev.from_cpu(&vv, &kv_shape, DType::F32).unwrap();
+        let (out_r, _hr) = dev
+            .qkv_attention(
+                qr.as_ref(),
+                kr.as_ref(),
+                vr.as_ref(),
+                num_kv_heads,
+                kv_len,
+                cache_offset,
+                &out_shape,
+                None,
+                None,
+            )
+            .unwrap();
+        let got = out_r.to_cpu_vec_f32().unwrap();
+
+        let tol = 1e-4f32;
+        let mut worst: f32 = 0.0;
+        let mut worst_i = 0usize;
+        for (i, (a, b)) in expect.iter().zip(got.iter()).enumerate() {
+            let d = (a - b).abs();
+            if d > worst {
+                worst = d;
+                worst_i = i;
+            }
+            assert!(
+                close(*a, *b, tol),
+                "attn idx {i} (elem {}) mismatch: CPU {a} vs ROCm {b} (rel tol {tol})",
+                i * 100
+            );
+        }
+        eprintln!("[abi] qkv_attention max |diff| = {worst} at elem {worst_i} (seq*heads*dim), OK");
+    }
+
+    #[test]
+    fn rope_rocm_matches_cpu_reference() {
+        let only = std::env::var("GRIM_RUN_GPU_TESTS").is_ok();
+        if !only {
+            return;
+        }
+        let n = 256usize; // b*s*heads rows
+        let head_dim = 128usize;
+        let mut seed: u64 = 0xDEAD_BEEF_1234_5678;
+        let mut rand = |lo: f32, hi: f32| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let r = ((seed >> 33) as f64) / ((1u64 << 31) as f64);
+            lo + (hi - lo) * r as f32
+        };
+        let x: Vec<f32> = (0..n * head_dim).map(|_| rand(-1.0, 1.0)).collect();
+        let positions: Vec<u32> = (0..n).map(|i| (i / 16) as u32).collect();
+        let shape = Shape::new(vec![n, head_dim]);
+
+        let cpu = CpuDevice::new();
+        let xc = cpu.from_cpu(&x, &shape, DType::F32).unwrap();
+        let (out_c, _hc) = cpu
+            .rope(xc.as_ref(), &positions, head_dim, 5000000.0, &shape)
+            .unwrap();
+        let expect = out_c.to_cpu_vec_f32().unwrap();
+
+        let dev = crate::RocmDevice::new(0);
+        let xr = dev.from_cpu(&x, &shape, DType::F32).unwrap();
+        let (out_r, _hr) = dev
+            .rope(xr.as_ref(), &positions, head_dim, 5000000.0, &shape)
+            .unwrap();
+        let got = out_r.to_cpu_vec_f32().unwrap();
+
+        let mut worst = 0.0f32;
+        for (i, (a, b)) in expect.iter().zip(got.iter()).enumerate() {
+            let d = (a - b).abs();
+            if d > worst {
+                worst = d;
+            }
+            assert!(
+                close(*a, *b, 1e-3),
+                "rope idx {i} mismatch: CPU {a} vs ROCm {b}"
+            );
+        }
+        eprintln!("[n] rope max |diff| = {worst}");
+    }
+}
+
+    #[test]
+    fn matmul_f32_rocm_matches_cpu_reference() {
+        let only = std::env::var("GRIM_RUN_GPU_TESTS").is_ok();
+        if !only {
+            return;
+        }
+        use grim_backend_cpu::CpuDevice;
+        use grim_tensor::dtype::DType;
+        use grim_tensor::Shape;
+        use grim_tensor::BackendDevice;
+
+        let (m, k, n) = (16usize, 1536usize, 1536usize);
+        let mut seed: u64 = 0xF00D_BEEF_CAFE_0001;
+        let mut rand = |lo: f32, hi: f32| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let r = ((seed >> 33) as f64) / ((1u64 << 31) as f64);
+            lo + (hi - lo) * r as f32
+        };
+        let a: Vec<f32> = (0..m * k).map(|_| rand(-2.0, 2.0)).collect();
+        let b: Vec<f32> = (0..k * n).map(|_| rand(-2.0, 2.0)).collect();
+        let a_shape = Shape::new(vec![m, k]);
+        let b_shape = Shape::new(vec![k, n]);
+        let out_shape = Shape::new(vec![m, n]);
+
+        let cpu = CpuDevice::new();
+        let ac = cpu.from_cpu(&a, &a_shape, DType::F32).unwrap();
+        let bc = cpu.from_cpu(&b, &b_shape, DType::F32).unwrap();
+        let (out_c, hc) = cpu.matmul(ac.as_ref(), bc.as_ref(), &out_shape).unwrap();
+        hc.synchronize().unwrap();
+        let expect = out_c.to_cpu_vec_f32().unwrap();
+
+        let dev = crate::RocmDevice::new(0);
+        let ar = dev.from_cpu(&a, &a_shape, DType::F32).unwrap();
+        let br = dev.from_cpu(&b, &b_shape, DType::F32).unwrap();
+        let (out_r, hr) = dev.matmul(ar.as_ref(), br.as_ref(), &out_shape).unwrap();
+        hr.synchronize().unwrap();
+        let got = out_r.to_cpu_vec_f32().unwrap();
+
+        let mut worst = 0.0f32;
+        let mut worst_i = 0usize;
+        for (i, (e, g)) in expect.iter().zip(got.iter()).enumerate() {
+            let d = (e - g).abs();
+            if d > worst {
+                worst = d;
+                worst_i = i;
+            }
+            assert!(
+                (e - g).abs() <= 1e-2 * (1.0 + e.abs()),
+                "matmul idx {i}: CPU {e} vs ROCm {g}"
+            );
+        }
+        eprintln!("[n] f32 matmul {m}x{k}x{n}: max |diff| = {worst} at {worst_i}");
+    }

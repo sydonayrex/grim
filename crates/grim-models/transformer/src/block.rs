@@ -5,7 +5,7 @@ use grim_nn::{
     ColumnParallelLinear, Linear, RmsNorm, Rope, RowParallelLinear, TensorParallelConfig,
     WeightSource,
 };
-use grim_tensor::{Device, Shape, Tensor};
+use grim_tensor::{Device, DType, Shape, Tensor};
 
 use crate::model::LlamaConfig;
 
@@ -58,6 +58,176 @@ pub fn plan_kv_head_sharding(
             "unsupported GQA topology: num_heads={num_heads}, num_kv_heads={num_kv_heads}, world_size={world_size}"
         )))
     }
+}
+
+/// Per-layer KV cache for Llama-style attention.
+///
+/// Stores post-RoPE Key and raw Value tensors from previous decode steps.
+/// On each forward, the current K/V are appended after the cached ones so
+/// `prefilled_self_attention` can attend to the full prefix without
+/// re-running attention on past tokens.
+///
+/// Two storage tiers:
+/// - `k_device`/`v_device`: device-resident arena (grows by re-alloc +
+///   D2D copy). Appends are pure device-side (`copy_slice_into`), so decode
+///   steps on ROCm never roundtrip the cache through host memory.
+/// - `k_cache`/`v_cache`: flat f32 host mirrors, used by backends without
+///   `alloc_storage`/`copy_slice_into` (CPU, CUDA, Vulkan, Metal).
+///
+/// Layout: `(past_len, local_num_kv_heads, head_dim)` for both K and V,
+/// matching the per-rank sharded KV-head count.
+#[derive(Default)]
+pub struct LlamaLayerCache {
+    /// Post-RoPE keys, flat layout `(past_len, local_num_kv_heads, head_dim)`.
+    pub k_cache: Vec<f32>,
+    /// Raw values (V is not RoPE'd), same layout.
+    pub v_cache: Vec<f32>,
+    /// Device-resident key arena (shape `[cap, num_kv_heads * head_dim]`),
+    /// valid rows are `0..past_len`.
+    pub k_device: Option<Box<dyn grim_tensor::BackendStorage>>,
+    /// Device-resident value arena, same layout as `k_device`.
+    pub v_device: Option<Box<dyn grim_tensor::BackendStorage>>,
+    /// Number of cached token positions.
+    pub past_len: usize,
+}
+
+impl LlamaLayerCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Appends can only be skipped when the backend lacks the device-cache
+/// primitives; any real error must propagate.
+fn is_unimplemented(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::Unimplemented(_) | Error::Tensor(grim_tensor::Error::Unimplemented(_))
+    )
+}
+
+/// Zero-copy relabel (B, S*H, D) → (B, S, H*D): the flat row-major
+/// layout must match exactly. When the *storage* shape doesn't already
+/// match the target, materialize a physically reshaped storage instead
+/// (D2D copy on backends with `alloc_storage`/`copy_slice_into`, host
+/// roundtrip elsewhere) — backend matmuls derive shapes from the storage.
+fn reshaped_view(x: &Tensor, shape: &Shape) -> Result<Tensor> {
+    if x.shape().elem_count() != shape.elem_count() {
+        return Err(Error::Shape(format!(
+            "reshaped_view: element count mismatch {:?} vs {:?}",
+            x.shape().dims(),
+            shape.dims()
+        )));
+    }
+    // Fast path: storage is already laid out as requested — zero-copy.
+    if x.storage().shape().dims() == shape.dims() {
+        return Ok(Tensor::new(
+            x.storage().clone(),
+            shape.clone(),
+            x.dtype(),
+            x.provenance().clone(),
+            x.device().clone(),
+        ));
+    }
+    let dev = grim_nn::modules::pick_device_for_storage_device(x.device());
+    // Preferred: device-side reshape via a fresh arena + D2D copy, so the
+    // data never leaves the GPU (decode-hot path on ROCm).
+    if let Ok(fresh) = dev.alloc_storage(shape, DType::F32) {
+        if dev
+            .copy_slice_into(fresh.as_ref(), x.storage().as_ref(), 0, x.shape().elem_count())
+            .is_ok()
+        {
+            return Ok(Tensor::new(
+                std::sync::Arc::from(fresh),
+                shape.clone(),
+                DType::F32,
+                x.provenance().clone(),
+                x.device().clone(),
+            ));
+        }
+    }
+    // Last resort: host roundtrip (CPU and shape-strict backends).
+    if std::env::var("GRIM_TRACE").is_ok() {
+        eprintln!(
+            "[TRACE] reshaped_view host fallback {:?} -> {:?}",
+            x.shape().dims(),
+            shape.dims()
+        );
+    }
+    let data = x.to_vec_f32()?;
+    let st = dev.from_cpu(&data, shape, DType::F32)?;
+    Ok(Tensor::new(
+        std::sync::Arc::from(st),
+        shape.clone(),
+        DType::F32,
+        x.provenance().clone(),
+        x.device().clone(),
+    ))
+}
+
+/// Physically reshape any contiguous producer layout (2-D `(rows, H*D)` or
+/// batch-1 3-D `(1, rows, H*D)` / `(1, rows*H, D)`) into `(s, h, d)`,
+/// zero-copy when the storage already matches, D2D copy otherwise.
+fn relabel_3d(x: &Tensor, s: usize, h: usize, d: usize) -> Result<Tensor> {
+    let flat = x.shape().elem_count();
+    if flat != s * h * d {
+        return Err(Error::Shape(format!(
+            "relabel_3d: expected {s}*{h}*{d}={} elements, got {} ({:?})",
+            s * h * d,
+            flat,
+            x.shape().dims()
+        )));
+    }
+    reshaped_view(x, &Shape::new(vec![s, h, d]))
+}
+
+/// Append `s_len` newly produced K/V rows (3-D `(S, H, D)` contiguous) into
+/// the device-resident cache arena, doubling the row capacity when needed.
+/// Pure device-side work (`alloc_storage` + `copy_slice_into`); returns
+/// `Err(Unimplemented)` on backends that lack these primitives so callers
+/// can degrade to the host-mirror cache.
+#[allow(clippy::too_many_arguments)]
+fn cache_append_kv<'a>(
+    dev: &dyn grim_tensor::BackendDevice,
+    k_device: &'a mut Option<Box<dyn grim_tensor::BackendStorage>>,
+    v_device: &'a mut Option<Box<dyn grim_tensor::BackendStorage>>,
+    cur_k: &dyn grim_tensor::BackendStorage,
+    cur_v: &dyn grim_tensor::BackendStorage,
+    past_len: usize,
+    s_len: usize,
+    row_elems: usize,
+) -> Result<(
+    &'a dyn grim_tensor::BackendStorage,
+    &'a dyn grim_tensor::BackendStorage,
+    usize,
+)> {
+    let want = past_len + s_len;
+    let grow = |slot: &mut Option<Box<dyn grim_tensor::BackendStorage>>| -> Result<()> {
+        let cap = slot
+            .as_ref()
+            .map(|st| st.shape().dims()[0])
+            .unwrap_or(0);
+        if cap >= want {
+            return Ok(());
+        }
+        let new_cap = (want * 2).max(8);
+        let shape = Shape::new(vec![new_cap, row_elems]);
+        let fresh = dev.alloc_storage(&shape, DType::F32)?;
+        if let Some(old) = slot.take() {
+            dev.copy_slice_into(fresh.as_ref(), old.as_ref(), 0, old.shape().elem_count())?;
+        }
+        *slot = Some(fresh);
+        Ok(())
+    };
+    grow(k_device)?;
+    grow(v_device)?;
+    let k_arena = k_device.as_ref().expect("k arena just grown");
+    let v_arena = v_device.as_ref().expect("v arena just grown");
+    let offset = past_len * row_elems;
+    let count = s_len * row_elems;
+    dev.copy_slice_into(k_arena.as_ref(), cur_k, offset, count)?;
+    dev.copy_slice_into(v_arena.as_ref(), cur_v, offset, count)?;
+    Ok((k_arena.as_ref(), v_arena.as_ref(), want))
 }
 
 #[derive(Clone)]
@@ -188,22 +358,79 @@ impl LlamaBlock {
         x: &Tensor,
         positions: &[u32],
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        self.forward_with_kv_paged(x, positions, None)
+        self.forward_with_kv_paged(x, positions, None, None)
     }
 
-    /// Forward pass with optional SessionT paged attention dispatch.
+    /// Forward pass with optional SessionT paged attention dispatch and
+    /// optional per-layer KV cache for incremental decoding.
     pub fn forward_with_kv_paged(
         &self,
         x: &Tensor,
         positions: &[u32],
         session: Option<&dyn grim_core::session::SessionT>,
+        cache: Option<&mut LlamaLayerCache>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
+        let t0 = std::time::Instant::now();
         let x_2d = x;
 
+        // GRIM_DUMP_STATE: print L2 norm + first/last samples of the hidden
+        // state entering the layer, to locate where ROCm vs CPU diverge.
+        if std::env::var("GRIM_DUMP_STATE").is_ok() && x_2d.shape().dims()[0] > 1 {
+            if let Ok(v) = x_2d.to_vec_f32() {
+                let n = v.len();
+                let norm: f32 = v.iter().map(|e| e * e).sum::<f32>().sqrt();
+                eprintln!(
+                    "[STATE] layer_in n={n} norm={norm:.4} head={:.4} tail={:.4}",
+                    v.first().copied().unwrap_or(0.0),
+                    v.last().copied().unwrap_or(0.0)
+                );
+            }
+        }
+
         let x_norm = self.attn_norm.forward(x_2d)?;
+        let t1 = std::time::Instant::now();
         let q = self.wq.forward(&x_norm)?;
         let k = self.wk.forward(&x_norm)?;
         let v = self.wv.forward(&x_norm)?;
+        let t2 = std::time::Instant::now();
+
+        if std::env::var("GRIM_DUMP_STATE").is_ok() && x_2d.shape().dims()[0] > 1 {
+            if let (Ok(hn), Ok(qv), Ok(kv), Ok(vv)) = (
+                x_norm.to_vec_f32(),
+                q.to_vec_f32(),
+                k.to_vec_f32(),
+                v.to_vec_f32(),
+            ) {
+                let n = |v: &[f32]| v.iter().map(|e| e * e).sum::<f32>().sqrt();
+                let f6 = |v: &[f32], off: usize| {
+                    v[off..off + 4]
+                        .iter()
+                        .map(|x| format!("{x:.6}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                eprintln!(
+                    "[STATE] norm={:.4} q={:.4} k={:.4} v={:.4} q0[0..4]={} k0[0..4]={} k1[0..4]={} v1[0..4]={}",
+                    n(&hn),
+                    n(&qv),
+                    n(&kv),
+                    n(&vv),
+                    f6(&qv, 0),
+                    f6(&kv, 0),
+                    f6(&kv, 256),
+                    f6(&vv, 256)
+                );
+            }
+        }
+        if std::env::var("GRIM_TRACE").is_ok() {
+            eprintln!(
+                "[TRACE] layer {:?} nrm={:.2}ms qkv={:.2}ms s={}",
+                self._cfg.hidden_size,
+                (t1 - t0).as_secs_f32() * 1e3,
+                (t2 - t1).as_secs_f32() * 1e3,
+                positions.len()
+            );
+        }
 
         let paged_attn_out = if let Some(sess) = session {
             if let (Some(bt), Some((k_pages, v_pages, page_size))) =
@@ -220,8 +447,25 @@ impl LlamaBlock {
 
         let attn_out = match paged_attn_out {
             Some(out) => out,
-            None => self.prefilled_self_attention(&q, &k, &v, positions)?,
+            None => self.prefilled_self_attention(&q, &k, &v, positions, cache)?,
         };
+        if std::env::var("GRIM_DUMP_STATE").is_ok() && x_2d.shape().dims()[0] > 1 {
+            if let Ok(v) = attn_out.to_vec_f32() {
+                let n = v.iter().map(|e| e * e).sum::<f32>().sqrt();
+                let fmt = |s: &[f32]| {
+                    s.iter()
+                        .map(|x| format!("{x:.6}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                eprintln!(
+                    "[STATE] attn_prewo norm={n:.4} e0={} e3={} e2047={}",
+                    fmt(&v[0..4]),
+                    fmt(&v[2048..2052]),
+                    v[2047]
+                );
+            }
+        }
         let attn_out = self.wo.forward(&attn_out)?;
 
         let added = grim_nn::modules::add_on_device(&x_2d, &attn_out)?;
@@ -235,12 +479,24 @@ impl LlamaBlock {
         let ffn_out = self.w_down.forward(&silu_storage)?;
 
         let out = grim_nn::modules::add_on_device(&added, &ffn_out)?;
+        if std::env::var("GRIM_DUMP_STATE").is_ok() {
+            if let Ok(v) = out.to_vec_f32() {
+                let n = v.len();
+                let norm: f32 = v.iter().map(|e| e * e).sum::<f32>().sqrt();
+                eprintln!(
+                    "[STATE] layer_out n={n} norm={norm:.4} head={:.4} tail={:.4}",
+                    v.first().copied().unwrap_or(0.0),
+                    v.last().copied().unwrap_or(0.0)
+                );
+            }
+        }
         Ok((out, k, v))
     }
 
     /// Apply RoPE to a multi-head tensor of shape (B, S, num_heads * head_dim)
-    /// or (S, num_heads * head_dim) by reshaping to (B, S * num_heads, head_dim),
-    /// repeating positions per-head, and reshaping back.
+    /// or (S, num_heads * head_dim). Stays fully on-device by relabeling the
+    /// tensor to (B, S * num_heads, head_dim), calling the backend's `rope`
+    /// kernel, then relabeling back — no CPU roundtrip.
     pub(crate) fn apply_rope_multi_head(
         &self,
         x: &Tensor,
@@ -264,38 +520,22 @@ impl LlamaBlock {
                 num_heads * head_dim
             )));
         }
-        // Reshape (B, S, num_heads * head_dim) -> (B, S * num_heads, head_dim)
-        let data = x.to_vec_f32()?;
-        let mut reshaped = vec![0.0f32; b * s * num_heads * head_dim];
-        for bi in 0..b {
-            for si in 0..s {
-                for hi in 0..num_heads {
-                    for di in 0..head_dim {
-                        let src = (bi * s + si) * d + hi * head_dim + di;
-                        let dst = (bi * s * num_heads + si * num_heads + hi) * head_dim + di;
-                        reshaped[dst] = data[src];
-                    }
-                }
-            }
-        }
-        let reshaped_tensor = {
-            let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
-            let storage = dev.from_cpu(
-                &reshaped,
-                &Shape::new(vec![b, s * num_heads, head_dim]),
-                grim_tensor::DType::F32,
-            )?;
-            Tensor::new(
-                std::sync::Arc::from(storage),
-                Shape::new(vec![b, s * num_heads, head_dim]),
-                grim_tensor::DType::F32,
-                grim_tensor::QuantProvenance::default(),
-                self._dev.clone(),
-            )
-        };
-        // Repeat positions per-head. If positions is empty, default to
-        // sequential positions (0..s) — callers that don't track position
-        // (e.g. streaming block forward) still get valid RoPE.
+
+        // Relabel (B, S, num_heads*head_dim) → (B, S*num_heads, head_dim).
+        // The data layout is already (B, S, num_heads, head_dim) row-major,
+        // which is identical to (B, S*num_heads, head_dim) — so this is a
+        // zero-copy shape relabel.
+        let rope_shape = Shape::new(vec![b, s * num_heads, head_dim]);
+        let relabeled = Tensor::new(
+            x.storage().clone(),
+            rope_shape.clone(),
+            x.dtype(),
+            x.provenance().clone(),
+            x.device().clone(),
+        );
+
+        // Repeat positions per-head: each of the S sequence positions appears
+        // num_heads times consecutively.
         let mut ext_positions = Vec::with_capacity(s * num_heads);
         for si in 0..s {
             let pos = if si < positions.len() {
@@ -307,30 +547,58 @@ impl LlamaBlock {
                 ext_positions.push(pos);
             }
         }
-        let rope_out = self.rope.forward(&reshaped_tensor, &ext_positions)?;
-        // Reshape back (B, S * num_heads, head_dim) -> (B, S, num_heads * head_dim)
-        let rope_data = rope_out.to_vec_f32()?;
-        let mut result = vec![0.0f32; b * s * d];
-        for bi in 0..b {
-            for si in 0..s {
-                for hi in 0..num_heads {
-                    for di in 0..head_dim {
-                        let src = (bi * s * num_heads + si * num_heads + hi) * head_dim + di;
-                        let dst = (bi * s + si) * d + hi * head_dim + di;
-                        result[dst] = rope_data[src];
+
+        // Apply rope on-device. If the backend has a `rope` kernel (ROCm, CPU),
+        // use it directly; otherwise fall back to the grim_nn Rope module.
+        let trace = std::env::var("GRIM_TRACE").is_ok();
+        let ta = std::time::Instant::now();
+let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
+        // GRIM_FORCE_CPU_ROPE: A/B switch — always use the grim_nn Rope module
+        // (CPU math) instead of the backend kernel, to isolate kernel-level
+        // numeric divergence.
+        let rope_out = if std::env::var("GRIM_FORCE_CPU_ROPE").is_ok() {
+            let rope_out = self.rope.forward(&relabeled, &ext_positions)?;
+            return reshaped_view(&rope_out, &Shape::new(vec![b, s, num_heads * head_dim]));
+        } else {
+            match dev.rope(
+                relabeled.storage().as_ref(),
+                &ext_positions,
+                head_dim,
+                self.rope.base,
+                &rope_shape,
+            ) {
+                Ok((st, _h)) => {
+                    let tb = std::time::Instant::now();
+                    let rope_out = Tensor::new(
+                        std::sync::Arc::from(st),
+                        rope_shape,
+                        x.dtype(),
+                        x.provenance().clone(),
+                        x.device().clone(),
+                    );
+                    let out = reshaped_view(&rope_out, &Shape::new(vec![b, s, num_heads * head_dim]))?;
+                    if trace {
+                        eprintln!(
+                            "[TRACE]   rope kernel={:.1}ms reshape={:.1}ms heads={}",
+                            (tb - ta).as_secs_f32() * 1e3,
+                            (std::time::Instant::now() - tb).as_secs_f32() * 1e3,
+                            num_heads
+                        );
                     }
+                    return Ok(out);
+                }
+                Err(e) => {
+                    if trace {
+                        eprintln!("[TRACE] rope kernel fell back: {e}");
+                    }
+                    // Fallback: use the grim_nn Rope module (which itself may
+                    // roundtrip on CPU, but at least it's a single call).
+                    let rope_out = self.rope.forward(&relabeled, &ext_positions)?;
+                    // The fallback returns the correct shape already.
+                    return reshaped_view(&rope_out, &Shape::new(vec![b, s, num_heads * head_dim]));
                 }
             }
-        }
-        let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
-        let storage = dev.from_cpu(&result, &x.shape().clone(), grim_tensor::DType::F32)?;
-        Ok(Tensor::new(
-            std::sync::Arc::from(storage),
-            x.shape().clone(),
-            grim_tensor::DType::F32,
-            grim_tensor::QuantProvenance::default(),
-            self._dev.clone(),
-        ))
+        };
     }
 
     pub(crate) fn prefilled_self_attention(
@@ -339,40 +607,226 @@ impl LlamaBlock {
         k: &Tensor,
         v: &Tensor,
         positions: &[u32],
+        mut cache: Option<&mut LlamaLayerCache>,
     ) -> Result<Tensor> {
+        use grim_tensor::BackendStorage;
+        let trace = std::env::var("GRIM_TRACE").is_ok();
+        let t0 = std::time::Instant::now();
+
         let cfg = &self._cfg;
 
-        // Apply RoPE to Q and K. The rope.forward expects (B, S, D=head_dim)
-        // but Q/K arrive as (B, S, num_heads * head_dim). Reshape to
-        // (B, S * num_heads, head_dim), repeat positions per-head, apply
-        // RoPE, then reshape back. Uses per-rank sharded head counts.
-        let q = self.apply_rope_multi_head(q, positions, cfg.local_num_heads)?;
-        let k = self.apply_rope_multi_head(k, positions, cfg.local_num_kv_heads)?;
+        // Apply RoPE to Q and K on-device.
+        let q_rot = self.apply_rope_multi_head(q, positions, cfg.local_num_heads)?;
+        let k_rot = self.apply_rope_multi_head(k, positions, cfg.local_num_kv_heads)?;
+        let t1 = std::time::Instant::now();
 
-        let qd = q.to_vec_f32()?;
-        let kd = k.to_vec_f32()?;
-        let vd = v.to_vec_f32()?;
+        if std::env::var("GRIM_DUMP_STATE").is_ok()
+            && (q_rot.shape().dims()[0] > 1 || q_rot.shape().dims().get(1).copied().unwrap_or(0) > 1)
+        {
+            let f6 = |v: &[f32], off: usize| {
+                v[off..off + 4]
+                    .iter()
+                    .map(|x| format!("{x:.6}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            if let (Ok(qv), Ok(kv)) = (q_rot.to_vec_f32(), k_rot.to_vec_f32()) {
+                eprintln!(
+                    "[STATE] qr1={} qr2={} kr1={}",
+                    f6(&qv, 2048),
+                    f6(&qv, 4096),
+                    f6(&kv, 256)
+                );
+            }
+        }
+
+        let q_len = {
+            let dims = q_rot.shape().dims();
+            if dims.len() == 3 {
+                dims[1]
+            } else {
+                dims[0]
+            }
+        };
+        let row_elems = cfg.local_num_kv_heads * cfg.head_dim;
+        let out_shape = Shape::new(vec![q_len, cfg.local_num_heads, cfg.head_dim]);
+
+        // Zero-copy relabels to 3-D (S, num_heads, head_dim): the flat
+        // row-major layout is identical for all the producer shapes.
+        let q_3d = relabel_3d(&q_rot, q_len, cfg.local_num_heads, cfg.head_dim)?;
+        let k_3d = relabel_3d(&k_rot, q_len, cfg.local_num_kv_heads, cfg.head_dim)?;
+        let v_3d = relabel_3d(v, q_len, cfg.local_num_kv_heads, cfg.head_dim)?;
+
+        let old_past_len = cache.as_ref().map(|c| c.past_len).unwrap_or(0);
+        let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
+
+        // --- KV cache: append the current K/V rows -------------------------
+        // Preferred path: device-resident arenas + D2D append. Only the newly
+        // produced rows are copied; the host never sees the cache contents.
+        // Fallback (backend without alloc_storage/copy_slice_into): keep the
+        // flat host mirrors and re-upload the concatenated cache.
+        let (mut k_borrowed, mut v_borrowed): (
+            Option<&dyn BackendStorage>,
+            Option<&dyn BackendStorage>,
+        ) = (None, None);
+        let mut owned_k: Option<Box<dyn BackendStorage>> = None;
+        let mut owned_v: Option<Box<dyn BackendStorage>> = None;
+        let mut host_vecs: Option<(Vec<f32>, Vec<f32>)> = None;
+        let kv_len; // assigned in every branch below (definite initialization)
+
+        if let Some(c) = cache.as_deref_mut() {
+            match cache_append_kv(
+                dev.as_ref(),
+                &mut c.k_device,
+                &mut c.v_device,
+                k_3d.storage().as_ref(),
+                v_3d.storage().as_ref(),
+                c.past_len,
+                q_len,
+                row_elems,
+            ) {
+                Ok((k_st, v_st, total)) => {
+                    k_borrowed = Some(k_st);
+                    v_borrowed = Some(v_st);
+                    kv_len = total;
+                    c.past_len = total;
+                }
+                Err(e) if is_unimplemented(&e) => {
+                let total = c.past_len + q_len;
+                c.k_cache.extend_from_slice(&k_3d.to_vec_f32()?);
+                c.v_cache.extend_from_slice(&v_3d.to_vec_f32()?);
+                c.past_len = total;
+                let kv_shape = Shape::new(vec![total, cfg.local_num_kv_heads, cfg.head_dim]);
+                owned_k = Some(dev.from_cpu(&c.k_cache, &kv_shape, DType::F32)?);
+                owned_v = Some(dev.from_cpu(&c.v_cache, &kv_shape, DType::F32)?);
+                host_vecs = Some((c.k_cache.clone(), c.v_cache.clone()));
+                kv_len = total;
+            }
+                Err(e) => return Err(e),
+            }
+        } else {
+            // One-shot prefill without a cache: upload current K/V directly.
+            let kv_shape = Shape::new(vec![q_len, cfg.local_num_kv_heads, cfg.head_dim]);
+            owned_k = Some(dev.from_cpu(&k_3d.to_vec_f32()?, &kv_shape, DType::F32)?);
+            owned_v = Some(dev.from_cpu(&v_3d.to_vec_f32()?, &kv_shape, DType::F32)?);
+            kv_len = q_len;
+        }
+
+        let (k_final, v_final): (&dyn BackendStorage, &dyn BackendStorage) =
+            match (k_borrowed, v_borrowed) {
+                (Some(a), Some(b)) => (a, b),
+                _ => (
+                    owned_k.as_ref().unwrap().as_ref(),
+                    owned_v.as_ref().unwrap().as_ref(),
+                ),
+            };
+        let t2a = std::time::Instant::now();
+
+        // Fused GQA + causal attention. ROCm and CPU implement the kernel;
+        // other backends degrade to the host fallback below.
+        // GRIM_FORCE_CPU_ATTN: A/B switch — always run the host reference
+        // attention to isolate kernel-level numeric divergence.
+        let attn_out = if std::env::var("GRIM_FORCE_CPU_ATTN").is_ok() {
+            let (hk, hv) = match &host_vecs {
+                Some((k, v)) => (k.clone(), v.clone()),
+                None => (k_final.to_cpu_vec_f32()?, v_final.to_cpu_vec_f32()?),
+            };
+            self.cpu_attention_fallback(&q_3d, &hk, &hv, old_past_len, q_len, kv_len)?
+        } else {
+            if std::env::var("GRIM_DUMP_STATE").is_ok() {
+                let qs = q_3d.shape().dims().to_vec();
+                let ks = k_final.shape().dims().to_vec();
+                let vs = v_final.shape().dims().to_vec();
+                eprintln!(
+                    "[STATE] qkv_dispatch q={qs:?} k={ks:?} v={vs:?} kv_len={kv_len} off={} out={:?}",
+                    old_past_len,
+                    out_shape.dims()
+                );
+            }
+            match dev.qkv_attention(
+                q_3d.storage().as_ref(),
+                k_final,
+                v_final,
+                cfg.local_num_kv_heads,
+                kv_len,
+                old_past_len as u32,
+                &out_shape,
+                None,
+                None,
+            ) {
+                Ok((s, _h)) => Tensor::new(
+                    std::sync::Arc::from(s),
+                    out_shape.clone(),
+                    DType::F32,
+                    grim_tensor::QuantProvenance::default(),
+                    self._dev.clone(),
+                ),
+                Err(_) => {
+                    // Manual attention on host. Prefer the cached host mirrors;
+                    // otherwise fetch the (device-resident) cache once.
+                    let (hk, hv) = match &host_vecs {
+                        Some((k, v)) => (k.clone(), v.clone()),
+                        None => (k_final.to_cpu_vec_f32()?, v_final.to_cpu_vec_f32()?),
+                    };
+                    self.cpu_attention_fallback(&q_3d, &hk, &hv, old_past_len, q_len, kv_len)?
+                }
+            }
+        };
+        let t2b = std::time::Instant::now();
+
+        // Rebuild the (S, num_heads*head_dim) view for wo — physically, so the
+        // storage rank matches (backend matmuls validate the storage shape).
+        let flat_shape = Shape::new(vec![q_len, cfg.local_num_heads * cfg.head_dim]);
+        let attn_out = reshaped_view(&attn_out, &flat_shape)?;
+        let t3 = std::time::Instant::now();
+        if trace {
+            eprintln!(
+                "[TRACE]   attn rope={:.1}ms append={:.1}ms qkv={:.1}ms flat={:.1}ms",
+                (t1 - t0).as_secs_f32() * 1e3,
+                (t2a - t1).as_secs_f32() * 1e3,
+                (t2b - t2a).as_secs_f32() * 1e3,
+                (t3 - t2b).as_secs_f32() * 1e3
+            );
+        }
+        Ok(attn_out)
+    }
+
+    /// CPU-only attention fallback used when the backend lacks `qkv_attention`.
+    /// Computes scaled-dot-product attention with causal masking + KV cache.
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_attention_fallback(
+        &self,
+        q_3d: &Tensor,
+        full_k: &[f32],
+        full_v: &[f32],
+        past_len: usize,
+        q_len: usize,
+        kv_len: usize,
+    ) -> Result<Tensor> {
+        if std::env::var("GRIM_TRACE").is_ok() {
+            eprintln!("[TRACE] CPU attention fallback q_len={q_len} kv_len={kv_len}");
+        }
+        let cfg = &self._cfg;
+        let qd = q_3d.to_vec_f32()?;
         let num_head_dims = cfg.local_num_heads * cfg.head_dim;
-        let total_tokens = qd.len() / num_head_dims;
         let scale = 1.0 / (cfg.head_dim as f32).sqrt();
-        let mut out = vec![0.0f32; total_tokens * num_head_dims];
         let kv_stride = cfg.local_num_kv_heads * cfg.head_dim;
+        let mut out = vec![0.0f32; q_len * num_head_dims];
 
         for h in 0..cfg.local_num_heads {
             let kvh = (h * cfg.local_num_kv_heads) / cfg.local_num_heads;
-            for t in 0..total_tokens {
-                let mut scores = vec![0.0f32; total_tokens];
-                // CRIT-1: Causal masking - only attend to current and past tokens (t2 <= t)
-                for t2 in 0..=t {
+            for t in 0..q_len {
+                let mut scores = vec![0.0f32; kv_len];
+                for t2 in 0..kv_len {
                     let mut dot = 0.0f32;
                     for d in 0..cfg.head_dim {
                         dot += qd[t * num_head_dims + h * cfg.head_dim + d]
-                            * kd[t2 * kv_stride + kvh * cfg.head_dim + d];
+                            * full_k[t2 * kv_stride + kvh * cfg.head_dim + d];
                     }
                     scores[t2] = dot * scale;
                 }
-                // Set future positions to -inf for softmax
-                for t2 in (t + 1)..total_tokens {
+                let causal_limit = past_len + t;
+                for t2 in (causal_limit + 1)..kv_len {
                     scores[t2] = f32::NEG_INFINITY;
                 }
                 let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -386,29 +840,24 @@ impl LlamaBlock {
                 }
                 for d in 0..cfg.head_dim {
                     let mut acc = 0.0f32;
-                    // Only sum over valid (non-masked) positions
-                    for t2 in 0..=t {
-                        acc += scores[t2] * vd[t2 * kv_stride + kvh * cfg.head_dim + d];
+                    for t2 in 0..=causal_limit {
+                        acc += scores[t2] * full_v[t2 * kv_stride + kvh * cfg.head_dim + d];
                     }
                     out[t * num_head_dims + h * cfg.head_dim + d] = acc;
                 }
             }
         }
-        Ok({
-            let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
-            let storage = dev.from_cpu(
-                &out,
-                &Shape::new(vec![total_tokens, num_head_dims]),
-                grim_tensor::DType::F32,
-            )?;
-            Tensor::new(
-                std::sync::Arc::from(storage),
-                Shape::new(vec![total_tokens, num_head_dims]),
-                grim_tensor::DType::F32,
-                grim_tensor::QuantProvenance::default(),
-                self._dev.clone(),
-            )
-        })
+
+        let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
+        let storage =
+            dev.from_cpu(&out, &Shape::new(vec![q_len, num_head_dims]), grim_tensor::DType::F32)?;
+        Ok(Tensor::new(
+            std::sync::Arc::from(storage),
+            Shape::new(vec![q_len, num_head_dims]),
+            grim_tensor::DType::F32,
+            grim_tensor::QuantProvenance::default(),
+            self._dev.clone(),
+        ))
     }
 
     /// Dispatch self-attention via paged attention kernel when block table & physical KV pools are available.
@@ -705,10 +1154,10 @@ mod tests {
 
         // Uniform shift → attention output invariant (RoPE relative encoding)
         let out0 = block
-            .prefilled_self_attention(&q, &k, &v, &[0, 1, 2])
+            .prefilled_self_attention(&q, &k, &v, &[0, 1, 2], None)
             .unwrap();
         let out10 = block
-            .prefilled_self_attention(&q, &k, &v, &[10, 11, 12])
+            .prefilled_self_attention(&q, &k, &v, &[10, 11, 12], None)
             .unwrap();
         let od0 = out0.to_vec_f32().unwrap();
         let od10 = out10.to_vec_f32().unwrap();
@@ -725,10 +1174,10 @@ mod tests {
 
         // Non-uniform shift → attention output differs
         let out_a = block
-            .prefilled_self_attention(&q, &k, &v, &[0, 1, 2])
+            .prefilled_self_attention(&q, &k, &v, &[0, 1, 2], None)
             .unwrap();
         let out_b = block
-            .prefilled_self_attention(&q, &k, &v, &[0, 2, 5])
+            .prefilled_self_attention(&q, &k, &v, &[0, 2, 5], None)
             .unwrap();
         let oa = out_a.to_vec_f32().unwrap();
         let ob = out_b.to_vec_f32().unwrap();

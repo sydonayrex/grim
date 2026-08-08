@@ -26,6 +26,8 @@ pub struct ArchHyperparameters {
     pub ssm_d_state: Option<usize>,
     pub ssm_d_inner: Option<usize>,
     pub ssm_d_conv: Option<usize>,
+    pub ssm_dt_rank: Option<usize>,
+    pub ssm_n_group: Option<usize>,
 }
 
 impl Default for ArchHyperparameters {
@@ -47,6 +49,8 @@ impl Default for ArchHyperparameters {
             ssm_d_state: None,
             ssm_d_inner: None,
             ssm_d_conv: None,
+            ssm_dt_rank: None,
+            ssm_n_group: None,
         }
     }
 }
@@ -183,6 +187,12 @@ impl HyperparameterExtractor {
         let ssm_d_conv = metadata
             .get_u32(&format!("{arch_name}.ssm.conv_kernel"))
             .map(|v| v as usize);
+        let ssm_dt_rank = metadata
+            .get_u32(&format!("{arch_name}.ssm.time_step_rank"))
+            .map(|v| v as usize);
+        let ssm_n_group = metadata
+            .get_u32(&format!("{arch_name}.ssm.group_count"))
+            .map(|v| v as usize);
 
         ArchHyperparameters {
             architecture: arch,
@@ -201,6 +211,8 @@ impl HyperparameterExtractor {
             ssm_d_state,
             ssm_d_inner,
             ssm_d_conv,
+            ssm_dt_rank,
+            ssm_n_group,
         }
     }
 }

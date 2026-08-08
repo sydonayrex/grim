@@ -291,7 +291,7 @@ fn materialize_rocm(
     device: &Device,
     ordinal: usize,
 ) -> Result<Tensor> {
-    let dev = RocmDevice::new(ordinal);
+    let dev = RocmDevice::shared(ordinal);
     // Storage is F32 bytes (already dequantized in `materialize`). Mirror
     // CUDA: stamp the storage as DType::F32 so ROCm kernels that check
     // input dtype (embedding, matmul) accept the result.
@@ -303,7 +303,7 @@ fn materialize_rocm(
     let storage = if managed {
         dev.from_cpu_managed(&f32s, &shape, DType::F32)?
     } else {
-        BackendDevice::from_cpu(&dev, &f32s, &shape, DType::F32)?
+        BackendDevice::from_cpu(dev.as_ref(), &f32s, &shape, DType::F32)?
     };
     Ok(Tensor::new(
         Arc::from(storage),
@@ -417,7 +417,7 @@ fn materialize(
             if let Device::Rocm(ordinal) = device {
                 #[cfg(feature = "rocm-mem")]
                 {
-                    let dev = RocmDevice::new(*ordinal);
+                    let dev = RocmDevice::shared(*ordinal);
                     let mut storage = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone())?;
                     storage.set_provenance(provenance.clone());
                     return Ok(Tensor::new(
@@ -437,7 +437,7 @@ fn materialize(
             if let Device::Rocm(ordinal) = device {
                 #[cfg(feature = "rocm-mem")]
                 {
-                    let dev = RocmDevice::new(*ordinal);
+                    let dev = RocmDevice::shared(*ordinal);
                     if let Ok(storage) = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone()) {
                         let f32_storage = {
                             let roc_storage = storage

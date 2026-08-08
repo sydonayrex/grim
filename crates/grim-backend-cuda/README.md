@@ -39,7 +39,7 @@ pub struct CudaDevice {
 }
 
 pub struct CudaStorage { /* GPU memory handle + metadata */ }
-pub struct CublasHandle(pub *mut c_void);
+pub struct CublasHandle(pub *mut c_void); // dropped → `cublasDestroy_v2`
 pub struct CudaHandle { /* ... */ }
 pub struct SendCmodule(pub CUmodule);
 
@@ -76,3 +76,4 @@ This crate has no feature flags.
 - Many `BackendDevice` methods (sqrt, recip, attention) return `Err(Error::Unimplemented(...))` — callers must fall back to CPU for these.
 - `vram_info` returns `Option` — `None` if the CUDA driver is unavailable.
 - `CudaDevice` is `Send` via `SendCmodule` wrapper for raw module pointers.
+- `CudaDevice` is pooled per ordinal: `CudaDevice::new(ordinal)` reuses one device (and one cuBLAS handle) per GPU for the process, so `to_cpu_vec_f32` on quantized weights no longer creates a cuBLAS handle per tensor. `CublasHandle` implements `Drop` and calls `cublasDestroy_v2` when the last `CudaDevice` clone sharing it is dropped.

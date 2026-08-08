@@ -416,6 +416,7 @@ pub async fn cmd_run(
         top_p,
         top_k,
         repeat_penalty,
+        thinking_level: grim_core::sampler::ThinkingLevel::Default,
     };
     let sampler: Box<dyn Sampler> = sampling_params.into_sampler(seed);
 
@@ -427,14 +428,11 @@ pub async fn cmd_run(
         // single-turn prompt through it for instruction-tuned models.
         // Otherwise fall back to raw prompt + best-effort BOS.
         let prompt_text = if tok.chat_template.is_some() {
-            // Some models (e.g. MiniCPM5) require a BOS token before the chat
-            // template output even though the template doesn't include it.
-            // Check the GGUF `add_bos_token` flag.
-            if tok.add_bos_token {
-                if let Some(bos_id) = tok.bos_token_id {
-                    ids.push(bos_id);
-                }
-            }
+            // The chat template itself is responsible for inserting BOS via
+            // `{{ bos_token }}` (grim-format resolves it to the tokenizer's
+            // `<s>` string). We must NOT prepend BOS here — that would
+            // double-inject it for models like MiniCPM5 whose template opens
+            // with `{{- bos_token }}`.
             let messages = vec![grim_format::ChatMessage {
                 role: "user".to_string(),
                 content: prompt.clone(),
@@ -536,6 +534,18 @@ pub async fn cmd_run(
         let logits_vec = logits.to_vec_f32()?;
         let last_start = logits_vec.len().saturating_sub(vocab);
         let last_logits = &logits_vec[last_start..];
+
+        // Temporary A/B diagnostic: dump the top-5 next-token logits on the
+        // first step so CPU vs ROCm paths can be compared post-prefill.
+        if std::env::var("GRIM_DUMP_LOGITS").is_ok() && generated_tokens.is_empty() {
+            let mut ranked: Vec<(usize, f32)> =
+                last_logits.iter().enumerate().map(|(i, v)| (i, *v)).collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            eprintln!("[LOGITS] top5 after prefill:");
+            for (id, val) in ranked.iter().take(5) {
+                eprintln!("[LOGITS]   tok {id}: {val}");
+            }
+        }
 
         // Single-position logits tensor so sampler sees next-token distribution only, not full sequence.
         let last_shape = grim_tensor::Shape::new(vec![vocab]);
@@ -673,6 +683,7 @@ pub fn init_generation(
         top_p,
         top_k,
         repeat_penalty,
+        thinking_level: grim_core::sampler::ThinkingLevel::Default,
     };
     let sampler: Box<dyn Sampler> = sampling_params.into_sampler(seed);
 
@@ -722,7 +733,9 @@ fn build_tensor(
             Arc::from(dev.from_cpu(data, shape, dtype.clone())?)
         }
         grim_tensor::Device::Rocm(ordinal) => {
-            let dev = grim_backend_rocm::RocmDevice::new(*ordinal);
+            // Shared singleton: per-weight `new()` + drop would flush the
+            // allocator cache and unload HIP modules on every upload.
+            let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
             Arc::from(dev.from_cpu(data, shape, dtype.clone())?)
         }
         grim_tensor::Device::Vulkan => {
@@ -829,6 +842,7 @@ pub async fn cmd_run_interactive(
         top_p,
         top_k,
         repeat_penalty,
+        thinking_level: grim_core::sampler::ThinkingLevel::Default,
     };
     let sampler: Box<dyn Sampler> = sampling_params.into_sampler(seed);
 

@@ -704,6 +704,20 @@ async fn chat_completions(
     // These were already accepted by the KNOWN_FIELDS gate above; here we
     // actually honor them instead of ignoring them (prior behavior was a
     // fixed 5-token argmax regardless of the request).
+    let thinking_str = body_obj
+        .get("reasoning_effort")
+        .or_else(|| body_obj.get("thinking"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            body_obj
+                .get("thinking")
+                .and_then(|v| v.as_bool())
+                .map(|b| if b { "on" } else { "off" })
+        });
+    let thinking_level = thinking_str
+        .map(grim_core::sampler::ThinkingLevel::parse)
+        .unwrap_or_default();
+
     let sampling = grim_core::sampler::SamplingParams {
         temperature: body_obj
             .get("temperature")
@@ -718,6 +732,7 @@ async fn chat_completions(
             .get("repeat_penalty")
             .and_then(|v| v.as_f64())
             .unwrap_or(1.0) as f32,
+        thinking_level,
     };
     // A per-request seed keeps stochastic sampling reproducible for a given
     // (model, request) without a global RNG; temperature == 0 path ignores it.

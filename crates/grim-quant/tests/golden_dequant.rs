@@ -429,3 +429,67 @@ fn f16_to_f32_via_q80_zero_normalized_subnormal() {
         }
     }
 }
+
+// ===========================================================================
+// Q5_K — hand-constructed 176-byte block golden vector test.
+// ===========================================================================
+#[test]
+fn q5k_golden_dequant_hand_constructed() {
+    let mut buf = vec![0u8; 176];
+    // d = 2.0 (f16 0x4000), dmin = 0.5 (f16 0x3800)
+    buf[0..2].copy_from_slice(&0x4000u16.to_le_bytes());
+    buf[2..4].copy_from_slice(&0x3800u16.to_le_bytes());
+
+    // scales: sub-block 0 sc_0 = 2 (buf[4] = 2), m_0 = 1 (buf[8] = 1)
+    // sub-block 1 sc_1 = 3 (buf[5] = 3), m_1 = 2 (buf[9] = 2)
+    buf[4] = 2;
+    buf[8] = 1;
+    buf[5] = 3;
+    buf[9] = 2;
+
+    // qh: byte 0 = 0x01 (u1 bit set for l=0 stride 0)
+    buf[16] = 1;
+
+    // qs: byte 0 (offset 48) = 4 (lo=4, hi=0)
+    buf[48] = 4;
+
+    let out = grim_quant::dequant_q5k(&buf, 256).expect("q5k dequant");
+    assert_eq!(out.len(), 256);
+
+    // out[0] (stride 0, l=0, lo nibble):
+    //   q1 = lo(4) + msb(16) = 20
+    //   val = d * sc_0 * q1 - dmin * m_0 = 2.0 * 2 * 20 - 0.5 * 1 = 79.5
+    assert_close(out[0], 79.5, "q5k lo weight at l=0");
+
+    // out[32] (stride 0, l=0, hi nibble):
+    //   q2 = hi(0) + msb(0) = 0
+    //   val = d * sc_1 * q2 - dmin * m_1 = 2.0 * 3 * 0 - 0.5 * 2 = -1.0
+    assert_close(out[32], -1.0, "q5k hi weight at l=0");
+}
+
+// ===========================================================================
+// Q6_K — hand-constructed 210-byte block golden vector test.
+// ===========================================================================
+#[test]
+fn q6k_golden_dequant_hand_constructed() {
+    let mut buf = vec![0u8; 210];
+    // d = 2.0 (f16 0x4000) at tail offset 208..210
+    buf[208..210].copy_from_slice(&0x4000u16.to_le_bytes());
+
+    // scales (signed i8 at 192..208): scale 0 = 5
+    buf[192] = 5;
+
+    // ql at offset 0: byte 0 = 0x34 (lo=4, hi=3)
+    buf[0] = 4;
+
+    // qh at offset 128: byte 0 = 0x01 (bits 0..1 = 1)
+    buf[128] = 1;
+
+    let out = grim_quant::dequant_q6k(&buf, 256).expect("q6k dequant");
+    assert_eq!(out.len(), 256);
+
+    // out[0] (stride 0, quarter 0, l=0):
+    //   q1 = lo(4) | (bits(1) << 4) = 20
+    //   val = d * sc_0 * (q1 - 32) = 2.0 * 5 * (20 - 32) = -120.0
+    assert_close(out[0], -120.0, "q6k quarter 0 weight at l=0");
+}

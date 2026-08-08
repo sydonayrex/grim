@@ -123,11 +123,11 @@ pub fn pick_device_for_tensor(x: &Tensor) -> Box<dyn BackendDevice> {
         }
         #[cfg(feature = "rocm-mem")]
         Device::Rocm(ordinal) => {
-            if let Ok(dev) = grim_backend_rocm::RocmDevice::try_new(*ordinal) {
-                Box::new(dev)
-            } else {
-                Box::new(grim_backend_cpu::CpuDevice::new())
-            }
+            // Process-wide shared device: per-op `try_new` + drop would run
+            // the ROCm destructor (hipDeviceSynchronize + allocator flush +
+            // module unload) on every dispatch. Arc clones keep the singleton
+            // alive (see `BackendDevice for Arc<T>` in grim_tensor).
+            Box::new(grim_backend_rocm::RocmDevice::shared(*ordinal))
         }
         #[cfg(feature = "vulkan-mem")]
         Device::Vulkan => Box::new(grim_backend_vulkan::VulkanDevice::new()),

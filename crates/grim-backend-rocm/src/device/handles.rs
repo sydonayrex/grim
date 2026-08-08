@@ -127,6 +127,9 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> HipErrorT;
     pub fn hipDeviceSynchronize() -> HipErrorT;
+    /// Returns the most recent asynchronous error reported on any API call
+    /// (including kernel launches), or success. Does not block.
+    pub fn hipGetLastError() -> HipErrorT;
     pub fn hipGetDeviceCount(count: *mut HipErrorT) -> HipErrorT;
     pub fn hipSetDevice(ordinal: HipErrorT) -> HipErrorT;
     pub fn hipGetDeviceProperties(prop: *mut c_void, device: i32) -> HipErrorT;

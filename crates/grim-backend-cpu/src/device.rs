@@ -358,29 +358,28 @@ impl BackendDevice for CpuDevice {
         let v_st = a_storage(v)?;
         let q_dims = q_st.shape().dims();
         let k_dims = k_st.shape().dims();
-        if q_dims.len() != 3 || k_dims.len() != 3 {
-            return Err(Error::Shape("qkv_attention: q/k/v must be 3-D".into()));
+        // Only the leading token count and the per-head stride matter for the
+        // flat reads below; storage views may legally be batch-1 3-D
+        // `(1, rows*heads, head_dim)`. Validate rank/last-dim only.
+        if q_dims.len() < 2 || k_dims.len() < 2 {
+            return Err(Error::Shape("qkv_attention: q/k/v must be >= 2-D".into()));
         }
-        let seq_len = q_dims[0];
-        let num_heads = q_dims[1];
-        let head_dim = q_dims[2];
-        if k_dims[2] != head_dim || v_st.shape().dims() != k_dims {
+        let out_dims = out_shape.dims();
+        if out_dims.len() != 3 {
+            return Err(Error::Shape("qkv_attention: out_shape mismatch".into()));
+        }
+        let seq_len = out_dims[0];
+        let num_heads = out_dims[1];
+        let head_dim = out_dims[2];
+        if k_dims[k_dims.len() - 1] != head_dim || v_st.shape().dims().len() < 2 {
             return Err(Error::Shape(
-                "qkv_attention: k/v shape mismatch with q".into(),
+                "qkv_attention: k/v last dim must match head_dim".into(),
             ));
         }
         if num_heads % num_kv_heads != 0 {
             return Err(Error::Shape(
                 "qkv_attention: num_heads must be multiple of num_kv_heads".into(),
             ));
-        }
-        let out_dims = out_shape.dims();
-        if out_dims.len() != 3
-            || out_dims[0] != seq_len
-            || out_dims[1] != num_heads
-            || out_dims[2] != head_dim
-        {
-            return Err(Error::Shape("qkv_attention: out_shape mismatch".into()));
         }
         let qd = q_st.data();
         let kd = k_st.data();
@@ -613,10 +612,116 @@ impl BackendDevice for CpuDevice {
                     .collect();
                 Ok(Box::new(CpuStorage::new(f32_data, shape.clone(), dtype)))
             }
-            _ => Err(Error::Unimplemented(
-                "from_cpu_bytes only implemented for native f32 on CPU backend".into(),
-            )),
+            _ => Ok(Box::new(CpuStorage::from_raw_bytes(
+                data.to_vec(),
+                shape.clone(),
+                dtype,
+            ))),
         }
+    }
+
+    fn quantized_matmul(
+        &self,
+        a: &dyn BackendStorage,
+        b_packed: &dyn BackendStorage,
+        b_scales: &[f32],
+        format: grim_tensor::QuantFormat,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let a_storage = a_storage(a)?;
+        let a_data = a_storage.data();
+        let a_dims = a.shape().dims();
+        let out_dims = out_shape.dims();
+        let m = a_dims[0];
+        let k = a_dims[1];
+        let n = out_dims[1];
+
+        let b_bytes: Vec<u8> = if let Some(cs) = b_packed.as_any().downcast_ref::<CpuStorage>() {
+            if let Some(rb) = &cs.raw_bytes {
+                (**rb).clone()
+            } else {
+                cs.data().iter().map(|&f| f as u8).collect()
+            }
+        } else {
+            vec![0u8; k * n]
+        };
+
+        let b_dequant: Vec<f32> = match format {
+            grim_tensor::QuantFormat::Q8_0 => {
+                let blocks_per_col = k / 32;
+                let mut out = vec![0.0f32; k * n];
+                for col in 0..n {
+                    for block in 0..blocks_per_col {
+                        let scale_idx = col * blocks_per_col + block;
+                        let scale = b_scales.get(scale_idx).copied().unwrap_or(1.0f32);
+                        for i in 0..32 {
+                            let byte_offset = (col * blocks_per_col + block) * 32 + i;
+                            let q_val = b_bytes
+                                .get(byte_offset)
+                                .map(|&b| (b as i8) as f32)
+                                .unwrap_or(0.0f32);
+                            let r = block * 32 + i;
+                            if r < k {
+                                out[r * n + col] = q_val * scale;
+                            }
+                        }
+                    }
+                }
+                out
+            }
+            grim_tensor::QuantFormat::Q4K => grim_quant::dequant_q4k(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("CPU quantized_matmul Q4K dequant: {e}")))?,
+            grim_tensor::QuantFormat::Q5K => grim_quant::dequant_q5k(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("CPU quantized_matmul Q5K dequant: {e}")))?,
+            grim_tensor::QuantFormat::Q6K => grim_quant::dequant_q6k(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("CPU quantized_matmul Q6K dequant: {e}")))?,
+            grim_tensor::QuantFormat::Iq4Nl => grim_quant::dequant_iq4nl(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("CPU quantized_matmul IQ4NL dequant: {e}")))?,
+            grim_tensor::QuantFormat::Iq4Xs => grim_quant::dequant_iq4xs(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("CPU quantized_matmul IQ4XS dequant: {e}")))?,
+            grim_tensor::QuantFormat::Iq3Xxs => grim_quant::dequant_iq3xxs(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("CPU quantized_matmul IQ3XXS dequant: {e}")))?,
+            grim_tensor::QuantFormat::Iq3S => grim_quant::dequant_iq3s(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("CPU quantized_matmul IQ3S dequant: {e}")))?,
+            grim_tensor::QuantFormat::Iq2Xxs => grim_quant::dequant_iq2xxs(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("CPU quantized_matmul IQ2XXS dequant: {e}")))?,
+            grim_tensor::QuantFormat::Iq2Xs => grim_quant::dequant_iq2xs(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("CPU quantized_matmul IQ2XS dequant: {e}")))?,
+            grim_tensor::QuantFormat::Iq2S => grim_quant::dequant_iq2s(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("CPU quantized_matmul IQ2S dequant: {e}")))?,
+            grim_tensor::QuantFormat::Fp4 => {
+                grim_quant::dequant_mxfp4(&b_bytes, k * n)
+                    .map_err(|e| Error::Backend(format!("CPU quantized_matmul MXFP4 dequant: {e}")))?
+            }
+            grim_tensor::QuantFormat::Fp4Block16 => {
+                grim_quant::dequant_fp4_block16(&b_bytes, k * n).map_err(|e| {
+                    Error::Backend(format!("CPU quantized_matmul FP4Block16 dequant: {e}"))
+                })?
+            }
+            grim_tensor::QuantFormat::Fp8 => grim_quant::dequant_fp8(&b_bytes, k * n)
+                .map_err(|e| Error::Backend(format!("CPU quantized_matmul FP8 dequant: {e}")))?,
+            unsupported => {
+                return Err(Error::Backend(format!(
+                    "CPU quantized_matmul: unsupported format {unsupported:?}"
+                )));
+            }
+        };
+
+        let mut c_vec = vec![0.0f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += a_data[row * k + p] * b_dequant[col * k + p];
+                }
+                c_vec[row * n + col] = sum;
+            }
+        }
+
+        Ok((
+            Box::new(CpuStorage::new(c_vec, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
     }
 
     fn advise(
@@ -1001,5 +1106,87 @@ mod tests {
         assert!(handle.is_ready());
         let result = out_s.to_cpu_vec_f32().unwrap();
         // Hand-computed: C[i][j] = sum_k A[i][k] * B[k][j]
+        // Row 0: 1*1 + 2*3 + 3*5 = 22, 1*2 + 2*4 + 3*6 = 28
+        // Row 1: 4*1 + 5*3 + 6*5 = 49, 4*2 + 5*4 + 6*6 = 64
+        assert_eq!(result, vec![22.0, 28.0, 49.0, 64.0]);
+    }
+
+    #[test]
+    fn test_backend_quantized_matmul_q4_k() {
+        let dev = CpuDevice::new();
+        let m = 2;
+        let k = 256;
+        let n = 4;
+
+        let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.05).sin()).collect();
+
+        // Hand construct packed Q4_K weights for B (n_blocks * 144 = 4 * 144 = 576 bytes).
+        let mut b_packed = vec![0u8; n * 144];
+        for col in 0..n {
+            let blk = &mut b_packed[col * 144..(col + 1) * 144];
+            let d_bits = 0x3E00u16.to_le_bytes(); // f16 1.5
+            let min_bits = 0x3400u16.to_le_bytes(); // f16 0.25
+            blk[0..2].copy_from_slice(&d_bits);
+            blk[2..4].copy_from_slice(&min_bits);
+            blk[4] = 2; // sc0 = 2
+            blk[8] = 1; // m0 = 1
+            blk[16] = 5 | (3 << 4); // lo nibble 5, hi nibble 3
+        }
+
+        let a_shape = Shape::new(vec![m, k]);
+        let b_packed_shape = Shape::new(vec![576]);
+        let out_shape = Shape::new(vec![m, n]);
+
+        let a_s = dev.from_cpu(&a_data, &a_shape, DType::F32).unwrap();
+        let b_s = dev
+            .from_cpu_bytes(
+                &b_packed,
+                &b_packed_shape,
+                DType {
+                    arith: grim_tensor::dtype::ArithType::F32,
+                    storage: grim_tensor::dtype::Storage::KQuant(
+                        grim_tensor::dtype::KQuantScheme::Q4K,
+                    ),
+                },
+            )
+            .unwrap();
+
+        let (out_s, _handle) = dev
+            .quantized_matmul(
+                a_s.as_ref(),
+                b_s.as_ref(),
+                &[],
+                grim_tensor::QuantFormat::Q4K,
+                &out_shape,
+            )
+            .unwrap();
+
+        let actual = out_s.to_cpu_vec_f32().unwrap();
+
+        // Independent CPU reference.
+        let mut b_deq = vec![0.0f32; k * n];
+        for col in 0..n {
+            let col_bytes = &b_packed[col * 144..(col + 1) * 144];
+            let col_weights = grim_quant::dequant_q4k(col_bytes, 256).unwrap();
+            for r in 0..k {
+                b_deq[r * n + col] = col_weights[r];
+            }
+        }
+
+        let mut expected = vec![0.0f32; m * n];
+        for r in 0..m {
+            for c in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += a_data[r * k + p] * b_deq[p * n + c];
+                }
+                expected[r * n + c] = sum;
+            }
+        }
+
+        assert!(
+            approx_eq(&actual, &expected, 1e-3),
+            "actual={actual:?} expected={expected:?}"
+        );
     }
 }

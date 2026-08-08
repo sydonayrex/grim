@@ -11,13 +11,15 @@ pub mod minicpm;
 pub mod model;
 pub mod multimodal;
 pub mod native_mtp;
+mod falcon_h1;
 pub mod t5;
 
-pub use block::{LlamaBlock, LlamaConfigRefs};
+pub use block::{LlamaBlock, LlamaConfigRefs, LlamaLayerCache};
 pub use configs::{BloomConfig, FalconConfig, MoeConfig, PhiConfig, QwenConfig};
 pub use deepseek::{DeepSeek, DeepSeekConfig};
 pub use gemma::{Gemma, GemmaConfig};
 pub use gpt2::{Gpt2, Gpt2Config};
+pub use falcon_h1::{FalconH1Config, FalconH1LayerCache, FalconH1Model};
 pub use lfm2::{Lfm2, Lfm2Config, Lfm2LayerCache};
 pub use lora::apply_adapters_to_logits;
 pub use minicpm::{MiniCpmBlock, MiniCpmConfig, MiniCpmModel};
@@ -124,3 +126,4 @@ mod tests {
         );
     }
 }
+
