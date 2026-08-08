@@ -12,12 +12,20 @@ extern "C" {
         float dmin = fp16_to_float_device(h_ptr[1]);
 
         const unsigned char* scales = block_ptr + 4;
-        const unsigned char* qs = block_ptr + 16;
-        const unsigned char* qh = block_ptr + 144;
+        const unsigned char* qh = block_ptr + 16;   // 32 bytes, 2 high bits/weight
+        const unsigned char* qs = block_ptr + 48;   // 128 bytes, 4 low bits/weight
 
-        int is = in_sb / 32; // 0..7 sub-block index
+        // ggml layout: four 64-weight groups. Within group n, the first 32
+        // weights take the low nibble of qs[n*32 + l] with high bit
+        // qh[l] & (1 << 2n) and scale sub-block 2n; the next 32 take the high
+        // nibble with bit qh[l] & (1 << (2n+1)) and scale sub-block 2n+1.
+        int n = in_sb / 64;      // 0..3 group
+        int j = in_sb % 64;      // 0..63 within group
+        int l = j & 31;          // qs/qh byte index within the group
+        int hi = j >> 5;         // 0 = low nibble, 1 = high nibble
+        int is = 2 * n + hi;     // 0..7 scale sub-block
 
-        // 6-bit scale unpacking (same as Q4_K): sc and m each 3 bits, packed 4 per byte
+        // 6-bit scale unpacking (same as Q4_K): sc and m each 6 bits
         unsigned char sc, m;
         if (is < 4) {
             sc = scales[is] & 63;
@@ -27,16 +35,9 @@ extern "C" {
             m  = (scales[is + 4] >> 4)  | ((scales[is] >> 6) << 4);
         }
 
-        // Low 4 bits from qs (2 codes per byte, alternating nibble placement)
-        int q_idx = in_sb / 2;
-        unsigned char packed = qs[q_idx];
-        unsigned char q_low = (in_sb % 2 == 0) ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
-
-        // MSB (5th bit) from qh: one bit per weight packed sequentially,
-        // stored as one byte per 8 weights (32 bytes / 256 weights → 1 bit per weight)
-        int qh_byte = in_sb / 8;
-        int qh_bit  = in_sb % 8;
-        unsigned char msb = (qh[qh_byte] >> qh_bit) & 1;
+        unsigned char packed = qs[n * 32 + l];
+        unsigned char q_low = hi ? (packed >> 4) : (packed & 0x0F);
+        unsigned char msb = (qh[l] >> (2 * n + hi)) & 1;
 
         // Full 5-bit code: low 4 bits + msb shifted to bit 4
         int q_code = (int)q_low | ((int)msb << 4);
