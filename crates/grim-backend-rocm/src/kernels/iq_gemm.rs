@@ -224,35 +224,6 @@ extern "C" {
         return d * (float)sc * (float)q_code - dmin * (float)m;
     }
 
-    // ===================== Q6_K (full) =====================
-
-    __device__ inline float dequant_q6k_standalone(const unsigned char* block_ptr, int in_sb) {
-        const float d = fp16_to_float_device(((const unsigned short*)block_ptr)[0]);
-        const float dmin = fp16_to_float_device(((const unsigned short*)block_ptr)[1]);
-        const unsigned char* scales = block_ptr + 4;
-        const unsigned char* qs = block_ptr + 16;
-        const unsigned char* qh = block_ptr + 144;
-
-        int is = in_sb / 32;
-        unsigned char sc, m;
-        if (is < 4) {
-            sc = scales[is] & 63;
-            m  = scales[is + 4] & 63;
-        } else {
-            sc = (scales[is + 4] & 0xF) | ((scales[is - 4] >> 6) << 4);
-            m  = (scales[is + 4] >> 4)  | ((scales[is] >> 6) << 4);
-        }
-
-        int q_idx = in_sb / 2;
-        unsigned char q_low = (in_sb % 2 == 0) ? (qs[q_idx] & 0x0F) : ((qs[q_idx] >> 4) & 0x0F);
-        int qh_byte_idx = in_sb / 4;
-        int qh_bit_offset = (in_sb % 4) * 2;
-        unsigned char qh_bits = (qh[qh_byte_idx] >> qh_bit_offset) & 0x03;
-        int q_code = (int)q_low | ((int)qh_bits << 4);
-
-        return d * (float)sc * (float)q_code - dmin * (float)m;
-    }
-
     // ===================== Q2_K standalone =====================
 
     __device__ inline float dequant_q2k_standalone(const unsigned char* block_ptr, int in_sb) {

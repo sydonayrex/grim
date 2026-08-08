@@ -507,18 +507,24 @@ impl Linear {
 }
 
 fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
-    // Dequantize first so quantized GGUF weights (Q8_0, etc.) are genuinely
-    // transposed to [in_dim, out_dim]. The previous `is_quantized()` early
-    // return left w_t as the untransposed [out_dim, in_dim] storage; on ROCm
-    // (where weights stay quantized after materialize) that made in_proj's
-    // w_t=[3072,1024] instead of [1024,3072], so the matmul's k-dim check
-    // failed with ShapeMismatch{expected:[12,1024], got:[3072,1024]}. On CPU
-    // the GGUF loader dequantizes during materialize, so the early return was
-    // simply never taken there — masking the bug. `to_vec_f32` dequantizes
-    // quantized dtypes, so the path below is correct for both F32 and quant.
+    // GGUF stores Linear weights as [in_dim, out_dim]. Backends consume this
+    // differently, so gate the relabel on the device:
+    //   * CUDA / CPU / Vulkan / Metal: keep the GGUF [in,out] layout as-is.
+    //     The CUDA fused GEMM relabels b_dims symmetrically and reads the same
+    //     packed bytes; the F32 matmul consumes [in,out] directly. (Verified:
+    //     CUDA Q4K/Q6K KATs pass.)
+    //   * ROCm: the fused dequant-GEMM kernel reads B as [out_dim, in_dim]
+    //     (it indexes `col` over the output dim), so relabel the shape to
+    //     [out,in] for quantized weights (no byte move) and genuinely
+    //     transpose the data for F32 weights (its matmul wants B=[out,in]).
+    //     Without this relabel ROCm hits ShapeMismatch (expected [16,1536]
+    //     got [2048,1536]) because the kernel writes the wrong output shape.
     let dims = t.shape().dims().to_vec();
     if dims.len() != 2 {
         return Err(Error::Shape("transpose_last_two: only 2-D".into()));
+    }
+    if !matches!(t.device(), Device::Rocm(_)) {
+        return Ok(t.clone());
     }
     let (a, b) = (dims[0], dims[1]);
     let new_shape = Shape::new(vec![b, a]);
