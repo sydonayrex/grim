@@ -194,6 +194,10 @@ static REQUEST_HISTORIES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u64, Vec<u32>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// WI-1 (defense-in-depth): returns `Err(message)` instead of panicking when
+/// the engine cannot advance. A network request must never be able to unwind
+/// this task while the engine mutex is held — that poisons the mutex and takes
+/// down every subsequent request on the process.
 fn sample_next_token(
     engine: &mut grim_engine::Engine,
     request_id: u64,
@@ -202,9 +206,12 @@ fn sample_next_token(
     prompt_tokens: Option<&[u32]>, // Only provided on step 0
     vocab_size: usize,
     model_id: Option<String>,
-) -> u32 {
+) -> std::result::Result<u32, String> {
     if step == 0 {
-        let prompt_tokens = prompt_tokens.expect("prompt_tokens must be provided on step 0");
+        let prompt_tokens = match prompt_tokens {
+            Some(t) => t,
+            None => return Err("prompt_tokens must be provided on step 0".to_string()),
+        };
         if let Ok(mut hist) = REQUEST_HISTORIES.lock() {
             hist.insert(request_id, prompt_tokens.to_vec());
         }
@@ -224,8 +231,11 @@ fn sample_next_token(
         let _ = engine.enqueue_request(req);
     }
 
+    // WI-1: propagate instead of panicking. Panicking here unwound the stream
+    // task while the engine mutex was held, poisoning it for every later
+    // request and preventing the `[DONE]` SSE terminator from ever being sent.
     if let Err(e) = engine.tick() {
-        panic!("[sample_next_token] engine tick failed: {e}");
+        return Err(format!("engine tick failed: {e}"));
     }
 
     let history = REQUEST_HISTORIES
@@ -263,7 +273,72 @@ fn sample_next_token(
     // Record the generated token so the next decode step uses the real token
     // instead of a position index.
     engine.record_generated_token(request_id, token);
-    token
+    Ok(token)
+}
+
+/// WI-1 — Remote-provider scheme allowlist.
+///
+/// Only these prefixes (used as `"<scheme>:<model>"`) denote a remote provider
+/// route. Kept in sync with the provider keys understood by
+/// [`grim_core::client::load_login_token`], which derives its credential key
+/// from `requested_model.split(':').next()`.
+const REMOTE_PROVIDER_SCHEMES: &[&str] = &["ollama", "openai", "hf", "huggingface", "anthropic"];
+
+/// Cached snapshot of local catalog names, refreshed at most once per
+/// [`CATALOG_CACHE_TTL`]. `list_local_models()` performs a filesystem scan, so
+/// calling it unconditionally per request would add real latency to the
+/// request-handling hot path (WI-1 gate 4).
+static LOCAL_CATALOG_CACHE: std::sync::LazyLock<
+    Mutex<Option<(std::time::Instant, std::collections::HashSet<String>)>>,
+> = std::sync::LazyLock::new(|| Mutex::new(None));
+
+const CATALOG_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// True when `name` exactly matches an entry in the local model catalog.
+///
+/// The catalog names files as `"{stem}:{ext}"` (`catalog.rs`), so local names
+/// routinely contain a colon — this check is what keeps them from being
+/// misrouted to the remote-provider branch.
+pub fn is_local_catalog_model(name: &str) -> bool {
+    let now = std::time::Instant::now();
+    let mut guard = match LOCAL_CATALOG_CACHE.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let fresh = guard
+        .as_ref()
+        .is_some_and(|(at, _)| now.duration_since(*at) < CATALOG_CACHE_TTL);
+    if !fresh {
+        let names: std::collections::HashSet<String> = grim_core::catalog::list_local_models()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        *guard = Some((now, names));
+    }
+    guard
+        .as_ref()
+        .is_some_and(|(_, names)| names.contains(name))
+}
+
+/// WI-1 — Decide whether a requested model name should be routed to the remote
+/// provider proxy instead of being served locally.
+///
+/// A name is remote only when it carries a known provider scheme *and* does not
+/// collide with a local catalog entry. Local catalog entries always win: the
+/// catalog's own `"{stem}:{ext}"` naming convention would otherwise make every
+/// locally-pulled model permanently unreachable through the OpenAI-compatible
+/// endpoint (the WI-1 root cause).
+pub fn is_remote_provider_model(name: &str) -> bool {
+    if is_local_catalog_model(name) {
+        return false;
+    }
+    if name.starts_with("hf/") {
+        return true;
+    }
+    match name.split_once(':') {
+        Some((scheme, rest)) if !rest.is_empty() => REMOTE_PROVIDER_SCHEMES.contains(&scheme),
+        _ => false,
+    }
 }
 
 /// Build the OpenAI `choices[0]` payload for one generated completion,
@@ -495,10 +570,12 @@ async fn chat_completions(
         .unwrap_or("default")
         .to_string();
 
-    // Remote Provider Routing — if model starts with a remote provider scheme or prefix
-    // (e.g. "ollama:cloud", "openai:gpt-4", "hf:meta-llama/..."), route through remote provider proxy using saved credentials.
-    let is_remote_provider = requested_model.contains(':') || requested_model.starts_with("hf/");
-    if is_remote_provider {
+    // WI-1: Remote Provider Routing — route only names carrying a *known*
+    // remote provider scheme (e.g. "ollama:cloud", "openai:gpt-4",
+    // "hf/meta-llama/..."). The previous `contains(':')` heuristic collided
+    // with the local catalog's own `"{stem}:{ext}"` naming convention
+    // (catalog.rs), making every locally-cataloged model unroutable.
+    if is_remote_provider_model(&requested_model) {
         let provider_key = requested_model.split(':').next().unwrap_or("default");
         let token = grim_core::client::load_login_token(provider_key)
             .ok()
@@ -959,6 +1036,7 @@ async fn chat_completions(
                 let parse_ctx = (tools_active_clone, template_family_clone.clone());
                 let prior_messages = messages.clone();
                 let req_model = requested_model.clone();
+                let stream_model = requested_model.clone();
                 async move {
                     // WI-CANCEL-1: check for explicit cancel before doing work.
                     // The cancel endpoint calls cancel_token.cancel(); we poll it
@@ -994,8 +1072,11 @@ async fn chat_completions(
                         });
                     }
 
-                    let token_id = {
-                        let mut engine = state.engine.lock().unwrap();
+                    let sampled = {
+                        let mut engine = match state.engine.lock() {
+                            Ok(g) => g,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
                         sample_next_token(
                             &mut engine,
                             request_id,
@@ -1009,6 +1090,35 @@ async fn chat_completions(
                             vocab_size,
                             Some(req_model),
                         )
+                    };
+                    // WI-1: a generation failure ends the stream with a
+                    // terminal OpenAI-shaped error event; the chained `[DONE]`
+                    // sentinel still fires because the task does not unwind.
+                    let token_id = match sampled {
+                        Ok(t) => t,
+                        Err(msg) => {
+                            let payload = serde_json::json!({
+                                "error": {
+                                    "code": "generation_failed",
+                                    "message": msg,
+                                }
+                            })
+                            .to_string();
+                            let ev = axum::response::sse::Event::default()
+                                .event("error")
+                                .data(payload);
+                            return Some((
+                                Ok(ev),
+                                (
+                                    max_tokens_clone,
+                                    emitted,
+                                    prompt_tokens,
+                                    request_id,
+                                    cancel_token,
+                                    cleanup_guard,
+                                ),
+                            ));
+                        }
                     };
 
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1039,7 +1149,11 @@ async fn chat_completions(
                             )
                         });
                     }
+                    // WI-2: streaming chunks echo the requested model too, so
+                    // clients validating `chunk.model` see what they sent.
                     let payload = serde_json::json!({
+                       "object": "chat.completion.chunk",
+                       "model": stream_model,
                        "choices": [{"index": 0, "delta": {"content": token_text}}],
                        "adapters_active": adapter_ids.len()
                     })
@@ -1083,8 +1197,11 @@ async fn chat_completions(
         let prompt_tokens = prompt_tokens.clone();
         // Honor `max_tokens` (was a hardcoded 5) and stop sequences.
         for step in 0..max_tokens {
-            let token_id = {
-                let mut engine = state.engine.lock().unwrap();
+            let sampled = {
+                let mut engine = match state.engine.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
                 sample_next_token(
                     &mut engine,
                     request_id,
@@ -1098,6 +1215,31 @@ async fn chat_completions(
                     vocab_size,
                     Some(requested_model.to_string()),
                 )
+            };
+            // WI-1: propagate a clean OpenAI-shaped 500 instead of panicking
+            // inside the handler while holding the engine mutex.
+            let token_id = match sampled {
+                Ok(t) => t,
+                Err(msg) => {
+                    let mut engine = match state.engine.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    engine.finish_request(request_id);
+                    drop(engine);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "generation_failed",
+                                "message": msg,
+                                "type": "server_error",
+                            },
+                            "model": requested_model,
+                        })),
+                    )
+                        .into_response();
+                }
             };
             let token_text = if let Some(tok) = &tokenizer {
                 tok.decode(&[token_id])
@@ -1200,11 +1342,15 @@ async fn chat_completions(
             let mut engine = state.engine.lock().unwrap();
             engine.finish_request(request_id);
         }
+        // WI-2: echo back exactly the model name the client requested, per
+        // OpenAI API semantics. The previous hardcoded "grim" broke any client
+        // that validates `response.model` against what it sent.
+        // TODO: `id` is still a static "chatcmpl-000"; make it unique.
         Json(serde_json::json!({
             "id": "chatcmpl-000",
             "object": "chat.completion",
             "created": 0,
-            "model": "grim",
+            "model": requested_model,
             "adapters_active": adapter_names.len(),
             "choices": [choice]
         }))
@@ -2833,6 +2979,207 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert!(body.get("choices").is_some());
         assert!(body.get("adapters_active").is_some());
+    }
+
+    /// Helper: build an AppState with a small CPU Llama registered under
+    /// `name`, so routing tests exercise the real generation path.
+    fn test_state_with_model(name: &str) -> Arc<AppState> {
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32000,
+                hidden_size: 512,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 4,
+                intermediate_size: 1024,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 2048,
+            },
+        ));
+        engine.register_model(name, mock_model);
+        Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            plugin_registry: None,
+        })
+    }
+
+    /// WI-1 unit test: the local-vs-remote decision must not treat the
+    /// catalog's own `"{stem}:{ext}"` naming convention as a remote provider
+    /// route. This is the exact defect that made every locally-cataloged model
+    /// unusable through `/v1/chat/completions`.
+    #[test]
+    fn test_colon_local_model_name_is_not_remote() {
+        // Catalog-style local names: colon-bearing but not a provider scheme.
+        assert!(!is_remote_provider_model("sleipnir:gguf"));
+        assert!(!is_remote_provider_model("mistral-7b:grim"));
+        assert!(!is_remote_provider_model("default"));
+        // Real remote-provider routes must still be recognised.
+        assert!(is_remote_provider_model("openai:gpt-4"));
+        assert!(is_remote_provider_model("ollama:cloud"));
+        assert!(is_remote_provider_model("hf/meta-llama/Llama-3-8B"));
+        // A known scheme with no model part is not a valid remote route.
+        assert!(!is_remote_provider_model("openai:"));
+    }
+
+    /// WI-1 correctness gate: posting a colon-bearing local catalog-style model
+    /// name that is registered with the engine must be served locally — 200
+    /// with real decoded content, no panic, no 404, no remote-provider detour.
+    #[tokio::test]
+    async fn test_chat_completions_serves_colon_bearing_local_model() {
+        let state = test_state_with_model("sleipnir:gguf");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state);
+
+        let request_body = serde_json::json!({
+            "model": "sleipnir:gguf",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": false,
+            "max_tokens": 3
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        // Real decoded content, not an error envelope.
+        assert!(body.get("error").is_none(), "unexpected error: {body}");
+        let content = body["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("choices[0].message.content must be a string");
+        assert!(!content.is_empty(), "expected non-empty generated content");
+        // WI-2: the response echoes exactly the requested model name.
+        assert_eq!(body["model"].as_str(), Some("sleipnir:gguf"));
+    }
+
+    /// WI-1 regression guard on the fix itself: an actual remote-style name
+    /// that is *not* in the local catalog must still take the remote-provider
+    /// branch (which does not register a model), so generation falls through
+    /// to the engine's already-loaded default rather than 404-ing.
+    #[tokio::test]
+    async fn test_chat_completions_remote_style_name_takes_remote_branch() {
+        assert!(is_remote_provider_model("openai:gpt-4"));
+
+        let state = test_state_with_model("default");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state);
+
+        let request_body = serde_json::json!({
+            "model": "openai:gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": false,
+            "max_tokens": 3
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // The remote branch never returns the local 404 "not in catalog" error.
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// WI-2 correctness gate: the non-streaming success payload echoes the
+    /// requested model instead of the old hardcoded literal `"grim"`.
+    #[tokio::test]
+    async fn test_chat_completions_echoes_requested_model() {
+        let state = test_state_with_model("default");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state);
+
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": false,
+            "max_tokens": 2
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["model"].as_str(), Some("default"));
+        assert_ne!(body["model"].as_str(), Some("grim"));
+    }
+
+    /// WI-2 streaming gate: every SSE chunk carries the requested model name,
+    /// and the stream still terminates with the `[DONE]` sentinel.
+    #[tokio::test]
+    async fn test_streaming_chunks_echo_requested_model_and_terminate() {
+        let state = test_state_with_model("sleipnir:gguf");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state);
+
+        let request_body = serde_json::json!({
+            "model": "sleipnir:gguf",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true,
+            "max_tokens": 3
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            text.contains("[DONE]"),
+            "stream must end with the [DONE] sentinel, got: {text}"
+        );
+        assert!(
+            text.contains("\"model\":\"sleipnir:gguf\""),
+            "stream chunks must echo the requested model, got: {text}"
+        );
     }
 
     /// E2E test: build .wasm fixture from .wat, register in PluginRegistry,
