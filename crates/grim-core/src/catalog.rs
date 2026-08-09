@@ -160,6 +160,22 @@ pub fn apply_gguf_enrichment(entry: &mut ModelEntry, model_path: &Path) {
     }
 }
 
+/// WI-3 serve-time self-heal: if `model_path`'s catalog sidecar still has
+/// an empty `arch` or zero `context_length` (an older pull, or a manually-
+/// placed file whose sidecar predates WI-3), reload it, fill only the empty
+/// fields from the GGUF header, and re-save. Header-only read — never the
+/// multi-GB tensor section. Failure is non-fatal (returns `()`); callers in
+/// the serve path invoke this after the model is already loaded, so a
+/// missing sidecar or unreadable header must never break serving.
+pub fn self_heal_sidecar(model_path: &Path) {
+    if let Some(mut entry) = ModelEntry::load_for(model_path) {
+        if entry.arch.is_empty() || entry.context_length == 0 {
+            apply_gguf_enrichment(&mut entry, model_path);
+            let _ = entry.save(model_path);
+        }
+    }
+}
+
 /// Fields derived from a GGUF header for catalog display.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GgufEnrichment {
@@ -694,6 +710,85 @@ mod tests {
             entry.context_length, 8192,
             "empty context filled from header"
         );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn self_heal_sidecar_backfills_empty_metadata() {
+        let bytes = build_gguf_with_metadata(
+            &[("w", &[4], 0, 0)],
+            &[
+                gguf_kv_string("general.architecture", "llama"),
+                gguf_kv_u64("general.parameter_count", 2_000_000_000),
+                gguf_kv_u64("llama.context_length", 4096),
+            ],
+        );
+        let tmp =
+            std::env::temp_dir().join(format!("grim_wi3_selfheal_{}.gguf", std::process::id()));
+        std::fs::write(&tmp, &bytes).unwrap();
+
+        // Plant a sidecar with empty arch / zero context_length (the pre-WI-3
+        // state for an older pull).
+        let entry = ModelEntry {
+            name: "x".into(),
+            path: tmp.to_string_lossy().into_owned(),
+            arch: String::new(),
+            params: String::new(),
+            quant: String::new(),
+            context_length: 0,
+            size_bytes: 0,
+            sha256: String::new(),
+            pulled_at: String::new(),
+            source: String::new(),
+        };
+        entry.save(&tmp).unwrap();
+
+        self_heal_sidecar(&tmp);
+
+        let healed = ModelEntry::load_for(&tmp).expect("sidecar must reload");
+        assert_eq!(healed.arch, "llama", "self-heal fills empty arch");
+        assert_eq!(healed.params, "2B", "self-heal fills empty params");
+        assert_eq!(healed.context_length, 4096, "self-heal fills empty context");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn self_heal_sidecar_is_noop_when_already_populated() {
+        let bytes = build_gguf_with_metadata(
+            &[("w", &[4], 0, 0)],
+            &[
+                gguf_kv_string("general.architecture", "llama"),
+                gguf_kv_u64("general.parameter_count", 99),
+                gguf_kv_u64("llama.context_length", 7),
+            ],
+        );
+        let tmp =
+            std::env::temp_dir().join(format!("grim_wi3_selfheal2_{}.gguf", std::process::id()));
+        std::fs::write(&tmp, &bytes).unwrap();
+
+        // Sidecar already has correct metadata from a WI-3 pull.
+        let entry = ModelEntry {
+            name: "x".into(),
+            path: tmp.to_string_lossy().into_owned(),
+            arch: "preset".into(),
+            params: "13B".into(),
+            quant: String::new(),
+            context_length: 8192,
+            size_bytes: 0,
+            sha256: String::new(),
+            pulled_at: String::new(),
+            source: String::new(),
+        };
+        entry.save(&tmp).unwrap();
+
+        self_heal_sidecar(&tmp);
+
+        let healed = ModelEntry::load_for(&tmp).unwrap();
+        assert_eq!(healed.arch, "preset", "already-populated arch untouched");
+        assert_eq!(healed.params, "13B");
+        assert_eq!(healed.context_length, 8192);
 
         let _ = std::fs::remove_file(&tmp);
     }
