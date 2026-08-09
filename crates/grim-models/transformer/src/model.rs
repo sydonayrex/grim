@@ -314,15 +314,8 @@ impl CausalLm for Llama {
             .expect("Llama::forward: session.model_state must be Vec<Option<LlamaLayerCache>>");
 
         let (logits, hidden_state, _kv_pairs) = {
-            let t0 = std::time::Instant::now();
+            let _t0 = std::time::Instant::now();
             let r = self.decode_paged(&hidden_t, &pos_vec, None, Some(caches))?;
-            if std::env::var("GRIM_TRACE").is_ok() {
-                eprintln!(
-                    "[TRACE] decode_paged {} tok took {:.1}ms",
-                    seq_len,
-                    t0.elapsed().as_secs_f32() * 1e3
-                );
-            }
             r
         };
         session.set_last_hidden_state(hidden_state);
