@@ -237,10 +237,10 @@ where
     .await?;
 
     // 5. Write catalog sidecar.
-    let entry = ModelEntry {
+    let mut entry = ModelEntry {
         name: model_ref.to_string(),
         path: dest_path.display().to_string(),
-        arch: String::new(), // Will be enriched when loaded by GgufProvider.
+        arch: String::new(), // WI-3: enriched below from the GGUF header.
         params: String::new(),
         quant: extract_quant_hint_from_tag(&tag),
         context_length: 0,
@@ -249,6 +249,9 @@ where
         pulled_at: utc_now_rfc3339(),
         source: "ollama".to_string(),
     };
+    // WI-3: fill arch/params/context_length from the just-downloaded file's
+    // GGUF header so `grim list` shows real metadata without a second scan.
+    crate::catalog::apply_gguf_enrichment(&mut entry, &dest_path);
     entry.save(&dest_path)?;
 
     progress_fn(DownloadProgress {
@@ -327,7 +330,7 @@ where
     )
     .await?;
 
-    let entry = ModelEntry {
+    let mut entry = ModelEntry {
         name: format!("{org}/{repo}/{filename}"),
         path: dest_path.display().to_string(),
         arch: String::new(),
@@ -339,6 +342,8 @@ where
         pulled_at: utc_now_rfc3339(),
         source: "huggingface".to_string(),
     };
+    // WI-3: enrich arch/params/context_length from the GGUF header.
+    crate::catalog::apply_gguf_enrichment(&mut entry, &dest_path);
     entry.save(&dest_path)?;
 
     progress_fn(DownloadProgress {

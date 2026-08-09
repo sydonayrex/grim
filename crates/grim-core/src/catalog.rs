@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::grim_models_dir;
+use grim_format::gguf::{GgufFile, GgufValue, read_gguf};
 use grim_tensor::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +79,119 @@ impl ModelEntry {
         let sidecar = Self::sidecar_path_for(model_path);
         let text = std::fs::read_to_string(sidecar).ok()?;
         serde_json::from_str(&text).ok()
+    }
+}
+
+impl ModelEntry {
+    /// Best-effort GGUF header enrichment.
+    ///
+    /// Parses only the GGUF header (magic, version, metadata KV map) — never
+    /// the multi-GB tensor data section — so it is cheap enough to run on the
+    /// per-model pull path and during `GET /v1/models`. Returns the fields the
+    /// catalog displays: architecture (`general.architecture`), a human-readable
+    /// parameter count (`general.parameter_count`, e.g. `"7B"`), and the context
+    /// window (`llama.context_length` / `<arch>.context_length`).
+    ///
+    /// A corrupted or non-GGUF file yields `None` and the caller keeps whatever
+    /// it already had (filename-derived hint, empty strings); this never fails
+    /// the surrounding download/catalog operation.
+    pub fn enrich_from_gguf(model_path: &Path) -> Option<GgufEnrichment> {
+        let mut file = std::fs::File::open(model_path).ok()?;
+        let gguf: GgufFile = read_gguf(&mut file).ok()?;
+
+        let arch = gguf
+            .metadata
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let params = gguf
+            .metadata
+            .get("general.parameter_count")
+            .and_then(|v| match v {
+                GgufValue::Uint64(n) => Some(human_param_count(*n)),
+                GgufValue::Int64(n) if *n > 0 => Some(human_param_count(*n as u64)),
+                GgufValue::Float64(f) => Some(human_param_count(*f as u64)),
+                GgufValue::String(s) => Some(s.clone()),
+                _ => None,
+            });
+
+        let context_length = arch
+            .as_ref()
+            .and_then(|a| gguf.metadata.get(&format!("{a}.context_length")))
+            .and_then(|v| v.as_u32().map(|n| n as u64))
+            .or_else(|| {
+                gguf.metadata
+                    .get("llama.context_length")
+                    .and_then(|v| v.as_u32().map(|n| n as u64))
+            })
+            .or_else(|| {
+                gguf.metadata
+                    .get("general.context_length")
+                    .and_then(|v| v.as_u32().map(|n| n as u64))
+            });
+
+        Some(GgufEnrichment {
+            arch: arch.unwrap_or_default(),
+            params: params.unwrap_or_default(),
+            context_length: context_length.unwrap_or(0),
+        })
+    }
+}
+
+/// Fill a `ModelEntry`'s `arch` / `params` / `context_length` from a GGUF
+/// header when those fields are still empty. Header-only read, so it is safe to
+/// call on the per-model pull path and the filesystem-scan fallback. Never
+/// overwrites data already present (e.g. a sidecar's richer value).
+pub fn apply_gguf_enrichment(entry: &mut ModelEntry, model_path: &Path) {
+    if !entry.arch.is_empty() && !entry.params.is_empty() && entry.context_length != 0 {
+        return;
+    }
+    if let Some(e) = ModelEntry::enrich_from_gguf(model_path) {
+        if entry.arch.is_empty() {
+            entry.arch = e.arch;
+        }
+        if entry.params.is_empty() {
+            entry.params = e.params;
+        }
+        if entry.context_length == 0 {
+            entry.context_length = e.context_length;
+        }
+    }
+}
+
+/// Fields derived from a GGUF header for catalog display.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GgufEnrichment {
+    pub arch: String,
+    pub params: String,
+    pub context_length: u64,
+}
+
+/// Format a parameter count into a compact human label (e.g. 7_000_000_000 ->
+/// `"7B"`). Counts are rounded to the nearest 0.1B for cleaner labels.
+fn human_param_count(n: u64) -> String {
+    const B: f64 = 1_000_000_000.0;
+    const M: f64 = 1_000_000.0;
+    if n >= 1_000_000_000 {
+        let v = (n as f64 / B * 10.0).round() / 10.0;
+        format!("{}B", trim_zero(v))
+    } else if n >= 1_000_000 {
+        let v = (n as f64 / M * 10.0).round() / 10.0;
+        format!("{}M", trim_zero(v))
+    } else if n == 0 {
+        String::new()
+    } else {
+        n.to_string()
+    }
+}
+
+/// Render a float without a trailing `.0` (so `7`, not `7.0`; `6.7` stays).
+fn trim_zero(v: f64) -> String {
+    let s = format!("{v}");
+    match s.strip_suffix(".0") {
+        Some(stripped) => stripped.to_string(),
+        None => s,
     }
 }
 
@@ -350,7 +464,7 @@ pub fn list_local_models() -> Vec<ModelEntry> {
                     .unwrap_or("unknown")
                     .to_string();
                 let size_bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                out.push(ModelEntry {
+                let mut entry = ModelEntry {
                     name: format!("{stem}:{ext}"),
                     path: path_str,
                     arch: String::new(),
@@ -361,7 +475,11 @@ pub fn list_local_models() -> Vec<ModelEntry> {
                     sha256: String::new(),
                     pulled_at: String::new(),
                     source: String::new(),
-                });
+                };
+                // WI-3: best-effort header-derived arch/params/context_length
+                // for manually-placed files that have no pull sidecar.
+                apply_gguf_enrichment(&mut entry, &path);
+                out.push(entry);
             }
         }
     }
@@ -435,5 +553,148 @@ mod tests {
                 None => std::env::remove_var("GRIM_MODELS_DIR"),
             }
         }
+    }
+
+    // ---- WI-3: GGUF-header catalog enrichment --------------------------------
+
+    /// Build a minimal GGUF v3 byte stream with metadata KV pairs, mirroring the
+    /// on-disk layout (not the library writer) so the assertion is encoder-independent.
+    fn build_gguf_with_metadata(
+        tensors: &[(&str, &[u64], u32, u64)],
+        metadata: &[(&str, u32, Vec<u8>)],
+    ) -> Vec<u8> {
+        use grim_format::gguf::GGUF_MAGIC;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes()); // GGUF_VERSION
+        buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+        for (key, tag, val) in metadata {
+            buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(&tag.to_le_bytes());
+            buf.extend_from_slice(val);
+        }
+        for (name, dims, dtype, offset) in tensors {
+            buf.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+            buf.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for &d in *dims {
+                buf.extend_from_slice(&d.to_le_bytes());
+            }
+            buf.extend_from_slice(&dtype.to_le_bytes());
+            buf.extend_from_slice(&offset.to_le_bytes());
+        }
+        buf
+    }
+
+    fn gguf_kv_string<'a>(key: &'a str, val: &'a str) -> (&'a str, u32, Vec<u8>) {
+        let mut v = (val.len() as u64).to_le_bytes().to_vec();
+        v.extend_from_slice(val.as_bytes());
+        (key, 8, v)
+    }
+
+    fn gguf_kv_u64(key: &str, val: u64) -> (&str, u32, Vec<u8>) {
+        (key, 10, val.to_le_bytes().to_vec())
+    }
+
+    #[test]
+    fn human_param_count_formats_bands() {
+        assert_eq!(human_param_count(7_000_000_000), "7B");
+        assert_eq!(human_param_count(6_700_000_000), "6.7B");
+        assert_eq!(human_param_count(13_000_000_000), "13B");
+        assert_eq!(human_param_count(70_000_000_000), "70B");
+        assert_eq!(human_param_count(1_300_000_000), "1.3B");
+        assert_eq!(human_param_count(350_000_000), "350M");
+        assert_eq!(human_param_count(0), "");
+        assert_eq!(human_param_count(42), "42");
+    }
+
+    #[test]
+    fn enrich_from_gguf_reads_arch_params_context() {
+        let bytes = build_gguf_with_metadata(
+            &[("token_embd.weight", &[32000, 4096], 0, 0)],
+            &[
+                gguf_kv_string("general.architecture", "llama"),
+                gguf_kv_u64("general.parameter_count", 7_000_000_000),
+                gguf_kv_u64("llama.context_length", 4096),
+            ],
+        );
+        let tmp = std::env::temp_dir().join(format!("grim_wi3_{}.gguf", std::process::id()));
+        std::fs::write(&tmp, &bytes).unwrap();
+
+        let e = ModelEntry::enrich_from_gguf(&tmp).expect("enrichment must succeed");
+        assert_eq!(e.arch, "llama");
+        assert_eq!(e.params, "7B");
+        assert_eq!(e.context_length, 4096);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn enrich_from_gguf_prefers_arch_scoped_context_key() {
+        let bytes = build_gguf_with_metadata(
+            &[("tok.weight", &[10], 0, 0)],
+            &[
+                gguf_kv_string("general.architecture", "mistral"),
+                gguf_kv_u64("mistral.context_length", 32768),
+                gguf_kv_u64("llama.context_length", 4096),
+            ],
+        );
+        let tmp = std::env::temp_dir().join(format!("grim_wi3b_{}.gguf", std::process::id()));
+        std::fs::write(&tmp, &bytes).unwrap();
+
+        let e = ModelEntry::enrich_from_gguf(&tmp).unwrap();
+        assert_eq!(e.arch, "mistral");
+        assert_eq!(e.context_length, 32768, "architecture-scoped key must win");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn enrich_from_gguf_corrupt_file_returns_none() {
+        let tmp = std::env::temp_dir().join(format!("grim_wi3c_{}.gguf", std::process::id()));
+        std::fs::write(&tmp, b"not a gguf").unwrap();
+        assert!(ModelEntry::enrich_from_gguf(&tmp).is_none());
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn apply_gguf_enrichment_fills_empty_fields_only() {
+        let bytes = build_gguf_with_metadata(
+            &[("w", &[4], 0, 0)],
+            &[
+                gguf_kv_string("general.architecture", "llama"),
+                gguf_kv_u64("general.parameter_count", 3_000_000_000),
+                gguf_kv_u64("llama.context_length", 8192),
+            ],
+        );
+        let tmp = std::env::temp_dir().join(format!("grim_wi3d_{}.gguf", std::process::id()));
+        std::fs::write(&tmp, &bytes).unwrap();
+
+        let mut entry = ModelEntry {
+            name: "x".into(),
+            path: tmp.to_string_lossy().into_owned(),
+            arch: "preset".into(),
+            params: String::new(),
+            quant: "Q4_K_M".into(),
+            context_length: 0,
+            size_bytes: 0,
+            sha256: String::new(),
+            pulled_at: String::new(),
+            source: String::new(),
+        };
+        apply_gguf_enrichment(&mut entry, &tmp);
+        assert_eq!(
+            entry.arch, "preset",
+            "existing arch must not be overwritten"
+        );
+        assert_eq!(entry.params, "3B", "empty params filled from header");
+        assert_eq!(
+            entry.context_length, 8192,
+            "empty context filled from header"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }

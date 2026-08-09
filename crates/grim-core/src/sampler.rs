@@ -484,6 +484,9 @@ mod tests {
         assert_eq!(ThinkingLevel::Low.max_thinking_tokens(), Some(1024));
         assert_eq!(ThinkingLevel::Medium.max_thinking_tokens(), Some(4096));
         assert_eq!(ThinkingLevel::High.max_thinking_tokens(), Some(16384));
-        assert_eq!(ThinkingLevel::Custom(50000).max_thinking_tokens(), Some(50000));
+        assert_eq!(
+            ThinkingLevel::Custom(50000).max_thinking_tokens(),
+            Some(50000)
+        );
     }
 }
