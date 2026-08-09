@@ -11,9 +11,11 @@ pub struct FalconConfig {
     pub hidden_size: usize,
     pub num_heads: usize,
     pub num_kv_heads: usize,
+    pub head_dim: usize,
     pub num_layers: usize,
     pub intermediate_size: usize,
     pub rms_norm_eps: f32,
+    pub rope_theta: f32,
     pub max_seq_len: usize,
 }
 
@@ -35,9 +37,12 @@ pub struct BloomConfig {
     pub vocab_size: usize,
     pub hidden_size: usize,
     pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
     pub num_layers: usize,
     pub intermediate_size: usize,
-    pub layer_norm_epsilon: f32,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
     pub max_seq_len: usize,
 }
 
@@ -60,6 +65,7 @@ pub struct PhiConfig {
     pub hidden_size: usize,
     pub num_heads: usize,
     pub num_kv_heads: usize,
+    pub head_dim: usize,
     pub num_layers: usize,
     pub intermediate_size: usize,
     pub rms_norm_eps: f32,
