@@ -147,13 +147,6 @@ fn reshaped_view(x: &Tensor, shape: &Shape) -> Result<Tensor> {
         }
     }
     // Last resort: host roundtrip (CPU and shape-strict backends).
-    if std::env::var("GRIM_TRACE").is_ok() {
-        eprintln!(
-            "[TRACE] reshaped_view host fallback {:?} -> {:?}",
-            x.shape().dims(),
-            shape.dims()
-        );
-    }
     let data = x.to_vec_f32()?;
     let st = dev.from_cpu(&data, shape, DType::F32)?;
     Ok(Tensor::new(
@@ -370,67 +363,15 @@ impl LlamaBlock {
         session: Option<&dyn grim_core::session::SessionT>,
         cache: Option<&mut LlamaLayerCache>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        let t0 = std::time::Instant::now();
+        let _t0 = std::time::Instant::now();
         let x_2d = x;
 
-        // GRIM_DUMP_STATE: print L2 norm + first/last samples of the hidden
-        // state entering the layer, to locate where ROCm vs CPU diverge.
-        if std::env::var("GRIM_DUMP_STATE").is_ok() && x_2d.shape().dims()[0] > 1 {
-            if let Ok(v) = x_2d.to_vec_f32() {
-                let n = v.len();
-                let norm: f32 = v.iter().map(|e| e * e).sum::<f32>().sqrt();
-                eprintln!(
-                    "[STATE] layer_in n={n} norm={norm:.4} head={:.4} tail={:.4}",
-                    v.first().copied().unwrap_or(0.0),
-                    v.last().copied().unwrap_or(0.0)
-                );
-            }
-        }
-
         let x_norm = self.attn_norm.forward(x_2d)?;
-        let t1 = std::time::Instant::now();
+        let _t1 = std::time::Instant::now();
         let q = self.wq.forward(&x_norm)?;
         let k = self.wk.forward(&x_norm)?;
         let v = self.wv.forward(&x_norm)?;
-        let t2 = std::time::Instant::now();
-
-        if std::env::var("GRIM_DUMP_STATE").is_ok() && x_2d.shape().dims()[0] > 1 {
-            if let (Ok(hn), Ok(qv), Ok(kv), Ok(vv)) = (
-                x_norm.to_vec_f32(),
-                q.to_vec_f32(),
-                k.to_vec_f32(),
-                v.to_vec_f32(),
-            ) {
-                let n = |v: &[f32]| v.iter().map(|e| e * e).sum::<f32>().sqrt();
-                let f6 = |v: &[f32], off: usize| {
-                    v[off..off + 4]
-                        .iter()
-                        .map(|x| format!("{x:.6}"))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                };
-                eprintln!(
-                    "[STATE] norm={:.4} q={:.4} k={:.4} v={:.4} q0[0..4]={} k0[0..4]={} k1[0..4]={} v1[0..4]={}",
-                    n(&hn),
-                    n(&qv),
-                    n(&kv),
-                    n(&vv),
-                    f6(&qv, 0),
-                    f6(&kv, 0),
-                    f6(&kv, 256),
-                    f6(&vv, 256)
-                );
-            }
-        }
-        if std::env::var("GRIM_TRACE").is_ok() {
-            eprintln!(
-                "[TRACE] layer {:?} nrm={:.2}ms qkv={:.2}ms s={}",
-                self._cfg.hidden_size,
-                (t1 - t0).as_secs_f32() * 1e3,
-                (t2 - t1).as_secs_f32() * 1e3,
-                positions.len()
-            );
-        }
+        let _t2 = std::time::Instant::now();
 
         let paged_attn_out = if let Some(sess) = session {
             if let (Some(bt), Some((k_pages, v_pages, page_size))) =
@@ -449,23 +390,6 @@ impl LlamaBlock {
             Some(out) => out,
             None => self.prefilled_self_attention(&q, &k, &v, positions, cache)?,
         };
-        if std::env::var("GRIM_DUMP_STATE").is_ok() && x_2d.shape().dims()[0] > 1 {
-            if let Ok(v) = attn_out.to_vec_f32() {
-                let n = v.iter().map(|e| e * e).sum::<f32>().sqrt();
-                let fmt = |s: &[f32]| {
-                    s.iter()
-                        .map(|x| format!("{x:.6}"))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                };
-                eprintln!(
-                    "[STATE] attn_prewo norm={n:.4} e0={} e3={} e2047={}",
-                    fmt(&v[0..4]),
-                    fmt(&v[2048..2052]),
-                    v[2047]
-                );
-            }
-        }
         let attn_out = self.wo.forward(&attn_out)?;
 
         let added = grim_nn::modules::add_on_device(&x_2d, &attn_out)?;
@@ -479,17 +403,6 @@ impl LlamaBlock {
         let ffn_out = self.w_down.forward(&silu_storage)?;
 
         let out = grim_nn::modules::add_on_device(&added, &ffn_out)?;
-        if std::env::var("GRIM_DUMP_STATE").is_ok() {
-            if let Ok(v) = out.to_vec_f32() {
-                let n = v.len();
-                let norm: f32 = v.iter().map(|e| e * e).sum::<f32>().sqrt();
-                eprintln!(
-                    "[STATE] layer_out n={n} norm={norm:.4} head={:.4} tail={:.4}",
-                    v.first().copied().unwrap_or(0.0),
-                    v.last().copied().unwrap_or(0.0)
-                );
-            }
-        }
         Ok((out, k, v))
     }
 
@@ -550,55 +463,34 @@ impl LlamaBlock {
 
         // Apply rope on-device. If the backend has a `rope` kernel (ROCm, CPU),
         // use it directly; otherwise fall back to the grim_nn Rope module.
-        let trace = std::env::var("GRIM_TRACE").is_ok();
-        let ta = std::time::Instant::now();
+        let _ta = std::time::Instant::now();
 let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
-        // GRIM_FORCE_CPU_ROPE: A/B switch — always use the grim_nn Rope module
-        // (CPU math) instead of the backend kernel, to isolate kernel-level
-        // numeric divergence.
-        let rope_out = if std::env::var("GRIM_FORCE_CPU_ROPE").is_ok() {
-            let rope_out = self.rope.forward(&relabeled, &ext_positions)?;
-            return reshaped_view(&rope_out, &Shape::new(vec![b, s, num_heads * head_dim]));
-        } else {
-            match dev.rope(
-                relabeled.storage().as_ref(),
-                &ext_positions,
-                head_dim,
-                self.rope.base,
-                &rope_shape,
-            ) {
-                Ok((st, _h)) => {
-                    let tb = std::time::Instant::now();
-                    let rope_out = Tensor::new(
-                        std::sync::Arc::from(st),
-                        rope_shape,
-                        x.dtype(),
-                        x.provenance().clone(),
-                        x.device().clone(),
-                    );
-                    let out = reshaped_view(&rope_out, &Shape::new(vec![b, s, num_heads * head_dim]))?;
-                    if trace {
-                        eprintln!(
-                            "[TRACE]   rope kernel={:.1}ms reshape={:.1}ms heads={}",
-                            (tb - ta).as_secs_f32() * 1e3,
-                            (std::time::Instant::now() - tb).as_secs_f32() * 1e3,
-                            num_heads
-                        );
-                    }
-                    return Ok(out);
-                }
-                Err(e) => {
-                    if trace {
-                        eprintln!("[TRACE] rope kernel fell back: {e}");
-                    }
-                    // Fallback: use the grim_nn Rope module (which itself may
-                    // roundtrip on CPU, but at least it's a single call).
-                    let rope_out = self.rope.forward(&relabeled, &ext_positions)?;
-                    // The fallback returns the correct shape already.
-                    return reshaped_view(&rope_out, &Shape::new(vec![b, s, num_heads * head_dim]));
-                }
+        match dev.rope(
+            relabeled.storage().as_ref(),
+            &ext_positions,
+            head_dim,
+            self.rope.base,
+            &rope_shape,
+        ) {
+            Ok((st, _h)) => {
+                let rope_out = Tensor::new(
+                    std::sync::Arc::from(st),
+                    rope_shape,
+                    x.dtype(),
+                    x.provenance().clone(),
+                    x.device().clone(),
+                );
+                let out = reshaped_view(&rope_out, &Shape::new(vec![b, s, num_heads * head_dim]))?;
+                return Ok(out);
             }
-        };
+            Err(_) => {
+                // Fallback: use the grim_nn Rope module (which itself may
+                // roundtrip on CPU, but at least it's a single call).
+                let rope_out = self.rope.forward(&relabeled, &ext_positions)?;
+                // The fallback returns the correct shape already.
+                return reshaped_view(&rope_out, &Shape::new(vec![b, s, num_heads * head_dim]));
+            }
+        }
     }
 
     pub(crate) fn prefilled_self_attention(
@@ -610,35 +502,14 @@ let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
         mut cache: Option<&mut LlamaLayerCache>,
     ) -> Result<Tensor> {
         use grim_tensor::BackendStorage;
-        let trace = std::env::var("GRIM_TRACE").is_ok();
-        let t0 = std::time::Instant::now();
+        let _t0 = std::time::Instant::now();
 
         let cfg = &self._cfg;
 
         // Apply RoPE to Q and K on-device.
         let q_rot = self.apply_rope_multi_head(q, positions, cfg.local_num_heads)?;
         let k_rot = self.apply_rope_multi_head(k, positions, cfg.local_num_kv_heads)?;
-        let t1 = std::time::Instant::now();
-
-        if std::env::var("GRIM_DUMP_STATE").is_ok()
-            && (q_rot.shape().dims()[0] > 1 || q_rot.shape().dims().get(1).copied().unwrap_or(0) > 1)
-        {
-            let f6 = |v: &[f32], off: usize| {
-                v[off..off + 4]
-                    .iter()
-                    .map(|x| format!("{x:.6}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
-            if let (Ok(qv), Ok(kv)) = (q_rot.to_vec_f32(), k_rot.to_vec_f32()) {
-                eprintln!(
-                    "[STATE] qr1={} qr2={} kr1={}",
-                    f6(&qv, 2048),
-                    f6(&qv, 4096),
-                    f6(&kv, 256)
-                );
-            }
-        }
+        let _t1 = std::time::Instant::now();
 
         let q_len = {
             let dims = q_rot.shape().dims();
@@ -720,74 +591,45 @@ let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
                     owned_v.as_ref().unwrap().as_ref(),
                 ),
             };
-        let t2a = std::time::Instant::now();
+        let _t2a = std::time::Instant::now();
 
         // Fused GQA + causal attention. ROCm and CPU implement the kernel;
         // other backends degrade to the host fallback below.
-        // GRIM_FORCE_CPU_ATTN: A/B switch — always run the host reference
-        // attention to isolate kernel-level numeric divergence.
-        let attn_out = if std::env::var("GRIM_FORCE_CPU_ATTN").is_ok() {
-            let (hk, hv) = match &host_vecs {
-                Some((k, v)) => (k.clone(), v.clone()),
-                None => (k_final.to_cpu_vec_f32()?, v_final.to_cpu_vec_f32()?),
-            };
-            self.cpu_attention_fallback(&q_3d, &hk, &hv, old_past_len, q_len, kv_len)?
-        } else {
-            if std::env::var("GRIM_DUMP_STATE").is_ok() {
-                let qs = q_3d.shape().dims().to_vec();
-                let ks = k_final.shape().dims().to_vec();
-                let vs = v_final.shape().dims().to_vec();
-                eprintln!(
-                    "[STATE] qkv_dispatch q={qs:?} k={ks:?} v={vs:?} kv_len={kv_len} off={} out={:?}",
-                    old_past_len,
-                    out_shape.dims()
-                );
-            }
-            match dev.qkv_attention(
-                q_3d.storage().as_ref(),
-                k_final,
-                v_final,
-                cfg.local_num_kv_heads,
-                kv_len,
-                old_past_len as u32,
-                &out_shape,
-                None,
-                None,
-            ) {
-                Ok((s, _h)) => Tensor::new(
-                    std::sync::Arc::from(s),
-                    out_shape.clone(),
-                    DType::F32,
-                    grim_tensor::QuantProvenance::default(),
-                    self._dev.clone(),
-                ),
-                Err(_) => {
-                    // Manual attention on host. Prefer the cached host mirrors;
-                    // otherwise fetch the (device-resident) cache once.
-                    let (hk, hv) = match &host_vecs {
-                        Some((k, v)) => (k.clone(), v.clone()),
-                        None => (k_final.to_cpu_vec_f32()?, v_final.to_cpu_vec_f32()?),
-                    };
-                    self.cpu_attention_fallback(&q_3d, &hk, &hv, old_past_len, q_len, kv_len)?
-                }
+        let attn_out = match dev.qkv_attention(
+            q_3d.storage().as_ref(),
+            k_final,
+            v_final,
+            cfg.local_num_kv_heads,
+            kv_len,
+            old_past_len as u32,
+            &out_shape,
+            None,
+            None,
+        ) {
+            Ok((s, _h)) => Tensor::new(
+                std::sync::Arc::from(s),
+                out_shape.clone(),
+                DType::F32,
+                grim_tensor::QuantProvenance::default(),
+                self._dev.clone(),
+            ),
+            Err(_) => {
+                // Manual attention on host. Prefer the cached host mirrors;
+                // otherwise fetch the (device-resident) cache once.
+                let (hk, hv) = match &host_vecs {
+                    Some((k, v)) => (k.clone(), v.clone()),
+                    None => (k_final.to_cpu_vec_f32()?, v_final.to_cpu_vec_f32()?),
+                };
+                self.cpu_attention_fallback(&q_3d, &hk, &hv, old_past_len, q_len, kv_len)?
             }
         };
-        let t2b = std::time::Instant::now();
+        let _t2b = std::time::Instant::now();
 
         // Rebuild the (S, num_heads*head_dim) view for wo — physically, so the
         // storage rank matches (backend matmuls validate the storage shape).
         let flat_shape = Shape::new(vec![q_len, cfg.local_num_heads * cfg.head_dim]);
         let attn_out = reshaped_view(&attn_out, &flat_shape)?;
-        let t3 = std::time::Instant::now();
-        if trace {
-            eprintln!(
-                "[TRACE]   attn rope={:.1}ms append={:.1}ms qkv={:.1}ms flat={:.1}ms",
-                (t1 - t0).as_secs_f32() * 1e3,
-                (t2a - t1).as_secs_f32() * 1e3,
-                (t2b - t2a).as_secs_f32() * 1e3,
-                (t3 - t2b).as_secs_f32() * 1e3
-            );
-        }
+        let _t3 = std::time::Instant::now();
         Ok(attn_out)
     }
 
@@ -803,9 +645,6 @@ let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
         q_len: usize,
         kv_len: usize,
     ) -> Result<Tensor> {
-        if std::env::var("GRIM_TRACE").is_ok() {
-            eprintln!("[TRACE] CPU attention fallback q_len={q_len} kv_len={kv_len}");
-        }
         let cfg = &self._cfg;
         let qd = q_3d.to_vec_f32()?;
         let num_head_dims = cfg.local_num_heads * cfg.head_dim;

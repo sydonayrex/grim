@@ -2879,6 +2879,19 @@ fn load_model_for_server(
                 .and_then(|gg| GgufProvider::open(gg).ok().and_then(|p| p.tokenizer().ok()))
         });
 
+    // WI-3 self-heal: if the catalog sidecar still carries empty arch/zero
+    // context_length (older pull, or a manually-placed file whose sidecar
+    // predates this fix), backfill it from the GGUF header now that we've
+    // already opened the model's path. Header-only read — no tensor load. Entry
+    // is reloaded, enriched, and re-saved; failure is non-fatal (we already
+    // have the model loaded for serving).
+    if let Ok(mut entry) = grim_core::catalog::ModelEntry::load_for(&path_str) {
+        if entry.arch.is_empty() || entry.context_length == 0 {
+            grim_core::catalog::apply_gguf_enrichment(&mut entry, &path);
+            let _ = entry.save(&path);
+        }
+    }
+
     Ok((model, tokenizer))
 }
 

@@ -535,21 +535,6 @@ pub async fn cmd_run(
         let last_start = logits_vec.len().saturating_sub(vocab);
         let last_logits = &logits_vec[last_start..];
 
-        // Temporary A/B diagnostic: dump the top-5 next-token logits on the
-        // first step so CPU vs ROCm paths can be compared post-prefill.
-        if std::env::var("GRIM_DUMP_LOGITS").is_ok() && generated_tokens.is_empty() {
-            let mut ranked: Vec<(usize, f32)> = last_logits
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (i, *v))
-                .collect();
-            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            eprintln!("[LOGITS] top5 after prefill:");
-            for (id, val) in ranked.iter().take(5) {
-                eprintln!("[LOGITS]   tok {id}: {val}");
-            }
-        }
-
         // Single-position logits tensor so sampler sees next-token distribution only, not full sequence.
         let last_shape = grim_tensor::Shape::new(vec![vocab]);
         let last_logits_tensor = build_tensor(last_logits, &last_shape, &device)?;
