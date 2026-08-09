@@ -1,7 +1,8 @@
 //! Grim's Garage — local-first training dashboard web application.
 //!
 //! Backend (`discovery`, `jobs`, `rocm`, `routes`) runs an axum HTTP server
-//! on `0.0.0.0:8741` and serves `/api/*`, `/sse/metrics/:id`, and web UI.
+//! on `127.0.0.1:8741` (WI-4: loopback by default, matching `grim serve`)
+//! and serves `/api/*`, `/sse/metrics/:id`, and web UI.
 
 pub mod backend;
 pub mod dataloader;
