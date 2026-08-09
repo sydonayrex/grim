@@ -16,7 +16,7 @@ toml = "0.8"
 libloading = { version = "0.8", optional = true }
 
 # WASM runtime for sandboxed plugin execution
-wasmtime = { version = "28", features = ["async"], optional = true }
+wasmtime = { version = "47", features = ["async"], optional = true }
 
 [dev-dependencies]
 grim-backend-cpu = { workspace = true }
