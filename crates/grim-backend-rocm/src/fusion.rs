@@ -69,17 +69,20 @@ impl QkvAttentionFusionConfig {
         self
     }
 
-    /// Launch geometry for Phase-1 QKV attention. Sequential implementation:
-    /// 1 thread per (query position, head) pair, block = (1,1,1). The
-    /// sequential KV walk and sequential online softmax produce the exact
-    /// same floating-point results as the CPU fallback (same reduction order).
+    /// Launch geometry for Phase-1 QKV attention. Parallel implementation:
+    /// block = (wavefront_size, 1, 1) with 256 threads covering head_dim up to
+    /// 256 in parallel. Wavefront-level online-softmax reduction produces
+    /// numerically stable results; small rounding differences vs the CPU
+    /// sequential reference are expected and covered by test tolerances.
     pub fn hip_launch_params(&self) -> HipKernelLaunch {
+        let block_dim_x = if self.wavefront_size == 32 { 128 } else { 256 };
         let grid_x = self.max_seq_len as u32;
         let grid_y = self.num_heads as u32;
+        let shared_mem_bytes = (self.head_dim * 4).min(ATTENTION_SHARED_MAX_BYTES);
         HipKernelLaunch {
             grid_dim: hipDim3::new(grid_x, grid_y, 1),
-            block_dim: hipDim3::new(1, 1, 1),
-            shared_mem_bytes: 0,
+            block_dim: hipDim3::new(block_dim_x, 1, 1),
+            shared_mem_bytes,
         }
     }
 }
