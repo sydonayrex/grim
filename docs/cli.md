@@ -6,13 +6,32 @@ Generated from clap derive attributes in `crates/grim-cli/src/main.rs`.
 
 Starts the inference HTTP server on Ollama-compatible endpoints (default `127.0.0.1:11434`). This is the subcommand used by the systemd/launchd service unit.
 
+`serve` is **model-agnostic**: there is no `--model`, `--backend`, `--temp`,
+`--top-p`, `--threads`, `--batch-size`, or `--kv-cache` flag. Those are not
+oversights — they are per-request or config concerns:
+
+- **Model**: named per request in the `"model"` field of `/v1/chat/completions`,
+  resolved against the local catalog (`grim pull` / `grim list`), or loaded
+  explicitly via `POST /v1/models/load`.
+- **Backend**: `GRIM_BACKEND` env var or `grim.toml`.
+- **Sampling** (`temperature`, `top_p`, `top_k`): per-request JSON body fields,
+  or `grim run`'s `--temperature` / `--top_p` / `--top_k` for one-shot CLI use.
+- **Threads / batch size / KV cache**: `grim.toml` `[server]` and `[scheduler]`
+  keys plus `GRIM_CONTEXT` / `GRIM_MEM_BUDGET_MIB` (see `configuration.md`).
+
 | Flag | Short | Default | Required |
 |---|---|---|---|
-| `--address` | `-a` | `""` | No |
-| `--host` | | None | No |
-| `--port` | `-p` | None | No |
+| `--address` | `-a` | `""` (falls back to `--host`/`--port`, then `GRIM_HOST`/`GRIM_PORT`) | No |
+| `--host` | | `127.0.0.1` | No |
+| `--port` | `-p` | `11434` | No |
 | `--config` | `-c` | `grim.toml` | No |
 | `--plugins` | | `plugins` | No |
+| `--disagg-role` | | `colocated` | No |
+| `--prefill-addr` | | `""` | No (decode role only) |
+| `--decode-addr` | | `""` | No (prefill role only) |
+
+Typical flow: `grim pull <model>` → `grim serve` → `POST /v1/chat/completions`
+with `{"model": "<name-from-grim-list>", ...}`.
 
 ## `grim run`
 
@@ -110,7 +129,10 @@ Log in to a registry or cloud provider.
 
 ## `grim quantize`
 
-Stub command; prints "Quantize command - not yet implemented."
+Stub command. It performs no quantization; it prints pointers to the commands
+that do: `grim convert -i <in.gguf> -o <out.grim> --target-bpw 4.0` for the
+one-shot path, or `grim oxidizer convert` for the full calibrate → search →
+write pipeline. There is no `--dtype` flag and no `grim oxidize` subcommand.
 
 No arguments.
 

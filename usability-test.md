@@ -113,8 +113,12 @@ and decode. Fine-tune a small adapter (LoRA) locally for a downstream task. Get 
 (tokens/sec, memory) for a methods paper.
 
 ### Task 1.1 — Serve and complete
-1. Run `grim serve --model ./qwen2-instruct-q4_k_m.gguf --backend rocm`.
-2. POST one chat completion to `/v1/chat/completions` with an instruct (ChatML) prompt.
+`grim serve` is model-agnostic: it does not take a `--model` or `--backend` flag.
+Models are resolved per request from the local catalog (or loaded via
+`POST /v1/models/load`); the backend is selected by `GRIM_BACKEND` / `grim.toml`.
+1. Run `grim pull <model>` once, then `grim serve` (add `--port` / `--host` if needed).
+2. POST one chat completion to `/v1/chat/completions` with an instruct (ChatML) prompt,
+   naming the pulled model in the `"model"` field (e.g. `"qwen2-instruct-q4_k_m:gguf"`).
 3. Confirm the completion returns and the log shows the backend plus a token/time stat.
 
 - **KPI:** first completion ≤ 60 s from server start.
@@ -122,7 +126,10 @@ and decode. Fine-tune a small adapter (LoRA) locally for a downstream task. Get 
 - **Prompt:** "Before you run serve, what do you expect to see?" / "What does that backend log mean?"
 
 ### Task 1.2 — Change sampling behavior
-1. Restart with `--temp 0.2 --top-p 0.9` (or use request-level `temperature` / `top_p`).
+Sampling is a per-request concern; there are no server-startup `--temp` / `--top-p`
+flags. Set `temperature` / `top_p` / `top_k` in the request body (all three are
+accepted by `/v1/chat/completions`), or use `grim run` for one-shot CLI inference.
+1. Issue requests with `"temperature": 0.2, "top_p": 0.9` in the JSON body.
 2. Issue three prompts and observe determinism / entropy.
 
 - **KPI:** can change sampling for one request vs. the server default.
@@ -300,7 +307,10 @@ without rewriting client logic.
 validates GGUF integrity.
 
 ### Task 10.1 — Quantize a model
-1. `grim quantize --dtype Q4_K input.gguf output.gguf`; serve and sanity-check (ppl).
+1. `grim convert -i input.gguf -o output.grim --target-bpw 4.0` (or the full
+   `grim oxidizer convert` calibrate -> search -> write pipeline); serve and
+   sanity-check (ppl). Note `grim quantize` is only a stub that prints these
+   pointers.
 - **Success:** artefact produced and loadable; user understands the trade-off.
 
 ### Task 10.2 — Verify fidelity

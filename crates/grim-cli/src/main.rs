@@ -949,8 +949,16 @@ async fn main() -> Result<()> {
             bench::cmd_bench(tokens, concurrency, model.as_deref()).await?;
         }
         Commands::Quantize => {
+            // WI-5: the redirect previously named `grim oxidize`, which is not
+            // a real subcommand — following it produced a clap "unrecognized
+            // subcommand" error, so the stub sent users to a dead end. The
+            // actual commands are `oxidizer` (calibrate/search/convert
+            // pipeline) and `convert` (one-shot GGUF -> .grim).
             println!(
-                "Quantization is available via 'grim oxidize'. Run 'grim oxidize --help' for conversion and quantization options."
+                "`grim quantize` is a stub. Quantization is available via:\n  \
+                 grim convert -i <input.gguf> -o <output.grim> --target-bpw 4.0\n  \
+                 grim oxidizer convert --help    # full calibrate -> search -> write pipeline\n\
+                 Run `grim oxidizer --help` for all conversion and quantization options."
             );
         }
         Commands::Train {
