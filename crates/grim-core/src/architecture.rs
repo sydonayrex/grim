@@ -146,6 +146,7 @@ pub enum ModelArchitecture {
     Mellum,
     Eagle3,
     DFlash,
+    DeltaNetBase,
     Unknown,
 }
 
@@ -258,22 +259,25 @@ impl ModelArchitecture {
             "afmoe" => Self::AfMoe,
             "laguna" => Self::Laguna,
             "ernie4-5" => Self::Ernie45,
+            "dflash" => Self::DFlash,
             "ernie4-5-moe" => Self::Ernie45Moe,
+            "glm4-moe" => Self::Glm4Moe,
+            "grovemoe" => Self::GroveMoe,
+            "hy-v3" => Self::HyV3,
+            "maincoder" => Self::MainCoder,
+            "openai-moe" => Self::OpenAiMoe,
+            "smallthinker" => Self::SmallThinker,
+            "smollm2" => Self::SmolLm2,
+            "smollm3" => Self::SmolLm3,
             "hunyuan-moe" => Self::HunyuanMoe,
             "hunyuan-dense" => Self::HunyuanDense,
             "hunyuan-vl" => Self::HunyuanVl,
-            "hy-v3" => Self::HyV3,
-            "smollm2" => Self::SmolLm2,
-            "smollm3" => Self::SmolLm3,
-            "openai-moe" => Self::OpenAiMoe,
             "lfm2" | "liquid" => Self::Lfm2,
             "lfm2moe" => Self::Lfm2Moe,
             "dream" => Self::Dream,
-            "smallthinker" => Self::SmallThinker,
             "llada" => Self::Llada,
             "llada-moe" => Self::LladaMoe,
             "seed-oss" => Self::SeedOss,
-            "grovemoe" => Self::GroveMoe,
             "apertus" => Self::Apertus,
             "minimax-m2" => Self::MiniMaxM2,
             "cogvlm" => Self::CogVlm,
@@ -285,12 +289,10 @@ impl ModelArchitecture {
             "mimo2" => Self::Mimo2,
             "step35" => Self::Step35,
             "llama-embed" => Self::LlamaEmbed,
-            "maincoder" => Self::MainCoder,
             "kimi-linear" => Self::KimiLinear,
             "talkie" => Self::Talkie,
             "mellum" => Self::Mellum,
             "eagle3" => Self::Eagle3,
-            "dflash" => Self::DFlash,
             _ => Self::Unknown,
         }
     }
@@ -319,7 +321,6 @@ impl ModelArchitecture {
             Self::JinaBertV3 => "jina-bert-v3",
             Self::Eurobert => "eurobert",
             Self::Bloom => "bloom",
-            Self::StableLm => "stablelm",
             Self::Qwen => "qwen",
             Self::Qwen2 => "qwen2",
             Self::Qwen2Moe => "qwen2moe",
@@ -428,12 +429,14 @@ impl ModelArchitecture {
             Self::Mimo2 => "mimo2",
             Self::Step35 => "step35",
             Self::LlamaEmbed => "llama-embed",
-            Self::MainCoder => "maincoder",
             Self::KimiLinear => "kimi-linear",
             Self::Talkie => "talkie",
             Self::Mellum => "mellum",
             Self::Eagle3 => "eagle3",
+            Self::MainCoder => "maincoder",
             Self::DFlash => "dflash",
+            Self::StableLm => "stablelm",
+            Self::DeltaNetBase => "delta-net-base",
             Self::Unknown => "unknown",
         }
     }
@@ -726,6 +729,48 @@ impl TensorNamingRegistry {
                     );
                 }
             }
+            ModelArchitecture::Laguna => {
+                for i in 0..num_layers {
+                    let hf_p = format!("model.layers.{i}.");
+                    let gg_p = format!("blk.{i}.");
+                    map.insert(
+                        format!("{hf_p}input_layernorm.weight"),
+                        format!("{gg_p}attn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.q_proj.weight"),
+                        format!("{gg_p}attn_q.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.k_proj.weight"),
+                        format!("{gg_p}attn_k.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.v_proj.weight"),
+                        format!("{gg_p}attn_v.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.o_proj.weight"),
+                        format!("{gg_p}attn_output.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}post_attention_layernorm.weight"),
+                        format!("{gg_p}ffn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.gate_proj.weight"),
+                        format!("{gg_p}ffn_gate.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.up_proj.weight"),
+                        format!("{gg_p}ffn_up.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.down_proj.weight"),
+                        format!("{gg_p}ffn_down.weight"),
+                    );
+                }
+            }
             ModelArchitecture::Gpt2 => {
                 map.insert(
                     "transformer.wte.weight".to_string(),
@@ -846,6 +891,54 @@ impl TensorNamingRegistry {
                     map.insert(
                         format!("{il_p}ffn.w_down.weight"),
                         format!("{gg_p}ffn_down.weight"),
+                    );
+                    // --- MoE expert-indexed tensor names (WI-M1) ---
+                    // llama.cpp stores per-expert FFN weights as 3D tensors:
+                    //   ffn_gate_exps.weight = [n_experts, inter, hidden]
+                    //   ffn_up_exps.weight   = [n_experts, inter, hidden]
+                    //   ffn_down_exps.weight = [n_experts, hidden, inter]
+                    // The HF `model.layers.{i}.mlp.experts.{e}.{w}.weight`
+                    // convention is mapped onto the flat GGUF expert tensor
+                    // by `WeightSource` slicing (see load_moe_block). These
+                    // entries let the dedup router + shared expert resolve by
+                    // their HF names too.
+                    map.insert(
+                        format!("{hf_p}mlp.gate.weight"),
+                        format!("{gg_p}ffn_gate_exps.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.experts.gate_proj.weight"),
+                        format!("{gg_p}ffn_gate_exps_e.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.experts.up_proj.weight"),
+                        format!("{gg_p}ffn_up_exps_e.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.experts.down_proj.weight"),
+                        format!("{gg_p}ffn_down_exps_e.weight"),
+                    );
+                    // Dedup/shared router gate (Laguna, Qwen2/3, GLM4, ...).
+                    map.insert(
+                        format!("{hf_p}mlp.gate_proj.weight"),
+                        format!("{gg_p}ffn_gate_inp.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.gate.e_score_correction_bias"),
+                        format!("{gg_p}exp_probs_b.weight"),
+                    );
+                    // Shared/always-on expert (Laguna, Qwen3-MoE, DeepSeek).
+                    map.insert(
+                        format!("{hf_p}mlp.shared_expert.gate_proj.weight"),
+                        format!("{gg_p}ffn_gate_she.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.shared_expert.up_proj.weight"),
+                        format!("{gg_p}ffn_up_she.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.shared_expert.down_proj.weight"),
+                        format!("{gg_p}ffn_down_she.weight"),
                     );
                 }
             }

@@ -238,6 +238,11 @@ pub struct LlamaBlock {
     pub tp_config: TensorParallelConfig,
     pub(crate) _dev: Device,
     pub(crate) _cfg: LlamaConfigRefs,
+    /// When true this layer's dense FFN is NOT applied inside
+    /// `forward_with_kv_paged`; the caller (e.g. `Llama::decode_paged`)
+    /// routes the post-attention residual through a `MoeBlock` instead.
+    /// Set for MoE layers so the dense SwiGLU triple is never double-applied.
+    pub(crate) ffn_disabled: bool,
 }
 
 impl LlamaBlock {
@@ -335,6 +340,7 @@ impl LlamaBlock {
                 local_num_kv_heads,
                 kv_head_replica_factor,
             },
+            ffn_disabled: false,
         })
     }
 
@@ -393,6 +399,13 @@ impl LlamaBlock {
         let attn_out = self.wo.forward(&attn_out)?;
 
         let added = grim_nn::modules::add_on_device(&x_2d, &attn_out)?;
+
+        // MoE layers: the dense SwiGLU triple is disabled; the caller routes
+        // `added` (post-attention residual) through a `MoeBlock`. Return it
+        // directly so `Llama::decode_paged` can apply the router + experts.
+        if self.ffn_disabled {
+            return Ok((added, k, v));
+        }
 
         // FFN: standard Llama uses a single shared expert for all tokens.
         // Process the full batch in one forward pass on-device (zero CPU roundtrips).

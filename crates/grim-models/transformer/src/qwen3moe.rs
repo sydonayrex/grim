@@ -1,12 +1,18 @@
-//! Thin wrapper around `Llama` for qwen3moe uses a Llama-style transformer.
+//! Qwen3-MoE transformer — routes every layer through a shared `MoeBlock`.
+//!
+//! Qwen3-MoE uses a softmax router (no correction bias) and no shared expert.
+//! Attention towers are plain Llama-style; the MoE routing replaces the dense
+//! FFN per layer.
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, Model, ModelConfig, ModalityHint};
 use grim_core::session::SessionT;
+use grim_nn::moe::RouterKind;
 use grim_nn::TensorParallelConfig;
 use grim_tensor::{ArithType, Device, Tensor};
 
 use crate::model::{Llama, LlamaConfig};
+use crate::moe_block::MoESpec;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -21,6 +27,10 @@ pub struct Qwen3MoeConfig {
     pub head_dim: usize,
     pub num_layers: usize,
     pub intermediate_size: usize,
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    /// Scaling applied to the routed expert output (`routed_scaling_factor`).
+    pub routed_scaling_factor: f32,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub max_seq_len: usize,
@@ -39,7 +49,7 @@ impl ModelConfig for Qwen3MoeConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Model — thin wrapper around Llama
+// Model
 // ---------------------------------------------------------------------------
 
 pub struct Qwen3Moe {
@@ -71,8 +81,24 @@ impl Qwen3Moe {
             rope_theta: cfg.rope_theta,
             max_seq_len: cfg.max_seq_len,
         };
-        let inner = Llama::load_tp(device.clone(), ws, llama_cfg, tp)?;
-        Ok(Self { cfg, device: inner.device.clone(), inner })
+
+        // Qwen3-MoE routes every layer through the MoE block: softmax router,
+        // no shared expert.
+        let spec = MoESpec {
+            num_experts: cfg.num_experts,
+            top_k: cfg.num_experts_per_tok,
+            router_kind: RouterKind::SoftmaxTopK,
+            routed_scaling_factor: cfg.routed_scaling_factor,
+            has_shared_expert: false,
+        };
+        let moe_spec: Vec<Option<MoESpec>> = vec![Some(spec); cfg.num_layers];
+
+        let inner = Llama::load_tp_moe(device.clone(), ws, llama_cfg, &moe_spec, tp)?;
+        Ok(Self {
+            cfg,
+            device: inner.device.clone(),
+            inner,
+        })
     }
 }
 

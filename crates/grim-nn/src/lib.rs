@@ -3,6 +3,8 @@
 pub mod modules;
 /// SCYTHE-2 WI-3: capacity-calibrated sharded linears.
 pub mod scythe2;
+/// Mixture-of-Experts primitives (router, expert bank, routed FFN).
+pub mod moe;
 pub mod varbuilder;
 
 pub use modules::{
