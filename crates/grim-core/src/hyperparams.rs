@@ -22,6 +22,8 @@ pub struct ArchHyperparameters {
     // MoE specific
     pub expert_count: Option<usize>,
     pub expert_used_count: Option<usize>,
+    pub routed_scaling_factor: f32,
+    pub norm_topk_prob: bool,
     // SSM specific
     pub ssm_d_state: Option<usize>,
     pub ssm_d_inner: Option<usize>,
@@ -46,6 +48,8 @@ impl Default for ArchHyperparameters {
             max_seq_len: 2048,
             expert_count: None,
             expert_used_count: None,
+            routed_scaling_factor: 1.0,
+            norm_topk_prob: false,
             ssm_d_state: None,
             ssm_d_inner: None,
             ssm_d_conv: None,
@@ -74,14 +78,28 @@ impl HyperparameterExtractor {
         arch: ModelArchitecture,
         metadata: &M,
     ) -> ArchHyperparameters {
-        let arch_name = arch.as_str();
+        // SmolLM2 is exported by llama.cpp under `general.architecture = "llama"`
+        // and carries `llama.*` hyperparameter keys. Use those as the lookup
+        // prefix and prefer them over the often-stale `tokenizer.ggml.vocab_size`
+        // key (which some SmolLM2 exports populate with a wrong value and would
+        // otherwise swap vocab/hidden).
+        let is_smollm2 = arch == ModelArchitecture::SmolLm2;
+        let arch_name = if is_smollm2 { "llama" } else { arch.as_str() };
 
-        let vocab_size = metadata
-            .get_u32("tokenizer.ggml.vocab_size")
-            .or_else(|| metadata.get_u32(&format!("{arch_name}.vocab_size")))
-            .or_else(|| metadata.get_u32("llama.vocab_size"))
-            .map(|v| v as usize)
-            .unwrap_or(32000);
+        let vocab_size = if is_smollm2 {
+            metadata
+                .get_u32("llama.vocab_size")
+                .or_else(|| metadata.get_u32("tokenizer.ggml.vocab_size"))
+                .map(|v| v as usize)
+                .unwrap_or(32000)
+        } else {
+            metadata
+                .get_u32("tokenizer.ggml.vocab_size")
+                .or_else(|| metadata.get_u32(&format!("{arch_name}.vocab_size")))
+                .or_else(|| metadata.get_u32("llama.vocab_size"))
+                .map(|v| v as usize)
+                .unwrap_or(32000)
+        };
 
         let hidden_size = metadata
             .get_u32(&format!("{arch_name}.embedding_length"))
@@ -177,6 +195,14 @@ impl HyperparameterExtractor {
         let expert_used_count = metadata
             .get_u32(&format!("{arch_name}.expert_used_count"))
             .map(|v| v as usize);
+        let routed_scaling_factor = metadata
+            .get_f32(&format!("{arch_name}.expert_gating_func") )
+            .or_else(|| metadata.get_f32(&format!("{arch_name}.routed_scaling_factor")))
+            .unwrap_or(1.0);
+        let norm_topk_prob = metadata
+            .get_u32(&format!("{arch_name}.norm_topk_prob"))
+            .map(|v| v != 0)
+            .unwrap_or(false);
 
         let ssm_d_state = metadata
             .get_u32(&format!("{arch_name}.ssm.state_size"))
@@ -208,6 +234,8 @@ impl HyperparameterExtractor {
             max_seq_len,
             expert_count,
             expert_used_count,
+            routed_scaling_factor,
+            norm_topk_prob,
             ssm_d_state,
             ssm_d_inner,
             ssm_d_conv,

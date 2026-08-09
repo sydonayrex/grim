@@ -1,6 +1,9 @@
 //! Dense CausalLm transformer implementations (Llama, Mistral, Qwen, DeepSeek, Gemma, T5, MTP).
 
 pub mod block;
+/// Shared MoE block (router + expert bank + optional shared expert).
+pub mod moe_block;
+pub mod qwen3moe;
 pub mod configs;
 pub mod deepseek;
 pub mod gemma;
@@ -104,6 +107,11 @@ pub mod dream;
 pub mod plamo;
 pub mod xverse;
 pub mod internlm2;
+pub mod arcee;
+pub mod codeshell;
+pub mod orion;
+pub mod chameleon;
+pub mod delta_net_base;
 
 pub use block::{LlamaBlock, LlamaConfigRefs, LlamaLayerCache};
 pub use configs::{BloomConfig, MoeConfig, PhiConfig, QwenConfig};
@@ -112,10 +120,16 @@ pub use falcon::{Falcon, FalconConfig};
 pub use bloom::Bloom;
 pub use phi2::Phi2;
 pub use qwen::Qwen;
+pub use arcee::{Arcee, ArceeConfig};
+pub use chameleon::{Chameleon, ChameleonConfig};
+pub use codeshell::{Codeshell, CodeshellConfig};
+pub use delta_net_base::{DeltaNetBase, DeltaNetBaseConfig};
+pub use orion::{Orion, OrionConfig};
 pub use starcoder2::{Starcoder2, Starcoder2Config};
 pub use granite_moe::{GraniteMoe, GraniteMoeConfig};
 pub use deepseek2ocr::{DeepSeek2Ocr, DeepSeek2OcrConfig};
 pub use laguna::{Laguna, LagunaConfig};
+pub use qwen3moe::{Qwen3Moe, Qwen3MoeConfig};
 pub use hunyuan_vl::{HunyuanVl, HunyuanVlConfig};
 pub use grovemoe::{GroveMoe, GroveMoeConfig};
 pub use eurobert::{Eurobert, EurobertConfig};

@@ -14,6 +14,7 @@ use grim_nn::{ColumnParallelLinear, Embedding, Linear, RowParallelLinear, Tensor
 use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
 use crate::block::{LlamaBlock, LlamaConfigRefs};
+use crate::moe_block::{MoESpec, MoeBlock};
 use grim_core::rng::SimpleRng;
 
 #[derive(Debug, Clone)]
@@ -47,6 +48,11 @@ pub struct Llama {
     pub device: Device,
     pub tok_embeddings: Embedding,
     pub layers: Vec<LlamaBlock>,
+    /// Per-layer optional MoE routing block. `Some` for MoE layers (the
+    /// corresponding `LlamaBlock.ffn_disabled` is set, so the dense FFN is
+    /// skipped and this router+expert bank runs instead). `None` for dense
+    /// layers and for the dense fallback when `load_tp` is used.
+    pub moe_blocks: Vec<Option<MoeBlock>>,
     pub norm: RmsNorm,
     pub output: Linear,
 }
@@ -73,6 +79,7 @@ impl Llama {
         cfg: LlamaConfig,
         tp: TensorParallelConfig,
     ) -> Result<Self> {
+        let num_layers = cfg.num_layers;
         let tok_embeddings =
             Embedding::load(&ws.pp("tok_embeddings"), cfg.vocab_size, cfg.hidden_size)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
@@ -102,11 +109,79 @@ impl Llama {
                 )?
             }
         };
+        let num_layers = cfg.num_layers;
         Ok(Self {
             cfg,
             device: device.clone(),
             tok_embeddings,
             layers,
+            moe_blocks: (0..num_layers).map(|_| None).collect(),
+            norm,
+            output,
+        })
+    }
+
+    /// Load a `Llama` model that mixes dense and MoE layers.
+    ///
+    /// `moe_spec` is `Some(spec)` for layers that should route through a
+    /// `MoeBlock` (their dense FFN is disabled), `None` for plain dense
+    /// layers. The attention towers are always loaded per layer.
+    pub fn load_tp_moe(
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: LlamaConfig,
+        moe_spec: &[Option<MoESpec>],
+        tp: TensorParallelConfig,
+    ) -> Result<Self> {
+        if moe_spec.len() != cfg.num_layers {
+            return Err(grim_core::error::Error::Config(format!(
+                "load_tp_moe: moe_spec len {} != num_layers {}",
+                moe_spec.len(),
+                cfg.num_layers
+            )));
+        }
+        let tok_embeddings =
+            Embedding::load(&ws.pp("tok_embeddings"), cfg.vocab_size, cfg.hidden_size)?;
+        let mut layers = Vec::with_capacity(cfg.num_layers);
+        let mut moe_blocks = Vec::with_capacity(cfg.num_layers);
+        for i in 0..cfg.num_layers {
+            let lws = ws.pp("layers").pp(&i.to_string());
+            let mut block = LlamaBlock::load_tp(&lws, &cfg, tp)?;
+            if let Some(spec) = &moe_spec[i] {
+                // Disable the dense FFN; route through the MoE block instead.
+                block.ffn_disabled = true;
+                let moe = MoeBlock::load(&lws, &cfg, spec, tp)?;
+                moe_blocks.push(Some(moe));
+            } else {
+                moe_blocks.push(None);
+            }
+            layers.push(block);
+        }
+        let norm = RmsNorm::load(&ws.pp("norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let output = match Linear::load_column_parallel(
+            &ws.pp("output"),
+            cfg.hidden_size,
+            cfg.vocab_size,
+            /*has_bias=*/ false,
+            tp,
+        ) {
+            Ok(o) => o,
+            Err(_) => {
+                let ws_unsharded = ws.with_tp_config(TensorParallelConfig::default());
+                Linear::load(
+                    &ws_unsharded.pp("output"),
+                    cfg.hidden_size,
+                    cfg.vocab_size,
+                    false,
+                )?
+            }
+        };
+        Ok(Self {
+            cfg,
+            device: device.clone(),
+            tok_embeddings,
+            layers,
+            moe_blocks,
             norm,
             output,
         })
@@ -114,6 +189,7 @@ impl Llama {
 
     pub fn random(device: Device, cfg: LlamaConfig) -> Self {
         use grim_backend_cpu::cpu_tensor;
+        let num_layers = cfg.num_layers;
         let _dev = CpuDevice::new();
         let mut rng = SimpleRng::new(0xDEAD_BEEF_CAFE_F00Du64);
 
@@ -168,6 +244,7 @@ impl Llama {
                 w_down: RowParallelLinear::new(linear(cfg.hidden_size, cfg.intermediate_size), tp),
                 rope: Rope::new(cfg.head_dim, cfg.rope_theta),
                 tp_config: tp,
+                ffn_disabled: false,
                 _dev: Device::Cpu,
                 _cfg: LlamaConfigRefs {
                     hidden_size: cfg.hidden_size,
@@ -190,6 +267,7 @@ impl Llama {
             device,
             tok_embeddings,
             layers,
+            moe_blocks: (0..num_layers).map(|_| None).collect(),
             norm,
             output,
         }
@@ -220,8 +298,15 @@ impl Llama {
         let mut kv_pairs = Vec::new();
         for (i, layer) in self.layers.iter().enumerate() {
             let cache = caches.as_deref_mut().and_then(|c| c[i].as_mut());
-            let (out, k, v) = layer.forward_with_kv_paged(&h, positions, session, cache)?;
+            let (attn_out, k, v) = layer.forward_with_kv_paged(&h, positions, session, cache)?;
             kv_pairs.push((k, v));
+            // MoE layers: `attn_out` is the post-attention residual (dense FFN
+            // was skipped inside the block). Route it through the experts.
+            let out = if let Some(moe) = &self.moe_blocks[i] {
+                moe.forward(&attn_out)?
+            } else {
+                attn_out
+            };
             h = out;
         }
         let h = self.norm.forward(&h)?;

@@ -15,10 +15,13 @@ use grim_models_mamba::{
     Rwkv6Config, Rwkv7Config, RwkvConfig,
 };
  use grim_models_transformer::{
-     Bloom, BloomConfig, DeepSeek, DeepSeekConfig, Falcon, FalconConfig, FalconH1Config,
-     FalconH1Model, Gemma, GemmaConfig, Gpt2, Gpt2Config,
-     Lfm2, Lfm2Config, Llama, LlamaConfig, MiniCpmConfig, MiniCpmModel, MoeConfig, Phi2, PhiConfig,
-     Qwen, QwenConfig, T5, T5Config,
+     Arcee, ArceeConfig, Bloom, BloomConfig, Chameleon, ChameleonConfig, Codeshell, CodeshellConfig,
+     CommandR, CommandRConfig, DeepSeek, DeepSeekConfig, DeltaNetBase, DeltaNetBaseConfig,
+     Falcon, FalconConfig, FalconH1Config, FalconH1Model, Gemma, GemmaConfig, Gpt2, Gpt2Config,
+     Lfm2, Lfm2Config, Laguna, LagunaConfig, Llama, LlamaConfig, MiniCpmConfig, MiniCpmModel,
+     SmolLm2, SmolLm2Config, Qwen3Moe, Qwen3MoeConfig,
+     MiniMaxM2, MiniMaxM2Config, MoeConfig, Orion, OrionConfig, Phi2, PhiConfig, Qwen, QwenConfig,
+     SeedOss, SeedOssConfig, T5, T5Config, WavTokenizerDec, WavTokenizerDecConfig,
  };
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::{TensorParallelConfig, WeightSource};
@@ -194,6 +197,14 @@ fn get_meta_str(provider: &GgufProvider, key: &str) -> Option<String> {
 fn get_meta_array<'a>(provider: &'a GgufProvider, key: &str) -> Option<&'a [GgufValue]> {
     let v: Option<&GgufValue> = provider.metadata(key);
     if let Some(v) = v { v.as_array() } else { None }
+}
+
+/// Returns true if `provider` can resolve a tensor by the given (GGUF) name,
+/// without materialising it. Used for architecture detection by tensor
+/// signature (e.g. distinguishing SmolLM2 from Llama under the same
+/// `general.architecture` tag).
+fn weight_provider_has_tensor(provider: &dyn TensorProvider, name: &str) -> bool {
+    provider.meta(name).is_ok()
 }
 
 /// Metadata accessor implementation wrapping `GgufProvider`.
@@ -458,6 +469,28 @@ fn load_model_from_config(
             let m = Bloom::load_tp(device.clone(), &ws, bloom_cfg, tp)?;
             Ok(Box::new(m))
         }
+        ModelArchitecture::Laguna => {
+            let laguna_cfg = LagunaConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                num_experts: 1,
+                num_experts_per_tok: 1,
+                routed_scaling_factor: 1.0,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+                sliding_window: None,
+                layer_types: None,
+            };
+            eprintln!("[grim] Loading Laguna model with config: {:?}", laguna_cfg);
+            let m = Laguna::load_tp(device.clone(), &ws, laguna_cfg, tp)?;
+            Ok(Box::new(m))
+        }
         ModelArchitecture::Phi2 | ModelArchitecture::Phi3 | ModelArchitecture::PhiMoe => {
             let phi_cfg = PhiConfig {
                 vocab_size,
@@ -498,8 +531,17 @@ fn load_model_from_config(
         ModelArchitecture::Qwen2Moe
         | ModelArchitecture::Qwen3Moe
         | ModelArchitecture::Qwen35Moe
+                | ModelArchitecture::AfMoe
+        | ModelArchitecture::BailingMoe
+        | ModelArchitecture::BailingMoe2
+        | ModelArchitecture::Cohere2Moe
+        | ModelArchitecture::Ernie45Moe
+        | ModelArchitecture::Glm4Moe
+        | ModelArchitecture::GroveMoe
+        | ModelArchitecture::OpenAiMoe
+        | ModelArchitecture::PhiMoe
         | ModelArchitecture::Qwen3VlMoe => {
-            let qwen_moe_cfg = MoeConfig {
+            let qwen_moe_cfg = Qwen3MoeConfig {
                 vocab_size,
                 hidden_size,
                 num_heads,
@@ -507,8 +549,9 @@ fn load_model_from_config(
                 head_dim,
                 num_layers,
                 intermediate_size,
-                expert_count,
-                expert_used_count,
+                num_experts: expert_count,
+                num_experts_per_tok: expert_used_count,
+                routed_scaling_factor: 1.0,
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
@@ -517,17 +560,7 @@ fn load_model_from_config(
                 "[grim] Loading Qwen-MoE model with config: {:?}",
                 qwen_moe_cfg
             );
-            let deepseek_cfg = DeepSeekConfig {
-                vocab_size,
-                hidden_size,
-                num_heads,
-                num_layers,
-                intermediate_size,
-                rms_norm_eps,
-                q_lora_rank: num_heads,
-                kv_lora_rank: num_kv_heads * 4,
-            };
-            let m = DeepSeek::load_tp(device.clone(), &ws, deepseek_cfg, tp)?;
+            let m = Qwen3Moe::load_tp(device.clone(), &ws, qwen_moe_cfg, tp)?;
             Ok(Box::new(m))
         }
         arch if arch.is_moe() => {
@@ -917,6 +950,65 @@ fn load_model_from_config(
             let m = DeepSeek::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
+        ModelArchitecture::CommandR => {
+            let commandr_cfg = CommandRConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+            };
+            eprintln!("[grim] Loading CommandR model with config: {:?}", commandr_cfg);
+            let llama_cfg = LlamaConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+            };
+            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Chameleon => {
+            let chameleon_cfg = ChameleonConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+                swin_norm: false,
+            };
+            eprintln!("[grim] Loading Chameleon model with config: {:?}", chameleon_cfg);
+            let llama_cfg = LlamaConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+            };
+            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            Ok(Box::new(m))
+        }
         arch if arch.is_encoder() => {
             let cfg = BertConfig {
                 vocab_size,
@@ -939,6 +1031,167 @@ fn load_model_from_config(
                 rms_norm_eps,
             };
             let m = T5::load_tp(&ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Arcee
+        | ModelArchitecture::Apertus
+        | ModelArchitecture::Arctic
+        | ModelArchitecture::Baichuan
+        | ModelArchitecture::BitNet
+        | ModelArchitecture::ChatGlm
+        | ModelArchitecture::Codeshell
+        | ModelArchitecture::CogVlm
+        | ModelArchitecture::Cohere2
+        | ModelArchitecture::CommandR
+        | ModelArchitecture::Dbrx
+        | ModelArchitecture::Deci
+        | ModelArchitecture::DeepSeek2
+        | ModelArchitecture::DeepSeek2Ocr
+        | ModelArchitecture::DeepSeek32
+        | ModelArchitecture::DeepSeek4
+        | ModelArchitecture::DFlash
+        | ModelArchitecture::Dots1
+        | ModelArchitecture::Dream
+        | ModelArchitecture::Eagle3
+        | ModelArchitecture::Ernie45
+        | ModelArchitecture::Eurobert
+        | ModelArchitecture::Exaone
+        | ModelArchitecture::Exaone4
+        | ModelArchitecture::Gemma3n
+        | ModelArchitecture::Gemma4Assistant
+        | ModelArchitecture::GemmaEmbedding
+        | ModelArchitecture::Glm4
+        | ModelArchitecture::GlmDsa
+        | ModelArchitecture::GptJ
+        | ModelArchitecture::GptNeoX
+        | ModelArchitecture::Granite
+        | ModelArchitecture::Grok
+        | ModelArchitecture::HunyuanDense
+        | ModelArchitecture::HunyuanVl
+        | ModelArchitecture::HyV3
+        | ModelArchitecture::InternLm2
+        | ModelArchitecture::Jais
+        | ModelArchitecture::Jais2
+        | ModelArchitecture::KimiLinear
+        | ModelArchitecture::Llada
+        | ModelArchitecture::Llama4
+        | ModelArchitecture::LlamaEmbed
+        | ModelArchitecture::MainCoder
+        | ModelArchitecture::Mellum
+        | ModelArchitecture::Mimo2
+        | ModelArchitecture::MiniMaxM2
+        | ModelArchitecture::Mistral3
+        | ModelArchitecture::Mistral4
+        | ModelArchitecture::Mpt
+        | ModelArchitecture::Nemotron
+        | ModelArchitecture::Olmo
+        | ModelArchitecture::Olmo2
+        | ModelArchitecture::OpenElm
+        | ModelArchitecture::Orion
+        | ModelArchitecture::PaddleOcr
+        | ModelArchitecture::PanguEmbed
+        | ModelArchitecture::Plamo
+        | ModelArchitecture::Plamo2
+        | ModelArchitecture::Plamo3
+        | ModelArchitecture::Plm
+        | ModelArchitecture::Qwen2Vl
+        | ModelArchitecture::Qwen3Next
+        | ModelArchitecture::Qwen3Vl
+        | ModelArchitecture::Refact
+        | ModelArchitecture::Rnd1
+        | ModelArchitecture::SeedOss
+        | ModelArchitecture::SmallThinker
+        | ModelArchitecture::SmolLm2
+        | ModelArchitecture::SmolLm3
+        | ModelArchitecture::StableLm
+        | ModelArchitecture::Starcoder
+        | ModelArchitecture::Starcoder2
+        | ModelArchitecture::Step35
+        | ModelArchitecture::Talkie
+        | ModelArchitecture::WavTokenizerDec
+                | ModelArchitecture::BitNet
+        | ModelArchitecture::ChatGlm
+        | ModelArchitecture::CogVlm
+        | ModelArchitecture::CommandR
+        | ModelArchitecture::DeepSeek2
+        | ModelArchitecture::DeepSeek2Ocr
+        | ModelArchitecture::DeepSeek32
+        | ModelArchitecture::DeepSeek4
+        | ModelArchitecture::DFlash
+        | ModelArchitecture::GlmDsa
+        | ModelArchitecture::HyV3
+        | ModelArchitecture::MainCoder
+        | ModelArchitecture::MiniCpm3
+        | ModelArchitecture::OpenElm
+        | ModelArchitecture::SmallThinker
+        | ModelArchitecture::SmolLm2
+        | ModelArchitecture::SmolLm3
+        | ModelArchitecture::StableLm
+| ModelArchitecture::Xverse => {
+            let llama_cfg = LlamaConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+            };
+            eprintln!("[grim] Loading Llama-family model ({:?}) with config: {:?}", model_arch, llama_cfg);
+            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::AfMoe
+        | ModelArchitecture::BailingMoe
+        | ModelArchitecture::BailingMoe2
+        | ModelArchitecture::Cohere2Moe
+        | ModelArchitecture::Ernie45Moe
+        | ModelArchitecture::Ernie45Moe
+        | ModelArchitecture::ExaoneMoe
+        | ModelArchitecture::GraniteMoe
+        | ModelArchitecture::GroveMoe
+        | ModelArchitecture::HunyuanMoe
+        | ModelArchitecture::LladaMoe
+        | ModelArchitecture::Lfm2Moe
+        | ModelArchitecture::NemotronHMoe
+        | ModelArchitecture::Olmoe
+        | ModelArchitecture::OpenAiMoe
+        | ModelArchitecture::PhiMoe
+        | ModelArchitecture::Qwen2Moe
+        | ModelArchitecture::Qwen3Moe
+        | ModelArchitecture::Qwen35Moe
+        | ModelArchitecture::Qwen3VlMoe => {
+            let moe_cfg = MoeConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                expert_count,
+                expert_used_count,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+            };
+            eprintln!("[grim] Loading MoE model ({:?}) with config: {:?}", model_arch, moe_cfg);
+            let llama_cfg = LlamaConfig {
+                vocab_size: moe_cfg.vocab_size,
+                hidden_size: moe_cfg.hidden_size,
+                num_heads: moe_cfg.num_heads,
+                num_kv_heads: moe_cfg.num_kv_heads,
+                head_dim: moe_cfg.head_dim,
+                num_layers: moe_cfg.num_layers,
+                intermediate_size: moe_cfg.intermediate_size,
+                rms_norm_eps: moe_cfg.rms_norm_eps,
+                rope_theta: moe_cfg.rope_theta,
+                max_seq_len: moe_cfg.max_seq_len,
+            };
+            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
         _ => {
@@ -1058,6 +1311,18 @@ fn load_model_with_providers(
             eprintln!("[grim] Detected MiniCPM model variant from metadata/path, promoting architecture to MiniCpm");
             model_arch = ModelArchitecture::MiniCpm;
         }
+        // SmolLM2 is exported by llama.cpp under `general.architecture = "llama"`
+        // but is architecturally distinct: it ties the LM head to the token
+        // embedding (no `output.weight`) and uses `output_norm` / `token_embd`
+        // naming. Promote to SmolLm2 only on that exact tensor signature so
+        // genuine Llama files stay on the unmodified Llama loader.
+        let has_output_norm = lookup.get_str("general.architecture").is_some()
+            && weight_provider_has_tensor(weight_provider, "output_norm.weight")
+            && !weight_provider_has_tensor(weight_provider, "output.weight");
+        if has_output_norm {
+            eprintln!("[grim] Detected SmolLM2 tensor signature (output_norm present, no output.weight); promoting architecture to SmolLm2");
+            model_arch = ModelArchitecture::SmolLm2;
+        }
     }
     let hparams = HyperparameterExtractor::extract(model_arch, &lookup);
 
@@ -1121,6 +1386,28 @@ fn load_model_with_providers(
             let m = Bloom::load_tp(device.clone(), &ws, bloom_cfg, tp)?;
             Ok(Box::new(m))
         }
+        ModelArchitecture::Laguna => {
+            let laguna_cfg = LagunaConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                num_experts: hparams.expert_count.unwrap_or(1),
+                num_experts_per_tok: hparams.expert_used_count.unwrap_or(1),
+                routed_scaling_factor: 1.0,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+                sliding_window: None,
+                layer_types: None,
+            };
+            eprintln!("[grim] Loading Laguna model with config: {:?}", laguna_cfg);
+            let m = Laguna::load_tp(device.clone(), &ws, laguna_cfg, tp)?;
+            Ok(Box::new(m))
+        }
         ModelArchitecture::Phi2 | ModelArchitecture::Phi3 | ModelArchitecture::PhiMoe => {
             let phi_cfg = PhiConfig {
                 vocab_size: hparams.vocab_size,
@@ -1165,6 +1452,23 @@ fn load_model_with_providers(
             };
             eprintln!("[grim] Loading MiniCPM model with config: {:?}", minicpm_cfg);
             let m = MiniCpmModel::load(&ws, minicpm_cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::SmolLm2 => {
+            let smollm2_cfg = SmolLm2Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading SmolLM2 model with config: {:?}", smollm2_cfg);
+            let m = SmolLm2::load_tp(device.clone(), &ws, smollm2_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen
@@ -1621,6 +1925,35 @@ fn load_model_with_providers(
             let m = Gemma::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
+        ModelArchitecture::CommandR => {
+            let commandr_cfg = CommandRConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading CommandR model with config: {:?}", commandr_cfg);
+            let llama_cfg = LlamaConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+            };
+            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            Ok(Box::new(m))
+        }
         ModelArchitecture::DeepSeek
         | ModelArchitecture::DeepSeek2
         | ModelArchitecture::DeepSeek32
@@ -1636,6 +1969,49 @@ fn load_model_with_providers(
                 kv_lora_rank: hparams.num_kv_heads * 4,
             };
             let m = DeepSeek::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Chameleon => {
+            let chameleon_cfg = ChameleonConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+                swin_norm: false,
+            };
+            eprintln!("[grim] Loading Chameleon model with config: {:?}", chameleon_cfg);
+            let llama_cfg = LlamaConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+            };
+            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::DeltaNetBase => {
+            let delta_cfg = DeltaNetBaseConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading DeltaNetBase model with config: {:?}", delta_cfg);
+            let m = DeltaNetBase::load_tp(device.clone(), &ws, delta_cfg, tp)?;
             Ok(Box::new(m))
         }
         arch if arch.is_encoder() => {
@@ -1660,6 +2036,149 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
             };
             let m = T5::load_tp(&ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Arcee
+        | ModelArchitecture::Apertus
+        | ModelArchitecture::Arctic
+        | ModelArchitecture::Baichuan
+        | ModelArchitecture::BitNet
+        | ModelArchitecture::ChatGlm
+        | ModelArchitecture::Codeshell
+        | ModelArchitecture::CogVlm
+        | ModelArchitecture::Cohere2
+        | ModelArchitecture::CommandR
+        | ModelArchitecture::Dbrx
+        | ModelArchitecture::Deci
+        | ModelArchitecture::DeepSeek2
+        | ModelArchitecture::DeepSeek2Ocr
+        | ModelArchitecture::DeepSeek32
+        | ModelArchitecture::DeepSeek4
+        | ModelArchitecture::DFlash
+        | ModelArchitecture::Dots1
+        | ModelArchitecture::Dream
+        | ModelArchitecture::Eagle3
+        | ModelArchitecture::Ernie45
+        | ModelArchitecture::Eurobert
+        | ModelArchitecture::Exaone
+        | ModelArchitecture::Exaone4
+        | ModelArchitecture::Gemma3n
+        | ModelArchitecture::Gemma4Assistant
+        | ModelArchitecture::GemmaEmbedding
+        | ModelArchitecture::Glm4
+        | ModelArchitecture::GlmDsa
+        | ModelArchitecture::GptJ
+        | ModelArchitecture::GptNeoX
+        | ModelArchitecture::Granite
+        | ModelArchitecture::Grok
+        | ModelArchitecture::HunyuanDense
+        | ModelArchitecture::HunyuanVl
+        | ModelArchitecture::HyV3
+        | ModelArchitecture::InternLm2
+        | ModelArchitecture::Jais
+        | ModelArchitecture::Jais2
+        | ModelArchitecture::KimiLinear
+        | ModelArchitecture::Llada
+        | ModelArchitecture::Llama4
+        | ModelArchitecture::LlamaEmbed
+        | ModelArchitecture::MainCoder
+        | ModelArchitecture::Mellum
+        | ModelArchitecture::Mimo2
+        | ModelArchitecture::MiniMaxM2
+        | ModelArchitecture::Mistral3
+        | ModelArchitecture::Mistral4
+        | ModelArchitecture::Mpt
+        | ModelArchitecture::Nemotron
+        | ModelArchitecture::Olmo
+        | ModelArchitecture::Olmo2
+        | ModelArchitecture::OpenElm
+        | ModelArchitecture::Orion
+        | ModelArchitecture::PaddleOcr
+        | ModelArchitecture::PanguEmbed
+        | ModelArchitecture::Plamo
+        | ModelArchitecture::Plamo2
+        | ModelArchitecture::Plamo3
+        | ModelArchitecture::Plm
+        | ModelArchitecture::Qwen2Vl
+        | ModelArchitecture::Qwen3Next
+        | ModelArchitecture::Qwen3Vl
+        | ModelArchitecture::Refact
+        | ModelArchitecture::Rnd1
+        | ModelArchitecture::SeedOss
+        | ModelArchitecture::SmallThinker
+        | ModelArchitecture::SmolLm2
+        | ModelArchitecture::SmolLm3
+        | ModelArchitecture::StableLm
+        | ModelArchitecture::Starcoder
+        | ModelArchitecture::Starcoder2
+        | ModelArchitecture::Step35
+        | ModelArchitecture::Talkie
+        | ModelArchitecture::WavTokenizerDec
+        | ModelArchitecture::Xverse => {
+            let llama_cfg = LlamaConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading Llama-family model ({:?}) with config: {:?}", model_arch, llama_cfg);
+            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::AfMoe
+        | ModelArchitecture::BailingMoe
+        | ModelArchitecture::BailingMoe2
+        | ModelArchitecture::Cohere2Moe
+        | ModelArchitecture::Ernie45Moe
+        | ModelArchitecture::Ernie45Moe
+        | ModelArchitecture::ExaoneMoe
+        | ModelArchitecture::GraniteMoe
+        | ModelArchitecture::GroveMoe
+        | ModelArchitecture::HunyuanMoe
+        | ModelArchitecture::LladaMoe
+        | ModelArchitecture::Lfm2Moe
+        | ModelArchitecture::NemotronHMoe
+        | ModelArchitecture::Olmoe
+        | ModelArchitecture::OpenAiMoe
+        | ModelArchitecture::PhiMoe
+        | ModelArchitecture::Qwen2Moe
+        | ModelArchitecture::Qwen3Moe
+        | ModelArchitecture::Qwen35Moe
+        | ModelArchitecture::Qwen3VlMoe => {
+            let moe_cfg = MoeConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                expert_count: hparams.expert_count.unwrap_or(8),
+                expert_used_count: hparams.expert_used_count.unwrap_or(2),
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+            };
+            eprintln!("[grim] Loading MoE model ({:?}) with config: {:?}", model_arch, moe_cfg);
+            let llama_cfg = LlamaConfig {
+                vocab_size: moe_cfg.vocab_size,
+                hidden_size: moe_cfg.hidden_size,
+                num_heads: moe_cfg.num_heads,
+                num_kv_heads: moe_cfg.num_kv_heads,
+                head_dim: moe_cfg.head_dim,
+                num_layers: moe_cfg.num_layers,
+                intermediate_size: moe_cfg.intermediate_size,
+                rms_norm_eps: moe_cfg.rms_norm_eps,
+                rope_theta: moe_cfg.rope_theta,
+                max_seq_len: moe_cfg.max_seq_len,
+            };
+            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
         _ => {
