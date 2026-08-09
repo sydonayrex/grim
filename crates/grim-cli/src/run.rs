@@ -538,8 +538,11 @@ pub async fn cmd_run(
         // Temporary A/B diagnostic: dump the top-5 next-token logits on the
         // first step so CPU vs ROCm paths can be compared post-prefill.
         if std::env::var("GRIM_DUMP_LOGITS").is_ok() && generated_tokens.is_empty() {
-            let mut ranked: Vec<(usize, f32)> =
-                last_logits.iter().enumerate().map(|(i, v)| (i, *v)).collect();
+            let mut ranked: Vec<(usize, f32)> = last_logits
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, *v))
+                .collect();
             ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             eprintln!("[LOGITS] top5 after prefill:");
             for (id, val) in ranked.iter().take(5) {
@@ -569,7 +572,10 @@ pub async fn cmd_run(
                 || tok.token_to_id.get("<|endoftext|>").copied() == Some(next_token)
                 || tok.token_to_id.get("</s>").copied() == Some(next_token);
             if is_eos {
-                eprintln!("[grim] EOS token {} reached, stopping generation.", next_token);
+                eprintln!(
+                    "[grim] EOS token {} reached, stopping generation.",
+                    next_token
+                );
                 break;
             }
         }
