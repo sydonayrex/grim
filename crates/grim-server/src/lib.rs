@@ -2810,7 +2810,7 @@ pub async fn serve(
                 })?;
 
         eprintln!("[grim-server] Serving over HTTPS (SSL enabled) on {}", addr);
-        let bind_addr = addr
+        let bind_addr: std::net::SocketAddr = addr
             .parse()
             .map_err(|e| grim_core::Error::Config(format!("invalid bind address {addr}: {e}")))?;
         axum_server::bind_rustls(bind_addr, rustls_config)
