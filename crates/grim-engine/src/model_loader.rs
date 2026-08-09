@@ -15,10 +15,10 @@ use grim_models_mamba::{
     Rwkv6Config, Rwkv7Config, RwkvConfig,
 };
  use grim_models_transformer::{
-     BloomConfig, DeepSeek, DeepSeekConfig, FalconConfig, FalconH1Config,
+     Bloom, BloomConfig, DeepSeek, DeepSeekConfig, Falcon, FalconConfig, FalconH1Config,
      FalconH1Model, Gemma, GemmaConfig, Gpt2, Gpt2Config,
-     Lfm2, Lfm2Config, Llama, LlamaConfig, MiniCpmConfig, MiniCpmModel, MoeConfig, PhiConfig,
-     QwenConfig, T5, T5Config,
+     Lfm2, Lfm2Config, Llama, LlamaConfig, MiniCpmConfig, MiniCpmModel, MoeConfig, Phi2, PhiConfig,
+     Qwen, QwenConfig, T5, T5Config,
  };
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::{TensorParallelConfig, WeightSource};
@@ -430,13 +430,19 @@ fn load_model_from_config(
                 hidden_size,
                 num_heads,
                 num_kv_heads,
+                head_dim,
                 num_layers,
                 intermediate_size,
                 rms_norm_eps,
+                rope_theta,
                 max_seq_len,
             };
             eprintln!("[grim] Loading Falcon model with config: {:?}", falcon_cfg);
-            let llama_cfg = LlamaConfig {
+            let m = Falcon::load_tp(device.clone(), &ws, falcon_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Bloom => {
+            let bloom_cfg = BloomConfig {
                 vocab_size,
                 hidden_size,
                 num_heads,
@@ -448,30 +454,8 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
-            Ok(Box::new(m))
-        }
-        ModelArchitecture::Bloom => {
-            let bloom_cfg = BloomConfig {
-                vocab_size,
-                hidden_size,
-                num_heads,
-                num_layers,
-                intermediate_size,
-                layer_norm_epsilon: rms_norm_eps,
-                max_seq_len,
-            };
             eprintln!("[grim] Loading BLOOM model with config: {:?}", bloom_cfg);
-            let gpt2_cfg = Gpt2Config {
-                vocab_size,
-                hidden_size,
-                num_heads,
-                num_layers,
-                intermediate_size,
-                layer_norm_epsilon: rms_norm_eps,
-                max_seq_len,
-            };
-            let m = Gpt2::load_tp(device.clone(), &ws, gpt2_cfg, tp)?;
+            let m = Bloom::load_tp(device.clone(), &ws, bloom_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Phi2 | ModelArchitecture::Phi3 | ModelArchitecture::PhiMoe => {
@@ -480,18 +464,6 @@ fn load_model_from_config(
                 hidden_size,
                 num_heads,
                 num_kv_heads,
-                num_layers,
-                intermediate_size,
-                rms_norm_eps,
-                rope_theta,
-                max_seq_len,
-            };
-            eprintln!("[grim] Loading Phi model with config: {:?}", phi_cfg);
-            let llama_cfg = LlamaConfig {
-                vocab_size,
-                hidden_size,
-                num_heads,
-                num_kv_heads,
                 head_dim,
                 num_layers,
                 intermediate_size,
@@ -499,7 +471,8 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            eprintln!("[grim] Loading Phi model with config: {:?}", phi_cfg);
+            let m = Phi2::load_tp(device.clone(), &ws, phi_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen
@@ -519,19 +492,7 @@ fn load_model_from_config(
                 max_seq_len,
             };
             eprintln!("[grim] Loading Qwen model with config: {:?}", qwen_cfg);
-            let llama_cfg = LlamaConfig {
-                vocab_size,
-                hidden_size,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                num_layers,
-                intermediate_size,
-                rms_norm_eps,
-                rope_theta,
-                max_seq_len,
-            };
-            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            let m = Qwen::load_tp(device.clone(), &ws, qwen_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen2Moe
@@ -1132,13 +1093,19 @@ fn load_model_with_providers(
                 hidden_size: hparams.hidden_size,
                 num_heads: hparams.num_heads,
                 num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
                 num_layers: hparams.num_layers,
                 intermediate_size: hparams.intermediate_size,
                 rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
             eprintln!("[grim] Loading Falcon model with config: {:?}", falcon_cfg);
-            let llama_cfg = LlamaConfig {
+            let m = Falcon::load_tp(device.clone(), &ws, falcon_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Bloom => {
+            let bloom_cfg = BloomConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
                 num_heads: hparams.num_heads,
@@ -1150,30 +1117,8 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
-            Ok(Box::new(m))
-        }
-        ModelArchitecture::Bloom => {
-            let bloom_cfg = BloomConfig {
-                vocab_size: hparams.vocab_size,
-                hidden_size: hparams.hidden_size,
-                num_heads: hparams.num_heads,
-                num_layers: hparams.num_layers,
-                intermediate_size: hparams.intermediate_size,
-                layer_norm_epsilon: hparams.rms_norm_eps,
-                max_seq_len: hparams.max_seq_len,
-            };
             eprintln!("[grim] Loading BLOOM model with config: {:?}", bloom_cfg);
-            let gpt2_cfg = Gpt2Config {
-                vocab_size: hparams.vocab_size,
-                hidden_size: hparams.hidden_size,
-                num_heads: hparams.num_heads,
-                num_layers: hparams.num_layers,
-                intermediate_size: hparams.intermediate_size,
-                layer_norm_epsilon: hparams.rms_norm_eps,
-                max_seq_len: hparams.max_seq_len,
-            };
-            let m = Gpt2::load_tp(device.clone(), &ws, gpt2_cfg, tp)?;
+            let m = Bloom::load_tp(device.clone(), &ws, bloom_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Phi2 | ModelArchitecture::Phi3 | ModelArchitecture::PhiMoe => {
@@ -1182,18 +1127,6 @@ fn load_model_with_providers(
                 hidden_size: hparams.hidden_size,
                 num_heads: hparams.num_heads,
                 num_kv_heads: hparams.num_kv_heads,
-                num_layers: hparams.num_layers,
-                intermediate_size: hparams.intermediate_size,
-                rms_norm_eps: hparams.rms_norm_eps,
-                rope_theta: hparams.rope_theta,
-                max_seq_len: hparams.max_seq_len,
-            };
-            eprintln!("[grim] Loading Phi model with config: {:?}", phi_cfg);
-            let llama_cfg = LlamaConfig {
-                vocab_size: hparams.vocab_size,
-                hidden_size: hparams.hidden_size,
-                num_heads: hparams.num_heads,
-                num_kv_heads: hparams.num_kv_heads,
                 head_dim: hparams.head_dim,
                 num_layers: hparams.num_layers,
                 intermediate_size: hparams.intermediate_size,
@@ -1201,7 +1134,8 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            eprintln!("[grim] Loading Phi model with config: {:?}", phi_cfg);
+            let m = Phi2::load_tp(device.clone(), &ws, phi_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::MiniCpm | ModelArchitecture::MiniCpm3 => {
@@ -1262,7 +1196,7 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            let m = Qwen::load_tp(device.clone(), &ws, qwen_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen2Moe
