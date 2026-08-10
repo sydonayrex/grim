@@ -500,6 +500,12 @@ impl LookaheadPredictor {
             self.num_experts,
             "current_logits length must equal num_experts"
         );
+        if !self.enabled {
+            // Identity prior: next-layer routing ≈ this-layer routing.
+            // Skip the distill matrix multiply entirely — the off-switch
+            // must not consult W_distill at all.
+            return self.top_k_from_logits(current_logits);
+        }
         // predicted_next_logits[j] = sum_i current_logits[i] * W[i, j]
         let mut pred = vec![0.0f32; self.num_experts];
         for j in 0..self.num_experts {
@@ -509,13 +515,17 @@ impl LookaheadPredictor {
             }
             pred[j] = acc;
         }
-        let probs = softmax(&pred);
-        // Top-k by probability.
+        self.top_k_from_logits(&pred)
+    }
+
+    /// Softmax over `logits`, then take `top_k` by probability and renormalize
+    /// the selected probabilities over the chosen set (mirrors
+    /// `MoeRouter::route`'s SoftmaxTopK combine-weight convention).
+    fn top_k_from_logits(&self, logits: &[f32]) -> (Vec<usize>, Vec<f32>) {
+        let probs = softmax(logits);
         let mut order: Vec<usize> = (0..self.num_experts).collect();
         order.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
         let chosen: Vec<usize> = order.iter().take(self.top_k).copied().collect();
-        // Renormalize the top-k probabilities over the selected set (mirrors
-        // `MoeRouter::route`'s SoftmaxTopK combine-weight convention).
         let raw: Vec<f32> = chosen.iter().map(|&i| probs[i]).collect();
         let sum: f32 = raw.iter().sum();
         let chosen_probs: Vec<f32> = if sum > 0.0 {
@@ -1100,5 +1110,39 @@ mod tests {
         // different). Hit@k must be 0 — the honest "no signal" outcome.
         let hit = prediction_hit_at_k(&idx, &[1, 3]);
         assert_eq!(hit, 0.0, "disabled predictor must report 0 Hit@k on disjoint next");
+    }
+
+    /// G-C3 off-switch programmatic enforcement: `predict()` must actually
+    /// consult `self.enabled`. With a non-identity `W_distill`, the buggy
+    /// implementation (which ignored `enabled`) would return the distilled
+    /// forecast instead of the identity prior. This test would have caught
+    /// that: it sets `enabled=false` and a W that *would* change the top-k
+    /// if consulted, then verifies the identity prior is returned unchanged.
+    #[test]
+    fn disabled_predictor_returns_identity_prior_not_distilled() {
+        let mut p = LookaheadPredictor::new_gate_initialized(4, 2);
+        p.enabled = false;
+        // Current logits: top-2 = {0 (5.0), 2 (4.0)}.
+        let cur = [5.0, 0.0, 4.0, 0.0];
+        // Overwrite W_distill to swap experts 0↔1: if predict() consulted
+        // W, the forecast would shift toward expert 1 (logit 5.0 lands on
+        // column 1 instead of column 0).
+        p.distill[0] = 0.0;  // W[0,0] = 0 (was 1.0)
+        p.distill[1] = 1.0;  // W[0,1] = 1 (was 0.0)
+        p.distill[4] = 1.0;  // W[1,0] = 1 (was 0.0)
+        p.distill[5] = 0.0;  // W[1,1] = 0 (was 1.0)
+        // With the buggy code (W consulted despite enabled=false):
+        //   pred[0] = cur[0]*0 + cur[1]*1 = 0.0
+        //   pred[1] = cur[0]*1 + cur[1]*0 = 5.0
+        //   softmax → top-2 = {1, 2} (WRONG — off-switch changed the forecast)
+        // With the fix (identity prior, W ignored):
+        //   softmax(cur) → top-2 = {0, 2} (CORRECT — identity prior)
+        let (idx, _) = p.predict(&cur);
+        assert_eq!(
+            idx,
+            vec![0, 2],
+            "disabled predictor must return identity prior (current top-k), \
+             not the distilled forecast — predict() must check self.enabled"
+        );
     }
 }
