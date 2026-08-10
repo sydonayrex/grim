@@ -1,5 +1,7 @@
 //! Dense CausalLm transformer implementations (Llama, Mistral, Qwen, DeepSeek, Gemma, T5, MTP).
 
+/// Charon P-DAFD fused MoE dispatch wiring seam (`rocm_kernel_plan.md` WI-D).
+pub mod charon_dispatch;
 pub mod block;
 /// Shared MoE block (router + expert bank + optional shared expert).
 pub mod moe_block;

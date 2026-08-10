@@ -9,6 +9,11 @@ use grim_kvquant::{CompressedKvBlock, KvCompressor};
 use grim_kvtransport::{BlockId as TransportBlockId, CacheTier, SharedSpillManager};
 use grim_tensor::Tensor;
 
+/// MoE resident-set HBM budget (`rocm_kernel_plan.md` WI-C).
+pub mod moe_budget;
+
+pub use moe_budget::{MoeResidentBudget, ResidentTier};
+
 pub const BLOCK_SIZE: usize = 16;
 
 pub type BlockId = usize;

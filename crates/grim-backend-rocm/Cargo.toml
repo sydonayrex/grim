@@ -52,5 +52,6 @@ rccl = []
 
 [dev-dependencies]
 grim-quant = { workspace = true }
+grim-nn = { workspace = true }
 grim-backend-cpu = { path = "../grim-backend-cpu" }
 grim-kvquant = { path = "../grim-kvquant" }

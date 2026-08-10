@@ -12,3 +12,15 @@ grim-nn = { workspace = true }
 grim-core = { workspace = true }
 grim-backend-cpu = { workspace = true }
 thiserror = { workspace = true }
+
+[features]
+default = []
+# Charon — P-DAFD fused MoE dispatch (`rocm_kernel_plan.md`).
+# When enabled, MoE architectures route their forward through the Charon
+# fused-dispatch path (grim-backend-rocm) instead of the CPU reference
+# (`grim_nn::moe::MoeFfn::forward`). Default OFF: the CPU reference is the
+# parity oracle and must remain the default path. When ON but no ROCm
+# backend is wired at runtime, `charon_dispatch` returns
+# `Err(Unimplemented)` — never a silent dense fallback (G-D2).
+moe_charon = []
+

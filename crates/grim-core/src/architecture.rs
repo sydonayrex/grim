@@ -591,7 +591,7 @@ impl TensorNamingRegistry {
             TensorRole::FfnDown => format!("{prefix}ffn_down.weight"),
             TensorRole::FfnUp => format!("{prefix}ffn_up.weight"),
             TensorRole::MoeGate => format!("{prefix}ffn_gate_inp.weight"),
-            TensorRole::MoeExperts => format!("{prefix}ffn_experts.weight"),
+            TensorRole::MoeExperts => format!("{prefix}ffn_gate_exps.weight"),
             TensorRole::ConvIn => format!("{prefix}shortconv.in_proj.weight"),
             TensorRole::ConvWeight => format!("{prefix}shortconv.conv.weight"),
             TensorRole::ConvOut => format!("{prefix}shortconv.out_proj.weight"),
@@ -893,30 +893,34 @@ impl TensorNamingRegistry {
                         format!("{gg_p}ffn_down.weight"),
                     );
                     // --- MoE expert-indexed tensor names (WI-M1) ---
-                    // llama.cpp stores per-expert FFN weights as 3D tensors:
+                    // llama.cpp stores per-expert FFN weights as 3D tensors
+                    // (experts are the OUTERMOST dimension):
                     //   ffn_gate_exps.weight = [n_experts, inter, hidden]
                     //   ffn_up_exps.weight   = [n_experts, inter, hidden]
-                    //   ffn_down_exps.weight = [n_experts, hidden, inter]
-                    // The HF `model.layers.{i}.mlp.experts.{e}.{w}.weight`
-                    // convention is mapped onto the flat GGUF expert tensor
-                    // by `WeightSource` slicing (see load_moe_block). These
-                    // entries let the dedup router + shared expert resolve by
-                    // their HF names too.
+                    //   ffn_down_exps.weight = [n_experts, inter, hidden]
+                    // Each expert's `[inter, hidden]` block is sliced out; the
+                    // down projection is transposed to `[hidden, inter]` for the
+                    // `Linear` (out=hidden, in=inter). Matches `ExpertBank::load`.
                     map.insert(
-                        format!("{hf_p}mlp.gate.weight"),
+                        format!("{hf_p}mlp.experts.gate_proj.weight"),
                         format!("{gg_p}ffn_gate_exps.weight"),
                     );
                     map.insert(
-                        format!("{hf_p}mlp.experts.gate_proj.weight"),
-                        format!("{gg_p}ffn_gate_exps_e.weight"),
-                    );
-                    map.insert(
                         format!("{hf_p}mlp.experts.up_proj.weight"),
-                        format!("{gg_p}ffn_up_exps_e.weight"),
+                        format!("{gg_p}ffn_up_exps.weight"),
                     );
                     map.insert(
                         format!("{hf_p}mlp.experts.down_proj.weight"),
-                        format!("{gg_p}ffn_down_exps_e.weight"),
+                        format!("{gg_p}ffn_down_exps.weight"),
+                    );
+                    // Router gate (the dedup router, NOT the expert bank).
+                    // HF convention for Qwen2/3-MoE / Mixtral is `mlp.gate.weight`.
+                    // Resolves to the GGUF router tensor `ffn_gate_inp.weight`
+                    // (kept distinct from `mlp.gate_proj.weight`, which some archs
+                    // also use for the same router — see below).
+                    map.insert(
+                        format!("{hf_p}mlp.gate.weight"),
+                        format!("{gg_p}ffn_gate_inp.weight"),
                     );
                     // Dedup/shared router gate (Laguna, Qwen2/3, GLM4, ...).
                     map.insert(
@@ -925,7 +929,7 @@ impl TensorNamingRegistry {
                     );
                     map.insert(
                         format!("{hf_p}mlp.gate.e_score_correction_bias"),
-                        format!("{gg_p}exp_probs_b.weight"),
+                        format!("{gg_p}ffn_exp_probs_b.bias"),
                     );
                     // Shared/always-on expert (Laguna, Qwen3-MoE, DeepSeek).
                     map.insert(
@@ -991,6 +995,24 @@ mod tests {
         assert_eq!(
             remap.get("model.layers.0.self_attn.q_proj.weight").unwrap(),
             "blk.0.attn_q.weight"
+        );
+
+        // MoE remap split: router gate vs expert bank must resolve to distinct
+        // GGUF tensors. `mlp.gate.weight` (Qwen2/3-MoE / Mixtral router) maps to
+        // the router `ffn_gate_inp.weight`, NOT the expert bank.
+        let moe = TensorNamingRegistry::remap_hf_to_gguf(ModelArchitecture::Qwen3Moe, 4);
+        assert_eq!(
+            moe.get("model.layers.0.mlp.gate.weight").unwrap(),
+            "blk.0.ffn_gate_inp.weight"
+        );
+        assert_eq!(
+            moe.get("model.layers.0.mlp.experts.gate_proj.weight")
+                .unwrap(),
+            "blk.0.ffn_gate_exps.weight"
+        );
+        assert_eq!(
+            moe.get("model.layers.0.mlp.gate_proj.weight").unwrap(),
+            "blk.0.ffn_gate_inp.weight"
         );
     }
 }

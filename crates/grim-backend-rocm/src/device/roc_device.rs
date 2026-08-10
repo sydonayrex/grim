@@ -4082,6 +4082,199 @@ impl RocmDevice {
         )
     }
 
+    /// Launch the Charon fused MoE dispatch kernel (`rocm_kernel_plan.md`
+    /// WI-A). Single sortless launch: each block reads its (token, expert)
+    /// pair from the uploaded routing arrays and performs the fused
+    /// gate+up→SiLU→down→weighted-accumulate.
+    ///
+    /// Device-gated: only callable with real `RocmStorage` device buffers.
+    /// The host-logic half (routing flatten + grid/block plan + arg
+    /// marshalling) is unit-tested without a device in
+    /// `kernels::charon::tests` (G-A2). Parity vs the CPU oracle
+    /// (`MoeFfn::forward`) is G-A4 — a device-verify TODO in this sandbox.
+    ///
+    /// Caller wiring lands in WI-D (`moe_charon` feature flag → transformer
+    /// MoE forward). Until then this is `allow(dead_code)` per the plan's
+    /// "device-gated TODO" discipline — not skipped silently.
+    #[allow(dead_code)]
+    pub(crate) fn launch_charon_fused_dispatch(
+        &self,
+        activations: &RocmStorage,
+        expert_gate_w_ptr: u64,
+        expert_up_w_ptr: u64,
+        expert_down_w_ptr: u64,
+        assignment: &crate::kernels::charon::RoutingAssignment,
+        out_storage: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<*mut c_void> {
+        let a_ptr = activations.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_fused_dispatch: activations has no device ptr".into())
+        })?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_fused_dispatch: out has no device ptr".into())
+        })?;
+
+        // Validate shapes + null pointers before any HIP dereference (G-A2
+        // host-logic path, unit-tested in kernels::charon::tests).
+        crate::kernels::charon::validate_launch_inputs(
+            a_ptr as *mut c_void,
+            expert_gate_w_ptr as *mut c_void,
+            expert_up_w_ptr as *mut c_void,
+            expert_down_w_ptr as *mut c_void,
+            out_ptr as *mut c_void,
+            assignment,
+            hidden,
+            inter,
+        )?;
+
+        // Zero the output buffer before launch: the kernel accumulates per-
+        // expert contributions via `atomicAdd`, so any stale bytes in the
+        // output storage would be added into the result. This mirrors the
+        // `BackendDevice::zeros` path (hipMemset, roc_device.rs:1363).
+        check_hip("charon hipMemset(output, 0)", unsafe {
+            hipMemset(out_ptr as *mut c_void, 0, out_storage.bytes())
+        })?;
+
+        // Plan the launch (wave-aligned block, grid over pairs). Pass the
+        // device's real wavefront size (W32 on gfx1036, W64 on CDNA).
+        let wave = self.wavefront_size() as u32;
+        let plan = crate::kernels::charon::plan_fused_dispatch(assignment, wave);
+        if plan.grid_x == 0 {
+            // No pairs → nothing to launch; return the active stream.
+            return Ok(self.active_stream());
+        }
+        let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
+        let block_dim = HipDim3::new(plan.block_x, 1, 1);
+
+        // Upload the routing arrays (tokens, experts, weights) to the device.
+        // These are freed after the launch synchronizes (mirroring the
+        // embedding path's transient-buffer discipline).
+        let mut tok_ptr = upload_device_buffer(&assignment.tokens)?;
+        let mut exp_ptr = upload_device_buffer(&assignment.experts)?;
+        let mut w_ptr = upload_device_buffer(&assignment.weights)?;
+
+        let mut a = a_ptr as *mut c_void;
+        let mut gw = expert_gate_w_ptr as *mut c_void;
+        let mut uw = expert_up_w_ptr as *mut c_void;
+        let mut dw = expert_down_w_ptr as *mut c_void;
+        let mut optr = out_ptr as *mut c_void;
+        let mut hidden_i = hidden as i32;
+        let mut inter_i = inter as i32;
+        let mut num_pairs_i = assignment.num_pairs() as i32;
+        let mut rsf = routed_scaling_factor;
+
+        let stream = self.launch_compute_kernel(
+            "grim_moe_fused_dispatch",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a),
+                arg(&mut gw),
+                arg(&mut uw),
+                arg(&mut dw),
+                arg(&mut tok_ptr),
+                arg(&mut exp_ptr),
+                arg(&mut w_ptr),
+                arg(&mut optr),
+                arg(&mut hidden_i),
+                arg(&mut inter_i),
+                arg(&mut num_pairs_i),
+                arg(&mut rsf),
+            ],
+        )?;
+
+        // Free the transient routing buffers after the kernel completes.
+        if self.active_capture_stream().is_none() {
+            unsafe {
+                let sync = hipStreamSynchronize(stream);
+                if sync != hipSuccess {
+                    hipFree(tok_ptr);
+                    hipFree(exp_ptr);
+                    hipFree(w_ptr);
+                    return Err(Error::Backend(format!(
+                        "charon hipStreamSynchronize failed: {}",
+                        sync
+                    )));
+                }
+                hipFree(tok_ptr);
+                hipFree(exp_ptr);
+                hipFree(w_ptr);
+            }
+        }
+        Ok(stream)
+    }
+
+    /// Public host-to-host roundtrip entry point for the Charon fused MoE
+    /// dispatch kernel, used by the golden GPU parity tests
+    /// (`tests/golden_charon_moe_gpu.rs`, G-A4). Takes plain host `f32`
+    /// buffers + a routing assignment, uploads them, zeros the output,
+    /// launches `grim_moe_fused_dispatch`, and reads the result back.
+    ///
+    /// Expert weight layout: `[num_experts, inter*hidden]` (gate/up) and
+    /// `[num_experts, hidden*inter]` (down), expert outermost — matching
+    /// `ExpertBank::gate[e].weight` / `down[e].weight` row-major layout so
+    /// the kernel's `gw + exp*inter*hidden` stride is correct.
+    ///
+    /// This is the only public surface the integration tests need; it does
+    /// not expose `RocmStorage` or raw device pointers.
+    pub fn charon_fused_dispatch_roundtrip(
+        &self,
+        activations: &[f32],
+        expert_gate_w: &[f32],
+        expert_up_w: &[f32],
+        expert_down_w: &[f32],
+        assignment: &crate::kernels::charon::RoutingAssignment,
+        batch: usize,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<Vec<f32>> {
+        let act_shape = Shape::new(vec![batch, hidden]);
+        let exp_gate_shape = Shape::new(vec![expert_gate_w.len()]);
+        let exp_up_shape = Shape::new(vec![expert_up_w.len()]);
+        let exp_down_shape = Shape::new(vec![expert_down_w.len()]);
+        let out_shape = Shape::new(vec![batch, hidden]);
+
+        // Upload host buffers to the device.
+        let act_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, activations, &act_shape, DType::F32)?;
+        let gw_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, expert_gate_w, &exp_gate_shape, DType::F32)?;
+        let uw_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, expert_up_w, &exp_up_shape, DType::F32)?;
+        let dw_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, expert_down_w, &exp_down_shape, DType::F32)?;
+        let out_storage: Box<dyn BackendStorage> =
+            BackendDevice::alloc_storage(self, &out_shape, DType::F32)?;
+
+        // Downcast to RocmStorage to reach device pointers + the launcher.
+        let act_s = as_rocm(act_storage.as_ref())?;
+        let gw_s = as_rocm(gw_storage.as_ref())?;
+        let uw_s = as_rocm(uw_storage.as_ref())?;
+        let dw_s = as_rocm(dw_storage.as_ref())?;
+        let out_s = as_rocm(out_storage.as_ref())?;
+
+        let gw_ptr = dev_ptr(gw_s)?;
+        let uw_ptr = dev_ptr(uw_s)?;
+        let dw_ptr = dev_ptr(dw_s)?;
+
+        self.launch_charon_fused_dispatch(
+            act_s,
+            gw_ptr,
+            uw_ptr,
+            dw_ptr,
+            assignment,
+            out_s,
+            hidden,
+            inter,
+            routed_scaling_factor,
+        )?;
+        self.synchronize();
+        out_storage.to_cpu_vec_f32()
+    }
+
     /// Launch the JIT compiled fused dequantization backward matmul kernel (WI-T3 / F5). [see: `dX[M, K] = dY[M, N] @ B^T`]
     pub(crate) fn launch_fused_dequant_backward_gemm_f16(
         &self,
