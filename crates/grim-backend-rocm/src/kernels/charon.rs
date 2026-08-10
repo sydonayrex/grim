@@ -502,13 +502,25 @@ pub fn routing_skew(per_expert_token_counts: &[u32]) -> f32 {
 /// the scalar `skew` (one f32 the kernel atomically wrote) into this
 /// selector. A min-hold count prevents thrashing variants between adjacent
 /// layers (DA-MoE caution, plan §5): a newly-preferred variant only takes
-/// over after it has been the argmin for `min_hold` consecutive calls.
+/// over after it has been the argmin for `min_hold` *consecutive* calls.
+///
+/// The de-sync guard tracks the *specific challenger* that is accumulating
+/// wins — if a different variant wins between hold calls, the streak resets
+/// to 1 (the new challenger starts from scratch). This prevents an
+/// alternating-challenger pattern from earning a spurious switch: without
+/// per-challenger tracking, two different non-current variants taking turns
+/// as argmin would each increment the same counter, eventually crossing
+/// `min_hold` and switching to whichever variant happened to win last,
+/// despite neither sustaining `min_hold` consecutive wins.
 #[allow(dead_code)]
 pub struct CharonSelector {
     table: Vec<VariantRow>,
     current_variant: CharonVariant,
-    /// Consecutive calls the current variant has been the argmin.
+    /// Consecutive calls the current challenger has been the argmin.
     hold_counter: u32,
+    /// Which variant the hold_counter is accumulating for. `None` when the
+    /// current variant is winning (no active challenger).
+    challenger: Option<CharonVariant>,
     /// Required consecutive wins before switching (de-sync guard).
     min_hold: u32,
 }
@@ -525,6 +537,7 @@ impl CharonSelector {
             table,
             current_variant: initial,
             hold_counter: 0,
+            challenger: None,
             min_hold: min_hold.max(1),
         }
     }
@@ -567,14 +580,29 @@ impl CharonSelector {
         }
 
         if best == self.current_variant {
-            self.hold_counter = self.hold_counter.saturating_add(1);
-        } else if self.hold_counter >= self.min_hold {
-            // Held long enough — allow the switch and reset the counter.
-            self.current_variant = best;
-            self.hold_counter = 1;
+            // Current variant is winning — reset any challenger streak.
+            self.hold_counter = 0;
+            self.challenger = None;
         } else {
-            // Not yet — keep the current variant, but note the challenger won.
-            self.hold_counter = self.hold_counter.saturating_add(1);
+            // A challenger won. Only accumulate credit for the *same*
+            // challenger across consecutive calls — a different challenger
+            // resets the streak to 1 (the new challenger starts from scratch).
+            match self.challenger {
+                Some(c) if c == best => {
+                    self.hold_counter += 1;
+                }
+                _ => {
+                    self.challenger = Some(best);
+                    self.hold_counter = 1;
+                }
+            }
+            // Switch only when the *same* challenger has held for min_hold
+            // consecutive calls.
+            if self.hold_counter >= self.min_hold {
+                self.current_variant = best;
+                self.hold_counter = 0;
+                self.challenger = None;
+            }
         }
         self.current_variant
     }
@@ -855,6 +883,39 @@ mod tests {
             sel.current(),
             CharonVariant::HighSkew,
             "after min_hold consecutive wins, switch takes effect"
+        );
+    }
+
+    /// G-B1 / §5 de-sync guard (alternating-challenger case): when two
+    /// different non-current variants take turns as argmin, the per-challenger
+    /// streak resets each time — no spurious switch can fire until one
+    /// variant wins `min_hold` consecutive calls on its own.
+    #[test]
+    fn selector_min_hold_alternating_challengers_does_not_switch() {
+        let mut sel = CharonSelector::new(default_variant_table(), 3);
+        // Establish SmallBatchDecode as current (low skew).
+        let _ = sel.select(0.1, 1.0, 512.0, 1e5, 0.1);
+        assert_eq!(sel.current(), CharonVariant::SmallBatchDecode);
+
+        // Alternating challengers: HighSkew (skew=0.95), LargeGroupPrefill
+        // (skew=0.5), HighSkew again.  Per-challenger streaks: HS=1, LGP=1,
+        // HS=1 — none reach min_hold=3, so no switch fires.
+        let _ = sel.select(0.95, 8.0, 2048.0, 1e6, 0.5);  // challenger: HighSkew
+        assert_eq!(sel.current(), CharonVariant::SmallBatchDecode);
+        let _ = sel.select(0.5, 4.0, 1024.0, 1e6, 0.3);   // challenger: LargeGroupPrefill
+        assert_eq!(sel.current(), CharonVariant::SmallBatchDecode);
+        let _ = sel.select(0.95, 8.0, 2048.0, 1e6, 0.5);  // challenger: HighSkew (streak resets to 1)
+        assert_eq!(sel.current(), CharonVariant::SmallBatchDecode);
+
+        // HighSkew wins 3 times consecutively → streak reaches min_hold=3,
+        // switch allowed.
+        let _ = sel.select(0.95, 8.0, 2048.0, 1e6, 0.5);
+        let _ = sel.select(0.95, 8.0, 2048.0, 1e6, 0.5);
+        let _ = sel.select(0.95, 8.0, 2048.0, 1e6, 0.5);
+        assert_eq!(
+            sel.current(),
+            CharonVariant::HighSkew,
+            "same challenger with min_hold consecutive wins must switch"
         );
     }
 
