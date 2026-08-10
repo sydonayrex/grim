@@ -4,6 +4,7 @@ pub fn compute_kernel_source() -> String {
     let mut s =
         String::with_capacity(crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE.len() + 16384);
     s.push_str(crate::kernels::shared_device_fns::KERNEL_SOURCE);
+    s.push_str(crate::kernels::charon::KERNEL_SOURCE);
     s.push_str(crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE);
     s.push_str(crate::kernels::qkv_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::decode_gemm::KERNEL_SOURCE);

@@ -2120,6 +2120,7 @@ dependencies = [
  "grim-backend-cpu",
  "grim-format",
  "grim-kvquant",
+ "grim-nn",
  "grim-quant",
  "grim-tensor",
  "half",
@@ -2416,6 +2417,7 @@ name = "grim-quant"
 version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
+ "grim-format",
  "grim-tensor",
  "thiserror 1.0.69",
 ]

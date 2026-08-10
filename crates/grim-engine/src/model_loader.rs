@@ -20,7 +20,7 @@ use grim_models_mamba::{
      Falcon, FalconConfig, FalconH1Config, FalconH1Model, Gemma, GemmaConfig, Gpt2, Gpt2Config,
      Lfm2, Lfm2Config, Laguna, LagunaConfig, Llama, LlamaConfig, MiniCpmConfig, MiniCpmModel,
      SmolLm2, SmolLm2Config, Qwen3Moe, Qwen3MoeConfig,
-     MiniMaxM2, MiniMaxM2Config, MoeConfig, Orion, OrionConfig, Phi2, PhiConfig, Qwen, QwenConfig,
+     MiniMaxM2, MiniMaxM2Config, Orion, OrionConfig, Phi2, PhiConfig, Qwen, QwenConfig,
      SeedOss, SeedOssConfig, T5, T5Config, WavTokenizerDec, WavTokenizerDecConfig,
  };
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
@@ -564,7 +564,7 @@ fn load_model_from_config(
             Ok(Box::new(m))
         }
         arch if arch.is_moe() => {
-            let moe_cfg = MoeConfig {
+            let moe_cfg = Qwen3MoeConfig {
                 vocab_size,
                 hidden_size,
                 num_heads,
@@ -572,24 +572,15 @@ fn load_model_from_config(
                 head_dim,
                 num_layers,
                 intermediate_size,
-                expert_count,
-                expert_used_count,
+                num_experts: expert_count,
+                num_experts_per_tok: expert_used_count,
+                routed_scaling_factor: 1.0,
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
             };
             eprintln!("[grim] Loading MoE model with config: {:?}", moe_cfg);
-            let deepseek_cfg = DeepSeekConfig {
-                vocab_size,
-                hidden_size,
-                num_heads,
-                num_layers,
-                intermediate_size,
-                rms_norm_eps,
-                q_lora_rank: num_heads,
-                kv_lora_rank: num_kv_heads * 4,
-            };
-            let m = DeepSeek::load_tp(device.clone(), &ws, deepseek_cfg, tp)?;
+            let m = Qwen3Moe::load_tp(device.clone(), &ws, moe_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Mamba2 => {
@@ -1144,56 +1135,6 @@ fn load_model_from_config(
             let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::AfMoe
-        | ModelArchitecture::BailingMoe
-        | ModelArchitecture::BailingMoe2
-        | ModelArchitecture::Cohere2Moe
-        | ModelArchitecture::Ernie45Moe
-        | ModelArchitecture::Ernie45Moe
-        | ModelArchitecture::ExaoneMoe
-        | ModelArchitecture::GraniteMoe
-        | ModelArchitecture::GroveMoe
-        | ModelArchitecture::HunyuanMoe
-        | ModelArchitecture::LladaMoe
-        | ModelArchitecture::Lfm2Moe
-        | ModelArchitecture::NemotronHMoe
-        | ModelArchitecture::Olmoe
-        | ModelArchitecture::OpenAiMoe
-        | ModelArchitecture::PhiMoe
-        | ModelArchitecture::Qwen2Moe
-        | ModelArchitecture::Qwen3Moe
-        | ModelArchitecture::Qwen35Moe
-        | ModelArchitecture::Qwen3VlMoe => {
-            let moe_cfg = MoeConfig {
-                vocab_size,
-                hidden_size,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                num_layers,
-                intermediate_size,
-                expert_count,
-                expert_used_count,
-                rms_norm_eps,
-                rope_theta,
-                max_seq_len,
-            };
-            eprintln!("[grim] Loading MoE model ({:?}) with config: {:?}", model_arch, moe_cfg);
-            let llama_cfg = LlamaConfig {
-                vocab_size: moe_cfg.vocab_size,
-                hidden_size: moe_cfg.hidden_size,
-                num_heads: moe_cfg.num_heads,
-                num_kv_heads: moe_cfg.num_kv_heads,
-                head_dim: moe_cfg.head_dim,
-                num_layers: moe_cfg.num_layers,
-                intermediate_size: moe_cfg.intermediate_size,
-                rms_norm_eps: moe_cfg.rms_norm_eps,
-                rope_theta: moe_cfg.rope_theta,
-                max_seq_len: moe_cfg.max_seq_len,
-            };
-            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
-            Ok(Box::new(m))
-        }
         _ => {
             if let Some(spec) = resolve_arch_compat_spec(&arch_str, raw_config_str) {
                 eprintln!(
@@ -1208,17 +1149,22 @@ fn load_model_from_config(
                 let ws = WeightSource::root(&remapped_provider, device.clone()).with_tp_config(tp);
 
                 if spec.is_moe {
-                    let deepseek_cfg = DeepSeekConfig {
+                    let moe_cfg = Qwen3MoeConfig {
                         vocab_size: spec.vocab_size,
                         hidden_size: spec.hidden_size,
                         num_heads: spec.num_heads,
+                        num_kv_heads: spec.num_kv_heads,
+                        head_dim: spec.head_dim,
                         num_layers: spec.num_layers,
                         intermediate_size: spec.intermediate_size,
+                        num_experts: spec.expert_count.unwrap_or(8),
+                        num_experts_per_tok: spec.expert_used_count.unwrap_or(2),
+                        routed_scaling_factor: 1.0,
                         rms_norm_eps: spec.rms_norm_eps,
-                        q_lora_rank: spec.num_heads,
-                        kv_lora_rank: spec.num_kv_heads * 4,
+                        rope_theta: spec.rope_theta,
+                        max_seq_len: spec.max_seq_len,
                     };
-                    let m = DeepSeek::load_tp(device.clone(), &ws, deepseek_cfg, tp)?;
+                    let m = Qwen3Moe::load_tp(device.clone(), &ws, moe_cfg, tp)?;
                     return Ok(Box::new(m));
                 } else if spec.is_ssm {
                     let mamba_cfg = MambaConfig {
@@ -1507,7 +1453,7 @@ fn load_model_with_providers(
         | ModelArchitecture::Qwen3Moe
         | ModelArchitecture::Qwen35Moe
         | ModelArchitecture::Qwen3VlMoe => {
-            let qwen_moe_cfg = MoeConfig {
+            let qwen_moe_cfg = Qwen3MoeConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
                 num_heads: hparams.num_heads,
@@ -1515,8 +1461,9 @@ fn load_model_with_providers(
                 head_dim: hparams.head_dim,
                 num_layers: hparams.num_layers,
                 intermediate_size: hparams.intermediate_size,
-                expert_count: hparams.expert_count.unwrap_or(8),
-                expert_used_count: hparams.expert_used_count.unwrap_or(2),
+                num_experts: hparams.expert_count.unwrap_or(8),
+                num_experts_per_tok: hparams.expert_used_count.unwrap_or(2),
+                routed_scaling_factor: hparams.routed_scaling_factor,
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
@@ -1525,21 +1472,11 @@ fn load_model_with_providers(
                 "[grim] Loading Qwen-MoE model with config: {:?}",
                 qwen_moe_cfg
             );
-            let deepseek_cfg = DeepSeekConfig {
-                vocab_size: hparams.vocab_size,
-                hidden_size: hparams.hidden_size,
-                num_heads: hparams.num_heads,
-                num_layers: hparams.num_layers,
-                intermediate_size: hparams.intermediate_size,
-                rms_norm_eps: hparams.rms_norm_eps,
-                q_lora_rank: hparams.num_heads,
-                kv_lora_rank: hparams.num_kv_heads * 4,
-            };
-            let m = DeepSeek::load_tp(device.clone(), &ws, deepseek_cfg, tp)?;
+            let m = Qwen3Moe::load_tp(device.clone(), &ws, qwen_moe_cfg, tp)?;
             Ok(Box::new(m))
         }
         arch if arch.is_moe() => {
-            let moe_cfg = MoeConfig {
+            let moe_cfg = Qwen3MoeConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
                 num_heads: hparams.num_heads,
@@ -1547,24 +1484,15 @@ fn load_model_with_providers(
                 head_dim: hparams.head_dim,
                 num_layers: hparams.num_layers,
                 intermediate_size: hparams.intermediate_size,
-                expert_count: hparams.expert_count.unwrap_or(8),
-                expert_used_count: hparams.expert_used_count.unwrap_or(2),
+                num_experts: hparams.expert_count.unwrap_or(8),
+                num_experts_per_tok: hparams.expert_used_count.unwrap_or(2),
+                routed_scaling_factor: hparams.routed_scaling_factor,
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
             eprintln!("[grim] Loading MoE model with config: {:?}", moe_cfg);
-            let deepseek_cfg = DeepSeekConfig {
-                vocab_size: hparams.vocab_size,
-                hidden_size: hparams.hidden_size,
-                num_heads: hparams.num_heads,
-                num_layers: hparams.num_layers,
-                intermediate_size: hparams.intermediate_size,
-                rms_norm_eps: hparams.rms_norm_eps,
-                q_lora_rank: hparams.num_heads,
-                kv_lora_rank: hparams.num_kv_heads * 4,
-            };
-            let m = DeepSeek::load_tp(device.clone(), &ws, deepseek_cfg, tp)?;
+            let m = Qwen3Moe::load_tp(device.clone(), &ws, moe_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Mamba2 => {
@@ -2131,56 +2059,6 @@ fn load_model_with_providers(
             let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::AfMoe
-        | ModelArchitecture::BailingMoe
-        | ModelArchitecture::BailingMoe2
-        | ModelArchitecture::Cohere2Moe
-        | ModelArchitecture::Ernie45Moe
-        | ModelArchitecture::Ernie45Moe
-        | ModelArchitecture::ExaoneMoe
-        | ModelArchitecture::GraniteMoe
-        | ModelArchitecture::GroveMoe
-        | ModelArchitecture::HunyuanMoe
-        | ModelArchitecture::LladaMoe
-        | ModelArchitecture::Lfm2Moe
-        | ModelArchitecture::NemotronHMoe
-        | ModelArchitecture::Olmoe
-        | ModelArchitecture::OpenAiMoe
-        | ModelArchitecture::PhiMoe
-        | ModelArchitecture::Qwen2Moe
-        | ModelArchitecture::Qwen3Moe
-        | ModelArchitecture::Qwen35Moe
-        | ModelArchitecture::Qwen3VlMoe => {
-            let moe_cfg = MoeConfig {
-                vocab_size: hparams.vocab_size,
-                hidden_size: hparams.hidden_size,
-                num_heads: hparams.num_heads,
-                num_kv_heads: hparams.num_kv_heads,
-                head_dim: hparams.head_dim,
-                num_layers: hparams.num_layers,
-                intermediate_size: hparams.intermediate_size,
-                expert_count: hparams.expert_count.unwrap_or(8),
-                expert_used_count: hparams.expert_used_count.unwrap_or(2),
-                rms_norm_eps: hparams.rms_norm_eps,
-                rope_theta: hparams.rope_theta,
-                max_seq_len: hparams.max_seq_len,
-            };
-            eprintln!("[grim] Loading MoE model ({:?}) with config: {:?}", model_arch, moe_cfg);
-            let llama_cfg = LlamaConfig {
-                vocab_size: moe_cfg.vocab_size,
-                hidden_size: moe_cfg.hidden_size,
-                num_heads: moe_cfg.num_heads,
-                num_kv_heads: moe_cfg.num_kv_heads,
-                head_dim: moe_cfg.head_dim,
-                num_layers: moe_cfg.num_layers,
-                intermediate_size: moe_cfg.intermediate_size,
-                rms_norm_eps: moe_cfg.rms_norm_eps,
-                rope_theta: moe_cfg.rope_theta,
-                max_seq_len: moe_cfg.max_seq_len,
-            };
-            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
-            Ok(Box::new(m))
-        }
         _ => {
             // Check for a sibling config.json alongside the GGUF file to
             // enrich ArchCompatSpec resolution for known HF architectures.
@@ -2202,17 +2080,22 @@ fn load_model_with_providers(
                 let ws = WeightSource::root(&remapped_provider, device.clone()).with_tp_config(tp);
 
                 if spec.is_moe {
-                    let deepseek_cfg = DeepSeekConfig {
+                    let moe_cfg = Qwen3MoeConfig {
                         vocab_size: hparams.vocab_size,
                         hidden_size: hparams.hidden_size,
                         num_heads: hparams.num_heads,
+                        num_kv_heads: hparams.num_kv_heads,
+                        head_dim: hparams.head_dim,
                         num_layers: hparams.num_layers,
                         intermediate_size: hparams.intermediate_size,
+                        num_experts: hparams.expert_count.unwrap_or(8),
+                        num_experts_per_tok: hparams.expert_used_count.unwrap_or(2),
+                        routed_scaling_factor: hparams.routed_scaling_factor,
                         rms_norm_eps: hparams.rms_norm_eps,
-                        q_lora_rank: hparams.num_heads,
-                        kv_lora_rank: hparams.num_kv_heads * 4,
+                        rope_theta: hparams.rope_theta,
+                        max_seq_len: hparams.max_seq_len,
                     };
-                    let m = DeepSeek::load_tp(device.clone(), &ws, deepseek_cfg, tp)?;
+                    let m = Qwen3Moe::load_tp(device.clone(), &ws, moe_cfg, tp)?;
                     return Ok(Box::new(m));
                 } else if spec.is_ssm {
                     let mamba_cfg = MambaConfig {

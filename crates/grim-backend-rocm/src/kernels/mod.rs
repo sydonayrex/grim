@@ -1,5 +1,7 @@
 //! Ground-level pyramid is `src/lib.rs`; this module holds per-kernel HIP [see: `lib.rs`]
 
+/// Charon — P-DAFD fused MoE dispatch kernel (`rocm_kernel_plan.md` WI-A).
+pub mod charon;
 /// SCYTHE-2 WI-6: CommFuse decomposed P2P fan-in.
 pub mod comm_fuse;
 pub mod compute_kernels;

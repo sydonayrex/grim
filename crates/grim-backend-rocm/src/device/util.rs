@@ -78,6 +78,13 @@ pub fn gpu_target_flag(arch: &str) -> CString {
     CString::new(format!("--offload-arch={arch}")).expect("GRIM_GPU_TARGET contains interior NUL")
 }
 
+/// True for CDNA-class targets (gfx9xx, MI-series), where Matrix-FMA (MFMA)
+/// is Wave64-native. RDNA (gfx10/11/12) uses Wave32 and Wave32-only WMMA,
+/// so forcing Wave64 there faults at runtime.
+fn is_cdna(arch: &str) -> bool {
+    arch.starts_with("gfx9")
+}
+
 /// Build compiler options list for AMD hipRTC based on detected hardware target `arch`. [see: `gfx103x`, `gfx11xx`, `gfx12xx`, `gfx9xx`]
 ///
 /// Injects the ROCm include directory (`-I`) so that JIT-compiled HIP
@@ -92,11 +99,18 @@ pub fn hiprtc_options_for_arch(arch: &str) -> Vec<CString> {
         // are a strict subset of C++17, so --std=c++17 is safe for all.
         CString::new("--std=c++17").unwrap(),
     ];
-    // Do not force `-mwavefrontsize64`: it configures codegen for 64-wide
-    // wavefronts, but Wave32-only targets (e.g. RDNA 2 iGPUs like gfx1036)
-    // cannot execute it and fault at runtime. Let hipRTC use the native wave
-    // size for the target arch and let kernels fall back to their runtime
-    // `warpSize` logic.
+    if is_cdna(arch) {
+        // CDNA / MFMA is Wave64-native: do NOT force a wave size, let hipRTC
+        // pick the 64-wide wavefront the Matrix-FMA path expects.
+    } else {
+        // RDNA2/3/4 (incl. gfx1036): these are Wave32-native and WMMA is
+        // Wave32-only. We do NOT push `-mwavefrontsize32` here: hipRTC
+        // (unlike offline clang) rejects that flag with "unknown argument",
+        // which blocks JIT compilation on gfx1036 (confirmed via
+        // hiprtcCompileProgram status 6). hipRTC derives the wave size from
+        // `--offload-arch=<gfx>` automatically, so the flag is unnecessary
+        // and harmful.
+    }
     opts.push(gpu_target_flag(arch));
     // HIPRTC does not search the ROCm include tree by default. Add the
     // discovered include directory so `<rocwmma/rocwmma.hpp>` and friends
@@ -186,5 +200,37 @@ mod util_self_tests {
         let flag = gpu_target_flag("gfx1036");
         let s = flag.into_string().expect("CString → String");
         assert_eq!(s, "--offload-arch=gfx1036");
+    }
+
+    #[test]
+    fn rdna_does_not_pass_rejected_wavefront_flag() {
+        let opts: Vec<String> = hiprtc_options_for_arch("gfx1036")
+            .into_iter()
+            .map(|c| c.into_string().unwrap())
+            .collect();
+        // hipRTC rejects `-mwavefrontsize32` with "unknown argument"
+        // (confirmed: hiprtcCompileProgram status 6 on ROCm 7.2 / gfx1036).
+        // The flag is unnecessary: hipRTC derives wave size from the
+        // `--offload-arch=gfx1036` target automatically.
+        assert!(
+            !opts.iter().any(|o| o == "-mwavefrontsize32"),
+            "RDNA must not pass -mwavefrontsize32 to hipRTC (rejected): {opts:?}"
+        );
+        assert!(
+            !opts.iter().any(|o| o == "-mwavefrontsize64"),
+            "RDNA must never force Wave64: {opts:?}"
+        );
+    }
+
+    #[test]
+    fn cdna_uses_native_wave_size() {
+        let opts: Vec<String> = hiprtc_options_for_arch("gfx90a")
+            .into_iter()
+            .map(|c| c.into_string().unwrap())
+            .collect();
+        assert!(
+            !opts.iter().any(|o| o.starts_with("-mwavefrontsize")),
+            "CDNA (gfx90a) must leave wave size to native MFMA: {opts:?}"
+        );
     }
 }

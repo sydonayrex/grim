@@ -12,3 +12,4 @@ thiserror = { workspace = true }
 [dev-dependencies]
 
 grim-backend-cpu = { workspace = true }
+grim-format = { workspace = true }

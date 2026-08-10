@@ -53,19 +53,21 @@ impl MoeBlock {
         let ffn_norm = RmsNorm::load(&ws.pp("ffn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
 
         // Router gate. llama.cpp stores the expert router as
-        // `ffn_gate_inp.weight` = [hidden, num_experts].
-        // `Linear::load` is TP-aware via `ws`'s tensor-parallel config.
+        // `ffn_gate_inp.weight` = [hidden, num_experts] (consistent with the
+        // in-repo Lfm2 MoE loader). `Linear::load` is TP-aware via `ws`'s
+        // tensor-parallel config.
         let gate = Linear::load(
-            &ws.pp("ffn").pp("gate_inp"),
+            &ws.pp("ffn_gate_inp"),
             cfg.hidden_size,
             spec.num_experts,
             /*has_bias=*/ false,
         )?;
 
         // Optional dedup/noisy-router correction bias (Laguna / DeepSeek).
+        // Stored as `ffn_exp_probs_b.bias` in GGUF (per Lfm2 loader).
         let correction_bias = match &spec.router_kind {
             RouterKind::SigmoidTopKWithBias { .. } => {
-                let b = ws.get(Shape::new(vec![spec.num_experts]), "exp_probs_b")?;
+                let b = ws.get(Shape::new(vec![spec.num_experts]), "ffn_exp_probs_b.bias")?;
                 Some(b)
             }
             RouterKind::SoftmaxTopK => None,
@@ -116,5 +118,166 @@ impl MoeBlock {
         let normed = self.ffn_norm.forward(x)?;
         let routed = self.moe.forward(&normed)?;
         Ok(routed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use grim_backend_cpu::cpu_tensor;
+    use grim_core::error::Result;
+    use grim_nn::moe::RouterKind;
+    use grim_nn::{TensorParallelConfig, WeightSource};
+    use grim_tensor::dtype::{DType, Device, QuantProvenance};
+    use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
+    use grim_tensor::shape::Shape;
+    use grim_tensor::Tensor;
+
+    use crate::model::LlamaConfig;
+    use crate::moe_block::{MoESpec, MoeBlock};
+
+    /// In-memory `TensorProvider` so the MoE load path can be exercised
+    /// without a real GGUF file (WI-M6). Mirrors the `FullProvider` used in
+    /// `block.rs`'s load-path tests.
+    #[derive(Clone)]
+    struct FullProvider {
+        tensors: HashMap<String, RawTensor>,
+    }
+
+    impl TensorProvider for FullProvider {
+        fn get(&self, name: &str) -> grim_tensor::error::Result<RawTensor> {
+            self.tensors.get(name).cloned().ok_or_else(|| {
+                grim_tensor::error::Error::Backend(format!("tensor '{name}' not found"))
+            })
+        }
+        fn meta(&self, _name: &str) -> grim_tensor::error::Result<TensorMeta> {
+            Ok(TensorMeta {
+                dtype: DType::F32,
+                provenance: QuantProvenance::GrimNative,
+                shape: vec![],
+                fusion_mask: 0,
+            })
+        }
+    }
+
+    fn f32_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    fn cfg(hidden: usize, inter: usize, num_experts: usize) -> LlamaConfig {
+        LlamaConfig {
+            vocab_size: 100,
+            hidden_size: hidden,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: hidden / 2,
+            num_layers: 1,
+            intermediate_size: inter,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            max_seq_len: 512,
+        }
+    }
+
+    /// Build a synthetic MoE layer's weights and load a `MoeBlock` from them,
+    /// then run a forward pass and assert the output shape + sanity.
+    #[test]
+    fn moe_block_load_and_forward() -> Result<()> {
+        let hidden = 8usize;
+        let inter = 8usize;
+        let num_experts = 4usize;
+        let top_k = 2usize;
+
+        let mut tensors = HashMap::new();
+        // RMS norm scale (all ones -> identity-ish norm).
+        tensors.insert(
+            "ffn_norm.weight".to_string(),
+            RawTensor {
+                bytes: f32_bytes(&vec![1.0f32; hidden]),
+                shape: vec![hidden],
+                dtype: DType::F32,
+                provenance: QuantProvenance::GrimNative,
+            },
+        );
+        // Router gate (`MoeBlock::load` queries `ffn_gate_inp.weight`, matching
+        // the in-repo Lfm2 MoE loader). `Linear::load(hidden, num_experts)`
+        // expects the stored weight in [out, in] = [num_experts, hidden].
+        let gate_w: Vec<f32> = (0..num_experts * hidden)
+            .map(|i| (i as f32 * 0.3 - 1.0))
+            .collect();
+        tensors.insert(
+            "ffn_gate_inp.weight".to_string(),
+            RawTensor {
+                bytes: f32_bytes(&gate_w),
+                shape: vec![num_experts, hidden],
+                dtype: DType::F32,
+                provenance: QuantProvenance::GrimNative,
+            },
+        );
+        // 3D expert tensors [num_experts, inter, hidden] (experts outermost,
+        // matching llama.cpp / Lfm2 GGUF convention).
+        let exp_gate: Vec<f32> = (0..num_experts * inter * hidden)
+            .map(|i| (i as f32 * 0.1 - 0.5))
+            .collect();
+        tensors.insert(
+            "ffn_gate_exps.weight".to_string(),
+            RawTensor {
+                bytes: f32_bytes(&exp_gate),
+                shape: vec![num_experts, inter, hidden],
+                dtype: DType::F32,
+                provenance: QuantProvenance::GrimNative,
+            },
+        );
+        let exp_up = exp_gate.clone();
+        tensors.insert(
+            "ffn_up_exps.weight".to_string(),
+            RawTensor {
+                bytes: f32_bytes(&exp_up),
+                shape: vec![num_experts, inter, hidden],
+                dtype: DType::F32,
+                provenance: QuantProvenance::GrimNative,
+            },
+        );
+        let exp_down: Vec<f32> = (0..num_experts * inter * hidden)
+            .map(|i| (i as f32 * 0.1 - 0.5))
+            .collect();
+        tensors.insert(
+            "ffn_down_exps.weight".to_string(),
+            RawTensor {
+                bytes: f32_bytes(&exp_down),
+                shape: vec![num_experts, inter, hidden],
+                dtype: DType::F32,
+                provenance: QuantProvenance::GrimNative,
+            },
+        );
+
+        let provider = FullProvider { tensors };
+        let ws = WeightSource::root(&provider, Device::Cpu);
+        let tp = TensorParallelConfig {
+            rank: 0,
+            world_size: 1,
+        };
+        let spec = MoESpec {
+            num_experts,
+            top_k,
+            router_kind: RouterKind::SoftmaxTopK,
+            routed_scaling_factor: 1.0,
+            has_shared_expert: false,
+        };
+
+        let block = MoeBlock::load(&ws, &cfg(hidden, inter, num_experts), &spec, tp)?;
+
+        let input = cpu_tensor(vec![0.5f32; hidden], Shape::new(vec![1, hidden]));
+        let out = block.forward(&input)?;
+        assert_eq!(out.shape().dims(), &[1usize, hidden], "MoE output shape");
+
+        let out_v = out.to_vec_f32()?;
+        assert_eq!(out_v.len(), hidden);
+        assert!(
+            out_v.iter().all(|x| x.is_finite()),
+            "MoE output must be finite (no NaN/Inf)"
+        );
+        Ok(())
     }
 }

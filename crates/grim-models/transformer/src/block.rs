@@ -863,6 +863,7 @@ mod tests {
             w_down,
             rope,
             tp_config: tp,
+            ffn_disabled: false,
             _dev: dev,
             _cfg: cfg,
         }
