@@ -286,13 +286,15 @@ fn sample_next_token(
 }
 
 /// Trim the first matched stop sequence from the end of `text`. Returns the
-/// trimmed text and whether a stop sequence was found and removed. This is
-/// applied to both streaming and non-streaming completions so the client
-/// never sees the stop string in the returned content (OpenAI convention).
+/// trimmed text and whether a stop sequence was found and removed. Only
+/// trims if the stop sequence is a suffix of `text` (the stop string is a
+/// terminator, not a substring to strip from the middle). This is applied
+/// to non-streaming completions so the client never sees the stop string
+/// in the returned content (OpenAI convention).
 fn trim_stop_sequences(text: &str, stop_seqs: &[String]) -> (String, bool) {
     for seq in stop_seqs {
-        if let Some(pos) = text.rfind(seq) {
-            let trimmed = text[..pos].to_string();
+        if text.ends_with(seq) {
+            let trimmed = text.strip_suffix(seq).unwrap_or(text).to_string();
             return (trimmed, true);
         }
     }
@@ -991,6 +993,17 @@ async fn chat_completions(
         .map(|t| t.tokens.len())
         .unwrap_or(65536);
 
+    // EOS token ID for early termination. When the model emits this token,
+    // generation stops immediately (the EOS token is not included in the
+    // returned content). This mirrors the OpenAI convention where EOS is a
+    // signal, not part of the output.
+    let eos_token_id: Option<u32> = state
+        .tokenizer
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|t| t.eos_token_id);
+
     // TODO(context_length enforcement): `ModelConfig` currently exposes only
     // `name()` and `modality()` — there is no `context_length()` method, so
     // the server cannot retrieve the model's actual context window. The value
@@ -1021,6 +1034,7 @@ async fn chat_completions(
         let sampler_clone = sampler.clone();
         let stop_sequences_clone = stop_sequences.clone();
         let max_tokens_clone = max_tokens;
+        let eos_token_id_clone = eos_token_id;
 
         // WI-TOOLS-5 (streaming MVP, buffered): true incremental tool-call
         // streaming is not achievable while parsing is still post-hoc (WI-
@@ -1173,7 +1187,18 @@ async fn chat_completions(
                     };
                     emitted.push_str(&token_text);
                     let hit_stop = stop_seqs.iter().any(|s| emitted.contains(s));
-                    if hit_stop {
+                    // EOS check: if the model emitted the EOS token, terminate
+                    // generation without including it in the output (the EOS
+                    // token is a signal, not content — OpenAI convention).
+                    let hit_eos = eos_token_id_clone == Some(token_id);
+                    if hit_eos {
+                        // Trim the EOS token's text from the emitted buffer
+                        // so it doesn't appear in the response.
+                        emitted = emitted.strip_suffix(&token_text)
+                            .unwrap_or(&emitted)
+                            .to_string();
+                    }
+                    if hit_stop || hit_eos {
                         // A stop sequence terminated generation early — same end-
                         // of-stream tool-call extraction path as max_tokens.
                         let delta = terminal_tool_delta(&parse_ctx, &emitted, &prior_messages);
@@ -1289,6 +1314,15 @@ async fn chat_completions(
                 format!("<tok:{token_id}>")
             };
             content.push_str(&token_text);
+            // EOS check: stop generation if the model emitted the EOS token,
+            // and strip the EOS token's text from the output (it's a signal,
+            // not content — OpenAI convention).
+            if eos_token_id == Some(token_id) {
+                content = content.strip_suffix(&token_text)
+                    .unwrap_or(&content)
+                    .to_string();
+                break;
+            }
             if stop_sequences.iter().any(|s| content.contains(s)) {
                 break;
             }

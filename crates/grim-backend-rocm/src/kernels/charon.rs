@@ -699,7 +699,7 @@ __device__ __forceinline__ float iqk_weight(int fmt, const unsigned char* b, int
         float q2 = (float)(((ql[ql_idx + l + 32] & 0x0F) | ((qh[qh_idx + l] & 0x0C) << 2))) - 32.0f;
         float q3 = (float)(((ql[ql_idx + l] >> 4) | ((qh[qh_idx + l] & 0x30))) ) - 32.0f;
         float q4 = (float)(((ql[ql_idx + l + 32] >> 4) | ((qh[qh_idx + l] & 0xC0) >> 2))) - 32.0f;
-        float sc = (float)(scales[sc_idx + is + quad * 2]); // i8
+        float sc = (float)((signed char)scales[sc_idx + is + quad * 2]); // i8
         float qs[4] = {q1, q2, q3, q4};
         return dd * sc * qs[quad];
     } else if (fmt == 10) { // q2k (MoE single-superblock, 76 bytes / 64 weights)
@@ -753,7 +753,7 @@ extern "C" __global__ void grim_moe_fused_grouped_iqk(
     const int blk = blockIdx.x;
     const int base = blk * block_size;
     const int end = base + block_size < num_tokens ? base + block_size : num_tokens;
-    const int BLOCK[12] = {170,136,96,110,66,74,82,144,176,210,76,138};
+    const int BLOCK[12] = {170,136,96,110,66,74,82,144,176,210,76,82};
     int sbytes = BLOCK[format_id];
 
     for (int s = base + threadIdx.x; s < end; s += blockDim.x) {
