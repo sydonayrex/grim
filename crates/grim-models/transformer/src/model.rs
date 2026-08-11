@@ -38,6 +38,12 @@ impl ModelConfig for LlamaConfig {
     fn modality(&self) -> ModalityHint {
         ModalityHint::TextInTextOut
     }
+    /// Context window in tokens. For LLaMA-family models this equals
+    /// `max_seq_len` (populated from GGUF `llama.context_length` /
+    /// `<arch>.context_length` during loading).
+    fn context_length(&self) -> u64 {
+        self.max_seq_len as u64
+    }
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

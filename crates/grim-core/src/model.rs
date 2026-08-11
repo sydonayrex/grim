@@ -30,6 +30,13 @@ pub trait ModelConfig: Send + Sync {
     /// Return a coarse `Modality` tag for routing in the serving layer.
     /// Capability traits stay the source of truth — this is just a hint.
     fn modality(&self) -> ModalityHint;
+    /// Return the model's context window in tokens, or `0` if unknown.
+    /// The server uses this to reject requests whose total token count
+    /// (prompt + max_tokens) exceeds the model's context window.
+    /// Default returns `0` (no enforcement for models that don't report it).
+    fn context_length(&self) -> u64 {
+        0
+    }
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
