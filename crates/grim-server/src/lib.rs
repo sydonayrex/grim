@@ -250,17 +250,17 @@ fn sample_next_token(
         engine.loaded_models()
     );
     let logits = outcome.and_then(|o| o.logits.as_ref().cloned());
-    // P0-3.2: Clamp sampled tokens to `[0, vocab_size)` and use a safe fallback
-    // instead of `step as u32`. The engine's logits table is 65536 entries wide,
-    // so without clamping a model with a smaller vocab (e.g. 32000) can emit
-    // out-of-bounds token IDs that crash the tokenizer's decode path. Mirrors the
-    // logits-slicing + vocab-bounds discipline already used by `cmd_run`
-    // (run.rs) and `sample_logits` in `sampler.rs`.
+    // The engine's logits table is 65536 entries wide; a model with a smaller
+    // vocab (e.g. 32000) must slice to the last `vocab_size` positions before
+    // sampling, otherwise the sampler scores against near-zero noise and picks
+    // PAD tokens. This mirrors the `last_start / last_logits` slice in `cmd_run`
+    // (run.rs:535-543). Clamp the sampled token ID to `[0, vocab_size)` as
+    // defense-in-depth after sampling.
     let token = match logits {
         Some(t) => {
-            let sampled = sampler.sample(&t, &history).unwrap_or(0);
-            // Clamp to the model's actual vocab range so a too-wide logits
-            // table can never produce an out-of-vocab token.
+            let last_start = t.len().saturating_sub(vocab_size);
+            let last_logits = &t[last_start..];
+            let sampled = sampler.sample(last_logits, &history).unwrap_or(0);
             let max = (vocab_size as u32).saturating_sub(1);
             sampled.min(max)
         }
@@ -2694,11 +2694,24 @@ pub async fn serve(
 ) -> Result<()> {
     // Attempt to load the tokenizer from the explicitly-given model path,
     // or by scanning the models directory for the first available GGUF.
+    // For `.grim` files, fall back to a sibling `.gguf` (same stem, `.gguf`
+    // extension) — this mirrors the resolution `grim run` performs at
+    // run.rs:390-398 so `run --serve` and `serve` agree on tokenizer source.
     let (tokenizer, resolved_path) = if let Some(ref p) = model_path {
         let path_str = p.display().to_string();
-        let tok = GgufProvider::open(&path_str)
+        // Try the path directly (works for .gguf files).
+        let mut tok = GgufProvider::open(&path_str)
             .ok()
             .and_then(|prov| prov.tokenizer().ok());
+        // If that failed and the path is a .grim file, try the sibling .gguf.
+        if tok.is_none() && p.extension().and_then(|x| x.to_str()) == Some("grim") {
+            let gguf_path = p.with_extension("gguf");
+            if gguf_path.exists() {
+                tok = GgufProvider::open(gguf_path.to_str().unwrap())
+                    .ok()
+                    .and_then(|prov| prov.tokenizer().ok());
+            }
+        }
         (tok, Some(p.clone()))
     } else {
         // Scan the models directory for the first available model, preferring
@@ -2734,10 +2747,26 @@ pub async fn serve(
                     p
                 };
                 let p_str = preferred.display().to_string();
-                GgufProvider::open(&p_str)
+                let tok = GgufProvider::open(&p_str)
                     .ok()
-                    .and_then(|prov| prov.tokenizer().ok())
-                    .map(|tok| (tok, preferred))
+                    .and_then(|prov| prov.tokenizer().ok());
+                // If the preferred file is a .grim, the tokenizer lives in
+                // the sibling .gguf — try that before giving up.
+                let tok = if tok.is_none()
+                    && preferred.extension().and_then(|x| x.to_str()) == Some("grim")
+                {
+                    let gguf_path = preferred.with_extension("gguf");
+                    if gguf_path.exists() {
+                        GgufProvider::open(gguf_path.to_str().unwrap())
+                            .ok()
+                            .and_then(|prov| prov.tokenizer().ok())
+                    } else {
+                        None
+                    }
+                } else {
+                    tok
+                };
+                tok.map(|t| (t, preferred))
             });
         if let Some((tok, p)) = tok_and_path {
             // WI-S6: if we auto-loaded a `.gguf` that has no tuned `.grim`

@@ -164,7 +164,7 @@ pub fn compile_gptq_kernel(
     let cache_key = format!("{}_{:016x}", kernel_name, hash);
 
     let cache = crate::HsacoKernelCache::new();
-    if let Some(path) = cache.get_cached_kernel(&cache_key) {
+    if let Some((path, _lowered)) = cache.get_cached_kernel(&cache_key) {
         if let Ok(bytes) = std::fs::read(&path) {
             return Ok(bytes);
         }
@@ -237,7 +237,7 @@ pub fn compile_gptq_kernel(
             )));
         }
 
-        let _ = cache.cache_kernel(&cache_key, source, &code_bytes);
+        let _ = cache.cache_kernel(&cache_key, source, &code_bytes, kernel_name);
         Ok(code_bytes)
     }
 }

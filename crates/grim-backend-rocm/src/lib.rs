@@ -65,8 +65,8 @@ pub use crate::device::handles::{
     hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad, hipModuleUnload, hipSetDevice,
     hipStreamBeginCapture, hipStreamCreate, hipStreamDestroy, hipStreamEndCapture,
     hipStreamSynchronize, hipSuccess, hiprtcAddNameExpression, hiprtcCompileProgram,
-    hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode, hiprtcGetCodeSize,
-    hiprtcGetErrorString, hiprtcGetProgramLog, hiprtcGetProgramLogSize,
+ hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode, hiprtcGetCodeSize,
+ hiprtcGetErrorString, hiprtcGetLoweredName, hiprtcGetProgramLog, hiprtcGetProgramLogSize,
 };
 
 pub use crate::device::rocblas::{

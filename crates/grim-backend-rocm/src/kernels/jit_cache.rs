@@ -8,11 +8,13 @@ use std::time::SystemTime;
 
 use grim_tensor::error::Result;
 
-/// Cache for compiled .hsaco kernels.
+/// Cache for compiled .hsaco kernels. The in-memory map also stores the
+/// (possibly C++-mangled) *lowered* kernel name so `hipModuleGetFunction` can
+/// resolve kernels that hipRTC emits mangled (e.g. `grim_moe_fused_grouped_fp8`).
 #[derive(Debug)]
 pub struct HsacoKernelCache {
     cache_dir: PathBuf,
-    entries: RwLock<HashMap<String, (PathBuf, SystemTime)>>,
+    entries: RwLock<HashMap<String, (PathBuf, SystemTime, String)>>,
 }
 
 impl HsacoKernelCache {
@@ -29,25 +31,12 @@ impl HsacoKernelCache {
             let _ = fs::create_dir_all(&cache_dir);
         }
 
+        // NOTE: we deliberately do NOT pre-populate `entries` from on-disk
+        // .hsaco files. The lowered (possibly mangled) kernel name is computed
+        // at JIT-compile time and stored in-memory here; a cold start just
+        // reuses the existing on-disk .hsaco via `cache_kernel`'s exists-check.
+        // This keeps `hipModuleGetFunction` pointing at the correct symbol.
         let entries_lock = RwLock::new(HashMap::new());
-        if let Ok(paths) = fs::read_dir(&cache_dir) {
-            let mut map = entries_lock.write().unwrap();
-            for entry in paths.flatten() {
-                let path = entry.path();
-                if path.is_file() && path.extension().map_or(false, |ext| ext == "hsaco") {
-                    if let Some(filename) = path.file_stem().and_then(|s| s.to_str()) {
-                        if let Some(last_underscore) = filename.rfind('_') {
-                            let key_part = &filename[..last_underscore];
-                            if let Ok(metadata) = entry.metadata() {
-                                if let Ok(modified) = metadata.modified() {
-                                    map.insert(key_part.to_string(), (path.clone(), modified));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
         Self {
             cache_dir,
@@ -55,17 +44,23 @@ impl HsacoKernelCache {
         }
     }
 
-    pub fn get_cached_kernel(&self, key: &str) -> Option<PathBuf> {
+    pub fn get_cached_kernel(&self, key: &str) -> Option<(PathBuf, String)> {
         let entries = self.entries.read().unwrap();
-        if let Some((path, _)) = entries.get(key) {
+        if let Some((path, _, lowered)) = entries.get(key) {
             if path.exists() {
-                return Some(path.clone());
+                return Some((path.clone(), lowered.clone()));
             }
         }
         None
     }
 
-    pub fn cache_kernel(&self, key: &str, source: &str, compiled: &[u8]) -> Result<PathBuf> {
+    pub fn cache_kernel(
+        &self,
+        key: &str,
+        source: &str,
+        compiled: &[u8],
+        lowered_name: &str,
+    ) -> Result<PathBuf> {
         let hash = seahash::hash(source.as_bytes());
         let cache_key = format!("{}_{:016x}.hsaco", key, hash);
         let cache_path = self.cache_dir.join(&cache_key);
@@ -76,7 +71,7 @@ impl HsacoKernelCache {
             self.entries
                 .write()
                 .unwrap()
-                .insert(key.to_string(), (cache_path.clone(), modified));
+                .insert(key.to_string(), (cache_path.clone(), modified, lowered_name.to_string()));
             return Ok(cache_path);
         }
 
@@ -87,13 +82,13 @@ impl HsacoKernelCache {
         self.entries
             .write()
             .unwrap()
-            .insert(key.to_string(), (cache_path.clone(), modified));
+            .insert(key.to_string(), (cache_path.clone(), modified, lowered_name.to_string()));
 
         Ok(cache_path)
     }
 
     pub fn invalidate(&self, key: &str) {
-        if let Some((path, _)) = self.entries.write().unwrap().remove(key) {
+        if let Some((path, _, _)) = self.entries.write().unwrap().remove(key) {
             let _ = fs::remove_file(path);
         }
     }

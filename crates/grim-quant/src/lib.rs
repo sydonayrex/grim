@@ -1337,7 +1337,9 @@ pub fn fp8_e4m3_to_f32(byte: u8) -> f32 {
         if mant == 7 {
             return f32::NAN;
         }
-        let val = 448.0f32;
+        // exp == 15, mant in 0..6 are normal numbers in [256, 448]:
+        // (1 + mant/8) * 2^(15 - 7) = (1 + mant/8) * 256.
+        let val = (1.0f32 + (mant as f32) / 8.0) * 256.0f32;
         return if sign != 0 { -val } else { val };
     }
 
@@ -1667,12 +1669,17 @@ pub fn f32_to_fp8_e4m3(v: f32) -> u8 {
         return sign | (mant as u8);
     }
 
-    if e4m3_exp >= 15 {
+    if e4m3_exp > 15 {
         return sign | 0x7E;
     }
 
-    let mant = (raw_mant >> 20) as u8;
-    sign | ((e4m3_exp as u8) << 3) | (mant & 0x07)
+    let mant = (raw_mant >> 20) as u8 & 0x07;
+    let code = sign | ((e4m3_exp as u8) << 3) | mant;
+    // exp == 15, mant == 7 is the NaN encoding (0x7F); clamp to max finite 0x7E.
+    if code == (sign | 0x7F) {
+        return sign | 0x7E;
+    }
+    code
 }
 
 /// Convert MXFP4 E2M1 (2-bit exp, 1-bit mantissa) + E8M0 shared exponent to f32.

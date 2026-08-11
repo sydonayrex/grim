@@ -212,6 +212,11 @@ unsafe extern "C" {
     pub fn hiprtcGetCode(prog: HiprtcProgram, code: *mut i8) -> HipErrorT;
     pub fn hiprtcDestroyProgram(prog: *mut HiprtcProgram) -> HipErrorT;
     pub fn hiprtcAddNameExpression(prog: HiprtcProgram, name: *const i8) -> HipErrorT;
+    pub fn hiprtcGetLoweredName(
+        prog: HiprtcProgram,
+        name: *const i8,
+        lowered_name: *mut *const i8,
+    ) -> HipErrorT;
     pub fn hiprtcGetCodeSize(prog: HiprtcProgram, size: *mut usize) -> HipErrorT;
     pub fn hiprtcGetErrorString(error: HipErrorT) -> *const i8;
     pub fn hiprtcGetProgramLogSize(prog: HiprtcProgram, log_size: *mut usize) -> HipErrorT;

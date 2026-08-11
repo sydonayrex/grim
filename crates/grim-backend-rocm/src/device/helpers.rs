@@ -8,8 +8,9 @@ use grim_tensor::error::{Error, Result};
 use crate::{
     HipErrorT, HipMemcpyKind, HiprtcProgram, hipFree, hipMalloc, hipMallocManaged, hipMemcpy,
     hipMemcpyAsync, hipStreamCreate, hipStreamDestroy, hipStreamSynchronize, hipSuccess,
-    hiprtcCompileProgram, hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode,
-    hiprtcGetCodeSize, hiprtcGetProgramLog, hiprtcGetProgramLogSize,
+    hiprtcAddNameExpression, hiprtcCompileProgram, hiprtcCreateProgram, hiprtcDestroyProgram,
+    hiprtcGetCode, hiprtcGetCodeSize, hiprtcGetLoweredName,
+    hiprtcGetProgramLog, hiprtcGetProgramLogSize,
 };
 
 /// Convert a raw `HipErrorT` into `Result<()>`. [see: `hipMalloc`, `hipStreamSynchronize`]
@@ -47,8 +48,13 @@ pub fn memcpy_with_xnack_fallback(
     }
 }
 
-/// JIT compile HIP source to .hsaco binary. [see: `hiprtcCreateProgram`, `hiprtcCompileProgram`, `hiprtcGetCode`, `hiprtcGetProgramLog`]
-pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<Vec<u8>> {
+/// JIT compile HIP source to .hsaco binary, returning the compiled code and
+/// the *lowered* (possibly C++-mangled) kernel name that `hipModuleGetFunction`
+/// requires. Some `__global__` kernels (e.g. `grim_moe_fused_grouped_fp8`) are
+/// emitted mangled by hipRTC even under `extern "C"`, so callers must use the
+/// lowered name, not the plain entry name, to look the function up. [see:
+/// `hiprtcAddNameExpression`, `hiprtcGetLoweredName`, `hipModuleGetFunction`]
+pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<(Vec<u8>, String)> {
     let mut prog: HiprtcProgram = std::ptr::null_mut();
     let source_cstr = CString::new(source)
         .map_err(|e| Error::Backend(format!("CString conversion failed: {}", e)))?;
@@ -70,6 +76,10 @@ pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<V
                 status
             )));
         }
+
+        // Register the entry name as a name expression so we can later resolve
+        // its (possibly mangled) lowered name for hipModuleGetFunction.
+        let _ = hiprtcAddNameExpression(prog, name_cstr.as_ptr());
 
         let options_c = crate::device::util::hiprtc_options_for_arch(arch);
         let options_ptrs: Vec<*const i8> = options_c.iter().map(|c| c.as_ptr()).collect();
@@ -106,9 +116,23 @@ pub fn jit_compile_hsaco(source: &str, entry_name: &str, arch: &str) -> Result<V
             return Err(Error::Backend(format!("hiprtcGetCode failed: {}", status)));
         }
 
+        // Resolve the lowered (possibly mangled) name. If hipRTC didn't mangle
+        // the entry (most kernels), this returns the plain name unchanged.
+        let mut lowered_ptr: *const i8 = std::ptr::null();
+        let lowered_name = if hiprtcGetLoweredName(prog, name_cstr.as_ptr(), &mut lowered_ptr)
+            == hipSuccess
+            && !lowered_ptr.is_null()
+        {
+            std::ffi::CStr::from_ptr(lowered_ptr)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            entry_name.to_string()
+        };
+
         let _ = hiprtcDestroyProgram(&mut prog);
 
-        Ok(code_bytes)
+        Ok((code_bytes, lowered_name))
     }
 }
 
