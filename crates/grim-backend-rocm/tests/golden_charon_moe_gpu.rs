@@ -1365,7 +1365,7 @@ fn build_q3k_block(w: &[f32]) -> Vec<u8> {
     for n in 0..4usize {
         let qv = w[n * 16].round().clamp(-7.0, 7.0);
         let scm = (-qv).clamp(0.0, 15.0) as u8;
-        buf[2 + n] = 0x80 | scm; // sce=8, scm
+        buf[2 + n] = 0x08 | (scm << 4); // low nibble = sce(8), high nibble = scm
         buf[10 + n] = 0u8; // hmask: hm_bit=0 (positive)
         for l in 0..16usize {
             let wv = w[n * 16 + l].round().clamp(-7.0, 7.0);
