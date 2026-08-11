@@ -4206,8 +4206,672 @@ impl RocmDevice {
         Ok(stream)
     }
 
-    /// Public host-to-host roundtrip entry point for the Charon fused MoE
-    /// dispatch kernel, used by the golden GPU parity tests
+    /// Device launcher for the #1 token-sorted (grouped) fused MoE dispatch.
+    ///
+    /// Mirrors `launch_charon_fused_dispatch` but feeds the sorted routing
+    /// layout (`SortedRouting`) produced by `moe_align_block_size` and calls
+    /// `grim_moe_fused_grouped`. The in-kernel math is identical to the
+    /// sortless path (gate+up fused → SiLU → down → weighted accumulate), so
+    /// the high-perf fused structure is preserved across quantizations — only
+    /// the work ordering changes (grouped by expert, no per-pair atomics
+    /// contention beyond the necessary top-k>1 accumulation).
+    ///
+    /// Device-gated: only callable with real `RocmStorage` device buffers.
+    #[allow(dead_code)]
+    pub(crate) fn launch_charon_grouped_dispatch(
+        &self,
+        activations: &RocmStorage,
+        expert_gate_w_ptr: u64,
+        expert_up_w_ptr: u64,
+        expert_down_w_ptr: u64,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out_storage: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+        num_experts: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = activations.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_dispatch: activations has no device ptr".into())
+        })?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_dispatch: out has no device ptr".into())
+        })?;
+
+        crate::kernels::charon::validate_grouped_inputs(
+            a_ptr as *mut c_void,
+            expert_gate_w_ptr as *mut c_void,
+            expert_up_w_ptr as *mut c_void,
+            expert_down_w_ptr as *mut c_void,
+            out_ptr as *mut c_void,
+            sorted,
+            hidden,
+            inter,
+            num_experts,
+        )?;
+
+        // Output is accumulated via atomicAdd in-kernel; zero first.
+        check_hip("charon_grouped hipMemset(output, 0)", unsafe {
+            hipMemset(out_ptr as *mut c_void, 0, out_storage.bytes())
+        })?;
+
+        let wave = self.wavefront_size() as u32;
+        let plan = crate::kernels::charon::plan_grouped_dispatch(sorted, wave);
+        if plan.grid_x == 0 {
+            return Ok(self.active_stream());
+        }
+        let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
+        let block_dim = HipDim3::new(plan.block_x, 1, 1);
+
+        let mut tok_ptr = upload_device_buffer(&sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(&sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(&sorted.sorted_weights)?;
+
+        let mut a = a_ptr as *mut c_void;
+        let mut gw = expert_gate_w_ptr as *mut c_void;
+        let mut uw = expert_up_w_ptr as *mut c_void;
+        let mut dw = expert_down_w_ptr as *mut c_void;
+        let mut optr = out_ptr as *mut c_void;
+        let mut hidden_i = hidden as i32;
+        let mut inter_i = inter as i32;
+        let mut num_tokens_i = sorted.num_tokens_post_padded as i32;
+        let mut block_size_i = sorted.block_size as i32;
+        let mut rsf = routed_scaling_factor;
+
+        let stream = self.launch_compute_kernel(
+            "grim_moe_fused_grouped",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a),
+                arg(&mut gw),
+                arg(&mut uw),
+                arg(&mut dw),
+                arg(&mut tok_ptr),
+                arg(&mut exp_ptr),
+                arg(&mut w_ptr),
+                arg(&mut optr),
+                arg(&mut hidden_i),
+                arg(&mut inter_i),
+                arg(&mut num_tokens_i),
+                arg(&mut block_size_i),
+                arg(&mut rsf),
+            ],
+        )?;
+
+        if self.active_capture_stream().is_none() {
+            unsafe {
+                let sync = hipStreamSynchronize(stream);
+                if sync != hipSuccess {
+                    hipFree(tok_ptr);
+                    hipFree(exp_ptr);
+                    hipFree(w_ptr);
+                    return Err(Error::Backend(format!(
+                        "charon_grouped hipStreamSynchronize failed: {}",
+                        sync
+                    )));
+                }
+                hipFree(tok_ptr);
+                hipFree(exp_ptr);
+                hipFree(w_ptr);
+            }
+        }
+        Ok(stream)
+    }
+
+    /// Device launcher for the #2 FP8 W8A8 token-sorted grouped dispatch.
+    ///
+    /// Mirrors `launch_charon_grouped_dispatch` (same sorted layout + grid/block)
+    /// but weights are FP8 E4M3 bytes with per-block-16 scales + per-token act
+    /// scale. Calls `grim_moe_fused_grouped_fp8`, reusing the identical
+    /// in-register fused math so the high-perf structure is preserved across
+    /// quantization (vLLM W8A8 contract).
+    #[allow(dead_code)]
+    pub(crate) fn launch_charon_grouped_dispatch_fp8(
+        &self,
+        activations: &RocmStorage,
+        expert_gate_w_fp8_ptr: u64,
+        expert_up_w_fp8_ptr: u64,
+        expert_down_w_fp8_ptr: u64,
+        expert_gate_scale_ptr: u64,
+        expert_up_scale_ptr: u64,
+        expert_down_scale_ptr: u64,
+        a_scale_ptr: u64,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out_storage: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<*mut c_void> {
+        let a_ptr = activations.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_fp8: activations has no device ptr".into())
+        })?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_fp8: out has no device ptr".into())
+        })?;
+
+        crate::kernels::charon::validate_grouped_inputs(
+            a_ptr as *mut c_void,
+            expert_gate_w_fp8_ptr as *mut c_void,
+            expert_up_w_fp8_ptr as *mut c_void,
+            expert_down_w_fp8_ptr as *mut c_void,
+            out_ptr as *mut c_void,
+            sorted,
+            hidden,
+            inter,
+            num_experts,
+        )?;
+
+        check_hip("charon_grouped_fp8 hipMemset(output, 0)", unsafe {
+            hipMemset(out_ptr as *mut c_void, 0, out_storage.bytes())
+        })?;
+
+        let wave = self.wavefront_size() as u32;
+        let plan = crate::kernels::charon::plan_grouped_dispatch(sorted, wave);
+        if plan.grid_x == 0 {
+            return Ok(self.active_stream());
+        }
+        let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
+        let block_dim = HipDim3::new(plan.block_x, 1, 1);
+
+        let mut tok_ptr = upload_device_buffer(&sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(&sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(&sorted.sorted_weights)?;
+
+        let mut a = a_ptr as *mut c_void;
+        let mut gw = expert_gate_w_fp8_ptr as *mut c_void;
+        let mut uw = expert_up_w_fp8_ptr as *mut c_void;
+        let mut dw = expert_down_w_fp8_ptr as *mut c_void;
+        let mut gs = expert_gate_scale_ptr as *mut c_void;
+        let mut us = expert_up_scale_ptr as *mut c_void;
+        let mut ds = expert_down_scale_ptr as *mut c_void;
+        let mut ascale = a_scale_ptr as *mut c_void;
+        let mut optr = out_ptr as *mut c_void;
+        let mut hidden_i = hidden as i32;
+        let mut inter_i = inter as i32;
+        let mut num_tokens_i = sorted.num_tokens_post_padded as i32;
+        let mut block_size_i = sorted.block_size as i32;
+        let mut rsf = routed_scaling_factor;
+
+        let stream = self.launch_compute_kernel(
+            "grim_moe_fused_grouped_fp8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a),
+                arg(&mut gw),
+                arg(&mut uw),
+                arg(&mut dw),
+                arg(&mut gs),
+                arg(&mut us),
+                arg(&mut ds),
+                arg(&mut ascale),
+                arg(&mut tok_ptr),
+                arg(&mut exp_ptr),
+                arg(&mut w_ptr),
+                arg(&mut optr),
+                arg(&mut hidden_i),
+                arg(&mut inter_i),
+                arg(&mut num_tokens_i),
+                arg(&mut block_size_i),
+                arg(&mut rsf),
+            ],
+        )?;
+
+        if self.active_capture_stream().is_none() {
+            unsafe {
+                let sync = hipStreamSynchronize(stream);
+                if sync != hipSuccess {
+                    hipFree(tok_ptr);
+                    hipFree(exp_ptr);
+                    hipFree(w_ptr);
+                    return Err(Error::Backend(format!(
+                        "charon_grouped_fp8 hipStreamSynchronize failed: {}",
+                        sync
+                    )));
+                }
+                hipFree(tok_ptr);
+                hipFree(exp_ptr);
+                hipFree(w_ptr);
+            }
+        }
+        Ok(stream)
+    }
+
+    pub(crate) fn launch_charon_grouped_dispatch_mxfp4(
+        &self,
+        activations: &RocmStorage,
+        egate_w_ptr: u64,
+        eup_w_ptr: u64,
+        edown_w_ptr: u64,
+        egate_e_ptr: u64,
+        eup_e_ptr: u64,
+        edown_e_ptr: u64,
+        a_scale_ptr: u64,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out_storage: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<*mut c_void> {
+        let a_ptr = activations.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_mxfp4: activations has no device ptr".into())
+        })?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_mxfp4: out has no device ptr".into())
+        })?;
+
+        crate::kernels::charon::validate_grouped_inputs(
+            a_ptr as *mut c_void,
+            egate_w_ptr as *mut c_void,
+            eup_w_ptr as *mut c_void,
+            edown_w_ptr as *mut c_void,
+            out_ptr as *mut c_void,
+            sorted,
+            hidden,
+            inter,
+            num_experts,
+        )?;
+
+        check_hip("charon_grouped_mxfp4 hipMemset(output, 0)", unsafe {
+            hipMemset(out_ptr as *mut c_void, 0, out_storage.bytes())
+        })?;
+
+        let wave = self.wavefront_size() as u32;
+        let plan = crate::kernels::charon::plan_grouped_dispatch(sorted, wave);
+        if plan.grid_x == 0 {
+            return Ok(self.active_stream());
+        }
+        let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
+        let block_dim = HipDim3::new(plan.block_x, 1, 1);
+
+        let mut tok_ptr = upload_device_buffer(&sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(&sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(&sorted.sorted_weights)?;
+
+        let mut a = a_ptr as *mut c_void;
+        let mut gw = egate_w_ptr as *mut c_void;
+        let mut uw = eup_w_ptr as *mut c_void;
+        let mut dw = edown_w_ptr as *mut c_void;
+        let mut ge = egate_e_ptr as *mut c_void;
+        let mut ue = eup_e_ptr as *mut c_void;
+        let mut de = edown_e_ptr as *mut c_void;
+        let mut ascale = a_scale_ptr as *mut c_void;
+        let mut optr = out_ptr as *mut c_void;
+        let mut hidden_i = hidden as i32;
+        let mut inter_i = inter as i32;
+        let mut num_tokens_i = sorted.num_tokens_post_padded as i32;
+        let mut block_size_i = sorted.block_size as i32;
+        let mut rsf = routed_scaling_factor;
+
+        let stream = self.launch_compute_kernel(
+            "grim_moe_fused_grouped_mxfp4",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a),
+                arg(&mut gw),
+                arg(&mut uw),
+                arg(&mut dw),
+                arg(&mut ge),
+                arg(&mut ue),
+                arg(&mut de),
+                arg(&mut ascale),
+                arg(&mut tok_ptr),
+                arg(&mut exp_ptr),
+                arg(&mut w_ptr),
+                arg(&mut optr),
+                arg(&mut hidden_i),
+                arg(&mut inter_i),
+                arg(&mut num_tokens_i),
+                arg(&mut block_size_i),
+                arg(&mut rsf),
+            ],
+        )?;
+
+        if self.active_capture_stream().is_none() {
+            unsafe {
+                let sync = hipStreamSynchronize(stream);
+                if sync != hipSuccess {
+                    hipFree(tok_ptr);
+                    hipFree(exp_ptr);
+                    hipFree(w_ptr);
+                    return Err(Error::Backend(format!(
+                        "charon_grouped_mxfp4 hipStreamSynchronize failed: {}",
+                        sync
+                    )));
+                }
+                hipFree(tok_ptr);
+                hipFree(exp_ptr);
+                hipFree(w_ptr);
+            }
+        }
+        Ok(stream)
+    }
+
+    pub(crate) fn launch_charon_grouped_dispatch_mxfp8(
+        &self,
+        activations: &RocmStorage,
+        egate_w_ptr: u64,
+        eup_w_ptr: u64,
+        edown_w_ptr: u64,
+        egate_e_ptr: u64,
+        eup_e_ptr: u64,
+        edown_e_ptr: u64,
+        a_scale_ptr: u64,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out_storage: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<*mut c_void> {
+        let a_ptr = activations.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_mxfp8: activations has no device ptr".into())
+        })?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_mxfp8: out has no device ptr".into())
+        })?;
+
+        crate::kernels::charon::validate_grouped_inputs(
+            a_ptr as *mut c_void,
+            egate_w_ptr as *mut c_void,
+            eup_w_ptr as *mut c_void,
+            edown_w_ptr as *mut c_void,
+            out_ptr as *mut c_void,
+            sorted,
+            hidden,
+            inter,
+            num_experts,
+        )?;
+
+        check_hip("charon_grouped_mxfp8 hipMemset(output, 0)", unsafe {
+            hipMemset(out_ptr as *mut c_void, 0, out_storage.bytes())
+        })?;
+
+        let wave = self.wavefront_size() as u32;
+        let plan = crate::kernels::charon::plan_grouped_dispatch(sorted, wave);
+        if plan.grid_x == 0 {
+            return Ok(self.active_stream());
+        }
+        let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
+        let block_dim = HipDim3::new(plan.block_x, 1, 1);
+
+        let mut tok_ptr = upload_device_buffer(&sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(&sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(&sorted.sorted_weights)?;
+
+        let mut a = a_ptr as *mut c_void;
+        let mut gw = egate_w_ptr as *mut c_void;
+        let mut uw = eup_w_ptr as *mut c_void;
+        let mut dw = edown_w_ptr as *mut c_void;
+        let mut ge = egate_e_ptr as *mut c_void;
+        let mut ue = eup_e_ptr as *mut c_void;
+        let mut de = edown_e_ptr as *mut c_void;
+        let mut ascale = a_scale_ptr as *mut c_void;
+        let mut optr = out_ptr as *mut c_void;
+        let mut hidden_i = hidden as i32;
+        let mut inter_i = inter as i32;
+        let mut num_tokens_i = sorted.num_tokens_post_padded as i32;
+        let mut block_size_i = sorted.block_size as i32;
+        let mut rsf = routed_scaling_factor;
+
+        let stream = self.launch_compute_kernel(
+            "grim_moe_fused_grouped_mxfp8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a),
+                arg(&mut gw),
+                arg(&mut uw),
+                arg(&mut dw),
+                arg(&mut ge),
+                arg(&mut ue),
+                arg(&mut de),
+                arg(&mut ascale),
+                arg(&mut tok_ptr),
+                arg(&mut exp_ptr),
+                arg(&mut w_ptr),
+                arg(&mut optr),
+                arg(&mut hidden_i),
+                arg(&mut inter_i),
+                arg(&mut num_tokens_i),
+                arg(&mut block_size_i),
+                arg(&mut rsf),
+            ],
+        )?;
+
+        if self.active_capture_stream().is_none() {
+            unsafe {
+                let sync = hipStreamSynchronize(stream);
+                if sync != hipSuccess {
+                    hipFree(tok_ptr);
+                    hipFree(exp_ptr);
+                    hipFree(w_ptr);
+                    return Err(Error::Backend(format!(
+                        "charon_grouped_mxfp8 hipStreamSynchronize failed: {}",
+                        sync
+                    )));
+                }
+                hipFree(tok_ptr);
+                hipFree(exp_ptr);
+                hipFree(w_ptr);
+            }
+        }
+        Ok(stream)
+    }
+
+    pub(crate) fn launch_charon_grouped_dispatch_q80(
+        &self,
+        activations: &RocmStorage,
+        egate_w_ptr: u64,
+        eup_w_ptr: u64,
+        edown_w_ptr: u64,
+        a_scale_ptr: u64,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out_storage: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<*mut c_void> {
+        let a_ptr = activations.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_q80: activations has no device ptr".into())
+        })?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_q80: out has no device ptr".into())
+        })?;
+
+        crate::kernels::charon::validate_grouped_inputs(
+            a_ptr as *mut c_void,
+            egate_w_ptr as *mut c_void,
+            eup_w_ptr as *mut c_void,
+            edown_w_ptr as *mut c_void,
+            out_ptr as *mut c_void,
+            sorted,
+            hidden,
+            inter,
+            num_experts,
+        )?;
+
+        check_hip("charon_grouped_q80 hipMemset(output, 0)", unsafe {
+            hipMemset(out_ptr as *mut c_void, 0, out_storage.bytes())
+        })?;
+
+        let wave = self.wavefront_size() as u32;
+        let plan = crate::kernels::charon::plan_grouped_dispatch(sorted, wave);
+        if plan.grid_x == 0 {
+            return Ok(self.active_stream());
+        }
+        let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
+        let block_dim = HipDim3::new(plan.block_x, 1, 1);
+
+        let mut tok_ptr = upload_device_buffer(&sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(&sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(&sorted.sorted_weights)?;
+
+        let mut a = a_ptr as *mut c_void;
+        let mut gw = egate_w_ptr as *mut c_void;
+        let mut uw = eup_w_ptr as *mut c_void;
+        let mut dw = edown_w_ptr as *mut c_void;
+        let mut ascale = a_scale_ptr as *mut c_void;
+        let mut optr = out_ptr as *mut c_void;
+        let mut hidden_i = hidden as i32;
+        let mut inter_i = inter as i32;
+        let mut num_tokens_i = sorted.num_tokens_post_padded as i32;
+        let mut block_size_i = sorted.block_size as i32;
+        let mut rsf = routed_scaling_factor;
+
+        let stream = self.launch_compute_kernel(
+            "grim_moe_fused_grouped_q80",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a),
+                arg(&mut gw),
+                arg(&mut uw),
+                arg(&mut dw),
+                arg(&mut ascale),
+                arg(&mut tok_ptr),
+                arg(&mut exp_ptr),
+                arg(&mut w_ptr),
+                arg(&mut optr),
+                arg(&mut hidden_i),
+                arg(&mut inter_i),
+                arg(&mut num_tokens_i),
+                arg(&mut block_size_i),
+                arg(&mut rsf),
+            ],
+        )?;
+
+        if self.active_capture_stream().is_none() {
+            unsafe {
+                let sync = hipStreamSynchronize(stream);
+                if sync != hipSuccess {
+                    hipFree(tok_ptr);
+                    hipFree(exp_ptr);
+                    hipFree(w_ptr);
+                    return Err(Error::Backend(format!(
+                        "charon_grouped_q80 hipStreamSynchronize failed: {}",
+                        sync
+                    )));
+                }
+                hipFree(tok_ptr);
+                hipFree(exp_ptr);
+                hipFree(w_ptr);
+            }
+        }
+        Ok(stream)
+    }
+
+    /// Launcher for the unified IQ/K-quant grouped MoE kernel
+    /// (`grim_moe_fused_grouped_iqk`). `format_id` selects the super-block
+    /// decode (0 iq4nl .. 11 q3k); each expert's weights occupy one 256-weight
+    /// super-block of `BLOCK_BYTES[format_id]` bytes. Mirrors
+    /// `launch_charon_grouped_dispatch_q80` otherwise.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_charon_grouped_dispatch_iqk(
+        &self,
+        act_storage: &RocmStorage,
+        egate_w_ptr: u64,
+        eup_w_ptr: u64,
+        edown_w_ptr: u64,
+        a_scale_ptr: u64,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out_storage: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        num_experts: usize,
+        format_id: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<*mut c_void> {
+        use crate::kernels::charon::plan_grouped_dispatch;
+        let _ = num_experts; // validated by caller; kernel reads per-expert super-blocks
+
+        check_hip("charon_grouped_iqk hipMemset(output, 0)", unsafe {
+            hipMemset(
+                out_storage.device_ptr.ok_or_else(|| {
+                    Error::Backend("charon_grouped_iqk: out has no device ptr".into())
+                })? as *mut c_void,
+                0,
+                out_storage.bytes(),
+            )
+        })?;
+
+        let wave = self.wavefront_size() as u32;
+        let plan = plan_grouped_dispatch(sorted, wave);
+        if plan.grid_x == 0 {
+            return Ok(self.active_stream());
+        }
+        let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
+        let block_dim = HipDim3::new(plan.block_x, 1, 1);
+
+        let mut tok_ptr = upload_device_buffer(&sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(&sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(&sorted.sorted_weights)?;
+
+        let mut a = act_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_iqk: activations has no device ptr".into())
+        })? as *mut c_void;
+        let mut gw = egate_w_ptr;
+        let mut uw = eup_w_ptr;
+        let mut dw = edown_w_ptr;
+        let mut ascale = a_scale_ptr;
+        let mut optr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_iqk: out has no device ptr".into())
+        })? as *mut c_void;
+        let mut hidden_i = hidden as i32;
+        let mut inter_i = inter as i32;
+        let mut num_tokens_i = sorted.num_tokens_post_padded as i32;
+        let mut block_size_i = sorted.block_size as i32;
+        let mut format_i = format_id as i32;
+        let mut rsf = routed_scaling_factor;
+
+        let stream = self.launch_compute_kernel(
+            "grim_moe_fused_grouped_iqk",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a),
+                arg(&mut gw),
+                arg(&mut uw),
+                arg(&mut dw),
+                arg(&mut ascale),
+                arg(&mut tok_ptr),
+                arg(&mut exp_ptr),
+                arg(&mut w_ptr),
+                arg(&mut optr),
+                arg(&mut hidden_i),
+                arg(&mut inter_i),
+                arg(&mut num_tokens_i),
+                arg(&mut block_size_i),
+                arg(&mut format_i),
+                arg(&mut rsf),
+            ],
+        )?;
+
+        if self.active_capture_stream().is_none() {
+            unsafe {
+                let sync = hipStreamSynchronize(stream);
+                if sync != hipSuccess {
+                    hipFree(tok_ptr);
+                    hipFree(exp_ptr);
+                    hipFree(w_ptr);
+                    return Err(Error::Backend(format!(
+                        "charon_grouped_iqk hipStreamSynchronize failed: {}",
+                        sync
+                    )));
+                }
+                hipFree(tok_ptr);
+                hipFree(exp_ptr);
+                hipFree(w_ptr);
+            }
+        }
+        Ok(stream)
+    }
+
     /// (`tests/golden_charon_moe_gpu.rs`, G-A4). Takes plain host `f32`
     /// buffers + a routing assignment, uploads them, zeros the output,
     /// launches `grim_moe_fused_dispatch`, and reads the result back.
@@ -4275,7 +4939,614 @@ impl RocmDevice {
         out_storage.to_cpu_vec_f32()
     }
 
-    /// Launch the JIT compiled fused dequantization backward matmul kernel (WI-T3 / F5). [see: `dX[M, K] = dY[M, N] @ B^T`]
+    /// Host-to-host roundtrip for the #1 token-sorted (grouped) fused MoE
+    /// dispatch. Mirrors `charon_fused_dispatch_roundtrip` but token-sorts the
+    /// routing (vLLM `moe_align_block_size`) and launches
+    /// `grim_moe_fused_grouped`. Used by the cross-kernel parity golden test
+    /// that proves the grouped path produces identical numerics to the
+    /// sortless path on gfx1036 (G-A4 extension for WI-A).
+    pub fn charon_grouped_dispatch_roundtrip(
+        &self,
+        activations: &[f32],
+        expert_gate_w: &[f32],
+        expert_up_w: &[f32],
+        expert_down_w: &[f32],
+        assignment: &crate::kernels::charon::RoutingAssignment,
+        batch: usize,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<Vec<f32>> {
+        let num_experts = expert_gate_w.len() / (inter * hidden);
+        let block_size = 128usize; // token-block the grouped kernel strides across
+
+        let sorted = crate::kernels::charon::moe_align_block_size(
+            assignment,
+            block_size,
+            num_experts,
+        );
+
+        let act_shape = Shape::new(vec![batch, hidden]);
+        let exp_gate_shape = Shape::new(vec![expert_gate_w.len()]);
+        let exp_up_shape = Shape::new(vec![expert_up_w.len()]);
+        let exp_down_shape = Shape::new(vec![expert_down_w.len()]);
+        let out_shape = Shape::new(vec![batch, hidden]);
+
+        let act_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, activations, &act_shape, DType::F32)?;
+        let gw_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, expert_gate_w, &exp_gate_shape, DType::F32)?;
+        let uw_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, expert_up_w, &exp_up_shape, DType::F32)?;
+        let dw_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, expert_down_w, &exp_down_shape, DType::F32)?;
+        let out_storage: Box<dyn BackendStorage> =
+            BackendDevice::alloc_storage(self, &out_shape, DType::F32)?;
+
+        let act_s = as_rocm(act_storage.as_ref())?;
+        let gw_s = as_rocm(gw_storage.as_ref())?;
+        let uw_s = as_rocm(uw_storage.as_ref())?;
+        let dw_s = as_rocm(dw_storage.as_ref())?;
+        let out_s = as_rocm(out_storage.as_ref())?;
+
+        let gw_ptr = dev_ptr(gw_s)?;
+        let uw_ptr = dev_ptr(uw_s)?;
+        let dw_ptr = dev_ptr(dw_s)?;
+
+        self.launch_charon_grouped_dispatch(
+            act_s,
+            gw_ptr,
+            uw_ptr,
+            dw_ptr,
+            &sorted,
+            out_s,
+            hidden,
+            inter,
+            routed_scaling_factor,
+            num_experts,
+        )?;
+        self.synchronize();
+        out_storage.to_cpu_vec_f32()
+    }
+
+    /// Host-to-host roundtrip for the #3 MXFP4 (E2M1 + E8M0) token-sorted grouped
+    /// dispatch. Takes packed E2M1 weight codes + E8M0 shared-exponent bytes
+    /// (one exp per 32-element group along the contraction dim) for gate/up/down,
+    /// token-sorts via `moe_align_block_size`, and launches
+    /// `grim_moe_fused_grouped_mxfp4`. Used by the MXFP4-vs-FP32 KAT golden test.
+    pub fn charon_grouped_dispatch_roundtrip_mxfp4(
+        &self,
+        activations: &[f32],
+        expert_gate_w_codes: &[u8], // packed E2M1, [num_experts, inter*hidden/2]
+        expert_up_w_codes: &[u8],
+        expert_down_w_codes: &[u8],
+        expert_gate_e8m0: &[u8], // [num_experts, inter*hidden/32]
+        expert_up_e8m0: &[u8],
+        expert_down_e8m0: &[u8],
+        a_scale: &[f32],
+        assignment: &crate::kernels::charon::RoutingAssignment,
+        batch: usize,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<Vec<f32>> {
+        // num_experts from the packed gate-code layout: [num_experts, inter*hidden/2].
+        let num_experts = expert_gate_w_codes.len() / ((inter * hidden / 2).max(1));
+        let block_size = 128usize;
+
+        let sorted = crate::kernels::charon::moe_align_block_size(
+            assignment,
+            block_size,
+            num_experts,
+        );
+
+        let act_shape = Shape::new(vec![batch, hidden]);
+        let gw_shape = Shape::new(vec![expert_gate_w_codes.len()]);
+        let uw_shape = Shape::new(vec![expert_up_w_codes.len()]);
+        let dw_shape = Shape::new(vec![expert_down_w_codes.len()]);
+        let ge_shape = Shape::new(vec![expert_gate_e8m0.len()]);
+        let ue_shape = Shape::new(vec![expert_up_e8m0.len()]);
+        let de_shape = Shape::new(vec![expert_down_e8m0.len()]);
+        let as_shape = Shape::new(vec![a_scale.len()]);
+        let out_shape = Shape::new(vec![batch, hidden]);
+
+        let act_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, activations, &act_shape, DType::F32)?;
+        let gw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_gate_w_codes,
+            &gw_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let uw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_up_w_codes,
+            &uw_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let dw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_down_w_codes,
+            &dw_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let ge_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_gate_e8m0,
+            &ge_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let ue_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_up_e8m0,
+            &ue_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let de_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_down_e8m0,
+            &de_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let as_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, a_scale, &as_shape, DType::F32)?;
+        let out_storage: Box<dyn BackendStorage> =
+            BackendDevice::alloc_storage(self, &out_shape, DType::F32)?;
+
+        let act_s = as_rocm(act_storage.as_ref())?;
+        let gw_s = as_rocm(gw_storage.as_ref())?;
+        let uw_s = as_rocm(uw_storage.as_ref())?;
+        let dw_s = as_rocm(dw_storage.as_ref())?;
+        let ge_s = as_rocm(ge_storage.as_ref())?;
+        let ue_s = as_rocm(ue_storage.as_ref())?;
+        let de_s = as_rocm(de_storage.as_ref())?;
+        let as_s = as_rocm(as_storage.as_ref())?;
+        let out_s = as_rocm(out_storage.as_ref())?;
+
+        let gw_ptr = dev_ptr(gw_s)?;
+        let uw_ptr = dev_ptr(uw_s)?;
+        let dw_ptr = dev_ptr(dw_s)?;
+        let ge_ptr = dev_ptr(ge_s)?;
+        let ue_ptr = dev_ptr(ue_s)?;
+        let de_ptr = dev_ptr(de_s)?;
+        let as_ptr = dev_ptr(as_s)?;
+
+        self.launch_charon_grouped_dispatch_mxfp4(
+            act_s,
+            gw_ptr,
+            uw_ptr,
+            dw_ptr,
+            ge_ptr,
+            ue_ptr,
+            de_ptr,
+            as_ptr,
+            &sorted,
+            out_s,
+            hidden,
+            inter,
+            num_experts,
+            routed_scaling_factor,
+        )?;
+        self.synchronize();
+        out_storage.to_cpu_vec_f32()
+    }
+
+    /// Host-to-host roundtrip for the #4 MXFP8 (E4M3 + E8M0) token-sorted grouped
+    /// dispatch. Takes E4M3 weight codes (1 byte each, NOT packed) + one E8M0
+    /// shared-exponent byte per 32-element group, reusing the identical in-register
+    /// gate/up/SiLU/down math. Used by the MXFP8-vs-FP32 KAT (WI-A / G-A4 extension).
+    pub fn charon_grouped_dispatch_roundtrip_mxfp8(
+        &self,
+        activations: &[f32],
+        expert_gate_w_codes: &[u8], // E4M3, [num_experts, inter*hidden]
+        expert_up_w_codes: &[u8],
+        expert_down_w_codes: &[u8],
+        expert_gate_e8m0: &[u8], // [num_experts, inter*hidden/32]
+        expert_up_e8m0: &[u8],
+        expert_down_e8m0: &[u8],
+        a_scale: &[f32],
+        assignment: &crate::kernels::charon::RoutingAssignment,
+        batch: usize,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<Vec<f32>> {
+        // num_experts from the E4M3 gate-code layout: [num_experts, inter*hidden].
+        let num_experts = expert_gate_w_codes.len() / ((inter * hidden).max(1));
+        let block_size = 128usize;
+
+        let sorted = crate::kernels::charon::moe_align_block_size(
+            assignment,
+            block_size,
+            num_experts,
+        );
+
+        let act_shape = Shape::new(vec![batch, hidden]);
+        let gw_shape = Shape::new(vec![expert_gate_w_codes.len()]);
+        let uw_shape = Shape::new(vec![expert_up_w_codes.len()]);
+        let dw_shape = Shape::new(vec![expert_down_w_codes.len()]);
+        let ge_shape = Shape::new(vec![expert_gate_e8m0.len()]);
+        let ue_shape = Shape::new(vec![expert_up_e8m0.len()]);
+        let de_shape = Shape::new(vec![expert_down_e8m0.len()]);
+        let as_shape = Shape::new(vec![a_scale.len()]);
+        let out_shape = Shape::new(vec![batch, hidden]);
+
+        let act_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, activations, &act_shape, DType::F32)?;
+        let gw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_gate_w_codes,
+            &gw_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let uw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_up_w_codes,
+            &uw_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let dw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_down_w_codes,
+            &dw_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let ge_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_gate_e8m0,
+            &ge_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let ue_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_up_e8m0,
+            &ue_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let de_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_down_e8m0,
+            &de_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let as_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, a_scale, &as_shape, DType::F32)?;
+        let out_storage: Box<dyn BackendStorage> =
+            BackendDevice::alloc_storage(self, &out_shape, DType::F32)?;
+
+        let act_s = as_rocm(act_storage.as_ref())?;
+        let gw_s = as_rocm(gw_storage.as_ref())?;
+        let uw_s = as_rocm(uw_storage.as_ref())?;
+        let dw_s = as_rocm(dw_storage.as_ref())?;
+        let ge_s = as_rocm(ge_storage.as_ref())?;
+        let ue_s = as_rocm(ue_storage.as_ref())?;
+        let de_s = as_rocm(de_storage.as_ref())?;
+        let as_s = as_rocm(as_storage.as_ref())?;
+        let out_s = as_rocm(out_storage.as_ref())?;
+
+        let gw_ptr = dev_ptr(gw_s)?;
+        let uw_ptr = dev_ptr(uw_s)?;
+        let dw_ptr = dev_ptr(dw_s)?;
+        let ge_ptr = dev_ptr(ge_s)?;
+        let ue_ptr = dev_ptr(ue_s)?;
+        let de_ptr = dev_ptr(de_s)?;
+        let as_ptr = dev_ptr(as_s)?;
+
+        self.launch_charon_grouped_dispatch_mxfp8(
+            act_s,
+            gw_ptr,
+            uw_ptr,
+            dw_ptr,
+            ge_ptr,
+            ue_ptr,
+            de_ptr,
+            as_ptr,
+            &sorted,
+            out_s,
+            hidden,
+            inter,
+            num_experts,
+            routed_scaling_factor,
+        )?;
+        self.synchronize();
+        out_storage.to_cpu_vec_f32()
+    }
+
+    /// Takes Q8_0 weight bytes (f16 scale + i8 per 32 weights) + per-token act
+    /// scale, token-sorts via `moe_align_block_size`, and launches
+    /// `grim_moe_fused_grouped_q80` reusing the identical in-register math. Used
+    /// by the Q8_0-vs-FP32 KAT golden test (WI-5 / G-A4 extension).
+    pub fn charon_grouped_dispatch_roundtrip_q80(
+        &self,
+        activations: &[f32],
+        expert_gate_w_q80: &[u8],
+        expert_up_w_q80: &[u8],
+        expert_down_w_q80: &[u8],
+        a_scale: &[f32],
+        assignment: &crate::kernels::charon::RoutingAssignment,
+        batch: usize,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<Vec<f32>> {
+        // Q8_0 layout: per 32 weights a 2-byte f16 scale + 32 i8 => 34 bytes.
+        let bytes_per_block = 34usize;
+        let weights_per_expert = inter * hidden;
+        let num_experts =
+            expert_gate_w_q80.len() / (bytes_per_block * weights_per_expert.div_ceil(32));
+        let block_size = 128usize;
+
+        let sorted = crate::kernels::charon::moe_align_block_size(
+            assignment,
+            block_size,
+            num_experts,
+        );
+
+        let act_shape = Shape::new(vec![batch, hidden]);
+        let gw_shape = Shape::new(vec![expert_gate_w_q80.len()]);
+        let uw_shape = Shape::new(vec![expert_up_w_q80.len()]);
+        let dw_shape = Shape::new(vec![expert_down_w_q80.len()]);
+        let as_shape = Shape::new(vec![a_scale.len()]);
+        let out_shape = Shape::new(vec![batch, hidden]);
+
+        let act_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, activations, &act_shape, DType::F32)?;
+        let gw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_gate_w_q80,
+            &gw_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let uw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_up_w_q80,
+            &uw_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let dw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_down_w_q80,
+            &dw_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let as_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, a_scale, &as_shape, DType::F32)?;
+        let out_storage: Box<dyn BackendStorage> =
+            BackendDevice::alloc_storage(self, &out_shape, DType::F32)?;
+
+        let act_s = as_rocm(act_storage.as_ref())?;
+        let gw_s = as_rocm(gw_storage.as_ref())?;
+        let uw_s = as_rocm(uw_storage.as_ref())?;
+        let dw_s = as_rocm(dw_storage.as_ref())?;
+        let as_s = as_rocm(as_storage.as_ref())?;
+        let out_s = as_rocm(out_storage.as_ref())?;
+
+        let gw_ptr = dev_ptr(gw_s)?;
+        let uw_ptr = dev_ptr(uw_s)?;
+        let dw_ptr = dev_ptr(dw_s)?;
+        let as_ptr = dev_ptr(as_s)?;
+
+        self.launch_charon_grouped_dispatch_q80(
+            act_s,
+            gw_ptr,
+            uw_ptr,
+            dw_ptr,
+            as_ptr,
+            &sorted,
+            out_s,
+            hidden,
+            inter,
+            num_experts,
+            routed_scaling_factor,
+        )?;
+        self.synchronize();
+        out_storage.to_cpu_vec_f32()
+    }
+
+    /// Generic host-to-host roundtrip for the unified IQ/K-quant token-sorted
+    /// grouped dispatch. `format_id` selects the super-block decode (0 iq4nl ..
+    /// 11 q3k); `block_bytes` is `BLOCK_BYTES[format_id]`. Each expert's weights
+    /// occupy one super-block of `block_bytes` bytes. Used by the IQ/K-vs-FP32
+    /// KAT golden tests.
+    pub fn charon_grouped_dispatch_roundtrip_iqk(
+        &self,
+        activations: &[f32],
+        expert_gate_w_q: &[u8],
+        expert_up_w_q: &[u8],
+        expert_down_w_q: &[u8],
+        a_scale: &[f32],
+        assignment: &crate::kernels::charon::RoutingAssignment,
+        batch: usize,
+        hidden: usize,
+        inter: usize,
+        format_id: usize,
+        block_bytes: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<Vec<f32>> {
+        // Each expert occupies one 256-weight super-block of `block_bytes`.
+        let weights_per_expert = (inter * hidden).div_ceil(256) * 256;
+        let num_experts = expert_gate_w_q.len() / (block_bytes * (weights_per_expert / 256).max(1));
+        let block_size = 128usize;
+
+        let sorted = crate::kernels::charon::moe_align_block_size(
+            assignment,
+            block_size,
+            num_experts,
+        );
+
+        let act_shape = Shape::new(vec![batch, hidden]);
+        let gw_shape = Shape::new(vec![expert_gate_w_q.len()]);
+        let uw_shape = Shape::new(vec![expert_up_w_q.len()]);
+        let dw_shape = Shape::new(vec![expert_down_w_q.len()]);
+        let as_shape = Shape::new(vec![a_scale.len()]);
+        let out_shape = Shape::new(vec![batch, hidden]);
+
+        let act_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, activations, &act_shape, DType::F32)?;
+        let gw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_gate_w_q,
+            &gw_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let uw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_up_w_q,
+            &uw_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let dw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_down_w_q,
+            &dw_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let as_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, a_scale, &as_shape, DType::F32)?;
+        let out_storage: Box<dyn BackendStorage> =
+            BackendDevice::alloc_storage(self, &out_shape, DType::F32)?;
+
+        let act_s = as_rocm(act_storage.as_ref())?;
+        let gw_s = as_rocm(gw_storage.as_ref())?;
+        let uw_s = as_rocm(uw_storage.as_ref())?;
+        let dw_s = as_rocm(dw_storage.as_ref())?;
+        let as_s = as_rocm(as_storage.as_ref())?;
+        let out_s = as_rocm(out_storage.as_ref())?;
+
+        let gw_ptr = dev_ptr(gw_s)?;
+        let uw_ptr = dev_ptr(uw_s)?;
+        let dw_ptr = dev_ptr(dw_s)?;
+        let as_ptr = dev_ptr(as_s)?;
+
+        self.launch_charon_grouped_dispatch_iqk(
+            act_s,
+            gw_ptr,
+            uw_ptr,
+            dw_ptr,
+            as_ptr,
+            &sorted,
+            out_s,
+            hidden,
+            inter,
+            num_experts,
+            format_id,
+            routed_scaling_factor,
+        )?;
+        self.synchronize();
+        out_storage.to_cpu_vec_f32()
+    }
+
+    /// token-sorts via `moe_align_block_size`, and launches
+    /// `grim_moe_fused_grouped_fp8` reusing the identical in-register math. Used
+    /// by the FP8-vs-FP32 KAT golden test (WI-A / G-A4 extension for WI-2).
+    pub fn charon_grouped_dispatch_roundtrip_fp8(
+        &self,
+        activations: &[f32],
+        expert_gate_w_fp8: &[u8],
+        expert_up_w_fp8: &[u8],
+        expert_down_w_fp8: &[u8],
+        expert_gate_scale: &[f32],
+        expert_up_scale: &[f32],
+        expert_down_scale: &[f32],
+        a_scale: &[f32],
+        assignment: &crate::kernels::charon::RoutingAssignment,
+        batch: usize,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<Vec<f32>> {
+        // num_experts is derived from the gate-scale layout produced by the test:
+        //   gate_scale is [num_experts, inter, hidden/16]  (block_size=16 along hidden)
+        let h16 = (hidden + 15) / 16;
+        let num_experts = expert_gate_scale.len() / (inter * h16.max(1));
+        let block_size = 128usize;
+
+        let sorted = crate::kernels::charon::moe_align_block_size(
+            assignment,
+            block_size,
+            num_experts,
+        );
+
+        let act_shape = Shape::new(vec![batch, hidden]);
+        let gw_shape = Shape::new(vec![expert_gate_w_fp8.len()]);
+        let uw_shape = Shape::new(vec![expert_up_w_fp8.len()]);
+        let dw_shape = Shape::new(vec![expert_down_w_fp8.len()]);
+        let gs_shape = Shape::new(vec![expert_gate_scale.len()]);
+        let us_shape = Shape::new(vec![expert_up_scale.len()]);
+        let ds_shape = Shape::new(vec![expert_down_scale.len()]);
+        let as_shape = Shape::new(vec![a_scale.len()]);
+        let out_shape = Shape::new(vec![batch, hidden]);
+
+        let act_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, activations, &act_shape, DType::F32)?;
+        // FP8 weights are uploaded as raw U8 blobs (no DType::F8 on this path).
+        let gw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_gate_w_fp8,
+            &gw_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let uw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_up_w_fp8,
+            &uw_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let dw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
+            self,
+            expert_down_w_fp8,
+            &dw_shape,
+            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+        )?;
+        let gs_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, expert_gate_scale, &gs_shape, DType::F32)?;
+        let us_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, expert_up_scale, &us_shape, DType::F32)?;
+        let ds_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, expert_down_scale, &ds_shape, DType::F32)?;
+        let as_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, a_scale, &as_shape, DType::F32)?;
+        let out_storage: Box<dyn BackendStorage> =
+            BackendDevice::alloc_storage(self, &out_shape, DType::F32)?;
+
+        let act_s = as_rocm(act_storage.as_ref())?;
+        let gw_s = as_rocm(gw_storage.as_ref())?;
+        let uw_s = as_rocm(uw_storage.as_ref())?;
+        let dw_s = as_rocm(dw_storage.as_ref())?;
+        let gs_s = as_rocm(gs_storage.as_ref())?;
+        let us_s = as_rocm(us_storage.as_ref())?;
+        let ds_s = as_rocm(ds_storage.as_ref())?;
+        let as_s = as_rocm(as_storage.as_ref())?;
+        let out_s = as_rocm(out_storage.as_ref())?;
+
+        let gw_ptr = dev_ptr(gw_s)?;
+        let uw_ptr = dev_ptr(uw_s)?;
+        let dw_ptr = dev_ptr(dw_s)?;
+        let gs_ptr = dev_ptr(gs_s)?;
+        let us_ptr = dev_ptr(us_s)?;
+        let ds_ptr = dev_ptr(ds_s)?;
+        let as_ptr = dev_ptr(as_s)?;
+
+        self.launch_charon_grouped_dispatch_fp8(
+            act_s,
+            gw_ptr,
+            uw_ptr,
+            dw_ptr,
+            gs_ptr,
+            us_ptr,
+            ds_ptr,
+            as_ptr,
+            &sorted,
+            out_s,
+            hidden,
+            inter,
+            num_experts,
+            routed_scaling_factor,
+        )?;
+        self.synchronize();
+        out_storage.to_cpu_vec_f32()
+    }
+
     pub(crate) fn launch_fused_dequant_backward_gemm_f16(
         &self,
         dy_storage: &RocmStorage,
@@ -5935,17 +7206,22 @@ impl RocmDevice {
             base_key
         };
 
-        let path = if let Some(cached_path) = self.hsaco_cache.get_cached_kernel(&cache_key) {
-            cached_path
+        let (path, lowered_name) = if let Some((cached_path, cached_lowered)) =
+            self.hsaco_cache.get_cached_kernel(&cache_key)
+        {
+            (cached_path, cached_lowered)
         } else {
-            let code = jit_compile_hsaco(&kernel_source, entry, &self.gpu_target)?;
-            self.hsaco_cache
-                .cache_kernel(&cache_key, &kernel_source, &code)?
+            let (code, lowered) =
+                jit_compile_hsaco(&kernel_source, entry, &self.gpu_target)?;
+            let p = self
+                .hsaco_cache
+                .cache_kernel(&cache_key, &kernel_source, &code, &lowered)?;
+            (p, lowered)
         };
 
         let path_c = std::ffi::CString::new(path.to_str().unwrap_or(""))
             .map_err(|e| Error::Backend(format!("hsaco path CString: {}", e)))?;
-        let entry_c = std::ffi::CString::new(entry)
+        let entry_c = std::ffi::CString::new(lowered_name.as_str())
             .map_err(|e| Error::Backend(format!("entry CString: {}", e)))?;
 
         // Load the HIP module once per unique kernel; reuse the cached module +

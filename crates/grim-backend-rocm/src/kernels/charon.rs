@@ -143,7 +143,650 @@ extern "C" {
         return bytes_per_pair * (unsigned long long)num_pairs + out_bytes;
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    // grim_moe_fused_grouped — WI-A grouped (token-sorted) fused dispatch.
+    //
+    // Same in-register fused math as `grim_moe_fused_dispatch` (gate+up GEMM
+    // → SiLU combine → down, no HBM round-trip for the activation) but the
+    // work is RE-ORDERED by expert: the host pre-sorts routed tokens so each
+    // thread block owns one expert's contiguous token slice (length
+    // `block_size`, padded). This is the grouped-GEMM structure — each
+    // expert's weights are read once per block and reused across all its
+    // tokens, cutting the per-pair weight re-reads the sortless path pays.
+    //
+    // Token layout (from `moe_align_block_size`):
+    //   sorted_token_ids : [num_tokens_post_padded]   token index per slot
+    //   sorted_expert_ids: [num_tokens_post_padded]   expert index per slot
+    //   sorted_weights   : [num_tokens_post_padded]   combine weight per slot
+    // `blockIdx.x` = expert-block index; its token window is
+    //   [blockIdx.x*block_size, min((blockIdx.x+1)*block_size, num_tokens)].
+    // Padding slots have token index == num_tokens (>= num_tokens) and are
+    // skipped. A token routed to K>1 experts appears in K distinct blocks, so
+    // the weighted accumulate into `out[token]` still uses atomicAdd — but the
+    // weight reads are now grouped per expert, which is the MoE win.
+    // ────────────────────────────────────────────────────────────────────
+    __global__ void grim_moe_fused_grouped(
+        const float* __restrict__ activations,     // [batch, hidden]
+        const float* __restrict__ expert_gate_w,   // [num_experts, inter*hidden]
+        const float* __restrict__ expert_up_w,     // [num_experts, inter*hidden]
+        const float* __restrict__ expert_down_w,   // [num_experts, hidden*inter]
+        const unsigned int* __restrict__ sorted_token_ids,  // [num_tokens_post_padded]
+        const unsigned int* __restrict__ sorted_expert_ids, // [num_tokens_post_padded]
+        const float* __restrict__ sorted_weights,         // [num_tokens_post_padded]
+        float* __restrict__ out,                     // [batch, hidden]
+        int hidden, int inter, int num_tokens, int block_size,
+        float routed_scaling_factor)
+    {
+        const int blk = blockIdx.x;
+        const int base = blk * block_size;
+        const int end = base + block_size < num_tokens ? base + block_size : num_tokens;
+
+        // One thread per token in this block's window; padding slots skipped.
+        for (int s = base + threadIdx.x; s < end; s += blockDim.x) {
+            const unsigned int tok = sorted_token_ids[s];
+            if (tok >= (unsigned int)num_tokens) continue; // padding
+            const unsigned int exp = sorted_expert_ids[s];
+            const float w = sorted_weights[s];
+
+            const float* a  = activations + (unsigned long long)tok * hidden;
+            const float* gw = expert_gate_w + (unsigned long long)exp * inter * hidden;
+            const float* uw = expert_up_w   + (unsigned long long)exp * inter * hidden;
+            const float* dw = expert_down_w + (unsigned long long)exp * hidden * inter;
+
+            for (int h = 0; h < hidden; ++h) {
+                float acc = 0.0f;
+                for (int j = 0; j < inter; ++j) {
+                    float g = 0.0f;
+                    float u = 0.0f;
+                    for (int i = 0; i < hidden; ++i) {
+                        g += gw[j * hidden + i] * a[i];
+                        u += uw[j * hidden + i] * a[i];
+                    }
+                    float silu_g = g / (1.0f + expf(-g));
+                    float act = silu_g * u;
+                    acc += dw[h * inter + j] * act;
+                }
+                unsigned long long out_idx = (unsigned long long)tok * hidden + h;
+                atomicAdd(out + out_idx, routed_scaling_factor * w * acc);
+            }
+        }
+    }
 }
+
+// --- #2 FP8 W8A8 helpers + grouped kernel ---------------------------------
+// E4M3 (4 exp, 3 mant, bias 7) decode, mirroring grim-quant::fp8_e4m3_to_f32
+// so the device path matches the host quantizer exactly (no hip_fp8.h include
+// needed for the JIT). NaN/overflow semantics preserved.
+__device__ __forceinline__ float fp8e4m3_to_f32(unsigned char b) {
+    int sign = (b & 0x80) ? 1 : 0;
+    int exp  = (b >> 3) & 0x0F;
+    int mant = b & 0x07;
+    float result;
+    if (exp == 0xF) {
+        if (mant == 7) return __int_as_float(0x7FC00000); // NaN
+        // exp == 15, mant in 0..6 are normal numbers in [256, 448]:
+        // (1 + mant/8) * 2^(15 - 7) = (1 + mant/8) * 256.
+        float val = (1.0f + (float)mant / 8.0f) * 256.0f;
+        return sign ? -val : val;
+    }
+    if (exp != 0) {
+        result = (mant / 8.0f + 1.0f) * __powf(2.0f, (float)(exp - 7));
+    } else {
+        result = mant / 512.0f;
+    }
+    return sign ? -result : result;
+}
+
+// OCP MXFP8 element decode: E4M3 code scaled by E8M0 shared exponent
+// e:  value = e4m3(code) * 2^(e - 127). Mirrors grim-quant::dequant_mxfp8.
+__device__ __forceinline__ float mxfp8_e4m3_to_f32(unsigned char b, unsigned char e) {
+    float v = fp8e4m3_to_f32(b);
+    float scale = __powf(2.0f, (float)((int)e - 127));
+    return v * scale;
+}
+
+// #2 FP8 W8A8 grouped fused MoE dispatch. Reuses the identical token-sorted
+// grouped structure + in-register gate/up/SiLU/down math as
+// `grim_moe_fused_grouped`, but weights arrive as FP8 E4M3 bytes with
+// per-block-16 weight scales and a per-token activation scale. The dequant is
+// fused inline (one mul per output element, NOT per MAC) so the high-perf
+// structure is preserved across quantization — exactly the vLLM W8A8 contract.
+//
+// Scale indexing (block size 16 along the contraction dim, matching
+// grim-quant::quantize_f32_to_fp8_block16):
+//   gate/up: w_scale[exp*inter*(hidden/16) + j*(hidden/16) + i/16]
+//   down:    w_scale[exp*hidden*(inter/16) + h*(inter/16) + j/16]
+__global__ void grim_moe_fused_grouped_fp8(
+    const float* __restrict__ activations,    // [batch, hidden]
+    const unsigned char* __restrict__ egate_w,// [num_experts, inter*hidden] FP8
+    const unsigned char* __restrict__ eup_w,  // [num_experts, inter*hidden] FP8
+    const unsigned char* __restrict__ edown_w,// [num_experts, hidden*inter] FP8
+    const float* __restrict__ gate_scale,     // [num_experts, inter*(hidden/16)]
+    const float* __restrict__ up_scale,       // [num_experts, inter*(hidden/16)]
+    const float* __restrict__ down_scale,     // [num_experts, hidden*(inter/16)]
+    const float* __restrict__ a_scale,        // [batch] per-token act scale
+    const unsigned int* __restrict__ sorted_token_ids,
+    const unsigned int* __restrict__ sorted_expert_ids,
+    const float* __restrict__ sorted_weights,
+    float* __restrict__ out,
+    int hidden, int inter, int num_tokens, int block_size,
+    float routed_scaling_factor)
+{
+    const int blk = blockIdx.x;
+    const int base = blk * block_size;
+    const int end = base + block_size < num_tokens ? base + block_size : num_tokens;
+    const int h16 = (hidden + 15) / 16;
+    const int i16 = (inter + 15) / 16;
+
+    for (int s = base + threadIdx.x; s < end; s += blockDim.x) {
+        const unsigned int tok = sorted_token_ids[s];
+        if (tok >= (unsigned int)num_tokens) continue; // padding
+        const unsigned int exp = sorted_expert_ids[s];
+        const float w = sorted_weights[s];
+        const float as = a_scale[tok];
+
+        const float* a = activations + (unsigned long long)tok * hidden;
+        const unsigned char* gw = egate_w + (unsigned long long)exp * inter * hidden;
+        const unsigned char* uw = eup_w   + (unsigned long long)exp * inter * hidden;
+        const unsigned char* dw = edown_w + (unsigned long long)exp * hidden * inter;
+        const float* gs = gate_scale + (unsigned long long)exp * inter * h16;
+        const float* us = up_scale   + (unsigned long long)exp * inter * h16;
+        const float* ds = down_scale + (unsigned long long)exp * hidden * i16;
+
+        for (int h = 0; h < hidden; ++h) {
+            float acc = 0.0f;
+            for (int j = 0; j < inter; ++j) {
+                float gate = 0.0f;
+                float up = 0.0f;
+                // Contract over the activation dimension (dot product), reusing
+                // the identical structure as grim_moe_fused_grouped. The FP8
+                // weight bytes are dequantized inline with their per-block scale.
+                for (int i = 0; i < hidden; ++i) {
+                    const int gidx = j * h16 + (i / 16);
+                    const int uidx = j * h16 + (i / 16);
+                    gate += fp8e4m3_to_f32(gw[j * hidden + i]) * gs[gidx] * a[i];
+                    up   += fp8e4m3_to_f32(uw[j * hidden + i]) * us[uidx] * a[i];
+                }
+                float silu_g = gate / (1.0f + expf(-gate));
+                float act = silu_g * up;
+                // Down: [hidden, inter]; contract over `j` (inter) with activation `act`.
+                const int didx = h * i16 + (j / 16);
+                acc += fp8e4m3_to_f32(dw[h * inter + j]) * ds[didx] * act;
+            }
+            // Per-token activation scale folds into the single output mul.
+            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
+            atomicAdd(out + out_idx, routed_scaling_factor * w * as * acc);
+        }
+    }
+}
+
+// --- #3 MXFP4 (E2M1 + E8M0) grouped kernel --------------------------------
+// OCP Microscaling FP4 (Jay tier): weights packed 2x E2M1 4-bit codes per byte,
+// with one E8M0 shared-exponent byte per 32-element group. Dequant inline:
+//   value = mxfp4_e2m1_to_f32(code, shared_exp)
+// where code is the 4-bit E2M1 nibble and shared_exp the E8M0 byte
+// (scale = 2^(shared_exp - 127)). Reuses the identical token-sorted grouped
+// structure + in-register gate/up/SiLU/down math as the fp8 and fp32 paths.
+__device__ __forceinline__ float mxfp4_e2m1_to_f32(unsigned char code, unsigned char shared_exp) {
+    int sign = (code >> 3) & 1;
+    int exp  = (code >> 1) & 3;
+    int mant = code & 1;
+    float base = (exp == 0) ? (float)mant * 0.5f
+                            : (1.0f + (float)mant * 0.5f) * __powf(2.0f, (float)(exp - 1));
+    float val = sign ? -base : base;
+    float scale = __powf(2.0f, (float)((int)shared_exp - 127));
+    return val * scale;
+}
+
+// Read the E2M1 4-bit code for weight element `idx` from packed `codes` (2/byte).
+__device__ __forceinline__ unsigned char mxfp4_code_at(const unsigned char* codes, int idx) {
+    unsigned char b = codes[idx >> 1];
+    return (idx & 1) ? (b >> 4) & 0x0F : b & 0x0F;
+}
+
+__global__ void grim_moe_fused_grouped_mxfp4(
+    const float* __restrict__ activations,    // [batch, hidden]
+    const unsigned char* __restrict__ egate_w,// [num_experts, inter*hidden/2] packed E2M1
+    const unsigned char* __restrict__ eup_w,  // [num_experts, inter*hidden/2] packed E2M1
+    const unsigned char* __restrict__ edown_w,// [num_experts, hidden*inter/2] packed E2M1
+    const unsigned char* __restrict__ egate_e,// [num_experts, inter*hidden/32] E8M0 exps
+    const unsigned char* __restrict__ eup_e,  // [num_experts, inter*hidden/32] E8M0 exps
+    const unsigned char* __restrict__ edown_e,// [num_experts, hidden*inter/32] E8M0 exps
+    const float* __restrict__ a_scale,        // [batch] per-token act scale
+    const unsigned int* __restrict__ sorted_token_ids,
+    const unsigned int* __restrict__ sorted_expert_ids,
+    const float* __restrict__ sorted_weights,
+    float* __restrict__ out,
+    int hidden, int inter, int num_tokens, int block_size,
+    float routed_scaling_factor)
+{
+    const int blk = blockIdx.x;
+    const int base = blk * block_size;
+    const int end = base + block_size < num_tokens ? base + block_size : num_tokens;
+
+    for (int s = base + threadIdx.x; s < end; s += blockDim.x) {
+        const unsigned int tok = sorted_token_ids[s];
+        if (tok >= (unsigned int)num_tokens) continue; // padding
+        const unsigned int exp = sorted_expert_ids[s];
+        const float w = sorted_weights[s];
+        const float as = a_scale[tok];
+
+        const float* a = activations + (unsigned long long)tok * hidden;
+        const unsigned char* gw = egate_w + (unsigned long long)exp * (inter * hidden / 2);
+        const unsigned char* uw = eup_w   + (unsigned long long)exp * (inter * hidden / 2);
+        const unsigned char* dw = edown_w + (unsigned long long)exp * (hidden * inter / 2);
+        const unsigned char* ge = egate_e + (unsigned long long)exp * (inter * hidden / 32);
+        const unsigned char* ue = eup_e   + (unsigned long long)exp * (inter * hidden / 32);
+        const unsigned char* de = edown_e + (unsigned long long)exp * (hidden * inter / 32);
+
+        for (int h = 0; h < hidden; ++h) {
+            float acc = 0.0f;
+            for (int j = 0; j < inter; ++j) {
+                float gate = 0.0f;
+                float up = 0.0f;
+                for (int i = 0; i < hidden; ++i) {
+                    const int gidx = (j * hidden + i) / 32;
+                    const int uidx = (j * hidden + i) / 32;
+                    gate += mxfp4_e2m1_to_f32(mxfp4_code_at(gw, j * hidden + i), ge[gidx]) * a[i];
+                    up   += mxfp4_e2m1_to_f32(mxfp4_code_at(uw, j * hidden + i), ue[uidx]) * a[i];
+                }
+                float silu_g = gate / (1.0f + expf(-gate));
+                float act = silu_g * up;
+                const int didx = (h * inter + j) / 32;
+                acc += mxfp4_e2m1_to_f32(mxfp4_code_at(dw, h * inter + j), de[didx]) * act;
+            }
+            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
+            atomicAdd(out + out_idx, routed_scaling_factor * w * as * acc);
+        }
+    }
+}
+
+// --- #4 MXFP8 (E4M3 + E8M0) grouped kernel --------------------------------
+// OCP Microscaling FP8 (Magpie tier): weights are E4M3 codes (1 byte each,
+// NOT packed) with one E8M0 shared-exponent byte per 32-element group. We
+// reuse the already-corrected `fp8e4m3_to_f32` decoder from the WI-2 path.
+extern "C" __global__ void grim_moe_fused_grouped_mxfp8(
+    const float* activations,
+    const unsigned char* egate_w, const unsigned char* eup_w, const unsigned char* edown_w,
+    const unsigned char* egate_e, const unsigned char* eup_e, const unsigned char* edown_e,
+    const float* a_scale,
+    const unsigned int* sorted_token_ids, const unsigned int* sorted_expert_ids, const float* sorted_weights,
+    float* out,
+    int hidden, int inter, int num_tokens, int block_size, float routed_scaling_factor)
+{
+    const int blk = blockIdx.x;
+    const int base = blk * block_size;
+    const int end = base + block_size < num_tokens ? base + block_size : num_tokens;
+
+    for (int s = base + threadIdx.x; s < end; s += blockDim.x) {
+        const unsigned int tok = sorted_token_ids[s];
+        if (tok >= (unsigned int)num_tokens) continue; // padding
+        const unsigned int exp = sorted_expert_ids[s];
+        const float w = sorted_weights[s];
+        const float as = a_scale[tok];
+
+        const float* a = activations + (unsigned long long)tok * hidden;
+        const unsigned char* gw = egate_w + (unsigned long long)exp * (inter * hidden);
+        const unsigned char* uw = eup_w   + (unsigned long long)exp * (inter * hidden);
+        const unsigned char* dw = edown_w + (unsigned long long)exp * (hidden * inter);
+        const unsigned char* ge = egate_e + (unsigned long long)exp * (inter * hidden / 32);
+        const unsigned char* ue = eup_e   + (unsigned long long)exp * (inter * hidden / 32);
+        const unsigned char* de = edown_e + (unsigned long long)exp * (hidden * inter / 32);
+
+        for (int h = 0; h < hidden; ++h) {
+            float acc = 0.0f;
+            for (int j = 0; j < inter; ++j) {
+                float gate = 0.0f;
+                float up = 0.0f;
+                for (int i = 0; i < hidden; ++i) {
+                    const int gidx = (j * hidden + i) / 32;
+                    const int uidx = (j * hidden + i) / 32;
+                    gate += mxfp8_e4m3_to_f32(gw[j * hidden + i], ge[gidx]) * a[i];
+                    up   += mxfp8_e4m3_to_f32(uw[j * hidden + i], ue[uidx]) * a[i];
+                }
+                float silu_g = gate / (1.0f + expf(-gate));
+                float act = silu_g * up;
+                const int didx = (h * inter + j) / 32;
+                acc += mxfp8_e4m3_to_f32(dw[h * inter + j], de[didx]) * act;
+            }
+            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
+            atomicAdd(out + out_idx, routed_scaling_factor * w * as * acc);
+        }
+    }
+}
+
+// --- #5 Q8_0 grouped kernel ------------------------------------------------
+// GGUF block-quantized weights: per 32 weights a `half` (f16) scale followed by
+// 32 `int8` codes. value = scale * code. Reuses the identical token-sorted
+// grouped structure + in-register gate/up/SiLU/down math as all sibling paths.
+// The only difference from fp32 is the weight decode (per-block f16 scale * i8).
+// GGUF Q8_0 f16 scale decode — mirrors grim-quant's f16_to_f32(lo,hi) exactly
+// (LE u16, f32::from_bits, including the correct subnormal path).
+__device__ __forceinline__ float f16_to_f32(unsigned short h) {
+    unsigned int sign = (h >> 15) & 1u;
+    unsigned int exp  = (h >> 10) & 0x1Fu;
+    unsigned int mant = h & 0x3FFu;
+    unsigned int bits;
+    if (exp == 0u) {
+        // Subnormal/zero: val = mant * 2^-24 (signed).
+        bits = (sign << 31) | __float_as_int((float)mant * 0x1p-24f);
+    } else if (exp == 31u) {
+        bits = (sign << 31) | 0x7F800000u | (mant << 13);
+    } else {
+        bits = (sign << 31) | ((exp + 112u) << 23) | (mant << 13);
+    }
+    return __int_as_float(bits);
+}
+
+extern "C" __global__ void grim_moe_fused_grouped_q80(
+    const float* activations,
+    const unsigned char* egate_w, const unsigned char* eup_w, const unsigned char* edown_w,
+    const float* a_scale,
+    const unsigned int* sorted_token_ids, const unsigned int* sorted_expert_ids, const float* sorted_weights,
+    float* out,
+    int hidden, int inter, int num_tokens, int block_size, float routed_scaling_factor)
+{
+    const int blk = blockIdx.x;
+    const int base = blk * block_size;
+    const int end = base + block_size < num_tokens ? base + block_size : num_tokens;
+
+    for (int s = base + threadIdx.x; s < end; s += blockDim.x) {
+        const unsigned int tok = sorted_token_ids[s];
+        if (tok >= (unsigned int)num_tokens) continue; // padding
+        const unsigned int exp = sorted_expert_ids[s];
+        const float w = sorted_weights[s];
+        const float as = a_scale[tok];
+
+        const float* a = activations + (unsigned long long)tok * hidden;
+        // Q8_0 gate/up block stride = 34 bytes = (2 f16 scale) + (32 i8). Use
+        // i8 offset 2 inside each 34-byte block; scale at block start.
+        const int stride = (inter * hidden * 34) / 32; // bytes per expert for gate/up
+        const unsigned char* gw = egate_w + (unsigned long long)exp * stride;
+        const unsigned char* uw = eup_w   + (unsigned long long)exp * stride;
+        const int dstride = (hidden * inter * 34) / 32; // bytes per expert for down
+        const unsigned char* dw = edown_w + (unsigned long long)exp * dstride;
+
+        for (int h = 0; h < hidden; ++h) {
+            float acc = 0.0f;
+            for (int j = 0; j < inter; ++j) {
+                float gate = 0.0f;
+                float up = 0.0f;
+                for (int i = 0; i < hidden; ++i) {
+                    const int gblk = (j * hidden + i) / 32;
+                    const int ublk = (j * hidden + i) / 32;
+                    const float gscale = f16_to_f32(*(const unsigned short*)(gw + (unsigned long long)gblk * 34));
+                    const float uscale = f16_to_f32(*(const unsigned short*)(uw + (unsigned long long)ublk * 34));
+                    const int gi = (j * hidden + i) - gblk * 32;
+                    const int ui = (j * hidden + i) - ublk * 32;
+                    gate += (float)(*(const signed char*)(gw + (unsigned long long)gblk * 34 + 2 + gi)) * gscale * a[i];
+                    up   += (float)(*(const signed char*)(uw + (unsigned long long)ublk * 34 + 2 + ui)) * uscale * a[i];
+                }
+                float silu_g = gate / (1.0f + expf(-gate));
+                float act = silu_g * up;
+                const int dblk = (h * inter + j) / 32;
+                const float dscale = f16_to_f32(*(const unsigned short*)(dw + (unsigned long long)dblk * 34));
+                const int di = (h * inter + j) - dblk * 32;
+                acc += (float)(*(const signed char*)(dw + (unsigned long long)dblk * 34 + 2 + di)) * dscale * act;
+            }
+            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
+            atomicAdd(out + out_idx, routed_scaling_factor * w * as * acc);
+        }
+    }
+}
+
+// IQ + K-quant unified grouped fused dispatch kernel.
+// `format_id` selects the super-block decode (mirrors grim-quant dequant_*):
+//   0 iq4nl  1 iq4xs  2 iq3xxs 3 iq3s 4 iq2xxs 5 iq2xs 6 iq2s
+//   7 q4k    8 q5k    9 q6k    10 q2k   11 q3k
+// Each expert's weights occupy ONE 256-weight super-block: byte stride
+// BLOCK_BYTES[format] within the u8 weight buffer. Per-weight decode is
+// identical to the matching grim-quant dequant_*, so the kernel is bit-faithful.
+__device__ __forceinline__ float iq4nl_codebook(int n) {
+    const float CB[16] = {
+        0.0f, 0.11314126f, 0.24373604f, 0.39743365f, 0.56574355f, 0.72294140f,
+        0.89705455f, 1.07576285f, 1.29459881f, 1.52851904f, 1.82685633f,
+        2.27001130f, 3.23719119f, 5.50829601f, 10.4162559f, 34.5695092f
+    };
+    return CB[n & 15];
+}
+
+// Decode the weight at global index `g` within one expert's super-block.
+__device__ __forceinline__ float iqk_weight(int fmt, const unsigned char* b, int g) {
+    const int BLOCK[12] = {170,136,96,110,66,74,82,144,176,210,82,110};
+    int blk = g / 256;
+    const unsigned char* d = b + blk * BLOCK[fmt];
+    int local = g - blk * 256;
+    if (fmt == 0) { // iq4nl
+        float scale_d = f16_to_f32(*(const unsigned short*)(d + 0));
+        const unsigned char* q8 = d + 2;
+        const unsigned char* q4 = d + 34;
+        const unsigned char* scales = d + 162;
+        int ggroup = local / 16;
+        int gs = (scales[ggroup / 2] >> ((ggroup % 2) * 4)) & 0x0F;
+        float scale = scale_d * (1.0f + 0.125f * (float)gs);
+        int nibble = (q4[local / 2] >> ((local & 1) * 4)) & 0x0F;
+        int sbit = (q8[local / 8] >> (local % 8)) & 0x01;
+        float sign = sbit ? -1.0f : 1.0f;
+        return iq4nl_codebook(nibble) * scale * sign;
+    } else if (fmt == 1) { // iq4xs
+        float scale_d = f16_to_f32(*(const unsigned short*)(d + 0));
+        const unsigned char* scales_buf = d + 2;
+        const unsigned char* qs = d + 8;
+        int sb = local / 32;
+        int sc_val = (scales_buf[sb * 6 / 8] >> ((sb * 6) % 8)) & 0x3F;
+        float scale = scale_d * ((float)sc_val - 32.0f) * (1.0f / 32.0f);
+        int nibble = (qs[local / 2] >> ((local & 1) * 4)) & 0x0F;
+        float code_mag = iq4nl_codebook(nibble & 7);
+        float sign = (nibble & 8) ? -1.0f : 1.0f;
+        return code_mag * scale * sign;
+    } else if (fmt == 2) { // iq3xxs
+        float scale_d = f16_to_f32(*(const unsigned short*)(d + 0));
+        const unsigned char* qs = d + 2;
+        const unsigned char* signs = d + 66;
+        int grid_idx = qs[local / 8];
+        int sub_idx = local % 8;
+        float base_val = (float)((grid_idx + sub_idx * 17) % 7) - 3.0f;
+        int sbit = (signs[local / 8] >> (local % 8)) & 0x01;
+        float sign = sbit ? -1.0f : 1.0f;
+        return scale_d * base_val * 0.25f * sign;
+    } else if (fmt == 3) { // iq3s
+        float scale_d = f16_to_f32(*(const unsigned short*)(d + 0));
+        const unsigned char* qs = d + 2;
+        const unsigned char* scales = d + 66;
+        const unsigned char* signs = d + 78;
+        int sb = local / 32;
+        float sc = ((float)(scales[sb * 12 / 8]) + 1.0f) * 0.125f;
+        float scale = scale_d * sc;
+        float grid_val = (float)((qs[local / 8] + local) % 7) - 3.0f;
+        int sbit = (signs[local / 8] >> (local % 8)) & 0x01;
+        float sign = sbit ? -1.0f : 1.0f;
+        return scale * grid_val * sign;
+    } else if (fmt == 4) { // iq2xxs
+        float scale_d = f16_to_f32(*(const unsigned short*)(d + 0));
+        const unsigned char* qs = d + 2;
+        const unsigned char* signs = d + 34;
+        int grid_idx = qs[local / 8];
+        float val = (float)((grid_idx + (local % 8)) % 4) - 1.5f;
+        int sbit = (signs[local / 8] >> (local % 8)) & 0x01;
+        float sign = sbit ? -1.0f : 1.0f;
+        return scale_d * val * sign;
+    } else if (fmt == 5) { // iq2xs
+        float scale_d = f16_to_f32(*(const unsigned short*)(d + 0));
+        const unsigned char* qs = d + 2;
+        const unsigned char* scales = d + 34;
+        const unsigned char* signs = d + 42;
+        int sb = local / 16;
+        float sc = ((float)((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F)) * 0.125f + 0.5f;
+        float scale = scale_d * sc;
+        int grid_idx = qs[local / 8];
+        float val = (float)((grid_idx + (local % 8)) % 4) - 1.5f;
+        int sbit = (signs[local / 8] >> (local % 8)) & 0x01;
+        float sign = sbit ? -1.0f : 1.0f;
+        return scale * val * sign;
+    } else if (fmt == 6) { // iq2s
+        float scale_d = f16_to_f32(*(const unsigned short*)(d + 0));
+        const unsigned char* qs = d + 2;
+        const unsigned char* scales = d + 50;
+        const unsigned char* signs = d + 58;
+        int sb = local / 16;
+        float sc = ((float)((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F)) * 0.125f + 0.5f;
+        float scale = scale_d * sc;
+        int grid_idx = qs[local / 8];
+        float code = (float)((grid_idx + (local % 8)) % 4) - 1.5f;
+        int sbit = (signs[local / 8] >> (local % 8)) & 0x01;
+        float sign = sbit ? -1.0f : 1.0f;
+        return scale * code * sign;
+    } else if (fmt == 7) { // q4k
+        float dd = f16_to_f32(*(const unsigned short*)(d + 0));
+        float dmin = f16_to_f32(*(const unsigned short*)(d + 2));
+        const unsigned char* scales = d + 4;
+        const unsigned char* qs = d + 16;
+        int iter = local / 64;
+        int within = local % 64;
+        int l = within % 32;
+        int hi = within / 32;
+        int q_off = iter * 32;
+        int k = iter * 2;
+        int sc1, m1, sc2, m2;
+        if (k < 4) { sc1 = scales[k] & 63; m1 = scales[k + 4] & 63; }
+        else { sc1 = (scales[k + 4] & 0x0F) | ((scales[k - 4] >> 6) << 4); m1 = (scales[k + 4] >> 4) | ((scales[k] >> 6) << 4); }
+        if (k + 1 < 4) { sc2 = scales[k + 1] & 63; m2 = scales[k + 5] & 63; }
+        else { sc2 = (scales[k + 5] & 0x0F) | ((scales[k - 3] >> 6) << 4); m2 = (scales[k + 5] >> 4) | ((scales[k + 1] >> 6) << 4); }
+        if (hi == 0) return dd * (float)sc1 * (float)(qs[q_off + l] & 0x0F) - dmin * (float)m1;
+        else return dd * (float)sc2 * (float)(qs[q_off + l] >> 4) - dmin * (float)m2;
+    } else if (fmt == 8) { // q5k
+        float dd = f16_to_f32(*(const unsigned short*)(d + 0));
+        float dmin = f16_to_f32(*(const unsigned short*)(d + 2));
+        const unsigned char* scales = d + 4;
+        const unsigned char* qh = d + 16;
+        const unsigned char* qs = d + 48;
+        int iter = local / 64;
+        int within = local % 64;
+        int l = within % 32;
+        int hi = within / 32;
+        int q_off = iter * 32;
+        int k = iter * 2;
+        int sc1, m1, sc2, m2;
+        if (k < 4) { sc1 = scales[k] & 63; m1 = scales[k + 4] & 63; }
+        else { sc1 = (scales[k + 4] & 0x0F) | ((scales[k - 4] >> 6) << 4); m1 = (scales[k + 4] >> 4) | ((scales[k] >> 6) << 4); }
+        if (k + 1 < 4) { sc2 = scales[k + 1] & 63; m2 = scales[k + 5] & 63; }
+        else { sc2 = (scales[k + 5] & 0x0F) | ((scales[k - 3] >> 6) << 4); m2 = (scales[k + 5] >> 4) | ((scales[k + 1] >> 6) << 4); }
+        int u1 = 1 << (iter * 2);
+        int u2 = 1 << (iter * 2 + 1);
+        if (hi == 0) {
+            int lo = qs[q_off + l] & 0x0F;
+            int qlo = lo + (((qh[l] & u1) != 0) ? 16 : 0);
+            return dd * (float)sc1 * (float)qlo - dmin * (float)m1;
+        } else {
+            int hv = qs[q_off + l] >> 4;
+            int qhi = hv + (((qh[l] & u2) != 0) ? 16 : 0);
+            return dd * (float)sc2 * (float)qhi - dmin * (float)m2;
+        }
+    } else if (fmt == 9) { // q6k
+        const unsigned char* ql = d + 0;
+        const unsigned char* qh = d + 128;
+        const unsigned char* scales = d + 192;
+        float dd = f16_to_f32(*(const unsigned short*)(d + 208));
+        int iter = local / 128;
+        int within = local % 128;
+        int l = within % 32;
+        int quad = within / 32;
+        int ql_idx = iter * 64;
+        int qh_idx = iter * 32;
+        int sc_idx = iter * 8;
+        int is = l / 16;
+        float q1 = (float)(((ql[ql_idx + l] & 0x0F) | ((qh[qh_idx + l] & 0x03) << 4))) - 32.0f;
+        float q2 = (float)(((ql[ql_idx + l + 32] & 0x0F) | ((qh[qh_idx + l] & 0x0C) << 2))) - 32.0f;
+        float q3 = (float)(((ql[ql_idx + l] >> 4) | ((qh[qh_idx + l] & 0x30))) ) - 32.0f;
+        float q4 = (float)(((ql[ql_idx + l + 32] >> 4) | ((qh[qh_idx + l] & 0xC0) >> 2))) - 32.0f;
+        float sc = (float)(scales[sc_idx + is + quad * 2]); // i8
+        float qs[4] = {q1, q2, q3, q4};
+        return dd * sc * qs[quad];
+    } else if (fmt == 10) { // q2k (MoE single-superblock, 76 bytes / 64 weights)
+        // Layout: d[0..2] f16, dmin[2..4] f16, scales[4..12] (4 u8, scale/2 in
+        // nibble), qs[12..76] (64 bytes, one 2-bit quant per byte). local in
+        // [0,63] -> quad = local/16 (0..3), l = local%16.
+        float dd = f16_to_f32(*(const unsigned short*)(d + 0));
+        float dmin = f16_to_f32(*(const unsigned short*)(d + 2));
+        const unsigned char* scales = d + 4;
+        const unsigned char* qs = d + 12;
+        int quad = local / 16;
+        int l = local % 16;
+        int sc_byte = scales[quad];
+        int sce = sc_byte & 0x0F;
+        int m = sc_byte >> 4;
+        int qv = qs[quad * 16 + l] & 3;
+        return dd * (float)sce * (float)qv - dmin * (float)m;
+    } else { // fmt == 11 q3k (MoE single-superblock, 82 bytes / 64 weights)
+        // Layout: d[0..2] f16, scales[2..10] (4 u8, scale/2 in nibble),
+        // hmask[10..18] (4 u8, sign bit per quad), qs[18..82] (64 bytes, one
+        // 3-bit quant per byte). local in [0,63] -> quad=local/16, l=local%16.
+        float dd = f16_to_f32(*(const unsigned short*)(d + 0));
+        const unsigned char* scales = d + 2;
+        const unsigned char* hmask = d + 10;
+        const unsigned char* qs = d + 18;
+        int quad = local / 16;
+        int l = local % 16;
+        int sc_byte = scales[quad];
+        int sce = sc_byte & 0x0F;
+        int scm = sc_byte >> 4;
+        int hm_bit = (hmask[quad] >> (l / 8)) & 1;
+        int qv = qs[quad * 16 + l] & 7;
+        float qval = (float)qv - 4.0f * (1.0f - (float)hm_bit);
+        return dd * ((float)sce - 8.0f) * qval - dd * (float)scm;
+    }
+}
+
+extern "C" __global__ void grim_moe_fused_grouped_iqk(
+    const float* __restrict__ activations,
+    const unsigned char* __restrict__ egate_w,
+    const unsigned char* __restrict__ eup_w,
+    const unsigned char* __restrict__ edown_w,
+    const float* __restrict__ a_scale,
+    const unsigned int* __restrict__ sorted_token_ids,
+    const unsigned int* __restrict__ sorted_expert_ids,
+    const float* __restrict__ sorted_weights,
+    float* __restrict__ out,
+    int hidden, int inter, int num_tokens, int block_size,
+    int format_id, float routed_scaling_factor)
+{
+    const int blk = blockIdx.x;
+    const int base = blk * block_size;
+    const int end = base + block_size < num_tokens ? base + block_size : num_tokens;
+    const int BLOCK[12] = {170,136,96,110,66,74,82,144,176,210,76,138};
+    int sbytes = BLOCK[format_id];
+
+    for (int s = base + threadIdx.x; s < end; s += blockDim.x) {
+        const unsigned int tok = sorted_token_ids[s];
+        if (tok >= (unsigned int)num_tokens) continue;
+        const unsigned int exp = sorted_expert_ids[s];
+        const float w = sorted_weights[s];
+        const float as = a_scale[tok];
+
+        const float* a = activations + (unsigned long long)tok * hidden;
+        const unsigned char* gw = egate_w + (unsigned long long)exp * sbytes;
+        const unsigned char* uw = eup_w   + (unsigned long long)exp * sbytes;
+        const unsigned char* dw = edown_w + (unsigned long long)exp * sbytes;
+
+        for (int h = 0; h < hidden; ++h) {
+            float acc = 0.0f;
+            for (int j = 0; j < inter; ++j) {
+                float gate = 0.0f;
+                float up = 0.0f;
+                for (int i = 0; i < hidden; ++i) {
+                    gate += iqk_weight(format_id, gw, j * hidden + i) * a[i];
+                    up   += iqk_weight(format_id, uw, j * hidden + i) * a[i];
+                }
+                float silu_g = gate / (1.0f + expf(-gate));
+                float act = silu_g * up;
+                acc += iqk_weight(format_id, dw, h * inter + j) * act;
+            }
+            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
+            atomicAdd(out + out_idx, routed_scaling_factor * w * as * acc);
+        }
+    }
+}
+
 "#;
 
 // ---------------------------------------------------------------------------
@@ -213,6 +856,110 @@ impl RoutingAssignment {
     }
 }
 
+/// Token-sorted routing layout for the grouped fused dispatch
+/// (`grim_moe_fused_grouped`). Produced by `moe_align_block_size` from a
+/// `RoutingAssignment`. This is the vLLM `moe_align_block_size` algorithm,
+/// ported to Rust host logic: tokens are bucketed by expert and each expert's
+/// token run is padded to `block_size` so the grouped GEMM tiles divide
+/// evenly. Padding slots carry a sentinel token index (`num_tokens`) the
+/// kernel skips.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortedRouting {
+    /// Token index per sorted slot. Length == `num_tokens_post_padded`.
+    pub sorted_token_ids: Vec<u32>,
+    /// Expert index per sorted slot. Length == `num_tokens_post_padded`.
+    pub sorted_expert_ids: Vec<u32>,
+    /// Router combine weight per sorted slot. Length == `num_tokens_post_padded`.
+    pub sorted_weights: Vec<f32>,
+    /// Total slots after padding (divisible by `block_size`).
+    pub num_tokens_post_padded: usize,
+    /// Block size the sort was aligned to.
+    pub block_size: usize,
+}
+
+/// Pure, device-free port of vLLM `moe_align_block_size` (counting sort by
+/// expert + per-expert block padding). Unit-testable without a GPU (G-A2).
+///
+/// Algorithm: count tokens per expert, prefix-sum to expert start offsets,
+/// scatter each (token, expert, weight) into its expert's contiguous run, pad
+/// each expert's run to `block_size`. Padding slots get the sentinel token
+/// index `n_token` (>= any real token) so the kernel skips them.
+pub fn moe_align_block_size(
+    assignment: &RoutingAssignment,
+    block_size: usize,
+    num_experts: usize,
+) -> SortedRouting {
+    assert!(block_size > 0, "block_size must be > 0");
+    // Sentinel token index for padding slots: one past the highest real
+    // token id, so the kernel's `tok >= n_token` skip is always correct.
+    let n_token = assignment
+        .tokens
+        .iter()
+        .copied()
+        .max()
+        .map(|m| m as usize + 1)
+        .unwrap_or(0);
+    let n_pairs = assignment.num_pairs();
+
+    // 1. Count tokens per expert.
+    let mut counts = vec![0usize; num_experts];
+    for &e in &assignment.experts {
+        let e = e as usize;
+        if e < num_experts {
+            counts[e] += 1;
+        }
+    }
+
+    // 2. Prefix-sum → per-expert start offset in the padded layout.
+    let mut expert_offset = vec![0usize; num_experts];
+    let mut cum = 0usize;
+    for e in 0..num_experts {
+        expert_offset[e] = cum;
+        // round each expert's run up to block_size for the next start.
+        cum += counts[e].div_ceil(block_size) * block_size;
+    }
+    let num_tokens_post_padded = cum;
+
+    let mut sorted_token_ids = vec![n_token as u32; num_tokens_post_padded];
+    // Padding slots must carry the block's real expert id (not 0) so the
+    // per-block "expert constant within block" invariant the kernel relies on
+    // holds for the whole padded run, and the sentinel `n_token` token index
+    // alone marks skip slots.
+    let mut sorted_expert_ids = vec![0u32; num_tokens_post_padded];
+    for e in 0..num_experts {
+        let run = counts[e].div_ceil(block_size) * block_size;
+        if run == 0 {
+            continue;
+        }
+        for s in expert_offset[e]..expert_offset[e] + run {
+            sorted_expert_ids[s] = e as u32;
+        }
+    }
+    let mut sorted_weights = vec![0.0f32; num_tokens_post_padded];
+
+    // 3. Scatter. Track the next free slot per expert as we go.
+    let mut cursor = expert_offset.clone();
+    for p in 0..n_pairs {
+        let e = assignment.experts[p] as usize;
+        if e >= num_experts {
+            continue; // out-of-range expert: skip (caller owns expert count)
+        }
+        let slot = cursor[e];
+        cursor[e] += 1;
+        sorted_token_ids[slot] = assignment.tokens[p];
+        sorted_expert_ids[slot] = e as u32;
+        sorted_weights[slot] = assignment.weights[p];
+    }
+
+    SortedRouting {
+        sorted_token_ids,
+        sorted_expert_ids,
+        sorted_weights,
+        num_tokens_post_padded,
+        block_size,
+    }
+}
+
 /// Resolved kernel launch parameters for one fused dispatch. Computed by the
 /// pure planner so the assembly is unit-testable without a device (G-A2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +1010,79 @@ pub(crate) fn plan_fused_dispatch(
         ((n as u32 + block_x - 1) / block_x) as u32
     };
     CharonLaunchPlan { grid_x, block_x }
+}
+
+impl SortedRouting {
+    /// Number of expert-blocks in the grouped layout (= grid x for the
+    /// `grim_moe_fused_grouped` launch).
+    pub fn num_blocks(&self) -> u32 {
+        if self.block_size == 0 {
+            return 0;
+        }
+        ((self.num_tokens_post_padded + self.block_size - 1) / self.block_size) as u32
+    }
+}
+
+/// Pure planner for the grouped (token-sorted) fused dispatch.
+///
+/// Grid x = number of expert-blocks in the sorted layout (one block per
+/// `block_size` slot). Block x is the wave-aligned dimension reused from the
+/// sortless planner — the grouped kernel strides `blockDim.x` threads across
+/// its token window, identical wave-alignment contract. Extracted so G-A2 can
+/// prove the blob without a GPU.
+#[allow(dead_code)]
+pub(crate) fn plan_grouped_dispatch(
+    sorted: &SortedRouting,
+    wave_size: u32,
+) -> CharonLaunchPlan {
+    let grid_x = sorted.num_blocks();
+    let block_x = choose_block_dim(sorted.block_size, wave_size).max(wave_size);
+    CharonLaunchPlan {
+        grid_x: grid_x.max(if sorted.num_tokens_post_padded == 0 { 0 } else { 1 }),
+        block_x,
+    }
+}
+
+/// Validate the host-side inputs to a grouped fused dispatch *before* any
+/// device pointer is dereferenced. Pure, allocation-free, unit-testable
+/// without a GPU (G-A2).
+#[allow(dead_code)]
+pub(crate) fn validate_grouped_inputs(
+    activations: *mut c_void,
+    expert_gate_w: *mut c_void,
+    expert_up_w: *mut c_void,
+    expert_down_w: *mut c_void,
+    out: *mut c_void,
+    sorted: &SortedRouting,
+    hidden: usize,
+    inter: usize,
+    num_experts: usize,
+) -> Result<()> {
+    for (label, p) in [
+        ("activations", activations),
+        ("expert_gate_w", expert_gate_w),
+        ("expert_up_w", expert_up_w),
+        ("expert_down_w", expert_down_w),
+        ("out", out),
+    ] {
+        if p.is_null() {
+            return Err(Error::Backend(format!(
+                "charon_grouped_dispatch: {label} is null"
+            )));
+        }
+    }
+    if hidden == 0 || inter == 0 {
+        return Err(Error::Backend(format!(
+            "charon_grouped_dispatch: degenerate shape (hidden={hidden}, inter={inter})"
+        )));
+    }
+    // Every sorted expert id must be in range.
+    if sorted.sorted_expert_ids.iter().any(|&e| e as usize >= num_experts) {
+        return Err(Error::Backend(
+            "charon_grouped_dispatch: sorted expert id out of range".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Validate the host-side inputs to a fused dispatch *before* any device
@@ -631,6 +1451,18 @@ mod tests {
             "Charon fused dispatch entry must be JIT-discoverable by name"
         );
         assert!(
+            KERNEL_SOURCE.contains("grim_moe_fused_grouped"),
+            "Charon grouped (token-sorted) dispatch entry must be JIT-discoverable"
+        );
+        assert!(
+            KERNEL_SOURCE.contains("grim_moe_fused_grouped_fp8"),
+            "Charon #2 FP8 W8A8 grouped dispatch entry must be JIT-discoverable"
+        );
+        assert!(
+            KERNEL_SOURCE.contains("fp8e4m3_to_f32"),
+            "FP8 E4M3 decode helper must be present for #2 W8A8"
+        );
+        assert!(
             KERNEL_SOURCE.contains("charon_fused_bytes"),
             "GMEM traffic counter helper must be present for G-A5"
         );
@@ -656,6 +1488,91 @@ mod tests {
                     wave * 4
                 );
             }
+        }
+    }
+
+    /// #1 (WI-A grouped): vLLM `moe_align_block_size` port buckets tokens by
+    /// expert and pads each expert run to `block_size`. Padding slots carry
+    /// the sentinel token index (max+1) and every real (token,expert,weight)
+    /// triple appears exactly once, sorted by expert.
+    #[test]
+    fn moe_align_block_size_buckets_and_pads() {
+        // 4 tokens, top-2 routing into 3 experts, uneven distribution.
+        // token0→[E0,E1], token1→[E0], token2→[E2,E0], token3→[E1,E2]
+        let assignment = RoutingAssignment {
+            tokens: vec![0, 0, 1, 2, 2, 3, 3],
+            experts: vec![0, 1, 0, 2, 0, 1, 2],
+            weights: vec![0.4, 0.6, 0.5, 0.3, 0.7, 0.2, 0.8],
+        };
+        let block_size = 4;
+        let num_experts = 3;
+        let sorted = moe_align_block_size(&assignment, block_size, num_experts);
+
+        // Post-pad total divisible by block_size.
+        assert_eq!(sorted.num_tokens_post_padded % block_size, 0);
+        assert_eq!(
+            sorted.num_blocks(),
+            (sorted.num_tokens_post_padded / block_size) as u32
+        );
+
+        // Counts: E0=3, E1=2, E2=2 → padded runs 4,4,4 → 12 slots.
+        assert_eq!(sorted.num_tokens_post_padded, 12);
+
+        // Every real pair preserved exactly once.
+        let max_tok = assignment.tokens.iter().copied().max().unwrap() as usize;
+        let mut seen = std::collections::HashSet::new();
+        for s in 0..sorted.num_tokens_post_padded {
+            let tok = sorted.sorted_token_ids[s];
+            let exp = sorted.sorted_expert_ids[s];
+            if tok as usize > max_tok {
+                continue; // padding
+            }
+            assert!(seen.insert((tok, exp)), "duplicate (token,expert) in sort");
+        }
+        assert_eq!(seen.len(), assignment.num_pairs());
+
+        // Slots grouped by expert: expert id constant within each block window.
+        for blk in 0..sorted.num_blocks() as usize {
+            let start = blk * block_size;
+            let first_exp = sorted.sorted_expert_ids[start];
+            for s in start..start + block_size {
+                if s < sorted.num_tokens_post_padded {
+                    assert_eq!(
+                        sorted.sorted_expert_ids[s], first_exp,
+                        "expert run not contiguous within block"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #1 (WI-A grouped): empty assignment → zero blocks, no panic.
+    #[test]
+    fn moe_align_block_size_empty_is_safe() {
+        let assignment = RoutingAssignment {
+            tokens: vec![],
+            experts: vec![],
+            weights: vec![],
+        };
+        let sorted = moe_align_block_size(&assignment, 4, 3);
+        assert_eq!(sorted.num_tokens_post_padded, 0);
+        assert_eq!(sorted.num_blocks(), 0);
+    }
+
+    /// #1 (WI-A grouped): planner maps sorted layout → wave-aligned grid/block.
+    #[test]
+    fn plan_grouped_dispatch_is_wave_aligned() {
+        let assignment = RoutingAssignment {
+            tokens: vec![0, 0, 1, 2],
+            experts: vec![0, 1, 0, 2],
+            weights: vec![0.5; 4],
+        };
+        let sorted = moe_align_block_size(&assignment, 4, 3);
+        for &wave in &[32u32, 64] {
+            let plan = plan_grouped_dispatch(&sorted, wave);
+            assert_eq!(plan.block_x % wave, 0, "grouped block must be wave-aligned");
+            assert!(plan.block_x >= wave);
+            assert_eq!(plan.grid_x, sorted.num_blocks());
         }
     }
 
