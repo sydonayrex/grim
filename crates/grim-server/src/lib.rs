@@ -258,9 +258,18 @@ fn sample_next_token(
     // defense-in-depth after sampling.
     let token = match logits {
         Some(t) => {
-            let last_start = t.len().saturating_sub(vocab_size);
-            let last_logits = &t[last_start..];
-            let sampled = sampler.sample(last_logits, &history).unwrap_or(0);
+            let full_logits = t.to_vec_f32().unwrap_or_default();
+            let last_start = full_logits.len().saturating_sub(vocab_size);
+            let last_logits = &full_logits[last_start..];
+            let sampled = sampler
+                .sample(
+                    &grim_backend_cpu::cpu_tensor(
+                        last_logits.to_vec(),
+                        grim_tensor::Shape::new(vec![last_logits.len()]),
+                    ),
+                    &history,
+                )
+                .unwrap_or(0);
             let max = (vocab_size as u32).saturating_sub(1);
             sampled.min(max)
         }
@@ -274,6 +283,20 @@ fn sample_next_token(
     // instead of a position index.
     engine.record_generated_token(request_id, token);
     Ok(token)
+}
+
+/// Trim the first matched stop sequence from the end of `text`. Returns the
+/// trimmed text and whether a stop sequence was found and removed. This is
+/// applied to both streaming and non-streaming completions so the client
+/// never sees the stop string in the returned content (OpenAI convention).
+fn trim_stop_sequences(text: &str, stop_seqs: &[String]) -> (String, bool) {
+    for seq in stop_seqs {
+        if let Some(pos) = text.rfind(seq) {
+            let trimmed = text[..pos].to_string();
+            return (trimmed, true);
+        }
+    }
+    (text.to_string(), false)
 }
 
 /// WI-1 — Remote-provider scheme allowlist.
@@ -649,6 +672,8 @@ async fn chat_completions(
         "tools",
         "tool_choice",
         "sampler",
+        "reasoning_effort",
+        "thinking",
     ];
     for key in body_obj.keys() {
         if !KNOWN_FIELDS.contains(&key.as_str()) {
@@ -966,6 +991,23 @@ async fn chat_completions(
         .map(|t| t.tokens.len())
         .unwrap_or(65536);
 
+    // TODO(context_length enforcement): `ModelConfig` currently exposes only
+    // `name()` and `modality()` — there is no `context_length()` method, so
+    // the server cannot retrieve the model's actual context window. The value
+    // lives in the catalog (`ModelEntry.context_length`) but is not plumbed
+    // through the engine. Until `ModelConfig::context_length()` exists, we
+    // warn on obviously excessive total lengths (prompt + max_tokens > 1M)
+    // as a coarse safety net. Proper enforcement requires adding the method
+    // to the trait in grim-core and implementing it in each model backend.
+    let total_requested = prompt_tokens.len() + max_tokens as usize;
+    if total_requested > 1_000_000 {
+        eprintln!(
+            "[Server] WARNING: prompt ({} tokens) + max_tokens ({}) = {} tokens \
+             exceeds 1M. Context-length enforcement pending (see TODO above).",
+            prompt_tokens.len(), max_tokens, total_requested
+        );
+    }
+
     if stream_requested {
         let state_clone = state.clone();
         let adapter_ids: Vec<u32> = {
@@ -1251,6 +1293,11 @@ async fn chat_completions(
                 break;
             }
         }
+
+        // Trim the stop sequence from the returned content (OpenAI convention:
+        // the stop string is a signal, not part of the output). This makes
+        // non-streaming and streaming consistent: both omit the stop text.
+        let (content, _hit_stop) = trim_stop_sequences(&content, &stop_sequences);
 
         {
             let mut engine = state.engine.lock().unwrap();
@@ -2838,10 +2885,20 @@ pub async fn serve(
                     grim_core::Error::Config(format!("failed to load TLS certificates: {e}"))
                 })?;
 
-        eprintln!("[grim-server] Serving over HTTPS (SSL enabled) on {}", addr);
-        let bind_addr: std::net::SocketAddr = addr
-            .parse()
-            .map_err(|e| grim_core::Error::Config(format!("invalid bind address {addr}: {e}")))?;
+        // Resolve the bind address the same way the non-TLS path does
+        // (TcpListener::bind accepts hostnames; addr.parse() only accepts
+        // numeric IPs). This ensures `--address localhost:11434` works
+        // identically over HTTP and HTTPS.
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| grim_core::Error::Config(format!("bind failed: {e}")))?;
+        let bind_addr = listener
+            .local_addr()
+            .map_err(|e| grim_core::Error::Config(format!("failed to get local addr: {e}")))?;
+        eprintln!(
+            "[grim-server] Serving over HTTPS (SSL enabled) on {}",
+            bind_addr
+        );
         axum_server::bind_rustls(bind_addr, rustls_config)
             .serve(app.into_make_service())
             .await
