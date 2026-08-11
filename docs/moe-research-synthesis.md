@@ -7,7 +7,7 @@ megakernel post (`mok.pdf`). Per-batch detail files (all read-only, none touch g
 |---|---|---|---|
 | A | Routing / router quality | 5 | `/tmp/opencode/moeres1_routing_out.md` |
 | C | Overlap / dispatch / multi-GPU | 6 | `/tmp/opencode/moeres1_analysis.md` |
-| D | Quantization & compression | 6 | `docs/moe-quantization-paper-analysis.md` (this repo) |
+| D | Quantization & compression | 6 | `old/moe-quantization-paper-analysis.md` (this repo) |
 | E | Serving, SLO, parallelism | 10 | `/tmp/opencode/moeres1_out/` |
 | F | Expert residency / offload | 7 | `/tmp/opencode/moeres1_residency_out.md` |
 | — | MoK megakernel (NVL72) | 1 | `mok.pdf` → mapped in `exploding_kittens.md` |
@@ -58,7 +58,7 @@ WMMA / K-streaming / LDS-SiLU version. **This is the plan already in flight.**
 | Load balance / stragglers | R&Q (2602.19938), GEM, MoRE | 1.4× LIS; gap 11.9→23.4% w/ N; 3–4× wall-clock @ M≥4096 |
 | Quant-safety of per-expert layouts | Super-Experts, GEMQ, MC#, DiEP, MoE-APEX, SPECTRA | never-cold SEs; LP bit budgets; ~92% perf at ½ experts |
 | Conv-VRAM expert residency | SMOE, OSDI SLP/DSLP, DALI, TriMoE, MELINOE, Harvest | 8.68×/2.98× prefill, +20.9% decode, 1.2K tok/s, 22.77>15.80 tok/s (residency > count) |
-| Expert-parallel + disaggregation | OSDI SmallEP, FluxMoE, MoE-Hub, ParallelKittens | 1.22× EP; single-hop intra-host A2A; destination-agnostic |
+| Expert-parallel + disaggregation | OSDI SmallEP, FluxMoE, MoE-Hub, ParallelKittens | 1.22× EP; expert paging (3.0×/3.7× @ 256-batch 4k ctx); destination-agnostic |
 | Router cost at large M | MoRE, MEAN | r=64 rank router, fused no-HBM top-k, 6–14% lower PPL |
 | Quant traffic & decode bandwidth | TritonMoE, MoEBlaze, Cost-of-Expertise | −35% memory; 4×; decode memory-bound, 2 batch regimes |
 | Topk threshold for EP | MegaScale-MoE | top-k>6 ⇒ prefer all-gather EP |
@@ -88,7 +88,8 @@ WMMA / K-streaming / LDS-SiLU version. **This is the plan already in flight.**
   safety. Top-3: concurrency-first tuning, self-assisted spec-decode, QoS-buffering+slice-stream+flags.
 - **Residency (F):** DALI greedy heterogeneous placement (≥92% optimal at ~4.5% cost); TriMoE EMA
   warm-tier prefetch; MELINOE/DALI "predictability beats residency" (22.77 vs 15.80 tok/s);
-  LEAST-LOADED EP; Harvest peer-GPU caching; FluxMoE layer-pairing (intra-host A2A); GEM heterogeneous
+  LEAST-LOADED EP; Harvest peer-GPU caching; FluxMoE expert paging (paged expert residency, budget-aware
+  planner); GEM heterogeneous
   placement. Top-3: greedy device assignment + overlap-window migration, EMA predictor, sequence-aware
   eviction.
 - **MoK (NVL72 megakernel):** pull/push dispatch combine (29% higher NVLink util, 5.8× lower signal

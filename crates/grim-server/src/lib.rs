@@ -301,6 +301,46 @@ fn trim_stop_sequences(text: &str, stop_seqs: &[String]) -> (String, bool) {
     (text.to_string(), false)
 }
 
+/// Split model-generated chain-of-thought preambles from the main response
+/// text.  The model is expected to wrap its reasoning in `<think>`...`</think>`
+/// tags (DeepSeek-R1 / Qwen3-Thinking convention).  Returns
+/// `(reasoning_content, clean_content)`: `reasoning_content` is the
+/// concatenation of all text inside think tags; `clean_content` is the
+/// input with all think blocks removed.  When no think blocks are found,
+/// both fields contain the original text.
+fn split_think_content(text: &str) -> (Option<String>, String) {
+    let mut reasoning = String::new();
+    let mut clean = String::new();
+    let mut in_think = false;
+    for part in text.split("<think>") {
+        if in_think {
+            // We're inside a think block — find the closing tag.
+            if let Some(pos) = part.find("</think>") {
+                reasoning.push_str(&part[..pos]);
+                reasoning.push('\n');
+                in_think = false;
+                // Continue processing after the closing tag.
+                let remainder = &part[pos + "</think>".len()..];
+                clean.push_str(remainder);
+            } else {
+                // No closing tag — entire remainder is reasoning.
+                reasoning.push_str(part);
+                reasoning.push('\n');
+                break;
+            }
+        } else {
+            // Outside a think block — this part is clean content, but may
+            // contain the opening tag that triggered the split.
+            clean.push_str(part);
+        }
+    }
+    if reasoning.is_empty() {
+        (None, text.to_string())
+    } else {
+        (Some(reasoning.trim_end().to_string()), clean)
+    }
+}
+
 /// WI-1 — Remote-provider scheme allowlist.
 ///
 /// Only these prefixes (used as `"<scheme>:<model>"`) denote a remote provider
@@ -382,6 +422,7 @@ pub fn is_remote_provider_model(name: &str) -> bool {
 /// function so a `400` can short-circuit response construction.
 fn build_choice_payload(
     content: &str,
+    reasoning_content: Option<&str>,
     tools_active: bool,
     template_family: Option<&str>,
     prior_messages: &[grim_format::ChatMessage],
@@ -395,10 +436,6 @@ fn build_choice_payload(
                 let tool_calls: Vec<serde_json::Value> = calls
                     .iter()
                     .map(|c| {
-                        // WI-TOOLS-4b soft guard: if this exact call already
-                        // appeared >= 2 times in prior history, replace the
-                        // arguments with the diagnostic payload instead of the
-                        // model's raw duplicate call.
                         let repeat_count = tool_parse::count_prior_identical_calls(
                             prior_messages,
                             &c.name,
@@ -425,19 +462,20 @@ fn build_choice_payload(
                     "tool_calls",
                 )
             }
-            // No clean tool-call parse — return the raw completion as ordinary
-            // content with finish_reason "stop", exactly as a non-tool model
-            // turn would.
-            _ => (
-                serde_json::json!({ "role": "assistant", "content": content }),
-                "stop",
-            ),
+            _ => {
+                let mut msg = serde_json::json!({ "role": "assistant", "content": content });
+                if let Some(rc) = reasoning_content {
+                    msg["reasoning_content"] = serde_json::json!(rc);
+                }
+                (msg, "stop")
+            }
         }
     } else {
-        (
-            serde_json::json!({ "role": "assistant", "content": content }),
-            "stop",
-        )
+        let mut msg = serde_json::json!({ "role": "assistant", "content": content });
+        if let Some(rc) = reasoning_content {
+            msg["reasoning_content"] = serde_json::json!(rc);
+        }
+        (msg, "stop")
     };
     serde_json::json!({
         "index": 0,
@@ -497,10 +535,12 @@ fn terminal_tool_delta(
     parse_ctx: &(bool, Option<String>),
     emitted: &str,
     prior_messages: &[grim_format::ChatMessage],
+    reasoning_content: Option<&str>,
 ) -> Option<std::result::Result<axum::response::sse::Event, axum::Error>> {
     let (tools_active, template_family) = parse_ctx;
     let choice = build_choice_payload(
         emitted,
+        reasoning_content,
         *tools_active,
         template_family.as_deref(),
         prior_messages,
@@ -531,6 +571,7 @@ fn terminal_tool_delta(
 /// "Making the error/diagnostic shape actually machine-actionable" § under
 /// WI-TOOLS-4c).
 pub enum ErrorCode {
+    InvalidRequest,
     UnknownField,
     AdapterNotFound,
     DeterminismMismatch,
@@ -543,6 +584,7 @@ pub enum ErrorCode {
 impl ErrorCode {
     pub fn as_str(&self) -> &'static str {
         match self {
+            ErrorCode::InvalidRequest => "invalid_request",
             ErrorCode::UnknownField => "unknown_field",
             ErrorCode::AdapterNotFound => "adapter_not_found",
             ErrorCode::DeterminismMismatch => "determinism_mismatch",
@@ -1004,20 +1046,52 @@ async fn chat_completions(
         .as_ref()
         .and_then(|t| t.eos_token_id);
 
-    // TODO(context_length enforcement): `ModelConfig` currently exposes only
-    // `name()` and `modality()` — there is no `context_length()` method, so
-    // the server cannot retrieve the model's actual context window. The value
-    // lives in the catalog (`ModelEntry.context_length`) but is not plumbed
-    // through the engine. Until `ModelConfig::context_length()` exists, we
-    // warn on obviously excessive total lengths (prompt + max_tokens > 1M)
-    // as a coarse safety net. Proper enforcement requires adding the method
-    // to the trait in grim-core and implementing it in each model backend.
+    // Enforce the model's context window: reject requests whose total
+    // token count (prompt + max_tokens) exceeds the model's reported
+    // context_length. Models that don't report context_length (return 0)
+    // fall back to a best-effort warning for obviously excessive lengths.
+    let model_context_length = {
+        let engine = state.engine.lock().unwrap();
+        engine
+            .loaded_models()
+            .iter()
+            .filter_map(|name| engine.model(name))
+            .next()
+            .map(|m| m.config.context_length())
+            .unwrap_or(0)
+    };
     let total_requested = prompt_tokens.len() + max_tokens as usize;
-    if total_requested > 1_000_000 {
+    if model_context_length > 0 && total_requested > model_context_length as usize {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json({
+                let mut body = request_error(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "prompt ({} tokens) + max_tokens ({}) = {} tokens exceeds \
+                         model context length of {}. Reduce prompt length or max_tokens.",
+                        prompt_tokens.len(),
+                        max_tokens,
+                        total_requested,
+                        model_context_length
+                    ),
+                );
+                body["error"]["context_length"] = serde_json::json!(model_context_length);
+                body["error"]["prompt_tokens"] = serde_json::json!(prompt_tokens.len());
+                body["error"]["max_tokens"] = serde_json::json!(max_tokens);
+                body["error"]["total_requested"] = serde_json::json!(total_requested);
+                body
+            }),
+        )
+            .into_response();
+    } else if total_requested > 1_000_000 {
         eprintln!(
             "[Server] WARNING: prompt ({} tokens) + max_tokens ({}) = {} tokens \
-             exceeds 1M. Context-length enforcement pending (see TODO above).",
-            prompt_tokens.len(), max_tokens, total_requested
+             exceeds 1M. Model context_length = {} (enforcement skipped if 0).",
+            prompt_tokens.len(),
+            max_tokens,
+            total_requested,
+            model_context_length
         );
     }
 
@@ -1112,7 +1186,18 @@ async fn chat_completions(
                         // result (Some terminal delta, or None to close) becomes
                         // the final unfold item; the stream then yields to the
                         // `[DONE]` terminator chained after.
-                        let delta = terminal_tool_delta(&parse_ctx, &emitted, &prior_messages);
+                        let (reasoning_content, clean_emitted) =
+                            if thinking_level != grim_core::sampler::ThinkingLevel::Off {
+                                split_think_content(&emitted)
+                            } else {
+                                (None, emitted.clone())
+                            };
+                        let delta = terminal_tool_delta(
+                            &parse_ctx,
+                            &clean_emitted,
+                            &prior_messages,
+                            reasoning_content.as_deref(),
+                        );
                         return delta.map(|ev| {
                             (
                                 ev,
@@ -1199,9 +1284,20 @@ async fn chat_completions(
                             .to_string();
                     }
                     if hit_stop || hit_eos {
-                        // A stop sequence terminated generation early — same end-
-                        // of-stream tool-call extraction path as max_tokens.
-                        let delta = terminal_tool_delta(&parse_ctx, &emitted, &prior_messages);
+                        // A stop sequence or EOS terminated generation early —
+                        // same end-of-stream tool-call extraction path as max_tokens.
+                        let (reasoning_content, clean_emitted) =
+                            if thinking_level != grim_core::sampler::ThinkingLevel::Off {
+                                split_think_content(&emitted)
+                            } else {
+                                (None, emitted.clone())
+                            };
+                        let delta = terminal_tool_delta(
+                            &parse_ctx,
+                            &clean_emitted,
+                            &prior_messages,
+                            reasoning_content.as_deref(),
+                        );
                         return delta.map(|ev| {
                             (
                                 ev,
@@ -1333,6 +1429,17 @@ async fn chat_completions(
         // non-streaming and streaming consistent: both omit the stop text.
         let (content, _hit_stop) = trim_stop_sequences(&content, &stop_sequences);
 
+        // Thinking output handling: when the model emits <think> blocks,
+        // split them into reasoning_content (chain-of-thought) and clean
+        // content (the actual response). This mirrors DeepSeek-R1 /
+        // Qwen3-Thinking convention where the think preamble is surfaced
+        // separately. Only applies when thinking_level is not Off.
+        let (reasoning_content, content) = if thinking_level != grim_core::sampler::ThinkingLevel::Off {
+            split_think_content(&content)
+        } else {
+            (None, content)
+        };
+
         {
             let mut engine = state.engine.lock().unwrap();
             engine.finish_request(request_id);
@@ -1409,6 +1516,7 @@ async fn chat_completions(
         }
         let choice = build_choice_payload(
             &content,
+            reasoning_content.as_deref(),
             tools_active,
             template_family.as_deref(),
             &messages,
