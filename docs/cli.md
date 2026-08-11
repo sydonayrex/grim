@@ -14,8 +14,8 @@ oversights — they are per-request or config concerns:
   resolved against the local catalog (`grim pull` / `grim list`), or loaded
   explicitly via `POST /v1/models/load`.
 - **Backend**: `GRIM_BACKEND` env var or `grim.toml`.
-- **Sampling** (`temperature`, `top_p`, `top_k`): per-request JSON body fields,
-  or `grim run`'s `--temperature` / `--top_p` / `--top_k` for one-shot CLI use.
+- **Sampling** (`temperature`, `top-p`, `top_k`): per-request JSON body fields,
+  or `grim run`'s `--temperature` / `--top-p` / `--top_k` for one-shot CLI use.
 - **Threads / batch size / KV cache**: `grim.toml` `[server]` and `[scheduler]`
   keys plus `GRIM_CONTEXT` / `GRIM_MEM_BUDGET_MIB` (see `configuration.md`).
 
@@ -40,18 +40,18 @@ One-shot inference or HTTP serving for a model.
 | Flag | Short | Default | Required |
 |---|---|---|---|
 | `model` | - | `default` | No (uses `default` model) |
-| `--prompt` | - | None | No (interactive mode if absent) |
+| `[PROMPT]` | - | None | No (interactive mode if absent) |
 | `--serve` | - | false | No |
 | `--address` | `-a` | `127.0.0.1:11434` | No (only used with `--serve`) |
 | `--config` | `-c` | `grim.toml` | No |
 | `--plugins` | - | `plugins` | No |
 | `--rocml-profile` | - | None | No |
 | `--temperature` | - | `0.7` | No |
-| `--top_p` | - | `0.9` | No |
+| `--top-p` | - | `0.9` | No |
 | `--top_k` | - | `40` | No |
-| `--max_tokens` | - | `256` | No |
+| `--max-tokens` | - | `256` | No |
 | `--seed` | - | `0` (random) | No |
-| `--repeat_penalty` | - | `1.1` | No |
+| `--repeat-penalty` | - | `1.1` | No |
 
 ## `grim bench`
 

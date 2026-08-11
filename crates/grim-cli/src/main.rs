@@ -129,6 +129,9 @@ enum Commands {
     Rm {
         /// Model name or path to delete.
         model: String,
+        /// Skip confirmation prompt.
+        #[arg(short, long)]
+        force: bool,
     },
     /// Stop a currently running model (unload from memory).
     Stop {
@@ -720,6 +723,9 @@ async fn main() -> Result<()> {
                 None
             };
             // Precedence: explicit --address > --host/--port > GRIM_HOST/GRIM_PORT > default.
+            // If --port is given without --host, default host to 127.0.0.1 so the
+            // port is not silently ignored (a missing --host was the most common
+            // cause of "port ignored" reports).
             let effective = if !address.is_empty() {
                 address.clone()
             } else if let (Some(h), Some(p)) = (&host, &port) {
@@ -727,6 +733,8 @@ async fn main() -> Result<()> {
             } else if let (Some(h), None) = (&host, &port) {
                 let env = grim_core::RuntimeEnv::from_env();
                 format!("{h}:{}", env.port.unwrap_or(11434))
+            } else if let (None, Some(p)) = (&host, &port) {
+                format!("127.0.0.1:{p}")
             } else {
                 grim_core::RuntimeEnv::resolve_bind(None)
             };
@@ -867,8 +875,8 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Rm { model } => {
-            if let Err(e) = rm::cmd_rm(&model).await {
+        Commands::Rm { model, force } => {
+            if let Err(e) = rm::cmd_rm(&model, force).await {
                 eprintln!("Remove failed: {e}");
                 std::process::exit(1);
             }
