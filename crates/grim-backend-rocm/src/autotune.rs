@@ -288,8 +288,20 @@ impl Autotuner {
         })?)
     }
 
+    /// Save the JSON snapshot to a file path.
+    pub fn save_to_file(&self, path: &std::path::Path) -> Result<()> {
+        let bytes = self.to_json_bytes()?;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(path, bytes).map_err(|e| {
+            Error::Backend(format!("Autotuner::save_to_file: {}", e))
+        })
+    }
+
     /// Restore from a JSON snapshot.
     pub fn from_json_bytes(
+
         device_ordinal: usize,
         gpu_arch: &'static str,
         bytes: &[u8],

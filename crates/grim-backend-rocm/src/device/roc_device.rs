@@ -435,6 +435,17 @@ impl RocmDevice {
 
         let gpu_target = detect_gpu_arch(ordinal as i32);
         let arch_leak: &'static str = Box::leak(gpu_target.clone().into_boxed_str());
+        let mut autotuner = crate::autotune::Autotuner::for_device(ordinal, arch_leak);
+
+        let cache_path = std::path::PathBuf::from(format!(".autotune_cache/{gpu_target}.json"));
+        if cache_path.exists() {
+            if let Ok(bytes) = std::fs::read(&cache_path) {
+                if let Ok(t) = crate::autotune::Autotuner::from_json_bytes(ordinal, arch_leak, &bytes) {
+                    autotuner = t;
+                }
+            }
+        }
+
         Self {
             ordinal,
             props: RocmDeviceProps {
@@ -446,7 +457,8 @@ impl RocmDevice {
             hsaco_cache: HsacoKernelCache::new(),
             allocator: Arc::new(RocmCachingAllocator::new(ordinal, cap_bytes)),
             scratch_pool: crate::memory::pool::DeviceScratchPool::new(),
-            autotuner: Mutex::new(crate::autotune::Autotuner::for_device(ordinal, arch_leak)),
+            autotuner: Mutex::new(autotuner),
+
 
             module_cache: Mutex::new(HashMap::new()),
             module_load_count: AtomicUsize::new(0),
