@@ -130,45 +130,54 @@ fn benchmark_moe_shape(
             if let Ok(act) = dev.from_cpu(&activations, &out_shape, grim_tensor::DType::F32) {
                 let act_r = act.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
 
-                for _ in 0..num_warmup {
-                    let _ = dev.moe_fused_dispatch(
-                        act_r,
-                        &expert_gate,
-                        &expert_up,
-                        &expert_down,
-                        &assignment,
-                        &out_shape,
-                        hidden,
-                        inter,
-                        1.0,
-                    );
-                }
+                for &bd in block_dims {
+                    for _ in 0..num_warmup {
+                        let _ = dev.moe_fused_dispatch(
+                            act_r,
+                            &expert_gate,
+                            &expert_up,
+                            &expert_down,
+                            &assignment,
+                            &out_shape,
+                            hidden,
+                            inter,
+                            1.0,
+                        );
+                    }
 
-                let t0 = Instant::now();
-                for _ in 0..num_iters {
-                    let _ = dev.moe_fused_dispatch(
-                        act_r,
-                        &expert_gate,
-                        &expert_up,
-                        &expert_down,
-                        &assignment,
-                        &out_shape,
-                        hidden,
-                        inter,
-                        1.0,
-                    );
+                    let t0 = Instant::now();
+                    for _ in 0..num_iters {
+                        let _ = dev.moe_fused_dispatch(
+                            act_r,
+                            &expert_gate,
+                            &expert_up,
+                            &expert_down,
+                            &assignment,
+                            &out_shape,
+                            hidden,
+                            inter,
+                            1.0,
+                        );
+                    }
+                    let elapsed_us = t0.elapsed().as_micros() as u64;
+                    let per_iter_us = (elapsed_us / num_iters.max(1) as u64).max(1);
+                    if per_iter_us < best_us {
+                        best_us = per_iter_us;
+                        best = AutotuneConfig {
+                            block_dim: bd,
+                            tile_kv: (hidden / 4).max(16) as u32,
+                            grid_stride: 1,
+                            cycles_per_invocation: per_iter_us * 1000,
+                        };
+                    }
                 }
-                let elapsed_us = t0.elapsed().as_micros() as u64;
-                let per_iter_us = (elapsed_us / num_iters.max(1) as u64).max(1);
-                return AutotuneConfig {
-                    block_dim: 64,
-                    tile_kv: (hidden / 4).max(16) as u32,
-                    grid_stride: 1,
-                    cycles_per_invocation: per_iter_us * 1000,
-                };
+                if best_us < u64::MAX {
+                    return best;
+                }
             }
         }
     }
+
 
 
     for &bd in block_dims {
