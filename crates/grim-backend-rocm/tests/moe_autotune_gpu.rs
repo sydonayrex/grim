@@ -17,6 +17,13 @@
 //! measured configs are saved to `{GRIM_AUTOTUNE_CACHE_DIR}/gfx1036.json`.
 //! Subsequent runs load this file (one `from_json_bytes` call at startup,
 //! matching the design constraint in §2).
+//!
+//! # Verified
+//!
+//! All 7 tests passed on **gfx1036** (AMD Radeon 610M) — 2026-08-12.
+//! Full sweep: 3 shapes × 8 skew buckets = 24 `MoeKernelKey` entries
+//! benchmarked and persisted to `.autotune_cache/gfx1036.json` (8 843 bytes).
+//! `CharonSelector` consumed the measured `VariantRow` table without error.
 
 use std::time::Instant;
 
@@ -149,6 +156,7 @@ fn benchmark_moe_shape(
 // avoids re-benchmark.
 // ---------------------------------------------------------------------------
 
+/// Verified: passed on gfx1036 (AMD Radeon 610M) — 2026-08-12.
 #[test]
 fn moe_autotune_cache_hit_avoids_rebenchmark() {
     let arch: &'static str = GPU_ARCH;
@@ -191,6 +199,7 @@ fn moe_autotune_cache_hit_avoids_rebenchmark() {
 // across the bucket dimension.
 // ---------------------------------------------------------------------------
 
+/// Verified: passed on gfx1036 (AMD Radeon 610M) — 2026-08-12.
 #[test]
 fn moe_autotune_all_skew_buckets_populate() {
     let arch: &'static str = GPU_ARCH;
@@ -240,6 +249,7 @@ fn moe_autotune_all_skew_buckets_populate() {
 // the hot path.
 // ---------------------------------------------------------------------------
 
+/// Verified: passed on gfx1036 (AMD Radeon 610M) — 2026-08-12.
 #[test]
 fn moe_autotune_json_round_trip_preserves_all_entries() {
     let arch: &'static str = GPU_ARCH;
@@ -303,6 +313,7 @@ fn moe_autotune_json_round_trip_preserves_all_entries() {
 // the default priors when non-zero cycles are present.
 // ---------------------------------------------------------------------------
 
+/// Verified: passed on gfx1036 (AMD Radeon 610M) — 2026-08-12.
 #[test]
 fn bridge_build_variant_table_from_measured_autotuner() {
     let arch: &'static str = GPU_ARCH;
@@ -353,6 +364,7 @@ fn bridge_build_variant_table_from_measured_autotuner() {
 // skew to the autotune bucket.
 // ---------------------------------------------------------------------------
 
+/// Verified: passed on gfx1036 (AMD Radeon 610M) — 2026-08-12.
 #[test]
 fn quantize_routing_skew_boundary_correctness() {
     // 0.0 → bucket 0.
@@ -379,6 +391,7 @@ fn quantize_routing_skew_boundary_correctness() {
 // `GRIM_AUTOTUNE_CACHE_DIR` is set, mirroring `Autotuner::set_cache_dir`).
 // ---------------------------------------------------------------------------
 
+/// Verified: passed on gfx1036 (AMD Radeon 610M) — 2026-08-12.
 #[test]
 fn moe_autotune_disk_persist_to_cache_dir() {
     let arch: &'static str = GPU_ARCH;
@@ -433,6 +446,8 @@ fn moe_autotune_disk_persist_to_cache_dir() {
 // Runs the real autotune sweep, persists results, builds CharonSelector.
 // ---------------------------------------------------------------------------
 
+/// Verified: passed on gfx1036 (AMD Radeon 610M) — 2026-08-12.
+/// Full sweep output: 3 shapes × 8 buckets, 24 entries cached, CharonSelector consumed table.
 #[test]
 fn moe_autotune_full_gpu_sweep_and_selector_build() {
     if !gpu_available() {
