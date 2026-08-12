@@ -1442,7 +1442,7 @@ impl VulkanDevice {
                     VulkanKernel::QuantQ80,
                     n_blocks * 34,
                     DType {
-                        arith: ArithType::F32,
+                        arith: ArithType::U8,
                         storage: DTypeStorage::KQuant(KQuantScheme::Q80),
                     },
                 )
@@ -1451,10 +1451,11 @@ impl VulkanDevice {
                 VulkanKernel::QuantFp8,
                 4 + total,
                 DType {
-                    arith: ArithType::F32,
+                    arith: ArithType::U8,
                     storage: DTypeStorage::FloatPack(FloatPackScheme::Fp8),
                 },
             ),
+
             other => {
                 return Err(Error::Backend(format!(
                     "Vulkan quantize_on_device: unsupported format {:?}",
