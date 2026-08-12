@@ -4378,15 +4378,16 @@ impl RocmDevice {
         // Plan the launch (wave-aligned block, grid over pairs). Pass the
         // device's real wavefront size (W32 on gfx1036, W64 on CDNA).
         let wave = self.wavefront_size() as u32;
-        let tuner_guard = self.autotuner.lock().ok();
+        let mut tuner_guard = self.autotuner.lock().ok();
         let plan = crate::kernels::charon::plan_fused_dispatch_with_autotuner(
             assignment,
             wave,
-            tuner_guard.as_deref(),
+            tuner_guard.as_deref_mut(),
             &self.gpu_target,
             hidden,
             inter,
         );
+
 
 
         if plan.grid_x == 0 {
