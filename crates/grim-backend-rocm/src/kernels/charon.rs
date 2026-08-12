@@ -1036,7 +1036,7 @@ pub(crate) fn plan_fused_dispatch(
 pub(crate) fn plan_fused_dispatch_with_autotuner(
     assignment: &RoutingAssignment,
     wave_size: u32,
-    tuner: Option<&crate::autotune::Autotuner>,
+    tuner: Option<&mut crate::autotune::Autotuner>,
     gpu_arch: &str,
     hidden: usize,
     inter: usize,
@@ -1058,10 +1058,12 @@ pub(crate) fn plan_fused_dispatch_with_autotuner(
         skew_bucket: bucket,
     };
 
-    let block_x = tuner
-        .and_then(|t| t.lookup_moe(&key))
-        .map(|cfg| cfg.block_dim)
-        .unwrap_or_else(|| choose_block_dim(n, wave_size));
+    let fallback_dim = choose_block_dim(n, wave_size);
+    let block_x = match tuner {
+        Some(t) => t.get_or_tune_moe_block_dim(key, fallback_dim),
+        None => fallback_dim,
+    };
+
 
     let grid_x = if n == 0 {
         0

@@ -198,7 +198,26 @@ impl Autotuner {
         self.record_moe(key.clone(), cfg)?;
         Ok(cfg)
     }
+
+    /// Read-through lookup for MoE block dimension, inserting a default tuned config if missing.
+    pub fn get_or_tune_moe_block_dim(
+        &mut self,
+        key: MoeKernelKey,
+        default_block_dim: u32,
+    ) -> u32 {
+        self.get_or_tune_moe(key, |_k| {
+            Ok(AutotuneConfig {
+                block_dim: default_block_dim,
+                tile_kv: 16,
+                grid_stride: 1,
+                cycles_per_invocation: 1000,
+            })
+        })
+        .map(|cfg| cfg.block_dim)
+        .unwrap_or(default_block_dim)
+    }
 }
+
 
 /// On-disk JSON shape. Uses owned `String`s for kernel/arch.
 #[derive(Debug, Serialize, Deserialize)]
