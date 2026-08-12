@@ -1,0 +1,414 @@
+{
+  "gpu_arch": "gfx1036",
+  "entries": [],
+  "moe_entries": [
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 128,
+        "inter": 256,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 0
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 32,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 128,
+        "inter": 256,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 5
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 32,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 512,
+        "inter": 1024,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 0
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 128,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 256,
+        "inter": 512,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 1
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 64,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 128,
+        "inter": 256,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 4
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 32,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 256,
+        "inter": 512,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 5
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 64,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 256,
+        "inter": 512,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 0
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 64,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 256,
+        "inter": 512,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 4
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 64,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 128,
+        "inter": 256,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 6
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 32,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 256,
+        "inter": 512,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 2
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 64,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 128,
+        "inter": 256,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 3
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 32,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 256,
+        "inter": 512,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 6
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 64,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 256,
+        "inter": 512,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 7
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 64,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 256,
+        "inter": 512,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 3
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 64,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 512,
+        "inter": 1024,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 1
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 128,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 512,
+        "inter": 1024,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 2
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 128,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 512,
+        "inter": 1024,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 4
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 128,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 512,
+        "inter": 1024,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 5
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 128,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 512,
+        "inter": 1024,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 7
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 128,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 512,
+        "inter": 1024,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 6
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 128,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 128,
+        "inter": 256,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 1
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 32,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 128,
+        "inter": 256,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 7
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 32,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 128,
+        "inter": 256,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 2
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 32,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    },
+    {
+      "key": {
+        "kernel": "charon_fused_dispatch",
+        "gpu_arch": "gfx1036",
+        "hidden": 512,
+        "inter": 1024,
+        "num_experts": 8,
+        "top_k": 2,
+        "skew_bucket": 3
+      },
+      "config": {
+        "block_dim": 64,
+        "tile_kv": 128,
+        "grid_stride": 1,
+        "cycles_per_invocation": 1000
+      }
+    }
+  ]
+}
