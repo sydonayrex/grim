@@ -148,6 +148,8 @@ pub struct RocmDevice {
     /// Phase-3 §3.1: device scratch pool — a thread-safe, power-of-2-bucketed [see: `hipMalloc`, `get_scratch`]
     pub(crate) scratch_pool: Arc<crate::memory::pool::DeviceScratchPool>,
     /// Loaded HIP modules + resolved entry functions, cached per unique kernel entry. [see: `hipModuleLoad`, `hipModuleGetFunction`]
+    pub(crate) autotuner: Mutex<crate::autotune::Autotuner>,
+
     pub(crate) module_cache: Mutex<HashMap<String, (*mut c_void, *mut c_void)>>,
     /// Real `hipModuleLoad` call count (cache hits excluded). Item 2 acceptance.
     pub(crate) module_load_count: AtomicUsize,
@@ -432,6 +434,7 @@ impl RocmDevice {
             .clamp(128 * 1024 * 1024, 512 * 1024 * 1024);
 
         let gpu_target = detect_gpu_arch(ordinal as i32);
+        let arch_leak: &'static str = Box::leak(gpu_target.clone().into_boxed_str());
         Self {
             ordinal,
             props: RocmDeviceProps {
@@ -443,6 +446,8 @@ impl RocmDevice {
             hsaco_cache: HsacoKernelCache::new(),
             allocator: Arc::new(RocmCachingAllocator::new(ordinal, cap_bytes)),
             scratch_pool: crate::memory::pool::DeviceScratchPool::new(),
+            autotuner: Mutex::new(crate::autotune::Autotuner::for_device(ordinal, arch_leak)),
+
             module_cache: Mutex::new(HashMap::new()),
             module_load_count: AtomicUsize::new(0),
             gpu_target: gpu_target.clone(),
@@ -4330,7 +4335,7 @@ impl RocmDevice {
     /// MoE forward). Until then this is `allow(dead_code)` per the plan's
     /// "device-gated TODO" discipline — not skipped silently.
     #[allow(dead_code)]
-    pub(crate) fn launch_charon_fused_dispatch(
+    pub fn launch_charon_fused_dispatch(
         &self,
         activations: &RocmStorage,
         expert_gate_w_ptr: u64,
@@ -4373,7 +4378,17 @@ impl RocmDevice {
         // Plan the launch (wave-aligned block, grid over pairs). Pass the
         // device's real wavefront size (W32 on gfx1036, W64 on CDNA).
         let wave = self.wavefront_size() as u32;
-        let plan = crate::kernels::charon::plan_fused_dispatch(assignment, wave);
+        let tuner_guard = self.autotuner.lock().ok();
+        let plan = crate::kernels::charon::plan_fused_dispatch_with_autotuner(
+            assignment,
+            wave,
+            tuner_guard.as_deref(),
+            &self.gpu_target,
+            hidden,
+            inter,
+        );
+
+
         if plan.grid_x == 0 {
             // No pairs → nothing to launch; return the active stream.
             return Ok(self.active_stream());
@@ -4439,7 +4454,46 @@ impl RocmDevice {
         Ok(stream)
     }
 
+    /// Fused MoE dispatch helper: allocates output buffer, uploads flat expert weights,
+    /// and launches `grim_moe_fused_dispatch`.
+    pub fn moe_fused_dispatch(
+        &self,
+        activations: &RocmStorage,
+        gate_flat: &[f32],
+        up_flat: &[f32],
+        down_flat: &[f32],
+        assignment: &crate::kernels::charon::RoutingAssignment,
+        out_shape: &Shape,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<(RocmStorage, RocmHandle)> {
+        let gate_buf = self.from_cpu(gate_flat, &Shape::new(vec![gate_flat.len()]), DType::F32)?;
+        let up_buf = self.from_cpu(up_flat, &Shape::new(vec![up_flat.len()]), DType::F32)?;
+        let down_buf = self.from_cpu(down_flat, &Shape::new(vec![down_flat.len()]), DType::F32)?;
+
+        let out_storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let gate_r = gate_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("gate_buf downcast failed".into()))?;
+        let up_r = up_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("up_buf downcast failed".into()))?;
+        let down_r = down_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("down_buf downcast failed".into()))?;
+
+
+        let stream = self.launch_charon_fused_dispatch(
+            activations,
+            gate_r.device_ptr.unwrap(),
+            up_r.device_ptr.unwrap(),
+            down_r.device_ptr.unwrap(),
+            assignment,
+            &out_storage,
+            hidden,
+            inter,
+            routed_scaling_factor,
+        )?;
+        Ok((out_storage, RocmHandle::new(Some(stream))))
+    }
+
     /// Device launcher for the #1 token-sorted (grouped) fused MoE dispatch.
+
     ///
     /// Mirrors `launch_charon_fused_dispatch` but feeds the sorted routing
     /// layout (`SortedRouting`) produced by `moe_align_block_size` and calls

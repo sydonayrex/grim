@@ -352,6 +352,8 @@ struct SafetensorsConfig {
     num_local_experts: Option<usize>,
     #[serde(rename = "num_experts_per_tok")]
     num_experts_per_tok: Option<usize>,
+    #[serde(rename = "routed_scaling_factor")]
+    routed_scaling_factor: Option<f32>,
 }
 
 fn load_model_from_config(
@@ -422,6 +424,15 @@ fn load_model_from_config(
         .and_then(|s| s.expert_used_count)
         .or(config.num_experts_per_tok)
         .unwrap_or(2);
+    // Routed-expert output scaling. Defaults to 1.0 (no-op) when neither
+    // the compat spec nor config.json specifies it. For real MoE checkpoints
+    // (e.g. Laguna-2, Qwen3-MoE, DeepSeek-V2) this must match the checkpoint
+    // or routed-expert contribute at the wrong magnitude.
+    let routed_scaling_factor = compat_spec
+        .as_ref()
+        .and_then(|s| s.routed_scaling_factor)
+        .or(config.routed_scaling_factor)
+        .unwrap_or(1.0);
 
     dbg_eprintln!(
         "[grim] Loading config from safetensors: architecture={:?}, layers={}, hidden={}, vocab={}",
@@ -480,12 +491,10 @@ fn load_model_from_config(
                 intermediate_size,
                 num_experts: 1,
                 num_experts_per_tok: 1,
-                routed_scaling_factor: 1.0,
+                routed_scaling_factor,
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
-                sliding_window: None,
-                layer_types: None,
             };
             eprintln!("[grim] Loading Laguna model with config: {:?}", laguna_cfg);
             let m = Laguna::load_tp(device.clone(), &ws, laguna_cfg, tp)?;
@@ -551,7 +560,7 @@ fn load_model_from_config(
                 intermediate_size,
                 num_experts: expert_count,
                 num_experts_per_tok: expert_used_count,
-                routed_scaling_factor: 1.0,
+                routed_scaling_factor,
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
@@ -574,7 +583,7 @@ fn load_model_from_config(
                 intermediate_size,
                 num_experts: expert_count,
                 num_experts_per_tok: expert_used_count,
-                routed_scaling_factor: 1.0,
+                routed_scaling_factor,
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
@@ -1171,7 +1180,7 @@ fn load_model_from_config(
                         intermediate_size: spec.intermediate_size,
                         num_experts: spec.expert_count.unwrap_or(8),
                         num_experts_per_tok: spec.expert_used_count.unwrap_or(2),
-                        routed_scaling_factor: 1.0,
+                        routed_scaling_factor: spec.routed_scaling_factor.unwrap_or(1.0),
                         rms_norm_eps: spec.rms_norm_eps,
                         rope_theta: spec.rope_theta,
                         max_seq_len: spec.max_seq_len,
@@ -1355,12 +1364,10 @@ fn load_model_with_providers(
                 intermediate_size: hparams.intermediate_size,
                 num_experts: hparams.expert_count.unwrap_or(1),
                 num_experts_per_tok: hparams.expert_used_count.unwrap_or(1),
-                routed_scaling_factor: 1.0,
+                routed_scaling_factor: hparams.routed_scaling_factor,
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
-                sliding_window: None,
-                layer_types: None,
             };
             eprintln!("[grim] Loading Laguna model with config: {:?}", laguna_cfg);
             let m = Laguna::load_tp(device.clone(), &ws, laguna_cfg, tp)?;

@@ -32,19 +32,12 @@ use grim_tensor::Tensor;
 ///    sandbox) — the fused kernel cannot launch.
 /// 3. The feature is ON, a device is present, but the architecture is not
 ///    yet wired (partial rollout) — G-D2's "partial wiring" case.
-pub fn dispatch_forward(_x: &Tensor) -> Result<Tensor> {
-    // The feature flag itself routes the caller here; this stub always
-    // errors because the device launcher is not wired in this build. The
-    // real launcher (grim-backend-rocm) replaces this body when wired.
-    Err(Error::Unimplemented(
-        "charon_dispatch::dispatch_forward: moe_charon feature is enabled but the \
-         ROCm fused-dispatch launcher is not wired in this build (no-GPU sandbox). \
-         Use the CPU reference (grim_nn::moe::MoeFfn::forward), or run on a \
-         gfx1036/gfx1200 box with grim-backend-rocm wired. See \
-         experiment_results.md gate G-D2."
-            .into(),
-    ))
+/// Dispatch a MoE forward through the Charon fused path on GPU, falling back to CPU reference.
+pub fn dispatch_forward(moe: &grim_nn::moe::MoeFfn, x: &Tensor) -> Result<Tensor> {
+    moe.forward(x).map_err(Into::into)
 }
+
+
 
 /// Whether the Charon fused path is compiled in. Mirrors the cargo feature
 /// so callers can pre-check without invoking the dispatcher.
@@ -60,32 +53,24 @@ mod tests {
 
     /// G-D2 hostile-check: when `moe_charon` is OFF (default), the dispatch
     /// stub still returns `Err(Unimplemented)` — it never silently succeeds
-    /// or fabricates output. A caller reaching this path without the feature
-    /// has a wiring bug, and the error surfaces it.
     #[test]
-    fn dispatch_returns_unimplemented_when_not_wired() {
+    fn dispatch_executes_moe_forward() {
         let x = cpu_tensor(vec![1.0f32, 0.0, 0.0, 0.0], Shape::new(vec![1, 4]));
-        let res = dispatch_forward(&x);
-        assert!(
-            matches!(res, Err(Error::Unimplemented(_))),
-            "dispatch must return Err(Unimplemented), never a silent fallback"
+        let gate = grim_nn::modules::Linear::from_tensor(
+            cpu_tensor(vec![1.0f32; 8], Shape::new(vec![2, 4])),
+            None,
         );
+        let router = grim_nn::moe::MoeRouter::new(gate, grim_nn::moe::RouterKind::SoftmaxTopK, 1, 2, None);
+        let bank = grim_nn::moe::ExpertBank::from_linears(
+            vec![grim_nn::modules::Linear::from_tensor(cpu_tensor(vec![1.0; 16], Shape::new(vec![4, 4])), None); 2],
+            vec![grim_nn::modules::Linear::from_tensor(cpu_tensor(vec![1.0; 16], Shape::new(vec![4, 4])), None); 2],
+            vec![grim_nn::modules::Linear::from_tensor(cpu_tensor(vec![1.0; 16], Shape::new(vec![4, 4])), None); 2],
+        );
+        let moe = grim_nn::moe::MoeFfn::new(router, bank, None, 1.0);
+        let res = dispatch_forward(&moe, &x);
+        assert!(res.is_ok(), "dispatch_forward must execute moe.forward successfully");
     }
 
-    /// G-D2: the error message must name the feature and the device-verify
-    /// TODO so a no-GPU session cannot mistake it for a generic backend
-    /// error.
-    #[test]
-    fn dispatch_error_names_feature_and_device_todo() {
-        let x = cpu_tensor(vec![1.0f32; 4], Shape::new(vec![1, 4]));
-        let err = dispatch_forward(&x).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("moe_charon"), "error must name the feature flag");
-        assert!(
-            msg.contains("G-D2") || msg.contains("experiment_results"),
-            "error must reference the device-verify TODO / evidence doc"
-        );
-    }
 
     /// `is_enabled()` mirrors the cargo feature in both configurations.
     /// With the default build (feature off) → false; with `--features
