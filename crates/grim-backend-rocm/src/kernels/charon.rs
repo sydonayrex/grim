@@ -1060,9 +1060,10 @@ pub(crate) fn plan_fused_dispatch_with_autotuner(
 
     let fallback_dim = choose_block_dim(n, wave_size);
     let block_x = match tuner {
-        Some(t) => t.get_or_tune_moe_block_dim(key, fallback_dim),
+        Some(t) => t.get_or_tune_moe_block_dim(&key, fallback_dim),
         None => fallback_dim,
     };
+
 
 
     let grid_x = if n == 0 {
