@@ -58,6 +58,28 @@ impl Default for AutotuneConfig {
     }
 }
 
+/// Cache key for MoE autotuning launch parameters.
+///
+/// Encapsulates model geometry (`hidden`, `inter`, `num_experts`, `top_k`)
+/// and coarse `skew_bucket` (quantized routing skew 0..7) to index MoE tuned configs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MoeKernelKey {
+    pub kernel: String,
+    pub gpu_arch: String,
+    pub hidden: usize,
+    pub inter: usize,
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub skew_bucket: u8,
+}
+
+/// Quantize a continuous routing skew `[0.0, 1.0]` into 8 coarse skew buckets (`0..7`).
+pub fn quantize_routing_skew(skew: f32) -> u8 {
+    let clamped = skew.clamp(0.0, 1.0);
+    let bucket = (clamped * 7.999_f32) as u8;
+    bucket.min(7)
+}
+
 /// Type alias for benchmark closures.
 pub type BenchFn<'a> = dyn FnOnce(KernelKey) -> Result<AutotuneConfig> + Send + 'a;
 
@@ -66,8 +88,10 @@ pub type BenchFn<'a> = dyn FnOnce(KernelKey) -> Result<AutotuneConfig> + Send + 
 pub struct Autotuner {
     device_ordinal: usize,
     gpu_arch: &'static str,
-    /// In-memory cache. Pre-allocated empty.
+    /// In-memory cache for dense GEMM keys.
     cache: HashMap<KernelKey, AutotuneConfig>,
+    /// In-memory cache for MoE keys (`MoeKernelKey`).
+    moe_cache: HashMap<MoeKernelKey, AutotuneConfig>,
     /// Optional on-disk shadow. `None` means "in-memory only".
     cache_dir: Option<PathBuf>,
 }
@@ -79,6 +103,7 @@ impl Autotuner {
             device_ordinal,
             gpu_arch,
             cache: HashMap::new(),
+            moe_cache: HashMap::new(),
             cache_dir: None,
         }
     }
@@ -100,7 +125,7 @@ impl Autotuner {
 
     /// Number of cached entries (in-memory).
     pub fn len(&self) -> usize {
-        self.cache.len()
+        self.cache.len() + self.moe_cache.len()
     }
 
     /// Look up a recorded config. Returns `None` if absent.
@@ -108,9 +133,19 @@ impl Autotuner {
         self.cache.get(&key).copied()
     }
 
+    /// Look up a recorded MoE config. Returns `None` if absent.
+    pub fn lookup_moe(&self, key: &MoeKernelKey) -> Option<AutotuneConfig> {
+        self.moe_cache.get(key).copied()
+    }
+
     /// List of keys currently cached (in arbitrary HashMap order).
     pub fn list_keys(&self) -> Vec<KernelKey> {
         self.cache.keys().copied().collect()
+    }
+
+    /// List of MoE keys currently cached.
+    pub fn list_moe_keys(&self) -> Vec<MoeKernelKey> {
+        self.moe_cache.keys().cloned().collect()
     }
 
     /// Insert a config directly. Used by `get_or_tune` on cache miss. [see: `Err`]
@@ -126,7 +161,19 @@ impl Autotuner {
         Ok(())
     }
 
-    /// Read-through cache: returns the recorded config; if absent, runs [see: `bench`, `rust-gpu-discipline`]
+    /// Insert an MoE config directly.
+    pub fn record_moe(&mut self, key: MoeKernelKey, config: AutotuneConfig) -> Result<()> {
+        if key.gpu_arch != self.gpu_arch {
+            return Err(Error::Backend(format!(
+                "Autotuner::record_moe: architecture mismatch (key.gpu_arch={}, tuner.gpu_arch={})",
+                key.gpu_arch, self.gpu_arch
+            )));
+        }
+        self.moe_cache.insert(key, config);
+        Ok(())
+    }
+
+    /// Read-through cache for standard GEMM keys.
     pub fn get_or_tune<F>(&mut self, key: KernelKey, bench: F) -> Result<AutotuneConfig>
     where
         F: FnOnce(KernelKey) -> Result<AutotuneConfig>,
@@ -138,18 +185,39 @@ impl Autotuner {
         self.record(key, cfg)?;
         Ok(cfg)
     }
+
+    /// Read-through cache for MoE keys.
+    pub fn get_or_tune_moe<F>(&mut self, key: MoeKernelKey, bench: F) -> Result<AutotuneConfig>
+    where
+        F: FnOnce(&MoeKernelKey) -> Result<AutotuneConfig>,
+    {
+        if let Some(cfg) = self.moe_cache.get(&key).copied() {
+            return Ok(cfg);
+        }
+        let cfg = bench(&key)?;
+        self.record_moe(key.clone(), cfg)?;
+        Ok(cfg)
+    }
 }
 
-/// On-disk JSON shape. Uses owned `String`s for kernel/arch so a [see: `HashMap`]
+/// On-disk JSON shape. Uses owned `String`s for kernel/arch.
 #[derive(Debug, Serialize, Deserialize)]
 struct AutotuneSnapshotOwned {
     gpu_arch: String,
     entries: Vec<EntrySnapshotOwned>,
+    #[serde(default)]
+    moe_entries: Vec<MoeEntrySnapshotOwned>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EntrySnapshotOwned {
     key: KernelKeyOwned,
+    config: AutotuneConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MoeEntrySnapshotOwned {
+    key: MoeKernelKey,
     config: AutotuneConfig,
 }
 
@@ -187,13 +255,21 @@ impl Autotuner {
                     config: *v,
                 })
                 .collect(),
+            moe_entries: self
+                .moe_cache
+                .iter()
+                .map(|(k, v)| MoeEntrySnapshotOwned {
+                    key: k.clone(),
+                    config: *v,
+                })
+                .collect(),
         };
         Ok(serde_json::to_vec_pretty(&snap).map_err(|e| {
             Error::Backend(format!("Autotuner::to_json_bytes: serde_json error: {}", e))
         })?)
     }
 
-    /// Restore from a JSON snapshot. Keys whose `gpu_arch` does not [see: `gpu_arch`]
+    /// Restore from a JSON snapshot.
     pub fn from_json_bytes(
         device_ordinal: usize,
         gpu_arch: &'static str,
@@ -208,7 +284,7 @@ impl Autotuner {
         let mut t = Self::for_device(device_ordinal, gpu_arch);
         for e in snap.entries {
             if e.key.gpu_arch == gpu_arch {
-                let kernel_str: &'static str = Box::leak(e.key.kernel.into_boxed_str()); // cache lifetime only.
+                let kernel_str: &'static str = Box::leak(e.key.kernel.into_boxed_str());
                 let arch_str: &'static str = Box::leak(e.key.gpu_arch.into_boxed_str());
                 let key = KernelKey {
                     kernel: kernel_str,
@@ -220,6 +296,12 @@ impl Autotuner {
                 t.cache.insert(key, e.config);
             }
         }
+        for e in snap.moe_entries {
+            if e.key.gpu_arch == gpu_arch {
+                t.moe_cache.insert(e.key, e.config);
+            }
+        }
         Ok(t)
     }
 }
+

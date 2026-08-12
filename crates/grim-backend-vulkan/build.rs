@@ -115,6 +115,7 @@ fn kernels() -> Vec<(&'static str, String)> {
             load_kernel("fused_quant_gemm_q8_0"),
         ),
         ("fused_quant_gemm_fp8", load_kernel("fused_quant_gemm_fp8")),
+        ("moe_fused_dispatch", load_kernel("moe_fused_dispatch")),
     ]
 }
 
@@ -165,6 +166,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/quant_fp8.comp");
     println!("cargo:rerun-if-changed=kernels/fused_quant_gemm_q8_0.comp");
     println!("cargo:rerun-if-changed=kernels/fused_quant_gemm_fp8.comp");
+    println!("cargo:rerun-if-changed=kernels/moe_fused_dispatch.comp");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
 

@@ -49,6 +49,7 @@ unsafe extern "C" {
     fn cudaGetDeviceCount(count: *mut i32) -> i32;
     fn cudaSetDevice(device: i32) -> i32;
     fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
+    fn cudaMemset(devPtr: *mut c_void, value: i32, size: usize) -> i32;
 
     fn cublasCreate_v2(handle: *mut *mut c_void) -> i32;
     fn cublasDestroy_v2(handle: *mut c_void) -> i32;
@@ -363,6 +364,32 @@ impl CudaStorage {
             provenance: QuantProvenance::GrimNative,
             ordinal: device_ordinal,
         })
+    }
+
+    /// Zeroes the backing GPU buffer. `cudaMalloc` does not initialize memory,
+    /// so callers that atomicAdd into otherwise-uninitialized output (e.g. the
+    /// MoE fused-dispatch kernel) must clear it first.
+    pub fn fill_zeroes(&self) -> Result<()> {
+        let dev_ptr = match self.device_ptr {
+            Some(p) => p as *mut c_void,
+            None => return Ok(()),
+        };
+        if unsafe { cudaSetDevice(self.ordinal as i32) } != cudaSuccess {
+            return Err(Error::Backend(format!(
+                "cudaSetDevice failed for device {}",
+                self.ordinal
+            )));
+        }
+        // SAFETY: `cudaMemset` fills `self.bytes` bytes with 0. All callers
+        // allocate f32 buffers whose length is a whole number of bytes.
+        let res = unsafe { cudaMemset(dev_ptr, 0, self.bytes) };
+        if res != cudaSuccess {
+            return Err(Error::Backend(format!(
+                "cudaMemset failed to zero {} bytes (err {})",
+                self.bytes, res
+            )));
+        }
+        Ok(())
     }
 
     /// Copies host data to GPU via cudaMemcpy.
@@ -1605,6 +1632,139 @@ impl CudaDevice {
             if launch_res != 0 {
                 return Err(Error::Backend(format!(
                     "cuLaunchKernel(grim_qkv_attention) failed: {launch_res}"
+                )));
+            }
+        }
+        let compute_handle = Box::new(CudaHandle {
+            completed: Arc::new(Mutex::new(false)),
+        });
+        Ok((Box::new(out_storage), compute_handle))
+    }
+
+    /// Fused grouped MoE dispatch (WI-M5). Mirrors `grim_moe_fused_dispatch` on ROCm
+    /// and `moe_fused_dispatch` on Vulkan: one CUDA thread block per routed
+    /// (token, expert) pair, computing the full SwiGLU expert contribution and
+    /// atomicAdding the `routed_scaling_factor * weight`-scaled result into the
+    /// shared token output. `grid_x = num_pairs`.
+    pub fn moe_fused_dispatch(
+        &self,
+        x: &dyn BackendStorage,
+        gate_w: &dyn BackendStorage,
+        up_w: &dyn BackendStorage,
+        down_w: &dyn BackendStorage,
+        router_tokens: &dyn BackendStorage,
+        router_experts: &dyn BackendStorage,
+        router_weights: &dyn BackendStorage,
+        out_shape: &Shape,
+        hidden: u32,
+        inter: u32,
+        num_experts: u32,
+        batch: u32,
+        routed_scaling_factor: f32,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = x
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("moe_fused_dispatch: x is not CudaStorage".into()))?;
+        let gw_s = gate_w
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("moe_fused_dispatch: gate_w is not CudaStorage".into()))?;
+        let uw_s = up_w
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("moe_fused_dispatch: up_w is not CudaStorage".into()))?;
+        let dw_s = down_w
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| Error::Backend("moe_fused_dispatch: down_w is not CudaStorage".into()))?;
+        let tok_s = router_tokens
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| {
+                Error::Backend("moe_fused_dispatch: router_tokens is not CudaStorage".into())
+            })?;
+        let exp_s = router_experts
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| {
+                Error::Backend("moe_fused_dispatch: router_experts is not CudaStorage".into())
+            })?;
+        let wt_s = router_weights
+            .as_any()
+            .downcast_ref::<CudaStorage>()
+            .ok_or_else(|| {
+                Error::Backend("moe_fused_dispatch: router_weights is not CudaStorage".into())
+            })?;
+        Self::ensure_f32_input("moe_fused_dispatch x", x_s)?;
+        Self::ensure_f32_input("moe_fused_dispatch gate_w", gw_s)?;
+        Self::ensure_f32_input("moe_fused_dispatch up_w", uw_s)?;
+        Self::ensure_f32_input("moe_fused_dispatch down_w", dw_s)?;
+
+        // Output is zero-initialized; the kernel atomicAdds contributions.
+        // cudaMalloc does not zero memory, so clear it explicitly before launch.
+        let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
+        out_storage.fill_zeroes()?;
+        let mut out_ptr = out_storage.device_ptr.unwrap();
+
+        let mut x_ptr = x_s.device_ptr.unwrap();
+        let mut gw_ptr = gw_s.device_ptr.unwrap();
+        let mut uw_ptr = uw_s.device_ptr.unwrap();
+        let mut dw_ptr = dw_s.device_ptr.unwrap();
+        let mut tok_ptr = tok_s.device_ptr.unwrap();
+        let mut exp_ptr = exp_s.device_ptr.unwrap();
+        let mut wt_ptr = wt_s.device_ptr.unwrap();
+        let mut hidden_i = hidden as i32;
+        let mut inter_i = inter as i32;
+        let mut num_experts_i = num_experts as i32;
+        let mut batch_i = batch as i32;
+        let mut rsf = routed_scaling_factor;
+
+        let mut args: [*mut c_void; 13] = [
+            &mut x_ptr as *mut u64 as *mut c_void,
+            &mut gw_ptr as *mut u64 as *mut c_void,
+            &mut uw_ptr as *mut u64 as *mut c_void,
+            &mut dw_ptr as *mut u64 as *mut c_void,
+            &mut tok_ptr as *mut u64 as *mut c_void,
+            &mut exp_ptr as *mut u64 as *mut c_void,
+            &mut wt_ptr as *mut u64 as *mut c_void,
+            &mut out_ptr as *mut u64 as *mut c_void,
+            &mut hidden_i as *mut i32 as *mut c_void,
+            &mut inter_i as *mut i32 as *mut c_void,
+            &mut num_experts_i as *mut i32 as *mut c_void,
+            &mut batch_i as *mut i32 as *mut c_void,
+            &mut rsf as *mut f32 as *mut c_void,
+        ];
+
+        let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
+        let mut func: CUfunction = std::ptr::null_mut();
+        unsafe {
+            let func_name = std::ffi::CString::new("grim_moe_fused_dispatch")
+                .map_err(|e| Error::Backend(format!("invalid kernel name: {e}")))?;
+            let res = cuModuleGetFunction(&mut func, module, func_name.as_ptr());
+            if res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuModuleGetFunction(grim_moe_fused_dispatch) failed: {res}"
+                )));
+            }
+            // grid_x = number of routed pairs (one block per pair).
+            let num_pairs = tok_s.shape.elem_count() as u32;
+            let launch_res = cuLaunchKernel(
+                func,
+                num_pairs,
+                1,
+                1,
+                1,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr() as *mut *mut c_void,
+                std::ptr::null_mut(),
+            );
+            if launch_res != 0 {
+                return Err(Error::Backend(format!(
+                    "cuLaunchKernel(grim_moe_fused_dispatch) failed: {launch_res}"
                 )));
             }
         }
@@ -3230,6 +3390,125 @@ mod tests {
 
         let (out_mul, _) = dev.mul_scalar(x.as_ref(), 0.5, &shape).unwrap();
         assert_eq!(out_mul.to_cpu_vec_f32().unwrap(), vec![2.0, 4.5, 8.0, 12.5]);
+    }
+
+    /// GPU-gated parity test for the fused grouped MoE dispatch kernel.
+    /// Compares the GPU output against a hand-computed CPU reference for a tiny
+    /// 2-expert / 2-token / top-1 routing. Numerical tolerance is loose because
+    /// FP32 atomic adds can reorder; the contract is correctness of the fused
+    /// gate+up SiLU combine + down + routed_scaling_factor accumulate.
+    #[test]
+    fn test_cuda_moe_fused_dispatch_parity() {
+        unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
+        let devices = CudaDevice::probe().unwrap();
+        if devices.is_empty() {
+            return;
+        }
+        let dev = &devices[0];
+
+        let hidden: usize = 4;
+        let inter: usize = 3;
+        let num_experts: usize = 2;
+        let batch: usize = 2;
+        let rsf: f32 = 0.5;
+
+        // activations [batch, hidden]
+        let x_data: Vec<f32> = (0..batch * hidden).map(|i| i as f32 * 0.1).collect();
+        let x = dev.from_cpu(&x_data, &Shape::new(vec![batch, hidden]), DType::F32).unwrap();
+
+        // per-expert gate/up [inter, hidden], down [hidden, inter]
+        let mk = |e: usize, sign: f32| -> Vec<f32> {
+            let mut v = vec![0.0f32; inter * hidden];
+            for i in 0..inter {
+                for h in 0..hidden {
+                    v[i * hidden + h] = sign * (1.0 + (i as f32) * 0.1 + (h as f32) * 0.01 + e as f32);
+                }
+            }
+            v
+        };
+        let gate_flat: Vec<f32> = (0..num_experts).flat_map(|e| mk(e, 1.0)).collect();
+        let up_flat: Vec<f32> = (0..num_experts).flat_map(|e| mk(e, 1.0)).collect();
+        let down_flat: Vec<f32> = (0..num_experts)
+            .flat_map(|e| {
+                let mut v = vec![0.0f32; hidden * inter];
+                for h in 0..hidden {
+                    for i in 0..inter {
+                        v[h * inter + i] = 1.0 + (h as f32) * 0.05 + (i as f32) * 0.02 + e as f32;
+                    }
+                }
+                v
+            })
+            .collect();
+
+        // top-1 routing: token0 -> expert0, token1 -> expert1
+        let rtok = vec![0u32, 1u32];
+        let rexp = vec![0u32, 1u32];
+        let rw = vec![1.0f32, 1.0f32];
+        let num_pairs = rtok.len();
+
+        let gate_buf = dev.from_cpu(&gate_flat, &Shape::new(vec![num_experts * inter * hidden]), DType::F32).unwrap();
+        let up_buf = dev.from_cpu(&up_flat, &Shape::new(vec![num_experts * inter * hidden]), DType::F32).unwrap();
+        let down_buf = dev.from_cpu(&down_flat, &Shape::new(vec![num_experts * hidden * inter]), DType::F32).unwrap();
+        let rtok_bytes: Vec<u8> = rtok.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let rexp_bytes: Vec<u8> = rexp.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let rw_bytes: Vec<u8> = rw.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tok_buf = Box::new(CudaStorage::copy_from_host_raw_bytes(&rtok_bytes, &Shape::new(vec![num_pairs]), DType::F32, 0).unwrap());
+        let exp_buf = Box::new(CudaStorage::copy_from_host_raw_bytes(&rexp_bytes, &Shape::new(vec![num_pairs]), DType::F32, 0).unwrap());
+        let w_buf = Box::new(CudaStorage::copy_from_host_raw_bytes(&rw_bytes, &Shape::new(vec![num_pairs]), DType::F32, 0).unwrap());
+
+        let out_shape = Shape::new(vec![batch, hidden]);
+        let (out, _h) = dev
+            .moe_fused_dispatch(
+                &*x,
+                &*gate_buf,
+                &*up_buf,
+                &*down_buf,
+                &*tok_buf,
+                &*exp_buf,
+                &*w_buf,
+                &out_shape,
+                hidden as u32,
+                inter as u32,
+                num_experts as u32,
+                batch as u32,
+                rsf,
+            )
+            .unwrap();
+        let res = out.to_cpu_vec_f32().unwrap();
+
+        // CPU reference
+        let silu = |a: f32| a / (1.0 + (-a).exp());
+        let dot = |w: &[f32], xx: &[f32]| -> f32 { (0..w.len()).map(|i| w[i] * xx[i]).sum() };
+        for t in 0..batch {
+            let e = rexp[t] as usize;
+            let xt = &x_data[t * hidden..(t + 1) * hidden];
+            let gw = &gate_flat[e * inter * hidden..(e + 1) * inter * hidden];
+            let uw = &up_flat[e * inter * hidden..(e + 1) * inter * hidden];
+            let dw = &down_flat[e * hidden * inter..(e + 1) * hidden * inter];
+            let mut routed = vec![0.0f32; hidden];
+            for h in 0..hidden {
+                let mut acc = 0.0f32;
+                for i in 0..inter {
+                    let g = dot(&gw[i * hidden..i * hidden + hidden], xt);
+                    let u = dot(&uw[i * hidden..i * hidden + hidden], xt);
+                    acc += dw[h * inter + i] * (silu(g) * u);
+                }
+                routed[h] = rsf * acc;
+            }
+            for h in 0..hidden {
+                let got = res[t * hidden + h];
+                let tol = routed[h].abs().max(1.0) * 1e-3 + 1e-3;
+                assert!(
+                    (got - routed[h]).abs() < tol,
+                    "moe tok{} dim{}: gpu {} vs ref {} (tol {})",
+                    t,
+                    h,
+                    got,
+                    routed[h],
+                    tol
+                );
+            }
+        }
     }
 
     #[test]

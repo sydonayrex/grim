@@ -2252,5 +2252,92 @@ mod tests {
             );
         }
     }
+
+    /// WI-Host-1 #1 device-gated parity test for native RoPE HIP kernel.
+    ///
+    /// Verifies that `RocmDevice::rope` yields numeric output matching hand-computed
+    /// split-half RoPE rotation within 1e-4 tolerance when ROCm hardware is present.
+    #[test]
+    fn rocm_native_rope_device_gated_parity() {
+        let dev = match RocmDevice::try_new(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("ROCm device unavailable: skipping rocm_native_rope_device_gated_parity");
+                return;
+            }
+        };
+
+        let dim = 4;
+        let base = 10000.0_f32;
+        let positions = [5u32];
+        let input = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let shape = Shape::new(vec![1, 1, 4]);
+
+        let in_storage = dev.from_cpu(&input, &shape, DType::F32).expect("from_cpu");
+        let (out_storage, _handle) = dev
+            .rope(in_storage.as_ref(), &positions, dim, base, &shape)
+            .expect("dev.rope");
+        let got = out_storage.to_cpu_vec_f32().expect("to_cpu_vec_f32");
+
+        let inv_freq = [1.0_f32, 1.0 / 10000.0_f32.powf(2.0 / 4.0)];
+        let pos = 5.0_f32;
+        let cos_p = [(pos * inv_freq[0]).cos(), (pos * inv_freq[1]).cos()];
+        let sin_p = [(pos * inv_freq[0]).sin(), (pos * inv_freq[1]).sin()];
+        let want = [
+            input[0] * cos_p[0] - input[2] * sin_p[0],
+            input[1] * cos_p[1] - input[3] * sin_p[1],
+            input[2] * cos_p[0] + input[0] * sin_p[0],
+            input[3] * cos_p[1] + input[1] * sin_p[1],
+        ];
+
+        assert_eq!(got.len(), 4);
+        for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (g - w).abs() < 1e-4,
+                "RoPE ROCm device parity mismatch at [{i}]: got {g:.8}, want {w:.8}",
+            );
+        }
+    }
+
+    /// WI-Host-1 #2 device-gated parity test for native broadcast_bias HIP kernel.
+    ///
+    /// Verifies that `RocmDevice::broadcast_bias` correctly tiles 1-D bias into [batch, out_dim]
+    /// matching CPU reference output within 1e-5 tolerance when ROCm hardware is present.
+    #[test]
+    fn rocm_native_broadcast_bias_device_gated_parity() {
+        let dev = match RocmDevice::try_new(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("ROCm device unavailable: skipping rocm_native_broadcast_bias_device_gated_parity");
+                return;
+            }
+        };
+
+        let bias = vec![0.1_f32, 0.2, 0.3, 0.4];
+        let batch = 3;
+        let out_dim = 4;
+        let bias_shape = Shape::new(vec![4]);
+        let out_shape = Shape::new(vec![batch, out_dim]);
+
+        let bias_storage = dev.from_cpu(&bias, &bias_shape, DType::F32).expect("from_cpu");
+        let (out_storage, _handle) = dev
+            .broadcast_bias(bias_storage.as_ref(), batch, out_dim, &out_shape)
+            .expect("dev.broadcast_bias");
+        let got = out_storage.to_cpu_vec_f32().expect("to_cpu_vec_f32");
+
+        let mut want = Vec::with_capacity(batch * out_dim);
+        for _ in 0..batch {
+            want.extend_from_slice(&bias);
+        }
+
+        assert_eq!(got.len(), batch * out_dim);
+        for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (g - w).abs() < 1e-5,
+                "broadcast_bias ROCm device parity mismatch at [{i}]: got {g:.8}, want {w:.8}",
+            );
+        }
+    }
 }
+
 

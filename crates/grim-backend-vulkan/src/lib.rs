@@ -1490,6 +1490,174 @@ impl VulkanDevice {
         run_compute_shader_kernel(ctx, kernel, &buffers, grid_x, 1, 1, Some(&push))?;
         Ok((Box::new(out_storage), Box::new(VulkanHandle)))
     }
+
+    /// Fused grouped MoE dispatch (WI-M5) — `gate+up` SiLU combine + `down`,
+    /// accumulated per routed (token, expert) pair into `out`.
+    ///
+    /// Mirrors the ROCm `grim_moe_fused_dispatch` P-DAFD contract: the host
+    /// pre-expands top-k routing into flat `router_tokens`/`router_experts`/
+    /// `router_weights` arrays (one entry per routed pair), so the kernel does
+    /// no device-side sort and emits no per-expert launch. `out` is
+    /// zero-initialized and the kernel `atomicAdd`s each expert's scaled
+    /// contribution (a token routed to K>1 experts hits K pairs).
+    ///
+    /// Weights are row-major per expert: `gate_w`/`up_w` are
+    /// `[num_experts, inter, hidden]`, `down_w` is `[num_experts, hidden, inter]`.
+    /// `x` is `[batch, hidden]`. `out` is `[batch, hidden]` on this device.
+    pub fn moe_fused_dispatch(
+        &self,
+        x: &dyn BackendStorage,
+        gate_w: &dyn BackendStorage,
+        up_w: &dyn BackendStorage,
+        down_w: &dyn BackendStorage,
+        router_tokens: &dyn BackendStorage,
+        router_experts: &dyn BackendStorage,
+        router_weights: &dyn BackendStorage,
+        out_shape: &Shape,
+        hidden: u32,
+        inter: u32,
+        num_experts: u32,
+        batch: u32,
+        routed_scaling_factor: f32,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = x
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan moe_fused_dispatch: x is not VulkanStorage".into()))?;
+        let gw_s = gate_w
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan moe_fused_dispatch: gate_w is not VulkanStorage".into()))?;
+        let uw_s = up_w
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan moe_fused_dispatch: up_w is not VulkanStorage".into()))?;
+        let dw_s = down_w
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan moe_fused_dispatch: down_w is not VulkanStorage".into()))?;
+        let tok_s = router_tokens
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan moe_fused_dispatch: router_tokens is not VulkanStorage".into()))?;
+        let exp_s = router_experts
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan moe_fused_dispatch: router_experts is not VulkanStorage".into()))?;
+        let wt_s = router_weights
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan moe_fused_dispatch: router_weights is not VulkanStorage".into()))?;
+
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        // Output is zero-initialized; the kernel atomicAdds contributions.
+        let out_storage = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        unsafe {
+            let mut mapped: *mut c_void = std::ptr::null_mut();
+            let res = vkMapMemory(
+                ctx.device,
+                out_storage.memory,
+                0,
+                out_storage.bytes as VkDeviceSize,
+                0,
+                &mut mapped,
+            );
+            if res != VK_SUCCESS {
+                return Err(Error::Backend(format!("vkMapMemory failed with status {res}")));
+            }
+            std::ptr::write_bytes(mapped, 0, out_storage.bytes);
+            vkUnmapMemory(ctx.device, out_storage.memory);
+        }
+
+        let push = push_params(hidden, inter, num_experts, batch, 0, routed_scaling_factor);
+
+        // Number of routed (token, expert) pairs = router_tokens length / 4 (u32 bytes).
+        let num_pairs = (tok_s.bytes / std::mem::size_of::<u32>()) as u32;
+        let grid_x = num_pairs.max(1);
+
+        let buffers = [
+            x_s.buffer,
+            gw_s.buffer,
+            uw_s.buffer,
+            dw_s.buffer,
+            tok_s.buffer,
+            exp_s.buffer,
+            wt_s.buffer,
+            out_storage.buffer,
+        ];
+
+        run_compute_shader_kernel(
+            ctx,
+            VulkanKernel::MoeFusedDispatch,
+            &buffers,
+            grid_x,
+            1,
+            1,
+            Some(&push),
+        )
+        .map_err(|e| Error::Backend(format!("Vulkan moe_fused_dispatch GPU dispatch failed: {e}")))?;
+
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
+    }
+
+    /// Upload a host `f32` slice into a freshly-allocated device buffer.
+    /// Used to stage small CPU-side routing arrays (token/expert/weight) and
+    /// flattened expert weights for `moe_fused_dispatch`.
+    pub fn upload_f32(
+        &self,
+        data: &[f32],
+        shape: &Shape,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.upload_bytes(&bytes, shape, DType::F32)
+    }
+
+    /// Upload a host `u32` slice into a freshly-allocated device buffer.
+    pub fn upload_u32(
+        &self,
+        data: &[u32],
+        shape: &Shape,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.upload_bytes(&bytes, shape, DType { arith: ArithType::U32, storage: DTypeStorage::Native })
+    }
+
+    fn upload_bytes(
+        &self,
+        bytes: &[u8],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let storage = VulkanStorage::alloc_gpu(shape, dtype, ctx.device, ctx.physical_device)?;
+        unsafe {
+            let mut mapped: *mut c_void = std::ptr::null_mut();
+            let res = vkMapMemory(
+                ctx.device,
+                storage.memory,
+                0,
+                storage.bytes as VkDeviceSize,
+                0,
+                &mut mapped,
+            );
+            if res != VK_SUCCESS {
+                return Err(Error::Backend(format!("vkMapMemory failed with status {res}")));
+            }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped as *mut u8, storage.bytes);
+            vkUnmapMemory(ctx.device, storage.memory);
+        }
+        Ok(Box::new(storage))
+    }
 }
 
 impl BackendDevice for VulkanDevice {
@@ -1810,6 +1978,7 @@ impl BackendDevice for VulkanDevice {
 
     fn softmax(
         &self,
+
         x: &dyn BackendStorage,
         out: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
@@ -3488,6 +3657,9 @@ pub enum VulkanKernel {
     QuantFp8,
     FusedQuantGemmQ80,
     FusedQuantGemmFp8,
+    /// Fused grouped MoE dispatch (WI-M5): gate+up SiLU + down, atomicAdd per
+    /// routed (token, expert) pair. FP32 base case.
+    MoeFusedDispatch,
 }
 
 pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
@@ -3538,6 +3710,7 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::QuantFp8 => SPIRV_QUANT_FP8,
         VulkanKernel::FusedQuantGemmQ80 => SPIRV_FUSED_QUANT_GEMM_Q8_0,
         VulkanKernel::FusedQuantGemmFp8 => SPIRV_FUSED_QUANT_GEMM_FP8,
+        VulkanKernel::MoeFusedDispatch => SPIRV_MOE_FUSED_DISPATCH,
     }
 }
 
@@ -3592,6 +3765,7 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::QuantQ80
         | VulkanKernel::QuantFp8
         | VulkanKernel::CommFuseReduce => 2,
+        VulkanKernel::MoeFusedDispatch => 8,
     }
 }
 
@@ -3666,6 +3840,121 @@ fn f32_to_bf16_to_f32(val: f32) -> f32 {
 mod tests {
     use super::*;
     use grim_tensor::{DType, Shape};
+
+    /// GPU-gated parity test for the fused grouped MoE dispatch kernel.
+    /// Runs only when a Vulkan device is present (`cargo test -- --ignored`).
+    /// Compares the GPU output against a hand-computed CPU reference for a
+    /// tiny 2-expert / 2-token / top-1 routing. Numerical tolerance is loose
+    /// because FP32 atomic adds can reorder; the contract is correctness of the
+    /// fused gate+up SiLU combine + down + routed_scaling_factor accumulate.
+    #[test]
+    #[ignore]
+    fn test_vulkan_moe_fused_dispatch_parity() {
+        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+            return;
+        }
+        let dev = VulkanDevice::new();
+        let hidden: usize = 4;
+        let inter: usize = 3;
+        let num_experts: usize = 2;
+        let batch: usize = 2;
+        let rsf: f32 = 0.5;
+
+        // activations [batch, hidden]
+        let x_data: Vec<f32> = (0..batch * hidden).map(|i| i as f32 * 0.1).collect();
+        let x = dev.from_cpu(&x_data, &Shape::new(vec![batch, hidden]), DType::F32).unwrap();
+
+        // per-expert gate/up [inter, hidden], down [hidden, inter] (identity-ish)
+        let mk = |e: usize, sign: f32| -> Vec<f32> {
+            let mut v = vec![0.0f32; inter * hidden];
+            for i in 0..inter {
+                for h in 0..hidden {
+                    v[i * hidden + h] = sign * (1.0 + (i as f32) * 0.1 + (h as f32) * 0.01 + e as f32);
+                }
+            }
+            v
+        };
+        let gate_flat: Vec<f32> = (0..num_experts).flat_map(|e| mk(e, 1.0)).collect();
+        let up_flat: Vec<f32> = (0..num_experts).flat_map(|e| mk(e, 1.0)).collect();
+        let down_flat: Vec<f32> = (0..num_experts)
+            .flat_map(|e| {
+                let mut v = vec![0.0f32; hidden * inter];
+                for h in 0..hidden {
+                    for i in 0..inter {
+                        v[h * inter + i] = 1.0 + (h as f32) * 0.05 + (i as f32) * 0.02 + e as f32;
+                    }
+                }
+                v
+            })
+            .collect();
+
+        // top-1 routing: token0 -> expert0, token1 -> expert1
+        let rtok = vec![0u32, 1u32];
+        let rexp = vec![0u32, 1u32];
+        let rw = vec![1.0f32, 1.0f32];
+        let num_pairs = rtok.len();
+
+        let gate_buf = dev.upload_f32(&gate_flat, &Shape::new(vec![num_experts * inter * hidden])).unwrap();
+        let up_buf = dev.upload_f32(&up_flat, &Shape::new(vec![num_experts * inter * hidden])).unwrap();
+        let down_buf = dev.upload_f32(&down_flat, &Shape::new(vec![num_experts * hidden * inter])).unwrap();
+        let tok_buf = dev.upload_u32(&rtok, &Shape::new(vec![num_pairs])).unwrap();
+        let exp_buf = dev.upload_u32(&rexp, &Shape::new(vec![num_pairs])).unwrap();
+        let w_buf = dev.upload_f32(&rw, &Shape::new(vec![num_pairs])).unwrap();
+
+        let out_shape = Shape::new(vec![batch, hidden]);
+        let (out, _h) = dev
+            .moe_fused_dispatch(
+                x.as_ref(),
+                gate_buf.as_ref(),
+                up_buf.as_ref(),
+                down_buf.as_ref(),
+                tok_buf.as_ref(),
+                exp_buf.as_ref(),
+                w_buf.as_ref(),
+                &out_shape,
+                hidden as u32,
+                inter as u32,
+                num_experts as u32,
+                batch as u32,
+                rsf,
+            )
+            .unwrap();
+        let res = out.to_cpu_vec_f32().unwrap();
+
+        // CPU reference: for each token, expert e, y = (gate*x).silu * (up*x); down*y * rsf.
+        let silu = |a: f32| a / (1.0 + (-a).exp());
+        let dot = |w: &[f32], x: &[f32]| -> f32 { (0..w.len()).map(|i| w[i] * x[i]).sum() };
+        for t in 0..batch {
+            let e = rexp[t] as usize;
+            let xt = &x_data[t * hidden..(t + 1) * hidden];
+            let gw = &gate_flat[e * inter * hidden..(e + 1) * inter * hidden];
+            let uw = &up_flat[e * inter * hidden..(e + 1) * inter * hidden];
+            let dw = &down_flat[e * hidden * inter..(e + 1) * hidden * inter];
+            let mut routed = vec![0.0f32; hidden];
+            for h in 0..hidden {
+                let mut acc = 0.0f32;
+                for i in 0..inter {
+                    let g = dot(&gw[i * hidden..i * hidden + hidden], xt);
+                    let u = dot(&uw[i * hidden..i * hidden + hidden], xt);
+                    acc += dw[h * inter + i] * (silu(g) * u);
+                }
+                routed[h] = rsf * acc;
+            }
+            for h in 0..hidden {
+                let got = res[t * hidden + h];
+                let tol = routed[h].abs().max(1.0) * 1e-3 + 1e-3;
+                assert!(
+                    (got - routed[h]).abs() < tol,
+                    "moe tok{} dim{}: gpu {} vs ref {} (tol {})",
+                    t,
+                    h,
+                    got,
+                    routed[h],
+                    tol
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_vulkan_device_probe() {
@@ -4178,5 +4467,6 @@ pub fn vram_info(_ordinal: usize) -> Option<(u64, u64)> {
             }
         }
     }
+
     None
 }

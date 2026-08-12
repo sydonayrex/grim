@@ -2366,8 +2366,10 @@ version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
  "grim-core",
+ "grim-models-vision",
  "grim-nn",
  "grim-tensor",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 
@@ -2379,6 +2381,7 @@ dependencies = [
  "grim-core",
  "grim-nn",
  "grim-tensor",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 

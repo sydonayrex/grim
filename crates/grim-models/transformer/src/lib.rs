@@ -15,6 +15,7 @@ pub mod lora;
 pub mod minicpm;
 pub mod model;
 pub mod multimodal;
+pub mod muse_glimmer;
 pub mod native_mtp;
 pub mod falcon_h1;
 pub mod t5;
@@ -35,6 +36,7 @@ pub mod commandr;
 pub mod cogvlm;
 pub mod bailingmoe2;
 pub mod bailingmoe;
+pub mod bailingmoe3;
 pub mod hyv3;
 pub mod eagle3;
 pub mod dots1;
@@ -113,7 +115,15 @@ pub mod arcee;
 pub mod codeshell;
 pub mod orion;
 pub mod chameleon;
+pub mod interns2_mobius;
+pub mod kimi_k3;
+pub mod inkling_small;
+pub mod glm5_2;
+pub mod diffusion_gemma;
+pub mod minimax_m3;
 pub mod delta_net_base;
+
+
 
 pub use block::{LlamaBlock, LlamaConfigRefs, LlamaLayerCache};
 pub use configs::{BloomConfig, MoeConfig, PhiConfig, QwenConfig};
@@ -126,7 +136,17 @@ pub use arcee::{Arcee, ArceeConfig};
 pub use chameleon::{Chameleon, ChameleonConfig};
 pub use codeshell::{Codeshell, CodeshellConfig};
 pub use delta_net_base::{DeltaNetBase, DeltaNetBaseConfig};
+pub use diffusion_gemma::{DiffusionGemma, DiffusionGemmaConfig};
+pub use glm5_2::{Glm52, Glm52Config};
+pub use inkling_small::{InklingSmall, InklingSmallConfig};
+pub use interns2_mobius::{InternS2Mobius, InternS2MobiusConfig};
+pub use kimi_k3::{KimiK3, KimiK3Config};
+pub use minimax_m3::{MiniMaxM3, MiniMaxM3Config};
+pub use muse_glimmer::{MuseGlimmer, MuseGlimmerConfig};
 pub use orion::{Orion, OrionConfig};
+
+
+
 pub use starcoder2::{Starcoder2, Starcoder2Config};
 pub use granite_moe::{GraniteMoe, GraniteMoeConfig};
 pub use deepseek2ocr::{DeepSeek2Ocr, DeepSeek2OcrConfig};
@@ -141,6 +161,7 @@ pub use commandr::{CommandR, CommandRConfig};
 pub use cogvlm::{CogVlm, CogVlmConfig};
 pub use bailingmoe2::{BailingMoe2, BailingMoe2Config};
 pub use bailingmoe::{BailingMoe, BailingMoeConfig};
+pub use bailingmoe3::{Ling3Tiny, Ling3TinyConfig};
 pub use hyv3::{HyV3, HyV3Config};
 pub use eagle3::{Eagle3, Eagle3Config};
 pub use dots1::{Dots1, Dots1Config};

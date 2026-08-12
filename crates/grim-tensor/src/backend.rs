@@ -378,6 +378,80 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
+    /// Broadcast a 1-D bias tensor `[out_dim]` into 2-D shape `[batch, out_dim]`.
+    ///
+    /// Contract: replicates the 1-D bias row `batch` times into `out_shape`.
+    /// Used by `broadcast_bias` in `grim-nn::modules` to prevent CPU round-trips.
+    fn broadcast_bias(
+        &self,
+        bias: &dyn BackendStorage,
+        batch: usize,
+        out_dim: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (bias, batch, out_dim, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "broadcast_bias not implemented for this backend".into(),
+        ))
+    }
+
+    /// Depthwise 1D causal convolution decode step on device.
+    fn short_conv1d_causal_step(
+        &self,
+        _x: &dyn BackendStorage,
+        _weight: &dyn BackendStorage,
+        _bias: Option<&dyn BackendStorage>,
+        _conv_state: &dyn BackendStorage,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "short_conv1d_causal_step not implemented for this backend".into(),
+        ))
+    }
+
+    /// KDA gated delta-rule linear recurrence step on device.
+    fn kda_gated_delta_rule_step(
+        &self,
+        _q: &dyn BackendStorage,
+        _k: &dyn BackendStorage,
+        _v: &dyn BackendStorage,
+        _beta: &dyn BackendStorage,
+        _a_gate: &dyn BackendStorage,
+        _recurrent_state: &dyn BackendStorage,
+        _d_k: usize,
+        _d_v: usize,
+        _out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        Err(crate::error::Error::Unimplemented(
+            "kda_gated_delta_rule_step not implemented for this backend".into(),
+        ))
+    }
+
+    /// MLA Q/KV RMSNorm and nope/rope split on device.
+    fn mla_q_kv_norm_split(
+        &self,
+        _q_raw: &dyn BackendStorage,
+        _kv_raw: &dyn BackendStorage,
+        _q_norm_w: &dyn BackendStorage,
+        _kv_norm_w: &dyn BackendStorage,
+        _qk_nope_dim: usize,
+        _qk_rope_dim: usize,
+        _v_dim: usize,
+        _eps: f32,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        Err(crate::error::Error::Unimplemented(
+            "mla_q_kv_norm_split not implemented for this backend".into(),
+        ))
+    }
+
+
+
     /// Fused GQA attention with causal masking.
     ///
     /// Phase-1 contract:

@@ -1294,6 +1294,37 @@ pub fn default_variant_table() -> Vec<VariantRow> {
     ]
 }
 
+/// Build `CharonSelector`'s `Vec<VariantRow>` from measured `Autotuner` configurations.
+///
+/// `moe_autotuning_design.md` §3: replaces static priors in `default_variant_table`
+/// with measured launch parameters from `Autotuner` per skew bucket.
+#[allow(dead_code)]
+pub fn build_variant_table_from_autotuner(
+    tuner: &crate::autotune::Autotuner,
+    gpu_arch: &str,
+) -> Vec<VariantRow> {
+    let mut table = default_variant_table();
+    let moe_keys = tuner.list_moe_keys();
+    if moe_keys.is_empty() {
+        return table;
+    }
+
+    for row in &mut table {
+        let bucket_idx = crate::autotune::quantize_routing_skew(row.skew_bucket);
+        if let Some(matching_key) = moe_keys.iter().find(|k| {
+            k.gpu_arch == gpu_arch && k.skew_bucket == bucket_idx
+        }) {
+            if let Some(cfg) = tuner.lookup_moe(matching_key) {
+                if cfg.cycles_per_invocation > 0 {
+                    row.model.c_bytes_per_wave = (cfg.cycles_per_invocation as f32 / 1e6).clamp(0.01, 10.0);
+                }
+            }
+        }
+    }
+    table
+}
+
+
 /// Compute the routing skew of a histogram — the fraction of tokens going
 /// to the single hottest expert. `0.0` = perfectly uniform, `1.0` = all
 /// tokens to one expert. Used by the reactive matcher; pure, no device.
@@ -1850,4 +1881,33 @@ mod tests {
         assert!(sorted.first().copied().unwrap_or(1.0) < 0.4, "low bucket");
         assert!(sorted.last().copied().unwrap_or(0.0) > 0.6, "high bucket");
     }
+
+    #[test]
+    fn autotune_build_variant_table_from_autotuner() {
+        use crate::autotune::{Autotuner, MoeKernelKey, AutotuneConfig, quantize_routing_skew};
+
+        let mut tuner = Autotuner::for_device(0, "gfx90a");
+        let key = MoeKernelKey {
+            kernel: "grim_moe_fused_grouped".into(),
+            gpu_arch: "gfx90a".into(),
+            hidden: 4096,
+            inter: 14336,
+            num_experts: 8,
+            top_k: 2,
+            skew_bucket: quantize_routing_skew(0.2),
+        };
+        let cfg = AutotuneConfig {
+            block_dim: 256,
+            tile_kv: 64,
+            grid_stride: 1,
+            cycles_per_invocation: 500_000,
+        };
+        tuner.record_moe(key.clone(), cfg).expect("record_moe");
+
+        let table = build_variant_table_from_autotuner(&tuner, "gfx90a");
+        assert_eq!(table.len(), 3);
+        // Row 0 corresponds to skew_bucket 0.2, which matches key.
+        assert!((table[0].model.c_bytes_per_wave - 0.5).abs() < 1e-3);
+    }
 }
+

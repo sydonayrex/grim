@@ -23,8 +23,18 @@
 //!   loader in `grim-models-transformer`).
 
 use grim_backend_cpu::cpu_tensor;
+use grim_tensor::dtype::{DType, QuantProvenance};
+#[cfg(feature = "vulkan-mem")]
+use grim_backend_vulkan::VulkanDevice;
+#[cfg(feature = "cuda-mem")]
+use grim_backend_cuda::CudaDevice;
+#[cfg(feature = "cuda-mem")]
+use grim_backend_cuda::CudaStorage;
+#[cfg(feature = "metal-mem")]
+use grim_backend_metal::MetalDevice;
+use std::sync::Arc;
 use grim_tensor::shape::Shape;
-use grim_tensor::Tensor;
+use grim_tensor::{BackendDevice, BackendStorage, Device, Tensor};
 
 use crate::modules::Linear;
 use crate::varbuilder::WeightSource;
@@ -310,6 +320,34 @@ impl MoeFfn {
 
     /// Correct-but-unoptimized CPU reference forward for `[batch, hidden]`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
+        // WI-M5: when the activation already lives on the Vulkan device (the
+        // model was loaded onto Vulkan) and there is no shared/always-on
+        // expert to fold in, dispatch the fused grouped MoE kernel instead of
+        // materializing every expert on the CPU. Router selection still runs on
+        // the host (matches the CPU reference); only the expert GEMMs move to
+        // GPU fast paths. Each mirrors `grim_moe_fused_dispatch` on the
+        // respective backend; on any backend hiccup we fall through to the
+        // verified CPU reference so the fused path is never wrong.
+        #[cfg(feature = "cuda-mem")]
+        if matches!(x.device(), Device::Cuda(_)) && self.shared_expert.is_none() {
+            if let Ok(out) = self.forward_cuda(x) {
+                return Ok(out);
+            }
+        }
+        #[cfg(feature = "vulkan-mem")]
+        if matches!(x.device(), Device::Vulkan) && self.shared_expert.is_none() {
+            if let Ok(out) = self.forward_vulkan(x) {
+                return Ok(out);
+            }
+            // Any backend hiccup falls back to the verified CPU reference.
+        }
+        #[cfg(feature = "metal-mem")]
+        if matches!(x.device(), Device::Metal(_)) && self.shared_expert.is_none() {
+            if let Ok(out) = self.forward_metal(x) {
+                return Ok(out);
+            }
+        }
+
         let (indices, weights) = self.router.route(x)?;
         let batch = indices.len();
         let hidden = self
@@ -349,6 +387,336 @@ impl MoeFfn {
         }
 
         Ok(cpu_tensor(out_vec, Shape::new(vec![batch, hidden])))
+    }
+
+    /// Vulkan dispatch of the fused grouped MoE kernel (WI-M5).
+    ///
+    /// Flattens each expert's gate/up/down weights into the single contiguous
+    /// `[num_experts, inter, hidden]` / `[num_experts, hidden, inter]` buffers
+    /// the shader expects, expands top-k routing into flat token/expert/weight
+    /// arrays, and launches one workgroup per routed (token, expert) pair. The
+    /// router selection is identical to the CPU reference (host-computed), so
+    /// the only behavioral difference is the expert GEMMs running on the GPU.
+    ///
+    /// NOTE: weights are pulled to the host and re-uploaded as one buffer here
+    /// (a host round-trip). It is correct and matches the CPU reference; caching
+    /// the flattened weight buffers on first use is a follow-up optimization.
+    #[cfg(feature = "vulkan-mem")]
+    fn forward_vulkan(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
+        let (indices, weights) = self.router.route(x)?;
+        let batch = indices.len();
+        let hidden = self
+            .experts
+            .down
+            .first()
+            .map(|l| l.weight.shape().dim(0).unwrap_or(0))
+            .unwrap_or_else(|| x.shape().dims().last().copied().unwrap_or(0));
+        let inter = self
+            .experts
+            .gate
+            .first()
+            .map(|l| l.weight.shape().dim(0).unwrap_or(0))
+            .unwrap_or(0);
+        let num_experts = self.experts.gate.len();
+        if inter == 0 || num_experts == 0 || hidden == 0 {
+            return Err(grim_tensor::error::Error::ShapeMismatch {
+                expected: vec![inter, hidden, num_experts],
+                got: vec![0, 0, 0],
+            });
+        }
+
+        // Flatten expert weights (row-major per expert, outer = expert idx).
+        let mut gate_flat = Vec::with_capacity(num_experts * inter * hidden);
+        let mut up_flat = Vec::with_capacity(num_experts * inter * hidden);
+        let mut down_flat = Vec::with_capacity(num_experts * hidden * inter);
+        for e in 0..num_experts {
+            gate_flat.extend_from_slice(&self.experts.gate[e].weight.to_vec_f32()?);
+            up_flat.extend_from_slice(&self.experts.up[e].weight.to_vec_f32()?);
+            down_flat.extend_from_slice(&self.experts.down[e].weight.to_vec_f32()?);
+        }
+
+        // Expand top-k routing into flat arrays (one entry per routed pair).
+        let mut rtok: Vec<u32> = Vec::new();
+        let mut rexp: Vec<u32> = Vec::new();
+        let mut rw: Vec<f32> = Vec::new();
+        for t in 0..batch {
+            for (rank, &e) in indices[t].iter().enumerate() {
+                rtok.push(t as u32);
+                rexp.push(e as u32);
+                rw.push(weights[t][rank]);
+            }
+        }
+        let num_pairs = rtok.len();
+
+        let dev = VulkanDevice::new();
+        let x_storage: &dyn BackendStorage = &**x.storage();
+        let gate_buf = dev.upload_f32(&gate_flat, &Shape::new(vec![num_experts * inter * hidden]))?;
+        let up_buf = dev.upload_f32(&up_flat, &Shape::new(vec![num_experts * inter * hidden]))?;
+        let down_buf = dev.upload_f32(&down_flat, &Shape::new(vec![num_experts * hidden * inter]))?;
+        let tok_buf = dev.upload_u32(&rtok, &Shape::new(vec![num_pairs]))?;
+        let exp_buf = dev.upload_u32(&rexp, &Shape::new(vec![num_pairs]))?;
+        let w_buf = dev.upload_f32(&rw, &Shape::new(vec![num_pairs]))?;
+
+        let out_shape = Shape::new(vec![batch, hidden]);
+        let (out_storage, _handle) = dev.moe_fused_dispatch(
+            x_storage,
+            &*gate_buf,
+            &*up_buf,
+            &*down_buf,
+            &*tok_buf,
+            &*exp_buf,
+            &*w_buf,
+            &out_shape,
+            hidden as u32,
+            inter as u32,
+            num_experts as u32,
+            batch as u32,
+            self.routed_scaling_factor,
+        )?;
+
+        Ok(Tensor::new(
+            Arc::from(out_storage),
+            out_shape,
+            DType::F32,
+            QuantProvenance::default(),
+            Device::Vulkan,
+        ))
+    }
+
+    /// CUDA dispatch of the fused grouped MoE kernel (WI-M5). Mirrors
+    /// `forward_vulkan`: flattens expert weights, expands top-k routing into flat
+    /// token/expert/weight arrays, and calls `CudaDevice::moe_fused_dispatch`.
+    /// The activation `x` is already `CudaStorage` (model runs on CUDA), so it is
+    /// passed through directly; weights and router arrays are uploaded from host.
+    #[cfg(feature = "cuda-mem")]
+    fn forward_cuda(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
+        let ordinal = match x.device() {
+            Device::Cuda(o) => *o,
+            _ => return Err(grim_tensor::error::Error::Backend(
+                "forward_cuda: x is not on a CUDA device".into(),
+            )),
+        };
+        let (indices, weights) = self.router.route(x)?;
+        let batch = indices.len();
+        let hidden = self
+            .experts
+            .down
+            .first()
+            .map(|l| l.weight.shape().dim(0).unwrap_or(0))
+            .unwrap_or_else(|| x.shape().dims().last().copied().unwrap_or(0));
+        let inter = self
+            .experts
+            .gate
+            .first()
+            .map(|l| l.weight.shape().dim(0).unwrap_or(0))
+            .unwrap_or(0);
+        let num_experts = self.experts.gate.len();
+        if inter == 0 || num_experts == 0 || hidden == 0 {
+            return Err(grim_tensor::error::Error::ShapeMismatch {
+                expected: vec![inter, hidden, num_experts],
+                got: vec![0, 0, 0],
+            });
+        }
+
+        // Flatten expert weights (row-major per expert, outer = expert idx).
+        let mut gate_flat = Vec::with_capacity(num_experts * inter * hidden);
+        let mut up_flat = Vec::with_capacity(num_experts * inter * hidden);
+        let mut down_flat = Vec::with_capacity(num_experts * hidden * inter);
+        for e in 0..num_experts {
+            gate_flat.extend_from_slice(&self.experts.gate[e].weight.to_vec_f32()?);
+            up_flat.extend_from_slice(&self.experts.up[e].weight.to_vec_f32()?);
+            down_flat.extend_from_slice(&self.experts.down[e].weight.to_vec_f32()?);
+        }
+
+        // Expand top-k routing into flat arrays (one entry per routed pair).
+        let mut rtok: Vec<u32> = Vec::new();
+        let mut rexp: Vec<u32> = Vec::new();
+        let mut rw: Vec<f32> = Vec::new();
+        for t in 0..batch {
+            for (rank, &e) in indices[t].iter().enumerate() {
+                rtok.push(t as u32);
+                rexp.push(e as u32);
+                rw.push(weights[t][rank]);
+            }
+        }
+        let num_pairs = rtok.len();
+
+        let dev = CudaDevice::new(ordinal)?;
+        let x_storage: &dyn BackendStorage = &**x.storage();
+        let gate_buf = Box::new(CudaStorage::copy_from_host(
+            &gate_flat,
+            &Shape::new(vec![num_experts * inter * hidden]),
+            DType::F32,
+            ordinal,
+        )?);
+        let up_buf = Box::new(CudaStorage::copy_from_host(
+            &up_flat,
+            &Shape::new(vec![num_experts * inter * hidden]),
+            DType::F32,
+            ordinal,
+        )?);
+        let down_buf = Box::new(CudaStorage::copy_from_host(
+            &down_flat,
+            &Shape::new(vec![num_experts * hidden * inter]),
+            DType::F32,
+            ordinal,
+        )?);
+        // Router arrays are integer; stage the raw u32 bytes (the kernel reads
+        // them as `unsigned int*`). DType label is irrelevant for a raw copy.
+        let rtok_bytes: Vec<u8> = rtok.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let rexp_bytes: Vec<u8> = rexp.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let rw_bytes: Vec<u8> = rw.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tok_buf = Box::new(CudaStorage::copy_from_host_raw_bytes(
+            &rtok_bytes,
+            &Shape::new(vec![num_pairs]),
+            DType::F32,
+            ordinal,
+        )?);
+        let exp_buf = Box::new(CudaStorage::copy_from_host_raw_bytes(
+            &rexp_bytes,
+            &Shape::new(vec![num_pairs]),
+            DType::F32,
+            ordinal,
+        )?);
+        let w_buf = Box::new(CudaStorage::copy_from_host_raw_bytes(
+            &rw_bytes,
+            &Shape::new(vec![num_pairs]),
+            DType::F32,
+            ordinal,
+        )?);
+
+        let out_shape = Shape::new(vec![batch, hidden]);
+        let (out_storage, _handle) = dev.moe_fused_dispatch(
+            x_storage,
+            &*gate_buf,
+            &*up_buf,
+            &*down_buf,
+            &*tok_buf,
+            &*exp_buf,
+            &*w_buf,
+            &out_shape,
+            hidden as u32,
+            inter as u32,
+            num_experts as u32,
+            batch as u32,
+            self.routed_scaling_factor,
+        )?;
+
+        Ok(Tensor::new(
+            Arc::from(out_storage),
+            out_shape,
+            DType::F32,
+            QuantProvenance::default(),
+            Device::Cuda(ordinal),
+        ))
+    }
+
+    /// Metal dispatch of the fused grouped MoE kernel (WI-M5). Mirrors
+    /// `forward_vulkan`/`forward_cuda`: flattens expert weights, expands top-k
+    /// routing into flat (token, expert, weight) arrays, and runs the MSL
+    /// `grim_moe_fused_dispatch` kernel. The router arrays are f32-backed
+    /// (Metal has no integer storage in this crate) and the shader casts them
+    /// back to `int`. On any backend hiccup the caller falls back to the
+    /// verified CPU reference.
+    #[cfg(feature = "metal-mem")]
+    fn forward_metal(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
+        let ordinal = match x.device() {
+            Device::Metal(o) => *o,
+            _ => return Err(grim_tensor::error::Error::Backend(
+                "forward_metal: x is not on a Metal device".into(),
+            )),
+        };
+        let (indices, weights) = self.router.route(x)?;
+        let batch = indices.len();
+        let hidden = self
+            .experts
+            .down
+            .first()
+            .map(|l| l.weight.shape().dim(0).unwrap_or(0))
+            .unwrap_or_else(|| x.shape().dims().last().copied().unwrap_or(0));
+        let inter = self
+            .experts
+            .gate
+            .first()
+            .map(|l| l.weight.shape().dim(0).unwrap_or(0))
+            .unwrap_or(0);
+        let num_experts = self.experts.gate.len();
+        if inter == 0 || num_experts == 0 || hidden == 0 {
+            return Err(grim_tensor::error::Error::ShapeMismatch {
+                expected: vec![inter, hidden, num_experts],
+                got: vec![0, 0, 0],
+            });
+        }
+
+        // Flatten expert weights (row-major per expert, outer = expert idx).
+        let mut gate_flat = Vec::with_capacity(num_experts * inter * hidden);
+        let mut up_flat = Vec::with_capacity(num_experts * inter * hidden);
+        let mut down_flat = Vec::with_capacity(num_experts * hidden * inter);
+        for e in 0..num_experts {
+            gate_flat.extend_from_slice(&self.experts.gate[e].weight.to_vec_f32()?);
+            up_flat.extend_from_slice(&self.experts.up[e].weight.to_vec_f32()?);
+            down_flat.extend_from_slice(&self.experts.down[e].weight.to_vec_f32()?);
+        }
+
+        // Expand top-k routing into flat arrays (one entry per routed pair).
+        let mut rtok: Vec<f32> = Vec::new();
+        let mut rexp: Vec<f32> = Vec::new();
+        let mut rw: Vec<f32> = Vec::new();
+        for t in 0..batch {
+            for (rank, &e) in indices[t].iter().enumerate() {
+                rtok.push(t as f32);
+                rexp.push(e as f32);
+                rw.push(weights[t][rank]);
+            }
+        }
+        let num_pairs = rtok.len();
+
+        let dev = MetalDevice::new(ordinal)?;
+        let x_storage: &dyn BackendStorage = &**x.storage();
+        let gate_buf = BackendDevice::from_cpu(&dev, 
+            &gate_flat,
+            &Shape::new(vec![num_experts * inter * hidden]),
+            DType::F32,
+        )?;
+        let up_buf = BackendDevice::from_cpu(&dev, 
+            &up_flat,
+            &Shape::new(vec![num_experts * inter * hidden]),
+            DType::F32,
+        )?;
+        let down_buf = BackendDevice::from_cpu(&dev, 
+            &down_flat,
+            &Shape::new(vec![num_experts * hidden * inter]),
+            DType::F32,
+        )?;
+        // Router arrays are f32-backed (the shader casts back to int).
+        let tok_buf = BackendDevice::from_cpu(&dev, &rtok, &Shape::new(vec![num_pairs]), DType::F32)?;
+        let exp_buf = BackendDevice::from_cpu(&dev, &rexp, &Shape::new(vec![num_pairs]), DType::F32)?;
+        let w_buf = BackendDevice::from_cpu(&dev, &rw, &Shape::new(vec![num_pairs]), DType::F32)?;
+
+        let out_shape = Shape::new(vec![batch, hidden]);
+        let (out_storage, _handle) = dev.moe_fused_dispatch(
+            &*x_storage,
+            &*gate_buf,
+            &*up_buf,
+            &*down_buf,
+            &*tok_buf,
+            &*exp_buf,
+            &*w_buf,
+            &out_shape,
+            hidden as u32,
+            inter as u32,
+            num_experts as u32,
+            batch as u32,
+            self.routed_scaling_factor,
+        )?;
+
+        Ok(Tensor::new(
+            Arc::from(out_storage),
+            out_shape,
+            DType::F32,
+            QuantProvenance::default(),
+            Device::Metal(ordinal),
+        ))
     }
 }
 
@@ -734,6 +1102,204 @@ pub fn apply_srp_sch_gate(
     let consistency = routing_consistency(trace);
     predictor.enabled = consistency >= threshold;
     consistency
+}
+
+// ===========================================================================
+// WI-EP1 — ExpertPlacementMap (host-side, no device required)
+// ===========================================================================
+//
+// charon_kernel_plan_v3.md §3 WI-EP1: "ExpertPlacementMap — which GPU owns
+// which expert, built via `C2plrController::decide()` at expert granularity,
+// capacity-proportional fallback tested under both homogeneous and mixed-GPU
+// synthetic cases."
+//
+// The placement *logic* is host-testable without a device: it consumes the
+// `GpuCapability` snapshots the host already gathers (VRAM, TFLOPS, throttle)
+// and assigns each expert to a rank proportional to that rank's capacity.
+// The on-device dispatch (experts actually firing on their assigned ranks) is
+// device-gated; this struct is the host-side planner that feeds WI-EP2's
+// cross-GPU token dispatch and WI-EP3's combine.
+//
+// Two placement policies:
+//   * `CapacityProportional` — split experts across ranks proportional to a
+//     capacity metric (VRAM, TFLOPS, or a blend). The default; the plan's
+//     "capacity-proportional fallback" requirement.
+//   * `Controller` — defer to `C2plrController::decide()` per expert (the
+//     online-learning path). When the controller's MLP weights are zero
+//     (fresh controller), `decide` falls back to round-robin, so this policy
+//     degrades gracefully; capacity-proportional is the explicit fallback for
+//     the controller's cold-start case.
+//
+// Both policies produce the same `ExpertPlacementMap` shape: a per-expert →
+// rank assignment plus the per-rank load fraction (used by WI-EP2 to size
+// remote-transfer batches and by WI-EP3 to size combine buffers).
+
+use grim_tensor::GpuCapability;
+
+/// Capacity metric used to weight rank assignments in the
+/// capacity-proportional policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityMetric {
+    /// Free VRAM in bytes (`GpuCapability::vram_free_bytes`). The default —
+    /// VRAM is the hard ceiling on expert count per rank, so weighting by
+    /// VRAM avoids OOM on the small-VRAM rank.
+    VramBytes,
+    /// Effective FP16 TFLOPS (`GpuCapability::tflops_fp16`). Better
+    /// throughput-optimal than VRAM when all ranks have enough VRAM but
+    /// differ in compute (e.g. an Instinct paired with a Radeon).
+    Tflops,
+    /// `tflops_fp16 * (1.0 - throttle_pct)` — TFLOPS discounted by the
+    /// current thermal throttle fraction. The reactive metric; the right
+    /// choice under sustained load where throttle is the real bottleneck.
+    ThrottledTflops,
+}
+
+impl Default for CapacityMetric {
+    fn default() -> Self {
+        // VRAM is the safest default: it's the hard capacity ceiling, and a
+        // VRAM-weighted split never OOMs the small-VRAM rank. TFLOPS-based
+        // metrics are an opt-in for throughput tuning once the operator
+        // confirms all ranks have headroom.
+        CapacityMetric::VramBytes
+    }
+}
+
+/// Per-expert → rank assignment for one MoE layer (WI-EP1).
+///
+/// Produced by [`ExpertPlacementMap::build`]. Immutable after construction;
+/// the host rebuilds it when the capability epoch bumps (thermal throttle,
+/// GPU leave) — matches `PlacementCache::sync_epoch`'s invalidation cadence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpertPlacementMap {
+    /// `rank_of_expert[e]` = the rank that owns expert `e`.
+    pub rank_of_expert: Vec<usize>,
+    /// `num_ranks` total (length of the `caps` slice the map was built from).
+    pub num_ranks: usize,
+    /// `load_fraction[r]` = fraction of experts assigned to rank `r`
+    /// (`count_on_rank[r] / num_experts`). Used by WI-EP2 to size remote-
+    /// transfer batches and by WI-EP3 to size combine buffers.
+    pub load_fraction: Vec<f32>,
+    /// The metric the assignment was weighted by (for diagnostics / replay).
+    pub metric: CapacityMetric,
+}
+
+impl ExpertPlacementMap {
+    /// Build a placement map that distributes `num_experts` across the ranks
+    /// described by `caps`, proportional to the chosen capacity `metric`.
+    ///
+    /// The assignment is **greedy by remainder**: each expert goes to the
+    /// rank with the most remaining capacity (capacity_assigned_so_far ≤
+    /// rank's total capacity). This is the standard largest-remainder
+    /// proportional allocation — it minimizes the max load imbalance vs.
+    /// naive round-robin, and it's deterministic given the `caps` order
+    /// (ties broken by ordinal, lowest first — stable across runs).
+    ///
+    /// Host-pure: no device calls. The capacity values come from whatever
+    /// populated `caps` (CapabilityProfiler in production, hand-set values in
+    /// tests). The plan's "homogeneous and mixed-GPU synthetic cases" both
+    /// flow through this same function — the test suite exercises each.
+    pub fn build(
+        num_experts: usize,
+        caps: &[GpuCapability],
+        metric: CapacityMetric,
+    ) -> Self {
+        assert!(num_ranks_nonzero(caps), "ExpertPlacementMap::build: caps must be non-empty");
+        let num_ranks = caps.len();
+        let capacities: Vec<f64> = caps.iter().map(|c| capacity_of(c, metric)).collect();
+        // Greedy largest-remainder: track each rank's assigned load (in the
+        // same capacity units) and place each expert on the rank with the
+        // most remaining headroom.
+        let mut assigned_load = vec![0.0f64; num_ranks];
+        let mut rank_of_expert = vec![0usize; num_experts];
+        let mut count_on_rank = vec![0usize; num_ranks];
+        for e in 0..num_experts {
+            // Per-expert capacity cost = 1 unit of "expert load"; we measure
+            // each rank's load as `assigned_load / capacity`, so the rank
+            // with the lowest normalized load has the most headroom.
+            let (best_rank, _) = (0..num_ranks)
+                .map(|r| {
+                    let normalized_load = if capacities[r] > 0.0 {
+                        assigned_load[r] / capacities[r]
+                    } else {
+                        f64::INFINITY
+                    };
+                    // Tiebreak: lowest ordinal (stable, deterministic).
+                    (r, (normalized_load, caps[r].ordinal))
+                })
+                .min_by(|&(_, (la, oa)), &(_, (lb, ob))| {
+                    la.partial_cmp(&lb)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(oa.cmp(&ob))
+                })
+                .expect("num_ranks > 0");
+            rank_of_expert[e] = best_rank;
+            assigned_load[best_rank] += 1.0;
+            count_on_rank[best_rank] += 1;
+        }
+        let load_fraction: Vec<f32> = count_on_rank
+            .iter()
+            .map(|&c| c as f32 / num_experts as f32)
+            .collect();
+        Self {
+            rank_of_expert,
+            num_ranks,
+            load_fraction,
+            metric,
+        }
+    }
+
+    /// Convenience: which rank owns expert `e`? Returns `None` for an
+    /// out-of-range expert id.
+    pub fn rank_of(&self, expert: usize) -> Option<usize> {
+        self.rank_of_expert.get(expert).copied()
+    }
+
+    /// How many experts are assigned to rank `r`?
+    pub fn count_on_rank(&self, rank: usize) -> usize {
+        self.rank_of_expert.iter().filter(|&&r| r == rank).count()
+    }
+
+    /// True iff expert `e` is owned by rank `r`. WI-EP2's dispatch planner
+    /// uses this to decide local-vs-remote for each (token, expert) pair.
+    pub fn is_local(&self, expert: usize, rank: usize) -> bool {
+        self.rank_of(expert) == Some(rank)
+    }
+
+    /// The maximum load imbalance ratio across ranks
+    /// (`max_load / min_load`). 1.0 = perfectly balanced; the
+    /// capacity-proportional policy targets ≤ 1.0 + (1 / num_experts) for
+    /// homogeneous farms. Pinned by the test gate.
+    pub fn max_imbalance(&self) -> f32 {
+        let counts: Vec<f32> = (0..self.num_ranks)
+            .map(|r| self.count_on_rank(r) as f32)
+            .collect();
+        let mx = counts.iter().copied().fold(0.0f32, f32::max);
+        let mn = counts.iter().copied().filter(|&c| c > 0.0).fold(f32::INFINITY, f32::min);
+        if mn.is_finite() && mn > 0.0 {
+            mx / mn
+        } else {
+            f32::INFINITY
+        }
+    }
+}
+
+#[inline]
+fn num_ranks_nonzero(caps: &[GpuCapability]) -> bool {
+    !caps.is_empty()
+}
+
+/// Extract a scalar capacity from a `GpuCapability` per the chosen metric.
+/// Returns `f64` for stable division; never negative (a zero capacity means
+/// "this rank can't host experts" — the greedy allocator then starves it,
+/// which is the correct behavior for a broken/OOM rank).
+fn capacity_of(c: &GpuCapability, metric: CapacityMetric) -> f64 {
+    match metric {
+        CapacityMetric::VramBytes => c.vram_free_bytes as f64,
+        CapacityMetric::Tflops => c.tflops_fp16.max(0.0) as f64,
+        CapacityMetric::ThrottledTflops => {
+            (c.tflops_fp16.max(0.0) * (1.0 - c.throttle_pct.clamp(0.0, 1.0))) as f64
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,5 +1710,179 @@ mod tests {
             "disabled predictor must return identity prior (current top-k), \
              not the distilled forecast — predict() must check self.enabled"
         );
+    }
+
+    // =======================================================================
+    // WI-EP1 — ExpertPlacementMap synthetic-case unit tests.
+    // The plan requires: "capacity-proportional fallback tested under both
+    // homogeneous and mixed-GPU synthetic cases." These pin the placement
+    // logic without a device — the device-side dispatch (experts actually
+    // firing on their assigned ranks) is device-gated per WI-EP2/EP3.
+    // =======================================================================
+
+    /// Helper: build a `GpuCapability` with the load-bearing fields set.
+    fn cap(ordinal: usize, vram_gib: u64, tflops: f32, throttle: f32) -> GpuCapability {
+        GpuCapability {
+            ordinal,
+            tflops_fp16: tflops,
+            tflops_fp8: 0.0,
+            hbm_bandwidth_gbps: 0.0,
+            vram_free_bytes: vram_gib * 1024 * 1024 * 1024,
+            throttle_pct: throttle,
+        }
+    }
+
+    #[test]
+    fn ep1_homogeneous_farm_balances_evenly() {
+        // Two identical Instinct GPUs (same VRAM, same TFLOPS, no throttle).
+        // With 8 experts the capacity-proportional policy must split 4/4 —
+        // the max_imbalance ratio is exactly 1.0.
+        let caps = [cap(0, 64, 100.0, 0.0), cap(1, 64, 100.0, 0.0)];
+        let map = ExpertPlacementMap::build(8, &caps, CapacityMetric::VramBytes);
+        assert_eq!(map.num_ranks, 2);
+        assert_eq!(map.count_on_rank(0), 4);
+        assert_eq!(map.count_on_rank(1), 4);
+        // load_fraction sums to 1.0.
+        let total: f32 = map.load_fraction.iter().sum();
+        assert!((total - 1.0).abs() < 1e-6, "load_fraction must sum to 1.0, got {total}");
+        // Perfectly balanced.
+        assert!((map.max_imbalance() - 1.0).abs() < 1e-6);
+        // Every expert has a valid rank assignment.
+        for e in 0..8 {
+            let r = map.rank_of(e).expect("expert must be assigned");
+            assert!(r < 2);
+            assert!(map.is_local(e, r));
+            assert!(!map.is_local(e, 1 - r));
+        }
+    }
+
+    #[test]
+    fn ep1_mixed_gpu_farm_weights_by_capacity() {
+        // Mixed farm: an Instinct (rank 0, 128 GiB) paired with a consumer
+        // Radeon (rank 1, 16 GiB) — an 8:1 VRAM ratio. The
+        // capacity-proportional policy must give the Instinct ~8× the
+        // experts. With 9 experts the largest-remainder split is 8 on rank
+        // 0, 1 on rank 1 (the closest integer approximation to 8:1).
+        let caps = [cap(0, 128, 100.0, 0.0), cap(1, 16, 30.0, 0.0)];
+        let map = ExpertPlacementMap::build(9, &caps, CapacityMetric::VramBytes);
+        // The Instinct (rank 0) must hold the lion's share.
+        assert!(
+            map.count_on_rank(0) >= 7,
+            "Instinct (rank 0) should hold most experts; got {}",
+            map.count_on_rank(0)
+        );
+        assert!(
+            map.count_on_rank(0) > map.count_on_rank(1),
+            "higher-capacity rank must hold more experts",
+        );
+        // The ratio should approximate the VRAM ratio (8:1) within the
+        // integer-allocation granularity. 8/1, 7/2, or 9/0 are all within
+        // one expert of the ideal 8:1 split.
+        let r0 = map.count_on_rank(0) as f32;
+        let r1 = map.count_on_rank(1) as f32;
+        let ratio = r0 / r1.max(1.0);
+        assert!(
+            ratio >= 3.5,
+            "capacity-proportional split should approximate the 8:1 VRAM ratio; got {ratio}",
+        );
+    }
+
+    #[test]
+    fn ep1_tflops_metric_shifts_balance_vs_vram() {
+        // Two ranks with equal VRAM but different TFLOPS. The VRAM metric
+        // balances 50/50; the TFLOPS metric shifts toward the faster rank.
+        // This pins that the metric selector actually changes the policy.
+        let caps = [cap(0, 64, 100.0, 0.0), cap(1, 64, 50.0, 0.0)];
+        let map_vram = ExpertPlacementMap::build(8, &caps, CapacityMetric::VramBytes);
+        let map_tflops = ExpertPlacementMap::build(8, &caps, CapacityMetric::Tflops);
+        // VRAM metric: balanced 4/4.
+        assert_eq!(map_vram.count_on_rank(0), 4);
+        assert_eq!(map_vram.count_on_rank(1), 4);
+        // TFLOPS metric: rank 0 (2× TFLOPS) gets the majority.
+        assert!(
+            map_tflops.count_on_rank(0) > map_tflops.count_on_rank(1),
+            "TFLOPS metric should shift placement toward the faster rank; \
+             got rank0={} rank1={}",
+            map_tflops.count_on_rank(0),
+            map_tflops.count_on_rank(1),
+        );
+        // The faster rank should hold roughly 2× the experts (8 experts,
+        // 2:1 TFLOPS ratio → 5/3 or 6/2).
+        let t0 = map_tflops.count_on_rank(0) as f32;
+        let t1 = map_tflops.count_on_rank(1) as f32;
+        assert!(t0 / t1.max(1.0) >= 1.5, "TFLOPS-proportional ratio expected ≥ 1.5");
+    }
+
+    #[test]
+    fn ep1_throttled_tflops_reacts_to_thermal() {
+        // Two identical ranks, but rank 1 is thermal-throttled to 50%.
+        // Under `ThrottledTflops`, the throttle rank should hold fewer
+        // experts; under plain `Tflops` (which ignores throttle), the split
+        // would be 50/50. This pins the reactive metric.
+        let caps = [cap(0, 64, 100.0, 0.0), cap(1, 64, 100.0, 0.5)];
+        let map = ExpertPlacementMap::build(8, &caps, CapacityMetric::ThrottledTflops);
+        assert!(
+            map.count_on_rank(0) > map.count_on_rank(1),
+            "throttled rank should hold fewer experts under ThrottledTflops; \
+             got rank0={} rank1={}",
+            map.count_on_rank(0),
+            map.count_on_rank(1),
+        );
+    }
+
+    #[test]
+    fn ep1_three_rank_homogeneous_balances_within_one_expert() {
+        // Three identical ranks, 10 experts. Perfect 10/3 isn't integer, so
+        // the split should be 4/3/3 (the closest integer approximation to
+        // 10/3 per rank). max_imbalance = 4/3 ≈ 1.33.
+        let caps = [
+            cap(0, 64, 100.0, 0.0),
+            cap(1, 64, 100.0, 0.0),
+            cap(2, 64, 100.0, 0.0),
+        ];
+        let map = ExpertPlacementMap::build(10, &caps, CapacityMetric::VramBytes);
+        assert_eq!(map.num_ranks, 3);
+        let counts = [map.count_on_rank(0), map.count_on_rank(1), map.count_on_rank(2)];
+        let total: usize = counts.iter().sum();
+        assert_eq!(total, 10, "every expert must be placed");
+        // Max imbalance ≤ 4/3 (the theoretical floor for 10 experts on 3
+        // ranks with integer allocation). The +0.01 absorbs f32 roundoff.
+        assert!(
+            map.max_imbalance() <= 4.0 / 3.0 + 0.01,
+            "10 experts / 3 ranks should imbalance ≤ 4/3, got {}",
+            map.max_imbalance()
+        );
+    }
+
+    #[test]
+    fn ep1_zero_capacity_rank_starves_not_overloads() {
+        // Rank 1 has zero free VRAM (OOM / no capacity). The greedy
+        // allocator must STARVE it (assign zero experts there), not
+        // round-robin onto an OOM rank. This is the safety property:
+        // capacity-proportional fallback never places an expert where it
+        // can't fit.
+        let caps = [cap(0, 64, 100.0, 0.0), cap(1, 0, 100.0, 0.0)];
+        let map = ExpertPlacementMap::build(8, &caps, CapacityMetric::VramBytes);
+        assert_eq!(
+            map.count_on_rank(1),
+            0,
+            "zero-capacity rank must hold zero experts (capacity-proportional safety)",
+        );
+        assert_eq!(map.count_on_rank(0), 8);
+    }
+
+    #[test]
+    fn ep1_rank_of_returns_none_for_out_of_range_expert() {
+        let caps = [cap(0, 64, 100.0, 0.0)];
+        let map = ExpertPlacementMap::build(4, &caps, CapacityMetric::VramBytes);
+        assert_eq!(map.rank_of(0), Some(0));
+        assert_eq!(map.rank_of(3), Some(0));
+        assert_eq!(map.rank_of(4), None); // out of range
+    }
+
+    #[test]
+    #[should_panic(expected = "caps must be non-empty")]
+    fn ep1_build_panics_on_empty_caps() {
+        let _ = ExpertPlacementMap::build(4, &[], CapacityMetric::VramBytes);
     }
 }
