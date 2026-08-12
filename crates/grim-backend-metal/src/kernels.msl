@@ -1282,3 +1282,56 @@ kernel void grim_dequant_iq4xs(
     }
 }
 
+// ---- Fused grouped MoE dispatch (WI-M5) ----------------------------------
+// One thread per output element of `out` ([batch, hidden]); each thread scans
+// the routed (token, expert) pairs that target its token and accumulates the
+// gated MLP contribution sequentially. Sequential accumulation (no atomics)
+// makes the GPU result bit-for-bit reproducible against the CPU reference,
+// which is what the parity test asserts. Contract matches the Vulkan/CUDA
+// `moe_fused_dispatch` kernels.
+kernel void grim_moe_fused_dispatch(
+    device const float* x [[buffer(0)]],
+    device const float* gate_w [[buffer(1)]],
+    device const float* up_w [[buffer(2)]],
+    device const float* down_w [[buffer(3)]],
+    device const float* router_tokens [[buffer(4)]],
+    device const float* router_experts [[buffer(5)]],
+    device const float* router_weights [[buffer(6)]],
+    device float* out [[buffer(7)]],
+    constant int& hidden [[buffer(8)]],
+    constant int& inter [[buffer(9)]],
+    constant int& num_experts [[buffer(10)]],
+    constant int& batch [[buffer(11)]],
+    constant float& rsf [[buffer(12)]],
+    constant int& num_pairs [[buffer(13)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= uint(batch) || gid.y >= uint(hidden)) return;
+    int tok = int(gid.x);
+    int h = int(gid.y);
+    int x_base = tok * hidden;
+    float acc = 0.0f; // accumulates this (tok,h) output across all routed pairs
+    for (int p = 0; p < num_pairs; ++p) {
+        if (int(router_tokens[p]) != tok) continue;
+        int exp_id = int(router_experts[p]);
+        float weight = router_weights[p];
+        int gw_base = exp_id * inter * hidden;
+        int uw_base = exp_id * inter * hidden;
+        int dw_base = exp_id * hidden * inter;
+        // Gate/up project hidden -> inter. `i` is the inter (expert-inner) index.
+        float down = 0.0f;
+        for (int i = 0; i < inter; ++i) {
+            float g = 0.0f, u = 0.0f;
+            for (int j = 0; j < hidden; ++j) {
+                float xv = x[x_base + j];
+                g += gate_w[gw_base + i * hidden + j] * xv;
+                u += up_w[uw_base + i * hidden + j] * xv;
+            }
+            float a = g / (1.0f + exp(-g)) * u; // silu(g) * u
+            down += down_w[dw_base + h * inter + i] * a;
+        }
+        acc += rsf * weight * down;
+    }
+    out[tok * hidden + h] = acc;
+}
+

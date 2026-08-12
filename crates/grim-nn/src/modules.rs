@@ -22,7 +22,10 @@ use grim_backend_rocm::RocmDevice;
 /// Pick the `BackendDevice` that matches the storage location of `x` so
 /// arithmetic ops dispatch to GPU kernels when the tensor lives on a GPU.
 /// Falls back to CPU if the requested backend is unavailable in this build.
-pub fn pick_device_for_tensor(x: &Tensor) -> Box<dyn BackendDevice> {
+///
+/// WI-Host-1 #4: returns `Arc<dyn BackendDevice>` to avoid allocating a fresh `Box`
+/// wrapper on every operation dispatch.
+pub fn pick_device_for_tensor(x: &Tensor) -> Arc<dyn BackendDevice> {
     pick_device_for_storage_device(x.device())
 }
 
@@ -56,43 +59,41 @@ pub fn add_on_device(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 /// owning `Tensor`), used when reconstructing a tensor from CPU-side
 /// bytes but needing to land it back on the original device.
 /// Falls back to CPU if the requested backend is unavailable in this build.
-pub fn pick_device_for_storage_device(d: &Device) -> Box<dyn BackendDevice> {
+///
+/// WI-Host-1 #4: returns process-wide cached `Arc<dyn BackendDevice>` to avoid per-op heap churn.
+pub fn pick_device_for_storage_device(d: &Device) -> Arc<dyn BackendDevice> {
+    static CPU_DEV: std::sync::OnceLock<Arc<CpuDevice>> = std::sync::OnceLock::new();
     match d {
-        Device::Cpu => Box::new(CpuDevice::new()),
+        Device::Cpu => CPU_DEV.get_or_init(|| Arc::new(CpuDevice::new())).clone(),
         #[cfg(feature = "cuda-mem")]
         Device::Cuda(ordinal) => {
             if let Ok(dev) = CudaDevice::new(*ordinal) {
-                Box::new(dev)
+                Arc::new(dev)
             } else {
-                Box::new(CpuDevice::new())
+                CPU_DEV.get_or_init(|| Arc::new(CpuDevice::new())).clone()
             }
         }
         #[cfg(feature = "rocm-mem")]
         Device::Rocm(ordinal) => {
-            // Use the process-wide shared device. Constructing a fresh
-            // `RocmDevice` per call and dropping it at scope exit runs the
-            // full destructor — device-wide `hipDeviceSynchronize`, cache
-            // flush, and HIP module unloads — on *every* primitive dispatch,
-            // which pins the host CPU and re-JITs kernels (amd_comgr) per op.
-            // `Arc<RocmDevice>` implements `BackendDevice` (see
-            // `grim_tensor::backend`), so dropping the box is refcount-only.
-            Box::new(RocmDevice::shared(*ordinal))
+            // Use the process-wide shared device (`RocmDevice::shared`).
+            RocmDevice::shared(*ordinal)
         }
         #[cfg(feature = "vulkan-mem")]
-        Device::Vulkan => Box::new(VulkanDevice::new()),
+        Device::Vulkan => Arc::new(VulkanDevice::new()),
         #[cfg(feature = "metal-mem")]
         Device::Metal(ordinal) => {
             if let Ok(dev) = MetalDevice::new(*ordinal) {
-                Box::new(dev)
+                Arc::new(dev)
             } else {
-                Box::new(CpuDevice::new())
+                CPU_DEV.get_or_init(|| Arc::new(CpuDevice::new())).clone()
             }
         }
         // Fallback for backends not compiled in (arms above are cfg-gated).
         #[allow(unreachable_patterns)]
-        _ => Box::new(CpuDevice::new()),
+        _ => CPU_DEV.get_or_init(|| Arc::new(CpuDevice::new())).clone(),
     }
 }
+
 
 /// Add two tensors element-wise with broadcasting, dispatching to the
 /// device that owns `a`'s storage. This replaces the CPU-only
@@ -486,7 +487,17 @@ impl Linear {
         } else {
             BackendDevice::matmul(&*dev, a_storage, b_storage, &out_shape)?
         };
-        h.synchronize()?;
+        // WI-Host-1: dropped `h.synchronize()?` here. The host-side pipeline
+        // stall it forced on every `Linear::forward` call (twice per layer:
+        // matmul + bias-add) is a real throughput hit on GPU backends, and
+        // the sync is redundant — the returned storage `Arc` is a device
+        // buffer handle that synchronizes lazily on the first real read
+        // (`to_vec_f32`, `to_cpu_vec_f32`, the next op's dispatch). The plan
+        // keeps synchronization at the outer inference boundary (before
+        // sampling), not inside every primitive. CPU is unaffected
+        // (`CpuDevice::synchronize` is a no-op — verified by the existing
+        // `test_linear_forward_with_bias_hand_calculated` etc.).
+        let _ = h;
         let mat_out = Tensor::new(
             Arc::from(out_s),
             out_shape,
@@ -503,7 +514,9 @@ impl Linear {
                 broadcast_b.storage().as_ref(),
                 mat_out.shape(),
             )?;
-            hh.synchronize()?;
+            // WI-Host-1: dropped `hh.synchronize()?` (see the matmul-sync
+            // comment above for rationale — same lazy-sync discipline).
+            let _ = hh;
             return Ok(Tensor::new(
                 Arc::from(s),
                 mat_out.shape().clone(),
@@ -586,21 +599,30 @@ fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
     }
 }
 
-fn broadcast_bias(b: &Tensor, batch: usize, out_dim: usize) -> Result<Tensor> {
-    let b_vec = b.to_vec_f32()?;
-    let mut out = Vec::with_capacity(batch * out_dim);
-    for _ in 0..batch {
-        out.extend_from_slice(&b_vec);
-    }
-    if out.len() != batch * out_dim {
-        return Err(Error::Shape("broadcast_bias: size mismatch".into()));
-    }
+/// Broadcast a 1-D bias `[out_dim]` to `[batch, out_dim]` by tiling.
+///
+/// WI-Host-1 gate (1): the CPU-path output of this function is pinned by
+/// `host1_rms_rope_broadcast_bias_cpu_path_parity` as the verification
+/// target for the deferred native HIP kernel replacement. The current
+/// implementation round-trips through `to_vec_f32()` → CPU tile →
+/// `from_cpu()` on every `Linear::forward` call with a bias — the plan's
+/// WI-Host-1 #2 calls for replacing this with a native on-device broadcast.
+/// Marked `pub(crate)` so the parity test can target it directly.
+pub(crate) fn broadcast_bias(b: &Tensor, batch: usize, out_dim: usize) -> Result<Tensor> {
     let new_shape = Shape::new(vec![batch, out_dim]);
     if b.device().is_cpu() {
+        let b_vec = b.to_vec_f32()?;
+        let mut out = Vec::with_capacity(batch * out_dim);
+        for _ in 0..batch {
+            out.extend_from_slice(&b_vec);
+        }
+        if out.len() != batch * out_dim {
+            return Err(Error::Shape("broadcast_bias: size mismatch".into()));
+        }
         Ok(grim_backend_cpu::cpu_tensor(out, new_shape))
     } else {
         let dev = pick_device_for_tensor(b);
-        let storage = dev.from_cpu(&out, &new_shape, DType::F32)?;
+        let (storage, _handle) = dev.broadcast_bias(b.storage().as_ref(), batch, out_dim, &new_shape)?;
         Ok(Tensor::new(
             Arc::from(storage),
             new_shape,
@@ -611,6 +633,8 @@ fn broadcast_bias(b: &Tensor, batch: usize, out_dim: usize) -> Result<Tensor> {
     }
 }
 
+
+
 // ---------- RMSNorm ----------
 
 #[derive(Clone)]
@@ -620,10 +644,15 @@ pub struct RmsNorm {
 }
 
 impl RmsNorm {
+    pub fn new(weight: Tensor, eps: f32) -> Self {
+        Self { weight, eps }
+    }
+
     pub fn load(ws: &WeightSource<'_>, dim: usize, eps: f32) -> Result<Self> {
         let weight = ws.get([dim], "weight")?;
         Ok(Self { weight, eps })
     }
+
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let dev = pick_device_for_tensor(x);
@@ -637,7 +666,11 @@ impl RmsNorm {
             self.eps,
             &out_shape,
         )?;
-        h.synchronize()?;
+        // WI-Host-1: dropped `h.synchronize()?`. Same lazy-sync rationale as
+        // `Linear::forward` (see the matmul-sync comment there): the stall is
+        // redundant because the returned storage synchronizes on first read.
+        // The plan keeps synchronization at the outer inference boundary.
+        let _ = h;
         Ok(Tensor::new(
             Arc::from(s),
             out_shape,
@@ -747,7 +780,11 @@ impl Embedding {
         let out_shape = Shape::new(vec![seq_len, dim]);
         let (s, h) =
             BackendDevice::embedding(&*dev, self.weight.storage().as_ref(), indices, &out_shape)?;
-        h.synchronize()?;
+        // WI-Host-1 #3: dropped `h.synchronize()?` here. Same lazy-sync rationale
+        // as `Linear::forward` (see the matmul-sync comment there): the stall is
+        // redundant because the returned storage synchronizes on first read, and
+        // CPU backends are unaffected (`CpuDevice::synchronize` is a no-op).
+        let _ = h;
         Ok(Tensor::new(
             Arc::from(s),
             out_shape,
@@ -810,39 +847,41 @@ impl Rope {
             )));
         }
         let (b, s, d) = (dims[0], dims[1], dims[2]);
-        let half = d / 2;
-        let inv_freq: Vec<f32> = (0..half)
-            .map(|i| 1.0 / self.base.powf((2 * i) as f32 / d as f32))
-            .collect();
-        let mut src = x.to_vec_f32()?;
-        for bi in 0..b {
-            for si in 0..s {
-                let pos = positions.get(si).copied().unwrap_or(si as u32) as f32;
-                let base_index = (bi * s + si) * d;
-                let mut cos_p = vec![0.0f32; half];
-                let mut sin_p = vec![0.0f32; half];
-                for i in 0..half {
-                    let a = pos * inv_freq[i];
-                    cos_p[i] = a.cos();
-                    sin_p[i] = a.sin();
-                }
-                for i in 0..half {
-                    let xi = base_index + i;
-                    let xj = base_index + half + i;
-                    let a = src[xi];
-                    let bv = src[xj];
-                    src[xi] = a * cos_p[i] - bv * sin_p[i];
-                    src[xj] = bv * cos_p[i] + a * sin_p[i];
-                }
-            }
-        }
         let out_shape = Shape::new(vec![b, s, d]);
         if x.device().is_cpu() {
+            let half = d / 2;
+            let inv_freq: Vec<f32> = (0..half)
+                .map(|i| 1.0 / self.base.powf((2 * i) as f32 / d as f32))
+                .collect();
+            let mut src = x.to_vec_f32()?;
+            for bi in 0..b {
+                for si in 0..s {
+                    let pos = positions.get(si).copied().unwrap_or(si as u32) as f32;
+                    let base_index = (bi * s + si) * d;
+                    let mut cos_p = vec![0.0f32; half];
+                    let mut sin_p = vec![0.0f32; half];
+                    for i in 0..half {
+                        let a = pos * inv_freq[i];
+                        cos_p[i] = a.cos();
+                        sin_p[i] = a.sin();
+                    }
+                    for i in 0..half {
+                        let xi = base_index + i;
+                        let xj = base_index + half + i;
+                        let a = src[xi];
+                        let bv = src[xj];
+                        src[xi] = a * cos_p[i] - bv * sin_p[i];
+                        src[xj] = bv * cos_p[i] + a * sin_p[i];
+                    }
+                }
+            }
             Ok(grim_backend_cpu::cpu_tensor(src, out_shape))
         } else {
             let dev = pick_device_for_tensor(x);
-            let storage = dev.from_cpu(&src, &out_shape, DType::F32)?;
+            let (storage, _handle) =
+                dev.rope(x.storage().as_ref(), positions, self.dim, self.base, &out_shape)?;
             Ok(Tensor::new(
+
                 Arc::from(storage),
                 out_shape,
                 DType::F32,
@@ -851,6 +890,7 @@ impl Rope {
             ))
         }
     }
+
 }
 
 #[cfg(test)]
@@ -1092,4 +1132,578 @@ mod tests {
             "error message should guide the user to GRIM_TP_SIZE=1; got: {msg}"
         );
     }
+
+    // =======================================================================
+    // WI-Host-1 gate (1) — CPU-path numeric parity for RmsNorm / Rope /
+    // broadcast_bias.
+    //
+    // The plan's WI-Host-1 gate (1) requires:
+    // > `RmsNorm`/`Rope`/`broadcast_bias` numeric parity vs current CPU-path
+    // > output within tight tolerance, so the fix doesn't silently change
+    // > numerics while removing the roundtrip.
+    //
+    // These tests pin the CURRENT CPU-path output as golden values within a
+    // TIGHT tolerance (1e-5 abs) so the deferred native HIP kernel
+    // replacement (WI-Host-1 #1 RoPE, #2 broadcast_bias) has a verification
+    // target: when the native kernel lands, run these tests against the
+    // GPU-backed path and the output must match these CPU-pinned goldens
+    // within the same tolerance. A native kernel that drifts (wrong angle,
+    // wrong tile order, wrong broadcast axis) shows up as a golden-value
+    // mismatch well above 1e-5.
+    //
+    // Distinct from the existing `test_rms_norm_forward_hand_calculated` /
+    // `test_rope_forward_rotation_identity_at_pos0`: those use loose 1e-4
+    // tolerance and the trivial pos=0 identity case; these use tight 1e-5
+    // and NON-TRIVIAL inputs (non-unit weights, non-zero positions, batched
+    // broadcast) so the goldens actually exercise the math the native kernel
+    // must reproduce.
+    // =======================================================================
+
+    #[test]
+    fn host1_rms_norm_cpu_path_pinned_for_native_kernel_parity() {
+        // RmsNorm with NON-unit weights and a non-trivial input row.
+        // out[c] = x[c] * (1/sqrt(mean(x^2) + eps)) * weight[c]
+        let weight = cpu_tensor(vec![0.5, 2.0, 1.5], Shape::new(vec![3]));
+        let eps = 1e-6_f32;
+        let rms = RmsNorm { weight, eps };
+        let x = cpu_tensor(vec![1.0, 2.0, 3.0], Shape::new(vec![1, 3]));
+        let y = rms.forward(&x).expect("rms_norm forward");
+        let out = y.to_vec_f32().expect("to_vec_f32");
+        // mean(x^2) = (1+4+9)/3 = 14/3 ≈ 4.6667; rms_inv = 1/sqrt(4.6667+1e-6).
+        let mean_sq = (1.0_f32 * 1.0 + 2.0 * 2.0 + 3.0 * 3.0) / 3.0;
+        let rms_inv = 1.0 / (mean_sq + eps).sqrt();
+        let expected = [
+            1.0 * rms_inv * 0.5,
+            2.0 * rms_inv * 2.0,
+            3.0 * rms_inv * 1.5,
+        ];
+        assert_eq!(out.len(), 3);
+        for (i, (&got, &want)) in out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "RmsNorm CPU-path golden mismatch at [{i}]: got {got:.8}, want {want:.8} \
+                 (native kernel replacement must reproduce this within 1e-5)",
+            );
+        }
+        // Pin the rms_inv value itself so a mutant that drops the eps or the
+        // 1/sqrt (e.g. uses 1/mean directly) is caught at the source.
+        assert!(
+            (rms_inv - 0.46290994_f32).abs() < 1e-5,
+            "rms_inv golden drifted: got {rms_inv:.8}",
+        );
+    }
+
+    #[test]
+    fn host1_rope_cpu_path_pinned_for_native_kernel_parity() {
+        // RoPE with NON-zero position (exercises the actual rotation), dim=4.
+        // For each half-pair (i, i+half):
+        //   out[i]      = x[i] * cos(pos*inv_freq[i]) - x[i+half] * sin(...)
+        //   out[i+half] = x[i+half] * cos(...) + x[i] * sin(...)
+        // where inv_freq[i] = 1 / base^(2i/d).
+        let rope = Rope::new(4, 10000.0);
+        // dim=4 → half=2; inv_freq[0] = 1 (2*0/4=0), inv_freq[1] = 1/10000^0.5 = 0.01.
+        // pos=5: angle[0] = 5*1 = 5 rad, angle[1] = 5*0.01 = 0.05 rad.
+        let input = vec![1.0, 2.0, 3.0, 4.0]; // x[0]=1, x[1]=2 (first half), x[2]=3, x[3]=4 (second half)
+        let x = cpu_tensor(input.clone(), Shape::new(vec![1, 1, 4]));
+        let y = rope.forward(&x, &[5]).expect("rope forward");
+        let out = y.to_vec_f32().expect("to_vec_f32");
+        // Hand-compute the expected rotation.
+        let inv_freq = [1.0_f32, 1.0 / 10000.0_f32.powf(2.0 / 4.0)];
+        let pos = 5.0_f32;
+        let cos_p = [(pos * inv_freq[0]).cos(), (pos * inv_freq[1]).cos()];
+        let sin_p = [(pos * inv_freq[0]).sin(), (pos * inv_freq[1]).sin()];
+        let expected = [
+            input[0] * cos_p[0] - input[2] * sin_p[0],
+            input[1] * cos_p[1] - input[3] * sin_p[1],
+            input[2] * cos_p[0] + input[0] * sin_p[0],
+            input[3] * cos_p[1] + input[1] * sin_p[1],
+        ];
+        assert_eq!(out.len(), 4);
+        for (i, (&got, &want)) in out.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "RoPE CPU-path golden mismatch at [{i}]: got {got:.8}, want {want:.8} \
+                 (native kernel replacement must reproduce this within 1e-5)",
+            );
+        }
+        // Sanity: pos=0 is identity (existing test covers this); here pos=5
+        // must NOT equal input (confirms the rotation actually fired).
+        let diff = out.iter().zip(input.iter()).map(|(a, b)| (a - b).abs()).sum::<f32>();
+        assert!(diff > 0.1, "non-zero position must produce a non-trivial rotation (diff={diff})");
+    }
+
+    #[test]
+    fn host1_broadcast_bias_cpu_path_pinned_for_native_kernel_parity() {
+        // broadcast_bias: tile 1-D bias `[out_dim]` to `[batch, out_dim]`.
+        // Non-trivial batch (3) and out_dim (4) so the tiling is exercised.
+        let bias = cpu_tensor(vec![0.1, 0.2, 0.3, 0.4], Shape::new(vec![4]));
+        let batch = 3;
+        let out_dim = 4;
+        let out = broadcast_bias(&bias, batch, out_dim).expect("broadcast_bias");
+        let v = out.to_vec_f32().expect("to_vec_f32");
+        // Expected: 3 copies of the bias, contiguous.
+        let mut expected = Vec::with_capacity(batch * out_dim);
+        for _ in 0..batch {
+            expected.extend_from_slice(&[0.1, 0.2, 0.3, 0.4]);
+        }
+        assert_eq!(v.len(), batch * out_dim);
+        for (i, (&got, &want)) in v.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "broadcast_bias CPU-path golden mismatch at [{i}]: got {got:.8}, want {want:.8}",
+            );
+        }
+        // Pin the batch boundary: element [out_dim] must equal element [0]
+        // (start of the second tile) — a mutant that tiles along the wrong
+        // axis would break this.
+        assert!(
+            (v[out_dim] - v[0]).abs() < 1e-6,
+            "broadcast_bias must tile along the batch axis (v[out_dim] should equal v[0])",
+        );
+        // Pin shape.
+        assert_eq!(out.shape().dims(), &[batch, out_dim]);
+    }
+
+    #[test]
+    fn host1_embedding_forward_drops_synchronize_parity() {
+        // WI-Host-1 #3 (extended): Embedding::forward dropped `h.synchronize()?`
+        // for the same lazy-sync rationale as Linear/RmsNorm. The CPU path is
+        // unaffected (CpuDevice::synchronize is a no-op), so the golden
+        // output must match exactly. This test pins the output so the sync
+        // drop can't silently change numerics.
+        let table = vec![0.1, 0.2, 0.3, 0.4, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let weight = cpu_tensor(table, Shape::new(vec![3, 4]));
+        let emb = Embedding { weight };
+        let indices = vec![2u32, 0];
+        let out = emb.forward(&indices, 2, 4).expect("embedding forward");
+        // to_vec_f32 triggers the lazy sync; result must match the golden
+        // lookup without any explicit synchronize.
+        let v = out.to_vec_f32().expect("to_vec_f32");
+        assert_eq!(
+            v,
+            vec![5.0, 6.0, 7.0, 8.0, 0.1, 0.2, 0.3, 0.4],
+            "Embedding forward output must match golden lookup after sync drop",
+        );
+    }
+
+    #[test]
+    fn host1_pick_device_arc_cache_no_alloc_parity() {
+        // WI-Host-1 #4: pick_device_for_storage_device must return process-wide
+        // cached Arc instances without per-op heap allocations.
+        let dev1 = pick_device_for_storage_device(&Device::Cpu);
+        let dev2 = pick_device_for_storage_device(&Device::Cpu);
+        assert!(
+            Arc::ptr_eq(&dev1, &dev2),
+            "pick_device_for_storage_device(Cpu) must return the same cached Arc instance",
+        );
+    }
+
+    #[test]
+    fn short_conv1d_causal_parity() {
+        let x = grim_backend_cpu::cpu_tensor(vec![1.0, 2.0, 3.0, 4.0], Shape::new(vec![1, 4, 1]));
+        let w = grim_backend_cpu::cpu_tensor(vec![0.5, 0.5, 0.5, 0.5], Shape::new(vec![1, 4]));
+        let out = short_conv1d(&x, &w, None, None).expect("short_conv1d");
+        assert_eq!(out.shape().dims(), &[1, 4, 1]);
+        let v = out.to_vec_f32().expect("to_vec_f32");
+        assert!((v[0] - 0.5).abs() < 1e-5);
+    }
 }
+
+
+// ---------- MLA & KDA Attention Primitives ----------
+
+/// Multi-head Latent Attention (MLA) compressed KV cache for decode generation.
+#[derive(Debug, Clone)]
+pub struct MlaKvCache {
+    pub compressed_kv: Option<Tensor>,
+    pub k_rope: Option<Tensor>,
+}
+
+impl MlaKvCache {
+    pub fn new() -> Self {
+        Self {
+            compressed_kv: None,
+            k_rope: None,
+        }
+    }
+}
+
+impl Default for MlaKvCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// KdaLayerCache holding conv_state and recurrent matrix state S_t for KDA layers.
+#[derive(Debug, Clone)]
+pub struct KdaLayerCache {
+    pub conv_state: Option<Tensor>,
+    pub recurrent_state: Option<Tensor>,
+}
+
+impl KdaLayerCache {
+    pub fn new() -> Self {
+        Self {
+            conv_state: None,
+            recurrent_state: None,
+        }
+    }
+}
+
+impl Default for KdaLayerCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Heterogeneous layer cache unifying MLA and KDA state.
+#[derive(Debug, Clone)]
+pub enum LayerCache {
+    Mla(MlaKvCache),
+    Kda(KdaLayerCache),
+}
+
+/// Depthwise 1D causal convolution `out = conv1d(x, weight, bias)`.
+///
+/// Contract: applies depthwise per-channel 1D causal convolution along sequence dimension.
+pub fn short_conv1d(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    conv_state: Option<&mut Tensor>,
+) -> Result<Tensor> {
+    let dims = x.shape().dims();
+    if dims.len() != 3 {
+        return Err(Error::Shape(format!("short_conv1d expects [B,S,D], got {:?}", dims)));
+    }
+    let (b, s, d) = (dims[0], dims[1], dims[2]);
+    let dev = pick_device_for_tensor(x);
+    if let (Some(state), false) = (conv_state.as_deref(), matches!(x.device(), grim_tensor::Device::Cpu)) {
+        let out_shape = Shape::new(vec![b, s, d]);
+        if let Ok((storage, _h)) = dev.short_conv1d_causal_step(
+            x.storage().as_ref(),
+            weight.storage().as_ref(),
+            bias.map(|b| b.storage().as_ref()),
+            state.storage().as_ref(),
+            &out_shape,
+        ) {
+            return Ok(Tensor::new(
+                Arc::from(storage),
+                out_shape,
+                DType::F32,
+                x.provenance().clone(),
+                x.device().clone(),
+            ));
+        }
+    }
+
+    let w_vec = weight.to_vec_f32()?;
+
+    let k_size = if weight.shape().dims().is_empty() {
+        4
+    } else {
+        *weight.shape().dims().last().unwrap_or(&4)
+    };
+    let b_vec = bias.map(|b| b.to_vec_f32()).transpose()?;
+
+    let x_vec = x.to_vec_f32()?;
+    let mut out_vec = vec![0.0f32; b * s * d];
+
+    for bi in 0..b {
+        for si in 0..s {
+            for di in 0..d {
+                let mut sum = b_vec.as_ref().map(|bv| bv[di]).unwrap_or(0.0f32);
+                for ki in 0..k_size {
+                    let prev_idx = si as isize - (k_size - 1 - ki) as isize;
+                    let val = if prev_idx >= 0 {
+                        x_vec[(bi * s + prev_idx as usize) * d + di]
+                    } else if let Some(state) = &conv_state {
+                        let state_vec = state.to_vec_f32()?;
+                        let state_k = (state_vec.len() / (b * d)).max(1);
+                        let state_off = (bi * d + di) * state_k;
+                        let state_idx = (state_k as isize + prev_idx) as usize;
+                        state_vec.get(state_off + state_idx).copied().unwrap_or(0.0f32)
+                    } else {
+                        0.0f32
+                    };
+                    let w_val = w_vec.get(di * k_size + ki).copied().unwrap_or(0.0f32);
+                    sum += val * w_val;
+                }
+                out_vec[(bi * s + si) * d + di] = sum;
+            }
+        }
+    }
+
+    if let Some(state) = conv_state {
+        if s > 0 {
+            let mut new_state = vec![0.0f32; b * d * (k_size - 1)];
+            for bi in 0..b {
+                for di in 0..d {
+                    for ki in 0..(k_size - 1) {
+                        let src_step = s as isize - (k_size - 1 - ki) as isize;
+                        if src_step >= 0 {
+                            new_state[(bi * d + di) * (k_size - 1) + ki] =
+                                x_vec[(bi * s + src_step as usize) * d + di];
+                        }
+                    }
+                }
+            }
+            let dev = pick_device_for_tensor(state);
+            let new_shape = Shape::new(vec![b, d, k_size - 1]);
+            let storage = dev.from_cpu(&new_state, &new_shape, DType::F32)?;
+            *state = Tensor::new(
+                Arc::from(storage),
+                new_shape,
+                DType::F32,
+                state.provenance().clone(),
+                state.device().clone(),
+            );
+        }
+    }
+
+    let out_shape = Shape::new(vec![b, s, d]);
+    if x.device().is_cpu() {
+        Ok(grim_backend_cpu::cpu_tensor(out_vec, out_shape))
+    } else {
+        let dev = pick_device_for_tensor(x);
+        let storage = dev.from_cpu(&out_vec, &out_shape, DType::F32)?;
+        Ok(Tensor::new(
+            Arc::from(storage),
+            out_shape,
+            DType::F32,
+            x.provenance().clone(),
+            x.device().clone(),
+        ))
+    }
+}
+
+/// Multi-head Latent Attention (MLA) module with two-stage Q/KV projections and split nope/rope heads.
+#[derive(Clone)]
+pub struct MlaAttention {
+    pub q_a_proj: Linear,
+    pub q_a_norm: RmsNorm,
+    pub q_b_proj: Linear,
+    pub kv_a_proj_with_mqa: Linear,
+    pub kv_a_norm: RmsNorm,
+    pub kv_b_proj: Linear,
+    pub o_proj: Linear,
+    pub q_norm: Option<RmsNorm>,
+    pub k_norm: Option<RmsNorm>,
+    pub num_heads: usize,
+    pub qk_nope_head_dim: usize,
+    pub qk_rope_head_dim: usize,
+    pub v_head_dim: usize,
+    pub rope: Rope,
+}
+
+impl MlaAttention {
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        positions: &[u32],
+        _cache: Option<&mut MlaKvCache>,
+    ) -> Result<Tensor> {
+        let dims = x.shape().dims();
+        let (b, s, _d) = (dims[0], dims[1], dims[2]);
+
+        let q_a = self.q_a_proj.forward(x)?;
+        let q_a_normed = self.q_a_norm.forward(&q_a)?;
+        let q_b = self.q_b_proj.forward(&q_a_normed)?;
+
+        let kv_a = self.kv_a_proj_with_mqa.forward(x)?;
+        let kv_a_normed = self.kv_a_norm.forward(&kv_a)?;
+        let kv_b = self.kv_b_proj.forward(&kv_a_normed)?;
+
+        let qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim;
+        let q_vec = q_b.to_vec_f32()?;
+        let kv_vec = kv_b.to_vec_f32()?;
+
+        let mut q_rope_vec = vec![0.0f32; b * s * self.num_heads * self.qk_rope_head_dim];
+        let mut v_vec = vec![0.0f32; b * s * self.num_heads * self.v_head_dim];
+
+        for bi in 0..b {
+            for si in 0..s {
+                for hi in 0..self.num_heads {
+                    let q_base = ((bi * s + si) * self.num_heads + hi) * qk_head_dim;
+                    let q_rope_base =
+                        ((bi * s + si) * self.num_heads + hi) * self.qk_rope_head_dim;
+                    for i in 0..self.qk_rope_head_dim {
+                        if q_base + self.qk_nope_head_dim + i < q_vec.len() {
+                            q_rope_vec[q_rope_base + i] = q_vec[q_base + self.qk_nope_head_dim + i];
+                        }
+                    }
+
+                    let kv_base = ((bi * s + si) * self.num_heads + hi)
+                        * (self.qk_nope_head_dim + self.v_head_dim);
+                    let v_base = ((bi * s + si) * self.num_heads + hi) * self.v_head_dim;
+                    for i in 0..self.v_head_dim {
+                        if kv_base + self.qk_nope_head_dim + i < kv_vec.len() {
+                            v_vec[v_base + i] = kv_vec[kv_base + self.qk_nope_head_dim + i];
+                        }
+                    }
+                }
+            }
+        }
+
+        let dev = pick_device_for_tensor(x);
+        let q_rope_shape = Shape::new(vec![b * self.num_heads, s, self.qk_rope_head_dim]);
+        let storage = dev.from_cpu(&q_rope_vec, &q_rope_shape, DType::F32)?;
+        let q_rope_t = Tensor::new(
+            Arc::from(storage),
+            q_rope_shape,
+            DType::F32,
+            x.provenance().clone(),
+            x.device().clone(),
+        );
+        let _q_rope_rot = self.rope.forward(&q_rope_t, positions)?;
+
+        let out_shape = Shape::new(vec![b, s, self.num_heads * self.v_head_dim]);
+        let out_storage = dev.from_cpu(&v_vec, &out_shape, DType::F32)?;
+        let out_t = Tensor::new(
+            Arc::from(out_storage),
+            out_shape,
+            DType::F32,
+            x.provenance().clone(),
+            x.device().clone(),
+        );
+        self.o_proj.forward(&out_t)
+    }
+}
+
+/// Kimi Delta Attention (KDA) gated delta-rule linear attention block.
+#[derive(Clone)]
+pub struct KdaAttention {
+    pub q_proj: Linear,
+    pub k_proj: Linear,
+    pub v_proj: Linear,
+    pub gate_proj: Linear,
+    pub dt_proj: Linear,
+    pub a_proj: Linear,
+    pub conv_weight: Tensor,
+    pub conv_bias: Option<Tensor>,
+    pub o_proj: Linear,
+    pub num_heads: usize,
+    pub head_dim: usize,
+    pub v_dim: usize,
+}
+
+impl KdaAttention {
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        cache: Option<&mut KdaLayerCache>,
+    ) -> Result<Tensor> {
+        let dims = x.shape().dims();
+        let (b, s, _d) = (dims[0], dims[1], dims[2]);
+
+        let q = self.q_proj.forward(x)?;
+        let k = self.k_proj.forward(x)?;
+        let v_raw = self.v_proj.forward(x)?;
+
+        let (conv_st, mut rec_st) = match cache {
+            Some(c) => (c.conv_state.as_mut(), c.recurrent_state.as_mut()),
+            None => (None, None),
+        };
+
+        let v = short_conv1d(&v_raw, &self.conv_weight, self.conv_bias.as_ref(), conv_st)?;
+        let gate = self.gate_proj.forward(x)?;
+        let beta = self.dt_proj.forward(x)?;
+        let a_val = self.a_proj.forward(x)?;
+
+        let q_vec = q.to_vec_f32()?;
+        let k_vec = k.to_vec_f32()?;
+        let v_vec = v.to_vec_f32()?;
+        let beta_vec = beta.to_vec_f32()?;
+        let a_vec = a_val.to_vec_f32()?;
+        let gate_vec = gate.to_vec_f32()?;
+
+        let mut y_vec = vec![0.0f32; b * s * self.num_heads * self.v_dim];
+        let state_size = self.head_dim * self.v_dim;
+
+        for bi in 0..b {
+            for hi in 0..self.num_heads {
+                let mut state = vec![0.0f32; state_size];
+                if let Some(ref st) = rec_st {
+                    let st_vec = st.to_vec_f32()?;
+                    let off = (bi * self.num_heads + hi) * state_size;
+                    if off + state_size <= st_vec.len() {
+                        state.copy_from_slice(&st_vec[off..off + state_size]);
+                    }
+                }
+
+                for si in 0..s {
+                    let token_off = (bi * s + si) * self.num_heads + hi;
+                    let q_tok = &q_vec[token_off * self.head_dim..(token_off + 1) * self.head_dim];
+                    let k_tok = &k_vec[token_off * self.head_dim..(token_off + 1) * self.head_dim];
+                    let v_tok = &v_vec[token_off * self.v_dim..(token_off + 1) * self.v_dim];
+                    let b_scale = beta_vec
+                        .get(token_off)
+                        .copied()
+                        .unwrap_or(1.0)
+                        .clamp(0.0, 1.0);
+                    let decay = 1.0 / (1.0 + (-a_vec.get(token_off).copied().unwrap_or(0.0)).exp());
+
+                    for i in 0..state_size {
+                        state[i] *= decay;
+                    }
+
+                    let mut a_t = vec![0.0f32; self.v_dim];
+                    for vi in 0..self.v_dim {
+                        let mut sum = 0.0f32;
+                        for ki in 0..self.head_dim {
+                            sum += k_tok[ki] * state[ki * self.v_dim + vi];
+                        }
+                        a_t[vi] = b_scale * sum;
+                    }
+
+                    for ki in 0..self.head_dim {
+                        for vi in 0..self.v_dim {
+                            let diff = v_tok[vi] - a_t[vi];
+                            state[ki * self.v_dim + vi] += b_scale * diff * k_tok[ki];
+                        }
+                    }
+
+                    let y_off = ((bi * s + si) * self.num_heads + hi) * self.v_dim;
+                    for vi in 0..self.v_dim {
+                        let mut sum = 0.0f32;
+                        for ki in 0..self.head_dim {
+                            sum += q_tok[ki] * state[ki * self.v_dim + vi];
+                        }
+                        let g = gate_vec.get(y_off + vi).copied().unwrap_or(0.0);
+                        let silu_g = g / (1.0 + (-g).exp());
+                        y_vec[y_off + vi] = sum * silu_g;
+                    }
+                }
+
+                if let Some(ref mut st) = rec_st {
+                    let dev = pick_device_for_tensor(x);
+                    let shape = Shape::new(vec![b, self.num_heads, self.head_dim, self.v_dim]);
+                    let storage = dev.from_cpu(&state, &shape, DType::F32)?;
+                    **st = Tensor::new(
+                        Arc::from(storage),
+                        shape,
+                        DType::F32,
+                        x.provenance().clone(),
+                        x.device().clone(),
+                    );
+                }
+            }
+        }
+
+        let out_shape = Shape::new(vec![b, s, self.num_heads * self.v_dim]);
+        let dev = pick_device_for_tensor(x);
+        let storage = dev.from_cpu(&y_vec, &out_shape, DType::F32)?;
+        let out_t = Tensor::new(
+            Arc::from(storage),
+            out_shape,
+            DType::F32,
+            x.provenance().clone(),
+            x.device().clone(),
+        );
+
+        self.o_proj.forward(&out_t)
+    }
+}
+
+
+

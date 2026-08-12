@@ -1254,4 +1254,58 @@ extern "C" __global__ void grim_fused_quant_gemm_fp8(const float* __restrict__ A
     }
     C[row * N + col] = sum;
 }
+
+// ---- Fused grouped MoE dispatch (WI-M5) ----------------------------------
+// One CUDA thread block (blockIdx.x) carries one (token, expert) routed pair,
+// exactly like the ROCm `grim_moe_fused_dispatch` / Vulkan `moe_fused_dispatch`
+// P-DAFD path. The host pre-expands top-k routing into flat token/expert/weight
+// arrays (`router_tokens`/`router_experts`/`router_weights`), so there is no
+// device-side sort or per-expert launch.
+//
+// Per pair, each thread computes the full SwiGLU expert contribution for one
+// token (loop over `hidden` output rows, contracting the `inter` dim for
+// gate+up then down) and atomicAdds the `routed_scaling_factor * weight`-scaled
+// result into `out[token]`. atomicAdd(float*) requires sm_70+ (RTX 40 is 8.9).
+//
+// Contract: gate_w/up_w are [e, inter, hidden] (row-major), down_w is
+// [e, hidden, inter] (row-major), x is [batch, hidden].
+extern "C" __global__ void grim_moe_fused_dispatch(
+    const float* x,
+    const float* gate_w,
+    const float* up_w,
+    const float* down_w,
+    const unsigned int* router_tokens,
+    const unsigned int* router_experts,
+    const float* router_weights,
+    float* out,
+    int hidden, int inter, int num_experts, int batch, float rsf)
+{
+    int pair = blockIdx.x;
+    int tok = (int)router_tokens[pair];
+    int exp_id = (int)router_experts[pair];
+    float w = router_weights[pair] * rsf;
+
+    int gw_base = exp_id * inter * hidden;
+    int uw_base = exp_id * inter * hidden;
+    int dw_base = exp_id * hidden * inter;
+    int x_base = tok * hidden;
+
+    // gate/up produce per-expert `inter`-dim intermediates; the contraction is
+    // over `hidden` (the activation input dim). down then maps `inter` -> `hidden`
+    // and atomicAdds the scaled contribution into the shared token output.
+    for (int i = 0; i < inter; ++i) {
+        float g = 0.0f, u = 0.0f;
+        for (int j = 0; j < hidden; ++j) {
+            float xv = x[x_base + j];
+            g += gate_w[gw_base + i * hidden + j] * xv;
+            u += up_w[uw_base + i * hidden + j] * xv;
+        }
+        float silu_g = g / (1.0f + expf(-g));
+        float act = silu_g * u;
+        for (int h = 0; h < hidden; ++h) {
+            float y = down_w[dw_base + h * inter + i] * act;
+            atomicAdd(&out[x_base + h], w * y);
+        }
+    }
+}
 "#;

@@ -35,9 +35,9 @@ extern "C" __global__ void grim_recip(const float* x, float* out, int n) {
 extern "C" __global__ void grim_rope(const float* x, const unsigned int* positions,
                                      float* out,
                                      int b, int s, int d, int half, float base) {
-    // One thread per (batch, step, dim-half-pair) element. Matches the CPU
-    // `BackendDevice::rope` semantics: 3-D input [B, S, D] with positions[si]
-    // per step, applying the rotation x1=x[2i], x2=x[2i+1] per pair (interleaved).
+    // One thread per (batch, step, dim-half-pair) element. Matches CPU
+    // `Rope::forward` semantics: 3-D input [B, S, D] with positions[si]
+    // per step, applying rotation to pairs (x[i], x[half+i]).
     int total = b * s * half;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
@@ -51,13 +51,23 @@ extern "C" __global__ void grim_rope(const float* x, const unsigned int* positio
     float sin_val = sinf(val);
     float cos_val = cosf(val);
     int base_idx = (bi * s + si) * d;
-    int a_idx = base_idx + 2 * i;
-    int b_idx = base_idx + 2 * i + 1;
+    int a_idx = base_idx + i;
+    int b_idx = base_idx + half + i;
     float x1 = x[a_idx];
     float x2 = x[b_idx];
     out[a_idx] = x1 * cos_val - x2 * sin_val;
     out[b_idx] = x2 * cos_val + x1 * sin_val;
 }
+
+extern "C" __global__ void grim_broadcast_bias(const float* bias, float* out,
+                                               int batch, int out_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * out_dim;
+    if (idx >= total) return;
+    int col = idx % out_dim;
+    out[idx] = bias[col];
+}
+
 
 extern "C" __global__ void grim_silu_mul(float* gate, float* up, float* out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -205,4 +215,112 @@ extern "C" __global__ void grim_split_k_reduction(
     }
     out[idx] = (_Float16)sum;
 }
+
+extern "C" __global__ void grim_short_conv1d_causal_step(
+    const float* x, const float* weight, const float* bias,
+    float* conv_state, float* out, int batch, int channels, int kernel_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * channels;
+    if (idx >= total) return;
+    int b = idx / channels;
+    int c = idx % channels;
+
+    float val = x[idx];
+    int state_offset = (b * channels + c) * (kernel_size - 1);
+    float sum = val * weight[c * kernel_size + (kernel_size - 1)];
+    for (int k = 0; k < kernel_size - 1; ++k) {
+        sum += conv_state[state_offset + k] * weight[c * kernel_size + k];
+    }
+    if (bias) {
+        sum += bias[c];
+    }
+    out[idx] = sum;
+
+    // Shift state buffer left and insert new input
+    for (int k = 0; k < kernel_size - 2; ++k) {
+        conv_state[state_offset + k] = conv_state[state_offset + k + 1];
+    }
+    if (kernel_size > 1) {
+        conv_state[state_offset + kernel_size - 2] = val;
+    }
+}
+
+extern "C" __global__ void grim_kda_gated_delta_rule_step(
+    const float* q, const float* k, const float* v, const float* beta,
+    const float* a_gate, float* S_state, float* out,
+    int d_k, int d_v
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= d_v) return;
+
+    // A_t = sigmoid(a_gate)
+    float a_t = 1.0f / (1.0f + expf(-a_gate[row]));
+    float beta_val = beta[row];
+
+    // Compute a_t_decay = a_t * S_{row, col}
+    // and update state S_t = a_t * S_{t-1} + beta_t * (v_t - a_prev) * k_t^T
+    float k_dot_s = 0.0f;
+    for (int col = 0; col < d_k; ++col) {
+        k_dot_s += k[col] * S_state[row * d_k + col];
+    }
+    float delta_v = v[row] - beta_val * k_dot_s;
+
+    float y_val = 0.0f;
+    for (int col = 0; col < d_k; ++col) {
+        float old_s = S_state[row * d_k + col];
+        float new_s = a_t * old_s + beta_val * delta_v * k[col];
+        S_state[row * d_k + col] = new_s;
+        y_val += q[col] * new_s;
+    }
+    out[row] = y_val;
+}
+
+extern "C" __global__ void grim_mla_q_kv_norm_split(
+    const float* q_raw, const float* kv_raw, const float* q_norm_w, const float* kv_norm_w,
+    float* q_nope, float* q_rope, float* kv_nope, float* kv_rope,
+    int qk_nope_dim, int qk_rope_dim, int v_dim, float eps
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < qk_nope_dim) {
+        // RMSNorm on q_nope
+        float ss = 0.0f;
+        for (int j = 0; j < qk_nope_dim; ++j) {
+            float val = q_raw[j];
+            ss += val * val;
+        }
+        float rms = sqrtf(ss / (float)qk_nope_dim + eps);
+        q_nope[idx] = q_raw[idx] * q_norm_w[idx] / rms;
+    } else if (idx < qk_nope_dim + qk_rope_dim) {
+        int rope_i = idx - qk_nope_dim;
+        q_rope[rope_i] = q_raw[idx];
+    }
+
+    if (idx < qk_nope_dim) {
+        float ss = 0.0f;
+        for (int j = 0; j < qk_nope_dim; ++j) {
+            float val = kv_raw[j];
+            ss += val * val;
+        }
+        float rms = sqrtf(ss / (float)qk_nope_dim + eps);
+        kv_nope[idx] = kv_raw[idx] * kv_norm_w[idx] / rms;
+    } else if (idx < qk_nope_dim + qk_rope_dim) {
+        int rope_i = idx - qk_nope_dim;
+        kv_rope[rope_i] = kv_raw[idx];
+    }
+}
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kda_mla_short_conv_kernel_presence() {
+        assert!(OTHER_KERNEL_SOURCE.contains("grim_short_conv1d_causal_step"));
+        assert!(OTHER_KERNEL_SOURCE.contains("grim_kda_gated_delta_rule_step"));
+        assert!(OTHER_KERNEL_SOURCE.contains("grim_mla_q_kv_norm_split"));
+    }
+}
+
+

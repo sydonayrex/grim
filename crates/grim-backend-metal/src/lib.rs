@@ -99,6 +99,7 @@ struct MetalPipelines {
     dequant_iq3s: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     dequant_iq4nl: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     dequant_iq4xs: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    moe_fused_dispatch: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     add_rms_norm: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     quant_q8_0: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     quant_fp8: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -245,6 +246,7 @@ impl MetalContext {
                 dequant_iq3s: get_pipeline("grim_dequant_iq3s")?,
                 dequant_iq4nl: get_pipeline("grim_dequant_iq4nl")?,
                 dequant_iq4xs: get_pipeline("grim_dequant_iq4xs")?,
+                moe_fused_dispatch: get_pipeline("grim_moe_fused_dispatch")?,
                 add_rms_norm: get_pipeline("grim_add_rms_norm")?,
                 quant_q8_0: get_pipeline("grim_quant_q8_0")?,
                 quant_fp8: get_pipeline("grim_quant_fp8")?,
@@ -1217,6 +1219,147 @@ impl MetalDevice {
         let out_shape = Shape::from_slice(&[out_bytes.len()]);
         let storage = self.from_cpu_bytes(&out_bytes, &out_shape, output_dtype)?;
         Ok((storage, Box::new(ReadyHandle)))
+    }
+
+    /// Fused grouped MoE dispatch (WI-M5). Mirrors `grim_moe_fused_dispatch` on
+    /// ROCm and `moe_fused_dispatch` on Vulkan. The MSL kernel runs one thread
+    /// per output element of `out` (`[batch, hidden]`) and accumulates the
+    /// gated-MLP contributions of every routed (token, expert) pair targeting
+    /// that token. The router arrays (`router_tokens`/`router_experts`) are
+    /// f32-backed (Metal has no integer buffer storage in this crate) and are
+    /// cast to `int` inside the shader.
+    #[allow(unused_variables)]
+    pub fn moe_fused_dispatch(
+        &self,
+        x: &dyn BackendStorage,
+        gate_w: &dyn BackendStorage,
+        up_w: &dyn BackendStorage,
+        down_w: &dyn BackendStorage,
+        router_tokens: &dyn BackendStorage,
+        router_experts: &dyn BackendStorage,
+        router_weights: &dyn BackendStorage,
+        out_shape: &Shape,
+        hidden: u32,
+        inter: u32,
+        num_experts: u32,
+        batch: u32,
+        rsf: f32,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let num_pairs = router_tokens.shape().elem_count();
+
+        // GPU fast path
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(ref inner) = self.inner {
+                if let (
+                    Some(x_s), Some(gw_s), Some(uw_s), Some(dw_s),
+                    Some(rt_s), Some(re_s), Some(rw_s),
+                ) = (
+                    x.as_any().downcast_ref::<MetalStorage>(),
+                    gate_w.as_any().downcast_ref::<MetalStorage>(),
+                    up_w.as_any().downcast_ref::<MetalStorage>(),
+                    down_w.as_any().downcast_ref::<MetalStorage>(),
+                    router_tokens.as_any().downcast_ref::<MetalStorage>(),
+                    router_experts.as_any().downcast_ref::<MetalStorage>(),
+                    router_weights.as_any().downcast_ref::<MetalStorage>(),
+                ) {
+                    let bufs = [
+                        x_s.buffer.as_ref(), gw_s.buffer.as_ref(), uw_s.buffer.as_ref(),
+                        dw_s.buffer.as_ref(), rt_s.buffer.as_ref(), re_s.buffer.as_ref(),
+                        rw_s.buffer.as_ref(),
+                    ];
+                    if bufs.iter().all(|b| b.is_some()) {
+                        if let Ok(out_storage) = self.zeros(out_shape, DType::F32) {
+                            let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                            let out_buf = out_s.buffer.as_ref().unwrap();
+
+                            let cmd = self.get_or_create_command_buffer()?;
+                            let encoder = cmd.computeCommandEncoder().ok_or_else(|| {
+                                Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                            })?;
+
+                            encoder.setComputePipelineState(&inner.pipelines.moe_fused_dispatch);
+                            for (i, b) in bufs.iter().enumerate() {
+                                encoder.setBuffer_offset_atIndex(Some(b.unwrap()), 0, i as u64);
+                            }
+                            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 7);
+
+                            let hidden_val = hidden as i32;
+                            let inter_val = inter as i32;
+                            let num_experts_val = num_experts as i32;
+                            let batch_val = batch as i32;
+                            let rsf_val = rsf;
+                            let num_pairs_val = num_pairs as i32;
+                            unsafe {
+                                encoder.setBytes_length_atIndex(&hidden_val as *const i32 as *const std::ffi::c_void, 4, 8);
+                                encoder.setBytes_length_atIndex(&inter_val as *const i32 as *const std::ffi::c_void, 4, 9);
+                                encoder.setBytes_length_atIndex(&num_experts_val as *const i32 as *const std::ffi::c_void, 4, 10);
+                                encoder.setBytes_length_atIndex(&batch_val as *const i32 as *const std::ffi::c_void, 4, 11);
+                                encoder.setBytes_length_atIndex(&rsf_val as *const f32 as *const std::ffi::c_void, 4, 12);
+                                encoder.setBytes_length_atIndex(&num_pairs_val as *const i32 as *const std::ffi::c_void, 4, 13);
+                            }
+
+                            let grid = MTLSize::new(batch as u64, hidden as u64, 1);
+                            let threads = MTLSize::new(1, 1, 1);
+                            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threads);
+                            encoder.endEncoding();
+
+                            return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd })));
+                        }
+                    }
+                }
+            }
+        }
+
+        // CPU fallback (also the path on non-Apple hosts)
+        let xv = x.to_cpu_vec_f32()?;
+        let gw = gate_w.to_cpu_vec_f32()?;
+        let uw = up_w.to_cpu_vec_f32()?;
+        let dw = down_w.to_cpu_vec_f32()?;
+        let rt = router_tokens.to_cpu_vec_f32()?;
+        let re = router_experts.to_cpu_vec_f32()?;
+        let rw = router_weights.to_cpu_vec_f32()?;
+
+        let hidden_us = hidden as usize;
+        let inter_us = inter as usize;
+        let batch_us = batch as usize;
+        let mut out = vec![0.0f32; batch_us * hidden_us];
+        for tok in 0..batch_us {
+            let x_base = tok * hidden_us;
+            for p in 0..num_pairs {
+                if rt[p] as usize != tok {
+                    continue;
+                }
+                let exp_id = re[p] as usize;
+                let weight = rw[p];
+                let gw_base = exp_id * inter_us * hidden_us;
+                let uw_base = exp_id * inter_us * hidden_us;
+                let dw_base = exp_id * hidden_us * inter_us;
+                for h in 0..hidden_us {
+                    let mut down = 0.0f32;
+                    for i in 0..inter_us {
+                        let mut g = 0.0f32;
+                        let mut u = 0.0f32;
+                        for j in 0..hidden_us {
+                            let xvj = xv[x_base + j];
+                            g += gw[gw_base + i * hidden_us + j] * xvj;
+                            u += uw[uw_base + i * hidden_us + j] * xvj;
+                        }
+                        let a = (g / (1.0f32 + (-g).exp())) * u;
+                        down += dw[dw_base + h * inter_us + i] * a;
+                    }
+                    out[tok * hidden_us + h] += rsf * weight * down;
+                }
+            }
+        }
+        let storage = self.from_cpu(&out, out_shape, DType::F32)?;
+        #[cfg(target_vendor = "apple")]
+        {
+            let command_buffer = self.get_or_create_command_buffer()?;
+            Ok((storage, Box::new(MetalHandle { command_buffer })))
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        Ok((storage, Box::new(MetalHandle)))
     }
 }
 

@@ -11,7 +11,9 @@ grim-tensor = { workspace = true }
 grim-nn = { workspace = true }
 grim-core = { workspace = true }
 grim-backend-cpu = { workspace = true }
+grim-models-vision = { workspace = true }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 default = []

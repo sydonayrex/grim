@@ -1024,6 +1024,35 @@ fn load_model_from_config(
             let m = T5::load_tp(&ws, cfg, tp)?;
             Ok(Box::new(m))
         }
+        ModelArchitecture::MuseGlimmer => {
+            let muse_cfg = if let Some(raw_json) = raw_config_str.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()) {
+                grim_models_transformer::MuseGlimmerConfig::from_hf(&raw_json)
+            } else {
+                grim_models_transformer::MuseGlimmerConfig {
+                    vocab_size,
+                    hidden_size,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    num_layers,
+                    intermediate_size,
+                    rms_norm_eps,
+                    per_layer_rope_theta: vec![],
+                    base_rope_theta: rope_theta,
+                    sliding_window_layer_ids: vec![],
+                    sliding_window_size: 0,
+                    qk_scale_factor: 1.0,
+                    output_multiplier: vec![],
+                    final_logit_softcapping: 0.0,
+                    max_seq_len,
+                    vision: None,
+                }
+            };
+            let m = grim_models_transformer::MuseGlimmer::load_tp(device.clone(), &ws, muse_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+
+
         ModelArchitecture::Arcee
         | ModelArchitecture::Apertus
         | ModelArchitecture::Arctic
@@ -1100,25 +1129,8 @@ fn load_model_from_config(
         | ModelArchitecture::Step35
         | ModelArchitecture::Talkie
         | ModelArchitecture::WavTokenizerDec
-                | ModelArchitecture::BitNet
-        | ModelArchitecture::ChatGlm
-        | ModelArchitecture::CogVlm
-        | ModelArchitecture::CommandR
-        | ModelArchitecture::DeepSeek2
-        | ModelArchitecture::DeepSeek2Ocr
-        | ModelArchitecture::DeepSeek32
-        | ModelArchitecture::DeepSeek4
-        | ModelArchitecture::DFlash
-        | ModelArchitecture::GlmDsa
-        | ModelArchitecture::HyV3
-        | ModelArchitecture::MainCoder
-        | ModelArchitecture::MiniCpm3
-        | ModelArchitecture::OpenElm
-        | ModelArchitecture::SmallThinker
-        | ModelArchitecture::SmolLm2
-        | ModelArchitecture::SmolLm3
-        | ModelArchitecture::StableLm
-| ModelArchitecture::Xverse => {
+        | ModelArchitecture::Xverse => {
+
             let llama_cfg = LlamaConfig {
                 vocab_size,
                 hidden_size,
@@ -1899,6 +1911,197 @@ fn load_model_with_providers(
             let m = DeepSeek::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
+        ModelArchitecture::MuseGlimmer => {
+            let softcap = lookup.get_f32("muse_glimmer.final_logit_softcapping").unwrap_or(0.0);
+            let qk_scale = lookup.get_f32("muse_glimmer.qk_scale_factor").unwrap_or(1.0);
+            let sliding_win = lookup.get_u32("muse_glimmer.sliding_window").unwrap_or(0) as usize;
+
+            let per_layer_rope: Vec<f32> = get_meta_array(provider, "muse_glimmer.per_layer_rope_theta")
+                .map(|arr| arr.iter().filter_map(|v| v.as_f32()).collect())
+                .unwrap_or_default();
+            let sliding_window_layer_ids: Vec<usize> = get_meta_array(provider, "muse_glimmer.sliding_window_layer_ids")
+                .map(|arr| arr.iter().filter_map(|v| v.as_u32().map(|u| u as usize)).collect())
+                .unwrap_or_default();
+            let output_multiplier: Vec<f32> = get_meta_array(provider, "muse_glimmer.output_multiplier")
+                .map(|arr| arr.iter().filter_map(|v| v.as_f32()).collect())
+                .unwrap_or_default();
+
+            let vision_cfg = if lookup.get_u32("muse_glimmer.vision.image_size").is_some()
+                || lookup.get_u32("muse_glimmer.vision.num_layers").is_some()
+            {
+                Some(grim_models_vision::GlimmerVisionConfig {
+                    image_temporal: lookup.get_u32("muse_glimmer.vision.image_temporal").unwrap_or(2) as usize,
+                    image_size: lookup.get_u32("muse_glimmer.vision.image_size").unwrap_or(336) as usize,
+                    patch_size: lookup.get_u32("muse_glimmer.vision.patch_size").unwrap_or(14) as usize,
+                    temporal_patch_size: lookup.get_u32("muse_glimmer.vision.temporal_patch_size").unwrap_or(2) as usize,
+                    in_channels: lookup.get_u32("muse_glimmer.vision.in_channels").unwrap_or(3) as usize,
+                    hidden_size: lookup.get_u32("muse_glimmer.vision.hidden_size").unwrap_or(1024) as usize,
+                    num_heads: lookup.get_u32("muse_glimmer.vision.num_heads").unwrap_or(16) as usize,
+                    num_layers: lookup.get_u32("muse_glimmer.vision.num_layers").unwrap_or(24) as usize,
+                    intermediate_size: lookup.get_u32("muse_glimmer.vision.intermediate_size").unwrap_or(4096) as usize,
+                    rms_norm_eps: lookup.get_f32("muse_glimmer.vision.rms_norm_eps").unwrap_or(1e-5),
+                    merge_size: lookup.get_u32("muse_glimmer.vision.merge_size").unwrap_or(2) as usize,
+                    use_vision_norm: true,
+                })
+            } else {
+                None
+            };
+
+            let muse_cfg = grim_models_transformer::MuseGlimmerConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                per_layer_rope_theta: per_layer_rope,
+                base_rope_theta: hparams.rope_theta,
+                sliding_window_layer_ids,
+                sliding_window_size: sliding_win,
+                qk_scale_factor: qk_scale,
+                output_multiplier,
+                final_logit_softcapping: softcap,
+                max_seq_len: hparams.max_seq_len,
+                vision: vision_cfg,
+            };
+            let m = grim_models_transformer::MuseGlimmer::load_tp(device.clone(), &ws, muse_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::InternS2Mobius => {
+            let cfg = grim_models_transformer::InternS2MobiusConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_attention_heads: hparams.num_heads,
+                num_key_value_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_hidden_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_position_embeddings: hparams.max_seq_len,
+            };
+            let m = grim_models_transformer::InternS2Mobius::load_tp(device.clone(), &ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::KimiK3 => {
+            let cfg = grim_models_transformer::KimiK3Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_attention_heads: hparams.num_heads,
+                num_key_value_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_hidden_layers: hparams.num_layers,
+                q_lora_rank: hparams.num_heads,
+                kv_lora_rank: hparams.num_kv_heads * 4,
+                qk_nope_head_dim: 128,
+                qk_rope_head_dim: 64,
+                v_head_dim: 128,
+                num_experts: hparams.expert_count.unwrap_or(8),
+                num_experts_per_tok: hparams.expert_used_count.unwrap_or(2),
+                routed_scaling_factor: hparams.routed_scaling_factor,
+                rms_norm_eps: hparams.rms_norm_eps,
+            };
+            let m = grim_models_transformer::KimiK3::load_tp(device.clone(), &ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::InklingSmall => {
+            let cfg = grim_models_transformer::InklingSmallConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_attention_heads: hparams.num_heads,
+                num_key_value_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_hidden_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_position_embeddings: hparams.max_seq_len,
+            };
+            let m = grim_models_transformer::InklingSmall::load_tp(device.clone(), &ws, cfg)?;
+            Ok(Box::new(m))
+        }
+
+        ModelArchitecture::Glm52 => {
+            let cfg = grim_models_transformer::Glm52Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_attention_heads: hparams.num_heads,
+                num_key_value_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_hidden_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                num_experts: hparams.expert_count.unwrap_or(8),
+                num_experts_per_tok: hparams.expert_used_count.unwrap_or(2),
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_position_embeddings: hparams.max_seq_len,
+            };
+            let m = grim_models_transformer::Glm52::load_tp(device.clone(), &ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::DiffusionGemma => {
+            let cfg = grim_models_transformer::DiffusionGemmaConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_attention_heads: hparams.num_heads,
+                num_key_value_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_hidden_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_position_embeddings: hparams.max_seq_len,
+            };
+            let m = grim_models_transformer::DiffusionGemma::load_tp(device.clone(), &ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::MiniMaxM3 => {
+            let cfg = grim_models_transformer::MiniMaxM3Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_attention_heads: hparams.num_heads,
+                num_key_value_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_hidden_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                num_experts: hparams.expert_count.unwrap_or(8),
+                num_experts_per_tok: hparams.expert_used_count.unwrap_or(2),
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_position_embeddings: hparams.max_seq_len,
+            };
+            let m = grim_models_transformer::MiniMaxM3::load_tp(device.clone(), &ws, cfg)?;
+            Ok(Box::new(m))
+        }
+
+        ModelArchitecture::BailingMoe3 => {
+            let cfg = grim_models_transformer::Qwen3MoeConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                num_experts: hparams.expert_count.unwrap_or(8),
+                num_experts_per_tok: hparams.expert_used_count.unwrap_or(2),
+                routed_scaling_factor: hparams.routed_scaling_factor,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+            };
+            let m = grim_models_transformer::Qwen3Moe::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+
+
+
+
+
+
+
         ModelArchitecture::Chameleon => {
             let chameleon_cfg = ChameleonConfig {
                 vocab_size: hparams.vocab_size,

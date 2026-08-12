@@ -108,6 +108,7 @@ pub enum ModelArchitecture {
     Plm,
     BailingMoe,
     BailingMoe2,
+    BailingMoe3,
     Dots1,
     Arcee,
     AfMoe,
@@ -147,8 +148,17 @@ pub enum ModelArchitecture {
     Eagle3,
     DFlash,
     DeltaNetBase,
+    InternS2Mobius,
+    KimiK3,
+    InklingSmall,
+    Glm52,
+    DiffusionGemma,
+    MiniMaxM3,
+    MuseGlimmer,
     Unknown,
 }
+
+
 
 impl ModelArchitecture {
     /// Parse string identifier into `ModelArchitecture` enum variant.
@@ -254,6 +264,7 @@ impl ModelArchitecture {
             "plm" => Self::Plm,
             "bailingmoe" => Self::BailingMoe,
             "bailingmoe2" => Self::BailingMoe2,
+            "bailingmoe3" | "bailing_hybrid" => Self::BailingMoe3,
             "dots1" => Self::Dots1,
             "arcee" => Self::Arcee,
             "afmoe" => Self::AfMoe,
@@ -293,9 +304,18 @@ impl ModelArchitecture {
             "talkie" => Self::Talkie,
             "mellum" => Self::Mellum,
             "eagle3" => Self::Eagle3,
+            "interns2_mobius" | "interns2-mobius" | "intern_s2_mobius" => Self::InternS2Mobius,
+            "kimi-k3" | "kimi_k3" | "kimik3" => Self::KimiK3,
+            "inkling-small" | "inkling_small" | "inklingsmall" | "inkling" => Self::InklingSmall,
+            "glm5_2" | "glm5-2" | "glm-5.2" | "glm5.2" | "glm52" => Self::Glm52,
+            "diffusion_gemma" | "diffusion-gemma" | "diffusiongemma" => Self::DiffusionGemma,
+            "minimax-m3" | "minimax_m3" | "minimaxm3" => Self::MiniMaxM3,
+            "muse-glimmer" | "museglimmer" | "muse_glimmer" => Self::MuseGlimmer,
             _ => Self::Unknown,
         }
     }
+
+
 
     /// Return canonical string representation of architecture.
     pub fn as_str(&self) -> &'static str {
@@ -397,6 +417,7 @@ impl ModelArchitecture {
             Self::Plm => "plm",
             Self::BailingMoe => "bailingmoe",
             Self::BailingMoe2 => "bailingmoe2",
+            Self::BailingMoe3 => "bailingmoe3",
             Self::Dots1 => "dots1",
             Self::Arcee => "arcee",
             Self::AfMoe => "afmoe",
@@ -435,11 +456,20 @@ impl ModelArchitecture {
             Self::Eagle3 => "eagle3",
             Self::MainCoder => "maincoder",
             Self::DFlash => "dflash",
+            Self::MuseGlimmer => "muse-glimmer",
             Self::StableLm => "stablelm",
             Self::DeltaNetBase => "delta-net-base",
+            Self::InternS2Mobius => "interns2_mobius",
+            Self::KimiK3 => "kimi_k3",
+            Self::InklingSmall => "inkling_small",
+            Self::Glm52 => "glm5_2",
+            Self::DiffusionGemma => "diffusion_gemma",
+            Self::MiniMaxM3 => "minimax_m3",
             Self::Unknown => "unknown",
         }
     }
+
+
 
     /// Return coarse modality hint for architecture.
     pub fn modality(&self) -> ModalityHint {
@@ -479,7 +509,13 @@ impl ModelArchitecture {
                 | Self::GraniteMoe
                 | Self::BailingMoe
                 | Self::BailingMoe2
+                | Self::BailingMoe3
+                | Self::KimiK3
+                | Self::Glm52
+                | Self::MiniMaxM3
                 | Self::AfMoe
+
+
                 | Self::Ernie45Moe
                 | Self::HunyuanMoe
                 | Self::OpenAiMoe

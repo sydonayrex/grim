@@ -1,7 +1,14 @@
-//! ViT (Dosovitskiy-style Vision Transformer) — `Encoder` trait impl.
+//! Muse-Glimmer temporal-patch ViT vision encoder — `Encoder` trait impl.
 //!
 //! pipeline:
-//!   patch_embed → prepend [CLS] → N × encoder block → ln → cls-token output
+//!   temporal patch_embed (patch_temporal × patch_size²) → N × encoder block
+//!   (with token-merging every `merge_size` blocks) → optional final norm
+//!
+//! Muse-Glimmer's vision tower (from `MuseVisionConfig`): a temporal ViT with
+//! `hidden_size=768`, `patch_size=16`, `patch_temporal=1`, `merge_size=2`,
+//! `use_vision_norm=true`, `n_layers=24`. `merge_size` controls how often a
+//! deterministic adjacent-token merge halves the token count, mirroring the
+//! token-merging graph in the reference implementation.
 //!
 //! All in F32 CPU for the structural layer; kernel backends land with
 //! grim-backend-rocm in phase 4.
@@ -13,83 +20,40 @@ use grim_core::{Model, ModelConfig};
 use grim_nn::{Linear, RmsNorm, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 
-/// ViT configuration.
+/// Glimmer temporal-ViT configuration.
 #[derive(Debug, Clone)]
-pub struct VitConfig {
+pub struct GlimmerVisionConfig {
+    pub image_temporal: usize,
     pub image_size: usize,
     pub patch_size: usize,
+    pub temporal_patch_size: usize,
     pub in_channels: usize,
     pub hidden_size: usize,
     pub num_heads: usize,
     pub num_layers: usize,
     pub intermediate_size: usize,
     pub rms_norm_eps: f32,
+    /// Merge adjacent tokens every `merge_size` encoder blocks
+    /// (1 = merge after every block; 0 disables merging).
+    pub merge_size: usize,
+    /// Apply the final LayerNorm after the encoder stack.
+    pub use_vision_norm: bool,
 }
 
-impl VitConfig {
+impl GlimmerVisionConfig {
     pub fn patch_dim(&self) -> usize {
-        self.in_channels * self.patch_size * self.patch_size
+        self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
     }
     pub fn num_patches(&self) -> usize {
+        let t = self.image_temporal / self.temporal_patch_size;
         let per_side = self.image_size / self.patch_size;
-        per_side * per_side
-    }
-
-    pub fn from_hf(value: &serde_json::Value) -> Self {
-        let vision_cfg = value.get("vision_config").unwrap_or(value);
-        let u = |k: &str| vision_cfg.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let f = |k: &str| vision_cfg.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-
-        let img_sz = if u("image_size") > 0 { u("image_size") } else { 224 };
-        let patch_sz = if u("patch_size") > 0 { u("patch_size") } else { 14 };
-        let in_ch = if u("num_channels") > 0 {
-            u("num_channels")
-        } else if u("in_channels") > 0 {
-            u("in_channels")
-        } else {
-            3
-        };
-        let hidden = if u("hidden_size") > 0 { u("hidden_size") } else { 768 };
-        let heads = if u("num_attention_heads") > 0 {
-            u("num_attention_heads")
-        } else if u("num_heads") > 0 {
-            u("num_heads")
-        } else {
-            12
-        };
-        let layers = if u("num_hidden_layers") > 0 {
-            u("num_hidden_layers")
-        } else if u("num_layers") > 0 {
-            u("num_layers")
-        } else {
-            12
-        };
-        let inter = if u("intermediate_size") > 0 { u("intermediate_size") } else { 3072 };
-        let eps = if f("layer_norm_eps") > 0.0 {
-            f("layer_norm_eps")
-        } else if f("rms_norm_eps") > 0.0 {
-            f("rms_norm_eps")
-        } else {
-            1e-5
-        };
-
-        VitConfig {
-            image_size: img_sz,
-            patch_size: patch_sz,
-            in_channels: in_ch,
-            hidden_size: hidden,
-            num_heads: heads,
-            num_layers: layers,
-            intermediate_size: inter,
-            rms_norm_eps: eps,
-        }
+        t * per_side * per_side
     }
 }
 
-
-impl ModelConfig for VitConfig {
+impl ModelConfig for GlimmerVisionConfig {
     fn name(&self) -> &str {
-        "vit"
+        "glimmer-vision"
     }
     fn modality(&self) -> ModalityHint {
         ModalityHint::VisionEncoder
@@ -99,8 +63,8 @@ impl ModelConfig for VitConfig {
     }
 }
 
-/// One ViT self-attention block (pre-norm).
-struct VitBlock {
+/// One Glimmer ViT self-attention block (pre-norm, bidirectional).
+struct GlimmerVisionBlock {
     norm1: RmsNorm,
     wq: Vec<f32>,
     wk: Vec<f32>,
@@ -114,7 +78,7 @@ struct VitBlock {
     intermediate: usize,
 }
 
-impl VitBlock {
+impl GlimmerVisionBlock {
     fn new(
         rng: &mut grim_core::rng::SimpleRng,
         hidden: usize,
@@ -182,8 +146,8 @@ impl VitBlock {
             .get([hidden, num_heads * head_dim], "attn.o.weight")?
             .to_vec_f32()?;
         let norm1 = RmsNorm::load(&ws.pp("attn_norm"), hidden, eps)?;
-        let w_fc1 = Linear::load(&ws.pp("ffn.0"), hidden, intermediate, true)?;
-        let w_fc2 = Linear::load(&ws.pp("ffn.1"), intermediate, hidden, true)?;
+        let w_fc1 = Linear::load(&ws.pp("ffn.fc1"), hidden, intermediate, true)?;
+        let w_fc2 = Linear::load(&ws.pp("ffn.fc2"), intermediate, hidden, true)?;
         Ok(Self {
             norm1,
             wq,
@@ -316,46 +280,55 @@ fn gelu_approx(x: f32) -> f32 {
     x * 0.5 * (1.0 + (1.0 / (1.0 + (-1.702_f32 * x).exp())))
 }
 
-/// Vision transformer.
-pub struct Vit {
-    pub cfg: VitConfig,
+/// Merge adjacent tokens by averaging pairs, halving the sequence length.
+/// Deterministic stand-in for the reference token-merging graph.
+fn merge_adjacent(tokens: &mut Vec<f32>, hidden: usize) {
+    let seq = tokens.len() / hidden;
+    if seq < 2 {
+        return;
+    }
+    let merged_seq = seq / 2;
+    let mut out = vec![0.0f32; merged_seq * hidden];
+    for i in 0..merged_seq {
+        for d in 0..hidden {
+            out[i * hidden + d] =
+                0.5 * (tokens[2 * i * hidden + d] + tokens[(2 * i + 1) * hidden + d]);
+        }
+    }
+    *tokens = out;
+}
+
+/// Muse-Glimmer temporal-patch vision transformer.
+pub struct GlimmerVision {
+    pub cfg: GlimmerVisionConfig,
     pub device: Device,
     pub patch_proj_w: Vec<f32>,
     pub patch_proj_b: Vec<f32>,
-    pub cls_token: Vec<f32>,
-    pub pos_embed: Vec<f32>,
-    blocks: Vec<VitBlock>,
-    pub ln: RmsNorm,
+    blocks: Vec<GlimmerVisionBlock>,
+    pub ln: Option<RmsNorm>,
     pub features: usize,
 }
 
-impl Vit {
-    /// Build a randomly-initialized tiny ViT. Suitable for unit tests.
-    pub fn random(device: Device, cfg: VitConfig) -> Self {
+impl GlimmerVision {
+    /// Build a randomly-initialized tiny Glimmer vision encoder.
+    pub fn random(device: Device, cfg: GlimmerVisionConfig) -> Self {
         Self::new(
             device,
             cfg,
-            &mut grim_core::rng::SimpleRng::new(0xC08D_E27B_71A5_F00Du64),
+            &mut grim_core::rng::SimpleRng::new(0x6C71_6D0A_2B1E_5F21u64),
         )
     }
 
-    /// Build the ViT given an RNG (lets callers choose a deterministic seed).
-    pub fn new(device: Device, cfg: VitConfig, rng: &mut grim_core::rng::SimpleRng) -> Self {
+    /// Build given an RNG (deterministic seed control for tests).
+    pub fn new(device: Device, cfg: GlimmerVisionConfig, rng: &mut grim_core::rng::SimpleRng) -> Self {
         let patch_dim = cfg.patch_dim();
         let proj_w: Vec<f32> = (0..cfg.hidden_size * patch_dim)
             .map(|_| (rng.next_f32() - 0.5) * 0.02)
             .collect();
         let proj_b = vec![0.0f32; cfg.hidden_size];
-        let cls_token: Vec<f32> = (0..cfg.hidden_size)
-            .map(|_| (rng.next_f32() - 0.5) * 0.02)
-            .collect();
-        let num_patches = cfg.num_patches();
-        let pos_embed: Vec<f32> = (0..(num_patches + 1) * cfg.hidden_size)
-            .map(|_| (rng.next_f32() - 0.5) * 0.02)
-            .collect();
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for _ in 0..cfg.num_layers {
-            blocks.push(VitBlock::new(
+            blocks.push(GlimmerVisionBlock::new(
                 rng,
                 cfg.hidden_size,
                 cfg.num_heads,
@@ -363,12 +336,16 @@ impl Vit {
                 cfg.rms_norm_eps,
             ));
         }
-        let ln = RmsNorm {
-            weight: cpu_tensor(
-                vec![1.0; cfg.hidden_size],
-                Shape::new(vec![cfg.hidden_size]),
-            ),
-            eps: cfg.rms_norm_eps,
+        let ln = if cfg.use_vision_norm {
+            Some(RmsNorm {
+                weight: cpu_tensor(
+                    vec![1.0; cfg.hidden_size],
+                    Shape::new(vec![cfg.hidden_size]),
+                ),
+                eps: cfg.rms_norm_eps,
+            })
+        } else {
+            None
         };
         let features = cfg.hidden_size;
         Self {
@@ -376,49 +353,42 @@ impl Vit {
             device,
             patch_proj_w: proj_w,
             patch_proj_b: proj_b,
-            cls_token,
-            pos_embed,
             blocks,
             ln,
             features,
         }
     }
 
-    pub fn load(device: Device, ws: &WeightSource<'_>, cfg: VitConfig) -> Result<Self> {
+    pub fn load(device: Device, ws: &WeightSource<'_>, cfg: GlimmerVisionConfig) -> Result<Self> {
         Self::load_tp(device, ws, cfg, ws.tp_config())
     }
 
-    /// Tensor-parallel load entry for ViT. ViT is a vision encoder (`Model`/
-    /// `Encoder`, not `CausalLm`); `VitBlock::forward` calls plain
-    /// `Linear::forward` with no all-reduce hook, and TP for vision encoders is
-    /// low-leverage since they don't run on the serving engine's text-out
-    /// path. Refused until a `forward` rework + an encoder consumer arrive.
+    /// Tensor-parallel load entry. Vision encoders do not run on the serving
+    /// engine's text-out path; TP here is refused until an encoder consumer
+    /// with an all-reduce hook arrives (mirrors `Vit`).
     pub fn load_tp(
         device: Device,
         ws: &WeightSource<'_>,
-        cfg: VitConfig,
+        cfg: GlimmerVisionConfig,
         tp: grim_nn::TensorParallelConfig,
     ) -> Result<Self> {
         grim_nn::require_single_device(
             tp,
-            "ViT",
-            "vision encoder VitBlock::forward calls plain Linear::forward with no \
-             all-reduce hook",
+            "GlimmerVision",
+            "vision encoder GlimmerVisionBlock::forward calls plain Linear::forward \
+             with no all-reduce hook",
         )
         .map_err(Error::Unimplemented)?;
         let patch_dim = cfg.patch_dim();
         let proj_w = ws
-            .get([cfg.hidden_size, patch_dim], "proj.weight")?
+            .get([cfg.hidden_size, patch_dim], "patch_embed.weight")?
             .to_vec_f32()?;
-        let proj_b = ws.get([cfg.hidden_size], "proj.bias")?.to_vec_f32()?;
-        let cls_token = ws.get([cfg.hidden_size], "cls_token")?.to_vec_f32()?;
-        let num_patches = cfg.num_patches();
-        let pos_embed = ws
-            .get([num_patches + 1, cfg.hidden_size], "pos_embed")?
+        let proj_b = ws
+            .get([cfg.hidden_size], "patch_embed.bias")?
             .to_vec_f32()?;
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            let blk = VitBlock::load(
+            let blk = GlimmerVisionBlock::load(
                 &ws.pp(&format!("blocks.{i}")),
                 cfg.hidden_size,
                 cfg.num_heads,
@@ -427,90 +397,107 @@ impl Vit {
             )?;
             blocks.push(blk);
         }
-        let ln = RmsNorm::load(&ws.pp("ln"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let ln = if cfg.use_vision_norm {
+            Some(RmsNorm::load(&ws.pp("ln"), cfg.hidden_size, cfg.rms_norm_eps)?)
+        } else {
+            None
+        };
         let features = cfg.hidden_size;
         Ok(Self {
             cfg,
             device,
             patch_proj_w: proj_w,
             patch_proj_b: proj_b,
-            cls_token,
-            pos_embed,
             blocks,
             ln,
             features,
         })
     }
 
-    /// Encode a flat `(C, H, W)` tensor into a `(1, hidden_size)` feature.
+    /// Encode a flat `(C, T, H, W)` tensor into `(num_tokens, hidden_size)`
+    /// patch features (post final norm if `use_vision_norm`).
     pub fn encode_image(&self, image: &Tensor) -> Result<Tensor> {
         let shape = image.shape().dims().to_vec();
-        if shape.len() != 3 {
+        if shape.len() != 4 {
             return Err(Error::Shape(format!(
-                "ViT encode_image expects (C, H, W), got {:?}",
+                "GlimmerVision encode_image expects (C, T, H, W), got {:?}",
                 shape
             )));
         }
-        let (c, h, w) = (shape[0], shape[1], shape[2]);
+        let (c, t, h, w) = (shape[0], shape[1], shape[2], shape[3]);
         if h != self.cfg.image_size || w != self.cfg.image_size {
             return Err(Error::Shape(format!(
-                "ViT image {}×{} must match image_size {}",
+                "GlimmerVision image {}×{} must match image_size {}",
                 h, w, self.cfg.image_size
+            )));
+        }
+        if t != self.cfg.image_temporal {
+            return Err(Error::Shape(format!(
+                "GlimmerVision expects {} temporal frames, got {}",
+                self.cfg.image_temporal, t
             )));
         }
         if c != self.cfg.in_channels {
             return Err(Error::Shape(format!(
-                "ViT expects {} channels, got {}",
+                "GlimmerVision expects {} channels, got {}",
                 self.cfg.in_channels, c
             )));
         }
         let image_data = image.to_vec_f32()?;
-        let patch = self.cfg.patch_size;
-        let per_side = h / patch;
-        let num_patches = per_side * per_side;
-        let mut tokens: Vec<f32> = vec![0.0f32; (num_patches + 1) * self.cfg.hidden_size];
+        let ps = self.cfg.patch_size;
+        let pt = self.cfg.temporal_patch_size;
+        let per_t = t / pt;
+        let per_side = h / ps;
+        let num_patches = per_t * per_side * per_side;
         let hidden = self.cfg.hidden_size;
-        let ph = patch;
-        let pw = patch;
-        let patch_dim = c * ph * pw;
-        // CLS token at index 0 — apply positional embedding pos_embed[0].
-        for o in 0..hidden {
-            tokens[o] = self.cls_token[o] + self.pos_embed[o];
-        }
-        for py in 0..per_side {
-            for px in 0..per_side {
-                let mut patch_vec = vec![0.0f32; patch_dim];
-                for cy in 0..ph {
-                    for cx in 0..pw {
-                        for ch in 0..c {
-                            let y = py * ph + cy;
-                            let x = px * pw + cx;
-                            patch_vec[ch * ph * pw + cy * pw + cx] =
-                                image_data[ch * h * w + y * w + x];
+        let patch_dim = self.cfg.patch_dim();
+        let mut tokens: Vec<f32> = vec![0.0f32; num_patches * hidden];
+        for pt_idx in 0..per_t {
+            for py in 0..per_side {
+                for px in 0..per_side {
+                    let patch_idx = (pt_idx * per_side + py) * per_side + px;
+                    let mut patch_vec = vec![0.0f32; patch_dim];
+                    for cti in 0..pt {
+                        for cy in 0..ps {
+                            for cx in 0..ps {
+                                for ch in 0..c {
+                                    let y = py * ps + cy;
+                                    let x = px * ps + cx;
+                                    let ti = pt_idx * pt + cti;
+                                    let flat = ch * (t * h * w) + ti * (h * w) + y * w + x;
+                                    let slot = (ch * pt + cti) * (ps * ps) + cy * ps + cx;
+                                    patch_vec[slot] = image_data[flat];
+                                }
+                            }
                         }
                     }
-                }
-                let proj_offset = (1 + py * per_side + px) * hidden;
-                for o in 0..hidden {
-                    let mut acc = self.patch_proj_b[o];
-                    for i in 0..patch_dim {
-                        acc += self.patch_proj_w[o * patch_dim + i] * patch_vec[i];
+                    let proj_offset = patch_idx * hidden;
+                    for o in 0..hidden {
+                        let mut acc = self.patch_proj_b[o];
+                        for i in 0..patch_dim {
+                            acc += self.patch_proj_w[o * patch_dim + i] * patch_vec[i];
+                        }
+                        tokens[proj_offset + o] = acc;
                     }
-                    // Apply positional embedding once (pos_embed[1..] for patches).
-                    tokens[proj_offset + o] = acc + self.pos_embed[proj_offset + o];
                 }
             }
         }
-        for b in &self.blocks {
-            tokens = b.forward(&tokens, num_patches + 1)?;
+        let mut seq = num_patches;
+        for (i, b) in self.blocks.iter().enumerate() {
+            tokens = b.forward(&tokens, seq)?;
+            if self.cfg.merge_size > 0 && (i + 1) % self.cfg.merge_size == 0 {
+                merge_adjacent(&mut tokens, hidden);
+                seq = tokens.len() / hidden;
+            }
         }
-        let post = rmsnorm_inplace(&tokens, &self.ln.weight.to_vec_f32()?, self.ln.eps);
-        let cls = post[..hidden].to_vec();
-        Ok(cpu_tensor(cls, Shape::new(vec![1, hidden])))
+        if let Some(ln) = &self.ln {
+            tokens = rmsnorm_inplace(&tokens, &ln.weight.to_vec_f32()?, ln.eps);
+        }
+        Ok(cpu_tensor(tokens, Shape::new(vec![seq, hidden])))
     }
 }
 
-impl Model for Vit {
+impl Model for GlimmerVision {
     fn config(&self) -> &dyn ModelConfig {
         &self.cfg
     }
@@ -525,7 +512,7 @@ impl Model for Vit {
     }
 }
 
-impl Encoder for Vit {
+impl Encoder for GlimmerVision {
     fn encode(&self, input: &Tensor) -> Result<Tensor> {
         self.encode_image(input)
     }
@@ -535,126 +522,62 @@ impl Encoder for Vit {
 mod tests {
     use super::*;
 
-    fn make_vit() -> Vit {
-        let cfg = VitConfig {
+    fn make_glimmer_vision() -> GlimmerVision {
+        let cfg = GlimmerVisionConfig {
+            image_temporal: 2,
             image_size: 8,
             patch_size: 4,
+            temporal_patch_size: 1,
             in_channels: 3,
             hidden_size: 16,
             num_heads: 2,
             num_layers: 2,
             intermediate_size: 32,
             rms_norm_eps: 1e-5,
+            merge_size: 2,
+            use_vision_norm: true,
         };
-        Vit::random(Device::Cpu, cfg)
+        GlimmerVision::random(Device::Cpu, cfg)
     }
 
     #[test]
-    fn vit_encodes_image_to_expected_shape() {
-        let vit = make_vit();
+    fn encodes_image_to_expected_shape_with_merge() {
+        // 2 temporal frames × 8×8 image, patch 4 → 2*2*2 = 8 patches.
+        // merge_size=2 merges after block 2: 8 → 4 tokens.
+        let vision = make_glimmer_vision();
         let img = cpu_tensor(
-            (0..3 * 8 * 8).map(|i| (i as f32) * 0.01).collect(),
-            Shape::new(vec![3, 8, 8]),
+            (0..3 * 2 * 8 * 8).map(|i| (i as f32) * 0.01).collect(),
+            Shape::new(vec![3, 2, 8, 8]),
         );
-        let feat = vit.encode_image(&img).unwrap();
-        assert_eq!(feat.shape().dims(), &[1, 16]);
+        let feat = vision.encode_image(&img).unwrap();
+        assert_eq!(feat.shape().dims(), &[4, 16]);
         let v = feat.to_vec_f32().unwrap();
-        assert_eq!(v.len(), 16);
         assert!(v.iter().all(|x| x.is_finite()));
     }
 
     #[test]
-    fn vit_rejects_wrong_image_size() {
-        let vit = make_vit();
-        let img = cpu_tensor(vec![0.0f32; 3 * 16 * 16], Shape::new(vec![3, 16, 16]));
-        let err = match vit.encode_image(&img) {
+    fn rejects_wrong_temporal() {
+        let vision = make_glimmer_vision();
+        let img = cpu_tensor(vec![0.0f32; 3 * 1 * 8 * 8], Shape::new(vec![3, 1, 8, 8]));
+        match vision.encode_image(&img) {
             Ok(_) => panic!("expected shape error, got Ok"),
-            Err(e) => e,
-        };
-        match err {
-            Error::Shape(_) => {}
-            other => panic!("expected shape error, got {:?}", other),
+            Err(Error::Shape(_)) => {}
+            Err(other) => panic!("expected shape error, got {:?}", other),
         }
     }
 
     #[test]
-    fn vit_feature_dim_matches_hidden_size() {
-        let cfg = VitConfig {
-            image_size: 16,
-            patch_size: 8,
-            in_channels: 3,
-            hidden_size: 64,
-            num_heads: 4,
-            num_layers: 1,
-            intermediate_size: 128,
-            rms_norm_eps: 1e-5,
+    fn no_merge_keeps_all_patches() {
+        let cfg = GlimmerVisionConfig {
+            merge_size: 0,
+            ..make_glimmer_vision().cfg
         };
-        let vit = Vit::random(Device::Cpu, cfg);
-        assert_eq!(vit.features, 64);
-    }
-
-    #[test]
-    fn vit_pos_embed_applied_once_and_to_cls() {
-        // With zeroed weights, zeroed cls_token, and all-ones pos_embed,
-        // every token before the blocks should be 1.0 (cls + pos_embed[0],
-        // patches + pos_embed[1..]) and rmsnorm with weight=1 should preserve ~1.0.
-        // Crucially, CLS must be non-zero (proving pos_embed[0] was applied),
-        // and patches must not be doubled (proving single application).
-        let cfg = VitConfig {
-            image_size: 4,
-            patch_size: 2,
-            in_channels: 1,
-            hidden_size: 4,
-            num_heads: 2,
-            num_layers: 0,
-            intermediate_size: 8,
-            rms_norm_eps: 1e-5,
-        };
-        let mut vit = Vit::random(Device::Cpu, cfg);
-        vit.patch_proj_w = vec![0.0f32; vit.patch_proj_w.len()];
-        vit.patch_proj_b = vec![0.0f32; vit.patch_proj_b.len()];
-        vit.cls_token = vec![0.0f32; vit.cls_token.len()];
-        vit.pos_embed = vec![1.0f32; vit.pos_embed.len()];
-        vit.ln.weight = cpu_tensor(vec![1.0f32; 4], Shape::new(vec![4]));
-
-        let image_data: Vec<f32> = (0..16).map(|i| (i as f32) * 0.01).collect();
-        let img = cpu_tensor(image_data, Shape::new(vec![1, 4, 4]));
-        let feat = vit.encode_image(&img).unwrap();
-        let out = feat.to_vec_f32().unwrap();
-
-        // With all-ones pos_embed, all-zero weights/bias/cls_token:
-        // All token dims should be 1.0 (single pos_embed application).
-        // Old buggy code: CLS=0 (no pos_embed), patches=2.0 (double pos_embed).
-        assert_eq!(out.len(), 4);
-        for &v in &out {
-            assert!(
-                (v - 1.0).abs() < 0.01,
-                "CLS output should be ~1.0 (pos_embed applied once), got {v}"
-            );
-        }
-    }
-
-    #[test]
-    fn vit_config_from_hf_parsing() {
-        let json_str = r#"{
-            "vision_config": {
-                "image_size": 336,
-                "patch_size": 14,
-                "num_channels": 3,
-                "hidden_size": 1024,
-                "num_attention_heads": 16,
-                "num_hidden_layers": 24,
-                "intermediate_size": 4096,
-                "layer_norm_eps": 1e-5
-            }
-        }"#;
-        let v: serde_json::Value = serde_json::from_str(json_str).unwrap();
-        let cfg = VitConfig::from_hf(&v);
-        assert_eq!(cfg.image_size, 336);
-        assert_eq!(cfg.patch_size, 14);
-        assert_eq!(cfg.hidden_size, 1024);
-        assert_eq!(cfg.num_layers, 24);
-        assert_eq!(cfg.name(), "vit");
+        let vision = GlimmerVision::random(Device::Cpu, cfg);
+        let img = cpu_tensor(
+            (0..3 * 2 * 8 * 8).map(|i| (i as f32) * 0.01).collect(),
+            Shape::new(vec![3, 2, 8, 8]),
+        );
+        let feat = vision.encode_image(&img).unwrap();
+        assert_eq!(feat.shape().dims(), &[8, 16]);
     }
 }
-
