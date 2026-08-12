@@ -1283,7 +1283,13 @@ async fn chat_completions(
                             .unwrap_or(&emitted)
                             .to_string();
                     }
+                    if hit_stop {
+                        let (trimmed, _) = trim_stop_sequences(&emitted, &stop_seqs);
+                        emitted = trimmed;
+                    }
                     if hit_stop || hit_eos {
+
+
                         // A stop sequence or EOS terminated generation early —
                         // same end-of-stream tool-call extraction path as max_tokens.
                         let (reasoning_content, clean_emitted) =
@@ -4214,6 +4220,85 @@ mod tests {
             "stop sequence must end generation at the first token"
         );
     }
+
+    /// P0-WI-1: streaming mode stop sequence test — asserts that when a stop
+    /// sequence is hit during streaming, the stop sequence string itself is
+    /// absent from the concatenated SSE deltas.
+    #[tokio::test]
+    async fn test_chat_completions_streaming_honors_stop_sequence() {
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32000,
+                hidden_size: 512,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 4,
+                intermediate_size: 1024,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 2048,
+            },
+        ));
+        engine.register_model("default", mock_model);
+
+        let state = Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            plugin_registry: None,
+        });
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state.clone());
+
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+            "max_tokens": 20,
+            "stop": ["<tok:"]
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&bytes);
+
+        // Concatenate text from all data: chunks
+        let mut concatenated = String::new();
+        for line in body_str.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data == "[DONE]" {
+                    continue;
+                }
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(delta) = val["choices"][0]["delta"]["content"].as_str() {
+                        concatenated.push_str(delta);
+                    }
+                }
+            }
+        }
+        assert!(
+            !concatenated.contains("<tok:"),
+            "stop sequence string '<tok:' must be absent from streaming SSE deltas, got: {concatenated}"
+        );
+    }
+
 
     /// WI-TOOLS-1: `tools` and `tool_choice` are now accepted by KNOWN_FIELDS
     /// (previously hard-400'd). A non-tool-capable model produces an ordinary

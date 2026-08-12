@@ -433,6 +433,153 @@ impl BackendDevice for CpuDevice {
         ))
     }
 
+    fn short_conv1d_causal_step(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        bias: Option<&dyn BackendStorage>,
+        conv_state: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = a_storage(x)?;
+        let w_s = a_storage(weight)?;
+        let st_s = a_storage(conv_state)?;
+
+        let x_data = x_s.data();
+        let w_data = w_s.data();
+        let st_data = st_s.data();
+
+        let hidden = x_s.shape().dims().last().cloned().unwrap_or(0);
+        let k_size = if hidden > 0 { w_s.data().len() / hidden } else { 1 };
+
+        let mut out = vec![0.0f32; out_shape.elem_count()];
+        for h in 0..hidden {
+            let mut sum = 0.0f32;
+            for k in 0..k_size.saturating_sub(1) {
+                sum += st_data[h * (k_size - 1) + k] * w_data[h * k_size + k];
+            }
+            sum += x_data[h] * w_data[h * k_size + (k_size - 1)];
+            if let Some(b) = bias {
+                let b_s = a_storage(b)?;
+                sum += b_s.data()[h];
+            }
+            out[h] = sum;
+        }
+
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
+    fn kda_gated_delta_rule_step(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        beta: &dyn BackendStorage,
+        a_gate: &dyn BackendStorage,
+        recurrent_state: &dyn BackendStorage,
+        d_k: usize,
+        d_v: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_s = a_storage(q)?;
+        let k_s = a_storage(k)?;
+        let v_s = a_storage(v)?;
+        let beta_s = a_storage(beta)?;
+        let gate_s = a_storage(a_gate)?;
+        let s_s = a_storage(recurrent_state)?;
+
+        let q_data = q_s.data();
+        let k_data = k_s.data();
+        let v_data = v_s.data();
+        let beta_val = beta_s.data()[0];
+        let gate_val = gate_s.data()[0];
+
+        let decay = gate_val.exp();
+        let mut out = vec![0.0f32; out_shape.elem_count()];
+
+        for i in 0..d_v {
+            let mut k_s_decayed = 0.0f32;
+            for j in 0..d_k {
+                k_s_decayed += k_data[j] * (decay * s_s.data()[j * d_v + i]);
+            }
+            let delta_i = beta_val * (v_data[i] - k_s_decayed);
+            let mut out_i = 0.0f32;
+            for j in 0..d_k {
+                let s_new_ji = decay * s_s.data()[j * d_v + i] + k_data[j] * delta_i;
+                out_i += q_data[j] * s_new_ji;
+            }
+            out[i] = out_i;
+        }
+
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
+    fn mla_q_kv_norm_split(
+        &self,
+        q_raw: &dyn BackendStorage,
+        kv_raw: &dyn BackendStorage,
+        q_norm_w: &dyn BackendStorage,
+        kv_norm_w: &dyn BackendStorage,
+        qk_nope_dim: usize,
+        qk_rope_dim: usize,
+        _v_dim: usize,
+        eps: f32,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let q_s = a_storage(q_raw)?;
+        let kv_s = a_storage(kv_raw)?;
+        let qw_s = a_storage(q_norm_w)?;
+        let kvw_s = a_storage(kv_norm_w)?;
+
+        let q_data = q_s.data();
+        let kv_data = kv_s.data();
+        let qw_data = qw_s.data();
+        let kvw_data = kvw_s.data();
+
+        let q_dim = q_data.len();
+        let kv_dim = kv_data.len();
+
+        let q_mean_sq = q_data.iter().map(|&x| x * x).sum::<f32>() / (q_dim.max(1) as f32);
+        let q_scale = 1.0 / (q_mean_sq + eps).sqrt();
+        let mut q_norm = vec![0.0f32; q_dim];
+        for i in 0..q_dim {
+            q_norm[i] = q_data[i] * q_scale * qw_data[i];
+        }
+
+        let kv_mean_sq = kv_data.iter().map(|&x| x * x).sum::<f32>() / (kv_dim.max(1) as f32);
+        let kv_scale = 1.0 / (kv_mean_sq + eps).sqrt();
+        let mut kv_norm = vec![0.0f32; kv_dim];
+        for i in 0..kv_dim {
+            kv_norm[i] = kv_data[i] * kv_scale * kvw_data[i];
+        }
+
+        let q_nope = q_norm[..qk_nope_dim].to_vec();
+        let q_rope = q_norm[qk_nope_dim..(qk_nope_dim + qk_rope_dim).min(q_dim)].to_vec();
+
+        let kv_nope = kv_norm[..qk_nope_dim].to_vec();
+        let kv_rope = kv_norm[qk_nope_dim..(qk_nope_dim + qk_rope_dim).min(kv_dim)].to_vec();
+
+        Ok((
+            Box::new(CpuStorage::new(q_nope, Shape::new(vec![qk_nope_dim]), DType::F32)),
+            Box::new(CpuStorage::new(q_rope, Shape::new(vec![qk_rope_dim]), DType::F32)),
+            Box::new(CpuStorage::new(kv_nope, Shape::new(vec![qk_nope_dim]), DType::F32)),
+            Box::new(CpuStorage::new(kv_rope, Shape::new(vec![qk_rope_dim]), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
+
     fn qkv_attention_paged(
         &self,
         q: &dyn BackendStorage,

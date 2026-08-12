@@ -55,6 +55,9 @@ pub struct ArchCompatSpec {
     pub audio_spec: Option<AudioEncoderSpec>,
     pub expert_count: Option<usize>,
     pub expert_used_count: Option<usize>,
+    /// Scaling applied to routed-expert output before adding the shared expert.
+    /// `None` means "not specified by this source"; callers fall back to 1.0.
+    pub routed_scaling_factor: Option<f32>,
     pub tensor_name_mapping: HashMap<String, String>,
 }
 
@@ -95,6 +98,13 @@ struct RawHfConfig {
     n_routed_experts: Option<usize>,
     #[serde(rename = "num_experts_per_tok")]
     num_experts_per_tok: Option<usize>,
+    // MoE routed-expert output scaling. HF configs use either
+    // `routed_scaling_factor` (Qwen3-MoE / DeepSeek-V2) or, in some
+    // SmolLM2-derived checkpoints, `expert_gating_func`.
+    #[serde(rename = "routed_scaling_factor")]
+    routed_scaling_factor: Option<f32>,
+    #[serde(rename = "expert_gating_func")]
+    expert_gating_func: Option<f32>,
     #[serde(rename = "text_config")]
     text_config: Option<Box<RawHfConfig>>,
     #[serde(rename = "vision_config")]
@@ -174,6 +184,12 @@ impl ArchCompatSpec {
         let expert_used_count = raw
             .num_experts_per_tok
             .or_else(|| text.and_then(|t| t.num_experts_per_tok));
+        let routed_scaling_factor = raw
+            .routed_scaling_factor
+            .or(raw.expert_gating_func)
+            .or_else(|| {
+                text.and_then(|t| t.routed_scaling_factor.or(t.expert_gating_func))
+            });
 
         let is_moe = model_arch.is_moe() || expert_count.is_some();
         let is_ssm = model_arch.is_ssm();
@@ -204,6 +220,7 @@ impl ArchCompatSpec {
             audio_spec,
             expert_count,
             expert_used_count,
+            routed_scaling_factor,
             tensor_name_mapping,
         })
     }

@@ -30,8 +30,11 @@ use grim_backend_vulkan::VulkanDevice;
 use grim_backend_cuda::CudaDevice;
 #[cfg(feature = "cuda-mem")]
 use grim_backend_cuda::CudaStorage;
+#[cfg(feature = "rocm-mem")]
+use grim_backend_rocm::RocmDevice;
 #[cfg(feature = "metal-mem")]
 use grim_backend_metal::MetalDevice;
+
 use std::sync::Arc;
 use grim_tensor::shape::Shape;
 use grim_tensor::{BackendDevice, BackendStorage, Device, Tensor};
@@ -347,6 +350,13 @@ impl MoeFfn {
                 return Ok(out);
             }
         }
+        #[cfg(feature = "rocm-mem")]
+        if matches!(x.device(), Device::Rocm(_)) {
+            if let Ok(out) = self.forward_rocm(x) {
+                return Ok(out);
+            }
+        }
+
 
         let (indices, weights) = self.router.route(x)?;
         let batch = indices.len();
@@ -718,7 +728,88 @@ impl MoeFfn {
             Device::Metal(ordinal),
         ))
     }
+
+    /// ROCm HIP dispatch of the Charon fused MoE kernel.
+    #[cfg(feature = "rocm-mem")]
+    fn forward_rocm(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
+        let ordinal = match x.device() {
+            Device::Rocm(o) => *o,
+            _ => return Err(grim_tensor::error::Error::Backend(
+                "forward_rocm: x is not on a ROCm device".into(),
+            )),
+        };
+        let (indices, weights) = self.router.route(x)?;
+        let batch = indices.len();
+        let hidden = self
+            .experts
+            .down
+            .first()
+            .map(|l| l.weight.shape().dim(0).unwrap_or(0))
+            .unwrap_or_else(|| x.shape().dims().last().copied().unwrap_or(0));
+        let inter = self
+            .experts
+            .gate
+            .first()
+            .map(|l| l.weight.shape().dim(0).unwrap_or(0))
+            .unwrap_or(0);
+        let num_experts = self.experts.gate.len();
+        if inter == 0 || num_experts == 0 || hidden == 0 {
+            return Err(grim_tensor::error::Error::ShapeMismatch {
+                expected: vec![inter, hidden, num_experts],
+                got: vec![0, 0, 0],
+            });
+        }
+
+        let mut gate_flat = Vec::with_capacity(num_experts * inter * hidden);
+        let mut up_flat = Vec::with_capacity(num_experts * inter * hidden);
+        let mut down_flat = Vec::with_capacity(num_experts * hidden * inter);
+        for e in 0..num_experts {
+            gate_flat.extend_from_slice(&self.experts.gate[e].weight.to_vec_f32()?);
+            up_flat.extend_from_slice(&self.experts.up[e].weight.to_vec_f32()?);
+            down_flat.extend_from_slice(&self.experts.down[e].weight.to_vec_f32()?);
+        }
+
+        let assignment = grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(
+            &indices, &weights
+        )?;
+
+        let dev = RocmDevice::try_new(ordinal)?;
+        let x_storage: &dyn BackendStorage = &**x.storage();
+        let x_rocm = x_storage.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().ok_or_else(|| {
+            grim_tensor::error::Error::Backend("x is not RocmStorage".into())
+        })?;
+
+        let out_shape = Shape::new(vec![batch, hidden]);
+        let (out_storage, _handle) = dev.moe_fused_dispatch(
+            x_rocm,
+            &gate_flat,
+            &up_flat,
+            &down_flat,
+            &assignment,
+            &out_shape,
+            hidden,
+            inter,
+            self.routed_scaling_factor,
+        )?;
+
+        let mut out_tensor = Tensor::new(
+            Arc::from(out_storage),
+            out_shape.clone(),
+            DType::F32,
+            QuantProvenance::default(),
+            Device::Rocm(ordinal),
+        );
+
+        if let Some(sh) = &self.shared_expert {
+            let s = sh.forward(x)?;
+            out_tensor = crate::modules::add_tensors(&out_tensor, &s)?;
+        }
+
+
+        Ok(out_tensor)
+    }
 }
+
 
 // ---------------------------------------------------------------------------
 // Host math helpers

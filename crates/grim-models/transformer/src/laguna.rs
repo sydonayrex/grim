@@ -2,7 +2,13 @@
 //!
 //! Laguna uses a sigmoid router with a noisy-router / dedup correction bias
 //! (`exp_probs_b`) and an always-on shared expert. Attention towers are plain
-//! Llama-style; the MoE routing replaces the dense FFN per layer.
+//! Llama-style full-context causal GQA; the MoE routing replaces the dense FFN
+//! per layer.
+//!
+//! Note: sliding-window / interleaved local-global attention is *not* supported
+//! here. The attention kernels in `block.rs` have no windowing path, and
+//! Laguna's design uses plain causal attention. (Hybrid windowed attention
+//! exists elsewhere — see `muse_glimmer` — but is unrelated to this model.)
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, Model, ModelConfig, ModalityHint};
@@ -35,8 +41,6 @@ pub struct LagunaConfig {
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub max_seq_len: usize,
-    pub sliding_window: Option<usize>,
-    pub layer_types: Option<Vec<String>>,
 }
 
 impl ModelConfig for LagunaConfig {

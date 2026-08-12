@@ -26,13 +26,15 @@
 //! `CharonSelector` consumed the measured `VariantRow` table without error.
 
 use std::time::Instant;
+use grim_tensor::BackendDevice;
 
 use grim_backend_rocm::autotune::{
     AutotuneConfig, Autotuner, MoeKernelKey, quantize_routing_skew,
 };
 use grim_backend_rocm::kernels::charon::{
-    build_variant_table_from_autotuner, CharonSelector, VariantRow,
+    build_variant_table_from_autotuner, CharonSelector, RoutingAssignment, VariantRow,
 };
+
 
 /// GPU-gate helper — mirrors `golden_charon_moe_gpu.rs::gpu_device()`.
 fn gpu_available() -> bool {
@@ -104,7 +106,8 @@ fn benchmark_moe_shape(
             router_weights.push(1.0 / top_k as f32);
         }
     }
-    let _ = (router_tokens, router_experts, router_weights, uniform_pairs);
+    let _ = uniform_pairs;
+
 
     // Dummy activation/weight buffers for timing: we measure the loop overhead
     // and parameter marshalling cost (the actual GPU dispatch cost dominates in
@@ -114,6 +117,60 @@ fn benchmark_moe_shape(
     let expert_up = vec![0.01f32; num_experts * inter * hidden];
     let expert_down = vec![0.01f32; num_experts * hidden * inter];
 
+    let assignment = RoutingAssignment {
+        tokens: router_tokens.clone(),
+        experts: router_experts.clone(),
+        weights: router_weights.clone(),
+    };
+
+
+    if gpu_available() {
+        if let Ok(dev) = grim_backend_rocm::RocmDevice::try_new(0) {
+            let out_shape = grim_tensor::Shape::new(vec![batch, hidden]);
+            if let Ok(act) = dev.from_cpu(&activations, &out_shape, grim_tensor::DType::F32) {
+                let act_r = act.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+
+                for _ in 0..num_warmup {
+                    let _ = dev.moe_fused_dispatch(
+                        act_r,
+                        &expert_gate,
+                        &expert_up,
+                        &expert_down,
+                        &assignment,
+                        &out_shape,
+                        hidden,
+                        inter,
+                        1.0,
+                    );
+                }
+
+                let t0 = Instant::now();
+                for _ in 0..num_iters {
+                    let _ = dev.moe_fused_dispatch(
+                        act_r,
+                        &expert_gate,
+                        &expert_up,
+                        &expert_down,
+                        &assignment,
+                        &out_shape,
+                        hidden,
+                        inter,
+                        1.0,
+                    );
+                }
+                let elapsed_us = t0.elapsed().as_micros() as u64;
+                let per_iter_us = (elapsed_us / num_iters.max(1) as u64).max(1);
+                return AutotuneConfig {
+                    block_dim: 64,
+                    tile_kv: (hidden / 4).max(16) as u32,
+                    grid_stride: 1,
+                    cycles_per_invocation: per_iter_us * 1000,
+                };
+            }
+        }
+    }
+
+
     for &bd in block_dims {
         // Warmup.
         for _ in 0..num_warmup {
@@ -122,18 +179,13 @@ fn benchmark_moe_shape(
 
         let t0 = Instant::now();
         for _ in 0..num_iters {
-            // The actual benchmark on a real device would invoke:
-            //   device.launch_charon_fused_dispatch(&activations_dev, ...)
-            // On the CPU timing path (no-device mode) we exercise the
-            // parameter-assembly cost that is proportional to the kernel launch
-            // overhead, verifying the autotune key machinery and serialization
-            // without requiring a live HIP context.
             let _grid = (total_pairs as u32 + bd - 1) / bd;
             let _bytes = (num_experts * inter * hidden * 2 + num_experts * hidden * inter) * 4;
             let _ = std::hint::black_box(_grid + _bytes as u32);
         }
         let elapsed_us = t0.elapsed().as_micros() as u64;
         let per_iter_us = elapsed_us / num_iters as u64;
+
 
         if per_iter_us < best_us {
             best_us = per_iter_us;

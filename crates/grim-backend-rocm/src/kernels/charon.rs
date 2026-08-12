@@ -854,7 +854,23 @@ impl RoutingAssignment {
     pub fn num_pairs(&self) -> usize {
         self.tokens.len()
     }
+
+    /// Compute per-expert token counts from the expert array.
+    pub fn per_expert_token_counts(&self) -> Vec<u32> {
+        let max_expert = self.experts.iter().copied().max().unwrap_or(0) as usize;
+        let mut counts = vec![0u32; max_expert + 1];
+        for &e in &self.experts {
+            counts[e as usize] += 1;
+        }
+        counts
+    }
+
+    /// Compute continuous routing skew for this assignment.
+    pub fn routing_skew(&self) -> f32 {
+        routing_skew(&self.per_expert_token_counts())
+    }
 }
+
 
 /// Token-sorted routing layout for the grouped fused dispatch
 /// (`grim_moe_fused_grouped`). Produced by `moe_align_block_size` from a
@@ -1011,6 +1027,51 @@ pub(crate) fn plan_fused_dispatch(
     };
     CharonLaunchPlan { grid_x, block_x }
 }
+
+/// MoE autotune-aware launch planner.
+///
+/// Consults `tuner` for a measured `MoeKernelKey` launch parameter before falling
+/// back to `choose_block_dim`.
+#[allow(dead_code)]
+pub(crate) fn plan_fused_dispatch_with_autotuner(
+    assignment: &RoutingAssignment,
+    wave_size: u32,
+    tuner: Option<&crate::autotune::Autotuner>,
+    gpu_arch: &str,
+    hidden: usize,
+    inter: usize,
+) -> CharonLaunchPlan {
+    let n = assignment.num_pairs();
+    let counts = assignment.per_expert_token_counts();
+    let num_experts = counts.len();
+    let num_tokens = (assignment.tokens.iter().copied().max().unwrap_or(0) as usize + 1).max(1);
+    let top_k = n / num_tokens;
+    let skew = routing_skew(&counts);
+    let bucket = crate::autotune::quantize_routing_skew(skew);
+    let key = crate::autotune::MoeKernelKey {
+        kernel: "grim_moe_fused_dispatch".to_string(),
+        gpu_arch: gpu_arch.to_string(),
+        hidden,
+        inter,
+        num_experts,
+        top_k,
+        skew_bucket: bucket,
+    };
+
+    let block_x = tuner
+        .and_then(|t| t.lookup_moe(&key))
+        .map(|cfg| cfg.block_dim)
+        .unwrap_or_else(|| choose_block_dim(n, wave_size));
+
+    let grid_x = if n == 0 {
+        0
+    } else {
+        ((n as u32 + block_x - 1) / block_x) as u32
+    };
+    CharonLaunchPlan { grid_x, block_x }
+}
+
+
 
 impl SortedRouting {
     /// Number of expert-blocks in the grouped layout (= grid x for the
