@@ -188,19 +188,39 @@ extern "C" {
 /// Per-expert gradient-tensor byte size for the FP32 backward path.
 ///
 /// `d_gate_w` / `d_up_w` are `[num_experts, inter * hidden]` f32.
+///
+/// # Panics
+/// Panics on arithmetic overflow (dimensions so large the byte count wraps `usize`).
 pub fn expert_weight_grad_bytes(num_experts: usize, inter: usize, hidden: usize) -> usize {
-    num_experts * inter * hidden * std::mem::size_of::<f32>()
+    num_experts
+        .checked_mul(inter)
+        .and_then(|x| x.checked_mul(hidden))
+        .and_then(|x| x.checked_mul(std::mem::size_of::<f32>()))
+        .expect("expert_weight_grad_bytes: dimension product overflows usize")
 }
 
 /// `d_down_w` is `[num_experts, hidden * inter]` f32 (down is already
 /// `[hidden, inter]` in the forward layout, see `grim_moe_fused_grouped`).
+///
+/// # Panics
+/// Panics on arithmetic overflow (dimensions so large the byte count wraps `usize`).
 pub fn expert_down_grad_bytes(num_experts: usize, inter: usize, hidden: usize) -> usize {
-    num_experts * hidden * inter * std::mem::size_of::<f32>()
+    num_experts
+        .checked_mul(hidden)
+        .and_then(|x| x.checked_mul(inter))
+        .and_then(|x| x.checked_mul(std::mem::size_of::<f32>()))
+        .expect("expert_down_grad_bytes: dimension product overflows usize")
 }
 
 /// `d_x` is `[batch, hidden]` f32.
+///
+/// # Panics
+/// Panics on arithmetic overflow (dimensions so large the byte count wraps `usize`).
 pub fn input_grad_bytes(batch: usize, hidden: usize) -> usize {
-    batch * hidden * std::mem::size_of::<f32>()
+    batch
+        .checked_mul(hidden)
+        .and_then(|x| x.checked_mul(std::mem::size_of::<f32>()))
+        .expect("input_grad_bytes: dimension product overflows usize")
 }
 
 /// Validate backward launch inputs before any HIP dereference (mirrors

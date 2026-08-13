@@ -329,7 +329,15 @@ impl CudaStorage {
 
     /// Allocates GPU memory on a CUDA device.
     pub fn alloc_gpu(shape: &Shape, dtype: DType, device_ordinal: usize) -> Result<Self> {
-        let bytes = shape.elem_count() * dtype_byte_size(&dtype);
+        let bytes = shape
+            .elem_count()
+            .checked_mul(dtype_byte_size(&dtype))
+            .ok_or_else(|| {
+                Error::Backend(format!(
+                    "alloc_gpu: byte count overflow for shape {:?} dtype {:?}",
+                    shape, dtype
+                ))
+            })?;
 
         // SAFETY: `cudaSetDevice` sets the active device for the current thread.
         // `device_ordinal` is validated at construction; this is a pure device switch.

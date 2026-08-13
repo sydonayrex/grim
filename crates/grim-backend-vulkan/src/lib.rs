@@ -746,7 +746,15 @@ impl VulkanStorage {
         device: *mut c_void,
         physical_device: *mut c_void,
     ) -> Result<Self> {
-        let bytes = shape.elem_count() * dtype_byte_size(&dtype);
+        let bytes = shape
+            .elem_count()
+            .checked_mul(dtype_byte_size(&dtype))
+            .ok_or_else(|| {
+                Error::Backend(format!(
+                    "alloc_gpu: byte count overflow for shape {:?} dtype {:?}",
+                    shape, dtype
+                ))
+            })?;
 
         let buffer_ci = VkBufferCreateInfo {
             s_type: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,

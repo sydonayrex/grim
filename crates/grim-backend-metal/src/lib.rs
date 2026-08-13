@@ -1175,7 +1175,12 @@ impl MetalDevice {
                         encoder
                             .dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
                     }
-                    _ => unreachable!(),
+                    other => {
+                        return Err(Error::Backend(format!(
+                            "Metal quantize_on_device: unsupported format for dispatch {:?}",
+                            other
+                        )));
+                    }
                 }
                 encoder.endEncoding();
 
