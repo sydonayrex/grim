@@ -33,6 +33,8 @@ pub struct LagunaConfig {
     pub head_dim: usize,
     pub num_layers: usize,
     pub intermediate_size: usize,
+    pub moe_intermediate_size: usize,
+    pub shared_expert_intermediate_size: usize,
     pub num_experts: usize,
     pub num_experts_per_tok: usize,
     /// Scaling applied to the routed expert output before adding the shared
@@ -41,6 +43,7 @@ pub struct LagunaConfig {
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub max_seq_len: usize,
+    pub mlp_only_layers: Vec<usize>,
 }
 
 impl ModelConfig for LagunaConfig {
@@ -89,18 +92,25 @@ impl Laguna {
             max_seq_len: cfg.max_seq_len,
         };
 
-        // Laguna routes every layer through the MoE block: sigmoid router with
-        // correction bias + always-on shared expert. `MoeBlock::load` reads the
-        // real `exp_probs_b` correction bias from the checkpoint when the router
-        // kind is `SigmoidTopKWithBias`, so no bias tensor is constructed here.
         let spec = MoESpec {
             num_experts: cfg.num_experts,
             top_k: cfg.num_experts_per_tok,
             router_kind: RouterKind::SigmoidTopKWithBias,
             routed_scaling_factor: cfg.routed_scaling_factor,
             has_shared_expert: true,
+            moe_intermediate_size: Some(cfg.moe_intermediate_size),
+            shared_expert_intermediate_size: Some(cfg.shared_expert_intermediate_size),
         };
-        let moe_spec: Vec<Option<MoESpec>> = vec![Some(spec); cfg.num_layers];
+
+        let moe_spec: Vec<Option<MoESpec>> = (0..cfg.num_layers)
+            .map(|i| {
+                if cfg.mlp_only_layers.contains(&i) {
+                    None
+                } else {
+                    Some(spec.clone())
+                }
+            })
+            .collect();
 
         let inner = Llama::load_tp_moe(device.clone(), ws, llama_cfg, &moe_spec, tp)?;
         Ok(Self {
@@ -110,6 +120,7 @@ impl Laguna {
         })
     }
 }
+
 
 impl Model for Laguna {
     fn config(&self) -> &dyn ModelConfig {

@@ -32,6 +32,10 @@ pub struct MoESpec {
     /// Whether this architecture carries an always-on shared expert
     /// (`ffn_gate_she` / `ffn_up_she` / `ffn_down_she`).
     pub has_shared_expert: bool,
+    /// Per-routed-expert FFN width override (e.g., 1024 for Laguna-S-2.1).
+    pub moe_intermediate_size: Option<usize>,
+    /// Shared-expert FFN width override (e.g., 1024 for Laguna-S-2.1).
+    pub shared_expert_intermediate_size: Option<usize>,
 }
 
 /// A single MoE transformer layer's feed-forward (routing) block.
@@ -81,13 +85,16 @@ impl MoeBlock {
             correction_bias,
         );
 
+        let moe_inter = spec.moe_intermediate_size.unwrap_or(cfg.intermediate_size);
+        let shared_inter = spec.shared_expert_intermediate_size.unwrap_or(cfg.intermediate_size);
+
         // Per-expert SwiGLU triples from the 3D GGUF layout
         // (`ffn_gate_exps` / `ffn_up_exps` / `ffn_down_exps`).
         let experts = ExpertBank::load(
             ws,
             spec.num_experts,
             cfg.hidden_size,
-            cfg.intermediate_size,
+            moe_inter,
             /*has_bias=*/ false,
         )?;
 
@@ -96,12 +103,13 @@ impl MoeBlock {
             Some(ExpertTriple::load(
                 ws,
                 cfg.hidden_size,
-                cfg.intermediate_size,
+                shared_inter,
                 /*has_bias=*/ false,
             )?)
         } else {
             None
         };
+
 
         let moe = MoeFfn::new(router, experts, shared_expert, spec.routed_scaling_factor);
 
@@ -264,7 +272,10 @@ mod tests {
             router_kind: RouterKind::SoftmaxTopK,
             routed_scaling_factor: 1.0,
             has_shared_expert: false,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
         };
+
 
         let block = MoeBlock::load(&ws, &cfg(hidden, inter, num_experts), &spec, tp)?;
 

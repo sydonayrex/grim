@@ -350,11 +350,22 @@ struct SafetensorsConfig {
     // MoE specific
     #[serde(rename = "num_local_experts")]
     num_local_experts: Option<usize>,
+    #[serde(rename = "num_experts")]
+    num_experts: Option<usize>,
     #[serde(rename = "num_experts_per_tok")]
     num_experts_per_tok: Option<usize>,
+    #[serde(rename = "moe_intermediate_size")]
+    moe_intermediate_size: Option<usize>,
+    #[serde(rename = "shared_expert_intermediate_size")]
+    shared_expert_intermediate_size: Option<usize>,
     #[serde(rename = "routed_scaling_factor")]
     routed_scaling_factor: Option<f32>,
+    #[serde(rename = "moe_routed_scaling_factor")]
+    moe_routed_scaling_factor: Option<f32>,
+    #[serde(rename = "mlp_only_layers")]
+    mlp_only_layers: Option<Vec<usize>>,
 }
+
 
 fn load_model_from_config(
     config: SafetensorsConfig,
@@ -431,8 +442,13 @@ fn load_model_from_config(
     let routed_scaling_factor = compat_spec
         .as_ref()
         .and_then(|s| s.routed_scaling_factor)
+        .or(config.moe_routed_scaling_factor)
         .or(config.routed_scaling_factor)
-        .unwrap_or(1.0);
+        .unwrap_or(2.5);
+    let moe_intermediate_size = config.moe_intermediate_size.unwrap_or(1024);
+    let shared_expert_intermediate_size = config.shared_expert_intermediate_size.unwrap_or(1024);
+    let mlp_only_layers = config.mlp_only_layers.unwrap_or_else(|| vec![0]);
+
 
     dbg_eprintln!(
         "[grim] Loading config from safetensors: architecture={:?}, layers={}, hidden={}, vocab={}",
@@ -489,18 +505,22 @@ fn load_model_from_config(
                 head_dim,
                 num_layers,
                 intermediate_size,
+                moe_intermediate_size,
+                shared_expert_intermediate_size,
                 num_experts: expert_count,
                 num_experts_per_tok: expert_used_count,
                 routed_scaling_factor,
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
+                mlp_only_layers,
             };
 
             eprintln!("[grim] Loading Laguna model with config: {:?}", laguna_cfg);
             let m = Laguna::load_tp(device.clone(), &ws, laguna_cfg, tp)?;
             Ok(Box::new(m))
         }
+
         ModelArchitecture::Phi2 | ModelArchitecture::Phi3 | ModelArchitecture::PhiMoe => {
             let phi_cfg = PhiConfig {
                 vocab_size,
@@ -1363,17 +1383,21 @@ fn load_model_with_providers(
                 head_dim: hparams.head_dim,
                 num_layers: hparams.num_layers,
                 intermediate_size: hparams.intermediate_size,
-                num_experts: hparams.expert_count.unwrap_or(1),
-                num_experts_per_tok: hparams.expert_used_count.unwrap_or(1),
+                moe_intermediate_size: 1024,
+                shared_expert_intermediate_size: 1024,
+                num_experts: hparams.expert_count.unwrap_or(256),
+                num_experts_per_tok: hparams.expert_used_count.unwrap_or(10),
                 routed_scaling_factor: hparams.routed_scaling_factor,
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
+                mlp_only_layers: vec![0],
             };
             eprintln!("[grim] Loading Laguna model with config: {:?}", laguna_cfg);
             let m = Laguna::load_tp(device.clone(), &ws, laguna_cfg, tp)?;
             Ok(Box::new(m))
         }
+
         ModelArchitecture::Phi2 | ModelArchitecture::Phi3 | ModelArchitecture::PhiMoe => {
             let phi_cfg = PhiConfig {
                 vocab_size: hparams.vocab_size,
