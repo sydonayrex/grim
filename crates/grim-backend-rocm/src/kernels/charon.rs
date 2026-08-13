@@ -45,6 +45,26 @@ pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
 
     // ────────────────────────────────────────────────────────────────────
+    // charon_atomic_add2 — packed 2xfloat atomic epilogue for the grouped
+    // kernels (grim_moe_fused_grouped*). A token's [hidden] output row is
+    // accumulated into `out` by per-element float atomicAdd (all routed
+    // tokens share the row, so atomics are mandatory). When `hidden` is
+    // even, columns (2k, 2k+1) share one 8-byte word: a lane that has both
+    // addends issues a single 64-bit atomicAdd of a packed 2xfloat
+    // register. The CAS loop serializes the 64-bit add exactly like two
+    // independent 32-bit atomicAdds to the same word, and float addition
+    // is associativity-tolerant at identical precision, so the packed
+    // result is bit-exact versus the scalar path. Odd `hidden` keeps the
+    // per-element path in the kernels. `out` must be 8-byte aligned; the
+    // launcher's even row stride (hidden even) plus the 16-byte allocator
+    // alignment guarantee column 0 of every row starts 8-aligned.
+    __device__ __forceinline__ void charon_atomic_add2(
+        float* out, unsigned long long idx2, float add0, float add1) {
+        float2 p = make_float2(add0, add1);
+        atomicAdd((unsigned long long*)out + idx2, *(unsigned long long*)&p);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
     // grim_moe_fused_dispatch — sortless fused MoE dispatch (WI-A).
     //
     // One launch carries every routed token to its expert. The grid is
@@ -195,6 +215,8 @@ extern "C" {
             const float* uw = expert_up_w   + (unsigned long long)exp * inter * hidden;
             const float* dw = expert_down_w + (unsigned long long)exp * hidden * inter;
 
+            float acc_prev = 0.0f;
+            const bool odd_hidden = (hidden & 1) != 0;
             for (int h = 0; h < hidden; ++h) {
                 float acc = 0.0f;
                 for (int j = 0; j < inter; ++j) {
@@ -208,8 +230,16 @@ extern "C" {
                     float act = silu_g * u;
                     acc += dw[h * inter + j] * act;
                 }
-                unsigned long long out_idx = (unsigned long long)tok * hidden + h;
-                atomicAdd(out + out_idx, routed_scaling_factor * w * acc);
+                if (odd_hidden) {
+                    atomicAdd(out + (unsigned long long)tok * hidden + h,
+                              routed_scaling_factor * w * acc);
+                } else if (h & 1) {
+                    charon_atomic_add2(out, (unsigned long long)tok * hidden + (h - 1),
+                                       routed_scaling_factor * w * acc_prev,
+                                       routed_scaling_factor * w * acc);
+                } else {
+                    acc_prev = acc;
+                }
             }
         }
     }
@@ -295,6 +325,8 @@ __global__ void grim_moe_fused_grouped_fp8(
         const float* us = up_scale   + (unsigned long long)exp * inter * h16;
         const float* ds = down_scale + (unsigned long long)exp * hidden * i16;
 
+        float acc_prev = 0.0f;
+        const bool odd_hidden = (hidden & 1) != 0;
         for (int h = 0; h < hidden; ++h) {
             float acc = 0.0f;
             for (int j = 0; j < inter; ++j) {
@@ -316,8 +348,16 @@ __global__ void grim_moe_fused_grouped_fp8(
                 acc += fp8e4m3_to_f32(dw[h * inter + j]) * ds[didx] * act;
             }
             // Per-token activation scale folds into the single output mul.
-            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
-            atomicAdd(out + out_idx, routed_scaling_factor * w * as * acc);
+            if (odd_hidden) {
+                atomicAdd(out + (unsigned long long)tok * hidden + h,
+                          routed_scaling_factor * w * as * acc);
+            } else if (h & 1) {
+                charon_atomic_add2(out, (unsigned long long)tok * hidden + (h - 1),
+                                   routed_scaling_factor * w * as * acc_prev,
+                                   routed_scaling_factor * w * as * acc);
+            } else {
+                acc_prev = acc;
+            }
         }
     }
 }
@@ -381,6 +421,8 @@ __global__ void grim_moe_fused_grouped_mxfp4(
         const unsigned char* ue = eup_e   + (unsigned long long)exp * (inter * hidden / 32);
         const unsigned char* de = edown_e + (unsigned long long)exp * (hidden * inter / 32);
 
+        float acc_prev = 0.0f;
+        const bool odd_hidden = (hidden & 1) != 0;
         for (int h = 0; h < hidden; ++h) {
             float acc = 0.0f;
             for (int j = 0; j < inter; ++j) {
@@ -397,8 +439,16 @@ __global__ void grim_moe_fused_grouped_mxfp4(
                 const int didx = (h * inter + j) / 32;
                 acc += mxfp4_e2m1_to_f32(mxfp4_code_at(dw, h * inter + j), de[didx]) * act;
             }
-            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
-            atomicAdd(out + out_idx, routed_scaling_factor * w * as * acc);
+            if (odd_hidden) {
+                atomicAdd(out + (unsigned long long)tok * hidden + h,
+                          routed_scaling_factor * w * as * acc);
+            } else if (h & 1) {
+                charon_atomic_add2(out, (unsigned long long)tok * hidden + (h - 1),
+                                   routed_scaling_factor * w * as * acc_prev,
+                                   routed_scaling_factor * w * as * acc);
+            } else {
+                acc_prev = acc;
+            }
         }
     }
 }
@@ -435,6 +485,8 @@ extern "C" __global__ void grim_moe_fused_grouped_mxfp8(
         const unsigned char* ue = eup_e   + (unsigned long long)exp * (inter * hidden / 32);
         const unsigned char* de = edown_e + (unsigned long long)exp * (hidden * inter / 32);
 
+        float acc_prev = 0.0f;
+        const bool odd_hidden = (hidden & 1) != 0;
         for (int h = 0; h < hidden; ++h) {
             float acc = 0.0f;
             for (int j = 0; j < inter; ++j) {
@@ -451,8 +503,16 @@ extern "C" __global__ void grim_moe_fused_grouped_mxfp8(
                 const int didx = (h * inter + j) / 32;
                 acc += mxfp8_e4m3_to_f32(dw[h * inter + j], de[didx]) * act;
             }
-            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
-            atomicAdd(out + out_idx, routed_scaling_factor * w * as * acc);
+            if (odd_hidden) {
+                atomicAdd(out + (unsigned long long)tok * hidden + h,
+                          routed_scaling_factor * w * as * acc);
+            } else if (h & 1) {
+                charon_atomic_add2(out, (unsigned long long)tok * hidden + (h - 1),
+                                   routed_scaling_factor * w * as * acc_prev,
+                                   routed_scaling_factor * w * as * acc);
+            } else {
+                acc_prev = acc;
+            }
         }
     }
 }
@@ -508,6 +568,8 @@ extern "C" __global__ void grim_moe_fused_grouped_q80(
         const int dstride = (hidden * inter * 34) / 32; // bytes per expert for down
         const unsigned char* dw = edown_w + (unsigned long long)exp * dstride;
 
+        float acc_prev = 0.0f;
+        const bool odd_hidden = (hidden & 1) != 0;
         for (int h = 0; h < hidden; ++h) {
             float acc = 0.0f;
             for (int j = 0; j < inter; ++j) {
@@ -530,8 +592,16 @@ extern "C" __global__ void grim_moe_fused_grouped_q80(
                 const int di = (h * inter + j) - dblk * 32;
                 acc += (float)(*(const signed char*)(dw + (unsigned long long)dblk * 34 + 2 + di)) * dscale * act;
             }
-            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
-            atomicAdd(out + out_idx, routed_scaling_factor * w * as * acc);
+            if (odd_hidden) {
+                atomicAdd(out + (unsigned long long)tok * hidden + h,
+                          routed_scaling_factor * w * as * acc);
+            } else if (h & 1) {
+                charon_atomic_add2(out, (unsigned long long)tok * hidden + (h - 1),
+                                   routed_scaling_factor * w * as * acc_prev,
+                                   routed_scaling_factor * w * as * acc);
+            } else {
+                acc_prev = acc;
+            }
         }
     }
 }
@@ -863,6 +933,8 @@ extern "C" __global__ void grim_moe_fused_grouped_iqk(
 
         float scratch[IQK_CHUNK];
 
+        float acc_prev = 0.0f;
+        const bool odd_hidden = (hidden & 1) != 0;
         for (int h = 0; h < hidden; ++h) {
             float acc = 0.0f;
             for (int jc = 0; jc < inter; jc += IQK_CHUNK) {
@@ -901,8 +973,16 @@ extern "C" __global__ void grim_moe_fused_grouped_iqk(
                     for (int j = 0; j < nj; ++j) acc += iqk_weight(format_id, dw, h * inter + jc + j) * actj[j];
                 }
             }
-            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
-            atomicAdd(out + out_idx, routed_scaling_factor * w * as * acc);
+            if (odd_hidden) {
+                atomicAdd(out + (unsigned long long)tok * hidden + h,
+                          routed_scaling_factor * w * as * acc);
+            } else if (h & 1) {
+                charon_atomic_add2(out, (unsigned long long)tok * hidden + (h - 1),
+                                   routed_scaling_factor * w * as * acc_prev,
+                                   routed_scaling_factor * w * as * acc);
+            } else {
+                acc_prev = acc;
+            }
         }
     }
 }
