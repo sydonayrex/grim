@@ -175,6 +175,44 @@ impl GgufDType {
         }
     }
 
+    /// Returns the canonical GGUF type tag for this dtype.
+    pub fn tag(self) -> u32 {
+        match self {
+            GgufDType::F32 => 0,
+            GgufDType::F16 => 1,
+            GgufDType::Q4_0 => 2,
+            GgufDType::Q4_1 => 3,
+            GgufDType::Q5_0 => 6,
+            GgufDType::Q5_1 => 7,
+            GgufDType::Q8_0 => 8,
+            GgufDType::Q8_1 => 9,
+            GgufDType::Q2K => 10,
+            GgufDType::Q3K => 11,
+            GgufDType::Q4K => 12,
+            GgufDType::Q5K => 13,
+            GgufDType::Q6K => 14,
+            GgufDType::Q8K => 15,
+            GgufDType::I8 => 16,
+            GgufDType::I16 => 17,
+            GgufDType::I32 => 18,
+            GgufDType::I64 => 19,
+            GgufDType::F64 => 20,
+            GgufDType::Q4_2 => 21,
+            GgufDType::Q8_1Hx => 22,
+            GgufDType::IQ2_XXS => 23,
+            GgufDType::IQ2_XS => 24,
+            GgufDType::IQ2_S => 25,
+            GgufDType::IQ3_XXS => 26,
+            GgufDType::IQ3_S => 27,
+            GgufDType::IQ1_S => 28,
+            GgufDType::IQ1_M => 29,
+            GgufDType::BF16 => 30,
+            GgufDType::IQ4_NL => 35,
+            GgufDType::IQ4_XS => 36,
+            GgufDType::MXFP4 => 39,
+        }
+    }
+
     /// Returns the number of bytes per element for this dtype (used by
     /// downstream materializers to size CPU buffers).
     pub fn elem_size(self) -> u64 {
@@ -855,7 +893,7 @@ impl GrimMetadata {
                             GgufValue::Array(vec![
                                 GgufValue::String(ov.tensor_name.clone()),
                                 GgufValue::Uint32(ov.effective_bpw),
-                                GgufValue::Uint32(ov.override_dtype as u32),
+                                GgufValue::Uint32(ov.override_dtype.tag()),
                                 GgufValue::Float32(ov.importance_score),
                                 GgufValue::String(
                                     match ov.layout_hint {
@@ -1256,7 +1294,7 @@ fn override_to_json(ov: &GrimQuantOverride) -> serde_json::Value {
     serde_json::json!({
         "tensor_name": ov.tensor_name,
         "effective_bpw": ov.effective_bpw,
-        "override_dtype": ov.override_dtype as u32,
+        "override_dtype": ov.override_dtype.tag(),
         "importance_score": ov.importance_score,
         "layout_hint": match ov.layout_hint {
             Some(GrimLayoutHint::WavefrontTiled) => "wavefront-tiled",
@@ -1358,9 +1396,9 @@ pub fn read_gguf<R: Read + Seek>(mut reader: R) -> Result<GgufFile> {
     }
     reader.read_exact(&mut buf[..4])?;
     let version = u32::from_le_bytes(buf);
-    if version != GGUF_VERSION {
+    if version != 2 && version != 3 {
         return Err(Error::Backend(format!(
-            "unsupported GGUF version {version}, expected {GGUF_VERSION}"
+            "unsupported GGUF version {version}, expected 2 or 3"
         )));
     }
     let tensor_count = read_u64_le(&mut reader)?;
