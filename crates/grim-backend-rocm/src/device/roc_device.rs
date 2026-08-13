@@ -4343,10 +4343,9 @@ impl RocmDevice {
     /// `kernels::charon::tests` (G-A2). Parity vs the CPU oracle
     /// (`MoeFfn::forward`) is G-A4 — a device-verify TODO in this sandbox.
     ///
-    /// Caller wiring lands in WI-D (`moe_charon` feature flag → transformer
-    /// MoE forward). Until then this is `allow(dead_code)` per the plan's
-    /// "device-gated TODO" discipline — not skipped silently.
-    #[allow(dead_code)]
+    /// Caller wiring lives in `grim_nn::moe::MoeFfn::forward_rocm`
+    /// (gated on the `rocm-mem` feature), reached when the activation is on
+    /// `Device::Rocm`. That path routes through `moe_fused_dispatch` below.
     pub fn launch_charon_fused_dispatch(
         &self,
         activations: &RocmStorage,

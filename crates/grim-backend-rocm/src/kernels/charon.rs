@@ -11,7 +11,9 @@
 //!
 //! * This is the **custom fused dispatch path only** — Rule 0 of
 //!   `rocm-hip-kernels`: vendor BLAS still owns dense per-expert GEMM. The
-//!   fused path is selected *only* under the `moe_charon` feature flag.
+//!   fused path is selected at runtime when the activation is on
+//!   `Device::Rocm` (`MoeFfn::forward` → `forward_rocm`, gated on the
+//!   `rocm-mem` feature).
 //! * Block size is a multiple of 64 (Wave64 mandate); tile sizes come from
 //!   `device::gemm_tuning::lookup_gemm_config`, not from per-launch autotune.
 //! * The CPU reference forward (`grim_nn::moe::MoeFfn::forward`) is the parity
