@@ -7,7 +7,9 @@ use grim_tensor::{ArithType, BackendStorage, Error, Result};
 
 use crate::{RocmStorage, hipGetDeviceProperties};
 
-/// Default launch block size: 256 threads = 4 Wave64 wavefronts on
+/// Default launch block size: 256 threads.
+/// On RDNA2 (gfx1036): 256 threads = 8 Wave32 wavefronts (32 threads each).
+/// On CDNA (gfx9xx): 256 threads = 4 Wave64 wavefronts (64 threads each).
 pub const ROCM_COMPUTE_BLOCK: u32 = 256;
 
 /// Grid/block dims for a 1-D launch over `total` elements.

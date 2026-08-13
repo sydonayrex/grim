@@ -155,6 +155,7 @@ pub enum ModelArchitecture {
     DiffusionGemma,
     MiniMaxM3,
     MuseGlimmer,
+    SolarOpen2,
     Unknown,
 }
 
@@ -236,7 +237,7 @@ impl ModelArchitecture {
             "deepseek2" | "deepseek_v2" => Self::DeepSeek2,
             "deepseek2ocr" => Self::DeepSeek2Ocr,
             "deepseek32" => Self::DeepSeek32,
-            "deepseek4" | "deepseek_v3" | "deepseek_r1" => Self::DeepSeek4,
+            "deepseek4" | "deepseek_v4" | "deepseek_v3" | "deepseek_r1" => Self::DeepSeek4,
             "chatglm" => Self::ChatGlm,
             "glm4" => Self::Glm4,
             "glm4moe" | "glm4_moe" => Self::Glm4Moe,
@@ -311,6 +312,7 @@ impl ModelArchitecture {
             "diffusion_gemma" | "diffusion-gemma" | "diffusiongemma" => Self::DiffusionGemma,
             "minimax-m3" | "minimax_m3" | "minimaxm3" => Self::MiniMaxM3,
             "muse-glimmer" | "museglimmer" | "muse_glimmer" => Self::MuseGlimmer,
+            "solar_open2" | "solaropen2" | "solar-open2" => Self::SolarOpen2,
             _ => Self::Unknown,
         }
     }
@@ -465,6 +467,7 @@ impl ModelArchitecture {
             Self::Glm52 => "glm5_2",
             Self::DiffusionGemma => "diffusion_gemma",
             Self::MiniMaxM3 => "minimax_m3",
+            Self::SolarOpen2 => "solar_open2",
             Self::Unknown => "unknown",
         }
     }
@@ -1021,6 +1024,10 @@ mod tests {
         assert_eq!(
             ModelArchitecture::from_str("modern-bert"),
             ModelArchitecture::ModernBert
+        );
+        assert_eq!(
+            ModelArchitecture::from_str("deepseek_v4"),
+            ModelArchitecture::DeepSeek4
         );
         assert_eq!(
             ModelArchitecture::from_str("unknown_arch"),

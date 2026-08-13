@@ -21,7 +21,7 @@ use grim_models_mamba::{
      Lfm2, Lfm2Config, Laguna, LagunaConfig, Llama, LlamaConfig, MiniCpmConfig, MiniCpmModel,
      SmolLm2, SmolLm2Config, Qwen3Moe, Qwen3MoeConfig, Qwen35Moe, Qwen35MoeConfig,
      MiniMaxM2, MiniMaxM2Config, Orion, OrionConfig, Phi2, PhiConfig, Qwen, QwenConfig,
-     SeedOss, SeedOssConfig, T5, T5Config, WavTokenizerDec, WavTokenizerDecConfig,
+     SeedOss, SeedOssConfig, SolarOpen2, SolarOpen2Config, T5, T5Config, WavTokenizerDec, WavTokenizerDecConfig,
  };
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::{TensorParallelConfig, WeightSource};
@@ -1342,6 +1342,26 @@ fn load_model_from_config(
             let m = grim_models_transformer::MuseGlimmer::load_tp(device.clone(), &ws, muse_cfg, tp)?;
             Ok(Box::new(m))
         }
+        ModelArchitecture::SolarOpen2 => {
+            let solar_cfg = if let Some(raw_json) = raw_config_str.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()) {
+                SolarOpen2Config::from_hf(&raw_json)
+            } else {
+                SolarOpen2Config {
+                    vocab_size,
+                    hidden_size,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    num_layers,
+                    intermediate_size,
+                    rms_norm_eps,
+                    max_seq_len,
+                    ..SolarOpen2Config::default()
+                }
+            };
+            let m = SolarOpen2::load_tp(&ws, solar_cfg)?;
+            Ok(Box::new(m))
+        }
 
 
         ModelArchitecture::Arcee
@@ -2337,6 +2357,24 @@ fn load_model_with_providers(
                 vision: vision_cfg,
             };
             let m = grim_models_transformer::MuseGlimmer::load_tp(device.clone(), &ws, muse_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::SolarOpen2 => {
+            let solar_cfg = SolarOpen2Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                max_seq_len: hparams.max_seq_len,
+                num_routed_experts: lookup.get_u32("solar_open2.expert_count").map(|u| u as usize).unwrap_or(320),
+                num_shared_experts: 1,
+                top_k: lookup.get_u32("solar_open2.expert_used_count").map(|u| u as usize).unwrap_or(8),
+            };
+            let m = SolarOpen2::load_tp(&ws, solar_cfg)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::InternS2Mobius => {
