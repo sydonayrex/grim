@@ -44,6 +44,14 @@ pub struct LagunaConfig {
     pub rope_theta: f32,
     pub max_seq_len: usize,
     pub mlp_only_layers: Vec<usize>,
+    pub layer_types: Vec<String>,
+    pub sliding_window: usize,
+    pub num_attention_heads_per_layer: Vec<usize>,
+    pub full_rope_theta: f32,
+    pub sliding_rope_theta: f32,
+    pub full_partial_rotary_factor: f32,
+    pub sliding_partial_rotary_factor: f32,
+    pub gating: String,
 }
 
 impl ModelConfig for LagunaConfig {
@@ -92,10 +100,16 @@ impl Laguna {
             max_seq_len: cfg.max_seq_len,
         };
 
+        let router_kind = if cfg.gating == "per-head" {
+            RouterKind::SigmoidTopKPerHead
+        } else {
+            RouterKind::SigmoidTopKWithBias
+        };
+
         let spec = MoESpec {
             num_experts: cfg.num_experts,
             top_k: cfg.num_experts_per_tok,
-            router_kind: RouterKind::SigmoidTopKWithBias,
+            router_kind,
             routed_scaling_factor: cfg.routed_scaling_factor,
             has_shared_expert: true,
             moe_intermediate_size: Some(cfg.moe_intermediate_size),
@@ -120,6 +134,7 @@ impl Laguna {
         })
     }
 }
+
 
 
 impl Model for Laguna {

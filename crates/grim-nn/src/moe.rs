@@ -57,13 +57,16 @@ pub enum RouterKind {
     /// time only**, never to the combine weights. The bias tensor itself is
     /// loaded from the checkpoint (`exp_probs_b`) and passed to `MoeRouter::new`.
     SigmoidTopKWithBias,
+    /// Sigmoid gating evaluated per-head for Laguna-S-2.1.
+    SigmoidTopKPerHead,
 }
 
 impl RouterKind {
     fn is_bias(&self) -> bool {
-        matches!(self, RouterKind::SigmoidTopKWithBias)
+        matches!(self, RouterKind::SigmoidTopKWithBias | RouterKind::SigmoidTopKPerHead)
     }
 }
+
 
 /// Router: a gate `Linear` (`hidden -> n_experts`), the gating strategy, and an
 /// optional correction bias (for `SigmoidTopKWithBias`, loaded from `exp_probs_b`).
@@ -124,7 +127,7 @@ impl MoeRouter {
             let row = &z[t * self.num_experts..(t + 1) * self.num_experts];
             let sel_scores: Vec<f32> = match &self.kind {
                 RouterKind::SoftmaxTopK => softmax(row),
-                RouterKind::SigmoidTopKWithBias => {
+                RouterKind::SigmoidTopKWithBias | RouterKind::SigmoidTopKPerHead => {
                     let b = self
                         .correction_bias
                         .as_ref()
@@ -136,6 +139,7 @@ impl MoeRouter {
                         .map(|(i, &v)| sigmoid(v) + b.get(i).copied().unwrap_or(0.0))
                         .collect()
                 }
+
             };
             // Rank by selection scores, take top_k.
             let mut order: Vec<usize> = (0..self.num_experts).collect();
@@ -154,9 +158,10 @@ impl MoeRouter {
                     let logits: Vec<f32> = chosen.iter().map(|&i| row[i]).collect();
                     softmax(&logits)
                 }
-                RouterKind::SigmoidTopKWithBias => {
+                RouterKind::SigmoidTopKWithBias | RouterKind::SigmoidTopKPerHead => {
                     chosen.iter().map(|&i| sigmoid(row[i])).collect()
                 }
+
             };
             indices.push(chosen.to_vec());
             weights.push(raw);

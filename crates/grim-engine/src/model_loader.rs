@@ -514,12 +514,21 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
                 mlp_only_layers,
+                layer_types: config.layer_types.unwrap_or_else(|| vec!["full_attention".into()]),
+                sliding_window: 512,
+                num_attention_heads_per_layer: vec![num_heads; num_layers],
+                full_rope_theta: 500000.0,
+                sliding_rope_theta: 10000.0,
+                full_partial_rotary_factor: 0.5,
+                sliding_partial_rotary_factor: 1.0,
+                gating: "per-head".into(),
             };
 
             eprintln!("[grim] Loading Laguna model with config: {:?}", laguna_cfg);
             let m = Laguna::load_tp(device.clone(), &ws, laguna_cfg, tp)?;
             Ok(Box::new(m))
         }
+
 
         ModelArchitecture::Phi2 | ModelArchitecture::Phi3 | ModelArchitecture::PhiMoe => {
             let phi_cfg = PhiConfig {
@@ -1392,11 +1401,20 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
                 mlp_only_layers: vec![0],
+                layer_types: vec!["full_attention".into()],
+                sliding_window: 512,
+                num_attention_heads_per_layer: vec![hparams.num_heads; hparams.num_layers],
+                full_rope_theta: 500000.0,
+                sliding_rope_theta: 10000.0,
+                full_partial_rotary_factor: 0.5,
+                sliding_partial_rotary_factor: 1.0,
+                gating: "per-head".into(),
             };
             eprintln!("[grim] Loading Laguna model with config: {:?}", laguna_cfg);
             let m = Laguna::load_tp(device.clone(), &ws, laguna_cfg, tp)?;
             Ok(Box::new(m))
         }
+
 
         ModelArchitecture::Phi2 | ModelArchitecture::Phi3 | ModelArchitecture::PhiMoe => {
             let phi_cfg = PhiConfig {
