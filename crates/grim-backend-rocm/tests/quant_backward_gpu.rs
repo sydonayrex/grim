@@ -57,20 +57,37 @@ fn quant_backward_rocm_q8_0_gemm_dx_numerics() {
     let dev = grim_backend_rocm::RocmDevice::try_new(rocm_devices[0].ordinal())
         .expect("RocmDevice::try_new should succeed for probed device");
 
-    let (m, k, n) = (8, 16, 16);
+    let (m, k, n) = (8, 32, 32);
     let dy_host: Vec<f32> = (0..m * n).map(|i| (i as f32 * 0.05).cos()).collect();
     let b_orig: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.1).sin() * 5.0).collect();
 
-    // Reference gradient on CPU
-    let dx_ref = compute_dx(&dy_host, &b_orig, m, n, k);
 
-    // Upload dy to ROCm as F32
     let dy_shape = Shape::from_slice(&[m, n]);
     let dy_rocm = dev.from_cpu(&dy_host, &dy_shape, DType::F32).unwrap();
 
-    // Quantize b to Q8_0, upload packed bytes to ROCm
-    let b_packed = quant_q80(&b_orig).unwrap();
+    let mut b_trans = vec![0.0f32; k * n];
+    for j in 0..k {
+        for l in 0..n {
+            b_trans[l * k + j] = b_orig[j * n + l];
+        }
+    }
+    let b_packed = quant_q80(&b_trans).unwrap();
     let b_rocm_shape = Shape::from_slice(&[k * n]);
+
+    // Dequantize b to FP32 for exact CPU reference gradient comparison
+    let b_dequant = grim_quant::dequant_q80(&b_packed, k * n).unwrap();
+    let mut b_dequant_untrans = vec![0.0f32; k * n];
+    for l in 0..n {
+        for j in 0..k {
+            b_dequant_untrans[j * n + l] = b_dequant[l * k + j];
+        }
+    }
+
+    // Reference gradient on CPU using dequantized weights
+    let dx_ref = compute_dx(&dy_host, &b_dequant_untrans, m, n, k);
+
+
+
     let b_rocm = dev
         .from_cpu_bytes(
             &b_packed,

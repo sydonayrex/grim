@@ -240,6 +240,12 @@ pub const HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS: i32 = 231;
 /// Wavefront size attribute id — passed to `hipDeviceGetAttribute`.
 pub const HIP_DEVICE_ATTRIBUTE_WARP_SIZE: i32 = 24;
 
+/// Maximum threads per block attribute id — passed to `hipDeviceGetAttribute`.
+pub const HIP_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: i32 = 1;
+
+/// Multiprocessor (Compute Unit) count attribute id — passed to `hipDeviceGetAttribute`.
+pub const HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 16;
+
 pub const HIP_MEM_ADVISE_SET_READ_MOSTLY: i32 = 1;
 pub const HIP_MEM_ADVISE_UNSET_READ_MOSTLY: i32 = 2;
 pub const HIP_MEM_ADVISE_SET_PREFERRED_LOCATION: i32 = 3;

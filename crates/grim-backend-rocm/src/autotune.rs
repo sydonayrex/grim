@@ -40,11 +40,21 @@ pub struct TuneKey {
     pub k: usize,
 }
 
-/// Broad category of tensor dimension shapes (e.g., Decode vs Prefill).
+/// Broad category of tensor dimension shapes (e.g., Decode vs Prefill vs TLOLog).
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ShapeClass {
-    Decode,  // m == 1
-    Prefill, // m > 1
+    Decode,  // m == 1: per-token GEMM
+    Prefill, // m > 1: large-batch GEMM
+    TLOLog,  // lm_head / logit-projection ONLY — tagged by op-identity, NOT by m
+}
+
+/// Known GEMM operational types passed into GEMM classification.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GemmOp {
+    Attention,
+    Ffn,
+    LmHead,    // -> ShapeClass::TLOLog
+    Other,
 }
 
 impl ShapeClass {
@@ -55,7 +65,16 @@ impl ShapeClass {
             Self::Prefill
         }
     }
+
+    /// Op-aware classifier. LmHead is TLOLog no matter its m; everything else bins by m.
+    pub fn from_op(op: GemmOp, m: usize) -> Self {
+        match op {
+            GemmOp::LmHead => Self::TLOLog,
+            _ => Self::from_m(m),
+        }
+    }
 }
+
 
 /// Hardware features and instruction sets required by a kernel configuration.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

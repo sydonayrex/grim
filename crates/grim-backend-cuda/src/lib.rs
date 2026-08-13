@@ -1,6 +1,10 @@
-//! CUDA backend with cuBLAS GEMM and device memory allocation.
-
+pub mod caps;
+pub mod autotune;
 pub mod kernels;
+
+pub use caps::CudaCaps;
+pub use autotune::{CudaAutotuner, CudaTileConfig, ShapeClass, GemmOp};
+
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -696,10 +700,11 @@ static DEVICE_POOL: LazyLock<Mutex<HashMap<usize, CudaDevice>>> =
 #[derive(Debug, Clone)]
 pub struct CudaDevice {
     pub(crate) ordinal: usize,
+    pub caps: CudaCaps,
     cublas_handle: Arc<Mutex<Option<CublasHandle>>>,
 }
 
-// SAFETY: `CudaDevice` contains only `usize` and `Arc<Mutex<Option<CublasHandle>>>`.
+// SAFETY: `CudaDevice` contains only `usize`, `CudaCaps`, and `Arc<Mutex<Option<CublasHandle>>>`.
 // Both fields are `Send + Sync` by construction, so `CudaDevice` is
 // automatically `Send + Sync` — the explicit `unsafe impl` is retained
 // only to document the invariant; it could be removed entirely.
@@ -725,13 +730,24 @@ impl CudaDevice {
                 None
             }
         };
+        let caps = CudaCaps::probe_default(ordinal, format!("CUDA Device {ordinal}"), 8, 9);
         let dev = Self {
             ordinal,
+            caps,
             cublas_handle: Arc::new(Mutex::new(cublas_handle)),
         };
         pool.insert(ordinal, dev.clone());
         Ok(dev)
     }
+
+    pub fn caps(&self) -> &CudaCaps {
+        &self.caps
+    }
+
+    pub fn hw_fingerprint(&self) -> u64 {
+        self.caps.cache_key_hash()
+    }
+
 
     /// Probes for available CUDA GPUs and returns a device per instance.
     pub fn probe() -> Result<Vec<CudaDevice>> {

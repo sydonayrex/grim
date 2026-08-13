@@ -39,10 +39,12 @@ extern "C" {
         unsigned char shared_exp = exps[group_idx];
         unsigned char fp8_code = codes[idx];
         float fp8_val = fp8_e4m3_to_float_hip(fp8_code);
-        float exp_scale = powf(2.0f, (float)shared_exp - 127.0f);
+        float exp_scale = exp2f((float)shared_exp - 127.0f);
 
         out[idx] = fp8_val * exp_scale;
     }
+
+
 
 }
 "#;

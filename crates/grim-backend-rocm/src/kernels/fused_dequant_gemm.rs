@@ -49,10 +49,10 @@ extern "C" {
     }
 
     __global__ void grim_fused_dequant_gemm_f16(
-        const _Float16* __restrict__ A,
+        const float* __restrict__ A,
         const unsigned char* __restrict__ B_codes,
         const unsigned char* __restrict__ B_scales,
-        _Float16* __restrict__ C,
+        float* __restrict__ C,
         int M, int N, int K,
         int stride_a, int stride_c,
         int default_bpw,
@@ -80,7 +80,7 @@ extern "C" {
 
         float acc = 0.0f;
         for (int k = 0; k < K; ++k) {
-            float a_val = (float)A[row * stride_a + k];
+            float a_val = A[row * stride_a + k];
             
             float w_val = 0.0f;
             int flat_weight_idx = col * K + k;
@@ -107,8 +107,9 @@ extern "C" {
             acc += a_val * w_val;
         }
 
-        C[row * stride_c + col] = (_Float16)acc;
+        C[row * stride_c + col] = acc;
     }
+
 
     // ────────────────────────────────────────────────────────────────────
     // Backward kernel with Straight-Through Estimator (STE).

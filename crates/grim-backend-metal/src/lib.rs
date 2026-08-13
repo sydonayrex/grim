@@ -1,4 +1,9 @@
-//! Metal backend for Apple Silicon GPUs using MSL compute pipelines.
+pub mod caps;
+pub mod autotune;
+
+pub use caps::MetalCaps;
+pub use autotune::{MetalAutotuner, MetalTileConfig, ShapeClass, GemmOp};
+
 
 use grim_tensor::backend::{ComputeHandle, ReadyHandle};
 #[allow(unused_imports)]
@@ -417,27 +422,7 @@ impl BackendStorage for MetalStorage {
     }
 }
 
-#[cfg(target_vendor = "apple")]
-#[derive(Debug, Clone)]
-pub struct MetalDevice {
-    ordinal: usize,
-    inner: Option<std::sync::Arc<MetalDeviceInner>>,
-}
 
-#[cfg(target_vendor = "apple")]
-#[derive(Debug)]
-struct MetalDeviceInner {
-    device: Retained<ProtocolObject<dyn MTLDevice>>,
-    command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    pipelines: std::sync::Arc<MetalPipelines>,
-    active_command_buffer: std::sync::Mutex<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
-}
-
-#[cfg(not(target_vendor = "apple"))]
-#[derive(Debug, Clone)]
-pub struct MetalDevice {
-    ordinal: usize,
-}
 
 #[cfg(target_vendor = "apple")]
 fn fnv1a_hash(s: &str) -> u64 {
@@ -468,6 +453,30 @@ fn get_cache_dir() -> Option<std::path::PathBuf> {
     }
 }
 
+#[cfg(target_vendor = "apple")]
+#[derive(Debug, Clone)]
+pub struct MetalDevice {
+    ordinal: usize,
+    pub caps: MetalCaps,
+    inner: Option<std::sync::Arc<MetalDeviceInner>>,
+}
+
+#[cfg(target_vendor = "apple")]
+#[derive(Debug)]
+struct MetalDeviceInner {
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    pipelines: std::sync::Arc<MetalPipelines>,
+    active_command_buffer: std::sync::Mutex<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[derive(Debug, Clone)]
+pub struct MetalDevice {
+    ordinal: usize,
+    pub caps: MetalCaps,
+}
+
 impl MetalDevice {
     pub fn new(ordinal: usize) -> Result<Self> {
         #[cfg(target_vendor = "apple")]
@@ -476,11 +485,15 @@ impl MetalDevice {
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            Ok(Self { ordinal })
+            Ok(Self {
+                ordinal,
+                caps: MetalCaps::probe_default(ordinal as u64, format!("Metal Device {ordinal}"), 7),
+            })
         }
     }
 
     pub fn try_new(ordinal: usize) -> Result<Self> {
+        let caps = MetalCaps::probe_default(ordinal as u64, format!("Apple Metal GPU {ordinal}"), 8);
         #[cfg(target_vendor = "apple")]
         {
             let ctx = MetalContext::get()?;
@@ -492,13 +505,22 @@ impl MetalDevice {
             });
             Ok(Self {
                 ordinal,
+                caps,
                 inner: Some(inner),
             })
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            Ok(Self { ordinal })
+            Ok(Self { ordinal, caps })
         }
+    }
+
+    pub fn caps(&self) -> &MetalCaps {
+        &self.caps
+    }
+
+    pub fn hw_fingerprint(&self) -> u64 {
+        self.caps.cache_key_hash()
     }
 
     #[cfg(target_vendor = "apple")]
@@ -4428,12 +4450,7 @@ impl MetalDevice {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MetalTileConfig {
-    pub block_m: u32,
-    pub block_n: u32,
-    pub block_k: u32,
-}
+
 
 pub struct Tuner;
 

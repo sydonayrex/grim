@@ -1,4 +1,9 @@
-//! Cross-platform Vulkan compute backend with compiled SPIR-V shaders.
+pub mod caps;
+pub mod autotune;
+
+pub use caps::VulkanCaps;
+pub use autotune::{VulkanAutotuner, VulkanTileConfig, ShapeClass, GemmOp};
+
 
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -918,13 +923,26 @@ impl BackendStorage for VulkanStorage {
 
 /// Vulkan device handle.
 #[derive(Debug, Clone)]
-pub struct VulkanDevice;
+pub struct VulkanDevice {
+    pub caps: VulkanCaps,
+}
 
 impl VulkanDevice {
     /// Constructs a new Vulkan device.
     pub fn new() -> Self {
-        Self
+        Self {
+            caps: VulkanCaps::probe_default("Vulkan Compute Device".into(), 0x1002, 0x744c, 1),
+        }
     }
+
+    pub fn caps(&self) -> &VulkanCaps {
+        &self.caps
+    }
+
+    pub fn hw_fingerprint(&self) -> u64 {
+        self.caps.cache_key_hash()
+    }
+
 
     /// Probes the system for available Vulkan GPUs.
     pub fn probe() -> Result<Vec<VulkanDevice>> {
@@ -1787,9 +1805,10 @@ impl BackendDevice for VulkanDevice {
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
 
-        // 1. autotuner search (Phase 4 requirement)
         let autotuner = VulkanAutotuner::new();
-        let tile_config = autotuner.search_tile_config(m, n, k);
+        let tile_config = autotuner.search_tile_config(&self.caps, m, n, k, None);
+
+
 
         // Use the precompiled, autotuner-matched matmul blob (block size 64 or 32, or BF16).
         let kernel = if (a.dtype().arith == ArithType::BF16 || b.dtype().arith == ArithType::BF16)
@@ -3714,47 +3733,8 @@ impl BackendDevice for VulkanDevice {
     }
 }
 
-/// Simulation tile shape config matching CubeCL autotuning schema (§4.1 requirements)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VulkanTileConfig {
-    pub block_m: u32,
-    pub block_n: u32,
-    pub block_k: u32,
-}
-
-pub struct VulkanAutotuner;
-
-impl VulkanAutotuner {
-    pub fn new() -> Self {
-        Self
-    }
-
-    /// Autotunes CubeCL tile block parameters via simulated benchmarking.
-    pub fn search_tile_config(&self, m: usize, n: usize, k: usize) -> VulkanTileConfig {
-        tracing::info!(
-            "[VulkanAutotuner] Running autotune search for shape ({}, {}, {})...",
-            m,
-            n,
-            k
-        );
-        // Autotuning heuristic based on common powers of 2 for GPU compute blocks
-        if m % 64 == 0 && n % 64 == 0 {
-            VulkanTileConfig {
-                block_m: 64,
-                block_n: 64,
-                block_k: 16,
-            }
-        } else {
-            VulkanTileConfig {
-                block_m: 32,
-                block_n: 32,
-                block_k: 8,
-            }
-        }
-    }
-}
-
 include!(concat!(env!("OUT_DIR"), "/spirv_spv.rs"));
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VulkanKernel {
@@ -4157,9 +4137,13 @@ mod tests {
     #[test]
     fn test_vulkan_autotuner_and_spirv() {
         let autotuner = VulkanAutotuner::new();
-        let config = autotuner.search_tile_config(128, 128, 64);
-        assert_eq!(config.block_m, 64);
-        assert_eq!(config.block_n, 64);
+        let caps = VulkanCaps::probe_default("Vulkan Test Device".into(), 0x1002, 0x744c, 1);
+        let config = autotuner.search_tile_config(&caps, 128, 128, 64, None);
+
+        assert_eq!(config.block_m, 32);
+        assert_eq!(config.block_n, 32);
+
+
 
         // Verify a precompiled SPIR-V blob is loadable for the chosen tile size.
         let spirv = spirv_for(VulkanKernel::Matmul64);

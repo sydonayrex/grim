@@ -27,8 +27,61 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::cross_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::rwkv::KERNEL_SOURCE);
     s.push_str(crate::kernels::quant_standalone::KERNEL_SOURCE);
+    s.push_str(crate::kernels::silu_mul_quant::SILU_MUL_QUANT_KERNEL_SOURCE);
+    s.push_str(crate::kernels::sage_attention::SAGE_ATTENTION_KERNEL_SOURCE);
     s
 }
+
+
+/// Generate JIT kernel source parameterized by HardwareSpec, tile selection, and multi-GPU shard parameters.
+pub fn compute_kernel_source_with_spec(
+    spec: &crate::device::hardware_spec::HardwareSpec,
+    _entry: &str,
+    shape_class: crate::autotune::ShapeClass,
+    dims: crate::kernels::tile_picker::ShapeDims,
+    device_id: u32,
+    num_devices: u32,
+    tiles: Option<&crate::kernels::tile_picker::TileConfig>,
+) -> String {
+    let tiles = match tiles {
+        Some(t) => t.clone(),
+        None => crate::kernels::tile_picker::pick_tiles(spec, shape_class, dims),
+    };
+
+    let mut source = compute_kernel_source();
+
+    let defines = format!(
+        r#"
+#define GRIM_WAVEFRONT_SIZE   {}
+#define GRIM_MAX_LDS_BYTES    {}
+#define GRIM_CU_COUNT         {}
+#define GRIM_BLOCK_M          {}
+#define GRIM_BLOCK_N          {}
+#define GRIM_BLOCK_K          {}
+#define GRIM_SPLIT_K          {}
+#define GRIM_GRID_STRIDE_M    {}
+#define GRIM_GRID_STRIDE_N    {}
+#define GRIM_DEVICE_ID        {}
+#define GRIM_NUM_DEVICES      {}
+
+"#,
+        spec.wavefront_size,
+        spec.max_shared_mem_per_block,
+        spec.cu_count,
+        tiles.block_m,
+        tiles.block_n,
+        tiles.block_k,
+        tiles.split_k,
+        tiles.grid_stride_m,
+        tiles.grid_stride_n,
+        device_id,
+        num_devices,
+    );
+
+    source.push_str(&defines);
+    source
+}
+
 
 #[cfg(test)]
 mod source_asm_self_tests {

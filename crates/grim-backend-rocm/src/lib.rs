@@ -8,6 +8,18 @@
 //! This crate provides the `RocmDevice` and `RocmStorage` implementations with FFI bindings to:
 //! - HIP runtime (`libamdhip64.so`): `hipMalloc`, `hipFree`, `hipMemcpy`
 //! - rocBLAS (`librocblas.so`): `rocblas_create_handle`, `rocblas_sgemm`, etc.
+//!
+//! # Feature gates (jit-mgpu.md §10)
+//!
+//! - **`jit-hw-adaptive`** *(default on)* — hardware-adaptive JIT. `launch_compute_kernel`
+//!   injects hardware-discovered `#define`s (wavefront/LDS/CU + tile geometry from
+//!   [`device::hardware_spec::HardwareSpec`] + [`kernels::tile_picker::pick_tiles`]) into the
+//!   kernel source before hiprtc compile, and keys the `.hsaco` cache by a hardware
+//!   fingerprint. Disable to fall back to the static source path.
+//! - **`multi-gpu-kernel`** *(default off)* — multi-GPU kernel launch
+//!   ([`multi_gpu_launch::launch_multi_gpu_kernel`]): splits the M dimension across devices,
+//!   JIT-compiles a per-device kernel, and RCCL-all-reduces the shards. Off by default because
+//!   it requires RCCL initialization and P2P setup not all deployments need.
 
 pub use grim_tensor::Shape;
 use grim_tensor::dtype::{DType, QuantProvenance};
@@ -32,7 +44,10 @@ pub mod gptq_kernel;
 pub mod graph_capture;
 pub mod kernels;
 pub mod memory;
+#[cfg(feature = "multi-gpu-kernel")]
+pub mod multi_gpu_launch;
 pub mod p2p_route;
+
 pub mod peer_access;
 pub mod perf_gate;
 pub mod quantization;

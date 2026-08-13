@@ -32,7 +32,43 @@ extern "C" __global__ void grim_comm_fuse_p2p_epilogue(
         atomicAdd(&peer_out[row * n_total + col_offset + col], local_out[row * n_local + col]);
     }
 }
+
+extern "C" __global__ void grim_fused_allreduce_rms_norm(
+    const float* __restrict__ local_in,
+    const float* __restrict__ peer_in,
+    const float* __restrict__ weight,
+    float* __restrict__ res_out,
+    float* __restrict__ norm_out,
+    float eps,
+    int n,
+    int hidden_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    int col = idx % hidden_dim;
+    float added = local_in[idx] + peer_in[idx];
+    res_out[idx] = added;
+
+    __shared__ float s_sum_sq[256];
+    int tid = threadIdx.x;
+    s_sum_sq[tid] = added * added;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+        }
+        __syncthreads();
+    }
+
+    float mean_sq = s_sum_sq[0] / (float)hidden_dim;
+    float scale = 1.0f / sqrtf(mean_sq + eps);
+
+    norm_out[idx] = added * scale * weight[col];
+}
 "#;
+
 
 // ── Host-side CommFuse orchestrator ──────────────────────────────────────────
 
