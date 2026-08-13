@@ -4,6 +4,7 @@ pub mod block;
 /// Shared MoE block (router + expert bank + optional shared expert).
 pub mod moe_block;
 pub mod qwen3moe;
+pub mod qwen35moe;
 pub mod configs;
 pub mod deepseek;
 pub mod gemma;
@@ -222,6 +223,7 @@ pub use gemma4_assistant::{Gemma4Assistant, Gemma4AssistantConfig};
 pub use qwen3next::{Qwen3Next, Qwen3NextConfig};
 pub use qwen2vl::{Qwen2Vl, Qwen2VlConfig};
 pub use qwen2moe::{Qwen2Moe, Qwen2MoeConfig};
+pub use qwen35moe::{Qwen35Moe, Qwen35MoeConfig};
 pub use plm::{Plm, PlmConfig};
 pub use smallthinker::{SmallThinker, SmallThinkerConfig};
 pub use qwen3::{Qwen3, Qwen3Config};
@@ -264,6 +266,9 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             max_seq_len: 256,
+        
+            partial_rotary_factor: 1.0,
+            yarn: None,
         };
         let model = Llama::random(Device::Cpu, cfg);
         let tok = grim_backend_cpu::cpu_tensor(vec![1.0f32], grim_tensor::Shape::new(vec![1]));
@@ -293,6 +298,9 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             max_seq_len: 32,
+        
+            partial_rotary_factor: 1.0,
+            yarn: None,
         };
         let model = Llama::random(Device::Cpu, cfg);
         let tok =

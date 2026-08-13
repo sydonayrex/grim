@@ -1478,11 +1478,33 @@ impl Default for KdaLayerCache {
     }
 }
 
-/// Heterogeneous layer cache unifying MLA and KDA state.
+#[derive(Debug, Clone)]
+pub struct LinearAttentionLayerCache {
+    pub conv_state: Option<Tensor>,
+    pub recurrent_state: Option<Tensor>,
+}
+
+impl LinearAttentionLayerCache {
+    pub fn new() -> Self {
+        Self {
+            conv_state: None,
+            recurrent_state: None,
+        }
+    }
+}
+
+impl Default for LinearAttentionLayerCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Heterogeneous layer cache unifying MLA, KDA, and Linear Attention state.
 #[derive(Debug, Clone)]
 pub enum LayerCache {
     Mla(MlaKvCache),
     Kda(KdaLayerCache),
+    LinearAttention(LinearAttentionLayerCache),
 }
 
 /// Depthwise 1D causal convolution `out = conv1d(x, weight, bias)`.
@@ -1813,6 +1835,128 @@ impl KdaAttention {
         }
 
         let out_shape = Shape::new(vec![b, s, self.num_heads * self.v_dim]);
+        let dev = pick_device_for_tensor(x);
+        let storage = dev.from_cpu(&y_vec, &out_shape, DType::F32)?;
+        let out_t = Tensor::new(
+            Arc::from(storage),
+            out_shape,
+            DType::F32,
+            x.provenance().clone(),
+            x.device().clone(),
+        );
+
+        self.o_proj.forward(&out_t)
+    }
+}
+
+/// Qwen 3.5 / 3.8 Linear Attention Block with short conv, linear attention state update, and Swish output gating.
+#[derive(Clone)]
+pub struct LinearAttentionBlock {
+    pub q_proj: Linear,
+    pub k_proj: Linear,
+    pub v_proj: Linear,
+    pub gate_proj: Option<Linear>,
+    pub conv_weight: Tensor,
+    pub conv_bias: Option<Tensor>,
+    pub o_proj: Linear,
+    pub num_k_heads: usize,
+    pub num_v_heads: usize,
+    pub k_head_dim: usize,
+    pub v_head_dim: usize,
+}
+
+impl LinearAttentionBlock {
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        cache: Option<&mut LinearAttentionLayerCache>,
+    ) -> Result<Tensor> {
+        let dims = x.shape().dims();
+        let (b, s, _d) = (dims[0], dims[1], dims[2]);
+
+        let q = self.q_proj.forward(x)?;
+        let k = self.k_proj.forward(x)?;
+        let v_raw = self.v_proj.forward(x)?;
+
+        let (conv_st, mut rec_st) = match cache {
+            Some(c) => (c.conv_state.as_mut(), c.recurrent_state.as_mut()),
+            None => (None, None),
+        };
+
+        let v = short_conv1d(&v_raw, &self.conv_weight, self.conv_bias.as_ref(), conv_st)?;
+        let gate = if let Some(ref g_proj) = self.gate_proj {
+            Some(g_proj.forward(x)?)
+        } else {
+            None
+        };
+
+        let q_vec = q.to_vec_f32()?;
+        let k_vec = k.to_vec_f32()?;
+        let v_vec = v.to_vec_f32()?;
+        let gate_vec = gate.as_ref().map(|g| g.to_vec_f32()).transpose()?;
+
+        let mut y_vec = vec![0.0f32; b * s * self.num_v_heads * self.v_head_dim];
+        let state_size = self.k_head_dim * self.v_head_dim;
+
+        for bi in 0..b {
+            for hi in 0..self.num_v_heads {
+                let k_head_idx = hi % self.num_k_heads;
+                let mut state = vec![0.0f32; state_size];
+                if let Some(ref st) = rec_st {
+                    let st_vec = st.to_vec_f32()?;
+                    let off = (bi * self.num_v_heads + hi) * state_size;
+                    if off + state_size <= st_vec.len() {
+                        state.copy_from_slice(&st_vec[off..off + state_size]);
+                    }
+                }
+
+                for si in 0..s {
+                    let qk_token_off = (bi * s + si) * self.num_k_heads + k_head_idx;
+                    let v_token_off = (bi * s + si) * self.num_v_heads + hi;
+
+                    let q_tok = &q_vec[qk_token_off * self.k_head_dim..(qk_token_off + 1) * self.k_head_dim];
+                    let k_tok = &k_vec[qk_token_off * self.k_head_dim..(qk_token_off + 1) * self.k_head_dim];
+                    let v_tok = &v_vec[v_token_off * self.v_head_dim..(v_token_off + 1) * self.v_head_dim];
+
+                    // Outer product state update: S += k^T * v
+                    for ki in 0..self.k_head_dim {
+                        for vi in 0..self.v_head_dim {
+                            state[ki * self.v_head_dim + vi] += k_tok[ki] * v_tok[vi];
+                        }
+                    }
+
+                    // Query state contraction: y = q * S
+                    let y_off = ((bi * s + si) * self.num_v_heads + hi) * self.v_head_dim;
+                    for vi in 0..self.v_head_dim {
+                        let mut sum = 0.0f32;
+                        for ki in 0..self.k_head_dim {
+                            sum += q_tok[ki] * state[ki * self.v_head_dim + vi];
+                        }
+                        if let Some(ref gv) = gate_vec {
+                            let g = gv.get(y_off + vi).copied().unwrap_or(0.0);
+                            let silu_g = g / (1.0 + (-g).exp());
+                            sum *= silu_g;
+                        }
+                        y_vec[y_off + vi] = sum;
+                    }
+                }
+
+                if let Some(ref mut st) = rec_st {
+                    let dev = pick_device_for_tensor(x);
+                    let shape = Shape::new(vec![b, self.num_v_heads, self.k_head_dim, self.v_head_dim]);
+                    let storage = dev.from_cpu(&state, &shape, DType::F32)?;
+                    **st = Tensor::new(
+                        Arc::from(storage),
+                        shape,
+                        DType::F32,
+                        x.provenance().clone(),
+                        x.device().clone(),
+                    );
+                }
+            }
+        }
+
+        let out_shape = Shape::new(vec![b, s, self.num_v_heads * self.v_head_dim]);
         let dev = pick_device_for_tensor(x);
         let storage = dev.from_cpu(&y_vec, &out_shape, DType::F32)?;
         let out_t = Tensor::new(

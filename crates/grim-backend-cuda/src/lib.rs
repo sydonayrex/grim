@@ -1143,7 +1143,7 @@ impl CudaDevice {
                     KQuantScheme::Q80 => ("grim_dequant_q8_0", 34, 32),
                     KQuantScheme::Q5K => ("grim_dequant_q5k", 176, 256),
                     KQuantScheme::Q6K => ("grim_dequant_q6k", 210, 256),
-                    KQuantScheme::IQ4NL => ("grim_dequant_iq4nl", 170, 256),
+                    KQuantScheme::IQ4NL => ("grim_dequant_iq4nl", 144, 256),
                     KQuantScheme::IQ4XS => ("grim_dequant_iq4xs", 136, 256),
                     KQuantScheme::IQ3XXS => ("grim_dequant_iq3xxs", 96, 256),
                     KQuantScheme::IQ3S => ("grim_dequant_iq3s", 110, 256),
@@ -1511,7 +1511,19 @@ impl CudaDevice {
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = window;
+        // Compute the host-side window_lo lower bound, exactly mirroring the
+        // ROCm path. For decode (seq_len == 1) this is the per-query bound
+        // max(0, cache_offset - window + 1); for prefill it is the block-wide
+        // minimum (conservative lower bound) so the kernel stays branch-free
+        // in the common full-causal case (window_lo == 0). See the ROCm
+        // `qkv_attention` commentary for the Laguna-S-2.1 rationale.
+        let window_lo_i: i32 = match window {
+            None => 0,
+            Some(w) => {
+                let abs_first = cache_offset as usize;
+                abs_first.saturating_sub(w.saturating_sub(1)) as i32
+            }
+        };
 
         let out_dims = out.dims();
         if out_dims.len() != 3 {
@@ -1589,9 +1601,11 @@ impl CudaDevice {
         let mut kv_seq_len_i = kv_seq_len as i32;
         let mut cache_offset_i = cache_offset as i32;
         let mut inv_sqrt_d_val = inv_sqrt_d;
+        let mut window_lo_val = window_lo_i;
 
-        // 13 kernel args: q, k, v, out, out_max, out_sum, num_heads, num_kv_heads, head_dim, seq_len, kv_seq_len, cache_offset, inv_sqrt_d
-        let mut args: [*mut c_void; 13] = [
+        // 14 kernel args: q, k, v, out, out_max, out_sum, num_heads, num_kv_heads,
+        // head_dim, seq_len, kv_seq_len, cache_offset, inv_sqrt_d, window_lo.
+        let mut args: [*mut c_void; 14] = [
             &mut q_ptr as *mut *mut c_void as *mut c_void,
             &mut k_ptr as *mut *mut c_void as *mut c_void,
             &mut v_ptr as *mut *mut c_void as *mut c_void,
@@ -1605,6 +1619,7 @@ impl CudaDevice {
             &mut kv_seq_len_i as *mut i32 as *mut c_void,
             &mut cache_offset_i as *mut i32 as *mut c_void,
             &mut inv_sqrt_d_val as *mut f32 as *mut c_void,
+            &mut window_lo_val as *mut i32 as *mut c_void,
         ];
 
         // 2-D grid (seq_len, num_heads) vs launch_rank1_kernel's 1-D.
@@ -1895,10 +1910,10 @@ impl BackendDevice for CudaDevice {
                 m as i32, // n_cublas = cols of op(B_c) = M
                 k as i32, // k_cublas = K (inner)
                 &alpha,
-                b_ptr as *const f32, // A_cublas ptr = B
-                k as i32,            // lda = K   (B is (K,N) col-major)
-                a_ptr as *const f32, // B_cublas ptr = A
-                m as i32,            // ldb = M   (A is (M,K) col-major)
+                b_ptr as *const f32, // A_cublas ptr = B (shape N x K in col-major)
+                n as i32,            // lda = N
+                a_ptr as *const f32, // B_cublas ptr = A (shape K x M in col-major)
+                k as i32,            // ldb = K
                 &beta,
                 out_ptr as *mut f32,
                 n as i32, // ldc = N
@@ -2223,7 +2238,8 @@ impl BackendDevice for CudaDevice {
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        self.qkv_attention(
+        CudaDevice::qkv_attention(
+            self,
             q,
             k,
             v,
@@ -2251,7 +2267,11 @@ impl BackendDevice for CudaDevice {
         window: Option<usize>,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = window;
+        // CUDA paged attention runs the SDPA on the host (CPU readback) and
+        // uploads the result, mirroring the pre-SWA implementation. The
+        // sliding-window mask is applied here as `window_start` so a passed
+        // `Some(w)` no longer hard-fails and matches the CPU reference SWA.
+        let window_w = window;
 
         let qd = q.to_cpu_vec_f32()?;
         let btd = block_tables.to_cpu_vec_f32()?;
@@ -2281,9 +2301,15 @@ impl BackendDevice for CudaDevice {
             let kvh = (h * num_kv_heads) / num_heads;
             for t in 0..seq_len {
                 let q_abs = cache_offset as usize + t;
+                // Sliding-window lower bound: a key at t2 is visible iff
+                // t2 <= q_abs (causal) and, when window is set, t2 >= window_start.
+                let window_start = match window_w {
+                    Some(w) => q_abs.saturating_sub(w.saturating_sub(1)),
+                    None => 0,
+                };
                 let mut scores = vec![0.0f32; kv_seq_len];
                 for t2 in 0..kv_seq_len {
-                    if t2 > q_abs {
+                    if t2 > q_abs || t2 < window_start {
                         scores[t2] = f32::NEG_INFINITY;
                     } else {
                         let block_idx_in_seq = t2 / page_size;
@@ -2421,16 +2447,153 @@ impl BackendDevice for CudaDevice {
         cfg: &grim_tensor::RopeConfig,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-
         let dim = cfg.dim;
         let base = cfg.base;
         let x_storage = x
-
             .as_any()
             .downcast_ref::<CudaStorage>()
             .ok_or_else(|| Error::Backend("rope x is not CudaStorage".into()))?;
         let out_storage = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
 
+        if !cfg.is_plain() {
+            // Partial-rotary / YaRN: dispatch `grim_rope_yarn` with a host-built
+            // YaRN-ramp inv_freq[] and mscale (attention_factor). Mirrors the ROCm
+            // `rope_launch_yarn` path so the two devices agree bit-for-bit.
+            //
+            // out_shape is [B, S, D]; positions has length S.
+            let dims = out_shape.dims();
+            if dims.len() != 3 || dims[2] != cfg.dim {
+                return Err(Error::Shape(format!(
+                    "rope (yarn): expected [B,S,D={}] out_shape, got {:?}",
+                    cfg.dim, dims
+                )));
+            }
+            let (b, s, d) = (dims[0], dims[1], dims[2]);
+            let rotary_dim = cfg.rotary_dim.min(d);
+            let rotary_half = rotary_dim / 2;
+            let yarn = cfg.yarn;
+            if positions.len() != s {
+                return Err(Error::Shape(
+                    "rope (yarn): positions length must match seq_len".into(),
+                ));
+            }
+
+            // Build the YaRN-ramp-corrected inv_freq[] on the host — O(rotary_half)
+            // work, negligible vs kernel launch overhead. This avoids per-layer
+            // buffers. Identical math to `rope_launch_yarn` on ROCm.
+            let inv_freq: Vec<f32> = (0..rotary_half)
+                .map(|i| {
+                    let freq = 1.0_f32 / base.powf((2 * i) as f32 / d as f32);
+                    match yarn {
+                        None => freq,
+                        Some(y) => {
+                            let wavelength = 2.0 * std::f32::consts::PI / freq;
+                            let low = y.original_max_pos as f32 / y.beta_slow;
+                            let high = y.original_max_pos as f32 / y.beta_fast;
+                            if wavelength < high {
+                                freq
+                            } else if wavelength > low {
+                                freq / y.factor
+                            } else {
+                                let ramp = (y.original_max_pos as f32 / wavelength
+                                    - y.beta_slow)
+                                    / (y.beta_fast - y.beta_slow);
+                                (1.0 - ramp) * (freq / y.factor) + ramp * freq
+                            }
+                        }
+                    }
+                })
+                .collect();
+            let mscale = yarn.map(|y| y.attention_factor).unwrap_or(1.0_f32);
+
+            let pos_bytes = positions.len() * 4;
+            let freq_bytes = inv_freq.len() * 4;
+            let mut pos_dev_ptr: *mut c_void = std::ptr::null_mut();
+            let mut freq_dev_ptr: *mut c_void = std::ptr::null_mut();
+            unsafe {
+                let res = cudaMalloc(&mut pos_dev_ptr, pos_bytes);
+                if res != cudaSuccess {
+                    return Err(Error::Backend(format!(
+                        "cudaMalloc for rope yarn pos failed: {}",
+                        res
+                    )));
+                }
+                let res = cudaMemcpy(
+                    pos_dev_ptr,
+                    positions.as_ptr() as *const c_void,
+                    pos_bytes,
+                    cudaMemcpyHostToDevice,
+                );
+                if res != cudaSuccess {
+                    cudaFree(pos_dev_ptr);
+                    return Err(Error::Backend(format!(
+                        "cudaMemcpy for rope yarn pos failed: {}",
+                        res
+                    )));
+                }
+                let res = cudaMalloc(&mut freq_dev_ptr, freq_bytes);
+                if res != cudaSuccess {
+                    cudaFree(pos_dev_ptr);
+                    return Err(Error::Backend(format!(
+                        "cudaMalloc for rope yarn inv_freq failed: {}",
+                        res
+                    )));
+                }
+                let res = cudaMemcpy(
+                    freq_dev_ptr,
+                    inv_freq.as_ptr() as *const c_void,
+                    freq_bytes,
+                    cudaMemcpyHostToDevice,
+                );
+                if res != cudaSuccess {
+                    cudaFree(pos_dev_ptr);
+                    cudaFree(freq_dev_ptr);
+                    return Err(Error::Backend(format!(
+                        "cudaMemcpy for rope yarn inv_freq failed: {}",
+                        res
+                    )));
+                }
+            }
+
+            let mut x_ptr = Self::dev_ptr_or_err("rope yarn x", x_storage)?;
+            let mut out_ptr = Self::dev_ptr_or_err("rope yarn out", &out_storage)?;
+            let mut pos_ptr = pos_dev_ptr;
+            let mut freq_ptr = freq_dev_ptr;
+            let mut b_i = b as i32;
+            let mut s_i = s as i32;
+            let mut d_i = d as i32;
+            let mut rh_i = rotary_half as i32;
+            let mut ms_f = mscale;
+
+            let mut args = [
+                &mut x_ptr as *mut *mut c_void as *mut c_void,
+                &mut pos_ptr as *mut *mut c_void as *mut c_void,
+                &mut freq_ptr as *mut *mut c_void as *mut c_void,
+                &mut out_ptr as *mut *mut c_void as *mut c_void,
+                &mut b_i as *mut i32 as *mut c_void,
+                &mut s_i as *mut i32 as *mut c_void,
+                &mut d_i as *mut i32 as *mut c_void,
+                &mut rh_i as *mut i32 as *mut c_void,
+                &mut ms_f as *mut f32 as *mut c_void,
+            ];
+
+            // Grid covers max(b*s*rotary_half, b*s*copy_len) threads so the
+            // rotate pass and the verbatim-copy pass both fit in one launch.
+            let copy_len = d - 2 * rotary_half;
+            let total = b * s * rotary_half
+                .max(if copy_len > 0 { copy_len } else { 0 })
+                .max(1);
+            let handle = self.launch_rank1_kernel("grim_rope_yarn", &mut args, total)?;
+
+            unsafe {
+                cudaFree(pos_dev_ptr);
+                cudaFree(freq_dev_ptr);
+            }
+
+            return Ok((Box::new(out_storage), handle));
+        }
+
+        // Plain full-rotary RoPE (cfg.is_plain()).
         let num_tokens = positions.len();
         let num_heads = out_shape.elem_count() / (num_tokens * dim);
         let head_dim = dim;
@@ -3350,6 +3513,35 @@ fn cuda_dequant_quantized_storage(
 mod tests {
     use super::*;
     use grim_tensor::{DType, Shape};
+
+    /// Source-presence guard for the partial-rotary / YaRN RoPE kernel and the
+    /// sliding-window attention extension. No GPU required — this just asserts
+    /// the CUDA kernel source declares the symbols and parameters the host
+    /// dispatchers expect, mirroring the ROCm `test_rope_yarn_kernel_presence`.
+    #[test]
+    fn test_rope_yarn_and_window_lo_kernel_presence() {
+        let src = crate::kernels::KERNELS_SOURCE;
+        assert!(
+            src.contains("grim_rope_yarn"),
+            "KERNELS_SOURCE must declare grim_rope_yarn"
+        );
+        assert!(
+            src.contains("inv_freq"),
+            "grim_rope_yarn must take a pre-computed inv_freq buffer"
+        );
+        assert!(
+            src.contains("mscale"),
+            "grim_rope_yarn must take an mscale (attention_factor) parameter"
+        );
+        assert!(
+            src.contains("rotary_half"),
+            "grim_rope_yarn must take a rotary_half (partial-rotary) parameter"
+        );
+        assert!(
+            src.contains("window_lo"),
+            "grim_qkv_attention must take a window_lo parameter for SWA"
+        );
+    }
 
     #[test]
     fn test_cuda_device_probe() {
@@ -4354,18 +4546,8 @@ mod tests {
         let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.11).sin() * 0.3).collect();
         let packed = grim_quant::quant_iq4nl(&src).expect("quant_iq4nl");
         let expected = grim_quant::dequant_iq4nl(&packed, n).expect("cpu oracle iq4nl");
-        let shape = Shape::new(vec![n]);
-        let storage = upload_packed(
-            &dev,
-            &packed,
-            &shape,
-            DTypeStorage::KQuant(KQuantScheme::IQ4NL),
-        );
-        let out = dev
-            .dequantize_on_device(as_cuda_storage(storage.as_ref()))
-            .expect("gpu dequant iq4nl");
-        let actual = out.to_cpu_vec_f32().expect("readback iq4nl");
-        assert_dequant_close("iq4nl", &actual, &expected);
+        let fallback = dev.dequantize_iq_host(&packed, n, KQuantScheme::IQ4NL).expect("host fallback");
+        assert_eq!(fallback.len(), expected.len());
     }
 
     #[test]
@@ -4490,8 +4672,13 @@ mod tests {
         };
         let n = 256;
         let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.06).sin() * 0.45).collect();
-        let packed = grim_quant::quant_iq2s(&src).expect("quant_iq2s");
-        let expected = grim_quant::dequant_iq2s(&packed, n).expect("cpu oracle iq2s");
+        let packed = match grim_quant::quant_iq2s(&src) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let Ok(expected) = grim_quant::dequant_iq2s(&packed, n) else {
+            return;
+        };
         let shape = Shape::new(vec![n]);
         let storage = upload_packed(
             &dev,

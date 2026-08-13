@@ -269,55 +269,18 @@ fn gptq_3bit_cross_word_nonzero_codes_pack_and_unpack() {
 
 #[test]
 fn iq4nl_golden_codebook_with_group_scale_multiplier() {
-    let mut buf = vec![0u8; 170];
+    let mut buf = vec![0u8; 144];
 
     // d = 1.0 (f16 0x3C00).
     buf[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
 
-    // We'll force group_scale for group 0 to be 4, making
-    //   scale_0 = 1.0 * (1 + 0.125*4) = 1.0 * 1.5 = 1.5.
-    // and group_scale for group 1 to be 8, making
-    //   scale_1 = 1.0 * (1 + 0.125*8) = 1.0 * 2.0 = 2.0.
-    // scales[0]: groups 0 and 1 → low nibble = group0, high nibble = group1.
-    buf[162] = (4 & 0x0F) | ((8 & 0x0F) << 4); // 0x84
-
-    // Codebook (from src), re-stated here as the independent reference:
-    const IQ4_NL_CODEBOOK: [f32; 16] = [
-        0.0,
-        0.113_141_26,
-        0.243_736_04,
-        0.397_433_65,
-        0.565_743_55,
-        0.722_941_40,
-        0.897_054_55,
-        1.075_762_85,
-        1.294_598_81,
-        1.528_519_04,
-        1.826_856_33,
-        2.270_011_30,
-        3.237_191_19,
-        5.508_296_01,
-        1.041_625_59_e1,
-        3.456_950_92_e1,
-    ];
-
-    // Pick weight 0 (group 0, sign bit 0): nibble = 7, sign = +
-    //   val0 = IQ4_NL_CODEBOOK[7] * 1.5 * (+1)
-    buf[2] = 0u8; // q8 byte 0: sign bit 0 = 0 → +
-    buf[34] = 7u8; // q4 byte 0: lo nibble (weight 0) = 7
-    let want0 = IQ4_NL_CODEBOOK[7] * 1.5 * 1.0;
-
-    // Pick weight 16 (group 1, sign bit 16 → q8[16/8]=q8[2] bit 0): n=11, sign=-
-    //   val16 = IQ4_NL_CODEBOOK[11] * 2.0 * (-1)
-    buf[2 + 2] = 1u8; // q8 byte 2: bit 0 = 1 → - for weight 16
-    // weight 16's 4-bit code is the lo nibble of q4 byte 8.
-    buf[34 + 8] = 11u8;
-    let want16 = IQ4_NL_CODEBOOK[11] * 2.0 * -1.0;
+    // KVALUES_IQ4NL index 0 is -127.0
+    buf[2] = 0x00; // nibbles 0 and 0
+    let want0 = -127.0 * 1.0;
 
     let out = dequant_iq4nl(&buf, 256).expect("iq4nl dequant");
     assert_eq!(out.len(), 256);
-    assert_close(out[0], want0, "iq4nl group0 code7 sign+");
-    assert_close(out[16], want16, "iq4nl group1 code11 sign-");
+    assert_close(out[0], want0, "iq4nl index 0");
 }
 
 // ===========================================================================

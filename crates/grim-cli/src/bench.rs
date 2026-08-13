@@ -33,6 +33,9 @@ pub async fn cmd_bench(tokens: usize, concurrency: usize, model_path: Option<&st
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             max_seq_len: 256,
+        
+            partial_rotary_factor: 1.0,
+            yarn: None,
         };
         Box::new(grim_models_transformer::Llama::random(device.clone(), cfg))
     };

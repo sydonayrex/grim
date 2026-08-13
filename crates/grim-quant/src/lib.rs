@@ -206,9 +206,13 @@ pub fn dequant_q80(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 
 const BLOCK_Q8_WEIGHTS: usize = 32;
 
-/// IQ4_NL 16-entry absolute-value codebook (llama.cpp `iq4nl_table`).
-/// The sign comes from the per-weight `q8` bit; the magnitude comes from this
-/// table indexed by the 4-bit `q4` code.
+/// Canonical IQ4_NL signed 16-entry codebook (ggml `kvalues_iq4nl`).
+const KVALUES_IQ4NL: [f32; 16] = [
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+      1.0,    13.0,  25.0,  38.0,  53.0,  69.0,  87.0, 107.0,
+];
+
+/// Absolute-value 16-entry codebook table alias for IQ4_XS.
 const IQ4_NL_CODEBOOK: [f32; 16] = [
     0.0,
     0.113_141_26,
@@ -224,22 +228,19 @@ const IQ4_NL_CODEBOOK: [f32; 16] = [
     2.270_011_30,
     3.237_191_19,
     5.508_296_01,
-    1.041_625_59_e1,
-    3.456_950_92_e1,
+    10.416256,
+    34.56951,
 ];
 
-/// Dequantize IQ4_NL (llama.cpp importance-matrix 4-bit) bytes to f32.
+/// Dequantize IQ4_NL (ggml non-linear 4-bit) bytes to f32.
 ///
-/// Per 256-weight super-block (170 bytes):
-///   - `d`    : f16 global scale (2 bytes)
-///   - `q8`   : 32 bytes = 256 sign bits (1 bit per weight, LSB-first)
-///   - `q4`   : 128 bytes = 256 4-bit codes (magnitude table index)
-///   - `scales`: 8 bytes = 16 × 2-bit per-group (16 weights) scale multipliers
-///
-/// Each group of 16 weights is scaled by `d * (1 + 0.125 * group_scale)`.
+/// Per 256-weight super-block (144 bytes):
+///   - `d`  : f16 scale factor (2 bytes)
+///   - `qs` : 128 bytes = 256 4-bit indices (nibbles)
+///   - `scales` : 14 bytes per-subblock scale factors
 pub fn dequant_iq4nl(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     const SUPER: usize = 256;
-    const BLOCK_BYTES: usize = 170; // 2 + 32 + 128 + 8
+    const BLOCK_BYTES: usize = 144;
     let num_blocks = num_weights.div_ceil(SUPER);
     if data.len() < num_blocks * BLOCK_BYTES {
         return Err(Error::Backend(format!(
@@ -253,35 +254,18 @@ pub fn dequant_iq4nl(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     let mut remaining = num_weights;
     for _ in 0..num_blocks {
         let d = f16_to_f32(data[pos], data[pos + 1]);
-        pos += 2;
-        let q8 = &data[pos..pos + 32];
-        pos += 32;
-        let q4 = &data[pos..pos + 128];
-        pos += 128;
-        let scales = &data[pos..pos + 8];
-        pos += 8;
-
+        let qs = &data[pos + 2..pos + 130];
         let block_len = remaining.min(SUPER);
-        for g in 0..16 {
-            let group_scale = (scales[g / 2] >> ((g % 2) * 4)) & 0x0F;
-            let scale = d * (1.0 + 0.125 * group_scale as f32);
-            let group_start = g * 16;
-            if group_start >= block_len {
-                break;
-            }
-            let group_end = (group_start + 16).min(block_len);
-            for i in group_start..group_end {
-                let nibble = if i % 2 == 0 {
-                    q4[i / 2] & 0x0F
-                } else {
-                    (q4[i / 2] >> 4) & 0x0F
-                };
-                let sign_bit = (q8[i / 8] >> (i % 8)) & 0x01;
-                let sign = if sign_bit == 0 { 1.0 } else { -1.0 };
-                let val = IQ4_NL_CODEBOOK[nibble as usize] * scale * sign;
-                out.push(val);
-            }
+        for i in 0..block_len {
+            let nibble = if i % 2 == 0 {
+                qs[i / 2] & 0x0F
+            } else {
+                (qs[i / 2] >> 4) & 0x0F
+            };
+            let val = d * KVALUES_IQ4NL[nibble as usize];
+            out.push(val);
         }
+        pos += BLOCK_BYTES;
         remaining = remaining.saturating_sub(SUPER);
     }
     Ok(out)
@@ -540,51 +524,8 @@ pub fn dequant_iq2xs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 ///   - `qs`    : 48 bytes grid indices
 ///   - `scales`: 8 bytes scale shifts
 ///   - `signs` : 24 bytes sign bits
-pub fn dequant_iq2s(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
-    const SUPER: usize = 256;
-    const BLOCK_BYTES: usize = 82;
-    let num_blocks = num_weights.div_ceil(SUPER);
-    if data.len() < num_blocks * BLOCK_BYTES {
-        return Err(Error::Backend(format!(
-            "IQ2_S: expected {} bytes for {num_weights} weights, got {}",
-            num_blocks * BLOCK_BYTES,
-            data.len()
-        )));
-    }
-    let mut out = Vec::with_capacity(num_weights);
-    let mut pos = 0usize;
-    let mut remaining = num_weights;
-    for _ in 0..num_blocks {
-        let d = f16_to_f32(data[pos], data[pos + 1]);
-        pos += 2;
-        let qs = &data[pos..pos + 48];
-        pos += 48;
-        let scales = &data[pos..pos + 8];
-        pos += 8;
-        let signs = &data[pos..pos + 24];
-        pos += 24;
-
-        let block_len = remaining.min(SUPER);
-        for sb in 0..16 {
-            let sc = ((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F) as f32 * 0.125 + 0.5;
-            let scale = d * sc;
-            let sb_start = sb * 16;
-            if sb_start >= block_len {
-                break;
-            }
-            let sb_end = (sb_start + 16).min(block_len);
-            for i in sb_start..sb_end {
-                let grid_idx = qs[(i / 8).min(qs.len() - 1)] as usize;
-                let code = ((grid_idx + (i % 8)) % 4) as f32 - 1.5;
-                let sign_byte_idx = (i / 8).min(signs.len() - 1);
-                let sign_bit = (signs[sign_byte_idx] >> (i % 8)) & 0x01;
-                let sign = if sign_bit == 0 { 1.0 } else { -1.0 };
-                out.push(scale * code * sign);
-            }
-        }
-        remaining = remaining.saturating_sub(SUPER);
-    }
-    Ok(out)
+pub fn dequant_iq2s(_data: &[u8], _num_weights: usize) -> Result<Vec<f32>> {
+    Err(Error::Unimplemented("dequant_iq2s requires grid-vector lookup table; use Q2_K or Q4_K".into()))
 }
 /// Dequantize Q4_K bytes to f32 per the ggml/llama.cpp super-block specification.
 ///
@@ -828,7 +769,7 @@ pub fn dequant_q2k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
         let scales = &data[pos..pos + 16];
         let qs = &data[pos + 16..pos + 80];
         let d = f16_to_f32(data[pos + 80], data[pos + 81]);
-        let dmin = f16_to_f32(data[pos + 82 - 2], data[pos + 82 - 1]);
+        let dmin = f16_to_f32(data[pos + 80], data[pos + 81]);
 
         let mut qs_idx = 0;
         let mut sc_idx = 0;
@@ -5105,24 +5046,24 @@ mod tests {
 
     #[test]
     fn test_iq4nl_dequant_exact_block_size_and_codebook_values() {
-        let mut data = vec![0u8; 170];
+        let mut data = vec![0u8; 144];
         // d = f16 1.0 = [0x00, 0x3c]
         data[0] = 0x00;
         data[1] = 0x3c;
-        // set q4[0] = 0x01 (first nibble index 1, second nibble index 0)
-        data[34] = 0x01;
+        // set qs[0] = 0x00 (first nibble index 0)
+        data[2] = 0x00;
 
         let res = dequant_iq4nl(&data, 256).expect("dequant_iq4nl");
         assert_eq!(res.len(), 256);
-        // index 1 in IQ4_NL_CODEBOOK is 0.11314126
+        // index 0 in KVALUES_IQ4NL is -127.0
         assert!(
-            (res[0] - 0.11314126).abs() < 1e-5,
-            "res[0] = {}, want 0.11314126",
+            (res[0] - (-127.0)).abs() < 1e-5,
+            "res[0] = {}, want -127.0",
             res[0]
         );
 
         // Error handling on truncated data
-        assert!(dequant_iq4nl(&data[..100], 256).is_err());
+        assert!(dequant_iq4nl(&data[..40], 256).is_err());
     }
 
     #[test]
@@ -5195,10 +5136,8 @@ mod tests {
         data[0] = 0x00;
         data[1] = 0x3c; // d = 1.0f16
 
-        let res = dequant_iq2s(&data, 256).expect("dequant_iq2s");
-        assert_eq!(res.len(), 256);
-
-        assert!(dequant_iq2s(&data[..40], 256).is_err());
+        let res = dequant_iq2s(&data, 256);
+        assert!(res.is_err());
     }
 
     #[test]

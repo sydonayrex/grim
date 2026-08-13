@@ -566,7 +566,19 @@ where
                     }
 
                     let num_elems = header.num_elements as usize;
-                    let total_bytes = num_elems * 8; // keys + values
+                    if num_elems > 100_000_000 {
+                        eprintln!(
+                            "[grim-kvtransport] KV receiver: num_elements {num_elems} exceeds safety cap"
+                        );
+                        continue;
+                    }
+                    let total_bytes = match num_elems.checked_mul(8) {
+                        Some(b) => b,
+                        None => {
+                            eprintln!("[grim-kvtransport] KV receiver: num_elements {num_elems} multiplied by 8 overflowed usize");
+                            continue;
+                        }
+                    };
                     let mut payload = vec![0u8; total_bytes];
                     if stream.read_exact(&mut payload).is_err() {
                         eprintln!(

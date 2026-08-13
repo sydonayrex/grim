@@ -29,6 +29,24 @@ pub struct LlamaConfig {
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub max_seq_len: usize,
+    /// Fraction of `head_dim` that participates in RoPE (e.g. 0.5 → rotate
+    /// half the channels). Defaults to 1.0 (full rotary); set < 1.0 for
+    /// partial-rotary models like Qwen3.5-MoE.
+    pub partial_rotary_factor: f32,
+    /// YaRN RoPE scaling parameters. `None` ⇒ plain RoPE. When `Some`, every
+    /// attention layer applies the YaRN frequency ramp + magnitude correction
+    /// on top of the partial-rotary base frequencies.
+    pub yarn: Option<grim_tensor::YaRNParams>,
+}
+
+impl LlamaConfig {
+    /// Derived rotary dim: `round(head_dim * partial_rotary_factor)`,
+    /// clamped to `head_dim`. This is what each layer's `RopeConfig.rotary_dim`
+    /// is populated with (mirrors the Laguna/Maple convention).
+    pub fn rotary_dim(&self) -> usize {
+        let r = (self.head_dim as f32 * self.partial_rotary_factor).round() as usize;
+        r.min(self.head_dim)
+    }
 }
 
 impl ModelConfig for LlamaConfig {
@@ -141,11 +159,13 @@ impl Llama {
     ) -> Result<Self> {
         let attn_specs: Vec<crate::block::LayerAttentionSpec> = (0..cfg.num_layers)
             .map(|_| {
-                crate::block::LayerAttentionSpec::default_full(
+                crate::block::LayerAttentionSpec::full_with_rope(
                     cfg.num_heads,
                     cfg.num_kv_heads,
                     cfg.head_dim,
                     cfg.rope_theta,
+                    cfg.rotary_dim(),
+                    cfg.yarn,
                 )
             })
             .collect();
@@ -278,7 +298,12 @@ impl Llama {
                 ),
                 w_up: ColumnParallelLinear::new(linear(cfg.intermediate_size, cfg.hidden_size), tp),
                 w_down: RowParallelLinear::new(linear(cfg.hidden_size, cfg.intermediate_size), tp),
-                rope: Rope::new(cfg.head_dim, cfg.rope_theta),
+                rope: Rope::from_config(grim_tensor::RopeConfig {
+                    dim: cfg.head_dim,
+                    base: cfg.rope_theta,
+                    rotary_dim: cfg.rotary_dim(),
+                    yarn: cfg.yarn,
+                }),
                 tp_config: tp,
                 ffn_disabled: false,
                 _dev: Device::Cpu,
@@ -455,5 +480,49 @@ impl CausalLm for Llama {
         };
         session.advance_pos(seq_len);
         Ok(logits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_cfg(head_dim: usize, prf: f32) -> LlamaConfig {
+        LlamaConfig {
+            vocab_size: 100,
+            hidden_size: 32,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim,
+            num_layers: 1,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            max_seq_len: 512,
+            partial_rotary_factor: prf,
+            yarn: None,
+        }
+    }
+
+    /// `rotary_dim` derives `round(head_dim * partial_rotary_factor)` and clamps to
+    /// `head_dim`. Qwen3.5-MoE uses a 0.5 partial factor on head_dim=128 ⇒ 64.
+    #[test]
+    fn llama_config_rotary_dim_derives_and_clamps() {
+        assert_eq!(base_cfg(128, 1.0).rotary_dim(), 128, "full rotary");
+        assert_eq!(
+            base_cfg(128, 0.5).rotary_dim(),
+            64,
+            "qwen3.5-moe-style 0.5 partial rotary"
+        );
+        assert_eq!(
+            base_cfg(32, 0.25).rotary_dim(),
+            8,
+            "0.25 partial rotary on head_dim 32"
+        );
+        // round-half-to-even on .5 boundary: round(0.5*33) = round(16.5) = 16 or 17
+        let r = base_cfg(33, 0.5).rotary_dim();
+        assert!(r == 16 || r == 17, "midpoint rounding must be near 16/17, got {r}");
+        // Clamp: prf > 1.0 cannot exceed head_dim.
+        assert_eq!(base_cfg(16, 2.0).rotary_dim(), 16, "clamped to head_dim");
     }
 }

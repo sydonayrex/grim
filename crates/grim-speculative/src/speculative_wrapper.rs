@@ -227,14 +227,17 @@ impl SpeculativeCausalLm {
                 // Rejection-sampling validation loop (§5.3)
                 // Correctly index logits as flat [seq, vocab_size] row-major,
                 // apply per-row softmax, and use the standard ratio test with per-request randomness.
+                let context_len = input_ids.shape().elem_count();
                 let mut accepted_count = 0;
                 for i in 0..verify_len {
                     let draft_tok = scored.tokens[i] as usize;
 
-                    let row_start = i * vocab_size;
+                    let row_start = (context_len - 1 + i) * vocab_size;
                     let row_end = row_start + vocab_size;
                     let p_target = softmax_f32_row(&target_probs[row_start..row_end])[draft_tok];
-                    let p_draft = softmax_f32_row(&draft_logits[row_start..row_end])[draft_tok];
+                    let draft_row_start = i * vocab_size;
+                    let draft_row_end = draft_row_start + vocab_size;
+                    let p_draft = softmax_f32_row(&draft_logits[draft_row_start..draft_row_end])[draft_tok];
 
                     // Ratio test: accept with min(1, p_target / p_draft).
                     let p_accept = if p_draft > 1e-10 {
@@ -538,6 +541,9 @@ mod tests {
             rope_theta: 10000.0,
             max_seq_len: 2048,
             rms_norm_eps: 1e-5,
+        
+            partial_rotary_factor: 1.0,
+            yarn: None,
         };
         let target = Box::new(MockCausalLm {
             cfg: cfg.clone(),

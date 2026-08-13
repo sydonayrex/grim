@@ -512,6 +512,8 @@ kernel void grim_qkv_attention(
     constant int& kv_seq_len [[buffer(10)]],
     constant int& cache_offset [[buffer(11)]],
     constant float& inv_sqrt_d [[buffer(12)]],
+    constant int& window_lo [[buffer(13)]],
+    constant int& has_window [[buffer(14)]],
     uint2 id [[thread_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint2 tg_id [[threadgroup_position_in_grid]]
@@ -524,7 +526,10 @@ kernel void grim_qkv_attention(
     int kv_head = h / q_per_kv;
     int q_offset = (i * num_heads + h) * head_dim;
     int abs_i = cache_offset + i;
-    int range_len = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    // SWA lower bound: has_window > 0 ⇒ start at window_lo (0 = full causal).
+    int lo = (has_window > 0) ? window_lo : 0;
+    int range_len = (lo < hi) ? (hi - lo) : 0;
 
     // Threadgroup tiling buffers for key-value slots
     threadgroup float tile_k[32][32];
@@ -532,7 +537,7 @@ kernel void grim_qkv_attention(
 
     float running_max = -1e30f;
     float running_sum = 0.0f;
-    
+
     // Output registers accumulator
     float acc[128] = {0.0f};
 
@@ -542,8 +547,8 @@ kernel void grim_qkv_attention(
         local_q[d] = q[q_offset + d];
     }
 
-    for (int block_start = 0; block_start < range_len; block_start += 32) {
-        int block_end = min(block_start + 32, range_len);
+    for (int block_start = lo; block_start < lo + range_len; block_start += 32) {
+        int block_end = min(block_start + 32, hi);
         
         // Coalesced collaborative load from device memory to threadgroup shared storage
         if (tid < 32) {
@@ -608,6 +613,8 @@ kernel void grim_qkv_attention_paged(
     constant int& max_blocks [[buffer(9)]],
     constant int& kv_seq_len [[buffer(10)]],
     constant int& num_kv_heads [[buffer(11)]],
+    constant int& window_lo [[buffer(12)]],
+    constant int& has_window [[buffer(13)]],
     uint3 id [[thread_position_in_grid]]) {
     int d = int(id.x);
     int h = int(id.y);
@@ -618,7 +625,9 @@ kernel void grim_qkv_attention_paged(
     float running_max = -1e30f;
     float running_sum = 0.0f;
     float acc = 0.0f;
-    for (int pos = 0; pos < kv_seq_len; ++pos) {
+    // SWA lower bound: has_window > 0 ⇒ start at window_lo (0 = full causal).
+    int lo = (has_window > 0) ? window_lo : 0;
+    for (int pos = lo; pos < kv_seq_len; ++pos) {
         int logical_block = pos / page_size;
         if (logical_block >= max_blocks) break;
         int physical_block = int(block_table[b * max_blocks + logical_block]);
@@ -849,6 +858,85 @@ kernel void grim_rope(
 
         out[i0] = v0 * cos_v - v1 * sin_v;
         out[i1] = v0 * sin_v + v1 * cos_v;
+    }
+}
+
+// Partial-rotary + YaRN RoPE. Mirrors the HIP `grim_rope_yarn` numerically with
+// the interleaved pair layout (2i, 2i+1) used by `grim_rope`. The YaRN
+// frequency ramp + mscale are recomputed inside the kernel from the scalar
+// arguments (no inv_freq buffer). The non-rotary tail [rotary_dim, head_dim)
+// is copied verbatim by a second pass over the same thread pool.
+kernel void grim_rope_yarn(
+    device const float* x [[buffer(0)]],
+    device const uint* pos [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant int& num_tokens [[buffer(3)]],
+    constant int& num_heads [[buffer(4)]],
+    constant int& head_dim [[buffer(5)]],
+    constant int& rotary_dim [[buffer(6)]],
+    constant int& has_yarn [[buffer(7)]],
+    constant float& base [[buffer(8)]],
+    constant float& yarn_factor [[buffer(9)]],
+    constant float& yarn_orig_max [[buffer(10)]],
+    constant float& yarn_beta_fast [[buffer(11)]],
+    constant float& yarn_beta_slow [[buffer(12)]],
+    constant float& mscale [[buffer(13)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    int rdim = (rotary_dim <= 0) ? head_dim : rotary_dim;
+    int rotary_half = rdim / 2;
+    int copy_len = head_dim - rdim;
+
+    // Pass 1: rotate the [0, rotary_half) pairs (interleaved layout).
+    int total = num_tokens * num_heads * rotary_half;
+    if (idx < uint(total)) {
+        int pair_idx = idx % rotary_half;
+        int head_idx = (idx / rotary_half) % num_heads;
+        int token_idx = idx / (rotary_half * num_heads);
+
+        uint p = pos[token_idx];
+        float freq = 1.0f / pow(base, (float)(2 * pair_idx) / (float)head_dim);
+
+        if (has_yarn > 0) {
+            float wavelength = 2.0f * 3.14159265358979323846f / freq;
+            float low = yarn_orig_max / yarn_beta_slow;
+            float high = yarn_orig_max / yarn_beta_fast;
+            if (wavelength < high) {
+                // extrapolation region: unchanged
+            } else if (wavelength > low) {
+                freq = freq / yarn_factor;
+            } else {
+                float ramp = (yarn_orig_max / wavelength - yarn_beta_slow)
+                             / (yarn_beta_fast - yarn_beta_slow);
+                freq = (1.0f - ramp) * (freq / yarn_factor) + ramp * freq;
+            }
+        }
+
+        float val = (float)p * freq;
+        float cos_v = cos(val) * mscale;
+        float sin_v = sin(val) * mscale;
+
+        int base_offset = (token_idx * num_heads + head_idx) * head_dim;
+        int i0 = base_offset + 2 * pair_idx;
+        int i1 = base_offset + 2 * pair_idx + 1;
+
+        float v0 = x[i0];
+        float v1 = x[i1];
+        out[i0] = v0 * cos_v - v1 * sin_v;
+        out[i1] = v0 * sin_v + v1 * cos_v;
+        return;
+    }
+
+    // Pass 2: copy the non-rotary tail [rdim, head_dim) verbatim.
+    if (copy_len > 0) {
+        int total2 = num_tokens * num_heads * copy_len;
+        if (idx < uint(total2)) {
+            int ci = idx % copy_len;
+            int head_idx = (idx / copy_len) % num_heads;
+            int token_idx = idx / (copy_len * num_heads);
+            int src = (token_idx * num_heads + head_idx) * head_dim + rdim + ci;
+            out[src] = x[src];
+        }
     }
 }
 

@@ -127,7 +127,7 @@ impl Scythe1Optimizer {
     pub fn new(lr_basis: f32, lr_sigma: f32, beta: f32, rank: usize) -> Self {
         Self {
             inner: SoulEaterOptimizer::new(lr_basis, lr_sigma, beta),
-            fim_diag: vec![0.0f32; rank],
+            fim_diag: vec![1.0f32; rank],
             rank,
         }
     }

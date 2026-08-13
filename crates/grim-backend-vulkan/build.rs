@@ -30,10 +30,12 @@ fn kernels() -> Vec<(&'static str, String)> {
         ("matmul_64", load_kernel("matmul_tile_64")),
         ("matmul_64_bf16", load_kernel("matmul_tile_64_bf16")),
         ("qkv_attention", load_kernel("qkv_attention")),
+        ("qkv_attention_swa", load_kernel("qkv_attention_swa")),
         ("mul_scalar", load_kernel("mul_scalar")),
         ("sqrt", load_kernel("sqrt")),
         ("recip", load_kernel("recip")),
         ("rope", load_kernel("rope")),
+        ("rope_yarn", load_kernel("rope_yarn")),
         (
             "fused_dequant_gemm_q4k",
             load_kernel("fused_dequant_gemm_q4k"),
@@ -89,6 +91,7 @@ fn kernels() -> Vec<(&'static str, String)> {
         ("kv_dequant_attention", load_kernel("kv_dequant_attention")),
         ("selective_scan", load_kernel("selective_scan")),
         ("qkv_attention_paged", load_kernel("qkv_attention_paged")),
+        ("qkv_attention_paged_swa", load_kernel("qkv_attention_paged_swa")),
         ("tree_attention", load_kernel("tree_attention")),
         ("flash_attention", load_kernel("flash_attention")),
         ("silu_mul_backward", load_kernel("silu_mul_backward")),
@@ -132,10 +135,12 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/matmul_tile_64.comp");
     println!("cargo:rerun-if-changed=kernels/matmul_tile_64_bf16.comp");
     println!("cargo:rerun-if-changed=kernels/qkv_attention.comp");
+    println!("cargo:rerun-if-changed=kernels/qkv_attention_swa.comp");
     println!("cargo:rerun-if-changed=kernels/mul_scalar.comp");
     println!("cargo:rerun-if-changed=kernels/sqrt.comp");
     println!("cargo:rerun-if-changed=kernels/recip.comp");
     println!("cargo:rerun-if-changed=kernels/rope.comp");
+    println!("cargo:rerun-if-changed=kernels/rope_yarn.comp");
     println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_q4k.comp");
     println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_q5k.comp");
     println!("cargo:rerun-if-changed=kernels/fused_dequant_gemm_q6k.comp");
@@ -152,6 +157,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/kv_dequant_attention.comp");
     println!("cargo:rerun-if-changed=kernels/selective_scan.comp");
     println!("cargo:rerun-if-changed=kernels/qkv_attention_paged.comp");
+    println!("cargo:rerun-if-changed=kernels/qkv_attention_paged_swa.comp");
     println!("cargo:rerun-if-changed=kernels/tree_attention.comp");
     println!("cargo:rerun-if-changed=kernels/flash_attention.comp");
     println!("cargo:rerun-if-changed=kernels/silu_mul_backward.comp");

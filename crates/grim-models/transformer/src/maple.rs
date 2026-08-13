@@ -127,6 +127,9 @@ impl Maple {
             rms_norm_eps: cfg.rms_norm_eps,
             rope_theta: cfg.rope_theta,
             max_seq_len: cfg.max_seq_len,
+        
+            partial_rotary_factor: 1.0,
+            yarn: None,
         };
 
         let router_kind = RouterKind::SigmoidTopKWithBias;

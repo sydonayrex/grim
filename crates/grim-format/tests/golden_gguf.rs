@@ -109,11 +109,11 @@ fn gguf_size_bytes_k_quant_superblock_constants_are_exact() {
     // Each at 256 params (one super-block) must equal the per-block constant.
     let cases: &[(GgufDType, u64)] = &[
         (GgufDType::Q2K, 84),
-        (GgufDType::Q3K, 108),
+        (GgufDType::Q3K, 110),
         (GgufDType::Q4K, 144),
         (GgufDType::Q5K, 176),
         (GgufDType::Q6K, 210),
-        (GgufDType::Q8K, 252),
+        (GgufDType::Q8K, 292),
     ];
     // Fixed tensor-info table; offsets are cumulative sizes (not validated by
     // the size_bytes assertion, only used so the stream is well-formed).

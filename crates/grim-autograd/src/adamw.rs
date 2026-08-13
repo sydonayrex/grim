@@ -1099,10 +1099,10 @@ impl PagedAdamW {
             let grad: Vec<f32> = param.grad().to_vec_f32()?;
 
             if !self.m.contains_key(id) {
-                self.m.insert(*id, vec![1.0f32; elem_count]);
+                self.m.insert(*id, vec![0.0f32; elem_count]);
             }
             if !self.v.contains_key(id) {
-                self.v.insert(*id, vec![1.0f32; elem_count]);
+                self.v.insert(*id, vec![0.0f32; elem_count]);
             }
 
             let m = self.m.get_mut(id).unwrap();

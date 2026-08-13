@@ -24,7 +24,7 @@ impl SafetensorInfo {
         self.dims.clone()
     }
     pub fn elem_count(&self) -> usize {
-        self.dims.iter().product()
+        self.dims.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d)).unwrap_or(usize::MAX)
     }
     pub fn byte_size(&self) -> usize {
         let elem = match self.dtype_tag.as_str() {
@@ -34,7 +34,7 @@ impl SafetensorInfo {
             "I8" | "U8" => 1,
             _ => 4,
         };
-        self.elem_count() * elem
+        self.elem_count().saturating_mul(elem)
     }
 }
 

@@ -21,9 +21,24 @@ pub struct Qwen35MoeConfig {
     pub head_dim: usize,
     pub num_layers: usize,
     pub intermediate_size: usize,
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub shared_expert_intermediate_size: Option<usize>,
+    pub routed_scaling_factor: f32,
+    pub layer_types: Vec<String>,
+    pub linear_key_head_dim: usize,
+    pub linear_num_key_heads: usize,
+    pub linear_value_head_dim: usize,
+    pub linear_num_value_heads: usize,
+    pub partial_rotary_factor: f32,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub max_seq_len: usize,
+    /// YaRN RoPE scaling parameters. `None` ⇒ plain RoPE matching the legacy
+    /// (non-YaRN) Qwen3.5-MoE behaviour; `Some` applies the YaRN frequency
+    /// ramp + magnitude correction on every attention layer's RoPE. Populated
+    /// from the GGUF / safetensors `rope_scaling` block by the loader.
+    pub full_yarn: Option<grim_tensor::YaRNParams>,
 }
 
 impl ModelConfig for Qwen35MoeConfig {
@@ -70,8 +85,24 @@ impl Qwen35Moe {
             rms_norm_eps: cfg.rms_norm_eps,
             rope_theta: cfg.rope_theta,
             max_seq_len: cfg.max_seq_len,
+            partial_rotary_factor: cfg.partial_rotary_factor,
+            yarn: cfg.full_yarn,
         };
-        let inner = Llama::load_tp(device.clone(), ws, llama_cfg, tp)?;
+
+        let has_shared = cfg.shared_expert_intermediate_size.is_some();
+        let spec = crate::moe_block::MoESpec {
+            num_experts: cfg.num_experts,
+            top_k: cfg.num_experts_per_tok,
+            router_kind: grim_nn::moe::RouterKind::SoftmaxTopK,
+            routed_scaling_factor: if cfg.routed_scaling_factor == 0.0 { 1.0 } else { cfg.routed_scaling_factor },
+            has_shared_expert: has_shared,
+            moe_intermediate_size: Some(cfg.intermediate_size),
+            shared_expert_intermediate_size: cfg.shared_expert_intermediate_size,
+        };
+
+        let moe_spec: Vec<Option<crate::moe_block::MoESpec>> = vec![Some(spec); cfg.num_layers];
+
+        let inner = Llama::load_tp_moe(device.clone(), ws, llama_cfg, &moe_spec, tp)?;
         Ok(Self { cfg, device: inner.device.clone(), inner })
     }
 }
