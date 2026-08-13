@@ -219,7 +219,9 @@ void grim_qkv_attention_paged(
     int page_size,
     int kv_seq_len,
     int cache_offset,
-    float inv_sqrt_d
+    float inv_sqrt_d,
+    int window_lo       // sliding-window lower bound: max(0, abs_i - window + 1).
+                        // Pass 0 for full causal attention (no window).
 ) {
     const int batch_idx = blockIdx.x; // grid is (batch, num_heads, 1)
     const int h = blockIdx.y;         // head index

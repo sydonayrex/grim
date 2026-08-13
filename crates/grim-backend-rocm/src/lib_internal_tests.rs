@@ -2346,6 +2346,72 @@ mod tests {
             );
         }
     }
+
+    /// WI vs plain-rocBLAS: in-place scale+bias epilogue parity against the CPU
+    /// reference `out[i,j] = g[i,j]*a_scale[i]*b_scale[j] + bias[j]`. Mirrors
+    /// the broadcast_bias gating so it self-skips when no ROCm device is present.
+    #[test]
+    fn rocm_scale_bias_epilogue_device_gated_parity() {
+        let dev = match RocmDevice::try_new(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("ROCm device unavailable: skipping rocm_scale_bias_epilogue_device_gated_parity");
+                return;
+            }
+        };
+
+        let batch = 4;
+        let out_dim = 5;
+        let mut seed = 0x5EED_F00D_u64;
+        let mut rng = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / 65536.0) - 1000.0
+        };
+
+        let a_scale: Vec<f32> = (0..batch).map(|_| rng()).collect();
+        let b_scale: Vec<f32> = (0..out_dim).map(|_| rng()).collect();
+        let bias: Vec<f32> = (0..out_dim).map(|_| rng()).collect();
+        let gemm_out: Vec<f32> = (0..batch * out_dim).map(|_| rng()).collect();
+
+        // CPU reference.
+        let mut want = gemm_out.clone();
+        for i in 0..batch {
+            for j in 0..out_dim {
+                let idx = i * out_dim + j;
+                want[idx] = gemm_out[idx] * a_scale[i] * b_scale[j] + bias[j];
+            }
+        }
+
+        let out_shape = Shape::new(vec![batch, out_dim]);
+        let a_shape = Shape::new(vec![batch]);
+        let b_shape = Shape::new(vec![out_dim]);
+        let bias_shape = Shape::new(vec![out_dim]);
+
+        let out_storage = dev.from_cpu(&gemm_out, &out_shape, DType::F32).expect("from_cpu out");
+        let a_storage = dev.from_cpu(&a_scale, &a_shape, DType::F32).expect("from_cpu a");
+        let b_storage = dev.from_cpu(&b_scale, &b_shape, DType::F32).expect("from_cpu b");
+        let bias_storage = dev.from_cpu(&bias, &bias_shape, DType::F32).expect("from_cpu bias");
+
+        let _handle = dev
+            .scale_bias_epilogue(
+                out_storage.as_ref(),
+                Some(a_storage.as_ref()),
+                Some(b_storage.as_ref()),
+                Some(bias_storage.as_ref()),
+                batch,
+                out_dim,
+            )
+            .expect("dev.scale_bias_epilogue");
+
+        let got = out_storage.to_cpu_vec_f32().expect("to_cpu_vec_f32");
+        assert_eq!(got.len(), batch * out_dim);
+        for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (g - w).abs() < 1e-4,
+                "scale_bias_epilogue ROCm device parity mismatch at [{i}]: got {g:.8}, want {w:.8}",
+            );
+        }
+    }
 }
 
 

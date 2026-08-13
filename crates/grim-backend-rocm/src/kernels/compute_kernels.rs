@@ -131,6 +131,22 @@ extern "C" __global__ void grim_broadcast_bias(const float* bias, float* out,
     out[idx] = bias[col];
 }
 
+extern "C" __global__ void grim_scale_bias_epilogue(
+    float* out, const float* a_scale, const float* b_scale,
+    const float* bias, int batch, int out_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * out_dim;
+    if (idx >= total) return;
+    int i = idx / out_dim;  // token
+    int j = idx - i * out_dim;  // output channel
+    float s = 1.0f;
+    if (a_scale) s *= a_scale[i];
+    if (b_scale) s *= b_scale[j];
+    float v = out[idx] * s;
+    if (bias) v += bias[j];
+    out[idx] = v;
+}
+
 
 extern "C" __global__ void grim_silu_mul(float* gate, float* up, float* out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -397,6 +413,24 @@ mod tests {
             "mscale param missing from grim_rope_yarn");
         assert!(OTHER_KERNEL_SOURCE.contains("rotary_half"),
             "rotary_half param missing from grim_rope_yarn");
+    }
+
+    /// `grim_scale_bias_epilogue` must be present in the HIP source so the JIT
+    /// module can resolve it by entry name (same convention as broadcast_bias).
+    #[test]
+    fn test_scale_bias_epilogue_kernel_presence() {
+        assert!(
+            OTHER_KERNEL_SOURCE.contains("grim_scale_bias_epilogue"),
+            "grim_scale_bias_epilogue kernel missing from OTHER_KERNEL_SOURCE"
+        );
+        assert!(
+            OTHER_KERNEL_SOURCE.contains("a_scale"),
+            "a_scale param missing from grim_scale_bias_epilogue"
+        );
+        assert!(
+            OTHER_KERNEL_SOURCE.contains("b_scale"),
+            "b_scale param missing from grim_scale_bias_epilogue"
+        );
     }
 }
 

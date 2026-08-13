@@ -739,6 +739,96 @@ __device__ __forceinline__ float iqk_weight(int fmt, const unsigned char* b, int
     }
 }
 
+// kernel-hygiene-plan item 1: batched decode helper for the k-quant formats
+// (7 = Q4_K, 8 = Q5_K, 9 = Q6_K). `iqk_weight` decodes one weight at a time and
+// re-unpacks the per-sub-block scalar fields on every call. This helper hoists
+// that unpack out of the per-weight loop and emits both nibbles from each qs[]
+// byte, so the per-element cost in the batched path is two fmaf-class loads and
+// a multiply — no f16_to_f32, no bit extraction, in the inner loop. `count`
+// weights starting at global index `g0` within the expert's super-block buffer
+// are written to out[0..count]. Arithmetic mirrors iqk_weight bit-for-bit.
+__device__ __forceinline__ void iqk_batch_decode(
+    int fmt, const unsigned char* b, int g0, int count, float* out) {
+    const int BLOCK[12] = {170,136,96,110,66,74,82,144,176,210,82,110};
+    const int sb_w = (fmt == 9) ? 128 : 64;
+    int gi = g0;
+    int used = 0;
+    while (used < count) {
+        int blk = gi / 256;
+        const unsigned char* d = b + (unsigned long long)blk * BLOCK[fmt];
+        int local = gi - blk * 256;
+        int sb = local / sb_w;
+        int pos = local - sb * sb_w;
+        int slack = sb_w - pos;
+        int n = (count - used) < slack ? (count - used) : slack;
+        // Per-sub-block scalar unpack, hoisted out of the per-weight loop.
+        if (fmt == 7 || fmt == 8) {
+            float dd = f16_to_f32(*(const unsigned short*)(d + 0));
+            float dmin = f16_to_f32(*(const unsigned short*)(d + 2));
+            const unsigned char* scales = d + 4;
+            const unsigned char* qs = (fmt == 7) ? (d + 16) : (d + 48);
+            const unsigned char* qh = d + 16;
+            int k = sb * 2;
+            int sc1, m1, sc2, m2;
+            if (k < 4) { sc1 = scales[k] & 63; m1 = scales[k + 4] & 63; }
+            else { sc1 = (scales[k + 4] & 0x0F) | ((scales[k - 4] >> 6) << 4); m1 = (scales[k + 4] >> 4) | ((scales[k] >> 6) << 4); }
+            if (k + 1 < 4) { sc2 = scales[k + 1] & 63; m2 = scales[k + 5] & 63; }
+            else { sc2 = (scales[k + 5] & 0x0F) | ((scales[k - 3] >> 6) << 4); m2 = (scales[k + 5] >> 4) | ((scales[k + 1] >> 6) << 4); }
+            int u1 = 1 << (sb * 2);
+            int u2 = 1 << (sb * 2 + 1);
+            int q_off = sb * 32;
+            for (int p = 0; p < n; ++p) {
+                int w = pos + p;
+                int l = w % 32;
+                int hi = w / 32;
+                float wt;
+                if (fmt == 7) {
+                    wt = (hi == 0)
+                        ? dd * (float)sc1 * (float)(qs[q_off + l] & 0x0F) - dmin * (float)m1
+                        : dd * (float)sc2 * (float)(qs[q_off + l] >> 4) - dmin * (float)m2;
+                } else {
+                    if (hi == 0) {
+                        int lo = qs[q_off + l] & 0x0F;
+                        int qlo = lo + (((qh[l] & u1) != 0) ? 16 : 0);
+                        wt = dd * (float)sc1 * (float)qlo - dmin * (float)m1;
+                    } else {
+                        int hv = qs[q_off + l] >> 4;
+                        int qhi = hv + (((qh[l] & u2) != 0) ? 16 : 0);
+                        wt = dd * (float)sc2 * (float)qhi - dmin * (float)m2;
+                    }
+                }
+                out[used + p] = wt;
+            }
+        } else { // fmt == 9 q6k
+            float dd = f16_to_f32(*(const unsigned short*)(d + 208));
+            const unsigned char* ql = d + 0;
+            const unsigned char* qh = d + 128;
+            const unsigned char* scales = d + 192;
+            int ql_idx = sb * 64;
+            int qh_idx = sb * 32;
+            int sc_idx = sb * 8;
+            for (int p = 0; p < n; ++p) {
+                int w = pos + p;
+                int l = w % 32;
+                int quad = w / 32;
+                int is = l / 16;
+                float sc = (float)((signed char)scales[sc_idx + is + quad * 2]);
+                float q1 = (float)(((ql[ql_idx + l] & 0x0F) | ((qh[qh_idx + l] & 0x03) << 4))) - 32.0f;
+                float q2 = (float)(((ql[ql_idx + l + 32] & 0x0F) | ((qh[qh_idx + l] & 0x0C) << 2))) - 32.0f;
+                float q3 = (float)(((ql[ql_idx + l] >> 4) | ((qh[qh_idx + l] & 0x30)))) - 32.0f;
+                float q4 = (float)(((ql[ql_idx + l + 32] >> 4) | ((qh[qh_idx + l] & 0xC0) >> 2))) - 32.0f;
+                float qv = (quad == 0) ? q1 : (quad == 1) ? q2 : (quad == 2) ? q3 : q4;
+                out[used + p] = dd * sc * qv;
+            }
+        }
+        used += n;
+        gi += n;
+    }
+}
+
+// kernel-hygiene-plan item 1: per-weight decode chunks for the batched path.
+#define IQK_CHUNK 64
+
 extern "C" __global__ void grim_moe_fused_grouped_iqk(
     const float* __restrict__ activations,
     const unsigned char* __restrict__ egate_w,
@@ -757,6 +847,7 @@ extern "C" __global__ void grim_moe_fused_grouped_iqk(
     const int end = base + block_size < num_tokens ? base + block_size : num_tokens;
     const int BLOCK[12] = {170,136,96,110,66,74,82,144,176,210,76,82};
     int sbytes = BLOCK[format_id];
+    const bool batched = (format_id == 7 || format_id == 8 || format_id == 9);
 
     for (int s = base + threadIdx.x; s < end; s += blockDim.x) {
         const unsigned int tok = sorted_token_ids[s];
@@ -770,18 +861,45 @@ extern "C" __global__ void grim_moe_fused_grouped_iqk(
         const unsigned char* uw = eup_w   + (unsigned long long)exp * sbytes;
         const unsigned char* dw = edown_w + (unsigned long long)exp * sbytes;
 
+        float scratch[IQK_CHUNK];
+
         for (int h = 0; h < hidden; ++h) {
             float acc = 0.0f;
-            for (int j = 0; j < inter; ++j) {
-                float gate = 0.0f;
-                float up = 0.0f;
-                for (int i = 0; i < hidden; ++i) {
-                    gate += iqk_weight(format_id, gw, j * hidden + i) * a[i];
-                    up   += iqk_weight(format_id, uw, j * hidden + i) * a[i];
+            for (int jc = 0; jc < inter; jc += IQK_CHUNK) {
+                int nj = (inter - jc) < IQK_CHUNK ? inter - jc : IQK_CHUNK;
+                float actj[IQK_CHUNK];
+                for (int j = 0; j < nj; ++j) {
+                    float gate = 0.0f;
+                    float up = 0.0f;
+                    const int jg = jc + j;
+                    if (batched) {
+                        // Item 1: batched k-quant decode. The per-64 sub-block
+                        // unpack is hoisted inside iqk_batch_decode.
+                        const int gbase = jg * hidden;
+                        for (int c0 = 0; c0 < hidden; c0 += IQK_CHUNK) {
+                            int n = (hidden - c0) < IQK_CHUNK ? hidden - c0 : IQK_CHUNK;
+                            iqk_batch_decode(format_id, gw, gbase + c0, n, scratch);
+                            for (int c = 0; c < n; ++c) gate += scratch[c] * a[c + c0];
+                            iqk_batch_decode(format_id, uw, gbase + c0, n, scratch);
+                            for (int c = 0; c < n; ++c) up += scratch[c] * a[c + c0];
+                        }
+                    } else {
+                        for (int i = 0; i < hidden; ++i) {
+                            gate += iqk_weight(format_id, gw, jg * hidden + i) * a[i];
+                            up   += iqk_weight(format_id, uw, jg * hidden + i) * a[i];
+                        }
+                    }
+                    float silu_g = gate / (1.0f + expf(-gate));
+                    actj[j] = silu_g * up;
                 }
-                float silu_g = gate / (1.0f + expf(-gate));
-                float act = silu_g * up;
-                acc += iqk_weight(format_id, dw, h * inter + j) * act;
+                if (batched) {
+                    // Down row is contiguous in g: h*inter + [jc, jc+nj). Decode
+                    // once per chunk and pair each weight with its actj column.
+                    iqk_batch_decode(format_id, dw, h * inter + jc, nj, scratch);
+                    for (int j = 0; j < nj; ++j) acc += scratch[j] * actj[j];
+                } else {
+                    for (int j = 0; j < nj; ++j) acc += iqk_weight(format_id, dw, h * inter + jc + j) * actj[j];
+                }
             }
             unsigned long long out_idx = (unsigned long long)tok * hidden + h;
             atomicAdd(out + out_idx, routed_scaling_factor * w * as * acc);
@@ -1597,6 +1715,41 @@ mod tests {
         assert!(
             KERNEL_SOURCE.contains("charon_fused_bytes"),
             "GMEM traffic counter helper must be present for G-A5"
+        );
+    }
+
+    /// kernel-hygiene-plan item 1: the grouped IQK kernel must expose the
+    /// batched k-quant decode helper and route Q4_K/Q5_K/Q6_K (formats 7,8,9)
+    /// through it, while keeping the per-element `iqk_weight` path for the
+    /// other formats. The helper's inner loop must not call f16_to_f32 (the
+    /// per-sub-block unpack is hoisted out).
+    #[test]
+    fn grouped_iqk_has_batched_kquant_decode() {
+        assert!(
+            KERNEL_SOURCE.contains("iqk_batch_decode"),
+            "Item 1: batched decode helper must be present in the HIP source"
+        );
+        assert!(
+            KERNEL_SOURCE.contains("const bool batched = (format_id == 7 || format_id == 8 || format_id == 9)"),
+            "Item 1: the grouped kernel must select the batched path for formats 7/8/9"
+        );
+        assert!(
+            KERNEL_SOURCE.contains("int sb_w = (fmt == 9) ? 128 : 64"),
+            "Item 1: Q6_K must use 128-weight sub-blocks, Q4_K/Q5_K 64-weight"
+        );
+        // Inner loop of the batched helper emits per-weight weights with hoisted
+        // scalars; the only f16_to_f32 calls must be before the per-weight loop.
+        let helper_start = KERNEL_SOURCE.find("iqk_batch_decode(").unwrap();
+        let helper_end = KERNEL_SOURCE.find("// kernel-hygiene-plan item 1: per-weight decode chunks")
+            .unwrap();
+        let helper = &KERNEL_SOURCE[helper_start..helper_end];
+        assert!(
+            helper.contains("float dd = f16_to_f32"),
+            "Item 1: super-block scale must be unpacked inside the helper"
+        );
+        assert!(
+            helper.contains("for (int p = 0; p < n; ++p)"),
+            "Item 1: the helper must have a per-weight inner loop"
         );
     }
 
