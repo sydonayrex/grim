@@ -27,12 +27,18 @@ impl SafetensorInfo {
         self.dims.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d)).unwrap_or(usize::MAX)
     }
     pub fn byte_size(&self) -> usize {
+        // FMT-10 fix: unknown dtype tags previously fell through to a 4-byte
+        // default, silently mis-sizing buffers for tensors we don't actually
+        // support. `grim_dtype()` already rejects unknown tags, so an unknown
+        // tag here means the tensor is unsupported — report 0 bytes rather than
+        // guessing, which makes any downstream allocation fail loudly instead
+        // of reading the wrong number of bytes.
         let elem = match self.dtype_tag.as_str() {
             "F32" | "I32" | "U32" => 4,
             "F16" | "BF16" => 2,
             "F64" | "I64" | "U64" => 8,
             "I8" | "U8" => 1,
-            _ => 4,
+            _ => 0,
         };
         self.elem_count().saturating_mul(elem)
     }

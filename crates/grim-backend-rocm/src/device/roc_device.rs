@@ -8453,7 +8453,8 @@ impl RocmDevice {
                 tree_parents.shape().elem_count(),
             )));
         }
-        // Wave64 mandate: kernel block dim is 256 = 4 wavefronts of 64 on
+        // Block dim: 128 threads for Wave32 (gfx1036/RDNA2: 4 Wave32 wavefronts),
+        // 256 threads for Wave64 (CDNA: 4 Wave64 wavefronts).
         if head_dim > 256 {
             return Err(Error::Shape(format!(
                 "tree_attention Phase-3 supports head_dim <= 256 (got {})",

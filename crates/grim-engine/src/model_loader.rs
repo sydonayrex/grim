@@ -1069,6 +1069,7 @@ fn load_model_from_config(
                 vocab_size,
                 hidden_size,
                 num_layers,
+                rms_norm_eps: rms_norm_eps as f64,
             };
             let m = Rwkv::load_tp(&ws, rwkv_cfg, device.clone(), tp)?;
             Ok(Box::new(m))
@@ -1086,6 +1087,7 @@ fn load_model_from_config(
                 vocab_size,
                 hidden_size,
                 num_layers,
+                rms_norm_eps: rms_norm_eps as f64,
             };
             let m = Rwkv::load_tp(&ws, rwkv_cfg, device.clone(), tp)?;
             Ok(Box::new(m))
@@ -2114,10 +2116,17 @@ fn load_model_with_providers(
                 max_seq_len: hparams.max_seq_len,
             };
             eprintln!("[grim] Loading RWKV6 model with config: {:?}", rwkv6_cfg);
+            let rwkv_eps = lookup
+                .get_f32("rwkv.epsilon")
+                .or_else(|| lookup.get_f32("rms_norm_epsilon"))
+                .or_else(|| lookup.get_f32("layer_norm_eps"))
+                .map(|v| v as f64)
+                .unwrap_or(hparams.rms_norm_eps as f64);
             let rwkv_cfg = RwkvConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
                 num_layers: hparams.num_layers,
+                rms_norm_eps: rwkv_eps,
             };
             let m = Rwkv::load_tp(&ws, rwkv_cfg, device.clone(), tp)?;
             Ok(Box::new(m))
@@ -2131,10 +2140,17 @@ fn load_model_with_providers(
                 max_seq_len: hparams.max_seq_len,
             };
             eprintln!("[grim] Loading RWKV7 model with config: {:?}", rwkv7_cfg);
+            let rwkv_eps = lookup
+                .get_f32("rwkv.epsilon")
+                .or_else(|| lookup.get_f32("rms_norm_epsilon"))
+                .or_else(|| lookup.get_f32("layer_norm_eps"))
+                .map(|v| v as f64)
+                .unwrap_or(hparams.rms_norm_eps as f64);
             let rwkv_cfg = RwkvConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
                 num_layers: hparams.num_layers,
+                rms_norm_eps: rwkv_eps,
             };
             let m = Rwkv::load_tp(&ws, rwkv_cfg, device.clone(), tp)?;
             Ok(Box::new(m))
@@ -2748,27 +2764,10 @@ fn load_model_with_providers(
                 }
             }
 
-            eprintln!(
-                "[grim] Unknown GGUF architecture '{}' with no plugin compat spec found; using default Llama loader",
+            return Err(Error::Config(format!(
+                "Unsupported GGUF architecture '{}': no plugin compat spec and no native loader",
                 arch_str
-            );
-            let cfg = LlamaConfig {
-                vocab_size: hparams.vocab_size,
-                hidden_size: hparams.hidden_size,
-                num_heads: hparams.num_heads,
-                num_kv_heads: hparams.num_kv_heads,
-                head_dim: hparams.head_dim,
-                num_layers: hparams.num_layers,
-                intermediate_size: hparams.intermediate_size,
-                rms_norm_eps: hparams.rms_norm_eps,
-                rope_theta: hparams.rope_theta,
-                max_seq_len: hparams.max_seq_len,
-            
-                partial_rotary_factor: 1.0,
-                yarn: None,
-        };
-            let m = Llama::load_tp(device.clone(), &ws, cfg, tp)?;
-            Ok(Box::new(m))
+            )));
         }
     }
 }

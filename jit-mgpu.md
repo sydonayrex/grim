@@ -61,6 +61,20 @@ ROCm-specific observations:
 - hiprtc JIT for per-arch fused kernels — this is exactly what grim already does
 - Wave32 occupancy targeting 2-4 wavefronts per CU (RDNA only; CDNA is Wave64)
 
+### Research verification against codebase (old/res5)
+
+Each research claim from `old/res5/synthesis_2.md` verified against `grim-backend-rocm/src`:
+
+| Research claim | Paper ID | In codebase? | Where / status |
+|---------------|----------|-------------|-----------------|
+| FCP polynomial-time auto-search, millisecond-level overhead | 2602.21788 | **No** | No references to FCP, polynomial-time search, or 2602.21788 found in any source file. The `autotune.rs` brute-force search and `charon.rs` cost model are related but do not implement FCP's polynomial-time approach. Plan Phase 5 (FCP fallback tile search) is the first integration. |
+| Lagom conditional compute-communication overlap, cost model decides | 2602.20656 | **No** | No references to Lagom, 2602.20656, or conditional overlap in any source file. No overlap decision logic exists. Noted as future consideration for multi-GPU RCCL overlap. |
+| Marlin/warp-tiled memory-aligned layouts matching bus transaction boundaries | — | **Partially** | `WavefrontTiledLayout` (`layout.rs`) is a wavefront-tiled layout but simpler than Marlin's micro-kernel. `PackedQuantLayout` (`layout.rs:188`) handles Wave64-aligned row segments for quantized data. The plan's tile picker with wavefront-multiple sizes is the first Marlin-style alignment for compute kernels. Old/mockdud.md explicitly identifies the gap: "GrimLayoutHint::WavefrontTiled exists but simpler." |
+| SCYTHE precomputed lookup table + FCP fallback | (derived in synthesis_2.md) | **Partially** | SCYTHE-2 infrastructure is in the codebase: `CapabilityProfiler` (WI-2, `capability_profiler.rs`), `estimate_gemm_latency_ms` (WI-1/WI-6, `roc_device.rs:3900`), `comm_fuse_reduce` (WI-6, `roc_device.rs:3942`), `comm_fuse.rs` (WI-6 kernel). BUT the C²PLR controller (per-layer-per-shape routing) is NOT in `grim-backend-rocm` — it's referenced as living in `grim_engine::scythe2` via `#[see: ...]` doc comments. The backend-rocm crate has the profiling, latency estimation, and comm_fuse infra; the controller that uses them is in a different crate. |
+| SCYTHE fills the gap: tree-drafting + disaggregation + topology-awareness + auto-search combined | (derived) | **Yes (claimed by SCYTHE-2)** | `launch_tree_attention` (roc_device.rs:4109) = tree drafting. `grim-disagg::DisaggRouter` (referenced in scythe2.md) = disaggregation. `link_matrix()` (capability_profiler.rs:107) + `ScytheLink` = topology-awareness. `estimate_gemm_latency_ms` + SCYTHE-2 controller = auto-search. Per `old/scythe2.md`: "Fuses FCP's speed with TriRoute's granularity." |
+
+**Bottom line**: None of the research from old/res5 is fully wired into `grim-backend-rocm` today. SCYTHE-2 has the most integration (profiling, latency estimation, comm_fuse), but the C²PLR controller that ties it together lives in `grim-engine`. FCP and Lagom are not in the codebase at all — the plan's Phase 5 is the first integration of FCP concepts.
+
 ### old/res4/grim_formats_evopress_ceiling.md — Quantization codec status
 
 All four codecs are built but not wired into TrainingJob: Crow (Q4K), Raven (FP8), Jay (MXFP4), Magpie (MXFP8). Relevance to kernel: the dequant kernels exist (`grim_dequant_mxfp4`, `grim_dequant_mxfp8`, `grim_dequant_fp8`). The hardware-adaptive path can choose which dequant kernel to invoke based on the loaded tensor format, which is part of the tensor metadata, not the hardware spec
@@ -308,7 +322,7 @@ This is where the kernel is not just unoptimized defaults. The tile selection de
 
 The research basis:
 - Marlin/warp-tiled kernels: tile sizes should be multiples of the **Wave32** wavefront size (32 threads on RDNA2) so that memory transactions align with bus boundaries. On RDNA2 with 32-byte memory transactions, a block of 128 or 256 threads (4 or 8 Wave32 wavefronts) hits transaction boundaries cleanly
-- Occupancy: 2-4 **Wave32** wavefronts per CU is the sweet spot on RDNA. More wavefronts → more register pressure. Fewer → underutilization. On gfx1036 with 64 CUs, 4 Wave32 wavefronts per CU = 128 threads per block. (CDNA is Wave64 — separate path.)
+- Occupancy: 2-4 **Wave32** wavefronts per CU is the sweet spot on RDNA. More wavefronts → more register pressure. Fewer → underutilization. On gfx1036 with 64 CUs, the codebase uses 256 threads/block (8 Wave32 wavefronts), which exceeds the 2-4 wavefront sweet spot and targets higher occupancy for compute-bound GEMMs. For memory-bound decode paths, 128 threads (4 Wave32 wavefronts) is preferred — matching `fusion.rs:56` which sets `block_dim_x = 128` when `wavefront_size == 32`. (CDNA is Wave64 — separate path.)
 - LDS double-buffering: when LDS is large enough relative to tile data, use ping-pong buffers to overlap global loads with computation. `max_shared_mem_per_block` tells us if we have room
 - Split-K: when K is large relative to block K, split the reduction across multiple passes to hide the reduction latency
 
@@ -357,14 +371,17 @@ pub fn pick_tiles(spec: &HardwareSpec, shape_class: ShapeClass) -> TileConfig {
     let max_threads = spec.max_threads_per_block; // 1024 on gfx1036
     let cu_count = spec.cu_count;              // 64 on gfx1036
 
-    // Block threads: target 4 Wave32 wavefronts per CU on high-CU RDNA cards,
-    // 2 Wave32 wavefronts on low-CU RDNA. Wavefront size is 32 on gfx1036/gfx1030.
-    // CDNA (gfx9xx) is Wave64 — separate path, not covered by this plan.
-    // gfx1036: 64 CUs → 4 waves = 128 threads (32 threads per Wave32 wavefront)
-    // gfx1030: ~32 CUs → 2 waves = 64 threads (conservative)
-    // Must be a multiple of wavefront_size and ≤ max_threads_per_block
-    let target_waves = if cu_count >= 48 { 4 } else { 2 };
-    let threads = target_waves * wave;
+    // Block threads: match existing codebase pattern.
+    // fusion.rs:56/78 sets block_dim_x = 128 for Wave32, 256 for Wave64.
+    // charon.rs:1195 says default_block_dim() = 256 on W64, 128 on W32.
+    // roc_device.rs:8143 sets block_dim_x = 128 for wavefront_size == 32.
+    // qkv_attention.rs:7/211/380 keep __launch_bounds__(256) (proven to launch
+    //   correctly on gfx1036 even with a 128-thread block) and derive num_waves
+    //   at runtime via blockDim.x / wave_size -> 4 wavefronts on either arch.
+    // The tile picker targets Wave32; CDNA is out of scope for this plan.
+    // Use 128 threads (4 Wave32 wavefronts) to match fusion.rs/charon.rs/roc_device.rs.
+    let target_waves = 4;  // 4 Wave32 wavefronts = 128 threads on RDNA2
+    let threads = target_waves * wave;  // wave=32 → threads=128
     assert!(threads <= max_threads && threads % wave == 0);
 
     // LDS per tile: we store BF16 A tile, BF16 B tile, and accumulate C tile in LDS.

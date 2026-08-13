@@ -283,7 +283,7 @@ impl GgufDType {
             GgufDType::Q5_0 => 2 + 4 + 32 / 2,
             GgufDType::Q5_1 => 2 + 2 + 4 + 32 / 2,
             GgufDType::Q8_0 => 2 + 32,
-            GgufDType::Q8_1 => 4 + 4 + 32,
+            GgufDType::Q8_1 => 2 + 2 + 32,
             GgufDType::Q2K => 84,
             GgufDType::Q3K => 110,
             GgufDType::Q4K => 144,

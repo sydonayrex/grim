@@ -200,7 +200,17 @@ impl MambaBlock {
         if xd.is_empty() {
             return Err(Error::Shape("empty Mamba input".into()));
         }
-        let x_flat = vec![xd[0]; h_in];
+        if self.b_param.is_empty() {
+            // MOD-1 fix: `b_param` (the SSM B matrix) must never be aliased to
+            // `a_log` (the A log-weights). Substitifying them produces a
+            // completely different, silent recurrence. Fail loudly instead.
+            return Err(Error::Backend(
+                "Mamba step_block_gpu: b_param is empty; refusing to alias a_log as B".into(),
+            ));
+        }
+        // MOD-4 fix: take the first `h_in` elements (batch=1 token) instead of
+        // replicating `xd[0]` across the whole vector.
+        let x_flat: Vec<f32> = xd.iter().take(h_in).copied().collect();
 
         // Upload input, weights, and SSM params to GPU.
         let x_gpu = dev.from_cpu(&x_flat, &Shape::new(vec![1, h_in]), grim_tensor::DType::F32)?;
@@ -210,7 +220,7 @@ impl MambaBlock {
             grim_tensor::DType::F32,
         )?;
         let b_gpu = dev.from_cpu(
-            if self.b_param.is_empty() { &self.a_log } else { &self.b_param },
+            &self.b_param,
             &Shape::new(vec![self.d_inner, self.d_state]),
             grim_tensor::DType::F32,
         )?;
@@ -271,8 +281,9 @@ impl MambaBlock {
         if xd.is_empty() {
             return Err(Error::Shape("empty Mamba input".into()));
         }
-        // For batch=1: just `xd[0..hidden]`.
-        let x_flat = vec![xd[0]; h_in];
+        // MOD-4 fix: take the first `h_in` elements (batch=1 token) instead of
+        // replicating `xd[0]` across the whole vector.
+        let x_flat: Vec<f32> = xd.iter().take(h_in).copied().collect();
         let x_norm = self
             .norm
             .forward(&cpu_tensor(x_flat, Shape::new(vec![1, h_in])))?;
@@ -281,12 +292,24 @@ impl MambaBlock {
         let d_inner = self.d_inner;
         let _ = d_inner;
 
-        // Selective SSM recurrence state update:
+        // MOD-3 fix: proper discretized SSM recurrence. The previous code used a
+        // placeholder `xz_data[s] * (state.pos as f32 * 0.01)` term that has no
+        // basis in the selective-scan math (it grew linearly with position and
+        // indexed the wrong tensor). The correct update is
+        //   h_new = A[n,s] * h + B[n,s] * x_n
+        // where A = a_log, B = b_param, and x_n is the input to channel `n`
+        // (mirroring the GPU kernel `h_new = a * h_prev + x_n * b_row[s]`).
         for n in 0..state.d_inner {
+            let x_n = xz_data[n];
             for s in 0..state.d_state {
-                let a = self.a_log[n * state.d_state + s] + 1.0;
+                let a = self.a_log[n * state.d_state + s];
+                let b = self
+                    .b_param
+                    .get(n * state.d_state + s)
+                    .copied()
+                    .unwrap_or(0.0);
                 let h_idx = n * state.d_state + s;
-                let new_h = a * state.h[h_idx] + xz_data[s] * (state.pos as f32 * 0.01);
+                let new_h = a * state.h[h_idx] + b * x_n;
                 state.h[h_idx] = new_h;
             }
         }

@@ -22,7 +22,11 @@ void grim_qkv_attention(
     int window_lo       // sliding-window lower bound: max(0, abs_i - window + 1).
                         // Pass 0 for full causal attention (no window).
 ) {
-    // grid = (seq_len, num_heads, 1); block = (256, 1, 1) -> 4 RDNA wavefronts of 64.
+    // grid = (seq_len, num_heads, 1); block = (blockDim.x, 1, 1).
+    // The host launches block_dim_x = 128 on RDNA2 (gfx1036, Wave32: 4 wavefronts)
+    // or 256 on CDNA (Wave64: 4 wavefronts) — see fusion.rs:78 / roc_device.rs:8145.
+    // num_waves is derived at runtime from blockDim.x (line ~74), so the LDS
+    // wave-merge loop sees the true wave count on either arch.
     const int i = blockIdx.x;             // query position (0..seq_len)
     const int h = blockIdx.y;             // head index
     if (i >= seq_len || h >= num_heads) return;
@@ -48,27 +52,30 @@ void grim_qkv_attention(
     // score vector materialized; kv_seq_len may exceed the LDS budget.
     //
     // Each thread owns one output dim d in [0, head_dim).
-    // Wave-cross accumulations are reduced via shfl_xor for tree reduction.
+    // Wave-cross accumulations within a block are reduced via shfl_xor (per
+    // wavefront) then combined across wavefronts in LDS by wave 0.
     //
-    // WI 1.4.2 (wave64 hardware — RDNA dGPU / CDNA): the causal KV walk is
-    // split across the 4 wavefronts in the 256-thread block, each owning a
-    // quarter-stride partitioning of the sequence. At the end, wave 0
-    // combines the 4 wavefront partials in shared memory LDS.
+    // The causal KV walk is split across all `num_waves` wavefronts in the
+    // block (quarter-stride partitioning for 4 waves; generalizes to N), each
+    // owning a slice of the sequence. At the end, wave 0 combines the
+    // per-wavefront partials in shared memory LDS.
     //
-    // Wave32 hardware fallback (RDNA iGPU, gfx1036 et al.): warpSize resolves
-    // to 32 at runtime; the host launches block = wave_size (single
-    // wavefront); WI 1.4.2's per-d up-axis at head_dim > wave_size would be
-    // incomplete. We constrain head_dim ≤ wave_size and run a single-thread
-    // (per dim) softmax — same algorithm, no parallelism across KV. This is a
-    // hardware-mediated fast path; the wave64 branch keeps the WI 1.4.2 speedup.
+    // Wave size is resolved at runtime via warpSize: 32 on RDNA2 (gfx1036),
+    // 64 on CDNA. The host launch sets block_dim_x = 128 on Wave32 / 256 on
+    // Wave64 (fusion.rs:78, roc_device.rs:8145), so num_waves = blockDim.x /
+    // wave_size is 4 on either arch. No single-wavefront fallback path
+    // exists — head_dim is capped at 256 and partitioned across lanes.
     // ──────────────────────────────────────────────────────────────────────
     const int tid = threadIdx.x;
     const int wave_size = warpSize;
     const int wave_id = tid / wave_size;
     const int lane_id = tid % wave_size;
-    // Block is fixed at 256 (`__launch_bounds__(256)`); num_waves = block_size / wave_size
-    // adapts to RDNA iGPU wave32 (num_waves=8) and RDNA dGPU / CDNA wave64 (num_waves=4).
-    const int num_waves = 256 / wave_size;
+    // num_waves = actual launched block size / wave size. Uses blockDim.x (not a
+    // compile-time constant) so it matches the real launch: 128 on gfx1036
+    // (Wave32 -> 4 wavefronts) or 256 on CDNA (Wave64 -> 4 wavefronts). The
+    // host sets block_dim_x = 128 for Wave32 (fusion.rs:78, roc_device.rs:8145),
+    // so this resolves to 4 waves on gfx1036 — the value the LDS merge loop needs.
+    const int num_waves = blockDim.x / wave_size;
 
     const int d = lane_id;
     const bool thread_active = d < head_dim;
@@ -85,7 +92,7 @@ void grim_qkv_attention(
     }
 
     // Per-wavefront partials published to LDS for the wave-0 merge. Sized to
-    // the worst-case 8 wavefronts (RDNA iGPU wave32 + block 256 host path) and
+    // worst-case 8 wavefronts (RDNA iGPU Wave32 + block 256 host path) and
     // head dimensions up to 256.
     __shared__ float s_max[8];
     __shared__ float s_sum[8];
@@ -237,9 +244,12 @@ void grim_qkv_attention_paged(
     const int wave_size = warpSize;
     const int wave_id = tid / wave_size;
     const int lane_id = tid % wave_size;
-    // Block is fixed at 256 (`__launch_bounds__(256)`); num_waves = block_size / wave_size
-    // adapts to RDNA iGPU wave32 (num_waves=8) and RDNA dGPU / CDNA wave64 (num_waves=4).
-    const int num_waves = 256 / wave_size;
+    // num_waves = actual launched block size / wave size. Uses blockDim.x (not a
+    // compile-time constant) so it matches the real launch: 128 on gfx1036
+    // (Wave32 -> 4 wavefronts) or 256 on CDNA (Wave64 -> 4 wavefronts). The
+    // host sets block_dim_x = 128 for Wave32 (fusion.rs:78, roc_device.rs:8145),
+    // so this resolves to 4 waves on gfx1036 — the value the LDS merge loop needs.
+    const int num_waves = blockDim.x / wave_size;
 
     const int d = lane_id;
     const bool thread_active = d < head_dim;
@@ -402,9 +412,12 @@ void grim_tree_attention(
     const int wave_size = warpSize;
     const int wave_id = tid / wave_size;
     const int lane_id = tid % wave_size;
-    // Block is fixed at 256 (`__launch_bounds__(256)`); num_waves = block_size / wave_size
-    // adapts to RDNA iGPU wave32 (num_waves=8) and RDNA dGPU / CDNA wave64 (num_waves=4).
-    const int num_waves = 256 / wave_size;
+    // num_waves = actual launched block size / wave size. Uses blockDim.x (not a
+    // compile-time constant) so it matches the real launch: 128 on gfx1036
+    // (Wave32 -> 4 wavefronts) or 256 on CDNA (Wave64 -> 4 wavefronts). The
+    // host sets block_dim_x = 128 for Wave32 (fusion.rs:78, roc_device.rs:8145),
+    // so this resolves to 4 waves on gfx1036 — the value the LDS merge loop needs.
+    const int num_waves = blockDim.x / wave_size;
 
     const int d = lane_id;
     const bool thread_active = d < head_dim;

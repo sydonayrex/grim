@@ -148,15 +148,21 @@ fn read_quant_params(
 impl GptqProvider {
     /// Open a safetensors file containing GPTQ tensors.
     pub fn open(path: &str) -> Result<Self> {
-        let file = File::open(path)
-            .map_err(|e| Error::Backend(format!("cannot open GPTQ file '{}': {e}", path)))?;
+        // FMT-16 fix: canonicalize the path so symlinks and relative components
+        // resolve to a stable absolute path before any I/O. If canonicalization
+        // is unavailable (e.g. sandbox without realpath), fall back to the raw
+        // path so a load that would otherwise succeed is not broken.
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+        let resolved_str = resolved.to_string_lossy().into_owned();
+        let file = File::open(&resolved)
+            .map_err(|e| Error::Backend(format!("cannot open GPTQ file '{}': {e}", resolved_str)))?;
         let reader = BufReader::new(file);
 
         // Read safetensors header to get tensor names and metadata
         let (info, metadata, data_region_start) =
             crate::safetensors::read_safetensors_header(reader)?;
 
-        let (bits, group_size, default_desc_act) = match read_quant_params(path, &metadata) {
+        let (bits, group_size, default_desc_act) = match read_quant_params(&resolved_str, &metadata) {
             Ok(params) => params,
             Err(e) => return Err(e),
         };
@@ -209,7 +215,7 @@ impl GptqProvider {
                 // Read g_idx to verify monotonicity
                 let g_idx_info = info.get(&g_idx_name).unwrap();
                 let mut local_reader =
-                    BufReader::new(File::open(path).map_err(|e| Error::Backend(e.to_string()))?);
+                    BufReader::new(File::open(&resolved_str).map_err(|e| Error::Backend(e.to_string()))?);
                 if let Ok(g_idx_bytes) =
                     read_safetensor_bytes(&mut local_reader, g_idx_info, data_region_start)
                 {
@@ -259,7 +265,10 @@ impl GptqProvider {
                     GptqTensorInfo {
                         name: base_name.to_string(),
                         shape,
-                        bits,
+                        // FMT-17 fix: store the clamped `valid_bits` (not the raw
+                        // `bits`) so `dequant_gptq_tensor` dequantizes with the
+                        // same bit width the shape was reconstructed for.
+                        bits: valid_bits,
                         group_size,
                         desc_act,
                         qweight_offset: Some(tensor_info.data_start),
@@ -275,7 +284,8 @@ impl GptqProvider {
             }
         }
 
-        let file = File::open(path)
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+        let file = File::open(&resolved)
             .map_err(|e| Error::Backend(format!("cannot reopen GPTQ file '{}': {e}", path)))?;
         let reader = Mutex::new(BufReader::new(file));
 
@@ -294,7 +304,10 @@ impl TensorProvider for GptqProvider {
             .get(name)
             .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in GPTQ file")))?;
 
-        let mut reader = self.reader.lock().unwrap();
+        let mut reader = self
+            .reader
+            .lock()
+            .map_err(|_| Error::Backend("GPTQ reader mutex poisoned".into()))?;
 
         // Helper to read raw bytes from offsets
         let mut read_bytes = |offset: Option<u64>, size: u64| -> Result<Vec<u8>> {
@@ -344,7 +357,10 @@ impl TensorProvider for GptqProvider {
             .get(name)
             .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in GPTQ file")))?;
 
-        let mut reader = self.reader.lock().unwrap();
+        let mut reader = self
+            .reader
+            .lock()
+            .map_err(|_| Error::Backend("GPTQ reader mutex poisoned".into()))?;
 
         // Helper to read raw bytes from offsets
         let mut read_bytes = |offset: Option<u64>, size: u64| -> Result<Vec<u8>> {

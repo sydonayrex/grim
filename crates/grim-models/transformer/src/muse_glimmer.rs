@@ -107,6 +107,10 @@ impl MuseGlimmerConfig {
             let hidden_size = u("hidden_size");
             let num_heads = u("num_attention_heads");
             let raw_head_dim = u("head_dim");
+            // MOD-2 fix: `hidden_size / num_heads` can evaluate to 0 (e.g. when
+            // `hidden_size == 0` or is smaller than `num_heads`), and a 0
+            // `head_dim` becomes a divisor later in the model and panics. Clamp
+            // to a minimum of 1 so the value is always a valid, non-zero stride.
             let head_dim = if raw_head_dim > 0 {
                 raw_head_dim
             } else if num_heads > 0 {
@@ -114,6 +118,7 @@ impl MuseGlimmerConfig {
             } else {
                 64
             };
+            let head_dim = head_dim.max(1);
 
             MuseGlimmerConfig {
                 vocab_size: u("vocab_size"),
@@ -941,7 +946,12 @@ impl MuseGlimmer {
         let caches = session
             .model_state_mut()
             .and_then(|s| s.downcast_mut::<Vec<Option<LlamaLayerCache>>>())
-            .expect("MuseGlimmer::forward: session.model_state must be Vec<Option<LlamaLayerCache>>");
+            .ok_or_else(|| {
+                Error::Session(
+                    "MuseGlimmer::forward: session.model_state has wrong type for this operation"
+                        .into(),
+                )
+            })?;
 
         let (logits, hidden_state, _) = {
             let mut h = hidden_t;
