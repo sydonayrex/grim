@@ -473,7 +473,17 @@ impl NetworkKvClient {
         }
 
         // Read the response payload
-        let total_bytes = (header.num_elements as usize) * 8; // k + v
+        // KVT-1: Cap allocation to prevent DoS from malicious num_elements.
+        const MAX_PAYLOAD_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
+        let total_bytes = (header.num_elements as usize)
+            .checked_mul(8)
+            .filter(|&b| b <= MAX_PAYLOAD_BYTES)
+            .ok_or_else(|| {
+                Error::KvCache(format!(
+                    "TCP fetch: num_elements={} overflows or exceeds cap",
+                    header.num_elements
+                ))
+            })?;
         let mut payload = vec![0u8; total_bytes];
         stream
             .read_exact(&mut payload)

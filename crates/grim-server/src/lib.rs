@@ -1551,11 +1551,20 @@ async fn chat_completions(
         // WI-2: echo back exactly the model name the client requested, per
         // OpenAI API semantics. The previous hardcoded "grim" broke any client
         // that validates `response.model` against what it sent.
-        // TODO: `id` is still a static "chatcmpl-000"; make it unique.
+        // Generate a unique chat completion ID (SRV-13).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COMPLETION_COUNTER: AtomicU64 = AtomicU64::new(1);
+        let completion_id = COMPLETION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let response_id = format!("chatcmpl-{completion_id:03}");
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
         Json(serde_json::json!({
-            "id": "chatcmpl-000",
+            "id": response_id,
             "object": "chat.completion",
-            "created": 0,
+            "created": created,
             "model": requested_model,
             "adapters_active": adapter_names.len(),
             "choices": [choice]
@@ -3063,6 +3072,17 @@ pub async fn serve(
             .await
             .map_err(|e| grim_core::Error::Config(format!("serve TLS failed: {e}")))?;
     } else {
+        // SRV-5: Warn when binding to non-loopback without TLS.
+        let host_part = addr.split(':').next().unwrap_or(addr);
+        let is_wildcard = host_part == "0.0.0.0" || host_part == "::";
+        let is_non_loopback = !host_part.starts_with("127.") && !is_wildcard;
+        if is_wildcard || is_non_loopback {
+            eprintln!(
+                "[grim-server] WARNING: Binding to {addr} exposes the server on a \
+                 non-loopback interface without TLS. This is a security risk on \
+                 untrusted networks."
+            );
+        }
         eprintln!(
             "[grim-server] WARNING: No TLS config found; serving over HTTP on {}",
             addr
