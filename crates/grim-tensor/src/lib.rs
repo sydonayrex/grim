@@ -11,8 +11,10 @@ pub mod wavefront;
 
 pub use backend::{
     BackendDevice, BackendStorage, ComputeHandle, GpuCapability, MemAdvice,
-    QuantizedMatmulBackwardResiduals, ReadyHandle, ScytheLink, ScythePlacement,
+    QuantizedMatmulBackwardResiduals, ReadyHandle, RopeConfig, ScytheLink, ScythePlacement,
+    YaRNParams,
 };
+
 pub use dtype::{
     ArithType, BlockDtype, DType, Device, FloatPackScheme, GpuIntConfig, GroupQuantScheme,
     KQuantScheme, QuantFormat, QuantProvenance, Storage,

@@ -1506,10 +1506,13 @@ impl CudaDevice {
         num_kv_heads: usize,
         kv_seq_len: usize,
         cache_offset: u32,
+        window: Option<usize>,
         out: &Shape,
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = window;
+
         let out_dims = out.dims();
         if out_dims.len() != 3 {
             return Err(Error::Shape(
@@ -2215,6 +2218,7 @@ impl BackendDevice for CudaDevice {
         num_kv_heads: usize,
         kv_seq_len: usize,
         cache_offset: u32,
+        window: Option<usize>,
         out_shape: &Shape,
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
@@ -2226,6 +2230,7 @@ impl BackendDevice for CudaDevice {
             num_kv_heads,
             kv_seq_len,
             cache_offset,
+            window,
             out_shape,
             out_max,
             out_sum,
@@ -2243,8 +2248,11 @@ impl BackendDevice for CudaDevice {
         page_size: usize,
         kv_seq_len: usize,
         cache_offset: u32,
+        window: Option<usize>,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = window;
+
         let qd = q.to_cpu_vec_f32()?;
         let btd = block_tables.to_cpu_vec_f32()?;
         let kd = k_pages.to_cpu_vec_f32()?;
@@ -2410,11 +2418,14 @@ impl BackendDevice for CudaDevice {
         &self,
         x: &dyn BackendStorage,
         positions: &[u32],
-        dim: usize,
-        base: f32,
+        cfg: &grim_tensor::RopeConfig,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+
+        let dim = cfg.dim;
+        let base = cfg.base;
         let x_storage = x
+
             .as_any()
             .downcast_ref::<CudaStorage>()
             .ok_or_else(|| Error::Backend("rope x is not CudaStorage".into()))?;
@@ -2588,7 +2599,7 @@ impl BackendDevice for CudaDevice {
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let (out_storage, _h) =
-            self.qkv_attention(q, k, v, num_kv_heads, seq_len, 0, out_shape, None, None)?;
+            self.qkv_attention(q, k, v, num_kv_heads, seq_len, 0, None, out_shape, None, None)?;
         let _ = num_heads;
         let _ = head_dim;
         Ok((
@@ -2611,7 +2622,8 @@ impl BackendDevice for CudaDevice {
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let (out_storage, _h) =
-            self.qkv_attention(q, k, v, num_heads, kv_seq_len, 0, out_shape, None, None)?;
+            self.qkv_attention(q, k, v, num_heads, kv_seq_len, 0, None, out_shape, None, None)?;
+
         let _ = head_dim;
         let _ = seq_len;
         Ok((

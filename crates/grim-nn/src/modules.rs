@@ -42,6 +42,43 @@ pub fn silu_mul_on_device(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// Fused softplus attention gate `softplus(gate) * x` per-head broadcast.
+pub fn softplus_mul_on_device(
+    x: &Tensor,
+    gate: &Tensor,
+    num_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    let dev = pick_device_for_tensor(x);
+    let x_vec = x.to_vec_f32()?;
+    let gate_vec = gate.to_vec_f32()?;
+    let mut out_vec = vec![0.0f32; x_vec.len()];
+
+    let tokens = x_vec.len() / (num_heads * head_dim);
+    for t in 0..tokens {
+        for h in 0..num_heads {
+            let g_val = gate_vec.get(t * num_heads + h).copied().unwrap_or(0.0);
+            let softplus_g = (1.0 + g_val.exp()).ln();
+            for d in 0..head_dim {
+                let idx = (t * num_heads + h) * head_dim + d;
+                if idx < x_vec.len() {
+                    out_vec[idx] = x_vec[idx] * softplus_g;
+                }
+            }
+        }
+    }
+
+    let storage = dev.from_cpu(&out_vec, x.shape(), DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(storage),
+        x.shape().clone(),
+        DType::F32,
+        x.provenance().clone(),
+        x.device().clone(),
+    ))
+}
+
+
 /// Elementwise tensor addition `a + b` dispatched on-device without CPU roundtrips.
 pub fn add_on_device(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let dev = pick_device_for_tensor(a);
@@ -824,50 +861,88 @@ impl Embedding {
     }
 }
 
-// ---------- RoPE ----------
+pub use grim_tensor::{RopeConfig, YaRNParams};
+
 
 /// Rotary positional embedding — apply RoPE to `(B, S, D)` query/key.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Rope {
-    pub dim: usize,
-    pub base: f32,
+    pub config: RopeConfig,
 }
 
 impl Rope {
     pub fn new(dim: usize, base: f32) -> Self {
-        Self { dim, base }
+        Self {
+            config: RopeConfig::new(dim, base),
+        }
+    }
+
+    pub fn from_config(config: RopeConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn dim(&self) -> usize {
+        self.config.dim
+    }
+
+    pub fn base(&self) -> f32 {
+        self.config.base
     }
 
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let dims = x.shape().dims().to_vec();
-        if dims.len() != 3 || dims[2] != self.dim {
+        if dims.len() != 3 || dims[2] != self.config.dim {
             return Err(Error::Shape(format!(
                 "RoPE expects (B,S,D={}), got {:?}",
-                self.dim, dims
+                self.config.dim, dims
             )));
         }
         let (b, s, d) = (dims[0], dims[1], dims[2]);
         let out_shape = Shape::new(vec![b, s, d]);
         if x.device().is_cpu() {
-            let half = d / 2;
-            let inv_freq: Vec<f32> = (0..half)
-                .map(|i| 1.0 / self.base.powf((2 * i) as f32 / d as f32))
+            let rotary_dim = self.config.rotary_dim.min(d);
+            let rotary_half = rotary_dim / 2;
+
+            // Compute inv_freq with YaRN frequency ramp if specified
+            let inv_freq: Vec<f32> = (0..rotary_half)
+                .map(|i| {
+                    let freq = 1.0 / self.config.base.powf((2 * i) as f32 / d as f32);
+                    if let Some(yarn) = &self.config.yarn {
+                        let wavelength = 2.0 * std::f32::consts::PI / freq;
+                        let low = (yarn.original_max_pos as f32) / yarn.beta_slow;
+                        let high = (yarn.original_max_pos as f32) / yarn.beta_fast;
+                        if wavelength < high {
+                            freq
+                        } else if wavelength > low {
+                            freq / yarn.factor
+                        } else {
+                            let ramp = (yarn.original_max_pos as f32 / wavelength - yarn.beta_slow)
+                                / (yarn.beta_fast - yarn.beta_slow);
+                            (1.0 - ramp) * (freq / yarn.factor) + ramp * freq
+                        }
+                    } else {
+                        freq
+                    }
+                })
                 .collect();
+
+            let mscale = self.config.yarn.as_ref().map_or(1.0, |y| y.attention_factor);
+
             let mut src = x.to_vec_f32()?;
             for bi in 0..b {
                 for si in 0..s {
                     let pos = positions.get(si).copied().unwrap_or(si as u32) as f32;
                     let base_index = (bi * s + si) * d;
-                    let mut cos_p = vec![0.0f32; half];
-                    let mut sin_p = vec![0.0f32; half];
-                    for i in 0..half {
+                    let mut cos_p = vec![0.0f32; rotary_half];
+                    let mut sin_p = vec![0.0f32; rotary_half];
+                    for i in 0..rotary_half {
                         let a = pos * inv_freq[i];
-                        cos_p[i] = a.cos();
-                        sin_p[i] = a.sin();
+                        cos_p[i] = a.cos() * mscale;
+                        sin_p[i] = a.sin() * mscale;
                     }
-                    for i in 0..half {
+                    for i in 0..rotary_half {
                         let xi = base_index + i;
-                        let xj = base_index + half + i;
+                        let xj = base_index + rotary_half + i;
                         let a = src[xi];
                         let bv = src[xj];
                         src[xi] = a * cos_p[i] - bv * sin_p[i];
@@ -879,9 +954,8 @@ impl Rope {
         } else {
             let dev = pick_device_for_tensor(x);
             let (storage, _handle) =
-                dev.rope(x.storage().as_ref(), positions, self.dim, self.base, &out_shape)?;
+                dev.rope(x.storage().as_ref(), positions, &self.config, &out_shape)?;
             Ok(Tensor::new(
-
                 Arc::from(storage),
                 out_shape,
                 DType::F32,
@@ -890,7 +964,6 @@ impl Rope {
             ))
         }
     }
-
 }
 
 #[cfg(test)]

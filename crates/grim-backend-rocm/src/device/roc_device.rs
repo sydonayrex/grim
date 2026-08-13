@@ -3271,10 +3271,13 @@ impl BackendDevice for RocmDevice {
         num_kv_heads: usize,
         kv_seq_len: usize,
         cache_offset: u32,
+        window: Option<usize>,
         out_shape: &Shape,
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = window;
+
         // ─── enabled gate ────────────────────────────────────────────────
         let config = {
             let out_dims = out_shape.dims();
@@ -3416,10 +3419,11 @@ impl BackendDevice for RocmDevice {
         &self,
         x: &dyn BackendStorage,
         positions: &[u32],
-        dim: usize,
-        base: f32,
+        cfg: &grim_tensor::RopeConfig,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let dim = cfg.dim;
+        let base = cfg.base;
         let x_s = as_rocm(x)?;
         if !x_s.device_ptr_is_valid() {
             return Err(Error::Backend(
@@ -3453,6 +3457,7 @@ impl BackendDevice for RocmDevice {
         let mut d_i = d;
         let mut half_i = half;
         let mut base_f = base;
+
         let total = (b * s * half) as usize;
         let (grid, block) = linear_launch(total);
 
@@ -3931,8 +3936,11 @@ impl BackendDevice for RocmDevice {
         page_size: usize,
         kv_seq_len: usize,
         cache_offset: u32,
+        window: Option<usize>,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = window;
+
         let q_s = as_rocm(q)?;
         let bt_s = as_rocm(block_tables)?;
         let k_s = as_rocm(k_pages)?;

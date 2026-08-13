@@ -2376,6 +2376,7 @@ impl BackendDevice for MetalDevice {
         num_kv_heads: usize,
         kv_seq_len: usize,
         cache_offset: u32,
+        window: Option<usize>,
         out_shape: &Shape,
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
@@ -2387,6 +2388,7 @@ impl BackendDevice for MetalDevice {
             num_kv_heads,
             kv_seq_len,
             cache_offset,
+            window,
             out_shape,
             out_max,
             out_sum,
@@ -2405,8 +2407,10 @@ impl BackendDevice for MetalDevice {
         page_size: usize,
         kv_seq_len: usize,
         _cache_offset: u32,
+        window: Option<usize>,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+
         #[cfg(target_vendor = "apple")]
         if let Some(ref inner) = self.inner {
             let dims = out_shape.dims();
@@ -2679,11 +2683,14 @@ impl BackendDevice for MetalDevice {
         &self,
         x: &dyn BackendStorage,
         positions: &[u32],
-        dim: usize,
-        base: f32,
+        cfg: &grim_tensor::RopeConfig,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+
+        let dim = cfg.dim;
+        let base = cfg.base;
         #[cfg(target_vendor = "apple")]
+
         {
             if let Some(ref inner) = self.inner {
                 let x_s = x.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
@@ -2947,7 +2954,7 @@ impl BackendDevice for MetalDevice {
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let (out_storage, _h) =
-            self.qkv_attention(q, k, v, num_kv_heads, seq_len, 0, out_shape, None, None)?;
+            self.qkv_attention(q, k, v, num_kv_heads, seq_len, 0, None, out_shape, None, None)?;
         let _ = num_heads;
         let _ = head_dim;
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
@@ -2965,7 +2972,8 @@ impl BackendDevice for MetalDevice {
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let (out_storage, _h) =
-            self.qkv_attention(q, k, v, num_heads, kv_seq_len, 0, out_shape, None, None)?;
+            self.qkv_attention(q, k, v, num_heads, kv_seq_len, 0, None, out_shape, None, None)?;
+
         let _ = head_dim;
         let _ = seq_len;
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
@@ -3861,10 +3869,13 @@ impl MetalDevice {
         num_kv_heads: usize,
         kv_seq_len: usize,
         cache_offset: u32,
+        window: Option<usize>,
         out: &Shape,
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = window;
+
         let out_dims = out.dims();
         if out_dims.len() != 3 {
             return Err(Error::Shape(

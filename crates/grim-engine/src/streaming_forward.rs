@@ -352,18 +352,17 @@ impl StreamingBlockForward {
         let q_3d = dev.from_cpu(&q.to_vec_f32()?, &q_shape, DType::F32)?;
         let k_3d = dev.from_cpu(&k.to_vec_f32()?, &k_shape, DType::F32)?;
 
+        let rope_cfg = grim_tensor::RopeConfig::new(cfg.head_dim, rope_base);
         let (q_rot_s, _) = dev.rope(
             q_3d.as_ref(),
             &q_positions,
-            cfg.head_dim,
-            rope_base,
+            &rope_cfg,
             &q_shape,
         )?;
         let (k_rot_s, _) = dev.rope(
             k_3d.as_ref(),
             &k_positions,
-            cfg.head_dim,
-            rope_base,
+            &rope_cfg,
             &k_shape,
         )?;
 
@@ -389,10 +388,12 @@ impl StreamingBlockForward {
             cfg.num_kv_heads,
             total_tokens,
             0,
+            None,
             &out_shape_3d,
             None,
             None,
         )?;
+
 
         let attn_raw = Tensor::new(
             std::sync::Arc::from(attn_s),

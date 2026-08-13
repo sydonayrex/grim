@@ -298,36 +298,59 @@ impl BackendDevice for CpuDevice {
         &self,
         x: &dyn BackendStorage,
         positions: &[u32],
-        dim: usize,
-        base: f32,
+        cfg: &grim_tensor::RopeConfig,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+
         let x_st = a_storage(x)?;
         let dims = out_shape.dims().to_vec();
-        if dims.len() != 3 || dims[2] != dim {
+        if dims.len() != 3 || dims[2] != cfg.dim {
             return Err(Error::Shape(format!(
                 "RoPE expects (B,S,D={}), got {:?}",
-                dim, dims
+                cfg.dim, dims
             )));
         }
         let (b, s, d) = (dims[0], dims[1], dims[2]);
-        let half = d / 2;
-        let inv_freq: Vec<f32> = (0..half)
-            .map(|i| 1.0 / base.powf((2 * i) as f32 / d as f32))
+        let rotary_dim = cfg.rotary_dim.min(d);
+        let rotary_half = rotary_dim / 2;
+
+        let inv_freq: Vec<f32> = (0..rotary_half)
+            .map(|i| {
+                let freq = 1.0 / cfg.base.powf((2 * i) as f32 / d as f32);
+                if let Some(yarn) = &cfg.yarn {
+                    let wavelength = 2.0 * std::f32::consts::PI / freq;
+                    let low = (yarn.original_max_pos as f32) / yarn.beta_slow;
+                    let high = (yarn.original_max_pos as f32) / yarn.beta_fast;
+                    if wavelength < high {
+                        freq
+                    } else if wavelength > low {
+                        freq / yarn.factor
+                    } else {
+                        let ramp = (yarn.original_max_pos as f32 / wavelength - yarn.beta_slow)
+                            / (yarn.beta_fast - yarn.beta_slow);
+                        (1.0 - ramp) * (freq / yarn.factor) + ramp * freq
+                    }
+                } else {
+                    freq
+                }
+            })
             .collect();
+
+        let mscale = cfg.yarn.as_ref().map_or(1.0, |y| y.attention_factor);
         let mut src = x_st.data().to_vec();
+
         for bi in 0..b {
             for si in 0..s {
                 let pos = positions.get(si).copied().unwrap_or(si as u32) as f32;
                 let base_index = (bi * s + si) * d;
-                let mut cos_p = vec![0.0f32; half];
-                let mut sin_p = vec![0.0f32; half];
-                for i in 0..half {
+                let mut cos_p = vec![0.0f32; rotary_half];
+                let mut sin_p = vec![0.0f32; rotary_half];
+                for i in 0..rotary_half {
                     let a = pos * inv_freq[i];
-                    cos_p[i] = a.cos();
-                    sin_p[i] = a.sin();
+                    cos_p[i] = a.cos() * mscale;
+                    sin_p[i] = a.sin() * mscale;
                 }
-                for i in 0..half {
+                for i in 0..rotary_half {
                     let x1 = src[base_index + 2 * i];
                     let x2 = src[base_index + 2 * i + 1];
                     src[base_index + 2 * i] = x1 * cos_p[i] - x2 * sin_p[i];
@@ -349,6 +372,7 @@ impl BackendDevice for CpuDevice {
         num_kv_heads: usize,
         kv_seq_len: usize,
         cache_offset: u32,
+        window: Option<usize>,
         out_shape: &Shape,
         _out_max: Option<&dyn BackendStorage>,
         _out_sum: Option<&dyn BackendStorage>,
@@ -358,9 +382,7 @@ impl BackendDevice for CpuDevice {
         let v_st = a_storage(v)?;
         let q_dims = q_st.shape().dims();
         let k_dims = k_st.shape().dims();
-        // Only the leading token count and the per-head stride matter for the
-        // flat reads below; storage views may legally be batch-1 3-D
-        // `(1, rows*heads, head_dim)`. Validate rank/last-dim only.
+
         if q_dims.len() < 2 || k_dims.len() < 2 {
             return Err(Error::Shape("qkv_attention: q/k/v must be >= 2-D".into()));
         }
@@ -392,11 +414,15 @@ impl BackendDevice for CpuDevice {
         for h in 0..num_heads {
             let kvh = (h * num_kv_heads) / num_heads;
             for t in 0..seq_len {
-                // Causal: for each key t2, compute score if t2 <= cache_offset + t
                 let q_abs = cache_offset as usize + t;
+                let window_start = if let Some(w) = window {
+                    (q_abs + 1).saturating_sub(w)
+                } else {
+                    0
+                };
                 let mut scores = vec![0.0f32; kv_seq_len];
                 for t2 in 0..kv_seq_len {
-                    if t2 > q_abs {
+                    if t2 > q_abs || t2 < window_start {
                         scores[t2] = f32::NEG_INFINITY;
                     } else {
                         let mut dot = 0.0f32;
@@ -432,6 +458,7 @@ impl BackendDevice for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
+
 
     fn short_conv1d_causal_step(
         &self,
@@ -591,8 +618,11 @@ impl BackendDevice for CpuDevice {
         page_size: usize,
         kv_seq_len: usize,
         cache_offset: u32,
+        window: Option<usize>,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = window;
+
         let q_st = a_storage(q)?;
         let bt_st = a_storage(block_tables)?;
         let k_st = a_storage(k_pages)?;

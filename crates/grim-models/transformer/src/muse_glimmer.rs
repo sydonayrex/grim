@@ -402,10 +402,10 @@ impl GlimmerBlock {
         match dev.rope(
             relabeled.storage().as_ref(),
             &ext_positions,
-            self._cfg.head_dim,
-            self.rope.base,
+            &self.rope.config,
             &rope_shape,
         ) {
+
             Ok((st, _h)) => {
                 let rope_out = Tensor::new(
                     Arc::from(st),

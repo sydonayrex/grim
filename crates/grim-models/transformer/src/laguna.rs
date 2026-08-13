@@ -54,6 +54,48 @@ pub struct LagunaConfig {
     pub gating: String,
 }
 
+impl Default for LagunaConfig {
+    fn default() -> Self {
+        Self {
+            vocab_size: 100352,
+            hidden_size: 3072,
+            num_heads: 48,
+            num_kv_heads: 8,
+            head_dim: 128,
+            num_layers: 48,
+            intermediate_size: 12288,
+            moe_intermediate_size: 1024,
+            shared_expert_intermediate_size: 1024,
+            num_experts: 256,
+            num_experts_per_tok: 8,
+            routed_scaling_factor: 2.5,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            max_seq_len: 4096,
+            mlp_only_layers: vec![0],
+            layer_types: (0..48)
+                .map(|i| {
+                    if i % 4 == 0 {
+                        "full_attention".to_string()
+                    } else {
+                        "sliding_attention".to_string()
+                    }
+                })
+                .collect(),
+            sliding_window: 512,
+            num_attention_heads_per_layer: (0..48)
+                .map(|i| if i % 4 == 0 { 48 } else { 72 })
+                .collect(),
+            full_rope_theta: 500000.0,
+            sliding_rope_theta: 10000.0,
+            full_partial_rotary_factor: 0.5,
+            sliding_partial_rotary_factor: 1.0,
+            gating: "per-head".to_string(),
+        }
+    }
+}
+
+
 impl ModelConfig for LagunaConfig {
     fn name(&self) -> &str {
         "laguna"
@@ -126,7 +168,77 @@ impl Laguna {
             })
             .collect();
 
-        let inner = Llama::load_tp_moe(device.clone(), ws, llama_cfg, &moe_spec, tp)?;
+        let attn_specs: Vec<crate::block::LayerAttentionSpec> = (0..cfg.num_layers)
+            .map(|i| {
+                let layer_type = cfg.layer_types.get(i).map(|s| s.as_str()).unwrap_or("full_attention");
+                let is_sliding = layer_type == "sliding_attention";
+                let attn_type = if is_sliding {
+                    crate::block::AttentionType::Sliding
+                } else {
+                    crate::block::AttentionType::Full
+                };
+
+                let num_heads = cfg
+                    .num_attention_heads_per_layer
+                    .get(i)
+                    .copied()
+                    .unwrap_or(cfg.num_heads);
+
+                let theta = if is_sliding {
+                    cfg.sliding_rope_theta
+                } else {
+                    cfg.full_rope_theta
+                };
+
+                let partial_factor = if is_sliding {
+                    cfg.sliding_partial_rotary_factor
+                } else {
+                    cfg.full_partial_rotary_factor
+                };
+
+                let rotary_dim = (cfg.head_dim as f32 * partial_factor).round() as usize;
+
+                let yarn = if !is_sliding && theta > 100000.0 {
+                    Some(grim_tensor::YaRNParams {
+                        factor: 1.0,
+                        original_max_pos: cfg.max_seq_len,
+                        beta_fast: 32.0,
+                        beta_slow: 1.0,
+                        attention_factor: 1.0,
+                    })
+                } else {
+                    None
+                };
+
+                let rope = grim_tensor::RopeConfig {
+                    dim: cfg.head_dim,
+                    base: theta,
+                    rotary_dim,
+                    yarn,
+                };
+
+
+                let sliding_window = if is_sliding {
+                    Some(cfg.sliding_window)
+                } else {
+                    None
+                };
+
+                let has_attn_gate = cfg.gating == "per-head";
+
+                crate::block::LayerAttentionSpec {
+                    attn_type,
+                    num_heads,
+                    num_kv_heads: cfg.num_kv_heads,
+                    rope,
+                    sliding_window,
+                    has_attn_gate,
+                }
+            })
+            .collect();
+
+        let inner = Llama::load_tp_moe_specs(device.clone(), ws, llama_cfg, &moe_spec, &attn_specs, tp)?;
+
         Ok(Self {
             cfg,
             device: inner.device.clone(),
@@ -167,3 +279,93 @@ impl CausalLm for Laguna {
         self.inner.forward(session, input_ids, positions, adapters)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_laguna_s_2_1_layer_attention_specs() {
+        let cfg = LagunaConfig::default();
+        let num_layers = cfg.num_layers;
+        assert_eq!(num_layers, 48);
+
+        let specs: Vec<crate::block::LayerAttentionSpec> = (0..num_layers)
+            .map(|i| {
+                let layer_type = cfg.layer_types.get(i).map(|s| s.as_str()).unwrap_or(if i % 4 == 0 { "full_attention" } else { "sliding_attention" });
+                let is_sliding = layer_type == "sliding_attention";
+
+                let num_heads = cfg.num_attention_heads_per_layer.get(i).copied().unwrap_or(if is_sliding { 72 } else { 48 });
+
+                let theta = if is_sliding {
+                    cfg.sliding_rope_theta
+                } else {
+                    cfg.full_rope_theta
+                };
+
+                let partial_factor = if is_sliding {
+                    cfg.sliding_partial_rotary_factor
+                } else {
+                    cfg.full_partial_rotary_factor
+                };
+
+
+                let rotary_dim = (cfg.head_dim as f32 * partial_factor).round() as usize;
+
+                let yarn = if !is_sliding && theta > 100000.0 {
+                    Some(grim_tensor::YaRNParams {
+                        factor: 1.0,
+                        original_max_pos: cfg.max_seq_len,
+                        beta_fast: 32.0,
+                        beta_slow: 1.0,
+                        attention_factor: 1.0,
+                    })
+                } else {
+                    None
+                };
+
+                let rope = grim_tensor::RopeConfig {
+                    dim: cfg.head_dim,
+                    base: theta,
+                    rotary_dim,
+                    yarn,
+                };
+
+                let sliding_window = if is_sliding {
+                    Some(cfg.sliding_window)
+                } else {
+                    None
+                };
+
+                let has_attn_gate = cfg.gating == "per-head";
+
+                crate::block::LayerAttentionSpec {
+                    attn_type: if is_sliding { crate::block::AttentionType::Sliding } else { crate::block::AttentionType::Full },
+
+                    num_heads,
+                    num_kv_heads: cfg.num_kv_heads,
+                    rope,
+                    sliding_window,
+                    has_attn_gate,
+                }
+            })
+            .collect();
+
+        // Layer 0: Full attention
+        assert_eq!(specs[0].num_heads, 48);
+        assert_eq!(specs[0].rope.base, 500000.0);
+        assert_eq!(specs[0].rope.rotary_dim, 64); // 0.5 * 128
+        assert!(specs[0].rope.yarn.is_some());
+        assert_eq!(specs[0].sliding_window, None);
+        assert!(specs[0].has_attn_gate);
+
+        // Layer 1: Sliding attention
+        assert_eq!(specs[1].num_heads, 72);
+        assert_eq!(specs[1].rope.base, 10000.0);
+        assert_eq!(specs[1].rope.rotary_dim, 128); // 1.0 * 128
+        assert!(specs[1].rope.yarn.is_none());
+        assert_eq!(specs[1].sliding_window, Some(512));
+        assert!(specs[1].has_attn_gate);
+    }
+}
+

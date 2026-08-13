@@ -2154,10 +2154,12 @@ impl BackendDevice for VulkanDevice {
         num_kv_heads: usize,
         kv_seq_len: usize,
         cache_offset: u32,
+        window: Option<usize>,
         out_shape: &Shape,
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = window;
         self.qkv_attention_inner(
             q,
             k,
@@ -2182,8 +2184,11 @@ impl BackendDevice for VulkanDevice {
         page_size: usize,
         kv_seq_len: usize,
         _cache_offset: u32,
+        window: Option<usize>,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = window;
+
         let out_dims = out_shape.dims();
         if out_dims.len() != 3 {
             return Err(Error::Shape(
@@ -2525,11 +2530,14 @@ impl BackendDevice for VulkanDevice {
         &self,
         x: &dyn BackendStorage,
         positions: &[u32],
-        dim: usize,
-        base: f32,
+        cfg: &grim_tensor::RopeConfig,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+
+        let dim = cfg.dim;
+        let base = cfg.base;
         let x_s = x
+
             .as_any()
             .downcast_ref::<VulkanStorage>()
             .ok_or_else(|| Error::Backend("Vulkan rope x is not VulkanStorage".into()))?;
@@ -2723,7 +2731,7 @@ impl BackendDevice for VulkanDevice {
         // Note: GPU fast path skipped until buffer layout matches CPU semantics and end-to-end golden verification passes.
         // Pass num_kv_heads for GQA head-repeat; num_heads comes from out_shape.
         let (out_storage, _h) =
-            self.qkv_attention(q, k, v, num_kv_heads, seq_len, 0, out_shape, None, None)?;
+            self.qkv_attention(q, k, v, num_kv_heads, seq_len, 0, None, out_shape, None, None)?;
         Ok((out_storage, Box::new(VulkanHandle)))
     }
 
@@ -2752,9 +2760,10 @@ impl BackendDevice for VulkanDevice {
         );
         // Cross-attention: Q and KV share num_heads, so pass it as KV-head count.
         let (out_storage, _h) =
-            self.qkv_attention(q, k, v, num_heads, kv_seq_len, 0, out_shape, None, None)?;
+            self.qkv_attention(q, k, v, num_heads, kv_seq_len, 0, None, out_shape, None, None)?;
         Ok((out_storage, Box::new(VulkanHandle)))
     }
+
 
     fn rwkv_time_mix(
         &self,
