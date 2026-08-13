@@ -2373,12 +2373,20 @@ mod tests {
         let bias: Vec<f32> = (0..out_dim).map(|_| rng()).collect();
         let gemm_out: Vec<f32> = (0..batch * out_dim).map(|_| rng()).collect();
 
-        // CPU reference.
+        // CPU reference mirroring the kernel's rounding order exactly
+        // (s = a_scale*b_scale rounded, then v = out*s rounded, then + bias),
+        // so the parity check is bit-exact rather than tolerance-limited at
+        // large magnitudes where 1 ulp dwarfs any fixed tolerance.
         let mut want = gemm_out.clone();
         for i in 0..batch {
             for j in 0..out_dim {
                 let idx = i * out_dim + j;
-                want[idx] = gemm_out[idx] * a_scale[i] * b_scale[j] + bias[j];
+                let mut s = 1.0f32;
+                s *= a_scale[i];
+                s *= b_scale[j];
+                let mut v = gemm_out[idx] * s;
+                v += bias[j];
+                want[idx] = v;
             }
         }
 
