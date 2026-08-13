@@ -51,6 +51,12 @@ pub fn read_safetensors_header<R: Read + Seek>(
     reader.read_exact(&mut len_bytes)?;
     let header_len = u64::from_le_bytes(len_bytes) as usize;
 
+    if header_len > 100_000_000 {
+        return Err(Error::Backend(format!(
+            "safetensors header_len {header_len} exceeds safety limit 100MB"
+        )));
+    }
+
     let mut header_json = vec![0u8; header_len];
     reader.read_exact(&mut header_json)?;
 
@@ -61,50 +67,85 @@ pub fn read_safetensors_header<R: Read + Seek>(
         .as_object()
         .ok_or_else(|| Error::Backend("safetensors header is not a JSON object".into()))?;
 
-    let metadata = header_map
-        .get("__metadata__")
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            let mut map = HashMap::new();
-            for (k, val) in obj {
-                if let Some(s) = val.as_str() {
-                    map.insert(k.clone(), s.to_string());
-                }
-            }
-            map
-        });
+    let file_len = reader.seek(SeekFrom::End(0))?;
 
     let mut tensors = HashMap::new();
+    let mut metadata = None;
     let mut total_data = 0u64;
+
     for (key, val) in header_map {
         if key == "__metadata__" {
+            if let Some(m) = val.as_object() {
+                let mut map = HashMap::new();
+                for (k, v) in m {
+                    if let Some(s) = v.as_str() {
+                        map.insert(k.clone(), s.to_string());
+                    }
+                }
+                metadata = Some(map);
+            }
             continue;
         }
-        let obj = val
-            .as_object()
-            .ok_or_else(|| Error::Backend(format!("safetensors entry '{key}' is not an object")))?;
+
+        let obj = match val.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
 
         let dtype_tag = obj
             .get("dtype")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::Backend(format!("missing dtype for '{key}'")))?
+            .unwrap_or("")
             .to_string();
+
+        if dtype_tag.is_empty() {
+            return Err(Error::Backend(format!("missing dtype for '{key}'")));
+        }
 
         let shape = obj
             .get("shape")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| Error::Backend(format!("missing shape for '{key}'")))?
-            .iter()
-            .map(|v| v.as_u64().unwrap_or(0) as usize)
-            .collect::<Vec<_>>();
+            .map(|arr| {
+                arr.iter()
+                    .map(|v| v.as_u64().unwrap_or(0) as usize)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        if shape.contains(&0) {
+            return Err(Error::Backend(format!("safetensors '{key}' shape contains zero dimension")));
+        }
 
         let data_offsets = obj
             .get("data_offsets")
             .and_then(|v| v.as_array())
             .ok_or_else(|| Error::Backend(format!("missing data_offsets for '{key}'")))?;
 
-        let data_start = data_offsets[0].as_u64().unwrap_or(0);
-        let data_end = data_offsets[1].as_u64().unwrap_or(0);
+        let data_start = data_offsets
+            .get(0)
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| Error::Backend(format!("invalid data_offsets[0] for '{key}'")))?;
+        let data_end = data_offsets
+            .get(1)
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| Error::Backend(format!("invalid data_offsets[1] for '{key}'")))?;
+
+        if data_start > data_end {
+            return Err(Error::Backend(format!(
+                "safetensors '{key}' data_start {data_start} > data_end {data_end}"
+            )));
+        }
+
+        let data_region_start = 8 + header_len as u64;
+        let abs_end = data_region_start.checked_add(data_end).ok_or_else(|| {
+            Error::Backend(format!("safetensors '{key}' offset overflow"))
+        })?;
+
+        if abs_end > file_len {
+            return Err(Error::Backend(format!(
+                "safetensors '{key}' offset {abs_end} exceeds file length {file_len}"
+            )));
+        }
 
         total_data = total_data.max(data_end);
         let info = SafetensorInfo {

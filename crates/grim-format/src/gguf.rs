@@ -1087,7 +1087,10 @@ impl GrimMetadata {
         if let Some(bpw) = self.kv_bpw {
             obj.insert(
                 "kv_bpw".into(),
-                serde_json::Value::Number(serde_json::Number::from_f64(bpw as f64).unwrap()),
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(bpw as f64)
+                        .unwrap_or_else(|| serde_json::Number::from(0)),
+                ),
             );
         }
         serde_json::Value::Object(obj)
@@ -1460,8 +1463,20 @@ pub fn read_tensor_bytes<R: Read + Seek>(
     file: &GgufFile,
     info: &GgufTensorInfo,
 ) -> Result<Vec<u8>> {
-    let start = file.data_start + info.offset;
+    let start = file.data_start.checked_add(info.offset).ok_or_else(|| {
+        Error::Backend(format!("GGUF tensor '{}' start offset overflow", info.name))
+    })?;
     let size = info.size_bytes as usize;
+    let end = start.checked_add(info.size_bytes).ok_or_else(|| {
+        Error::Backend(format!("GGUF tensor '{}' end offset overflow", info.name))
+    })?;
+    let file_len = reader.seek(SeekFrom::End(0))?;
+    if end > file_len {
+        return Err(Error::Backend(format!(
+            "GGUF tensor '{}' offset {}..{} exceeds file length {}",
+            info.name, start, end, file_len
+        )));
+    }
     reader.seek(SeekFrom::Start(start))?;
     let mut buf = vec![0u8; size];
     reader.read_exact(&mut buf)?;
