@@ -90,7 +90,10 @@ impl Qwen3Moe {
             router_kind: RouterKind::SoftmaxTopK,
             routed_scaling_factor: cfg.routed_scaling_factor,
             has_shared_expert: false,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
         };
+
         let moe_spec: Vec<Option<MoESpec>> = vec![Some(spec); cfg.num_layers];
 
         let inner = Llama::load_tp_moe(device.clone(), ws, llama_cfg, &moe_spec, tp)?;
