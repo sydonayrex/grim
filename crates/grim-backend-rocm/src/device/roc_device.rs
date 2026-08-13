@@ -3595,21 +3595,24 @@ impl BackendDevice for RocmDevice {
                 "scale_bias_epilogue: out lacks a valid device pointer".into(),
             ));
         }
-        let (a_s, a_ptr): (Option<&dyn BackendStorage>, Option<*mut c_void>) = match a_scale {
+        // `_a_s` / `_b_s` / `_bt_s` hold borrows that keep the underlying storage
+        // allocations alive until after the kernel launch; only the raw pointers are
+        // forwarded into the kernel args.
+        let (_a_s, a_ptr): (Option<&dyn BackendStorage>, Option<*mut c_void>) = match a_scale {
             Some(s) => {
                 let s = as_rocm(s)?;
                 (Some(s), Some(dev_ptr(s)? as *mut c_void))
             }
             None => (None, None),
         };
-        let (b_s, b_ptr): (Option<&dyn BackendStorage>, Option<*mut c_void>) = match b_scale {
+        let (_b_s, b_ptr): (Option<&dyn BackendStorage>, Option<*mut c_void>) = match b_scale {
             Some(s) => {
                 let s = as_rocm(s)?;
                 (Some(s), Some(dev_ptr(s)? as *mut c_void))
             }
             None => (None, None),
         };
-        let (bt_s, b_ptr2): (Option<&dyn BackendStorage>, Option<*mut c_void>) = match bias {
+        let (_bt_s, b_ptr2): (Option<&dyn BackendStorage>, Option<*mut c_void>) = match bias {
             Some(s) => {
                 let s = as_rocm(s)?;
                 (Some(s), Some(dev_ptr(s)? as *mut c_void))
@@ -3652,7 +3655,6 @@ impl BackendDevice for RocmDevice {
             }
         }
 
-        drop((a_s, b_s, bt_s));
         Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
     }
 
