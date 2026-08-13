@@ -1084,6 +1084,55 @@ mod tests {
         );
     }
 
+    // Laguna-S-2.1 full-attention layers rotate only `rotary_dim` channels;
+    // the remainder pass through unchanged (partial rotary).
+    #[test]
+    fn test_rope_partial_rotary_passthrough() {
+        let cfg = RopeConfig::new(8, 10000.0);
+        let rope = Rope::from_config(RopeConfig {
+            rotary_dim: 4,
+            ..cfg
+        });
+        let input: Vec<f32> = (0..8).map(|i| (i + 1) as f32).collect();
+        let x = cpu_tensor(input.clone(), Shape::new(vec![1, 1, 8]));
+        let y = rope.forward(&x, &[3]).expect("partial rope forward");
+        let out = y.to_vec_f32().expect("to vec");
+        // Channels 4..8 unchanged.
+        assert_eq!(out[4..8], input[4..8], "partial rotary must pass through tail channels");
+        // Channels 0..4 rotated (not equal to input).
+        assert!(out[..4].iter().zip(input[..4].iter()).any(|(a, b)| (a - b).abs() > 1e-4),
+            "partial rotary must rotate leading channels");
+    }
+
+    // YaRN magnitude correction applies the attention_factor mscale (here 1.0)
+    // and the frequency ramp. With mscale=1.0 the rotation magnitude must match
+    // plain RoPE at the rotated positions when factor is 1.0 (no extrapolation).
+    #[test]
+    fn test_rope_yarn_factor_one_matches_plain() {
+        let plain = Rope::from_config(RopeConfig::new(4, 10000.0));
+        let yarn_cfg = RopeConfig {
+            dim: 4,
+            base: 10000.0,
+            rotary_dim: 4,
+            yarn: Some(YaRNParams {
+                factor: 1.0,
+                original_max_pos: 8192,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                attention_factor: 1.0,
+            }),
+        };
+        let yarn = Rope::from_config(yarn_cfg);
+        let input: Vec<f32> = (0..4).map(|i| (i + 1) as f32).collect();
+        let x = cpu_tensor(input.clone(), Shape::new(vec![1, 1, 4]));
+        let p = plain.forward(&x, &[5]).unwrap().to_vec_f32().unwrap();
+        let y = yarn.forward(&x, &[5]).unwrap().to_vec_f32().unwrap();
+        for (a, b) in p.iter().zip(y.iter()) {
+            assert!((a - b).abs() < 1e-4, "YaRN factor=1 must equal plain RoPE, got {a} vs {b}");
+        }
+    }
+
+
     #[test]
     fn test_linear_shape_mismatch_returns_error() {
         let weight = cpu_tensor(vec![1.0, 2.0, 3.0, 4.0], Shape::new(vec![2, 2]));

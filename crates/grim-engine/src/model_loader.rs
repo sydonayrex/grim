@@ -26,7 +26,7 @@ use grim_models_mamba::{
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::{TensorParallelConfig, WeightSource};
 use grim_plugin::ArchCompatSpec;
-use grim_tensor::{Device, TensorProvider};
+use grim_tensor::{Device, TensorProvider, YaRNParams};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -364,6 +364,46 @@ struct SafetensorsConfig {
     moe_routed_scaling_factor: Option<f32>,
     #[serde(rename = "mlp_only_layers")]
     mlp_only_layers: Option<Vec<usize>>,
+    // Laguna-S-2.1 hybrid attention
+    #[serde(rename = "sliding_window")]
+    sliding_window: Option<usize>,
+    #[serde(rename = "gating")]
+    gating: Option<String>,
+    #[serde(rename = "num_attention_heads_per_layer")]
+    num_attention_heads_per_layer: Option<Vec<usize>>,
+    #[serde(rename = "partial_rotary_factor")]
+    partial_rotary_factor: Option<f32>,
+    /// Laguna-S-2.1 nested `{full_attention: {rope_type, rope_theta, factor,
+    /// original_max_position_embeddings, beta_fast, beta_slow,
+    /// attention_factor, partial_rotary_factor}, sliding_attention: {...}}`.
+    /// Parsed lazily; absence = plain RoPE.
+    #[serde(rename = "rope_parameters")]
+    rope_parameters: Option<serde_json::Value>,
+}
+
+/// Extract full-attention YaRN params from Laguna-S-2.1 `rope_parameters`.
+///
+/// Layout: `{full_attention: {rope_type: "yarn", factor, original_max_position_embeddings,
+/// beta_fast, beta_slow, attention_factor, ...}}`. Returns `None` when the
+/// block is absent or `rope_type != "yarn"` (plain RoPE).
+fn parse_full_yarn(rope_parameters: &Option<serde_json::Value>) -> Option<YaRNParams> {
+    let full = rope_parameters.as_ref()?.get("full_attention")?;
+    if full.get("rope_type").and_then(|v| v.as_str()) != Some("yarn") {
+        return None;
+    }
+    Some(YaRNParams {
+        factor: full.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+        original_max_pos: full
+            .get("original_max_position_embeddings")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(8192) as usize,
+        beta_fast: full.get("beta_fast").and_then(|v| v.as_f64()).unwrap_or(32.0) as f32,
+        beta_slow: full.get("beta_slow").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+        attention_factor: full
+            .get("attention_factor")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0) as f32,
+    })
 }
 
 
@@ -497,6 +537,40 @@ fn load_model_from_config(
             Ok(Box::new(m))
         }
         ModelArchitecture::Laguna => {
+            // Laguna-S-2.1 hybrid attention: per-layer layer_types, sliding
+            // window, per-layer head counts, dual RoPE, and the attention
+            // output gate. Parsed from config.json; defaults match the
+            // published S-2.1 checkpoint when keys are absent.
+            let full_rope_theta = config
+                .rope_parameters
+                .as_ref()
+                .and_then(|r| r.get("full_attention"))
+                .and_then(|f| f.get("rope_theta"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(500000.0) as f32;
+            let sliding_rope_theta = config
+                .rope_parameters
+                .as_ref()
+                .and_then(|r| r.get("sliding_attention"))
+                .and_then(|f| f.get("rope_theta"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(10000.0) as f32;
+            let full_partial_rotary_factor = config
+                .rope_parameters
+                .as_ref()
+                .and_then(|r| r.get("full_attention"))
+                .and_then(|f| f.get("partial_rotary_factor"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.5) as f32;
+            let sliding_partial_rotary_factor = config
+                .rope_parameters
+                .as_ref()
+                .and_then(|r| r.get("sliding_attention"))
+                .and_then(|f| f.get("partial_rotary_factor"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0) as f32;
+            let full_yarn = parse_full_yarn(&config.rope_parameters);
+
             let laguna_cfg = LagunaConfig {
                 vocab_size,
                 hidden_size,
@@ -515,13 +589,16 @@ fn load_model_from_config(
                 max_seq_len,
                 mlp_only_layers,
                 layer_types: config.layer_types.unwrap_or_else(|| vec!["full_attention".into()]),
-                sliding_window: 512,
-                num_attention_heads_per_layer: vec![num_heads; num_layers],
-                full_rope_theta: 500000.0,
-                sliding_rope_theta: 10000.0,
-                full_partial_rotary_factor: 0.5,
-                sliding_partial_rotary_factor: 1.0,
-                gating: "per-head".into(),
+                sliding_window: config.sliding_window.unwrap_or(512),
+                num_attention_heads_per_layer: config
+                    .num_attention_heads_per_layer
+                    .unwrap_or_else(|| vec![num_heads; num_layers]),
+                full_rope_theta,
+                sliding_rope_theta,
+                full_partial_rotary_factor,
+                sliding_partial_rotary_factor,
+                gating: config.gating.unwrap_or_else(|| "per-head".into()),
+                full_yarn,
             };
 
             eprintln!("[grim] Loading Laguna model with config: {:?}", laguna_cfg);
@@ -1409,6 +1486,7 @@ fn load_model_with_providers(
                 full_partial_rotary_factor: 0.5,
                 sliding_partial_rotary_factor: 1.0,
                 gating: "per-head".into(),
+                full_yarn: None,
             };
             eprintln!("[grim] Loading Laguna model with config: {:?}", laguna_cfg);
             let m = Laguna::load_tp(device.clone(), &ws, laguna_cfg, tp)?;

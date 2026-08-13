@@ -789,6 +789,13 @@ impl TensorNamingRegistry {
                         format!("{hf_p}self_attn.o_proj.weight"),
                         format!("{gg_p}attn_output.weight"),
                     );
+                    // Laguna-S-2.1 attention output gate (per-head softplus gate,
+                    // applied before o_proj). GGUF name matches llama.cpp
+                    // `LLM_TENSOR_ATTN_GATE` -> `blk.{i}.attn_gate.weight`.
+                    map.insert(
+                        format!("{hf_p}self_attn.g_proj.weight"),
+                        format!("{gg_p}attn_gate.weight"),
+                    );
                     map.insert(
                         format!("{hf_p}post_attention_layernorm.weight"),
                         format!("{gg_p}ffn_norm.weight"),

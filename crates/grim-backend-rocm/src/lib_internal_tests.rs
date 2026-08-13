@@ -1168,6 +1168,7 @@ mod tests {
                 2, // num_kv_heads: real param, not num_heads/4
                 4, // kv_seq_len
                 0, // cache_offset
+                None, // window: full causal
                 &Shape::from_slice(&[4, 4, 64]),
                 None,
                 None,
@@ -1188,6 +1189,7 @@ mod tests {
                     2,
                     4,
                     0,
+                    None, // window: full causal
                     &Shape::from_slice(&[4, 4, 64]),
                     None,
                     None,
@@ -1848,6 +1850,7 @@ mod tests {
                 num_kv_heads,
                 kv_seq_len,
                 cache_offset,
+                None, // window: full causal
                 &Shape::from_slice(&[seq_len, num_heads, head_dim]),
                 None,
                 None,
@@ -2275,7 +2278,12 @@ mod tests {
 
         let in_storage = dev.from_cpu(&input, &shape, DType::F32).expect("from_cpu");
         let (out_storage, _handle) = dev
-            .rope(in_storage.as_ref(), &positions, dim, base, &shape)
+            .rope(
+                in_storage.as_ref(),
+                &positions,
+                &grim_tensor::RopeConfig::new(dim, base),
+                &shape,
+            )
             .expect("dev.rope");
         let got = out_storage.to_cpu_vec_f32().expect("to_cpu_vec_f32");
 

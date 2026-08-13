@@ -121,6 +121,7 @@ fn test_hybrid_cpu_gpu_attention_correctness() {
             num_kv_heads,
             kv_seq_len,
             cache_offset as u32,
+            None, // window: full causal
             &Shape::from_slice(&[seq_len, num_heads, head_dim]),
             None,
             None,
@@ -165,6 +166,7 @@ fn test_hybrid_cpu_gpu_attention_correctness() {
             num_kv_heads,
             device_seq_len,
             cache_offset as u32,
+            None, // window: full causal
             &Shape::from_slice(&[seq_len, num_heads, head_dim]),
             Some(dev_max_buf.as_ref()),
             Some(dev_sum_buf.as_ref()),

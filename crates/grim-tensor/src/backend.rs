@@ -112,6 +112,13 @@ impl RopeConfig {
             yarn: None,
         }
     }
+
+    /// Whether this config deviates from plain full-rotary RoPE. Backends that
+    /// only implement the legacy path use this to return `Err(Unimplemented)`
+    /// rather than silently producing wrong output.
+    pub fn is_plain(&self) -> bool {
+        self.rotary_dim == self.dim && self.yarn.is_none()
+    }
 }
 
 

@@ -186,6 +186,7 @@ fn qkv_attention_gpu_head_dim_128_not_nan() {
         num_kv_heads,
         kv_seq_len,
         cache_offset as u32,
+        None, // window: full causal
         &q_shape,
         None,
         None,
@@ -265,6 +266,7 @@ fn qkv_attention_gpu_head_dim_64_still_correct() {
             num_kv_heads,
             kv_seq_len,
             cache_offset as u32,
+            None, // window: full causal
             &q_shape,
             None,
             None,

@@ -70,7 +70,7 @@ impl MoeBlock {
         // Optional dedup/noisy-router correction bias (Laguna / DeepSeek).
         // Stored as `ffn_exp_probs_b.bias` in GGUF (per Lfm2 loader).
         let correction_bias = match &spec.router_kind {
-            RouterKind::SigmoidTopKWithBias | RouterKind::SigmoidTopKPerHead => {
+            RouterKind::SigmoidTopKWithBias => {
                 let b = ws.get(Shape::new(vec![spec.num_experts]), "ffn_exp_probs_b.bias")?;
                 Some(b)
             }

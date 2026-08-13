@@ -18,7 +18,9 @@ void grim_qkv_attention(
     int seq_len,
     int kv_seq_len,
     int cache_offset,   // absolute position of q[head, 0, *]
-    float inv_sqrt_d
+    float inv_sqrt_d,
+    int window_lo       // sliding-window lower bound: max(0, abs_i - window + 1).
+                        // Pass 0 for full causal attention (no window).
 ) {
     // grid = (seq_len, num_heads, 1); block = (256, 1, 1) -> 4 RDNA wavefronts of 64.
     const int i = blockIdx.x;             // query position (0..seq_len)
@@ -89,13 +91,19 @@ void grim_qkv_attention(
     __shared__ float s_sum[8];
     __shared__ float s_acc[8][256];
 
-    // Causal KV range for this query: [0, hi) where hi = min(abs_i + 1, kv_seq_len).
+    // Causal KV range for this query: [lo, hi) where:
+    //   hi = min(abs_i + 1, kv_seq_len)  (standard causal upper bound)
+    //   lo = window_lo                    (0 for full attention; sliding lower bound for SWA)
+    // `window_lo` is pre-computed on the host as max(0, abs_i - window + 1) so
+    // the kernel stays branch-free for the common full-causal case (window_lo == 0).
     const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
-    const int range_len = hi;  // j in [0, hi)
+    const int lo = window_lo;             // 0 for full causal; >= 0 for SWA
+    const int range_len = hi - lo;        // may be 0 if lo >= hi (empty window)
 
-    // Quarter-stride partitioning of [0, hi) across the wavefronts.
+    // Quarter-stride partitioning of [lo, hi) across the wavefronts.
     const int base = range_len / num_waves;
     const int rem  = range_len % num_waves;
+    // j_start / j_end are offsets into [0, range_len); add `lo` when accessing KV.
     int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
     int j_end   = j_start + base + (wave_id < rem ? 1 : 0);
 
@@ -107,8 +115,8 @@ void grim_qkv_attention(
     const float* __restrict__ k_head = &k_tensor[kv_head * head_dim];
     const float* __restrict__ v_head = &v_tensor[kv_head * head_dim];
 
-    // Inner loop: online-softmax over assigned range
-    for (int j = j_start; j < j_end; ++j) {
+    // Inner loop: online-softmax over assigned range [lo + j_start, lo + j_end)
+    for (int j = lo + j_start; j < lo + j_end; ++j) {
         // Dot product Q.K for this head
         float score = 0.0f;
         #pragma unroll
