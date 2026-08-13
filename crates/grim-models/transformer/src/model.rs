@@ -139,10 +139,39 @@ impl Llama {
         moe_spec: &[Option<MoESpec>],
         tp: TensorParallelConfig,
     ) -> Result<Self> {
+        let attn_specs: Vec<crate::block::LayerAttentionSpec> = (0..cfg.num_layers)
+            .map(|_| {
+                crate::block::LayerAttentionSpec::default_full(
+                    cfg.num_heads,
+                    cfg.num_kv_heads,
+                    cfg.head_dim,
+                    cfg.rope_theta,
+                )
+            })
+            .collect();
+        Self::load_tp_moe_specs(device, ws, cfg, moe_spec, &attn_specs, tp)
+    }
+
+    /// Load a `Llama` model with per-layer `MoESpec` and per-layer `LayerAttentionSpec`.
+    pub fn load_tp_moe_specs(
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: LlamaConfig,
+        moe_spec: &[Option<MoESpec>],
+        attn_specs: &[crate::block::LayerAttentionSpec],
+        tp: TensorParallelConfig,
+    ) -> Result<Self> {
         if moe_spec.len() != cfg.num_layers {
             return Err(grim_core::error::Error::Config(format!(
-                "load_tp_moe: moe_spec len {} != num_layers {}",
+                "load_tp_moe_specs: moe_spec len {} != num_layers {}",
                 moe_spec.len(),
+                cfg.num_layers
+            )));
+        }
+        if attn_specs.len() != cfg.num_layers {
+            return Err(grim_core::error::Error::Config(format!(
+                "load_tp_moe_specs: attn_specs len {} != num_layers {}",
+                attn_specs.len(),
                 cfg.num_layers
             )));
         }
@@ -152,7 +181,7 @@ impl Llama {
         let mut moe_blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             let lws = ws.pp("layers").pp(&i.to_string());
-            let mut block = LlamaBlock::load_tp(&lws, &cfg, tp)?;
+            let mut block = LlamaBlock::load_tp_spec(&lws, &cfg, &attn_specs[i], tp)?;
             if let Some(spec) = &moe_spec[i] {
                 // Disable the dense FFN; route through the MoE block instead.
                 block.ffn_disabled = true;
@@ -241,6 +270,7 @@ impl Llama {
                     linear(cfg.hidden_size, cfg.num_heads * cfg.head_dim),
                     tp,
                 ),
+                g_proj: None,
                 ffn_norm: rms(cfg.hidden_size),
                 w_gate: ColumnParallelLinear::new(
                     linear(cfg.intermediate_size, cfg.hidden_size),
@@ -258,6 +288,7 @@ impl Llama {
                     num_kv_heads: cfg.num_kv_heads,
                     head_dim: cfg.head_dim,
                     intermediate_size: cfg.intermediate_size,
+                    sliding_window: None,
                     tp_world_size: 1,
                     local_num_heads: cfg.num_heads,
                     local_num_kv_heads: cfg.num_kv_heads,

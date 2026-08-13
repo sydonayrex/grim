@@ -86,6 +86,35 @@ impl ComputeHandle for ReadyHandle {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct YaRNParams {
+    pub factor: f32,
+    pub original_max_pos: usize,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+    pub attention_factor: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct RopeConfig {
+    pub dim: usize,
+    pub base: f32,
+    pub rotary_dim: usize,
+    pub yarn: Option<YaRNParams>,
+}
+
+impl RopeConfig {
+    pub fn new(dim: usize, base: f32) -> Self {
+        Self {
+            dim,
+            base,
+            rotary_dim: dim,
+            yarn: None,
+        }
+    }
+}
+
+
 /// Unified memory-advice options matching `madvise` and `hipMemAdvise`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemAdvice {
@@ -368,11 +397,11 @@ pub trait BackendDevice: Send + Sync {
         &self,
         x: &dyn BackendStorage,
         positions: &[u32],
-        dim: usize,
-        base: f32,
+        cfg: &RopeConfig,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = (x, positions, dim, base, out_shape);
+
+        let _ = (x, positions, cfg, out_shape);
         Err(crate::error::Error::Unimplemented(
             "rope not implemented for this backend".into(),
         ))
@@ -398,46 +427,48 @@ pub trait BackendDevice: Send + Sync {
     /// Depthwise 1D causal convolution decode step on device.
     fn short_conv1d_causal_step(
         &self,
-        _x: &dyn BackendStorage,
-        _weight: &dyn BackendStorage,
-        _bias: Option<&dyn BackendStorage>,
-        _conv_state: &dyn BackendStorage,
-        _out_shape: &Shape,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        bias: Option<&dyn BackendStorage>,
+        state: &dyn BackendStorage,
+        out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (x, weight, bias, state, out_shape);
         Err(crate::error::Error::Unimplemented(
             "short_conv1d_causal_step not implemented for this backend".into(),
         ))
     }
 
-    /// KDA gated delta-rule linear recurrence step on device.
+    /// Fuse recurrent gating step for KDA (gated delta rule).
     fn kda_gated_delta_rule_step(
         &self,
-        _q: &dyn BackendStorage,
-        _k: &dyn BackendStorage,
-        _v: &dyn BackendStorage,
-        _beta: &dyn BackendStorage,
-        _a_gate: &dyn BackendStorage,
-        _recurrent_state: &dyn BackendStorage,
-        _d_k: usize,
-        _d_v: usize,
-        _out_shape: &Shape,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        beta: &dyn BackendStorage,
+        a_gate: &dyn BackendStorage,
+        recurrent_state: &dyn BackendStorage,
+        d_k: usize,
+        d_v: usize,
+        out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (q, k, v, beta, a_gate, recurrent_state, d_k, d_v, out_shape);
         Err(crate::error::Error::Unimplemented(
             "kda_gated_delta_rule_step not implemented for this backend".into(),
         ))
     }
 
-    /// MLA Q/KV RMSNorm and nope/rope split on device.
+    /// MLA normalization and projection split on device.
     fn mla_q_kv_norm_split(
         &self,
-        _q_raw: &dyn BackendStorage,
-        _kv_raw: &dyn BackendStorage,
-        _q_norm_w: &dyn BackendStorage,
-        _kv_norm_w: &dyn BackendStorage,
-        _qk_nope_dim: usize,
-        _qk_rope_dim: usize,
-        _v_dim: usize,
-        _eps: f32,
+        q_raw: &dyn BackendStorage,
+        kv_raw: &dyn BackendStorage,
+        q_norm_w: &dyn BackendStorage,
+        kv_norm_w: &dyn BackendStorage,
+        qk_nope_dim: usize,
+        qk_rope_dim: usize,
+        v_dim: usize,
+        eps: f32,
     ) -> Result<(
         Box<dyn BackendStorage>,
         Box<dyn BackendStorage>,
@@ -445,26 +476,28 @@ pub trait BackendDevice: Send + Sync {
         Box<dyn BackendStorage>,
         Box<dyn ComputeHandle>,
     )> {
+        let _ = (q_raw, kv_raw, q_norm_w, kv_norm_w, qk_nope_dim, qk_rope_dim, v_dim, eps);
         Err(crate::error::Error::Unimplemented(
             "mla_q_kv_norm_split not implemented for this backend".into(),
         ))
     }
 
 
-
-    /// Fused GQA attention with causal masking.
+    /// QKV attention calculation on device.
     ///
-    /// Phase-1 contract:
-    /// - `q`:         `[seq_len, num_heads, head_dim]` (f32)
-    /// - `k`, `v`:    `[kv_seq_len, num_kv_heads, head_dim]` (f32)
+    /// Contracts:
+    /// - `q`: `[seq_len, num_heads, head_dim]` (prefill) or `[1, num_heads, head_dim]` (decode)
+    /// - `k`: `[kv_seq_len, num_kv_heads, head_dim]` contiguous KV-cache buffer
+    /// - `v`: `[kv_seq_len, num_kv_heads, head_dim]` contiguous KV-cache buffer
     /// - `num_kv_heads`: real call-site parameter (GQA ratio = num_heads / num_kv_heads)
     /// - `kv_seq_len`:  length of the K/V cache being attended to
     /// - `cache_offset`: absolute position of `q[0, *, *]` (for causal masking)
+    /// - `window`: optional sliding window size (e.g. `Some(512)` for Laguna-S-2.1)
     /// - `out_shape`:  `[seq_len, num_heads, head_dim]`
     /// - `out_max`/`out_sum`: optional flash-attention-style statistics buffers
     ///
     /// Causal masking: query at absolute position `(cache_offset + i)` attends
-    /// only to key positions `j` with `j <= cache_offset + i`.
+    /// only to key positions `j` with `j <= cache_offset + i` and `j >= cache_offset + i - window + 1`.
     fn qkv_attention(
         &self,
         q: &dyn BackendStorage,
@@ -473,6 +506,7 @@ pub trait BackendDevice: Send + Sync {
         num_kv_heads: usize,
         kv_seq_len: usize,
         cache_offset: u32,
+        window: Option<usize>,
         out_shape: &Shape,
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
@@ -484,6 +518,7 @@ pub trait BackendDevice: Send + Sync {
             num_kv_heads,
             kv_seq_len,
             cache_offset,
+            window,
             out_shape,
             out_max,
             out_sum,
@@ -494,16 +529,6 @@ pub trait BackendDevice: Send + Sync {
     }
 
     /// Paged (block-table) attention for KV-cache-serving with paged memory.
-    ///
-    /// Dispatches a paged-attention kernel that reads K/V from page tables
-    /// rather than a contiguous cache. Used by the serving path when the
-    /// KV cache is managed in fixed-size pages (vLLM-style).
-    ///
-    /// `block_tables` is `[batch, max_blocks]` of page indices; `k_pages`/`v_pages`
-    /// are `[num_pages, page_size, num_kv_heads, head_dim]`.
-    ///
-    /// Default: returns `Err(Unimplemented)`. Only backends with a paged
-    /// attention kernel override this.
     fn qkv_attention_paged(
         &self,
         q: &dyn BackendStorage,
@@ -515,6 +540,7 @@ pub trait BackendDevice: Send + Sync {
         page_size: usize,
         kv_seq_len: usize,
         cache_offset: u32,
+        window: Option<usize>,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let _ = (
@@ -527,6 +553,7 @@ pub trait BackendDevice: Send + Sync {
             page_size,
             kv_seq_len,
             cache_offset,
+            window,
             out_shape,
         );
         Err(crate::error::Error::Unimplemented(
@@ -1162,12 +1189,12 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         &self,
         x: &dyn BackendStorage,
         positions: &[u32],
-        dim: usize,
-        base: f32,
+        cfg: &RopeConfig,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        (**self).rope(x, positions, dim, base, out_shape)
+        (**self).rope(x, positions, cfg, out_shape)
     }
+
 
     fn qkv_attention(
         &self,
@@ -1177,6 +1204,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         num_kv_heads: usize,
         kv_seq_len: usize,
         cache_offset: u32,
+        window: Option<usize>,
         out_shape: &Shape,
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
@@ -1188,6 +1216,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
             num_kv_heads,
             kv_seq_len,
             cache_offset,
+            window,
             out_shape,
             out_max,
             out_sum,
@@ -1205,6 +1234,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         page_size: usize,
         kv_seq_len: usize,
         cache_offset: u32,
+        window: Option<usize>,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         (**self).qkv_attention_paged(
@@ -1217,9 +1247,11 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
             page_size,
             kv_seq_len,
             cache_offset,
+            window,
             out_shape,
         )
     }
+
 
     fn tree_attention(
         &self,

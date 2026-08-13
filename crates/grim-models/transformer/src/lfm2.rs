@@ -391,20 +391,20 @@ impl Lfm2Block {
                 }
                 v
             };
+            let rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, self.rope_theta);
             let (q_rot_storage, _) = dev.rope(
                 q_norm.storage().as_ref(),
                 &q_positions,
-                self.head_dim,
-                self.rope_theta,
+                &rope_cfg,
                 &q_shape,
             )?;
             let (k_rot_storage, _) = dev.rope(
                 k_norm.storage().as_ref(),
                 &k_positions,
-                self.head_dim,
-                self.rope_theta,
+                &rope_cfg,
                 &k_shape,
             )?;
+
             let q_rot_vec = q_rot_storage.to_cpu_vec_f32()?;
             let k_rot_vec = k_rot_storage.to_cpu_vec_f32()?;
             let v_vec = v.to_vec_f32()?;

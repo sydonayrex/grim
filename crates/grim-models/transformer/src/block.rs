@@ -9,6 +9,36 @@ use grim_tensor::{Device, DType, Shape, Tensor};
 
 use crate::model::LlamaConfig;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionType {
+    Full,
+    Sliding,
+}
+
+#[derive(Debug, Clone)]
+pub struct LayerAttentionSpec {
+    pub attn_type: AttentionType,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub rope: grim_tensor::RopeConfig,
+    pub sliding_window: Option<usize>,
+    pub has_attn_gate: bool,
+}
+
+impl LayerAttentionSpec {
+    pub fn default_full(num_heads: usize, num_kv_heads: usize, head_dim: usize, rope_theta: f32) -> Self {
+        Self {
+            attn_type: AttentionType::Full,
+            num_heads,
+            num_kv_heads,
+            rope: grim_tensor::RopeConfig::new(head_dim, rope_theta),
+            sliding_window: None,
+            has_attn_gate: false,
+        }
+    }
+}
+
+
 #[derive(Debug, Clone, Copy)]
 pub struct LlamaConfigRefs {
     pub hidden_size: usize,
@@ -25,7 +55,9 @@ pub struct LlamaConfigRefs {
     /// How many times each KV head is replicated across TP ranks.
     /// 1 = sharded, >1 = replicated.
     pub kv_head_replica_factor: usize,
+    pub sliding_window: Option<usize>,
 }
+
 
 /// Compute the per-rank TP sharding plan for attention heads.
 ///
@@ -230,6 +262,7 @@ pub struct LlamaBlock {
     pub wk: ColumnParallelLinear,
     pub wv: ColumnParallelLinear,
     pub wo: RowParallelLinear,
+    pub g_proj: Option<ColumnParallelLinear>,
     pub ffn_norm: RmsNorm,
     pub w_gate: ColumnParallelLinear,
     pub w_up: ColumnParallelLinear,
@@ -259,35 +292,69 @@ impl LlamaBlock {
         cfg: &LlamaConfig,
         tp: TensorParallelConfig,
     ) -> Result<Self> {
+        let spec = LayerAttentionSpec::default_full(
+            cfg.num_heads,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            cfg.rope_theta,
+        );
+        Self::load_tp_spec(ws, cfg, &spec, tp)
+    }
+
+    /// Load a `LlamaBlock` with explicit `LayerAttentionSpec`.
+    pub fn load_tp_spec(
+        ws: &WeightSource<'_>,
+        cfg: &LlamaConfig,
+        spec: &LayerAttentionSpec,
+        tp: TensorParallelConfig,
+    ) -> Result<Self> {
+        let num_heads = spec.num_heads;
+        let num_kv_heads = spec.num_kv_heads;
+
         let attn_norm = RmsNorm::load(&ws.pp("attn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
         let wq = Linear::load_column_parallel(
             &ws.pp("attn").pp("wq"),
             cfg.hidden_size,
-            cfg.num_heads * cfg.head_dim,
+            num_heads * cfg.head_dim,
             /*has_bias=*/ false,
             tp,
         )?;
         let wk = Linear::load_column_parallel(
             &ws.pp("attn").pp("wk"),
             cfg.hidden_size,
-            cfg.num_kv_heads * cfg.head_dim,
+            num_kv_heads * cfg.head_dim,
             /*has_bias=*/ false,
             tp,
         )?;
         let wv = Linear::load_column_parallel(
             &ws.pp("attn").pp("wv"),
             cfg.hidden_size,
-            cfg.num_kv_heads * cfg.head_dim,
+            num_kv_heads * cfg.head_dim,
             /*has_bias=*/ false,
             tp,
         )?;
         let wo = Linear::load_row_parallel(
             &ws.pp("attn").pp("wo"),
-            cfg.num_heads * cfg.head_dim,
+            num_heads * cfg.head_dim,
             cfg.hidden_size,
             /*has_bias=*/ false,
             tp,
         )?;
+
+        // Optional attention gate (g_proj / attn_gate) for Laguna-S-2.1
+        let g_proj = if spec.has_attn_gate {
+            let lin = Linear::load_column_parallel(
+                &ws.pp("attn").pp("gate"),
+                cfg.hidden_size,
+                num_heads,
+                /*has_bias=*/ false,
+                tp,
+            )?;
+            Some(ColumnParallelLinear::new(lin, tp))
+        } else {
+            None
+        };
+
         let ffn_norm = RmsNorm::load(&ws.pp("ffn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
         let w_gate = Linear::load_column_parallel(
             &ws.pp("ffn").pp("w_gate"),
@@ -311,10 +378,10 @@ impl LlamaBlock {
             tp,
         )?;
         let device = wq.weight().device().clone();
-        let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
+        let rope = Rope::from_config(spec.rope.clone());
 
         let (local_num_heads, local_num_kv_heads, kv_head_replica_factor) =
-            plan_kv_head_sharding(cfg.num_heads, cfg.num_kv_heads, tp.world_size)?;
+            plan_kv_head_sharding(num_heads, num_kv_heads, tp.world_size)?;
 
         Ok(Self {
             attn_norm,
@@ -322,6 +389,7 @@ impl LlamaBlock {
             wk: ColumnParallelLinear::new(wk, tp),
             wv: ColumnParallelLinear::new(wv, tp),
             wo: RowParallelLinear::new(wo, tp),
+            g_proj,
             ffn_norm,
             w_gate: ColumnParallelLinear::new(w_gate, tp),
             w_up: ColumnParallelLinear::new(w_up, tp),
@@ -331,18 +399,20 @@ impl LlamaBlock {
             _dev: device,
             _cfg: LlamaConfigRefs {
                 hidden_size: cfg.hidden_size,
-                num_heads: cfg.num_heads,
-                num_kv_heads: cfg.num_kv_heads,
+                num_heads,
+                num_kv_heads,
                 head_dim: cfg.head_dim,
                 intermediate_size: cfg.intermediate_size,
                 tp_world_size: tp.world_size,
                 local_num_heads,
                 local_num_kv_heads,
                 kv_head_replica_factor,
+                sliding_window: spec.sliding_window,
             },
             ffn_disabled: false,
         })
     }
+
 
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let (out, _, _) = self.forward_with_kv(x, positions)?;
@@ -481,10 +551,10 @@ let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
         match dev.rope(
             relabeled.storage().as_ref(),
             &ext_positions,
-            head_dim,
-            self.rope.base,
+            &self.rope.config,
             &rope_shape,
         ) {
+
             Ok((st, _h)) => {
                 let rope_out = Tensor::new(
                     std::sync::Arc::from(st),
@@ -615,10 +685,13 @@ let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
             cfg.local_num_kv_heads,
             kv_len,
             old_past_len as u32,
+            self._cfg.sliding_window,
+
             &out_shape,
             None,
             None,
         ) {
+
             Ok((s, _h)) => Tensor::new(
                 std::sync::Arc::from(s),
                 out_shape.clone(),
@@ -678,9 +751,17 @@ let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
                     scores[t2] = dot * scale;
                 }
                 let causal_limit = past_len + t;
-                for t2 in (causal_limit + 1)..kv_len {
-                    scores[t2] = f32::NEG_INFINITY;
+                let window_start = if let Some(w) = cfg.sliding_window {
+                    (causal_limit + 1).saturating_sub(w)
+                } else {
+                    0
+                };
+                for t2 in 0..kv_len {
+                    if t2 > causal_limit || t2 < window_start {
+                        scores[t2] = f32::NEG_INFINITY;
+                    }
                 }
+
                 let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum = 0.0f32;
                 for s in &mut scores {
@@ -763,8 +844,11 @@ let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
             page_size,
             kv_seq_len,
             cache_offset,
+            self._cfg.sliding_window,
+
             &out_shape_3d,
         )?;
+
 
         let num_head_dims = cfg.local_num_heads * cfg.head_dim;
         let out_shape_2d = Shape::new(vec![total_tokens, num_head_dims]);
@@ -791,12 +875,14 @@ mod tests {
             num_kv_heads: 1,
             head_dim: 16,
             intermediate_size: 64,
+            sliding_window: None,
             tp_world_size: 1,
             local_num_heads: 2,
             local_num_kv_heads: 1,
             kv_head_replica_factor: 1,
         }
     }
+
 
     fn make_linear(in_dim: usize, out_dim: usize) -> Linear {
         // Small weights to keep attention scores in a reasonable range for
@@ -857,8 +943,10 @@ mod tests {
             wk,
             wv,
             wo,
+            g_proj: None,
             ffn_norm,
             w_gate,
+
             w_up,
             w_down,
             rope,
