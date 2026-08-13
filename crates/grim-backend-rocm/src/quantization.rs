@@ -111,13 +111,48 @@ pub enum QuantMode {
     MxFp8Emulated,
 }
 
+/// The concrete FP8 element format a device is **natively** capable of. This is
+/// the axis a W8A8 GEMM must branch on — the two formats have different packed
+/// code namespaces and different MFMA predicates. One `bool` cannot express it.
+///
+/// NAMING: this "OCP" is the OCP *element format* (e4m3fn), NOT OCP *Microscaling*
+/// (MXFP4/MXFP8 — see the Jay/Magpie tiers in `charon.rs` / `grim-quant`). The
+/// variant is spelled `OcpFn` to avoid that collision.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum Fp8NativeFormat {
+    /// No native FP8 path on this arch.
+    None,
+    /// OCP FP8 e4m3fn — native on RDNA4 (`gfx1200+`) W8A8 WMMA.
+    OcpFn,
+    /// AMD e4m3fnuz — native on CDNA3 (`gfx940-942`) W8A8 MFMA.
+    Fnuz,
+}
+
+impl Fp8NativeFormat {
+    pub fn is_native(self) -> bool {
+        !matches!(self, Fp8NativeFormat::None)
+    }
+}
+
+impl fmt::Display for Fp8NativeFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Fp8NativeFormat::None => write!(f, "none"),
+            Fp8NativeFormat::OcpFn => write!(f, "OCP-e4m3fn (RDNA4)"),
+            Fp8NativeFormat::Fnuz => write!(f, "e4m3fnuz (CDNA3)"),
+        }
+    }
+}
+
 /// Per-arch capability bitmap. The struct is the *output* of the gate; [see: `capability.supports(mode)`]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct QuantCapability {
     fp32: bool,
     f16: bool,
     bf16: bool,
-    fp8_native: bool,
+    /// Native FP8 element format (OCP e4m3fn vs AMD e4m3fnuz) — deferred to
+    /// concrete arches that actually differ. `None` == no native FP8.
+    fp8: Fp8NativeFormat,
     mxfp4_emulated: bool,
     mxfp8_emulated: bool,
 }
@@ -128,10 +163,16 @@ impl QuantCapability {
             QuantMode::Fp32 => self.fp32,
             QuantMode::F16 => self.f16,
             QuantMode::Bf16 => self.bf16,
-            QuantMode::Fp8Native => self.fp8_native,
+            QuantMode::Fp8Native => self.fp8.is_native(),
             QuantMode::MxFp4Emulated => self.mxfp4_emulated,
             QuantMode::MxFp8Emulated => self.mxfp8_emulated,
         }
+    }
+
+    /// The concrete FP8 element format native on this arch (`None` when FP8 is
+    /// not native). W8A8 dispatch branches on this — see `Fp8NativeFormat`.
+    pub fn fp8_native_format(self) -> Fp8NativeFormat {
+        self.fp8
     }
 }
 
@@ -143,7 +184,7 @@ impl fmt::Display for QuantCapability {
             self.fp32,
             self.f16,
             self.bf16,
-            self.fp8_native,
+            self.fp8,
             self.mxfp4_emulated,
             self.mxfp8_emulated
         )
@@ -153,11 +194,19 @@ impl fmt::Display for QuantCapability {
 /// Compute the capabilities for a coarse-grained arch bucket.
 pub fn arch_capability(arch: GcnArch) -> QuantCapability {
     match arch {
-        GcnArch::RDNA4 | GcnArch::CDNA3 => QuantCapability {
+        GcnArch::RDNA4 => QuantCapability {
             fp32: true,
             f16: true,
             bf16: true,
-            fp8_native: true,
+            fp8: Fp8NativeFormat::OcpFn,
+            mxfp4_emulated: true,
+            mxfp8_emulated: true,
+        },
+        GcnArch::CDNA3 => QuantCapability {
+            fp32: true,
+            f16: true,
+            bf16: true,
+            fp8: Fp8NativeFormat::Fnuz,
             mxfp4_emulated: true,
             mxfp8_emulated: true,
         },
@@ -165,7 +214,7 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             fp32: true,
             f16: true,
             bf16: true,
-            fp8_native: false,
+            fp8: Fp8NativeFormat::None,
             mxfp4_emulated: true,
             mxfp8_emulated: true,
         },
@@ -173,7 +222,7 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             fp32: true,
             f16: false,
             bf16: false,
-            fp8_native: false,
+            fp8: Fp8NativeFormat::None,
             mxfp4_emulated: false,
             mxfp8_emulated: false,
         },
@@ -241,6 +290,31 @@ mod self_tests {
                 !c.supports(QuantMode::Fp8Native),
                 "{:?}: fp8_native must NOT be supported",
                 arch
+            );
+        }
+    }
+
+    #[test]
+    fn fp8_native_format_is_split_by_arch() {
+        // RDNA4 == OCP e4m3fn; CDNA3 == AMD e4m3fnuz. The point of the split:
+        // a W8A8 GEMM must branch on the element format, not on "fp8 yes/no".
+        let rdna4 = arch_capability(GcnArch::RDNA4);
+        assert_eq!(rdna4.fp8_native_format(), Fp8NativeFormat::OcpFn);
+        let cdna3 = arch_capability(GcnArch::CDNA3);
+        assert_eq!(cdna3.fp8_native_format(), Fp8NativeFormat::Fnuz);
+        assert_ne!(rdna4.fp8_native_format(), cdna3.fp8_native_format());
+        // Every other arch has no native FP8 element format at all.
+        for arch in [
+            GcnArch::RDNA1,
+            GcnArch::RDNA2,
+            GcnArch::RDNA3,
+            GcnArch::CDNA2,
+            GcnArch::Other,
+        ] {
+            assert_eq!(
+                arch_capability(arch).fp8_native_format(),
+                Fp8NativeFormat::None,
+                "{arch:?} must have no native FP8 element format"
             );
         }
     }

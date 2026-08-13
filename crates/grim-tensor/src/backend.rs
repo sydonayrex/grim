@@ -431,6 +431,31 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
+    /// In-place scale+bias epilogue on a `[batch, out_dim]` GEMM output.
+    ///
+    /// Contract: `out[i,j] = out[i,j] * a_scale[i] * b_scale[j] + bias[j]`,
+    /// where `a_scale` (`[batch]`, per-token) and `b_scale` (`[out_dim]`,
+    /// per-channel) may be `None` (treated as 1.0) and `bias` (`[out_dim]`)
+    /// may be `None` (treated as 0.0). The GEMM output is scaled in place.
+    ///
+    /// Plain rocBLAS exposes no epilogue-fusion API, so a standalone kernel
+    /// after the GEMM is the structurally-required path. Mirror of
+    /// `broadcast_bias`, but operating on existing output storage.
+    fn scale_bias_epilogue(
+        &self,
+        out: &dyn BackendStorage,
+        a_scale: Option<&dyn BackendStorage>,
+        b_scale: Option<&dyn BackendStorage>,
+        bias: Option<&dyn BackendStorage>,
+        batch: usize,
+        out_dim: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let _ = (out, a_scale, b_scale, bias, batch, out_dim);
+        Err(crate::error::Error::Unimplemented(
+            "scale_bias_epilogue not implemented for this backend".into(),
+        ))
+    }
+
     /// Depthwise 1D causal convolution decode step on device.
     fn short_conv1d_causal_step(
         &self,

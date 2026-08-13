@@ -3575,6 +3575,87 @@ impl BackendDevice for RocmDevice {
     }
 
 
+    /// In-place scale+bias epilogue on a `[batch, out_dim]` GEMM output via
+    /// `grim_scale_bias_epilogue`. Plain rocBLAS has no epilogue-fusion API, so
+    /// this standalone kernel is the required post-GEMM step for W8A8-style
+    /// per-token × per-channel scaling. `a_scale`/`b_scale`/`bias` may be
+    /// `None`; kernel treats absent scale as 1.0 and absent bias as 0.0.
+    fn scale_bias_epilogue(
+        &self,
+        out: &dyn BackendStorage,
+        a_scale: Option<&dyn BackendStorage>,
+        b_scale: Option<&dyn BackendStorage>,
+        bias: Option<&dyn BackendStorage>,
+        batch: usize,
+        out_dim: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let o_s = as_rocm(out)?;
+        if !o_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "scale_bias_epilogue: out lacks a valid device pointer".into(),
+            ));
+        }
+        let (a_s, a_ptr): (Option<&dyn BackendStorage>, Option<*mut c_void>) = match a_scale {
+            Some(s) => {
+                let s = as_rocm(s)?;
+                (Some(s), Some(dev_ptr(s)? as *mut c_void))
+            }
+            None => (None, None),
+        };
+        let (b_s, b_ptr): (Option<&dyn BackendStorage>, Option<*mut c_void>) = match b_scale {
+            Some(s) => {
+                let s = as_rocm(s)?;
+                (Some(s), Some(dev_ptr(s)? as *mut c_void))
+            }
+            None => (None, None),
+        };
+        let (bt_s, b_ptr2): (Option<&dyn BackendStorage>, Option<*mut c_void>) = match bias {
+            Some(s) => {
+                let s = as_rocm(s)?;
+                (Some(s), Some(dev_ptr(s)? as *mut c_void))
+            }
+            None => (None, None),
+        };
+
+        let mut out_ptr = dev_ptr(o_s)?;
+        let mut a_p = a_ptr.unwrap_or(std::ptr::null_mut());
+        let mut b_p = b_ptr.unwrap_or(std::ptr::null_mut());
+        let mut bpt = b_ptr2.unwrap_or(std::ptr::null_mut());
+        let mut batch_i = batch as i32;
+        let mut out_dim_i = out_dim as i32;
+        let total = batch * out_dim;
+        let (grid, block) = linear_launch(total);
+
+        let stream = self.launch_compute_kernel(
+            "grim_scale_bias_epilogue",
+            grid,
+            block,
+            &mut [
+                arg(&mut out_ptr),
+                arg(&mut a_p),
+                arg(&mut b_p),
+                arg(&mut bpt),
+                arg(&mut batch_i),
+                arg(&mut out_dim_i),
+            ],
+        )?;
+
+        if self.active_capture_stream().is_none() {
+            unsafe {
+                let sync = hipStreamSynchronize(stream);
+                if sync != hipSuccess {
+                    return Err(Error::Backend(format!(
+                        "hipStreamSynchronize failed: {}",
+                        sync
+                    )));
+                }
+            }
+        }
+
+        drop((a_s, b_s, bt_s));
+        Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+    }
+
     fn selective_scan(
         &self,
         x: &dyn BackendStorage,
