@@ -100,6 +100,7 @@ pub struct MambaBlock {
     pub in_proj: Linear,
     pub conv: Vec<f32>,
     pub a_log: Vec<f32>,
+    pub b_param: Vec<f32>,
     pub d_param: Vec<f32>,
     pub dt_bias: Vec<f32>,
     pub out_proj: Linear,
@@ -137,6 +138,9 @@ impl MambaBlock {
         let a_log: Vec<f32> = (0..cfg.d_inner * cfg.d_state)
             .map(|_| (rng.next_f32() - 0.5) * 0.5)
             .collect();
+        let b_param: Vec<f32> = (0..cfg.d_inner * cfg.d_state)
+            .map(|_| (rng.next_f32() - 0.5) * 0.5)
+            .collect();
         let d_param: Vec<f32> = (0..cfg.d_inner).map(|_| 1.0).collect();
         let dt_bias: Vec<f32> = (0..cfg.d_inner).map(|_| 0.0).collect();
         Self {
@@ -150,6 +154,7 @@ impl MambaBlock {
             in_proj,
             conv,
             a_log,
+            b_param,
             d_param,
             dt_bias,
             out_proj,
@@ -204,11 +209,8 @@ impl MambaBlock {
             &Shape::new(vec![self.d_inner, self.d_state]),
             grim_tensor::DType::F32,
         )?;
-        // TODO: MambaBlock has no separate B-weight field; the CPU path uses
-        // the input projection xz[:d_state] as the B-like term.  When a
-        // `b_param` field is added to the struct, replace a_log here.
         let b_gpu = dev.from_cpu(
-            &self.a_log,
+            if self.b_param.is_empty() { &self.a_log } else { &self.b_param },
             &Shape::new(vec![self.d_inner, self.d_state]),
             grim_tensor::DType::F32,
         )?;
@@ -416,6 +418,10 @@ impl MambaBlock {
             .get([cfg.d_inner, cfg.conv_kernel], "ssm_conv1d.weight")?
             .to_vec_f32()?;
         let a_log = ws.get([cfg.d_inner, cfg.d_state], "ssm_a")?.to_vec_f32()?;
+        let b_param = ws
+            .get([cfg.d_inner, cfg.d_state], "ssm_b")
+            .and_then(|t| t.to_vec_f32())
+            .unwrap_or_default();
         let d_param = ws.get([cfg.d_inner], "ssm_d")?.to_vec_f32()?;
         let dt_bias = ws.get([cfg.d_inner], "ssm_dt.bias")?.to_vec_f32()?;
 
@@ -424,6 +430,7 @@ impl MambaBlock {
             in_proj,
             conv,
             a_log,
+            b_param,
             d_param,
             dt_bias,
             out_proj,

@@ -1181,6 +1181,13 @@ async fn load_model_handler(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| req.model_path.clone());
 
+    if req.model_path.contains("..") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Invalid model path: path traversal components ('..') are prohibited" })),
+        ));
+    }
+
     if !std::path::Path::new(&req.model_path).exists() {
         return Err((
             StatusCode::NOT_FOUND,

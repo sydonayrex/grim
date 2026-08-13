@@ -8,9 +8,10 @@ pub mod moe;
 pub mod varbuilder;
 
 pub use modules::{
-    ColumnParallelLinear, Embedding, KdaAttention, KdaLayerCache, LayerCache, Linear, MlaAttention,
-    MlaKvCache, RmsNorm, Rope, RowParallelLinear, TensorParallelConfig, add_tensors,
-    pick_device_for_storage_device, pick_device_for_tensor, require_single_device, short_conv1d,
+    ColumnParallelLinear, Embedding, KdaAttention, KdaLayerCache, LayerCache, Linear,
+    LinearAttentionBlock, LinearAttentionLayerCache, MlaAttention, MlaKvCache, RmsNorm, Rope,
+    RowParallelLinear, TensorParallelConfig, add_tensors, pick_device_for_storage_device,
+    pick_device_for_tensor, require_single_device, short_conv1d,
 };
 
 pub use scythe2::{Scythe2Linear, slice_input_dim, slice_output_dim};

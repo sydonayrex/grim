@@ -260,9 +260,11 @@ void grim_qkv_attention_paged(
     __shared__ float s_sum[8];
     __shared__ float s_acc[8][256];
 
-    // Per-wavefront KV slice [j_start, j_end) over the flattened page/token
-    // index space [0, kv_seq_len). Same stride partition as the non-paged kernel.
-    const int range_len = kv_seq_len;
+    // Per-wavefront KV slice over [window_lo, abs_i+1), partitioned by wavefront.
+    // window_lo == 0 is full causal; >=0 is the sliding-window lower bound.
+    const int lo = window_lo;
+    const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
+    const int range_len = hi - lo;  // may be 0 if lo >= hi (empty window)
     const int base = range_len / num_waves;
     const int rem  = range_len % num_waves;
     int j_start = wave_id * base + (wave_id < rem ? wave_id : rem);
@@ -275,8 +277,11 @@ void grim_qkv_attention_paged(
     // Get the block table for this batch
     const BlockTableEntry* my_table = block_tables + batch_idx * max_blocks;
 
-    // Walk this wavefront's K/V slice [j_start, j_end).
-    for (int j = j_start; j < j_end; ++j) {
+    // Walk this wavefront's K/V slice [lo + j_start, lo + j_end).
+    for (int j = lo + j_start; j < lo + j_end; ++j) {
+        // KV index space is [0, kv_seq_len); causal upper bound is abs_i.
+        // (lo already lowers the bound in the partition; this guards the edge on
+        // the last wave where j_end may overshoot abs_i+1 if range_len % num_waves.)
         if (j > abs_i || j >= kv_seq_len) break;
 
         // Decompose j into (block b, token t within page)
@@ -546,6 +551,7 @@ pub fn launch_paged_attention(
     page_size: u32,
     kv_seq_len: u32,
     cache_offset: u32,
+    window_lo: i32,                    // sliding-window lower bound; 0 = full causal
 ) -> Result<(), crate::Error> {
     let q_s = q
         .as_any()
@@ -605,6 +611,10 @@ pub fn launch_paged_attention(
     let mut ksl = kv_seq_len as i32;
     let mut co = cache_offset as i32;
     let mut isd = inv_sqrt_d;
+    // Sliding-window lower bound (0 for full causal; >=0 for SWA). Mirrors the
+    // non-paged wrapper's host-side `window_lo_i` computation. Laguna-S-2.1
+    // uses seq_len==1 decode, so the block-wide bound is exact.
+    let mut wlo = window_lo;
 
     dev.launch_compute_kernel(
         "grim_qkv_attention_paged",
@@ -624,6 +634,7 @@ pub fn launch_paged_attention(
             arg(&mut ksl),
             arg(&mut co),
             arg(&mut isd),
+            arg(&mut wlo),
         ],
     )?;
 

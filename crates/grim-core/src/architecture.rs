@@ -198,7 +198,7 @@ impl ModelArchitecture {
             "qwen3vl" => Self::Qwen3Vl,
             "qwen3vlmoe" => Self::Qwen3VlMoe,
             "qwen35" | "qwen3.5" => Self::Qwen35,
-            "qwen35moe" => Self::Qwen35Moe,
+            "qwen35moe" | "qwen3_5_moe" | "qwen3_5_moe_text" => Self::Qwen35Moe,
             "phi" | "phi2" | "phi-2" => Self::Phi2,
             "phi3" | "phi-3" | "phishort" => Self::Phi3,
             "phimoe" => Self::PhiMoe,

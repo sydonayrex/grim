@@ -86,6 +86,7 @@ fn test_paged_attention_gpu_matches_reference() {
         page_size,
         kv_seq_len,
         cache_offset,
+        0i32,
     );
 
     assert!(

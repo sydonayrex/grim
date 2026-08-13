@@ -19,7 +19,7 @@ use grim_models_mamba::{
      CommandR, CommandRConfig, DeepSeek, DeepSeekConfig, DeltaNetBase, DeltaNetBaseConfig,
      Falcon, FalconConfig, FalconH1Config, FalconH1Model, Gemma, GemmaConfig, Gpt2, Gpt2Config,
      Lfm2, Lfm2Config, Laguna, LagunaConfig, Llama, LlamaConfig, MiniCpmConfig, MiniCpmModel,
-     SmolLm2, SmolLm2Config, Qwen3Moe, Qwen3MoeConfig,
+     SmolLm2, SmolLm2Config, Qwen3Moe, Qwen3MoeConfig, Qwen35Moe, Qwen35MoeConfig,
      MiniMaxM2, MiniMaxM2Config, Orion, OrionConfig, Phi2, PhiConfig, Qwen, QwenConfig,
      SeedOss, SeedOssConfig, T5, T5Config, WavTokenizerDec, WavTokenizerDecConfig,
  };
@@ -379,6 +379,12 @@ struct SafetensorsConfig {
     /// Parsed lazily; absence = plain RoPE.
     #[serde(rename = "rope_parameters")]
     rope_parameters: Option<serde_json::Value>,
+    /// HuggingFace-standard rope-scaling block used by Qwen3.5-MoE and other
+    /// HF-exported checkpoints: `{rope_type: "yarn", factor, original_max_position_embeddings,
+    /// beta_fast, beta_slow, attention_factor}`. Parsed lazily by
+    /// `parse_yarn_scaling`; absence = plain RoPE.
+    #[serde(rename = "rope_scaling")]
+    rope_scaling: Option<serde_json::Value>,
 }
 
 /// Extract full-attention YaRN params from Laguna-S-2.1 `rope_parameters`.
@@ -404,6 +410,139 @@ fn parse_full_yarn(rope_parameters: &Option<serde_json::Value>) -> Option<YaRNPa
             .and_then(|v| v.as_f64())
             .unwrap_or(1.0) as f32,
     })
+}
+
+/// Parse YaRN params from a HuggingFace-standard `rope_scaling` block
+/// `{rope_type: "yarn", factor, original_max_position_embeddings, beta_fast,
+/// beta_slow, attention_factor}`. Used by Qwen3.5-MoE and other HF-exported
+/// checkpoints. Returns `None` for non-YaRN rope types (`linear`, `dynamic`...)
+/// or absence, falling back to plain RoPE.
+pub fn parse_yarn_scaling(rope_scaling: &Option<serde_json::Value>) -> Option<YaRNParams> {
+    let rs = rope_scaling.as_ref()?;
+    // Only YaRN scaling yields a `YaRNParams`. Other rope types (`linear`,
+    // `dynamic`, `ntk-aware`, `longrope`, ...) get plain RoPE here.
+    if rs.get("rope_type").and_then(|v| v.as_str()) != Some("yarn") {
+        return None;
+    }
+    Some(YaRNParams {
+        factor: rs.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+        original_max_pos: rs
+            .get("original_max_position_embeddings")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(8192) as usize,
+        beta_fast: rs
+            .get("beta_fast")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(32.0) as f32,
+        beta_slow: rs
+            .get("beta_slow")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0) as f32,
+        attention_factor: rs
+            .get("attention_factor")
+            .or_else(|| rs.get("attn_factor"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0) as f32,
+    })
+}
+
+/// Parse full-attention YaRN params from a GGUF metadata string.
+///
+/// Some GGUF exports (e.g. llama.cpp-converted Laguna checkpoints) store the
+/// `rope_parameters` JSON block under a key like `laguna.rope_parameters`. When
+/// present, parse and return the YaRN params; otherwise `None` (plain RoPE).
+pub fn parse_full_yarn_gguf(lookup: &dyn MetadataLookup) -> Option<YaRNParams> {
+    let json_str = lookup.get_str("rope_parameters").or_else(|| lookup.get_str("laguna.rope_parameters"))?;
+    let value: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+    parse_full_yarn(&Some(value))
+}
+
+/// Parse a HuggingFace `rope_scaling` YaRN block from GGUF metadata. Checks the
+/// common GGUF keys carrying a JSON `rope_scaling` blob (`rope_scaling`,
+/// `<arch>.rope_scaling`, `rope.scaling`) and falls back to individual dotted
+/// keys (`rope_scaling.rope_type`, `rope_scaling.factor`, ...) — matching
+/// llama.cpp converter conventions.
+pub fn parse_yarn_scaling_gguf(lookup: &dyn MetadataLookup) -> Option<YaRNParams> {
+    // First try the JSON-string form (some converters store the full block).
+    for key in ["rope_scaling", "qwen35moe.rope_scaling", "rope.scaling"] {
+        if let Some(json_str) = lookup.get_str(key) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                if let Some(y) = parse_yarn_scaling(&Some(value)) {
+                    return Some(y);
+                }
+            }
+        }
+    }
+    // Then build a Value from the individual dotted keys.
+    let rope_type = lookup.get_str("rope_scaling.rope_type").or_else(|| lookup.get_str("rope_scaling.rope_type"))?;
+    if rope_type != "yarn" {
+        return None;
+    }
+    let factor = lookup.get_f32("rope_scaling.factor").unwrap_or(1.0);
+    let original_max_pos = lookup
+        .get_u32("rope_scaling.original_max_position_embeddings")
+        .or_else(|| lookup.get_u32("rope_scaling.original_max_position_embed"))
+        .or_else(|| lookup.get_u32("rope_scaling.context_length_orig"))
+        .unwrap_or(8192) as usize;
+    let beta_fast = lookup.get_f32("rope_scaling.beta_fast").unwrap_or(32.0);
+    let beta_slow = lookup.get_f32("rope_scaling.beta_slow").unwrap_or(1.0);
+    let attention_factor = lookup
+        .get_f32("rope_scaling.attention_factor")
+        .or_else(|| lookup.get_f32("rope_scaling.attn_factor"))
+        .unwrap_or(1.0);
+    Some(YaRNParams {
+        factor,
+        original_max_pos,
+        beta_fast,
+        beta_slow,
+        attention_factor,
+    })
+}
+
+/// Extract Laguna-S-2.1 hybrid-attention + RoPE fields from GGUF metadata.
+///
+/// GGUF checkpoints carry only a single `rope_theta` + `max_seq_len` in
+/// `ArchHyperparameters`/`hparams`; the dual thetas, partial-rotary factors,
+/// sliding window, layer types, and gating are **not** stored in GGUF metadata
+/// (they live in `config.json` for the Safetensors path). This helper reads what
+/// **is** available — the `rope_parameters` JSON string if the checkpoint was
+/// converted with it — and falls back to the published S-2.1 hardcoded values
+/// otherwise. This keeps the GGUF path correct for checkpoints that carry it and
+/// safety-correct (plain RoPE + published defaults) for those that don't.
+pub fn extract_laguna_gguf_hybrid(
+    lookup: &dyn MetadataLookup,
+) -> (
+    f32,        // full_rope_theta
+    f32,        // sliding_rope_theta
+    f32,        // full_partial_rotary_factor
+    f32,        // sliding_partial_rotary_factor
+    usize,      // sliding_window
+    Option<YaRNParams>,  // full_yarn
+) {
+    let full_rope_theta = lookup
+        .get_f32("rope_parameters.full_attention.rope_theta")
+        .or_else(|| lookup.get_f32("rope_parameters.full_attention.freq_base"))
+        .or_else(|| lookup.get_f32("full_attention.rope_theta"))
+        .unwrap_or(500000.0);
+    let sliding_rope_theta = lookup
+        .get_f32("rope_parameters.sliding_attention.rope_theta")
+        .or_else(|| lookup.get_f32("sliding_attention.rope_theta"))
+        .unwrap_or(10000.0);
+    let full_partial_rotary_factor = lookup
+        .get_f32("rope_parameters.full_attention.partial_rotary_factor")
+        .or_else(|| lookup.get_f32("full_attention.partial_rotary_factor"))
+        .unwrap_or(0.5);
+    let sliding_partial_rotary_factor = lookup
+        .get_f32("rope_parameters.sliding_attention.partial_rotary_factor")
+        .or_else(|| lookup.get_f32("sliding_attention.partial_rotary_factor"))
+        .unwrap_or(1.0);
+    let sliding_window = lookup
+        .get_u32("sliding_window")
+        .or_else(|| lookup.get_u32("laguna.sliding_window"))
+        .map(|v| v as usize)
+        .unwrap_or(512);
+    let full_yarn = parse_full_yarn_gguf(lookup);
+    (full_rope_theta, sliding_rope_theta, full_partial_rotary_factor, sliding_partial_rotary_factor, sliding_window, full_yarn)
 }
 
 
@@ -644,10 +783,40 @@ fn load_model_from_config(
             let m = Qwen::load_tp(device.clone(), &ws, qwen_cfg, tp)?;
             Ok(Box::new(m))
         }
+        ModelArchitecture::Qwen35Moe => {
+            let qwen35_moe_cfg = Qwen35MoeConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                num_experts: expert_count,
+                num_experts_per_tok: expert_used_count,
+                shared_expert_intermediate_size: None,
+                routed_scaling_factor,
+                layer_types: vec![],
+                linear_key_head_dim: 128,
+                linear_num_key_heads: 16,
+                linear_value_head_dim: 128,
+                linear_num_value_heads: 128,
+                partial_rotary_factor: config.partial_rotary_factor.unwrap_or(0.25),
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+                full_yarn: parse_yarn_scaling(&config.rope_scaling),
+            };
+            eprintln!(
+                "[grim] Loading Qwen3.5/3.8 MoE model with config: {:?}",
+                qwen35_moe_cfg
+            );
+            let m = Qwen35Moe::load_tp(device.clone(), &ws, qwen35_moe_cfg, tp)?;
+            Ok(Box::new(m))
+        }
         ModelArchitecture::Qwen2Moe
         | ModelArchitecture::Qwen3Moe
-        | ModelArchitecture::Qwen35Moe
-                | ModelArchitecture::AfMoe
+        | ModelArchitecture::AfMoe
         | ModelArchitecture::BailingMoe
         | ModelArchitecture::BailingMoe2
         | ModelArchitecture::Cohere2Moe
@@ -1082,7 +1251,10 @@ fn load_model_from_config(
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
-            };
+            
+            partial_rotary_factor: 1.0,
+            yarn: None,
+        };
             let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -1112,7 +1284,10 @@ fn load_model_from_config(
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
-            };
+            
+            partial_rotary_factor: 1.0,
+            yarn: None,
+        };
             let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -1258,7 +1433,10 @@ fn load_model_from_config(
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
-            };
+            
+            partial_rotary_factor: 1.0,
+            yarn: None,
+        };
             eprintln!("[grim] Loading Llama-family model ({:?}) with config: {:?}", model_arch, llama_cfg);
             let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
@@ -1319,7 +1497,10 @@ fn load_model_from_config(
                         rms_norm_eps: spec.rms_norm_eps,
                         rope_theta: spec.rope_theta,
                         max_seq_len: spec.max_seq_len,
-                    };
+                    
+                        partial_rotary_factor: 1.0,
+                        yarn: None,
+        };
                     let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
                     return Ok(Box::new(m));
                 }
@@ -1340,7 +1521,10 @@ fn load_model_from_config(
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
-            };
+            
+            partial_rotary_factor: 1.0,
+            yarn: None,
+        };
             let m = Llama::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -1461,6 +1645,14 @@ fn load_model_with_providers(
             Ok(Box::new(m))
         }
         ModelArchitecture::Laguna => {
+            // GGUF checkpoints carry only a single rope_theta + max_seq_len;
+            // the dual thetas, partial-rotary factors, sliding window, and YaRN
+            // block are read from GGUF metadata when present (llama.cpp-converted
+            // checkpoints may store `rope_parameters` as a JSON string), with the
+            // published S-2.1 values as defaults otherwise.
+            let (full_rope_theta, sliding_rope_theta, full_partial_rotary_factor, sliding_partial_rotary_factor, sliding_window, full_yarn) =
+                extract_laguna_gguf_hybrid(&lookup);
+
             let laguna_cfg = LagunaConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -1479,14 +1671,14 @@ fn load_model_with_providers(
                 max_seq_len: hparams.max_seq_len,
                 mlp_only_layers: vec![0],
                 layer_types: vec!["full_attention".into()],
-                sliding_window: 512,
+                sliding_window,
                 num_attention_heads_per_layer: vec![hparams.num_heads; hparams.num_layers],
-                full_rope_theta: 500000.0,
-                sliding_rope_theta: 10000.0,
-                full_partial_rotary_factor: 0.5,
-                sliding_partial_rotary_factor: 1.0,
+                full_rope_theta,
+                sliding_rope_theta,
+                full_partial_rotary_factor,
+                sliding_partial_rotary_factor,
                 gating: "per-head".into(),
-                full_yarn: None,
+                full_yarn,
             };
             eprintln!("[grim] Loading Laguna model with config: {:?}", laguna_cfg);
             let m = Laguna::load_tp(device.clone(), &ws, laguna_cfg, tp)?;
@@ -1585,13 +1777,60 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
-            };
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        };
             let m = Qwen::load_tp(device.clone(), &ws, qwen_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Qwen35Moe => {
+            // GGUF YaRN: read the `rope_scaling` block if the converter stored
+            // it, falling back to plain RoPE (no YaRN). Partial-rotary factor
+            // is read from `<arch>.partial_rotary_factor` if present, else the
+            // published Qwen3.5-MoE default of 0.25.
+            let prf = lookup
+                .get_f32("qwen35moe.partial_rotary_factor")
+                .or_else(|| lookup.get_f32("partial_rotary_factor"))
+                .or_else(|| {
+                    // llama.cpp sometimes stores the rotary dim count as a u32.
+                    lookup
+                        .get_u32("qwen35moe.rope.rope_dimension_count")
+                        .map(|v| (v as f32) / (hparams.head_dim as f32))
+                })
+                .unwrap_or(0.25);
+            let qwen35_moe_cfg = Qwen35MoeConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                num_experts: hparams.expert_count.unwrap_or(8),
+                num_experts_per_tok: hparams.expert_used_count.unwrap_or(2),
+                shared_expert_intermediate_size: None,
+                routed_scaling_factor: hparams.routed_scaling_factor,
+                layer_types: vec![],
+                linear_key_head_dim: 128,
+                linear_num_key_heads: 16,
+                linear_value_head_dim: 128,
+                linear_num_value_heads: 128,
+                partial_rotary_factor: prf,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+                full_yarn: parse_yarn_scaling_gguf(&lookup),
+            };
+            eprintln!(
+                "[grim] Loading Qwen3.5/3.8 MoE model with config: {:?}",
+                qwen35_moe_cfg
+            );
+            let m = Qwen35Moe::load_tp(device.clone(), &ws, qwen35_moe_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen2Moe
         | ModelArchitecture::Qwen3Moe
-        | ModelArchitecture::Qwen35Moe
         | ModelArchitecture::Qwen3VlMoe => {
             let qwen_moe_cfg = Qwen3MoeConfig {
                 vocab_size: hparams.vocab_size,
@@ -2018,7 +2257,10 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
-            };
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        };
             let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2256,7 +2498,10 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
-            };
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        };
             let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2385,7 +2630,10 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
-            };
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        };
             eprintln!("[grim] Loading Llama-family model ({:?}) with config: {:?}", model_arch, llama_cfg);
             let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
@@ -2453,7 +2701,10 @@ fn load_model_with_providers(
                         rms_norm_eps: hparams.rms_norm_eps,
                         rope_theta: hparams.rope_theta,
                         max_seq_len: hparams.max_seq_len,
-                    };
+                    
+                        partial_rotary_factor: 1.0,
+                        yarn: None,
+        };
                     let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
                     return Ok(Box::new(m));
                 }
@@ -2474,7 +2725,10 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
-            };
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        };
             let m = Llama::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2704,5 +2958,65 @@ mod tests {
         let gguf_name = "blk.0.attn_q.weight";
         assert_eq!(spec.remap_tensor_name(hf_name), gguf_name);
         assert_eq!(spec.remap_tensor_name(gguf_name), hf_name);
+    }
+
+    /// `parse_yarn_scaling` must accept a standard HF `rope_scaling` block with
+    /// `rope_type: "yarn"` and populate all five YaRNParams fields (with sensible
+    /// defaults for any missing sub-field).
+    #[test]
+    fn parse_yarn_scaling_reads_standard_hf_yarn_block() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"rope_type": "yarn", "factor": 4.0,
+                "original_max_position_embeddings": 32768,
+                "beta_fast": 32.0, "beta_slow": 1.0,
+                "attention_factor": 0.1}"#,
+        )
+        .unwrap();
+        let y = parse_yarn_scaling(&Some(v)).expect("yarn block must parse");
+        assert!((y.factor - 4.0).abs() < 1e-6);
+        assert_eq!(y.original_max_pos, 32768);
+        assert!((y.beta_fast - 32.0).abs() < 1e-6);
+        assert!((y.beta_slow - 1.0).abs() < 1e-6);
+        assert!((y.attention_factor - 0.1).abs() < 1e-6);
+    }
+
+    /// Non-YaRN rope types (linear / dynamic) must fall back to plain RoPE
+    /// (return `None`), not silently fabricate YaRN params.
+    #[test]
+    fn parse_yarn_scaling_returns_none_for_non_yarn_rope_types() {
+        for rt in ["linear", "dynamic", "ntk-aware", "longrope"] {
+            let v: serde_json::Value =
+                serde_json::from_str(&format!(r#"{{"rope_type": "{rt}", "factor": 4.0}}"#)).unwrap();
+            assert!(
+                parse_yarn_scaling(&Some(v)).is_none(),
+                "rope_type={rt} must not produce YaRNParams"
+            );
+        }
+        assert!(parse_yarn_scaling(&None).is_none());
+    }
+
+    /// A yarn block missing optional sub-fields must still parse, applying the
+    /// documented defaults (factor 1.0, beta_fast 32.0, beta_slow 1.0,
+    /// attention_factor 1.0, original_max_pos 8192).
+    #[test]
+    fn parse_yarn_scaling_applies_defaults_for_missing_fields() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"rope_type": "yarn"}"#).unwrap();
+        let y = parse_yarn_scaling(&Some(v)).expect("yarn (defaults) must parse");
+        assert!((y.factor - 1.0).abs() < 1e-6);
+        assert_eq!(y.original_max_pos, 8192);
+        assert!((y.beta_fast - 32.0).abs() < 1e-6);
+        assert!((y.beta_slow - 1.0).abs() < 1e-6);
+        assert!((y.attention_factor - 1.0).abs() < 1e-6);
+    }
+
+    /// `parse_yarn_scaling` must accept the llama.cpp `attn_factor` alias for the
+    /// attention-factor field (used by some GGUF converters).
+    #[test]
+    fn parse_yarn_scaling_accepts_attn_factor_alias() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"rope_type": "yarn", "attn_factor": 0.707}"#).unwrap();
+        let y = parse_yarn_scaling(&Some(v)).expect("yarn (alias) must parse");
+        assert!((y.attention_factor - 0.707).abs() < 1e-5);
     }
 }

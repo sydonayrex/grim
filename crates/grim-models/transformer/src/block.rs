@@ -36,6 +36,31 @@ impl LayerAttentionSpec {
             has_attn_gate: false,
         }
     }
+
+    /// Full-attention layer with an explicit rotary dim and optional YaRN
+    /// scaling. Used by Qwen3.5-MoE and other models that combine partial
+    /// rotary with YaRN RoPE on every layer. `rotary_dim` is clamped to
+    /// `head_dim` by the `RopeConfig`.
+    pub fn full_with_rope(
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_theta: f32,
+        rotary_dim: usize,
+        yarn: Option<grim_tensor::YaRNParams>,
+    ) -> Self {
+        let mut rope = grim_tensor::RopeConfig::new(head_dim, rope_theta);
+        rope.rotary_dim = rotary_dim.min(head_dim);
+        rope.yarn = yarn;
+        Self {
+            attn_type: AttentionType::Full,
+            num_heads,
+            num_kv_heads,
+            rope,
+            sliding_window: None,
+            has_attn_gate: false,
+        }
+    }
 }
 
 
@@ -882,6 +907,35 @@ mod tests {
     use grim_backend_cpu::cpu_tensor;
     use grim_tensor::{DType, Device, Shape, Tensor};
 
+    #[test]
+    fn full_with_rope_threads_partial_rotary_and_yarn_into_spec() {
+        // partial_rotary_factor = 0.5, head_dim = 16 ⇒ rotary_dim = 8.
+        let yarn = grim_tensor::YaRNParams {
+            factor: 4.0,
+            original_max_pos: 32768,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            attention_factor: 0.1,
+        };
+        let spec = LayerAttentionSpec::full_with_rope(8, 2, 16, 1_000_000.0, 8, Some(yarn));
+        assert_eq!(spec.attn_type, AttentionType::Full);
+        assert_eq!(spec.rope.dim, 16);
+        assert!((spec.rope.base - 1_000_000.0).abs() < 1e-3);
+        assert_eq!(spec.rope.rotary_dim, 8, "rotary_dim must be round(0.5 * 16)");
+        assert!(!spec.rope.is_plain(), "yarn + partial-rotary must not be plain");
+        assert_eq!(spec.rope.yarn.unwrap().factor, 4.0);
+        assert_eq!(spec.sliding_window, None);
+    }
+
+    #[test]
+    fn full_with_rope_rotary_dim_clamps_to_head_dim() {
+        // An over-large rotary_dim is clamped to head_dim (RopeConfig invariant).
+        let spec = LayerAttentionSpec::full_with_rope(4, 1, 16, 10_000.0, 99, None);
+        assert_eq!(spec.rope.rotary_dim, 16);
+        // Full rotary, no yarn ⇒ plain fast path still available.
+        assert!(spec.rope.is_plain());
+    }
+
     fn small_cfg() -> LlamaConfigRefs {
         LlamaConfigRefs {
             hidden_size: 32,
@@ -1353,6 +1407,9 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             max_seq_len: 512,
+        
+            partial_rotary_factor: 1.0,
+            yarn: None,
         };
         let provider = FullProvider { tensors };
         let ws = WeightSource::root(&provider, Device::Cpu);
@@ -1439,6 +1496,9 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             max_seq_len: 512,
+        
+            partial_rotary_factor: 1.0,
+            yarn: None,
         };
 
         // (name, out_dim, in_dim) for every weight the block loads.

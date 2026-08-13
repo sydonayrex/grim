@@ -185,6 +185,8 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             max_seq_len: 512,
+            partial_rotary_factor: 1.0,
+            yarn: None,
         }
     }
 

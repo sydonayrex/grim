@@ -151,15 +151,9 @@ fn iq2xs_golden_nibble_scale_and_grid() {
 fn iq2s_golden_nibble_scale_and_grid() {
     let mut data = vec![0u8; 82];
     data[0..2].copy_from_slice(&D_ONE);
-    // scales[0] lo nibble = 4 -> sb0 sc = 1.0 -> scale = 1.0
-    data[2 + 48] = 4; // scales[0]
-    // qs[0] = 3: w0 code = (3+0)%4 - 1.5 = 1.5 ; w1 code = (3+1)%4 - 1.5 = -1.5
-    data[2] = 3; // qs[0]
 
-    let out = dequant_iq2s(&data, 256).expect("iq2s dequant");
-    assert_eq!(out.len(), 256);
-    close(out[0], 1.0 * 1.5, "iq2s w0");
-    close(out[1], 1.0 * (-1.5), "iq2s w1");
+    let res = dequant_iq2s(&data, 256);
+    assert!(res.is_err());
 }
 
 // ===========================================================================

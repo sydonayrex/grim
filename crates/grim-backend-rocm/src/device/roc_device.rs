@@ -4044,15 +4044,20 @@ impl BackendDevice for RocmDevice {
         window: Option<usize>,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        // grim_qkv_attention_paged is full-causal only; sliding-window falls
-        // back to the host path.
-        if window.is_some() {
-            return Err(Error::Unimplemented(
-                "qkv_attention_paged: sliding-window not yet in the ROCm kernel; \
-                 falling back to host attention"
-                    .into(),
-            ));
-        }
+        // Sliding-window lower bound:
+        //   None       -> 0 (full causal)
+        //   Some(w)    -> max(0, cache_offset - (w - 1)). For decode (seq_len==1)
+        //                 this is exact; for prefill it is the per-block conservative
+        //                 lower bound (each query thread uses abs_i = cache_offset + i
+        //                 and the causal upper bound abs_i + 1 is still enforced in
+        //                 the kernel).
+        let window_lo_i: i32 = match window {
+            None => 0,
+            Some(w) => {
+                let abs_first = cache_offset as usize;
+                abs_first.saturating_sub(w.saturating_sub(1)) as i32
+            }
+        };
 
         let q_s = as_rocm(q)?;
         let bt_s = as_rocm(block_tables)?;
@@ -4092,6 +4097,7 @@ impl BackendDevice for RocmDevice {
             page_size as u32,
             kv_seq_len as u32,
             cache_offset,
+            window_lo_i,
         )?;
 
         Ok((
@@ -4165,73 +4171,6 @@ pub use crate::device::gemm_tuning::{GemmTileConfig, lookup_gemm_config, lookup_
 // Re-exports that pulled up `pub use crate::graph_capture::*` etc. in [see: `pub use`]
 
 impl RocmDevice {
-    /// CPU-fallback RoPE for partial-rotary + YaRN configs (Laguna-S-2.1 full
-    /// layers). Mirrors `grim-backend-cpu::CpuDevice::rope`: readback → YaRN
-    /// frequency ramp + mscale → rotate `rotary_dim` channels, pass the rest
-    /// → re-upload. Self-contained so the backend crate stays model-agnostic.
-    pub(crate) fn rope_fallback_yarn(
-        &self,
-        x_s: &RocmStorage,
-        positions: &[u32],
-        cfg: &grim_tensor::RopeConfig,
-        out_shape: &Shape,
-    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let dims = out_shape.dims();
-        let (b, s, d) = (dims[0], dims[1], dims[2]);
-        let rotary_dim = cfg.rotary_dim.min(d);
-        let rotary_half = rotary_dim / 2;
-        let yarn = cfg.yarn;
-
-        let inv_freq: Vec<f32> = (0..rotary_half)
-            .map(|i| {
-                let freq = 1.0 / cfg.base.powf((2 * i) as f32 / d as f32);
-                match yarn {
-                    None => freq,
-                    Some(y) => {
-                        let wavelength = 2.0 * std::f32::consts::PI / freq;
-                        let low = y.original_max_pos as f32 / y.beta_slow;
-                        let high = y.original_max_pos as f32 / y.beta_fast;
-                        if wavelength < high {
-                            freq
-                        } else if wavelength > low {
-                            freq / y.factor
-                        } else {
-                            let ramp = (y.original_max_pos as f32 / wavelength - y.beta_slow)
-                                / (y.beta_fast - y.beta_slow);
-                            (1.0 - ramp) * (freq / y.factor) + ramp * freq
-                        }
-                    }
-                }
-            })
-            .collect();
-        let mscale = yarn.map(|y| y.attention_factor).unwrap_or(1.0);
-
-        let mut src = x_s.to_cpu_vec_f32()?;
-        for bi in 0..b {
-            for si in 0..s {
-                let pos = positions.get(si).copied().unwrap_or(si as u32) as f32;
-                let base_index = (bi * s + si) * d;
-                let mut cos_p = vec![0.0f32; rotary_half];
-                let mut sin_p = vec![0.0f32; rotary_half];
-                for i in 0..rotary_half {
-                    let a = pos * inv_freq[i];
-                    cos_p[i] = a.cos() * mscale;
-                    sin_p[i] = a.sin() * mscale;
-                }
-                for i in 0..rotary_half {
-                    let xi = base_index + i;
-                    let xj = base_index + rotary_half + i;
-                    let a = src[xi];
-                    let bv = src[xj];
-                    src[xi] = a * cos_p[i] - bv * sin_p[i];
-                    src[xj] = bv * cos_p[i] + a * sin_p[i];
-                }
-            }
-        }
-        let storage = self.from_cpu(&src, out_shape, DType::F32)?;
-        Ok((storage, Box::new(RocmHandle::new(Some(self.active_stream())))))
-    }
-
     /// GPU-side YaRN / partial-rotary RoPE: computes `inv_freq[]` on the host,
     /// uploads it once per call, then dispatches `grim_rope_yarn` entirely on-device.
     ///
@@ -8460,6 +8399,7 @@ impl RocmDevice {
             page_size as u32,
             kv_seq_len as u32,
             cache_offset,
+            0,
         )?;
 
         Ok((

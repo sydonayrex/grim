@@ -125,9 +125,15 @@ pub enum GgufDType {
     #[allow(non_camel_case_types)]
     IQ1_S = 28,
     #[allow(non_camel_case_types)]
+    IQ1_M = 29,
+    #[allow(non_camel_case_types)]
+    BF16 = 30,
+    #[allow(non_camel_case_types)]
     IQ4_NL = 35,
     #[allow(non_camel_case_types)]
     IQ4_XS = 36,
+    #[allow(non_camel_case_types)]
+    MXFP4 = 39,
 }
 
 impl GgufDType {
@@ -160,8 +166,11 @@ impl GgufDType {
             26 => Some(GgufDType::IQ3_XXS),
             27 => Some(GgufDType::IQ3_S),
             28 => Some(GgufDType::IQ1_S),
+            29 => Some(GgufDType::IQ1_M),
+            30 => Some(GgufDType::BF16),
             35 => Some(GgufDType::IQ4_NL),
             36 => Some(GgufDType::IQ4_XS),
+            39 => Some(GgufDType::MXFP4),
             _ => None,
         }
     }
@@ -171,17 +180,12 @@ impl GgufDType {
     pub fn elem_size(self) -> u64 {
         match self {
             GgufDType::F32 => 4,
-            GgufDType::F16 => 2,
+            GgufDType::F16 | GgufDType::BF16 => 2,
             GgufDType::I8 => 1,
             GgufDType::I16 => 2,
             GgufDType::I32 => 4,
             GgufDType::I64 => 8,
             GgufDType::F64 => 8,
-            // Quantized layouts use block storage; their effective per-element cost
-            // when dequantized to F32 (or how many bytes a single weight occupies in
-            // a codebook) is computed via `type_size_bytes / block_size`. The values
-            // 17, 21, 34, etc. were placeholder block-sizes and must NOT be used to
-            // compute on-disk byte counts — see `type_size_per_block` / `block_size`.
             _ => 1,
         }
     }
@@ -189,15 +193,11 @@ impl GgufDType {
     /// Number of weights stored per quantization block. Quant layouts package
     /// N weights together with shared scales/deltas; this is the N. F32/F16/I*/BF16
     /// are stored as 1-element blocks.
-    ///
-    /// K-quants (Q2_K … Q8_K, IQ) use ggml's `QK_K = 256`-element super-block.
-    /// Q4_0/Q5_0/Q8_0-style blocks hold 32 weights. Mis-sizing either path
-    /// silently produces `size_bytes` values that don't match the on-disk
-    /// tensor, which then surfaces as `UnexpectedEof` in `read_exact`.
     pub fn block_size(self) -> u64 {
         match self {
             GgufDType::F32
             | GgufDType::F16
+            | GgufDType::BF16
             | GgufDType::F64
             | GgufDType::I8
             | GgufDType::I16
@@ -219,7 +219,9 @@ impl GgufDType {
             | GgufDType::IQ2_XXS
             | GgufDType::IQ2_XS
             | GgufDType::IQ2_S
-            | GgufDType::IQ1_S => 256,
+            | GgufDType::IQ1_S
+            | GgufDType::IQ1_M
+            | GgufDType::MXFP4 => 256,
             // Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q8_1: 32-elem block
             _ => 32,
         }
@@ -231,7 +233,7 @@ impl GgufDType {
     pub fn type_size_per_block(self) -> u64 {
         match self {
             GgufDType::F32 => 4,
-            GgufDType::F16 => 2,
+            GgufDType::F16 | GgufDType::BF16 => 2,
             GgufDType::I8 => 1,
             GgufDType::I16 => 2,
             GgufDType::I32 => 4,
@@ -245,39 +247,27 @@ impl GgufDType {
             GgufDType::Q8_0 => 2 + 32,
             GgufDType::Q8_1 => 4 + 4 + 32,
             GgufDType::Q2K => 84,
-            GgufDType::Q3K => 108,
+            GgufDType::Q3K => 110,
             GgufDType::Q4K => 144,
             GgufDType::Q5K => 176,
             GgufDType::Q6K => 210,
-            GgufDType::Q8K => 252,
-            GgufDType::IQ4_NL => 170,
+            GgufDType::Q8K => 292,
+            GgufDType::IQ4_NL => 144,
             GgufDType::IQ4_XS => 136,
-            GgufDType::IQ3_XXS => 96,
+            GgufDType::IQ3_XXS => 98,
             GgufDType::IQ3_S => 110,
             GgufDType::IQ2_XXS => 66,
             GgufDType::IQ2_XS => 74,
             GgufDType::IQ2_S => 82,
             GgufDType::IQ1_S => 50,
+            GgufDType::IQ1_M => 56,
+            GgufDType::MXFP4 => 128,
             _ => 0,
         }
     }
-
-    /// Check whether `out_dim` can be evenly split into `world_size` shards
-    /// without breaking GGUF block-quant alignment. Returns `true` if
-    /// `out_dim % world_size == 0` AND each shard's row count is a multiple
-    /// of the block size for this dtype.
-    pub fn block_boundary_valid(self, out_dim: usize, world_size: usize) -> bool {
-        if world_size == 0 {
-            return false;
-        }
-        if out_dim % world_size != 0 {
-            return false;
-        }
-        let shard_size = out_dim / world_size;
-        let block_size = self.block_size() as usize;
-        shard_size % block_size == 0
-    }
 }
+
+
 
 /// One tensor index entry from a GGUF file.
 #[derive(Debug, Clone)]
@@ -1412,13 +1402,19 @@ pub fn read_gguf<R: Read + Seek>(mut reader: R) -> Result<GgufFile> {
         //   size_bytes = (params × type_size_per_block) / block_size
         let block_size = dtype.block_size();
         let type_size = dtype.type_size_per_block();
-        let params: u64 = dims.iter().product();
+        let params: u64 = dims.iter().try_fold(1u64, |acc, &d| acc.checked_mul(d)).ok_or_else(|| {
+            Error::Backend(format!("GGUF tensor '{name}' dimension product overflowed u64"))
+        })?;
         let size_bytes: u64 = if block_size == 1 {
-            params * type_size
+            params.checked_mul(type_size).ok_or_else(|| {
+                Error::Backend(format!("GGUF tensor '{name}' byte size overflowed u64"))
+            })?
         } else if type_size == 0 {
             0
         } else {
-            (params.saturating_mul(type_size)) / block_size
+            params.checked_mul(type_size).map(|total| total / block_size).ok_or_else(|| {
+                Error::Backend(format!("GGUF tensor '{name}' byte size overflowed u64"))
+            })?
         };
         tensors.push(GgufTensorInfo {
             name,
@@ -1658,10 +1654,34 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::IQ2XS),
         },
-        GgufDType::IQ2_S | GgufDType::IQ1_S => DType {
+        GgufDType::IQ2_S | GgufDType::IQ1_S | GgufDType::IQ1_M => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::IQ2S),
         },
+        GgufDType::BF16 => DType::F16,
+        GgufDType::MXFP4 => DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q4K),
+        },
+    }
+}
+
+impl GgufDType {
+    /// Check whether `out_dim` can be evenly split into `world_size` shards
+    /// without breaking GGUF block-quant alignment.
+    pub fn block_boundary_valid(self, out_dim: usize, world_size: usize) -> bool {
+        if world_size == 0 {
+            return false;
+        }
+        if out_dim % world_size != 0 {
+            return false;
+        }
+        let shard_dim = out_dim / world_size;
+        let bsize = self.block_size() as usize;
+        if bsize <= 1 {
+            return true;
+        }
+        shard_dim % bsize == 0
     }
 }
 
@@ -1673,19 +1693,20 @@ pub fn map_gguf_dtype_to_grim(gguf_dtype: GgufDType) -> (DType, Option<u32>) {
     let dtype = map_gguf_dtype_to_storage(gguf_dtype);
     let bpw = match gguf_dtype {
         GgufDType::F32 | GgufDType::F64 | GgufDType::I32 | GgufDType::I64 => None,
-        GgufDType::F16 | GgufDType::I16 => Some(16),
+        GgufDType::F16 | GgufDType::BF16 | GgufDType::I16 => Some(16),
         GgufDType::I8 => Some(8),
         GgufDType::Q4_0
         | GgufDType::Q4_1
         | GgufDType::Q4_2
         | GgufDType::Q4K
         | GgufDType::IQ4_NL
-        | GgufDType::IQ4_XS => Some(4),
+        | GgufDType::IQ4_XS
+        | GgufDType::MXFP4 => Some(4),
         GgufDType::Q5_0 | GgufDType::Q5_1 | GgufDType::Q5K => Some(5),
         GgufDType::Q6K => Some(6),
         GgufDType::Q2K | GgufDType::IQ2_XXS | GgufDType::IQ2_XS | GgufDType::IQ2_S => Some(2),
         GgufDType::Q3K | GgufDType::IQ3_XXS | GgufDType::IQ3_S => Some(3),
-        GgufDType::IQ1_S => Some(1),
+        GgufDType::IQ1_S | GgufDType::IQ1_M => Some(1),
         GgufDType::Q8_0 | GgufDType::Q8_1 | GgufDType::Q8_1Hx | GgufDType::Q8K => Some(8),
     };
     (dtype, bpw)
@@ -1718,6 +1739,8 @@ impl GgufDType {
                 | GgufDType::IQ2_XS
                 | GgufDType::IQ2_S
                 | GgufDType::IQ1_S
+                | GgufDType::IQ1_M
+                | GgufDType::MXFP4
         )
     }
 
@@ -1726,6 +1749,7 @@ impl GgufDType {
         match self {
             GgufDType::F32 => "F32",
             GgufDType::F16 => "F16",
+            GgufDType::BF16 => "BF16",
             GgufDType::F64 => "F64",
             GgufDType::I8 => "I8",
             GgufDType::I16 => "I16",
@@ -1753,6 +1777,8 @@ impl GgufDType {
             GgufDType::IQ2_XS => "IQ2_XS",
             GgufDType::IQ2_S => "IQ2_S",
             GgufDType::IQ1_S => "IQ1_S",
+            GgufDType::IQ1_M => "IQ1_M",
+            GgufDType::MXFP4 => "MXFP4",
         }
     }
 }

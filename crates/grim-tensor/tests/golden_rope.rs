@@ -26,8 +26,9 @@ fn test_rope_golden_mutation_resistant() {
     let x = cpu_tensor(x_data, Shape::new(vec![1, 2, 4]));
     let positions = vec![0u32, 1u32];
 
+    let rope_cfg = grim_tensor::RopeConfig::new(4, 10000.0);
     let (out_st, _) = dev
-        .rope(x.storage().as_ref(), &positions, 4, 10000.0, x.shape())
+        .rope(x.storage().as_ref(), &positions, &rope_cfg, x.shape())
         .expect("rope");
     let out_data = out_st.to_cpu_vec_f32().expect("to_cpu_vec_f32");
 

@@ -105,7 +105,9 @@ extern "C" __global__ void grim_qkv_attention(
     int seq_len,
     int kv_seq_len,
     int cache_offset,
-    float inv_sqrt_d
+    float inv_sqrt_d,
+    int window_lo       // sliding-window lower bound: max(0, abs_i - window + 1).
+                        // Pass 0 for full causal attention (no window).
 ) {
     const int i = blockIdx.x;             // query pos (0..seq_len)
     const int h = blockIdx.y;             // head idx
@@ -137,7 +139,8 @@ extern "C" __global__ void grim_qkv_attention(
     __shared__ float s_acc[8][256];
 
     const int hi = (abs_i < kv_seq_len) ? (abs_i + 1) : kv_seq_len;
-    const int range_len = hi;
+    const int lo = window_lo;             // 0 for full causal; >= 0 for SWA
+    const int range_len = hi - lo;        // may be 0 if lo >= hi (empty window)
 
     const int base = range_len / num_waves;
     const int rem  = range_len % num_waves;
@@ -152,11 +155,13 @@ extern "C" __global__ void grim_qkv_attention(
     const float* __restrict__ v_head = &v_tensor[kv_head * head_dim];
 
     for (int j = j_start; j < j_end; ++j) {
+        // j is an offset into [0, range_len); the real KV index is j + lo.
+        const int kj = j + lo;
         float score = 0.0f;
         #pragma unroll
         for (int dim = 0; dim < 256; ++dim) {
             if (dim < head_dim) {
-                score += q[q_offset + dim] * k_head[j * (num_kv_heads * head_dim) + dim];
+                score += q[q_offset + dim] * k_head[kj * (num_kv_heads * head_dim) + dim];
             }
         }
         score *= inv_sqrt_d;
@@ -170,7 +175,7 @@ extern "C" __global__ void grim_qkv_attention(
         for (int chunk = 0; chunk < 8; ++chunk) {
             int d = lane_id + chunk * wave_size;
             if (d < head_dim) {
-                out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_head[j * (num_kv_heads * head_dim) + d];
+                out_acc[chunk] = out_acc[chunk] * scale_old + scale_new * v_head[kj * (num_kv_heads * head_dim) + d];
             }
         }
     }
@@ -259,6 +264,71 @@ extern "C" __global__ void grim_rope(const float* x, const int* pos, float* out,
 
     out[i0] = v0 * cos_v - v1 * sin_v;
     out[i1] = v0 * sin_v + v1 * cos_v;
+}
+
+// Partial-rotary + YaRN kernel. Mirrors the ROCm `grim_rope_yarn` so the two
+// devices produce bit-identical results for the same input.
+//
+// CONTRACT:
+//   x        – [B, S, D] f32 input
+//   positions– [S] absolute token positions
+//   inv_freq – [rotary_half] pre-computed YaRN / plain inv-frequencies
+//   out      – [B, S, D] f32 output (non-rotary dims copied verbatim)
+//   b, s, d  – batch / seq / full head dim
+//   rotary_half – half of rotary_dim (= rotary_dim/2); dims [rotary_half, d)
+//               are NOT rotated (copied verbatim)
+//   mscale   – attention_factor (1.0 for plain RoPE; YaRN sets this)
+//
+// One thread per (batch, step, rotary-pair). Non-rotary dims are handled
+// by a second pass over the copy range [rotary_dim, d). The launch grid
+// (sized by the host) covers max(b*s*rotary_half, b*s*copy_len) threads so
+// both passes are handled in a single launch.
+extern "C" __global__ void grim_rope_yarn(
+    const float* __restrict__ x,
+    const unsigned int* __restrict__ positions,
+    const float* __restrict__ inv_freq,
+    float* __restrict__ out,
+    int b, int s, int d, int rotary_half, float mscale
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Pass 1: rotate the [0, rotary_half) pairs (interleaved layout: (2i, 2i+1)).
+    int total = b * s * rotary_half;
+    if (idx < total) {
+        int bi = idx / (s * rotary_half);
+        int rem = idx - bi * (s * rotary_half);
+        int si = rem / rotary_half;
+        int i  = rem - si * rotary_half;
+        float pos = (float)positions[si];
+        float val = pos * inv_freq[i];
+        float sin_val = sinf(val) * mscale;
+        float cos_val = cosf(val) * mscale;
+        int base_idx = (bi * s + si) * d;
+        int a_idx = base_idx + 2 * i;
+        int b_idx = base_idx + 2 * i + 1;
+        float x1 = x[a_idx];
+        float x2 = x[b_idx];
+        out[a_idx] = x1 * cos_val - x2 * sin_val;
+        out[b_idx] = x1 * sin_val + x2 * cos_val;
+    }
+
+    // Pass 2: copy the non-rotary dims [2*rotary_half, d) verbatim. The same
+    // thread pool is reused; threads with idx in [0, b*s*(d-2*rotary_half))
+    // handle the copy dimension. For full rotary (rotary_dim == d) copy_len
+    // is 0 and this pass is a no-op.
+    int copy_start = 2 * rotary_half;
+    int copy_len   = d - copy_start;
+    if (copy_len > 0) {
+        int total2 = b * s * copy_len;
+        if (idx < total2) {
+            int bi = idx / (s * copy_len);
+            int rem = idx - bi * (s * copy_len);
+            int si = rem / copy_len;
+            int ci = rem - si * copy_len;
+            int src_idx = (bi * s + si) * d + copy_start + ci;
+            out[src_idx] = x[src_idx];
+        }
+    }
 }
 
 

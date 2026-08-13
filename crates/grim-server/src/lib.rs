@@ -119,7 +119,7 @@ impl Drop for RequestCleanupGuard {
             return;
         }
         self.dropped = true;
-        if let Ok(mut engine) = self.state.engine.lock() {
+        if let Ok(mut engine) = self.state.engine.lock().or_else(|p| Ok::<_, ()>(p.into_inner())) {
             engine.finish_request(self.request_id);
         }
         // Remove the cancel token we registered so a stray reference doesn't
@@ -152,6 +152,15 @@ pub struct AppState {
     /// it embeds safely in `Arc<AppState>` shared across axum tasks with no
     /// interior locking — the registry is mutated only at load time.
     pub plugin_registry: Option<std::sync::Arc<grim_plugin::PluginRegistry>>,
+}
+
+impl AppState {
+    pub fn lock_engine(&self) -> std::sync::MutexGuard<'_, Engine> {
+        self.engine.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    pub fn lock_tokenizer(&self) -> std::sync::MutexGuard<'_, Option<grim_format::GgufTokenizer>> {
+        self.tokenizer.lock().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 /// Health-check endpoint.
@@ -658,7 +667,7 @@ async fn chat_completions(
         // try to resolve it from the local catalog and load its GGUF file.
         // If the model cannot be resolved, return 404 immediately so the user
         // gets a clear error instead of silently running a random toy model.
-        let mut engine = state.engine.lock().unwrap();
+        let mut engine = state.lock_engine();
         if !engine
             .loaded_models()
             .contains(&requested_model.to_string())
@@ -671,7 +680,7 @@ async fn chat_completions(
                         requested_model
                     );
                     if let Some(tok) = maybe_tokenizer {
-                        *state.tokenizer.lock().unwrap() = Some(tok);
+                        *state.lock_tokenizer() = Some(tok);
                     }
                 }
                 Err(e) => {
@@ -1060,8 +1069,9 @@ async fn chat_completions(
             .map(|m| m.config.context_length())
             .unwrap_or(0)
     };
-    let total_requested = prompt_tokens.len() + max_tokens as usize;
-    if model_context_length > 0 && total_requested > model_context_length as usize {
+    let context_limit = if model_context_length > 0 { model_context_length as usize } else { 8192 };
+    let total_requested = prompt_tokens.len().saturating_add(max_tokens as usize);
+    if total_requested > context_limit {
         return (
             StatusCode::BAD_REQUEST,
             Json({
@@ -1069,14 +1079,15 @@ async fn chat_completions(
                     ErrorCode::InvalidRequest,
                     format!(
                         "prompt ({} tokens) + max_tokens ({}) = {} tokens exceeds \
-                         model context length of {}. Reduce prompt length or max_tokens.",
+                         model context limit ({} tokens)",
                         prompt_tokens.len(),
                         max_tokens,
                         total_requested,
-                        model_context_length
+                        context_limit,
                     ),
                 );
-                body["error"]["context_length"] = serde_json::json!(model_context_length);
+                body["error"]["code"] = serde_json::json!("context_length_exceeded");
+                body["error"]["context_length"] = serde_json::json!(context_limit);
                 body["error"]["prompt_tokens"] = serde_json::json!(prompt_tokens.len());
                 body["error"]["max_tokens"] = serde_json::json!(max_tokens);
                 body["error"]["total_requested"] = serde_json::json!(total_requested);
@@ -3174,7 +3185,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
 
@@ -3238,7 +3252,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model(name, mock_model);
         Arc::new(AppState {
@@ -3484,7 +3501,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
 
@@ -3580,7 +3600,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
 
@@ -3652,7 +3675,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
 
@@ -3711,7 +3737,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
 
@@ -3767,7 +3796,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
 
@@ -3836,7 +3868,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
 
@@ -3891,7 +3926,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
 
@@ -3952,7 +3990,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
         let state = Arc::new(AppState {
@@ -4006,7 +4047,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
 
@@ -4111,7 +4155,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
 
@@ -4173,7 +4220,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
 
@@ -4240,7 +4290,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
 
@@ -4319,7 +4372,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
 
@@ -4393,7 +4449,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
 
@@ -4523,7 +4582,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
 
@@ -4593,7 +4655,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
 
@@ -4791,7 +4856,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            },
+            
+                partial_rotary_factor: 1.0,
+                yarn: None,
+        },
         ));
         engine.register_model("default", mock_model);
         let state = Arc::new(AppState {

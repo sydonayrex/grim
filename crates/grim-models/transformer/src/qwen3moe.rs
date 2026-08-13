@@ -80,6 +80,9 @@ impl Qwen3Moe {
             rms_norm_eps: cfg.rms_norm_eps,
             rope_theta: cfg.rope_theta,
             max_seq_len: cfg.max_seq_len,
+        
+            partial_rotary_factor: 1.0,
+            yarn: None,
         };
 
         // Qwen3-MoE routes every layer through the MoE block: softmax router,

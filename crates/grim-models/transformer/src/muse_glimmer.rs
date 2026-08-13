@@ -104,13 +104,24 @@ impl MuseGlimmerConfig {
         });
 
 
-        MuseGlimmerConfig {
-            vocab_size: u("vocab_size"),
-            hidden_size: u("hidden_size"),
-            num_heads: u("num_attention_heads"),
-            num_kv_heads: u("num_key_value_heads"),
-            head_dim: u("head_dim"),
-            num_layers: u("num_hidden_layers"),
+            let hidden_size = u("hidden_size");
+            let num_heads = u("num_attention_heads");
+            let raw_head_dim = u("head_dim");
+            let head_dim = if raw_head_dim > 0 {
+                raw_head_dim
+            } else if num_heads > 0 {
+                hidden_size / num_heads
+            } else {
+                64
+            };
+
+            MuseGlimmerConfig {
+                vocab_size: u("vocab_size"),
+                hidden_size,
+                num_heads,
+                num_kv_heads: u("num_key_value_heads"),
+                head_dim,
+                num_layers: u("num_hidden_layers"),
             intermediate_size: u("intermediate_size"),
             rms_norm_eps: f("rms_norm_eps"),
             per_layer_rope_theta: per_layer_rope,

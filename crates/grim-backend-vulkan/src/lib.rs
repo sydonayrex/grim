@@ -929,6 +929,11 @@ impl VulkanDevice {
     }
 
     /// Fused QKV attention compute shader dispatch on Vulkan GPU.
+    ///
+    /// When `window` is `Some(w)` the dedicated `QkvAttentionSwa` kernel is
+    /// dispatched with a host-computed `window_lo = max(0, cache_offset - w + 1)`
+    /// lower bound (matching the ROCm/CUDA convention); otherwise the plain
+    /// full-causal `QkvAttention` kernel runs.
     pub fn qkv_attention_inner(
         &self,
         q: &dyn BackendStorage,
@@ -940,6 +945,7 @@ impl VulkanDevice {
         out: &Shape,
         _out_max: Option<&dyn BackendStorage>,
         _out_sum: Option<&dyn BackendStorage>,
+        window: Option<usize>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let out_dims = out.dims();
         if out_dims.len() != 3 {
@@ -971,22 +977,60 @@ impl VulkanDevice {
         let out_storage =
             VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
-        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::QkvAttention).to_vec();
         let buffers = [q_s.buffer, k_s.buffer, v_s.buffer, out_storage.buffer];
         let total_work = (seq_len * num_heads) as u32;
         let grid_x = (total_work + 255) / 256;
 
         let inv_sqrt_d: f32 = 1.0 / (head_dim as f32).sqrt();
-        let push = push_params(
-            seq_len as u32,
-            head_dim as u32,
-            num_heads as u32,
-            num_kv_heads as u32,
-            cache_offset,
-            inv_sqrt_d,
-        );
 
-        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push))?;
+        if let Some(w) = window {
+            // Sliding-window: dispatch QkvAttentionSwa. window_lo is the
+            // block-minimum lower bound max(0, cache_offset - w + 1); the
+            // kernel's causal upper bound (min(abs_i+1, seq_len)) is unchanged.
+            let abs_first = cache_offset as usize;
+            let window_lo = abs_first.saturating_sub(w.saturating_sub(1)) as u32;
+            // 8 × u32 = 32 bytes Params block:
+            //   seq_len, head_dim, num_heads, num_kv_heads, cache_offset,
+            //   inv_sqrt_d(f32 bits), window_lo, has_window(=1)
+            let push: [u32; 8] = [
+                seq_len as u32,
+                head_dim as u32,
+                num_heads as u32,
+                num_kv_heads as u32,
+                cache_offset,
+                inv_sqrt_d.to_bits(),
+                window_lo,
+                1u32,
+            ];
+            run_compute_shader_kernel(
+                ctx,
+                VulkanKernel::QkvAttentionSwa,
+                &buffers,
+                grid_x,
+                1,
+                1,
+                Some(&push),
+            )?;
+        } else {
+            // Full causal attention.
+            let push = push_params(
+                seq_len as u32,
+                head_dim as u32,
+                num_heads as u32,
+                num_kv_heads as u32,
+                cache_offset,
+                inv_sqrt_d,
+            );
+            run_compute_shader_kernel(
+                ctx,
+                VulkanKernel::QkvAttention,
+                &buffers,
+                grid_x,
+                1,
+                1,
+                Some(&push),
+            )?;
+        }
 
         Ok((
             Box::new(out_storage),
@@ -2159,7 +2203,10 @@ impl BackendDevice for VulkanDevice {
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = window;
+        // `window == Some(w)` dispatches the dedicated `QkvAttentionSwa` kernel
+        // (host-computed `window_lo` lower bound); `None` runs the plain
+        // full-causal `QkvAttention` kernel. Both produce correct on-device
+        // output; no host fallback.
         self.qkv_attention_inner(
             q,
             k,
@@ -2170,6 +2217,7 @@ impl BackendDevice for VulkanDevice {
             out_shape,
             out_max,
             out_sum,
+            window,
         )
     }
 
@@ -2183,12 +2231,10 @@ impl BackendDevice for VulkanDevice {
         _max_blocks: usize,
         page_size: usize,
         kv_seq_len: usize,
-        _cache_offset: u32,
+        cache_offset: u32,
         window: Option<usize>,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = window;
-
         let out_dims = out_shape.dims();
         if out_dims.len() != 3 {
             return Err(Error::Shape(
@@ -2247,15 +2293,36 @@ impl BackendDevice for VulkanDevice {
             num_kv_heads as f32,
         );
         let grid_x = ((head_dim + 31) / 32) as u32;
-        run_compute_shader(
-            ctx,
-            spirv_for(VulkanKernel::QkvAttentionPaged),
-            &buffers,
-            grid_x,
-            num_heads as u32,
-            1,
-            Some(&push),
-        )?;
+
+        if let Some(w) = window {
+            // Sliding-window paged: dispatch QkvAttentionPagedSwa. window_lo is
+            // host-computed max(0, cache_offset - w + 1).
+            let abs_first = cache_offset as usize;
+            let window_lo = abs_first.saturating_sub(w.saturating_sub(1)) as u32;
+            // 8 × u32 = 32 bytes Params block: 6 base slots + window_lo + has_window(=1).
+            let swa_push: [u32; 8] = [
+                push[0], push[1], push[2], push[3], push[4], push[5], window_lo, 1u32,
+            ];
+            run_compute_shader_kernel(
+                ctx,
+                VulkanKernel::QkvAttentionPagedSwa,
+                &buffers,
+                grid_x,
+                num_heads as u32,
+                1,
+                Some(&swa_push),
+            )?;
+        } else {
+            run_compute_shader_kernel(
+                ctx,
+                VulkanKernel::QkvAttentionPaged,
+                &buffers,
+                grid_x,
+                num_heads as u32,
+                1,
+                Some(&push),
+            )?;
+        }
 
         Ok((
             Box::new(out_storage),
@@ -2533,11 +2600,9 @@ impl BackendDevice for VulkanDevice {
         cfg: &grim_tensor::RopeConfig,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-
         let dim = cfg.dim;
         let base = cfg.base;
         let x_s = x
-
             .as_any()
             .downcast_ref::<VulkanStorage>()
             .ok_or_else(|| Error::Backend("Vulkan rope x is not VulkanStorage".into()))?;
@@ -2581,13 +2646,75 @@ impl BackendDevice for VulkanDevice {
             vkUnmapMemory(ctx.device, pos_storage.memory);
         }
 
-        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Rope).to_vec();
         let buffers = [x_s.buffer, pos_storage.buffer, out_storage.buffer];
-        let total_pairs = (num_tokens * num_heads * (dim / 2)) as u32;
-        let grid_x = (total_pairs + 255) / 256;
 
-        let push = push_params(num_tokens as u32, dim as u32, num_heads as u32, 0, 0, base);
-        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push))?;
+        if !cfg.is_plain() {
+            // Partial-rotary / YaRN: dispatch the dedicated `RopeYarn` kernel.
+            // The YaRN frequency ramp + mscale are recomputed inside the shader
+            // from the push-constant scalars (no inv_freq buffer needed),
+            // numerically matching the CPU/HIP references.
+            let rotary_dim = cfg.rotary_dim.min(dim);
+            let rotary_half = rotary_dim / 2;
+            let (has_yarn, yarn_factor, yarn_orig_max, yarn_beta_fast, yarn_beta_slow, mscale) =
+                match cfg.yarn {
+                    Some(y) => (
+                        1u32,
+                        y.factor,
+                        y.original_max_pos as f32,
+                        y.beta_fast,
+                        y.beta_slow,
+                        y.attention_factor,
+                    ),
+                    None => (0u32, 1.0f32, 8192.0f32, 32.0f32, 1.0f32, 1.0f32),
+                };
+            // Params block (11 × u32 = 44 bytes):
+            //   num_tokens, head_dim, num_heads, rotary_dim, has_yarn,
+            //   base(f32 bits), yarn_factor, yarn_orig_max, yarn_beta_fast,
+            //   yarn_beta_slow, mscale
+            let push: [u32; 11] = [
+                num_tokens as u32,
+                dim as u32,
+                num_heads as u32,
+                rotary_dim as u32,
+                has_yarn,
+                base.to_bits(),
+                yarn_factor.to_bits(),
+                yarn_orig_max.to_bits(),
+                yarn_beta_fast.to_bits(),
+                yarn_beta_slow.to_bits(),
+                mscale.to_bits(),
+            ];
+            // Grid covers max(num_tokens*num_heads*rotary_half, *copy_len) for
+            // both the rotate pass and the verbatim-tail copy pass.
+            let copy_len = dim - 2 * rotary_half;
+            let total = (num_tokens * num_heads
+                * rotary_half.max(if copy_len > 0 { copy_len } else { 0 }).max(1))
+                as u32;
+            let grid_x = (total + 255) / 256;
+            run_compute_shader_kernel(
+                ctx,
+                VulkanKernel::RopeYarn,
+                &buffers,
+                grid_x,
+                1,
+                1,
+                Some(&push),
+            )?;
+        } else {
+            // Plain full-rotary RoPE.
+            let total_pairs = (num_tokens * num_heads * (dim / 2)) as u32;
+            let grid_x = (total_pairs + 255) / 256;
+            let push = push_params(num_tokens as u32, dim as u32, num_heads as u32, 0, 0, base);
+            run_compute_shader_kernel(
+                ctx,
+                VulkanKernel::Rope,
+                &buffers,
+                grid_x,
+                1,
+                1,
+                Some(&push),
+            )?;
+        }
 
         Ok((
             Box::new(out_storage),
@@ -3633,10 +3760,17 @@ pub enum VulkanKernel {
     Matmul32,
     Matmul64Bf16,
     QkvAttention,
+    /// QKV attention with sliding-window (SWA) lower-bound support
+    /// (`window_lo` push-constant). Same 4-binding layout as `QkvAttention`.
+    QkvAttentionSwa,
     MulScalar,
     Sqrt,
     Recip,
     Rope,
+    /// Partial-rotary + YaRN RoPE. Same 3-binding layout as `Rope`; the YaRN
+    /// ramp + `mscale` are recomputed inside the shader from push-constant
+    /// scalars so no `inv_freq` buffer is needed.
+    RopeYarn,
     FusedDequantGemmQ4K,
     FusedDequantGemmQ5K,
     FusedDequantGemmQ6K,
@@ -3653,6 +3787,9 @@ pub enum VulkanKernel {
     KvDequantAttention,
     SelectiveScan,
     QkvAttentionPaged,
+    /// Paged QKV attention with sliding-window (SWA) lower-bound support.
+    /// Same 5-binding layout as `QkvAttentionPaged`.
+    QkvAttentionPagedSwa,
     TreeAttention,
     FlashAttention,
     SiluMulBackward,
@@ -3684,10 +3821,12 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::Matmul32 => SPIRV_MATMUL_32,
         VulkanKernel::Matmul64Bf16 => SPIRV_MATMUL_64_BF16,
         VulkanKernel::QkvAttention => SPIRV_QKV_ATTENTION,
+        VulkanKernel::QkvAttentionSwa => SPIRV_QKV_ATTENTION_SWA,
         VulkanKernel::MulScalar => SPIRV_MUL_SCALAR,
         VulkanKernel::Sqrt => SPIRV_SQRT,
         VulkanKernel::Recip => SPIRV_RECIP,
         VulkanKernel::Rope => SPIRV_ROPE,
+        VulkanKernel::RopeYarn => SPIRV_ROPE_YARN,
         VulkanKernel::FusedDequantGemmQ4K => SPIRV_FUSED_DEQUANT_GEMM_Q4K,
         VulkanKernel::FusedDequantGemmQ5K => SPIRV_FUSED_DEQUANT_GEMM_Q5K,
         VulkanKernel::FusedDequantGemmQ6K => SPIRV_FUSED_DEQUANT_GEMM_Q6K,
@@ -3704,6 +3843,7 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::KvDequantAttention => SPIRV_KV_DEQUANT_ATTENTION,
         VulkanKernel::SelectiveScan => SPIRV_SELECTIVE_SCAN,
         VulkanKernel::QkvAttentionPaged => SPIRV_QKV_ATTENTION_PAGED,
+        VulkanKernel::QkvAttentionPagedSwa => SPIRV_QKV_ATTENTION_PAGED_SWA,
         VulkanKernel::TreeAttention => SPIRV_TREE_ATTENTION,
         VulkanKernel::FlashAttention => SPIRV_FLASH_ATTENTION,
         VulkanKernel::SiluMulBackward => SPIRV_SILU_MUL_BACKWARD,
@@ -3742,6 +3882,7 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::Matmul32
         | VulkanKernel::Matmul64Bf16
         | VulkanKernel::Rope
+        | VulkanKernel::RopeYarn
         | VulkanKernel::FusedDequantGemmQ4K
         | VulkanKernel::FusedDequantGemmQ5K
         | VulkanKernel::FusedDequantGemmQ6K
@@ -3758,8 +3899,12 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::FusedQuantGemmQ80
         | VulkanKernel::FusedQuantGemmFp8
         | VulkanKernel::SiluMulBackward => 3,
-        VulkanKernel::QkvAttention | VulkanKernel::FlashAttention | VulkanKernel::RwkvTimeMix => 4,
+        VulkanKernel::QkvAttention
+        | VulkanKernel::QkvAttentionSwa
+        | VulkanKernel::FlashAttention
+        | VulkanKernel::RwkvTimeMix => 4,
         VulkanKernel::QkvAttentionPaged
+        | VulkanKernel::QkvAttentionPagedSwa
         | VulkanKernel::TreeAttention
         | VulkanKernel::QuantizedMatmulBackwardDx
         | VulkanKernel::QuantizedMatmulBackwardDxQ8_0 => 5,
@@ -4160,6 +4305,23 @@ mod tests {
         );
     }
 
+    /// Source-presence guard for the partial-rotary/YaRN RoPE and the
+    /// sliding-window attention kernels. No GPU required — asserts the SPIR-V
+    /// blobs compiled (build.rs emits a `SPIRV_*` const only on successful
+    /// glslangValidator compilation) and the enum/binding tables are wired.
+    #[test]
+    fn yarn_and_swa_kernel_presence() {
+        // If build.rs failed to compile any of these, the `SPIRV_*` const would
+        // be absent and `spirv_for` would fail to compile — so merely
+        // referencing them is the presence test.
+        let _ = spirv_for(VulkanKernel::RopeYarn);
+        let _ = spirv_for(VulkanKernel::QkvAttentionSwa);
+        let _ = spirv_for(VulkanKernel::QkvAttentionPagedSwa);
+        assert_eq!(binding_count(VulkanKernel::RopeYarn), 3);
+        assert_eq!(binding_count(VulkanKernel::QkvAttentionSwa), 4);
+        assert_eq!(binding_count(VulkanKernel::QkvAttentionPagedSwa), 5);
+    }
+
     #[test]
     fn test_vulkan_add_golden_exact() {
         if GLOBAL_CONTEXT.lock().unwrap().is_none() {
@@ -4351,6 +4513,7 @@ mod tests {
                 num_kv_heads,
                 kv_seq_len,
                 0,
+                None,
                 &out_shape,
                 None,
                 None,
@@ -4396,6 +4559,7 @@ mod tests {
                 2,
                 2,
                 0,
+                None,
                 &q_shape,
             )
             .unwrap();

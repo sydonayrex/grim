@@ -82,6 +82,8 @@ struct MetalPipelines {
     sqrt: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     recip: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     rope: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// Partial-rotary + YaRN RoPE (`grim_rope_yarn`).
+    rope_yarn: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     quantized_matmul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     residualpacked_matmul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     quantized_matmul_backward: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -229,6 +231,7 @@ impl MetalContext {
                 sqrt: get_pipeline("grim_sqrt")?,
                 recip: get_pipeline("grim_recip")?,
                 rope: get_pipeline("grim_rope")?,
+                rope_yarn: get_pipeline("grim_rope_yarn")?,
                 quantized_matmul: get_pipeline("grim_quantized_matmul_q8_0")?,
                 residualpacked_matmul: get_pipeline("grim_quantized_matmul_residualpacked")?,
                 quantized_matmul_backward: get_pipeline("grim_quantized_matmul_backward_q8_0")?,
@@ -1468,9 +1471,9 @@ impl BackendDevice for MetalDevice {
                         n as i32,
                         k as i32,
                         1.0,
-                        a.as_ptr() as *const f32,
+                        a_vec.as_ptr(),
                         k as i32,
-                        b.as_ptr() as *const f32,
+                        b_vec.as_ptr(),
                         n as i32,
                         0.0,
                         c_vec.as_mut_ptr(),
@@ -2406,10 +2409,13 @@ impl BackendDevice for MetalDevice {
         max_blocks: usize,
         page_size: usize,
         kv_seq_len: usize,
-        _cache_offset: u32,
+        cache_offset: u32,
         window: Option<usize>,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        // The Metal `grim_qkv_attention_paged` kernel accepts a `window_lo` +
+        // `has_window` argument pair; SWA layers compute the lower bound
+        // host-side and the kernel masks below it. No host fallback needed.
 
         #[cfg(target_vendor = "apple")]
         if let Some(ref inner) = self.inner {
@@ -2474,6 +2480,13 @@ impl BackendDevice for MetalDevice {
             encoder.setBuffer_offset_atIndex(Some(v_buf), 0, 2);
             encoder.setBuffer_offset_atIndex(Some(table_buf), 0, 3);
             encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 4);
+            // SWA: window_lo = max(0, cache_offset - window + 1).
+            let abs_first = cache_offset as usize;
+            let window_lo_val: i32 = match window {
+                Some(w) => abs_first.saturating_sub(w.saturating_sub(1)) as i32,
+                None => 0,
+            };
+            let has_window_val: i32 = if window.is_some() { 1 } else { 0 };
             let vals = [
                 dims[0] as i32,
                 dims[1] as i32,
@@ -2482,6 +2495,8 @@ impl BackendDevice for MetalDevice {
                 max_blocks as i32,
                 kv_seq_len as i32,
                 num_kv_heads as i32,
+                window_lo_val,
+                has_window_val,
             ];
             unsafe {
                 for (i, value) in vals.iter().enumerate() {
@@ -2686,7 +2701,6 @@ impl BackendDevice for MetalDevice {
         cfg: &grim_tensor::RopeConfig,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-
         let dim = cfg.dim;
         let base = cfg.base;
         #[cfg(target_vendor = "apple")]
@@ -2737,15 +2751,91 @@ impl BackendDevice for MetalDevice {
                     Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
                 })?;
 
-                encoder.setComputePipelineState(&inner.pipelines.rope);
-                encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(&pos_buf), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
-
                 let num_tokens_val = num_tokens as i32;
                 let num_heads_val = num_heads;
                 let head_dim_val = head_dim;
                 let base_val = base;
+
+                if !cfg.is_plain() {
+                    // Partial-rotary / YaRN: dispatch grim_rope_yarn. The YaRN
+                    // ramp + mscale are recomputed inside the kernel.
+                    let rotary_dim = cfg.rotary_dim.min(dim) as i32;
+                    let rotary_half = (rotary_dim / 2) as usize;
+                    let (has_yarn, yarn_factor, yarn_orig_max, yarn_beta_fast, yarn_beta_slow, mscale) =
+                        match cfg.yarn {
+                            Some(y) => (
+                                1i32,
+                                y.factor,
+                                y.original_max_pos as f32,
+                                y.beta_fast,
+                                y.beta_slow,
+                                y.attention_factor,
+                            ),
+                            None => (0i32, 1.0f32, 8192.0f32, 32.0f32, 1.0f32, 1.0f32),
+                        };
+                    encoder.setComputePipelineState(&inner.pipelines.rope_yarn);
+                    encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(&pos_buf), 0, 1);
+                    encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
+                    // Scalar buffers 3..14.
+                    unsafe {
+                        encoder.setBytes_length_atIndex(
+                            &num_tokens_val as *const i32 as *const std::ffi::c_void, 4, 3,
+                        );
+                        encoder.setBytes_length_atIndex(
+                            &num_heads_val as *const i32 as *const std::ffi::c_void, 4, 4,
+                        );
+                        encoder.setBytes_length_atIndex(
+                            &head_dim_val as *const i32 as *const std::ffi::c_void, 4, 5,
+                        );
+                        encoder.setBytes_length_atIndex(
+                            &rotary_dim as *const i32 as *const std::ffi::c_void, 4, 6,
+                        );
+                        encoder.setBytes_length_atIndex(
+                            &has_yarn as *const i32 as *const std::ffi::c_void, 4, 7,
+                        );
+                        encoder.setBytes_length_atIndex(
+                            &base_val as *const f32 as *const std::ffi::c_void, 4, 8,
+                        );
+                        encoder.setBytes_length_atIndex(
+                            &yarn_factor as *const f32 as *const std::ffi::c_void, 4, 9,
+                        );
+                        encoder.setBytes_length_atIndex(
+                            &yarn_orig_max as *const f32 as *const std::ffi::c_void, 4, 10,
+                        );
+                        encoder.setBytes_length_atIndex(
+                            &yarn_beta_fast as *const f32 as *const std::ffi::c_void, 4, 11,
+                        );
+                        encoder.setBytes_length_atIndex(
+                            &yarn_beta_slow as *const f32 as *const std::ffi::c_void, 4, 12,
+                        );
+                        encoder.setBytes_length_atIndex(
+                            &mscale as *const f32 as *const std::ffi::c_void, 4, 13,
+                        );
+                    }
+                    // Grid covers max(num_tokens*num_heads*rotary_half, *copy_len).
+                    let copy_len = dim - 2 * rotary_half;
+                    let total_pairs = (num_tokens
+                        * num_heads as usize
+                        * rotary_half.max(if copy_len > 0 { copy_len } else { 0 }).max(1))
+                    as u64;
+                    let threads_per_group = MTLSize::new(256, 1, 1);
+                    let groups = MTLSize::new(((total_pairs + 255) / 256), 1, 1);
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
+                    encoder.endEncoding();
+                    return Ok((
+                        out_storage,
+                        Box::new(MetalHandle {
+                            command_buffer: cmd_buffer,
+                        }),
+                    ));
+                }
+
+                // Plain full-rotary RoPE.
+                encoder.setComputePipelineState(&inner.pipelines.rope);
+                encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&pos_buf), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 2);
 
                 unsafe {
                     encoder.setBytes_length_atIndex(
@@ -2786,7 +2876,14 @@ impl BackendDevice for MetalDevice {
             }
         }
 
-        // CPU fallback: non-Apple target or Metal unavailable.
+        // CPU fallback: non-Apple target or Metal unavailable. Plain RoPE only;
+        // refuse non-plain configs so the block-level CPU Rope::forward runs.
+        if !cfg.is_plain() {
+            return Err(Error::Unimplemented(
+                "Metal rope: partial-rotary / YaRN not available on non-Apple CPU fallback; falling back to CPU rope module"
+                    .into(),
+            ));
+        }
         let x_vec = x.to_cpu_vec_f32()?;
         let num_tokens = positions.len();
         let num_heads = out_shape.elem_count() / (num_tokens * dim);
@@ -3874,7 +3971,12 @@ impl MetalDevice {
         out_max: Option<&dyn BackendStorage>,
         out_sum: Option<&dyn BackendStorage>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = window;
+        // The Metal `grim_qkv_attention` kernel accepts a `window_lo` +
+        // `has_window` argument pair; SWA layers compute the lower bound
+        // host-side and the kernel masks below it. No host fallback needed.
+        // (On non-Apple targets the Apple dispatch block is cfg'd out, so
+        // reference `window` here to keep the binding live.)
+        let _ = &window;
 
         let out_dims = out.dims();
         if out_dims.len() != 3 {
@@ -4009,6 +4111,24 @@ impl MetalDevice {
                         &inv_sqrt_d_val as *const f32 as *const std::ffi::c_void,
                         4,
                         12,
+                    );
+                    // SWA: window_lo = max(0, cache_offset - window + 1);
+                    // has_window = window.is_some().
+                    let abs_first = cache_offset as usize;
+                    let window_lo_val: i32 = match window {
+                        Some(w) => abs_first.saturating_sub(w.saturating_sub(1)) as i32,
+                        None => 0,
+                    };
+                    let has_window_val: i32 = if window.is_some() { 1 } else { 0 };
+                    encoder.setBytes_length_atIndex(
+                        &window_lo_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        13,
+                    );
+                    encoder.setBytes_length_atIndex(
+                        &has_window_val as *const i32 as *const std::ffi::c_void,
+                        4,
+                        14,
                     );
                 }
 
@@ -4729,6 +4849,7 @@ mod tests {
                 2,
                 1,
                 0,
+                None,
                 &out_shape,
                 None,
                 None,

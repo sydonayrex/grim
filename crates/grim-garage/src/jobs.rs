@@ -974,7 +974,10 @@ fn load_rank_model_from_provider(
         rms_norm_eps: hparams.rms_norm_eps,
         rope_theta: hparams.rope_theta,
         max_seq_len: hparams.max_seq_len,
-    };
+    
+        partial_rotary_factor: 1.0,
+        yarn: None,
+        };
     Ok((
         provider,
         tok_embeddings,
