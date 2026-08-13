@@ -22,6 +22,152 @@ pub struct KernelKey {
     pub k: usize,
 }
 
+/// Coarse key hierarchy for kernel compilation (excludes fast-changing dimensions like batch/seq_len).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CompileKey {
+    pub kernel: String,
+    pub gpu_arch: String,
+    pub shape_class: ShapeClass,
+    pub features: FeatureSet,
+}
+
+/// Fine-grained key hierarchy for exact launch tuning.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TuneKey {
+    pub compile_key: CompileKey,
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+}
+
+/// Broad category of tensor dimension shapes (e.g., Decode vs Prefill).
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ShapeClass {
+    Decode,  // m == 1
+    Prefill, // m > 1
+}
+
+impl ShapeClass {
+    pub fn from_m(m: usize) -> Self {
+        if m == 1 {
+            Self::Decode
+        } else {
+            Self::Prefill
+        }
+    }
+}
+
+/// Hardware features and instruction sets required by a kernel configuration.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FeatureSet {
+    pub requires_wmma: bool,
+    pub requires_fp8_mfma: bool,
+}
+
+impl FeatureSet {
+    pub fn scalar() -> Self {
+        Self {
+            requires_wmma: false,
+            requires_fp8_mfma: false,
+        }
+    }
+
+    pub fn wmma() -> Self {
+        Self {
+            requires_wmma: true,
+            requires_fp8_mfma: false,
+        }
+    }
+
+    pub fn fp8_mfma() -> Self {
+        Self {
+            requires_wmma: true,
+            requires_fp8_mfma: true,
+        }
+    }
+
+    /// Check if target GPU architecture supports this feature set.
+    pub fn supported_on(&self, arch: &str) -> bool {
+        let is_gfx11 = arch.starts_with("gfx11");
+        let is_gfx12 = arch.starts_with("gfx12");
+
+        if self.requires_fp8_mfma {
+            return is_gfx12;
+        }
+        if self.requires_wmma {
+            return is_gfx11 || is_gfx12;
+        }
+        true
+    }
+}
+
+/// Detailed candidate launch configuration for ROCm kernels.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LaunchConfig {
+    pub block_m: u32,
+    pub block_n: u32,
+    pub block_k: u32,
+    pub split_k: u32,
+    pub threads: u32,
+}
+
+impl LaunchConfig {
+    /// Calculate static shared memory (LDS) requirements in bytes for this configuration.
+    pub fn smem_cost(&self, bytes_per_elem: u32) -> u32 {
+        (self.block_m * self.block_k + self.block_k * self.block_n) * bytes_per_elem
+    }
+
+    /// Check if config violates LDS capacity or hardware constraints.
+    pub fn is_valid(&self, arch: &str, device_smem_limit: u32, bytes_per_elem: u32) -> bool {
+        if self.smem_cost(bytes_per_elem) > device_smem_limit {
+            return false;
+        }
+        // Mutual exclusion: small block_m with high split_k causes excessive synchronization overhead
+        if self.block_m <= 8 && self.split_k > 4 {
+            return false;
+        }
+        // Thread block size must be multiple of wave size (32/64)
+        if self.threads % 32 != 0 || self.threads == 0 {
+            return false;
+        }
+        let _ = arch;
+        true
+    }
+}
+
+/// Candidate generator for Charon (fused MoE grouped GEMM) scalar path.
+pub fn charon_scalar_candidates(arch: &str, device_smem_limit: u32) -> Vec<LaunchConfig> {
+    let mut candidates = Vec::new();
+    let block_m_opts = [8, 16, 32, 64];
+    let block_n_opts = [32, 64, 128];
+    let block_k_opts = [32, 64];
+    let split_k_opts = [1, 2, 4];
+    let threads_opts = [64, 128, 256];
+
+    for &bm in &block_m_opts {
+        for &bn in &block_n_opts {
+            for &bk in &block_k_opts {
+                for &sk in &split_k_opts {
+                    for &t in &threads_opts {
+                        let cfg = LaunchConfig {
+                            block_m: bm,
+                            block_n: bn,
+                            block_k: bk,
+                            split_k: sk,
+                            threads: t,
+                        };
+                        if cfg.is_valid(arch, device_smem_limit, 2) {
+                            candidates.push(cfg);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    candidates
+}
+
+
 /// Tuned launch parameters for a `(kernel, arch, shape)` slot. [see: `block_dim`, `rocm-hip-kernels`, `tile_kv`, `grid_stride`]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutotuneConfig {
@@ -331,4 +477,86 @@ impl Autotuner {
         Ok(t)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shape_class_from_m() {
+        assert_eq!(ShapeClass::from_m(1), ShapeClass::Decode);
+        assert_eq!(ShapeClass::from_m(2), ShapeClass::Prefill);
+        assert_eq!(ShapeClass::from_m(128), ShapeClass::Prefill);
+    }
+
+    #[test]
+    fn test_feature_set_supported_on() {
+        let scalar = FeatureSet::scalar();
+        let wmma = FeatureSet::wmma();
+        let fp8_mfma = FeatureSet::fp8_mfma();
+
+        // GFX1036 (RDNA2) supports scalar, but NOT WMMA or FP8 MFMA
+        assert!(scalar.supported_on("gfx1036"));
+        assert!(!wmma.supported_on("gfx1036"));
+        assert!(!fp8_mfma.supported_on("gfx1036"));
+
+        // GFX1100 (RDNA3) supports scalar and WMMA, but NOT FP8 MFMA
+        assert!(scalar.supported_on("gfx1100"));
+        assert!(wmma.supported_on("gfx1100"));
+        assert!(!fp8_mfma.supported_on("gfx1100"));
+
+        // GFX1200 (CDNA3/RDNA4) supports scalar, WMMA, and FP8 MFMA
+        assert!(scalar.supported_on("gfx1200"));
+        assert!(wmma.supported_on("gfx1200"));
+        assert!(fp8_mfma.supported_on("gfx1200"));
+    }
+
+    #[test]
+    fn test_launch_config_pruning() {
+        let arch = "gfx1036";
+        let smem_limit = 65536; // 64 KiB
+
+        // Valid config: small LDS, acceptable split_k
+        let valid = LaunchConfig {
+            block_m: 16,
+            block_n: 64,
+            block_k: 32,
+            split_k: 1,
+            threads: 128,
+        };
+        assert!(valid.is_valid(arch, smem_limit, 2));
+
+        // Invalid config: LDS memory exceeds capacity limit
+        let smem_overflow = LaunchConfig {
+            block_m: 128,
+            block_n: 128,
+            block_k: 256, // Requires (128*256 + 256*128)*2 = 131,072 bytes > 64 KiB
+            split_k: 1,
+            threads: 256,
+        };
+        assert!(!smem_overflow.is_valid(arch, smem_limit, 2));
+
+        // Invalid config: Mutual exclusion (block_m <= 8 with split_k > 4)
+        let mutual_excl = LaunchConfig {
+            block_m: 8,
+            block_n: 64,
+            block_k: 32,
+            split_k: 8,
+            threads: 64,
+        };
+        assert!(!mutual_excl.is_valid(arch, smem_limit, 2));
+    }
+
+    #[test]
+    fn test_charon_scalar_candidates_generation() {
+        let candidates = charon_scalar_candidates("gfx1036", 65536);
+        assert!(!candidates.is_empty(), "charon candidates generated should be non-empty");
+
+        for cfg in &candidates {
+            assert!(cfg.is_valid("gfx1036", 65536, 2));
+            assert!(cfg.smem_cost(2) <= 65536);
+        }
+    }
+}
+
 

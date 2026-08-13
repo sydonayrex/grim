@@ -175,6 +175,14 @@ unsafe extern "C" {
     pub fn hipStreamBeginCapture(stream: *mut c_void, mode: u32) -> HipErrorT;
     pub fn hipStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> HipErrorT;
 
+    // Event FFI for autotune benchmarking
+    pub fn hipEventCreate(event: *mut *mut c_void) -> HipErrorT;
+    pub fn hipEventDestroy(event: *mut c_void) -> HipErrorT;
+    pub fn hipEventRecord(event: *mut c_void, stream: *mut c_void) -> HipErrorT;
+    pub fn hipEventSynchronize(event: *mut c_void) -> HipErrorT;
+    pub fn hipEventElapsedTime(ms: *mut f32, start: *mut c_void, stop: *mut c_void) -> HipErrorT;
+
+
     pub fn hipModuleLoad(module: *mut *mut c_void, path: *const i8) -> HipErrorT;
     pub fn hipModuleUnload(module: *mut c_void) -> HipErrorT;
     pub fn hipModuleGetFunction(
