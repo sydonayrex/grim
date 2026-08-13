@@ -763,7 +763,7 @@ async fn chat_completions(
     // established "reject before generating" status) rather than introducing a
     // 413 — see the spec's reasoning for that convention.
     {
-        let engine = state.engine.lock().unwrap();
+        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         let max_messages = engine.config.max_messages_per_request;
         if let Some(arr) = body_obj.get("messages").and_then(|v| v.as_array()) {
             if arr.len() > max_messages {
@@ -793,7 +793,7 @@ async fn chat_completions(
     // non-deterministic output would be a silent correctness bug.
     if let Some(det) = body_obj.get("determinism").and_then(|v| v.as_str()) {
         if det == "strict" {
-            let engine = state.engine.lock().unwrap();
+            let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
             if engine.config.determinism_mode == DeterminismMode::Relaxed {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -832,7 +832,7 @@ async fn chat_completions(
 
     // Validate all requested adapters exist before starting the stream.
     {
-        let engine = state.engine.lock().unwrap();
+        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         for name in &adapter_names {
             if engine.get_adapter_by_name(name).is_none() {
                 return (
@@ -1002,7 +1002,7 @@ async fn chat_completions(
     // model template that shapes the prompt also selects the extraction
     // convention for its own tool-call output.
     let (prompt_text, template_family) = {
-        let tok = state.tokenizer.lock().unwrap();
+        let tok = state.tokenizer.lock().unwrap_or_else(|e| e.into_inner());
         match tok.as_ref() {
             Some(t) if tools_active => {
                 let family = t.chat_template.clone();
@@ -1025,7 +1025,7 @@ async fn chat_completions(
         }
     };
     let prompt_tokens: Vec<u32> = {
-        let tok = state.tokenizer.lock().unwrap();
+        let tok = state.tokenizer.lock().unwrap_or_else(|e| e.into_inner());
         let tokens = tok
             .as_ref()
             .map(|t| t.encode(&prompt_text))
@@ -1060,7 +1060,7 @@ async fn chat_completions(
     // context_length. Models that don't report context_length (return 0)
     // fall back to a best-effort warning for obviously excessive lengths.
     let model_context_length = {
-        let engine = state.engine.lock().unwrap();
+        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         engine
             .loaded_models()
             .iter()
@@ -1109,7 +1109,7 @@ async fn chat_completions(
     if stream_requested {
         let state_clone = state.clone();
         let adapter_ids: Vec<u32> = {
-            let engine = state.engine.lock().unwrap();
+            let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
             adapter_names
                 .iter()
                 .filter_map(|name| engine.get_adapter_by_name(name).map(|a| a.handle.id))
@@ -1275,7 +1275,7 @@ async fn chat_completions(
 
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-                    let tokenizer = state.tokenizer.lock().unwrap().clone();
+                    let tokenizer = state.tokenizer.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     let token_text = if let Some(tok) = &tokenizer {
                         tok.decode(&[token_id])
                     } else {
@@ -1365,14 +1365,14 @@ async fn chat_completions(
         let mut content = String::new();
         let request_id = REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
         let _adapter_ids: Vec<u32> = {
-            let engine = state.engine.lock().unwrap();
+            let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
             adapter_names
                 .iter()
                 .filter_map(|name| engine.get_adapter_by_name(name).map(|a| a.handle.id))
                 .collect()
         };
 
-        let tokenizer = state.tokenizer.lock().unwrap().clone();
+        let tokenizer = state.tokenizer.lock().unwrap_or_else(|e| e.into_inner()).clone();
         // Tokenize the prompt once for prefill (rendered from messages above)
         let prompt_tokens = prompt_tokens.clone();
         // Honor `max_tokens` (was a hardcoded 5) and stop sequences.
@@ -1458,7 +1458,7 @@ async fn chat_completions(
         };
 
         {
-            let mut engine = state.engine.lock().unwrap();
+            let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
             engine.finish_request(request_id);
         }
 
@@ -1505,7 +1505,7 @@ async fn chat_completions(
                 // cumulative count past the engine-config cap, reject with 400
                 // (hard threshold only — no soft tier, per the spec's rationale).
                 {
-                    let engine = state.engine.lock().unwrap();
+                    let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
                     let max_tool_calls = engine.config.max_tool_calls_per_conversation;
                     let total_prior = tool_parse::count_total_prior_tool_calls(&messages);
                     let total_with_new = total_prior + calls.len();
@@ -1545,7 +1545,7 @@ async fn chat_completions(
         // cases). Idempotent per the audit: retain-based queue removal and
         // refcount-decrement rollback are no-ops if state is already gone.
         {
-            let mut engine = state.engine.lock().unwrap();
+            let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
             engine.finish_request(request_id);
         }
         // WI-2: echo back exactly the model name the client requested, per
@@ -1858,7 +1858,7 @@ async fn grpc_service_handler() -> (StatusCode, &'static str) {
 
 /// Telemetry metrics endpoint (§8)
 async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let engine = state.engine.lock().unwrap();
+    let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
 
     // Probe actual ROCm hardware rather than reporting hardcoded values.
     // §13.1: we verify the actual state rather than assuming the reported state.
@@ -1928,7 +1928,7 @@ async fn load_model(
     // the same lookup logic as the CLI's on-demand model loader.
     let resolved_path = grim_core::catalog::resolve_model_preferring_grim(&req.model);
 
-    let mut engine = state.engine.lock().unwrap();
+    let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
     let device = grim_tensor::Device::Cpu;
 
     let model_path = match resolved_path {
@@ -1983,7 +1983,7 @@ async fn load_model(
                         .to_str()
                         .and_then(|gg| GgufProvider::open(gg).ok().and_then(|p| p.tokenizer().ok()))
                 });
-            *state.tokenizer.lock().unwrap() = tokenizer;
+            *state.tokenizer.lock().unwrap_or_else(|e| e.into_inner()) = tokenizer;
             engine.register_model(&req.model, m);
             (
                 StatusCode::OK,
@@ -2018,7 +2018,7 @@ async fn unload_model(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UnloadModelRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let mut engine = state.engine.lock().unwrap();
+    let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
     let unloaded = engine.unload_model(&req.model);
     if unloaded {
         (
@@ -2067,7 +2067,7 @@ fn get_default_model_from_config() -> Option<String> {
 
 /// Status / metrics endpoint displaying processor and active model allocations.
 async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let engine = state.engine.lock().unwrap();
+    let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
     let models = engine.loaded_models();
 
     // Probe VRAM via platform-specific backend
@@ -2234,7 +2234,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
 
     // 2. Add any models that are currently loaded in the engine (may not be on disk).
     {
-        let engine = state.engine.lock().unwrap();
+        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         for name in engine.loaded_models() {
             if seen.insert(name.clone()) {
                 entries.push(serde_json::json!({
@@ -3019,7 +3019,7 @@ pub async fn serve(
     });
 
     // Capability-based routing verification at server startup (§8)
-    if let Err(e) = validate_model_capabilities(&state.engine.lock().unwrap(), "default", "text") {
+    if let Err(e) = validate_model_capabilities(&state.engine.lock().unwrap_or_else(|e| e.into_inner()), "default", "text") {
         eprintln!("[Server] Model capability check failed: {e}");
     }
 
@@ -4832,7 +4832,7 @@ mod tests {
         assert_eq!(val["state"], "cancelled");
 
         // Engine state must be cleaned up.
-        let engine = state.engine.lock().unwrap();
+        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         assert!(!engine.scheduler.running.iter().any(|r| r.id == 7));
         assert!(engine.sessions.get(&7).is_none());
     }
@@ -4893,7 +4893,7 @@ mod tests {
 
         // After completion, the scheduler must have no running requests and
         // no per-request state entries left behind.
-        let engine = state.engine.lock().unwrap();
+        let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
         assert!(engine.scheduler.running.is_empty());
         assert!(engine.sessions.is_empty());
         assert!(engine.last_outcomes.is_empty());
@@ -5059,7 +5059,7 @@ fn probe_cuda_vram(cuda_gpu_count: usize) -> (u64, u64, Vec<serde_json::Value>) 
 }
 
 async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let engine = state.engine.lock().unwrap();
+    let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
     let models = engine.loaded_models();
     let model_name = models
         .first()

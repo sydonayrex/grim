@@ -609,6 +609,29 @@ where
                     if header.block_id < guard.num_blocks() as u64 {
                         let block_id = header.block_id as usize;
                         let elem_per_token = guard.block_elem_per_token();
+                        // The sender computed `num_elems` using its OWN pool's
+                        // `block_elem_per_token()`. If that differs from this
+                        // receiver's value, the token count derived below is
+                        // wrong. Detect the mismatch (a sender/receiver
+                        // `elem_per_token` disagreement makes `num_elems`
+                        // non-divisible by the receiver's value) and warn, but
+                        // keep sizing off the receiver's value so the write
+                        // never overflows the block.
+                        if elem_per_token == 0 {
+                            eprintln!(
+                                "[grim-kvtransport] KV receiver: block_elem_per_token is zero; \
+                                 cannot size block {}",
+                                header.block_id
+                            );
+                        } else if num_elems % elem_per_token != 0 {
+                            eprintln!(
+                                "[grim-kvtransport] KV receiver: num_elements {num_elems} not \
+                                 divisible by block_elem_per_token {elem_per_token} for block {} \
+                                 — possible sender/receiver elem_per_token mismatch; using \
+                                 receiver value",
+                                header.block_id
+                            );
+                        }
                         let num_tokens = if elem_per_token > 0 {
                             (num_elems / elem_per_token).min(guard.block_size())
                         } else {

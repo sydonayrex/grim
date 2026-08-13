@@ -458,7 +458,11 @@ impl CausalLm for Llama {
         let caches = session
             .model_state_mut()
             .and_then(|s| s.downcast_mut::<Vec<Option<crate::block::LlamaLayerCache>>>())
-            .expect("Llama::forward: session.model_state must be Vec<Option<LlamaLayerCache>>");
+            .ok_or_else(|| {
+                grim_core::error::Error::Session(
+                    "Llama::forward: session.model_state has wrong type for this operation".into(),
+                )
+            })?;
 
         let (logits, hidden_state, _kv_pairs) = {
             let _t0 = std::time::Instant::now();
