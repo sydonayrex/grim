@@ -1391,6 +1391,41 @@ pub fn build_variant_table_from_autotuner(
 }
 
 
+/// Select autotuned launch configuration for Charon kernel using t-pain model.
+///
+/// Falls back to default wave-aligned planning if no tuned entry is found in `Autotuner`.
+pub fn charon_autotune_launch_config(
+    tuner: &crate::autotune::Autotuner,
+    gpu_arch: &'static str,
+    hidden: usize,
+    inter: usize,
+    num_experts: usize,
+    top_k: usize,
+    routing_histogram: &[u32],
+) -> crate::autotune::AutotuneConfig {
+    let skew = routing_skew(routing_histogram);
+    let skew_bucket = crate::autotune::quantize_routing_skew(skew);
+    let key = crate::autotune::MoeKernelKey {
+        kernel: "grim_moe_fused_dispatch".to_string(),
+        gpu_arch: gpu_arch.to_string(),
+        hidden,
+        inter,
+        num_experts,
+        top_k,
+        skew_bucket,
+    };
+
+    tuner.lookup_moe(&key).unwrap_or_else(|| {
+        let default_threads = if gpu_arch.starts_with("gfx10") { 32 } else { 64 };
+        crate::autotune::AutotuneConfig {
+            block_dim: default_threads,
+            tile_kv: 64,
+            grid_stride: 1,
+            cycles_per_invocation: 0,
+        }
+    })
+}
+
 /// Compute the routing skew of a histogram — the fraction of tokens going
 /// to the single hottest expert. `0.0` = perfectly uniform, `1.0` = all
 /// tokens to one expert. Used by the reactive matcher; pure, no device.
@@ -1975,5 +2010,43 @@ mod tests {
         // Row 0 corresponds to skew_bucket 0.2, which matches key.
         assert!((table[0].model.c_bytes_per_wave - 0.5).abs() < 1e-3);
     }
+
+    #[test]
+    fn test_charon_autotune_launch_config_fallback_and_lookup() {
+        use crate::autotune::{Autotuner, MoeKernelKey, AutotuneConfig, quantize_routing_skew};
+
+        let arch = "gfx1036";
+        let mut tuner = Autotuner::for_device(0, arch);
+        let histogram = vec![10, 2, 2, 2];
+
+        // Case 1: Cache miss returns fallbacks (32 threads for gfx1036)
+        let fallback_cfg = charon_autotune_launch_config(&tuner, arch, 4096, 14336, 4, 2, &histogram);
+        assert_eq!(fallback_cfg.block_dim, 32);
+
+        // Case 2: Cache hit returns registered config
+        let skew = routing_skew(&histogram);
+        let skew_bucket = quantize_routing_skew(skew);
+        let key = MoeKernelKey {
+            kernel: "grim_moe_fused_dispatch".to_string(),
+            gpu_arch: arch.to_string(),
+            hidden: 4096,
+            inter: 14336,
+            num_experts: 4,
+            top_k: 2,
+            skew_bucket,
+        };
+        let expected_cfg = AutotuneConfig {
+            block_dim: 128,
+            tile_kv: 64,
+            grid_stride: 1,
+            cycles_per_invocation: 120_000,
+        };
+        tuner.record_moe(key, expected_cfg).unwrap();
+
+        let tuned_cfg = charon_autotune_launch_config(&tuner, arch, 4096, 14336, 4, 2, &histogram);
+        assert_eq!(tuned_cfg.block_dim, 128);
+        assert_eq!(tuned_cfg.cycles_per_invocation, 120_000);
+    }
 }
+
 
