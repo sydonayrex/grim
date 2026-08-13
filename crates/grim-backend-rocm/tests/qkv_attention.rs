@@ -127,6 +127,7 @@ fn qkv_attention_structural_empty_call() {
             1, // num_kv_heads
             0, // kv_seq_len
             0, // cache_offset
+            None, // window: full causal
             &Shape::from_slice(&[0, 0, 0]),
             None,
             None,
@@ -571,6 +572,7 @@ fn qkv_attention_gpu_matches_reference_when_enabled() {
             num_kv_heads,
             kv_seq_len,
             cache_offset as u32,
+            None, // window: full causal
             &out_shape,
             None,
             None,
@@ -646,6 +648,7 @@ fn qkv_attention_gpu_rejects_bad_gqa_ratio() {
         num_kv_heads,
         8,
         0,
+        None, // window: full causal
         &out_shape,
         None,
         None,
@@ -694,6 +697,7 @@ fn qkv_attention_gpu_zero_kv_seq_len_not_nan() {
             num_kv_heads,
             kv_seq_len,
             cache_offset as u32,
+            None, // window: full causal
             &out_shape,
             None,
             None,

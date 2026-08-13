@@ -52,6 +52,9 @@ pub struct LagunaConfig {
     pub full_partial_rotary_factor: f32,
     pub sliding_partial_rotary_factor: f32,
     pub gating: String,
+    /// YaRN magnitude-correction for full-attention layers. `None` = plain RoPE.
+    /// Parsed from `rope_parameters.full_attention` in `config.json`.
+    pub full_yarn: Option<grim_tensor::YaRNParams>,
 }
 
 impl Default for LagunaConfig {
@@ -91,6 +94,7 @@ impl Default for LagunaConfig {
             full_partial_rotary_factor: 0.5,
             sliding_partial_rotary_factor: 1.0,
             gating: "per-head".to_string(),
+            full_yarn: None,
         }
     }
 }
@@ -142,11 +146,11 @@ impl Laguna {
             max_seq_len: cfg.max_seq_len,
         };
 
-        let router_kind = if cfg.gating == "per-head" {
-            RouterKind::SigmoidTopKPerHead
-        } else {
-            RouterKind::SigmoidTopKWithBias
-        };
+        // The MoE router is a token-level sigmoid gate (one score per expert
+        // per token). Laguna's `gating: "per-head"` config selects the
+        // attention output gate (applied in `LlamaBlock::forward_with_kv_paged`),
+        // not a per-head MoE router.
+        let router_kind = RouterKind::SigmoidTopKWithBias;
 
         let spec = MoESpec {
             num_experts: cfg.num_experts,
@@ -198,17 +202,7 @@ impl Laguna {
 
                 let rotary_dim = (cfg.head_dim as f32 * partial_factor).round() as usize;
 
-                let yarn = if !is_sliding && theta > 100000.0 {
-                    Some(grim_tensor::YaRNParams {
-                        factor: 1.0,
-                        original_max_pos: cfg.max_seq_len,
-                        beta_fast: 32.0,
-                        beta_slow: 1.0,
-                        attention_factor: 1.0,
-                    })
-                } else {
-                    None
-                };
+                let yarn = if !is_sliding { cfg.full_yarn } else { None };
 
                 let rope = grim_tensor::RopeConfig {
                     dim: cfg.head_dim,
@@ -286,7 +280,15 @@ mod tests {
 
     #[test]
     fn test_laguna_s_2_1_layer_attention_specs() {
-        let cfg = LagunaConfig::default();
+        let mut cfg = LagunaConfig::default();
+        // Match Laguna-S-2.1 `rope_parameters.full_attention` (YaRN).
+        cfg.full_yarn = Some(grim_tensor::YaRNParams {
+            factor: 128.0,
+            original_max_pos: 8192,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            attention_factor: 1.4852030263919618,
+        });
         let num_layers = cfg.num_layers;
         assert_eq!(num_layers, 48);
 
@@ -312,17 +314,7 @@ mod tests {
 
                 let rotary_dim = (cfg.head_dim as f32 * partial_factor).round() as usize;
 
-                let yarn = if !is_sliding && theta > 100000.0 {
-                    Some(grim_tensor::YaRNParams {
-                        factor: 1.0,
-                        original_max_pos: cfg.max_seq_len,
-                        beta_fast: 32.0,
-                        beta_slow: 1.0,
-                        attention_factor: 1.0,
-                    })
-                } else {
-                    None
-                };
+                let yarn = if !is_sliding { cfg.full_yarn } else { None };
 
                 let rope = grim_tensor::RopeConfig {
                     dim: cfg.head_dim,
@@ -355,7 +347,9 @@ mod tests {
         assert_eq!(specs[0].num_heads, 48);
         assert_eq!(specs[0].rope.base, 500000.0);
         assert_eq!(specs[0].rope.rotary_dim, 64); // 0.5 * 128
-        assert!(specs[0].rope.yarn.is_some());
+        let yarn = specs[0].rope.yarn.expect("full layer must carry YaRN");
+        assert!((yarn.factor - 128.0).abs() < 1e-3);
+        assert_eq!(yarn.original_max_pos, 8192);
         assert_eq!(specs[0].sliding_window, None);
         assert!(specs[0].has_attn_gate);
 

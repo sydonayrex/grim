@@ -38,6 +38,8 @@ extern "C" __global__ void grim_rope(const float* x, const unsigned int* positio
     // One thread per (batch, step, dim-half-pair) element. Matches CPU
     // `Rope::forward` semantics: 3-D input [B, S, D] with positions[si]
     // per step, applying rotation to pairs (x[i], x[half+i]).
+    // CONTRACT: plain full-rotary only (rotary_dim == d). Use grim_rope_yarn
+    // for partial rotary or YaRN-modified frequencies.
     int total = b * s * half;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
@@ -57,6 +59,67 @@ extern "C" __global__ void grim_rope(const float* x, const unsigned int* positio
     float x2 = x[b_idx];
     out[a_idx] = x1 * cos_val - x2 * sin_val;
     out[b_idx] = x2 * cos_val + x1 * sin_val;
+}
+
+// Partial-rotary + YaRN kernel.
+// Handles rotary_dim <= d (partial) and pre-computed YaRN-ramp frequencies.
+//
+// CONTRACT:
+//   x        – [B, S, D] f32 input
+//   positions– [S] absolute token positions
+//   inv_freq – [rotary_half] pre-computed YaRN / plain inv-frequencies
+//   out      – [B, S, D] f32 output (non-rotary dims copied verbatim)
+//   b, s, d  – batch / seq / full head dim
+//   rotary_half – half of rotary_dim (= rotary_dim/2); dims [rotary_half, d)
+//               are NOT rotated (copied verbatim)
+//   mscale   – attention_factor (1.0 for plain RoPE; YaRN sets this)
+//
+// One thread per (batch, step, rotary-pair). Non-rotary dims are handled
+// by a second pass over the copy range [rotary_dim, d).
+extern "C" __global__ void grim_rope_yarn(
+    const float* __restrict__ x,
+    const unsigned int* __restrict__ positions,
+    const float* __restrict__ inv_freq,
+    float* __restrict__ out,
+    int b, int s, int d, int rotary_half, float mscale
+) {
+    // Pass 1: rotate the [0, rotary_half) pairs.
+    int total = b * s * rotary_half;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        int bi = idx / (s * rotary_half);
+        int rem = idx - bi * (s * rotary_half);
+        int si = rem / rotary_half;
+        int i  = rem - si * rotary_half;
+        float pos = (float)positions[si];
+        float val = pos * inv_freq[i];
+        float sin_val = sinf(val) * mscale;
+        float cos_val = cosf(val) * mscale;
+        int base_idx = (bi * s + si) * d;
+        // Interleaved layout: pair (2i, 2i+1)
+        int a_idx = base_idx + 2 * i;
+        int b_idx = base_idx + 2 * i + 1;
+        float x1 = x[a_idx];
+        float x2 = x[b_idx];
+        out[a_idx] = x1 * cos_val - x2 * sin_val;
+        out[b_idx] = x1 * sin_val + x2 * cos_val;
+    }
+    // Pass 2: copy the non-rotary dims [2*rotary_half, d) verbatim.
+    // We reuse the same thread pool; threads with idx in [0, b*s*(d-2*rotary_half))
+    // handle the copy dimension.
+    int copy_start = 2 * rotary_half;
+    int copy_len   = d - copy_start;  // may be 0 for full rotary
+    if (copy_len > 0) {
+        int total2 = b * s * copy_len;
+        if (idx < total2) {
+            int bi = idx / (s * copy_len);
+            int rem = idx - bi * (s * copy_len);
+            int si = rem / copy_len;
+            int ci = rem - si * copy_len;  // offset within the non-rotary tail
+            int src_idx = (bi * s + si) * d + copy_start + ci;
+            out[src_idx] = x[src_idx];
+        }
+    }
 }
 
 extern "C" __global__ void grim_broadcast_bias(const float* bias, float* out,
@@ -320,6 +383,20 @@ mod tests {
         assert!(OTHER_KERNEL_SOURCE.contains("grim_short_conv1d_causal_step"));
         assert!(OTHER_KERNEL_SOURCE.contains("grim_kda_gated_delta_rule_step"));
         assert!(OTHER_KERNEL_SOURCE.contains("grim_mla_q_kv_norm_split"));
+    }
+
+    /// `grim_rope_yarn` must carry the full YaRN / partial-rotary contract in
+    /// the kernel source so the JIT compiler can resolve all referenced symbols.
+    #[test]
+    fn test_rope_yarn_kernel_presence() {
+        assert!(OTHER_KERNEL_SOURCE.contains("grim_rope_yarn"),
+            "grim_rope_yarn kernel missing from OTHER_KERNEL_SOURCE");
+        assert!(OTHER_KERNEL_SOURCE.contains("inv_freq"),
+            "inv_freq param missing from grim_rope_yarn");
+        assert!(OTHER_KERNEL_SOURCE.contains("mscale"),
+            "mscale param missing from grim_rope_yarn");
+        assert!(OTHER_KERNEL_SOURCE.contains("rotary_half"),
+            "rotary_half param missing from grim_rope_yarn");
     }
 }
 

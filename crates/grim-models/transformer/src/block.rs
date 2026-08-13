@@ -466,6 +466,20 @@ impl LlamaBlock {
             Some(out) => out,
             None => self.prefilled_self_attention(&q, &k, &v, positions, cache)?,
         };
+        // Laguna-S-2.1 attention output gate: g_proj runs on the pre-attention
+        // hidden state (vLLM `laguna.py`), softplus in f32, then per-head
+        // broadcast over head_dim before o_proj.
+        let attn_out = if let Some(g) = &self.g_proj {
+            let gate = g.forward(&x_norm)?;
+            grim_nn::modules::softplus_mul_on_device(
+                &attn_out,
+                &gate,
+                self._cfg.local_num_heads,
+                self._cfg.head_dim,
+            )?
+        } else {
+            attn_out
+        };
         let attn_out = self.wo.forward(&attn_out)?;
 
         let added = grim_nn::modules::add_on_device(&x_2d, &attn_out)?;

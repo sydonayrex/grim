@@ -621,8 +621,6 @@ impl BackendDevice for CpuDevice {
         window: Option<usize>,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let _ = window;
-
         let q_st = a_storage(q)?;
         let bt_st = a_storage(block_tables)?;
         let k_st = a_storage(k_pages)?;
@@ -656,9 +654,12 @@ impl BackendDevice for CpuDevice {
             let kvh = (h * num_kv_heads) / num_heads;
             for t in 0..seq_len {
                 let q_abs = cache_offset as usize + t;
+                let window_start = window
+                    .map(|w| q_abs.saturating_sub(w.saturating_sub(1)))
+                    .unwrap_or(0);
                 let mut scores = vec![0.0f32; kv_seq_len];
                 for t2 in 0..kv_seq_len {
-                    if t2 > q_abs {
+                    if t2 > q_abs || t2 < window_start {
                         scores[t2] = f32::NEG_INFINITY;
                     } else {
                         let block_idx_in_seq = t2 / page_size;
@@ -1287,6 +1288,60 @@ mod tests {
         // Row 1: 4*1 + 5*3 + 6*5 = 49, 4*2 + 5*4 + 6*6 = 64
         assert_eq!(result, vec![22.0, 28.0, 49.0, 64.0]);
     }
+
+    // ── 7. Sliding-window attention masks out-of-window keys ─────────
+    // Laguna-S-2.1 hybrid attention: SWA layers attend only the last `window`
+    // positions. Verify the CPU `qkv_attention` honors `window` by placing a
+    // dominant value far outside the window and confirming it is excluded.
+    #[test]
+    fn qkv_attention_sliding_window_masks_remote_keys() {
+        let dev = CpuDevice::new();
+        let num_heads = 1usize;
+        let num_kv_heads = 1usize;
+        let head_dim = 4usize;
+        let kv_seq_len = 8usize;
+        let cache_offset = 7u32; // query at absolute position 7
+        let window = Some(4usize); // may attend positions 4..=7 only
+
+        // Single query vector (all ones).
+        let q = dev
+            .from_cpu(&vec![1.0f32; head_dim], &Shape::new(vec![1, num_heads, head_dim]), DType::F32)
+            .unwrap();
+        // K: identity-like rows so dot products are position-identifiable.
+        let mut k_data = vec![0.0f32; kv_seq_len * num_kv_heads * head_dim];
+        for t in 0..kv_seq_len {
+            k_data[t * head_dim + (t % head_dim)] = 1.0;
+        }
+        let k = dev
+            .from_cpu(&k_data, &Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]), DType::F32)
+            .unwrap();
+        // V: position 0 carries a dominant value; all others near-zero. If the
+        // window excludes position 0, it must not appear in the output.
+        let mut v_data = vec![0.0f32; kv_seq_len * num_kv_heads * head_dim];
+        v_data[0 * head_dim + 0] = 1000.0;
+        let v = dev
+            .from_cpu(&v_data, &Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]), DType::F32)
+            .unwrap();
+
+        let out_shape = Shape::new(vec![1, num_heads, head_dim]);
+
+        let (w_out, _) = dev
+            .qkv_attention(q.as_ref(), k.as_ref(), v.as_ref(), num_kv_heads, kv_seq_len, cache_offset, window, &out_shape, None, None)
+            .unwrap();
+        let w_vec = w_out.to_cpu_vec_f32().unwrap();
+
+        let (full_out, _) = dev
+            .qkv_attention(q.as_ref(), k.as_ref(), v.as_ref(), num_kv_heads, kv_seq_len, cache_offset, None, &out_shape, None, None)
+            .unwrap();
+        let full_vec = full_out.to_cpu_vec_f32().unwrap();
+
+        // Windowed output must exclude the position-0 dominant V value.
+        let w_norm: f32 = w_vec.iter().map(|x| x.abs()).sum();
+        let full_norm: f32 = full_vec.iter().map(|x| x.abs()).sum();
+        assert!(w_norm < 1.0, "sliding-window output must not carry remote V, got norm {}", w_norm);
+        assert!(full_norm > 100.0, "full-causal output must carry the dominant V, got norm {}", full_norm);
+    }
+
 
     #[test]
     fn test_backend_quantized_matmul_q4_k() {
