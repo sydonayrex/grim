@@ -167,6 +167,8 @@ pub use hyv3::{HyV3, HyV3Config};
 pub use eagle3::{Eagle3, Eagle3Config};
 pub use dots1::{Dots1, Dots1Config};
 pub use dflash::{DFlash, DFlashConfig};
+pub mod solar_open2;
+pub use solar_open2::{SolarLayerType, SolarOpen2, SolarOpen2Block, SolarOpen2Config};
 pub use wav_tokenizer_dec::{WavTokenizerDec, WavTokenizerDecConfig};
 pub use talkie::{Talkie, TalkieConfig};
 pub use step35::{Step35, Step35Config};
