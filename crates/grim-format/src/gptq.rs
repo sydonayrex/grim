@@ -176,11 +176,17 @@ impl GptqProvider {
             let scales_name = format!("{}.scales", base_name);
             let g_idx_name = format!("{}.g_idx", base_name);
 
+            // Validate bits
+            let valid_bits = match bits {
+                2 | 3 | 4 | 8 => bits,
+                _ => 4,
+            };
+
             // Get base tensor shape - infer from qweight shape for now
             let qw = tensor_info.shape();
             let shape: Vec<usize> = if qw.len() >= 2 {
                 // Approximate shape reconstruction: [in_features, out_features / bits * 32]
-                vec![qw[0], qw[1].saturating_mul(32 / bits as usize).max(1)]
+                vec![qw[0], qw[1].saturating_mul(32 / valid_bits as usize).max(1)]
             } else {
                 qw.clone()
             };
@@ -317,11 +323,7 @@ impl TensorProvider for GptqProvider {
         let dequanted = dequant_gptq_tensor(info, &qweight, &qzeros, &scales, g_idx.as_deref())?;
 
         // Convert f32 vector to raw bytes safely
-        let bytes = unsafe {
-            let ptr = dequanted.as_ptr() as *const u8;
-            let len = dequanted.len() * std::mem::size_of::<f32>();
-            std::slice::from_raw_parts(ptr, len).to_vec()
-        };
+        let bytes: Vec<u8> = dequanted.iter().flat_map(|f| f.to_le_bytes()).collect();
 
         Ok(RawTensor {
             bytes,
