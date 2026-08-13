@@ -449,8 +449,11 @@ pub fn read_outliers<R: Read + Seek>(
             entry.outlier_count
         )));
     }
+    let alloc_bytes = (entry.outlier_count as usize)
+        .checked_mul(OUTLIER_RECORD_BYTES)
+        .ok_or_else(|| Error::Backend("outlier buffer size overflow".into()))?;
     reader.seek(SeekFrom::Start(entry.outlier_offset))?;
-    let mut buf = vec![0u8; entry.outlier_count as usize * OUTLIER_RECORD_BYTES];
+    let mut buf = vec![0u8; alloc_bytes];
     reader.read_exact(&mut buf)?;
     let mut outliers = Vec::with_capacity((entry.outlier_count as usize).min(100_000));
     for chunk in buf.chunks_exact(OUTLIER_RECORD_BYTES) {
@@ -478,12 +481,12 @@ pub fn read_outliers_with_encoding<R: Read + Seek>(
         return read_outliers(reader, entry);
     }
     // DeltaVarint path: read the entire varint stream from outlier_offset.
-    // We don't know the exact byte length upfront (varint is variable-length),
-    // so we read until EOF. The decoder will consume exactly what it needs
-    // and return the bytes consumed.
+    // Bound reading for DeltaVarint: each outlier consumes at most ~10 varint bytes
+    let max_read_len = (entry.outlier_count as usize).saturating_mul(10).min(100_000_000);
     reader.seek(SeekFrom::Start(entry.outlier_offset))?;
-    let mut buf = Vec::new();
-    reader.read_to_end(&mut buf)?;
+    let mut buf = vec![0u8; max_read_len];
+    let n = reader.read(&mut buf)?;
+    buf.truncate(n);
     let (decoded, _bytes_consumed) =
         crate::spec::decode_outliers_delta_varint(&buf).map_err(Error::Backend)?;
     Ok(decoded
@@ -1169,6 +1172,12 @@ impl GrimFile {
 
         // Metadata JSON layer.
         let metadata = if header.metadata_len > 0 {
+            if header.metadata_len > 100_000_000 {
+                return Err(Error::Backend(format!(
+                    "metadata_len {} exceeds safety cap",
+                    header.metadata_len
+                )));
+            }
             let mut meta_buf = vec![0u8; header.metadata_len as usize];
             reader.read_exact(&mut meta_buf)?;
             let json: serde_json::Value = serde_json::from_slice(&meta_buf)
