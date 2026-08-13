@@ -489,13 +489,14 @@ fn load_model_from_config(
                 head_dim,
                 num_layers,
                 intermediate_size,
-                num_experts: 1,
-                num_experts_per_tok: 1,
+                num_experts: expert_count,
+                num_experts_per_tok: expert_used_count,
                 routed_scaling_factor,
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
             };
+
             eprintln!("[grim] Loading Laguna model with config: {:?}", laguna_cfg);
             let m = Laguna::load_tp(device.clone(), &ws, laguna_cfg, tp)?;
             Ok(Box::new(m))

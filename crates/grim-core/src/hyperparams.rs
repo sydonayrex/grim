@@ -196,9 +196,11 @@ impl HyperparameterExtractor {
             .get_u32(&format!("{arch_name}.expert_used_count"))
             .map(|v| v as usize);
         let routed_scaling_factor = metadata
-            .get_f32(&format!("{arch_name}.expert_gating_func") )
+            .get_f32(&format!("{arch_name}.expert_gating_func"))
             .or_else(|| metadata.get_f32(&format!("{arch_name}.routed_scaling_factor")))
+            .or_else(|| metadata.get_f32(&format!("{arch_name}.moe_routed_scaling_factor")))
             .unwrap_or(1.0);
+
         let norm_topk_prob = metadata
             .get_u32(&format!("{arch_name}.norm_topk_prob"))
             .map(|v| v != 0)
