@@ -286,9 +286,11 @@ impl SpeculativeCausalLm {
                 }
 
                 // CRIT-7: Return logits for the accepted tokens, not the original input
-                // The output logits should correspond to the tokens we actually accepted
+                // Accepted token rows start at (context_len - 1) since target forward
+                // returned [context_len, vocab_size] and the last row is the bonus token.
+                let ctx_offset = context_len.saturating_sub(1);
                 let accepted_logits =
-                    self.extract_accepted_logits(&target_logits, accepted_count, vocab_size)?;
+                    self.extract_accepted_logits(&target_logits, accepted_count, vocab_size, ctx_offset)?;
                 session.set_last_accepted_tokens(accepted_count);
                 Ok(accepted_logits)
             }
@@ -330,11 +332,14 @@ impl SpeculativeCausalLm {
                 .forward(session, &extended_input, &extended_positions, adapters)?;
 
         // 4. Rejection sampling / validation loop (§5.3)
-        // Correctly index logits as flat [seq, vocab_size] row-major,
-        // apply per-row softmax, and use the standard ratio test with per-request randomness.
+        // The target logits tensor has shape [S + verify_len, vocab_size] where S =
+        // len(original_input). Draft token i's target logit row is at offset
+        // (S + i) * vocab_size, NOT i * vocab_size.
+        // Draft logits have shape [verify_len, vocab_size] — no offset needed.
         let target_probs = target_logits.to_vec_f32()?;
         let vocab_size = draft_block.base_logits.shape().dims()[1];
         let draft_logits = draft_block.base_logits.to_vec_f32()?;
+        let context_len = input_ids.shape().elem_count();
 
         let mut accepted_count = 0;
         let mut rng = session
@@ -344,10 +349,13 @@ impl SpeculativeCausalLm {
         for i in 0..verify_len {
             let draft_tok = draft_block.tokens[i] as usize;
 
-            let row_start = i * vocab_size;
-            let row_end = row_start + vocab_size;
-            let p_target = softmax_f32_row(&target_probs[row_start..row_end])[draft_tok];
-            let p_draft = softmax_f32_row(&draft_logits[row_start..row_end])[draft_tok];
+            // Target row at (context_len + i), draft row at i
+            let target_row_start = (context_len + i) * vocab_size;
+            let target_row_end = target_row_start + vocab_size;
+            let draft_row_start = i * vocab_size;
+            let draft_row_end = draft_row_start + vocab_size;
+            let p_target = softmax_f32_row(&target_probs[target_row_start..target_row_end])[draft_tok];
+            let p_draft = softmax_f32_row(&draft_logits[draft_row_start..draft_row_end])[draft_tok];
 
             let p_accept = if p_draft > 1e-10 {
                 (p_target / p_draft).min(1.0)
@@ -365,9 +373,9 @@ impl SpeculativeCausalLm {
             kv.commit(accepted_count)?;
         }
 
-        // CRIT-7: Return logits for accepted tokens
+        // CRIT-7: Return logits for accepted tokens (rows S..S+accepted)
         let accepted_logits =
-            self.extract_accepted_logits(&target_logits, accepted_count, vocab_size)?;
+            self.extract_accepted_logits(&target_logits, accepted_count, vocab_size, context_len)?;
         session.set_last_accepted_tokens(accepted_count);
         Ok(accepted_logits)
     }
@@ -386,23 +394,42 @@ impl SpeculativeCausalLm {
     fn extend_positions(&self, positions: &Tensor, num_new: usize) -> Result<Tensor> {
         let mut pos = positions.to_vec_f32()?;
         let last_pos = pos.last().copied().unwrap_or(-1.0);
-        for i in 0..num_new {
-            pos.push(last_pos + 1.0 + i as f32);
+        if pos.is_empty() && num_new > 0 {
+            // Empty positions: first draft token starts at position 0.
+            // last_pos will be -1.0, so we get 0, 1, 2, ... — correct.
+            // Guard: ensure we never emit a negative position.
+            for i in 0..num_new {
+                pos.push(i as f32);
+            }
+        } else {
+            for i in 0..num_new {
+                pos.push(last_pos + 1.0 + i as f32);
+            }
         }
         let shape = grim_tensor::Shape::new(vec![pos.len()]);
         Ok(grim_backend_cpu::cpu_tensor(pos, shape))
     }
 
-    /// Extract logits for only the accepted tokens
+    /// Extract logits for only the accepted tokens.
+    /// `context_len` is the length of the original (non-draft) input;
+    /// accepted token rows start at offset `context_len * vocab_size`.
     fn extract_accepted_logits(
         &self,
         target_logits: &Tensor,
         accepted_count: usize,
         vocab_size: usize,
+        context_len: usize,
     ) -> Result<Tensor> {
         let all_logits = target_logits.to_vec_f32()?;
-        // Return logits for the first `accepted_count` positions
-        let accepted_logits = all_logits[..accepted_count * vocab_size].to_vec();
+        let start = context_len * vocab_size;
+        let end = start + accepted_count * vocab_size;
+        if end > all_logits.len() {
+            return Err(grim_core::error::Error::Config(format!(
+                "extract_accepted_logits: slice [{start}..{end}] out of bounds (logits len={})",
+                all_logits.len()
+            )));
+        }
+        let accepted_logits = all_logits[start..end].to_vec();
         let shape = grim_tensor::Shape::new(vec![accepted_count, vocab_size]);
         Ok(grim_backend_cpu::cpu_tensor(accepted_logits, shape))
     }

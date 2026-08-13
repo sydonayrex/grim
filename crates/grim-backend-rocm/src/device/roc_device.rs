@@ -2521,7 +2521,7 @@ impl BackendDevice for RocmDevice {
         let v_s = as_rocm(v)?;
         let beta_s = as_rocm(beta)?;
         let gate_s = as_rocm(a_gate)?;
-        let S_s = as_rocm(recurrent_state)?;
+        let s_s = as_rocm(recurrent_state)?;
 
         let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
@@ -2530,7 +2530,7 @@ impl BackendDevice for RocmDevice {
         let mut v_ptr = dev_ptr(v_s)?;
         let mut beta_ptr = dev_ptr(beta_s)?;
         let mut gate_ptr = dev_ptr(gate_s)?;
-        let mut S_ptr = dev_ptr(S_s)?;
+        let mut s_ptr = dev_ptr(s_s)?;
         let mut dk_i = d_k as i32;
         let mut dv_i = d_v as i32;
 
@@ -2545,7 +2545,7 @@ impl BackendDevice for RocmDevice {
                 arg(&mut v_ptr),
                 arg(&mut beta_ptr),
                 arg(&mut gate_ptr),
-                arg(&mut S_ptr),
+                arg(&mut s_ptr),
                 arg(&mut out_ptr),
                 arg(&mut dk_i),
                 arg(&mut dv_i),
