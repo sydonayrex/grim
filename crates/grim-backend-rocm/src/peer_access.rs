@@ -158,6 +158,69 @@ pub fn enable_peer_access(src: i32, dst: i32) -> Result<bool> {
     }
 }
 
+
+/// Peer link classification for inter-GPU communication paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LinkType {
+    /// Peer direct DMA enabled via `hipDeviceEnablePeerAccess`.
+    PeerDirect,
+    /// Peer direct DMA unavailable; transfer requires host bounce.
+    HostBounce,
+    /// Cross-host or unreachable inter-device link.
+    NoLink,
+}
+
+/// Matrix representation of peer-to-peer topology across GPU devices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct P2PTopology {
+    /// Total number of devices participating in the topology matrix.
+    pub device_count: usize,
+    /// 2D link matrix where `links[i][j]` describes the link from device `i` to device `j`.
+    pub links: Vec<Vec<LinkType>>,
+}
+
+/// Build an N x N topology matrix for the provided slice of ROCm devices.
+pub fn build_topology_matrix(devices: &[&crate::device::roc_device::RocmDevice]) -> P2PTopology {
+    let count = devices.len();
+    if count == 0 {
+        return P2PTopology {
+            device_count: 0,
+            links: Vec::new(),
+        };
+    }
+
+    let mut links = vec![vec![LinkType::NoLink; count]; count];
+    for i in 0..count {
+        for j in 0..count {
+            if i == j {
+                links[i][j] = LinkType::PeerDirect;
+                continue;
+            }
+            let ord_i = devices[i].ordinal() as i32;
+            let ord_j = devices[j].ordinal() as i32;
+
+            let status = peer_status(ord_i, ord_j).unwrap_or(P2PStatus::Host);
+            links[i][j] = match status {
+                P2PStatus::P2P | P2PStatus::Pcie => {
+                    let enabled = enable_peer_access(ord_i, ord_j).unwrap_or(false);
+                    if enabled {
+                        LinkType::PeerDirect
+                    } else {
+                        LinkType::HostBounce
+                    }
+                }
+                P2PStatus::Host => LinkType::HostBounce,
+            };
+        }
+    }
+
+    P2PTopology {
+        device_count: count,
+        links,
+    }
+}
+
+
 fn bounded(x: i32, n: i32) -> bool {
     x >= 0 && x < n
 }

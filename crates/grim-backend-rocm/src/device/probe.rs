@@ -6,12 +6,69 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::handles::{
+    HIP_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
     HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS, HIP_DEVICE_ATTRIBUTE_WARP_SIZE,
     hipDeviceGetAttribute, hipSetDevice,
 };
 
 /// HIP attribute ID for maximum shared memory (LDS) per block.
 pub const HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: i32 = 3;
+
+/// Query maximum threads per block for a specific device ordinal.
+pub fn max_threads_per_block(device_ordinal: usize) -> u32 {
+    let mut val: i32 = 0;
+    unsafe {
+        let _ = hipSetDevice(device_ordinal as i32);
+        let status = hipDeviceGetAttribute(
+            &mut val,
+            HIP_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+            device_ordinal as i32,
+        );
+        if status == 0 && val > 0 { val as u32 } else { 1024 }
+    }
+}
+
+/// Query active compute unit (multiprocessor) count for a specific device ordinal.
+pub fn active_cu_count(device_ordinal: usize) -> u32 {
+    let mut val: i32 = 0;
+    unsafe {
+        let _ = hipSetDevice(device_ordinal as i32);
+        let status = hipDeviceGetAttribute(
+            &mut val,
+            HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            device_ordinal as i32,
+        );
+        if status == 0 && val > 0 { val as u32 } else { 64 }
+    }
+}
+
+/// Query wavefront execution size (32 or 64) for a specific device ordinal.
+pub fn wavefront_size(device_ordinal: usize) -> u32 {
+    let mut val: i32 = 0;
+    unsafe {
+        let _ = hipSetDevice(device_ordinal as i32);
+        let status = hipDeviceGetAttribute(
+            &mut val,
+            HIP_DEVICE_ATTRIBUTE_WARP_SIZE,
+            device_ordinal as i32,
+        );
+        if status == 0 && val > 0 { val as u32 } else { 32 }
+    }
+}
+
+/// Query maximum shared memory (LDS) in bytes per block for a specific device ordinal.
+pub fn max_shared_mem(device_ordinal: usize) -> u32 {
+    let mut val: i32 = 0;
+    unsafe {
+        let _ = hipSetDevice(device_ordinal as i32);
+        let status = hipDeviceGetAttribute(
+            &mut val,
+            HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+            device_ordinal as i32,
+        );
+        if status == 0 && val > 0 { val as u32 } else { 384 * 1024 }
+    }
+}
 
 /// XNACK probe for unified memory availability. Returns true if the [see: `hipMemAdvise`]
 pub fn probe_xnack(device_ordinal: usize) -> bool {
@@ -26,6 +83,7 @@ pub fn probe_xnack(device_ordinal: usize) -> bool {
         status == 0 && val == 1
     }
 }
+
 
 /// System ROCm installation info resolved dynamically.
 #[derive(Debug, Clone)]

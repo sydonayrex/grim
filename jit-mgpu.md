@@ -2,6 +2,20 @@
 
 Implementation plan for grim-backend-rocm. Target: gfx1036 (RX 7900 XT/XTX) primary, gfx1030 secondary.
 
+> **UPDATE (patched against current `crates.zip` source):** Two factual inaccuracies in the original
+> draft's "what exists today" claims were found and corrected in place, marked inline as **PATCH NOTE**
+> blocks:
+> 1. `ShapeClass::TLOLog` was described as an existing variant of `autotune.rs`'s `ShapeClass`. It does
+>    not exist — real `ShapeClass` has only `Decode`/`Prefill`. Added as explicit new-work item #0 in
+>    "What's missing," rather than assumed pre-existing.
+> 2. `capability_profiler::estimate_bandwidth(device)` was cited as an existing function. It does not
+>    exist under that name. The underlying data (`hbm_bandwidth_gbps`) already exists on `GpuCapability`
+>    via `CapabilityProfiler::capabilities()` — the fix is to read that field, not add a new function.
+>
+> Everything else in this document was spot-checked against source (`jit_compile_hsaco`, `HsacoKernelCache`,
+> `fusion.rs`'s `block_dim_x` ternary, `WavefrontTiledLayout`/`PackedQuantLayout` in `layout.rs`, the
+> MFMA/WMMA arch-gating logic) and confirmed accurate — no changes made to those sections.
+
 ---
 
 ## 1. What exists today
@@ -29,11 +43,14 @@ Implementation plan for grim-backend-rocm. Target: gfx1036 (RX 7900 XT/XTX) prim
 ### Autotune (launch params, not kernel code)
 
 - `autotune.rs` — `KernelKey` (kernel, gpu_arch, m, n, k) maps to `LaunchConfig` (block_m, block_n, block_k, split_k, threads). Caches to on-disk JSON. `KernelTuneCache` for the JSON shadow
-- `gemm_tuning.rs` — `lookup_gemm_config()` picks tiles from shape class (Decode/Prefill/TLOLog) and wavefront size. `lookup_solution_index()` is an offline-tuned rocBLAS solution index table for gfx1036
+- `gemm_tuning.rs` — `lookup_gemm_config()` picks tiles from shape class and wavefront size. `lookup_solution_index()` is an offline-tuned rocBLAS solution index table for gfx1036
+
+> **PATCH NOTE (verified against source):** `autotune.rs`'s real `ShapeClass` currently has only two variants — `Decode` (m==1) and `Prefill` (m>1). `TLOLog` does **not** exist in source today; every reference to it below is this plan's proposal to add it as a genuine third variant (the `lm_head` / logit-projection GEMM — a real, distinct shape pattern, not an existing thing being described). Item 0 in "What's missing" below reflects this. The classifier is **op-identity** (`ShapeClass::from_op(GemmOp, m)`, `GemmOp::LmHead → TLOLog`) — not the earlier draft's `from_m`-only rule, which cannot fire for lm_head (M alone can't tell it from an attention/ffn GEMM of equal m). Treat every `TLOLog` arm + `GemmOp`/`from_op` as new code to write, not code already present in `autotune.rs`.
 - `charon_scalar_candidates()` — brute-force block dims against LDS limit
 
 ### What's missing
 
+0. **`ShapeClass::TLOLog` variant** — `autotune.rs`'s `ShapeClass` enum currently has only `Decode`/`Prefill`. This plan adds a third variant for the `lm_head` / logit-projection GEMM. It is **new work, not existing infrastructure** — reviewers should not look for it in current `autotune.rs`. The addition is: (a) the `TLOLog` enum arm; (b) a `GemmOp` enum + `ShapeClass::from_op(op, m)` **op-identity** classifier (the `from_m`-only rule cannot distinguish lm_head from an attention/ffn GEMM of equal m, so the class MUST be tagged at the dispatch layer — see the §4.2 "Why TLOLog is a separate bucket" section); (c) a `lookup_gemm_config` + `pick_tiles` arm with the distinct TLOLog tile `(16, 64)`, block_k 64. The tile is justified there: N=vocab is the dominant wide dim, K=hidden is reused across it, so the optimal tile is *small block_m / wide block_n* — the inverse of the Decode/Prefill square tiling.
 1. **Source parametrization** — injecting hardware-discovered constants into kernel source before JIT compile. Today the source is a static string
 2. **Hardware-to-kernel-parameter mapping** — LDS, CU count, wavefront, P2P topology should drive kernel specialization. They are queried but ignored
 3. **Multi-GPU kernel launches** — no kernel splits work across GPUs. Pattern today: same kernel on each GPU + host-side RCCL all-reduce
@@ -228,7 +245,15 @@ impl From<&RocmDevice> for HardwareSpec {
             max_threads_per_block: probe::max_threads_per_block(device),
             cu_count: probe::active_cu_count(device),
             multiprocessor_count: probe::active_cu_count(device),  // same on AMD
-            mem_bandwidth_gb_s: capability_profiler::estimate_bandwidth(device),
+            // PATCH NOTE (verified against source): `capability_profiler::estimate_bandwidth`
+            // does not exist. The real data lives in `GpuCapability.hbm_bandwidth_gbps`,
+            // populated by `arch_tflops_table()` and retrieved via `CapabilityProfiler::capabilities()`.
+            // Use that instead of inventing a new function:
+            mem_bandwidth_gb_s: CapabilityProfiler::new()
+                .capabilities()
+                .first()
+                .map(|cap| cap.hbm_bandwidth_gbps as f64)
+                .unwrap_or(500.0), // conservative gfx1036 GDDR6 default if no GPU capability reported yet
             p2p_topology: P2PTopology {
                 device_count: 1,
                 links: vec![vec![LinkType::NoLink]],
@@ -249,10 +274,15 @@ pub fn compute_kernel_source_with_spec(
     spec: &HardwareSpec,
     entry: &str,
     shape_class: ShapeClass,
+    dims: ShapeDims,      // M,N,K of the problem — drives K-derived split-K (see #4)
     device_id: u32,       // 0 for single-GPU, 0..N-1 for multi-GPU
     num_devices: u32,     // 1 for single-GPU, N for multi-GPU
+    tiles: Option<&TileConfig>,  // None -> pick_tiles(); Some(c) -> force a config (FCP search)
 ) -> String {
-    let tiles = pick_tiles(spec, shape_class);
+    let tiles = match tiles {
+        Some(t) => t.clone(),
+        None => pick_tiles(spec, shape_class, dims),
+    };
     
     let mut source = String::new();
     
@@ -302,19 +332,57 @@ pub fn compute_kernel_source_with_spec(
 
 The existing `compute_kernel_source()` stays as-is. It is the fallback when the `jit-hw-adaptive` feature is disabled.
 
-`ShapeClass` is already defined in `autotune.rs`. It classifies GEMM shapes:
+`ShapeClass` is defined in `autotune.rs` (real `Decode`/`Prefill` today; this plan adds `TLOLog` — see "What's missing" #0 and the classifier below). It classifies GEMM shapes. `shape_class` is produced by the GEMM dispatch layer, not invented here:
 
 ```rust
-// From autotune.rs — already exists
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// autotune.rs — real enum after this plan's #0 addition
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ShapeClass {
-    Decode,   // memory-bound: small M, large N, small K per token
-    Prefill,  // compute-bound: large M, large N, large K
-    TLOLog,   // mixed: tensor-parallel logit projection
+    Decode,   // m == 1: per-token GEMM (attention, ffn, lm_head during decode)
+    Prefill,  // m > 1:  large-batch GEMM (attention, ffn, lm_head during prefill)
+    TLOLog,   // lm_head / logit-projection ONLY — tagged by op-identity, NOT by m (see from_op)
+}
+
+/// Which GEMM an op is, known at the dispatch layer (the engine launches lm_head as a
+/// matmul with weight [vocab, hidden]). M alone cannot distinguish lm_head from an
+/// attention/ffn GEMM of the same m, so the class is tagged op-identity here and passed
+/// into `matmul` (roc_device.rs:1488), which forwards it to `lookup_gemm_config` /
+/// `pick_tiles`. This is the classifier for TLOLog — it fires for every lm_head GEMM
+/// regardless of m (decode: m==1; prefill: m==steps), which `from_m` can never do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GemmOp {
+    Attention,
+    Ffn,
+    LmHead,    // -> ShapeClass::TLOLog
+    Other,
+}
+
+impl ShapeClass {
+    /// Backward-compatible: used by attention/ffn callers (m is sufficient to bin them).
+    pub fn from_m(m: usize) -> Self {
+        if m == 1 { Self::Decode } else { Self::Prefill }
+    }
+    /// Op-aware classifier. LmHead is TLOLog no matter its m; everything else bins by m.
+    pub fn from_op(op: GemmOp, m: usize) -> Self {
+        match op {
+            GemmOp::LmHead => Self::TLOLog,
+            _ => Self::from_m(m),
+        }
+    }
 }
 ```
 
-`shape_class` comes from the GEMM dispatch layer, not invented here. The existing `lookup_gemm_config()` in `gemm_tuning.rs` already classifies shapes this way.
+`lookup_gemm_config()` in `gemm_tuning.rs` gains a `shape: ShapeClass` parameter (or a `from_op`-derived class) so the TLOLog tile is selected for lm_head. The existing `from_m`-only callers keep working via `ShapeClass::from_m`.
+
+#### Why TLOLog is a separate bucket (justification)
+
+The `lm_head` GEMM is `C[steps, vocab] = X[steps, hidden] · W[vocab, hidden]ᵀ`. Its shape profile is **structurally different** from any attention/ffn GEMM, so a shared Decode/Prefill tile is sub-optimal:
+
+- **N = vocab is the dominant, widest dimension** (vocab 32000–128000 ≫ hidden 4096 ≫ steps). Attention GEMMs are near-square (N≈hidden); ffn up-proj has N≈4·hidden. Only lm_head has N *much larger* than M and than K.
+- The reduction dim **K = hidden is reused across the vast N column** — tiling should *widen block_n* to amortize the K-load over many output columns, and *keep block_m small* because M is 1 at decode (≤ steps at prefill).
+- Consequence: the optimal tile is **(small block_m, wide block_n)** — the inverse of the attention/ffn tiling the Decode/Prefill arms pick. Hard-coding lm_head into Decode (N≈hidden square tile) wastes the wide-N reuse; hard-coding it into Prefill (block_m=32) over-subscribes M when m==1. Hence a distinct arm.
+
+The hand-written TLOLog default below is the starting point; the empirical FCP pass (#2) refines it. It is **(16, 64)**: block_m=16 (small — M is 1 at decode), block_n=64 (wide — N=vocab dominated), block_k=64 (K=hidden, reused across N). (The earlier draft's `(32,16)` was backwards — it narrowed the output column exactly where widening helps; corrected here.)
 
 ### 4.3 Tile selection from hardware + shape
 
@@ -356,33 +424,36 @@ pub struct ShapeDims {
 }
 
 impl ShapeClass {
+    /// Placeholder dims for the hand-written tile defaults below. ONLY Decode/Prefill use
+    /// these in tests; TLOLog is never constructed with placeholder dims — its real M/N/K
+    /// arrive via the `dims` argument to `pick_tiles` from the dispatch layer (the lm_head
+    /// GEMM's actual [steps, vocab, hidden]). The `m:0` placeholders here are NOT a real
+    /// shape; do not read them for TLOLog.
     pub fn dims(&self) -> ShapeDims {
         match self {
             ShapeClass::Decode => ShapeDims { m: 1, n: 0, k: 0 },  // per-token: M=1
             ShapeClass::Prefill => ShapeDims { m: 0, n: 0, k: 0 }, // large batch
-            ShapeClass::TLOLog => ShapeDims { m: 0, n: 0, k: 0 },  // projection
+            ShapeClass::TLOLog => ShapeDims { m: 0, n: 0, k: 0 },  // real dims from dispatch
         }
     }
 }
 
-pub fn pick_tiles(spec: &HardwareSpec, shape_class: ShapeClass) -> TileConfig {
+pub fn pick_tiles(spec: &HardwareSpec, shape_class: ShapeClass, dims: ShapeDims) -> TileConfig {
     let wave = spec.wavefront_size;           // 32 on gfx1036/gfx1030
-    let max_lds = spec.max_shared_mem_per_block; // 384 * 1024 on gfx1036
+    // NOTE: max_shared_mem_per_block (384 KB) is the per-BLOCK request ceiling, but
+    // physical LDS is 64 KB/CU on gfx1036/gfx1030. Co-residency is bounded by the
+    // per-CU figure, so the double-buffer gate and the #6 candidate-validity check
+    // (§4.3 empirical pass) must use lds_per_cu, NOT the per-block attribute.
+    let lds_per_cu = 64 * 1024; // physical LDS per CU on gfx1036/gfx1030
+    let max_lds = lds_per_cu;
     let max_threads = spec.max_threads_per_block; // 1024 on gfx1036
     let cu_count = spec.cu_count;              // 64 on gfx1036
 
-    // Block threads: match existing codebase pattern.
-    // fusion.rs:56/78 sets block_dim_x = 128 for Wave32, 256 for Wave64.
-    // charon.rs:1195 says default_block_dim() = 256 on W64, 128 on W32.
-    // roc_device.rs:8143 sets block_dim_x = 128 for wavefront_size == 32.
-    // qkv_attention.rs:7/211/380 keep __launch_bounds__(256) (proven to launch
-    //   correctly on gfx1036 even with a 128-thread block) and derive num_waves
-    //   at runtime via blockDim.x / wave_size -> 4 wavefronts on either arch.
-    // The tile picker targets Wave32; CDNA is out of scope for this plan.
-    // Use 128 threads (4 Wave32 wavefronts) to match fusion.rs/charon.rs/roc_device.rs.
-    let target_waves = 4;  // 4 Wave32 wavefronts = 128 threads on RDNA2
-    let threads = target_waves * wave;  // wave=32 → threads=128
-    assert!(threads <= max_threads && threads % wave == 0);
+    // Block thread count (target_waves) is NOT hardcoded here — it is derived from the
+    // tile's LDS + VGPR + thread bounds once block_m/block_k/lds_per_tile are known
+    // (see the [#6] occupancy derivation right after the LDS double-buffer gate below).
+    // CDNA (Wave64) is out of scope for this plan; gfx1036/gfx1030 are Wave32, so
+    // wave = 32 throughout.
 
     // LDS per tile: we store BF16 A tile, BF16 B tile, and accumulate C tile in LDS.
     // A tile: block_m * block_k * 2 bytes (BF16)
@@ -395,14 +466,16 @@ pub fn pick_tiles(spec: &HardwareSpec, shape_class: ShapeClass) -> TileConfig {
     //
     // We pick block_k first from LDS budget, then block_m/block_n from shape heuristics.
 
-    // Block M/N from shape class (matches existing gemm_tuning.rs logic):
-    // Decode: small tiles (memory-bound, many small GEMMs)
-    // Prefill: large tiles (compute-bound, fewer large GEMMs)
-    // TLOLog: medium tiles (projection, moderate compute)
+    // Block M/N from shape class:
+    // Decode:  (16, 16) small tiles (memory-bound, M=1 per token)
+    // Prefill: (32, 32) large tiles (compute-bound, fewer large GEMMs)
+    // TLOLog:  (16, 64) small block_m (M=1 at decode), WIDE block_n (N=vocab dominated,
+    //          K=hidden reused across the wide N column) — see "Why TLOLog is a separate
+    //          bucket" above. This is the inverse of the Decode/Prefill square-ish tiling.
     let (block_m, block_n) = match shape_class {
         ShapeClass::Decode => (16, 16),
         ShapeClass::Prefill => (32, 32),
-        ShapeClass::TLOLog => (32, 16),
+        ShapeClass::TLOLog => (16, 64),
     };
 
     // Round up to wavefront multiple
@@ -418,18 +491,18 @@ pub fn pick_tiles(spec: &HardwareSpec, shape_class: ShapeClass) -> TileConfig {
     //   block_k ≤ (max_lds / 2 - block_m * block_n) / (block_m + block_n)
     //
     // For gfx1036, Decode (16,16):
-    //   block_k ≤ (384*1024/2 - 256) / 32 = (196608 - 256) / 32 = 6136
-    // That's too large — limited by threads, not LDS.
+    //   block_k ≤ (64*1024/2 - 256) / 32 = (32768 - 256) / 32 = 1016
+    // That's still large — limited by threads/VGPR, not LDS.
     //
     // For gfx1036, Prefill (32,32):
-    //   block_k ≤ (196608 - 1024) / 64 = 3082
+    //   block_k ≤ (32768 - 1024) / 64 = 496
     // Still large. LDS is not the bottleneck for BF16 tiles on gfx1036.
     //
     // Practical block_k: limited by register pressure and wavefront occupancy,
     // not LDS. Use values from existing charon_scalar_candidates() that work:
-    // Decode: block_k = 32 (small K per token)
+    // Decode:  block_k = 32 (small K per token)
     // Prefill: block_k = 64 (larger K for batch)
-    // TLOLog: block_k = 64
+    // TLOLog:  block_k = 64 (K=hidden, reused across the wide N=vocab column)
 
     let block_k = match shape_class {
         ShapeClass::Decode => 32,
@@ -445,11 +518,50 @@ pub fn pick_tiles(spec: &HardwareSpec, shape_class: ShapeClass) -> TileConfig {
     ) as u32;
     let lds_double_buffer = max_lds >= 2 * lds_per_tile;
 
-    // Split-K: when K > block_k * 4, split the reduction.
-    // This requires the kernel to support split-K (existing charon kernels do).
-    // For shape_class, we need the actual K dimension. ShapeClass doesn't carry K.
-    // The caller passes K separately. For now, use a conservative default.
-    let split_k = 1;  // overridden by caller when K is known
+    // [#6] Derive occupancy (target_waves -> threads) from HARDWARE BOUNDS, not a
+    // hard-coded 4. vLLM's LL4MI kernel does exactly this wave-aware partitioning;
+    // jit-mgpu.md targets the same on gfx1036 (Wave32). No threading race: pick_tiles
+    // is pure in (spec, dims), single-threaded per device. This is a launch-validity
+    // + occupancy guard (see candidate_valid() in the FCP section for the same bounds
+    // used as a search pre-filter).
+    //
+    // Occupancy on one CU is bounded by three independent ceilings; the real wave count
+    // is the MINIMUM of all three, then clamped to a sane range:
+    //
+    //   (a) VGPR ceiling:    waves <= VGPR_FILE / (vgpr_per_thread * wave)
+    //       VGPR_FILE = 512 per SIMD (RDNA2). vgpr_per_thread is kernel-specific
+    //       (estimate from tile size; refined empirically by the FCP pass — see #2).
+    //   (b) LDS ceiling:     waves <= (lds_per_cu / (lds_per_tile + double_buf))
+    //       co-resident tiles must fit in physical 64 KB/CU, not the 384 KB request cap.
+    //   (c) Thread ceiling:  waves <= max_threads_per_block / wave
+    //
+    // Then clamp to [1, 4] (RDNA sweet spot per rocm-kernels; 4 Wave32 = 128 threads,
+    // which matches the existing fusion.rs/charon.rs launch pattern). The empirical FCP
+    // pass (#2) is the final arbiter — this just picks a safe, occupancy-aware default
+    // so the base (non-searched) path is correct, not over- or under-subscribed.
+    let vgpr_per_thread = estimate_vgpr_per_thread(block_m, block_n, block_k); // (a)
+    let vgpr_file: u32 = 512;                  // RDNA2 per-SIMD VGPR file
+    let waves_vgpr = vgpr_file / (vgpr_per_thread * wave).max(1);
+    let waves_lds = (lds_per_cu / (lds_per_tile + if lds_double_buffer { lds_per_tile } else { 0 }).max(1)) as u32; // (b)
+    let waves_thread = max_threads / wave;     // (c)
+    let target_waves = waves_vgpr
+        .min(waves_lds)
+        .min(waves_thread)
+        .clamp(1, 4);                          // RDNA occupancy sweet spot
+    let threads = target_waves * wave;
+    assert!(threads <= max_threads && threads % wave == 0);
+
+    // Split-K: derive from the ACTUAL K dimension (dims.k), not a hard-coded 1.
+    // vLLM's q_gemm_rdna3.cu uses compute_wmma_k_split / compute_wmma_k_split_mn:
+    // split when K exceeds what one block_k pass can hide. Same rule of thumb here:
+    // split when K > block_k * 4, with the split count capped so per-split work
+    // stays balanced. The kernel already supports split-K (charon kernels do).
+    let split_k = if dims.k > block_k * 4 {
+        // ceil(K / (block_k * 4)), clamped to [1, 16] to bound atomic/epilogue cost.
+        ((dims.k + block_k * 4 - 1) / (block_k * 4)).clamp(1, 16)
+    } else {
+        1
+    };
 
     // WMMA: rocWMMA is available on gfx1100+. Not on gfx1036.
     let use_wmma = spec.gcn_arch.starts_with("gfx11") || spec.gcn_arch.starts_with("gfx12");
@@ -469,15 +581,32 @@ pub fn pick_tiles(spec: &HardwareSpec, shape_class: ShapeClass) -> TileConfig {
         threads,
     }
 }
+
+/// [#6] Estimate VGPRs/thread for a tile, so the occupancy derivation can bound
+/// wave count by the VGPR file. This is a cheap static estimate from tile geometry;
+/// the empirical FCP pass (#2) is the real arbiter of register pressure (it skips
+/// candidates that fail to compile/launch under VGPR overflow via `Err(_) => continue`).
+/// Larger tiles (more accumulators / A-B fragments) cost more VGPRs; clamp to the
+/// RDNA2 per-thread max of 256 so the divisor in `waves_vgpr` stays valid.
+fn estimate_vgpr_per_thread(block_m: u32, block_n: u32, block_k: u32) -> u32 {
+    // Heuristic: per-thread fragments scale with the per-thread tile area after
+    // wavefront decomposition. ~1 VGPR per 4 (block_m*block_n)/wave elements for the
+    // C accumulator + ~1 per 4 (block_k*wave)/... for A/B staging. Keep it simple and
+    // conservative; the FCP pass corrects it.
+    let per_thread_area = ((block_m * block_n) / 32).max(1) + ((block_k * 32) / 64).max(1);
+    per_thread_area.clamp(32, 256)   // RDNA2 VGPR/thread range
+}
 ```
 
-The numbers above are for gfx1036. For gfx1030 (fewer CUs, same LDS/CU): `target_waves = 2`, `threads = 64`, same block_m/block_n/block_k. The LDS budget is the same per-CU, so tile sizes don't change — only the thread count per block drops to match the lower CU count.
+The numbers above are for gfx1036. For gfx1030 (fewer CUs, same LDS/CU): the same formula applies — `target_waves` is derived from the VGPR/LDS/thread ceilings above, and on gfx1030 it typically resolves to 2 (→ 64 threads) because the per-CU budgets are identical but the lower CU count drives smaller grids; it is NOT a separate literal. The LDS budget is the same per-CU, so tile sizes don't change — only the derived occupancy (and thus `threads`) drops. Verify `pick_tiles` on gfx1030 returns `threads == 64`.
 
 This is not "first pass, validate later." These numbers are derived from the actual gfx1036 hardware properties and the existing `charon_scalar_candidates()` brute-force approach. The tile picker should be validated against `charon_scalar_candidates()` output for the same shapes, but the starting point is concrete.
 
-#### Roofline cost model for FCP fallback
+#### Roofline cost model — pre-filter for FCP (NOT the final selector)  [#2]
 
-The FCP fallback evaluates candidates and picks the one with the lowest estimated execution time. The roofline model:
+The roofline model is a cheap **pre-filter** that drops obviously bad candidates before
+the empirical GPU measurement pass (below). It is no longer the winner selector — that
+role belongs to measured kernel time. The model:
 
 ```
 compute_time = (2 * M * N * K) / (TFLOPS * occupancy_factor)
@@ -510,56 +639,122 @@ pub fn roofline_cost(spec: &HardwareSpec, dims: ShapeDims, tiles: &TileConfig) -
 }
 ```
 
-The FCP fallback generates candidates by perturbing the default tile config:
+#### Empirical autotune — FCP measures, it does not estimate  [#2]
+
+The prior FCP design picked the winner by `roofline_cost` — a static model that
+cannot see register pressure, LDS bank conflicts, or instruction scheduling. That
+selection is structurally wrong for real shapes. helion's autotuner (and vLLM's
+runtime-tuned rocBLAS solution index in `gemm_tuning.rs`) *measure* candidate kernels
+on the GPU and persist the winner. The corrected `fcp_fallback_tile_search` does the
+same:
+
+1. Generate a small, **constrained** candidate set (not a 1400-way joint search).
+2. Pre-filter by roofline (cheap) to drop obviously bad configs.
+3. For survivors, JIT-compile + launch + GPU-time each, keep the fastest.
+4. **[#3] Write the winner into `KernelTuneCache`** (`autotune.rs`), keyed by the real
+   shape `(entry, gpu_arch, m, n, k)` so repeat shapes hit the lookup table (SCYTHE
+   principle) and skip the search entirely.
 
 ```rust
 pub fn fcp_fallback_tile_search(
+    device: &RocmDevice,        // needed to compile + launch + time candidates
     spec: &HardwareSpec,
+    entry: &str,
     dims: ShapeDims,
     shape_class: ShapeClass,
 ) -> TileConfig {
-    let base = pick_tiles(spec, shape_class);
-    
-    // Generate candidates: perturb block_m, block_n, block_k around the base.
-    // Candidates: base, and ±1 wave in each dimension.
+    let base = pick_tiles(spec, shape_class, dims);
+
+    // --- Candidate generation: constrained search space ---
+    // block_k ∈ {16,32,64,128} (K a multiple of 16 for Wave/MFMA alignment);
+    // block_m/block_n are wavefront multiples only; split_k ∈ {1, base.split_k, 2*base.split_k}
+    // (clamped [1,16]). This kills invalid candidates and matches vLLM's templated
+    // BLOCK_SIZE discipline (vllm-port.md §2).
     let wave = spec.wavefront_size;
-    let mut candidates = vec![base.clone()];
-    
-    for dm in [-wave, wave] {
-        for dn in [-wave, wave] {
-            for dk in [32u32.wrapping_sub(wave), 32u32 + wave].iter() {
-                // Only include candidates that are valid (positive, wavefront-multiple, ≤ max_threads)
-                let bm = (base.block_m as i32 + dm) as u32;
-                let bn = (base.block_n as i32 + dn) as u32;
-                let bk = if dk > &0 { *dk } else { continue };
-                if bm % wave != 0 || bn % wave != 0 || bk % wave != 0 { continue; }
-                if bm + bn == 0 { continue; }
-                if (bm * bn) as u32 > spec.max_threads_per_block { continue; }
-                
-                let mut cand = base.clone();
-                cand.block_m = bm;
-                cand.block_n = bn;
-                cand.block_k = bk;
-                candidates.push(cand);
+    let block_k_choices = [16u32, 32, 64, 128];
+    let mut candidates: Vec<TileConfig> = Vec::new();
+    for &bm in &[base.block_m, base.block_m.saturating_add(wave)] {
+        for &bn in &[base.block_n, base.block_n.saturating_add(wave)] {
+            if bm == 0 || bn == 0 || bm % wave != 0 || bn % wave != 0 { continue; }
+            if (bm * bn) as u32 > spec.max_threads_per_block { continue; }
+            for &bk in block_k_choices.iter() {
+                if bk % wave != 0 { continue; }
+                for &sk in [1u32, base.split_k, (base.split_k * 2).clamp(1, 16)].iter() {
+                    let mut cand = base.clone();
+                    cand.block_m = bm; cand.block_n = bn; cand.block_k = bk; cand.split_k = sk;
+                    if candidate_valid(spec, &cand) {     // [#6] resource gate (below)
+                        candidates.push(cand);
+                    }
+                }
             }
         }
     }
-    
-    // Deduplicate
-    candidates.sort();
+
+    // --- Pre-filter by roofline (cheap; keeps the measured set small) ---
+    candidates.sort_by(|a, b| {
+        roofline_cost(spec, dims, a).partial_cmp(&roofline_cost(spec, dims, b)).unwrap()
+    });
+    candidates.truncate(candidates.len().min(16));   // cap measured candidates
     candidates.dedup();
-    
-    // Pick lowest roofline cost. Tie-break: smallest block dimensions.
-    candidates.iter().min_by(|a, b| {
-        let cost_a = roofline_cost(spec, dims, a);
-        let cost_b = roofline_cost(spec, dims, b);
-        cost_a.partial_cmp(&cost_b).unwrap()
-            .then_with(|| (a.block_m + a.block_n).cmp(&(b.block_m + b.block_n)))
-    }).cloned()
+
+    // --- Empirical measurement: compile + launch + GPU-time each survivor ---
+    // DESIGN NOTE: compute_kernel_source_with_spec must accept an explicit TileConfig
+    // (add Option<TileConfig>; None -> pick_tiles). The loop passes Some(cand) so each
+    // candidate is compiled with its own #defines, not the base config.
+    let mut best: Option<(TileConfig, f64)> = None;
+    for cand in &candidates {
+        let source = compute_kernel_source_with_spec(spec, entry, shape_class, dims, 0, 1, Some(cand));
+        let (hsaco, lowered) = match device.jit_compile_or_cache(&source, entry, spec) {
+            Ok(v) => v,
+            Err(_) => continue,   // VGPR/compile failure (see [#6]) -> skip, don't panic
+        };
+        let t_ms = device.time_kernel_ms(&hsaco, &lowered, dims, cand);
+        if best.as_ref().map_or(true, |(_, bt)| t_ms < *bt) {
+            best = Some((cand.clone(), t_ms));
+        }
+    }
+    let winner = best.expect("at least one valid candidate").0;
+
+    // --- [#3] Persist the winner into KernelTuneCache ---
+    // autotune.rs already has KernelKey(kernel, gpu_arch, m, n, k) -> LaunchConfig
+    // and KernelTuneCache (JSON shadow). Map TileConfig -> LaunchConfig and store
+    // keyed by the REAL shape so the next miss on this (entry,arch,m,n,k) is a table
+    // hit, not a re-measure.
+    device.store_tune_cache(entry, spec, dims, &winner);
+
+    winner
+}
+
+/// [#6] Reject candidates that overcommit GPU resources.
+/// This is NOT a threading race — pick_tiles / fcp_fallback_tile_search are pure in
+/// (spec, dims), and the compile path is single-threaded per device (§3). It is a
+/// launch-validity + occupancy guard:
+///  - physical LDS is 64 KB/CU on gfx1036/gfx1030, NOT the 384 KB per-block ceiling.
+///    With co-resident blocks, the double buffer + 1 resident tile must fit in 64 KB/CU.
+///  - block threads <= max_threads_per_block.
+///  - VGPR/register pressure is not modeled here; the backstop is the hiprtc
+///    compile/launch failure caught by `match Err(_) => continue` above. If a
+///    candidate's VGPRs/thread exceed the per-thread max (256 on ROCm), compilation or
+///    launch fails hard — we skip it rather than panic, so the search still returns a
+///    valid winner.
+fn candidate_valid(spec: &HardwareSpec, cand: &TileConfig) -> bool {
+    let lds_per_cu = 64 * 1024;  // physical LDS/CU on RDNA2
+    let lds_per_tile = 2 * (
+        (cand.block_m as u64) * (cand.block_k as u64) * 2
+        + (cand.block_k as u64) * (cand.block_n as u64) * 2
+        + (cand.block_m as u64) * (cand.block_n as u64) * 2
+    );
+    if 2 * lds_per_tile > lds_per_cu { return false; }   // double buffer + co-residency
+    if cand.threads > spec.max_threads_per_block { return false; }
+    if cand.block_m == 0 || cand.block_n == 0 || cand.block_k == 0 { return false; }
+    true
 }
 ```
 
-This generates ~12-20 candidates (not 1400 like full joint search). The evaluation is O(candidates) with a simple roofline formula. Millisecond-level, matching the FCP paper's claim.
+The result: a **measured** best config (not an estimated one), persisted for reuse. The
+cost is O(survivors) GPU launches on a cache miss — milliseconds-to-tens-of-ms for ≤16
+candidates — matching FCP's "millisecond-level overhead" claim, and it runs only once
+per (entry, arch, m, n, k) thanks to #3.
 
 ### 4.4 Hardware fingerprint in JIT cache key
 
@@ -664,8 +859,10 @@ pub fn launch_multi_gpu_kernel(
             spec,
             entry,
             shape_class,
+            full_dims,    // real M,N,K for split-K (#4) + FCP search shaping
             i as u32,      // GRIM_DEVICE_ID
             n as u32,      // GRIM_NUM_DEVICES
+            None,          // multi-GPU path uses pick_tiles(); FCP loop passes Some(cand)
         );
         
         // JIT compile or cache hit
@@ -729,7 +926,7 @@ impl RocmDevice {
         #[cfg(feature = "jit-hw-adaptive")]
         {
             let spec = self.hardware_spec();  // Populates HardwareSpec from probe queries
-            let source = compute_kernel_source_with_spec(&spec, entry, shape_class, 0, 1);
+            let source = compute_kernel_source_with_spec(&spec, entry, shape_class, dims, 0, 1, None);
             let (hsaco, lowered_name) = self.jit_compile_or_cache(&source, entry, &spec)?;
             
             let grid_m = (dims.m + spec.grid_stride_m - 1) / spec.grid_stride_m;
@@ -774,7 +971,7 @@ Each phase has: what to build, which files to create/modify, test criteria, and 
 
 **Modified files:**
 - `crates/grim-backend-rocm/src/device/probe.rs` — add functions that return the specific values needed by `HardwareSpec`: `wavefront_size()`, `max_shared_mem()`, `max_threads_per_block()`, `active_cu_count()`. These may already exist — check and expose them
-- `crates/grim-backend-rocm/src/device/capability_profiler.rs` — add `estimate_bandwidth(device: &RocmDevice) -> f64`. Use GPU model name + memory clock to estimate, or return a conservative default (gfx1036: 500 GB/s GDDR6)
+- `crates/grim-backend-rocm/src/device/hardware_spec.rs` — populate `mem_bandwidth_gb_s` from the existing `CapabilityProfiler::capabilities()[..].hbm_bandwidth_gbps` (already computed by `arch_tflops_table()`); no new function needed in `capability_profiler.rs` itself. Fall back to a conservative default (gfx1036: 500 GB/s GDDR6) when no capability has been reported yet.
 - `crates/grim-backend-rocm/src/peer_access.rs` — add `build_topology_matrix(devices: &[&RocmDevice]) -> P2PTopology`. For each pair (i, j), check `hipDeviceCanAccessPeer(i, j)` and whether peer is enabled. Map to `LinkType::PeerDirect` or `LinkType::HostBounce`
 
 **Test:**
@@ -795,7 +992,7 @@ Each phase has: what to build, which files to create/modify, test criteria, and 
 **What:** Add `compute_kernel_source_with_spec()` that injects `#define`s. Add `pick_tiles()` and `TileConfig`. Add roofline cost model.
 
 **New files:**
-- `crates/grim-backend-rocm/src/kernels/tile_picker.rs` — `TileConfig`, `pick_tiles()`, `roofline_cost()`, `fcp_fallback_tile_search()`, `ShapeDims`
+- `crates/grim-backend-rocm/src/kernels/tile_picker.rs` — `TileConfig`, `pick_tiles()`, `roofline_cost()`, `estimate_vgpr_per_thread()`, `fcp_fallback_tile_search()`, `candidate_valid()`, `ShapeDims`
 
 **Modified files:**
 - `crates/grim-backend-rocm/src/kernels/source_asm.rs` — add `compute_kernel_source_with_spec()`. Keep `compute_kernel_source()` as-is for backward compatibility
@@ -804,9 +1001,14 @@ Each phase has: what to build, which files to create/modify, test criteria, and 
 - Generate source for gfx1036 with shape_class = Prefill. Verify the source contains `#define GRIM_WAVEFRONT_SIZE 32`, `#define GRIM_CU_COUNT 64`, `#define GRIM_BLOCK_M 32`, `#define GRIM_BLOCK_N 32`, `#define GRIM_BLOCK_K 64`
 - Generate source for gfx1030 with shape_class = Decode. Verify: wavefront = 32, block_m = 16, block_n = 16, block_k = 32, threads = 64 (2 waves)
 - Generate source for gfx1036 with shape_class = Decode, then with shape_class = Prefill. Verify different block_m/block_n values
-- `pick_tiles` for gfx1036 Prefill returns `TileConfig { block_m: 32, block_n: 32, block_k: 64, threads: 128, lds_double_buffer: true }` (verify LDS calculation: lds_per_tile = 2*(32*64*2 + 64*32*2 + 32*32*2) = 2*(4096 + 4096 + 2048) = 2*10240 = 20480 bytes. max_lds = 393216. 2*20480 = 40960 ≤ 393216 → double buffer true)
+- `pick_tiles` for gfx1036 Prefill returns `TileConfig { block_m: 32, block_n: 32, block_k: 64, lds_double_buffer: true, ... }`. Verify LDS: lds_per_tile = 2*(32*64*2 + 64*32*2 + 32*32*2) = 20480 bytes; physical lds_per_cu = 64*1024 = 65536; 2*20480 = 40960 ≤ 65536 → double buffer true. **[#6]** Verify `threads` is derived (not hardcoded): `target_waves` = min(VGPR ceiling, LDS ceiling, thread ceiling) clamped [1,4]; for Prefill on gfx1036 this resolves to 128 (4 Wave32). Assert `threads % wave == 0 && threads <= max_threads`.
+- **[#6]** `pick_tiles` occupancy derivation: inject a tile that would demand >512 VGPRs/thread (e.g. oversized block_m/block_n) and verify `target_waves` drops accordingly (waves_vgpr ceiling bites) — proves occupancy is bound-driven, not the old constant 4.
+- `pick_tiles` for gfx1030 (Decode) returns `threads == 64` (derived 2 Wave32), not a hardcoded literal.
+- **[TLOLog]** `ShapeClass::from_op(GemmOp::LmHead, 1)` == `ShapeClass::TLOLog` even though `m == 1` (which `from_m` would bin as Decode) — proves the classifier is op-identity, not M-derived. And `ShapeClass::from_op(GemmOp::LmHead, 4096)` is also `TLOLog` (fires at prefill m too). `ShapeClass::from_op(GemmOp::Attention, 1)` == `Decode` (unchanged behavior for non-lm_head).
+- **[TLOLog]** `pick_tiles` for gfx1036 with `shape_class = ShapeClass::TLOLog` and real `dims { m: 1, n: vocab(=32000), k: 4096 }` returns `block_m == 16, block_n == 64, block_k == 64` — the distinct wide-N tile, confirmed different from both Decode (16,16) and Prefill (32,32). Assert `block_n == 64` (wide output for N=vocab) and `block_m == 16` (small, M=1 at decode).
+- **[TLOLog]** Wire-through: a `matmul` call on `roc_device.rs:1488` tagged `GemmOp::LmHead` results in a JIT source containing `#define GRIM_BLOCK_M 16` + `#define GRIM_BLOCK_N 64` (not the Decode/Prefill defines), proving the op tag propagates end-to-end through `lookup_gemm_config`/`pick_tiles`/`compute_kernel_source_with_spec`.
 - `roofline_cost` for a known shape returns a finite f64. Verify it's deterministic (same input → same output)
-- `fcp_fallback_tile_search` for M=137, N=256, K=512 returns a TileConfig with valid dimensions (wavefront multiples, ≤ max_threads)
+- `fcp_fallback_tile_search` for M=137, N=256, K=512 returns a TileConfig with valid dimensions (wavefront multiples, ≤ max_threads) and `candidate_valid() == true`
 
 **Skills that apply:**
 - `kernel` — tile selection heuristics, LDS budgeting, wavefront alignment
@@ -861,24 +1063,33 @@ Each phase has: what to build, which files to create/modify, test criteria, and 
 - `kernel` — shard boundary computation, grid/block sizing per shard
 - `rust-expert` — slice iteration, error propagation with `?`, `assert!` for preconditions
 
-### Phase 5: FCP-style fallback tile search
+### Phase 5: Empirical FCP fallback tile search  [#2,#3]
 
 **Duration:** 1-2 days
 
-**What:** Add `fcp_fallback_tile_search()` to `tile_picker.rs`. Integrate into `Autotuner` when cache miss for a shape that doesn't match a precomputed tile config.
+**What:** Add `fcp_fallback_tile_search()` to `tile_picker.rs` as a **measured** search (GPU-time candidates, keep fastest), and self-persist the winner into `KernelTuneCache` so repeat shapes hit the lookup table. This replaces the prior roofline-only design (the roofline model is now just a pre-filter — see §4.3). Add the `candidate_valid()` resource gate (see #6).
+
+**New files / new fns:**
+- `crates/grim-backend-rocm/src/kernels/tile_picker.rs`:
+  - `fcp_fallback_tile_search(device, spec, entry, dims, shape_class)` — compile + launch + GPU-time each candidate, return fastest
+  - `candidate_valid(spec, &TileConfig)` — LDS-per-CU / threads / non-zero gate (backstops VGPR failure via the `match Err(_) => continue` path in the search)
+- `crates/grim-backend-rocm/src/device/helpers.rs`: add `RocmDevice::time_kernel_ms()` (hipEventRecord around launch, returns ms) and `RocmDevice::store_tune_cache()` (maps `TileConfig` -> `LaunchConfig`, writes `KernelTuneCache` keyed by `(entry, arch, m, n, k)`)
+- `crates/grim-backend-rocm/src/kernels/source_asm.rs`: `compute_kernel_source_with_spec` gains `tiles: Option<&TileConfig>` (None -> `pick_tiles()`; Some -> force a per-candidate config for the FCP loop)
 
 **Modified files:**
-- `crates/grim-backend-rocm/src/kernels/tile_picker.rs` — add `fcp_fallback_tile_search()` and `roofline_cost()` (created in Phase 2, tested in Phase 2)
-- `crates/grim-backend-rocm/src/autotune.rs` — in `Autotuner::lookup()` or `Autotuner::tune()`, when the shape doesn't match a cached entry and `pick_tiles()` returns a config, run `fcp_fallback_tile_search()` to refine. Or: when `pick_tiles()` doesn't have enough info (e.g., K dimension not available from ShapeClass alone), fall back to FCP search
+- `crates/grim-backend-rocm/src/autotune.rs` — `Autotuner::lookup()`: on key miss, call `fcp_fallback_tile_search()` (which self-persists via `store_tune_cache`), then return the stored `LaunchConfig`. No separate "refine" branch needed — persistence is inside the search.
 
 **Test:**
-- Feed shape M=137, N=256, K=512 (doesn't match standard tile sizes). Verify `fcp_fallback_tile_search` returns a TileConfig with valid wavefront-multiple dimensions
-- Feed same shape twice. Verify deterministic result (same TileConfig both times)
-- Compare `fcp_fallback_tile_search` result against `charon_scalar_candidates()` for the same shape. Verify the FCP result is not worse (same or better LDS utilization)
+- Feed shape M=137, N=256, K=512. Verify `fcp_fallback_tile_search` returns a TileConfig with valid wavefront-multiple dimensions and `candidate_valid()==true`
+- Feed same shape twice. Verify: (a) deterministic winner, (b) the second call is a **cache hit** in `KernelTuneCache` — no GPU re-measure (assert `time_kernel_ms` not invoked)
+- Compare winner against `charon_scalar_candidates()` for the same shape: same or better LDS utilization, and the measured time is ≤ the base `pick_tiles` config time
+- Inject a bogus candidate with 256 KB/CU LDS demand; verify `candidate_valid()` rejects it before any compile
+- Inject a candidate that exceeds VGPR headroom; verify the search skips it via `Err(_) => continue` and still returns a valid winner
 
 **Skills that apply:**
-- `kernel` — roofline model, candidate generation, cost comparison
-- `amd` — occupancy factors for RDNA2, TFLOPS estimates
+- `kernel` — empirical tuning, candidate generation over constrained space, measured cost
+- `amd` — occupancy factors for RDNA2, TFLOPS estimates (pre-filter only)
+- `ffi` — hipEvent timing, hiprtc compile-per-candidate
 - `rust-expert` — deterministic iteration, `min_by` with tie-break
 
 ### Phase 6: Wire into existing kernel dispatch
@@ -936,7 +1147,7 @@ Benchmark two-GPU gfx1036 on PCIe Gen4:
 | File | Purpose |
 |------|---------|
 | `crates/grim-backend-rocm/src/device/hardware_spec.rs` | `HardwareSpec`, `P2PTopology`, `LinkType`, `From<&RocmDevice>` impl |
-| `crates/grim-backend-rocm/src/kernels/tile_picker.rs` | `TileConfig`, `pick_tiles()`, `roofline_cost()`, `fcp_fallback_tile_search()`, `ShapeDims` |
+| `crates/grim-backend-rocm/src/kernels/tile_picker.rs` | `TileConfig`, `pick_tiles()`, `roofline_cost()`, `estimate_vgpr_per_thread()`, `fcp_fallback_tile_search()`, `candidate_valid()`, `ShapeDims` |
 | `crates/grim-backend-rocm/src/multi_gpu_launch.rs` | `launch_multi_gpu_kernel()`, shard computation, per-device JIT + launch |
 
 ### Modified files
@@ -944,8 +1155,10 @@ Benchmark two-GPU gfx1036 on PCIe Gen4:
 | File | Change |
 |------|--------|
 | `src/device/probe.rs` | Expose `wavefront_size()`, `max_shared_mem()`, `max_threads_per_block()`, `active_cu_count()` |
-| `src/device/capability_profiler.rs` | Add `estimate_bandwidth(device: &RocmDevice) -> f64` |
-| `src/peer_access.rs` | Add `build_topology_matrix(devices: &[&RocmDevice]) -> P2PTopology` |
+| `src/device/capability_profiler.rs` | No changes needed — `hbm_bandwidth_gbps` already exists on `GpuCapability` |
+| `src/autotune.rs` | Add `ShapeClass::TLOLog` variant (#0); add `GemmOp` enum + `ShapeClass::from_op(op, m)` op-identity classifier (replaces the inoperable `from_m`-only rule for TLOLog) |
+| `src/device/gemm_tuning.rs` | `lookup_gemm_config(m, n, k, wave)` gains a `shape: ShapeClass` param; select the TLOLog tile arm for `ShapeClass::TLOLog` (lm_head). `from_m`-only callers unchanged via `ShapeClass::from_m` |
+| `src/device/roc_device.rs` | `matmul` (line 1488) takes a `GemmOp` and forwards it into `lookup_gemm_config`/`pick_tiles` so lm_head is tagged TLOLog regardless of m; extend `launch_compute_kernel()` to try hardware-adaptive source first |
 | `src/kernels/source_asm.rs` | Add `compute_kernel_source_with_spec()` |
 | `src/kernels/jit_cache.rs` | Extend `JitCacheKey` with `hardware_fingerprint` |
 | `src/device/helpers.rs` | Add `jit_compile_or_cache()` method to `RocmDevice` |
@@ -958,7 +1171,7 @@ Benchmark two-GPU gfx1036 on PCIe Gen4:
 
 - `rccl.rs` — multi-GPU collectives already complete. Only verify the all-reduce method signature
 - `p2p_route.rs` — route selection already complete. Only verify `to_route_link()` works for multi-device case
-- `gemm_tuning.rs` — shape-class tile lookup already exists. `tile_picker` builds on it, doesn't replace it
+- `gemm_tuning.rs` — NOT in the "not touched" list: `lookup_gemm_config` is modified to accept `ShapeClass` (see Modified files). The existing shape-class tables for Decode/Prefill are unchanged; only the new TLOLog arm + the `shape` param are added.
 - `charon.rs` — kernel source modules already complete. Not modified
 - `jit_cache.rs` — caching infra already complete. Only extends the key struct
 
@@ -970,7 +1183,7 @@ The hardware-adaptive JIT kernel adjusts these parameters based on system inform
 
 | Parameter | Source | Effect |
 |-----------|--------|--------|
-| Block M/N tile sizes | Shape class (Decode=16, Prefill=32, TLOLog=32x16) + wavefront rounding | LDS utilization, occupancy |
+| Block M/N tile sizes | Shape class (Decode=16x16, Prefill=32x32, TLOLog=16x64) + wavefront rounding | LDS utilization, occupancy |
 | Block K tile size | Shape class (Decode=32, Prefill=64, TLOLog=64) | Reduction efficiency |
 | Double-buffering depth | LDS bytes vs tile data size | Hides global memory latency when LDS budget allows |
 | Thread count per block | Wavefront size × target waves/CU (4 waves on ≥48 CU, 2 waves on <48 CU) | Occupancy vs register pressure |

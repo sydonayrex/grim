@@ -20,6 +20,13 @@ extern "C" __global__ void grim_mul_scalar(const float* x, float s, float* out, 
     out[i] = x[i] * s;
 }
 
+extern "C" __global__ void grim_add_scalar(const float* x, float s, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = x[i] + s;
+}
+
+
 extern "C" __global__ void grim_sqrt(const float* x, float* out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;

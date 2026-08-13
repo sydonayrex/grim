@@ -14,9 +14,29 @@ pub struct GemmTileConfig {
     pub split_k: u32,
 }
 
-/// Shape-indexed GEMM tile selection for prefill vs. decode shapes. [see: `m`, `n`, `k`, `block_m`]
+/// Shape-indexed GEMM tile selection for prefill, decode, and TLOLog shapes.
 pub fn lookup_gemm_config(m: usize, n: usize, k: usize, wave: WavefrontSize) -> GemmTileConfig {
+    lookup_gemm_config_for_shape(m, n, k, wave, crate::autotune::ShapeClass::from_m(m))
+}
+
+/// Explicit shape-class aware tile selection function.
+pub fn lookup_gemm_config_for_shape(
+    m: usize,
+    n: usize,
+    k: usize,
+    wave: WavefrontSize,
+    shape: crate::autotune::ShapeClass,
+) -> GemmTileConfig {
+    if shape == crate::autotune::ShapeClass::TLOLog {
+        return GemmTileConfig {
+            block_m: 16,
+            block_n: 64,
+            block_k: 64,
+            split_k: 1,
+        };
+    }
     match wave {
+
         WavefrontSize::W64 => {
             if m <= 8 {
                 // Decode / small-batch path. Asymmetric sizing:

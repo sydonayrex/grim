@@ -446,8 +446,21 @@ impl BackendStorage for RocmStorage {
                 };
                 Ok(bf16_slice.iter().map(|&b| b.to_f32()).collect())
             }
+            grim_tensor::ArithType::U8 => {
+                let mut raw = vec![0u8; elem_count];
+                check_hip("hipMemcpyDtoH (u8)", unsafe {
+                    hipMemcpy(
+                        raw.as_mut_ptr() as *mut c_void,
+                        dev_ptr_void,
+                        self.bytes,
+                        HipMemcpyKind::DeviceToHost,
+                    )
+                })?;
+                Ok(raw.iter().map(|&b| b as f32).collect())
+            }
             // F32 and integer types: direct memcpy into f32 buffer.
             _ => {
+
                 let mut host_data = vec![0.0f32; elem_count];
                 check_hip("hipMemcpyDtoH", unsafe {
                     hipMemcpy(

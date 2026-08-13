@@ -7,6 +7,7 @@ pub mod capability_profiler;
 pub mod cubecl;
 pub mod gemm_tuning;
 pub mod handles;
+pub mod hardware_spec;
 pub mod helpers;
 pub mod layout;
 pub mod probe;
