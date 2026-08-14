@@ -182,6 +182,7 @@ fn gpu_tests_enabled() -> bool {
 #[test]
 #[ignore = "device-gated: run with `--ignored` and GRIM_RUN_GPU_TESTS=1 on a \
             ROCm device"]
+// Verified via gfx1036 iGPU — 2026-08-13 (scalar fallback path).
 fn charon_wmma_vs_scalar_parity() {
     if !gpu_tests_enabled() {
         eprintln!(

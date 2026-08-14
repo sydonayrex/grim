@@ -153,29 +153,36 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
     const unsigned int* stop_ptr,
     unsigned int max_tasks)
 {
-    // Persistent loop: one wave polls forever. (In a real deployment this is
-    // launched with a fixed-iteration count or signals exit via a sentinel
-    // slot; for the structural integration test the body is what matters.)
-    unsigned int processed = 0;
-    while (processed < max_tasks && atomicAdd((unsigned int*)stop_ptr, 0) == 0u) {
-        unsigned int tail = atomicAdd(tail_ptr, 0); // read current tail
-        unsigned int head = atomicAdd((unsigned int*)head_ptr, 0);
-        if (tail == head) continue;
-        unsigned int slot_idx = tail & (capacity - 1); // power-of-2 mod
-        scythe_task_descriptor_t* desc = &slots[slot_idx];
-
-        // Acquire-load status; pending → claim.
-        unsigned int st = atomicAdd((unsigned int*)&desc->status, 0);
-        if (st != ST_PENDING) {
-            // Nothing to do this iteration; in a real persistent kernel we'd
-            // yield or back off. For the structural test the JIT-compile
-            // shape is what matters.
+    // Lane zero owns queue control; the whole block cooperates on the claimed
+    // descriptor so Charon receives the launch width it expects. Shared state
+    // also gives every lane the same termination condition.
+    __shared__ unsigned int claimed_slot;
+    __shared__ unsigned int active;
+    __shared__ unsigned int terminate;
+    if (threadIdx.x == 0) terminate = 0;
+    __syncthreads();
+    for (unsigned int iteration = 0; iteration < max_tasks; ++iteration) {
+        if (atomicAdd((unsigned int*)stop_ptr, 0) != 0u) break;
+        if (threadIdx.x == 0) {
+            active = 0;
+            unsigned int tail = atomicAdd(tail_ptr, 0);
+            unsigned int head = atomicAdd((unsigned int*)head_ptr, 0);
+            if (tail != head) {
+                claimed_slot = tail & (capacity - 1);
+                scythe_task_descriptor_t* candidate = &slots[claimed_slot];
+                if (atomicCAS((unsigned int*)&candidate->status, ST_PENDING, ST_RUNNING) == ST_PENDING)
+                    active = 1;
+            }
+        }
+        __syncthreads();
+        if (!active) {
+            if (threadIdx.x == 0)
+                terminate = atomicAdd((unsigned int*)head_ptr, 0) == atomicAdd(tail_ptr, 0);
+            __syncthreads();
+            if (terminate) break;
             continue;
         }
-        // Claim atomically (CAS-like: set running; a real impl would CAS).
-        unsigned int expected = ST_PENDING;
-        if (atomicCAS((unsigned int*)&desc->status, expected, ST_RUNNING) != ST_PENDING)
-            continue;
+        scythe_task_descriptor_t* desc = &slots[claimed_slot];
 
         // Dispatch on opcode.
         if (desc->opcode == OP_MOE) {
@@ -184,35 +191,28 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
             // structural test below pins each one so a regression that
             // drops or mis-reads a field fails the host-side check.
             moe_task_descriptor_t* moe =
-                (moe_task_descriptor_t*)(uintptr_t)desc->weight_ptr;
+                (moe_task_descriptor_t*)desc->weight_ptr;
 
-            const float* activations = (const float*)(uintptr_t)desc->input_ptr;
-            float* out = (float*)(uintptr_t)desc->output_ptr;
+            const float* activations = (const float*)desc->input_ptr;
+            float* out = (float*)desc->output_ptr;
 
-            const float* gate_w = (const float*)(uintptr_t)moe->gate_w_ptr;
-            const float* up_w   = (const float*)(uintptr_t)moe->up_w_ptr;
-            const float* down_w = (const float*)(uintptr_t)moe->down_w_ptr;
+            const float* gate_w = (const float*)moe->gate_w_ptr;
+            const float* up_w   = (const float*)moe->up_w_ptr;
+            const float* down_w = (const float*)moe->down_w_ptr;
 
             // The schedule struct holds sorted_token_ids, sorted_expert_ids,
             // sorted_weights contiguously; the host lays them out in that
             // order. The device reads three pointers off schedule_ptr.
             const unsigned int* sorted_token_ids =
-                (const unsigned int*)(uintptr_t)moe->schedule_ptr;
+                (const unsigned int*)moe->schedule_ptr;
             const unsigned int* sorted_expert_ids =
-                (const unsigned int*)(uintptr_t)(moe->schedule_ptr + sizeof(unsigned int) * moe->num_tokens);
+                (const unsigned int*)(moe->schedule_ptr + sizeof(unsigned int) * moe->num_tokens);
             const float* sorted_weights =
-                (const float*)(uintptr_t)(moe->schedule_ptr + 2ull * sizeof(unsigned int) * moe->num_tokens);
+                (const float*)(moe->schedule_ptr + 2ull * sizeof(unsigned int) * moe->num_tokens);
 
             // Branch on quant_mode — FP32 here, quantized variants would
             // call grim_moe_fused_grouped_{fp8,mxfp4,mxfp8,q80,iqk}.
             if (moe->quant_mode == MOE_QUANT_FP32) {
-                // Call the Charon FP32 grouped forward inline. blockDim/gridDim
-                // are inherited from THIS persistent kernel's launch config —
-                // a real deployment would either (a) launch a child grid via
-                // hipLaunchKernel (matches the "no separate launch" rule by
-                // keeping it device-side) or (b) restructure grim_moe_fused_grouped
-                // as a __device__ function called directly. The inline-call
-                // shape is preserved here per the plan.
                 grim_moe_fused_grouped_device(
                     activations, gate_w, up_w, down_w,
                     sorted_token_ids, sorted_expert_ids, sorted_weights,
@@ -221,10 +221,7 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
                     (int)moe->num_tokens, (int)moe->block_size,
                     moe->routed_scaling_factor);
             } else {
-                atomicExch((unsigned int*)&desc->status, ST_ERROR);
-                atomicAdd(tail_ptr, 1);
-                ++processed;
-                continue;
+                if (threadIdx.x == 0) atomicExch((unsigned int*)&desc->status, ST_ERROR);
             }
         }
         // (Opcodes 0–5 dispatch to their respective kernels here in a full
@@ -233,17 +230,17 @@ extern "C" __global__ void grim_scythe_persistent_dispatch(
         //  the WI-Charon-3 scope is the opcode-6 arm.)
 
         if (desc->opcode != OP_MOE && desc->opcode != OP_NOP) {
-            atomicExch((unsigned int*)&desc->status, ST_ERROR);
-            atomicAdd(tail_ptr, 1);
-            ++processed;
-            continue;
+            if (threadIdx.x == 0) atomicExch((unsigned int*)&desc->status, ST_ERROR);
         }
 
         // Mark complete and advance tail.
-        __threadfence();
-        atomicExch((unsigned int*)&desc->status, ST_COMPLETE);
-        atomicAdd(tail_ptr, 1);
-        ++processed;
+        __syncthreads();
+        if (threadIdx.x == 0 && desc->status == ST_RUNNING) {
+            __threadfence();
+            atomicExch((unsigned int*)&desc->status, ST_COMPLETE);
+            atomicAdd(tail_ptr, 1);
+        }
+        __syncthreads();
     }
 }
 "#;
@@ -318,7 +315,7 @@ mod tests {
         );
         // The MoE arm must cast weight_ptr to moe_task_descriptor_t*.
         assert!(
-            src.contains("(moe_task_descriptor_t*)(uintptr_t)desc->weight_ptr"),
+            src.contains("(moe_task_descriptor_t*)desc->weight_ptr"),
             "opcode-6 arm must cast desc->weight_ptr to moe_task_descriptor_t*",
         );
     }
@@ -390,16 +387,17 @@ mod tests {
     /// Verifies that when ROCm hardware is present, launching `grim_scythe_persistent_dispatch`
     /// against a VRAM task slot carrying opcode=6 processes the slot and marks it complete (ST_COMPLETE=2).
     #[test]
+    // Verified via gfx1036 iGPU — 2026-08-13.
     fn rocm_persistent_dispatch_opcode_6_device_gated() {
         use crate::RocmDevice;
-        use grim_tensor::{BackendDevice, Shape};
         use grim_tensor::dtype::{ArithType, DType, Storage};
+        use grim_tensor::{BackendDevice, Shape};
 
         let dev = match RocmDevice::try_new(0) {
             Ok(d) => d,
-            Err(_) => {
+            Err(error) => {
                 eprintln!(
-                    "ROCm device unavailable: skipping rocm_persistent_dispatch_opcode_6_device_gated"
+                    "ROCm device unavailable ({error:?}): skipping rocm_persistent_dispatch_opcode_6_device_gated"
                 );
                 return;
             }
@@ -410,24 +408,43 @@ mod tests {
             return;
         }
 
-        let u32_dtype = DType { arith: ArithType::U32, storage: Storage::Native };
+        let u32_dtype = DType {
+            arith: ArithType::U32,
+            storage: Storage::Native,
+        };
         let u32_storage = |values: &[u32]| {
             let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            dev.from_cpu_bytes(&bytes, &Shape::new(vec![values.len()]), u32_dtype.clone()).unwrap()
+            dev.from_cpu_bytes(&bytes, &Shape::new(vec![values.len()]), u32_dtype.clone())
+                .unwrap()
         };
-        let input = dev.from_cpu(&[2.0f32], &Shape::new(vec![1]), DType::F32).unwrap();
-        let input2 = dev.from_cpu(&[2.0f32], &Shape::new(vec![1]), DType::F32).unwrap();
-        let gate = dev.from_cpu(&[1.0f32], &Shape::new(vec![1]), DType::F32).unwrap();
-        let up = dev.from_cpu(&[1.0f32], &Shape::new(vec![1]), DType::F32).unwrap();
-        let down = dev.from_cpu(&[1.0f32], &Shape::new(vec![1]), DType::F32).unwrap();
-        let output = dev.from_cpu(&[0.0f32], &Shape::new(vec![1]), DType::F32).unwrap();
-        let output2 = dev.from_cpu(&[0.0f32], &Shape::new(vec![1]), DType::F32).unwrap();
+        let input = dev
+            .from_cpu(&[2.0f32], &Shape::new(vec![1]), DType::F32)
+            .unwrap();
+        let input2 = dev
+            .from_cpu(&[2.0f32], &Shape::new(vec![1]), DType::F32)
+            .unwrap();
+        let gate = dev
+            .from_cpu(&[1.0f32], &Shape::new(vec![1]), DType::F32)
+            .unwrap();
+        let up = dev
+            .from_cpu(&[1.0f32], &Shape::new(vec![1]), DType::F32)
+            .unwrap();
+        let down = dev
+            .from_cpu(&[1.0f32], &Shape::new(vec![1]), DType::F32)
+            .unwrap();
+        let output = dev
+            .from_cpu(&[0.0f32], &Shape::new(vec![1]), DType::F32)
+            .unwrap();
+        let output2 = dev
+            .from_cpu(&[0.0f32], &Shape::new(vec![1]), DType::F32)
+            .unwrap();
         let schedule = {
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&0u32.to_ne_bytes());
             bytes.extend_from_slice(&0u32.to_ne_bytes());
             bytes.extend_from_slice(&1.0f32.to_ne_bytes());
-            dev.from_cpu_bytes(&bytes, &Shape::new(vec![3]), u32_dtype.clone()).unwrap()
+            dev.from_cpu_bytes(&bytes, &Shape::new(vec![3]), u32_dtype.clone())
+                .unwrap()
         };
         let mut moe = vec![0u8; 96];
         moe[0..4].copy_from_slice(&1u32.to_ne_bytes());
@@ -440,27 +457,60 @@ mod tests {
         moe[40..48].copy_from_slice(&up.device_ptr().unwrap().to_ne_bytes());
         moe[48..56].copy_from_slice(&down.device_ptr().unwrap().to_ne_bytes());
         moe[56..64].copy_from_slice(&schedule.device_ptr().unwrap().to_ne_bytes());
-        let moe_storage = dev.from_cpu_bytes(&moe, &Shape::new(vec![96]), DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
+        let moe_storage = dev
+            .from_cpu_bytes(
+                &moe,
+                &Shape::new(vec![96]),
+                DType {
+                    arith: ArithType::U8,
+                    storage: Storage::Native,
+                },
+            )
+            .unwrap();
         let mut slot = vec![0u8; 64];
         slot[0..4].copy_from_slice(&6u32.to_ne_bytes());
-        slot[32..40].copy_from_slice(&input.device_ptr().unwrap().to_ne_bytes());
-        slot[40..48].copy_from_slice(&moe_storage.device_ptr().unwrap().to_ne_bytes());
-        slot[48..56].copy_from_slice(&output.device_ptr().unwrap().to_ne_bytes());
+        slot[16..24].copy_from_slice(&input.device_ptr().unwrap().to_ne_bytes());
+        slot[24..32].copy_from_slice(&moe_storage.device_ptr().unwrap().to_ne_bytes());
+        slot[32..40].copy_from_slice(&output.device_ptr().unwrap().to_ne_bytes());
         let mut slot2 = slot.clone();
-        slot2[32..40].copy_from_slice(&input2.device_ptr().unwrap().to_ne_bytes());
-        slot2[48..56].copy_from_slice(&output2.device_ptr().unwrap().to_ne_bytes());
+        slot2[16..24].copy_from_slice(&input2.device_ptr().unwrap().to_ne_bytes());
+        slot2[32..40].copy_from_slice(&output2.device_ptr().unwrap().to_ne_bytes());
         let mut slots_bytes = slot;
         slots_bytes.extend_from_slice(&slot2);
-        let slots = dev.from_cpu_bytes(&slots_bytes, &Shape::new(vec![128]), DType { arith: ArithType::U8, storage: Storage::Native }).unwrap();
+        let slots = dev
+            .from_cpu_bytes(
+                &slots_bytes,
+                &Shape::new(vec![128]),
+                DType {
+                    arith: ArithType::U8,
+                    storage: Storage::Native,
+                },
+            )
+            .unwrap();
         let tail = u32_storage(&[0]);
         let head = u32_storage(&[2]);
         let stop = u32_storage(&[0]);
-        let handle = dev.launch_scythe_persistent_dispatch(slots.as_ref(), 2, tail.as_ref(), head.as_ref(), stop.as_ref(), 2).unwrap();
+        let handle = dev
+            .launch_scythe_persistent_dispatch(
+                slots.as_ref(),
+                2,
+                tail.as_ref(),
+                head.as_ref(),
+                stop.as_ref(),
+                2,
+            )
+            .unwrap();
         handle.synchronize().unwrap();
         let result = output.to_cpu_vec_f32().unwrap()[0];
         let expected = 2.0f32 / (1.0 + (-2.0f32).exp()) * 2.0;
-        assert!((result - expected).abs() < 1e-4, "persistent opcode-6 output {result} != {expected}");
+        assert!(
+            (result - expected).abs() < 1e-4,
+            "persistent opcode-6 output {result} != {expected}"
+        );
         let result2 = output2.to_cpu_vec_f32().unwrap()[0];
-        assert!((result2 - expected).abs() < 1e-4, "second opcode-6 output {result2} != {expected}");
+        assert!(
+            (result2 - expected).abs() < 1e-4,
+            "second opcode-6 output {result2} != {expected}"
+        );
     }
 }

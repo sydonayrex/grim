@@ -46,6 +46,33 @@ pub static FUSED_FORWARD_DISPATCH_STATS: FusedForwardDispatchStats = FusedForwar
 
 // Symbols that lib.rs re-exports publicly. They live in sub-modules [see: `crate::*`, `pub use`]
 use crate::{
+    CapturedGraph,
+    DecodeGemmConfig,
+    FusedDequantGemmConfig,
+    // HIP types / constants
+    HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS,
+    HIP_DEVICE_ATTRIBUTE_WARP_SIZE,
+    HipDim3,
+    HipErrorT,
+    HipMemcpyKind,
+    // kernel cache + graph capture
+    HsacoKernelCache,
+    QkvAttentionFusionConfig,
+    QuantMode,
+    ROCBLAS_GEMM_FLAGS_NONE,
+    RmsNormMatMulFusionConfig,
+    RocblasInt,
+    RocblasOperation,
+    RoclabsHandle,
+    RocmCachingAllocator,
+    RocmDeviceProps,
+    RocmHandle,
+    RocmPinnedBuffer,
+    // Misc types
+    RocmStorage,
+    SplitKGemmConfig,
+    WavefrontSize,
+    WmmaGemmConfig,
     // lib.rs helpers (re-exported from memory/, device::util/, etc.)
     arg,
     // rocBLAS FFI
@@ -93,33 +120,6 @@ use crate::{
     rocblas_status_success,
     select_gemm_algo,
     upload_device_buffer,
-    CapturedGraph,
-    DecodeGemmConfig,
-    FusedDequantGemmConfig,
-    HipDim3,
-    HipErrorT,
-    HipMemcpyKind,
-    // kernel cache + graph capture
-    HsacoKernelCache,
-    QkvAttentionFusionConfig,
-    QuantMode,
-    RmsNormMatMulFusionConfig,
-    RocblasInt,
-    RocblasOperation,
-    RoclabsHandle,
-    RocmCachingAllocator,
-    RocmDeviceProps,
-    RocmHandle,
-    RocmPinnedBuffer,
-    // Misc types
-    RocmStorage,
-    SplitKGemmConfig,
-    WavefrontSize,
-    WmmaGemmConfig,
-    // HIP types / constants
-    HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS,
-    HIP_DEVICE_ATTRIBUTE_WARP_SIZE,
-    ROCBLAS_GEMM_FLAGS_NONE,
 };
 
 #[derive(Debug)]
@@ -3948,7 +3948,7 @@ impl BackendDevice for RocmDevice {
 
 // to `device::gemm_tuning` — see that module.
 pub use crate::device::gemm_tuning::{
-    lookup_gemm_config, lookup_gemm_config_for_shape, lookup_solution_index, GemmTileConfig,
+    GemmTileConfig, lookup_gemm_config, lookup_gemm_config_for_shape, lookup_solution_index,
 };
 
 // Re-exports that pulled up `pub use crate::graph_capture::*` etc. in [see: `pub use`]
@@ -8370,46 +8370,150 @@ impl RocmDevice {
         let w = as_rocm(lm_head)?;
         let t = as_rocm(targets)?;
         if !h.device_ptr_is_valid() || !w.device_ptr_is_valid() || !t.device_ptr_is_valid() {
-            return Err(Error::Backend("fused_linear_ce: invalid input pointer".into()));
+            return Err(Error::Backend(
+                "fused_linear_ce: invalid input pointer".into(),
+            ));
         }
         let hd = hidden.shape().dims();
         let wd = lm_head.shape().dims();
         let td = targets.shape().dims();
         if hd.len() != 2 || wd.len() != 2 || td.len() != 1 || td[0] != hd[0] || wd[1] != hd[1] {
-            return Err(Error::Shape("fused_linear_ce: incompatible input shapes".into()));
+            return Err(Error::Shape(
+                "fused_linear_ce: incompatible input shapes".into(),
+            ));
         }
         if v_tile_size <= 0 {
-            return Err(Error::Backend("fused_linear_ce: v_tile_size must be positive".into()));
+            return Err(Error::Backend(
+                "fused_linear_ce: v_tile_size must be positive".into(),
+            ));
         }
         let batch = hd[0];
-        let loss = RocmStorage::alloc_gpu(&Shape::new(vec![batch]), dtype_f32(), &self.allocator, self.ordinal)?;
-        let lse = RocmStorage::alloc_gpu(&Shape::new(vec![batch]), dtype_f32(), &self.allocator, self.ordinal)?;
-        let mut hp = dev_ptr(h)?; let mut wp = dev_ptr(w)?; let mut tp = dev_ptr(t)?;
-        let mut lp = dev_ptr(&loss)?; let mut ep = dev_ptr(&lse)?;
-        let mut k = hd[1] as i32; let mut v = wd[0] as i32; let mut tile = v_tile_size; let mut b = batch as i32;
+        let loss = RocmStorage::alloc_gpu(
+            &Shape::new(vec![batch]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let lse = RocmStorage::alloc_gpu(
+            &Shape::new(vec![batch]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let mut hp = dev_ptr(h)?;
+        let mut wp = dev_ptr(w)?;
+        let mut tp = dev_ptr(t)?;
+        let mut lp = dev_ptr(&loss)?;
+        let mut ep = dev_ptr(&lse)?;
+        let mut k = hd[1] as i32;
+        let mut v = wd[0] as i32;
+        let mut tile = v_tile_size;
+        let mut b = batch as i32;
         let block = crate::HipDim3 { x: 128, y: 1, z: 1 };
-        let grid = crate::HipDim3 { x: ((batch + 127) / 128) as u32, y: 1, z: 1 };
-        self.launch_compute_kernel("grim_fused_linear_ce_forward", grid, block, &mut [arg(&mut hp), arg(&mut wp), arg(&mut tp), arg(&mut lp), arg(&mut ep), arg(&mut k), arg(&mut v), arg(&mut tile), arg(&mut b)])?;
-        Ok((Box::new(loss), Box::new(lse), Box::new(RocmHandle::new(Some(self.active_stream())))))
+        let grid = crate::HipDim3 {
+            x: ((batch + 127) / 128) as u32,
+            y: 1,
+            z: 1,
+        };
+        self.launch_compute_kernel(
+            "grim_fused_linear_ce_forward",
+            grid,
+            block,
+            &mut [
+                arg(&mut hp),
+                arg(&mut wp),
+                arg(&mut tp),
+                arg(&mut lp),
+                arg(&mut ep),
+                arg(&mut k),
+                arg(&mut v),
+                arg(&mut tile),
+                arg(&mut b),
+            ],
+        )?;
+        Ok((
+            Box::new(loss),
+            Box::new(lse),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
     }
 
     /// Launch the Design-A on-device linear cross-entropy backward pass.
     pub fn fused_linear_cross_entropy_backward(
-        &self, hidden: &dyn BackendStorage, lm_head: &dyn BackendStorage,
-        targets: &dyn BackendStorage, lse: &dyn BackendStorage, v_tile_size: i32,
+        &self,
+        hidden: &dyn BackendStorage,
+        lm_head: &dyn BackendStorage,
+        targets: &dyn BackendStorage,
+        lse: &dyn BackendStorage,
+        v_tile_size: i32,
         inv_batch: f32,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let h = as_rocm(hidden)?; let w = as_rocm(lm_head)?; let t = as_rocm(targets)?; let e = as_rocm(lse)?;
-        if !h.device_ptr_is_valid() || !w.device_ptr_is_valid() || !t.device_ptr_is_valid() || !e.device_ptr_is_valid() { return Err(Error::Backend("fused_linear_ce: invalid input pointer".into())); }
-        let hd = hidden.shape().dims(); let wd = lm_head.shape().dims();
-        if hd.len() != 2 || wd.len() != 2 || wd[1] != hd[1] || targets.shape().elem_count() != hd[0] { return Err(Error::Shape("fused_linear_ce: incompatible input shapes".into())); }
-        if v_tile_size <= 0 { return Err(Error::Backend("fused_linear_ce: v_tile_size must be positive".into())); }
-        let batch = hd[0]; let grad = RocmStorage::alloc_gpu(hidden.shape(), dtype_f32(), &self.allocator, self.ordinal)?;
-        let mut hp = dev_ptr(h)?; let mut wp = dev_ptr(w)?; let mut tp = dev_ptr(t)?; let mut ep = dev_ptr(e)?; let mut gp = dev_ptr(&grad)?;
-        let mut k = hd[1] as i32; let mut v = wd[0] as i32; let mut tile = v_tile_size; let mut inv = inv_batch; let mut b = batch as i32;
-        let block = crate::HipDim3 { x: 128, y: 1, z: 1 }; let grid = crate::HipDim3 { x: ((batch + 127) / 128) as u32, y: 1, z: 1 };
-        self.launch_compute_kernel("grim_fused_linear_ce_backward", grid, block, &mut [arg(&mut hp), arg(&mut wp), arg(&mut tp), arg(&mut ep), arg(&mut gp), arg(&mut k), arg(&mut v), arg(&mut tile), arg(&mut inv), arg(&mut b)])?;
-        Ok((Box::new(grad), Box::new(RocmHandle::new(Some(self.active_stream())))))
+        let h = as_rocm(hidden)?;
+        let w = as_rocm(lm_head)?;
+        let t = as_rocm(targets)?;
+        let e = as_rocm(lse)?;
+        if !h.device_ptr_is_valid()
+            || !w.device_ptr_is_valid()
+            || !t.device_ptr_is_valid()
+            || !e.device_ptr_is_valid()
+        {
+            return Err(Error::Backend(
+                "fused_linear_ce: invalid input pointer".into(),
+            ));
+        }
+        let hd = hidden.shape().dims();
+        let wd = lm_head.shape().dims();
+        if hd.len() != 2 || wd.len() != 2 || wd[1] != hd[1] || targets.shape().elem_count() != hd[0]
+        {
+            return Err(Error::Shape(
+                "fused_linear_ce: incompatible input shapes".into(),
+            ));
+        }
+        if v_tile_size <= 0 {
+            return Err(Error::Backend(
+                "fused_linear_ce: v_tile_size must be positive".into(),
+            ));
+        }
+        let batch = hd[0];
+        let grad =
+            RocmStorage::alloc_gpu(hidden.shape(), dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut hp = dev_ptr(h)?;
+        let mut wp = dev_ptr(w)?;
+        let mut tp = dev_ptr(t)?;
+        let mut ep = dev_ptr(e)?;
+        let mut gp = dev_ptr(&grad)?;
+        let mut k = hd[1] as i32;
+        let mut v = wd[0] as i32;
+        let mut tile = v_tile_size;
+        let mut inv = inv_batch;
+        let mut b = batch as i32;
+        let block = crate::HipDim3 { x: 128, y: 1, z: 1 };
+        let grid = crate::HipDim3 {
+            x: ((batch + 127) / 128) as u32,
+            y: 1,
+            z: 1,
+        };
+        self.launch_compute_kernel(
+            "grim_fused_linear_ce_backward",
+            grid,
+            block,
+            &mut [
+                arg(&mut hp),
+                arg(&mut wp),
+                arg(&mut tp),
+                arg(&mut ep),
+                arg(&mut gp),
+                arg(&mut k),
+                arg(&mut v),
+                arg(&mut tile),
+                arg(&mut inv),
+                arg(&mut b),
+            ],
+        )?;
+        Ok((
+            Box::new(grad),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
     }
 
     /// Launch one bounded Scythe persistent worker. The worker is intentionally
@@ -8434,8 +8538,14 @@ impl RocmDevice {
             "grim_scythe_persistent_dispatch",
             crate::HipDim3::new(1, 1, 1),
             crate::HipDim3::new(128, 1, 1),
-            &mut [arg(&mut slots_ptr), arg(&mut cap), arg(&mut tail_ptr),
-                arg(&mut head_ptr), arg(&mut stop_ptr), arg(&mut limit)],
+            &mut [
+                arg(&mut slots_ptr),
+                arg(&mut cap),
+                arg(&mut tail_ptr),
+                arg(&mut head_ptr),
+                arg(&mut stop_ptr),
+                arg(&mut limit),
+            ],
         )?;
         Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
     }

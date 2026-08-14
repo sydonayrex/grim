@@ -9,7 +9,8 @@ extern "C" __global__ void grim_fused_linear_ce_forward(
     float* loss_out, float* lse_out, int hidden_dim, int vocab_size, int v_tile_size, int batch) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= batch || row < 0) return;
-    float max_logit = -INFINITY;
+    // HIPRTC does not guarantee the C math macro INFINITY is defined.
+    float max_logit = -3.402823466e+38f;
     float sum_exp = 0.0f;
     float target_logit = 0.0f;
     int target = targets[row];

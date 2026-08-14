@@ -30,6 +30,7 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::quant_standalone::KERNEL_SOURCE);
     s.push_str(crate::kernels::silu_mul_quant::SILU_MUL_QUANT_KERNEL_SOURCE);
     s.push_str(crate::kernels::sage_attention::SAGE_ATTENTION_KERNEL_SOURCE);
+    s.push_str(crate::kernels::scythe_persistent::KERNEL_SOURCE);
     s
 }
 
