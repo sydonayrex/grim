@@ -24,7 +24,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, Sse},
     },
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use futures::stream::{self, Stream, StreamExt};
 use grim_core::error::Result;
@@ -2142,6 +2142,53 @@ async fn unload_model(
     }
 }
 
+async fn list_adapters(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let engine = state.lock_engine();
+    let adapters = engine
+        .adapters
+        .values()
+        .map(|adapter| {
+            serde_json::json!({
+                "id": adapter.handle.id,
+                "name": adapter.name,
+                "base_model": adapter.base_model_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({ "object": "list", "data": adapters }))
+}
+
+async fn unload_adapter(
+    Path(name): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut engine = state.lock_engine();
+    let adapter_id = engine
+        .adapters
+        .values()
+        .find(|adapter| adapter.name == name)
+        .map(|adapter| adapter.handle.id);
+    match adapter_id {
+        Some(id) if engine.drop_adapter(id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "unloaded",
+                "name": name,
+                "id": id
+            })),
+        ),
+        _ => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "adapter_not_found",
+                    "message": format!("adapter '{}' is not loaded", name)
+                }
+            })),
+        ),
+    }
+}
+
 /// Retrieve default model configured in the config file.
 fn get_default_model_from_config() -> Option<String> {
     let paths = vec![
@@ -2846,10 +2893,9 @@ async fn grim_tags(State(_state): State<Arc<AppState>>) -> Json<serde_json::Valu
                 entry.quant.clone()
             };
             let digest = if entry.sha256.is_empty() {
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string()
+                serde_json::Value::Null
             } else {
-                entry.sha256.clone()
+                serde_json::Value::String(entry.sha256.clone())
             };
             let modified_at = if entry.pulled_at.is_empty() {
                 "2026-07-19T00:00:00Z".to_string()
@@ -2937,6 +2983,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models/load", post(load_model))
         .route("/v1/models/unload", post(unload_model))
+        .route("/v1/adapters", get(list_adapters))
+        .route("/v1/adapters/:name", delete(unload_adapter))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/audio/transcriptions", post(audio_transcriptions))
         .route("/v1/images/generations", post(images_generations))
@@ -3460,6 +3508,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adapter_lifecycle_lists_and_rejects_unknown_unload() {
+        let state = test_state_with_model("fixture-model");
+        let list = list_adapters(State(state.clone())).await.0;
+        assert_eq!(list["object"], "list");
+        assert!(list["data"].as_array().unwrap().is_empty());
+
+        let (status, Json(body)) =
+            unload_adapter(Path("missing-adapter".to_string()), State(state)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["type"], "adapter_not_found");
+    }
+
+    #[tokio::test]
     async fn acceptance_model_catalog_chat_status_and_unknown_model_error() {
         let app = build_router(test_state_with_model("fixture-model"));
 
@@ -3787,6 +3848,7 @@ mod tests {
                 kind: PluginKind::Wasm,
                 capabilities: PluginCapabilities::SAMPLER,
                 entry: "sampler.wasm".into(),
+                sha256: None,
                 limits: None,
                 stage: None,
                 priority: None,

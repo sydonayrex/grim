@@ -120,6 +120,8 @@ pub struct PluginManifest {
     pub kind: PluginKind,
     pub capabilities: PluginCapabilities,
     pub entry: String,
+    /// Optional SHA-256 digest of the entry file, written as lowercase hex.
+    pub sha256: Option<String>,
     pub limits: Option<PluginLimits>,
     pub stage: Option<String>,
     pub priority: Option<i32>,
@@ -200,6 +202,10 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let sha256 = plugin
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .map(str::to_ascii_lowercase);
 
     let stage = plugin
         .get("stage")
@@ -276,6 +282,7 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest> {
         kind,
         capabilities,
         entry,
+        sha256,
         limits,
         stage,
         priority,
@@ -434,6 +441,7 @@ max_memory_mb = 64
             kind: PluginKind::Wasm,
             capabilities: PluginCapabilities::SAMPLER,
             entry: "t.wasm".into(),
+            sha256: None,
             limits: None,
             stage: None,
             priority: None,

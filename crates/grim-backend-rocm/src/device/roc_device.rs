@@ -9662,21 +9662,47 @@ impl grim_format::convert::GpuDequant for RocmDevice {
         bytes: &[u8],
         elem_count: usize,
     ) -> grim_tensor::error::Result<Option<Vec<f32>>> {
+        use grim_tensor::dtype::{BlockDtype, FloatPackScheme, KQuantScheme, Storage};
         match storage {
-            // Q8_0 is bit-exact between CPU `dequant_q80` and the ROCm
-            // `dequantize_q8_0` kernel (block-major f16 scale + 32 int8).
-            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80) => {
+            Storage::KQuant(KQuantScheme::Q80) => {
                 Ok(Some(self.dequantize_q8_0_host(bytes, elem_count)?))
             }
-            // Q4_K: bit-exact between CPU `dequant_q4k` and the ROCm
-            // `dequantize_q4k` kernel (interleaved-pair nibble layout,
-            // 6-bit packed sub-block scale/min). Routed through the GPU kernel
-            // instead of the CPU fallback.
-            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K) => {
+            Storage::KQuant(KQuantScheme::Q4K) => {
                 Ok(Some(self.dequantize_q4k_host(bytes, elem_count)?))
             }
-            // IQ grid-decode formats and other schemes whose GPU kernels do not
-            // yet match the CPU reference layouts remain on the CPU fallback.
+            Storage::KQuant(KQuantScheme::IQ2XXS) => {
+                Ok(Some(self.dequantize_iq2xxs_host(bytes, elem_count)?))
+            }
+            Storage::KQuant(KQuantScheme::IQ2XS) => {
+                Ok(Some(self.dequantize_iq2xs_host(bytes, elem_count)?))
+            }
+            Storage::KQuant(KQuantScheme::IQ2S) => {
+                Ok(Some(self.dequantize_iq2s_host(bytes, elem_count)?))
+            }
+            Storage::KQuant(KQuantScheme::IQ3XXS) => {
+                Ok(Some(self.dequantize_iq3xxs_host(bytes, elem_count)?))
+            }
+            Storage::KQuant(KQuantScheme::IQ3S) => {
+                Ok(Some(self.dequantize_iq3s_host(bytes, elem_count)?))
+            }
+            Storage::KQuant(KQuantScheme::IQ4NL) => {
+                Ok(Some(self.dequantize_iq4nl_host(bytes, elem_count)?))
+            }
+            Storage::KQuant(KQuantScheme::IQ4XS) => {
+                Ok(Some(self.dequantize_iq4xs_host(bytes, elem_count)?))
+            }
+            Storage::FloatPack(FloatPackScheme::Fp8) => {
+                Ok(Some(self.dequantize_fp8_host(bytes, elem_count)?))
+            }
+            Storage::FloatPack(FloatPackScheme::MxFp4) => {
+                Ok(Some(self.dequantize_mxfp4_host(bytes, elem_count)?))
+            }
+            Storage::FloatPack(FloatPackScheme::MxFp8) => {
+                Ok(Some(self.dequantize_mxfp8_host(bytes, elem_count)?))
+            }
+            Storage::Block(BlockDtype::Fp8 | BlockDtype::Fp8Block16) => {
+                Ok(Some(self.dequantize_fp8_host(bytes, elem_count)?))
+            }
             _ => Ok(None),
         }
     }

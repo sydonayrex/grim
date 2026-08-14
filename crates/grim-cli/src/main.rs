@@ -341,8 +341,8 @@ enum Commands {
         /// RDNA → Wave32), "w32", or "w64" (explicit CDNA opt-in).
         #[arg(long, default_value = "auto")]
         wave: String,
-        /// Offload tensor dequantization to the host ROCm GPU during conversion.
-        #[arg(long)]
+        /// Offload tensor dequantization to host ROCm GPU during conversion (GPU-first with CPU fallback).
+        #[arg(long, default_value_t = true)]
         gpu: bool,
     },
     /// Bake a trained LoRA/QLoRA adapter sidecar permanently into a base .grim model file.
@@ -546,8 +546,8 @@ enum OxidizerCommands {
         /// "w32", or "w64" (CDNA opt-in).
         #[arg(long, default_value = "auto")]
         wave: String,
-        /// Offload tensor dequantization to the host ROCm GPU during conversion.
-        #[arg(long)]
+        /// Offload tensor dequantization to host ROCm GPU during conversion (GPU-first with CPU fallback).
+        #[arg(long, default_value_t = true)]
         gpu: bool,
     },
     /// Raven FP8/MXFP4 repack pipeline: rewrite model tensors into FP8 format.
