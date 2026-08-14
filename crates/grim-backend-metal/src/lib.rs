@@ -113,6 +113,8 @@ struct MetalPipelines {
     quant_mxfp4: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     quant_mxfp8: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     quant_q4k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    matmul_split_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    reduce_split_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -261,6 +263,8 @@ impl MetalContext {
                 quant_mxfp4: get_pipeline("grim_quant_mxfp4")?,
                 quant_mxfp8: get_pipeline("grim_quant_mxfp8")?,
                 quant_q4k: get_pipeline("grim_quant_q4k")?,
+                matmul_split_k: get_pipeline("grim_matmul_split_k")?,
+                reduce_split_k: get_pipeline("grim_reduce_split_k")?,
             });
 
             Ok(MetalContext {
@@ -458,6 +462,7 @@ fn get_cache_dir() -> Option<std::path::PathBuf> {
 pub struct MetalDevice {
     ordinal: usize,
     pub caps: MetalCaps,
+    pub autotuner: std::sync::Arc<MetalAutotuner>,
     inner: Option<std::sync::Arc<MetalDeviceInner>>,
 }
 
@@ -475,6 +480,7 @@ struct MetalDeviceInner {
 pub struct MetalDevice {
     ordinal: usize,
     pub caps: MetalCaps,
+    pub autotuner: std::sync::Arc<MetalAutotuner>,
 }
 
 impl MetalDevice {
@@ -488,12 +494,15 @@ impl MetalDevice {
             Ok(Self {
                 ordinal,
                 caps: MetalCaps::probe_default(ordinal as u64, format!("Metal Device {ordinal}"), 7),
+                autotuner: std::sync::Arc::new(MetalAutotuner::new()),
             })
         }
     }
 
     pub fn try_new(ordinal: usize) -> Result<Self> {
         let caps = MetalCaps::probe_default(ordinal as u64, format!("Apple Metal GPU {ordinal}"), 8);
+        let autotuner = std::sync::Arc::new(MetalAutotuner::new());
+        autotuner.load_cache(&caps);
         #[cfg(target_vendor = "apple")]
         {
             let ctx = MetalContext::get()?;
@@ -506,12 +515,13 @@ impl MetalDevice {
             Ok(Self {
                 ordinal,
                 caps,
+                autotuner,
                 inner: Some(inner),
             })
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            Ok(Self { ordinal, caps })
+            Ok(Self { ordinal, caps, autotuner })
         }
     }
 
@@ -521,6 +531,10 @@ impl MetalDevice {
 
     pub fn hw_fingerprint(&self) -> u64 {
         self.caps.cache_key_hash()
+    }
+
+    pub fn save_autotune_cache(&self) {
+        self.autotuner.save_cache(&self.caps);
     }
 
     #[cfg(target_vendor = "apple")]
@@ -1391,71 +1405,23 @@ impl MetalDevice {
         #[cfg(not(target_vendor = "apple"))]
         Ok((storage, Box::new(MetalHandle)))
     }
-}
 
-impl BackendDevice for MetalDevice {
-    fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
-        let bytes = shape
-            .elem_count()
-            .checked_mul(dtype_byte_size(&dtype)?)
-            .ok_or_else(|| {
-                Error::from(MetalError::AllocationFailed("Buffer size overflow".into()))
-            })?;
-        #[cfg(target_vendor = "apple")]
-        {
-            if let Some(ref inner) = self.inner {
-                use objc2_metal::MTLResourceOptions;
-                let buffer = inner
-                    .device
-                    .newBufferWithLength_options(
-                        bytes as u64,
-                        MTLResourceOptions::StorageModeShared,
-                    )
-                    .ok_or_else(|| {
-                        Error::from(MetalError::AllocationFailed(
-                            "Failed to allocate Metal buffer".into(),
-                        ))
-                    })?;
-
-                let contents = buffer.contents();
-                if !contents.is_null() {
-                    unsafe {
-                        std::ptr::write_bytes(contents, 0, bytes);
-                    }
-                }
-
-                Ok(Box::new(MetalStorage {
-                    buffer: Some(buffer),
-                    data: None,
-                    shape: shape.clone(),
-                    dtype,
-                    provenance: QuantProvenance::GrimNative,
-                }))
-            } else {
-                Ok(Box::new(MetalStorage {
-                    buffer: None,
-                    data: Some(std::sync::Mutex::new(vec![0u8; bytes])),
-                    shape: shape.clone(),
-                    dtype,
-                    provenance: QuantProvenance::GrimNative,
-                }))
-            }
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            Ok(Box::new(MetalStorage {
-                data: std::sync::Mutex::new(vec![0u8; bytes]),
-                shape: shape.clone(),
-                dtype,
-                provenance: QuantProvenance::GrimNative,
-            }))
-        }
-    }
-    fn matmul(
+    pub fn matmul_with_op(
         &self,
         a: &dyn BackendStorage,
         b: &dyn BackendStorage,
         out: &Shape,
+        op: GemmOp,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.matmul_with_op_internal(a, b, out, Some(op))
+    }
+
+    pub fn matmul_with_op_internal(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &Shape,
+        _op: Option<GemmOp>,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         #[cfg(target_vendor = "apple")]
         {
@@ -1596,8 +1562,14 @@ impl BackendDevice for MetalDevice {
                     );
                 }
 
-                let tuner = Tuner::new();
-                let config = tuner.search_tile_config(m, n, k, inner);
+                let config = self.autotuner.search_tile_config_measured(
+                    &self.caps,
+                    m,
+                    n,
+                    k,
+                    _op,
+                    Some(|cfg: &MetalTileConfig| measure_pipeline_timing(inner, m, n, k, cfg)),
+                );
                 let config_data = [
                     config.block_m as i32,
                     config.block_n as i32,
@@ -1639,6 +1611,72 @@ impl BackendDevice for MetalDevice {
                 cpu_dev.matmul(a_cpu, b_cpu, out_shape)
             })
         }
+    }
+}
+
+impl BackendDevice for MetalDevice {
+    fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
+        let elem_count = shape.elem_count();
+        let bytes = elem_count * dtype_byte_size(&dtype)?;
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(ref inner) = self.inner {
+                use objc2_metal::MTResourceOptions;
+
+                let buffer = inner
+                    .device
+                    .newBufferWithLength_options(
+                        bytes as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .ok_or_else(|| {
+                        Error::from(MetalError::AllocationFailed(
+                            "Failed to allocate Metal buffer".into(),
+                        ))
+                    })?;
+
+                let contents = buffer.contents();
+                if !contents.is_null() {
+                    unsafe {
+                        std::ptr::write_bytes(contents, 0, bytes);
+                    }
+                }
+
+                Ok(Box::new(MetalStorage {
+                    buffer: Some(buffer),
+                    data: None,
+                    shape: shape.clone(),
+                    dtype,
+                    provenance: QuantProvenance::GrimNative,
+                }))
+            } else {
+                Ok(Box::new(MetalStorage {
+                    buffer: None,
+                    data: Some(std::sync::Mutex::new(vec![0u8; bytes])),
+                    shape: shape.clone(),
+                    dtype,
+                    provenance: QuantProvenance::GrimNative,
+                }))
+            }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            Ok(Box::new(MetalStorage {
+                data: std::sync::Mutex::new(vec![0u8; bytes]),
+                shape: shape.clone(),
+                dtype,
+                provenance: QuantProvenance::GrimNative,
+            }))
+        }
+    }
+
+    fn matmul(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.matmul_with_op_internal(a, b, out, None)
     }
 
     fn add(
@@ -4452,251 +4490,95 @@ impl MetalDevice {
 
 
 
-pub struct Tuner;
+#[cfg(target_vendor = "apple")]
+pub(crate) fn measure_pipeline_timing(
+    inner: &MetalDeviceInner,
+    m: usize,
+    n: usize,
+    k: usize,
+    cfg: &MetalTileConfig,
+) -> Option<f64> {
+    use objc2_metal::MTResourceOptions;
+    let bytes_a = m * k * 4;
+    let bytes_b = k * n * 4;
+    let bytes_c = m * n * 4;
+    let buf_a = inner
+        .device
+        .newBufferWithLength_options(bytes_a as u64, MTResourceOptions::StorageModeShared)?;
+    let buf_b = inner
+        .device
+        .newBufferWithLength_options(bytes_b as u64, MTResourceOptions::StorageModeShared)?;
+    let buf_c = inner
+        .device
+        .newBufferWithLength_options(bytes_c as u64, MTResourceOptions::StorageModeShared)?;
 
-impl Tuner {
-    pub fn new() -> Self {
-        Self
-    }
+    let config_data = [
+        cfg.block_m as i32,
+        cfg.block_n as i32,
+        cfg.block_k as i32,
+    ];
 
-    #[cfg(target_vendor = "apple")]
-    pub fn search_tile_config(
-        &self,
-        m: usize,
-        n: usize,
-        k: usize,
-        inner: &MetalDeviceInner,
-    ) -> MetalTileConfig {
-        let key = (m, n, k);
-        self.with_persistent_cache(key, || {
-            let candidates = vec![
-                MetalTileConfig {
-                    block_m: 8,
-                    block_n: 8,
-                    block_k: 8,
-                },
-                MetalTileConfig {
-                    block_m: 16,
-                    block_n: 16,
-                    block_k: 16,
-                },
-                MetalTileConfig {
-                    block_m: 32,
-                    block_n: 16,
-                    block_k: 16,
-                },
-                MetalTileConfig {
-                    block_m: 16,
-                    block_n: 32,
-                    block_k: 16,
-                },
-            ];
-            let mut best_config = candidates[1];
-            let mut best_time = std::time::Duration::MAX;
-
-            use objc2_metal::MTResourceOptions;
-            let bytes_a = m * k * 4;
-            let bytes_b = k * n * 4;
-            let bytes_c = m * n * 4;
-            let buf_a = inner
-                .device
-                .newBufferWithLength_options(bytes_a as u64, MTResourceOptions::StorageModeShared)
-                .unwrap();
-            let buf_b = inner
-                .device
-                .newBufferWithLength_options(bytes_b as u64, MTResourceOptions::StorageModeShared)
-                .unwrap();
-            let buf_c = inner
-                .device
-                .newBufferWithLength_options(bytes_c as u64, MTResourceOptions::StorageModeShared)
-                .unwrap();
-
-            for &config in &candidates {
-                let config_data = [
-                    config.block_m as i32,
-                    config.block_n as i32,
-                    config.block_k as i32,
-                ];
-                for _ in 0..2 {
-                    if let Some(cmd) = inner.command_queue.commandBuffer() {
-                        if let Some(enc) = cmd.computeCommandEncoder() {
-                            enc.setComputePipelineState(&inner.pipelines.matmul);
-                            enc.setBuffer_offset_atIndex(Some(&buf_a), 0, 0);
-                            enc.setBuffer_offset_atIndex(Some(&buf_b), 0, 1);
-                            enc.setBuffer_offset_atIndex(Some(&buf_c), 0, 2);
-                            let m_val = m as i32;
-                            let n_val = n as i32;
-                            let k_val = k as i32;
-                            unsafe {
-                                enc.setBytes_length_atIndex(
-                                    &m_val as *const i32 as *const std::ffi::c_void,
-                                    4,
-                                    3,
-                                );
-                                enc.setBytes_length_atIndex(
-                                    &n_val as *const i32 as *const std::ffi::c_void,
-                                    4,
-                                    4,
-                                );
-                                enc.setBytes_length_atIndex(
-                                    &k_val as *const i32 as *const std::ffi::c_void,
-                                    4,
-                                    5,
-                                );
-                                enc.setBytes_length_atIndex(
-                                    config_data.as_ptr() as *const std::ffi::c_void,
-                                    12,
-                                    6,
-                                );
-                            }
-                            let threads =
-                                MTLSize::new(config.block_n as u64, config.block_m as u64, 1);
-                            let groups = MTLSize::new(
-                                ((n + (config.block_n as usize) - 1) / (config.block_n as usize))
-                                    as u64,
-                                ((m + (config.block_m as usize) - 1) / (config.block_m as usize))
-                                    as u64,
-                                1,
-                            );
-                            enc.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
-                            enc.endEncoding();
-                            cmd.commit();
-                            cmd.waitUntilCompleted();
-                        }
-                    }
-                }
-
-                let start = std::time::Instant::now();
-                let iters = 5;
-                for _ in 0..iters {
-                    if let Some(cmd) = inner.command_queue.commandBuffer() {
-                        if let Some(enc) = cmd.computeCommandEncoder() {
-                            enc.setComputePipelineState(&inner.pipelines.matmul);
-                            enc.setBuffer_offset_atIndex(Some(&buf_a), 0, 0);
-                            enc.setBuffer_offset_atIndex(Some(&buf_b), 0, 1);
-                            enc.setBuffer_offset_atIndex(Some(&buf_c), 0, 2);
-                            let m_val = m as i32;
-                            let n_val = n as i32;
-                            let k_val = k as i32;
-                            unsafe {
-                                enc.setBytes_length_atIndex(
-                                    &m_val as *const i32 as *const std::ffi::c_void,
-                                    4,
-                                    3,
-                                );
-                                enc.setBytes_length_atIndex(
-                                    &n_val as *const i32 as *const std::ffi::c_void,
-                                    4,
-                                    4,
-                                );
-                                enc.setBytes_length_atIndex(
-                                    &k_val as *const i32 as *const std::ffi::c_void,
-                                    4,
-                                    5,
-                                );
-                                enc.setBytes_length_atIndex(
-                                    config_data.as_ptr() as *const std::ffi::c_void,
-                                    12,
-                                    6,
-                                );
-                            }
-                            let threads =
-                                MTLSize::new(config.block_n as u64, config.block_m as u64, 1);
-                            let groups = MTLSize::new(
-                                ((n + (config.block_n as usize) - 1) / (config.block_n as usize))
-                                    as u64,
-                                ((m + (config.block_m as usize) - 1) / (config.block_m as usize))
-                                    as u64,
-                                1,
-                            );
-                            enc.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
-                            enc.endEncoding();
-                            cmd.commit();
-                            cmd.waitUntilCompleted();
-                        }
-                    }
-                }
-                let elapsed = start.elapsed() / iters;
-                if elapsed < best_time {
-                    best_time = elapsed;
-                    best_config = config;
-                }
-            }
-
-            best_config
-        })
-    }
-
-    #[cfg(target_vendor = "apple")]
-    fn with_persistent_cache<F>(&self, key: (usize, usize, usize), benchmark: F) -> MetalTileConfig
-    where
-        F: FnOnce() -> MetalTileConfig,
-    {
-        use std::collections::HashMap;
-        use std::sync::Mutex;
-        use std::sync::OnceLock;
-
-        static CACHE: OnceLock<Mutex<HashMap<(usize, usize, usize), (u32, u32, u32)>>> =
-            OnceLock::new();
-        let cache_mutex = CACHE.get_or_init(|| {
-            let mut map = HashMap::new();
-            if let Some(cache_dir) = get_cache_dir() {
-                let cache_file = cache_dir.join("grim_metal_autotune_cache.txt");
-                if cache_file.exists() {
-                    if let Ok(contents) = std::fs::read_to_string(cache_file) {
-                        for line in contents.lines() {
-                            let parts: Vec<&str> = line.split('=').collect();
-                            if parts.len() == 2 {
-                                let key_parts: Vec<&str> = parts[0].split(',').collect();
-                                let val_parts: Vec<&str> = parts[1].split(',').collect();
-                                if key_parts.len() == 3 && val_parts.len() == 3 {
-                                    if let (Ok(km), Ok(kn), Ok(kk), Ok(vx), Ok(vy), Ok(vz)) = (
-                                        key_parts[0].parse::<usize>(),
-                                        key_parts[1].parse::<usize>(),
-                                        key_parts[2].parse::<usize>(),
-                                        val_parts[0].parse::<u32>(),
-                                        val_parts[1].parse::<u32>(),
-                                        val_parts[2].parse::<u32>(),
-                                    ) {
-                                        map.insert((km, kn, kk), (vx, vy, vz));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Mutex::new(map)
-        });
-
-        {
-            let guard = cache_mutex.lock().unwrap();
-            if let Some(&val) = guard.get(&key) {
-                return MetalTileConfig {
-                    block_m: val.0,
-                    block_n: val.1,
-                    block_k: val.2,
-                };
-            }
+    // Warm-up passes
+    for _ in 0..2 {
+        let cmd = inner.command_queue.commandBuffer()?;
+        let enc = cmd.computeCommandEncoder()?;
+        enc.setComputePipelineState(&inner.pipelines.matmul);
+        enc.setBuffer_offset_atIndex(Some(&buf_a), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(&buf_b), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(&buf_c), 0, 2);
+        let m_val = m as i32;
+        let n_val = n as i32;
+        let k_val = k as i32;
+        unsafe {
+            enc.setBytes_length_atIndex(&m_val as *const i32 as *const std::ffi::c_void, 4, 3);
+            enc.setBytes_length_atIndex(&n_val as *const i32 as *const std::ffi::c_void, 4, 4);
+            enc.setBytes_length_atIndex(&k_val as *const i32 as *const std::ffi::c_void, 4, 5);
+            enc.setBytes_length_atIndex(config_data.as_ptr() as *const std::ffi::c_void, 12, 6);
         }
-
-        let config = benchmark();
-
-        {
-            let mut guard = cache_mutex.lock().unwrap();
-            guard.insert(key, (config.block_m, config.block_n, config.block_k));
-            if let Some(cache_dir) = get_cache_dir() {
-                let cache_file = cache_dir.join("grim_metal_autotune_cache.txt");
-                let mut lines = Vec::new();
-                for (k, v) in guard.iter() {
-                    lines.push(format!("{},{},{}={},{},{}", k.0, k.1, k.2, v.0, v.1, v.2));
-                }
-                let _ = std::fs::write(cache_file, lines.join("\n"));
-            }
-        }
-
-        config
+        let threads = MTLSize::new(cfg.block_n as u64, cfg.block_m as u64, 1);
+        let groups = MTLSize::new(
+            ((n + (cfg.block_n as usize) - 1) / (cfg.block_n as usize)) as u64,
+            ((m + (cfg.block_m as usize) - 1) / (cfg.block_m as usize)) as u64,
+            1,
+        );
+        enc.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
     }
+
+    // Timed passes
+    let start = std::time::Instant::now();
+    let iters = 5;
+    for _ in 0..iters {
+        let cmd = inner.command_queue.commandBuffer()?;
+        let enc = cmd.computeCommandEncoder()?;
+        enc.setComputePipelineState(&inner.pipelines.matmul);
+        enc.setBuffer_offset_atIndex(Some(&buf_a), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(&buf_b), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(&buf_c), 0, 2);
+        let m_val = m as i32;
+        let n_val = n as i32;
+        let k_val = k as i32;
+        unsafe {
+            enc.setBytes_length_atIndex(&m_val as *const i32 as *const std::ffi::c_void, 4, 3);
+            enc.setBytes_length_atIndex(&n_val as *const i32 as *const std::ffi::c_void, 4, 4);
+            enc.setBytes_length_atIndex(&k_val as *const i32 as *const std::ffi::c_void, 4, 5);
+            enc.setBytes_length_atIndex(config_data.as_ptr() as *const std::ffi::c_void, 12, 6);
+        }
+        let threads = MTLSize::new(cfg.block_n as u64, cfg.block_m as u64, 1);
+        let groups = MTLSize::new(
+            ((n + (cfg.block_n as usize) - 1) / (cfg.block_n as usize)) as u64,
+            ((m + (cfg.block_m as usize) - 1) / (cfg.block_m as usize)) as u64,
+            1,
+        );
+        enc.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+    }
+    let elapsed = start.elapsed() / iters;
+    Some(elapsed.as_secs_f64() * 1000.0)
 }
 
 #[cfg(not(target_vendor = "apple"))]

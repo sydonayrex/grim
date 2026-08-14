@@ -18,3 +18,6 @@ models/
 node_modules/
 package.json
 package.lock.json
+
+# Autotuner on-disk tune caches (test/runtime artifacts)
+.autotune_cache/

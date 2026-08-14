@@ -1,6 +1,11 @@
 //! `CudaCaps`: CUDA hardware capability probe, resource limits, capability gating, and cache key fingerprinting.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use grim_tensor::dtype::QuantFormat;
+
+static CAP_EPOCH: AtomicU64 = AtomicU64::new(0);
+static CACHED_FINGERPRINT: Mutex<Option<String>> = Mutex::new(None);
 
 /// Hardware capabilities and resource ceilings for a CUDA device.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -14,12 +19,14 @@ pub struct CudaCaps {
     pub shared_mem_per_block: u32,
     pub max_threads_per_block: u32,
     pub max_grid_dims: [u32; 3],
+    pub mem_pitch: u64,
+    pub epoch: u64,
 }
 
 impl CudaCaps {
     /// Probes default capabilities for a device ordinal and name.
     pub fn probe_default(ordinal: usize, device_name: String, major: u32, minor: u32) -> Self {
-        Self {
+        let spec = Self {
             device_name,
             ordinal,
             compute_major: major,
@@ -29,21 +36,51 @@ impl CudaCaps {
             shared_mem_per_block: 49152, // 48KB default per block ceiling
             max_threads_per_block: 1024,
             max_grid_dims: [2147483647, 65535, 65535],
-        }
+            mem_pitch: 2147483647,
+            epoch: 0,
+        };
+
+        let fp = spec.fingerprint_string();
+        let mut cached = CACHED_FINGERPRINT.lock().unwrap();
+        let changed = cached.as_ref() != Some(&fp);
+        let epoch = if changed {
+            let e = CAP_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+            *cached = Some(fp);
+            e
+        } else {
+            CAP_EPOCH.load(Ordering::SeqCst)
+        };
+        Self { epoch, ..spec }
     }
 
-    /// Compute 64-bit SeaHash fingerprint of CUDA device capabilities for cache keying.
-    pub fn cache_key_hash(&self) -> u64 {
-        let mut key_str = format!(
-            "{}:{}:{}.{}:{}:{}:{}",
+    /// Current process-wide capability epoch.
+    pub fn current_epoch() -> u64 {
+        CAP_EPOCH.load(Ordering::SeqCst)
+    }
+
+    /// True if device hardware config has changed since this snapshot was probed.
+    pub fn is_stale(&self) -> bool {
+        self.epoch != Self::current_epoch()
+    }
+
+    /// Deterministic fingerprint string for caching and epoch invalidation.
+    pub fn fingerprint_string(&self) -> String {
+        format!(
+            "{}:{}:{}.{}:{}:{}:{}:{}",
             self.device_name,
             self.ordinal,
             self.compute_major,
             self.compute_minor,
             self.multi_processor_count,
             self.shared_mem_per_block,
-            self.max_threads_per_block
-        );
+            self.max_threads_per_block,
+            self.mem_pitch
+        )
+    }
+
+    /// Compute 64-bit SeaHash fingerprint of CUDA device capabilities for cache keying.
+    pub fn cache_key_hash(&self) -> u64 {
+        let mut key_str = self.fingerprint_string();
         if self.supports_fp8_native() {
             key_str.push_str(":fp8");
         }
@@ -70,3 +107,4 @@ impl CudaCaps {
             && threads_per_block <= self.max_threads_per_block
     }
 }
+

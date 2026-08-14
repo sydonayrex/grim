@@ -99,6 +99,11 @@ impl CpuGraphRegistry {
             Ok(false)
         }
     }
+
+    /// Check whether a graph executable is stored under `key`.
+    pub fn has_captured(&self, key: &str) -> bool {
+        self.graphs.lock().unwrap().contains_key(key)
+    }
 }
 
 #[cfg(test)]

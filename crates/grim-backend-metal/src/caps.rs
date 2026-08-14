@@ -1,6 +1,11 @@
 //! `MetalCaps`: Apple Metal hardware capability probe, resource limits, capability gating, and cache key fingerprinting.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use grim_tensor::dtype::QuantFormat;
+
+static CAP_EPOCH: AtomicU64 = AtomicU64::new(0);
+static CACHED_FINGERPRINT: Mutex<Option<String>> = Mutex::new(None);
 
 /// Hardware capabilities and resource ceilings for an Apple Metal GPU device.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -13,12 +18,13 @@ pub struct MetalCaps {
     pub supports_fp16: bool,
     pub supports_bf16: bool,
     pub supports_fp8: bool,
+    pub epoch: u64,
 }
 
 impl MetalCaps {
     /// Probes default capabilities for a device name and registry ID.
     pub fn probe_default(registry_id: u64, device_name: String, gpu_family: u32) -> Self {
-        Self {
+        let spec = Self {
             device_name,
             registry_id,
             gpu_family,
@@ -27,19 +33,47 @@ impl MetalCaps {
             supports_fp16: true,
             supports_bf16: true,
             supports_fp8: gpu_family >= 8, // Apple M3/M4 / GPUFamily8+ supports FP8
-        }
+            epoch: 0,
+        };
+
+        let fp = spec.fingerprint_string();
+        let mut cached = CACHED_FINGERPRINT.lock().unwrap();
+        let changed = cached.as_ref() != Some(&fp);
+        let epoch = if changed {
+            let e = CAP_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+            *cached = Some(fp);
+            e
+        } else {
+            CAP_EPOCH.load(Ordering::SeqCst)
+        };
+        Self { epoch, ..spec }
     }
 
-    /// Compute 64-bit SeaHash fingerprint of Metal device capabilities for cache keying.
-    pub fn cache_key_hash(&self) -> u64 {
-        let mut key_str = format!(
+    /// Current process-wide capability epoch.
+    pub fn current_epoch() -> u64 {
+        CAP_EPOCH.load(Ordering::SeqCst)
+    }
+
+    /// True if device hardware config has changed since this snapshot was probed.
+    pub fn is_stale(&self) -> bool {
+        self.epoch != Self::current_epoch()
+    }
+
+    /// Deterministic fingerprint string for caching and epoch invalidation.
+    pub fn fingerprint_string(&self) -> String {
+        format!(
             "{}:{}:{}:{}:{}",
             self.device_name,
             self.registry_id,
             self.gpu_family,
             self.max_threadgroup_memory_length,
             self.max_threads_per_threadgroup
-        );
+        )
+    }
+
+    /// Compute 64-bit SeaHash fingerprint of Metal device capabilities for cache keying.
+    pub fn cache_key_hash(&self) -> u64 {
+        let mut key_str = self.fingerprint_string();
         if self.supports_fp8 {
             key_str.push_str(":fp8");
         }
@@ -61,3 +95,4 @@ impl MetalCaps {
             && threads_per_threadgroup <= self.max_threads_per_threadgroup
     }
 }
+
