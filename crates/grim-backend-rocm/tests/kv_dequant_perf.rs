@@ -74,7 +74,7 @@ fn main_config(
 
     let synth = |seed: f32| {
         (0..cache_len * num_kv_heads * head_dim)
-            .map(|i| ((i as f32).sin() * 0.4 + seed))
+            .map(|i| (i as f32).sin() * 0.4 + seed)
             .collect::<Vec<f32>>()
     };
     let k_data = synth(1.0);

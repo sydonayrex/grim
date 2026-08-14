@@ -159,8 +159,6 @@ pub enum ModelArchitecture {
     Unknown,
 }
 
-
-
 impl ModelArchitecture {
     /// Parse string identifier into `ModelArchitecture` enum variant.
     /// Matches GGUF `general.architecture` strings and HuggingFace `model_type` values.
@@ -317,8 +315,6 @@ impl ModelArchitecture {
         }
     }
 
-
-
     /// Return canonical string representation of architecture.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -472,8 +468,6 @@ impl ModelArchitecture {
         }
     }
 
-
-
     /// Return coarse modality hint for architecture.
     pub fn modality(&self) -> ModalityHint {
         match self {
@@ -517,8 +511,6 @@ impl ModelArchitecture {
                 | Self::Glm52
                 | Self::MiniMaxM3
                 | Self::AfMoe
-
-
                 | Self::Ernie45Moe
                 | Self::HunyuanMoe
                 | Self::OpenAiMoe

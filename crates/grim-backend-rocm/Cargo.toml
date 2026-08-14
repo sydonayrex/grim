@@ -39,8 +39,11 @@ cubecl-runtime = { version = "0.10.0", features = ["std"], optional = true }
 cc = "1.0"
 
 [features]
-default = []
+default = ["jit-hw-adaptive"]
+jit-hw-adaptive = []
+multi-gpu-kernel = []
 rocm-profile = []
+
 rocm-aiter = []
 # grim-sonnet F8 — Composable Kernel (ck_tile) GEMM used to expose a
 # `ck` cargo feature that built src/device/ck_gemm.cpp + a C FFI surface

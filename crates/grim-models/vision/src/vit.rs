@@ -40,8 +40,16 @@ impl VitConfig {
         let u = |k: &str| vision_cfg.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let f = |k: &str| vision_cfg.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
 
-        let img_sz = if u("image_size") > 0 { u("image_size") } else { 224 };
-        let patch_sz = if u("patch_size") > 0 { u("patch_size") } else { 14 };
+        let img_sz = if u("image_size") > 0 {
+            u("image_size")
+        } else {
+            224
+        };
+        let patch_sz = if u("patch_size") > 0 {
+            u("patch_size")
+        } else {
+            14
+        };
         let in_ch = if u("num_channels") > 0 {
             u("num_channels")
         } else if u("in_channels") > 0 {
@@ -49,7 +57,11 @@ impl VitConfig {
         } else {
             3
         };
-        let hidden = if u("hidden_size") > 0 { u("hidden_size") } else { 768 };
+        let hidden = if u("hidden_size") > 0 {
+            u("hidden_size")
+        } else {
+            768
+        };
         let heads = if u("num_attention_heads") > 0 {
             u("num_attention_heads")
         } else if u("num_heads") > 0 {
@@ -64,7 +76,11 @@ impl VitConfig {
         } else {
             12
         };
-        let inter = if u("intermediate_size") > 0 { u("intermediate_size") } else { 3072 };
+        let inter = if u("intermediate_size") > 0 {
+            u("intermediate_size")
+        } else {
+            3072
+        };
         let eps = if f("layer_norm_eps") > 0.0 {
             f("layer_norm_eps")
         } else if f("rms_norm_eps") > 0.0 {
@@ -85,7 +101,6 @@ impl VitConfig {
         }
     }
 }
-
 
 impl ModelConfig for VitConfig {
     fn name(&self) -> &str {
@@ -657,4 +672,3 @@ mod tests {
         assert_eq!(cfg.name(), "vit");
     }
 }
-

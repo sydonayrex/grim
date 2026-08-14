@@ -1,10 +1,10 @@
 //! Neural-network modules (`Linear`, `Embedding`, `RmsNorm`, `RoPE`, `SwiGLU`) and `WeightSource` loading.
 
 pub mod modules;
-/// SCYTHE-2 WI-3: capacity-calibrated sharded linears.
-pub mod scythe2;
 /// Mixture-of-Experts primitives (router, expert bank, routed FFN).
 pub mod moe;
+/// SCYTHE-2 WI-3: capacity-calibrated sharded linears.
+pub mod scythe2;
 pub mod varbuilder;
 
 pub use modules::{

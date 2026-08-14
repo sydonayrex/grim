@@ -1,130 +1,91 @@
 # grim-engine
 
-Grim inference engine runtime. Wires the scheduler, memory manager, model registry, and executor into a single `Engine` struct.
-
 ## Purpose
-
-The `Engine` is the top-level orchestrator that coordinates:
-- The continuous-batching scheduler (`grim-scheduler`)
-- The paged KV cache (`grim-memory`)
-- The model registry (type-erased, keyed by model id)
-- Adapter registry for LoRA serving
-
-Downstream crates (`grim-server`) call `Engine::tick()` to advance one iteration.
+The `grim-engine` crate serves as the monolithic runtime core of the Grim framework. It wires together the scheduler, KV memory manager, model registry, speculative decoding wrappers, and the active hardware backends into a unified `Engine` struct. It handles the complete lifecycle of inference ticks, dispatching prefill and decode passes while mediating interactions with disaggregated KV routing and tensor-parallel cluster layers.
 
 ## Boundaries
-
-- Does not perform HTTP serving — see `grim-server`
-- Does not define scheduler policies — see `grim-scheduler`
-- Does not manage memory buffers directly — delegates to `grim-memory`
+This crate orchestrates and coordinates. It delegates actual tensor algebra to backend crates (`grim-backend-*`), memory allocation to `grim-memory`, and queue routing to `grim-scheduler`. While it owns the main loop state (like `sessions` and `models`), it avoids doing raw math or I/O directly, focusing entirely on state machine transitions.
 
 ## Dependency Graph
-
 ```mermaid
-graph LR
-    A[grim-engine] -->|DType, Device| B[grim-tensor]
-    A -->|Model traits| C[grim-core]
-    A -->|Modules| D[grim-nn]
-    A -->|Scheduler| E[grim-scheduler]
-    A -->|KV cache| F[grim-memory]
-    A -->|KV quant| G[grim-kvquant]
-    A -->|Autograd| H[grim-autograd]
-    A -->|Speculative| I[grim-speculative]
-    A -->|Plugin system| J[grim-plugin]
-    
-    style A fill:#e8f5e8
+graph TD
+    %% Focal Node
+    grim-engine(("grim-engine"))
+
+    %% Workspace Dependencies
+    grim-engine --> grim-tensor
+    grim-engine --> grim-core
+    grim-engine --> grim-nn
+    grim-engine --> grim-backend-cpu
+    grim-engine --> grim-backend-rocm
+    grim-engine --> grim-backend-cuda
+    grim-engine --> grim-backend-metal
+    grim-engine --> grim-memory
+    grim-engine --> grim-scheduler
+    grim-engine --> grim-models-transformer
+    grim-engine --> grim-models-mamba
+    grim-engine --> grim-models-vision
+    grim-engine --> grim-format
+    grim-engine --> grim-speculative
+    grim-engine --> grim-kvquant
+    grim-engine --> grim-autograd
+    grim-engine --> grim-plugin
+    grim-engine --> grim-disagg
+    grim-engine --> thiserror
+
+    %% External Dependencies
+    grim-engine -.-> serde
+    grim-engine -.-> serde_json
+
+    %% Reverse Workspace Dependents
+    grim-server --> grim-engine
+    grim-cli --> grim-engine
 ```
 
-## Public API
-
-### EngineConfig
-
-```rust
-pub struct EngineConfig {
-    pub max_batched_tokens: usize,
-    pub max_num_seqs: usize,
-    pub block_pool_capacity: usize,
-    pub num_kv_heads: usize,
-    pub head_dim: usize,
-    pub target_ttft_ms: u64,
-    pub target_itl_ms: u64,
-    pub determinism_mode: DeterminismMode,
-    pub kv_compressor: Option<Arc<dyn grim_kvquant::KvCompressor>>,
-}
-
-impl Default for EngineConfig {
-    fn default() -> Self;
-}
-```
-
-### Engine
-
-```rust
-pub struct Engine {
-    pub config: EngineConfig,
-    pub scheduler: Scheduler,
-    pub block_pool: Arc<Mutex<KvBlockPool>>,
-}
-
-impl Engine {
-    pub fn new(config: EngineConfig) -> Self;
-    
-    pub fn tokens_per_sec(&self) -> Option<f32>;
-    pub fn kv_cache_telemetry(&self) -> (u64, u64, u64, u64);
-    
-    pub fn register_model(&mut self, id: &str, model: Box<dyn CausalLm>);
-    pub fn register_with_dspark(&mut self, id: &str, model: Box<dyn CausalLm>,
-                                draft: Arc<dyn DraftBackbone>, markov: Arc<dyn MarkovHead>,
-                                confidence: Arc<dyn ConfidenceHead>);
-    
-    pub fn register_adapter(&mut self, base_model_id: &str, name: impl Into<String>,
-                           handle: AdapterHandle);
-    pub fn resolve_adapters(&self, ids: &[u32]) -> Option<Vec<AdapterHandle>>;
-    pub fn drop_adapter(&mut self, id: u32) -> bool;
-    pub fn adapter_count(&self) -> usize;
-    pub fn get_adapter_by_name(&self, name: &str) -> Option<&LoadedAdapter>;
-    
-    pub fn loaded_models(&self) -> Vec<String>;
-    pub fn unload_model(&mut self, name: &str) -> bool;
-    pub fn strategy_for(&self, id: &str) -> Option<Strategy>;
-    
-    pub fn tick(&mut self) -> Result<SchedulerOutput>;
-}
-```
-
-### StepOutcome
-
-```rust
-#[derive(Clone)]
-pub struct StepOutcome {
-    pub logits: Option<Arc<Tensor>>,
-    pub accepted_tokens: usize,
-    pub speculative: bool,
-}
-```
+## Public API Overview
+- **`Engine` / `EngineConfig`**: The primary orchestrator handling configuration, model registration, and stepping the generation loop.
+- **`LoadedModel` & `LoadedAdapter`**: Internal structs maintaining registered models and LoRA adapters.
+- **`Engine::tick()`**: The main stepping function that polls the scheduler, dispatches prefills/decodes, manages speculative fallbacks, and tracks timing (TTFT/ITL).
+- **`Engine::register_model` / `register_with_dspark`**: Interfaces for loading raw auto-regressive models or models coupled with draft/Markov speculation heads.
+- **`scythe2::*`**: Implementations for C²PLR continuous batching logic, PlacementCache, and ScytheRing operations.
+- **`rope_scaling::*` / `streaming_forward::*` / `model_loader::*` / `packing::*`**: Various inference pipeline utilities.
 
 ## Usage Example
-
 ```rust
 use grim_engine::{Engine, EngineConfig};
 
-let config = EngineConfig::default();
-let mut engine = Engine::new(config);
-
-// Register a model
-engine.register_model("llama3", model);
-
-// Run inference
-let output = engine.tick()?;
-let logits = output.last_outcome(request_id).and_then(|o| o.logits.as_ref());
+fn main() {
+    let mut config = EngineConfig::default();
+    config.max_batched_tokens = 2048;
+    
+    // Initialize the unified engine
+    let mut engine = Engine::new(config);
+    
+    // In a real application, you would register models here:
+    // engine.register_model("model_id", loaded_causal_lm);
+    
+    // Step the engine continuously in a server loop
+    // loop {
+    //     let outcome = engine.tick().unwrap();
+    //     if outcome.is_empty() { break; }
+    // }
+}
 ```
 
-## Feature Flags
+## Use Cases
+- Acting as the backend driver for the `grim-server` HTTP API.
+- Hosting tensor-parallel distributed inference configurations where `grim-engine` coordinates multiple GPU processes via RCCL/NCCL.
+- Implementing speculative decoding setups (like DSpark) that require tight coordination between draft head predictions and KV cache block verification.
+- Enforcing KV Cache disaggregation, catching blocks broadcast from Pre-fill nodes over the network.
 
-This crate has no feature flags.
+## Edge Cases, Limitations, and Quirks
+- **Strict Speculative Wrapper Rule**: Models are forcefully wrapped in `SpeculativeCausalLm` at registration. Plain autoregressive decoding is treated merely as a fallback strategy if no draft heads are provided.
+- **Tick Poisoning**: Engine panics during `tick()` are dangerous because they can poison the engine's internal Mutex, stalling all requests permanently. Therefore, tick errors are propagated as standard `Result` rather than panics.
+- **Tensor-Parallel Initialization**: If `GRIM_TP_SIZE` > 1, the engine assumes exactly one OS process per rank. The configuration is validated strictly in `Engine::new()` and will hard-fail (panic) on invalid distributed config, avoiding silent mis-sharding.
 
-## Edge Cases
-
-1. **Speculative decoding is default-on**: All causal models are wrapped in `SpeculativeCausalLm`
-2. **Self-tuning**: Engine adapts `max_batched_tokens`, `speculative_block_len`, and `kv_compression_bit_width` at runtime
-3. **Weight streaming**: Controlled by `GRIM_WEIGHT_STREAMING` env var
+## Build Flags, Feature Flags, and Environment Variables
+- **Features**: `default = []`, `rocm-mem`.
+- **Environment Variables**:
+  - `GRIM_TP_SIZE` / `GRIM_GPUS`: Configures tensor-parallel world size and target ordinals.
+  - `GRIM_KV_QUANT`: Triggers KV block quantization (`int8` or `int4`) via Lloyd-Max.
+  - `GRIM_WEIGHT_STREAMING` / `GRIM_AVAILABLE_VRAM`: Configures on-the-fly model paging for memory-constrained environments.

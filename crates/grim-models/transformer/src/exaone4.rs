@@ -1,7 +1,7 @@
 //! Thin wrapper around `Llama` for exaone4 uses a Llama-style transformer.
 
 use grim_core::error::Result;
-use grim_core::model::{AdapterHandle, CausalLm, Model, ModelConfig, ModalityHint};
+use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::TensorParallelConfig;
 use grim_tensor::{ArithType, Device, Tensor};
@@ -49,7 +49,11 @@ pub struct Exaone4 {
 }
 
 impl Exaone4 {
-    pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: Exaone4Config) -> Result<Self> {
+    pub fn load(
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: Exaone4Config,
+    ) -> Result<Self> {
         Self::load_tp(device, ws, cfg, ws.tp_config())
     }
 
@@ -70,12 +74,16 @@ impl Exaone4 {
             rms_norm_eps: cfg.rms_norm_eps,
             rope_theta: cfg.rope_theta,
             max_seq_len: cfg.max_seq_len,
-        
+
             partial_rotary_factor: 1.0,
             yarn: None,
         };
         let inner = Llama::load_tp(device.clone(), ws, llama_cfg, tp)?;
-        Ok(Self { cfg, device: inner.device.clone(), inner })
+        Ok(Self {
+            cfg,
+            device: inner.device.clone(),
+            inner,
+        })
     }
 }
 

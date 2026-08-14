@@ -31,7 +31,10 @@
 //! - `rust-ffi-grim` §3 — `cargo check` gate after each WI.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use grim_backend_rocm::{RocmDevice, RocmPinnedBuffer, RocmStorage};
 
 use grim_tensor::backend::{GpuCapability, ScytheLink, ScythePlacement};
 
@@ -862,20 +865,14 @@ impl MoeDispatchPlan {
     /// Host-pure: no device calls. The on-device peer transfer (WI-EP2's
     /// `peer_status → to_route_link → copy_via_route` reuse) consumes the
     /// `remote` batches at dispatch time and is device-gated.
-    pub fn build(
-        pairs: &[RoutedPair],
-        placement: &ExpertPlacementMap,
-        local_rank: usize,
-    ) -> Self {
+    pub fn build(pairs: &[RoutedPair], placement: &ExpertPlacementMap, local_rank: usize) -> Self {
         let mut local = LocalDispatch::default();
         // Remote batches indexed by dest_rank; collected in a Vec-of-Vec then
         // flattened to preserve per-rank input order. `num_ranks+1` slots so
         // every valid dest_rank has a home.
         let mut by_rank: Vec<Vec<RoutedPair>> = vec![Vec::new(); placement.num_ranks];
         for &p in pairs {
-            let dest = placement
-                .rank_of(p.expert as usize)
-                .unwrap_or(local_rank); // unmapped expert → fall back to local
+            let dest = placement.rank_of(p.expert as usize).unwrap_or(local_rank); // unmapped expert → fall back to local
             if dest == local_rank {
                 local.pairs.push(p);
             } else if dest < by_rank.len() {
@@ -962,6 +959,9 @@ pub struct ScytheRing {
     /// Raw u64 pointing to the device-side slot array.
     /// Set to 0 when running on CPU (GPU-less tests).
     pub slots_device_ptr: AtomicU64,
+    _device_storage: Option<RocmStorage>,
+    device: Option<*const RocmDevice>,
+    staging: Vec<Mutex<RocmPinnedBuffer<u8>>>,
 }
 
 impl ScytheRing {
@@ -976,7 +976,42 @@ impl ScytheRing {
             head: AtomicU32::new(0),
             tail: AtomicU32::new(0),
             slots_device_ptr: AtomicU64::new(0),
+            _device_storage: None,
+            device: None,
+            staging: Vec::new(),
         }
+    }
+
+    /// Create a ring whose slots are owned by the supplied ROCm device.
+    pub fn with_device(capacity: u32, device: &RocmDevice) -> grim_backend_rocm::Result<Self> {
+        assert!(
+            capacity > 0 && capacity.is_power_of_two(),
+            "capacity must be a power of 2"
+        );
+        let storage = device.alloc_scythe_ring_bytes(
+            capacity as usize * std::mem::size_of::<ScytheTaskDescriptor>(),
+        )?;
+        let ptr = storage.device_ptr_u64().ok_or_else(|| {
+            grim_backend_rocm::Error::Backend(
+                "ScytheRing allocation returned no device pointer".into(),
+            )
+        })?;
+        let mut staging = Vec::with_capacity(capacity as usize);
+        for _ in 0..capacity {
+            staging.push(Mutex::new(RocmPinnedBuffer::alloc(std::mem::size_of::<
+                ScytheTaskDescriptor,
+            >())?));
+        }
+        Ok(Self {
+            capacity,
+            head: AtomicU32::new(0),
+            tail: AtomicU32::new(0),
+            slots_device_ptr: AtomicU64::new(ptr),
+            _device_storage: Some(storage),
+            // The caller must keep `device` alive for the ring's lifetime.
+            device: Some(device as *const RocmDevice),
+            staging,
+        })
     }
 
     /// Return the number of occupied slots.
@@ -996,22 +1031,50 @@ impl ScytheRing {
         self.len() >= self.capacity
     }
 
-    /// Enqueue a task descriptor. Returns `Ok(slot_index)` or `Err` if full.
-    ///
-    /// # Contract
-    /// The caller must write the descriptor to device memory at
-    /// `slots_device_ptr + slot_index * sizeof(ScytheTaskDescriptor)` and
-    /// then set `status = 0 (pending)` with a store-release barrier before
-    /// calling this function.
+    /// Enqueue a task descriptor and, for a device-backed ring, upload its
+    /// complete 64-byte payload with one pinned async H2D copy. Because status
+    /// is in that same payload, descriptor fields and status become visible as
+    /// one device-side transfer; CPU-only rings retain head/tail bookkeeping.
     pub fn enqueue(&self, desc: ScytheTaskDescriptor) -> Result<u32, ScytheTaskDescriptor> {
-        if self.is_full() {
-            return Err(desc);
+        let slot_counter = loop {
+            let head = self.head.load(Ordering::Acquire);
+            let tail = self.tail.load(Ordering::Acquire);
+            if head.wrapping_sub(tail) >= self.capacity {
+                return Err(desc);
+            }
+            match self.head.compare_exchange_weak(
+                head,
+                head.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break head,
+                Err(_) => continue,
+            }
+        };
+        let slot = slot_counter % self.capacity;
+        if let (Some(device), Some(staging)) = (self.device, self.staging.get(slot as usize)) {
+            let mut staging = staging.lock().unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &desc as *const ScytheTaskDescriptor as *const u8,
+                    staging.as_mut_ptr(),
+                    std::mem::size_of::<ScytheTaskDescriptor>(),
+                );
+            }
+            let dst = self.slots_device_ptr.load(Ordering::Acquire)
+                + slot as u64 * std::mem::size_of::<ScytheTaskDescriptor>() as u64;
+            let copy_result = unsafe {
+                (&*device).copy_scythe_descriptor_async(
+                    dst,
+                    staging.as_ptr() as *const _,
+                    std::mem::size_of::<ScytheTaskDescriptor>(),
+                )
+            };
+            if copy_result.is_err() {
+                return Err(desc);
+            }
         }
-        let slot = self.head.fetch_add(1, Ordering::AcqRel) % self.capacity;
-        // In a GPU-less test environment `slots_device_ptr` is 0 — we skip
-        // the device write silently. In a real GPU path the kernel would poll
-        // the slot directly; here we just advance the counter.
-        let _ = slot;
         Ok(slot)
     }
 
@@ -1317,7 +1380,11 @@ mod tests {
         let mut sorted: Vec<u32> = modes.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), modes.len(), "quant-mode discriminants must be distinct");
+        assert_eq!(
+            sorted.len(),
+            modes.len(),
+            "quant-mode discriminants must be distinct"
+        );
         // FP32 is zero (the default / no-quant case).
         assert_eq!(moe_quant_mode::FP32, 0);
     }
@@ -1339,7 +1406,10 @@ mod tests {
             schedule_ptr: 0x4000,
             _reserved: 0,
         };
-        assert!(good.validate().is_ok(), "well-formed descriptor must validate");
+        assert!(
+            good.validate().is_ok(),
+            "well-formed descriptor must validate"
+        );
 
         // Each geometry field is independently checked.
         let mut bad = good;
@@ -1401,8 +1471,7 @@ mod tests {
         assert_eq!(task.opcode, 6, "MoE enqueue must set opcode = 6");
         // weight_ptr must point at the MoETaskDescriptor.
         assert_eq!(
-            task.weight_ptr,
-            &moe_desc as *const _ as u64,
+            task.weight_ptr, &moe_desc as *const _ as u64,
             "weight_ptr must point at the MoETaskDescriptor",
         );
         // Input/output/peer flow through unchanged.
@@ -1418,7 +1487,9 @@ mod tests {
         // the fields correctly" half is device-gated.
         let ring = ScytheRing::new(4);
         assert!(ring.is_empty());
-        let slot = ring.enqueue(task).expect("ring must accept on an empty queue");
+        let slot = ring
+            .enqueue(task)
+            .expect("ring must accept on an empty queue");
         assert_eq!(slot, 0, "first enqueue must take slot 0");
         let dequeued = ring.dequeue();
         assert_eq!(dequeued, 0, "first dequeue must read slot 0");
@@ -1444,8 +1515,18 @@ mod tests {
         // caps equal so the greedy allocator alternates: e0→r0, e1→r1,
         // e2→r0, e3→r1. Gives the {0,2}→r0, {1,3}→r1 split.
         let caps = [
-            grim_tensor::GpuCapability { ordinal: 0, vram_free_bytes: 64, tflops_fp16: 1.0, ..Default::default() },
-            grim_tensor::GpuCapability { ordinal: 1, vram_free_bytes: 64, tflops_fp16: 1.0, ..Default::default() },
+            grim_tensor::GpuCapability {
+                ordinal: 0,
+                vram_free_bytes: 64,
+                tflops_fp16: 1.0,
+                ..Default::default()
+            },
+            grim_tensor::GpuCapability {
+                ordinal: 1,
+                vram_free_bytes: 64,
+                tflops_fp16: 1.0,
+                ..Default::default()
+            },
         ];
         ExpertPlacementMap::build(4, &caps, grim_nn::moe::CapacityMetric::VramBytes)
     }
@@ -1455,10 +1536,26 @@ mod tests {
         let map = ep_map_2ranks_4experts_split();
         // 4 tokens, top-1 each, routed to experts [0, 1, 2, 3] respectively.
         let pairs = vec![
-            RoutedPair { token: 0, expert: 0, combine_weight: 1.0 },
-            RoutedPair { token: 1, expert: 1, combine_weight: 1.0 },
-            RoutedPair { token: 2, expert: 2, combine_weight: 1.0 },
-            RoutedPair { token: 3, expert: 3, combine_weight: 1.0 },
+            RoutedPair {
+                token: 0,
+                expert: 0,
+                combine_weight: 1.0,
+            },
+            RoutedPair {
+                token: 1,
+                expert: 1,
+                combine_weight: 1.0,
+            },
+            RoutedPair {
+                token: 2,
+                expert: 2,
+                combine_weight: 1.0,
+            },
+            RoutedPair {
+                token: 3,
+                expert: 3,
+                combine_weight: 1.0,
+            },
         ];
         let plan = MoeDispatchPlan::build(&pairs, &map, /*local_rank*/ 0);
         // rank 0 owns experts {0, 2}; rank 1 owns {1, 3}.
@@ -1483,18 +1580,49 @@ mod tests {
     fn ep2_batches_remote_by_destination_rank() {
         // 3 ranks, with experts split so each rank owns a distinct expert.
         let caps = [
-            grim_tensor::GpuCapability { ordinal: 0, vram_free_bytes: 64, tflops_fp16: 1.0, ..Default::default() },
-            grim_tensor::GpuCapability { ordinal: 1, vram_free_bytes: 64, tflops_fp16: 1.0, ..Default::default() },
-            grim_tensor::GpuCapability { ordinal: 2, vram_free_bytes: 64, tflops_fp16: 1.0, ..Default::default() },
+            grim_tensor::GpuCapability {
+                ordinal: 0,
+                vram_free_bytes: 64,
+                tflops_fp16: 1.0,
+                ..Default::default()
+            },
+            grim_tensor::GpuCapability {
+                ordinal: 1,
+                vram_free_bytes: 64,
+                tflops_fp16: 1.0,
+                ..Default::default()
+            },
+            grim_tensor::GpuCapability {
+                ordinal: 2,
+                vram_free_bytes: 64,
+                tflops_fp16: 1.0,
+                ..Default::default()
+            },
         ];
         let map = ExpertPlacementMap::build(3, &caps, grim_nn::moe::CapacityMetric::VramBytes);
         // local_rank = 0. The placement alternates e0→r0, e1→r1, e2→r2.
         // Pairs target all three experts.
         let pairs = vec![
-            RoutedPair { token: 0, expert: 0, combine_weight: 0.5 }, // → local r0
-            RoutedPair { token: 0, expert: 1, combine_weight: 0.3 }, // → remote r1
-            RoutedPair { token: 1, expert: 2, combine_weight: 0.7 }, // → remote r2
-            RoutedPair { token: 1, expert: 1, combine_weight: 0.4 }, // → remote r1
+            RoutedPair {
+                token: 0,
+                expert: 0,
+                combine_weight: 0.5,
+            }, // → local r0
+            RoutedPair {
+                token: 0,
+                expert: 1,
+                combine_weight: 0.3,
+            }, // → remote r1
+            RoutedPair {
+                token: 1,
+                expert: 2,
+                combine_weight: 0.7,
+            }, // → remote r2
+            RoutedPair {
+                token: 1,
+                expert: 1,
+                combine_weight: 0.4,
+            }, // → remote r1
         ];
         let plan = MoeDispatchPlan::build(&pairs, &map, 0);
         // Local: 1 pair (the (t0,e0)).
@@ -1502,7 +1630,11 @@ mod tests {
         // Remote: 2 batches (rank 1 and rank 2), rank-ascending order.
         assert_eq!(plan.remote.len(), 2);
         assert_eq!(plan.remote[0].dest_rank, 1);
-        assert_eq!(plan.remote[0].pairs.len(), 2, "rank 1 batch has both (t0,e1) and (t1,e1)");
+        assert_eq!(
+            plan.remote[0].pairs.len(),
+            2,
+            "rank 1 batch has both (t0,e1) and (t1,e1)"
+        );
         assert_eq!(plan.remote[1].dest_rank, 2);
         assert_eq!(plan.remote[1].pairs.len(), 1);
         // Input order preserved within each batch.
@@ -1522,12 +1654,23 @@ mod tests {
         }];
         let map = ExpertPlacementMap::build(4, &caps, grim_nn::moe::CapacityMetric::VramBytes);
         let pairs = vec![
-            RoutedPair { token: 0, expert: 0, combine_weight: 1.0 },
-            RoutedPair { token: 1, expert: 1, combine_weight: 1.0 },
+            RoutedPair {
+                token: 0,
+                expert: 0,
+                combine_weight: 1.0,
+            },
+            RoutedPair {
+                token: 1,
+                expert: 1,
+                combine_weight: 1.0,
+            },
         ];
         let plan = MoeDispatchPlan::build(&pairs, &map, 0);
         assert_eq!(plan.local.pairs.len(), 2);
-        assert!(plan.remote.is_empty(), "single-rank farm must have no remote batches");
+        assert!(
+            plan.remote.is_empty(),
+            "single-rank farm must have no remote batches"
+        );
     }
 
     #[test]
@@ -1539,25 +1682,52 @@ mod tests {
         let map = ep_map_2ranks_4experts_split();
         // token 0 routed to experts {0, 1} (rank 0 and rank 1 respectively).
         let pairs = vec![
-            RoutedPair { token: 0, expert: 0, combine_weight: 0.6 },
-            RoutedPair { token: 0, expert: 1, combine_weight: 0.4 },
+            RoutedPair {
+                token: 0,
+                expert: 0,
+                combine_weight: 0.6,
+            },
+            RoutedPair {
+                token: 0,
+                expert: 1,
+                combine_weight: 0.4,
+            },
         ];
         let plan = MoeDispatchPlan::build(&pairs, &map, 0);
         assert_eq!(plan.local.pairs.len(), 1, "(t0, e0) is local on rank 0");
         assert_eq!(plan.local.pairs[0].token, 0);
         assert_eq!(plan.remote.len(), 1);
         assert_eq!(plan.remote[0].dest_rank, 1);
-        assert_eq!(plan.remote[0].pairs.len(), 1, "(t0, e1) is remote on rank 1");
-        assert_eq!(plan.remote[0].pairs[0].token, 0, "same token, different rank — must not de-dup");
+        assert_eq!(
+            plan.remote[0].pairs.len(),
+            1,
+            "(t0, e1) is remote on rank 1"
+        );
+        assert_eq!(
+            plan.remote[0].pairs[0].token, 0,
+            "same token, different rank — must not de-dup"
+        );
     }
 
     #[test]
     fn ep2_emit_remote_descriptors_sets_num_tokens_per_batch() {
         let map = ep_map_2ranks_4experts_split();
         let pairs = vec![
-            RoutedPair { token: 0, expert: 1, combine_weight: 1.0 }, // → r1
-            RoutedPair { token: 1, expert: 3, combine_weight: 1.0 }, // → r1
-            RoutedPair { token: 2, expert: 0, combine_weight: 1.0 }, // → r0 local
+            RoutedPair {
+                token: 0,
+                expert: 1,
+                combine_weight: 1.0,
+            }, // → r1
+            RoutedPair {
+                token: 1,
+                expert: 3,
+                combine_weight: 1.0,
+            }, // → r1
+            RoutedPair {
+                token: 2,
+                expert: 0,
+                combine_weight: 1.0,
+            }, // → r0 local
         ];
         let plan = MoeDispatchPlan::build(&pairs, &map, 0);
         // Template descriptor with the shared geometry; only `num_tokens`
@@ -1599,8 +1769,16 @@ mod tests {
         // fields) is device-gated.
         let map = ep_map_2ranks_4experts_split();
         let pairs = vec![
-            RoutedPair { token: 0, expert: 1, combine_weight: 1.0 }, // → r1
-            RoutedPair { token: 2, expert: 0, combine_weight: 1.0 }, // → r0 local
+            RoutedPair {
+                token: 0,
+                expert: 1,
+                combine_weight: 1.0,
+            }, // → r1
+            RoutedPair {
+                token: 2,
+                expert: 0,
+                combine_weight: 1.0,
+            }, // → r0 local
         ];
         let plan = MoeDispatchPlan::build(&pairs, &map, 0);
         let template = MoETaskDescriptor::default();
@@ -1611,7 +1789,9 @@ mod tests {
         let ring = ScytheRing::new(4);
         let (dest_rank, desc) = &descriptors[0];
         let task = desc.enqueue_via(0xAA00, 0xBB00, 0xCC00);
-        let slot = ring.enqueue(task).expect("enqueue on empty ring must succeed");
+        let slot = ring
+            .enqueue(task)
+            .expect("enqueue on empty ring must succeed");
         assert_eq!(slot, 0);
         let dequeued = ring.dequeue();
         assert_eq!(dequeued, 0);
@@ -1632,10 +1812,18 @@ mod tests {
         // job here is just "don't drop the pair silently."
         let map = ep_map_2ranks_4experts_split(); // 4 experts (0..3)
         let pairs = vec![
-            RoutedPair { token: 0, expert: 99, combine_weight: 1.0 }, // out of range
+            RoutedPair {
+                token: 0,
+                expert: 99,
+                combine_weight: 1.0,
+            }, // out of range
         ];
         let plan = MoeDispatchPlan::build(&pairs, &map, 0);
-        assert_eq!(plan.local.pairs.len(), 1, "unmapped expert falls back to local");
+        assert_eq!(
+            plan.local.pairs.len(),
+            1,
+            "unmapped expert falls back to local"
+        );
         assert!(plan.remote.is_empty());
         assert_eq!(plan.total_pairs(), 1, "pair is not dropped");
     }
@@ -1746,7 +1934,8 @@ mod tests {
                     });
                 }
                 // Group partials by expert for this destination
-                let mut expert_groups: std::collections::HashMap<usize, Vec<ExpertPartial>> = std::collections::HashMap::new();
+                let mut expert_groups: std::collections::HashMap<usize, Vec<ExpertPartial>> =
+                    std::collections::HashMap::new();
                 for p in partials {
                     expert_groups.entry(p.expert).or_default().push(p);
                 }
@@ -1815,9 +2004,21 @@ mod tests {
     fn ep3_combine_plan_groups_partials_by_expert() {
         let map = ep_map_2ranks_4experts_split();
         let pairs = vec![
-            RoutedPair { token: 0, expert: 1, combine_weight: 0.6 },
-            RoutedPair { token: 1, expert: 3, combine_weight: 0.4 },
-            RoutedPair { token: 2, expert: 0, combine_weight: 1.0 },
+            RoutedPair {
+                token: 0,
+                expert: 1,
+                combine_weight: 0.6,
+            },
+            RoutedPair {
+                token: 1,
+                expert: 3,
+                combine_weight: 0.4,
+            },
+            RoutedPair {
+                token: 2,
+                expert: 0,
+                combine_weight: 1.0,
+            },
         ];
         let plan = MoeDispatchPlan::build(&pairs, &map, 0);
 
@@ -1842,9 +2043,21 @@ mod tests {
         // per expert with combined weights.
         let map = ep_map_2ranks_4experts_split();
         let pairs = vec![
-            RoutedPair { token: 0, expert: 1, combine_weight: 0.6 },
-            RoutedPair { token: 1, expert: 1, combine_weight: 0.4 }, // same expert
-            RoutedPair { token: 2, expert: 3, combine_weight: 1.0 },
+            RoutedPair {
+                token: 0,
+                expert: 1,
+                combine_weight: 0.6,
+            },
+            RoutedPair {
+                token: 1,
+                expert: 1,
+                combine_weight: 0.4,
+            }, // same expert
+            RoutedPair {
+                token: 2,
+                expert: 3,
+                combine_weight: 1.0,
+            },
         ];
         let plan = MoeDispatchPlan::build(&pairs, &map, 0);
         let combine = plan.build_combine_plan(0, 4096, 14336);
@@ -1853,7 +2066,11 @@ mod tests {
         let batch = &combine.remote_batches[0];
         // Two tokens → expert 1 should merge into one partial
         assert_eq!(batch.partials.len(), 2); // expert 1 (merged) + expert 3
-        let expert1 = batch.partials.iter().find(|p| p.expert == 1).expect("expert 1");
+        let expert1 = batch
+            .partials
+            .iter()
+            .find(|p| p.expert == 1)
+            .expect("expert 1");
         // Combined weight = (0.6 + 0.4) / 2 = 0.5
         assert!((expert1.combine_weight - 0.5).abs() < 1e-5);
     }
@@ -1862,8 +2079,16 @@ mod tests {
     fn ep3_combine_plan_output_shape() {
         let map = ep_map_2ranks_4experts_split();
         let pairs = vec![
-            RoutedPair { token: 0, expert: 1, combine_weight: 1.0 },
-            RoutedPair { token: 1, expert: 3, combine_weight: 1.0 },
+            RoutedPair {
+                token: 0,
+                expert: 1,
+                combine_weight: 1.0,
+            },
+            RoutedPair {
+                token: 1,
+                expert: 3,
+                combine_weight: 1.0,
+            },
         ];
         let plan = MoeDispatchPlan::build(&pairs, &map, 0);
         let combine = plan.build_combine_plan(0, 128, 256);
@@ -1884,8 +2109,16 @@ mod tests {
         }];
         let map = ExpertPlacementMap::build(4, &caps, grim_nn::moe::CapacityMetric::VramBytes);
         let pairs = vec![
-            RoutedPair { token: 0, expert: 0, combine_weight: 1.0 },
-            RoutedPair { token: 1, expert: 1, combine_weight: 1.0 },
+            RoutedPair {
+                token: 0,
+                expert: 0,
+                combine_weight: 1.0,
+            },
+            RoutedPair {
+                token: 1,
+                expert: 1,
+                combine_weight: 1.0,
+            },
         ];
         let plan = MoeDispatchPlan::build(&pairs, &map, 0);
         let combine = plan.build_combine_plan(0, 4096, 14336);
@@ -1912,40 +2145,6 @@ mod tests {
     //    RcclAllReduce::sum_gradients_device)
     // 4. Router gradient handled separately (full-batch all-reduce across all
     //    ranks, since every rank's tokens influence the router)
-
-    /// A gradient partial for one expert on one rank.
-    ///
-    /// During backward pass, each rank that computed a given expert's forward
-    //  pass holds a gradient shard for that expert's weights. These shards
-    //  must be combined (summed) across all ranks that participated.
-    pub struct ExpertGradientPartial {
-        /// The expert index
-        pub expert: usize,
-        /// Rank that holds this gradient shard
-        pub rank: usize,
-        /// The gradient buffers for this expert's weights
-        //  - d_gate_w: [inter, hidden]
-        //  - d_up_w:   [inter, hidden]
-        //  - d_down_w: [hidden, inter]
-        //  - d_x:      [batch, hidden] (input gradient, accumulated)
-        pub d_gate_w_ptr: Option<u64>,
-        pub d_up_w_ptr: Option<u64>,
-        pub d_down_w_ptr: Option<u64>,
-        pub d_x_ptr: Option<u64>,
-        /// Whether this rank actually computed this expert's forward
-        /// (and thus has valid gradients to contribute)
-        pub has_valid_gradient: bool,
-    }
-
-    impl std::fmt::Debug for ExpertGradientPartial {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("ExpertGradientPartial")
-                .field("expert", &self.expert)
-                .field("rank", &self.rank)
-                .field("has_valid_gradient", &self.has_valid_gradient)
-                .finish()
-        }
-    }
 
     /// Gradient combine plan for one expert.
     ///
@@ -2013,7 +2212,7 @@ mod tests {
             &self,
             placement: &ExpertPlacementMap,
             num_ranks: usize,
-            local_rank: usize,
+            _local_rank: usize,
         ) -> MoeGradientCombinePlan {
             let mut expert_plans = Vec::new();
 
@@ -2023,7 +2222,10 @@ mod tests {
 
                 // Only create plans for experts that actually have dispatch pairs.
                 let has_local = self.local.pairs.iter().any(|p| p.expert as usize == expert);
-                let has_remote = self.remote.iter().any(|b| b.pairs.iter().any(|p| p.expert as usize == expert));
+                let has_remote = self
+                    .remote
+                    .iter()
+                    .any(|b| b.pairs.iter().any(|p| p.expert as usize == expert));
                 if !has_local && !has_remote {
                     continue;
                 }
@@ -2127,8 +2329,16 @@ mod tests {
         let map = ep_map_2ranks_4experts_split();
         // rank 0 owns {0, 2}, rank 1 owns {1, 3}
         let pairs = vec![
-            RoutedPair { token: 0, expert: 1, combine_weight: 1.0 },
-            RoutedPair { token: 1, expert: 3, combine_weight: 1.0 },
+            RoutedPair {
+                token: 0,
+                expert: 1,
+                combine_weight: 1.0,
+            },
+            RoutedPair {
+                token: 1,
+                expert: 3,
+                combine_weight: 1.0,
+            },
         ];
         let plan = MoeDispatchPlan::build(&pairs, &map, 0);
 
@@ -2139,21 +2349,39 @@ mod tests {
         // Expert 1: rank 1 (owner) participates. Rank 0 dispatched remotely
         // but does not hold weight gradients — only the owner rank joins the
         // weight-gradient all-reduce.
-        let e1 = grad_plan.expert_plans.iter().find(|p| p.expert == 1).expect("expert 1");
+        let e1 = grad_plan
+            .expert_plans
+            .iter()
+            .find(|p| p.expert == 1)
+            .expect("expert 1");
         assert_eq!(e1.participating_ranks.len(), 1);
         assert!(e1.participating_ranks.contains(&1));
         assert_eq!(e1.owner_rank, 1);
 
         // Expert 3: rank 1 (owner) participates.
-        let e3 = grad_plan.expert_plans.iter().find(|p| p.expert == 3).expect("expert 3");
+        let e3 = grad_plan
+            .expert_plans
+            .iter()
+            .find(|p| p.expert == 3)
+            .expect("expert 3");
         assert_eq!(e3.participating_ranks.len(), 1);
         assert!(e3.participating_ranks.contains(&1));
         assert_eq!(e3.owner_rank, 1);
 
         // Router: all ranks participate
         assert_eq!(grad_plan.router_gradient_plan.participating_ranks.len(), 2);
-        assert!(grad_plan.router_gradient_plan.participating_ranks.contains(&0));
-        assert!(grad_plan.router_gradient_plan.participating_ranks.contains(&1));
+        assert!(
+            grad_plan
+                .router_gradient_plan
+                .participating_ranks
+                .contains(&0)
+        );
+        assert!(
+            grad_plan
+                .router_gradient_plan
+                .participating_ranks
+                .contains(&1)
+        );
     }
 
     #[test]
@@ -2166,8 +2394,16 @@ mod tests {
         }];
         let map = ExpertPlacementMap::build(4, &caps, grim_nn::moe::CapacityMetric::VramBytes);
         let pairs = vec![
-            RoutedPair { token: 0, expert: 0, combine_weight: 1.0 },
-            RoutedPair { token: 1, expert: 1, combine_weight: 1.0 },
+            RoutedPair {
+                token: 0,
+                expert: 0,
+                combine_weight: 1.0,
+            },
+            RoutedPair {
+                token: 1,
+                expert: 1,
+                combine_weight: 1.0,
+            },
         ];
         let plan = MoeDispatchPlan::build(&pairs, &map, 0);
         let grad_plan = plan.build_gradient_combine_plan(&map, 1, 0);
@@ -2181,9 +2417,11 @@ mod tests {
     fn ep4_gradient_plan_excludes_unused_experts() {
         let map = ep_map_2ranks_4experts_split();
         // Only use expert 1
-        let pairs = vec![
-            RoutedPair { token: 0, expert: 1, combine_weight: 1.0 },
-        ];
+        let pairs = vec![RoutedPair {
+            token: 0,
+            expert: 1,
+            combine_weight: 1.0,
+        }];
         let plan = MoeDispatchPlan::build(&pairs, &map, 0);
         let grad_plan = plan.build_gradient_combine_plan(&map, 2, 0);
 
@@ -2197,8 +2435,16 @@ mod tests {
     fn ep4_expert_gradient_combine_device_gated() {
         let map = ep_map_2ranks_4experts_split();
         let pairs = vec![
-            RoutedPair { token: 0, expert: 0, combine_weight: 1.0 },
-            RoutedPair { token: 1, expert: 1, combine_weight: 1.0 },
+            RoutedPair {
+                token: 0,
+                expert: 0,
+                combine_weight: 1.0,
+            },
+            RoutedPair {
+                token: 1,
+                expert: 1,
+                combine_weight: 1.0,
+            },
         ];
         let plan = MoeDispatchPlan::build(&pairs, &map, 0);
         let grad_plan = plan.build_gradient_combine_plan(&map, 2, 0);
@@ -2213,10 +2459,14 @@ mod tests {
                 let res_expert = all_reduce_expert_gradients_f32(&dev, None, e0_plan, 128);
                 assert!(res_expert.is_ok());
 
-                let res_router = all_reduce_router_gradients_f32(&dev, None, &grad_plan.router_gradient_plan, 128);
+                let res_router = all_reduce_router_gradients_f32(
+                    &dev,
+                    None,
+                    &grad_plan.router_gradient_plan,
+                    128,
+                );
                 assert!(res_router.is_ok());
             }
         }
     }
 }
-

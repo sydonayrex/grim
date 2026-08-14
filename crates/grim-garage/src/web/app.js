@@ -189,11 +189,12 @@ document.addEventListener('DOMContentLoaded', () => {
       const isNvidia = d.vendor === 'NVIDIA' || (d.name && d.name.includes('NVIDIA'));
       const isRocm = d.is_rocm_compliant || d.vendor === 'AMD';
 
-      const totalMb = d.vram_bytes ? Math.round(d.vram_bytes / (1024 * 1024)) : (d.vram_total_mb || 24576);
-      const totalGb = (totalMb / 1024).toFixed(1);
-      const freeMb = d.vram_free_mb || Math.round(totalMb * 0.75);
-      const usedMb = totalMb - freeMb;
-      const pct = Math.min(100, Math.max(0, Math.round((usedMb / totalMb) * 100)));
+      const totalMb = d.vram_bytes ? Math.round(d.vram_bytes / (1024 * 1024)) : d.vram_total_mb;
+      const freeMb = Number.isFinite(d.vram_free_mb) ? d.vram_free_mb : null;
+      const usedMb = totalMb !== null && totalMb !== undefined && freeMb !== null
+        ? Math.max(0, totalMb - freeMb) : null;
+      const pct = totalMb && usedMb !== null
+        ? Math.min(100, Math.max(0, Math.round((usedMb / totalMb) * 100))) : null;
 
       const badgeHtml = isNvidia
         ? '<span class="vendor-tag vendor-nvidia">🟢 NVIDIA CUDA (Non-ROCm)</span>'
@@ -226,11 +227,11 @@ document.addEventListener('DOMContentLoaded', () => {
             ${badgeHtml}
           </div>
           ${complianceHtml}
-          <div class="item-detail"><strong>Max Memory (VRAM):</strong> ${totalMb.toLocaleString()} MB (${totalGb} GB Total)</div>
+          <div class="item-detail"><strong>Max Memory (VRAM):</strong> ${totalMb ? `${totalMb.toLocaleString()} MB (${(totalMb / 1024).toFixed(1)} GB Total)` : 'Unavailable'}</div>
           <div class="vram-meter">
-            <div class="vram-fill" style="width: ${pct}%;"></div>
+            <div class="vram-fill" style="width: ${pct === null ? 0 : pct}%;"></div>
           </div>
-          <div class="item-detail"><strong>Memory Status:</strong> ${usedMb.toLocaleString()} MB used / ${freeMb.toLocaleString()} MB free (${pct}% allocated)</div>
+          <div class="item-detail"><strong>Memory Status:</strong> ${usedMb === null ? 'Unavailable' : `${usedMb.toLocaleString()} MB used / ${freeMb.toLocaleString()} MB free (${pct}% allocated)`}</div>
           ${archDetailsHtml}
           <div class="item-detail"><strong>Max Threads Per Block:</strong> ${d.max_threads_per_block || 1024} threads</div>
         </div>

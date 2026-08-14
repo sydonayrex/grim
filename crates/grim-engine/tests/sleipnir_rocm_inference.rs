@@ -168,17 +168,6 @@ fn generate(dev: &dyn BackendDevice, device: &Device, path: &str, vocab: usize) 
     let logits = model
         .forward(session.as_mut(), &input_tensor, &pos_tensor, &[])
         .expect("model.forward prefill failed");
-    // Debug first-token logits to diagnose all-EOS behavior
-    {
-        let first_logits = last_position_logits(dev, &device, &logits, vocab);
-        let vals = first_logits.to_vec_f32().expect("first logits to_vec_f32");
-        let max_v = vals.iter().cloned().fold(f32::NAN, f32::max);
-        let min_v = vals.iter().cloned().fold(f32::NAN, f32::min);
-        let mean_v = vals.iter().sum::<f32>() / vals.len() as f32;
-        let nan_count = vals.iter().filter(|v| v.is_nan()).count();
-        let zero_count = vals.iter().filter(|v| **v == 0.0).count();
-    }
-
     let sampler: Box<dyn Sampler> = SAMPLING.into_sampler(42);
     let mut generated = Vec::new();
     let mut current = sampler

@@ -269,13 +269,18 @@ fn gptq_3bit_cross_word_nonzero_codes_pack_and_unpack() {
 
 #[test]
 fn iq4nl_golden_codebook_with_group_scale_multiplier() {
-    let mut buf = vec![0u8; 144];
+    // QNT-3 fix: IQ4_NL super-block is 170 bytes (d[2] + q8 sign[32] + q4
+    // nibbles[128] + scales[8]). The old test used the broken 144-byte layout
+    // and conflated the sign byte with the first quant nibble.
+    let mut buf = vec![0u8; 170];
 
     // d = 1.0 (f16 0x3C00).
     buf[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
 
-    // KVALUES_IQ4NL index 0 is -127.0
-    buf[2] = 0x00; // nibbles 0 and 0
+    // q4 nibble 0 (at byte 34) = 0 -> KVALUES_IQ4NL index 0 = -127.0
+    buf[34] = 0x00;
+    // sign byte for weight 0 (q8[0] bit 0) set so the result is negative
+    buf[2] = 0x01;
     let want0 = -127.0 * 1.0;
 
     let out = dequant_iq4nl(&buf, 256).expect("iq4nl dequant");

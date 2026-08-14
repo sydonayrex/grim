@@ -4,7 +4,6 @@ use grim_autograd::omnigrad::{OmniGradConfig, OmniGradRouter};
 
 #[test]
 fn omnigrad_routes_synthetic_3_layer_network() {
-    let num_layers = 3;
     let mut config = OmniGradConfig::default();
     config.per_layer_lr = vec![0.1, 0.2, 0.3];
     config.noise_threshold = 2.0;

@@ -1,73 +1,56 @@
-# grim-backend-vulkan
-
-Vulkan compute backend for Grim — implements `BackendDevice` and `BackendStorage` traits from `grim-tensor` via Vulkan compute shaders.
-
 ## Purpose
-
-Provides `VulkanDevice` and `VulkanStorage` as a cross-platform GPU backend using the Vulkan compute pipeline. Exposes a fused QKV attention compute shader dispatch.
+The `grim-backend-vulkan` crate provides a highly portable backend for the Grim engine using the Vulkan graphics and compute API. It ensures that inference can run on virtually any modern hardware platform (AMD, NVIDIA, Intel, and mobile SOCs) that supports Vulkan compute shaders.
 
 ## Boundaries
-
-- Does **not** define the `BackendDevice` / `BackendStorage` traits — those are declared in `grim-tensor`.
-- Does **not** provide the full ROCm backend feature set (no RCCL, no HIP graph capture, no MIOpen).
-- Does **not** handle model loading — see `grim-format`.
+This crate connects the Grim engine to Vulkan 1.x APIs. It explicitly targets compute capabilities and storage buffers, ignoring Vulkan's graphics pipeline (rasterization, presentation). It operates via standard Vulkan FFI and requires a valid Vulkan ICD (Installable Client Driver) on the host system.
 
 ## Dependency Graph
-
 ```mermaid
-graph LR
-    A[grim-backend-vulkan] --> B[grim-tensor]
-
-    subgraph "reverse deps"
-        C1[grim-nn]
-        C2[grim-autograd]
-    end
-
-    C1 --> A
-    C2 --> A
-
-    style A fill:#f3e5f5
+graph TD
+    grim-backend-vulkan[["grim-backend-vulkan"]]
+    
+    grim-tensor["grim-tensor"]
+    grim-quant["grim-quant"]
+    thiserror["thiserror"]
+    lazy_static["lazy_static"]
+    tracing["tracing"]
+    seahash["seahash"]
+    serde["serde"]
+    serde_json["serde_json"]
+    
+    grim-backend-vulkan --> grim-tensor
+    grim-backend-vulkan --> grim-quant
+    grim-backend-vulkan --> thiserror
+    grim-backend-vulkan --> lazy_static
+    grim-backend-vulkan --> tracing
+    grim-backend-vulkan --> seahash
+    grim-backend-vulkan --> serde
+    grim-backend-vulkan --> serde_json
 ```
 
-## Public API
+## Public API Overview
+- `VulkanDevice` / `VulkanContext`: Initializes the Vulkan instance, physical device, logical device, and compute queues.
+- `VulkanStorage`: Wraps `VkBuffer` and `VkDeviceMemory` for hardware-accessible tensor data.
+- `VulkanHandle`: Represents execution synchronization (often synchronous `vkQueueWaitIdle` in current implementation).
+- `VulkanAutotuner`: Profiles kernel workgroup configurations to achieve optimal utilization across diverse hardware architectures.
 
+## Usage Example
 ```rust
-pub struct VulkanDevice;
-pub struct VulkanStorage { /* Vulkan buffer handle + metadata */ }
+use grim_backend_vulkan::caps::VulkanCaps;
 
-impl VulkanDevice {
-    pub fn new() -> Self;
-    pub fn probe() -> Result<Vec<VulkanDevice>>;
-    pub fn qkv_attention_inner(&self, q: &dyn BackendStorage,
-        k: &dyn BackendStorage, v: &dyn BackendStorage,
-        out: &mut dyn BackendStorage,
-        scale: f32, stride_q: usize, stride_k: usize, stride_v: usize,
-        stride_out: usize, batch: usize, heads: usize, seq_len: usize,
-        head_dim: usize, block_tables: Option<&[u32]>,
-        max_seq_len: usize, alibi: Option<&[f32]>) -> Result<()>;
+fn print_vulkan_caps(caps: &VulkanCaps) {
+    println!("Vulkan Device: {}", caps.device_name);
+    println!("Compute Queue Family: {}", caps.queue_family_index);
 }
-
-impl Default for VulkanDevice {
-    fn default() -> Self { Self::new() }
-}
-
-impl BackendDevice for VulkanDevice { /* ... */ }
 ```
 
-Vulkan FFI constants and types:
-
-```rust
-pub type VkFlags = u32;
-pub type VkDeviceSize = u64;
-pub const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: u32 = 1;
-// ... plus Vulkan structure type and physical device type constants
-```
-
-## Feature Flags
-
-This crate has no feature flags.
+## Use Cases
+- Hardware-agnostic execution where proprietary drivers (CUDA, ROCm) are unavailable or difficult to configure.
+- Edge device or consumer desktop deployment targeting integrated graphics or generic hardware.
 
 ## Edge Cases, Limitations, and Quirks
+- The initialization routine deliberately rejects software rasterizers (like `lavapipe` or `swiftshader`) to prevent severe performance penalties when actual hardware acceleration is expected.
+- Memory allocation maps host-visible and host-coherent buffers whenever possible to simplify data upload, which might incur overhead compared to purely device-local staging strategies.
 
-- `VulkanDevice` is a zero-sized type — a `LazyLock` holds the global Vulkan context; if initialization fails, `probe()` returns an empty vector.
-- The fused QKV attention shader is the primary optimization; non-attention ops dispatch through the generic `BackendDevice` path.
+## Build Flags, Feature Flags, and Environment Variables
+- `default`: No default features are enabled.

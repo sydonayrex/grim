@@ -14,7 +14,7 @@ use grim_backend_rocm::RocmDevice;
 use grim_backend_rocm::device::cubecl::{
     add, client, embedding, gptq_correction, mul, qkv_attention, silu_mul,
 };
-use grim_tensor::{BackendDevice, BackendStorage, DType, Shape};
+use grim_tensor::{BackendDevice, DType, Shape};
 
 /// End-to-end check that the feature-gated A/B dispatch in `RocmDevice`
 /// actually routes `add`/`rms_norm`/`softmax`/`embedding`/`qkv_attention`/
@@ -148,10 +148,6 @@ fn cubecl_ab_dispatch_through_device_methods() {
         );
     }
     println!("cubecl A/B embedding: ok");
-}
-
-fn approx_eq(a: f32, b: f32, tol: f32) -> bool {
-    (a - b).abs() <= tol + 1e-4 * a.abs()
 }
 
 fn max_err(got: &[f32], want: &[f32]) -> f32 {

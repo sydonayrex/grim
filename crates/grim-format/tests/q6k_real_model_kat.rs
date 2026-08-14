@@ -4,7 +4,7 @@
 use std::fs::File;
 use std::io::BufReader;
 
-use grim_format::gguf::{read_gguf, read_tensor_bytes, GgufDType};
+use grim_format::gguf::{GgufDType, read_gguf, read_tensor_bytes};
 use grim_quant::dequant_q6k;
 
 fn f16_le(b: &[u8], i: usize) -> f32 {
@@ -69,7 +69,10 @@ fn real_model_q6k_matches_reference() {
     let path = repo_root.join("models/MiniCPM5-1B-Q4_K_M.gguf");
     let f = match File::open(&path) {
         Ok(f) => f,
-        Err(_) => { eprintln!("skip: model not present"); return; }
+        Err(_) => {
+            eprintln!("skip: model not present");
+            return;
+        }
     };
     let mut reader = BufReader::new(f);
     let file = read_gguf(&mut reader).expect("read_gguf");
@@ -78,7 +81,10 @@ fn real_model_q6k_matches_reference() {
         .iter()
         .find(|t| t.dtype == GgufDType::Q6K)
         .expect("at least one Q6K tensor");
-    eprintln!("[kat6] tensor '{}' dims={:?} bytes={}", target.name, target.dims, target.size_bytes);
+    eprintln!(
+        "[kat6] tensor '{}' dims={:?} bytes={}",
+        target.name, target.dims, target.size_bytes
+    );
     let bytes = read_tensor_bytes(&mut reader, &file, target).expect("read tensor");
     let n = target.elem_count();
     let grim = dequant_q6k(&bytes, n).expect("grim dequant");
@@ -102,5 +108,8 @@ fn real_model_q6k_matches_reference() {
         }
     }
     eprintln!("[kat6] finite_max_diff={finite_max:.6} first_div={first_div:?}");
-    assert!(finite_max < 1e-2, "grim q6k diverges from reference: finite_max={finite_max}");
+    assert!(
+        finite_max < 1e-2,
+        "grim q6k diverges from reference: finite_max={finite_max}"
+    );
 }

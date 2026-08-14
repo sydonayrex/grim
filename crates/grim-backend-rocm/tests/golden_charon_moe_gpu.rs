@@ -31,10 +31,10 @@
 
 use std::panic;
 
-use grim_backend_rocm::RocmDevice;
 use grim_backend_cpu::cpu_tensor;
-use grim_nn::moe::{ExpertBank, MoeFfn, MoeRouter, RouterKind};
+use grim_backend_rocm::RocmDevice;
 use grim_nn::Linear;
+use grim_nn::moe::{ExpertBank, MoeFfn, MoeRouter, RouterKind};
 use grim_tensor::shape::Shape;
 
 const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
@@ -66,9 +66,9 @@ const BATCH: usize = 4;
 /// trivial matrix so the kernel exercises real GEMM + SiLU + down paths.
 /// Gate/up are `[inter, hidden]`; down is `[hidden, inter]`.
 struct ExpertWeights {
-    gate: Vec<Vec<f32>>,  // [num_experts][inter*hidden]
-    up: Vec<Vec<f32>>,    // [num_experts][inter*hidden]
-    down: Vec<Vec<f32>>,  // [num_experts][hidden*inter]
+    gate: Vec<Vec<f32>>, // [num_experts][inter*hidden]
+    up: Vec<Vec<f32>>,   // [num_experts][inter*hidden]
+    down: Vec<Vec<f32>>, // [num_experts][hidden*inter]
 }
 
 /// Deterministic, numerically-rich expert weights. Distinct per expert so a
@@ -134,10 +134,7 @@ fn deterministic_activations() -> Vec<f32> {
 fn build_moe_oracle(routed_scaling_factor: f32) -> MoeFfn {
     let ew = deterministic_expert_weights();
     let gw = deterministic_router_gate();
-    let gate = Linear::from_tensor(
-        cpu_tensor(gw, Shape::new(vec![NUM_EXPERTS, HIDDEN])),
-        None,
-    );
+    let gate = Linear::from_tensor(cpu_tensor(gw, Shape::new(vec![NUM_EXPERTS, HIDDEN])), None);
     let mut eg = Vec::with_capacity(NUM_EXPERTS);
     let mut eu = Vec::with_capacity(NUM_EXPERTS);
     let mut ed = Vec::with_capacity(NUM_EXPERTS);
@@ -201,11 +198,20 @@ fn max_rel_diff(a: &[f32], b: &[f32]) -> f32 {
 /// per-block-16 weight dequant (scale from the quant tensors), dot-product
 /// gate/up contraction, SiLU, down contraction, top-k accumulation with rsf.
 fn cpu_fp8_reference(
-    gw_flat: &[f32], uw_flat: &[f32], dw_flat: &[f32],
-    gw8: &[u8], uw8: &[u8], dw8: &[u8],
-    gs: &[f32], us: &[f32], ds: &[f32],
-    indices: &[Vec<usize>], weights: &[Vec<f32>],
-    x: &[f32], num_experts: usize, rsf: f32,
+    gw_flat: &[f32],
+    uw_flat: &[f32],
+    dw_flat: &[f32],
+    gw8: &[u8],
+    uw8: &[u8],
+    dw8: &[u8],
+    gs: &[f32],
+    us: &[f32],
+    ds: &[f32],
+    indices: &[Vec<usize>],
+    weights: &[Vec<f32>],
+    x: &[f32],
+    _num_experts: usize,
+    rsf: f32,
 ) -> Vec<f32> {
     use grim_quant::{f32_to_fp8_e4m3, fp8_e4m3_to_f32};
     let _ = (gw_flat, uw_flat, dw_flat); // fp32 weights unused; we dequant from bytes.
@@ -234,7 +240,7 @@ fn cpu_fp8_reference(
                         let gidx = j * h16 + (i / 16);
                         let uidx = j * h16 + (i / 16);
                         gate += fp8_e4m3_to_f32(gw[j * hidden + i]) * gsb[gidx] * a[i];
-                        up   += fp8_e4m3_to_f32(uw[j * hidden + i]) * usb[uidx] * a[i];
+                        up += fp8_e4m3_to_f32(uw[j * hidden + i]) * usb[uidx] * a[i];
                     }
                     let silu = gate / (1.0 + (-gate).exp());
                     let act = silu * up;
@@ -254,11 +260,20 @@ fn cpu_fp8_reference(
 /// E2M1 dequant with per-32-group E8M0 shared exponent, dot-product gate/up
 /// contraction, SiLU, down contraction, top-k accumulation with rsf.
 fn cpu_mxfp4_reference(
-    _gw_flat: &[f32], _uw_flat: &[f32], _dw_flat: &[f32],
-    gw_c: &[u8], uw_c: &[u8], dw_c: &[u8],
-    gw_e: &[u8], uw_e: &[u8], dw_e: &[u8],
-    indices: &[Vec<usize>], weights: &[Vec<f32>],
-    x: &[f32], num_experts: usize, rsf: f32,
+    _gw_flat: &[f32],
+    _uw_flat: &[f32],
+    _dw_flat: &[f32],
+    gw_c: &[u8],
+    uw_c: &[u8],
+    dw_c: &[u8],
+    gw_e: &[u8],
+    uw_e: &[u8],
+    dw_e: &[u8],
+    indices: &[Vec<usize>],
+    weights: &[Vec<f32>],
+    x: &[f32],
+    _num_experts: usize,
+    rsf: f32,
 ) -> Vec<f32> {
     use grim_quant::{f32_to_mxfp4_e2m1, mxfp4_e2m1_to_f32};
     let _ = f32_to_mxfp4_e2m1 as fn(f32, u8) -> u8;
@@ -269,7 +284,11 @@ fn cpu_mxfp4_reference(
     // E2M1 nibble reader matching the kernel's `mxfp4_code_at`.
     let code_at = |codes: &[u8], idx: usize| -> u8 {
         let b = codes[idx >> 1];
-        if idx & 1 != 0 { (b >> 4) & 0x0F } else { b & 0x0F }
+        if idx & 1 != 0 {
+            (b >> 4) & 0x0F
+        } else {
+            b & 0x0F
+        }
     };
     for (t, (idx_row, w_row)) in indices.iter().zip(weights.iter()).enumerate() {
         for (&e, &wt) in idx_row.iter().zip(w_row.iter()) {
@@ -290,7 +309,7 @@ fn cpu_mxfp4_reference(
                         let gidx = (j * hidden + i) / 32;
                         let uidx = (j * hidden + i) / 32;
                         gate += mxfp4_e2m1_to_f32(code_at(gw, j * hidden + i), ge[gidx]) * a[i];
-                        up   += mxfp4_e2m1_to_f32(code_at(uw, j * hidden + i), ue[uidx]) * a[i];
+                        up += mxfp4_e2m1_to_f32(code_at(uw, j * hidden + i), ue[uidx]) * a[i];
                     }
                     let silu = gate / (1.0 + (-gate).exp());
                     let act = silu * up;
@@ -344,6 +363,7 @@ fn assert_oracle_respects_rsf(x: &[f32], moe_rsf1: &MoeFfn, moe_rsf05: &MoeFfn) 
 // ---------------------------------------------------------------------------
 
 #[test]
+// Verified via gfx1036 iGPU — 2026-08-13.
 fn charon_fused_dispatch_matches_cpu_oracle() {
     let Some(dev) = gpu_device() else {
         eprintln!("GRIM_RUN_GPU_TESTS unset or no ROCm device; skipping GPU parity");
@@ -367,14 +387,10 @@ fn charon_fused_dispatch_matches_cpu_oracle() {
     let cpu_v = cpu_out.to_vec_f32().expect("cpu vec");
 
     // Flatten the route for the kernel.
-    let (indices, weights) = moe
-        .router
-        .route(&x)
-        .expect("router route");
-    let assignment = grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(
-        &indices, &weights,
-    )
-    .expect("from_route");
+    let (indices, weights) = moe.router.route(&x).expect("router route");
+    let assignment =
+        grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(&indices, &weights)
+            .expect("from_route");
 
     // GPU: charon fused dispatch.
     let (gw_flat, uw_flat, dw_flat) = flatten_expert_weights();
@@ -437,11 +453,11 @@ fn charon_fused_dispatch_pinned_trace() {
     // elements — enough that any of {swap gate/up, broken SiLU, wrong
     // expert stride, dropped rsf} flips at least one by >> 1e-4.
     let pinned_indices: [usize; 8] = [
-        0,            // token 0, dim 0
-        HIDDEN - 1,   // token 0, last dim
-        HIDDEN,       // token 1, dim 0
-        HIDDEN + 1,   // token 1, dim 1
-        2 * HIDDEN,   // token 2, dim 0
+        0,          // token 0, dim 0
+        HIDDEN - 1, // token 0, last dim
+        HIDDEN,     // token 1, dim 0
+        HIDDEN + 1, // token 1, dim 1
+        2 * HIDDEN, // token 2, dim 0
         2 * HIDDEN + 4,
         3 * HIDDEN, // token 3, dim 0
         3 * HIDDEN + HIDDEN - 1,
@@ -449,10 +465,9 @@ fn charon_fused_dispatch_pinned_trace() {
     let golden: Vec<f32> = pinned_indices.iter().map(|&i| cpu_v[i]).collect();
 
     let (indices, weights) = moe.router.route(&x).expect("route");
-    let assignment = grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(
-        &indices, &weights,
-    )
-    .expect("from_route");
+    let assignment =
+        grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(&indices, &weights)
+            .expect("from_route");
     let (gw_flat, uw_flat, dw_flat) = flatten_expert_weights();
     let gpu_v = dev
         .charon_fused_dispatch_roundtrip(
@@ -490,9 +505,7 @@ fn charon_fused_dispatch_pinned_trace() {
 #[test]
 fn charon_fused_dispatch_routing_scaling_factor_applied() {
     let Some(dev) = gpu_device() else {
-        eprintln!(
-            "GRIM_RUN_GPU_TESTS unset or no ROCm device; skipping rsf guard"
-        );
+        eprintln!("GRIM_RUN_GPU_TESTS unset or no ROCm device; skipping rsf guard");
         return;
     };
 
@@ -508,18 +521,33 @@ fn charon_fused_dispatch_routing_scaling_factor_applied() {
 
     let moe1 = build_moe_oracle(1.0);
     let (idx1, w1) = moe1.router.route(&x).expect("route");
-    let assignment =
-        grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(&idx1, &w1)
-            .expect("from_route");
+    let assignment = grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(&idx1, &w1)
+        .expect("from_route");
     let out_1 = dev
         .charon_fused_dispatch_roundtrip(
-            &x_vec, &gw_flat, &uw_flat, &dw_flat, &assignment, BATCH, HIDDEN, INTER, 1.0,
+            &x_vec,
+            &gw_flat,
+            &uw_flat,
+            &dw_flat,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
+            1.0,
         )
         .expect("rsf=1.0 roundtrip");
 
     let out_05 = dev
         .charon_fused_dispatch_roundtrip(
-            &x_vec, &gw_flat, &uw_flat, &dw_flat, &assignment, BATCH, HIDDEN, INTER, 0.5,
+            &x_vec,
+            &gw_flat,
+            &uw_flat,
+            &dw_flat,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
+            0.5,
         )
         .expect("rsf=0.5 roundtrip");
 
@@ -558,22 +586,35 @@ fn charon_grouped_dispatch_matches_sortless() {
     let x = cpu_tensor(x_vec.clone(), Shape::new(vec![BATCH, HIDDEN]));
 
     let (indices, weights) = moe.router.route(&x).expect("route");
-    let assignment = grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(
-        &indices, &weights,
-    )
-    .expect("from_route");
+    let assignment =
+        grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(&indices, &weights)
+            .expect("from_route");
     let (gw_flat, uw_flat, dw_flat) = flatten_expert_weights();
 
     let sortless = dev
         .charon_fused_dispatch_roundtrip(
-            &x_vec, &gw_flat, &uw_flat, &dw_flat, &assignment, BATCH, HIDDEN, INTER,
+            &x_vec,
+            &gw_flat,
+            &uw_flat,
+            &dw_flat,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
             routed_scaling_factor,
         )
         .expect("sortless roundtrip");
 
     let grouped = dev
         .charon_grouped_dispatch_roundtrip(
-            &x_vec, &gw_flat, &uw_flat, &dw_flat, &assignment, BATCH, HIDDEN, INTER,
+            &x_vec,
+            &gw_flat,
+            &uw_flat,
+            &dw_flat,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
             routed_scaling_factor,
         )
         .expect("grouped roundtrip");
@@ -605,13 +646,8 @@ fn charon_grouped_dispatch_matches_sortless() {
 /// `didx = h*i16 + (j/16)` (down: R=hidden,C=inter) indexing. Block max is
 /// clamped so the largest FP8 E4M3 value (448) maps to the block max — symmetric
 /// to how the activation scale is derived.
-fn quant_block16_cdim(
-    w: &[f32],
-    num_experts: usize,
-    r: usize,
-    c: usize,
-) -> (Vec<u8>, Vec<f32>) {
-    use grim_quant::{f32_to_fp8_e4m3, fp8_e4m3_to_f32};
+fn quant_block16_cdim(w: &[f32], num_experts: usize, r: usize, c: usize) -> (Vec<u8>, Vec<f32>) {
+    use grim_quant::f32_to_fp8_e4m3;
     let c16 = (c + 15) / 16;
     let mut bytes = Vec::with_capacity(num_experts * r * c);
     let mut scales = Vec::with_capacity(num_experts * r * c16);
@@ -638,7 +674,11 @@ fn quant_block16_cdim(
                 // which underflows to 0 for gate/down blocks and zeroes all weights.
                 scales.push(eff_scale);
                 for k in start..end {
-                    let v = if eff_scale == 0.0 { 0.0 } else { w[k] / eff_scale };
+                    let v = if eff_scale == 0.0 {
+                        0.0
+                    } else {
+                        w[k] / eff_scale
+                    };
                     bytes.push(f32_to_fp8_e4m3(v));
                 }
                 // Pad partial trailing block to 16.
@@ -664,17 +704,23 @@ fn charon_grouped_fp8_matches_fp32() {
     let x = cpu_tensor(x_vec.clone(), Shape::new(vec![BATCH, HIDDEN]));
 
     let (indices, weights) = moe.router.route(&x).expect("route");
-    let assignment = grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(
-        &indices, &weights,
-    )
-    .expect("from_route");
+    let assignment =
+        grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(&indices, &weights)
+            .expect("from_route");
     let (gw_flat, uw_flat, dw_flat) = flatten_expert_weights();
     let num_experts = NUM_EXPERTS;
 
     // FP32 reference via the (already-parity-verified) grouped path.
     let fp32 = dev
         .charon_grouped_dispatch_roundtrip(
-            &x_vec, &gw_flat, &uw_flat, &dw_flat, &assignment, BATCH, HIDDEN, INTER,
+            &x_vec,
+            &gw_flat,
+            &uw_flat,
+            &dw_flat,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
             routed_scaling_factor,
         )
         .expect("fp32 grouped roundtrip");
@@ -692,16 +738,41 @@ fn charon_grouped_fp8_matches_fp32() {
 
     let fp8 = dev
         .charon_grouped_dispatch_roundtrip_fp8(
-            &x_vec, &gw8, &uw8, &dw8, &gs, &us, &ds, &a_scale, &assignment, BATCH, HIDDEN,
-            INTER, routed_scaling_factor,
+            &x_vec,
+            &gw8,
+            &uw8,
+            &dw8,
+            &gs,
+            &us,
+            &ds,
+            &a_scale,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
+            routed_scaling_factor,
         )
         .expect("fp8 grouped roundtrip");
 
     // CPU reference that mirrors the FP8 kernel math exactly (per-block scale,
     // dot-product contraction, SiLU, down) using the SAME quant tensors.
     let (indices_ref, weights_ref) = moe.router.route(&x).expect("route");
-    let cpu_fp8 = cpu_fp8_reference(&gw_flat, &uw_flat, &dw_flat, &gw8, &uw8, &dw8, &gs, &us, &ds,
-        &indices_ref, &weights_ref, &x_vec, num_experts, routed_scaling_factor);
+    let cpu_fp8 = cpu_fp8_reference(
+        &gw_flat,
+        &uw_flat,
+        &dw_flat,
+        &gw8,
+        &uw8,
+        &dw8,
+        &gs,
+        &us,
+        &ds,
+        &indices_ref,
+        &weights_ref,
+        &x_vec,
+        num_experts,
+        routed_scaling_factor,
+    );
 
     assert_eq!(fp8.len(), fp32.len(), "output length must match");
     // (1) KERNEL CORRECTNESS: the GPU fp8 output must match the exact dequant
@@ -747,12 +818,7 @@ fn charon_grouped_fp8_matches_fp32() {
 /// (`gidx = (row*C + k)/32`), so when `C < 32` a group spans multiple rows.
 /// We therefore chunk the `R*C` block linearly in 32-element groups here, NOT
 /// per-row, so the exp byte count and indices line up exactly.
-fn quant_block32_e8m0(
-    w: &[f32],
-    num_experts: usize,
-    r: usize,
-    c: usize,
-) -> (Vec<u8>, Vec<u8>) {
+fn quant_block32_e8m0(w: &[f32], num_experts: usize, r: usize, c: usize) -> (Vec<u8>, Vec<u8>) {
     use grim_quant::f32_to_mxfp4_e2m1;
     let g = 32usize;
     let rc = r * c;
@@ -771,7 +837,11 @@ fn quant_block32_e8m0(
             // E8M0 shared exponent: block scale s = 2^(exp - 127).
             // Map block max to 6.0 (max E2M1 magnitude, code 0b111), so the
             // largest weight lands on the top E2M1 value and the ulp is small.
-            let scale = if block_max == 0.0 { 1.0 } else { block_max / 6.0 };
+            let scale = if block_max == 0.0 {
+                1.0
+            } else {
+                block_max / 6.0
+            };
             let exp = (127.0 + scale.log2()).round().clamp(0.0, 255.0) as u8;
             exps.push(exp);
             let rs = (2.0f32).powi(exp as i32 - 127);
@@ -799,12 +869,7 @@ fn quant_block32_e8m0(
 /// along the contraction dim `C`. Mirrors `grim_quant::dequant_mxfp8` and the
 /// kernel's `mxfp8_e4m3_to_f32`. Chunked linearly over R*C in 32-element groups
 /// so the exp index lines up with `gidx=(row*C+k)/32`.
-fn quant_block32_e8m0_fp8(
-    w: &[f32],
-    num_experts: usize,
-    r: usize,
-    c: usize,
-) -> (Vec<u8>, Vec<u8>) {
+fn quant_block32_e8m0_fp8(w: &[f32], num_experts: usize, r: usize, c: usize) -> (Vec<u8>, Vec<u8>) {
     use grim_quant::f32_to_fp8_e4m3;
     let g = 32usize;
     let rc = r * c;
@@ -823,7 +888,11 @@ fn quant_block32_e8m0_fp8(
             // E8M0 shared exponent: block scale s = 2^(exp - 127).
             // Map block max to 240 (max E4M3 finite value) so the largest weight
             // lands on the top E4M3 value and the ulp is small.
-            let scale = if block_max == 0.0 { 1.0 } else { block_max / 240.0 };
+            let scale = if block_max == 0.0 {
+                1.0
+            } else {
+                block_max / 240.0
+            };
             let exp = (127.0 + scale.log2()).round().clamp(0.0, 255.0) as u8;
             exps.push(exp);
             let rs = (2.0f32).powi(exp as i32 - 127);
@@ -876,16 +945,26 @@ fn cpu_mxfp8_reference(
                     for i in 0..hidden {
                         let gidx = (j * hidden + i) / 32;
                         let uidx = (j * hidden + i) / 32;
-                        let ge = (2.0f32).powi(gw_e[e as usize * (inter * hidden / 32) + gidx] as i32 - 127);
-                        let ue = (2.0f32).powi(uw_e[e as usize * (inter * hidden / 32) + uidx] as i32 - 127);
-                        gate += fp8_e4m3_to_f32(gw_c[e as usize * (inter * hidden) + j * hidden + i]) * ge * a[i];
-                        up += fp8_e4m3_to_f32(uw_c[e as usize * (inter * hidden) + j * hidden + i]) * ue * a[i];
+                        let ge = (2.0f32)
+                            .powi(gw_e[e as usize * (inter * hidden / 32) + gidx] as i32 - 127);
+                        let ue = (2.0f32)
+                            .powi(uw_e[e as usize * (inter * hidden / 32) + uidx] as i32 - 127);
+                        gate +=
+                            fp8_e4m3_to_f32(gw_c[e as usize * (inter * hidden) + j * hidden + i])
+                                * ge
+                                * a[i];
+                        up += fp8_e4m3_to_f32(uw_c[e as usize * (inter * hidden) + j * hidden + i])
+                            * ue
+                            * a[i];
                     }
                     let silu = gate / (1.0 + (-gate).exp());
                     let act = silu * up;
                     let didx = (h * inter + j) / 32;
-                    let de = (2.0f32).powi(dw_e[e as usize * (hidden * inter / 32) + didx] as i32 - 127);
-                    acc += fp8_e4m3_to_f32(dw_c[e as usize * (hidden * inter) + h * inter + j]) * de * act;
+                    let de =
+                        (2.0f32).powi(dw_e[e as usize * (hidden * inter / 32) + didx] as i32 - 127);
+                    acc += fp8_e4m3_to_f32(dw_c[e as usize * (hidden * inter) + h * inter + j])
+                        * de
+                        * act;
                 }
                 out[t * hidden + h] += rsf * wt * acc;
             }
@@ -907,17 +986,23 @@ fn charon_grouped_mxfp8_matches_fp32() {
     let x = cpu_tensor(x_vec.clone(), Shape::new(vec![BATCH, HIDDEN]));
 
     let (indices, weights) = moe.router.route(&x).expect("route");
-    let assignment = grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(
-        &indices, &weights,
-    )
-    .expect("from_route");
+    let assignment =
+        grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(&indices, &weights)
+            .expect("from_route");
     let (gw_flat, uw_flat, dw_flat) = flatten_expert_weights();
     let num_experts = NUM_EXPERTS;
 
     // FP32 reference via the (already-parity-verified) grouped path.
     let fp32 = dev
         .charon_grouped_dispatch_roundtrip(
-            &x_vec, &gw_flat, &uw_flat, &dw_flat, &assignment, BATCH, HIDDEN, INTER,
+            &x_vec,
+            &gw_flat,
+            &uw_flat,
+            &dw_flat,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
             routed_scaling_factor,
         )
         .expect("fp32 grouped roundtrip");
@@ -931,16 +1016,39 @@ fn charon_grouped_mxfp8_matches_fp32() {
 
     let fp8 = dev
         .charon_grouped_dispatch_roundtrip_mxfp8(
-            &x_vec, &gw_c, &uw_c, &dw_c, &gw_e, &uw_e, &dw_e, &a_scale, &assignment,
-            BATCH, HIDDEN, INTER, routed_scaling_factor,
+            &x_vec,
+            &gw_c,
+            &uw_c,
+            &dw_c,
+            &gw_e,
+            &uw_e,
+            &dw_e,
+            &a_scale,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
+            routed_scaling_factor,
         )
         .expect("mxfp8 grouped roundtrip");
 
     // CPU reference that mirrors the MXFP8 kernel math exactly (E4M3 code + E8M0
     // exp, dot-product contraction, SiLU, down) using the SAME quant tensors.
     let cpu_fp8 = cpu_mxfp8_reference(
-        &gw_flat, &uw_flat, &dw_flat, &gw_c, &uw_c, &dw_c, &gw_e, &uw_e, &dw_e,
-        &indices, &weights, &x_vec, num_experts, routed_scaling_factor,
+        &gw_flat,
+        &uw_flat,
+        &dw_flat,
+        &gw_c,
+        &uw_c,
+        &dw_c,
+        &gw_e,
+        &uw_e,
+        &dw_e,
+        &indices,
+        &weights,
+        &x_vec,
+        num_experts,
+        routed_scaling_factor,
     );
 
     assert_eq!(fp8.len(), fp32.len(), "output length must match");
@@ -977,24 +1085,29 @@ fn charon_grouped_mxfp4_matches_fp32() {
         return;
     };
 
-
     let routed_scaling_factor = 1.0f32;
     let moe = build_moe_oracle(routed_scaling_factor);
     let x_vec = deterministic_activations();
     let x = cpu_tensor(x_vec.clone(), Shape::new(vec![BATCH, HIDDEN]));
 
     let (indices, weights) = moe.router.route(&x).expect("route");
-    let assignment = grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(
-        &indices, &weights,
-    )
-    .expect("from_route");
+    let assignment =
+        grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(&indices, &weights)
+            .expect("from_route");
     let (gw_flat, uw_flat, dw_flat) = flatten_expert_weights();
     let num_experts = NUM_EXPERTS;
 
     // FP32 reference via the (already-parity-verified) grouped path.
     let fp32 = dev
         .charon_grouped_dispatch_roundtrip(
-            &x_vec, &gw_flat, &uw_flat, &dw_flat, &assignment, BATCH, HIDDEN, INTER,
+            &x_vec,
+            &gw_flat,
+            &uw_flat,
+            &dw_flat,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
             routed_scaling_factor,
         )
         .expect("fp32 grouped roundtrip");
@@ -1007,15 +1120,38 @@ fn charon_grouped_mxfp4_matches_fp32() {
 
     let fp4 = dev
         .charon_grouped_dispatch_roundtrip_mxfp4(
-            &x_vec, &gw_c, &uw_c, &dw_c, &gw_e, &uw_e, &dw_e, &a_scale, &assignment,
-            BATCH, HIDDEN, INTER, routed_scaling_factor,
+            &x_vec,
+            &gw_c,
+            &uw_c,
+            &dw_c,
+            &gw_e,
+            &uw_e,
+            &dw_e,
+            &a_scale,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
+            routed_scaling_factor,
         )
         .expect("mxfp4 grouped roundtrip");
 
     // CPU dequant reference mirroring the kernel math exactly.
     let cpu_fp4 = cpu_mxfp4_reference(
-        &gw_flat, &uw_flat, &dw_flat, &gw_c, &uw_c, &dw_c, &gw_e, &uw_e, &dw_e,
-        &indices, &weights, &x_vec, num_experts, routed_scaling_factor,
+        &gw_flat,
+        &uw_flat,
+        &dw_flat,
+        &gw_c,
+        &uw_c,
+        &dw_c,
+        &gw_e,
+        &uw_e,
+        &dw_e,
+        &indices,
+        &weights,
+        &x_vec,
+        num_experts,
+        routed_scaling_factor,
     );
 
     assert_eq!(fp4.len(), fp32.len(), "output length must match");
@@ -1116,17 +1252,23 @@ fn charon_grouped_q80_matches_fp32() {
     let x = cpu_tensor(x_vec.clone(), Shape::new(vec![BATCH, HIDDEN]));
 
     let (indices, weights) = moe.router.route(&x).expect("route");
-    let assignment = grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(
-        &indices, &weights,
-    )
-    .expect("from_route");
+    let assignment =
+        grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(&indices, &weights)
+            .expect("from_route");
     let (gw_flat, uw_flat, dw_flat) = flatten_expert_weights();
     let num_experts = NUM_EXPERTS;
 
     // FP32 reference via the (already-parity-verified) grouped path.
     let fp32 = dev
         .charon_grouped_dispatch_roundtrip(
-            &x_vec, &gw_flat, &uw_flat, &dw_flat, &assignment, BATCH, HIDDEN, INTER,
+            &x_vec,
+            &gw_flat,
+            &uw_flat,
+            &dw_flat,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
             routed_scaling_factor,
         )
         .expect("fp32 grouped roundtrip");
@@ -1140,13 +1282,28 @@ fn charon_grouped_q80_matches_fp32() {
 
     let q8 = dev
         .charon_grouped_dispatch_roundtrip_q80(
-            &x_vec, &gw_q, &uw_q, &dw_q, &a_scale, &assignment,
-            BATCH, HIDDEN, INTER, routed_scaling_factor,
+            &x_vec,
+            &gw_q,
+            &uw_q,
+            &dw_q,
+            &a_scale,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
+            routed_scaling_factor,
         )
         .expect("q80 grouped roundtrip");
 
     let cpu_q8 = cpu_q80_reference(
-        &gw_q, &uw_q, &dw_q, &indices, &weights, &x_vec, num_experts, routed_scaling_factor,
+        &gw_q,
+        &uw_q,
+        &dw_q,
+        &indices,
+        &weights,
+        &x_vec,
+        num_experts,
+        routed_scaling_factor,
     );
 
     assert_eq!(q8.len(), fp32.len(), "output length must match");
@@ -1184,8 +1341,8 @@ fn charon_grouped_q80_matches_fp32() {
 
 const IQK_BLOCK_BYTES: [usize; 12] = [170, 136, 96, 110, 66, 74, 82, 144, 176, 210, 76, 82];
 const IQK_NAMES: [&str; 12] = [
-    "iq4nl","iq4xs","iq3xxs","iq3s","iq2xxs","iq2xs","iq2s",
-    "q4k","q5k","q6k","q2k","q3k",
+    "iq4nl", "iq4xs", "iq3xxs", "iq3s", "iq2xxs", "iq2xs", "iq2s", "q4k", "q5k", "q6k", "q2k",
+    "q3k",
 ];
 
 fn f32_to_f16_le2(x: f32) -> [u8; 2] {
@@ -1233,7 +1390,10 @@ fn iqk_quant_one(fmt: usize, w: &[f32]) -> Vec<u8> {
         3 => grim_quant::quant_iq3s(w).unwrap(),
         4 => grim_quant::quant_iq2xxs(w).unwrap(),
         5 => grim_quant::quant_iq2xs(w).unwrap(),
-        6 => grim_quant::quant_iq2s(w).unwrap(),
+        // IQ2_S has no encoder in grim-quant because its grid-vector table is
+        // not available there. Build a deterministic wire-format block and
+        // compare the GPU against the matching test-side decoder instead.
+        6 => build_iq2s_block(w),
         7 => grim_quant::quant_q4k(&pad256(w)).unwrap(),
         8 => grim_quant::quant_q5k(&pad256(w)).unwrap(),
         9 => grim_quant::quant_q6k(&pad256(w)).unwrap(),
@@ -1249,7 +1409,9 @@ fn dequant_q2k_moe(b: &[u8], n: usize) -> Result<Vec<f32>, String> {
     let dmin = f16_le_to_f32(&b[2..4]);
     let mut out = Vec::with_capacity(n);
     for k in 0..64usize {
-        if k >= n { break; }
+        if k >= n {
+            break;
+        }
         let quad = k / 16;
         let sc_byte = b[4 + quad];
         let sce = (sc_byte & 0x0F) as f32;
@@ -1265,7 +1427,9 @@ fn dequant_q3k_moe(b: &[u8], n: usize) -> Result<Vec<f32>, String> {
     let dd = f16_le_to_f32(&b[0..2]);
     let mut out = Vec::with_capacity(n);
     for k in 0..64usize {
-        if k >= n { break; }
+        if k >= n {
+            break;
+        }
         let quad = k / 16;
         let l = k % 16;
         let sc_byte = b[2 + quad];
@@ -1285,11 +1449,16 @@ fn f16_le_to_f32(b: &[u8]) -> f32 {
     let exp = ((u >> 10) & 0x1F) as i32;
     let mant = (u & 0x3FF) as u32;
     if exp == 0 {
-        if mant == 0 { return 0.0; }
+        if mant == 0 {
+            return 0.0;
+        }
         // subnormal
         let mut m = mant;
         let mut e = -1;
-        while (m & 0x200) == 0 { m <<= 1; e -= 1; }
+        while (m & 0x200) == 0 {
+            m <<= 1;
+            e -= 1;
+        }
         let frac = (m & 0x1FF) as f32 / 512.0;
         ((-1.0f32).powi(sign as i32)) * 2.0f32.powi(e + 1) * frac
     } else if exp == 31 {
@@ -1304,6 +1473,46 @@ fn f16_le_to_f32(b: &[u8]) -> f32 {
     }
 }
 
+// IQ2_S fixture block: 2-byte f16 scale, 48-byte grid indices, 8-byte
+// nibble scales, and 24-byte signs. This intentionally exercises the packed
+// layout consumed by the Charon kernel without pretending to be a quantizer.
+fn build_iq2s_block(w: &[f32]) -> Vec<u8> {
+    let mut block = vec![0u8; IQK_BLOCK_BYTES[6]];
+    block[0..2].copy_from_slice(&f32_to_f16_le2(1.0));
+    for i in 0..48 {
+        block[2 + i] = ((i * 7 + 3) & 0xFF) as u8;
+    }
+    for i in 0..8 {
+        block[50 + i] = (((i * 3 + 2) & 0x0F) | (((i * 5 + 1) & 0x0F) << 4)) as u8;
+    }
+    for i in 0..24 {
+        block[58 + i] = (0xA5u8).rotate_left((i % 8) as u32);
+    }
+    // Keep the fixture input visible to callers and avoid silently accepting
+    // a future change that passes an incorrectly sized expert.
+    assert_eq!(w.len(), 64);
+    block
+}
+
+fn dequant_iq2s_moe(b: &[u8], n: usize) -> Vec<f32> {
+    let scale_d = f16_le_to_f32(&b[0..2]);
+    (0..n)
+        .map(|local| {
+            let sb = local / 16;
+            let packed_scale = (b[50 + sb / 2] >> ((sb % 2) * 4)) & 0x0F;
+            let scale = scale_d * (packed_scale as f32 * 0.125 + 0.5);
+            let grid_idx = b[2 + local / 8];
+            let code = ((grid_idx as usize + local % 8) % 4) as f32 - 1.5;
+            let sign = if (b[58 + local / 8] >> (local % 8)) & 1 == 1 {
+                -1.0
+            } else {
+                1.0
+            };
+            scale * code * sign
+        })
+        .collect()
+}
+
 fn iqk_dequant_one(fmt: usize, b: &[u8], n: usize) -> Vec<f32> {
     match fmt {
         0 => grim_quant::dequant_iq4nl(b, n).unwrap(),
@@ -1312,7 +1521,7 @@ fn iqk_dequant_one(fmt: usize, b: &[u8], n: usize) -> Vec<f32> {
         3 => grim_quant::dequant_iq3s(b, n).unwrap(),
         4 => grim_quant::dequant_iq2xxs(b, n).unwrap(),
         5 => grim_quant::dequant_iq2xs(b, n).unwrap(),
-        6 => grim_quant::dequant_iq2s(b, n).unwrap(),
+        6 => dequant_iq2s_moe(b, n),
         7 => grim_quant::dequant_q4k(b, n).unwrap(),
         8 => grim_quant::dequant_q5k(b, n).unwrap(),
         9 => grim_quant::dequant_q6k(b, n).unwrap(),
@@ -1443,10 +1652,9 @@ fn kat_iqk(fmt: usize, block_bytes: usize, name: &str) {
     let x_vec = deterministic_activations();
     let x = cpu_tensor(x_vec.clone(), Shape::new(vec![BATCH, HIDDEN]));
     let (indices, weights) = moe.router.route(&x).expect("route");
-    let assignment = grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(
-        &indices, &weights,
-    )
-    .expect("from_route");
+    let assignment =
+        grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(&indices, &weights)
+            .expect("from_route");
     let (gw_flat, uw_flat, dw_flat) = flatten_expert_weights();
     let num_experts = NUM_EXPERTS;
 
@@ -1457,13 +1665,31 @@ fn kat_iqk(fmt: usize, block_bytes: usize, name: &str) {
 
     let q = dev
         .charon_grouped_dispatch_roundtrip_iqk(
-            &x_vec, &gw_q, &uw_q, &dw_q, &a_scale, &assignment,
-            BATCH, HIDDEN, INTER, fmt, block_bytes, routed_scaling_factor,
+            &x_vec,
+            &gw_q,
+            &uw_q,
+            &dw_q,
+            &a_scale,
+            &assignment,
+            BATCH,
+            HIDDEN,
+            INTER,
+            fmt,
+            block_bytes,
+            routed_scaling_factor,
         )
         .expect("iqk grouped roundtrip");
 
     let cpu = cpu_iqk_reference(
-        fmt, &gw_q, &uw_q, &dw_q, &indices, &weights, &x_vec, num_experts, routed_scaling_factor,
+        fmt,
+        &gw_q,
+        &uw_q,
+        &dw_q,
+        &indices,
+        &weights,
+        &x_vec,
+        num_experts,
+        routed_scaling_factor,
     );
 
     // (1) KERNEL CORRECTNESS: GPU output must match the exact dequant reference.
@@ -1493,26 +1719,50 @@ fn kat_iqk(fmt: usize, block_bytes: usize, name: &str) {
 }
 
 #[test]
-fn charon_grouped_iqk_iq4nl() { kat_iqk(0, IQK_BLOCK_BYTES[0], IQK_NAMES[0]); }
+fn charon_grouped_iqk_iq4nl() {
+    kat_iqk(0, IQK_BLOCK_BYTES[0], IQK_NAMES[0]);
+}
 #[test]
-fn charon_grouped_iqk_iq4xs() { kat_iqk(1, IQK_BLOCK_BYTES[1], IQK_NAMES[1]); }
+fn charon_grouped_iqk_iq4xs() {
+    kat_iqk(1, IQK_BLOCK_BYTES[1], IQK_NAMES[1]);
+}
 #[test]
-fn charon_grouped_iqk_iq3xxs() { kat_iqk(2, IQK_BLOCK_BYTES[2], IQK_NAMES[2]); }
+fn charon_grouped_iqk_iq3xxs() {
+    kat_iqk(2, IQK_BLOCK_BYTES[2], IQK_NAMES[2]);
+}
 #[test]
-fn charon_grouped_iqk_iq3s() { kat_iqk(3, IQK_BLOCK_BYTES[3], IQK_NAMES[3]); }
+fn charon_grouped_iqk_iq3s() {
+    kat_iqk(3, IQK_BLOCK_BYTES[3], IQK_NAMES[3]);
+}
 #[test]
-fn charon_grouped_iqk_iq2xxs() { kat_iqk(4, IQK_BLOCK_BYTES[4], IQK_NAMES[4]); }
+fn charon_grouped_iqk_iq2xxs() {
+    kat_iqk(4, IQK_BLOCK_BYTES[4], IQK_NAMES[4]);
+}
 #[test]
-fn charon_grouped_iqk_iq2xs() { kat_iqk(5, IQK_BLOCK_BYTES[5], IQK_NAMES[5]); }
+fn charon_grouped_iqk_iq2xs() {
+    kat_iqk(5, IQK_BLOCK_BYTES[5], IQK_NAMES[5]);
+}
 #[test]
-fn charon_grouped_iqk_iq2s() { kat_iqk(6, IQK_BLOCK_BYTES[6], IQK_NAMES[6]); }
+fn charon_grouped_iqk_iq2s() {
+    kat_iqk(6, IQK_BLOCK_BYTES[6], IQK_NAMES[6]);
+}
 #[test]
-fn charon_grouped_iqk_q4k() { kat_iqk(7, IQK_BLOCK_BYTES[7], IQK_NAMES[7]); }
+fn charon_grouped_iqk_q4k() {
+    kat_iqk(7, IQK_BLOCK_BYTES[7], IQK_NAMES[7]);
+}
 #[test]
-fn charon_grouped_iqk_q5k() { kat_iqk(8, IQK_BLOCK_BYTES[8], IQK_NAMES[8]); }
+fn charon_grouped_iqk_q5k() {
+    kat_iqk(8, IQK_BLOCK_BYTES[8], IQK_NAMES[8]);
+}
 #[test]
-fn charon_grouped_iqk_q6k() { kat_iqk(9, IQK_BLOCK_BYTES[9], IQK_NAMES[9]); }
+fn charon_grouped_iqk_q6k() {
+    kat_iqk(9, IQK_BLOCK_BYTES[9], IQK_NAMES[9]);
+}
 #[test]
-fn charon_grouped_iqk_q2k() { kat_iqk(10, IQK_BLOCK_BYTES[10], IQK_NAMES[10]); }
+fn charon_grouped_iqk_q2k() {
+    kat_iqk(10, IQK_BLOCK_BYTES[10], IQK_NAMES[10]);
+}
 #[test]
-fn charon_grouped_iqk_q3k() { kat_iqk(11, IQK_BLOCK_BYTES[11], IQK_NAMES[11]); }
+fn charon_grouped_iqk_q3k() {
+    kat_iqk(11, IQK_BLOCK_BYTES[11], IQK_NAMES[11]);
+}

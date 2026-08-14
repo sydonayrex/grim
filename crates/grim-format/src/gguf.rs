@@ -283,7 +283,7 @@ impl GgufDType {
             GgufDType::Q5_0 => 2 + 4 + 32 / 2,
             GgufDType::Q5_1 => 2 + 2 + 4 + 32 / 2,
             GgufDType::Q8_0 => 2 + 32,
-            GgufDType::Q8_1 => 4 + 4 + 32,
+            GgufDType::Q8_1 => 2 + 2 + 32,
             GgufDType::Q2K => 84,
             GgufDType::Q3K => 110,
             GgufDType::Q4K => 144,
@@ -304,8 +304,6 @@ impl GgufDType {
         }
     }
 }
-
-
 
 /// One tensor index entry from a GGUF file.
 #[derive(Debug, Clone)]
@@ -1443,9 +1441,14 @@ pub fn read_gguf<R: Read + Seek>(mut reader: R) -> Result<GgufFile> {
         //   size_bytes = (params × type_size_per_block) / block_size
         let block_size = dtype.block_size();
         let type_size = dtype.type_size_per_block();
-        let params: u64 = dims.iter().try_fold(1u64, |acc, &d| acc.checked_mul(d)).ok_or_else(|| {
-            Error::Backend(format!("GGUF tensor '{name}' dimension product overflowed u64"))
-        })?;
+        let params: u64 = dims
+            .iter()
+            .try_fold(1u64, |acc, &d| acc.checked_mul(d))
+            .ok_or_else(|| {
+                Error::Backend(format!(
+                    "GGUF tensor '{name}' dimension product overflowed u64"
+                ))
+            })?;
         let size_bytes: u64 = if block_size == 1 {
             params.checked_mul(type_size).ok_or_else(|| {
                 Error::Backend(format!("GGUF tensor '{name}' byte size overflowed u64"))
@@ -1453,9 +1456,12 @@ pub fn read_gguf<R: Read + Seek>(mut reader: R) -> Result<GgufFile> {
         } else if type_size == 0 {
             0
         } else {
-            params.checked_mul(type_size).map(|total| total / block_size).ok_or_else(|| {
-                Error::Backend(format!("GGUF tensor '{name}' byte size overflowed u64"))
-            })?
+            params
+                .checked_mul(type_size)
+                .map(|total| total / block_size)
+                .ok_or_else(|| {
+                    Error::Backend(format!("GGUF tensor '{name}' byte size overflowed u64"))
+                })?
         };
         tensors.push(GgufTensorInfo {
             name,

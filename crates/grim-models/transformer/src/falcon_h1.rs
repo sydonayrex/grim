@@ -13,13 +13,15 @@
 //!
 //! Pattern mirrors `lfm2.rs`: `FalconH1Config: ModelConfig`, `FalconH1Model:
 //! Model + CausalLm`. The loader constructs the type via `FalconH1Model::load`.
-use grim_core::model::{CausalLm, Model, ModelConfig, ModalityHint};
-use grim_core::session::{Inner, SessionT};
-use grim_core::Result;
-use grim_nn::modules::{pick_device_for_storage_device, require_single_device, Embedding, Linear, RmsNorm, Rope};
-use grim_nn::{WeightSource, TensorParallelConfig};
 use grim_backend_cpu::cpu_tensor;
-use grim_tensor::{ArithType, Device, DType, Shape, Tensor};
+use grim_core::Result;
+use grim_core::model::{CausalLm, ModalityHint, Model, ModelConfig};
+use grim_core::session::{Inner, SessionT};
+use grim_nn::modules::{
+    Embedding, Linear, RmsNorm, Rope, pick_device_for_storage_device, require_single_device,
+};
+use grim_nn::{TensorParallelConfig, WeightSource};
+use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
 /// Falcon-H1 model config — what the loader passes in.
 ///
@@ -34,14 +36,14 @@ pub struct FalconH1Config {
     pub num_layers: usize,        // 24
     pub intermediate_size: usize, // 768
     pub rms_norm_eps: f32,
-    pub rope_theta: f32,          // 10000.0
+    pub rope_theta: f32, // 10000.0
 
     // SSM (Mamba-2) per-block hyper-params.
-    pub ssm_d_state: usize,    // 64
-    pub ssm_d_inner: usize,    // 768
-    pub ssm_d_conv: usize,     // 4
-    pub ssm_dt_rank: usize,    // 24
-    pub ssm_n_group: usize,    // 1
+    pub ssm_d_state: usize, // 64
+    pub ssm_d_inner: usize, // 768
+    pub ssm_d_conv: usize,  // 4
+    pub ssm_dt_rank: usize, // 24
+    pub ssm_n_group: usize, // 1
 }
 
 impl FalconH1Config {
@@ -135,7 +137,8 @@ impl FalconH1Model {
         cfg: FalconH1Config,
         tp: TensorParallelConfig,
     ) -> Result<Self> {
-        require_single_device(tp, "FalconH1", "CPU-only scaffold").map_err(grim_core::Error::Unimplemented)?;
+        require_single_device(tp, "FalconH1", "CPU-only scaffold")
+            .map_err(grim_core::Error::Unimplemented)?;
         let embedding = Embedding::load(&ws.pp("token_embd"), cfg.vocab_size, cfg.hidden_size)?;
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for li in 0..cfg.num_layers {
@@ -160,10 +163,30 @@ impl FalconH1Model {
 /// `ssm_conv1d.{weight,bias}`, `ssm_a`, `ssm_d`, `ssm_dt.bias`.
 fn load_block(ws: &WeightSource<'_>, cfg: &FalconH1Config) -> Result<FalconH1Block> {
     let attn_norm = RmsNorm::load(&ws.pp("attn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-    let wq = Linear::load(&ws.pp("attn_q"), cfg.hidden_size, cfg.num_heads * cfg.head_dim, false)?;
-    let wk = Linear::load(&ws.pp("attn_k"), cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim, false)?;
-    let wv = Linear::load(&ws.pp("attn_v"), cfg.hidden_size, cfg.num_kv_heads * cfg.head_dim, false)?;
-    let wo = Linear::load(&ws.pp("attn_output"), cfg.hidden_size, cfg.hidden_size, false)?;
+    let wq = Linear::load(
+        &ws.pp("attn_q"),
+        cfg.hidden_size,
+        cfg.num_heads * cfg.head_dim,
+        false,
+    )?;
+    let wk = Linear::load(
+        &ws.pp("attn_k"),
+        cfg.hidden_size,
+        cfg.num_kv_heads * cfg.head_dim,
+        false,
+    )?;
+    let wv = Linear::load(
+        &ws.pp("attn_v"),
+        cfg.hidden_size,
+        cfg.num_kv_heads * cfg.head_dim,
+        false,
+    )?;
+    let wo = Linear::load(
+        &ws.pp("attn_output"),
+        cfg.hidden_size,
+        cfg.hidden_size,
+        false,
+    )?;
 
     // ffn_norm is a bare weight tensor (no `.weight` suffix in GGUF).
     let ffn_norm_weight = ws.get([cfg.hidden_size], "ffn_norm")?;
@@ -171,9 +194,24 @@ fn load_block(ws: &WeightSource<'_>, cfg: &FalconH1Config) -> Result<FalconH1Blo
         weight: ffn_norm_weight,
         eps: cfg.rms_norm_eps,
     };
-    let w_gate = Linear::load(&ws.pp("ffn_gate"), cfg.hidden_size, cfg.intermediate_size, false)?;
-    let w_up = Linear::load(&ws.pp("ffn_up"), cfg.hidden_size, cfg.intermediate_size, false)?;
-    let w_down = Linear::load(&ws.pp("ffn_down"), cfg.intermediate_size, cfg.hidden_size, false)?;
+    let w_gate = Linear::load(
+        &ws.pp("ffn_gate"),
+        cfg.hidden_size,
+        cfg.intermediate_size,
+        false,
+    )?;
+    let w_up = Linear::load(
+        &ws.pp("ffn_up"),
+        cfg.hidden_size,
+        cfg.intermediate_size,
+        false,
+    )?;
+    let w_down = Linear::load(
+        &ws.pp("ffn_down"),
+        cfg.intermediate_size,
+        cfg.hidden_size,
+        false,
+    )?;
 
     let rope = Rope::new(cfg.head_dim, cfg.rope_theta);
 
@@ -242,21 +280,29 @@ impl CausalLm for FalconH1Model {
         _adapters: &[grim_core::model::AdapterHandle],
     ) -> Result<Tensor> {
         let ids: Vec<u32> = match input_ids.dtype() {
-            d if d == DType::F32 => input_ids.to_vec_f32()?.into_iter().map(|x| x as u32).collect(),
+            d if d == DType::F32 => input_ids
+                .to_vec_f32()?
+                .into_iter()
+                .map(|x| x as u32)
+                .collect(),
             _ => {
                 return Err(grim_tensor::Error::Unimplemented(
                     "FalconH1 only accepts F32 input ids".into(),
                 )
-                .into())
+                .into());
             }
         };
         let positions_vec: Vec<u32> = match positions.dtype() {
-            d if d == DType::F32 => positions.to_vec_f32()?.into_iter().map(|x| x as u32).collect(),
+            d if d == DType::F32 => positions
+                .to_vec_f32()?
+                .into_iter()
+                .map(|x| x as u32)
+                .collect(),
             _ => {
                 return Err(grim_tensor::Error::Unimplemented(
                     "FalconH1 only accepts F32 positions".into(),
                 )
-                .into())
+                .into());
             }
         };
         let caches: &mut Vec<FalconH1LayerCache> = match session
@@ -289,7 +335,9 @@ impl FalconH1Model {
     ) -> Result<Tensor> {
         let cfg = &self.cfg;
         let seq_len = input_ids.len();
-        let hidden = self.embedding.forward(input_ids, seq_len, cfg.hidden_size)?;
+        let hidden = self
+            .embedding
+            .forward(input_ids, seq_len, cfg.hidden_size)?;
         let device = hidden.device().clone();
         let mut h = hidden.to_vec_f32()?;
 
@@ -319,21 +367,20 @@ fn forward_block_cpu(
     let seq_len = positions.len();
     let device = b.attn_norm.weight.device();
 
-    let normed = b.attn_norm.forward(&wrap(h, seq_len, cfg.hidden_size, device)?)?;
+    let normed = b
+        .attn_norm
+        .forward(&wrap(h, seq_len, cfg.hidden_size, device)?)?;
     let normed = normed.to_vec_f32()?;
 
-    let q = b
-        .wq
-        .forward(&wrap(&normed, seq_len, cfg.hidden_size, device)?)?
-        .to_vec_f32()?;
-    let k = b
-        .wk
-        .forward(&wrap(&normed, seq_len, cfg.hidden_size, device)?)?
-        .to_vec_f32()?;
-    let v = b
-        .wv
-        .forward(&wrap(&normed, seq_len, cfg.hidden_size, device)?)?
-        .to_vec_f32()?;
+    let q =
+        b.wq.forward(&wrap(&normed, seq_len, cfg.hidden_size, device)?)?
+            .to_vec_f32()?;
+    let k =
+        b.wk.forward(&wrap(&normed, seq_len, cfg.hidden_size, device)?)?
+            .to_vec_f32()?;
+    let v =
+        b.wv.forward(&wrap(&normed, seq_len, cfg.hidden_size, device)?)?
+            .to_vec_f32()?;
 
     let attn_out = gqa_attn_with_cache(b, cfg, &q, &k, &v, positions, seq_len, cache)?;
     let ssm_out = mamba2_layer_cpu(b, cfg, &normed, cache)?;
@@ -392,7 +439,9 @@ fn gqa_attn_with_cache(
     // RoPE via the Rope module (NEOX pairing, reshaped to (1, S*heads, head_dim)).
     let q_3d = q_reshaped(q, seq_len, n_heads, h_dim);
     let k_3d = q_reshaped(k, seq_len, n_kv, h_dim);
-    let q_roped = b.rope.forward(&q_3d, &expand_positions(positions, n_heads))?;
+    let q_roped = b
+        .rope
+        .forward(&q_3d, &expand_positions(positions, n_heads))?;
     let k_roped = b.rope.forward(&k_3d, &expand_positions(positions, n_kv))?;
     let q_roped = q_roped.to_vec_f32()?;
     let k_roped = k_roped.to_vec_f32()?;
@@ -539,7 +588,8 @@ fn mamba2_layer_cpu(
     let mut swiglu = vec![0.0f32; seq_len * cfg.ssm_d_inner];
     for t in 0..seq_len {
         for i in 0..cfg.ssm_d_inner {
-            swiglu[t * cfg.ssm_d_inner + i] = silu(ssm[t * in_dim + i]) * y[t * cfg.ssm_d_inner + i];
+            swiglu[t * cfg.ssm_d_inner + i] =
+                silu(ssm[t * in_dim + i]) * y[t * cfg.ssm_d_inner + i];
         }
     }
 

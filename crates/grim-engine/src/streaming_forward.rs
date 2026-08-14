@@ -353,18 +353,8 @@ impl StreamingBlockForward {
         let k_3d = dev.from_cpu(&k.to_vec_f32()?, &k_shape, DType::F32)?;
 
         let rope_cfg = grim_tensor::RopeConfig::new(cfg.head_dim, rope_base);
-        let (q_rot_s, _) = dev.rope(
-            q_3d.as_ref(),
-            &q_positions,
-            &rope_cfg,
-            &q_shape,
-        )?;
-        let (k_rot_s, _) = dev.rope(
-            k_3d.as_ref(),
-            &k_positions,
-            &rope_cfg,
-            &k_shape,
-        )?;
+        let (q_rot_s, _) = dev.rope(q_3d.as_ref(), &q_positions, &rope_cfg, &q_shape)?;
+        let (k_rot_s, _) = dev.rope(k_3d.as_ref(), &k_positions, &rope_cfg, &k_shape)?;
 
         let q_rot = Tensor::new(
             std::sync::Arc::from(q_rot_s),
@@ -393,7 +383,6 @@ impl StreamingBlockForward {
             None,
             None,
         )?;
-
 
         let attn_raw = Tensor::new(
             std::sync::Arc::from(attn_s),
@@ -612,10 +601,10 @@ mod tests {
                     rms_norm_eps: 1e-5,
                     rope_theta: 10000.0,
                     max_seq_len: 64,
-                
+
                     partial_rotary_factor: 1.0,
                     yarn: None,
-        },
+                },
             }
         }
     }

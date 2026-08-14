@@ -1,7 +1,7 @@
 //! Compatibility loader for `google/diffusiongemma-26B-A4B-it` (HuggingFace `model_type = "diffusion_gemma"`).
 
 use grim_core::error::{Error, Result};
-use grim_core::model::{AdapterHandle, CausalLm, Model, ModelConfig, ModalityHint};
+use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_tensor::{ArithType, Device, Tensor};
 
@@ -72,7 +72,11 @@ pub struct DiffusionGemma {
 }
 
 impl DiffusionGemma {
-    pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: DiffusionGemmaConfig) -> Result<Self> {
+    pub fn load(
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: DiffusionGemmaConfig,
+    ) -> Result<Self> {
         Self::load_tp(device, ws, cfg)
     }
 

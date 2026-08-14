@@ -124,9 +124,9 @@ fn qkv_attention_structural_empty_call() {
             q.as_ref(),
             q.as_ref(),
             q.as_ref(),
-            1, // num_kv_heads
-            0, // kv_seq_len
-            0, // cache_offset
+            1,    // num_kv_heads
+            0,    // kv_seq_len
+            0,    // cache_offset
             None, // window: full causal
             &Shape::from_slice(&[0, 0, 0]),
             None,
@@ -233,7 +233,6 @@ fn qkv_attention_reference_8_to_1_gqa() {
     // output norm should be larger than the first query's output (which
     // only attends to k=0). This rules out accidental "always return zeros"
     // regressions.
-    let head_dim_f = head_dim as f32;
     let row_norm = |row: usize, h: usize| -> f32 {
         (0..head_dim)
             .map(|d| got[(row * num_heads + h) * head_dim + d].powi(2))
@@ -264,7 +263,7 @@ fn qkv_attention_reference_decode_with_cache() {
         .map(|i| (i as f32 * 0.19).cos())
         .collect();
     let v: Vec<f32> = (0..(kv_seq_len * num_kv_heads * head_dim))
-        .map(|i| ((i as f32 * 0.17).sin() + 0.1))
+        .map(|i| (i as f32 * 0.17).sin() + 0.1)
         .collect();
     let got = reference_attention(
         &q,

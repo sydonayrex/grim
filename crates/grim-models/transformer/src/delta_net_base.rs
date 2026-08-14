@@ -6,7 +6,7 @@
 //! loader can recognize it.
 
 use grim_core::error::{Error, Result};
-use grim_core::model::{AdapterHandle, CausalLm, Model, ModelConfig, ModalityHint};
+use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::TensorParallelConfig;
 use grim_tensor::{ArithType, Device, Tensor};
@@ -47,20 +47,26 @@ pub struct DeltaNetBase {
 }
 
 impl DeltaNetBase {
-    pub fn load(device: Device, _ws: &grim_nn::WeightSource<'_>, cfg: DeltaNetBaseConfig) -> Result<Self> {
+    pub fn load(
+        _device: Device,
+        _ws: &grim_nn::WeightSource<'_>,
+        _cfg: DeltaNetBaseConfig,
+    ) -> Result<Self> {
         Err(Error::Unimplemented(
-            "delta-net-base architecture requires a custom forward pass; not yet implemented".into(),
+            "delta-net-base architecture requires a custom forward pass; not yet implemented"
+                .into(),
         ))
     }
 
     pub fn load_tp(
-        device: Device,
+        _device: Device,
         _ws: &grim_nn::WeightSource<'_>,
-        cfg: DeltaNetBaseConfig,
+        _cfg: DeltaNetBaseConfig,
         _tp: TensorParallelConfig,
     ) -> Result<Self> {
         Err(Error::Unimplemented(
-            "delta-net-base architecture requires a custom forward pass; not yet implemented".into(),
+            "delta-net-base architecture requires a custom forward pass; not yet implemented"
+                .into(),
         ))
     }
 }

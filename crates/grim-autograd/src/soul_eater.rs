@@ -288,7 +288,7 @@ impl SoulEaterOptimizer {
         let fim_sig = self
             .fim_sigma
             .entry(key_sig)
-            .or_insert_with(|| g_sigma.iter().map(|&g| g * g + self.fim_damping).collect());
+            .or_insert_with(|| vec![self.fim_damping; g_sigma.len()]);
         let decay = self.fim_ema_decay;
         for i in 0..r {
             fim_sig[i] = decay * fim_sig[i] + (1.0 - decay) * (g_sigma[i] * g_sigma[i]);
@@ -613,7 +613,6 @@ mod tests {
         let x_vec = x.to_vec_f32().unwrap();
         let u_vec = adapter.u.to_vec_f32().unwrap();
         let v_vec = adapter.v.to_vec_f32().unwrap();
-        let sig_vec = adapter.sigma.to_vec_f32().unwrap();
         let mut x_v = vec![0.0f32; r];
         for k in 0..r {
             for i in 0..d_in {

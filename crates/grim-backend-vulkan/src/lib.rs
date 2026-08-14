@@ -1,4 +1,8 @@
-//! Cross-platform Vulkan compute backend with compiled SPIR-V shaders.
+pub mod autotune;
+pub mod caps;
+
+pub use autotune::{GemmOp, ShapeClass, VulkanAutotuner, VulkanTileConfig};
+pub use caps::VulkanCaps;
 
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -917,13 +921,43 @@ impl BackendStorage for VulkanStorage {
 }
 
 /// Vulkan device handle.
-#[derive(Debug, Clone)]
-pub struct VulkanDevice;
+#[derive(Debug)]
+pub struct VulkanDevice {
+    pub caps: VulkanCaps,
+    /// Persistent autotuner — survives across matmul calls so a previously measured winner on
+    /// this GPU (loaded from disk at construction) is reused instead of re-searched each call.
+    autotuner: Mutex<VulkanAutotuner>,
+}
+
+impl Clone for VulkanDevice {
+    fn clone(&self) -> Self {
+        // A cloned handle shouldn't share tuning state; give it a fresh (empty) autotuner.
+        Self {
+            caps: self.caps.clone(),
+            autotuner: Mutex::new(VulkanAutotuner::new()),
+        }
+    }
+}
 
 impl VulkanDevice {
     /// Constructs a new Vulkan device.
     pub fn new() -> Self {
-        Self
+        let caps = VulkanCaps::probe_default("Vulkan Compute Device".into(), 0x1002, 0x744c, 1);
+        let autotuner = VulkanAutotuner::new();
+        // Restore prior tuning for this hardware fingerprint so repeat shapes hit the cache.
+        autotuner.load_cache(&caps);
+        Self {
+            caps,
+            autotuner: Mutex::new(autotuner),
+        }
+    }
+
+    pub fn caps(&self) -> &VulkanCaps {
+        &self.caps
+    }
+
+    pub fn hw_fingerprint(&self) -> u64 {
+        self.caps.cache_key_hash()
     }
 
     /// Probes the system for available Vulkan GPUs.
@@ -1499,14 +1533,22 @@ impl VulkanDevice {
                     },
                 )
             }
-            QuantFormat::Fp8 => (
-                VulkanKernel::QuantFp8,
-                4 + total,
-                DType {
-                    arith: ArithType::U8,
-                    storage: DTypeStorage::FloatPack(FloatPackScheme::Fp8),
-                },
-            ),
+            QuantFormat::Fp8 => {
+                // T1 caps gate: a device without FP8 shader support must not dispatch the fp8 blob.
+                if !self.caps.supports_quant_format(QuantFormat::Fp8) {
+                    return Err(Error::Backend(
+                        "Vulkan quantize_on_device: FP8 not supported on this device".into(),
+                    ));
+                }
+                (
+                    VulkanKernel::QuantFp8,
+                    4 + total,
+                    DType {
+                        arith: ArithType::U8,
+                        storage: DTypeStorage::FloatPack(FloatPackScheme::Fp8),
+                    },
+                )
+            }
 
             other => {
                 return Err(Error::Backend(format!(
@@ -1573,34 +1615,51 @@ impl VulkanDevice {
         batch: u32,
         routed_scaling_factor: f32,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let x_s = x
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan moe_fused_dispatch: x is not VulkanStorage".into()))?;
+        let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan moe_fused_dispatch: x is not VulkanStorage".into())
+        })?;
         let gw_s = gate_w
             .as_any()
             .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan moe_fused_dispatch: gate_w is not VulkanStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("Vulkan moe_fused_dispatch: gate_w is not VulkanStorage".into())
+            })?;
         let uw_s = up_w
             .as_any()
             .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan moe_fused_dispatch: up_w is not VulkanStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("Vulkan moe_fused_dispatch: up_w is not VulkanStorage".into())
+            })?;
         let dw_s = down_w
             .as_any()
             .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan moe_fused_dispatch: down_w is not VulkanStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("Vulkan moe_fused_dispatch: down_w is not VulkanStorage".into())
+            })?;
         let tok_s = router_tokens
             .as_any()
             .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan moe_fused_dispatch: router_tokens is not VulkanStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend(
+                    "Vulkan moe_fused_dispatch: router_tokens is not VulkanStorage".into(),
+                )
+            })?;
         let exp_s = router_experts
             .as_any()
             .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan moe_fused_dispatch: router_experts is not VulkanStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend(
+                    "Vulkan moe_fused_dispatch: router_experts is not VulkanStorage".into(),
+                )
+            })?;
         let wt_s = router_weights
             .as_any()
             .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan moe_fused_dispatch: router_weights is not VulkanStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend(
+                    "Vulkan moe_fused_dispatch: router_weights is not VulkanStorage".into(),
+                )
+            })?;
 
         let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
         let ctx = ctx_guard
@@ -1608,7 +1667,8 @@ impl VulkanDevice {
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
 
         // Output is zero-initialized; the kernel atomicAdds contributions.
-        let out_storage = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let out_storage =
+            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
         unsafe {
             let mut mapped: *mut c_void = std::ptr::null_mut();
             let res = vkMapMemory(
@@ -1620,7 +1680,9 @@ impl VulkanDevice {
                 &mut mapped,
             );
             if res != VK_SUCCESS {
-                return Err(Error::Backend(format!("vkMapMemory failed with status {res}")));
+                return Err(Error::Backend(format!(
+                    "vkMapMemory failed with status {res}"
+                )));
             }
             std::ptr::write_bytes(mapped, 0, out_storage.bytes);
             vkUnmapMemory(ctx.device, out_storage.memory);
@@ -1652,7 +1714,11 @@ impl VulkanDevice {
             1,
             Some(&push),
         )
-        .map_err(|e| Error::Backend(format!("Vulkan moe_fused_dispatch GPU dispatch failed: {e}")))?;
+        .map_err(|e| {
+            Error::Backend(format!(
+                "Vulkan moe_fused_dispatch GPU dispatch failed: {e}"
+            ))
+        })?;
 
         Ok((
             Box::new(out_storage),
@@ -1663,23 +1729,22 @@ impl VulkanDevice {
     /// Upload a host `f32` slice into a freshly-allocated device buffer.
     /// Used to stage small CPU-side routing arrays (token/expert/weight) and
     /// flattened expert weights for `moe_fused_dispatch`.
-    pub fn upload_f32(
-        &self,
-        data: &[f32],
-        shape: &Shape,
-    ) -> Result<Box<dyn BackendStorage>> {
+    pub fn upload_f32(&self, data: &[f32], shape: &Shape) -> Result<Box<dyn BackendStorage>> {
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         self.upload_bytes(&bytes, shape, DType::F32)
     }
 
     /// Upload a host `u32` slice into a freshly-allocated device buffer.
-    pub fn upload_u32(
-        &self,
-        data: &[u32],
-        shape: &Shape,
-    ) -> Result<Box<dyn BackendStorage>> {
+    pub fn upload_u32(&self, data: &[u32], shape: &Shape) -> Result<Box<dyn BackendStorage>> {
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        self.upload_bytes(&bytes, shape, DType { arith: ArithType::U32, storage: DTypeStorage::Native })
+        self.upload_bytes(
+            &bytes,
+            shape,
+            DType {
+                arith: ArithType::U32,
+                storage: DTypeStorage::Native,
+            },
+        )
     }
 
     fn upload_bytes(
@@ -1704,12 +1769,118 @@ impl VulkanDevice {
                 &mut mapped,
             );
             if res != VK_SUCCESS {
-                return Err(Error::Backend(format!("vkMapMemory failed with status {res}")));
+                return Err(Error::Backend(format!(
+                    "vkMapMemory failed with status {res}"
+                )));
             }
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped as *mut u8, storage.bytes);
             vkUnmapMemory(ctx.device, storage.memory);
         }
         Ok(Box::new(storage))
+    }
+
+    /// Op-tagged GEMM. `op` drives the shape-classifier (via `search_tile_config`): a `LmHead`
+    /// tag routes to the wide-N TLOLog tile; everything else classifies by shape. The trait
+    /// `matmul` delegates with `None` (preserving prior behavior); `matmul_lm_head` delegates
+    /// with `Some(GemmOp::LmHead)` so logit projection gets the wide-N candidate set.
+    pub fn matmul_op(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out_shape: &Shape,
+        op: Option<GemmOp>,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let a_s = a
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan matmul: input a is not VulkanStorage".into()))?;
+        let b_s = b
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| Error::Backend("Vulkan matmul: input b is not VulkanStorage".into()))?;
+
+        let a_dims = a.shape().dims();
+        let b_dims = b.shape().dims();
+        if a_dims.len() != 2 || b_dims.len() != 2 {
+            return Err(Error::Shape("Vulkan matmul: inputs must be 2D".into()));
+        }
+        let (m, k) = (a_dims[0], a_dims[1]);
+        let (k2, n) = (b_dims[0], b_dims[1]);
+        if k != k2 {
+            return Err(Error::ShapeMismatch {
+                expected: a_dims.to_vec(),
+                got: b_dims.to_vec(),
+            });
+        }
+        if out_shape.dims() != &[m, n] {
+            return Err(Error::Shape(format!(
+                "expected out [{m},{n}], got {out_shape:?}"
+            )));
+        }
+
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+
+        // Persistent autotuner: cached (loaded-from-disk or in-memory) winner on a repeat shape
+        // is reused; on a miss the winner is chosen and persisted (search_tile_config saves).
+        let tile_config = {
+            let autotuner = self.autotuner.lock().unwrap();
+            autotuner.search_tile_config(&self.caps, m, n, k, op)
+        };
+        let shape_class = match op {
+            Some(GemmOp::LmHead) => ShapeClass::TLOLog,
+            _ => ShapeClass::classify(m, n, k),
+        };
+
+        // Use the precompiled, autotuner-matched matmul blob (block size 64 or 32, or BF16).
+        // Caps-gate BF16: a device without BF16 shader support must not pick the BF16 blob.
+        let kernel = if (a.dtype().arith == ArithType::BF16 || b.dtype().arith == ArithType::BF16)
+            && a_s.bytes == m * k * 2
+            && self.caps.supports_bf16
+        {
+            VulkanKernel::Matmul64Bf16
+        } else if shape_class == ShapeClass::TLOLog {
+            // Wide-N (vocab-dominated) output column: route to the Matmul64 surface.
+            VulkanKernel::Matmul64
+        } else if tile_config.block_m == 64 {
+            VulkanKernel::Matmul64
+        } else {
+            VulkanKernel::Matmul32
+        };
+        let spirv_source: Vec<u8> = spirv_for(kernel).to_vec();
+
+        let out_storage =
+            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+
+        // Try GPU dispatch first
+        let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
+        let grid_x = ((n + tile_config.block_n as usize - 1) / tile_config.block_n as usize) as u32;
+        let grid_y = ((m + tile_config.block_m as usize - 1) / tile_config.block_m as usize) as u32;
+
+        let push = push_params(0, 0, k as u32, n as u32, m as u32, 0.0);
+
+        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, grid_y, 1, Some(&push)).map_err(
+            |e| grim_tensor::Error::Backend(format!("Vulkan matmul GPU dispatch failed: {e}")),
+        )?;
+
+        Ok((
+            Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
+    }
+
+    /// Public hook for the engine layer to tag the lm_head / logit-projection GEMM, so it is
+    /// classified as `ShapeClass::TLOLog` (op-identity) and gets the wide-N tile candidate set
+    /// regardless of M. This is the vulkan-catch-up.md §3 T3 dispatch-layer tag.
+    pub fn matmul_lm_head(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.matmul_op(a, b, out_shape, Some(GemmOp::LmHead))
     }
 }
 
@@ -1754,73 +1925,7 @@ impl BackendDevice for VulkanDevice {
         b: &dyn BackendStorage,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let a_s = a
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan matmul: input a is not VulkanStorage".into()))?;
-        let b_s = b
-            .as_any()
-            .downcast_ref::<VulkanStorage>()
-            .ok_or_else(|| Error::Backend("Vulkan matmul: input b is not VulkanStorage".into()))?;
-
-        let a_dims = a.shape().dims();
-        let b_dims = b.shape().dims();
-        if a_dims.len() != 2 || b_dims.len() != 2 {
-            return Err(Error::Shape("Vulkan matmul: inputs must be 2D".into()));
-        }
-        let (m, k) = (a_dims[0], a_dims[1]);
-        let (k2, n) = (b_dims[0], b_dims[1]);
-        if k != k2 {
-            return Err(Error::ShapeMismatch {
-                expected: a_dims.to_vec(),
-                got: b_dims.to_vec(),
-            });
-        }
-        if out_shape.dims() != &[m, n] {
-            return Err(Error::Shape(format!(
-                "expected out [{m},{n}], got {out_shape:?}"
-            )));
-        }
-
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-
-        // 1. autotuner search (Phase 4 requirement)
-        let autotuner = VulkanAutotuner::new();
-        let tile_config = autotuner.search_tile_config(m, n, k);
-
-        // Use the precompiled, autotuner-matched matmul blob (block size 64 or 32, or BF16).
-        let kernel = if (a.dtype().arith == ArithType::BF16 || b.dtype().arith == ArithType::BF16)
-            && a_s.bytes == m * k * 2
-        {
-            VulkanKernel::Matmul64Bf16
-        } else if tile_config.block_m == 64 {
-            VulkanKernel::Matmul64
-        } else {
-            VulkanKernel::Matmul32
-        };
-        let spirv_source: Vec<u8> = spirv_for(kernel).to_vec();
-
-        let out_storage =
-            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
-
-        // Try GPU dispatch first
-        let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
-        let grid_x = ((n + tile_config.block_n as usize - 1) / tile_config.block_n as usize) as u32;
-        let grid_y = ((m + tile_config.block_m as usize - 1) / tile_config.block_m as usize) as u32;
-
-        let push = push_params(0, 0, k as u32, n as u32, m as u32, 0.0);
-
-        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, grid_y, 1, Some(&push)).map_err(
-            |e| grim_tensor::Error::Backend(format!("Vulkan matmul GPU dispatch failed: {e}")),
-        )?;
-
-        Ok((
-            Box::new(out_storage),
-            Box::new(grim_tensor::backend::ReadyHandle),
-        ))
+        self.matmul_op(a, b, out_shape, None)
     }
 
     fn add(
@@ -2025,6 +2130,79 @@ impl BackendDevice for VulkanDevice {
 
         Ok((
             Box::new(out_storage),
+            Box::new(grim_tensor::backend::ReadyHandle),
+        ))
+    }
+
+    /// Fused Add + RMSNorm: `y_out = x + residual`, `norm_out = rms_norm(y_out, w, eps)`.
+    /// Returns `(y_out, norm_out, compute_handle)`. Overrides the trait default with the real
+    /// fused `grim_add_rms_norm` SPIR-V pipeline — mirrors ROCm (HIP) and Metal (MSL) 1:1.
+    fn fused_add_rms_norm(
+        &self,
+        x: &dyn BackendStorage,
+        residual: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        eps: f32,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let x_s = x.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
+            Error::Backend("Vulkan fused_add_rms_norm: x is not VulkanStorage".into())
+        })?;
+        let r_s = residual
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan fused_add_rms_norm: residual is not VulkanStorage".into())
+            })?;
+        let w_s = weight
+            .as_any()
+            .downcast_ref::<VulkanStorage>()
+            .ok_or_else(|| {
+                Error::Backend("Vulkan fused_add_rms_norm: weight is not VulkanStorage".into())
+            })?;
+
+        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        let y_storage =
+            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let norm_storage =
+            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+
+        let size = out_shape.elem_count();
+        let x_dims = x.shape().dims();
+        let dim = x_dims[x_dims.len() - 1];
+
+        let spirv_source: Vec<u8> = spirv_for(VulkanKernel::AddRmsNorm).to_vec();
+
+        // Bindings: x(0), residual(1), weight(2), y_out(3), norm_out(4).
+        let buffers = [
+            x_s.buffer,
+            r_s.buffer,
+            w_s.buffer,
+            y_storage.buffer,
+            norm_storage.buffer,
+        ];
+        let grid_x = ((size + 255) / 256) as u32;
+
+        let push = push_params(size as u32, dim as u32, 0, 0, 0, eps);
+
+        run_compute_shader(ctx, &spirv_source, &buffers, grid_x, 1, 1, Some(&push)).map_err(
+            |e| {
+                Error::Backend(format!(
+                    "Vulkan fused_add_rms_norm GPU dispatch failed: {e}"
+                ))
+            },
+        )?;
+
+        Ok((
+            Box::new(y_storage),
+            Box::new(norm_storage),
             Box::new(grim_tensor::backend::ReadyHandle),
         ))
     }
@@ -2695,9 +2873,11 @@ impl BackendDevice for VulkanDevice {
             // Grid covers max(num_tokens*num_heads*rotary_half, *copy_len) for
             // both the rotate pass and the verbatim-tail copy pass.
             let copy_len = dim - 2 * rotary_half;
-            let total = (num_tokens * num_heads
-                * rotary_half.max(if copy_len > 0 { copy_len } else { 0 }).max(1))
-                as u32;
+            let total = (num_tokens
+                * num_heads
+                * rotary_half
+                    .max(if copy_len > 0 { copy_len } else { 0 })
+                    .max(1)) as u32;
             let grid_x = (total + 255) / 256;
             run_compute_shader_kernel(
                 ctx,
@@ -2865,8 +3045,18 @@ impl BackendDevice for VulkanDevice {
         }
         // Note: GPU fast path skipped until buffer layout matches CPU semantics and end-to-end golden verification passes.
         // Pass num_kv_heads for GQA head-repeat; num_heads comes from out_shape.
-        let (out_storage, _h) =
-            self.qkv_attention(q, k, v, num_kv_heads, seq_len, 0, None, out_shape, None, None)?;
+        let (out_storage, _h) = self.qkv_attention(
+            q,
+            k,
+            v,
+            num_kv_heads,
+            seq_len,
+            0,
+            None,
+            out_shape,
+            None,
+            None,
+        )?;
         Ok((out_storage, Box::new(VulkanHandle)))
     }
 
@@ -2894,11 +3084,11 @@ impl BackendDevice for VulkanDevice {
             "Vulkan cross_attention: seq_len={seq_len}, kv_seq_len={kv_seq_len}, num_heads={num_heads}, head_dim={head_dim}"
         );
         // Cross-attention: Q and KV share num_heads, so pass it as KV-head count.
-        let (out_storage, _h) =
-            self.qkv_attention(q, k, v, num_heads, kv_seq_len, 0, None, out_shape, None, None)?;
+        let (out_storage, _h) = self.qkv_attention(
+            q, k, v, num_heads, kv_seq_len, 0, None, out_shape, None, None,
+        )?;
         Ok((out_storage, Box::new(VulkanHandle)))
     }
-
 
     fn rwkv_time_mix(
         &self,
@@ -3034,7 +3224,16 @@ impl BackendDevice for VulkanDevice {
                 Storage::KQuant(KQuantScheme::IQ2XS) => Some(VulkanKernel::FusedDequantGemmIQ2XS),
                 Storage::KQuant(KQuantScheme::IQ2S) => Some(VulkanKernel::FusedDequantGemmIQ2S),
                 Storage::FloatPack(FloatPackScheme::Fp8) => {
-                    Some(VulkanKernel::FusedDequantGemmFp8E4M3)
+                    // T1 caps gate: without FP8 shader support, fall through to the CPU path
+                    // rather than dispatch the FP8 fused-dequant shader.
+                    if self
+                        .caps
+                        .supports_quant_format(grim_tensor::QuantFormat::Fp8)
+                    {
+                        Some(VulkanKernel::FusedDequantGemmFp8E4M3)
+                    } else {
+                        None
+                    }
                 }
                 Storage::FloatPack(FloatPackScheme::MxFp4) => {
                     Some(VulkanKernel::FusedDequantGemmMxFp4)
@@ -3714,46 +3913,6 @@ impl BackendDevice for VulkanDevice {
     }
 }
 
-/// Simulation tile shape config matching CubeCL autotuning schema (§4.1 requirements)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VulkanTileConfig {
-    pub block_m: u32,
-    pub block_n: u32,
-    pub block_k: u32,
-}
-
-pub struct VulkanAutotuner;
-
-impl VulkanAutotuner {
-    pub fn new() -> Self {
-        Self
-    }
-
-    /// Autotunes CubeCL tile block parameters via simulated benchmarking.
-    pub fn search_tile_config(&self, m: usize, n: usize, k: usize) -> VulkanTileConfig {
-        tracing::info!(
-            "[VulkanAutotuner] Running autotune search for shape ({}, {}, {})...",
-            m,
-            n,
-            k
-        );
-        // Autotuning heuristic based on common powers of 2 for GPU compute blocks
-        if m % 64 == 0 && n % 64 == 0 {
-            VulkanTileConfig {
-                block_m: 64,
-                block_n: 64,
-                block_k: 16,
-            }
-        } else {
-            VulkanTileConfig {
-                block_m: 32,
-                block_n: 32,
-                block_k: 8,
-            }
-        }
-    }
-}
-
 include!(concat!(env!("OUT_DIR"), "/spirv_spv.rs"));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3762,6 +3921,7 @@ pub enum VulkanKernel {
     Mul,
     SiluMul,
     RmsNorm,
+    AddRmsNorm,
     Softmax,
     Embedding,
     Matmul64,
@@ -3823,6 +3983,7 @@ pub fn spirv_for(kernel: VulkanKernel) -> &'static [u8] {
         VulkanKernel::Mul => SPIRV_MUL,
         VulkanKernel::SiluMul => SPIRV_SILU_MUL,
         VulkanKernel::RmsNorm => SPIRV_RMS_NORM,
+        VulkanKernel::AddRmsNorm => SPIRV_ADD_RMS_NORM,
         VulkanKernel::Softmax => SPIRV_SOFTMAX,
         VulkanKernel::Embedding => SPIRV_EMBEDDING,
         VulkanKernel::Matmul64 => SPIRV_MATMUL_64,
@@ -3915,7 +4076,8 @@ pub fn binding_count(kernel: VulkanKernel) -> usize {
         | VulkanKernel::QkvAttentionPagedSwa
         | VulkanKernel::TreeAttention
         | VulkanKernel::QuantizedMatmulBackwardDx
-        | VulkanKernel::QuantizedMatmulBackwardDxQ8_0 => 5,
+        | VulkanKernel::QuantizedMatmulBackwardDxQ8_0
+        | VulkanKernel::AddRmsNorm => 5,
         VulkanKernel::KvDequantAttention
         | VulkanKernel::SelectiveScan
         | VulkanKernel::QuantizedMatmulBackwardDxGeneric => 6,
@@ -4025,14 +4187,17 @@ mod tests {
 
         // activations [batch, hidden]
         let x_data: Vec<f32> = (0..batch * hidden).map(|i| i as f32 * 0.1).collect();
-        let x = dev.from_cpu(&x_data, &Shape::new(vec![batch, hidden]), DType::F32).unwrap();
+        let x = dev
+            .from_cpu(&x_data, &Shape::new(vec![batch, hidden]), DType::F32)
+            .unwrap();
 
         // per-expert gate/up [inter, hidden], down [hidden, inter] (identity-ish)
         let mk = |e: usize, sign: f32| -> Vec<f32> {
             let mut v = vec![0.0f32; inter * hidden];
             for i in 0..inter {
                 for h in 0..hidden {
-                    v[i * hidden + h] = sign * (1.0 + (i as f32) * 0.1 + (h as f32) * 0.01 + e as f32);
+                    v[i * hidden + h] =
+                        sign * (1.0 + (i as f32) * 0.1 + (h as f32) * 0.01 + e as f32);
                 }
             }
             v
@@ -4057,9 +4222,15 @@ mod tests {
         let rw = vec![1.0f32, 1.0f32];
         let num_pairs = rtok.len();
 
-        let gate_buf = dev.upload_f32(&gate_flat, &Shape::new(vec![num_experts * inter * hidden])).unwrap();
-        let up_buf = dev.upload_f32(&up_flat, &Shape::new(vec![num_experts * inter * hidden])).unwrap();
-        let down_buf = dev.upload_f32(&down_flat, &Shape::new(vec![num_experts * hidden * inter])).unwrap();
+        let gate_buf = dev
+            .upload_f32(&gate_flat, &Shape::new(vec![num_experts * inter * hidden]))
+            .unwrap();
+        let up_buf = dev
+            .upload_f32(&up_flat, &Shape::new(vec![num_experts * inter * hidden]))
+            .unwrap();
+        let down_buf = dev
+            .upload_f32(&down_flat, &Shape::new(vec![num_experts * hidden * inter]))
+            .unwrap();
         let tok_buf = dev.upload_u32(&rtok, &Shape::new(vec![num_pairs])).unwrap();
         let exp_buf = dev.upload_u32(&rexp, &Shape::new(vec![num_pairs])).unwrap();
         let w_buf = dev.upload_f32(&rw, &Shape::new(vec![num_pairs])).unwrap();
@@ -4157,9 +4328,11 @@ mod tests {
     #[test]
     fn test_vulkan_autotuner_and_spirv() {
         let autotuner = VulkanAutotuner::new();
-        let config = autotuner.search_tile_config(128, 128, 64);
-        assert_eq!(config.block_m, 64);
-        assert_eq!(config.block_n, 64);
+        let caps = VulkanCaps::probe_default("Vulkan Test Device".into(), 0x1002, 0x744c, 1);
+        let config = autotuner.search_tile_config(&caps, 128, 128, 64, None);
+
+        assert_eq!(config.block_m, 32);
+        assert_eq!(config.block_n, 32);
 
         // Verify a precompiled SPIR-V blob is loadable for the chosen tile size.
         let spirv = spirv_for(VulkanKernel::Matmul64);

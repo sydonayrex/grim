@@ -33,14 +33,17 @@ pub fn dequant_row(
         let code = if byte_offset < row_data.len() {
             if bits_left_in_byte >= bpw as usize {
                 let shift = bits_left_in_byte - bpw as usize;
-                ((row_data[byte_offset] >> shift) & ((1 << bpw) - 1)) as u32
+                let mask = (1u32 << bpw).wrapping_sub(1);
+                (row_data[byte_offset] >> shift) as u32 & mask
             } else {
                 let high_bits = bits_left_in_byte;
                 let low_bits = bpw as usize - high_bits;
-                let high_part = (row_data[byte_offset] & ((1 << high_bits) - 1)) as u32;
+                let high_mask = (1u32 << high_bits).wrapping_sub(1);
+                let low_mask = (1u32 << low_bits).wrapping_sub(1);
+                let high_part = (row_data[byte_offset] as u32) & high_mask;
                 let low_part = if byte_offset + 1 < row_data.len() {
                     let shift = 8 - low_bits;
-                    ((row_data[byte_offset + 1] >> shift) & ((1 << low_bits) - 1)) as u32
+                    ((row_data[byte_offset + 1] >> shift) as u32) & low_mask
                 } else {
                     0
                 };
@@ -93,14 +96,17 @@ pub fn dequant_row(
                 let code = if byte_offset < b1_row_data.len() {
                     if bits_left_in_byte >= b1_bpw as usize {
                         let shift = bits_left_in_byte - b1_bpw as usize;
-                        ((b1_row_data[byte_offset] >> shift) & ((1 << b1_bpw) - 1)) as u32
+                        let mask = (1u32 << b1_bpw).wrapping_sub(1);
+                        (b1_row_data[byte_offset] >> shift) as u32 & mask
                     } else {
                         let high_bits = bits_left_in_byte;
                         let low_bits = b1_bpw as usize - high_bits;
-                        let high_part = (b1_row_data[byte_offset] & ((1 << high_bits) - 1)) as u32;
+                        let high_mask = (1u32 << high_bits).wrapping_sub(1);
+                        let low_mask = (1u32 << low_bits).wrapping_sub(1);
+                        let high_part = (b1_row_data[byte_offset] as u32) & high_mask;
                         let low_part = if byte_offset + 1 < b1_row_data.len() {
                             let shift = 8 - low_bits;
-                            ((b1_row_data[byte_offset + 1] >> shift) & ((1 << low_bits) - 1)) as u32
+                            ((b1_row_data[byte_offset + 1] >> shift) as u32) & low_mask
                         } else {
                             0
                         };
@@ -144,14 +150,17 @@ pub fn dequant_row(
                 let code = if byte_offset < b2_row_data.len() {
                     if bits_left_in_byte >= b2_bpw as usize {
                         let shift = bits_left_in_byte - b2_bpw as usize;
-                        ((b2_row_data[byte_offset] >> shift) & ((1 << b2_bpw) - 1)) as u32
+                        let mask = (1u32 << b2_bpw).wrapping_sub(1);
+                        (b2_row_data[byte_offset] >> shift) as u32 & mask
                     } else {
                         let high_bits = bits_left_in_byte;
                         let low_bits = b2_bpw as usize - high_bits;
-                        let high_part = (b2_row_data[byte_offset] & ((1 << high_bits) - 1)) as u32;
+                        let high_mask = (1u32 << high_bits).wrapping_sub(1);
+                        let low_mask = (1u32 << low_bits).wrapping_sub(1);
+                        let high_part = (b2_row_data[byte_offset] as u32) & high_mask;
                         let low_part = if byte_offset + 1 < b2_row_data.len() {
                             let shift = 8 - low_bits;
-                            ((b2_row_data[byte_offset + 1] >> shift) & ((1 << low_bits) - 1)) as u32
+                            ((b2_row_data[byte_offset + 1] >> shift) as u32) & low_mask
                         } else {
                             0
                         };

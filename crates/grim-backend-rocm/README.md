@@ -1,135 +1,83 @@
-# grim-backend-rocm
-
-ROCm (HIP/rocBLAS) backend for Grim — primary GPU target per architecture §4. Provides `RocmDevice`, `RocmStorage`, RCCL all-reduce, HIP graph capture, fused kernels, and quantization support.
-
 ## Purpose
-
-Implements the `BackendDevice` and `BackendStorage` traits from `grim-tensor` for AMD GPUs via FFI to the HIP runtime (`libamdhip64.so`) and rocBLAS (`librocblas.so`). Also provides tensor-parallel communication (RCCL), graph capture/execution (HIP graphs), fused kernels (QKV attention, RMS-norm matmul, dequant-gemm), MIOpen dynamic loading, HSACO kernel JIT caching, and memory management (caching allocator, pinned buffers).
+The `grim-backend-rocm` crate provides the primary GPU execution target for the Grim engine on AMD hardware. It encapsulates ROCm runtime semantics, binding directly to HIP and rocBLAS to perform highly optimized hardware-accelerated tensor operations.
 
 ## Boundaries
-
-- Does **not** define model architectures — see `grim-models-*`.
-- Does **not** manage the KV cache block pool — see `grim-memory`.
-- Does **not** implement CPU fallback — see `grim-backend-cpu`.
-- Does **not** handle ROCm/GPU detection in the CLI — see `grim-core::env_config::Backend`.
+This crate strictly concerns itself with ROCm ecosystem interoperability (HIP, rocBLAS, RCCL). It interfaces directly with native shared libraries via dynamic loading or FFI. It does not handle general GPU abstractions beyond what is necessary to satisfy the `BackendDevice` contract for AMD environments.
 
 ## Dependency Graph
-
 ```mermaid
-graph LR
-    A[grim-backend-rocm] --> B[grim-tensor]
-    A --> C[grim-format]
-    A --> D[grim-kvquant]
-    A --> E[grim-quant]
-
-    subgraph "reverse deps"
-        F1[grim-backend-metal]
-        F2[grim-autograd]
-        F3[grim-nn]
-        F4[grim-engine]
-        F5[grim-garage]
-        F6[grim-memory]
-        F7[grim-models-audio]
-        F8[grim-models-mamba]
-    end
-
-    F1 --> A
-    F2 --> A
-    F3 --> A
-    F4 --> A
-    F5 --> A
-    F6 --> A
-    F7 --> A
-    F8 --> A
-
-    style A fill:#e1f5e9
+graph TD
+    grim-backend-rocm[["grim-backend-rocm"]]
+    
+    grim-tensor["grim-tensor"]
+    grim-format["grim-format"]
+    grim-quant["grim-quant"]
+    thiserror["thiserror"]
+    log["log"]
+    half["half"]
+    seahash["seahash"]
+    lazy_static["lazy_static"]
+    temp-env["temp-env"]
+    serde["serde"]
+    serde_json["serde_json"]
+    libloading["libloading"]
+    cubecl["cubecl (optional)"]
+    cubecl-hip["cubecl-hip (optional)"]
+    cubecl-hip-sys["cubecl-hip-sys (optional)"]
+    cubecl-runtime["cubecl-runtime (optional)"]
+    cc["cc (build)"]
+    
+    grim-backend-rocm --> grim-tensor
+    grim-backend-rocm --> grim-format
+    grim-backend-rocm --> grim-quant
+    grim-backend-rocm --> thiserror
+    grim-backend-rocm --> log
+    grim-backend-rocm --> half
+    grim-backend-rocm --> seahash
+    grim-backend-rocm --> lazy_static
+    grim-backend-rocm --> temp-env
+    grim-backend-rocm --> serde
+    grim-backend-rocm --> serde_json
+    grim-backend-rocm --> libloading
+    grim-backend-rocm -.-> cubecl
+    grim-backend-rocm -.-> cubecl-hip
+    grim-backend-rocm -.-> cubecl-hip-sys
+    grim-backend-rocm -.-> cubecl-runtime
 ```
 
-## Public API
-
-### Core Device Types
-
-```rust
-pub use crate::device::roc_device::RocmDevice;
-pub use crate::memory::storage::RocmStorage;
-pub use crate::rccl::RcclAllReduce;
-pub use grim_tensor::backend::{BackendDevice, BackendStorage, ComputeHandle};
-```
-
-### Memory and Allocation
-
-```rust
-pub use crate::memory::allocator::RocmCachingAllocator;
-pub use crate::memory::pinned::RocmPinnedBuffer;
-```
-
-### Kernel and Compute
-
-```rust
-pub use crate::kernels::qkv_attention::{launch_paged_attention, launch_tree_attention};
-pub use crate::kernels::source_asm::compute_kernel_source;
-pub use crate::kernels::jit_cache::HsacoKernelCache;
-pub use crate::gptq_kernel::wavefront_size_for_gcn;
-pub use crate::device::helpers::{check_hip, jit_compile_hsaco, hipMemcpy, hipMalloc};
-```
-
-### Graph Capture
-
-```rust
-pub use crate::graph_capture::{CapturedGraph, HipGraphExecutor};
-```
-
-### rocBLAS
-
-```rust
-pub use crate::device::rocblas::{
-    rocblas_sgemm, rocblas_create_handle, rocblas_destroy_handle,
-    rocblas_set_stream, rocblas_datatype, select_gemm_algo,
-    GemmTileConfig, lookup_gemm_config, lookup_solution_index,
-};
-```
-
-### FSDP
-
-```rust
-pub mod fsdp;  // shard / unscale allreduce across TP ranks
-```
-
-### Layout and Quantization
-
-```rust
-pub use crate::device::layout::{
-    KvLayout, WeightLayout, select_kv_layout, resolve_weight_layout,
-    kv_from_block_major, kv_to_block_major,
-};
-pub use crate::device::capability_profiler::{CapabilityProfiler, vram_info};
-pub use crate::quantization::QuantMode;
-pub use crate::fusion::{
-    DecodeGemmConfig, FusedDequantGemmConfig, KvDequantAttentionConfig,
-    QkvAttentionFusionConfig, RmsNormMatMulFusionConfig, SplitKGemmConfig,
-    WmmaGemmConfig,
-};
-```
-
-## Feature Flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `rccl` | yes | Enable RCCL all-reduce for tensor-parallel communication |
+## Public API Overview
+- `RocmDevice`: The primary device implementation managing the ROCm context and executing kernels.
+- `RocmStorage`: The HIP-managed memory buffer living in VRAM.
+- `HipGraphExecutor`: Implementation of graph capture and replay for low-latency batch execution.
+- `RocmCachingAllocator`: Advanced VRAM allocator for reducing `hipMalloc` / `hipFree` overhead.
+- `CapabilityProfiler`: Interrogates device limits (e.g., maximum threads, available VRAM, arch).
 
 ## Usage Example
-
 ```rust
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{Device, Shape, DType};
+use grim_tensor::BackendDevice;
 
-let device = RocmDevice::new(0).unwrap(); // GPU ordinal 0
-let storage = device.zeros(&Shape(&[128, 256]), DType::F32);
+fn init_rocm() {
+    let ordinal = 0;
+    // Attempt to initialize the ROCm device on GPU 0
+    if let Ok(device) = RocmDevice::new(ordinal) {
+        println!("ROCm device initialized on ordinal {}", ordinal);
+    }
+}
 ```
 
-## Edge Cases, Limitations, and Quirks
+## Use Cases
+- High-performance, large-batch LLM inference on AMD hardware (MI-series, RX-series).
+- Serving multi-GPU distributed deployments using RCCL for collective operations.
+- JIT-compiling customized GPU kernels adaptive to specific AMD architectures (RDNA/CDNA).
 
-- MIOpen is dynamically loaded via `libloading` at runtime; if the library is absent, operations requiring it return an error rather than panicking.
-- HIP graph capture requires ROCm 6.0+; older SDKs fall back to non-captured execution.
-- `RocmDevice` is `Send + Sync`, but GPU contexts are per-thread — callers must ensure consistent device affinity.
-- JIT-compiled HSACO kernels are cached to the system temp directory; the cache is keyed by GCN arch and kernel source hash.
+## Edge Cases, Limitations, and Quirks
+- The crate heavily depends on dynamic loading of system shared libraries (`libamdhip64.so`, `librocblas.so`). If these are missing or mismatched at runtime, the backend initialization will fail cleanly.
+- Graph capture features (`hipGraphCreate`) enforce strict requirements on kernel synchronization and streams.
+
+## Build Flags, Feature Flags, and Environment Variables
+- `default`: Enables `jit-hw-adaptive`.
+- `jit-hw-adaptive`: Enables hardware-adaptive JIT compilation via `hiprtc`, substituting specific wavefront and cache tile macros tailored to the detected GPU architecture.
+- `multi-gpu-kernel`: Unlocks multi-GPU kernel launch and RCCL bindings. Requires valid P2P interconnects and RCCL library availability.
+- `rccl`: Specifically enables the RCCL collective communication wrappers.
+- `cubecl`: Pulls in CubeCL frameworks for compute shader pipelines.

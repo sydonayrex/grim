@@ -1,7 +1,7 @@
+use grim_format::gguf::{GgufDType, read_gguf};
+use std::fmt::Write;
 use std::fs::File;
 use std::io::BufReader;
-use grim_format::gguf::{read_gguf, GgufDType};
-use std::fmt::Write;
 
 #[test]
 fn scan_q4k_model_dtypes() {
@@ -13,7 +13,10 @@ fn scan_q4k_model_dtypes() {
     let path = repo_root.join("models/MiniCPM5-1B-Q4_K_M.gguf");
     let f = match File::open(&path) {
         Ok(f) => f,
-        Err(_) => { eprintln!("skip"); return; }
+        Err(_) => {
+            eprintln!("skip");
+            return;
+        }
     };
     let mut reader = BufReader::new(f);
     let file = read_gguf(&mut reader).expect("read_gguf");

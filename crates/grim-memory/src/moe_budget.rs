@@ -127,10 +127,7 @@ impl MoeResidentBudget {
 
     /// Current tier of expert `e`.
     pub fn tier(&self, e: usize) -> ResidentTier {
-        self.tiers
-            .get(e)
-            .copied()
-            .unwrap_or(ResidentTier::Off)
+        self.tiers.get(e).copied().unwrap_or(ResidentTier::Off)
     }
 
     /// The set of fp16-resident (hot) experts — the resident hot set the

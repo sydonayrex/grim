@@ -1,6 +1,5 @@
 //! List GGUF tensor names with counts per pattern.
 /// Usage: `cargo run --example list_tensors -- <path-to.gguf>`
-
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::process::ExitCode;
@@ -39,7 +38,6 @@ fn main() -> ExitCode {
 
     let mut prefixes: BTreeMap<String, usize> = BTreeMap::new();
     for t in &gguf.tensors {
-        let mut pre: String = String::new();
         let parts: Vec<&str> = t.name.split('.').collect();
         // normalize digits to N in each part
         let normed: Vec<String> = parts
@@ -52,11 +50,11 @@ fn main() -> ExitCode {
                 s
             })
             .collect();
-        if normed.len() >= 2 {
-            pre = format!("{}.{}", normed[0], normed[1]);
+        let pre = if normed.len() >= 2 {
+            format!("{}.{}", normed[0], normed[1])
         } else {
-            pre = normed.join(".");
-        }
+            normed.join(".")
+        };
         *prefixes.entry(pre).or_insert(0) += 1;
     }
     println!("total tensors: {}", gguf.tensors.len());
@@ -67,7 +65,11 @@ fn main() -> ExitCode {
     for t in gguf.tensors.iter().filter(|t| t.name.starts_with("blk.0.")) {
         println!("  {}", t.name);
     }
-    for t in gguf.tensors.iter().filter(|t| t.name.starts_with("output") || t.name.starts_with("token_embd")) {
+    for t in gguf
+        .tensors
+        .iter()
+        .filter(|t| t.name.starts_with("output") || t.name.starts_with("token_embd"))
+    {
         println!("  {}", t.name);
     }
     ExitCode::SUCCESS

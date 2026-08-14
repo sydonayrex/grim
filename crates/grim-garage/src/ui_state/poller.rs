@@ -328,8 +328,7 @@ impl Drop for Poller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::BackendProbe;
-    use crate::discovery::{DatasetEntry, ModelEntry};
+    use crate::discovery::ModelEntry;
     use crate::jobs::TrainingMode;
     use crate::ui_state::{JobSummaryDto, UiJob};
 

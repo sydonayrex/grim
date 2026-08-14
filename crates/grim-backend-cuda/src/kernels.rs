@@ -60,6 +60,31 @@ extern "C" __global__ void grim_rms_norm(float* x, float* w, float* out,
     out[idx] = x[idx] * w[col] / rms;
 }
 
+// Fused Add + RMSNorm: y_out = x + residual; norm_out = rms_norm(y_out, w, eps).
+// Mirrors the ROCm `grim_add_rms_norm` HIP kernel and the Metal `grim_add_rms_norm` MSL shader
+// 1:1 — no cross-invocation shared memory; one thread per output element.
+extern "C" __global__ void grim_add_rms_norm(const float* x, const float* residual,
+                                             float* w, float* y_out, float* norm_out,
+                                             int row_len, float eps, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int row = idx / row_len;
+    int col = idx - row * row_len;
+
+    // y = x + residual
+    float y_val = x[idx] + residual[idx];
+    y_out[idx] = y_val;
+
+    // RMSNorm of y over this row
+    float ss = 0.0f;
+    for (int j = 0; j < row_len; ++j) {
+        float v = x[row * row_len + j] + residual[row * row_len + j];
+        ss += v * v;
+    }
+    float rms = sqrtf(ss / (float)row_len + eps);
+    norm_out[idx] = y_val * w[col] / rms;
+}
+
 extern "C" __global__ void grim_softmax(float* x, float* out, int last_dim, int total) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;

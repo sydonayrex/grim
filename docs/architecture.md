@@ -119,6 +119,19 @@ graph TD
     %% Training
     U -->|Engine| AC[grim-speculative]
     
+    %% Spacer for 480px min height
+    A ~~~ Spacer1[ ] ~~~ Spacer2[ ] ~~~ Spacer3[ ] ~~~ Spacer4[ ] ~~~ Spacer5[ ] ~~~ Spacer6[ ] ~~~ Spacer7[ ] ~~~ Spacer8[ ] ~~~ Spacer9[ ] ~~~ Spacer10[ ]
+    style Spacer1 fill:none,stroke:none,color:none
+    style Spacer2 fill:none,stroke:none,color:none
+    style Spacer3 fill:none,stroke:none,color:none
+    style Spacer4 fill:none,stroke:none,color:none
+    style Spacer5 fill:none,stroke:none,color:none
+    style Spacer6 fill:none,stroke:none,color:none
+    style Spacer7 fill:none,stroke:none,color:none
+    style Spacer8 fill:none,stroke:none,color:none
+    style Spacer9 fill:none,stroke:none,color:none
+    style Spacer10 fill:none,stroke:none,color:none
+
     style A fill:#e1f5e1
     style O fill:#fff3e0
     style I fill:#f3e5f5
@@ -140,7 +153,7 @@ graph TD
 - **`BackendStorage`** (`grim-tensor`): Device-specific tensor storage
 - **`ComputeHandle`** (`grim-tensor`): Async operation tracking
 - **`KvCache`** (`grim-core`): Key-value cache interface for autoregressive generation
-- **`Session`** (`grim-core`): Per-request state and RNG for deterministic inference
+- **`SessionT`** (`grim-core`): Object-safe per-request execution state and RNG interface
 - **`Model`** (`grim-core`): Model trait family for different architectures
 
 ## Backend Architecture

@@ -1,94 +1,93 @@
-# Grim — Rust Inference & Training Engine
+# Grim
 
-## What this project is
+Grim is a pure-Rust neural network inference and fine-tuning engine supporting language models, state-space models, vision encoders, audio encoders, and diffusion architectures across CPU, ROCm, CUDA, Vulkan, and Metal backends.
 
-A pure-Rust inference and fine-tuning engine that runs autoregressive language models, SSM-based architectures, vision encoders, audio encoders, and diffusion models on CPU or GPU backends (ROCm primary, with CUDA, Vulkan, and Metal fallbacks). It uses GGUF-compatible checkpoint loading, continuous batching, speculative decoding by default, parameter-efficient fine-tuning (LoRA, QLoRA, Vera, SoulEater, QGaLore, PISSA, OLORA), an OpenAI-compatible HTTP API server, and a local-first web training dashboard (`grim-garage`).
+## Problem Solved and Target Audience
 
-## Problem it solves
-
-Grim provides a single, pure-Rust codebase for executing and training large language models and multi-modal neural architectures without C/C++ toolchain dependencies or vendor-specific CUDA lock-in. It addresses the need for:
-
-- **Cross-platform GPU support** (ROCm/HIP primary, CUDA, Vulkan SPIR-V, Metal) from a single unified codebase
-- **Efficient continuous batching** for high multi-request throughput
-- **Low-latency inference** through speculative decoding (DSpark, Markov heads, zero-config MTP)
-- **Local-first adapter fine-tuning** and real-time web dashboard management (`grim-garage`)
-- **Seamless deployment** with GGUF checkpoint compatibility, safetensors bridging, and OpenAI/Ollama-compatible REST APIs
-
-Grim targets researchers, machine learning engineers, and system developers who want high-performance LLM serving and fine-tuning without heavy external framework dependencies.
+Grim provides execution and fine-tuning of neural network models without reliance on C/C++ runtime dependencies or vendor-locked frameworks. It targets machine learning researchers, systems software developers, and platform engineers who require configurable inference serving, continuous batching, and local adapter fine-tuning.
 
 ## Prerequisites
 
-- **Rust toolchain**: edition 2024, minimum version 1.85 (`rustup update 1.85`)
-- **LLVM development libraries**: `llvm-dev` (for ROCm JIT kernel compilation)
-- **ROCm runtime libraries**: for AMD GPU backend support (`libhipblas.so`, `librocblas.so`, etc.)
-- **CUDA toolkit**: optional, for NVIDIA GPU compilation (version 11.8+)
-- **macOS Frameworks**: Metal framework active for Apple Silicon GPU acceleration
-- **Vulkan SDK**: optional, for cross-platform Vulkan SPIR-V compute acceleration
+- **Rust toolchain**: Edition 2024, version 1.85 or higher (`rustup update 1.85`)
+- **System C compiler / LLVM**: `clang` and `llvm-dev` (required for ROCm JIT kernel compilation)
+- **ROCm runtime**: `libhipblas.so` and `librocblas.so` (required for AMD GPU execution)
+- **CUDA toolkit**: Version 11.8 or higher (optional, for NVIDIA GPU support)
+- **Vulkan SDK**: Optional, for Vulkan compute execution
+- **macOS SDK**: Metal framework (optional, for Apple Silicon GPU execution)
 
-## Quick start (five commands)
+## Quick Start
 
 ```bash
 git clone https://github.com/Nelsk/Grim.git
 cd Grim
-cargo build --release                # builds all 28 workspace member crates in one invocation
-cargo test --workspace               # runs the full workspace test suite
-# Optional: ROCm GPU tests (set GRIM_RUN_GPU_TESTS=1)
-GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --features rocm-aiter
+cargo build --release
+cargo test --workspace
+./target/release/grim serve
 ```
 
-## Workspace map — all 28 crates
+## Workspace Map
 
-| Crate | Purpose (one sentence) |
+| Crate | Scope |
 |---|---|
-| `grim-tensor` | Core tensor, DType, Shape, Device abstractions, and `BackendStorage`/`BackendDevice` trait surfaces |
-| `grim-tensor-graph` | Checkpoint-derived IR for operator fusion-pattern detection and subgraph optimization |
-| `grim-backend-cpu` | CPU reference compute backend using SIMD OxiBLAS GEMM, parallel loops, and scalar fallbacks |
-| `grim-backend-rocm` | AMD ROCm/HIP primary GPU target (hipRTC JIT, rocBLAS GEMM, HIP graph capture, matrix-core WMMA/MFMA) |
-| `grim-backend-cuda` | CUDA compatibility backend (cuBLAS GEMM and CUDA device memory allocation) |
-| `grim-backend-vulkan` | Platform-agnostic Vulkan compute backend with compiled SPIR-V GLSL shaders |
-| `grim-backend-metal` | Metal backend for Apple Silicon GPUs with MPS and Metal Shading Language compute pipelines |
-| `grim-nn` | Neural-network modules (`Linear`, `Embedding`, `RmsNorm`, `RoPE`, `SwiGLU`) and `WeightSource` loading |
-| `grim-core` | Base `Model` trait family, `Session`, KV cache interfaces, sampler pipelines, and core error types |
-| `grim-models/transformer` | Llama/Mistral/Qwen dense transformer architecture implementation (`LlamaModel`, `LlamaBlock`, `MtpLayer`) |
-| `grim-models/mamba` | Mamba / Mamba2 state-space model (SSM) stateful sequence architecture |
-| `grim-models/vision` | ViT / CLIP-style vision patch encoder architecture |
-| `grim-models/audio` | Whisper-style audio encoder-decoder architecture |
-| `grim-models/diffusion` | UNet + DDIM/Euler sampler image generation pipeline |
-| `grim-format` | GGUF reader/writer, safetensors bridge, GPTQ import/export, and Grim `.grim` metadata format |
-| `grim-quant` | Quantization routines (Q8_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, IQ*, FP4, NF4, FP8, MXFP) and GGN calibration |
-| `grim-memory` | Paged KV cache manager, block allocator, prefix-caching hash map, and SSM state memory pool |
-| `grim-scheduler` | Continuous-batching scheduler featuring latency-aware admission control and a three-queue architecture |
-| `grim-engine` | Core runtime orchestrator integrating scheduler, memory manager, and model registry into a unified `Engine` |
-| `grim-server` | HTTP/HTTPS serving layer (Axum) with OpenAI-compatible REST endpoints, Ollama support, and SSE streaming |
-| `grim-cli` | Subcommand CLI: `serve`, `run`, `bench`, `convert`, `train`, `dl`/`pull`, `spec`, `oxidizer`, `service`, `plugin`, `doctor`, `verify`, `cp`, `use`, `login`, `start`, `reap`, `accept`, `compat`, `stop`, `rm`, `ps`, `list`, `check`, `show` |
-| `grim-speculative` | Speculative decoding engines (DSpark drafter, Markov n-gram head, confidence head, zero-config MTP path) |
-| `grim-kvquant` | Runtime KV-cache compression with random-orthogonal rotation + Lloyd-Max quantization, plus KV-OMNI modalities |
-| `grim-plugin` | WebAssembly (WASM) plugin sandbox and dynamic library (`.so`/`.dylib`/`.dll`) loader |
-| `grim-kvtransport` | Multi-tiered KV cache transfer engine (GPU VRAM $\leftrightarrow$ Host System RAM $\leftrightarrow$ NVMe disk spill) |
-| `grim-disagg` | Distributed serving decoupling layer for separated Prefill and Decode GPU clusters |
-| `grim-autograd` | Scoped reverse-mode autograd engine for adapter training (LoRA, QLoRA, Vera, SoulEater, QGaLore, PISSA, OLORA) |
-| `grim-garage` | Local-first training dashboard web application (Axum backend, REST/SSE APIs, embedded web UI, and ROCm telemetry) |
+| [`grim-tensor`](crates/grim-tensor/README.md) | Core tensor structures, shape handling, data types, and device storage traits. |
+| [`grim-tensor-graph`](crates/grim-tensor-graph/README.md) | Computation graph representation and subgraph optimization passes. |
+| [`grim-backend-cpu`](crates/grim-backend-cpu/README.md) | CPU compute backend using SIMD vector primitives and scalar execution fallback. |
+| [`grim-backend-rocm`](crates/grim-backend-rocm/README.md) | AMD ROCm/HIP primary GPU backend with JIT kernel compilation and rocBLAS integration. |
+| [`grim-backend-cuda`](crates/grim-backend-cuda/README.md) | NVIDIA CUDA compatibility backend using cuBLAS and CUDA runtime APIs. |
+| [`grim-backend-vulkan`](crates/grim-backend-vulkan/README.md) | Vulkan compute backend executing SPIR-V compute pipelines. |
+| [`grim-backend-metal`](crates/grim-backend-metal/README.md) | Apple Metal compute backend using Metal Performance Shaders and MSL shaders. |
+| [`grim-nn`](crates/grim-nn/README.md) | Neural network layer building blocks and weight loader traits. |
+| [`grim-core`](crates/grim-core/README.md) | Core model traits, session execution, error definitions, and sampler interfaces. |
+| [`grim-models/transformer`](crates/grim-models/transformer/README.md) | Dense transformer model family implementations (LLaMA, Mistral, Qwen). |
+| [`grim-models/mamba`](crates/grim-models/mamba/README.md) | Mamba and Mamba2 state-space model architecture implementations. |
+| [`grim-models/vision`](crates/grim-models/vision/README.md) | Vision transformer and CLIP patch encoder architecture implementations. |
+| [`grim-models/audio`](crates/grim-models/audio/README.md) | Whisper audio encoder and decoder model architecture implementations. |
+| [`grim-models/diffusion`](crates/grim-models/diffusion/README.md) | UNet and DDIM/Euler diffusion sampling pipeline implementations. |
+| [`grim-format`](crates/grim-format/README.md) | GGUF reader and writer, safetensors parser, and native `.grim` metadata I/O. |
+| [`grim-quant`](crates/grim-quant/README.md) | Weight quantization schemes (Q8_0, Q4_K, Q5_K, NF4, FP8, MXFP) and calibration routines. |
+| [`grim-memory`](crates/grim-memory/README.md) | Paged KV cache allocator, prefix caching index, and SSM state pools. |
+| [`grim-scheduler`](crates/grim-scheduler/README.md) | Continuous batching scheduler with admission control and priority queues. |
+| [`grim-engine`](crates/grim-engine/README.md) | Top-level execution orchestrator linking model, memory, scheduler, and backends. |
+| [`grim-server`](crates/grim-server/README.md) | Axum HTTP server delivering OpenAI-compatible and Ollama-compatible REST APIs. |
+| [`grim-cli`](crates/grim-cli/README.md) | Command-line interface entry points for serving, inference, testing, and administration. |
+| [`grim-speculative`](crates/grim-speculative/README.md) | Speculative decoding execution algorithms including draft models and n-gram heads. |
+| [`grim-kvquant`](crates/grim-kvquant/README.md) | KV cache compression and quantization algorithms. |
+| [`grim-plugin`](crates/grim-plugin/README.md) | WASM plugin runtime sandbox and dynamic library loader. |
+| [`grim-kvtransport`](crates/grim-kvtransport/README.md) | Tiered KV cache transfer between GPU VRAM, system RAM, and NVMe storage. |
+| [`grim-disagg`](crates/grim-disagg/README.md) | Disaggregated serving split for separate prefill and decode execution clusters. |
+| [`grim-autograd`](crates/grim-autograd/README.md) | Reverse-mode automatic differentiation engine for parameter-efficient fine-tuning. |
+| [`grim-garage`](crates/grim-garage/README.md) | Embedded web dashboard backend for monitoring training and engine status. |
 
-## Non-crate top-level directories
+## Top-Level Directories
 
-| Directory/File | Contents |
+| Directory / File | Description |
 |---|---|
-| `old/doc.md` | Legacy documentation specification prompt; contains historical checklist and rules |
-| `Cargo.toml` (workspace root) | Workspace definition with 28 members, edition 2024, Rust 1.85 minimum, MIT OR Apache-2.0 license |
-| `.github/workflows/ci.yml` | CI configuration for build, test, clippy, and cargo-mutants |
-| `docs/` | Documentation (onboarding, architecture, CLI reference, configuration, data model, integrations, observability, troubleshooting, glossary, release, how-to guides) |
-| `crates/` | Crate source code, each with its own Cargo.toml |
+| `.agents/` | Agent configuration and local customization skills for project tooling. |
+| `.github/` | Continuous integration workflow definitions for build, test, and lint checking. |
+| `.opencode/`, `.poolside/`, `.rocm/`, `.zcode/`, `.zl/` | Hardware probe files and environment settings for ROCm and tool configurations. |
+| `crates/` | Workspace crate source implementations. |
+| `dist/` | Distribution installation scripts and systemd service configuration files. |
+| `docs/` | Comprehensive technical documentation and user guides. |
+| `models/` | Cache directory for downloaded model weights and GGUF checkpoints. |
+| `mutants.toml` | Mutation testing configuration file for `cargo-mutants`. |
+| `old/` | Historical specification files and legacy reference prompts. |
+| `plugins/` | Native and WebAssembly plugin artifacts. |
+| `third-party/` | Vendor-patched third-party dependency source crates. |
 
-## Links — other documentation
+## Documentation Links
 
-- [Onboarding guide](docs/onboarding.md) — step-by-step development setup
-- [Architecture overview](docs/architecture.md) — workspace dependency graph and design
-- [CLI reference](docs/cli.md) — command-line interface
-- [Configuration reference](docs/configuration.md) — env vars and config files
-- [Data model](docs/data-model.md) — schemas and serialization formats
-- [Integrations](docs/integrations.md) — external systems and protocols
-- [Observability](docs/observability.md) — metrics, logging, and telemetry
-- [Troubleshooting](docs/troubleshooting.md) — common issues and solutions
-- [Glossary](docs/glossary.md) — domain-specific terms
-- [Release & Deployment](docs/release.md) — build, versioning, and CI
-- [Per-crate READMEs](crates/) — crate-specific documentation
+- [Onboarding Guide](docs/onboarding.md)
+- [Architecture Overview](docs/architecture.md)
+- [CLI Reference](docs/cli.md)
+- [Configuration Reference](docs/configuration.md)
+- [Data Model Reference](docs/data-model.md)
+- [External Integrations](docs/integrations.md)
+- [Observability Reference](docs/observability.md)
+- [Troubleshooting Guide](docs/troubleshooting.md)
+- [Glossary](docs/glossary.md)
+- [Release and Deployment](docs/release.md)
+- [How-To: Install Grim](docs/howto/install-grim.md)
+- [How-To: Run Inference](docs/howto/run-inference.md)
+- [How-To: Download Model](docs/howto/download-model.md)
+- [How-To: Convert Model](docs/howto/convert-model.md)
+- [How-To: Train Adapter](docs/howto/train-adapter.md)

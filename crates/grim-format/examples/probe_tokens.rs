@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::process::ExitCode;
 
-use grim_format::tokenizer::GgufTokenizer;
 use grim_format::GgufValue;
+use grim_format::tokenizer::GgufTokenizer;
 
 fn main() -> ExitCode {
     let path = match std::env::args().nth(1) {
@@ -38,21 +38,27 @@ fn main() -> ExitCode {
         }
     };
 
-    println!("bos_token_id = {:?}  add_bos_token = {}  eos_token_id = {:?}",
-        tok.bos_token_id, tok.add_bos_token, tok.eos_token_id);
+    println!(
+        "bos_token_id = {:?}  add_bos_token = {}  eos_token_id = {:?}",
+        tok.bos_token_id, tok.add_bos_token, tok.eos_token_id
+    );
 
     println!("\n-- tokenizer.ggml.* metadata keys --");
-    let mut tkeys: Vec<&String> =
-        meta.keys().filter(|k| k.starts_with("tokenizer.ggml") && !k.contains("tokens")).collect();
+    let mut tkeys: Vec<&String> = meta
+        .keys()
+        .filter(|k| k.starts_with("tokenizer.ggml") && !k.contains("tokens"))
+        .collect();
     tkeys.sort();
     for k in tkeys {
         println!("{k} = {:?}", meta.get(k).unwrap());
     }
     if let Some(v) = meta.get("tokenizer.chat_template") {
         if let GgufValue::String(s) = v {
-            std::fs::write("/tmp/minicpm5_chat_template.jinja", s)
-                .expect("write template");
-            println!("\nwrote chat template to /tmp/minicpm5_chat_template.jinja ({} chars)", s.len());
+            std::fs::write("/tmp/minicpm5_chat_template.jinja", s).expect("write template");
+            println!(
+                "\nwrote chat template to /tmp/minicpm5_chat_template.jinja ({} chars)",
+                s.len()
+            );
         }
     }
     println!("\n-- general.* metadata keys --");

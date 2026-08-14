@@ -178,7 +178,7 @@ pub fn cmd_oxidizer_calibrate(
     model_path: &str,
     output_path: &str,
     calibration_dataset: Option<&str>,
-    progress: &mut Option<&mut dyn FnMut(&str, usize, usize)>,
+    progress: &mut Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)>,
 ) -> Result<ImportanceScores, String> {
     if let Some(ds) = calibration_dataset {
         eprintln!("[oxidizer] calibrate: using dataset '{ds}'");
@@ -263,7 +263,7 @@ pub fn cmd_oxidizer_convert(
     calibration_dataset: Option<String>,
     wave_override: Option<grim_format::WaveSize>,
     use_gpu: bool,
-    mut progress: Option<&mut dyn FnMut(&str, usize, usize)>,
+    mut progress: Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)>,
 ) -> Result<(), String> {
     let (_provider, names, sizes, mut grim_meta) = open_provider(model_path)?;
     let importance_scores = if Path::new(&format!("{}.importance.json", model_path)).exists() {
@@ -376,9 +376,27 @@ pub fn cmd_oxidizer_convert(
             None
         }
     });
-    if use_gpu {
-        let device = grim_backend_rocm::RocmDevice::try_new(0)
-            .map_err(|e| format!("GPU dequant requested but no ROCm device available: {e}"))?;
+    // GPU-first conversion path: try initializing ROCm device first, fallback to CPU
+    let gpu_device = if use_gpu {
+        match grim_backend_rocm::RocmDevice::try_new(0) {
+            Ok(device) => {
+                println!(
+                    "[Grim Convert] ROCm GPU detected (device 0) — using GPU-accelerated dequantization pipeline."
+                );
+                Some(device)
+            }
+            Err(e) => {
+                println!(
+                    "[Grim Convert] Notice: ROCm GPU initialization failed ({e}) — falling back to multi-threaded CPU conversion."
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(ref device) = gpu_device {
         grim_format::convert_to_grim_with_dequant(
             model_path,
             output_path,
@@ -388,12 +406,11 @@ pub fn cmd_oxidizer_convert(
             calibration_dataset.as_deref(),
             None,
             Some(full_bitwidths),
-            // Pass calibrated metadata through; convert_to_grim preserves quant_overrides, ext_entries, etc.
             Some(grim_meta),
             None,
             wave,
             progress,
-            &device,
+            device,
         )
         .map_err(|e| e.to_string())?;
     } else {
@@ -406,7 +423,6 @@ pub fn cmd_oxidizer_convert(
             calibration_dataset.as_deref(),
             None,
             Some(full_bitwidths),
-            // Pass calibrated metadata through; convert_to_grim preserves quant_overrides, ext_entries, etc.
             Some(grim_meta),
             None,
             wave,
@@ -608,7 +624,7 @@ pub fn cmd_oxidizer_raven(
     output_path: &str,
     target_bpw: f32,
     calibration_dataset: Option<&str>,
-    mut progress: Option<&mut dyn FnMut(&str, usize, usize)>,
+    mut progress: Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)>,
 ) -> Result<(), String> {
     let (provider, names, _sizes, mut grim_meta) = open_provider(model_path)?;
     let importance_scores = if Path::new(&format!("{}.importance.json", model_path)).exists() {

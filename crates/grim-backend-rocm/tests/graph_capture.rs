@@ -30,7 +30,6 @@ type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<R = ()> = Result<R, TestError>;
 
 const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
-const CAPTURE_ENV: &str = "GRIM_CAPTURE_GRAPH";
 
 /// Build a device, bailing the test (Ok) if no GPU is present.
 fn gpu_device() -> Option<RocmDevice> {
@@ -83,7 +82,7 @@ fn run_compute(
         Box<dyn grim_tensor::BackendStorage>,
     ),
     m: usize,
-    k: usize,
+    _k: usize,
     n: usize,
 ) -> TestResult<Box<dyn grim_tensor::BackendStorage>> {
     let out_s = Shape::from_slice(&[m, n]);

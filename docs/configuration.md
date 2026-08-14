@@ -23,6 +23,7 @@ This document describes all environment variables and configuration options used
 | `GRIM_GPU_TARGET` | string | `gfx900` | `grim-backend-rocm` | Target GPU GCN architecture (e.g., `gfx1100`, `gfx1201`) |
 | `GRIM_RUN_GPU_TESTS` | flag | unset | `grim-backend-rocm` | Enable GPU tests when set |
 | `GRIM_ROCM_ORDINAL_OVERRIDE` | string | unset | `grim-backend-rocm` | Override GPU ordinal |
+| `GRIM_CUDA_ORDINAL_OVERRIDE` | string | unset | `grim-backend-cuda` | Override CUDA GPU ordinal |
 | `GRIM_ROCM_DEVICE_NAME` | string | unset | `grim-backend-rocm` | Device name filter |
 | `GRIM_ROCM_GCN_NAME` | string | unset | `grim-backend-rocm` | GCN name filter |
 | `GRIM_CAPTURE_GRAPH` | flag | unset | `grim-backend-rocm` | Enable hip graph capture |
@@ -45,6 +46,7 @@ This document describes all environment variables and configuration options used
 |---|---|---|---|---|
 | `GRIM_HOST` | string | `127.0.0.1` | `grim-core` | Server bind host address |
 | `GRIM_PORT` | number | `11434` | `grim-core` | Server bind port |
+| `GRIM_ALLOW_PUBLIC_METRICS` | `1`/`true`/`yes` | unset | `grim-server` | Required opt-in before binding the server/metrics listener to a non-loopback address |
 | `GRIM_CONTEXT` | number | unset | `grim-core` | Override model context window (KV cache length) — takes precedence over GGUF `max_position_embeddings` |
 | `GRIM_GPUS` | string | unset (all) | `grim-core`, `grim-engine` | Comma-separated ordinal list of GPUs to use (e.g., `0,1`) |
 | `GRIM_TP_SIZE` | number | `0` (single-device) | `grim-core`, `grim-engine`, `grim-nn` | Tensor-parallel world size. >1 requires matching GPUs and RCCL/NCCL |

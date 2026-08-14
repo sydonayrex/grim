@@ -29,6 +29,7 @@ oversights — they are per-request or config concerns:
 | `--disagg-role` | | `colocated` | No |
 | `--prefill-addr` | | `""` | No (decode role only) |
 | `--decode-addr` | | `""` | No (prefill role only) |
+| `--allow-public` | | false | No |
 
 Typical flow: `grim pull <model>` → `grim serve` → `POST /v1/chat/completions`
 with `{"model": "<name-from-grim-list>", ...}`.
@@ -51,6 +52,7 @@ One-shot inference or HTTP serving for a model.
 | `--top_k` | - | `40` | No |
 | `--max-tokens` | - | `256` | No |
 | `--seed` | - | `0` (random) | No |
+| `--device` | - | None | No |
 | `--repeat-penalty` | - | `1.1` | No |
 
 ## `grim bench`
@@ -85,9 +87,10 @@ Stop a running model (unload from memory).
 
 Delete a model from local cache.
 
-| Argument | Required |
+| Argument/Flag | Required |
 |---|---|
 | `model` | Yes |
+| `--force` (`-f`) | No |
 
 ## `grim check`
 

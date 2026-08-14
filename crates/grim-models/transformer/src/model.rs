@@ -103,7 +103,6 @@ impl Llama {
         cfg: LlamaConfig,
         tp: TensorParallelConfig,
     ) -> Result<Self> {
-        let num_layers = cfg.num_layers;
         let tok_embeddings =
             Embedding::load(&ws.pp("tok_embeddings"), cfg.vocab_size, cfg.hidden_size)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
@@ -458,7 +457,11 @@ impl CausalLm for Llama {
         let caches = session
             .model_state_mut()
             .and_then(|s| s.downcast_mut::<Vec<Option<crate::block::LlamaLayerCache>>>())
-            .expect("Llama::forward: session.model_state must be Vec<Option<LlamaLayerCache>>");
+            .ok_or_else(|| {
+                grim_core::error::Error::Session(
+                    "Llama::forward: session.model_state has wrong type for this operation".into(),
+                )
+            })?;
 
         let (logits, hidden_state, _kv_pairs) = {
             let _t0 = std::time::Instant::now();
@@ -521,7 +524,10 @@ mod tests {
         );
         // round-half-to-even on .5 boundary: round(0.5*33) = round(16.5) = 16 or 17
         let r = base_cfg(33, 0.5).rotary_dim();
-        assert!(r == 16 || r == 17, "midpoint rounding must be near 16/17, got {r}");
+        assert!(
+            r == 16 || r == 17,
+            "midpoint rounding must be near 16/17, got {r}"
+        );
         // Clamp: prf > 1.0 cannot exceed head_dim.
         assert_eq!(base_cfg(16, 2.0).rotary_dim(), 16, "clamped to head_dim");
     }

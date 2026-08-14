@@ -1,7 +1,7 @@
 //! Compatibility loader for `zai-org/GLM-5.2` (HuggingFace `model_type = "glm5_2"`).
 
 use grim_core::error::{Error, Result};
-use grim_core::model::{AdapterHandle, CausalLm, Model, ModelConfig, ModalityHint};
+use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_tensor::{ArithType, Device, Tensor};
 

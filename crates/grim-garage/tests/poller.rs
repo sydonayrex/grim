@@ -203,7 +203,7 @@ async fn http_post(url: &str, body: &str) -> Result<RawResponse, String> {
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| "no CRLF CRLF".to_string())?;
-    let (head, body) = raw.split_at(head_end + 4);
+    let (head, _body) = raw.split_at(head_end + 4);
     let head_str = String::from_utf8_lossy(head).into_owned();
     let status = head_str
         .lines()
@@ -211,16 +211,12 @@ async fn http_post(url: &str, body: &str) -> Result<RawResponse, String> {
         .and_then(|line| line.split_ascii_whitespace().nth(1))
         .and_then(|s| s.parse::<u16>().ok())
         .ok_or_else(|| "no status".to_string())?;
-    Ok(RawResponse {
-        status,
-        body: body.to_vec(),
-    })
+    Ok(RawResponse { status })
 }
 
 #[derive(Debug)]
 struct RawResponse {
     status: u16,
-    body: Vec<u8>,
 }
 
 fn url_host(url: &str) -> &str {

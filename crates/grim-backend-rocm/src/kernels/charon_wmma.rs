@@ -1,8 +1,8 @@
 //! Charon WMMA / tensor-core grouped forward (WI-Charon-2).
 //!
 //! The v2 plan confirms `charon.rs`'s existing kernels are scalar per-thread
-//! FMA loops (verified by kernel-body read), not tensor-core tiled GEMMs —
-//! the single biggest structural gap vs vLLM's `fused_moe_kernel`. This file
+//! FMA loops (verified by kernel-body read), not tensor-core tiled GEMMs.
+//! This file
 //! adds a **grouped** (token-sorted) WMMA variant that reuses the identical
 //! `grim_moe_fused_grouped` host/sort contract and in-register SiLU math,
 //! replacing the gate/up/down contractions with 16×16 rocWMMA tiles.
@@ -226,9 +226,7 @@ mod tests {
     fn wmma_forward_kernel_is_jit_discoverable_both_paths() {
         // The symbol must resolve on WMMA arches (rocWMMA branch) AND on the
         // scalar fallback branch, so the JIT loader never 500s on gfx1036.
-        assert!(KERNEL_SOURCE.contains(
-            "extern \"C\" __global__ void grim_moe_fused_grouped_wmma"
-        ));
+        assert!(KERNEL_SOURCE.contains("extern \"C\" __global__ void grim_moe_fused_grouped_wmma"));
         // rocWMMA include is gated, not unconditional (would fail on RDNA2).
         assert!(KERNEL_SOURCE.contains("#include <rocwmma/rocwmma.hpp>"));
         assert!(KERNEL_SOURCE.contains("mma_sync"));
@@ -240,11 +238,7 @@ mod tests {
     fn wmma_forward_mirrors_grouped_contract() {
         // Same sorted routing arrays as grim_moe_fused_grouped so the host sort
         // feeds both forward paths.
-        for sym in [
-            "sorted_token_ids",
-            "sorted_expert_ids",
-            "sorted_weights",
-        ] {
+        for sym in ["sorted_token_ids", "sorted_expert_ids", "sorted_weights"] {
             assert!(KERNEL_SOURCE.contains(sym), "missing sorted array: {sym}");
         }
         // Must respect the router scaling factor exactly like the scalar kernel.

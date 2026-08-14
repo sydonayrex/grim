@@ -252,7 +252,7 @@ impl GrimTensorEntry {
         Ok(())
     }
 
-    pub fn read<R: Read>(r: &mut R, has_kv: bool) -> Result<Self> {
+    pub fn read<R: Read>(r: &mut R) -> Result<Self> {
         let mut name_len_bytes = [0u8; 2];
         r.read_exact(&mut name_len_bytes)
             .map_err(|e| Error::Backend(format!("Tensor entry read failed: {e}")))?;
@@ -300,18 +300,29 @@ impl GrimTensorEntry {
             .map_err(|e| Error::Backend(format!("Tensor entry read failed: {e}")))?;
         let outlier_offset = u64::from_le_bytes(o_offset_bytes);
 
-        let mut kv_present = 0u8;
-        let mut kv_rotated = 0u8;
-        let mut kv_bits_k = 0u8;
-        let mut kv_bits_v = 0u8;
-        let mut kv_head_bits_table_offset = 0u64;
-        let mut kv_eviction_map_offset = 0u64;
-        let mut kv_eviction_map_size = 0u64;
-        let mut kv_sink_fp16 = 0u8;
-        let mut kv_compressed_offset = 0u64;
-        let mut kv_compressed_size = 0u64;
+        // FMT-15 fix (cont.): the KV fields are now always read below, so the
+        // initializers are dead — declare without an initializer to avoid
+        // "value assigned is never read" warnings (the workspace denies
+        // warnings). Each is assigned exactly once in the read block.
+        let kv_present: u8;
+        let kv_rotated: u8;
+        let kv_bits_k: u8;
+        let kv_bits_v: u8;
+        let kv_head_bits_table_offset: u64;
+        let kv_eviction_map_offset: u64;
+        let kv_eviction_map_size: u64;
+        let kv_sink_fp16: u8;
+        let kv_compressed_offset: u64;
+        let kv_compressed_size: u64;
 
-        if has_kv {
+        // FMT-15 fix: the writer (`GrimTensorEntry::write`) and the byte-size
+        // accounting (`registry_entry_size`, used to lay out payload offsets)
+        // ALWAYS emit/charge the 45-byte KV field block per entry, so the
+        // reader must always consume it too. The previous `has_kv`-gated read
+        // desynced the stream whenever a file was read with `has_kv == false`
+        // (e.g. `has_kv_registry` unset), silently misaligning every subsequent
+        // tensor's payload. We now unconditionally read the KV fields.
+        {
             let mut buf_u8 = [0u8; 1];
             r.read_exact(&mut buf_u8)
                 .map_err(|e| Error::Backend(format!("Tensor entry read failed: {e}")))?;
@@ -482,7 +493,9 @@ pub fn read_outliers_with_encoding<R: Read + Seek>(
     }
     // DeltaVarint path: read the entire varint stream from outlier_offset.
     // Bound reading for DeltaVarint: each outlier consumes at most ~10 varint bytes
-    let max_read_len = (entry.outlier_count as usize).saturating_mul(10).min(100_000_000);
+    let max_read_len = (entry.outlier_count as usize)
+        .saturating_mul(10)
+        .min(100_000_000);
     reader.seek(SeekFrom::Start(entry.outlier_offset))?;
     let mut buf = vec![0u8; max_read_len];
     let n = reader.read(&mut buf)?;
@@ -1194,10 +1207,9 @@ impl GrimFile {
                 header.num_tensors
             )));
         }
-        let has_kv = metadata.has_kv_registry.unwrap_or(false);
         let mut tensors = Vec::with_capacity((header.num_tensors as usize).min(10_000));
         for _ in 0..header.num_tensors {
-            tensors.push(GrimTensorEntry::read(reader, has_kv)?);
+            tensors.push(GrimTensorEntry::read(reader)?);
         }
         let mut tensors_by_name = HashMap::with_capacity(tensors.len());
         for (i, t) in tensors.iter().enumerate() {
@@ -1326,7 +1338,7 @@ mod tests {
         entry.write(&mut buf).unwrap();
 
         let mut reader = &buf[..];
-        let decoded = GrimTensorEntry::read(&mut reader, true).unwrap();
+        let decoded = GrimTensorEntry::read(&mut reader).unwrap();
         assert_eq!(entry, decoded);
     }
 

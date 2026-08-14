@@ -15,13 +15,16 @@ fn device_or_skip() -> Option<VulkanDevice> {
 
 #[test]
 fn test_vulkan_quantize_q8_0_and_fp8() {
-    let dev = match device_or_skip() {
+    let mut dev = match device_or_skip() {
         Some(d) => d,
         None => {
             eprintln!("skipping: no Vulkan device");
             return;
         }
     };
+    // This test validates the FP8 quantize shader, so opt the device into FP8 support
+    // (probe_default reports supports_fp8=false pending real device probing).
+    dev.caps.supports_fp8 = true;
 
     let shape = Shape::new(vec![32]);
     let x_data: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) / 4.0).collect();
@@ -90,13 +93,15 @@ fn test_vulkan_quantize_q8_0_parity() {
 
 #[test]
 fn test_vulkan_quantize_fp8_parity() {
-    let dev = match device_or_skip() {
+    let mut dev = match device_or_skip() {
         Some(d) => d,
         None => {
             eprintln!("skipping: no Vulkan device");
             return;
         }
     };
+    // This test validates the FP8 quantize shader, so opt the device into FP8 support.
+    dev.caps.supports_fp8 = true;
 
     let n = 64;
     let input: Vec<f32> = (0..n)
