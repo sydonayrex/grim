@@ -407,8 +407,8 @@ mod tests {
     /// the Decode/Prefill arms — proving the op-identity tag propagates through dispatch.
     #[test]
     fn tlolog_tile_via_lookup_gemm_config_for_shape() {
-        use crate::device::gemm_tuning::lookup_gemm_config_for_shape;
         use crate::WavefrontSize;
+        use crate::device::gemm_tuning::lookup_gemm_config_for_shape;
 
         // lm_head: M=1 (decode), N=vocab=32000, K=hidden=4096.
         let lm = lookup_gemm_config_for_shape(

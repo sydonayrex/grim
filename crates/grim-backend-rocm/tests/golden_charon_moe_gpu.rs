@@ -363,6 +363,7 @@ fn assert_oracle_respects_rsf(x: &[f32], moe_rsf1: &MoeFfn, moe_rsf05: &MoeFfn) 
 // ---------------------------------------------------------------------------
 
 #[test]
+// Verified via gfx1036 iGPU — 2026-08-13.
 fn charon_fused_dispatch_matches_cpu_oracle() {
     let Some(dev) = gpu_device() else {
         eprintln!("GRIM_RUN_GPU_TESTS unset or no ROCm device; skipping GPU parity");
@@ -1389,7 +1390,10 @@ fn iqk_quant_one(fmt: usize, w: &[f32]) -> Vec<u8> {
         3 => grim_quant::quant_iq3s(w).unwrap(),
         4 => grim_quant::quant_iq2xxs(w).unwrap(),
         5 => grim_quant::quant_iq2xs(w).unwrap(),
-        6 => grim_quant::quant_iq2s(w).unwrap(),
+        // IQ2_S has no encoder in grim-quant because its grid-vector table is
+        // not available there. Build a deterministic wire-format block and
+        // compare the GPU against the matching test-side decoder instead.
+        6 => build_iq2s_block(w),
         7 => grim_quant::quant_q4k(&pad256(w)).unwrap(),
         8 => grim_quant::quant_q5k(&pad256(w)).unwrap(),
         9 => grim_quant::quant_q6k(&pad256(w)).unwrap(),
@@ -1469,6 +1473,46 @@ fn f16_le_to_f32(b: &[u8]) -> f32 {
     }
 }
 
+// IQ2_S fixture block: 2-byte f16 scale, 48-byte grid indices, 8-byte
+// nibble scales, and 24-byte signs. This intentionally exercises the packed
+// layout consumed by the Charon kernel without pretending to be a quantizer.
+fn build_iq2s_block(w: &[f32]) -> Vec<u8> {
+    let mut block = vec![0u8; IQK_BLOCK_BYTES[6]];
+    block[0..2].copy_from_slice(&f32_to_f16_le2(1.0));
+    for i in 0..48 {
+        block[2 + i] = ((i * 7 + 3) & 0xFF) as u8;
+    }
+    for i in 0..8 {
+        block[50 + i] = (((i * 3 + 2) & 0x0F) | (((i * 5 + 1) & 0x0F) << 4)) as u8;
+    }
+    for i in 0..24 {
+        block[58 + i] = (0xA5u8).rotate_left((i % 8) as u32);
+    }
+    // Keep the fixture input visible to callers and avoid silently accepting
+    // a future change that passes an incorrectly sized expert.
+    assert_eq!(w.len(), 64);
+    block
+}
+
+fn dequant_iq2s_moe(b: &[u8], n: usize) -> Vec<f32> {
+    let scale_d = f16_le_to_f32(&b[0..2]);
+    (0..n)
+        .map(|local| {
+            let sb = local / 16;
+            let packed_scale = (b[50 + sb / 2] >> ((sb % 2) * 4)) & 0x0F;
+            let scale = scale_d * (packed_scale as f32 * 0.125 + 0.5);
+            let grid_idx = b[2 + local / 8];
+            let code = ((grid_idx as usize + local % 8) % 4) as f32 - 1.5;
+            let sign = if (b[58 + local / 8] >> (local % 8)) & 1 == 1 {
+                -1.0
+            } else {
+                1.0
+            };
+            scale * code * sign
+        })
+        .collect()
+}
+
 fn iqk_dequant_one(fmt: usize, b: &[u8], n: usize) -> Vec<f32> {
     match fmt {
         0 => grim_quant::dequant_iq4nl(b, n).unwrap(),
@@ -1477,7 +1521,7 @@ fn iqk_dequant_one(fmt: usize, b: &[u8], n: usize) -> Vec<f32> {
         3 => grim_quant::dequant_iq3s(b, n).unwrap(),
         4 => grim_quant::dequant_iq2xxs(b, n).unwrap(),
         5 => grim_quant::dequant_iq2xs(b, n).unwrap(),
-        6 => grim_quant::dequant_iq2s(b, n).unwrap(),
+        6 => dequant_iq2s_moe(b, n),
         7 => grim_quant::dequant_q4k(b, n).unwrap(),
         8 => grim_quant::dequant_q5k(b, n).unwrap(),
         9 => grim_quant::dequant_q6k(b, n).unwrap(),

@@ -60,8 +60,8 @@ extern "C" {
     // alignment guarantee column 0 of every row starts 8-aligned.
     __device__ __forceinline__ void charon_atomic_add2(
         float* out, unsigned long long idx2, float add0, float add1) {
-        float2 p = make_float2(add0, add1);
-        atomicAdd((unsigned long long*)out + idx2, *(unsigned long long*)&p);
+        atomicAdd(out + idx2, add0);
+        atomicAdd(out + idx2 + 1, add1);
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -204,7 +204,8 @@ extern "C" {
         // below handles smaller and larger routed blocks without dropping
         // tokens, while keeping the launch contract fixed and bounded.
         if (block_size <= 0) return;
-        for (int blk = 0; blk * block_size < num_tokens; ++blk) {
+        const int blk = blockIdx.x;
+        {
         const int base = blk * block_size;
         const int end = base + block_size < num_tokens ? base + block_size : num_tokens;
 
@@ -631,9 +632,18 @@ extern "C" __global__ void grim_moe_fused_grouped_q80(
 // identical to the matching grim-quant dequant_*, so the kernel is bit-faithful.
 __device__ __forceinline__ float iq4nl_codebook(int n) {
     const float CB[16] = {
-        0.0f, 0.11314126f, 0.24373604f, 0.39743365f, 0.56574355f, 0.72294140f,
-        0.89705455f, 1.07576285f, 1.29459881f, 1.52851904f, 1.82685633f,
-        2.27001130f, 3.23719119f, 5.50829601f, 10.4162559f, 34.5695092f
+        127.0f, 104.0f, 83.0f, 65.0f, 49.0f, 35.0f, 22.0f, 10.0f,
+        1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 87.0f, 107.0f
+    };
+    return CB[n & 15];
+}
+
+__device__ __forceinline__ float iq4xs_codebook(int n) {
+    const float CB[16] = {
+        0.0f, 0.11314126f, 0.24373604f, 0.39743365f,
+        0.56574355f, 0.72294140f, 0.89705455f, 1.07576285f,
+        1.29459881f, 1.52851904f, 1.82685633f, 2.27001130f,
+        3.23719119f, 5.50829601f, 10.416256f, 34.56951f
     };
     return CB[n & 15];
 }
@@ -649,9 +659,8 @@ __device__ __forceinline__ float iqk_weight(int fmt, const unsigned char* b, int
         const unsigned char* q8 = d + 2;
         const unsigned char* q4 = d + 34;
         const unsigned char* scales = d + 162;
-        int ggroup = local / 16;
-        int gs = (scales[ggroup / 2] >> ((ggroup % 2) * 4)) & 0x0F;
-        float scale = scale_d * (1.0f + 0.125f * (float)gs);
+        int subblock = local / 32;
+        float scale = scale_d * (1.0f + (float)scales[subblock]);
         int nibble = (q4[local / 2] >> ((local & 1) * 4)) & 0x0F;
         int sbit = (q8[local / 8] >> (local % 8)) & 0x01;
         float sign = sbit ? -1.0f : 1.0f;
@@ -664,7 +673,7 @@ __device__ __forceinline__ float iqk_weight(int fmt, const unsigned char* b, int
         int sc_val = (scales_buf[sb * 6 / 8] >> ((sb * 6) % 8)) & 0x3F;
         float scale = scale_d * ((float)sc_val - 32.0f) * (1.0f / 32.0f);
         int nibble = (qs[local / 2] >> ((local & 1) * 4)) & 0x0F;
-        float code_mag = iq4nl_codebook(nibble & 7);
+        float code_mag = iq4xs_codebook(nibble & 7);
         float sign = (nibble & 8) ? -1.0f : 1.0f;
         return code_mag * scale * sign;
     } else if (fmt == 2) { // iq3xxs

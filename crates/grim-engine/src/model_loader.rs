@@ -15,11 +15,11 @@ use grim_models_mamba::{
     Rwkv6Config, Rwkv7Config, RwkvConfig,
 };
 use grim_models_transformer::{
-    Bloom, BloomConfig, ChameleonConfig, CommandRConfig, DeepSeek, DeepSeekConfig, DeltaNetBase, DeltaNetBaseConfig, Falcon,
-    FalconConfig, FalconH1Config, FalconH1Model, Gemma, GemmaConfig, Gpt2, Gpt2Config, Laguna,
-    LagunaConfig, Lfm2, Lfm2Config, Llama, LlamaConfig, MiniCpmConfig, MiniCpmModel,
-    Phi2, PhiConfig, Qwen, Qwen3Moe, Qwen3MoeConfig, Qwen35Moe, Qwen35MoeConfig, QwenConfig,
-    SmolLm2, SmolLm2Config, SolarOpen2, SolarOpen2Config, T5, T5Config,
+    Bloom, BloomConfig, ChameleonConfig, CommandRConfig, DeepSeek, DeepSeekConfig, DeltaNetBase,
+    DeltaNetBaseConfig, Falcon, FalconConfig, FalconH1Config, FalconH1Model, Gemma, GemmaConfig,
+    Gpt2, Gpt2Config, Laguna, LagunaConfig, Lfm2, Lfm2Config, Llama, LlamaConfig, MiniCpmConfig,
+    MiniCpmModel, Phi2, PhiConfig, Qwen, Qwen3Moe, Qwen3MoeConfig, Qwen35Moe, Qwen35MoeConfig,
+    QwenConfig, SmolLm2, SmolLm2Config, SolarOpen2, SolarOpen2Config, T5, T5Config,
 };
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::{TensorParallelConfig, WeightSource};

@@ -211,9 +211,7 @@ async fn http_post(url: &str, body: &str) -> Result<RawResponse, String> {
         .and_then(|line| line.split_ascii_whitespace().nth(1))
         .and_then(|s| s.parse::<u16>().ok())
         .ok_or_else(|| "no status".to_string())?;
-    Ok(RawResponse {
-        status,
-    })
+    Ok(RawResponse { status })
 }
 
 #[derive(Debug)]
