@@ -1,75 +1,48 @@
 # grim-models-vision
 
-Vision encoders for Grim — ViT/CLIP-style patch embedding + transformer encoder, plus BERT-style text encoders. Implements `Encoder` and `CausalLm` traits from `grim-core`.
-
 ## Purpose
-
-Provides vision model implementations: `Vit` (Vision Transformer) for image-to-embedding encoding, and `Bert` for text encoding. Also provides config types for ModernBERT, NomicBert, and T5Encoder.
+Provides vision encoder implementations (e.g., ViT, CLIP patch embedding, and BERT-style models) for the Grim ecosystem. It implements the `Encoder` trait.
 
 ## Boundaries
-
-- Does **not** handle image file I/O — callers provide `Tensor` inputs.
-- Does **not** perform image generation — only feature extraction / encoding.
-- Does **not** manage KV cache — vision encoders are single-pass.
+- Converts images into sequence embeddings (patch embeddings).
+- Handles purely encoder transformer blocks.
+- Does not contain decoder heads or language model generation capabilities.
+- Serves as a dependency for multimodal transformers in `grim-models-transformer`.
 
 ## Dependency Graph
-
 ```mermaid
-graph LR
-    A[grim-models-vision] --> B[grim-tensor]
-    A --> C[grim-nn]
-    A --> D[grim-core]
-    A --> E[grim-backend-cpu]
-
-    style A fill:#e0f2f1
+graph TD
+    T[grim-tensor] --> V[grim-models-vision]
+    N[grim-nn] --> V
+    C[grim-core] --> V
+    CPU[grim-backend-cpu] --> V
+    E[thiserror] --> V
+    SJ[serde_json] --> V
+    
+    V --> TR[grim-models-transformer]
+    
+    classDef focus fill:#f9f,stroke:#333,stroke-width:4px;
+    class V focus;
+    %% min 480px
+    style V padding:20px
 ```
 
-## Public API
+## Public API Overview
+- **Model Structs:** `Vit`, `Bert`, `GlimmerVision`.
+- **Configurations:** `VitConfig`, `BertConfig`, `GlimmerVisionConfig`.
 
+## Usage Example
 ```rust
-pub use vit::{Vit, VitConfig, VitBlock};
-pub use bert::{Bert, BertConfig};
-pub use configs::{ModernBertConfig, NomicBertConfig, T5EncoderConfig};
-
-pub struct VitConfig {
-    pub image_size: usize,
-    pub patch_size: usize,
-    pub in_channels: usize,
-    pub hidden_size: usize,
-    pub num_heads: usize,
-    pub num_layers: usize,
-    pub intermediate_size: usize,
-    pub rms_norm_eps: f32,
-}
-
-pub struct Vit {
-    pub cfg: VitConfig,
-    pub device: grim_tensor::Device,
-    pub patch_proj_w: Vec<f32>,
-    pub patch_proj_b: Vec<f32>,
-    pub cls_token: Vec<f32>,
-    pub pos_embed: Vec<f32>,
-    blocks: Vec<VitBlock>,
-    pub ln: grim_nn::RmsNorm,
-    pub features: usize,
-}
-
-impl Vit {
-    pub fn random(device: grim_tensor::Device, cfg: VitConfig) -> Self;
-    pub fn new(device: grim_tensor::Device, cfg: VitConfig,
-               rng: &mut grim_core::rng::SimpleRng) -> Self;
-}
-
-impl grim_core::Encoder for Vit {
-    fn encode(&self, input: &grim_tensor::Tensor) -> grim_core::error::Result<grim_tensor::Tensor>;
-}
+use grim_models_vision::{Vit, VitConfig};
+// Encode images into embeddings for downstream multimodal components.
 ```
 
-## Feature Flags
-
-This crate has no feature flags.
+## Use Cases
+- Pre-processing and encoding visual tokens for consumption by large multimodal models (e.g., Llama 3 Vision variants).
+- Running standalone Vision Transformers for image representation.
 
 ## Edge Cases, Limitations, and Quirks
+- The inputs must be correctly normalized and resized prior to being passed into the Vision encoder.
 
-- `Vit::random` creates a randomly-initialized model suitable for unit tests — not for real inference.
-- `blocks` field on `Vit` is private; access is only through `encode`.
+## Build Flags, Feature Flags, and Environment Variables
+- No specific crate features defined beyond `default = []`.

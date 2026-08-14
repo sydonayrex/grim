@@ -1,93 +1,44 @@
 # grim-models-diffusion
 
-Diffusion model (UNet + DDIM/Euler noise schedulers) for Grim — implements `DiffusionModel` from `grim-core`.
-
 ## Purpose
-
-Provides `Unet2D` for latent diffusion denoising and `DdimScheduler` / `EulerScheduler` for the step loop. The noise scheduler owns a sequence of denoising steps; each step takes predicted noise from the model and produces the next latent state.
+Implements UNet/DiT diffusion models and noise sampler schedulers (e.g., DDIM, Euler) for the Grim ecosystem. Fulfills the `DiffusionModel` trait defined in `grim-core`.
 
 ## Boundaries
-
-- Does **not** perform image generation end-to-end — only denoising of latent tensors.
-- Does **not** implement VAE encoding/decoding — callers provide latents.
-- Does **not** handle model loading — see `grim-format`.
+- Handles spatial and temporal UNet architectures for iterative denoising.
+- Implements mathematical schedulers (Euler, DDIM) for step-wise noise reduction.
+- Does not handle text conditioning encoders (like CLIP) or VAE decoding directly within this crate.
 
 ## Dependency Graph
-
 ```mermaid
-graph LR
-    A[grim-models-diffusion] --> B[grim-tensor]
-    A --> C[grim-nn]
-    A --> D[grim-core]
-    A --> E[grim-backend-cpu]
-
-    style A fill:#e1f5ea
+graph TD
+    T[grim-tensor] --> D[grim-models-diffusion]
+    C[grim-core] --> D
+    CPU[grim-backend-cpu] --> D
+    E[thiserror] --> D
+    
+    classDef focus fill:#f9f,stroke:#333,stroke-width:4px;
+    class D focus;
+    %% min 480px
+    style D padding:20px
 ```
 
-## Public API
-
-```rust
-pub use unet::{Unet2D, UnetConfig};
-pub use scheduler::{DdimScheduler, EulerScheduler};
-
-pub struct UnetConfig {
-    pub in_channels: usize,
-    pub out_channels: usize,
-    pub hidden: usize,
-    pub num_downsample: usize,
-    pub rms_norm_eps: f32,
-}
-
-pub struct Unet2D {
-    pub cfg: UnetConfig,
-    pub device: grim_tensor::Device,
-    // down/mid/up blocks
-}
-
-impl Unet2D {
-    pub fn new(device: grim_tensor::Device, cfg: UnetConfig) -> Self;
-}
-
-impl grim_core::model::DiffusionModel for Unet2D {
-    fn load(&mut self, weights: &mut impl TensorProvider) -> Result<()>;
-}
-```
-
-```rust
-// From grim-core::model
-pub trait NoiseScheduler: Send + Sync {
-    fn step(&self, model_output: &Tensor, t: u32, x: &Tensor) -> Result<Tensor>;
-}
-
-pub struct DdimScheduler { /* fields */ }
-impl DdimScheduler {
-    pub fn new(timesteps: Vec<u32>, alphas_cumprod: Vec<f32>) -> Self;
-    pub fn linear(num_steps: usize, beta_start: f32, beta_end: f32) -> Self;
-}
-
-pub struct EulerScheduler { /* fields */ }
-impl EulerScheduler {
-    pub fn from_betas(betas: Vec<f32>) -> Self;
-}
-```
-
-## Feature Flags
-
-This crate has no feature flags.
+## Public API Overview
+- **Schedulers:** `DdimScheduler`, `EulerScheduler`.
+- **Models:** `Unet2D`.
+- **Configurations:** `UnetConfig`.
 
 ## Usage Example
-
 ```rust
-use grim_models_diffusion::{Unet2D, UnetConfig, DdimScheduler};
-use grim_tensor::Device;
-
-let cfg = UnetConfig {
-    in_channels: 4,
-    out_channels: 4,
-    hidden: 128,
-    num_downsample: 3,
-    rms_norm_eps: 1e-5,
-};
-let model = Unet2D::new(Device::Cpu, cfg);
-let scheduler = DdimScheduler::linear(50, 0.0001, 0.02);
+use grim_models_diffusion::{Unet2D, UnetConfig, EulerScheduler};
+// Combine Unet2D and a Scheduler to denoise a latent tensor over T timesteps.
 ```
+
+## Use Cases
+- Image generation models requiring a UNet backbone.
+- Running discrete sampling algorithms to extract clear signals from noise.
+
+## Edge Cases, Limitations, and Quirks
+- Timestep embeddings and scheduler variables must match the precise continuous or discrete formulation of the target checkpoint (e.g., Stable Diffusion 1.5 vs SDXL).
+
+## Build Flags, Feature Flags, and Environment Variables
+- No specific crate features defined beyond `default = []`.

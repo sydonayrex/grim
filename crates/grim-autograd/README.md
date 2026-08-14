@@ -1,73 +1,60 @@
 # grim-autograd
 
-Scoped reverse-mode autodiff for adapter-only backward pass. Implements Unsloth-style QLoRA training: frozen base weights stay quantized, only LoRA adapter parameters require gradients, dequantization happens fused and just-in-time per op. WI-T1.
-
 ## Purpose
-
-Provides a minimal, correctness-first reverse-mode tape recorder over the trainable path (adapter parameters + injection points). Only records `MatMul`, `Add`, and `Scale` ops — the exact op set QLoRA training exercises. Includes optimizers (AdamW, Adafactor, Lion, Muon), LoRA injection (`LoRAInjectionPoint`, `loftq_initialize`, `pissa_initialize`), loss functions (ContrastOmni, MM-GRPO preference loss), LR scheduling, and training utilities (`PackedBatch`, `TokenSequence`, `VarLenCollator`).
+Provides a scoped, minimal reverse-mode autodiff tape specifically designed for adapter-only backward passes (LoRA / QLoRA). It tracks gradients exclusively for trainable adapter parameters while frozen base weights remain unquantized only during their localized forward and backward execution.
 
 ## Boundaries
-
-- Does **not** autodiff the frozen base model weights — that is WI-T8's scope.
-- Does **not** reimplement `grim-tensor-graph`'s fusion IR — it is a separate concern.
-- Does **not** reach into backend kernel internals — goes through `BackendDevice` like existing forward code.
-- Does **not** implement cross-entropy loss backward yet — that is slated for WI-T5.
+- Does not compute gradients for frozen base weights.
+- Operates on the established `BackendDevice` abstraction without reimplementing the fusion IR.
+- Only records operations that touch adapter parameters (`MatMul`, `Add`, `Scale`).
 
 ## Dependency Graph
-
 ```mermaid
-graph LR
-    A[grim-autograd] --> B[grim-tensor]
-    A --> C[grim-format]
-    A --> D[grim-quant]
-    A --> E[grim-backend-cpu]
-    A --> F[grim-backend-rocm]
-    A --> G[grim-backend-cuda]
-    A --> H[grim-backend-metal]
-    A --> I[grim-backend-vulkan]
+graph TD
+    grim-engine --> grim-autograd
+    grim-garage --> grim-autograd
 
-    style A fill:#f8bbd0
+    grim-autograd --> grim-tensor
+    grim-autograd --> grim-format
+    grim-autograd --> grim-backend-cpu
+    grim-autograd --> grim-backend-rocm
+    grim-autograd --> grim-backend-cuda
+    grim-autograd --> grim-backend-metal
+    grim-autograd --> grim-backend-vulkan
+    grim-autograd --> grim-quant
+    grim-autograd --> serde
 ```
 
-## Public API
+## Public API Overview
+- `AutogradScope`: Enum determining which parameters are recorded (`LoRAOnly` or `FullParameter`).
+- `Tape`: Core execution tape recording the forward pass of trainable ops.
+- `BackwardContext`: Context handling the execution of the reverse mode tape.
+- `TrainableParam` / `TrainableParams`: Structs encapsulating parameters that require gradients.
+- `Optimizer` / `AdamW` / `PagedAdamW`: Trait and implementations for gradient application.
+- `cross_entropy_loss` / preference losses (`dpo_loss`, `grpo_loss`): Implementations of standard loss functions with autograd hookups.
 
+## Usage Example
 ```rust
-pub enum AutogradScope { LoRAOnly, FullParameter }
+use grim_autograd::{Tape, AutogradScope};
 
-impl Default for AutogradScope {
-    fn default() -> Self { AutogradScope::LoRAOnly }
-}
+let mut tape = Tape::new();
+// tape.register(tensors) and tape.record_matmul(...) used internally by adapter forward passes
 
-pub use scythe1::{Scythe1Adapter, Scythe1Optimizer};
-pub use soul_eater::{SoulEaterAdapter, SoulEaterOptimizer};
-pub use turbo_finetune::{TrainingMode, TurboFinituneConfig, TurboFinetuneScheduler};
-pub use contrast_omni::{ContrastOmniConfig, ContrastOmniLoss};
-pub use mm_grpo::{MmGrpoConfig, MmGrpoRewardNormalizer};
-
-pub use adamw::{
-    Adafactor, AdamW, Lion8Bit, Muon, Optimizer, OptimizerKind, PagedAdamW, LRScheduler,
-};
-pub use backward::{BackwardContext, backward};
-pub use collate::{PackedBatch, TokenSequence, VarLenCollator};
-pub use injection::{LoRAInjectionConfig, LoRAInjectionPoint, LoRAInjectionRegistry,
-    loftq_initialize, pissa_initialize};
-pub use param::{LoRAAdapterParams, LoRAParam};
-pub use ops;
-pub use tape::{AutogradTape, TapeOp};
+// Context built from tape executes backward pass
+// let ctx = BackwardContext::new(tape);
+// ctx.backward(loss_tensor).unwrap();
 ```
 
-## Feature Flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `cuda-mem` | yes | Enable CUDA memory allocation paths |
-| `rocm-mem` | yes | Enable ROCm memory allocation paths |
-| `metal-mem` | yes | Enable Metal memory allocation paths |
-| `vulkan-mem` | yes | Enable Vulkan memory allocation paths |
+## Use Cases
+- Training LoRA adapters locally on consumer hardware.
+- Serving memory-efficient QLoRA backward passes by materializing unquantized states just-in-time.
+- Applying specialized preference optimization techniques like DPO, GRPO, or ORPO.
 
 ## Edge Cases, Limitations, and Quirks
+- The tape only tracks explicitly supported ops; if an adapter introduces an unsupported operation, the backward pass will fail to calculate gradients.
+- Assumes the underlying tensors resolve device placements correctly via `pick_device_for_tensor`.
 
-- `AutogradScope::Default` is `LoRAOnly` — full-parameter training is not yet wired.
-- Cross-entropy loss backward is slated for WI-T5; currently loss is computed forward-only and gradients are injected via the adapter path.
-- Optimizer state (AdamW moments) is kept in full precision even when base weights are quantized — this is the memory tradeoff QLoRA makes.
-- The tape grows with computation graph size; callers should drop it after `backward` to release intermediate buffers.
+## Build Flags, Feature Flags, and Environment Variables
+- `default`: Includes `[cuda-mem, rocm-mem, metal-mem, vulkan-mem]`.
+- `cuda-mem`, `rocm-mem`, `metal-mem`, `vulkan-mem`: Enables memory dispatch backend support for respective hardware.
+- `gpu-selection`: Catch-all feature that enables all GPU memory backend flags.

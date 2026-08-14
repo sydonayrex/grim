@@ -8,14 +8,30 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GRIM_BINARY="${SCRIPT_DIR}/../target/release/grim"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Search locations for pre-built grim binary
+if [ -n "$GRIM_BINARY_PATH" ] && [ -f "$GRIM_BINARY_PATH" ]; then
+    GRIM_BINARY="$GRIM_BINARY_PATH"
+elif [ -f "${PROJECT_ROOT}/target/release/grim" ]; then
+    GRIM_BINARY="${PROJECT_ROOT}/target/release/grim"
+elif [ -f "./grim" ]; then
+    GRIM_BINARY="./grim"
+else
+    GRIM_BINARY="${PROJECT_ROOT}/target/release/grim"
+fi
 
 GRIM_INSTALL_DIR="/usr/local/bin"
 GRIM_CONFIG_DIR="/etc/grim"
 GRIM_LOG_DIR="/var/log/grim"
-GRIM_MODELS_DIR="/var/lib/grim/models"
+GRIM_VAR_DIR="/var/lib/grim"
+GRIM_MODELS_DIR="${GRIM_VAR_DIR}/models"
+GRIM_PLUGINS_DIR="${GRIM_VAR_DIR}/plugins"
+GRIM_CACHE_DIR="${GRIM_VAR_DIR}/cache"
 GRIM_ENV_FILE="${GRIM_CONFIG_DIR}/environment"
 GRIM_SERVICE_FILE="/etc/systemd/system/grim.service"
+GRIM_USER="grim"
+GRIM_GROUP="grim"
 GRIM_DEFAULT_PORT="11434"
 GRIM_DEFAULT_HOST="127.0.0.1"   # SSRF-safe default; override in $GRIM_ENV_FILE
 
@@ -37,12 +53,13 @@ need_root() {
 
 # ---------------------------------------------------------------------------
 # Hardware detection. Sets globals: DETECTED_BACKEND, DETECTED_GPUS,
-# DETECTED_PARALLEL, DETECTED_KERNELS_TIMEOUT.
+# DETECTED_PARALLEL, DETECTED_TP_SIZE, DETECTED_KERNELS_TIMEOUT.
 # ---------------------------------------------------------------------------
 detect_hardware() {
     DETECTED_BACKEND=""
     DETECTED_GPUS=""
     DETECTED_PARALLEL="No"
+    DETECTED_TP_SIZE="0"
     DETECTED_KERNELS_TIMEOUT=""
 
     # ROCm (AMD Instinct / CDNA)
@@ -52,9 +69,13 @@ detect_hardware() {
         if [ "$gpu_count" -gt 0 ] 2>/dev/null; then
             DETECTED_BACKEND="rocm"
             DETECTED_GPUS=$(seq 0 $((gpu_count - 1)) | paste -sd, -)
-            DETECTED_PARALLEL=$([ "$gpu_count" -gt 1 ] && echo "Yes" || echo "No")
-            # MI300/X/MI355 expose shared-memory ROCm limits; surface a timeout
-            # hint so the host aborts a wedged kernel.
+            if [ "$gpu_count" -gt 1 ]; then
+                DETECTED_PARALLEL="Yes"
+                DETECTED_TP_SIZE="$gpu_count"
+            else
+                DETECTED_PARALLEL="No"
+                DETECTED_TP_SIZE="0"
+            fi
             DETECTED_KERNELS_TIMEOUT=300
         fi
     fi
@@ -66,7 +87,13 @@ detect_hardware() {
         if [ "$gpu_count" -gt 0 ]; then
             DETECTED_BACKEND="cuda"
             DETECTED_GPUS=$(seq 0 $((gpu_count - 1)) | paste -sd, -)
-            DETECTED_PARALLEL=$([ "$gpu_count" -gt 1 ] && echo "Yes" || echo "No")
+            if [ "$gpu_count" -gt 1 ]; then
+                DETECTED_PARALLEL="Yes"
+                DETECTED_TP_SIZE="$gpu_count"
+            else
+                DETECTED_PARALLEL="No"
+                DETECTED_TP_SIZE="0"
+            fi
         fi
     fi
 
@@ -76,6 +103,7 @@ detect_hardware() {
             DETECTED_BACKEND="metal"
             DETECTED_GPUS="0"
             DETECTED_PARALLEL="No"
+            DETECTED_TP_SIZE="0"
         fi
     fi
 
@@ -86,6 +114,7 @@ detect_hardware() {
                 DETECTED_BACKEND="vulkan"
                 DETECTED_GPUS="0"
                 DETECTED_PARALLEL="No"
+                DETECTED_TP_SIZE="0"
             fi
         fi
     fi
@@ -95,10 +124,9 @@ detect_hardware() {
         DETECTED_BACKEND="cpu"
         DETECTED_GPUS=""
         DETECTED_PARALLEL="No"
+        DETECTED_TP_SIZE="0"
     fi
 
-    # GRIM_CONTEXT: pick a sane default context window. 8192 unless the
-    # operator overrides in the environment file.
     if [ -z "$DETECTED_KERNELS_TIMEOUT" ]; then
         DETECTED_KERNELS_TIMEOUT="300"
     fi
@@ -110,7 +138,7 @@ detect_hardware() {
 build_grim() {
     if [ ! -f "$GRIM_BINARY" ]; then
         echo "[grim] Building grim from source (release)..."
-        (cd "$(dirname "$SCRIPT_DIR")" && cargo build --release)
+        (cd "$PROJECT_ROOT" && cargo build --release)
         if [ ! -f "$GRIM_BINARY" ]; then
             echo "[grim] ERROR: cargo build failed — binary not found."
             exit 1
@@ -119,12 +147,18 @@ build_grim() {
 }
 
 # ---------------------------------------------------------------------------
-# Install the binary
+# Install binary and companion tools
 # ---------------------------------------------------------------------------
 install_binary() {
     echo "[grim] Installing binary to $GRIM_INSTALL_DIR/grim"
     need_root cp "$GRIM_BINARY" "$GRIM_INSTALL_DIR/grim"
     need_root chmod +x "$GRIM_INSTALL_DIR/grim"
+
+    if [ -f "${SCRIPT_DIR}/grim-config" ]; then
+        echo "[grim] Installing helper to $GRIM_INSTALL_DIR/grim-config"
+        need_root cp "${SCRIPT_DIR}/grim-config" "$GRIM_INSTALL_DIR/grim-config"
+        need_root chmod +x "$GRIM_INSTALL_DIR/grim-config"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -136,6 +170,7 @@ install_env_file() {
     echo "[grim]   backend   = $DETECTED_BACKEND"
     echo "[grim]   gpus      = ${DETECTED_GPUS:-(none)}"
     echo "[grim]   parallel  = $DETECTED_PARALLEL"
+    echo "[grim]   tp_size   = $DETECTED_TP_SIZE"
     echo "[grim]   timeout   = ${DETECTED_KERNELS_TIMEOUT}s"
     echo "[grim]   context   = ${GRIM_CONTEXT:-8192}"
 
@@ -144,8 +179,14 @@ install_env_file() {
     # (and `grim serve`) read them via RuntimeEnv.
     need_root tee "$GRIM_ENV_FILE" > /dev/null <<EOF
 # Persisted by dist/install.sh — read by the grim systemd unit via
-# `EnvironmentFile` and by `RuntimeEnv::from_env` at process start.
-# Edit and restart the service (`systemctl restart grim`) to apply.
+# \`EnvironmentFile\` and by \`RuntimeEnv::from_env\` at process start.
+# Edit and restart the service (\`systemctl restart grim\`) to apply.
+
+# System Directories
+GRIM_MODELS_DIR=${GRIM_MODELS_DIR}
+GRIM_PLUGINS_DIR=${GRIM_PLUGINS_DIR}
+GRIM_LOG_DIR=${GRIM_LOG_DIR}
+GRIM_HSACO_CACHE_DIR=${GRIM_CACHE_DIR}/hsaco
 
 # Incoming SSRF posture (§network): bind host. Defaults to loopback.
 GRIM_HOST=${GRIM_DEFAULT_HOST}
@@ -162,9 +203,8 @@ GRIM_GPUS=${DETECTED_GPUS}
 # Multi-GPU parallelism hint (Yes=attempt; No=single device).
 GRIM_PARALLEL=${DETECTED_PARALLEL}
 
-# Tensor-parallel world size (0 or 1 = single device; >1 requires RCCL/NCCL
-# comms init + sharded model layers — SCYTHE-2 WI-6 entry point).
-GRIM_TP_SIZE=0
+# Tensor-parallel world size (0 or 1 = single device; >1 requires RCCL/NCCL).
+GRIM_TP_SIZE=${DETECTED_TP_SIZE}
 
 # KV-cache quantization: off | int4 | int8
 GRIM_KV_QUANT=off
@@ -183,12 +223,28 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Create required directories and a default config
+# Create required directories, system user, and default config
 # ---------------------------------------------------------------------------
 install_config() {
-    echo "[grim] Creating config and log directories..."
-    need_root mkdir -p "$GRIM_CONFIG_DIR" "$GRIM_LOG_DIR" "$GRIM_MODELS_DIR"
-    need_root chmod 755 "$GRIM_LOG_DIR" "$GRIM_MODELS_DIR"
+    echo "[grim] Creating system user ($GRIM_USER)..."
+    if ! getent group "$GRIM_GROUP" >/dev/null 2>&1; then
+        need_root groupadd -r "$GRIM_GROUP" 2>/dev/null || true
+    fi
+    if ! getent passwd "$GRIM_USER" >/dev/null 2>&1; then
+        need_root useradd -r -g "$GRIM_GROUP" -d "$GRIM_VAR_DIR" -s /usr/sbin/nologin "$GRIM_USER" 2>/dev/null || true
+    fi
+
+    # Add grim user to video and render groups for GPU device node access
+    for grp in video render kvm; do
+        if getent group "$grp" >/dev/null 2>&1; then
+            need_root usermod -aG "$grp" "$GRIM_USER" 2>/dev/null || true
+        fi
+    done
+
+    echo "[grim] Creating config, log, cache, and model directories..."
+    need_root mkdir -p "$GRIM_CONFIG_DIR" "$GRIM_LOG_DIR" "$GRIM_MODELS_DIR" "$GRIM_PLUGINS_DIR" "$GRIM_CACHE_DIR/hsaco"
+    need_root chown -R "${GRIM_USER}:${GRIM_GROUP}" "$GRIM_LOG_DIR" "$GRIM_VAR_DIR"
+    need_root chmod 755 "$GRIM_LOG_DIR" "$GRIM_MODELS_DIR" "$GRIM_PLUGINS_DIR" "$GRIM_CACHE_DIR"
 
     # Write a minimal default config if one does not already exist
     if [ ! -f "$GRIM_CONFIG_DIR/grim.toml" ]; then
@@ -196,11 +252,13 @@ install_config() {
 # Grim inference server default configuration.
 # Bind address is sourced from /etc/grim/environment (GRIM_HOST/GRIM_PORT).
 models_dir = "${GRIM_MODELS_DIR}"
+plugins_dir = "${GRIM_PLUGINS_DIR}"
 
 [server.log]
 level = "info"
 file  = "${GRIM_LOG_DIR}/serve.log"
 EOF
+        need_root chown "${GRIM_USER}:${GRIM_GROUP}" "$GRIM_CONFIG_DIR/grim.toml"
         echo "[grim] Default config written to $GRIM_CONFIG_DIR/grim.toml"
     else
         echo "[grim] Config already exists — skipping."
@@ -227,19 +285,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# grim serve reads GRIM_HOST/GRIM_PORT from the EnvironmentFile via
-# RuntimeEnv::resolve_bind; no --address flag is needed.
+User=${GRIM_USER}
+Group=${GRIM_GROUP}
+SupplementaryGroups=video render kvm
 EnvironmentFile=${GRIM_ENV_FILE}
-ExecStart=${GRIM_INSTALL_DIR}/grim serve --config ${GRIM_CONFIG_DIR}/grim.toml
+ExecStart=${GRIM_INSTALL_DIR}/grim serve --config ${GRIM_CONFIG_DIR}/grim.toml --plugins ${GRIM_PLUGINS_DIR}
 Restart=on-failure
 RestartSec=5
 StandardOutput=append:${GRIM_LOG_DIR}/serve.log
 StandardError=append:${GRIM_LOG_DIR}/serve.log
-
-# Run as a dedicated system user when available
-# Create with: useradd -r -s /usr/sbin/nologin grim
-# User=grim
-# Group=grim
 
 [Install]
 WantedBy=multi-user.target
@@ -276,11 +330,16 @@ uninstall_grim() {
         need_root rm -f "$GRIM_INSTALL_DIR/grim"
         echo "[grim] Removed binary from $GRIM_INSTALL_DIR"
     fi
+    if [ -f "$GRIM_INSTALL_DIR/grim-config" ]; then
+        need_root rm -f "$GRIM_INSTALL_DIR/grim-config"
+        echo "[grim] Removed helper from $GRIM_INSTALL_DIR"
+    fi
 
     if [ "$purge" = "purge" ]; then
-        need_root rm -rf "$GRIM_CONFIG_DIR" "$GRIM_LOG_DIR"
-        echo "[grim] Purged config ($GRIM_CONFIG_DIR) and logs ($GRIM_LOG_DIR)."
-        echo "[grim] Model files at $GRIM_MODELS_DIR were NOT removed. Delete manually if desired."
+        need_root rm -rf "$GRIM_CONFIG_DIR" "$GRIM_LOG_DIR" "$GRIM_VAR_DIR"
+        need_root userdel "$GRIM_USER" 2>/dev/null || true
+        need_root groupdel "$GRIM_GROUP" 2>/dev/null || true
+        echo "[grim] Purged config ($GRIM_CONFIG_DIR), logs ($GRIM_LOG_DIR), data ($GRIM_VAR_DIR), and system user."
     fi
 }
 
@@ -296,7 +355,7 @@ cmd_config() {
     echo "  backend  = ${GRIM_BACKEND:-$DETECTED_BACKEND}"
     echo "  gpus     = ${GRIM_GPUS:-${DETECTED_GPUS:-(none)}}"
     echo "  parallel = ${GRIM_PARALLEL:-$DETECTED_PARALLEL}"
-    echo "  tp_size  = ${GRIM_TP_SIZE:-0}"
+    echo "  tp_size  = ${GRIM_TP_SIZE:-$DETECTED_TP_SIZE}"
     echo "  kv_quant = ${GRIM_KV_QUANT:-off}"
     echo "  context  = ${GRIM_CONTEXT:-8192}"
     if [ -f "$GRIM_ENV_FILE" ] && [ -r "$GRIM_ENV_FILE" ]; then
@@ -321,7 +380,8 @@ case "$ACTION" in
         install_service
         echo ""
         echo "=== Installation Complete ==="
-        echo "  Server is listening on ${GRIM_DEFAULT_HOST}:${GRIM_DEFAULT_PORT}"
+        echo "  Server is listening on http://${GRIM_DEFAULT_HOST}:${GRIM_DEFAULT_PORT}"
+        echo "  Open http://${GRIM_DEFAULT_HOST}:${GRIM_DEFAULT_PORT} in your web browser to access the dashboard."
         echo "  To expose publicly, edit GRIM_HOST in ${GRIM_ENV_FILE} and run:"
         echo "      sudo systemctl restart grim"
         echo "  Logs:    ${GRIM_LOG_DIR}/serve.log"
@@ -348,7 +408,7 @@ case "$ACTION" in
         echo "  install   - Build and install grim; register systemd daemon on loopback:${GRIM_DEFAULT_PORT}"
         echo "  config    - Print the runtime config detected from hardware + env"
         echo "  uninstall - Stop and remove grim service and binary"
-        echo "  purge     - (uninstall modifier) also removes config and logs"
+        echo "  purge     - (uninstall modifier) also removes config, logs, and user"
         exit 1
         ;;
 esac

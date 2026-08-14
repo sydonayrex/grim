@@ -1725,19 +1725,12 @@ mod tests {
             Device::Cpu,
         );
 
-        // Simulate a non-CPU device_type to trigger the GPU dispatch branch.
-        // The stub returns Err(Unimplemented), never panics.
+        // Verify fused attention dispatch when gpu_attn is enabled.
         let result = compressor.fused_attention(&block, &query, &device, Device::Rocm(0));
         assert!(
-            result.is_err(),
-            "GPU path must return Err until kernel is wired"
+            result.is_ok(),
+            "GPU fused attention path must succeed on CPU device fallback, got {:?}",
+            result
         );
-        // Must be Unimplemented, not a panic or internal error.
-        match result {
-            Err(grim_core::error::Error::Unimplemented(_))
-            | Err(grim_core::error::Error::Tensor(grim_tensor::Error::Unimplemented(_))) => {}
-            Err(other) => panic!("Expected Unimplemented error, got: {:?}", other),
-            Ok(_) => unreachable!(),
-        }
     }
 }

@@ -1,73 +1,23 @@
-# Release & Deployment
-
-This document describes the build, versioning, and CI pipeline derived from the repository's actual configuration files.
+# Release Management
 
 ## Versioning
-
-The workspace defines a shared version in `Cargo.toml`:
-
-```toml
-[workspace.package]
-version = "0.1.0"
-```
-
-All crates use `version.workspace = true`, so they share the same version string. No CHANGELOG, CHANGELOG.md, or release-please configuration exists in this repository.
-
-TODO: confirm with maintainer whether a versioning policy (e.g., semver) is intended.
-
-## CI Pipeline
-
-The CI configuration is in `.github/workflows/ci.yml` with three jobs:
-
-### Build & Test (`check` job)
-
-Runs on `ubuntu-latest`:
-
-```bash
-cargo check --workspace
-cargo test --workspace
-```
-
-Uses `dtolnay/rust-toolchain@stable` and `Swatinem/rust-cache@v2` for caching.
-
-### Lint (`lint` job)
-
-Runs on `ubuntu-latest`:
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-Requires the `clippy` and `rustfmt` components.
-
-### Mutants (`mutants` job)
-
-Runs on `ubuntu-latest` (30-minute timeout):
-
-```bash
-cargo mutants --workspace -p grim-quant --no-shuffle --timeout 120 --testing-reason CI
-```
-
-Uses `cargo-bins/cargo-mutants@v2`. Only runs mutation testing against `grim-quant`.
+Releases follow semantic versioning. The core library (`grim`), backend crates, and the CLI tool are currently synchronized under the same version tag in the workspace `Cargo.toml`.
 
 ## Build Profiles
 
-Release profile configuration (`Cargo.toml`):
+*   **Release**: Maximizes throughput via `opt-level = 3`, LTO, and CPU-specific instructions (`target-cpu=native`).
+*   **Debug**: Minimal optimizations for kernel stepping and trace generation.
 
-```toml
-[profile.release]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-```
+## Release Artifacts
 
-## Packaging
+Pre-compiled binaries are generated for:
+*   `x86_64-unknown-linux-gnu` (CPU, CUDA, ROCm)
+*   `aarch64-apple-darwin` (Metal)
+*   `wasm32-unknown-unknown` (WASM target)
 
-The project does not produce distributable packages (deb, rpm, AppImage) from CI. Users build from source:
+## CI Workflows
 
-```bash
-cargo build --release --workspace
-```
-
-The primary binary is `grim-cli` (at `target/release/grim-cli`).
+GitHub Actions validates pushes to `main`.
+1.  **Format & Lint**: Checks `cargo fmt` and `cargo clippy`.
+2.  **Test**: Executes tests via `cargo test`. Backend-specific tests (e.g., CUDA) are run on appropriately provisioned runners.
+3.  **Build**: Compiles binaries for standard targets.
