@@ -187,7 +187,7 @@ extern "C" {
     // the weighted accumulate into `out[token]` still uses atomicAdd — but the
     // weight reads are now grouped per expert, which is the MoE win.
     // ────────────────────────────────────────────────────────────────────
-    __global__ void grim_moe_fused_grouped(
+    __device__ void grim_moe_fused_grouped_device(
         const float* __restrict__ activations,     // [batch, hidden]
         const float* __restrict__ expert_gate_w,   // [num_experts, inter*hidden]
         const float* __restrict__ expert_up_w,     // [num_experts, inter*hidden]
@@ -199,7 +199,12 @@ extern "C" {
         int hidden, int inter, int num_tokens, int block_size,
         float routed_scaling_factor)
     {
-        const int blk = blockIdx.x;
+        // `blockDim.x` is the effective worker width supplied by the
+        // persistent dispatcher. It need not equal block_size: the stride
+        // below handles smaller and larger routed blocks without dropping
+        // tokens, while keeping the launch contract fixed and bounded.
+        if (block_size <= 0) return;
+        for (int blk = 0; blk * block_size < num_tokens; ++blk) {
         const int base = blk * block_size;
         const int end = base + block_size < num_tokens ? base + block_size : num_tokens;
 
@@ -242,6 +247,17 @@ extern "C" {
                 }
             }
         }
+        }
+    }
+
+    __global__ void grim_moe_fused_grouped(
+        const float* activations, const float* expert_gate_w, const float* expert_up_w,
+        const float* expert_down_w, const unsigned int* sorted_token_ids,
+        const unsigned int* sorted_expert_ids, const float* sorted_weights, float* out,
+        int hidden, int inter, int num_tokens, int block_size, float routed_scaling_factor) {
+        grim_moe_fused_grouped_device(activations, expert_gate_w, expert_up_w, expert_down_w,
+            sorted_token_ids, sorted_expert_ids, sorted_weights, out, hidden, inter,
+            num_tokens, block_size, routed_scaling_factor);
     }
 }
 
@@ -1012,10 +1028,7 @@ impl RoutingAssignment {
     ///
     /// `indices[t]` and `weights[t]` are the selected experts and combine
     /// weights for token `t`; both must have the same length (`top_k`).
-    pub fn from_route(
-        indices: &[Vec<usize>],
-        weights: &[Vec<f32>],
-    ) -> Result<Self> {
+    pub fn from_route(indices: &[Vec<usize>], weights: &[Vec<f32>]) -> Result<Self> {
         if indices.len() != weights.len() {
             return Err(Error::Backend(format!(
                 "RoutingAssignment::from_route: indices len {} != weights len {}",
@@ -1038,7 +1051,9 @@ impl RoutingAssignment {
             if idx_row.len() != w_row.len() {
                 return Err(Error::Backend(format!(
                     "RoutingAssignment::from_route: token {} has {} experts but {} weights",
-                    t, idx_row.len(), w_row.len()
+                    t,
+                    idx_row.len(),
+                    w_row.len()
                 )));
             }
             for (&e, &wi) in idx_row.iter().zip(w_row.iter()) {
@@ -1047,7 +1062,11 @@ impl RoutingAssignment {
                 w.push(wi);
             }
         }
-        Ok(Self { tokens, experts, weights: w })
+        Ok(Self {
+            tokens,
+            experts,
+            weights: w,
+        })
     }
 
     /// Number of (token, expert) work pairs.
@@ -1070,7 +1089,6 @@ impl RoutingAssignment {
         routing_skew(&self.per_expert_token_counts())
     }
 }
-
 
 /// Token-sorted routing layout for the grouped fused dispatch
 /// (`grim_moe_fused_grouped`). Produced by `moe_align_block_size` from a
@@ -1264,8 +1282,6 @@ pub(crate) fn plan_fused_dispatch_with_autotuner(
         None => fallback_dim,
     };
 
-
-
     let grid_x = if n == 0 {
         0
     } else {
@@ -1273,8 +1289,6 @@ pub(crate) fn plan_fused_dispatch_with_autotuner(
     };
     CharonLaunchPlan { grid_x, block_x }
 }
-
-
 
 impl SortedRouting {
     /// Number of expert-blocks in the grouped layout (= grid x for the
@@ -1295,14 +1309,15 @@ impl SortedRouting {
 /// its token window, identical wave-alignment contract. Extracted so G-A2 can
 /// prove the blob without a GPU.
 #[allow(dead_code)]
-pub(crate) fn plan_grouped_dispatch(
-    sorted: &SortedRouting,
-    wave_size: u32,
-) -> CharonLaunchPlan {
+pub(crate) fn plan_grouped_dispatch(sorted: &SortedRouting, wave_size: u32) -> CharonLaunchPlan {
     let grid_x = sorted.num_blocks();
     let block_x = choose_block_dim(sorted.block_size, wave_size).max(wave_size);
     CharonLaunchPlan {
-        grid_x: grid_x.max(if sorted.num_tokens_post_padded == 0 { 0 } else { 1 }),
+        grid_x: grid_x.max(if sorted.num_tokens_post_padded == 0 {
+            0
+        } else {
+            1
+        }),
         block_x,
     }
 }
@@ -1341,7 +1356,11 @@ pub(crate) fn validate_grouped_inputs(
         )));
     }
     // Every sorted expert id must be in range.
-    if sorted.sorted_expert_ids.iter().any(|&e| e as usize >= num_experts) {
+    if sorted
+        .sorted_expert_ids
+        .iter()
+        .any(|&e| e as usize >= num_experts)
+    {
         return Err(Error::Backend(
             "charon_grouped_dispatch: sorted expert id out of range".into(),
         ));
@@ -1575,19 +1594,20 @@ pub fn build_variant_table_from_autotuner(
 
     for row in &mut table {
         let bucket_idx = crate::autotune::quantize_routing_skew(row.skew_bucket);
-        if let Some(matching_key) = moe_keys.iter().find(|k| {
-            k.gpu_arch == gpu_arch && k.skew_bucket == bucket_idx
-        }) {
+        if let Some(matching_key) = moe_keys
+            .iter()
+            .find(|k| k.gpu_arch == gpu_arch && k.skew_bucket == bucket_idx)
+        {
             if let Some(cfg) = tuner.lookup_moe(matching_key) {
                 if cfg.cycles_per_invocation > 0 {
-                    row.model.c_bytes_per_wave = (cfg.cycles_per_invocation as f32 / 1e6).clamp(0.01, 10.0);
+                    row.model.c_bytes_per_wave =
+                        (cfg.cycles_per_invocation as f32 / 1e6).clamp(0.01, 10.0);
                 }
             }
         }
     }
     table
 }
-
 
 /// Select autotuned launch configuration for Charon kernel using t-pain model.
 ///
@@ -1614,7 +1634,11 @@ pub fn charon_autotune_launch_config(
     };
 
     tuner.lookup_moe(&key).unwrap_or_else(|| {
-        let default_threads = if gpu_arch.starts_with("gfx10") { 32 } else { 64 };
+        let default_threads = if gpu_arch.starts_with("gfx10") {
+            32
+        } else {
+            64
+        };
         crate::autotune::AutotuneConfig {
             block_dim: default_threads,
             tile_kv: 64,
@@ -1810,7 +1834,9 @@ mod tests {
             "Item 1: batched decode helper must be present in the HIP source"
         );
         assert!(
-            KERNEL_SOURCE.contains("const bool batched = (format_id == 7 || format_id == 8 || format_id == 9)"),
+            KERNEL_SOURCE.contains(
+                "const bool batched = (format_id == 7 || format_id == 8 || format_id == 9)"
+            ),
             "Item 1: the grouped kernel must select the batched path for formats 7/8/9"
         );
         assert!(
@@ -1820,7 +1846,8 @@ mod tests {
         // Inner loop of the batched helper emits per-weight weights with hoisted
         // scalars; the only f16_to_f32 calls must be before the per-weight loop.
         let helper_start = KERNEL_SOURCE.find("iqk_batch_decode(").unwrap();
-        let helper_end = KERNEL_SOURCE.find("// kernel-hygiene-plan item 1: per-weight decode chunks")
+        let helper_end = KERNEL_SOURCE
+            .find("// kernel-hygiene-plan item 1: per-weight decode chunks")
             .unwrap();
         let helper = &KERNEL_SOURCE[helper_start..helper_end];
         assert!(
@@ -2018,12 +2045,7 @@ mod tests {
             weights: vec![0.5, 0.5],
         };
         let dummy: *mut c_void = 0x1000 as *mut c_void;
-        let res = validate_launch_inputs(
-            dummy, dummy, dummy, dummy,
-            dummy,
-            &assignment,
-            64, 16,
-        );
+        let res = validate_launch_inputs(dummy, dummy, dummy, dummy, dummy, &assignment, 64, 16);
         assert!(res.is_ok(), "well-formed launch must validate");
     }
 
@@ -2038,10 +2060,13 @@ mod tests {
         let dummy: *mut c_void = 0x1000 as *mut c_void;
         let err = validate_launch_inputs(
             std::ptr::null_mut(), // activations null
-            dummy, dummy, dummy,
+            dummy,
+            dummy,
+            dummy,
             dummy,
             &assignment,
-            64, 16,
+            64,
+            16,
         );
         assert!(err.is_err(), "null activations must be rejected");
         let msg = format!("{err:?}");
@@ -2059,10 +2084,14 @@ mod tests {
         };
         let dummy: *mut c_void = 0x1000 as *mut c_void;
         let err = validate_launch_inputs(
-            dummy, dummy, dummy, dummy,
+            dummy,
+            dummy,
+            dummy,
+            dummy,
             dummy,
             &assignment,
-            0, 16, // hidden=0
+            0,
+            16, // hidden=0
         );
         assert!(err.is_err(), "hidden=0 must be rejected");
     }
@@ -2182,11 +2211,11 @@ mod tests {
         // Alternating challengers: HighSkew (skew=0.95), LargeGroupPrefill
         // (skew=0.5), HighSkew again.  Per-challenger streaks: HS=1, LGP=1,
         // HS=1 — none reach min_hold=3, so no switch fires.
-        let _ = sel.select(0.95, 8.0, 2048.0, 1e6, 0.5);  // challenger: HighSkew
+        let _ = sel.select(0.95, 8.0, 2048.0, 1e6, 0.5); // challenger: HighSkew
         assert_eq!(sel.current(), CharonVariant::SmallBatchDecode);
-        let _ = sel.select(0.5, 4.0, 1024.0, 1e6, 0.3);   // challenger: LargeGroupPrefill
+        let _ = sel.select(0.5, 4.0, 1024.0, 1e6, 0.3); // challenger: LargeGroupPrefill
         assert_eq!(sel.current(), CharonVariant::SmallBatchDecode);
-        let _ = sel.select(0.95, 8.0, 2048.0, 1e6, 0.5);  // challenger: HighSkew (streak resets to 1)
+        let _ = sel.select(0.95, 8.0, 2048.0, 1e6, 0.5); // challenger: HighSkew (streak resets to 1)
         assert_eq!(sel.current(), CharonVariant::SmallBatchDecode);
 
         // HighSkew wins 3 times consecutively → streak reaches min_hold=3,
@@ -2218,7 +2247,7 @@ mod tests {
 
     #[test]
     fn autotune_build_variant_table_from_autotuner() {
-        use crate::autotune::{Autotuner, MoeKernelKey, AutotuneConfig, quantize_routing_skew};
+        use crate::autotune::{AutotuneConfig, Autotuner, MoeKernelKey, quantize_routing_skew};
 
         let mut tuner = Autotuner::for_device(0, "gfx90a");
         let key = MoeKernelKey {
@@ -2246,14 +2275,15 @@ mod tests {
 
     #[test]
     fn test_charon_autotune_launch_config_fallback_and_lookup() {
-        use crate::autotune::{Autotuner, MoeKernelKey, AutotuneConfig, quantize_routing_skew};
+        use crate::autotune::{AutotuneConfig, Autotuner, MoeKernelKey, quantize_routing_skew};
 
         let arch = "gfx1036";
         let mut tuner = Autotuner::for_device(0, arch);
         let histogram = vec![10, 2, 2, 2];
 
         // Case 1: Cache miss returns fallbacks (32 threads for gfx1036)
-        let fallback_cfg = charon_autotune_launch_config(&tuner, arch, 4096, 14336, 4, 2, &histogram);
+        let fallback_cfg =
+            charon_autotune_launch_config(&tuner, arch, 4096, 14336, 4, 2, &histogram);
         assert_eq!(fallback_cfg.block_dim, 32);
 
         // Case 2: Cache hit returns registered config
@@ -2281,5 +2311,3 @@ mod tests {
         assert_eq!(tuned_cfg.cycles_per_invocation, 120_000);
     }
 }
-
-
