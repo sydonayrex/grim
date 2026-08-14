@@ -173,6 +173,88 @@ async fn health() -> &'static str {
     "OK"
 }
 
+/// Conventional readiness probe; `/health` remains the legacy alias.
+async fn healthz() -> &'static str {
+    "OK"
+}
+
+/// Readiness probe: unlike liveness, inference is not ready until a model is
+/// loaded. This lets an orchestrator keep an empty server out of rotation.
+async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+    let loaded_models = state
+        .engine
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .loaded_models();
+    if loaded_models.is_empty() {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "not_ready",
+                "reason": "no model loaded",
+                "recovery": "POST /v1/models/load or run 'grim pull <model>'"
+            })),
+        )
+    } else {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ready",
+                "loaded_models": loaded_models
+            })),
+        )
+    }
+}
+
+fn active_backend(has_gpu: bool) -> String {
+    if let Ok(configured) = std::env::var("GRIM_BACKEND") {
+        let configured = configured.trim().to_ascii_lowercase();
+        if !configured.is_empty() && configured != "auto" {
+            return configured;
+        }
+    }
+    if has_gpu {
+        if grim_backend_rocm::RocmDevice::probe()
+            .map(|devices| !devices.is_empty())
+            .unwrap_or(false)
+        {
+            "rocm".to_string()
+        } else if grim_backend_cuda::CudaDevice::probe()
+            .map(|devices| !devices.is_empty())
+            .unwrap_or(false)
+        {
+            "cuda".to_string()
+        } else {
+            "gpu".to_string()
+        }
+    } else {
+        "cpu".to_string()
+    }
+}
+
+fn validate_metrics_bind_policy(addr: &str) -> grim_core::error::Result<()> {
+    let explicitly_allowed = std::env::var("GRIM_ALLOW_PUBLIC_METRICS")
+        .map(|value| matches!(value.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    validate_metrics_bind_policy_with_opt_in(addr, explicitly_allowed)
+}
+
+fn validate_metrics_bind_policy_with_opt_in(
+    addr: &str,
+    explicitly_allowed: bool,
+) -> grim_core::error::Result<()> {
+    let host = addr.rsplit_once(':').map(|(host, _)| host).unwrap_or(addr);
+    let loopback =
+        host == "localhost" || host == "::1" || host == "[::1]" || host.starts_with("127.");
+    let public = !loopback;
+    if public && !explicitly_allowed {
+        return Err(grim_core::Error::Config(format!(
+            "refusing public metrics/server bind at {addr}; set GRIM_ALLOW_PUBLIC_METRICS=1 only when public exposure is intentional"
+        )));
+    }
+    Ok(())
+}
+
 /// Chat completions endpoint — SSE streaming (§8, §4.5).
 ///
 /// §13.3 contract: no silent partial fulfillment.
@@ -693,18 +775,17 @@ async fn chat_completions(
                         "[grim-server] Cannot load model '{}': {}",
                         requested_model, e
                     );
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({
-                            "error": format!(
-                                "Model '{}' is not loaded and could not be found in the catalog. \
-                                 Run 'grim pull {}' to download it first.",
-                                requested_model, requested_model
-                            ),
-                            "model": requested_model,
-                        })),
-                    )
-                        .into_response();
+                    let mut body = request_error(
+                        ErrorCode::InvalidRequest,
+                        format!(
+                            "Model '{}' is not loaded and could not be found in the catalog. \
+                             Run 'grim pull {}' to download it first.",
+                            requested_model, requested_model
+                        ),
+                    );
+                    body["error"]["model"] = serde_json::json!(requested_model);
+                    body["error"]["cause"] = serde_json::json!(e.to_string());
+                    return (StatusCode::NOT_FOUND, Json(body)).into_response();
                 }
             }
         }
@@ -1831,6 +1912,7 @@ async fn embeddings() -> (StatusCode, Json<serde_json::Value>) {
             "model": "grim",
             "error": {
                 "type": "not_implemented",
+                "capability": "embeddings",
                 "message": "Embeddings endpoint is not yet implemented."
             }
         })),
@@ -1849,6 +1931,7 @@ async fn audio_transcriptions() -> (StatusCode, Json<serde_json::Value>) {
             "text": "",
             "error": {
                 "type": "not_implemented",
+                "capability": "audio_transcription",
                 "message": "Audio transcription endpoint is not yet implemented."
             }
         })),
@@ -1868,6 +1951,7 @@ async fn images_generations() -> (StatusCode, Json<serde_json::Value>) {
             "data": [],
             "error": {
                 "type": "not_implemented",
+                "capability": "image_generation",
                 "message": "Image generation endpoint is not yet implemented."
             }
         })),
@@ -1885,28 +1969,20 @@ async fn grpc_service_handler() -> (StatusCode, &'static str) {
 
 /// Telemetry metrics endpoint (§8)
 async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
-
-    // Probe actual ROCm hardware rather than reporting hardcoded values.
-    // §13.1: we verify the actual state rather than assuming the reported state.
-    let (rocm_gpu_count, xnack_enabled) = match grim_backend_rocm::RocmDevice::probe() {
-        Ok(devices) if !devices.is_empty() => {
-            let first = &devices[0];
-            (devices.len(), first.xnack_enabled())
-        }
-        _ => (0, false),
-    };
-
-    Json(serde_json::json!({
-        "engine_state": "healthy",
-        "active_sessions": engine.adapter_count(),
-        "block_pool_usage": 0.0,
-        "preemption_count": 0,
-        "hardware": {
-            "rocm_gpu_count": rocm_gpu_count,
-            "xnack_enabled": xnack_enabled
-        }
-    }))
+    // Keep metrics and status on one contract so probes and dashboards cannot
+    // disagree about backend, model, or KV state. Legacy counters remain.
+    let mut snapshot = get_status(State(state.clone())).await.0;
+    let active_sessions = state
+        .engine
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .adapter_count();
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert("active_sessions".into(), serde_json::json!(active_sessions));
+        object.insert("block_pool_usage".into(), serde_json::json!(0.0));
+        object.insert("preemption_count".into(), serde_json::json!(0));
+    }
+    Json(snapshot)
 }
 
 /// Helper function to perform Model capability check routing validation (§8)
@@ -2179,6 +2255,8 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
 
     // Get tokens per second from engine
     let tps = engine.tokens_per_sec().unwrap_or(0.0) as f64;
+    let scheduler = engine.scheduler_snapshot();
+    let ttft_ms = engine.last_ttft_ms();
 
     let default_model = get_default_model_from_config().unwrap_or_else(|| "default".to_string());
 
@@ -2196,14 +2274,18 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
             "kv_used_gb": kv_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             "kv_total_gb": kv_total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             "ctx_limit": ctx_limit,
-            "ttft_ms": 820.0,
-            "prefill_tps": 12.3,
+            "ttft_ms": ttft_ms,
+            "prefill_tps": serde_json::Value::Null,
             "decode_tps": tps
         }));
     }
 
+    let backend = active_backend(has_gpu);
     Json(serde_json::json!({
-        "status": "healthy",
+        "status": if models_info.is_empty() { "degraded" } else { "healthy" },
+        "engine_state": if models_info.is_empty() { "ready_no_model" } else { "healthy" },
+        "backend": backend,
+        "model_path": state.model_path.as_ref().map(|p| p.display().to_string()),
         "processor": processor,
         "default_model": default_model,
         "system_ram_used_gb": (sys_ram_used as f64 / (1024.0 * 1024.0 * 1024.0)),
@@ -2211,6 +2293,12 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
         "vram_used_gb": (total_vram_used as f64 / (1024.0 * 1024.0 * 1024.0)),
         "vram_total_gb": (total_vram_max as f64 / (1024.0 * 1024.0 * 1024.0)),
         "gpu_util_pct": gpu_util_pct,
+        "scheduler": serde_json::json!({
+            "active_requests": scheduler.active_requests,
+            "waiting_requests": scheduler.waiting_requests,
+            "admitted_requests": scheduler.admitted_requests,
+            "paused_requests": scheduler.paused_requests
+        }),
         "loaded_models": models_info,
         "kv_cache": serde_json::json!({
             "used_bytes": kv_used_bytes,
@@ -2840,7 +2928,10 @@ async fn grim_pull(
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/status", get(get_status))
+        .route("/v1/status", get(get_status))
         .route("/metrics", get(metrics_endpoint))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
@@ -2925,6 +3016,7 @@ pub async fn serve(
     model_path: Option<std::path::PathBuf>,
     plugin_registry: Option<std::sync::Arc<grim_plugin::PluginRegistry>>,
 ) -> Result<()> {
+    validate_metrics_bind_policy(addr)?;
     // Attempt to load the tokenizer from the explicitly-given model path,
     // or by scanning the models directory for the first available GGUF.
     // For `.grim` files, fall back to a sibling `.gguf` (same stem, `.gguf`
@@ -3197,6 +3289,65 @@ mod tests {
         let _ = (used, total);
     }
 
+    #[tokio::test]
+    async fn status_reports_scheduler_counts_and_no_fake_timings() {
+        let state = Arc::new(AppState {
+            engine: Mutex::new(grim_engine::Engine::new(
+                grim_engine::EngineConfig::default(),
+            )),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            plugin_registry: None,
+        });
+        let response = get_status(State(state)).await.0;
+        assert_eq!(response["scheduler"]["active_requests"], 0);
+        assert_eq!(response["scheduler"]["waiting_requests"], 0);
+        assert_eq!(response["scheduler"]["paused_requests"], 0);
+        assert!(response["loaded_models"].as_array().unwrap().is_empty());
+        assert!(response["loaded_models"][0]["ttft_ms"].is_null());
+        assert!(response["loaded_models"][0]["prefill_tps"].is_null());
+    }
+
+    #[tokio::test]
+    async fn healthz_does_not_require_loaded_model() {
+        assert_eq!(healthz().await, "OK");
+    }
+
+    #[tokio::test]
+    async fn readyz_reports_503_without_model() {
+        let state = Arc::new(AppState {
+            engine: Mutex::new(grim_engine::Engine::new(
+                grim_engine::EngineConfig::default(),
+            )),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            plugin_registry: None,
+        });
+        let (status, Json(body)) = readyz(State(state)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "not_ready");
+        assert!(
+            body["recovery"]
+                .as_str()
+                .unwrap()
+                .contains("/v1/models/load")
+        );
+    }
+
+    #[test]
+    fn metrics_public_bind_requires_explicit_opt_in() {
+        assert!(validate_metrics_bind_policy_with_opt_in("0.0.0.0:11434", false).is_err());
+        assert!(validate_metrics_bind_policy_with_opt_in("127.0.0.1:11434", false).is_ok());
+        assert!(validate_metrics_bind_policy_with_opt_in("localhost:11434", false).is_ok());
+        assert!(validate_metrics_bind_policy_with_opt_in("0.0.0.0:11434", true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn dashboard_html_references_stats_endpoint() {
+        let axum::response::Html(html) = dashboard_html().await;
+        assert!(html.contains("fetch('/api/stats')"));
+    }
+
     use axum::{
         Router,
         body::Body,
@@ -3306,6 +3457,121 @@ mod tests {
             model_path: None,
             plugin_registry: None,
         })
+    }
+
+    #[tokio::test]
+    async fn acceptance_model_catalog_chat_status_and_unknown_model_error() {
+        let app = build_router(test_state_with_model("fixture-model"));
+
+        let models = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(models.status(), StatusCode::OK);
+        let model_body = axum::body::to_bytes(models.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let model_json: serde_json::Value = serde_json::from_slice(&model_body).unwrap();
+        assert!(
+            model_json["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|model| { model["id"] == "fixture-model" })
+        );
+
+        let chat = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "fixture-model",
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "max_tokens": 2,
+                            "stream": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(chat.status(), StatusCode::OK);
+        let chat_body = axum::body::to_bytes(chat.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let chat_json: serde_json::Value = serde_json::from_slice(&chat_body).unwrap();
+        assert_eq!(chat_json["choices"][0]["message"]["role"], "assistant");
+
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let status_body = axum::body::to_bytes(status.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
+        for field in [
+            "status",
+            "engine_state",
+            "backend",
+            "loaded_models",
+            "kv_cache",
+        ] {
+            assert!(
+                status_json.get(field).is_some(),
+                "missing status field {field}"
+            );
+        }
+
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "missing-model",
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "max_tokens": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(missing.status().is_client_error());
+        let missing_body = axum::body::to_bytes(missing.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let missing_json: serde_json::Value = serde_json::from_slice(&missing_body).unwrap();
+        assert!(
+            missing_json["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("grim pull missing-model")
+        );
     }
 
     /// WI-1 unit test: the local-vs-remote decision must not treat the

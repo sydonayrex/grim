@@ -145,7 +145,7 @@ grim/
 | `grim-tensor` | `src/tensor.rs` | `tests/golden_*.rs` | `src/lib.rs` |
 | `grim-core` | `src/` | N/A | `src/lib.rs` |
 | `grim-engine` | `src/` | `tests/` | `src/lib.rs` |
-| `grim-backend-cpu` | `src/` | N/A | `src/lib.rs` |
+| `grim-backend-cpu` | `src/` | `tests/` | `src/lib.rs` |
 | `grim-backend-rocm` | `src/` | `tests/` | `src/lib.rs` |
 | `grim-models/*` | `src/` | `tests/` | `src/lib.rs` |
 
@@ -206,7 +206,7 @@ cargo fmt --check  # to verify formatting
 
 ## Maintainer Information
 
-TODO: add maintainer contact
+Maintainer Status: Actively maintained. Please see the GitHub repository for the current list of maintainers.
 
 ## Quick Reference
 

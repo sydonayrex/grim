@@ -1421,6 +1421,7 @@ fn load_model_from_config(
         | ModelArchitecture::Jais2
         | ModelArchitecture::KimiLinear
         | ModelArchitecture::Llada
+        | ModelArchitecture::Llama
         | ModelArchitecture::Llama4
         | ModelArchitecture::LlamaEmbed
         | ModelArchitecture::MainCoder
@@ -2695,6 +2696,7 @@ fn load_model_with_providers(
         | ModelArchitecture::Jais2
         | ModelArchitecture::KimiLinear
         | ModelArchitecture::Llada
+        | ModelArchitecture::Llama
         | ModelArchitecture::Llama4
         | ModelArchitecture::LlamaEmbed
         | ModelArchitecture::MainCoder

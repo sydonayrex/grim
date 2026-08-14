@@ -1,66 +1,64 @@
 # How to Download Models
 
-Grim supports multiple download sources: Ollama registry, Hugging Face, and direct URLs.
+## Goal
 
-## From Ollama Registry
+Download models into your local Grim cache from the Ollama registry, Hugging Face, or direct URLs.
 
-```bash
-# Short name (Ollama tag)
-grim pull llama3
+## Prerequisites
 
-# With quantization tag
-grim pull llama3:q4_k_m
-grim pull llama3:latest
-```
+- Grim is installed.
+- You have network access to the model registries.
 
-## From Hugging Face Hub
+## Steps
 
-```bash
-# Direct file specification
-grim pull hf:org/repo/model.gguf
+1. **Pull from the Ollama Registry**
+   Use the short name (Ollama tag) to download a model.
 
-# Repository (automated GGUF detection)
-grim pull org/repo
+   ```bash
+   grim pull llama3
+   
+   # Or with a specific tag:
+   grim pull llama3:q4_k_m
+   ```
 
-# With output path
-grim dl hf:org/repo/model.gguf --output /path/to/model.gguf
-```
+2. **Pull from Hugging Face**
+   Specify the `hf:` scheme or directly refer to the repository and file.
 
-## From Direct URL
+   ```bash
+   grim pull hf:org/repo/model.gguf
+   
+   # To specify a custom output path, use -o or --output:
+   grim dl hf:org/repo/model.gguf -o /path/to/custom.gguf
+   ```
 
-```bash
-# Any HTTPS URL to a model file
-grim pull https://huggingface.co/org/repo/resolve/main/model.gguf
+3. **Pull from a Direct URL**
+   Provide any HTTPS URL to a model file.
 
-# With output path
-grim pull https://example.com/model.gguf --output ./model.gguf
-```
+   ```bash
+   grim pull https://example.com/model.gguf
+   
+   # With a custom output path:
+   grim pull https://example.com/model.gguf --output ./model.gguf
+   ```
 
-## Resolve Model Name
+4. **Verify the Download**
+   Check your local cache to confirm the model was downloaded successfully.
 
-To check if a model exists in your cache:
+   ```bash
+   grim check
+   ```
 
-```bash
-grim check
-grim list
-```
+## Expected Output
 
-## Model Cache Location
-
-Models are stored in:
-- System: `/var/lib/grim/models/`
-- User: `~/.grim/models/`
-
-Override with:
-```bash
-export GRIM_MODELS_DIR=/custom/path
-```
-
-## Download Progress
-
-Downloads show real-time progress:
+During the download, you will see real-time progress:
 ```
   [ 45%] 2.15 / 4.80 GB
 [grim] downloading
 [grim] success
 ```
+When running `grim check`, the downloaded model will appear in your local cached list.
+
+## What Can Go Wrong
+
+- **Network timeouts**: The download may stall or fail due to network instability. **Recovery**: Re-run the `grim pull` command; Grim will attempt to resume the partial download if the server supports range requests.
+- **Out of disk space**: The model may be larger than available storage. **Recovery**: Delete unused models using `grim rm <model>` or specify a different partition using `--output`.

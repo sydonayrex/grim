@@ -1,76 +1,59 @@
 # grim-plugin
 
-Plugin system for Grim — dynamic library and WASM component loading with capability-based security. Architecture §6.
-
 ## Purpose
-
-Provides loading infrastructure for third-party extensions: dylib plugins (for performance-critical kernels and model architectures) and WASM sandboxed plugins (for control-path extensions like samplers, tokenizers, pre/post-processors). Defines the `PluginManifest` schema, `PluginCapabilities` bitflags, ABI validation, and the `DylibPluginLoader` / `WasmPluginLoader` implementations.
+Provides a third-party extension system for Grim. It supports high-performance shared-memory dynamic libraries (dylibs) and secure sandboxed WASM components.
 
 ## Boundaries
-
-- Does **not** perform inference — only loads extension code.
-- Does **not** define the `Model` or `Sampler` traits — those are in `grim-core`; it re-exports `Sampler` for plugin integration.
-- Does **not** handle HTTP serving — see `grim-server`.
+- Focuses strictly on loading, ABI validation, and invocation.
+- Does not implement specific logic for models or samplers (plugins do that).
+- Relies on `libloading` for dynamic libraries and `wasmtime` for sandboxing.
 
 ## Dependency Graph
-
 ```mermaid
-graph LR
-    A[grim-plugin] --> B[grim-tensor]
-    A --> C[grim-core]
+graph TD
+    grim-engine --> grim-plugin
 
-    subgraph "reverse deps"
-        D1[grim-engine]
-        D2[grim-cli]
-    end
-
-    D1 --> A
-    D2 --> A
-
-    style A fill:#fff8e1
+    grim-plugin --> grim-tensor
+    grim-plugin --> grim-core
+    
+    grim-plugin --> thiserror
+    grim-plugin --> serde
+    grim-plugin --> serde_json
+    grim-plugin --> toml
+    grim-plugin --> libloading
+    grim-plugin --> wasmtime
 ```
 
-## Public API
-
-```rust
-pub use arch_compat::ArchCompatSpec;
-pub use dylib_loader::DylibPluginLoader;
-pub use wasm_loader::WasmPluginLoader;
-pub use grim_core::sampler::Sampler;
-
-pub struct PluginCapabilities(pub u32);
-pub struct GrimPluginVTable { /* function pointers */ }
-pub enum PluginKind { /* Dylib, Wasm */ }
-pub struct PluginGrants { /* granted capabilities */ }
-pub struct PluginReload { /* reload policy */ }
-pub struct PluginManifest { /* fields */ }
-pub struct PluginLimits { /* memory/fuel limits */ }
-
-pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest>;
-pub fn validate_abi(manifest: &PluginManifest, engine_abi: u32) -> Result<()>;
-
-pub struct PluginRegistry { /* loaded plugin set */ }
-```
-
-## Feature Flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `dylib-loading` | no | Enable dynamic library loading via `libloading` |
-| `wasm-sandbox` | no | Enable WASM runtime via `wasmtime` |
+## Public API Overview
+- `PluginRegistry`: Container discovering and storing active plugins.
+- `PluginManifest`: Parsed representation of `plugin.grim.toml`.
+- `PluginCapabilities`: Bitflags delineating plugin features (Model, Sampler, Backend, etc.).
+- `WasmPluginLoader` & `DylibPluginLoader`: Strategy-specific loaders.
+- `GrimPluginVTable`: Stable C ABI vtable for Dylib FFI boundaries.
 
 ## Usage Example
-
 ```rust
 use grim_plugin::PluginRegistry;
 
-// grim-cli/src/plugin.rs handles loading:
-//   let count = load_plugins("/path/to/plugins", &mut registry)?;
-//   let list = list_plugins(&registry);
+let mut registry = PluginRegistry::new();
+// registry.scan_plugin_directory("/path/to/plugins").unwrap();
+
+// if let Some(sampler) = registry.get_sampler("grammar-constrained-json") {
+//     // use sampler
+// }
 ```
 
-## Edge Cases, Limitations, and Quirks
+## Use Cases
+- Distributing proprietary models via compiled Dylibs.
+- Sandboxing untrusted community pre/post-processors with WASM limits.
+- Injecting constrained grammar samplers without rebuilding the core engine.
 
-- Dylib plugins share process memory — a crash in the plugin takes the engine down. Only first-party and reviewed plugins should use this path.
-- WASM plugins are sandboxed with fuel and memory limits — they cannot touch host memory outside their grants.
-- `validate_abi` checks the plugin's declared ABI version against the engine's compiled `engine_abi` constant — mismatched versions are rejected before loading.
+## Edge Cases, Limitations, and Quirks
+- Dylib plugins execute in process memory; a segmentation fault in a Dylib will crash Grim.
+- WASM plugins have fixed memory and execution fuel limits to prevent runaway loops, configured in `plugin.grim.toml`.
+- Duplicate stage and priority pairs for processing pipelines are rejected at load time.
+
+## Build Flags, Feature Flags, and Environment Variables
+- `default`: Base system only.
+- `wasm-sandbox`: Pulls in `wasmtime` for WASM plugin support.
+- `dylib-loading`: Pulls in `libloading` for shared library support.

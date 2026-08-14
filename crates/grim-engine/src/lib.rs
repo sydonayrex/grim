@@ -161,6 +161,7 @@ pub struct Engine {
     tuned_kv_compression_bit_width: u8,
     tokens_per_sec_ema: f32,
     total_tokens_generated: u64,
+    last_ttft_ms: Option<f64>,
     /// Tensor-parallel config stamped onto each `LoadedModel`. Populated in
     /// `Engine::new` when TP is active (one OS process per rank, Design A);
     /// `None` for single-device operation. The actual per-rank device + RCCL
@@ -350,6 +351,7 @@ impl Engine {
             tuned_kv_compression_bit_width: 4,
             tokens_per_sec_ema: 0.0,
             total_tokens_generated: 0,
+            last_ttft_ms: None,
             tp_config,
             kv_receiver,
         }
@@ -380,6 +382,18 @@ impl Engine {
         } else {
             Some(self.tokens_per_sec_ema)
         }
+    }
+
+    /// Most recent measured prefill time in milliseconds. `None` means no
+    /// completed prefill has been observed yet; callers must not invent a
+    /// latency value for that state.
+    pub fn last_ttft_ms(&self) -> Option<f64> {
+        self.last_ttft_ms
+    }
+
+    /// Snapshot of scheduler queues for status and metrics consumers.
+    pub fn scheduler_snapshot(&self) -> grim_scheduler::SchedulerSnapshot {
+        self.scheduler.snapshot()
     }
 
     /// Returns KV cache telemetry stats `(used_bytes, total_bytes, blocks_used, blocks_total)`.
@@ -535,6 +549,7 @@ impl Engine {
         // scheduler produced them so a paused predicate is monotonically
         // consistent.
         let prefill = output.prefill_ids.clone();
+        let had_prefill = !prefill.is_empty();
         let mut prefill_elapsed = Duration::ZERO;
         for id in prefill {
             if self.scheduler.is_paused(id) {
@@ -580,6 +595,9 @@ impl Engine {
         // MIN-4: Record actual forward-pass wall time, not schedule time.
         // TTFT = time to first token (prefill), ITL = inter-token latency (decode).
         let ttft_ms = prefill_elapsed.as_secs_f64() * 1000.0;
+        if had_prefill {
+            self.last_ttft_ms = Some(ttft_ms);
+        }
         let itl_ms = if decode_count > 0 {
             decode_elapsed.as_secs_f64() * 1000.0 / decode_count as f64
         } else {

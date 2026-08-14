@@ -1,27 +1,22 @@
 # How to Install Grim
 
+## Goal
+
+Install Grim, build it from source, and optionally register it as a background service.
+
 ## Prerequisites
 
-### Linux (ROCm)
+### Linux (ROCm or CUDA)
 
 ```bash
-# Install ROCm 7.0+ (follow AMD's official installation guide)
-# Verify installation:
+# For AMD GPUs (ROCm 7.0+):
 /opt/rocm/bin/rocminfo
 
-# Install Rust 1.85+:
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-### Linux (CUDA)
-
-```bash
-# Install CUDA 11.8+ (follow NVIDIA's official installation guide)
-# Verify installation:
+# For NVIDIA GPUs (CUDA 11.8+):
 nvcc --version
 nvidia-smi
 
-# Install Rust 1.85+:
+# Rust 1.85+ is required for both:
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
@@ -40,50 +35,51 @@ rustup update stable
 # Install CUDA if using NVIDIA GPU
 ```
 
-## Build from Source
+## Steps
 
-```bash
-# Clone the repository
-git clone https://github.com/poolside-ai/grim.git
-cd grim
+1. **Build from source**
+   Clone the repository and build the CLI.
 
-# Build in release mode
-cargo build --release -p grim-cli
+   ```bash
+   git clone https://github.com/poolside-ai/grim.git
+   cd grim
+   cargo build --release -p grim-cli
+   ```
 
-# Or build the full workspace
-cargo build --release --workspace
+2. **Install the binary**
+   Copy the binary to a location in your PATH.
+
+   ```bash
+   cp target/release/grim-cli /usr/local/bin/grim
+   ```
+
+3. **Verify the installation**
+   Run the doctor command to re-verify every claim Grim makes about itself.
+
+   ```bash
+   grim doctor
+   ```
+
+4. **(Optional) Install as a background service**
+   Register Grim to run continuously as a system service.
+
+   ```bash
+   grim service install
+   
+   # Or with a custom service name and config file:
+   grim service install --name grim-daemon --config /etc/grim/grim.toml
+   ```
+
+## Expected Output
+
+When running `grim doctor`, you should see validation checks passing for the unit on disk, OS service visibility, HTTP health, and GPU backend:
+```
+[grim] checking unit on disk... ok
+[grim] checking OS service visibility... ok
+...
 ```
 
-## Optional: Run Tests
+## What Can Go Wrong
 
-```bash
-# Run unit tests
-cargo test --workspace
-
-# Run GPU tests (ROCm only)
-GRIM_RUN_GPU_TESTS=1 cargo test -p grim-backend-rocm --features rocm-aiter,rccl
-```
-
-## Installation
-
-```bash
-# Copy binary to PATH (binary is named grim-cli)
-cp target/release/grim-cli /usr/local/bin/grim
-
-# Verify installation
-grim --version
-grim doctor
-```
-
-## Service Installation
-
-```bash
-# Linux - systemd
-grim service install
-
-# macOS - launchd
-grim service install --exec-path /usr/local/bin/grim
-
-# Windows - SCM (admin)
-grim service run --config /etc/grim/grim.toml
-```
+- **Missing GPU toolkits**: If ROCm or CUDA are not found during the build, the compiler will fail to build the GPU backends. **Recovery**: Ensure `/opt/rocm/bin` or the CUDA toolkit paths are in your environment variables.
+- **Service installation fails**: The OS service manager may deny permission. **Recovery**: Run the service installation step with elevated privileges (e.g., `sudo` or Admin prompt).

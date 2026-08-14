@@ -149,15 +149,35 @@ fn verify_metadata<R: Read + Seek>(
 
     // Parse JSON
     match serde_json::from_slice::<serde_json::Value>(&meta_buf) {
-        Ok(_) => {
+        Ok(json) => {
             report.metadata_parsed = true;
             println!("[OK]  Metadata JSON: valid ({} bytes)", metadata_len);
+            if let Some(arch) = json.get("architecture").and_then(|v| v.as_str()) {
+                println!("[OK]  Model Architecture: {}", arch);
+            }
+            if let Some(bpw) = json.get("target_bpw").and_then(|v| v.as_f64()) {
+                println!("[OK]  Target BPW: {:.2}", bpw);
+            }
         }
         Err(e) => {
             report.errors.push(format!("Invalid metadata JSON: {e}"));
             println!("[ERR] Metadata JSON: invalid — {e}");
         }
     }
+
+    // Compute whole-file SHA256 provenance checksum
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| Error::Backend(e.to_string()))?;
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut file_buf = Vec::new();
+    reader
+        .read_to_end(&mut file_buf)
+        .map_err(|e| Error::Backend(format!("Failed to read file for provenance: {e}")))?;
+    hasher.update(&file_buf);
+    let hash = hasher.finalize();
+    println!("[OK]  Model Provenance Checksum: sha256:{:x}", hash);
 
     Ok(())
 }

@@ -1,79 +1,63 @@
-# grim-backend-cuda
-
-CUDA backend for Grim — implements `BackendDevice` and `BackendStorage` traits from `grim-tensor` using direct FFI to the CUDA driver API and cuBLAS.
-
 ## Purpose
-
-Provides `CudaDevice` and `CudaStorage` as the CUDA backend for tensor operations on NVIDIA GPUs. Uses direct FFI bindings to `cudaMalloc`, `cudaFree`, `cudaMemcpy`, and cuBLAS `cublasSgemm` rather than a crate wrapper.
+The `grim-backend-cuda` crate provides compatibility for NVIDIA GPU execution within the Grim engine. It implements the `BackendDevice` trait, binding directly to the CUDA runtime and cuBLAS library to enable high-performance operations on CUDA-capable architectures.
 
 ## Boundaries
-
-- Does **not** define the `BackendDevice` / `BackendStorage` traits — those are declared in `grim-tensor`.
-- Does **not** provide fused or attention-specific kernels — GEMM-only; other ops fall back to CPU.
-- Does **not** handle ROCm, Vulkan, or Metal dispatch — each has its own backend crate.
+This crate acts as a translation layer from the engine's generic tensor operations to native CUDA API calls. It handles raw FFI for `cudaMalloc`, `cudaMemcpy`, and kernel compilation (`nvcc`). It is strictly limited to CUDA hardware and does not bridge abstraction layers outside of fulfilling the `BackendDevice` trait.
 
 ## Dependency Graph
-
 ```mermaid
-graph LR
-    A[grim-backend-cuda] --> B[grim-tensor]
-    A --> C[grim-quant]
-
-    subgraph "reverse deps"
-        D1[grim-nn]
-        D2[grim-autograd]
-    end
-
-    D1 --> A
-    D2 --> A
-
-    style A fill:#e1f5ea
+graph TD
+    grim-backend-cuda[["grim-backend-cuda"]]
+    
+    grim-tensor["grim-tensor"]
+    grim-quant["grim-quant"]
+    grim-format["grim-format"]
+    half["half"]
+    thiserror["thiserror"]
+    seahash["seahash"]
+    serde["serde"]
+    serde_json["serde_json"]
+    tracing["tracing"]
+    
+    grim-backend-cuda --> grim-tensor
+    grim-backend-cuda --> grim-quant
+    grim-backend-cuda --> grim-format
+    grim-backend-cuda --> half
+    grim-backend-cuda --> thiserror
+    grim-backend-cuda --> seahash
+    grim-backend-cuda --> serde
+    grim-backend-cuda --> serde_json
+    grim-backend-cuda --> tracing
 ```
 
-## Public API
+## Public API Overview
+- `CudaDevice`: The core structure representing an active CUDA device and context.
+- `CudaStorage`: Represents VRAM allocations accessible via standard CUDA memory pointers.
+- `CudaHandle`: Represents the status of queued asynchronous CUDA operations.
+- `CudaAutotuner`: Mechanisms for profiling and persisting optimal kernel configurations per device.
+- `CudaCaps`: Hardware capability interrogation (e.g., compute capability, SM count).
 
+## Usage Example
 ```rust
-pub struct CudaDevice {
-    pub(crate) ordinal: usize,
-    cublas_handle: Arc<Mutex<Option<CublasHandle>>>,
+use grim_backend_cuda::CudaDevice;
+use grim_tensor::BackendDevice;
+
+fn init_cuda() {
+    let ordinal = 0;
+    if let Ok(device) = CudaDevice::new(ordinal) {
+        println!("CUDA device initialized on ordinal {}", ordinal);
+    }
 }
-
-pub struct CudaStorage { /* GPU memory handle + metadata */ }
-pub struct CublasHandle(pub *mut c_void); // dropped → `cublasDestroy_v2`
-pub struct CudaHandle { /* ... */ }
-pub struct SendCmodule(pub CUmodule);
-
-pub fn vram_info(ordinal: usize) -> Option<(u64, u64)>;
 ```
 
-CUDA FFI constants:
-
-```rust
-pub const cudaSuccess: i32 = 0;
-pub const cudaMemcpyHostToDevice: i32 = 1;
-pub const cudaMemcpyDeviceToHost: i32 = 2;
-pub const CUBLAS_STATUS_SUCCESS: i32 = 0;
-pub const CUBLAS_OP_N: i32 = 0;
-pub const CUBLAS_OP_T: i32 = 1;
-```
-
-CUDA FFI types:
-
-```rust
-pub type CUdevice = i32;
-pub type CUcontext = *mut c_void;
-pub type CUmodule = *mut c_void;
-pub type CUfunction = *mut c_void;
-pub type CUstream = *mut c_void;
-```
-
-## Feature Flags
-
-This crate has no feature flags.
+## Use Cases
+- Executing inference workloads efficiently on NVIDIA datacenters and consumer GPUs.
+- Taking advantage of cuBLAS routines for dense matrix multiplication and custom JIT-compiled PTX kernels for quantized operations.
 
 ## Edge Cases, Limitations, and Quirks
+- The crate shells out to `nvcc` at runtime for JIT compilation. The host machine *must* have the CUDA toolkit installed and `nvcc` accessible in the `$PATH` or specified via the `$NVCC` environment variable.
+- It reuses cuBLAS handles in a global thread-safe pool to avoid context exhaustion overhead during heavy tensor initialization.
 
-- Many `BackendDevice` methods (sqrt, recip, attention) return `Err(Error::Unimplemented(...))` — callers must fall back to CPU for these.
-- `vram_info` returns `Option` — `None` if the CUDA driver is unavailable.
-- `CudaDevice` is `Send` via `SendCmodule` wrapper for raw module pointers.
-- `CudaDevice` is pooled per ordinal: `CudaDevice::new(ordinal)` reuses one device (and one cuBLAS handle) per GPU for the process, so `to_cpu_vec_f32` on quantized weights no longer creates a cuBLAS handle per tensor. `CublasHandle` implements `Drop` and calls `cublasDestroy_v2` when the last `CudaDevice` clone sharing it is dropped.
+## Build Flags, Feature Flags, and Environment Variables
+- `default`: No default features are enabled.
+- Uses `NVCC` or `CUDA_PATH` environment variables during runtime JIT compilation if present.
