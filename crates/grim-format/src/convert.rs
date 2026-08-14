@@ -433,7 +433,7 @@ pub fn convert_to_grim(
     // Progress callback invoked with `(stage, done, total)` so the CLI
     // can render a conversion percentage bar. Stages: "evopress",
     // "pack", "write". When `None`, no progress is reported.
-    progress: Option<&mut dyn FnMut(&str, usize, usize)>,
+    progress: Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)>,
 ) -> Result<()> {
     convert_to_grim_inner(
         input_path,
@@ -467,7 +467,7 @@ pub fn convert_to_grim_with_dequant(
     caller_metadata: Option<crate::gguf::GrimMetadata>,
     target_format: Option<String>,
     wave: Option<crate::format::WaveSize>,
-    progress: Option<&mut dyn FnMut(&str, usize, usize)>,
+    progress: Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)>,
     gpu_dequant: &(dyn GpuDequant + Sync),
 ) -> Result<()> {
     convert_to_grim_inner(
@@ -499,9 +499,10 @@ fn convert_to_grim_inner(
     caller_metadata: Option<crate::gguf::GrimMetadata>,
     target_format: Option<String>,
     wave: Option<crate::format::WaveSize>,
-    mut progress: Option<&mut dyn FnMut(&str, usize, usize)>,
+    mut progress: Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)>,
     gpu_dequant: Option<&(dyn GpuDequant + Sync)>,
 ) -> Result<()> {
+    let start_time = std::time::Instant::now();
     println!("[Grim Convert] Starting conversion pipeline...");
     println!("  Source: {}", input_path);
     println!("  Target GCN: {}", target_gcn);
@@ -671,8 +672,10 @@ fn convert_to_grim_inner(
     writer
         .flush()
         .map_err(|e| Error::Backend(format!("flush failed: {e}")))?;
+    let elapsed = start_time.elapsed();
     println!(
-        "[Grim Convert] Conversion completed: {} ({} tensors)",
+        "[Grim Convert] Conversion completed in {:.2}s: {} ({} tensors)",
+        elapsed.as_secs_f64(),
         output_path,
         written_entries.len()
     );
@@ -695,7 +698,7 @@ fn build_entries_from_source(
     target_bpw: f32,
     evopress_bitwidths: Option<Vec<u32>>,
     wave: crate::format::WaveSize,
-    progress: &mut Option<&mut dyn FnMut(&str, usize, usize)>,
+    progress: &mut Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)>,
     gpu_dequant: Option<&(dyn GpuDequant + Sync)>,
 ) -> Result<(
     Vec<(crate::format::GrimTensorEntry, Vec<u8>)>,
@@ -743,7 +746,7 @@ fn pack_tensors(
     target_bpw: f32,
     evopress_bitwidths: Option<Vec<u32>>,
     wave: crate::format::WaveSize,
-    progress: &mut Option<&mut dyn FnMut(&str, usize, usize)>,
+    progress: &mut Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)>,
     gpu_dequant: Option<&(dyn GpuDequant + Sync)>,
 ) -> Result<(
     Vec<(crate::format::GrimTensorEntry, Vec<u8>)>,
@@ -754,7 +757,8 @@ fn pack_tensors(
 
     let total = names.len();
     let completed = AtomicUsize::new(0);
-    let (tx, rx) = std::sync::mpsc::channel();
+    use std::sync::Mutex;
+    let progress_mutex = progress.as_mut().map(|cb| Mutex::new(cb));
 
     let packed_items: Result<
         Vec<(
@@ -849,17 +853,15 @@ fn pack_tensors(
             };
 
             let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            let _ = tx.send(count);
+            if let Some(ref mtx) = progress_mutex {
+                if let Ok(mut cb) = mtx.lock() {
+                    cb("pack", count, total);
+                }
+            }
 
             Ok(((entry, normals), spqr_ext))
         })
         .collect();
-
-    if let Some(cb) = progress.as_deref_mut() {
-        while let Ok(count) = rx.try_recv() {
-            cb("pack", count, total);
-        }
-    }
 
     let packed_items = packed_items?;
     let mut result = Vec::with_capacity(total);
