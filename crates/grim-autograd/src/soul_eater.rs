@@ -613,7 +613,6 @@ mod tests {
         let x_vec = x.to_vec_f32().unwrap();
         let u_vec = adapter.u.to_vec_f32().unwrap();
         let v_vec = adapter.v.to_vec_f32().unwrap();
-        let sig_vec = adapter.sigma.to_vec_f32().unwrap();
         let mut x_v = vec![0.0f32; r];
         for k in 0..r {
             for i in 0..d_in {

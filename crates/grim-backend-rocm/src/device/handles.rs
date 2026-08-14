@@ -182,7 +182,6 @@ unsafe extern "C" {
     pub fn hipEventSynchronize(event: *mut c_void) -> HipErrorT;
     pub fn hipEventElapsedTime(ms: *mut f32, start: *mut c_void, stop: *mut c_void) -> HipErrorT;
 
-
     pub fn hipModuleLoad(module: *mut *mut c_void, path: *const i8) -> HipErrorT;
     pub fn hipModuleUnload(module: *mut c_void) -> HipErrorT;
     pub fn hipModuleGetFunction(

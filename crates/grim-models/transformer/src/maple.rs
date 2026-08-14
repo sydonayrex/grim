@@ -1,10 +1,10 @@
 //! Maple 20B-A1B MoE transformer — 256 experts, 8 active per token, 3:1 SWA-512 hybrid attention.
 
 use grim_core::error::Result;
-use grim_core::model::{AdapterHandle, CausalLm, Model, ModelConfig, ModalityHint};
+use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
-use grim_nn::moe::RouterKind;
 use grim_nn::TensorParallelConfig;
+use grim_nn::moe::RouterKind;
 use grim_tensor::{ArithType, Device, Tensor};
 
 use crate::model::{Llama, LlamaConfig};
@@ -127,7 +127,7 @@ impl Maple {
             rms_norm_eps: cfg.rms_norm_eps,
             rope_theta: cfg.rope_theta,
             max_seq_len: cfg.max_seq_len,
-        
+
             partial_rotary_factor: 1.0,
             yarn: None,
         };
@@ -156,7 +156,11 @@ impl Maple {
 
         let attn_specs: Vec<crate::block::LayerAttentionSpec> = (0..cfg.num_layers)
             .map(|i| {
-                let layer_type = cfg.layer_types.get(i).map(|s| s.as_str()).unwrap_or("full_attention");
+                let layer_type = cfg
+                    .layer_types
+                    .get(i)
+                    .map(|s| s.as_str())
+                    .unwrap_or("full_attention");
                 let is_sliding = layer_type == "sliding_attention";
                 let attn_type = if is_sliding {
                     crate::block::AttentionType::Sliding
@@ -211,7 +215,8 @@ impl Maple {
             })
             .collect();
 
-        let inner = Llama::load_tp_moe_specs(device.clone(), ws, llama_cfg, &moe_spec, &attn_specs, tp)?;
+        let inner =
+            Llama::load_tp_moe_specs(device.clone(), ws, llama_cfg, &moe_spec, &attn_specs, tp)?;
 
         Ok(Self {
             cfg,

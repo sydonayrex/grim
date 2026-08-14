@@ -1,7 +1,7 @@
 //! Thin wrapper around `Llama` for qwen35moe uses a Llama-style transformer.
 
 use grim_core::error::Result;
-use grim_core::model::{AdapterHandle, CausalLm, Model, ModelConfig, ModalityHint};
+use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::TensorParallelConfig;
 use grim_tensor::{ArithType, Device, Tensor};
@@ -64,7 +64,11 @@ pub struct Qwen35Moe {
 }
 
 impl Qwen35Moe {
-    pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: Qwen35MoeConfig) -> Result<Self> {
+    pub fn load(
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: Qwen35MoeConfig,
+    ) -> Result<Self> {
         Self::load_tp(device, ws, cfg, ws.tp_config())
     }
 
@@ -94,7 +98,11 @@ impl Qwen35Moe {
             num_experts: cfg.num_experts,
             top_k: cfg.num_experts_per_tok,
             router_kind: grim_nn::moe::RouterKind::SoftmaxTopK,
-            routed_scaling_factor: if cfg.routed_scaling_factor == 0.0 { 1.0 } else { cfg.routed_scaling_factor },
+            routed_scaling_factor: if cfg.routed_scaling_factor == 0.0 {
+                1.0
+            } else {
+                cfg.routed_scaling_factor
+            },
             has_shared_expert: has_shared,
             moe_intermediate_size: Some(cfg.intermediate_size),
             shared_expert_intermediate_size: cfg.shared_expert_intermediate_size,
@@ -103,7 +111,11 @@ impl Qwen35Moe {
         let moe_spec: Vec<Option<crate::moe_block::MoESpec>> = vec![Some(spec); cfg.num_layers];
 
         let inner = Llama::load_tp_moe(device.clone(), ws, llama_cfg, &moe_spec, tp)?;
-        Ok(Self { cfg, device: inner.device.clone(), inner })
+        Ok(Self {
+            cfg,
+            device: inner.device.clone(),
+            inner,
+        })
     }
 }
 

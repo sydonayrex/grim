@@ -1,10 +1,9 @@
-pub mod caps;
 pub mod autotune;
+pub mod caps;
 pub mod kernels;
 
+pub use autotune::{CudaAutotuner, CudaTileConfig, GemmOp, ShapeClass};
 pub use caps::CudaCaps;
-pub use autotune::{CudaAutotuner, CudaTileConfig, ShapeClass, GemmOp};
-
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -744,13 +743,37 @@ impl CudaDevice {
             let mut max_threads = 0i32;
             let mut pitch = 0i32;
 
-            if cudaDeviceGetAttribute(&mut major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, ordinal as i32) == cudaSuccess
-                && cudaDeviceGetAttribute(&mut minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, ordinal as i32) == cudaSuccess
+            if cudaDeviceGetAttribute(
+                &mut major,
+                CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                ordinal as i32,
+            ) == cudaSuccess
+                && cudaDeviceGetAttribute(
+                    &mut minor,
+                    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                    ordinal as i32,
+                ) == cudaSuccess
             {
-                cudaDeviceGetAttribute(&mut sm_count, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, ordinal as i32);
-                cudaDeviceGetAttribute(&mut shared_mem, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, ordinal as i32);
-                cudaDeviceGetAttribute(&mut max_threads, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, ordinal as i32);
-                cudaDeviceGetAttribute(&mut pitch, CU_DEVICE_ATTRIBUTE_TEXTURE_PITCH_ALIGNMENT, ordinal as i32);
+                cudaDeviceGetAttribute(
+                    &mut sm_count,
+                    CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                    ordinal as i32,
+                );
+                cudaDeviceGetAttribute(
+                    &mut shared_mem,
+                    CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+                    ordinal as i32,
+                );
+                cudaDeviceGetAttribute(
+                    &mut max_threads,
+                    CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+                    ordinal as i32,
+                );
+                cudaDeviceGetAttribute(
+                    &mut pitch,
+                    CU_DEVICE_ATTRIBUTE_TEXTURE_PITCH_ALIGNMENT,
+                    ordinal as i32,
+                );
 
                 let mut total_mem = 0usize;
                 let mut free_mem = 0usize;
@@ -798,7 +821,8 @@ impl CudaDevice {
     /// ROCm-parity dispatch glue; the tile config is logged for diagnostics and
     /// will drive a custom-kernel path once one exists.
     pub fn gemm_tile_config(&self, m: usize, n: usize, k: usize, op: GemmOp) -> CudaTileConfig {
-        self.autotuner.search_tile_config(&self.caps, m, n, k, Some(op))
+        self.autotuner
+            .search_tile_config(&self.caps, m, n, k, Some(op))
     }
 
     /// Persist the on-disk autotune cache for this device's hardware fingerprint.
@@ -1067,7 +1091,10 @@ impl CudaDevice {
         out_ptr: *mut c_void,
         n_weights: usize,
     ) -> Result<Box<dyn ComputeHandle>> {
-        if !self.caps.supports_quant_format(grim_tensor::dtype::QuantFormat::Fp8) {
+        if !self
+            .caps
+            .supports_quant_format(grim_tensor::dtype::QuantFormat::Fp8)
+        {
             return Err(Error::Backend(format!(
                 "FP8 dequantization is not supported on CUDA Compute Capability {}.{} (requires >= 8.9 / Ada)",
                 self.caps.compute_major, self.caps.compute_minor
@@ -1380,7 +1407,10 @@ impl CudaDevice {
             grim_tensor::QuantFormat::Fp8 => {
                 // T1 caps gate: a device without native FP8 (compute < 8.9) must not
                 // dispatch the fp8 quantize kernel.
-                if !self.caps.supports_quant_format(grim_tensor::QuantFormat::Fp8) {
+                if !self
+                    .caps
+                    .supports_quant_format(grim_tensor::QuantFormat::Fp8)
+                {
                     return Err(Error::Backend(
                         "quantize_on_device: FP8 not supported on this device".into(),
                     ));
@@ -1781,7 +1811,9 @@ impl CudaDevice {
         let gw_s = gate_w
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("moe_fused_dispatch: gate_w is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("moe_fused_dispatch: gate_w is not CudaStorage".into())
+            })?;
         let uw_s = up_w
             .as_any()
             .downcast_ref::<CudaStorage>()
@@ -1789,7 +1821,9 @@ impl CudaDevice {
         let dw_s = down_w
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("moe_fused_dispatch: down_w is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("moe_fused_dispatch: down_w is not CudaStorage".into())
+            })?;
         let tok_s = router_tokens
             .as_any()
             .downcast_ref::<CudaStorage>()
@@ -2048,7 +2082,9 @@ impl CudaDevice {
         let res_storage = residual
             .as_any()
             .downcast_ref::<CudaStorage>()
-            .ok_or_else(|| Error::Backend("fused_add_rms_norm residual is not CudaStorage".into()))?;
+            .ok_or_else(|| {
+                Error::Backend("fused_add_rms_norm residual is not CudaStorage".into())
+            })?;
         let w_storage = weight
             .as_any()
             .downcast_ref::<CudaStorage>()
@@ -2705,8 +2741,7 @@ impl BackendDevice for CudaDevice {
                             } else if wavelength > low {
                                 freq / y.factor
                             } else {
-                                let ramp = (y.original_max_pos as f32 / wavelength
-                                    - y.beta_slow)
+                                let ramp = (y.original_max_pos as f32 / wavelength - y.beta_slow)
                                     / (y.beta_fast - y.beta_slow);
                                 (1.0 - ramp) * (freq / y.factor) + ramp * freq
                             }
@@ -2790,9 +2825,11 @@ impl BackendDevice for CudaDevice {
             // Grid covers max(b*s*rotary_half, b*s*copy_len) threads so the
             // rotate pass and the verbatim-copy pass both fit in one launch.
             let copy_len = d - 2 * rotary_half;
-            let total = b * s * rotary_half
-                .max(if copy_len > 0 { copy_len } else { 0 })
-                .max(1);
+            let total = b
+                * s
+                * rotary_half
+                    .max(if copy_len > 0 { copy_len } else { 0 })
+                    .max(1);
             let handle = self.launch_rank1_kernel("grim_rope_yarn", &mut args, total)?;
 
             unsafe {
@@ -2971,8 +3008,18 @@ impl BackendDevice for CudaDevice {
         _causal: bool,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let (out_storage, _h) =
-            self.qkv_attention(q, k, v, num_kv_heads, seq_len, 0, None, out_shape, None, None)?;
+        let (out_storage, _h) = self.qkv_attention(
+            q,
+            k,
+            v,
+            num_kv_heads,
+            seq_len,
+            0,
+            None,
+            out_shape,
+            None,
+            None,
+        )?;
         let _ = num_heads;
         let _ = head_dim;
         tracing::debug!(
@@ -3000,8 +3047,9 @@ impl BackendDevice for CudaDevice {
         kv_seq_len: usize,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let (out_storage, _h) =
-            self.qkv_attention(q, k, v, num_heads, kv_seq_len, 0, None, out_shape, None, None)?;
+        let (out_storage, _h) = self.qkv_attention(
+            q, k, v, num_heads, kv_seq_len, 0, None, out_shape, None, None,
+        )?;
         tracing::debug!(
             target: "grim_cuda",
             seq_len = seq_len,
@@ -3559,7 +3607,10 @@ impl BackendDevice for CudaDevice {
             grim_tensor::QuantFormat::Fp4Block16 => "grim_fused_quant_gemm_nvfp4",
             grim_tensor::QuantFormat::Fp8 => {
                 // T1 caps gate: without native FP8 (compute < 8.9), don't select the fp8 shader.
-                if !self.caps.supports_quant_format(grim_tensor::QuantFormat::Fp8) {
+                if !self
+                    .caps
+                    .supports_quant_format(grim_tensor::QuantFormat::Fp8)
+                {
                     return Err(Error::Backend(
                         "fused_quant_gemm: FP8 not supported on this device".into(),
                     ));
@@ -3848,14 +3899,17 @@ mod tests {
 
         // activations [batch, hidden]
         let x_data: Vec<f32> = (0..batch * hidden).map(|i| i as f32 * 0.1).collect();
-        let x = dev.from_cpu(&x_data, &Shape::new(vec![batch, hidden]), DType::F32).unwrap();
+        let x = dev
+            .from_cpu(&x_data, &Shape::new(vec![batch, hidden]), DType::F32)
+            .unwrap();
 
         // per-expert gate/up [inter, hidden], down [hidden, inter]
         let mk = |e: usize, sign: f32| -> Vec<f32> {
             let mut v = vec![0.0f32; inter * hidden];
             for i in 0..inter {
                 for h in 0..hidden {
-                    v[i * hidden + h] = sign * (1.0 + (i as f32) * 0.1 + (h as f32) * 0.01 + e as f32);
+                    v[i * hidden + h] =
+                        sign * (1.0 + (i as f32) * 0.1 + (h as f32) * 0.01 + e as f32);
                 }
             }
             v
@@ -3880,15 +3934,57 @@ mod tests {
         let rw = vec![1.0f32, 1.0f32];
         let num_pairs = rtok.len();
 
-        let gate_buf = dev.from_cpu(&gate_flat, &Shape::new(vec![num_experts * inter * hidden]), DType::F32).unwrap();
-        let up_buf = dev.from_cpu(&up_flat, &Shape::new(vec![num_experts * inter * hidden]), DType::F32).unwrap();
-        let down_buf = dev.from_cpu(&down_flat, &Shape::new(vec![num_experts * hidden * inter]), DType::F32).unwrap();
+        let gate_buf = dev
+            .from_cpu(
+                &gate_flat,
+                &Shape::new(vec![num_experts * inter * hidden]),
+                DType::F32,
+            )
+            .unwrap();
+        let up_buf = dev
+            .from_cpu(
+                &up_flat,
+                &Shape::new(vec![num_experts * inter * hidden]),
+                DType::F32,
+            )
+            .unwrap();
+        let down_buf = dev
+            .from_cpu(
+                &down_flat,
+                &Shape::new(vec![num_experts * hidden * inter]),
+                DType::F32,
+            )
+            .unwrap();
         let rtok_bytes: Vec<u8> = rtok.iter().flat_map(|v| v.to_le_bytes()).collect();
         let rexp_bytes: Vec<u8> = rexp.iter().flat_map(|v| v.to_le_bytes()).collect();
         let rw_bytes: Vec<u8> = rw.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let tok_buf = Box::new(CudaStorage::copy_from_host_raw_bytes(&rtok_bytes, &Shape::new(vec![num_pairs]), DType::F32, 0).unwrap());
-        let exp_buf = Box::new(CudaStorage::copy_from_host_raw_bytes(&rexp_bytes, &Shape::new(vec![num_pairs]), DType::F32, 0).unwrap());
-        let w_buf = Box::new(CudaStorage::copy_from_host_raw_bytes(&rw_bytes, &Shape::new(vec![num_pairs]), DType::F32, 0).unwrap());
+        let tok_buf = Box::new(
+            CudaStorage::copy_from_host_raw_bytes(
+                &rtok_bytes,
+                &Shape::new(vec![num_pairs]),
+                DType::F32,
+                0,
+            )
+            .unwrap(),
+        );
+        let exp_buf = Box::new(
+            CudaStorage::copy_from_host_raw_bytes(
+                &rexp_bytes,
+                &Shape::new(vec![num_pairs]),
+                DType::F32,
+                0,
+            )
+            .unwrap(),
+        );
+        let w_buf = Box::new(
+            CudaStorage::copy_from_host_raw_bytes(
+                &rw_bytes,
+                &Shape::new(vec![num_pairs]),
+                DType::F32,
+                0,
+            )
+            .unwrap(),
+        );
 
         let out_shape = Shape::new(vec![batch, hidden]);
         let (out, _h) = dev
@@ -4525,7 +4621,9 @@ mod tests {
 
         let a_shape = Shape::new(vec![m as usize, k as usize]);
         let b_shape = Shape::new(vec![n as usize, k as usize]); // [N, K] packed layout
-        let a_storage = dev.from_cpu(&a_src, &a_shape, DType::F32).expect("a from_cpu");
+        let a_storage = dev
+            .from_cpu(&a_src, &a_shape, DType::F32)
+            .expect("a from_cpu");
         let a_cuda = as_cuda_storage(a_storage.as_ref());
 
         let packed = grim_quant::quant_q4k(&b_src).expect("quant_q4k");
@@ -4586,7 +4684,9 @@ mod tests {
 
         let a_shape = Shape::new(vec![m as usize, k as usize]);
         let b_shape = Shape::new(vec![n as usize, k as usize]); // [N, K] packed layout
-        let a_storage = dev.from_cpu(&a_src, &a_shape, DType::F32).expect("a from_cpu");
+        let a_storage = dev
+            .from_cpu(&a_src, &a_shape, DType::F32)
+            .expect("a from_cpu");
         let a_cuda = as_cuda_storage(a_storage.as_ref());
 
         let packed = grim_quant::quant_q6k(&b_src).expect("quant_q6k");
@@ -4623,7 +4723,10 @@ mod tests {
             let denom = expected[i].abs().max(1.0);
             max_err = max_err.max(e / denom);
         }
-        assert!(max_err < 0.05, "fused q6k GEMM mismatch: max_rel_err={max_err}");
+        assert!(
+            max_err < 0.05,
+            "fused q6k GEMM mismatch: max_rel_err={max_err}"
+        );
     }
 
     #[test]
@@ -4634,7 +4737,7 @@ mod tests {
         let Some(dev) = dequant_test_device() else {
             return;
         };
-        use grim_format::gguf::{read_gguf, read_tensor_bytes, GgufDType};
+        use grim_format::gguf::{GgufDType, read_gguf, read_tensor_bytes};
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .find(|p| p.join("models").is_dir())
@@ -4660,7 +4763,9 @@ mod tests {
             let m = 8u32;
             let a_src: Vec<f32> = (0..(m * k)).map(|i| (i as f32 * 0.013).sin()).collect();
             let a_shape = Shape::new(vec![m as usize, k as usize]);
-            let a_storage = dev.from_cpu(&a_src, &a_shape, DType::F32).expect("a from_cpu");
+            let a_storage = dev
+                .from_cpu(&a_src, &a_shape, DType::F32)
+                .expect("a from_cpu");
             let a_cuda = as_cuda_storage(a_storage.as_ref());
             let b_shape = Shape::new(vec![n as usize, k as usize]);
             let b_storage = upload_packed(
@@ -4715,13 +4820,19 @@ mod tests {
         assert!(e1 < 0.05, "real-model Q4K fused GEMM mismatch: {e1}");
         let (n1b, e1b) = run_one(GgufDType::Q4K, "blk.0.attn_q.weight");
         eprintln!("[real-q4k] {n1b}: max_rel_err={e1b}");
-        assert!(e1b < 0.05, "real-model Q4K attn_q fused GEMM mismatch: {e1b}");
+        assert!(
+            e1b < 0.05,
+            "real-model Q4K attn_q fused GEMM mismatch: {e1b}"
+        );
         let (n2, e2) = run_one(GgufDType::Q6K, "output.weight");
         eprintln!("[real-q6k] {n2}: max_rel_err={e2}");
         assert!(e2 < 0.05, "real-model Q6K fused GEMM mismatch: {e2}");
         let (n2b, e2b) = run_one(GgufDType::Q6K, "blk.0.attn_v.weight");
         eprintln!("[real-q6k] {n2b}: max_rel_err={e2b}");
-        assert!(e2b < 0.05, "real-model Q6K attn_v fused GEMM mismatch: {e2b}");
+        assert!(
+            e2b < 0.05,
+            "real-model Q6K attn_v fused GEMM mismatch: {e2b}"
+        );
 
         // CLI orientation: get transposes attn_v to [256, 1536]; verify the
         // kernel on that transposed layout with several A patterns.
@@ -4735,16 +4846,26 @@ mod tests {
             let (n, k) = (256u32, 1536u32); // transposed [out, in]
             let m = 16u32;
             let patterns: Vec<(&str, Vec<f32>)> = vec![
-                ("sin", (0..(m * k)).map(|i| (i as f32 * 0.013).sin()).collect()),
+                (
+                    "sin",
+                    (0..(m * k)).map(|i| (i as f32 * 0.013).sin()).collect(),
+                ),
                 ("ones", vec![1.0f32; (m * k) as usize]),
-                ("realmag", (0..(m * k)).map(|i| {
-                    // mimic real x_norm range ~[-3.4, 1.7]
-                    if i % 7 == 0 { -3.37f32 } else { 1.71f32 }
-                }).collect()),
+                (
+                    "realmag",
+                    (0..(m * k))
+                        .map(|i| {
+                            // mimic real x_norm range ~[-3.4, 1.7]
+                            if i % 7 == 0 { -3.37f32 } else { 1.71f32 }
+                        })
+                        .collect(),
+                ),
             ];
             for (name, a_src) in patterns {
                 let a_shape = Shape::new(vec![m as usize, k as usize]);
-                let a_storage = dev.from_cpu(&a_src, &a_shape, DType::F32).expect("a from_cpu");
+                let a_storage = dev
+                    .from_cpu(&a_src, &a_shape, DType::F32)
+                    .expect("a from_cpu");
                 let a_cuda = as_cuda_storage(a_storage.as_ref());
                 let b_shape = Shape::new(vec![n as usize, k as usize]);
                 let b_storage = upload_packed(
@@ -4776,7 +4897,9 @@ mod tests {
         let src: Vec<f32> = (0..n).map(|i| (i as f32 * 0.11).sin() * 0.3).collect();
         let packed = grim_quant::quant_iq4nl(&src).expect("quant_iq4nl");
         let expected = grim_quant::dequant_iq4nl(&packed, n).expect("cpu oracle iq4nl");
-        let fallback = dev.dequantize_iq_host(&packed, n, KQuantScheme::IQ4NL).expect("host fallback");
+        let fallback = dev
+            .dequantize_iq_host(&packed, n, KQuantScheme::IQ4NL)
+            .expect("host fallback");
         assert_eq!(fallback.len(), expected.len());
     }
 

@@ -37,8 +37,14 @@ fn test_cuda_autotuner_shape_class_routing() {
     let caps = CudaCaps::probe_default(0, "CUDA Test Device".into(), 8, 9);
     let autotuner = CudaAutotuner::new();
 
-    assert_eq!(ShapeClass::from_op(GemmOp::LmHead, 16, 128000, 4096), ShapeClass::TLOLog);
-    assert_eq!(ShapeClass::from_op(GemmOp::Ffn, 64, 64, 4096), ShapeClass::Prefill);
+    assert_eq!(
+        ShapeClass::from_op(GemmOp::LmHead, 16, 128000, 4096),
+        ShapeClass::TLOLog
+    );
+    assert_eq!(
+        ShapeClass::from_op(GemmOp::Ffn, 64, 64, 4096),
+        ShapeClass::Prefill
+    );
 
     // Decode shape (m=1)
     assert_eq!(ShapeClass::classify(1, 4096, 4096), ShapeClass::Decode);
@@ -92,7 +98,12 @@ fn test_cuda_gemm_tile_config_op_identity() {
     assert!(prefill_cfg.is_valid(&caps));
 
     // Resource gating: a config that exceeds shared memory should be filtered
-    let over_cfg = CudaTileConfig { block_m: 128, block_n: 128, block_k: 128, split_k: 1 };
+    let over_cfg = CudaTileConfig {
+        block_m: 128,
+        block_n: 128,
+        block_k: 128,
+        split_k: 1,
+    };
     assert!(!over_cfg.is_valid(&caps));
 }
 
@@ -122,7 +133,10 @@ fn test_autotuner_cache_persistence_round_trip() {
     let loaded = CudaAutotuner::new();
     loaded.load_cache(&caps);
     let cfg = loaded.search_tile_config(&caps, 16, 128000, 4096, Some(GemmOp::LmHead));
-    assert_eq!(cfg, winner, "loaded cache must restore the persisted winner");
+    assert_eq!(
+        cfg, winner,
+        "loaded cache must restore the persisted winner"
+    );
 
     // Cleanup the test artifact.
     let _ = std::fs::remove_file(&path);

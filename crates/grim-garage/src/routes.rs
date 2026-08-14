@@ -1184,7 +1184,9 @@ async fn load_model_handler(
     if req.model_path.contains("..") {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "Invalid model path: path traversal components ('..') are prohibited" })),
+            Json(
+                json!({ "error": "Invalid model path: path traversal components ('..') are prohibited" }),
+            ),
         ));
     }
 

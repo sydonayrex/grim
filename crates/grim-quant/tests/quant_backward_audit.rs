@@ -8,12 +8,6 @@
 //! 4. ROCm GPU path moved to `grim-backend-rocm/tests/quant_backward_gpu.rs`.
 
 use grim_quant::{dequant_q4k, dequant_q80, quant_q4k, quant_q80};
-use grim_tensor::{
-    Shape,
-    backend::BackendDevice,
-    dtype::{DType, KQuantScheme, Storage},
-};
-
 /// Maximum allowed RMS relative error for Q8_0 (8-bit).
 const MAX_RMS_REL_ERROR_Q8: f32 = 0.05;
 /// Maximum allowed RMS relative error for Q4_K (4-bit quantization with up to 20% accumulation noise).

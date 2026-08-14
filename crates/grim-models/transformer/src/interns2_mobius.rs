@@ -1,7 +1,7 @@
 //! Compatibility loader for `internlm/Intern-S2-Mobius` (HuggingFace `model_type = "interns2_mobius"`).
 
 use grim_core::error::{Error, Result};
-use grim_core::model::{AdapterHandle, CausalLm, Model, ModelConfig, ModalityHint};
+use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_tensor::{ArithType, Device, Tensor};
 
@@ -71,7 +71,11 @@ pub struct InternS2Mobius {
 }
 
 impl InternS2Mobius {
-    pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: InternS2MobiusConfig) -> Result<Self> {
+    pub fn load(
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: InternS2MobiusConfig,
+    ) -> Result<Self> {
         Self::load_tp(device, ws, cfg)
     }
 

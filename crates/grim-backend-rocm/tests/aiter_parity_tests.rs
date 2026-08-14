@@ -132,4 +132,3 @@ fn test_fused_allreduce_rms_norm_parity() {
     assert_eq!(res_vec, vec![1.5, 2.5, 3.5, 4.5, 0.0, -1.0, -2.0, -3.0]);
     assert_eq!(norm_vec.len(), 8);
 }
-

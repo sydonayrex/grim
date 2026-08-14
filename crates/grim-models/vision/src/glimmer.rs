@@ -320,7 +320,11 @@ impl GlimmerVision {
     }
 
     /// Build given an RNG (deterministic seed control for tests).
-    pub fn new(device: Device, cfg: GlimmerVisionConfig, rng: &mut grim_core::rng::SimpleRng) -> Self {
+    pub fn new(
+        device: Device,
+        cfg: GlimmerVisionConfig,
+        rng: &mut grim_core::rng::SimpleRng,
+    ) -> Self {
         let patch_dim = cfg.patch_dim();
         let proj_w: Vec<f32> = (0..cfg.hidden_size * patch_dim)
             .map(|_| (rng.next_f32() - 0.5) * 0.02)
@@ -398,7 +402,11 @@ impl GlimmerVision {
             blocks.push(blk);
         }
         let ln = if cfg.use_vision_norm {
-            Some(RmsNorm::load(&ws.pp("ln"), cfg.hidden_size, cfg.rms_norm_eps)?)
+            Some(RmsNorm::load(
+                &ws.pp("ln"),
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+            )?)
         } else {
             None
         };

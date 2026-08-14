@@ -36,7 +36,6 @@ pub fn lookup_gemm_config_for_shape(
         };
     }
     match wave {
-
         WavefrontSize::W64 => {
             if m <= 8 {
                 // Decode / small-batch path. Asymmetric sizing:

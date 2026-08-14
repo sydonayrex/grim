@@ -118,15 +118,17 @@ impl MetalAutotuner {
         let lock = self.cache.lock().unwrap();
         let entries: Vec<CacheEntry> = lock
             .iter()
-            .map(|(&(c_hash, m, n, k, sc), &(config, latency_ms))| CacheEntry {
-                caps_hash: c_hash,
-                m,
-                n,
-                k,
-                shape_class: format!("{:?}", sc),
-                config,
-                latency_ms,
-            })
+            .map(
+                |(&(c_hash, m, n, k, sc), &(config, latency_ms))| CacheEntry {
+                    caps_hash: c_hash,
+                    m,
+                    n,
+                    k,
+                    shape_class: format!("{:?}", sc),
+                    config,
+                    latency_ms,
+                },
+            )
             .collect();
 
         if let Ok(json) = serde_json::to_string_pretty(&entries) {
@@ -143,7 +145,9 @@ impl MetalAutotuner {
         k: usize,
         op: Option<GemmOp>,
     ) -> MetalTileConfig {
-        self.search_tile_config_measured::<fn(&MetalTileConfig) -> Option<f64>>(caps, m, n, k, op, None)
+        self.search_tile_config_measured::<fn(&MetalTileConfig) -> Option<f64>>(
+            caps, m, n, k, op, None,
+        )
     }
 
     /// Select optimal Metal tile parameters using empirical GPU timing benchmarking when available.
@@ -175,19 +179,64 @@ impl MetalAutotuner {
         // Candidate tile configs including split_k variations
         let candidates = match shape_class {
             ShapeClass::TLOLog => vec![
-                MetalTileConfig { block_m: 16, block_n: 64, block_k: 16, split_k: 1 },
-                MetalTileConfig { block_m: 32, block_n: 64, block_k: 16, split_k: 1 },
-                MetalTileConfig { block_m: 16, block_n: 64, block_k: 16, split_k: 2 },
+                MetalTileConfig {
+                    block_m: 16,
+                    block_n: 64,
+                    block_k: 16,
+                    split_k: 1,
+                },
+                MetalTileConfig {
+                    block_m: 32,
+                    block_n: 64,
+                    block_k: 16,
+                    split_k: 1,
+                },
+                MetalTileConfig {
+                    block_m: 16,
+                    block_n: 64,
+                    block_k: 16,
+                    split_k: 2,
+                },
             ],
             ShapeClass::Decode => vec![
-                MetalTileConfig { block_m: 16, block_n: 32, block_k: 16, split_k: 1 },
-                MetalTileConfig { block_m: 32, block_n: 32, block_k: 16, split_k: 1 },
-                MetalTileConfig { block_m: 16, block_n: 32, block_k: 16, split_k: 4 },
+                MetalTileConfig {
+                    block_m: 16,
+                    block_n: 32,
+                    block_k: 16,
+                    split_k: 1,
+                },
+                MetalTileConfig {
+                    block_m: 32,
+                    block_n: 32,
+                    block_k: 16,
+                    split_k: 1,
+                },
+                MetalTileConfig {
+                    block_m: 16,
+                    block_n: 32,
+                    block_k: 16,
+                    split_k: 4,
+                },
             ],
             ShapeClass::Prefill => vec![
-                MetalTileConfig { block_m: 64, block_n: 64, block_k: 16, split_k: 1 },
-                MetalTileConfig { block_m: 32, block_n: 32, block_k: 16, split_k: 1 },
-                MetalTileConfig { block_m: 32, block_n: 32, block_k: 32, split_k: 2 },
+                MetalTileConfig {
+                    block_m: 64,
+                    block_n: 64,
+                    block_k: 16,
+                    split_k: 1,
+                },
+                MetalTileConfig {
+                    block_m: 32,
+                    block_n: 32,
+                    block_k: 16,
+                    split_k: 1,
+                },
+                MetalTileConfig {
+                    block_m: 32,
+                    block_n: 32,
+                    block_k: 32,
+                    split_k: 2,
+                },
             ],
         };
 

@@ -92,7 +92,10 @@ fn kernels() -> Vec<(&'static str, String)> {
         ("kv_dequant_attention", load_kernel("kv_dequant_attention")),
         ("selective_scan", load_kernel("selective_scan")),
         ("qkv_attention_paged", load_kernel("qkv_attention_paged")),
-        ("qkv_attention_paged_swa", load_kernel("qkv_attention_paged_swa")),
+        (
+            "qkv_attention_paged_swa",
+            load_kernel("qkv_attention_paged_swa"),
+        ),
         ("tree_attention", load_kernel("tree_attention")),
         ("flash_attention", load_kernel("flash_attention")),
         ("silu_mul_backward", load_kernel("silu_mul_backward")),

@@ -506,7 +506,12 @@ impl MiniCpmModel {
         let norm = RmsNorm::load(&ws.pp("norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
         let output = match Linear::load(&ws.pp("output"), cfg.hidden_size, cfg.vocab_size, false) {
             Ok(out) => out,
-            Err(_) => Linear::load(&ws.pp("tok_embeddings"), cfg.hidden_size, cfg.vocab_size, false)?,
+            Err(_) => Linear::load(
+                &ws.pp("tok_embeddings"),
+                cfg.hidden_size,
+                cfg.vocab_size,
+                false,
+            )?,
         };
 
         Ok(Self {
@@ -632,10 +637,7 @@ impl CausalLm for MiniCpmModel {
             .map(|_| 0.0f32)
             .collect();
 
-        let emb = self
-            .tok_embeddings
-            .weight
-            .to_vec_f32()?;
+        let emb = self.tok_embeddings.weight.to_vec_f32()?;
 
         for (idx, &id) in ids.iter().enumerate() {
             if (id as usize) < self.cfg.vocab_size {

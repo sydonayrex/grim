@@ -237,7 +237,8 @@ impl SpeculativeCausalLm {
                     let p_target = softmax_f32_row(&target_probs[row_start..row_end])[draft_tok];
                     let draft_row_start = i * vocab_size;
                     let draft_row_end = draft_row_start + vocab_size;
-                    let p_draft = softmax_f32_row(&draft_logits[draft_row_start..draft_row_end])[draft_tok];
+                    let p_draft =
+                        softmax_f32_row(&draft_logits[draft_row_start..draft_row_end])[draft_tok];
 
                     // Ratio test: accept with min(1, p_target / p_draft).
                     let p_accept = if p_draft > 1e-10 {
@@ -289,8 +290,12 @@ impl SpeculativeCausalLm {
                 // Accepted token rows start at (context_len - 1) since target forward
                 // returned [context_len, vocab_size] and the last row is the bonus token.
                 let ctx_offset = context_len.saturating_sub(1);
-                let accepted_logits =
-                    self.extract_accepted_logits(&target_logits, accepted_count, vocab_size, ctx_offset)?;
+                let accepted_logits = self.extract_accepted_logits(
+                    &target_logits,
+                    accepted_count,
+                    vocab_size,
+                    ctx_offset,
+                )?;
                 session.set_last_accepted_tokens(accepted_count);
                 Ok(accepted_logits)
             }
@@ -354,7 +359,8 @@ impl SpeculativeCausalLm {
             let target_row_end = target_row_start + vocab_size;
             let draft_row_start = i * vocab_size;
             let draft_row_end = draft_row_start + vocab_size;
-            let p_target = softmax_f32_row(&target_probs[target_row_start..target_row_end])[draft_tok];
+            let p_target =
+                softmax_f32_row(&target_probs[target_row_start..target_row_end])[draft_tok];
             let p_draft = softmax_f32_row(&draft_logits[draft_row_start..draft_row_end])[draft_tok];
 
             let p_accept = if p_draft > 1e-10 {
@@ -568,7 +574,7 @@ mod tests {
             rope_theta: 10000.0,
             max_seq_len: 2048,
             rms_norm_eps: 1e-5,
-        
+
             partial_rotary_factor: 1.0,
             yarn: None,
         };

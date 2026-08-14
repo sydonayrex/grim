@@ -204,19 +204,64 @@ impl CudaAutotuner {
         // Candidate tile configs including specialization & split_k variations
         let candidates = match shape_class {
             ShapeClass::TLOLog => vec![
-                CudaTileConfig { block_m: 16, block_n: 64, block_k: 64, split_k: 1 },
-                CudaTileConfig { block_m: 32, block_n: 64, block_k: 32, split_k: 1 },
-                CudaTileConfig { block_m: 16, block_n: 64, block_k: 64, split_k: 2 },
+                CudaTileConfig {
+                    block_m: 16,
+                    block_n: 64,
+                    block_k: 64,
+                    split_k: 1,
+                },
+                CudaTileConfig {
+                    block_m: 32,
+                    block_n: 64,
+                    block_k: 32,
+                    split_k: 1,
+                },
+                CudaTileConfig {
+                    block_m: 16,
+                    block_n: 64,
+                    block_k: 64,
+                    split_k: 2,
+                },
             ],
             ShapeClass::Decode => vec![
-                CudaTileConfig { block_m: 16, block_n: 16, block_k: 16, split_k: 1 },
-                CudaTileConfig { block_m: 32, block_n: 32, block_k: 16, split_k: 1 },
-                CudaTileConfig { block_m: 16, block_n: 16, block_k: 16, split_k: 4 },
+                CudaTileConfig {
+                    block_m: 16,
+                    block_n: 16,
+                    block_k: 16,
+                    split_k: 1,
+                },
+                CudaTileConfig {
+                    block_m: 32,
+                    block_n: 32,
+                    block_k: 16,
+                    split_k: 1,
+                },
+                CudaTileConfig {
+                    block_m: 16,
+                    block_n: 16,
+                    block_k: 16,
+                    split_k: 4,
+                },
             ],
             ShapeClass::Prefill => vec![
-                CudaTileConfig { block_m: 64, block_n: 64, block_k: 16, split_k: 1 },
-                CudaTileConfig { block_m: 32, block_n: 32, block_k: 16, split_k: 1 },
-                CudaTileConfig { block_m: 32, block_n: 32, block_k: 32, split_k: 2 },
+                CudaTileConfig {
+                    block_m: 64,
+                    block_n: 64,
+                    block_k: 16,
+                    split_k: 1,
+                },
+                CudaTileConfig {
+                    block_m: 32,
+                    block_n: 32,
+                    block_k: 16,
+                    split_k: 1,
+                },
+                CudaTileConfig {
+                    block_m: 32,
+                    block_n: 32,
+                    block_k: 32,
+                    split_k: 2,
+                },
             ],
         };
 

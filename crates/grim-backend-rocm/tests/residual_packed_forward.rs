@@ -88,7 +88,8 @@ fn residual_packed_forward_passes_backup2_and_merges_it() {
     assert!(
         FUSED_FORWARD_DISPATCH_STATS
             .kernel_calls
-            .load(std::sync::atomic::Ordering::Relaxed) >= 1
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 1
     );
 
     assert_eq!(
@@ -181,7 +182,8 @@ fn residual_packed_forward_applies_outlier_correction_in_fused_path() {
     assert!(
         FUSED_FORWARD_DISPATCH_STATS
             .kernel_calls
-            .load(std::sync::atomic::Ordering::Relaxed) >= 1
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 1
     );
 
     assert_eq!(

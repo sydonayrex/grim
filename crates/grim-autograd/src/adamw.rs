@@ -2235,7 +2235,7 @@ mod tests {
         let n = 24;
         let rank = 4;
         let mat: Vec<f32> = (0..m * n)
-            .map(|i| ((i as f32 * 0.05).sin() * 0.5))
+            .map(|i| (i as f32 * 0.05).sin() * 0.5)
             .collect();
         let (u, s, vt) = randomized_svd(&mat, m, n, rank, 5, 2);
         assert_eq!(u.len(), m * rank);

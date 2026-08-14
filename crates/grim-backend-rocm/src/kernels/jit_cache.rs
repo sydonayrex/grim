@@ -115,10 +115,10 @@ impl HsacoKernelCache {
         if cache_path.exists() {
             let metadata = fs::metadata(&cache_path)?;
             let modified = metadata.modified()?;
-            self.entries
-                .write()
-                .unwrap()
-                .insert(key.to_string(), (cache_path.clone(), modified, lowered_name.to_string()));
+            self.entries.write().unwrap().insert(
+                key.to_string(),
+                (cache_path.clone(), modified, lowered_name.to_string()),
+            );
             return Ok(cache_path);
         }
 
@@ -126,10 +126,10 @@ impl HsacoKernelCache {
 
         let metadata = fs::metadata(&cache_path)?;
         let modified = metadata.modified()?;
-        self.entries
-            .write()
-            .unwrap()
-            .insert(key.to_string(), (cache_path.clone(), modified, lowered_name.to_string()));
+        self.entries.write().unwrap().insert(
+            key.to_string(),
+            (cache_path.clone(), modified, lowered_name.to_string()),
+        );
 
         Ok(cache_path)
     }

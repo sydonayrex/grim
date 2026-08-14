@@ -119,7 +119,12 @@ impl Drop for RequestCleanupGuard {
             return;
         }
         self.dropped = true;
-        if let Ok(mut engine) = self.state.engine.lock().or_else(|p| Ok::<_, ()>(p.into_inner())) {
+        if let Ok(mut engine) = self
+            .state
+            .engine
+            .lock()
+            .or_else(|p| Ok::<_, ()>(p.into_inner()))
+        {
             engine.finish_request(self.request_id);
         }
         // Remove the cancel token we registered so a stray reference doesn't
@@ -1069,7 +1074,11 @@ async fn chat_completions(
             .map(|m| m.config.context_length())
             .unwrap_or(0)
     };
-    let context_limit = if model_context_length > 0 { model_context_length as usize } else { 8192 };
+    let context_limit = if model_context_length > 0 {
+        model_context_length as usize
+    } else {
+        8192
+    };
     let total_requested = prompt_tokens.len().saturating_add(max_tokens as usize);
     if total_requested > context_limit {
         return (
@@ -1275,7 +1284,11 @@ async fn chat_completions(
 
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-                    let tokenizer = state.tokenizer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let tokenizer = state
+                        .tokenizer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
                     let token_text = if let Some(tok) = &tokenizer {
                         tok.decode(&[token_id])
                     } else {
@@ -1290,7 +1303,8 @@ async fn chat_completions(
                     if hit_eos {
                         // Trim the EOS token's text from the emitted buffer
                         // so it doesn't appear in the response.
-                        emitted = emitted.strip_suffix(&token_text)
+                        emitted = emitted
+                            .strip_suffix(&token_text)
                             .unwrap_or(&emitted)
                             .to_string();
                     }
@@ -1299,8 +1313,6 @@ async fn chat_completions(
                         emitted = trimmed;
                     }
                     if hit_stop || hit_eos {
-
-
                         // A stop sequence or EOS terminated generation early —
                         // same end-of-stream tool-call extraction path as max_tokens.
                         let (reasoning_content, clean_emitted) =
@@ -1372,7 +1384,11 @@ async fn chat_completions(
                 .collect()
         };
 
-        let tokenizer = state.tokenizer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let tokenizer = state
+            .tokenizer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         // Tokenize the prompt once for prefill (rendered from messages above)
         let prompt_tokens = prompt_tokens.clone();
         // Honor `max_tokens` (was a hardcoded 5) and stop sequences.
@@ -1431,7 +1447,8 @@ async fn chat_completions(
             // and strip the EOS token's text from the output (it's a signal,
             // not content — OpenAI convention).
             if eos_token_id == Some(token_id) {
-                content = content.strip_suffix(&token_text)
+                content = content
+                    .strip_suffix(&token_text)
                     .unwrap_or(&content)
                     .to_string();
                 break;
@@ -1451,11 +1468,12 @@ async fn chat_completions(
         // content (the actual response). This mirrors DeepSeek-R1 /
         // Qwen3-Thinking convention where the think preamble is surfaced
         // separately. Only applies when thinking_level is not Off.
-        let (reasoning_content, content) = if thinking_level != grim_core::sampler::ThinkingLevel::Off {
-            split_think_content(&content)
-        } else {
-            (None, content)
-        };
+        let (reasoning_content, content) =
+            if thinking_level != grim_core::sampler::ThinkingLevel::Off {
+                split_think_content(&content)
+            } else {
+                (None, content)
+            };
 
         {
             let mut engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
@@ -3028,7 +3046,11 @@ pub async fn serve(
     });
 
     // Capability-based routing verification at server startup (§8)
-    if let Err(e) = validate_model_capabilities(&state.engine.lock().unwrap_or_else(|e| e.into_inner()), "default", "text") {
+    if let Err(e) = validate_model_capabilities(
+        &state.engine.lock().unwrap_or_else(|e| e.into_inner()),
+        "default",
+        "text",
+    ) {
         eprintln!("[Server] Model capability check failed: {e}");
     }
 
@@ -3205,10 +3227,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
 
@@ -3272,10 +3294,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model(name, mock_model);
         Arc::new(AppState {
@@ -3521,10 +3543,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
 
@@ -3620,10 +3642,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
 
@@ -3695,10 +3717,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
 
@@ -3757,10 +3779,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
 
@@ -3816,10 +3838,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
 
@@ -3888,10 +3910,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
 
@@ -3946,10 +3968,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
 
@@ -4010,10 +4032,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
         let state = Arc::new(AppState {
@@ -4067,10 +4089,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
 
@@ -4175,10 +4197,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
 
@@ -4240,10 +4262,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
 
@@ -4310,10 +4332,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
 
@@ -4372,7 +4394,6 @@ mod tests {
         );
     }
 
-
     /// WI-TOOLS-1: `tools` and `tool_choice` are now accepted by KNOWN_FIELDS
     /// (previously hard-400'd). A non-tool-capable model produces an ordinary
     /// completion, but the request must succeed rather than be rejected.
@@ -4392,10 +4413,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
 
@@ -4469,10 +4490,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
 
@@ -4602,10 +4623,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
 
@@ -4675,10 +4696,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
 
@@ -4740,7 +4761,7 @@ mod tests {
             adapter_ids: vec![],
             input_ids: Some(vec![0]),
         };
-        engine.enqueue_request(req);
+        let _ = engine.enqueue_request(req);
         assert!(
             !engine.scheduler.waiting.is_empty(),
             "request should be enqueued in the waiting queue"
@@ -4821,7 +4842,7 @@ mod tests {
             adapter_ids: vec![],
             input_ids: Some(vec![0]),
         };
-        engine.enqueue_request(req);
+        let _ = engine.enqueue_request(req);
 
         let state = Arc::new(AppState {
             engine: Mutex::new(engine),
@@ -4876,10 +4897,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 2048,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ));
         engine.register_model("default", mock_model);
         let state = Arc::new(AppState {

@@ -29,12 +29,43 @@ extern "C" __global__ void grim_wmma_gemm(
     const _Float16* a_tile_ptr = A + tile_row * 16 * stride_a;
     const _Float16* b_tile_ptr = B + tile_col * 16;
 
-    // Loop over the K dimension in steps of 16.
+    // Optional ping-pong LDS staging. The JIT define is selected by the tile
+    // picker only when two tiles fit in the LDS budget. Each wave cooperatively
+    // fills one buffer, computes from it, then alternates buffers.
+#if GRIM_LDS_DOUBLE_BUFFER
+    __shared__ _Float16 lds_a[2][256];
+    __shared__ _Float16 lds_b[2][256];
+    int ping = 0;
+    for (int k = 0; k < K; k += 16) {
+        int lane = threadIdx.x & 255;
+        if (lane < 256) {
+            int r = lane / 16;
+            int c = lane & 15;
+            lds_a[ping][lane] = (r < 16 && k + c < K)
+                ? a_tile_ptr[r * stride_a + k + c] : (_Float16)0;
+            lds_b[ping][lane] = (r < 16 && k + r < K)
+                ? b_tile_ptr[(k + r) * stride_b + c] : (_Float16)0;
+        }
+        __syncthreads();
+#if GRIM_SCHED_GROUP_BARRIER
+        __builtin_amdgcn_sched_group_barrier(0xffffffff, 1, 0);
+#endif
+        load_matrix_sync(frag_a, lds_a[ping], 16);
+        load_matrix_sync(frag_b, lds_b[ping], 16);
+        mma_sync(frag_c, frag_a, frag_b, frag_c);
+        __syncthreads();
+        ping ^= 1;
+    }
+#else
     for (int k = 0; k < K; k += 16) {
         load_matrix_sync(frag_a, a_tile_ptr + k, stride_a);
         load_matrix_sync(frag_b, b_tile_ptr + k * stride_b, stride_b);
         mma_sync(frag_c, frag_a, frag_b, frag_c);
+#if GRIM_SCHED_GROUP_BARRIER
+        __builtin_amdgcn_sched_group_barrier(0xffffffff, 1, 0);
+#endif
     }
+#endif
 
     // rocWMMA accumulators store float; store to an intermediate row-major
     // float buffer, then cast to _Float16 for the output. Directly passing

@@ -187,9 +187,7 @@ impl ArchCompatSpec {
         let routed_scaling_factor = raw
             .routed_scaling_factor
             .or(raw.expert_gating_func)
-            .or_else(|| {
-                text.and_then(|t| t.routed_scaling_factor.or(t.expert_gating_func))
-            });
+            .or_else(|| text.and_then(|t| t.routed_scaling_factor.or(t.expert_gating_func)));
 
         let is_moe = model_arch.is_moe() || expert_count.is_some();
         let is_ssm = model_arch.is_ssm();

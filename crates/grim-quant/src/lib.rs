@@ -58,12 +58,12 @@ pub fn dequant_gptq_group_int(
     // QNT-6 fix: `shape` is caller-supplied and was indexed with `shape[0]` /
     // `shape[1]` directly, which panics on a slice shorter than 2 elements.
     // Bounds-check and return a proper error instead.
-    let in_features = *shape
-        .get(0)
-        .ok_or_else(|| Error::Backend("dequant_gptq_group_int: shape missing in_features".into()))?;
-    let out_features = *shape
-        .get(1)
-        .ok_or_else(|| Error::Backend("dequant_gptq_group_int: shape missing out_features".into()))?;
+    let in_features = *shape.get(0).ok_or_else(|| {
+        Error::Backend("dequant_gptq_group_int: shape missing in_features".into())
+    })?;
+    let out_features = *shape.get(1).ok_or_else(|| {
+        Error::Backend("dequant_gptq_group_int: shape missing out_features".into())
+    })?;
 
     let mut out = vec![0.0f32; in_features * out_features];
 
@@ -215,8 +215,8 @@ const BLOCK_Q8_WEIGHTS: usize = 32;
 
 /// Canonical IQ4_NL signed 16-entry codebook (ggml `kvalues_iq4nl`).
 const KVALUES_IQ4NL: [f32; 16] = [
-    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
-      1.0,    13.0,  25.0,  38.0,  53.0,  69.0,  87.0, 107.0,
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0,
+    87.0, 107.0,
 ];
 
 /// Absolute-value 16-entry codebook table alias for IQ4_XS.
@@ -284,7 +284,11 @@ pub fn dequant_iq4nl(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
             let sb_scale = scales[sb] as f32 + 1.0;
             let code = KVALUES_IQ4NL[nibble as usize];
             let sign_bit = (q8[i / 8] >> (i % 8)) & 1;
-            let signed = if sign_bit != 0 { -code.abs() } else { code.abs() };
+            let signed = if sign_bit != 0 {
+                -code.abs()
+            } else {
+                code.abs()
+            };
             let val = d * sb_scale * signed;
             out.push(val);
         }
@@ -548,7 +552,9 @@ pub fn dequant_iq2xs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 ///   - `scales`: 8 bytes scale shifts
 ///   - `signs` : 24 bytes sign bits
 pub fn dequant_iq2s(_data: &[u8], _num_weights: usize) -> Result<Vec<f32>> {
-    Err(Error::Unimplemented("dequant_iq2s requires grid-vector lookup table; use Q2_K or Q4_K".into()))
+    Err(Error::Unimplemented(
+        "dequant_iq2s requires grid-vector lookup table; use Q2_K or Q4_K".into(),
+    ))
 }
 /// Dequantize Q4_K bytes to f32 per the ggml/llama.cpp super-block specification.
 ///
@@ -3055,7 +3061,11 @@ pub fn evopress_search(
         let mut next_gen = Vec::with_capacity(config.population_size);
 
         // Elitism: keep top-2.
-        population.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap_or(std::cmp::Ordering::Equal));
+        population.sort_by(|a, b| {
+            b.fitness
+                .partial_cmp(&a.fitness)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         if config.population_size >= 2 {
             next_gen.push(population[0].clone());
             next_gen.push(population[1].clone());
@@ -3106,7 +3116,11 @@ fn tournament_select<'a>(pop: &'a [Individual], k: usize, rng: &mut SimpleRng) -
             let idx = (rng.next_u64() as usize) % pop.len().max(1);
             &pop[idx]
         })
-        .max_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            a.fitness
+                .partial_cmp(&b.fitness)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .unwrap();
     best
 }
@@ -4814,7 +4828,11 @@ mod tests {
 
         let ql_offset = n * 64 + l + if (quarter & 1) != 0 { 32 } else { 0 };
         let ql_byte = ql[ql_offset];
-        let nibble = if (quarter & 2) != 0 { ql_byte >> 4 } else { ql_byte & 0x0F };
+        let nibble = if (quarter & 2) != 0 {
+            ql_byte >> 4
+        } else {
+            ql_byte & 0x0F
+        };
 
         let qh_byte = qh[n * 32 + l];
         let qh_bits = (qh_byte >> (2 * quarter)) & 0x03;
@@ -4872,8 +4890,7 @@ mod tests {
         }
         data[208..210].copy_from_slice(&0x3E00u16.to_le_bytes());
         let cpu = dequant_q6k(&data, 256).expect("dequant_q6k");
-        let distinct =
-            cpu.iter().filter(|v| v.abs() > 1e-6).count();
+        let distinct = cpu.iter().filter(|v| v.abs() > 1e-6).count();
         assert!(
             distinct > 200,
             "golden block dequant produced mostly-zeros ({distinct}/256); \
@@ -4965,12 +4982,12 @@ mod tests {
     /// file is absent.
     #[test]
     fn test_q4k_real_model_matches_ggml_reference() {
-        let path = std::env::var("GRIM_Q4K_MODEL").unwrap_or_else(|_| "models/MiniCPM5-1B-Q4_K_M.gguf".into());
+        let path = std::env::var("GRIM_Q4K_MODEL")
+            .unwrap_or_else(|_| "models/MiniCPM5-1B-Q4_K_M.gguf".into());
         let Ok(file) = std::fs::File::open(&path) else {
             eprintln!("skip: model not found at {path}");
             return;
         };
-        use std::io::{Read, Seek, SeekFrom};
         let mut reader = file;
         let gguf = grim_format::gguf::read_gguf(&mut reader).expect("read_gguf");
         let info = gguf
@@ -4978,8 +4995,13 @@ mod tests {
             .iter()
             .find(|t| t.name == "token_embd.weight")
             .expect("token_embd.weight present");
-        assert_eq!(info.dtype, grim_format::gguf::GgufDType::Q4K, "dtype must be Q4_K");
-        let bytes = grim_format::gguf::read_tensor_bytes(&mut reader, &gguf, info).expect("read bytes");
+        assert_eq!(
+            info.dtype,
+            grim_format::gguf::GgufDType::Q4K,
+            "dtype must be Q4_K"
+        );
+        let bytes =
+            grim_format::gguf::read_tensor_bytes(&mut reader, &gguf, info).expect("read bytes");
         let n = info.elem_count();
 
         let grim_out = dequant_q4k(&bytes, n).expect("grim dequant_q4k");
@@ -5010,7 +5032,7 @@ mod tests {
             let mut is = 0usize;
             let mut qoff = 0usize;
             for _ in 0..(QK_K / 64) {
-                let (mut s, mut m) = ggml_get_scale_min_k4(is, scales);
+                let (s, m) = ggml_get_scale_min_k4(is, scales);
                 let d1 = d * s;
                 let m1 = min * m;
                 let (s, m) = ggml_get_scale_min_k4(is + 1, scales);

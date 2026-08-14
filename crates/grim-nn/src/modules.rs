@@ -78,7 +78,6 @@ pub fn softplus_mul_on_device(
     ))
 }
 
-
 /// Elementwise tensor addition `a + b` dispatched on-device without CPU roundtrips.
 pub fn add_on_device(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let dev = pick_device_for_tensor(a);
@@ -130,7 +129,6 @@ pub fn pick_device_for_storage_device(d: &Device) -> Arc<dyn BackendDevice> {
         _ => CPU_DEV.get_or_init(|| Arc::new(CpuDevice::new())).clone(),
     }
 }
-
 
 /// Add two tensors element-wise with broadcasting, dispatching to the
 /// device that owns `a`'s storage. This replaces the CPU-only
@@ -492,10 +490,18 @@ impl Linear {
         let out_shape = Shape::new(vec![batch, out_dim]);
         let (out_s, h) = if self.w_t.dtype().is_quantized() {
             let quant_fmt = match &self.w_t.dtype().storage {
-                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80) => Some(grim_tensor::QuantFormat::Q8_0),
-                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q5K) => Some(grim_tensor::QuantFormat::Q5K),
-                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K) => Some(grim_tensor::QuantFormat::Q4K),
-                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q6K) => Some(grim_tensor::QuantFormat::Q6K),
+                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80) => {
+                    Some(grim_tensor::QuantFormat::Q8_0)
+                }
+                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q5K) => {
+                    Some(grim_tensor::QuantFormat::Q5K)
+                }
+                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K) => {
+                    Some(grim_tensor::QuantFormat::Q4K)
+                }
+                Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q6K) => {
+                    Some(grim_tensor::QuantFormat::Q6K)
+                }
                 _ => None,
             };
             if let Some(fmt) = quant_fmt {
@@ -659,7 +665,8 @@ pub(crate) fn broadcast_bias(b: &Tensor, batch: usize, out_dim: usize) -> Result
         Ok(grim_backend_cpu::cpu_tensor(out, new_shape))
     } else {
         let dev = pick_device_for_tensor(b);
-        let (storage, _handle) = dev.broadcast_bias(b.storage().as_ref(), batch, out_dim, &new_shape)?;
+        let (storage, _handle) =
+            dev.broadcast_bias(b.storage().as_ref(), batch, out_dim, &new_shape)?;
         Ok(Tensor::new(
             Arc::from(storage),
             new_shape,
@@ -669,8 +676,6 @@ pub(crate) fn broadcast_bias(b: &Tensor, batch: usize, out_dim: usize) -> Result
         ))
     }
 }
-
-
 
 // ---------- RMSNorm ----------
 
@@ -689,7 +694,6 @@ impl RmsNorm {
         let weight = ws.get([dim], "weight")?;
         Ok(Self { weight, eps })
     }
-
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let dev = pick_device_for_tensor(x);
@@ -863,7 +867,6 @@ impl Embedding {
 
 pub use grim_tensor::{RopeConfig, YaRNParams};
 
-
 /// Rotary positional embedding — apply RoPE to `(B, S, D)` query/key.
 #[derive(Debug, Clone)]
 pub struct Rope {
@@ -926,7 +929,11 @@ impl Rope {
                 })
                 .collect();
 
-            let mscale = self.config.yarn.as_ref().map_or(1.0, |y| y.attention_factor);
+            let mscale = self
+                .config
+                .yarn
+                .as_ref()
+                .map_or(1.0, |y| y.attention_factor);
 
             let mut src = x.to_vec_f32()?;
             for bi in 0..b {
@@ -1098,10 +1105,19 @@ mod tests {
         let y = rope.forward(&x, &[3]).expect("partial rope forward");
         let out = y.to_vec_f32().expect("to vec");
         // Channels 4..8 unchanged.
-        assert_eq!(out[4..8], input[4..8], "partial rotary must pass through tail channels");
+        assert_eq!(
+            out[4..8],
+            input[4..8],
+            "partial rotary must pass through tail channels"
+        );
         // Channels 0..4 rotated (not equal to input).
-        assert!(out[..4].iter().zip(input[..4].iter()).any(|(a, b)| (a - b).abs() > 1e-4),
-            "partial rotary must rotate leading channels");
+        assert!(
+            out[..4]
+                .iter()
+                .zip(input[..4].iter())
+                .any(|(a, b)| (a - b).abs() > 1e-4),
+            "partial rotary must rotate leading channels"
+        );
     }
 
     // YaRN magnitude correction applies the attention_factor mscale (here 1.0)
@@ -1128,10 +1144,12 @@ mod tests {
         let p = plain.forward(&x, &[5]).unwrap().to_vec_f32().unwrap();
         let y = yarn.forward(&x, &[5]).unwrap().to_vec_f32().unwrap();
         for (a, b) in p.iter().zip(y.iter()) {
-            assert!((a - b).abs() < 1e-4, "YaRN factor=1 must equal plain RoPE, got {a} vs {b}");
+            assert!(
+                (a - b).abs() < 1e-4,
+                "YaRN factor=1 must equal plain RoPE, got {a} vs {b}"
+            );
         }
     }
-
 
     #[test]
     fn test_linear_shape_mismatch_returns_error() {
@@ -1350,8 +1368,15 @@ mod tests {
         }
         // Sanity: pos=0 is identity (existing test covers this); here pos=5
         // must NOT equal input (confirms the rotation actually fired).
-        let diff = out.iter().zip(input.iter()).map(|(a, b)| (a - b).abs()).sum::<f32>();
-        assert!(diff > 0.1, "non-zero position must produce a non-trivial rotation (diff={diff})");
+        let diff = out
+            .iter()
+            .zip(input.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum::<f32>();
+        assert!(
+            diff > 0.1,
+            "non-zero position must produce a non-trivial rotation (diff={diff})"
+        );
     }
 
     #[test]
@@ -1430,7 +1455,6 @@ mod tests {
         assert!((v[0] - 0.5).abs() < 1e-5);
     }
 }
-
 
 // ---------- MLA & KDA Attention Primitives ----------
 
@@ -1518,11 +1542,17 @@ pub fn short_conv1d(
 ) -> Result<Tensor> {
     let dims = x.shape().dims();
     if dims.len() != 3 {
-        return Err(Error::Shape(format!("short_conv1d expects [B,S,D], got {:?}", dims)));
+        return Err(Error::Shape(format!(
+            "short_conv1d expects [B,S,D], got {:?}",
+            dims
+        )));
     }
     let (b, s, d) = (dims[0], dims[1], dims[2]);
     let dev = pick_device_for_tensor(x);
-    if let (Some(state), false) = (conv_state.as_deref(), matches!(x.device(), grim_tensor::Device::Cpu)) {
+    if let (Some(state), false) = (
+        conv_state.as_deref(),
+        matches!(x.device(), grim_tensor::Device::Cpu),
+    ) {
         let out_shape = Shape::new(vec![b, s, d]);
         if let Ok((storage, _h)) = dev.short_conv1d_causal_step(
             x.storage().as_ref(),
@@ -1566,7 +1596,10 @@ pub fn short_conv1d(
                         let state_k = (state_vec.len() / (b * d)).max(1);
                         let state_off = (bi * d + di) * state_k;
                         let state_idx = (state_k as isize + prev_idx) as usize;
-                        state_vec.get(state_off + state_idx).copied().unwrap_or(0.0f32)
+                        state_vec
+                            .get(state_off + state_idx)
+                            .copied()
+                            .unwrap_or(0.0f32)
                     } else {
                         0.0f32
                     };
@@ -1669,8 +1702,7 @@ impl MlaAttention {
             for si in 0..s {
                 for hi in 0..self.num_heads {
                     let q_base = ((bi * s + si) * self.num_heads + hi) * qk_head_dim;
-                    let q_rope_base =
-                        ((bi * s + si) * self.num_heads + hi) * self.qk_rope_head_dim;
+                    let q_rope_base = ((bi * s + si) * self.num_heads + hi) * self.qk_rope_head_dim;
                     for i in 0..self.qk_rope_head_dim {
                         if q_base + self.qk_nope_head_dim + i < q_vec.len() {
                             q_rope_vec[q_rope_base + i] = q_vec[q_base + self.qk_nope_head_dim + i];
@@ -1732,11 +1764,7 @@ pub struct KdaAttention {
 }
 
 impl KdaAttention {
-    pub fn forward(
-        &self,
-        x: &Tensor,
-        cache: Option<&mut KdaLayerCache>,
-    ) -> Result<Tensor> {
+    pub fn forward(&self, x: &Tensor, cache: Option<&mut KdaLayerCache>) -> Result<Tensor> {
         let dims = x.shape().dims();
         let (b, s, _d) = (dims[0], dims[1], dims[2]);
 
@@ -1914,9 +1942,12 @@ impl LinearAttentionBlock {
                     let qk_token_off = (bi * s + si) * self.num_k_heads + k_head_idx;
                     let v_token_off = (bi * s + si) * self.num_v_heads + hi;
 
-                    let q_tok = &q_vec[qk_token_off * self.k_head_dim..(qk_token_off + 1) * self.k_head_dim];
-                    let k_tok = &k_vec[qk_token_off * self.k_head_dim..(qk_token_off + 1) * self.k_head_dim];
-                    let v_tok = &v_vec[v_token_off * self.v_head_dim..(v_token_off + 1) * self.v_head_dim];
+                    let q_tok = &q_vec
+                        [qk_token_off * self.k_head_dim..(qk_token_off + 1) * self.k_head_dim];
+                    let k_tok = &k_vec
+                        [qk_token_off * self.k_head_dim..(qk_token_off + 1) * self.k_head_dim];
+                    let v_tok =
+                        &v_vec[v_token_off * self.v_head_dim..(v_token_off + 1) * self.v_head_dim];
 
                     // Outer product state update: S += k^T * v
                     for ki in 0..self.k_head_dim {
@@ -1943,7 +1974,8 @@ impl LinearAttentionBlock {
 
                 if let Some(ref mut st) = rec_st {
                     let dev = pick_device_for_tensor(x);
-                    let shape = Shape::new(vec![b, self.num_v_heads, self.k_head_dim, self.v_head_dim]);
+                    let shape =
+                        Shape::new(vec![b, self.num_v_heads, self.k_head_dim, self.v_head_dim]);
                     let storage = dev.from_cpu(&state, &shape, DType::F32)?;
                     **st = Tensor::new(
                         Arc::from(storage),
@@ -1970,6 +2002,3 @@ impl LinearAttentionBlock {
         self.o_proj.forward(&out_t)
     }
 }
-
-
-

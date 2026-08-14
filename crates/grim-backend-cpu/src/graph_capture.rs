@@ -1,8 +1,8 @@
 //! CPU graph capture and zero-allocation decode graph replay executor.
 
+use grim_tensor::error::{Error, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use grim_tensor::error::{Error, Result};
 
 /// Thread-safe operation closure for recorded CPU execution graphs.
 pub type CpuGraphOp = Arc<dyn Fn() -> Result<()> + Send + Sync>;

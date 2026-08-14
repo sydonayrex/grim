@@ -61,15 +61,16 @@ impl TileConfig {
     /// Re-derive block_m/block_n from spec + shape_class, rounding up to the wavefront size.
     /// Used when reconstructing a `TileConfig` from the leaner `AutotuneConfig` cache entry,
     /// which stores threads/block_k/grid_stride but not block_m/block_n.
-    pub fn with_block_geometry(
-        mut self,
-        spec: &HardwareSpec,
-        shape_class: ShapeClass,
-    ) -> Self {
+    pub fn with_block_geometry(mut self, spec: &HardwareSpec, shape_class: ShapeClass) -> Self {
         let wave = spec.wavefront_size;
         let (bm, bn) = raw_block_mn(shape_class);
         self.block_m = ((bm + wave - 1) / wave) * wave;
         self.block_n = ((bn + wave - 1) / wave) * wave;
+        let lds_per_tile = 2
+            * (self.block_m * self.block_k
+                + self.block_k * self.block_n
+                + self.block_m * self.block_n);
+        self.lds_double_buffer = 64 * 1024 >= 2 * lds_per_tile;
         self
     }
 }
@@ -92,23 +93,21 @@ pub fn pick_tiles(spec: &HardwareSpec, shape_class: ShapeClass, dims: ShapeDims)
         ShapeClass::TLOLog => 64,
     };
 
-    let lds_per_tile = 2 * (
-        (block_m as u64) * (block_k as u64) * 2
-        + (block_k as u64) * (block_n as u64) * 2
-        + (block_m as u64) * (block_n as u64) * 2
-    ) as u32;
+    let lds_per_tile = 2
+        * ((block_m as u64) * (block_k as u64) * 2
+            + (block_k as u64) * (block_n as u64) * 2
+            + (block_m as u64) * (block_n as u64) * 2) as u32;
 
     let lds_double_buffer = max_lds >= 2 * lds_per_tile;
 
     let vgpr_per_thread = estimate_vgpr_per_thread(block_m, block_n, block_k);
     let vgpr_file: u32 = 512;
     let waves_vgpr = vgpr_file / (vgpr_per_thread * wave).max(1);
-    let waves_lds = (lds_per_cu / (lds_per_tile + if lds_double_buffer { lds_per_tile } else { 0 }).max(1)) as u32;
+    let waves_lds = (lds_per_cu
+        / (lds_per_tile + if lds_double_buffer { lds_per_tile } else { 0 }).max(1))
+        as u32;
     let waves_thread = max_threads / wave;
-    let target_waves = waves_vgpr
-        .min(waves_lds)
-        .min(waves_thread)
-        .clamp(1, 4);
+    let target_waves = waves_vgpr.min(waves_lds).min(waves_thread).clamp(1, 4);
     let threads = target_waves * wave;
     assert!(threads <= max_threads && threads % wave == 0);
 
@@ -140,8 +139,8 @@ pub fn roofline_cost(spec: &HardwareSpec, dims: ShapeDims, _tiles: &TileConfig) 
     let muflops = 2.0 * (dims.m as f64) * (dims.n as f64) * (dims.k as f64);
     let compute_time_s = muflops / (spec.mem_bandwidth_gb_s * 1e9 * 0.6);
 
-    let bytes_read = ((dims.m as u64) * (dims.k as u64) * 2
-        + (dims.k as u64) * (dims.n as u64) * 2) as f64;
+    let bytes_read =
+        ((dims.m as u64) * (dims.k as u64) * 2 + (dims.k as u64) * (dims.n as u64) * 2) as f64;
     let bytes_written = ((dims.m as u64) * (dims.n as u64) * 2) as f64;
     let bytes_total = bytes_read + bytes_written;
     let memory_time_s = bytes_total / (spec.mem_bandwidth_gb_s * 1e9);
@@ -158,11 +157,10 @@ pub fn estimate_vgpr_per_thread(block_m: u32, block_n: u32, block_k: u32) -> u32
 /// Resource validator checking physical LDS, max threads, and dimension positivity.
 pub fn candidate_valid(spec: &HardwareSpec, cand: &TileConfig) -> bool {
     let lds_per_cu = 64 * 1024;
-    let lds_per_tile = 2 * (
-        (cand.block_m as u64) * (cand.block_k as u64) * 2
-        + (cand.block_k as u64) * (cand.block_n as u64) * 2
-        + (cand.block_m as u64) * (cand.block_n as u64) * 2
-    );
+    let lds_per_tile = 2
+        * ((cand.block_m as u64) * (cand.block_k as u64) * 2
+            + (cand.block_k as u64) * (cand.block_n as u64) * 2
+            + (cand.block_m as u64) * (cand.block_n as u64) * 2);
     if 2 * lds_per_tile > lds_per_cu as u64 {
         return false;
     }
@@ -297,7 +295,6 @@ mod tests {
         assert_eq!(tiles.block_k, 64);
     }
 
-
     #[test]
     fn roofline_cost_exact_formula_mutation_resistant() {
         let spec = make_test_spec("gfx1036", 64);
@@ -313,7 +310,10 @@ mod tests {
         // expected max(compute_time, memory_time) = 6.666666666666667e-6
         let cost = roofline_cost(&spec, dims, &tiles);
         let expected = 2.0e6 / (500.0 * 1e9 * 0.6);
-        assert!((cost - expected).abs() < 1e-12, "roofline_cost formula mutated");
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "roofline_cost formula mutated"
+        );
     }
 
     #[test]
@@ -412,7 +412,9 @@ mod tests {
 
         // lm_head: M=1 (decode), N=vocab=32000, K=hidden=4096.
         let lm = lookup_gemm_config_for_shape(
-            1, 32000, 4096,
+            1,
+            32000,
+            4096,
             WavefrontSize::W32,
             ShapeClass::from_op(GemmOp::LmHead, 1),
         );
@@ -420,7 +422,9 @@ mod tests {
 
         // A non-lm_head GEMM at the same M=1 bins as Decode, NOT TLOLog.
         let other = lookup_gemm_config_for_shape(
-            1, 32000, 4096,
+            1,
+            32000,
+            4096,
             WavefrontSize::W32,
             ShapeClass::from_op(GemmOp::Attention, 1),
         );
@@ -436,9 +440,15 @@ mod tests {
         // LmHead is TLOLog even at decode m==1 (which from_m would bin as Decode).
         assert_eq!(ShapeClass::from_op(GemmOp::LmHead, 1), ShapeClass::TLOLog);
         // And at prefill m > 1.
-        assert_eq!(ShapeClass::from_op(GemmOp::LmHead, 4096), ShapeClass::TLOLog);
+        assert_eq!(
+            ShapeClass::from_op(GemmOp::LmHead, 4096),
+            ShapeClass::TLOLog
+        );
         // Non-lm_head bins by m exactly as from_m.
-        assert_eq!(ShapeClass::from_op(GemmOp::Attention, 1), ShapeClass::Decode);
+        assert_eq!(
+            ShapeClass::from_op(GemmOp::Attention, 1),
+            ShapeClass::Decode
+        );
         assert_eq!(ShapeClass::from_op(GemmOp::Ffn, 64), ShapeClass::Prefill);
         assert_eq!(ShapeClass::from_op(GemmOp::Other, 1), ShapeClass::Decode);
     }
@@ -450,8 +460,9 @@ mod tests {
         let winner_ms: f64 = 0.25; // 0.25 ms measured
         let cycles = (winner_ms * 1e6) as u64;
         assert_eq!(cycles, 250_000);
-        assert!(cycles > 0, "non-zero measurement must persist as non-zero cycles");
+        assert!(
+            cycles > 0,
+            "non-zero measurement must persist as non-zero cycles"
+        );
     }
 }
-
-

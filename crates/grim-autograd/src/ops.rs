@@ -1667,7 +1667,7 @@ mod tests {
         let x_tensor = grim_backend_cpu::cpu_tensor(vec![0.5f32, 0.5f32], Shape::new(vec![1, 2]));
         let x_id = tape.register(x_tensor.clone());
 
-        let (out_id, out_tensor) = apply_and_record_lora(
+        let (_out_id, out_tensor) = apply_and_record_lora(
             &registry,
             &mut tape,
             0,

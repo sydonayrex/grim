@@ -49,8 +49,8 @@
 //! routed_scaling_factor=2.5, vocab_size=157184, max_position_embeddings=131072,
 //! rope_theta=6000000, partial_rotary_factor=0.5, rope_interleave=true.`
 
-use grim_core::error::{Error, Result};
-use grim_core::model::{AdapterHandle, CausalLm, Model, ModelConfig, ModalityHint};
+use grim_core::error::Result;
+use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_tensor::{ArithType, Device, Tensor};
 
@@ -275,7 +275,11 @@ pub struct Ling3Tiny {
 }
 
 impl Ling3Tiny {
-    pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: Ling3TinyConfig) -> Result<Self> {
+    pub fn load(
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: Ling3TinyConfig,
+    ) -> Result<Self> {
         Self::load_tp(device, ws, cfg)
     }
 
@@ -287,7 +291,6 @@ impl Ling3Tiny {
         let embed_w = ws.get_unconstrained("model.embed_tokens.weight")?;
         let embed_tokens = grim_nn::Embedding { weight: embed_w };
 
-
         let norm_w = ws.get_unconstrained("model.norm.weight")?;
         let norm = grim_nn::RmsNorm::new(norm_w, cfg.rms_norm_eps);
 
@@ -298,14 +301,19 @@ impl Ling3Tiny {
         };
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        let group_size = if cfg.layer_group_size > 0 { cfg.layer_group_size } else { 4 };
+        let group_size = if cfg.layer_group_size > 0 {
+            cfg.layer_group_size
+        } else {
+            4
+        };
 
         for i in 0..cfg.num_hidden_layers {
             let prefix = format!("model.layers.{i}");
             let in_ln_w = ws.get_unconstrained(&format!("{prefix}.input_layernorm.weight"))?;
             let input_layernorm = grim_nn::RmsNorm::new(in_ln_w, cfg.rms_norm_eps);
 
-            let post_ln_w = ws.get_unconstrained(&format!("{prefix}.post_attention_layernorm.weight"))?;
+            let post_ln_w =
+                ws.get_unconstrained(&format!("{prefix}.post_attention_layernorm.weight"))?;
             let post_attention_layernorm = grim_nn::RmsNorm::new(post_ln_w, cfg.rms_norm_eps);
 
             let is_kda = (i % group_size) < (group_size - 1);
@@ -345,10 +353,12 @@ impl Ling3Tiny {
                 let kv_b_w = ws.get_unconstrained(&format!("{mla_p}.kv_b_proj.weight"))?;
                 let o_w = ws.get_unconstrained(&format!("{mla_p}.o_proj.weight"))?;
 
-                let q_norm = ws.get_unconstrained(&format!("{mla_p}.q_norm.weight"))
+                let q_norm = ws
+                    .get_unconstrained(&format!("{mla_p}.q_norm.weight"))
                     .ok()
                     .map(|w| grim_nn::RmsNorm::new(w, cfg.rms_norm_eps));
-                let k_norm = ws.get_unconstrained(&format!("{mla_p}.k_norm.weight"))
+                let k_norm = ws
+                    .get_unconstrained(&format!("{mla_p}.k_norm.weight"))
                     .ok()
                     .map(|w| grim_nn::RmsNorm::new(w, cfg.rms_norm_eps));
 
@@ -437,13 +447,17 @@ impl CausalLm for Ling3Tiny {
         _adapters: &[AdapterHandle],
     ) -> Result<Tensor> {
         let seq_len = input_ids.shape().dims().iter().product();
-        let indices = input_ids.to_vec_f32()?
+        let indices = input_ids
+            .to_vec_f32()?
             .into_iter()
             .map(|v| v as u32)
             .collect::<Vec<_>>();
 
-        let mut h = self.embed_tokens.forward(&indices, seq_len, self.cfg.hidden_size)?;
-        let pos_vec: Vec<u32> = positions.to_vec_f32()?
+        let mut h = self
+            .embed_tokens
+            .forward(&indices, seq_len, self.cfg.hidden_size)?;
+        let pos_vec: Vec<u32> = positions
+            .to_vec_f32()?
             .into_iter()
             .map(|v| v as u32)
             .collect();
@@ -472,9 +486,6 @@ impl CausalLm for Ling3Tiny {
         }
     }
 }
-
-
-
 
 #[cfg(test)]
 mod tests {

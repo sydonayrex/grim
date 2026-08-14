@@ -24,7 +24,10 @@ impl SafetensorInfo {
         self.dims.clone()
     }
     pub fn elem_count(&self) -> usize {
-        self.dims.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d)).unwrap_or(usize::MAX)
+        self.dims
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+            .unwrap_or(usize::MAX)
     }
     pub fn byte_size(&self) -> usize {
         // FMT-10 fix: unknown dtype tags previously fell through to a 4-byte
@@ -119,7 +122,9 @@ pub fn read_safetensors_header<R: Read + Seek>(
             .unwrap_or_default();
 
         if shape.contains(&0) {
-            return Err(Error::Backend(format!("safetensors '{key}' shape contains zero dimension")));
+            return Err(Error::Backend(format!(
+                "safetensors '{key}' shape contains zero dimension"
+            )));
         }
 
         let data_offsets = obj
@@ -143,9 +148,9 @@ pub fn read_safetensors_header<R: Read + Seek>(
         }
 
         let data_region_start = 8 + header_len as u64;
-        let abs_end = data_region_start.checked_add(data_end).ok_or_else(|| {
-            Error::Backend(format!("safetensors '{key}' offset overflow"))
-        })?;
+        let abs_end = data_region_start
+            .checked_add(data_end)
+            .ok_or_else(|| Error::Backend(format!("safetensors '{key}' offset overflow")))?;
 
         if abs_end > file_len {
             return Err(Error::Backend(format!(

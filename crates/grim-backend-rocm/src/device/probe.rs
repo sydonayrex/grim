@@ -24,7 +24,11 @@ pub fn max_threads_per_block(device_ordinal: usize) -> u32 {
             HIP_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
             device_ordinal as i32,
         );
-        if status == 0 && val > 0 { val as u32 } else { 1024 }
+        if status == 0 && val > 0 {
+            val as u32
+        } else {
+            1024
+        }
     }
 }
 
@@ -38,7 +42,11 @@ pub fn active_cu_count(device_ordinal: usize) -> u32 {
             HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
             device_ordinal as i32,
         );
-        if status == 0 && val > 0 { val as u32 } else { 64 }
+        if status == 0 && val > 0 {
+            val as u32
+        } else {
+            64
+        }
     }
 }
 
@@ -52,7 +60,11 @@ pub fn wavefront_size(device_ordinal: usize) -> u32 {
             HIP_DEVICE_ATTRIBUTE_WARP_SIZE,
             device_ordinal as i32,
         );
-        if status == 0 && val > 0 { val as u32 } else { 32 }
+        if status == 0 && val > 0 {
+            val as u32
+        } else {
+            32
+        }
     }
 }
 
@@ -66,7 +78,11 @@ pub fn max_shared_mem(device_ordinal: usize) -> u32 {
             HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
             device_ordinal as i32,
         );
-        if status == 0 && val > 0 { val as u32 } else { 384 * 1024 }
+        if status == 0 && val > 0 {
+            val as u32
+        } else {
+            384 * 1024
+        }
     }
 }
 
@@ -83,7 +99,6 @@ pub fn probe_xnack(device_ordinal: usize) -> bool {
         status == 0 && val == 1
     }
 }
-
 
 /// System ROCm installation info resolved dynamically.
 #[derive(Debug, Clone)]

@@ -53,7 +53,9 @@ pub struct VulkanAutotuner {
 impl std::fmt::Debug for VulkanAutotuner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let len = self.cache.lock().unwrap().len();
-        f.debug_struct("VulkanAutotuner").field("cache_len", &len).finish()
+        f.debug_struct("VulkanAutotuner")
+            .field("cache_len", &len)
+            .finish()
     }
 }
 
@@ -182,19 +184,64 @@ impl VulkanAutotuner {
         // Candidate tile configs including specialization constants & split_k variations
         let candidates = match shape_class {
             ShapeClass::TLOLog => vec![
-                VulkanTileConfig { block_m: 16, block_n: 64, block_k: 16, split_k: 1 },
-                VulkanTileConfig { block_m: 32, block_n: 64, block_k: 16, split_k: 1 },
-                VulkanTileConfig { block_m: 16, block_n: 64, block_k: 16, split_k: 2 },
+                VulkanTileConfig {
+                    block_m: 16,
+                    block_n: 64,
+                    block_k: 16,
+                    split_k: 1,
+                },
+                VulkanTileConfig {
+                    block_m: 32,
+                    block_n: 64,
+                    block_k: 16,
+                    split_k: 1,
+                },
+                VulkanTileConfig {
+                    block_m: 16,
+                    block_n: 64,
+                    block_k: 16,
+                    split_k: 2,
+                },
             ],
             ShapeClass::Decode => vec![
-                VulkanTileConfig { block_m: 16, block_n: 32, block_k: 16, split_k: 1 },
-                VulkanTileConfig { block_m: 32, block_n: 32, block_k: 16, split_k: 1 },
-                VulkanTileConfig { block_m: 16, block_n: 32, block_k: 16, split_k: 4 },
+                VulkanTileConfig {
+                    block_m: 16,
+                    block_n: 32,
+                    block_k: 16,
+                    split_k: 1,
+                },
+                VulkanTileConfig {
+                    block_m: 32,
+                    block_n: 32,
+                    block_k: 16,
+                    split_k: 1,
+                },
+                VulkanTileConfig {
+                    block_m: 16,
+                    block_n: 32,
+                    block_k: 16,
+                    split_k: 4,
+                },
             ],
             ShapeClass::Prefill => vec![
-                VulkanTileConfig { block_m: 64, block_n: 64, block_k: 16, split_k: 1 },
-                VulkanTileConfig { block_m: 32, block_n: 32, block_k: 16, split_k: 1 },
-                VulkanTileConfig { block_m: 32, block_n: 32, block_k: 32, split_k: 2 },
+                VulkanTileConfig {
+                    block_m: 64,
+                    block_n: 64,
+                    block_k: 16,
+                    split_k: 1,
+                },
+                VulkanTileConfig {
+                    block_m: 32,
+                    block_n: 32,
+                    block_k: 16,
+                    split_k: 1,
+                },
+                VulkanTileConfig {
+                    block_m: 32,
+                    block_n: 32,
+                    block_k: 32,
+                    split_k: 2,
+                },
             ],
         };
 

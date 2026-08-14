@@ -4,7 +4,6 @@ use grim_tensor::error::{Error, Result};
 
 use crate::device::gemm_dispatch;
 
-
 /// Fused CPU MoE grouped dispatch: Top-K routing, expert token gather, grouped GEMM,
 /// SwiGLU gating, and weighted scatter reduction.
 pub fn moe_fused_dispatch(
@@ -59,13 +58,27 @@ pub fn moe_fused_dispatch(
             // Gate GEMM: [1, hidden_dim] @ [hidden_dim, inter_dim] -> [1, inter_dim]
             let mut gate_out = vec![0.0f32; inter_dim];
             if exp_idx < w_gate.len() && w_gate[exp_idx].len() == hidden_dim * inter_dim {
-                gemm_dispatch(tok_src, &w_gate[exp_idx], &mut gate_out, 1, inter_dim, hidden_dim);
+                gemm_dispatch(
+                    tok_src,
+                    &w_gate[exp_idx],
+                    &mut gate_out,
+                    1,
+                    inter_dim,
+                    hidden_dim,
+                );
             }
 
             // Up GEMM: [1, hidden_dim] @ [hidden_dim, inter_dim] -> [1, inter_dim]
             let mut up_out = vec![0.0f32; inter_dim];
             if exp_idx < w_up.len() && w_up[exp_idx].len() == hidden_dim * inter_dim {
-                gemm_dispatch(tok_src, &w_up[exp_idx], &mut up_out, 1, inter_dim, hidden_dim);
+                gemm_dispatch(
+                    tok_src,
+                    &w_up[exp_idx],
+                    &mut up_out,
+                    1,
+                    inter_dim,
+                    hidden_dim,
+                );
             }
 
             // SwiGLU: silu(gate_out) * up_out
@@ -79,7 +92,14 @@ pub fn moe_fused_dispatch(
             // Down GEMM: [1, inter_dim] @ [inter_dim, hidden_dim] -> [1, hidden_dim]
             let mut down_out = vec![0.0f32; hidden_dim];
             if exp_idx < w_down.len() && w_down[exp_idx].len() == inter_dim * hidden_dim {
-                gemm_dispatch(&activated, &w_down[exp_idx], &mut down_out, 1, hidden_dim, inter_dim);
+                gemm_dispatch(
+                    &activated,
+                    &w_down[exp_idx],
+                    &mut down_out,
+                    1,
+                    hidden_dim,
+                    inter_dim,
+                );
             }
 
             // Weighted scatter accumulate

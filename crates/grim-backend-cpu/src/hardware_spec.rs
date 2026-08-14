@@ -1,8 +1,8 @@
 //! CPU hardware specification probing, ISA capability inspection, and fingerprinting.
 
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Host CPU vector ISA extensions recognized by [`CpuHardwareSpec`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -242,7 +242,10 @@ mod tests {
                 "neon" => CpuIsa::Neon,
                 _ => continue,
             };
-            assert!(spec.supports(isa), "supports({f}) should be true when present");
+            assert!(
+                spec.supports(isa),
+                "supports({f}) should be true when present"
+            );
         }
         // An ISA that is NOT in the feature list must report false.
         let absent = if spec.supports(CpuIsa::Neon) {
@@ -251,7 +254,9 @@ mod tests {
             CpuIsa::Neon
         };
         if !spec.isa_features.is_empty() {
-            assert!(!spec.supports(absent) || spec.isa_features.iter().any(|x| x == absent.as_str()));
+            assert!(
+                !spec.supports(absent) || spec.isa_features.iter().any(|x| x == absent.as_str())
+            );
         }
     }
 

@@ -935,12 +935,18 @@ pub fn render_chat_template(
     // Most GGUF chat templates are self-contained; disable autoescaping and treat undefined variables gracefully.
     env.set_auto_escape_callback(|_| minijinja::AutoEscape::None);
     env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
-    env.add_function("raise_exception", |_msg: Option<&str>| -> std::result::Result<String, minijinja::Error> {
-        Ok(String::new())
-    });
-    env.add_filter("tojson", |v: minijinja::Value| -> std::result::Result<String, minijinja::Error> {
-        serde_json::to_string(&v).map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))
-    });
+    env.add_function(
+        "raise_exception",
+        |_msg: Option<&str>| -> std::result::Result<String, minijinja::Error> { Ok(String::new()) },
+    );
+    env.add_filter(
+        "tojson",
+        |v: minijinja::Value| -> std::result::Result<String, minijinja::Error> {
+            serde_json::to_string(&v).map_err(|e| {
+                minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
+            })
+        },
+    );
     // P1-3.3: Some GGUF-embedded Jinja templates use block directives that
     // minijinja does not support (e.g. `{% generation %}…{% endgeneration %}`).
     // Strip those unsupported tags (keeping their inner content) so the

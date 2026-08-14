@@ -18,7 +18,9 @@ fn cpu_alloc_storage_and_copy_slice_into_kv_arena() {
     };
 
     // Allocate KV arena
-    let arena = dev.alloc_storage(&shape, dtype.clone()).expect("alloc KV arena");
+    let arena = dev
+        .alloc_storage(&shape, dtype.clone())
+        .expect("alloc KV arena");
     assert_eq!(arena.shape(), &shape);
 
     // Source slice (e.g. 1 head row of 16 floats)
@@ -210,17 +212,26 @@ fn cpu_scalar_arithmetic_helpers() {
     // add_scalar
     let (out_add, h_add) = dev.add_scalar(x.as_ref(), 5.0, &shape).expect("add_scalar");
     h_add.synchronize().expect("sync");
-    assert_eq!(out_add.to_cpu_vec_f32().expect("read"), vec![15.0, 25.0, 35.0, 45.0]);
+    assert_eq!(
+        out_add.to_cpu_vec_f32().expect("read"),
+        vec![15.0, 25.0, 35.0, 45.0]
+    );
 
     // sub_scalar
     let (out_sub, h_sub) = dev.sub_scalar(x.as_ref(), 5.0, &shape).expect("sub_scalar");
     h_sub.synchronize().expect("sync");
-    assert_eq!(out_sub.to_cpu_vec_f32().expect("read"), vec![5.0, 15.0, 25.0, 35.0]);
+    assert_eq!(
+        out_sub.to_cpu_vec_f32().expect("read"),
+        vec![5.0, 15.0, 25.0, 35.0]
+    );
 
     // div_scalar
-    let (out_div, h_div) = dev.div_scalar(x.as_ref(), 10.0, &shape).expect("div_scalar");
+    let (out_div, h_div) = dev
+        .div_scalar(x.as_ref(), 10.0, &shape)
+        .expect("div_scalar");
     h_div.synchronize().expect("sync");
-    assert_eq!(out_div.to_cpu_vec_f32().expect("read"), vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(
+        out_div.to_cpu_vec_f32().expect("read"),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
 }
-
-

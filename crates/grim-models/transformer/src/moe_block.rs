@@ -9,9 +9,7 @@
 
 use grim_core::error::Result;
 use grim_nn::moe::{ExpertBank, ExpertTriple, MoeFfn, MoeRouter, RouterKind};
-use grim_nn::{
-    Linear, RmsNorm, TensorParallelConfig, WeightSource,
-};
+use grim_nn::{Linear, RmsNorm, TensorParallelConfig, WeightSource};
 use grim_tensor::{Shape, Tensor};
 
 use crate::model::LlamaConfig;
@@ -86,7 +84,9 @@ impl MoeBlock {
         );
 
         let moe_inter = spec.moe_intermediate_size.unwrap_or(cfg.intermediate_size);
-        let shared_inter = spec.shared_expert_intermediate_size.unwrap_or(cfg.intermediate_size);
+        let shared_inter = spec
+            .shared_expert_intermediate_size
+            .unwrap_or(cfg.intermediate_size);
 
         // Per-expert SwiGLU triples from the 3D GGUF layout
         // (`ffn_gate_exps` / `ffn_up_exps` / `ffn_down_exps`).
@@ -109,7 +109,6 @@ impl MoeBlock {
         } else {
             None
         };
-
 
         let moe = MoeFfn::new(router, experts, shared_expert, spec.routed_scaling_factor);
 
@@ -140,7 +139,6 @@ mod tests {
     use grim_tensor::dtype::{DType, Device, QuantProvenance};
     use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
     use grim_tensor::shape::Shape;
-    use grim_tensor::Tensor;
 
     use crate::model::LlamaConfig;
     use crate::moe_block::{MoESpec, MoeBlock};
@@ -173,7 +171,7 @@ mod tests {
         v.iter().flat_map(|x| x.to_le_bytes()).collect()
     }
 
-    fn cfg(hidden: usize, inter: usize, num_experts: usize) -> LlamaConfig {
+    fn cfg(hidden: usize, inter: usize, _num_experts: usize) -> LlamaConfig {
         LlamaConfig {
             vocab_size: 100,
             hidden_size: hidden,
@@ -214,7 +212,7 @@ mod tests {
         // the in-repo Lfm2 MoE loader). `Linear::load(hidden, num_experts)`
         // expects the stored weight in [out, in] = [num_experts, hidden].
         let gate_w: Vec<f32> = (0..num_experts * hidden)
-            .map(|i| (i as f32 * 0.3 - 1.0))
+            .map(|i| i as f32 * 0.3 - 1.0)
             .collect();
         tensors.insert(
             "ffn_gate_inp.weight".to_string(),
@@ -228,7 +226,7 @@ mod tests {
         // 3D expert tensors [num_experts, inter, hidden] (experts outermost,
         // matching llama.cpp / Lfm2 GGUF convention).
         let exp_gate: Vec<f32> = (0..num_experts * inter * hidden)
-            .map(|i| (i as f32 * 0.1 - 0.5))
+            .map(|i| i as f32 * 0.1 - 0.5)
             .collect();
         tensors.insert(
             "ffn_gate_exps.weight".to_string(),
@@ -250,7 +248,7 @@ mod tests {
             },
         );
         let exp_down: Vec<f32> = (0..num_experts * inter * hidden)
-            .map(|i| (i as f32 * 0.1 - 0.5))
+            .map(|i| i as f32 * 0.1 - 0.5)
             .collect();
         tensors.insert(
             "ffn_down_exps.weight".to_string(),
@@ -277,7 +275,6 @@ mod tests {
             moe_intermediate_size: None,
             shared_expert_intermediate_size: None,
         };
-
 
         let block = MoeBlock::load(&ws, &cfg(hidden, inter, num_experts), &spec, tp)?;
 

@@ -10,7 +10,7 @@ use std::io::{Read, Seek};
 
 use grim_tensor::dtype::{DType, KQuantScheme, QuantProvenance, Storage};
 use grim_tensor::error::{Error, Result};
-use grim_tensor::provider::{shard_raw_tensor, RawTensor, TensorMeta, TensorProvider};
+use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider, shard_raw_tensor};
 
 use crate::format::{
     GrimFile, GrimTensorEntry, read_normals, read_outliers, read_outliers_with_encoding,
@@ -1008,7 +1008,8 @@ impl<'a> TensorProvider for RemappingTensorProvider<'a> {
         world_size: usize,
     ) -> Result<RawTensor> {
         let mapped = (self.remap)(name);
-        self.inner.get_packed_sharded(&mapped, dim, rank, world_size)
+        self.inner
+            .get_packed_sharded(&mapped, dim, rank, world_size)
     }
 
     fn meta(&self, name: &str) -> Result<TensorMeta> {

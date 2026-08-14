@@ -245,7 +245,9 @@ pub fn validate_backward_inputs(
         )));
     }
     if block_size == 0 {
-        return Err(Error::Backend("charon_backward: block_size must be > 0".into()));
+        return Err(Error::Backend(
+            "charon_backward: block_size must be > 0".into(),
+        ));
     }
     for (name, p) in [
         ("gate_w", gate_w),
@@ -285,10 +287,9 @@ mod tests {
     fn validate_backward_inputs_rejects_null_and_bad_geometry() {
         let p = 0x1 as *mut c_void;
         // null pointer
-        assert!(validate_backward_inputs(
-            std::ptr::null(), p, p, p, p, p, p, p, 4, 4, 4, 4
-        )
-        .is_err());
+        assert!(
+            validate_backward_inputs(std::ptr::null(), p, p, p, p, p, p, p, 4, 4, 4, 4).is_err()
+        );
         // zero hidden
         assert!(validate_backward_inputs(p, p, p, p, p, p, p, p, 0, 4, 4, 4).is_err());
         // zero block_size
@@ -308,9 +309,7 @@ mod tests {
         // `extern "C"` that the existing kernel sources in this crate don't
         // use — they use the block form consistently).
         assert!(KERNEL_SOURCE.contains("extern \"C\" {"));
-        assert!(KERNEL_SOURCE.contains(
-            "__global__ void grim_moe_fused_grouped_backward"
-        ));
+        assert!(KERNEL_SOURCE.contains("__global__ void grim_moe_fused_grouped_backward"));
         // Must reuse the SiLU-derivative decomposition documented in the plan.
         assert!(KERNEL_SOURCE.contains("silu_grad"));
         // Must not hard-depend on a quant format for the base FP32 case.
@@ -321,11 +320,7 @@ mod tests {
     fn backward_kernel_is_grouped_contract() {
         // The backward must consume the same sorted routing arrays as the
         // forward `grim_moe_fused_grouped` so the same host sort feeds both.
-        for sym in [
-            "sorted_token_ids",
-            "sorted_expert_ids",
-            "sorted_weights",
-        ] {
+        for sym in ["sorted_token_ids", "sorted_expert_ids", "sorted_weights"] {
             assert!(KERNEL_SOURCE.contains(sym), "missing sorted array: {sym}");
         }
     }
