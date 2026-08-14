@@ -376,9 +376,27 @@ pub fn cmd_oxidizer_convert(
             None
         }
     });
-    if use_gpu {
-        let device = grim_backend_rocm::RocmDevice::try_new(0)
-            .map_err(|e| format!("GPU dequant requested but no ROCm device available: {e}"))?;
+    // GPU-first conversion path: try initializing ROCm device first, fallback to CPU
+    let gpu_device = if use_gpu {
+        match grim_backend_rocm::RocmDevice::try_new(0) {
+            Ok(device) => {
+                println!(
+                    "[Grim Convert] ROCm GPU detected (device 0) — using GPU-accelerated dequantization pipeline."
+                );
+                Some(device)
+            }
+            Err(e) => {
+                println!(
+                    "[Grim Convert] Notice: ROCm GPU initialization failed ({e}) — falling back to multi-threaded CPU conversion."
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(ref device) = gpu_device {
         grim_format::convert_to_grim_with_dequant(
             model_path,
             output_path,
@@ -388,12 +406,11 @@ pub fn cmd_oxidizer_convert(
             calibration_dataset.as_deref(),
             None,
             Some(full_bitwidths),
-            // Pass calibrated metadata through; convert_to_grim preserves quant_overrides, ext_entries, etc.
             Some(grim_meta),
             None,
             wave,
             progress,
-            &device,
+            device,
         )
         .map_err(|e| e.to_string())?;
     } else {
@@ -406,7 +423,6 @@ pub fn cmd_oxidizer_convert(
             calibration_dataset.as_deref(),
             None,
             Some(full_bitwidths),
-            // Pass calibrated metadata through; convert_to_grim preserves quant_overrides, ext_entries, etc.
             Some(grim_meta),
             None,
             wave,

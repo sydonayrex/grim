@@ -2,7 +2,49 @@
 
 use grim_plugin::{PluginKind, PluginRegistry, WasmPluginLoader, parse_manifest, validate_abi};
 use grim_tensor::error::Result;
+use sha2::{Digest, Sha256};
 use std::path::Path;
+
+fn resolve_entry(plugin_dir: &Path, entry: &str) -> Result<std::path::PathBuf> {
+    let relative = Path::new(entry);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(grim_tensor::Error::Backend(format!(
+            "plugin entry escapes its directory: {entry}"
+        )));
+    }
+    let path = plugin_dir.join(relative);
+    if !path.is_file() {
+        return Err(grim_tensor::Error::Backend(format!(
+            "plugin entry is not a regular file: {}",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
+fn verify_entry_digest(path: &Path, expected: Option<&str>) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(grim_tensor::Error::Backend(
+            "plugin sha256 must be 64 hexadecimal characters".into(),
+        ));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|e| grim_tensor::Error::Backend(format!("failed to read plugin entry: {e}")))?;
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if actual != expected.to_ascii_lowercase() {
+        return Err(grim_tensor::Error::Backend(format!(
+            "plugin entry checksum mismatch: expected {expected}, got {actual}"
+        )));
+    }
+    Ok(())
+}
 
 /// Load plugins from a directory into the registry.
 pub fn load_plugins(plugin_dir: &str, registry: &mut PluginRegistry) -> Result<usize> {
@@ -36,31 +78,39 @@ pub fn load_plugins(plugin_dir: &str, registry: &mut PluginRegistry) -> Result<u
         // Load based on plugin kind
         match manifest.kind {
             PluginKind::Wasm => {
-                let wasm_path = plugin_subdir.join(&manifest.entry);
-                if wasm_path.exists() {
-                    let wasm_bytes = std::fs::read(&wasm_path).map_err(|e| {
-                        grim_tensor::Error::Backend(format!("Failed to read WASM: {e}"))
-                    })?;
-                    let limits = manifest.limits.clone().unwrap_or_default();
-                    let loader = WasmPluginLoader::new(&manifest.name, limits);
+                match resolve_entry(&plugin_subdir, &manifest.entry).and_then(|p| {
+                    verify_entry_digest(&p, manifest.sha256.as_deref())?;
+                    Ok(p)
+                }) {
+                    Ok(wasm_path) => {
+                        let wasm_bytes = std::fs::read(&wasm_path).map_err(|e| {
+                            grim_tensor::Error::Backend(format!("Failed to read WASM: {e}"))
+                        })?;
+                        let limits = manifest.limits.clone().unwrap_or_default();
+                        let loader = WasmPluginLoader::new(&manifest.name, limits);
 
-                    match loader.create_sampler(&wasm_bytes) {
-                        Ok(sampler) => {
-                            registry.register_sampler(manifest.name.clone(), sampler);
-                            let _ = registry.register_manifest(manifest);
-                            count += 1;
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "Warning: Failed to load WASM plugin '{}': {}",
-                                manifest.name, e
-                            );
+                        match loader.create_sampler(&wasm_bytes) {
+                            Ok(sampler) => {
+                                registry.register_sampler(manifest.name.clone(), sampler);
+                                let _ = registry.register_manifest(manifest);
+                                count += 1;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: Failed to load WASM plugin '{}': {}",
+                                    manifest.name, e
+                                );
+                            }
                         }
                     }
+                    Err(e) => return Err(e),
                 }
             }
             PluginKind::Dylib => {
                 // Dylib plugins require runtime support; register manifest for discovery.
+                // Native plugins are trusted/in-process; verify their declared artifact before discovery.
+                let path = resolve_entry(&plugin_subdir, &manifest.entry)?;
+                verify_entry_digest(&path, manifest.sha256.as_deref())?;
                 let _ = registry.register_manifest(manifest);
             }
         }
@@ -100,5 +150,21 @@ entry = "test.wasm"
         let manifest = parse_manifest(toml).unwrap();
         assert_eq!(manifest.name, "test-plugin");
         assert!(validate_abi(&manifest, 1).is_ok());
+    }
+
+    #[test]
+    fn plugin_entry_cannot_escape_directory() {
+        let dir = tempdir().unwrap();
+        let err = resolve_entry(dir.path(), "../outside.wasm").unwrap_err();
+        assert!(err.to_string().contains("escapes"));
+    }
+
+    #[test]
+    fn plugin_entry_digest_is_verified() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("plugin.wasm");
+        std::fs::write(&path, b"plugin").unwrap();
+        verify_entry_digest(&path, Some(&format!("{:x}", Sha256::digest(b"plugin")))).unwrap();
+        assert!(verify_entry_digest(&path, Some(&"0".repeat(64))).is_err());
     }
 }

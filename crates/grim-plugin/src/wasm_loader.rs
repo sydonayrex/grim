@@ -99,7 +99,6 @@ impl WasmPluginLoader {
         use wasmtime::{Config, Engine as WasmtimeEngine, Linker, Module, Store};
 
         let mut config = Config::new();
-        config.async_support(false);
         config.max_wasm_stack(1048576); // 1 MB default
 
         // Enable fuel-based metering if the manifest specifies a per-invocation
@@ -125,7 +124,7 @@ impl WasmPluginLoader {
         }
 
         // Build the linker. Start with nothing linked — deny-by-default.
-        let mut linker: Linker<()> = Linker::new(&engine);
+        let linker: Linker<()> = Linker::new(&engine);
 
         // ----- Network capability -----
         // Only link WASI socket/network interfaces if the manifest explicitly
