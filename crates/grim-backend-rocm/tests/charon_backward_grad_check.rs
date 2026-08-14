@@ -59,8 +59,8 @@
 
 use grim_backend_cpu::cpu_tensor;
 use grim_backend_rocm::kernels::charon_backward;
-use grim_nn::moe::{ExpertBank, MoeFfn, MoeRouter, RouterKind};
 use grim_nn::Linear;
+use grim_nn::moe::{ExpertBank, MoeFfn, MoeRouter, RouterKind};
 use grim_tensor::shape::Shape;
 
 // ---------------------------------------------------------------------------
@@ -159,11 +159,15 @@ fn well_separated_router_gate() -> Vec<f32> {
 /// folded into expert backward once autograd integration lands).
 fn build_oracle(fw: &FlatWeights) -> MoeFfn {
     let gw = well_separated_router_gate();
-    let router_gate = Linear::from_tensor(
-        cpu_tensor(gw, Shape::new(vec![NUM_EXPERTS, HIDDEN])),
+    let router_gate =
+        Linear::from_tensor(cpu_tensor(gw, Shape::new(vec![NUM_EXPERTS, HIDDEN])), None);
+    let router = MoeRouter::new(
+        router_gate,
+        RouterKind::SoftmaxTopK,
+        TOP_K,
+        NUM_EXPERTS,
         None,
     );
-    let router = MoeRouter::new(router_gate, RouterKind::SoftmaxTopK, TOP_K, NUM_EXPERTS, None);
 
     let mut eg = Vec::with_capacity(NUM_EXPERTS);
     let mut eu = Vec::with_capacity(NUM_EXPERTS);
@@ -195,10 +199,7 @@ fn objective(fw: &FlatWeights) -> f32 {
     let moe = build_oracle(fw);
     let x = cpu_tensor(fw.x.clone(), Shape::new(vec![BATCH, HIDDEN]));
     let out = moe.forward(&x).expect("MoeFfn::forward");
-    out.to_vec_f32()
-        .expect("to_vec_f32")
-        .iter()
-        .sum::<f32>()
+    out.to_vec_f32().expect("to_vec_f32").iter().sum::<f32>()
 }
 
 // ---------------------------------------------------------------------------
@@ -210,10 +211,10 @@ fn objective(fw: &FlatWeights) -> f32 {
 // ---------------------------------------------------------------------------
 
 struct MoEGrads {
-    d_x: Vec<f32>,            // [batch*hidden]
-    d_gate_w: Vec<Vec<f32>>,  // [num_experts][inter*hidden]
-    d_up_w: Vec<Vec<f32>>,    // [num_experts][inter*hidden]
-    d_down_w: Vec<Vec<f32>>,  // [num_experts][hidden*inter]
+    d_x: Vec<f32>,           // [batch*hidden]
+    d_gate_w: Vec<Vec<f32>>, // [num_experts][inter*hidden]
+    d_up_w: Vec<Vec<f32>>,   // [num_experts][inter*hidden]
+    d_down_w: Vec<Vec<f32>>, // [num_experts][hidden*inter]
 }
 
 #[inline]
@@ -236,17 +237,20 @@ fn analytical_backward(fw: &FlatWeights) -> MoEGrads {
     let x = cpu_tensor(fw.x.clone(), Shape::new(vec![BATCH, HIDDEN]));
 
     // Forward routing — the SAME selection the forward used.
-    let (indices, weights) = moe
-        .router
-        .route(&x)
-        .expect("MoeRouter::route");
+    let (indices, weights) = moe.router.route(&x).expect("MoeRouter::route");
     debug_assert_eq!(indices.len(), BATCH);
     debug_assert_eq!(weights.len(), BATCH);
 
     let mut d_x = vec![0.0f32; BATCH * HIDDEN];
-    let mut d_gate_w: Vec<Vec<f32>> = (0..NUM_EXPERTS).map(|_| vec![0.0; INTER * HIDDEN]).collect();
-    let mut d_up_w: Vec<Vec<f32>> = (0..NUM_EXPERTS).map(|_| vec![0.0; INTER * HIDDEN]).collect();
-    let mut d_down_w: Vec<Vec<f32>> = (0..NUM_EXPERTS).map(|_| vec![0.0; HIDDEN * INTER]).collect();
+    let mut d_gate_w: Vec<Vec<f32>> = (0..NUM_EXPERTS)
+        .map(|_| vec![0.0; INTER * HIDDEN])
+        .collect();
+    let mut d_up_w: Vec<Vec<f32>> = (0..NUM_EXPERTS)
+        .map(|_| vec![0.0; INTER * HIDDEN])
+        .collect();
+    let mut d_down_w: Vec<Vec<f32>> = (0..NUM_EXPERTS)
+        .map(|_| vec![0.0; HIDDEN * INTER])
+        .collect();
 
     for t in 0..BATCH {
         let chosen = &indices[t];
@@ -341,8 +345,7 @@ fn analytical_backward(fw: &FlatWeights) -> MoEGrads {
             for i in 0..HIDDEN {
                 let mut acc = 0.0f32;
                 for j in 0..INTER {
-                    acc += gate_w[j * HIDDEN + i] * d_h_gate[j]
-                        + up_w[j * HIDDEN + i] * d_h_up[j];
+                    acc += gate_w[j * HIDDEN + i] * d_h_gate[j] + up_w[j * HIDDEN + i] * d_h_up[j];
                 }
                 d_x[t * HIDDEN + i] += acc;
             }
@@ -377,7 +380,12 @@ fn fd_scalar<F: FnMut(f32) -> f32>(mut objective: F, base: f32) -> f32 {
 /// routed to this token (their grads are correctly zero by construction, so
 /// an all-zero slab for a non-routed expert is the CORRECT behavior — without
 /// this flag the guard would false-positive and reject a correct backward).
-fn assert_grad_matches_fd(name: &str, analytic: &[f32], fd: impl Fn(usize) -> f32, expect_nonzero: bool) {
+fn assert_grad_matches_fd(
+    name: &str,
+    analytic: &[f32],
+    fd: impl Fn(usize) -> f32,
+    expect_nonzero: bool,
+) {
     let mut max_rel = 0.0f32;
     for (i, &a) in analytic.iter().enumerate() {
         let f = fd(i);
@@ -451,7 +459,12 @@ fn d_down_w_gradient_matches_fd_by_name() {
     // Flatten into one slice per expert and run the comparator.
     for e in 0..NUM_EXPERTS {
         let flat = &g.d_down_w[e];
-        assert_grad_matches_fd(&format!("d_down_w[e={e}]"), flat, |k| fd_for(e, k / INTER, k % INTER), routed.contains(&e));
+        assert_grad_matches_fd(
+            &format!("d_down_w[e={e}]"),
+            flat,
+            |k| fd_for(e, k / INTER, k % INTER),
+            routed.contains(&e),
+        );
     }
 }
 
@@ -474,7 +487,12 @@ fn d_gate_w_gradient_matches_fd_by_name() {
     };
     for e in 0..NUM_EXPERTS {
         let flat = &g.d_gate_w[e];
-        assert_grad_matches_fd(&format!("d_gate_w[e={e}]"), flat, |k| fd_for(e, k / HIDDEN, k % HIDDEN), routed.contains(&e));
+        assert_grad_matches_fd(
+            &format!("d_gate_w[e={e}]"),
+            flat,
+            |k| fd_for(e, k / HIDDEN, k % HIDDEN),
+            routed.contains(&e),
+        );
     }
 }
 
@@ -497,7 +515,12 @@ fn d_up_w_gradient_matches_fd_by_name() {
     };
     for e in 0..NUM_EXPERTS {
         let flat = &g.d_up_w[e];
-        assert_grad_matches_fd(&format!("d_up_w[e={e}]"), flat, |k| fd_for(e, k / HIDDEN, k % HIDDEN), routed.contains(&e));
+        assert_grad_matches_fd(
+            &format!("d_up_w[e={e}]"),
+            flat,
+            |k| fd_for(e, k / HIDDEN, k % HIDDEN),
+            routed.contains(&e),
+        );
     }
 }
 
@@ -542,11 +565,19 @@ fn directional_derivative_under_combined_named_grads() {
         ((seed >> 8) as f32 / 16777216.0) - 0.5
     };
     for e in 0..NUM_EXPERTS {
-        for v in &mut dir_gate[e] { *v = rng(); }
-        for v in &mut dir_up[e] { *v = rng(); }
-        for v in &mut dir_down[e] { *v = rng(); }
+        for v in &mut dir_gate[e] {
+            *v = rng();
+        }
+        for v in &mut dir_up[e] {
+            *v = rng();
+        }
+        for v in &mut dir_down[e] {
+            *v = rng();
+        }
     }
-    for v in &mut dir_x { *v = rng(); }
+    for v in &mut dir_x {
+        *v = rng();
+    }
 
     // Combined analytical directional derivative.
     let mut analytic_dd = 0.0f32;
@@ -637,7 +668,9 @@ fn charon_backward_kernel_encodes_all_four_named_gradients_and_silu_grad() {
     // The expert-weight grads are also atomic-add accumulators (each grad
     // buffer is shared across the K blocks of one expert's tokens).
     assert!(
-        src.contains("atomicAdd(&dgw") && src.contains("atomicAdd(&duw") && src.contains("atomicAdd(&ddw"),
+        src.contains("atomicAdd(&dgw")
+            && src.contains("atomicAdd(&duw")
+            && src.contains("atomicAdd(&ddw"),
         "d_gate_w/d_up_w/d_down_w must use atomicAdd(&dgw/duw/ddw, ...)",
     );
     // The by-name gradient gate surfaced two regressions in the historical

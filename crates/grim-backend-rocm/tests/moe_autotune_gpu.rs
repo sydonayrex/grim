@@ -25,16 +25,13 @@
 //! benchmarked and persisted to `.autotune_cache/gfx1036.json` (8 843 bytes).
 //! `CharonSelector` consumed the measured `VariantRow` table without error.
 
-use std::time::Instant;
 use grim_tensor::BackendDevice;
+use std::time::Instant;
 
-use grim_backend_rocm::autotune::{
-    AutotuneConfig, Autotuner, MoeKernelKey, quantize_routing_skew,
-};
+use grim_backend_rocm::autotune::{AutotuneConfig, Autotuner, MoeKernelKey, quantize_routing_skew};
 use grim_backend_rocm::kernels::charon::{
-    build_variant_table_from_autotuner, CharonSelector, RoutingAssignment, VariantRow,
+    CharonSelector, RoutingAssignment, VariantRow, build_variant_table_from_autotuner,
 };
-
 
 /// GPU-gate helper — mirrors `golden_charon_moe_gpu.rs::gpu_device()`.
 fn gpu_available() -> bool {
@@ -108,7 +105,6 @@ fn benchmark_moe_shape(
     }
     let _ = uniform_pairs;
 
-
     // Dummy activation/weight buffers for timing: we measure the loop overhead
     // and parameter marshalling cost (the actual GPU dispatch cost dominates in
     // real usage; this gives a proportional cycle estimate for the cache).
@@ -123,12 +119,14 @@ fn benchmark_moe_shape(
         weights: router_weights.clone(),
     };
 
-
     if gpu_available() {
         if let Ok(dev) = grim_backend_rocm::RocmDevice::try_new(0) {
             let out_shape = grim_tensor::Shape::new(vec![batch, hidden]);
             if let Ok(act) = dev.from_cpu(&activations, &out_shape, grim_tensor::DType::F32) {
-                let act_r = act.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().unwrap();
+                let act_r = act
+                    .as_any()
+                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                    .unwrap();
 
                 for &bd in block_dims {
                     for _ in 0..num_warmup {
@@ -178,12 +176,12 @@ fn benchmark_moe_shape(
         }
     }
 
-
-
     for &bd in block_dims {
         // Warmup.
         for _ in 0..num_warmup {
-            let _ = std::hint::black_box(activations[0] * expert_gate[0] * expert_up[0] * expert_down[0]);
+            let _ = std::hint::black_box(
+                activations[0] * expert_gate[0] * expert_up[0] * expert_down[0],
+            );
         }
 
         let t0 = Instant::now();
@@ -194,7 +192,6 @@ fn benchmark_moe_shape(
         }
         let elapsed_us = t0.elapsed().as_micros() as u64;
         let per_iter_us = elapsed_us / num_iters as u64;
-
 
         if per_iter_us < best_us {
             best_us = per_iter_us;
@@ -235,20 +232,27 @@ fn moe_autotune_cache_hit_avoids_rebenchmark() {
 
     let mut bench_count = 0u32;
     // First call: cache miss, benchmark runs.
-    let cfg1 = tuner.get_or_tune_moe(key.clone(), |_k| {
-        bench_count += 1;
-        Ok(benchmark_moe_shape(128, 256, 8, 2, 0, 0, 3))
-    }).expect("get_or_tune_moe failed");
+    let cfg1 = tuner
+        .get_or_tune_moe(key.clone(), |_k| {
+            bench_count += 1;
+            Ok(benchmark_moe_shape(128, 256, 8, 2, 0, 0, 3))
+        })
+        .expect("get_or_tune_moe failed");
 
     assert_eq!(bench_count, 1, "first call must invoke benchmark");
-    assert!(cfg1.block_dim >= 64, "block_dim must be ≥ 64 (Wave64 mandate)");
+    assert!(
+        cfg1.block_dim >= 64,
+        "block_dim must be ≥ 64 (Wave64 mandate)"
+    );
     assert!(cfg1.cycles_per_invocation > 0, "must have a measured cost");
 
     // Second call: cache hit, benchmark must NOT run.
-    let cfg2 = tuner.get_or_tune_moe(key.clone(), |_k| {
-        bench_count += 1;
-        Ok(AutotuneConfig::default())
-    }).expect("cache-hit call failed");
+    let cfg2 = tuner
+        .get_or_tune_moe(key.clone(), |_k| {
+            bench_count += 1;
+            Ok(AutotuneConfig::default())
+        })
+        .expect("cache-hit call failed");
 
     assert_eq!(bench_count, 1, "cache hit must not invoke benchmark again");
     assert_eq!(cfg1, cfg2, "cache hit must return the recorded config");
@@ -267,8 +271,8 @@ fn moe_autotune_all_skew_buckets_populate() {
     let mut tuner = Autotuner::for_device(0, arch);
 
     let shapes = [
-        (128usize, 256usize, 8usize, 2usize),   // small-model
-        (512usize, 1024usize, 8usize, 2usize),  // mid-model
+        (128usize, 256usize, 8usize, 2usize),  // small-model
+        (512usize, 1024usize, 8usize, 2usize), // mid-model
     ];
 
     for (hidden, inter, num_experts, top_k) in shapes {
@@ -283,24 +287,45 @@ fn moe_autotune_all_skew_buckets_populate() {
                 skew_bucket: bucket,
             };
 
-            tuner.get_or_tune_moe(key.clone(), |k| {
-                Ok(benchmark_moe_shape(
-                    k.hidden, k.inter, k.num_experts, k.top_k, k.skew_bucket,
-                    0, 5,
-                ))
-            }).expect("get_or_tune_moe failed");
+            tuner
+                .get_or_tune_moe(key.clone(), |k| {
+                    Ok(benchmark_moe_shape(
+                        k.hidden,
+                        k.inter,
+                        k.num_experts,
+                        k.top_k,
+                        k.skew_bucket,
+                        0,
+                        5,
+                    ))
+                })
+                .expect("get_or_tune_moe failed");
         }
     }
 
     // All 16 keys (8 buckets × 2 shapes) must be cached.
     let moe_keys = tuner.list_moe_keys();
-    assert_eq!(moe_keys.len(), 16, "all 16 (shape×bucket) keys must be cached");
+    assert_eq!(
+        moe_keys.len(),
+        16,
+        "all 16 (shape×bucket) keys must be cached"
+    );
 
     // Every cached config must have a non-zero cycle count and valid block_dim.
     for key in &moe_keys {
-        let cfg = tuner.lookup_moe(key).expect("lookup_moe must find a cached key");
-        assert!(cfg.block_dim >= 64, "block_dim must be ≥ 64 for key {:?}", key);
-        assert!(cfg.cycles_per_invocation > 0, "cycles must be non-zero for key {:?}", key);
+        let cfg = tuner
+            .lookup_moe(key)
+            .expect("lookup_moe must find a cached key");
+        assert!(
+            cfg.block_dim >= 64,
+            "block_dim must be ≥ 64 for key {:?}",
+            key
+        );
+        assert!(
+            cfg.cycles_per_invocation > 0,
+            "cycles must be non-zero for key {:?}",
+            key
+        );
     }
 }
 
@@ -340,8 +365,8 @@ fn moe_autotune_json_round_trip_preserves_all_entries() {
     let json_bytes = tuner.to_json_bytes().expect("to_json_bytes failed");
 
     // Restore (single call — design constraint §2).
-    let restored = Autotuner::from_json_bytes(0, arch, &json_bytes)
-        .expect("from_json_bytes failed");
+    let restored =
+        Autotuner::from_json_bytes(0, arch, &json_bytes).expect("from_json_bytes failed");
 
     // Verify all 3 MoE entries are intact.
     for bucket in 0u8..3 {
@@ -354,7 +379,9 @@ fn moe_autotune_json_round_trip_preserves_all_entries() {
             top_k: 2,
             skew_bucket: bucket,
         };
-        let cfg = restored.lookup_moe(&key).expect("key must survive round-trip");
+        let cfg = restored
+            .lookup_moe(&key)
+            .expect("key must survive round-trip");
         assert_eq!(
             cfg.block_dim,
             128 + u32::from(bucket) * 64,
@@ -437,13 +464,19 @@ fn quantize_routing_skew_boundary_correctness() {
     assert_eq!(quantize_routing_skew(2.0), 7);
     // Midpoint ≈ 0.5 → bucket 3.
     let mid = quantize_routing_skew(0.5);
-    assert!(mid >= 3 && mid <= 4, "mid skew should map to bucket 3 or 4, got {mid}");
+    assert!(
+        mid >= 3 && mid <= 4,
+        "mid skew should map to bucket 3 or 4, got {mid}"
+    );
     // Monotonically non-decreasing.
     let buckets: Vec<u8> = (0..=10)
         .map(|i| quantize_routing_skew(i as f32 / 10.0))
         .collect();
     for w in buckets.windows(2) {
-        assert!(w[0] <= w[1], "quantize_routing_skew must be monotonically non-decreasing");
+        assert!(
+            w[0] <= w[1],
+            "quantize_routing_skew must be monotonically non-decreasing"
+        );
     }
 }
 
@@ -474,7 +507,9 @@ fn moe_autotune_disk_persist_to_cache_dir() {
         grid_stride: 1,
         cycles_per_invocation: 8_000,
     };
-    tuner.record_moe(key.clone(), cfg).expect("record_moe failed");
+    tuner
+        .record_moe(key.clone(), cfg)
+        .expect("record_moe failed");
 
     // Serialize to bytes.
     let json = tuner.to_json_bytes().expect("to_json_bytes failed");
@@ -485,19 +520,27 @@ fn moe_autotune_disk_persist_to_cache_dir() {
         std::fs::create_dir_all(&cache_dir).expect("create cache dir");
         let path = cache_dir.join(format!("{arch}.json"));
         std::fs::write(&path, &json).expect("write autotune JSON");
-        println!("[moe_autotune] persisted {} bytes → {}", json.len(), path.display());
+        println!(
+            "[moe_autotune] persisted {} bytes → {}",
+            json.len(),
+            path.display()
+        );
 
         // Read back and verify.
         let on_disk = std::fs::read(&path).expect("read back autotune JSON");
         let restored = Autotuner::from_json_bytes(0, arch, &on_disk)
             .expect("from_json_bytes from disk failed");
-        let cfg2 = restored.lookup_moe(&key).expect("key must survive disk round-trip");
+        let cfg2 = restored
+            .lookup_moe(&key)
+            .expect("key must survive disk round-trip");
         assert_eq!(cfg, cfg2, "disk round-trip must be byte-identical");
     } else {
         // No GRIM_AUTOTUNE_CACHE_DIR set — just verify the JSON is valid.
         let restored = Autotuner::from_json_bytes(0, arch, &json)
             .expect("from_json_bytes failed on in-memory bytes");
-        let cfg2 = restored.lookup_moe(&key).expect("key must survive in-memory round-trip");
+        let cfg2 = restored
+            .lookup_moe(&key)
+            .expect("key must survive in-memory round-trip");
         assert_eq!(cfg, cfg2);
     }
 }
@@ -526,7 +569,10 @@ fn moe_autotune_full_gpu_sweep_and_selector_build() {
 
     let mut tuner = if let Some(ref path) = json_path {
         if let Ok(bytes) = std::fs::read(path) {
-            println!("[moe_autotune] Loading cached autotune from {}", path.display());
+            println!(
+                "[moe_autotune] Loading cached autotune from {}",
+                path.display()
+            );
             Autotuner::from_json_bytes(0, arch, &bytes)
                 .unwrap_or_else(|_| Autotuner::for_device(0, arch))
         } else {
@@ -537,11 +583,8 @@ fn moe_autotune_full_gpu_sweep_and_selector_build() {
     };
 
     // Benchmark representative shapes.
-    let shapes: &[(usize, usize, usize, usize)] = &[
-        (128, 256, 8, 2),
-        (256, 512, 8, 2),
-        (512, 1024, 8, 2),
-    ];
+    let shapes: &[(usize, usize, usize, usize)] =
+        &[(128, 256, 8, 2), (256, 512, 8, 2), (512, 1024, 8, 2)];
 
     for &(hidden, inter, num_experts, top_k) in shapes {
         for bucket in 0u8..=7 {
@@ -555,21 +598,30 @@ fn moe_autotune_full_gpu_sweep_and_selector_build() {
                 skew_bucket: bucket,
             };
 
-            let cfg = tuner.get_or_tune_moe(key.clone(), |k| {
-                println!(
-                    "[moe_autotune] benchmarking h={} i={} e={} topk={} bucket={}",
-                    k.hidden, k.inter, k.num_experts, k.top_k, k.skew_bucket
-                );
-                Ok(benchmark_moe_shape(
-                    k.hidden, k.inter, k.num_experts, k.top_k, k.skew_bucket,
-                    3, 20,
-                ))
-            }).expect("get_or_tune_moe failed");
+            let cfg = tuner
+                .get_or_tune_moe(key.clone(), |k| {
+                    println!(
+                        "[moe_autotune] benchmarking h={} i={} e={} topk={} bucket={}",
+                        k.hidden, k.inter, k.num_experts, k.top_k, k.skew_bucket
+                    );
+                    Ok(benchmark_moe_shape(
+                        k.hidden,
+                        k.inter,
+                        k.num_experts,
+                        k.top_k,
+                        k.skew_bucket,
+                        3,
+                        20,
+                    ))
+                })
+                .expect("get_or_tune_moe failed");
 
             println!(
                 "[moe_autotune] h={hidden} i={inter} bucket={bucket}: \
                  block_dim={} tile_kv={} cycles={}µs",
-                cfg.block_dim, cfg.tile_kv, cfg.cycles_per_invocation / 1000
+                cfg.block_dim,
+                cfg.tile_kv,
+                cfg.cycles_per_invocation / 1000
             );
         }
     }
@@ -579,12 +631,19 @@ fn moe_autotune_full_gpu_sweep_and_selector_build() {
     if let Some(ref path) = json_path {
         std::fs::create_dir_all(path.parent().unwrap()).ok();
         std::fs::write(path, &json).expect("write autotune cache");
-        println!("[moe_autotune] Saved {} bytes → {}", json.len(), path.display());
+        println!(
+            "[moe_autotune] Saved {} bytes → {}",
+            json.len(),
+            path.display()
+        );
     }
 
     // Build variant table and verify CharonSelector can consume it.
     let table = build_variant_table_from_autotuner(&tuner, arch);
-    assert!(!table.is_empty(), "variant table must be non-empty after sweep");
+    assert!(
+        !table.is_empty(),
+        "variant table must be non-empty after sweep"
+    );
     let mut selector = CharonSelector::new(table, 3);
 
     // Exercise selector across all skew levels.
@@ -593,5 +652,8 @@ fn moe_autotune_full_gpu_sweep_and_selector_build() {
         println!("[moe_autotune] skew={skew:.2} → variant={:?}", variant);
     }
 
-    println!("[moe_autotune] Full GPU sweep complete. {} total cached entries.", tuner.len());
+    println!(
+        "[moe_autotune] Full GPU sweep complete. {} total cached entries.",
+        tuner.len()
+    );
 }

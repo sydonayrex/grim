@@ -18,7 +18,7 @@ use grim_core::model::CausalLm;
 use grim_core::session::DeterminismMode;
 use grim_disagg::{DisaggConfig, DisaggRouter, PoolRole};
 use grim_engine::{Engine, EngineConfig};
-use grim_kvtransport::{KvBlockStore, NetworkKvClient};
+use grim_kvtransport::NetworkKvClient;
 use grim_memory::BLOCK_SIZE;
 use grim_models_transformer::{Llama, LlamaConfig};
 use grim_tensor::Device;
@@ -165,7 +165,7 @@ fn test_disagg_prefill_to_decode_loopback() {
     prefill_engine.register_model("small", small_llama());
 
     // --- Step 1: Run prefill on the prefill engine ---
-    prefill_engine.enqueue_request(grim_scheduler::Request {
+    let _ = prefill_engine.enqueue_request(grim_scheduler::Request {
         id: 1,
         prompt_tokens: 4,
         priority: 0,

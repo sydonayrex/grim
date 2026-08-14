@@ -159,6 +159,15 @@ pub struct SchedulerOutput {
     pub adapter_batches: std::collections::HashMap<u32, Vec<u64>>,
 }
 
+/// Read-only queue counts for status and observability surfaces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SchedulerSnapshot {
+    pub active_requests: usize,
+    pub waiting_requests: usize,
+    pub admitted_requests: usize,
+    pub paused_requests: usize,
+}
+
 impl SchedulerOutput {
     pub fn is_empty(&self) -> bool {
         self.prefill_ids.is_empty() && self.decode_ids.is_empty()
@@ -166,6 +175,20 @@ impl SchedulerOutput {
 }
 
 impl Scheduler {
+    /// Return queue counts without exposing the scheduler's collections to
+    /// status consumers. `admitted_requests` is the number currently eligible
+    /// to enter the next batch; this scheduler stores admitted work in
+    /// `waiting` until `schedule()` moves it into `running`, so it is zero
+    /// between scheduling passes.
+    pub fn snapshot(&self) -> SchedulerSnapshot {
+        SchedulerSnapshot {
+            active_requests: self.running.len(),
+            waiting_requests: self.waiting.len(),
+            admitted_requests: 0,
+            paused_requests: self.paused.len(),
+        }
+    }
+
     pub fn new(
         max_batched_tokens: usize,
         max_num_seqs: usize,
@@ -414,7 +437,6 @@ pub fn plan_hybrid_attention_step(
 #[cfg(test)]
 mod hybrid_tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn make_spill() -> grim_kvtransport::SharedSpillManager {
         let dir = std::env::temp_dir().join(format!(

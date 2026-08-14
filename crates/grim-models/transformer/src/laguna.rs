@@ -11,10 +11,10 @@
 //! exists elsewhere — see `muse_glimmer` — but is unrelated to this model.)
 
 use grim_core::error::Result;
-use grim_core::model::{AdapterHandle, CausalLm, Model, ModelConfig, ModalityHint};
+use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
-use grim_nn::moe::RouterKind;
 use grim_nn::TensorParallelConfig;
+use grim_nn::moe::RouterKind;
 use grim_tensor::{ArithType, Device, Tensor};
 
 use crate::model::{Llama, LlamaConfig};
@@ -99,7 +99,6 @@ impl Default for LagunaConfig {
     }
 }
 
-
 impl ModelConfig for LagunaConfig {
     fn name(&self) -> &str {
         "laguna"
@@ -144,7 +143,7 @@ impl Laguna {
             rms_norm_eps: cfg.rms_norm_eps,
             rope_theta: cfg.rope_theta,
             max_seq_len: cfg.max_seq_len,
-        
+
             partial_rotary_factor: 1.0,
             yarn: None,
         };
@@ -177,7 +176,11 @@ impl Laguna {
 
         let attn_specs: Vec<crate::block::LayerAttentionSpec> = (0..cfg.num_layers)
             .map(|i| {
-                let layer_type = cfg.layer_types.get(i).map(|s| s.as_str()).unwrap_or("full_attention");
+                let layer_type = cfg
+                    .layer_types
+                    .get(i)
+                    .map(|s| s.as_str())
+                    .unwrap_or("full_attention");
                 let is_sliding = layer_type == "sliding_attention";
                 let attn_type = if is_sliding {
                     crate::block::AttentionType::Sliding
@@ -214,7 +217,6 @@ impl Laguna {
                     yarn,
                 };
 
-
                 let sliding_window = if is_sliding {
                     Some(cfg.sliding_window)
                 } else {
@@ -234,7 +236,8 @@ impl Laguna {
             })
             .collect();
 
-        let inner = Llama::load_tp_moe_specs(device.clone(), ws, llama_cfg, &moe_spec, &attn_specs, tp)?;
+        let inner =
+            Llama::load_tp_moe_specs(device.clone(), ws, llama_cfg, &moe_spec, &attn_specs, tp)?;
 
         Ok(Self {
             cfg,
@@ -243,8 +246,6 @@ impl Laguna {
         })
     }
 }
-
-
 
 impl Model for Laguna {
     fn config(&self) -> &dyn ModelConfig {
@@ -297,10 +298,22 @@ mod tests {
 
         let specs: Vec<crate::block::LayerAttentionSpec> = (0..num_layers)
             .map(|i| {
-                let layer_type = cfg.layer_types.get(i).map(|s| s.as_str()).unwrap_or(if i % 4 == 0 { "full_attention" } else { "sliding_attention" });
+                let layer_type =
+                    cfg.layer_types
+                        .get(i)
+                        .map(|s| s.as_str())
+                        .unwrap_or(if i % 4 == 0 {
+                            "full_attention"
+                        } else {
+                            "sliding_attention"
+                        });
                 let is_sliding = layer_type == "sliding_attention";
 
-                let num_heads = cfg.num_attention_heads_per_layer.get(i).copied().unwrap_or(if is_sliding { 72 } else { 48 });
+                let num_heads = cfg
+                    .num_attention_heads_per_layer
+                    .get(i)
+                    .copied()
+                    .unwrap_or(if is_sliding { 72 } else { 48 });
 
                 let theta = if is_sliding {
                     cfg.sliding_rope_theta
@@ -313,7 +326,6 @@ mod tests {
                 } else {
                     cfg.full_partial_rotary_factor
                 };
-
 
                 let rotary_dim = (cfg.head_dim as f32 * partial_factor).round() as usize;
 
@@ -335,7 +347,11 @@ mod tests {
                 let has_attn_gate = cfg.gating == "per-head";
 
                 crate::block::LayerAttentionSpec {
-                    attn_type: if is_sliding { crate::block::AttentionType::Sliding } else { crate::block::AttentionType::Full },
+                    attn_type: if is_sliding {
+                        crate::block::AttentionType::Sliding
+                    } else {
+                        crate::block::AttentionType::Full
+                    },
 
                     num_heads,
                     num_kv_heads: cfg.num_kv_heads,
@@ -365,4 +381,3 @@ mod tests {
         assert!(specs[1].has_attn_gate);
     }
 }
-

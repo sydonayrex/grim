@@ -16,10 +16,7 @@ use grim_autograd::preference_loss::{
     dpo_loss, grpo_loss, grpo_normalize_rewards, kto_loss, orpo_odds_ratio_loss, simpo_loss,
 };
 use grim_format::tprov::RemappingTensorProvider;
-use grim_tensor::{
-    DType, QuantProvenance, Shape, Tensor, TensorProvider,
-    backend::ScytheLink,
-};
+use grim_tensor::{DType, QuantProvenance, Shape, Tensor, TensorProvider, backend::ScytheLink};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{RwLock, broadcast};
@@ -974,10 +971,10 @@ fn load_rank_model_from_provider(
         rms_norm_eps: hparams.rms_norm_eps,
         rope_theta: hparams.rope_theta,
         max_seq_len: hparams.max_seq_len,
-    
+
         partial_rotary_factor: 1.0,
         yarn: None,
-        };
+    };
     Ok((
         provider,
         tok_embeddings,
@@ -2463,8 +2460,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     // Vary the layer key per step so `PlacementCache`'s
                     // per-layer keying is actually exercised. WI-EP1 will
                     // replace this with a true per-layer loop binding.
-                    let layer_id = (micro_step as u32)
-                        .wrapping_rem(num_layers.max(1) as u32);
+                    let layer_id = (micro_step as u32).wrapping_rem(num_layers.max(1) as u32);
                     Some(ctrl.decide(layer_id, &shape_slice, &caps, &links, 0))
                 } else {
                     None
@@ -3192,13 +3188,13 @@ mod fallback_tests {
         );
     }
 
+    #[allow(deprecated)]
     #[test]
     fn step_pacing_delay_is_pinned_ten_ms() {
         // Pin the per-step pacing delay so docs and code stay in sync. The
         // value is a UI/observability constant, not a compute simulation.
         assert_eq!(STEP_PACING_DELAY, std::time::Duration::from_millis(10));
         // Deprecated alias must remain equal for back-compat.
-        #[allow(deprecated)]
         assert_eq!(SIMULATED_STEP_DELAY, STEP_PACING_DELAY);
     }
 }
@@ -3261,7 +3257,7 @@ mod charon0_topology_tests {
         assert_eq!(m.len(), 4);
         assert_eq!(m[0], ScytheLink::PeerDirect); // 0 -> 0
         assert_eq!(m[1], ScytheLink::PeerDirect); // 0 -> 1 (xGMI)
-        assert_eq!(m[2], ScytheLink::Pcie);      // 1 -> 0 (PCIe back-path)
+        assert_eq!(m[2], ScytheLink::Pcie); // 1 -> 0 (PCIe back-path)
         assert_eq!(m[3], ScytheLink::PeerDirect); // 1 -> 1
         // The critical assertion: the matrix is NOT symmetric, proving the
         // code consults the probe for every ordered pair rather than
@@ -3325,14 +3321,16 @@ mod charon0_topology_tests {
     fn distinct_layer_idx_populates_distinct_cache_slots() {
         let num_layers = 4usize;
         let num_gpus = 2usize;
-        let mut ctrl = grim_engine::scythe2::C2plrController::new(
-            num_layers,
-            num_gpus,
-            10.0_f64,
-        );
+        let mut ctrl = grim_engine::scythe2::C2plrController::new(num_layers, num_gpus, 10.0_f64);
         let caps = vec![
-            grim_tensor::backend::GpuCapability { ordinal: 0, ..Default::default() },
-            grim_tensor::backend::GpuCapability { ordinal: 1, ..Default::default() },
+            grim_tensor::backend::GpuCapability {
+                ordinal: 0,
+                ..Default::default()
+            },
+            grim_tensor::backend::GpuCapability {
+                ordinal: 1,
+                ..Default::default()
+            },
         ];
         let links = build_link_matrix(num_gpus, |_, _| PairLink::Host);
         let shape = [4usize, 4096usize];
@@ -3346,10 +3344,24 @@ mod charon0_topology_tests {
             //  `routes: vec![route_link]`): it picks ONE GPU for this layer,
             //  not a multi-GPU plan. Assert that contract rather than a KxK
             //  shape the controller does not produce.
-            assert_eq!(p.ranks.len(), 1, "layer {layer_id} ranks not single-GPU: {:?}", p.ranks);
-            assert_eq!(p.routes.len(), 1, "layer {layer_id} routes not single-link: {:?}", p.routes);
+            assert_eq!(
+                p.ranks.len(),
+                1,
+                "layer {layer_id} ranks not single-GPU: {:?}",
+                p.ranks
+            );
+            assert_eq!(
+                p.routes.len(),
+                1,
+                "layer {layer_id} routes not single-link: {:?}",
+                p.routes
+            );
             // The chosen rank must be a valid ordinal.
-            assert!(p.ranks[0] < num_gpus, "layer {layer_id} bad rank: {}", p.ranks[0]);
+            assert!(
+                p.ranks[0] < num_gpus,
+                "layer {layer_id} bad rank: {}",
+                p.ranks[0]
+            );
             // The route link must be a valid enum discriminant.
             assert!(matches!(
                 p.routes[0],
@@ -3397,7 +3409,10 @@ mod charon0_topology_tests {
         // a singleton set caught here.
         assert_eq!(seen.len(), num_layers as usize);
         for layer in 0..num_layers {
-            assert!(seen.contains(&layer), "layer {layer} missing from layer-key cycle");
+            assert!(
+                seen.contains(&layer),
+                "layer {layer} missing from layer-key cycle"
+            );
         }
     }
 

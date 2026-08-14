@@ -1,5 +1,5 @@
 use grim_backend_rocm::{RocmDevice, launch_tree_attention};
-use grim_tensor::{BackendDevice, BackendStorage, DType, Shape};
+use grim_tensor::{BackendDevice, DType, Shape};
 use std::sync::Arc;
 
 #[test]

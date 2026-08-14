@@ -20,6 +20,13 @@ extern "C" __global__ void grim_mul_scalar(const float* x, float s, float* out, 
     out[i] = x[i] * s;
 }
 
+extern "C" __global__ void grim_add_scalar(const float* x, float s, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = x[i] + s;
+}
+
+
 extern "C" __global__ void grim_sqrt(const float* x, float* out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -405,14 +412,22 @@ mod tests {
     /// the kernel source so the JIT compiler can resolve all referenced symbols.
     #[test]
     fn test_rope_yarn_kernel_presence() {
-        assert!(OTHER_KERNEL_SOURCE.contains("grim_rope_yarn"),
-            "grim_rope_yarn kernel missing from OTHER_KERNEL_SOURCE");
-        assert!(OTHER_KERNEL_SOURCE.contains("inv_freq"),
-            "inv_freq param missing from grim_rope_yarn");
-        assert!(OTHER_KERNEL_SOURCE.contains("mscale"),
-            "mscale param missing from grim_rope_yarn");
-        assert!(OTHER_KERNEL_SOURCE.contains("rotary_half"),
-            "rotary_half param missing from grim_rope_yarn");
+        assert!(
+            OTHER_KERNEL_SOURCE.contains("grim_rope_yarn"),
+            "grim_rope_yarn kernel missing from OTHER_KERNEL_SOURCE"
+        );
+        assert!(
+            OTHER_KERNEL_SOURCE.contains("inv_freq"),
+            "inv_freq param missing from grim_rope_yarn"
+        );
+        assert!(
+            OTHER_KERNEL_SOURCE.contains("mscale"),
+            "mscale param missing from grim_rope_yarn"
+        );
+        assert!(
+            OTHER_KERNEL_SOURCE.contains("rotary_half"),
+            "rotary_half param missing from grim_rope_yarn"
+        );
     }
 
     /// `grim_scale_bias_epilogue` must be present in the HIP source so the JIT
@@ -433,5 +448,3 @@ mod tests {
         );
     }
 }
-
-

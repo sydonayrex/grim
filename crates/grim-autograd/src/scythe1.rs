@@ -30,7 +30,7 @@ impl Scythe1Adapter {
     /// Instantiate from base dimensions, rank, and alpha.
     pub fn new(d_out: usize, d_in: usize, r: usize, alpha: f32) -> Result<Self> {
         let inner = SoulEaterAdapter::new(d_out, d_in, r, alpha)?;
-        let fim_diag = vec![0.0f32; r];
+        let fim_diag = vec![1.0f32; r];
         Ok(Self { inner, fim_diag })
     }
 

@@ -123,7 +123,7 @@ fn run_case(
     // round-trips with negligible error.
     let synth = |seed, heads| {
         (0..num_tokens * heads * head_dim)
-            .map(|i| ((i as f32).sin() * 0.5 + (seed as f32) * 1e-3))
+            .map(|i| (i as f32).sin() * 0.5 + (seed as f32) * 1e-3)
             .collect::<Vec<f32>>()
     };
     let k_data = synth(1, num_kv_heads);

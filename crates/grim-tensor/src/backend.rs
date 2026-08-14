@@ -121,7 +121,6 @@ impl RopeConfig {
     }
 }
 
-
 /// Unified memory-advice options matching `madvise` and `hipMemAdvise`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemAdvice {
@@ -208,6 +207,87 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
+    /// Elementwise scalar addition: `out = x + scalar`.
+    fn add_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (x, scalar, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "add_scalar not implemented for this backend".into(),
+        ))
+    }
+
+    /// Elementwise scalar subtraction: `out = x - scalar`.
+    fn sub_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (x, scalar, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "sub_scalar not implemented for this backend".into(),
+        ))
+    }
+
+    /// Elementwise scalar division: `out = x / scalar`.
+    fn div_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.mul_scalar(x, 1.0 / scalar, out_shape)
+    }
+
+    /// Fused 3-in-1 SwiGLU activation + dynamic quantization:
+    /// `y = silu(gate) * up`, dynamically computes block scale, and quantizes `y` to u8 bytes.
+    /// Returns `(quantized_bytes_storage, scales_storage, compute_handle)`.
+    fn silu_mul_quantize(
+        &self,
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        format: crate::dtype::QuantFormat,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let (y_unquant, handle) = self.silu_mul(gate, up, out_shape)?;
+        let q_bytes = self.quantize(y_unquant.as_ref(), format)?;
+        let scale_storage = self.zeros(&Shape::from_slice(&[1]), crate::dtype::DType::F32)?;
+        Ok((q_bytes, scale_storage, handle))
+    }
+
+    /// Block-Quantized SageAttention:
+    /// INT8/FP8 block-scaled attention for ultra-long context windows (>128k tokens).
+    fn sage_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.qkv_attention(
+            q,
+            k,
+            v,
+            num_kv_heads,
+            kv_seq_len,
+            0,
+            None,
+            out_shape,
+            None,
+            None,
+        )
+    }
+
     /// Elementwise square root: `out = sqrt(x)`.
     ///
     /// Used by the device-resident AdamW optimizer step to compute
@@ -288,6 +368,25 @@ pub trait BackendDevice: Send + Sync {
         Ok(handle)
     }
 
+    /// Fused Add + RMSNorm: `res_out = x + residual`, `y_out = rms_norm(res_out, weight, eps)`.
+    /// Returns `(y_out, res_out, compute_handle)`.
+    fn fused_add_rms_norm(
+        &self,
+        x: &dyn BackendStorage,
+        residual: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        eps: f32,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let (res_out, _) = self.add(x, residual, out_shape)?;
+        let (y_out, handle) = self.rms_norm(res_out.as_ref(), weight, eps, out_shape)?;
+        Ok((y_out, res_out, handle))
+    }
+
     /// Softmax along the last dim.
     fn softmax(
         &self,
@@ -332,11 +431,7 @@ pub trait BackendDevice: Send + Sync {
     /// steps can append new rows with `copy_slice_into` instead of
     /// re-uploading the whole cache through host memory. Contents are
     /// undefined until written.
-    fn alloc_storage(
-        &self,
-        shape: &Shape,
-        dtype: DType,
-    ) -> Result<Box<dyn BackendStorage>> {
+    fn alloc_storage(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         let _ = (shape, dtype);
         Err(crate::error::Error::Unimplemented(
             "alloc_storage not implemented for this backend".into(),
@@ -407,7 +502,6 @@ pub trait BackendDevice: Send + Sync {
         cfg: &RopeConfig,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-
         let _ = (x, positions, cfg, out_shape);
         Err(crate::error::Error::Unimplemented(
             "rope not implemented for this backend".into(),
@@ -508,12 +602,20 @@ pub trait BackendDevice: Send + Sync {
         Box<dyn BackendStorage>,
         Box<dyn ComputeHandle>,
     )> {
-        let _ = (q_raw, kv_raw, q_norm_w, kv_norm_w, qk_nope_dim, qk_rope_dim, v_dim, eps);
+        let _ = (
+            q_raw,
+            kv_raw,
+            q_norm_w,
+            kv_norm_w,
+            qk_nope_dim,
+            qk_rope_dim,
+            v_dim,
+            eps,
+        );
         Err(crate::error::Error::Unimplemented(
             "mla_q_kv_norm_split not implemented for this backend".into(),
         ))
     }
-
 
     /// QKV attention calculation on device.
     ///
@@ -1074,6 +1176,59 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         (**self).mul_scalar(x, scalar, out_shape)
     }
 
+    fn add_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).add_scalar(x, scalar, out_shape)
+    }
+
+    fn sub_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).sub_scalar(x, scalar, out_shape)
+    }
+
+    fn div_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).div_scalar(x, scalar, out_shape)
+    }
+
+    fn silu_mul_quantize(
+        &self,
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        format: crate::dtype::QuantFormat,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        (**self).silu_mul_quantize(gate, up, format, out_shape)
+    }
+
+    fn sage_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).sage_attention(q, k, v, num_kv_heads, kv_seq_len, out_shape)
+    }
+
     fn sqrt(
         &self,
         x: &dyn BackendStorage,
@@ -1168,11 +1323,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         (**self).from_cpu_bytes(data, shape, dtype)
     }
 
-    fn alloc_storage(
-        &self,
-        shape: &Shape,
-        dtype: DType,
-    ) -> Result<Box<dyn BackendStorage>> {
+    fn alloc_storage(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         (**self).alloc_storage(shape, dtype)
     }
 
@@ -1226,7 +1377,6 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         (**self).rope(x, positions, cfg, out_shape)
     }
-
 
     fn qkv_attention(
         &self,
@@ -1283,7 +1433,6 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
             out_shape,
         )
     }
-
 
     fn tree_attention(
         &self,
@@ -1381,7 +1530,15 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         (**self).flash_attention(
-            q, k, v, num_heads, num_kv_heads, head_dim, seq_len, causal, out_shape,
+            q,
+            k,
+            v,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            causal,
+            out_shape,
         )
     }
 
@@ -1475,7 +1632,11 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         )
     }
 
-    fn quantize(&self, x: &dyn BackendStorage, format: QuantFormat) -> Result<Box<dyn BackendStorage>> {
+    fn quantize(
+        &self,
+        x: &dyn BackendStorage,
+        format: QuantFormat,
+    ) -> Result<Box<dyn BackendStorage>> {
         (**self).quantize(x, format)
     }
 

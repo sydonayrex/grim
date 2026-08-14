@@ -1,64 +1,66 @@
 # How to Run Inference
 
-## One-Shot Inference
+## Goal
 
-```bash
-# Simple prompt
-grim run llama3 --prompt "Hello, world!"
+Run local inference for one-shot generations, interactive chats, or start an OpenAI-compatible HTTP server.
 
-# With token limit
-grim run llama3 --prompt "Write a poem about AI" --max-tokens 200
+## Prerequisites
 
-# Interactive mode
-grim run llama3
-# Then type prompts and press Enter
+- Grim is installed and available in your PATH.
+- You have downloaded a valid model file.
 
-# Streaming enabled by default
+## Steps
+
+1. **Run a simple prompt (One-shot inference)**
+   Execute a prompt and exit immediately. Provide the model name and the prompt as positional arguments.
+
+   ```bash
+   grim run llama3 "Hello, world!"
+   ```
+
+2. **Run an interactive chat session**
+   Omit the prompt to enter interactive mode.
+
+   ```bash
+   grim run llama3
+   ```
+
+3. **Start the HTTP Server**
+   To start the OpenAI-compatible HTTP server on the default port (11434):
+
+   ```bash
+   grim serve
+   ```
+
+   You can specify a custom bind address:
+
+   ```bash
+   grim serve --address 0.0.0.0:8080
+   ```
+
+4. **Serve a model during inference**
+   You can also spin up the server directly from the `run` command.
+
+   ```bash
+   grim run llama3 --serve --address 127.0.0.1:11434
+   ```
+
+5. **Benchmark Performance**
+   Run a smoke test or a customized benchmark to test throughput.
+
+   ```bash
+   grim bench --model llama3 --tokens 256 --concurrency 4
+   ```
+
+## Expected Output
+
+For one-shot execution, the model will output text directly to standard output.
+When running `grim serve`, you will see:
 ```
-
-## Start HTTP Server
-
-```bash
-# Default port 11434
-grim serve
-
-# Custom address
-grim serve --address 0.0.0.0:8080
-
-# With config file
-grim serve --config /etc/grim/grim.toml
+[grim] server listening on 127.0.0.1:11434
 ```
-
-## Convert for GPU Optimization
-
-### For ROCm (AMD GPUs)
-
+You can then test the server via HTTP:
 ```bash
-# Convert and optimize for your GPU
-grim oxidizer convert -i model.gguf -o model.grim
-
-# With ROCm profile
-grim oxidizer convert -i model.gguf -o model.grim --profile gfx1100
-
-# Calibrate and convert
-grim oxidizer calibrate -m model.gguf -o model
-grim oxidizer search scores.json -o model
-grim oxidizer convert -i model.gguf -o model.grim
-```
-
-### For CUDA (NVIDIA GPUs)
-
-```bash
-grim convert -i model.gguf -o model.grim
-```
-
-## Server as OpenAI-Compatible API
-
-```bash
-# Start server
-grim serve --address 127.0.0.1:11434
-
-# Test with curl
 curl -X POST http://localhost:11434/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -68,15 +70,7 @@ curl -X POST http://localhost:11434/v1/chat/completions \
   }'
 ```
 
-## Benchmark Performance
+## What Can Go Wrong
 
-```bash
-# Smoke test
-grim bench
-
-# With custom parameters
-grim bench --tokens 512 --concurrency 4
-
-# With specific model
-grim bench --model llama3 --tokens 256
-```
+- **Model not found**: If the requested model is not downloaded or the path is incorrect, Grim will return a missing model error. **Recovery**: Ensure the model is available by running `grim check` or pull it using `grim dl`.
+- **Address in use**: If another service (like Ollama) is already using port 11434, the server will fail to bind. **Recovery**: Use a different port via `--address 127.0.0.1:8080` or stop the conflicting service.

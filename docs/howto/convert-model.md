@@ -1,67 +1,77 @@
 # How to Convert Models
 
-Grim converts models from GGUF/safetensors to its native `.grim` format optimized for ROCm.
+## Goal
 
-## Convert GGUF to .grim
+Convert models from GGUF/safetensors to the native `.grim` format optimized for ROCm, optionally calibrating and searching for optimal quantization.
 
-```bash
-# Basic conversion
-grim oxidizer convert -i model.gguf -o model.grim
+## Prerequisites
 
-# With quantization for ROCm
-grim oxidizer convert -i model.gguf -o model.grim --target_bpw 4.0
+- Grim is installed.
+- You have downloaded a source model (e.g., `model.gguf`).
 
-# With generations (EvoPress search)
-grim oxidizer convert -i model.gguf -o model.grim --generations 100
+## Steps
 
-# Profile for specific GPU
-grim oxidizer convert -i model.gguf -o model.grim --profile gfx1100
+1. **Basic Conversion**
+   You can use the top-level `convert` command with flags for input and output.
+
+   ```bash
+   grim convert -i model.gguf -o model.grim
+   
+   # With a target bits-per-weight and GPU target:
+   grim convert -i model.gguf -o model.grim --target-bpw 4.0 --target gfx1100
+   ```
+
+2. **Advanced Pipeline: Calibrate**
+   For higher quality quantization, calibrate the model to generate importance scores. (Note: These arguments are positional).
+
+   ```bash
+   grim oxidizer calibrate model.gguf model_scores.json
+   
+   # With a custom dataset:
+   grim oxidizer calibrate model.gguf model_scores.json --dataset /path/to/datasets
+   ```
+
+3. **Advanced Pipeline: Search**
+   Run the EvoPress evolutionary search on the pre-computed importance scores. You must provide the scores path and a comma-separated list of tensor sizes.
+
+   ```bash
+   grim oxidizer search model_scores.json "4096x4096,4096x11008" --target-bpw 4.0 --generations 50
+   ```
+
+4. **Advanced Pipeline: Convert**
+   Execute the full conversion pipeline using the `oxidizer convert` subcommand (which takes positional arguments for files and uses `--profile` instead of `--target`).
+
+   ```bash
+   grim oxidizer convert model.gguf model.grim --profile gfx1100
+   ```
+
+5. **Prepare for Training**
+   Create a training-ready artifact from a base checkpoint.
+
+   ```bash
+   grim oxidizer prepare model.gguf model.train.grim
+   
+   # With bf16 format:
+   grim oxidizer prepare model.gguf model.train.grim --format bf16
+   ```
+
+6. **Fuse for Performance**
+   Analyze a checkpoint and bake ROCm fusion hints into the output artifact.
+
+   ```bash
+   grim oxidizer fuse model.gguf model.fused.grim
+   ```
+
+## Expected Output
+
+When converting, you will see a progress bar and metadata about the conversion:
+```
+[grim] converting model.gguf -> model.grim
+[grim] running EvoPress...
+[grim] conversion complete
 ```
 
-## Calibrate for Optimization
+## What Can Go Wrong
 
-```bash
-# Run importance-matrix calibration
-grim oxidizer calibrate -m model.gguf -o model
-
-# With custom dataset
-grim oxidizer calibrate -m model.gguf -o model --dataset /path/to/datasets
-```
-
-## Run EvoPress Evolution
-
-```bash
-# Evolve quantization parameters
-grim oxidizer search scores.json -o model --target_bpw 4.0 --generations 50
-```
-
-## Prepare Training Artifact
-
-```bash
-# Create train-ready artifact
-grim oxidizer prepare -i model.gguf -o model.train
-
-# With BF16 precision
-grim oxidizer prepare -i model.gguf -o model.train --format bf16
-```
-
-## Fuse for Better Performance
-
-```bash
-# Analyze and bake fusion hints
-grim oxidizer fuse -i model.gguf -o model.fused
-```
-
-## ROCm Profiles
-
-| Profile | GPU Family |
-|---|---|
-| `gfx900` | Vega 10/20 (default) |
-| `gfx906` | MI50/MI60 |
-| `gfx1030` | RX 6000 series |
-| `gfx1100` | RX 7000 series |
-| `gfx1101` | RX 7000 XT |
-| `gfx1200` | RX 8000 series |
-| `gfx1201` | RX 8000 XT |
-
-Auto-detection is used when `--profile` is omitted.
+- **Invalid model format**: Grim may reject unsupported or corrupted files. **Recovery**: Ensure you are using a valid, intact `.gguf` or supported format file.
+- **Out of memory during calibration**: Calibrating large models requires substantial RAM/VRAM. **Recovery**: Use a machine with more memory or enable offloading via `--gpu` if applicable.

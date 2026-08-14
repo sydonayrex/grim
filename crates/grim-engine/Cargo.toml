@@ -35,3 +35,4 @@ grim-kvtransport = { workspace = true }
 
 [features]
 default = []
+rocm-mem = []

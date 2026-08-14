@@ -81,6 +81,10 @@ enum Commands {
         /// Decode node address for prefill mode (where to push KV to).
         #[arg(long, default_value = "")]
         decode_addr: String,
+        /// Allow binding to 0.0.0.0 / :: (all interfaces). Without this flag,
+        /// binding to a wildcard address is refused for safety.
+        #[arg(long)]
+        allow_public: bool,
     },
     /// One-shot inference or HTTP serving.
     Run {
@@ -337,8 +341,8 @@ enum Commands {
         /// RDNA → Wave32), "w32", or "w64" (explicit CDNA opt-in).
         #[arg(long, default_value = "auto")]
         wave: String,
-        /// Offload tensor dequantization to the host ROCm GPU during conversion.
-        #[arg(long)]
+        /// Offload tensor dequantization to host ROCm GPU during conversion (GPU-first with CPU fallback).
+        #[arg(long, default_value_t = true)]
         gpu: bool,
     },
     /// Bake a trained LoRA/QLoRA adapter sidecar permanently into a base .grim model file.
@@ -542,8 +546,8 @@ enum OxidizerCommands {
         /// "w32", or "w64" (CDNA opt-in).
         #[arg(long, default_value = "auto")]
         wave: String,
-        /// Offload tensor dequantization to the host ROCm GPU during conversion.
-        #[arg(long)]
+        /// Offload tensor dequantization to host ROCm GPU during conversion (GPU-first with CPU fallback).
+        #[arg(long, default_value_t = true)]
         gpu: bool,
     },
     /// Raven FP8/MXFP4 repack pipeline: rewrite model tensors into FP8 format.
@@ -663,6 +667,7 @@ async fn main() -> Result<()> {
             disagg_role,
             prefill_addr,
             decode_addr,
+            allow_public,
         } => {
             // Build EngineConfig with optional disaggregation wiring.
             let mut engine_config = grim_engine::EngineConfig::default();
@@ -727,6 +732,20 @@ async fn main() -> Result<()> {
             // port is not silently ignored (a missing --host was the most common
             // cause of "port ignored" reports).
             let effective = if !address.is_empty() {
+                let host_part = address.split(':').next().unwrap_or("");
+                if host_part == "0.0.0.0" || host_part == "::" {
+                    eprintln!(
+                        "[grim] WARNING: binding to {host_part} exposes the server on all network \
+                         interfaces. This is a security risk on untrusted networks. Use \
+                         --allow-public to suppress this warning."
+                    );
+                    if !allow_public {
+                        eprintln!(
+                            "[grim] ERROR: refusing to bind to {host_part} without --allow-public flag."
+                        );
+                        std::process::exit(1);
+                    }
+                }
                 address.clone()
             } else if let (Some(h), Some(p)) = (&host, &port) {
                 format!("{h}:{p}")
@@ -758,6 +777,10 @@ async fn main() -> Result<()> {
             repeat_penalty,
         } => {
             if let Some(ref dev) = device {
+                // SAFETY: env::set_var is UB if other threads concurrently read the
+                // environment. At this point no background worker tasks exist yet
+                // (engine hasn't been constructed), so no concurrent reader of
+                // GRIM_BACKEND is possible within this process.
                 unsafe {
                     std::env::set_var("GRIM_BACKEND", dev);
                 }
@@ -1325,7 +1348,8 @@ async fn main() -> Result<()> {
                     let mut cb = |stage: &str, done: usize, total: usize| {
                         prog.render(stage, done, total);
                     };
-                    let mut progress: Option<&mut dyn FnMut(&str, usize, usize)> = Some(&mut cb);
+                    let mut progress: Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)> =
+                        Some(&mut cb);
                     match oxidizer::cmd_oxidizer_calibrate(
                         &model,
                         &output,

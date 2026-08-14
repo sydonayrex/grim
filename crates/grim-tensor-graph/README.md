@@ -1,105 +1,52 @@
-# grim-tensor-graph
-
-Checkpoint-derived tensor graph IR and fusion-pattern detection. Analyzes named-tensor lists to identify fusable op sequences (RmsNorm + MatMul, QKV projection, attention) and emit backend-specific fusion hints.
-
 ## Purpose
-
-Provides an IR for detecting fusion opportunities in compiled transformer graphs. Takes a list of tensor names (from a loaded checkpoint), constructs a `ComputationGraph` with `GraphNode` entries keyed by op type, identifies `FusionSequence` candidates, and produces `TensorGraphIr` with fusion groups that the ROCm backend applies.
+The `grim-tensor-graph` crate provides an intermediate representation (IR) for analyzing and optimizing computational graphs derived from model checkpoints. It specializes in detecting tensor fusion patterns, combining multiple sequential operations into fused variants for optimal hardware execution.
 
 ## Boundaries
-
-- Is a read-only analysis tool — does not execute kernels.
-- Does **not** load checkpoints directly — callers pass tensor name lists; checkpoint loading is `grim-format`'s role.
-- Does **not** perform inference.
+This crate is an analytical layer. It builds IR graphs and pattern-matches them, returning structural optimization suggestions. It does not execute the graphs, nor does it interact with any hardware backend directly. It strictly operates on metadata (tensor names and operator intents) parsed from checkpoints.
 
 ## Dependency Graph
-
 ```mermaid
-graph LR
-    A[grim-tensor-graph] --> B[grim-tensor]
-    A --> C[grim-format]
-
-    subgraph "reverse deps"
-        D1[grim-cli]
-        D2[grim-garage]
-    end
-
-    D1 --> A
-    D2 --> A
-
-    style A fill:#fff3e0
+graph TD
+    grim-tensor-graph[["grim-tensor-graph"]]
+    
+    grim-tensor["grim-tensor"]
+    grim-format["grim-format"]
+    
+    grim-tensor-graph --> grim-tensor
+    grim-tensor-graph --> grim-format
 ```
 
-## Public API
-
-```rust
-pub use ir::{ComputationGraph, FusionSequence, GraphNode, OpType};
-
-pub enum OpType {
-    MatMul,
-    RmsNorm,
-    QkvProjection,
-    AttentionScore,
-    Linear,
-}
-
-pub struct GraphNode {
-    pub id: usize,
-    pub op_type: OpType,
-    pub input_tensors: Vec<String>,
-    pub output_tensor: String,
-    pub shape: Option<Shape>,
-    pub dtype: ArithType,
-}
-
-pub struct ComputationGraph {
-    pub nodes: Vec<GraphNode>,
-    pub entry_points: Vec<String>,
-    pub fusion_candidates: Vec<FusionSequence>,
-}
-
-pub struct FusionSequence {
-    pub ops: Vec<OpType>,
-    pub target_backend_op: String,
-}
-
-pub struct TensorGraphIr {
-    pub nodes: Vec<String>,
-    pub fusion_groups: Vec<FusionGroup>,
-}
-
-pub struct FusionGroup {
-    pub op: grim_format::gguf::GrimFusionOp,
-    pub tensors: Vec<String>,
-}
-
-pub fn build_transformer_ir(tensor_names: &[&str]) -> TensorGraphIr;
-
-impl TensorGraphIr {
-    pub fn recommended_fusion_ops(&self) -> Vec<GrimFusionOp>;
-}
-```
+## Public API Overview
+- `TensorGraphIr`: Represents the computational graph with extracted nodes and fusion groups.
+- `ComputationGraph` / `FusionSequence` / `GraphNode` / `OpType`: Core IR structs representing node connectivity and operator categories.
+- `FusionGroup`: Represents a set of tensors flagged for kernel fusion (e.g., Q, K, V projections).
+- `build_transformer_ir`: Analyzes an iterator of tensor names and constructs a `TensorGraphIr`.
 
 ## Usage Example
-
 ```rust
-use grim_tensor_graph::build_transformer_ir;
+use grim_tensor_graph::{build_transformer_ir, TensorGraphIr};
 
-let names = [
+let tensor_names = vec![
     "blk.0.attention_norm.weight",
     "blk.0.attention.wq.weight",
     "blk.0.attention.wk.weight",
     "blk.0.attention.wv.weight",
 ];
-let ir = build_transformer_ir(&names);
-let ops = ir.recommended_fusion_ops();
+
+let ir: TensorGraphIr = build_transformer_ir(tensor_names.iter().map(AsRef::as_ref));
+let fusions = ir.recommended_fusion_ops();
+
+println!("Recommended fusions: {:?}", fusions);
 ```
 
-## Feature Flags
-
-This crate has no feature flags.
+## Use Cases
+- Inspecting GGUF checkpoints during load time to find structural optimization opportunities.
+- Identifying sets of individual linear projections (e.g., Q, K, V) that can be merged into a single fused QKV kernel.
+- Recognizing patterns like RMSNorm + MatMul that can be fused on supporting backends.
 
 ## Edge Cases, Limitations, and Quirks
+- The pattern matching heavily relies on string sub-matching of tensor naming conventions (e.g., `attn_q.weight`, `attention_norm`). Checkpoints with non-standard naming schemas may evade detection.
+- Fusions are "recommended" and not strictly enforced; the engine executing the graph must ultimately respect the detected groups.
 
-- Fusion detection uses substring matching on tensor names (e.g., `"attention_norm"`, `"self_attn.q_proj"`) — names must follow the conventions used in `grim-models-*` checkpoints.
-- `recommended_fusion_ops` returns only one entry per `GrimFusionOp` variant, even if multiple fusion groups match.
+## Build Flags, Feature Flags, and Environment Variables
+- `default`: No default features are enabled.

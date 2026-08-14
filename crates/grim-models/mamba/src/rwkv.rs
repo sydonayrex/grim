@@ -10,11 +10,36 @@ use grim_nn::{Linear, RmsNorm};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 use std::any::Any;
 
+/// Validate that a loaded weight tensor has the expected shape, returning a
+/// descriptive `Error::Shape` when it does not.
+fn assert_weight_shape(tensor: &Tensor, expected: &[usize], name: &str) -> Result<()> {
+    let dims = tensor.shape().dims();
+    if dims != expected {
+        return Err(Error::Shape(format!(
+            "RWKV weight '{}' has shape {:?}, expected {:?}",
+            name, dims, expected
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct RwkvConfig {
     pub vocab_size: usize,
     pub hidden_size: usize,
     pub num_layers: usize,
+    pub rms_norm_eps: f64,
+}
+
+impl Default for RwkvConfig {
+    fn default() -> Self {
+        Self {
+            vocab_size: 0,
+            hidden_size: 0,
+            num_layers: 0,
+            rms_norm_eps: 1e-5,
+        }
+    }
 }
 
 impl ModelConfig for RwkvConfig {
@@ -68,7 +93,7 @@ pub struct RwkvBlock {
 
 impl RwkvBlock {
     pub fn load(ws: &grim_nn::WeightSource<'_>, cfg: &RwkvConfig, device: Device) -> Result<Self> {
-        let norm = RmsNorm::load(&ws.pp("ln_x"), cfg.hidden_size, 1e-5)?;
+        let norm = RmsNorm::load(&ws.pp("ln_x"), cfg.hidden_size, cfg.rms_norm_eps as f32)?;
         let time_mix_key =
             Linear::load(&ws.pp("att.key"), cfg.hidden_size, cfg.hidden_size, false)?;
         let time_mix_value =
@@ -96,6 +121,43 @@ impl RwkvBlock {
         )?;
         let channel_mix_value =
             Linear::load(&ws.pp("ffn.value"), cfg.hidden_size, cfg.hidden_size, false)?;
+
+        assert_weight_shape(&norm.weight, &[cfg.hidden_size], "ln_x")?;
+        assert_weight_shape(
+            &time_mix_key.weight,
+            &[cfg.hidden_size, cfg.hidden_size],
+            "att.key",
+        )?;
+        assert_weight_shape(
+            &time_mix_value.weight,
+            &[cfg.hidden_size, cfg.hidden_size],
+            "att.value",
+        )?;
+        assert_weight_shape(
+            &time_mix_receptance.weight,
+            &[cfg.hidden_size, cfg.hidden_size],
+            "att.receptance",
+        )?;
+        assert_weight_shape(
+            &time_mix_output.weight,
+            &[cfg.hidden_size, cfg.hidden_size],
+            "att.output",
+        )?;
+        assert_weight_shape(
+            &channel_mix_key.weight,
+            &[cfg.hidden_size, cfg.hidden_size],
+            "ffn.key",
+        )?;
+        assert_weight_shape(
+            &channel_mix_receptance.weight,
+            &[cfg.hidden_size, cfg.hidden_size],
+            "ffn.receptance",
+        )?;
+        assert_weight_shape(
+            &channel_mix_value.weight,
+            &[cfg.hidden_size, cfg.hidden_size],
+            "ffn.value",
+        )?;
 
         Ok(Self {
             norm,
@@ -315,8 +377,12 @@ impl Rwkv {
                 device.clone(),
             )?);
         }
-        let ln_out = RmsNorm::load(&ws.pp("ln_out"), cfg.hidden_size, 1e-5)?;
+        let ln_out = RmsNorm::load(&ws.pp("ln_out"), cfg.hidden_size, cfg.rms_norm_eps as f32)?;
         let head = Linear::load(&ws.pp("head"), cfg.hidden_size, cfg.vocab_size, false)?;
+
+        assert_weight_shape(&emb.weight, &[cfg.hidden_size, cfg.vocab_size], "emb")?;
+        assert_weight_shape(&ln_out.weight, &[cfg.hidden_size], "ln_out")?;
+        assert_weight_shape(&head.weight, &[cfg.vocab_size, cfg.hidden_size], "head")?;
 
         Ok(Self {
             cfg,

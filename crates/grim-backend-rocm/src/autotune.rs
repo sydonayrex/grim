@@ -40,19 +40,33 @@ pub struct TuneKey {
     pub k: usize,
 }
 
-/// Broad category of tensor dimension shapes (e.g., Decode vs Prefill).
+/// Broad category of tensor dimension shapes (e.g., Decode vs Prefill vs TLOLog).
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ShapeClass {
-    Decode,  // m == 1
-    Prefill, // m > 1
+    Decode,  // m == 1: per-token GEMM
+    Prefill, // m > 1: large-batch GEMM
+    TLOLog,  // lm_head / logit-projection ONLY — tagged by op-identity, NOT by m
+}
+
+/// Known GEMM operational types passed into GEMM classification.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GemmOp {
+    Attention,
+    Ffn,
+    LmHead, // -> ShapeClass::TLOLog
+    Other,
 }
 
 impl ShapeClass {
     pub fn from_m(m: usize) -> Self {
-        if m == 1 {
-            Self::Decode
-        } else {
-            Self::Prefill
+        if m == 1 { Self::Decode } else { Self::Prefill }
+    }
+
+    /// Op-aware classifier. LmHead is TLOLog no matter its m; everything else bins by m.
+    pub fn from_op(op: GemmOp, m: usize) -> Self {
+        match op {
+            GemmOp::LmHead => Self::TLOLog,
+            _ => Self::from_m(m),
         }
     }
 }
@@ -166,7 +180,6 @@ pub fn charon_scalar_candidates(arch: &str, device_smem_limit: u32) -> Vec<Launc
     }
     candidates
 }
-
 
 /// Tuned launch parameters for a `(kernel, arch, shape)` slot. [see: `block_dim`, `rocm-hip-kernels`, `tile_kv`, `grid_stride`]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,19 +360,13 @@ impl Autotuner {
 
     /// Read-through lookup for MoE block dimension. On a cache miss, returns `default_block_dim`
     /// without caching fake timing data, so real autotuning sweeps populate true measurements.
-    pub fn get_or_tune_moe_block_dim(
-        &mut self,
-        key: &MoeKernelKey,
-        default_block_dim: u32,
-    ) -> u32 {
+    pub fn get_or_tune_moe_block_dim(&mut self, key: &MoeKernelKey, default_block_dim: u32) -> u32 {
         self.moe_cache
             .get(key)
             .map(|cfg| cfg.block_dim)
             .unwrap_or(default_block_dim)
     }
 }
-
-
 
 /// On-disk JSON shape. Uses owned `String`s for kernel/arch.
 #[derive(Debug, Serialize, Deserialize)]
@@ -436,14 +443,12 @@ impl Autotuner {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        std::fs::write(path, bytes).map_err(|e| {
-            Error::Backend(format!("Autotuner::save_to_file: {}", e))
-        })
+        std::fs::write(path, bytes)
+            .map_err(|e| Error::Backend(format!("Autotuner::save_to_file: {}", e)))
     }
 
     /// Restore from a JSON snapshot.
     pub fn from_json_bytes(
-
         device_ordinal: usize,
         gpu_arch: &'static str,
         bytes: &[u8],
@@ -550,7 +555,10 @@ mod tests {
     #[test]
     fn test_charon_scalar_candidates_generation() {
         let candidates = charon_scalar_candidates("gfx1036", 65536);
-        assert!(!candidates.is_empty(), "charon candidates generated should be non-empty");
+        assert!(
+            !candidates.is_empty(),
+            "charon candidates generated should be non-empty"
+        );
 
         for cfg in &candidates {
             assert!(cfg.is_valid("gfx1036", 65536, 2));
@@ -558,5 +566,3 @@ mod tests {
         }
     }
 }
-
-

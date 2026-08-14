@@ -682,16 +682,18 @@ extern "C" {
         const int k_idx = (int)(idx % K);
         const int blocks_per_row = K / 32;
         const int row_bytes = blocks_per_row * 34;
-        int sb_idx = k_idx / 32;
-        int in_sb = k_idx % 32;
+        const int sb_idx = k_idx / 32;
+        const int in_sb = k_idx % 32;
         float acc = 0.0f;
         for (int n = 0; n < N; ++n) {
             float dy_val = dY[row * N + n];
-            float w_val = dequant_q80_standalone(B_q80 + n * row_bytes + sb_idx * 34, in_sb);
+            float w_val = dequant_q80_standalone(B_q80 + (unsigned long long)n * row_bytes + sb_idx * 34, in_sb);
             acc += dy_val * w_val;
         }
         dX[row * K + k_idx] = acc;
     }
+
+
 
 }
 "#;

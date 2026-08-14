@@ -1,76 +1,46 @@
 # grim-models-audio
 
-Audio encoder-decoder (Whisper-style) for Grim — implements `EncoderDecoderLm` from `grim-core`.
-
 ## Purpose
-
-Provides the `Whisper` model struct and `WhisperConfig` — an encoder-decoder transformer for speech tasks. The encoder processes audio features (mel-spectrogram tokens), the decoder generates text tokens.
+Provides an audio encoder-decoder architecture implementation for Grim, focusing on Whisper-style speech recognition. It implements the `EncoderDecoderLm` trait defined in `grim-core`.
 
 ## Boundaries
-
-- Does **not** handle raw audio file I/O — callers provide token IDs.
-- Does **not** implement ASR directly — converts audio token sequences to text token sequences.
-- Does **not** manage KV cache directly — delegates to `grim-core`'s `KvCache` trait via the decoder.
+- Defines the architecture for transforming audio spectrograms into tokens.
+- Does not handle audio file parsing or spectrogram generation directly (assumes tensor inputs).
+- Operates strictly on `EncoderDecoderLm` paradigms rather than causal language modeling.
 
 ## Dependency Graph
-
 ```mermaid
-graph LR
-    A[grim-models-audio] --> B[grim-tensor]
-    A --> C[grim-nn]
-    A --> D[grim-core]
-    A --> E[grim-backend-cpu]
-
-    style A fill:#fff8e1
+graph TD
+    T[grim-tensor] --> A[grim-models-audio]
+    N[grim-nn] --> A
+    C[grim-core] --> A
+    CPU[grim-backend-cpu] --> A
+    ROCM[grim-backend-rocm] -.-> A
+    E[thiserror] --> A
+    
+    classDef focus fill:#f9f,stroke:#333,stroke-width:4px;
+    class A focus;
+    %% min 480px
+    style A padding:20px
 ```
 
-## Public API
-
-```rust
-pub use whisper::{Whisper, WhisperConfig};
-
-pub struct WhisperConfig {
-    pub vocab_size: usize,
-    pub n_mels: usize,
-    pub d_model: usize,
-    pub num_enc_layers: usize,
-    pub num_dec_layers: usize,
-    // ... additional config fields
-}
-
-pub struct Whisper {
-    pub cfg: WhisperConfig,
-    pub device: grim_tensor::Device,
-    // encoder + decoder weights
-}
-
-impl Whisper {
-    pub fn new(device: grim_tensor::Device, cfg: WhisperConfig) -> Self;
-}
-
-impl grim_core::model::EncoderDecoderLm for Whisper {
-    // encode() + decode() via the Model trait
-}
-```
-
-## Feature Flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `rocm` | no | Enable ROCm backend |
+## Public API Overview
+- **Model Structs:** `Whisper`.
+- **Configurations:** `WhisperConfig`.
 
 ## Usage Example
-
 ```rust
 use grim_models_audio::{Whisper, WhisperConfig};
-use grim_tensor::Device;
-
-let cfg = WhisperConfig {
-    vocab_size: 51865,
-    n_mels: 80,
-    d_model: 1024,
-    num_enc_layers: 12,
-    num_dec_layers: 12,
-};
-let model = Whisper::new(Device::Cpu, cfg);
+// Intended for inference with Whisper models using EncoderDecoderLm trait methods.
 ```
+
+## Use Cases
+- Automatic Speech Recognition (ASR) via Whisper and derivatives.
+- Audio-to-text generation tasks within the Grim ecosystem.
+
+## Edge Cases, Limitations, and Quirks
+- The encoder requires Mel spectrogram tensors with specific feature dimensions and sequence lengths depending on the Whisper variant.
+
+## Build Flags, Feature Flags, and Environment Variables
+- `default`: No special features.
+- `rocm`: Enables `grim-backend-rocm` for GPU operations.

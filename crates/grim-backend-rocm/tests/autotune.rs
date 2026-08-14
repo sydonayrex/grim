@@ -383,7 +383,7 @@ fn autotuner_per_arch_separation() -> TestResult {
 
 #[test]
 fn autotuner_lookup_returns_none_for_unknown_keys() -> TestResult {
-    let mut tuner = Autotuner::for_device(0, "gfx1036");
+    let tuner = Autotuner::for_device(0, "gfx1036");
     let key = KernelKey {
         kernel: "missing",
         gpu_arch: "gfx1036",

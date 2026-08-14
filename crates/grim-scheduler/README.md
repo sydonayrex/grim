@@ -1,128 +1,70 @@
 # grim-scheduler
 
-Continuous-batching request scheduler with latency-aware admission control and self-tuning.
-
 ## Purpose
-
-Manages which inference requests run in each batch. Maintains four queues — `waiting` (pending), `running` (active), `paused` (KV retained, §5.2.1), and `swapped` (evicted under memory pressure) — and decides which requests to admit via an `AdmissionController` that predicts TTFT and ITL. The scheduler also handles chunked prefill, LoRA adapter sub-batching, preemption, and self-tuning of batch parameters via `SelfTuningController`.
+The `grim-scheduler` crate provides a continuous-batching execution scheduler tailored for LLM inference. It manages request queues (waiting, running, swapped, paused), applies chunked prefill policies (Sarathi-Serve style), and enforces latency-aware admission control to respect strict Time-To-First-Token (TTFT) and Inter-Token-Latency (ITL) budgets.
 
 ## Boundaries
-
-- Does **not** perform tensor computation — delegates to `grim-engine`.
-- Does **not** manage KV block allocation — see `grim-memory`.
-- Does **not** handle HTTP routing — see `grim-server`.
+This crate acts purely as a decision-making and routing layer. It does *not* execute models or allocate KV cache memory. It takes in requests, observes engine throughput estimates via the `AdmissionController`, and produces a `SchedulerOutput` dictating exactly which sequences should prefill, decode, or be preempted on the current engine tick. It also handles grouping sequences by LoRA adapter ID for fused batch dispatches.
 
 ## Dependency Graph
-
 ```mermaid
-graph LR
-    A[grim-scheduler] --> B[grim-tensor]
-    A --> C[grim-core]
+graph TD
+    %% Focal Node
+    grim-scheduler(("grim-scheduler"))
 
-    subgraph "reverse deps"
-        D1[grim-engine]
-        D2[grim-server]
-    end
+    %% Workspace Dependencies
+    grim-scheduler --> grim-core
+    grim-scheduler --> grim-kvtransport
+    grim-scheduler --> thiserror
 
-    D1 --> A
-    D2 --> A
-
-    style A fill:#ffecb3
+    %% Reverse Workspace Dependents
+    grim-engine --> grim-scheduler
+    grim-server --> grim-scheduler
 ```
 
-## Public API
-
-```rust
-pub struct Request {
-    pub id: u64,
-    pub prompt_tokens: usize,
-    pub priority: i32,
-    pub consumed_tokens: usize,
-    pub model_id: Option<String>,
-    pub adapter_ids: Vec<u32>,
-    pub input_ids: Option<Vec<u32>>,
-}
-
-impl Default for Request { ... }
-
-pub struct Scheduler {
-    pub waiting: VecDeque<Request>,
-    pub running: Vec<Request>,
-    pub swapped: VecDeque<Request>,
-    pub paused: VecDeque<Request>,
-    pub max_batched_tokens: usize,
-    pub max_num_seqs: usize,
-    pub chunked_prefill_size: usize,
-    pub admission: AdmissionController,
-    pub determinism_mode: grim_core::DeterminismMode,
-}
-
-impl Scheduler {
-    pub fn new(max_batched_tokens: usize, max_num_seqs: usize,
-               admission: AdmissionController) -> Self;
-    pub fn enqueue(&mut self, request: Request);
-    pub fn schedule(&mut self) -> SchedulerOutput;
-    pub fn finish(&mut self, id: u64);
-    pub fn pause(&mut self, id: u64) -> bool;
-    pub fn resume(&mut self, id: u64) -> bool;
-    pub fn is_paused(&self, id: u64) -> bool;
-}
-
-pub struct SchedulerOutput {
-    pub prefill_ids: Vec<u64>,
-    pub decode_ids: Vec<u64>,
-    pub preempted_ids: Vec<u64>,
-    pub adapter_batches: HashMap<u32, Vec<u64>>,
-}
-
-impl SchedulerOutput {
-    pub fn is_empty(&self) -> bool;
-}
-
-pub enum AdmissionDecision { Admit, Defer }
-
-pub struct AdmissionController {
-    pub target_ttft_ms: u64,
-    pub target_itl_ms: u64,
-    pub throughput_estimate: Mutex<f64>,
-}
-
-impl AdmissionController {
-    pub fn new(target_ttft_ms: u64, target_itl_ms: u64) -> Self;
-    pub fn admit(&self, request: &Request, backlog: &BatchTokenBacklog) -> AdmissionDecision;
-    pub fn predict_ttft(&self, prompt_tokens: usize, batch_token_backlog: usize) -> Duration;
-    pub fn observe_prefill(&self, prompt_tokens: usize, wall_duration: Duration);
-    pub fn observe_decode(&self, decode_tokens: usize, wall_duration: Duration);
-}
-
-pub fn plan_hybrid_attention_step(...) -> (Vec<usize>, Vec<u32>);
-pub use self_tuning::{SelfTuningController, TunableKnob};
-```
+## Public API Overview
+- **`Scheduler`**: The core struct managing the execution queues and evaluating which requests can proceed based on max batch limits and pressure heuristics.
+- **`AdmissionController`**: Predictive module estimating TTFT/ITL against configured budgets to either `Admit` or `Defer` incoming requests.
+- **`Request`**: Represents a generation task, tracking its priority, tokens consumed (for chunked prefill), target model, and active adapter IDs.
+- **`SchedulerOutput`**: The per-tick execution plan detailing `prefill_ids`, `decode_ids`, `preempted_ids`, and `adapter_batches`.
+- **`plan_hybrid_attention_step`**: Resolves which physical blocks belong on-device vs. on-host for hybrid CPU/GPU attention offload.
+- **`self_tuning::*`**: PID-style tuning controllers for dynamically adjusting prefill chunk sizes and batch limits based on observed hardware latencies.
 
 ## Usage Example
-
 ```rust
-use grim_scheduler::{Scheduler, Request, AdmissionController};
+use grim_scheduler::{AdmissionController, Scheduler, Request};
 
-let admission = AdmissionController::new(2000, 100);
-let mut scheduler = Scheduler::new(4096, 8, admission);
-
-scheduler.enqueue(Request {
-    id: 1,
-    prompt_tokens: 512,
-    input_ids: Some(vec![1, 2, 3, 4]),
-    ..Default::default()
-});
-let output = scheduler.schedule();
+fn main() {
+    // Target 2000ms TTFT, 100ms ITL
+    let admission = AdmissionController::new(2000, 100);
+    
+    // Max 4096 batched tokens, max 8 concurrent sequences
+    let mut scheduler = Scheduler::new(4096, 8, admission);
+    
+    // Enqueue a request
+    scheduler.enqueue(Request {
+        id: 1,
+        prompt_tokens: 128,
+        priority: 0,
+        consumed_tokens: 0,
+        ..Default::default()
+    });
+    
+    // Decide what to run on this tick
+    let output = scheduler.schedule();
+    println!("Prefill IDs: {:?}", output.prefill_ids);
+}
 ```
 
-## Feature Flags
-
-This crate has no feature flags.
+## Use Cases
+- Orchestrating multi-user request streams in an OpenAI-compatible serving backend.
+- Managing speculative decoding sessions where sequences might pause, resume, or swap to the host due to KV cache pressure.
+- Dynamically tuning batch sizes (`self_tuning`) to maintain consistent latency when deploying unknown models on diverse hardware.
 
 ## Edge Cases, Limitations, and Quirks
+- **Solo-Prompt Livelock Bypass**: If a single request's prompt is so massive that its predicted TTFT alone exceeds the admission target, the scheduler will forcibly admit it if the queue is empty, preventing permanent livelock.
+- **Preemption Priority**: When token pressure forces preemption, the lowest priority requests are swapped to host memory first.
+- **Determinism Mode**: If configured for `Strict` determinism, the scheduler sorts queues deterministically by request ID before making scheduling decisions, slightly altering the natural first-in-first-out flow.
 
-- `Scheduler::schedule()` uses a deterministic sort (by request id) — ordering is reproducible across runs in the same state.
-- The solo-prompt livelock bypass (§5.2): if a single oversized request is the only one in the backlog, it is admitted regardless of its predicted TTFT — preventing indefinite deferral.
-- `paused` queue retains KV blocks (ref-counted); `finish` removes from all queues but does not free session state — that is `Engine::finish_request`'s job (see `grim-engine`).
-- `SelfTuningController` adjusts `max_batched_tokens`, `chunked_prefill_size`, speculative block length, and KV compression bit width based on EMA of observed TTFT/ITL.
+## Build Flags, Feature Flags, and Environment Variables
+- **Features**: Defaults to an empty `default = []` feature set. No specific environment variables are read directly by this crate (tuning targets are passed in by the caller).

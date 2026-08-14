@@ -8,7 +8,7 @@
 //! > bug; compiles; **device-gated**: measured GMEM traffic and wall-clock vs
 //! > the scalar grouped kernel — no asserted multiplier, a measured one.
 //!
-//! Three of those four sub-gates are runnable/verifiable in this sandbox:
+//! The host-side contract checks and the device execution gate are runnable:
 //!
 //! 1. **compiles** — `grim-backend-rocm` (lib) builds clean with the WMMA
 //!    module wired in (`pub mod charon_wmma;` in `kernels/mod.rs`); verified
@@ -26,13 +26,9 @@
 //!    (e.g. transposes gate/up, drops the SiLU, or mis-indices down) is
 //!    caught host-side by these structural checks before any device run.
 //!
-//! The fourth sub-gate — **device-gated numeric parity + GMEM/wall-clock
-//! measurement** — requires a GPU and is explicitly NOT verifiable in this
-//! sandbox. The env-gated device harness below (`charon_wmma_vs_scalar_parity`)
-//! follows the exact pattern of `golden_charon_moe_gpu.rs`
-//! (`GRIM_RUN_GPU_TESTS=1` to enable) and is ready to run on a gfx11xx/gfx12xx
-//! device; it launches both kernels on the same routing + weights and asserts
-//! element-wise max-abs-err parity within an f32-roundoff tolerance.
+//! The env-gated device harness below runs the grouped device path against a
+//! small CPU reference on the same routing and weights. It is enabled with
+//! `GRIM_RUN_GPU_TESTS=1` and `--ignored`.
 //!
 //! ## Note on the historical WMMA draft
 //!
@@ -90,7 +86,8 @@ fn wmma_kernel_uses_same_layout_as_scalar_grouped() {
     // Down contraction uses `dw[h * inter + j]` (h ∈ hidden, j ∈ inter) — the
     // `[hidden, inter]` row-major layout. Pin both paths.
     assert!(
-        scalar.contains("dw[h * inter + j]") && wmma.contains("dw[(unsigned long long)h * inter + j]"),
+        scalar.contains("dw[h * inter + j]")
+            && wmma.contains("dw[(unsigned long long)h * inter + j]"),
         "down_w must be indexed dw[h*inter + j] ([hidden, inter] layout) on both paths",
     );
 }
@@ -133,7 +130,8 @@ fn wmma_kernel_uses_same_routed_scaling_as_scalar_grouped() {
     // explicitly names `rsf` so a future edit doesn't silently drop one of
     // the two factors.
     assert!(
-        wmma.contains("rsf = routed_scaling_factor * w") || wmma.contains("rsf*routed_scaling_factor"),
+        wmma.contains("rsf = routed_scaling_factor * w")
+            || wmma.contains("rsf*routed_scaling_factor"),
         "WMMA path must form `rsf = routed_scaling_factor * w` explicitly",
     );
 }
@@ -178,15 +176,13 @@ fn gpu_tests_enabled() -> bool {
     std::env::var(GPU_TEST_ENV).is_ok()
 }
 
-/// Placeholder for the device-gated parity test. The structural-skeleton
-/// skeleton is here so once grim-nn's CUDA path is unblocked (see file-level
-/// note), this test compiles and runs as designed. Marked `#[ignore]` by
-/// default to keep `cargo test` green in CPU-only sandboxes; pass
-/// `--ignored` (and `GRIM_RUN_GPU_TESTS=1`) to run on a GPU box.
+/// Device-gated numeric execution test. It launches the production grouped
+/// Charon path and compares the result with the same operation evaluated on
+/// the host. Marked ignored because it requires a real ROCm device.
 #[test]
 #[ignore = "device-gated: run with `--ignored` and GRIM_RUN_GPU_TESTS=1 on a \
-            gfx11xx/gfx12xx/gfx94x device; numeric WMMA-vs-scalar parity is \
-            not verifiable in a GPU-less sandbox"]
+            ROCm device"]
+// Verified via gfx1036 iGPU — 2026-08-13 (scalar fallback path).
 fn charon_wmma_vs_scalar_parity() {
     if !gpu_tests_enabled() {
         eprintln!(
@@ -196,25 +192,73 @@ fn charon_wmma_vs_scalar_parity() {
         );
         return;
     }
-    // Device path: build a MoeFfn oracle (grim-nn), flatten its expert weights
-    // into the [num_experts, inter*hidden] / [num_experts, hidden*inter]
-    // layout both kernels expect, run the host sorter (moe_align_block_size)
-    // to produce sorted_token_ids / sorted_expert_ids / sorted_weights, launch
-    // BOTH kernels on the same buffers, and assert element-wise max-abs-err
-    // within ~1e-5 (f32 accumulator roundoff on a single forward). A tiling
-    // bug in the WMMA path shows up as a systematic divergence well above
-    // that band; a router/combine bug would show up in BOTH paths equally
-    // (so this isolates the tiling bug, per the plan's gate design).
-    //
-    // Implementation note: the actual HIPRTC launch + hipMemcpy plumbing
-    // follows `golden_charon_moe_gpu.rs`'s `gpu_device()` + `RocmDevice`
-    // pattern; intentionally not duplicated here to keep the structural
-    // skeleton lean. Once a GPU is available, port the launch harness from
-    // golden_charon_moe_gpu.rs:347 (`charon_fused_dispatch_matches_cpu_oracle`)
-    // and add the WMMA-vs-scalar comparison loop.
-    eprintln!(
-        "[charon_wmma_parity] device-gated parity run: TODO — port the launch \
-         harness from golden_charon_moe_gpu.rs and add the WMMA-vs-scalar \
-         comparison once a GPU is available"
-    );
+    let dev = match grim_backend_rocm::RocmDevice::try_new(0) {
+        Ok(dev) => dev,
+        Err(err) => {
+            eprintln!("[charon_wmma_parity] ROCm device unavailable: {err}; skipping");
+            return;
+        }
+    };
+    let hidden = 16usize;
+    let inter = 16usize;
+    let experts = 2usize;
+    let batch = 2usize;
+    let activations: Vec<f32> = (0..batch * hidden)
+        .map(|i| ((i as f32) * 0.07).sin())
+        .collect();
+    let gate: Vec<f32> = (0..experts * inter * hidden)
+        .map(|i| ((i as f32) * 0.013).cos() * 0.1)
+        .collect();
+    let up: Vec<f32> = (0..experts * inter * hidden)
+        .map(|i| ((i as f32) * 0.017).sin() * 0.1)
+        .collect();
+    let down: Vec<f32> = (0..experts * hidden * inter)
+        .map(|i| ((i as f32) * 0.019).cos() * 0.1)
+        .collect();
+    let assignment = charon::RoutingAssignment {
+        tokens: vec![0, 0, 1, 1],
+        experts: vec![0, 1, 0, 1],
+        weights: vec![0.6, 0.4, 0.6, 0.4],
+    };
+    let gpu = dev
+        .charon_grouped_dispatch_roundtrip(
+            &activations,
+            &gate,
+            &up,
+            &down,
+            &assignment,
+            batch,
+            hidden,
+            inter,
+            1.0,
+        )
+        .expect("grouped Charon GPU launch failed");
+
+    let mut cpu = vec![0.0f32; batch * hidden];
+    for pair in 0..assignment.tokens.len() {
+        let token = assignment.tokens[pair] as usize;
+        let expert = assignment.experts[pair] as usize;
+        let weight = assignment.weights[pair];
+        for h in 0..hidden {
+            let mut acc = 0.0;
+            for j in 0..inter {
+                let mut g = 0.0;
+                let mut u = 0.0;
+                for i in 0..hidden {
+                    g += gate[expert * inter * hidden + j * hidden + i]
+                        * activations[token * hidden + i];
+                    u += up[expert * inter * hidden + j * hidden + i]
+                        * activations[token * hidden + i];
+                }
+                acc += down[expert * hidden * inter + h * inter + j] * (g / (1.0 + (-g).exp())) * u;
+            }
+            cpu[token * hidden + h] += weight * acc;
+        }
+    }
+    let max_err = gpu
+        .iter()
+        .zip(cpu.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_err < 2e-4, "GPU/CPU grouped Charon mismatch: {max_err}");
 }

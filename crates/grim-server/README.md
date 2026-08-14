@@ -1,170 +1,88 @@
 # grim-server
 
-HTTP serving layer for Grim — OpenAI-compatible endpoints plus native SSE streaming. axum-based.
-
 ## Purpose
-
-Provides inference serving:
-- OpenAI-compatible REST API endpoints (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`)
-- Server-Sent Events (SSE) for streaming token output via `stream::unfold`
-- Request lifecycle management: pause, resume, cancel, and stream state introspection
-- Chat-stream interruption (WI-CANCEL) via `CancellationToken` + RAII `Drop` guard
-- Tool/function-calling support (WI-TOOLS) with structured error codes
-- Request-scoped LoRA adapter routing (§4.5)
-- Dynamic model loading/unloading
-- Dashboard and Grim REST API compatibility shims
+The `grim-server` crate is the front-facing HTTP and gRPC network layer for Grim. Based on the `axum` framework, it serves an OpenAI-compatible `/v1/chat/completions` REST API, executing requests through the central `grim-engine`. It handles routing, concurrent request parsing, SSE stream management, tool calling logic, and dynamic on-demand model loading from the local catalog.
 
 ## Boundaries
-
-- Does not perform inference — delegates to `grim-engine`.
-- Does not manage KV cache directly — coordinates through `Engine::finish_request`.
-- Does not manage tensor computation — depends on backend crates via `grim-engine`.
-- All backends (ROCm, CUDA, Vulkan, Metal) are compiled unconditionally — no feature flags.
+This crate only translates network payloads into engine requests, and engine outcomes into network responses (like JSON or SSE streams). It executes no tensor logic, allocates no direct hardware memory, and relies completely on the Engine to manage inference state. It also defines strict HTTP routing boundaries and error taxonomy to maintain faithful compatibility with client SDKs.
 
 ## Dependency Graph
-
 ```mermaid
-graph LR
-    A[grim-server] --> B[grim-tensor]
-    A --> C[grim-core]
-    A --> D[grim-scheduler]
-    A --> E[grim-engine]
-    A --> F[grim-format]
-    A --> G[grim-backend-rocm]
-    A --> H[grim-backend-cuda]
-    A --> I[grim-backend-vulkan]
-    A --> J[grim-backend-metal]
-    A --> K[grim-models-transformer]
-    A --> L[axum]
-    A --> M[tokio-util]
+graph TD
+    %% Focal Node
+    grim-server(("grim-server"))
 
-    style A fill:#fce4ec
+    %% Workspace Dependencies
+    grim-server --> grim-tensor
+    grim-server --> grim-core
+    grim-server --> grim-scheduler
+    grim-server --> grim-engine
+    grim-server --> grim-format
+    grim-server --> grim-plugin
+    grim-server --> grim-backend-rocm
+    grim-server --> grim-backend-cuda
+    grim-server --> grim-backend-metal
+    grim-server --> grim-backend-vulkan
+    grim-server --> grim-backend-cpu
+    grim-server --> grim-models-transformer
+    grim-server --> grim-disagg
+    grim-server --> thiserror
+
+    %% External Dependencies
+    grim-server -.-> axum
+    grim-server -.-> serde_json
+    grim-server -.-> tokio
+    grim-server -.-> tokio-util
+    grim-server -.-> futures
+    grim-server -.-> axum-server
+    grim-server -.-> rcgen
+    grim-server -.-> serde
+
+    %% Reverse Workspace Dependents (Conceptual)
+    grim-cli --> grim-server
 ```
 
-## Public API
-
-### State & Lifecycle
-
-```rust
-pub struct AppState {
-    pub engine: Mutex<Engine>,
-    pub tokenizer: Mutex<Option<grim_format::GgufTokenizer>>,
-    pub model_path: Option<std::path::PathBuf>,
-}
-
-/// RAII guard ensuring `Engine::finish_request(id)` runs exactly once
-/// when the streaming SSE future is dropped — covering normal completion,
-/// explicit cancel, and client disconnect paths. WI-CANCEL-2.
-pub struct RequestCleanupGuard { /* fields private */ }
-
-impl RequestCleanupGuard {
-    pub fn new(state: Arc<AppState>, request_id: u64) -> Self;
-}
-
-pub static LIVE_CLEANUP_GUARDS: AtomicUsize;
-
-/// Cancellation token registry for active chat requests. WI-CANCEL-1.
-pub fn register_cancel_token(request_id: u64) -> CancellationToken;
-pub fn take_cancel_token(request_id: u64) -> Option<CancellationToken>;
-```
-
-### Error Codes
-
-```rust
-pub enum ErrorCode {
-    UnknownField,
-    AdapterNotFound,
-    DeterminismMismatch,
-    EmptyMessages,
-    DuplicateToolCall,
-    TotalToolCallLimit,
-    MessageCountLimit,
-}
-
-impl ErrorCode {
-    pub fn as_str(&self) -> &'static str;
-}
-```
-
-### Router & Server
-
-```rust
-pub fn build_router(state: Arc<AppState>) -> Router;
-
-pub async fn serve(
-    addr: &str,
-    engine: Engine,
-    model_path: Option<std::path::PathBuf>,
-) -> Result<()>;
-```
-
-## HTTP Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Health check |
-| `GET` | `/status` | Server status and health |
-| `GET` | `/metrics` | Prometheus-style metrics |
-| `GET` | `/` | Dashboard UI |
-| `GET` | `/v1/models` | List available models |
-| `POST` | `/v1/models/load` | Dynamic model loading |
-| `POST` | `/v1/models/unload` | Unload model |
-| `POST` | `/v1/chat/completions` | Chat completion with SSE streaming + tool calls |
-| `POST` | `/v1/completions` | Text completion |
-| `POST` | `/v1/embeddings` | Embeddings (stub — returns 501) |
-| `POST` | `/v1/audio/transcriptions` | Audio transcription (stub) |
-| `POST` | `/v1/images/generations` | Image generation (stub) |
-| `POST` | `/v1/requests/:id/pause` | Pause a running request (§5.2.1) |
-| `POST` | `/v1/requests/:id/resume` | Resume a paused request (§5.2.1) |
-| `POST` | `/v1/requests/:id/cancel` | Cancel a streaming request (WI-CANCEL-1/2) |
-| `GET` | `/v1/requests/:id/stream` | Stream request state |
-| `GET` | `/grpc` | gRPC service handler (stub) |
-
-### Grim REST API Compatibility Shims
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/chat` | Chat (compat shim) |
-| `POST` | `/api/generate` | Generate (compat shim) |
-| `GET` | `/api/tags` | Tags (compat shim) |
-| `POST` | `/api/pull` | Pull model (compat shim) |
-| `GET` | `/api/stats` | Aggregated stats |
+## Public API Overview
+- **`AppState`**: Shared state holding the `Engine` mutex, the active `GgufTokenizer`, the server model path, and the WASM plugin registry.
+- **REST Endpoints**: 
+  - `POST /v1/chat/completions`: Main inference endpoint supporting full SSE streaming and strict schema validation.
+  - `POST /v1/requests/{id}/pause` & `resume`: Controls sequence execution within the engine's scheduler.
+  - `POST /v1/requests/{id}/cancel`: Aborts generation via cancellation tokens.
+- **`ErrorCode`**: Stable, machine-actionable error enumeration (e.g. `DuplicateToolCall`, `DeterminismMismatch`) returned in standard `invalid_request_error` JSON bodies.
+- **Tool Calling (`tool_parse.rs`)**: Integrates structured parsing of `<think>` and tool invocation tags into `message.tool_calls`.
+- **Cancellation**: Implements `CancellationToken` tracking and the `RequestCleanupGuard` RAII struct to prevent KV cache leaks on client disconnects.
 
 ## Usage Example
-
 ```rust
-use std::sync::Arc;
-use std::sync::Mutex;
-use grim_server::{AppState, build_router, serve};
-use grim_engine::Engine;
-
-let state = Arc::new(AppState {
-    engine: Mutex::new(Engine::new(config)),
-    tokenizer: Mutex::new(None),
-    model_path: None,
-});
-
-let app = build_router(state);
-serve("127.0.0.1:11434", engine, model_path).await?;
+// Internally in `grim-server`'s main application boot:
+// 
+// let engine = Engine::new(config);
+// let state = Arc::new(AppState {
+//     engine: Mutex::new(engine),
+//     tokenizer: Mutex::new(None),
+//     model_path: None,
+//     plugin_registry: None,
+// });
+//
+// let app = Router::new()
+//     .route("/v1/chat/completions", post(chat_completions))
+//     .route("/v1/models", get(list_models))
+//     .with_state(state);
+//
+// axum::serve(listener, app).await.unwrap();
 ```
 
-## Streaming Cancellation (WI-CANCEL)
-
-Chat-stream interruption is implemented across three layers:
-
-- **WI-CANCEL-0**: `/v1/requests/:id/cancel` route registered in `build_router`.
-- **WI-CANCEL-1**: Each streaming request registers a `CancellationToken` via `register_cancel_token`. The cancel endpoint calls `take_cancel_token` and signals cancellation.
-- **WI-CANCEL-2**: A `RequestCleanupGuard` is threaded into the `stream::unfold` state tuple. Its `Drop` impl calls `engine.finish_request(request_id)` exactly once — covering normal completion, explicit cancel (token set), and client disconnect (stream dropped).
-- **WI-CANCEL-3**: The `unfold` closure checks the cancel token at the top of each poll step and returns `None` on cancellation.
-
-## Feature Flags
-
-This crate has no feature flags — all GPU backends (ROCm, CUDA, Vulkan, Metal) are compiled unconditionally.
+## Use Cases
+- Standing up a production LLM proxy endpoint for OpenAI-compatible client libraries (like `openai-python` or `LangChain`).
+- Enabling tool-calling loops with strict guards (preventing models from repeating identical tool calls endlessly).
+- Paging requests off the active GPU dynamically using the pause/resume API.
 
 ## Edge Cases, Limitations, and Quirks
+- **Strict Parsing Strategy**: The `/v1/chat/completions` endpoint strictly rejects unknown JSON keys immediately (`400 Bad Request`) to catch typos and version skew, rather than silently ignoring them.
+- **Remote Provider Routing**: If a requested model string specifies a known proxy prefix (e.g., `ollama:cloud` or `hf/meta-llama`), the server attempts to route the request outbound instead of evaluating locally. However, if the name exactly matches an installed local catalog file, the local model always wins.
+- **Tool Calling MVP Constraints**: The buffered tool calling integration MVP suppresses intermediate stream chunks until tool calls are successfully parsed at the end of generation. A hard guard against infinite identical tool loops (`check_repeated_call_hard_guard`) is evaluated before response construction.
 
-- **Adapter routing (§4.5)**: The `"adapters"` key in the request body accepts a JSON array of adapter names. Unknown names return 400 immediately — fail loudly rather than silently drop.
-- **Determinism mismatch**: If `determinism: "strict"` is requested but the engine is in Relaxed mode, returns 400.
-- **Unknown request fields**: Strict validation — unknown top-level keys return 400 with the offending key name.
-- **Body limit**: Maximum request body size is 10 MB (set via `DefaultBodyLimit`).
-- **Embedding endpoint**: `/v1/embeddings` is registered but returns 501 Not Implemented.
+## Build Flags, Feature Flags, and Environment Variables
+- **Features**: 
+  - `default = []`
+  - `wasm-sandbox`: Enables the `wasmtime`-backed WASM plugin loader for executing sandboxed sampler scripts during generation.

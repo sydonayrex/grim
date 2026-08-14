@@ -1,7 +1,7 @@
 //! Compatibility loader for `MiniMaxAI/MiniMax-M3` (HuggingFace `model_type = "minimax_m3"`).
 
 use grim_core::error::{Error, Result};
-use grim_core::model::{AdapterHandle, CausalLm, Model, ModelConfig, ModalityHint};
+use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_tensor::{ArithType, Device, Tensor};
 
@@ -78,7 +78,11 @@ pub struct MiniMaxM3 {
 }
 
 impl MiniMaxM3 {
-    pub fn load(device: Device, ws: &grim_nn::WeightSource<'_>, cfg: MiniMaxM3Config) -> Result<Self> {
+    pub fn load(
+        device: Device,
+        ws: &grim_nn::WeightSource<'_>,
+        cfg: MiniMaxM3Config,
+    ) -> Result<Self> {
         Self::load_tp(device, ws, cfg)
     }
 

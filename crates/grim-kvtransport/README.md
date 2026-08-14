@@ -1,102 +1,56 @@
 # grim-kvtransport
 
-Tiered KV cache local transport and spillage (GPU → Host RAM → NVMe). §5.5.
-
 ## Purpose
-
-Manages KV block data movement between storage tiers: GPU VRAM, Host RAM, and local NVMe scratch. Integrates with `grim-memory`'s `KvBlockPool` as the spill manager invoked when refcount-zero blocks need demotion. Also provides `NvmeWeightStreamer` for streaming model weights that exceed VRAM/DRAM, and `NetworkKvClient` for cross-node KV transfer in disaggregated scenarios.
+Provides tiered KV cache local transport, spillage, and network transport mechanisms. Handles moving KV block contents between GPU, Host RAM, and local scratch NVMe files, and implements the wire protocol for cross-node KV cache handoffs.
 
 ## Boundaries
-
-- Does **not** perform computation or compression — only data movement.
-- Does **not** manage cache allocation — delegates to `grim-memory`.
-- Does **not** define the `KvCache` trait — see `grim-core`.
+- Executes local filesystem spills and TCP network block transfers.
+- Defines the `KvBlockStore` trait to decouple from `grim-memory` while providing network ingestion servers.
+- Does not dictate the eviction algorithm (managed by callers).
 
 ## Dependency Graph
-
 ```mermaid
-graph LR
-    A[grim-kvtransport] --> B[grim-tensor]
-    A --> C[grim-core]
+graph TD
+    grim-disagg --> grim-kvtransport
+    grim-engine -.-> grim-kvtransport
 
-    subgraph "reverse deps"
-        D1[grim-memory]
-        D2[grim-disagg]
-    end
-
-    D1 --> A
-    D2 --> A
-
-    style A fill:#e1f5ea
+    grim-kvtransport --> grim-tensor
+    grim-kvtransport --> grim-core
+    grim-kvtransport --> thiserror
+    grim-kvtransport --> parking_lot
+    grim-kvtransport --> libc
 ```
 
-## Public API
-
-```rust
-pub type BlockId = usize;
-
-pub enum CacheTier {
-    Gpu,
-    HostRam,
-    NvMe,
-    NvMeWeightStream, // NVMe weight-streaming layer
-}
-
-pub fn grimvise_advise(data: &[f32], advice: grim_tensor::MemAdvice) -> Result<()>;
-
-pub struct LocalSpillManager {
-    scratch_dir: PathBuf,
-    block_tiers: HashMap<BlockId, CacheTier>,
-    host_ram_cache: HashMap<BlockId, (Vec<f32>, Vec<f32>)>,
-    nvme_cache: HashMap<BlockId, PathBuf>,
-    block_elems: usize,
-}
-
-impl LocalSpillManager {
-    pub fn new(scratch_dir: PathBuf, block_elems: usize) -> Result<Self>;
-}
-
-pub struct SharedSpillManager {
-    inner: RwLock<LocalSpillManager>,
-}
-
-impl SharedSpillManager {
-    pub fn new(scratch_dir: PathBuf, block_elems: usize) -> Result<Self>;
-}
-
-pub struct NetworkKvClient {
-    pub local_ip: String,
-}
-
-impl NetworkKvClient {
-    pub fn new(local_ip: String) -> Self;
-}
-
-pub struct NvmeWeightStreamer {
-    pub lru_capacity_layers: usize,
-    pub weights_path: PathBuf,
-    // host_weight_cache + lru_order (private)
-}
-```
+## Public API Overview
+- `LocalSpillManager` & `SharedSpillManager`: Tiered NVMe/RAM block spilling.
+- `NetworkKvClient`: TCP client for V2 wire protocol block transfers.
+- `start_kv_receiver_server`: Background TCP server for remote KV block ingestion.
+- `KvBlockStore`: Abstract trait implemented by `grim-memory` pools.
+- `NvmeWeightStreamer`: Double-buffered async layer weight prefetcher.
+- `grimvise_advise`: OS-level `madvise` helper for memory hinting.
 
 ## Usage Example
-
 ```rust
-use grim_kvtransport::{SharedSpillManager, CacheTier};
+use grim_kvtransport::{LocalSpillManager, CacheTier};
 use std::path::PathBuf;
 
-let spill = SharedSpillManager::new(
-    PathBuf::from("/tmp/grim-spill"),
-    16 * 32 * 64, // BLOCK_SIZE * num_heads * head_dim
-)?;
+let scratch_dir = PathBuf::from("/tmp/grim-spill");
+// 1024 represents block elements
+// let mut manager = LocalSpillManager::new(scratch_dir, 1024).unwrap();
+
+// manager.demote_to_host(1, vec![0.0; 1024], vec![0.0; 1024]).unwrap();
+// manager.demote_to_nvme(1).unwrap();
 ```
 
-## Feature Flags
-
-This crate has no feature flags.
+## Use Cases
+- Spilling cache blocks to host memory or NVMe when VRAM is exhausted.
+- Sending KV blocks between prefill and decode nodes in a disaggregated cluster.
+- Streaming model weights directly from NVMe to bypass RAM limits.
 
 ## Edge Cases, Limitations, and Quirks
+- The NVMe weight streamer relies on synchronous file I/O until `io_uring` is implemented.
+- `grimvise_advise` is a no-op on platforms without `madvise` (like Windows).
+- Network transfers use unencrypted TCP; suitable for secure private clusters only.
 
-- `LocalSpillManager` uses OS-level `madvise` on Linux/macOS to hint page residency — on Windows, `grimvise_advise` is a no-op.
-- `NetworkKvClient` requires the local IP to match a network interface that can reach the target node — mismatched IPs produce connection errors at transfer time.
-- `NvmeWeightStreamer` uses LRU eviction with configurable layer cache capacity — when the cache is full, the least-recently-used layer is evicted to the NVMe scratch file.
+## Build Flags, Feature Flags, and Environment Variables
+- `default`: No special features.

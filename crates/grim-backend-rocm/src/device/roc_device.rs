@@ -175,6 +175,35 @@ unsafe impl Send for RocmDevice {}
 unsafe impl Sync for RocmDevice {}
 
 impl RocmDevice {
+    /// Allocate raw device bytes for an engine-owned persistent dispatch ring.
+    pub fn alloc_scythe_ring_bytes(&self, bytes: usize) -> Result<RocmStorage> {
+        RocmStorage::alloc_gpu_with_bytes(
+            &Shape::from_slice(&[bytes]),
+            dtype_f32(),
+            bytes,
+            &self.allocator,
+            self.ordinal,
+        )
+    }
+
+    /// Enqueue one descriptor upload on the device's active stream.
+    pub fn copy_scythe_descriptor_async(
+        &self,
+        dst: u64,
+        src: *const std::ffi::c_void,
+        bytes: usize,
+    ) -> Result<()> {
+        check_hip("hipMemcpyAsync(ScytheRing H2D)", unsafe {
+            hipMemcpyAsync(
+                dst as *mut std::ffi::c_void,
+                src,
+                bytes,
+                HipMemcpyKind::HostToDevice,
+                self.active_stream(),
+            )
+        })
+    }
+
     /// Create a new ROCm device instance and initialize its handle caches and stream pool. [see: `RocmDevice::try_new`, `hipSetDevice`]
     pub fn new(ordinal: usize) -> Self {
         match Self::try_new(ordinal) {
@@ -440,7 +469,9 @@ impl RocmDevice {
         let cache_path = std::path::PathBuf::from(format!(".autotune_cache/{gpu_target}.json"));
         if cache_path.exists() {
             if let Ok(bytes) = std::fs::read(&cache_path) {
-                if let Ok(t) = crate::autotune::Autotuner::from_json_bytes(ordinal, arch_leak, &bytes) {
+                if let Ok(t) =
+                    crate::autotune::Autotuner::from_json_bytes(ordinal, arch_leak, &bytes)
+                {
                     autotuner = t;
                 }
             }
@@ -458,7 +489,6 @@ impl RocmDevice {
             allocator: Arc::new(RocmCachingAllocator::new(ordinal, cap_bytes)),
             scratch_pool: crate::memory::pool::DeviceScratchPool::new(),
             autotuner: Mutex::new(autotuner),
-
 
             module_cache: Mutex::new(HashMap::new()),
             module_load_count: AtomicUsize::new(0),
@@ -497,6 +527,11 @@ impl RocmDevice {
     /// Release all pooled device buffers back to the driver. Mirrors `torch.cuda.empty_cache()`.
     pub fn empty_cache(&self) {
         self.allocator.empty_cache();
+    }
+
+    /// Return the GCN target architecture string (e.g. "gfx1036", "gfx1100").
+    pub fn gcn_arch(&self) -> &str {
+        &self.gpu_target
     }
 
     /// P1-WI-1 dispatch probe: should this GEMM route through the WMMA path [see: `GrimTensorExt`, `true`, `wmma_gemm_config`, `layout_hint`]
@@ -1438,11 +1473,7 @@ impl BackendDevice for RocmDevice {
             .map(|s| Box::new(s) as Box<dyn BackendStorage>)
     }
 
-    fn alloc_storage(
-        &self,
-        shape: &Shape,
-        dtype: DType,
-    ) -> Result<Box<dyn BackendStorage>> {
+    fn alloc_storage(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         RocmStorage::alloc_gpu(shape, dtype, &self.allocator, self.ordinal)
             .map(|s| Box::new(s) as Box<dyn BackendStorage>)
     }
@@ -1491,280 +1522,7 @@ impl BackendDevice for RocmDevice {
         b: &dyn BackendStorage,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        #[cfg(feature = "rocm-profile")]
-        println!("[rocprofiler-sdk] Begin marker span: matmul");
-
-        // For matmul on GPU, both inputs must be RocmStorage (or we need to copy them to the device first)
-        let a_storage = match a.as_any().downcast_ref::<RocmStorage>() {
-            Some(s) => s,
-            None => return Err(Error::Backend("matmul: input a is not RocmStorage".into())),
-        };
-
-        let b_storage = match b.as_any().downcast_ref::<RocmStorage>() {
-            Some(s) => s,
-            None => return Err(Error::Backend("matmul: input b is not RocmStorage".into())),
-        };
-
-        if !a_storage.device_ptr_is_valid() || !b_storage.device_ptr_is_valid() {
-            return Err(Error::Backend(
-                "matmul: inputs must have valid GPU device pointers".into(),
-            ));
-        }
-
-        let a_dims = a.shape().dims();
-        let b_dims = b.shape().dims();
-
-        if a_dims.len() < 2 || b_dims.len() < 2 {
-            return Err(Error::Shape("matmul expects inputs with rank >= 2".into()));
-        }
-
-        let k = a_dims[a_dims.len() - 1];
-        let m = a.shape().elem_count() / k;
-
-        let n = b_dims[b_dims.len() - 1];
-        let k2 = b.shape().elem_count() / n;
-
-        if k != k2 {
-            return Err(Error::ShapeMismatch {
-                expected: a_dims.to_vec(),
-                got: b_dims.to_vec(),
-            });
-        }
-
-        if out_shape.elem_count() != m * n {
-            return Err(Error::Shape(format!(
-                "expected out elem_count {}, got {:?}",
-                m * n,
-                out_shape.dims()
-            )));
-        }
-
-        // Allocate output GPU storage with the actual input precision
-        let dtype_out = DType {
-            arith: a_storage.dtype.arith,
-            storage: DTypeStorage::Native,
-        };
-        let out_storage =
-            RocmStorage::alloc_gpu(out_shape, dtype_out.clone(), &self.allocator, self.ordinal)?;
-
-        // Shape-indexed GEMM dispatch lookup (Tensile-inspired layout resolution)
-        let tile_config = lookup_gemm_config(m, n, k, self.props.wavefront_size);
-        // Offline-tuned solution_index per (M,N,K) for FP32. Falls back to 0 for [see: `examples/tune_gemm.rs`]
-        let solution_index = lookup_solution_index(m, n, k, &self.gpu_target, dtype_out.arith);
-        // WI 2.4.3 — split_k clamp gate.
-        let split_k_effective: u32 = {
-            let split_k_enabled = self.split_k_config.lock().unwrap().enabled;
-            if split_k_enabled
-                && tile_config.split_k > 1
-                && (k % tile_config.split_k as usize == 0)
-                && (m > 1 || k > 8192)
-            {
-                tile_config.split_k
-            } else {
-                1
-            }
-        };
-
-        if split_k_effective > 1 {
-            let k_part = k / split_k_effective as usize;
-            let partials_shape = Shape::from_slice(&[split_k_effective as usize, m, n]);
-            let partials_storage = RocmStorage::alloc_gpu(
-                &partials_shape,
-                dtype_out.clone(),
-                &self.allocator,
-                self.ordinal,
-            )?;
-
-            let handle = self.get_rocblas_handle()?;
-            let alpha: f32 = 1.0f32;
-            let beta: f32 = 0.0f32;
-
-            let a_ptr_void = a_storage.device_ptr.unwrap() as *const c_void;
-            let b_ptr_void = b_storage.device_ptr.unwrap() as *const c_void;
-            let partials_ptr_void = partials_storage.device_ptr.unwrap() as *mut c_void;
-
-            let status = unsafe {
-                let a_type = arith_to_rocblas_dtype(a_storage.dtype.arith);
-                let b_type = arith_to_rocblas_dtype(b_storage.dtype.arith);
-                let out_type = arith_to_rocblas_dtype(dtype_out.arith);
-                let compute_type = arith_to_compute_dtype(dtype_out.arith);
-                let alpha_ptr = &alpha as *const f32 as *const c_void;
-                let beta_ptr = &beta as *const f32 as *const c_void;
-
-                rocblas_gemm_strided_batched_ex(
-                    handle,
-                    RocblasOperation::None,
-                    RocblasOperation::None,
-                    n as RocblasInt,
-                    m as RocblasInt,
-                    k_part as RocblasInt,
-                    alpha_ptr,
-                    b_ptr_void,
-                    b_type,
-                    n as RocblasInt,
-                    (k_part * n) as i64,
-                    a_ptr_void,
-                    a_type,
-                    k as RocblasInt,
-                    k_part as i64,
-                    beta_ptr,
-                    partials_ptr_void,
-                    out_type,
-                    n as RocblasInt,
-                    (m * n) as i64,
-                    partials_ptr_void,
-                    out_type,
-                    n as RocblasInt,
-                    (m * n) as i64,
-                    split_k_effective as RocblasInt,
-                    compute_type,
-                    select_gemm_algo(solution_index),
-                    0,
-                    ROCBLAS_GEMM_FLAGS_NONE,
-                )
-            };
-
-            if status != rocblas_status_success {
-                return Err(Error::Backend(format!(
-                    "rocblas_gemm_strided_batched_ex failed with status {status}"
-                )));
-            }
-
-            // Sum up the partials along the batch dimension using the hand-written reduction kernel
-            let stream = self.launch_split_k_reduction(
-                &partials_storage,
-                &out_storage,
-                m,
-                n,
-                split_k_effective,
-            )?;
-            let compute_handle = Box::new(RocmHandle::new(Some(stream)));
-            return Ok((Box::new(out_storage), compute_handle));
-        }
-        #[cfg(feature = "rocm-profile")]
-        println!(
-            "[RocmDevice] GEMM Dispatch: Shape ({}, {}, {}) resolved to autotune tile config {:?} on Wavefront {:?}, solution_index={}",
-            m, n, k, tile_config, self.props.wavefront_size, solution_index
-        );
-
-        // ─── WI 2.4.4-2 — decode GEMM dispatch (opt-in, F16-only, m ≤ 8) ───── [see: `ck_gemm.cpp`, `grim_decode_gemm_f16`]
-        {
-            // Lock-free read via AtomicBool shadow — avoids Mutex acquisition on every matmul.
-            // [see: `decode_gemm_enabled`, `set_decode_gemm_enabled`]
-            if self.decode_gemm_enabled.load(Ordering::Relaxed)
-                && dtype_out.arith == ArithType::F16
-                && m <= 8
-            {
-                // WI 2.4.4-2(a) — thread the *real* enqueued stream into the [see: `launch_compute_kernel`, `hipModuleLaunchKernel`]
-                let stream =
-                    self.launch_decode_gemm_f16(a_storage, b_storage, &out_storage, m, n, k)?;
-                let compute_handle = Box::new(RocmHandle::new(Some(stream)));
-                return Ok((Box::new(out_storage), compute_handle));
-            }
-        }
-
-        // ─── WI-G — WMMA GEMM dispatch (opt-in, F16-only) ─────
-        {
-            if self.should_use_wmma_path(None, dtype_out.arith) {
-                let stream = self.launch_wmma_gemm(a_storage, b_storage, &out_storage, m, n, k)?;
-                let compute_handle = Box::new(RocmHandle::new(Some(stream)));
-                return Ok((Box::new(out_storage), compute_handle));
-            }
-        }
-
-        // Get rocBLAS handle and execute sgemm. If handle is null (due to memory error fallback),
-        // execute using WMMA HIP GEMM kernel directly.
-        let handle = match self.get_rocblas_handle() {
-            Ok(h) if !h.0.is_null() => h,
-            _ => {
-                let stream = self.launch_wmma_gemm(a_storage, b_storage, &out_storage, m, n, k)?;
-                let compute_handle = Box::new(RocmHandle::new(Some(stream)));
-                return Ok((Box::new(out_storage), compute_handle));
-            }
-        };
-
-        let alpha: f32 = 1.0f32;
-        let beta: f32 = 0.0f32;
-
-        let a_ptr_void = a_storage.device_ptr.unwrap() as *const c_void;
-        let b_ptr_void = b_storage.device_ptr.unwrap() as *const c_void;
-        let out_ptr_void = out_storage.device_ptr.unwrap() as *mut c_void;
-
-        // In ROCm/rocBLAS (column-major), row-major C[M,N] = A[M,K] @ B[K,N] is
-
-        let use_gemm_ex = cfg!(feature = "rocm-aiter") || {
-            let gcn = std::env::var("GRIM_GPU_TARGET").unwrap_or_else(|_| "gfx900".into());
-            gcn == "gfx90a" || gcn == "gfx942"
-        };
-
-        unsafe {
-            let status = if use_gemm_ex
-                || dtype_out.arith == ArithType::F16
-                || dtype_out.arith == ArithType::BF16
-            {
-                let a_type = arith_to_rocblas_dtype(a_storage.dtype.arith);
-                let b_type = arith_to_rocblas_dtype(b_storage.dtype.arith);
-                let out_type = arith_to_rocblas_dtype(dtype_out.arith);
-                let compute_type = arith_to_compute_dtype(dtype_out.arith);
-                let alpha_ptr = &alpha as *const f32 as *const c_void;
-                let beta_ptr = &beta as *const f32 as *const c_void;
-                rocblas_gemm_ex(
-                    handle,
-                    RocblasOperation::None,
-                    RocblasOperation::None,
-                    n as RocblasInt,
-                    m as RocblasInt,
-                    k as RocblasInt,
-                    alpha_ptr,
-                    b_ptr_void,
-                    b_type,
-                    n as RocblasInt,
-                    a_ptr_void,
-                    a_type,
-                    k as RocblasInt,
-                    beta_ptr,
-                    out_ptr_void,
-                    out_type,
-                    n as RocblasInt,
-                    out_ptr_void,
-                    out_type,
-                    n as RocblasInt,
-                    compute_type,
-                    // Wire `lookup_solution_index` to `algo` so rocBLAS actually [see: `select_gemm_algo(0)`, `standard`]
-                    select_gemm_algo(solution_index),
-                    solution_index as RocblasInt,
-                    ROCBLAS_GEMM_FLAGS_NONE,
-                )
-            } else {
-                rocblas_sgemm(
-                    handle,
-                    RocblasOperation::None,
-                    RocblasOperation::None,
-                    n as RocblasInt,
-                    m as RocblasInt,
-                    k as RocblasInt,
-                    &alpha,
-                    b_ptr_void as *const f32,
-                    n as RocblasInt,
-                    a_ptr_void as *const f32,
-                    k as RocblasInt,
-                    &beta,
-                    out_ptr_void as *mut f32,
-                    n as RocblasInt,
-                )
-            };
-
-            if status != rocblas_status_success {
-                // If rocBLAS matmul returns an error (e.g. status 1 = invalid handle),
-                // fall back seamlessly to WMMA HIP GEMM kernel.
-                let stream = self.launch_wmma_gemm(a_storage, b_storage, &out_storage, m, n, k)?;
-                let compute_handle = Box::new(RocmHandle::new(Some(stream)));
-                return Ok((Box::new(out_storage), compute_handle));
-            }
-        };
-
-        let compute_handle = Box::new(RocmHandle::new(Some(self.active_stream())));
-        Ok((Box::new(out_storage), compute_handle))
+        self.matmul_op(a, b, out_shape, crate::autotune::GemmOp::Other)
     }
 
     fn matmul_with_solution(
@@ -2463,10 +2221,13 @@ impl BackendDevice for RocmDevice {
         let w_s = as_rocm(weight)?;
         let st_s = as_rocm(conv_state)?;
         if !x_s.device_ptr_is_valid() || !w_s.device_ptr_is_valid() || !st_s.device_ptr_is_valid() {
-            return Err(Error::Backend("short_conv1d: inputs lack valid device ptr".into()));
+            return Err(Error::Backend(
+                "short_conv1d: inputs lack valid device ptr".into(),
+            ));
         }
         let total = out_shape.elem_count();
-        let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut x_ptr = dev_ptr(x_s)?;
         let mut w_ptr = dev_ptr(w_s)?;
@@ -2475,7 +2236,6 @@ impl BackendDevice for RocmDevice {
             None => 0u64,
         };
         let mut st_ptr = dev_ptr(st_s)?;
-
 
         let dims = out_shape.dims();
         let mut batch = dims[0] as i32;
@@ -2521,16 +2281,17 @@ impl BackendDevice for RocmDevice {
         let v_s = as_rocm(v)?;
         let beta_s = as_rocm(beta)?;
         let gate_s = as_rocm(a_gate)?;
-        let S_s = as_rocm(recurrent_state)?;
+        let s_s = as_rocm(recurrent_state)?;
 
-        let storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
         let mut q_ptr = dev_ptr(q_s)?;
         let mut k_ptr = dev_ptr(k_s)?;
         let mut v_ptr = dev_ptr(v_s)?;
         let mut beta_ptr = dev_ptr(beta_s)?;
         let mut gate_ptr = dev_ptr(gate_s)?;
-        let mut S_ptr = dev_ptr(S_s)?;
+        let mut s_ptr = dev_ptr(s_s)?;
         let mut dk_i = d_k as i32;
         let mut dv_i = d_v as i32;
 
@@ -2545,7 +2306,7 @@ impl BackendDevice for RocmDevice {
                 arg(&mut v_ptr),
                 arg(&mut beta_ptr),
                 arg(&mut gate_ptr),
-                arg(&mut S_ptr),
+                arg(&mut s_ptr),
                 arg(&mut out_ptr),
                 arg(&mut dk_i),
                 arg(&mut dv_i),
@@ -2579,10 +2340,30 @@ impl BackendDevice for RocmDevice {
         let qw_s = as_rocm(q_norm_w)?;
         let kvw_s = as_rocm(kv_norm_w)?;
 
-        let q_nope_st = RocmStorage::alloc_gpu(&Shape::new(vec![qk_nope_dim]), dtype_f32(), &self.allocator, self.ordinal)?;
-        let q_rope_st = RocmStorage::alloc_gpu(&Shape::new(vec![qk_rope_dim]), dtype_f32(), &self.allocator, self.ordinal)?;
-        let kv_nope_st = RocmStorage::alloc_gpu(&Shape::new(vec![qk_nope_dim]), dtype_f32(), &self.allocator, self.ordinal)?;
-        let kv_rope_st = RocmStorage::alloc_gpu(&Shape::new(vec![qk_rope_dim]), dtype_f32(), &self.allocator, self.ordinal)?;
+        let q_nope_st = RocmStorage::alloc_gpu(
+            &Shape::new(vec![qk_nope_dim]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let q_rope_st = RocmStorage::alloc_gpu(
+            &Shape::new(vec![qk_rope_dim]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let kv_nope_st = RocmStorage::alloc_gpu(
+            &Shape::new(vec![qk_nope_dim]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let kv_rope_st = RocmStorage::alloc_gpu(
+            &Shape::new(vec![qk_rope_dim]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
 
         let mut q_ptr = dev_ptr(q_s)?;
         let mut kv_ptr = dev_ptr(kv_s)?;
@@ -2629,7 +2410,6 @@ impl BackendDevice for RocmDevice {
     }
 
     fn quantized_matmul(
-
         &self,
         a: &dyn BackendStorage,
         b_packed: &dyn BackendStorage,
@@ -3574,7 +3354,6 @@ impl BackendDevice for RocmDevice {
         ))
     }
 
-
     /// In-place scale+bias epilogue on a `[batch, out_dim]` GEMM output via
     /// `grim_scale_bias_epilogue`. Plain rocBLAS has no epilogue-fusion API, so
     /// this standalone kernel is the required post-GEMM step for W8A8-style
@@ -4168,7 +3947,9 @@ impl BackendDevice for RocmDevice {
 }
 
 // to `device::gemm_tuning` — see that module.
-pub use crate::device::gemm_tuning::{GemmTileConfig, lookup_gemm_config, lookup_solution_index};
+pub use crate::device::gemm_tuning::{
+    GemmTileConfig, lookup_gemm_config, lookup_gemm_config_for_shape, lookup_solution_index,
+};
 
 // Re-exports that pulled up `pub use crate::graph_capture::*` etc. in [see: `pub use`]
 
@@ -4250,7 +4031,11 @@ impl RocmDevice {
         // Launch grid covers max(b*s*rotary_half, b*s*copy_len) threads to
         // handle both the rotate pass and the verbatim-copy pass in one kernel launch.
         let copy_len = d - 2 * rotary_half;
-        let total = b * s * rotary_half.max(if copy_len > 0 { copy_len } else { 0 }).max(1);
+        let total = b
+            * s
+            * rotary_half
+                .max(if copy_len > 0 { copy_len } else { 0 })
+                .max(1);
         let (grid, block) = linear_launch(total);
 
         let stream = self.launch_compute_kernel(
@@ -4273,7 +4058,12 @@ impl RocmDevice {
         // Free scratch device buffers regardless of whether the launch succeeded.
         unsafe {
             if self.active_capture_stream().is_none() {
-                let _ = hipStreamSynchronize(stream.as_ref().map(|_| self.active_stream()).unwrap_or(std::ptr::null_mut()));
+                let _ = hipStreamSynchronize(
+                    stream
+                        .as_ref()
+                        .map(|_| self.active_stream())
+                        .unwrap_or(std::ptr::null_mut()),
+                );
             }
             hipFree(pos_ptr);
             hipFree(freq_ptr);
@@ -4281,10 +4071,7 @@ impl RocmDevice {
 
         let stream = stream?;
 
-        Ok((
-            Box::new(storage),
-            Box::new(RocmHandle::new(Some(stream))),
-        ))
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
     }
 
     /// WI 2.4.4-2c — dispatch `grim_decode_gemm_f16` and return the [see: `launch_compute_kernel`, `DecodeGemmConfig::enabled`]
@@ -4604,9 +4391,9 @@ impl RocmDevice {
         let a_ptr = activations.device_ptr.ok_or_else(|| {
             Error::Backend("charon_fused_dispatch: activations has no device ptr".into())
         })?;
-        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
-            Error::Backend("charon_fused_dispatch: out has no device ptr".into())
-        })?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("charon_fused_dispatch: out has no device ptr".into()))?;
 
         // Validate shapes + null pointers before any HIP dereference (G-A2
         // host-logic path, unit-tested in kernels::charon::tests).
@@ -4641,8 +4428,6 @@ impl RocmDevice {
             hidden,
             inter,
         );
-
-
 
         if plan.grid_x == 0 {
             // No pairs → nothing to launch; return the active stream.
@@ -4727,11 +4512,20 @@ impl RocmDevice {
         let up_buf = self.from_cpu(up_flat, &Shape::new(vec![up_flat.len()]), DType::F32)?;
         let down_buf = self.from_cpu(down_flat, &Shape::new(vec![down_flat.len()]), DType::F32)?;
 
-        let out_storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
-        let gate_r = gate_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("gate_buf downcast failed".into()))?;
-        let up_r = up_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("up_buf downcast failed".into()))?;
-        let down_r = down_buf.as_any().downcast_ref::<RocmStorage>().ok_or_else(|| Error::Backend("down_buf downcast failed".into()))?;
-
+        let out_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let gate_r = gate_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("gate_buf downcast failed".into()))?;
+        let up_r = up_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("up_buf downcast failed".into()))?;
+        let down_r = down_buf
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("down_buf downcast failed".into()))?;
 
         let stream = self.launch_charon_fused_dispatch(
             activations,
@@ -4889,9 +4683,9 @@ impl RocmDevice {
         let a_ptr = activations.device_ptr.ok_or_else(|| {
             Error::Backend("charon_grouped_fp8: activations has no device ptr".into())
         })?;
-        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
-            Error::Backend("charon_grouped_fp8: out has no device ptr".into())
-        })?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("charon_grouped_fp8: out has no device ptr".into()))?;
 
         crate::kernels::charon::validate_grouped_inputs(
             a_ptr as *mut c_void,
@@ -5001,9 +4795,9 @@ impl RocmDevice {
         let a_ptr = activations.device_ptr.ok_or_else(|| {
             Error::Backend("charon_grouped_mxfp4: activations has no device ptr".into())
         })?;
-        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
-            Error::Backend("charon_grouped_mxfp4: out has no device ptr".into())
-        })?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("charon_grouped_mxfp4: out has no device ptr".into()))?;
 
         crate::kernels::charon::validate_grouped_inputs(
             a_ptr as *mut c_void,
@@ -5113,9 +4907,9 @@ impl RocmDevice {
         let a_ptr = activations.device_ptr.ok_or_else(|| {
             Error::Backend("charon_grouped_mxfp8: activations has no device ptr".into())
         })?;
-        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
-            Error::Backend("charon_grouped_mxfp8: out has no device ptr".into())
-        })?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("charon_grouped_mxfp8: out has no device ptr".into()))?;
 
         crate::kernels::charon::validate_grouped_inputs(
             a_ptr as *mut c_void,
@@ -5222,9 +5016,9 @@ impl RocmDevice {
         let a_ptr = activations.device_ptr.ok_or_else(|| {
             Error::Backend("charon_grouped_q80: activations has no device ptr".into())
         })?;
-        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
-            Error::Backend("charon_grouped_q80: out has no device ptr".into())
-        })?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("charon_grouped_q80: out has no device ptr".into()))?;
 
         crate::kernels::charon::validate_grouped_inputs(
             a_ptr as *mut c_void,
@@ -5361,9 +5155,10 @@ impl RocmDevice {
         let mut uw = eup_w_ptr;
         let mut dw = edown_w_ptr;
         let mut ascale = a_scale_ptr;
-        let mut optr = out_storage.device_ptr.ok_or_else(|| {
-            Error::Backend("charon_grouped_iqk: out has no device ptr".into())
-        })? as *mut c_void;
+        let mut optr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("charon_grouped_iqk: out has no device ptr".into()))?
+            as *mut c_void;
         let mut hidden_i = hidden as i32;
         let mut inter_i = inter as i32;
         let mut num_tokens_i = sorted.num_tokens_post_padded as i32;
@@ -5502,11 +5297,8 @@ impl RocmDevice {
         let num_experts = expert_gate_w.len() / (inter * hidden);
         let block_size = 128usize; // token-block the grouped kernel strides across
 
-        let sorted = crate::kernels::charon::moe_align_block_size(
-            assignment,
-            block_size,
-            num_experts,
-        );
+        let sorted =
+            crate::kernels::charon::moe_align_block_size(assignment, block_size, num_experts);
 
         let act_shape = Shape::new(vec![batch, hidden]);
         let exp_gate_shape = Shape::new(vec![expert_gate_w.len()]);
@@ -5576,11 +5368,8 @@ impl RocmDevice {
         let num_experts = expert_gate_w_codes.len() / ((inter * hidden / 2).max(1));
         let block_size = 128usize;
 
-        let sorted = crate::kernels::charon::moe_align_block_size(
-            assignment,
-            block_size,
-            num_experts,
-        );
+        let sorted =
+            crate::kernels::charon::moe_align_block_size(assignment, block_size, num_experts);
 
         let act_shape = Shape::new(vec![batch, hidden]);
         let gw_shape = Shape::new(vec![expert_gate_w_codes.len()]);
@@ -5598,37 +5387,55 @@ impl RocmDevice {
             self,
             expert_gate_w_codes,
             &gw_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let uw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
             self,
             expert_up_w_codes,
             &uw_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let dw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
             self,
             expert_down_w_codes,
             &dw_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let ge_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
             self,
             expert_gate_e8m0,
             &ge_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let ue_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
             self,
             expert_up_e8m0,
             &ue_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let de_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
             self,
             expert_down_e8m0,
             &de_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let as_storage: Box<dyn BackendStorage> =
             BackendDevice::from_cpu(self, a_scale, &as_shape, DType::F32)?;
@@ -5697,11 +5504,8 @@ impl RocmDevice {
         let num_experts = expert_gate_w_codes.len() / ((inter * hidden).max(1));
         let block_size = 128usize;
 
-        let sorted = crate::kernels::charon::moe_align_block_size(
-            assignment,
-            block_size,
-            num_experts,
-        );
+        let sorted =
+            crate::kernels::charon::moe_align_block_size(assignment, block_size, num_experts);
 
         let act_shape = Shape::new(vec![batch, hidden]);
         let gw_shape = Shape::new(vec![expert_gate_w_codes.len()]);
@@ -5719,37 +5523,55 @@ impl RocmDevice {
             self,
             expert_gate_w_codes,
             &gw_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let uw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
             self,
             expert_up_w_codes,
             &uw_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let dw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
             self,
             expert_down_w_codes,
             &dw_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let ge_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
             self,
             expert_gate_e8m0,
             &ge_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let ue_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
             self,
             expert_up_e8m0,
             &ue_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let de_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
             self,
             expert_down_e8m0,
             &de_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let as_storage: Box<dyn BackendStorage> =
             BackendDevice::from_cpu(self, a_scale, &as_shape, DType::F32)?;
@@ -5818,11 +5640,8 @@ impl RocmDevice {
             expert_gate_w_q80.len() / (bytes_per_block * weights_per_expert.div_ceil(32));
         let block_size = 128usize;
 
-        let sorted = crate::kernels::charon::moe_align_block_size(
-            assignment,
-            block_size,
-            num_experts,
-        );
+        let sorted =
+            crate::kernels::charon::moe_align_block_size(assignment, block_size, num_experts);
 
         let act_shape = Shape::new(vec![batch, hidden]);
         let gw_shape = Shape::new(vec![expert_gate_w_q80.len()]);
@@ -5837,19 +5656,28 @@ impl RocmDevice {
             self,
             expert_gate_w_q80,
             &gw_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let uw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
             self,
             expert_up_w_q80,
             &uw_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let dw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
             self,
             expert_down_w_q80,
             &dw_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let as_storage: Box<dyn BackendStorage> =
             BackendDevice::from_cpu(self, a_scale, &as_shape, DType::F32)?;
@@ -5910,11 +5738,8 @@ impl RocmDevice {
         let num_experts = expert_gate_w_q.len() / (block_bytes * (weights_per_expert / 256).max(1));
         let block_size = 128usize;
 
-        let sorted = crate::kernels::charon::moe_align_block_size(
-            assignment,
-            block_size,
-            num_experts,
-        );
+        let sorted =
+            crate::kernels::charon::moe_align_block_size(assignment, block_size, num_experts);
 
         let act_shape = Shape::new(vec![batch, hidden]);
         let gw_shape = Shape::new(vec![expert_gate_w_q.len()]);
@@ -5929,19 +5754,28 @@ impl RocmDevice {
             self,
             expert_gate_w_q,
             &gw_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let uw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
             self,
             expert_up_w_q,
             &uw_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let dw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
             self,
             expert_down_w_q,
             &dw_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let as_storage: Box<dyn BackendStorage> =
             BackendDevice::from_cpu(self, a_scale, &as_shape, DType::F32)?;
@@ -6003,11 +5837,8 @@ impl RocmDevice {
         let num_experts = expert_gate_scale.len() / (inter * h16.max(1));
         let block_size = 128usize;
 
-        let sorted = crate::kernels::charon::moe_align_block_size(
-            assignment,
-            block_size,
-            num_experts,
-        );
+        let sorted =
+            crate::kernels::charon::moe_align_block_size(assignment, block_size, num_experts);
 
         let act_shape = Shape::new(vec![batch, hidden]);
         let gw_shape = Shape::new(vec![expert_gate_w_fp8.len()]);
@@ -6026,19 +5857,28 @@ impl RocmDevice {
             self,
             expert_gate_w_fp8,
             &gw_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let uw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
             self,
             expert_up_w_fp8,
             &uw_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let dw_storage: Box<dyn BackendStorage> = BackendDevice::from_cpu_bytes(
             self,
             expert_down_w_fp8,
             &dw_shape,
-            DType { arith: ArithType::U8, storage: DTypeStorage::Native },
+            DType {
+                arith: ArithType::U8,
+                storage: DTypeStorage::Native,
+            },
         )?;
         let gs_storage: Box<dyn BackendStorage> =
             BackendDevice::from_cpu(self, expert_gate_scale, &gs_shape, DType::F32)?;
@@ -7728,6 +7568,521 @@ impl RocmDevice {
         self.launch_compute_kernel_with_solution(entry, grid, block, args, None, 0)
     }
 
+    /// JIT compile source or fetch cached binary. When a `HardwareSpec` is supplied, the
+    /// cache key incorporates the hardware fingerprint (wavefront/lds/cu/mp/threads) via
+    /// `JitCacheKey::from_spec`, so parametrized kernels for different hardware don't
+    /// collide. Without a spec, falls back to the legacy (entry, arch, hash) key.
+    pub fn jit_compile_or_cache(
+        &self,
+        source: &str,
+        entry: &str,
+        spec: Option<&crate::device::hardware_spec::HardwareSpec>,
+    ) -> Result<(std::path::PathBuf, String)> {
+        let hash = seahash::hash(source.as_bytes());
+        let cache_key = if let Some(spec) = spec {
+            crate::kernels::jit_cache::JitCacheKey::from_spec(entry, &self.gpu_target, spec, hash)
+                .to_key_string()
+        } else {
+            format!("grim_{}_{}_{:016x}", entry, self.gpu_target, hash)
+        };
+
+        if let Some((cached_path, cached_lowered)) = self.hsaco_cache.get_cached_kernel(&cache_key)
+        {
+            Ok((cached_path, cached_lowered))
+        } else {
+            let (code, lowered) = jit_compile_hsaco(source, entry, &self.gpu_target)?;
+            let p = self
+                .hsaco_cache
+                .cache_kernel(&cache_key, source, &code, &lowered)?;
+            Ok((p, lowered))
+        }
+    }
+
+    /// Benchmark kernel execution time in milliseconds using HIP events.
+    /// Loads the module, resolves the entry, launches once on the device stream bracketed by
+    /// start/stop events, and returns the elapsed GPU time. Falls back to a conservative
+    /// constant if any HIP call fails so the FCP search still returns a valid winner.
+    pub fn time_kernel_ms(
+        &self,
+        hsaco: &std::path::Path,
+        lowered: &str,
+        dims: crate::kernels::tile_picker::ShapeDims,
+        cand: &crate::kernels::tile_picker::TileConfig,
+    ) -> f64 {
+        use crate::device::handles::{
+            hipEventCreate, hipEventDestroy, hipEventElapsedTime, hipEventRecord,
+            hipEventSynchronize, hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad,
+            hipModuleUnload,
+        };
+        let mut start_event: *mut c_void = std::ptr::null_mut();
+        let mut stop_event: *mut c_void = std::ptr::null_mut();
+
+        unsafe {
+            if hipEventCreate(&mut start_event) != hipSuccess {
+                return 0.5;
+            }
+            if hipEventCreate(&mut stop_event) != hipSuccess {
+                let _ = hipEventDestroy(start_event);
+                return 0.5;
+            }
+
+            let _ = hipEventRecord(start_event, std::ptr::null_mut());
+
+            let grid = HipDim3::new(
+                (dims.m + cand.grid_stride_m - 1) / cand.grid_stride_m,
+                (dims.n + cand.grid_stride_n - 1) / cand.grid_stride_n,
+                1,
+            );
+            let block = HipDim3::new(cand.threads, 1, 1);
+
+            let path_c = match std::ffi::CString::new(hsaco.to_str().unwrap_or("")) {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = hipEventDestroy(start_event);
+                    let _ = hipEventDestroy(stop_event);
+                    return 0.5;
+                }
+            };
+            let entry_c = match std::ffi::CString::new(lowered) {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = hipEventDestroy(start_event);
+                    let _ = hipEventDestroy(stop_event);
+                    return 0.5;
+                }
+            };
+
+            let mut module: *mut c_void = std::ptr::null_mut();
+            if hipModuleLoad(&mut module, path_c.as_ptr()) == hipSuccess {
+                let mut func: *mut c_void = std::ptr::null_mut();
+                if hipModuleGetFunction(&mut func, module, entry_c.as_ptr()) == hipSuccess {
+                    let mut dummy_args: [*mut c_void; 0] = [];
+                    let _ = hipModuleLaunchKernel(
+                        func,
+                        grid.x,
+                        grid.y,
+                        grid.z,
+                        block.x,
+                        block.y,
+                        block.z,
+                        0,
+                        std::ptr::null_mut(),
+                        dummy_args.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    );
+                }
+                let _ = hipModuleUnload(module);
+            }
+
+            let _ = hipEventRecord(stop_event, std::ptr::null_mut());
+            let _ = hipEventSynchronize(stop_event);
+
+            let mut elapsed_ms: f32 = 0.0;
+            let status = hipEventElapsedTime(&mut elapsed_ms, start_event, stop_event);
+
+            let _ = hipEventDestroy(start_event);
+            let _ = hipEventDestroy(stop_event);
+
+            if status == hipSuccess && elapsed_ms > 0.0 {
+                elapsed_ms as f64
+            } else {
+                0.5
+            }
+        }
+    }
+
+    /// Store empirically discovered winning tile configuration into the autotuner cache.
+    /// `winner_ms` is the measured GPU time of the winning candidate; persisted as
+    /// `cycles_per_invocation` (ns-scale u64) so cached entries carry the measurement.
+    pub fn store_tune_cache(
+        &self,
+        entry: &str,
+        _spec: &crate::device::hardware_spec::HardwareSpec,
+        dims: crate::kernels::tile_picker::ShapeDims,
+        winner: &crate::kernels::tile_picker::TileConfig,
+        winner_ms: f64,
+    ) {
+        let mut autotuner = self.autotuner.lock().unwrap();
+        // The in-memory KernelKey uses &'static str (Copy HashMap key). Leak the runtime
+        // strings to obtain 'static lifetime — bounded by unique (entry, arch) pairs, then
+        // cache hits; matches the from_json interning pattern in autotune.rs.
+        let arch_leak: &'static str = Box::leak(self.gpu_target.clone().into_boxed_str());
+        let entry_leak: &'static str = Box::leak(entry.to_string().into_boxed_str());
+        let key = crate::autotune::KernelKey {
+            kernel: entry_leak,
+            gpu_arch: arch_leak,
+            m: dims.m as usize,
+            n: dims.n as usize,
+            k: dims.k as usize,
+        };
+        let config = crate::autotune::AutotuneConfig {
+            block_dim: winner.threads,
+            tile_kv: winner.block_k,
+            grid_stride: winner.grid_stride_m,
+            cycles_per_invocation: (winner_ms * 1e6) as u64,
+        };
+        let _ = autotuner.record(key, config);
+    }
+
+    /// Return a fresh HardwareSpec snapshot describing this device.
+    pub fn hardware_spec(&self) -> crate::device::hardware_spec::HardwareSpec {
+        crate::device::hardware_spec::HardwareSpec::from(self)
+    }
+
+    /// Read-through tile-cache lookup. On a hit, maps the stored `AutotuneConfig` back to a
+    /// `TileConfig`. On a miss, runs `fcp_fallback_tile_search` (compile + GPU-time a small
+    /// constrained candidate set, keep the fastest), which self-persists the winner via
+    /// `store_tune_cache` so subsequent calls for the same shape are a table hit, not a
+    /// re-measure. This is the Phase 5 wiring that makes the empirical FCP search fire.
+    pub fn get_or_tune_tiles(
+        &self,
+        entry: &str,
+        spec: &crate::device::hardware_spec::HardwareSpec,
+        dims: crate::kernels::tile_picker::ShapeDims,
+        shape_class: crate::autotune::ShapeClass,
+    ) -> crate::kernels::tile_picker::TileConfig {
+        // Same &'static-str interning as store_tune_cache — bounded by unique (entry, arch).
+        let arch_leak: &'static str = Box::leak(self.gpu_target.clone().into_boxed_str());
+        let entry_leak: &'static str = Box::leak(entry.to_string().into_boxed_str());
+        let key = crate::autotune::KernelKey {
+            kernel: entry_leak,
+            gpu_arch: arch_leak,
+            m: dims.m as usize,
+            n: dims.n as usize,
+            k: dims.k as usize,
+        };
+
+        // 1. Hot path: in-memory table hit.
+        {
+            let autotuner = self.autotuner.lock().unwrap();
+            if let Some(cfg) = autotuner.lookup(key) {
+                return crate::kernels::tile_picker::TileConfig {
+                    block_m: 0,
+                    block_n: 0,
+                    block_k: cfg.tile_kv,
+                    split_k: 1,
+                    grid_stride_m: cfg.grid_stride,
+                    grid_stride_n: cfg.grid_stride,
+                    lds_double_buffer: 64 * 1024
+                        >= 2 * (2
+                            * (cfg.tile_kv * (spec.wavefront_size.max(16))
+                                + cfg.tile_kv * (spec.wavefront_size.max(16))
+                                + (spec.wavefront_size.max(16)) * (spec.wavefront_size.max(16)))),
+                    use_wmma: spec.gcn_arch.starts_with("gfx11")
+                        || spec.gcn_arch.starts_with("gfx12"),
+                    use_mfma: spec.gcn_arch.starts_with("gfx12")
+                        || spec.gcn_arch.starts_with("gfx9"),
+                    threads: cfg.block_dim,
+                }
+                .with_block_geometry(spec, shape_class);
+            }
+        }
+
+        // 2. Cold path: empirical FCP search. Self-persists, so the next call hits step 1.
+        crate::kernels::tile_picker::fcp_fallback_tile_search(self, spec, entry, dims, shape_class)
+    }
+
+    /// Op-tagged GEMM. `op` drives the `ShapeClass` via `ShapeClass::from_op`: `LmHead`
+    /// selects the TLOLog tile arm (wide block_n for the vocab-dominated output column);
+    /// everything else bins by M as before (from_op(Other, m) == from_m(m)).
+    pub(crate) fn matmul_op(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out_shape: &Shape,
+        op: crate::autotune::GemmOp,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        #[cfg(feature = "rocm-profile")]
+        println!("[rocprofiler-sdk] Begin marker span: matmul");
+
+        // For matmul on GPU, both inputs must be RocmStorage (or we need to copy them to the device first)
+        let a_storage = match a.as_any().downcast_ref::<RocmStorage>() {
+            Some(s) => s,
+            None => return Err(Error::Backend("matmul: input a is not RocmStorage".into())),
+        };
+
+        let b_storage = match b.as_any().downcast_ref::<RocmStorage>() {
+            Some(s) => s,
+            None => return Err(Error::Backend("matmul: input b is not RocmStorage".into())),
+        };
+
+        if !a_storage.device_ptr_is_valid() || !b_storage.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "matmul: inputs must have valid GPU device pointers".into(),
+            ));
+        }
+
+        let a_dims = a.shape().dims();
+        let b_dims = b.shape().dims();
+
+        if a_dims.len() < 2 || b_dims.len() < 2 {
+            return Err(Error::Shape("matmul expects inputs with rank >= 2".into()));
+        }
+
+        let k = a_dims[a_dims.len() - 1];
+        let m = a.shape().elem_count() / k;
+
+        let n = b_dims[b_dims.len() - 1];
+        let k2 = b.shape().elem_count() / n;
+
+        if k != k2 {
+            return Err(Error::ShapeMismatch {
+                expected: a_dims.to_vec(),
+                got: b_dims.to_vec(),
+            });
+        }
+
+        if out_shape.elem_count() != m * n {
+            return Err(Error::Shape(format!(
+                "expected out elem_count {}, got {:?}",
+                m * n,
+                out_shape.dims()
+            )));
+        }
+
+        // Allocate output GPU storage with the actual input precision
+        let dtype_out = DType {
+            arith: a_storage.dtype.arith,
+            storage: DTypeStorage::Native,
+        };
+        let out_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_out.clone(), &self.allocator, self.ordinal)?;
+
+        // Shape-indexed GEMM dispatch lookup (Tensile-inspired layout resolution).
+        // Op-identity classifier: LmHead -> TLOLog tile arm; everything else bins by m.
+        let shape_class = crate::autotune::ShapeClass::from_op(op, m);
+        let tile_config =
+            lookup_gemm_config_for_shape(m, n, k, self.props.wavefront_size, shape_class);
+        // Offline-tuned solution_index per (M,N,K) for FP32. Falls back to 0 for [see: `examples/tune_gemm.rs`]
+        let solution_index = lookup_solution_index(m, n, k, &self.gpu_target, dtype_out.arith);
+        // WI 2.4.3 — split_k clamp gate.
+        let split_k_effective: u32 = {
+            let split_k_enabled = self.split_k_config.lock().unwrap().enabled;
+            if split_k_enabled
+                && tile_config.split_k > 1
+                && (k % tile_config.split_k as usize == 0)
+                && (m > 1 || k > 8192)
+            {
+                tile_config.split_k
+            } else {
+                1
+            }
+        };
+
+        if split_k_effective > 1 {
+            let k_part = k / split_k_effective as usize;
+            let partials_shape = Shape::from_slice(&[split_k_effective as usize, m, n]);
+            let partials_storage = RocmStorage::alloc_gpu(
+                &partials_shape,
+                dtype_out.clone(),
+                &self.allocator,
+                self.ordinal,
+            )?;
+
+            let handle = self.get_rocblas_handle()?;
+            let alpha: f32 = 1.0f32;
+            let beta: f32 = 0.0f32;
+
+            let a_ptr_void = a_storage.device_ptr.unwrap() as *const c_void;
+            let b_ptr_void = b_storage.device_ptr.unwrap() as *const c_void;
+            let partials_ptr_void = partials_storage.device_ptr.unwrap() as *mut c_void;
+
+            let status = unsafe {
+                let a_type = arith_to_rocblas_dtype(a_storage.dtype.arith);
+                let b_type = arith_to_rocblas_dtype(b_storage.dtype.arith);
+                let out_type = arith_to_rocblas_dtype(dtype_out.arith);
+                let compute_type = arith_to_compute_dtype(dtype_out.arith);
+                let alpha_ptr = &alpha as *const f32 as *const c_void;
+                let beta_ptr = &beta as *const f32 as *const c_void;
+
+                rocblas_gemm_strided_batched_ex(
+                    handle,
+                    RocblasOperation::None,
+                    RocblasOperation::None,
+                    n as RocblasInt,
+                    m as RocblasInt,
+                    k_part as RocblasInt,
+                    alpha_ptr,
+                    b_ptr_void,
+                    b_type,
+                    n as RocblasInt,
+                    (k_part * n) as i64,
+                    a_ptr_void,
+                    a_type,
+                    k as RocblasInt,
+                    k_part as i64,
+                    beta_ptr,
+                    partials_ptr_void,
+                    out_type,
+                    n as RocblasInt,
+                    (m * n) as i64,
+                    partials_ptr_void,
+                    out_type,
+                    n as RocblasInt,
+                    (m * n) as i64,
+                    split_k_effective as RocblasInt,
+                    compute_type,
+                    select_gemm_algo(solution_index),
+                    0,
+                    ROCBLAS_GEMM_FLAGS_NONE,
+                )
+            };
+
+            if status != rocblas_status_success {
+                return Err(Error::Backend(format!(
+                    "rocblas_gemm_strided_batched_ex failed with status {status}"
+                )));
+            }
+
+            // Sum up the partials along the batch dimension using the hand-written reduction kernel
+            let stream = self.launch_split_k_reduction(
+                &partials_storage,
+                &out_storage,
+                m,
+                n,
+                split_k_effective,
+            )?;
+            let compute_handle = Box::new(RocmHandle::new(Some(stream)));
+            return Ok((Box::new(out_storage), compute_handle));
+        }
+        #[cfg(feature = "rocm-profile")]
+        println!(
+            "[RocmDevice] GEMM Dispatch: Shape ({}, {}, {}) resolved to autotune tile config {:?} on Wavefront {:?}, solution_index={}",
+            m, n, k, tile_config, self.props.wavefront_size, solution_index
+        );
+
+        // ─── WI 2.4.4-2 — decode GEMM dispatch (opt-in, F16-only, m ≤ 8) ───── [see: `ck_gemm.cpp`, `grim_decode_gemm_f16`]
+        {
+            // Lock-free read via AtomicBool shadow — avoids Mutex acquisition on every matmul.
+            // [see: `decode_gemm_enabled`, `set_decode_gemm_enabled`]
+            if self.decode_gemm_enabled.load(Ordering::Relaxed)
+                && dtype_out.arith == ArithType::F16
+                && m <= 8
+            {
+                // WI 2.4.4-2(a) — thread the *real* enqueued stream into the [see: `launch_compute_kernel`, `hipModuleLaunchKernel`]
+                let stream =
+                    self.launch_decode_gemm_f16(a_storage, b_storage, &out_storage, m, n, k)?;
+                let compute_handle = Box::new(RocmHandle::new(Some(stream)));
+                return Ok((Box::new(out_storage), compute_handle));
+            }
+        }
+
+        // ─── WI-G — WMMA GEMM dispatch (opt-in, F16-only) ─────
+        {
+            if self.should_use_wmma_path(None, dtype_out.arith) {
+                let stream = self.launch_wmma_gemm(a_storage, b_storage, &out_storage, m, n, k)?;
+                let compute_handle = Box::new(RocmHandle::new(Some(stream)));
+                return Ok((Box::new(out_storage), compute_handle));
+            }
+        }
+
+        // Get rocBLAS handle and execute sgemm. If handle is null (due to memory error fallback),
+        // execute using WMMA HIP GEMM kernel directly.
+        let handle = match self.get_rocblas_handle() {
+            Ok(h) if !h.0.is_null() => h,
+            _ => {
+                let stream = self.launch_wmma_gemm(a_storage, b_storage, &out_storage, m, n, k)?;
+                let compute_handle = Box::new(RocmHandle::new(Some(stream)));
+                return Ok((Box::new(out_storage), compute_handle));
+            }
+        };
+
+        let alpha: f32 = 1.0f32;
+        let beta: f32 = 0.0f32;
+
+        let a_ptr_void = a_storage.device_ptr.unwrap() as *const c_void;
+        let b_ptr_void = b_storage.device_ptr.unwrap() as *const c_void;
+        let out_ptr_void = out_storage.device_ptr.unwrap() as *mut c_void;
+
+        // In ROCm/rocBLAS (column-major), row-major C[M,N] = A[M,K] @ B[K,N] is
+
+        let use_gemm_ex = cfg!(feature = "rocm-aiter") || {
+            let gcn = std::env::var("GRIM_GPU_TARGET").unwrap_or_else(|_| "gfx900".into());
+            gcn == "gfx90a" || gcn == "gfx942"
+        };
+
+        unsafe {
+            let status = if use_gemm_ex
+                || dtype_out.arith == ArithType::F16
+                || dtype_out.arith == ArithType::BF16
+            {
+                let a_type = arith_to_rocblas_dtype(a_storage.dtype.arith);
+                let b_type = arith_to_rocblas_dtype(b_storage.dtype.arith);
+                let out_type = arith_to_rocblas_dtype(dtype_out.arith);
+                let compute_type = arith_to_compute_dtype(dtype_out.arith);
+                let alpha_ptr = &alpha as *const f32 as *const c_void;
+                let beta_ptr = &beta as *const f32 as *const c_void;
+                rocblas_gemm_ex(
+                    handle,
+                    RocblasOperation::None,
+                    RocblasOperation::None,
+                    n as RocblasInt,
+                    m as RocblasInt,
+                    k as RocblasInt,
+                    alpha_ptr,
+                    b_ptr_void,
+                    b_type,
+                    n as RocblasInt,
+                    a_ptr_void,
+                    a_type,
+                    k as RocblasInt,
+                    beta_ptr,
+                    out_ptr_void,
+                    out_type,
+                    n as RocblasInt,
+                    out_ptr_void,
+                    out_type,
+                    n as RocblasInt,
+                    compute_type,
+                    // Wire `lookup_solution_index` to `algo` so rocBLAS actually [see: `select_gemm_algo(0)`, `standard`]
+                    select_gemm_algo(solution_index),
+                    solution_index as RocblasInt,
+                    ROCBLAS_GEMM_FLAGS_NONE,
+                )
+            } else {
+                rocblas_sgemm(
+                    handle,
+                    RocblasOperation::None,
+                    RocblasOperation::None,
+                    n as RocblasInt,
+                    m as RocblasInt,
+                    k as RocblasInt,
+                    &alpha,
+                    b_ptr_void as *const f32,
+                    n as RocblasInt,
+                    a_ptr_void as *const f32,
+                    k as RocblasInt,
+                    &beta,
+                    out_ptr_void as *mut f32,
+                    n as RocblasInt,
+                )
+            };
+
+            if status != rocblas_status_success {
+                // If rocBLAS matmul returns an error (e.g. status 1 = invalid handle),
+                // fall back seamlessly to WMMA HIP GEMM kernel.
+                let stream = self.launch_wmma_gemm(a_storage, b_storage, &out_storage, m, n, k)?;
+                let compute_handle = Box::new(RocmHandle::new(Some(stream)));
+                return Ok((Box::new(out_storage), compute_handle));
+            }
+        };
+
+        let compute_handle = Box::new(RocmHandle::new(Some(self.active_stream())));
+        Ok((Box::new(out_storage), compute_handle))
+    }
+
+    /// Public hook for the engine layer to tag the lm_head / logit-projection GEMM, so the
+    /// dispatch layer classifies it as `ShapeClass::TLOLog` (op-identity) and selects the
+    /// distinct wide-N tile regardless of M. This is the jit-mgpu.md §4.2 dispatch-layer tag.
+    pub fn matmul_lm_head(
+        &self,
+        a: &dyn BackendStorage,
+        b: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.matmul_op(a, b, out_shape, crate::autotune::GemmOp::LmHead)
+    }
+
     pub(crate) fn launch_compute_kernel_with_solution(
         &self,
         entry: &str,
@@ -7737,28 +8092,64 @@ impl RocmDevice {
         solution_index: Option<i32>,
         shared_mem_bytes: usize,
     ) -> Result<*mut c_void> {
-        // Build the kernel source fresh per dispatch so the live QKV kernel [see: `const`, `concat!`]
-        let kernel_source = crate::kernels::source_asm::compute_kernel_source();
-        let hash = seahash::hash(kernel_source.as_bytes());
-        // Include the GPU target in the cache key so a binary compiled for one
-        let base_key = format!("grim_{}_{}_{:016x}", entry, self.gpu_target, hash);
-        let cache_key = if let Some(sol) = solution_index {
-            format!("{}_sol{}", base_key, sol)
-        } else {
-            base_key
+        // Build the kernel source. Under `jit-hw-adaptive`, inject hardware-specific #defines
+        // (wavefront/LDS/CU + tile geometry) via `compute_kernel_source_with_spec` and route the
+        // compile through the fingerprinted `jit_compile_or_cache`. Otherwise fall back to the
+        // static source + legacy cache key.
+        #[cfg(feature = "jit-hw-adaptive")]
+        let (path, lowered_name, cache_key) = {
+            let spec = self.hardware_spec();
+            // `launch_compute_kernel` is a generic launcher (no GEMM M/N/K in its signature), so
+            // infer a coarse (m, n) from the grid dims; the per-op TLOLog tagging is handled at
+            // the `matmul_op` layer, not here. K is unknown to the generic launcher; use a
+            // conservative default — split-K is derived from the real K inside `pick_tiles`.
+            let (m_val, n_val) = if grid.y > 1 { (grid.x, grid.y) } else { (1, 1) };
+            let shape_class = crate::autotune::ShapeClass::from_m(m_val as usize);
+            let dims = crate::kernels::tile_picker::ShapeDims::new(m_val, n_val, 64);
+            let kernel_source = crate::kernels::source_asm::compute_kernel_source_with_spec(
+                &spec,
+                entry,
+                shape_class,
+                dims,
+                0,
+                1,
+                None,
+            );
+            let (p, lowered) = self.jit_compile_or_cache(&kernel_source, entry, Some(&spec))?;
+            let mut key = format!(
+                "grim_{}_{}_{:016x}",
+                entry,
+                self.gpu_target,
+                seahash::hash(kernel_source.as_bytes())
+            );
+            if let Some(sol) = solution_index {
+                key = format!("{}_sol{}", key, sol);
+            }
+            (p, lowered, key)
         };
 
-        let (path, lowered_name) = if let Some((cached_path, cached_lowered)) =
-            self.hsaco_cache.get_cached_kernel(&cache_key)
-        {
-            (cached_path, cached_lowered)
-        } else {
-            let (code, lowered) =
-                jit_compile_hsaco(&kernel_source, entry, &self.gpu_target)?;
-            let p = self
-                .hsaco_cache
-                .cache_kernel(&cache_key, &kernel_source, &code, &lowered)?;
-            (p, lowered)
+        #[cfg(not(feature = "jit-hw-adaptive"))]
+        let (path, lowered_name, cache_key) = {
+            let kernel_source = crate::kernels::source_asm::compute_kernel_source();
+            let hash = seahash::hash(kernel_source.as_bytes());
+            let base_key = format!("grim_{}_{}_{:016x}", entry, self.gpu_target, hash);
+            let cache_key = if let Some(sol) = solution_index {
+                format!("{}_sol{}", base_key, sol)
+            } else {
+                base_key
+            };
+            let (path, lowered_name) = if let Some((cached_path, cached_lowered)) =
+                self.hsaco_cache.get_cached_kernel(&cache_key)
+            {
+                (cached_path, cached_lowered)
+            } else {
+                let (code, lowered) = jit_compile_hsaco(&kernel_source, entry, &self.gpu_target)?;
+                let p =
+                    self.hsaco_cache
+                        .cache_kernel(&cache_key, &kernel_source, &code, &lowered)?;
+                (p, lowered)
+            };
+            (path, lowered_name, cache_key)
         };
 
         let path_c = std::ffi::CString::new(path.to_str().unwrap_or(""))
@@ -7836,7 +8227,9 @@ impl RocmDevice {
         let x_dims = x.shape().dims();
         let w_mat_dims = weight_mat.shape().dims();
         if x_dims.len() < 2 || w_mat_dims.len() < 2 {
-            return Err(Error::Shape("rmsnorm_matmul expects rank >= 2 inputs".into()));
+            return Err(Error::Shape(
+                "rmsnorm_matmul expects rank >= 2 inputs".into(),
+            ));
         }
         let k = x_dims[x_dims.len() - 1];
         let m = x.shape().elem_count() / k;
@@ -7961,6 +8354,202 @@ impl RocmDevice {
         ))
     }
 
+    /// Launch the Design-A on-device linear cross-entropy forward pass.
+    pub fn fused_linear_cross_entropy_forward(
+        &self,
+        hidden: &dyn BackendStorage,
+        lm_head: &dyn BackendStorage,
+        targets: &dyn BackendStorage,
+        v_tile_size: i32,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let h = as_rocm(hidden)?;
+        let w = as_rocm(lm_head)?;
+        let t = as_rocm(targets)?;
+        if !h.device_ptr_is_valid() || !w.device_ptr_is_valid() || !t.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "fused_linear_ce: invalid input pointer".into(),
+            ));
+        }
+        let hd = hidden.shape().dims();
+        let wd = lm_head.shape().dims();
+        let td = targets.shape().dims();
+        if hd.len() != 2 || wd.len() != 2 || td.len() != 1 || td[0] != hd[0] || wd[1] != hd[1] {
+            return Err(Error::Shape(
+                "fused_linear_ce: incompatible input shapes".into(),
+            ));
+        }
+        if v_tile_size <= 0 {
+            return Err(Error::Backend(
+                "fused_linear_ce: v_tile_size must be positive".into(),
+            ));
+        }
+        let batch = hd[0];
+        let loss = RocmStorage::alloc_gpu(
+            &Shape::new(vec![batch]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let lse = RocmStorage::alloc_gpu(
+            &Shape::new(vec![batch]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let mut hp = dev_ptr(h)?;
+        let mut wp = dev_ptr(w)?;
+        let mut tp = dev_ptr(t)?;
+        let mut lp = dev_ptr(&loss)?;
+        let mut ep = dev_ptr(&lse)?;
+        let mut k = hd[1] as i32;
+        let mut v = wd[0] as i32;
+        let mut tile = v_tile_size;
+        let mut b = batch as i32;
+        let block = crate::HipDim3 { x: 128, y: 1, z: 1 };
+        let grid = crate::HipDim3 {
+            x: ((batch + 127) / 128) as u32,
+            y: 1,
+            z: 1,
+        };
+        self.launch_compute_kernel(
+            "grim_fused_linear_ce_forward",
+            grid,
+            block,
+            &mut [
+                arg(&mut hp),
+                arg(&mut wp),
+                arg(&mut tp),
+                arg(&mut lp),
+                arg(&mut ep),
+                arg(&mut k),
+                arg(&mut v),
+                arg(&mut tile),
+                arg(&mut b),
+            ],
+        )?;
+        Ok((
+            Box::new(loss),
+            Box::new(lse),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
+    /// Launch the Design-A on-device linear cross-entropy backward pass.
+    pub fn fused_linear_cross_entropy_backward(
+        &self,
+        hidden: &dyn BackendStorage,
+        lm_head: &dyn BackendStorage,
+        targets: &dyn BackendStorage,
+        lse: &dyn BackendStorage,
+        v_tile_size: i32,
+        inv_batch: f32,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let h = as_rocm(hidden)?;
+        let w = as_rocm(lm_head)?;
+        let t = as_rocm(targets)?;
+        let e = as_rocm(lse)?;
+        if !h.device_ptr_is_valid()
+            || !w.device_ptr_is_valid()
+            || !t.device_ptr_is_valid()
+            || !e.device_ptr_is_valid()
+        {
+            return Err(Error::Backend(
+                "fused_linear_ce: invalid input pointer".into(),
+            ));
+        }
+        let hd = hidden.shape().dims();
+        let wd = lm_head.shape().dims();
+        if hd.len() != 2 || wd.len() != 2 || wd[1] != hd[1] || targets.shape().elem_count() != hd[0]
+        {
+            return Err(Error::Shape(
+                "fused_linear_ce: incompatible input shapes".into(),
+            ));
+        }
+        if v_tile_size <= 0 {
+            return Err(Error::Backend(
+                "fused_linear_ce: v_tile_size must be positive".into(),
+            ));
+        }
+        let batch = hd[0];
+        let grad =
+            RocmStorage::alloc_gpu(hidden.shape(), dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut hp = dev_ptr(h)?;
+        let mut wp = dev_ptr(w)?;
+        let mut tp = dev_ptr(t)?;
+        let mut ep = dev_ptr(e)?;
+        let mut gp = dev_ptr(&grad)?;
+        let mut k = hd[1] as i32;
+        let mut v = wd[0] as i32;
+        let mut tile = v_tile_size;
+        let mut inv = inv_batch;
+        let mut b = batch as i32;
+        let block = crate::HipDim3 { x: 128, y: 1, z: 1 };
+        let grid = crate::HipDim3 {
+            x: ((batch + 127) / 128) as u32,
+            y: 1,
+            z: 1,
+        };
+        self.launch_compute_kernel(
+            "grim_fused_linear_ce_backward",
+            grid,
+            block,
+            &mut [
+                arg(&mut hp),
+                arg(&mut wp),
+                arg(&mut tp),
+                arg(&mut ep),
+                arg(&mut gp),
+                arg(&mut k),
+                arg(&mut v),
+                arg(&mut tile),
+                arg(&mut inv),
+                arg(&mut b),
+            ],
+        )?;
+        Ok((
+            Box::new(grad),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
+    /// Launch one bounded Scythe persistent worker. The worker is intentionally
+    /// launched as a single 128-thread block: the callable Charon device
+    /// function uses that block cooperatively and processes the complete task.
+    pub fn launch_scythe_persistent_dispatch(
+        &self,
+        slots: &dyn BackendStorage,
+        capacity: u32,
+        tail: &dyn BackendStorage,
+        head: &dyn BackendStorage,
+        stop: &dyn BackendStorage,
+        max_tasks: u32,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let mut slots_ptr = dev_ptr(as_rocm(slots)?)?;
+        let mut tail_ptr = dev_ptr(as_rocm(tail)?)?;
+        let mut head_ptr = dev_ptr(as_rocm(head)?)?;
+        let mut stop_ptr = dev_ptr(as_rocm(stop)?)?;
+        let mut cap = capacity;
+        let mut limit = max_tasks;
+        self.launch_compute_kernel(
+            "grim_scythe_persistent_dispatch",
+            crate::HipDim3::new(1, 1, 1),
+            crate::HipDim3::new(128, 1, 1),
+            &mut [
+                arg(&mut slots_ptr),
+                arg(&mut cap),
+                arg(&mut tail_ptr),
+                arg(&mut head_ptr),
+                arg(&mut stop_ptr),
+                arg(&mut limit),
+            ],
+        )?;
+        Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+    }
+
     /// Launch standalone Q8_0 quantization HIP kernel.
     pub fn launch_quant_q8_0(
         &self,
@@ -7969,7 +8558,11 @@ impl RocmDevice {
         total: usize,
     ) -> Result<*mut c_void> {
         let n_blocks = (total + 31) / 32;
-        let grid = crate::HipDim3 { x: n_blocks as u32, y: 1, z: 1 };
+        let grid = crate::HipDim3 {
+            x: n_blocks as u32,
+            y: 1,
+            z: 1,
+        };
         let block = crate::HipDim3 { x: 32, y: 1, z: 1 };
         let mut x_ptr = dev_ptr(x)?;
         let mut out_ptr = dev_ptr(out)?;
@@ -8344,6 +8937,138 @@ impl RocmDevice {
         Ok((avg_loss, Box::new(grad_storage) as Box<dyn BackendStorage>))
     }
 
+    /// Fused 3-in-1 SwiGLU activation + dynamic scale quantization HIP kernel launch.
+    pub fn silu_mul_quantize_gpu(
+        &self,
+        gate: &dyn BackendStorage,
+        up: &dyn BackendStorage,
+        _format: grim_tensor::dtype::QuantFormat,
+        out_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let g_s = as_rocm(gate)?;
+        let u_s = as_rocm(up)?;
+        if !g_s.device_ptr_is_valid() || !u_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "silu_mul_quantize: inputs lack a valid device pointer".into(),
+            ));
+        }
+
+        let total = out_shape.elem_count();
+        let qout_storage = RocmStorage::alloc_gpu(
+            out_shape,
+            DType {
+                arith: grim_tensor::dtype::ArithType::U8,
+                storage: grim_tensor::dtype::Storage::Native,
+            },
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let scale_storage = RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[1]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+
+        let mut gate_ptr = dev_ptr(g_s)?;
+        let mut up_ptr = dev_ptr(u_s)?;
+        let mut qout_ptr = dev_ptr(&qout_storage)?;
+        let mut scale_ptr = dev_ptr(&scale_storage)?;
+        let mut n_i = total as i32;
+
+        let grid = HipDim3::new(1, 1, 1);
+        let block = HipDim3::new(256, 1, 1);
+
+        self.launch_compute_kernel(
+            "grim_silu_mul_quantize",
+            grid,
+            block,
+            &mut [
+                arg(&mut gate_ptr),
+                arg(&mut up_ptr),
+                arg(&mut qout_ptr),
+                arg(&mut scale_ptr),
+                arg(&mut n_i),
+            ],
+        )?;
+
+        Ok((
+            Box::new(qout_storage),
+            Box::new(scale_storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
+    /// Block-Quantized SageAttention HIP kernel launch.
+    pub fn sage_attention_gpu(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_s = as_rocm(q)?;
+        let k_s = as_rocm(k)?;
+        let v_s = as_rocm(v)?;
+        if !q_s.device_ptr_is_valid() || !k_s.device_ptr_is_valid() || !v_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "sage_attention: inputs lack a valid device pointer".into(),
+            ));
+        }
+
+        let out_dims = out_shape.dims();
+        let seq_len = out_dims[0];
+        let num_heads = out_dims[1];
+        let head_dim = out_dims[2];
+
+        let out_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+
+        let mut q_ptr = dev_ptr(q_s)?;
+        let mut k_ptr = dev_ptr(k_s)?;
+        let mut v_ptr = dev_ptr(v_s)?;
+        let mut out_ptr = dev_ptr(&out_storage)?;
+
+        let mut nh_i = num_heads as i32;
+        let mut nkv_i = num_kv_heads as i32;
+        let mut hd_i = head_dim as i32;
+        let mut sl_i = seq_len as i32;
+        let mut ksl_i = kv_seq_len as i32;
+        let mut sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        let grid = HipDim3::new(num_heads as u32, ((seq_len + 127) / 128) as u32, 1);
+        let block = HipDim3::new(128, 1, 1);
+
+        self.launch_compute_kernel(
+            "grim_sage_attention",
+            grid,
+            block,
+            &mut [
+                arg(&mut q_ptr),
+                arg(&mut k_ptr),
+                arg(&mut v_ptr),
+                arg(&mut out_ptr),
+                arg(&mut nh_i),
+                arg(&mut nkv_i),
+                arg(&mut hd_i),
+                arg(&mut sl_i),
+                arg(&mut ksl_i),
+                arg(&mut sm_scale),
+            ],
+        )?;
+
+        Ok((
+            Box::new(out_storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
     /// Tree-attention wrapper for speculative-decoding verification. [see: `1 + gamma`, `tree_parents`]
     pub fn qkv_attention_paged(
         &self,
@@ -8453,7 +9178,8 @@ impl RocmDevice {
                 tree_parents.shape().elem_count(),
             )));
         }
-        // Wave64 mandate: kernel block dim is 256 = 4 wavefronts of 64 on
+        // Block dim: 128 threads for Wave32 (gfx1036/RDNA2: 4 Wave32 wavefronts),
+        // 256 threads for Wave64 (CDNA: 4 Wave64 wavefronts).
         if head_dim > 256 {
             return Err(Error::Shape(format!(
                 "tree_attention Phase-3 supports head_dim <= 256 (got {})",
@@ -8936,21 +9662,47 @@ impl grim_format::convert::GpuDequant for RocmDevice {
         bytes: &[u8],
         elem_count: usize,
     ) -> grim_tensor::error::Result<Option<Vec<f32>>> {
+        use grim_tensor::dtype::{BlockDtype, FloatPackScheme, KQuantScheme, Storage};
         match storage {
-            // Q8_0 is bit-exact between CPU `dequant_q80` and the ROCm
-            // `dequantize_q8_0` kernel (block-major f16 scale + 32 int8).
-            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80) => {
+            Storage::KQuant(KQuantScheme::Q80) => {
                 Ok(Some(self.dequantize_q8_0_host(bytes, elem_count)?))
             }
-            // Q4_K: bit-exact between CPU `dequant_q4k` and the ROCm
-            // `dequantize_q4k` kernel (interleaved-pair nibble layout,
-            // 6-bit packed sub-block scale/min). Routed through the GPU kernel
-            // instead of the CPU fallback.
-            grim_tensor::dtype::Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q4K) => {
+            Storage::KQuant(KQuantScheme::Q4K) => {
                 Ok(Some(self.dequantize_q4k_host(bytes, elem_count)?))
             }
-            // IQ grid-decode formats and other schemes whose GPU kernels do not
-            // yet match the CPU reference layouts remain on the CPU fallback.
+            Storage::KQuant(KQuantScheme::IQ2XXS) => {
+                Ok(Some(self.dequantize_iq2xxs_host(bytes, elem_count)?))
+            }
+            Storage::KQuant(KQuantScheme::IQ2XS) => {
+                Ok(Some(self.dequantize_iq2xs_host(bytes, elem_count)?))
+            }
+            Storage::KQuant(KQuantScheme::IQ2S) => {
+                Ok(Some(self.dequantize_iq2s_host(bytes, elem_count)?))
+            }
+            Storage::KQuant(KQuantScheme::IQ3XXS) => {
+                Ok(Some(self.dequantize_iq3xxs_host(bytes, elem_count)?))
+            }
+            Storage::KQuant(KQuantScheme::IQ3S) => {
+                Ok(Some(self.dequantize_iq3s_host(bytes, elem_count)?))
+            }
+            Storage::KQuant(KQuantScheme::IQ4NL) => {
+                Ok(Some(self.dequantize_iq4nl_host(bytes, elem_count)?))
+            }
+            Storage::KQuant(KQuantScheme::IQ4XS) => {
+                Ok(Some(self.dequantize_iq4xs_host(bytes, elem_count)?))
+            }
+            Storage::FloatPack(FloatPackScheme::Fp8) => {
+                Ok(Some(self.dequantize_fp8_host(bytes, elem_count)?))
+            }
+            Storage::FloatPack(FloatPackScheme::MxFp4) => {
+                Ok(Some(self.dequantize_mxfp4_host(bytes, elem_count)?))
+            }
+            Storage::FloatPack(FloatPackScheme::MxFp8) => {
+                Ok(Some(self.dequantize_mxfp8_host(bytes, elem_count)?))
+            }
+            Storage::Block(BlockDtype::Fp8 | BlockDtype::Fp8Block16) => {
+                Ok(Some(self.dequantize_fp8_host(bytes, elem_count)?))
+            }
             _ => Ok(None),
         }
     }

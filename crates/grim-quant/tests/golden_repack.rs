@@ -9,7 +9,7 @@ fn test_q4k_to_fp8_repack_precision_floor() -> TestResult {
     // Generate input weights with synthetic values
     let num_elements = 256;
     let orig_weights: Vec<f32> = (0..num_elements)
-        .map(|i| ((i as f32 * 0.1).sin() * 2.0))
+        .map(|i| (i as f32 * 0.1).sin() * 2.0)
         .collect();
 
     // Quantize to FP8 E4M3

@@ -181,12 +181,7 @@ impl fmt::Display for QuantCapability {
         write!(
             f,
             "fp32={} f16={} bf16={} fp8_native={} mxfp4_emulated={} mxfp8_emulated={}",
-            self.fp32,
-            self.f16,
-            self.bf16,
-            self.fp8,
-            self.mxfp4_emulated,
-            self.mxfp8_emulated
+            self.fp32, self.f16, self.bf16, self.fp8, self.mxfp4_emulated, self.mxfp8_emulated
         )
     }
 }

@@ -317,7 +317,6 @@ pub struct KnobValues {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::AdmissionController;
 
     #[test]
     fn self_tuning_ema_and_adjustments_recorded() {

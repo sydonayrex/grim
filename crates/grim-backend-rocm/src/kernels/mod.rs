@@ -33,6 +33,7 @@ pub mod decode_gemm;
 pub mod fp8_gemm_rdna4;
 pub mod fp8_standalone;
 pub mod fused_dequant_gemm;
+pub mod fused_linear_ce;
 pub mod iq_dequant;
 pub mod iq_gemm;
 pub mod jit_cache;
@@ -48,12 +49,12 @@ pub mod q8_0_dequant;
 pub mod qkv_attention;
 pub mod quant_standalone;
 pub mod rwkv;
-/// ScytheRing persistent dispatch kernel — device-side opcode loop
-/// (WI-Charon-3 item 2). Polls `ScytheRing` slots and dispatches per opcode;
-/// the opcode-6 arm casts `weight_ptr` to `MoETaskDescriptor*` and calls the
-/// Charon forward kernel inline. Device-gated for actual dispatch firing.
+pub mod sage_attention;
 pub mod scythe_persistent;
+pub mod silu_mul_quant;
+
 pub mod selective_scan;
 pub mod shared_device_fns;
 pub mod source_asm;
+pub mod tile_picker;
 pub mod wmma_gemm;

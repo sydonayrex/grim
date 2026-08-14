@@ -8,7 +8,54 @@ use std::time::SystemTime;
 
 use grim_tensor::error::Result;
 
+/// Cache key identifying a JIT compiled kernel by entry, GPU target, hardware fingerprint, and source hash.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JitCacheKey {
+    /// Kernel entry point name.
+    pub entry: String,
+    /// GPU target architecture string (e.g., "gfx1036").
+    pub gpu_target: String,
+    /// Hardware feature fingerprint string.
+    pub hardware_fingerprint: String,
+    /// Hash of the complete kernel source code.
+    pub source_hash: u64,
+}
+
+impl JitCacheKey {
+    /// Create a new cache key snapshot from hardware spec and source hash.
+    pub fn from_spec(
+        entry: &str,
+        gpu_target: &str,
+        spec: &crate::device::hardware_spec::HardwareSpec,
+        source_hash: u64,
+    ) -> Self {
+        let fingerprint = format!(
+            "{}:{}:{}:{}:{}",
+            spec.wavefront_size,
+            spec.max_shared_mem_per_block,
+            spec.cu_count,
+            spec.multiprocessor_count,
+            spec.max_threads_per_block,
+        );
+        JitCacheKey {
+            entry: entry.to_string(),
+            gpu_target: gpu_target.to_string(),
+            hardware_fingerprint: fingerprint,
+            source_hash,
+        }
+    }
+
+    /// Format the cache key into a unique file prefix string.
+    pub fn to_key_string(&self) -> String {
+        format!(
+            "grim_{}_{}_{}_{:016x}",
+            self.entry, self.gpu_target, self.hardware_fingerprint, self.source_hash
+        )
+    }
+}
+
 /// Cache for compiled .hsaco kernels. The in-memory map also stores the
+
 /// (possibly C++-mangled) *lowered* kernel name so `hipModuleGetFunction` can
 /// resolve kernels that hipRTC emits mangled (e.g. `grim_moe_fused_grouped_fp8`).
 #[derive(Debug)]
@@ -68,10 +115,10 @@ impl HsacoKernelCache {
         if cache_path.exists() {
             let metadata = fs::metadata(&cache_path)?;
             let modified = metadata.modified()?;
-            self.entries
-                .write()
-                .unwrap()
-                .insert(key.to_string(), (cache_path.clone(), modified, lowered_name.to_string()));
+            self.entries.write().unwrap().insert(
+                key.to_string(),
+                (cache_path.clone(), modified, lowered_name.to_string()),
+            );
             return Ok(cache_path);
         }
 
@@ -79,10 +126,10 @@ impl HsacoKernelCache {
 
         let metadata = fs::metadata(&cache_path)?;
         let modified = metadata.modified()?;
-        self.entries
-            .write()
-            .unwrap()
-            .insert(key.to_string(), (cache_path.clone(), modified, lowered_name.to_string()));
+        self.entries.write().unwrap().insert(
+            key.to_string(),
+            (cache_path.clone(), modified, lowered_name.to_string()),
+        );
 
         Ok(cache_path)
     }

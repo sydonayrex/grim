@@ -55,8 +55,15 @@ pub fn dequant_gptq_group_int(
     bits: u32,
     group_size: usize,
 ) -> Result<Vec<f32>> {
-    let in_features = shape[0];
-    let out_features = shape[1];
+    // QNT-6 fix: `shape` is caller-supplied and was indexed with `shape[0]` /
+    // `shape[1]` directly, which panics on a slice shorter than 2 elements.
+    // Bounds-check and return a proper error instead.
+    let in_features = *shape.get(0).ok_or_else(|| {
+        Error::Backend("dequant_gptq_group_int: shape missing in_features".into())
+    })?;
+    let out_features = *shape.get(1).ok_or_else(|| {
+        Error::Backend("dequant_gptq_group_int: shape missing out_features".into())
+    })?;
 
     let mut out = vec![0.0f32; in_features * out_features];
 
@@ -208,8 +215,8 @@ const BLOCK_Q8_WEIGHTS: usize = 32;
 
 /// Canonical IQ4_NL signed 16-entry codebook (ggml `kvalues_iq4nl`).
 const KVALUES_IQ4NL: [f32; 16] = [
-    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
-      1.0,    13.0,  25.0,  38.0,  53.0,  69.0,  87.0, 107.0,
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0,
+    87.0, 107.0,
 ];
 
 /// Absolute-value 16-entry codebook table alias for IQ4_XS.
@@ -234,13 +241,19 @@ const IQ4_NL_CODEBOOK: [f32; 16] = [
 
 /// Dequantize IQ4_NL (ggml non-linear 4-bit) bytes to f32.
 ///
-/// Per 256-weight super-block (144 bytes):
-///   - `d`  : f16 scale factor (2 bytes)
-///   - `qs` : 128 bytes = 256 4-bit indices (nibbles)
-///   - `scales` : 14 bytes per-subblock scale factors
+/// Per 256-weight super-block (170 bytes), matching `quant_iq4nl`:
+///   -  2 bytes `d`      : f16 global scale
+///   - 32 bytes `q8`     : one sign bit per weight (bit `i % 8` of byte `i / 8`)
+///   - 128 bytes `q4`    : 256 4-bit codebook indices (nibbles)
+///   -  8 bytes `scales` : per-subblock scale factors (8 sub-blocks of 32 weights)
+///
+/// QNT-3 fix: the previous decoder used a flat 144-byte layout and read `qs`
+/// at the wrong offset (colliding with the sign/scales region), never applied
+/// the 8 sub-block scales, and ignored the per-weight sign. It now matches the
+/// on-disk producer layout and applies `subblock_scale * sign * codebook`.
 pub fn dequant_iq4nl(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     const SUPER: usize = 256;
-    const BLOCK_BYTES: usize = 144;
+    const BLOCK_BYTES: usize = 170;
     let num_blocks = num_weights.div_ceil(SUPER);
     if data.len() < num_blocks * BLOCK_BYTES {
         return Err(Error::Backend(format!(
@@ -254,7 +267,9 @@ pub fn dequant_iq4nl(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     let mut remaining = num_weights;
     for _ in 0..num_blocks {
         let d = f16_to_f32(data[pos], data[pos + 1]);
-        let qs = &data[pos + 2..pos + 130];
+        let q8 = &data[pos + 2..pos + 34];
+        let qs = &data[pos + 34..pos + 162];
+        let scales = &data[pos + 162..pos + 170];
         let block_len = remaining.min(SUPER);
         for i in 0..block_len {
             let nibble = if i % 2 == 0 {
@@ -262,7 +277,19 @@ pub fn dequant_iq4nl(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
             } else {
                 (qs[i / 2] >> 4) & 0x0F
             };
-            let val = d * KVALUES_IQ4NL[nibble as usize];
+            // Per-subblock scale (8 sub-blocks of 32 weights). The producer
+            // stores the raw scale so 0 maps to 1.0 (identity), keeping the
+            // round-trip stable for blocks that don't populate sub-block scales.
+            let sb = i / 32;
+            let sb_scale = scales[sb] as f32 + 1.0;
+            let code = KVALUES_IQ4NL[nibble as usize];
+            let sign_bit = (q8[i / 8] >> (i % 8)) & 1;
+            let signed = if sign_bit != 0 {
+                -code.abs()
+            } else {
+                code.abs()
+            };
+            let val = d * sb_scale * signed;
             out.push(val);
         }
         pos += BLOCK_BYTES;
@@ -525,7 +552,9 @@ pub fn dequant_iq2xs(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
 ///   - `scales`: 8 bytes scale shifts
 ///   - `signs` : 24 bytes sign bits
 pub fn dequant_iq2s(_data: &[u8], _num_weights: usize) -> Result<Vec<f32>> {
-    Err(Error::Unimplemented("dequant_iq2s requires grid-vector lookup table; use Q2_K or Q4_K".into()))
+    Err(Error::Unimplemented(
+        "dequant_iq2s requires grid-vector lookup table; use Q2_K or Q4_K".into(),
+    ))
 }
 /// Dequantize Q4_K bytes to f32 per the ggml/llama.cpp super-block specification.
 ///
@@ -744,10 +773,20 @@ pub fn dequant_q6k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// Dequantize Q2_K bytes to f32 per the ggml/llama.cpp super-block specification (82 bytes / 256 weights).
+/// Dequantize Q2_K bytes to f32 per the ggml/llama.cpp super-block specification
+/// (84 bytes / 256 weights).
+///
+/// On-disk super-block layout (84 bytes total):
+///   - 16 bytes `scales` : 16 sub-blocks, each a `(min << 4) | scale` nibble pair
+///   - 64 bytes `qs`     : 256 2-bit quants (4 weights per byte, 4 bytes/sub-block)
+///   -  2 bytes `d`      : f16 main scale   (at offset 80)
+///   -  2 bytes `dmin`   : f16 min scale   (at offset 82)
+///
+/// Each sub-block of 16 weights dequantizes as `x = d * sc * q - dmin * m`,
+/// where `sc`/`m` are the low/high nibbles of `scales[sb]`.
 pub fn dequant_q2k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     const BLOCK_SIZE: usize = 256;
-    const BLOCK_BYTES: usize = 82;
+    const BLOCK_BYTES: usize = 84;
 
     if num_weights == 0 {
         return Ok(Vec::new());
@@ -769,41 +808,36 @@ pub fn dequant_q2k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
         let scales = &data[pos..pos + 16];
         let qs = &data[pos + 16..pos + 80];
         let d = f16_to_f32(data[pos + 80], data[pos + 81]);
-        let dmin = f16_to_f32(data[pos + 80], data[pos + 81]);
+        let dmin = f16_to_f32(data[pos + 82], data[pos + 83]);
 
-        let mut qs_idx = 0;
-        let mut sc_idx = 0;
-
-        for _ in 0..2 {
-            let mut block_out = [0.0f32; 128];
-            for l in 0..32 {
-                let is = l / 16;
-                let sc1 = (scales[sc_idx + is + 0] & 0x0F) as f32;
-                let m1 = (scales[sc_idx + is + 0] >> 4) as f32;
-                let sc2 = (scales[sc_idx + is + 2] & 0x0F) as f32;
-                let m2 = (scales[sc_idx + is + 2] >> 4) as f32;
-                let sc3 = (scales[sc_idx + is + 4] & 0x0F) as f32;
-                let m3 = (scales[sc_idx + is + 4] >> 4) as f32;
-                let sc4 = (scales[sc_idx + is + 6] & 0x0F) as f32;
-                let m4 = (scales[sc_idx + is + 6] >> 4) as f32;
-
-                let q1 = ((qs[qs_idx + l + 0] >> 0) & 3) as f32;
-                let q2 = ((qs[qs_idx + l + 32] >> 0) & 3) as f32;
-                let q3 = ((qs[qs_idx + l + 0] >> 2) & 3) as f32;
-                let q4 = ((qs[qs_idx + l + 32] >> 2) & 3) as f32;
-
-                block_out[l + 0] = d * sc1 * q1 - dmin * m1;
-                block_out[l + 32] = d * sc2 * q2 - dmin * m2;
-                block_out[l + 64] = d * sc3 * q3 - dmin * m3;
-                block_out[l + 96] = d * sc4 * q4 - dmin * m4;
+        // 16 sub-blocks of 16 weights. QNT-1 fix: `dmin` now reads its own
+        // 2 bytes at offset 82/83 (previously aliased to `d`'s bytes at 80/81,
+        // so every min scale was wrong). QNT-2 fix: each sub-block walks its
+        // own `scales[sb]` nibble pair via the `is` counter instead of the
+        // previous `l / 16` index, which collapsed all sub-blocks onto two
+        // scale bytes and produced garbage weights.
+        let mut block_out = [0.0f32; 256];
+        let mut is = 0usize;
+        let mut q_off = 0usize;
+        for sb in 0..16 {
+            let sc = (scales[is] & 0x0F) as f32;
+            let m = (scales[is] >> 4) as f32;
+            is += 1;
+            let dl = d * sc;
+            let ml = dmin * m;
+            for w in 0..16 {
+                let byte = qs[q_off + w / 4];
+                let shift = (w % 4) * 2;
+                let q_val = ((byte >> shift) & 3) as f32;
+                block_out[sb * 16 + w] = dl * q_val - ml;
             }
-            for &v in &block_out {
-                if out.len() < num_weights {
-                    out.push(v);
-                }
+            q_off += 4;
+        }
+
+        for &v in &block_out {
+            if out.len() < num_weights {
+                out.push(v);
             }
-            qs_idx += 64;
-            sc_idx += 8;
         }
         pos += BLOCK_BYTES;
     }
@@ -2045,32 +2079,17 @@ pub fn quant_iq2xs(data: &[f32]) -> Result<Vec<u8>> {
 }
 
 /// Quantize f32 values to IQ2_S bytes (82 bytes per 256 weights).
-pub fn quant_iq2s(data: &[f32]) -> Result<Vec<u8>> {
-    const SUPER: usize = 256;
-    let num_blocks = data.len().div_ceil(SUPER);
-    let mut out = Vec::with_capacity(num_blocks * 82);
-    for chunk in data.chunks(SUPER) {
-        let max_val = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-        let scale = if max_val > 0.0 { max_val / 1.5 } else { 1.0 };
-        let d_f16 = f32_to_f16(scale).to_le_bytes();
-        out.extend_from_slice(&d_f16);
-
-        let mut qs = vec![0u8; 48];
-        let scales = vec![0u8; 8];
-        let mut signs = vec![0u8; 24];
-        let qs_len = qs.len();
-        for (i, &val) in chunk.iter().enumerate() {
-            if val < 0.0 && i / 8 < 24 {
-                signs[i / 8] |= 1 << (i % 8);
-            }
-            let code = ((val.abs() / scale).clamp(0.0, 3.0) as u8).min(3);
-            qs[(i / 8).min(qs_len - 1)] = code;
-        }
-        out.extend_from_slice(&qs);
-        out.extend_from_slice(&scales);
-        out.extend_from_slice(&signs);
-    }
-    Ok(out)
+///
+/// QNT-5 fix: the previous encoder was degenerate — it wrote a single 2-bit
+/// code per `qs` byte (instead of packing four 2-bit codes per byte) and never
+/// populated the per-subblock `scales`, so the emitted bytes could not be
+/// decoded back to the input. The matching decoder `dequant_iq2s` is also
+/// unimplemented, so the encoder now returns `Unimplemented` rather than
+/// silently emitting corrupt quantized weights.
+pub fn quant_iq2s(_data: &[f32]) -> Result<Vec<u8>> {
+    Err(Error::Unimplemented(
+        "quant_iq2s requires a grid-vector lookup table; use Q2_K or Q4_K".into(),
+    ))
 }
 
 pub fn dequant_packed_symmetric(data: &[u8], num_weights: usize, bits: u8) -> Result<Vec<f32>> {
@@ -3010,7 +3029,7 @@ pub fn evopress_search(
                         .min_by(|a, b| {
                             let da = ((**a) as f32 - target_bpw_for_tensor).abs();
                             let db = ((**b) as f32 - target_bpw_for_tensor).abs();
-                            da.partial_cmp(&db).unwrap()
+                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
                         })
                         .unwrap_or(&4);
                     genes.push(gene);
@@ -3042,7 +3061,11 @@ pub fn evopress_search(
         let mut next_gen = Vec::with_capacity(config.population_size);
 
         // Elitism: keep top-2.
-        population.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
+        population.sort_by(|a, b| {
+            b.fitness
+                .partial_cmp(&a.fitness)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         if config.population_size >= 2 {
             next_gen.push(population[0].clone());
             next_gen.push(population[1].clone());
@@ -3093,7 +3116,11 @@ fn tournament_select<'a>(pop: &'a [Individual], k: usize, rng: &mut SimpleRng) -
             let idx = (rng.next_u64() as usize) % pop.len().max(1);
             &pop[idx]
         })
-        .max_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap())
+        .max_by(|a, b| {
+            a.fitness
+                .partial_cmp(&b.fitness)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .unwrap();
     best
 }
@@ -4801,7 +4828,11 @@ mod tests {
 
         let ql_offset = n * 64 + l + if (quarter & 1) != 0 { 32 } else { 0 };
         let ql_byte = ql[ql_offset];
-        let nibble = if (quarter & 2) != 0 { ql_byte >> 4 } else { ql_byte & 0x0F };
+        let nibble = if (quarter & 2) != 0 {
+            ql_byte >> 4
+        } else {
+            ql_byte & 0x0F
+        };
 
         let qh_byte = qh[n * 32 + l];
         let qh_bits = (qh_byte >> (2 * quarter)) & 0x03;
@@ -4859,8 +4890,7 @@ mod tests {
         }
         data[208..210].copy_from_slice(&0x3E00u16.to_le_bytes());
         let cpu = dequant_q6k(&data, 256).expect("dequant_q6k");
-        let distinct =
-            cpu.iter().filter(|v| v.abs() > 1e-6).count();
+        let distinct = cpu.iter().filter(|v| v.abs() > 1e-6).count();
         assert!(
             distinct > 200,
             "golden block dequant produced mostly-zeros ({distinct}/256); \
@@ -4952,12 +4982,12 @@ mod tests {
     /// file is absent.
     #[test]
     fn test_q4k_real_model_matches_ggml_reference() {
-        let path = std::env::var("GRIM_Q4K_MODEL").unwrap_or_else(|_| "models/MiniCPM5-1B-Q4_K_M.gguf".into());
+        let path = std::env::var("GRIM_Q4K_MODEL")
+            .unwrap_or_else(|_| "models/MiniCPM5-1B-Q4_K_M.gguf".into());
         let Ok(file) = std::fs::File::open(&path) else {
             eprintln!("skip: model not found at {path}");
             return;
         };
-        use std::io::{Read, Seek, SeekFrom};
         let mut reader = file;
         let gguf = grim_format::gguf::read_gguf(&mut reader).expect("read_gguf");
         let info = gguf
@@ -4965,8 +4995,13 @@ mod tests {
             .iter()
             .find(|t| t.name == "token_embd.weight")
             .expect("token_embd.weight present");
-        assert_eq!(info.dtype, grim_format::gguf::GgufDType::Q4K, "dtype must be Q4_K");
-        let bytes = grim_format::gguf::read_tensor_bytes(&mut reader, &gguf, info).expect("read bytes");
+        assert_eq!(
+            info.dtype,
+            grim_format::gguf::GgufDType::Q4K,
+            "dtype must be Q4_K"
+        );
+        let bytes =
+            grim_format::gguf::read_tensor_bytes(&mut reader, &gguf, info).expect("read bytes");
         let n = info.elem_count();
 
         let grim_out = dequant_q4k(&bytes, n).expect("grim dequant_q4k");
@@ -4997,7 +5032,7 @@ mod tests {
             let mut is = 0usize;
             let mut qoff = 0usize;
             for _ in 0..(QK_K / 64) {
-                let (mut s, mut m) = ggml_get_scale_min_k4(is, scales);
+                let (s, m) = ggml_get_scale_min_k4(is, scales);
                 let d1 = d * s;
                 let m1 = min * m;
                 let (s, m) = ggml_get_scale_min_k4(is + 1, scales);
@@ -5046,16 +5081,21 @@ mod tests {
 
     #[test]
     fn test_iq4nl_dequant_exact_block_size_and_codebook_values() {
-        let mut data = vec![0u8; 144];
+        // QNT-3 fix: IQ4_NL super-block is now 170 bytes — d(2) + q8 sign(32)
+        // + q4 nibbles(128) + scales(8). The old test used the broken 144-byte
+        // layout and conflated the sign byte with the first quant nibble.
+        let mut data = vec![0u8; 170];
         // d = f16 1.0 = [0x00, 0x3c]
         data[0] = 0x00;
         data[1] = 0x3c;
-        // set qs[0] = 0x00 (first nibble index 0)
-        data[2] = 0x00;
+        // q4 nibble 0 (at data[34]) = 0x00 -> codebook index 0 = -127.0
+        data[34] = 0x00;
+        // sign byte for weight 0 (q8[0] bit 0) set so the result is negative
+        data[2] = 0x01;
 
         let res = dequant_iq4nl(&data, 256).expect("dequant_iq4nl");
         assert_eq!(res.len(), 256);
-        // index 0 in KVALUES_IQ4NL is -127.0
+        // index 0 in KVALUES_IQ4NL is -127.0 (with sign bit applied)
         assert!(
             (res[0] - (-127.0)).abs() < 1e-5,
             "res[0] = {}, want -127.0",
@@ -5150,7 +5190,9 @@ mod tests {
             QuantFormat::Iq3S,
             QuantFormat::Iq2Xxs,
             QuantFormat::Iq2Xs,
-            QuantFormat::Iq2S,
+            // Iq2S is intentionally unimplemented (QNT-5): its encoder was
+            // degenerate and its decoder returns Unimplemented, so it cannot
+            // round-trip. Excluded from this list on purpose.
         ];
         for fmt in formats {
             let plan = TensorRewritePlan {

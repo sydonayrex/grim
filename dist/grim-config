@@ -18,8 +18,12 @@ if [ -x "$INSTALL_SH" ]; then
 else
     # Minimal fallback if the install script is absent.
     echo "=== Grim Runtime Configuration ==="
-    echo "  bind    = ${GRIM_HOST:-127.0.0.1}:${GRIM_PORT:-11434}"
-    echo "  backend = ${GRIM_BACKEND:-auto}"
-    echo "  gpus    = ${GRIM_GPUS:-(none)}"
-    echo "  context = ${GRIM_CONTEXT:-8192}"
+    echo "  bind     = ${GRIM_HOST:-127.0.0.1}:${GRIM_PORT:-11434}"
+    echo "  backend  = ${GRIM_BACKEND:-auto}"
+    echo "  gpus     = ${GRIM_GPUS:-(none)}"
+    echo "  parallel = ${GRIM_PARALLEL:-No}"
+    echo "  tp_size  = ${GRIM_TP_SIZE:-0}"
+    echo "  context  = ${GRIM_CONTEXT:-8192}"
+    echo "  models   = ${GRIM_MODELS_DIR:-/var/lib/grim/models}"
+    echo "  plugins  = ${GRIM_PLUGINS_DIR:-/var/lib/grim/plugins}"
 fi

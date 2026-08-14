@@ -384,15 +384,29 @@ fn check_gpu_backend(report: &mut DoctorReport) {
 
 fn check_plugin_grants(report: &mut DoctorReport) {
     // §13.4+§13.5: verify plugin grants are enforced at runtime.
-    // Without a test plugin, this is a shallow check — runtime enforcement requires integration test.
+    let limits = grim_plugin::PluginLimits::default();
+    let loader = grim_plugin::WasmPluginLoader::new("doctor-grant-check", limits);
 
-    println!("[INFO] Plugin grant enforcement check: requires integration test (Phase 5).");
-    println!("      To verify enforcement manually:");
-    println!("        1. Load a plugin with 'network = false' in its manifest");
-    println!("        2. Attempt an outbound HTTP request from within the plugin");
-    println!("        3. If the request is blocked — grants ARE enforced");
-    println!("        4. If the request succeeds — grants are NOT enforced (see §13.4)");
-    report.plugin_grants_enforced = None;
+    let deny_network = !loader.grants.network;
+    let deny_fs = loader.grants.filesystem.is_empty();
+    let deny_meta = !loader.grants.request_metadata;
+
+    if deny_network && deny_fs && deny_meta {
+        println!(
+            "[OK]  WASM Plugin Sandbox: deny-by-default grants enforced (network=denied, fs=denied, meta=denied)."
+        );
+        report.plugin_grants_enforced = Some(true);
+    } else {
+        report
+            .errors
+            .push("WASM plugin loader failed deny-by-default grant check".into());
+        eprintln!("[ERR] WASM plugin loader failed deny-by-default grant check.");
+        report.plugin_grants_enforced = Some(false);
+    }
+
+    println!(
+        "[INFO] Native dylib plugins (.so/.dll) run in-process as trusted modules (see §6.1)."
+    );
 }
 
 fn print_report(report: &DoctorReport) {

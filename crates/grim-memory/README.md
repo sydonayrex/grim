@@ -1,107 +1,77 @@
 # grim-memory
 
-Paged KV cache with logical block tables, prefix sharing, multi-tier spilling, and block-pool ref-counting.
-
 ## Purpose
-
-Manages GPU memory for attention key/value caches. Provides `PagedKvCache` (the `KvCache` trait implementation used by `grim-engine` sessions), `KvBlockPool` (shared physical block pool with ref-counting), `BlockTable` (logical-to-physical mapping), and integration with `grim-kvtransport` for multi-tier spilling (GPU → host RAM → NVMe) and `grim-kvquant` for KV compression.
+The `grim-memory` crate handles the lifecycle, allocation, and multi-tier spilling of Key-Value (KV) cache memory. It implements the `KvCache` trait from `grim-core`, providing a `PagedKvCache` that supports logical block tables, prefix sharing, and integration with `grim-kvtransport` for demoting unused blocks to Host RAM or NVMe storage.
 
 ## Boundaries
-
-- Does **not** perform tensor computation — only memory management.
-- Does **not** define the `KvCache` trait — that is in `grim-core`.
-- Does **not** handle model loading — see `grim-format`.
+This crate concerns itself solely with *memory management* of the KV state. It tracks logical-to-physical block mappings, refcounts, and offload orchestration. It does *not* perform attention computation, tensor algebra, or network layer RPCs (though it invokes transport interfaces for spilling). 
 
 ## Dependency Graph
-
 ```mermaid
-graph LR
-    A[grim-memory] --> B[grim-tensor]
-    A --> C[grim-core]
-    A --> D[grim-kvquant]
-    A --> E[grim-kvtransport]
+graph TD
+    %% Focal Node
+    grim-memory(("grim-memory"))
 
-    subgraph "reverse deps"
-        F1[grim-engine]
-        F2[grim-models-mamba]
-    end
+    %% Workspace Dependencies
+    grim-memory --> grim-tensor
+    grim-memory --> grim-core
+    grim-memory --> grim-kvtransport
+    grim-memory --> grim-kvquant
+    grim-memory --> grim-backend-cpu
+    grim-memory --> thiserror
 
-    F1 --> A
-    F2 --> A
-
-    style A fill:#fce4ec
+    %% Reverse Workspace Dependents
+    grim-engine --> grim-memory
 ```
 
-## Public API
-
-```rust
-pub const BLOCK_SIZE: usize = 16;
-pub type BlockId = usize;
-
-pub struct DemotionRecord {
-    pub block_id: BlockId,
-    pub from_tier: grim_kvtransport::CacheTier,
-    pub to_tier: grim_kvtransport::CacheTier,
-    pub bytes_freed: usize,
-    pub bytes_consumed: usize,
-}
-
-pub struct KvBlockPool {
-    blocks: Vec<KvBlock>,
-    free_list: VecDeque<BlockId>,
-    ref_counts: HashMap<BlockId, u32>,
-    prefix_cache: HashMap<u64, BlockId>,
-}
-
-impl KvBlockPool {
-    pub fn new(num_blocks: usize, block_size: usize, ...) -> Self;
-    pub fn allocate(&mut self) -> Option<BlockId>;
-    pub fn free(&mut self, id: BlockId);
-    pub fn free_with_tier(&mut self, id: BlockId, force_tier: bool) -> Result<()>;
-    pub fn ref_block(&mut self, id: BlockId);
-    pub fn deref_block(&mut self, id: BlockId);
-    pub fn find_or_share_prefix(&mut self, hash: u64) -> Option<BlockId>;
-}
-
-pub struct BlockTable {
-    pub logical_to_physical: Vec<BlockId>,
-}
-
-impl BlockTable {
-    pub fn new() -> Self;
-    pub fn physical_len(&self) -> usize;
-    pub fn allocate(&mut self, pool: &mut KvBlockPool) -> Result<BlockId>;
-}
-
-pub struct PagedKvCache { /* fields */ }
-
-impl PagedKvCache {
-    pub fn new(num_heads: usize, head_dim: usize,
-               block_pool: Arc<Mutex<KvBlockPool>>) -> Self;
-    pub fn rollback_to(&mut self, len: usize) -> Result<()>;
-}
-
-pub type KvTransportId = grim_kvtransport::TransportBlockId;
-```
+## Public API Overview
+- **`PagedKvCache`**: The primary implementation of `grim_core::kv_cache::KvCache`, managing tentative (speculative) and committed tokens.
+- **`KvBlockPool`**: A pre-allocated shared pool of physical blocks. Handles refcounting, prefix cache hashes, block allocation, and SSM state pools.
+- **`BlockTable`**: Maps a sequence's logical blocks to the physical block IDs in the pool.
+- **Tier Spilling Hooks**: `attach_spill` and `attach_compressor` on the `KvBlockPool` to wire in compression and NVMe/RAM demotion.
+- **`moe_budget::*`**: Budget tracking for MoE resident-set HBM constraints (`MoeResidentBudget`).
 
 ## Usage Example
-
 ```rust
-use grim_memory::{KvBlockPool, PagedKvCache, BLOCK_SIZE};
+use grim_memory::{KvBlockPool, PagedKvCache};
+use grim_core::kv_cache::KvCache;
 use std::sync::{Arc, Mutex};
 
-let pool = Arc::new(Mutex::new(
-    KvBlockPool::new(256, BLOCK_SIZE, num_heads, head_dim)));
-let cache = PagedKvCache::new(num_heads, head_dim, pool.clone());
+fn setup_cache() {
+    let num_heads = 32;
+    let head_dim = 128;
+    let capacity_blocks = 1024;
+    
+    // Create physical pool
+    let pool = Arc::new(Mutex::new(KvBlockPool::new(
+        capacity_blocks,
+        num_heads,
+        head_dim
+    )));
+    
+    // Create a logical sequence cache
+    let mut seq_cache = PagedKvCache::new(pool.clone(), num_heads, head_dim);
+    
+    // Append a slot and commit tokens
+    seq_cache.append_slot().unwrap();
+    seq_cache.commit(1).unwrap();
+    
+    println!("Sequence length: {}", seq_cache.len());
+}
 ```
 
-## Feature Flags
-
-This crate has no feature flags.
+## Use Cases
+- Allocating continuous token context during LLM text generation.
+- Speculative decoding workflows where tokens are tentatively appended and then rolled back (`rollback_to`) if speculation fails.
+- Reusing context windows across requests via prefix caching (sharing physical blocks for matching prompt hashes).
+- Evicting old KV blocks to NVMe when GPU HBM fills up during heavy server load.
 
 ## Edge Cases, Limitations, and Quirks
+- **Block Granularity Truncation**: When rolling back or truncating block tables, the `truncate` logic operates strictly on *block counts*, not token counts. Tentative/speculative tokens must be managed carefully so partial blocks are aligned correctly.
+- **Zero Content Optimization**: Blocks in the pool track a `received` boolean. An all-zero block might genuinely be received data rather than an uninitialized state, bypassing fragile content-sniffing heuristics.
 
-- `BLOCK_SIZE` is 16 tokens — KV blocks are allocated in fixed 16-token chunks.
-- Ref-counting: `free_with_tier` decrements the refcount and only removes the block from the pool when it reaches zero — blocks shared via prefix cache stay alive while referenced.
-- `rollback_to(0)` frees all physical blocks for the requesting session, but shared blocks (other active requests via prefix cache) are preserved by ref-counting.
-- Multi-tier spilling: when VRAM pressure is high, refcount-zero blocks are demoted to host RAM, then to NVMe, before the GPU copy is released.
+## Build Flags, Feature Flags, and Environment Variables
+- **Features**: 
+  - `default = []`
+  - `rocm-aiter`: Alters internal configuration to use a block-major layout, optimizing LDS accesses on ROCm hardware.
+- **Dev-Dependencies**: Uses `tempfile` for testing NVMe spill behaviors.

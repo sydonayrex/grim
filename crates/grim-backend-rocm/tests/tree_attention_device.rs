@@ -29,7 +29,7 @@
 //!   is `tests/tree_attention.rs` (gated by `GRIM_RUN_GPU_TESTS`).
 
 use grim_backend_rocm::RocmDevice;
-use grim_tensor::{BackendDevice, DType, Shape};
+use grim_tensor::{DType, Shape};
 
 /// RED: `RocmDevice::tree_attention` must exist at crate root with
 /// the documented signature.
@@ -41,7 +41,7 @@ use grim_tensor::{BackendDevice, DType, Shape};
 /// fail to compile. Pin the API, not just a behavior test.
 #[test]
 fn roc_device_exposes_tree_attention_method() {
-    let _compiles = |dev: &RocmDevice| {
+    let _compiles = |_dev: &RocmDevice| {
         // The wrapper takes (q, k, v, tree_parents, num_kv_heads,
         // kv_seq_len, cache_offset, out_shape). `num_heads` is NOT a
         // parameter -- it's derived from `out_shape.dims()[2]`, the

@@ -1184,7 +1184,9 @@ async fn load_model_handler(
     if req.model_path.contains("..") {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "Invalid model path: path traversal components ('..') are prohibited" })),
+            Json(
+                json!({ "error": "Invalid model path: path traversal components ('..') are prohibited" }),
+            ),
         ));
     }
 
@@ -1239,6 +1241,13 @@ async fn chat_handler(
             Json(json!({ "error": "Prompt cannot be empty" })),
         ));
     }
+
+    // GAR-1 fix: `model_id` is later used directly as a filesystem path by
+    // `load_tokenizer_from_path` / `model_loader::load_from_path`. Reject any
+    // traversal / separator characters up front so a caller cannot escape the
+    // model directory (e.g. `../../etc/passwd`). Other routes already call this
+    // helper; the chat handler was the one gap.
+    prevent_path_traversal(&req.model_id)?;
 
     let model_name = std::path::Path::new(&req.model_id)
         .file_name()

@@ -1,4 +1,6 @@
-//! Mamba selective scan HIP kernel — Wave64 (256-thread block), LDS tiling, persistent for decode-step.
+//! Mamba selective scan HIP kernel — Block size 256 threads, LDS tiling, persistent for decode-step.
+//! On RDNA2 (gfx1036/gfx1030, Wave32): 256 threads = 8 Wave32 wavefronts.
+//! On CDNA (gfx9xx, Wave64): 256 threads = 4 Wave64 wavefronts.
 
 /// HIP source for `grim_selective_scan` and `grim_selective_scan_backward`.
 pub const KERNEL_SOURCE: &str = r#"

@@ -1,125 +1,75 @@
 # grim-format
 
-Model checkpoint parsers, tokenizers, metadata headers, and format converters (GGUF, `.grim` native, safetensors). Implements `TensorProvider` so weights can be loaded through the standard pipeline.
-
 ## Purpose
-
-Handles model checkpoint I/O: reading GGUF files, safetensors, and native `.grim` format; writing Grim's native `.grim` artifacts (including training sidecars `.grim.train`); and providing `GgufTokenizer` for text encoding plus `ChatMessage`/`ToolDef`/`ToolChoice` types for tool-calling support.
+The `grim-format` crate provides model checkpoint parsers, tokenizers, metadata headers, and format converters for `.gguf`, `.safetensors`, and the native `.grim` format. It acts as the serialization and deserialization bridge for the Grim ecosystem, implementing `TensorProvider` so that the `WeightSource` can load physical tensors from disk into memory. It also handles chat templates via Jinja and manages training-state sidecar files (`.grim.train`).
 
 ## Boundaries
-
-- Does **not** perform tensor computation — only I/O and parsing.
-- Does **not** quantize weights at load time — dequant kernels live in `grim-backend-*` and `grim-quant`.
-- Does **not** handle HTTP serving or model serving lifecycle — see `grim-server`.
+This crate strictly manages file I/O, parsing, layout metadata, and tokenization. It does *not* handle tensor math, inference graphs, or execution scheduling. It relies on `grim-tensor` for the foundational tensor types and `grim-quant` for reading quantized block structures, but it leaves dequantization execution to backend implementations where possible (unless pre-processing).
 
 ## Dependency Graph
-
 ```mermaid
-graph LR
-    A[grim-format] --> B[grim-tensor]
-    A --> C[grim-quant]
-    A --> D[grim-backend-cpu]
+graph TD
+    %% Focal Node
+    grim-format(("grim-format"))
 
-    subgraph "reverse deps"
-        E1[grim-backend-rocm]
-        E2[grim-backend-metal]
-        E3[grim-autograd]
-        E4[grim-cli]
-        E5[grim-engine]
-        E6[grim-garage]
-        E7[grim-server]
-        E8[grim-tensor-graph]
-    end
+    %% Workspace Dependencies
+    grim-format --> grim-tensor
+    grim-format --> grim-quant
+    grim-format --> thiserror
+    grim-format --> serde
 
-    E1 --> A
-    E2 --> A
-    E3 --> A
-    E4 --> A
-    E5 --> A
-    E6 --> A
-    E7 --> A
-    E8 --> A
+    %% Reverse Workspace Dependents (Conceptual/Typical)
+    grim-engine --> grim-format
+    grim-cli --> grim-format
 
-    style A fill:#fff3e0
+    %% External Dependencies
+    grim-format -.-> serde_json
+    grim-format -.-> half
+    grim-format -.-> zstd
+    grim-format -.-> rayon
+    grim-format -.-> minijinja
 ```
 
-## Public API
-
-### TensorProvider Implementations
-
-```rust
-pub struct GgufProvider { /* file reader, tensor index */ }
-impl GgufProvider {
-    pub fn open(path: &str) -> Result<Self>;
-    pub fn metadata(&self, key: &str) -> Option<&GgufValue>;
-    pub fn architecture(&self) -> Option<&str>;
-    pub fn grim_metadata(&self) -> &GrimMetadata;
-    pub fn tokenizer(&self) -> Result<GgufTokenizer>;
-    pub fn tensors(&self) -> &HashMap<String, GgufTensorInfo>;
-}
-impl TensorProvider for GgufProvider { ... }
-
-pub struct GrimProvider { /* native .grim reader */ }
-impl GrimProvider {
-    pub fn open(path: &str) -> Result<Self>;
-    pub fn grim_metadata(&self) -> &GrimMetadata;
-}
-impl TensorProvider for GrimProvider { ... }
-```
-
-### Tokenizer and Chat Types
-
-```rust
-pub struct GgufTokenizer { /* fields */ }
-pub struct ChatMessage { /* fields: role, content, ... */ }
-pub struct ToolDef { /* fields */ }
-pub struct FunctionDef { /* fields */ }
-pub enum ToolChoice { Auto, None, Required }
-pub struct FunctionName(pub String);
-pub struct ToolCallMsg { /* fields */ }
-
-pub fn render_chat_template(tokenizer: &GgufTokenizer, messages: &[ChatMessage],
-    tools: Option<&[ToolDef]>, tool_choice: Option<&ToolChoice>) -> String;
-pub fn render_messages_or_last(tokenizer: &GgufTokenizer, messages: &[ChatMessage]) -> String;
-pub fn render_messages_or_last_with_tools(tokenizer: &GgufTokenizer, messages: &[ChatMessage],
-    tools: Option<&[ToolDef]>, tool_choice: Option<&ToolChoice>) -> String;
-```
-
-### Conversion and Metadata
-
-```rust
-pub fn convert_gguf_to_grim(gguf_path: &str, out_path: &str, ...) -> Result<()>;
-pub fn convert_to_grim(provider: &dyn TensorProvider, out_path: &str, ...) -> Result<()>;
-
-pub struct GrimHeader { /* magic, version, tensor count */ }
-pub struct GrimTensorEntry { /* name, dtype, shape, offset */ }
-
-pub const FUCKING_SORCERY: [u8; 5] = [0x47, 0x52, 0x49, 0x4d, 0x01]; // "GRIM\x01" magic
-```
-
-### GGUF and Train Types
-
-```rust
-pub use gguf::{GgufFile, GgufValue, GgufDType, GrimMetadata, GrimFusionOp, GrimRocmlProfile, ...};
-pub use train::{TrainState, TrainFpFormat};
-```
+## Public API Overview
+- **`GgufProvider` & `GrimProvider`**: Implementations of `TensorProvider` for loading models.
+- **`GgufTokenizer`**: Chat template rendering (via `minijinja`) and token encoding/decoding.
+- **`gguf::*`**: Structs and enums for parsing GGUF magic, versions, metadata, and dtypes (`GgufFile`, `GrimMetadata`, `GGUF_MAGIC`).
+- **`format::*` & `spec::*`**: Internal `.grim` format headers (`GrimHeader`, `GrimTensorEntry`, `GrimTensorExt`) and packing utilities.
+- **`convert::*`**: Conversion utilities (`convert_gguf_to_grim`, `convert_to_grim_with_dequant`) mapping foreign formats to native layouts.
+- **`train::*`**: Types for training state persistence (`TrainState`, `TrainFpFormat`).
+- **`onnx::OnnxProvider`**: Provider for loading ONNX models.
 
 ## Usage Example
-
 ```rust
-use grim_format::GgufProvider;
+use grim_format::{GgufProvider, GgufTokenizer};
+use std::path::Path;
 
-let provider = GgufProvider::open("model.gguf")?;
-let tokenizer = provider.tokenizer()?;
-let text = provider.architecture().unwrap_or("unknown");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let model_path = Path::new("model.gguf");
+    
+    // Load metadata and tensor headers
+    let provider = GgufProvider::open(model_path)?;
+    println!("Loaded model with {} tensors", provider.tensor_count());
+    
+    // Initialize tokenizer from the GGUF file
+    let tokenizer = GgufTokenizer::from_gguf(&provider)?;
+    let template = tokenizer.chat_template().unwrap_or_default();
+    println!("Model chat template: {}", template);
+    
+    Ok(())
+}
 ```
 
-## Feature Flags
-
-This crate has no feature flags.
+## Use Cases
+- Loading a downloaded `.gguf` or `.safetensors` model checkpoint.
+- Converting models from Hugging Face formats to the native `.grim` binary layout.
+- Rendering conversational chat templates for a specific model before inference.
+- Saving/loading adapter weights and optimizer momentum buffers during fine-tuning.
 
 ## Edge Cases, Limitations, and Quirks
+- **Template Rendering**: The Jinja templating engine (`minijinja`) requires standard template strings. Highly customized Python-specific template quirks might need sanitization (`sanitize_jinja_template`).
+- **Layout Hints**: During conversion, specific hardware layout hints (like `WavefrontTiled`) may be injected for ROCm/CUDA efficiency, meaning a `.grim` file converted for one hardware type might be suboptimal or fail to load on another if strict layouts are enforced.
 
-- The GGUF magic bytes constant is named `FUCKING_SORCERY` in source (see `src/format.rs`) — used for the native `.grim` file header magic.
-- `GgufTokenizer::render_chat_template` accepts an optional `tools`/`tool_choice` and emits a warning when tools are supplied but the chat template does not reference `tools` — the model still receives the prompt, but no tool-call structure is injected.
-- `render_messages_or_last` falls back to the last message's content when no Jinja template is embedded in the GGUF metadata.
+## Build Flags, Feature Flags, and Environment Variables
+- **Features**: Currently uses a `default = []` feature set.
+- **Dev-Dependencies**: Pulls in `tempfile` and `grim-backend-cpu` for running format conversion and integrity tests locally.
