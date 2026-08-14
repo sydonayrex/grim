@@ -14,15 +14,13 @@ use grim_models_mamba::{
     GraniteHybridConfig, JambaConfig, Mamba, Mamba2Config, MambaConfig, NemotronHConfig, Rwkv,
     Rwkv6Config, Rwkv7Config, RwkvConfig,
 };
- use grim_models_transformer::{
-     Arcee, ArceeConfig, Bloom, BloomConfig, Chameleon, ChameleonConfig, Codeshell, CodeshellConfig,
-     CommandR, CommandRConfig, DeepSeek, DeepSeekConfig, DeltaNetBase, DeltaNetBaseConfig,
-     Falcon, FalconConfig, FalconH1Config, FalconH1Model, Gemma, GemmaConfig, Gpt2, Gpt2Config,
-     Lfm2, Lfm2Config, Laguna, LagunaConfig, Llama, LlamaConfig, MiniCpmConfig, MiniCpmModel,
-     SmolLm2, SmolLm2Config, Qwen3Moe, Qwen3MoeConfig, Qwen35Moe, Qwen35MoeConfig,
-     MiniMaxM2, MiniMaxM2Config, Orion, OrionConfig, Phi2, PhiConfig, Qwen, QwenConfig,
-     SeedOss, SeedOssConfig, SolarOpen2, SolarOpen2Config, T5, T5Config, WavTokenizerDec, WavTokenizerDecConfig,
- };
+use grim_models_transformer::{
+    Bloom, BloomConfig, ChameleonConfig, CommandRConfig, DeepSeek, DeepSeekConfig, DeltaNetBase, DeltaNetBaseConfig, Falcon,
+    FalconConfig, FalconH1Config, FalconH1Model, Gemma, GemmaConfig, Gpt2, Gpt2Config, Laguna,
+    LagunaConfig, Lfm2, Lfm2Config, Llama, LlamaConfig, MiniCpmConfig, MiniCpmModel,
+    Phi2, PhiConfig, Qwen, Qwen3Moe, Qwen3MoeConfig, Qwen35Moe, Qwen35MoeConfig, QwenConfig,
+    SmolLm2, SmolLm2Config, SolarOpen2, SolarOpen2Config, T5, T5Config,
+};
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::{TensorParallelConfig, WeightSource};
 use grim_plugin::ArchCompatSpec;
@@ -403,8 +401,14 @@ fn parse_full_yarn(rope_parameters: &Option<serde_json::Value>) -> Option<YaRNPa
             .get("original_max_position_embeddings")
             .and_then(|v| v.as_u64())
             .unwrap_or(8192) as usize,
-        beta_fast: full.get("beta_fast").and_then(|v| v.as_f64()).unwrap_or(32.0) as f32,
-        beta_slow: full.get("beta_slow").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+        beta_fast: full
+            .get("beta_fast")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(32.0) as f32,
+        beta_slow: full
+            .get("beta_slow")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0) as f32,
         attention_factor: full
             .get("attention_factor")
             .and_then(|v| v.as_f64())
@@ -430,14 +434,8 @@ pub fn parse_yarn_scaling(rope_scaling: &Option<serde_json::Value>) -> Option<Ya
             .get("original_max_position_embeddings")
             .and_then(|v| v.as_u64())
             .unwrap_or(8192) as usize,
-        beta_fast: rs
-            .get("beta_fast")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(32.0) as f32,
-        beta_slow: rs
-            .get("beta_slow")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1.0) as f32,
+        beta_fast: rs.get("beta_fast").and_then(|v| v.as_f64()).unwrap_or(32.0) as f32,
+        beta_slow: rs.get("beta_slow").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
         attention_factor: rs
             .get("attention_factor")
             .or_else(|| rs.get("attn_factor"))
@@ -452,7 +450,9 @@ pub fn parse_yarn_scaling(rope_scaling: &Option<serde_json::Value>) -> Option<Ya
 /// `rope_parameters` JSON block under a key like `laguna.rope_parameters`. When
 /// present, parse and return the YaRN params; otherwise `None` (plain RoPE).
 pub fn parse_full_yarn_gguf(lookup: &dyn MetadataLookup) -> Option<YaRNParams> {
-    let json_str = lookup.get_str("rope_parameters").or_else(|| lookup.get_str("laguna.rope_parameters"))?;
+    let json_str = lookup
+        .get_str("rope_parameters")
+        .or_else(|| lookup.get_str("laguna.rope_parameters"))?;
     let value: serde_json::Value = serde_json::from_str(&json_str).ok()?;
     parse_full_yarn(&Some(value))
 }
@@ -474,7 +474,9 @@ pub fn parse_yarn_scaling_gguf(lookup: &dyn MetadataLookup) -> Option<YaRNParams
         }
     }
     // Then build a Value from the individual dotted keys.
-    let rope_type = lookup.get_str("rope_scaling.rope_type").or_else(|| lookup.get_str("rope_scaling.rope_type"))?;
+    let rope_type = lookup
+        .get_str("rope_scaling.rope_type")
+        .or_else(|| lookup.get_str("rope_scaling.rope_type"))?;
     if rope_type != "yarn" {
         return None;
     }
@@ -512,12 +514,12 @@ pub fn parse_yarn_scaling_gguf(lookup: &dyn MetadataLookup) -> Option<YaRNParams
 pub fn extract_laguna_gguf_hybrid(
     lookup: &dyn MetadataLookup,
 ) -> (
-    f32,        // full_rope_theta
-    f32,        // sliding_rope_theta
-    f32,        // full_partial_rotary_factor
-    f32,        // sliding_partial_rotary_factor
-    usize,      // sliding_window
-    Option<YaRNParams>,  // full_yarn
+    f32,                // full_rope_theta
+    f32,                // sliding_rope_theta
+    f32,                // full_partial_rotary_factor
+    f32,                // sliding_partial_rotary_factor
+    usize,              // sliding_window
+    Option<YaRNParams>, // full_yarn
 ) {
     let full_rope_theta = lookup
         .get_f32("rope_parameters.full_attention.rope_theta")
@@ -542,9 +544,15 @@ pub fn extract_laguna_gguf_hybrid(
         .map(|v| v as usize)
         .unwrap_or(512);
     let full_yarn = parse_full_yarn_gguf(lookup);
-    (full_rope_theta, sliding_rope_theta, full_partial_rotary_factor, sliding_partial_rotary_factor, sliding_window, full_yarn)
+    (
+        full_rope_theta,
+        sliding_rope_theta,
+        full_partial_rotary_factor,
+        sliding_partial_rotary_factor,
+        sliding_window,
+        full_yarn,
+    )
 }
-
 
 fn load_model_from_config(
     config: SafetensorsConfig,
@@ -608,6 +616,7 @@ fn load_model_from_config(
         .as_ref()
         .and_then(|s| s.expert_count)
         .or(config.num_local_experts)
+        .or(config.num_experts)
         .unwrap_or(8);
     let expert_used_count = compat_spec
         .as_ref()
@@ -627,7 +636,6 @@ fn load_model_from_config(
     let moe_intermediate_size = config.moe_intermediate_size.unwrap_or(1024);
     let shared_expert_intermediate_size = config.shared_expert_intermediate_size.unwrap_or(1024);
     let mlp_only_layers = config.mlp_only_layers.unwrap_or_else(|| vec![0]);
-
 
     dbg_eprintln!(
         "[grim] Loading config from safetensors: architecture={:?}, layers={}, hidden={}, vocab={}",
@@ -727,7 +735,9 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
                 mlp_only_layers,
-                layer_types: config.layer_types.unwrap_or_else(|| vec!["full_attention".into()]),
+                layer_types: config
+                    .layer_types
+                    .unwrap_or_else(|| vec!["full_attention".into()]),
                 sliding_window: config.sliding_window.unwrap_or(512),
                 num_attention_heads_per_layer: config
                     .num_attention_heads_per_layer
@@ -744,7 +754,6 @@ fn load_model_from_config(
             let m = Laguna::load_tp(device.clone(), &ws, laguna_cfg, tp)?;
             Ok(Box::new(m))
         }
-
 
         ModelArchitecture::Phi2 | ModelArchitecture::Phi3 | ModelArchitecture::PhiMoe => {
             let phi_cfg = PhiConfig {
@@ -824,7 +833,6 @@ fn load_model_from_config(
         | ModelArchitecture::Glm4Moe
         | ModelArchitecture::GroveMoe
         | ModelArchitecture::OpenAiMoe
-        | ModelArchitecture::PhiMoe
         | ModelArchitecture::Qwen3VlMoe => {
             let qwen_moe_cfg = Qwen3MoeConfig {
                 vocab_size,
@@ -1241,7 +1249,10 @@ fn load_model_from_config(
                 rope_theta,
                 max_seq_len,
             };
-            eprintln!("[grim] Loading CommandR model with config: {:?}", commandr_cfg);
+            eprintln!(
+                "[grim] Loading CommandR model with config: {:?}",
+                commandr_cfg
+            );
             let llama_cfg = LlamaConfig {
                 vocab_size,
                 hidden_size,
@@ -1253,10 +1264,10 @@ fn load_model_from_config(
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
-            
-            partial_rotary_factor: 1.0,
-            yarn: None,
-        };
+
+                partial_rotary_factor: 1.0,
+                yarn: None,
+            };
             let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -1274,7 +1285,10 @@ fn load_model_from_config(
                 max_seq_len,
                 swin_norm: false,
             };
-            eprintln!("[grim] Loading Chameleon model with config: {:?}", chameleon_cfg);
+            eprintln!(
+                "[grim] Loading Chameleon model with config: {:?}",
+                chameleon_cfg
+            );
             let llama_cfg = LlamaConfig {
                 vocab_size,
                 hidden_size,
@@ -1286,10 +1300,10 @@ fn load_model_from_config(
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
-            
-            partial_rotary_factor: 1.0,
-            yarn: None,
-        };
+
+                partial_rotary_factor: 1.0,
+                yarn: None,
+            };
             let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -1318,7 +1332,9 @@ fn load_model_from_config(
             Ok(Box::new(m))
         }
         ModelArchitecture::MuseGlimmer => {
-            let muse_cfg = if let Some(raw_json) = raw_config_str.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()) {
+            let muse_cfg = if let Some(raw_json) =
+                raw_config_str.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            {
                 grim_models_transformer::MuseGlimmerConfig::from_hf(&raw_json)
             } else {
                 grim_models_transformer::MuseGlimmerConfig {
@@ -1341,11 +1357,14 @@ fn load_model_from_config(
                     vision: None,
                 }
             };
-            let m = grim_models_transformer::MuseGlimmer::load_tp(device.clone(), &ws, muse_cfg, tp)?;
+            let m =
+                grim_models_transformer::MuseGlimmer::load_tp(device.clone(), &ws, muse_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::SolarOpen2 => {
-            let solar_cfg = if let Some(raw_json) = raw_config_str.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()) {
+            let solar_cfg = if let Some(raw_json) =
+                raw_config_str.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            {
                 SolarOpen2Config::from_hf(&raw_json)
             } else {
                 SolarOpen2Config {
@@ -1365,7 +1384,6 @@ fn load_model_from_config(
             Ok(Box::new(m))
         }
 
-
         ModelArchitecture::Arcee
         | ModelArchitecture::Apertus
         | ModelArchitecture::Arctic
@@ -1375,13 +1393,9 @@ fn load_model_from_config(
         | ModelArchitecture::Codeshell
         | ModelArchitecture::CogVlm
         | ModelArchitecture::Cohere2
-        | ModelArchitecture::CommandR
         | ModelArchitecture::Dbrx
         | ModelArchitecture::Deci
-        | ModelArchitecture::DeepSeek2
         | ModelArchitecture::DeepSeek2Ocr
-        | ModelArchitecture::DeepSeek32
-        | ModelArchitecture::DeepSeek4
         | ModelArchitecture::DFlash
         | ModelArchitecture::Dots1
         | ModelArchitecture::Dream
@@ -1434,7 +1448,6 @@ fn load_model_from_config(
         | ModelArchitecture::Rnd1
         | ModelArchitecture::SeedOss
         | ModelArchitecture::SmallThinker
-        | ModelArchitecture::SmolLm2
         | ModelArchitecture::SmolLm3
         | ModelArchitecture::StableLm
         | ModelArchitecture::Starcoder
@@ -1443,7 +1456,6 @@ fn load_model_from_config(
         | ModelArchitecture::Talkie
         | ModelArchitecture::WavTokenizerDec
         | ModelArchitecture::Xverse => {
-
             let llama_cfg = LlamaConfig {
                 vocab_size,
                 hidden_size,
@@ -1455,11 +1467,14 @@ fn load_model_from_config(
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
-            
-            partial_rotary_factor: 1.0,
-            yarn: None,
-        };
-            eprintln!("[grim] Loading Llama-family model ({:?}) with config: {:?}", model_arch, llama_cfg);
+
+                partial_rotary_factor: 1.0,
+                yarn: None,
+            };
+            eprintln!(
+                "[grim] Loading Llama-family model ({:?}) with config: {:?}",
+                model_arch, llama_cfg
+            );
             let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -1519,10 +1534,10 @@ fn load_model_from_config(
                         rms_norm_eps: spec.rms_norm_eps,
                         rope_theta: spec.rope_theta,
                         max_seq_len: spec.max_seq_len,
-                    
+
                         partial_rotary_factor: 1.0,
                         yarn: None,
-        };
+                    };
                     let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
                     return Ok(Box::new(m));
                 }
@@ -1543,10 +1558,10 @@ fn load_model_from_config(
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
-            
-            partial_rotary_factor: 1.0,
-            yarn: None,
-        };
+
+                partial_rotary_factor: 1.0,
+                yarn: None,
+            };
             let m = Llama::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -1588,7 +1603,9 @@ fn load_model_with_providers(
         if (name_lower.contains("minicpm") || path_lower.contains("minicpm"))
             && has_minicpm_metadata
         {
-            eprintln!("[grim] Detected MiniCPM model variant from metadata/path, promoting architecture to MiniCpm");
+            eprintln!(
+                "[grim] Detected MiniCPM model variant from metadata/path, promoting architecture to MiniCpm"
+            );
             model_arch = ModelArchitecture::MiniCpm;
         }
         // SmolLM2 is exported by llama.cpp under `general.architecture = "llama"`
@@ -1600,7 +1617,9 @@ fn load_model_with_providers(
             && weight_provider_has_tensor(weight_provider, "output_norm.weight")
             && !weight_provider_has_tensor(weight_provider, "output.weight");
         if has_output_norm {
-            eprintln!("[grim] Detected SmolLM2 tensor signature (output_norm present, no output.weight); promoting architecture to SmolLm2");
+            eprintln!(
+                "[grim] Detected SmolLM2 tensor signature (output_norm present, no output.weight); promoting architecture to SmolLm2"
+            );
             model_arch = ModelArchitecture::SmolLm2;
         }
     }
@@ -1672,8 +1691,14 @@ fn load_model_with_providers(
             // block are read from GGUF metadata when present (llama.cpp-converted
             // checkpoints may store `rope_parameters` as a JSON string), with the
             // published S-2.1 values as defaults otherwise.
-            let (full_rope_theta, sliding_rope_theta, full_partial_rotary_factor, sliding_partial_rotary_factor, sliding_window, full_yarn) =
-                extract_laguna_gguf_hybrid(&lookup);
+            let (
+                full_rope_theta,
+                sliding_rope_theta,
+                full_partial_rotary_factor,
+                sliding_partial_rotary_factor,
+                sliding_window,
+                full_yarn,
+            ) = extract_laguna_gguf_hybrid(&lookup);
 
             let laguna_cfg = LagunaConfig {
                 vocab_size: hparams.vocab_size,
@@ -1706,7 +1731,6 @@ fn load_model_with_providers(
             let m = Laguna::load_tp(device.clone(), &ws, laguna_cfg, tp)?;
             Ok(Box::new(m))
         }
-
 
         ModelArchitecture::Phi2 | ModelArchitecture::Phi3 | ModelArchitecture::PhiMoe => {
             let phi_cfg = PhiConfig {
@@ -1750,7 +1774,10 @@ fn load_model_with_providers(
                 scale_depth,
                 dim_model_base,
             };
-            eprintln!("[grim] Loading MiniCPM model with config: {:?}", minicpm_cfg);
+            eprintln!(
+                "[grim] Loading MiniCPM model with config: {:?}",
+                minicpm_cfg
+            );
             let m = MiniCpmModel::load(&ws, minicpm_cfg)?;
             Ok(Box::new(m))
         }
@@ -1767,7 +1794,10 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!("[grim] Loading SmolLM2 model with config: {:?}", smollm2_cfg);
+            eprintln!(
+                "[grim] Loading SmolLM2 model with config: {:?}",
+                smollm2_cfg
+            );
             let m = SmolLm2::load_tp(device.clone(), &ws, smollm2_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -1788,21 +1818,6 @@ fn load_model_with_providers(
                 max_seq_len: hparams.max_seq_len,
             };
             eprintln!("[grim] Loading Qwen model with config: {:?}", qwen_cfg);
-            let llama_cfg = LlamaConfig {
-                vocab_size: hparams.vocab_size,
-                hidden_size: hparams.hidden_size,
-                num_heads: hparams.num_heads,
-                num_kv_heads: hparams.num_kv_heads,
-                head_dim: hparams.head_dim,
-                num_layers: hparams.num_layers,
-                intermediate_size: hparams.intermediate_size,
-                rms_norm_eps: hparams.rms_norm_eps,
-                rope_theta: hparams.rope_theta,
-                max_seq_len: hparams.max_seq_len,
-            
-                partial_rotary_factor: 1.0,
-                yarn: None,
-        };
             let m = Qwen::load_tp(device.clone(), &ws, qwen_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -1936,11 +1951,15 @@ fn load_model_with_providers(
                 ssm_d_inner: hparams.ssm_d_inner.unwrap_or(hparams.intermediate_size),
                 ssm_d_conv: hparams.ssm_d_conv.unwrap_or(4),
                 ssm_dt_rank: hparams.ssm_dt_rank.unwrap_or(
-                    hparams.ssm_d_inner.unwrap_or(hparams.intermediate_size) / hparams.num_heads.max(1),
+                    hparams.ssm_d_inner.unwrap_or(hparams.intermediate_size)
+                        / hparams.num_heads.max(1),
                 ),
                 ssm_n_group: hparams.ssm_n_group.unwrap_or(1),
             };
-            eprintln!("[grim] Loading Falcon-H1 model with config: {:?}", falcon_h1_cfg);
+            eprintln!(
+                "[grim] Loading Falcon-H1 model with config: {:?}",
+                falcon_h1_cfg
+            );
             let m = FalconH1Model::load_tp(device.clone(), &ws, falcon_h1_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2281,7 +2300,10 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!("[grim] Loading CommandR model with config: {:?}", commandr_cfg);
+            eprintln!(
+                "[grim] Loading CommandR model with config: {:?}",
+                commandr_cfg
+            );
             let llama_cfg = LlamaConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -2293,10 +2315,10 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        };
+            };
             let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2318,35 +2340,68 @@ fn load_model_with_providers(
             Ok(Box::new(m))
         }
         ModelArchitecture::MuseGlimmer => {
-            let softcap = lookup.get_f32("muse_glimmer.final_logit_softcapping").unwrap_or(0.0);
-            let qk_scale = lookup.get_f32("muse_glimmer.qk_scale_factor").unwrap_or(1.0);
+            let softcap = lookup
+                .get_f32("muse_glimmer.final_logit_softcapping")
+                .unwrap_or(0.0);
+            let qk_scale = lookup
+                .get_f32("muse_glimmer.qk_scale_factor")
+                .unwrap_or(1.0);
             let sliding_win = lookup.get_u32("muse_glimmer.sliding_window").unwrap_or(0) as usize;
 
-            let per_layer_rope: Vec<f32> = get_meta_array(provider, "muse_glimmer.per_layer_rope_theta")
-                .map(|arr| arr.iter().filter_map(|v| v.as_f32()).collect())
-                .unwrap_or_default();
-            let sliding_window_layer_ids: Vec<usize> = get_meta_array(provider, "muse_glimmer.sliding_window_layer_ids")
-                .map(|arr| arr.iter().filter_map(|v| v.as_u32().map(|u| u as usize)).collect())
-                .unwrap_or_default();
-            let output_multiplier: Vec<f32> = get_meta_array(provider, "muse_glimmer.output_multiplier")
-                .map(|arr| arr.iter().filter_map(|v| v.as_f32()).collect())
-                .unwrap_or_default();
+            let per_layer_rope: Vec<f32> =
+                get_meta_array(provider, "muse_glimmer.per_layer_rope_theta")
+                    .map(|arr| arr.iter().filter_map(|v| v.as_f32()).collect())
+                    .unwrap_or_default();
+            let sliding_window_layer_ids: Vec<usize> =
+                get_meta_array(provider, "muse_glimmer.sliding_window_layer_ids")
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_u32().map(|u| u as usize))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            let output_multiplier: Vec<f32> =
+                get_meta_array(provider, "muse_glimmer.output_multiplier")
+                    .map(|arr| arr.iter().filter_map(|v| v.as_f32()).collect())
+                    .unwrap_or_default();
 
             let vision_cfg = if lookup.get_u32("muse_glimmer.vision.image_size").is_some()
                 || lookup.get_u32("muse_glimmer.vision.num_layers").is_some()
             {
                 Some(grim_models_vision::GlimmerVisionConfig {
-                    image_temporal: lookup.get_u32("muse_glimmer.vision.image_temporal").unwrap_or(2) as usize,
-                    image_size: lookup.get_u32("muse_glimmer.vision.image_size").unwrap_or(336) as usize,
-                    patch_size: lookup.get_u32("muse_glimmer.vision.patch_size").unwrap_or(14) as usize,
-                    temporal_patch_size: lookup.get_u32("muse_glimmer.vision.temporal_patch_size").unwrap_or(2) as usize,
-                    in_channels: lookup.get_u32("muse_glimmer.vision.in_channels").unwrap_or(3) as usize,
-                    hidden_size: lookup.get_u32("muse_glimmer.vision.hidden_size").unwrap_or(1024) as usize,
-                    num_heads: lookup.get_u32("muse_glimmer.vision.num_heads").unwrap_or(16) as usize,
-                    num_layers: lookup.get_u32("muse_glimmer.vision.num_layers").unwrap_or(24) as usize,
-                    intermediate_size: lookup.get_u32("muse_glimmer.vision.intermediate_size").unwrap_or(4096) as usize,
-                    rms_norm_eps: lookup.get_f32("muse_glimmer.vision.rms_norm_eps").unwrap_or(1e-5),
-                    merge_size: lookup.get_u32("muse_glimmer.vision.merge_size").unwrap_or(2) as usize,
+                    image_temporal: lookup
+                        .get_u32("muse_glimmer.vision.image_temporal")
+                        .unwrap_or(2) as usize,
+                    image_size: lookup
+                        .get_u32("muse_glimmer.vision.image_size")
+                        .unwrap_or(336) as usize,
+                    patch_size: lookup
+                        .get_u32("muse_glimmer.vision.patch_size")
+                        .unwrap_or(14) as usize,
+                    temporal_patch_size: lookup
+                        .get_u32("muse_glimmer.vision.temporal_patch_size")
+                        .unwrap_or(2) as usize,
+                    in_channels: lookup
+                        .get_u32("muse_glimmer.vision.in_channels")
+                        .unwrap_or(3) as usize,
+                    hidden_size: lookup
+                        .get_u32("muse_glimmer.vision.hidden_size")
+                        .unwrap_or(1024) as usize,
+                    num_heads: lookup
+                        .get_u32("muse_glimmer.vision.num_heads")
+                        .unwrap_or(16) as usize,
+                    num_layers: lookup
+                        .get_u32("muse_glimmer.vision.num_layers")
+                        .unwrap_or(24) as usize,
+                    intermediate_size: lookup
+                        .get_u32("muse_glimmer.vision.intermediate_size")
+                        .unwrap_or(4096) as usize,
+                    rms_norm_eps: lookup
+                        .get_f32("muse_glimmer.vision.rms_norm_eps")
+                        .unwrap_or(1e-5),
+                    merge_size: lookup
+                        .get_u32("muse_glimmer.vision.merge_size")
+                        .unwrap_or(2) as usize,
                     use_vision_norm: true,
                 })
             } else {
@@ -2372,7 +2427,8 @@ fn load_model_with_providers(
                 max_seq_len: hparams.max_seq_len,
                 vision: vision_cfg,
             };
-            let m = grim_models_transformer::MuseGlimmer::load_tp(device.clone(), &ws, muse_cfg, tp)?;
+            let m =
+                grim_models_transformer::MuseGlimmer::load_tp(device.clone(), &ws, muse_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::SolarOpen2 => {
@@ -2386,9 +2442,15 @@ fn load_model_with_providers(
                 intermediate_size: hparams.intermediate_size,
                 rms_norm_eps: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
-                num_routed_experts: lookup.get_u32("solar_open2.expert_count").map(|u| u as usize).unwrap_or(320),
+                num_routed_experts: lookup
+                    .get_u32("solar_open2.expert_count")
+                    .map(|u| u as usize)
+                    .unwrap_or(320),
                 num_shared_experts: 1,
-                top_k: lookup.get_u32("solar_open2.expert_used_count").map(|u| u as usize).unwrap_or(8),
+                top_k: lookup
+                    .get_u32("solar_open2.expert_used_count")
+                    .map(|u| u as usize)
+                    .unwrap_or(8),
             };
             let m = SolarOpen2::load_tp(&ws, solar_cfg)?;
             Ok(Box::new(m))
@@ -2520,12 +2582,6 @@ fn load_model_with_providers(
             Ok(Box::new(m))
         }
 
-
-
-
-
-
-
         ModelArchitecture::Chameleon => {
             let chameleon_cfg = ChameleonConfig {
                 vocab_size: hparams.vocab_size,
@@ -2540,7 +2596,10 @@ fn load_model_with_providers(
                 max_seq_len: hparams.max_seq_len,
                 swin_norm: false,
             };
-            eprintln!("[grim] Loading Chameleon model with config: {:?}", chameleon_cfg);
+            eprintln!(
+                "[grim] Loading Chameleon model with config: {:?}",
+                chameleon_cfg
+            );
             let llama_cfg = LlamaConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -2552,10 +2611,10 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        };
+            };
             let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2568,7 +2627,10 @@ fn load_model_with_providers(
                 intermediate_size: hparams.intermediate_size,
                 max_seq_len: hparams.max_seq_len,
             };
-            eprintln!("[grim] Loading DeltaNetBase model with config: {:?}", delta_cfg);
+            eprintln!(
+                "[grim] Loading DeltaNetBase model with config: {:?}",
+                delta_cfg
+            );
             let m = DeltaNetBase::load_tp(device.clone(), &ws, delta_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2605,13 +2667,9 @@ fn load_model_with_providers(
         | ModelArchitecture::Codeshell
         | ModelArchitecture::CogVlm
         | ModelArchitecture::Cohere2
-        | ModelArchitecture::CommandR
         | ModelArchitecture::Dbrx
         | ModelArchitecture::Deci
-        | ModelArchitecture::DeepSeek2
         | ModelArchitecture::DeepSeek2Ocr
-        | ModelArchitecture::DeepSeek32
-        | ModelArchitecture::DeepSeek4
         | ModelArchitecture::DFlash
         | ModelArchitecture::Dots1
         | ModelArchitecture::Dream
@@ -2664,7 +2722,6 @@ fn load_model_with_providers(
         | ModelArchitecture::Rnd1
         | ModelArchitecture::SeedOss
         | ModelArchitecture::SmallThinker
-        | ModelArchitecture::SmolLm2
         | ModelArchitecture::SmolLm3
         | ModelArchitecture::StableLm
         | ModelArchitecture::Starcoder
@@ -2684,11 +2741,14 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        };
-            eprintln!("[grim] Loading Llama-family model ({:?}) with config: {:?}", model_arch, llama_cfg);
+            };
+            eprintln!(
+                "[grim] Loading Llama-family model ({:?}) with config: {:?}",
+                model_arch, llama_cfg
+            );
             let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
@@ -2755,10 +2815,10 @@ fn load_model_with_providers(
                         rms_norm_eps: hparams.rms_norm_eps,
                         rope_theta: hparams.rope_theta,
                         max_seq_len: hparams.max_seq_len,
-                    
+
                         partial_rotary_factor: 1.0,
                         yarn: None,
-        };
+                    };
                     let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
                     return Ok(Box::new(m));
                 }
@@ -3023,7 +3083,8 @@ mod tests {
     fn parse_yarn_scaling_returns_none_for_non_yarn_rope_types() {
         for rt in ["linear", "dynamic", "ntk-aware", "longrope"] {
             let v: serde_json::Value =
-                serde_json::from_str(&format!(r#"{{"rope_type": "{rt}", "factor": 4.0}}"#)).unwrap();
+                serde_json::from_str(&format!(r#"{{"rope_type": "{rt}", "factor": 4.0}}"#))
+                    .unwrap();
             assert!(
                 parse_yarn_scaling(&Some(v)).is_none(),
                 "rope_type={rt} must not produce YaRNParams"
@@ -3037,8 +3098,7 @@ mod tests {
     /// attention_factor 1.0, original_max_pos 8192).
     #[test]
     fn parse_yarn_scaling_applies_defaults_for_missing_fields() {
-        let v: serde_json::Value =
-            serde_json::from_str(r#"{"rope_type": "yarn"}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(r#"{"rope_type": "yarn"}"#).unwrap();
         let y = parse_yarn_scaling(&Some(v)).expect("yarn (defaults) must parse");
         assert!((y.factor - 1.0).abs() < 1e-6);
         assert_eq!(y.original_max_pos, 8192);

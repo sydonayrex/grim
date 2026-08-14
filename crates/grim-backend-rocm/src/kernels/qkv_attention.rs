@@ -564,7 +564,7 @@ pub fn launch_paged_attention(
     page_size: u32,
     kv_seq_len: u32,
     cache_offset: u32,
-    window_lo: i32,                    // sliding-window lower bound; 0 = full causal
+    window_lo: i32, // sliding-window lower bound; 0 = full causal
 ) -> Result<(), crate::Error> {
     let q_s = q
         .as_any()

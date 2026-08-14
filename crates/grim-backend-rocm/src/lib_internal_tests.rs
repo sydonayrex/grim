@@ -1165,9 +1165,9 @@ mod tests {
                 q.as_ref(),
                 q.as_ref(),
                 q.as_ref(),
-                2, // num_kv_heads: real param, not num_heads/4
-                4, // kv_seq_len
-                0, // cache_offset
+                2,    // num_kv_heads: real param, not num_heads/4
+                4,    // kv_seq_len
+                0,    // cache_offset
                 None, // window: full causal
                 &Shape::from_slice(&[4, 4, 64]),
                 None,
@@ -2233,7 +2233,11 @@ mod tests {
             let sc = scales[sc_idx];
             let ql_offset = n * 64 + l + if (quarter & 1) != 0 { 32 } else { 0 };
             let ql_byte = ql[ql_offset];
-            let nibble = if (quarter & 2) != 0 { ql_byte >> 4 } else { ql_byte & 0x0F };
+            let nibble = if (quarter & 2) != 0 {
+                ql_byte >> 4
+            } else {
+                ql_byte & 0x0F
+            };
 
             let qh_byte = qh[n * 32 + l];
             let qh_bits = (qh_byte >> (2 * quarter)) & 0x03;
@@ -2316,7 +2320,9 @@ mod tests {
         let dev = match RocmDevice::try_new(0) {
             Ok(d) => d,
             Err(_) => {
-                eprintln!("ROCm device unavailable: skipping rocm_native_broadcast_bias_device_gated_parity");
+                eprintln!(
+                    "ROCm device unavailable: skipping rocm_native_broadcast_bias_device_gated_parity"
+                );
                 return;
             }
         };
@@ -2327,7 +2333,9 @@ mod tests {
         let bias_shape = Shape::new(vec![4]);
         let out_shape = Shape::new(vec![batch, out_dim]);
 
-        let bias_storage = dev.from_cpu(&bias, &bias_shape, DType::F32).expect("from_cpu");
+        let bias_storage = dev
+            .from_cpu(&bias, &bias_shape, DType::F32)
+            .expect("from_cpu");
         let (out_storage, _handle) = dev
             .broadcast_bias(bias_storage.as_ref(), batch, out_dim, &out_shape)
             .expect("dev.broadcast_bias");
@@ -2355,7 +2363,9 @@ mod tests {
         let dev = match RocmDevice::try_new(0) {
             Ok(d) => d,
             Err(_) => {
-                eprintln!("ROCm device unavailable: skipping rocm_scale_bias_epilogue_device_gated_parity");
+                eprintln!(
+                    "ROCm device unavailable: skipping rocm_scale_bias_epilogue_device_gated_parity"
+                );
                 return;
             }
         };
@@ -2395,10 +2405,18 @@ mod tests {
         let b_shape = Shape::new(vec![out_dim]);
         let bias_shape = Shape::new(vec![out_dim]);
 
-        let out_storage = dev.from_cpu(&gemm_out, &out_shape, DType::F32).expect("from_cpu out");
-        let a_storage = dev.from_cpu(&a_scale, &a_shape, DType::F32).expect("from_cpu a");
-        let b_storage = dev.from_cpu(&b_scale, &b_shape, DType::F32).expect("from_cpu b");
-        let bias_storage = dev.from_cpu(&bias, &bias_shape, DType::F32).expect("from_cpu bias");
+        let out_storage = dev
+            .from_cpu(&gemm_out, &out_shape, DType::F32)
+            .expect("from_cpu out");
+        let a_storage = dev
+            .from_cpu(&a_scale, &a_shape, DType::F32)
+            .expect("from_cpu a");
+        let b_storage = dev
+            .from_cpu(&b_scale, &b_shape, DType::F32)
+            .expect("from_cpu b");
+        let bias_storage = dev
+            .from_cpu(&bias, &bias_shape, DType::F32)
+            .expect("from_cpu bias");
 
         let _handle = dev
             .scale_bias_epilogue(
@@ -2421,5 +2439,3 @@ mod tests {
         }
     }
 }
-
-

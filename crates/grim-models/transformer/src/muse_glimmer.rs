@@ -19,18 +19,18 @@ use grim_core::error::{Error, Result};
 use grim_core::model::{
     AdapterHandle, CausalLm, ModalityHint, MultimodalCausalLm, MultimodalInputs,
 };
-use grim_core::session::{Inner, SessionT};
 use grim_core::rng::SimpleRng;
+use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
 use grim_models_vision::{GlimmerVision, GlimmerVisionConfig};
 use grim_nn::pick_device_for_storage_device;
 use grim_nn::{
-    ColumnParallelLinear, Embedding, Linear, RmsNorm, Rope, RowParallelLinear, TensorParallelConfig,
-    WeightSource,
+    ColumnParallelLinear, Embedding, Linear, RmsNorm, Rope, RowParallelLinear,
+    TensorParallelConfig, WeightSource,
 };
 use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 
-use crate::block::{plan_kv_head_sharding, LlamaLayerCache};
+use crate::block::{LlamaLayerCache, plan_kv_head_sharding};
 use crate::multimodal::merge_multimodal_embeddings;
 
 // ---------------------------------------------------------------------------
@@ -71,76 +71,145 @@ impl MuseGlimmerConfig {
     pub fn from_hf(value: &serde_json::Value) -> Self {
         let u = |k: &str| value.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let f = |k: &str| value.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-        let per_layer_rope = value.get("per_layer_rope_theta")
+        let per_layer_rope = value
+            .get("per_layer_rope_theta")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_f64().map(|f| f as f32))
+                    .collect()
+            })
             .unwrap_or_default();
-        let sliding_layers = value.get("attention_sliding_window_layer_ids")
+        let sliding_layers = value
+            .get("attention_sliding_window_layer_ids")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|x| x.as_u64().map(|u| u as usize)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_u64().map(|u| u as usize))
+                    .collect()
+            })
             .unwrap_or_default();
-        let output_mult = value.get("output_multiplier")
+        let output_mult = value
+            .get("output_multiplier")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_f64().map(|f| f as f32))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let vision_cfg = value.get("vision_config").map(|v| {
             let vu = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0) as usize;
             let vf = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
             grim_models_vision::GlimmerVisionConfig {
-                image_temporal: if vu("image_temporal") > 0 { vu("image_temporal") } else { 2 },
-                image_size: if vu("image_size") > 0 { vu("image_size") } else { 336 },
-                patch_size: if vu("patch_size") > 0 { vu("patch_size") } else { 14 },
-                temporal_patch_size: if vu("temporal_patch_size") > 0 { vu("temporal_patch_size") } else { 2 },
-                in_channels: if vu("num_channels") > 0 { vu("num_channels") } else { 3 },
-                hidden_size: if vu("hidden_size") > 0 { vu("hidden_size") } else { 1024 },
-                num_heads: if vu("num_attention_heads") > 0 { vu("num_attention_heads") } else { 16 },
-                num_layers: if vu("num_hidden_layers") > 0 { vu("num_hidden_layers") } else { 24 },
-                intermediate_size: if vu("intermediate_size") > 0 { vu("intermediate_size") } else { 4096 },
-                rms_norm_eps: if vf("layer_norm_eps") > 0.0 { vf("layer_norm_eps") } else { 1e-5 },
-                merge_size: if vu("merge_size") > 0 { vu("merge_size") } else { 2 },
+                image_temporal: if vu("image_temporal") > 0 {
+                    vu("image_temporal")
+                } else {
+                    2
+                },
+                image_size: if vu("image_size") > 0 {
+                    vu("image_size")
+                } else {
+                    336
+                },
+                patch_size: if vu("patch_size") > 0 {
+                    vu("patch_size")
+                } else {
+                    14
+                },
+                temporal_patch_size: if vu("temporal_patch_size") > 0 {
+                    vu("temporal_patch_size")
+                } else {
+                    2
+                },
+                in_channels: if vu("num_channels") > 0 {
+                    vu("num_channels")
+                } else {
+                    3
+                },
+                hidden_size: if vu("hidden_size") > 0 {
+                    vu("hidden_size")
+                } else {
+                    1024
+                },
+                num_heads: if vu("num_attention_heads") > 0 {
+                    vu("num_attention_heads")
+                } else {
+                    16
+                },
+                num_layers: if vu("num_hidden_layers") > 0 {
+                    vu("num_hidden_layers")
+                } else {
+                    24
+                },
+                intermediate_size: if vu("intermediate_size") > 0 {
+                    vu("intermediate_size")
+                } else {
+                    4096
+                },
+                rms_norm_eps: if vf("layer_norm_eps") > 0.0 {
+                    vf("layer_norm_eps")
+                } else {
+                    1e-5
+                },
+                merge_size: if vu("merge_size") > 0 {
+                    vu("merge_size")
+                } else {
+                    2
+                },
                 use_vision_norm: true,
             }
         });
 
+        let hidden_size = u("hidden_size");
+        let num_heads = u("num_attention_heads");
+        let raw_head_dim = u("head_dim");
+        // MOD-2 fix: `hidden_size / num_heads` can evaluate to 0 (e.g. when
+        // `hidden_size == 0` or is smaller than `num_heads`), and a 0
+        // `head_dim` becomes a divisor later in the model and panics. Clamp
+        // to a minimum of 1 so the value is always a valid, non-zero stride.
+        let head_dim = if raw_head_dim > 0 {
+            raw_head_dim
+        } else if num_heads > 0 {
+            hidden_size / num_heads
+        } else {
+            64
+        };
+        let head_dim = head_dim.max(1);
 
-            let hidden_size = u("hidden_size");
-            let num_heads = u("num_attention_heads");
-            let raw_head_dim = u("head_dim");
-            // MOD-2 fix: `hidden_size / num_heads` can evaluate to 0 (e.g. when
-            // `hidden_size == 0` or is smaller than `num_heads`), and a 0
-            // `head_dim` becomes a divisor later in the model and panics. Clamp
-            // to a minimum of 1 so the value is always a valid, non-zero stride.
-            let head_dim = if raw_head_dim > 0 {
-                raw_head_dim
-            } else if num_heads > 0 {
-                hidden_size / num_heads
-            } else {
-                64
-            };
-            let head_dim = head_dim.max(1);
-
-            MuseGlimmerConfig {
-                vocab_size: u("vocab_size"),
-                hidden_size,
-                num_heads,
-                num_kv_heads: u("num_key_value_heads"),
-                head_dim,
-                num_layers: u("num_hidden_layers"),
+        MuseGlimmerConfig {
+            vocab_size: u("vocab_size"),
+            hidden_size,
+            num_heads,
+            num_kv_heads: u("num_key_value_heads"),
+            head_dim,
+            num_layers: u("num_hidden_layers"),
             intermediate_size: u("intermediate_size"),
             rms_norm_eps: f("rms_norm_eps"),
             per_layer_rope_theta: per_layer_rope,
-            base_rope_theta: if f("rope_theta") > 0.0 { f("rope_theta") } else { 10000.0 },
+            base_rope_theta: if f("rope_theta") > 0.0 {
+                f("rope_theta")
+            } else {
+                10000.0
+            },
             sliding_window_layer_ids: sliding_layers,
             sliding_window_size: u("sliding_window"),
-            qk_scale_factor: if f("qk_scale_factor") > 0.0 { f("qk_scale_factor") } else { 1.0 },
+            qk_scale_factor: if f("qk_scale_factor") > 0.0 {
+                f("qk_scale_factor")
+            } else {
+                1.0
+            },
             output_multiplier: output_mult,
             final_logit_softcapping: f("final_logit_softcapping"),
-            max_seq_len: if u("max_position_embeddings") > 0 { u("max_position_embeddings") } else { 8192 },
+            max_seq_len: if u("max_position_embeddings") > 0 {
+                u("max_position_embeddings")
+            } else {
+                8192
+            },
             vision: vision_cfg,
         }
     }
-
 
     fn rope_theta_for(&self, layer: usize) -> f32 {
         self.per_layer_rope_theta
@@ -171,7 +240,6 @@ pub const MUSE_GLIMMER_30B_TENSOR_KEYS: &[&str] = &[
     "layers.{i}.ffn.w_up.weight",
     "layers.{i}.ffn.w_down.weight",
 ];
-
 
 impl ModelConfig for MuseGlimmerConfig {
     fn name(&self) -> &str {
@@ -353,8 +421,10 @@ impl GlimmerBlock {
         let past_len = kv_len - s;
 
         let attn_out = self.hybrid_attention(&q_rot, &full_k, &full_v, past_len, s, kv_len)?;
-        let attn_out =
-            reshaped_view(&attn_out, &Shape::new(vec![s, cfg.local_num_heads * cfg.head_dim]))?;
+        let attn_out = reshaped_view(
+            &attn_out,
+            &Shape::new(vec![s, cfg.local_num_heads * cfg.head_dim]),
+        )?;
         let attn_out = self.wo.forward(&attn_out)?;
 
         let added = grim_nn::modules::add_on_device(x_2d, &attn_out)?;
@@ -421,7 +491,6 @@ impl GlimmerBlock {
             &self.rope.config,
             &rope_shape,
         ) {
-
             Ok((st, _h)) => {
                 let rope_out = Tensor::new(
                     Arc::from(st),
@@ -430,11 +499,17 @@ impl GlimmerBlock {
                     x.provenance().clone(),
                     x.device().clone(),
                 );
-                reshaped_view(&rope_out, &Shape::new(vec![b, s, num_heads * self._cfg.head_dim]))
+                reshaped_view(
+                    &rope_out,
+                    &Shape::new(vec![b, s, num_heads * self._cfg.head_dim]),
+                )
             }
             Err(_) => {
                 let rope_out = self.rope.forward(&relabeled, &ext_positions)?;
-                reshaped_view(&rope_out, &Shape::new(vec![b, s, num_heads * self._cfg.head_dim]))
+                reshaped_view(
+                    &rope_out,
+                    &Shape::new(vec![b, s, num_heads * self._cfg.head_dim]),
+                )
             }
         }
     }
@@ -520,8 +595,6 @@ impl GlimmerBlock {
     }
 }
 
-
-
 /// Zero-copy relabel (B, S*H, D) → (B, S, H*D) when the flat element count and
 /// storage rank match; otherwise physically reshape. Mirrors `block::reshaped_view`.
 fn reshaped_view(x: &Tensor, shape: &Shape) -> Result<Tensor> {
@@ -567,11 +640,7 @@ pub struct GlimmerProjector {
 }
 
 impl GlimmerProjector {
-    pub fn load(
-        ws: &WeightSource<'_>,
-        input_dim: usize,
-        output_dim: usize,
-    ) -> Result<Self> {
+    pub fn load(ws: &WeightSource<'_>, input_dim: usize, output_dim: usize) -> Result<Self> {
         let proj = Linear::load(&ws.pp("proj"), input_dim, output_dim, false)?;
         Ok(Self {
             proj,
@@ -905,7 +974,8 @@ impl MultimodalCausalLm for MuseGlimmer {
             }
             (Some(_), _) => {
                 return Err(Error::Config(
-                    "MuseGlimmer multimodal input has an image but no image_placeholder_mask".into(),
+                    "MuseGlimmer multimodal input has an image but no image_placeholder_mask"
+                        .into(),
                 ));
             }
             _ => {}
@@ -1010,7 +1080,6 @@ fn text_positions(positions: &Tensor, seq_len: usize) -> Result<Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grim_tensor::DType;
 
     fn tiny_cfg() -> MuseGlimmerConfig {
         MuseGlimmerConfig {
@@ -1064,10 +1133,7 @@ mod tests {
     fn decode_kv_cache_grows() {
         let cfg = tiny_cfg();
         let model = MuseGlimmer::random(Device::Cpu, cfg);
-        let hidden = grim_backend_cpu::cpu_tensor(
-            vec![0.1f32; 1 * 32],
-            Shape::new(vec![1, 32]),
-        );
+        let hidden = grim_backend_cpu::cpu_tensor(vec![0.1f32; 1 * 32], Shape::new(vec![1, 32]));
         let (logits, _, kv) = model.decode(&hidden, &[0]).unwrap();
         assert_eq!(logits.shape().dims(), &[1, 64]);
         assert_eq!(kv.len(), 2);
@@ -1100,9 +1166,7 @@ mod tests {
         let proj = GlimmerProjector {
             proj: Linear::from_tensor(
                 grim_backend_cpu::cpu_tensor(
-                    (0..16 * 32)
-                        .map(|i| ((i as f32) - 256.0) * 0.001)
-                        .collect(),
+                    (0..16 * 32).map(|i| ((i as f32) - 256.0) * 0.001).collect(),
                     Shape::new(vec![32, 16]),
                 ),
                 None,
@@ -1120,9 +1184,7 @@ mod tests {
             Shape::new(vec![6]),
         );
         let img = grim_backend_cpu::cpu_tensor(
-            (0..3 * 2 * 8 * 8)
-                .map(|i| (i as f32) * 0.01)
-                .collect(),
+            (0..3 * 2 * 8 * 8).map(|i| (i as f32) * 0.01).collect(),
             Shape::new(vec![3, 2, 8, 8]),
         );
         let inputs = MultimodalInputs {
@@ -1152,10 +1214,8 @@ mod tests {
         let cfg = tiny_cfg();
         let model = MuseGlimmer::random(Device::Cpu, cfg);
         let ids = grim_backend_cpu::cpu_tensor(vec![3.0f32, 0.0, 4.0], Shape::new(vec![3]));
-        let img = grim_backend_cpu::cpu_tensor(
-            vec![0.0f32; 3 * 2 * 8 * 8],
-            Shape::new(vec![3, 2, 8, 8]),
-        );
+        let img =
+            grim_backend_cpu::cpu_tensor(vec![0.0f32; 3 * 2 * 8 * 8], Shape::new(vec![3, 2, 8, 8]));
         let inputs = MultimodalInputs {
             input_ids: ids,
             image_patches: Some(img),

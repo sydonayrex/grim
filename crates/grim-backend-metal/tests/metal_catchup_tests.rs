@@ -21,8 +21,14 @@ fn test_metal_autotuner_shape_class_routing() {
     let caps = MetalCaps::probe_default(1001, "Metal Test Device".into(), 8);
     let autotuner = MetalAutotuner::new();
 
-    assert_eq!(ShapeClass::from_op(GemmOp::LmHead, 16, 128000, 4096), ShapeClass::TLOLog);
-    assert_eq!(ShapeClass::from_op(GemmOp::Ffn, 64, 64, 4096), ShapeClass::Prefill);
+    assert_eq!(
+        ShapeClass::from_op(GemmOp::LmHead, 16, 128000, 4096),
+        ShapeClass::TLOLog
+    );
+    assert_eq!(
+        ShapeClass::from_op(GemmOp::Ffn, 64, 64, 4096),
+        ShapeClass::Prefill
+    );
 
     // Decode shape (m=1)
     assert_eq!(ShapeClass::classify(1, 4096, 4096), ShapeClass::Decode);
@@ -45,8 +51,18 @@ fn test_metal_resource_limits_gating() {
     assert!(!caps.validate_resource_limits(65536, 256)); // Exceeds 32KB threadgroup memory
     assert!(!caps.validate_resource_limits(16384, 2048)); // Exceeds 1024 thread limit
 
-    let valid_cfg = grim_backend_metal::MetalTileConfig { block_m: 16, block_n: 32, block_k: 16, split_k: 1 };
-    let invalid_cfg = grim_backend_metal::MetalTileConfig { block_m: 128, block_n: 128, block_k: 16, split_k: 1 };
+    let valid_cfg = grim_backend_metal::MetalTileConfig {
+        block_m: 16,
+        block_n: 32,
+        block_k: 16,
+        split_k: 1,
+    };
+    let invalid_cfg = grim_backend_metal::MetalTileConfig {
+        block_m: 128,
+        block_n: 128,
+        block_k: 16,
+        split_k: 1,
+    };
     assert!(valid_cfg.is_valid(&caps));
     assert!(!invalid_cfg.is_valid(&caps));
 }
@@ -55,7 +71,7 @@ fn test_metal_resource_limits_gating() {
 fn test_metal_autotuner_cache_persistence() {
     let caps = MetalCaps::probe_default(2002, "Persistence Test GPU".into(), 8);
     let autotuner = MetalAutotuner::new();
-    
+
     // Warm cache with shape (32, 64, 128)
     let original_cfg = autotuner.search_tile_config(&caps, 32, 64, 128, Some(GemmOp::Ffn));
     autotuner.save_cache(&caps);

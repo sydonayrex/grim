@@ -115,4 +115,3 @@ mod tests {
         assert_eq!(hasher_a.finish(), hasher_b.finish());
     }
 }
-

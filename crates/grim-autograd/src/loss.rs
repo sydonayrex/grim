@@ -3,7 +3,7 @@
 //! Provides `cross_entropy_loss` returning `(loss_val, loss_grad_tensor)`.
 
 use grim_tensor::{
-    DType, Tensor,
+    BackendDevice, DType, Shape, Storage, Tensor,
     error::{Error, Result},
 };
 use std::sync::Arc;
@@ -40,6 +40,31 @@ pub fn fused_linear_cross_entropy_loss(
     }
     if targets.len() != batch_size {
         return Err(Error::Backend("targets length mismatch".into()));
+    }
+
+    if let grim_tensor::Device::Rocm(ordinal) = hidden.device() {
+        for &target in targets {
+            if target >= vocab_size {
+                return Err(Error::Backend(format!("target_token {} >= vocab_size {}", target, vocab_size)));
+            }
+        }
+        let dev = grim_backend_rocm::RocmDevice::try_new(*ordinal)?;
+        let target_bytes: Vec<u8> = targets.iter().flat_map(|&v| (v as u32).to_ne_bytes()).collect();
+        let target_dtype = DType { arith: grim_tensor::ArithType::U32, storage: Storage::Native };
+        let target_storage = dev.from_cpu_bytes(&target_bytes, &Shape::new(vec![batch_size]), target_dtype)?;
+        let (loss_out, lse_out, _forward_handle) = dev.fused_linear_cross_entropy_forward(
+            &**hidden.storage(), &**lm_head.storage(), &*target_storage, 4096,
+        )?;
+        let loss_sum: f32 = loss_out.to_cpu_vec_f32()?.iter().sum();
+        let (grad_storage, _backward_handle) = dev.fused_linear_cross_entropy_backward(
+            &**hidden.storage(), &**lm_head.storage(), &*target_storage, &*lse_out,
+            4096, 1.0 / batch_size as f32,
+        )?;
+        let grad_tensor = Tensor::new(
+            Arc::from(grad_storage), hidden.shape().clone(), DType::F32,
+            hidden.provenance().clone(), hidden.device().clone(),
+        );
+        return Ok((loss_sum / batch_size as f32, grad_tensor));
     }
 
     let h_vec = hidden.to_vec_f32()?;

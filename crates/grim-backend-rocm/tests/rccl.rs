@@ -22,7 +22,7 @@
 //!     DMA can deadlock across host PCIe bridges. Setting `NCCL_P2P_DISABLE=1`
 //!     forces host staging and resolves the PCIe bridge hang.
 
-use grim_backend_rocm::rccl::{CollectiveConfig, UniqueId, p2p_memcpy_async};
+use grim_backend_rocm::rccl::CollectiveConfig;
 #[cfg(feature = "rccl")]
 use grim_tensor::backend::BackendDevice;
 #[cfg(feature = "rccl")]

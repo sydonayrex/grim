@@ -1,6 +1,5 @@
 use grim_backend_cpu::{CpuDevice, moe_fused_dispatch};
 
-
 #[test]
 fn cpu_device_returns_hardware_spec_and_cache_key() {
     let dev = CpuDevice::new();
@@ -10,7 +9,11 @@ fn cpu_device_returns_hardware_spec_and_cache_key() {
 
     let cache_key = dev.cache_key("quantized_matmul", 0x42);
     assert_eq!(cache_key.entry, "quantized_matmul");
-    assert!(cache_key.to_key_string().contains("grim_cpu_quantized_matmul"));
+    assert!(
+        cache_key
+            .to_key_string()
+            .contains("grim_cpu_quantized_matmul")
+    );
 }
 
 #[test]
@@ -62,7 +65,6 @@ fn cpu_device_graph_capture_and_replay() {
 
     dev.record_op(|| Ok(()));
 
-
     dev.end_graph_capture("decode_layer_0").expect("end");
     assert!(!dev.is_capturing());
 
@@ -72,4 +74,3 @@ fn cpu_device_graph_capture_and_replay() {
     let not_found = dev.replay_graph("nonexistent").expect("replay nonexistent");
     assert!(!not_found);
 }
-

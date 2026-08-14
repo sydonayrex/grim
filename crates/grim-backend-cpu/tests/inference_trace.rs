@@ -32,7 +32,11 @@ fn cpu_full_inference_trace_and_graph_replay() {
         .map(|i| (i as f32 * 0.01).sin())
         .collect();
     let emb_table = dev
-        .from_cpu(&emb_table_data, &Shape::from_slice(&[vocab_size, hidden_dim]), dtype.clone())
+        .from_cpu(
+            &emb_table_data,
+            &Shape::from_slice(&[vocab_size, hidden_dim]),
+            dtype.clone(),
+        )
         .expect("emb_table");
 
     let (x_emb, handle_emb) = dev
@@ -45,9 +49,13 @@ fn cpu_full_inference_trace_and_graph_replay() {
 
     // 2. Fused Add + RMSNorm
     let res_initial = vec![0.0f32; hidden_dim];
-    let res_storage = dev.from_cpu(&res_initial, &shape_hidden, dtype.clone()).expect("res");
+    let res_storage = dev
+        .from_cpu(&res_initial, &shape_hidden, dtype.clone())
+        .expect("res");
     let norm_w_data = vec![1.0f32; hidden_dim];
-    let norm_w = dev.from_cpu(&norm_w_data, &shape_weight, dtype.clone()).expect("norm_w");
+    let norm_w = dev
+        .from_cpu(&norm_w_data, &shape_weight, dtype.clone())
+        .expect("norm_w");
 
     let (_y_norm, _updated_res, handle_norm) = dev
         .fused_add_rms_norm(
@@ -59,7 +67,6 @@ fn cpu_full_inference_trace_and_graph_replay() {
         )
         .expect("fused_add_rms_norm");
     handle_norm.synchronize().expect("sync norm");
-
 
     // 3. QKV Attention (Self Attention)
     let q_data = vec![0.1f32; seq_len * hidden_dim];
@@ -112,15 +119,19 @@ fn cpu_full_inference_trace_and_graph_replay() {
     assert_eq!(moe_out.len(), hidden_dim);
 
     // 5. Decode Graph Capture and Replay Verification
-    dev.begin_graph_capture("cpu_decode_token_1").expect("begin_graph_capture");
+    dev.begin_graph_capture("cpu_decode_token_1")
+        .expect("begin_graph_capture");
     assert!(dev.is_capturing());
 
     dev.record_op(|| Ok(()));
     dev.record_op(|| Ok(()));
 
-    dev.end_graph_capture("cpu_decode_token_1").expect("end_graph_capture");
+    dev.end_graph_capture("cpu_decode_token_1")
+        .expect("end_graph_capture");
     assert!(!dev.is_capturing());
 
-    let replayed = dev.replay_graph("cpu_decode_token_1").expect("replay_graph");
+    let replayed = dev
+        .replay_graph("cpu_decode_token_1")
+        .expect("replay_graph");
     assert!(replayed, "Decode graph replay should succeed");
 }

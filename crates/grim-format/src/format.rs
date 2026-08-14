@@ -493,7 +493,9 @@ pub fn read_outliers_with_encoding<R: Read + Seek>(
     }
     // DeltaVarint path: read the entire varint stream from outlier_offset.
     // Bound reading for DeltaVarint: each outlier consumes at most ~10 varint bytes
-    let max_read_len = (entry.outlier_count as usize).saturating_mul(10).min(100_000_000);
+    let max_read_len = (entry.outlier_count as usize)
+        .saturating_mul(10)
+        .min(100_000_000);
     reader.seek(SeekFrom::Start(entry.outlier_offset))?;
     let mut buf = vec![0u8; max_read_len];
     let n = reader.read(&mut buf)?;

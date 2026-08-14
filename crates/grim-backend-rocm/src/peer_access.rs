@@ -158,7 +158,6 @@ pub fn enable_peer_access(src: i32, dst: i32) -> Result<bool> {
     }
 }
 
-
 /// Peer link classification for inter-GPU communication paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LinkType {
@@ -219,7 +218,6 @@ pub fn build_topology_matrix(devices: &[&crate::device::roc_device::RocmDevice])
         links,
     }
 }
-
 
 fn bounded(x: i32, n: i32) -> bool {
     x >= 0 && x < n

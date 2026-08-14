@@ -24,7 +24,6 @@ fn test_vulkan_autotuner_shape_class_routing() {
     let decode_cfg = autotuner.search_tile_config(&caps, 1, 4096, 4096, None);
     assert_eq!(decode_cfg.block_m, 16);
 
-
     // TLOLog / LmHead wide-N shape
     let tlog_cfg = autotuner.search_tile_config(&caps, 16, 128000, 4096, Some(GemmOp::LmHead));
     assert_eq!(tlog_cfg.block_n, 64);
@@ -32,7 +31,6 @@ fn test_vulkan_autotuner_shape_class_routing() {
     // Prefill shape (m=64, n=64)
     let prefill_cfg = autotuner.search_tile_config(&caps, 64, 64, 4096, Some(GemmOp::Ffn));
     assert_eq!(prefill_cfg.block_m, 32);
-
 }
 
 #[test]
@@ -76,7 +74,10 @@ fn test_autotuner_cache_persistence_round_trip() {
     let loaded = VulkanAutotuner::new();
     loaded.load_cache(&caps);
     let cfg = loaded.search_tile_config(&caps, 16, 128000, 4096, Some(GemmOp::LmHead));
-    assert_eq!(cfg, winner, "loaded cache must restore the persisted winner");
+    assert_eq!(
+        cfg, winner,
+        "loaded cache must restore the persisted winner"
+    );
 
     // Cleanup the test artifact.
     let _ = std::fs::remove_file(&path);

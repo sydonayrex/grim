@@ -1,8 +1,8 @@
 //! `CudaCaps`: CUDA hardware capability probe, resource limits, capability gating, and cache key fingerprinting.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use grim_tensor::dtype::QuantFormat;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 static CAP_EPOCH: AtomicU64 = AtomicU64::new(0);
 static CACHED_FINGERPRINT: Mutex<Option<String>> = Mutex::new(None);
@@ -95,16 +95,23 @@ impl CudaCaps {
     /// Capability gate checking if a quantization format is supported on device.
     pub fn supports_quant_format(&self, format: QuantFormat) -> bool {
         match format {
-            QuantFormat::Q8_0 | QuantFormat::Q4K | QuantFormat::Q5K | QuantFormat::Q6K | QuantFormat::Iq4Nl => true,
+            QuantFormat::Q8_0
+            | QuantFormat::Q4K
+            | QuantFormat::Q5K
+            | QuantFormat::Q6K
+            | QuantFormat::Iq4Nl => true,
             QuantFormat::Fp8 | QuantFormat::Fp8Block16 => self.supports_fp8_native(),
             _ => true,
         }
     }
 
     /// Resource limit validation: check if requested shared memory and block threads exceed device ceilings.
-    pub fn validate_resource_limits(&self, requested_shared_mem_bytes: u32, threads_per_block: u32) -> bool {
+    pub fn validate_resource_limits(
+        &self,
+        requested_shared_mem_bytes: u32,
+        threads_per_block: u32,
+    ) -> bool {
         requested_shared_mem_bytes <= self.shared_mem_per_block
             && threads_per_block <= self.max_threads_per_block
     }
 }
-

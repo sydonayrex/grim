@@ -69,7 +69,6 @@ extern "C" __global__ void grim_fused_allreduce_rms_norm(
 }
 "#;
 
-
 // ── Host-side CommFuse orchestrator ──────────────────────────────────────────
 
 /// Result of a CommFuse reduce fan-in.

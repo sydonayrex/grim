@@ -19,7 +19,12 @@ pub struct VulkanCaps {
 
 impl VulkanCaps {
     /// Probes default capabilities for a device name and properties.
-    pub fn probe_default(device_name: String, vendor_id: u32, device_id: u32, driver_version: u32) -> Self {
+    pub fn probe_default(
+        device_name: String,
+        vendor_id: u32,
+        device_id: u32,
+        driver_version: u32,
+    ) -> Self {
         Self {
             device_name,
             vendor_id,
@@ -60,14 +65,22 @@ impl VulkanCaps {
     /// Capability gate checking if a quantization format is supported on device.
     pub fn supports_quant_format(&self, format: QuantFormat) -> bool {
         match format {
-            QuantFormat::Q8_0 | QuantFormat::Q4K | QuantFormat::Q5K | QuantFormat::Q6K | QuantFormat::Iq4Nl => true,
+            QuantFormat::Q8_0
+            | QuantFormat::Q4K
+            | QuantFormat::Q5K
+            | QuantFormat::Q6K
+            | QuantFormat::Iq4Nl => true,
             QuantFormat::Fp8 | QuantFormat::Fp8Block16 => self.supports_fp8,
             _ => true,
         }
     }
 
     /// Resource limit validation: check if requested shared memory and workgroup size exceed device ceilings.
-    pub fn validate_resource_limits(&self, requested_shared_mem_bytes: u32, workgroup_invocations: u32) -> bool {
+    pub fn validate_resource_limits(
+        &self,
+        requested_shared_mem_bytes: u32,
+        workgroup_invocations: u32,
+    ) -> bool {
         requested_shared_mem_bytes <= self.max_shared_memory_bytes
             && workgroup_invocations <= self.max_workgroup_invocations
     }

@@ -50,4 +50,3 @@ extern "C" __global__ void grim_silu_mul_quantize(
     }
 }
 "#;
-

@@ -740,7 +740,9 @@ async fn main() -> Result<()> {
                          --allow-public to suppress this warning."
                     );
                     if !allow_public {
-                        eprintln!("[grim] ERROR: refusing to bind to {host_part} without --allow-public flag.");
+                        eprintln!(
+                            "[grim] ERROR: refusing to bind to {host_part} without --allow-public flag."
+                        );
                         std::process::exit(1);
                     }
                 }

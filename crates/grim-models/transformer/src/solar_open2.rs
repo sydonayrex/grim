@@ -3,22 +3,15 @@
 //! Features 48 layers interleaving 1 GQA (softmax attention) layer with 3 KDA
 //! (linear attention) layers. MoE block utilizes 320 routed experts + 1 shared expert.
 
-use std::sync::Arc;
-
-use grim_backend_cpu::CpuDevice;
-use grim_core::error::{Error, Result};
+use crate::{DeltaNetBase, DeltaNetBaseConfig};
+use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
-use grim_core::rng::SimpleRng;
 use grim_core::{Model, ModelConfig};
-use grim_nn::{
-    ColumnParallelLinear, Embedding, Linear, RmsNorm, RowParallelLinear,
-    TensorParallelConfig, WeightSource,
-};
-use grim_tensor::{DType, Device, Shape, Tensor};
-use crate::{DeltaNetBase, DeltaNetBaseConfig};
+use grim_nn::{Embedding, Linear, RmsNorm, TensorParallelConfig, WeightSource};
+use grim_tensor::{Device, Shape, Tensor};
 
-use crate::block::{plan_kv_head_sharding, LlamaLayerCache};
+use crate::block::LlamaLayerCache;
 use crate::moe_block::MoeBlock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,8 +57,20 @@ impl Default for SolarOpen2Config {
 
 impl SolarOpen2Config {
     pub fn from_hf(value: &serde_json::Value) -> Self {
-        let u = |k: &str, def: usize| value.get(k).and_then(|v| v.as_u64()).map(|x| x as usize).unwrap_or(def);
-        let f = |k: &str, def: f32| value.get(k).and_then(|v| v.as_f64()).map(|x| x as f32).unwrap_or(def);
+        let u = |k: &str, def: usize| {
+            value
+                .get(k)
+                .and_then(|v| v.as_u64())
+                .map(|x| x as usize)
+                .unwrap_or(def)
+        };
+        let f = |k: &str, def: f32| {
+            value
+                .get(k)
+                .and_then(|v| v.as_f64())
+                .map(|x| x as f32)
+                .unwrap_or(def)
+        };
 
         let hidden_size = u("hidden_size", 4096);
         let num_heads = u("num_attention_heads", 64);
@@ -227,7 +232,12 @@ impl SolarOpen2Block {
 
         let attn_out = match self.layer_type {
             SolarLayerType::Gqa => {
-                let (out, _, _) = self.llama_block.as_ref().unwrap().forward_with_kv_paged(&normed_attn, positions, sess, caches.and_then(|c| c.get_mut(0).and_then(|x| x.as_mut())))?;
+                let (out, _, _) = self.llama_block.as_ref().unwrap().forward_with_kv_paged(
+                    &normed_attn,
+                    positions,
+                    sess,
+                    caches.and_then(|c| c.get_mut(0).and_then(|x| x.as_mut())),
+                )?;
                 out
             }
             SolarLayerType::Kda => {
@@ -235,8 +245,14 @@ impl SolarOpen2Block {
                     positions.iter().map(|&p| p as f32).collect(),
                     Shape::new(vec![positions.len()]),
                 );
-                let mut dummy_sess = grim_core::session::Inner::new(self.delta_net.as_ref().unwrap().device.clone());
-                self.delta_net.as_ref().unwrap().forward(&mut dummy_sess, &normed_attn, &pos_tensor, &[])?
+                let mut dummy_sess =
+                    grim_core::session::Inner::new(self.delta_net.as_ref().unwrap().device.clone());
+                self.delta_net.as_ref().unwrap().forward(
+                    &mut dummy_sess,
+                    &normed_attn,
+                    &pos_tensor,
+                    &[],
+                )?
             }
         };
 
@@ -259,14 +275,21 @@ pub struct SolarOpen2 {
 impl SolarOpen2 {
     pub fn load_tp(ws: &WeightSource<'_>, cfg: SolarOpen2Config) -> Result<Self> {
         let tp = ws.tp_config();
-        let tok_embeddings = Embedding::load(&ws.pp("embed_tokens"), cfg.vocab_size, cfg.hidden_size)?;
+        let tok_embeddings =
+            Embedding::load(&ws.pp("embed_tokens"), cfg.vocab_size, cfg.hidden_size)?;
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for idx in 0..cfg.num_layers {
             let layer_ws = ws.pp(&format!("layers.{idx}"));
             layers.push(SolarOpen2Block::load_tp(&layer_ws, &cfg, idx, tp)?);
         }
         let norm = RmsNorm::load(&ws.pp("norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let output = Linear::load_column_parallel(&ws.pp("lm_head"), cfg.hidden_size, cfg.vocab_size, false, tp)?;
+        let output = Linear::load_column_parallel(
+            &ws.pp("lm_head"),
+            cfg.hidden_size,
+            cfg.vocab_size,
+            false,
+            tp,
+        )?;
 
         Ok(Self {
             cfg,
@@ -305,12 +328,19 @@ impl CausalLm for SolarOpen2 {
         let pos_vec = positions.to_vec_f32()?;
         let pos_u32: Vec<u32> = pos_vec.iter().map(|&x| x as u32).collect();
         let seq_len = pos_u32.len();
-        let ids = input_tokens.to_vec_f32()?.iter().map(|&x| x as u32).collect::<Vec<_>>();
+        let ids = input_tokens
+            .to_vec_f32()?
+            .iter()
+            .map(|&x| x as u32)
+            .collect::<Vec<_>>();
 
-        let mut h = self.tok_embeddings.forward(&ids, seq_len, self.cfg.hidden_size)?;
+        let mut h = self
+            .tok_embeddings
+            .forward(&ids, seq_len, self.cfg.hidden_size)?;
 
         if session.model_state().is_none() {
-            let mut init_caches: Vec<Option<LlamaLayerCache>> = Vec::with_capacity(self.layers.len());
+            let mut init_caches: Vec<Option<LlamaLayerCache>> =
+                Vec::with_capacity(self.layers.len());
             for _ in 0..self.layers.len() {
                 init_caches.push(None);
             }
@@ -319,10 +349,12 @@ impl CausalLm for SolarOpen2 {
         let caches = session
             .model_state_mut()
             .and_then(|s| s.downcast_mut::<Vec<Option<LlamaLayerCache>>>())
-            .expect("SolarOpen2::forward: session.model_state must be Vec<Option<LlamaLayerCache>>");
+            .expect(
+                "SolarOpen2::forward: session.model_state must be Vec<Option<LlamaLayerCache>>",
+            );
 
         for (idx, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, &pos_u32, None, Some(&mut caches[idx..idx+1]))?;
+            h = layer.forward(&h, &pos_u32, None, Some(&mut caches[idx..idx + 1]))?;
         }
         let h_norm = self.norm.forward(&h)?;
         let logits = self.output.forward(&h_norm)?;

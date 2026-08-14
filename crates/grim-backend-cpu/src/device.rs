@@ -75,9 +75,6 @@ impl CpuDevice {
     }
 }
 
-
-
-
 /// Dequantize a packed K/V cache tensor of layout `[kv_seq_len, num_kv_heads, head_dim]`
 /// (8-bit: 1 elem/byte; 4-bit: 2 elems/byte) using per-row f32 scales into a
 /// row-major f32 buffer the reference attention can consume.
@@ -319,7 +316,6 @@ impl BackendDevice for CpuDevice {
     }
 
     fn silu_mul_quantize(
-
         &self,
         gate: &dyn BackendStorage,
         up: &dyn BackendStorage,
@@ -358,7 +354,6 @@ impl BackendDevice for CpuDevice {
         }
 
         let bytes_storage = CpuStorage::from_raw_bytes(
-
             qbytes,
             out_shape.clone(),
             DType {
@@ -391,10 +386,19 @@ impl BackendDevice for CpuDevice {
         kv_seq_len: usize,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        self.qkv_attention(q, k, v, num_kv_heads, kv_seq_len, 0, None, out_shape, None, None)
+        self.qkv_attention(
+            q,
+            k,
+            v,
+            num_kv_heads,
+            kv_seq_len,
+            0,
+            None,
+            out_shape,
+            None,
+            None,
+        )
     }
-
-
 
     fn sqrt(
         &self,
@@ -463,7 +467,6 @@ impl BackendDevice for CpuDevice {
     }
 
     fn silu_mul_backward(
-
         &self,
         e: &dyn BackendStorage,
         g: &dyn BackendStorage,
@@ -503,7 +506,6 @@ impl BackendDevice for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
-
 
     fn rms_norm(
         &self,
@@ -571,7 +573,9 @@ impl BackendDevice for CpuDevice {
         let n = out_shape.elem_count();
         let hidden_dim = w_st.shape().elem_count();
         if hidden_dim == 0 || n % hidden_dim != 0 {
-            return Err(Error::Shape("fused_add_rms_norm: invalid dimensions".into()));
+            return Err(Error::Shape(
+                "fused_add_rms_norm: invalid dimensions".into(),
+            ));
         }
         let num_rows = n / hidden_dim;
 
@@ -601,7 +605,6 @@ impl BackendDevice for CpuDevice {
             Box::new(ReadyHandle),
         ))
     }
-
 
     fn softmax(
         &self,
@@ -643,7 +646,6 @@ impl BackendDevice for CpuDevice {
         cfg: &grim_tensor::RopeConfig,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-
         let x_st = a_storage(x)?;
         let dims = out_shape.dims().to_vec();
         if dims.len() != 3 || dims[2] != cfg.dim {
@@ -801,7 +803,6 @@ impl BackendDevice for CpuDevice {
         ))
     }
 
-
     /// CPU **reference** implementation of fused dequantized KV-attention.
     ///
     /// The trait default is `Unimplemented` (only ROCm wires the real HIP kernel),
@@ -846,8 +847,22 @@ impl BackendDevice for CpuDevice {
             ));
         }
 
-        let k_deq = dequant_packed_kv(&k_st, &k_sc_st, num_kv_heads, kv_seq_len, head_dim, quant_bits)?;
-        let v_deq = dequant_packed_kv(&v_st, &v_sc_st, num_kv_heads, kv_seq_len, head_dim, quant_bits)?;
+        let k_deq = dequant_packed_kv(
+            &k_st,
+            &k_sc_st,
+            num_kv_heads,
+            kv_seq_len,
+            head_dim,
+            quant_bits,
+        )?;
+        let v_deq = dequant_packed_kv(
+            &v_st,
+            &v_sc_st,
+            num_kv_heads,
+            kv_seq_len,
+            head_dim,
+            quant_bits,
+        )?;
 
         let qd = q_st.data();
         let kd = k_deq.as_slice();
@@ -916,7 +931,11 @@ impl BackendDevice for CpuDevice {
         let st_data = st_s.data();
 
         let hidden = x_s.shape().dims().last().cloned().unwrap_or(0);
-        let k_size = if hidden > 0 { w_s.data().len() / hidden } else { 1 };
+        let k_size = if hidden > 0 {
+            w_s.data().len() / hidden
+        } else {
+            1
+        };
 
         let mut out = vec![0.0f32; out_shape.elem_count()];
         for h in 0..hidden {
@@ -1037,14 +1056,29 @@ impl BackendDevice for CpuDevice {
         let kv_rope = kv_norm[qk_nope_dim..(qk_nope_dim + qk_rope_dim).min(kv_dim)].to_vec();
 
         Ok((
-            Box::new(CpuStorage::new(q_nope, Shape::new(vec![qk_nope_dim]), DType::F32)),
-            Box::new(CpuStorage::new(q_rope, Shape::new(vec![qk_rope_dim]), DType::F32)),
-            Box::new(CpuStorage::new(kv_nope, Shape::new(vec![qk_nope_dim]), DType::F32)),
-            Box::new(CpuStorage::new(kv_rope, Shape::new(vec![qk_rope_dim]), DType::F32)),
+            Box::new(CpuStorage::new(
+                q_nope,
+                Shape::new(vec![qk_nope_dim]),
+                DType::F32,
+            )),
+            Box::new(CpuStorage::new(
+                q_rope,
+                Shape::new(vec![qk_rope_dim]),
+                DType::F32,
+            )),
+            Box::new(CpuStorage::new(
+                kv_nope,
+                Shape::new(vec![qk_nope_dim]),
+                DType::F32,
+            )),
+            Box::new(CpuStorage::new(
+                kv_rope,
+                Shape::new(vec![qk_rope_dim]),
+                DType::F32,
+            )),
             Box::new(ReadyHandle),
         ))
     }
-
 
     fn qkv_attention_paged(
         &self,
@@ -1263,98 +1297,122 @@ impl BackendDevice for CpuDevice {
             vec![0u8; k * n]
         };
 
-        let b_dequant_transposed: Vec<f32> = match &b_packed.dtype().storage {
-            grim_tensor::dtype::Storage::ResidualPacked(cfg) => {
-                let mut out = vec![0.0f32; n * k];
-                let prov = b_packed.provenance();
-                let outliers: Vec<(u32, f32)> = match &prov {
-                    QuantProvenance::WithResiduals {
-                        outlier_indices,
-                        outlier_values_bits,
-                        ..
-                    } => outlier_indices
+        let b_dequant_transposed: Vec<f32> =
+            match &b_packed.dtype().storage {
+                grim_tensor::dtype::Storage::ResidualPacked(cfg) => {
+                    let mut out = vec![0.0f32; n * k];
+                    let prov = b_packed.provenance();
+                    let outliers: Vec<(u32, f32)> = match &prov {
+                        QuantProvenance::WithResiduals {
+                            outlier_indices,
+                            outlier_values_bits,
+                            ..
+                        } => outlier_indices
+                            .iter()
+                            .zip(outlier_values_bits.iter())
+                            .map(|(&idx, &bits)| (idx, f32::from_bits(bits)))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    let scales_u8: Vec<u8> = b_scales
                         .iter()
-                        .zip(outlier_values_bits.iter())
-                        .map(|(&idx, &bits)| (idx, f32::from_bits(bits)))
-                        .collect(),
-                    _ => Vec::new(),
-                };
-                let scales_u8: Vec<u8> = b_scales
-                    .iter()
-                    .map(|&s| (s * 255.0).clamp(0.0, 255.0) as u8)
-                    .collect();
-                for col in 0..n {
-                    let row_vals = crate::dequant_gemm::dequant_row(
-                        col,
-                        k,
-                        &b_bytes,
-                        &scales_u8,
-                        cfg.bpw,
-                        None,
-                        &outliers,
-                    );
-                    out[col * k..(col + 1) * k].copy_from_slice(&row_vals[..k]);
-                }
-                out
-            }
-            _ => match format {
-                grim_tensor::QuantFormat::Q8_0 => {
-                    let blocks_per_col = k / 32;
-                    let mut out = vec![0.0f32; k * n];
+                        .map(|&s| (s * 255.0).clamp(0.0, 255.0) as u8)
+                        .collect();
                     for col in 0..n {
-                        for block in 0..blocks_per_col {
-                            let scale_idx = col * blocks_per_col + block;
-                            let scale = b_scales.get(scale_idx).copied().unwrap_or(1.0f32);
-                            for i in 0..32 {
-                                let byte_offset = (col * blocks_per_col + block) * 32 + i;
-                                let q_val = b_bytes
-                                    .get(byte_offset)
-                                    .map(|&b| (b as i8) as f32)
-                                    .unwrap_or(0.0f32);
-                                let r = block * 32 + i;
-                                if r < k {
-                                    out[col * k + r] = q_val * scale;
-                                }
-                            }
-                        }
+                        let row_vals = crate::dequant_gemm::dequant_row(
+                            col, k, &b_bytes, &scales_u8, cfg.bpw, None, &outliers,
+                        );
+                        out[col * k..(col + 1) * k].copy_from_slice(&row_vals[..k]);
                     }
                     out
                 }
-                grim_tensor::QuantFormat::Q4K => grim_quant::dequant_q4k(&b_bytes, k * n)
-                    .map_err(|e| Error::Backend(format!("CPU quantized_matmul Q4K dequant: {e}")))?,
-                grim_tensor::QuantFormat::Q5K => grim_quant::dequant_q5k(&b_bytes, k * n)
-                    .map_err(|e| Error::Backend(format!("CPU quantized_matmul Q5K dequant: {e}")))?,
-                grim_tensor::QuantFormat::Q6K => grim_quant::dequant_q6k(&b_bytes, k * n)
-                    .map_err(|e| Error::Backend(format!("CPU quantized_matmul Q6K dequant: {e}")))?,
-                grim_tensor::QuantFormat::Iq4Nl => grim_quant::dequant_iq4nl(&b_bytes, k * n)
-                    .map_err(|e| Error::Backend(format!("CPU quantized_matmul IQ4NL dequant: {e}")))?,
-                grim_tensor::QuantFormat::Iq4Xs => grim_quant::dequant_iq4xs(&b_bytes, k * n)
-                    .map_err(|e| Error::Backend(format!("CPU quantized_matmul IQ4XS dequant: {e}")))?,
-                grim_tensor::QuantFormat::Iq3Xxs => grim_quant::dequant_iq3xxs(&b_bytes, k * n)
-                    .map_err(|e| Error::Backend(format!("CPU quantized_matmul IQ3XXS dequant: {e}")))?,
-                grim_tensor::QuantFormat::Iq3S => grim_quant::dequant_iq3s(&b_bytes, k * n)
-                    .map_err(|e| Error::Backend(format!("CPU quantized_matmul IQ3S dequant: {e}")))?,
-                grim_tensor::QuantFormat::Iq2Xxs => grim_quant::dequant_iq2xxs(&b_bytes, k * n)
-                    .map_err(|e| Error::Backend(format!("CPU quantized_matmul IQ2XXS dequant: {e}")))?,
-                grim_tensor::QuantFormat::Iq2Xs => grim_quant::dequant_iq2xs(&b_bytes, k * n)
-                    .map_err(|e| Error::Backend(format!("CPU quantized_matmul IQ2XS dequant: {e}")))?,
-                grim_tensor::QuantFormat::Iq2S => grim_quant::dequant_iq2s(&b_bytes, k * n)
-                    .map_err(|e| Error::Backend(format!("CPU quantized_matmul IQ2S dequant: {e}")))?,
-                grim_tensor::QuantFormat::Fp4 => grim_quant::dequant_mxfp4(&b_bytes, k * n)
-                    .map_err(|e| Error::Backend(format!("CPU quantized_matmul MXFP4 dequant: {e}")))?,
-                grim_tensor::QuantFormat::Fp4Block16 => {
-                    grim_quant::dequant_fp4_block16(&b_bytes, k * n).map_err(|e| {
-                        Error::Backend(format!("CPU quantized_matmul FP4Block16 dequant: {e}"))
-                    })?
-                }
-                grim_tensor::QuantFormat::Fp8 => grim_quant::dequant_fp8(&b_bytes, k * n)
-                    .map_err(|e| Error::Backend(format!("CPU quantized_matmul FP8 dequant: {e}")))?,
-                grim_tensor::QuantFormat::Fp8Block16 => grim_quant::dequant_fp8_block16(&b_bytes, k * n)
-                    .map_err(|e| Error::Backend(format!("CPU quantized_matmul FP8Block16 dequant: {e}")))?,
-                grim_tensor::QuantFormat::Nf4 => grim_quant::dequant_nf4(&b_bytes, k * n)
-                    .map_err(|e| Error::Backend(format!("CPU quantized_matmul NF4 dequant: {e}")))?,
-            },
-        };
+                _ => match format {
+                    grim_tensor::QuantFormat::Q8_0 => {
+                        let blocks_per_col = k / 32;
+                        let mut out = vec![0.0f32; k * n];
+                        for col in 0..n {
+                            for block in 0..blocks_per_col {
+                                let scale_idx = col * blocks_per_col + block;
+                                let scale = b_scales.get(scale_idx).copied().unwrap_or(1.0f32);
+                                for i in 0..32 {
+                                    let byte_offset = (col * blocks_per_col + block) * 32 + i;
+                                    let q_val = b_bytes
+                                        .get(byte_offset)
+                                        .map(|&b| (b as i8) as f32)
+                                        .unwrap_or(0.0f32);
+                                    let r = block * 32 + i;
+                                    if r < k {
+                                        out[col * k + r] = q_val * scale;
+                                    }
+                                }
+                            }
+                        }
+                        out
+                    }
+                    grim_tensor::QuantFormat::Q4K => grim_quant::dequant_q4k(&b_bytes, k * n)
+                        .map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul Q4K dequant: {e}"))
+                        })?,
+                    grim_tensor::QuantFormat::Q5K => grim_quant::dequant_q5k(&b_bytes, k * n)
+                        .map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul Q5K dequant: {e}"))
+                        })?,
+                    grim_tensor::QuantFormat::Q6K => grim_quant::dequant_q6k(&b_bytes, k * n)
+                        .map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul Q6K dequant: {e}"))
+                        })?,
+                    grim_tensor::QuantFormat::Iq4Nl => grim_quant::dequant_iq4nl(&b_bytes, k * n)
+                        .map_err(|e| {
+                        Error::Backend(format!("CPU quantized_matmul IQ4NL dequant: {e}"))
+                    })?,
+                    grim_tensor::QuantFormat::Iq4Xs => grim_quant::dequant_iq4xs(&b_bytes, k * n)
+                        .map_err(|e| {
+                        Error::Backend(format!("CPU quantized_matmul IQ4XS dequant: {e}"))
+                    })?,
+                    grim_tensor::QuantFormat::Iq3Xxs => grim_quant::dequant_iq3xxs(&b_bytes, k * n)
+                        .map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul IQ3XXS dequant: {e}"))
+                        })?,
+                    grim_tensor::QuantFormat::Iq3S => grim_quant::dequant_iq3s(&b_bytes, k * n)
+                        .map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul IQ3S dequant: {e}"))
+                        })?,
+                    grim_tensor::QuantFormat::Iq2Xxs => grim_quant::dequant_iq2xxs(&b_bytes, k * n)
+                        .map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul IQ2XXS dequant: {e}"))
+                        })?,
+                    grim_tensor::QuantFormat::Iq2Xs => grim_quant::dequant_iq2xs(&b_bytes, k * n)
+                        .map_err(|e| {
+                        Error::Backend(format!("CPU quantized_matmul IQ2XS dequant: {e}"))
+                    })?,
+                    grim_tensor::QuantFormat::Iq2S => grim_quant::dequant_iq2s(&b_bytes, k * n)
+                        .map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul IQ2S dequant: {e}"))
+                        })?,
+                    grim_tensor::QuantFormat::Fp4 => grim_quant::dequant_mxfp4(&b_bytes, k * n)
+                        .map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul MXFP4 dequant: {e}"))
+                        })?,
+                    grim_tensor::QuantFormat::Fp4Block16 => {
+                        grim_quant::dequant_fp4_block16(&b_bytes, k * n).map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul FP4Block16 dequant: {e}"))
+                        })?
+                    }
+                    grim_tensor::QuantFormat::Fp8 => grim_quant::dequant_fp8(&b_bytes, k * n)
+                        .map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul FP8 dequant: {e}"))
+                        })?,
+                    grim_tensor::QuantFormat::Fp8Block16 => {
+                        grim_quant::dequant_fp8_block16(&b_bytes, k * n).map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul FP8Block16 dequant: {e}"))
+                        })?
+                    }
+                    grim_tensor::QuantFormat::Nf4 => grim_quant::dequant_nf4(&b_bytes, k * n)
+                        .map_err(|e| {
+                            Error::Backend(format!("CPU quantized_matmul NF4 dequant: {e}"))
+                        })?,
+                },
+            };
 
         // Convert transposed [N, K] dequantized weights to row-major [K, N]
         let mut b_rm = vec![0.0f32; k * n];
@@ -1440,14 +1498,7 @@ impl BackendDevice for CpuDevice {
         ))
     }
 
-
-
-    fn alloc_storage(
-
-        &self,
-        shape: &Shape,
-        dtype: DType,
-    ) -> Result<Box<dyn BackendStorage>> {
+    fn alloc_storage(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         ensure_cpu_native(&dtype)?;
         let n = shape.elem_count();
         Ok(Box::new(CpuStorage::new(
@@ -1477,9 +1528,7 @@ impl BackendDevice for CpuDevice {
         if dst_elem_offset + count > dst_len {
             return Err(Error::IndexOutOfBounds(format!(
                 "copy_slice_into: offset {} + count {} > dst len {}",
-                dst_elem_offset,
-                count,
-                dst_len
+                dst_elem_offset, count, dst_len
             )));
         }
         unsafe {
@@ -1489,10 +1538,6 @@ impl BackendDevice for CpuDevice {
         }
         Ok(())
     }
-
-
-
-
 
     fn advise(
         &self,
@@ -1574,7 +1619,6 @@ fn ensure_cpu_native(dtype: &DType) -> Result<()> {
 
 /// Row-major `(M,K) @ (K,N) → (M,N)`. Selection: GEMV fast path, `oxiblas` SIMD, scalar fallback.
 pub(crate) fn gemm_dispatch(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: usize, k: usize) {
-
     // Fast path: M=1 (single-token decode), dot-product per column.
     if m == 1 {
         gemv_row(a, b, out, n, k);
@@ -1926,7 +1970,11 @@ mod tests {
 
         // Single query vector (all ones).
         let q = dev
-            .from_cpu(&vec![1.0f32; head_dim], &Shape::new(vec![1, num_heads, head_dim]), DType::F32)
+            .from_cpu(
+                &vec![1.0f32; head_dim],
+                &Shape::new(vec![1, num_heads, head_dim]),
+                DType::F32,
+            )
             .unwrap();
         // K: identity-like rows so dot products are position-identifiable.
         let mut k_data = vec![0.0f32; kv_seq_len * num_kv_heads * head_dim];
@@ -1934,35 +1982,72 @@ mod tests {
             k_data[t * head_dim + (t % head_dim)] = 1.0;
         }
         let k = dev
-            .from_cpu(&k_data, &Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]), DType::F32)
+            .from_cpu(
+                &k_data,
+                &Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]),
+                DType::F32,
+            )
             .unwrap();
         // V: position 0 carries a dominant value; all others near-zero. If the
         // window excludes position 0, it must not appear in the output.
         let mut v_data = vec![0.0f32; kv_seq_len * num_kv_heads * head_dim];
         v_data[0 * head_dim + 0] = 1000.0;
         let v = dev
-            .from_cpu(&v_data, &Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]), DType::F32)
+            .from_cpu(
+                &v_data,
+                &Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]),
+                DType::F32,
+            )
             .unwrap();
 
         let out_shape = Shape::new(vec![1, num_heads, head_dim]);
 
         let (w_out, _) = dev
-            .qkv_attention(q.as_ref(), k.as_ref(), v.as_ref(), num_kv_heads, kv_seq_len, cache_offset, window, &out_shape, None, None)
+            .qkv_attention(
+                q.as_ref(),
+                k.as_ref(),
+                v.as_ref(),
+                num_kv_heads,
+                kv_seq_len,
+                cache_offset,
+                window,
+                &out_shape,
+                None,
+                None,
+            )
             .unwrap();
         let w_vec = w_out.to_cpu_vec_f32().unwrap();
 
         let (full_out, _) = dev
-            .qkv_attention(q.as_ref(), k.as_ref(), v.as_ref(), num_kv_heads, kv_seq_len, cache_offset, None, &out_shape, None, None)
+            .qkv_attention(
+                q.as_ref(),
+                k.as_ref(),
+                v.as_ref(),
+                num_kv_heads,
+                kv_seq_len,
+                cache_offset,
+                None,
+                &out_shape,
+                None,
+                None,
+            )
             .unwrap();
         let full_vec = full_out.to_cpu_vec_f32().unwrap();
 
         // Windowed output must exclude the position-0 dominant V value.
         let w_norm: f32 = w_vec.iter().map(|x| x.abs()).sum();
         let full_norm: f32 = full_vec.iter().map(|x| x.abs()).sum();
-        assert!(w_norm < 1.0, "sliding-window output must not carry remote V, got norm {}", w_norm);
-        assert!(full_norm > 100.0, "full-causal output must carry the dominant V, got norm {}", full_norm);
+        assert!(
+            w_norm < 1.0,
+            "sliding-window output must not carry remote V, got norm {}",
+            w_norm
+        );
+        assert!(
+            full_norm > 100.0,
+            "full-causal output must carry the dominant V, got norm {}",
+            full_norm
+        );
     }
-
 
     #[test]
     fn test_backend_quantized_matmul_q4_k() {
@@ -2062,7 +2147,11 @@ mod tests {
 
         // q: all-ones so dot products are position-identifiable.
         let q = dev
-            .from_cpu(&vec![1.0f32; seq_len * num_heads * head_dim], &Shape::new(vec![seq_len, num_heads, head_dim]), DType::F32)
+            .from_cpu(
+                &vec![1.0f32; seq_len * num_heads * head_dim],
+                &Shape::new(vec![seq_len, num_heads, head_dim]),
+                DType::F32,
+            )
             .unwrap();
 
         // Packed 4-bit K/V: [kv_seq_len, num_kv_heads, head_dim], 2 nibbles/byte.
@@ -2087,15 +2176,33 @@ mod tests {
         let k_s = Box::new(CpuStorage::from_raw_bytes(
             k_packed.clone(),
             Shape::new(vec![kv_seq_len * num_kv_heads * head_dim / 2]),
-            DType { arith: grim_tensor::dtype::ArithType::U8, storage: grim_tensor::dtype::Storage::Native },
+            DType {
+                arith: grim_tensor::dtype::ArithType::U8,
+                storage: grim_tensor::dtype::Storage::Native,
+            },
         ));
         let v_s = Box::new(CpuStorage::from_raw_bytes(
             v_packed.clone(),
             Shape::new(vec![kv_seq_len * num_kv_heads * head_dim / 2]),
-            DType { arith: grim_tensor::dtype::ArithType::U8, storage: grim_tensor::dtype::Storage::Native },
+            DType {
+                arith: grim_tensor::dtype::ArithType::U8,
+                storage: grim_tensor::dtype::Storage::Native,
+            },
         ));
-        let k_scale_s = dev.from_cpu(&scales, &Shape::new(vec![kv_seq_len * num_kv_heads]), DType::F32).unwrap();
-        let v_scale_s = dev.from_cpu(&scales, &Shape::new(vec![kv_seq_len * num_kv_heads]), DType::F32).unwrap();
+        let k_scale_s = dev
+            .from_cpu(
+                &scales,
+                &Shape::new(vec![kv_seq_len * num_kv_heads]),
+                DType::F32,
+            )
+            .unwrap();
+        let v_scale_s = dev
+            .from_cpu(
+                &scales,
+                &Shape::new(vec![kv_seq_len * num_kv_heads]),
+                DType::F32,
+            )
+            .unwrap();
 
         let (out_s, _h) = dev
             .kv_dequant_attention(
@@ -2120,7 +2227,11 @@ mod tests {
                 let s = scales[r];
                 for d in 0..head_dim {
                     let byte = packed[r * head_dim / 2 + d / 2];
-                    let nibble = if d % 2 == 0 { byte & 0x0F } else { (byte >> 4) & 0x0F };
+                    let nibble = if d % 2 == 0 {
+                        byte & 0x0F
+                    } else {
+                        (byte >> 4) & 0x0F
+                    };
                     let signed = ((nibble as i8) << 4) >> 4;
                     out[r * head_dim + d] = signed as f32 * s;
                 }
@@ -2129,11 +2240,34 @@ mod tests {
         };
         let k_deq = dequant_row(&k_packed, &scales);
         let v_deq = dequant_row(&v_packed, &scales);
-        let k_deq_s = dev.from_cpu(&k_deq, &Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]), DType::F32).unwrap();
-        let v_deq_s = dev.from_cpu(&v_deq, &Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]), DType::F32).unwrap();
+        let k_deq_s = dev
+            .from_cpu(
+                &k_deq,
+                &Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]),
+                DType::F32,
+            )
+            .unwrap();
+        let v_deq_s = dev
+            .from_cpu(
+                &v_deq,
+                &Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]),
+                DType::F32,
+            )
+            .unwrap();
 
         let (ref_s, _h2) = dev
-            .qkv_attention(q.as_ref(), k_deq_s.as_ref(), v_deq_s.as_ref(), num_kv_heads, kv_seq_len, cache_offset, None, &out_shape, None, None)
+            .qkv_attention(
+                q.as_ref(),
+                k_deq_s.as_ref(),
+                v_deq_s.as_ref(),
+                num_kv_heads,
+                kv_seq_len,
+                cache_offset,
+                None,
+                &out_shape,
+                None,
+                None,
+            )
             .unwrap();
         let expected = ref_s.to_cpu_vec_f32().unwrap();
 
@@ -2154,11 +2288,19 @@ mod tests {
         let dyn_dev: &dyn BackendDevice = &dev;
 
         let key = "cpu_trait_capture";
-        dyn_dev.begin_graph_capture(key).expect("trait begin_graph_capture");
+        dyn_dev
+            .begin_graph_capture(key)
+            .expect("trait begin_graph_capture");
         assert!(!dyn_dev.replay_graph(key).expect("trait replay (pre)"));
-        dyn_dev.end_graph_capture(key).expect("trait end_graph_capture");
+        dyn_dev
+            .end_graph_capture(key)
+            .expect("trait end_graph_capture");
         assert!(dyn_dev.has_captured_graph(key));
         assert!(dyn_dev.replay_graph(key).expect("trait replay (post)"));
-        assert!(!dyn_dev.replay_graph("missing").expect("trait replay (missing)"));
+        assert!(
+            !dyn_dev
+                .replay_graph("missing")
+                .expect("trait replay (missing)")
+        );
     }
 }

@@ -170,8 +170,6 @@ pub fn dequant_row(
                     0
                 };
 
-
-
                 let levels = (1u32 << b2_bpw) as f32;
                 let normalized = code as f32 / (levels - 1.0);
                 let dequant_b2 = (normalized * 2.0 - 1.0) * b2_scale;

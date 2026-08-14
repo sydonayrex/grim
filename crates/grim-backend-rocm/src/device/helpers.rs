@@ -9,8 +9,8 @@ use crate::{
     HipErrorT, HipMemcpyKind, HiprtcProgram, hipFree, hipMalloc, hipMallocManaged, hipMemcpy,
     hipMemcpyAsync, hipStreamCreate, hipStreamDestroy, hipStreamSynchronize, hipSuccess,
     hiprtcAddNameExpression, hiprtcCompileProgram, hiprtcCreateProgram, hiprtcDestroyProgram,
-    hiprtcGetCode, hiprtcGetCodeSize, hiprtcGetLoweredName,
-    hiprtcGetProgramLog, hiprtcGetProgramLogSize,
+    hiprtcGetCode, hiprtcGetCodeSize, hiprtcGetLoweredName, hiprtcGetProgramLog,
+    hiprtcGetProgramLogSize,
 };
 
 /// Convert a raw `HipErrorT` into `Result<()>`. [see: `hipMalloc`, `hipStreamSynchronize`]

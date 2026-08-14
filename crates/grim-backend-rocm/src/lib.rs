@@ -80,8 +80,8 @@ pub use crate::device::handles::{
     hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad, hipModuleUnload, hipSetDevice,
     hipStreamBeginCapture, hipStreamCreate, hipStreamDestroy, hipStreamEndCapture,
     hipStreamSynchronize, hipSuccess, hiprtcAddNameExpression, hiprtcCompileProgram,
- hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode, hiprtcGetCodeSize,
- hiprtcGetErrorString, hiprtcGetLoweredName, hiprtcGetProgramLog, hiprtcGetProgramLogSize,
+    hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode, hiprtcGetCodeSize,
+    hiprtcGetErrorString, hiprtcGetLoweredName, hiprtcGetProgramLog, hiprtcGetProgramLogSize,
 };
 
 pub use crate::device::rocblas::{
@@ -122,6 +122,7 @@ pub use crate::graph_capture::{CapturedGraph, HipGraphExecutor, hip_graph_launch
 pub use crate::gptq_kernel::wavefront_size_for_gcn;
 
 pub use crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE;
+pub use crate::kernels::fused_linear_ce::FUSED_LINEAR_CE_KERNEL_SOURCE;
 pub use crate::kernels::jit_cache::HsacoKernelCache;
 pub use crate::kernels::source_asm::compute_kernel_source;
 

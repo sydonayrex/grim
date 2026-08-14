@@ -6,7 +6,7 @@
 use std::fs::File;
 use std::io::BufReader;
 
-use grim_format::gguf::{read_gguf, read_tensor_bytes, GgufDType};
+use grim_format::gguf::{GgufDType, read_gguf, read_tensor_bytes};
 use grim_quant::dequant_q4k;
 
 fn f16_le(b: &[u8], i: usize) -> f32 {
@@ -16,16 +16,12 @@ fn f16_le(b: &[u8], i: usize) -> f32 {
     let mant = (bits & 0x3FF) as u32;
     if exp == 0 {
         let val = (mant as f32) * 2f32.powi(-24);
-        if sign != 0 {
-            -val
-        } else {
-            val
-        }
+        if sign != 0 { -val } else { val }
     } else if exp == 31 {
         f32::from_bits((sign << 31) | 0x7F80_0000 | (mant << 13))
     } else {
-    let e = (exp as i32) - 15 + 127;
-    f32::from_bits((sign << 31) | ((e as u32) << 23) | (mant << 13))
+        let e = (exp as i32) - 15 + 127;
+        f32::from_bits((sign << 31) | ((e as u32) << 23) | (mant << 13))
     }
 }
 
@@ -132,11 +128,15 @@ fn real_model_q4k_matches_reference() {
             first_mismatch = Some((i, grim[i], refr[i]));
         }
     }
+    eprintln!("[kat] max_abs_diff={max_abs:.6} first_mismatch={first_mismatch:?}",);
     eprintln!(
-        "[kat] max_abs_diff={max_abs:.6} first_mismatch={first_mismatch:?}",
+        "[kat] grim first8={:?}",
+        &grim.iter().take(8).collect::<Vec<_>>()
     );
-    eprintln!("[kat] grim first8={:?}", &grim.iter().take(8).collect::<Vec<_>>());
-    eprintln!("[kat] ref  first8={:?}", &refr.iter().take(8).collect::<Vec<_>>());
+    eprintln!(
+        "[kat] ref  first8={:?}",
+        &refr.iter().take(8).collect::<Vec<_>>()
+    );
     assert!(
         max_abs < 1e-2,
         "grim q4k diverges from reference: max_abs={max_abs}"

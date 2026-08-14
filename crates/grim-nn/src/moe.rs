@@ -23,21 +23,21 @@
 //!   loader in `grim-models-transformer`).
 
 use grim_backend_cpu::cpu_tensor;
-use grim_tensor::dtype::{DType, QuantProvenance};
-#[cfg(feature = "vulkan-mem")]
-use grim_backend_vulkan::VulkanDevice;
 #[cfg(feature = "cuda-mem")]
 use grim_backend_cuda::CudaDevice;
 #[cfg(feature = "cuda-mem")]
 use grim_backend_cuda::CudaStorage;
-#[cfg(feature = "rocm-mem")]
-use grim_backend_rocm::RocmDevice;
 #[cfg(feature = "metal-mem")]
 use grim_backend_metal::MetalDevice;
+#[cfg(feature = "rocm-mem")]
+use grim_backend_rocm::RocmDevice;
+#[cfg(feature = "vulkan-mem")]
+use grim_backend_vulkan::VulkanDevice;
+use grim_tensor::dtype::{DType, QuantProvenance};
 
-use std::sync::Arc;
 use grim_tensor::shape::Shape;
 use grim_tensor::{BackendDevice, BackendStorage, Device, Tensor};
+use std::sync::Arc;
 
 use crate::modules::Linear;
 use crate::varbuilder::WeightSource;
@@ -58,13 +58,6 @@ pub enum RouterKind {
     /// loaded from the checkpoint (`exp_probs_b`) and passed to `MoeRouter::new`.
     SigmoidTopKWithBias,
 }
-
-impl RouterKind {
-    fn is_bias(&self) -> bool {
-        matches!(self, RouterKind::SigmoidTopKWithBias)
-    }
-}
-
 
 /// Router: a gate `Linear` (`hidden -> n_experts`), the gating strategy, and an
 /// optional correction bias (for `SigmoidTopKWithBias`, loaded from `exp_probs_b`).
@@ -137,7 +130,6 @@ impl MoeRouter {
                         .map(|(i, &v)| sigmoid(v) + b.get(i).copied().unwrap_or(0.0))
                         .collect()
                 }
-
             };
             // Rank by selection scores, take top_k.
             let mut order: Vec<usize> = (0..self.num_experts).collect();
@@ -159,7 +151,6 @@ impl MoeRouter {
                 RouterKind::SigmoidTopKWithBias => {
                     chosen.iter().map(|&i| sigmoid(row[i])).collect()
                 }
-
             };
             indices.push(chosen.to_vec());
             weights.push(raw);
@@ -206,12 +197,18 @@ impl ExpertBank {
         inter: usize,
         has_bias: bool,
     ) -> Result<Self, grim_tensor::error::Error> {
-        let gate_3d =
-            ws.get(Shape::new(vec![num_experts, inter, hidden]), "ffn_gate_exps.weight")?;
-        let up_3d =
-            ws.get(Shape::new(vec![num_experts, inter, hidden]), "ffn_up_exps.weight")?;
-        let down_3d =
-            ws.get(Shape::new(vec![num_experts, inter, hidden]), "ffn_down_exps.weight")?;
+        let gate_3d = ws.get(
+            Shape::new(vec![num_experts, inter, hidden]),
+            "ffn_gate_exps.weight",
+        )?;
+        let up_3d = ws.get(
+            Shape::new(vec![num_experts, inter, hidden]),
+            "ffn_up_exps.weight",
+        )?;
+        let down_3d = ws.get(
+            Shape::new(vec![num_experts, inter, hidden]),
+            "ffn_down_exps.weight",
+        )?;
 
         let gate_v = gate_3d.to_vec_f32()?;
         let up_v = up_3d.to_vec_f32()?;
@@ -360,7 +357,6 @@ impl MoeFfn {
             }
         }
 
-
         let (indices, weights) = self.router.route(x)?;
         let batch = indices.len();
         let hidden = self
@@ -463,9 +459,11 @@ impl MoeFfn {
 
         let dev = VulkanDevice::new();
         let x_storage: &dyn BackendStorage = &**x.storage();
-        let gate_buf = dev.upload_f32(&gate_flat, &Shape::new(vec![num_experts * inter * hidden]))?;
+        let gate_buf =
+            dev.upload_f32(&gate_flat, &Shape::new(vec![num_experts * inter * hidden]))?;
         let up_buf = dev.upload_f32(&up_flat, &Shape::new(vec![num_experts * inter * hidden]))?;
-        let down_buf = dev.upload_f32(&down_flat, &Shape::new(vec![num_experts * hidden * inter]))?;
+        let down_buf =
+            dev.upload_f32(&down_flat, &Shape::new(vec![num_experts * hidden * inter]))?;
         let tok_buf = dev.upload_u32(&rtok, &Shape::new(vec![num_pairs]))?;
         let exp_buf = dev.upload_u32(&rexp, &Shape::new(vec![num_pairs]))?;
         let w_buf = dev.upload_f32(&rw, &Shape::new(vec![num_pairs]))?;
@@ -505,9 +503,11 @@ impl MoeFfn {
     fn forward_cuda(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
         let ordinal = match x.device() {
             Device::Cuda(o) => *o,
-            _ => return Err(grim_tensor::error::Error::Backend(
-                "forward_cuda: x is not on a CUDA device".into(),
-            )),
+            _ => {
+                return Err(grim_tensor::error::Error::Backend(
+                    "forward_cuda: x is not on a CUDA device".into(),
+                ));
+            }
         };
         let (indices, weights) = self.router.route(x)?;
         let batch = indices.len();
@@ -635,9 +635,11 @@ impl MoeFfn {
     fn forward_metal(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
         let ordinal = match x.device() {
             Device::Metal(o) => *o,
-            _ => return Err(grim_tensor::error::Error::Backend(
-                "forward_metal: x is not on a Metal device".into(),
-            )),
+            _ => {
+                return Err(grim_tensor::error::Error::Backend(
+                    "forward_metal: x is not on a Metal device".into(),
+                ));
+            }
         };
         let (indices, weights) = self.router.route(x)?;
         let batch = indices.len();
@@ -686,24 +688,29 @@ impl MoeFfn {
 
         let dev = MetalDevice::new(ordinal)?;
         let x_storage: &dyn BackendStorage = &**x.storage();
-        let gate_buf = BackendDevice::from_cpu(&dev, 
+        let gate_buf = BackendDevice::from_cpu(
+            &dev,
             &gate_flat,
             &Shape::new(vec![num_experts * inter * hidden]),
             DType::F32,
         )?;
-        let up_buf = BackendDevice::from_cpu(&dev, 
+        let up_buf = BackendDevice::from_cpu(
+            &dev,
             &up_flat,
             &Shape::new(vec![num_experts * inter * hidden]),
             DType::F32,
         )?;
-        let down_buf = BackendDevice::from_cpu(&dev, 
+        let down_buf = BackendDevice::from_cpu(
+            &dev,
             &down_flat,
             &Shape::new(vec![num_experts * hidden * inter]),
             DType::F32,
         )?;
         // Router arrays are f32-backed (the shader casts back to int).
-        let tok_buf = BackendDevice::from_cpu(&dev, &rtok, &Shape::new(vec![num_pairs]), DType::F32)?;
-        let exp_buf = BackendDevice::from_cpu(&dev, &rexp, &Shape::new(vec![num_pairs]), DType::F32)?;
+        let tok_buf =
+            BackendDevice::from_cpu(&dev, &rtok, &Shape::new(vec![num_pairs]), DType::F32)?;
+        let exp_buf =
+            BackendDevice::from_cpu(&dev, &rexp, &Shape::new(vec![num_pairs]), DType::F32)?;
         let w_buf = BackendDevice::from_cpu(&dev, &rw, &Shape::new(vec![num_pairs]), DType::F32)?;
 
         let out_shape = Shape::new(vec![batch, hidden]);
@@ -737,9 +744,11 @@ impl MoeFfn {
     fn forward_rocm(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
         let ordinal = match x.device() {
             Device::Rocm(o) => *o,
-            _ => return Err(grim_tensor::error::Error::Backend(
-                "forward_rocm: x is not on a ROCm device".into(),
-            )),
+            _ => {
+                return Err(grim_tensor::error::Error::Backend(
+                    "forward_rocm: x is not on a ROCm device".into(),
+                ));
+            }
         };
         let (indices, weights) = self.router.route(x)?;
         let batch = indices.len();
@@ -772,15 +781,15 @@ impl MoeFfn {
             down_flat.extend_from_slice(&self.experts.down[e].weight.to_vec_f32()?);
         }
 
-        let assignment = grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(
-            &indices, &weights
-        )?;
+        let assignment =
+            grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(&indices, &weights)?;
 
         let dev = RocmDevice::try_new(ordinal)?;
         let x_storage: &dyn BackendStorage = &**x.storage();
-        let x_rocm = x_storage.as_any().downcast_ref::<grim_backend_rocm::RocmStorage>().ok_or_else(|| {
-            grim_tensor::error::Error::Backend("x is not RocmStorage".into())
-        })?;
+        let x_rocm = x_storage
+            .as_any()
+            .downcast_ref::<grim_backend_rocm::RocmStorage>()
+            .ok_or_else(|| grim_tensor::error::Error::Backend("x is not RocmStorage".into()))?;
 
         let out_shape = Shape::new(vec![batch, hidden]);
         let (out_storage, _handle) = dev.moe_fused_dispatch(
@@ -808,11 +817,9 @@ impl MoeFfn {
             out_tensor = crate::modules::add_tensors(&out_tensor, &s)?;
         }
 
-
         Ok(out_tensor)
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Host math helpers
@@ -874,6 +881,7 @@ fn bias_opt(has_bias: bool, dim: usize) -> Option<Tensor> {
     }
 }
 
+#[cfg(test)]
 fn silu(x: f32) -> f32 {
     x * sigmoid(x)
 }
@@ -953,10 +961,7 @@ impl LookaheadPredictor {
     /// forecast hot set and their normalized probabilities. When `enabled`
     /// is `false`, returns the current-layer top-k unchanged (the reactive
     /// fallback that adds no prediction signal — G-C3's off-switch).
-    pub fn predict(
-        &self,
-        current_logits: &[f32],
-    ) -> (Vec<usize>, Vec<f32>) {
+    pub fn predict(&self, current_logits: &[f32]) -> (Vec<usize>, Vec<f32>) {
         assert_eq!(
             current_logits.len(),
             self.num_experts,
@@ -1002,12 +1007,7 @@ impl LookaheadPredictor {
     /// (current_logits → next_layer_activated_set) pair. Strength `lr ∈
     /// (0, 1]`; v1 uses a Hebbian-style update pulling `W[i, j]` toward the
     /// co-activation signal `current_logits[i] * next_onehot[j]`.
-    pub fn distill_step(
-        &mut self,
-        current_logits: &[f32],
-        next_activated: &[usize],
-        lr: f32,
-    ) {
+    pub fn distill_step(&mut self, current_logits: &[f32], next_activated: &[usize], lr: f32) {
         let mut next_onehot = vec![0.0f32; self.num_experts];
         for &e in next_activated {
             if e < self.num_experts {
@@ -1093,11 +1093,7 @@ impl PlanBuilder {
     /// observed routing frequency). The hottest experts are kept fp16 up
     /// to the budget; the rest demote to int8. `prediction_driven` labels
     /// the plan for G-C3's off-switch comparison.
-    pub fn build(
-        &self,
-        hotness: &[f32],
-        prediction_driven: bool,
-    ) -> ResidentPlan {
+    pub fn build(&self, hotness: &[f32], prediction_driven: bool) -> ResidentPlan {
         let n = hotness.len();
         // Rank experts by hotness (desc); ties broken by index for stability.
         let mut order: Vec<usize> = (0..n).collect();
@@ -1112,10 +1108,11 @@ impl PlanBuilder {
         let mut used = 0usize;
         // Greedy: promote experts to fp16 in hotness order until budget hit.
         // Start from the all-int8 baseline cost, then upgrade.
-        let mut baseline = n * self.bytes_per_expert_int8;
+        let baseline = n * self.bytes_per_expert_int8;
         for &e in &order {
-            let upgrade_cost =
-                self.bytes_per_expert_fp16.saturating_sub(self.bytes_per_expert_int8);
+            let upgrade_cost = self
+                .bytes_per_expert_fp16
+                .saturating_sub(self.bytes_per_expert_int8);
             let _ = baseline; // baseline tracks the all-int8 floor
             if used + upgrade_cost <= self.hbm_budget_bytes || self.hbm_budget_bytes == 0 {
                 precision[e] = ExpertPrecision::Fp16;
@@ -1292,12 +1289,11 @@ impl ExpertPlacementMap {
     /// populated `caps` (CapabilityProfiler in production, hand-set values in
     /// tests). The plan's "homogeneous and mixed-GPU synthetic cases" both
     /// flow through this same function — the test suite exercises each.
-    pub fn build(
-        num_experts: usize,
-        caps: &[GpuCapability],
-        metric: CapacityMetric,
-    ) -> Self {
-        assert!(num_ranks_nonzero(caps), "ExpertPlacementMap::build: caps must be non-empty");
+    pub fn build(num_experts: usize, caps: &[GpuCapability], metric: CapacityMetric) -> Self {
+        assert!(
+            num_ranks_nonzero(caps),
+            "ExpertPlacementMap::build: caps must be non-empty"
+        );
         let num_ranks = caps.len();
         let capacities: Vec<f64> = caps.iter().map(|c| capacity_of(c, metric)).collect();
         // Greedy largest-remainder: track each rank's assigned load (in the
@@ -1368,7 +1364,11 @@ impl ExpertPlacementMap {
             .map(|r| self.count_on_rank(r) as f32)
             .collect();
         let mx = counts.iter().copied().fold(0.0f32, f32::max);
-        let mn = counts.iter().copied().filter(|&c| c > 0.0).fold(f32::INFINITY, f32::min);
+        let mn = counts
+            .iter()
+            .copied()
+            .filter(|&c| c > 0.0)
+            .fold(f32::INFINITY, f32::min);
         if mn.is_finite() && mn > 0.0 {
             mx / mn
         } else {
@@ -1495,7 +1495,10 @@ mod tests {
         // Combine weight for selected expert 1 is the unbiased sigmoid of its
         // gate logit (0.1) -> 1/(1+e^-0.1), NOT the biased score.
         let unbiased = sigmoid(0.1);
-        assert!((w[0][0] - unbiased).abs() < 1e-5, "combine weight must be unbiased");
+        assert!(
+            (w[0][0] - unbiased).abs() < 1e-5,
+            "combine weight must be unbiased"
+        );
     }
 
     #[test]
@@ -1517,7 +1520,9 @@ mod tests {
         let expected0 = w0 * silu(1.0) + w2 * silu(3.0);
         assert!(
             (v[0] - expected0).abs() < 1e-4,
-            "dim0 = {} expected {}", v[0], expected0
+            "dim0 = {} expected {}",
+            v[0],
+            expected0
         );
         assert!(v[1].abs() < 1e-6 && v[2].abs() < 1e-6 && v[3].abs() < 1e-6);
     }
@@ -1548,7 +1553,12 @@ mod tests {
         let w0 = (3.0f32.exp()) / (3.0f32.exp() + 2.0f32.exp());
         let w2 = 1.0 - w0;
         let expected0 = w0 * silu(1.0) + w2 * silu(3.0) + 1.0 * silu(1.0);
-        assert!((v[0] - expected0).abs() < 1e-4, "with shared: dim0 = {} vs {}", v[0], expected0);
+        assert!(
+            (v[0] - expected0).abs() < 1e-4,
+            "with shared: dim0 = {} vs {}",
+            v[0],
+            expected0
+        );
     }
 
     #[test]
@@ -1596,7 +1606,10 @@ mod tests {
         // logits [3.0, 0.1, 2.0, -1.0] → top-2 = {0, 2}
         let (idx, probs) = p.predict(&[3.0, 0.1, 2.0, -1.0]);
         assert_eq!(idx, vec![0, 2], "identity-prior forecast = current top-k");
-        assert!((probs.iter().sum::<f32>() - 1.0).abs() < 1e-5, "probs normalized");
+        assert!(
+            (probs.iter().sum::<f32>() - 1.0).abs() < 1e-5,
+            "probs normalized"
+        );
         assert!(probs[0] > probs[1], "hotter expert first");
     }
 
@@ -1639,7 +1652,7 @@ mod tests {
     fn predictor_hits_threshold_on_consistent_trace() {
         // 6 experts, top-2. Build a trace where layer L+1 = layer L (perfect
         // consistency), so the identity-prior predictor already hits 1.0.
-        let mut p = LookaheadPredictor::new_gate_initialized(6, 2);
+        let p = LookaheadPredictor::new_gate_initialized(6, 2);
         // Logits that select experts {0, 3} every layer.
         let cur = vec![5.0, 0.0, 0.0, 4.0, 0.0, 0.0];
         // Held-out realized routing = {0, 3} (the ground truth).
@@ -1769,7 +1782,10 @@ mod tests {
         // Identity prior → forecasts {0, 2}. Realized next = {1, 3} (totally
         // different). Hit@k must be 0 — the honest "no signal" outcome.
         let hit = prediction_hit_at_k(&idx, &[1, 3]);
-        assert_eq!(hit, 0.0, "disabled predictor must report 0 Hit@k on disjoint next");
+        assert_eq!(
+            hit, 0.0,
+            "disabled predictor must report 0 Hit@k on disjoint next"
+        );
     }
 
     /// G-C3 off-switch programmatic enforcement: `predict()` must actually
@@ -1787,10 +1803,10 @@ mod tests {
         // Overwrite W_distill to swap experts 0↔1: if predict() consulted
         // W, the forecast would shift toward expert 1 (logit 5.0 lands on
         // column 1 instead of column 0).
-        p.distill[0] = 0.0;  // W[0,0] = 0 (was 1.0)
-        p.distill[1] = 1.0;  // W[0,1] = 1 (was 0.0)
-        p.distill[4] = 1.0;  // W[1,0] = 1 (was 0.0)
-        p.distill[5] = 0.0;  // W[1,1] = 0 (was 1.0)
+        p.distill[0] = 0.0; // W[0,0] = 0 (was 1.0)
+        p.distill[1] = 1.0; // W[0,1] = 1 (was 0.0)
+        p.distill[4] = 1.0; // W[1,0] = 1 (was 0.0)
+        p.distill[5] = 0.0; // W[1,1] = 0 (was 1.0)
         // With the buggy code (W consulted despite enabled=false):
         //   pred[0] = cur[0]*0 + cur[1]*1 = 0.0
         //   pred[1] = cur[0]*1 + cur[1]*0 = 5.0
@@ -1838,7 +1854,10 @@ mod tests {
         assert_eq!(map.count_on_rank(1), 4);
         // load_fraction sums to 1.0.
         let total: f32 = map.load_fraction.iter().sum();
-        assert!((total - 1.0).abs() < 1e-6, "load_fraction must sum to 1.0, got {total}");
+        assert!(
+            (total - 1.0).abs() < 1e-6,
+            "load_fraction must sum to 1.0, got {total}"
+        );
         // Perfectly balanced.
         assert!((map.max_imbalance() - 1.0).abs() < 1e-6);
         // Every expert has a valid rank assignment.
@@ -1904,7 +1923,10 @@ mod tests {
         // 2:1 TFLOPS ratio → 5/3 or 6/2).
         let t0 = map_tflops.count_on_rank(0) as f32;
         let t1 = map_tflops.count_on_rank(1) as f32;
-        assert!(t0 / t1.max(1.0) >= 1.5, "TFLOPS-proportional ratio expected ≥ 1.5");
+        assert!(
+            t0 / t1.max(1.0) >= 1.5,
+            "TFLOPS-proportional ratio expected ≥ 1.5"
+        );
     }
 
     #[test]
@@ -1936,7 +1958,11 @@ mod tests {
         ];
         let map = ExpertPlacementMap::build(10, &caps, CapacityMetric::VramBytes);
         assert_eq!(map.num_ranks, 3);
-        let counts = [map.count_on_rank(0), map.count_on_rank(1), map.count_on_rank(2)];
+        let counts = [
+            map.count_on_rank(0),
+            map.count_on_rank(1),
+            map.count_on_rank(2),
+        ];
         let total: usize = counts.iter().sum();
         assert_eq!(total, 10, "every expert must be placed");
         // Max imbalance ≤ 4/3 (the theoretical floor for 10 experts on 3

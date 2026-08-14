@@ -3,8 +3,8 @@
 use grim_core::catalog::resolve_model_preferring_grim;
 use grim_core::error::{Error, Result};
 use grim_core::grim_models_dir;
-use std::io::{self, Write};
 use std::fs;
+use std::io::{self, Write};
 
 /// Remove a model from the local cache.
 ///
@@ -60,7 +60,9 @@ pub async fn cmd_rm(model: &str, force: bool) -> Result<()> {
             println!("  {}", t);
         }
         print!("Proceed? [y/N] ");
-        io::stdout().flush().map_err(|e| Error::Config(format!("Failed to flush stdout: {e}")))?;
+        io::stdout()
+            .flush()
+            .map_err(|e| Error::Config(format!("Failed to flush stdout: {e}")))?;
         let mut buf = String::new();
         io::stdin()
             .read_line(&mut buf)

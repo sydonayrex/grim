@@ -414,7 +414,6 @@ pub fn plan_hybrid_attention_step(
 #[cfg(test)]
 mod hybrid_tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn make_spill() -> grim_kvtransport::SharedSpillManager {
         let dir = std::env::temp_dir().join(format!(

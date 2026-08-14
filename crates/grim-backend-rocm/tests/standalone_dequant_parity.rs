@@ -261,7 +261,9 @@ fn run_iq(
     let expected = match cpu(&bytes, n_weights) {
         Ok(e) => e,
         Err(_) => {
-            eprintln!("[{name}_parity] skipped CPU oracle comparison (format unimplemented in CPU oracle)");
+            eprintln!(
+                "[{name}_parity] skipped CPU oracle comparison (format unimplemented in CPU oracle)"
+            );
             return;
         }
     };

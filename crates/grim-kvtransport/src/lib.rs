@@ -585,7 +585,9 @@ where
                     let total_bytes = match num_elems.checked_mul(8) {
                         Some(b) => b,
                         None => {
-                            eprintln!("[grim-kvtransport] KV receiver: num_elements {num_elems} multiplied by 8 overflowed usize");
+                            eprintln!(
+                                "[grim-kvtransport] KV receiver: num_elements {num_elems} multiplied by 8 overflowed usize"
+                            );
                             continue;
                         }
                     };

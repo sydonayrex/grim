@@ -6,6 +6,7 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::shared_device_fns::KERNEL_SOURCE);
     s.push_str(crate::kernels::charon::KERNEL_SOURCE);
     s.push_str(crate::kernels::compute_kernels::OTHER_KERNEL_SOURCE);
+    s.push_str(crate::kernels::fused_linear_ce::FUSED_LINEAR_CE_KERNEL_SOURCE);
     s.push_str(crate::kernels::qkv_attention::KERNEL_SOURCE);
     s.push_str(crate::kernels::decode_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::fused_dequant_gemm::KERNEL_SOURCE);
@@ -31,7 +32,6 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::sage_attention::SAGE_ATTENTION_KERNEL_SOURCE);
     s
 }
-
 
 /// Generate JIT kernel source parameterized by HardwareSpec, tile selection, and multi-GPU shard parameters.
 pub fn compute_kernel_source_with_spec(
@@ -63,6 +63,8 @@ pub fn compute_kernel_source_with_spec(
 #define GRIM_GRID_STRIDE_N    {}
 #define GRIM_DEVICE_ID        {}
 #define GRIM_NUM_DEVICES      {}
+#define GRIM_LDS_DOUBLE_BUFFER {}
+#define GRIM_SCHED_GROUP_BARRIER {}
 
 "#,
         spec.wavefront_size,
@@ -76,12 +78,13 @@ pub fn compute_kernel_source_with_spec(
         tiles.grid_stride_n,
         device_id,
         num_devices,
+        tiles.lds_double_buffer as u32,
+        (tiles.block_k >= 32) as u32,
     );
 
     source.push_str(&defines);
     source
 }
-
 
 #[cfg(test)]
 mod source_asm_self_tests {
@@ -113,6 +116,43 @@ mod source_asm_self_tests {
         assert!(src.contains("grim_cross_attention"));
         assert!(src.contains("grim_rwkv_time_mix"));
         assert!(src.contains("grim_fp8_gemm_rdna4"));
+    }
+
+    #[test]
+    fn specialized_source_wires_lds_and_schedule_controls() {
+        let topology = crate::peer_access::P2PTopology {
+            device_count: 0,
+            links: Vec::new(),
+        };
+        let spec = crate::device::hardware_spec::HardwareSpec {
+            gcn_arch: "gfx1100".into(),
+            wavefront_size: 32,
+            max_shared_mem_per_block: 64 * 1024,
+            cu_count: 1,
+            max_threads_per_block: 1024,
+            mem_bandwidth_gb_s: 1000.0,
+            multiprocessor_count: 1,
+            p2p_topology: topology,
+        };
+        let dims = crate::kernels::tile_picker::ShapeDims::new(32, 32, 64);
+        let tiles = crate::kernels::tile_picker::pick_tiles(
+            &spec,
+            crate::autotune::ShapeClass::Prefill,
+            dims,
+        );
+        let source = compute_kernel_source_with_spec(
+            &spec,
+            "grim_wmma_gemm",
+            crate::autotune::ShapeClass::Prefill,
+            dims,
+            0,
+            1,
+            Some(&tiles),
+        );
+        assert!(source.contains("#define GRIM_LDS_DOUBLE_BUFFER"));
+        assert!(source.contains("#define GRIM_SCHED_GROUP_BARRIER"));
+        assert!(source.contains("__builtin_amdgcn_sched_group_barrier"));
+        assert!(source.contains("lds_a[2][256]"));
     }
 
     /// A.0 regression guard: every shared __device__ helper must be defined

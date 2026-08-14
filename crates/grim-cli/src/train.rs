@@ -231,10 +231,10 @@ fn llama_config_from_metadata(provider: &GgufProvider) -> Result<LlamaConfig> {
         rms_norm_eps,
         rope_theta,
         max_seq_len: 2048,
-    
+
         partial_rotary_factor: 1.0,
         yarn: None,
-        })
+    })
 }
 
 /// Helper: get metadata as u32 from provider.

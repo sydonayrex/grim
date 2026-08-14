@@ -8,7 +8,7 @@ use crate::autotune::ShapeClass;
 use crate::device::hardware_spec::HardwareSpec;
 use crate::device::roc_device::RocmDevice;
 use crate::kernels::source_asm::compute_kernel_source_with_spec;
-use crate::kernels::tile_picker::{pick_tiles, ShapeDims};
+use crate::kernels::tile_picker::{ShapeDims, pick_tiles};
 use crate::rccl::RcclAllReduce;
 
 /// Launch a kernel across N GPUs with shard split on the M dimension.
@@ -81,4 +81,3 @@ pub fn launch_multi_gpu_kernel(
 
     Ok(())
 }
-

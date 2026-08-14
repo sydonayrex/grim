@@ -11,7 +11,7 @@
 
 use grim_quant::quant_q80;
 use grim_tensor::{
-    BackendDevice, BackendStorage, QuantizedMatmulBackwardResiduals, Shape,
+    BackendDevice, QuantizedMatmulBackwardResiduals, Shape,
     dtype::{ArithType, DType, KQuantScheme, Storage},
 };
 
@@ -61,7 +61,6 @@ fn quant_backward_rocm_q8_0_gemm_dx_numerics() {
     let dy_host: Vec<f32> = (0..m * n).map(|i| (i as f32 * 0.05).cos()).collect();
     let b_orig: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.1).sin() * 5.0).collect();
 
-
     let dy_shape = Shape::from_slice(&[m, n]);
     let dy_rocm = dev.from_cpu(&dy_host, &dy_shape, DType::F32).unwrap();
 
@@ -85,8 +84,6 @@ fn quant_backward_rocm_q8_0_gemm_dx_numerics() {
 
     // Reference gradient on CPU using dequantized weights
     let dx_ref = compute_dx(&dy_host, &b_dequant_untrans, m, n, k);
-
-
 
     let b_rocm = dev
         .from_cpu_bytes(

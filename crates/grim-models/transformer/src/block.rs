@@ -5,7 +5,7 @@ use grim_nn::{
     ColumnParallelLinear, Linear, RmsNorm, Rope, RowParallelLinear, TensorParallelConfig,
     WeightSource,
 };
-use grim_tensor::{Device, DType, Shape, Tensor};
+use grim_tensor::{DType, Device, Shape, Tensor};
 
 use crate::model::LlamaConfig;
 
@@ -26,7 +26,12 @@ pub struct LayerAttentionSpec {
 }
 
 impl LayerAttentionSpec {
-    pub fn default_full(num_heads: usize, num_kv_heads: usize, head_dim: usize, rope_theta: f32) -> Self {
+    pub fn default_full(
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rope_theta: f32,
+    ) -> Self {
         Self {
             attn_type: AttentionType::Full,
             num_heads,
@@ -63,7 +68,6 @@ impl LayerAttentionSpec {
     }
 }
 
-
 #[derive(Debug, Clone, Copy)]
 pub struct LlamaConfigRefs {
     pub hidden_size: usize,
@@ -82,7 +86,6 @@ pub struct LlamaConfigRefs {
     pub kv_head_replica_factor: usize,
     pub sliding_window: Option<usize>,
 }
-
 
 /// Compute the per-rank TP sharding plan for attention heads.
 ///
@@ -191,7 +194,12 @@ fn reshaped_view(x: &Tensor, shape: &Shape) -> Result<Tensor> {
     // data never leaves the GPU (decode-hot path on ROCm).
     if let Ok(fresh) = dev.alloc_storage(shape, DType::F32) {
         if dev
-            .copy_slice_into(fresh.as_ref(), x.storage().as_ref(), 0, x.shape().elem_count())
+            .copy_slice_into(
+                fresh.as_ref(),
+                x.storage().as_ref(),
+                0,
+                x.shape().elem_count(),
+            )
             .is_ok()
         {
             return Ok(Tensor::new(
@@ -253,10 +261,7 @@ fn cache_append_kv<'a>(
 )> {
     let want = past_len + s_len;
     let grow = |slot: &mut Option<Box<dyn grim_tensor::BackendStorage>>| -> Result<()> {
-        let cap = slot
-            .as_ref()
-            .map(|st| st.shape().dims()[0])
-            .unwrap_or(0);
+        let cap = slot.as_ref().map(|st| st.shape().dims()[0]).unwrap_or(0);
         if cap >= want {
             return Ok(());
         }
@@ -438,7 +443,6 @@ impl LlamaBlock {
         })
     }
 
-
     pub fn forward(&self, x: &Tensor, positions: &[u32]) -> Result<Tensor> {
         let (out, _, _) = self.forward_with_kv(x, positions)?;
         Ok(out)
@@ -586,14 +590,13 @@ impl LlamaBlock {
         // Apply rope on-device. If the backend has a `rope` kernel (ROCm, CPU),
         // use it directly; otherwise fall back to the grim_nn Rope module.
         let _ta = std::time::Instant::now();
-let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
+        let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
         match dev.rope(
             relabeled.storage().as_ref(),
             &ext_positions,
             &self.rope.config,
             &rope_shape,
         ) {
-
             Ok((st, _h)) => {
                 let rope_out = Tensor::new(
                     std::sync::Arc::from(st),
@@ -635,11 +638,7 @@ let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
 
         let q_len = {
             let dims = q_rot.shape().dims();
-            if dims.len() == 3 {
-                dims[1]
-            } else {
-                dims[0]
-            }
+            if dims.len() == 3 { dims[1] } else { dims[0] }
         };
         let row_elems = cfg.local_num_kv_heads * cfg.head_dim;
         let out_shape = Shape::new(vec![q_len, cfg.local_num_heads, cfg.head_dim]);
@@ -685,16 +684,16 @@ let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
                     c.past_len = total;
                 }
                 Err(e) if is_unimplemented(&e) => {
-                let total = c.past_len + q_len;
-                c.k_cache.extend_from_slice(&k_3d.to_vec_f32()?);
-                c.v_cache.extend_from_slice(&v_3d.to_vec_f32()?);
-                c.past_len = total;
-                let kv_shape = Shape::new(vec![total, cfg.local_num_kv_heads, cfg.head_dim]);
-                owned_k = Some(dev.from_cpu(&c.k_cache, &kv_shape, DType::F32)?);
-                owned_v = Some(dev.from_cpu(&c.v_cache, &kv_shape, DType::F32)?);
-                host_vecs = Some((c.k_cache.clone(), c.v_cache.clone()));
-                kv_len = total;
-            }
+                    let total = c.past_len + q_len;
+                    c.k_cache.extend_from_slice(&k_3d.to_vec_f32()?);
+                    c.v_cache.extend_from_slice(&v_3d.to_vec_f32()?);
+                    c.past_len = total;
+                    let kv_shape = Shape::new(vec![total, cfg.local_num_kv_heads, cfg.head_dim]);
+                    owned_k = Some(dev.from_cpu(&c.k_cache, &kv_shape, DType::F32)?);
+                    owned_v = Some(dev.from_cpu(&c.v_cache, &kv_shape, DType::F32)?);
+                    host_vecs = Some((c.k_cache.clone(), c.v_cache.clone()));
+                    kv_len = total;
+                }
                 Err(e) => return Err(e),
             }
         } else {
@@ -725,12 +724,10 @@ let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
             kv_len,
             old_past_len as u32,
             self._cfg.sliding_window,
-
             &out_shape,
             None,
             None,
         ) {
-
             Ok((s, _h)) => Tensor::new(
                 std::sync::Arc::from(s),
                 out_shape.clone(),
@@ -821,8 +818,11 @@ let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
         }
 
         let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
-        let storage =
-            dev.from_cpu(&out, &Shape::new(vec![q_len, num_head_dims]), grim_tensor::DType::F32)?;
+        let storage = dev.from_cpu(
+            &out,
+            &Shape::new(vec![q_len, num_head_dims]),
+            grim_tensor::DType::F32,
+        )?;
         Ok(Tensor::new(
             std::sync::Arc::from(storage),
             Shape::new(vec![q_len, num_head_dims]),
@@ -884,10 +884,8 @@ let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
             kv_seq_len,
             cache_offset,
             self._cfg.sliding_window,
-
             &out_shape_3d,
         )?;
-
 
         let num_head_dims = cfg.local_num_heads * cfg.head_dim;
         let out_shape_2d = Shape::new(vec![total_tokens, num_head_dims]);
@@ -905,7 +903,7 @@ let dev = grim_nn::modules::pick_device_for_storage_device(&self._dev);
 mod tests {
     use super::*;
     use grim_backend_cpu::cpu_tensor;
-    use grim_tensor::{DType, Device, Shape, Tensor};
+    use grim_tensor::{Device, Shape, Tensor};
 
     #[test]
     fn full_with_rope_threads_partial_rotary_and_yarn_into_spec() {
@@ -921,8 +919,14 @@ mod tests {
         assert_eq!(spec.attn_type, AttentionType::Full);
         assert_eq!(spec.rope.dim, 16);
         assert!((spec.rope.base - 1_000_000.0).abs() < 1e-3);
-        assert_eq!(spec.rope.rotary_dim, 8, "rotary_dim must be round(0.5 * 16)");
-        assert!(!spec.rope.is_plain(), "yarn + partial-rotary must not be plain");
+        assert_eq!(
+            spec.rope.rotary_dim, 8,
+            "rotary_dim must be round(0.5 * 16)"
+        );
+        assert!(
+            !spec.rope.is_plain(),
+            "yarn + partial-rotary must not be plain"
+        );
         assert_eq!(spec.rope.yarn.unwrap().factor, 4.0);
         assert_eq!(spec.sliding_window, None);
     }
@@ -950,7 +954,6 @@ mod tests {
             kv_head_replica_factor: 1,
         }
     }
-
 
     fn make_linear(in_dim: usize, out_dim: usize) -> Linear {
         // Small weights to keep attention scores in a reasonable range for
@@ -1407,7 +1410,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             max_seq_len: 512,
-        
+
             partial_rotary_factor: 1.0,
             yarn: None,
         };
@@ -1426,7 +1429,7 @@ mod tests {
     /// shard weights to half size while keeping KV head replication correct.
     #[test]
     fn test_llama_load_tp_output_head_sharded() {
-        let tp = TensorParallelConfig {
+        let _tp = TensorParallelConfig {
             rank: 0,
             world_size: 2,
         };
@@ -1496,7 +1499,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             max_seq_len: 512,
-        
+
             partial_rotary_factor: 1.0,
             yarn: None,
         };

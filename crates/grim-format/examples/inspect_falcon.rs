@@ -1,7 +1,7 @@
+use grim_format::GgufValue;
+use grim_format::gguf::read_gguf;
 use std::collections::HashMap;
 use std::fs::File;
-use grim_format::gguf::read_gguf;
-use grim_format::GgufValue;
 
 fn main() {
     let mut f = File::open(std::env::args().nth(1).unwrap()).unwrap();

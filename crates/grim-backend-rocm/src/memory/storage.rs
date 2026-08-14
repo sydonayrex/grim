@@ -9,8 +9,8 @@ use grim_tensor::error::{Error, Result};
 
 // Re-exports used by the type's field types. The actual type declarations
 use crate::{
-    DType, DTypeStorage, HipMemcpyKind, QuantProvenance, RocmCachingAllocator, RocmDevice, Shape, check_hip,
-    hipMallocManaged, hipMemPrefetchAsync, hipMemcpy, hipSuccess,
+    DType, DTypeStorage, HipMemcpyKind, QuantProvenance, RocmCachingAllocator, RocmDevice, Shape,
+    check_hip, hipMallocManaged, hipMemPrefetchAsync, hipMemcpy, hipSuccess,
 };
 
 /// ROCm-side tensor storage. Holds a hipDeviceptr_t (as u64) plus shape/dtype/provenance metadata.
@@ -400,11 +400,15 @@ impl BackendStorage for RocmStorage {
 
             let dev = RocmDevice::shared(self.ordinal);
             let gpu_deq = match self.dtype.storage {
-                DTypeStorage::KQuant(KQuantScheme::Q80) => dev.dequantize_q8_0_host(&raw, elem_count),
+                DTypeStorage::KQuant(KQuantScheme::Q80) => {
+                    dev.dequantize_q8_0_host(&raw, elem_count)
+                }
                 DTypeStorage::FloatPack(grim_tensor::FloatPackScheme::Fp8) => {
                     dev.dequantize_fp8_host(&raw, elem_count)
                 }
-                DTypeStorage::KQuant(KQuantScheme::Q4K) => dev.dequantize_q4k_host(&raw, elem_count),
+                DTypeStorage::KQuant(KQuantScheme::Q4K) => {
+                    dev.dequantize_q4k_host(&raw, elem_count)
+                }
                 _ => dequant_cpu(&raw, elem_count, &self.dtype),
             };
 
@@ -460,7 +464,6 @@ impl BackendStorage for RocmStorage {
             }
             // F32 and integer types: direct memcpy into f32 buffer.
             _ => {
-
                 let mut host_data = vec![0.0f32; elem_count];
                 check_hip("hipMemcpyDtoH", unsafe {
                     hipMemcpy(
@@ -549,9 +552,7 @@ fn dequant_cpu(raw: &[u8], elem_count: usize, dtype: &DType) -> Result<Vec<f32>>
             }
             Ok(out)
         }
-        DTypeStorage::KQuant(KQuantScheme::Q4K) => {
-            grim_quant::dequant_q4k(raw, elem_count)
-        }
+        DTypeStorage::KQuant(KQuantScheme::Q4K) => grim_quant::dequant_q4k(raw, elem_count),
         _ => Err(Error::Backend(format!(
             "to_cpu_vec_f32: host dequant not yet implemented for {:?}",
             dtype.storage

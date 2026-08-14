@@ -3,7 +3,7 @@
 use std::fs::File;
 use std::io::BufReader;
 
-use grim_format::gguf::{read_gguf, read_tensor_bytes, GgufDType};
+use grim_format::gguf::{GgufDType, read_gguf, read_tensor_bytes};
 use grim_quant::dequant_q6k;
 
 fn f16_le(b: &[u8], i: usize) -> f32 {
@@ -62,7 +62,10 @@ fn diag_block0() {
     let path = repo_root.join("models/MiniCPM5-1B-Q4_K_M.gguf");
     let f = match File::open(&path) {
         Ok(f) => f,
-        Err(_) => { eprintln!("skip: model not present"); return; }
+        Err(_) => {
+            eprintln!("skip: model not present");
+            return;
+        }
     };
     let mut reader = BufReader::new(f);
     let file = read_gguf(&mut reader).expect("read_gguf");
@@ -84,7 +87,10 @@ fn diag_block0() {
     let mut max_d = 0.0f32;
     for i in 0..a.len().min(b.len()) {
         let d = (a[i] - b[i]).abs();
-        if d > max_d { max_d = d; max_i = i; }
+        if d > max_d {
+            max_d = d;
+            max_i = i;
+        }
     }
     eprintln!("[diag] block0 max_diff={max_d} at {max_i}");
     eprintln!("[diag] a[128..140]={:?}", &a[128..140]);

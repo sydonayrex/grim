@@ -962,6 +962,7 @@ pub use grim_memory::PagedKvCache;
 pub use grim_scheduler::{AdmissionController, Request, Scheduler, SchedulerOutput};
 
 #[cfg(test)]
+#[allow(unused_must_use)]
 mod tests {
     use super::*;
 
@@ -1019,10 +1020,10 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 max_seq_len: 64,
-            
+
                 partial_rotary_factor: 1.0,
                 yarn: None,
-        },
+            },
         ))
     }
 

@@ -1,9 +1,8 @@
-pub mod caps;
 pub mod autotune;
+pub mod caps;
 
+pub use autotune::{GemmOp, MetalAutotuner, MetalTileConfig, ShapeClass};
 pub use caps::MetalCaps;
-pub use autotune::{MetalAutotuner, MetalTileConfig, ShapeClass, GemmOp};
-
 
 use grim_tensor::backend::{ComputeHandle, ReadyHandle};
 #[allow(unused_imports)]
@@ -426,8 +425,6 @@ impl BackendStorage for MetalStorage {
     }
 }
 
-
-
 #[cfg(target_vendor = "apple")]
 fn fnv1a_hash(s: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
@@ -493,14 +490,19 @@ impl MetalDevice {
         {
             Ok(Self {
                 ordinal,
-                caps: MetalCaps::probe_default(ordinal as u64, format!("Metal Device {ordinal}"), 7),
+                caps: MetalCaps::probe_default(
+                    ordinal as u64,
+                    format!("Metal Device {ordinal}"),
+                    7,
+                ),
                 autotuner: std::sync::Arc::new(MetalAutotuner::new()),
             })
         }
     }
 
     pub fn try_new(ordinal: usize) -> Result<Self> {
-        let caps = MetalCaps::probe_default(ordinal as u64, format!("Apple Metal GPU {ordinal}"), 8);
+        let caps =
+            MetalCaps::probe_default(ordinal as u64, format!("Apple Metal GPU {ordinal}"), 8);
         let autotuner = std::sync::Arc::new(MetalAutotuner::new());
         autotuner.load_cache(&caps);
         #[cfg(target_vendor = "apple")]
@@ -521,7 +523,11 @@ impl MetalDevice {
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            Ok(Self { ordinal, caps, autotuner })
+            Ok(Self {
+                ordinal,
+                caps,
+                autotuner,
+            })
         }
     }
 
@@ -1296,8 +1302,13 @@ impl MetalDevice {
         {
             if let Some(ref inner) = self.inner {
                 if let (
-                    Some(x_s), Some(gw_s), Some(uw_s), Some(dw_s),
-                    Some(rt_s), Some(re_s), Some(rw_s),
+                    Some(x_s),
+                    Some(gw_s),
+                    Some(uw_s),
+                    Some(dw_s),
+                    Some(rt_s),
+                    Some(re_s),
+                    Some(rw_s),
                 ) = (
                     x.as_any().downcast_ref::<MetalStorage>(),
                     gate_w.as_any().downcast_ref::<MetalStorage>(),
@@ -1308,18 +1319,25 @@ impl MetalDevice {
                     router_weights.as_any().downcast_ref::<MetalStorage>(),
                 ) {
                     let bufs = [
-                        x_s.buffer.as_ref(), gw_s.buffer.as_ref(), uw_s.buffer.as_ref(),
-                        dw_s.buffer.as_ref(), rt_s.buffer.as_ref(), re_s.buffer.as_ref(),
+                        x_s.buffer.as_ref(),
+                        gw_s.buffer.as_ref(),
+                        uw_s.buffer.as_ref(),
+                        dw_s.buffer.as_ref(),
+                        rt_s.buffer.as_ref(),
+                        re_s.buffer.as_ref(),
                         rw_s.buffer.as_ref(),
                     ];
                     if bufs.iter().all(|b| b.is_some()) {
                         if let Ok(out_storage) = self.zeros(out_shape, DType::F32) {
-                            let out_s = out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
+                            let out_s =
+                                out_storage.as_any().downcast_ref::<MetalStorage>().unwrap();
                             let out_buf = out_s.buffer.as_ref().unwrap();
 
                             let cmd = self.get_or_create_command_buffer()?;
                             let encoder = cmd.computeCommandEncoder().ok_or_else(|| {
-                                Error::from(MetalError::Ffi("Failed to create compute encoder".into()))
+                                Error::from(MetalError::Ffi(
+                                    "Failed to create compute encoder".into(),
+                                ))
                             })?;
 
                             encoder.setComputePipelineState(&inner.pipelines.moe_fused_dispatch);
@@ -1335,12 +1353,36 @@ impl MetalDevice {
                             let rsf_val = rsf;
                             let num_pairs_val = num_pairs as i32;
                             unsafe {
-                                encoder.setBytes_length_atIndex(&hidden_val as *const i32 as *const std::ffi::c_void, 4, 8);
-                                encoder.setBytes_length_atIndex(&inter_val as *const i32 as *const std::ffi::c_void, 4, 9);
-                                encoder.setBytes_length_atIndex(&num_experts_val as *const i32 as *const std::ffi::c_void, 4, 10);
-                                encoder.setBytes_length_atIndex(&batch_val as *const i32 as *const std::ffi::c_void, 4, 11);
-                                encoder.setBytes_length_atIndex(&rsf_val as *const f32 as *const std::ffi::c_void, 4, 12);
-                                encoder.setBytes_length_atIndex(&num_pairs_val as *const i32 as *const std::ffi::c_void, 4, 13);
+                                encoder.setBytes_length_atIndex(
+                                    &hidden_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    8,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &inter_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    9,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &num_experts_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    10,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &batch_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    11,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &rsf_val as *const f32 as *const std::ffi::c_void,
+                                    4,
+                                    12,
+                                );
+                                encoder.setBytes_length_atIndex(
+                                    &num_pairs_val as *const i32 as *const std::ffi::c_void,
+                                    4,
+                                    13,
+                                );
                             }
 
                             let grid = MTLSize::new(batch as u64, hidden as u64, 1);
@@ -1348,7 +1390,12 @@ impl MetalDevice {
                             encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threads);
                             encoder.endEncoding();
 
-                            return Ok((out_storage, Box::new(MetalHandle { command_buffer: cmd })));
+                            return Ok((
+                                out_storage,
+                                Box::new(MetalHandle {
+                                    command_buffer: cmd,
+                                }),
+                            ));
                         }
                     }
                 }
@@ -2769,7 +2816,6 @@ impl BackendDevice for MetalDevice {
         let dim = cfg.dim;
         let base = cfg.base;
         #[cfg(target_vendor = "apple")]
-
         {
             if let Some(ref inner) = self.inner {
                 let x_s = x.as_any().downcast_ref::<MetalStorage>().ok_or_else(|| {
@@ -2826,18 +2872,24 @@ impl BackendDevice for MetalDevice {
                     // ramp + mscale are recomputed inside the kernel.
                     let rotary_dim = cfg.rotary_dim.min(dim) as i32;
                     let rotary_half = (rotary_dim / 2) as usize;
-                    let (has_yarn, yarn_factor, yarn_orig_max, yarn_beta_fast, yarn_beta_slow, mscale) =
-                        match cfg.yarn {
-                            Some(y) => (
-                                1i32,
-                                y.factor,
-                                y.original_max_pos as f32,
-                                y.beta_fast,
-                                y.beta_slow,
-                                y.attention_factor,
-                            ),
-                            None => (0i32, 1.0f32, 8192.0f32, 32.0f32, 1.0f32, 1.0f32),
-                        };
+                    let (
+                        has_yarn,
+                        yarn_factor,
+                        yarn_orig_max,
+                        yarn_beta_fast,
+                        yarn_beta_slow,
+                        mscale,
+                    ) = match cfg.yarn {
+                        Some(y) => (
+                            1i32,
+                            y.factor,
+                            y.original_max_pos as f32,
+                            y.beta_fast,
+                            y.beta_slow,
+                            y.attention_factor,
+                        ),
+                        None => (0i32, 1.0f32, 8192.0f32, 32.0f32, 1.0f32, 1.0f32),
+                    };
                     encoder.setComputePipelineState(&inner.pipelines.rope_yarn);
                     encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
                     encoder.setBuffer_offset_atIndex(Some(&pos_buf), 0, 1);
@@ -2845,45 +2897,68 @@ impl BackendDevice for MetalDevice {
                     // Scalar buffers 3..14.
                     unsafe {
                         encoder.setBytes_length_atIndex(
-                            &num_tokens_val as *const i32 as *const std::ffi::c_void, 4, 3,
+                            &num_tokens_val as *const i32 as *const std::ffi::c_void,
+                            4,
+                            3,
                         );
                         encoder.setBytes_length_atIndex(
-                            &num_heads_val as *const i32 as *const std::ffi::c_void, 4, 4,
+                            &num_heads_val as *const i32 as *const std::ffi::c_void,
+                            4,
+                            4,
                         );
                         encoder.setBytes_length_atIndex(
-                            &head_dim_val as *const i32 as *const std::ffi::c_void, 4, 5,
+                            &head_dim_val as *const i32 as *const std::ffi::c_void,
+                            4,
+                            5,
                         );
                         encoder.setBytes_length_atIndex(
-                            &rotary_dim as *const i32 as *const std::ffi::c_void, 4, 6,
+                            &rotary_dim as *const i32 as *const std::ffi::c_void,
+                            4,
+                            6,
                         );
                         encoder.setBytes_length_atIndex(
-                            &has_yarn as *const i32 as *const std::ffi::c_void, 4, 7,
+                            &has_yarn as *const i32 as *const std::ffi::c_void,
+                            4,
+                            7,
                         );
                         encoder.setBytes_length_atIndex(
-                            &base_val as *const f32 as *const std::ffi::c_void, 4, 8,
+                            &base_val as *const f32 as *const std::ffi::c_void,
+                            4,
+                            8,
                         );
                         encoder.setBytes_length_atIndex(
-                            &yarn_factor as *const f32 as *const std::ffi::c_void, 4, 9,
+                            &yarn_factor as *const f32 as *const std::ffi::c_void,
+                            4,
+                            9,
                         );
                         encoder.setBytes_length_atIndex(
-                            &yarn_orig_max as *const f32 as *const std::ffi::c_void, 4, 10,
+                            &yarn_orig_max as *const f32 as *const std::ffi::c_void,
+                            4,
+                            10,
                         );
                         encoder.setBytes_length_atIndex(
-                            &yarn_beta_fast as *const f32 as *const std::ffi::c_void, 4, 11,
+                            &yarn_beta_fast as *const f32 as *const std::ffi::c_void,
+                            4,
+                            11,
                         );
                         encoder.setBytes_length_atIndex(
-                            &yarn_beta_slow as *const f32 as *const std::ffi::c_void, 4, 12,
+                            &yarn_beta_slow as *const f32 as *const std::ffi::c_void,
+                            4,
+                            12,
                         );
                         encoder.setBytes_length_atIndex(
-                            &mscale as *const f32 as *const std::ffi::c_void, 4, 13,
+                            &mscale as *const f32 as *const std::ffi::c_void,
+                            4,
+                            13,
                         );
                     }
                     // Grid covers max(num_tokens*num_heads*rotary_half, *copy_len).
                     let copy_len = dim - 2 * rotary_half;
                     let total_pairs = (num_tokens
                         * num_heads as usize
-                        * rotary_half.max(if copy_len > 0 { copy_len } else { 0 }).max(1))
-                    as u64;
+                        * rotary_half
+                            .max(if copy_len > 0 { copy_len } else { 0 })
+                            .max(1)) as u64;
                     let threads_per_group = MTLSize::new(256, 1, 1);
                     let groups = MTLSize::new(((total_pairs + 255) / 256), 1, 1);
                     encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads_per_group);
@@ -3115,8 +3190,18 @@ impl BackendDevice for MetalDevice {
         _causal: bool,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let (out_storage, _h) =
-            self.qkv_attention(q, k, v, num_kv_heads, seq_len, 0, None, out_shape, None, None)?;
+        let (out_storage, _h) = self.qkv_attention(
+            q,
+            k,
+            v,
+            num_kv_heads,
+            seq_len,
+            0,
+            None,
+            out_shape,
+            None,
+            None,
+        )?;
         let _ = num_heads;
         let _ = head_dim;
         Ok((out_storage, Box::new(grim_tensor::backend::ReadyHandle)))
@@ -3133,8 +3218,9 @@ impl BackendDevice for MetalDevice {
         kv_seq_len: usize,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
-        let (out_storage, _h) =
-            self.qkv_attention(q, k, v, num_heads, kv_seq_len, 0, None, out_shape, None, None)?;
+        let (out_storage, _h) = self.qkv_attention(
+            q, k, v, num_heads, kv_seq_len, 0, None, out_shape, None, None,
+        )?;
 
         let _ = head_dim;
         let _ = seq_len;
@@ -4488,8 +4574,6 @@ impl MetalDevice {
     }
 }
 
-
-
 #[cfg(target_vendor = "apple")]
 pub(crate) fn measure_pipeline_timing(
     inner: &MetalDeviceInner,
@@ -4512,11 +4596,7 @@ pub(crate) fn measure_pipeline_timing(
         .device
         .newBufferWithLength_options(bytes_c as u64, MTResourceOptions::StorageModeShared)?;
 
-    let config_data = [
-        cfg.block_m as i32,
-        cfg.block_n as i32,
-        cfg.block_k as i32,
-    ];
+    let config_data = [cfg.block_m as i32, cfg.block_n as i32, cfg.block_k as i32];
 
     // Warm-up passes
     for _ in 0..2 {
