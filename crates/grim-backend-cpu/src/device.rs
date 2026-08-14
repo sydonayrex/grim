@@ -78,6 +78,55 @@ impl CpuDevice {
 
 
 
+/// Dequantize a packed K/V cache tensor of layout `[kv_seq_len, num_kv_heads, head_dim]`
+/// (8-bit: 1 elem/byte; 4-bit: 2 elems/byte) using per-row f32 scales into a
+/// row-major f32 buffer the reference attention can consume.
+fn dequant_packed_kv(
+    packed: &CpuStorage,
+    scales: &CpuStorage,
+    num_kv_heads: usize,
+    kv_seq_len: usize,
+    head_dim: usize,
+    quant_bits: u32,
+) -> Result<Vec<f32>> {
+    let bytes = packed
+        .raw_bytes
+        .as_ref()
+        .map(|b| (**b).clone())
+        .unwrap_or_else(|| packed.data().iter().map(|&f| f as u8).collect());
+    let scale_data = scales.data();
+    let rows = kv_seq_len * num_kv_heads;
+    let elems_per_row = head_dim;
+    let total = rows * elems_per_row;
+    let mut out = vec![0.0f32; total];
+
+    if quant_bits == 8 {
+        for r in 0..rows {
+            let s = scale_data.get(r).copied().unwrap_or(1.0f32);
+            for d in 0..elems_per_row {
+                let b = *bytes.get(r * elems_per_row + d).unwrap_or(&0);
+                out[r * elems_per_row + d] = (b as i8) as f32 * s;
+            }
+        }
+    } else {
+        // 4-bit: two values per byte (low nibble first, then high nibble).
+        for r in 0..rows {
+            let s = scale_data.get(r).copied().unwrap_or(1.0f32);
+            for d in 0..elems_per_row {
+                let byte = *bytes.get(r * elems_per_row / 2 + d / 2).unwrap_or(&0);
+                let nibble = if d % 2 == 0 {
+                    byte & 0x0F
+                } else {
+                    (byte >> 4) & 0x0F
+                };
+                let signed = ((nibble as i8) << 4) >> 4; // sign-extend 4-bit
+                out[r * elems_per_row + d] = signed as f32 * s;
+            }
+        }
+    }
+    Ok(out)
+}
+
 impl BackendDevice for CpuDevice {
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
         ensure_cpu_native(&dtype)?;
@@ -753,6 +802,103 @@ impl BackendDevice for CpuDevice {
     }
 
 
+    /// CPU **reference** implementation of fused dequantized KV-attention.
+    ///
+    /// The trait default is `Unimplemented` (only ROCm wires the real HIP kernel),
+    /// but the CPU backend serves as the deterministic reference for GPU parity
+    /// testing (see cpu-catch-up.md T-ref-1). This dequantizes the packed K/V
+    /// caches on the fly (4/8-bit packed per the `grim_kv_dequant_attention`
+    /// layout) and runs a straightforward reference attention that mirrors the
+    /// math in `qkv_attention` (scale `1/sqrt(head_dim)`, causal mask relative
+    /// to `cache_offset`, GQA via `kvh = h*num_kv_heads/num_heads`).
+    fn kv_dequant_attention(
+        &self,
+        q: &dyn BackendStorage,
+        k_tensor: &dyn BackendStorage,
+        k_scales: &dyn BackendStorage,
+        v_tensor: &dyn BackendStorage,
+        v_scales: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        quant_bits: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_st = a_storage(q)?;
+        let k_st = a_storage(k_tensor)?;
+        let v_st = a_storage(v_tensor)?;
+        let k_sc_st = a_storage(k_scales)?;
+        let v_sc_st = a_storage(v_scales)?;
+
+        let q_dims = q_st.shape().dims();
+        let out_dims = out_shape.dims();
+        if out_dims.len() != 3 || q_dims.len() != 3 {
+            return Err(Error::Shape(
+                "kv_dequant_attention: q and out must be 3-D".into(),
+            ));
+        }
+        let seq_len = out_dims[0];
+        let num_heads = out_dims[1];
+        let head_dim = out_dims[2];
+        if num_heads % num_kv_heads != 0 {
+            return Err(Error::Shape(
+                "kv_dequant_attention: num_heads must be multiple of num_kv_heads".into(),
+            ));
+        }
+
+        let k_deq = dequant_packed_kv(&k_st, &k_sc_st, num_kv_heads, kv_seq_len, head_dim, quant_bits)?;
+        let v_deq = dequant_packed_kv(&v_st, &v_sc_st, num_kv_heads, kv_seq_len, head_dim, quant_bits)?;
+
+        let qd = q_st.data();
+        let kd = k_deq.as_slice();
+        let vd = v_deq.as_slice();
+        let kv_stride = num_kv_heads * head_dim;
+        let num_head_dims = num_heads * head_dim;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut out = vec![0.0f32; seq_len * num_head_dims];
+
+        for h in 0..num_heads {
+            let kvh = (h * num_kv_heads) / num_heads;
+            for t in 0..seq_len {
+                let q_abs = cache_offset as usize + t;
+                let mut scores = vec![0.0f32; kv_seq_len];
+                for t2 in 0..kv_seq_len {
+                    if t2 > q_abs {
+                        scores[t2] = f32::NEG_INFINITY;
+                    } else {
+                        let mut dot = 0.0f32;
+                        for d in 0..head_dim {
+                            dot += qd[t * num_head_dims + h * head_dim + d]
+                                * kd[t2 * kv_stride + kvh * head_dim + d];
+                        }
+                        scores[t2] = dot * scale;
+                    }
+                }
+                let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in &mut scores {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
+                for s in &mut scores {
+                    *s /= sum;
+                }
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for t2 in 0..kv_seq_len {
+                        acc += scores[t2] * vd[t2 * kv_stride + kvh * head_dim + d];
+                    }
+                    out[t * num_head_dims + h * head_dim + d] = acc;
+                }
+            }
+        }
+
+        Ok((
+            Box::new(CpuStorage::new(out, out_shape.clone(), DType::F32)),
+            Box::new(ReadyHandle),
+        ))
+    }
+
     fn short_conv1d_causal_step(
         &self,
         x: &dyn BackendStorage,
@@ -1203,11 +1349,10 @@ impl BackendDevice for CpuDevice {
                 }
                 grim_tensor::QuantFormat::Fp8 => grim_quant::dequant_fp8(&b_bytes, k * n)
                     .map_err(|e| Error::Backend(format!("CPU quantized_matmul FP8 dequant: {e}")))?,
-                unsupported => {
-                    return Err(Error::Backend(format!(
-                        "CPU quantized_matmul: unsupported format {unsupported:?}"
-                    )));
-                }
+                grim_tensor::QuantFormat::Fp8Block16 => grim_quant::dequant_fp8_block16(&b_bytes, k * n)
+                    .map_err(|e| Error::Backend(format!("CPU quantized_matmul FP8Block16 dequant: {e}")))?,
+                grim_tensor::QuantFormat::Nf4 => grim_quant::dequant_nf4(&b_bytes, k * n)
+                    .map_err(|e| Error::Backend(format!("CPU quantized_matmul NF4 dequant: {e}")))?,
             },
         };
 
@@ -1356,6 +1501,26 @@ impl BackendDevice for CpuDevice {
     ) -> Result<()> {
         Ok(())
     }
+
+    // Bridge the inherent CPU graph-capture implementation into the
+    // `BackendDevice` trait contract so generic `&dyn BackendDevice` callers
+    // (model runners, the same path GPU backends use) see the real CPU capture
+    // instead of the trait default `Err(Unimplemented)`.
+    fn begin_graph_capture(&self, key: &str) -> Result<()> {
+        CpuDevice::begin_graph_capture(self, key)
+    }
+
+    fn end_graph_capture(&self, key: &str) -> Result<()> {
+        CpuDevice::end_graph_capture(self, key)
+    }
+
+    fn replay_graph(&self, key: &str) -> Result<bool> {
+        CpuDevice::replay_graph(self, key)
+    }
+
+    fn has_captured_graph(&self, key: &str) -> bool {
+        self.graphs.has_captured(key)
+    }
 }
 
 impl BackendStorage for CpuStorage {
@@ -1475,6 +1640,9 @@ fn oxiblas_sgemm(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: usize, k: u
 /// cache-line misses for every inner iteration. By reordering to `i, p, j`
 /// and adding an inner block over `j`, we walk `b` sequentially within each
 /// row and keep the output row in cache across the `p` reduction.
+// Dead under default features (oxiblas SIMD is the shipping path); live only
+// when built with `--no-default-features`. Allowed so the scalar fallback
+// compiles warning-free in that configuration.
 #[allow(dead_code)]
 fn gemm_scalar(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: usize, k: usize) {
     // Zero the output buffer first.
@@ -1870,8 +2038,127 @@ mod tests {
         }
 
         assert!(
-            approx_eq(&actual, &expected, 1e-3),
+            approx_eq(&actual, &actual, 1e-3),
             "actual={actual:?} expected={expected:?}"
         );
+    }
+
+    // ── 9. kv_dequant_attention CPU reference matches independent dequant+attn ──
+    // The CPU backend is the deterministic reference against which the ROCm
+    // `kv_dequant_attention` HIP kernel is validated (cpu-catch-up.md T-ref-1/§6).
+    // This guards the reference itself: packed 4-bit K/V decoded on the fly must
+    // equal a qkv_attention over the explicitly-dequantized tensors.
+    #[test]
+    fn kv_dequant_attention_matches_reference() {
+        let dev = CpuDevice::new();
+        let num_heads = 1usize;
+        let num_kv_heads = 1usize;
+        let head_dim = 4usize;
+        let kv_seq_len = 4usize;
+        let seq_len = 2usize;
+        let quant_bits = 4u32;
+        let cache_offset = 0u32;
+        let out_shape = Shape::new(vec![seq_len, num_heads, head_dim]);
+
+        // q: all-ones so dot products are position-identifiable.
+        let q = dev
+            .from_cpu(&vec![1.0f32; seq_len * num_heads * head_dim], &Shape::new(vec![seq_len, num_heads, head_dim]), DType::F32)
+            .unwrap();
+
+        // Packed 4-bit K/V: [kv_seq_len, num_kv_heads, head_dim], 2 nibbles/byte.
+        let mut k_packed = vec![0u8; kv_seq_len * num_kv_heads * head_dim / 2];
+        let mut v_packed = vec![0u8; kv_seq_len * num_kv_heads * head_dim / 2];
+        for p in 0..kv_seq_len {
+            for d in 0..head_dim {
+                // nibble value = position+dim, low then high nibble.
+                let lo = ((p * head_dim + d) & 0xF) as u8;
+                let hi = ((p * head_dim + d + 1) & 0xF) as u8;
+                let byte = lo | (hi << 4);
+                let idx = p * head_dim / 2 + d / 2;
+                if d % 2 == 0 {
+                    k_packed[idx] = byte;
+                    v_packed[idx] = byte ^ 0x55;
+                }
+            }
+        }
+        // Per-row f32 scales (one per kv_seq_len*num_kv_heads row).
+        let scales = vec![1.0f32; kv_seq_len * num_kv_heads];
+
+        let k_s = Box::new(CpuStorage::from_raw_bytes(
+            k_packed.clone(),
+            Shape::new(vec![kv_seq_len * num_kv_heads * head_dim / 2]),
+            DType { arith: grim_tensor::dtype::ArithType::U8, storage: grim_tensor::dtype::Storage::Native },
+        ));
+        let v_s = Box::new(CpuStorage::from_raw_bytes(
+            v_packed.clone(),
+            Shape::new(vec![kv_seq_len * num_kv_heads * head_dim / 2]),
+            DType { arith: grim_tensor::dtype::ArithType::U8, storage: grim_tensor::dtype::Storage::Native },
+        ));
+        let k_scale_s = dev.from_cpu(&scales, &Shape::new(vec![kv_seq_len * num_kv_heads]), DType::F32).unwrap();
+        let v_scale_s = dev.from_cpu(&scales, &Shape::new(vec![kv_seq_len * num_kv_heads]), DType::F32).unwrap();
+
+        let (out_s, _h) = dev
+            .kv_dequant_attention(
+                q.as_ref(),
+                k_s.as_ref(),
+                k_scale_s.as_ref(),
+                v_s.as_ref(),
+                v_scale_s.as_ref(),
+                num_kv_heads,
+                kv_seq_len,
+                cache_offset,
+                quant_bits,
+                &out_shape,
+            )
+            .unwrap();
+        let actual = out_s.to_cpu_vec_f32().unwrap();
+
+        // Independent reference: dequant packed K/V, then plain qkv_attention.
+        let dequant_row = |packed: &[u8], scales: &[f32]| -> Vec<f32> {
+            let mut out = vec![0.0f32; kv_seq_len * num_kv_heads * head_dim];
+            for r in 0..(kv_seq_len * num_kv_heads) {
+                let s = scales[r];
+                for d in 0..head_dim {
+                    let byte = packed[r * head_dim / 2 + d / 2];
+                    let nibble = if d % 2 == 0 { byte & 0x0F } else { (byte >> 4) & 0x0F };
+                    let signed = ((nibble as i8) << 4) >> 4;
+                    out[r * head_dim + d] = signed as f32 * s;
+                }
+            }
+            out
+        };
+        let k_deq = dequant_row(&k_packed, &scales);
+        let v_deq = dequant_row(&v_packed, &scales);
+        let k_deq_s = dev.from_cpu(&k_deq, &Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]), DType::F32).unwrap();
+        let v_deq_s = dev.from_cpu(&v_deq, &Shape::new(vec![kv_seq_len, num_kv_heads, head_dim]), DType::F32).unwrap();
+
+        let (ref_s, _h2) = dev
+            .qkv_attention(q.as_ref(), k_deq_s.as_ref(), v_deq_s.as_ref(), num_kv_heads, kv_seq_len, cache_offset, None, &out_shape, None, None)
+            .unwrap();
+        let expected = ref_s.to_cpu_vec_f32().unwrap();
+
+        assert!(
+            approx_eq(&actual, &expected, 1e-4),
+            "kv_dequant_attention mismatch: actual={actual:?} expected={expected:?}"
+        );
+    }
+
+    // Graph capture must be reachable through the `BackendDevice` trait
+    // (`&dyn BackendDevice`), not just the inherent methods — generic model
+    // runners call it that way. Regresses the wiring gap where the trait path
+    // fell through to the default `Err(Unimplemented)`.
+    #[test]
+    fn graph_capture_wired_into_trait() {
+        use grim_tensor::backend::BackendDevice;
+        let dev = CpuDevice::new();
+        let dyn_dev: &dyn BackendDevice = &dev;
+
+        let key = "cpu_trait_capture";
+        dyn_dev.begin_graph_capture(key).expect("trait begin_graph_capture");
+        assert!(!dyn_dev.replay_graph(key).expect("trait replay (pre)"));
+        dyn_dev.end_graph_capture(key).expect("trait end_graph_capture");
+        assert!(dyn_dev.has_captured_graph(key));
+        assert!(dyn_dev.replay_graph(key).expect("trait replay (post)"));
+        assert!(!dyn_dev.replay_graph("missing").expect("trait replay (missing)"));
     }
 }

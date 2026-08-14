@@ -24,6 +24,7 @@ fn kernels() -> Vec<(&'static str, String)> {
         ("mul", load_kernel("mul")),
         ("silu_mul", load_kernel("silu_mul")),
         ("rms_norm", load_kernel("rms_norm")),
+        ("add_rms_norm", load_kernel("add_rms_norm")),
         ("softmax", load_kernel("softmax")),
         ("embedding", load_kernel("embedding")),
         ("matmul_32", load_kernel("matmul_tile_32")),
