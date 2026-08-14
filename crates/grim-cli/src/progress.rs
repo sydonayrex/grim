@@ -31,11 +31,11 @@ impl Progress {
             .collect();
 
         if self.tty {
-            // TTY terminal: overwrite the same line cleanly using \r + ANSI clear-to-end-of-line
-            eprint!("\r\x1B[K[{stage}] [{bar}] {pct:3}% ({done}/{total})");
+            // Interactive terminal (TTY): update the exact same line in-place using \r + ANSI clear line
+            eprint!("\r\x1B[2K[{stage}] [{bar}] {pct:3}% ({done}/{total})");
             let _ = std::io::stderr().flush();
         } else {
-            // Non-TTY (piped/logged): emit a distinct newline per percentage step for clean readable output
+            // Non-interactive / log stream: emit a new distinct line whenever percentage changes
             if pct != self.last_pct {
                 eprintln!("[{stage}] [{bar}] {pct:3}% ({done}/{total})");
                 self.last_pct = pct;
