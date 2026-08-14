@@ -23,19 +23,21 @@ impl Progress {
             return;
         }
         let pct = (done as f64 * 100.0 / total as f64) as isize;
+        let width = 24;
+        let filled = ((pct as f64 / 100.0) * width as f64).round() as usize;
+        let bar: String = std::iter::repeat('#')
+            .take(filled)
+            .chain(std::iter::repeat('-').take(width - filled))
+            .collect();
+
         if self.tty {
-            let width = 24;
-            let filled = ((pct as f64 / 100.0) * width as f64).round() as usize;
-            let bar: String = std::iter::repeat('#')
-                .take(filled)
-                .chain(std::iter::repeat('-').take(width - filled))
-                .collect();
-            eprint!("\r[{stage}] [{bar}] {pct:3}% ({done}/{total})");
+            // TTY terminal: overwrite the same line cleanly using \r + ANSI clear-to-end-of-line
+            eprint!("\r\x1B[K[{stage}] [{bar}] {pct:3}% ({done}/{total})");
             let _ = std::io::stderr().flush();
         } else {
-            // Non-TTY: emit one line per integer percent point.
+            // Non-TTY (piped/logged): emit a distinct newline per percentage step for clean readable output
             if pct != self.last_pct {
-                eprintln!("[{stage}] {pct}% ({done}/{total})");
+                eprintln!("[{stage}] [{bar}] {pct:3}% ({done}/{total})");
                 self.last_pct = pct;
             }
         }
@@ -43,9 +45,7 @@ impl Progress {
 
     /// Terminate the current in-place bar line.
     pub fn finish(&mut self) {
-        if self.tty {
-            eprintln!();
-        }
+        eprintln!();
     }
 }
 

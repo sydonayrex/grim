@@ -1348,7 +1348,8 @@ async fn main() -> Result<()> {
                     let mut cb = |stage: &str, done: usize, total: usize| {
                         prog.render(stage, done, total);
                     };
-                    let mut progress: Option<&mut dyn FnMut(&str, usize, usize)> = Some(&mut cb);
+                    let mut progress: Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)> =
+                        Some(&mut cb);
                     match oxidizer::cmd_oxidizer_calibrate(
                         &model,
                         &output,

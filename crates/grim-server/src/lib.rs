@@ -2898,9 +2898,9 @@ async fn grim_tags(State(_state): State<Arc<AppState>>) -> Json<serde_json::Valu
                 serde_json::Value::String(entry.sha256.clone())
             };
             let modified_at = if entry.pulled_at.is_empty() {
-                "2026-07-19T00:00:00Z".to_string()
+                serde_json::Value::Null
             } else {
-                entry.pulled_at.clone()
+                serde_json::Value::String(entry.pulled_at.clone())
             };
 
             models.push(serde_json::json!({

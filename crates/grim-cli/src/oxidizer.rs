@@ -178,7 +178,7 @@ pub fn cmd_oxidizer_calibrate(
     model_path: &str,
     output_path: &str,
     calibration_dataset: Option<&str>,
-    progress: &mut Option<&mut dyn FnMut(&str, usize, usize)>,
+    progress: &mut Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)>,
 ) -> Result<ImportanceScores, String> {
     if let Some(ds) = calibration_dataset {
         eprintln!("[oxidizer] calibrate: using dataset '{ds}'");
@@ -263,7 +263,7 @@ pub fn cmd_oxidizer_convert(
     calibration_dataset: Option<String>,
     wave_override: Option<grim_format::WaveSize>,
     use_gpu: bool,
-    mut progress: Option<&mut dyn FnMut(&str, usize, usize)>,
+    mut progress: Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)>,
 ) -> Result<(), String> {
     let (_provider, names, sizes, mut grim_meta) = open_provider(model_path)?;
     let importance_scores = if Path::new(&format!("{}.importance.json", model_path)).exists() {
@@ -624,7 +624,7 @@ pub fn cmd_oxidizer_raven(
     output_path: &str,
     target_bpw: f32,
     calibration_dataset: Option<&str>,
-    mut progress: Option<&mut dyn FnMut(&str, usize, usize)>,
+    mut progress: Option<&mut (dyn FnMut(&str, usize, usize) + Send + Sync)>,
 ) -> Result<(), String> {
     let (provider, names, _sizes, mut grim_meta) = open_provider(model_path)?;
     let importance_scores = if Path::new(&format!("{}.importance.json", model_path)).exists() {

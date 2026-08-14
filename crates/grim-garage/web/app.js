@@ -382,10 +382,9 @@ document.addEventListener('DOMContentLoaded', () => {
         const ev = JSON.parse(event.data);
         if (ev && ev.metric && typeof ev.metric.loss === 'number') {
           const loss = ev.metric.loss;
-          const vram = ev.metric.tokens; // tokens per step serves as the rough vram proxy
           document.getElementById('val-loss').textContent = loss.toFixed(4);
-          document.getElementById('val-vram').textContent = `${(vram / (1024*1024*1024)).toFixed(1)} GB`;
-          document.getElementById('val-tokens-sec').textContent = `${Math.round(vram || 1250)} tok/s`;
+          document.getElementById('val-vram').textContent = 'Unavailable';
+          document.getElementById('val-tokens-sec').textContent = 'Unavailable';
           lossHistory.push(loss);
           if (lossHistory.length > 50) lossHistory.shift();
           renderLossChart();
@@ -492,7 +491,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const box = document.getElementById('autotune-recommendation-box');
     const text = document.getElementById('autotune-text');
     if (!model) return;
-    text.textContent = `Recommended for ${model.split('/').pop()}: LoRA Rank r=16, ROCm Fused RMSNorm+Matmul & FlashAttention enabled. Peak VRAM budget ~4.2 GB on RX 9060/9070.`;
+    text.textContent = `Recommended for ${model.split('/').pop()}: LoRA Rank r=16. Hardware-specific VRAM requirements will be calculated after the model and training configuration are loaded.`;
     box.style.display = 'block';
   }
 
