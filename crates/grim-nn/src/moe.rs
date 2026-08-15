@@ -186,10 +186,13 @@ impl ExpertBank {
     /// Lfm2 MoE loader's naming and layout convention:
     ///   `ffn_gate_exps.weight` = `[n_experts, inter, hidden]`
     ///   `ffn_up_exps.weight`   = `[n_experts, inter, hidden]`
-    ///   `ffn_down_exps.weight` = `[n_experts, inter, hidden]`
-    /// (experts are the OUTERMOST dimension). Each expert's
-    /// `[inter, hidden]` block is sliced out; the down projection is
-    /// transposed to `[hidden, inter]` for the `Linear` (out=hidden, in=inter).
+    ///   `ffn_down_exps.weight` = `[n_experts, hidden, inter]`
+    /// (experts are the OUTERMOST dimension).
+    ///
+    /// Quantized checkpoints (KQuant / FloatPack / MXFP4 / ...) keep each
+    /// expert's packed bytes resident on the target device — no full-model
+    /// host-f32 mirror is materialized. Native (F32/F16/BF16) checkpoints use
+    /// the host-f32 path.
     pub fn load(
         ws: &WeightSource<'_>,
         num_experts: usize,
@@ -197,45 +200,209 @@ impl ExpertBank {
         inter: usize,
         has_bias: bool,
     ) -> Result<Self, grim_tensor::error::Error> {
-        let gate_3d = ws.get(
-            Shape::new(vec![num_experts, inter, hidden]),
-            "ffn_gate_exps.weight",
-        )?;
-        let up_3d = ws.get(
-            Shape::new(vec![num_experts, inter, hidden]),
-            "ffn_up_exps.weight",
-        )?;
-        let down_3d = ws.get(
-            Shape::new(vec![num_experts, inter, hidden]),
-            "ffn_down_exps.weight",
-        )?;
+        // gate/up: per-expert [out=inter, in=hidden]; down: [out=hidden, in=inter].
+        Self::load_impl(
+            ws,
+            num_experts,
+            hidden,
+            inter,
+            has_bias,
+            [
+                ("ffn_gate_exps.weight", inter, hidden),
+                ("ffn_up_exps.weight", inter, hidden),
+                ("ffn_down_exps.weight", hidden, inter),
+            ],
+        )
+    }
 
-        let gate_v = gate_3d.to_vec_f32()?;
-        let up_v = up_3d.to_vec_f32()?;
-        let down_v = down_3d.to_vec_f32()?;
+    /// Load experts from a GGUF-style 3D weight layout where ALL three tensors
+    /// (gate/up/down) are stored as `[n_experts, hidden, inter]` (Mellum2 /
+    /// Unsloth-quantized GGUFs).
+    ///
+    /// Each expert's `[hidden, inter]` block is sliced out. Gate/up are
+    /// transposed to `[inter, hidden]` for the Linear (in=inter, out=hidden).
+    /// Down is used as-is (already `[hidden, inter]`, correct for Linear
+    /// out=hidden, in=inter).
+    pub fn load_transposed(
+        ws: &WeightSource<'_>,
+        num_experts: usize,
+        hidden: usize,
+        inter: usize,
+        has_bias: bool,
+    ) -> Result<Self, grim_tensor::error::Error> {
+        Self::load_impl(
+            ws,
+            num_experts,
+            hidden,
+            inter,
+            has_bias,
+            [
+                ("ffn_gate_exps.weight", hidden, inter),
+                ("ffn_up_exps.weight", hidden, inter),
+                ("ffn_down_exps.weight", hidden, inter),
+            ],
+        )
+    }
+
+    /// Shared loader. `projections` lists `(tensor_name, out_dim, in_dim)` per
+    /// projection as stored per-expert in the checkpoint.
+    ///
+    /// GGUF stores `ne` fastest-first, so a tensor with file dims
+    /// `[in, out, n_experts]` reads back as `[n_experts, out, in]` and each
+    /// expert's `out * in` elements are contiguous in the packed stream — the
+    /// slice math is identical for every projection.
+    fn load_impl(
+        ws: &WeightSource<'_>,
+        num_experts: usize,
+        hidden: usize,
+        inter: usize,
+        has_bias: bool,
+        projections: [(&'static str, usize, usize); 3],
+    ) -> Result<Self, grim_tensor::error::Error> {
+        // Probe the first projection to decide the storage path.
+        let probe = ws.get_raw_packed(projections[0].0)?;
+
+        if probe.dtype.storage == grim_tensor::dtype::Storage::Native {
+            return Self::load_native(ws, num_experts, hidden, inter, has_bias, projections);
+        }
+        Self::load_quantized(ws, num_experts, has_bias, projections)
+    }
+
+    /// Quantized-resident path: slice each expert's packed bytes and
+    /// materialize them individually so weights stay packed on-device.
+    fn load_quantized(
+        ws: &WeightSource<'_>,
+        num_experts: usize,
+        has_bias: bool,
+        projections: [(&'static str, usize, usize); 3],
+    ) -> Result<Self, grim_tensor::error::Error> {
+        use grim_tensor::dtype::{FloatPackScheme, Storage};
+
+        // Fetch the three raw packed buffers once.
+        let mut banks = Vec::with_capacity(3);
+        for (name, out, in_) in projections {
+            let raw = ws.get_raw_packed(name)?;
+            let dims = &raw.shape;
+            let expected = vec![num_experts, out, in_];
+            if *dims != expected {
+                return Err(grim_tensor::error::Error::ShapeMismatch {
+                    expected,
+                    got: dims.clone(),
+                });
+            }
+            let elem_count: usize = dims.iter().product();
+            // MXFP4 arrives from the provider as the length-prefixed
+            // [codes][exps] framing; every other quant format is raw blocks.
+            let is_framed_mxfp4 =
+                matches!(raw.dtype.storage, Storage::FloatPack(FloatPackScheme::MxFp4));
+            banks.push((raw, out, in_, elem_count, is_framed_mxfp4));
+        }
 
         let mut gate = Vec::with_capacity(num_experts);
         let mut up = Vec::with_capacity(num_experts);
         let mut down = Vec::with_capacity(num_experts);
         for e in 0..num_experts {
-            let g = slice_expert(&gate_v, e, inter, hidden);
-            let u = slice_expert(&up_v, e, inter, hidden);
-            // down per-expert block is `[inter, hidden]`; transpose to
-            // `[hidden, inter]` for the down `Linear` (out=hidden, in=inter).
-            let d_block = slice_expert(&down_v, e, inter, hidden);
-            let d = transpose_block(&d_block, inter, hidden);
-            gate.push(Linear::from_tensor(
-                cpu_tensor(g, Shape::new(vec![inter, hidden])),
-                bias_opt(has_bias, inter),
-            ));
-            up.push(Linear::from_tensor(
-                cpu_tensor(u, Shape::new(vec![inter, hidden])),
-                bias_opt(has_bias, inter),
-            ));
-            down.push(Linear::from_tensor(
-                cpu_tensor(d, Shape::new(vec![hidden, inter])),
-                bias_opt(has_bias, hidden),
-            ));
+            let mut lins = Vec::with_capacity(3);
+            for (raw, out, in_, elem_count, is_framed_mxfp4) in &banks {
+                let per_expert = elem_count / num_experts;
+                let (bytes, dtype): (Vec<u8>, grim_tensor::dtype::DType) = if *is_framed_mxfp4 {
+                    // MXFP4 has no fused GEMM wired through `Linear::forward`
+                    // yet (plain matmul would misread the packed bytes as
+                    // F32). Convert each expert to Q8_0 on the host — one
+                    // expert at a time — so the expert rides the proven
+                    // Q8_0 fused dequant-GEMM path while keeping weights at 1
+                    // byte/element on-device instead of 4.
+                    let (codes, exps) = split_mxfp4_framed(&raw.bytes)?;
+                    let codes_per = per_expert / 2;
+                    let exps_per = per_expert.div_ceil(32);
+                    let c = &codes[e * codes_per..(e + 1) * codes_per];
+                    let x = &exps[e * exps_per..(e + 1) * exps_per];
+                    let mut framed = Vec::with_capacity(16 + c.len() + x.len());
+                    framed.extend_from_slice(&(c.len() as u64).to_le_bytes());
+                    framed.extend_from_slice(c);
+                    framed.extend_from_slice(&(x.len() as u64).to_le_bytes());
+                    framed.extend_from_slice(x);
+                    let f32s = grim_quant::dequant_mxfp4(&framed, per_expert)?;
+                    let q80 = f32s_to_q8_0_blocks(&f32s);
+                    let d = grim_tensor::dtype::DType {
+                        arith: grim_tensor::ArithType::F32,
+                        storage: grim_tensor::dtype::Storage::KQuant(
+                            grim_tensor::dtype::KQuantScheme::Q80,
+                        ),
+                    };
+                    (q80, d)
+                } else {
+                    // Raw block-quant bytes: contiguous per-expert stride.
+                    if raw.bytes.len() % num_experts != 0 {
+                        return Err(grim_tensor::error::Error::Backend(format!(
+                            "expert bank '{}': {} bytes not divisible by {num_experts} experts",
+                            projections[0].0,
+                            raw.bytes.len()
+                        )));
+                    }
+                    let stride = raw.bytes.len() / num_experts;
+                    (
+                        raw.bytes[e * stride..(e + 1) * stride].to_vec(),
+                        raw.dtype.clone(),
+                    )
+                };
+                let shape = Shape::new(vec![*out, *in_]);
+                let rt = grim_tensor::provider::RawTensor {
+                    bytes,
+                    shape: vec![*out, *in_],
+                    dtype,
+                    provenance: raw.provenance.clone(),
+                };
+                let t = ws.materialize_raw(rt, shape)?;
+                lins.push(Linear::from_tensor(t, bias_opt(has_bias, *out)));
+            }
+            let mut it = lins.into_iter();
+            gate.push(it.next().ok_or_else(err_proj)?);
+            up.push(it.next().ok_or_else(err_proj)?);
+            down.push(it.next().ok_or_else(err_proj)?);
+        }
+        Ok(Self { gate, up, down })
+    }
+
+    /// Native (F32/F16/BF16) path: dequantize on host as before.
+    #[allow(clippy::too_many_arguments)]
+    fn load_native(
+        ws: &WeightSource<'_>,
+        num_experts: usize,
+        hidden: usize,
+        inter: usize,
+        has_bias: bool,
+        projections: [(&'static str, usize, usize); 3],
+    ) -> Result<Self, grim_tensor::error::Error> {
+        let mut flat = Vec::with_capacity(3);
+        for (name, out, in_) in projections {
+            let t = ws.get(
+                Shape::new(vec![num_experts, out, in_]),
+                name,
+            )?;
+            flat.push((t.to_vec_f32()?, out, in_));
+        }
+
+        let mut gate = Vec::with_capacity(num_experts);
+        let mut up = Vec::with_capacity(num_experts);
+        let mut down = Vec::with_capacity(num_experts);
+        for e in 0..num_experts {
+            let mut lins = Vec::with_capacity(3);
+            for (v, out, in_) in &flat {
+                let block = slice_expert(v, e, *out, *in_);
+                // GGUF row-major per expert is [out, in] when the bank stores
+                // [n_experts, out, in] — matches Linear directly. gate/up banks
+                // store [inter, hidden] (out=inter) and down stores
+                // [hidden, inter] (out=hidden), so no transpose is needed.
+                lins.push(Linear::from_tensor(
+                    cpu_tensor(block, Shape::new(vec![*out, *in_])),
+                    bias_opt(has_bias, *out),
+                ));
+            }
+            let mut it = lins.into_iter();
+            gate.push(it.next().ok_or_else(err_proj)?);
+            up.push(it.next().ok_or_else(err_proj)?);
+            down.push(it.next().ok_or_else(err_proj)?);
         }
         Ok(Self { gate, up, down })
     }
@@ -851,6 +1018,101 @@ fn silu_mul_host(g: &Tensor, u: &Tensor) -> Result<Tensor, grim_tensor::error::E
 fn slice_expert(flat: &[f32], e: usize, out: usize, in_dim: usize) -> Vec<f32> {
     let stride = out * in_dim;
     flat[e * stride..(e + 1) * stride].to_vec()
+}
+
+fn err_proj() -> grim_tensor::error::Error {
+    grim_tensor::error::Error::Backend("expert projection missing".into())
+}
+
+/// Encode a flat f32 slice into GGUF Q8_0 blocks (f16 scale + 32 int8 codes
+/// per 32-element block, 34 bytes/block). Used to convert MXFP4 experts to a
+/// format with a working fused dequant-GEMM path.
+fn f32s_to_q8_0_blocks(v: &[f32]) -> Vec<u8> {
+    let blocks = v.len().div_ceil(32);
+    let mut out = Vec::with_capacity(blocks * 34);
+    for b in 0..blocks {
+        let start = b * 32;
+        let end = (start + 32).min(v.len());
+        let block = &v[start..end];
+        let amax = block.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+        out.extend_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        for i in 0..32 {
+            let q = if start + i < v.len() {
+                let x = v[start + i] * id;
+                x.round().clamp(-127.0, 127.0) as i8
+            } else {
+                0
+            };
+            out.push(q as u8);
+        }
+    }
+    out
+}
+
+/// f32 → IEEE 754 half-precision bits (round-to-nearest-even).
+fn f32_to_f16_bits(val: f32) -> u16 {
+    let x = val.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    if !val.is_finite() {
+        return sign | 0x7C00;
+    }
+    let f = x & 0x7FFF_FFFF;
+    if f >= 0x477F_FFFF {
+        return sign | 0x7C00; // overflow → inf
+    }
+    if f < 0x3300_0000 {
+        return sign; // underflow → zero
+    }
+    if f < 0x3880_0000 {
+        // f16 subnormal range: value = m16 * 2^-24 with m16 < 0x400.
+        let e = f >> 23;
+        let m = (f & 0x007F_FFFF) | 0x0080_0000;
+        let s = 126 - e;
+        let m16 = (m + (1 << (s - 1)) + ((m >> s) & 1)) >> s;
+        if m16 >= 0x400 {
+            return sign | 0x0400; // rounded up into the smallest normal
+        }
+        return sign | m16 as u16;
+    }
+    let rounded = (f + 0x0FFF + ((f >> 13) & 1)) >> 13;
+    sign | rounded as u16
+}
+
+/// Split a length-prefixed MXFP4 buffer into its `(codes, exps)` segments.
+fn split_mxfp4_framed(
+    bytes: &[u8],
+) -> Result<(&[u8], &[u8]), grim_tensor::error::Error> {
+    if bytes.len() < 16 {
+        return Err(grim_tensor::error::Error::Backend(
+            "split_mxfp4_framed: buffer too short for two length prefixes".into(),
+        ));
+    }
+    let codes_len =
+        u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+    if bytes.len() < 8 + codes_len + 8 {
+        return Err(grim_tensor::error::Error::Backend(
+            "split_mxfp4_framed: truncated codes segment".into(),
+        ));
+    }
+    let exps_len = u64::from_le_bytes(
+        bytes[8 + codes_len..8 + codes_len + 8].try_into().unwrap(),
+    ) as usize;
+    if bytes.len() < 8 + codes_len + 8 + exps_len {
+        return Err(grim_tensor::error::Error::Backend(
+            "split_mxfp4_framed: truncated exps segment".into(),
+        ));
+    }
+    Ok((
+        &bytes[8..8 + codes_len],
+        &bytes[8 + codes_len + 8..8 + codes_len + 8 + exps_len],
+    ))
+}
+
+/// Transpose a sliced expert block from `[out, in_dim]` to `[in_dim, out]`.
+fn transpose_slice(flat: &[f32], out: usize, in_dim: usize) -> Vec<f32> {
+    transpose_block(flat, out, in_dim)
 }
 
 /// Transpose a contiguous `[out, in_dim]` block into `[in_dim, out]`.

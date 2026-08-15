@@ -10,34 +10,39 @@ fn scan_q4k_model_dtypes() {
         .find(|p| p.join("models").is_dir())
         .expect("repo root with models/")
         .to_path_buf();
-    let path = repo_root.join("models/MiniCPM5-1B-Q4_K_M.gguf");
-    let f = match File::open(&path) {
-        Ok(f) => f,
-        Err(_) => {
-            eprintln!("skip");
-            return;
+    let path = "/drive/bigfast/grim/models/Mellum2-12B-A2.5B-Thinking-MXFP4_MOE.gguf";
+    let file = File::open(path).expect("failed to open GGUF");
+    let mut reader = BufReader::new(file);
+    let file = read_gguf(&mut reader).expect("failed to parse GGUF");
+    println!("Metadata:");
+    for (k, v) in &file.metadata {
+        if !k.contains("tokens") && !k.contains("merges") {
+            println!("  {k} = {:?}", v);
         }
-    };
-    let mut reader = BufReader::new(f);
-    let file = read_gguf(&mut reader).expect("read_gguf");
-    let mut counts: std::collections::HashMap<String, usize> = Default::default();
-    for t in &file.tensors {
-        let s = format!("{:?}", t.dtype);
-        *counts.entry(s).or_insert(0) += 1;
     }
-    let mut out = String::new();
-    for (k, v) in counts.iter() {
-        writeln!(out, "{k}: {v}").unwrap();
-    }
-    eprintln!("[scan]\n{out}");
-    // also print any tensor whose dtype is NOT Q4K
+    println!("Total tensors: {}", file.tensors.len());
+    let total_bytes: u64 = file.tensors.iter().map(|t| t.size_bytes).sum();
+    let file_len = std::fs::metadata(path).unwrap().len();
+    println!(
+        "data_start={}, sum(size_bytes)={}, sum+data_start={}, actual file len={}, diff={}",
+        file.data_start,
+        total_bytes,
+        file.data_start + total_bytes,
+        file_len,
+        file_len as i64 - (file.data_start + total_bytes) as i64
+    );
     for t in &file.tensors {
-        if t.dtype != GgufDType::Q4K {
-            eprintln!("[non-q4k] {} {:?} dims={:?}", t.name, t.dtype, t.dims);
-        } else {
-            if t.name.contains("blk.0.") {
-                eprintln!("[q4k] {} dims={:?}", t.name, t.dims);
-            }
+        if t.name.contains("blk.0.") || t.name.contains("token_embd") {
+            let n: usize = t.dims.iter().map(|&d| d as usize).product();
+            println!(
+                "  {}: dims={:?}, dtype={:?}, size_bytes={}, elems={} (bytes/elem={:.3})",
+                t.name,
+                t.dims,
+                t.dtype,
+                t.size_bytes,
+                n,
+                t.size_bytes as f64 / n as f64
+            );
         }
     }
 }

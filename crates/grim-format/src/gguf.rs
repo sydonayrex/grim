@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
 use grim_tensor::dtype::DType;
-use grim_tensor::dtype::{KQuantScheme, Storage};
+use grim_tensor::dtype::{FloatPackScheme, KQuantScheme, Storage};
 use grim_tensor::error::{Error, Result};
 
 pub const GGUF_MAGIC: u32 = 0x4655_4747; // "GGUF" LE
@@ -299,7 +299,7 @@ impl GgufDType {
             GgufDType::IQ2_S => 82,
             GgufDType::IQ1_S => 50,
             GgufDType::IQ1_M => 56,
-            GgufDType::MXFP4 => 128,
+            GgufDType::MXFP4 => 136,
             _ => 0,
         }
     }
@@ -1720,7 +1720,7 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
         GgufDType::BF16 => DType::F16,
         GgufDType::MXFP4 => DType {
             arith: grim_tensor::ArithType::F32,
-            storage: Storage::KQuant(KQuantScheme::Q4K),
+            storage: Storage::FloatPack(FloatPackScheme::MxFp4),
         },
     }
 }

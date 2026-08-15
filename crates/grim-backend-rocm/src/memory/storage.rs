@@ -409,6 +409,9 @@ impl BackendStorage for RocmStorage {
                 DTypeStorage::KQuant(KQuantScheme::Q4K) => {
                     dev.dequantize_q4k_host(&raw, elem_count)
                 }
+                DTypeStorage::FloatPack(grim_tensor::FloatPackScheme::MxFp4) => {
+                    dev.dequantize_mxfp4_host(&raw, elem_count)
+                }
                 _ => dequant_cpu(&raw, elem_count, &self.dtype),
             };
 
@@ -553,6 +556,9 @@ fn dequant_cpu(raw: &[u8], elem_count: usize, dtype: &DType) -> Result<Vec<f32>>
             Ok(out)
         }
         DTypeStorage::KQuant(KQuantScheme::Q4K) => grim_quant::dequant_q4k(raw, elem_count),
+        DTypeStorage::FloatPack(grim_tensor::FloatPackScheme::MxFp4) => {
+            grim_quant::dequant_mxfp4(raw, elem_count)
+        }
         _ => Err(Error::Backend(format!(
             "to_cpu_vec_f32: host dequant not yet implemented for {:?}",
             dtype.storage
