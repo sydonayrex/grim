@@ -81,6 +81,18 @@ impl<'a> WeightSource<'a> {
         }
     }
 
+    /// Return a new `WeightSource` targeting a different `device`.
+    pub fn with_device(&self, device: Device) -> WeightSource<'a> {
+        WeightSource {
+            tensors: self.tensors,
+            prefix: self.prefix.clone(),
+            default_dtype: self.default_dtype.clone(),
+            default_provenance: self.default_provenance.clone(),
+            device,
+            tp_config: self.tp_config,
+        }
+    }
+
     /// Read-only access to the current TP config.
     pub fn tp_config(&self) -> TensorParallelConfig {
         self.tp_config
@@ -145,6 +157,27 @@ impl<'a> WeightSource<'a> {
     /// Returns the target device for this WeightSource (CPU or GPU).
     pub fn device(&self) -> Device {
         self.device.clone()
+    }
+
+    /// Fetch the raw packed bytes for a tensor BEFORE materialization. Used by
+    /// loaders that slice a 3D expert bank into per-expert tensors so each
+    /// expert can be materialized (quantized-resident on GPU) individually
+    /// instead of dequantizing the whole bank to host f32.
+    pub fn get_raw_packed(&self, leaf: &str) -> Result<grim_tensor::provider::RawTensor> {
+        self.tensors.get_packed(&self.full_name(leaf))
+    }
+
+    /// Materialize an already-fetched `RawTensor` on this WeightSource's
+    /// device (quantized formats stay packed/resident on GPU; native formats
+    /// become f32 tensors). Crate-internal helper shared by module loaders.
+    pub(crate) fn materialize_raw(
+        &self,
+        raw: grim_tensor::provider::RawTensor,
+        shape: Shape,
+    ) -> Result<Tensor> {
+        let dtype = raw.dtype.clone();
+        let provenance = raw.provenance.clone();
+        materialize(raw, shape, dtype, provenance, &self.device)
     }
 
     fn full_name(&self, leaf: &str) -> String {
@@ -228,6 +261,7 @@ impl<'a> WeightSource<'a> {
 // Materialization helpers — each arm is a self-contained branch so cfg(...)
 // attributes on `use` statements don't create non-exhaustive match arms.
 
+#[cfg(feature = "cuda-mem")]
 fn materialize_cuda(
     f32s: Vec<f32>,
     shape: Shape,
@@ -408,73 +442,19 @@ fn materialize(
         return Ok(cpu_tensor(f32s, shape));
     }
     if dtype.is_quantized() {
-        // Q8_0 has an on-device dequant kernel on ROCm. All other KQuant
-        // formats (Q4K, Q6K, IQ*, etc.) lack on-device dequant kernels, so
-        // they must fall through to the CPU dequant path below, which
-        // produces real F32 and uploads it via materialize_rocm.
-        let is_q80 = matches!(&dtype.storage, Storage::KQuant(KQuantScheme::Q80));
-        if matches!(&dtype.storage, Storage::ResidualPacked(_)) {
-            if let Device::Rocm(ordinal) = device {
-                #[cfg(feature = "rocm-mem")]
-                {
-                    let dev = RocmDevice::shared(*ordinal);
-                    let mut storage = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone())?;
-                    storage.set_provenance(provenance.clone());
-                    return Ok(Tensor::new(
-                        Arc::from(storage),
-                        shape,
-                        dtype,
-                        provenance,
-                        device.clone(),
-                    ));
-                }
-            }
-            return Err(Error::Unimplemented(
-                "ResidualPacked inference requires a ROCm device".into(),
-            ));
-        }
-        if is_q80 {
-            if let Device::Rocm(ordinal) = device {
-                #[cfg(feature = "rocm-mem")]
-                {
-                    let dev = RocmDevice::shared(*ordinal);
-                    if let Ok(storage) = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone()) {
-                        let f32_storage = {
-                            let roc_storage = storage
-                                .as_any()
-                                .downcast_ref::<RocmStorage>()
-                                .ok_or_else(|| {
-                                    Error::Backend(
-                                        "materialize: ROCm Q80 storage is not RocmStorage".into(),
-                                    )
-                                })?;
-                            dev.dequantize_q8_0(roc_storage)?
-                        };
-                        // Free the packed buffer immediately instead of
-                        // letting it live until this function returns. On a
-                        // 4GB card, holding both the packed (~1.06 B/elem)
-                        // and freshly-dequantized F32 (4 B/elem) buffers
-                        // alive at once nearly quadruples this tensor's peak
-                        // VRAM footprint during load — across every Q8_0
-                        // tensor in the model that adds up fast enough to
-                        // OOM (`hipMalloc failed: 2`) on small consumer
-                        // cards. `roc_storage` only borrowed `storage`, so
-                        // dropping the owning `Box` here (rather than at
-                        // end-of-scope) is what actually returns the packed
-                        // allocation to the caching allocator before the
-                        // next tensor loads.
-                        drop(storage);
-                        return Ok(Tensor::new(
-                            Arc::from(f32_storage),
-                            shape,
-                            DType::F32,
-                            provenance,
-                            device.clone(),
-                        ));
-                    }
-                }
-                #[cfg(not(feature = "rocm-mem"))]
-                let _ = ordinal;
+        #[cfg(feature = "rocm-mem")]
+        if let Device::Rocm(ordinal) = device {
+            if !matches!(dtype.storage, Storage::GroupInt(_)) {
+                let dev = RocmDevice::shared(*ordinal);
+                let mut storage = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone())?;
+                storage.set_provenance(provenance.clone());
+                return Ok(Tensor::new(
+                    Arc::from(storage),
+                    shape,
+                    dtype,
+                    provenance,
+                    device.clone(),
+                ));
             }
         }
 

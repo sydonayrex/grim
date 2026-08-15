@@ -176,6 +176,18 @@ impl TensorProvider for GgufProvider {
         let mut reader = self.reader.lock().unwrap();
         let bytes = read_tensor_bytes(&mut *reader, &self.file, info)?;
         let dtype = effective_dtype(info, &self.overrides);
+        // GGUF-native MXFP4 (llama.cpp 17-byte blocks: E8M0 scale first, then
+        // nibble-packed codes) must be reframed into the length-prefixed
+        // [codes][exps] layout that every downstream dequant path expects.
+        let bytes = if matches!(
+            &dtype.storage,
+            grim_tensor::dtype::Storage::FloatPack(grim_tensor::dtype::FloatPackScheme::MxFp4)
+        ) {
+            let n = info.shape().iter().product::<usize>();
+            grim_quant::reframe_mxfp4_gguf(&bytes, n)?
+        } else {
+            bytes
+        };
         Ok(RawTensor {
             bytes,
             shape: info.shape(),
@@ -213,7 +225,7 @@ impl TensorProvider for GgufProvider {
         if world_size == 1 && rank == 0 {
             return self.get_packed(name);
         }
-        if dim != 0 {
+        if dim != 0 && dim != 1 {
             let raw = self.get_packed(name)?;
             return shard_raw_tensor(raw, dim, rank, world_size);
         }
@@ -230,37 +242,70 @@ impl TensorProvider for GgufProvider {
         }
 
         let gguf_dtype = info.dtype;
-        let out_dim = info.shape()[0];
+        let shape = info.shape();
+        let out_dim = shape[0];
+        let in_dim = if shape.len() > 1 { shape[1] } else { 1 };
         let block_size = gguf_dtype.block_size() as usize;
-        if !gguf_dtype.block_boundary_valid(out_dim, world_size) {
-            return Err(Error::Backend(format!(
-                "tensor '{name}': shard boundary does not align with block size {block_size} \
-                 (out_dim={out_dim}, world_size={world_size})"
-            )));
-        }
-
-        let shard_rows = out_dim / world_size;
-        let start_row = rank * shard_rows;
         let type_size = gguf_dtype.type_size_per_block() as usize;
 
-        // GGUF block-quant layout: each block covers `block_size` rows and occupies
-        // `type_size` bytes. Compute the byte range for this rank's blocks.
-        let blocks_per_shard = shard_rows / block_size;
-        let start_block = start_row / block_size;
-        let byte_offset = info.offset + (start_block * type_size) as u64;
-        let byte_len = blocks_per_shard * type_size;
+        if dim == 0 {
+            let shard_rows = out_dim / world_size;
+            let start_row = rank * shard_rows;
 
-        let mut reader = self.reader.lock().unwrap();
-        reader.seek(std::io::SeekFrom::Start(byte_offset))?;
-        let mut buf = vec![0u8; byte_len];
-        reader.read_exact(&mut buf)?;
+            let bytes_per_row = if shape.len() > 1 {
+                (in_dim / block_size) * type_size
+            } else {
+                (shard_rows / block_size) * type_size
+            };
 
-        Ok(RawTensor {
-            bytes: buf,
-            shape: vec![shard_rows, info.shape()[1]],
-            dtype,
-            provenance: QuantProvenance::GrimNative,
-        })
+            let byte_offset = info.offset + (start_row * bytes_per_row) as u64;
+            let byte_len = if shape.len() > 1 {
+                shard_rows * bytes_per_row
+            } else {
+                bytes_per_row
+            };
+
+            let mut reader = self.reader.lock().unwrap();
+            reader.seek(std::io::SeekFrom::Start(byte_offset))?;
+            let mut buf = vec![0u8; byte_len];
+            reader.read_exact(&mut buf)?;
+
+            let out_shape = if shape.len() > 1 {
+                vec![shard_rows, shape[1]]
+            } else {
+                vec![shard_rows]
+            };
+
+            Ok(RawTensor {
+                bytes: buf,
+                shape: out_shape,
+                dtype,
+                provenance: QuantProvenance::GrimNative,
+            })
+        } else {
+            // dim == 1 (row-parallel: slice across columns)
+            let shard_cols = in_dim / world_size;
+            let blocks_per_rank_row = (shard_cols / block_size).max(1);
+            let rank_row_bytes = blocks_per_rank_row * type_size;
+            let start_block = (rank * shard_cols) / block_size;
+            let row_start_byte_offset = start_block * type_size;
+            let full_bytes_per_row = (in_dim / block_size) * type_size;
+
+            let mut reader = self.reader.lock().unwrap();
+            let mut buf = vec![0u8; out_dim * rank_row_bytes];
+            for r in 0..out_dim {
+                let row_offset = info.offset + (r * full_bytes_per_row) as u64 + row_start_byte_offset as u64;
+                reader.seek(std::io::SeekFrom::Start(row_offset))?;
+                reader.read_exact(&mut buf[r * rank_row_bytes..(r + 1) * rank_row_bytes])?;
+            }
+
+            Ok(RawTensor {
+                bytes: buf,
+                shape: vec![out_dim, shard_cols],
+                dtype,
+                provenance: QuantProvenance::GrimNative,
+            })
+        }
     }
 }
 
