@@ -630,6 +630,23 @@ fn transpose_last_two(t: &Tensor) -> Result<Tensor> {
         ));
     }
 
+    // ROCm F32 on-device path: transpose in device memory (`grim_transpose_2d_f32`),
+    // avoiding the host `to_vec_f32` (DtoH) + `from_cpu` (H2D) round trip below.
+    // Only reached for non-quantized ROCm weights (quantized took the relabel
+    // fast path above), so the input is plain F32 storage on the device.
+    #[cfg(feature = "rocm-mem")]
+    if let Device::Rocm(ordinal) = t.device() {
+        let dev = grim_backend_rocm::RocmDevice::shared(*ordinal);
+        let storage = dev.transpose_f32_2d(t.storage().as_ref(), a, b)?;
+        return Ok(Tensor::new(
+            Arc::from(storage),
+            new_shape,
+            DType::F32,
+            t.provenance().clone(),
+            t.device().clone(),
+        ));
+    }
+
     // All other cases (CPU/CUDA/Vulkan/Metal, F32 or quantized): genuinely
     // transpose the data so `w_t` is in [in,out]=[k,n] row-major layout.
     // Quantized tensors reaching here are already dequantized to F32 in
@@ -755,8 +772,17 @@ impl Embedding {
     pub fn load(ws: &WeightSource<'_>, vocab: usize, dim: usize) -> Result<Self> {
         // Probe `[vocab, dim]`. On exact shape match, use as-is on the target device.
         if let Ok(t) = ws.get([vocab, dim], "weight") {
+            if !t.dtype().is_quantized() {
+                // Native (F32/BF16/F16) embedding: already on-device, pass through.
+                return Ok(Self { weight: t });
+            }
+            // Quantized embedding (e.g. GGUF token_embd Q8_0 on ROCm): `ws.get`
+            // keeps the packed bytes resident on-device, so dequantizing via
+            // `to_vec_f32()` + re-upload would be a DtoH→H2D round trip. Instead
+            // dequantize the host bytes once and upload as an F32 table in a
+            // single H2D — the layout `grim_embedding` reads.
             return Ok(Self {
-                weight: dequantize_for_gather(t)?,
+                weight: ws.get_f32([vocab, dim], "weight")?,
             });
         }
 

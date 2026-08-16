@@ -307,12 +307,17 @@ impl ExpertBank {
             for e in 0..num_experts {
                 let per_expert = elem_count / num_experts;
                 let (bytes, dtype): (Vec<u8>, grim_tensor::dtype::DType) = if is_framed_mxfp4 {
-                    // MXFP4 has no fused GEMM wired through `Linear::forward`
-                    // yet (plain matmul would misread the packed bytes as
-                    // F32). Convert each expert to Q8_0 on the host — one
-                    // expert at a time — so the expert rides the proven
-                    // Q8_0 fused dequant-GEMM path while keeping weights at 1
-                    // byte/element on-device instead of 4.
+                    // MXFP4 rides the fused dequant-GEMM path through
+                    // `Linear::forward` -> `quantized_matmul` (ROCm dispatch at
+                    // roc_device.rs:2607), so keep it packed on-device as MXFP4
+                    // instead of dequantizing on the host and requantizing to
+                    // Q8_0. That host round-trip was the load tax: it ran
+                    // serially per expert, in the layer loop, and it silently
+                    // swapped the dtype the kernel was expecting.
+                    //
+                    // Slice this expert's codes/exps out of the framed bank
+                    // and re-wrap in the length-prefixed [codes][exps]
+                    // framing `quantized_matmul` expects.
                     let (codes, exps) = split_mxfp4_framed(&raw.bytes)?;
                     let codes_per = per_expert / 2;
                     let exps_per = per_expert.div_ceil(32);
@@ -320,18 +325,16 @@ impl ExpertBank {
                     let x = &exps[e * exps_per..(e + 1) * exps_per];
                     let mut framed = Vec::with_capacity(16 + c.len() + x.len());
                     framed.extend_from_slice(&(c.len() as u64).to_le_bytes());
-                    framed.extend_from_slice(c);
+                    framed.extend_from_slice(&c);
                     framed.extend_from_slice(&(x.len() as u64).to_le_bytes());
-                    framed.extend_from_slice(x);
-                    let f32s = grim_quant::dequant_mxfp4(&framed, per_expert)?;
-                    let q80 = f32s_to_q8_0_blocks(&f32s);
-                    let d = grim_tensor::dtype::DType {
+                    framed.extend_from_slice(&x);
+                    let mxfp4_dtype = grim_tensor::dtype::DType {
                         arith: grim_tensor::ArithType::F32,
-                        storage: grim_tensor::dtype::Storage::KQuant(
-                            grim_tensor::dtype::KQuantScheme::Q80,
+                        storage: grim_tensor::dtype::Storage::FloatPack(
+                            grim_tensor::dtype::FloatPackScheme::MxFp4,
                         ),
                     };
-                    (q80, d)
+                    (framed, mxfp4_dtype)
                 } else {
                     // Raw block-quant bytes: contiguous per-expert stride.
                     if raw.bytes.len() % num_experts != 0 {
@@ -374,8 +377,8 @@ impl ExpertBank {
     fn load_native(
         ws: &WeightSource<'_>,
         num_experts: usize,
-        hidden: usize,
-        inter: usize,
+        _hidden: usize,
+        _inter: usize,
         has_bias: bool,
         projections: [(&'static str, usize, usize); 3],
     ) -> Result<Self, grim_tensor::error::Error> {
@@ -1029,62 +1032,7 @@ fn err_proj() -> grim_tensor::error::Error {
     grim_tensor::error::Error::Backend("expert projection missing".into())
 }
 
-/// Encode a flat f32 slice into GGUF Q8_0 blocks (f16 scale + 32 int8 codes
-/// per 32-element block, 34 bytes/block). Used to convert MXFP4 experts to a
-/// format with a working fused dequant-GEMM path.
-fn f32s_to_q8_0_blocks(v: &[f32]) -> Vec<u8> {
-    let blocks = v.len().div_ceil(32);
-    let mut out = Vec::with_capacity(blocks * 34);
-    for b in 0..blocks {
-        let start = b * 32;
-        let end = (start + 32).min(v.len());
-        let block = &v[start..end];
-        let amax = block.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-        let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
-        out.extend_from_slice(&f32_to_f16_bits(d).to_le_bytes());
-        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
-        for i in 0..32 {
-            let q = if start + i < v.len() {
-                let x = v[start + i] * id;
-                x.round().clamp(-127.0, 127.0) as i8
-            } else {
-                0
-            };
-            out.push(q as u8);
-        }
-    }
-    out
-}
-
 /// f32 → IEEE 754 half-precision bits (round-to-nearest-even).
-fn f32_to_f16_bits(val: f32) -> u16 {
-    let x = val.to_bits();
-    let sign = ((x >> 16) & 0x8000) as u16;
-    if !val.is_finite() {
-        return sign | 0x7C00;
-    }
-    let f = x & 0x7FFF_FFFF;
-    if f >= 0x477F_FFFF {
-        return sign | 0x7C00; // overflow → inf
-    }
-    if f < 0x3300_0000 {
-        return sign; // underflow → zero
-    }
-    if f < 0x3880_0000 {
-        // f16 subnormal range: value = m16 * 2^-24 with m16 < 0x400.
-        let e = f >> 23;
-        let m = (f & 0x007F_FFFF) | 0x0080_0000;
-        let s = 126 - e;
-        let m16 = (m + (1 << (s - 1)) + ((m >> s) & 1)) >> s;
-        if m16 >= 0x400 {
-            return sign | 0x0400; // rounded up into the smallest normal
-        }
-        return sign | m16 as u16;
-    }
-    let rounded = (f + 0x0FFF + ((f >> 13) & 1)) >> 13;
-    sign | rounded as u16
-}
-
 /// Split a length-prefixed MXFP4 buffer into its `(codes, exps)` segments.
 fn split_mxfp4_framed(
     bytes: &[u8],
@@ -1113,22 +1061,6 @@ fn split_mxfp4_framed(
         &bytes[8..8 + codes_len],
         &bytes[8 + codes_len + 8..8 + codes_len + 8 + exps_len],
     ))
-}
-
-/// Transpose a sliced expert block from `[out, in_dim]` to `[in_dim, out]`.
-fn transpose_slice(flat: &[f32], out: usize, in_dim: usize) -> Vec<f32> {
-    transpose_block(flat, out, in_dim)
-}
-
-/// Transpose a contiguous `[out, in_dim]` block into `[in_dim, out]`.
-fn transpose_block(v: &[f32], out: usize, in_dim: usize) -> Vec<f32> {
-    let mut t = vec![0.0f32; v.len()];
-    for o in 0..out {
-        for i in 0..in_dim {
-            t[i * out + o] = v[o * in_dim + i];
-        }
-    }
-    t
 }
 
 fn slice_row(x: &Tensor, t: usize) -> Result<Tensor, grim_tensor::error::Error> {
