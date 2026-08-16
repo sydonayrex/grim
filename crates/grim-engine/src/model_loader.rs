@@ -697,6 +697,7 @@ fn load_model_from_config(
 
     let tp = resolve_tp_config()?;
     let ws = WeightSource::root(provider, device.clone()).with_tp_config(tp);
+            ws.prefetch_all();
 
     match model_arch {
         ModelArchitecture::Falcon => {

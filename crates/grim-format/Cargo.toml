@@ -16,6 +16,7 @@ half = "2.0"
 zstd = { version = "0.13", default-features = false }
 rayon = "1.8"
 minijinja = "2"
+memmap2 = "0.9"
 
 [features]
 default = []

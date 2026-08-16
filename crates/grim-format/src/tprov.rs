@@ -17,15 +17,20 @@ use crate::format::{
 };
 use crate::gguf::{
     GgufDType, GgufFile, GgufTensorInfo, GrimFusionOp, GrimMetadata, GrimQuantOverride,
-    GrimTrainQuantMode, read_gguf, read_tensor_bytes,
+    GrimTrainQuantMode, read_gguf,
 };
-use crate::safetensors::{SafetensorInfo, read_safetensor_bytes, read_safetensors_header};
+use crate::safetensors::{SafetensorInfo, read_safetensors_header};
 
 /// GGUF-backed `TensorProvider`. Holds the parsed file index and wraps a
 /// `BufReader<File>` for lazy tensor reads.
 pub struct GgufProvider {
     file: GgufFile,
-    reader: std::sync::Mutex<BufReader<File>>,
+    /// Memory-mapped file. Tensor bytes are sliced directly from this (zero
+    /// copy) instead of being `read_exact`'d through a per-tensor mutex, which
+    /// both removes the serialization bottleneck and lets the OS prefetch.
+    mmap: memmap2::Mmap,
+    /// Byte offset of the aligned tensor-data section within the file.
+    data_start: u64,
     tensors: HashMap<String, GgufTensorInfo>,
     grim: GrimMetadata,
     overrides: HashMap<String, GrimQuantOverride>,
@@ -61,12 +66,20 @@ impl GgufProvider {
             }
         }
 
-        let file = File::open(path)
-            .map_err(|e| Error::Backend(format!("cannot reopen GGUF file '{path}': {e}")))?;
-        let reader = std::sync::Mutex::new(BufReader::new(file));
+        // Map the whole file read-only and slice tensors directly out of it.
+        let mmap = {
+            let f = File::open(path)
+                .map_err(|e| Error::Backend(format!("cannot reopen GGUF file '{path}': {e}")))?;
+            unsafe {
+                memmap2::Mmap::map(&f)
+                    .map_err(|e| Error::Backend(format!("cannot mmap GGUF file '{path}': {e}")))?
+            }
+        };
+        let data_start = gguf.data_start;
         Ok(Self {
             file: gguf,
-            reader,
+            mmap,
+            data_start,
             tensors,
             grim,
             overrides,
@@ -173,8 +186,7 @@ impl TensorProvider for GgufProvider {
             .tensors
             .get(name)
             .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in GGUF file")))?;
-        let mut reader = self.reader.lock().unwrap();
-        let bytes = read_tensor_bytes(&mut *reader, &self.file, info)?;
+        let bytes = self.slice_tensor(info)?;
         let dtype = effective_dtype(info, &self.overrides);
         // GGUF-native MXFP4 (llama.cpp 17-byte blocks: E8M0 scale first, then
         // nibble-packed codes) must be reframed into the length-prefixed
@@ -208,6 +220,10 @@ impl TensorProvider for GgufProvider {
             shape: info.shape(),
             fusion_mask: 0,
         })
+    }
+
+    fn tensor_names(&self) -> Vec<String> {
+        self.tensors.keys().cloned().collect()
     }
 
     /// Zero-copy byte-range read for column-parallel (dim==0) sharding of GGUF
@@ -258,17 +274,14 @@ impl TensorProvider for GgufProvider {
                 (shard_rows / block_size) * type_size
             };
 
-            let byte_offset = info.offset + (start_row * bytes_per_row) as u64;
+            let byte_offset = self.data_start + info.offset + (start_row * bytes_per_row) as u64;
             let byte_len = if shape.len() > 1 {
                 shard_rows * bytes_per_row
             } else {
                 bytes_per_row
             };
 
-            let mut reader = self.reader.lock().unwrap();
-            reader.seek(std::io::SeekFrom::Start(byte_offset))?;
-            let mut buf = vec![0u8; byte_len];
-            reader.read_exact(&mut buf)?;
+            let buf = self.read_region(byte_offset, byte_len)?;
 
             let out_shape = if shape.len() > 1 {
                 vec![shard_rows, shape[1]]
@@ -291,12 +304,14 @@ impl TensorProvider for GgufProvider {
             let row_start_byte_offset = start_block * type_size;
             let full_bytes_per_row = (in_dim / block_size) * type_size;
 
-            let mut reader = self.reader.lock().unwrap();
             let mut buf = vec![0u8; out_dim * rank_row_bytes];
             for r in 0..out_dim {
-                let row_offset = info.offset + (r * full_bytes_per_row) as u64 + row_start_byte_offset as u64;
-                reader.seek(std::io::SeekFrom::Start(row_offset))?;
-                reader.read_exact(&mut buf[r * rank_row_bytes..(r + 1) * rank_row_bytes])?;
+                let row_offset = self.data_start
+                    + info.offset
+                    + (r * full_bytes_per_row) as u64
+                    + row_start_byte_offset as u64;
+                let slice = self.read_region(row_offset, rank_row_bytes)?;
+                buf[r * rank_row_bytes..(r + 1) * rank_row_bytes].copy_from_slice(&slice);
             }
 
             Ok(RawTensor {
@@ -309,11 +324,41 @@ impl TensorProvider for GgufProvider {
     }
 }
 
+impl GgufProvider {
+    /// Slice a full tensor's packed bytes out of the mmap (zero copy into a
+    /// fresh `Vec`). `GgufTensorInfo.offset` is relative to the tensor-data
+    /// section start, which begins at `self.data_start`.
+    fn slice_tensor(&self, info: &GgufTensorInfo) -> Result<Vec<u8>> {
+        let start = self
+            .data_start
+            .checked_add(info.offset)
+            .ok_or_else(|| Error::Backend(format!("GGUF tensor '{}' offset overflow", info.name)))?;
+        self.read_region(start, info.size_bytes as usize)
+    }
+
+    /// Read a byte range straight out of the memory map.
+    fn read_region(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let start = offset as usize;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| Error::Backend("GGUF read range overflow".into()))?;
+        if end > self.mmap.len() {
+            return Err(Error::Backend(format!(
+                "GGUF read range {start}..{end} exceeds mmap length {}",
+                self.mmap.len()
+            )));
+        }
+        Ok(self.mmap[start..end].to_vec())
+    }
+}
+
 /// Safetensors-backed `TensorProvider`.
 pub struct SafetensorsProvider {
     info: std::collections::HashMap<String, SafetensorInfo>,
     tensors: std::collections::HashMap<String, SafetensorInfo>,
-    reader: std::sync::Mutex<BufReader<File>>,
+    /// Memory-mapped file. Tensor bytes are sliced directly (zero copy),
+    /// replacing the per-tensor `Mutex<BufReader>` that serialized all reads.
+    mmap: memmap2::Mmap,
     data_region_start: u64,
     gptq: Option<crate::gptq::GptqProvider>,
 }
@@ -370,11 +415,14 @@ impl SafetensorsProvider {
 
         let file = File::open(path)
             .map_err(|e| Error::Backend(format!("cannot reopen safetensors file '{path}': {e}")))?;
-        let reader = std::sync::Mutex::new(BufReader::new(file));
+        let mmap = unsafe {
+            memmap2::Mmap::map(&file)
+                .map_err(|e| Error::Backend(format!("cannot mmap safetensors file '{path}': {e}")))?
+        };
         Ok(Self {
             info,
             tensors,
-            reader,
+            mmap,
             data_region_start,
             gptq,
         })
@@ -383,6 +431,21 @@ impl SafetensorsProvider {
     /// Access the logical tensor index (filtered for quantized GPTQ models).
     pub fn tensors(&self) -> &std::collections::HashMap<String, SafetensorInfo> {
         &self.tensors
+    }
+
+    /// Read a byte range straight out of the memory map.
+    fn read_region(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let start = offset as usize;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| Error::Backend("safetensors read range overflow".into()))?;
+        if end > self.mmap.len() {
+            return Err(Error::Backend(format!(
+                "safetensors read range {start}..{end} exceeds mmap length {}",
+                self.mmap.len()
+            )));
+        }
+        Ok(self.mmap[start..end].to_vec())
     }
 }
 
@@ -396,8 +459,14 @@ impl TensorProvider for SafetensorsProvider {
         let info = self.info.get(name).ok_or_else(|| {
             Error::Backend(format!("tensor '{name}' not found in safetensors file"))
         })?;
-        let mut reader = self.reader.lock().unwrap();
-        let bytes = read_safetensor_bytes(&mut *reader, info, self.data_region_start)?;
+        // Zero-copy slice of the mmap. `data_offsets` in the safetensors
+        // header are relative to the data section, so add the section base.
+        let start = self
+            .data_region_start
+            .checked_add(info.data_start)
+            .ok_or_else(|| Error::Backend("safetensors tensor offset overflow".into()))?;
+        let len = (info.data_end - info.data_start) as usize;
+        let bytes = self.read_region(start, len)?;
         Ok(RawTensor {
             bytes,
             shape: info.shape(),
@@ -430,6 +499,10 @@ impl TensorProvider for SafetensorsProvider {
             shape: info.shape(),
             fusion_mask: 0,
         })
+    }
+
+    fn tensor_names(&self) -> Vec<String> {
+        self.tensors.keys().cloned().collect()
     }
 }
 
@@ -1060,5 +1133,12 @@ impl<'a> TensorProvider for RemappingTensorProvider<'a> {
     fn meta(&self, name: &str) -> Result<TensorMeta> {
         let mapped = (self.remap)(name);
         self.inner.meta(&mapped)
+    }
+
+    fn tensor_names(&self) -> Vec<String> {
+        // Enumerate under the remapped (loader-side) names so a
+        // `WeightSource` prefetch keyed by those names lines up with the
+        // `full_name` keys the loader actually requests.
+        self.inner.tensor_names().into_iter().map(|n| (self.remap)(&n)).collect()
     }
 }
