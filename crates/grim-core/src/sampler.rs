@@ -153,7 +153,7 @@ impl Sampler for GreedySampler {
             Some(rp) => apply_repeat_penalty(&v, rp, history),
             None => v,
         };
-        Ok(argmax(&adjusted))
+        Ok(argmax_first(&adjusted))
     }
 
     fn name(&self) -> &str {
@@ -213,11 +213,22 @@ impl Sampler for TopPSampler {
     }
 }
 
-/// Index of the maximum element. Ties resolve to the first occurrence, which
-/// matches the prior inline `max_by` behavior and keeps greedy output stable.
+/// Index of the maximum element. Ties resolve to the first occurrence
+/// (matching llama.cpp / common convention for deterministic greedy decoding).
 fn argmax(v: &[f32]) -> u32 {
     v.iter()
         .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
+}
+
+/// Index of the maximum element with first-occurrence tie-breaking.
+/// Uses `max_by` + reverse enumeration so the first max in forward order wins.
+fn argmax_first(v: &[f32]) -> u32 {
+    v.iter()
+        .enumerate()
+        .rev()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i as u32)
         .unwrap_or(0)
@@ -277,7 +288,7 @@ where
         // Greedy mode still benefits from repetition penalty — apply it before
         // argmax so a token emitted once isn't immediately re-emitted forever.
         let scaled = apply_repeat_penalty(logits, repeat_penalty, history);
-        return argmax(&scaled);
+        return argmax_first(&scaled);
     }
 
     // Apply repetition penalty first, before temperature scaling — CTRL paper.
@@ -333,7 +344,7 @@ where
         // `INF - INF` is NaN, so a +INF-dominant logit makes `sum` NaN; in that
         // case the softmax is a one-hot on the max-logit token(s). Delegate to
         // argmax over the (already NaN-masked) scaled logits.
-        return argmax(&masked);
+        return argmax_first(&masked);
     }
     let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
 
@@ -369,7 +380,7 @@ where
         cdf.push((idx, cumulative));
     }
     if cumulative <= 0.0 {
-        return argmax(logits);
+        return argmax_first(logits);
     }
 
     let draw = (rng() as f64 / (u32::MAX as f64)) * cumulative as f64;

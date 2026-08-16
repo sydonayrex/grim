@@ -137,11 +137,12 @@ struct RawHfConfig {
     num_experts_per_tok: Option<usize>,
     // MoE routed-expert output scaling. HF configs use either
     // `routed_scaling_factor` (Qwen3-MoE / DeepSeek-V2) or, in some
-    // SmolLM2-derived checkpoints, `expert_gating_func`.
+    // SmolLM2-derived checkpoints, `expert_gating_func` (a string like "softmax"
+    // or "silu", NOT a float).
     #[serde(rename = "routed_scaling_factor")]
     routed_scaling_factor: Option<f32>,
     #[serde(rename = "expert_gating_func")]
-    expert_gating_func: Option<f32>,
+    expert_gating_func: Option<String>,
     #[serde(rename = "text_config")]
     text_config: Option<Box<RawHfConfig>>,
     #[serde(rename = "vision_config")]
@@ -223,8 +224,7 @@ impl ArchCompatSpec {
             .or_else(|| text.and_then(|t| t.num_experts_per_tok));
         let routed_scaling_factor = raw
             .routed_scaling_factor
-            .or(raw.expert_gating_func)
-            .or_else(|| text.and_then(|t| t.routed_scaling_factor.or(t.expert_gating_func)));
+            .or_else(|| text.and_then(|t| t.routed_scaling_factor));
 
         let is_moe = model_arch.is_moe() || expert_count.is_some();
         let is_ssm = model_arch.is_ssm();

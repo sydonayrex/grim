@@ -62,7 +62,6 @@ fn detect_rmsnorm_matmul(names: &[String]) -> Option<FusionGroup> {
             "attn_q.weight",
             "attention.wq.weight",
             "self_attn.q_proj.weight",
-            "feed_forward.w1.weight",
         ],
     )?;
     Some(FusionGroup {

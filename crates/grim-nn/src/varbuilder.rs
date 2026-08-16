@@ -14,7 +14,7 @@ use grim_tensor::shape::Shape;
 use grim_tensor::tensor::Tensor;
 use grim_tensor::{BackendDevice, RawTensor};
 
-use grim_backend_cpu::{cpu_tensor, CpuDevice};
+use grim_backend_cpu::{CpuDevice, cpu_tensor};
 use grim_quant::{
     dequant_fp4, dequant_fp4_block16, dequant_fp8, dequant_fp8_block16, dequant_iq2s,
     dequant_iq2xs, dequant_iq2xxs, dequant_iq3s, dequant_iq3xxs, dequant_iq4nl, dequant_iq4xs,
@@ -53,7 +53,9 @@ pub struct WeightSource<'a> {
     /// Keyed by the *full* (prefixed) tensor name so it matches what `get`
     /// requests. Shared across `pp`/`with_tp_config` clones via `Arc`.
     prefetch_cache: std::sync::Arc<
-        parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<grim_tensor::provider::RawTensor>>>,
+        parking_lot::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<grim_tensor::provider::RawTensor>>,
+        >,
     >,
     /// Host-f32 dequant cache, populated by [`prefetch_all`] in the parallel
     /// worker for formats that the `materialize` path dequantizes to host f32
@@ -63,8 +65,9 @@ pub struct WeightSource<'a> {
     /// and the host-dequant `materialize` branch reuse it instead of re-running
     /// `dequant_to_f32` on the layer-construction thread — overlapping the
     /// CPU dequant cost with disk I/O and device uploads.
-    dequant_cache:
-        std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<f32>>>>>,
+    dequant_cache: std::sync::Arc<
+        parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<f32>>>>,
+    >,
 }
 
 impl<'a> WeightSource<'a> {
@@ -81,8 +84,12 @@ impl<'a> WeightSource<'a> {
             default_provenance,
             device,
             tp_config: TensorParallelConfig::default(),
-            prefetch_cache: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
-            dequant_cache: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            prefetch_cache: std::sync::Arc::new(parking_lot::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            dequant_cache: std::sync::Arc::new(parking_lot::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -141,7 +148,10 @@ impl<'a> WeightSource<'a> {
         // across the (potentially slow) fetch.
         let pending: Vec<String> = {
             let guard = cache.lock();
-            names.into_iter().filter(|n| !guard.contains_key(n)).collect()
+            names
+                .into_iter()
+                .filter(|n| !guard.contains_key(n))
+                .collect()
         };
         if pending.is_empty() {
             return;
@@ -151,7 +161,9 @@ impl<'a> WeightSource<'a> {
         pending.par_iter().for_each(|name| {
             match self.tensors.get_packed(name) {
                 Ok(raw) => {
-                    cache.lock().insert(name.clone(), std::sync::Arc::new(raw.clone()));
+                    cache
+                        .lock()
+                        .insert(name.clone(), std::sync::Arc::new(raw.clone()));
                     // Move the CPU dequant into the worker so it overlaps the
                     // remaining disk I/O and device uploads (task: dequant in
                     // prefetch worker). Only formats that `materialize` always
@@ -267,12 +279,8 @@ impl<'a> WeightSource<'a> {
             // Quantized (block-packed) full tensor: the client-side byte layout
             // cannot be sliced safely; fall through to the provider override.
         }
-        self.tensors.get_packed_sharded(
-            name,
-            dim,
-            self.tp_config.rank,
-            self.tp_config.world_size,
-        )
+        self.tensors
+            .get_packed_sharded(name, dim, self.tp_config.rank, self.tp_config.world_size)
     }
 
     /// Push a path segment and return a new `WeightSource` whose prefix is
@@ -733,11 +741,9 @@ fn materialize(
         dequant_to_f32(&raw, &dtype)?
     };
     match device {
-        Device::Cpu => {
-            Err(Error::Backend(
-                "Device::Cpu reached after is_cpu early-return — unreachable".into(),
-            ))
-        }
+        Device::Cpu => Err(Error::Backend(
+            "Device::Cpu reached after is_cpu early-return — unreachable".into(),
+        )),
         Device::Cuda(ordinal) => materialize_cuda(f32s, shape, dtype, provenance, device, *ordinal),
         Device::Rocm(ordinal) => materialize_rocm(f32s, shape, dtype, provenance, device, *ordinal),
         Device::Vulkan => materialize_vulkan(f32s, shape, dtype, provenance, device),
@@ -983,8 +989,8 @@ mod tests {
 
     // ===== audit probe: does prefetch actually populate + hit through a
     // RemappingTensorProvider with an hf->gguf name map (the Mellum2 path)? =====
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::collections::HashMap as HMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CountingNamedProvider {
         map: HMap<String, RawTensor>,
@@ -1035,16 +1041,14 @@ mod tests {
         };
 
         // Real engine remap: hf->gguf. Identity on GGUF names (no HF key matches).
-        let remapped = grim_format::tprov::RemappingTensorProvider::new(
-            &inner,
-            |n: &str| -> String {
+        let remapped =
+            grim_format::tprov::RemappingTensorProvider::new(&inner, |n: &str| -> String {
                 if n == "model.layers.0.attn_norm.weight" {
                     "blk.0.attn_norm.weight".to_string()
                 } else {
                     n.to_string()
                 }
-            },
-        );
+            });
 
         let ws = WeightSource::root(&remapped, Device::Cpu);
         ws.prefetch_all();
@@ -1062,7 +1066,6 @@ mod tests {
             "cache did NOT absorb the get() fetch (fetches={total}); prefetch is ineffective",
         );
     }
-
 
     // ===== audit probe 2: does prefetch_all actually parallelize per-tensor
     // CPU work (the MXFP4 reframe dominates the read phase)? =====

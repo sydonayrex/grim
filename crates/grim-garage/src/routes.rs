@@ -543,7 +543,7 @@ async fn cancel_job(
 pub(crate) fn validate_job_path(field: &str, value: &str) -> std::result::Result<(), String> {
     let has_traversal = value
         .split('/')
-        .any(|component| component == ".." || component == ".");
+        .any(|component| component == ".." || component == "." || component.is_empty());
     if has_traversal || value.contains('\\') {
         Err(format!(
             "{field}: invalid path {value:?} (forbidden: path traversal or backslash)"
@@ -1042,8 +1042,21 @@ async fn convert_model_route(Json(req): Json<ConvertModelRequest>) -> impl IntoR
         }
         source_input.to_string()
     } else {
-        // Relative path: resolve under the models dir (join is safe from `..`
-        // escapes because the result is always beneath `output_dir`).
+        // Relative path: reject `..`/`.` components before joining — Path::join
+        // does not sanitize traversal, so a source_input like "../secret" would
+        // escape the models directory.
+        if source_input.contains("..")
+            || source_input.split('/').any(|c| c == ".")
+            || source_input.split('\\').any(|c| c == ".")
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ConvertModelResponse {
+                    success: false,
+                    output_path: "".into(),
+                    message: "Invalid source_path_or_url: path traversal forbidden".into(),
+                }),
+            );
+        }
         output_dir.join(source_input).to_string_lossy().to_string()
     };
 
@@ -1339,12 +1352,22 @@ async fn chat_handler(
             .last_outcome(request_id)
             .and_then(|o| o.logits.as_ref().cloned())
         {
-            Some(logits) => sampler.sample(&logits, &generated_ids).unwrap_or(0),
+            Some(logits) => match sampler.sample(&logits, &generated_ids) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("[chat_handler] sampler error: {e}");
+                    break;
+                }
+            },
             None => break,
         };
 
-        // Common EOS token IDs
-        if token == 0 || token == 2 {
+        // EOS detection: use tokenizer's EOS token ID if available, otherwise
+        // fall back to token == 0 (common but not universal). Never hardcode
+        // token == 2 which is wrong for Llama-3-family tokenizers.
+        // [P2-13 fix: tokenizer-aware EOS detection; propagate sampler errors.]
+        let eos_id = tok.as_ref().map(|t| t.eos_token_id()).unwrap_or(0);
+        if token == eos_id || token == 0 {
             break;
         }
 

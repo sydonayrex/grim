@@ -121,18 +121,37 @@ void grim_qkv_attention(
     // Fast-path GQA key/value stride pointers
     const float* __restrict__ k_head = &k_tensor[kv_head * head_dim];
     const float* __restrict__ v_head = &v_tensor[kv_head * head_dim];
+    const int kv_stride = num_kv_heads * head_dim;
+
+    // Stage this lane's strided slice of q into registers ONCE. The previous
+    // form re-fetched the whole q head from global memory on every KV token
+    // and walked a 256-iteration branchy loop per lane; here each lane does
+    // <=8 MACs per token and the wavefront-uniform score is produced by a
+    // __shfl_xor butterfly.
+    float q_reg[8];
+    #pragma unroll
+    for (int chunk = 0; chunk < 8; ++chunk) {
+        int dd = lane_id + chunk * wave_size;
+        q_reg[chunk] = (dd < head_dim) ? q[q_offset + dd] : 0.0f;
+    }
 
     // Inner loop: online-softmax over assigned range [lo + j_start, lo + j_end)
     for (int j = lo + j_start; j < lo + j_end; ++j) {
-        // Dot product Q.K for this head
-        float score = 0.0f;
+        // Lane-strided partial dot product Q.K, then butterfly reduction.
+        float partial = 0.0f;
         #pragma unroll
-        for (int dim = 0; dim < 256; ++dim) {
-            if (dim < head_dim) {
-                score += q[q_offset + dim] * k_head[j * (num_kv_heads * head_dim) + dim];
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            int dd = lane_id + chunk * wave_size;
+            if (dd < head_dim) {
+                partial += q_reg[chunk] * k_head[j * kv_stride + dd];
             }
         }
-        score *= inv_sqrt_d;
+        const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+        #pragma unroll
+        for (int off = wave_size >> 1; off > 0; off >>= 1) {
+            partial += __shfl_xor_sync(shfl_mask, partial, off);
+        }
+        float score = partial * inv_sqrt_d;
 
         // Online-softmax update
         const float old_max = running_max;
@@ -566,6 +585,15 @@ pub fn launch_paged_attention(
     cache_offset: u32,
     window_lo: i32, // sliding-window lower bound; 0 = full causal
 ) -> Result<(), crate::Error> {
+    // The kernel bakes in a hard cap at head_dim > 256 (writes NaN + returns).
+    // Reject unsupported head_dim at the wrapper so callers get a clear error
+    // rather than silent NaN output. [P1-9 fix.]
+    if head_dim > 256 {
+        return Err(crate::Error::Backend(format!(
+            "qkv_attention: head_dim {} exceeds kernel cap of 256",
+            head_dim
+        )));
+    }
     let q_s = q
         .as_any()
         .downcast_ref::<crate::memory::storage::RocmStorage>()
@@ -606,8 +634,14 @@ pub fn launch_paged_attention(
     let wf = dev.wavefront_size() as u32;
     let grid_dim = crate::HipDim3::new(batch, num_heads, 1);
     let block_dim = crate::HipDim3::new(wf * 4, 1, 1);
-
-    // Wavefront-aware: W32→128 threads, W64→256 threads
+    // Wavefront-aware: W32→128 threads (4×Wave32), W64→256 threads (4×Wave64).
+    // The kernel's LDS sizing assumes exactly 4 wavefronts; assert the invariant.
+    debug_assert!(
+        block_dim.x == wf * 4,
+        "qkv_attention: block_dim.x ({}) != wf*4 ({}) — LDS sizing assumes 4 waves",
+        block_dim.x,
+        wf * 4
+    );
 
     let inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
 

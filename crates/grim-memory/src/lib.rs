@@ -338,6 +338,8 @@ impl KvBlockPool {
             // without re-querying the spill manager.
             self.blocks[id].location = CacheTier::HostRam;
             self.recently_zero.push_back(id);
+            // Do NOT push to free_list — the block is spilled, not available
+            // for fresh allocation. Only promote_to_gpu can reclaim it.
         } else {
             // No spill attached: zero the in-place contents directly.
             self.blocks[id].num_tokens = 0;
@@ -345,8 +347,8 @@ impl KvBlockPool {
             self.blocks[id].key_data.fill(0.0);
             self.blocks[id].value_data.fill(0.0);
             self.blocks[id].location = CacheTier::Gpu;
+            self.free_list.push_back(id);
         }
-        self.free_list.push_back(id);
         Ok(())
     }
 
@@ -363,8 +365,13 @@ impl KvBlockPool {
             Some((k, v)) => {
                 let elem = self.num_heads * self.head_dim;
                 let n = (k.len() / elem).min(BLOCK_SIZE);
-                self.blocks[id].key_data[..k.len()].copy_from_slice(&k);
-                self.blocks[id].value_data[..v.len()].copy_from_slice(&v);
+                // Validate retrieved spill data fits within the block's capacity
+                // before copying — a mismatch is a panic, not silent corruption.
+                let block_cap = self.blocks[id].key_data.len();
+                let k_len = k.len().min(block_cap);
+                let v_len = v.len().min(self.blocks[id].value_data.len());
+                self.blocks[id].key_data[..k_len].copy_from_slice(&k[..k_len]);
+                self.blocks[id].value_data[..v_len].copy_from_slice(&v[..v_len]);
                 self.blocks[id].num_tokens = n;
                 self.blocks[id].received = true;
                 self.blocks[id].location = CacheTier::Gpu;
@@ -398,15 +405,19 @@ impl KvBlockPool {
             }
             self.blocks[bid].location = CacheTier::HostRam;
             self.recently_zero.push_back(bid);
+            // Do NOT push to free_list — spilled blocks are not available for
+            // fresh allocation. Only promote_to_gpu can reclaim them.
+            self.ref_counts.remove(&bid);
+            true
         } else {
             self.blocks[bid].num_tokens = 0;
             self.blocks[bid].received = false;
             self.blocks[bid].key_data.fill(0.0);
             self.blocks[bid].value_data.fill(0.0);
+            self.ref_counts.remove(&bid);
+            self.free_list.push_back(bid);
+            true
         }
-        self.ref_counts.remove(&bid);
-        self.free_list.push_back(bid);
-        true
     }
 
     /// Compress the latest snapshot of `id` via the attached

@@ -25,6 +25,18 @@ pub fn linear_launch(total: usize) -> (crate::HipDim3, crate::HipDim3) {
     )
 }
 
+/// Grid/block dims for warp-per-row kernels (`grim_rms_norm`,
+/// `grim_add_rms_norm`, `grim_softmax`): 256-thread blocks = 8 warps, each
+/// warp owning one row with `__shfl_xor` reductions.
+pub fn warp_rows_launch(rows: usize) -> (crate::HipDim3, crate::HipDim3) {
+    const WARPS_PER_BLOCK: usize = (ROCM_COMPUTE_BLOCK as usize) / 32;
+    let grid = ((rows.max(1) + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK) as u32;
+    (
+        crate::HipDim3::new(grid, 1, 1),
+        crate::HipDim3::new(ROCM_COMPUTE_BLOCK, 1, 1),
+    )
+}
+
 /// Helper: downcast a `BackendStorage` to `RocmStorage`, returning a
 pub fn as_rocm<'a>(s: &'a dyn BackendStorage) -> Result<&'a RocmStorage> {
     s.as_any()

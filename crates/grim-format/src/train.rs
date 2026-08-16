@@ -135,6 +135,15 @@ impl TrainBlob {
         r.read_exact(&mut len_b)
             .map_err(|e| Error::Backend(format!("train blob len read failed: {e}")))?;
         let len = u64::from_le_bytes(len_b) as usize;
+        // Cap blob length to a sane maximum (1 GiB) to avoid allocating up to 4 GB
+        // from an untrusted length field. [P1-28 fix.]
+        const MAX_TRAIN_BLOB: usize = 1 << 30;
+        if len > MAX_TRAIN_BLOB {
+            return Err(Error::Backend(format!(
+                "train blob '{name}': length {} exceeds maximum {}",
+                len, MAX_TRAIN_BLOB
+            )));
+        }
         let mut data = vec![0u8; len];
         r.read_exact(&mut data)
             .map_err(|e| Error::Backend(format!("train blob data read failed: {e}")))?;
@@ -258,6 +267,15 @@ impl TrainState {
             .read_exact(&mut header_len_b)
             .map_err(|e| Error::Backend(format!("train header len read failed: {e}")))?;
         let header_len = u32::from_le_bytes(header_len_b) as usize;
+        // Cap header length to a sane maximum (64 MiB) to avoid allocating up to
+        // 4 GB from an untrusted length field. [P1-28 fix.]
+        const MAX_TRAIN_HEADER: usize = 1 << 26;
+        if header_len > MAX_TRAIN_HEADER {
+            return Err(Error::Backend(format!(
+                "train sidecar: header_len {} exceeds maximum {}",
+                header_len, MAX_TRAIN_HEADER
+            )));
+        }
         let mut header_bytes = vec![0u8; header_len];
         reader
             .read_exact(&mut header_bytes)
