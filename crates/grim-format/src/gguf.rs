@@ -1454,7 +1454,14 @@ pub fn read_gguf<R: Read + Seek>(mut reader: R) -> Result<GgufFile> {
                 Error::Backend(format!("GGUF tensor '{name}' byte size overflowed u64"))
             })?
         } else if type_size == 0 {
-            0
+            // Unimplemented/unsupported dtype — don't silently produce a zero-byte
+            // tensor (which loads as empty data with no error anywhere in the chain).
+            // [P1-22 fix: error on Q4_2/Q8_1Hx instead of silent zero bytes.]
+            return Err(Error::Backend(format!(
+                "GGUF tensor '{name}': dtype {:?} has no implemented block size — \
+                 cannot compute byte size",
+                dtype
+            )));
         } else {
             params
                 .checked_mul(type_size)

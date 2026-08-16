@@ -89,7 +89,7 @@ pub use crate::device::rocblas::{
     RocblasInt,
     RocblasOperation,
     Rocblstatus,
-    RoclabsHandle,
+    RocblasHandle,
     arith_to_compute_dtype,
     arith_to_rocblas_dtype,
     rocblas_create_handle,
@@ -137,7 +137,7 @@ pub use crate::device::probe::{probe_host_gpu, probe_system_rocm, probe_xnack};
 
 pub use crate::device::util::{
     ROCM_COMPUTE_BLOCK, arg, as_rocm, detect_gpu_arch, dev_ptr, dtype_byte_size, dtype_f32,
-    gpu_target_arch, gpu_target_flag, gpu_test_enabled, linear_launch,
+    gpu_target_arch, gpu_target_flag, gpu_test_enabled, linear_launch, warp_rows_launch,
 };
 
 // ROCmDevice itself: large struct + every impl lives in

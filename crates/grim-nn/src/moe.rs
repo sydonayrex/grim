@@ -301,8 +301,10 @@ impl ExpertBank {
             let elem_count: usize = dims.iter().product();
             // MXFP4 arrives from the provider as the length-prefixed
             // [codes][exps] framing; every other quant format is raw blocks.
-            let is_framed_mxfp4 =
-                matches!(raw.dtype.storage, Storage::FloatPack(FloatPackScheme::MxFp4));
+            let is_framed_mxfp4 = matches!(
+                raw.dtype.storage,
+                Storage::FloatPack(FloatPackScheme::MxFp4)
+            );
 
             for e in 0..num_experts {
                 let per_expert = elem_count / num_experts;
@@ -384,10 +386,7 @@ impl ExpertBank {
     ) -> Result<Self, grim_tensor::error::Error> {
         let mut flat = Vec::with_capacity(3);
         for (name, out, in_) in projections {
-            let t = ws.get(
-                Shape::new(vec![num_experts, out, in_]),
-                name,
-            )?;
+            let t = ws.get(Shape::new(vec![num_experts, out, in_]), name)?;
             flat.push((t.to_vec_f32()?, out, in_));
         }
 
@@ -1034,24 +1033,20 @@ fn err_proj() -> grim_tensor::error::Error {
 
 /// f32 → IEEE 754 half-precision bits (round-to-nearest-even).
 /// Split a length-prefixed MXFP4 buffer into its `(codes, exps)` segments.
-fn split_mxfp4_framed(
-    bytes: &[u8],
-) -> Result<(&[u8], &[u8]), grim_tensor::error::Error> {
+fn split_mxfp4_framed(bytes: &[u8]) -> Result<(&[u8], &[u8]), grim_tensor::error::Error> {
     if bytes.len() < 16 {
         return Err(grim_tensor::error::Error::Backend(
             "split_mxfp4_framed: buffer too short for two length prefixes".into(),
         ));
     }
-    let codes_len =
-        u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+    let codes_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
     if bytes.len() < 8 + codes_len + 8 {
         return Err(grim_tensor::error::Error::Backend(
             "split_mxfp4_framed: truncated codes segment".into(),
         ));
     }
-    let exps_len = u64::from_le_bytes(
-        bytes[8 + codes_len..8 + codes_len + 8].try_into().unwrap(),
-    ) as usize;
+    let exps_len =
+        u64::from_le_bytes(bytes[8 + codes_len..8 + codes_len + 8].try_into().unwrap()) as usize;
     if bytes.len() < 8 + codes_len + 8 + exps_len {
         return Err(grim_tensor::error::Error::Backend(
             "split_mxfp4_framed: truncated exps segment".into(),
@@ -1305,15 +1300,20 @@ impl PlanBuilder {
 
         let mut precision = vec![ExpertPrecision::Int8; n];
         let mut used = 0usize;
-        // Greedy: promote experts to fp16 in hotness order until budget hit.
-        // Start from the all-int8 baseline cost, then upgrade.
-        let baseline = n * self.bytes_per_expert_int8;
+        // Greedy: promote experts to fp16 in hotness order while the *upgrade*
+        // cost (fp16 bytes − int8 bytes) stays within the HBM upgrade budget.
+        // The all-int8 floor is the always-resident baseline and is not counted
+        // against `hbm_budget_bytes` (an empty/zero budget still keeps the int8
+        // floor resident).
+        let _baseline = n * self.bytes_per_expert_int8;
         for &e in &order {
             let upgrade_cost = self
                 .bytes_per_expert_fp16
                 .saturating_sub(self.bytes_per_expert_int8);
-            let _ = baseline; // baseline tracks the all-int8 floor
-            if used + upgrade_cost <= self.hbm_budget_bytes || self.hbm_budget_bytes == 0 {
+            if used + upgrade_cost <= self.hbm_budget_bytes {
+                // budget == 0 means nothing gets promoted beyond the int8 baseline
+                // (the `|| budget == 0` clause was removed — it contradicted the
+                // doc comment which says zero budget keeps everything at int8).
                 precision[e] = ExpertPrecision::Fp16;
                 used += upgrade_cost;
             } else {

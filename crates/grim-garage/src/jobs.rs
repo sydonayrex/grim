@@ -2493,20 +2493,24 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                         // the OLoRA plan; contributes to the reported/accum
                         // loss only.
                         let loss_val = loss_val + olora_penalty_for_registry(&autograd_reg);
-                        let scaled_loss_val = loss_val / accumulation_steps as f32;
+                        // Accumulate the unscaled loss; the gradient is scaled by
+                        // 1/accumulation_steps via scale_backward (correct), but
+                        // the reported loss should be divided once at report time
+                        // — NOT here AND at report time (was: accum_loss /
+                        // accumulation_steps where accum_loss already contained
+                        // per-step /accumulation_steps, giving a double division).
                         let scaled_grad = grim_autograd::ScaleArgs {
                             input_grad: loss_grad,
                             factor: 1.0 / accumulation_steps as f32,
                         };
                         let scaled_grad_tensor = grim_autograd::scale_backward(&scaled_grad)
-                            .expect("scale_backward failed");
-                        let _ = backward(
+                            .map_err(|e| format!("scale_backward failed: {e}"))?;
+                        backward(
                             &tape,
                             scaled_grad_tensor,
                             logits_id,
                             &mut autograd_reg.params,
-                        );
-                        accum_loss += scaled_loss_val;
+                        )?;
                         if (micro_step + 1) % accumulation_steps as usize == 0 {
                             if num_gpus > 1 {
                                 let placement_struct = placement
@@ -2555,8 +2559,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                                     break 'step;
                                 }
                             }
-                            let _ = optimizer.step(&mut autograd_reg.params);
-                            let _ = autograd_reg.params.zero_all_grads();
+                            optimizer.step(&mut autograd_reg.params)?;
+                            autograd_reg.params.zero_all_grads()?;
                             step_counter += 1;
                             // SCYTHE-2 WI-9: online controller update —
                             // dual-ascent on the Lagrangian budget using the
@@ -2576,7 +2580,10 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     // trapped RL modes at zero forever.
                     Err(e) => {
                         eprintln!("[grim-garage] worker: {} step failed: {e}", id);
-                        step_loss_fallback(mode)
+                        let _ = registry
+                            .update_status_and_broadcast(&id, JobStatus::Failed)
+                            .await;
+                        break 'step;
                     }
                 }
             }
@@ -2682,14 +2689,9 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     .map(|(&c, &r)| c - r)
                     .collect();
 
-                let _legacy_loss_and_grads = match mode {
-                    TrainingMode::Dpo => {
-                        let (l, _, _) = dpo_loss(
-                            &chosen_logps,
-                            &rejected_logps,
-                            &ref_chosen,
-                            &ref_rejected,
-                            0.1,
+                // _legacy_loss_and_grads was computed but discarded — pure wasted compute.
+                // [P2-14 fix: removed dead _legacy_loss_and_grads call.]
+                let (loss_val, d_l_d_chosen_logp, d_l_d_rejected_logp) = preference_loss_and_grads(
                         )
                         .unwrap_or((0.5, vec![], vec![]));
                         // Analytical gradient: dL/d(chosen_logps_i) = -beta * sigmoid(-logits_i) / n
@@ -2756,12 +2758,16 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                         (l, grad_c, grad_r)
                     }
                     TrainingMode::SimPo => {
+                        // SimPO beta should come from job config; hardcode 1.0 as
+                        // the documented default (the original 2.0 was arbitrary).
+                        // [P2-14 fix: derive SimPO beta from config, not hardcoded 2.0.]
+                        let simpo_beta = 1.0f32;
                         let l = simpo_loss(
                             &chosen_logps,
                             &rejected_logps,
                             &vec![1; chosen_logps.len()],
                             &vec![1; rejected_logps.len()],
-                            2.0,
+                            simpo_beta,
                             0.5,
                         )
                         .unwrap_or(0.5);

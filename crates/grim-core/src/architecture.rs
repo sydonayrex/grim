@@ -1173,11 +1173,6 @@ impl TensorNamingRegistry {
                         format!("{il_p}ffn_gate_inp.weight"),
                         format!("{gg_p}ffn_gate_inp.weight"),
                     );
-                    // Dedup/shared router gate (Laguna, Qwen2/3, GLM4, ...).
-                    map.insert(
-                        format!("{hf_p}mlp.gate_proj.weight"),
-                        format!("{gg_p}ffn_gate_inp.weight"),
-                    );
                     map.insert(
                         format!("{hf_p}mlp.gate.e_score_correction_bias"),
                         format!("{gg_p}ffn_exp_probs_b.bias"),

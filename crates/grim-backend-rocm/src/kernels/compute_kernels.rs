@@ -215,61 +215,99 @@ extern "C" __global__ void grim_all_reduce_accum(
     out[i] = acc;
 }
 
-extern "C" __global__ void grim_rms_norm(float* x, float* w, float* out,
-                                         int row_len, float eps, int total) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-    int row = idx / row_len;
+// Warp-per-row RMS norm: one warp owns a row; the sum of squares reduces
+// with 5 __shfl_xor butterflies (no barriers). The previous one-thread-per-
+// element form made EVERY thread walk the whole row — O(row_len^2) loads per
+// row (16.7M redundant reads at hidden=4096).
+extern "C" __global__ void __launch_bounds__(256)
+grim_rms_norm(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ out,
+              int row_len, float eps, int total) {
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    const int rows = total / row_len;
+    if (warp_id >= rows) return;
+    const float* x_row = x + (size_t)warp_id * row_len;
+    float* o_row = out + (size_t)warp_id * row_len;
+    const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+
     float ss = 0.0f;
-    for (int j = 0; j < row_len; ++j) {
-        float v = x[row * row_len + j];
+    for (int col = lane; col < row_len; col += 32) {
+        float v = x_row[col];
         ss += v * v;
     }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        ss += __shfl_xor_sync(shfl_mask, ss, off);
     float rms = sqrtf(ss / (float)row_len + eps);
-    // w has row_len elements; index by position within the row, not the
-    // global linear index.  Using w[idx] (the prior code) reads garbage
-    // for every row past the first and makes the hidden state explode.
-    int col = idx - row * row_len;
-    out[idx] = x[idx] * w[col] / rms;
-}
-
-extern "C" __global__ void grim_add_rms_norm(const float* x, const float* residual,
-                                             float* w, float* y_out, float* norm_out,
-                                             int row_len, float eps, int total) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-    int row = idx / row_len;
-    int col = idx - row * row_len;
-
-    // First pass compute/write updated residual sum y = x + residual
-    float y_val = x[idx] + residual[idx];
-    y_out[idx] = y_val;
-
-    // Compute mean of squares for this row of y
-    float ss = 0.0f;
-    for (int j = 0; j < row_len; ++j) {
-        float v = x[row * row_len + j] + residual[row * row_len + j];
-        ss += v * v;
+    for (int col = lane; col < row_len; col += 32) {
+        o_row[col] = x_row[col] * w[col] / rms;
     }
-    float rms = sqrtf(ss / (float)row_len + eps);
-    norm_out[idx] = y_val * w[col] / rms;
 }
 
-extern "C" __global__ void grim_softmax(float* x, float* out, int row_len, int total) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-    int row = idx / row_len;
+// Warp-per-row fused residual-add + RMS norm (same reduction structure).
+extern "C" __global__ void __launch_bounds__(256)
+grim_add_rms_norm(const float* __restrict__ x, const float* __restrict__ residual,
+                  const float* __restrict__ w, float* __restrict__ y_out, float* __restrict__ norm_out,
+                  int row_len, float eps, int total) {
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    const int rows = total / row_len;
+    if (warp_id >= rows) return;
+    const float* x_row = x + (size_t)warp_id * row_len;
+    const float* r_row = residual + (size_t)warp_id * row_len;
+    float* y_row = y_out + (size_t)warp_id * row_len;
+    float* n_row = norm_out + (size_t)warp_id * row_len;
+    const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+
+    // Pass 1: y = x + residual (write-through) + strided sum of squares.
+    float ss = 0.0f;
+    for (int col = lane; col < row_len; col += 32) {
+        float y = x_row[col] + r_row[col];
+        y_row[col] = y;
+        ss += y * y;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        ss += __shfl_xor_sync(shfl_mask, ss, off);
+    float rms = sqrtf(ss / (float)row_len + eps);
+    // Pass 2: normalize (y_row is L1/L2-hot from pass 1).
+    for (int col = lane; col < row_len; col += 32) {
+        n_row[col] = y_row[col] * w[col] / rms;
+    }
+}
+
+// Warp-per-row online softmax (shuffle max + shuffle sum).
+extern "C" __global__ void __launch_bounds__(256)
+grim_softmax(const float* __restrict__ x, float* __restrict__ out, int row_len, int total) {
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    const int rows = total / row_len;
+    if (warp_id >= rows) return;
+    const float* x_row = x + (size_t)warp_id * row_len;
+    float* o_row = out + (size_t)warp_id * row_len;
+    const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+
     float maxv = -1e30f;
-    for (int j = 0; j < row_len; ++j) {
-        float v = x[row * row_len + j];
+    for (int col = lane; col < row_len; col += 32) {
+        float v = x_row[col];
         if (v > maxv) maxv = v;
     }
-    float sum = 0.0f;
-    for (int j = 0; j < row_len; ++j) {
-        float e = expf(x[row * row_len + j] - maxv);
-        sum += e;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float o = __shfl_xor_sync(shfl_mask, maxv, off);
+        if (o > maxv) maxv = o;
     }
-    out[idx] = expf(x[idx] - maxv) / sum;
+    float sum = 0.0f;
+    for (int col = lane; col < row_len; col += 32) {
+        sum += expf(x_row[col] - maxv);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        sum += __shfl_xor_sync(shfl_mask, sum, off);
+    float inv = 1.0f / sum;
+    for (int col = lane; col < row_len; col += 32) {
+        o_row[col] = expf(x_row[col] - maxv) * inv;
+    }
 }
 
 extern "C" __global__ void grim_embedding(float* weight, float* out,

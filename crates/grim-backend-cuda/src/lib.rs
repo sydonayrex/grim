@@ -2938,6 +2938,7 @@ impl BackendDevice for CudaDevice {
         b: &dyn BackendStorage,
         c: &dyn BackendStorage,
         d: &dyn BackendStorage,
+        state: &dyn BackendStorage,
         batch: usize,
         dim_dstate: usize,
         dim_dinner: usize,
@@ -2950,11 +2951,17 @@ impl BackendDevice for CudaDevice {
         let b_v = b.to_cpu_vec_f32()?;
         let c_v = c.to_cpu_vec_f32()?;
         let d_v = d.to_cpu_vec_f32()?;
+        let state_v = state.to_cpu_vec_f32()?;
 
         let mut out = vec![0.0f32; batch * seq_len * dim_dinner];
         for b_idx in 0..batch {
             for d_idx in 0..dim_dinner {
+                // Initialize state from the provided state buffer.
                 let mut h = vec![0.0f32; dim_dstate];
+                for s in 0..dim_dstate {
+                    let state_idx = (b_idx * dim_dinner + d_idx) * dim_dstate + s;
+                    h[s] = if state_v.len() > state_idx { state_v[state_idx] } else { 0.0 };
+                }
                 let d_val = if d_v.len() > d_idx { d_v[d_idx] } else { 0.0 };
 
                 for t in 0..seq_len {
@@ -3258,16 +3265,19 @@ impl BackendDevice for CudaDevice {
         // row-major order matching the B[K, N] layout expected by the GEMM below.
         let b_dequant: Vec<f32> = match format {
             grim_tensor::QuantFormat::Q8_0 => {
-                // Q8_0 CPU path: scale * i8 per 32-element block.
-                // Uses the same bit layout as launch_quantized_matmul_q8_0.
+                // Q8_0 packed layout: 34-byte blocks, each with f16 scale (2 bytes)
+                // followed by 32 i8 codes. Real Q8_0 embeds the scale in every block —
+                // read it from the byte stream rather than consulting b_scales (which
+                // is empty for the Linear path).
                 let blocks_per_col = k / 32;
                 let mut out = vec![0.0f32; k * n];
                 for col in 0..n {
                     for block in 0..blocks_per_col {
-                        let scale_idx = col * blocks_per_col + block;
-                        let scale = b_scales.get(scale_idx).copied().unwrap_or(1.0f32);
+                        let block_offset = (col * blocks_per_col + block) * 34;
+                        let scale_bytes = &b_bytes[block_offset..block_offset + 2];
+                        let scale = half::f16::from_le_bytes([scale_bytes[0], scale_bytes[1]]).to_f32();
                         for i in 0..32 {
-                            let byte_offset = (col * blocks_per_col + block) * 32 + i;
+                            let byte_offset = block_offset + 2 + i;
                             let q_val = b_bytes
                                 .get(byte_offset)
                                 .map(|&b| (b as i8) as f32)
@@ -3664,9 +3674,74 @@ impl BackendDevice for CudaDevice {
         }
 
         let a_ptr = Self::dev_ptr_or_err("fused_quant_gemm a", a_storage)?;
-        let b_ptr = Self::dev_ptr_or_err("fused_quant_gemm b", b_storage)?;
         let out = CudaStorage::alloc_gpu(out_shape, DType::F32, self.ordinal)?;
         let out_ptr = Self::dev_ptr_or_err("fused_quant_gemm out", &out)?;
+
+        // Q8_0 weights are packed (34-byte blocks: f16 scale + 32 i8 codes), but
+        // the fused kernel declares B as `const float*`. Dequantize B to f32 on
+        // device before launch so the kernel reads correct weight values.
+        let b_ptr = if format == grim_tensor::QuantFormat::Q8_0 {
+            let b_storage = b
+                .as_any()
+                .downcast_ref::<CudaStorage>()
+                .ok_or_else(|| Error::Backend("fused_quant_gemm: b is not CudaStorage".into()))?;
+            let b_bytes = b_storage.bytes();
+            let blocks_per_col = k / 32;
+            let n_cols = n;
+            // Q8_0: ceil(k/32)*34 bytes per column, but storage is [n, k] packed.
+            // Total packed size = n * ceil(k/32) * 34.
+            let expected_packed = n_cols * blocks_per_col * 34;
+            if b_bytes != expected_packed {
+                return Err(Error::Shape(format!(
+                    "fused_quant_gemm(Q8_0): B packed size {} != expected {}",
+                    b_bytes, expected_packed
+                )));
+            }
+            // Read packed bytes to host, dequantize, upload as f32.
+            let mut host_packed = vec![0u8; b_bytes];
+            if let Some(dev_ptr) = b_storage.device_ptr {
+                unsafe {
+                    let res = cudaMemcpy(
+                        host_packed.as_mut_ptr() as *mut c_void,
+                        dev_ptr as *const c_void,
+                        b_bytes,
+                        cudaMemcpyDeviceToHost,
+                    );
+                    if res != 0 {
+                        return Err(Error::Backend(format!(
+                            "fused_quant_gemm(Q8_0): cudaMemcpy(B) D2H failed: {res}"
+                        )));
+                    }
+                }
+            }
+            // Dequantize: for each of n*blocks_per_col blocks, read f16 scale + 32 i8.
+            let total_elements = k * n;
+            let mut host_f32 = vec![0.0f32; total_elements];
+            for col in 0..n_cols {
+                for block in 0..blocks_per_col {
+                    let block_offset = (col * blocks_per_col + block) * 34;
+                    let scale = half::f16::from_le_bytes([
+                        host_packed[block_offset], host_packed[block_offset + 1],
+                    ]).to_f32();
+                    for i in 0..32 {
+                        let idx = block * 32 + i;
+                        if idx < k {
+                            let q = host_packed[block_offset + 2 + i] as i8 as f32;
+                            host_f32[idx * n_cols + col] = q * scale;
+                        }
+                    }
+                }
+            }
+            let b_f32_storage = CudaStorage::copy_from_host(
+                &host_f32,
+                &Shape::new(vec![k, n]),
+                DType::F32,
+                self.ordinal,
+            )?;
+            Self::dev_ptr_or_err("fused_quant_gemm b (dequantized)", &b_f32_storage)?
+        } else {
+            Self::dev_ptr_or_err("fused_quant_gemm b", b_storage)?
+        };
 
         let handle = self.launch_fused_quant_gemm(kernel_name, a_ptr, b_ptr, out_ptr, m, n, k)?;
         Ok((Box::new(out), handle))

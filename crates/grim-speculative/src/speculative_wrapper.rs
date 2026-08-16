@@ -222,17 +222,27 @@ impl SpeculativeCausalLm {
                 let mut rng = session
                     .request_rng()
                     .cloned()
-                    .unwrap_or_else(|| SimpleRng::new(rand::random()));
+                    .ok_or_else(|| {
+                        Error::Backend(
+                            "speculative decoding requires a session-provided RNG; \
+                             none available — cannot perform acceptance sampling"
+                                .into(),
+                        )
+                    })?;
 
                 // Rejection-sampling validation loop (§5.3)
                 // Correctly index logits as flat [seq, vocab_size] row-major,
                 // apply per-row softmax, and use the standard ratio test with per-request randomness.
+                // Target logits cover [0..context_len) rows (original input positions).
+                // Draft logits cover [0..verify_len) rows (draft positions).
+                // Verify draft position i against target position (context_len + i).
+                // [P1-18 fix: unified indexing — context_len = original input length.]
                 let context_len = input_ids.shape().elem_count();
                 let mut accepted_count = 0;
                 for i in 0..verify_len {
                     let draft_tok = scored.tokens[i] as usize;
 
-                    let row_start = (context_len - 1 + i) * vocab_size;
+                    let row_start = (context_len + i) * vocab_size;
                     let row_end = row_start + vocab_size;
                     let p_target = softmax_f32_row(&target_probs[row_start..row_end])[draft_tok];
                     let draft_row_start = i * vocab_size;
@@ -253,7 +263,15 @@ impl SpeculativeCausalLm {
                     }
                 }
 
-                // CRIT-5: Properly commit/rollback KV cache based on accepted count
+                // CRIT-5: Properly commit/rollback KV cache based on accepted count.
+                // tentative_append(verify_len) must have added >= accepted_count slots.
+                // [P1-20 fix: assert verify_len >= accepted_count before commit.]
+                if accepted_count > verify_len {
+                    return Err(Error::Backend(format!(
+                        "speculative KV contract violation: accepted_count ({accepted_count}) > \
+                         verify_len ({verify_len})"
+                    ));
+                }
                 if let Some(kv) = session.kv_mut() {
                     kv.commit(accepted_count)?;
                 }
@@ -286,15 +304,15 @@ impl SpeculativeCausalLm {
                     }
                 }
 
-                // CRIT-7: Return logits for the accepted tokens, not the original input
-                // Accepted token rows start at (context_len - 1) since target forward
-                // returned [context_len, vocab_size] and the last row is the bonus token.
-                let ctx_offset = context_len.saturating_sub(1);
+                // Return logits for the accepted tokens. Accepted token rows start at
+                // context_len (the original input length) since target forward returned
+                // [context_len + verify_len, vocab_size] and draft positions map to
+                // target positions context_len + i. [P1-18 fix.]
                 let accepted_logits = self.extract_accepted_logits(
                     &target_logits,
                     accepted_count,
                     vocab_size,
-                    ctx_offset,
+                    context_len,
                 )?;
                 session.set_last_accepted_tokens(accepted_count);
                 Ok(accepted_logits)
@@ -350,7 +368,13 @@ impl SpeculativeCausalLm {
         let mut rng = session
             .request_rng()
             .cloned()
-            .unwrap_or_else(|| SimpleRng::new(rand::random()));
+            .ok_or_else(|| {
+                Error::Backend(
+                    "speculative decoding requires a session-provided RNG; \
+                     none available — cannot perform acceptance sampling"
+                        .into(),
+                )
+            })?;
         for i in 0..verify_len {
             let draft_tok = draft_block.tokens[i] as usize;
 
@@ -375,6 +399,12 @@ impl SpeculativeCausalLm {
             }
         }
 
+        if accepted_count > verify_len {
+            return Err(Error::Backend(format!(
+                "speculative KV contract violation (NativeMTP): accepted_count ({accepted_count}) > \
+                 verify_len ({verify_len})"
+            ));
+        }
         if let Some(kv) = session.kv_mut() {
             kv.commit(accepted_count)?;
         }

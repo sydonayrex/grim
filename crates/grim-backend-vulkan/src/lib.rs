@@ -2955,6 +2955,7 @@ impl BackendDevice for VulkanDevice {
         b: &dyn BackendStorage,
         c: &dyn BackendStorage,
         d: &dyn BackendStorage,
+        _state: &dyn BackendStorage,
         batch: usize,
         dim_dstate: usize,
         dim_dinner: usize,

@@ -129,8 +129,13 @@ impl DeviceScratchPool {
     fn return_buffer(&self, ptr: *mut std::ffi::c_void, layout: PoolLayout) {
         if let Ok(mut buckets) = self.buckets.lock() {
             buckets.entry(layout).or_default().push(ptr);
+        } else {
+            // Mutex poisoned (e.g. from an earlier panic): free eagerly instead
+            // of silently leaking VRAM. [P1-12 fix: hipFree on poison.]
+            if !ptr.is_null() {
+                let _ = unsafe { hipFree(ptr) };
+            }
         }
-        // Mutex-poison fallback: silent recycle failure means the next [see: `get`, `hipMalloc`]
     }
 
     pub fn peak_bytes(&self) -> usize {
@@ -142,7 +147,11 @@ impl DeviceScratchPool {
     }
 
     /// Free every cached pointer back to the GPU. Used by `Drop` to avoid
+    /// use-after-free when async kernels may still be reading pooled buffers.
     fn drain(&self) {
+        // Synchronize before freeing — async kernels on pooled streams may
+        // still be reading returned buffers. [P1-11 fix: add hipDeviceSynchronize.]
+        let _ = unsafe { crate::hipDeviceSynchronize() };
         let mut buckets = match self.buckets.lock() {
             Ok(b) => b,
             Err(_) => return,

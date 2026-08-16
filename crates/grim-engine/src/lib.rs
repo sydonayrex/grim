@@ -870,7 +870,7 @@ impl Engine {
     pub fn finish_request(&mut self, id: u64) {
         self.scheduler.finish(id);
         if let Some(session) = self.sessions.get_mut(&id) {
-            session.rollback_kv_to(0);
+            let _ = session.rollback_kv_to(0);
         }
         self.sessions.remove(&id);
         self.last_outcomes.remove(&id);

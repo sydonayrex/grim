@@ -2196,8 +2196,8 @@ mod tests {
         // ── Launch the Jay-Tier fused MXFP4 kernel ─────────────────────────
         dev.launch_fused_dequant_gemm_mxfp4(
             &a_storage,
-            &b_codes_storage,
-            &b_exps_storage,
+            b_codes_storage.device_ptr_u64().expect("codes ptr"),
+            b_exps_storage.device_ptr_u64().expect("exps ptr"),
             &out_storage,
             m,
             n,

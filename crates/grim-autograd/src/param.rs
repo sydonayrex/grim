@@ -326,6 +326,14 @@ impl TrainableParams {
                         // the gradient tensor directly.
                         let stream = 0u64; // default HIP stream
                         rccl_handle.sum_gradients_device(ptr, ptr, count, stream)?;
+                        // Synchronize after the all-reduce on the default stream —
+                        // without this, param.grad may be read before the NCCL
+                        // collective has finished writing it. [P1-15 fix.]
+                        if let Some(dev) = param.grad.device().as_any().downcast_ref::<
+                            grim_backend_rocm::RocmDevice,
+                        >() {
+                            let _ = dev.synchronize();
+                        }
                     } else {
                         // CPU fallback for this tensor: host round-trip.
                         let grad_vec = param.grad.to_vec_f32()?;

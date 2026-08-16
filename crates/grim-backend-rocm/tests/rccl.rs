@@ -133,7 +133,7 @@ fn rccl_multi_gpu_all_reduce_sums_real_device_buffers() -> TestResult {
                     unsafe {
                         grim_backend_rocm::hipSetDevice(ord as i32);
                     }
-                    communicator.sum_gradients_device(*ptr, *ptr, 4, 0)
+                    communicator.sum_gradients_device(*ptr, *ptr, 4, 0, *ordinal)
                 })
             })
             .collect::<Vec<_>>();

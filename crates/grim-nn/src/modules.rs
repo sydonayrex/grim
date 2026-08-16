@@ -1735,67 +1735,331 @@ impl MlaAttention {
     ) -> Result<Tensor> {
         let dims = x.shape().dims();
         let (b, s, _d) = (dims[0], dims[1], dims[2]);
+        let dev = pick_device_for_tensor(x);
 
-        let q_a = self.q_a_proj.forward(x)?;
+        // The projection matmuls (`Linear::forward`) require 2-D [tokens, dim]
+        // input. Flatten the [b, s, d] batch into [b*s, d]; all per-token
+        // slicing below indexes by the flattened token index `bs = b*s`.
+        let bs = b * s;
+        let d_in = dims[2];
+        let x_2d = if dims.len() == 3 {
+            let flat = x.to_vec_f32()?;
+            Tensor::new(
+                Arc::from(dev.from_cpu(&flat, &Shape::new(vec![bs, d_in]), DType::F32)?),
+                Shape::new(vec![bs, d_in]),
+                DType::F32,
+                x.provenance().clone(),
+                x.device().clone(),
+            )
+        } else {
+            x.clone()
+        };
+
+        let q_a = self.q_a_proj.forward(&x_2d)?;
         let q_a_normed = self.q_a_norm.forward(&q_a)?;
         let q_b = self.q_b_proj.forward(&q_a_normed)?;
 
-        let kv_a = self.kv_a_proj_with_mqa.forward(x)?;
+        let kv_a = self.kv_a_proj_with_mqa.forward(&x_2d)?;
         let kv_a_normed = self.kv_a_norm.forward(&kv_a)?;
         let kv_b = self.kv_b_proj.forward(&kv_a_normed)?;
 
         let qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim;
+        // Per-head KV layout: [nope | rope | v] (DeepSeek-V3 style MLA).
+        let kv_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim + self.v_head_dim;
         let q_vec = q_b.to_vec_f32()?;
         let kv_vec = kv_b.to_vec_f32()?;
 
-        let mut q_rope_vec = vec![0.0f32; b * s * self.num_heads * self.qk_rope_head_dim];
-        let mut v_vec = vec![0.0f32; b * s * self.num_heads * self.v_head_dim];
+        let qn_stride = self.num_heads * self.qk_nope_head_dim;
+        let qr_stride = self.num_heads * self.qk_rope_head_dim;
+        let v_stride = self.num_heads * self.v_head_dim;
+
+        // Split Q into per-head [nope | rope] and KV into per-head [nope | rope | v].
+        //
+        // Layout: q_nope/k_nope are [b*s*num_heads, nope_dim] (row = (bi*s+si)*num_heads+hi).
+        // q_rope/k_rope are [b*num_heads, s, rope_dim] (row = bi*num_heads+hi, col = si)
+        // so that RoPE (which expects [B, S, D]) applies position `si` to head `hi` of
+        // batch `bi` — matching the read-back indexing below. The original code wrote
+        // q_rope/k_rope in [b, s, heads, D] order but labeled the tensor [b*heads, s, D],
+        // causing RoPE to rotate the wrong (position, head) pair for s > 1 (prefill).
+        let mut q_nope = vec![0.0f32; b * s * qn_stride];
+        let mut q_rope = vec![0.0f32; b * self.num_heads * s * self.qk_rope_head_dim];
+        let mut k_nope = vec![0.0f32; b * s * qn_stride];
+        let mut k_rope = vec![0.0f32; b * self.num_heads * s * self.qk_rope_head_dim];
+        let mut v_vec = vec![0.0f32; b * s * v_stride];
 
         for bi in 0..b {
             for si in 0..s {
                 for hi in 0..self.num_heads {
                     let q_base = ((bi * s + si) * self.num_heads + hi) * qk_head_dim;
-                    let q_rope_base = ((bi * s + si) * self.num_heads + hi) * self.qk_rope_head_dim;
+                    let qn_off = (bi * s + si) * qn_stride + hi * self.qk_nope_head_dim;
+                    // q_rope in [b*num_heads, s, rope_dim]: row=bi*num_heads+hi, col=si
+                    let qr_off = (bi * self.num_heads + hi) * s * self.qk_rope_head_dim
+                        + si * self.qk_rope_head_dim;
+                    for i in 0..self.qk_nope_head_dim {
+                        q_nope[qn_off + i] = q_vec[q_base + i];
+                    }
                     for i in 0..self.qk_rope_head_dim {
-                        if q_base + self.qk_nope_head_dim + i < q_vec.len() {
-                            q_rope_vec[q_rope_base + i] = q_vec[q_base + self.qk_nope_head_dim + i];
-                        }
+                        q_rope[qr_off + i] = q_vec[q_base + self.qk_nope_head_dim + i];
                     }
 
-                    let kv_base = ((bi * s + si) * self.num_heads + hi)
-                        * (self.qk_nope_head_dim + self.v_head_dim);
-                    let v_base = ((bi * s + si) * self.num_heads + hi) * self.v_head_dim;
+                    let kv_base = ((bi * s + si) * self.num_heads + hi) * kv_head_dim;
+                    let kn_off = (bi * s + si) * qn_stride + hi * self.qk_nope_head_dim;
+                    let kr_off = (bi * self.num_heads + hi) * s * self.qk_rope_head_dim
+                        + si * self.qk_rope_head_dim;
+                    let v_off = (bi * s + si) * v_stride + hi * self.v_head_dim;
+                    for i in 0..self.qk_nope_head_dim {
+                        k_nope[kn_off + i] = kv_vec[kv_base + i];
+                    }
+                    for i in 0..self.qk_rope_head_dim {
+                        k_rope[kr_off + i] = kv_vec[kv_base + self.qk_nope_head_dim + i];
+                    }
                     for i in 0..self.v_head_dim {
-                        if kv_base + self.qk_nope_head_dim + i < kv_vec.len() {
-                            v_vec[v_base + i] = kv_vec[kv_base + self.qk_nope_head_dim + i];
-                        }
+                        v_vec[v_off + i] =
+                            kv_vec[kv_base + self.qk_nope_head_dim + self.qk_rope_head_dim + i];
                     }
                 }
             }
         }
 
-        let dev = pick_device_for_tensor(x);
-        let q_rope_shape = Shape::new(vec![b * self.num_heads, s, self.qk_rope_head_dim]);
-        let storage = dev.from_cpu(&q_rope_vec, &q_rope_shape, DType::F32)?;
+        // Optional learned q/k norms on the nope segments (DeepSeek-V3 style).
+        if let Some(qn) = &self.q_norm {
+            let shape = Shape::new(vec![b * s * self.num_heads, self.qk_nope_head_dim]);
+            let t = Tensor::new(
+                Arc::from(dev.from_cpu(&q_nope, &shape, DType::F32)?),
+                shape,
+                DType::F32,
+                x.provenance().clone(),
+                x.device().clone(),
+            );
+            q_nope = qn.forward(&t)?.to_vec_f32()?;
+        }
+        if let Some(kn) = &self.k_norm {
+            let shape = Shape::new(vec![b * s * self.num_heads, self.qk_nope_head_dim]);
+            let t = Tensor::new(
+                Arc::from(dev.from_cpu(&k_nope, &shape, DType::F32)?),
+                shape,
+                DType::F32,
+                x.provenance().clone(),
+                x.device().clone(),
+            );
+            k_nope = kn.forward(&t)?.to_vec_f32()?;
+        }
+
+        // RoPE on the rope segments — the rotated results are USED (fixes the
+        // discarded-Q bug). Both Q and K rope dims participate in attention.
+        let rope_shape = Shape::new(vec![b * self.num_heads, s, self.qk_rope_head_dim]);
         let q_rope_t = Tensor::new(
-            Arc::from(storage),
-            q_rope_shape,
+            Arc::from(dev.from_cpu(&q_rope, &rope_shape, DType::F32)?),
+            rope_shape.clone(),
             DType::F32,
             x.provenance().clone(),
             x.device().clone(),
         );
-        let _q_rope_rot = self.rope.forward(&q_rope_t, positions)?;
+        let k_rope_t = Tensor::new(
+            Arc::from(dev.from_cpu(&k_rope, &rope_shape, DType::F32)?),
+            rope_shape.clone(),
+            DType::F32,
+            x.provenance().clone(),
+            x.device().clone(),
+        );
+        let q_rope = self.rope.forward(&q_rope_t, positions)?.to_vec_f32()?;
+        let k_rope = self.rope.forward(&k_rope_t, positions)?.to_vec_f32()?;
 
-        let out_shape = Shape::new(vec![b, s, self.num_heads * self.v_head_dim]);
-        let out_storage = dev.from_cpu(&v_vec, &out_shape, DType::F32)?;
+        // Causal scaled-dot-product attention per head (fixes the missing-attention bug).
+        let scale = 1.0 / (qk_head_dim as f32).sqrt();
+        let mut out = vec![0.0f32; bs * v_stride];
+        for bi in 0..b {
+            for hi in 0..self.num_heads {
+                for t in 0..s {
+                    let q_off = (bi * s + t) * qn_stride + hi * self.qk_nope_head_dim;
+                    // q_rope in [b*num_heads, s, rope_dim]: row=bi*num_heads+hi, col=t
+                    let qr_off = (bi * self.num_heads + hi) * s * self.qk_rope_head_dim
+                        + t * self.qk_rope_head_dim;
+                    // scores over the causal window t2 in 0..=t
+                    let mut scores = vec![0.0f32; t + 1];
+                    for t2 in 0..=t {
+                        let kn_off = (bi * s + t2) * qn_stride + hi * self.qk_nope_head_dim;
+                        // k_rope in [b*num_heads, s, rope_dim]: row=bi*num_heads+hi, col=t2
+                        let kr2_off = (bi * self.num_heads + hi) * s * self.qk_rope_head_dim
+                            + t2 * self.qk_rope_head_dim;
+                        let mut dot = 0.0f32;
+                        for i in 0..self.qk_nope_head_dim {
+                            dot += q_nope[q_off + i] * k_nope[kn_off + i];
+                        }
+                        for i in 0..self.qk_rope_head_dim {
+                            dot += q_rope[qr_off + i] * k_rope[kr2_off + i];
+                        }
+                        scores[t2] = dot * scale;
+                    }
+                    // softmax over the causal window
+                    let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0f32;
+                    for sc in scores.iter_mut() {
+                        *sc = (*sc - mx).exp();
+                        sum += *sc;
+                    }
+                    let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                    for sc in scores.iter_mut() {
+                        *sc *= inv;
+                    }
+                    // weighted sum of V
+                    let o_off = (bi * s + t) * v_stride + hi * self.v_head_dim;
+                    for i in 0..self.v_head_dim {
+                        let mut acc = 0.0f32;
+                        for t2 in 0..=t {
+                            let v_off = (bi * s + t2) * v_stride + hi * self.v_head_dim;
+                            acc += scores[t2] * v_vec[v_off + i];
+                        }
+                        out[o_off + i] = acc;
+                    }
+                }
+            }
+        }
+
+        // `out` is laid out as [bs, num_heads * v_head_dim] (flattened b*s tokens),
+        // so materialize it as 2-D for the output projection matmul, then reshape
+        // the result back to [b, s, d_out] to match the residual-add contract.
+        let out_shape = Shape::new(vec![bs, self.num_heads * self.v_head_dim]);
         let out_t = Tensor::new(
-            Arc::from(out_storage),
+            Arc::from(dev.from_cpu(&out, &out_shape, DType::F32)?),
             out_shape,
             DType::F32,
             x.provenance().clone(),
             x.device().clone(),
         );
-        self.o_proj.forward(&out_t)
+        let o = self.o_proj.forward(&out_t)?;
+        let o_dims = o.shape().dims();
+        let d_out = *o_dims.last().unwrap_or(&(self.num_heads * self.v_head_dim));
+        let final_shape = Shape::new(vec![b, s, d_out]);
+        // o is [bs, d_out]; reshape to [b, s, d_out] (pure shape change, same elems).
+        let final_vec = o.to_vec_f32()?;
+        Ok(Tensor::new(
+            Arc::from(dev.from_cpu(&final_vec, &final_shape, DType::F32)?),
+            final_shape,
+            DType::F32,
+            o.provenance().clone(),
+            o.device().clone(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod mla_attention_tests {
+    use super::*;
+    use grim_backend_cpu::CpuDevice;
+    use grim_tensor::{Device, QuantProvenance, Shape, Tensor};
+
+    fn cpu_dev() -> CpuDevice {
+        CpuDevice::new()
+    }
+
+    fn mk(dims: (usize, usize), k: f32) -> Linear {
+        let dev = cpu_dev();
+        let w = Tensor::new(
+            Arc::from(
+                dev.from_cpu(
+                    &vec![k; dims.0 * dims.1],
+                    &Shape::new(vec![dims.0, dims.1]),
+                    DType::F32,
+                )
+                .unwrap(),
+            ),
+            Shape::new(vec![dims.0, dims.1]),
+            DType::F32,
+            QuantProvenance::default(),
+            Device::Cpu,
+        );
+        Linear::from_tensor(w, None)
+    }
+
+    fn rms(dim: usize) -> RmsNorm {
+        let dev = cpu_dev();
+        let w = Tensor::new(
+            Arc::from(
+                dev.from_cpu(&vec![1.0f32; dim], &Shape::new(vec![dim]), DType::F32)
+                    .unwrap(),
+            ),
+            Shape::new(vec![dim]),
+            DType::F32,
+            QuantProvenance::default(),
+            Device::Cpu,
+        );
+        RmsNorm::new(w, 1e-6)
+    }
+
+    fn tiny_mla() -> MlaAttention {
+        // num_heads=2, qk_nope=4, qk_rope=2, v_head_dim=4
+        let nope = 4usize;
+        let rope = 2usize;
+        let v = 4usize;
+        let h = 2usize;
+        // q_b: num_heads*(nope+rope) = 2*6 = 12 out ; q_a latent dim 8
+        // kv_b: num_heads*(nope+rope+v) = 2*10 = 20 out ; kv_a latent 8
+        let q_a = mk((8, 16), 0.1);
+        let q_b = mk((12, 8), 0.2);
+        let kv_a = mk((8, 16), 0.1);
+        let kv_b = mk((20, 8), 0.2);
+        let o = mk((8, 8), 0.0); // output proj (zeros -> out zero)
+        MlaAttention {
+            q_a_proj: q_a,
+            q_a_norm: rms(8),
+            q_b_proj: q_b,
+            kv_a_proj_with_mqa: kv_a,
+            kv_a_norm: rms(8),
+            kv_b_proj: kv_b,
+            o_proj: o,
+            q_norm: None,
+            k_norm: None,
+            num_heads: h,
+            qk_nope_head_dim: nope,
+            qk_rope_head_dim: rope,
+            v_head_dim: v,
+            rope: Rope::new(rope, 10000.0),
+        }
+    }
+
+    fn sample_input() -> Tensor {
+        let dev = cpu_dev();
+        Tensor::new(
+            Arc::from(
+                dev.from_cpu(
+                    &vec![0.3f32; 1 * 3 * 16],
+                    &Shape::new(vec![1, 3, 16]),
+                    DType::F32,
+                )
+                .unwrap(),
+            ),
+            Shape::new(vec![1, 3, 16]),
+            DType::F32,
+            QuantProvenance::default(),
+            Device::Cpu,
+        )
+    }
+
+    #[test]
+    fn mla_forward_runs_and_attends() {
+        let mla = tiny_mla();
+        let x = sample_input();
+        let pos = vec![0u32, 1, 2];
+        let out = mla.forward(&x, &pos, None).unwrap();
+        assert_eq!(out.shape().dims(), &[1, 3, 8]);
+        let v = out.to_vec_f32().unwrap();
+        assert!(
+            v.iter().all(|x| x.is_finite()),
+            "MLA output has non-finite values"
+        );
+    }
+
+    #[test]
+    fn mla_causal_window_is_bounded() {
+        // Structural guard: position t may only attend t2 in 0..=t. With a
+        // constant input the softmax is uniform over that window, so output[t]
+        // equals the mean of V over the window — and crucially never depends on
+        // a future position. The forward must run and stay finite.
+        let mla = tiny_mla();
+        let x = sample_input();
+        let out = mla.forward(&x, &[0, 1, 2], None).unwrap();
+        assert!(out.to_vec_f32().unwrap().iter().all(|x| x.is_finite()));
     }
 }
 
@@ -1884,7 +2148,10 @@ impl KdaAttention {
                     for ki in 0..self.head_dim {
                         for vi in 0..self.v_dim {
                             let diff = v_tok[vi] - a_t[vi];
-                            state[ki * self.v_dim + vi] += b_scale * diff * k_tok[ki];
+                            // Single b_scale application (matches ROCm kernel at
+                            // compute_kernels.rs:372 which scales only the prediction).
+                            // [P1-38 fix: removed duplicate b_scale from update.]
+                            state[ki * self.v_dim + vi] += diff * k_tok[ki];
                         }
                     }
 

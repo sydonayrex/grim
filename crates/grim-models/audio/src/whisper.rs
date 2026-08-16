@@ -901,8 +901,13 @@ impl Whisper {
             )));
         }
         let mel_data = mel.to_vec_f32()?;
-        // Project each frame: (T, n_mels) @ (n_mels, d) → (T, d) via CPU backend matmul.
-        let mel_t = cpu_tensor(mel_data, Shape::new(vec![frames, mel_bins]));
+        // Shape validated as (n_mels, frames) above; must transpose to (frames, n_mels)
+        // for the projection. Without this transpose, data is scrambled for n_mels != frames.
+        // [P1-33 fix: transpose mel matrix after shape check.]
+        let transposed: Vec<f32> = (0..frames)
+            .flat_map(|f| (0..mel_bins).map(move |m| mel_data[m * frames + f]))
+            .collect();
+        let mel_t = cpu_tensor(transposed, Shape::new(vec![frames, mel_bins]));
         let proj = self.enc_in_proj.forward(&mel_t)?;
         let mut cur = proj;
         for blk in &self.enc_blocks {

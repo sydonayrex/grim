@@ -1224,7 +1224,10 @@ impl Lion8Bit {
             let (lr_step, _) = dev.mul_scalar(m_new.as_ref(), lr, shape)?;
             let (neg_lr_step, _) = dev.mul_scalar(lr_step.as_ref(), -1.0, shape)?;
             let (wd_w, _) = dev.mul_scalar(data_st.as_ref(), weight_decay, shape)?;
-            let (updated, _) = dev.add(neg_lr_step.as_ref(), wd_w.as_ref(), shape)?;
+            // Lion8Bit update: w - lr * (β1*m + (1-β1)*g) + wd*w, matching the
+            // correct Lion path (adamw.rs:808) which does data_st + neg_lr_step.
+            let (updated, _) = dev.add(data_st.as_ref(), neg_lr_step.as_ref(), shape)?;
+            let (updated, _) = dev.add(updated.as_ref(), wd_w.as_ref(), shape)?;
 
             *m = m_new;
             param.data = Tensor::new(

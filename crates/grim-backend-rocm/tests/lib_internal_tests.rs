@@ -39,7 +39,7 @@ fn rocm_trait_ops_are_reachable_via_dyn() {
     let shape = grim_tensor::Shape::new(vec![1, 1]);
     let dummy = dev.zeros(&shape, grim_tensor::DType::BF16).unwrap();
     let s = dummy.as_ref();
-    let r = dev.selective_scan(s, s, s, s, s, 1, 1, 1, 1, &shape);
+    let r = dev.selective_scan(s, s, s, s, s, s, 1, 1, 1, 1, &shape);
     assert!(
         !matches!(r, Err(grim_tensor::error::Error::Unimplemented(_))),
         "selective_scan must not return Unimplemented when called via dyn BackendDevice"
