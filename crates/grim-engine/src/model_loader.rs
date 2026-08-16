@@ -1218,6 +1218,7 @@ fn load_model_from_config(
             };
             let remapped_provider = RemappingTensorProvider::new(provider, remap_fn);
             let ws = WeightSource::root(&remapped_provider, device.clone()).with_tp_config(tp);
+            ws.prefetch_all();
 
             let intermediate_size = remapped_provider
                 .meta("blk.0.ffn_gate.weight")
@@ -1601,6 +1602,7 @@ fn load_model_from_config(
                         spec_clone.remap_tensor_name(name)
                     });
                 let ws = WeightSource::root(&remapped_provider, device.clone()).with_tp_config(tp);
+                ws.prefetch_all();
 
                 if spec.is_moe || spec.expert_count.unwrap_or(0) > 0 {
                     let moe_cfg = Qwen3MoeConfig {
@@ -1760,6 +1762,7 @@ fn load_model_with_providers(
     });
     let tp = resolve_tp_config()?;
     let ws = WeightSource::root(&remapped_provider, device.clone()).with_tp_config(tp);
+    ws.prefetch_all();
 
     match model_arch {
         ModelArchitecture::Falcon => {
@@ -2974,6 +2977,7 @@ fn load_model_with_providers(
                         spec_clone.remap_tensor_name(name)
                     });
                 let ws = WeightSource::root(&remapped_provider, device.clone()).with_tp_config(tp);
+                ws.prefetch_all();
 
                 if spec.is_moe || hparams.expert_count.unwrap_or(0) > 0 {
                     let intermediate = hparams

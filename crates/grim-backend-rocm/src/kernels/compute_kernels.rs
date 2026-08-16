@@ -39,6 +39,23 @@ extern "C" __global__ void grim_recip(const float* x, float* out, int n) {
     out[i] = 1.0f / x[i];
 }
 
+// In-memory transpose of a contiguous [a, b] f32 matrix to [b, a].
+// Patch-indexed: each thread writes OUT[j*a + i] = IN[i*b + j], so the
+// transposed output is produced directly in device memory — no DtoH + H2D
+// round trip for weights that must be available in both [out,in] and
+// [in,out] layouts. One thread per output element.
+extern "C" __global__ void grim_transpose_2d_f32(const float* __restrict__ in,
+                                                 float* __restrict__ out,
+                                                 int a, int b) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = a * b;
+    if (idx >= total) return;
+    int i = idx / b;  // row in [a, b]
+    int j = idx - i * b;  // col in [a, b]
+    // out is [b, a] row-major: out[j * a + i] holds in[i * b + j].
+    out[j * a + i] = in[i * b + j];
+}
+
 extern "C" __global__ void grim_rope(const float* x, const unsigned int* positions,
                                      float* out,
                                      int b, int s, int d, int half, float base) {

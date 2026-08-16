@@ -17,6 +17,12 @@ pub struct RocmPinnedBuffer<T> {
 // The buffer is only touched from the owning thread; the raw pointer is not shared.
 unsafe impl<T: Send> Send for RocmPinnedBuffer<T> {}
 
+impl<T> std::fmt::Debug for RocmPinnedBuffer<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RocmPinnedBuffer").field("len", &self.len).finish()
+    }
+}
+
 impl<T: Copy> RocmPinnedBuffer<T> {
     /// Allocate `len` elements of pinned host memory.
     pub fn alloc(len: usize) -> Result<Self> {

@@ -188,18 +188,8 @@ impl TensorProvider for GgufProvider {
             .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in GGUF file")))?;
         let bytes = self.slice_tensor(info)?;
         let dtype = effective_dtype(info, &self.overrides);
-        // GGUF-native MXFP4 (llama.cpp 17-byte blocks: E8M0 scale first, then
-        // nibble-packed codes) must be reframed into the length-prefixed
-        // [codes][exps] layout that every downstream dequant path expects.
-        let bytes = if matches!(
-            &dtype.storage,
-            grim_tensor::dtype::Storage::FloatPack(grim_tensor::dtype::FloatPackScheme::MxFp4)
-        ) {
-            let n = info.shape().iter().product::<usize>();
-            grim_quant::reframe_mxfp4_gguf(&bytes, n)?
-        } else {
-            bytes
-        };
+        let n = info.shape().iter().product::<usize>();
+        let bytes = self.reframe_bytes(bytes, n, &dtype)?;
         Ok(RawTensor {
             bytes,
             shape: info.shape(),
@@ -288,6 +278,8 @@ impl TensorProvider for GgufProvider {
             } else {
                 vec![shard_rows]
             };
+            let n = out_shape.iter().product::<usize>();
+            let buf = self.reframe_bytes(buf, n, &dtype)?;
 
             Ok(RawTensor {
                 bytes: buf,
@@ -313,6 +305,8 @@ impl TensorProvider for GgufProvider {
                 let slice = self.read_region(row_offset, rank_row_bytes)?;
                 buf[r * rank_row_bytes..(r + 1) * rank_row_bytes].copy_from_slice(&slice);
             }
+            let n = out_dim * shard_cols;
+            let buf = self.reframe_bytes(buf, n, &dtype)?;
 
             Ok(RawTensor {
                 bytes: buf,
@@ -334,6 +328,24 @@ impl GgufProvider {
             .checked_add(info.offset)
             .ok_or_else(|| Error::Backend(format!("GGUF tensor '{}' offset overflow", info.name)))?;
         self.read_region(start, info.size_bytes as usize)
+    }
+
+    /// Reframe GGUF-native MXFP4 (llama.cpp 17-byte blocks: E8M0 scale
+    /// first, then nibble-packed codes) into the length-prefixed
+    /// `[codes][exps]` layout every downstream dequant path expects.
+    ///
+    /// Shared by [`get`] and [`get_packed_sharded`] so that sharded (TP)
+    /// MXFP4 tensors — which slice straight out of the mmap and therefore
+    /// skip `get`'s reframe — still come back in the correct layout.
+    fn reframe_bytes(&self, bytes: Vec<u8>, num_values: usize, dtype: &DType) -> Result<Vec<u8>> {
+        if matches!(
+            dtype.storage,
+            grim_tensor::dtype::Storage::FloatPack(grim_tensor::dtype::FloatPackScheme::MxFp4)
+        ) {
+            grim_quant::reframe_mxfp4_gguf(&bytes, num_values)
+        } else {
+            Ok(bytes)
+        }
     }
 
     /// Read a byte range straight out of the memory map.

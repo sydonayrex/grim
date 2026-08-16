@@ -150,6 +150,13 @@ pub struct RocmDevice {
     pub(crate) wmma_gemm_enabled: AtomicBool,
     /// Caching device-memory allocator (size-bucketed free-list). See `RocmCachingAllocator`.
     pub(crate) allocator: Arc<RocmCachingAllocator>,
+    /// Pinned host buffers backing in-flight stream-ordered H2D copies. A
+    /// `hipMemcpyAsync` reads these pages on the copy engine *after* the CPU
+    /// returns, so the page-locked source must outlive the enqueue. Each
+    /// stream-ordered upload retains its pin here; `synchronize()` drains the
+    /// list only after the device has completed all queued copies. This is the
+    /// lifetime-safety half of the async H2D pipeline.
+    pub(crate) retained_pins: Mutex<Vec<RocmPinnedBuffer<f32>>>,
     /// Phase-3 §3.1: device scratch pool — a thread-safe, power-of-2-bucketed [see: `hipMalloc`, `get_scratch`]
     pub(crate) scratch_pool: Arc<crate::memory::pool::DeviceScratchPool>,
     /// Loaded HIP modules + resolved entry functions, cached per unique kernel entry. [see: `hipModuleLoad`, `hipModuleGetFunction`]
@@ -518,6 +525,7 @@ impl RocmDevice {
             stream_pool: Mutex::new(streams),
             hsaco_cache: HsacoKernelCache::new(),
             allocator: Arc::new(RocmCachingAllocator::new(ordinal, cap_bytes)),
+            retained_pins: Mutex::new(Vec::new()),
             scratch_pool: crate::memory::pool::DeviceScratchPool::new(),
             autotuner: Mutex::new(autotuner),
 
@@ -547,7 +555,31 @@ impl RocmDevice {
             }),
             decode_gemm_enabled: AtomicBool::new(true),
             fused_dequant_gemm_enabled: AtomicBool::new(true),
-            mxfp4_fused_dequant_gemm_enabled: AtomicBool::new(false),
+            mxfp4_fused_dequant_gemm_enabled: AtomicBool::new(
+                match std::env::var("GRIM_MXFP4_FUSED_GEMM") {
+                    Ok(v) => {
+                        // Explicit operator override: "1"/"true" forces the fused
+                        // path on, "0"/"false" forces it off. Any other value
+                        // falls back to the arch-confirmed default.
+                        !matches!(v.as_str(), "0" | "false" | "off" | "no")
+                    }
+                    Err(_) => {
+                        // GPU-confirmation guard: RDNA4 (gfx12x) is the first
+                        // arch with native 2:4 FP4 / E8M0 matrix hardware that
+                        // the Jay-Tier fused dequant-GEMM kernel is validated
+                        // against. On that silicon the fused kernel replaces the
+                        // stopgap dequant+requant path with an in-register fused
+                        // dequant, so default it ON there. Other families keep
+                        // the proven tiled path until per-GPU parity with the
+                        // F32 oracle is confirmed (mirrors the wmma RDNA3/4 gate
+                        // and the `GRIM_MXFP4_FUSED_GEMM` escape hatch above).
+                        matches!(
+                            crate::quantization::gcn_arch(&gpu_target),
+                            crate::quantization::GcnArch::RDNA4
+                        )
+                    }
+                }
+            ),
             wmma_gemm_enabled: AtomicBool::new(matches!(
                 crate::quantization::gcn_arch(&gpu_target),
                 crate::quantization::GcnArch::RDNA3 | crate::quantization::GcnArch::RDNA4
@@ -707,6 +739,13 @@ impl RocmDevice {
     /// Block until all previously issued work on all streams of this device
     pub fn synchronize(&self) {
         let _ = unsafe { hipDeviceSynchronize() };
+        // All stream-ordered H2D copies are complete, so the pinned host
+        // sources they read are now safe to release. Draining here (rather than
+        // at each upload) is what allows consecutive uploads to queue on the
+        // stream pool and overlap with one another.
+        if let Ok(mut pins) = self.retained_pins.lock() {
+            pins.clear();
+        }
     }
 
     /// Begin a generic graph-capture session keyed by `key`. Until `end_graph_capture` [see: `key`, `GRIM_CAPTURE_GRAPH`]
@@ -1116,6 +1155,55 @@ impl RocmDevice {
         Ok(Box::new(storage))
     }
 
+    /// Stream-ordered f32 H2D upload that does NOT synchronize before returning.
+    ///
+    /// Pins the host data, allocates device storage, and issues `hipMemcpyAsync`
+    /// on a pooled compute stream. The pinned source is retained in
+    /// [`RocmDevice::retained_pins`] so it outlives the enqueue; [`synchronize`]
+    /// releases every retained pin after the device completes the copies. This
+    /// lets consecutive per-tensor weight uploads queue on the stream pool and
+    /// overlap with each other (and with the dequant CPU work done ahead of
+    /// them), pipelining the per-tensor H2D copies instead of serializing them.
+    ///
+    /// [`synchronize`]: RocmDevice::synchronize
+    pub fn upload_from_host_stream_ordered(
+        &self,
+        data: &[f32],
+        shape: &Shape,
+        dtype: DType,
+    ) -> Result<Box<dyn BackendStorage>> {
+        let pinned = RocmPinnedBuffer::<f32>::from_slice(data)?;
+        let storage = RocmStorage::alloc_gpu(shape, dtype.clone(), &self.allocator, self.ordinal)?;
+        if !storage.device_ptr_is_valid() {
+            return Err(Error::Backend("Invalid device pointer after alloc".into()));
+        }
+        let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
+        let stream = self.active_stream();
+        let status = unsafe {
+            hipMemcpyAsync(
+                dev_ptr_void,
+                pinned.as_ptr() as *const c_void,
+                storage.bytes,
+                HipMemcpyKind::HostToDevice,
+                stream,
+            )
+        };
+        // On failure the async copy was never enqueued, so the pin is safe to
+        // drop immediately; return the device buffer to the caching allocator.
+        if status != hipSuccess {
+            self.allocator.free(dev_ptr_void, storage.bytes);
+            return Err(Error::Backend(format!(
+                "hipMemcpyAsync(H2D, stream-ordered) failed with error code {status}"
+            )));
+        }
+        // Retain the pin until the next device-wide synchronize (never free a
+        // page-locked source while a stream-ordered copy may still read it).
+        if let Ok(mut pins) = self.retained_pins.lock() {
+            pins.push(pinned);
+        }
+        Ok(Box::new(storage))
+    }
+
     /// Like [`RocmDevice::copy_from_host_async`] but uploads from a caller-owned [see: `hipHostMalloc`]
     pub fn upload_from_pinned(
         &self,
@@ -1141,6 +1229,47 @@ impl RocmDevice {
         check_hip("hipStreamSynchronize(H2D)", unsafe {
             hipStreamSynchronize(stream)
         })?;
+        Ok(Box::new(storage))
+    }
+
+    /// In-memory D2D transpose of a contiguous `[a, b]` f32 tensor into a fresh
+    /// `[b, a]` device buffer via `grim_transpose_2d_f32`.
+    ///
+    /// This replaces the DtoH + transpose + H2D round trip that the host
+    /// fallback performs for F32 weights on GPU: the input storage is read and
+    /// written entirely in device memory, so transposing a weight that is
+    /// already resident on the device costs no host transfer.
+    pub fn transpose_f32_2d(&self, src: &dyn BackendStorage, a: usize, b: usize) -> Result<Box<dyn BackendStorage>> {
+        let src_s = src
+            .as_any()
+            .downcast_ref::<RocmStorage>()
+            .ok_or_else(|| Error::Backend("transpose_f32_2d: src is not RocmStorage".into()))?;
+        let out_shape = Shape::new(vec![b, a]);
+        let storage = RocmStorage::alloc_gpu(&out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut in_ptr = dev_ptr(src_s)?;
+        let mut out_ptr = dev_ptr(&storage)?;
+        let total = a
+            .checked_mul(b)
+            .ok_or_else(|| Error::Backend("transpose_f32_2d: a*b overflow".into()))?;
+        let (grid, block) = linear_launch(total);
+        let mut a_i = a as i32;
+        let mut b_i = b as i32;
+        let stream = self.launch_compute_kernel(
+            "grim_transpose_2d_f32",
+            grid,
+            block,
+            &mut [
+                arg(&mut in_ptr),
+                arg(&mut out_ptr),
+                arg(&mut a_i),
+                arg(&mut b_i),
+            ],
+        )?;
+        if self.active_capture_stream().is_none() {
+            check_hip("hipStreamSynchronize(transpose_2d_f32)", unsafe {
+                hipStreamSynchronize(stream)
+            })?;
+        }
         Ok(Box::new(storage))
     }
 

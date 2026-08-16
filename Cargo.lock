@@ -2405,6 +2405,7 @@ dependencies = [
  "grim-backend-metal",
  "grim-backend-rocm",
  "grim-backend-vulkan",
+ "grim-format",
  "grim-quant",
  "grim-tensor",
  "parking_lot",
