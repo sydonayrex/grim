@@ -278,12 +278,20 @@ impl ExpertBank {
     ) -> Result<Self, grim_tensor::error::Error> {
         use grim_tensor::dtype::{FloatPackScheme, Storage};
 
-        // Fetch the three raw packed buffers once.
-        let mut banks = Vec::with_capacity(3);
-        for (name, out, in_) in projections {
+        // Process ONE projection at a time. Each projection's full packed bank
+        // is fetched, sliced across all `num_experts`, and fully consumed
+        // before the next projection's bank is fetched — so at most ONE full
+        // packed bank (not three) is resident at once. This bounds peak
+        // packed-byte RSS to ~1.4 GB/layer for Mellum2-class MoE instead of
+        // ~4.2 GB and fixes the OOM that previously killed the load mid-way.
+        let mut gate = Vec::with_capacity(num_experts);
+        let mut up = Vec::with_capacity(num_experts);
+        let mut down = Vec::with_capacity(num_experts);
+
+        for (p_idx, (name, out, in_)) in projections.iter().enumerate() {
             let raw = ws.get_raw_packed(name)?;
             let dims = &raw.shape;
-            let expected = vec![num_experts, out, in_];
+            let expected = vec![num_experts, *out, *in_];
             if *dims != expected {
                 return Err(grim_tensor::error::Error::ShapeMismatch {
                     expected,
@@ -295,17 +303,10 @@ impl ExpertBank {
             // [codes][exps] framing; every other quant format is raw blocks.
             let is_framed_mxfp4 =
                 matches!(raw.dtype.storage, Storage::FloatPack(FloatPackScheme::MxFp4));
-            banks.push((raw, out, in_, elem_count, is_framed_mxfp4));
-        }
 
-        let mut gate = Vec::with_capacity(num_experts);
-        let mut up = Vec::with_capacity(num_experts);
-        let mut down = Vec::with_capacity(num_experts);
-        for e in 0..num_experts {
-            let mut lins = Vec::with_capacity(3);
-            for (raw, out, in_, elem_count, is_framed_mxfp4) in &banks {
+            for e in 0..num_experts {
                 let per_expert = elem_count / num_experts;
-                let (bytes, dtype): (Vec<u8>, grim_tensor::dtype::DType) = if *is_framed_mxfp4 {
+                let (bytes, dtype): (Vec<u8>, grim_tensor::dtype::DType) = if is_framed_mxfp4 {
                     // MXFP4 has no fused GEMM wired through `Linear::forward`
                     // yet (plain matmul would misread the packed bytes as
                     // F32). Convert each expert to Q8_0 on the host — one
@@ -335,8 +336,7 @@ impl ExpertBank {
                     // Raw block-quant bytes: contiguous per-expert stride.
                     if raw.bytes.len() % num_experts != 0 {
                         return Err(grim_tensor::error::Error::Backend(format!(
-                            "expert bank '{}': {} bytes not divisible by {num_experts} experts",
-                            projections[0].0,
+                            "expert bank '{name}': {} bytes not divisible by {num_experts} experts",
                             raw.bytes.len()
                         )));
                     }
@@ -354,12 +354,17 @@ impl ExpertBank {
                     provenance: raw.provenance.clone(),
                 };
                 let t = ws.materialize_raw(rt, shape)?;
-                lins.push(Linear::from_tensor(t, bias_opt(has_bias, *out)));
+                let lin = Linear::from_tensor(t, bias_opt(has_bias, *out));
+                // `p_idx` maps the projection to its expert slot: 0 = gate,
+                // 1 = up, 2 = down (matches the `projections` argument order).
+                match p_idx {
+                    0 => gate.push(lin),
+                    1 => up.push(lin),
+                    _ => down.push(lin),
+                }
             }
-            let mut it = lins.into_iter();
-            gate.push(it.next().ok_or_else(err_proj)?);
-            up.push(it.next().ok_or_else(err_proj)?);
-            down.push(it.next().ok_or_else(err_proj)?);
+            // `raw` (and its full packed bank) drops here, before the next
+            // projection is fetched — this is the core of the OOM fix.
         }
         Ok(Self { gate, up, down })
     }

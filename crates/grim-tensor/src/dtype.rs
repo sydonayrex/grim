@@ -88,8 +88,10 @@ pub enum Storage {
     /// Grouped INT weights from an external QAT pipeline (EfficientQAT, GPTQ).
     GroupInt(GpuIntConfig),
     /// Low-bit floating-point pack formats (FP4 E2M1, NF4, FP8 E4M3/E5M2).
-    /// Dequantized to F32 on load; kept distinct from KQuant so the dequant
-    /// kernel selects the correct float-pack layout.
+    /// Kept as packed bytes on-device for residency-capable backends (ROCm /
+    /// CUDA / CPU), which dequantize in-kernel; only backends without a packed
+    /// residency path dequantize to F32 on load. Kept distinct from KQuant so
+    /// the dequant kernel selects the correct float-pack layout.
     FloatPack(FloatPackScheme),
     /// Block-quantized formats mapping FP4/NF4/FP8.
     Block(BlockDtype),
@@ -284,6 +286,14 @@ impl DType {
     };
     pub const F16: DType = DType {
         arith: ArithType::F16,
+        storage: Storage::Native,
+    };
+    pub const U8: DType = DType {
+        arith: ArithType::U8,
+        storage: Storage::Native,
+    };
+    pub const U32: DType = DType {
+        arith: ArithType::U32,
         storage: Storage::Native,
     };
 

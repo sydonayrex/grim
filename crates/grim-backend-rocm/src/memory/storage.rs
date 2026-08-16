@@ -412,6 +412,24 @@ impl BackendStorage for RocmStorage {
                 DTypeStorage::FloatPack(grim_tensor::FloatPackScheme::MxFp4) => {
                     dev.dequantize_mxfp4_host(&raw, elem_count)
                 }
+                DTypeStorage::KQuant(KQuantScheme::IQ4NL) => {
+                    dev.dequantize_iq4nl_host(&raw, elem_count)
+                }
+                DTypeStorage::KQuant(KQuantScheme::IQ4XS) => {
+                    dev.dequantize_iq4xs_host(&raw, elem_count)
+                }
+                DTypeStorage::KQuant(KQuantScheme::IQ3XXS) => {
+                    dev.dequantize_iq3xxs_host(&raw, elem_count)
+                }
+                DTypeStorage::KQuant(KQuantScheme::IQ3S) => {
+                    dev.dequantize_iq3s_host(&raw, elem_count)
+                }
+                DTypeStorage::KQuant(KQuantScheme::IQ2XXS) => {
+                    dev.dequantize_iq2xxs_host(&raw, elem_count)
+                }
+                DTypeStorage::KQuant(KQuantScheme::IQ2XS) => {
+                    dev.dequantize_iq2xs_host(&raw, elem_count)
+                }
                 _ => dequant_cpu(&raw, elem_count, &self.dtype),
             };
 
@@ -513,7 +531,8 @@ impl BackendStorage for RocmStorage {
 
 /// Minimal host-side dequantizer for when a quantized tensor needs to be [see: `Vec<f32>`]
 fn dequant_cpu(raw: &[u8], elem_count: usize, dtype: &DType) -> Result<Vec<f32>> {
-    match &dtype.storage {
+    let start = std::time::Instant::now();
+    let result = match &dtype.storage {
         DTypeStorage::KQuant(KQuantScheme::Q80) => {
             const QK8_0: usize = 32;
             let expected = (elem_count.div_ceil(QK8_0)) * (QK8_0 + 2);
@@ -538,6 +557,18 @@ fn dequant_cpu(raw: &[u8], elem_count: usize, dtype: &DType) -> Result<Vec<f32>>
             }
             Ok(out)
         }
+        DTypeStorage::KQuant(KQuantScheme::Q2K) => grim_quant::dequant_q2k(raw, elem_count),
+        DTypeStorage::KQuant(KQuantScheme::Q3K) => grim_quant::dequant_q3k(raw, elem_count),
+        DTypeStorage::KQuant(KQuantScheme::Q4K) => grim_quant::dequant_q4k(raw, elem_count),
+        DTypeStorage::KQuant(KQuantScheme::Q5K) => grim_quant::dequant_q5k(raw, elem_count),
+        DTypeStorage::KQuant(KQuantScheme::Q6K) => grim_quant::dequant_q6k(raw, elem_count),
+        DTypeStorage::KQuant(KQuantScheme::IQ4NL) => grim_quant::dequant_iq4nl(raw, elem_count),
+        DTypeStorage::KQuant(KQuantScheme::IQ4XS) => grim_quant::dequant_iq4xs(raw, elem_count),
+        DTypeStorage::KQuant(KQuantScheme::IQ3XXS) => grim_quant::dequant_iq3xxs(raw, elem_count),
+        DTypeStorage::KQuant(KQuantScheme::IQ3S) => grim_quant::dequant_iq3s(raw, elem_count),
+        DTypeStorage::KQuant(KQuantScheme::IQ2XXS) => grim_quant::dequant_iq2xxs(raw, elem_count),
+        DTypeStorage::KQuant(KQuantScheme::IQ2XS) => grim_quant::dequant_iq2xs(raw, elem_count),
+        DTypeStorage::KQuant(KQuantScheme::IQ2S) => grim_quant::dequant_iq2s(raw, elem_count),
         DTypeStorage::FloatPack(grim_tensor::FloatPackScheme::Fp8) => {
             if raw.len() < 4 + elem_count {
                 return Err(Error::Backend(format!(
@@ -555,7 +586,6 @@ fn dequant_cpu(raw: &[u8], elem_count: usize, dtype: &DType) -> Result<Vec<f32>>
             }
             Ok(out)
         }
-        DTypeStorage::KQuant(KQuantScheme::Q4K) => grim_quant::dequant_q4k(raw, elem_count),
         DTypeStorage::FloatPack(grim_tensor::FloatPackScheme::MxFp4) => {
             grim_quant::dequant_mxfp4(raw, elem_count)
         }
@@ -563,7 +593,21 @@ fn dequant_cpu(raw: &[u8], elem_count: usize, dtype: &DType) -> Result<Vec<f32>>
             "to_cpu_vec_f32: host dequant not yet implemented for {:?}",
             dtype.storage
         ))),
+    };
+    // Priority 3: surface progress for the host-side dequant fallback. Without
+    // this, a legitimate ~10-minute load is silent between `[alias]` log lines
+    // and is indistinguishable from a true hang. Borrowed from the `[grim]` log
+    // convention used elsewhere in the load path.
+    match &result {
+        Ok(out) => eprintln!(
+            "[grim] Host dequantized {:?} ({} elements) in {:.2}s",
+            dtype.storage,
+            out.len(),
+            start.elapsed().as_secs_f64()
+        ),
+        Err(_) => {}
     }
+    result
 }
 
 fn fp8_e4m3_to_f32(byte: u8) -> f32 {
