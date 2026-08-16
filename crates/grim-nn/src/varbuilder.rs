@@ -14,7 +14,7 @@ use grim_tensor::shape::Shape;
 use grim_tensor::tensor::Tensor;
 use grim_tensor::{BackendDevice, RawTensor};
 
-use grim_backend_cpu::cpu_tensor;
+use grim_backend_cpu::{cpu_tensor, CpuDevice};
 use grim_quant::{
     dequant_fp4, dequant_fp4_block16, dequant_fp8, dequant_fp8_block16, dequant_iq2s,
     dequant_iq2xs, dequant_iq2xxs, dequant_iq3s, dequant_iq3xxs, dequant_iq4nl, dequant_iq4xs,
@@ -27,7 +27,10 @@ use grim_backend_cuda::CudaDevice;
 #[cfg(feature = "metal-mem")]
 use grim_backend_metal::MetalDevice;
 #[cfg(feature = "rocm-mem")]
-use grim_backend_rocm::{RocmDevice, RocmStorage};
+use grim_backend_rocm::RocmDevice;
+#[cfg(feature = "rocm-mem")]
+#[allow(unused_imports)]
+use grim_backend_rocm::RocmStorage;
 #[cfg(feature = "vulkan-mem")]
 use grim_backend_vulkan::VulkanDevice;
 
@@ -437,25 +440,33 @@ fn materialize(
     provenance: QuantProvenance,
     device: &Device,
 ) -> Result<Tensor> {
-    if device.is_cpu() {
-        let f32s = dequant_to_f32(&raw, &dtype)?;
-        return Ok(cpu_tensor(f32s, shape));
-    }
-    if dtype.is_quantized() {
+    if dtype.is_quantized()
+        && !matches!(dtype.storage, Storage::ResidualPacked(_))
+        && !matches!(dtype.storage, Storage::GroupInt(_))
+    {
         #[cfg(feature = "rocm-mem")]
         if let Device::Rocm(ordinal) = device {
-            if !matches!(dtype.storage, Storage::GroupInt(_)) {
-                let dev = RocmDevice::shared(*ordinal);
-                let mut storage = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone())?;
-                storage.set_provenance(provenance.clone());
-                return Ok(Tensor::new(
-                    Arc::from(storage),
-                    shape,
-                    dtype,
-                    provenance,
-                    device.clone(),
-                ));
+            // Priority 2 diagnostic (opt-in): set GRIM_ROCM_FASTPATH_TRACE to
+            // confirm which path each quantized tensor takes on ROCm. Left in
+            // as a debug aid — silent otherwise so it never spams large MoE
+            // loads (thousands of expert tensors).
+            if std::env::var_os("GRIM_ROCM_FASTPATH_TRACE").is_some() {
+                eprintln!(
+                    "[grim][fastpath] ROCm on-device packed residency for {:?} ({} elems) on ordinal {ordinal}",
+                    dtype.storage,
+                    raw.shape.iter().product::<usize>()
+                );
             }
+            let dev = RocmDevice::shared(*ordinal);
+            let mut storage = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone())?;
+            storage.set_provenance(provenance.clone());
+            return Ok(Tensor::new(
+                Arc::from(storage),
+                shape,
+                dtype,
+                provenance,
+                device.clone(),
+            ));
         }
 
         // CUDA: keep KQuant / FloatPack / Block storage resident on-device
@@ -466,29 +477,60 @@ fn materialize(
         // dequantized-to-F32 to preserve its multi-segment loader semantics.
         #[cfg(feature = "cuda-mem")]
         if let Device::Cuda(ordinal) = device {
-            if dtype.is_quantized()
-                && !matches!(dtype.storage, Storage::ResidualPacked(_))
-                && !matches!(dtype.storage, Storage::GroupInt(_))
-            {
-                let dev = CudaDevice::new(*ordinal)?;
-                let storage = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone())?;
-                return Ok(Tensor::new(
-                    Arc::from(storage),
-                    shape,
-                    dtype,
-                    provenance,
-                    device.clone(),
-                ));
-            }
+            let dev = CudaDevice::new(*ordinal)?;
+            let storage = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone())?;
+            return Ok(Tensor::new(
+                Arc::from(storage),
+                shape,
+                dtype,
+                provenance,
+                device.clone(),
+            ));
         }
-        #[cfg(not(feature = "cuda-mem"))]
-        let _ = device;
+
+        #[cfg(not(any(feature = "rocm-mem", feature = "cuda-mem")))]
+        {
+            let _ = (&raw, &shape, &dtype);
+        }
+
+        // CPU: keep quantized (KQuant / FloatPack / Block) bytes resident in
+        // system memory rather than decompressing to F32 at load time. The CPU
+        // `quantized_matmul` path dequantizes on-the-fly, so a 12B MXFP4 model
+        // stays ~6GB in RAM instead of inflating to ~48GB F32 and blowing past
+        // system RAM / thrashing swap. Mirrors the ROCm/CUDA residency semantics.
+        if let Device::Cpu = device {
+            let dev = CpuDevice::new();
+            let storage = dev.from_cpu_bytes(&raw.bytes, &shape, dtype.clone())?;
+            return Ok(Tensor::new(
+                Arc::from(storage),
+                shape,
+                dtype,
+                provenance,
+                device.clone(),
+            ));
+        }
     }
 
-    let f32s = dequant_to_f32(&raw, &dtype)?;
+    if device.is_cpu() {
+        let f32s = dequant_to_f32(&raw, &dtype)?;
+        return Ok(cpu_tensor(f32s, shape));
+    }
+
+    let f32s = {
+        // Priority 2 diagnostic (opt-in): this is the host-side scalar dequant
+        // fallthrough. If GRIM_ROCM_FASTPATH_TRACE is set and this fires for an
+        // MXFP4/FloatPack tensor, the ROCm fast path was NOT taken for it.
+        if std::env::var_os("GRIM_ROCM_FASTPATH_TRACE").is_some() {
+            eprintln!(
+                "[grim][fastpath] host dequant fallthrough for {:?} ({} elems)",
+                dtype.storage,
+                raw.shape.iter().product::<usize>()
+            );
+        }
+        dequant_to_f32(&raw, &dtype)?
+    };
     match device {
         Device::Cpu => {
-            _ = f32s;
             Err(Error::Backend(
                 "Device::Cpu reached after is_cpu early-return — unreachable".into(),
             ))
