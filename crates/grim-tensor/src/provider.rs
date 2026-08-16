@@ -45,6 +45,18 @@ pub trait TensorProvider: Send + Sync {
     /// materializing the full tensor (shape, dtype, provenance).
     fn meta(&self, name: &str) -> Result<TensorMeta>;
 
+    /// Enumerate every tensor name this provider can `get`/`get_packed`.
+    ///
+    /// Used by [`grim_nn::WeightSource::prefetch_all`] to parallelize disk
+    /// reads + per-tensor CPU passes (e.g. MXFP4 reframing) ahead of the
+    /// layer-construction loop, eliminating the serial per-tensor read that
+    /// otherwise dominates model load time. The default returns an empty list,
+    /// which makes prefetch a no-op (callers fall back to on-demand reads) —
+    /// providers that don't implement this are unaffected.
+    fn tensor_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Fetch the rank-th shard of a tensor, splitting along `dim`.
     ///
     /// `dim == 0` shards rows (column-parallel): each rank owns a contiguous

@@ -48,6 +48,13 @@ pub struct WeightSource<'a> {
     /// Tensor-parallel config for sharded weight loading. Defaults to
     /// single-device (rank 0, world_size 1).
     tp_config: TensorParallelConfig,
+    /// Parallel-prefetch cache: tensors fetched + per-tensor CPU passes
+    /// (e.g. MXFP4 reframing) done ahead of the layer loop by `prefetch_all`.
+    /// Keyed by the *full* (prefixed) tensor name so it matches what `get`
+    /// requests. Shared across `pp`/`with_tp_config` clones via `Arc`.
+    prefetch_cache: std::sync::Arc<
+        parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<grim_tensor::provider::RawTensor>>>,
+    >,
 }
 
 impl<'a> WeightSource<'a> {
@@ -64,6 +71,7 @@ impl<'a> WeightSource<'a> {
             default_provenance,
             device,
             tp_config: TensorParallelConfig::default(),
+            prefetch_cache: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -81,6 +89,7 @@ impl<'a> WeightSource<'a> {
             default_provenance: self.default_provenance.clone(),
             device: self.device.clone(),
             tp_config: tp,
+            prefetch_cache: self.prefetch_cache.clone(),
         }
     }
 
@@ -93,7 +102,58 @@ impl<'a> WeightSource<'a> {
             default_provenance: self.default_provenance.clone(),
             device,
             tp_config: self.tp_config,
+            prefetch_cache: self.prefetch_cache.clone(),
         }
+    }
+
+    /// Parallel-prefetch every tensor the underlying provider can name.
+    ///
+    /// Reads + per-tensor CPU passes (MXFP4 reframing, etc.) run concurrently
+    /// across a rayon worker pool instead of serially behind the provider's
+    /// read path, and the results are cached keyed by full (prefixed) name.
+    /// This is the primary load-time speedup: by the time the layer-
+    /// construction loop calls `get`, each `RawTensor` is already resident in
+    /// the cache and only the device upload remains.
+    ///
+    /// Tensors that fail to fetch are skipped (left for on-demand fallback),
+    /// so a partial provider (or a name the model doesn't reference) never
+    /// aborts the load.
+    pub fn prefetch_all(&self) {
+        let names = self.tensors.tensor_names();
+        if names.is_empty() {
+            return;
+        }
+        let cache = self.prefetch_cache.clone();
+        // De-dupe against already-cached entries without holding the lock
+        // across the (potentially slow) fetch.
+        let pending: Vec<String> = {
+            let guard = cache.lock();
+            names.into_iter().filter(|n| !guard.contains_key(n)).collect()
+        };
+        if pending.is_empty() {
+            return;
+        }
+        use rayon::prelude::*;
+        pending.par_iter().for_each(|name| {
+            match self.tensors.get_packed(name) {
+                Ok(raw) => {
+                    cache.lock().insert(name.clone(), std::sync::Arc::new(raw));
+                }
+                Err(_) => { /* leave for on-demand fetch */ }
+            }
+        });
+    }
+
+    /// Fetch a raw tensor, consulting the prefetch cache first.
+    fn cached_raw(&self, name: &str) -> Result<grim_tensor::provider::RawTensor> {
+        if let Some(arc) = self.prefetch_cache.lock().get(name) {
+            return Ok((**arc).clone());
+        }
+        let raw = self.tensors.get_packed(name)?;
+        self.prefetch_cache
+            .lock()
+            .insert(name.to_string(), std::sync::Arc::new(raw.clone()));
+        Ok(raw)
     }
 
     /// Read-only access to the current TP config.
@@ -154,6 +214,7 @@ impl<'a> WeightSource<'a> {
             default_provenance: self.default_provenance.clone(),
             device: self.device.clone(),
             tp_config: self.tp_config,
+            prefetch_cache: self.prefetch_cache.clone(),
         }
     }
 
@@ -167,7 +228,8 @@ impl<'a> WeightSource<'a> {
     /// expert can be materialized (quantized-resident on GPU) individually
     /// instead of dequantizing the whole bank to host f32.
     pub fn get_raw_packed(&self, leaf: &str) -> Result<grim_tensor::provider::RawTensor> {
-        self.tensors.get_packed(&self.full_name(leaf))
+        let name = self.full_name(leaf);
+        self.cached_raw(&name)
     }
 
     /// Materialize an already-fetched `RawTensor` on this WeightSource's
@@ -198,7 +260,7 @@ impl<'a> WeightSource<'a> {
     pub fn get(&self, shape: impl Into<Shape>, leaf: &str) -> Result<Tensor> {
         let shape = shape.into();
         let name = self.full_name(leaf);
-        let raw = self.tensors.get_packed(&name)?;
+        let raw = self.cached_raw(&name)?;
 
         if raw.shape != shape.dims() {
             eprintln!(
@@ -227,7 +289,7 @@ impl<'a> WeightSource<'a> {
     /// transposed weights or token dimension padding in model checkpoints).
     pub fn get_unconstrained(&self, leaf: &str) -> Result<Tensor> {
         let name = self.full_name(leaf);
-        let raw = self.tensors.get_packed(&name)?;
+        let raw = self.cached_raw(&name)?;
         let shape = Shape::new(raw.shape.clone());
         let (dtype, provenance) = match self.tensors.meta(&name) {
             Ok(m) => (m.dtype, m.provenance),
@@ -705,6 +767,9 @@ mod tests {
                 fusion_mask: 0,
             })
         }
+        fn tensor_names(&self) -> Vec<String> {
+            vec!["weight".to_string()]
+        }
     }
 
     #[test]
@@ -741,6 +806,38 @@ mod tests {
         let ws = WeightSource::root(&dummy, Device::Cpu);
         let scoped = ws.pp("model").pp("layers.0");
         assert_eq!(scoped.full_name("weight"), "model.layers.0.weight");
+    }
+
+    #[test]
+    fn prefetch_all_populates_cache_and_get_hits_it() {
+        let q8 = DType {
+            arith: grim_tensor::ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q80),
+        };
+        let sentinel = vec![0xABu8; 64];
+        let dummy = DummyProvider {
+            raw: RawTensor {
+                bytes: sentinel.clone(),
+                shape: vec![2, 16],
+                dtype: q8.clone(),
+                provenance: QuantProvenance::GrimNative,
+            },
+            dtype: q8,
+        };
+        let ws = WeightSource::root(&dummy, Device::Cpu);
+        // Before prefetch the cache is empty; get_raw_packed should still work
+        // (on-demand path) and populate the cache.
+        let before = ws.get_raw_packed("weight").unwrap();
+        assert_eq!(before.bytes, sentinel);
+
+        // Explicit parallel prefetch must also populate the cache.
+        ws.prefetch_all();
+
+        // A scoped (prefixed) source shares the cache Arc; its get must hit
+        // the same cached entry keyed by full name.
+        let scoped = ws.pp("model").pp("layers.0");
+        let after = scoped.get_raw_packed("weight").unwrap();
+        assert_eq!(after.bytes, sentinel);
     }
 
     // ===== golden dequant_to_f32 tests (see header below) =====

@@ -15,6 +15,8 @@ grim-backend-metal = { workspace = true }
 grim-backend-vulkan = { workspace = true }
 grim-quant = { workspace = true }
 thiserror = { workspace = true }
+rayon = { workspace = true }
+parking_lot = { workspace = true }
 
 [features]
 default = ["rocm-mem", "metal-mem", "vulkan-mem"]
