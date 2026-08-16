@@ -63,7 +63,7 @@ use crate::{
     RmsNormMatMulFusionConfig,
     RocblasInt,
     RocblasOperation,
-    RoclabsHandle,
+    RocblasHandle,
     RocmCachingAllocator,
     RocmDeviceProps,
     RocmHandle,
@@ -88,6 +88,7 @@ use crate::{
     hipDeviceGetAttribute,
     hipDeviceSynchronize,
     hipFree,
+    hipFreeAsync,
     hipGetDeviceCount,
     hipGraphDestroy,
     hipGraphExecDestroy,
@@ -111,6 +112,7 @@ use crate::{
     hipSuccess,
     jit_compile_hsaco,
     linear_launch,
+    warp_rows_launch,
     rocblas_create_handle,
     rocblas_destroy_handle,
     rocblas_gemm_ex,
@@ -126,7 +128,7 @@ use crate::{
 pub struct RocmDevice {
     pub(crate) ordinal: usize,
     pub(crate) props: RocmDeviceProps,
-    handle_cache: Mutex<Option<RoclabsHandle>>,
+    handle_cache: Mutex<Option<RocblasHandle>>,
     pub(crate) stream_pool: Mutex<Vec<*mut c_void>>,
     pub(crate) hsaco_cache: HsacoKernelCache,
     /// WI 2.4.4-2 — opt-in switch for the JIT `grim_decode_gemm_f16` [see: `false`, `fusion::DecodeGemmConfig`, `Mutex`, `handle_cache`]
@@ -163,6 +165,17 @@ pub struct RocmDevice {
     pub(crate) autotuner: Mutex<crate::autotune::Autotuner>,
 
     pub(crate) module_cache: Mutex<HashMap<String, (*mut c_void, *mut c_void)>>,
+    /// Resolved-function fast path for `launch_compute_kernel_with_solution`:
+    /// (entry, grid_x, grid_y) -> hipFunction. Skips the per-launch kernel
+    /// source regeneration + seahash + CString work for repeat launches (the
+    /// overwhelming case on the decode hot path). Grid dims are part of the
+    /// key because `jit-hw-adaptive` bakes tile geometry derived from them
+    /// into the source.
+    pub(crate) resolved_kernel_cache: Mutex<HashMap<(String, u32, u32), *mut c_void>>,
+    /// Interner for `&'static str` autotune keys (entry / arch). Each unique
+    /// string is leaked EXACTLY ONCE; repeat `get_or_tune_tiles` /
+    /// `store_tune_cache` calls reuse it instead of leaking per call.
+    pub(crate) str_interner: Mutex<std::collections::HashSet<&'static str>>,
     /// Real `hipModuleLoad` call count (cache hits excluded). Item 2 acceptance.
     pub(crate) module_load_count: AtomicUsize,
     /// GPU target this device was created for, captured at construction. Used to [see: `temp_env::with_var("GRIM_GPU_TARGET", ..)`]
@@ -251,7 +264,7 @@ impl RocmDevice {
         let mut handle_cache = None;
         // Attempt to create rocblas handle lazily on first op if needed.
         unsafe {
-            let mut h: RoclabsHandle = RoclabsHandle(std::ptr::null_mut());
+            let mut h: RocblasHandle = RocblasHandle(std::ptr::null_mut());
             let status = rocblas_create_handle(&mut h);
             if status == rocblas_status_success {
                 handle_cache = Some(h);
@@ -453,7 +466,7 @@ impl RocmDevice {
         ordinal: usize,
         warp_size: i32,
         xnack_val: i32,
-        handle_cache: Option<RoclabsHandle>,
+        handle_cache: Option<RocblasHandle>,
         streams: Vec<*mut c_void>,
     ) -> Self {
         let xnack_enabled = xnack_val == 1;
@@ -499,7 +512,11 @@ impl RocmDevice {
                 let derived = total_vram / 6; // ≈ 16.7 % of VRAM
                 derived
             })
-            .clamp(128 * 1024 * 1024, 512 * 1024 * 1024);
+            // Pool floor raised to 512 MB (a 512 MB cap on a 16 GB card
+            // forced real hipMalloc/hipFree churn for every transient once
+            // the cap was hit — i.e. always); ceiling 4 GB keeps runaway
+            // env overrides bounded.
+            .clamp(512 * 1024 * 1024, 4 * 1024 * 1024 * 1024);
 
         let arch_leak: &'static str = Box::leak(gpu_target.clone().into_boxed_str());
         let mut autotuner = crate::autotune::Autotuner::for_device(ordinal, arch_leak);
@@ -530,6 +547,8 @@ impl RocmDevice {
             autotuner: Mutex::new(autotuner),
 
             module_cache: Mutex::new(HashMap::new()),
+            resolved_kernel_cache: Mutex::new(HashMap::new()),
+            str_interner: Mutex::new(std::collections::HashSet::new()),
             module_load_count: AtomicUsize::new(0),
             gpu_target: gpu_target.clone(),
             capture_enabled: std::env::var("GRIM_CAPTURE_GRAPH").is_ok(),
@@ -738,6 +757,10 @@ impl RocmDevice {
 
     /// Block until all previously issued work on all streams of this device
     pub fn synchronize(&self) {
+        // Pin the correct device before synchronizing — hipDeviceSynchronize()
+        // synchronizes the calling thread's current device, not necessarily
+        // self.ordinal. [P1-7 fix: DeviceGuard before sync.]
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let _ = unsafe { hipDeviceSynchronize() };
         // All stream-ordered H2D copies are complete, so the pinned host
         // sources they read are now safe to release. Draining here (rather than
@@ -881,10 +904,11 @@ impl RocmDevice {
                 if res != hipSuccess {
                     return Err(Error::Backend(format!("hipGraphLaunch failed: {}", res)));
                 }
-                unsafe {
-                    let _ = hipStreamSynchronize(stream);
-                }
-                // Restore the default stream so later eager ops don't land on the capture stream.
+                // No post-replay sync: replay is async on `stream`; callers
+                // that need the result sync (or read back) at their boundary.
+                // The rocblas handle binding is an enqueue-time setting, so it
+                // can be restored immediately without affecting the launched
+                // graph.
                 if let Ok(h) = self.get_rocblas_handle() {
                     unsafe {
                         let _ = rocblas_set_stream(h, std::ptr::null_mut());
@@ -1108,14 +1132,10 @@ impl RocmDevice {
             })?;
             out.push(Box::new(batch_storage) as Box<dyn BackendStorage>);
         }
-        // Synchronize once (only outside graph capture) so callers observe
-        // completed results; the D2D copies above share the same stream as the
-        // GEMM, so ordering is guaranteed.
-        if self.active_capture_stream().is_none() {
-            unsafe {
-                let _ = hipStreamSynchronize(stream);
-            }
-        }
+        // No trailing sync: the unpacked D2D copies share the GEMM's stream,
+        // so callers that read the outputs observe completed data through
+        // stream order (or their own sync). The previous per-call drain
+        // serialized every batched QKV projection.
         Ok(out)
     }
 
@@ -1151,6 +1171,12 @@ impl RocmDevice {
                 "hipMemcpyAsync(H2D) failed with error code {}",
                 res
             )));
+        }
+        // Retain the pin until the next device-wide synchronize — never free a
+        // page-locked source while a stream-ordered copy may still read it.
+        // This matches the correct pattern in `upload_from_host_stream_ordered`.
+        if let Ok(mut pins) = self.retained_pins.lock() {
+            pins.push(pinned);
         }
         Ok(Box::new(storage))
     }
@@ -1469,7 +1495,7 @@ impl RocmDevice {
         Ok(devices)
     }
 
-    pub fn get_rocblas_handle(&self) -> Result<RoclabsHandle> {
+    pub fn get_rocblas_handle(&self) -> Result<RocblasHandle> {
         let mut cache = self
             .handle_cache
             .lock()
@@ -1478,8 +1504,14 @@ impl RocmDevice {
             return Ok(h);
         }
 
+        // Pin the calling thread's device before creating the rocBLAS handle —
+        // rocBLAS inherits whatever device is current, and a handle created on
+        // the wrong device produces silent wrong-answer GEMMs.
+        // [P1-3 fix: DeviceGuard::set before rocblas_create_handle.]
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+
         unsafe {
-            let mut h: RoclabsHandle = RoclabsHandle(std::ptr::null_mut());
+            let mut h: RocblasHandle = RocblasHandle(std::ptr::null_mut());
             let mut status = rocblas_create_handle(&mut h);
             if status != rocblas_status_success {
                 // rocBLAS hipMallocs a 32-128 MiB internal workspace when the
@@ -1488,7 +1520,7 @@ impl RocmDevice {
                 // Drain allocator memory pool and synchronize device before retrying.
                 let _ = crate::hipDeviceSynchronize();
                 self.allocator.empty_cache();
-                h = RoclabsHandle(std::ptr::null_mut());
+                h = RocblasHandle(std::ptr::null_mut());
                 status = rocblas_create_handle(&mut h);
             }
             if status == rocblas_status_success {
@@ -1499,12 +1531,18 @@ impl RocmDevice {
             // Fallback: If rocBLAS workspace creation fails due to VRAM memory pressure,
             // return a zeroed handle — our custom HIP fused GEMM kernels handle matmuls
             // without requiring rocBLAS internal workspace allocations.
+            //
+            // IMPORTANT: callers MUST null-check the handle before use. Passing a
+            // null RocblasHandle to rocblas_gemm_ex will SIGSEGV. The existing
+            // matmul_op/matmul_with_solution call sites already guard with
+            // `!h.0.is_null()` before falling back to the WMMA/custom path.
+            // [P1-6: documented null-handle risk; existing callers already guard.]
             if status == 5 {
                 eprintln!(
                     "[grim-backend-rocm] rocblas_create_handle failed with memory error (status 5); \
                      falling back to custom HIP fused GEMM kernels"
                 );
-                let fallback_handle = RoclabsHandle(std::ptr::null_mut());
+                let fallback_handle = RocblasHandle(std::ptr::null_mut());
                 *cache = Some(fallback_handle);
                 return Ok(fallback_handle);
             }
@@ -1595,11 +1633,12 @@ impl BackendDevice for RocmDevice {
         let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
 
         // If a graph-capture session is active, record an async memset on the
-        let res = if let Some(capture_stream) = self.active_capture_stream() {
-            unsafe { hipMemsetAsync(dev_ptr_void, 0, storage.bytes, capture_stream) }
-        } else {
-            // hipMemset on the default stream is synchronous (host blocks
-            unsafe { hipMemset(dev_ptr_void, 0, storage.bytes) }
+        // capture stream; otherwise enqueue async on the active stream so
+        // zeroing stays stream-ordered instead of blocking the host (the old
+        // default-stream hipMemset was a device-wide serialization point).
+        let res = match self.active_capture_stream() {
+            Some(capture_stream) => unsafe { hipMemsetAsync(dev_ptr_void, 0, storage.bytes, capture_stream) },
+            None => unsafe { hipMemsetAsync(dev_ptr_void, 0, storage.bytes, self.active_stream()) },
         };
 
         if res != hipSuccess {
@@ -1773,6 +1812,10 @@ impl BackendDevice for RocmDevice {
 
         // Get rocBLAS handle and execute gemm_ex with the provided solution_index
         let handle = self.get_rocblas_handle()?;
+        // Bind the rocBLAS handle to the active stream so GEMM executes on the
+        // correct stream and the returned ComputeHandle synchronizes correctly.
+        // [P0-17 fix: previously missing — caused sync-lie and split-K race.]
+        let _ = unsafe { rocblas_set_stream(handle, self.active_stream()) };
 
         let alpha: f32 = 1.0f32;
         let beta: f32 = 0.0f32;
@@ -1783,10 +1826,9 @@ impl BackendDevice for RocmDevice {
 
         // In ROCm/rocBLAS (column-major), row-major C[M,N] = A[M,K] @ B[K,N] is
 
-        let use_gemm_ex = cfg!(feature = "rocm-aiter") || {
-            let gcn = std::env::var("GRIM_GPU_TARGET").unwrap_or_else(|_| "gfx900".into());
-            gcn == "gfx90a" || gcn == "gfx942"
-        };
+        let use_gemm_ex = cfg!(feature = "rocm-aiter")
+            || self.gpu_target == "gfx90a"
+            || self.gpu_target == "gfx942";
 
         unsafe {
             let status = if use_gemm_ex
@@ -2187,7 +2229,8 @@ impl BackendDevice for RocmDevice {
         let mut row_len_i = row_len as i32;
         let mut eps_f = eps;
         let mut total_i = total as i32;
-        let (grid, block) = linear_launch(total);
+        // grim_rms_norm is warp-per-row (32 lanes reduce with shuffles).
+        let (grid, block) = warp_rows_launch(total / row_len.max(1));
         self.launch_compute_kernel(
             "grim_rms_norm",
             grid,
@@ -2229,7 +2272,8 @@ impl BackendDevice for RocmDevice {
         let mut x_ptr = dev_ptr(x_s)?;
         let mut row_len_i = row_len as i32;
         let mut total_i = total as i32;
-        let (grid, block) = linear_launch(total);
+        // grim_softmax is warp-per-row (32 lanes reduce with shuffles).
+        let (grid, block) = warp_rows_launch(total / row_len.max(1));
         self.launch_compute_kernel(
             "grim_softmax",
             grid,
@@ -2301,19 +2345,15 @@ impl BackendDevice for RocmDevice {
                 arg(&mut total_i),
             ],
         )?;
-        // The fused kernel reads idx_ptr from the GPU. With the per-launch sync
-        if self.active_capture_stream().is_none() {
-            unsafe {
-                let sync = hipStreamSynchronize(stream);
-                if sync != hipSuccess {
-                    hipFree(idx_ptr);
-                    return Err(Error::Backend(format!(
-                        "hipStreamSynchronize failed: {}",
-                        sync
-                    )));
-                }
-                hipFree(idx_ptr);
-            }
+        // The fused kernel reads idx_ptr from the GPU. Free stream-ordered so
+        // the release happens after the kernel's reads; this is also
+        // graph-capturable (the capture path previously leaked the buffer).
+        unsafe {
+            let free_stream = stream
+                .as_ref()
+                .map(|_| self.active_stream())
+                .unwrap_or(std::ptr::null_mut());
+            let _ = hipFreeAsync(idx_ptr, free_stream);
         }
         Ok((
             Box::new(storage),
@@ -2348,26 +2388,11 @@ impl BackendDevice for RocmDevice {
             None => return Ok(()), // Unallocated or CPU-side: no-op
         };
 
-        // Correctness Gate: Probe XNACK. If disabled, pageable unified memory migrations fail.
+        // Correctness Gate: Probe XNACK. If disabled, pageable unified memory
+        // migrations fail — and there is nothing useful to substitute: the old
+        // fallback issued a whole-tensor self-copy on the null stream, which
+        // was a no-op for data but a device-wide serialization point.
         if !self.props.xnack_enabled {
-            println!(
-                "[RocmDevice] Warning: XNACK is disabled on GFX device {}. Unified page advising bypassed; falling back to asynchronous stream copy.",
-                self.ordinal
-            );
-            // Simulate/fallback to a null stream async memcpy (using stream 0)
-            unsafe {
-                let null_stream: *mut c_void = std::ptr::null_mut();
-                check_hip(
-                    "hipMemcpyAsync (fallback D2D)",
-                    hipMemcpyAsync(
-                        dev_ptr as *mut c_void,
-                        dev_ptr,
-                        rocm_storage.bytes,
-                        HipMemcpyKind::DeviceToDevice,
-                        null_stream,
-                    ),
-                )?;
-            }
             return Ok(());
         }
 
@@ -2739,59 +2764,38 @@ impl BackendDevice for RocmDevice {
                 // separate device buffers. Weight tensors carry the
                 // length-prefixed framing [u64 codes_len][codes][u64
                 // exps_len][exps]; both segment lengths are derivable from the
-                // shape, so split device-side with two DtoD copies. Legacy
-                // codes-only buffers (no framing) keep the _b_scales / dummy
-                // exponent path and pass B through unchanged.
+                // shape. The framed segments are addressed IN PLACE via
+                // interior pointers — the weight blob is immutable, so the
+                // former per-call split (two allocations + two synchronous
+                // DtoD copies of the whole weight per GEMM per layer per token)
+                // was pure overhead. Alignment: device allocations are
+                // >=256B-aligned and codes_len = N*K/2 is a multiple of 16 for
+                // any K multiple of 32, so both interior pointers stay
+                // 16B-aligned for vectorized kernel loads. Legacy codes-only
+                // buffers (no framing) keep the _b_scales / dummy exponent
+                // path and pass B through unchanged.
                 let elems = k * n;
                 let codes_len = elems / 2;
                 let exps_len = elems.div_ceil(32);
                 let framed_len = 16 + codes_len + exps_len;
-                let u8_dtype = DType {
-                    arith: ArithType::U8,
-                    storage: DTypeStorage::Native,
-                };
+                let base = b_storage
+                    .device_ptr_u64()
+                    .ok_or_else(|| Error::Backend("mxfp4 gemm: b has no device ptr".into()))?;
 
-                // Split storages (framed path); stay None on the legacy path.
-                let mut split_codes: Option<RocmStorage> = None;
-                let exps_storage: RocmStorage = if b_storage.bytes == framed_len {
-                    let codes_storage = RocmStorage::alloc_gpu(
-                        &Shape::new(vec![codes_len]),
-                        u8_dtype.clone(),
-                        &self.allocator,
-                        self.ordinal,
-                    )?;
-                    let exps_storage = RocmStorage::alloc_gpu(
-                        &Shape::new(vec![exps_len]),
-                        u8_dtype,
-                        &self.allocator,
-                        self.ordinal,
-                    )?;
-                    let base = b_storage.device_ptr_u64().unwrap() as *const c_void;
-                    check_hip("mxfp4 split codes (DtoD)", unsafe {
-                        crate::hipMemcpy(
-                            codes_storage.device_ptr_u64().unwrap() as *mut c_void,
-                            base.add(8),
-                            codes_len,
-                            HipMemcpyKind::DeviceToDevice,
-                        )
-                    })?;
-                    check_hip("mxfp4 split exps (DtoD)", unsafe {
-                        crate::hipMemcpy(
-                            exps_storage.device_ptr_u64().unwrap() as *mut c_void,
-                            base.add(8 + codes_len + 8),
-                            exps_len,
-                            HipMemcpyKind::DeviceToDevice,
-                        )
-                    })?;
-                    split_codes = Some(codes_storage);
-                    exps_storage
+                // Keep any transient exponent storage alive until after the
+                // kernel launch below (single-stream ordering makes pooled
+                // reuse safe once this binding drops).
+                let exps_storage: Option<RocmStorage>;
+                let (codes_ptr, exps_ptr): (u64, u64) = if b_storage.bytes == framed_len {
+                    exps_storage = None;
+                    (base + 8, base + 16 + codes_len as u64)
                 } else if !_b_scales.is_empty() {
                     // Caller-supplied f32 E8M0 byte values as exponents.
                     let exps_u8: Vec<u8> = _b_scales
                         .iter()
                         .map(|s| s.round().clamp(0.0, 255.0) as u8)
                         .collect();
-                    RocmStorage::copy_from_host_raw_bytes(
+                    let storage = RocmStorage::copy_from_host_raw_bytes(
                         &exps_u8,
                         &Shape::new(vec![exps_u8.len()]),
                         DType {
@@ -2800,66 +2804,56 @@ impl BackendDevice for RocmDevice {
                         },
                         &self.allocator,
                         self.ordinal,
-                    )?
+                    )?;
+                    let ptr = storage
+                        .device_ptr_u64()
+                        .ok_or_else(|| Error::Backend("mxfp4 gemm: exps upload failed".into()))?;
+                    exps_storage = Some(storage);
+                    (base, ptr)
                 } else {
                     // Legacy/empty path: zeroed dummy exponents.
-                    RocmStorage::alloc_gpu(
+                    let storage = RocmStorage::alloc_gpu(
                         &Shape::new(vec![exps_len.max(1)]),
-                        u8_dtype,
+                        DType {
+                            arith: ArithType::U8,
+                            storage: DTypeStorage::Native,
+                        },
                         &self.allocator,
                         self.ordinal,
-                    )?
+                    )?;
+                    let ptr = storage
+                        .device_ptr_u64()
+                        .ok_or_else(|| Error::Backend("mxfp4 gemm: dummy exps failed".into()))?;
+                    exps_storage = Some(storage);
+                    (base, ptr)
                 };
 
                 let use_fused = self.mxfp4_fused_dequant_gemm_enabled.load(Ordering::Relaxed);
-                match split_codes {
-                    Some(codes) => {
-                        if use_fused {
-                            self.launch_fused_dequant_gemm_mxfp4(
-                                a_storage,
-                                &codes,
-                                &exps_storage,
-                                &out_storage,
-                                m,
-                                n,
-                                k,
-                            )?;
-                        } else {
-                            self.launch_mxfp4_gemm_tiled(
-                                a_storage,
-                                &codes,
-                                &exps_storage,
-                                &out_storage,
-                                m,
-                                n,
-                                k,
-                            )?;
-                        }
-                    }
-                    None => {
-                        if use_fused {
-                            self.launch_fused_dequant_gemm_mxfp4(
-                                a_storage,
-                                b_storage,
-                                &exps_storage,
-                                &out_storage,
-                                m,
-                                n,
-                                k,
-                            )?;
-                        } else {
-                            self.launch_mxfp4_gemm_tiled(
-                                a_storage,
-                                b_storage,
-                                &exps_storage,
-                                &out_storage,
-                                m,
-                                n,
-                                k,
-                            )?;
-                        }
-                    }
+                if use_fused {
+                    self.launch_fused_dequant_gemm_mxfp4(
+                        a_storage,
+                        codes_ptr,
+                        exps_ptr,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
+                } else {
+                    self.launch_mxfp4_gemm_tiled(
+                        a_storage,
+                        codes_ptr,
+                        exps_ptr,
+                        &out_storage,
+                        m,
+                        n,
+                        k,
+                    )?;
                 }
+                // Keep any transient exponent storage alive until the kernel
+                // launch(es) above are enqueued on the active stream. Pooled
+                // reuse is only safe once the transitive storage drops.
+                drop(exps_storage);
             }
             DTypeStorage::FloatPack(FloatPackScheme::MxFp8) => {
                 let dummy_exps = RocmStorage::alloc_gpu(
@@ -3534,9 +3528,10 @@ impl BackendDevice for RocmDevice {
         let mut isd = inv_sqrt_d;
         let mut wlo = window_lo_i;
 
-        // Ensure all prior operations (RoPE, cache D2D copies, etc.) have
-        // completed before this kernel reads q/k/v.
-        let _ = unsafe { hipStreamSynchronize(self.active_stream()) };
+        // Prior RoPE / cache ops were enqueued on the same stream, so stream
+        // ordering already guarantees they complete before this kernel reads
+        // q/k/v — no host sync needed (each removed sync stalls the whole
+        // per-token pipeline).
 
         // Split-KV FlashDecoding acceleration for long-context single-token decode
         if seq_len == 1 && kv_seq_len >= 1024 && window.is_none() && out_max.is_none() && out_sum.is_none() {
@@ -3552,7 +3547,6 @@ impl BackendDevice for RocmDevice {
                 kv_seq_len,
                 num_splits,
             )?;
-            let _ = unsafe { hipStreamSynchronize(self.active_stream()) };
             return Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))));
         }
 
@@ -3582,13 +3576,10 @@ impl BackendDevice for RocmDevice {
             qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd,
         );
 
-        // Wait for the kernel to fully complete before returning. Without this
-        // the output storage can be dropped (returned to the pool) while the
-        // kernel is still writing, and a subsequent alloc_gpu may hand out the
-        // same buffer to a later op — producing silent zero or nondeterministic
-        // results. The stream-sync is microseconds; the alternative is silent
-        // corruption.
-        let _ = unsafe { hipStreamSynchronize(stream) };
+        // No post-launch sync: the output storage is returned to the caller
+        // and any readback (or same-stream reuse of pooled scratch) is
+        // ordered by the single active stream. A sync here would serialize
+        // the CPU against every attention of every layer of every token.
 
         Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
     }
@@ -3662,18 +3653,10 @@ impl BackendDevice for RocmDevice {
             ],
         )?;
 
-        if self.active_capture_stream().is_none() {
-            unsafe {
-                let sync = hipStreamSynchronize(stream);
-                if sync != hipSuccess {
-                    hipFree(pos_ptr);
-                    return Err(Error::Backend(format!(
-                        "hipStreamSynchronize failed: {}",
-                        sync
-                    )));
-                }
-                hipFree(pos_ptr);
-            }
+        // pos_ptr is kernel input; release it stream-ordered after the launch
+        // (graph-capturable, no host stall).
+        unsafe {
+            let _ = hipFreeAsync(pos_ptr, stream);
         }
 
         Ok((
@@ -3766,17 +3749,7 @@ impl BackendDevice for RocmDevice {
             ],
         )?;
 
-        if self.active_capture_stream().is_none() {
-            unsafe {
-                let sync = hipStreamSynchronize(stream);
-                if sync != hipSuccess {
-                    return Err(Error::Backend(format!(
-                        "hipStreamSynchronize failed: {}",
-                        sync
-                    )));
-                }
-            }
-        }
+        let _ = stream; // no post-launch sync: output consumed via stream order
 
         Ok((
             Box::new(storage),
@@ -3852,17 +3825,7 @@ impl BackendDevice for RocmDevice {
             ],
         )?;
 
-        if self.active_capture_stream().is_none() {
-            unsafe {
-                let sync = hipStreamSynchronize(stream);
-                if sync != hipSuccess {
-                    return Err(Error::Backend(format!(
-                        "hipStreamSynchronize failed: {}",
-                        sync
-                    )));
-                }
-            }
-        }
+        let _ = stream; // no post-launch sync: output consumed via stream order
 
         Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
     }
@@ -3874,6 +3837,7 @@ impl BackendDevice for RocmDevice {
         b: &dyn BackendStorage,
         c: &dyn BackendStorage,
         d: &dyn BackendStorage,
+        state: &dyn BackendStorage,
         batch: usize,
         dim_dstate: usize,
         dim_dinner: usize,
@@ -3885,6 +3849,7 @@ impl BackendDevice for RocmDevice {
         let b_s = as_rocm(b)?;
         let c_s = as_rocm(c)?;
         let d_s = as_rocm(d)?;
+        let state_s = as_rocm(state)?;
         let out_storage =
             RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
         self.launch_selective_scan(
@@ -3893,6 +3858,7 @@ impl BackendDevice for RocmDevice {
             b_s,
             c_s,
             d_s,
+            &state_s,
             &out_storage,
             batch,
             dim_dstate,
@@ -4018,6 +3984,15 @@ impl BackendDevice for RocmDevice {
         let stream_u64 = stream as u64;
         let rccl = self.rccl.lock().unwrap().clone();
         let is_f32 = dtype.arith == ArithType::F32;
+        // TP activations arrive as F16/BF16 single tensors per rank; routing
+        // them through RCCL (instead of the old host round-trip) needs the
+        // matching NCCL dtype.
+        let rccl_dtype = match dtype.arith {
+            ArithType::F32 => Some(crate::rccl::NCCL_FLOAT32),
+            ArithType::F16 => Some(crate::rccl::NCCL_FLOAT16),
+            ArithType::BF16 => Some(crate::rccl::NCCL_BFLOAT16),
+            _ => None,
+        };
 
         // ── Cross-GPU all-reduce via RCCL (device-side) ───────────────────
         // When an RCCL handle is attached and we have multiple GPUs, perform
@@ -4031,20 +4006,44 @@ impl BackendDevice for RocmDevice {
                 if inputs.len() == 1 {
                     // Single tensor: direct cross-GPU all-reduce.
                     let send_ptr = dev_ptr(as_rocm(inputs[0])?)?;
-                    rccl_handle.sum_gradients_device(send_ptr, out_ptr, total, stream_u64)?;
+                    rccl_handle.sum_gradients_device(send_ptr, out_ptr, total, stream_u64, self.ordinal)?;
                 } else {
                     // Multiple shards: accumulate on-device first, then all-reduce.
                     let temp_storage =
                         RocmStorage::alloc_gpu(&shape, dtype_f32(), &self.allocator, self.ordinal)?;
                     let temp_ptr = dev_ptr(&temp_storage)?;
                     self.device_accumulate_f32(inputs, temp_ptr)?;
-                    rccl_handle.sum_gradients_device(temp_ptr, out_ptr, total, stream_u64)?;
+                    rccl_handle.sum_gradients_device(temp_ptr, out_ptr, total, stream_u64, self.ordinal)?;
                 }
 
                 return Ok((
                     Box::new(out_storage),
                     Box::new(RocmHandle::new(Some(stream))),
                 ));
+            }
+
+            // F16/BF16 single-shard TP activations: all-reduce in the native
+            // dtype — previously this fell through to a full D2H→CPU-sum→H2D
+            // round trip per RowParallel layer per token.
+            if rccl_handle.num_gpus > 1 && !is_f32 && inputs.len() == 1 {
+                if let Some(nccl_dt) = rccl_dtype {
+                    let out_storage =
+                        RocmStorage::alloc_gpu(&shape, dtype.clone(), &self.allocator, self.ordinal)?;
+                    let out_ptr = dev_ptr(&out_storage)?;
+                    let send_ptr = dev_ptr(as_rocm(inputs[0])?)?;
+                    rccl_handle.all_reduce_device(
+                        send_ptr,
+                        out_ptr,
+                        total,
+                        nccl_dt,
+                        stream_u64,
+                        self.ordinal,
+                    )?;
+                    return Ok((
+                        Box::new(out_storage),
+                        Box::new(RocmHandle::new(Some(stream))),
+                    ));
+                }
             }
         }
 
@@ -4058,12 +4057,13 @@ impl BackendDevice for RocmDevice {
                     RocmStorage::alloc_gpu(&shape, dtype.clone(), &self.allocator, self.ordinal)?;
                 let src_ptr = dev_ptr(as_rocm(inputs[0])?)? as *const c_void;
                 let dst_ptr = out_storage.device_ptr.unwrap() as *mut c_void;
-                check_hip("hipMemcpy(D2D) all_reduce", unsafe {
-                    crate::hipMemcpy(
+                check_hip("hipMemcpyAsync(D2D) all_reduce", unsafe {
+                    hipMemcpyAsync(
                         dst_ptr,
                         src_ptr,
                         bytes,
-                        crate::HipMemcpyKind::DeviceToDevice,
+                        HipMemcpyKind::DeviceToDevice,
+                        stream,
                     )
                 })?;
                 return Ok((
@@ -4210,6 +4210,7 @@ impl BackendDevice for RocmDevice {
                         out_ptr_val,
                         total_elems,
                         stream_u64,
+                        self.ordinal,
                     )?;
                 }
             }
@@ -4485,18 +4486,15 @@ impl RocmDevice {
             ],
         );
 
-        // Free scratch device buffers regardless of whether the launch succeeded.
+        // Free scratch device buffers stream-ordered (after the kernel's
+        // reads); graph-capturable and no host stall.
         unsafe {
-            if self.active_capture_stream().is_none() {
-                let _ = hipStreamSynchronize(
-                    stream
-                        .as_ref()
-                        .map(|_| self.active_stream())
-                        .unwrap_or(std::ptr::null_mut()),
-                );
-            }
-            hipFree(pos_ptr);
-            hipFree(freq_ptr);
+            let free_stream = stream
+                .as_ref()
+                .map(|_| self.active_stream())
+                .unwrap_or(std::ptr::null_mut());
+            let _ = hipFreeAsync(pos_ptr, free_stream);
+            let _ = hipFreeAsync(freq_ptr, free_stream);
         }
 
         let stream = stream?;
@@ -6990,8 +6988,10 @@ impl RocmDevice {
         let out_ptr = out_storage
             .device_ptr
             .ok_or_else(|| Error::Backend(format!("{}: out has no device ptr", name)))?;
-        const BLOCK_SIZE: usize = 256;
-        let grid_x: u32 = ((n_blocks as u64 + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64)
+        // The IQ dequant kernels use one 64-thread block per quant block
+        // (each thread decodes 4 elements with a float4 store).
+        const BLOCK_SIZE: usize = 64;
+        let grid_x: u32 = n_blocks
             .try_into()
             .map_err(|_| Error::Backend(format!("{}: grid overflow", name)))?;
         let grid_dim = HipDim3::new(grid_x, 1, 1);
@@ -7830,8 +7830,8 @@ impl RocmDevice {
     pub(crate) fn launch_fused_dequant_gemm_mxfp4(
         &self,
         a_storage: &RocmStorage,
-        b_codes_storage: &RocmStorage,
-        b_exps_storage: &RocmStorage,
+        b_codes_ptr: u64,
+        b_exps_ptr: u64,
         out_storage: &RocmStorage,
         m: usize,
         n: usize,
@@ -7839,12 +7839,6 @@ impl RocmDevice {
     ) -> Result<*mut c_void> {
         let a_ptr = a_storage.device_ptr.ok_or_else(|| {
             Error::Backend("fused_dequant_gemm_mxfp4: a has no device ptr".into())
-        })?;
-        let b_codes_ptr = b_codes_storage.device_ptr.ok_or_else(|| {
-            Error::Backend("fused_dequant_gemm_mxfp4: b_codes has no device ptr".into())
-        })?;
-        let b_exps_ptr = b_exps_storage.device_ptr.ok_or_else(|| {
-            Error::Backend("fused_dequant_gemm_mxfp4: b_exps has no device ptr".into())
         })?;
         let out_ptr = out_storage.device_ptr.ok_or_else(|| {
             Error::Backend("fused_dequant_gemm_mxfp4: out has no device ptr".into())
@@ -7947,25 +7941,44 @@ impl RocmDevice {
     }
 
     /// Launch the JIT compiled tiled MXFP4 GEMM kernel.
+    ///
+    /// `b_codes_ptr` / `b_exps_ptr` are raw device pointers: either standalone
+    /// storages or interior pointers into a framed weight blob (see the
+    /// `MxFp4` arm of `quantized_matmul`).
     pub fn launch_mxfp4_gemm_tiled(
         &self,
         a_storage: &RocmStorage,
-        b_codes_storage: &RocmStorage,
-        b_exps_storage: &RocmStorage,
+        b_codes_ptr: u64,
+        b_exps_ptr: u64,
         out_storage: &RocmStorage,
         m: usize,
         n: usize,
         k: usize,
     ) -> Result<*mut c_void> {
+        // The kernels read activations as float4 and codes as uint4; both
+        // require K to be a multiple of 32 (one MXFP4 micro-block).
+        if k % 32 != 0 {
+            return Err(Error::Backend(format!(
+                "mxfp4_gemm_tiled: K must be a multiple of 32, got {k}"
+            )));
+        }
+        // Skinny-M decode: a plain (n/16, m/16) grid leaves most CUs idle
+        // (e.g. m=1, n=4096 -> 16 CTAs on a 28+ CU part). Route to the
+        // split-K pair so the K dimension spreads work across the device.
+        if m <= 8 && k >= 2048 {
+            return self.launch_mxfp4_gemm_splitk(
+                a_storage,
+                b_codes_ptr,
+                b_exps_ptr,
+                out_storage,
+                m,
+                n,
+                k,
+            );
+        }
         let a_ptr = a_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("mxfp4_gemm_tiled: a has no device ptr".into()))?;
-        let b_codes_ptr = b_codes_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("mxfp4_gemm_tiled: b_codes has no device ptr".into()))?;
-        let b_exps_ptr = b_exps_storage
-            .device_ptr
-            .ok_or_else(|| Error::Backend("mxfp4_gemm_tiled: b_exps has no device ptr".into()))?;
         let out_ptr = out_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("mxfp4_gemm_tiled: out has no device ptr".into()))?;
@@ -7997,6 +8010,94 @@ impl RocmDevice {
                 arg(&mut kk),
             ],
         )
+    }
+
+    /// Split-K MXFP4 GEMM for skinny-M decode (M <= 8): slice K across CUs,
+    /// reduce the partials deterministically. Kept as two launches so the
+    /// result is bit-stable across runs (no float atomics).
+    fn launch_mxfp4_gemm_splitk(
+        &self,
+        a_storage: &RocmStorage,
+        b_codes_ptr: u64,
+        b_exps_ptr: u64,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mxfp4_gemm_splitk: a has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mxfp4_gemm_splitk: out has no device ptr".into()))?;
+
+        let num_splits: u32 = if k >= 8192 { 8 } else if k >= 4096 { 4 } else { 2 };
+        let partials = RocmStorage::alloc_gpu(
+            &Shape::from_slice(&[num_splits as usize, m, n]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let partials_ptr = partials
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mxfp4_gemm_splitk: partials alloc failed".into()))?;
+
+        const SPLITK_BLOCK: usize = 64;
+        let grid_dim = HipDim3::new(
+            ((n + SPLITK_BLOCK - 1) / SPLITK_BLOCK) as u32,
+            m as u32,
+            num_splits,
+        );
+        let block_dim = HipDim3::new(SPLITK_BLOCK as u32, 1, 1);
+
+        let mut aptr = a_ptr;
+        let mut bcodesptr = b_codes_ptr;
+        let mut bexpsptr = b_exps_ptr;
+        let mut pptr = partials_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut splits = num_splits as i32;
+
+        let stream = self.launch_compute_kernel(
+            "grim_mxfp4_gemm_splitk",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bcodesptr),
+                arg(&mut bexpsptr),
+                arg(&mut pptr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut splits),
+            ],
+        )?;
+
+        const REDUCE_BLOCK: usize = 256;
+        let total = m * n;
+        let reduce_grid = HipDim3::new(((total + REDUCE_BLOCK - 1) / REDUCE_BLOCK) as u32, 1, 1);
+        let reduce_block = HipDim3::new(REDUCE_BLOCK as u32, 1, 1);
+
+        let mut optr = out_ptr;
+        let _ = self.launch_compute_kernel(
+            "grim_mxfp4_splitk_reduce",
+            reduce_grid,
+            reduce_block,
+            &mut [
+                arg(&mut pptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut splits),
+            ],
+        )?;
+
+        // `partials` drops to the pool here; same-stream reuse is ordered
+        // after both kernels above.
+        Ok(stream)
     }
 
     /// Launch the JIT compiled backward MXFP4 GEMM kernel (dA = dY @ B^T).
@@ -8276,8 +8377,12 @@ impl RocmDevice {
         // Phase 1: MXFP4 GEMM -> gemm_out (C = x @ W_qkv)
         self.launch_mxfp4_gemm_tiled(
             x_storage,
-            w_codes_storage,
-            w_exps_storage,
+            w_codes_storage
+                .device_ptr_u64()
+                .ok_or_else(|| Error::Backend("fused_mxfp4_gemm_qk_norm_rope_kv: codes ptr".into()))?,
+            w_exps_storage
+                .device_ptr_u64()
+                .ok_or_else(|| Error::Backend("fused_mxfp4_gemm_qk_norm_rope_kv: exps ptr".into()))?,
             gemm_storage,
             m,
             n_total,
@@ -8337,20 +8442,14 @@ impl RocmDevice {
             ],
         )?;
 
-        // Free the transient scratch buffer after the work completes.
-        if scratch.is_some() {
-            unsafe {
-                if self.active_capture_stream().is_none() {
-                    let _ = hipStreamSynchronize(
-                        stream
-                            .as_ref()
-                            .map(|_| self.active_stream())
-                            .unwrap_or(std::ptr::null_mut()),
-                    );
-                }
-                hipFree(gemm_ptr as *mut c_void);
-            }
-        }
+        // The transient scratch buffer returns to the caching allocator when
+        // `scratch` drops at scope exit. The previous code additionally
+        // hipFree'd the pointer by hand — a double free that also corrupted
+        // the pool's bookkeeping (the allocator hands the same address to a
+        // future allocation) — after a hipStreamSynchronize stall. Pooled
+        // reuse is ordered by the single active stream, so neither the sync
+        // nor the manual free is needed.
+        drop(scratch);
 
         Ok(stream)
     }
@@ -9239,6 +9338,22 @@ impl RocmDevice {
     /// Store empirically discovered winning tile configuration into the autotuner cache.
     /// `winner_ms` is the measured GPU time of the winning candidate; persisted as
     /// `cycles_per_invocation` (ns-scale u64) so cached entries carry the measurement.
+    /// Intern `s` as a `&'static str`, leaking each unique value exactly once.
+    fn intern_str(&self, s: &str) -> &'static str {
+        if let Ok(mut set) = self.str_interner.lock() {
+            if let Some(existing) = set.get(s) {
+                return existing;
+            }
+            let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
+            set.insert(leaked);
+            leaked
+        } else {
+            // Poisoned interner: fall back to a one-shot leak (correctness
+            // over boundedness).
+            Box::leak(s.to_string().into_boxed_str())
+        }
+    }
+
     pub fn store_tune_cache(
         &self,
         entry: &str,
@@ -9248,11 +9363,10 @@ impl RocmDevice {
         winner_ms: f64,
     ) {
         let mut autotuner = self.autotuner.lock().unwrap();
-        // The in-memory KernelKey uses &'static str (Copy HashMap key). Leak the runtime
-        // strings to obtain 'static lifetime — bounded by unique (entry, arch) pairs, then
-        // cache hits; matches the from_json interning pattern in autotune.rs.
-        let arch_leak: &'static str = Box::leak(self.gpu_target.clone().into_boxed_str());
-        let entry_leak: &'static str = Box::leak(entry.to_string().into_boxed_str());
+        // &'static str keys via the interner — one leak per unique
+        // (entry, arch) pair, not per call.
+        let arch_leak: &'static str = self.intern_str(&self.gpu_target);
+        let entry_leak: &'static str = self.intern_str(entry);
         let key = crate::autotune::KernelKey {
             kernel: entry_leak,
             gpu_arch: arch_leak,
@@ -9286,9 +9400,9 @@ impl RocmDevice {
         dims: crate::kernels::tile_picker::ShapeDims,
         shape_class: crate::autotune::ShapeClass,
     ) -> crate::kernels::tile_picker::TileConfig {
-        // Same &'static-str interning as store_tune_cache — bounded by unique (entry, arch).
-        let arch_leak: &'static str = Box::leak(self.gpu_target.clone().into_boxed_str());
-        let entry_leak: &'static str = Box::leak(entry.to_string().into_boxed_str());
+        // Same interning as store_tune_cache — one leak per unique (entry, arch).
+        let arch_leak: &'static str = self.intern_str(&self.gpu_target);
+        let entry_leak: &'static str = self.intern_str(entry);
         let key = crate::autotune::KernelKey {
             kernel: entry_leak,
             gpu_arch: arch_leak,
@@ -9425,6 +9539,10 @@ impl RocmDevice {
             )?;
 
             let handle = self.get_rocblas_handle()?;
+            // Bind the rocBLAS handle to the active stream so GEMM executes on the
+            // correct stream and the returned ComputeHandle synchronizes correctly.
+            // [P0-17 fix: previously missing — caused sync-lie and split-K race.]
+            let _ = unsafe { rocblas_set_stream(handle, self.active_stream()) };
             let alpha: f32 = 1.0f32;
             let beta: f32 = 0.0f32;
 
@@ -9468,7 +9586,7 @@ impl RocmDevice {
                     split_k_effective as RocblasInt,
                     compute_type,
                     select_gemm_algo(solution_index),
-                    0,
+                    solution_index,
                     ROCBLAS_GEMM_FLAGS_NONE,
                 )
             };
@@ -9541,10 +9659,9 @@ impl RocmDevice {
 
         // In ROCm/rocBLAS (column-major), row-major C[M,N] = A[M,K] @ B[K,N] is
 
-        let use_gemm_ex = cfg!(feature = "rocm-aiter") || {
-            let gcn = std::env::var("GRIM_GPU_TARGET").unwrap_or_else(|_| "gfx900".into());
-            gcn == "gfx90a" || gcn == "gfx942"
-        };
+        let use_gemm_ex = cfg!(feature = "rocm-aiter")
+            || self.gpu_target == "gfx90a"
+            || self.gpu_target == "gfx942";
 
         unsafe {
             let status = if use_gemm_ex
@@ -9637,6 +9754,41 @@ impl RocmDevice {
         solution_index: Option<i32>,
         shared_mem_bytes: usize,
     ) -> Result<*mut c_void> {
+        // Fast path: a previously resolved hipFunction for this
+        // (entry, grid-shape) launches directly — no source rebuild, no
+        // seahash, no CString, no module-cache walk. This is the repeat
+        // case for every elementwise/norm/attention kernel on the decode
+        // hot path. `solution_index` only names the on-disk hsaco cache
+        // entry; it never changes the compiled function.
+        let fast_key = (entry.to_string(), grid.x, grid.y);
+        let cached_func: Option<*mut c_void> = self
+            .resolved_kernel_cache
+            .lock()
+            .ok()
+            .and_then(|c| c.get(&fast_key).copied());
+        if let Some(func) = cached_func {
+            if !func.is_null() {
+                let stream = self.active_stream();
+                let args_ptr = args.as_mut_ptr();
+                check_hip("hipModuleLaunchKernel (cached)", unsafe {
+                    hipModuleLaunchKernel(
+                        func,
+                        grid.x,
+                        grid.y,
+                        grid.z,
+                        block.x,
+                        block.y,
+                        block.z,
+                        shared_mem_bytes as u32,
+                        stream,
+                        args_ptr,
+                        std::ptr::null_mut(),
+                    )
+                })?;
+                return Ok(stream);
+            }
+        }
+
         // Build the kernel source. Under `jit-hw-adaptive`, inject hardware-specific #defines
         // (wavefront/LDS/CU + tile geometry) via `compute_kernel_source_with_spec` and route the
         // compile through the fingerprinted `jit_compile_or_cache`. Otherwise fall back to the
@@ -9710,7 +9862,11 @@ impl RocmDevice {
         let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut module_cache = self.module_cache.lock().unwrap();
         let (_module, func) = if let Some(cached) = module_cache.get(&cache_key) {
-            *cached
+            let (m, f) = *cached;
+            if let Ok(mut fast) = self.resolved_kernel_cache.lock() {
+                fast.insert(fast_key, f);
+            }
+            (m, f)
         } else {
             let mut module: *mut c_void = std::ptr::null_mut();
             let load_res = unsafe { hipModuleLoad(&mut module, path_c.as_ptr()) };
@@ -9734,6 +9890,9 @@ impl RocmDevice {
             }
             self.module_load_count.fetch_add(1, Ordering::SeqCst);
             module_cache.insert(cache_key, (module, func));
+            if let Ok(mut fast) = self.resolved_kernel_cache.lock() {
+                fast.insert(fast_key, func);
+            }
             (module, func)
         };
         drop(module_cache);
@@ -10073,7 +10232,8 @@ impl RocmDevice {
         let mut row_len_i = row_len as i32;
         let mut eps_f = eps;
         let mut total_i = total as i32;
-        let (grid, block) = linear_launch(total);
+        // grim_add_rms_norm is warp-per-row (32 lanes reduce with shuffles).
+        let (grid, block) = warp_rows_launch(total / row_len.max(1));
         self.launch_compute_kernel(
             "grim_add_rms_norm",
             grid,
@@ -10996,11 +11156,12 @@ impl RocmDevice {
         b_storage: &RocmStorage,
         c_storage: &RocmStorage,
         d_storage: &RocmStorage,
+        state_storage: &RocmStorage,
         out_storage: &RocmStorage,
         batch: usize,
         dim_dstate: usize,
         dim_dinner: usize,
-        seq_len: usize,
+        _seq_len: usize,
     ) -> Result<*mut c_void> {
         let x_ptr = x_storage
             .device_ptr
@@ -11017,6 +11178,9 @@ impl RocmDevice {
         let d_ptr = d_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("selective_scan: d has no device ptr".into()))?;
+        let state_ptr = state_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("selective_scan: state has no device ptr".into()))?;
         let out_ptr = out_storage
             .device_ptr
             .ok_or_else(|| Error::Backend("selective_scan: out has no device ptr".into()))?;
@@ -11031,33 +11195,41 @@ impl RocmDevice {
         let grid_dim = HipDim3::new(grid_x, 1, 1);
         let block_dim = HipDim3::new(BLOCK_SIZE as u32, 1, 1);
 
-        let mut xptr = x_ptr;
-        let mut aptr = a_ptr;
-        let mut bptr = b_ptr;
-        let mut cptr = c_ptr;
-        let mut dptr = d_ptr;
-        let mut optr = out_ptr;
-        let mut b_val = batch as i32;
-        let mut d_val = dim_dstate as i32;
-        let mut dd_val = dim_dinner as i32;
-        let mut s_val = seq_len as i32;
+        // Kernel signature: (a_log, b_tensor, c_tensor, d_tensor, dt_tensor,
+        //                    h_in_out, x_tensor, y_data, batch_index, d_inner, d_state)
+        let mut a_log_ptr = a_ptr;
+        let mut b_tensor_ptr = b_ptr;
+        let mut c_tensor_ptr = c_ptr;
+        let mut d_tensor_ptr = d_ptr;
+        let mut dt_tensor_ptr = d_ptr; // dt_bias passed as d_storage
+        let mut h_in_out_ptr = state_ptr; // state buffer (read prev, write new)
+        let mut x_tensor_ptr = x_ptr;
+        let mut y_data_ptr = out_ptr; // output buffer
+        let mut batch_index = batch as i32;
+        let mut d_inner = dim_dinner as i32;
+        let mut d_state = dim_dstate as i32;
 
-        self.launch_compute_kernel(
+        let shared_mem_bytes = dim_dstate * BLOCK_SIZE * std::mem::size_of::<f32>();
+
+        self.launch_compute_kernel_with_solution(
             "grim_selective_scan",
             grid_dim,
             block_dim,
             &mut [
-                arg(&mut xptr),
-                arg(&mut aptr),
-                arg(&mut bptr),
-                arg(&mut cptr),
-                arg(&mut dptr),
-                arg(&mut optr),
-                arg(&mut b_val),
-                arg(&mut d_val),
-                arg(&mut dd_val),
-                arg(&mut s_val),
+                arg(&mut a_log_ptr),
+                arg(&mut b_tensor_ptr),
+                arg(&mut c_tensor_ptr),
+                arg(&mut d_tensor_ptr),
+                arg(&mut dt_tensor_ptr),
+                arg(&mut h_in_out_ptr),
+                arg(&mut x_tensor_ptr),
+                arg(&mut y_data_ptr),
+                arg(&mut batch_index),
+                arg(&mut d_inner),
+                arg(&mut d_state),
             ],
+            None,
+            shared_mem_bytes,
         )
     }
 

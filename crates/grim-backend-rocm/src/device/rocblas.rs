@@ -25,20 +25,24 @@ pub type RocblasInt = i32;
 /// Opaque rocBLAS handle. rocBLAS handles are thread-safe per the lib docs.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy)]
-pub struct RoclabsHandle(pub *mut c_void);
+pub struct RocblasHandle(pub *mut c_void);
 
-unsafe impl Send for RoclabsHandle {}
-unsafe impl Sync for RoclabsHandle {}
+// NOTE: RocblasHandle is Send (can be moved between threads) but NOT Sync —
+// rocblas_set_stream mutates the handle's internal active-stream state, so
+// concurrent rocblas_gemm_ex calls from multiple threads sharing a handle can
+// execute a GEMM on the wrong stream. Callers must serialize access (e.g. via
+// Mutex) if sharing across threads.
+unsafe impl Send for RocblasHandle {}
 
 #[link(name = "rocblas", kind = "dylib")]
 unsafe extern "C" {
-    pub fn rocblas_create_handle(handle: *mut RoclabsHandle) -> Rocblstatus;
-    pub fn rocblas_destroy_handle(handle: RoclabsHandle) -> Rocblstatus;
-    pub fn rocblas_set_stream(handle: RoclabsHandle, stream: *mut c_void) -> Rocblstatus;
+    pub fn rocblas_create_handle(handle: *mut RocblasHandle) -> Rocblstatus;
+    pub fn rocblas_destroy_handle(handle: RocblasHandle) -> Rocblstatus;
+    pub fn rocblas_set_stream(handle: RocblasHandle, stream: *mut c_void) -> Rocblstatus;
 
     /// Special-case FP32 GEMM (16 args). Used by the FP32-only [see: `RocmDevice::matmul`, `gemm_ex`]
     pub fn rocblas_sgemm(
-        handle: RoclabsHandle,
+        handle: RocblasHandle,
         trans_a: RocblasOperation,
         trans_b: RocblasOperation,
         m: RocblasInt,
@@ -96,7 +100,7 @@ pub const ROCBLAS_GEMM_FLAGS_NONE: rocblas_gemm_flags = 0x0;
 unsafe extern "C" {
     // gemm_ex — signature matches rocBLAS exactly (29 args). Used by
     pub fn rocblas_gemm_ex(
-        handle: RoclabsHandle,
+        handle: RocblasHandle,
         trans_a: RocblasOperation,
         trans_b: RocblasOperation,
         m: RocblasInt,
@@ -124,7 +128,7 @@ unsafe extern "C" {
 
     // gemm_strided_batched_ex — 29 args, batch_count inserted before
     pub fn rocblas_gemm_strided_batched_ex(
-        handle: RoclabsHandle,
+        handle: RocblasHandle,
         trans_a: RocblasOperation,
         trans_b: RocblasOperation,
         m: RocblasInt,

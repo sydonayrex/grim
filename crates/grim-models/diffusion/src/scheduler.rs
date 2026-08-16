@@ -121,6 +121,10 @@ impl EulerScheduler {
         }
         let sigmas: Vec<f32> = cumprod.iter().map(|a| (1.0 - a).max(0.0).sqrt()).collect();
         alphas.clear();
+        // timesteps descend (N-1..0); sigmas must be in the same order so that
+        // the first denoising step (largest timestep) uses the largest sigma.
+        // [P1-35 fix: reverse sigmas to match descending timesteps.]
+        sigmas.reverse();
         let timesteps: Vec<u32> = (0..cumprod.len() as u32).rev().collect();
         Self { sigmas, timesteps }
     }

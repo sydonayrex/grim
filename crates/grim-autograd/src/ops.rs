@@ -756,15 +756,9 @@ pub fn lora_backward(
     let out_features = b_dims[0];
 
     if matches!(x.device(), grim_tensor::Device::Rocm(_)) {
-        let transpose_matrix = |v: &[f32], rows: usize, cols: usize| -> Vec<f32> {
-            let mut out = vec![0.0f32; rows * cols];
-            for r in 0..rows {
-                for c in 0..cols {
-                    out[c * rows + r] = v[r * cols + c];
-                }
-            }
-            out
-        };
+        // ROCm path: keep transposes on-device via transpose_f32_2d instead of
+        // round-tripping to host (D2H + transpose + H2D) for every operand.
+        // [P1-16 fix: on-device transpose eliminates 3 D2H/H2D round trips.]
 
         let b_storage = if matches!(b.device(), grim_tensor::Device::Rocm(_)) {
             b.storage().clone()
@@ -778,9 +772,19 @@ pub fn lora_backward(
             Arc::from(dev.from_cpu(&a_vec, a.shape(), DType::F32)?)
         };
 
-        let a_t_vec = transpose_matrix(&a_vec, rank, in_features);
-        let a_t_storage =
-            dev.from_cpu(&a_t_vec, &Shape::new(vec![in_features, rank]), DType::F32)?;
+        // a_t = transpose(a) on device: [rank, in_features] -> [in_features, rank]
+        let a_t_storage = match a_storage.as_ref().as_any().downcast_ref::<
+            grim_backend_rocm::RocmStorage,
+        >() {
+            Some(rocm_a) => {
+                dev.transpose_f32_2d(rocm_a, rank, in_features)?
+            }
+            None => dev.from_cpu(
+                &transpose_matrix(&a_vec, rank, in_features),
+                &Shape::new(vec![in_features, rank]),
+                DType::F32,
+            )?
+        };
         let (h_storage, _) = dev.matmul(
             x.storage().as_ref(),
             a_t_storage.as_ref(),
@@ -795,9 +799,19 @@ pub fn lora_backward(
         let (dh_storage, _) =
             dev.mul_scalar(dh_unscaled.as_ref(), scale, &Shape::new(vec![batch, rank]))?;
 
-        let g_t_vec = transpose_matrix(&g_vec, batch, out_features);
-        let g_t_storage =
-            dev.from_cpu(&g_t_vec, &Shape::new(vec![out_features, batch]), DType::F32)?;
+        // g_t = transpose(g) on device: [batch, out_features] -> [out_features, batch]
+        let g_t_storage = match out_grad.storage().as_ref().as_any().downcast_ref::<
+            grim_backend_rocm::RocmStorage,
+        >() {
+            Some(rocm_g) => {
+                dev.transpose_f32_2d(rocm_g, batch, out_features)?
+            }
+            None => dev.from_cpu(
+                &transpose_matrix(&g_vec, batch, out_features),
+                &Shape::new(vec![out_features, batch]),
+                DType::F32,
+            )?
+        };
         let (db_unscaled, _) = dev.matmul(
             g_t_storage.as_ref(),
             h_storage.as_ref(),
@@ -809,9 +823,19 @@ pub fn lora_backward(
             &Shape::new(vec![out_features, rank]),
         )?;
 
-        let dh_vec_gpu = dh_storage.to_cpu_vec_f32()?;
-        let dh_t_vec = transpose_matrix(&dh_vec_gpu, batch, rank);
-        let dh_t_storage = dev.from_cpu(&dh_t_vec, &Shape::new(vec![rank, batch]), DType::F32)?;
+        // dh_t = transpose(dh) on device: [batch, rank] -> [rank, batch]
+        let dh_t_storage = match dh_storage.as_any().downcast_ref::<
+            grim_backend_rocm::RocmStorage,
+        >() {
+            Some(rocm_dh) => {
+                dev.transpose_f32_2d(rocm_dh, batch, rank)?
+            }
+            None => dev.from_cpu(
+                &transpose_matrix(&dh_storage.to_cpu_vec_f32()?, batch, rank),
+                &Shape::new(vec![rank, batch]),
+                DType::F32,
+            )?
+        };
         let (da_storage, _) = dev.matmul(
             dh_t_storage.as_ref(),
             x.storage().as_ref(),
@@ -1846,5 +1870,81 @@ mod tests {
         let out_grad = tensor(vec![1.0], vec![1, 1]);
         let codebook = vec![vec![3.0, 0.0], vec![1.0]];
         assert!(vera_backward(&out_grad, &x, &a, &b, &codebook, 1.0).is_err());
+    }
+
+    /// Sanity check for DoRA backward: verifies gradients are produced with
+    /// correct shapes and non-zero values (catches catastrophic sign/zero bugs).
+    /// [P1-17 fix: add basic coverage for dora_backward.]
+    #[test]
+    fn dora_backward_sanity() {
+        let in_features = 4;
+        let out_features = 3;
+        let rank = 2;
+        let batch = 1;
+
+        let x = tensor(
+            (0..in_features).map(|i| (i as f32 + 1.0) / 10.0).collect::<Vec<f32>>(),
+            &Shape::new(vec![batch, in_features]),
+        );
+        let w_base = tensor(
+            (0..out_features * in_features)
+                .map(|i| (i as f32 + 1.0) / 100.0)
+                .collect::<Vec<f32>>(),
+            &Shape::new(vec![out_features, in_features]),
+        );
+        let a = tensor(
+            (0..rank * in_features)
+                .map(|i| (i as f32 + 1.0) / 50.0)
+                .collect::<Vec<f32>>(),
+            &Shape::new(vec![rank, in_features]),
+        );
+        let b = tensor(
+            (0..rank * out_features)
+                .map(|i| (i as f32 + 1.0) / 50.0)
+                .collect::<Vec<f32>>(),
+            &Shape::new(vec![rank, out_features]),
+        );
+        let m = tensor(
+            (0..in_features)
+                .map(|i| 0.5 + (i as f32) * 0.1)
+                .collect::<Vec<f32>>(),
+            &Shape::new(vec![batch, in_features]),
+        );
+        let scale = 1.0;
+        let out_grad = tensor(
+            (0..out_features * batch).map(|i| 1.0).collect::<Vec<f32>>(),
+            &Shape::new(vec![batch, out_features]),
+        );
+
+        let (_, grad_w, grad_a, grad_b, grad_m) = dora_backward(&out_grad, &x, &w_base, &a, &b, &m, scale)?;
+
+        // Shape checks
+        assert_eq!(grad_w.shape().dims(), vec![out_features, in_features]);
+        assert_eq!(grad_a.shape().dims(), vec![rank, in_features]);
+        assert_eq!(grad_b.shape().dims(), vec![rank, out_features]);
+        assert_eq!(grad_m.shape().dims(), vec![batch, in_features]);
+
+        // Non-zero gradient check (catches catastrophic zeroing bugs)
+        let gw = grad_w.to_vec_f32().unwrap();
+        let ga = grad_a.to_vec_f32().unwrap();
+        let gb = grad_b.to_vec_f32().unwrap();
+        let gm = grad_m.to_vec_f32().unwrap();
+
+        assert!(
+            gw.iter().any(|&v| v.abs() > 1e-6),
+            "grad_w is all zeros — likely a sign/zero bug"
+        );
+        assert!(
+            ga.iter().any(|&v| v.abs() > 1e-6),
+            "grad_a is all zeros — likely a sign/zero bug"
+        );
+        assert!(
+            gb.iter().any(|&v| v.abs() > 1e-6),
+            "grad_b is all zeros — likely a sign/zero bug"
+        );
+        assert!(
+            gm.iter().any(|&v| v.abs() > 1e-6),
+            "grad_m is all zeros — likely a sign/zero bug"
+        );
     }
 }

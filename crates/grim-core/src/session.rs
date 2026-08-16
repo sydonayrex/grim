@@ -46,7 +46,7 @@ pub trait SessionT: Send {
     fn paged_kv_handles(&self, _layer: usize) -> Option<(Tensor, Tensor, usize)> {
         None
     }
-    fn rollback_kv_to(&mut self, len: usize);
+    fn rollback_kv_to(&mut self, len: usize) -> Result<()>;
     // Graph capture / replay hooks for §4.1 ROCm execution optimization
     fn get_hip_graph_handle(&self) -> Option<u64> {
         None
@@ -196,9 +196,11 @@ impl SessionT for Inner {
             .as_deref()
             .and_then(|kv| kv.paged_kv_handles(layer))
     }
-    fn rollback_kv_to(&mut self, len: usize) {
+    fn rollback_kv_to(&mut self, len: usize) -> Result<()> {
         if let Some(kv) = self.kv.as_deref_mut() {
-            let _ = kv.rollback_to(len);
+            kv.rollback_to(len)
+        } else {
+            Ok(())
         }
     }
     fn get_hip_graph_handle(&self) -> Option<u64> {

@@ -187,6 +187,12 @@ impl Drop for HostStagingBuffer {
 use crate::{HipMemcpyKind, hipHostFree, hipHostMalloc, hipMemcpyAsync};
 
 /// Performs inter-device copy routing either via direct peer copies or host bounce staging.
+///
+/// Host-bounce staging buffers are cached per stream: a D2H+H2D pair is
+/// enqueued on `stream`, so the next bounce on the SAME stream is
+/// queue-ordered after it and can safely reuse the pinned buffer. This
+/// removes a `hipHostMalloc`/`hipHostFree` pair (~ms each) from every
+/// bounced copy — the per-token cost of peer-denied TP routing.
 pub fn copy_route(
     src_device: i32,
     dst_device: i32,
@@ -201,7 +207,7 @@ pub fn copy_route(
             crate::rccl::p2p_memcpy_async(dst_ptr, dst_device, src_ptr, src_device, len, stream)?;
         }
         RouteLink::HostBounce => {
-            let staging = HostStagingBuffer::new(len)?;
+            let staging = take_staging(stream, len)?;
             crate::device::helpers::check_hip("copy_route: D2H copy to staging", unsafe {
                 hipMemcpyAsync(
                     staging.as_device_ptr(),
@@ -223,6 +229,85 @@ pub fn copy_route(
         }
     }
     Ok(())
+}
+
+/// Cached pinned staging buffer, reused across host-bounce copies on one
+/// stream. `None` until the first bounce; grown when a larger transfer
+/// arrives. A bounce on a different stream gets a fresh one-shot buffer
+/// (concurrent streams must not share staging without an event fence).
+struct StagingCache {
+    stream: *mut c_void,
+    buf: HostStagingBuffer,
+}
+// SAFETY: the cache holds a raw stream handle and a pinned buffer explicitly
+// marked Send+Sync by HostStagingBuffer; access is serialized by the mutex.
+unsafe impl Send for StagingCache {}
+unsafe impl Sync for StagingCache {}
+
+static STAGING_CACHE: std::sync::Mutex<Option<StagingCache>> = std::sync::Mutex::new(None);
+
+/// Staging memory pinned for the duration of one bounce. Holds the cache
+/// lock so a concurrent regrow cannot free the buffer mid-enqueue; the lock
+/// is only held across two async enqueue calls (microseconds), and
+/// same-stream bounces serialize on the stream regardless.
+struct StagingGuard<'a> {
+    _lock: std::sync::MutexGuard<'a, Option<StagingCache>>,
+    _one_shot: Option<HostStagingBuffer>,
+    ptr: *mut c_void,
+}
+
+impl StagingGuard<'_> {
+    fn as_device_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+}
+
+/// Obtain staging memory for a bounce on `stream`: the cached buffer when
+/// the stream matches and capacity suffices, a regrown replacement when a
+/// bigger same-stream transfer arrives, otherwise a one-shot allocation.
+fn take_staging(stream: *mut c_void, len: usize) -> Result<StagingGuard<'static>> {
+    let mut guard = STAGING_CACHE
+        .lock()
+        .map_err(|_| Error::Backend("staging cache mutex poisoned".into()))?;
+    let reuse_cached = guard
+        .as_ref()
+        .is_some_and(|c| c.stream == stream && c.buf.size() >= len);
+    if reuse_cached {
+        // SAFETY: the lock is held for the whole lease, so the buffer cannot
+        // be swapped out or freed underneath us; same-stream reuse is
+        // additionally queue-ordered by `stream` itself.
+        let ptr = unsafe { std::ptr::NonNull::new_unchecked(guard.as_ref().unwrap().buf.as_device_ptr()) }.as_ptr();
+        return Ok(StagingGuard {
+            _lock: guard,
+            _one_shot: None,
+            ptr,
+        });
+    }
+    let fresh = HostStagingBuffer::new(len)?;
+    let ptr = fresh.as_device_ptr();
+    let same_stream_grow = guard
+        .as_ref()
+        .is_some_and(|c| c.stream == stream && c.buf.size() < len);
+    if same_stream_grow || guard.is_none() {
+        // First use, or a larger transfer on the same stream: (re)seed the
+        // cache so subsequent bounces reuse this allocation.
+        *guard = Some(StagingCache { stream, buf: fresh });
+        Ok(StagingGuard {
+            _lock: guard,
+            _one_shot: None,
+            ptr,
+        })
+    } else {
+        // Different stream: one-shot buffer, freed when the leases drops.
+        // The enqueued D2H+H2D pair completes before the free only because
+        // the caller's stream drains; callers own that ordering (same
+        // contract as the previous per-call allocation).
+        Ok(StagingGuard {
+            _lock: guard,
+            _one_shot: Some(fresh),
+            ptr,
+        })
+    }
 }
 
 #[cfg(test)]

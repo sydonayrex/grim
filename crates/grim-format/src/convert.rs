@@ -531,7 +531,8 @@ fn convert_to_grim_inner(
     let evopress_bitwidths = if generations > 0 && evopress_bitwidths.is_none() {
         let provider = crate::tprov::GgufProvider::open(input_path)
             .map_err(|e| Error::Backend(format!("failed to open GGUF for EvoPress: {e}")))?;
-        let tensor_names: Vec<String> = provider.tensors().keys().cloned().collect();
+        let mut tensor_names: Vec<String> = provider.tensors().keys().cloned().collect();
+        tensor_names.sort();
         let mut tensor_data: Vec<(String, Vec<f32>, usize, usize)> =
             Vec::with_capacity(tensor_names.len());
         for name in &tensor_names {
@@ -707,7 +708,8 @@ fn build_entries_from_source(
     let lower = input_path.to_ascii_lowercase();
     if lower.ends_with(".gguf") || lower.ends_with(".grim") {
         let provider = crate::tprov::GgufProvider::open(input_path)?;
-        let names: Vec<String> = provider.tensors().keys().cloned().collect();
+        let mut names: Vec<String> = provider.tensors().keys().cloned().collect();
+        names.sort();
         pack_tensors(
             &provider,
             &names,
@@ -719,7 +721,8 @@ fn build_entries_from_source(
         )
     } else if lower.ends_with(".safetensors") || lower.ends_with(".bin") {
         let provider = crate::tprov::SafetensorsProvider::open(input_path)?;
-        let names: Vec<String> = provider.tensors().keys().cloned().collect();
+        let mut names: Vec<String> = provider.tensors().keys().cloned().collect();
+        names.sort();
         pack_tensors(
             &provider,
             &names,

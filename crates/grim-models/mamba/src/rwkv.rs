@@ -251,13 +251,17 @@ impl RwkvBlock {
         )?;
         let tm_data = tm_out.to_cpu_vec_f32()?;
 
-        let x_res1 = add_tensors(x, &att_out).map_err(grim_core::Error::Tensor)?;
+        // Use time-mix output (tm_data) in the residual, not att_out.
+        // [P1-32 fix: use tm_data in residual.]
+        let x_res1 = add_tensors(x, &cpu_tensor(tm_data, Shape::new(vec![1, dim]))).map_err(grim_core::Error::Tensor)?;
         let x_res1_data = x_res1.to_vec_f32()?;
 
         // Channel-mix: project through key/receptance/value weights.
+        // ffn_v must use its own weight (channel_mix_value), not ffn_k's.
+        // [P1-32 fix: ffn_v uses channel_mix_value weight.]
         let ffn_k = self.channel_mix_key.forward(&x_res1)?;
         let ffn_r = self.channel_mix_receptance.forward(&x_res1)?;
-        let ffn_v = self.channel_mix_value.forward(&ffn_k)?;
+        let ffn_v = self.channel_mix_value.forward(&x_res1)?;
 
         let x_res1_gpu = dev.from_cpu(
             &x_res1_data,
@@ -316,11 +320,15 @@ impl RwkvBlock {
         let att_out = self
             .time_mix_output
             .forward(&cpu_tensor(time_mix_in, Shape::new(vec![1, dim])))?;
+        // Use time-mix output in residual.
+        // [P1-32 fix: use tm_data in residual.]
         let x_res1 = add_tensors(x, &att_out).map_err(grim_core::Error::Tensor)?;
 
         let ffn_k = self.channel_mix_key.forward(&x_res1)?;
         let ffn_r = self.channel_mix_receptance.forward(&x_res1)?;
-        let ffn_v = self.channel_mix_value.forward(&ffn_k)?;
+        // ffn_v must use its own weight, not ffn_k's.
+        // [P1-32 fix: ffn_v uses channel_mix_value weight.]
+        let ffn_v = self.channel_mix_value.forward(&x_res1)?;
 
         let ffn_r_vec = ffn_r.to_vec_f32()?;
         let ffn_v_vec = ffn_v.to_vec_f32()?;
@@ -338,7 +346,10 @@ impl RwkvBlock {
 pub struct Rwkv {
     pub cfg: RwkvConfig,
     pub device: Device,
-    pub emb: Linear,
+    /// Embedding table: [vocab_size, hidden_size] stored as flat Vec.
+    /// Used as a gather (token_id -> row), NOT a Linear matrix multiply.
+    pub emb: Vec<f32>,
+    pub emb_shape: (usize, usize), // (vocab_size, hidden_size)
     pub layers: Vec<RwkvBlock>,
     pub ln_out: RmsNorm,
     pub head: Linear,
@@ -368,7 +379,18 @@ impl Rwkv {
              sharding needs a bespoke plan",
         )
         .map_err(grim_core::Error::Unimplemented)?;
-        let emb = Linear::load(&ws.pp("emb"), cfg.vocab_size, cfg.hidden_size, false)?;
+        let emb_weight = ws.get(&format!("{}.weight", ws.pp("emb")))?
+            .to_vec_f32()?;
+        // RWKV embedding is [vocab_size, hidden_size] — use as a gather table,
+        // NOT a Linear matrix multiply.
+        // [P1-32 fix: emb is an embedding table, not a Linear.]
+        if emb_weight.len() != cfg.vocab_size * cfg.hidden_size {
+            return Err(Error::Shape(format!(
+                "RWKV emb: expected {} elements, got {}",
+                cfg.vocab_size * cfg.hidden_size,
+                emb_weight.len()
+            )));
+        }
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             layers.push(RwkvBlock::load(
@@ -380,14 +402,14 @@ impl Rwkv {
         let ln_out = RmsNorm::load(&ws.pp("ln_out"), cfg.hidden_size, cfg.rms_norm_eps as f32)?;
         let head = Linear::load(&ws.pp("head"), cfg.hidden_size, cfg.vocab_size, false)?;
 
-        assert_weight_shape(&emb.weight, &[cfg.hidden_size, cfg.vocab_size], "emb")?;
         assert_weight_shape(&ln_out.weight, &[cfg.hidden_size], "ln_out")?;
         assert_weight_shape(&head.weight, &[cfg.vocab_size, cfg.hidden_size], "head")?;
 
         Ok(Self {
             cfg,
             device,
-            emb,
+            emb: emb_weight,
+            emb_shape: (cfg.vocab_size, cfg.hidden_size),
             layers,
             ln_out,
             head,
@@ -422,7 +444,21 @@ impl StatefulSequence for Rwkv {
             .as_any_mut()
             .downcast_mut::<RwkvState>()
             .ok_or_else(|| Error::Session("downcast failed".into()))?;
-        let emb_out = self.emb.forward(input)?;
+        // Embedding gather: for each token ID, look up the corresponding row
+        // in the embedding table. NOT a Linear matrix multiply.
+        // [P1-32 fix: emb is an embedding gather, not Linear forward.]
+        let input_ids = input.to_vec_f32()?;
+        let emb_rows: Vec<Vec<f32>> = input_ids
+            .iter()
+            .map(|&id| {
+                let idx = id as usize * self.emb_shape.1;
+                self.emb[idx..idx + self.emb_shape.1].to_vec()
+            })
+            .collect();
+        let emb_out = cpu_tensor(
+            emb_rows.iter().flatten().cloned().collect::<Vec<f32>>(),
+            &Shape::new(vec![input_ids.len(), self.emb_shape.1]),
+        );
         let mut h = emb_out;
         for layer in &self.layers {
             h = layer.step(&h, s)?;

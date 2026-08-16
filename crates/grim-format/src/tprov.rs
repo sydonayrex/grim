@@ -255,6 +255,14 @@ impl TensorProvider for GgufProvider {
         let type_size = gguf_dtype.type_size_per_block() as usize;
 
         if dim == 0 {
+            // Shard geometry must divide evenly — truncating produces wrong data.
+            // [P1-26 fix: error on non-divisible shard geometry.]
+            if out_dim % world_size != 0 {
+                return Err(Error::Backend(format!(
+                    "sharded tensor '{name}': out_dim {} not divisible by world_size {}",
+                    out_dim, world_size
+                )));
+            }
             let shard_rows = out_dim / world_size;
             let start_row = rank * shard_rows;
 
@@ -289,6 +297,14 @@ impl TensorProvider for GgufProvider {
             })
         } else {
             // dim == 1 (row-parallel: slice across columns)
+            // Shard geometry must divide evenly.
+            // [P1-26 fix: error on non-divisible shard geometry.]
+            if in_dim % world_size != 0 {
+                return Err(Error::Backend(format!(
+                    "sharded tensor '{name}': in_dim {} not divisible by world_size {}",
+                    in_dim, world_size
+                )));
+            }
             let shard_cols = in_dim / world_size;
             let blocks_per_rank_row = (shard_cols / block_size).max(1);
             let rank_row_bytes = blocks_per_rank_row * type_size;

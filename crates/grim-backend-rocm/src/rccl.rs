@@ -22,6 +22,11 @@ pub const NCCL_SUCCESS: NcclResult = 0;
 pub type NcclDataType = i32;
 pub const NCCL_FLOAT16: NcclDataType = 6;
 pub const NCCL_FLOAT32: NcclDataType = 7;
+/// `ncclBfloat16` — supported by RCCL shipped with ROCm 5.x+. Mapping BF16
+/// buffers to `NCCL_FLOAT16` instead would reinterpret the bits and corrupt
+/// every collective, so BF16 gets its real type (older RCCL builds return an
+/// error status we surface instead of silently producing garbage).
+pub const NCCL_BFLOAT16: NcclDataType = 9;
 
 pub type NcclRedOp = i32;
 pub const NCCL_SUM: NcclRedOp = 0;
@@ -186,7 +191,8 @@ impl RocmComm {
         #[cfg(feature = "rccl")]
         unsafe {
             let nccl_dtype = match dtype.arith {
-                grim_tensor::ArithType::F16 | grim_tensor::ArithType::BF16 => NCCL_FLOAT16,
+                grim_tensor::ArithType::F16 => NCCL_FLOAT16,
+                grim_tensor::ArithType::BF16 => NCCL_BFLOAT16,
                 grim_tensor::ArithType::F32 => NCCL_FLOAT32,
                 _ => {
                     return Err(Error::Backend(format!(
@@ -223,7 +229,8 @@ impl RocmComm {
         #[cfg(feature = "rccl")]
         unsafe {
             let nccl_dtype = match dtype.arith {
-                grim_tensor::ArithType::F16 | grim_tensor::ArithType::BF16 => NCCL_FLOAT16,
+                grim_tensor::ArithType::F16 => NCCL_FLOAT16,
+                grim_tensor::ArithType::BF16 => NCCL_BFLOAT16,
                 grim_tensor::ArithType::F32 => NCCL_FLOAT32,
                 _ => {
                     return Err(Error::Backend(format!(
@@ -262,7 +269,8 @@ impl RocmComm {
         #[cfg(feature = "rccl")]
         unsafe {
             let nccl_dtype = match dtype.arith {
-                grim_tensor::ArithType::F16 | grim_tensor::ArithType::BF16 => NCCL_FLOAT16,
+                grim_tensor::ArithType::F16 => NCCL_FLOAT16,
+                grim_tensor::ArithType::BF16 => NCCL_BFLOAT16,
                 grim_tensor::ArithType::F32 => NCCL_FLOAT32,
                 _ => {
                     return Err(Error::Backend(format!(
@@ -309,7 +317,8 @@ impl RocmComm {
         #[cfg(feature = "rccl")]
         unsafe {
             let nccl_dtype = match dtype.arith {
-                grim_tensor::ArithType::F16 | grim_tensor::ArithType::BF16 => NCCL_FLOAT16,
+                grim_tensor::ArithType::F16 => NCCL_FLOAT16,
+                grim_tensor::ArithType::BF16 => NCCL_BFLOAT16,
                 grim_tensor::ArithType::F32 => NCCL_FLOAT32,
                 _ => {
                     return Err(Error::Backend(format!(
@@ -382,7 +391,8 @@ impl RocmComm {
         #[cfg(feature = "rccl")]
         unsafe {
             let nccl_dtype = match dtype.arith {
-                grim_tensor::ArithType::F16 | grim_tensor::ArithType::BF16 => NCCL_FLOAT16,
+                grim_tensor::ArithType::F16 => NCCL_FLOAT16,
+                grim_tensor::ArithType::BF16 => NCCL_BFLOAT16,
                 grim_tensor::ArithType::F32 => NCCL_FLOAT32,
                 _ => {
                     return Err(Error::Backend(format!(
@@ -597,6 +607,7 @@ impl RcclAllReduce {
         recv_dev_ptr: u64,
         count: usize,
         stream: u64,
+        rank: usize,
     ) -> Result<()> {
         if self.num_gpus <= 1 || count == 0 {
             return Ok(());
@@ -605,7 +616,7 @@ impl RcclAllReduce {
         {
             let comm = self
                 .comms
-                .first()
+                .get(rank)
                 .copied()
                 .unwrap_or(NcclComm(std::ptr::null_mut()));
             if comm.0.is_null() {
@@ -638,9 +649,69 @@ impl RcclAllReduce {
         }
         #[cfg(not(feature = "rccl"))]
         {
-            let _ = (send_dev_ptr, recv_dev_ptr, count, stream);
+            let _ = (send_dev_ptr, recv_dev_ptr, count, stream, rank);
             Err(Error::Backend(
                 "RcclAllReduce::sum_gradients_device: multi-GPU RCCL \
+                 all-reduce requires the `rccl` feature flag"
+                    .into(),
+            ))
+        }
+    }
+
+    /// All-reduce device buffers of an explicit NCCL dtype on `rank`'s
+    /// communicator (used by the TP activation path for F16/BF16 tensors).
+    /// See `sum_gradients_device` for the F32 gradient special case.
+    pub fn all_reduce_device(
+        &self,
+        send_dev_ptr: u64,
+        recv_dev_ptr: u64,
+        count: usize,
+        nccl_dtype: NcclDataType,
+        stream: u64,
+        rank: usize,
+    ) -> Result<()> {
+        if self.num_gpus <= 1 || count == 0 {
+            return Ok(());
+        }
+        #[cfg(feature = "rccl")]
+        {
+            let comm = self
+                .comms
+                .get(rank)
+                .copied()
+                .unwrap_or(NcclComm(std::ptr::null_mut()));
+            if comm.0.is_null() {
+                return Err(Error::Backend(
+                    "RCCL communicator is unavailable for a multi-GPU reduction".into(),
+                ));
+            }
+            // SAFETY: send/recv must be valid device pointers for `count`
+            // elements of `nccl_dtype`; comm and stream are owned by the
+            // caller's device/rank pairing.
+            let status = unsafe {
+                ncclAllReduce(
+                    send_dev_ptr as *const c_void,
+                    recv_dev_ptr as *mut c_void,
+                    count,
+                    nccl_dtype,
+                    NCCL_SUM,
+                    comm,
+                    stream as *mut c_void,
+                )
+            };
+            if status != NCCL_SUCCESS {
+                return Err(Error::Backend(format!(
+                    "RcclAllReduce::all_reduce_device: ncclAllReduce failed (status {})",
+                    status,
+                )));
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "rccl"))]
+        {
+            let _ = (send_dev_ptr, recv_dev_ptr, count, nccl_dtype, stream, rank);
+            Err(Error::Backend(
+                "RcclAllReduce::all_reduce_device: multi-GPU RCCL \
                  all-reduce requires the `rccl` feature flag"
                     .into(),
             ))

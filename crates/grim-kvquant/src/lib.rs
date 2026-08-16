@@ -255,6 +255,11 @@ struct PackedKvBuf {
     value_bits_cfg: u8,
     key_bits_len: usize,
     value_bits_len: usize,
+    /// Content hashes for key/value bits — included in memo key to prevent
+    /// same-shape-but-different-content blocks from reusing stale packed bytes.
+    /// [P1-39 fix: content hash in PackedKvBuf.]
+    key_content_hash: u64,
+    value_content_hash: u64,
 }
 
 pub struct LloydMaxCompressor {
@@ -345,10 +350,22 @@ fn dispatch_gpu_fused_attention(
         8
     };
 
-    // Memo key — reuse packed buffers across decode steps (same block). The
-    // block's packed-byte Vec lengths reflect its identity too, so include them.
+    // Memo key — reuse packed buffers across decode steps (same block). Include
+    // a content hash so same-shape-but-different-content blocks don't reuse stale
+    // packed bytes. [P1-39 fix: content hash in memo key.]
+    use std::hash::{Hash, Hasher};
     let key_bits_len = block.key_bits.len();
     let value_bits_len = block.value_bits.len();
+    let key_content_hash = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        block.key_bits.hash(&mut h);
+        h.finish()
+    };
+    let value_content_hash = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        block.value_bits.hash(&mut h);
+        h.finish()
+    };
     let memo_hit = match compressor.packed_kv.lock() {
         Ok(g) => match g.as_ref() {
             Some(buf) => {
@@ -360,6 +377,8 @@ fn dispatch_gpu_fused_attention(
                     && buf.value_bits_cfg == cfg_value_bits
                     && buf.key_bits_len == key_bits_len
                     && buf.value_bits_len == value_bits_len
+                    && buf.key_content_hash == key_content_hash
+                    && buf.value_content_hash == value_content_hash
             }
             None => false,
         },
@@ -410,34 +429,22 @@ fn dispatch_gpu_fused_attention(
         storage: grim_tensor::Storage::Native,
     };
 
-    // Reinterpret the u8 packed bytes as &[f32] of equal *byte* length so
-    // `from_cpu` (which copies `len*4` bytes for f32) ships the exact u8
-    // bytes the kernel's `unsigned char*` reads.
+    // Ship the packed u8 bytes directly via from_cpu_bytes — reinterpreting as
+    // &[f32] with len = byte_count gives 4x the real element count (OOB read).
+    // [P0-20 fix: was `from_raw_parts(ptr as *const f32, packed.k_packed.len())`.]
     assert_eq!(
         k_packed_byte_len(&packed, quant_bits, kv_seq_len, num_kv_heads, head_dim),
         kv_byte_len
     );
-    let k_as_f32: &[f32] = unsafe {
-        std::slice::from_raw_parts(
-            packed.k_packed.as_ptr() as *const f32,
-            packed.k_packed.len(),
-        )
-    };
-    let v_as_f32: &[f32] = unsafe {
-        std::slice::from_raw_parts(
-            packed.v_packed.as_ptr() as *const f32,
-            packed.v_packed.len(),
-        )
-    };
 
     let q_storage: Arc<dyn BackendStorage> =
         Arc::from(device.from_cpu(&q_data, &q_shape, f32_dtype.clone())?);
     let k_storage: Arc<dyn BackendStorage> =
-        Arc::from(device.from_cpu(k_as_f32, &kv_shape, u8_dtype.clone())?);
+        Arc::from(device.from_cpu_bytes(&packed.k_packed, &kv_shape, u8_dtype.clone())?);
     let ks_storage: Arc<dyn BackendStorage> =
         Arc::from(device.from_cpu(&packed.k_scales, &scale_shape, f32_dtype.clone())?);
     let v_storage: Arc<dyn BackendStorage> =
-        Arc::from(device.from_cpu(v_as_f32, &kv_shape, u8_dtype.clone())?);
+        Arc::from(device.from_cpu_bytes(&packed.v_packed, &kv_shape, u8_dtype.clone())?);
     let vs_storage: Arc<dyn BackendStorage> =
         Arc::from(device.from_cpu(&packed.v_scales, &scale_shape, f32_dtype.clone())?);
 
@@ -545,6 +552,21 @@ fn pack_kv_buf(
     pack_row(&k_data, &mut k_packed, &mut k_scales);
     pack_row(&v_data, &mut v_packed, &mut v_scales);
 
+    // Content hashes for memo keying — include in PackedKvBuf so the memo key
+    // can distinguish same-shape-but-different-content blocks.
+    // [P1-39 fix: populate content hashes in pack_kv_buf.]
+    use std::hash::{Hash, Hasher};
+    let key_content_hash = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        block.key_bits.hash(&mut h);
+        h.finish()
+    };
+    let value_content_hash = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        block.value_bits.hash(&mut h);
+        h.finish()
+    };
+
     Ok(PackedKvBuf {
         k_packed,
         v_packed,
@@ -558,6 +580,8 @@ fn pack_kv_buf(
         value_bits_cfg: compressor.config.value_bits,
         key_bits_len: block.key_bits.len(),
         value_bits_len: block.value_bits.len(),
+        key_content_hash,
+        value_content_hash,
     })
 }
 

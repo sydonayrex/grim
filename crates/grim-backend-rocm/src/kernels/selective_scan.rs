@@ -22,12 +22,15 @@ extern "C" {
     }
 
     /// Single-step Mamba selective scan (decode-step). One thread per n dimension.
-    /// h_t[n,s] = a[n,s] * h_{t-1}[n,s] + dt * x_t[n] * b[n,s]
-    /// y[n] = sum_s(h_t[n,s]) + D[n] * x_t[n]
+    /// h_t[n,s] = a[n,s] * h_{t-1}[n,s] + dt[n] * x_t[n] * b[n,s]
+    /// y[n] = sum_s(c[n] * h_t[n,s]) + D[n] * x_t[n]
+    ///   c[n] broadcast across state dim (per-channel C, matching d_param shape [d_inner]).
     __global__ void grim_selective_scan(
         const float* __restrict__ a_log,       // [d_inner * d_state]  A = exp(a_log+1), pre-computed on host
         const float* __restrict__ b_tensor,    // [d_inner * d_state]  B parameter
+        const float* __restrict__ c_tensor,    // [d_inner]            C per-channel (broadcast across state)
         const float* __restrict__ d_tensor,    // [d_inner]            D bypass
+        const float* __restrict__ dt_tensor,   // [d_inner]            delta/dt per channel
         float* __restrict__ h_in_out,          // [batch * d_inner * d_state]  state (read prev, write new)
         const float* __restrict__ x_tensor,    // [batch * d_inner]     input x_t
         float* __restrict__ y_data,             // [batch * d_inner]     scan output accumulator
@@ -50,15 +53,17 @@ extern "C" {
 
         const float* a_row = a_log + n * d_state;
         const float* b_row = b_tensor + n * d_state;
+        float c_n = c_tensor[n];
         const float x_n = x_tensor[batch_index * d_inner + n];
+        float dt_n = dt_tensor[n];
         float y_accum = 0.0f;
 
         for (int s = 0; s < d_state; ++s) {
             float a = a_row[s];
             float h_prev = my_h[s];
-            float h_new = a * h_prev + x_n * b_row[s];
+            float h_new = a * h_prev + dt_n * x_n * b_row[s];
             my_h[s] = h_new;
-            y_accum += h_new;
+            y_accum += c_n * h_new;
         }
 
         y_accum += d_tensor[n] * x_n;
