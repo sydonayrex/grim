@@ -204,7 +204,7 @@ impl MambaBlock {
             // MOD-1 fix: `b_param` (the SSM B matrix) must never be aliased to
             // `a_log` (the A log-weights). Substitifying them produces a
             // completely different, silent recurrence. Fail loudly instead.
-            return Err(Error::Backend(
+            return Err(Error::Unimplemented(
                 "Mamba step_block_gpu: b_param is empty; refusing to alias a_log as B".into(),
             ));
         }
