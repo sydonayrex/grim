@@ -196,7 +196,7 @@ impl ModelArchitecture {
             "qwen3next" => Self::Qwen3Next,
             "qwen3vl" => Self::Qwen3Vl,
             "qwen3vlmoe" => Self::Qwen3VlMoe,
-            "qwen35" | "qwen3.5" => Self::Qwen35,
+            "qwen35" | "qwen3.5" | "qwen3_5" => Self::Qwen35,
             "qwen35moe" | "qwen3_5_moe" | "qwen3_5_moe_text" => Self::Qwen35Moe,
             "phi" | "phi2" | "phi-2" => Self::Phi2,
             "phi3" | "phi-3" | "phishort" => Self::Phi3,
@@ -517,6 +517,7 @@ impl ModelArchitecture {
                 | Self::Lfm2Moe
                 | Self::LladaMoe
                 | Self::GroveMoe
+                | Self::Mellum
         )
     }
 
@@ -847,6 +848,202 @@ impl TensorNamingRegistry {
                     );
                 }
             }
+            ModelArchitecture::Qwen35 => {
+                for i in 0..num_layers {
+                    let hf_p = format!("model.layers.{i}.");
+                    let gg_p = format!("blk.{i}.");
+                    let il_p = format!("layers.{i}.");
+                    map.insert(
+                        format!("{hf_p}input_layernorm.weight"),
+                        format!("{gg_p}attn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}attn_norm.weight"),
+                        format!("{gg_p}attn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.qkv_proj.weight"),
+                        format!("{gg_p}attn_qkv.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}attn.qkv.weight"),
+                        format!("{gg_p}attn_qkv.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.gate_proj.weight"),
+                        format!("{gg_p}attn_gate.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}attn.gate.weight"),
+                        format!("{gg_p}attn_gate.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}post_attention_layernorm.weight"),
+                        format!("{gg_p}post_attention_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}post_attention_norm.weight"),
+                        format!("{gg_p}post_attention_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.gate_proj.weight"),
+                        format!("{gg_p}ffn_gate.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn.w_gate.weight"),
+                        format!("{gg_p}ffn_gate.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.up_proj.weight"),
+                        format!("{gg_p}ffn_up.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn.w_up.weight"),
+                        format!("{gg_p}ffn_up.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.down_proj.weight"),
+                        format!("{gg_p}ffn_down.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn.w_down.weight"),
+                        format!("{gg_p}ffn_down.weight"),
+                    );
+                    map.insert(format!("{il_p}ssm.conv1d.weight"), format!("{gg_p}ssm_conv1d.weight"));
+                    map.insert(format!("{il_p}ssm.a"), format!("{gg_p}ssm_a"));
+                    map.insert(format!("{il_p}ssm.alpha.weight"), format!("{gg_p}ssm_alpha.weight"));
+                    map.insert(format!("{il_p}ssm.beta.weight"), format!("{gg_p}ssm_beta.weight"));
+                    map.insert(format!("{il_p}ssm.dt.bias"), format!("{gg_p}ssm_dt.bias"));
+                    map.insert(format!("{il_p}ssm.norm.weight"), format!("{gg_p}ssm_norm.weight"));
+                    map.insert(format!("{il_p}ssm.out.weight"), format!("{gg_p}ssm_out.weight"));
+                }
+            }
+            ModelArchitecture::Mellum => {
+                // Mellum2 GGUF uses a different MoE tensor naming convention than
+                // the default Qwen3-MoE mapping. The GGUF (quantized by Unsloth)
+                // stores:
+                //   ffn_gate_inp.weight  = [hidden, num_experts]  (router gate)
+                //   ffn_gate_exps.weight = [num_experts, ffn_inter, hidden] (3D)
+                //   ffn_up_exps.weight   = [num_experts, ffn_inter, hidden] (3D)
+                //   ffn_down_exps.weight = [num_experts, ffn_inter, hidden] (3D)
+                // The attention uses standard Llama naming (attn_q/k/v/output,
+                // attn_norm). Unlike Qwen3-MoE, there is no `ffn_gate.weight`
+                // (singular) — the router is always `ffn_gate_inp.weight`.
+                for i in 0..num_layers {
+                    let hf_p = format!("model.layers.{i}.");
+                    let gg_p = format!("blk.{i}.");
+                    let il_p = format!("layers.{i}.");
+                    // Standard Llama attention (same as default)
+                    map.insert(
+                        format!("{hf_p}input_layernorm.weight"),
+                        format!("{gg_p}attn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.q_proj.weight"),
+                        format!("{gg_p}attn_q.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.k_proj.weight"),
+                        format!("{gg_p}attn_k.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.v_proj.weight"),
+                        format!("{gg_p}attn_v.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.o_proj.weight"),
+                        format!("{gg_p}attn_output.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}post_attention_layernorm.weight"),
+                        format!("{gg_p}ffn_norm.weight"),
+                    );
+                    // Per-head QK-norm (Qwen3/Mellum2 `attn_q_norm`/`attn_k_norm`,
+                    // [head_dim]).
+                    map.insert(
+                        format!("{hf_p}self_attn.q_norm.weight"),
+                        format!("{gg_p}attn_q_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attn.k_norm.weight"),
+                        format!("{gg_p}attn_k_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}attn_q_norm.weight"),
+                        format!("{gg_p}attn_q_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}attn_k_norm.weight"),
+                        format!("{gg_p}attn_k_norm.weight"),
+                    );
+                    // Internal loader canonical names
+                    map.insert(
+                        format!("{il_p}attn_norm.weight"),
+                        format!("{gg_p}attn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}attn.wq.weight"),
+                        format!("{gg_p}attn_q.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}attn.wk.weight"),
+                        format!("{gg_p}attn_k.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}attn.wv.weight"),
+                        format!("{gg_p}attn_v.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}attn.wo.weight"),
+                        format!("{gg_p}attn_output.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn_norm.weight"),
+                        format!("{gg_p}ffn_norm.weight"),
+                    );
+                    // Router gate: Mellum uses `ffn_gate_inp.weight` (NOT
+                    // `ffn_gate.weight`). This is the key difference from the
+                    // default mapping.
+                    map.insert(
+                        format!("{hf_p}mlp.gate_proj.weight"),
+                        format!("{gg_p}ffn_gate_inp.weight"),
+                    );
+                    // Internal canonical name for the router gate.
+                    map.insert(
+                        format!("{il_p}ffn.w_gate.weight"),
+                        format!("{gg_p}ffn_gate_inp.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn_gate_inp.weight"),
+                        format!("{gg_p}ffn_gate_inp.weight"),
+                    );
+                    // MoE expert tensors (3D, same naming as default MoE path)
+                    map.insert(
+                        format!("{hf_p}mlp.experts.gate_proj.weight"),
+                        format!("{gg_p}ffn_gate_exps.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.experts.up_proj.weight"),
+                        format!("{gg_p}ffn_up_exps.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.experts.down_proj.weight"),
+                        format!("{gg_p}ffn_down_exps.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn_gate_exps.weight"),
+                        format!("{gg_p}ffn_gate_exps.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn_up_exps.weight"),
+                        format!("{gg_p}ffn_up_exps.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn_down_exps.weight"),
+                        format!("{gg_p}ffn_down_exps.weight"),
+                    );
+                }
+            }
             _ => {
                 // Default Llama-family HF -> GGUF mappings per layer.
                 // Covers both `model.layers.N.xxx` (standard HF) and
@@ -951,6 +1148,18 @@ impl TensorNamingRegistry {
                         format!("{hf_p}mlp.experts.down_proj.weight"),
                         format!("{gg_p}ffn_down_exps.weight"),
                     );
+                    map.insert(
+                        format!("{il_p}ffn_gate_exps.weight"),
+                        format!("{gg_p}ffn_gate_exps.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn_up_exps.weight"),
+                        format!("{gg_p}ffn_up_exps.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn_down_exps.weight"),
+                        format!("{gg_p}ffn_down_exps.weight"),
+                    );
                     // Router gate (the dedup router, NOT the expert bank).
                     // HF convention for Qwen2/3-MoE / Mixtral is `mlp.gate.weight`.
                     // Resolves to the GGUF router tensor `ffn_gate_inp.weight`
@@ -960,6 +1169,10 @@ impl TensorNamingRegistry {
                         format!("{hf_p}mlp.gate.weight"),
                         format!("{gg_p}ffn_gate_inp.weight"),
                     );
+                    map.insert(
+                        format!("{il_p}ffn_gate_inp.weight"),
+                        format!("{gg_p}ffn_gate_inp.weight"),
+                    );
                     // Dedup/shared router gate (Laguna, Qwen2/3, GLM4, ...).
                     map.insert(
                         format!("{hf_p}mlp.gate_proj.weight"),
@@ -967,6 +1180,10 @@ impl TensorNamingRegistry {
                     );
                     map.insert(
                         format!("{hf_p}mlp.gate.e_score_correction_bias"),
+                        format!("{gg_p}ffn_exp_probs_b.bias"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn_exp_probs_b.bias"),
                         format!("{gg_p}ffn_exp_probs_b.bias"),
                     );
                     // Shared/always-on expert (Laguna, Qwen3-MoE, DeepSeek).
@@ -980,6 +1197,18 @@ impl TensorNamingRegistry {
                     );
                     map.insert(
                         format!("{hf_p}mlp.shared_expert.down_proj.weight"),
+                        format!("{gg_p}ffn_down_she.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn_gate_she.weight"),
+                        format!("{gg_p}ffn_gate_she.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn_up_she.weight"),
+                        format!("{gg_p}ffn_up_she.weight"),
+                    );
+                    map.insert(
+                        format!("{il_p}ffn_down_she.weight"),
                         format!("{gg_p}ffn_down_she.weight"),
                     );
                 }

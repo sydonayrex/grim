@@ -12,8 +12,6 @@
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::{BackendDevice, DType, Shape};
 
-const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
-
 /// CPU reference: causal GQA attention for arbitrary head_dim.
 fn reference_attention(
     q: &[f32],
@@ -154,7 +152,7 @@ fn cpu_reference_head_dim_96_not_nan() {
 /// GREEN state: after removing the guard and implementing LDS tiling, this test passes.
 #[test]
 fn qkv_attention_gpu_head_dim_128_not_nan() {
-    if std::env::var(GPU_TEST_ENV).is_err() {
+    if !grim_backend_rocm::gpu_test_enabled() {
         return;
     }
     let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len, cache_offset) =
@@ -233,7 +231,7 @@ fn qkv_attention_gpu_head_dim_128_not_nan() {
 /// GPU path: head_dim=64 (boundary) must still work correctly after the refactor.
 #[test]
 fn qkv_attention_gpu_head_dim_64_still_correct() {
-    if std::env::var(GPU_TEST_ENV).is_err() {
+    if !grim_backend_rocm::gpu_test_enabled() {
         return;
     }
     let (seq_len, num_heads, num_kv_heads, head_dim, kv_seq_len, cache_offset) =

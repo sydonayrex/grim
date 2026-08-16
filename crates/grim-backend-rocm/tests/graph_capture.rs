@@ -29,13 +29,12 @@ use grim_tensor::{BackendDevice, DType, Shape};
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<R = ()> = Result<R, TestError>;
 
-const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
-
 /// Build a device, bailing the test (Ok) if no GPU is present.
 fn gpu_device() -> Option<RocmDevice> {
-    if !std::env::var(GPU_TEST_ENV).is_ok() {
+    if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
+    unsafe { std::env::set_var("GRIM_CAPTURE_GRAPH", "1") };
     match std::panic::catch_unwind(|| {
         RocmDevice::try_new(0).expect("RocmDevice::new should succeed on ROCm")
     }) {

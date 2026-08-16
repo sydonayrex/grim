@@ -25,15 +25,25 @@ pub trait SessionT: Send {
     fn advance_pos(&mut self, by: usize);
     fn has_kv(&self) -> bool;
     fn append_kv(&mut self, _k: &Tensor, _v: &Tensor) -> Result<()>;
+    /// Append K/V for one transformer layer into the session's paged store.
+    fn append_kv_layer(&mut self, _layer: usize, _k: &Tensor, _v: &Tensor) -> Result<()> {
+        Ok(())
+    }
     fn kv_mut(&mut self) -> Option<&mut (dyn KvCache + 'static)> {
         None
+    }
+    /// True when the session's KV cache is a paged store usable by the
+    /// paged-attention kernel.
+    fn has_paged_kv(&self) -> bool {
+        false
     }
     /// Return the assigned block table for paged attention execution, if active.
     fn block_table(&self) -> Option<&[u32]> {
         None
     }
-    /// Return the global Paged KV Cache handles (k_pages, v_pages, page_size) if active.
-    fn paged_kv_handles(&self) -> Option<(&Tensor, &Tensor, usize)> {
+    /// Return the physical K/V page tensors for `layer` plus the page size,
+    /// if a paged store is active.
+    fn paged_kv_handles(&self, _layer: usize) -> Option<(Tensor, Tensor, usize)> {
         None
     }
     fn rollback_kv_to(&mut self, len: usize);
@@ -164,8 +174,27 @@ impl SessionT for Inner {
         }
         Ok(())
     }
+    fn append_kv_layer(&mut self, layer: usize, k: &Tensor, v: &Tensor) -> Result<()> {
+        if let Some(kv) = self.kv.as_deref_mut() {
+            kv.append_kv_layer(layer, k, v)?;
+        }
+        Ok(())
+    }
     fn kv_mut(&mut self) -> Option<&mut (dyn KvCache + 'static)> {
         self.kv.as_deref_mut()
+    }
+    fn has_paged_kv(&self) -> bool {
+        self.kv
+            .as_deref()
+            .map_or(false, |kv| kv.has_paged_kv())
+    }
+    fn block_table(&self) -> Option<&[u32]> {
+        self.kv.as_deref().and_then(|kv| kv.block_table())
+    }
+    fn paged_kv_handles(&self, layer: usize) -> Option<(Tensor, Tensor, usize)> {
+        self.kv
+            .as_deref()
+            .and_then(|kv| kv.paged_kv_handles(layer))
     }
     fn rollback_kv_to(&mut self, len: usize) {
         if let Some(kv) = self.kv.as_deref_mut() {

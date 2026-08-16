@@ -293,10 +293,15 @@ pub struct LlamaBlock {
     pub wv: ColumnParallelLinear,
     pub wo: RowParallelLinear,
     pub g_proj: Option<ColumnParallelLinear>,
+    /// Per-head Q RMS-norm over `head_dim` (Qwen3/Mellum2-style
+    /// `attn_q_norm`). Applied to Q after the projection, before RoPE.
+    pub q_norm: Option<RmsNorm>,
+    /// Per-head K RMS-norm over `head_dim` (`attn_k_norm`).
+    pub k_norm: Option<RmsNorm>,
     pub ffn_norm: RmsNorm,
-    pub w_gate: ColumnParallelLinear,
-    pub w_up: ColumnParallelLinear,
-    pub w_down: RowParallelLinear,
+    pub w_gate: Option<ColumnParallelLinear>,
+    pub w_up: Option<ColumnParallelLinear>,
+    pub w_down: Option<RowParallelLinear>,
     pub rope: Rope,
     pub tp_config: TensorParallelConfig,
     pub(crate) _dev: Device,
@@ -338,10 +343,25 @@ impl LlamaBlock {
         spec: &LayerAttentionSpec,
         tp: TensorParallelConfig,
     ) -> Result<Self> {
+        Self::load_tp_spec_with_ffn(ws, cfg, spec, tp, true)
+    }
+
+    /// Load a `LlamaBlock` with explicit `LayerAttentionSpec` and optional dense FFN.
+    pub fn load_tp_spec_with_ffn(
+        ws: &WeightSource<'_>,
+        cfg: &LlamaConfig,
+        spec: &LayerAttentionSpec,
+        tp: TensorParallelConfig,
+        load_dense_ffn: bool,
+    ) -> Result<Self> {
         let num_heads = spec.num_heads;
         let num_kv_heads = spec.num_kv_heads;
 
         let attn_norm = RmsNorm::load(&ws.pp("attn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        // Optional per-head QK-norm (Qwen3/Mellum2 `attn_q_norm` /
+        // `attn_k_norm`, [head_dim]). Absent in classic Llama checkpoints.
+        let q_norm = RmsNorm::load(&ws.pp("attn_q_norm"), cfg.head_dim, cfg.rms_norm_eps).ok();
+        let k_norm = RmsNorm::load(&ws.pp("attn_k_norm"), cfg.head_dim, cfg.rms_norm_eps).ok();
         let wq = Linear::load_column_parallel(
             &ws.pp("attn").pp("wq"),
             cfg.hidden_size,
@@ -386,27 +406,36 @@ impl LlamaBlock {
         };
 
         let ffn_norm = RmsNorm::load(&ws.pp("ffn_norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
-        let w_gate = Linear::load_column_parallel(
-            &ws.pp("ffn").pp("w_gate"),
-            cfg.hidden_size,
-            cfg.intermediate_size,
-            /*has_bias=*/ false,
-            tp,
-        )?;
-        let w_up = Linear::load_column_parallel(
-            &ws.pp("ffn").pp("w_up"),
-            cfg.hidden_size,
-            cfg.intermediate_size,
-            /*has_bias=*/ false,
-            tp,
-        )?;
-        let w_down = Linear::load_row_parallel(
-            &ws.pp("ffn").pp("w_down"),
-            cfg.intermediate_size,
-            cfg.hidden_size,
-            /*has_bias=*/ false,
-            tp,
-        )?;
+        let (w_gate, w_up, w_down) = if load_dense_ffn {
+            let wg = Linear::load_column_parallel(
+                &ws.pp("ffn").pp("w_gate"),
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                /*has_bias=*/ false,
+                tp,
+            )?;
+            let wu = Linear::load_column_parallel(
+                &ws.pp("ffn").pp("w_up"),
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                /*has_bias=*/ false,
+                tp,
+            )?;
+            let wd = Linear::load_row_parallel(
+                &ws.pp("ffn").pp("w_down"),
+                cfg.intermediate_size,
+                cfg.hidden_size,
+                /*has_bias=*/ false,
+                tp,
+            )?;
+            (
+                Some(ColumnParallelLinear::new(wg, tp)),
+                Some(ColumnParallelLinear::new(wu, tp)),
+                Some(RowParallelLinear::new(wd, tp)),
+            )
+        } else {
+            (None, None, None)
+        };
         let device = wq.weight().device().clone();
         let rope = Rope::from_config(spec.rope.clone());
 
@@ -420,10 +449,12 @@ impl LlamaBlock {
             wv: ColumnParallelLinear::new(wv, tp),
             wo: RowParallelLinear::new(wo, tp),
             g_proj,
+            q_norm,
+            k_norm,
             ffn_norm,
-            w_gate: ColumnParallelLinear::new(w_gate, tp),
-            w_up: ColumnParallelLinear::new(w_up, tp),
-            w_down: RowParallelLinear::new(w_down, tp),
+            w_gate,
+            w_up,
+            w_down,
             rope,
             tp_config: tp,
             _dev: device,
@@ -439,7 +470,7 @@ impl LlamaBlock {
                 kv_head_replica_factor,
                 sliding_window: spec.sliding_window,
             },
-            ffn_disabled: false,
+            ffn_disabled: !load_dense_ffn,
         })
     }
 
@@ -456,7 +487,7 @@ impl LlamaBlock {
         x: &Tensor,
         positions: &[u32],
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        self.forward_with_kv_paged(x, positions, None, None)
+        self.forward_with_kv_paged(x, positions, None, None, 0)
     }
 
     /// Forward pass with optional SessionT paged attention dispatch and
@@ -465,8 +496,9 @@ impl LlamaBlock {
         &self,
         x: &Tensor,
         positions: &[u32],
-        session: Option<&dyn grim_core::session::SessionT>,
+        session: Option<&mut dyn grim_core::session::SessionT>,
         cache: Option<&mut LlamaLayerCache>,
+        layer: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let _t0 = std::time::Instant::now();
         let x_2d = x;
@@ -475,15 +507,32 @@ impl LlamaBlock {
         let _t1 = std::time::Instant::now();
         let q = self.wq.forward(&x_norm)?;
         let k = self.wk.forward(&x_norm)?;
+        // Per-head QK-norm (Qwen3/Mellum2): normalize each head's head_dim
+        // slice before RoPE. No-op when the checkpoint has no q/k norms.
+        let q = self.apply_qk_norm(&self.q_norm, &q, self._cfg.local_num_heads)?;
+        let k = self.apply_qk_norm(&self.k_norm, &k, self._cfg.local_num_kv_heads)?;
         let v = self.wv.forward(&x_norm)?;
         let _t2 = std::time::Instant::now();
 
         let paged_attn_out = if let Some(sess) = session {
-            if let (Some(bt), Some((k_pages, v_pages, page_size))) =
-                (sess.block_table(), sess.paged_kv_handles())
-            {
-                self.paged_self_attention(&q, bt, k_pages, v_pages, page_size, positions)
-                    .ok()
+            if sess.has_paged_kv() {
+                // Append this layer's K/V into the paged store BEFORE attending
+                // so the current token is visible to the attention kernel
+                // (which reads up to `cache_offset + total_tokens`). The K
+                // stored must be POST-RoPE — the classic `LlamaLayerCache`
+                // path caches `k_rot` and the dense attention reads it
+                // directly, so the paged pages must match exactly.
+                let k_rot =
+                    self.apply_rope_multi_head(&k, positions, self._cfg.local_num_kv_heads)?;
+                sess.append_kv_layer(layer, &k_rot, &v).ok();
+                if let (Some(bt), Some((k_pages, v_pages, page_size))) =
+                    (sess.block_table(), sess.paged_kv_handles(layer))
+                {
+                    self.paged_self_attention(&q, bt, &k_pages, &v_pages, page_size, positions)
+                        .ok()
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -523,13 +572,57 @@ impl LlamaBlock {
         // FFN: standard Llama uses a single shared expert for all tokens.
         // Process the full batch in one forward pass on-device (zero CPU roundtrips).
         let x_norm = self.ffn_norm.forward(&added)?;
-        let gate = self.w_gate.forward(&x_norm)?;
-        let up = self.w_up.forward(&x_norm)?;
+        let gate = self.w_gate.as_ref().expect("dense FFN enabled").forward(&x_norm)?;
+        let up = self.w_up.as_ref().expect("dense FFN enabled").forward(&x_norm)?;
         let silu_storage = grim_nn::modules::silu_mul_on_device(&gate, &up)?;
-        let ffn_out = self.w_down.forward(&silu_storage)?;
+        let ffn_out = self.w_down.as_ref().expect("dense FFN enabled").forward(&silu_storage)?;
 
         let out = grim_nn::modules::add_on_device(&added, &ffn_out)?;
         Ok((out, k, v))
+    }
+
+    /// Apply a per-head RMS-norm over `head_dim` to a multi-head tensor
+    /// `(B, S, num_heads * head_dim)` (or 2-D `(S, num_heads * head_dim)`).
+    /// The row-major layout makes `(B, S, num_heads, head_dim)` identical to
+    /// `(B * S * num_heads, head_dim)`, so the norm runs as a zero-copy
+    /// relabel + `RmsNorm::forward` + relabel back. Returns `x` unchanged
+    /// when the norm is absent.
+    pub(crate) fn apply_qk_norm(
+        &self,
+        norm: &Option<RmsNorm>,
+        x: &Tensor,
+        num_heads: usize,
+    ) -> Result<Tensor> {
+        let Some(norm) = norm else {
+            return Ok(x.clone());
+        };
+        let dims = x.shape().dims().to_vec();
+        let (b, s, d) = if dims.len() == 3 {
+            (dims[0], dims[1], dims[2])
+        } else if dims.len() == 2 {
+            (1, dims[0], dims[1])
+        } else {
+            return Err(grim_core::error::Error::Shape(format!(
+                "qk_norm: expected 2-D or 3-D tensor, got {dims:?}"
+            )));
+        };
+        let head_dim = self._cfg.head_dim;
+        if d != num_heads * head_dim || head_dim == 0 {
+            return Err(grim_core::error::Error::Shape(format!(
+                "qk_norm: last dim {d} != {num_heads}*{head_dim}"
+            )));
+        }
+
+        let flat = Shape::new(vec![b * s * num_heads, head_dim]);
+        let relabeled = Tensor::new(
+            x.storage().clone(),
+            flat.clone(),
+            x.dtype(),
+            x.provenance().clone(),
+            x.device().clone(),
+        );
+        let normed = norm.forward(&relabeled)?;
+        reshaped_view(&normed, &Shape::new(vec![b, s, num_heads * head_dim]))
     }
 
     /// Apply RoPE to a multi-head tensor of shape (B, S, num_heads * head_dim)
@@ -857,13 +950,13 @@ impl LlamaBlock {
         };
 
         let q_3d_shape = Shape::new(vec![total_tokens, cfg.local_num_heads, cfg.head_dim]);
-        let q_3d = Tensor::new(
-            q_rot.storage().clone(),
-            q_3d_shape,
-            grim_tensor::DType::F32,
-            q.provenance().clone(),
-            q.device().clone(),
-        );
+        // Relabel through `relabel_3d` so the BACKEND STORAGE carries the 3-D
+        // shape — kernels read the storage's dims, and a hand-rolled
+        // `Tensor::new(storage.clone(), shape)` leaves the storage at the old
+        // [B, S, H*D] shape (the CPU paged kernel then reads seq_len/heads/
+        // head_dim from the wrong axes and scrambles the causal mask).
+        let q_3d = relabel_3d(&q_rot, total_tokens, cfg.local_num_heads, cfg.head_dim)?;
+        let _ = q_3d_shape;
 
         let bt_f32: Vec<f32> = block_table.iter().map(|&b| b as f32).collect();
         let bt_shape = Shape::new(vec![block_table.len()]);
@@ -889,13 +982,19 @@ impl LlamaBlock {
 
         let num_head_dims = cfg.local_num_heads * cfg.head_dim;
         let out_shape_2d = Shape::new(vec![total_tokens, num_head_dims]);
-        Ok(Tensor::new(
+        let attn_out = Tensor::new(
             std::sync::Arc::from(attn_storage),
-            out_shape_2d,
+            out_shape_3d,
             grim_tensor::DType::F32,
             q.provenance().clone(),
             q.device().clone(),
-        ))
+        );
+        // The kernel returns a 3-D storage `[total_tokens, num_heads,
+        // head_dim]`; relabel it to the 2-D `[total_tokens, num_head_dims]`
+        // view the downstream `wo` matmul expects. Use `reshaped_view` so the
+        // storage shape matches the declared shape on every backend (the CPU
+        // matmul validates storage rank).
+        Ok(reshaped_view(&attn_out, &out_shape_2d)?)
     }
 }
 
@@ -1015,11 +1114,12 @@ mod tests {
             wv,
             wo,
             g_proj: None,
+            q_norm: None,
+            k_norm: None,
             ffn_norm,
-            w_gate,
-
-            w_up,
-            w_down,
+            w_gate: Some(w_gate),
+            w_up: Some(w_up),
+            w_down: Some(w_down),
             rope,
             tp_config: tp,
             ffn_disabled: false,
@@ -1031,6 +1131,112 @@ mod tests {
     fn make_tensor(data: Vec<f32>, shape: &[usize]) -> Tensor {
         let t = cpu_tensor(data, Shape::new(shape.to_vec()));
         t
+    }
+
+    /// Phase-1 correctness proof at the block level: a `LlamaBlock` driven
+    /// through the paged-KV path (session-backed page tensors + block table)
+    /// must produce byte-identical attention output to the same block driven
+    /// through the classic per-layer `LlamaLayerCache` path, for both prefill
+    /// (multi-token) and decode (single-token) shapes. This is the invariant
+    /// that lets the engine re-enable prefix-cache/tiering wiring on top of
+    /// the paged path without changing serving numerics.
+    #[test]
+    fn paged_attention_matches_classic_attention() {
+        use grim_core::session::Inner;
+        use grim_memory::{BLOCK_SIZE, KvBlockPool, PagedKvCache};
+        use std::sync::{Arc, Mutex};
+
+        let block = small_block();
+        let cfg = small_cfg();
+        let hidden = cfg.hidden_size;
+
+        // Classic path: per-layer LlamaLayerCache (used for the decode step).
+        let mut classic_cache = crate::block::LlamaLayerCache::new();
+
+        let x_data: Vec<f32> = (0..4 * hidden).map(|i| (i as f32) * 0.01).collect();
+        let x = make_tensor(x_data.clone(), &[4, hidden]);
+        let positions = [0u32, 1, 2, 3];
+
+        // Compute q/k/v once, then compare the two ATTENTION paths on
+        // identical inputs (before wo/FFN), which is where the paged-vs-class
+        // difference lives.
+        let x_norm = block.attn_norm.forward(&x).unwrap();
+        let q = block.wq.forward(&x_norm).unwrap();
+        let k = block.wk.forward(&x_norm).unwrap();
+        let v = block.wv.forward(&x_norm).unwrap();
+        let q_rot = block
+            .apply_rope_multi_head(&q, &positions, cfg.local_num_heads)
+            .unwrap();
+        let k_rot = block
+            .apply_rope_multi_head(&k, &positions, cfg.local_num_kv_heads)
+            .unwrap();
+
+        // Classic: dense attention over the full K/V. `prefilled_self_attention`
+        // applies RoPE internally (it takes pre-RoPE q/k), so pass the raw q/k.
+        let classic_attn = block
+            .prefilled_self_attention(&q, &k, &v, &positions, None)
+            .unwrap();
+
+        // Paged: page the same post-RoPE K/V into a PagedKvCache and run the
+        // paged kernel with an identity block table.
+        let pool = Arc::new(Mutex::new(KvBlockPool::new(
+            1024,
+            cfg.local_num_kv_heads,
+            cfg.head_dim,
+        )));
+        let kv = PagedKvCache::new(pool, cfg.local_num_kv_heads, cfg.head_dim, BLOCK_SIZE);
+        let mut inner = Inner::with_kv(Device::Cpu, Box::new(kv));
+        let mut sess: &mut dyn grim_core::session::SessionT = &mut inner;
+        // Append the 4 post-RoPE K/V tokens one at a time (decode-style) so
+        // the page layout matches what the paged kernel expects.
+        for t in 0..4 {
+            let kt = make_tensor(
+                k_rot.to_vec_f32().unwrap()[t * cfg.local_num_kv_heads * cfg.head_dim
+                    ..(t + 1) * cfg.local_num_kv_heads * cfg.head_dim]
+                    .to_vec(),
+                &[1, cfg.local_num_kv_heads, cfg.head_dim],
+            );
+            let vt = make_tensor(
+                v.to_vec_f32().unwrap()[t * cfg.local_num_kv_heads * cfg.head_dim
+                    ..(t + 1) * cfg.local_num_kv_heads * cfg.head_dim]
+                    .to_vec(),
+                &[1, cfg.local_num_kv_heads, cfg.head_dim],
+            );
+            sess.append_kv_layer(0, &kt, &vt).unwrap();
+        }
+        let bt: Vec<u32> = sess.block_table().unwrap().to_vec();
+        let (kp, vp, ps) = sess.paged_kv_handles(0).unwrap();
+        // Pass the RAW (post-QK-norm, pre-RoPE) q: `paged_self_attention`
+        // applies RoPE internally (mirroring the runtime call in
+        // `forward_with_kv_paged`), so feeding it `q_rot` would rotate twice.
+        let paged_attn = block
+            .paged_self_attention(&q, &bt, &kp, &vp, ps, &positions)
+            .unwrap();
+        assert_eq!(
+            classic_attn.to_vec_f32().unwrap(),
+            paged_attn.to_vec_f32().unwrap(),
+            "prefill attention output must match between paged and classic paths"
+        );
+
+        // Decode: single token at position 4. First prefill the classic cache with
+        // the same 4 tokens the paged session already holds, so both paths have
+        // identical KV context before the decode step.
+        let _ = block
+            .forward_with_kv_paged(&x, &positions, None, Some(&mut classic_cache), 0)
+            .unwrap();
+        let x1 = make_tensor(vec![4.0f32 * 0.01; hidden], &[1, hidden]);
+        let pos1 = [4u32];
+        let classic_decode = block
+            .forward_with_kv_paged(&x1, &pos1, None, Some(&mut classic_cache), 0)
+            .unwrap();
+        let paged_decode = block
+            .forward_with_kv_paged(&x1, &pos1, Some(sess), None, 0)
+            .unwrap();
+        assert_eq!(
+            classic_decode.0.to_vec_f32().unwrap(),
+            paged_decode.0.to_vec_f32().unwrap(),
+            "decode attention output must match between paged and classic paths"
+        );
     }
 
     /// CRIT-1: Causal mask — token at position i must not attend to positions > i.
@@ -1646,15 +1852,15 @@ mod tests {
             "wv",
         );
         check_col(
-            &block_full.w_gate.weight(),
-            &block_r0.w_gate.weight(),
-            &block_r1.w_gate.weight(),
+            &block_full.w_gate.as_ref().unwrap().weight(),
+            &block_r0.w_gate.as_ref().unwrap().weight(),
+            &block_r1.w_gate.as_ref().unwrap().weight(),
             "w_gate",
         );
         check_col(
-            &block_full.w_up.weight(),
-            &block_r0.w_up.weight(),
-            &block_r1.w_up.weight(),
+            &block_full.w_up.as_ref().unwrap().weight(),
+            &block_r0.w_up.as_ref().unwrap().weight(),
+            &block_r1.w_up.as_ref().unwrap().weight(),
             "w_up",
         );
 
@@ -1669,9 +1875,9 @@ mod tests {
             "wo",
         );
         check_row(
-            &block_full.w_down.weight(),
-            &block_r0.w_down.weight(),
-            &block_r1.w_down.weight(),
+            &block_full.w_down.as_ref().unwrap().weight(),
+            &block_r0.w_down.as_ref().unwrap().weight(),
+            &block_r1.w_down.as_ref().unwrap().weight(),
             cfg.hidden_size,
             cfg.intermediate_size / 2,
             "w_down",

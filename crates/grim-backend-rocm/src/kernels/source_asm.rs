@@ -22,6 +22,7 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::fp8_standalone::KERNEL_SOURCE);
     s.push_str(crate::kernels::fp8_gemm_rdna4::KERNEL_SOURCE);
     s.push_str(crate::kernels::mxfp_standalone::KERNEL_SOURCE);
+    s.push_str(crate::kernels::mxfp4_gemm::KERNEL_SOURCE);
     s.push_str(crate::kernels::selective_scan::KERNEL_SOURCE);
     s.push_str(crate::kernels::q4k_dequant::KERNEL_SOURCE);
     s.push_str(crate::kernels::iq_dequant::KERNEL_SOURCE);
@@ -31,6 +32,14 @@ pub fn compute_kernel_source() -> String {
     s.push_str(crate::kernels::silu_mul_quant::SILU_MUL_QUANT_KERNEL_SOURCE);
     s.push_str(crate::kernels::sage_attention::SAGE_ATTENTION_KERNEL_SOURCE);
     s.push_str(crate::kernels::scythe_persistent::KERNEL_SOURCE);
+    s.push_str(crate::kernels::flash_decode::KERNEL_SOURCE);
+    s.push_str(crate::kernels::mla_decode::KERNEL_SOURCE);
+    s.push_str(crate::kernels::marlin_gemm::KERNEL_SOURCE);
+    s.push_str(crate::kernels::bitnet_gemm::KERNEL_SOURCE);
+    s.push_str(crate::kernels::extend_attention::KERNEL_SOURCE);
+    s.push_str(crate::kernels::preshuffled_attention::KERNEL_SOURCE);
+    s.push_str(crate::kernels::mrope::KERNEL_SOURCE);
+    s.push_str(crate::kernels::speculative_sampler::KERNEL_SOURCE);
     s
 }
 

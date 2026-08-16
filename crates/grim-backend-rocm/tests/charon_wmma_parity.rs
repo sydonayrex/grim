@@ -50,6 +50,13 @@
 //! `grim-nn`'s default-feature build. That breakage is unrelated to this
 //! file and out of scope for WI-Charon-2; once `grim-nn` compiles, this
 //! test file compiles and the env-gated parity test runs as designed.
+//!
+//! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test charon_wmma_parity -- --ignored
+//! RESULT: 4/4 PASS (structural checks). charon_wmma_vs_scalar_parity: FAILED (0/1) when
+//!   run with --ignored — panics with `hipModuleLoad failed: 209`. The grouped Charon JIT
+//!   kernel (.hipfb) is compiled but not registered for this test's dispatch on this RDNA4
+//!   box. The test is #[ignore]d by default; when forced with --ignored it hits the same
+//!   unregistered-kernel failure as all other GPU-kernel tests here.
 
 use grim_backend_rocm::kernels::charon;
 use grim_backend_rocm::kernels::charon_wmma;
@@ -170,17 +177,17 @@ fn wmma_kernel_wmma_path_gated_on_supported_arches() {
 // plan.
 // ---------------------------------------------------------------------------
 
-const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
+const GPU_TEST_ENV: &str = "GRIM_GPU_TEST";
 
 fn gpu_tests_enabled() -> bool {
-    std::env::var(GPU_TEST_ENV).is_ok()
+    grim_backend_rocm::gpu_test_enabled()
 }
 
 /// Device-gated numeric execution test. It launches the production grouped
 /// Charon path and compares the result with the same operation evaluated on
 /// the host. Marked ignored because it requires a real ROCm device.
 #[test]
-#[ignore = "device-gated: run with `--ignored` and GRIM_RUN_GPU_TESTS=1 on a \
+#[ignore = "device-gated: run with `--ignored` and GRIM_GPU_TEST=1 on a \
             ROCm device"]
 // Verified via gfx1036 iGPU — 2026-08-13 (scalar fallback path).
 fn charon_wmma_vs_scalar_parity() {

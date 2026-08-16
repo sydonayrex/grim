@@ -6,8 +6,6 @@
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::{BackendDevice, DType, Shape, SoftmaxPartial, merge_partials};
 
-const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
-
 /// Deterministic LCG for reproducible test inputs.
 fn lcg_f32(seed: u32) -> u32 {
     seed.wrapping_mul(1103515245).wrapping_add(12345)
@@ -53,10 +51,10 @@ fn approx_close(a: &[f32], b: &[f32], rel_tol: f32) -> bool {
 
 #[test]
 fn test_hybrid_cpu_gpu_attention_correctness() {
-    let env = std::env::var(GPU_TEST_ENV).is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         println!(
-            "[INFO] Skipped test_hybrid_cpu_gpu_attention_correctness (requires GRIM_RUN_GPU_TESTS)"
+            "[INFO] Skipped test_hybrid_cpu_gpu_attention_correctness (requires GRIM_GPU_TEST=1)"
         );
         return;
     }

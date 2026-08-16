@@ -1,7 +1,4 @@
-//! GPU-gated parity for Design-A fused linear cross-entropy.
-//!
-//! Numeric assertions execute only with `GRIM_RUN_GPU_TESTS=1`; compilation and
-//! API coverage remain available on hosts without a ROCm device.
+//! RUN ON THIS SYSTEM: GRIM_GPU_TEST=1 cargo test -p grim-backend-rocm --test fused_linear_ce_parity_tests
 
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::dtype::{ArithType, DType, Storage};
@@ -9,7 +6,7 @@ use grim_tensor::{BackendDevice, Shape};
 
 #[test]
 fn fused_linear_ce_matches_cpu_oracle() {
-    if std::env::var("GRIM_RUN_GPU_TESTS").ok().as_deref() != Some("1") {
+    if !grim_backend_rocm::gpu_test_enabled() {
         return;
     }
     let Ok(dev) = RocmDevice::try_new(0) else {

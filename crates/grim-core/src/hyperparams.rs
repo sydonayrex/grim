@@ -22,6 +22,7 @@ pub struct ArchHyperparameters {
     // MoE specific
     pub expert_count: Option<usize>,
     pub expert_used_count: Option<usize>,
+    pub expert_feed_forward_length: Option<usize>,
     pub routed_scaling_factor: f32,
     pub norm_topk_prob: bool,
     // SSM specific
@@ -30,6 +31,7 @@ pub struct ArchHyperparameters {
     pub ssm_d_conv: Option<usize>,
     pub ssm_dt_rank: Option<usize>,
     pub ssm_n_group: Option<usize>,
+    pub full_attention_interval: Option<usize>,
 }
 
 impl Default for ArchHyperparameters {
@@ -48,6 +50,7 @@ impl Default for ArchHyperparameters {
             max_seq_len: 2048,
             expert_count: None,
             expert_used_count: None,
+            expert_feed_forward_length: None,
             routed_scaling_factor: 1.0,
             norm_topk_prob: false,
             ssm_d_state: None,
@@ -55,6 +58,7 @@ impl Default for ArchHyperparameters {
             ssm_d_conv: None,
             ssm_dt_rank: None,
             ssm_n_group: None,
+            full_attention_interval: None,
         }
     }
 }
@@ -90,11 +94,13 @@ impl HyperparameterExtractor {
             metadata
                 .get_u32("llama.vocab_size")
                 .or_else(|| metadata.get_u32("tokenizer.ggml.vocab_size"))
+                .or_else(|| metadata.get_u32("tokenizer.ggml.tokens"))
                 .map(|v| v as usize)
                 .unwrap_or(32000)
         } else {
             metadata
                 .get_u32("tokenizer.ggml.vocab_size")
+                .or_else(|| metadata.get_u32("tokenizer.ggml.tokens"))
                 .or_else(|| metadata.get_u32(&format!("{arch_name}.vocab_size")))
                 .or_else(|| metadata.get_u32("llama.vocab_size"))
                 .map(|v| v as usize)
@@ -195,6 +201,10 @@ impl HyperparameterExtractor {
         let expert_used_count = metadata
             .get_u32(&format!("{arch_name}.expert_used_count"))
             .map(|v| v as usize);
+        let expert_feed_forward_length = metadata
+            .get_u32(&format!("{arch_name}.expert_feed_forward_length"))
+            .or_else(|| metadata.get_u32(&format!("{arch_name}.expert_intermediate_size")))
+            .map(|v| v as usize);
         let routed_scaling_factor = metadata
             .get_f32(&format!("{arch_name}.expert_gating_func"))
             .or_else(|| metadata.get_f32(&format!("{arch_name}.routed_scaling_factor")))
@@ -221,6 +231,9 @@ impl HyperparameterExtractor {
         let ssm_n_group = metadata
             .get_u32(&format!("{arch_name}.ssm.group_count"))
             .map(|v| v as usize);
+        let full_attention_interval = metadata
+            .get_u32(&format!("{arch_name}.full_attention_interval"))
+            .map(|v| v as usize);
 
         ArchHyperparameters {
             architecture: arch,
@@ -236,6 +249,7 @@ impl HyperparameterExtractor {
             max_seq_len,
             expert_count,
             expert_used_count,
+            expert_feed_forward_length,
             routed_scaling_factor,
             norm_topk_prob,
             ssm_d_state,
@@ -243,6 +257,7 @@ impl HyperparameterExtractor {
             ssm_d_conv,
             ssm_dt_rank,
             ssm_n_group,
+            full_attention_interval,
         }
     }
 }

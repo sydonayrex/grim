@@ -105,10 +105,15 @@ impl TrainableParam {
             return Ok(());
         }
         let dev = crate::pick_device_for_tensor(&self.grad);
+        let grad_storage = if grad.device() == self.grad.device() {
+            grad.storage().clone()
+        } else {
+            Arc::from(dev.from_cpu(&grad.to_vec_f32()?, self.grad.shape(), DType::F32)?)
+        };
         let (sum_storage, handle) = BackendDevice::add(
             &*dev,
             self.grad.storage().as_ref(),
-            grad.storage().as_ref(),
+            grad_storage.as_ref(),
             self.grad.shape(),
         )?;
         handle.synchronize()?;

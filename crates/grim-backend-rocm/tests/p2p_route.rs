@@ -29,9 +29,12 @@
 //! - `rust-ml-llm-architecture` — backend isolation: the routing
 //!   primitive lives in the ROCm crate, not core.
 //!
-//! Dual-GPU test results (syd-beasty, ROCm 7.2.53211):
+//! Dual-GPU test results (multi-GPU RDNA4 system, ROCm 7.2.53211):
 //!   Hardware: RX 9070 XT (gfx1201, device 0) + RX 9060 XT (gfx1200, device 1)
 //!   — all 16 tests PASS (16/16), including HostStagingBuffer pinned alloc + D2H round-trip.
+//!
+//! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test p2p_route
+//! RESULT: 16/16 PASS. Verified on the dual-GPU RDNA4 box.
 
 use grim_backend_rocm::p2p_route::{HostStagingBuffer, RouteLink, to_route_link};
 use grim_backend_rocm::peer_access::P2PStatus;
@@ -155,7 +158,7 @@ fn link_decision_pcie_overflow_threshold_saturates() -> TestResult {
 
 #[test]
 fn host_staging_buffer_round_trips_a_short_byte_record() -> TestResult {
-    let env = std::env::var("GRIM_RUN_GPU_TESTS").is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(());
     }
@@ -187,7 +190,7 @@ fn host_staging_buffer_round_trips_a_short_byte_record() -> TestResult {
 
 #[test]
 fn host_staging_buffer_zero_size_returns_err() -> TestResult {
-    let env = std::env::var("GRIM_RUN_GPU_TESTS").is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(());
     }
@@ -201,7 +204,7 @@ fn host_staging_buffer_zero_size_returns_err() -> TestResult {
 
 #[test]
 fn host_staging_buffer_drop_returns_the_pinned_block() -> TestResult {
-    let env = std::env::var("GRIM_RUN_GPU_TESTS").is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(());
     }
@@ -214,7 +217,7 @@ fn host_staging_buffer_drop_returns_the_pinned_block() -> TestResult {
 
 #[test]
 fn host_staging_buffer_rejects_overflow() -> TestResult {
-    let env = std::env::var("GRIM_RUN_GPU_TESTS").is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(());
     }
@@ -240,7 +243,7 @@ fn host_staging_buffer_rejects_overflow() -> TestResult {
 
 #[test]
 fn staging_for_routes_is_none_when_peer_direct() -> TestResult {
-    let env = std::env::var("GRIM_RUN_GPU_TESTS").is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(());
     }
@@ -254,7 +257,7 @@ fn staging_for_routes_is_none_when_peer_direct() -> TestResult {
 
 #[test]
 fn staging_for_routes_is_some_when_host_bounce() -> TestResult {
-    let env = std::env::var("GRIM_RUN_GPU_TESTS").is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(());
     }

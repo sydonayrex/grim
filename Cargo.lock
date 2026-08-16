@@ -2374,8 +2374,10 @@ version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
  "grim-core",
+ "grim-memory",
  "grim-models-vision",
  "grim-nn",
+ "grim-quant",
  "grim-tensor",
  "serde_json",
  "thiserror 1.0.69",
@@ -2415,9 +2417,11 @@ dependencies = [
  "grim-core",
  "grim-tensor",
  "libloading 0.8.9",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tokio",
  "toml 0.8.23",
  "wasmtime",
  "wat",
@@ -2427,10 +2431,11 @@ dependencies = [
 name = "grim-quant"
 version = "0.1.0"
 dependencies = [
- "grim-backend-cpu",
+ "grim-backend-rocm",
  "grim-format",
+ "grim-nn",
  "grim-tensor",
- "thiserror 1.0.69",
+ "rayon",
 ]
 
 [[package]]
@@ -3229,6 +3234,16 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mxfp4_probe"
+version = "0.1.0"
+dependencies = [
+ "grim-backend-rocm",
+ "grim-format",
+ "grim-nn",
+ "grim-tensor",
 ]
 
 [[package]]

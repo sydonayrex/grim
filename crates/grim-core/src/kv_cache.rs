@@ -52,4 +52,45 @@ pub trait KvCache: Send {
     /// Called by `Session::append_kv` after `append_slot()` to write
     /// the actual K/V data into the block identified by the slot.
     fn store_kv(&mut self, k: &Tensor, v: &Tensor) -> Result<()>;
+
+    /// True when this cache is backed by a paged KV store that can be fed
+    /// directly to the paged-attention kernel (physical page tensors +
+    /// a logical block table). Models consult this to decide whether to
+    /// dispatch through `append_kv_layer` + `paged_kv_handles`.
+    fn has_paged_kv(&self) -> bool {
+        false
+    }
+
+    /// Append the key/value tensors for one layer into the paged store.
+    /// `k`/`v` carry `seq` tokens (shape `[seq, num_kv_heads, head_dim]` or
+    /// `[seq, num_kv_heads * head_dim]`); each token is written into its own
+    /// slot in the layer's page tensor. Per-layer page buffers are grown
+    /// lazily, so no upfront layer count is required.
+    fn append_kv_layer(&mut self, _layer: usize, _k: &Tensor, _v: &Tensor) -> Result<()> {
+        Ok(())
+    }
+
+    /// Return the logical→physical block table (as u32 physical ids), if a
+    /// paged store is active and at least one block has been allocated.
+    fn block_table(&self) -> Option<&[u32]> {
+        None
+    }
+
+    /// Return the physical K/V page tensors for `layer` plus the page size,
+    /// if a paged store is active for that layer.
+    fn paged_kv_handles(&self, _layer: usize) -> Option<(Tensor, Tensor, usize)> {
+        None
+    }
+
+    /// Seed the start of the cache with already-computed prefix blocks from
+    /// a shared pool (RadixAttention-style prefix reuse, §5.1). The default
+    /// is a no-op for caches that don't support cross-sequence sharing.
+    fn seed_prefix(&mut self, _blocks: &[usize]) {}
+
+    /// Return the physical block ids currently backing this cache, in token
+    /// order. Used by the engine to register a computed prefix into the
+    /// shared pool's radix tree. Empty by default.
+    fn prefix_physical_ids(&self) -> Vec<usize> {
+        Vec::new()
+    }
 }

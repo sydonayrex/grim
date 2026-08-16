@@ -140,6 +140,11 @@ pub struct RocmDevice {
     /// AtomicBool shadow of `fused_dequant_gemm_config.enabled` — read lock-free on every
     /// quantized_matmul dispatch. Written by `set_fused_dequant_gemm_enabled`.
     pub(crate) fused_dequant_gemm_enabled: AtomicBool,
+    /// Opt-in gate for the Jay-Tier MXFP4 fused dequant-GEMM kernel
+    /// (`launch_fused_dequant_gemm_mxfp4`). Defaults to `false` so the proven
+    /// tiled MXFP4 path stays the default until parity with the F32 oracle is
+    /// confirmed on a target GPU. Written by `set_mxfp4_fused_dequant_gemm_enabled`.
+    pub(crate) mxfp4_fused_dequant_gemm_enabled: AtomicBool,
     /// AtomicBool shadow of `wmma_gemm_config.enabled` — read lock-free by
     /// `should_use_wmma_path`. Written by `set_wmma_gemm_enabled`.
     pub(crate) wmma_gemm_enabled: AtomicBool,
@@ -247,7 +252,7 @@ impl RocmDevice {
         }
 
         // Query device attributes for Wavefront size correctness gate.
-        let mut warp_size = 64; // Default to W64 (MI200/MI300 CDNA) safety fallback
+        let mut warp_size = 32; // Default to W32 (RDNA) fallback
         let mut xnack_val = 0;
         let mut streams = Vec::new();
         unsafe {
@@ -283,7 +288,7 @@ impl RocmDevice {
         Ok(dev)
     }
     fn fallback(ordinal: usize) -> Self {
-        Self::build(ordinal, 64, 0, None, Vec::new())
+        Self::build(ordinal, 32, 0, None, Vec::new())
     }
 
     /// Attach (or detach) an RCCL multi-GPU collective handle. Called by the
@@ -444,12 +449,39 @@ impl RocmDevice {
         handle_cache: Option<RoclabsHandle>,
         streams: Vec<*mut c_void>,
     ) -> Self {
-        let wavefront_size = if warp_size == 32 {
-            WavefrontSize::W32
-        } else {
-            WavefrontSize::W64
-        };
         let xnack_enabled = xnack_val == 1;
+
+        let gpu_target = detect_gpu_arch(ordinal as i32);
+        let wavefront_size = if let Ok(s) = std::env::var("GRIM_WAVEFRONT_SIZE") {
+            if s == "64" {
+                WavefrontSize::W64
+            } else {
+                WavefrontSize::W32
+            }
+        } else {
+            match crate::quantization::gcn_arch(&gpu_target) {
+                crate::quantization::GcnArch::CDNA2 | crate::quantization::GcnArch::CDNA3 => {
+                    WavefrontSize::W64
+                }
+                crate::quantization::GcnArch::RDNA1
+                | crate::quantization::GcnArch::RDNA2
+                | crate::quantization::GcnArch::RDNA3
+                | crate::quantization::GcnArch::RDNA4 => WavefrontSize::W32,
+                _ => {
+                    if warp_size == 64 && gpu_target.starts_with("gfx9") {
+                        WavefrontSize::W64
+                    } else if warp_size == 32 {
+                        WavefrontSize::W32
+                    } else {
+                        WavefrontSize::W32 // Default RDNA fallback
+                    }
+                }
+            }
+        };
+        let wf_u32 = match wavefront_size {
+            WavefrontSize::W32 => 32,
+            WavefrontSize::W64 => 64,
+        };
 
         // Phase-aware cache cap: when the env override is absent, derive a
         let cap_bytes: usize = std::env::var("GRIM_ALLOC_POOL_CAP_BYTES")
@@ -462,7 +494,6 @@ impl RocmDevice {
             })
             .clamp(128 * 1024 * 1024, 512 * 1024 * 1024);
 
-        let gpu_target = detect_gpu_arch(ordinal as i32);
         let arch_leak: &'static str = Box::leak(gpu_target.clone().into_boxed_str());
         let mut autotuner = crate::autotune::Autotuner::for_device(ordinal, arch_leak);
 
@@ -500,11 +531,11 @@ impl RocmDevice {
             batched_gemm_warmed: AtomicBool::new(false),
             decode_gemm_config: Mutex::new(DecodeGemmConfig {
                 enabled: true,
-                wavefront_size: warp_size as u32,
+                wavefront_size: wf_u32,
             }),
             fused_dequant_gemm_config: Mutex::new(FusedDequantGemmConfig {
                 enabled: true,
-                wavefront_size: warp_size as u32,
+                wavefront_size: wf_u32,
             }),
             split_k_config: Mutex::new(SplitKGemmConfig { enabled: true }),
             wmma_gemm_config: Mutex::new(WmmaGemmConfig {
@@ -512,10 +543,11 @@ impl RocmDevice {
                     crate::quantization::gcn_arch(&gpu_target),
                     crate::quantization::GcnArch::RDNA3 | crate::quantization::GcnArch::RDNA4
                 ),
-                wavefront_size: warp_size as u32,
+                wavefront_size: wf_u32,
             }),
             decode_gemm_enabled: AtomicBool::new(true),
             fused_dequant_gemm_enabled: AtomicBool::new(true),
+            mxfp4_fused_dequant_gemm_enabled: AtomicBool::new(false),
             wmma_gemm_enabled: AtomicBool::new(matches!(
                 crate::quantization::gcn_arch(&gpu_target),
                 crate::quantization::GcnArch::RDNA3 | crate::quantization::GcnArch::RDNA4
@@ -560,6 +592,14 @@ impl RocmDevice {
             .store(enabled, Ordering::Relaxed);
         let mut cfg = self.fused_dequant_gemm_config.lock().unwrap();
         cfg.enabled = enabled;
+    }
+
+    /// Set whether the Jay-Tier MXFP4 fused dequant-GEMM kernel is enabled.
+    /// Defaults to `false` (tiled fallback) until parity with the F32 oracle is
+    /// confirmed on a target GPU.
+    pub fn set_mxfp4_fused_dequant_gemm_enabled(&self, enabled: bool) {
+        self.mxfp4_fused_dequant_gemm_enabled
+            .store(enabled, Ordering::Relaxed);
     }
 
     /// Set whether SplitK GEMM is enabled (WI-D).
@@ -1794,6 +1834,55 @@ impl BackendDevice for RocmDevice {
         ))
     }
 
+    fn add_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = as_rocm(x)?;
+        if !x_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "add_scalar: input lacks a valid device pointer".into(),
+            ));
+        }
+        let total = out.elem_count();
+        let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut out_ptr = dev_ptr(&storage)?;
+        let mut x_ptr = dev_ptr(x_s)?;
+        let mut n = total as i32;
+        let mut s = scalar;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_add_scalar",
+            grid,
+            block,
+            &mut [arg(&mut x_ptr), arg(&mut s), arg(&mut out_ptr), arg(&mut n)],
+        )?;
+        Ok((
+            Box::new(storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
+    fn sub_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.add_scalar(x, -scalar, out)
+    }
+
+    fn div_scalar(
+        &self,
+        x: &dyn BackendStorage,
+        scalar: f32,
+        out: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        self.mul_scalar(x, 1.0 / scalar, out)
+    }
+
     fn sqrt(
         &self,
         x: &dyn BackendStorage,
@@ -1960,7 +2049,7 @@ impl BackendDevice for RocmDevice {
         if x_dims.is_empty() {
             return Err(Error::Shape("rms_norm: empty input".into()));
         }
-        let row_len = *x_dims.last().unwrap();
+        let row_len = *out.dims().last().unwrap();
         let total = out.elem_count();
         let storage = RocmStorage::alloc_gpu(out, dtype_f32(), &self.allocator, self.ordinal)?;
         let mut out_ptr = dev_ptr(&storage)?;
@@ -2516,24 +2605,132 @@ impl BackendDevice for RocmDevice {
                 }
             }
             DTypeStorage::FloatPack(FloatPackScheme::MxFp4) => {
-                let dummy_exps = RocmStorage::alloc_gpu(
-                    &Shape::new(vec![(k * n).max(32) / 32]),
-                    DType {
-                        arith: ArithType::U8,
-                        storage: DTypeStorage::Native,
-                    },
-                    &self.allocator,
-                    self.ordinal,
-                )?;
-                self.launch_fused_dequant_gemm_mxfp4(
-                    a_storage,
-                    b_storage,
-                    &dummy_exps,
-                    &out_storage,
-                    m,
-                    n,
-                    k,
-                )?;
+                // The MXFP4 kernel reads one E8M0 exponent per 32-element block
+                // (block_idx = (col*K+k)/32) and expects B_codes / B_exps as
+                // separate device buffers. Weight tensors carry the
+                // length-prefixed framing [u64 codes_len][codes][u64
+                // exps_len][exps]; both segment lengths are derivable from the
+                // shape, so split device-side with two DtoD copies. Legacy
+                // codes-only buffers (no framing) keep the _b_scales / dummy
+                // exponent path and pass B through unchanged.
+                let elems = k * n;
+                let codes_len = elems / 2;
+                let exps_len = elems.div_ceil(32);
+                let framed_len = 16 + codes_len + exps_len;
+                let u8_dtype = DType {
+                    arith: ArithType::U8,
+                    storage: DTypeStorage::Native,
+                };
+
+                // Split storages (framed path); stay None on the legacy path.
+                let mut split_codes: Option<RocmStorage> = None;
+                let exps_storage: RocmStorage = if b_storage.bytes == framed_len {
+                    let codes_storage = RocmStorage::alloc_gpu(
+                        &Shape::new(vec![codes_len]),
+                        u8_dtype.clone(),
+                        &self.allocator,
+                        self.ordinal,
+                    )?;
+                    let exps_storage = RocmStorage::alloc_gpu(
+                        &Shape::new(vec![exps_len]),
+                        u8_dtype,
+                        &self.allocator,
+                        self.ordinal,
+                    )?;
+                    let base = b_storage.device_ptr_u64().unwrap() as *const c_void;
+                    check_hip("mxfp4 split codes (DtoD)", unsafe {
+                        crate::hipMemcpy(
+                            codes_storage.device_ptr_u64().unwrap() as *mut c_void,
+                            base.add(8),
+                            codes_len,
+                            HipMemcpyKind::DeviceToDevice,
+                        )
+                    })?;
+                    check_hip("mxfp4 split exps (DtoD)", unsafe {
+                        crate::hipMemcpy(
+                            exps_storage.device_ptr_u64().unwrap() as *mut c_void,
+                            base.add(8 + codes_len + 8),
+                            exps_len,
+                            HipMemcpyKind::DeviceToDevice,
+                        )
+                    })?;
+                    split_codes = Some(codes_storage);
+                    exps_storage
+                } else if !_b_scales.is_empty() {
+                    // Caller-supplied f32 E8M0 byte values as exponents.
+                    let exps_u8: Vec<u8> = _b_scales
+                        .iter()
+                        .map(|s| s.round().clamp(0.0, 255.0) as u8)
+                        .collect();
+                    RocmStorage::copy_from_host_raw_bytes(
+                        &exps_u8,
+                        &Shape::new(vec![exps_u8.len()]),
+                        DType {
+                            arith: ArithType::U8,
+                            storage: DTypeStorage::Native,
+                        },
+                        &self.allocator,
+                        self.ordinal,
+                    )?
+                } else {
+                    // Legacy/empty path: zeroed dummy exponents.
+                    RocmStorage::alloc_gpu(
+                        &Shape::new(vec![exps_len.max(1)]),
+                        u8_dtype,
+                        &self.allocator,
+                        self.ordinal,
+                    )?
+                };
+
+                let use_fused = self.mxfp4_fused_dequant_gemm_enabled.load(Ordering::Relaxed);
+                match split_codes {
+                    Some(codes) => {
+                        if use_fused {
+                            self.launch_fused_dequant_gemm_mxfp4(
+                                a_storage,
+                                &codes,
+                                &exps_storage,
+                                &out_storage,
+                                m,
+                                n,
+                                k,
+                            )?;
+                        } else {
+                            self.launch_mxfp4_gemm_tiled(
+                                a_storage,
+                                &codes,
+                                &exps_storage,
+                                &out_storage,
+                                m,
+                                n,
+                                k,
+                            )?;
+                        }
+                    }
+                    None => {
+                        if use_fused {
+                            self.launch_fused_dequant_gemm_mxfp4(
+                                a_storage,
+                                b_storage,
+                                &exps_storage,
+                                &out_storage,
+                                m,
+                                n,
+                                k,
+                            )?;
+                        } else {
+                            self.launch_mxfp4_gemm_tiled(
+                                a_storage,
+                                b_storage,
+                                &exps_storage,
+                                &out_storage,
+                                m,
+                                n,
+                                k,
+                            )?;
+                        }
+                    }
+                }
             }
             DTypeStorage::FloatPack(FloatPackScheme::MxFp8) => {
                 let dummy_exps = RocmStorage::alloc_gpu(
@@ -2973,6 +3170,43 @@ impl BackendDevice for RocmDevice {
                     )?;
                 }
             }
+            DTypeStorage::FloatPack(FloatPackScheme::MxFp4) => {
+                let exps_storage = if !b_scales.is_empty() {
+                    let exps_u8: Vec<u8> = b_scales
+                        .iter()
+                        .map(|s| s.round().clamp(0.0, 255.0) as u8)
+                        .collect();
+                    RocmStorage::copy_from_host_raw_bytes(
+                        &exps_u8,
+                        &Shape::new(vec![exps_u8.len()]),
+                        DType {
+                            arith: ArithType::U8,
+                            storage: DTypeStorage::Native,
+                        },
+                        &self.allocator,
+                        self.ordinal,
+                    )?
+                } else {
+                    RocmStorage::alloc_gpu(
+                        &Shape::new(vec![(k * n).max(32) / 32]),
+                        DType {
+                            arith: ArithType::U8,
+                            storage: DTypeStorage::Native,
+                        },
+                        &self.allocator,
+                        self.ordinal,
+                    )?
+                };
+                self.launch_mxfp4_backward_gemm(
+                    dy_storage,
+                    b_storage,
+                    &exps_storage,
+                    &dx_storage,
+                    m,
+                    n,
+                    k,
+                )?;
+            }
             DTypeStorage::ResidualPacked(cfg) => {
                 // Mirror the forward `enabled` gate: when the fused backward path
                 // is disabled, fall back to a standard matmul of dY against the
@@ -3175,6 +3409,24 @@ impl BackendDevice for RocmDevice {
         // completed before this kernel reads q/k/v.
         let _ = unsafe { hipStreamSynchronize(self.active_stream()) };
 
+        // Split-KV FlashDecoding acceleration for long-context single-token decode
+        if seq_len == 1 && kv_seq_len >= 1024 && window.is_none() && out_max.is_none() && out_sum.is_none() {
+            let num_splits = (kv_seq_len / 256).clamp(2, 64);
+            let stream = self.launch_flash_decode(
+                q_s,
+                k_s,
+                v_s,
+                &storage,
+                config.num_heads,
+                config.num_kv_heads,
+                config.head_dim,
+                kv_seq_len,
+                num_splits,
+            )?;
+            let _ = unsafe { hipStreamSynchronize(self.active_stream()) };
+            return Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))));
+        }
+
         let stream = self.launch_compute_kernel(
             "grim_qkv_attention",
             launch.grid_dim,
@@ -3299,6 +3551,55 @@ impl BackendDevice for RocmDevice {
             Box::new(storage),
             Box::new(RocmHandle::new(Some(self.active_stream()))),
         ))
+    }
+
+    fn fused_mxfp4_gemm_qk_norm_rope_kv(
+        &self,
+        x: &dyn BackendStorage,
+        gamma_q: &dyn BackendStorage,
+        gamma_k: &dyn BackendStorage,
+        w_codes: &dyn BackendStorage,
+        w_exps: &dyn BackendStorage,
+        q_out: Option<&dyn BackendStorage>,
+        k_cache: Option<&dyn BackendStorage>,
+        v_cache: Option<&dyn BackendStorage>,
+        out_all: Option<&dyn BackendStorage>,
+        positions: Option<&dyn BackendStorage>,
+        m: usize,
+        k: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        rope_theta: f32,
+        inv_freq: Option<&dyn BackendStorage>,
+        mscale: f32,
+        eps: f32,
+        max_seq_len: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        self.fused_mxfp4_gemm_qk_norm_rope_kv(
+            x,
+            gamma_q,
+            gamma_k,
+            w_codes,
+            w_exps,
+            q_out,
+            k_cache,
+            v_cache,
+            out_all,
+            positions,
+            m,
+            k,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            rope_theta,
+            inv_freq,
+            mscale,
+            eps,
+            max_seq_len,
+        )
     }
 
     /// Broadcast 1-D bias tensor `[out_dim]` into 2-D storage `[batch, out_dim]` via `grim_broadcast_bias`.
@@ -7396,6 +7697,7 @@ impl RocmDevice {
     }
 
     /// Launch the JIT compiled MXFP4 fused dequantization matmul kernel (Jay Tier).
+    #[allow(dead_code)]
     pub(crate) fn launch_fused_dequant_gemm_mxfp4(
         &self,
         a_storage: &RocmStorage,
@@ -7513,6 +7815,1120 @@ impl RocmDevice {
                 arg(&mut kk),
             ],
         )
+    }
+
+    /// Launch the JIT compiled tiled MXFP4 GEMM kernel.
+    pub fn launch_mxfp4_gemm_tiled(
+        &self,
+        a_storage: &RocmStorage,
+        b_codes_storage: &RocmStorage,
+        b_exps_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mxfp4_gemm_tiled: a has no device ptr".into()))?;
+        let b_codes_ptr = b_codes_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mxfp4_gemm_tiled: b_codes has no device ptr".into()))?;
+        let b_exps_ptr = b_exps_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mxfp4_gemm_tiled: b_exps has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mxfp4_gemm_tiled: out has no device ptr".into()))?;
+
+        let block_dim = HipDim3::new(16, 16, 1);
+        let grid_x = ((n + 15) / 16) as u32;
+        let grid_y = ((m + 15) / 16) as u32;
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+
+        let mut aptr = a_ptr;
+        let mut bcodesptr = b_codes_ptr;
+        let mut bexpsptr = b_exps_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_mxfp4_gemm_tiled",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bcodesptr),
+                arg(&mut bexpsptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Launch the JIT compiled backward MXFP4 GEMM kernel (dA = dY @ B^T).
+    pub(crate) fn launch_mxfp4_backward_gemm(
+        &self,
+        dy_storage: &RocmStorage,
+        b_codes_storage: &RocmStorage,
+        b_exps_storage: &RocmStorage,
+        dx_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<*mut c_void> {
+        let dy_ptr = dy_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mxfp4_backward_gemm: dy has no device ptr".into()))?;
+        let b_codes_ptr = b_codes_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mxfp4_backward_gemm: b_codes has no device ptr".into()))?;
+        let b_exps_ptr = b_exps_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mxfp4_backward_gemm: b_exps has no device ptr".into()))?;
+        let dx_ptr = dx_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mxfp4_backward_gemm: dx has no device ptr".into()))?;
+
+        let block_dim = HipDim3::new(16, 16, 1);
+        let grid_x = ((k + 15) / 16) as u32;
+        let grid_y = ((m + 15) / 16) as u32;
+        let grid_dim = HipDim3::new(grid_x, grid_y, 1);
+
+        let mut dyptr = dy_ptr;
+        let mut bcodesptr = b_codes_ptr;
+        let mut bexpsptr = b_exps_ptr;
+        let mut dxptr = dx_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+
+        self.launch_compute_kernel(
+            "grim_mxfp4_backward_gemm",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut dyptr),
+                arg(&mut bcodesptr),
+                arg(&mut bexpsptr),
+                arg(&mut dxptr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+            ],
+        )
+    }
+
+    /// Launch the fused RMSNorm + MXFP4 GEMM kernel (e.g. for MLP projections).
+    pub fn launch_fused_rmsnorm_mxfp4_gemm(
+        &self,
+        x_storage: &RocmStorage,
+        gamma_storage: &RocmStorage,
+        w_codes_storage: &RocmStorage,
+        w_exps_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        eps: f32,
+    ) -> Result<*mut c_void> {
+        let x_ptr = x_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fused_rmsnorm_mxfp4_gemm: x has no device ptr".into()))?;
+        let gamma_ptr = gamma_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_rmsnorm_mxfp4_gemm: gamma has no device ptr".into())
+        })?;
+        let w_codes_ptr = w_codes_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_rmsnorm_mxfp4_gemm: w_codes has no device ptr".into())
+        })?;
+        let w_exps_ptr = w_exps_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_rmsnorm_mxfp4_gemm: w_exps has no device ptr".into())
+        })?;
+        let out_ptr = out_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_rmsnorm_mxfp4_gemm: out has no device ptr".into())
+        })?;
+
+        let block_dim = HipDim3::new(64, 1, 1);
+        let grid_dim = HipDim3::new(m as u32, ((n + 63) / 64) as u32, 1);
+
+        let mut xptr = x_ptr;
+        let mut gammaptr = gamma_ptr;
+        let mut wcodesptr = w_codes_ptr;
+        let mut wexpsptr = w_exps_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut eps_val = eps;
+
+        self.launch_compute_kernel_with_solution(
+            "grim_fused_rmsnorm_mxfp4_gemm",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut xptr),
+                arg(&mut gammaptr),
+                arg(&mut wcodesptr),
+                arg(&mut wexpsptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut eps_val),
+            ],
+            None,
+            64 * std::mem::size_of::<f32>(),
+        )
+    }
+
+    /// Launch the fused RMSNorm + MXFP4 GEMM + RoPE + direct KV cache scatter kernel.
+    pub fn launch_fused_rmsnorm_mxfp4_gemm_rope_kv(
+        &self,
+        x_storage: &RocmStorage,
+        gamma_storage: &RocmStorage,
+        w_codes_storage: &RocmStorage,
+        w_exps_storage: &RocmStorage,
+        q_out_storage: Option<&RocmStorage>,
+        k_cache_storage: Option<&RocmStorage>,
+        v_cache_storage: Option<&RocmStorage>,
+        out_all_storage: Option<&RocmStorage>,
+        positions_storage: Option<&RocmStorage>,
+        m: usize,
+        k: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        rope_theta: f32,
+        inv_freq_storage: Option<&RocmStorage>,
+        mscale: f32,
+        eps: f32,
+        max_seq_len: usize,
+    ) -> Result<*mut c_void> {
+        let x_ptr = x_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_rmsnorm_mxfp4_rope_kv: x has no device ptr".into())
+        })?;
+        let gamma_ptr = gamma_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_rmsnorm_mxfp4_rope_kv: gamma has no device ptr".into())
+        })?;
+        let w_codes_ptr = w_codes_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_rmsnorm_mxfp4_rope_kv: w_codes has no device ptr".into())
+        })?;
+        let w_exps_ptr = w_exps_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_rmsnorm_mxfp4_rope_kv: w_exps has no device ptr".into())
+        })?;
+
+        let q_out_ptr = q_out_storage.and_then(|s| s.device_ptr).unwrap_or(0);
+        let k_cache_ptr = k_cache_storage.and_then(|s| s.device_ptr).unwrap_or(0);
+        let v_cache_ptr = v_cache_storage.and_then(|s| s.device_ptr).unwrap_or(0);
+        let out_all_ptr = out_all_storage.and_then(|s| s.device_ptr).unwrap_or(0);
+        let positions_ptr = positions_storage.and_then(|s| s.device_ptr).unwrap_or(0);
+        let inv_freq_ptr = inv_freq_storage.and_then(|s| s.device_ptr).unwrap_or(0);
+
+        let n_total = (num_q_heads + 2 * num_kv_heads) * head_dim;
+        let block_dim = HipDim3::new(64, 1, 1);
+        let grid_dim = HipDim3::new(m as u32, ((n_total + 63) / 64) as u32, 1);
+
+        let mut xptr = x_ptr;
+        let mut gammaptr = gamma_ptr;
+        let mut wcodesptr = w_codes_ptr;
+        let mut wexpsptr = w_exps_ptr;
+        let mut qptr = q_out_ptr;
+        let mut kptr = k_cache_ptr;
+        let mut vptr = v_cache_ptr;
+        let mut allptr = out_all_ptr;
+        let mut posptr = positions_ptr;
+        let mut mm = m as i32;
+        let mut kk = k as i32;
+        let mut nq = num_q_heads as i32;
+        let mut nkv = num_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut rd = rotary_dim as i32;
+        let mut theta = rope_theta;
+        let mut invfreqptr = inv_freq_ptr;
+        let mut mscale_val = mscale;
+        let mut eps_val = eps;
+        let mut max_seq = max_seq_len as i32;
+
+        self.launch_compute_kernel_with_solution(
+            "grim_fused_rmsnorm_mxfp4_gemm_rope_kv",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut xptr),
+                arg(&mut gammaptr),
+                arg(&mut wcodesptr),
+                arg(&mut wexpsptr),
+                arg(&mut qptr),
+                arg(&mut kptr),
+                arg(&mut vptr),
+                arg(&mut allptr),
+                arg(&mut posptr),
+                arg(&mut mm),
+                arg(&mut kk),
+                arg(&mut nq),
+                arg(&mut nkv),
+                arg(&mut hd),
+                arg(&mut rd),
+                arg(&mut theta),
+                arg(&mut invfreqptr),
+                arg(&mut mscale_val),
+                arg(&mut eps_val),
+                arg(&mut max_seq),
+            ],
+            None,
+            64 * std::mem::size_of::<f32>(),
+        )
+    }
+
+    /// Launch LFM2-style fused QKV projection: MXFP4 GEMM (x @ W_qkv) followed by
+    /// per-head QK-Norm + RoPE (YaRN-aware). The GEMM result is staged in a scratch
+    /// buffer (or `out_all` if provided) and consumed by `grim_qk_norm_rope`.
+    pub fn launch_fused_mxfp4_gemm_qk_norm_rope_kv(
+        &self,
+        x_storage: &RocmStorage,
+        gamma_q_storage: &RocmStorage,
+        gamma_k_storage: &RocmStorage,
+        w_codes_storage: &RocmStorage,
+        w_exps_storage: &RocmStorage,
+        q_out_storage: Option<&RocmStorage>,
+        k_cache_storage: Option<&RocmStorage>,
+        v_cache_storage: Option<&RocmStorage>,
+        out_all_storage: Option<&RocmStorage>,
+        positions_storage: Option<&RocmStorage>,
+        m: usize,
+        k: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        rope_theta: f32,
+        inv_freq_storage: Option<&RocmStorage>,
+        mscale: f32,
+        eps: f32,
+        max_seq_len: usize,
+    ) -> Result<*mut c_void> {
+        let gamma_q_ptr = gamma_q_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fused_mxfp4_gemm_qk_norm_rope_kv: gamma_q has no device ptr".into()))?;
+        let gamma_k_ptr = gamma_k_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("fused_mxfp4_gemm_qk_norm_rope_kv: gamma_k has no device ptr".into()))?;
+
+        let n_q = num_q_heads * head_dim;
+        let n_k = num_kv_heads * head_dim;
+        let n_total = n_q + 2 * n_k;
+
+        // Stage the raw QKV GEMM output. Reuse `out_all` if supplied; otherwise
+        // allocate a transient scratch buffer freed after the stream syncs.
+        let scratch = if out_all_storage.is_some() {
+            None
+        } else {
+            Some(RocmStorage::alloc_gpu(
+                &Shape::from_slice(&[m, n_total]),
+                dtype_f32(),
+                &self.allocator,
+                self.ordinal,
+            )?)
+        };
+        let gemm_storage: &RocmStorage = match (out_all_storage, &scratch) {
+            (Some(o), _) => o,
+            (None, Some(s)) => s,
+            (None, None) => unreachable!(),
+        };
+        let gemm_ptr = gemm_storage.device_ptr.ok_or_else(|| {
+            Error::Backend("fused_mxfp4_gemm_qk_norm_rope_kv: gemm buffer has no device ptr".into())
+        })?;
+
+        // Phase 1: MXFP4 GEMM -> gemm_out (C = x @ W_qkv)
+        self.launch_mxfp4_gemm_tiled(
+            x_storage,
+            w_codes_storage,
+            w_exps_storage,
+            gemm_storage,
+            m,
+            n_total,
+            k,
+        )?;
+
+        // Phase 2: per-head QK-Norm + RoPE -> q_out / k_cache / v_cache
+        let q_out_ptr = q_out_storage.and_then(|s| s.device_ptr).unwrap_or(0);
+        let k_cache_ptr = k_cache_storage.and_then(|s| s.device_ptr).unwrap_or(0);
+        let v_cache_ptr = v_cache_storage.and_then(|s| s.device_ptr).unwrap_or(0);
+        let positions_ptr = positions_storage.and_then(|s| s.device_ptr).unwrap_or(0);
+        let inv_freq_ptr = inv_freq_storage.and_then(|s| s.device_ptr).unwrap_or(0);
+
+        let total = m * (num_q_heads + 2 * num_kv_heads);
+        let (grid, block) = linear_launch(total);
+
+        let mut gemmptr = gemm_ptr;
+        let mut gqptr = gamma_q_ptr;
+        let mut gkptr = gamma_k_ptr;
+        let mut posptr = positions_ptr;
+        let mut qptr = q_out_ptr;
+        let mut kptr = k_cache_ptr;
+        let mut vptr = v_cache_ptr;
+        let mut mm = m as i32;
+        let mut nq = num_q_heads as i32;
+        let mut nkv = num_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut rd = rotary_dim as i32;
+        let mut theta = rope_theta;
+        let mut invfreqptr = inv_freq_ptr;
+        let mut mscale_val = mscale;
+        let mut eps_val = eps;
+        let mut max_seq = max_seq_len as i32;
+
+        let stream = self.launch_compute_kernel(
+            "grim_qk_norm_rope",
+            grid,
+            block,
+            &mut [
+                arg(&mut gemmptr),
+                arg(&mut gqptr),
+                arg(&mut gkptr),
+                arg(&mut posptr),
+                arg(&mut qptr),
+                arg(&mut kptr),
+                arg(&mut vptr),
+                arg(&mut mm),
+                arg(&mut nq),
+                arg(&mut nkv),
+                arg(&mut hd),
+                arg(&mut rd),
+                arg(&mut theta),
+                arg(&mut invfreqptr),
+                arg(&mut mscale_val),
+                arg(&mut eps_val),
+                arg(&mut max_seq),
+            ],
+        )?;
+
+        // Free the transient scratch buffer after the work completes.
+        if scratch.is_some() {
+            unsafe {
+                if self.active_capture_stream().is_none() {
+                    let _ = hipStreamSynchronize(
+                        stream
+                            .as_ref()
+                            .map(|_| self.active_stream())
+                            .unwrap_or(std::ptr::null_mut()),
+                    );
+                }
+                hipFree(gemm_ptr as *mut c_void);
+            }
+        }
+
+        Ok(stream)
+    }
+
+    /// Launch FlashDecoding (Split-KV Parallel Attention) across sequence chunks + merge reduction.
+    pub fn launch_flash_decode(
+        &self,
+        q_storage: &RocmStorage,
+        k_storage: &RocmStorage,
+        v_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        kv_seq_len: usize,
+        num_splits: usize,
+    ) -> Result<*mut c_void> {
+        let q_ptr = q_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("flash_decode: q has no device ptr".into()))?;
+        let k_ptr = k_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("flash_decode: k has no device ptr".into()))?;
+        let v_ptr = v_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("flash_decode: v has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("flash_decode: out has no device ptr".into()))?;
+
+        let num_splits = num_splits.max(1);
+        let mid_out_storage = RocmStorage::alloc_gpu(
+            &Shape::new(vec![num_splits, num_heads, head_dim]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let mid_max_storage = RocmStorage::alloc_gpu(
+            &Shape::new(vec![num_splits, num_heads]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+        let mid_sum_storage = RocmStorage::alloc_gpu(
+            &Shape::new(vec![num_splits, num_heads]),
+            dtype_f32(),
+            &self.allocator,
+            self.ordinal,
+        )?;
+
+        let mut mid_out_ptr = dev_ptr(&mid_out_storage)?;
+        let mut mid_max_ptr = dev_ptr(&mid_max_storage)?;
+        let mut mid_sum_ptr = dev_ptr(&mid_sum_storage)?;
+
+        let block_dim = HipDim3::new(head_dim.max(32).next_power_of_two() as u32, 1, 1);
+        let grid_stage1 = HipDim3::new(num_heads as u32, num_splits as u32, 1);
+
+        let mut qptr = q_ptr;
+        let mut kptr = k_ptr;
+        let mut vptr = v_ptr;
+        let mut nh = num_heads as i32;
+        let mut nkvh = num_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut slen = kv_seq_len as i32;
+        let mut nsplits = num_splits as i32;
+        let mut inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
+
+        // Stage 1
+        let lds_stage1_bytes = (head_dim + block_dim.x as usize) * std::mem::size_of::<f32>();
+        self.launch_compute_kernel_with_solution(
+            "grim_flash_decode_stage1",
+            grid_stage1,
+            block_dim,
+            &mut [
+                arg(&mut qptr),
+                arg(&mut kptr),
+                arg(&mut vptr),
+                arg(&mut mid_out_ptr),
+                arg(&mut mid_max_ptr),
+                arg(&mut mid_sum_ptr),
+                arg(&mut nh),
+                arg(&mut nkvh),
+                arg(&mut hd),
+                arg(&mut slen),
+                arg(&mut nsplits),
+                arg(&mut inv_sqrt_d),
+            ],
+            None,
+            lds_stage1_bytes,
+        )?;
+
+        // Stage 2
+        let grid_stage2 = HipDim3::new(num_heads as u32, 1, 1);
+        let mut optr = out_ptr;
+        self.launch_compute_kernel(
+            "grim_flash_decode_stage2",
+            grid_stage2,
+            block_dim,
+            &mut [
+                arg(&mut mid_out_ptr),
+                arg(&mut mid_max_ptr),
+                arg(&mut mid_sum_ptr),
+                arg(&mut optr),
+                arg(&mut nh),
+                arg(&mut hd),
+                arg(&mut nsplits),
+            ],
+        )
+    }
+
+    /// Launch DeepSeek Multi-Head Latent Attention (MLA) Matrix-Absorbed Decode.
+    pub fn launch_mla_absorbed_decode(
+        &self,
+        q_absorbed: &RocmStorage,
+        q_rope: &RocmStorage,
+        kv_cache: &RocmStorage,
+        w_uv: Option<&RocmStorage>,
+        out: &RocmStorage,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        qk_rope_dim: usize,
+        v_head_dim: usize,
+        seq_len: usize,
+    ) -> Result<*mut c_void> {
+        let q_abs_ptr = q_absorbed
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mla_absorbed_decode: q_absorbed has no device ptr".into()))?;
+        let q_rope_ptr = q_rope
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mla_absorbed_decode: q_rope has no device ptr".into()))?;
+        let kv_ptr = kv_cache
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mla_absorbed_decode: kv_cache has no device ptr".into()))?;
+        let out_ptr = out
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mla_absorbed_decode: out has no device ptr".into()))?;
+        let w_uv_ptr = w_uv.and_then(|s| s.device_ptr).unwrap_or(0);
+        let has_w_uv = if w_uv.is_some() { 1i32 } else { 0i32 };
+
+        let block_dim = HipDim3::new(256, 1, 1);
+        let grid_dim = HipDim3::new(num_heads as u32, 1, 1);
+
+        let mut qabsptr = q_abs_ptr;
+        let mut qropeptr = q_rope_ptr;
+        let mut kvptr = kv_ptr;
+        let mut wuvptr = w_uv_ptr;
+        let mut optr = out_ptr;
+        let mut nh = num_heads as i32;
+        let mut lora_r = kv_lora_rank as i32;
+        let mut rope_d = qk_rope_dim as i32;
+        let mut v_dim = v_head_dim as i32;
+        let mut slen = seq_len as i32;
+        let mut inv_sqrt = 1.0f32 / ((kv_lora_rank + qk_rope_dim) as f32).sqrt();
+        let mut has_w = has_w_uv;
+
+        let lds_bytes = 256 * std::mem::size_of::<f32>();
+        self.launch_compute_kernel_with_solution(
+            "grim_mla_absorbed_decode",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut qabsptr),
+                arg(&mut qropeptr),
+                arg(&mut kvptr),
+                arg(&mut wuvptr),
+                arg(&mut optr),
+                arg(&mut nh),
+                arg(&mut lora_r),
+                arg(&mut rope_d),
+                arg(&mut v_dim),
+                arg(&mut slen),
+                arg(&mut inv_sqrt),
+                arg(&mut has_w),
+            ],
+            None,
+            lds_bytes,
+        )
+    }
+
+    /// Launch Marlin-style Interleaved W4A16 GEMM.
+    pub fn launch_marlin_gemm_w4a16(
+        &self,
+        a_storage: &RocmStorage,
+        b_w4_storage: &RocmStorage,
+        scales_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("marlin_gemm: a has no device ptr".into()))?;
+        let b_ptr = b_w4_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("marlin_gemm: b has no device ptr".into()))?;
+        let scales_ptr = scales_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("marlin_gemm: scales has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("marlin_gemm: out has no device ptr".into()))?;
+
+        let block_dim = HipDim3::new(16, 16, 1);
+        let grid_dim = HipDim3::new(((n + 15) / 16) as u32, ((m + 15) / 16) as u32, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut sptr = scales_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut gs = group_size as i32;
+
+        let kernel_name = if out_storage.dtype.arith == grim_tensor::ArithType::F16 {
+            "grim_marlin_gemm_w4a16"
+        } else {
+            "grim_marlin_gemm_w4a16_f32"
+        };
+
+        self.launch_compute_kernel(
+            kernel_name,
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut sptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut gs),
+            ],
+        )
+    }
+
+    /// Launch BitNet b1.58 Ternary GEMM (W1.58A8).
+    pub fn launch_bitnet_gemm_w158a8(
+        &self,
+        a_storage: &RocmStorage,
+        b_ternary_storage: &RocmStorage,
+        scale_b_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        scale_a: f32,
+    ) -> Result<*mut c_void> {
+        let a_ptr = a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("bitnet_gemm: a has no device ptr".into()))?;
+        let b_ptr = b_ternary_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("bitnet_gemm: b has no device ptr".into()))?;
+        let scale_b_ptr = scale_b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("bitnet_gemm: scale_b has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("bitnet_gemm: out has no device ptr".into()))?;
+
+        let block_dim = HipDim3::new(16, 16, 1);
+        let grid_dim = HipDim3::new(((n + 15) / 16) as u32, ((m + 15) / 16) as u32, 1);
+
+        let mut aptr = a_ptr;
+        let mut bptr = b_ptr;
+        let mut sbptr = scale_b_ptr;
+        let mut optr = out_ptr;
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut sa = scale_a;
+
+        self.launch_compute_kernel(
+            "grim_bitnet_gemm_w158a8",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut aptr),
+                arg(&mut bptr),
+                arg(&mut sbptr),
+                arg(&mut optr),
+                arg(&mut mm),
+                arg(&mut nn),
+                arg(&mut kk),
+                arg(&mut sa),
+            ],
+        )
+    }
+
+    /// Launch Extend Attention Chunk kernel across context slice [chunk_start, chunk_end).
+    pub fn launch_extend_attention_chunk(
+        &self,
+        q_storage: &RocmStorage,
+        k_cache_storage: &RocmStorage,
+        v_cache_storage: &RocmStorage,
+        chunk_out_storage: &RocmStorage,
+        chunk_lse_storage: &RocmStorage,
+        num_tokens: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        chunk_start: usize,
+        chunk_end: usize,
+    ) -> Result<*mut c_void> {
+        let q_ptr = q_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("extend_attention: q has no device ptr".into()))?;
+        let k_ptr = k_cache_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("extend_attention: k has no device ptr".into()))?;
+        let v_ptr = v_cache_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("extend_attention: v has no device ptr".into()))?;
+        let out_ptr = chunk_out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("extend_attention: out has no device ptr".into()))?;
+        let lse_ptr = chunk_lse_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("extend_attention: lse has no device ptr".into()))?;
+
+        let block_dim = HipDim3::new(head_dim.max(32).next_power_of_two() as u32, 1, 1);
+        let grid_dim = HipDim3::new(num_tokens as u32, num_heads as u32, 1);
+
+        let mut qptr = q_ptr;
+        let mut kptr = k_ptr;
+        let mut vptr = v_ptr;
+        let mut optr = out_ptr;
+        let mut lseptr = lse_ptr;
+        let mut nt = num_tokens as i32;
+        let mut nh = num_heads as i32;
+        let mut nkvh = num_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut cstart = chunk_start as i32;
+        let mut cend = chunk_end as i32;
+        let mut inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
+
+        let lds_bytes = (head_dim + block_dim.x as usize) * std::mem::size_of::<f32>();
+        self.launch_compute_kernel_with_solution(
+            "grim_extend_attention_chunk",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut qptr),
+                arg(&mut kptr),
+                arg(&mut vptr),
+                arg(&mut optr),
+                arg(&mut lseptr),
+                arg(&mut nt),
+                arg(&mut nh),
+                arg(&mut nkvh),
+                arg(&mut hd),
+                arg(&mut cstart),
+                arg(&mut cend),
+                arg(&mut inv_sqrt_d),
+            ],
+            None,
+            lds_bytes,
+        )
+    }
+
+    /// Launch Log-Sum-Exp Attention State Merging kernel.
+    pub fn launch_merge_attn_states(
+        &self,
+        out_a_storage: &RocmStorage,
+        lse_a_storage: &RocmStorage,
+        out_b_storage: &RocmStorage,
+        lse_b_storage: &RocmStorage,
+        out_merged_storage: &RocmStorage,
+        lse_merged_storage: &RocmStorage,
+        num_tokens: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Result<*mut c_void> {
+        let out_a_ptr = out_a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("merge_attn_states: out_a has no device ptr".into()))?;
+        let lse_a_ptr = lse_a_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("merge_attn_states: lse_a has no device ptr".into()))?;
+        let out_b_ptr = out_b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("merge_attn_states: out_b has no device ptr".into()))?;
+        let lse_b_ptr = lse_b_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("merge_attn_states: lse_b has no device ptr".into()))?;
+        let out_m_ptr = out_merged_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("merge_attn_states: out_merged has no device ptr".into()))?;
+        let lse_m_ptr = lse_merged_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("merge_attn_states: lse_merged has no device ptr".into()))?;
+
+        let block_dim = HipDim3::new(head_dim.max(32).next_power_of_two() as u32, 1, 1);
+        let grid_dim = HipDim3::new(num_tokens as u32, num_heads as u32, 1);
+
+        let mut a_ptr = out_a_ptr;
+        let mut la_ptr = lse_a_ptr;
+        let mut b_ptr = out_b_ptr;
+        let mut lb_ptr = lse_b_ptr;
+        let mut m_ptr = out_m_ptr;
+        let mut lm_ptr = lse_m_ptr;
+        let mut nt = num_tokens as i32;
+        let mut nh = num_heads as i32;
+        let mut hd = head_dim as i32;
+
+        self.launch_compute_kernel(
+            "grim_merge_attn_states",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a_ptr),
+                arg(&mut la_ptr),
+                arg(&mut b_ptr),
+                arg(&mut lb_ptr),
+                arg(&mut m_ptr),
+                arg(&mut lm_ptr),
+                arg(&mut nt),
+                arg(&mut nh),
+                arg(&mut hd),
+            ],
+        )
+    }
+
+    /// Launch Reshape and Cache into Preshuffled Layout kernel.
+    pub fn launch_reshape_and_cache_preshuffled(
+        &self,
+        key_storage: &RocmStorage,
+        value_storage: &RocmStorage,
+        k_cache_storage: &RocmStorage,
+        v_cache_storage: &RocmStorage,
+        slot_mapping_storage: &RocmStorage,
+        num_tokens: usize,
+        num_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+    ) -> Result<*mut c_void> {
+        let k_ptr = key_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("reshape_preshuffled: key has no device ptr".into()))?;
+        let v_ptr = value_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("reshape_preshuffled: value has no device ptr".into()))?;
+        let kc_ptr = k_cache_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("reshape_preshuffled: k_cache has no device ptr".into()))?;
+        let vc_ptr = v_cache_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("reshape_preshuffled: v_cache has no device ptr".into()))?;
+        let sm_ptr = slot_mapping_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("reshape_preshuffled: slot_mapping has no device ptr".into()))?;
+
+        let block_dim = HipDim3::new(head_dim as u32, 1, 1);
+        let grid_dim = HipDim3::new(num_tokens as u32, num_heads as u32, 1);
+
+        let mut kptr = k_ptr;
+        let mut vptr = v_ptr;
+        let mut kcptr = kc_ptr;
+        let mut vcptr = vc_ptr;
+        let mut smptr = sm_ptr;
+        let mut nt = num_tokens as i32;
+        let mut nh = num_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = block_size as i32;
+
+        self.launch_compute_kernel(
+            "grim_reshape_and_cache_preshuffled",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut kptr),
+                arg(&mut vptr),
+                arg(&mut kcptr),
+                arg(&mut vcptr),
+                arg(&mut smptr),
+                arg(&mut nt),
+                arg(&mut nh),
+                arg(&mut hd),
+                arg(&mut bs),
+            ],
+        )
+    }
+
+    /// Launch Preshuffled Paged Attention Decode kernel.
+    pub fn launch_preshuffled_paged_attention(
+        &self,
+        q_storage: &RocmStorage,
+        k_cache_storage: &RocmStorage,
+        v_cache_storage: &RocmStorage,
+        block_tables_storage: &RocmStorage,
+        context_lens_storage: &RocmStorage,
+        out_storage: &RocmStorage,
+        num_seqs: usize,
+        num_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        max_num_blocks_per_seq: usize,
+    ) -> Result<*mut c_void> {
+        let q_ptr = q_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("preshuffled_paged_attn: q has no device ptr".into()))?;
+        let kc_ptr = k_cache_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("preshuffled_paged_attn: k_cache has no device ptr".into()))?;
+        let vc_ptr = v_cache_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("preshuffled_paged_attn: v_cache has no device ptr".into()))?;
+        let bt_ptr = block_tables_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("preshuffled_paged_attn: block_tables has no device ptr".into()))?;
+        let cl_ptr = context_lens_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("preshuffled_paged_attn: context_lens has no device ptr".into()))?;
+        let out_ptr = out_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("preshuffled_paged_attn: out has no device ptr".into()))?;
+
+        let block_dim = HipDim3::new(head_dim.max(32).next_power_of_two() as u32, 1, 1);
+        let grid_dim = HipDim3::new(num_seqs as u32, num_heads as u32, 1);
+
+        let mut qptr = q_ptr;
+        let mut kcptr = kc_ptr;
+        let mut vcptr = vc_ptr;
+        let mut btptr = bt_ptr;
+        let mut clptr = cl_ptr;
+        let mut optr = out_ptr;
+        let mut nseqs = num_seqs as i32;
+        let mut nh = num_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = block_size as i32;
+        let mut max_b = max_num_blocks_per_seq as i32;
+        let mut inv_sqrt_d = 1.0f32 / (head_dim as f32).sqrt();
+
+        let lds_bytes = (head_dim + block_dim.x as usize) * std::mem::size_of::<f32>();
+        self.launch_compute_kernel_with_solution(
+            "grim_preshuffled_paged_attention",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut qptr),
+                arg(&mut kcptr),
+                arg(&mut vcptr),
+                arg(&mut btptr),
+                arg(&mut clptr),
+                arg(&mut optr),
+                arg(&mut nseqs),
+                arg(&mut nh),
+                arg(&mut hd),
+                arg(&mut bs),
+                arg(&mut max_b),
+                arg(&mut inv_sqrt_d),
+            ],
+            None,
+            lds_bytes,
+        )
+    }
+
+    /// Launch Multimodal 3D Rotary Position Embedding (M-RoPE) for Q and K tensors.
+    pub fn launch_mrope_qk(
+        &self,
+        q_storage: &RocmStorage,
+        k_storage: &RocmStorage,
+        positions_storage: &RocmStorage,
+        num_tokens: usize,
+        num_q_heads: usize,
+        num_k_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        section_t: usize,
+        section_h: usize,
+        section_w: usize,
+        rope_theta: f32,
+    ) -> Result<*mut c_void> {
+        let q_ptr = q_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mrope_qk: q has no device ptr".into()))?;
+        let k_ptr = k_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mrope_qk: k has no device ptr".into()))?;
+        let pos_ptr = positions_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("mrope_qk: positions has no device ptr".into()))?;
+
+        let block_dim = HipDim3::new((rotary_dim / 2) as u32, 1, 1);
+        let grid_dim = HipDim3::new(num_tokens as u32, (num_q_heads + num_k_heads) as u32, 1);
+
+        let mut qptr = q_ptr;
+        let mut kptr = k_ptr;
+        let mut posptr = pos_ptr;
+        let mut nt = num_tokens as i32;
+        let mut nqh = num_q_heads as i32;
+        let mut nkh = num_k_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut rd = rotary_dim as i32;
+        let mut st = section_t as i32;
+        let mut sh = section_h as i32;
+        let mut sw = section_w as i32;
+        let mut theta = rope_theta;
+
+        self.launch_compute_kernel(
+            "grim_mrope_qk",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut qptr),
+                arg(&mut kptr),
+                arg(&mut posptr),
+                arg(&mut nt),
+                arg(&mut nqh),
+                arg(&mut nkh),
+                arg(&mut hd),
+                arg(&mut rd),
+                arg(&mut st),
+                arg(&mut sh),
+                arg(&mut sw),
+                arg(&mut theta),
+            ],
+        )
+    }
+
+    /// Launch GPU Speculative Rejection Sampling kernel.
+    pub fn launch_speculative_rejection_sample(
+        &self,
+        target_probs_storage: &RocmStorage,
+        draft_probs_storage: &RocmStorage,
+        draft_tokens_storage: &RocmStorage,
+        uniform_rands_storage: &RocmStorage,
+        accepted_tokens_storage: &RocmStorage,
+        accepted_lens_storage: &RocmStorage,
+        batch_size: usize,
+        num_draft_tokens: usize,
+        vocab_size: usize,
+    ) -> Result<*mut c_void> {
+        let tp_ptr = target_probs_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("spec_sample: target_probs has no device ptr".into()))?;
+        let dp_ptr = draft_probs_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("spec_sample: draft_probs has no device ptr".into()))?;
+        let dt_ptr = draft_tokens_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("spec_sample: draft_tokens has no device ptr".into()))?;
+        let ur_ptr = uniform_rands_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("spec_sample: uniform_rands has no device ptr".into()))?;
+        let at_ptr = accepted_tokens_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("spec_sample: accepted_tokens has no device ptr".into()))?;
+        let al_ptr = accepted_lens_storage
+            .device_ptr
+            .ok_or_else(|| Error::Backend("spec_sample: accepted_lens has no device ptr".into()))?;
+
+        let block_dim = HipDim3::new(256, 1, 1);
+        let grid_dim = HipDim3::new(batch_size as u32, 1, 1);
+
+        let mut tpptr = tp_ptr;
+        let mut dpptr = dp_ptr;
+        let mut dtptr = dt_ptr;
+        let mut urptr = ur_ptr;
+        let mut atptr = at_ptr;
+        let mut alptr = al_ptr;
+        let mut bs = batch_size as i32;
+        let mut ndt = num_draft_tokens as i32;
+        let mut vs = vocab_size as i32;
+
+        self.launch_compute_kernel(
+            "grim_speculative_rejection_sample",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut tpptr),
+                arg(&mut dpptr),
+                arg(&mut dtptr),
+                arg(&mut urptr),
+                arg(&mut atptr),
+                arg(&mut alptr),
+                arg(&mut bs),
+                arg(&mut ndt),
+                arg(&mut vs),
+            ],
+        )
+    }
+
+    /// Compute dynamic Expert Parallel Load Balancing (EPLB) greedy LPT placement.
+    pub fn eplb_balance_experts(
+        &self,
+        expert_frequencies: &[f32],
+        num_ranks: usize,
+        replication_slots: usize,
+    ) -> crate::device::eplb::EplbPackingPlan {
+        crate::device::eplb::EplbRouter::balance_experts(
+            expert_frequencies,
+            num_ranks,
+            replication_slots,
+        )
+    }
+
+    /// Plan continuous batch reordering into [Decode : Extend : Prefill] partitions.
+    pub fn reorder_batch(
+        &self,
+        sequences: &[crate::device::batch_orchestrator::SequenceMeta],
+    ) -> crate::device::batch_orchestrator::ReorderedBatch {
+        crate::device::batch_orchestrator::BatchReorderer::plan(sequences)
     }
 
     /// Launch the JIT compiled SplitK reduction kernel (WI-D).
@@ -8158,14 +9574,24 @@ impl RocmDevice {
             .map_err(|e| Error::Backend(format!("entry CString: {}", e)))?;
 
         // Load the HIP module once per unique kernel; reuse the cached module +
+        // Pin the current device to self.ordinal before loading: the JIT pipeline
+        // queries CapabilityProfiler which sweeps every device and can leave the
+        // thread on a foreign ordinal. Loading a gfx1201 hsaco on gfx1200 yields
+        // HIP error 209 (no binary for device).
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         let mut module_cache = self.module_cache.lock().unwrap();
         let (_module, func) = if let Some(cached) = module_cache.get(&cache_key) {
             *cached
         } else {
             let mut module: *mut c_void = std::ptr::null_mut();
-            check_hip("hipModuleLoad", unsafe {
-                hipModuleLoad(&mut module, path_c.as_ptr())
-            })?;
+            let load_res = unsafe { hipModuleLoad(&mut module, path_c.as_ptr()) };
+            if load_res != hipSuccess {
+                return Err(Error::Backend(format!(
+                    "hipModuleLoad failed: {load_res} (entry={entry}, path={}, gpu_target={})",
+                    path.display(),
+                    self.gpu_target
+                )));
+            }
             let mut func: *mut c_void = std::ptr::null_mut();
             let res = unsafe { hipModuleGetFunction(&mut func, module, entry_c.as_ptr()) };
             if res != hipSuccess {
@@ -8288,6 +9714,193 @@ impl RocmDevice {
             Box::new(storage),
             Box::new(RocmHandle::new(Some(self.active_stream()))),
         ))
+    }
+
+    /// High-level fused RMSNorm + MXFP4 GEMM (e.g. for MLP gate/up/down projections).
+    pub fn fused_rmsnorm_mxfp4_gemm(
+        &self,
+        x: &dyn BackendStorage,
+        gamma: &dyn BackendStorage,
+        w_codes: &dyn BackendStorage,
+        w_exps: &dyn BackendStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+        eps: f32,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_s = as_rocm(x)?;
+        let gamma_s = as_rocm(gamma)?;
+        let w_codes_s = as_rocm(w_codes)?;
+        let w_exps_s = as_rocm(w_exps)?;
+
+        let out_shape = Shape::new(vec![m, n]);
+        let out_storage =
+            RocmStorage::alloc_gpu(&out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+
+        self.launch_fused_rmsnorm_mxfp4_gemm(
+            x_s,
+            gamma_s,
+            w_codes_s,
+            w_exps_s,
+            &out_storage,
+            m,
+            n,
+            k,
+            eps,
+        )?;
+
+        Ok((
+            Box::new(out_storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
+    /// High-level fused RMSNorm + MXFP4 GEMM + RoPE + direct KV cache scatter.
+    pub fn fused_rmsnorm_mxfp4_gemm_rope_kv(
+        &self,
+        x: &dyn BackendStorage,
+        gamma: &dyn BackendStorage,
+        w_codes: &dyn BackendStorage,
+        w_exps: &dyn BackendStorage,
+        q_out: Option<&dyn BackendStorage>,
+        k_cache: Option<&dyn BackendStorage>,
+        v_cache: Option<&dyn BackendStorage>,
+        out_all: Option<&dyn BackendStorage>,
+        positions: Option<&dyn BackendStorage>,
+        m: usize,
+        k: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        rope_theta: f32,
+        inv_freq: Option<&dyn BackendStorage>,
+        mscale: f32,
+        eps: f32,
+        max_seq_len: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let x_s = as_rocm(x)?;
+        let gamma_s = as_rocm(gamma)?;
+        let w_codes_s = as_rocm(w_codes)?;
+        let w_exps_s = as_rocm(w_exps)?;
+
+        let q_out_s = match q_out {
+            Some(q) => Some(as_rocm(q)?),
+            None => None,
+        };
+        let k_cache_s = match k_cache {
+            Some(k) => Some(as_rocm(k)?),
+            None => None,
+        };
+        let v_cache_s = match v_cache {
+            Some(v) => Some(as_rocm(v)?),
+            None => None,
+        };
+        let out_all_s = match out_all {
+            Some(a) => Some(as_rocm(a)?),
+            None => None,
+        };
+        let positions_s = match positions {
+            Some(p) => Some(as_rocm(p)?),
+            None => None,
+        };
+        let inv_freq_s = match inv_freq {
+            Some(f) => Some(as_rocm(f)?),
+            None => None,
+        };
+
+        self.launch_fused_rmsnorm_mxfp4_gemm_rope_kv(
+            x_s,
+            gamma_s,
+            w_codes_s,
+            w_exps_s,
+            q_out_s,
+            k_cache_s,
+            v_cache_s,
+            out_all_s,
+            positions_s,
+            m,
+            k,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            rope_theta,
+            inv_freq_s,
+            mscale,
+            eps,
+            max_seq_len,
+        )?;
+
+        Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+    }
+
+    /// LFM2-style fused QKV projection: MXFP4 GEMM (C = x @ W_qkv) followed by
+    /// per-head QK-Norm + RoPE (YaRN-aware). Mirrors `fused_rmsnorm_mxfp4_gemm_rope_kv`
+    /// but applies the normalization *after* the projection (QK-norm) instead of
+    /// before it, matching QK-norm attention (e.g. LFM2). The input `x` is expected
+    /// to already carry any pre-attention RMSNorm the model applies.
+    pub fn fused_mxfp4_gemm_qk_norm_rope_kv(
+        &self,
+        x: &dyn BackendStorage,
+        gamma_q: &dyn BackendStorage,
+        gamma_k: &dyn BackendStorage,
+        w_codes: &dyn BackendStorage,
+        w_exps: &dyn BackendStorage,
+        q_out: Option<&dyn BackendStorage>,
+        k_cache: Option<&dyn BackendStorage>,
+        v_cache: Option<&dyn BackendStorage>,
+        out_all: Option<&dyn BackendStorage>,
+        positions: Option<&dyn BackendStorage>,
+        m: usize,
+        k: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        rope_theta: f32,
+        inv_freq: Option<&dyn BackendStorage>,
+        mscale: f32,
+        eps: f32,
+        max_seq_len: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let x_s = as_rocm(x)?;
+        let gamma_q_s = as_rocm(gamma_q)?;
+        let gamma_k_s = as_rocm(gamma_k)?;
+        let w_codes_s = as_rocm(w_codes)?;
+        let w_exps_s = as_rocm(w_exps)?;
+        let q_out_s = q_out.map(|q| as_rocm(q)).transpose()?;
+        let k_cache_s = k_cache.map(|k| as_rocm(k)).transpose()?;
+        let v_cache_s = v_cache.map(|v| as_rocm(v)).transpose()?;
+        let out_all_s = out_all.map(|a| as_rocm(a)).transpose()?;
+        let positions_s = positions.map(|p| as_rocm(p)).transpose()?;
+        let inv_freq_s = inv_freq.map(|f| as_rocm(f)).transpose()?;
+
+        self.launch_fused_mxfp4_gemm_qk_norm_rope_kv(
+            x_s,
+            gamma_q_s,
+            gamma_k_s,
+            w_codes_s,
+            w_exps_s,
+            q_out_s,
+            k_cache_s,
+            v_cache_s,
+            out_all_s,
+            positions_s,
+            m,
+            k,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            rope_theta,
+            inv_freq_s,
+            mscale,
+            eps,
+            max_seq_len,
+        )?;
+
+        Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
     }
 
     /// Fused Add + RMSNorm kernel.

@@ -9,11 +9,19 @@
 //! sole purpose of this module is correctness; performance tuning lives
 //! under Phase 2 / `.rocm-rocm-/...` skill guidance, not here.
 //!
-//! Dual-GPU test results (syd-beasty, ROCm 7.2.53211):
+//! Dual-GPU test results (multi-GPU RDNA4 system, ROCm 7.2.53211):
 //!   Hardware: RX 9070 XT (gfx1201, device 0) + RX 9060 XT (gfx1200, device 1)
 //!   — all 12/12 PASS (structural + GPU correctness), including
 //!   qkv_attention_gpu_matches_reference_when_enabled and
 //!   qkv_attention_gpu_head_dim_128_not_nan.
+//!
+//! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test qkv_attention
+//! RESULT: 10/12 PASS, 2/12 FAIL. The 2 failures
+//!   (qkv_attention_gpu_matches_reference_when_enabled,
+//!    qkv_attention_gpu_zero_kv_seq_len_not_nan) both panic with
+//!   `hipModuleLoad failed: 209` — the JIT-compiled QKV attention kernel is compiled
+//!   but the .hipfb binary is not registered for these test shapes on this RDNA4 box.
+//!   10 CPU-reference and structural tests pass.
 
 use grim_backend_rocm::{QkvAttentionFusionConfig, RocmDevice};
 use grim_tensor::{BackendDevice, DType, Shape};
@@ -102,8 +110,6 @@ fn approx_close(a: &[f32], b: &[f32], rel_tol: f32) -> bool {
     true
 }
 
-const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
-
 /// Empty-tensor corner: when cache_offset == 0 and seq_len == 0, the
 /// reference returns an empty Vec and the GPU path returns an empty
 /// output buffer; we don't crash. (Sanity that the new parameter set
@@ -112,7 +118,7 @@ const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
 fn qkv_attention_structural_empty_call() {
     // The host launcher requires the gate to be checked first; this case
     // amply demonstrates it returns Err when the gate is closed.
-    let env = std::env::var(GPU_TEST_ENV).is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     let dev = RocmDevice::try_new(0)
         .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
     let _ = env; // Reserved for future GPU-gated branches.
@@ -526,7 +532,7 @@ fn qkv_attention_config_default_enables_kernel() {
 /// Tolerance is the same `1e-3` relative error budget as Step 4.
 #[test]
 fn qkv_attention_gpu_matches_reference_when_enabled() {
-    let env = std::env::var(GPU_TEST_ENV).is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return;
     }
@@ -609,7 +615,7 @@ fn qkv_attention_gpu_matches_reference_when_enabled() {
 /// rejects with a structured error (PyTorch parity: no silent fallback).
 #[test]
 fn qkv_attention_gpu_rejects_bad_gqa_ratio() {
-    let env = std::env::var(GPU_TEST_ENV).is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return;
     }
@@ -658,7 +664,7 @@ fn qkv_attention_gpu_rejects_bad_gqa_ratio() {
 /// GPU-gated: when kv_seq_len is 0, the kernel must not divide by zero and produce NaN.
 #[test]
 fn qkv_attention_gpu_zero_kv_seq_len_not_nan() {
-    let env = std::env::var(GPU_TEST_ENV).is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return;
     }

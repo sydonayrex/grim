@@ -17,9 +17,10 @@ use grim_models_mamba::{
 use grim_models_transformer::{
     Bloom, BloomConfig, ChameleonConfig, CommandRConfig, DeepSeek, DeepSeekConfig, DeltaNetBase,
     DeltaNetBaseConfig, Falcon, FalconConfig, FalconH1Config, FalconH1Model, Gemma, GemmaConfig,
-    Gpt2, Gpt2Config, Laguna, LagunaConfig, Lfm2, Lfm2Config, Llama, LlamaConfig, MiniCpmConfig,
-    MiniCpmModel, Phi2, PhiConfig, Qwen, Qwen3Moe, Qwen3MoeConfig, Qwen35Moe, Qwen35MoeConfig,
-    QwenConfig, SmolLm2, SmolLm2Config, SolarOpen2, SolarOpen2Config, T5, T5Config,
+    Gpt2, Gpt2Config, Laguna, LagunaConfig, Lfm2, Lfm2Config, Llama, LlamaConfig, Mellum,
+    MellumConfig, MiniCpmConfig, MiniCpmModel, Phi2, PhiConfig, Qwen, Qwen3Moe, Qwen3MoeConfig,
+    Qwen35, Qwen35Config, Qwen35Moe, Qwen35MoeConfig, QwenConfig, SmolLm2, SmolLm2Config,
+    SolarOpen2, SolarOpen2Config, T5, T5Config,
 };
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::{TensorParallelConfig, WeightSource};
@@ -112,6 +113,33 @@ fn resolve_tp_ordinal() -> Result<(Option<usize>, Option<Vec<usize>>)> {
     Ok((Some(my_ordinal), Some(all_ordinals)))
 }
 
+/// Resolve discrete ROCm GPUs (honoring `GRIM_GPUS` and taking only dedicated GPUs 0 and 1,
+/// strictly excluding integrated APU devices).
+pub fn resolve_discrete_rocm_devices(fallback: &Device) -> Vec<Device> {
+    if let Ok(val) = std::env::var("GRIM_GPUS") {
+        let explicit: Vec<Device> = val
+            .split(',')
+            .filter_map(|t| t.trim().parse::<usize>().ok())
+            .map(Device::Rocm)
+            .collect();
+        if !explicit.is_empty() {
+            return explicit;
+        }
+    }
+
+    if let Ok(rocm_devices) = grim_backend_rocm::RocmDevice::probe() {
+        let discrete: Vec<Device> = rocm_devices
+            .iter()
+            .take(2)
+            .map(|d| Device::Rocm(d.ordinal()))
+            .collect();
+        if !discrete.is_empty() && !fallback.is_cpu() {
+            return discrete;
+        }
+    }
+    vec![fallback.clone()]
+}
+
 /// Debug-only logging macro. Compiles to a no-op in release builds so that
 /// diagnostic  calls do not pollute production stderr (sims.md issue #7).
 macro_rules! dbg_eprintln {
@@ -135,6 +163,24 @@ fn probe_host_wavefront_size(device: &Device) -> Option<u32> {
 }
 
 /// Attempt to resolve an `ArchCompatSpec` for an unknown architecture string,
+/// Read a sibling `config.json` from alongside a GGUF file, returning the contents
+/// as an `Option<&str>`. A missing sibling is optional — returns `None` so the
+/// caller falls back to the plugins-dir scan. This is the helper extracted from
+/// the GGUF load path so the config-reading fix has a regression test.
+///
+/// # Bug history
+///
+/// Prior to the extraction, the GGUF load path built a *path string* instead of
+/// reading file contents:
+///   `dir.join("config.json").to_str().map(|s| s.to_string())`
+/// which passed a path (e.g. "/path/config.json") as `config_raw`. `from_hf_config_json`
+fn read_sibling_config_json(path: &str) -> Option<String> {
+    let config_path = std::path::Path::new(path)
+        .parent()
+        .map(|dir| dir.join("config.json"))?;
+    std::fs::read_to_string(config_path).ok()
+}
+
 /// first from an inline HF `config.json` string, and second by searching installed
 /// `.grimplugin` manifests in `grim_plugins_dir()`.
 fn resolve_arch_compat_spec(arch_str: &str, config_raw: Option<&str>) -> Option<ArchCompatSpec> {
@@ -217,6 +263,10 @@ impl<'a> MetadataLookup for GgufMetadataLookup<'a> {
         if let Some(u) = v.as_u32() {
             dbg_eprintln!("[meta-get-u32] {key} = {u} (u32)");
             return Some(u);
+        }
+        if let Some(arr) = v.as_array() {
+            dbg_eprintln!("[meta-get-u32] {key} = {} (array.len)", arr.len());
+            return Some(arr.len() as u32);
         }
         if let Some(s) = v.as_str() {
             if let Ok(u) = s.parse::<u32>() {
@@ -774,8 +824,7 @@ fn load_model_from_config(
         }
         ModelArchitecture::Qwen
         | ModelArchitecture::Qwen2
-        | ModelArchitecture::Qwen3
-        | ModelArchitecture::Qwen35 => {
+        | ModelArchitecture::Qwen3 => {
             let qwen_cfg = QwenConfig {
                 vocab_size,
                 hidden_size,
@@ -790,6 +839,30 @@ fn load_model_from_config(
             };
             eprintln!("[grim] Loading Qwen model with config: {:?}", qwen_cfg);
             let m = Qwen::load_tp(device.clone(), &ws, qwen_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Qwen35 => {
+            let qwen35_cfg = Qwen35Config {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+                full_attention_interval: 4,
+                ssm_d_state: 128,
+                ssm_d_inner: 6144,
+                ssm_d_conv: 4,
+                ssm_dt_rank: 48,
+                ssm_n_group: 16,
+                devices: resolve_discrete_rocm_devices(&device),
+            };
+            eprintln!("[grim] Loading Qwen3.5 model with config: {:?}", qwen35_cfg);
+            let m = Qwen35::load_tp(device.clone(), &ws, qwen35_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen35Moe => {
@@ -821,6 +894,40 @@ fn load_model_from_config(
                 qwen35_moe_cfg
             );
             let m = Qwen35Moe::load_tp(device.clone(), &ws, qwen35_moe_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Mellum => {
+            let mellum_cfg = MellumConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                moe_intermediate_size: config.moe_intermediate_size.unwrap_or(896),
+                num_experts: expert_count,
+                num_experts_per_tok: expert_used_count,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+                sliding_window: 1024,
+                // Mellum2 uses YaRN RoPE on full-attention layers with these
+                // documented constants (matches the HF `rope_parameters`).
+                max_window_layers: 0,
+                yarn: Some(grim_tensor::YaRNParams {
+                    factor: 16.0,
+                    original_max_pos: 8192,
+                    beta_fast: 32.0,
+                    beta_slow: 1.0,
+                    attention_factor: 1.2772588722239782,
+                }),
+            };
+            eprintln!(
+                "[grim] Loading Mellum model with config: {:?}",
+                mellum_cfg
+            );
+            let m = Mellum::load_tp(device.clone(), &ws, mellum_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen2Moe
@@ -1167,6 +1274,9 @@ fn load_model_from_config(
                 n_swa: 0,
                 swa_type: 0,
                 n_embd_out: 0,
+                mxfp4_qkv_attention: std::env::var("GRIM_LFM2_MXFP4_QKV")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
             };
 
             let m = Lfm2::load_tp(&ws, cfg, tp)?;
@@ -1425,7 +1535,6 @@ fn load_model_from_config(
         | ModelArchitecture::Llama4
         | ModelArchitecture::LlamaEmbed
         | ModelArchitecture::MainCoder
-        | ModelArchitecture::Mellum
         | ModelArchitecture::Mimo2
         | ModelArchitecture::MiniMaxM2
         | ModelArchitecture::Mistral3
@@ -1492,7 +1601,7 @@ fn load_model_from_config(
                     });
                 let ws = WeightSource::root(&remapped_provider, device.clone()).with_tp_config(tp);
 
-                if spec.is_moe {
+                if spec.is_moe || spec.expert_count.unwrap_or(0) > 0 {
                     let moe_cfg = Qwen3MoeConfig {
                         vocab_size: spec.vocab_size,
                         hidden_size: spec.hidden_size,
@@ -1804,8 +1913,7 @@ fn load_model_with_providers(
         }
         ModelArchitecture::Qwen
         | ModelArchitecture::Qwen2
-        | ModelArchitecture::Qwen3
-        | ModelArchitecture::Qwen35 => {
+        | ModelArchitecture::Qwen3 => {
             let qwen_cfg = QwenConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -1820,6 +1928,61 @@ fn load_model_with_providers(
             };
             eprintln!("[grim] Loading Qwen model with config: {:?}", qwen_cfg);
             let m = Qwen::load_tp(device.clone(), &ws, qwen_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Qwen35 => {
+            let qwen35_cfg = Qwen35Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: {
+                    let devices = resolve_discrete_rocm_devices(&device);
+                    let mut min_free = u64::MAX;
+                    for dev in &devices {
+                        if let Device::Rocm(ord) = dev {
+                            let (free, _) = grim_backend_rocm::vram_info(*ord);
+                            if free > 0 && free < min_free {
+                                min_free = free;
+                            }
+                        }
+                    }
+                    if min_free != u64::MAX && min_free > 0 {
+                        let headroom = 1536 * 1024 * 1024;
+                        let avail = min_free.saturating_sub(headroom);
+                        let attn_layers_per_gpu = (hparams.num_layers / devices.len().max(1)).max(1) / hparams.full_attention_interval.unwrap_or(4).max(1);
+                        let kv_bytes_per_tok = (2 * hparams.num_kv_heads * hparams.head_dim * 4 * attn_layers_per_gpu).max(1) as u64;
+                        let max_safe = (avail / kv_bytes_per_tok) as usize;
+                        if max_safe < hparams.max_seq_len {
+                            let clamped = max_safe.max(1024);
+                            eprintln!(
+                                "[grim] VRAM budget: free={}MB/GPU, dynamically capping context length to {} tokens to ensure zero host spillage",
+                                min_free / (1024 * 1024),
+                                clamped
+                            );
+                            clamped
+                        } else {
+                            hparams.max_seq_len
+                        }
+                    } else {
+                        hparams.max_seq_len
+                    }
+                },
+                full_attention_interval: hparams.full_attention_interval.unwrap_or(4),
+                ssm_d_state: hparams.ssm_d_state.unwrap_or(128),
+                ssm_d_inner: hparams.ssm_d_inner.unwrap_or(6144),
+                ssm_d_conv: hparams.ssm_d_conv.unwrap_or(4),
+                ssm_dt_rank: hparams.ssm_dt_rank.unwrap_or(48),
+                ssm_n_group: hparams.ssm_n_group.unwrap_or(16),
+                devices: resolve_discrete_rocm_devices(&device),
+            };
+            eprintln!("[grim] Loading Qwen3.5/3.8 model with config: {:?}", qwen35_cfg);
+            let m = Qwen35::load_tp(device.clone(), &ws, qwen35_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen35Moe => {
@@ -1865,6 +2028,40 @@ fn load_model_with_providers(
                 qwen35_moe_cfg
             );
             let m = Qwen35Moe::load_tp(device.clone(), &ws, qwen35_moe_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Mellum => {
+            let mellum_cfg = MellumConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                moe_intermediate_size: hparams.expert_feed_forward_length.unwrap_or(896),
+                num_experts: hparams.expert_count.unwrap_or(64),
+                num_experts_per_tok: hparams.expert_used_count.unwrap_or(8),
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+                sliding_window: 1024,
+                // Mellum2 uses YaRN RoPE on full-attention layers with these
+                // documented constants (matches the HF `rope_parameters`).
+                max_window_layers: 0,
+                yarn: Some(grim_tensor::YaRNParams {
+                    factor: 16.0,
+                    original_max_pos: 8192,
+                    beta_fast: 32.0,
+                    beta_slow: 1.0,
+                    attention_factor: 1.2772588722239782,
+                }),
+            };
+            eprintln!(
+                "[grim] Loading Mellum model with config: {:?}",
+                mellum_cfg
+            );
+            let m = Mellum::load_tp(device.clone(), &ws, mellum_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::Qwen2Moe
@@ -2237,6 +2434,9 @@ fn load_model_with_providers(
                 n_swa: 0,
                 swa_type: 0,
                 n_embd_out: 0,
+                mxfp4_qkv_attention: std::env::var("GRIM_LFM2_MXFP4_QKV")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
             };
             let m = Lfm2::load_tp(&ws, cfg, tp)?;
             Ok(Box::new(m))
@@ -2700,7 +2900,6 @@ fn load_model_with_providers(
         | ModelArchitecture::Llama4
         | ModelArchitecture::LlamaEmbed
         | ModelArchitecture::MainCoder
-        | ModelArchitecture::Mellum
         | ModelArchitecture::Mimo2
         | ModelArchitecture::MiniMaxM2
         | ModelArchitecture::Mistral3
@@ -2757,12 +2956,13 @@ fn load_model_with_providers(
         _ => {
             // Check for a sibling config.json alongside the GGUF file to
             // enrich ArchCompatSpec resolution for known HF architectures.
-            let hf_config_json = std::path::Path::new(path)
-                .parent()
-                .and_then(|dir| dir.join("config.json").to_str().map(|s| s.to_string()));
-            let config_raw = hf_config_json.as_deref();
+            // Read the file *contents* (not just the path) so that
+            // resolve_arch_compat_spec's inline-config branch can parse it.
+            // A missing sibling config.json is optional — fall back to the
+            // plugins-dir scan, don't error.
+            let config_raw = read_sibling_config_json(path);
 
-            if let Some(spec) = resolve_arch_compat_spec(arch_str, config_raw) {
+            if let Some(spec) = resolve_arch_compat_spec(arch_str, config_raw.as_deref()) {
                 eprintln!(
                     "[grim] Resolved unknown GGUF architecture '{}' via ArchCompatSpec plugin (base='{}', is_moe={})",
                     arch_str, spec.base_architecture, spec.is_moe
@@ -2774,7 +2974,10 @@ fn load_model_with_providers(
                     });
                 let ws = WeightSource::root(&remapped_provider, device.clone()).with_tp_config(tp);
 
-                if spec.is_moe {
+                if spec.is_moe || hparams.expert_count.unwrap_or(0) > 0 {
+                    let intermediate = hparams
+                        .expert_feed_forward_length
+                        .unwrap_or(hparams.intermediate_size);
                     let moe_cfg = Qwen3MoeConfig {
                         vocab_size: hparams.vocab_size,
                         hidden_size: hparams.hidden_size,
@@ -2782,7 +2985,7 @@ fn load_model_with_providers(
                         num_kv_heads: hparams.num_kv_heads,
                         head_dim: hparams.head_dim,
                         num_layers: hparams.num_layers,
-                        intermediate_size: hparams.intermediate_size,
+                        intermediate_size: intermediate,
                         num_experts: hparams.expert_count.unwrap_or(8),
                         num_experts_per_tok: hparams.expert_used_count.unwrap_or(2),
                         routed_scaling_factor: hparams.routed_scaling_factor,
@@ -2846,6 +3049,7 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
     // Check for forced device first
     if let Ok(s) = std::env::var("GRIM_FORCE_DEVICE") {
         match s.as_str() {
+            #[cfg(feature = "cuda")]
             "cuda" => {
                 if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
                     if let Some(first) = cuda_devices.first() {
@@ -2969,6 +3173,7 @@ pub fn load_from_path(path: &str) -> Result<Box<dyn CausalLm>> {
         };
     }
     // Fall back to CUDA.
+    #[cfg(feature = "cuda")]
     if let Ok(cuda_devices) = grim_backend_cuda::CudaDevice::probe() {
         if let Some(first) = cuda_devices.first() {
             eprintln!("[model_loader] Using CUDA device {}", first.ordinal());
@@ -3117,5 +3322,188 @@ mod tests {
             serde_json::from_str(r#"{"rope_type": "yarn", "attn_factor": 0.707}"#).unwrap();
         let y = parse_yarn_scaling(&Some(v)).expect("yarn (alias) must parse");
         assert!((y.attention_factor - 0.707).abs() < 1e-5);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Red-phase tests: GGUF config.json read bug + plugins-dir scan branch
+    // ---------------------------------------------------------------------------
+
+    /// Regression test for the GGUF config.json read bug.
+    ///
+    /// The bug (model_loader.rs ~line 2760-2763, now extracted to
+    /// `read_sibling_config_json`) built a *path string* instead of reading
+    /// file contents:
+    ///   `dir.join("config.json").to_str().map(|s| s.to_string())`
+    /// which passed "/path/to/config.json" as `config_raw`. `from_hf_config_json`
+    /// would then try to parse that path string as JSON and fail, silently
+    /// falling through to the plugins-dir scan instead of using the sibling
+    /// config.json.
+    ///
+    /// This test exercises `read_sibling_config_json` directly — the exact helper
+    /// the GGUF load path uses — and verifies it returns the file *contents*,
+    /// not a path string. A regression that reverts to the old buggy behavior
+    /// would break this test.
+    #[test]
+    fn read_sibling_config_json_reads_file_contents_not_path() {
+        // Build a temp dir with a fake .gguf path and sibling config.json.
+        let tmp_dir = tempfile::TempDir::new().expect("temp dir");
+        let gguf_path = tmp_dir.path().join("model.gguf");
+        std::fs::write(&gguf_path, b"fake").expect("fake gguf");
+
+        let config_json = r#"{
+            "model_type": "test-arch",
+            "hidden_size": 2048,
+            "num_hidden_layers": 12
+        }"#;
+        let config_path = tmp_dir.path().join("config.json");
+        std::fs::write(&config_path, config_json).expect("write config.json");
+
+        // Simulate the GGUF load path: it calls read_sibling_config_json(gguf_path)
+        // to get the sibling config.json contents.
+        let gguf_path_str = gguf_path.to_str().expect("gguf path must be valid utf8");
+        let config_raw = read_sibling_config_json(gguf_path_str);
+
+        // The fix: config_raw must be Some(contents), not Some(path_string).
+        let config_raw_str = config_raw.expect("sibling config.json must be read");
+        assert_eq!(config_raw_str, config_json, "must return file contents, not path");
+
+        // And that it parses correctly via resolve_arch_compat_spec.
+        let spec = resolve_arch_compat_spec("test-arch", Some(&config_raw_str))
+            .expect("must resolve spec from sibling config.json contents");
+        assert_eq!(spec.model_type, "test-arch");
+        assert_eq!(spec.num_layers, 12);
+        assert_eq!(spec.hidden_size, 2048);
+    }
+
+    /// Regression test: `read_sibling_config_json` returns None when there is
+    /// no sibling config.json (the GGUF load path falls back to plugins-dir scan).
+    #[test]
+    fn read_sibling_config_json_returns_none_when_missing() {
+        let tmp_dir = tempfile::TempDir::new().expect("temp dir");
+        let gguf_path = tmp_dir.path().join("model.gguf");
+        std::fs::write(&gguf_path, b"fake").expect("fake gguf");
+        // No config.json written — sibling is missing.
+
+        let gguf_path_str = gguf_path.to_str().expect("gguf path must be valid utf8");
+        let config_raw = read_sibling_config_json(gguf_path_str);
+        assert!(
+            config_raw.is_none(),
+            "missing sibling config.json must return None (fallback to plugins-dir scan)"
+        );
+    }
+
+    /// Red target: the plugins-dir scan branch of `resolve_arch_compat_spec`
+    /// must actually find and match a .grimplugin file in
+    /// `grim_plugins_dir()`.
+    ///
+    /// This is the exact path the entire HF plugin-generation workflow depends
+    /// on, and it has zero existing test coverage. The test writes a .grimplugin
+    /// JSON to a temp dir, sets `GRIM_PLUGINS_DIR` to point at it, and calls
+    /// `resolve_arch_compat_spec` with an arch_str that only matches via the
+    /// plugins-dir file (not via inline config).
+    ///
+    /// In the Red phase this test exercises the existing branch — it should PASS
+    /// if the branch is correctly wired (which we're verifying), and the real
+    /// work is making sure the CLI install step puts files in the right place
+    /// for this branch to find them.
+    #[test]
+    fn resolve_arch_compat_spec_finds_grimplugin_in_plugins_dir() {
+        let tmp_dir = tempfile::TempDir::new().expect("temp dir");
+
+        // Write a .grimplugin JSON into the temp dir.
+        let plugin_json = r#"{
+            "name": "test-plugin-compat",
+            "model_type": "test-arch-from-plugin",
+            "base_architecture": "llama",
+            "hidden_size": 2048,
+            "num_layers": 12,
+            "vocab_size": 32000,
+            "num_heads": 16,
+            "num_kv_heads": 16,
+            "head_dim": 128,
+            "intermediate_size": 8192,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "max_seq_len": 2048,
+            "is_moe": false,
+            "is_ssm": false,
+            "is_multimodal": false,
+            "tensor_name_mapping": {},
+            "expert_count": null,
+            "expert_used_count": null,
+            "routed_scaling_factor": null,
+            "vision_spec": null,
+            "audio_spec": null
+        }"#;
+        let plugin_path = tmp_dir.path().join("test-arch-from-plugin.grimplugin");
+        std::fs::write(&plugin_path, plugin_json).expect("write .grimplugin");
+
+        // Point GRIM_PLUGINS_DIR at the temp dir.
+        let old_env = std::env::var("GRIM_PLUGINS_DIR").ok();
+        unsafe {
+            std::env::set_var("GRIM_PLUGINS_DIR", tmp_dir.path().to_str().unwrap());
+        }
+        // grim_plugins_dir() reads the env var at call time, so we can override it.
+        let plugins_dir = grim_core::paths::grim_plugins_dir();
+        assert_eq!(
+            plugins_dir, tmp_dir.path(),
+            "GRIM_PLUGINS_DIR override must be honoured"
+        );
+
+        // Call resolve_arch_compat_spec with an arch_str that matches via the
+        // plugins-dir file (model_type == "test-arch-from-plugin").
+        let spec = resolve_arch_compat_spec("test-arch-from-plugin", None)
+            .expect("must find .grimplugin in plugins dir");
+        assert_eq!(spec.model_type, "test-arch-from-plugin");
+        assert_eq!(spec.num_layers, 12);
+        assert_eq!(spec.hidden_size, 2048);
+
+        // Restore env.
+        if let Some(v) = old_env {
+            unsafe { std::env::set_var("GRIM_PLUGINS_DIR", v) };
+        } else {
+            unsafe { std::env::remove_var("GRIM_PLUGINS_DIR") };
+        }
+    }
+
+    /// Red target: `resolve_arch_compat_spec` must prefer the inline config_raw
+    /// over the plugins-dir scan when both are available.
+    #[test]
+    fn resolve_arch_compat_spec_prefers_inline_config_over_plugins_dir() {
+        let tmp_dir = tempfile::TempDir::new().expect("temp dir");
+
+        // Write a .grimplugin into the plugins dir with one set of values.
+        let plugin_json = r#"{
+            "name": "plugin-override",
+            "model_type": "test-arch",
+            "hidden_size": 1024,
+            "num_layers": 6
+        }"#;
+        let plugin_path = tmp_dir.path().join("test-arch.grimplugin");
+        std::fs::write(&plugin_path, plugin_json).expect("write .grimplugin");
+
+        let old_env = std::env::var("GRIM_PLUGINS_DIR").ok();
+        unsafe {
+            std::env::set_var("GRIM_PLUGINS_DIR", tmp_dir.path().to_str().unwrap());
+        }
+
+        // Pass an inline config_raw with DIFFERENT values.
+        let inline_json = r#"{
+            "model_type": "test-arch",
+            "hidden_size": 2048,
+            "num_layers": 12
+        }"#;
+
+        let spec = resolve_arch_compat_spec("test-arch", Some(inline_json))
+            .expect("must resolve");
+        // The inline config must win.
+        assert_eq!(spec.hidden_size, 2048, "inline config must take priority");
+        assert_eq!(spec.num_layers, 12, "inline config must take priority");
+
+        if let Some(v) = old_env {
+            unsafe { std::env::set_var("GRIM_PLUGINS_DIR", v) };
+        } else {
+            unsafe { std::env::remove_var("GRIM_PLUGINS_DIR") };
+        }
     }
 }

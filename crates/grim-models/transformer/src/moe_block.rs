@@ -34,6 +34,10 @@ pub struct MoESpec {
     pub moe_intermediate_size: Option<usize>,
     /// Shared-expert FFN width override (e.g., 1024 for Laguna-S-2.1).
     pub shared_expert_intermediate_size: Option<usize>,
+    /// Whether the GGUF stores expert tensors as `[num_experts, hidden, inter]`
+    /// instead of the standard `[num_experts, inter, hidden]`. Mellum2 (Unsloth
+    /// quantized) uses this layout.
+    pub transposed_expert_layout: bool,
 }
 
 /// A single MoE transformer layer's feed-forward (routing) block.
@@ -90,13 +94,25 @@ impl MoeBlock {
 
         // Per-expert SwiGLU triples from the 3D GGUF layout
         // (`ffn_gate_exps` / `ffn_up_exps` / `ffn_down_exps`).
-        let experts = ExpertBank::load(
-            ws,
-            spec.num_experts,
-            cfg.hidden_size,
-            moe_inter,
-            /*has_bias=*/ false,
-        )?;
+        let experts = if spec.transposed_expert_layout {
+            // Mellum2 / Unsloth-quantized GGUFs store experts as
+            // [num_experts, hidden, inter] instead of [num_experts, inter, hidden].
+            ExpertBank::load_transposed(
+                ws,
+                spec.num_experts,
+                cfg.hidden_size,
+                moe_inter,
+                /*has_bias=*/ false,
+            )?
+        } else {
+            ExpertBank::load(
+                ws,
+                spec.num_experts,
+                cfg.hidden_size,
+                moe_inter,
+                /*has_bias=*/ false,
+            )?
+        };
 
         // Optional always-on shared expert.
         let shared_expert: Option<ExpertTriple> = if spec.has_shared_expert {
@@ -254,7 +270,7 @@ mod tests {
             "ffn_down_exps.weight".to_string(),
             RawTensor {
                 bytes: f32_bytes(&exp_down),
-                shape: vec![num_experts, inter, hidden],
+                shape: vec![num_experts, hidden, inter],
                 dtype: DType::F32,
                 provenance: QuantProvenance::GrimNative,
             },
@@ -274,6 +290,7 @@ mod tests {
             has_shared_expert: false,
             moe_intermediate_size: None,
             shared_expert_intermediate_size: None,
+            transposed_expert_layout: false,
         };
 
         let block = MoeBlock::load(&ws, &cfg(hidden, inter, num_experts), &spec, tp)?;

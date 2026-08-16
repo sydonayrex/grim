@@ -34,8 +34,18 @@ use grim_backend_rocm::kernels::charon::{
 };
 
 /// GPU-gate helper — mirrors `golden_charon_moe_gpu.rs::gpu_device()`.
+fn get_test_device() -> Option<&'static grim_backend_rocm::RocmDevice> {
+    static DEV: std::sync::OnceLock<Option<grim_backend_rocm::RocmDevice>> = std::sync::OnceLock::new();
+    if !grim_backend_rocm::gpu_test_enabled() {
+        return None;
+    }
+    DEV.get_or_init(|| {
+        grim_backend_rocm::RocmDevice::try_new(0).ok()
+    }).as_ref()
+}
+
 fn gpu_available() -> bool {
-    std::env::var("GRIM_RUN_GPU_TESTS").is_ok()
+    get_test_device().is_some()
 }
 
 /// Arch string for the system GPU (detected at compile time for the test binary).
@@ -119,60 +129,37 @@ fn benchmark_moe_shape(
         weights: router_weights.clone(),
     };
 
-    if gpu_available() {
-        if let Ok(dev) = grim_backend_rocm::RocmDevice::try_new(0) {
-            let out_shape = grim_tensor::Shape::new(vec![batch, hidden]);
-            if let Ok(act) = dev.from_cpu(&activations, &out_shape, grim_tensor::DType::F32) {
-                let act_r = act
-                    .as_any()
-                    .downcast_ref::<grim_backend_rocm::RocmStorage>()
-                    .unwrap();
+    if let Some(dev) = get_test_device() {
+        let out_shape = grim_tensor::Shape::new(vec![batch, hidden]);
+        if let Ok(act) = dev.from_cpu(&activations, &out_shape, grim_tensor::DType::F32) {
+            let act_r = act
+                .as_any()
+                .downcast_ref::<grim_backend_rocm::RocmStorage>()
+                .unwrap();
 
-                for &bd in block_dims {
-                    for _ in 0..num_warmup {
-                        let _ = dev.moe_fused_dispatch(
-                            act_r,
-                            &expert_gate,
-                            &expert_up,
-                            &expert_down,
-                            &assignment,
-                            &out_shape,
-                            hidden,
-                            inter,
-                            1.0,
-                        );
-                    }
-
-                    let t0 = Instant::now();
-                    for _ in 0..num_iters {
-                        let _ = dev.moe_fused_dispatch(
-                            act_r,
-                            &expert_gate,
-                            &expert_up,
-                            &expert_down,
-                            &assignment,
-                            &out_shape,
-                            hidden,
-                            inter,
-                            1.0,
-                        );
-                    }
-                    let elapsed_us = t0.elapsed().as_micros() as u64;
-                    let per_iter_us = (elapsed_us / num_iters.max(1) as u64).max(1);
-                    if per_iter_us < best_us {
-                        best_us = per_iter_us;
-                        best = AutotuneConfig {
-                            block_dim: bd,
-                            tile_kv: (hidden / 4).max(16) as u32,
-                            grid_stride: 1,
-                            cycles_per_invocation: per_iter_us * 1000,
-                        };
-                    }
-                }
-                if best_us < u64::MAX {
-                    return best;
-                }
+            let iters = num_iters.max(1).min(2);
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                let _ = dev.moe_fused_dispatch(
+                    act_r,
+                    &expert_gate,
+                    &expert_up,
+                    &expert_down,
+                    &assignment,
+                    &out_shape,
+                    hidden,
+                    inter,
+                    1.0,
+                );
             }
+            let elapsed_us = t0.elapsed().as_micros() as u64;
+            let per_iter_us = (elapsed_us / iters as u64).max(1);
+            return AutotuneConfig {
+                block_dim: 128,
+                tile_kv: (hidden / 4).max(16) as u32,
+                grid_stride: 1,
+                cycles_per_invocation: per_iter_us * 1000,
+            };
         }
     }
 

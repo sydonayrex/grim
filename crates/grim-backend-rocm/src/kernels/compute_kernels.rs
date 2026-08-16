@@ -103,13 +103,15 @@ extern "C" __global__ void grim_rope_yarn(
         float sin_val = sinf(val) * mscale;
         float cos_val = cosf(val) * mscale;
         int base_idx = (bi * s + si) * d;
-        // Interleaved layout: pair (2i, 2i+1)
-        int a_idx = base_idx + 2 * i;
-        int b_idx = base_idx + 2 * i + 1;
+        // Rotate-half pairing — (x[i], x[rotary_half + i]) — matching the plain
+        // `grim_rope` kernel and CPU `Rope::forward`. The previous interleaved
+        // pairing (x[2i], x[2i+1]) scrambled Q/K rotations for every YaRN model.
+        int a_idx = base_idx + i;
+        int b_idx = base_idx + rotary_half + i;
         float x1 = x[a_idx];
         float x2 = x[b_idx];
         out[a_idx] = x1 * cos_val - x2 * sin_val;
-        out[b_idx] = x1 * sin_val + x2 * cos_val;
+        out[b_idx] = x2 * cos_val + x1 * sin_val;
     }
     // Pass 2: copy the non-rotary dims [2*rotary_half, d) verbatim.
     // We reuse the same thread pool; threads with idx in [0, b*s*(d-2*rotary_half))

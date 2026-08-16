@@ -23,6 +23,10 @@
 //!     forces host staging and resolves the PCIe bridge hang.
 
 use grim_backend_rocm::rccl::CollectiveConfig;
+// `UniqueId`/`p2p_memcpy_async` are declared unconditionally but their OFF-build
+// bodies return `Err`, so these two tests exercise the stub contract.
+#[cfg(not(feature = "rccl"))]
+use grim_backend_rocm::rccl::{UniqueId, p2p_memcpy_async};
 #[cfg(feature = "rccl")]
 use grim_tensor::backend::BackendDevice;
 #[cfg(feature = "rccl")]

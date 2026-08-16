@@ -403,8 +403,8 @@ mod tests {
             }
         };
 
-        if std::env::var("GRIM_RUN_GPU_TESTS").ok().as_deref() != Some("1") {
-            eprintln!("GRIM_RUN_GPU_TESTS=1 not set; skipping persistent dispatch launch");
+        if !crate::gpu_test_enabled() {
+            eprintln!("GRIM_GPU_TEST=1 not set; skipping persistent dispatch launch");
             return;
         }
 

@@ -214,10 +214,13 @@ fn arch_tflops_table(gcn: &str) -> (f32, f32, f32) {
 /// Query the thermal throttle fraction [0, 1] for `ordinal`.
 fn query_throttle_pct(ordinal: usize) -> f32 {
     let mut val: i32 = 0;
+    // The guard restores the caller's current device: a profiler sweep over
+    // every ordinal must not leave the thread on a foreign device, or later
+    // `hipModuleLoad` calls bind to the wrong context (HIP error 209).
+    let _guard = crate::device::util::DeviceGuard::set(ordinal as i32);
     // SAFETY: `hipDeviceGetAttribute` is safe to call with a valid ordinal.
     unsafe {
-        use crate::device::handles::{hipDeviceGetAttribute, hipSetDevice};
-        let _ = hipSetDevice(ordinal as i32);
+        use crate::device::handles::hipDeviceGetAttribute;
         let status = hipDeviceGetAttribute(&mut val, HIP_DEVICE_ATTR_THROTTLE, ordinal as i32);
         if status != 0 {
             return 0.0;
@@ -236,9 +239,9 @@ fn query_vram_free(ordinal: usize) -> u64 {
 pub fn vram_info(ordinal: usize) -> (u64, u64) {
     let mut free: usize = 0;
     let mut total: usize = 0;
+    let _guard = crate::device::util::DeviceGuard::set(ordinal as i32);
     unsafe {
-        use crate::device::handles::{hipMemGetInfo, hipSetDevice};
-        let _ = hipSetDevice(ordinal as i32);
+        use crate::device::handles::hipMemGetInfo;
         let status = hipMemGetInfo(&mut free, &mut total);
         if status != 0 {
             return (0, 0);

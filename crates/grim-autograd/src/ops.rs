@@ -766,6 +766,18 @@ pub fn lora_backward(
             out
         };
 
+        let b_storage = if matches!(b.device(), grim_tensor::Device::Rocm(_)) {
+            b.storage().clone()
+        } else {
+            Arc::from(dev.from_cpu(&b_vec, b.shape(), DType::F32)?)
+        };
+
+        let a_storage = if matches!(a.device(), grim_tensor::Device::Rocm(_)) {
+            a.storage().clone()
+        } else {
+            Arc::from(dev.from_cpu(&a_vec, a.shape(), DType::F32)?)
+        };
+
         let a_t_vec = transpose_matrix(&a_vec, rank, in_features);
         let a_t_storage =
             dev.from_cpu(&a_t_vec, &Shape::new(vec![in_features, rank]), DType::F32)?;
@@ -777,7 +789,7 @@ pub fn lora_backward(
 
         let (dh_unscaled, _) = dev.matmul(
             out_grad.storage().as_ref(),
-            b.storage().as_ref(),
+            b_storage.as_ref(),
             &Shape::new(vec![batch, rank]),
         )?;
         let (dh_storage, _) =
@@ -807,7 +819,7 @@ pub fn lora_backward(
         )?;
         let (dx_storage, _) = dev.matmul(
             dh_storage.as_ref(),
-            a.storage().as_ref(),
+            a_storage.as_ref(),
             &Shape::new(vec![batch, in_features]),
         )?;
 
@@ -823,14 +835,14 @@ pub fn lora_backward(
             a.shape().clone(),
             DType::F32,
             QuantProvenance::default(),
-            a.device().clone(),
+            x.device().clone(),
         );
         let grad_b = Tensor::new(
             Arc::from(db_storage),
             b.shape().clone(),
             DType::F32,
             QuantProvenance::default(),
-            b.device().clone(),
+            x.device().clone(),
         );
 
         return Ok((grad_base, grad_x, grad_a, grad_b));
@@ -1293,11 +1305,21 @@ pub fn apply_and_record_lora(
 
             let scale = cfg.scale();
             let dev = crate::pick_device_for_tensor(&base);
+            let a_storage = if matches!(param_a.data.device(), grim_tensor::Device::Rocm(_)) {
+                param_a.data.storage().clone()
+            } else {
+                Arc::from(dev.from_cpu(&param_a.data.to_vec_f32()?, param_a.data.shape(), DType::F32)?)
+            };
+            let b_storage = if matches!(param_b.data.device(), grim_tensor::Device::Rocm(_)) {
+                param_b.data.storage().clone()
+            } else {
+                Arc::from(dev.from_cpu(&param_b.data.to_vec_f32()?, param_b.data.shape(), DType::F32)?)
+            };
             let (out_storage, handle) = dev.lora_accumulate(
                 base.storage().as_ref(),
                 x.storage().as_ref(),
-                param_a.data.storage().as_ref(),
-                param_b.data.storage().as_ref(),
+                a_storage.as_ref(),
+                b_storage.as_ref(),
                 scale,
                 base.shape(),
             )?;

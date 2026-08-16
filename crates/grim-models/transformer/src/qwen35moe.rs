@@ -106,6 +106,7 @@ impl Qwen35Moe {
             has_shared_expert: has_shared,
             moe_intermediate_size: Some(cfg.intermediate_size),
             shared_expert_intermediate_size: cfg.shared_expert_intermediate_size,
+            transposed_expert_layout: false,
         };
 
         let moe_spec: Vec<Option<crate::moe_block::MoESpec>> = vec![Some(spec); cfg.num_layers];

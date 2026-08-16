@@ -450,36 +450,7 @@ pub fn align_quantized_tensor_for_rocm_gemm(
     (padded, vec![rows_padded, cols])
 }
 
-/// Returns true if `tensor_name` corresponds to an attention projection layer.
-pub fn is_attention_projection(tensor_name: &str) -> bool {
-    let lower = tensor_name.to_lowercase();
-    lower.contains("attn_q")
-        || lower.contains("attn_k")
-        || lower.contains("attn_v")
-        || lower.contains("attn_o")
-        || lower.contains(".wq.weight")
-        || lower.contains(".wk.weight")
-        || lower.contains(".wv.weight")
-        || lower.contains(".wo.weight")
-        || lower.contains("q_proj")
-        || lower.contains("k_proj")
-        || lower.contains("v_proj")
-        || lower.contains("o_proj")
-        || lower.contains("self_attn.q_proj")
-        || lower.contains("self_attn.k_proj")
-        || lower.contains("self_attn.v_proj")
-        || lower.contains("self_attn.o_proj")
-}
-
-/// Minimum quantization bitwidth for attention projection tensors.
-pub fn attention_min_bpw() -> u32 {
-    5 // Q5_K
-}
-
-/// Enforce the minimum precision floor for attention projection tensors.
-pub fn enforce_attention_precision(suggested_bpw: u32) -> u32 {
-    suggested_bpw.max(attention_min_bpw())
-}
+pub use grim_quant::{attention_min_bpw, enforce_attention_precision, is_attention_projection};
 
 /// Resolve the effective `WeightLayout` for a quantized tensor based on its [see: `.grim`, `GrimLayoutHint`, `WavefrontTiled`, `RowMajor`]
 pub fn resolve_weight_layout(

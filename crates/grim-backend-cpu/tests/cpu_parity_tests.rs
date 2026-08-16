@@ -91,19 +91,31 @@ fn cpu_silu_mul_backward_numerics() {
 #[test]
 fn cpu_quantized_matmul_and_backward_ste_parity() {
     let dev = dev();
-    let (m, k, n) = (2, 32, 32);
+    let (m, k, n): (usize, usize, usize) = (2, 32, 32);
 
     let a_data: Vec<f32> = (0..(m * k)).map(|i| (i as f32 * 0.01).sin()).collect();
     let dy_data: Vec<f32> = (0..(m * n)).map(|i| (i as f32 * 0.02).cos()).collect();
 
-    // Q8_0 style block weight
-    let mut b_bytes = vec![0u8; n * k];
+    // GGUF-native Q8_0 layout: one 34-byte block per 32 values — a 2-byte
+    // little-endian f16 scale followed by 32 int8 quants — laid out [n, k]
+    // row-major, exactly as `Linear::forward` passes resident GGUF weights
+    // (with empty `b_scales`; the scales live in the block headers).
+    let blocks_per_col = k.div_ceil(32usize);
+    let mut b_bytes = vec![0u8; n * blocks_per_col * 34];
     for col in 0..n {
-        for p in 0..k {
-            b_bytes[col * k + p] = ((p % 15) as i8) as u8;
+        for blk in 0..blocks_per_col {
+            let base = (col * blocks_per_col + blk) * 34;
+            let scale_f16: u16 = 0x3C00; // f16 1.0
+            b_bytes[base] = (scale_f16 & 0xFF) as u8;
+            b_bytes[base + 1] = (scale_f16 >> 8) as u8;
+            for p in 0..32 {
+                let r = blk * 32 + p;
+                let v = if r < k { (r % 15) as i8 } else { 0i8 };
+                b_bytes[base + 2 + p] = v as u8;
+            }
         }
     }
-    let b_scales = vec![1.0f32; (n * k) / 32];
+    let b_scales: Vec<f32> = Vec::new();
 
     let a = dev
         .from_cpu(&a_data, &Shape::from_slice(&[m, k]), DType::F32)
@@ -117,8 +129,8 @@ fn cpu_quantized_matmul_and_backward_ste_parity() {
             &b_bytes,
             &Shape::from_slice(&[n, k]),
             DType {
-                arith: ArithType::U8,
-                storage: Storage::Native,
+                arith: ArithType::F32,
+                storage: Storage::KQuant(grim_tensor::dtype::KQuantScheme::Q80),
             },
         )
         .expect("b_packed");

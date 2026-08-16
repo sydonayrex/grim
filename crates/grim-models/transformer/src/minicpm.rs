@@ -190,7 +190,9 @@ impl MiniCpmBlock {
         &self,
         x: &Tensor,
         positions: &[u32],
-        session: Option<&dyn SessionT>,
+        session: Option<&mut dyn SessionT>,
+        _cache: Option<&mut crate::block::LlamaLayerCache>,
+        layer: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let orig_dims = x.shape().dims().to_vec();
         let (x_2d, is_3d) = if orig_dims.len() == 3 {
@@ -218,11 +220,16 @@ impl MiniCpmBlock {
         let k_rot = self.apply_rope_multi_head(&k, positions, self.cfg.local_num_kv_heads)?;
 
         let paged_attn_out = if let Some(sess) = session {
-            if let (Some(bt), Some((k_pages, v_pages, page_size))) =
-                (sess.block_table(), sess.paged_kv_handles())
-            {
-                self.paged_self_attention(&q_rot, bt, k_pages, v_pages, page_size, positions)
-                    .ok()
+            if sess.has_paged_kv() {
+                sess.append_kv_layer(layer, &k, &v).ok();
+                if let (Some(bt), Some((k_pages, v_pages, page_size))) =
+                    (sess.block_table(), sess.paged_kv_handles(layer))
+                {
+                    self.paged_self_attention(&q_rot, bt, &k_pages, &v_pages, page_size, positions)
+                        .ok()
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -528,12 +535,15 @@ impl MiniCpmModel {
         &self,
         hidden: &Tensor,
         positions: &[u32],
-        session: Option<&dyn SessionT>,
+        session: &mut dyn SessionT,
+        _caches: Option<&mut [Option<crate::block::LlamaLayerCache>]>,
+        _layer: usize,
     ) -> Result<(Tensor, Tensor, Vec<(Tensor, Tensor)>)> {
         let mut h = hidden.clone();
         let mut kv_pairs = Vec::new();
-        for layer in &self.layers {
-            let (out, k, v) = layer.forward_with_kv_paged(&h, positions, session)?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            let (out, k, v) =
+                layer.forward_with_kv_paged(&h, positions, Some(&mut *session), None, i)?;
             kv_pairs.push((k, v));
             h = out;
         }
@@ -682,7 +692,7 @@ impl CausalLm for MiniCpmModel {
         };
 
         let (logits, hidden_state, kv_pairs) =
-            self.decode_paged(&hidden_t, &pos_vec, Some(session))?;
+            self.decode_paged(&hidden_t, &pos_vec, &mut *session, None, 0)?;
 
         for (k, v) in &kv_pairs {
             session.append_kv(k, v)?;

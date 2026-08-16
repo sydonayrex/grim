@@ -6,10 +6,18 @@
 //! this executes the scalar fallback path within the JIT kernel, verifying full JIT compile
 //! and launch infrastructure safety.
 //!
-//! Dual-GPU test results (syd-beasty, ROCm 7.2.53211):
+//! Dual-GPU test results (multi-GPU RDNA4 system, ROCm 7.2.53211):
 //!   Hardware: RX 9070 XT (gfx1201, device 0) + RX 9060 XT (gfx1200, device 1)
 //!   — 1/1 PASS. JIT compile + ROCm include path + C++17 fix resolves the
 //!   rocWMMA header discovery issue; kernel output matches CPU oracle within 1e-2.
+//!
+//! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test wmma_gemm
+//! RESULT: FAILED — hipModuleLoad failed: 209. The JIT WMMA kernel is compiled but
+//!   not registered/loaded for this test's (m=8,k=128,n=128) shape on this dual-GPU
+//!   RDNA4 box. HIP 209 = the kernel binary (.hipfb) was not found in the runtime's
+//!   module table for the requesting context. Host-side infrastructure (device creation,
+//!   tensor upload, dispatch plumbing) all work; the failure is that no GPU kernel is
+//!   tied to this test shape.
 
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::{BackendDevice, DType, Shape};
@@ -18,14 +26,11 @@ use std::panic;
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<R = ()> = Result<R, TestError>;
 
-/// Env var opting into GPU execution. If unset, tests bail Ok to run on CPU-only CI.
-const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
-
 /// Build a RocmDevice if the GPU test environment is enabled.
 ///
 /// Returns `None` if `GRIM_RUN_GPU_TESTS` is not set or device instantiation fails.
 fn gpu_device() -> Option<RocmDevice> {
-    if std::env::var(GPU_TEST_ENV).is_err() {
+    if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
     match panic::catch_unwind(|| {

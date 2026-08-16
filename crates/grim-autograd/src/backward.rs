@@ -155,10 +155,15 @@ fn accumulate_tensor_grad(
 ) -> Result<()> {
     if let Some(existing) = grads.get_mut(&id) {
         let dev = crate::pick_device_for_tensor(existing);
+        let g_storage = if g.device() == existing.device() {
+            g.storage().clone()
+        } else {
+            std::sync::Arc::from(dev.from_cpu(&g.to_vec_f32()?, existing.shape(), grim_tensor::DType::F32)?)
+        };
         let (sum_storage, handle) = grim_tensor::BackendDevice::add(
             &*dev,
             existing.storage().as_ref(),
-            g.storage().as_ref(),
+            g_storage.as_ref(),
             existing.shape(),
         )?;
         handle.synchronize()?;

@@ -203,6 +203,7 @@ impl SolarOpen2Block {
             has_shared_expert: cfg.num_shared_experts > 0,
             moe_intermediate_size: Some(cfg.intermediate_size),
             shared_expert_intermediate_size: None,
+            transposed_expert_layout: false,
         };
         let moe = MoeBlock::load(ws, &llama_cfg, &spec, tp)?;
 
@@ -224,8 +225,9 @@ impl SolarOpen2Block {
         &self,
         x: &Tensor,
         positions: &[u32],
-        sess: Option<&dyn SessionT>,
+        sess: Option<&mut dyn SessionT>,
         caches: Option<&mut [Option<LlamaLayerCache>]>,
+        layer: usize,
     ) -> Result<Tensor> {
         let residual = x;
         let normed_attn = self.attn_norm.forward(x)?;
@@ -237,6 +239,7 @@ impl SolarOpen2Block {
                     positions,
                     sess,
                     caches.and_then(|c| c.get_mut(0).and_then(|x| x.as_mut())),
+                    layer,
                 )?;
                 out
             }
@@ -354,7 +357,7 @@ impl CausalLm for SolarOpen2 {
             );
 
         for (idx, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, &pos_u32, None, Some(&mut caches[idx..idx + 1]))?;
+            h = layer.forward(&h, &pos_u32, None, Some(&mut caches[idx..idx + 1]), idx)?;
         }
         let h_norm = self.norm.forward(&h)?;
         let logits = self.output.forward(&h_norm)?;

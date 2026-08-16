@@ -508,6 +508,44 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
+    /// LFM2-style fused QKV projection: MXFP4 GEMM (`x @ W_qkv`) followed by
+    /// per-head QK-Norm (separate `gamma_q` / `gamma_k`) + RoPE (YaRN-aware via
+    /// `inv_freq` + `mscale`). Optional on backends; returns `Unimplemented` by
+    /// default so only backends that wire a kernel override this.
+    fn fused_mxfp4_gemm_qk_norm_rope_kv(
+        &self,
+        x: &dyn BackendStorage,
+        gamma_q: &dyn BackendStorage,
+        gamma_k: &dyn BackendStorage,
+        w_codes: &dyn BackendStorage,
+        w_exps: &dyn BackendStorage,
+        q_out: Option<&dyn BackendStorage>,
+        k_cache: Option<&dyn BackendStorage>,
+        v_cache: Option<&dyn BackendStorage>,
+        out_all: Option<&dyn BackendStorage>,
+        positions: Option<&dyn BackendStorage>,
+        m: usize,
+        k: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        rope_theta: f32,
+        inv_freq: Option<&dyn BackendStorage>,
+        mscale: f32,
+        eps: f32,
+        max_seq_len: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let _ = (
+            x, gamma_q, gamma_k, w_codes, w_exps, q_out, k_cache, v_cache, out_all, positions, m,
+            k, num_q_heads, num_kv_heads, head_dim, rotary_dim, rope_theta, inv_freq, mscale, eps,
+            max_seq_len,
+        );
+        Err(crate::error::Error::Unimplemented(
+            "fused_mxfp4_gemm_qk_norm_rope_kv not implemented for this backend".into(),
+        ))
+    }
+
     /// Broadcast a 1-D bias tensor `[out_dim]` into 2-D shape `[batch, out_dim]`.
     ///
     /// Contract: replicates the 1-D bias row `batch` times into `out_shape`.

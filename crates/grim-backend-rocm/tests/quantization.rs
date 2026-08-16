@@ -15,14 +15,11 @@
 //! guest-mode bf16/f16 on RDNA2/3 — *not* fp8). Tests pin this with
 //! pure-CPU logic; the kernel plumbing is a separate cycle.
 //!
-//! Skill attribution:
-//! - `rocm-quantization-inference` — fp8 dtype ladder, per-arch dispatch.
-//! - `rust-gpu-discipline` §2 #12 — emulated fp8 on RDNA2/3 is regression;
-//!   gate it loudly.
-//! - `rust-ml-llm-architecture` — backend separation; the gate lives in
-//!   the ROCm crate, not in core.
+//! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test quantization
+//! RESULT: 19/19 PASS. All tests are CPU-side arch table logic — no GPU calls.
+//!   Verified on the dual-GPU RDNA4 box.
 
-use grim_backend_rocm::quantization::{GcnArch, QuantMode, arch_capability, gcn_arch};
+use grim_backend_rocm::quantization::{arch_capability, gcn_arch, GcnArch, QuantMode};
 
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<R = ()> = Result<R, TestError>;

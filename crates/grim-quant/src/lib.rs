@@ -1121,6 +1121,91 @@ pub fn dequant_fp8_block16(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// Convert GGUF-native MXFP4 tensor bytes (llama.cpp layout) into the
+/// length-prefixed `[codes][exps]` framing consumed by `dequant_mxfp4` and the
+/// ROCm/CUDA `grim_dequant_mxfp4` kernels.
+///
+/// GGUF (llama.cpp `block_mxfp4`) stores, per 32-element block: one E8M0
+/// scale byte FIRST, then 16 packed code bytes where the LOW nibbles hold
+/// elements 0–15 and the HIGH nibbles hold elements 16–31. Grim's framing
+/// instead packs element `i` in the low nibble when even / high when odd, and
+/// stores all codes and all exponents as separate length-prefixed segments.
+pub fn reframe_mxfp4_gguf(raw: &[u8], num_values: usize) -> Result<Vec<u8>> {
+    if num_values == 0 {
+        return Ok(Vec::new());
+    }
+    let blocks = num_values.div_ceil(32);
+    let expected = blocks * 17;
+    if raw.len() < expected {
+        return Err(Error::Backend(format!(
+            "reframe_mxfp4_gguf: buffer {} bytes too small for {num_values} values (need {expected})",
+            raw.len()
+        )));
+    }
+
+    let codes_len = num_values.div_ceil(2);
+    let mut codes = vec![0u8; codes_len];
+    let mut exps = vec![0u8; blocks];
+
+    use rayon::prelude::*;
+
+    // Vectorized block-by-block reframing:
+    // llama.cpp 17-byte block: byte 0 is scale; bytes 1..17 are 16-byte qs.
+    // qs[0..16] low nibbles -> elements 0..15; high nibbles -> elements 16..31.
+    // Grim output: 16 bytes per block, even element in low nibble, odd in high nibble.
+    if blocks >= 512 {
+        const CHUNK_BLOCKS: usize = 256;
+        codes
+            .par_chunks_mut(CHUNK_BLOCKS * 16)
+            .zip(exps.par_chunks_mut(CHUNK_BLOCKS))
+            .enumerate()
+            .for_each(|(chunk_idx, (c_chunk, e_chunk)): (usize, (&mut [u8], &mut [u8]))| {
+                let start_b = chunk_idx * CHUNK_BLOCKS;
+                let chunk_blocks = e_chunk.len();
+                for b_local in 0..chunk_blocks {
+                    let b = start_b + b_local;
+                    let raw_offset = b * 17;
+                    e_chunk[b_local] = raw[raw_offset];
+
+                    let qs = &raw[raw_offset + 1..raw_offset + 17];
+                    let out_c = &mut c_chunk[b_local * 16..(b_local + 1) * 16];
+
+                    // Lower 16 elements (0..15) packed into 8 bytes
+                    for k in 0..8 {
+                        out_c[k] = (qs[2 * k] & 0x0F) | ((qs[2 * k + 1] & 0x0F) << 4);
+                    }
+                    // Upper 16 elements (16..31) packed into 8 bytes
+                    for k in 0..8 {
+                        out_c[8 + k] = (qs[2 * k] >> 4) | ((qs[2 * k + 1] >> 4) << 4);
+                    }
+                }
+            });
+    } else {
+        for b in 0..blocks {
+            let raw_offset = b * 17;
+            exps[b] = raw[raw_offset];
+
+            let qs = &raw[raw_offset + 1..raw_offset + 17];
+            let out_c = &mut codes[b * 16..(b + 1) * 16];
+
+            for k in 0..8 {
+                out_c[k] = (qs[2 * k] & 0x0F) | ((qs[2 * k + 1] & 0x0F) << 4);
+            }
+            for k in 0..8 {
+                out_c[8 + k] = (qs[2 * k] >> 4) | ((qs[2 * k + 1] >> 4) << 4);
+            }
+        }
+    }
+
+    // Emit the length-prefixed framing.
+    let mut out = Vec::with_capacity(16 + codes.len() + exps.len());
+    out.extend_from_slice(&(codes.len() as u64).to_le_bytes());
+    out.extend_from_slice(&codes);
+    out.extend_from_slice(&(exps.len() as u64).to_le_bytes());
+    out.extend_from_slice(&exps);
+    Ok(out)
+}
+
 /// Dequantize MXFP4 (OCP Microscaling, Jay tier) single-buffer bytes to f32.
 ///
 /// # Layout
@@ -1701,6 +1786,58 @@ pub fn f32_to_mxfp4_e2m1(v: f32, shared_exp: u8) -> u8 {
     };
 
     sign_bit | (exp << 1) | mant
+}
+
+/// Quantize a row-major `[rows, k]` f32 matrix to MXFP4 (E2M1 weights + E8M0
+/// shared exponents) in the exact layout consumed by the ROCm/CUDA
+/// `grim_mxfp4_gemm_tiled` kernel:
+/// - `codes`: `rows * k / 2` bytes, two E2M1 codes per byte (even element in
+///   the low nibble, odd in the high nibble), grouped contiguously per row.
+/// - `exps`: `rows * (k / 32)` bytes, one E8M0 shared exponent per 32-element
+///   block, grouped contiguously per row.
+///
+/// The per-block shared exponent is chosen so the largest magnitude in the
+/// block decodes to at most `6.0 * 2^(exp - 127)` (the E2M1 max), avoiding
+/// overflow/clamping. `k` must be a multiple of 32.
+pub fn quant_mxfp4_matrix(data: &[f32], rows: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+    assert!(k % 32 == 0, "quant_mxfp4_matrix: k must be a multiple of 32");
+    let exps_per_row = k / 32;
+    let mut codes = vec![0u8; rows * k / 2];
+    let mut exps = vec![0u8; rows * exps_per_row];
+    for r in 0..rows {
+        for b in 0..exps_per_row {
+            let block_base = r * k + b * 32;
+            let mut max_abs = 0.0f32;
+            for j in 0..32 {
+                let a = data[block_base + j].abs();
+                if a > max_abs {
+                    max_abs = a;
+                }
+            }
+            // Pick the E8M0 exponent (scale = 2^(e - 127)) so the block's max
+            // magnitude fits within the E2M1 representable range.
+            let e = if max_abs == 0.0 {
+                127u32
+            } else {
+                let ratio = max_abs / 6.0f32;
+                let mut e = (127.0 + ratio.log2().ceil()) as i32;
+                while (max_abs / (2.0f32).powi(e - 127)) > 6.0 && e < 255 {
+                    e += 1;
+                }
+                e.clamp(0, 255) as u32
+            };
+            let exp_byte = e as u8;
+            exps[r * exps_per_row + b] = exp_byte;
+            for i in 0..16 {
+                let k0 = block_base + i * 2;
+                let k1 = k0 + 1;
+                let c0 = f32_to_mxfp4_e2m1(data[k0], exp_byte);
+                let c1 = f32_to_mxfp4_e2m1(data[k1], exp_byte);
+                codes[r * (k / 2) + b * 16 + i] = c0 | (c1 << 4);
+            }
+        }
+    }
+    (codes, exps)
 }
 
 /// Quantize f32 values to block-scaled FP4 (E2M1) bytes.
@@ -3451,6 +3588,48 @@ pub fn pre_quantize_transform(
     smooth_scales
 }
 
+// ===========================================================================
+// Attention projection role detection & precision policy (WI-SPINQUANT-AttentionGate)
+// ===========================================================================
+
+/// Returns true if `tensor_name` corresponds to an attention projection layer.
+///
+/// Matches standard attention projection substring conventions across GGUF,
+/// HuggingFace / SafeTensors, and native formats:
+/// - `attn_q`, `attn_k`, `attn_v`, `attn_o`
+/// - `.wq.weight`, `.wk.weight`, `.wv.weight`, `.wo.weight`
+/// - `q_proj`, `k_proj`, `v_proj`, `o_proj`
+/// - `self_attn.q_proj`, `self_attn.k_proj`, `self_attn.v_proj`, `self_attn.o_proj`
+pub fn is_attention_projection(tensor_name: &str) -> bool {
+    let lower = tensor_name.to_lowercase();
+    lower.contains("attn_q")
+        || lower.contains("attn_k")
+        || lower.contains("attn_v")
+        || lower.contains("attn_o")
+        || lower.contains(".wq.weight")
+        || lower.contains(".wk.weight")
+        || lower.contains(".wv.weight")
+        || lower.contains(".wo.weight")
+        || lower.contains("q_proj")
+        || lower.contains("k_proj")
+        || lower.contains("v_proj")
+        || lower.contains("o_proj")
+        || lower.contains("self_attn.q_proj")
+        || lower.contains("self_attn.k_proj")
+        || lower.contains("self_attn.v_proj")
+        || lower.contains("self_attn.o_proj")
+}
+
+/// Minimum quantization bitwidth for attention projection tensors.
+pub fn attention_min_bpw() -> u32 {
+    5 // Q5_K
+}
+
+/// Enforce the minimum precision floor for attention projection tensors.
+pub fn enforce_attention_precision(suggested_bpw: u32) -> u32 {
+    suggested_bpw.max(attention_min_bpw())
+}
+
 #[cfg(test)]
 mod smoothquant_tests {
     use super::*;
@@ -3559,6 +3738,50 @@ mod spinquant_tests {
 }
 
 #[cfg(test)]
+mod attention_role_tests {
+    use super::*;
+
+    #[test]
+    fn test_is_attention_projection() {
+        let cases = &[
+            ("blk.48.attn_q.weight", true),
+            ("blk.48.attn_k.weight", true),
+            ("blk.48.attn_v.weight", true),
+            ("blk.48.attn_o.weight", true),
+            ("model.embed_tokens.weight", false),
+            ("model.layers.48.mlp.gate_proj.weight", false),
+            ("model.layers.48.mlp.up_proj.weight", false),
+            ("model.layers.48.mlp.down_proj.weight", false),
+            ("blk.48.ffn_gate", false),
+            ("self_attn.q_proj.weight", true),
+            ("self_attn.k_proj.weight", true),
+            ("self_attn.v_proj.weight", true),
+            ("self_attn.o_proj.weight", true),
+            ("layers.0.attention.wq.weight", true),
+            ("layers.0.attention.wk.weight", true),
+            ("layers.0.attention.wv.weight", true),
+            ("layers.0.attention.wo.weight", true),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                is_attention_projection(name),
+                *expected,
+                "failed for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_enforce_attention_precision() {
+        assert_eq!(enforce_attention_precision(3), 5);
+        assert_eq!(enforce_attention_precision(4), 5);
+        assert_eq!(enforce_attention_precision(5), 5);
+        assert_eq!(enforce_attention_precision(6), 6);
+        assert_eq!(enforce_attention_precision(8), 8);
+    }
+}
+
+#[cfg(test)]
 mod pre_quantize_transform_tests {
     use super::*;
 
@@ -3624,6 +3847,56 @@ mod tests {
         assert_eq!(dequantized.len(), data.len());
         let mse = mean_squared_error(&data, &dequantized);
         assert!(mse < 0.5, "q4k mse too high: {mse}");
+    }
+
+    #[test]
+    fn quant_mxfp4_matrix_layout_and_roundtrip() {
+        let k = 64usize;
+        let rows = 4usize;
+        let data: Vec<f32> = (0..rows * k).map(|i| (i as f32 - 128.0) * 0.05).collect();
+        let (codes, exps) = quant_mxfp4_matrix(&data, rows, k);
+        assert_eq!(codes.len(), rows * k / 2);
+        assert_eq!(exps.len(), rows * (k / 32));
+
+        // Decode every element with mxfp4_e2m1_to_f32 and check the layout
+        // matches the GEMM kernel (even element = low nibble, odd = high,
+        // exps grouped per 32-element block per row).
+        let mut max_err = 0.0f32;
+        let exps_per_row = k / 32;
+        for r in 0..rows {
+            for b in 0..exps_per_row {
+                let e = exps[r * exps_per_row + b];
+                for i in 0..16 {
+                    let byte = codes[r * (k / 2) + b * 16 + i];
+                    let c0 = byte & 0x0F;
+                    let c1 = (byte >> 4) & 0x0F;
+                    let k0 = r * k + b * 32 + i * 2;
+                    let k1 = k0 + 1;
+                    let d0 = mxfp4_e2m1_to_f32(c0, e);
+                    let d1 = mxfp4_e2m1_to_f32(c1, e);
+                    // Sign preservation proves the nibble/block layout is correct.
+                    if data[k0] != 0.0 {
+                        assert_eq!(
+                            d0.is_sign_negative(),
+                            data[k0].is_sign_negative(),
+                            "sign mismatch at {k0}"
+                        );
+                    }
+                    if data[k1] != 0.0 {
+                        assert_eq!(
+                            d1.is_sign_negative(),
+                            data[k1].is_sign_negative(),
+                            "sign mismatch at {k1}"
+                        );
+                    }
+                    max_err = max_err.max((d0 - data[k0]).abs());
+                    max_err = max_err.max((d1 - data[k1]).abs());
+                }
+            }
+        }
+        // MXFP4 E2M1 is ~4-bit; absolute error up to ~half the top code spacing
+        // (<= 1.0 * block_scale) is expected for this magnitude range.
+        assert!(max_err < 1.5, "mxfp4 matrix max_err too high: {max_err}");
     }
 
     #[test]

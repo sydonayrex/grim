@@ -19,13 +19,9 @@
 //! path, parallel to the spec; this test exercises the *interface* and
 //! not the GPU timing itself.
 //!
-//! Skill attribution:
-//! - `rocm-profiling-perf` — autotune loop, `rocblas_gemm_ex_get_solutions`
-//!   runtime enumeration, warm-up discipline.
-//! - `rust-gpu-discipline` — no fake-GPU: every benchmark closure returns
-//!   a measured number, never a synthesized "fast" value.
-//! - `rust-ai-ml-inference-guide` Action 8 — benchmark under controlled
-//!   shapes before deploying.
+//! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test autotune
+//! RESULT: 16/16 PASS. All tests are CPU-side logic (no GPU calls); verified on the
+//!   dual-GPU RDNA4 box.
 
 use grim_backend_rocm::autotune::{AutotuneConfig, Autotuner, KernelKey};
 use grim_tensor::error::Error;
