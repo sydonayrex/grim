@@ -246,6 +246,39 @@ impl GgufTokenizer {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        // Load BPE merges from GGUF metadata if the model type is BPE.
+        // HF tokenizer.json-style merges may be stored as
+        // tokenizer.ggml.merges (array of ["tokenA", "tokenB"] or "tokenA tokenB").
+        let bpe_merges = if model_type == "bpe" || model_type == "gpt2" {
+            metadata
+                .get("tokenizer.ggml.merges")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    let mut map = HashMap::with_capacity(arr.len());
+                    for (rank, entry) in arr.iter().enumerate() {
+                        let pair = if let Some(pair_arr) = entry.as_array() {
+                            if pair_arr.len() == 2 {
+                                format!(
+                                    "{} {}",
+                                    pair_arr[0].as_str().unwrap_or(""),
+                                    pair_arr[1].as_str().unwrap_or("")
+                                )
+                            } else {
+                                continue;
+                            }
+                        } else if let Some(s) = entry.as_str() {
+                            s.to_string()
+                        } else {
+                            continue;
+                        };
+                        map.insert(pair, rank as u32);
+                    }
+                    map
+                })
+        } else {
+            None
+        };
+
         let byte_decoder = if model_type == "bpe" || model_type == "gpt2" {
             Some(gpt2_byte_decoder())
         } else {
@@ -257,7 +290,7 @@ impl GgufTokenizer {
             token_to_id,
             scores,
             model_type,
-            bpe_merges: None,
+            bpe_merges,
             byte_decoder,
             eos_token_id,
             bos_token_id,
@@ -358,14 +391,22 @@ impl GgufTokenizer {
             for pair in ids.windows(2) {
                 let t1 = pair[0];
                 let t2 = pair[1];
-                let t1_str = &self.tokens[t1 as usize];
-                let t2_str = &self.tokens[t2 as usize];
+                // Bounds-check token lookup — panic on OOB is a DoS risk with
+                // untrusted/malformed tokenizer configs. [P1-25 fix.]
+                let t1_str = match self.tokens.get(t1 as usize) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let t2_str = match self.tokens.get(t2 as usize) {
+                    Some(s) => s,
+                    None => continue,
+                };
                 let merged_str = format!("{}{}", t1_str, t2_str);
                 if let Some(&merged_id) = self.token_to_id.get(&merged_str) {
                     let score = self
                         .scores
                         .as_ref()
-                        .map(|s| s[merged_id as usize])
+                        .and_then(|s| s.get(merged_id as usize).copied())
                         .unwrap_or(-(merged_id as f32));
                     if score > best_score {
                         best_score = score;
@@ -836,19 +877,53 @@ pub fn sanitize_jinja_template(template: &str) -> String {
     //    method. This is used by tool-call templates: `{% for k, v in d.items() %}`.
 
     // Transform `.get('key')` and `.get("key")` → `["key"]`.
+    // Use char-boundary-safe ranges — byte offsets from `find` can land in the
+    // middle of a multi-byte character, causing panic on non-ASCII templates.
+    // [P1-25 fix: char-boundary-safe replace_range.]
     let mut result = result;
     while let Some(pos) = result.find(".get('") {
         if let Some(end) = result[pos..].find("')") {
-            let key = result[pos + 6..pos + end].to_string();
-            result.replace_range(pos..pos + end + 2, &format!("[\"{key}\"]"));
+            let abs_end = pos + end;
+            // Clamp to char boundary.
+            let end_char = result[..=abs_end]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let key = &result[pos + 6..end_char];
+            let replacement = format!("[\"{key}\"]");
+            let start_char = result[..pos].char_indices().count();
+            let end_char_count = result[..=abs_end].char_indices().count();
+            if let Some((s, _)) = result.char_indices().nth(start_char) {
+                if let Some((e, _)) = result.char_indices().nth(end_char_count) {
+                    result.replace_range(s..e, &replacement);
+                    continue;
+                }
+            }
+            break;
         } else {
             break;
         }
     }
     while let Some(pos) = result.find(".get(\"") {
         if let Some(end) = result[pos..].find("\")") {
-            let key = result[pos + 6..pos + end].to_string();
-            result.replace_range(pos..pos + end + 2, &format!("[\"{key}\"]"));
+            let abs_end = pos + end;
+            let end_char = result[..=abs_end]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let key = &result[pos + 6..end_char];
+            let replacement = format!("[\"{key}\"]");
+            let start_char = result[..pos].char_indices().count();
+            let end_char_count = result[..=abs_end].char_indices().count();
+            if let Some((s, _)) = result.char_indices().nth(start_char) {
+                if let Some((e, _)) = result.char_indices().nth(end_char_count) {
+                    result.replace_range(s..e, &replacement);
+                    continue;
+                }
+            }
+            break;
         } else {
             break;
         }

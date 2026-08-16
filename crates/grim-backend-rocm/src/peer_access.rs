@@ -40,6 +40,8 @@ unsafe extern "C" {
     ) -> HipErrorT;
     fn hipDeviceEnablePeerAccess(peer_device: i32, flags: u32) -> HipErrorT;
     fn hipDeviceDisablePeerAccess(peer_device: i32) -> HipErrorT;
+    fn hipGetDevice(device: *mut i32) -> HipErrorT;
+    fn hipSetDevice(device: i32) -> HipErrorT;
 }
 
 /// Runtime verdict for a `(src, dst)` GPU pair. `Copy + PartialEq` so
@@ -140,22 +142,45 @@ pub fn enable_peer_access(src: i32, dst: i32) -> Result<bool> {
             src, dst, count
         )));
     }
-    // Disable first (best practice — peer access persists in the
-    // process address space, so a fresh probe may collide with a stale
-    // grant).
-    let _ = unsafe { hipDeviceDisablePeerAccess(dst) };
-    let res = unsafe { hipDeviceEnablePeerAccess(dst, 0) };
-    if res == hipSuccess {
-        Ok(true)
-    } else if res == HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED {
-        // Soft success — the runtime already enabled it.
-        Ok(true)
-    } else {
-        Err(Error::Backend(format!(
-            "enable_peer_access: hipDeviceEnablePeerAccess returned code={}",
-            res
-        )))
+    // hipDeviceEnablePeerAccess / DisablePeerAccess operate on the CURRENT
+    // device, so we must pin the current device to `src` for the duration.
+    // Without this, the grant lands on (or fails from) whatever device the
+    // caller last touched and the topology matrix records phantom links.
+    let mut prev_device: i32 = 0;
+    let mut pinned = false;
+    if unsafe { hipGetDevice(&mut prev_device) } == hipSuccess {
+        if prev_device != src {
+            pinned = unsafe { hipSetDevice(src) } == hipSuccess;
+        } else {
+            pinned = true;
+        }
     }
+    let outcome = if !pinned && prev_device != src {
+        Err(Error::Backend(
+            "enable_peer_access: could not pin current device to src".into(),
+        ))
+    } else {
+        // Disable first (best practice — peer access persists in the
+        // process address space, so a fresh probe may collide with a stale
+        // grant).
+        let _ = unsafe { hipDeviceDisablePeerAccess(dst) };
+        let res = unsafe { hipDeviceEnablePeerAccess(dst, 0) };
+        if res == hipSuccess {
+            Ok(true)
+        } else if res == HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED {
+            // Soft success — the runtime already enabled it.
+            Ok(true)
+        } else {
+            Err(Error::Backend(format!(
+                "enable_peer_access: hipDeviceEnablePeerAccess returned code={}",
+                res
+            )))
+        }
+    };
+    if pinned && prev_device != src {
+        let _ = unsafe { hipSetDevice(prev_device) };
+    }
+    outcome
 }
 
 /// Peer link classification for inter-GPU communication paths.

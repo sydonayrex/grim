@@ -864,6 +864,7 @@ pub trait BackendDevice: Send + Sync {
         _b: &dyn BackendStorage,
         _c: &dyn BackendStorage,
         _d: &dyn BackendStorage,
+        _state: &dyn BackendStorage,
         _batch: usize,
         _dim_dstate: usize,
         _dim_dinner: usize,
@@ -1544,6 +1545,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         b: &dyn BackendStorage,
         c: &dyn BackendStorage,
         d: &dyn BackendStorage,
+        state: &dyn BackendStorage,
         batch: usize,
         dim_dstate: usize,
         dim_dinner: usize,
@@ -1551,7 +1553,7 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         (**self).selective_scan(
-            x, a, b, c, d, batch, dim_dstate, dim_dinner, seq_len, out_shape,
+            x, a, b, c, d, state, batch, dim_dstate, dim_dinner, seq_len, out_shape,
         )
     }
 

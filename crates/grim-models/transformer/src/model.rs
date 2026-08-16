@@ -133,6 +133,38 @@ impl Llama {
             }
         };
         let num_layers = cfg.num_layers;
+
+        // Weight sanity check: models that loaded with zeroed weights should fail
+        // at load time rather than silently returning Unimplemented on first forward.
+        // [P1-36 fix: fail loudly on zeroed weights.]
+        let check_not_zeroed = |name: &str, tensor: &grim_nn::Tensor| {
+            let data = tensor.to_vec_f32();
+            if let Ok(data) = data {
+                let all_zero = data.iter().all(|&v| v.abs() < 1e-10);
+                let all_same = data.windows(2).all(|w| (w[1] - w[0]).abs() < 1e-10);
+                if all_zero || all_same {
+                    return Err(grim_tensor::Error::Backend(format!(
+                        "{name}: weights appear to be zeroed or constant — \
+                         model may be structurally broken"
+                    )));
+                }
+            }
+            Ok(())
+        };
+        check_not_zeroed("tok_embeddings", &tok_embeddings)?;
+        check_not_zeroed("norm", &norm)?;
+        check_not_zeroed("output", &output)?;
+        for (i, layer) in layers.iter().enumerate() {
+            check_not_zeroed(&format!("layer.{i}.attn_norm"), &layer.attn_norm)?;
+            check_not_zeroed(&format!("layer.{i}.ffn_norm"), &layer.ffn_norm)?;
+            check_not_zeroed(&format!("layer.{i}.wq"), &layer.wq)?;
+            check_not_zeroed(&format!("layer.{i}.wk"), &layer.wk)?;
+            check_not_zeroed(&format!("layer.{i}.wv"), &layer.wv)?;
+            check_not_zeroed(&format!("layer.{i}.wo"), &layer.wo)?;
+            check_not_zeroed(&format!("layer.{i}.gate_proj"), &layer.gate_proj)?;
+            check_not_zeroed(&format!("layer.{i}.down_proj"), &layer.down_proj)?;
+        }
+
         Ok(Self {
             cfg,
             device: device.clone(),

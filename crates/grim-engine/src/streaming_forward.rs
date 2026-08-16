@@ -352,16 +352,36 @@ impl StreamingBlockForward {
         let out_shape_3d = Shape::new(vec![total_tokens, cfg.num_heads, cfg.head_dim]);
         let out_shape_2d = Shape::new(vec![total_tokens, num_head_dims]);
 
-        // Reshape Q/K to 3D [1, total_tokens*num_heads, head_dim] so that
-        // `rope` sees the per-head split it expects. The data is already laid
-        // out as (i*num_heads + h)*head_dim, so this is a pure shape reinterpretation —
-        // the total element count is unchanged; only the dims vector differs.
-        let q_3d = dev.from_cpu(&q.to_vec_f32()?, &q_shape, DType::F32)?;
-        let k_3d = dev.from_cpu(&k.to_vec_f32()?, &k_shape, DType::F32)?;
+        // Reshape Q/K to 3D [1, total_tokens*num_heads, head_dim] for the
+        // `rope` call below. The data is already laid out as
+        // (i*num_heads + h)*head_dim, and rope() only reads the storage's
+        // device pointer plus the explicitly-passed shape — so for
+        // device-resident Q/K we pass the original storage straight through
+        // with the 3-D shape (zero copies). The previous form did
+        // to_vec_f32 + from_cpu: a full D2H+H2D round trip per tensor per
+        // layer per token. CPU tensors still take the upload path.
+        let q_up: Option<Box<dyn grim_tensor::BackendStorage>> = if q.device().is_cpu() {
+            Some(dev.from_cpu(&q.to_vec_f32()?, &q_shape, DType::F32)?)
+        } else {
+            None
+        };
+        let k_up: Option<Box<dyn grim_tensor::BackendStorage>> = if k.device().is_cpu() {
+            Some(dev.from_cpu(&k.to_vec_f32()?, &k_shape, DType::F32)?)
+        } else {
+            None
+        };
+        let q_in: &dyn grim_tensor::BackendStorage = match &q_up {
+            Some(b) => b.as_ref(),
+            None => &**q.storage(),
+        };
+        let k_in: &dyn grim_tensor::BackendStorage = match &k_up {
+            Some(b) => b.as_ref(),
+            None => &**k.storage(),
+        };
 
         let rope_cfg = grim_tensor::RopeConfig::new(cfg.head_dim, rope_base);
-        let (q_rot_s, _) = dev.rope(q_3d.as_ref(), &q_positions, &rope_cfg, &q_shape)?;
-        let (k_rot_s, _) = dev.rope(k_3d.as_ref(), &k_positions, &rope_cfg, &k_shape)?;
+        let (q_rot_s, _) = dev.rope(q_in, &q_positions, &rope_cfg, &q_shape)?;
+        let (k_rot_s, _) = dev.rope(k_in, &k_positions, &rope_cfg, &k_shape)?;
 
         let q_rot = Tensor::new(
             std::sync::Arc::from(q_rot_s),

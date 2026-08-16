@@ -247,6 +247,7 @@ impl MambaBlock {
             b_gpu.as_ref(),
             c_gpu.as_ref(),
             d_gpu.as_ref(),
+            state_gpu.as_ref(),
             1,
             self.d_state,
             self.d_inner,
@@ -491,25 +492,14 @@ impl StatefulSequence for Mamba {
             .downcast_mut::<MambaState>()
             .ok_or_else(|| Error::Session("state downcast".into()))?;
 
-        // SsmStatePool integration (§5.1):
-        // Before running the scan step, check if the block pool already contains cached states.
-        // We simulate a block pool reference lookup to synchronize cached state updates.
-        let request_id = 999u32; // Default mock request ID for single session pipeline
-        let mut pool = grim_memory::KvBlockPool::new(1, 1, 1);
-        if let Some(cached_h) = pool.get_ssm_state(request_id) {
-            if cached_h.len() == ms.h.len() {
-                ms.h.copy_from_slice(cached_h);
-            }
-        }
+        // Apply token embedding — input is token IDs, not hidden states.
+        let h = self.tok_embeddings.forward(input)?;
 
         // Map (input -> step through each layer with shared SSM state).
-        let mut h = input.clone();
+        let mut h = h;
         for layer in &self.layers {
             h = layer.step_block(&h, ms)?;
         }
-
-        // Push the updated state back to the pool to persist progress
-        pool.put_ssm_state(request_id, ms.h.clone());
 
         let h = self.norm.forward(&h)?;
         let logits = self.output.forward(&h)?;

@@ -229,7 +229,15 @@ fn test_mxfp4_tiled_gemm_parity_against_cpu() -> TestResult {
     let exps_s = grim_backend_rocm::device::util::as_rocm(exps_dev.as_ref())?;
     let out_s = grim_backend_rocm::device::util::as_rocm(out_dev.as_ref())?;
 
-    dev.launch_mxfp4_gemm_tiled(a_s, b_s, exps_s, out_s, m, n, k)?;
+    dev.launch_mxfp4_gemm_tiled(
+        a_s,
+        b_s.device_ptr_u64().ok_or("b codes ptr")?,
+        exps_s.device_ptr_u64().ok_or("exps ptr")?,
+        out_s,
+        m,
+        n,
+        k,
+    )?;
     dev.synchronize();
 
     let actual_c = out_dev.to_cpu_vec_f32()?;

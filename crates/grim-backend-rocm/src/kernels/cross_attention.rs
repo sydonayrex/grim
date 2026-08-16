@@ -11,8 +11,12 @@ extern "C" {
     /// V:  [seq_len_k, num_heads_k, head_dim]     (row-major, stride = num_heads_k * head_dim)
     /// out: [seq_len_q, num_heads, head_dim]      (row-major, stride = num_heads * head_dim)
     ///
-    /// GQA: num_heads_k divides num_heads evenly. Each group of
-    /// (num_heads/num_heads_k) query heads shares the same K/V projection.
+    /// GQA: num_heads_k divides num_heads evenly. Query head `h` uses KV head
+    /// `h % num_heads_k` (interleaved grouping). The Q-projection weights must be
+    /// laid out to match this convention — if upstream weights assume contiguous
+    /// grouping (`h / (num_heads/num_heads_k)`), the kernel silently attends with
+    /// the wrong K/V head. [P1-13: doc corrected to match code; verify weight
+    /// loader convention matches.]
     ///
     /// Full (non-causal) cross-attention: every query attends to every
     /// encoder position. The output projection W_o is applied on the host.

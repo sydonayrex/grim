@@ -674,21 +674,24 @@ pub fn probe_rocm_devices() -> Vec<RocmDeviceInfo> {
                         }) {
                             continue;
                         }
+                        // lspci fallback: report what we can detect, mark capability
+                        // as unverified rather than fabricating specific numbers.
+                        // [P2-16 fix: don't fabricate GPU compliance data.]
                         devices.push(RocmDeviceInfo {
                             ordinal,
                             name: friendly_name,
                             vendor: "AMD".to_string(),
                             backend: "ROCm".to_string(),
-                            is_rocm_compliant: true,
+                            is_rocm_compliant: false,
                             gcn_arch: arch,
-                            vram_bytes: 4_294_967_296u64,
-                            vram_used_bytes: query_amd_vram_used(ordinal),
-                            wavefront_size: 32,
+                            vram_bytes: 0,
+                            vram_used_bytes: 0,
+                            wavefront_size: 0,
                             wmma_supported: false,
                             mfma_supported: false,
                             xnack_enabled: false,
-                            compute_units: 12,
-                            max_threads_per_block: 1024,
+                            compute_units: 0,
+                            max_threads_per_block: 0,
                         });
                         ordinal += 1;
                     }

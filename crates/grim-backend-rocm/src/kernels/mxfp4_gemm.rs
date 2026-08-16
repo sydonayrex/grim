@@ -8,6 +8,23 @@
 //! 2. `grim_fused_rmsnorm_mxfp4_gemm`: Fused MLP projection (RMSNorm -> MXFP4 GEMM).
 //! 3. `grim_mxfp4_gemm_tiled`: Tiled 2D batched GEMM for standalone MXFP4 linear layers.
 //! 4. `grim_mxfp4_backward_gemm`: Backward GEMM (dX = dY @ B^T) dequantizing B on-the-fly.
+//! 5. `grim_mxfp4_gemm_splitk` + `grim_mxfp4_splitk_reduce`: split-K pair for
+//!    skinny-M decode GEMMs (M <= 8), where a plain (M, N/threads) grid leaves
+//!    most CUs idle.
+//!
+//! Perf notes (decode-path review):
+//! - Weight codes are read as `uint4` (16 B = 32 codes = exactly one MXFP4
+//!   micro-block) instead of 16 scalar byte loads.
+//! - Activations are read as `float4` (K is a multiple of 32, so offsets stay
+//!   16B-aligned; the launcher validates this).
+//! - The E8M0 block scale is computed once per 32-element block
+//!   (`exp2f(e - 127)`) instead of calling `ldexpf` per element.
+//! - RoPE pairs: the partner column's GEMM result is fetched from the adjacent
+//!   lane with one `__shfl_xor_sync` instead of recomputing the entire K-long
+//!   dot product (which used to double the QK GEMM cost for rotary dims).
+//!   Warp bases are multiples of 32 (blockDim.x is a power of two >= 32) and
+//!   RoPE pairs are adjacent (2i, 2i+1), so both lanes of a pair always live
+//!   in the same warp.
 
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
@@ -25,6 +42,53 @@ __device__ __forceinline__ float mxfp4_decode_fast(unsigned char code, unsigned 
     return base * ldexpf(1.0f, (int)shared_exp - 127);
 }
 
+// E8M0 -> float scale for a whole 32-element micro-block. Callers multiply
+// LUT bases by this once per block instead of paying ldexpf per element.
+__device__ __forceinline__ float mxfp4_block_scale(unsigned char shared_exp) {
+    return exp2f((float)(int)shared_exp - 127.0f);
+}
+
+// Accumulate one 32-element MXFP4 micro-block into `acc`, vectorizing the
+// code stream as one uint4 (16 B) and the activation stream as float4s.
+// `a_row` points at A[row*K + block_k*32] (as float4*); `gamma4` optionally
+// points at gamma[block_k*32] (as float4*) and is applied elementwise (null
+// for the un-normalized kernels).
+__device__ __forceinline__ float mxfp4_dot_block(
+    const float4* __restrict__ a_row,
+    const float4* __restrict__ gamma4,        // may be null
+    const unsigned char* __restrict__ codes,  // 16 bytes = 32 codes
+    float block_scale,
+    float acc)
+{
+    const uint4 packed = *reinterpret_cast<const uint4*>(codes);
+    float4 x[8];
+    #pragma unroll
+    for (int v = 0; v < 8; ++v) x[v] = a_row[v];
+    if (gamma4 != nullptr) {
+        #pragma unroll
+        for (int v = 0; v < 8; ++v) {
+            float4 g = gamma4[v];
+            x[v].x *= g.x; x[v].y *= g.y;
+            x[v].z *= g.z; x[v].w *= g.w;
+        }
+    }
+    const float* xf = reinterpret_cast<const float*>(x);
+    const unsigned int* pc = reinterpret_cast<const unsigned int*>(&packed);
+    #pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        unsigned int word = pc[w];
+        #pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            unsigned int byte_val = (word >> (8 * b)) & 0xFFu;
+            float w0 = MXFP4_E2M1_LUT[byte_val & 0x0F] * block_scale;
+            float w1 = MXFP4_E2M1_LUT[(byte_val >> 4) & 0x0F] * block_scale;
+            int k0 = w * 8 + b * 2;
+            acc += xf[k0 + 0] * w0 + xf[k0 + 1] * w1;
+        }
+    }
+    return acc;
+}
+
 // ---------------------------------------------------------------------------
 // 1. Fused RMSNorm + MXFP4 QKV GEMM + RoPE + Direct KV Cache Scatter
 // ---------------------------------------------------------------------------
@@ -38,7 +102,8 @@ __device__ __forceinline__ float mxfp4_decode_fast(unsigned char code, unsigned 
 // Grid: (M, (N_q + N_k + N_v + 31) / 32)
 // Block: (32, 1) or (64, 1) or (256, 1)
 // ---------------------------------------------------------------------------
-__global__ void grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
+__global__ void __launch_bounds__(256)
+grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
     const float* __restrict__ x,                // [M, K]
     const float* __restrict__ gamma,            // [K]
     const unsigned char* __restrict__ w_codes,  // Packed 4-bit codes for [N_total, K]
@@ -99,30 +164,22 @@ __global__ void grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
     const int exps_per_row = K / 32;
     const int row_exp_offset = col * exps_per_row;
     const int row_codes_offset = col * (K / 2);
+    const float4* x_row = reinterpret_cast<const float4*>(x + (size_t)row * K);
+    const float4* gamma4 = reinterpret_cast<const float4*>(gamma);
 
     for (int block_k = 0; block_k < exps_per_row; ++block_k) {
-        unsigned char exp_val = w_exps[row_exp_offset + block_k];
-        int k_base = block_k * 32;
-        int code_byte_base = row_codes_offset + block_k * 16;
-
-        #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            unsigned char packed_byte = w_codes[code_byte_base + i];
-            unsigned char c0 = packed_byte & 0x0F;
-            unsigned char c1 = (packed_byte >> 4) & 0x0F;
-
-            int k0 = k_base + i * 2;
-            int k1 = k0 + 1;
-
-            float x0_norm = x[row * K + k0] * rms * gamma[k0];
-            float x1_norm = x[row * K + k1] * rms * gamma[k1];
-
-            float w0 = mxfp4_decode_fast(c0, exp_val);
-            float w1 = mxfp4_decode_fast(c1, exp_val);
-
-            acc += x0_norm * w0 + x1_norm * w1;
-        }
+        float scale = mxfp4_block_scale(w_exps[row_exp_offset + block_k]);
+        acc = mxfp4_dot_block(
+            x_row + block_k * 8,
+            gamma4 + block_k * 8,
+            w_codes + row_codes_offset + block_k * 16,
+            scale,
+            acc);
     }
+    // Apply the RMSNorm scale post-accumulation (mathematically identical to
+    // normalizing x per element: rms factors out of the dot product; gamma
+    // does NOT factor out and is applied inside the block helper).
+    acc *= rms;
 
     // Phase 3 & 4: RoPE rotation and direct scatter to Q / KV Cache
     if (out_all != nullptr) {
@@ -133,7 +190,6 @@ __global__ void grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
 
     if (col < N_q) {
         // Query projection
-        int h = col / head_dim;
         int d = col % head_dim;
 
         float q_val = acc;
@@ -144,30 +200,15 @@ __global__ void grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
                 ? inv_freq[pair_idx]
                 : 1.0f / powf(rope_theta, (float)(2 * pair_idx) / (float)rotary_dim);
             float angle = (float)pos * freq;
-            float cos_a = cosf(angle) * mscale;
-            float sin_a = sinf(angle) * mscale;
+            float cos_a, sin_a;
+            sincosf(angle, &sin_a, &cos_a);
+            cos_a *= mscale;
+            sin_a *= mscale;
 
-            // Reconstruct pair using neighbour element
-            float partner_acc = 0.0f;
-            int partner_col = is_odd ? (col - 1) : (col + 1);
-            int partner_row_exp = partner_col * exps_per_row;
-            int partner_row_codes = partner_col * (K / 2);
-
-            for (int bk = 0; bk < exps_per_row; ++bk) {
-                unsigned char e_val = w_exps[partner_row_exp + bk];
-                int kb = bk * 32;
-                int cb_base = partner_row_codes + bk * 16;
-                #pragma unroll
-                for (int i = 0; i < 16; ++i) {
-                    unsigned char p_byte = w_codes[cb_base + i];
-                    float w0 = mxfp4_decode_fast(p_byte & 0x0F, e_val);
-                    float w1 = mxfp4_decode_fast((p_byte >> 4) & 0x0F, e_val);
-                    int k0 = kb + i * 2;
-                    float x0_norm = x[row * K + k0] * rms * gamma[k0];
-                    float x1_norm = x[row * K + (k0 + 1)] * rms * gamma[k0 + 1];
-                    partner_acc += x0_norm * w0 + x1_norm * w1;
-                }
-            }
+            // Partner GEMM result lives in the adjacent lane (col ^ 1); both
+            // lanes of a RoPE pair are in the same warp, so one shuffle
+            // replaces the full partner-column dot-product recompute.
+            float partner_acc = __shfl_xor_sync(0xffffffffffffffffULL, acc, 1);
 
             if (is_odd) {
                 q_val = partner_acc * sin_a + acc * cos_a;
@@ -181,7 +222,6 @@ __global__ void grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
     } else if (col < N_q + N_k) {
         // Key projection
         int k_col = col - N_q;
-        int h = k_col / head_dim;
         int d = k_col % head_dim;
 
         float k_val = acc;
@@ -192,29 +232,12 @@ __global__ void grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
                 ? inv_freq[pair_idx]
                 : 1.0f / powf(rope_theta, (float)(2 * pair_idx) / (float)rotary_dim);
             float angle = (float)pos * freq;
-            float cos_a = cosf(angle) * mscale;
-            float sin_a = sinf(angle) * mscale;
+            float cos_a, sin_a;
+            sincosf(angle, &sin_a, &cos_a);
+            cos_a *= mscale;
+            sin_a *= mscale;
 
-            float partner_acc = 0.0f;
-            int partner_col = is_odd ? (col - 1) : (col + 1);
-            int partner_row_exp = partner_col * exps_per_row;
-            int partner_row_codes = partner_col * (K / 2);
-
-            for (int bk = 0; bk < exps_per_row; ++bk) {
-                unsigned char e_val = w_exps[partner_row_exp + bk];
-                int kb = bk * 32;
-                int cb_base = partner_row_codes + bk * 16;
-                #pragma unroll
-                for (int i = 0; i < 16; ++i) {
-                    unsigned char p_byte = w_codes[cb_base + i];
-                    float w0 = mxfp4_decode_fast(p_byte & 0x0F, e_val);
-                    float w1 = mxfp4_decode_fast((p_byte >> 4) & 0x0F, e_val);
-                    int k0 = kb + i * 2;
-                    float x0_norm = x[row * K + k0] * rms * gamma[k0];
-                    float x1_norm = x[row * K + (k0 + 1)] * rms * gamma[k0 + 1];
-                    partner_acc += x0_norm * w0 + x1_norm * w1;
-                }
-            }
+            float partner_acc = __shfl_xor_sync(0xffffffffffffffffULL, acc, 1);
 
             if (is_odd) {
                 k_val = partner_acc * sin_a + acc * cos_a;
@@ -237,7 +260,8 @@ __global__ void grim_fused_rmsnorm_mxfp4_gemm_rope_kv(
 // ---------------------------------------------------------------------------
 // 2. Fused RMSNorm + MXFP4 GEMM (e.g. for MLP gate/up/down projections)
 // ---------------------------------------------------------------------------
-__global__ void grim_fused_rmsnorm_mxfp4_gemm(
+__global__ void __launch_bounds__(256)
+grim_fused_rmsnorm_mxfp4_gemm(
     const float* __restrict__ x,                // [M, K]
     const float* __restrict__ gamma,            // [K]
     const unsigned char* __restrict__ w_codes,  // Packed 4-bit codes for [N, K]
@@ -280,30 +304,19 @@ __global__ void grim_fused_rmsnorm_mxfp4_gemm(
     const int exps_per_row = K / 32;
     const int row_exp_offset = col * exps_per_row;
     const int row_codes_offset = col * (K / 2);
+    const float4* x_row = reinterpret_cast<const float4*>(x + (size_t)row * K);
+    const float4* gamma4 = reinterpret_cast<const float4*>(gamma);
 
     for (int block_k = 0; block_k < exps_per_row; ++block_k) {
-        unsigned char exp_val = w_exps[row_exp_offset + block_k];
-        int k_base = block_k * 32;
-        int code_byte_base = row_codes_offset + block_k * 16;
-
-        #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            unsigned char packed_byte = w_codes[code_byte_base + i];
-            unsigned char c0 = packed_byte & 0x0F;
-            unsigned char c1 = (packed_byte >> 4) & 0x0F;
-
-            int k0 = k_base + i * 2;
-            int k1 = k0 + 1;
-
-            float x0_norm = x[row * K + k0] * rms * gamma[k0];
-            float x1_norm = x[row * K + k1] * rms * gamma[k1];
-
-            float w0 = mxfp4_decode_fast(c0, exp_val);
-            float w1 = mxfp4_decode_fast(c1, exp_val);
-
-            acc += x0_norm * w0 + x1_norm * w1;
-        }
+        float scale = mxfp4_block_scale(w_exps[row_exp_offset + block_k]);
+        acc = mxfp4_dot_block(
+            x_row + block_k * 8,
+            gamma4 + block_k * 8,
+            w_codes + row_codes_offset + block_k * 16,
+            scale,
+            acc);
     }
+    acc *= rms;
 
     out[row * N + col] = acc;
 }
@@ -311,7 +324,8 @@ __global__ void grim_fused_rmsnorm_mxfp4_gemm(
 // ---------------------------------------------------------------------------
 // 3. Tiled 2D MXFP4 GEMM (Standalone Linear Matmul C = A @ B)
 // ---------------------------------------------------------------------------
-__global__ void grim_mxfp4_gemm_tiled(
+__global__ void __launch_bounds__(256)
+grim_mxfp4_gemm_tiled(
     const float* __restrict__ A,                // [M, K]
     const unsigned char* __restrict__ B_codes,  // [N, K/2]
     const unsigned char* __restrict__ B_exps,   // [N, K/32]
@@ -329,32 +343,85 @@ __global__ void grim_mxfp4_gemm_tiled(
     const int exps_per_row = K / 32;
     const int row_exp_offset = col * exps_per_row;
     const int row_codes_offset = col * (K / 2);
+    const float4* a_row = reinterpret_cast<const float4*>(A + (size_t)row * K);
 
     for (int block_k = 0; block_k < exps_per_row; ++block_k) {
-        unsigned char exp_val = B_exps[row_exp_offset + block_k];
-        int k_base = block_k * 32;
-        int code_byte_base = row_codes_offset + block_k * 16;
-
-        #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            unsigned char packed_byte = B_codes[code_byte_base + i];
-            unsigned char c0 = packed_byte & 0x0F;
-            unsigned char c1 = (packed_byte >> 4) & 0x0F;
-
-            int k0 = k_base + i * 2;
-            int k1 = k0 + 1;
-
-            float a0 = A[row * K + k0];
-            float a1 = A[row * K + k1];
-
-            float w0 = mxfp4_decode_fast(c0, exp_val);
-            float w1 = mxfp4_decode_fast(c1, exp_val);
-
-            acc += a0 * w0 + a1 * w1;
-        }
+        float scale = mxfp4_block_scale(B_exps[row_exp_offset + block_k]);
+        acc = mxfp4_dot_block(
+            a_row + block_k * 8,
+            (const float4*)nullptr,
+            B_codes + row_codes_offset + block_k * 16,
+            scale,
+            acc);
     }
 
     C[row * N + col] = acc;
+}
+
+// ---------------------------------------------------------------------------
+// 3b. Split-K MXFP4 GEMM for skinny-M decode (M <= 8)
+// ---------------------------------------------------------------------------
+// With M=1 a plain (N/threads) grid occupies only a handful of CUs. Slice K
+// across `gridDim.z` splits, write per-split partials, then reduce. The
+// reduction kernel below sums the splits in a fixed order, keeping results
+// deterministic across launches.
+__global__ void __launch_bounds__(64)
+grim_mxfp4_gemm_splitk(
+    const float* __restrict__ A,                // [M, K]
+    const unsigned char* __restrict__ B_codes,  // [N, K/2]
+    const unsigned char* __restrict__ B_exps,   // [N, K/32]
+    float* __restrict__ partials,               // [num_splits, M, N]
+    int M,
+    int N,
+    int K,
+    int num_splits
+) {
+    const int row = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int split = blockIdx.z;
+
+    if (row >= M || col >= N) return;
+
+    const int exps_per_row = K / 32;
+    const int k_per_split = (exps_per_row + num_splits - 1) / num_splits;
+    const int bk_begin = split * k_per_split;
+    const int bk_end = min(bk_begin + k_per_split, exps_per_row);
+
+    float acc = 0.0f;
+    const int row_exp_offset = col * exps_per_row;
+    const int row_codes_offset = col * (K / 2);
+    const float4* a_row = reinterpret_cast<const float4*>(A + (size_t)row * K);
+
+    for (int block_k = bk_begin; block_k < bk_end; ++block_k) {
+        float scale = mxfp4_block_scale(B_exps[row_exp_offset + block_k]);
+        acc = mxfp4_dot_block(
+            a_row + block_k * 8,
+            (const float4*)nullptr,
+            B_codes + row_codes_offset + block_k * 16,
+            scale,
+            acc);
+    }
+
+    partials[((size_t)split * M + row) * N + col] = acc;
+}
+
+__global__ void __launch_bounds__(256)
+grim_mxfp4_splitk_reduce(
+    const float* __restrict__ partials,         // [num_splits, M, N]
+    float* __restrict__ C,                      // [M, N]
+    int M,
+    int N,
+    int num_splits
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = M * N;
+    if (idx >= total) return;
+
+    float acc = 0.0f;
+    for (int s = 0; s < num_splits; ++s) {
+        acc += partials[((size_t)s * M) * N + idx];
+    }
+    C[idx] = acc;
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +436,8 @@ __global__ void grim_mxfp4_gemm_tiled(
 // per-head reduction (which needs the whole head vector) out of the GEMM grid.
 // Grid: (M * (num_q_heads + 2*num_kv_heads) + 63) / 64 threads, block 64.
 // ---------------------------------------------------------------------------
-__global__ void grim_qk_norm_rope(
+__global__ void __launch_bounds__(64)
+grim_qk_norm_rope(
     const float* __restrict__ gemm_out,   // [M, N_total] raw QKV (N_total = N_q + 2*N_k)
     const float* __restrict__ gamma_q,     // [head_dim] Q-norm weight
     const float* __restrict__ gamma_k,     // [head_dim] K-norm weight
@@ -411,8 +479,10 @@ __global__ void grim_qk_norm_rope(
                 ? inv_freq[i]
                 : 1.0f / powf(rope_theta, (float)(2 * i) / (float)head_dim);
             float angle = (float)pos * freq;
-            float c = cosf(angle) * mscale;
-            float s = sinf(angle) * mscale;
+            float c, s;
+            sincosf(angle, &s, &c);
+            c *= mscale;
+            s *= mscale;
             if (q_out != nullptr) {
                 int o = row * N_q + h * head_dim;
                 q_out[o + d0] = v0 * c - v1 * s;
@@ -440,8 +510,10 @@ __global__ void grim_qk_norm_rope(
                 ? inv_freq[i]
                 : 1.0f / powf(rope_theta, (float)(2 * i) / (float)head_dim);
             float angle = (float)pos * freq;
-            float c = cosf(angle) * mscale;
-            float s = sinf(angle) * mscale;
+            float c, s;
+            sincosf(angle, &s, &c);
+            c *= mscale;
+            s *= mscale;
             if (k_cache != nullptr && (int)pos < max_seq_len) {
                 int o = (int)pos * N_k + h * head_dim;
                 k_cache[o + d0] = v0 * c - v1 * s;
@@ -468,7 +540,15 @@ __global__ void grim_qk_norm_rope(
 // ---------------------------------------------------------------------------
 // 4. Backward MXFP4 GEMM (dA = dY @ B^T)
 // ---------------------------------------------------------------------------
-__global__ void grim_mxfp4_backward_gemm(
+// Coalescing fix: the naive one-thread-per-(row,k) form strides through
+// B_codes[n][block_k] with a K/2-byte stride per n — the worst possible
+// access pattern. This form has each thread own up to 32 consecutive k
+// (one micro-block row of dA) and walk N in the inner loop: dY[row, n] is
+// contiguous in n (coalesced across the warp's rows share), and each
+// 16-byte code group / exponent byte is loaded once per thread instead of
+// once per element.
+__global__ void __launch_bounds__(256)
+grim_mxfp4_backward_gemm(
     const float* __restrict__ dY,               // [M, N]
     const unsigned char* __restrict__ B_codes,  // [N, K/2]
     const unsigned char* __restrict__ B_exps,   // [N, K/32]
@@ -477,30 +557,45 @@ __global__ void grim_mxfp4_backward_gemm(
     int N,
     int K
 ) {
-    const int row = blockIdx.y * blockDim.y + threadIdx.y;
-    const int k_idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (row >= M || k_idx >= K) return;
-
-    const int block_k = k_idx / 32;
-    const int in_block = k_idx % 32;
-    const int byte_in_block = in_block / 2;
-    const int is_high = in_block % 2;
+    // One thread per (row, 32-element k micro-block).
+    const int row = blockIdx.y;
+    const int block_k = blockIdx.x * blockDim.x + threadIdx.x;
     const int exps_per_row = K / 32;
 
-    float acc = 0.0f;
+    if (row >= M || block_k >= exps_per_row) return;
+
+    float acc[32];
+    #pragma unroll
+    for (int i = 0; i < 32; ++i) acc[i] = 0.0f;
+
+    const int k_base = block_k * 32;
+    const float* dy_row = dY + (size_t)row * N;
+
     for (int n = 0; n < N; ++n) {
-        float dy = dY[row * N + n];
-
-        unsigned char exp_val = B_exps[n * exps_per_row + block_k];
-        unsigned char packed_byte = B_codes[n * (K / 2) + block_k * 16 + byte_in_block];
-        unsigned char code = is_high ? ((packed_byte >> 4) & 0x0F) : (packed_byte & 0x0F);
-        float w = mxfp4_decode_fast(code, exp_val);
-
-        acc += dy * w;
+        float dy = dy_row[n];
+        float scale = mxfp4_block_scale(B_exps[n * exps_per_row + block_k]);
+        const uint4 packed = *reinterpret_cast<const uint4*>(
+            B_codes + (size_t)n * (K / 2) + block_k * 16);
+        const unsigned int* pc = reinterpret_cast<const unsigned int*>(&packed);
+        float f = dy * scale;
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            unsigned int word = pc[w];
+            #pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                unsigned int byte_val = (word >> (8 * b)) & 0xFFu;
+                int k0 = w * 8 + b * 2;
+                acc[k0 + 0] += f * MXFP4_E2M1_LUT[byte_val & 0x0F];
+                acc[k0 + 1] += f * MXFP4_E2M1_LUT[(byte_val >> 4) & 0x0F];
+            }
+        }
     }
 
-    dA[row * K + k_idx] = acc;
+    float* out = dA + (size_t)row * K + k_base;
+    #pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        out[i] = acc[i];
+    }
 }
 
 } // extern "C"
@@ -517,5 +612,9 @@ mod tests {
         assert!(KERNEL_SOURCE.contains("grim_mxfp4_gemm_tiled"));
         assert!(KERNEL_SOURCE.contains("grim_mxfp4_backward_gemm"));
         assert!(KERNEL_SOURCE.contains("mxfp4_decode_fast"));
+        assert!(KERNEL_SOURCE.contains("grim_mxfp4_gemm_splitk"));
+        assert!(KERNEL_SOURCE.contains("grim_mxfp4_splitk_reduce"));
+        assert!(KERNEL_SOURCE.contains("__shfl_xor_sync"));
+        assert!(KERNEL_SOURCE.contains("mxfp4_block_scale"));
     }
 }

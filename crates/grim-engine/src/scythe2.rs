@@ -358,7 +358,7 @@ impl C2plrController {
         let best_gpu = placement_logits
             .iter()
             .enumerate()
-            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i)
             .unwrap_or(0);
 
@@ -1072,6 +1072,15 @@ impl ScytheRing {
                 )
             };
             if copy_result.is_err() {
+                // Copy failed — roll back the CAS increment so the consumer
+                // doesn't poll a slot that will never be filled (infinite hang).
+                // [P1-42 fix: CAS rollback on copy failure.]
+                let _ = self.head.compare_exchange_weak(
+                    slot_counter.wrapping_add(1),
+                    slot_counter,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
                 return Err(desc);
             }
         }
@@ -1943,18 +1952,20 @@ mod tests {
                 let partials: Vec<ExpertPartial> = expert_groups
                     .into_iter()
                     .map(|(expert, group)| {
-                        // Merge group into single partial per expert
-                        // Compute average combine weight across all entries in group
+                        // Merge group into single partial per expert.
+                        // Sum combine weights for repeated expert selections (standard
+                        // MoE top-k combine semantics), not average. Also set col_offset
+                        // from the first entry's actual column offset.
+                        // [P1-31 fix: sum not average; set col_offset.]
                         let total_weight: f32 = group.iter().map(|g| g.combine_weight).sum();
-                        let count = group.len();
                         let first = group.into_iter().next().unwrap();
                         ExpertPartial {
                             storage: None,
                             expert,
                             dest_rank: first.dest_rank,
-                            col_offset: 0,
-                            n_cols: count,
-                            combine_weight: total_weight / count as f32,
+                            col_offset: first.col_offset,
+                            n_cols: group.len(),
+                            combine_weight: total_weight,
                         }
                     })
                     .collect();
@@ -2071,8 +2082,9 @@ mod tests {
             .iter()
             .find(|p| p.expert == 1)
             .expect("expert 1");
-        // Combined weight = (0.6 + 0.4) / 2 = 0.5
-        assert!((expert1.combine_weight - 0.5).abs() < 1e-5);
+        // Combined weight = 0.6 + 0.4 = 1.0 (sum, not average — standard MoE
+        // top-k combine semantics). [P1-31 fix: updated from 0.5 to 1.0.]
+        assert!((expert1.combine_weight - 1.0).abs() < 1e-5);
     }
 
     #[test]

@@ -87,7 +87,15 @@ extern "C" {
         float sign_val = ((signs[sign_byte_idx] >> sign_bit) & 1) ? -1.0f : 1.0f;
         int q_byte = in_sb / 2;
         unsigned char q_code = (in_sb % 2 == 0) ? (qs[q_byte] & 0x0F) : ((qs[q_byte] >> 4) & 0x0F);
-        return d * group_scale * (float)q_code * sign_val;
+        // Canonical signed codebook (ggml kvalues_iq4nl); CPU decoder takes abs()
+        // then applies the q8 sign bit — replicate exactly.
+        static const float kvalues_iq4nl[16] = {
+            -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+            1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 87.0f, 107.0f
+        };
+        float code_abs = kvalues_iq4nl[q_code];
+        code_abs = code_abs < 0.0f ? -code_abs : code_abs;
+        return d * group_scale * code_abs * sign_val;
     }
 
     __device__ inline float dequant_iq4xs_device(const unsigned char* blk, int in_sb) {
@@ -111,101 +119,178 @@ extern "C" {
     // ─── Standalone global kernels ──────────────────────────────────
 
     /// Dequantize IQ2_XXS packed bytes to F32.
-    __global__ void grim_dequant_iq2xxs(
+    ///
+    /// One 64-thread block per 256-element quant block; each thread decodes
+    /// four consecutive elements with vectorized float4 stores (the previous
+    /// one-thread-per-block form serialized 256 dependent dequants and wrote
+    /// scalars).
+    __global__ void __launch_bounds__(64)
+    grim_dequant_iq2xxs(
         const unsigned char* __restrict__ packed,
         float* __restrict__ out,
         int n_blocks)
     {
-        int b = blockIdx.x * blockDim.x + threadIdx.x;
+        const int b = blockIdx.x;
         if (b >= n_blocks) return;
-        const unsigned char* blk = packed + b * 66;
-        for (int i = 0; i < 256; ++i) {
-            out[b * 256 + i] = dequant_iq2xxs_device(blk, i);
-        }
+        const unsigned char* blk = packed + (size_t)b * 66;
+        float* dst = out + (size_t)b * 256;
+        const int base = threadIdx.x * 4;
+        float4 v;
+        v.x = dequant_iq2xxs_device(blk, base + 0);
+        v.y = dequant_iq2xxs_device(blk, base + 1);
+        v.z = dequant_iq2xxs_device(blk, base + 2);
+        v.w = dequant_iq2xxs_device(blk, base + 3);
+        *reinterpret_cast<float4*>(dst + base) = v;
     }
 
     /// Dequantize IQ2_XS packed bytes to F32.
-    __global__ void grim_dequant_iq2xs(
+    ///
+    /// One 64-thread block per 256-element quant block; each thread decodes
+    /// four consecutive elements with vectorized float4 stores (the previous
+    /// one-thread-per-block form serialized 256 dependent dequants and wrote
+    /// scalars).
+    __global__ void __launch_bounds__(64)
+    grim_dequant_iq2xs(
         const unsigned char* __restrict__ packed,
         float* __restrict__ out,
         int n_blocks)
     {
-        int b = blockIdx.x * blockDim.x + threadIdx.x;
+        const int b = blockIdx.x;
         if (b >= n_blocks) return;
-        const unsigned char* blk = packed + b * 74;
-        for (int i = 0; i < 256; ++i) {
-            out[b * 256 + i] = dequant_iq2xs_device(blk, i);
-        }
+        const unsigned char* blk = packed + (size_t)b * 74;
+        float* dst = out + (size_t)b * 256;
+        const int base = threadIdx.x * 4;
+        float4 v;
+        v.x = dequant_iq2xs_device(blk, base + 0);
+        v.y = dequant_iq2xs_device(blk, base + 1);
+        v.z = dequant_iq2xs_device(blk, base + 2);
+        v.w = dequant_iq2xs_device(blk, base + 3);
+        *reinterpret_cast<float4*>(dst + base) = v;
     }
 
     /// Dequantize IQ2_S packed bytes to F32.
-    __global__ void grim_dequant_iq2s(
+    ///
+    /// One 64-thread block per 256-element quant block; each thread decodes
+    /// four consecutive elements with vectorized float4 stores (the previous
+    /// one-thread-per-block form serialized 256 dependent dequants and wrote
+    /// scalars).
+    __global__ void __launch_bounds__(64)
+    grim_dequant_iq2s(
         const unsigned char* __restrict__ packed,
         float* __restrict__ out,
         int n_blocks)
     {
-        int b = blockIdx.x * blockDim.x + threadIdx.x;
+        const int b = blockIdx.x;
         if (b >= n_blocks) return;
-        const unsigned char* blk = packed + b * 82;
-        for (int i = 0; i < 256; ++i) {
-            out[b * 256 + i] = dequant_iq2s_device(blk, i);
-        }
+        const unsigned char* blk = packed + (size_t)b * 82;
+        float* dst = out + (size_t)b * 256;
+        const int base = threadIdx.x * 4;
+        float4 v;
+        v.x = dequant_iq2s_device(blk, base + 0);
+        v.y = dequant_iq2s_device(blk, base + 1);
+        v.z = dequant_iq2s_device(blk, base + 2);
+        v.w = dequant_iq2s_device(blk, base + 3);
+        *reinterpret_cast<float4*>(dst + base) = v;
     }
 
     /// Dequantize IQ3_XXS packed bytes to F32.
-    __global__ void grim_dequant_iq3xxs(
+    ///
+    /// One 64-thread block per 256-element quant block; each thread decodes
+    /// four consecutive elements with vectorized float4 stores (the previous
+    /// one-thread-per-block form serialized 256 dependent dequants and wrote
+    /// scalars).
+    __global__ void __launch_bounds__(64)
+    grim_dequant_iq3xxs(
         const unsigned char* __restrict__ packed,
         float* __restrict__ out,
         int n_blocks)
     {
-        int b = blockIdx.x * blockDim.x + threadIdx.x;
+        const int b = blockIdx.x;
         if (b >= n_blocks) return;
-        const unsigned char* blk = packed + b * 96;
-        for (int i = 0; i < 256; ++i) {
-            out[b * 256 + i] = dequant_iq3xxs_device(blk, i);
-        }
+        const unsigned char* blk = packed + (size_t)b * 96;
+        float* dst = out + (size_t)b * 256;
+        const int base = threadIdx.x * 4;
+        float4 v;
+        v.x = dequant_iq3xxs_device(blk, base + 0);
+        v.y = dequant_iq3xxs_device(blk, base + 1);
+        v.z = dequant_iq3xxs_device(blk, base + 2);
+        v.w = dequant_iq3xxs_device(blk, base + 3);
+        *reinterpret_cast<float4*>(dst + base) = v;
     }
 
     /// Dequantize IQ3_S packed bytes to F32.
-    __global__ void grim_dequant_iq3s(
+    ///
+    /// One 64-thread block per 256-element quant block; each thread decodes
+    /// four consecutive elements with vectorized float4 stores (the previous
+    /// one-thread-per-block form serialized 256 dependent dequants and wrote
+    /// scalars).
+    __global__ void __launch_bounds__(64)
+    grim_dequant_iq3s(
         const unsigned char* __restrict__ packed,
         float* __restrict__ out,
         int n_blocks)
     {
-        int b = blockIdx.x * blockDim.x + threadIdx.x;
+        const int b = blockIdx.x;
         if (b >= n_blocks) return;
-        const unsigned char* blk = packed + b * 110;
-        for (int i = 0; i < 256; ++i) {
-            out[b * 256 + i] = dequant_iq3s_device(blk, i);
-        }
+        const unsigned char* blk = packed + (size_t)b * 110;
+        float* dst = out + (size_t)b * 256;
+        const int base = threadIdx.x * 4;
+        float4 v;
+        v.x = dequant_iq3s_device(blk, base + 0);
+        v.y = dequant_iq3s_device(blk, base + 1);
+        v.z = dequant_iq3s_device(blk, base + 2);
+        v.w = dequant_iq3s_device(blk, base + 3);
+        *reinterpret_cast<float4*>(dst + base) = v;
     }
 
     /// Dequantize IQ4_NL packed bytes to F32.
-    __global__ void grim_dequant_iq4nl(
+    ///
+    /// One 64-thread block per 256-element quant block; each thread decodes
+    /// four consecutive elements with vectorized float4 stores (the previous
+    /// one-thread-per-block form serialized 256 dependent dequants and wrote
+    /// scalars).
+    __global__ void __launch_bounds__(64)
+    grim_dequant_iq4nl(
         const unsigned char* __restrict__ packed,
         float* __restrict__ out,
         int n_blocks)
     {
-        int b = blockIdx.x * blockDim.x + threadIdx.x;
+        const int b = blockIdx.x;
         if (b >= n_blocks) return;
-        const unsigned char* blk = packed + b * 170;
-        for (int i = 0; i < 256; ++i) {
-            out[b * 256 + i] = dequant_iq4nl_device(blk, i);
-        }
+        const unsigned char* blk = packed + (size_t)b * 170;
+        float* dst = out + (size_t)b * 256;
+        const int base = threadIdx.x * 4;
+        float4 v;
+        v.x = dequant_iq4nl_device(blk, base + 0);
+        v.y = dequant_iq4nl_device(blk, base + 1);
+        v.z = dequant_iq4nl_device(blk, base + 2);
+        v.w = dequant_iq4nl_device(blk, base + 3);
+        *reinterpret_cast<float4*>(dst + base) = v;
     }
 
     /// Dequantize IQ4_XS packed bytes to F32.
-    __global__ void grim_dequant_iq4xs(
+    ///
+    /// One 64-thread block per 256-element quant block; each thread decodes
+    /// four consecutive elements with vectorized float4 stores (the previous
+    /// one-thread-per-block form serialized 256 dependent dequants and wrote
+    /// scalars).
+    __global__ void __launch_bounds__(64)
+    grim_dequant_iq4xs(
         const unsigned char* __restrict__ packed,
         float* __restrict__ out,
         int n_blocks)
     {
-        int b = blockIdx.x * blockDim.x + threadIdx.x;
+        const int b = blockIdx.x;
         if (b >= n_blocks) return;
-        const unsigned char* blk = packed + b * 136;
-        for (int i = 0; i < 256; ++i) {
-            out[b * 256 + i] = dequant_iq4xs_device(blk, i);
-        }
+        const unsigned char* blk = packed + (size_t)b * 136;
+        float* dst = out + (size_t)b * 256;
+        const int base = threadIdx.x * 4;
+        float4 v;
+        v.x = dequant_iq4xs_device(blk, base + 0);
+        v.y = dequant_iq4xs_device(blk, base + 1);
+        v.z = dequant_iq4xs_device(blk, base + 2);
+        v.w = dequant_iq4xs_device(blk, base + 3);
+        *reinterpret_cast<float4*>(dst + base) = v;
     }
 
 }

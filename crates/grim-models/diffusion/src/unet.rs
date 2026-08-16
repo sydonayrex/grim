@@ -121,11 +121,10 @@ impl UpBlock {
                     acc += self.conv_w[ch_out * (hidden * 2) + ch_in] * prev[ch_in * hw + elem];
                 }
                 if !skip.is_empty() {
-                    let skip_ch_out = ch_out % hidden;
-                    for ch_in in 0..hidden {
-                        acc += self.conv_w[ch_out * (hidden * 2) + hidden + ch_in]
-                            * skip[skip_ch_out * hw + elem];
-                    }
+                    // Skip connection indexed by ch_in (the input channel), not ch_out.
+                    // [P1-35 fix: skip channel index uses ch_in, not ch_out.]
+                    acc += self.conv_w[ch_out * (hidden * 2) + hidden + ch_in]
+                        * skip[ch_in * hw + elem];
                 }
                 x_data[idx] = acc;
             }

@@ -206,8 +206,7 @@ impl HyperparameterExtractor {
             .or_else(|| metadata.get_u32(&format!("{arch_name}.expert_intermediate_size")))
             .map(|v| v as usize);
         let routed_scaling_factor = metadata
-            .get_f32(&format!("{arch_name}.expert_gating_func"))
-            .or_else(|| metadata.get_f32(&format!("{arch_name}.routed_scaling_factor")))
+            .get_f32(&format!("{arch_name}.routed_scaling_factor"))
             .or_else(|| metadata.get_f32(&format!("{arch_name}.moe_routed_scaling_factor")))
             .unwrap_or(1.0);
 

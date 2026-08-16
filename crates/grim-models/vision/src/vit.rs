@@ -284,7 +284,9 @@ impl VitBlock {
             }
         }
 
-        let mut attn_res = x_normed.clone();
+        // Pre-norm residual: skip connection uses the original input x, not x_normed.
+        // attn_res = x + attn(norm(x)). [P1-34 fix: residual uses x, not x_normed.]
+        let mut attn_res = x.clone();
         for i in 0..attn_res.len() {
             attn_res[i] += attn_out[i];
         }

@@ -194,8 +194,17 @@ impl GptqProvider {
             // Get base tensor shape - infer from qweight shape for now
             let qw = tensor_info.shape();
             let shape: Vec<usize> = if qw.len() >= 2 {
-                // Approximate shape reconstruction: [in_features, out_features / bits * 32]
-                vec![qw[0], qw[1].saturating_mul(32 / valid_bits as usize).max(1)]
+                // Shape reconstruction: the packed weight has qw[1] u32 words.
+                // For 3-bit, 32 elements span 3 u32 words (96 bits), so
+                // out_features = qw[1] * 32 / 3 (multiply first to avoid truncation).
+                // For other bit widths: out_features = qw[1] * 32 / bits.
+                // Use saturating arithmetic to avoid overflow.
+                let out_features = if valid_bits == 3 {
+                    (qw[1].saturating_mul(32) / 3).max(1)
+                } else {
+                    (qw[1].saturating_mul(32) / valid_bits as usize).max(1)
+                };
+                vec![qw[0], out_features]
             } else {
                 qw.clone()
             };

@@ -61,7 +61,13 @@ pub fn scaling_base(method: &RopeScalingMethod, base: f32, head_dim: usize) -> f
     match method {
         RopeScalingMethod::None => base,
         RopeScalingMethod::Linear { factor } => base * factor.powf(1.0 / dim),
-        RopeScalingMethod::Llama3 { factor } => base * (1.0 + factor * (8.0 / dim).powi(2) / 2.0),
+        // Llama 3 style: linear interpolation between original and scaled rope.
+        // effective_base = base * factor for the full scaling factor.
+        // The (8/head_dim)^2/2 term was a rough approximation that produced ~1.6%
+        // shift for factor=8 instead of the intended ~8x. Corrected to match the
+        // Llama 3 reference: scale the base by the factor directly.
+        // [P2-22 fix: corrected Llama3 rope scaling formula.]
+        RopeScalingMethod::Llama3 { factor } => base * factor,
         RopeScalingMethod::LongRoPE { factor } | RopeScalingMethod::YaRN { factor, .. } => {
             // NTK-aware effective base (interpolation for low freq, extrapolation for high).
             base * factor.powf(dim / (dim - 2.0).max(1.0))
@@ -97,7 +103,9 @@ mod tests {
     #[test]
     fn llama3_scales_with_gamma() {
         let out = scaling_base(&RopeScalingMethod::Llama3 { factor: 8.0 }, 10000.0, 128);
-        let expected = 10000.0 * (1.0 + 8.0 * (8.0 / 128.0_f32).powi(2) / 2.0);
+        // Llama3 rope scaling: effective_base = base * factor (corrected from the
+        // rough (8/head_dim)^2/2 approximation which gave ~1.6% instead of ~8x).
+        let expected = 10000.0 * 8.0;
         assert!((out - expected).abs() < 1e-3);
     }
 
