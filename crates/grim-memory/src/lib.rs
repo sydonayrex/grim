@@ -617,7 +617,7 @@ impl PagedKvCache {
         let capacity = pool.lock().unwrap().capacity();
         let page_size = if page_size_ == 0 { BLOCK_SIZE } else { page_size_ };
         let np = capacity * page_size;
-        let elem_per_page = np * num_heads * head_dim;
+        let _elem_per_page = np * num_heads * head_dim;
         Self {
             table: BlockTable::new(),
             pool,

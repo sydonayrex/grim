@@ -848,7 +848,7 @@ impl Engine {
         );
         let backend = grim_nn::pick_device_for_storage_device(&device);
         kv.set_device(device.clone(), backend);
-        let mut session = Box::new(grim_core::session::Inner::with_kv(device, Box::new(kv)));
+        let session = Box::new(grim_core::session::Inner::with_kv(device, Box::new(kv)));
 
         self.sessions.insert(request.id, session);
         self.request_model_ids
