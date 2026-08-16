@@ -50,16 +50,14 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[test]
-#[ignore = "requires real ROCm device; run with GRIM_RUN_GPU_TESTS=1 and -- --ignored"]
+#[ignore = "requires real ROCm device; run with GRIM_GPU_TEST=1 and -- --ignored"]
 fn q4k_kernel_matches_cpu_dequant() {
-    let dev = match std::env::var("GRIM_RUN_GPU_TESTS") {
-        Ok(_) => RocmDevice::try_new(0)
-            .expect("RocmDevice::try_new(0) should succeed on a system with ROCm"),
-        Err(_) => {
-            eprintln!("[SKIP] set GRIM_RUN_GPU_TESTS=1 to run on a real ROCm device");
-            return;
-        }
-    };
+    if !grim_backend_rocm::gpu_test_enabled() {
+        eprintln!("[SKIP] set GRIM_GPU_TEST=1 to run on a real ROCm device");
+        return;
+    }
+    let dev = RocmDevice::try_new(0)
+        .expect("RocmDevice::try_new(0) should succeed on a system with ROCm");
 
     let mut packed = Vec::new();
     build_q4k_block(&mut packed, 1.0, 0.25, 10, 7);

@@ -5,6 +5,11 @@
 //! Achieves 92-127 tok/s (4.9x-6.6x speedup over CPU dense baseline).
 //!
 //! Run: `cargo test -p grim-backend-rocm --test kv_dequant_perf -- --ignored --nocapture`
+//!
+//! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test kv_dequant_perf -- --ignored
+//! RESULT: 0/1 IGNORED — test is marked #[ignore] and requires `--ignored` flag to run.
+//!   Not executed on this run. GPU kernel load (hipModuleLoad 209) would likely fail
+//!   same as other JIT-kernel tests on this box.
 
 use std::time::Instant;
 

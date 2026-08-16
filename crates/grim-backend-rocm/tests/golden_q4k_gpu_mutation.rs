@@ -1,3 +1,8 @@
+//! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test golden_q4k_gpu_mutation
+//! RESULT: FAILED — hipModuleLoad failed: 209. The Q4_K GPU dequantization GEMM kernel is
+//!   compiled but the .hipfb binary is not registered/loaded for this test on this dual-GPU
+//!   RDNA4 box. Host-side infrastructure works; the kernel is not tied to this test at runtime.
+//!
 //! Golden mutation-resistant test for Crow Q4_K GPU dequantization GEMM forward and backward paths.
 
 use grim_backend_rocm::RocmDevice;
@@ -11,10 +16,8 @@ use std::panic;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
 
-const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
-
 fn gpu_device() -> Option<RocmDevice> {
-    if std::env::var(GPU_TEST_ENV).is_err() {
+    if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
     match panic::catch_unwind(|| {

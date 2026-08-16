@@ -219,12 +219,14 @@ fn active_backend(has_gpu: bool) -> String {
             .unwrap_or(false)
         {
             "rocm".to_string()
-        } else if grim_backend_cuda::CudaDevice::probe()
-            .map(|devices| !devices.is_empty())
-            .unwrap_or(false)
-        {
-            "cuda".to_string()
         } else {
+            #[cfg(feature = "cuda")]
+            if grim_backend_cuda::CudaDevice::probe()
+                .map(|devices| !devices.is_empty())
+                .unwrap_or(false)
+            {
+                return "cuda".to_string();
+            }
             "gpu".to_string()
         }
     } else {
@@ -2226,10 +2228,18 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     {
         if !rocm_devs.is_empty() {
             probe_vram_and_gpus(rocm_devs.len())
-        } else if let Ok(cuda_devs) = grim_backend_cuda::CudaDevice::probe() {
-            if !cuda_devs.is_empty() {
-                probe_cuda_vram(cuda_devs.len())
-            } else if let Some((free, total)) = grim_backend_metal::vram_info(0) {
+        } else {
+            #[cfg(feature = "cuda")]
+            if let Ok(cuda_devs) = grim_backend_cuda::CudaDevice::probe() {
+                if !cuda_devs.is_empty() {
+                    return (
+                        probe_cuda_vram(cuda_devs.len()).0,
+                        probe_cuda_vram(cuda_devs.len()).1,
+                        probe_cuda_vram(cuda_devs.len()).2,
+                    );
+                }
+            }
+            if let Some((free, total)) = grim_backend_metal::vram_info(0) {
                 (
                     total - free,
                     total,
@@ -2242,13 +2252,19 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
             } else {
                 (0, 0, vec![])
             }
-        } else {
-            (0, 0, vec![])
         }
-    } else if let Ok(cuda_devs) = grim_backend_cuda::CudaDevice::probe() {
-        if !cuda_devs.is_empty() {
-            probe_cuda_vram(cuda_devs.len())
-        } else if let Some((free, total)) = grim_backend_metal::vram_info(0) {
+    } else {
+        #[cfg(feature = "cuda")]
+        if let Ok(cuda_devs) = grim_backend_cuda::CudaDevice::probe() {
+            if !cuda_devs.is_empty() {
+                return (
+                    probe_cuda_vram(cuda_devs.len()).0,
+                    probe_cuda_vram(cuda_devs.len()).1,
+                    probe_cuda_vram(cuda_devs.len()).2,
+                );
+            }
+        }
+        if let Some((free, total)) = grim_backend_metal::vram_info(0) {
             (
                 total - free,
                 total,
@@ -2261,18 +2277,6 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
         } else {
             (0, 0, vec![])
         }
-    } else if let Some((free, total)) = grim_backend_metal::vram_info(0) {
-        (
-            total - free,
-            total,
-            vec![serde_json::json!({
-                "name": "Metal GPU",
-                "index": 0u32,
-                "memory": if total > 0 { ((total - free) as f64 / total as f64 * 100.0) as u32 } else { 0 }
-            })],
-        )
-    } else {
-        (0, 0, vec![])
     };
 
     let has_gpu = total_vram_max > 0;
@@ -5328,6 +5332,7 @@ fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::Valu
         return (total_vram_used, total_vram_max, gpus_json);
     }
 
+    #[cfg(feature = "cuda")]
     if let Ok(cuda_devs) = grim_backend_cuda::CudaDevice::probe() {
         if !cuda_devs.is_empty() {
             for ord in 0..cuda_devs.len() {
@@ -5398,6 +5403,7 @@ fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::Valu
 }
 
 /// Probe CUDA VRAM usage for N GPUs.
+#[cfg(feature = "cuda")]
 fn probe_cuda_vram(cuda_gpu_count: usize) -> (u64, u64, Vec<serde_json::Value>) {
     let mut total_vram_used: u64 = 0;
     let mut total_vram_max: u64 = 0;
@@ -5424,6 +5430,7 @@ fn probe_cuda_vram(cuda_gpu_count: usize) -> (u64, u64, Vec<serde_json::Value>) 
             }));
         }
     }
+
     (total_vram_used, total_vram_max, gpus_json)
 }
 

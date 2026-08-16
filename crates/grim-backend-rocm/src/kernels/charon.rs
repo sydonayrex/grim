@@ -111,33 +111,25 @@ extern "C" {
         const float* dw = expert_down_w + (unsigned long long)exp * hidden * inter;
 
         // Fused gate + up GEMM with in-register SiLU combine, then down.
-        // Each thread owns one output column of the token's hidden vector.
         // The intermediate inter-dimension is reduced in-register (no HBM
         // round-trip for the activation — the TritonMoE ~35% GMEM cut).
-        for (int h = 0; h < hidden; ++h) {
-            float acc = 0.0f;
-            for (int j = 0; j < inter; ++j) {
-                float g = 0.0f;
-                float u = 0.0f;
-                for (int i = 0; i < hidden; ++i) {
-                    g += gw[j * hidden + i] * a[i];
-                    u += uw[j * hidden + i] * a[i];
-                }
-                // SiLU(g) * u, fused in-register.
-                float silu_g = g / (1.0f + expf(-g));
-                float act = silu_g * u;
-                // down: dw[h, j] * act
-                acc += dw[h * inter + j] * act;
+        for (int j = 0; j < inter; ++j) {
+            float g = 0.0f;
+            float u = 0.0f;
+            for (int i = 0; i < hidden; ++i) {
+                g += gw[j * hidden + i] * a[i];
+                u += uw[j * hidden + i] * a[i];
             }
-            // Weighted accumulate into the token's output row. Multiple
-            // blocks may write the same token (different experts) — they
-            // accumulate the routed contribution scaled by the combine
-            // weight and routed_scaling_factor. Correctness relies solely
-            // on atomicAdd: pair emission order carries no cross-block
-            // serialization guarantee, and float atomic accumulation is
-            // associativity-tolerant so the result is deterministic.
-            unsigned long long out_idx = (unsigned long long)tok * hidden + h;
-            atomicAdd(out + out_idx, routed_scaling_factor * w * acc);
+            // SiLU(g) * u, fused in-register.
+            float silu_g = g / (1.0f + expf(-g));
+            float act = silu_g * u;
+            float scale = routed_scaling_factor * w * act;
+
+            // down: dw[h, j] * act, accumulated into token output row
+            for (int h = 0; h < hidden; ++h) {
+                unsigned long long out_idx = (unsigned long long)tok * hidden + h;
+                atomicAdd(out + out_idx, dw[h * inter + j] * scale);
+            }
         }
     }
 

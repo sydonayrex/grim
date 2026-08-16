@@ -14,7 +14,7 @@ grim-engine = { workspace = true }
 grim-format = { workspace = true }
 grim-plugin = { workspace = true }
 grim-backend-rocm = { workspace = true }
-grim-backend-cuda = { workspace = true }
+grim-backend-cuda = { workspace = true, optional = true }
 grim-backend-metal = { workspace = true }
 grim-backend-vulkan = { workspace = true }
 grim-backend-cpu = { workspace = true }
@@ -36,6 +36,7 @@ wat = "1.0"
 
 [features]
 default = []
+cuda = ["dep:grim-backend-cuda", "grim-engine/cuda"]
 # Enables the wasmtime-backed WASM plugin loader. When disabled,
 # `WasmPluginLoader::create_sampler` returns `Unimplemented`; the request-time
 # `sampler` field wiring is still exercised by the default-on mock-sampler E2E

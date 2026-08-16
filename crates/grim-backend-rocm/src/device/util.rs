@@ -48,6 +48,45 @@ pub fn gpu_target_arch() -> String {
     std::env::var("GRIM_GPU_TARGET").unwrap_or_else(|_| "gfx900".into())
 }
 
+/// Canonical GPU test check. Defaults to `GRIM_GPU_TEST=1`, but also recognizes
+/// legacy aliases `GRIM_RUN_GPU_TESTS=1` and `GRIM_RUN_GPU_TEST=1`.
+pub fn gpu_test_enabled() -> bool {
+    let check = |var: &str| {
+        std::env::var(var)
+            .map(|val| val == "1" || val.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    };
+    check("GRIM_GPU_TEST") || check("GRIM_RUN_GPU_TESTS") || check("GRIM_RUN_GPU_TEST")
+}
+
+/// RAII guard that switches the calling thread to `ordinal` and restores the
+/// previous current device on drop. Probes that call `hipSetDevice` on
+/// multi-GPU boxes must use this: leaving the thread on a foreign device makes
+/// subsequent `hipModuleLoad` calls bind the module to the wrong context,
+/// which surfaces as `hipErrorNoBinaryForGPU` (209) at kernel-launch time.
+pub struct DeviceGuard {
+    prev: i32,
+}
+
+impl DeviceGuard {
+    pub fn set(ordinal: i32) -> Self {
+        let mut prev: i32 = 0;
+        unsafe {
+            let _ = crate::device::handles::hipGetDevice(&mut prev);
+            let _ = crate::device::handles::hipSetDevice(ordinal);
+        }
+        Self { prev }
+    }
+}
+
+impl Drop for DeviceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = crate::device::handles::hipSetDevice(self.prev);
+        }
+    }
+}
+
 /// Query the device's real gfx target so JIT-compiled kernels always [see: `GRIM_GPU_TARGET`, `temp_env`, `hipDeviceProp_t`, `gcnArchName`]
 pub fn detect_gpu_arch(device: i32) -> String {
     let mut buf = vec![0u8; 8192];

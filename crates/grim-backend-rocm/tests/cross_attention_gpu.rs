@@ -1,13 +1,10 @@
-//! GPU parity test for the Whisper cross-attention kernel (`grim_cross_attention`).
-//!
-//! Gated by `GRIM_RUN_GPU_TESTS`. Runs the same full cross-attention math
-//! (softmax(Q @ K^T / sqrt(head_dim)) @ V, non-causal) on the CPU reference
-//! and on the ROCm device, then compares.
+//! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test cross_attention_gpu
+//! RESULT: FAILED — hipModuleLoad failed: 209. The Whisper cross-attention JIT kernel is
+//!   compiled but the .hipfb binary is not registered/loaded for this test on this dual-GPU
+//!   RDNA4 box. Host-side infrastructure works; the kernel is not tied to this test at runtime.
 
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::{BackendDevice, DType, Shape};
-
-const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
 
 /// Deterministic LCG for reproducible test inputs.
 fn lcg_f32(seed: u32) -> u32 {
@@ -107,9 +104,9 @@ fn approx_close(a: &[f32], b: &[f32], rel_tol: f32) -> bool {
 
 #[test]
 fn test_cross_attention_gpu_parity() {
-    let env = std::env::var(GPU_TEST_ENV).is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
-        println!("[INFO] Skipped test_cross_attention_gpu_parity (requires GRIM_RUN_GPU_TESTS)");
+        println!("[INFO] Skipped test_cross_attention_gpu_parity (requires GRIM_GPU_TEST=1)");
         return;
     }
 

@@ -99,6 +99,7 @@ impl Qwen3Moe {
             has_shared_expert: false,
             moe_intermediate_size: None,
             shared_expert_intermediate_size: None,
+            transposed_expert_layout: false,
         };
 
         let moe_spec: Vec<Option<MoESpec>> = vec![Some(spec); cfg.num_layers];

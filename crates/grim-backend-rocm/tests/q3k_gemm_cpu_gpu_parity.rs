@@ -20,10 +20,8 @@ use std::panic;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
 
-const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
-
 fn gpu_device() -> Option<RocmDevice> {
-    if std::env::var(GPU_TEST_ENV).is_err() {
+    if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
     match panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new")) {

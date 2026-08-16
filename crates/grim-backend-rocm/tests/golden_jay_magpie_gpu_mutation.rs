@@ -10,10 +10,8 @@ use std::panic;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
 
-const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
-
 fn gpu_device() -> Option<RocmDevice> {
-    if std::env::var(GPU_TEST_ENV).is_err() {
+    if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
     match panic::catch_unwind(|| {
@@ -63,12 +61,30 @@ fn test_jay_mxfp4_gpu_gemm_golden_mutation_resistant() -> TestResult {
             arith: ArithType::F32,
             storage: Storage::FloatPack(FloatPackScheme::MxFp4),
         };
-        let b_dev = BackendDevice::from_cpu_bytes(&dev, &b_codes, &b_shape, mxfp4_dtype)?;
+
+        // The MXFP4 kernel expects `B_codes` packed 2-per-byte (low nibble =
+        // even element, high nibble = odd element) in flat `col*K+k` order.
+        let mut b_packed = vec![0u8; (n * k) / 2];
+        for j in 0..(n * k) {
+            let code = b_codes[j] & 0x0F;
+            if j % 2 == 0 {
+                b_packed[j / 2] |= code;
+            } else {
+                b_packed[j / 2] |= code << 4;
+            }
+        }
+        let b_dev = BackendDevice::from_cpu_bytes(&dev, &b_packed, &b_shape, mxfp4_dtype)?;
+
+        // One E8M0 exponent (shared_exp) per 32-element block, matching the
+        // kernel's `block_idx = (col*K+k)/32` layout. Passed via `_b_scales`
+        // so `quantized_matmul` uploads real exponents instead of a zero dummy.
+        let num_blocks = (n * k) / 32;
+        let b_exps: Vec<f32> = vec![shared_exp as f32; num_blocks];
 
         let (out, handle) = dev.quantized_matmul(
             a_dev.as_ref(),
             b_dev.as_ref(),
-            &[],
+            &b_exps,
             grim_tensor::QuantFormat::Fp4Block16,
             &out_shape,
         )?;

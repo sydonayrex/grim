@@ -638,17 +638,18 @@ impl Engine {
         if prompt_tokens == 0 {
             return Ok(());
         }
-        // Build the input_ids tensor: use real token IDs if provided,
+        // Build the full input_ids tensor: use real token IDs if provided,
         // otherwise fall back to synthetic position indices (0..prompt_tokens)
         // for backward compatibility.
-        let input_ids: Vec<u32> = self
+        let full_input: Vec<u32> = self
             .request_input_ids
             .get(&id)
             .cloned()
             .filter(|v| !v.is_empty() && v.len() == prompt_tokens)
             .unwrap_or_else(|| (0..prompt_tokens as u32).collect());
+
         let ids = grim_backend_cpu::cpu_tensor(
-            input_ids.iter().map(|&t| t as f32).collect::<Vec<f32>>(),
+            full_input.iter().map(|&t| t as f32).collect::<Vec<f32>>(),
             grim_tensor::Shape::new(vec![prompt_tokens]),
         );
         let positions = grim_backend_cpu::cpu_tensor(
@@ -839,35 +840,15 @@ impl Engine {
                 .map(|m| m.device.clone())
                 .unwrap_or(grim_tensor::Device::Cpu),
         };
-        let kv = grim_memory::PagedKvCache::new(
+        let mut kv = grim_memory::PagedKvCache::new(
             self.block_pool.clone(),
             self.config.num_kv_heads,
             self.config.head_dim,
+            BLOCK_SIZE,
         );
+        let backend = grim_nn::pick_device_for_storage_device(&device);
+        kv.set_device(device.clone(), backend);
         let mut session = Box::new(grim_core::session::Inner::with_kv(device, Box::new(kv)));
-
-        // Prefix Caching (§5.1): Check if prompt tokens contain shared system prompt blocks
-        if let Some(ref input_tokens) = request.input_ids {
-            let block_size = grim_memory::BLOCK_SIZE;
-            let mut pool = self.block_pool.lock().unwrap();
-            let mut shared_blocks = 0;
-            for chunk in input_tokens.chunks_exact(block_size) {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                use std::hash::Hash;
-                chunk.hash(&mut hasher);
-                let hash = std::hash::Hasher::finish(&hasher);
-                if pool.find_or_share_prefix(hash).is_ok() {
-                    shared_blocks += 1;
-                } else {
-                    break;
-                }
-            }
-            if shared_blocks > 0 {
-                let shared_tokens = shared_blocks * block_size;
-                use grim_core::session::SessionT;
-                session.advance_pos(shared_tokens);
-            }
-        }
 
         self.sessions.insert(request.id, session);
         self.request_model_ids
@@ -1675,35 +1656,86 @@ mod tests {
         );
     }
 
+    /// Phase-1 correctness proof: a Llama driven through the paged-KV path
+    /// (session carries a `PagedKvCache`) must produce byte-identical logits
+    /// to the same model driven through the classic per-layer
+    /// `LlamaLayerCache` path (no KV session). This is the invariant that
+    /// lets us re-enable prefix-cache/tiering wiring on top of the paged
+    /// path without changing serving numerics.
     #[test]
-    fn test_prefix_caching_shares_blocks_and_advances_pos() {
-        let mut engine = Engine::new(EngineConfig::default());
-        engine.register_model("small", small_llama());
+    fn paged_llama_forward_matches_non_paged_llama_forward() {
+        use grim_core::CausalLm;
+        use grim_core::session::Inner;
+        use grim_models_transformer::{Llama, LlamaConfig};
+        use grim_tensor::Device;
 
-        let system_prompt = vec![101u32; 16];
+        let cfg = LlamaConfig {
+            vocab_size: 64,
+            hidden_size: 32,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 16,
+            num_layers: 2,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            max_seq_len: 64,
+            partial_rotary_factor: 1.0,
+            yarn: None,
+        };
+        let model = Llama::random(Device::Cpu, cfg);
 
-        engine.enqueue_request(Request {
-            id: 100,
-            prompt_tokens: 16,
-            input_ids: Some(system_prompt.clone()),
-            ..Default::default()
-        });
+        // Classic path: session with no KV cache → model_state caches.
+        let mut classic = Inner::new(model.device.clone());
+        // Paged path: session backed by a shared block pool.
+        let pool = std::sync::Arc::new(std::sync::Mutex::new(
+            grim_memory::KvBlockPool::new(1024, 1, 16),
+        ));
+        let kv = grim_memory::PagedKvCache::new(pool, 1, 16, 16);
+        let mut paged = Inner::with_kv(model.device.clone(), Box::new(kv));
 
-        engine.enqueue_request(Request {
-            id: 200,
-            prompt_tokens: 16,
-            input_ids: Some(system_prompt.clone()),
-            ..Default::default()
-        });
-
-        let s2_pos = engine
-            .sessions
-            .get(&200)
-            .map(|s| s.current_pos())
-            .unwrap_or(0);
+        let tok = grim_backend_cpu::cpu_tensor(
+            vec![0.0f32, 1.0f32, 2.0f32, 3.0f32],
+            grim_tensor::Shape::new(vec![4]),
+        );
+        let pos = grim_backend_cpu::cpu_tensor(
+            vec![0.0f32, 1.0f32, 2.0f32, 3.0f32],
+            grim_tensor::Shape::new(vec![4]),
+        );
+        let classic_logits =
+            CausalLm::forward(&model, &mut classic, &tok, &pos, &[]).unwrap();
+        let paged_logits = CausalLm::forward(&model, &mut paged, &tok, &pos, &[]).unwrap();
+        let cl = classic_logits.to_vec_f32().unwrap();
+        let pl = paged_logits.to_vec_f32().unwrap();
+        let diffs: Vec<f32> = cl.iter().zip(pl.iter()).map(|(a, b)| (a - b).abs()).collect();
+        let max_diff = diffs.iter().copied().fold(0.0f32, f32::max);
+        let argmax = diffs
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+        eprintln!(
+            "[eq] prefill max_diff={max_diff} at idx={argmax} classic={:?} paged={:?}",
+            cl[argmax], pl[argmax]
+        );
         assert_eq!(
-            s2_pos, 16,
-            "identical prefix prompt must hit prefix cache and advance pos"
+            classic_logits.to_vec_f32().unwrap(),
+            paged_logits.to_vec_f32().unwrap(),
+            "prefill logits must match between paged and non-paged paths"
+        );
+
+        // One decode step at position 4 on the SAME sessions.
+        let tok1 = grim_backend_cpu::cpu_tensor(vec![4.0f32], grim_tensor::Shape::new(vec![1]));
+        let pos4 = grim_backend_cpu::cpu_tensor(vec![4.0f32], grim_tensor::Shape::new(vec![1]));
+        let classic_decode =
+            CausalLm::forward(&model, &mut classic, &tok1, &pos4, &[]).unwrap();
+        let paged_decode =
+            CausalLm::forward(&model, &mut paged, &tok1, &pos4, &[]).unwrap();
+        assert_eq!(
+            classic_decode.to_vec_f32().unwrap(),
+            paged_decode.to_vec_f32().unwrap(),
+            "decode logits must match between paged and non-paged paths"
         );
     }
 }

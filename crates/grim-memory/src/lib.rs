@@ -7,12 +7,17 @@ use grim_core::error::{Error, Result};
 use grim_core::kv_cache::KvCache;
 use grim_kvquant::{CompressedKvBlock, KvCompressor};
 use grim_kvtransport::{BlockId as TransportBlockId, CacheTier, SharedSpillManager};
-use grim_tensor::Tensor;
+use grim_tensor::{DType, Device, Shape, Tensor};
 
 /// MoE resident-set HBM budget (`rocm_kernel_plan.md` WI-C).
 pub mod moe_budget;
 
 pub use moe_budget::{MoeResidentBudget, ResidentTier};
+
+/// Block-granular radix tree for prefix (RadixAttention-style) KV sharing.
+pub mod radix;
+
+pub use radix::RadixTree;
 
 pub const BLOCK_SIZE: usize = 16;
 
@@ -52,6 +57,9 @@ struct KvBlock {
     /// fragile non-zero-content sniff in the decode fetch loop: a
     /// genuinely all-zero KV block is valid data, not "not yet arrived."
     received: bool,
+    /// Current tier residency (Phase 2.3): explicit so promotion can be
+    /// decided without re-querying the spill manager.
+    location: CacheTier,
 }
 
 /// Outcome of a single demote-before-drop operation. Recorded so callers
@@ -79,10 +87,11 @@ pub struct KvBlockPool {
     blocks: Vec<KvBlock>,
     free_list: VecDeque<BlockId>,
     /// Block id → refcount; 0 means released and eligible for tiering.
-    /// Block id → refcount; 0 means released and eligible for tiering.
     ref_counts: HashMap<BlockId, u32>,
-    /// Prefix caching: hash of prefix tokens → physical block ID (§5.1)
-    prefix_cache: HashMap<u64, BlockId>,
+    /// Prefix caching: block-granular radix tree (§5.1). Keys by block
+    /// content, so partial/branching prefix sharing across requests works
+    /// instead of the old exact-whole-prefix hash map.
+    prefix_tree: RadixTree,
     /// SsmStatePool containing fixed-size state tensors for Mamba/SSM architectures (§5.1)
     ssm_states: HashMap<u32, Vec<f32>>,
     /// Layout configuration: block-major switch tied to the rocm-aiter feature flag
@@ -111,6 +120,7 @@ impl KvBlockPool {
                 value_data: vec![0.0; block_elem],
                 num_tokens: 0,
                 received: false,
+                location: CacheTier::Gpu,
             });
             free_list.push_back(i);
         }
@@ -119,7 +129,7 @@ impl KvBlockPool {
             blocks,
             free_list,
             ref_counts: HashMap::new(),
-            prefix_cache: HashMap::new(),
+            prefix_tree: RadixTree::new(BLOCK_SIZE),
             ssm_states: HashMap::new(),
             block_major_layout,
             recently_zero: VecDeque::new(),
@@ -153,6 +163,11 @@ impl KvBlockPool {
     }
 
     pub fn alloc(&mut self) -> Result<BlockId> {
+        if self.free_list.is_empty() {
+            // Pressure: reclaim a cold, unreferenced trie leaf before
+            // declaring exhaustion.
+            self.evict_cold();
+        }
         let id = self
             .free_list
             .pop_front()
@@ -161,24 +176,112 @@ impl KvBlockPool {
         Ok(id)
     }
 
-    /// Prefix caching block lookup/share (§5.1)
-    pub fn find_or_share_prefix(&mut self, prefix_hash: u64) -> Result<BlockId> {
-        if let Some(&bid) = self.prefix_cache.get(&prefix_hash) {
-            if let Some(cnt) = self.ref_counts.get(&bid) {
-                if *cnt > 0 {
-                    *self.ref_counts.entry(bid).or_insert(0) += 1;
-                    println!(
-                        "[PrefixCache] Shared prefix block {} (hash {})",
-                        bid, prefix_hash
-                    );
-                    return Ok(bid);
+    /// Prefix caching (§5.1): look up how much of `tokens` can be reused
+    /// from previously computed blocks. Returns the reused physical block
+    /// ids and the number of leading tokens they cover. The caller runs
+    /// prefill only for `tokens[matched..]` and then calls
+    /// [`KvBlockPool::insert_prefix`].
+    pub fn match_prefix(&self, tokens: &[u32]) -> (Vec<BlockId>, usize) {
+        self.prefix_tree.match_prefix(tokens)
+    }
+
+    /// Register newly computed `blocks` for `tokens` after a prefill
+    /// completes. Shared prefix nodes are reused; diverging blocks become
+    /// new tree nodes.
+    pub fn insert_prefix(&mut self, tokens: &[u32], blocks: &[BlockId]) {
+        self.prefix_tree.insert(tokens, blocks);
+        self.prefix_tree.touch(tokens);
+    }
+
+    /// Drop one sequence's reference to `blocks`, pruning unshared tree
+    /// nodes (trie-leaf LRU walk-up). Call this when a sequence is fully
+    /// released so eviction does not reclaim a still-referenced prefix.
+    pub fn remove_prefix(&mut self, blocks: &[BlockId]) {
+        self.prefix_tree.remove(blocks);
+    }
+
+    /// Current tier residency of a physical block (Phase 2.3).
+    pub fn block_location(&self, id: BlockId) -> CacheTier {
+        self.blocks[id].location
+    }
+
+    /// Look up reusable prefix blocks for `tokens`, promoting any matched
+    /// block that was demoted to host/NVMe back to GPU before returning it
+    /// (Phase 2.2: the "cache hit but demoted" path). Returns the matched
+    /// block ids, the number of matched tokens, and whether any promotion
+    /// occurred.
+    pub fn match_prefix_promoting(
+        &mut self,
+        tokens: &[u32],
+    ) -> (Vec<BlockId>, usize, bool) {
+        let (matched, n) = self.prefix_tree.match_prefix(tokens);
+        let mut promoted = false;
+        for &bid in &matched {
+            if self.blocks[bid].location != CacheTier::Gpu {
+                if self.promote_to_gpu(bid).ok().flatten().is_some() {
+                    promoted = true;
                 }
             }
-            self.prefix_cache.remove(&prefix_hash);
         }
-        let bid = self.alloc()?;
-        self.prefix_cache.insert(prefix_hash, bid);
-        Ok(bid)
+        (matched, n, promoted)
+    }
+
+    /// Demote a cached prefix block to the spill tier under memory pressure
+    /// WITHOUT reclaiming it: the radix-tree entry is kept so a future
+    /// request can still match it and promote it back, and the block is NOT
+    /// returned to the free list (so its cached KV is never overwritten by a
+    /// new alloc). The caller (`demote_cold_prefix`) only supplies blocks
+    /// the radix tree reports as cold (tree refcount 0), so an actively
+    /// referenced block is never demoted.
+    fn demote_prefix_block(&mut self, bid: BlockId) -> bool {
+        let Some(spill) = self.spill.as_ref() else {
+            return false;
+        };
+        let k = self.blocks[bid].key_data.clone();
+        let v = self.blocks[bid].value_data.clone();
+        if spill.demote_to_host(bid, k, v).is_err() {
+            return false;
+        }
+        if spill.demote_to_nvme(bid).is_err() {
+            return false;
+        }
+        self.blocks[bid].location = CacheTier::HostRam;
+        true
+    }
+
+    /// Pressure hook (Phase 2.1): demote the coldest unreferenced prefix
+    /// leaf to host/NVMe, keeping it cached. Returns the demoted block id,
+    /// or `None` if there is no cold prefix to demote. The engine calls this
+    /// when GPU block-pool utilization crosses a threshold.
+    pub fn demote_cold_prefix(&mut self) -> Option<BlockId> {
+        let bid = self.prefix_tree.coldest_leaf()?;
+        if self.demote_prefix_block(bid) {
+            Some(bid)
+        } else {
+            None
+        }
+    }
+
+    /// Convenience single-call prefix share (§5.1): match, allocate physical
+    /// blocks for any non-matching tail, insert, and return all block ids
+    /// plus the count of tokens that were reused. Used where the caller
+    /// does not split match/prefill/insert (e.g. eager one-shot paths).
+    pub fn find_or_share_prefix_tokens(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<(Vec<BlockId>, usize)> {
+        let (matched, matched_tokens) = self.prefix_tree.match_prefix(tokens);
+        let total_blocks = tokens.len().div_ceil(BLOCK_SIZE);
+        let mut all_blocks = matched.clone();
+        for _ in matched.len()..total_blocks {
+            let bid = self.alloc()?;
+            all_blocks.push(bid);
+        }
+        for &bid in &matched {
+            self.add_ref(bid);
+        }
+        self.insert_prefix(tokens, &all_blocks);
+        Ok((all_blocks, matched_tokens))
     }
 
     /// SSM State Pool management (§5.1): Retrieve a state vector by request ID.
@@ -218,7 +321,6 @@ impl KvBlockPool {
             }
             *cnt -= 1;
             if *cnt == 0 {
-                self.prefix_cache.retain(|_, v| *v != id);
                 self.ref_counts.remove(&id);
             }
         }
@@ -232,6 +334,9 @@ impl KvBlockPool {
             if let Err(e) = spill.demote_to_nvme(id) {
                 eprintln!("[BlockPool] demote_to_nvme failed for block {id}: {e}");
             }
+            // Mark the block as demoted so promotion can be decided later
+            // without re-querying the spill manager.
+            self.blocks[id].location = CacheTier::HostRam;
             self.recently_zero.push_back(id);
         } else {
             // No spill attached: zero the in-place contents directly.
@@ -239,20 +344,69 @@ impl KvBlockPool {
             self.blocks[id].received = false;
             self.blocks[id].key_data.fill(0.0);
             self.blocks[id].value_data.fill(0.0);
+            self.blocks[id].location = CacheTier::Gpu;
         }
         self.free_list.push_back(id);
         Ok(())
     }
 
-    /// Promote a previously demoted block back to GPU resident. Returns
-    /// the current contents if promotion succeeded. The block remains
-    /// owned by the spill tier until the caller `alloc`s / `write`s on
-    /// it (ref-counted allocation lifetime).
+    /// Promote a previously demoted block back to GPU resident. On success
+    /// the retrieved key/value data is written back into the block and its
+    /// `location` restored to [`CacheTier::Gpu`]. Returns the contents if
+    /// promotion succeeded (the block was demoted), or `None` if there was
+    /// nothing to promote (block already GPU-resident or no spill manager).
     pub fn promote_to_gpu(&mut self, id: BlockId) -> Result<Option<(Vec<f32>, Vec<f32>)>> {
-        match self.spill.as_ref() {
-            Some(spill) => Ok(spill.retrieve(id)?),
+        let Some(spill) = self.spill.as_ref() else {
+            return Ok(None);
+        };
+        match spill.retrieve(id)? {
+            Some((k, v)) => {
+                let elem = self.num_heads * self.head_dim;
+                let n = (k.len() / elem).min(BLOCK_SIZE);
+                self.blocks[id].key_data[..k.len()].copy_from_slice(&k);
+                self.blocks[id].value_data[..v.len()].copy_from_slice(&v);
+                self.blocks[id].num_tokens = n;
+                self.blocks[id].received = true;
+                self.blocks[id].location = CacheTier::Gpu;
+                Ok(Some((k, v)))
+            }
             None => Ok(None),
         }
+    }
+
+    /// Trie-leaf LRU eviction (Phase 1.6): reclaim the coldest childless
+    /// tree leaf whose physical block is not actively referenced, freeing
+    /// its contents (demote-to-host/NVMe if a spill manager is attached,
+    /// otherwise in-place zero) and returning it to the free list. Returns
+    /// `true` if a block was reclaimed.
+    fn evict_cold(&mut self) -> bool {
+        let Some(bid) = self.prefix_tree.evict_coldest_leaf() else {
+            return false;
+        };
+        // Never reclaim a block still attached to a live sequence.
+        if self.ref_counts.get(&bid).copied().unwrap_or(0) > 0 {
+            return false;
+        }
+        if let Some(spill) = self.spill.as_ref() {
+            let k = self.blocks[bid].key_data.clone();
+            let v = self.blocks[bid].value_data.clone();
+            if let Err(e) = spill.demote_to_host(bid, k, v) {
+                eprintln!("[BlockPool] evict demote_to_host failed for {bid}: {e}");
+            }
+            if let Err(e) = spill.demote_to_nvme(bid) {
+                eprintln!("[BlockPool] evict demote_to_nvme failed for {bid}: {e}");
+            }
+            self.blocks[bid].location = CacheTier::HostRam;
+            self.recently_zero.push_back(bid);
+        } else {
+            self.blocks[bid].num_tokens = 0;
+            self.blocks[bid].received = false;
+            self.blocks[bid].key_data.fill(0.0);
+            self.blocks[bid].value_data.fill(0.0);
+        }
+        self.ref_counts.remove(&bid);
+        self.free_list.push_back(bid);
+        true
     }
 
     /// Compress the latest snapshot of `id` via the attached
@@ -419,33 +573,113 @@ pub struct PagedKvCache {
     pool: Arc<Mutex<KvBlockPool>>,
     num_heads: usize,
     head_dim: usize,
+    /// Physical block capacity of the backing pool (page tensors are sized
+    /// `capacity * page_size * num_heads * head_dim` per layer).
+    capacity: usize,
+    /// Paged-attention page size (tokens per physical block).
+    page_size: usize,
     /// Number of committed tokens in the sequence.
     committed_tokens: usize,
     /// Number of "tentative" (speculative-draft) tokens at the end.
     tentative_len: usize,
+    /// Logical→physical block table as u32 physical ids (mirrors
+    /// `table.logical_to_physical`), handed to the paged-attention kernel.
+    block_table_u32: Vec<u32>,
+    /// Per-layer physical K page tensors, laid out flat as
+    /// `[capacity * page_size * num_kv_heads * head_dim]`.
+    k_pages: Vec<Vec<f32>>,
+    /// Per-layer physical V page tensors, same layout as `k_pages`.
+    v_pages: Vec<Vec<f32>>,
+    /// Per-layer token count so page offsets stay per-layer even though the
+    /// block-table / `committed_tokens` counter is shared across layers.
+    layer_committed_tokens: Vec<usize>,
+    /// Owning device for this session. When ROCm, paged_kv_handles copies
+    /// page slices to GPU once and returns RocmStorage tensors so the ROCm
+    /// qkv_attention_paged kernel (which demands as_rocm inputs) doesn't
+    /// panic on CPU-resident pages.
+    device: Option<Device>,
+    /// Backend device handle used for `from_cpu` when staging pages to GPU.
+    backend: Option<Arc<dyn grim_tensor::BackendDevice>>,
+    /// Per-layer full K/V GPU tensors (flat):
+    /// `[capacity * page_size * num_kv_heads * head_dim]`, cached once per layer
+    /// when first requested on a ROCm session.
+    gpu_paged_k: Vec<Option<Arc<dyn grim_tensor::BackendStorage>>>,
+    gpu_paged_v: Vec<Option<Arc<dyn grim_tensor::BackendStorage>>>,
 }
 
 impl PagedKvCache {
-    pub fn new(pool: Arc<Mutex<KvBlockPool>>, num_heads: usize, head_dim: usize) -> Self {
+    pub fn new(
+        pool: Arc<Mutex<KvBlockPool>>,
+        num_heads: usize,
+        head_dim: usize,
+        page_size_: usize,
+    ) -> Self {
+        let capacity = pool.lock().unwrap().capacity();
+        let page_size = if page_size_ == 0 { BLOCK_SIZE } else { page_size_ };
+        let np = capacity * page_size;
+        let elem_per_page = np * num_heads * head_dim;
         Self {
             table: BlockTable::new(),
             pool,
             num_heads,
             head_dim,
+            capacity,
+            page_size,
             committed_tokens: 0,
             tentative_len: 0,
+            block_table_u32: Vec::new(),
+            k_pages: Vec::new(),
+            v_pages: Vec::new(),
+            layer_committed_tokens: Vec::new(),
+            device: None,
+            backend: None,
+            gpu_paged_k: Vec::new(),
+            gpu_paged_v: Vec::new(),
         }
+    }
+
+    pub fn set_device(
+        &mut self,
+        device: Device,
+        backend: Arc<dyn grim_tensor::BackendDevice>,
+    ) {
+        self.device = Some(device);
+        self.backend = Some(backend);
+        let n = self.k_pages.len().max(self.v_pages.len());
+        self.gpu_paged_k.resize_with(n, || None);
+        self.gpu_paged_v.resize_with(n, || None);
+    }
+
+    pub fn copy_pages_to_gpu(
+        &self,
+        layer: usize,
+    ) -> Result<(
+        Arc<dyn grim_tensor::BackendStorage>,
+        Arc<dyn grim_tensor::BackendStorage>,
+    )> {
+        let dev = self
+            .backend
+            .as_ref()
+            .ok_or_else(|| grim_core::error::Error::KvCache("no backend device set".into()))?;
+        let stride = self.k_pages[layer].len() / (self.capacity * self.page_size);
+        let dims = vec![self.capacity * self.page_size, stride];
+        let k_storage =
+            dev.from_cpu(&self.k_pages[layer], &Shape::new(dims.clone()), DType::F32)?;
+        let v_storage = dev
+            .from_cpu(&self.v_pages[layer], &Shape::new(dims), DType::F32)?;
+        Ok((Arc::from(k_storage), Arc::from(v_storage)))
     }
 }
 
 impl KvCache for PagedKvCache {
-    fn append_slot(&mut self) -> Result<()> {
+        fn append_slot(&mut self) -> Result<()> {
         self.committed_tokens += 1;
         let req_blocks = self.committed_tokens.div_ceil(BLOCK_SIZE);
         if self.table.len() < req_blocks {
             let mut pool = self.pool.lock().unwrap();
             let id = pool.alloc()?;
             self.table.push(id);
+            self.block_table_u32.push(id as u32);
         }
         Ok(())
     }
@@ -462,6 +696,7 @@ impl KvCache for PagedKvCache {
             for _ in 0..needed {
                 let id = pool.alloc()?;
                 self.table.push(id);
+                self.block_table_u32.push(id as u32);
             }
         }
         self.tentative_len += n_tokens;
@@ -481,6 +716,7 @@ impl KvCache for PagedKvCache {
         while self.table.len() > keep_blocks {
             if let Some(pid) = self.table.logical_to_physical.pop() {
                 pool.free_with_tier(pid, false).ok();
+                self.block_table_u32.pop();
             } else {
                 break;
             }
@@ -500,6 +736,7 @@ impl KvCache for PagedKvCache {
         while self.table.len() > keep_blocks {
             if let Some(pid) = self.table.logical_to_physical.pop() {
                 pool.free_with_tier(pid, false).ok();
+                self.block_table_u32.pop();
             } else {
                 break;
             }
@@ -550,6 +787,124 @@ impl KvCache for PagedKvCache {
             pool.write_values(id, &v_flat);
         }
         Ok(())
+    }
+
+    fn has_paged_kv(&self) -> bool {
+        true
+    }
+
+    fn append_kv_layer(&mut self, layer: usize, k: &Tensor, v: &Tensor) -> Result<()> {
+        let k_flat = k.to_vec_f32()?;
+        let v_flat = v.to_vec_f32()?;
+        // Derive the per-token stride from the tensor's real shape rather than
+        // trusting the cache's configured head counts: the engine builds its
+        // `PagedKvCache` from `EngineConfig` defaults that may not match the
+        // registered model (e.g. small_llama uses kvh=1, hd=16 while the
+        // default config is kvh=4, hd=128). The paged kernel indexes the page
+        // tensor by flat `(block_id * page_size + offset) * kv_stride` offset,
+        // so only the stride matters — the declared tensor shape is cosmetic.
+        let k_dims = k.shape().dims();
+        // 3-D `[batch, seq, kvh*head_dim]` (post-RoPE K from the block, or
+        // prefill batch) vs 2-D `[seq, kvh*head_dim]` (single-token decode).
+        // The batch dim is always 1 here; `seq` is dim 1 for 3-D and dim 0
+        // for 2-D.
+        let (seq, stride) = if k_dims.len() == 3 {
+            (k_dims[1], k_dims[2])
+        } else if k_dims.len() == 2 {
+            (k_dims[0], k_dims[1])
+        } else {
+            (1, k_flat.len())
+        };
+        if stride == 0 || seq == 0 {
+            return Ok(());
+        }
+        // Grow the per-layer page buffers lazily up to `layer`, sized to the
+        // actual per-token stride so the flat layout matches the kernel.
+        let page_elems = self.capacity * self.page_size * stride;
+        if self.k_pages.len() <= layer {
+            for _ in self.k_pages.len()..=layer {
+                self.k_pages.push(vec![0.0f32; page_elems]);
+                self.v_pages.push(vec![0.0f32; page_elems]);
+                self.layer_committed_tokens.push(0);
+            }
+        }
+        for t in 0..seq {
+            // Only layer 0 drives block-table growth (all layers see the
+            // same token sequence, so `append_slot` must fire once per token,
+            // not once per layer per token).
+            if layer == 0 {
+                self.append_slot()?;
+            }
+            let pos = self.layer_committed_tokens[layer];
+            let physical = *self.table.logical_to_physical.last().unwrap();
+            let slot = physical * self.page_size + (pos % self.page_size);
+            let offset = slot * stride;
+            let tok_start = t * stride;
+            self.k_pages[layer][offset..offset + stride]
+                .copy_from_slice(&k_flat[tok_start..tok_start + stride]);
+            self.v_pages[layer][offset..offset + stride]
+                .copy_from_slice(&v_flat[tok_start..tok_start + stride]);
+            self.layer_committed_tokens[layer] += 1;
+        }
+        Ok(())
+    }
+
+    fn block_table(&self) -> Option<&[u32]> {
+        if self.block_table_u32.is_empty() {
+            None
+        } else {
+            Some(&self.block_table_u32)
+        }
+    }
+
+    fn paged_kv_handles(&self, layer: usize) -> Option<(Tensor, Tensor, usize)> {
+        if layer >= self.k_pages.len() {
+            return None;
+        }
+        let stride = self.k_pages[layer].len() / (self.capacity * self.page_size);
+        let dims = vec![self.capacity * self.page_size, stride];
+        if let (Some(dev), Some(dev_enum)) = (self.backend.as_ref(), self.device.as_ref()) {
+            let k_storage = dev
+                .from_cpu(&self.k_pages[layer], &Shape::new(dims.clone()), DType::F32)
+                .ok()?;
+            let v_storage = dev
+                .from_cpu(&self.v_pages[layer], &Shape::new(dims.clone()), DType::F32)
+                .ok()?;
+            Some((
+                Tensor::new(
+                    Arc::from(k_storage),
+                    Shape::new(dims.clone()),
+                    DType::F32,
+                    grim_tensor::QuantProvenance::default(),
+                    dev_enum.clone(),
+                ),
+                Tensor::new(
+                    Arc::from(v_storage),
+                    Shape::new(dims),
+                    DType::F32,
+                    grim_tensor::QuantProvenance::default(),
+                    dev_enum.clone(),
+                ),
+                self.page_size,
+            ))
+        } else {
+            let k = grim_backend_cpu::cpu_tensor(self.k_pages[layer].clone(), Shape::new(dims.clone()));
+            let v = grim_backend_cpu::cpu_tensor(self.v_pages[layer].clone(), Shape::new(dims));
+            Some((k, v, self.page_size))
+        }
+    }
+
+    fn seed_prefix(&mut self, blocks: &[usize]) {
+        let mut pool = self.pool.lock().unwrap();
+        for &b in blocks {
+            pool.add_ref(b);
+            self.table.push(b);
+        }
+        self.committed_tokens = self.table.len() * BLOCK_SIZE;
+    }
+
+    fn prefix_physical_ids(&self) -> Vec<usize> {
+        self.table.physical_ids().to_vec()
     }
 }
 
@@ -654,12 +1009,14 @@ mod tests {
     #[test]
     fn test_prefix_sharing_and_ssm_states() {
         let mut pool = KvBlockPool::new(4, 2, 4);
-        let hash = 42u64;
+        let tokens: Vec<u32> = (0..48).collect(); // 3 blocks of 16 tokens
 
-        let id1 = pool.find_or_share_prefix(hash).unwrap();
-        let id2 = pool.find_or_share_prefix(hash).unwrap();
-        assert_eq!(id1, id2); // Must share the same block ID
-        assert_eq!(*pool.ref_counts.get(&id1).unwrap(), 2); // Ref count must be incremented
+        let (ids1, reused1) = pool.find_or_share_prefix_tokens(&tokens).unwrap();
+        let (ids2, reused2) = pool.find_or_share_prefix_tokens(&tokens).unwrap();
+        assert_eq!(ids1, ids2); // Must share the same block IDs
+        assert_eq!(reused1, 0); // first call computes everything
+        assert_eq!(reused2, 48); // second call reuses the whole prefix
+        assert_eq!(*pool.ref_counts.get(&ids1[0]).unwrap(), 2); // Ref count must be incremented
 
         pool.put_ssm_state(100, vec![1.0, 2.0, 3.0]);
         let state = pool.get_ssm_state(100).unwrap();
@@ -670,6 +1027,42 @@ mod tests {
         } else {
             assert!(!pool.is_block_major());
         }
+    }
+
+    #[test]
+    fn prefix_demoted_under_pressure_is_promoted_on_match() {
+        // Phase 2: a cached prefix demoted to host/NVMe under pressure must
+        // be promoted back (and its KV recovered, not recomputed) when a
+        // later request hits that prefix.
+        let dir = tempdir().unwrap();
+        let block_elems = BLOCK_SIZE * 2 * 4;
+        let spill =
+            Arc::new(SharedSpillManager::new(dir.path().to_path_buf(), block_elems).unwrap());
+        let mut pool = KvBlockPool::new(8, 2, 4);
+        pool.attach_spill(spill.clone());
+
+        let tokens: Vec<u32> = (0..16).collect(); // single-block prefix
+        let (blocks, _) = pool.find_or_share_prefix_tokens(&tokens).unwrap();
+        let k0 = vec![1.0f32; block_elems];
+        let v0 = vec![2.0f32; block_elems];
+        pool.write_keys(blocks[0], &k0, BLOCK_SIZE);
+        pool.write_values(blocks[0], &v0);
+
+        // Release the sequence's reference: the prefix becomes a cold, cached
+        // entry (refcount 0) but stays in the tree.
+        pool.remove_prefix(&blocks);
+
+        // Pressure: demote the coldest cached leaf to host/NVMe.
+        let demoted = pool.demote_cold_prefix().expect("a cold prefix to demote");
+        assert!(pool.block_location(demoted) != CacheTier::Gpu);
+
+        // A later request hits the demoted prefix → promote back, recover KV.
+        let (matched, n, promoted) = pool.match_prefix_promoting(&tokens);
+        assert!(promoted, "demoted prefix must be promoted on match");
+        assert_eq!(n, 16);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(pool.read_keys(matched[0]), &k0[..]);
+        assert_eq!(pool.read_values(matched[0]), &v0[..]);
     }
 
     #[test]
@@ -742,7 +1135,7 @@ mod tests {
     #[test]
     fn test_paged_kv_cache_current_k_v() {
         let pool = Arc::new(Mutex::new(KvBlockPool::new(4, 2, 4)));
-        let mut cache = PagedKvCache::new(pool.clone(), 2, 4);
+        let mut cache = PagedKvCache::new(pool.clone(), 2, 4, BLOCK_SIZE);
 
         // Append two blocks of slots (32 slots = 2 blocks of BLOCK_SIZE 16)
         for _ in 0..(2 * BLOCK_SIZE) {
@@ -786,7 +1179,7 @@ mod tests {
     #[test]
     fn test_speculative_kv_rollback_units() {
         let pool = Arc::new(Mutex::new(KvBlockPool::new(10, 2, 4)));
-        let mut cache = PagedKvCache::new(pool.clone(), 2, 4);
+        let mut cache = PagedKvCache::new(pool.clone(), 2, 4, BLOCK_SIZE);
 
         // 1. Append 16 committed slots (1 full block of 16 tokens)
         for _ in 0..16 {

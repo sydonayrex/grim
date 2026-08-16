@@ -23,23 +23,25 @@
 //! a per-layer MoE spec (softmax router, 64 experts, 8 per token, no shared
 //! expert).
 //!
-//! Remaining gaps (tracked, not silently fallen back):
-//! * Yarn RoPE parameters (`factor`, `beta_fast`, `beta_slow`,
-//!   `attention_factor`) are not yet differentiated from default yarn — the
-//!   loader passes `rope_theta = 500000.0` and the standard yarn config.
-//!   Full Yarn fidelity (scaling factors) is a follow-up once the Yarn
-//!   config struct is extended.
-//! * Sliding-window attention is noted in config but the Llama loader
-//!   currently treats all layers uniformly; windowed layers run the same
-//!   attention path.
+//! RoPE / attention fidelity:
+//! * Mellum2 uses **YaRN** RoPE on its full-attention layers. The loader
+//!   parses `rope_parameters.full_attention` (factor, beta_fast, beta_slow,
+//!   original_max_position_embeddings, attention_factor) and threads it into
+//!   every full-attention layer's `RopeConfig` so the GPU `rope_launch_yarn`
+//!   path applies the frequency ramp + magnitude correction.
+//! * Mellum2 mixes full-attention and sliding-window layers: the last
+//!   `max_window_layers` layers run sliding-window attention with plain RoPE,
+//!   the rest run full attention with YaRN. `max_window_layers = 0` ⇒ all
+//!   layers are full-attention-with-YaRN (the common Mellum2 config).
 
 use grim_core::error::Result;
 use grim_core::model::{AdapterHandle, CausalLm, ModalityHint, Model, ModelConfig};
 use grim_core::session::SessionT;
 use grim_nn::TensorParallelConfig;
 use grim_nn::moe::RouterKind;
-use grim_tensor::{ArithType, Device, Tensor};
+use grim_tensor::{ArithType, Device, Tensor, YaRNParams};
 
+use crate::block::{AttentionType, LayerAttentionSpec};
 use crate::model::{Llama, LlamaConfig};
 use crate::moe_block::MoESpec;
 
@@ -71,6 +73,12 @@ pub struct MellumConfig {
     pub rope_theta: f32,
     pub max_seq_len: usize,
     pub sliding_window: usize,
+    /// Number of trailing layers that use sliding-window attention with plain
+    /// RoPE; the remaining (earlier) layers use full attention with YaRN.
+    /// `0` ⇒ all layers are full-attention-with-YaRN.
+    pub max_window_layers: usize,
+    /// YaRN RoPE parameters parsed from `rope_parameters.full_attention`.
+    pub yarn: Option<YaRNParams>,
 }
 
 impl ModelConfig for MellumConfig {
@@ -109,6 +117,63 @@ impl MellumConfig {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
 
+        let rope_theta = {
+            let direct = f("rope_theta");
+            if direct > 0.0 {
+                direct
+            } else if let Some(rp) = value.get("rope_parameters").or_else(|| value.get("rope_scaling")) {
+                if let Some(th) = rp.get("rope_theta").and_then(|v| v.as_f64()) {
+                    th as f32
+                } else if let Some(fa) = rp.get("full_attention") {
+                    fa.get("rope_theta").and_then(|v| v.as_f64()).unwrap_or(500000.0) as f32
+                } else {
+                    10000.0
+                }
+            } else {
+                10000.0
+            }
+        };
+
+        // YaRN RoPE parameters live under `rope_parameters.full_attention`
+        // (Mellum2's actual layout). Fall back to a flat `rope_scaling` block
+        // for other variants. Missing fields default to the documented
+        // Mellum2 YaRN constants so a slightly different checkpoint still works.
+        let yarn = value
+            .get("rope_parameters")
+            .and_then(|rp| rp.get("full_attention"))
+            .or_else(|| value.get("rope_scaling"))
+            .and_then(|rs| {
+                let factor = rs.get("factor").and_then(|v| v.as_f64())? as f32;
+                let original_max_pos = rs
+                    .get("original_max_position_embeddings")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(8192) as usize;
+                let beta_fast = rs.get("beta_fast").and_then(|v| v.as_f64()).unwrap_or(32.0) as f32;
+                let beta_slow = rs.get("beta_slow").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                let attention_factor = rs
+                    .get("attention_factor")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0) as f32;
+                if factor > 0.0 {
+                    Some(YaRNParams {
+                        factor,
+                        original_max_pos,
+                        beta_fast,
+                        beta_slow,
+                        attention_factor,
+                    })
+                } else {
+                    None
+                }
+            });
+
+        // Trailing layers that use sliding-window attention; 0 ⇒ all layers
+        // are full-attention-with-YaRN.
+        let max_window_layers = value
+            .get("max_window_layers")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
         MellumConfig {
             vocab_size: u("vocab_size"),
             hidden_size: u("hidden_size"),
@@ -121,9 +186,11 @@ impl MellumConfig {
             num_experts: u("num_experts"),
             num_experts_per_tok: u("num_experts_per_tok"),
             rms_norm_eps: f("rms_norm_eps"),
-            rope_theta: f("rope_theta"),
+            rope_theta,
             max_seq_len: u("max_position_embeddings"),
             sliding_window,
+            max_window_layers,
+            yarn,
         }
     }
 }
@@ -149,20 +216,21 @@ impl Mellum {
         cfg: MellumConfig,
         tp: TensorParallelConfig,
     ) -> Result<Self> {
+        let num_layers = cfg.num_layers;
         let llama_cfg = LlamaConfig {
             vocab_size: cfg.vocab_size,
             hidden_size: cfg.hidden_size,
             num_heads: cfg.num_heads,
             num_kv_heads: cfg.num_kv_heads,
             head_dim: cfg.head_dim,
-            num_layers: cfg.num_layers,
+            num_layers,
             intermediate_size: cfg.intermediate_size,
             rms_norm_eps: cfg.rms_norm_eps,
             rope_theta: cfg.rope_theta,
             max_seq_len: cfg.max_seq_len,
 
             partial_rotary_factor: 1.0,
-            yarn: None,
+            yarn: cfg.yarn,
         };
 
         // Mellum2 uses a softmax router (no correction bias), no shared expert.
@@ -178,9 +246,33 @@ impl Mellum {
             transposed_expert_layout: false,
         };
 
-        let moe_spec: Vec<Option<MoESpec>> = vec![Some(spec); cfg.num_layers];
+        let moe_spec: Vec<Option<MoESpec>> = vec![Some(spec); num_layers];
 
-        let inner = Llama::load_tp_moe(device.clone(), ws, llama_cfg, &moe_spec, tp)?;
+        // Per-layer attention specs. Mellum2 mixes full-attention-with-YaRN
+        // layers (the earlier layers) and sliding-window layers (the trailing
+        // `max_window_layers` layers, which use plain RoPE). `max_window_layers
+        // = 0` ⇒ every layer is full-attention-with-YaRN.
+        let attn_specs: Vec<LayerAttentionSpec> = (0..num_layers)
+            .map(|i| {
+                let is_sliding = cfg.max_window_layers > 0 && i >= num_layers - cfg.max_window_layers;
+                let mut s = LayerAttentionSpec::full_with_rope(
+                    cfg.num_heads,
+                    cfg.num_kv_heads,
+                    cfg.head_dim,
+                    cfg.rope_theta,
+                    cfg.head_dim, // partial_rotary_factor = 1.0 ⇒ rotary_dim = head_dim
+                    if is_sliding { None } else { cfg.yarn },
+                );
+                if is_sliding {
+                    s.attn_type = AttentionType::Sliding;
+                    s.sliding_window = Some(cfg.sliding_window).filter(|&w| w > 0);
+                }
+                s
+            })
+            .collect();
+
+        let inner =
+            Llama::load_tp_moe_specs(device.clone(), ws, llama_cfg, &moe_spec, &attn_specs, tp)?;
         Ok(Self {
             cfg,
             device: inner.device.clone(),
@@ -306,6 +398,13 @@ mod tests {
         assert!((cfg.rope_theta - 500000.0).abs() < 1e-6);
         assert_eq!(cfg.max_seq_len, 131072);
         assert_eq!(cfg.sliding_window, 1024);
+        assert_eq!(cfg.max_window_layers, 0);
+        let yarn = cfg.yarn.expect("YaRN params should be parsed");
+        assert!((yarn.factor - 16.0).abs() < 1e-6);
+        assert_eq!(yarn.original_max_pos, 8192);
+        assert!((yarn.beta_fast - 32.0).abs() < 1e-6);
+        assert!((yarn.beta_slow - 1.0).abs() < 1e-6);
+        assert!((yarn.attention_factor - 1.2772588722239782).abs() < 1e-6);
     }
 
     #[test]

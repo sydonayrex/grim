@@ -525,7 +525,21 @@ impl Linear {
                     Err(e) => return Err(e),
                 }
             } else {
-                BackendDevice::matmul(&*dev, a_storage, b_storage, &out_shape)?
+                // Quantized storage without a QuantFormat mapping (e.g.
+                // FloatPack(MxFp4)): plain `matmul` would misread the packed
+                // bytes as F32. Route through `quantized_matmul`, whose ROCm
+                // dispatch matches on the storage dtype (the `format`
+                // parameter is unused there) and has per-format fused
+                // dequant-GEMM kernels; backends without the override
+                // materialize F32 weights at load time and never reach this
+                // branch.
+                dev.quantized_matmul(
+                    a_storage,
+                    b_storage,
+                    &[],
+                    grim_tensor::QuantFormat::Fp4,
+                    &out_shape,
+                )?
             }
         } else {
             BackendDevice::matmul(&*dev, a_storage, b_storage, &out_shape)?
@@ -739,26 +753,11 @@ impl Embedding {
     /// `[actual_vocab, dim]` row-major storage (rows = tokens), matching the
     /// layout expected by downstream gathering and tied linear heads.
     pub fn load(ws: &WeightSource<'_>, vocab: usize, dim: usize) -> Result<Self> {
-        // Probe `[vocab, dim]`. On exact shape match, use as-is.
+        // Probe `[vocab, dim]`. On exact shape match, use as-is on the target device.
         if let Ok(t) = ws.get([vocab, dim], "weight") {
-            let weight = if t.dtype().is_quantized() {
-                // Embedding table (e.g. 131072 × 1536 ≈ 800MB FP32) dequantizes to F32.
-                // Keep it on CPU to save GPU VRAM, gathering tokens host-side or uploading per token.
-                let f32s = t.to_vec_f32()?;
-                let shape = t.shape().clone();
-                let cpu_dev = grim_backend_cpu::CpuDevice::new();
-                let storage = cpu_dev.from_cpu(&f32s, &shape, DType::F32)?;
-                Tensor::new(
-                    Arc::from(storage),
-                    shape,
-                    DType::F32,
-                    t.provenance().clone(),
-                    Device::Cpu,
-                )
-            } else {
-                t
-            };
-            return Ok(Self { weight });
+            return Ok(Self {
+                weight: dequantize_for_gather(t)?,
+            });
         }
 
         // Fallback: load unconstrained tensor and normalize the layout.
@@ -775,7 +774,9 @@ impl Embedding {
 
         // Case 1: Row-major layout [actual_vocab, dim] where s1 == dim.
         if s1 == dim {
-            return Ok(Self { weight: raw_tensor });
+            return Ok(Self {
+                weight: dequantize_for_gather(raw_tensor)?,
+            });
         }
 
         // Case 2: Column-major layout [dim, actual_vocab] where s0 == dim.
@@ -866,6 +867,32 @@ impl Embedding {
 }
 
 pub use grim_tensor::{RopeConfig, YaRNParams};
+
+/// Materialize a gather-source tensor to F32 on its device. Embedding
+/// lookups read raw weight rows as f32 (e.g. the ROCm `grim_embedding`
+/// kernel), so quantized-resident packed storage must be dequantized before
+/// it can serve as an embedding table. Non-quantized tensors pass through.
+fn dequantize_for_gather(t: Tensor) -> Result<Tensor> {
+    if !t.dtype().is_quantized() {
+        return Ok(t);
+    }
+    let shape = t.shape().clone();
+    let device = t.device().clone();
+    let provenance = t.provenance().clone();
+    let f32s = t.to_vec_f32()?;
+    if device.is_cpu() {
+        return Ok(grim_backend_cpu::cpu_tensor(f32s, shape));
+    }
+    let dev = pick_device_for_storage_device(&device);
+    let storage = dev.from_cpu(&f32s, &shape, DType::F32)?;
+    Ok(Tensor::new(
+        std::sync::Arc::from(storage),
+        shape,
+        DType::F32,
+        provenance,
+        device,
+    ))
+}
 
 /// Rotary positional embedding — apply RoPE to `(B, S, D)` query/key.
 #[derive(Debug, Clone)]

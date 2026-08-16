@@ -810,10 +810,19 @@ fn pack_tensors(
                 );
             }
 
-            let elem_sqrt = (elem_count as f64).sqrt() as usize;
-            if elem_sqrt * elem_sqrt == elem_count && elem_sqrt >= 16 && elem_sqrt.is_power_of_two()
-            {
-                grim_quant::spinquant_rotate(&mut f32_values, elem_sqrt, 0.01, 5);
+            // SpinQuant Cayley rotation (WI-SPINQUANT-AttentionGate): only run on
+            // attention projections (e.g. Q/K/V/O) with a square, power-of-two dimension >= 16.
+            if grim_quant::is_attention_projection(name) {
+                let elem_sqrt = (elem_count as f64).sqrt() as usize;
+                if elem_sqrt * elem_sqrt == elem_count
+                    && elem_sqrt >= 16
+                    && elem_sqrt.is_power_of_two()
+                {
+                    grim_quant::spinquant_rotate(&mut f32_values, elem_sqrt, 0.01, 5);
+                }
+                // else: attention projection but not a rotatable square block —
+                // fall through without rotating; do not error (non-square attention
+                // projections are legitimate, e.g. GQA with differing Q/KV dims).
             }
 
             let payload_size =
@@ -1022,5 +1031,180 @@ mod tests {
         let (buf, encoding) = encode_outliers_with_encoding(&original);
         assert_eq!(encoding, crate::spec::OutlierIndexEncoding::DeltaVarint);
         assert!(!buf.is_empty());
+    }
+
+    /// WI-SPINQUANT-AttentionGate: SpinQuant Cayley rotation must run ONLY on
+    /// attention projections with square, power-of-two dimensions (>= 16).
+    /// Non-attention square tensors and non-square attention tensors must be skipped.
+    #[test]
+    fn test_spinquant_gated_on_attention_role_and_square_shape() {
+        use grim_tensor::dtype::{DType, QuantProvenance};
+        use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
+        use std::collections::HashMap;
+
+        struct MockProvider {
+            tensors: HashMap<String, (RawTensor, TensorMeta)>,
+        }
+
+        impl TensorProvider for MockProvider {
+            fn get(&self, name: &str) -> grim_tensor::error::Result<RawTensor> {
+                self.tensors
+                    .get(name)
+                    .map(|(raw, _)| raw.clone())
+                    .ok_or_else(|| grim_tensor::error::Error::Backend(format!("not found: {name}")))
+            }
+            fn meta(&self, name: &str) -> grim_tensor::error::Result<TensorMeta> {
+                self.tensors
+                    .get(name)
+                    .map(|(_, meta)| meta.clone())
+                    .ok_or_else(|| grim_tensor::error::Error::Backend(format!("not found: {name}")))
+            }
+        }
+
+        // Generate synthetic float values with varying values across rows/cols
+        let dim = 64;
+        let count_sq = dim * dim;
+        let initial_sq_floats: Vec<f32> = (0..count_sq)
+            .map(|i| ((i as f32 * 0.017).sin() * 2.0) + ((i % dim) as f32 * 0.1))
+            .collect();
+        let sq_bytes: Vec<u8> = initial_sq_floats
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        let count_rect = 64 * 32;
+        let initial_rect_floats: Vec<f32> = (0..count_rect)
+            .map(|i| (i as f32 * 0.013).cos() * 1.5)
+            .collect();
+        let rect_bytes: Vec<u8> = initial_rect_floats
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        let mut provider = MockProvider {
+            tensors: HashMap::new(),
+        };
+
+        // 1. Square attention tensor -> should be rotated
+        let name_attn_sq = "blk.0.attn_q.weight".to_string();
+        provider.tensors.insert(
+            name_attn_sq.clone(),
+            (
+                RawTensor {
+                    bytes: sq_bytes.clone(),
+                    shape: vec![dim, dim],
+                    dtype: DType::F32,
+                    provenance: QuantProvenance::GrimNative,
+                },
+                TensorMeta {
+                    dtype: DType::F32,
+                    provenance: QuantProvenance::GrimNative,
+                    shape: vec![dim, dim],
+                    fusion_mask: 0,
+                },
+            ),
+        );
+
+        // 2. Square non-attention tensor -> must NOT be rotated
+        let name_ffn_sq = "blk.0.ffn_gate.weight".to_string();
+        provider.tensors.insert(
+            name_ffn_sq.clone(),
+            (
+                RawTensor {
+                    bytes: sq_bytes.clone(),
+                    shape: vec![dim, dim],
+                    dtype: DType::F32,
+                    provenance: QuantProvenance::GrimNative,
+                },
+                TensorMeta {
+                    dtype: DType::F32,
+                    provenance: QuantProvenance::GrimNative,
+                    shape: vec![dim, dim],
+                    fusion_mask: 0,
+                },
+            ),
+        );
+
+        // 3. Non-square attention tensor -> must NOT be rotated (and must not panic)
+        let name_attn_rect = "blk.0.attn_k.weight".to_string();
+        provider.tensors.insert(
+            name_attn_rect.clone(),
+            (
+                RawTensor {
+                    bytes: rect_bytes.clone(),
+                    shape: vec![64, 32],
+                    dtype: DType::F32,
+                    provenance: QuantProvenance::GrimNative,
+                },
+                TensorMeta {
+                    dtype: DType::F32,
+                    provenance: QuantProvenance::GrimNative,
+                    shape: vec![64, 32],
+                    fusion_mask: 0,
+                },
+            ),
+        );
+
+        let names = vec![name_attn_sq, name_ffn_sq, name_attn_rect];
+        let mut progress = None;
+        let (packed_entries, _) = pack_tensors(
+            &provider,
+            &names,
+            8.0, // target_bpw
+            None,
+            crate::format::WaveSize::W64,
+            &mut progress,
+            None,
+        )
+        .expect("pack_tensors succeeds");
+
+        assert_eq!(packed_entries.len(), 3);
+        let (entry_attn_sq, payload_attn_sq) = &packed_entries[0];
+        let (entry_ffn_sq, payload_ffn_sq) = &packed_entries[1];
+        let (entry_attn_rect, _payload_attn_rect) = &packed_entries[2];
+
+        assert_eq!(entry_attn_sq.name, "blk.0.attn_q.weight");
+        assert_eq!(entry_ffn_sq.name, "blk.0.ffn_gate.weight");
+        assert_eq!(entry_attn_rect.name, "blk.0.attn_k.weight");
+
+        // The square attention tensor and square non-attention tensor started with
+        // identical input bytes. Because SpinQuant rotation was applied ONLY to the
+        // attention tensor, their packed payloads must differ.
+        assert_ne!(
+            payload_attn_sq, payload_ffn_sq,
+            "Attention square tensor and non-attention square tensor must have different payloads because only attention was SpinQuant-rotated"
+        );
+
+        // Verify that the attention tensor's payload matches expected SpinQuant-rotated floats
+        let mut expected_attn_floats = initial_sq_floats.clone();
+        let _ = grim_quant::apply_smoothquant_scale(&mut expected_attn_floats, dim, dim, None);
+        grim_quant::spinquant_rotate(&mut expected_attn_floats, dim, 0.01, 5);
+        let expected_attn_payload_size =
+            crate::format::normals_packed_size_for_wave(count_sq, 0, 8, crate::format::WaveSize::W64);
+        let mut expected_attn_payload = Vec::with_capacity(expected_attn_payload_size as usize);
+        crate::format::pack_row_bpw_for_wave(
+            &mut expected_attn_payload,
+            &expected_attn_floats,
+            8,
+            crate::format::WaveSize::W64,
+        );
+        expected_attn_payload.resize(expected_attn_payload_size as usize, 0u8);
+        assert_eq!(payload_attn_sq, &expected_attn_payload);
+
+        // Verify that the non-attention tensor's payload matches expected unrotated floats
+        let mut expected_ffn_floats = initial_sq_floats.clone();
+        let _ = grim_quant::apply_smoothquant_scale(&mut expected_ffn_floats, dim, dim, None);
+        // Note: NO spinquant_rotate
+        let expected_ffn_payload_size =
+            crate::format::normals_packed_size_for_wave(count_sq, 0, 8, crate::format::WaveSize::W64);
+        let mut expected_ffn_payload = Vec::with_capacity(expected_ffn_payload_size as usize);
+        crate::format::pack_row_bpw_for_wave(
+            &mut expected_ffn_payload,
+            &expected_ffn_floats,
+            8,
+            crate::format::WaveSize::W64,
+        );
+        expected_ffn_payload.resize(expected_ffn_payload_size as usize, 0u8);
+        assert_eq!(payload_ffn_sq, &expected_ffn_payload);
     }
 }

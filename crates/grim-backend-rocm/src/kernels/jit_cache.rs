@@ -122,6 +122,7 @@ impl HsacoKernelCache {
             return Ok(cache_path);
         }
 
+        let _ = fs::create_dir_all(&self.cache_dir);
         fs::write(&cache_path, compiled)?;
 
         let metadata = fs::metadata(&cache_path)?;

@@ -362,6 +362,7 @@ extern "C" __global__ void grim_fused_dequant_gemm_fp8_mfma(
         // the mfma instruction itself. This scalar fallback ensures
         // compilation on non-gfx1200 targets within the same source string.
         for (int i = 0; i < 32 && (k + i) < K; ++i) {
+            float a_val = A[row * K + (k + i)];
             float b_f32 = fp8_e4m3_to_float_hip(b_vals[i]);
             acc += a_val * b_f32;
         }

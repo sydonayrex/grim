@@ -4,12 +4,34 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Block quantizers (Q8_0, Q4_K, Q5_K, Q6_K) for Grim. Dequant-to-f32 on load, per-block scale/min following llama.cpp design."
+
+[features]
+default = ["rocm-mem"]
+rocm-mem = []
+rocm = ["rocm-mem"]
 
 [dependencies]
 grim-tensor = { workspace = true }
-thiserror = { workspace = true }
-[dev-dependencies]
+rayon = "1.12"
 
-grim-backend-cpu = { workspace = true }
+[lib]
+name = "grim_quant"
+path = "src/lib.rs"
+
+[[test]]
+name = "scan_q4k_dtypes"
+path = "tests/scan_q4k_dtypes.rs"
+
+[[test]]
+name = "mxfp4_gemm_tests"
+path = "tests/mxfp4_gemm_tests.rs"
+
+[[test]]
+name = "mxfp4_framed_matmul"
+path = "tests/mxfp4_framed_matmul.rs"
+
+[dev-dependencies]
 grim-format = { workspace = true }
+grim-nn = { workspace = true, features = ["rocm-mem"] }
+grim-backend-rocm = { workspace = true }
+grim-tensor = { workspace = true }

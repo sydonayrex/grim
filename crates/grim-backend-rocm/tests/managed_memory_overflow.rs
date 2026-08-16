@@ -12,8 +12,8 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 #[test]
 fn managed_storage_accepts_prefetch_request() {
     let _guard = TEST_LOCK.lock().expect("managed-memory test lock poisoned");
-    if std::env::var("GRIM_RUN_GPU_TESTS").is_err() {
-        eprintln!("[skipped: GRIM_RUN_GPU_TESTS not set]");
+    if !grim_backend_rocm::gpu_test_enabled() {
+        eprintln!("[skipped: GRIM_GPU_TEST not set]");
         return;
     }
 
@@ -40,8 +40,8 @@ fn managed_storage_accepts_prefetch_request() {
 #[test]
 fn global_policy_routes_ordinary_allocations_to_managed_memory() {
     let _guard = TEST_LOCK.lock().expect("managed-memory test lock poisoned");
-    if std::env::var("GRIM_RUN_GPU_TESTS").is_err() {
-        eprintln!("[skipped: GRIM_RUN_GPU_TESTS not set]");
+    if !grim_backend_rocm::gpu_test_enabled() {
+        eprintln!("[skipped: GRIM_GPU_TEST not set]");
         return;
     }
 

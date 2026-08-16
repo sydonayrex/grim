@@ -7,8 +7,12 @@ use grim_core::model::{AdapterHandle, CausalLm, ModalityHint};
 use grim_core::session::{Inner, SessionT};
 use grim_core::{Model, ModelConfig};
 use grim_nn::{Embedding, Linear, RmsNorm, add_tensors};
+use grim_tensor::dtype::{FloatPackScheme, QuantProvenance, Storage};
 use grim_tensor::{ArithType, DType, Device, Shape, Tensor};
 use std::sync::Arc;
+
+/// Max KV-cache rows pre-allocated on the ROCm device for the fused MXFP4 QKV path.
+const LFM2_FUSED_KV_CACHE_LEN: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct Lfm2Config {
@@ -32,6 +36,9 @@ pub struct Lfm2Config {
     pub n_swa: usize,
     pub swa_type: u32,
     pub n_embd_out: usize,
+    /// Opt-in: route attention QKV through the ROCm fused MXFP4 GEMM + QK-Norm + RoPE kernel.
+    /// Off by default so the F32 reference path remains the golden behavior.
+    pub mxfp4_qkv_attention: bool,
 }
 
 impl ModelConfig for Lfm2Config {
@@ -49,7 +56,13 @@ impl ModelConfig for Lfm2Config {
 #[derive(Clone)]
 pub enum Lfm2LayerCache {
     ShortConv(Vec<f32>),
-    Attention { k: Vec<f32>, v: Vec<f32> },
+    Attention {
+        k: Vec<f32>,
+        v: Vec<f32>,
+        /// Device-resident KV cache arena for the fused MXFP4 path (ROCm only).
+        k_dev: Option<Tensor>,
+        v_dev: Option<Tensor>,
+    },
 }
 
 pub struct Lfm2Block {
@@ -60,6 +73,13 @@ pub struct Lfm2Block {
     pub wo: Option<Linear>,
     pub attn_q_norm: Option<RmsNorm>,
     pub attn_k_norm: Option<RmsNorm>,
+    /// Fused MXFP4 QKV pack (ROCm only, built when `mxfp4_qkv_attention` is set).
+    /// `wqkv_codes`/`wqkv_exps` are the packed MXFP4 GEMM weights `[N_total, hidden]`,
+    /// `gamma_q`/`gamma_k` are the per-head Q/K norm weights `[head_dim]`.
+    pub wqkv_codes: Option<Tensor>,
+    pub wqkv_exps: Option<Tensor>,
+    pub gamma_q: Option<Tensor>,
+    pub gamma_k: Option<Tensor>,
     pub shortconv_in_proj: Option<Linear>,
     pub shortconv_conv: Option<Tensor>,
     pub shortconv_conv_vec: Option<Vec<f32>>,
@@ -79,6 +99,7 @@ pub struct Lfm2Block {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub rope_theta: f32,
+    pub eps: f32,
 }
 
 impl Lfm2Block {
@@ -128,6 +149,26 @@ impl Lfm2Block {
             (wq, wk, wv, wo, attn_q_norm, attn_k_norm)
         } else {
             (None, None, None, None, None, None)
+        };
+
+        let device = wq.as_ref().map(|w| w.weight.device().clone());
+        let (wqkv_codes, wqkv_exps, gamma_q, gamma_k) = if !is_recurrent
+            && cfg.mxfp4_qkv_attention
+            && device
+                .as_ref()
+                .map(|d| matches!(d, Device::Rocm(_)))
+                .unwrap_or(false)
+        {
+            build_fused_qkv_pack(
+                wq.as_ref().unwrap(),
+                wk.as_ref().unwrap(),
+                wv.as_ref().unwrap(),
+                attn_q_norm.as_ref().unwrap(),
+                attn_k_norm.as_ref().unwrap(),
+                cfg,
+            )?
+        } else {
+            (None, None, None, None)
         };
 
         let (shortconv_in_proj, shortconv_conv, shortconv_conv_vec, shortconv_out_proj) =
@@ -184,14 +225,26 @@ impl Lfm2Block {
                 [cfg.n_expert, cfg.n_ff_exp, cfg.hidden_size],
                 "ffn_gate_exps.weight",
             )?);
+            eprintln!(
+                "[grim] dequant done: layer {} ffn_gate_exps ({}x{}x{})",
+                layer_idx, cfg.n_expert, cfg.n_ff_exp, cfg.hidden_size
+            );
             let ffn_up_exps = Some(ws.get(
                 [cfg.n_expert, cfg.n_ff_exp, cfg.hidden_size],
                 "ffn_up_exps.weight",
             )?);
+            eprintln!(
+                "[grim] dequant done: layer {} ffn_up_exps ({}x{}x{})",
+                layer_idx, cfg.n_expert, cfg.n_ff_exp, cfg.hidden_size
+            );
             let ffn_down_exps = Some(ws.get(
                 [cfg.n_ff_exp, cfg.hidden_size, cfg.n_expert],
                 "ffn_down_exps.weight",
             )?);
+            eprintln!(
+                "[grim] dequant done: layer {} ffn_down_exps ({}x{}x{})",
+                layer_idx, cfg.n_ff_exp, cfg.hidden_size, cfg.n_expert
+            );
             let ffn_exp_probs_b_val = ws.get([cfg.n_expert], "ffn_exp_probs_b.bias")?;
             let ffn_gate = Linear::load(
                 &ws.pp("ffn_gate"),
@@ -260,6 +313,10 @@ impl Lfm2Block {
             wo,
             attn_q_norm,
             attn_k_norm,
+            wqkv_codes,
+            wqkv_exps,
+            gamma_q,
+            gamma_k,
             shortconv_in_proj,
             shortconv_conv,
             shortconv_conv_vec,
@@ -279,6 +336,7 @@ impl Lfm2Block {
             num_kv_heads: cfg.num_kv_heads,
             head_dim: cfg.head_dim,
             rope_theta: cfg.rope_theta,
+            eps: cfg.rms_norm_eps,
         })
     }
 
@@ -344,81 +402,114 @@ impl Lfm2Block {
         } else if self.is_moe {
             self.forward_moe_ffn(&norm_x)?
         } else {
-            let q = self.wq.as_ref().unwrap().forward(&norm_x)?;
-            let k = self.wk.as_ref().unwrap().forward(&norm_x)?;
-            let v = self.wv.as_ref().unwrap().forward(&norm_x)?;
-
-            let steps = q.shape().dims()[0];
-
-            let q_2d = device_tensor(
-                q.to_vec_f32()?,
-                Shape::new(vec![steps * self.num_heads, self.head_dim]),
-                norm_x.device(),
-            )?;
-            let q_norm = self.attn_q_norm.as_ref().unwrap().forward(&q_2d)?;
-
-            let k_2d = device_tensor(
-                k.to_vec_f32()?,
-                Shape::new(vec![steps * self.num_kv_heads, self.head_dim]),
-                norm_x.device(),
-            )?;
-            let k_norm = self.attn_k_norm.as_ref().unwrap().forward(&k_2d)?;
-
-            let dev = grim_nn::modules::pick_device_for_storage_device(norm_x.device());
-            let q_shape = Shape::new(vec![1, steps * self.num_heads, self.head_dim]);
-            let k_shape = Shape::new(vec![1, steps * self.num_kv_heads, self.head_dim]);
-
+            let steps = norm_x.shape().dims()[0];
+            let hidden = norm_x.shape().dims().last().copied().unwrap();
             let kv_stride = self.num_kv_heads * self.head_dim;
-            let cache_offset = match cache {
-                Some(Lfm2LayerCache::Attention { k, .. }) => k.len() / kv_stride,
-                _ => 0,
-            };
-            let q_positions: Vec<u32> = {
-                let mut v = Vec::with_capacity(steps * self.num_heads);
-                for t in 0..steps {
-                    for _ in 0..self.num_heads {
-                        v.push((cache_offset + t) as u32);
-                    }
-                }
-                v
-            };
-            let k_positions: Vec<u32> = {
-                let mut v = Vec::with_capacity(steps * self.num_kv_heads);
-                for t in 0..steps {
-                    for _ in 0..self.num_kv_heads {
-                        v.push((cache_offset + t) as u32);
-                    }
-                }
-                v
-            };
-            let rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, self.rope_theta);
-            let (q_rot_storage, _) =
-                dev.rope(q_norm.storage().as_ref(), &q_positions, &rope_cfg, &q_shape)?;
-            let (k_rot_storage, _) =
-                dev.rope(k_norm.storage().as_ref(), &k_positions, &rope_cfg, &k_shape)?;
 
-            let q_rot_vec = q_rot_storage.to_cpu_vec_f32()?;
-            let k_rot_vec = k_rot_storage.to_cpu_vec_f32()?;
-            let v_vec = v.to_vec_f32()?;
+            let use_fused = self.wqkv_codes.is_some()
+                && matches!(norm_x.device(), Device::Rocm(_));
+
+            // Produce `q_rot_vec` (rotated, QK-normalized Q) and extend the
+            // K/V history. Both the fused MXFP4 path and the F32 reference
+            // produce identical layouts so the attention loop is shared.
+            let q_rot_vec: Vec<f32> = if use_fused {
+                self.fused_qkv(&norm_x, cache, steps, hidden)?
+            } else {
+                let q = self.wq.as_ref().unwrap().forward(&norm_x)?;
+                let k = self.wk.as_ref().unwrap().forward(&norm_x)?;
+                let v = self.wv.as_ref().unwrap().forward(&norm_x)?;
+
+                let q_2d = device_tensor(
+                    q.to_vec_f32()?,
+                    Shape::new(vec![steps * self.num_heads, self.head_dim]),
+                    norm_x.device(),
+                )?;
+                let q_norm = self.attn_q_norm.as_ref().unwrap().forward(&q_2d)?;
+
+                let k_2d = device_tensor(
+                    k.to_vec_f32()?,
+                    Shape::new(vec![steps * self.num_kv_heads, self.head_dim]),
+                    norm_x.device(),
+                )?;
+                let k_norm = self.attn_k_norm.as_ref().unwrap().forward(&k_2d)?;
+
+                let dev = grim_nn::modules::pick_device_for_storage_device(norm_x.device());
+                let q_shape = Shape::new(vec![1, steps * self.num_heads, self.head_dim]);
+                let k_shape = Shape::new(vec![1, steps * self.num_kv_heads, self.head_dim]);
+
+                let cache_offset = match cache {
+                    Some(Lfm2LayerCache::Attention { k, .. }) => k.len() / kv_stride,
+                    _ => 0,
+                };
+                let q_positions: Vec<u32> = {
+                    let mut v = Vec::with_capacity(steps * self.num_heads);
+                    for t in 0..steps {
+                        for _ in 0..self.num_heads {
+                            v.push((cache_offset + t) as u32);
+                        }
+                    }
+                    v
+                };
+                let k_positions: Vec<u32> = {
+                    let mut v = Vec::with_capacity(steps * self.num_kv_heads);
+                    for t in 0..steps {
+                        for _ in 0..self.num_kv_heads {
+                            v.push((cache_offset + t) as u32);
+                        }
+                    }
+                    v
+                };
+                let rope_cfg = grim_tensor::RopeConfig::new(self.head_dim, self.rope_theta);
+                let (q_rot_storage, _) =
+                    dev.rope(q_norm.storage().as_ref(), &q_positions, &rope_cfg, &q_shape)?;
+                let (k_rot_storage, _) =
+                    dev.rope(k_norm.storage().as_ref(), &k_positions, &rope_cfg, &k_shape)?;
+
+                let q_rot_vec = q_rot_storage.to_cpu_vec_f32()?;
+                let k_rot_vec = k_rot_storage.to_cpu_vec_f32()?;
+                let v_vec = v.to_vec_f32()?;
+
+                if cache.is_none() {
+                    *cache = Some(Lfm2LayerCache::Attention {
+                        k: vec![],
+                        v: vec![],
+                        k_dev: None,
+                        v_dev: None,
+                    });
+                }
+
+                let (k_hist, v_hist) = match cache.as_mut().unwrap() {
+                    Lfm2LayerCache::Attention { k, v, .. } => (k, v),
+                    _ => {
+                        return Err(grim_core::error::Error::Session(
+                            "Mismatched Attention layer cache".into(),
+                        ));
+                    }
+                };
+
+                k_hist.extend_from_slice(&k_rot_vec);
+                v_hist.extend_from_slice(&v_vec);
+
+                q_rot_vec
+            };
 
             if cache.is_none() {
                 *cache = Some(Lfm2LayerCache::Attention {
                     k: vec![],
                     v: vec![],
+                    k_dev: None,
+                    v_dev: None,
                 });
             }
 
             let (k_hist, v_hist) = match cache.as_mut().unwrap() {
-                Lfm2LayerCache::Attention { k, v } => (k, v),
+                Lfm2LayerCache::Attention { k, v, .. } => (k, v),
                 _ => {
                     return Err(grim_core::error::Error::Session(
                         "Mismatched Attention layer cache".into(),
                     ));
                 }
             };
-
-            k_hist.extend_from_slice(&k_rot_vec);
-            v_hist.extend_from_slice(&v_vec);
 
             let total_kv_tokens = k_hist.len() / kv_stride;
             let num_head_dims = self.num_heads * self.head_dim;
@@ -481,6 +572,130 @@ impl Lfm2Block {
         };
 
         add_tensors(&x_added, &ffn_out).map_err(grim_core::Error::Tensor)
+    }
+
+    /// Fused MXFP4 QKV path: a single ROCm kernel computes the QKV GEMM,
+    /// per-head QK-Norm (dual gamma), and plain RoPE, writing Q to `q_out`
+    /// and K/V rows into the device-resident cache at their sequence
+    /// positions. Returns the rotated Q vector (matching the F32 reference
+    /// layout) and extends the CPU K/V history so the shared attention loop
+    /// below can run unchanged.
+    fn fused_qkv(
+        &self,
+        norm_x: &Tensor,
+        cache: &mut Option<Lfm2LayerCache>,
+        steps: usize,
+        hidden: usize,
+    ) -> Result<Vec<f32>> {
+        let dev_arc = grim_nn::modules::pick_device_for_storage_device(norm_x.device());
+        let dev = dev_arc.as_ref();
+        let n_q = self.num_heads * self.head_dim;
+        let n_k = self.num_kv_heads * self.head_dim;
+        let n_v = self.num_kv_heads * self.head_dim;
+        let max_seq = LFM2_FUSED_KV_CACHE_LEN;
+
+        let cache_offset = match cache {
+            Some(Lfm2LayerCache::Attention { k, .. }) => k.len() / n_k,
+            _ => 0,
+        };
+        let positions: Vec<u32> = (0..steps).map(|t| (cache_offset + t) as u32).collect();
+
+        if cache.is_none() {
+            *cache = Some(Lfm2LayerCache::Attention {
+                k: vec![],
+                v: vec![],
+                k_dev: None,
+                v_dev: None,
+            });
+        }
+        let (k_dev, v_dev) = match cache.as_mut().unwrap() {
+            Lfm2LayerCache::Attention { k_dev, v_dev, .. } => (k_dev, v_dev),
+            _ => {
+                return Err(grim_core::error::Error::Session(
+                    "Mismatched Attention layer cache".into(),
+                ));
+            }
+        };
+        if k_dev.is_none() {
+            let k_shape = Shape::new(vec![max_seq, n_k]);
+            *k_dev = Some(Tensor::new(
+                Arc::from(dev.zeros(&k_shape, DType::F32)?),
+                k_shape,
+                DType::F32,
+                QuantProvenance::GrimNative.into(),
+                norm_x.device().clone(),
+            ));
+            let v_shape = Shape::new(vec![max_seq, n_v]);
+            *v_dev = Some(Tensor::new(
+                Arc::from(dev.zeros(&v_shape, DType::F32)?),
+                v_shape,
+                DType::F32,
+                QuantProvenance::GrimNative.into(),
+                norm_x.device().clone(),
+            ));
+        }
+
+        let q_shape = Shape::new(vec![steps, n_q]);
+        let q_out = Tensor::new(
+            Arc::from(dev.zeros(&q_shape, DType::F32)?),
+            q_shape,
+            DType::F32,
+            QuantProvenance::GrimNative.into(),
+            norm_x.device().clone(),
+        );
+
+        let pos_shape = Shape::new(vec![steps]);
+        let pos_storage = dev.from_cpu_bytes(
+            as_u8_slice(&positions),
+            &pos_shape,
+            DType::U32,
+        )?;
+
+        let handle = dev.fused_mxfp4_gemm_qk_norm_rope_kv(
+            norm_x.storage().as_ref(),
+            self.gamma_q.as_ref().unwrap().storage().as_ref(),
+            self.gamma_k.as_ref().unwrap().storage().as_ref(),
+            self.wqkv_codes.as_ref().unwrap().storage().as_ref(),
+            self.wqkv_exps.as_ref().unwrap().storage().as_ref(),
+            Some(q_out.storage().as_ref()),
+            Some(k_dev.as_ref().unwrap().storage().as_ref()),
+            Some(v_dev.as_ref().unwrap().storage().as_ref()),
+            None,
+            Some(&*pos_storage),
+            steps,
+            hidden,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.head_dim,
+            self.rope_theta,
+            None,
+            1.0,
+            self.eps,
+            max_seq,
+        )?;
+        handle.synchronize()?;
+
+        let q_rot_vec = q_out.to_vec_f32()?;
+        let k_cache_vec = k_dev.as_ref().unwrap().to_vec_f32()?;
+        let v_cache_vec = v_dev.as_ref().unwrap().to_vec_f32()?;
+
+        let (k_hist, v_hist) = match cache.as_mut().unwrap() {
+            Lfm2LayerCache::Attention { k, v, .. } => (k, v),
+            _ => {
+                return Err(grim_core::error::Error::Session(
+                    "Mismatched Attention layer cache".into(),
+                ));
+            }
+        };
+        for t in 0..steps {
+            let pos = cache_offset + t;
+            let koff = pos * n_k;
+            k_hist.extend_from_slice(&k_cache_vec[koff..koff + n_k]);
+            let voff = pos * n_v;
+            v_hist.extend_from_slice(&v_cache_vec[voff..voff + n_v]);
+        }
+        Ok(q_rot_vec)
     }
 
     /// Top-1 routed MoE feed-forward.
@@ -574,6 +789,94 @@ impl Lfm2Block {
 
         device_tensor(out, Shape::new(vec![steps, hidden]), x.device())
     }
+}
+
+/// Build the ROCm device-resident fused QKV pack: concatenate the Q/K/V
+/// projection weights into one `[N_total, hidden]` matrix, MXFP4-quantize it,
+/// and upload the packed codes/exps plus the per-head Q/K norm weights.
+/// Returns `(codes, exps, gamma_q, gamma_k)`, all as device tensors.
+fn build_fused_qkv_pack(
+    wq: &Linear,
+    wk: &Linear,
+    wv: &Linear,
+    attn_q_norm: &RmsNorm,
+    attn_k_norm: &RmsNorm,
+    cfg: &Lfm2Config,
+) -> Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
+    let n_q = cfg.num_heads * cfg.head_dim;
+    let n_k = cfg.num_kv_heads * cfg.head_dim;
+    let n_v = cfg.num_kv_heads * cfg.head_dim;
+    let n_total = n_q + n_k + n_v;
+    let hidden = cfg.hidden_size;
+
+    let wq_d = wq.weight.to_vec_f32()?;
+    let wk_d = wk.weight.to_vec_f32()?;
+    let wv_d = wv.weight.to_vec_f32()?;
+    let mut concat = Vec::with_capacity(n_total * hidden);
+    concat.extend_from_slice(&wq_d);
+    concat.extend_from_slice(&wk_d);
+    concat.extend_from_slice(&wv_d);
+
+    let (codes, exps) = grim_quant::quant_mxfp4_matrix(&concat, n_total, hidden);
+    let num_blocks = (n_total * hidden) / 32;
+
+    let device = wq.weight.device().clone();
+    let dev = grim_nn::modules::pick_device_for_storage_device(&device);
+
+    let codes_dtype = DType {
+        arith: ArithType::F32,
+        storage: Storage::FloatPack(FloatPackScheme::MxFp4),
+    };
+    let codes_shape = Shape::new(vec![n_total, hidden]);
+    let exps_shape = Shape::new(vec![num_blocks]);
+    let gamma_shape = Shape::new(vec![cfg.head_dim]);
+
+    let codes_storage = dev.from_cpu_bytes(&codes, &codes_shape, codes_dtype.clone())?;
+    let exps_storage = dev.from_cpu_bytes(
+        &exps,
+        &exps_shape,
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+    )?;
+    let gq_d = attn_q_norm.weight.to_vec_f32()?;
+    let gk_d = attn_k_norm.weight.to_vec_f32()?;
+    let gq_storage = dev.from_cpu(&gq_d, &gamma_shape, DType::F32)?;
+    let gk_storage = dev.from_cpu(&gk_d, &gamma_shape, DType::F32)?;
+
+    let codes_t = Tensor::new(
+        Arc::from(codes_storage),
+        codes_shape,
+        codes_dtype,
+        QuantProvenance::GrimNative.into(),
+        device.clone(),
+    );
+    let exps_t = Tensor::new(
+        Arc::from(exps_storage),
+        exps_shape,
+        DType {
+            arith: ArithType::U8,
+            storage: Storage::Native,
+        },
+        QuantProvenance::GrimNative.into(),
+        device.clone(),
+    );
+    let gq_t = Tensor::new(
+        Arc::from(gq_storage),
+        gamma_shape.clone(),
+        DType::F32,
+        QuantProvenance::GrimNative.into(),
+        device.clone(),
+    );
+    let gk_t = Tensor::new(
+        Arc::from(gk_storage),
+        gamma_shape.clone(),
+        DType::F32,
+        QuantProvenance::GrimNative.into(),
+        device.clone(),
+    );
+    Ok((Some(codes_t), Some(exps_t), Some(gq_t), Some(gk_t)))
 }
 
 pub struct Lfm2 {
@@ -728,6 +1031,11 @@ impl CausalLm for Lfm2 {
         session.advance_pos(seq_len);
         Ok(logits)
     }
+}
+
+/// Reinterpret a slice of `T` as raw bytes (for `from_cpu_bytes` uploads).
+fn as_u8_slice<T>(slice: &[T]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * std::mem::size_of::<T>()) }
 }
 
 fn device_tensor(data: Vec<f32>, shape: Shape, device: &Device) -> Result<Tensor> {

@@ -16,9 +16,12 @@
 //! - `rust-ml-llm-architecture` — backend isolation: cross-device logic
 //!   stays in the ROCm crate.
 //!
-//! Dual-GPU test results (syd-beasty, ROCm 7.2.53211):
+//! Dual-GPU test results (multi-GPU RDNA4 system, ROCm 7.2.53211):
 //!   Hardware: RX 9070 XT (gfx1201, device 0) + RX 9060 XT (gfx1200, device 1)
 //!   — all 8 tests PASS, including peer_status(0,1) symmetry and enable_peer_access(0,1)
+//!
+//! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test peer_access
+//! RESULT: 8/8 PASS. Verified on the dual-GPU RDNA4 box.
 
 use std::sync::Arc;
 
@@ -84,7 +87,7 @@ fn enumerate_devices_does_not_panic_on_gpu_less_box() -> TestResult {
 
 #[test]
 fn peer_status_is_symmetric_in_family_within_a_single_call() -> TestResult {
-    let env = std::env::var("GRIM_RUN_GPU_TESTS").is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(());
     }
@@ -119,7 +122,7 @@ fn peer_status_is_symmetric_in_family_within_a_single_call() -> TestResult {
 
 #[test]
 fn enable_peer_access_is_infallible_or_errors_loud() -> TestResult {
-    let env = std::env::var("GRIM_RUN_GPU_TESTS").is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(());
     }
@@ -135,7 +138,7 @@ fn enable_peer_access_is_infallible_or_errors_loud() -> TestResult {
 
 #[test]
 fn enable_peer_access_self_pair_is_no_op() -> TestResult {
-    let env = std::env::var("GRIM_RUN_GPU_TESTS").is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(());
     }

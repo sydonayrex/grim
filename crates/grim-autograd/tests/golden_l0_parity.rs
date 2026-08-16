@@ -134,7 +134,7 @@ fn test_l0_parity_cpu_overfit_loss_decreases() {
 
 #[test]
 fn test_l0_parity_rocm_device_gated() {
-    if std::env::var("GRIM_RUN_GPU_TESTS").is_err() {
+    if !grim_backend_rocm::gpu_test_enabled() {
         return;
     }
     let (cpu_init, cpu_final) = run_overfit_test_for_device(Device::Cpu);

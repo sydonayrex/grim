@@ -3,11 +3,10 @@
 use clap::{Parser, Subcommand};
 use grim_core::error::Result;
 
-pub mod accept;
+pub mod arch_plugin;
 pub mod bench;
 pub mod catalog;
 pub mod client;
-pub mod compat;
 pub mod cp;
 pub mod doctor;
 pub mod echo;
@@ -367,6 +366,16 @@ enum Commands {
         #[command(subcommand)]
         subcommand: PluginCommands,
     },
+    /// Generate and install an architecture compatibility plugin (.grimplugin) from a
+    /// HuggingFace model repo. Fetches config.json via the HF Hub API, validates the
+    /// required fields, and installs the plugin into `grim_plugins_dir()` where
+    /// `model_loader.rs` can discover it at model-load time.
+    ///
+    /// Example: `grim arch-plugin generate hf:Qwen/Qwen3.8-27B`
+    ArchPlugin {
+        #[command(subcommand)]
+        subcommand: ArchPluginCommands,
+    },
     /// Service management.
     Service {
         #[command(subcommand)]
@@ -402,19 +411,6 @@ enum Commands {
         /// Verbose output (show per-tensor details).
         #[arg(short, long)]
         verbose: bool,
-    },
-    /// Validate and install a model architecture plugin into system plugin directory.
-    Accept {
-        /// Path to the plugin file (e.g., ling-2.6.grimplugin).
-        plugin_path: String,
-    },
-    /// Generate a model architecture compatibility plugin (.grimplugin) from a HuggingFace config.json.
-    Compat {
-        /// Path to config.json file.
-        config_path: String,
-        /// Optional output path for the generated .grimplugin file.
-        #[arg(short, long)]
-        output: Option<String>,
     },
 }
 
@@ -491,6 +487,24 @@ enum PluginCommands {
         /// Path to plugins directory.
         #[arg(short, long, default_value = "plugins")]
         path: String,
+    },
+}
+
+/// Subcommands for `grim arch-plugin`.
+#[derive(Subcommand)]
+enum ArchPluginCommands {
+    /// Generate and install a .grimplugin from a HuggingFace model repo.
+    ///
+    /// `model_id` is an `hf:org/repo` reference (e.g. `hf:Qwen/Qwen3.8-27B`).
+    /// The command fetches config.json via the HF Hub API, validates required fields,
+    /// and installs the plugin into `grim_plugins_dir()`.
+    Generate {
+        /// HuggingFace model reference (hf:org/repo).
+        model_id: String,
+        /// Optional output path override. Defaults to `{model_type}.grimplugin`
+        /// in `grim_plugins_dir()`.
+        #[arg(short, long)]
+        output: Option<String>,
     },
 }
 
@@ -1114,6 +1128,11 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Commands::ArchPlugin { subcommand } => match subcommand {
+            ArchPluginCommands::Generate { model_id, output } => {
+                arch_plugin::cmd_arch_plugin_generate(&model_id, output).await?;
+            }
+        },
         Commands::Service { subcommand } => {
             // Build platform service manager with resolved service name (single source of truth).
             let build_manager = |name: String| -> Box<dyn service::ServiceManager> {
@@ -1565,21 +1584,6 @@ async fn main() -> Result<()> {
         Commands::Show { verbose } => {
             if let Err(e) = show::cmd_show(verbose).await {
                 eprintln!("Show failed: {e}");
-                std::process::exit(1);
-            }
-        }
-        Commands::Accept { plugin_path } => {
-            if let Err(e) = accept::cmd_accept(&plugin_path).await {
-                eprintln!("Accept failed: {e}");
-                std::process::exit(1);
-            }
-        }
-        Commands::Compat {
-            config_path,
-            output,
-        } => {
-            if let Err(e) = compat::cmd_compat(&config_path, output).await {
-                eprintln!("Compat generation failed: {e}");
                 std::process::exit(1);
             }
         }

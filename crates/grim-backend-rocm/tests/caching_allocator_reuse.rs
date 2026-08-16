@@ -28,7 +28,7 @@ use grim_backend_rocm::RocmDevice;
 use grim_tensor::{DType, Shape};
 
 fn gpu_tests_enabled() -> bool {
-    std::env::var("GRIM_RUN_GPU_TESTS").is_ok()
+    grim_backend_rocm::gpu_test_enabled()
 }
 
 /// One warmup + a large loop of `copy_from_host_async` uploads. The number
@@ -39,7 +39,7 @@ fn gpu_tests_enabled() -> bool {
 #[test]
 fn copy_from_host_async_does_not_grow_malloc_count_per_call() {
     if !gpu_tests_enabled() {
-        eprintln!("[skipped: GRIM_RUN_GPU_TESTS not set]");
+        eprintln!("[skipped: GRIM_GPU_TEST not set]");
         return;
     }
 

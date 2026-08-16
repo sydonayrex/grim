@@ -142,6 +142,7 @@ impl Maple {
             has_shared_expert: true,
             moe_intermediate_size: Some(cfg.moe_intermediate_size),
             shared_expert_intermediate_size: Some(cfg.shared_expert_intermediate_size),
+            transposed_expert_layout: false,
         };
 
         let moe_spec: Vec<Option<MoESpec>> = (0..cfg.num_layers)

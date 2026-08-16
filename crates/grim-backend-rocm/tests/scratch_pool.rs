@@ -32,8 +32,6 @@ use grim_tensor::{DType, Shape};
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 type TestResult<R = ()> = Result<R, TestError>;
 
-const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
-
 /// `PoolLayout::new(size, align).size` must round up to the next power of
 /// two (with a 256-byte floor). This is the bucketization that lets the
 /// pool reuse buffers across similarly-sized requests without copying.
@@ -71,7 +69,7 @@ fn pool_layout_hash_key_stable() -> TestResult {
 /// and the pool tracks them monotonically.
 #[test]
 fn pool_alloc_tracks_peak_and_current() -> TestResult {
-    let env = std::env::var(GPU_TEST_ENV).is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(()); // Pool math is purely CPU-side bookkeeping.
     }
@@ -82,21 +80,20 @@ fn pool_alloc_tracks_peak_and_current() -> TestResult {
         Err(_) => return Ok(()),
     };
 
-    let pool = DeviceScratchPool::new();
-    let baseline = pool.peak_bytes();
-    assert_eq!(pool.current_bytes(), 0);
-    assert_eq!(baseline, 0);
+    let baseline = dev.scratch_pool_peak_bytes();
+    let _ = dev.scratch_pool_current_bytes();
 
     let buf1 = dev.get_scratch(1024, 16)?;
     drop(buf1);
     // After drop, the bucket returns the buffer to the pool, so current_bytes
     // is non-zero but peak_bytes is at least 1024.
-    let after_drop = pool.current_bytes();
+    let after_drop = dev.scratch_pool_current_bytes();
     assert!(
         after_drop >= 1024,
         "current_bytes must reflect allocations, got {}",
         after_drop
     );
+    assert!(dev.scratch_pool_peak_bytes() >= baseline);
     Ok(())
 }
 
@@ -107,7 +104,7 @@ fn pool_alloc_tracks_peak_and_current() -> TestResult {
 /// size bucket", proving pool reclamation actually happens.
 #[test]
 fn pool_drops_recycle_pointer_for_same_bucket() -> TestResult {
-    let env = std::env::var(GPU_TEST_ENV).is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(());
     }
@@ -138,7 +135,7 @@ fn pool_drops_recycle_pointer_for_same_bucket() -> TestResult {
 /// slot freed by a 1 KB request — different buckets, different slots.
 #[test]
 fn pool_uses_distinct_buckets_per_size() -> TestResult {
-    let env = std::env::var(GPU_TEST_ENV).is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(());
     }
@@ -170,7 +167,7 @@ fn pool_uses_distinct_buckets_per_size() -> TestResult {
 /// and the main inference task may both ask for scratch.
 #[test]
 fn pool_handle_concurrent_allocs() -> TestResult {
-    let env = std::env::var(GPU_TEST_ENV).is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(());
     }
@@ -210,7 +207,7 @@ fn pool_handle_concurrent_allocs() -> TestResult {
 /// the pool's raw-pointer bucket map is not `Send`).
 #[test]
 fn pool_peak_monotonic_under_concurrent_load() -> TestResult {
-    let env = std::env::var(GPU_TEST_ENV).is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(());
     }
@@ -265,7 +262,7 @@ fn pool_new_is_infallible_and_zeroed() -> TestResult {
 /// and isn't reachable from the success path.
 #[test]
 fn pool_buffer_as_ptr_is_nonnull() -> TestResult {
-    let env = std::env::var(GPU_TEST_ENV).is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(());
     }
@@ -288,7 +285,7 @@ fn pool_buffer_as_ptr_is_nonnull() -> TestResult {
 /// confirms dtype/storage round-trips through the buffer alignment.
 #[test]
 fn pool_buffer_can_be_uploaded_to() -> TestResult {
-    let env = std::env::var(GPU_TEST_ENV).is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(());
     }
@@ -338,7 +335,7 @@ fn pool_buffer_can_be_uploaded_to() -> TestResult {
 /// (after the first one is dropped), proving the integration is wired.
 #[test]
 fn upload_to_scratch_recycles_slot() -> TestResult {
-    let env = std::env::var(GPU_TEST_ENV).is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(());
     }
@@ -371,7 +368,7 @@ fn upload_to_scratch_recycles_slot() -> TestResult {
 /// expected size, the subsequent memcpy would be wrong.
 #[test]
 fn upload_to_scratch_bytes_match_data() -> TestResult {
-    let env = std::env::var(GPU_TEST_ENV).is_ok();
+    let env = grim_backend_rocm::gpu_test_enabled();
     if !env {
         return Ok(());
     }

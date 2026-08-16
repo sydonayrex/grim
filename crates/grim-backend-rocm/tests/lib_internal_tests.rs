@@ -1,7 +1,7 @@
 //! Internal correctness tests for grim-backend-rocm.
 //! These tests verify kernel symbol uniqueness and trait reachability;
 //! GPU-requiring tests are marked #[ignore] and gated by
-//! GRIM_RUN_GPU_TESTS=1.
+//! GRIM_GPU_TEST=1.
 
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::backend::BackendDevice;
@@ -31,7 +31,7 @@ fn kernel_source_has_no_duplicate_device_fns() {
 /// cross_attention, rwkv_time_mix, rwkv_channel_mix must be reachable
 /// via `dyn BackendDevice`, not just the inherent `impl RocmDevice`.
 #[test]
-#[ignore = "requires GRIM_RUN_GPU_TESTS=1 and a real ROCm GPU"]
+#[ignore = "requires GRIM_GPU_TEST=1 and a real ROCm GPU"]
 fn rocm_trait_ops_are_reachable_via_dyn() {
     let dev: Box<dyn BackendDevice> = Box::new(
         RocmDevice::try_new(0).expect("RocmDevice::new should succeed on a system with ROCm"),

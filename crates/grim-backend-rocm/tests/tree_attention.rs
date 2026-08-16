@@ -5,7 +5,7 @@ use std::sync::Arc;
 #[test]
 fn test_tree_attention_gpu_matches_reference() {
     // Only run if the GPU tests gate is open
-    if std::env::var("GRIM_RUN_GPU_TESTS").is_err() {
+    if !grim_backend_rocm::gpu_test_enabled() {
         return;
     }
 

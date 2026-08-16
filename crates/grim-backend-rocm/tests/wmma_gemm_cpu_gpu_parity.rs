@@ -10,8 +10,12 @@
 //!      (to match GPU precision), and asserts the max relative error is within 2e-2
 //!      (accounting for F16 accumulation rounding on gfx1200 scalar-fallback path).
 //!
-//! Without `GRIM_RUN_GPU_TESTS=1` all GPU sub-tests bail `Ok(())` (CI-safe).
-//! The shape-parameter and helper logic run on CPU without a device.
+//! RUN ON THIS SYSTEM: GRIM_RUN_GPU_TEST=1 cargo test -p grim-backend-rocm --test wmma_gemm_cpu_gpu_parity
+//! RESULT: 1/2 PASS (test_wmma_gemm_enable_disable_output_consistency), 1/2 FAIL
+//!   (test_wmma_gemm_cpu_gpu_parity_all_shapes — hipModuleLoad failed: 209). The
+//!   enable/disable consistency test passes because it exercises the dispatch switch;
+//!   the full parity sweep fails because the JIT WMMA kernel module cannot be loaded
+//!   on this system.
 
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::{BackendDevice, DType, Shape};
@@ -19,11 +23,9 @@ use std::panic;
 
 type TestResult<R = ()> = Result<R, Box<dyn std::error::Error + Send + Sync>>;
 
-const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
-
 /// Build a `RocmDevice` if `GRIM_RUN_GPU_TESTS` is set; returns `None` otherwise.
 fn gpu_device() -> Option<RocmDevice> {
-    if std::env::var(GPU_TEST_ENV).is_err() {
+    if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
     match panic::catch_unwind(|| RocmDevice::try_new(0).expect("RocmDevice::try_new")) {

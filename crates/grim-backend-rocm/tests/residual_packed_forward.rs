@@ -7,8 +7,6 @@ use grim_backend_rocm::{FUSED_FORWARD_DISPATCH_STATS, RocmDevice};
 use grim_tensor::dtype::{ArithType, DType, QuantProvenance, Storage};
 use grim_tensor::{BackendDevice, Shape};
 
-const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
-
 fn pack_bpw2(codes: [u8; 4]) -> u8 {
     (codes[0] << 6) | (codes[1] << 4) | (codes[2] << 2) | codes[3]
 }
@@ -16,7 +14,7 @@ fn pack_bpw2(codes: [u8; 4]) -> u8 {
 #[test]
 #[ignore = "requires real ROCm device; run with GRIM_RUN_GPU_TESTS=1 and -- --ignored"]
 fn residual_packed_forward_passes_backup2_and_merges_it() {
-    if std::env::var(GPU_TEST_ENV).is_err() {
+    if !grim_backend_rocm::gpu_test_enabled() {
         return;
     }
     let devices = match RocmDevice::probe() {
@@ -122,7 +120,7 @@ fn residual_packed_forward_passes_backup2_and_merges_it() {
 #[test]
 #[ignore = "requires real ROCm device; run with GRIM_RUN_GPU_TESTS=1 and -- --ignored"]
 fn residual_packed_forward_applies_outlier_correction_in_fused_path() {
-    if std::env::var(GPU_TEST_ENV).is_err() {
+    if !grim_backend_rocm::gpu_test_enabled() {
         return;
     }
     let devices = match RocmDevice::probe() {

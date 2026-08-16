@@ -200,10 +200,9 @@ impl Llama {
         let mut moe_blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             let lws = ws.pp("layers").pp(&i.to_string());
-            let mut block = LlamaBlock::load_tp_spec(&lws, &cfg, &attn_specs[i], tp)?;
+            let is_moe = moe_spec[i].is_some();
+            let block = LlamaBlock::load_tp_spec_with_ffn(&lws, &cfg, &attn_specs[i], tp, !is_moe)?;
             if let Some(spec) = &moe_spec[i] {
-                // Disable the dense FFN; route through the MoE block instead.
-                block.ffn_disabled = true;
                 let moe = MoeBlock::load(&lws, &cfg, spec, tp)?;
                 moe_blocks.push(Some(moe));
             } else {
@@ -257,11 +256,11 @@ impl Llama {
             ),
         };
 
-        let mut linear = |out: usize, inp: usize| {
-            let data: Vec<f32> = (0..out * inp)
+        let mut linear = |out: usize, in_: usize| {
+            let data: Vec<f32> = (0..out * in_)
                 .map(|_| (rng.next_f32() - 0.5) * 0.02)
                 .collect();
-            Linear::from_tensor(cpu_tensor(data, Shape::new(vec![out, inp])), None)
+            Linear::from_tensor(cpu_tensor(data, Shape::new(vec![out, in_])), None)
         };
         let rms = |dim: usize| RmsNorm {
             weight: cpu_tensor(vec![1.0; dim], Shape::new(vec![dim])),
@@ -290,13 +289,15 @@ impl Llama {
                     tp,
                 ),
                 g_proj: None,
+                q_norm: None,
+                k_norm: None,
                 ffn_norm: rms(cfg.hidden_size),
-                w_gate: ColumnParallelLinear::new(
+                w_gate: Some(ColumnParallelLinear::new(
                     linear(cfg.intermediate_size, cfg.hidden_size),
                     tp,
-                ),
-                w_up: ColumnParallelLinear::new(linear(cfg.intermediate_size, cfg.hidden_size), tp),
-                w_down: RowParallelLinear::new(linear(cfg.hidden_size, cfg.intermediate_size), tp),
+                )),
+                w_up: Some(ColumnParallelLinear::new(linear(cfg.intermediate_size, cfg.hidden_size), tp)),
+                w_down: Some(RowParallelLinear::new(linear(cfg.hidden_size, cfg.intermediate_size), tp)),
                 rope: Rope::from_config(grim_tensor::RopeConfig {
                     dim: cfg.head_dim,
                     base: cfg.rope_theta,
@@ -345,26 +346,33 @@ impl Llama {
         hidden: &Tensor,
         positions: &[u32],
     ) -> Result<(Tensor, Tensor, Vec<(Tensor, Tensor)>)> {
-        self.decode_paged(hidden, positions, None, None)
+        let mut throwaway = Inner::new(self.device.clone());
+        self.decode_paged(hidden, positions, &mut throwaway, None, 0)
     }
 
     pub fn decode_paged(
         &self,
         hidden: &Tensor,
         positions: &[u32],
-        session: Option<&dyn SessionT>,
+        session: &mut dyn SessionT,
         mut caches: Option<&mut [Option<crate::block::LlamaLayerCache>]>,
+        _layer: usize,
     ) -> Result<(Tensor, Tensor, Vec<(Tensor, Tensor)>)> {
         let mut h = hidden.clone();
         let mut kv_pairs = Vec::new();
-        for (i, layer) in self.layers.iter().enumerate() {
+        for (i, block) in self.layers.iter().enumerate() {
             let cache = caches.as_deref_mut().and_then(|c| c[i].as_mut());
-            let (attn_out, k, v) = layer.forward_with_kv_paged(&h, positions, session, cache)?;
+            let (attn_out, k, v) =
+                block.forward_with_kv_paged(&h, positions, Some(&mut *session), cache, i)?;
             kv_pairs.push((k, v));
             // MoE layers: `attn_out` is the post-attention residual (dense FFN
-            // was skipped inside the block). Route it through the experts.
+            // was skipped inside the block). Route it through the experts and
+            // ADD the residual back — `MoeBlock::forward` returns only the
+            // normed expert output, so skipping the add drops the residual
+            // stream entirely (matches bailingmoe3 / solar_open2 convention).
             let out = if let Some(moe) = &self.moe_blocks[i] {
-                moe.forward(&attn_out)?
+                let routed = moe.forward(&attn_out)?;
+                grim_nn::modules::add_on_device(&attn_out, &routed)?
             } else {
                 attn_out
             };
@@ -444,29 +452,36 @@ impl CausalLm for Llama {
         } else {
             (0..seq_len).map(|i| i as u32).collect()
         };
-        // Initialize per-layer KV cache in model_state if not present.
-        // The cache stores post-RoPE K and raw V across decode steps so
-        // `prefilled_self_attention` can attend to the full prefix.
-        if session.model_state().is_none() {
-            session.set_model_state(Box::new(
-                (0..self.layers.len())
-                    .map(|_| Some(crate::block::LlamaLayerCache::new()))
-                    .collect::<Vec<_>>(),
-            ));
-        }
-        let caches = session
-            .model_state_mut()
-            .and_then(|s| s.downcast_mut::<Vec<Option<crate::block::LlamaLayerCache>>>())
-            .ok_or_else(|| {
-                grim_core::error::Error::Session(
-                    "Llama::forward: session.model_state has wrong type for this operation".into(),
-                )
-            })?;
-
-        let (logits, hidden_state, _kv_pairs) = {
-            let _t0 = std::time::Instant::now();
-            let r = self.decode_paged(&hidden_t, &pos_vec, None, Some(caches))?;
-            r
+        // Two execution paths:
+        //  * paged  — when the session carries a `PagedKvCache` (engine
+        //    serving), K/V is written into physical page tensors and attention
+        //    runs through the paged kernel via the logical block table.
+        //  * classic — otherwise (single-shot tests, no KV session) we keep the
+        //    per-layer `LlamaLayerCache` in `model_state` and use dense causal
+        //    attention.
+        let use_paged = session.has_kv();
+        let (logits, hidden_state, _kv_pairs) = if use_paged {
+            self.decode_paged(&hidden_t, &pos_vec, &mut *session, None, 0)?
+        } else {
+            // Initialize per-layer KV cache in model_state if not present.
+            if session.model_state().is_none() {
+                session.set_model_state(Box::new(
+                    (0..self.layers.len())
+                        .map(|_| Some(crate::block::LlamaLayerCache::new()))
+                        .collect::<Vec<_>>(),
+                ));
+            }
+            let caches = session
+                .model_state_mut()
+                .and_then(|s| s.downcast_mut::<Vec<Option<crate::block::LlamaLayerCache>>>())
+                .ok_or_else(|| {
+                    grim_core::error::Error::Session(
+                        "Llama::forward: session.model_state has wrong type for this operation"
+                            .into(),
+                    )
+                })?;
+            let mut throwaway = Inner::new(self.device.clone());
+            self.decode_paged(&hidden_t, &pos_vec, &mut throwaway, Some(caches), 0)?
         };
         session.set_last_hidden_state(hidden_state);
         let logits = if adapters.is_empty() {

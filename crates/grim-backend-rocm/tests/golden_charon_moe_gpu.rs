@@ -37,11 +37,9 @@ use grim_nn::Linear;
 use grim_nn::moe::{ExpertBank, MoeFfn, MoeRouter, RouterKind};
 use grim_tensor::shape::Shape;
 
-const GPU_TEST_ENV: &str = "GRIM_RUN_GPU_TESTS";
-
 /// Env-gated device helper (mirrors `decode_gemm.rs` / `golden_q4k_*`).
 fn gpu_device() -> Option<RocmDevice> {
-    if std::env::var(GPU_TEST_ENV).is_err() {
+    if !grim_backend_rocm::gpu_test_enabled() {
         return None;
     }
     match panic::catch_unwind(|| {

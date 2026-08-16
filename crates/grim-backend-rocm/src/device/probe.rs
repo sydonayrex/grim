@@ -1,6 +1,6 @@
 //! Device-feature probes — small functions that ask HIP runtime a [see: `hipDeviceGetAttribute`, `unsafe`]
 
-use crate::device::util::detect_gpu_arch;
+use crate::device::util::{DeviceGuard, detect_gpu_arch};
 use grim_tensor::error::{Error, Result};
 use std::fs;
 use std::path::PathBuf;
@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use super::handles::{
     HIP_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
     HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS, HIP_DEVICE_ATTRIBUTE_WARP_SIZE,
-    hipDeviceGetAttribute, hipSetDevice,
+    hipDeviceGetAttribute,
 };
 
 /// HIP attribute ID for maximum shared memory (LDS) per block.
@@ -17,8 +17,8 @@ pub const HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: i32 = 3;
 /// Query maximum threads per block for a specific device ordinal.
 pub fn max_threads_per_block(device_ordinal: usize) -> u32 {
     let mut val: i32 = 0;
+    let _guard = DeviceGuard::set(device_ordinal as i32);
     unsafe {
-        let _ = hipSetDevice(device_ordinal as i32);
         let status = hipDeviceGetAttribute(
             &mut val,
             HIP_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
@@ -35,8 +35,8 @@ pub fn max_threads_per_block(device_ordinal: usize) -> u32 {
 /// Query active compute unit (multiprocessor) count for a specific device ordinal.
 pub fn active_cu_count(device_ordinal: usize) -> u32 {
     let mut val: i32 = 0;
+    let _guard = DeviceGuard::set(device_ordinal as i32);
     unsafe {
-        let _ = hipSetDevice(device_ordinal as i32);
         let status = hipDeviceGetAttribute(
             &mut val,
             HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
@@ -52,18 +52,33 @@ pub fn active_cu_count(device_ordinal: usize) -> u32 {
 
 /// Query wavefront execution size (32 or 64) for a specific device ordinal.
 pub fn wavefront_size(device_ordinal: usize) -> u32 {
-    let mut val: i32 = 0;
-    unsafe {
-        let _ = hipSetDevice(device_ordinal as i32);
-        let status = hipDeviceGetAttribute(
-            &mut val,
-            HIP_DEVICE_ATTRIBUTE_WARP_SIZE,
-            device_ordinal as i32,
-        );
-        if status == 0 && val > 0 {
-            val as u32
-        } else {
-            32
+    if let Ok(s) = std::env::var("GRIM_WAVEFRONT_SIZE") {
+        if let Ok(val) = s.parse::<u32>() {
+            return val;
+        }
+    }
+    let arch = crate::device::util::detect_gpu_arch(device_ordinal as i32);
+    match crate::quantization::gcn_arch(&arch) {
+        crate::quantization::GcnArch::RDNA1
+        | crate::quantization::GcnArch::RDNA2
+        | crate::quantization::GcnArch::RDNA3
+        | crate::quantization::GcnArch::RDNA4 => 32,
+        crate::quantization::GcnArch::CDNA2 | crate::quantization::GcnArch::CDNA3 => 64,
+        _ => {
+            let mut val: i32 = 0;
+            let _guard = DeviceGuard::set(device_ordinal as i32);
+            unsafe {
+                let status = hipDeviceGetAttribute(
+                    &mut val,
+                    HIP_DEVICE_ATTRIBUTE_WARP_SIZE,
+                    device_ordinal as i32,
+                );
+                if status == 0 && val == 64 && arch.starts_with("gfx9") {
+                    64
+                } else {
+                    32
+                }
+            }
         }
     }
 }
@@ -71,8 +86,8 @@ pub fn wavefront_size(device_ordinal: usize) -> u32 {
 /// Query maximum shared memory (LDS) in bytes per block for a specific device ordinal.
 pub fn max_shared_mem(device_ordinal: usize) -> u32 {
     let mut val: i32 = 0;
+    let _guard = DeviceGuard::set(device_ordinal as i32);
     unsafe {
-        let _ = hipSetDevice(device_ordinal as i32);
         let status = hipDeviceGetAttribute(
             &mut val,
             HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
@@ -89,8 +104,8 @@ pub fn max_shared_mem(device_ordinal: usize) -> u32 {
 /// XNACK probe for unified memory availability. Returns true if the [see: `hipMemAdvise`]
 pub fn probe_xnack(device_ordinal: usize) -> bool {
     let mut val: i32 = 0;
+    let _guard = DeviceGuard::set(device_ordinal as i32);
     unsafe {
-        let _ = hipSetDevice(device_ordinal as i32);
         let status = hipDeviceGetAttribute(
             &mut val,
             HIP_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS,
@@ -161,14 +176,8 @@ pub fn probe_host_gpu(device_ordinal: usize) -> Result<HostGpuCapabilities> {
     let mut warp_val: i32 = 0;
     let mut lds_val: i32 = 0;
 
+    let _guard = DeviceGuard::set(device_ordinal as i32);
     unsafe {
-        let set_status = hipSetDevice(device_ordinal as i32);
-        if set_status != 0 {
-            return Err(Error::Backend(format!(
-                "hipSetDevice failed for ordinal {device_ordinal}: error code {set_status}"
-            )));
-        }
-
         let warp_status = hipDeviceGetAttribute(
             &mut warp_val,
             HIP_DEVICE_ATTRIBUTE_WARP_SIZE,

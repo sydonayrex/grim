@@ -25,7 +25,7 @@ use grim_tensor::{BackendDevice, DType, Shape};
 /// the A/B branches that the direct-kernel test above does NOT cover.
 #[test]
 fn cubecl_ab_dispatch_through_device_methods() {
-    if std::env::var("GRIM_RUN_GPU_TESTS").is_err() {
+    if !grim_backend_rocm::gpu_test_enabled() {
         return;
     }
     let dev = RocmDevice::try_new(0)
@@ -160,7 +160,7 @@ fn max_err(got: &[f32], want: &[f32]) -> f32 {
 
 #[test]
 fn cubecl_lifted_kernels_match_cpu_reference() {
-    if std::env::var("GRIM_RUN_GPU_TESTS").is_err() {
+    if !grim_backend_rocm::gpu_test_enabled() {
         return;
     }
     let c = client();
