@@ -29,7 +29,7 @@ members = [
     "crates/grim-kvtransport",
     "crates/grim-disagg",
     "crates/grim-autograd",
-    "crates/grim-garage", "crates/mxfp4_probe",
+    "crates/grim-garage",
 ]
 
 [workspace.package]
