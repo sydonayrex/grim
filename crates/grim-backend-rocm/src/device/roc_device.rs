@@ -124,6 +124,19 @@ use crate::{
     upload_device_buffer,
 };
 
+/// Return type for [`RocmDevice::charon_grouped_backward_roundtrip`].
+///
+/// Holds the four named gradient buffers from the Charon MoE backward kernel,
+/// each as a flat `Vec<f32>` in the device layout (expert-outermost for weight
+/// grads, batch-outermost for `d_x`).
+#[derive(Debug, Clone)]
+pub struct CharonBackwardResult {
+    pub d_gate_w: Vec<f32>,
+    pub d_up_w: Vec<f32>,
+    pub d_down_w: Vec<f32>,
+    pub d_x: Vec<f32>,
+}
+
 #[derive(Debug)]
 pub struct RocmDevice {
     pub(crate) ordinal: usize,
@@ -5769,6 +5782,253 @@ impl RocmDevice {
         )?;
         self.synchronize();
         out_storage.to_cpu_vec_f32()
+    }
+
+    // -----------------------------------------------------------------------
+    // Charon MoE backward launcher (P2 — WI-Charon-1 device dispatch)
+    // -----------------------------------------------------------------------
+
+    /// Device launcher for the FP32 Charon MoE backward kernel
+    /// (`grim_moe_fused_grouped_backward`). Mirrors
+    /// `launch_charon_grouped_dispatch`: validates inputs, zero-initialises the
+    /// four atomicAdd output buffers, plans the grouped grid/block from the
+    /// sorted routing arrays, uploads sorted routing arrays, and launches.
+    pub(crate) fn launch_charon_grouped_backward(
+        &self,
+        activations: &RocmStorage,
+        expert_gate_w_ptr: u64,
+        expert_up_w_ptr: u64,
+        expert_down_w_ptr: u64,
+        d_y: &RocmStorage,
+        d_gate_w: &RocmStorage,
+        d_up_w: &RocmStorage,
+        d_down_w: &RocmStorage,
+        d_x: &RocmStorage,
+        sorted: &crate::kernels::charon::SortedRouting,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+        _num_experts: usize,
+    ) -> Result<*mut c_void> {
+        let a_ptr = activations.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_backward: activations has no device ptr".into())
+        })?;
+        let dy_ptr = d_y.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_backward: d_y has no device ptr".into())
+        })?;
+        let dgw_ptr = d_gate_w.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_backward: d_gate_w has no device ptr".into())
+        })?;
+        let duw_ptr = d_up_w.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_backward: d_up_w has no device ptr".into())
+        })?;
+        let ddw_ptr = d_down_w.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_backward: d_down_w has no device ptr".into())
+        })?;
+        let dx_ptr = d_x.device_ptr.ok_or_else(|| {
+            Error::Backend("charon_grouped_backward: d_x has no device ptr".into())
+        })?;
+
+        crate::kernels::charon_backward::validate_backward_inputs(
+            expert_gate_w_ptr as *const c_void,
+            expert_up_w_ptr as *const c_void,
+            expert_down_w_ptr as *const c_void,
+            dy_ptr as *const c_void,
+            dgw_ptr as *mut c_void,
+            duw_ptr as *mut c_void,
+            ddw_ptr as *mut c_void,
+            dx_ptr as *mut c_void,
+            hidden,
+            inter,
+            sorted.num_tokens_post_padded,
+            sorted.block_size,
+        )?;
+
+        // All four output buffers are accumulated via atomicAdd; zero first.
+        check_hip("charon_backward hipMemset(d_gate_w, 0)", unsafe {
+            hipMemset(dgw_ptr as *mut c_void, 0, d_gate_w.bytes())
+        })?;
+        check_hip("charon_backward hipMemset(d_up_w, 0)", unsafe {
+            hipMemset(duw_ptr as *mut c_void, 0, d_up_w.bytes())
+        })?;
+        check_hip("charon_backward hipMemset(d_down_w, 0)", unsafe {
+            hipMemset(ddw_ptr as *mut c_void, 0, d_down_w.bytes())
+        })?;
+        check_hip("charon_backward hipMemset(d_x, 0)", unsafe {
+            hipMemset(dx_ptr as *mut c_void, 0, d_x.bytes())
+        })?;
+
+        let wave = self.wavefront_size() as u32;
+        let plan = crate::kernels::charon::plan_grouped_dispatch(sorted, wave);
+        if plan.grid_x == 0 {
+            return Ok(self.active_stream());
+        }
+        let grid_dim = HipDim3::new(plan.grid_x, 1, 1);
+        let block_dim = HipDim3::new(plan.block_x, 1, 1);
+
+        let mut tok_ptr = upload_device_buffer(&sorted.sorted_token_ids)?;
+        let mut exp_ptr = upload_device_buffer(&sorted.sorted_expert_ids)?;
+        let mut w_ptr = upload_device_buffer(&sorted.sorted_weights)?;
+
+        // Kernel arg order matches grim_moe_fused_grouped_backward signature:
+        // activations, gate_w, up_w, down_w, d_y, d_gate_w, d_up_w, d_down_w,
+        // d_x, sorted_token_ids, sorted_expert_ids, sorted_weights,
+        // hidden, inter, num_tokens, block_size, routed_scaling_factor
+        let mut a = a_ptr as *mut c_void;
+        let mut gw = expert_gate_w_ptr as *mut c_void;
+        let mut uw = expert_up_w_ptr as *mut c_void;
+        let mut dw = expert_down_w_ptr as *mut c_void;
+        let mut dy = dy_ptr as *mut c_void;
+        let mut dgw = dgw_ptr as *mut c_void;
+        let mut duw = duw_ptr as *mut c_void;
+        let mut ddw = ddw_ptr as *mut c_void;
+        let mut dx = dx_ptr as *mut c_void;
+        let mut hidden_i = hidden as i32;
+        let mut inter_i = inter as i32;
+        let mut num_tokens_i = sorted.num_tokens_post_padded as i32;
+        let mut block_size_i = sorted.block_size as i32;
+        let mut rsf = routed_scaling_factor;
+
+        let stream = self.launch_compute_kernel(
+            "grim_moe_fused_grouped_backward",
+            grid_dim,
+            block_dim,
+            &mut [
+                arg(&mut a),
+                arg(&mut gw),
+                arg(&mut uw),
+                arg(&mut dw),
+                arg(&mut dy),
+                arg(&mut dgw),
+                arg(&mut duw),
+                arg(&mut ddw),
+                arg(&mut dx),
+                arg(&mut tok_ptr),
+                arg(&mut exp_ptr),
+                arg(&mut w_ptr),
+                arg(&mut hidden_i),
+                arg(&mut inter_i),
+                arg(&mut num_tokens_i),
+                arg(&mut block_size_i),
+                arg(&mut rsf),
+            ],
+        )?;
+
+        if self.active_capture_stream().is_none() {
+            unsafe {
+                let sync = hipStreamSynchronize(stream);
+                if sync != hipSuccess {
+                    hipFree(tok_ptr);
+                    hipFree(exp_ptr);
+                    hipFree(w_ptr);
+                    return Err(Error::Backend(format!(
+                        "charon_grouped_backward hipStreamSynchronize failed: {}",
+                        sync
+                    )));
+                }
+                hipFree(tok_ptr);
+                hipFree(exp_ptr);
+                hipFree(w_ptr);
+            }
+        }
+        Ok(stream)
+    }
+
+    /// Host-to-host roundtrip for the Charon MoE backward kernel.
+    ///
+    /// Uploads all inputs (activations, expert weights, d_y) and the sorted
+    /// routing arrays to the device, launches `grim_moe_fused_grouped_backward`,
+    /// and downloads the four gradient buffers (`d_gate_w`, `d_up_w`,
+    /// `d_down_w`, `d_x`). Used by the P2 device verifier test.
+    pub fn charon_grouped_backward_roundtrip(
+        &self,
+        activations: &[f32],
+        expert_gate_w: &[f32],
+        expert_up_w: &[f32],
+        expert_down_w: &[f32],
+        d_y: &[f32],
+        assignment: &crate::kernels::charon::RoutingAssignment,
+        batch: usize,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<CharonBackwardResult> {
+        let num_experts = expert_gate_w.len() / (inter * hidden);
+        let block_size = 128usize;
+
+        let sorted =
+            crate::kernels::charon::moe_align_block_size(assignment, block_size, num_experts);
+
+        let act_shape = Shape::new(vec![batch, hidden]);
+        let gw_shape = Shape::new(vec![expert_gate_w.len()]);
+        let uw_shape = Shape::new(vec![expert_up_w.len()]);
+        let dw_shape = Shape::new(vec![expert_down_w.len()]);
+        let dy_shape = Shape::new(vec![d_y.len()]);
+
+        let dgw_shape = Shape::new(vec![num_experts * inter * hidden]);
+        let duw_shape = Shape::new(vec![num_experts * inter * hidden]);
+        let ddw_shape = Shape::new(vec![num_experts * hidden * inter]);
+        let dx_shape = Shape::new(vec![batch * hidden]);
+
+        let act_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, activations, &act_shape, DType::F32)?;
+        let gw_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, expert_gate_w, &gw_shape, DType::F32)?;
+        let uw_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, expert_up_w, &uw_shape, DType::F32)?;
+        let dw_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, expert_down_w, &dw_shape, DType::F32)?;
+        let dy_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, d_y, &dy_shape, DType::F32)?;
+
+        // Output grad buffers — allocated (not uploaded), kernel fills them.
+        let dgw_storage: Box<dyn BackendStorage> =
+            BackendDevice::alloc_storage(self, &dgw_shape, DType::F32)?;
+        let duw_storage: Box<dyn BackendStorage> =
+            BackendDevice::alloc_storage(self, &duw_shape, DType::F32)?;
+        let ddw_storage: Box<dyn BackendStorage> =
+            BackendDevice::alloc_storage(self, &ddw_shape, DType::F32)?;
+        let dx_storage: Box<dyn BackendStorage> =
+            BackendDevice::alloc_storage(self, &dx_shape, DType::F32)?;
+
+        let act_s = as_rocm(act_storage.as_ref())?;
+        let gw_s = as_rocm(gw_storage.as_ref())?;
+        let uw_s = as_rocm(uw_storage.as_ref())?;
+        let dw_s = as_rocm(dw_storage.as_ref())?;
+        let dy_s = as_rocm(dy_storage.as_ref())?;
+        let dgw_s = as_rocm(dgw_storage.as_ref())?;
+        let duw_s = as_rocm(duw_storage.as_ref())?;
+        let ddw_s = as_rocm(ddw_storage.as_ref())?;
+        let dx_s = as_rocm(dx_storage.as_ref())?;
+
+        let gw_ptr = dev_ptr(gw_s)?;
+        let uw_ptr = dev_ptr(uw_s)?;
+        let dw_ptr = dev_ptr(dw_s)?;
+
+        self.launch_charon_grouped_backward(
+            act_s,
+            gw_ptr,
+            uw_ptr,
+            dw_ptr,
+            dy_s,
+            dgw_s,
+            duw_s,
+            ddw_s,
+            dx_s,
+            &sorted,
+            hidden,
+            inter,
+            routed_scaling_factor,
+            num_experts,
+        )?;
+        self.synchronize();
+
+        Ok(CharonBackwardResult {
+            d_gate_w: dgw_storage.to_cpu_vec_f32()?,
+            d_up_w: duw_storage.to_cpu_vec_f32()?,
+            d_down_w: ddw_storage.to_cpu_vec_f32()?,
+            d_x: dx_storage.to_cpu_vec_f32()?,
+        })
     }
 
     /// Host-to-host roundtrip for the #3 MXFP4 (E2M1 + E8M0) token-sorted grouped

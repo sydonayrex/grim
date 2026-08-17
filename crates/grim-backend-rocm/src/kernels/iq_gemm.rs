@@ -630,34 +630,42 @@ extern "C" {
         if (idx >= total) return;
         const int row = (int)(idx / K);
         const int k_idx = (int)(idx % K);
-        const int superblock_idx = k_idx / 256;
-        const int k_in_superblock = k_idx % 256;
 
-        // P4: per-thread superblock for backward — one thread handles a 256-weight
-        // superblock worth of K. The dV/dX entry is at row (m = idx / K),
-        // K-index k_idx, so superblock_idx = k_idx / 256 and k_in_sb = k_idx % 256.
-        //
-        // We precompute the per-superblock row of B in registers: 8 sub-blocks
-        // × 32 weights, each sub-block has its own 6-bit scale (unpacked inside
-        // `dequant_iq4xs`), and we dequant all 256 codes in this superblock once
-        // via `dequant_iq4xs` in a `#pragma unroll` loop. Then we MAC across N.
-        // This removes the per-MAC `sb_idx`/`in_sb` div/mod and the per-MAC-per-N
-        // dequant call that the old kernel did inside the N-loop. One thread does
-        // 256 dequant calls total instead of N * 256.
+        // P4: hoist every loop-invariant decode index out of the per-MAC N
+        // loop. dX[row][k] = sum_n dY[row][n] * B[n][k] walks one packed
+        // superblock per output row n (B varies with n), so the work that CAN
+        // be hoisted per thread is the superblock/sub-block/nibble index math
+        // — the old kernel recomputed `k/256`, `k%256`, `in_sb/2`, `%2`,
+        // `(group*6)/8`, `%8` inside the N loop via a full `dequant_iq4xs`
+        // call per MAC. The decode below is byte-for-byte the same as
+        // `dequant_iq4xs`, with those indices precomputed once.
+        const int superblock_idx = k_idx >> 8;      // k_idx / 256
+        const int k_in_superblock = k_idx & 255;    // k_idx % 256
+        const int group = k_in_superblock >> 5;     // 32-weight sub-block
+        const int sc_byte_idx = (group * 6) >> 3;   // 6-bit scale byte
+        const int sc_bit_offset = (group * 6) & 7;  // 6-bit scale shift
+        const int q_byte = k_in_superblock >> 1;    // nibble byte
+        const bool low_nibble = (k_in_superblock & 1) == 0;
+
         const int blocks_per_row = K / 256;
-        const int row_bytes = blocks_per_row * 136;
-        const unsigned char* superblock_base = B_iq4xs + (unsigned long long)row_bytes * superblock_idx;
-        float b_vals[256];
-        #pragma unroll
-        for (int w = 0; w < 256; ++w) {
-            b_vals[w] = dequant_iq4xs(superblock_base, w);
-        }
+        const unsigned long long row_bytes = (unsigned long long)blocks_per_row * 136;
 
         float acc = 0.0f;
         for (int n = 0; n < N; ++n) {
-            float dy_val = dY[row * N + n];
-            float w_val = b_vals[k_in_superblock];
-            acc += dy_val * w_val;
+            const unsigned char* blk = B_iq4xs + (unsigned long long)n * row_bytes
+                                              + (unsigned long long)superblock_idx * 136;
+            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+            const unsigned char* sc = blk + 2;
+            const unsigned char* qs = blk + 8;
+            unsigned int sc_val = (unsigned int)sc[sc_byte_idx] >> sc_bit_offset;
+            if (sc_bit_offset > 2) {
+                sc_val |= (unsigned int)sc[sc_byte_idx + 1] << (8 - sc_bit_offset);
+            }
+            sc_val &= 0x3F;
+            const unsigned char q_code = low_nibble
+                ? (unsigned char)(qs[q_byte] & 0x0F)
+                : (unsigned char)((qs[q_byte] >> 4) & 0x0F);
+            acc += dY[row * N + n] * (d * (float)sc_val * (float)q_code);
         }
         dX[row * K + k_idx] = acc;
     }
