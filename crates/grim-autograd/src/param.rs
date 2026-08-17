@@ -325,7 +325,7 @@ impl TrainableParams {
                         // alias the same buffer so ncclAllReduce reduces into
                         // the gradient tensor directly.
                         let stream = 0u64; // default HIP stream
-                        rccl_handle.sum_gradients_device(ptr, ptr, count, stream)?;
+                        rccl_handle.sum_gradients_device(ptr, ptr, count, stream, dev.ordinal)?;
                         // Synchronize after the all-reduce on the default stream —
                         // without this, param.grad may be read before the NCCL
                         // collective has finished writing it. [P1-15 fix.]

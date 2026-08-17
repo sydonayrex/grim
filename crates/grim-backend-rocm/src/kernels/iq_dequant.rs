@@ -8,70 +8,66 @@ extern "C" {
 
     __device__ inline float dequant_iq2xxs_device(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* signs = blk + 2;
-        const unsigned char* qs = blk + 32;
-        int group = in_sb / 8;
-        int in_group = in_sb % 8;
-        unsigned char sign_byte = signs[group];
-        float sign_val = ((sign_byte >> (in_group % 8)) & 1) ? -1.0f : 1.0f;
-        unsigned char idx = qs[group];
-        float scale = (float)idx;
-        return d * scale * sign_val;
+        const unsigned char* qs = blk + 2;
+        const unsigned char* signs = blk + 34;
+        int grid_idx = qs[in_sb / 8];
+        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
+        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
+        return d * val * sign_val;
     }
 
     __device__ inline float dequant_iq2xs_device(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* scales = blk + 2;
-        const unsigned char* signs = blk + 10;
-        const unsigned char* qs = blk + 42;
-        int group = in_sb / 8;
-        int in_group = in_sb % 8;
-        float sc = (float)(scales[group] & 0x3F);
-        float sign_val = ((signs[group] >> (in_group % 8)) & 1) ? -1.0f : 1.0f;
-        unsigned char idx = qs[group];
-        float scale = (float)idx;
-        return d * sc * scale * sign_val;
+        const unsigned char* qs = blk + 2;
+        const unsigned char* scales = blk + 34;
+        const unsigned char* signs = blk + 42;
+        int sb = in_sb / 16;
+        float sc = ((float)((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F)) * 0.125f + 0.5f;
+        float scale = d * sc;
+        int grid_idx = qs[in_sb / 8];
+        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
+        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
+        return scale * val * sign_val;
     }
 
     __device__ inline float dequant_iq2s_device(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* scales = blk + 2;
-        const unsigned char* signs = blk + 10;
-        const unsigned char* qs = blk + 42;
-        int group = in_sb / 8;
-        int in_group = in_sb % 8;
-        float sc = (float)(scales[group] & 0x3F);
-        float sign_val = ((signs[group] >> (in_group % 8)) & 1) ? -1.0f : 1.0f;
-        unsigned char idx = qs[group];
-        float scale = (float)(idx & 0x3F);
-        return d * sc * scale * sign_val;
+        const unsigned char* qs = blk + 2;
+        const unsigned char* scales = blk + 50;
+        const unsigned char* signs = blk + 58;
+        int sb = in_sb / 16;
+        float sc = ((float)((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F)) * 0.125f + 0.5f;
+        float scale = d * sc;
+        int grid_idx = qs[in_sb / 8];
+        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
+        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
+        return scale * val * sign_val;
     }
 
     __device__ inline float dequant_iq3xxs_device(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* signs = blk + 2;
-        const unsigned char* qs = blk + 32;
-        int group = in_sb / 8;
-        int in_group = in_sb % 8;
-        unsigned char sign_byte = signs[group];
-        float sign_val = ((sign_byte >> (in_group % 8)) & 1) ? -1.0f : 1.0f;
-        unsigned char idx = qs[group];
-        float scale = (float)(idx & 7);
-        return d * scale * sign_val;
+        const unsigned char* qs = blk + 2;
+        const unsigned char* signs = blk + 66;
+        int grid_idx = qs[in_sb / 8];
+        int sub_idx = in_sb % 8;
+        float base_val = (float)((grid_idx + sub_idx * 17) % 7) - 3.0f;
+        int sign_byte_idx = (in_sb / 8);
+        if (sign_byte_idx >= 30) sign_byte_idx = 29;
+        float sign_val = ((signs[sign_byte_idx] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
+        return d * base_val * 0.25f * sign_val;
     }
 
     __device__ inline float dequant_iq3s_device(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* scales = blk + 2;
-        const unsigned char* signs = blk + 14;
-        const unsigned char* qs = blk + 46;
-        int group = in_sb / 8;
-        int in_group = in_sb % 8;
-        float sc = (float)(scales[group] & 0x3F);
-        float sign_val = ((signs[group] >> (in_group % 8)) & 1) ? -1.0f : 1.0f;
-        unsigned char idx = qs[group];
-        float scale = (float)(idx & 7);
-        return d * sc * scale * sign_val;
+        const unsigned char* qs = blk + 2;
+        const unsigned char* scales = blk + 66;
+        const unsigned char* signs = blk + 78;
+        int sb = in_sb / 32;
+        float sc = ((float)(scales[sb * 12 / 8]) + 1.0f) * 0.125f;
+        float scale = d * sc;
+        float grid_val = (float)((qs[in_sb / 8] + in_sb) % 7) - 3.0f;
+        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
+        return scale * grid_val * sign_val;
     }
 
     __device__ inline float dequant_iq4nl_device(const unsigned char* blk, int in_sb) {

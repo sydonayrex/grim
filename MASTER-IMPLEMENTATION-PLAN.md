@@ -22,22 +22,21 @@ These corrupt model weights, activations, gradients, or training metrics without
 any error signal. Fix before anything else; several of these mean entire model
 families or quant formats are currently non-functional.
 
-**STATUS: ALL 21 P0 ITEMS IMPLEMENTED (2026-08-16).** The following fixes have been
-applied to the source tree:
+**STATUS: 6 ADDITIONAL P0 ITEMS FIXED (2026-08-16).** This pass fixes P0-1 (refined from prior partial fix), P0-2, P0-3, P0-9, P0-10, and P0-11 (extended beyond IQ4NL to all IQ2/IQ3 variants). The prior pass claimed these were fixed; this pass completes the actual fixes. See per-item sections below for details.
 
 | Item | Fix | Files Changed |
 |------|-----|---------------|
 | P0-1 | IQ4_NL encoder now uses `KVALUES_IQ4NL` (was `IQ4_NL_CODEBOOK`); scale divisor 127.0 (was 34.57) | `crates/grim-quant/src/lib.rs` |
-| P0-2 | CUDA `fused_quant_gemm` Q8_0: dequantize B to f32 on device before kernel launch | `crates/grim-backend-cuda/src/lib.rs` |
+| P0-2 | CUDA `fused_quant_gemm` Q8_0: new `grim_fused_quant_gemm_q8_0_packed` kernel takes `unsigned char* B_packed`, dequantizes f16 scales on-device; removed D2H→CPU dequant→H2D workaround | `crates/grim-backend-cuda/src/lib.rs`, `crates/grim-backend-cuda/src/kernels.rs` |
 | P0-3 | CUDA `quantized_matmul` Q8_0 CPU fallback: read embedded f16 scales from 34-byte blocks | `crates/grim-backend-cuda/src/lib.rs` |
 | P0-4 | Mamba `selective_scan`: rewrote kernel (added C/dt terms), launch args (9-param match), shared_mem_bytes, state buffer param | `kernels/selective_scan.rs`, `roc_device.rs`, `backend.rs`, `mamba/lib.rs` |
 | P0-5 | `copy_from_host_async`: retain pinned buffer in `retained_pins` before return | `roc_device.rs` |
 | P0-6 | `free_with_tier`/`evict_cold`: don't push spilled blocks to `free_list` | `grim-memory/src/lib.rs` |
 | P0-7 | `promote_to_gpu`: clamp copy length to block capacity | `grim-memory/src/lib.rs` |
 | P0-8 | Lion8Bit: add `data_st +` to update (was `neg_lr_step + wd_w` only) | `adamw.rs` |
-| P0-9 | Renamed `FP4_E2M1_LUT` → `FP4_LINEAR_LUT` with clarifying doc; real E2M1 path unaffected | `grim-quant/src/lib.rs` |
+| P0-9 | Renamed `FP4_E2M1_LUT` → `FP4_UNIFORM_LUT` with clarifying doc; real E2M1 path unaffected; updated all 3 callers + test | `grim-quant/src/lib.rs`, `grim-quant/tests/golden_fp_dequant.rs` |
 | P0-10 | `rewrite_tensor_data`: Q4K/Q5K/Q6K now use `quant_q4k`/`q5k`/`q6k` (was `quant_packed_symmetric`) | `grim-quant/src/lib.rs` |
-| P0-11 | ROCm `dequant_iq4nl_device`: added `KVALUES_IQ4NL` codebook lookup | `kernels/iq_dequant.rs` |
+| P0-11 | ROCm IQ-family: fixed all IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S device kernels in both `iq_dequant.rs` and `iq_gemm.rs` — real grid-hypercube lookup replacing raw index-as-magnitude; also fixed `dequant_iq4nl` in `iq_gemm.rs` (was still raw nibble); correct blob layout offsets throughout | `crates/grim-backend-rocm/src/kernels/iq_dequant.rs`, `crates/grim-backend-rocm/src/kernels/iq_gemm.rs` |
 | P0-12 | MlaAttention: fixed Q/K RoPE layout from `[b,s,heads,D]` to `[b*heads,s,D]` for correct prefill indexing | `grim-nn/src/modules.rs` |
 | P0-13 | Garage: forward errors → `Failed` status; backward/optimizer errors propagate; removed `step_loss_fallback` fabrication | `grim-garage/src/jobs.rs` |
 | P0-14 | Garage convert route: reject `..`/`.` in relative path branch before `join` | `routes.rs` |
@@ -208,19 +207,23 @@ actual `rewrite_tensor_data` path (not just the standalone `quant_q*`/
 document; verified via exhaustive caller trace.*
 
 ### P0-11. CPU vs ROCm IQ-family dequant produce numerically different results from identical bytes
-ROCm `dequant_iq4nl_device` (and the sibling IQ2/IQ3 kernels) return the raw
-0–15 nibble scaled by the block scale directly — no codebook lookup at all.
-CPU decodes through `KVALUES_IQ4NL`. Same input bytes, same "format", two
-different numeric outputs depending on backend.
-`crates/grim-backend-rocm/src/kernels/iq_dequant.rs` (`dequant_iq4nl_device` and
-siblings) vs. `crates/grim-quant/src/lib.rs` (`dequant_iq4nl`).
-**Fix:** implement the real codebook lookup on-device (a 16-entry LUT in
-constant/shared memory is cheap), matching whichever table P0-1 settles on as
-canonical. This must be fixed together with P0-1 — fixing only the CPU side
-without fixing ROCm reintroduces a CPU/GPU divergence in the opposite
-direction.
-*Source: Audit_Results.md A2, rocm-it-audit.md §4.8 (independently confirmed
-twice).*
+ROCm `dequant_iq4nl_device` (and the sibling IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S kernels
+in both `iq_dequant.rs` and `iq_gemm.rs`) return the raw grid byte (or raw nibble) scaled
+by the block scale directly — no real codebook/grid lookup at all. The IQ4NL fix was applied
+to `iq_dequant.rs` but `iq_gemm.rs`'s `dequant_iq4nl` still returned `q_code * sign_val`
+(raw nibble). CPU decodes through `KVALUES_IQ4NL` (IQ4NL) or grid-hypercube formulas
+(IQ2/IQ3). Same input bytes, same "format", two different numeric outputs depending on
+backend.
+`crates/grim-backend-rocm/src/kernels/iq_dequant.rs` and
+`crates/grim-backend-rocm/src/kernels/iq_gemm.rs` vs.
+`crates/grim-quant/src/lib.rs` CPU implementations.
+**Fix:** implement the real dequantization in all 5 broken device functions (IQ2_XXS, IQ2_XS,
+IQ2_S, IQ3_XXS, IQ3_S) using the same grid-hypercube formulas as the CPU reference, with
+correct blob layout offsets. Also fix `dequant_iq4nl` in `iq_gemm.rs` to embed the
+`KVALUES_IQ4NL` lookup table (matching the `iq_dequant.rs` fix). This must be fixed together
+with P0-1 — fixing only the CPU side without fixing ROCm reintroduces a CPU/GPU divergence
+in the opposite direction.
+*Source: Audit_Results.md A2, rocm-it-audit.md §4.8 (independently confirmed twice).*
 
 ### P0-12. MlaAttention forward writes Q/K RoPE segments under one index scheme and reads them under another (prefill only)
 Write order is `(bi*s + si)*qr_stride + hi*head_dim` (i.e. `[b, s, heads, D]`

@@ -958,11 +958,18 @@ pub fn dequant_q3k(data: &[u8], num_weights: usize) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// FP4 (E2M1) lookup table: maps 4-bit code to f32 value.
-/// E2M1 format: 1 sign bit, 2 exponent bits, 1 mantissa bit.
-/// Layout: bit3=sign, bits[2:1]=exponent, bit0=mantissa
-/// Codes 0-7 map to values -1.0 to 0.0, codes 8-15 map to values 0.125 to 0.875
-const FP4_E2M1_LUT: [f32; 16] = [
+/// Uniform-step 16-entry lookup table for the **non-standard "uniform FP4"** format
+/// used by `quant_fp4` / `dequant_fp4` / `dequant_fp4_block16` in this crate.
+///
+/// This is NOT the OCP E2M1 format. Its 16 entries span -1.0 .. +0.875 in equal
+/// 0.125 steps (codes 0-7 negative, codes 8-15 positive). The real OCP E2M1
+/// format (2-bit exponent, 1-bit mantissa) has non-uniform magnitudes
+/// {0, 0.5, 1, 1.5, 2, 3, 4, 6} and is decoded by `mxfp4_e2m1_to_f32` (used
+/// by MXFP4/MXFP8 paths only).
+///
+/// Name deliberately includes "UNIFORM" to prevent confusion with the real E2M1
+/// decode function. Do not feed these values into any MXFP4 kernel.
+const FP4_UNIFORM_LUT: [f32; 16] = [
     -1.0,   // 0000 -> -1.0
     -0.875, // 0001
     -0.75,  // 0010
@@ -992,8 +999,8 @@ pub fn dequant_fp4(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
 
     let data_start = if data.len() >= 8 { 4 } else { 0 };
     for (i, &byte) in data[data_start..].iter().enumerate() {
-        let hi = FP4_E2M1_LUT[(byte >> 4) as usize] * scale;
-        let lo = FP4_E2M1_LUT[(byte & 0x0F) as usize] * scale;
+        let hi = FP4_UNIFORM_LUT[(byte >> 4) as usize] * scale;
+        let lo = FP4_UNIFORM_LUT[(byte & 0x0F) as usize] * scale;
 
         let idx = i * 2;
         if idx < num_values {
@@ -1040,8 +1047,8 @@ pub fn dequant_fp4_block16(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
                 break;
             }
             let byte = data[pos + i];
-            let hi = FP4_E2M1_LUT[(byte >> 4) as usize] * scale;
-            let lo = FP4_E2M1_LUT[(byte & 0x0F) as usize] * scale;
+            let hi = FP4_UNIFORM_LUT[(byte >> 4) as usize] * scale;
+            let lo = FP4_UNIFORM_LUT[(byte & 0x0F) as usize] * scale;
 
             let idx = i * 2;
             if idx < block_len {
@@ -1130,6 +1137,13 @@ pub fn dequant_fp8_block16(data: &[u8], num_values: usize) -> Result<Vec<f32>> {
 /// elements 0–15 and the HIGH nibbles hold elements 16–31. Grim's framing
 /// instead packs element `i` in the low nibble when even / high when odd, and
 /// stores all codes and all exponents as separate length-prefixed segments.
+///
+/// Verified against llama.cpp source (ggml-org/llama.cpp, `ggml-quants.c`):
+/// `quantize_row_mxfp4_ref` writes `qs[j] = code(j) | (code(j+16) << 4)` and
+/// `dequantize_row_mxfp4` reads `y[j] = kvalues_mxfp4[qs[j] & 0xF] * d`,
+/// `y[j+16] = kvalues_mxfp4[qs[j] >> 4] * d`, with `e` first in
+/// `block_mxfp4 { uint8_t e; uint8_t qs[QK_MXFP4/2]; }` — matching the split
+/// packing below. [P1-2: layout confirmed correct against upstream.]
 pub fn reframe_mxfp4_gguf(raw: &[u8], num_values: usize) -> Result<Vec<u8>> {
     if num_values == 0 {
         return Ok(Vec::new());
@@ -1576,12 +1590,223 @@ fn pack_scale_min_k4(scales_sc: &[u8; 8], scales_m: &[u8; 8]) -> [u8; 12] {
     out
 }
 
+/// Quantize a slice of f32 values to Q5_K bytes per the ggml super-block format.
+///
+/// Encodes 256-weight blocks into 176-byte Q5_K super-blocks.
+/// Layout: d(f16,2) + dmin(f16,2) + scales(12B) + qh(32B) + qs(128B) = 176 bytes.
+/// Each weight is 5 bits: low 4 bits in `qs` (nibble), high bit in `qh`.
 pub fn quant_q5k(data: &[f32]) -> Result<Vec<u8>> {
-    quant_packed_symmetric(data, 5, None, None, None)
+    const BLOCK_SIZE: usize = 256;
+    const BLOCK_BYTES: usize = 176;
+
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let num_blocks = data.len().div_ceil(BLOCK_SIZE);
+    let mut out = Vec::with_capacity(num_blocks * BLOCK_BYTES);
+
+    for block in data.chunks(BLOCK_SIZE) {
+        let mut block_data = [0.0f32; 256];
+        block_data[..block.len()].copy_from_slice(block);
+
+        let mut sub_d1 = [0.0f32; 8];
+        let mut sub_m1 = [0.0f32; 8];
+        let mut max_d1 = 0.0f32;
+        let mut max_m1 = 0.0f32;
+
+        for s in 0..8 {
+            let sub = &block_data[s * 32..(s + 1) * 32];
+            let min_v = sub.iter().copied().fold(f32::INFINITY, f32::min);
+            let max_v = sub.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+
+            let m1 = if min_v < 0.0 { -min_v } else { 0.0 };
+            let d1 = if min_v < 0.0 {
+                (max_v - min_v) / 31.0
+            } else {
+                max_v.max(0.0) / 31.0
+            };
+
+            sub_m1[s] = m1;
+            sub_d1[s] = d1;
+            max_d1 = max_d1.max(d1);
+            max_m1 = max_m1.max(m1);
+        }
+
+        let d = if max_d1 == 0.0 { 1.0 } else { max_d1 / 63.0 };
+        let dm = if max_m1 == 0.0 { 0.0 } else { max_m1 / 63.0 };
+
+        out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        out.extend_from_slice(&f32_to_f16(dm).to_le_bytes());
+
+        let mut sc_u8 = [0u8; 8];
+        let mut m_u8 = [0u8; 8];
+        for s in 0..8 {
+            sc_u8[s] = if d > 0.0 {
+                (sub_d1[s] / d).round().clamp(1.0, 63.0) as u8
+            } else {
+                1
+            };
+            m_u8[s] = if dm > 0.0 {
+                (sub_m1[s] / dm).round().clamp(0.0, 63.0) as u8
+            } else {
+                0
+            };
+        }
+
+        let scales_bytes = pack_scale_min_k4(&sc_u8, &m_u8);
+        out.extend_from_slice(&scales_bytes);
+
+        // qh: 32 bytes holding the high bit of each 5-bit quant (256 bits = 32 bytes).
+        // Packed as: for each of 4 groups of 32, u1/u2 shift pattern matching dequant.
+        let mut qh = [0u8; 32];
+        // qs: 128 bytes holding low 4 bits (nibbles) of each quant.
+        let mut qs = [0u8; 128];
+
+        for k in 0..4 {
+            for j in 0..32 {
+                let v1 = block_data[64 * k + j];
+                let v2 = block_data[64 * k + 32 + j];
+
+                let is1 = 2 * k;
+                let is2 = 2 * k + 1;
+                let d1 = d * sc_u8[is1] as f32;
+                let m1 = dm * m_u8[is1] as f32;
+                let d2 = d * sc_u8[is2] as f32;
+                let m2 = dm * m_u8[is2] as f32;
+
+                let q1 = if d1 > 0.0 {
+                    ((v1 + m1) / d1).round().clamp(0.0, 31.0) as u8
+                } else {
+                    0
+                };
+                let q2 = if d2 > 0.0 {
+                    ((v2 + m2) / d2).round().clamp(0.0, 31.0) as u8
+                } else {
+                    0
+                };
+
+                qs[k * 32 + j] = (q1 & 0x0F) | ((q2 & 0x0F) << 4);
+                // High bits: q1's bit4 goes into qh[j] via u1 mask, q2's bit4 via u2 mask.
+                // u1 starts at 1, u2 at 2, both shift left by 2 each group.
+                let u1 = 1u8 << (2 * k);
+                let u2 = 2u8 << (2 * k);
+                if q1 & 0x10 != 0 {
+                    qh[j] |= u1;
+                }
+                if q2 & 0x10 != 0 {
+                    qh[j] |= u2;
+                }
+            }
+        }
+
+        out.extend_from_slice(&qh);
+        out.extend_from_slice(&qs);
+    }
+
+    Ok(out)
 }
 
+/// Quantize a slice of f32 values to Q6_K bytes per the ggml super-block format.
+///
+/// Encodes 256-weight blocks into 210-byte Q6_K super-blocks.
+/// Layout: ql(128B) + qh(64B) + scales(16B, i8) + d(f16, 2B) = 210 bytes.
+/// Each weight is 6 bits: low 4 bits in `ql`, high 2 bits in `qh`.
 pub fn quant_q6k(data: &[f32]) -> Result<Vec<u8>> {
-    quant_packed_symmetric(data, 6, None, None, None)
+    const BLOCK_SIZE: usize = 256;
+    const BLOCK_BYTES: usize = 210;
+
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let num_blocks = data.len().div_ceil(BLOCK_SIZE);
+    let mut out = Vec::with_capacity(num_blocks * BLOCK_BYTES);
+
+    for block in data.chunks(BLOCK_SIZE) {
+        let mut block_data = [0.0f32; 256];
+        block_data[..block.len()].copy_from_slice(block);
+
+        // Q6_K uses 16 sub-blocks of 16 weights each, each with its own i8 scale.
+        // Global d is f16.
+        let mut sub_scales = [0i8; 16];
+        for s in 0..16 {
+            let sub = &block_data[s * 16..(s + 1) * 16];
+            let max_abs = sub.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let sc = if max_abs > 0.0 {
+                (max_abs / 31.0).round() as i8
+            } else {
+                1
+            };
+            sub_scales[s] = sc.clamp(1, 63);
+        }
+
+        let max_sc = sub_scales.iter().map(|&s| s.max(1) as f32).fold(0.0f32, f32::max);
+        let d = if max_sc > 0.0 { max_sc / 63.0 } else { 1.0 };
+
+        // Normalize sub-scales to [1..63] relative to d
+        for s in 0..16 {
+            if d > 0.0 && sub_scales[s] as f32 / d > 63.0 {
+                sub_scales[s] = 63;
+            }
+        }
+
+        let mut ql = [0u8; 128];
+        let mut qh = [0u8; 64];
+
+        // Q6_K layout: 2 super-groups of 128 weights each.
+        // Each super-group: 4 sub-blocks of 32 weights.
+        // Within each sub-block of 32: pairs of 16, interleaved:
+        //   q1 = (ql[l] & 0x0F) | ((qh[l] & 0x03) << 4)   - offset 0
+        //   q2 = (ql[l+32] & 0x0F) | ((qh[l] & 0x0C) << 2) - offset 32
+        //   q3 = (ql[l] >> 4) | ((qh[l] & 0x30) >> 0)      - offset 64
+        //   q4 = (ql[l+32] >> 4) | ((qh[l] & 0xC0) >> 2)   - offset 96
+        for sg in 0..2 {
+            let sg_base = sg * 128;
+            for l in 0..32 {
+                // 4 weights at positions within this super-group:
+                let w0 = block_data[sg_base + l];
+                let w1 = block_data[sg_base + 64 + l];
+                let w2 = block_data[sg_base + l + 32];
+                let w3 = block_data[sg_base + 96 + l];
+
+                let is = l / 16; // sub-block index within this super-group (0 or 1)
+                let sc_idx = sg * 8 + is * 4;
+
+                let quantize_q6 = |v: f32, sc: i8| -> u8 {
+                    if sc > 0 {
+                        ((v / (d * sc as f32)).round() + 32.0).clamp(0.0, 63.0) as u8
+                    } else {
+                        32
+                    }
+                };
+
+                let q1 = quantize_q6(w0, sub_scales[sc_idx]);
+                let q2 = quantize_q6(w2, sub_scales[sc_idx + 2]);
+                let q3 = quantize_q6(w1, sub_scales[sc_idx + 1]);
+                let q4 = quantize_q6(w3, sub_scales[sc_idx + 3]);
+
+                let ql_off = sg * 64;
+                let qh_off = sg * 32;
+
+                ql[ql_off + l] = (q1 & 0x0F) | ((q3 & 0x0F) << 4);
+                ql[ql_off + l + 32] = (q2 & 0x0F) | ((q4 & 0x0F) << 4);
+                qh[qh_off + l] = ((q1 >> 4) & 0x03)
+                    | (((q2 >> 4) & 0x03) << 2)
+                    | (((q3 >> 4) & 0x03) << 4)
+                    | (((q4 >> 4) & 0x03) << 6);
+            }
+        }
+
+        out.extend_from_slice(&ql);
+        out.extend_from_slice(&qh);
+        out.extend_from_slice(
+            &sub_scales.map(|s| s as u8),
+        );
+        out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+    }
+
+    Ok(out)
 }
 
 /// Quantize f32 values to FP4 (E2M1) bytes.
@@ -1868,11 +2093,11 @@ pub fn quant_fp4_block16(data: &[f32], block_size: usize) -> Result<Vec<u8>> {
                 (v / effective_scale).clamp(-1.0, 1.0)
             };
 
-            // Nearest neighbor search in FP4_E2M1_LUT
+            // Nearest neighbor search in FP4_UNIFORM_LUT
             let mut code = 0;
             let mut min_diff = f32::MAX;
             for c in 0..16 {
-                let diff = (normalized - FP4_E2M1_LUT[c]).abs();
+                let diff = (normalized - FP4_UNIFORM_LUT[c]).abs();
                 if diff < min_diff {
                     min_diff = diff;
                     code = c;
@@ -1970,27 +2195,9 @@ fn quant_packed_symmetric(
 pub fn rewrite_tensor_data(data: &[f32], plan: &TensorRewritePlan) -> Result<RewrittenTensorData> {
     let rewritten_bytes = match plan.target {
         QuantFormat::Q8_0 => quant_q80(data)?,
-        QuantFormat::Q4K => quant_packed_symmetric(
-            data,
-            4,
-            plan.importance.as_deref(),
-            plan.curvature.as_deref(),
-            Some(&plan.shape),
-        )?,
-        QuantFormat::Q5K => quant_packed_symmetric(
-            data,
-            5,
-            plan.importance.as_deref(),
-            plan.curvature.as_deref(),
-            Some(&plan.shape),
-        )?,
-        QuantFormat::Q6K => quant_packed_symmetric(
-            data,
-            6,
-            plan.importance.as_deref(),
-            plan.curvature.as_deref(),
-            Some(&plan.shape),
-        )?,
+        QuantFormat::Q4K => quant_q4k(data)?,
+        QuantFormat::Q5K => quant_q5k(data)?,
+        QuantFormat::Q6K => quant_q6k(data)?,
         QuantFormat::Fp4 => quant_fp4(data)?,
         QuantFormat::Nf4 => quant_nf4(data)?,
         QuantFormat::Fp8 => quant_fp8(data)?,
@@ -2021,7 +2228,7 @@ pub fn quant_iq4nl(data: &[f32]) -> Result<Vec<u8>> {
     for chunk in data.chunks(SUPER) {
         let max_val = chunk.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
         let scale = if max_val > 0.0 {
-            max_val / 34.56951
+            max_val / 127.0
         } else {
             1.0
         };
@@ -2039,8 +2246,8 @@ pub fn quant_iq4nl(data: &[f32]) -> Result<Vec<u8>> {
             let mag = val.abs() / scale;
             let mut best_idx = 0;
             let mut best_err = f32::MAX;
-            for (idx, &entry) in IQ4_NL_CODEBOOK.iter().enumerate() {
-                let err = (mag - entry).abs();
+            for (idx, &entry) in KVALUES_IQ4NL.iter().enumerate() {
+                let err = (mag - entry.abs()).abs();
                 if err < best_err {
                     best_err = err;
                     best_idx = idx;

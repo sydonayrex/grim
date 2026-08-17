@@ -367,7 +367,8 @@ extern "C" __global__ void grim_quantized_matmul_q8_0(const float* a, const unsi
     int blocks_per_row = k / 32;
     for (int b_idx = 0; b_idx < blocks_per_row; ++b_idx) {
         float scale = b_scales[col * blocks_per_row + b_idx];
-        int b_offset = (col * blocks_per_row + b_idx) * 32;
+        // Q8_0 block: 2-byte f16 scale + 32 i8 codes = 34 bytes.
+        int b_offset = (col * blocks_per_row + b_idx) * 34 + 2;
         int a_offset = row * k + b_idx * 32;
         for (int i = 0; i < 32; ++i) {
             signed char q = (signed char)b[b_offset + i];
@@ -1324,6 +1325,51 @@ extern "C" __global__ void grim_fused_quant_gemm_q8_0(const float* __restrict__ 
             if (q_f < -128.0f) q_f = -128.0f;
             float a_deq = q_f * scale;
             sum += a_deq * b_block[i * N];
+        }
+    }
+
+    C[row * N + col] = sum;
+}
+
+// ---- Fused quantize + GEMM: Q8_0 activations (packed, on-device dequant) ------
+// Computes C = A_quant @ B where B is stored as Q8_0 packed blocks.
+// Each Q8_0 block is 34 bytes: 2-byte f16 scale + 32 i8 codes.
+// A is f32; the kernel quantizes A on-the-fly per 32-element K-block.
+// Grid: (ceil(N/32), ceil(M/8)), Block: (32, 8).
+extern "C" __global__ void grim_fused_quant_gemm_q8_0_packed(const float* __restrict__ A,
+                                                              const unsigned char* __restrict__ B_packed,
+                                                              float* __restrict__ C,
+                                                              int M, int N, int K) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M || col >= N) return;
+
+    float sum = 0.0f;
+    int blocks_per_row = K / 32;
+
+    for (int b_idx = 0; b_idx < blocks_per_row; ++b_idx) {
+        // Inline Q8_0 quantization of A[row, b_idx*32 .. b_idx*32+31].
+        const float* a_block = A + row * K + b_idx * 32;
+        float amax = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            float a = fabsf(a_block[i]);
+            if (a > amax) amax = a;
+        }
+        float a_scale = (amax == 0.0f) ? 1.0f : (amax / 127.0f);
+
+        // Q8_0 weight block: 2-byte f16 scale + 32 i8 codes = 34 bytes.
+        int packed_block_idx = col * blocks_per_row + b_idx;
+        int b_off = packed_block_idx * 34;
+        unsigned short scale_bits = ((unsigned int)B_packed[b_off + 1] << 8) | B_packed[b_off];
+        float w_scale = grim_f16_to_f32(scale_bits);
+        const unsigned char* w_codes = B_packed + b_off + 2;
+
+        for (int i = 0; i < 32; ++i) {
+            float q_f = (a_scale == 0.0f) ? 0.0f : rintf(a_block[i] / a_scale);
+            if (q_f > 127.0f) q_f = 127.0f;
+            if (q_f < -128.0f) q_f = -128.0f;
+            float a_deq = q_f * a_scale;
+            sum += a_deq * ((float)(signed char)w_codes[i] * w_scale);
         }
     }
 
