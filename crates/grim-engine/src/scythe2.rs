@@ -2308,7 +2308,7 @@ mod tests {
                 .chain(expert_plan.d_x_ptrs.iter())
             {
                 if let Some(ptr) = ptr_opt {
-                    rccl_handle.sum_gradients_device(*ptr, *ptr, count, 0)?;
+                    rccl_handle.sum_gradients_device(*ptr, *ptr, count, 0, device.ordinal)?;
                 }
             }
         }
@@ -2328,7 +2328,7 @@ mod tests {
         let _ = device;
         if let Some(rccl_handle) = rccl {
             for ptr in router_plan.d_gate_w_ptrs.iter().flatten() {
-                rccl_handle.sum_gradients_device(*ptr, *ptr, count, 0)?;
+                rccl_handle.sum_gradients_device(*ptr, *ptr, count, 0, device.ordinal)?;
             }
         }
         Ok(())

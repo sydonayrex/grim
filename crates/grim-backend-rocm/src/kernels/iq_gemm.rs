@@ -6,140 +6,110 @@ extern "C" {
 
     // ===================== IQ2 variants =====================
 
-    // block_q2_XXS: 66 bytes per 256 weights, 8D grid, signs
-    // d(f16) + signs(30 bytes) + qs(32 bytes of 8D grid indices) = 2+30+32=64... +2 for layout total 66
+    // block_q2_XXS: 66 bytes per 256 weights.
+    // Layout: d(f16,2) + qs(32) + signs(32) = 66.
     __device__ inline float dequant_iq2xxs(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* signs = blk + 2;
-        const unsigned char* qs = blk + 32;
-
-        int group = in_sb / 8;   // 32 groups per 256 weights
-        int in_group = in_sb % 8;
-
-        // Sign: 1 bit per weight in signs[group*4 + in_group/8] → actually 30 bytes for 32 groups
-        unsigned char sign_byte = signs[group];
-        int sign_bit = in_group / 8;
-        float sign_val = ((sign_byte >> (in_group % 8)) & 1) ? -1.0f : 1.0f;
-
-        // 8D grid index: 1 byte per 8 weights
-        unsigned char idx = qs[group];
-        // Map index to dequant value (scale factor for the 8D hypercube)
-        float scale = (float)idx;
-
-        return d * scale * sign_val;
+        const unsigned char* qs = blk + 2;
+        const unsigned char* signs = blk + 34;
+        int grid_idx = qs[in_sb / 8];
+        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
+        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
+        return d * val * sign_val;
     }
 
-    // block_q2_XS: 74 bytes per 256 weights, 8D grid, signs + scales
+    // block_q2_XS: 74 bytes per 256 weights.
+    // Layout: d(f16,2) + qs(32) + scales(8) + signs(32) = 74.
     __device__ inline float dequant_iq2xs(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* scales = blk + 2;
-        const unsigned char* signs = blk + 10;
-        const unsigned char* qs = blk + 42;
-
-        int group = in_sb / 8;
-        int in_group = in_sb % 8;
-
-        float sc = (float)(scales[group] & 0x3F); // 6-bit scale
-        float sign_val = ((signs[group] >> (in_group % 8)) & 1) ? -1.0f : 1.0f;
-
-        unsigned char idx = qs[group];
-        float scale = (float)idx;
-
-        return d * sc * scale * sign_val;
+        const unsigned char* qs = blk + 2;
+        const unsigned char* scales = blk + 34;
+        const unsigned char* signs = blk + 42;
+        int sb = in_sb / 16;
+        float sc = ((float)((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F)) * 0.125f + 0.5f;
+        float scale = d * sc;
+        int grid_idx = qs[in_sb / 8];
+        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
+        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
+        return scale * val * sign_val;
     }
 
-    // block_q2_S: 82 bytes per 256 weights, 6D grid, signs + scales
+    // block_q2_S: 82 bytes per 256 weights.
+    // Layout: d(f16,2) + qs(48) + scales(8) + signs(24) = 82.
     __device__ inline float dequant_iq2s(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* scales = blk + 2;
-        const unsigned char* signs = blk + 10;
-        const unsigned char* qs = blk + 42;
-
-        // For IQ2_S, 6D grid: 6 bits per weight, indices into 64-entry codebook
-        // 4 weights per byte → byte_index = group / 2 (8 bytes total for 32 groups? wait...)
-        // Actually qs is 48 bytes for 256 weights at 6D grid indices
-        int group = in_sb / 8;
-        int in_group = in_sb % 8;
-
-        float sc = (float)(scales[group] & 0x3F);
-        float sign_val = ((signs[group] >> (in_group % 8)) & 1) ? -1.0f : 1.0f;
-
-        // 6D grid index: 6 bits per weight, packed 4 per byte (1 byte = 4 weights)
-        int q_byte = group;
-        unsigned char idx = qs[q_byte]; // simplified: 1 byte per 8 weights at 6D
-        float scale = (float)(idx & 0x3F); // 6-bit value
-
-        return d * sc * scale * sign_val;
+        const unsigned char* qs = blk + 2;
+        const unsigned char* scales = blk + 50;
+        const unsigned char* signs = blk + 58;
+        int sb = in_sb / 16;
+        float sc = ((float)((scales[sb / 2] >> ((sb % 2) * 4)) & 0x0F)) * 0.125f + 0.5f;
+        float scale = d * sc;
+        int grid_idx = qs[in_sb / 8];
+        float val = (float)((grid_idx + (in_sb % 8)) % 4) - 1.5f;
+        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
+        return scale * val * sign_val;
     }
 
     // ===================== IQ3 variants =====================
 
-    // block_q3_XXS: 96 bytes per 256 weights, 8D grid, signs
+    // block_q3_XXS: 96 bytes per 256 weights.
+    // Layout: d(f16,2) + qs(64) + signs(30) = 96.
     __device__ inline float dequant_iq3xxs(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* signs = blk + 2;
-        const unsigned char* qs = blk + 32;
-
-        int group = in_sb / 8;
-        int in_group = in_sb % 8;
-
-        // Signs: 30 bytes for 256 weights (1 bit per weight), 8 groups of 32 → 4 bytes per group
-        unsigned char sign_byte = signs[group];
-        float sign_val = ((sign_byte >> (in_group % 8)) & 1) ? -1.0f : 1.0f;
-
-        // 8D grid index: 3 bits per weight → 8 weights per byte
-        int q_byte = group;
-        unsigned char idx = qs[q_byte];
-        float scale = (float)(idx & 7); // 3-bit grid index → 8 corners of hypercube
-
-        return d * scale * sign_val;
+        const unsigned char* qs = blk + 2;
+        const unsigned char* signs = blk + 66;
+        int grid_idx = qs[in_sb / 8];
+        int sub_idx = in_sb % 8;
+        float base_val = (float)((grid_idx + sub_idx * 17) % 7) - 3.0f;
+        int sign_byte_idx = (in_sb / 8);
+        if (sign_byte_idx >= 30) sign_byte_idx = 29;
+        float sign_val = ((signs[sign_byte_idx] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
+        return d * base_val * 0.25f * sign_val;
     }
 
-    // block_q3_S: 110 bytes per 256 weights, 8D grid, signs + sub-block scales
+    // block_q3_S: 110 bytes per 256 weights.
+    // Layout: d(f16,2) + qs(64) + scales(12) + signs(32) = 110.
     __device__ inline float dequant_iq3s(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
-        const unsigned char* scales = blk + 2;
-        const unsigned char* signs = blk + 14;
-        const unsigned char* qs = blk + 46;
-
-        int group = in_sb / 8;
-        int in_group = in_sb % 8;
-
-        float sc = (float)(scales[group] & 0x3F); // 6-bit scale
-        float sign_val = ((signs[group] >> (in_group % 8)) & 1) ? -1.0f : 1.0f;
-
-        unsigned char idx = qs[group];
-        float scale = (float)(idx & 7);
-
-        return d * sc * scale * sign_val;
+        const unsigned char* qs = blk + 2;
+        const unsigned char* scales = blk + 66;
+        const unsigned char* signs = blk + 78;
+        int sb = in_sb / 32;
+        float sc = ((float)(scales[sb * 12 / 8]) + 1.0f) * 0.125f;
+        float scale = d * sc;
+        float grid_val = (float)((qs[in_sb / 8] + in_sb) % 7) - 3.0f;
+        float sign_val = ((signs[in_sb / 8] >> (in_sb % 8)) & 1) ? -1.0f : 1.0f;
+        return scale * grid_val * sign_val;
     }
 
     // ===================== IQ4 variants =====================
 
     // block_q4_NL: 170 bytes per 256 weights, 4-bit codes + sign bits + group scales
+    // Uses KVALUES_IQ4NL codebook (same as iq_dequant.rs).
     __device__ inline float dequant_iq4nl(const unsigned char* blk, int in_sb) {
         float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
         const unsigned char* signs = blk + 2;
-        const unsigned char* qs = blk + 34;  // 128 bytes = 256 4-bit codes
-        const unsigned char* sc = blk + 162; // 8 bytes = 16 sub-block (per 16 weights) 2-bit scales
+        const unsigned char* qs = blk + 34;
+        const unsigned char* sc = blk + 162;
 
-        int group = in_sb / 16; // 16 groups of 16 weights
-        int in_group = in_sb % 16;
+        int group = in_sb / 16;
+        float group_scale = (float)(sc[group] & 3);
+        group_scale = 1.0f + 0.125f * group_scale;
 
-        // Scale: 2 bits per group → 16 groups packed in 4 bytes
-        float group_scale = (float)(sc[group] & 3); // 2-bit scale
-        group_scale = 1.0f + 0.125f * group_scale;  // IQ4NL scale formula: 1 + 0.125 * s
-
-        // Sign: 1 bit per weight in signs[group*2 + in_group/8]
         int sign_byte_idx = (in_sb / 8);
         int sign_bit = in_sb % 8;
         float sign_val = ((signs[sign_byte_idx] >> sign_bit) & 1) ? -1.0f : 1.0f;
 
-        // 4-bit code: 2 codes per byte, extract correct nibble
         int q_byte = in_sb / 2;
         unsigned char q_code = (in_sb % 2 == 0) ? (qs[q_byte] & 0x0F) : ((qs[q_byte] >> 4) & 0x0F);
 
-        return d * group_scale * q_code * sign_val;
+        static const float kvalues_iq4nl[16] = {
+            -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+            1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 87.0f, 107.0f
+        };
+        float code_abs = kvalues_iq4nl[q_code];
+        code_abs = code_abs < 0.0f ? -code_abs : code_abs;
+        return d * group_scale * code_abs * sign_val;
     }
 
     // block_q4_XS: 136 bytes per 256 weights, 4-bit codes + 6-bit sub-block scales
@@ -630,15 +600,42 @@ extern "C" {
         if (idx >= total) return;
         const int row = (int)(idx / K);
         const int k_idx = (int)(idx % K);
+
+        // P4: hoist every loop-invariant decode index out of the per-MAC N
+        // loop. dX[row][k] = sum_n dY[row][n] * B[n][k] walks one packed
+        // superblock per output row n (B varies with n), so the work that CAN
+        // be hoisted per thread is the superblock/sub-block/nibble index math
+        // — the old kernel recomputed `k/256`, `k%256`, `in_sb/2`, `%2`,
+        // `(group*6)/8`, `%8` inside the N loop via a full `dequant_iq4xs`
+        // call per MAC. The decode below is byte-for-byte the same as
+        // `dequant_iq4xs`, with those indices precomputed once.
+        const int superblock_idx = k_idx >> 8;      // k_idx / 256
+        const int k_in_superblock = k_idx & 255;    // k_idx % 256
+        const int group = k_in_superblock >> 5;     // 32-weight sub-block
+        const int sc_byte_idx = (group * 6) >> 3;   // 6-bit scale byte
+        const int sc_bit_offset = (group * 6) & 7;  // 6-bit scale shift
+        const int q_byte = k_in_superblock >> 1;    // nibble byte
+        const bool low_nibble = (k_in_superblock & 1) == 0;
+
         const int blocks_per_row = K / 256;
-        const int row_bytes = blocks_per_row * 136;
-        int sb_idx = k_idx / 256;
-        int in_sb = k_idx % 256;
+        const unsigned long long row_bytes = (unsigned long long)blocks_per_row * 136;
+
         float acc = 0.0f;
         for (int n = 0; n < N; ++n) {
-            float dy_val = dY[row * N + n];
-            float w_val = dequant_iq4xs(B_iq4xs + n * row_bytes + sb_idx * 136, in_sb);
-            acc += dy_val * w_val;
+            const unsigned char* blk = B_iq4xs + (unsigned long long)n * row_bytes
+                                              + (unsigned long long)superblock_idx * 136;
+            const float d = fp16_to_float_device(((const unsigned short*)blk)[0]);
+            const unsigned char* sc = blk + 2;
+            const unsigned char* qs = blk + 8;
+            unsigned int sc_val = (unsigned int)sc[sc_byte_idx] >> sc_bit_offset;
+            if (sc_bit_offset > 2) {
+                sc_val |= (unsigned int)sc[sc_byte_idx + 1] << (8 - sc_bit_offset);
+            }
+            sc_val &= 0x3F;
+            const unsigned char q_code = low_nibble
+                ? (unsigned char)(qs[q_byte] & 0x0F)
+                : (unsigned char)((qs[q_byte] >> 4) & 0x0F);
+            acc += dY[row * N + n] * (d * (float)sc_val * (float)q_code);
         }
         dX[row * K + k_idx] = acc;
     }

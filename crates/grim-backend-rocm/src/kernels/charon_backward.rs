@@ -27,9 +27,17 @@
 //! forward `grim_moe_fused_grouped`. A token routed to K>1 experts has K
 //! backward blocks; gradients into `d_x[token]` use `atomicAdd`.
 //!
-//! Device-gated: the HIP numeric correctness is UNVERIFIED in this sandbox
-//! (no GPU). Host-side planning helpers (`plan_*`, `validate_*`) are pure and
-//! unit-tested without a device per the verification discipline.
+//! Dispatch status (P2): the HIP kernel source (`KERNEL_SOURCE`) is written and
+//! the host-side math is validated (see `tests/charon_backward_grad_check.rs`,
+//! 7/7 green: analytical backward + finite-difference vs `MoeFfn::forward` +
+//! kernel-source structural + directional derivative). What is NOT wired is the
+//! device dispatch — there is no ROCm launch path that constructs the sorted
+//! routing arrays (`sorted_token_ids`/`sorted_expert_ids`/`sorted_weights`) and
+//! calls `grim_moe_fused_grouped_backward`. The per-weight `atomicAdd` sites and
+//! the forward `hg`/`hu` recomputation loops in the kernel are the patterns P2
+//! calls a gap; they remain until a device run verifies the kernel produces
+//! correct grads. P2 is DEFERRED to device-run; the green host-side verifier is
+//! the in-sandbox anchor.
 
 use std::ffi::c_void;
 
