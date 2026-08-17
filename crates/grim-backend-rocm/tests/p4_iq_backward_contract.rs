@@ -7,22 +7,27 @@
 //! one-thread-per-output + per-MAC full dequant, instead of the forward path's
 //! superblock-per-thread + scale-loaded-once layout.
 //!
-//! P4 is **not implemented here** — the backward kernels are HIP and device-gated,
-//! and there is no host-side backward golden in the repo to red-to-green a device
-//! kernel change. What these tests provide is the *verifier contract* a future P4
-//! change must satisfy before it can be red-to-green'd on a device run:
+//! STATUS: the representative variant (IQ4XS backward) has been rewritten —
+//! `grim_fused_dequant_backward_gemm_iq4xs` now does per-thread superblock: one
+//! thread handles a 256-weight superblock, dequant all 256 codes once via
+//! `dequant_iq4xs` in a `#pragma unroll` loop, then MAC across N. The per-MAC
+//! `sb_idx`/`in_sb` div/mod and per-MAC-per-N dequant call are removed. The
+//! device verifier (`p4_iq4xs_backward_device_verifier.rs`) must still be run on
+//! a ROCm GPU to confirm RMS rel err <= 0.05 vs the host reference — that is the
+//! red-to-green anchor for P4.
 //!
-//! 1. **The current bad pattern is named explicitly** so a P4 change cannot
-//!    regress silently: the test asserts the representative variant's source
-//!    currently still contains the per-MAC `div/mod` scalar pattern — i.e. the
-//!    test is *red on the current code* in the sense that the bad pattern exists
-//!    and must be removed by a future P4 change. (This is a structural assertion
-//!    about the kernel source, not a runtime device test.)
+//! What these tests provide:
+//!
+//! 1. **The bad-pattern-removed assertion** — the structural test
+//!    `p4_iq4xs_backward_source_has_no_per_mac_div_mod_pattern` asserts the
+//!    rewritten kernel source does NOT contain the per-MAC `div/mod` pattern.
+//!    This is the regression gate: any future change that reintroduces the
+//!    per-MAC div/mod fails this test.
 //!
 //! 2. **A host-side reference decomposition that a device verifier can compare
 //!    against** — for a representative variant (IQ4_XS), define a deterministic
 //!    FP32 weight matrix B and compute the backward reference dX = dY @ B^T
-//!    host-side, so a future device run can compare the device backward output
+//!    host-side, so the device verifier can compare the device backward output
 //!    against this reference within tolerance. (Host-side; no device needed.)
 //!
 //! 3. **The host reference is self-consistent and non-trivial** — a deterministic
@@ -31,8 +36,8 @@
 //!
 //! Representative variant chosen: IQ4_XS, because `dequant_iq4xs` + `quant_iq4xs`
 //! both exist host-side in `grim-quant`, so the reference chain is buildable here.
-//! P4's "done looks like" is: at least one variant proven before expansion — a
-//! device run with this contract as the verifier would satisfy that.
+//! P4's "done looks like" is: at least one variant proven before expansion — the
+//! device verifier run against this contract would satisfy that.
 
 use grim_quant::dequant_iq4xs;
 
@@ -68,26 +73,66 @@ fn iq4xs_backward_dx_host(dY: &[f32], b_deq: &[f32], m: usize, n: usize, k: usiz
     dx
 }
 
-/// Assert the representative variant's source currently still contains the
-/// per-MAC scalar `div/mod` pattern that P4 calls a gap. This is intentionally
-/// a *structural assertion about the current kernel source* — it is red in the
-/// sense that the bad pattern exists and must be removed by a future P4 change.
-/// A P4 kernel change that removes the per-MAC `div/mod` would make this
-/// assertion fail, which is the intended red-to-green signal for that change.
+/// The IQ4XS backward rewrite (P4) removes the per-MAC `sb_idx`/`in_sb`
+/// div/mod and the per-MAC per-N-loop dequant call. The bad pattern *must not
+/// be present* in the rewritten kernel source — this is the assertion that
+/// flips red when the pattern is still there (pre-P4) and green once the
+/// rewrite lands (post-P4). A subsequent regression that reintroduces the
+/// per-MAC div/mod would fail this test.
+///
+/// NOTE: `sb_idx`/`in_sb` appear elsewhere in `iq_gemm.rs` (in the per-format
+/// `dequant_*` helper signatures and in the other backward kernels), so we
+/// scope the check to ONLY the text of the `grim_fused_dequant_backward_gemm_iq4xs`
+/// kernel, not the whole file.
 #[test]
-fn p4_iq4xs_backward_source_currently_still_has_per_mac_div_mod_pattern() {
+fn p4_iq4xs_backward_source_has_no_per_mac_div_mod_pattern() {
     let src = std::include_str!("../src/kernels/iq_gemm.rs");
     assert!(
         src.contains("grim_fused_dequant_backward_gemm_iq4xs"),
         "P4: IQ4XS backward kernel source must be present for the contract test"
     );
+    // Extract ONLY the iq4xs backward kernel text (from its `__global__` line to
+    // the closing `}` before the next kernel or EOF).
+    let kernel_start = src.find("__global__ void grim_fused_dequant_backward_gemm_iq4xs")
+        .expect("P4: IQ4XS backward kernel __global__ line must be present");
+    // Find the end: the next `__global__` or the closing `}` of the extern block.
+    let rest = &src[kernel_start..];
+    let next_global = rest.find("\n    __global__").unwrap_or(rest.len());
+    let kernel_text = &rest[..next_global];
+    // The rewritten kernel must NOT still contain the per-MAC sb_idx/in_sb
+    // div/mod pattern that P4 calls a gap. Scoped to this kernel only.
+    //
+    // NOTE: the comment at the top of the kernel may reference "k_idx / 256"
+    // descriptively (explaining the superblock_idx computation), and the
+    // `blocks_per_row = K / 256` line is structural (not per-MAC). The P4 gap
+    // is the *per-output-thread* `int sb_idx = k_idx / 256; int in_sb = k_idx
+    // % 256;` declaration plus the per-N-loop dequant call using those — i.e.
+    // both symbols appearing as local variable declarations used per-MAC.
+    // We check that the kernel does NOT declare both as local vars (the "sb_idx"
+    // and "in_sb" tokens appearing as declarations, not as comment references or
+    // in the blocks_per_row structural line).
+    let has_sb_idx_decl = kernel_text.contains("int sb_idx") || kernel_text.contains("const int sb_idx");
+    let has_in_sb_decl = kernel_text.contains("int in_sb") || kernel_text.contains("const int in_sb");
     assert!(
-        src.contains("sb_idx") && src.contains("in_sb"),
-        "P4: IQ4XS backward source currently still contains per-MAC sb_idx/in_sb (the gap)"
+        !(has_sb_idx_decl && has_in_sb_decl),
+        "P4: IQ4XS backward kernel must NOT declare per-MAC sb_idx/in_sb locals after the rewrite"
     );
+    // The per-MAC div/mod gap is `k / 256` used as a local computation (not the
+    // structural `blocks_per_row = K / 256`). Check that the kernel text does not
+    // contain a bare `k / 256` or `K / 256` used as a div outside of the
+    // `blocks_per_row` structural line and comment references.
+    //
+    // We exclude the `blocks_per_row = K / 256` line (structural, not per-MAC)
+    // and comment lines (// ...) which may reference the computation descriptively.
+    let code_lines: Vec<&str> = kernel_text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//") && !l.contains("blocks_per_row"))
+        .collect();
+    let code_text = code_lines.join("\n");
+    let has_per_mac_div = code_text.contains("k / 256") || code_text.contains("K / 256");
     assert!(
-        src.contains("k / 256") || src.contains("K / 256"),
-        "P4: IQ4XS backward source contains the per-MAC superblock index div"
+        !has_per_mac_div,
+        "P4: IQ4XS backward kernel must NOT contain per-MAC k/K / 256 div after the rewrite"
     );
 }
 
