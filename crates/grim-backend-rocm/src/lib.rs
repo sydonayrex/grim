@@ -143,7 +143,7 @@ pub use crate::device::util::{
 // ROCmDevice itself: large struct + every impl lives in
 // `device::roc_device`. Re-exported here so existing callers can
 // keep using `RocmDevice::new(...)` etc. unchanged.
-pub use crate::device::roc_device::{FUSED_FORWARD_DISPATCH_STATS, RocmDevice};
+pub use crate::device::roc_device::{CharonBackwardResult, FUSED_FORWARD_DISPATCH_STATS, RocmDevice};
 
 pub use crate::rccl::RcclAllReduce;
 

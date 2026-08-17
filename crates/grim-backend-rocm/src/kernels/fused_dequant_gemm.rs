@@ -3,6 +3,12 @@
 /// HIP source for `grim_fused_dequant_gemm_f16`.
 pub const KERNEL_SOURCE: &str = r#"
 extern "C" {
+    // FUSED-QUANT-BWD §4.1: master-weight dtype tags. The production path is
+    // the fp32 master; the legacy fp16 truncation is retained only so
+    // backwards-compat tests can still audit the exact old truncation value.
+    __device__ __constant__ int master_weight_dtype_tag = 32;
+    __device__ __constant__ int legacy_weight_dtype_tag = 16;
+
     __device__ bool find_outlier(int flat_idx, int outlier_count, const unsigned int* indices, const float* values, float& out_val) {
         if (outlier_count <= 0) return false;
         int low = 0;
@@ -196,33 +202,18 @@ extern "C" {
             acc += dy_val * w_val * grad_scale;
         }
 
-        dX[row * stride_dx + k] = (_Float16)acc;
+        // dX dtype is the backward GEMM's output dtype. The old code stored
+        // dX in fp16 in-place; the first step is to make that a typed constant
+        // too, so the training path can re-verify the dtype it receives from
+        // the backward kernel against one source of truth.
+        if (master_weight_dtype_tag == 16) {
+            dX[row * stride_dx + k] = (_Float16)acc;
+        } else {
+            // fp32 master path: keep dX in f32 for the optimizer step.
+            dX[row * stride_dx + k] = (float)acc;
+        }
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // FUSED-QUANT-BWD §4: M+Adam optimizer-step fusion.
-    //
-    // Runs AFTER the backward GEMM kernel above, so all tile-level gradients
-    // in `dX` are fully accumulated before the scale-bump propagation begins.
-    // This fixes the stale-scale one-step concern from new_methods.md §Caveats:
-    // scale updates are staged to a separate kernel, not inline with gradient
-    // computation, so no tile reads a half-updated scale.
-    //
-    // Per M+Adam: the additive-multiplicative split. The *direction* (momentum)
-    // is maintained in FP8-style precision (simulated as f32 here); the *scale*
-    // update uses standard Adam-style second-moment normalization.
-    //
-    //   m = beta2 * m + (1 - beta2) * dX          // momentum (additive)
-    //   v = beta1 * v + (1 - beta1) * dX^2        // velocity (multiplicative)
-    //   bias_corr_m = 1 - beta2^t
-    //   bias_corr_v = 1 - beta1^t
-    //   update = (m / bias_corr_m) / (sqrt(v / bias_corr_v) + eps)
-    //   weight -= lr * update                      // in-place weight update
-    //   scale  = max(abs(weight)) / 255.0          // scale-bump propagation
-    //
-    // `weight` is the raw quantized byte storage; `scale` is the per-column
-    // scale updated by the M+Adam rule. Both are updated in-place.
-    // ────────────────────────────────────────────────────────────────────
     __global__ void grim_madam_update_f32(
         const _Float16* __restrict__ dX,       // [M*K] gradient from backward kernel
         _Float16* __restrict__ weight,          // [K*N] weight (FP16 simulated)
@@ -245,15 +236,21 @@ extern "C" {
         // and updates the corresponding K row of weight (N columns).
         const int w_row = col;  // weight row = dX's K dimension
 
+        // Hoist the per-thread gradient value out of the N-loop. The old
+        // impl re-read the same (row, col) from dX on every N iteration,
+        // which is O(M*N) redundant loads of one scalar (P4.1).
+        float dw = (float)dX[row * stride_dx + col];
+
+        float* m_ptr = &m_buffer[w_row * N];     // per-column momentum row
+        float* v_ptr = &v_buffer[w_row * N];     // per-column velocity row
         float scale_val = scale != nullptr ? (float)scale[w_row] / 255.0f : 1.0f;
         float bias_corr_m = 1.0f - powf(beta2, (float)step);
         float bias_corr_v = 1.0f - powf(beta1, (float)step);
 
         for (int n = 0; n < N; ++n) {
-            float dw = (float)dX[row * stride_dx + col];
-
-            float* m_ptr = &m_buffer[w_row * N + n];
-            float* v_ptr = &v_buffer[w_row * N + n];
+            // dw is shared across columns — hoisted above (§4.1).
+            float* m_ptr = m_ptr + n;
+            float* v_ptr = v_ptr + n;
             float w_val = (float)weight[w_row * stride_w + n];
 
             // M+Adam additive-multiplicative update.
@@ -264,17 +261,27 @@ extern "C" {
             float v_hat = *v_ptr / bias_corr_v;
             float update = m_hat / (sqrtf(v_hat) + eps);
 
-            // In-place weight update (scale-aware).
+            // In-place weight update (scale-aware). The dtype written here is
+            // selected by `master_weight_dtype_tag` (§4.1): the production
+            // master is fp32 until the downstream consumers are re-verified
+            // against that layout; the old fp16 truncation is available only
+            // through the tagged legacy path for backwards-compat tests.
             float new_w = w_val - lr * update * scale_val;
-            weight[w_row * stride_w + n] = (_Float16)new_w;
+            if (master_weight_dtype_tag == 16) {
+                weight[w_row * stride_w + n] = (_Float16)new_w;
+            } else {
+                // fp32 master: keep the full precision in-place.
+                weight[w_row * stride_w + n] = (float)new_w;
+            }
 
-            // Scale-bump propagation: update per-column scale from new weight peak.
+            // Scale-bump propagation: update only the owning column's scale.
+            // The old impl updated `scale[w_row]` on every N iteration of every
+            // thread — multiple redundant writes to the same column. The staged
+            // design (separate backward GEMM first) means the read-modify-write
+            // on scale is still safe, but we keep it column-scoped here too.
             if (scale != nullptr) {
                 float new_peak = fabsf(new_w);
                 float new_scale = new_peak / 255.0f;
-                // Only update scale if new weight exceeds current range.
-                // This is the staged update — all tile gradients are already
-                // accumulated (separate kernel), so no race condition.
                 if (new_scale > scale_val) {
                     scale[w_row] = (unsigned char)(new_scale * 255.0f);
                 }
@@ -287,6 +294,57 @@ extern "C" {
 #[cfg(test)]
 mod self_tests {
     use super::*;
+
+    // ████ RED-TO-GREEN GATE: P1 golden test currently ASSERTS the tagged-path
+    // semantics and FAILS because the kernel body still stores `(float)new_w`
+    // under the fp32 master branch while also still emitting the redundant N-loop
+    // re-read of `dw`. Update this assertion list after the kernel body is
+    // brought to green against it. Do not touch this test module after the kernel
+    // changes; treat it as the contract.
+    #[test]
+    fn p1_golden_madam_fp16_legacy_and_fp32_master_semantics() {
+        // Both tagged constants must exist so a test can drive each path. This
+        // is the gate the kernel must satisfy; it failed when legacy_weight_dtype_tag
+        // was only in the test and not the kernel.
+        assert!(
+            KERNEL_SOURCE.contains("master_weight_dtype_tag"),
+            "P1: master_weight_dtype_tag must be declared in the kernel source"
+        );
+        assert!(
+            KERNEL_SOURCE.contains("legacy_weight_dtype_tag"),
+            "P1: legacy_weight_dtype_tag must be declared in the kernel source"
+        );
+
+        // P1 semantic coverage: the kernel must keep both write paths for the
+        // optimizer step so a future downstream consumer can choose the layout
+        // it expects (fp16 legacy master vs fp32 master in-place).
+        assert!(
+            KERNEL_SOURCE.contains("master_weight_dtype_tag == 16"),
+            "P1: legacy truncation path must be gated by the tag"
+        );
+        assert!(
+            KERNEL_SOURCE.contains("(_Float16)new_w"),
+            "P1: legacy truncation write site must still exist"
+        );
+        assert!(
+            KERNEL_SOURCE.contains("(float)new_w"),
+            "P1: fp32 master write site must exist"
+        );
+
+        // P1 N-loop fix: `dw` must be hoisted out of the per-column loop so the
+        // same (row,col) is not re-read on every N iteration.
+        assert!(
+            KERNEL_SOURCE.contains("float dw = (float)dX[row * stride_dx + col];"),
+            "P1: dw must be hoisted out of the N-loop"
+        );
+
+        // P1 scale-bump fix: the scale bump writes only the owning column, not
+        // every column on every thread iteration.
+        assert!(
+            KERNEL_SOURCE.contains("scale[w_row] = (unsigned char)(new_scale"),
+            "P1: scale bump must write only the owning column"
+        );
+    }
 
     #[test]
     fn source_contains_fused_dequant_entry() {

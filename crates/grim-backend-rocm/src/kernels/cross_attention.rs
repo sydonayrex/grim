@@ -12,11 +12,11 @@ extern "C" {
     /// out: [seq_len_q, num_heads, head_dim]      (row-major, stride = num_heads * head_dim)
     ///
     /// GQA: num_heads_k divides num_heads evenly. Query head `h` uses KV head
-    /// `h % num_heads_k` (interleaved grouping). The Q-projection weights must be
-    /// laid out to match this convention — if upstream weights assume contiguous
-    /// grouping (`h / (num_heads/num_heads_k)`), the kernel silently attends with
-    /// the wrong K/V head. [P1-13: doc corrected to match code; verify weight
-    /// loader convention matches.]
+    /// `h / (num_heads / num_heads_k)` (contiguous grouping), matching
+    /// `grim_qkv_attention` and every other grim GQA kernel. This is the
+    /// standard GGUF/GQA convention, so upstream K/V projection weights are
+    /// laid out for contiguous grouping. [P1-13: was interleaved
+    /// `h % num_heads_k`; corrected to contiguous to match the codebase.]
     ///
     /// Full (non-causal) cross-attention: every query attends to every
     /// encoder position. The output projection W_o is applied on the host.
@@ -41,7 +41,10 @@ extern "C" {
         const int row = (int)blockIdx.x;
         const int q_pos = row / num_heads;
         const int head = row % num_heads;
-        const int kv_head = head % num_heads_k;
+        // Contiguous GQA grouping (matches grim_qkv_attention): the first
+        // (num_heads/num_heads_k) query heads share KV head 0, and so on.
+        const int q_per_kv = num_heads / num_heads_k;
+        const int kv_head = head / q_per_kv;
         const int tid = (int)threadIdx.x;
         const int bdim = (int)blockDim.x;
 
@@ -121,5 +124,24 @@ mod tests {
         assert!(KERNEL_SOURCE.contains("grim_cross_attention"));
         assert!(KERNEL_SOURCE.contains("encoder"));
         assert!(KERNEL_SOURCE.contains("dot"));
+    }
+
+    #[test]
+    fn cross_attention_uses_contiguous_gqa_grouping() {
+        // P1-13: the kernel must map query head h -> kv_head h / q_per_kv
+        // (contiguous), matching grim_qkv_attention. Interleaved grouping
+        // (`h % num_heads_k`) would silently attend with the wrong KV head.
+        assert!(
+            KERNEL_SOURCE.contains("const int q_per_kv = num_heads / num_heads_k;"),
+            "missing contiguous q_per_kv derivation"
+        );
+        assert!(
+            KERNEL_SOURCE.contains("const int kv_head = head / q_per_kv;"),
+            "missing contiguous kv_head = head / q_per_kv"
+        );
+        assert!(
+            !KERNEL_SOURCE.contains("kv_head = head % num_heads_k"),
+            "interleaved GQA grouping (h % num_heads_k) must not be used"
+        );
     }
 }
