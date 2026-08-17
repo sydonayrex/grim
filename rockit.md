@@ -292,6 +292,310 @@ quant variant needs a CPU oracle parity gate (mirroring `q4k_dequant.rs`'s host 
 
 ---
 
+## Part G — concrete patch examples (file + line references)
+
+These are illustrative edit sketches to show what fidelity looks like when the synthesis is turned into
+edits. They are **not** applied; they are reference patches a later implementer can re-derive from the
+cited lines. Line numbers are as of the reviewed source tree and may drift.
+
+### G.1 WaveTune-style bilinear latency predictor on top of the existing autotune cache
+
+**Paper anchor:** WaveTune (2604.10187v1) §3.3, Eq. (1): `T(G, L) ≈ α·G·L + β·G + γ·L + δ`; §4.3
+fits a compact bilinear model per `⟨cmacro, w⟩` bucket; §4.4 uses two-stage runtime selection
+(macro via coefficient table, micro via anchor table).
+
+**Grim anchor:** grim already computes the wave count that WaveTune's model needs:
+- `src/kernels/qkv_attention.rs:78` — `const int num_waves = blockDim.x / wave_size;`
+- `src/kernels/qkv_attention.rs:325-329` — paged KV variant, same `num_waves = blockDim.x / WARP_SIZE` with wave partitioning
+- `src/kernels/mxfp4_gemm.rs:327-359` — `grim_mxfp4_gemm_tiled` (fixed 2D tile, K/32 loop)
+- `src/device/roc_device.rs:7986-7989` — hardcoded launch geometry in `launch_mxfp4_gemm_tiled`
+  (`block_dim = HipDim3::new(16, 16, 1)`, `grid_x = ((n+15)/16)`, `grid_y = ((m+15)/16)`)
+- `src/device/roc_device.rs:8035` — fixed `num_splits` heuristic in `launch_mxfp4_gemm_splitk`
+- `src/autotune.rs:118-150` — `LaunchConfig` struct (block_m, block_n, block_k, split_k, threads)
+- `src/autotune.rs:247-256` — `Autotuner` cache (in-memory + optional on-disk shadow)
+
+**What to add:**
+
+1. Extend `AutotuneConfig` (or add a sibling struct) to carry WaveTune model coefficients.
+   **File:** `src/autotune.rs`, near `AutotuneConfig` (line ~186).
+   **Sketch:**
+   ```rust
+   // New struct, companion to AutotuneConfig
+   #[derive(Debug, Clone, Serialize, Deserialize)]
+   pub struct WaveTuneCoeffs {
+       pub alpha: f64,  // G*L interaction term
+       pub beta:  f64,  // G marginal
+       pub gamma: f64,  // L marginal
+       pub delta: f64,  // constant offset
+       pub wave_count: u32, // w = ceil(G / N_SM) this coeffs are valid for
+       pub n_sm: u32,       // GPU SM count (cached at probe time)
+   }
+   ```
+   Then add a `HashMap<MacroConfigKey, HashMap<u32, WaveTuneCoeffs>>` (macro-config → wave-count → coeffs)
+   to `Autotuner` alongside the existing `cache: HashMap<KernelKey, AutotuneConfig>` (line 251).
+
+2. Add the wave-count + grid-size computation to the measurement path so each autotune sample records
+   `(G, L, w, c_macro, c_micro, measured_latency)` matching WaveTune's sample tuple.
+   **File:** `src/autotune.rs` or the empirical FCP fallback near `fcp_fallback_tile_search`.
+   **Sketch:** compute `G = grid_m * grid_n`, `L = ceil(K / T_K)`, `w = ceil(G / n_sm)` from the launch
+   geometry (already available from `LaunchConfig` + the GEMM dims) and store alongside the latency.
+
+3. Add the bilinear prediction + dual-table retrieval at the top of the launch-dispatch path so the
+   predicted winner can be retrieved at microsecond cost for hot/unseen shapes.
+   **File:** `src/device/roc_device.rs` near `launch_mxfp4_gemm_tiled` (line ~7948) or in a new
+   `autotune_dispatch` helper called from `matmul_op` / `matmul_with_solution`.
+   **Sketch:**
+   ```rust
+   // Stage I (WaveTune §4.4): for each candidate macro-config c_macro,
+   // compute G, L, w = ceil(G / n_sm), look up coeffs theta{c_macro, w},
+   // predict T = alpha*G*L + beta*G + gamma*L + delta, pick min.
+   // Stage II: retrieve micro-config from anchor table keyed on (c_macro, w, L).
+   ```
+   The wave-count term `ceil(G / N_SM)` is directly computable from existing data (grid_m*grid_n and
+   the SM count from `HardwareSpec`), so no new probe is required — this mirrors WaveTune §3.2's
+   derivation of `w = ceil(G / N_SM)`.
+
+4. Keep measured compile+time search as the cold-shape path and use the model for hot/unseen shapes —
+   that's the WaveTune trade-off resolution (accuracy of search + microsecond overhead of heuristics).
+   **File:** the dispatch path that currently calls `jit_compile_or_cache` + `hipModuleLaunchKernel` +
+   `hipEvent` timing; add a model-lookup early-exit before the compile when a cached coeffs entry exists
+   for the (shape_class, arch, w) bucket.
+
+### G.2 MXFP4 tiled path parametrization (RVjit-style) + WaveTune auto-tune
+
+**Paper anchor:** RVjit (IPDPS 2026) — JIT assembler parametrizes register grouping, loop ordering, kernel
+shape at code-gen time based on probed hardware; 1.43× over hand-tuned GEMM on RISC-V. Grim already JITs
+full HIP source via hiprtc, so the lesson transfers: parametrize the micro-kernel at JIT time and
+auto-tune per arch + shape.
+
+**Grim anchor:**
+- `src/kernels/mxfp4_gemm.rs:327-359` — `grim_mxfp4_gemm_tiled`: one thread per (row, col), K/32 loop,
+  hardcoded `exps_per_row = K / 32`
+- `src/device/roc_device.rs:7986-7989` — hardcoded `block_dim = HipDim3::new(16, 16, 1)` launch
+- `src/device/roc_device.rs:7968-7977` — fixed skinny-M heuristic routing to split-K
+- `src/device/roc_device.rs:8035` — fixed `num_splits` selection
+- `src/kernels/mxfp4_gemm.rs:368-406` — `grim_mxfp4_gemm_splitk`: split-K variant
+- `src/kernels/scythe_persistent.rs:148-245` — persistent dispatch kernel; `quant_mode` branch at
+  line ~215 (`if (moe->quant_mode == MOE_QUANT_FP32)`)
+
+**What to add:**
+
+1. Parametrize the MXFP4 tiled micro-kernel at JIT time. Replace the hardcoded tile (16×16) and K/32
+   loop with a templated tile in the HIP source string, generated per (arch, shape) by
+   `compute_kernel_source_with_spec` (called at `src/multi_gpu_launch.rs:64` and in `roc_device.rs`).
+   **File:** `src/kernels/mxfp4_gemm.rs` (the kernel source string near line 327), generated from
+   `src/kernels/source_asm.rs` style machinery.
+   **Sketch:** the HIP source should take tile_m, tile_n, k_loop_tile as `#define`-generated constants
+   (or template args) so the same JIT mechanism that already compiles the source can produce variants
+   with different tile geometries; the launch geometry in `launch_mxfp4_gemm_tiled` (line 7986) then
+   reads those constants instead of hardcoding `HipDim3::new(16, 16, 1)`.
+
+2. Add the auto-tune loop for these tile params per (arch, M, N, K), gated by CPU-oracle parity.
+   **File:** `src/autotune.rs` (extend the candidate generator / FCP fallback) or a new mxpf4-specific
+   tuner paired with the existing `Autotuner` cache.
+   **Sketch:** candidate set = {(tile_m ∈ {8,16,32}, tile_n ∈ {8,16,32}, k_loop_tile ∈ {8,16,32})}
+   filtered by LDS budget (`LaunchConfig::smem_cost` pattern at `src/autotune.rs:130-132`) and the
+   MXFP4 K%32 constraint already enforced at `src/device/roc_device.rs:7960`; measure each on-GPU and
+   cache the winner per (arch, M, N, K).
+
+3. Pair with the WaveTune predictor (G.1) so the tuned geometry for a given (M,N,K) is retrievable at
+   runtime without a fresh compile+time — same architecture as RVjit's "probed hardware → parametrize →
+   select" loop, but with a microsecond retrieval layer on top.
+
+4. Extend the persistent dispatch `quant_mode` arm at `src/kernels/scythe_persistent.rs:215` to call a
+   fused MoE-MXFP4 kernel (see G.4) instead of routing through per-expert standalone MXFP4 GEMM.
+
+### G.3 TTX-style predictor from grim's own measured data (offline training)
+
+**Paper anchor:** TTX (ISPASS 2026) — XGBoost predictor over (input shape, tuning params, IR-level features),
+~10% MAPE on compute-heavy ops, top-50 reaches 95% of oracle, training ~3-4s on EPYC for 20k points.
+
+**Grim anchor:** `src/autotune.rs:247-256` (cache), the empirical FCP fallback compile+time path, and the
+measurement records captured in G.1 step 2.
+
+**What to add:**
+
+1. Persist the measured samples `(shape, tile_config, format, arch, G, L, w, measured_latency)` to disk
+   as grim runs autotune / FCP fallback, building the training set TTX needs.
+   **File:** extend `Autotuner`'s `cache_dir` shadow (line 255, `src/autotune.rs`) or add a parallel
+   measurement log.
+
+2. Train an XGBoost (or small GBT) model offline over those samples; for ROCm, start with source-level
+   static features (shared memory bytes from `__shared__` declarations, thread count from launch bounds /
+   grid-block geometry, estimated wave count from grid/block/wavefront, tile params) because grim on ROCm
+   doesn't expose PTX-style IR trivially — full hsaco/ISA feature extraction is a later step.
+   **File:** a new offline training script (Python/XGBoost) consuming the persisted samples; not in the
+   Rust crate. The runtime side (Rust) only needs to load the trained model and call it to pre-filter the
+   candidate set before any compile.
+
+3. Integrate the predictor as an early filter in the dispatch path so hot/unseen shapes get a predicted
+   winner without compile+time.
+   **File:** `src/device/roc_device.rs` near the GEMM dispatch (e.g., `matmul_op` / `matmul_with_solution` —
+   search for those symbols in `src/device/roc_device.rs` to place the call), or in the autotune lookup
+   path at `src/autotune.rs:291-293` (`lookup`).
+
+### G.4 Multi-GPU transfer/schedule policy (Parallel Kittens-style)
+
+**Paper anchor:** Parallel Kittens (MLSys 2026) — three factors: transfer mechanism (copy engine vs TMA vs
+register ops, different saturation by message size), scheduling (inter-SM vs intra-SM overlap), design
+overheads (NCCL-like sync/buffering choices can cost 1.7-4.5×). Copy engine saturates >256MB; register
+ops needed for in-network reduction.
+
+**Grim anchor:**
++- `src/rccl.rs:56-80` — RCCL bindings (NCCL), `ncclAllReduce`, in-place device reduce
++- `src/rccl.rs:604-655` — `RcclAllReduce::sum_gradients_device` (in-place device all-reduce via `ncclAllReduce`)
++- `src/rccl.rs:449-490` — `p2p_memcpy_async` (hipMemcpyPeerAsync wrapper) + tensor-parallel all-reduce hook (P2-WI-2 / WI-R3 canonical call site)
++- `src/rccl.rs:492-498` — single canonical call site for TP all-reduce; designed as interception point for a future `CommComputeOverlapConfig` stream-overlap
+- `src/p2p_route.rs:40-49` — `RouteLink` enum (PeerDirect, HostBounce)
+- `src/peer_access.rs:47-58` — `P2PStatus` enum (P2P, Pcie, Host), peer probe before any peer memcpy
+- `src/peer_access.rs:33-45` — HIP symbols re-declared locally (hipDeviceCanAccessPeer, hipDeviceEnablePeerAccess)
+- `src/multi_gpu_launch.rs:25-99` — `launch_multi_gpu_kernel`, M-shard split + per-device JIT + RCCL all-reduce,
+  lines 86-96 do the RCCL launch
+- `src/kernels/comm_fuse.rs:20-34` — `grim_comm_fuse_p2p_epilogue` atomicAdd to peer buffer (register-level
+  in-network reduction)
+- `src/kernels/comm_fuse.rs:36-69` — `grim_fused_allreduce_rms_norm` fused RMSNorm+allreduce
+
+**What to add:**
+
+1. Add a policy function `select_multi_gpu_path(message_size_bytes, p2p_status, num_gpus, link_type) ->
+   MultiGpuPolicy { transfer_mechanism, overlap_mode, use_commfuse: bool, use_rccl: bool, use_host_bounce: bool }`.
+   **File:** new module or extend `src/p2p_route.rs` / `src/multi_gpu_launch.rs`.
+   **Sketch:**
+   ```rust
+   pub enum TransferMechanism { PeerDirectCopyEngine, RegisterP2P, HostBounce, RcclCollective }
+   pub enum OverlapMode { None, InterSm, IntraSm }
+   pub struct MultiGpuPolicy {
+       pub transfer: TransferMechanism,
+       pub overlap: OverlapMode,
+       pub use_commfuse_epilogue: bool,  // register-level atomicAdd to peer buffer
+   }
+   // Calibrate thresholds using PK-style microbenchmarks on the target hardware:
+   // copy engine saturates >256MB, register ops needed for in-network reduction,
+   // TMA-like bulk transfers for mid-range. PK's numbers (copy engine 81-82% of
+   // theoretical max on H100/B200, TMA 74-78%, register ops 70-76%) give the
+   // starting calibration; re-measure on the deployment box.
+   ```
+
+2. Wire the policy into `launch_multi_gpu_kernel` (line 25, `src/multi_gpu_launch.rs`) so the per-device
+   launch + RCCL collective selection is driven by the policy rather than always doing M-shard split + RCCL
+   all-reduce. In particular, for small per-shard message sizes where peer-direct copy-engine or register P2P
+   wins, prefer the CommFuse atomicAdd path (`grim_comm_fuse_p2p_epilogue`) over RCCL all-reduce; for large
+   messages where copy engine saturates, use the copy-engine route; for mid-range, use TMA-like bulk transfers.
+
+3. Add the compute/collective overlap schedule (intra-SM where compute and communication granularities align,
+   inter-SM where it reduces transfer size) — PK's intra-SM schedule overlaps the per-device compute with the
+   RCCL launch; grim currently launches compute first (lines 56-83) then RCCL (lines 86-96) with no overlap.
+
+### G.5 Static feature extraction for the predictor (TTX/IR features, lighter-weight first step)
+
+**Paper anchor:** TTX uses PTX/LLVM-IR features; grim on ROCm doesn't expose those trivially, so start with
+source-level static features.
+
+**Grim anchor:**
+- `src/kernels/mxfp4_gemm.rs:327-359` — `__launch_bounds__(256)`, `__shared__` absent in the tiled kernel
+  (LDS accessed via the default shared memory window; SMEM bytes can be derived from the LDS declarations in
+  the full source string)
+- `src/autotune.rs:130-132` — `LaunchConfig::smem_cost(bytes_per_elem)` already computes LDS bytes from
+  block_m * block_k + block_k * block_n — reuse/extending this pattern
+- `src/kernels/qkv_attention.rs:78` — `num_waves` computed from `blockDim.x / warpSize`;
+  `src/kernels/qkv_attention.rs:63-78` — wave_size resolved from warpSize (32 on RDNA2, 64 on CDNA)
+
+**What to add:**
+
+1. Add a `StaticKernelFeatures` struct captured at JIT-compile time (before or alongside `hiprtcCompileProgram`),
+   extracted from the HIP source string and the launch configuration:
+   **File:** new, near `src/kernels/source_asm.rs` or in `src/autotune.rs`.
+   **Sketch:**
+   ```rust
+   #[derive(Debug, Clone)]
+   pub struct StaticKernelFeatures {
+       pub shared_memory_bytes: u32,    // from __shared__ declarations in source, or smem_cost
+       pub thread_count: u32,           // blockDim.x * blockDim.y * blockDim.z
+       pub wave_count_estimate: u32,    // ceil(grid_blocks / n_sm) using grid/block/wavefront
+       pub tile_m: u32,                 // from launch config
+       pub tile_n: u32,
+       pub tile_k: u32,
+       pub k_loop_tiles: u32,           // ceil(K / tile_k)
+       pub uses_wmma: bool,
+       pub uses_mfma: bool,
+       pub arch: String,
+   }
+   ```
+   Extract `__shared__` bytes by scanning the source string for `__shared__ float s_mem[N]` / `__shared__ ...`
+   declarations (regex or simple parser), or reuse `LaunchConfig::smem_cost` pattern where the LDS is derived
+   from tile geometry. The wave count estimate `ceil(grid_blocks / n_sm)` mirrors WaveTune's `w = ceil(G / N_SM)`.
+
+2. Store these features alongside each autotune measurement record (G.1 step 2, G.3 step 1) so the offline
+   predictor has features to train on. This is the lighter-weight first step before any hsaco/ISA feature
+   extraction.
+
+### G.6 Quantized MoE fused path + dedicated fused MoE-MXFP4 kernel
+
+**Paper anchor:** WaveTune covers grouped GEMM (MoE) as one of its three representative kernels (Table 2:
+Grouped GEMM (MoE) row), with physical coordinates `G = sum_i ceil(M_i/T_M) * ceil(N/T_N)`, `L = ceil(K/T_K)`.
+Grim's persistent dispatch already routes MoE through `grim_moe_fused_grouped_device`; adding a fused
+MoE-MXFP4 entry means the MXFP4-quantized MoE runs through a single fused kernel instead of per-expert
+standalone MXFP4 GEMM.
+
+**Grim anchor:**
+- `src/kernels/scythe_persistent.rs:148-245` — persistent dispatch kernel; `quant_mode` branch at line 215;
+  the else-arm (line 224) currently sets `ST_ERROR` for non-FP32 quant modes
+- `src/kernels/scythe_persistent.rs:193-225` — the FP32 MoE arm calls `grim_moe_fused_grouped_device`
+- `src/kernels/scythe_persistent.rs:215` — `if (moe->quant_mode == MOE_QUANT_FP32)` is the only wired arm
+- `src/kernels/charon.rs` — `grim_moe_fused_grouped` family (the FP32 dispatch kernel)
+- `src/kernels/charon_wmma.rs` — WMMA variant `grim_moe_fused_grouped_wmma`
+- `src/device/roc_device.rs:8378` — `launch_mxfp4_gemm_tiled` called for the MXFP4 QKV path
+- `src/kernels/q4k_dequant.rs` (not read in full, but referenced) — host CPU mirror oracle pattern for Q4_K
+
+**What to add:**
+
+1. Implement the quantized arms of the persistent dispatch `quant_mode` branch at `src/kernels/scythe_persistent.rs:215`.
+   **File:** `src/kernels/scythe_persistent.rs`, the `if (moe->quant_mode == MOE_QUANT_FP32)` arm (line 215) and
+   its else (line 224).
+   **Sketch:** add arms for `MOE_QUANT_MXFP4` (and fp8/mxfp8/q80/iq) that call the corresponding fused grouped
+   dispatch kernel (e.g., a new `grim_moe_fused_grouped_mxfp4_device` for MXFP4) instead of falling through to
+   `ST_ERROR`. Each new arm needs a CPU-oracle parity gate (see G.7) before it is tuned.
+
+2. Add a dedicated fused MoE-MXFP4 kernel so MXFP4-quantized MoE runs through one fused kernel rather than
+   per-expert standalone MXFP4 GEMM.
+   **File:** new kernel source in `src/kernels/` (e.g., `moe_mxfp4_grouped.rs`), wired into
+   `src/kernels/source_asm.rs` and the persistent dispatch arm.
+   **Sketch:** the fused kernel should dequantize MXFP4 expert weights on-the-fly (like `mxfp4_gemm_tiled`'s
+   `mxfp4_dot_block` at `src/kernels/mxfp4_gemm.rs:349-356`) and accumulate per-expert, matching the WaveTune
+   grouped GEMM physical coordinate decomposition (sum over experts of the per-expert GEMM grid).
+
+3. Wire the new kernel into `src/kernels/scythe_persistent.rs:215` arm and add the launch path in
+   `src/device/roc_device.rs` (next to `launch_mxfp4_gemm_tiled` at line 7948).
+
+### G.7 Correctness-before-tuning guardrail — extend oracle parity to every new quant variant
+
+**Paper anchor:** not from a single paper — cross-cutting discipline. Grim's `q4k_dequant.rs` already runs a
+host CPU mirror against `grim_quant::dequant_q4k` as an oracle; every new auto-tuned variant should have the
+same gate.
+
+**Grim anchor:**
+- `src/memory/storage.rs:560-563` — host dequant dispatch for Q2K/Q3K/Q4K/Q5K/Q6K via `grim_quant::dequant_*`
+- `src/device/roc_device.rs:6778-6806` — `launch_dequant_q4k` (device-side dequant)
+- `src/device/roc_device.rs:6808-6836` — `launch_dequant_fp8`
+- `src/device/roc_device.rs:6838-6850` — `launch_dequant_mxfp4` (start of MXFP4 dequant launcher)
+- `src/kernels/charon.rs:2100-2102` — G-A2 parity test: routing assignment from synthetic SoftmaxTopK vs CPU
+  reference (`grim_nn::moe::MoeRouter::route`)
+
+**What to add:**
+
+1. For every new quant variant (MXFP4, FP8, MXFP8, Q8_0, IQK) added in G.6, add a host CPU mirror dequant
+   that produces the reference F32 weights using the same quantization convention as the device kernel, then
+   parity-test the device output against the CPU reference at a few (M, N, K) points before the variant is
+   auto-tuned.
+   **File:** extend the host dequant dispatch in `src/memory/storage.rs` (near line 560, add MXFP4/FP8/MXFP8/Q8_0/
+   IQK arms) and add parity tests in the kernel's `mod tests` (cf. `src/kernels/charon.rs:2100` G-A2 pattern).
+
+2. Don't auto-tune a kernel whose correctness isn't gated — tuning a wrong kernel produces a fast wrong answer.
+   Add an assertion or test-gate that the parity test passes before the auto-tuned winner is cached in
+   `Autotuner` (line 251, `src/autotune.rs`).
+
+---
+
 ## Part F — action items for the team owning the WIP tree
 
 1. **Near-term, low-risk:** add source-level static feature extraction (smem bytes, thread count, wave estimate,

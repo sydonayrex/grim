@@ -630,14 +630,33 @@ extern "C" {
         if (idx >= total) return;
         const int row = (int)(idx / K);
         const int k_idx = (int)(idx % K);
+        const int superblock_idx = k_idx / 256;
+        const int k_in_superblock = k_idx % 256;
+
+        // P4: per-thread superblock for backward — one thread handles a 256-weight
+        // superblock worth of K. The dV/dX entry is at row (m = idx / K),
+        // K-index k_idx, so superblock_idx = k_idx / 256 and k_in_sb = k_idx % 256.
+        //
+        // We precompute the per-superblock row of B in registers: 8 sub-blocks
+        // × 32 weights, each sub-block has its own 6-bit scale (unpacked inside
+        // `dequant_iq4xs`), and we dequant all 256 codes in this superblock once
+        // via `dequant_iq4xs` in a `#pragma unroll` loop. Then we MAC across N.
+        // This removes the per-MAC `sb_idx`/`in_sb` div/mod and the per-MAC-per-N
+        // dequant call that the old kernel did inside the N-loop. One thread does
+        // 256 dequant calls total instead of N * 256.
         const int blocks_per_row = K / 256;
         const int row_bytes = blocks_per_row * 136;
-        int sb_idx = k_idx / 256;
-        int in_sb = k_idx % 256;
+        const unsigned char* superblock_base = B_iq4xs + (unsigned long long)row_bytes * superblock_idx;
+        float b_vals[256];
+        #pragma unroll
+        for (int w = 0; w < 256; ++w) {
+            b_vals[w] = dequant_iq4xs(superblock_base, w);
+        }
+
         float acc = 0.0f;
         for (int n = 0; n < N; ++n) {
             float dy_val = dY[row * N + n];
-            float w_val = dequant_iq4xs(B_iq4xs + n * row_bytes + sb_idx * 136, in_sb);
+            float w_val = b_vals[k_in_superblock];
             acc += dy_val * w_val;
         }
         dX[row * K + k_idx] = acc;
