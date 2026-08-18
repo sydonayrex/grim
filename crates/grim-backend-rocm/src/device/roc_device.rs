@@ -207,6 +207,12 @@ pub struct RocmDevice {
     /// Set externally when multi-GPU RCCL training is active; `None` when
     /// single-GPU or RCCL not initialised. [see: `RcclAllReduce`, `set_rccl_handle`]
     pub rccl: Mutex<Option<Arc<crate::rccl::RcclAllReduce>>>,
+    /// A single reusable HIP event recording the most recent upload completion
+    /// on the transfer stream. The active (compute) stream fences on it via
+    /// `hipStreamWaitEvent` so a weight prefetch on the transfer stream can
+    /// overlap the prior decode-step GEMM on the active stream (SPEED-ROC-1).
+    /// `None` until the first stream-ordered upload allocates it.
+    upload_event: Mutex<Option<*mut c_void>>,
 }
 
 unsafe impl Send for RocmDevice {}
@@ -462,7 +468,7 @@ impl RocmDevice {
     }
 
     /// Probe the total amount of device memory reported by the driver, in bytes. [see: `hipMemGetInfo`, `hipDeviceProp_t`]
-    fn query_device_vram_bytes(_ordinal: usize) -> usize {
+    pub fn query_device_vram_bytes(_ordinal: usize) -> usize {
         unsafe {
             let mut free_mem: usize = 0;
             let mut total_mem: usize = 0;
@@ -617,6 +623,7 @@ impl RocmDevice {
                 crate::quantization::GcnArch::RDNA3 | crate::quantization::GcnArch::RDNA4
             )),
             rccl: Mutex::new(None),
+            upload_event: Mutex::new(None),
         }
     }
 
@@ -758,14 +765,29 @@ impl RocmDevice {
 
     /// The stream an op should dispatch onto: the capture stream when a session is
     fn active_stream(&self) -> *mut c_void {
-        if self.capture_active.load(Ordering::SeqCst) {
-            return self
-                .capture_stream
+        let stream = if self.capture_active.load(Ordering::SeqCst) {
+            self.capture_stream
                 .read()
                 .unwrap()
-                .unwrap_or_else(|| self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut()));
+                .unwrap_or_else(|| self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut()))
+        } else {
+            self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut())
+        };
+        // SPEED-ROC-1: if a stream-ordered upload is in flight on the transfer
+        // stream, fence this (compute) stream on its completion event so the
+        // prefetch can overlap the prior decode-step GEMM instead of racing it.
+        // `hipStreamWaitEvent` is a no-op ordering edge; it does not block the
+        // host. The event is recorded by `upload_from_host_stream_ordered`.
+        if let Ok(guard) = self.upload_event.lock() {
+            if let Some(ev) = *guard {
+                if !ev.is_null() {
+                    unsafe {
+                        let _ = crate::hipStreamWaitEvent(stream, ev, 0);
+                    }
+                }
+            }
         }
-        self.get_stream_from_pool(0).unwrap_or(std::ptr::null_mut())
+        stream
     }
 
     /// Block until all previously issued work on all streams of this device
@@ -884,12 +906,13 @@ impl RocmDevice {
                 let _ = hipGraphDestroy(old.graph);
             }
         }
-        // Restore the rocBLAS handle to its default stream now that capture is done.
-        if let Ok(h) = self.get_rocblas_handle() {
-            unsafe {
-                let _ = rocblas_set_stream(h, std::ptr::null_mut());
-            }
-        }
+        // Do NOT reset the rocBLAS handle to the null stream here. Every eager
+        // GEMM dispatch re-binds the handle to `active_stream()` before use
+        // (P0-17 fix), so leaving it bound to the capture stream is harmless
+        // and avoids the footgun where a later GEMM that forgets to set the
+        // stream silently lands on the default stream instead of the active
+        // one. The next dispatch's `rocblas_set_stream(handle, active_stream())`
+        // overwrites this binding regardless.
         self.capture_active.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -919,14 +942,11 @@ impl RocmDevice {
                 }
                 // No post-replay sync: replay is async on `stream`; callers
                 // that need the result sync (or read back) at their boundary.
-                // The rocblas handle binding is an enqueue-time setting, so it
-                // can be restored immediately without affecting the launched
-                // graph.
-                if let Ok(h) = self.get_rocblas_handle() {
-                    unsafe {
-                        let _ = rocblas_set_stream(h, std::ptr::null_mut());
-                    }
-                }
+                // The rocblas handle binding is an enqueue-time setting, so we
+                // leave it bound to `stream` rather than resetting to null:
+                // the next eager GEMM re-binds to `active_stream()` anyway, and
+                // resetting to the default stream would be a footgun (P0-17
+                // class) if any future dispatch forgets to set the stream.
                 Ok(true)
             }
             None => Ok(false),
@@ -1113,8 +1133,11 @@ impl RocmDevice {
                 solution_index as RocblasInt,
                 ROCBLAS_GEMM_FLAGS_NONE,
             );
-            // Restore the handle to the default (null) stream so other eager GEMMs
-            let _ = rocblas_set_stream(handle, std::ptr::null_mut());
+            // NOTE: do NOT reset the handle to the null (default) stream here.
+            // Every eager GEMM dispatch re-binds the handle to `active_stream()`
+            // before its call (P0-17 fix), so leaving the binding as-is is
+            // correct and avoids the footgun where a later GEMM that omits the
+            // set_stream would silently dispatch on the default stream.
             if status != rocblas_status_success {
                 return Err(Error::Backend(format!(
                     "rocblas_gemm_strided_batched_ex failed with status {status}"
@@ -1197,14 +1220,17 @@ impl RocmDevice {
     /// Stream-ordered f32 H2D upload that does NOT synchronize before returning.
     ///
     /// Pins the host data, allocates device storage, and issues `hipMemcpyAsync`
-    /// on a pooled compute stream. The pinned source is retained in
-    /// [`RocmDevice::retained_pins`] so it outlives the enqueue; [`synchronize`]
-    /// releases every retained pin after the device completes the copies. This
-    /// lets consecutive per-tensor weight uploads queue on the stream pool and
-    /// overlap with each other (and with the dequant CPU work done ahead of
-    /// them), pipelining the per-tensor H2D copies instead of serializing them.
+    /// on a dedicated **transfer stream** (distinct from the compute stream the
+    /// GEMMs use). After the copy it records a reusable completion event into
+    /// [`RocmDevice::upload_event`]; [`active_stream`] fences the compute stream
+    /// on that event, so a weight prefetch enqueued here can overlap the prior
+    /// decode-step GEMM on the compute stream instead of serializing behind it
+    /// (SPEED-ROC-1). The pinned source is retained in [`RocmDevice::retained_pins`]
+    /// so it outlives the enqueue; [`synchronize`] releases every retained pin
+    /// after the device completes the copies.
     ///
     /// [`synchronize`]: RocmDevice::synchronize
+    /// [`active_stream`]: RocmDevice::active_stream
     pub fn upload_from_host_stream_ordered(
         &self,
         data: &[f32],
@@ -1217,14 +1243,19 @@ impl RocmDevice {
             return Err(Error::Backend("Invalid device pointer after alloc".into()));
         }
         let dev_ptr_void = storage.device_ptr.unwrap() as *mut c_void;
-        let stream = self.active_stream();
+        // Distinct transfer stream (pool index 1) so H2D copy-engine work runs
+        // concurrently with compute on the active stream (pool index 0).
+        let xfer = self
+            .get_stream_from_pool(1)
+            .or_else(|| self.get_stream_from_pool(0))
+            .unwrap_or(std::ptr::null_mut());
         let status = unsafe {
             hipMemcpyAsync(
                 dev_ptr_void,
                 pinned.as_ptr() as *const c_void,
                 storage.bytes,
                 HipMemcpyKind::HostToDevice,
-                stream,
+                xfer,
             )
         };
         // On failure the async copy was never enqueued, so the pin is safe to
@@ -1233,6 +1264,36 @@ impl RocmDevice {
             self.allocator.free(dev_ptr_void, storage.bytes);
             return Err(Error::Backend(format!(
                 "hipMemcpyAsync(H2D, stream-ordered) failed with error code {status}"
+            )));
+        }
+        // Record a completion event on the transfer stream so the next
+        // compute-dispatch on the active stream (via `active_stream()`) can
+        // wait on it. Reuse a single event across uploads.
+        let event = {
+            let mut guard = self.upload_event.lock().map_err(|_| {
+                Error::Backend("upload_event mutex poisoned".into())
+            })?;
+            match *guard {
+                Some(e) => e,
+                None => {
+                    let mut ev: *mut c_void = std::ptr::null_mut();
+                    let r = unsafe { crate::hipEventCreate(&mut ev) };
+                    if r != hipSuccess {
+                        self.allocator.free(dev_ptr_void, storage.bytes);
+                        return Err(Error::Backend(format!(
+                            "hipEventCreate failed with code {r}"
+                        )));
+                    }
+                    *guard = Some(ev);
+                    ev
+                }
+            }
+        };
+        let r = unsafe { crate::hipEventRecord(event, xfer) };
+        if r != hipSuccess {
+            self.allocator.free(dev_ptr_void, storage.bytes);
+            return Err(Error::Backend(format!(
+                "hipEventRecord failed with code {r}"
             )));
         }
         // Retain the pin until the next device-wide synchronize (never free a
@@ -1408,6 +1469,10 @@ impl RocmDevice {
 impl Drop for RocmDevice {
     fn drop(&mut self) {
         // Drain any in-flight kernels on the pooled streams before recycling or
+        // freeing. Pin the device first (P1-7 discipline): hipDeviceSynchronize
+        // targets the calling thread's current device, which may not be
+        // `self.ordinal` if another device's Drop ran on this thread.
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         unsafe {
             let _ = hipDeviceSynchronize();
         }
@@ -1425,6 +1490,16 @@ impl Drop for RocmDevice {
             for stream in pool.drain(..) {
                 unsafe {
                     let _ = hipStreamDestroy(stream);
+                }
+            }
+        }
+        // Destroy the reusable upload-completion event (SPEED-ROC-1 overlap).
+        if let Ok(mut guard) = self.upload_event.lock() {
+            if let Some(ev) = guard.take() {
+                if !ev.is_null() {
+                    unsafe {
+                        let _ = crate::hipEventDestroy(ev);
+                    }
                 }
             }
         }
@@ -4953,8 +5028,37 @@ impl RocmDevice {
         let up_buf = self.from_cpu(up_flat, &Shape::new(vec![up_flat.len()]), DType::F32)?;
         let down_buf = self.from_cpu(down_flat, &Shape::new(vec![down_flat.len()]), DType::F32)?;
 
-        let out_storage =
-            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        self.moe_fused_dispatch_resident(
+            activations,
+            &*gate_buf,
+            &*up_buf,
+            &*down_buf,
+            assignment,
+            out_shape,
+            hidden,
+            inter,
+            routed_scaling_factor,
+        )
+    }
+
+    /// Fused MoE dispatch against weight buffers that are already resident on
+    /// the device. Unlike [`Self::moe_fused_dispatch`], no host `&[f32]`
+    /// weight arrays are uploaded per call — callers keep the flattened
+    /// gate/up/down buffers resident across forward calls (see
+    /// `grim_nn::moe::MoeFfn::forward_rocm`), so the per-call cost is limited
+    /// to the routing arrays and the output allocation.
+    pub fn moe_fused_dispatch_resident(
+        &self,
+        activations: &RocmStorage,
+        gate_buf: &dyn BackendStorage,
+        up_buf: &dyn BackendStorage,
+        down_buf: &dyn BackendStorage,
+        assignment: &crate::kernels::charon::RoutingAssignment,
+        out_shape: &Shape,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<(RocmStorage, RocmHandle)> {
         let gate_r = gate_buf
             .as_any()
             .downcast_ref::<RocmStorage>()
@@ -4967,6 +5071,9 @@ impl RocmDevice {
             .as_any()
             .downcast_ref::<RocmStorage>()
             .ok_or_else(|| Error::Backend("down_buf downcast failed".into()))?;
+
+        let out_storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
 
         let stream = self.launch_charon_fused_dispatch(
             activations,

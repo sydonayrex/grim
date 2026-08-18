@@ -180,6 +180,10 @@ unsafe extern "C" {
     pub fn hipEventDestroy(event: *mut c_void) -> HipErrorT;
     pub fn hipEventRecord(event: *mut c_void, stream: *mut c_void) -> HipErrorT;
     pub fn hipEventSynchronize(event: *mut c_void) -> HipErrorT;
+    // Cross-stream dependency: block `stream` until `event` (recorded on another
+    // stream) completes. Enables upload-on-transfer-stream to overlap with
+    // compute-on-active-stream (SPEED-ROC-1 decode-step overlap).
+    pub fn hipStreamWaitEvent(stream: *mut c_void, event: *mut c_void, flags: u32) -> HipErrorT;
     pub fn hipEventElapsedTime(ms: *mut f32, start: *mut c_void, stop: *mut c_void) -> HipErrorT;
 
     pub fn hipGetDevice(device: *mut i32) -> HipErrorT;

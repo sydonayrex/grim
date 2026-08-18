@@ -107,6 +107,10 @@ impl RocmCachingAllocator {
 
     /// Release every pooled buffer back to the driver. Mirrors `torch.cuda.empty_cache()`.
     pub fn empty_cache(&self) {
+        // Pin the device (P1-7 discipline): hipDeviceSynchronize targets the
+        // calling thread's current device, which may differ from `self.ordinal`
+        // on a multi-GPU host where another device's teardown ran on this thread.
+        let _guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
         unsafe {
             let _ = crate::hipDeviceSynchronize();
         }

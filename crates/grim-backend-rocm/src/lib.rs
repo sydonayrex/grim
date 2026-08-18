@@ -79,7 +79,8 @@ pub use crate::device::handles::{
     hipMemGetInfo, hipMemPrefetchAsync, hipMemcpy, hipMemcpyAsync, hipMemset, hipMemsetAsync,
     hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad, hipModuleUnload, hipSetDevice,
     hipStreamBeginCapture, hipStreamCreate, hipStreamDestroy, hipStreamEndCapture,
-    hipStreamSynchronize, hipSuccess, hiprtcAddNameExpression, hiprtcCompileProgram,
+    hipStreamSynchronize, hipStreamWaitEvent, hipSuccess, hipEventCreate, hipEventDestroy,
+    hipEventRecord, hipEventSynchronize, hiprtcAddNameExpression, hiprtcCompileProgram,
     hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode, hiprtcGetCodeSize,
     hiprtcGetErrorString, hiprtcGetLoweredName, hiprtcGetProgramLog, hiprtcGetProgramLogSize,
 };

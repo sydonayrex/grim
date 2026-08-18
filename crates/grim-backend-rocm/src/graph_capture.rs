@@ -372,6 +372,11 @@ impl HipGraphExecutor {
             _ => return Err(Error::Backend("Graph not instantiated".into())),
         };
 
+        // Pin the device (P1-7 discipline): the graph and its stream were
+        // created against `device_ordinal`'s context. If the calling thread's
+        // current device differs, hipStreamSynchronize would target the wrong
+        // context and either deadlock or sync the wrong stream.
+        let _guard = crate::device::util::DeviceGuard::set(self.device_ordinal as i32);
         unsafe {
             let res = hipGraphLaunch(exec, stream);
             if res != hipSuccess {
