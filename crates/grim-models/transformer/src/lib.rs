@@ -10,6 +10,7 @@ pub mod bailingmoe2;
 pub mod bailingmoe3;
 pub mod bitnet;
 pub mod block;
+pub mod kv_attention;
 pub mod bloom;
 pub mod chameleon;
 pub mod chatglm;

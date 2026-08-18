@@ -6,12 +6,15 @@
 
 use crate::rope_scaling::{RopeScalingMethod, scaling_base};
 use grim_autograd::AutogradScope;
+use grim_backend_rocm::RocmDevice;
 use grim_core::error::{Error, Result};
 use grim_models_transformer::{LlamaBlock, LlamaConfig};
 use grim_nn::WeightSource;
-use grim_nn::modules::pick_device_for_tensor;
-use grim_tensor::{DType, Shape, Tensor, TensorProvider};
+use grim_nn::modules::{pick_device_for_storage_device, pick_device_for_tensor};
+use grim_tensor::{BackendDevice, DType, Device, Shape, Tensor, TensorProvider};
 use std::collections::HashMap;
+use std::ffi::c_void;
+use std::sync::Arc;
 
 /// Saved activation checkpoint for a transformer block.
 #[derive(Debug, Clone)]
@@ -76,12 +79,71 @@ impl GradientCheckpointBuffer {
     }
 }
 
+/// Transfer `x` to `target_device`, returning a tensor owned by that device.
+///
+/// ROCm→ROCm moves use a true device-to-device copy (peer-routed through
+/// `RocmDevice::copy_via_route`), so activations never detour through host
+/// memory. CUDA↔CUDA moves within the same PCI domain would also support
+/// peer memcpy via `cuMemcpyPeer` but is not yet wired. Any other cross-backend
+/// move (different backends, or different PCI domains) stages through host memory
+/// since cross-device P2P transfer requires backend-specific peer support that
+/// is not universally available (e.g. ROCm↔CUDA GPUDirect requires both drivers
+/// and hardware support).
+fn transfer_to_device(x: &Tensor, target_device: &Device) -> Result<Tensor> {
+    if x.device() == target_device {
+        return Ok(x.clone());
+    }
+    // Same-backend ROCm move: peer memcpy, no host round-trip.
+    if let (Device::Rocm(src_ord), Device::Rocm(dst_ord)) = (x.device(), target_device) {
+        if src_ord != dst_ord {
+            let dev = RocmDevice::shared(*dst_ord);
+            let dst_storage = dev.alloc_storage(x.shape(), DType::F32)?;
+            let src_ptr = x.storage().device_ptr().ok_or_else(|| {
+                Error::Tensor(grim_tensor::Error::Backend(
+                    "transfer_to_device: source lacks a device pointer".into(),
+                ))
+            })? as *const c_void;
+            let dst_ptr = dst_storage.device_ptr().ok_or_else(|| {
+                Error::Tensor(grim_tensor::Error::Backend(
+                    "transfer_to_device: destination lacks a device pointer".into(),
+                ))
+            })? as *mut c_void;
+            let bytes = x.shape().elem_count() * std::mem::size_of::<f32>();
+            dev.copy_via_route(*src_ord as i32, *dst_ord as i32, src_ptr, dst_ptr, bytes)?;
+            return Ok(Tensor::new(
+                Arc::from(dst_storage),
+                x.shape().clone(),
+                DType::F32,
+                x.provenance().clone(),
+                target_device.clone(),
+            ));
+        }
+        // Same ordinal, distinct device identity: no data movement needed.
+        return Ok(x.clone());
+    }
+    // Cross-backend: host-staged upload onto the target device.
+    let dev = pick_device_for_storage_device(target_device);
+    let out_storage = dev.from_cpu(&x.to_vec_f32()?, x.shape(), DType::F32)?;
+    Ok(Tensor::new(
+        Arc::from(out_storage),
+        x.shape().clone(),
+        DType::F32,
+        x.provenance().clone(),
+        target_device.clone(),
+    ))
+}
+
 /// Block-wise streaming forward executor for memory-bounded QLoRA fine-tuning.
 pub struct StreamingBlockForward {
     pub num_layers: usize,
     pub hidden_size: usize,
     pub checkpoint_buffer: GradientCheckpointBuffer,
     pub rope_scaling: Option<RopeScalingMethod>,
+    /// Session-lifetime cache of materialized `LlamaBlock`s, keyed by
+    /// `(layer_idx, device)` so block weights are loaded/uploaded once and
+    /// reused across forward and recompute passes. Cleared explicitly via
+    /// [`Self::clear_block_cache`] when the model or configuration changes.
+    block_cache: std::sync::Mutex<HashMap<(usize, Device), LlamaBlock>>,
 }
 
 impl StreamingBlockForward {
@@ -92,7 +154,37 @@ impl StreamingBlockForward {
             hidden_size,
             checkpoint_buffer: GradientCheckpointBuffer::new(),
             rope_scaling: None,
+            block_cache: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Drop the cached materialized blocks. Call after the underlying model
+    /// or configuration changes so the next forward pass reloads weights.
+    pub fn clear_block_cache(&self) {
+        self.block_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// Load (or return the cached) `LlamaBlock` for `layer_idx` on `device`.
+    fn block(
+        &self,
+        provider: &dyn TensorProvider,
+        cfg: &LlamaConfig,
+        layer_idx: usize,
+        device: &Device,
+    ) -> Result<LlamaBlock> {
+        let mut cache = self.block_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(block) = cache.get(&(layer_idx, device.clone())) {
+            return Ok(block.clone());
+        }
+        let ws = WeightSource::root(provider, device.clone());
+        let block_ws = ws.pp("layers").pp(&layer_idx.to_string());
+        let block = LlamaBlock::load(&block_ws, cfg)?;
+        prefetch_block_weights(&block)?;
+        cache.insert((layer_idx, device.clone()), block.clone());
+        Ok(block)
     }
 
     /// Configure a RoPE scaling method for long-context training.
@@ -113,8 +205,9 @@ impl StreamingBlockForward {
     /// an empty slice is passed (RoPE not applied), matching prior behavior.
     /// Run streaming forward block for `layer_idx` targeting a SCYTHE-2 assigned GPU device.
     ///
-    /// If `layer_device` differs from `x.device()`, transfers activation `x` to `layer_device`
-    /// via P2P before running block forward.
+    /// If `target_device` differs from `x.device()`, transfers activation `x` to
+    /// `target_device` before running block forward. ROCm→ROCm moves use a true
+    /// device-to-device copy (no host round-trip); other pairs stage through host.
     pub fn forward_block_on_device(
         &mut self,
         provider: &dyn TensorProvider,
@@ -124,12 +217,7 @@ impl StreamingBlockForward {
         positions: Option<&[u32]>,
         target_device: &grim_tensor::Device,
     ) -> Result<Tensor> {
-        let x_target = if x.device() != target_device {
-            let vec_f32 = x.to_vec_f32()?;
-            grim_backend_cpu::cpu_tensor(vec_f32, x.shape().clone())
-        } else {
-            x.clone()
-        };
+        let x_target = transfer_to_device(x, target_device)?;
         self.forward_block(provider, cfg, layer_idx, &x_target, positions)
     }
     pub fn forward_block(
@@ -151,15 +239,12 @@ impl StreamingBlockForward {
         self.checkpoint_buffer.save(layer_idx, x.clone());
 
         // Load block weights lazily from provider on target tensor device, run real forward
-        let ws = WeightSource::root(provider, x.device().clone());
-        let block_ws = ws.pp("layers").pp(&layer_idx.to_string());
-        let block = LlamaBlock::load(&block_ws, cfg)?;
-        prefetch_block_weights(&block)?;
+        let block = self.block(provider, cfg, layer_idx, x.device())?;
         block.forward(x, positions.unwrap_or(&[]))
     }
 
     /// Recompute block forward pass from saved input checkpoint during backward traversal.
-    /// Reloads block weights from `provider` and re-runs the real forward.
+    /// Reuses the session-cached `LlamaBlock` weights instead of reloading them.
     pub fn recompute_block(
         &self,
         provider: &dyn TensorProvider,
@@ -174,11 +259,7 @@ impl StreamingBlockForward {
             ))
         })?;
 
-        // Reload block weights from provider on target tensor device, run real forward from saved input
-        let ws = WeightSource::root(provider, input_x.device().clone());
-        let block_ws = ws.pp("layers").pp(&layer_idx.to_string());
-        let block = LlamaBlock::load(&block_ws, cfg)?;
-        prefetch_block_weights(&block)?;
+        let block = self.block(provider, cfg, layer_idx, input_x.device())?;
         block.forward(input_x, positions.unwrap_or(&[]))
     }
 
@@ -206,10 +287,7 @@ impl StreamingBlockForward {
 
         self.checkpoint_buffer.save(layer_idx, x.clone());
 
-        let ws = WeightSource::root(provider, x.device().clone());
-        let block_ws = ws.pp("layers").pp(&layer_idx.to_string());
-        let block = LlamaBlock::load(&block_ws, cfg)?;
-        prefetch_block_weights(&block)?;
+        let block = self.block(provider, cfg, layer_idx, x.device())?;
 
         // Pre-attention norm & Q/K/V projections
         let x_norm = block.attn_norm.forward(x)?;

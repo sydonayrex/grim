@@ -10,7 +10,7 @@ use grim_backend_cpu::cpu_tensor;
 use grim_core::error::{Error, Result};
 use grim_core::model::{Encoder, ModalityHint};
 use grim_core::{Model, ModelConfig};
-use grim_nn::{Linear, RmsNorm, WeightSource};
+use grim_nn::{Linear, WeightSource};
 use grim_tensor::{ArithType, Device, Shape, Tensor};
 
 /// ViT configuration.
@@ -114,9 +114,62 @@ impl ModelConfig for VitConfig {
     }
 }
 
+/// True LayerNorm (mean-subtracted, learnable bias) — distinct from `RmsNorm`.
+///
+/// Real ViT checkpoints are trained with LayerNorm, so loading their `weight`/
+/// `bias` into an RmsNorm (no mean subtraction, no bias) is numerically wrong.
+/// [P1-34 fix: ViT norms are LayerNorm, not RmsNorm.]
+pub struct LayerNorm {
+    pub weight: Vec<f32>,
+    pub bias: Vec<f32>,
+    pub eps: f32,
+}
+
+impl LayerNorm {
+    fn ones(dim: usize, eps: f32) -> Self {
+        Self {
+            weight: vec![1.0; dim],
+            bias: vec![0.0; dim],
+            eps,
+        }
+    }
+
+    /// Load `weight` and `bias` under `ws`. A missing `bias` tensor is treated
+    /// as zeros (some exports omit it); a missing `weight` is a hard error.
+    fn load(ws: &WeightSource<'_>, dim: usize, eps: f32) -> Result<Self> {
+        let weight = ws.get([dim], "weight")?.to_vec_f32()?;
+        let bias = match ws.get([dim], "bias") {
+            Ok(t) => t.to_vec_f32()?,
+            Err(_) => vec![0.0; dim],
+        };
+        Ok(Self { weight, bias, eps })
+    }
+
+    /// Row-wise LayerNorm over the last dimension of a `[n, dim]` buffer.
+    fn forward(&self, x: &[f32]) -> Vec<f32> {
+        let dim = self.weight.len();
+        let rows = x.len() / dim;
+        let mut out = vec![0.0f32; x.len()];
+        for r in 0..rows {
+            let off = r * dim;
+            let row = &x[off..off + dim];
+            let mean = row.iter().sum::<f32>() / dim as f32;
+            let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / dim as f32;
+            let inv = 1.0 / (var + self.eps).sqrt();
+            for d in 0..dim {
+                out[off + d] = (row[d] - mean) * inv * self.weight[d] + self.bias[d];
+            }
+        }
+        out
+    }
+}
+
 /// One ViT self-attention block (pre-norm).
 struct VitBlock {
-    norm1: RmsNorm,
+    norm1: LayerNorm,
+    /// Second LayerNorm, applied before the MLP (pre-norm ViT has two norms
+    /// per block). [P1-34 fix: pre-MLP norm was missing entirely.]
+    norm2: LayerNorm,
     wq: Vec<f32>,
     wk: Vec<f32>,
     wv: Vec<f32>,
@@ -150,10 +203,8 @@ impl VitBlock {
         let fc1_w = mat(intermediate, hidden);
         let fc2_w = mat(hidden, intermediate);
         Self {
-            norm1: RmsNorm {
-                weight: cpu_tensor(vec![1.0; hidden], Shape::new(vec![hidden])),
-                eps,
-            },
+            norm1: LayerNorm::ones(hidden, eps),
+            norm2: LayerNorm::ones(hidden, eps),
             wq,
             wk,
             wv,
@@ -196,11 +247,13 @@ impl VitBlock {
         let wo = ws
             .get([hidden, num_heads * head_dim], "attn.o.weight")?
             .to_vec_f32()?;
-        let norm1 = RmsNorm::load(&ws.pp("attn_norm"), hidden, eps)?;
+        let norm1 = LayerNorm::load(&ws.pp("attn_norm"), hidden, eps)?;
+        let norm2 = LayerNorm::load(&ws.pp("ffn_norm"), hidden, eps)?;
         let w_fc1 = Linear::load(&ws.pp("ffn.0"), hidden, intermediate, true)?;
         let w_fc2 = Linear::load(&ws.pp("ffn.1"), intermediate, hidden, true)?;
         Ok(Self {
             norm1,
+            norm2,
             wq,
             wk,
             wv,
@@ -216,7 +269,7 @@ impl VitBlock {
 
     fn forward(&self, x: &[f32], seq: usize) -> Result<Vec<f32>> {
         let h = self.hidden;
-        let x_normed = rmsnorm_inplace(x, &self.norm1.weight.to_vec_f32()?, self.norm1.eps);
+        let x_normed = self.norm1.forward(x);
 
         let mut q = vec![0.0f32; seq * h];
         let mut k = vec![0.0f32; seq * h];
@@ -286,14 +339,17 @@ impl VitBlock {
 
         // Pre-norm residual: skip connection uses the original input x, not x_normed.
         // attn_res = x + attn(norm(x)). [P1-34 fix: residual uses x, not x_normed.]
-        let mut attn_res = x.clone();
+        let mut attn_res: Vec<f32> = x.to_vec();
         for i in 0..attn_res.len() {
             attn_res[i] += attn_out[i];
         }
-
+        // Pre-MLP norm: mlp operates on norm2(attn_res), and the second
+        // residual adds onto attn_res (not the block input x).
+        // [P1-34 fix: missing pre-MLP norm + wrong second residual base.]
+        let normed2 = self.norm2.forward(&attn_res);
         let fc1_out = self
             .w_fc1
-            .forward(&cpu_tensor(attn_res.clone(), Shape::new(vec![seq, h])))?;
+            .forward(&cpu_tensor(normed2, Shape::new(vec![seq, h])))?;
         let gate = fc1_out.to_vec_f32()?;
         let mut gelu = vec![0.0f32; gate.len()];
         for (i, g) in gate.iter().enumerate() {
@@ -303,30 +359,12 @@ impl VitBlock {
             .w_fc2
             .forward(&cpu_tensor(gelu, Shape::new(vec![seq, self.intermediate])))?;
         let mlp = fc2_out.to_vec_f32()?;
-        let mut out = x.to_vec();
+        let mut out = attn_res;
         for i in 0..out.len() {
             out[i] += mlp[i];
         }
         Ok(out)
     }
-}
-
-fn rmsnorm_inplace(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
-    let hidden = w.len();
-    let batches = x.len() / hidden;
-    let mut out = vec![0.0f32; x.len()];
-    for b in 0..batches {
-        let off = b * hidden;
-        let mut sq = 0.0f32;
-        for v in &x[off..off + hidden] {
-            sq += v * v;
-        }
-        let rms = (sq / hidden as f32 + eps).sqrt();
-        for d in 0..hidden {
-            out[off + d] = (x[off + d] / rms) * w[d];
-        }
-    }
-    out
 }
 
 fn gelu_approx(x: f32) -> f32 {
@@ -342,7 +380,7 @@ pub struct Vit {
     pub cls_token: Vec<f32>,
     pub pos_embed: Vec<f32>,
     blocks: Vec<VitBlock>,
-    pub ln: RmsNorm,
+    pub ln: LayerNorm,
     pub features: usize,
 }
 
@@ -380,13 +418,7 @@ impl Vit {
                 cfg.rms_norm_eps,
             ));
         }
-        let ln = RmsNorm {
-            weight: cpu_tensor(
-                vec![1.0; cfg.hidden_size],
-                Shape::new(vec![cfg.hidden_size]),
-            ),
-            eps: cfg.rms_norm_eps,
-        };
+        let ln = LayerNorm::ones(cfg.hidden_size, cfg.rms_norm_eps);
         let features = cfg.hidden_size;
         Self {
             cfg,
@@ -444,7 +476,7 @@ impl Vit {
             )?;
             blocks.push(blk);
         }
-        let ln = RmsNorm::load(&ws.pp("ln"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let ln = LayerNorm::load(&ws.pp("ln"), cfg.hidden_size, cfg.rms_norm_eps)?;
         let features = cfg.hidden_size;
         Ok(Self {
             cfg,
@@ -521,7 +553,7 @@ impl Vit {
         for b in &self.blocks {
             tokens = b.forward(&tokens, num_patches + 1)?;
         }
-        let post = rmsnorm_inplace(&tokens, &self.ln.weight.to_vec_f32()?, self.ln.eps);
+        let post = self.ln.forward(&tokens);
         let cls = post[..hidden].to_vec();
         Ok(cpu_tensor(cls, Shape::new(vec![1, hidden])))
     }
@@ -612,11 +644,12 @@ mod tests {
 
     #[test]
     fn vit_pos_embed_applied_once_and_to_cls() {
-        // With zeroed weights, zeroed cls_token, and all-ones pos_embed,
-        // every token before the blocks should be 1.0 (cls + pos_embed[0],
-        // patches + pos_embed[1..]) and rmsnorm with weight=1 should preserve ~1.0.
-        // Crucially, CLS must be non-zero (proving pos_embed[0] was applied),
-        // and patches must not be doubled (proving single application).
+        // With zeroed projection weights and a zeroed cls_token, the CLS row
+        // entering the block stack is exactly pos_embed[0..hidden] — so the
+        // final LayerNorm output must equal LayerNorm(pos_embed[0..hidden]).
+        // Double application (2x) or a missing CLS pos_embed (zeros) both
+        // produce a different result, since LayerNorm is not scale-invariant
+        // once the row is non-constant vs. all-zero.
         let cfg = VitConfig {
             image_size: 4,
             patch_size: 2,
@@ -631,24 +664,27 @@ mod tests {
         vit.patch_proj_w = vec![0.0f32; vit.patch_proj_w.len()];
         vit.patch_proj_b = vec![0.0f32; vit.patch_proj_b.len()];
         vit.cls_token = vec![0.0f32; vit.cls_token.len()];
-        vit.pos_embed = vec![1.0f32; vit.pos_embed.len()];
-        vit.ln.weight = cpu_tensor(vec![1.0f32; 4], Shape::new(vec![4]));
+        // Non-constant per-dim pattern, repeated for every token.
+        let pattern = [1.0f32, 2.0, 3.0, 4.0];
+        vit.pos_embed = (0..vit.pos_embed.len()).map(|i| pattern[i % 4]).collect();
+        vit.ln = LayerNorm::ones(4, 1e-5);
 
         let image_data: Vec<f32> = (0..16).map(|i| (i as f32) * 0.01).collect();
         let img = cpu_tensor(image_data, Shape::new(vec![1, 4, 4]));
         let feat = vit.encode_image(&img).unwrap();
         let out = feat.to_vec_f32().unwrap();
 
-        // With all-ones pos_embed, all-zero weights/bias/cls_token:
-        // All token dims should be 1.0 (single pos_embed application).
-        // Old buggy code: CLS=0 (no pos_embed), patches=2.0 (double pos_embed).
+        let expect = LayerNorm::ones(4, 1e-5).forward(&pattern);
         assert_eq!(out.len(), 4);
-        for &v in &out {
+        for (i, (&got, &want)) in out.iter().zip(expect.iter()).enumerate() {
             assert!(
-                (v - 1.0).abs() < 0.01,
-                "CLS output should be ~1.0 (pos_embed applied once), got {v}"
+                (got - want).abs() < 1e-4,
+                "dim {i}: expected LayerNorm(pos_embed) {want}, got {got} \
+                 (pos_embed applied zero or twice?)"
             );
         }
+        // Sanity: the row is genuinely non-trivial, so this is a real check.
+        assert!(expect.iter().any(|v| v.abs() > 0.5));
     }
 
     #[test]

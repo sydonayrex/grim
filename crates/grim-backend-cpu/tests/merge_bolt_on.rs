@@ -41,9 +41,9 @@ fn build_base_file() -> (tempfile::TempDir, std::path::PathBuf) {
             scale_offset: 256,
             backup2: BackupLayer {
                 codes_offset: 512,
-                codes_size: 256,
+                codes_size: 8192,
                 bpw: 2,
-                scale_offset: 768,
+                scale_offset: 512 + 8192,
                 scale_size: 256,
             },
             ..Default::default()
@@ -56,7 +56,7 @@ fn build_base_file() -> (tempfile::TempDir, std::path::PathBuf) {
         shape: vec![ROWS, COLS],
         base_bitwidth: BPW,
         payload_offset: 0,
-        payload_size: 1024,
+        payload_size: 10240,
         ..Default::default()
     };
 

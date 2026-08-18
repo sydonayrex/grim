@@ -632,9 +632,19 @@ where
         completed: None,
     });
 
+    // Compare computed hash against expected digest BEFORE rename,
+    // so a corrupted download never reaches its final destination.
+    let sha256_hex = format!("{:x}", hasher.finalize());
+    if !digest.is_empty() && sha256_hex != digest {
+        // Remove the partial file so it doesn't linger.
+        let _ = fs::remove_file(&part);
+        return Err(Error::Backend(format!(
+            "SHA-256 integrity check failed: expected {digest}, got {sha256_hex}"
+        )));
+    }
+
     fs::rename(&part, dest).map_err(|e| Error::Backend(format!("rename failed: {e}")))?;
 
-    let sha256_hex = format!("{:x}", hasher.finalize());
     Ok(sha256_hex)
 }
 
@@ -1045,10 +1055,14 @@ pub fn check_model_cache() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn build_http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10));
+    // Gate TLS cert bypass behind GRIM_INSECURE_TLS=1 for local development only.
+    if std::env::var("GRIM_INSECURE_TLS").map(|v| v == "1" || v == "true").unwrap_or(false) {
+        eprintln!("[grim-core] WARNING: GRIM_INSECURE_TLS=1 — accepting invalid TLS certificates");
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder.build()
         .map_err(|e| Error::Backend(format!("failed to build HTTP client: {e}")))
 }
 

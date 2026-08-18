@@ -82,11 +82,11 @@ impl InklingSmall {
     }
 
     pub fn load_tp(
-        device: Device,
+        _device: Device,
         _ws: &grim_nn::WeightSource<'_>,
-        cfg: InklingSmallConfig,
+        _cfg: InklingSmallConfig,
     ) -> Result<Self> {
-        Ok(InklingSmall { cfg, device })
+        Err(Error::Unimplemented("InklingSmall load_tp is not yet implemented".into()))
     }
 }
 

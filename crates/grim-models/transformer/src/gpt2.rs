@@ -133,19 +133,33 @@ impl Gpt2Block {
         })
     }
 
+    /// Prefill-only convenience wrapper: attends over just the tokens passed
+    /// in. Correct when `x` is the whole prompt.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut cache = crate::kv_attention::RefKvCache::new();
+        self.forward_cached(x, &mut cache)
+    }
+
+    /// Cache-aware forward. Appends this call's K/V to `cache` before
+    /// attending, so a single-token decode step sees the full prior context
+    /// rather than only itself. [Group B fix: decode was stateless.]
+    pub fn forward_cached(
+        &self,
+        x: &Tensor,
+        cache: &mut crate::kv_attention::RefKvCache,
+    ) -> Result<Tensor> {
         let norm_x = self.ln_1.forward(x)?;
         let qkv = self.wqkv.forward(&norm_x)?;
 
         // Split QKV into separate Q, K, V
         let qkv_data = qkv.to_vec_f32()?;
-        let seq_len = qkv.shape().dims()[0];
+        let new_tokens = qkv.shape().dims()[0];
         let hidden_size = self.num_heads * self.head_dim;
-        let mut q = vec![0.0f32; seq_len * hidden_size];
-        let mut k = vec![0.0f32; seq_len * hidden_size];
-        let mut v = vec![0.0f32; seq_len * hidden_size];
+        let mut q = vec![0.0f32; new_tokens * hidden_size];
+        let mut k = vec![0.0f32; new_tokens * hidden_size];
+        let mut v = vec![0.0f32; new_tokens * hidden_size];
 
-        for pos in 0..seq_len {
+        for pos in 0..new_tokens {
             for h in 0..self.num_heads {
                 for d in 0..self.head_dim {
                     let idx = pos * 3 * hidden_size + h * self.head_dim + d;
@@ -156,50 +170,31 @@ impl Gpt2Block {
             }
         }
 
-        // Apply causal attention computation
-        let scale = 1.0 / (self.head_dim as f32).sqrt();
-        let mut attn_out = vec![0.0f32; seq_len * hidden_size];
+        let k_t = cpu_tensor(k, grim_tensor::Shape::new(vec![new_tokens, hidden_size]));
+        let past_len = cache.past_len;
+        cache.k.extend_from_slice(&k_t.to_vec_f32()?);
+        cache.v.extend_from_slice(&v);
+        let total_len = cache.past_len + new_tokens;
+        cache.past_len = total_len;
 
-        for h in 0..self.num_heads {
-            for t in 0..seq_len {
-                let mut scores = vec![0.0f32; seq_len];
-                // Causal masking
-                for t2 in 0..=t {
-                    let mut dot = 0.0f32;
-                    for d in 0..self.head_dim {
-                        dot += q[t * hidden_size + h * self.head_dim + d]
-                            * k[t2 * hidden_size + h * self.head_dim + d];
-                    }
-                    scores[t2] = dot * scale;
-                }
-                // Mask future positions
-                for t2 in (t + 1)..seq_len {
-                    scores[t2] = f32::NEG_INFINITY;
-                }
-                // Softmax
-                let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0f32;
-                for s in &mut scores {
-                    *s = (*s - mx).exp();
-                    sum += *s;
-                }
-                for s in &mut scores {
-                    *s /= sum;
-                }
-                // Weighted sum of V
-                for d in 0..self.head_dim {
-                    let mut acc = 0.0f32;
-                    for t2 in 0..=t {
-                        acc += scores[t2] * v[t2 * hidden_size + h * self.head_dim + d];
-                    }
-                    attn_out[t * hidden_size + h * self.head_dim + d] = acc;
-                }
-            }
-        }
+        // Cache-aware causal attention (see kv_attention.rs). MHA: kv heads == q heads.
+        let attn_out = crate::kv_attention::causal_attention(
+            &q,
+            &cache.k,
+            &cache.v,
+            new_tokens,
+            total_len,
+            past_len,
+            self.num_heads,
+            self.head_dim,
+            hidden_size,
+            hidden_size,
+            &(0..self.num_heads).collect::<Vec<_>>(),
+        );
 
         let attn_out_tensor = cpu_tensor(
             attn_out,
-            grim_tensor::Shape::new(vec![seq_len, hidden_size]),
+            grim_tensor::Shape::new(vec![new_tokens, hidden_size]),
         );
         let attn_out = self.c_proj.forward(&attn_out_tensor)?;
         let x_res1 = add_tensors(x, &attn_out).map_err(grim_core::Error::Tensor)?;
@@ -306,7 +301,11 @@ impl Model for Gpt2 {
 
 impl CausalLm for Gpt2 {
     fn new_session(&self) -> Box<dyn SessionT> {
-        Box::new(Inner::new(self.device.clone()))
+        let mut session = Inner::new(self.device.clone());
+        let caches: Vec<Option<crate::kv_attention::RefKvCache>> =
+            vec![None; self.layers.len()];
+        session.set_model_state(Box::new(caches));
+        Box::new(session)
     }
 
     fn forward(
@@ -329,8 +328,25 @@ impl CausalLm for Gpt2 {
         let pos_emb = self.wpe.forward(&pos_ids, seq_len, self.cfg.hidden_size)?;
 
         let mut h = add_tensors(&tok_emb, &pos_emb).map_err(grim_core::Error::Tensor)?;
-        for layer in &self.layers {
-            h = layer.forward(&h)?;
+
+        // Per-layer KV caches live on the session so decode steps see the full
+        // prior context (Group B fix).
+        if session.model_state().is_none() {
+            session.set_model_state(Box::new(vec![
+                None::<crate::kv_attention::RefKvCache>;
+                self.layers.len()
+            ]));
+        }
+        let caches = session
+            .model_state_mut()
+            .and_then(|s| s.downcast_mut::<Vec<Option<crate::kv_attention::RefKvCache>>>())
+            .expect("Gpt2::forward: model_state must be Vec<Option<RefKvCache>>");
+        if caches.len() < self.layers.len() {
+            caches.resize(self.layers.len(), None);
+        }
+        for (i, layer) in self.layers.iter().enumerate() {
+            let cache = caches[i].get_or_insert_with(crate::kv_attention::RefKvCache::new);
+            h = layer.forward_cached(&h, cache)?;
         }
         let h = self.ln_f.forward(&h)?;
         let logits = self.lm_head.forward(&h)?;
@@ -338,3 +354,102 @@ impl CausalLm for Gpt2 {
         Ok(logits)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kv_attention::RefKvCache;
+    use grim_nn::modules::Linear;
+    use grim_tensor::Shape;
+
+    fn lin(in_dim: usize, out_dim: usize) -> Linear {
+        // Ramp weights (not uniform) so the prior-context influence during
+        // decode is large enough to distinguish from a stateless forward.
+        let w: Vec<f32> = (0..out_dim * in_dim).map(|i| (i as f32) * 0.01 + 0.01).collect();
+        let w = cpu_tensor(w, Shape::new(vec![out_dim, in_dim]));
+        Linear::from_tensor(w, None)
+    }
+
+    fn identity_ln(dim: usize) -> LayerNorm {
+        LayerNorm {
+            weight: cpu_tensor(vec![1.0f32; dim], Shape::new(vec![dim])),
+            bias: None,
+            eps: 1e-5,
+        }
+    }
+
+    fn tiny_block() -> Gpt2Block {
+        let h = 4 * 2; // num_heads * head_dim
+        Gpt2Block {
+            ln_1: identity_ln(h),
+            wqkv: lin(h, 3 * h),
+            c_proj: lin(h, h),
+            ln_2: identity_ln(h),
+            ffn_gate: lin(h, h),
+            ffn_down: lin(h, h),
+            num_heads: 4,
+            head_dim: 2,
+        }
+    }
+
+    // Prefill regression: one call with the whole prompt must match a fresh
+    // cache-aware forward (Group B: the cache-aware path is the new default).
+    #[test]
+    fn test_prefill_matches_cacheless() {
+        let blk = tiny_block();
+        let n = 3;
+        let x = cpu_tensor((0..n * 8).map(|i| (i as f32) * 0.1).collect(), Shape::new(vec![n, 8]));
+        let a = blk
+            .forward_cached(&x, &mut RefKvCache::new())
+            .unwrap()
+            .to_vec_f32()
+            .unwrap();
+        let b = blk.forward(&x).unwrap().to_vec_f32().unwrap();
+        assert_eq!(a.len(), b.len());
+        for (av, bv) in a.iter().zip(b.iter()) {
+            assert!((av - bv).abs() <= 1e-4, "prefill mismatch {av} vs {bv}");
+        }
+    }
+
+    // Decode sees prior context: a cached single-token decode must differ from
+    // the stateless single-token forward (which is what the old code did).
+    #[test]
+    fn test_decode_sees_prior_context() {
+        let blk = tiny_block();
+        let prompt = cpu_tensor(
+            (0..2 * 8).map(|i| (i as f32) * 0.1).collect(),
+            Shape::new(vec![2, 8]),
+        );
+        let dec = cpu_tensor(vec![0.9f32; 8], Shape::new(vec![1, 8]));
+
+        let mut cache = RefKvCache::new();
+        let _ = blk.forward_cached(&prompt, &mut cache).unwrap();
+        let cached = blk.forward_cached(&dec, &mut cache).unwrap();
+
+        let stateless = blk.forward(&dec).unwrap();
+
+        let a = cached.to_vec_f32().unwrap();
+        let b = stateless.to_vec_f32().unwrap();
+        let diff = a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        assert!(diff > 1e-5, "decode ignored cached prefix (diff={diff})");
+        assert_eq!(cache.past_len, 3, "cache should hold prompt + decode");
+    }
+
+    // Cache length invariant: P prefill + N decode => past_len == P+N.
+    #[test]
+    fn test_cache_len_invariant() {
+        let blk = tiny_block();
+        let p = 4usize;
+        let n = 3usize;
+        let prompt = cpu_tensor((0..p * 8).map(|i| (i as f32) * 0.05).collect(), Shape::new(vec![p, 8]));
+        let mut cache = RefKvCache::new();
+        let _ = blk.forward_cached(&prompt, &mut cache).unwrap();
+        assert_eq!(cache.past_len, p);
+        for i in 0..n {
+            let tok = cpu_tensor((0..8).map(|j| (j as f32) * 0.03 + i as f32).collect(), Shape::new(vec![1, 8]));
+            let _ = blk.forward_cached(&tok, &mut cache).unwrap();
+        }
+        assert_eq!(cache.past_len, p + n);
+    }
+}
+

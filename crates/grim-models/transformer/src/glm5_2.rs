@@ -80,11 +80,11 @@ impl Glm52 {
     }
 
     pub fn load_tp(
-        device: Device,
+        _device: Device,
         _ws: &grim_nn::WeightSource<'_>,
-        cfg: Glm52Config,
+        _cfg: Glm52Config,
     ) -> Result<Self> {
-        Ok(Glm52 { cfg, device })
+        Err(Error::Unimplemented("Glm52 load_tp is not yet implemented".into()))
     }
 }
 

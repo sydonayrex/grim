@@ -121,10 +121,11 @@ impl UpBlock {
                     acc += self.conv_w[ch_out * (hidden * 2) + ch_in] * prev[ch_in * hw + elem];
                 }
                 if !skip.is_empty() {
-                    // Skip connection indexed by ch_in (the input channel), not ch_out.
-                    // [P1-35 fix: skip channel index uses ch_in, not ch_out.]
-                    acc += self.conv_w[ch_out * (hidden * 2) + hidden + ch_in]
-                        * skip[ch_in * hw + elem];
+                    // Skip connection: conv_w has [hidden * 2] entries per output channel,
+                    // where the second half [hidden..hidden*2] are the skip projection weights.
+                    // Index by ch_out (output channel) for the skip weights.
+                    acc += self.conv_w[ch_out * (hidden * 2) + hidden + ch_out]
+                        * skip[ch_out * hw + elem];
                 }
                 x_data[idx] = acc;
             }

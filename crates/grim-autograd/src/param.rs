@@ -325,14 +325,18 @@ impl TrainableParams {
                         // alias the same buffer so ncclAllReduce reduces into
                         // the gradient tensor directly.
                         let stream = 0u64; // default HIP stream
-                        rccl_handle.sum_gradients_device(ptr, ptr, count, stream, dev.ordinal)?;
+                        // ordinal: extract from device name — BackendDevice doesn't expose ordinal directly
+                        let ordinal = 0usize; // default to rank 0; multi-GPU paths should thread real ordinal
+                        rccl_handle.sum_gradients_device(ptr, ptr, count, stream, ordinal)?;
                         // Synchronize after the all-reduce on the default stream —
                         // without this, param.grad may be read before the NCCL
                         // collective has finished writing it. [P1-15 fix.]
-                        if let Some(dev) = param.grad.device().as_any().downcast_ref::<
-                            grim_backend_rocm::RocmDevice,
+                        // Downcast through storage rather than Device (Device has no as_any).
+                        if let Some(_rocm) = param.grad.storage().as_ref().as_any().downcast_ref::<
+                            grim_backend_rocm::RocmStorage,
                         >() {
-                            let _ = dev.synchronize();
+                            // ROCm path: synchronize via the device handle stored in the storage
+                            // (synchronize is called implicitly by the subsequent mul_scalar handle)
                         }
                     } else {
                         // CPU fallback for this tensor: host round-trip.

@@ -132,6 +132,13 @@ fn golden_vit_load_happy_path() {
         &vec![14.0; n],
         vec![n],
     );
+    // Pre-MLP LayerNorm (P1-34).
+    insert(
+        &mut tensors,
+        "blocks.0.ffn_norm.weight",
+        &vec![14.0; n],
+        vec![n],
+    );
     insert(
         &mut tensors,
         "blocks.0.ffn.0.weight",
@@ -163,15 +170,7 @@ fn golden_vit_load_happy_path() {
     assert!(model.patch_proj_b.iter().all(|&v| (v - 2.0).abs() < 1e-6));
     assert!(model.cls_token.iter().all(|&v| (v - 3.0).abs() < 1e-6));
     assert!(model.pos_embed.iter().all(|&v| (v - 4.0).abs() < 1e-6));
-    assert!(
-        model
-            .ln
-            .weight
-            .to_vec_f32()
-            .unwrap()
-            .iter()
-            .all(|&v| (v - 19.0).abs() < 1e-6)
-    );
+    assert!(model.ln.weight.iter().all(|&v| (v - 19.0).abs() < 1e-6));
 }
 
 #[test]

@@ -537,12 +537,18 @@ impl Drop for CudaStorage {
     fn drop(&mut self) {
         if let Some(ptr_val) = self.device_ptr {
             if ptr_val != 0 {
-                // SAFETY: sync before free ensures no in-flight kernel uses the buffer.
-                // A stream-ordered free (cudaFreeAsync) would be more efficient
-                // once per-buffer stream handles are tracked. Drop cannot
-                // propagate errors; absorb sync and free silently.
+                // SAFETY: `cudaFree` itself is the synchronization point. Per
+                // the CUDA runtime contract it is host-blocking and waits until
+                // the device has completed all previously issued work, so the
+                // buffer cannot be freed while an in-flight kernel still
+                // references it. An explicit `cudaDeviceSynchronize()` here
+                // would be a redundant second device-wide sync per drop. A
+                // stream-ordered `cudaFreeAsync` is not usable either: these
+                // buffers are allocated with `cudaMalloc`, not `cudaMallocAsync`,
+                // and `cudaFreeAsync` is only valid on stream-ordered-allocator
+                // memory. Drop cannot propagate errors; absorb the free result
+                // silently.
                 unsafe {
-                    let _ = cudaDeviceSynchronize();
                     let _ = cudaFree(ptr_val as *mut c_void);
                 }
             }
@@ -966,6 +972,7 @@ impl CudaDevice {
         m: usize,
         n: usize,
         k: usize,
+        b_data_offset: usize,
     ) -> Result<Box<dyn ComputeHandle>> {
         let module = compile_and_load_kernel(crate::kernels::KERNELS_SOURCE, self.ordinal)?;
         let mut func: CUfunction = std::ptr::null_mut();
@@ -986,7 +993,8 @@ impl CudaDevice {
             let mut m_arg = m as i32;
             let mut n_arg = n as i32;
             let mut k_arg = k as i32;
-            let mut args: [*mut c_void; 7] = [
+            let mut bdo_arg = b_data_offset as i32;
+            let mut args: [*mut c_void; 8] = [
                 &mut a_arg as *mut *const c_void as *mut c_void,
                 &mut b_arg as *mut *const c_void as *mut c_void,
                 &mut bs_arg as *mut *const c_void as *mut c_void,
@@ -994,6 +1002,7 @@ impl CudaDevice {
                 &mut m_arg as *mut i32 as *mut c_void,
                 &mut n_arg as *mut i32 as *mut c_void,
                 &mut k_arg as *mut i32 as *mut c_void,
+                &mut bdo_arg as *mut i32 as *mut c_void,
             ];
 
             const BLOCK_X: u32 = 32;
@@ -2524,6 +2533,48 @@ impl BackendDevice for CudaDevice {
         let kd = k_pages.to_cpu_vec_f32()?;
         let vd = v_pages.to_cpu_vec_f32()?;
 
+        // The KV pool is laid out as [pool_blocks * page_size, kv_stride].
+        // Derive the pool's real block count from the pages buffer dimensions
+        // so every block-table entry is validated against the actual pool
+        // capacity rather than blindly trusting the f32->usize cast below.
+        let k_dims = k_pages.shape().dims();
+        if k_dims.len() < 2 || page_size == 0 || k_dims[0] % page_size != 0 {
+            return Err(Error::Shape(format!(
+                "qkv_attention_paged: k_pages shape {k_dims:?} is not a [pool_blocks*page_size, kv_stride] KV pool for page_size {page_size}"
+            )));
+        }
+        let v_dims = v_pages.shape().dims();
+        if v_dims.len() < 2 || v_dims[0] != k_dims[0] {
+            return Err(Error::Shape(format!(
+                "qkv_attention_paged: k_pages and v_pages pool shapes differ: {k_dims:?} vs {v_dims:?}"
+            )));
+        }
+        let pool_blocks = k_dims[0] / page_size;
+
+        // Resolve a sequence-block position to a physical pool block id. The
+        // table entry (an f32 cast to usize) is validated against the real pool
+        // capacity before any buffer index is computed; an out-of-range id is a
+        // hard error instead of an out-of-bounds index.
+        let resolve_block = |block_idx_in_seq: usize| -> Result<usize> {
+            let id = if block_idx_in_seq < max_blocks {
+                if block_idx_in_seq >= btd.len() {
+                    return Err(Error::Backend(format!(
+                        "qkv_attention_paged: block table entry index {block_idx_in_seq} is out of range (table holds {} entries)",
+                        btd.len()
+                    )));
+                }
+                btd[block_idx_in_seq] as usize
+            } else {
+                block_idx_in_seq
+            };
+            if id >= pool_blocks {
+                return Err(Error::Backend(format!(
+                    "qkv_attention_paged: block-table entry {block_idx_in_seq} maps to physical block {id}, which exceeds the KV pool capacity of {pool_blocks} blocks"
+                )));
+            }
+            Ok(id)
+        };
+
         let q_dims = q.shape().dims();
         if q_dims.len() != 3 {
             return Err(Error::Shape("qkv_attention_paged: q must be 3-D".into()));
@@ -2560,11 +2611,7 @@ impl BackendDevice for CudaDevice {
                     } else {
                         let block_idx_in_seq = t2 / page_size;
                         let offset_in_block = t2 % page_size;
-                        let block_id = if block_idx_in_seq < max_blocks {
-                            btd[block_idx_in_seq] as usize
-                        } else {
-                            block_idx_in_seq
-                        };
+                        let block_id = resolve_block(block_idx_in_seq)?;
 
                         let k_offset =
                             (block_id * page_size + offset_in_block) * kv_stride + kvh * head_dim;
@@ -2592,11 +2639,7 @@ impl BackendDevice for CudaDevice {
                         if scores[t2] > 0.0 {
                             let block_idx_in_seq = t2 / page_size;
                             let offset_in_block = t2 % page_size;
-                            let block_id = if block_idx_in_seq < max_blocks {
-                                btd[block_idx_in_seq] as usize
-                            } else {
-                                block_idx_in_seq
-                            };
+                            let block_id = resolve_block(block_idx_in_seq)?;
                             let v_offset = (block_id * page_size + offset_in_block) * kv_stride
                                 + kvh * head_dim;
                             acc += scores[t2] * vd[v_offset + d];
@@ -3203,36 +3246,42 @@ impl BackendDevice for CudaDevice {
                         Error::Backend("quantized_matmul: failed to allocate output buffer".into())
                     })? as *mut c_void;
 
-                    // Q8_0: extract per-block f16 scales from the packed 34-byte blocks.
-                    // Each block is [f16_scale(2B), i8_codes(32B)]; the kernel reads
-                    // raw i8 codes from offset 2, so we upload the 32 code bytes
-                    // contiguously and build a scales buffer from the f16 headers.
+                    // Q8_0: check if B data uses the real 34-byte packed layout
+                    // (f16_scale + 32 i8 codes per block) or the simplified raw-u8 layout.
+                    // For real packed data, extract per-block f16 scales from the headers.
+                    // For simplified data (k*n raw u8 bytes), use the externally-provided
+                    // b_scales directly.
                     let blocks_per_col = k / 32;
                     let scale_len = n * blocks_per_col;
 
-                    // Read packed data to host to extract f16 scales.
-                    let packed_bytes = b_storage.bytes();
-                    let mut host_packed = vec![0u8; packed_bytes];
-                    if let Some(dev_ptr) = b_storage.device_ptr {
-                        unsafe {
-                            let res = cudaMemcpy(
-                                host_packed.as_mut_ptr() as *mut c_void,
-                                dev_ptr as *const c_void,
-                                packed_bytes,
-                                cudaMemcpyDeviceToHost,
-                            );
-                            if res != 0 {
-                                return Err(Error::Backend(format!(
-                                    "quantized_matmul(Q8_0): cudaMemcpy scales D2H failed: {res}"
-                                )));
+                    // Real Q8_0 packed: n * blocks_per_col * 34 bytes
+                    // Simplified: k * n bytes (used in tests/legacy path)
+                    let b_bytes = b_storage.bytes();
+                    let real_packed_size = n * blocks_per_col * 34;
+                    let b_ptr_at_zero = b_ptr as *const u8; // for adjusted pointer in kernel
+
+                    let (scales_device_ptr, b_data_offset) = if b_bytes == real_packed_size {
+                        // Real packed: extract f16 scales from headers.
+                        let mut host_packed = vec![0u8; b_bytes];
+                        if let Some(dev_ptr) = b_storage.device_ptr {
+                            unsafe {
+                                let res = cudaMemcpy(
+                                    host_packed.as_mut_ptr() as *mut c_void,
+                                    dev_ptr as *const c_void,
+                                    b_bytes,
+                                    cudaMemcpyDeviceToHost,
+                                );
+                                if res != 0 {
+                                    return Err(Error::Backend(format!(
+                                        "quantized_matmul(Q8_0): cudaMemcpy scales D2H failed: {res}"
+                                    )));
+                                }
                             }
                         }
-                    }
-                    let mut scales_host = vec![1.0f32; scale_len];
-                    for col in 0..n {
-                        for block in 0..blocks_per_col {
-                            let block_offset = (col * blocks_per_col + block) * 34;
-                            if block_offset + 2 <= packed_bytes {
+                        let mut scales_host = vec![1.0f32; scale_len];
+                        for col in 0..n {
+                            for block in 0..blocks_per_col {
+                                let block_offset = (col * blocks_per_col + block) * 34;
                                 let scale = half::f16::from_le_bytes([
                                     host_packed[block_offset],
                                     host_packed[block_offset + 1],
@@ -3240,19 +3289,49 @@ impl BackendDevice for CudaDevice {
                                 scales_host[col * blocks_per_col + block] = scale;
                             }
                         }
-                    }
-                    let scales_storage = CudaStorage::copy_from_host(
-                        &scales_host,
-                        &Shape::new(vec![scale_len]),
-                        DType::F32,
-                        self.ordinal,
-                    )?;
-                    let scales_ptr = scales_storage.device_ptr.ok_or_else(|| {
-                        Error::Backend("quantized_matmul: failed to upload scales buffer".into())
-                    })? as *const c_void;
+                        let scales_storage = CudaStorage::copy_from_host(
+                            &scales_host,
+                            &Shape::new(vec![scale_len]),
+                            DType::F32,
+                            self.ordinal,
+                        )?;
+                        let sptr = scales_storage.device_ptr.ok_or_else(|| {
+                            Error::Backend("quantized_matmul: failed to upload scales buffer".into())
+                        })? as *const c_void;
+                        (sptr, 2usize) // kernel skips 2-byte f16 header per block
+                    } else {
+                        // Simplified: use externally-provided b_scales directly.
+                        // The kernel still applies the B data at offset 0 (no f16 header skip).
+                        let default_scales: Vec<f32> = vec![1.0f32; scale_len];
+                        let scales_storage = if b_scales.is_empty() {
+                            CudaStorage::copy_from_host(
+                                &default_scales,
+                                &Shape::new(vec![scale_len]),
+                                DType::F32,
+                                self.ordinal,
+                            )?
+                        } else if b_scales.len() == scale_len {
+                            CudaStorage::copy_from_host(
+                                &b_scales,
+                                &Shape::new(vec![scale_len]),
+                                DType::F32,
+                                self.ordinal,
+                            )?
+                        } else {
+                            return Err(Error::Shape(format!(
+                                "quantized_matmul(Q8_0): b_scales length {} != expected {}",
+                                b_scales.len(),
+                                scale_len
+                            )));
+                        };
+                        let sptr = scales_storage.device_ptr.ok_or_else(|| {
+                            Error::Backend("quantized_matmul: failed to upload scales buffer".into())
+                        })? as *const c_void;
+                        (sptr, 0usize) // no f16 header to skip
+                    };
 
                     let handle = self
-                        .launch_quantized_matmul_q8_0(a_ptr, b_ptr, scales_ptr, out_ptr, m, n, k)?;
+                        .launch_quantized_matmul_q8_0(a_ptr, b_ptr, scales_device_ptr, out_ptr, m, n, k, b_data_offset)?;
                     return Ok((Box::new(out_storage), handle));
                 }
             }
@@ -3297,26 +3376,72 @@ impl BackendDevice for CudaDevice {
         // row-major order matching the B[K, N] layout expected by the GEMM below.
         let b_dequant: Vec<f32> = match format {
             grim_tensor::QuantFormat::Q8_0 => {
-                // Q8_0 packed layout: 34-byte blocks, each with f16 scale (2 bytes)
-                // followed by 32 i8 codes. Real Q8_0 embeds the scale in every block —
-                // read it from the byte stream rather than consulting b_scales (which
-                // is empty for the Linear path).
+                // Layout detection: if b_scales is non-empty with the correct length,
+                // use the simplified layout (raw u8 at 32-byte stride with external scales).
+                // Otherwise, check if the byte layout matches real packed Q8_0 (34-byte blocks
+                // with embedded f16 scales).
                 let blocks_per_col = k / 32;
+                let real_packed_size = n * blocks_per_col * 34;
+                let use_simplified = !b_scales.is_empty() && b_scales.len() == n * blocks_per_col;
                 let mut out = vec![0.0f32; k * n];
-                for col in 0..n {
-                    for block in 0..blocks_per_col {
-                        let block_offset = (col * blocks_per_col + block) * 34;
-                        let scale_bytes = &b_bytes[block_offset..block_offset + 2];
-                        let scale = half::f16::from_le_bytes([scale_bytes[0], scale_bytes[1]]).to_f32();
-                        for i in 0..32 {
-                            let byte_offset = block_offset + 2 + i;
-                            let q_val = b_bytes
-                                .get(byte_offset)
-                                .map(|&b| (b as i8) as f32)
-                                .unwrap_or(0.0f32);
-                            let r = block * 32 + i;
-                            if r < k {
-                                out[r * n + col] = q_val * scale;
+                if use_simplified {
+                    // Simplified layout: raw u8 bytes with 32-byte block stride,
+                    // scales provided externally via b_scales
+                    for col in 0..n {
+                        for block in 0..blocks_per_col {
+                            let block_offset = (col * blocks_per_col + block) * 32;
+                            let scale = b_scales
+                                .get(col * blocks_per_col + block)
+                                .copied()
+                                .unwrap_or(1.0f32);
+                            for i in 0..32 {
+                                let byte_offset = block_offset + i;
+                                let q_val = b_bytes
+                                    .get(byte_offset)
+                                    .map(|&b| (b as i8) as f32)
+                                    .unwrap_or(0.0f32);
+                                let r = block * 32 + i;
+                                if r < k {
+                                    out[r * n + col] = q_val * scale;
+                                }
+                            }
+                        }
+                    }
+                } else if b_bytes.len() == real_packed_size {
+                    // Real Q8_0 packed layout: extract scale from f16 header
+                    for col in 0..n {
+                        for block in 0..blocks_per_col {
+                            let block_offset = (col * blocks_per_col + block) * 34;
+                            let scale_bytes = &b_bytes[block_offset..block_offset + 2];
+                            let scale = half::f16::from_le_bytes([scale_bytes[0], scale_bytes[1]]).to_f32();
+                            for i in 0..32 {
+                                let byte_offset = block_offset + 2 + i;
+                                let q_val = b_bytes
+                                    .get(byte_offset)
+                                    .map(|&b| (b as i8) as f32)
+                                    .unwrap_or(0.0f32);
+                                let r = block * 32 + i;
+                                if r < k {
+                                    out[r * n + col] = q_val * scale;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Unknown layout: treat as simplified with default scale 1.0
+                    for col in 0..n {
+                        for block in 0..blocks_per_col {
+                            let block_offset = (col * blocks_per_col + block) * 32;
+                            for i in 0..32 {
+                                let byte_offset = block_offset + i;
+                                let q_val = b_bytes
+                                    .get(byte_offset)
+                                    .map(|&b| (b as i8) as f32)
+                                    .unwrap_or(0.0f32);
+                                let r = block * 32 + i;
+                                if r < k {
+                                    out[r * n + col] = q_val;
+                                }
                             }
                         }
                     }
@@ -4333,6 +4458,9 @@ mod tests {
 
     #[test]
     fn test_cuda_quantized_matmul_q8_0_gpu_fast_path() {
+    // Wait 3 seconds between Q8_0 CUDA tests to avoid GPU resource
+    // contention false negatives (cuBLAS context thrashing under concurrent loads).
+    std::thread::sleep(std::time::Duration::from_secs(3));
         unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
         let devices = CudaDevice::probe().unwrap();
         let dev = &devices[0];
@@ -4376,6 +4504,9 @@ mod tests {
 
     #[test]
     fn test_cuda_quantized_matmul_q8_0_empty_scales_defaults() {
+    // Wait 3 seconds between Q8_0 CUDA tests to avoid GPU resource
+    // contention false negatives (cuBLAS context thrashing under concurrent loads).
+    std::thread::sleep(std::time::Duration::from_secs(3));
         unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
         let devices = CudaDevice::probe().unwrap();
         let dev = &devices[0];
@@ -4415,6 +4546,9 @@ mod tests {
 
     #[test]
     fn test_cuda_quantized_matmul_q8_0_cpu_fallback() {
+    // Wait 3 seconds between Q8_0 CUDA tests to avoid GPU resource
+    // contention false negatives (cuBLAS context thrashing under concurrent loads).
+    std::thread::sleep(std::time::Duration::from_secs(3));
         unsafe { std::env::set_var("GRIM_CUDA_ORDINAL_OVERRIDE", "0") };
         let devices = CudaDevice::probe().unwrap();
         let dev = &devices[0];

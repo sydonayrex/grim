@@ -4,7 +4,7 @@
 use grim_backend_cpu::CpuDevice;
 use grim_backend_rocm::RocmDevice;
 use grim_tensor::dtype::{DType, QuantFormat};
-use grim_tensor::{BackendDevice, Shape};
+use grim_tensor::{BackendDevice, BackendStorage, Shape};
 
 #[test]
 fn test_silu_mul_quantize_parity() {
@@ -23,8 +23,10 @@ fn test_silu_mul_quantize_parity() {
         .unwrap();
     h_cpu.synchronize().unwrap();
 
-    let q_cpu_vec = q_bytes_cpu.to_cpu_vec_f32().unwrap();
     let scale_cpu_val = s_cpu.to_cpu_vec_f32().unwrap()[0];
+    // Downcast CPU storage to get raw bytes for comparison
+    let q_cpu_storage = q_bytes_cpu.as_any().downcast_ref::<grim_backend_cpu::CpuStorage>().unwrap();
+    let q_cpu_elem_count = q_cpu_storage.shape().elem_count();
 
     let g_rocm = rocm_dev.from_cpu(&gate_data, &shape, DType::F32).unwrap();
     let u_rocm = rocm_dev.from_cpu(&up_data, &shape, DType::F32).unwrap();
@@ -34,11 +36,22 @@ fn test_silu_mul_quantize_parity() {
         .unwrap();
     h_rocm.synchronize().unwrap();
 
-    let q_rocm_vec = q_bytes_rocm.to_cpu_vec_f32().unwrap();
     let scale_rocm_val = s_rocm.to_cpu_vec_f32().unwrap()[0];
+    // Copy ROCm storage to CPU for comparison
+    let q_rocm_vec = q_bytes_rocm.to_cpu_vec_f32().unwrap();
+    let q_rocm_elem_count = q_bytes_rocm.shape().elem_count();
+
+    eprintln!("CPU: q_elem_count={}, scale={}", q_cpu_elem_count, scale_cpu_val);
+    eprintln!("ROCm: q_elem_count={}, scale={}", q_rocm_elem_count, scale_rocm_val);
 
     assert!((scale_cpu_val - scale_rocm_val).abs() < 1e-4);
-    assert_eq!(q_cpu_vec.len(), q_rocm_vec.len());
+    assert_eq!(q_cpu_elem_count, q_rocm_elem_count);
+    // Compare quantized values (both as f32, then cast to i32 for tolerance check)
+    assert!(q_cpu_storage.data().iter().zip(q_rocm_vec.iter()).all(|(c, r)| {
+        let ci = (*c as u8) as i32;
+        let ri = (*r as f32).round() as i32;
+        (ci - ri).abs() <= 1
+    }));
 }
 
 #[test]

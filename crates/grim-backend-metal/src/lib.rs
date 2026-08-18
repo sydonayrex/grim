@@ -5095,9 +5095,12 @@ mod tests {
         let dev = MetalDevice::new(0).expect("MetalDevice::new(0) should succeed");
         let x_data = vec![3.0f32, 4.0];
         let w_data = vec![1.0f32, 2.0];
-        let shape = Shape::new(vec![2]);
+        // `rms_norm`'s contract takes a rank-2 (rows, dim) out_shape; the
+        // weight stays 1-D.
+        let shape = Shape::new(vec![1, 2]);
+        let w_shape = Shape::new(vec![2]);
         let x = dev.from_cpu(&x_data, &shape, DType::F32).unwrap();
-        let w = dev.from_cpu(&w_data, &shape, DType::F32).unwrap();
+        let w = dev.from_cpu(&w_data, &w_shape, DType::F32).unwrap();
         let (out, handle) = dev.rms_norm(x.as_ref(), w.as_ref(), 1e-6, &shape).unwrap();
         handle.synchronize().unwrap();
         let res = out.to_cpu_vec_f32().unwrap();

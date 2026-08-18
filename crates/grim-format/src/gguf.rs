@@ -41,6 +41,22 @@ pub enum GgufValue {
     Float64(f64),
 }
 
+static WARNED_AS_U32_TRUNCATED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Warn once when `as_u32` drops an integer metadata value that falls
+/// outside the `u32` range (negative or > u32::MAX). Previously these were
+/// silently truncated with `as u32`, which produced nonsense values
+/// (e.g. -1 → 4294967295).
+fn warn_as_u32_truncated() {
+    if !WARNED_AS_U32_TRUNCATED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[grim-format] GgufValue::as_u32: integer metadata value outside u32 range \
+             (negative or > u32::MAX) dropped — check the source GGUF metadata"
+        );
+    }
+}
+
 impl GgufValue {
     pub fn as_str(&self) -> Option<&str> {
         match self {
@@ -49,16 +65,23 @@ impl GgufValue {
         }
     }
     pub fn as_u32(&self) -> Option<u32> {
-        match self {
-            GgufValue::Uint32(v) => Some(*v),
-            GgufValue::Uint64(v) => Some(*v as u32),
-            GgufValue::Int32(v) => Some(*v as u32),
-            GgufValue::Int64(v) => Some(*v as u32),
-            GgufValue::Int8(v) => Some(*v as u32),
-            GgufValue::Int16(v) => Some(*v as u32),
-            GgufValue::Uint8(v) => Some(*v as u32),
-            GgufValue::Uint16(v) => Some(*v as u32),
-            _ => None,
+        let wide: i128 = match self {
+            GgufValue::Uint8(v) => *v as i128,
+            GgufValue::Uint16(v) => *v as i128,
+            GgufValue::Uint32(v) => *v as i128,
+            GgufValue::Uint64(v) => *v as i128,
+            GgufValue::Int8(v) => *v as i128,
+            GgufValue::Int16(v) => *v as i128,
+            GgufValue::Int32(v) => *v as i128,
+            GgufValue::Int64(v) => *v as i128,
+            _ => return None,
+        };
+        match u32::try_from(wide) {
+            Ok(u) => Some(u),
+            Err(_) => {
+                warn_as_u32_truncated();
+                None
+            }
         }
     }
     pub fn as_f32(&self) -> Option<f32> {
@@ -1336,14 +1359,51 @@ fn read_grim_quant_overrides(value: &GgufValue) -> Option<Vec<GrimQuantOverride>
     let arr = value.as_array()?;
     let mut overrides = Vec::with_capacity(arr.len());
     for entry in arr {
-        let inner = entry.as_array()?;
+        let inner = match entry.as_array() {
+            Some(a) => a,
+            None => {
+                eprintln!("[grim-format] skipping malformed quant override entry (not an array)");
+                continue;
+            }
+        };
         if inner.len() < 4 {
+            eprintln!("[grim-format] skipping quant override entry with < 4 fields");
             continue;
         }
-        let tensor_name = inner[0].as_str()?.to_string();
-        let effective_bpw = inner[1].as_u32()?;
-        let override_dtype_tag = inner[2].as_u32()?;
-        let override_dtype = GgufDType::from_tag(override_dtype_tag)?;
+        let tensor_name = match inner[0].as_str() {
+            Some(s) => s.to_string(),
+            None => {
+                eprintln!("[grim-format] skipping quant override entry with non-string name");
+                continue;
+            }
+        };
+        let effective_bpw = match inner[1].as_u32() {
+            Some(v) => v,
+            None => {
+                eprintln!(
+                    "[grim-format] skipping quant override '{tensor_name}': invalid effective_bpw"
+                );
+                continue;
+            }
+        };
+        let override_dtype_tag = match inner[2].as_u32() {
+            Some(v) => v,
+            None => {
+                eprintln!(
+                    "[grim-format] skipping quant override '{tensor_name}': invalid override dtype tag"
+                );
+                continue;
+            }
+        };
+        let override_dtype = match GgufDType::from_tag(override_dtype_tag) {
+            Some(d) => d,
+            None => {
+                eprintln!(
+                    "[grim-format] skipping quant override '{tensor_name}': unknown dtype tag {override_dtype_tag}"
+                );
+                continue;
+            }
+        };
         let importance_score = inner[3].as_f32().unwrap_or(0.0);
 
         let layout_hint = inner.get(4).and_then(|v| v.as_str()).and_then(|s| match s {
@@ -1644,6 +1704,21 @@ fn read_gguf_value_with_tag<R: Read>(r: &mut R, tag: u32) -> Result<GgufValue> {
     }
 }
 
+static WARNED_DTYPE_F64: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WARNED_DTYPE_INT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WARNED_DTYPE_BF16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Warn once when a GGUF dtype loses precision under the canonical grim
+/// dtype mapping (value precision is not preserved).
+fn warn_dtype_lossy(kind: &str, flag: &std::sync::atomic::AtomicBool) {
+    if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[grim-format] GGUF dtype {kind} is lossy under the canonical grim dtype mapping — \
+             value precision is not preserved"
+        );
+    }
+}
+
 /// Canonical GGUF dtype → grim `DType` mapping, preserving quantization storage.
 ///
 /// This is the single source of truth for how GGUF tensor dtypes map to grim's
@@ -1658,12 +1733,18 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
     match gguf_dtype {
         GgufDType::F32 => DType::F32,
         GgufDType::F16 => DType::F16,
-        GgufDType::F64 => DType::F32,
+        GgufDType::F64 => {
+            warn_dtype_lossy("F64", &WARNED_DTYPE_F64);
+            DType::F32
+        }
         GgufDType::I8 => DType {
             arith: grim_tensor::ArithType::U8,
             storage: Storage::Native,
         },
-        GgufDType::I16 | GgufDType::I32 | GgufDType::I64 => DType::F32,
+        GgufDType::I16 | GgufDType::I32 | GgufDType::I64 => {
+            warn_dtype_lossy("I16/I32/I64", &WARNED_DTYPE_INT);
+            DType::F32
+        }
         GgufDType::Q2K => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::Q2K),
@@ -1724,7 +1805,10 @@ pub fn map_gguf_dtype_to_storage(gguf_dtype: GgufDType) -> DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::KQuant(KQuantScheme::IQ2S),
         },
-        GgufDType::BF16 => DType::F16,
+        GgufDType::BF16 => {
+            warn_dtype_lossy("BF16", &WARNED_DTYPE_BF16);
+            DType::F16
+        }
         GgufDType::MXFP4 => DType {
             arith: grim_tensor::ArithType::F32,
             storage: Storage::FloatPack(FloatPackScheme::MxFp4),

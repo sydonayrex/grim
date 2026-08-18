@@ -81,11 +81,11 @@ impl DiffusionGemma {
     }
 
     pub fn load_tp(
-        device: Device,
+        _device: Device,
         _ws: &grim_nn::WeightSource<'_>,
-        cfg: DiffusionGemmaConfig,
+        _cfg: DiffusionGemmaConfig,
     ) -> Result<Self> {
-        Ok(DiffusionGemma { cfg, device })
+        Err(Error::Unimplemented("DiffusionGemma load_tp is not yet implemented".into()))
     }
 }
 

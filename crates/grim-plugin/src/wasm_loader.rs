@@ -310,9 +310,9 @@ impl Sampler for WasmSampler {
             // instantiation only, so long-running plugins would trap mid-inference
             // once fuel is exhausted. [P1-29 fix: per-call fuel top-up.]
             if let Some(fuel) = self.limits.fuel_per_invocation {
-                store.set_fuel(fuel).map_err(|e| {
-                    Error::Backend(format!("WASM set_fuel failed: {e}"))
-                })?;
+                store
+                    .set_fuel(fuel)
+                    .map_err(|e| Error::Backend(format!("WASM set_fuel failed: {e}")))?;
             }
 
             let token_id = sample_typed

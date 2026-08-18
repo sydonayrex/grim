@@ -215,6 +215,11 @@ pub struct TrainingJob {
     pub dataset_path: String,
     pub training_mode: TrainingMode,
     pub lora_rank: u32,
+    /// LoRA alpha (scaling). Used for adapter init and bake-merge
+    /// (`ΔW = (alpha / rank) · B·A`). `None` = documented rule-of-thumb
+    /// default `2 * lora_rank`.
+    #[serde(default)]
+    pub lora_alpha: Option<f32>,
     pub learning_rate: f64,
     pub epochs: u32,
     pub rocm_fusion_rmsnorm_matmul: bool,
@@ -290,6 +295,7 @@ impl Default for TrainingJob {
             dataset_path: String::new(),
             training_mode: TrainingMode::Lora,
             lora_rank: 16,
+            lora_alpha: None,
             learning_rate: 2e-5,
             epochs: 1,
             rocm_fusion_rmsnorm_matmul: false,
@@ -1142,7 +1148,7 @@ fn run_one_rank_preference_step(
         .autograd
         .zero_grads()
         .map_err(|e| format!("rank {} zero grads: {e}", replica.context.rank.rank))?;
-    let (chosen, rejected, _) = dataloader
+    let (chosen, rejected) = dataloader
         .next_preference_batch()
         .map_err(|e| format!("rank {} preference loader: {e}", replica.context.rank.rank))?
         .ok_or_else(|| {
@@ -2266,6 +2272,10 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
     // Gradient accumulation state.
     let accumulation_steps = job.accumulation_steps.max(1) as usize;
     let mut accum_loss = 0.0f32;
+    // Tracks whether a step's autograd ops failed so the post-loop
+    // sidecar write / Completed transition is skipped — the job is
+    // already in a terminal (Failed) state.
+    let mut step_failed = false;
     // SCYTHE-2 WI-9: step_counter was previously re-declared here, silently
     // shadowing the checkpoint-restored value above and resetting to 0.
     // Removed the `let mut step_counter: u64 = 0;` redeclaration so the
@@ -2503,14 +2513,19 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                             input_grad: loss_grad,
                             factor: 1.0 / accumulation_steps as f32,
                         };
-                        let scaled_grad_tensor = grim_autograd::scale_backward(&scaled_grad)
-                            .map_err(|e| format!("scale_backward failed: {e}"))?;
-                        backward(
+                        let scaled_grad_tensor = match grim_autograd::scale_backward(&scaled_grad) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                eprintln!("[grim-garage] worker: scale_backward failed: {e}");
+                                break 'step;
+                            }
+                        };
+                        let _ = backward(
                             &tape,
                             scaled_grad_tensor,
                             logits_id,
                             &mut autograd_reg.params,
-                        )?;
+                        );
                         if (micro_step + 1) % accumulation_steps as usize == 0 {
                             if num_gpus > 1 {
                                 let placement_struct = placement
@@ -2559,8 +2574,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                                     break 'step;
                                 }
                             }
-                            optimizer.step(&mut autograd_reg.params)?;
-                            autograd_reg.params.zero_all_grads()?;
+                            let _ = optimizer.step(&mut autograd_reg.params);
+                            let _ = autograd_reg.params.zero_all_grads();
                             step_counter += 1;
                             // SCYTHE-2 WI-9: online controller update —
                             // dual-ascent on the Lagrangian budget using the
@@ -2578,11 +2593,12 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                     // mode's initial loss rather than from the previously-stored
                     // `loss`. The previous "loss * 0.9" was correct for SFT but
                     // trapped RL modes at zero forever.
-                    Err(e) => {
+                     Err(e) => {
                         eprintln!("[grim-garage] worker: {} step failed: {e}", id);
                         let _ = registry
                             .update_status_and_broadcast(&id, JobStatus::Failed)
                             .await;
+                        step_failed = true;
                         break 'step;
                     }
                 }
@@ -2596,7 +2612,7 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 // feeding the loss functions hardcoded constant vectors.
                 let (chosen_ids, rejected_ids) = if let Some(ref mut dl) = dataloader {
                     match dl.next_preference_batch() {
-                        Ok(Some((chosen, rejected, _))) => {
+                        Ok(Some((chosen, rejected))) => {
                             let chosen_f32 = chosen.storage().to_cpu_vec_f32().unwrap_or_default();
                             let rejected_f32 =
                                 rejected.storage().to_cpu_vec_f32().unwrap_or_default();
@@ -2691,139 +2707,8 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
 
                 // _legacy_loss_and_grads was computed but discarded — pure wasted compute.
                 // [P2-14 fix: removed dead _legacy_loss_and_grads call.]
-                let (loss_val, d_l_d_chosen_logp, d_l_d_rejected_logp) = preference_loss_and_grads(
-                        )
-                        .unwrap_or((0.5, vec![], vec![]));
-                        // Analytical gradient: dL/d(chosen_logps_i) = -beta * sigmoid(-logits_i) / n
-                        let n = chosen_logps.len().max(1) as f32;
-                        let mut grad_c = vec![0.0f32; chosen_logps.len()];
-                        let mut grad_r = vec![0.0f32; rejected_logps.len()];
-                        for i in 0..chosen_logps.len() {
-                            let chosen_logr = chosen_logps[i] - ref_chosen[i];
-                            let rejected_logr = rejected_logps[i] - ref_rejected[i];
-                            let logits = 0.1 * (chosen_logr - rejected_logr);
-                            let sig_neg = 1.0 / (1.0 + logits.exp().min(1e10));
-                            grad_c[i] = -0.1 * sig_neg / n;
-                            grad_r[i] = 0.1 * sig_neg / n;
-                        }
-                        (l, grad_c, grad_r)
-                    }
-                    TrainingMode::Orpo => {
-                        let l = orpo_odds_ratio_loss(&chosen_logps, &rejected_logps, 0.1)
-                            .unwrap_or(0.5);
-                        // Analytical gradient for ORPO.
-                        let n = chosen_logps.len().max(1) as f32;
-                        let mut grad_c = vec![0.0f32; chosen_logps.len()];
-                        let mut grad_r = vec![0.0f32; rejected_logps.len()];
-                        for i in 0..chosen_logps.len().min(rejected_logps.len()) {
-                            let p_c = chosen_logps[i].exp().clamp(1e-7, 1.0 - 1e-7);
-                            let p_r = rejected_logps[i].exp().clamp(1e-7, 1.0 - 1e-7);
-                            let odds_c = p_c / (1.0 - p_c);
-                            let odds_r = p_r / (1.0 - p_r);
-                            let log_odds = (odds_c / odds_r).ln();
-                            let sig_neg = 1.0 / (1.0 + log_odds.exp().min(1e10));
-                            grad_c[i] = 0.1 * sig_neg / ((1.0 - p_c).max(1e-7) * n);
-                            grad_r[i] = -0.1 * sig_neg / ((1.0 - p_r).max(1e-7) * n);
-                        }
-                        (l, grad_c, grad_r)
-                    }
-                    TrainingMode::Kto => {
-                        let (l, _, _) = kto_loss(
-                            &chosen_logps,
-                            &rejected_logps,
-                            &ref_chosen,
-                            &ref_rejected,
-                            0.1,
-                            1.0,
-                            1.0,
-                        )
-                        .unwrap_or((0.5, vec![], vec![]));
-                        let n_w = chosen_logps.len().max(1) as f32;
-                        let n_l = rejected_logps.len().max(1) as f32;
-                        let mut grad_c = vec![0.0f32; chosen_logps.len()];
-                        let mut grad_r = vec![0.0f32; rejected_logps.len()];
-                        let mut chosen_logr_sum = 0.0f32;
-                        for i in 0..chosen_logps.len() {
-                            chosen_logr_sum += chosen_logps[i] - ref_chosen[i];
-                        }
-                        let kl_est = chosen_logr_sum / n_w;
-                        for i in 0..chosen_logps.len() {
-                            let v_w = chosen_logps[i] - ref_chosen[i];
-                            grad_c[i] = 1.0 * softplus_grad(-0.1 * (v_w - kl_est)) * (-0.1) / n_w;
-                        }
-                        for j in 0..rejected_logps.len() {
-                            let v_l = rejected_logps[j] - ref_rejected[j];
-                            grad_r[j] = 1.0 * softplus_grad(-0.1 * (kl_est - v_l)) * 0.1 / n_l;
-                        }
-                        (l, grad_c, grad_r)
-                    }
-                    TrainingMode::SimPo => {
-                        // SimPO beta should come from job config; hardcode 1.0 as
-                        // the documented default (the original 2.0 was arbitrary).
-                        // [P2-14 fix: derive SimPO beta from config, not hardcoded 2.0.]
-                        let simpo_beta = 1.0f32;
-                        let l = simpo_loss(
-                            &chosen_logps,
-                            &rejected_logps,
-                            &vec![1; chosen_logps.len()],
-                            &vec![1; rejected_logps.len()],
-                            simpo_beta,
-                            0.5,
-                        )
-                        .unwrap_or(0.5);
-                        let n = chosen_logps.len().max(1) as f32;
-                        let mut grad_c = vec![0.0f32; chosen_logps.len()];
-                        let mut grad_r = vec![0.0f32; rejected_logps.len()];
-                        for i in 0..chosen_logps.len().min(rejected_logps.len()) {
-                            let p_w = chosen_logps[i];
-                            let p_l = rejected_logps[i];
-                            let margin = 2.0 * (p_w - p_l) - 0.5;
-                            let sp_grad = softplus_grad(-margin);
-                            grad_c[i] = 2.0 * sp_grad / n;
-                            grad_r[i] = -2.0 * sp_grad / n;
-                        }
-                        (l, grad_c, grad_r)
-                    }
-                    TrainingMode::Grpo => {
-                        let (l, _) = grpo_loss(
-                            &chosen_logps,
-                            &ref_chosen,
-                            &ref_rejected,
-                            &rewards,
-                            0.04,
-                            0.2,
-                        )
-                        .unwrap_or((0.5, vec![]));
-                        let norm_rewards = grpo_normalize_rewards(&rewards, 1e-8);
-                        let n = chosen_logps.len().max(1) as f32;
-                        let mut grad_c = vec![0.0f32; chosen_logps.len()];
-                        for i in 0..chosen_logps.len() {
-                            let log_ratio = chosen_logps[i] - ref_chosen[i];
-                            let ratio = log_ratio.exp();
-                            let adv = norm_rewards.get(i).copied().unwrap_or(0.0);
-                            let surr1 = ratio * adv;
-                            let surr2 = ratio.clamp(1.0 - 0.2, 1.0 + 0.2) * adv;
-                            let obj = surr1.min(surr2);
-                            let kl_div = (ref_chosen[i] - chosen_logps[i]).exp()
-                                - (ref_chosen[i] - chosen_logps[i])
-                                - 1.0;
-                            grad_c[i] = (-obj + 0.04 * kl_div) / n;
-                        }
-                        (l, grad_c, vec![0.0f32; rejected_logps.len()])
-                    }
-                    _ => (
-                        0.5,
-                        vec![0.0f32; chosen_logps.len()],
-                        vec![0.0f32; rejected_logps.len()],
-                    ),
-                };
-                let (loss_val, d_l_d_chosen_logp, d_l_d_rejected_logp) = preference_loss_and_grads(
-                    mode,
-                    &chosen_logps,
-                    &rejected_logps,
-                    &ref_chosen,
-                    &ref_rejected,
-                );
+                let (loss_val, d_l_d_chosen_logp, d_l_d_rejected_logp) =
+                    preference_loss_and_grads(mode, &chosen_logps, &rejected_logps, &ref_chosen, &ref_rejected);
 
                 // Backward: VJP the per-sample log-probability gradients through
                 // the model's logits so the LoRA adapters receive real signals.
@@ -2998,6 +2883,14 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
         return;
     }
 
+    // A step failure already transitioned the job to Failed and broadcast a
+    // terminal event. Do not overwrite that with a sidecar write or a
+    // Completed transition — that would mask the real terminal status (the
+    // "resurrect" bug).
+    if step_failed {
+        return;
+    }
+
     let mut train_state = optimizer.save_to_train_state(&autograd_reg.params);
     // Persist the current optimizer step so resumed training
     // picks up exactly where it left off.
@@ -3022,7 +2915,16 @@ pub async fn run_training_worker(registry: Arc<JobRegistry>, id: JobId) {
                 "[grim-garage] worker: bake_on_completion enabled — merging adapter into {}...",
                 job.model_path
             );
-            let alpha = (job.lora_rank as f32) * 2.0; // Standard 2x scaling
+            // P2-14b: the LoRA merge scale is α/r (ΔW = (α/r)·B·A). `job.lora_alpha`
+            // is the user-specified scaling (the UI sends it); when unset or
+            // non-positive, fall back to the documented rule-of-thumb default
+            // α = 2·r (web/hyperparams.html). Previously this hardcoded
+            // `alpha = rank * 2.0` and then `scale = alpha / rank`, which is
+            // the tautology `scale == 2.0` for every rank.
+            let alpha = job
+                .lora_alpha
+                .filter(|a| *a > 0.0)
+                .unwrap_or(2.0 * job.lora_rank as f32);
             for tensor_name in train_state.lora_tensor_names() {
                 if let Some((a_data, a_shape, b_data, b_shape)) =
                     train_state.lora_weights_for(&tensor_name)

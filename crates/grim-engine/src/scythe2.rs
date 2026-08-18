@@ -1951,12 +1951,13 @@ mod tests {
 
                 let partials: Vec<ExpertPartial> = expert_groups
                     .into_iter()
-                    .map(|(expert, group)| {
+                    .map(|(expert, mut group)| {
                         // Merge group into single partial per expert.
                         // Sum combine weights for repeated expert selections (standard
                         // MoE top-k combine semantics), not average. Also set col_offset
                         // from the first entry's actual column offset.
                         // [P1-31 fix: sum not average; set col_offset.]
+                        let n_cols = group.len();
                         let total_weight: f32 = group.iter().map(|g| g.combine_weight).sum();
                         let first = group.into_iter().next().unwrap();
                         ExpertPartial {
@@ -1964,7 +1965,7 @@ mod tests {
                             expert,
                             dest_rank: first.dest_rank,
                             col_offset: first.col_offset,
-                            n_cols: group.len(),
+                            n_cols,
                             combine_weight: total_weight,
                         }
                     })

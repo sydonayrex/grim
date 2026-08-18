@@ -10,6 +10,18 @@ use grim_tensor::dtype::{DType, QuantProvenance};
 use grim_tensor::error::{Error, Result};
 use grim_tensor::provider::{RawTensor, TensorMeta, TensorProvider};
 
+static WARNED_ONNX_F64: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WARNED_ONNX_INT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Warn once when an ONNX dtype maps lossily to `DType::F32`.
+fn warn_onnx_lossy(kind: &str, flag: &std::sync::atomic::AtomicBool) {
+    if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[grim-format] ONNX dtype {kind} mapped lossily to F32 — value precision is not preserved"
+        );
+    }
+}
+
 /// ONNX tensor info.
 #[derive(Debug, Clone)]
 pub struct OnnxTensorInfo {
@@ -50,7 +62,17 @@ impl OnnxDType {
         match self {
             OnnxDType::F32 => DType::F32,
             OnnxDType::BF16 => DType::BF16,
-            _ => DType::F32, // Default for quantization-aware types
+            // Widening into F32 (F16, U8, I8) is lossless — keep silent.
+            // Only F64/I32/I64→F32 lose precision and warn once.
+            OnnxDType::F16 | OnnxDType::U8 | OnnxDType::I8 => DType::F32,
+            OnnxDType::F64 => {
+                warn_onnx_lossy("F64", &WARNED_ONNX_F64);
+                DType::F32
+            }
+            OnnxDType::I32 | OnnxDType::I64 => {
+                warn_onnx_lossy("I32/I64", &WARNED_ONNX_INT);
+                DType::F32
+            }
         }
     }
 }
