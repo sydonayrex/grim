@@ -741,6 +741,41 @@ pub struct Whisper {
     pub output: Linear,
 }
 
+/// Whisper sinusoidal position table: `n` rows of `d_model` values, starting at
+/// absolute position `offset`. Matches OpenAI Whisper's
+/// `sinusoids()` (log-spaced timescales, `[sin | cos]` halves).
+/// [P1-33 fix: positional information for encoder and decoder.]
+fn sinusoid_positions(d_model: usize, n: usize, offset: usize) -> Vec<f32> {
+    let half = d_model / 2;
+    let mut out = vec![0.0f32; n * d_model];
+    if half == 0 {
+        return out;
+    }
+    let inc = if half > 1 {
+        (10000.0f32).ln() / (half - 1) as f32
+    } else {
+        0.0
+    };
+    for p in 0..n {
+        let pos = (p + offset) as f32;
+        for i in 0..half {
+            let scaled = pos * (-inc * i as f32).exp();
+            out[p * d_model + i] = scaled.sin();
+            out[p * d_model + half + i] = scaled.cos();
+        }
+    }
+    out
+}
+
+/// Add a position table in place to a `[n, d_model]` row-major activation.
+fn add_positions(x: &mut [f32], d_model: usize, offset: usize) {
+    let n = x.len() / d_model;
+    let pos = sinusoid_positions(d_model, n, offset);
+    for (v, p) in x.iter_mut().zip(pos.iter()) {
+        *v += *p;
+    }
+}
+
 impl Whisper {
     pub fn random(device: Device, cfg: WhisperConfig) -> Self {
         Self::new(device, cfg, &mut SimpleRng::new(0xA5D1_BEEF_70E5_CAFE_u64))
@@ -905,11 +940,19 @@ impl Whisper {
         // for the projection. Without this transpose, data is scrambled for n_mels != frames.
         // [P1-33 fix: transpose mel matrix after shape check.]
         let transposed: Vec<f32> = (0..frames)
-            .flat_map(|f| (0..mel_bins).map(move |m| mel_data[m * frames + f]))
+            .flat_map(|f| {
+                let row: Vec<f32> = (0..mel_bins).map(|m| mel_data[m * frames + f]).collect();
+                row.into_iter()
+            })
             .collect();
         let mel_t = cpu_tensor(transposed, Shape::new(vec![frames, mel_bins]));
         let proj = self.enc_in_proj.forward(&mel_t)?;
-        let mut cur = proj;
+        // Encoder positional embeddings: Whisper adds a fixed sinusoidal table
+        // to the convolution/projection output before the encoder blocks.
+        // [P1-33 fix: encoder positional embeddings.]
+        let mut proj_data = proj.to_vec_f32()?;
+        add_positions(&mut proj_data, self.cfg.d_model, 0);
+        let mut cur = cpu_tensor(proj_data, Shape::new(vec![frames, self.cfg.d_model]));
         for blk in &self.enc_blocks {
             cur = blk.forward(&cur)?;
         }
@@ -929,7 +972,12 @@ impl Whisper {
         let ids: Vec<u32> = ids_data.iter().map(|x| *x as u32).collect();
         let seq_len = ids.len();
         let emb = self.tok_emb.forward(&ids, seq_len, self.cfg.d_model)?;
-        let mut cur = emb;
+        // Decoder positional embeddings. `decode_step` is passed the full id
+        // prefix and recomputes attention over it, so absolute positions start
+        // at 0 for row 0. [P1-33 fix: decoder positional embeddings.]
+        let mut emb_data = emb.to_vec_f32()?;
+        add_positions(&mut emb_data, self.cfg.d_model, 0);
+        let mut cur = cpu_tensor(emb_data, Shape::new(vec![seq_len, self.cfg.d_model]));
         for blk in &self.dec_blocks {
             cur = blk.decode_step(&cur, _enc_out)?;
         }

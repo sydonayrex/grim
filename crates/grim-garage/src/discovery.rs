@@ -1,6 +1,7 @@
 //! Discovery: scan local filesystem for `.gguf`, `.grim`, and training-dataset
 //! files. Returns shaped structs that the React UI consumes.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,23 @@ pub struct DatasetEntry {
     pub size_bytes: u64,
 }
 
+/// Minimal GGUF header sanity check: the 4-byte `GGUF` magic at bytes 0-3
+/// plus a little-endian u32 version >= 1 at bytes 4-7. Reads only the first
+/// 8 bytes — never the whole file — so a renamed/truncated file is caught
+/// cheaply without loading the model.
+fn has_gguf_magic(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    if f.read_exact(&mut magic).is_err() || &magic != b"GGUF" {
+        return false;
+    }
+    let mut version = [0u8; 4];
+    f.read_exact(&mut version).is_ok() && u32::from_le_bytes(version) >= 1
+}
+
 fn classify_convertible_format(filename: &str) -> Option<&'static str> {
     let lower = filename.to_ascii_lowercase();
     if lower.ends_with(".gguf") {
@@ -113,7 +131,26 @@ fn classify_dataset_format(filename: &str) -> Option<&'static str> {
     }
 }
 
-fn scan_dir_recursive(dir: &Path, out: &mut Vec<ModelEntry>, is_convertible_only: bool) {
+fn scan_dir_recursive(
+    dir: &Path,
+    out: &mut Vec<ModelEntry>,
+    is_convertible_only: bool,
+    seen: &mut HashSet<PathBuf>,
+) {
+    scan_dir_recursive_inner(dir, out, is_convertible_only, &mut HashSet::new(), seen)
+}
+
+fn scan_dir_recursive_inner(
+    dir: &Path,
+    out: &mut Vec<ModelEntry>,
+    is_convertible_only: bool,
+    visited: &mut HashSet<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+) {
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    if !visited.insert(canonical) {
+        return; // symlink cycle detected
+    }
     if !dir.exists() {
         return;
     }
@@ -123,7 +160,7 @@ fn scan_dir_recursive(dir: &Path, out: &mut Vec<ModelEntry>, is_convertible_only
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            scan_dir_recursive(&path, out, is_convertible_only);
+            scan_dir_recursive_inner(&path, out, is_convertible_only, visited, seen);
         } else if path.is_file() {
             let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
@@ -131,15 +168,23 @@ fn scan_dir_recursive(dir: &Path, out: &mut Vec<ModelEntry>, is_convertible_only
             if is_convertible_only {
                 if let Some(fmt) = classify_convertible_format(filename) {
                     let path_str = path.to_string_lossy().to_string();
-                    if !out.iter().any(|m| m.path == path_str) {
+                    // P2-17b: O(1) dedup via a shared HashSet — threaded from
+                    // the discover_* entry points so it also covers the
+                    // multiple roots scanned there — instead of the previous
+                    // O(n²) `out.iter().any(...)` scan per file.
+                    if seen.insert(path.clone()) {
                         out.push(ModelEntry::new(filename, &path_str, fmt, false));
                     }
                 }
             } else {
                 if let Some(format) = classify_model_format(filename) {
                     let path_str = path.to_string_lossy().to_string();
-                    if !out.iter().any(|m| m.path == path_str) {
-                        let is_grim = format == "grim";
+                    if seen.insert(path.clone()) {
+                        // P2-17a: `.grim` files are GGUF under the hood — a
+                        // renamed/truncated file is caught by the cheap 8-byte
+                        // header check (magic `GGUF` + u32 version) instead of
+                        // trusting the extension alone.
+                        let is_grim = format == "grim" && has_gguf_magic(&path);
                         out.push(ModelEntry::new(filename, &path_str, format, is_grim));
                     }
                 }
@@ -168,18 +213,19 @@ pub fn discover_models(dir: &Path) -> Result<Vec<ModelEntry>, DiscoveryError> {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    scan_dir_recursive(dir, &mut out, false);
+    let mut seen = HashSet::new();
+    scan_dir_recursive(dir, &mut out, false, &mut seen);
 
     if is_default_dir(dir) {
         if let Some(home) = std::env::var_os("HOME") {
             let grim_home = PathBuf::from(home).join(".grim").join("models");
             if grim_home != dir && grim_home.exists() {
-                scan_dir_recursive(&grim_home, &mut out, false);
+                scan_dir_recursive(&grim_home, &mut out, false, &mut seen);
             }
         }
         let local_models = PathBuf::from("./models");
         if local_models != dir && local_models.exists() {
-            scan_dir_recursive(&local_models, &mut out, false);
+            scan_dir_recursive(&local_models, &mut out, false, &mut seen);
         }
     }
 
@@ -193,18 +239,19 @@ pub fn discover_convertible_models(dir: &Path) -> Result<Vec<ModelEntry>, Discov
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    scan_dir_recursive(dir, &mut out, true);
+    let mut seen = HashSet::new();
+    scan_dir_recursive(dir, &mut out, true, &mut seen);
 
     if is_default_dir(dir) {
         if let Some(home) = std::env::var_os("HOME") {
             let grim_home = PathBuf::from(home).join(".grim").join("models");
             if grim_home != dir && grim_home.exists() {
-                scan_dir_recursive(&grim_home, &mut out, true);
+                scan_dir_recursive(&grim_home, &mut out, true, &mut seen);
             }
         }
         let local_models = PathBuf::from("./models");
         if local_models != dir && local_models.exists() {
-            scan_dir_recursive(&local_models, &mut out, true);
+            scan_dir_recursive(&local_models, &mut out, true, &mut seen);
         }
     }
 

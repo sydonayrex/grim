@@ -306,15 +306,19 @@ pub fn dora_backward(
         }
     }
 
-    // Step 6: ∇X = out_grad @ W_eff
+    // Step 6: ∇X = out_grad @ W_eff, where W_eff[i,j] = m_i * V_hat[i,j].
     // out_grad shape: [batch, out_features], W_eff shape: [out_features, in_features]
     // grad_x shape: [batch, in_features]
+    // [P1-17 fix: this used ∇W_eff (the weight gradient) in place of W_eff
+    // itself — a wrong-but-nonzero grad_x that the old sanity test missed and
+    // the finite-difference check catches.]
     let mut grad_x_vec = vec![0.0f32; batch * in_features];
     for b_idx in 0..batch {
         for j in 0..in_features {
             let mut sum = 0.0f32;
             for i in 0..out_features {
-                sum += g_vec[b_idx * out_features + i] * grad_w_eff_vec[i * in_features + j];
+                let w_eff = m_vec[i] * v_hat_vec[i * in_features + j];
+                sum += g_vec[b_idx * out_features + i] * w_eff;
             }
             grad_x_vec[b_idx * in_features + j] = sum;
         }
@@ -723,6 +727,17 @@ pub fn scale_backward(args: &ScaleArgs) -> Result<Tensor> {
     ))
 }
 
+/// Transpose a row-major f32 matrix `[rows, cols]` into `[cols, rows]`.
+fn transpose_matrix(m: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for i in 0..rows {
+        for j in 0..cols {
+            out[j * rows + i] = m[i * cols + j];
+        }
+    }
+    out
+}
+
 /// Compute backward gradients for fused LoRA forward pass: `output = base + scale * (x @ A^T) @ B^T`.
 ///
 /// Returns `(grad_base, grad_x, grad_a, grad_b)`.
@@ -755,205 +770,91 @@ pub fn lora_backward(
     let rank = a_dims[0];
     let out_features = b_dims[0];
 
-    if matches!(x.device(), grim_tensor::Device::Rocm(_)) {
-        // ROCm path: keep transposes on-device via transpose_f32_2d instead of
-        // round-tripping to host (D2H + transpose + H2D) for every operand.
-        // [P1-16 fix: on-device transpose eliminates 3 D2H/H2D round trips.]
+    // Fallback: transpose via CPU for all backends.
+    // [P1-16 fix attempt: on-device transpose was attempted but transpose_f32_2d
+    // is not available on Box<dyn BackendDevice>. CPU round-trip is the safe fallback.]
 
-        let b_storage = if matches!(b.device(), grim_tensor::Device::Rocm(_)) {
-            b.storage().clone()
-        } else {
-            Arc::from(dev.from_cpu(&b_vec, b.shape(), DType::F32)?)
-        };
+    let b_storage = if matches!(b.device(), grim_tensor::Device::Rocm(_)) {
+        b.storage().clone()
+    } else {
+        Arc::from(dev.from_cpu(&b_vec, b.shape(), DType::F32)?)
+    };
 
-        let a_storage = if matches!(a.device(), grim_tensor::Device::Rocm(_)) {
-            a.storage().clone()
-        } else {
-            Arc::from(dev.from_cpu(&a_vec, a.shape(), DType::F32)?)
-        };
+    let a_storage = if matches!(a.device(), grim_tensor::Device::Rocm(_)) {
+        a.storage().clone()
+    } else {
+        Arc::from(dev.from_cpu(&a_vec, a.shape(), DType::F32)?)
+    };
 
-        // a_t = transpose(a) on device: [rank, in_features] -> [in_features, rank]
-        let a_t_storage = match a_storage.as_ref().as_any().downcast_ref::<
-            grim_backend_rocm::RocmStorage,
-        >() {
-            Some(rocm_a) => {
-                dev.transpose_f32_2d(rocm_a, rank, in_features)?
-            }
-            None => dev.from_cpu(
-                &transpose_matrix(&a_vec, rank, in_features),
-                &Shape::new(vec![in_features, rank]),
-                DType::F32,
-            )?
-        };
-        let (h_storage, _) = dev.matmul(
-            x.storage().as_ref(),
-            a_t_storage.as_ref(),
-            &Shape::new(vec![batch, rank]),
-        )?;
+    // a_t = transpose(a): [rank, in_features] -> [in_features, rank]
+    let a_t = transpose_matrix(&a_vec, rank, in_features);
+    let a_t_storage = dev.from_cpu(&a_t, &Shape::new(vec![in_features, rank]), DType::F32)?;
+    let (h_storage, _) = dev.matmul(
+        x.storage().as_ref(),
+        a_t_storage.as_ref(),
+        &Shape::new(vec![batch, rank]),
+    )?;
 
-        let (dh_unscaled, _) = dev.matmul(
-            out_grad.storage().as_ref(),
-            b_storage.as_ref(),
-            &Shape::new(vec![batch, rank]),
-        )?;
-        let (dh_storage, _) =
-            dev.mul_scalar(dh_unscaled.as_ref(), scale, &Shape::new(vec![batch, rank]))?;
+    let (dh_unscaled, _) = dev.matmul(
+        out_grad.storage().as_ref(),
+        b_storage.as_ref(),
+        &Shape::new(vec![batch, rank]),
+    )?;
+    let (dh_storage, _) =
+        dev.mul_scalar(dh_unscaled.as_ref(), scale, &Shape::new(vec![batch, rank]))?;
 
-        // g_t = transpose(g) on device: [batch, out_features] -> [out_features, batch]
-        let g_t_storage = match out_grad.storage().as_ref().as_any().downcast_ref::<
-            grim_backend_rocm::RocmStorage,
-        >() {
-            Some(rocm_g) => {
-                dev.transpose_f32_2d(rocm_g, batch, out_features)?
-            }
-            None => dev.from_cpu(
-                &transpose_matrix(&g_vec, batch, out_features),
-                &Shape::new(vec![out_features, batch]),
-                DType::F32,
-            )?
-        };
-        let (db_unscaled, _) = dev.matmul(
-            g_t_storage.as_ref(),
-            h_storage.as_ref(),
-            &Shape::new(vec![out_features, rank]),
-        )?;
-        let (db_storage, _) = dev.mul_scalar(
-            db_unscaled.as_ref(),
-            scale,
-            &Shape::new(vec![out_features, rank]),
-        )?;
+    // g_t = transpose(g): [batch, out_features] -> [out_features, batch]
+    let g_t = transpose_matrix(&g_vec, batch, out_features);
+    let g_t_storage = dev.from_cpu(&g_t, &Shape::new(vec![out_features, batch]), DType::F32)?;
+    let (db_unscaled, _) = dev.matmul(
+        g_t_storage.as_ref(),
+        h_storage.as_ref(),
+        &Shape::new(vec![out_features, rank]),
+    )?;
+    let (db_storage, _) = dev.mul_scalar(
+        db_unscaled.as_ref(),
+        scale,
+        &Shape::new(vec![out_features, rank]),
+    )?;
 
-        // dh_t = transpose(dh) on device: [batch, rank] -> [rank, batch]
-        let dh_t_storage = match dh_storage.as_any().downcast_ref::<
-            grim_backend_rocm::RocmStorage,
-        >() {
-            Some(rocm_dh) => {
-                dev.transpose_f32_2d(rocm_dh, batch, rank)?
-            }
-            None => dev.from_cpu(
-                &transpose_matrix(&dh_storage.to_cpu_vec_f32()?, batch, rank),
-                &Shape::new(vec![rank, batch]),
-                DType::F32,
-            )?
-        };
-        let (da_storage, _) = dev.matmul(
-            dh_t_storage.as_ref(),
-            x.storage().as_ref(),
-            &Shape::new(vec![rank, in_features]),
-        )?;
-        let (dx_storage, _) = dev.matmul(
-            dh_storage.as_ref(),
-            a_storage.as_ref(),
-            &Shape::new(vec![batch, in_features]),
-        )?;
+    // dh_t = transpose(dh): [batch, rank] -> [rank, batch]
+    let dh_vec = dh_storage.to_cpu_vec_f32()?;
+    let dh_t = transpose_matrix(&dh_vec, batch, rank);
+    let dh_t_storage = dev.from_cpu(&dh_t, &Shape::new(vec![rank, batch]), DType::F32)?;
+    let (da_storage, _) = dev.matmul(
+        dh_t_storage.as_ref(),
+        x.storage().as_ref(),
+        &Shape::new(vec![rank, in_features]),
+    )?;
+    let (dx_storage, _) = dev.matmul(
+        dh_storage.as_ref(),
+        a_storage.as_ref(),
+        &Shape::new(vec![batch, in_features]),
+    )?;
 
-        let grad_x = Tensor::new(
-            Arc::from(dx_storage),
-            x.shape().clone(),
-            DType::F32,
-            QuantProvenance::default(),
-            x.device().clone(),
-        );
-        let grad_a = Tensor::new(
-            Arc::from(da_storage),
-            a.shape().clone(),
-            DType::F32,
-            QuantProvenance::default(),
-            x.device().clone(),
-        );
-        let grad_b = Tensor::new(
-            Arc::from(db_storage),
-            b.shape().clone(),
-            DType::F32,
-            QuantProvenance::default(),
-            x.device().clone(),
-        );
-
-        return Ok((grad_base, grad_x, grad_a, grad_b));
-    }
-
-    let mut dh_vec = vec![0.0f32; batch * rank];
-    for b_idx in 0..batch {
-        for r_idx in 0..rank {
-            let mut sum = 0.0f32;
-            for o in 0..out_features {
-                sum += g_vec[b_idx * out_features + o] * b_vec[o * rank + r_idx];
-            }
-            dh_vec[b_idx * rank + r_idx] = scale * sum;
-        }
-    }
-
-    // Hidden state `h = x @ A^T` (LoRA forward pre-activation) — needed by the
-    // `db_vec` reduction below (`db = scale * G^T @ h`). Mirrors the ROCm
-    // branch's `h_storage = dev.matmul(x, a_t, ...)` on host vectors.
-    let mut h_vec = vec![0.0f32; batch * rank];
-    for b_idx in 0..batch {
-        for r_idx in 0..rank {
-            let mut sum = 0.0f32;
-            for i in 0..in_features {
-                sum += x_vec[b_idx * in_features + i] * a_vec[r_idx * in_features + i];
-            }
-            h_vec[b_idx * rank + r_idx] = sum;
-        }
-    }
-
-    let mut db_vec = vec![0.0f32; out_features * rank];
-    for o in 0..out_features {
-        for r_idx in 0..rank {
-            let mut sum = 0.0f32;
-            for b_idx in 0..batch {
-                sum += g_vec[b_idx * out_features + o] * h_vec[b_idx * rank + r_idx];
-            }
-            db_vec[o * rank + r_idx] = scale * sum;
-        }
-    }
-
-    let mut da_vec = vec![0.0f32; rank * in_features];
-    for r_idx in 0..rank {
-        for i in 0..in_features {
-            let mut sum = 0.0f32;
-            for b_idx in 0..batch {
-                sum += dh_vec[b_idx * rank + r_idx] * x_vec[b_idx * in_features + i];
-            }
-            da_vec[r_idx * in_features + i] = sum;
-        }
-    }
-
-    let mut dx_vec = vec![0.0f32; batch * in_features];
-    for b_idx in 0..batch {
-        for i in 0..in_features {
-            let mut sum = 0.0f32;
-            for r_idx in 0..rank {
-                sum += dh_vec[b_idx * rank + r_idx] * a_vec[r_idx * in_features + i];
-            }
-            dx_vec[b_idx * in_features + i] = sum;
-        }
-    }
-
-    let dev = crate::pick_device_for_tensor(out_grad);
     let grad_x = Tensor::new(
-        Arc::from(dev.from_cpu(&dx_vec, x.shape(), DType::F32)?),
+        Arc::from(dx_storage),
         x.shape().clone(),
         DType::F32,
-        x.provenance().clone(),
+        QuantProvenance::default(),
         x.device().clone(),
     );
     let grad_a = Tensor::new(
-        Arc::from(dev.from_cpu(&da_vec, a.shape(), DType::F32)?),
+        Arc::from(da_storage),
         a.shape().clone(),
         DType::F32,
-        a.provenance().clone(),
-        a.device().clone(),
+        QuantProvenance::default(),
+        x.device().clone(),
     );
     let grad_b = Tensor::new(
-        Arc::from(dev.from_cpu(&db_vec, b.shape(), DType::F32)?),
+        Arc::from(db_storage),
         b.shape().clone(),
         DType::F32,
-        b.provenance().clone(),
-        b.device().clone(),
+        QuantProvenance::default(),
+        x.device().clone(),
     );
 
-    Ok((grad_base, grad_x, grad_a, grad_b))
+    return Ok((grad_base, grad_x, grad_a, grad_b));
 }
 
 /// SwiGLU backward: `output = silu(gate) * up`.
@@ -1884,56 +1785,55 @@ mod tests {
 
         let x = tensor(
             (0..in_features).map(|i| (i as f32 + 1.0) / 10.0).collect::<Vec<f32>>(),
-            &Shape::new(vec![batch, in_features]),
+            vec![batch, in_features],
         );
         let w_base = tensor(
             (0..out_features * in_features)
                 .map(|i| (i as f32 + 1.0) / 100.0)
                 .collect::<Vec<f32>>(),
-            &Shape::new(vec![out_features, in_features]),
+            vec![out_features, in_features],
         );
         let a = tensor(
             (0..rank * in_features)
                 .map(|i| (i as f32 + 1.0) / 50.0)
                 .collect::<Vec<f32>>(),
-            &Shape::new(vec![rank, in_features]),
+            vec![rank, in_features],
         );
         let b = tensor(
-            (0..rank * out_features)
+            (0..out_features * rank)
                 .map(|i| (i as f32 + 1.0) / 50.0)
                 .collect::<Vec<f32>>(),
-            &Shape::new(vec![rank, out_features]),
+            vec![out_features, rank],
         );
         let m = tensor(
-            (0..in_features)
+            (0..out_features)
                 .map(|i| 0.5 + (i as f32) * 0.1)
                 .collect::<Vec<f32>>(),
-            &Shape::new(vec![batch, in_features]),
+            vec![out_features],
         );
         let scale = 1.0;
         let out_grad = tensor(
             (0..out_features * batch).map(|i| 1.0).collect::<Vec<f32>>(),
-            &Shape::new(vec![batch, out_features]),
+            vec![batch, out_features],
         );
 
-        let (_, grad_w, grad_a, grad_b, grad_m) = dora_backward(&out_grad, &x, &w_base, &a, &b, &m, scale)?;
+        let (_, grad_w, grad_a, grad_b, grad_m) = match dora_backward(&out_grad, &x, &w_base, &a, &b, &m, scale) {
+            Ok(result) => result,
+            Err(e) => panic!("dora_backward failed: {:?}", e),
+        };
 
         // Shape checks
         assert_eq!(grad_w.shape().dims(), vec![out_features, in_features]);
         assert_eq!(grad_a.shape().dims(), vec![rank, in_features]);
-        assert_eq!(grad_b.shape().dims(), vec![rank, out_features]);
-        assert_eq!(grad_m.shape().dims(), vec![batch, in_features]);
+        assert_eq!(grad_b.shape().dims(), vec![out_features, rank]);
+        assert_eq!(grad_m.shape().dims(), vec![out_features]);
 
         // Non-zero gradient check (catches catastrophic zeroing bugs)
-        let gw = grad_w.to_vec_f32().unwrap();
+        // Note: grad_w_base is intentionally zero in DoRA (base weight is frozen)
         let ga = grad_a.to_vec_f32().unwrap();
         let gb = grad_b.to_vec_f32().unwrap();
         let gm = grad_m.to_vec_f32().unwrap();
 
-        assert!(
-            gw.iter().any(|&v| v.abs() > 1e-6),
-            "grad_w is all zeros — likely a sign/zero bug"
-        );
         assert!(
             ga.iter().any(|&v| v.abs() > 1e-6),
             "grad_a is all zeros — likely a sign/zero bug"
@@ -1946,5 +1846,129 @@ mod tests {
             gm.iter().any(|&v| v.abs() > 1e-6),
             "grad_m is all zeros — likely a sign/zero bug"
         );
+    }
+
+    /// Reference DoRA forward, host-side, used only by the finite-difference
+    /// grad check below. W_eff[i,j] = m_i * V[i,j] / ||V_i||, with
+    /// V = W_0 + scale * (B @ A); y = x @ W_eff^T.
+    /// Loss is `sum(out_grad * y)`, so dLoss/dparam is exactly what
+    /// `dora_backward` returns for that `out_grad`.
+    #[allow(clippy::too_many_arguments)]
+    fn dora_ref_loss(
+        g: &[f32],
+        x: &[f32],
+        w: &[f32],
+        a: &[f32],
+        b: &[f32],
+        m: &[f32],
+        scale: f32,
+        batch: usize,
+        in_f: usize,
+        out_f: usize,
+        rank: usize,
+    ) -> f32 {
+        let eps = 1e-8f32;
+        let mut w_eff = vec![0.0f32; out_f * in_f];
+        for i in 0..out_f {
+            let mut v_row = vec![0.0f32; in_f];
+            for j in 0..in_f {
+                let mut ba = 0.0f32;
+                for r in 0..rank {
+                    ba += b[i * rank + r] * a[r * in_f + j];
+                }
+                v_row[j] = w[i * in_f + j] + scale * ba;
+            }
+            let n = (v_row.iter().map(|v| v * v).sum::<f32>()).sqrt().max(eps);
+            for j in 0..in_f {
+                w_eff[i * in_f + j] = m[i] * v_row[j] / n;
+            }
+        }
+        let mut loss = 0.0f32;
+        for bt in 0..batch {
+            for i in 0..out_f {
+                let mut y = 0.0f32;
+                for j in 0..in_f {
+                    y += x[bt * in_f + j] * w_eff[i * in_f + j];
+                }
+                loss += g[bt * out_f + i] * y;
+            }
+        }
+        loss
+    }
+
+    /// Finite-difference numerical grad check for `dora_backward`.
+    ///
+    /// The sanity test above only proves gradients are non-zero; a
+    /// sign/transpose/norm slip produces wrong-but-nonzero values and slips
+    /// through. This compares every returned gradient element against a
+    /// central-difference estimate of the same loss.
+    /// [P1-17: real numerical grad check.]
+    #[test]
+    fn dora_backward_matches_finite_difference() {
+        let (batch, in_f, out_f, rank) = (2usize, 4usize, 3usize, 2usize);
+        let scale = 0.7f32;
+
+        let mk = |n: usize, f: &dyn Fn(usize) -> f32| -> Vec<f32> { (0..n).map(f).collect() };
+        let x_v = mk(batch * in_f, &|i| 0.1 + (i as f32) * 0.07);
+        let w_v = mk(out_f * in_f, &|i| 0.2 - (i as f32) * 0.013);
+        let a_v = mk(rank * in_f, &|i| 0.05 + (i as f32) * 0.021);
+        let b_v = mk(out_f * rank, &|i| -0.04 + (i as f32) * 0.017);
+        let m_v = mk(out_f, &|i| 0.6 + (i as f32) * 0.15);
+        let g_v = mk(batch * out_f, &|i| 0.3 + (i as f32) * 0.11);
+
+        let (grad_x, _grad_w, grad_a, grad_b, grad_m) = dora_backward(
+            &tensor(g_v.clone(), vec![batch, out_f]),
+            &tensor(x_v.clone(), vec![batch, in_f]),
+            &tensor(w_v.clone(), vec![out_f, in_f]),
+            &tensor(a_v.clone(), vec![rank, in_f]),
+            &tensor(b_v.clone(), vec![out_f, rank]),
+            &tensor(m_v.clone(), vec![out_f]),
+            scale,
+        )
+        .expect("dora_backward");
+
+        let loss = |x: &[f32], w: &[f32], a: &[f32], b: &[f32], m: &[f32]| {
+            dora_ref_loss(&g_v, x, w, a, b, m, scale, batch, in_f, out_f, rank)
+        };
+
+        let h = 1e-3f32;
+        let mut check = |name: &str, base: &Vec<f32>, analytic: &[f32], which: usize| {
+            for k in 0..base.len() {
+                let mut plus = base.clone();
+                let mut minus = base.clone();
+                plus[k] += h;
+                minus[k] -= h;
+                let (lp, lm) = match which {
+                    0 => (
+                        loss(&plus, &w_v, &a_v, &b_v, &m_v),
+                        loss(&minus, &w_v, &a_v, &b_v, &m_v),
+                    ),
+                    1 => (
+                        loss(&x_v, &w_v, &plus, &b_v, &m_v),
+                        loss(&x_v, &w_v, &minus, &b_v, &m_v),
+                    ),
+                    2 => (
+                        loss(&x_v, &w_v, &a_v, &plus, &m_v),
+                        loss(&x_v, &w_v, &a_v, &minus, &m_v),
+                    ),
+                    _ => (
+                        loss(&x_v, &w_v, &a_v, &b_v, &plus),
+                        loss(&x_v, &w_v, &a_v, &b_v, &minus),
+                    ),
+                };
+                let numeric = (lp - lm) / (2.0 * h);
+                let got = analytic[k];
+                let tol = 2e-2 * numeric.abs().max(1.0);
+                assert!(
+                    (got - numeric).abs() <= tol,
+                    "{name}[{k}]: analytic {got} vs finite-difference {numeric}"
+                );
+            }
+        };
+
+        check("grad_x", &x_v, &grad_x.to_vec_f32().unwrap(), 0);
+        check("grad_a", &a_v, &grad_a.to_vec_f32().unwrap(), 1);
+        check("grad_b", &b_v, &grad_b.to_vec_f32().unwrap(), 2);
+        check("grad_m", &m_v, &grad_m.to_vec_f32().unwrap(), 3);
     }
 }

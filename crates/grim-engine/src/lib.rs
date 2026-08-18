@@ -668,12 +668,22 @@ impl Engine {
             // stream real KV blocks generated during prefill over the network to the decode node.
             if let Some(router) = &self.config.disagg_router {
                 if router.pool_role == grim_disagg::PoolRole::Prefill {
-                    let pool_guard = self.block_pool.lock().unwrap();
-                    let block_ids: Vec<usize> = (0..pool_guard.num_blocks()).collect();
-                    if let Err(e) = router.transfer_kv_cache_real(id, &block_ids, &pool_guard) {
-                        eprintln!(
-                            "[grim-engine] Disagg prefill KV transfer failed for req {id}: {e}"
-                        );
+                    // The pool is shared across concurrent requests, so the
+                    // handoff must carry only this request's physical blocks —
+                    // a full-pool scan would leak other requests' KV cache.
+                    let block_ids: Vec<usize> = self
+                        .sessions
+                        .get(&id)
+                        .and_then(|s| s.block_table())
+                        .map(|t| t.iter().map(|&b| b as usize).collect())
+                        .unwrap_or_default();
+                    if !block_ids.is_empty() {
+                        let pool_guard = self.block_pool.lock().unwrap();
+                        if let Err(e) = router.transfer_kv_cache_real(id, &block_ids, &pool_guard) {
+                            eprintln!(
+                                "[grim-engine] Disagg prefill KV transfer failed for req {id}: {e}"
+                            );
+                        }
                     }
                 }
             }

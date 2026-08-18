@@ -9,7 +9,9 @@
 //!   equivalently `effective_base = base * factor^{1/head_dim}`.
 //! - `Llama3(factor)`: Llama 3 style piecewise interpolation with the
 //!   default `low_freq_factor`/`high_freq_factor` folding into a single
-//!   effective base: `effective_base = base * (1 + factor * (8/head_dim)^2 / 2)`.
+//!   effective base: `effective_base = base * factor` (corrected from the
+//!   earlier `(8/head_dim)^2/2` approximation, which produced ~1.6% rather
+//!   than the intended ~8x shift for `head_dim=128, factor=8`).
 //! - `LongRoPE(factor)`: NTK-aware frequency mixing (Kim et al.) where
 //!   frequencies below a critical threshold are interpolated and those above
 //!   are extrapolated. Reduced to a scalar effective base for backends whose

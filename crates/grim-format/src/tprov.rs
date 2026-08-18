@@ -543,7 +543,10 @@ impl TensorProvider for SafetensorsProvider {
 /// the [`crate::format`] helpers.
 pub struct GrimProvider {
     file: GrimFile,
-    reader: std::sync::Mutex<BufReader<File>>,
+    /// Memory-mapped file. Lazy normals/outliers reads slice directly from
+    /// this (zero copy) via a per-call `Cursor`, so concurrent `get()` calls
+    /// are lock-free instead of serializing behind a `Mutex<BufReader<File>>`.
+    mmap: memmap2::Mmap,
 }
 
 impl GrimProvider {
@@ -557,8 +560,11 @@ impl GrimProvider {
         // Reopen for lazy reads — the BufReader above was consumed by the parse.
         let f = File::open(path)
             .map_err(|e| Error::Backend(format!("cannot reopen .grim file '{path}': {e}")))?;
-        let reader = std::sync::Mutex::new(BufReader::new(f));
-        Ok(Self { file, reader })
+        let mmap = unsafe {
+            memmap2::Mmap::map(&f)
+                .map_err(|e| Error::Backend(format!("cannot mmap .grim file '{path}': {e}")))?
+        };
+        Ok(Self { file, mmap })
     }
 
     /// Access the parsed `.grim` metadata.
@@ -596,8 +602,8 @@ impl GrimProvider {
             .file
             .tensor(name)
             .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in .grim file")))?;
-        let mut reader = self.reader.lock().unwrap();
-        read_outliers(&mut *reader, entry)
+        let mut reader = std::io::Cursor::new(&self.mmap[..]);
+        read_outliers(&mut reader, entry)
     }
 
     /// Construct a `GgufTokenizer` from the GGUF metadata embedded in this
@@ -623,8 +629,8 @@ impl TensorProvider for GrimProvider {
             .file
             .tensor(name)
             .ok_or_else(|| Error::Backend(format!("tensor '{name}' not found in .grim file")))?;
-        let mut reader = self.reader.lock().unwrap();
-        let bytes = read_normals(&mut *reader, entry)?;
+        let mut reader = std::io::Cursor::new(&self.mmap[..]);
+        let bytes = read_normals(&mut reader, entry)?;
 
         if let Some(ext) = self.ext_for(name) {
             let residual = ext.scale_size != 0
@@ -633,18 +639,18 @@ impl TensorProvider for GrimProvider {
                 || entry.outlier_count != 0;
             if residual {
                 let outliers = if entry.outlier_count != 0 {
-                    read_outliers_with_encoding(&mut *reader, entry, ext.outlier_index_encoding)?
+                    read_outliers_with_encoding(&mut reader, entry, ext.outlier_index_encoding)?
                 } else {
                     Vec::new()
                 };
                 let mut primary_scale_bytes = Vec::new();
                 if ext.scale_size != 0 {
-                    // `scale_offset` is an absolute file offset, not relative to
-                    // the payload region, so seek and read directly from the file.
+                    // `scale_offset` is payload-relative; add payload_offset
+                    // to get the absolute file position.
                     // If the region is outside the file (e.g. test fixtures that
                     // only emit metadata without real scale payloads), leave the
                     // bytes empty — provenance metadata is still populated.
-                    let start = ext.scale_offset;
+                    let start = entry.payload_offset + ext.scale_offset;
                     if let Ok(seek_pos) = reader.seek(std::io::SeekFrom::Start(start)) {
                         if seek_pos == start {
                             let mut buf = vec![0u8; ext.scale_size as usize];

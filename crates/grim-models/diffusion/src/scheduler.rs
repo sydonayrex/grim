@@ -119,7 +119,7 @@ impl EulerScheduler {
             acc *= *a;
             cumprod[i] = acc;
         }
-        let sigmas: Vec<f32> = cumprod.iter().map(|a| (1.0 - a).max(0.0).sqrt()).collect();
+        let mut sigmas: Vec<f32> = cumprod.iter().map(|a| (1.0 - a).max(0.0).sqrt()).collect();
         alphas.clear();
         // timesteps descend (N-1..0); sigmas must be in the same order so that
         // the first denoising step (largest timestep) uses the largest sigma.

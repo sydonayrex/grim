@@ -90,11 +90,11 @@ impl KimiK3 {
     }
 
     pub fn load_tp(
-        device: Device,
+        _device: Device,
         _ws: &grim_nn::WeightSource<'_>,
-        cfg: KimiK3Config,
+        _cfg: KimiK3Config,
     ) -> Result<Self> {
-        Ok(KimiK3 { cfg, device })
+        Err(Error::Unimplemented("KimiK3 load_tp is not yet implemented".into()))
     }
 }
 

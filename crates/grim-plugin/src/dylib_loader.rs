@@ -11,10 +11,15 @@ use grim_tensor::error::{Error, Result};
 use std::path::Path;
 use std::sync::Arc;
 
+/// Upper bound on the number of bytes scanned when reading a plugin name
+/// from the vtable's `name` pointer. Guards against unbounded C-string reads
+/// on untrusted plugin data.
+const MAX_NAME_BYTES: usize = 1024;
+
 /// Loaded dylib plugin with its vtable and optional sampler.
 pub struct DylibPluginLoader {
     #[cfg(feature = "dylib-loading")]
-    _lib: libloading::Library,
+    _lib: Arc<libloading::Library>,
     pub vtable: GrimPluginVTable,
     _sampler: Option<Arc<dyn Sampler>>,
 }
@@ -26,7 +31,18 @@ pub struct DylibPluginLoader {
 /// handle is owned and freed via the vtable's `teardown` surface on drop.
 struct DylibSampler {
     name: String,
+    /// Keeps the owning library mapped for as long as any sampler built from
+    /// it is alive. Without this, dropping the `DylibPluginLoader` unloads the
+    /// library while `sample_fn`/`teardown` are still callable.
+    /// [P1-29 fix: sampler owns a refcount on the library.]
+    #[cfg(feature = "dylib-loading")]
+    _lib: Arc<libloading::Library>,
     handle: *mut std::os::raw::c_void,
+    /// `logits_len` is an **f32 element count** here (the dylib ABI takes a
+    /// native `*const f32`). The WASM backend passes a **byte** length instead,
+    /// because that is the natural unit for wasm linear memory. Plugin authors
+    /// must use the unit matching the backend they target.
+    /// [P1-29: unit mismatch documented per-backend, not silently unified.]
     sample_fn: extern "C" fn(
         handle: *mut std::os::raw::c_void,
         logits_ptr: *const f32,
@@ -121,7 +137,7 @@ impl DylibPluginLoader {
             let vtable = std::ptr::read(raw_vtable_ptr);
 
             Ok(Self {
-                _lib: lib,
+                _lib: Arc::new(lib),
                 vtable,
                 _sampler: None,
             })
@@ -130,10 +146,17 @@ impl DylibPluginLoader {
 
     /// Initialize the plugin. Calls the vtable's init function if present.
     /// Uses `catch_unwind` to isolate panics in the plugin (§6.1.2).
+    ///
+    /// NOTE: `catch_unwind` only guards Rust panics (unwinding across the FFI
+    /// boundary). It does NOT contain FFI-level crashes — segfaults, `abort()`,
+    /// or other C-level faults still take down the engine; process isolation is
+    /// required for those.
     pub fn init(&self) -> Result<()> {
         // Wrap in catch_unwind to prevent plugin panics from crashing the engine
         // The FFI functions are plain C calls - we use a raw pointer to avoid
         // the catch_unwind panic-payload type constraints
+        // NOTE: catch_unwind only catches Rust panics, NOT FFI-level crashes
+        // (segfaults, aborts) — containing those requires process isolation.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // FFI functions are safe to call - the unsafe is in loading them
             (self.vtable.init)(std::ptr::null_mut());
@@ -176,10 +199,26 @@ impl DylibPluginLoader {
             if ptr.is_null() {
                 return "unknown".to_string();
             }
-            // SAFETY: Plugin promises valid UTF-8 string
             unsafe {
-                std::ffi::CStr::from_ptr(ptr)
-                    .to_str()
+                // Bounded scan: never trust an unbounded CStr scan on a pointer
+                // sourced from untrusted plugin data. Walk at most MAX_NAME_BYTES
+                // looking for a NUL terminator before treating the pointer as a
+                // valid C string.
+                let mut buf = [0u8; MAX_NAME_BYTES];
+                let mut len = 0usize;
+                while len < MAX_NAME_BYTES {
+                    let byte = *ptr.add(len) as u8;
+                    if byte == 0 {
+                        break;
+                    }
+                    buf[len] = byte;
+                    len += 1;
+                }
+                if len == MAX_NAME_BYTES {
+                    // No NUL within the cap: not a bounded, terminated string.
+                    return "invalid-name".to_string();
+                }
+                std::str::from_utf8(&buf[..len])
                     .unwrap_or("invalid-name")
                     .to_string()
             }
@@ -214,6 +253,8 @@ impl DylibPluginLoader {
 
         // §6.1.2: sampler_factory is a plain C call; isolate panics so a
         // buggy/malicious plugin can't unwind through the FFI boundary.
+        // NOTE: catch_unwind only guards Rust panics — NOT FFI-level crashes
+        // (segfaults, aborts); containing those requires process isolation.
         let handle = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sampler_factory()))
             .map_err(|_| Error::Backend("Plugin sampler_factory panicked".into()))?;
         if handle.is_null() {
@@ -224,6 +265,8 @@ impl DylibPluginLoader {
 
         Ok(Arc::new(DylibSampler {
             name: self.name(),
+            #[cfg(feature = "dylib-loading")]
+            _lib: Arc::clone(&self._lib),
             handle,
             sample_fn: sampler_sample,
             teardown: self.vtable.teardown,

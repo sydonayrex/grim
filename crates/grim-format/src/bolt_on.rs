@@ -104,7 +104,8 @@ pub fn attach_bolt_on(
             } else {
                 0.0
             };
-            let code = (((norm + 1.0) * 0.5) * 15.0).round() as u32;
+            let levels = (1usize << bpw as usize) - 1;
+            let code = (((norm + 1.0) * 0.5) * levels as f32).round() as u32;
 
             let bit_offset = c_idx * bpw as usize;
             let byte_offset = bit_offset / 8;
@@ -129,6 +130,13 @@ pub fn attach_bolt_on(
     let codes_abs_offset = entry.payload_offset + ext.backup2.codes_offset;
     file.seek(SeekFrom::Start(codes_abs_offset))
         .map_err(Error::Io)?;
+    if packed_codes.len() > ext.backup2.codes_size as usize {
+        return Err(Error::Backend(format!(
+            "bolt-on codes overflow: {} bytes written > {} bytes provisioned",
+            packed_codes.len(),
+            ext.backup2.codes_size
+        )));
+    }
     file.write_all(&packed_codes).map_err(Error::Io)?;
 
     let scale_abs_offset = entry.payload_offset + ext.backup2.scale_offset;
@@ -368,26 +376,51 @@ pub fn merge_bolt_on(
         wave: src.wave,
     };
 
-    // Rewrite atomically through a temp file.
+    // Rewrite atomically through a unique temp file: fsync the temp data to
+    // stable storage first, then rename it over the target so readers never
+    // observe a partially-written `.grim`. The unique name means concurrent
+    // merges cannot collide on the same temp path.
     let tmp = temp_path(grim_path);
-    let out_file = File::create(&tmp).map_err(Error::Io)?;
-    let mut writer = BufWriter::new(out_file);
-    let written = new_grim.write(&mut writer)?;
+    let result = (|| -> Result<()> {
+        let out_file = File::create(&tmp).map_err(Error::Io)?;
+        let mut writer = BufWriter::new(out_file);
+        let written = new_grim.write(&mut writer)?;
 
-    for (i, we) in written.iter().enumerate() {
-        write_region_at(&mut writer, we.payload_offset, &payload_blobs[i])?;
-        if !outlier_blobs[i].is_empty() {
-            write_region_at(&mut writer, we.outlier_offset, &outlier_blobs[i])?;
-        }
-        if we.kv_present != 0 && we.kv_compressed_size > 0 {
-            if let Some(kv) = kv_map.get(&we.name) {
-                write_region_at(&mut writer, we.kv_compressed_offset, kv)?;
+        for (i, we) in written.iter().enumerate() {
+            write_region_at(&mut writer, we.payload_offset, &payload_blobs[i])?;
+            if !outlier_blobs[i].is_empty() {
+                write_region_at(&mut writer, we.outlier_offset, &outlier_blobs[i])?;
+            }
+            if we.kv_present != 0 && we.kv_compressed_size > 0 {
+                if let Some(kv) = kv_map.get(&we.name) {
+                    write_region_at(&mut writer, we.kv_compressed_offset, kv)?;
+                }
             }
         }
-    }
-    writer.flush().map_err(Error::Io)?;
-    std::fs::rename(&tmp, grim_path).map_err(Error::Io)?;
 
+        writer.flush().map_err(Error::Io)?;
+        // Flush the buffer into the kernel AND to stable storage before the
+        // atomic rename — the old file is only replaced once the new data is
+        // durable on disk.
+        writer.get_ref().sync_all().map_err(Error::Io)?;
+        drop(writer);
+
+        std::fs::rename(&tmp, grim_path).map_err(Error::Io)?;
+
+        // Best-effort directory fsync so the rename itself is durable.
+        if let Some(dir) = grim_path.parent() {
+            if let Ok(d) = File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        // Never leave a half-written temp file behind.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -424,13 +457,22 @@ fn write_region_at<W: Write + Seek>(w: &mut W, target: u64, blob: &[u8]) -> Resu
     Ok(())
 }
 
-/// Temp file path placed next to `grim_path` (same directory).
+/// Temp file path placed next to `grim_path` (same directory). The name is
+/// unique per process + timestamp so concurrent merges cannot collide.
 fn temp_path(grim_path: &Path) -> PathBuf {
     let name = grim_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "model.grim".into());
-    grim_path.with_file_name(format!("{name}.merge.tmp"))
+    let unique = format!(
+        "{name}.merge.tmp.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    grim_path.with_file_name(unique)
 }
 
 /// Compute `ΔW = (scale / rank) * B @ A` for a LoRA adapter.
@@ -622,10 +664,12 @@ mod tests {
                 scale_size: 32,
                 scale_offset: 256,
                 backup2: crate::spec::BackupLayer {
+                    // Provision must fit the full packed codes: 32 rows ×
+                    // row_bytes ((128×2+7)/8 padded to 256) = 8192 bytes.
                     codes_offset: 512,
-                    codes_size: 256,
+                    codes_size: 8192,
                     bpw: 2,
-                    scale_offset: 768,
+                    scale_offset: 512 + 8192,
                     scale_size: 256,
                 },
                 ..Default::default()

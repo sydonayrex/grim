@@ -67,6 +67,12 @@ pub struct StartTrainingRequest {
     pub training_mode: TrainingMode,
     #[serde(default = "default_rank")]
     pub lora_rank: u32,
+    /// LoRA alpha (scaling) for adapter init and bake-merge
+    /// (`ΔW = (alpha / rank) · B·A`). `None` = documented rule-of-thumb
+    /// default `2 * lora_rank`. The UI always sends this; previously it was
+    /// silently dropped by serde.
+    #[serde(default)]
+    pub lora_alpha: Option<f32>,
     #[serde(default = "default_lr")]
     pub learning_rate: f64,
     #[serde(default = "default_epochs")]
@@ -224,6 +230,14 @@ async fn embedded_asset_handler(AxumPath(path): AxumPath<String>) -> impl IntoRe
     } else {
         &path
     };
+    // P2-13d: axum matches registered `/api/*` routes before this catch-all,
+    // so any path reaching here that starts with `api/` is an unknown API
+    // endpoint. It must 404 rather than silently serving the SPA shell —
+    // returning index.html would mask API typos as HTTP 200 and confuse
+    // clients.
+    if path_str == "api" || path_str.starts_with("api/") {
+        return (StatusCode::NOT_FOUND, "404 Not Found").into_response();
+    }
     match WebAssets::get(path_str) {
         Some(content) => {
             let mime_str = if path_str.ends_with(".html") {
@@ -440,6 +454,7 @@ async fn start_training(
         dataset_path: req.dataset_path,
         training_mode: req.training_mode,
         lora_rank: rank.value(),
+        lora_alpha: req.lora_alpha,
         learning_rate: req.learning_rate,
         epochs: req.epochs,
         rocm_fusion_rmsnorm_matmul: req.rocm_fusion_rmsnorm_matmul,
@@ -1048,6 +1063,7 @@ async fn convert_model_route(Json(req): Json<ConvertModelRequest>) -> impl IntoR
         if source_input.contains("..")
             || source_input.split('/').any(|c| c == ".")
             || source_input.split('\\').any(|c| c == ".")
+        {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ConvertModelResponse {
@@ -1060,36 +1076,60 @@ async fn convert_model_route(Json(req): Json<ConvertModelRequest>) -> impl IntoR
         output_dir.join(source_input).to_string_lossy().to_string()
     };
 
-    match grim_format::convert_to_grim(
-        &source_resolved,
-        &output_str,
-        &req.target_gcn,
-        req.target_bpw,
-        req.evopress_generations,
-        None,
-        None,
-        None,
-        None,
-        req.target_format,
-        None,
-        None,
-    ) {
-        Ok(_) => (
+    // P2-13e: the oxidizer conversion is CPU/file-bound — it reads the source
+    // model, may run the EvoPress evolutionary search, packs tensors, and
+    // writes the .grim file. Run it on the blocking pool so a single slow
+    // conversion can never occupy an async worker thread. Response semantics
+    // are unchanged.
+    let target_gcn = req.target_gcn;
+    let target_bpw = req.target_bpw;
+    let evopress_generations = req.evopress_generations;
+    let target_format = req.target_format;
+    let output_clone = output_str.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        grim_format::convert_to_grim(
+            &source_resolved,
+            &output_str,
+            &target_gcn,
+            target_bpw,
+            evopress_generations,
+            None,
+            None,
+            None,
+            None,
+            target_format,
+            None,
+            None,
+        )
+    })
+    .await;
+
+    match result {
+        Ok(Ok(_)) => (
             StatusCode::OK,
             Json(ConvertModelResponse {
                 success: true,
-                output_path: output_str,
+                output_path: output_clone,
                 message:
                     "Model converted successfully to native .grim format via grim-format oxidizer"
                         .into(),
+            }),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ConvertModelResponse {
+                success: false,
+                output_path: output_clone,
+                message: format!("Oxidizer conversion error: {e}"),
             }),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ConvertModelResponse {
                 success: false,
-                output_path: output_str,
-                message: format!("Oxidizer conversion error: {e}"),
+                output_path: output_clone,
+                message: format!("Oxidizer conversion task panicked: {e}"),
             }),
         ),
     }
@@ -1304,8 +1344,6 @@ async fn chat_handler(
         ids.len()
     };
 
-    let mut engine = state.engine.lock().unwrap();
-
     static REQUEST_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let request_id = REQUEST_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -1326,55 +1364,78 @@ async fn chat_handler(
         ))
     };
 
-    // Enqueue prefill
-    if let Err(e) = engine.enqueue_request(grim_engine::Request {
-        id: request_id,
-        prompt_tokens,
-        priority: 0,
-        consumed_tokens: 0,
-        model_id: Some(model_name.clone()),
-        adapter_ids: vec![],
-        input_ids: None,
-    }) {
-        eprintln!("[chat_handler] enqueue_request failed: {e}");
+    // P2-13a: acquire the engine mutex per engine call instead of holding a
+    // single guard across the entire generation loop. The engine is a
+    // multi-request scheduler — `tick()` advances every scheduled request and
+    // outcomes are keyed per request id — so concurrent chats interleave
+    // correctly as long as each handler only reads its own request's outcome.
+    // No `.await` happens while the guard is held (the loop body is
+    // synchronous), so `std::sync::Mutex` remains correct; we only shrink the
+    // hold time from the whole sequence to a single step.
+    {
+        // Enqueue prefill under a short-lived lock.
+        let mut engine = state.engine.lock().unwrap();
+        if let Err(e) = engine.enqueue_request(grim_engine::Request {
+            id: request_id,
+            prompt_tokens,
+            priority: 0,
+            consumed_tokens: 0,
+            model_id: Some(model_name.clone()),
+            adapter_ids: vec![],
+            input_ids: None,
+        }) {
+            eprintln!("[chat_handler] enqueue_request failed: {e}");
+        }
     }
 
     let max_tokens = req.max_tokens.min(4096);
     let mut generated_ids: Vec<u32> = Vec::with_capacity(max_tokens);
 
     for _step in 0..max_tokens {
-        if let Err(e) = engine.tick() {
-            eprintln!("[chat_handler] engine tick failed: {e}");
-            break;
-        }
-
-        let token = match engine
-            .last_outcome(request_id)
-            .and_then(|o| o.logits.as_ref().cloned())
-        {
-            Some(logits) => match sampler.sample(&logits, &generated_ids) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("[chat_handler] sampler error: {e}");
+        // Step the engine and pull this request's logits under one short
+        // lock, then sample outside it. The lock is released between steps,
+        // so competing chats can make progress instead of waiting for the
+        // whole sequence to finish.
+        let token = {
+            let logits = {
+                let mut engine = state.engine.lock().unwrap();
+                if let Err(e) = engine.tick() {
+                    eprintln!("[chat_handler] engine tick failed: {e}");
                     break;
                 }
-            },
-            None => break,
+                engine
+                    .last_outcome(request_id)
+                    .and_then(|o| o.logits.as_ref().cloned())
+            };
+            match logits {
+                Some(logits) => match sampler.sample(&logits, &generated_ids) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("[chat_handler] sampler error: {e}");
+                        break;
+                    }
+                },
+                None => break,
+            }
         };
 
         // EOS detection: use tokenizer's EOS token ID if available, otherwise
         // fall back to token == 0 (common but not universal). Never hardcode
         // token == 2 which is wrong for Llama-3-family tokenizers.
         // [P2-13 fix: tokenizer-aware EOS detection; propagate sampler errors.]
-        let eos_id = tok.as_ref().map(|t| t.eos_token_id()).unwrap_or(0);
-        if token == eos_id || token == 0 {
+        let eos_id = state.tokenizer.lock().unwrap().as_ref().and_then(|t| t.eos_token_id);
+        if token == eos_id.unwrap_or(0) || token == 0 {
             break;
         }
 
         generated_ids.push(token);
     }
 
-    engine.finish_request(request_id);
+    // Detach the request under a short-lived lock.
+    {
+        let mut engine = state.engine.lock().unwrap();
+        engine.finish_request(request_id);
+    }
     let latency_ms = start_time.elapsed().as_millis() as u64;
 
     // Decode generated tokens
@@ -1471,8 +1532,8 @@ mod tests {
         let r = build_router(state.clone());
 
         let start_body = serde_json::json!({
-            "model_path": "/tmp/model.grim",
-            "dataset_path": "/tmp/dataset.jsonl",
+            "model_path": "model.grim",
+            "dataset_path": "dataset.jsonl",
             "training_mode": "Lora"
         });
 

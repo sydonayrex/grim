@@ -9,7 +9,7 @@
 //!   cargo test -p grim-backend-cuda --test standalone_quant_parity -- --nocapture
 
 use grim_backend_cuda::{CudaDevice, CudaStorage};
-use grim_tensor::dtype::{DType, KQuantScheme, QuantFormat, Storage};
+use grim_tensor::dtype::{ArithType, DType, KQuantScheme, QuantFormat, Storage};
 use grim_tensor::{BackendDevice, Shape};
 
 /// Skip the test gracefully if no CUDA device is available.
@@ -141,6 +141,9 @@ fn test_quantize_q8_0_roundtrip() {
 
 #[test]
 fn test_fused_quant_gemm_q8_0() {
+    // Wait 3 seconds between Q8_0 CUDA tests to avoid GPU resource
+    // contention false negatives (cuBLAS context thrashing under concurrent loads).
+    std::thread::sleep(std::time::Duration::from_secs(3));
     let dev = match device_or_skip() {
         Some(d) => d,
         None => {
@@ -156,12 +159,33 @@ fn test_fused_quant_gemm_q8_0() {
     let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.1 - 2.0).sin()).collect();
     let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.05).cos()).collect();
 
+    // Pack B as real Q8_0 bytes. The fused kernel expects B packed column-major:
+    // for each output column col (0..N-1), a 34-byte block (f16 scale + 32 i8 codes)
+    // containing the 32 elements B[0..K][col]. We transpose b_data (row-major [K,N])
+    // into column-major order before quantizing so each 32-element chunk = one column.
+    let mut b_col_major = Vec::with_capacity(k * n);
+    for col in 0..n {
+        for row in 0..k {
+            b_col_major.push(b_data[row * n + col]);
+        }
+    }
+    let b_packed = grim_quant::quant_q80(&b_col_major).expect("quant_q80");
+    assert_eq!(b_packed.len(), n * (k / 32) * 34, "Q8_0 packed size mismatch");
+
     let a_shape = Shape::new(vec![m, k]);
-    let b_shape = Shape::new(vec![k, n]);
+    let b_shape = Shape::new(vec![k, n]); // logical shape is still [k, n]
     let out_shape = Shape::new(vec![m, n]);
 
     let a = dev.from_cpu(&a_data, &a_shape, DType::F32).unwrap();
-    let b = dev.from_cpu(&b_data, &b_shape, DType::F32).unwrap();
+    // Upload B as KQuant(Q80) storage so the dispatch sees real packed Q8_0 bytes.
+    let b = dev.from_cpu_bytes(
+        &b_packed,
+        &b_shape,
+        DType {
+            arith: ArithType::F32,
+            storage: Storage::KQuant(KQuantScheme::Q80),
+        },
+    ).unwrap();
 
     let (out, handle) = dev
         .fused_quant_gemm(a.as_ref(), b.as_ref(), QuantFormat::Q8_0, &out_shape)
@@ -170,7 +194,17 @@ fn test_fused_quant_gemm_q8_0() {
 
     let result = out.to_cpu_vec_f32().unwrap();
 
-    // Manual reference: quantize A per-row-block, then matmul.
+    // Manual reference: quantize A per-row-block, then matmul against dequantized B.
+    // Dequantize the column-major packed B back and transpose to row-major for the
+    // reference matmul (which uses b_data[row * n + col] indexing).
+    let k_val = k;
+    let b_col_deq = grim_quant::dequant_q80(&b_packed, k * n).expect("dequant_q80");
+    let b_dequant: Vec<f32> = (0..k_val)
+        .flat_map(|row| {
+            let b = b_col_deq.clone();
+            (0..n).map(move |col| b[col * k_val + row])
+        })
+        .collect();
     let mut expected = vec![0.0f32; m * n];
     for row in 0..m {
         let a_row = &a_data[row * k..(row + 1) * k];
@@ -187,7 +221,7 @@ fn test_fused_quant_gemm_q8_0() {
         for col in 0..n {
             let mut sum = 0.0f32;
             for i in 0..k {
-                sum += quantized[i] * b_data[i * n + col];
+                sum += quantized[i] * b_dequant[i * n + col];
             }
             expected[row * n + col] = sum;
         }

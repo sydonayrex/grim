@@ -514,8 +514,10 @@ impl KvCompressor for OmniKvCompressor {
         let scale = 1.0 / f32::sqrt(head_dim as f32);
         let mut out_data = vec![0.0f32; num_tokens * num_heads * head_dim];
 
+        let q_per_kv = num_heads / block.num_kv_heads;
         for t in 0..num_tokens {
             for h in 0..num_heads {
+                let kv_head = h / q_per_kv;
                 let mut scores = vec![0.0f32; block.num_tokens];
                 let mut max_score = f32::NEG_INFINITY;
 
@@ -523,7 +525,7 @@ impl KvCompressor for OmniKvCompressor {
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
                         let q_idx = (t * num_heads + h) * head_dim + d;
-                        let k_idx = (kt * block.num_kv_heads + h) * head_dim + d;
+                        let k_idx = (kt * block.num_kv_heads + kv_head) * head_dim + d;
                         if k_idx < k_data.len() && q_idx < q_data.len() {
                             dot += q_data[q_idx] * k_data[k_idx];
                         }
@@ -549,7 +551,7 @@ impl KvCompressor for OmniKvCompressor {
                 for d in 0..head_dim {
                     let mut val = 0.0f32;
                     for kt in 0..block.num_tokens {
-                        let v_idx = (kt * block.num_kv_heads + h) * head_dim + d;
+                        let v_idx = (kt * block.num_kv_heads + kv_head) * head_dim + d;
                         if v_idx < v_data.len() {
                             val += scores[kt] * v_data[v_idx];
                         }

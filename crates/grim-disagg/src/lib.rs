@@ -115,9 +115,14 @@ impl Default for DisaggConfig {
 /// engine's `KvBlockPool` via `read_keys()` / `read_values()` rather than
 /// synthesising fake payloads.
 pub trait DisaggRouterT: Send + Sync {
-    /// Dispatch a prefill task — sends real KV blocks from the local pool
-    /// to the prefill node.
-    fn dispatch_prefill(&self, request_id: u64, tokens: &[u32]) -> Result<()>;
+    /// Dispatch a prefill task — sends the request's real KV blocks (its
+    /// logical→physical block table) from the local pool to the prefill node.
+    fn dispatch_prefill(
+        &self,
+        request_id: u64,
+        tokens: &[u32],
+        block_ids: &[usize],
+    ) -> Result<()>;
     /// Transfer real KV blocks (identified by physical `block_ids`) from the
     /// local pool to the decode node.
     fn transfer_kv_cache(&self, request_id: u64, block_ids: &[usize]) -> Result<()>;
@@ -127,6 +132,7 @@ pub trait DisaggRouterT: Send + Sync {
         request_id: u64,
         last_token: u32,
         assignment: PoolAssignment,
+        block_ids: &[usize],
     ) -> Result<()>;
 }
 
@@ -198,9 +204,18 @@ impl DisaggRouter {
         Ok(())
     }
 
-    /// Extract real KV blocks from the stored pool and send them to the
-    /// prefill node address.
-    fn extract_and_send_prefill(&self, _request_id: u64, tokens: &[u32]) -> Result<()> {
+    /// Extract real KV blocks for `block_ids` from the stored pool and send
+    /// them to the prefill node address.
+    ///
+    /// Only the request's own blocks are transferred — the pool is shared
+    /// across concurrent requests, so a full-pool scan would leak other
+    /// requests' KV cache over the wire.
+    fn extract_and_send_prefill(
+        &self,
+        _request_id: u64,
+        tokens: &[u32],
+        block_ids: &[usize],
+    ) -> Result<()> {
         let pool = self.pool.as_ref().ok_or_else(|| {
             Error::KvCache(
                 "dispatch_prefill: no KvBlockPool attached for real KV extraction".into(),
@@ -209,9 +224,8 @@ impl DisaggRouter {
         let guard = pool
             .lock()
             .map_err(|e| Error::KvCache(format!("dispatch_prefill: pool mutex poisoned: {e}")))?;
-        // Iterate over all allocated blocks in the pool and stream their real
-        // KV data to the prefill node.
-        for block_id in 0..guard.num_blocks() {
+        // Stream this request's real KV blocks to the prefill node.
+        for &block_id in block_ids {
             let k_data = guard.read_keys(block_id);
             let v_data = guard.read_values(block_id);
             self.kv_client.send_block_remote(
@@ -236,16 +250,21 @@ impl DisaggRouter {
         Ok(())
     }
 
-    /// Extract real KV blocks from the stored pool and send them to the
-    /// decode node address as a decode step context.
-    fn extract_and_send_decode(&self, _request_id: u64, _last_token: u32) -> Result<()> {
+    /// Extract real KV blocks for `block_ids` from the stored pool and send
+    /// them to the decode node address as a decode step context.
+    fn extract_and_send_decode(
+        &self,
+        _request_id: u64,
+        _last_token: u32,
+        block_ids: &[usize],
+    ) -> Result<()> {
         let pool = self.pool.as_ref().ok_or_else(|| {
             Error::KvCache("dispatch_decode: no KvBlockPool attached for real KV extraction".into())
         })?;
         let guard = pool
             .lock()
             .map_err(|e| Error::KvCache(format!("dispatch_decode: pool mutex poisoned: {e}")))?;
-        for block_id in 0..guard.num_blocks() {
+        for &block_id in block_ids {
             let k_data = guard.read_keys(block_id);
             let v_data = guard.read_values(block_id);
             self.kv_client.send_block_remote(
@@ -275,8 +294,13 @@ impl DisaggRouter {
 
 impl DisaggRouterT for DisaggRouter {
     /// Dispatch a prefill task to a dedicated prefill engine.
-    fn dispatch_prefill(&self, request_id: u64, tokens: &[u32]) -> Result<()> {
-        self.extract_and_send_prefill(request_id, tokens)
+    fn dispatch_prefill(
+        &self,
+        request_id: u64,
+        tokens: &[u32],
+        block_ids: &[usize],
+    ) -> Result<()> {
+        self.extract_and_send_prefill(request_id, tokens, block_ids)
     }
 
     /// Transfer real KV blocks to the decode node.
@@ -309,8 +333,9 @@ impl DisaggRouterT for DisaggRouter {
         request_id: u64,
         last_token: u32,
         _assignment: PoolAssignment,
+        block_ids: &[usize],
     ) -> Result<()> {
-        self.extract_and_send_decode(request_id, last_token)
+        self.extract_and_send_decode(request_id, last_token, block_ids)
     }
 }
 
@@ -400,7 +425,7 @@ mod tests {
         assert_eq!(router.pool_role, PoolRole::Prefill);
 
         // dispatch_prefill without a pool → error
-        let prefill_res = router.dispatch_prefill(42, &[101, 102, 103]);
+        let prefill_res = router.dispatch_prefill(42, &[101, 102, 103], &[0, 1, 2, 3]);
         assert!(
             prefill_res.is_err(),
             "dispatch_prefill should fail without a pool"
@@ -418,7 +443,7 @@ mod tests {
             source_prefill_pool_addr: "127.0.0.1:0".to_string(),
             request_id: 42,
         };
-        let decode_res = router.dispatch_decode(42, 104, assignment);
+        let decode_res = router.dispatch_decode(42, 104, assignment, &[0, 1, 2, 3]);
         assert!(
             decode_res.is_err(),
             "dispatch_decode should fail without a pool"
@@ -461,7 +486,7 @@ mod tests {
         // Verify assignment fields are accessible and correct
         assert_eq!(assignment.source_prefill_pool_addr, "127.0.0.1:0");
         assert_eq!(assignment.request_id, 99);
-        let decode_res = router.dispatch_decode(99, 200, assignment);
+        let decode_res = router.dispatch_decode(99, 200, assignment, &[0]);
         assert!(
             decode_res.is_err(),
             "dispatch_decode should fail without a pool"

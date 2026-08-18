@@ -658,12 +658,17 @@ pub fn encode_outliers_delta_varint(outliers: &[(u32, f32)]) -> Vec<u8> {
     // emit the raw value quantized to u8 in [-128, 127] when it fits,
     // falling back to clamping. The reader reconstructs by adding the
     // delta to the running reconstruction.
+    //
+    // The encoder must track the *quantized* reconstruction (`prev_val +=
+    // clamped`), not the true previous value. That keeps encoder and decoder
+    // accumulating the same quantity, so quantization error stays bounded
+    // (≤0.5 per value) instead of compounding across the stream.
     let mut prev_val: f32 = 0.0;
     for (_, value) in outliers.iter() {
         let delta = value - prev_val;
         let clamped = delta.round().clamp(-128.0, 127.0) as i8;
         buf.push(clamped as u8);
-        prev_val = *value;
+        prev_val += clamped as f32;
     }
 
     buf
@@ -687,6 +692,12 @@ pub fn decode_outliers_delta_varint(buf: &[u8]) -> Result<(Vec<(u32, f32)>, usiz
     let (count, consumed) = decode_varint(&buf[cursor..])?;
     cursor += consumed;
     let count = count as usize;
+
+    // Bound allocation from untrusted input: each index costs ≥1 varint byte
+    // and each value 1 byte, so `count` can never exceed the remaining buffer.
+    let count = count
+        .min(buf.len().saturating_sub(cursor))
+        .min(1_000_000);
 
     let mut indices: Vec<u32> = Vec::with_capacity(count);
     let mut prev_idx: u64 = 0;
@@ -897,6 +908,10 @@ mod tests {
 
     /// Phase 5: outlier delta-varint codec round-trips a multi-record
     /// sequence including a contiguous run (where delta compression wins).
+    ///
+    /// Since the encoder feeds quantized deltas back into `prev_val`, the
+    /// reconstruction is the *encoder's* reconstruction, so integer test
+    /// values round-trip exactly (no drift).
     #[test]
     fn outlier_delta_varint_round_trips() {
         let outliers = vec![(5u32, 1.0f32), (10, 2.0), (11, 3.0), (12, 4.0)];
@@ -905,9 +920,27 @@ mod tests {
         assert_eq!(decoded.len(), outliers.len());
         for (got, want) in decoded.iter().zip(outliers.iter()) {
             assert_eq!(got.0, want.0, "index mismatch");
+            assert_eq!(got.1, want.1, "value mismatch");
+        }
+    }
+
+    /// Phase 5: fractional values stay within the per-value quantization
+    /// bound (±0.5) instead of compounding. The old encoder (which tracked
+    /// the *true* previous value) drifted unboundedly on a monotone 1.5-step
+    /// sequence — by the 6th record the error reached 3.0. The fixed encoder
+    /// keeps every error ≤ 0.5.
+    #[test]
+    fn outlier_delta_varint_fractional_drift_is_bounded() {
+        let outliers: Vec<(u32, f32)> = (0..12)
+            .map(|i| (i as u32, 1.5 * (i as f32 + 1.0)))
+            .collect();
+        let encoded = encode_outliers_delta_varint(&outliers);
+        let (decoded, _consumed) = decode_outliers_delta_varint(&encoded).expect("decode");
+        assert_eq!(decoded.len(), outliers.len());
+        for (got, want) in decoded.iter().zip(outliers.iter()) {
             assert!(
-                (got.1 - want.1).abs() < 1.5,
-                "value {} vs {}",
+                (got.1 - want.1).abs() <= 0.5 + 1e-6,
+                "drift value {} vs {}",
                 got.1,
                 want.1
             );

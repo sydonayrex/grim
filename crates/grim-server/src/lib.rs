@@ -1365,7 +1365,16 @@ async fn chat_completions(
                         }
                     };
 
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    // Token pacing: configurable inter-token delay to avoid overwhelming
+                    // clients or the engine. Set GRIM_TOKEN_PACING_MS=0 to disable.
+                    // Default 10ms provides gentle pacing for SSE stream stability.
+                    let pacing_ms = std::env::var("GRIM_TOKEN_PACING_MS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(10);
+                    if pacing_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(pacing_ms)).await;
+                    }
 
                     let tokenizer = state
                         .tokenizer

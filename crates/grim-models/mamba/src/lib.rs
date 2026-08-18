@@ -493,7 +493,12 @@ impl StatefulSequence for Mamba {
             .ok_or_else(|| Error::Session("state downcast".into()))?;
 
         // Apply token embedding — input is token IDs, not hidden states.
-        let h = self.tok_embeddings.forward(input)?;
+        let ids = input.to_vec_f32()?;
+        let h = self.tok_embeddings.forward(
+            &ids.iter().map(|x| *x as u32).collect::<Vec<u32>>(),
+            input.shape().dims()[0],
+            self.cfg.hidden_size,
+        )?;
 
         // Map (input -> step through each layer with shared SSM state).
         let mut h = h;

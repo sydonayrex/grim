@@ -12,7 +12,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use grim_core::error::Result;
+use grim_core::error::{Error, Result};
 use grim_core::model::AdapterHandle;
 use grim_core::rng::SimpleRng;
 use grim_core::session::SessionT;
@@ -223,7 +223,7 @@ impl SpeculativeCausalLm {
                     .request_rng()
                     .cloned()
                     .ok_or_else(|| {
-                        Error::Backend(
+                        Error::Session(
                             "speculative decoding requires a session-provided RNG; \
                              none available — cannot perform acceptance sampling"
                                 .into(),
@@ -267,10 +267,10 @@ impl SpeculativeCausalLm {
                 // tentative_append(verify_len) must have added >= accepted_count slots.
                 // [P1-20 fix: assert verify_len >= accepted_count before commit.]
                 if accepted_count > verify_len {
-                    return Err(Error::Backend(format!(
+                    return Err(Error::Session(format!(
                         "speculative KV contract violation: accepted_count ({accepted_count}) > \
                          verify_len ({verify_len})"
-                    ));
+                    )));
                 }
                 if let Some(kv) = session.kv_mut() {
                     kv.commit(accepted_count)?;
@@ -369,7 +369,7 @@ impl SpeculativeCausalLm {
             .request_rng()
             .cloned()
             .ok_or_else(|| {
-                Error::Backend(
+                Error::Session(
                     "speculative decoding requires a session-provided RNG; \
                      none available — cannot perform acceptance sampling"
                         .into(),
@@ -400,10 +400,10 @@ impl SpeculativeCausalLm {
         }
 
         if accepted_count > verify_len {
-            return Err(Error::Backend(format!(
+            return Err(Error::Session(format!(
                 "speculative KV contract violation (NativeMTP): accepted_count ({accepted_count}) > \
                  verify_len ({verify_len})"
-            ));
+            )));
         }
         if let Some(kv) = session.kv_mut() {
             kv.commit(accepted_count)?;

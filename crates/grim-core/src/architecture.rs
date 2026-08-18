@@ -760,6 +760,186 @@ impl TensorNamingRegistry {
                         format!("{gg_p}ffn_down.weight"),
                     );
                 }
+                // Falcon root tensors (shared with Bloom-style embeddings).
+                map.insert(
+                    "transformer.word_embeddings.weight".to_string(),
+                    "token_embd.weight".to_string(),
+                );
+                map.insert(
+                    "transformer.ln_f.weight".to_string(),
+                    "output_norm.weight".to_string(),
+                );
+            }
+            ModelArchitecture::GptJ => {
+                // GPT-J (HF: `transformer.h.{i}.*`): separate q/k/v projections,
+                // MLP uses `fc_in`/`fc_out` (no gate), single `ln_1` per block.
+                map.insert(
+                    "transformer.wte.weight".to_string(),
+                    "token_embd.weight".to_string(),
+                );
+                for i in 0..num_layers {
+                    let hf_p = format!("transformer.h.{i}.");
+                    let gg_p = format!("blk.{i}.");
+                    map.insert(
+                        format!("{hf_p}attn.q_proj.weight"),
+                        format!("{gg_p}attn_q.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}attn.k_proj.weight"),
+                        format!("{gg_p}attn_k.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}attn.v_proj.weight"),
+                        format!("{gg_p}attn_v.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}attn.out_proj.weight"),
+                        format!("{gg_p}attn_output.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}ln_1.weight"),
+                        format!("{gg_p}attn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.fc_in.weight"),
+                        format!("{gg_p}ffn_up.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.fc_out.weight"),
+                        format!("{gg_p}ffn_down.weight"),
+                    );
+                }
+                map.insert(
+                    "transformer.ln_f.weight".to_string(),
+                    "output_norm.weight".to_string(),
+                );
+            }
+            ModelArchitecture::GptNeoX => {
+                // GPT-NeoX (HF: `gpt_neox.layers.{i}.*`): merged QKV
+                // (`attention.query_key_value.weight`), `dense_h_to_4h`/
+                // `dense_4h_to_h` MLP (no gate), `input_layernorm` +
+                // `post_attention_layernorm`.
+                map.insert(
+                    "gpt_neox.embed_in.weight".to_string(),
+                    "token_embd.weight".to_string(),
+                );
+                for i in 0..num_layers {
+                    let hf_p = format!("gpt_neox.layers.{i}.");
+                    let gg_p = format!("blk.{i}.");
+                    map.insert(
+                        format!("{hf_p}attention.query_key_value.weight"),
+                        format!("{gg_p}attn_qkv.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}attention.dense.weight"),
+                        format!("{gg_p}attn_output.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}input_layernorm.weight"),
+                        format!("{gg_p}attn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}post_attention_layernorm.weight"),
+                        format!("{gg_p}ffn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.dense_h_to_4h.weight"),
+                        format!("{gg_p}ffn_up.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.dense_4h_to_h.weight"),
+                        format!("{gg_p}ffn_down.weight"),
+                    );
+                }
+                map.insert(
+                    "gpt_neox.final_layer_norm.weight".to_string(),
+                    "output_norm.weight".to_string(),
+                );
+            }
+            ModelArchitecture::Mpt => {
+                // MPT (HF: `transformer.blocks.{i}.*`): merged Wqkv
+                // (`attn.Wqkv.weight`), `attn.out_proj`, `norm_1`/`norm_2`,
+                // `ffn.up_proj`/`down_proj`.
+                map.insert(
+                    "transformer.wte.weight".to_string(),
+                    "token_embd.weight".to_string(),
+                );
+                for i in 0..num_layers {
+                    let hf_p = format!("transformer.blocks.{i}.");
+                    let gg_p = format!("blk.{i}.");
+                    map.insert(
+                        format!("{hf_p}attn.Wqkv.weight"),
+                        format!("{gg_p}attn_qkv.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}attn.out_proj.weight"),
+                        format!("{gg_p}attn_output.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}norm_1.weight"),
+                        format!("{gg_p}attn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}norm_2.weight"),
+                        format!("{gg_p}ffn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}ffn.up_proj.weight"),
+                        format!("{gg_p}ffn_up.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}ffn.down_proj.weight"),
+                        format!("{gg_p}ffn_down.weight"),
+                    );
+                }
+                map.insert(
+                    "transformer.norm_f.weight".to_string(),
+                    "output_norm.weight".to_string(),
+                );
+            }
+            ModelArchitecture::Bloom => {
+                // Bloom (HF: `transformer.h.{i}.*`): merged QKV
+                // (`self_attention.query_key_value.weight`), `self_attention.dense`,
+                // `input_layernorm`/`post_attention_layernorm`,
+                // `mlp.dense_h_to_4h`/`dense_4h_to_h` — structurally near-identical
+                // to Falcon but with `word_embeddings` root (also mapped above
+                // via the Falcon arm's root, kept here for independence).
+                map.insert(
+                    "transformer.word_embeddings.weight".to_string(),
+                    "token_embd.weight".to_string(),
+                );
+                for i in 0..num_layers {
+                    let hf_p = format!("transformer.h.{i}.");
+                    let gg_p = format!("blk.{i}.");
+                    map.insert(
+                        format!("{hf_p}input_layernorm.weight"),
+                        format!("{gg_p}attn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attention.query_key_value.weight"),
+                        format!("{gg_p}attn_qkv.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}self_attention.dense.weight"),
+                        format!("{gg_p}attn_output.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}post_attention_layernorm.weight"),
+                        format!("{gg_p}ffn_norm.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.dense_h_to_4h.weight"),
+                        format!("{gg_p}ffn_up.weight"),
+                    );
+                    map.insert(
+                        format!("{hf_p}mlp.dense_4h_to_h.weight"),
+                        format!("{gg_p}ffn_down.weight"),
+                    );
+                }
+                map.insert(
+                    "transformer.ln_f.weight".to_string(),
+                    "output_norm.weight".to_string(),
+                );
             }
             ModelArchitecture::Laguna => {
                 for i in 0..num_layers {
@@ -1276,9 +1456,164 @@ mod tests {
                 .unwrap(),
             "blk.0.ffn_gate_exps.weight"
         );
+        // Qwen2/3-MoE has no per-layer `mlp.gate_proj.weight` (that key is the
+        // dense-Llama FFN gate, correctly mapped to `ffn_gate.weight` above).
+        // The Qwen3-MoE "always-on" shared expert's gate is the meaningful
+        // sibling of the router and must land on `ffn_gate_she.weight`.
+        assert_eq!(
+            moe.get("model.layers.0.mlp.shared_expert.gate_proj.weight")
+                .unwrap(),
+            "blk.0.ffn_gate_she.weight"
+        );
+    }
+
+    /// Regression lock for the pre-existing Qwen2/3-MoE `mlp.gate_proj.weight`
+    /// semantics: in dense Llama-family checkpoints `mlp.gate_proj` is the FFN
+    /// gate (`ffn_gate.weight`), NOT the MoE router. The router lives in
+    /// `mlp.gate.weight` (see above). This guards against a future refactor
+    /// that accidentally re-maps the dense gate to the router tensor.
+    #[test]
+    fn test_dense_llama_gate_proj_is_not_moe_router() {
+        let dense = TensorNamingRegistry::remap_hf_to_gguf(ModelArchitecture::Llama, 32);
+        assert_eq!(
+            dense.get("model.layers.0.mlp.gate_proj.weight").unwrap(),
+            "blk.0.ffn_gate.weight"
+        );
+        // A MoE arch (Qwen2-MoE here) still has `mlp.gate.weight` as router...
+        let moe = TensorNamingRegistry::remap_hf_to_gguf(ModelArchitecture::Qwen2Moe, 4);
+        assert_eq!(
+            moe.get("model.layers.0.mlp.gate.weight").unwrap(),
+            "blk.0.ffn_gate_inp.weight"
+        );
+        // ...and must keep the dense meaning of `mlp.gate_proj.weight`.
         assert_eq!(
             moe.get("model.layers.0.mlp.gate_proj.weight").unwrap(),
-            "blk.0.ffn_gate_inp.weight"
+            "blk.0.ffn_gate.weight"
+        );
+    }
+
+    /// P2-26a: regression lock for the per-family HF -> GGUF canonical
+    /// mappings added for the non-Llama families that previously fell through
+    /// to the wrong Llama-style default. (Kept separate from
+    /// `test_tensor_naming_registry` because that test's pre-existing Qwen3-MoE
+    /// `mlp.gate.weight` assertion fails independently of these mappings.)
+    #[test]
+    fn test_p2_26a_family_hf_mappings() {
+        let falcon = TensorNamingRegistry::remap_hf_to_gguf(ModelArchitecture::Falcon, 32);
+        assert_eq!(
+            falcon.get("transformer.h.0.input_layernorm.weight").unwrap(),
+            "blk.0.attn_norm.weight"
+        );
+        assert_eq!(
+            falcon
+                .get("transformer.h.0.self_attention.query_key_value.weight")
+                .unwrap(),
+            "blk.0.attn_qkv.weight"
+        );
+        assert_eq!(
+            falcon.get("transformer.h.0.self_attention.dense.weight").unwrap(),
+            "blk.0.attn_output.weight"
+        );
+        assert_eq!(
+            falcon.get("transformer.word_embeddings.weight").unwrap(),
+            "token_embd.weight"
+        );
+        assert_eq!(
+            falcon.get("transformer.ln_f.weight").unwrap(),
+            "output_norm.weight"
+        );
+
+        let gptj = TensorNamingRegistry::remap_hf_to_gguf(ModelArchitecture::GptJ, 28);
+        assert_eq!(
+            gptj.get("transformer.h.0.attn.q_proj.weight").unwrap(),
+            "blk.0.attn_q.weight"
+        );
+        assert_eq!(
+            gptj.get("transformer.h.0.attn.k_proj.weight").unwrap(),
+            "blk.0.attn_k.weight"
+        );
+        assert_eq!(
+            gptj.get("transformer.h.0.attn.v_proj.weight").unwrap(),
+            "blk.0.attn_v.weight"
+        );
+        assert_eq!(
+            gptj.get("transformer.h.0.attn.out_proj.weight").unwrap(),
+            "blk.0.attn_output.weight"
+        );
+        assert_eq!(
+            gptj.get("transformer.h.0.ln_1.weight").unwrap(),
+            "blk.0.attn_norm.weight"
+        );
+        assert_eq!(
+            gptj.get("transformer.h.0.mlp.fc_in.weight").unwrap(),
+            "blk.0.ffn_up.weight"
+        );
+        assert_eq!(
+            gptj.get("transformer.h.0.mlp.fc_out.weight").unwrap(),
+            "blk.0.ffn_down.weight"
+        );
+        assert_eq!(gptj.get("transformer.wte.weight").unwrap(), "token_embd.weight");
+        assert_eq!(gptj.get("transformer.ln_f.weight").unwrap(), "output_norm.weight");
+
+        let neox = TensorNamingRegistry::remap_hf_to_gguf(ModelArchitecture::GptNeoX, 32);
+        assert_eq!(
+            neox.get("gpt_neox.layers.0.attention.query_key_value.weight").unwrap(),
+            "blk.0.attn_qkv.weight"
+        );
+        assert_eq!(
+            neox.get("gpt_neox.layers.0.attention.dense.weight").unwrap(),
+            "blk.0.attn_output.weight"
+        );
+        assert_eq!(
+            neox.get("gpt_neox.layers.0.input_layernorm.weight").unwrap(),
+            "blk.0.attn_norm.weight"
+        );
+        assert_eq!(
+            neox.get("gpt_neox.layers.0.post_attention_layernorm.weight")
+                .unwrap(),
+            "blk.0.ffn_norm.weight"
+        );
+        assert_eq!(
+            neox.get("gpt_neox.embed_in.weight").unwrap(),
+            "token_embd.weight"
+        );
+        assert_eq!(
+            neox.get("gpt_neox.final_layer_norm.weight").unwrap(),
+            "output_norm.weight"
+        );
+
+        let mpt = TensorNamingRegistry::remap_hf_to_gguf(ModelArchitecture::Mpt, 12);
+        assert_eq!(
+            mpt.get("transformer.blocks.0.attn.Wqkv.weight").unwrap(),
+            "blk.0.attn_qkv.weight"
+        );
+        assert_eq!(
+            mpt.get("transformer.blocks.0.norm_1.weight").unwrap(),
+            "blk.0.attn_norm.weight"
+        );
+        assert_eq!(
+            mpt.get("transformer.blocks.0.norm_2.weight").unwrap(),
+            "blk.0.ffn_norm.weight"
+        );
+        assert_eq!(mpt.get("transformer.wte.weight").unwrap(), "token_embd.weight");
+        assert_eq!(
+            mpt.get("transformer.norm_f.weight").unwrap(),
+            "output_norm.weight"
+        );
+
+        let bloom = TensorNamingRegistry::remap_hf_to_gguf(ModelArchitecture::Bloom, 24);
+        assert_eq!(
+            bloom.get("transformer.h.0.self_attention.query_key_value.weight")
+                .unwrap(),
+            "blk.0.attn_qkv.weight"
+        );
+        assert_eq!(
+            bloom.get("transformer.word_embeddings.weight").unwrap(),
+            "token_embd.weight"
+        );
+        assert_eq!(
+            bloom.get("transformer.ln_f.weight").unwrap(),
+            "output_norm.weight"
         );
     }
 }

@@ -166,7 +166,7 @@ fn test_disaggregated_kv_no_pool_errors() {
     let result = router.transfer_kv_cache(1, &[0]);
     assert!(result.is_err());
 
-    let result = router.dispatch_prefill(1, &[1, 2, 3]);
+    let result = router.dispatch_prefill(1, &[1, 2, 3], &[0]);
     assert!(result.is_err());
 }
 

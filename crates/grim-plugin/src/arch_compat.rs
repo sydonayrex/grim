@@ -36,11 +36,21 @@ pub struct VisionEncoderSpec {
 }
 
 impl VisionEncoderSpec {
-    fn default_decoder_dmodel() -> usize { 2048 }
-    fn default_patch_size() -> usize { 16 }
-    fn default_temporal_patch_size() -> usize { 16 }
-    fn default_n_channels() -> usize { 3 }
-    fn default_n_layers() -> usize { 12 }
+    fn default_decoder_dmodel() -> usize {
+        2048
+    }
+    fn default_patch_size() -> usize {
+        16
+    }
+    fn default_temporal_patch_size() -> usize {
+        16
+    }
+    fn default_n_channels() -> usize {
+        3
+    }
+    fn default_n_layers() -> usize {
+        12
+    }
 }
 
 /// Audio encoder sub-specification.
@@ -64,9 +74,15 @@ pub struct AudioEncoderSpec {
 }
 
 impl AudioEncoderSpec {
-    fn default_decoder_dmodel() -> usize { 2048 }
-    fn default_n_mel_bins() -> usize { 80 }
-    fn default_mel_vocab_size() -> usize { 3000 }
+    fn default_decoder_dmodel() -> usize {
+        2048
+    }
+    fn default_n_mel_bins() -> usize {
+        80
+    }
+    fn default_mel_vocab_size() -> usize {
+        3000
+    }
 }
 
 /// Architecture compatibility specification generated from HuggingFace `config.json`.
@@ -311,18 +327,17 @@ impl ArchCompatSpec {
     /// The raw file is the authoritative source and is what `from_hf_config_json` was
     /// designed to parse.
     pub async fn from_hf_model_id(org_repo: &str) -> Result<Self> {
-        let config_url = format!(
-            "https://huggingface.co/{org_repo}/resolve/main/config.json"
-        );
+        let config_url = format!("https://huggingface.co/{org_repo}/resolve/main/config.json");
         let client = reqwest::Client::builder()
             .user_agent("hf-cli/0.1")
             .build()
             .map_err(|e| Error::Config(format!("build HTTP client: {e}")))?;
 
-        let resp = client.get(&config_url).send().await
-            .map_err(|e| Error::Config(format!(
+        let resp = client.get(&config_url).send().await.map_err(|e| {
+            Error::Config(format!(
                 "Failed to fetch config.json from {config_url}: {e}"
-            )))?;
+            ))
+        })?;
 
         if !resp.status().is_success() {
             return Err(Error::Config(format!(
@@ -331,10 +346,11 @@ impl ArchCompatSpec {
             )));
         }
 
-        let config_json = resp.text().await
-            .map_err(|e| Error::Config(format!(
+        let config_json = resp.text().await.map_err(|e| {
+            Error::Config(format!(
                 "Failed to read config.json body from {config_url}: {e}"
-            )))?;
+            ))
+        })?;
 
         let spec = Self::from_hf_config_json(&config_json)?;
         validate_required_fields(&spec)?;
@@ -386,19 +402,14 @@ impl ArchCompatSpec {
 fn validate_required_fields(spec: &ArchCompatSpec) -> Result<()> {
     if spec.model_type.is_empty() || spec.model_type == "custom" {
         return Err(Error::Config(
-            "model_type is required but was empty or missing from config.json"
-                .into(),
+            "model_type is required but was empty or missing from config.json".into(),
         ));
     }
     if spec.num_layers == 0 {
-        return Err(Error::Config(
-            "num_hidden_layers must be > 0".into(),
-        ));
+        return Err(Error::Config("num_hidden_layers must be > 0".into()));
     }
     if spec.hidden_size == 0 {
-        return Err(Error::Config(
-            "hidden_size must be > 0".into(),
-        ));
+        return Err(Error::Config("hidden_size must be > 0".into()));
     }
     Ok(())
 }
@@ -420,8 +431,7 @@ mod tests {
     #[test]
     fn from_hf_config_json_parses_qwen38_nested_config() {
         let config_json = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/qwen38_config.json"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/qwen38_config.json"),
         )
         .expect("qwen38_config.json fixture must exist");
 
@@ -440,8 +450,14 @@ mod tests {
             "num_hidden_layers from text_config must be 64, got {}",
             spec.num_layers
         );
-        assert_eq!(spec.hidden_size, 5120, "hidden_size from text_config must be 5120");
-        assert_eq!(spec.vocab_size, 248320, "vocab_size from text_config must be 248320");
+        assert_eq!(
+            spec.hidden_size, 5120,
+            "hidden_size from text_config must be 5120"
+        );
+        assert_eq!(
+            spec.vocab_size, 248320,
+            "vocab_size from text_config must be 248320"
+        );
         assert_eq!(spec.num_heads, 24);
         assert_eq!(spec.num_kv_heads, 4);
         assert_eq!(spec.head_dim, 256);
@@ -458,16 +474,23 @@ mod tests {
         // partial_rotary_factor (1.0, set in Qwen35/Qwen3 wrappers) unless the
         // loader path is also updated. Flagged for follow-up; not blocking the
         // plugin-generation work item.
-        assert!(spec.rope_theta > 0.0, "rope_theta must be set (default 10000.0 if absent)");
+        assert!(
+            spec.rope_theta > 0.0,
+            "rope_theta must be set (default 10000.0 if absent)"
+        );
     }
 
     /// Green target: a non-existent org/repo returns `Err`, not a panic or a
     /// defaulted spec. The error should surface the failed fetch, not silently
     /// produce garbage.
+    ///
+    /// NOTE: requires network access to huggingface.co. Ignored by default —
+    /// run with `--ignored` to exercise.
     #[tokio::test]
+    #[ignore]
     async fn from_hf_model_id_rejects_nonexistent_repo() {
-        let result = ArchCompatSpec::from_hf_model_id("nonexistent-org-12345/nonexistent-repo-67890")
-            .await;
+        let result =
+            ArchCompatSpec::from_hf_model_id("nonexistent-org-12345/nonexistent-repo-67890").await;
 
         assert!(result.is_err(), "non-existent repo must return Err");
         // The error should not be a successfully-parsed spec with defaulted fields.
@@ -567,6 +590,9 @@ mod tests {
     /// Integration test: pull Inkling-Small's config.json from HF via
     /// `from_hf_model_id` and verify the spec matches the known values.
     ///
+    /// NOTE: requires network access to huggingface.co. Ignored by default —
+    /// run with `--ignored` to exercise.
+    ///
     /// This replaces the local-file `test_inkling_config_json_ingestion` test
     /// with a real HF API pull, exercising the full `resolve/main/config.json`
     /// → `from_hf_config_json` → spec pipeline end-to-end.
@@ -585,6 +611,7 @@ mod tests {
     ///   - vision_config.patch_size: 40
     ///   - audio_config.n_mel_bins: 80
     #[tokio::test]
+    #[ignore]
     async fn from_hf_model_id_pulls_inkling_small_from_hf() {
         let spec = ArchCompatSpec::from_hf_model_id("thinkingmachines/Inkling-Small")
             .await
@@ -602,31 +629,50 @@ mod tests {
             spec.base_architecture, "dynamic:inkling_mm_model",
             "unrecognized model_type should get dynamic:inkling_mm_model base_architecture"
         );
-        assert_eq!(spec.num_layers, 42, "text_config.num_hidden_layers must be 42");
-        assert_eq!(spec.hidden_size, 4096, "text_config.hidden_size must be 4096");
-        assert_eq!(spec.vocab_size, 201024, "text_config.vocab_size must be 201024");
+        assert_eq!(
+            spec.num_layers, 42,
+            "text_config.num_hidden_layers must be 42"
+        );
+        assert_eq!(
+            spec.hidden_size, 4096,
+            "text_config.hidden_size must be 4096"
+        );
+        assert_eq!(
+            spec.vocab_size, 201024,
+            "text_config.vocab_size must be 201024"
+        );
         assert_eq!(spec.num_heads, 32);
         assert_eq!(spec.num_kv_heads, 8);
         assert_eq!(spec.head_dim, 128);
-        assert_eq!(spec.max_seq_len, 1048576, "model_max_length must be 1048576");
+        assert_eq!(
+            spec.max_seq_len, 1048576,
+            "model_max_length must be 1048576"
+        );
         assert!(spec.is_moe, "Inkling-Small is MoE (256 experts)");
-        assert!(spec.is_multimodal, "Inkling-Small has vision + audio encoders");
+        assert!(
+            spec.is_multimodal,
+            "Inkling-Small has vision + audio encoders"
+        );
         assert!(spec.vision_spec.is_some(), "vision_config must be present");
         assert_eq!(
-            spec.vision_spec.as_ref().unwrap().patch_size, 40,
+            spec.vision_spec.as_ref().unwrap().patch_size,
+            40,
             "vision_config.patch_size must be 40"
         );
         assert!(spec.audio_spec.is_some(), "audio_config must be present");
         assert_eq!(
-            spec.audio_spec.as_ref().unwrap().n_mel_bins, 80,
+            spec.audio_spec.as_ref().unwrap().n_mel_bins,
+            80,
             "audio_config.n_mel_bins must be 80"
         );
         assert_eq!(
-            spec.expert_count, Some(256),
+            spec.expert_count,
+            Some(256),
             "text_config.n_routed_experts must be 256"
         );
         assert_eq!(
-            spec.expert_used_count, Some(6),
+            spec.expert_used_count,
+            Some(6),
             "text_config.num_experts_per_tok must be 6"
         );
 

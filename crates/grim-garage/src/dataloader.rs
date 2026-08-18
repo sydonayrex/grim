@@ -93,9 +93,9 @@ impl JsonlBatchIterator {
     }
 
     /// Load the next preference optimization batch (chosen/rejected pairs).
-    /// Returns `Ok(Some((chosen, rejected, is_preferred)))` when a batch is ready,
+    /// Returns `Ok(Some((chosen, rejected)))` when a batch is ready,
     /// `Ok(None)` when the file is exhausted, or `Err` on I/O errors.
-    pub fn next_preference_batch(&mut self) -> Result<Option<(Tensor, Tensor, Vec<bool>)>> {
+    pub fn next_preference_batch(&mut self) -> Result<Option<(Tensor, Tensor)>> {
         let needed = self.batch_size * self.seq_len;
         while self.token_buffer.len() < needed * 2 && !self.exhausted {
             self.fill_preference_buffer()?;
@@ -127,10 +127,10 @@ impl JsonlBatchIterator {
             Shape::from_slice(&[self.batch_size, self.seq_len]),
         );
 
-        // For now, all are "preferred" by default
-        let is_preferred = vec![true; self.batch_size];
-
-        Ok(Some((chosen_ids, rejected_ids, is_preferred)))
+        // P2-14c: the `is_preferred` vector was computed but never consumed —
+        // every caller destructured the return with `_` and discarded it, so
+        // drop it from the API entirely.
+        Ok(Some((chosen_ids, rejected_ids)))
     }
 
     fn fill_preference_buffer(&mut self) -> Result<()> {
@@ -172,25 +172,29 @@ impl JsonlBatchIterator {
     }
 
     fn fill_buffer(&mut self) -> Result<()> {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line) {
-            Ok(0) => {
-                self.exhausted = true;
-            }
-            Ok(_) => {
-                let line_index = self.line_index;
-                self.line_index += 1;
-                if line_index % self.world_size != self.rank {
-                    return self.fill_buffer();
+        loop {
+            let mut line = String::new();
+            match self.reader.read_line(&mut line) {
+                Ok(0) => {
+                    self.exhausted = true;
+                    break;
                 }
-                let v: serde_json::Value = serde_json::from_str(line.trim())
-                    .map_err(|e| grim_tensor::error::Error::Backend(e.to_string()))?;
-                let text = v["text"].as_str().unwrap_or("");
-                let tokens = self.tokenizer.encode(text);
-                self.token_buffer.extend(tokens);
-            }
-            Err(e) => {
-                return Err(grim_tensor::error::Error::Backend(e.to_string()));
+                Ok(_) => {
+                    let line_index = self.line_index;
+                    self.line_index += 1;
+                    if line_index % self.world_size != self.rank {
+                        continue; // skip lines belonging to other ranks
+                    }
+                    let v: serde_json::Value = serde_json::from_str(line.trim())
+                        .map_err(|e| grim_tensor::error::Error::Backend(e.to_string()))?;
+                    let text = v["text"].as_str().unwrap_or("");
+                    let tokens = self.tokenizer.encode(text);
+                    self.token_buffer.extend(tokens);
+                    break;
+                }
+                Err(e) => {
+                    return Err(grim_tensor::error::Error::Backend(e.to_string()));
+                }
             }
         }
         Ok(())

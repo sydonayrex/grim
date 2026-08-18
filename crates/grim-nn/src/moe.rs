@@ -33,7 +33,7 @@ use grim_backend_metal::MetalDevice;
 use grim_backend_rocm::RocmDevice;
 #[cfg(feature = "vulkan-mem")]
 use grim_backend_vulkan::VulkanDevice;
-use grim_tensor::dtype::{DType, QuantProvenance};
+use grim_tensor::dtype::{ArithType, BlockDtype, DType, FloatPackScheme, KQuantScheme, QuantProvenance, Storage};
 
 use grim_tensor::shape::Shape;
 use grim_tensor::{BackendDevice, BackendStorage, Device, Tensor};
@@ -432,12 +432,257 @@ impl ExpertBank {
 // MoE FFN
 // ---------------------------------------------------------------------------
 
+/// On-device resident copy of the flattened expert weight banks for the ROCm
+/// fused MoE dispatch. Built once on first `forward_rocm` call and reused for
+/// the session's lifetime, so expert weights never round-trip host↔device on
+/// every forward call. Rebuilt only when the resident set (expert count and
+/// weight shapes) changes.
+#[cfg(feature = "rocm-mem")]
+struct RocmResidentWeights {
+    gate: Arc<dyn BackendStorage>,
+    up: Arc<dyn BackendStorage>,
+    down: Arc<dyn BackendStorage>,
+    /// Structural key of the resident set: `(num_experts, hidden, inter)`.
+    fingerprint: (usize, usize, usize),
+}
+
+#[cfg(feature = "rocm-mem")]
+impl RocmResidentWeights {
+    fn build(
+        experts: &ExpertBank,
+        num_experts: usize,
+        hidden: usize,
+        inter: usize,
+        ordinal: usize,
+    ) -> Result<Self, grim_tensor::error::Error> {
+        let mut gate_flat = Vec::with_capacity(num_experts * inter * hidden);
+        let mut up_flat = Vec::with_capacity(num_experts * inter * hidden);
+        let mut down_flat = Vec::with_capacity(num_experts * hidden * inter);
+        for e in 0..num_experts {
+            gate_flat.extend_from_slice(&experts.gate[e].weight.to_vec_f32()?);
+            up_flat.extend_from_slice(&experts.up[e].weight.to_vec_f32()?);
+            down_flat.extend_from_slice(&experts.down[e].weight.to_vec_f32()?);
+        }
+
+        let dev = RocmDevice::try_new(ordinal)?;
+        let gate = Arc::from(BackendDevice::from_cpu(
+            &dev,
+            &gate_flat,
+            &Shape::new(vec![gate_flat.len()]),
+            DType::F32,
+        )?);
+        let up = Arc::from(BackendDevice::from_cpu(
+            &dev,
+            &up_flat,
+            &Shape::new(vec![up_flat.len()]),
+            DType::F32,
+        )?);
+        let down = Arc::from(BackendDevice::from_cpu(
+            &dev,
+            &down_flat,
+            &Shape::new(vec![down_flat.len()]),
+            DType::F32,
+        )?);
+
+        Ok(Self {
+            gate,
+            up,
+            down,
+            fingerprint: (num_experts, hidden, inter),
+        })
+    }
+}
+
+/// CUDA resident expert-weight cache: flattened gate/up/down buffers
+/// uploaded to the device once and reused across forward calls.
+/// Mirrors [`RocmResidentWeights`] for the CUDA backend.
+#[cfg(feature = "cuda-mem")]
+struct CudaResidentWeights {
+    gate: Arc<CudaStorage>,
+    up: Arc<CudaStorage>,
+    down: Arc<CudaStorage>,
+    /// Structural key of the resident set: `(num_experts, hidden, inter)`.
+    fingerprint: (usize, usize, usize),
+}
+
+#[cfg(feature = "cuda-mem")]
+impl CudaResidentWeights {
+    fn build(
+        experts: &ExpertBank,
+        num_experts: usize,
+        hidden: usize,
+        inter: usize,
+        ordinal: usize,
+    ) -> Result<Self, grim_tensor::error::Error> {
+        let mut gate_flat = Vec::with_capacity(num_experts * inter * hidden);
+        let mut up_flat = Vec::with_capacity(num_experts * inter * hidden);
+        let mut down_flat = Vec::with_capacity(num_experts * hidden * inter);
+        for e in 0..num_experts {
+            gate_flat.extend_from_slice(&experts.gate[e].weight.to_vec_f32()?);
+            up_flat.extend_from_slice(&experts.up[e].weight.to_vec_f32()?);
+            down_flat.extend_from_slice(&experts.down[e].weight.to_vec_f32()?);
+        }
+
+        let dev = crate::backend_cuda::CudaDevice::new(ordinal)?;
+        let gate = Arc::new(CudaStorage::copy_from_host(
+            &gate_flat,
+            &Shape::new(vec![gate_flat.len()]),
+            DType::F32,
+            ordinal,
+        )?);
+        let up = Arc::new(CudaStorage::copy_from_host(
+            &up_flat,
+            &Shape::new(vec![up_flat.len()]),
+            DType::F32,
+            ordinal,
+        )?);
+        let down = Arc::new(CudaStorage::copy_from_host(
+            &down_flat,
+            &Shape::new(vec![down_flat.len()]),
+            DType::F32,
+            ordinal,
+        )?);
+
+        Ok(Self {
+            gate,
+            up,
+            down,
+            fingerprint: (num_experts, hidden, inter),
+        })
+    }
+}
+
+/// Compute the actual packed byte size of one expert's weight given its dtype
+/// and element count. Works for any quant format: MXFP4/MXFP8/FP8 (float-pack),
+/// Q4_K/Q5_K/Q6_K/IQ2/3/4/NF4/FP4/block-quant (KQuant/block), and native
+/// fp16/f32/BF16. Returns the byte size that the PlanBuilder should use for
+/// budget accounting.
+fn expert_weight_bytes(dtype: &DType, elem_count: usize) -> usize {
+    match dtype.storage {
+        // Float-pack formats (MXFP4, MXFP8, FP8 block): packed bytes per element
+        // varies by scheme; approximate as the element count times the pack width.
+        Storage::FloatPack(scheme) => {
+            let bits_per_element = match scheme {
+                FloatPackScheme::MxFp4 => 4,
+                FloatPackScheme::MxFp8 => 8,
+                FloatPackScheme::Fp4 => 4,
+                FloatPackScheme::Fp8 => 8,
+                _ => 32, // fallback: treat as fp32
+            };
+            // Round up: ceil(elem_count * bits / 8)
+            (elem_count * bits_per_element + 7) / 8
+        }
+        // K-quant / block-quant / IQ formats: packed bytes, typically
+        // bits_per_weight per element. Use the quant scheme's bit width.
+        Storage::KQuant(qscheme) => {
+            let bits = match qscheme {
+                KQuantScheme::Q80 => 8,
+                KQuantScheme::Q4K => 4,
+                KQuantScheme::Q5K => 5,
+                KQuantScheme::Q6K => 6,
+                KQuantScheme::Q3K => 3,
+                KQuantScheme::Q2K => 2,
+                KQuantScheme::IQ4NL => 4,
+                KQuantScheme::IQ4XS => 4,
+                KQuantScheme::IQ3XXS => 3,
+                KQuantScheme::IQ3S => 3,
+                KQuantScheme::IQ2XXS => 2,
+                KQuantScheme::IQ2XS => 2,
+                KQuantScheme::IQ2S => 2,
+                _ => 8, // fallback
+            };
+            (elem_count * bits + 7) / 8
+        }
+        // Block-quantized formats (IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, etc.)
+        Storage::Block(bdtype) => {
+            // BlockDtype covers float-pack block formats (FP4/NF4/FP8) and
+            // block-quant variants. Use the bit width from the scheme.
+            let bits = match bdtype {
+                BlockDtype::Fp4 => 4,
+                BlockDtype::Nf4 => 4,
+                BlockDtype::Fp8 => 8,
+                BlockDtype::Fp4Block16 => 4,
+                BlockDtype::Fp8Block16 => 8,
+                _ => 8, // fallback
+            };
+            (elem_count * bits + 7) / 8
+        }
+        // GroupInt: variable, approximate as 1 byte per element
+        Storage::GroupInt(_) => elem_count,
+        // ResidualPacked: packed residual format with per-block scales.
+        // Use bpw (bits per weight) to compute byte size.
+        Storage::ResidualPacked(config) => {
+            (elem_count * config.bpw as usize + 7) / 8
+        }
+        // Native: fp16/f32/bf16
+        Storage::Native => {
+            match dtype.arith {
+                ArithType::F16 | ArithType::BF16 => elem_count * 2,
+                ArithType::F32 => elem_count * 4,
+                _ => elem_count * 4, // fallback
+            }
+        }
+    }
+}
+
+/// Detect the MoE-resident HBM budget from hardware, subtracting reservations.
+///
+/// Uses `hipMemGetInfo` (via `RocmDevice::query_device_vram_bytes`) to get total
+/// device memory, then subtracts estimated reservations for:
+/// - Driver/kernel overhead (~1-2 GB typical)
+/// - Kernel launch buffers, HIP streams, rocBLAS handles (~100-200 MB)
+/// - KV cache reservation (configurable, default 0 — caller should account separately)
+/// - Activation workspace for the current batch (configurable, default 0)
+///
+/// The remainder is the budget available for resident expert weights.
+/// For GDDR-only systems (Radeon), this is the GDDR capacity minus reservations.
+/// For hybrid systems, this is the HBM capacity minus reservations.
+///
+/// Returns `None` if VRAM probing fails or the device has 0 bytes (e.g., CPU fallback).
+pub fn detect_moe_budget(
+    ordinal: usize,
+    _kv_cache_reservation_bytes: usize,
+    _activation_reservation_bytes: usize,
+) -> Option<usize> {
+    let total_vram = RocmDevice::query_device_vram_bytes(ordinal);
+    if total_vram == 0 {
+        return None;
+    }
+    // Rough reservations: driver overhead, HIP streams, rocBLAS, kernel buffers.
+    // Conservative estimate: ~2 GB for non-weight GPU state.
+    let driver_reservation = 2usize * 1024 * 1024 * 1024usize;
+    let available = total_vram.saturating_sub(driver_reservation);
+    if available == 0 {
+        return None;
+    }
+    // Subtract caller-specified reservations (KV cache, activations)
+    let after_kv = available.saturating_sub(_kv_cache_reservation_bytes);
+    let after_activations = after_kv.saturating_sub(_activation_reservation_bytes);
+    if after_activations == 0 {
+        return None;
+    }
+    Some(after_activations)
+}
+
 /// A routed MoE feed-forward block: router + experts + optional shared expert.
 pub struct MoeFfn {
     pub router: MoeRouter,
     pub experts: ExpertBank,
     pub shared_expert: Option<ExpertTriple>,
     pub routed_scaling_factor: f32,
+    /// Per-expert routing hotness accumulator (updated each forward call).
+    /// Used by PlanBuilder to decide which experts deserve fp16 residency.
+    hotness: std::sync::Mutex<Vec<f32>>,
+    /// PlanBuilder for budget-feasible resident-set selection (P2-1 wiring).
+    plan_builder: PlanBuilder,
+    /// Cached resident plan from the last cache-miss rebuild.
+    cached_plan: std::sync::Mutex<Option<ResidentPlan>>,
+    /// ROCm resident expert-weight cache (see [`RocmResidentWeights`]).
+    #[cfg(feature = "rocm-mem")]
+    rocm_weights: std::sync::Mutex<Option<RocmResidentWeights>>,
+    /// CUDA resident expert-weight cache (see [`CudaResidentWeights`]).
+    #[cfg(feature = "cuda-mem")]
+    cuda_weights: std::sync::Mutex<Option<CudaResidentWeights>>,
 }
 
 /// An independent SwiGLU triple for the (always-on) shared expert.
@@ -487,11 +732,51 @@ impl MoeFfn {
         shared_expert: Option<ExpertTriple>,
         routed_scaling_factor: f32,
     ) -> Self {
+        let n_experts = experts.gate.len();
+        // Compute per-expert byte costs from the ACTUAL packed/precision dtype
+        // of each expert's weights — works for any quant format (MXFP4/MXFP8/FP8/
+        // Q4_K/Q5_K/Q6_K/IQ2/3/4 variants/NF4/FP4/block-quant) as well as native
+        // fp16/f32. The PlanBuilder uses these real costs for budget-feasible selection.
+        let (bytes_per_expert, hbm_budget) = if n_experts > 0 {
+            let mut total_bytes = 0usize;
+            for e in 0..n_experts {
+                // Sum the packed byte cost of gate + up + down for this expert.
+                // Use the dtype's storage to determine the actual per-element byte size.
+                let gate_dtype = experts.gate[e].weight.dtype();
+                let up_dtype = experts.up[e].weight.dtype();
+                let down_dtype = experts.down[e].weight.dtype();
+                let gate_elem = experts.gate[e].weight.shape().dims().iter().product::<usize>();
+                let up_elem = experts.up[e].weight.shape().dims().iter().product::<usize>();
+                let down_elem = experts.down[e].weight.shape().dims().iter().product::<usize>();
+                total_bytes += expert_weight_bytes(&gate_dtype, gate_elem)
+                    + expert_weight_bytes(&up_dtype, up_elem)
+                    + expert_weight_bytes(&down_dtype, down_elem);
+            }
+            // HBM budget: fit ALL experts at their actual packed cost (no demotion
+            // needed unless the budget is explicitly tightened).
+            let hbm_budget = total_bytes;
+            (total_bytes / n_experts, hbm_budget)
+        } else {
+            (0, 0)
+        };
+        // int8 cost is ~half the actual packed cost (used when demoting fp16 experts
+        // to a tighter format). For already-int8/quantized formats, demotion would
+        // mean a further quantize step; we approximate as half.
+        let bytes_per_int8 = (bytes_per_expert / 2).max(1);
+        let plan_builder = PlanBuilder::new(bytes_per_expert, bytes_per_int8, hbm_budget);
+
         Self {
             router,
             experts,
             shared_expert,
             routed_scaling_factor,
+            hotness: std::sync::Mutex::new(vec![0.0f32; n_experts]),
+            plan_builder,
+            cached_plan: std::sync::Mutex::new(None),
+            #[cfg(feature = "rocm-mem")]
+            rocm_weights: std::sync::Mutex::new(None),
+            #[cfg(feature = "cuda-mem")]
+            cuda_weights: std::sync::Mutex::new(None),
         }
     }
 
@@ -669,10 +954,11 @@ impl MoeFfn {
     }
 
     /// CUDA dispatch of the fused grouped MoE kernel (WI-M5). Mirrors
-    /// `forward_vulkan`: flattens expert weights, expands top-k routing into flat
-    /// token/expert/weight arrays, and calls `CudaDevice::moe_fused_dispatch`.
-    /// The activation `x` is already `CudaStorage` (model runs on CUDA), so it is
-    /// passed through directly; weights and router arrays are uploaded from host.
+    /// `forward_vulkan`: expands top-k routing into flat token/expert/weight
+    /// arrays and calls `CudaDevice::moe_fused_dispatch_resident` against
+    /// device-resident weight buffers (P2-1: weights are uploaded once and
+    /// cached across forward calls, eliminating the per-call host round-trip).
+    /// The activation `x` is already `CudaStorage` (model runs on CUDA).
     #[cfg(feature = "cuda-mem")]
     fn forward_cuda(&self, x: &Tensor) -> Result<Tensor, grim_tensor::error::Error> {
         let ordinal = match x.device() {
@@ -705,15 +991,35 @@ impl MoeFfn {
             });
         }
 
-        // Flatten expert weights (row-major per expert, outer = expert idx).
-        let mut gate_flat = Vec::with_capacity(num_experts * inter * hidden);
-        let mut up_flat = Vec::with_capacity(num_experts * inter * hidden);
-        let mut down_flat = Vec::with_capacity(num_experts * hidden * inter);
-        for e in 0..num_experts {
-            gate_flat.extend_from_slice(&self.experts.gate[e].weight.to_vec_f32()?);
-            up_flat.extend_from_slice(&self.experts.up[e].weight.to_vec_f32()?);
-            down_flat.extend_from_slice(&self.experts.down[e].weight.to_vec_f32()?);
-        }
+        // Resident expert-weight fast path: the flattened gate/up/down banks
+        // are uploaded to the device once and reused across forward calls
+        // (P2-1). The cache is rebuilt only when the resident set — expert
+        // count plus weight shapes — actually changes.
+        let (gate_buf, up_buf, down_buf) = {
+            let mut guard = self.cuda_weights.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (num_experts, hidden, inter);
+            match guard.as_ref() {
+                Some(r) if r.fingerprint == key => {
+                    (Arc::clone(&r.gate), Arc::clone(&r.up), Arc::clone(&r.down))
+                }
+                _ => {
+                    let built = CudaResidentWeights::build(
+                        &self.experts,
+                        num_experts,
+                        hidden,
+                        inter,
+                        ordinal,
+                    )?;
+                    let triple = (
+                        Arc::clone(&built.gate),
+                        Arc::clone(&built.up),
+                        Arc::clone(&built.down),
+                    );
+                    *guard = Some(built);
+                    triple
+                }
+            }
+        };
 
         // Expand top-k routing into flat arrays (one entry per routed pair).
         let mut rtok: Vec<u32> = Vec::new();
@@ -730,24 +1036,6 @@ impl MoeFfn {
 
         let dev = CudaDevice::new(ordinal)?;
         let x_storage: &dyn BackendStorage = &**x.storage();
-        let gate_buf = Box::new(CudaStorage::copy_from_host(
-            &gate_flat,
-            &Shape::new(vec![num_experts * inter * hidden]),
-            DType::F32,
-            ordinal,
-        )?);
-        let up_buf = Box::new(CudaStorage::copy_from_host(
-            &up_flat,
-            &Shape::new(vec![num_experts * inter * hidden]),
-            DType::F32,
-            ordinal,
-        )?);
-        let down_buf = Box::new(CudaStorage::copy_from_host(
-            &down_flat,
-            &Shape::new(vec![num_experts * hidden * inter]),
-            DType::F32,
-            ordinal,
-        )?);
         // Router arrays are integer; stage the raw u32 bytes (the kernel reads
         // them as `unsigned int*`). DType label is irrelevant for a raw copy.
         let rtok_bytes: Vec<u8> = rtok.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -773,7 +1061,7 @@ impl MoeFfn {
         )?);
 
         let out_shape = Shape::new(vec![batch, hidden]);
-        let (out_storage, _handle) = dev.moe_fused_dispatch(
+        let (out_storage, _handle) = dev.moe_fused_dispatch_resident(
             x_storage,
             &*gate_buf,
             &*up_buf,
@@ -946,19 +1234,9 @@ impl MoeFfn {
             });
         }
 
-        let mut gate_flat = Vec::with_capacity(num_experts * inter * hidden);
-        let mut up_flat = Vec::with_capacity(num_experts * inter * hidden);
-        let mut down_flat = Vec::with_capacity(num_experts * hidden * inter);
-        for e in 0..num_experts {
-            gate_flat.extend_from_slice(&self.experts.gate[e].weight.to_vec_f32()?);
-            up_flat.extend_from_slice(&self.experts.up[e].weight.to_vec_f32()?);
-            down_flat.extend_from_slice(&self.experts.down[e].weight.to_vec_f32()?);
-        }
-
         let assignment =
             grim_backend_rocm::kernels::charon::RoutingAssignment::from_route(&indices, &weights)?;
 
-        let dev = RocmDevice::try_new(ordinal)?;
         let x_storage: &dyn BackendStorage = &**x.storage();
         let x_rocm = x_storage
             .as_any()
@@ -966,11 +1244,65 @@ impl MoeFfn {
             .ok_or_else(|| grim_tensor::error::Error::Backend("x is not RocmStorage".into()))?;
 
         let out_shape = Shape::new(vec![batch, hidden]);
-        let (out_storage, _handle) = dev.moe_fused_dispatch(
+
+        // Update per-expert routing hotness from this call's router weights.
+        // Each token's routing weights indicate how much each expert was used;
+        // accumulate to track which experts are "hot" over time.
+        {
+            let mut hotness = self.hotness.lock().unwrap();
+            for (token_indices, token_weights) in indices.iter().zip(weights.iter()) {
+                for (&expert, &w) in token_indices.iter().zip(token_weights.iter()) {
+                    hotness[expert] += w;
+                }
+            }
+        }
+
+        // PlanBuilder: decide which experts deserve fp16 residency under the
+        // HBM budget. Called on every call with the updated hotness; the plan
+        // is cached for the resident-set rebuild (cache-miss path below).
+        let plan = self.plan_builder.build(&*self.hotness.lock().unwrap(), false);
+        *self.cached_plan.lock().unwrap() = Some(plan.clone());
+
+        // Resident expert-weight fast path: the flattened gate/up/down banks
+        // are uploaded to the device once and reused across forward calls
+        // (P2-1). The cache is rebuilt only when the resident set changes.
+        // PlanBuilder directs which experts are worth keeping resident; the
+        // current build uploads all experts (the PlanBuilder selects the subset
+        // that fits the HBM budget, but the full upload happens once per
+        // fingerprint change — cold experts would use the int8 dequant path
+        // in a full implementation).
+        let resident = {
+            let mut guard = self.rocm_weights.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (num_experts, hidden, inter);
+            match guard.as_ref() {
+                Some(r) if r.fingerprint == key => {
+                    (Arc::clone(&r.gate), Arc::clone(&r.up), Arc::clone(&r.down))
+                }
+                _ => {
+                    let built = RocmResidentWeights::build(
+                        &self.experts,
+                        num_experts,
+                        hidden,
+                        inter,
+                        ordinal,
+                    )?;
+                    let triple = (
+                        Arc::clone(&built.gate),
+                        Arc::clone(&built.up),
+                        Arc::clone(&built.down),
+                    );
+                    *guard = Some(built);
+                    triple
+                }
+            }
+        };
+
+        let dev = RocmDevice::try_new(ordinal)?;
+        let (out_storage, _handle) = dev.moe_fused_dispatch_resident(
             x_rocm,
-            &gate_flat,
-            &up_flat,
-            &down_flat,
+            &*resident.0,
+            &*resident.1,
+            &*resident.2,
             &assignment,
             &out_shape,
             hidden,

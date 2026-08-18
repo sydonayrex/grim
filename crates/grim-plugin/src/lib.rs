@@ -176,27 +176,33 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest> {
         }
         None => PluginKind::Wasm,
     };
-    let capabilities = PluginCapabilities(
-        plugin
-            .get("capabilities")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                let mut acc = 0u32;
-                for entry in arr {
-                    let tag = match entry.as_str() {
-                        Some("model") => PluginCapabilities::MODEL_ARCHITECTURE,
-                        Some("backend") => PluginCapabilities::BACKEND,
-                        Some("sampler") => PluginCapabilities::SAMPLER,
-                        Some("tokenizer") => PluginCapabilities::TOKENIZER,
-                        Some("pre_post") => PluginCapabilities::PRE_POST_PROCESSOR,
-                        _ => PluginCapabilities(0),
-                    };
-                    acc |= tag.0;
-                }
-                acc
-            })
-            .unwrap_or(0),
-    );
+    let capabilities = match plugin.get("capabilities").and_then(|v| v.as_array()) {
+        Some(arr) => {
+            let mut acc = 0u32;
+            for entry in arr {
+                let tag = match entry.as_str() {
+                    Some("model") => PluginCapabilities::MODEL_ARCHITECTURE,
+                    Some("backend") => PluginCapabilities::BACKEND,
+                    Some("sampler") => PluginCapabilities::SAMPLER,
+                    Some("tokenizer") => PluginCapabilities::TOKENIZER,
+                    Some("pre_post") => PluginCapabilities::PRE_POST_PROCESSOR,
+                    Some(other) => {
+                        return Err(grim_tensor::Error::Backend(format!(
+                            "unknown plugin capability '{other}'"
+                        )));
+                    }
+                    None => {
+                        return Err(grim_tensor::Error::Backend(
+                            "plugin capability entries must be strings".into(),
+                        ));
+                    }
+                };
+                acc |= tag.0;
+            }
+            PluginCapabilities(acc)
+        }
+        None => PluginCapabilities(0),
+    };
     let entry = plugin
         .get("entry")
         .and_then(|v| v.as_str())
@@ -335,6 +341,15 @@ impl PluginRegistry {
 
     /// Register a manifest for a loaded plugin.
     pub fn register_manifest(&mut self, manifest: PluginManifest) -> Result<()> {
+        // §6.3 Processing pipeline composition checks:
+        // Reject duplicate plugin identity at load time, independent of whether
+        // the optional stage/priority fields are present.
+        if self.manifests.contains_key(&manifest.name) {
+            return Err(grim_tensor::Error::Backend(format!(
+                "Duplicate plugin registered: '{}'",
+                manifest.name
+            )));
+        }
         // §6.3 Processing pipeline composition checks:
         // Reject duplicate (stage, priority) pairs at load time
         if let (Some(stage), Some(priority)) = (&manifest.stage, manifest.priority) {

@@ -53,14 +53,10 @@ pub trait SessionT: Send {
     }
     fn set_hip_graph_handle(&mut self, _handle: u64) {}
     /// Eager escape hatch for interactive validation (§4.3)
-    fn eval_eager(&mut self, op: &str, inputs: &[&Tensor]) -> Result<Tensor> {
-        let _ = op;
-        if inputs.is_empty() {
-            return Err(crate::error::Error::Session(
-                "eval_eager: empty inputs".into(),
-            ));
-        }
-        Ok(inputs[0].clone())
+    fn eval_eager(&mut self, _op: &str, _inputs: &[&Tensor]) -> Result<Tensor> {
+        Err(crate::error::Error::Unimplemented(
+            "eval_eager: eager evaluation is not implemented".into(),
+        ))
     }
     // Hidden-state capture hooks for WI 4 §4.4.1
     fn get_last_hidden_state(&self) -> Option<Tensor> {
@@ -210,14 +206,10 @@ impl SessionT for Inner {
         self.hip_graph_handle = Some(handle);
     }
     /// Eager escape hatch for interactive validation (§4.3)
-    fn eval_eager(&mut self, op: &str, inputs: &[&Tensor]) -> Result<Tensor> {
-        let _ = op;
-        if inputs.is_empty() {
-            return Err(crate::error::Error::Session(
-                "eval_eager: empty inputs".into(),
-            ));
-        }
-        Ok(inputs[0].clone())
+    fn eval_eager(&mut self, _op: &str, _inputs: &[&Tensor]) -> Result<Tensor> {
+        Err(crate::error::Error::Unimplemented(
+            "eval_eager: eager evaluation is not implemented".into(),
+        ))
     }
     fn get_last_hidden_state(&self) -> Option<Tensor> {
         self.last_hidden_state.clone()

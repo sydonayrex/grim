@@ -213,16 +213,6 @@ impl Sampler for TopPSampler {
     }
 }
 
-/// Index of the maximum element. Ties resolve to the first occurrence
-/// (matching llama.cpp / common convention for deterministic greedy decoding).
-fn argmax(v: &[f32]) -> u32 {
-    v.iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
-}
-
 /// Index of the maximum element with first-occurrence tie-breaking.
 /// Uses `max_by` + reverse enumeration so the first max in forward order wins.
 fn argmax_first(v: &[f32]) -> u32 {

@@ -80,11 +80,11 @@ impl InternS2Mobius {
     }
 
     pub fn load_tp(
-        device: Device,
+        _device: Device,
         _ws: &grim_nn::WeightSource<'_>,
-        cfg: InternS2MobiusConfig,
+        _cfg: InternS2MobiusConfig,
     ) -> Result<Self> {
-        Ok(InternS2Mobius { cfg, device })
+        Err(Error::Unimplemented("InternS2Mobius load_tp is not yet implemented".into()))
     }
 }
 

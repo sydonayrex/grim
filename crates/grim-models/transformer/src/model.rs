@@ -137,7 +137,7 @@ impl Llama {
         // Weight sanity check: models that loaded with zeroed weights should fail
         // at load time rather than silently returning Unimplemented on first forward.
         // [P1-36 fix: fail loudly on zeroed weights.]
-        let check_not_zeroed = |name: &str, tensor: &grim_nn::Tensor| {
+        let check_not_zeroed = |name: &str, tensor: &grim_tensor::Tensor| {
             let data = tensor.to_vec_f32();
             if let Ok(data) = data {
                 let all_zero = data.iter().all(|&v| v.abs() < 1e-10);
@@ -151,18 +151,22 @@ impl Llama {
             }
             Ok(())
         };
-        check_not_zeroed("tok_embeddings", &tok_embeddings)?;
-        check_not_zeroed("norm", &norm)?;
-        check_not_zeroed("output", &output)?;
+        check_not_zeroed("tok_embeddings", &tok_embeddings.weight)?;
+        check_not_zeroed("norm", &norm.weight)?;
+        check_not_zeroed("output", &output.weight())?;
         for (i, layer) in layers.iter().enumerate() {
-            check_not_zeroed(&format!("layer.{i}.attn_norm"), &layer.attn_norm)?;
-            check_not_zeroed(&format!("layer.{i}.ffn_norm"), &layer.ffn_norm)?;
-            check_not_zeroed(&format!("layer.{i}.wq"), &layer.wq)?;
-            check_not_zeroed(&format!("layer.{i}.wk"), &layer.wk)?;
-            check_not_zeroed(&format!("layer.{i}.wv"), &layer.wv)?;
-            check_not_zeroed(&format!("layer.{i}.wo"), &layer.wo)?;
-            check_not_zeroed(&format!("layer.{i}.gate_proj"), &layer.gate_proj)?;
-            check_not_zeroed(&format!("layer.{i}.down_proj"), &layer.down_proj)?;
+            check_not_zeroed(&format!("layer.{i}.attn_norm"), &layer.attn_norm.weight)?;
+            check_not_zeroed(&format!("layer.{i}.ffn_norm"), &layer.ffn_norm.weight)?;
+            check_not_zeroed(&format!("layer.{i}.wq"), &layer.wq.weight())?;
+            check_not_zeroed(&format!("layer.{i}.wk"), &layer.wk.weight())?;
+            check_not_zeroed(&format!("layer.{i}.wv"), &layer.wv.weight())?;
+            check_not_zeroed(&format!("layer.{i}.wo"), &layer.wo.weight())?;
+            if let Some(ref g) = layer.w_gate {
+                check_not_zeroed(&format!("layer.{i}.w_gate"), &g.weight())?;
+            }
+            if let Some(ref d) = layer.w_down {
+                check_not_zeroed(&format!("layer.{i}.w_down"), &d.weight())?;
+            }
         }
 
         Ok(Self {

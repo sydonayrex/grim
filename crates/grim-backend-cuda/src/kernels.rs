@@ -358,17 +358,19 @@ extern "C" __global__ void grim_rope_yarn(
 
 
 
-extern "C" __global__ void grim_quantized_matmul_q8_0(const float* a, const unsigned char* b, const float* b_scales, float* out, int m, int n, int k) {
+extern "C" __global__ void grim_quantized_matmul_q8_0(const float* a, const unsigned char* b, const float* b_scales, float* out, int m, int n, int k, int b_data_offset) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= m || col >= n) return;
 
     float sum = 0.0f;
     int blocks_per_row = k / 32;
+    // b_data_offset=2 → real Q8_0 packed layout (34 bytes/block with f16 header)
+    // b_data_offset=0 → simplified layout (32 bytes/block raw i8 codes)
+    int block_stride = 32 + b_data_offset;
     for (int b_idx = 0; b_idx < blocks_per_row; ++b_idx) {
         float scale = b_scales[col * blocks_per_row + b_idx];
-        // Q8_0 block: 2-byte f16 scale + 32 i8 codes = 34 bytes.
-        int b_offset = (col * blocks_per_row + b_idx) * 34 + 2;
+        int b_offset = (col * blocks_per_row + b_idx) * block_stride + b_data_offset;
         int a_offset = row * k + b_idx * 32;
         for (int i = 0; i < 32; ++i) {
             signed char q = (signed char)b[b_offset + i];

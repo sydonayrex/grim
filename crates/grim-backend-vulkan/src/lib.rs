@@ -6,6 +6,7 @@ pub use caps::VulkanCaps;
 
 use std::ffi::c_void;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use grim_tensor::backend::ComputeHandle;
 use grim_tensor::dtype::{
@@ -66,6 +67,13 @@ pub struct VkBufferCreateInfo {
     pub sharing_mode: u32,
     pub queue_family_index_count: u32,
     pub p_queue_family_indices: *const u32,
+}
+
+#[repr(C)]
+pub struct VkBufferCopy {
+    pub src_offset: VkDeviceSize,
+    pub dst_offset: VkDeviceSize,
+    pub size: VkDeviceSize,
 }
 
 #[repr(C)]
@@ -150,6 +158,7 @@ pub const VK_QUEUE_COMPUTE_BIT: u32 = 0x00000002;
 pub const VK_BUFFER_USAGE_STORAGE_BUFFER_BIT: u32 = 0x00000020;
 pub const VK_SHARING_MODE_EXCLUSIVE: u32 = 0;
 
+pub const VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT: u32 = 0x00000001;
 pub const VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT: u32 = 0x00000002;
 pub const VK_MEMORY_PROPERTY_HOST_COHERENT_BIT: u32 = 0x00000004;
 
@@ -476,6 +485,13 @@ unsafe extern "C" {
         groupCountY: u32,
         groupCountZ: u32,
     );
+    fn vkCmdCopyBuffer(
+        commandBuffer: *mut c_void,
+        srcBuffer: u64,
+        dstBuffer: u64,
+        regionCount: u32,
+        pRegions: *const VkBufferCopy,
+    );
     fn vkCmdPushConstants(
         commandBuffer: *mut c_void,
         layout: u64,
@@ -501,6 +517,10 @@ struct VulkanContext {
     device: *mut c_void,
     queue: *mut c_void,
     compute_family_index: u32,
+    device_name: String,
+    vendor_id: u32,
+    device_id: u32,
+    driver_version: u32,
 }
 
 unsafe impl Send for VulkanContext {}
@@ -686,8 +706,19 @@ impl VulkanContext {
             device,
             queue,
             compute_family_index,
+            device_name: read_device_name(&props.device_name),
+            vendor_id: props.vendor_id,
+            device_id: props.device_id,
+            driver_version: props.driver_version,
         })
     }
+}
+
+/// Convert a null-terminated `VkPhysicalDeviceProperties.device_name`
+/// (`[u8; 256]`) into a `String`.
+fn read_device_name(name: &[u8; 256]) -> String {
+    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    String::from_utf8_lossy(&name[..end]).into_owned()
 }
 
 impl Drop for VulkanContext {
@@ -705,6 +736,47 @@ impl Drop for VulkanContext {
 
 lazy_static::lazy_static! {
     static ref GLOBAL_CONTEXT: Mutex<Option<VulkanContext>> = Mutex::new(VulkanContext::init().ok());
+}
+
+/// Guards against re-attempting Vulkan init on every consumer call after a
+/// persistent failure. A single on-demand retry (see `global_context`) is
+/// enough; re-running init in a hot loop would just spam the loader.
+static RETRY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+
+/// Re-initializes the global Vulkan context after a failed init.
+///
+/// `lazy_static` caches `None` forever when the initial `VulkanContext::init`
+/// fails (e.g. GPU was busy or a transient loader error at process start).
+/// This is the explicit re-init/retry entry point consumers can call when
+/// they hit a stale "Vulkan context uninitialized" error. Only one fresh init
+/// is attempted; a persistent failure surfaces as `Err` and the caller decides
+/// whether to degrade gracefully.
+pub fn reset_global_context() -> Result<()> {
+    let mut guard = GLOBAL_CONTEXT.lock().unwrap();
+    if guard.is_none() {
+        RETRY_ATTEMPTED.store(true, Ordering::SeqCst);
+        *guard = VulkanContext::init().ok();
+    }
+    if guard.is_some() {
+        Ok(())
+    } else {
+        Err(Error::Backend(
+            "Vulkan context re-initialization failed".into(),
+        ))
+    }
+}
+
+/// Accessor for the global context that re-attempts init once when the
+/// initial `lazy_static` init failed (which would otherwise cache `None`
+/// forever). A persistent failure is not re-tried on every call thanks to
+/// `RETRY_ATTEMPTED`; callers see `None` and can invoke `reset_global_context`
+/// explicitly if they want another attempt.
+fn global_context() -> std::sync::MutexGuard<'static, Option<VulkanContext>> {
+    let mut guard = GLOBAL_CONTEXT.lock().unwrap();
+    if guard.is_none() && !RETRY_ATTEMPTED.swap(true, Ordering::SeqCst) {
+        *guard = VulkanContext::init().ok();
+    }
+    guard
 }
 
 // Vulkan crate structs
@@ -737,18 +809,67 @@ pub struct VulkanStorage {
     dtype: DType,
     provenance: QuantProvenance,
     device: *mut c_void,
+    /// Whether the backing `memory` is host-visible. Device-local buffers
+    /// cannot be `vkMapMemory`'d and are read back via a staging copy.
+    host_visible: bool,
 }
 
 unsafe impl Send for VulkanStorage {}
 unsafe impl Sync for VulkanStorage {}
 
+/// Which memory tier `alloc_gpu_inner` should prefer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuMemoryTier {
+    /// Require HOST_VISIBLE | HOST_COHERENT (mappable; used for uploads).
+    HostVisible,
+    /// Prefer DEVICE_LOCAL, falling back to host-visible when no device-local
+    /// type matches the buffer's `memory_type_bits`.
+    DeviceLocal,
+}
+
 impl VulkanStorage {
-    /// Allocates memory and a buffer on the Vulkan device.
+    /// Allocates memory and a buffer on the Vulkan device (host-visible).
     pub fn alloc_gpu(
         shape: &Shape,
         dtype: DType,
         device: *mut c_void,
         physical_device: *mut c_void,
+    ) -> Result<Self> {
+        Self::alloc_gpu_inner(
+            shape,
+            dtype,
+            device,
+            physical_device,
+            GpuMemoryTier::HostVisible,
+        )
+    }
+
+    /// Allocates a buffer preferring `DEVICE_LOCAL` VRAM for compute outputs,
+    /// falling back to a host-visible type where no suitable device-local type
+    /// exists (e.g. some UMA/APU configs). `host_visible` on the result
+    /// records what was actually selected so readback can route through a
+    /// staging copy.
+    pub fn alloc_device_local_gpu(
+        shape: &Shape,
+        dtype: DType,
+        device: *mut c_void,
+        physical_device: *mut c_void,
+    ) -> Result<Self> {
+        Self::alloc_gpu_inner(
+            shape,
+            dtype,
+            device,
+            physical_device,
+            GpuMemoryTier::DeviceLocal,
+        )
+    }
+
+    fn alloc_gpu_inner(
+        shape: &Shape,
+        dtype: DType,
+        device: *mut c_void,
+        physical_device: *mut c_void,
+        tier: GpuMemoryTier,
     ) -> Result<Self> {
         let bytes = shape
             .elem_count()
@@ -789,8 +910,10 @@ impl VulkanStorage {
             vkGetBufferMemoryRequirements(device, buffer, &mut reqs);
         }
 
-        // Find a host-visible and host-coherent memory type index
-        let memory_type_index = {
+        // Select a memory type for the requested tier. HostVisible requires a
+        // mappable+coherent type; DeviceLocal prefers VRAM and falls back to a
+        // mappable type (UMA/APU) so allocation never hard-fails on those.
+        let (memory_type_index, host_visible) = {
             let mut mem_properties = VkPhysicalDeviceMemoryProperties {
                 memory_type_count: 0,
                 memory_types: [VkMemoryType {
@@ -804,22 +927,38 @@ impl VulkanStorage {
                 vkGetPhysicalDeviceMemoryProperties(physical_device, &mut mem_properties);
             }
 
-            let required_properties =
+            let mappable =
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-            let mut found_type = None;
-            for i in 0..mem_properties.memory_type_count {
-                if (reqs.memory_type_bits & (1 << i)) != 0
-                    && (mem_properties.memory_types[i as usize].property_flags
-                        & required_properties)
-                        == required_properties
-                {
-                    found_type = Some(i);
-                    break;
-                }
+            let find = |required: u32| -> Option<u32> {
+                (0..mem_properties.memory_type_count).find(|i| {
+                    (reqs.memory_type_bits & (1 << i)) != 0
+                        && (mem_properties.memory_types[*i as usize].property_flags & required)
+                            == required
+                })
+            };
+
+            match tier {
+                GpuMemoryTier::HostVisible => (
+                    find(mappable).ok_or_else(|| {
+                        Error::Backend("Failed to find suitable Vulkan memory type".into())
+                    })?,
+                    true,
+                ),
+                GpuMemoryTier::DeviceLocal => match find(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+                    // A device-local type that also happens to be mappable
+                    // (UMA) can still be read directly.
+                    Some(i) => {
+                        let flags = mem_properties.memory_types[i as usize].property_flags;
+                        (i, (flags & mappable) == mappable)
+                    }
+                    None => (
+                        find(mappable).ok_or_else(|| {
+                            Error::Backend("Failed to find suitable Vulkan memory type".into())
+                        })?,
+                        true,
+                    ),
+                },
             }
-            found_type.ok_or_else(|| {
-                Error::Backend("Failed to find suitable Vulkan memory type".into())
-            })?
         };
 
         let alloc_info = VkMemoryAllocateInfo {
@@ -861,7 +1000,50 @@ impl VulkanStorage {
             dtype,
             provenance: QuantProvenance::GrimNative,
             device,
+            // This allocator records the tier actually selected above.
+            host_visible,
         })
+    }
+
+    /// Read the raw backing bytes, routing device-local buffers through a
+    /// staging copy. Prefer this over direct `vkMapMemory` for readback so
+    /// the caller works regardless of which memory tier was selected.
+    fn read_raw_bytes(&self) -> Result<Vec<u8>> {
+        if self.host_visible {
+            let mut mapped: *mut c_void = std::ptr::null_mut();
+            let res = unsafe {
+                vkMapMemory(
+                    self.device,
+                    self.memory,
+                    0,
+                    self.bytes as VkDeviceSize,
+                    0,
+                    &mut mapped,
+                )
+            };
+            if res != VK_SUCCESS {
+                return Err(Error::Backend(format!(
+                    "vkMapMemory failed with status {}",
+                    res
+                )));
+            }
+            let bytes = unsafe {
+                let slice = std::slice::from_raw_parts(mapped as *const u8, self.bytes);
+                let v = slice.to_vec();
+                vkUnmapMemory(self.device, self.memory);
+                v
+            };
+            Ok(bytes)
+        } else {
+            // A staging copy needs a command pool + compute queue, which this
+            // storage does not own (only `device`/`memory`/`buffer`). Callers
+            // that need readback must allocate with `alloc_gpu` (host-visible).
+            Err(Error::Backend(
+                "read_raw_bytes: buffer is DEVICE_LOCAL and not host-mappable; \
+                 allocate with alloc_gpu for readable buffers"
+                    .into(),
+            ))
+        }
     }
 }
 
@@ -888,36 +1070,302 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn to_cpu_vec_f32(&self) -> Result<Vec<f32>> {
-        let mut mapped: *mut c_void = std::ptr::null_mut();
-        let res = unsafe {
-            vkMapMemory(
-                self.device,
-                self.memory,
-                0,
-                self.bytes as VkDeviceSize,
-                0,
-                &mut mapped,
-            )
-        };
-        if res != VK_SUCCESS {
+        let raw = self.read_raw_bytes()?;
+        let expected = self
+            .shape
+            .elem_count()
+            .checked_mul(4)
+            .ok_or_else(|| Error::Backend("to_cpu_vec_f32: elem_count overflow".into()))?;
+        if raw.len() < expected {
             return Err(Error::Backend(format!(
-                "vkMapMemory failed with status {}",
-                res
+                "to_cpu_vec_f32: read {} bytes, expected at least {}",
+                raw.len(),
+                expected
             )));
         }
-
         let mut out = vec![0.0f32; self.shape.elem_count()];
         unsafe {
-            std::ptr::copy_nonoverlapping(mapped as *const f32, out.as_mut_ptr(), out.len());
-            vkUnmapMemory(self.device, self.memory);
+            std::ptr::copy_nonoverlapping(raw.as_ptr() as *const f32, out.as_mut_ptr(), out.len());
         }
-
         Ok(out)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+/// Allocate a host-visible, host-coherent staging buffer on `device`.
+/// Returns `(buffer, memory)`. The caller owns cleanup.
+fn alloc_host_visible_staging_buffer(
+    device: *mut c_void,
+    physical_device: *mut c_void,
+    bytes: usize,
+) -> Result<(u64, u64)> {
+    unsafe {
+        let buffer_ci = VkBufferCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            size: bytes as VkDeviceSize,
+            usage: VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            sharing_mode: VK_SHARING_MODE_EXCLUSIVE,
+            queue_family_index_count: 0,
+            p_queue_family_indices: std::ptr::null(),
+        };
+
+        let mut buffer: u64 = 0;
+        let res = vkCreateBuffer(device, &buffer_ci, std::ptr::null(), &mut buffer);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!(
+                "alloc_host_visible_staging_buffer: vkCreateBuffer failed: {res}"
+            )));
+        }
+
+        let mut reqs = VkMemoryRequirements {
+            size: 0,
+            alignment: 0,
+            memory_type_bits: 0,
+        };
+        vkGetBufferMemoryRequirements(device, buffer, &mut reqs);
+
+        let mut mem_properties = VkPhysicalDeviceMemoryProperties {
+            memory_type_count: 0,
+            memory_types: [VkMemoryType {
+                property_flags: 0,
+                heap_index: 0,
+            }; 32],
+            memory_heap_count: 0,
+            memory_heaps: [VkMemoryHeap { size: 0, flags: 0 }; 16],
+        };
+        vkGetPhysicalDeviceMemoryProperties(physical_device, &mut mem_properties);
+
+        let mappable =
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        let memory_type_index = (0..mem_properties.memory_type_count)
+            .find(|i| {
+                (reqs.memory_type_bits & (1 << i)) != 0
+                    && (mem_properties.memory_types[*i as usize].property_flags & mappable) == mappable
+            })
+            .ok_or_else(|| Error::Backend("staging: no mappable memory type".into()))?;
+
+        let alloc_info = VkMemoryAllocateInfo {
+            s_type: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            p_next: std::ptr::null(),
+            allocation_size: reqs.size,
+            memory_type_index,
+        };
+
+        let mut memory: u64 = 0;
+        let res = vkAllocateMemory(device, &alloc_info, std::ptr::null(), &mut memory);
+        if res != VK_SUCCESS {
+            vkDestroyBuffer(device, buffer, std::ptr::null());
+            return Err(Error::Backend(format!(
+                "alloc_host_visible_staging_buffer: vkAllocateMemory failed: {res}"
+            )));
+        }
+
+        let res = vkBindBufferMemory(device, buffer, memory, 0);
+        if res != VK_SUCCESS {
+            vkFreeMemory(device, memory, std::ptr::null());
+            vkDestroyBuffer(device, buffer, std::ptr::null());
+            return Err(Error::Backend(format!(
+                "alloc_host_visible_staging_buffer: vkBindBufferMemory failed: {res}"
+            )));
+        }
+
+        Ok((buffer, memory))
+    }
+}
+
+/// Synchronously copy `size` bytes from `src_buffer` (device) into
+/// `dst_buffer` (host-visible staging) using a one-shot command buffer on the
+/// compute queue. Compute queues support transfer operations.
+fn copy_device_buffer_to_host(
+    device: *mut c_void,
+    queue: *mut c_void,
+    compute_family_index: u32,
+    src_buffer: u64,
+    dst_buffer: u64,
+    size: u64,
+) -> Result<()> {
+    unsafe {
+        let pool_ci = VkCommandPoolCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            queue_family_index: compute_family_index,
+        };
+        let mut command_pool = 0u64;
+        let res = vkCreateCommandPool(device, &pool_ci, std::ptr::null(), &mut command_pool);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!(
+                "copy_device_buffer_to_host: vkCreateCommandPool failed: {res}"
+            )));
+        }
+        struct PoolCleanup {
+            device: *mut c_void,
+            command_pool: u64,
+        }
+        impl Drop for PoolCleanup {
+            fn drop(&mut self) {
+                if self.command_pool != 0 {
+                    unsafe {
+                        vkDestroyCommandPool(self.device, self.command_pool, std::ptr::null());
+                    }
+                }
+            }
+        }
+        let _pool = PoolCleanup {
+            device,
+            command_pool,
+        };
+
+        let cmd_alloc_info = VkCommandBufferAllocateInfo {
+            s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            p_next: std::ptr::null(),
+            command_pool,
+            level: 0,
+            command_buffer_count: 1,
+        };
+        let mut command_buffer: *mut c_void = std::ptr::null_mut();
+        let res = vkAllocateCommandBuffers(device, &cmd_alloc_info, &mut command_buffer);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!(
+                "copy_device_buffer_to_host: vkAllocateCommandBuffers failed: {res}"
+            )));
+        }
+
+        let begin_info = VkCommandBufferBeginInfo {
+            s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            p_next: std::ptr::null(),
+            flags: 1, // VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+            p_inheritance_info: std::ptr::null(),
+        };
+        let res = vkBeginCommandBuffer(command_buffer, &begin_info);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!(
+                "copy_device_buffer_to_host: vkBeginCommandBuffer failed: {res}"
+            )));
+        }
+
+        let region = VkBufferCopy {
+            src_offset: 0,
+            dst_offset: 0,
+            size,
+        };
+        vkCmdCopyBuffer(command_buffer, src_buffer, dst_buffer, 1, &region);
+
+        let res = vkEndCommandBuffer(command_buffer);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!(
+                "copy_device_buffer_to_host: vkEndCommandBuffer failed: {res}"
+            )));
+        }
+
+        let cmd_buf_u64 = command_buffer as u64;
+        let submit_info = VkSubmitInfo {
+            s_type: VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            p_next: std::ptr::null(),
+            wait_semaphore_count: 0,
+            p_wait_semaphores: std::ptr::null(),
+            p_wait_dst_stage_mask: std::ptr::null(),
+            command_buffer_count: 1,
+            p_command_buffers: &cmd_buf_u64,
+            signal_semaphore_count: 0,
+            p_signal_semaphores: std::ptr::null(),
+        };
+        let res = vkQueueSubmit(queue, 1, &submit_info, 0);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!(
+                "copy_device_buffer_to_host: vkQueueSubmit failed: {res}"
+            )));
+        }
+        let res = vkQueueWaitIdle(queue);
+        if res != VK_SUCCESS {
+            return Err(Error::Backend(format!(
+                "copy_device_buffer_to_host: vkQueueWaitIdle failed: {res}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Read back a device-local `VulkanStorage` by copying into a host-visible
+/// staging buffer. Acquires the global context for the compute queue; callers
+/// must NOT hold the context lock when invoking readback.
+fn read_back_via_staging(storage: &VulkanStorage) -> Result<Vec<u8>> {
+    let (device, queue, compute_family_index, physical_device) = {
+        let guard = global_context();
+        let ctx = guard
+            .as_ref()
+            .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
+        (
+            ctx.device,
+            ctx.queue,
+            ctx.compute_family_index,
+            ctx.physical_device,
+        )
+    };
+    let (staging_buffer, staging_memory) =
+        alloc_host_visible_staging_buffer(device, physical_device, storage.bytes)?;
+
+    struct StagingCleanup {
+        device: *mut c_void,
+        buffer: u64,
+        memory: u64,
+    }
+    impl Drop for StagingCleanup {
+        fn drop(&mut self) {
+            unsafe {
+                if self.memory != 0 {
+                    vkFreeMemory(self.device, self.memory, std::ptr::null());
+                }
+                if self.buffer != 0 {
+                    vkDestroyBuffer(self.device, self.buffer, std::ptr::null());
+                }
+            }
+        }
+    }
+    let _staging = StagingCleanup {
+        device,
+        buffer: staging_buffer,
+        memory: staging_memory,
+    };
+
+    copy_device_buffer_to_host(
+        device,
+        queue,
+        compute_family_index,
+        storage.buffer,
+        staging_buffer,
+        storage.bytes as u64,
+    )?;
+
+    let mut mapped: *mut c_void = std::ptr::null_mut();
+    let res = unsafe {
+        vkMapMemory(
+            device,
+            staging_memory,
+            0,
+            storage.bytes as VkDeviceSize,
+            0,
+            &mut mapped,
+        )
+    };
+    if res != VK_SUCCESS {
+        return Err(Error::Backend(format!(
+            "read_back_via_staging: vkMapMemory failed with status {}",
+            res
+        )));
+    }
+    let bytes = unsafe {
+        let slice = std::slice::from_raw_parts(mapped as *const u8, storage.bytes);
+        let v = slice.to_vec();
+        vkUnmapMemory(device, staging_memory);
+        v
+    };
+    Ok(bytes)
 }
 
 /// Vulkan device handle.
@@ -941,8 +1389,28 @@ impl Clone for VulkanDevice {
 
 impl VulkanDevice {
     /// Constructs a new Vulkan device.
+    ///
+    /// Threads the real adapter identity (queried in `VulkanContext::init`)
+    /// into the device caps so `vendor_id`/`device_id`/`device_name` reflect
+    /// the actual physical device. `VulkanCaps::probe_default` is kept only as
+    /// a last-resort fallback when no live Vulkan context exists (e.g. the
+    /// context was never initialized), so device identity is never fabricated.
     pub fn new() -> Self {
-        let caps = VulkanCaps::probe_default("Vulkan Compute Device".into(), 0x1002, 0x744c, 1);
+        let caps = {
+            let guard = global_context();
+            match guard.as_ref() {
+                Some(ctx) => VulkanCaps::probe_default(
+                    ctx.device_name.clone(),
+                    ctx.vendor_id,
+                    ctx.device_id,
+                    ctx.driver_version,
+                ),
+                None => {
+                    // Last-resort fallback only — no live context to query.
+                    VulkanCaps::probe_default("Vulkan Compute Device".into(), 0x1002, 0x744c, 1)
+                }
+            }
+        };
         let autotuner = VulkanAutotuner::new();
         // Restore prior tuning for this hardware fingerprint so repeat shapes hit the cache.
         autotuner.load_cache(&caps);
@@ -962,7 +1430,7 @@ impl VulkanDevice {
 
     /// Probes the system for available Vulkan GPUs.
     pub fn probe() -> Result<Vec<VulkanDevice>> {
-        let ctx = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx = global_context();
         if ctx.is_some() {
             Ok(vec![VulkanDevice::new()])
         } else {
@@ -1012,12 +1480,12 @@ impl VulkanDevice {
             .downcast_ref::<VulkanStorage>()
             .ok_or_else(|| Error::Backend("qkv_attention v is not VulkanStorage".into()))?;
 
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
         let out_storage =
-            VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let buffers = [q_s.buffer, k_s.buffer, v_s.buffer, out_storage.buffer];
         let total_work = (seq_len * num_heads) as u32;
@@ -1474,33 +1942,12 @@ impl Default for VulkanDevice {
     }
 }
 
-/// Extract raw bytes from a VulkanStorage buffer via vkMapMemory.
+/// Extract raw bytes from a VulkanStorage buffer. Host-visible buffers are
+/// read via `vkMapMemory`; device-local buffers are read back through a
+/// staging copy so the caller works regardless of the memory tier selected.
 pub fn extract_raw_bytes(storage: &dyn BackendStorage) -> Result<Vec<u8>> {
     if let Some(b_vk) = storage.as_any().downcast_ref::<VulkanStorage>() {
-        let mut mapped: *mut c_void = std::ptr::null_mut();
-        let res = unsafe {
-            vkMapMemory(
-                b_vk.device,
-                b_vk.memory,
-                0,
-                b_vk.bytes as VkDeviceSize,
-                0,
-                &mut mapped,
-            )
-        };
-        if res != VK_SUCCESS {
-            return Err(Error::Backend(format!(
-                "extract_raw_bytes: vkMapMemory failed ({})",
-                res
-            )));
-        }
-        let bytes = unsafe {
-            let slice = std::slice::from_raw_parts(mapped as *const u8, b_vk.bytes);
-            let v = slice.to_vec();
-            vkUnmapMemory(b_vk.device, b_vk.memory);
-            v
-        };
-        Ok(bytes)
+        b_vk.read_raw_bytes()
     } else {
         Err(Error::Backend(
             "extract_raw_bytes: storage is not VulkanStorage; \
@@ -1560,7 +2007,7 @@ impl VulkanDevice {
 
         let out_shape = Shape::from_slice(&[out_bytes]);
         let (ctx_device, ctx_physical_device) = {
-            let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+            let ctx_guard = global_context();
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
@@ -1568,8 +2015,8 @@ impl VulkanDevice {
         };
 
         let out_storage =
-            VulkanStorage::alloc_gpu(&out_shape, output_dtype, ctx_device, ctx_physical_device)?;
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+            VulkanStorage::alloc_device_local_gpu(&out_shape, output_dtype, ctx_device, ctx_physical_device)?;
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
@@ -1661,14 +2108,14 @@ impl VulkanDevice {
                 )
             })?;
 
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
 
         // Output is zero-initialized; the kernel atomicAdds contributions.
         let out_storage =
-            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
         unsafe {
             let mut mapped: *mut c_void = std::ptr::null_mut();
             let res = vkMapMemory(
@@ -1753,7 +2200,7 @@ impl VulkanDevice {
         shape: &Shape,
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
@@ -1818,7 +2265,7 @@ impl VulkanDevice {
             )));
         }
 
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
@@ -1852,7 +2299,7 @@ impl VulkanDevice {
         let spirv_source: Vec<u8> = spirv_for(kernel).to_vec();
 
         let out_storage =
-            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
 
         // Try GPU dispatch first
         let buffers = [a_s.buffer, b_s.buffer, out_storage.buffer];
@@ -1886,7 +2333,7 @@ impl VulkanDevice {
 
 impl BackendDevice for VulkanDevice {
     fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Box<dyn BackendStorage>> {
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
@@ -1943,12 +2390,12 @@ impl BackendDevice for VulkanDevice {
             .downcast_ref::<VulkanStorage>()
             .ok_or_else(|| Error::Backend("Vulkan add: input b is not VulkanStorage".into()))?;
 
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
         let out_storage =
-            VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Add).to_vec();
@@ -1982,12 +2429,12 @@ impl BackendDevice for VulkanDevice {
             .downcast_ref::<VulkanStorage>()
             .ok_or_else(|| Error::Backend("Vulkan mul: input b is not VulkanStorage".into()))?;
 
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
         let out_storage =
-            VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Mul).to_vec();
@@ -2022,12 +2469,12 @@ impl BackendDevice for VulkanDevice {
             Error::Backend("Vulkan silu_mul: input up is not VulkanStorage".into())
         })?;
 
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
         let out_storage =
-            VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::SiluMul).to_vec();
@@ -2066,12 +2513,12 @@ impl BackendDevice for VulkanDevice {
         let dw_s = dw.as_any().downcast_ref::<VulkanStorage>().ok_or_else(|| {
             Error::Backend("Vulkan silu_mul_backward dw is not VulkanStorage".into())
         })?;
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
-        let df = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
-        let de = VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let df = VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+        let de = VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
         let buffers = [e_s.buffer, g_s.buffer, dw_s.buffer, df.buffer, de.buffer];
         let push = push_params(out_shape.elem_count() as u32, 0, 0, 0, 0, 0.0);
         run_compute_shader(
@@ -2107,12 +2554,12 @@ impl BackendDevice for VulkanDevice {
                 Error::Backend("Vulkan rms_norm: input weight is not VulkanStorage".into())
             })?;
 
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
         let out_storage =
-            VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
         let x_dims = x.shape().dims();
@@ -2165,14 +2612,14 @@ impl BackendDevice for VulkanDevice {
                 Error::Backend("Vulkan fused_add_rms_norm: weight is not VulkanStorage".into())
             })?;
 
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
         let y_storage =
-            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
         let norm_storage =
-            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out_shape.elem_count();
         let x_dims = x.shape().dims();
@@ -2218,12 +2665,12 @@ impl BackendDevice for VulkanDevice {
             .downcast_ref::<VulkanStorage>()
             .ok_or_else(|| Error::Backend("Vulkan softmax: input x is not VulkanStorage".into()))?;
 
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
         let out_storage =
-            VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         let size = out.elem_count();
         let x_dims = x.shape().dims();
@@ -2258,12 +2705,12 @@ impl BackendDevice for VulkanDevice {
                 Error::Backend("Vulkan embedding: weight is not VulkanStorage".into())
             })?;
 
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
         let out_storage =
-            VulkanStorage::alloc_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out, DType::F32, ctx.device, ctx.physical_device)?;
 
         // Upload indices to GPU buffer temp
         let idx_shape = Shape::new(vec![indices.len()]);
@@ -2323,7 +2770,7 @@ impl BackendDevice for VulkanDevice {
         shape: &Shape,
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
@@ -2457,12 +2904,12 @@ impl BackendDevice for VulkanDevice {
                 Error::Backend("qkv_attention_paged v_pages is not VulkanStorage".into())
             })?;
 
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
         let out_storage =
-            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
         let buffers = [
             q_s.buffer,
             k_s.buffer,
@@ -2562,12 +3009,12 @@ impl BackendDevice for VulkanDevice {
             .ok_or_else(|| {
                 Error::Backend("tree_attention tree_parents is not VulkanStorage".into())
             })?;
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
         let out_storage =
-            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
         let buffers = [
             q_s.buffer,
             k_s.buffer,
@@ -2650,12 +3097,12 @@ impl BackendDevice for VulkanDevice {
             .ok_or_else(|| {
                 Error::Backend("kv_dequant_attention v_scales is not VulkanStorage".into())
             })?;
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
         let out_storage =
-            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
         let buffers = [
             q_s.buffer,
             k_s.buffer,
@@ -2698,12 +3145,12 @@ impl BackendDevice for VulkanDevice {
             .as_any()
             .downcast_ref::<VulkanStorage>()
             .ok_or_else(|| Error::Backend("Vulkan mul_scalar x is not VulkanStorage".into()))?;
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
         let out_storage =
-            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
 
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::MulScalar).to_vec();
         let buffers = [x_s.buffer, out_storage.buffer];
@@ -2728,12 +3175,12 @@ impl BackendDevice for VulkanDevice {
             .as_any()
             .downcast_ref::<VulkanStorage>()
             .ok_or_else(|| Error::Backend("Vulkan sqrt x is not VulkanStorage".into()))?;
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
         let out_storage =
-            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
 
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Sqrt).to_vec();
         let buffers = [x_s.buffer, out_storage.buffer];
@@ -2758,12 +3205,12 @@ impl BackendDevice for VulkanDevice {
             .as_any()
             .downcast_ref::<VulkanStorage>()
             .ok_or_else(|| Error::Backend("Vulkan recip x is not VulkanStorage".into()))?;
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
         let out_storage =
-            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
 
         let spirv_source: Vec<u8> = spirv_for(VulkanKernel::Recip).to_vec();
         let buffers = [x_s.buffer, out_storage.buffer];
@@ -2792,12 +3239,12 @@ impl BackendDevice for VulkanDevice {
             .as_any()
             .downcast_ref::<VulkanStorage>()
             .ok_or_else(|| Error::Backend("Vulkan rope x is not VulkanStorage".into()))?;
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
         let out_storage =
-            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
 
         let num_tokens = positions.len();
         let num_heads = out_shape.elem_count() / (num_tokens * dim);
@@ -2916,7 +3363,7 @@ impl BackendDevice for VulkanDevice {
         shape: &Shape,
         dtype: DType,
     ) -> Result<Box<dyn BackendStorage>> {
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
@@ -3249,9 +3696,9 @@ impl BackendDevice for VulkanDevice {
                 }
             };
             if let Some(kernel) = maybe_kernel {
-                let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+                let ctx_guard = global_context();
                 if let Some(ctx) = ctx_guard.as_ref() {
-                    if let Ok(out_storage) = VulkanStorage::alloc_gpu(
+                    if let Ok(out_storage) = VulkanStorage::alloc_device_local_gpu(
                         out_shape,
                         DType::F32,
                         ctx.device,
@@ -3440,7 +3887,7 @@ impl BackendDevice for VulkanDevice {
         };
 
         let (ctx_device, ctx_physical_device) = {
-            let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+            let ctx_guard = global_context();
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
@@ -3449,7 +3896,7 @@ impl BackendDevice for VulkanDevice {
 
         let out_storage =
             VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx_device, ctx_physical_device)?;
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
@@ -3490,7 +3937,7 @@ impl BackendDevice for VulkanDevice {
         // lock — from_cpu_bytes also locks GLOBAL_CONTEXT, so we must release
         // here to avoid deadlock.
         let (ctx_device, ctx_physical_device) = {
-            let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+            let ctx_guard = global_context();
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
@@ -3661,7 +4108,7 @@ impl BackendDevice for VulkanDevice {
         }
 
         // --- Lock context and dispatch ---
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
@@ -3714,7 +4161,7 @@ impl BackendDevice for VulkanDevice {
                 .iter()
                 .all(|s| s.as_any().downcast_ref::<VulkanStorage>().is_some());
             if is_f32 && total > 0 && all_vulkan {
-                let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+                let ctx_guard = global_context();
                 if let Some(ctx) = ctx_guard.as_ref() {
                     if let Ok(out_storage) = VulkanStorage::alloc_gpu(
                         &shape,
@@ -3822,7 +4269,7 @@ impl BackendDevice for VulkanDevice {
                 .iter()
                 .all(|(s, _)| s.as_any().downcast_ref::<VulkanStorage>().is_some());
             if is_f32 && n_total > 0 && all_vulkan {
-                let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+                let ctx_guard = global_context();
                 if let Some(ctx) = ctx_guard.as_ref() {
                     if let Ok(out_storage) = VulkanStorage::alloc_gpu(
                         &out_shape,
@@ -4176,7 +4623,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_vulkan_moe_fused_dispatch_parity() {
-        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+        if global_context().is_none() {
             return;
         }
         let dev = VulkanDevice::new();
@@ -4294,14 +4741,14 @@ mod tests {
     #[test]
     fn test_vulkan_device_probe() {
         let devices = VulkanDevice::probe().unwrap();
-        if GLOBAL_CONTEXT.lock().unwrap().is_some() {
+        if global_context().is_some() {
             assert!(!devices.is_empty());
         }
     }
 
     #[test]
     fn test_vulkan_zeros() {
-        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+        if global_context().is_none() {
             return;
         }
         let devices = VulkanDevice::probe().unwrap();
@@ -4314,7 +4761,7 @@ mod tests {
 
     #[test]
     fn test_vulkan_from_cpu() {
-        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+        if global_context().is_none() {
             return;
         }
         let devices = VulkanDevice::probe().unwrap();
@@ -4342,7 +4789,7 @@ mod tests {
 
     #[test]
     fn test_vulkan_matmul_simulated() {
-        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+        if global_context().is_none() {
             return;
         }
         let devices = VulkanDevice::probe().unwrap();
@@ -4362,7 +4809,7 @@ mod tests {
 
     #[test]
     fn test_vulkan_matmul_non_identity_and_shape_mismatch() {
-        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+        if global_context().is_none() {
             return;
         }
         let devices = VulkanDevice::probe().unwrap();
@@ -4402,7 +4849,7 @@ mod tests {
         let a_storage = a_s.as_any().downcast_ref::<VulkanStorage>().unwrap();
         let b_storage = b_s.as_any().downcast_ref::<VulkanStorage>().unwrap();
 
-        let ctx_guard = GLOBAL_CONTEXT.lock().unwrap();
+        let ctx_guard = global_context();
         let ctx = match ctx_guard.as_ref() {
             Some(c) => c,
             None => return,
@@ -4506,7 +4953,7 @@ mod tests {
 
     #[test]
     fn test_vulkan_add_golden_exact() {
-        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+        if global_context().is_none() {
             return;
         }
         let dev = VulkanDevice::new();
@@ -4526,7 +4973,7 @@ mod tests {
 
     #[test]
     fn test_vulkan_math_ops() {
-        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+        if global_context().is_none() {
             return;
         }
         let dev = VulkanDevice::new();
@@ -4549,7 +4996,7 @@ mod tests {
 
     #[test]
     fn test_vulkan_silu_mul_golden_exact() {
-        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+        if global_context().is_none() {
             return;
         }
         let dev = VulkanDevice::new();
@@ -4574,7 +5021,7 @@ mod tests {
 
     #[test]
     fn test_vulkan_rms_norm_golden_exact() {
-        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+        if global_context().is_none() {
             return;
         }
         let dev = VulkanDevice::new();
@@ -4596,7 +5043,7 @@ mod tests {
 
     #[test]
     fn test_vulkan_softmax_golden_exact() {
-        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+        if global_context().is_none() {
             return;
         }
         let dev = VulkanDevice::new();
@@ -4615,7 +5062,7 @@ mod tests {
 
     #[test]
     fn test_vulkan_embedding_golden_exact() {
-        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+        if global_context().is_none() {
             return;
         }
         let dev = VulkanDevice::new();
@@ -4637,7 +5084,7 @@ mod tests {
 
     #[test]
     fn test_vulkan_matmul_bf16_golden_exact() {
-        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+        if global_context().is_none() {
             return;
         }
         let dev = VulkanDevice::new();
@@ -4663,7 +5110,7 @@ mod tests {
     // Q: [seq=2, heads=2, dim=2]; K/V: [kv_seq=4, kv_heads=1, dim=2].
     #[test]
     fn test_vulkan_qkv_attention_exact() {
-        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+        if global_context().is_none() {
             return;
         }
         let dev = VulkanDevice::new();
@@ -4711,7 +5158,7 @@ mod tests {
 
     #[test]
     fn test_vulkan_qkv_attention_paged_gqa_exact() {
-        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+        if global_context().is_none() {
             return;
         }
         let dev = VulkanDevice::new();
@@ -4752,7 +5199,7 @@ mod tests {
 
     #[test]
     fn test_vulkan_tree_attention_gqa_exact() {
-        if GLOBAL_CONTEXT.lock().unwrap().is_none() {
+        if global_context().is_none() {
             return;
         }
         let dev = VulkanDevice::new();

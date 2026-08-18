@@ -379,7 +379,7 @@ impl Rwkv {
              sharding needs a bespoke plan",
         )
         .map_err(grim_core::Error::Unimplemented)?;
-        let emb_weight = ws.get(&format!("{}.weight", ws.pp("emb")))?
+        let emb_weight = ws.pp("emb").get(Shape::new(vec![cfg.vocab_size, cfg.hidden_size]), "weight")?
             .to_vec_f32()?;
         // RWKV embedding is [vocab_size, hidden_size] — use as a gather table,
         // NOT a Linear matrix multiply.
@@ -402,14 +402,16 @@ impl Rwkv {
         let ln_out = RmsNorm::load(&ws.pp("ln_out"), cfg.hidden_size, cfg.rms_norm_eps as f32)?;
         let head = Linear::load(&ws.pp("head"), cfg.hidden_size, cfg.vocab_size, false)?;
 
-        assert_weight_shape(&ln_out.weight, &[cfg.hidden_size], "ln_out")?;
-        assert_weight_shape(&head.weight, &[cfg.vocab_size, cfg.hidden_size], "head")?;
+        let vocab_size = cfg.vocab_size;
+        let hidden_size = cfg.hidden_size;
+        assert_weight_shape(&ln_out.weight, &[hidden_size], "ln_out")?;
+        assert_weight_shape(&head.weight, &[vocab_size, hidden_size], "head")?;
 
         Ok(Self {
             cfg,
             device,
             emb: emb_weight,
-            emb_shape: (cfg.vocab_size, cfg.hidden_size),
+            emb_shape: (vocab_size, hidden_size),
             layers,
             ln_out,
             head,
@@ -457,7 +459,7 @@ impl StatefulSequence for Rwkv {
             .collect();
         let emb_out = cpu_tensor(
             emb_rows.iter().flatten().cloned().collect::<Vec<f32>>(),
-            &Shape::new(vec![input_ids.len(), self.emb_shape.1]),
+            Shape::new(vec![input_ids.len(), self.emb_shape.1]),
         );
         let mut h = emb_out;
         for layer in &self.layers {

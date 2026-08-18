@@ -87,11 +87,11 @@ impl MiniMaxM3 {
     }
 
     pub fn load_tp(
-        device: Device,
+        _device: Device,
         _ws: &grim_nn::WeightSource<'_>,
-        cfg: MiniMaxM3Config,
+        _cfg: MiniMaxM3Config,
     ) -> Result<Self> {
-        Ok(MiniMaxM3 { cfg, device })
+        Err(Error::Unimplemented("MiniMaxM3 load_tp is not yet implemented".into()))
     }
 }
 
