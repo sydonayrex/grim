@@ -1645,6 +1645,9 @@ pub fn charon_autotune_launch_config(
             tile_kv: 64,
             grid_stride: 1,
             cycles_per_invocation: 0,
+            spec_gamma: 4,
+            spec_acceptance_threshold: 0.6,
+            spec_alpha: 0.0,
         }
     })
 }
@@ -2265,6 +2268,9 @@ mod tests {
             tile_kv: 64,
             grid_stride: 1,
             cycles_per_invocation: 500_000,
+            spec_gamma: 4,
+            spec_acceptance_threshold: 0.6,
+            spec_alpha: 0.0,
         };
         tuner.record_moe(key.clone(), cfg).expect("record_moe");
 
@@ -2304,6 +2310,9 @@ mod tests {
             tile_kv: 64,
             grid_stride: 1,
             cycles_per_invocation: 120_000,
+            spec_gamma: 4,
+            spec_acceptance_threshold: 0.6,
+            spec_alpha: 0.0,
         };
         tuner.record_moe(key, expected_cfg).unwrap();
 

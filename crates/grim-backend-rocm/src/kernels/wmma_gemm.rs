@@ -437,4 +437,77 @@ mod self_tests {
             "MXFP8 backward must use the shared fp8_e4m3_to_float_hip helper"
         );
     }
+
+    // WRECK-8: FP8 MFMA kernel structure test. The FP8 MFMA path (grim_fused_dequant_gemm_fp8_mfma
+    // + grim_fused_dequant_backward_gemm_fp8_mfma) is guarded by `#if defined(__gfx1200__)`
+    // so non-gfx1200 targets never compile it; the dispatch path (roc_device.rs:2831) checks
+    // `gpu_target.starts_with("gfx12")` before calling the MFMA kernel, falling back to the
+    // scalar grim_fused_dequant_gemm_fp8 on non-gfx12. The MFMA kernel is a scalar fallback
+    // (no real __builtin_amdgcn_mfma_f32_32x32x16f8f6f4) until on-device gfx1200 hardware
+    // is available to verify the builtin — that's the on-device WRECK-8 verification item,
+    // not a CPU-testable deliverable.
+    #[test]
+    fn source_contains_fp8_mfma_guarded_path() {
+        // MFMA forward kernel present and guarded by gfx1200.
+        assert!(
+            KERNEL_SOURCE.contains("grim_fused_dequant_gemm_fp8_mfma"),
+            "FP8 MFMA forward kernel must be present for JIT discovery"
+        );
+        assert!(
+            KERNEL_SOURCE.contains("grim_fused_dequant_backward_gemm_fp8_mfma"),
+            "FP8 MFMA backward kernel must be present for JIT discovery"
+        );
+        // The FP8 MFMA kernels are under `#if defined(__gfx1200__)` (line 319/395).
+        assert!(
+            KERNEL_SOURCE.contains("#if defined(__gfx1200__)")
+                && KERNEL_SOURCE.contains("#endif // __gfx1200__"),
+            "FP8 MFMA kernels must be guarded by #if defined(__gfx1200__)"
+        );
+        // The scalar FP8 fallback (non-MFMA) must be present for non-gfx1200 targets.
+        assert!(
+            KERNEL_SOURCE.contains("extern \"C\" __global__ void grim_fused_dequant_gemm_fp8")
+                && KERNEL_SOURCE.contains("extern \"C\" __global__ void grim_fused_dequant_backward_gemm_fp8"),
+            "Scalar FP8 fallback kernels must be present for non-gfx1200 targets"
+        );
+        // The MFMA kernel must use fp8_e4m3_to_float_hip (the shared FP8 decode helper).
+        assert!(
+            KERNEL_SOURCE.contains("fp8_e4m3_to_float_hip"),
+            "FP8 MFMA kernel must use the shared fp8_e4m3_to_float_hip helper"
+        );
+    }
+    /// Verifies the standalone FP8 GEMM kernel (fp8_gemm_rdna4.rs) is present in the
+    /// compute_kernel_source and is arch-gated. The standalone kernel is dead code
+    /// (launch_fp8_gemm_rdna4 has no callers — the fused dequant path in wmma_gemm.rs
+    /// handles FP8 GEMM); kept only because it is compiled into the kernel source for
+    /// JIT-compile test coverage. The real FP8 throughput path is the fused dequant
+    /// MFMA kernel in wmma_gemm.rs (WRECK-8 primary deliverable).
+    #[test]
+    fn source_contains_fp8_standalone_gated_path() {
+        let src = crate::kernels::source_asm::compute_kernel_source();
+        assert!(
+            src.contains("grim_fp8_gemm_rdna4"),
+            "standalone FP8 GEMM kernel must be present in compute_kernel_source"
+        );
+        assert!(
+            src.contains("#if defined(__gfx1200__)")
+                && src.contains("#if defined(__gfx1100__)"),
+            "standalone FP8 GEMM kernel must be arch-gated"
+        );
+    }
+
+    /// Verifies the standalone FP8 dequant kernel (fp8_standalone.rs) is present in the
+    /// compute_kernel_source. This is the scalar FP8 E4M3→F32 dequant path used by the
+    /// non-MFMA FP8 GEMM fallback (grim_fused_dequant_gemm_fp8 on non-gfx1200).
+    #[test]
+    fn source_contains_fp8_standalone() {
+        let src = crate::kernels::source_asm::compute_kernel_source();
+        assert!(
+            src.contains("grim_dequant_fp8"),
+            "standalone FP8 dequant kernel must be present in compute_kernel_source"
+        );
+        assert!(
+            src.contains("fp8_e4m3_to_float_hip"),
+            "standalone FP8 dequant must use the shared fp8_e4m3_to_float_hip helper"
+        );
+    }
 }

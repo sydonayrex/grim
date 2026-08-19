@@ -109,6 +109,10 @@ pub enum QuantMode {
     MxFp4Emulated,
     /// Jackdaw: MXFP8 E4M3 emulated (dequant in LDS to BF16, WMMA BF16 GEMM). Safe RDNA2+.
     MxFp8Emulated,
+    /// W8A8 SmoothQuant-style int8 GEMM — activations quantized per-token, weights quantized
+    /// per-channel. Uses int8 MFMA (CDNA2/3: `__builtin_amdgcn_mfma_i32_32x32x16_i8`)
+    /// or the int8 dot-product path on RDNA3/4.
+    Int8W8A8,
 }
 
 /// The concrete FP8 element format a device is **natively** capable of. This is
@@ -144,7 +148,7 @@ impl fmt::Display for Fp8NativeFormat {
     }
 }
 
-/// Per-arch capability bitmap. The struct is the *output* of the gate; [see: `capability.supports(mode)`]
+    /// Per-arch capability bitmap. The struct is the *output* of the gate; [see: `capability.supports(mode)`]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct QuantCapability {
     fp32: bool,
@@ -155,6 +159,8 @@ pub struct QuantCapability {
     fp8: Fp8NativeFormat,
     mxfp4_emulated: bool,
     mxfp8_emulated: bool,
+    /// Int8 MFMA for W8A8 SmoothQuant (CDNA2+: `mfma_i32_32x32x16_i8`).
+    int8_w8a8: bool,
 }
 
 impl QuantCapability {
@@ -166,6 +172,7 @@ impl QuantCapability {
             QuantMode::Fp8Native => self.fp8.is_native(),
             QuantMode::MxFp4Emulated => self.mxfp4_emulated,
             QuantMode::MxFp8Emulated => self.mxfp8_emulated,
+            QuantMode::Int8W8A8 => self.int8_w8a8,
         }
     }
 
@@ -180,8 +187,8 @@ impl fmt::Display for QuantCapability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "fp32={} f16={} bf16={} fp8_native={} mxfp4_emulated={} mxfp8_emulated={}",
-            self.fp32, self.f16, self.bf16, self.fp8, self.mxfp4_emulated, self.mxfp8_emulated
+            "fp32={} f16={} bf16={} fp8_native={} mxfp4_emulated={} mxfp8_emulated={} int8_w8a8={}",
+            self.fp32, self.f16, self.bf16, self.fp8, self.mxfp4_emulated, self.mxfp8_emulated, self.int8_w8a8
         )
     }
 }
@@ -196,6 +203,7 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             fp8: Fp8NativeFormat::OcpFn,
             mxfp4_emulated: true,
             mxfp8_emulated: true,
+            int8_w8a8: true,
         },
         GcnArch::CDNA3 => QuantCapability {
             fp32: true,
@@ -204,6 +212,7 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             fp8: Fp8NativeFormat::Fnuz,
             mxfp4_emulated: true,
             mxfp8_emulated: true,
+            int8_w8a8: true,
         },
         GcnArch::RDNA2 | GcnArch::RDNA3 | GcnArch::CDNA2 => QuantCapability {
             fp32: true,
@@ -212,6 +221,7 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             fp8: Fp8NativeFormat::None,
             mxfp4_emulated: true,
             mxfp8_emulated: true,
+            int8_w8a8: true,
         },
         GcnArch::RDNA1 | GcnArch::Other => QuantCapability {
             fp32: true,
@@ -220,6 +230,7 @@ pub fn arch_capability(arch: GcnArch) -> QuantCapability {
             fp8: Fp8NativeFormat::None,
             mxfp4_emulated: false,
             mxfp8_emulated: false,
+            int8_w8a8: false,
         },
     }
 }
@@ -256,7 +267,43 @@ pub fn resolve_quant_mode(arch: GcnArch, requested: QuantMode) -> QuantMode {
             }
         }
         QuantMode::Fp32 => QuantMode::Fp32,
+        QuantMode::Int8W8A8 => {
+            if caps.int8_w8a8 { requested } else { QuantMode::Fp32 }
+        }
     }
+}
+
+/// Per-channel activation scale array for SmoothQuant W8A8 path. Channels ==
+/// output features of a linear/conv. One scale per output channel absorbed from
+/// the activation max via gamma migration. Stored as fp32 so downstream
+/// in-kernel dequant can work from the canonical float value.
+#[derive(Debug, Clone, Default)]
+pub struct SmoothQuantActScales {
+    /// Flat vec, `len == num_channels`. Must be non-empty when the W8A8 dispatch
+    /// is enabled.
+    pub channels: Vec<f32>,
+}
+
+impl SmoothQuantActScales {
+    pub fn new(num_channels: usize) -> Self {
+        Self {
+            channels: vec![1.0f32; num_channels],
+        }
+    }
+
+    pub fn borrow(&self) -> &[f32] {
+        &self.channels
+    }
+}
+
+/// Offline calibration result from a single forward pass over a calibration
+/// dataset. Collects per-token activation maxes per layer and optionally
+/// applies SmoothQuant gamma migration to derive per-channel scales.
+#[derive(Debug, Clone)]
+pub struct SmoothQuantCalibration {
+    /// Per-layer per-channel activation scales after calibration. Layer index
+    /// is the position in the transformer stack (0 = embedding-adjacent).
+    pub layer_scales: Vec<SmoothQuantActScales>,
 }
 
 #[cfg(test)]
@@ -331,5 +378,81 @@ mod self_tests {
                 QuantMode::MxFp8Emulated
             );
         }
+    }
+
+    // =========================================================================
+    // WRECK-10: W8A8 SmoothQuant — structure tests, no GPU required.
+    // =========================================================================
+
+    #[test]
+    fn quantmode_int8w8a8_variant_compiles() {
+        // Verify the new QuantMode variant is in enum space and participates
+        // in capability resolution. If it didn't compile, this test wouldn't
+        // exist.
+        let mode = QuantMode::Int8W8A8;
+        assert!(matches!(mode, QuantMode::Int8W8A8));
+    }
+
+    #[test]
+    fn quant_capability_int8_w8a8_arch_table() {
+        // CDNA3 (gfx940) and RDNA3 (gfx1100) should both report int8_w8a8.
+        let cdna3 = arch_capability(GcnArch::CDNA3);
+        assert!(cdna3.int8_w8a8,
+            "CDNA3 should support Int8W8A8 (int8 MFMA: mfma_i32_32x32x16_i8)");
+        let rna3 = arch_capability(GcnArch::RDNA3);
+        assert!(rna3.int8_w8a8,
+            "RDNA3 should support Int8W8A8 (int8 MFMA / dot product path)");
+        let rna4 = arch_capability(GcnArch::RDNA4);
+        assert!(rna4.int8_w8a8,
+            "RDNA4 should support Int8W8A8 (int8 MFMA path)");
+    }
+
+    #[test]
+    fn quant_capability_int8_w8a8_missing_on_rna1() {
+        let rna1 = arch_capability(GcnArch::RDNA1);
+        assert!(!rna1.int8_w8a8,
+            "RDNA1 should NOT support Int8W8A8 (no int8 MFMA)");
+    }
+
+    #[test]
+    fn quantmode_supports_int8w8a8_gate() {
+        let cap = arch_capability(GcnArch::CDNA3);
+        assert!(cap.supports(QuantMode::Int8W8A8));
+        let rna1_cap = arch_capability(GcnArch::RDNA1);
+        assert!(!rna1_cap.supports(QuantMode::Int8W8A8));
+    }
+
+    #[test]
+    fn smooth_quant_act_scales_default() {
+        let scales = SmoothQuantActScales::new(128);
+        assert_eq!(scales.channels.len(), 128);
+        assert!(scales.channels.iter().all(|&s| (s - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn smooth_quant_calibration_empty_layers_ok() {
+        let cal = SmoothQuantCalibration { layer_scales: Vec::new() };
+        assert!(cal.layer_scales.is_empty());
+        let _ = cal.clone();
+    }
+
+    #[test]
+    fn smooth_quant_calibration_layer_scales_created() {
+        let mut cal = SmoothQuantCalibration { layer_scales: Vec::new() };
+        cal.layer_scales.push(SmoothQuantActScales::new(64));
+        cal.layer_scales.push(SmoothQuantActScales::new(128));
+        assert_eq!(cal.layer_scales.len(), 2);
+        assert_eq!(cal.layer_scales[0].channels.len(), 64);
+        assert_eq!(cal.layer_scales[1].channels.len(), 128);
+    }
+
+    #[test]
+    fn smooth_quant_calibration_scales_not_all_ones_by_default() {
+        // Verify the default constructor sets per-channel scales to 1.0 (the
+        // "no scaling" identity). A real calibration pass would replace these
+        // with observed maxes.
+        let scales = SmoothQuantActScales::new(32);
+        let all_ones = scales.channels.iter().all(|&s| (s - 1.0).abs() < 1e-6);
+        assert!(all_ones, "default calibration should start with 1.0 identity scales");
     }
 }

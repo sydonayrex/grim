@@ -201,18 +201,14 @@ pub struct RocmDevice {
     capture_active: AtomicBool,
     /// Keyed cache of captured + instantiated graphs. A graph is recorded exactly once [see: `replay_graph`]
     captured_graphs: Mutex<HashMap<String, CapturedGraph>>,
-    /// Once-flag: the first `matmul_batched` call in a process warms up the [see: `gemm_strided_batched_ex`]
-    batched_gemm_warmed: AtomicBool,
-    /// Optional RCCL collective handle for cross-GPU all-reduce (WI-R1/WI-R3).
-    /// Set externally when multi-GPU RCCL training is active; `None` when
-    /// single-GPU or RCCL not initialised. [see: `RcclAllReduce`, `set_rccl_handle`]
-    pub rccl: Mutex<Option<Arc<crate::rccl::RcclAllReduce>>>,
-    /// A single reusable HIP event recording the most recent upload completion
-    /// on the transfer stream. The active (compute) stream fences on it via
-    /// `hipStreamWaitEvent` so a weight prefetch on the transfer stream can
-    /// overlap the prior decode-step GEMM on the active stream (SPEED-ROC-1).
-    /// `None` until the first stream-ordered upload allocates it.
-    upload_event: Mutex<Option<*mut c_void>>,
+    /// GraphCaptureManager for decode-step graph capture/replay. Lazily initialized.
+    graph_capture_mgr: Mutex<Option<crate::graph_capture::GraphCaptureManager>>,
+    /// Whether batched GEMM rocBLAS handle has been warmed up.
+    pub(crate) batched_gemm_warmed: AtomicBool,
+    /// Optional NCCL/RCCL communicator for multi-GPU all-reduce.
+    pub(crate) rccl: Mutex<Option<Arc<crate::rccl::RcclAllReduce>>>,
+    /// Upload completion event for async H2D pipeline.
+    pub(crate) upload_event: Mutex<Option<*mut c_void>>,
 }
 
 unsafe impl Send for RocmDevice {}
@@ -624,6 +620,7 @@ impl RocmDevice {
             )),
             rccl: Mutex::new(None),
             upload_event: Mutex::new(None),
+            graph_capture_mgr: Mutex::new(None),
         }
     }
 
@@ -958,7 +955,53 @@ impl RocmDevice {
         self.captured_graphs.lock().unwrap().contains_key(key)
     }
 
-    /// Collapse a batch of `batch_count` same-shape GEMMs into one [see: `rocblas_gemm_strided_batched_ex`, `a[i]`, `[m, k]`, `b[i]`]
+    // =============================================================================
+    // WRECK-9: decode-step graph capture via GraphCaptureManager.
+    // =============================================================================
+
+    /// Lazily-initialized GraphCaptureManager for decode-step graph capture.
+    fn ensure_graph_capture_mgr(&self) {
+        let mut mgr = self.graph_capture_mgr.lock().unwrap();
+        if mgr.is_none() {
+            *mgr = Some(crate::graph_capture::GraphCaptureManager::for_device(self));
+        }
+    }
+
+    /// Capture the decode-step GEMM (`launch_decode_gemm_f16`) under a shape key via the
+    /// GraphCaptureManager, then replay it. Collapses per-step launch+dispatch overhead for
+    /// repeated decode steps at the same shape.
+    ///
+    /// Returns Ok(true) if captured and replayed; Ok(false) if manager not initialized
+    /// (callers fall back to eager `launch_decode_gemm_f16`).
+    pub fn decode_graph_capture_and_replay(
+        &self,
+        key: crate::graph_capture::DecodeGraphKey,
+        a: &RocmStorage,
+        b: &RocmStorage,
+        out: &RocmStorage,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<bool> {
+        self.ensure_graph_capture_mgr();
+        let mgr = self.graph_capture_mgr.lock().unwrap();
+        let mgr = mgr.as_ref().ok_or_else(|| {
+            Error::Backend("decode_graph_capture_and_replay: graph capture manager not initialized".into())
+        })?;
+        mgr.get_or_capture(key, |stream| {
+            if let Ok(h) = self.get_rocblas_handle() {
+                unsafe {
+                    let _ = rocblas_set_stream(h, stream);
+                }
+            }
+            self.launch_decode_gemm_f16(a, b, out, m, n, k)?;
+            Ok(())
+        })?;
+        mgr.replay(key)?;
+        Ok(true)
+    }
+
+    // =============================================================================
     pub fn matmul_batched(
         &self,
         a: &[&dyn BackendStorage],
@@ -2526,6 +2569,7 @@ impl BackendDevice for RocmDevice {
         quant_bits: u32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let quant_format = crate::fusion::KvQuantFormat::from_legacy_quant_bits(quant_bits as u8, true);
         self.kv_dequant_attention_impl(
             q,
             k_tensor,
@@ -2535,6 +2579,7 @@ impl BackendDevice for RocmDevice {
             num_kv_heads,
             kv_seq_len,
             cache_offset,
+            quant_format,
             quant_bits,
             out_shape,
         )
@@ -9746,6 +9791,9 @@ impl RocmDevice {
             tile_kv: winner.block_k,
             grid_stride: winner.grid_stride_m,
             cycles_per_invocation: (winner_ms * 1e6) as u64,
+            spec_gamma: 4,
+            spec_acceptance_threshold: 0.6,
+            spec_alpha: 0.0,
         };
         let _ = autotuner.record(key, config);
     }
@@ -10939,7 +10987,7 @@ impl RocmDevice {
         num_kv_heads: usize,
         kv_seq_len: usize,
         cache_offset: u32,
-        quant_bits: u32,
+        quant_format: crate::fusion::KvQuantFormat, quant_bits: u32,
         out_shape: &Shape,
     ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
         let config = {
@@ -10955,7 +11003,7 @@ impl RocmDevice {
                 num_heads: out_dims[1],
                 num_kv_heads,
                 head_dim: out_dims[2],
-                quant_bits: quant_bits as u8,
+                quant_format,
                 wavefront_size: self.props.wavefront_size as u32,
             }
         };
@@ -11037,7 +11085,8 @@ impl RocmDevice {
         let mut inv_sqrt_d_bits = inv_sqrt_d.to_bits();
         let inv_sqrt_d_ptr = &mut inv_sqrt_d_bits as *mut u32 as *mut f32;
         let inv_sqrt_d_stable = inv_sqrt_d_ptr;
-        let quant_bits_i = config.quant_bits as i32;
+        let quant_bits_i = quant_bits as i32;
+        let quant_format_i = config.quant_format.kernel_arg() as i32;
 
         let mut qp = q_ptr;
         let mut kp = k_ptr;
@@ -11053,6 +11102,7 @@ impl RocmDevice {
         let mut co = cache_offset_i;
         let mut isd = inv_sqrt_d;
         let mut qb = quant_bits_i;
+        let mut qf = quant_format_i;
 
         let stream = self.launch_compute_kernel(
             "grim_kv_dequant_attention",
@@ -11073,6 +11123,7 @@ impl RocmDevice {
                 arg(&mut co),
                 arg(&mut isd),
                 arg(&mut qb),
+                arg(&mut qf),
             ],
         )?;
 

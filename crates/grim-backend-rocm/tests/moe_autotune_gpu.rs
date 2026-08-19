@@ -159,6 +159,7 @@ fn benchmark_moe_shape(
                 tile_kv: (hidden / 4).max(16) as u32,
                 grid_stride: 1,
                 cycles_per_invocation: per_iter_us * 1000,
+            ..Default::default()
             };
         }
     }
@@ -190,6 +191,7 @@ fn benchmark_moe_shape(
                 // (`build_variant_table_from_autotuner`) has non-zero values
                 // to derive crossover points from.
                 cycles_per_invocation: per_iter_us.max(1) * 1000,
+            ..Default::default()
             };
         }
     }
@@ -344,6 +346,7 @@ fn moe_autotune_json_round_trip_preserves_all_entries() {
             tile_kv: 64,
             grid_stride: 1,
             cycles_per_invocation: 1000 + u64::from(bucket) * 500,
+        ..Default::default()
         };
         tuner.record_moe(key, cfg).expect("record_moe failed");
     }
@@ -413,6 +416,7 @@ fn bridge_build_variant_table_from_measured_autotuner() {
             // Higher cycles for high-skew buckets (as expected: skewed dispatch
             // wastes wave utilization).
             cycles_per_invocation: 1_000_000 + u64::from(bucket) * 500_000,
+        ..Default::default()
         };
         tuner.record_moe(key, cfg).expect("record_moe failed");
     }
@@ -493,6 +497,7 @@ fn moe_autotune_disk_persist_to_cache_dir() {
         tile_kv: 16,
         grid_stride: 1,
         cycles_per_invocation: 8_000,
+    ..Default::default()
     };
     tuner
         .record_moe(key.clone(), cfg)
