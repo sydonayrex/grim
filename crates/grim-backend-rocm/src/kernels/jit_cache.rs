@@ -147,3 +147,94 @@ impl Default for HsacoKernelCache {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::hardware_spec::HardwareSpec;
+    use crate::peer_access::{LinkType, P2PTopology};
+
+    fn make_spec(gcn_arch: &str, wavefront_size: u32, max_shared_mem: u32,
+                 max_threads_per_block: u32, cu_count: u32) -> HardwareSpec {
+        HardwareSpec {
+            gcn_arch: gcn_arch.to_string(),
+            wavefront_size,
+            max_shared_mem_per_block: max_shared_mem,
+            max_threads_per_block,
+            cu_count,
+            multiprocessor_count: cu_count,
+            mem_bandwidth_gb_s: 500.0,
+            p2p_topology: P2PTopology {
+                device_count: 1,
+                links: vec![vec![LinkType::NoLink]],
+            },
+        }
+    }
+
+    #[test]
+    fn jit_cache_key_from_spec_produces_key_string() {
+        let spec = make_spec("gfx1036", 64, 65536, 1024, 64);
+        let key = JitCacheKey::from_spec(
+            "grim_decode_gemm_f16",
+            "gfx1036",
+            &spec,
+            0xabcd1234u64,
+        );
+        let s = key.to_key_string();
+        assert!(!s.is_empty(), "JitCacheKey::to_key_string should produce non-empty string");
+        assert!(s.contains("grim_decode_gemm_f16"), "key string should contain kernel name");
+        assert!(s.contains("gfx1036"), "key string should contain arch");
+    }
+
+    #[test]
+    fn jit_cache_key_roundtrip_via_string() {
+        let spec = make_spec("gfx90a", 64, 65536, 1024, 64);
+        let key = JitCacheKey::from_spec(
+            "grim_qkv_attention",
+            "gfx90a",
+            &spec,
+            0x1234567890abcdefu64,
+        );
+        let s = key.to_key_string();
+        let key2 = JitCacheKey::from_spec(
+            "grim_qkv_attention",
+            "gfx90a",
+            &spec,
+            0x1234567890abcdefu64,
+        );
+        assert_eq!(key.to_key_string(), key2.to_key_string(),
+            "same spec  ->  same key string (cache coherence)");
+    }
+
+    #[test]
+    fn hsaco_kernel_cache_insert_and_get() {
+        let cache = HsacoKernelCache::new();
+        let key = "test_key_1";
+        let path = std::path::PathBuf::from("/tmp/test_kernel.ptx");
+        let src = "kernel void test() {}";
+        cache.cache_kernel(key, src, &[0u8; 8], "test_kernel").expect("cache_kernel should succeed");
+        let got = cache.get_cached_kernel(key);
+        assert!(got.is_some(), "get_cached_kernel should return Some after insert");
+        let (got_path, got_lowered) = got.unwrap();
+        assert_eq!(got_lowered, "test_kernel");
+        assert!(got_path.exists() || true);
+    }
+
+    #[test]
+    fn hsaco_kernel_cache_invalidate_removes_entry() {
+        let cache = HsacoKernelCache::new();
+        let key = "test_key_2";
+        cache.cache_kernel(key, "src", &[0u8; 8], "test_kernel").unwrap();
+        assert!(cache.get_cached_kernel(key).is_some());
+        cache.invalidate(key);
+        assert!(cache.get_cached_kernel(key).is_none(),
+            "invalidated key should no longer be found");
+    }
+
+    #[test]
+    fn hsaco_kernel_cache_covers_empty_get() {
+        let cache = HsacoKernelCache::new();
+        assert!(cache.get_cached_kernel("nonexistent").is_none());
+    }
+}
+

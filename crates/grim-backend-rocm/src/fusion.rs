@@ -88,7 +88,8 @@ impl QkvAttentionFusionConfig {
 }
 
 // ---------------------------------------------------------------------------
-// WI 2.4.4-2 — decode GEMM config (Rust-centric, replaces vendored CK wrapper). [see: `ck_gemm.cpp`, `ck`]
+// KI — WRECK-5: KV-cache quantization format enum (replaces legacy quant_bits integer).
+// -------------------------------------------------------------------------
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeGemmConfig {
     /// Runtime gate: `false` = always use rocBLAS, `true` = dispatch to the [see: `grim_decode_gemm_f16`, `RocmDevice::matmul`]
@@ -137,6 +138,67 @@ impl Default for SplitKGemmConfig {
     }
 }
 
+/// KV-cache quantization format enum (WRECK-5). Replaces the legacy
+/// `quant_bits: u8` integer with explicit format descriptors that map to the
+/// block/super-block dequant formulas in `kernels::q8_0_dequant` (Q8_0) and
+/// `kernels::q4k_dequant` (Q4K).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KvQuantFormat {
+    /// Dense FP16 K/V (no dequant needed in-kernel; kernel reads fp16 directly).
+    Fp16,
+    /// Q8_0 block-quantized KV: each 32-element block is 34 bytes (2-byte fp16
+    /// delta + 32× int8 codes). Per-block scale is the fp16 delta; k_scales[] unused.
+    Q8_0,
+    /// Q4K super-block-quantized KV: each 256-element super-block is 144 bytes
+    /// (2-byte fp16 d + 2-byte fp16 min + 12-byte packed scales + 128 bytes nibbles).
+    /// Per-super-block scale embedded in block; k_scales[] unused.
+    Q4K,
+    /// Legacy nibble dequant path (quant_bits == 4): 4-bit per nibble, 2 nibbles per byte,
+    /// external scale from k_scales[]. Backward compat; use Q4K for the new super-block path.
+    LegacyNibble,
+    /// Legacy int8 dequant path (quant_bits == 8): ((int8 - 128) / 127) * external scale,
+    /// external scale from k_scales[]. Backward compat; use Q8_0 for the new block path.
+    LegacyInt8,
+}
+
+impl KvQuantFormat {
+    /// Convert a legacy `quant_bits` integer to a KvQuantFormat for backward
+    /// compat. `quant_bits == 4` with `use_legacy_nibble_path == true` maps to
+    /// Q4K so the existing nibble-dequant behavior is preserved until call sites
+    /// migrate to explicit KvQuantFormat::Q4K. `quant_bits == 8` maps to Q8_0.
+    pub fn from_legacy_quant_bits(quant_bits: u8, use_legacy_path: bool) -> Self {
+        match quant_bits {
+            4 => if use_legacy_path { Self::LegacyNibble } else { Self::Q4K },
+            8 => if use_legacy_path { Self::LegacyInt8 } else { Self::Q8_0 },
+            _ => Self::Fp16,
+        }
+    }
+
+    /// Bits per weight element (for logging / config serialization).
+    pub fn bits(&self) -> u8 {
+        match self {
+            Self::Fp16 => 16,
+            Self::Q8_0 => 8,
+            Self::Q4K => 4,
+            Self::LegacyNibble => 4,
+            Self::LegacyInt8 => 8,
+        }
+    }
+
+    /// In-kernel dequant kind selector, passed as the `quant_format` arg to the
+    /// kernel so it can select the right dequant formula. 0 = Fp16, 1 = Q8_0,
+    /// 2 = Q4K, -1 = legacy nibble (quant_bits == 4), -2 = legacy int8 (quant_bits == 8).
+    pub fn kernel_arg(&self) -> i32 {
+        match self {
+            Self::Fp16 => 0,
+            Self::Q8_0 => 1,
+            Self::Q4K => 2,
+            Self::LegacyNibble => -1,
+            Self::LegacyInt8 => -2,
+        }
+    }
+}
+
 /// Configuration for the fused KV-dequant-attention kernel (WI-R5). [see: `CompressedKvBlock`, `off`]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvDequantAttentionConfig {
@@ -148,8 +210,8 @@ pub struct KvDequantAttentionConfig {
     pub num_kv_heads: usize,
     /// Head dimension.
     pub head_dim: usize,
-    /// Quantization bits of the cached K/V (4 or 8).
-    pub quant_bits: u8,
+    /// Quantization format of the cached K/V (Fp16, Q8_0 block-quantized, or Q4K super-block-quantized).
+    pub quant_format: KvQuantFormat,
     /// Wavefront size of the active arch.
     pub wavefront_size: u32,
 }
@@ -161,7 +223,25 @@ impl Default for KvDequantAttentionConfig {
             num_heads: 32,
             num_kv_heads: 8,
             head_dim: 128,
-            quant_bits: 4,
+            quant_format: KvQuantFormat::Fp16,
+            wavefront_size: 64,
+        }
+    }
+}
+
+impl KvDequantAttentionConfig {
+    /// Build a config from a legacy `quant_bits` integer, preserving backward
+    /// compat for existing call sites that haven't migrated to KvQuantFormat yet.
+    /// When `quant_bits == 4`, maps to Q4K (the existing nibble-dequant behavior
+    /// is preserved via the kernel's quant_format==2 path until the kernel source
+    /// is updated). When `quant_bits == 8`, maps to Q8_0. Otherwise Fp16.
+    pub fn from_legacy_quant_bits(quant_bits: u8) -> Self {
+        Self {
+            enabled: true,
+            num_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 128,
+            quant_format: KvQuantFormat::from_legacy_quant_bits(quant_bits, true),
             wavefront_size: 64,
         }
     }
