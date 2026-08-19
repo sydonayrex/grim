@@ -23,6 +23,7 @@ pub mod spec;
 pub mod start;
 pub mod stop;
 pub mod train;
+pub mod tui;
 pub mod verify;
 
 pub use service::ServiceManager;
