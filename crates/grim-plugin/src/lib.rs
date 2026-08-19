@@ -129,6 +129,35 @@ pub struct PluginManifest {
     pub reload: PluginReload,
 }
 
+/// Execution and memory limits for WASM plugin sandboxing.
+///
+/// These limits are enforced by the WASM loader (`WasmPluginLoader`) when
+/// present. Both fields default to `Some` with conservative values when using
+/// `PluginLimits::default()`:
+/// - `fuel_per_invocation`: defaults to `50_000` fuel units per invocation.
+///   Controls how much "work" a plugin can do before being paused. Higher values
+///   allow more complex sampling logic but increase the risk of a runaway plugin.
+/// - `max_memory_mb`: defaults to `64` MB. Caps the total linear memory a plugin
+///   can allocate. Prevents a malicious or buggy plugin from exhausting host RAM.
+///
+/// # Opt-out behavior
+///
+/// Both fields are `Option` types. Setting either field to `None` in a manifest
+/// **disables that limit entirely**. This is an explicit opt-out — a manifest
+/// that omits `limits` or sets `fuel_per_invocation = null` / `max_memory_mb = null`
+/// will run without that restriction. Operators should ensure untrusted/third-party
+/// plugins always carry explicit limits or be loaded in a context where the
+/// `require_pinned_hash` / capability-grant enforcement provides sufficient
+/// bounding.
+///
+/// # Trust model
+///
+/// For first-party and reviewed plugins, the defaults are typically sufficient.
+/// For third-party or untrusted plugins, consider:
+/// - Setting explicit lower limits in the manifest.
+/// - Using the WASM sandbox exclusively (not dylib loading).
+/// - Restricting capability grants (`network`, `filesystem`, `request_metadata`)
+///   to the minimum required.
 #[derive(Debug, Clone)]
 pub struct PluginLimits {
     pub fuel_per_invocation: Option<u64>,

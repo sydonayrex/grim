@@ -23,6 +23,15 @@ use grim_tensor::error::{Error, Result};
 pub const GGUF_MAGIC: u32 = 0x4655_4747; // "GGUF" LE
 pub const GGUF_VERSION: u32 = 3;
 
+/// Maximum nesting depth for GGUF array values during parsing.
+///
+/// Real-world GGUF metadata arrays are effectively always depth 1 (a flat list
+/// of scalars). Even unusually structured metadata is very unlikely to need more
+/// than a handful of nesting levels. This limit bounds worst-case stack usage to
+/// something the default thread stack size comfortably survives, preventing a
+/// crafted file with deeply nested arrays from causing a stack overflow.
+const MAX_GGUF_ARRAY_NESTING_DEPTH: u32 = 64;
+
 /// Metadata value type tags from GGUF spec.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GgufValue {
@@ -1623,7 +1632,7 @@ fn read_gguf_string<R: Read>(r: &mut R) -> Result<String> {
 
 fn read_gguf_value<R: Read>(r: &mut R) -> Result<GgufValue> {
     let tag = read_u32_le(r)?;
-    read_gguf_value_with_tag(r, tag)
+    read_gguf_value_with_tag(r, tag, 0)
 }
 
 /// Read a single GGUF metadata value given its type tag.
@@ -1632,7 +1641,7 @@ fn read_gguf_value<R: Read>(r: &mut R) -> Result<GgufValue> {
 /// byte, UINT16/INT16 = 2, UINT32/INT32/FLOAT32 = 4, UINT64/INT64/FLOAT64
 /// = 8). ARRAY elements are stored WITHOUT a repeated type tag — only the
 /// array's element type (read once) precedes the count and the raw elements.
-fn read_gguf_value_with_tag<R: Read>(r: &mut R, tag: u32) -> Result<GgufValue> {
+fn read_gguf_value_with_tag<R: Read>(r: &mut R, tag: u32, depth: u32) -> Result<GgufValue> {
     match tag {
         // GGUF metadata value type tags
         0 => Ok(GgufValue::Uint8({
@@ -1676,6 +1685,14 @@ fn read_gguf_value_with_tag<R: Read>(r: &mut R, tag: u32) -> Result<GgufValue> {
             // Array: element type tag (u32) + count (u64) + `count` raw
             // elements of that type (no per-element tag). Elements may
             // themselves be arrays (nested), so recurse on the element tag.
+            //
+            // Guard against deeply nested arrays that could cause a stack
+            // overflow on a crafted file.
+            if depth >= MAX_GGUF_ARRAY_NESTING_DEPTH {
+                return Err(Error::Backend(format!(
+                    "GGUF array nesting exceeds max depth of {MAX_GGUF_ARRAY_NESTING_DEPTH}"
+                )));
+            }
             let elem_tag = read_u32_le(r)?;
             let count = read_u64_le(r)?;
             if count > 10_000_000 {
@@ -1685,7 +1702,7 @@ fn read_gguf_value_with_tag<R: Read>(r: &mut R, tag: u32) -> Result<GgufValue> {
             }
             let mut items = Vec::with_capacity((count as usize).min(100_000));
             for _ in 0..count {
-                items.push(read_gguf_value_with_tag(r, elem_tag)?);
+                items.push(read_gguf_value_with_tag(r, elem_tag, depth + 1)?);
             }
             Ok(GgufValue::Array(items))
         }
@@ -2201,5 +2218,130 @@ mod tests {
             .get("general.architecture")
             .and_then(|v| v.as_str());
         assert_eq!(arch, Some("llama"));
+    }
+
+    /// Test that legitimately nested arrays (2-3 levels deep) still parse correctly.
+    #[test]
+    fn test_gguf_nested_array_parsing() {
+        // Build a buffer for nested array [[1, 2], [3, 4]]
+        // When read_gguf_value_with_tag is called with tag=9 (Array), it reads:
+        //   - elem_tag (u32): the type tag of elements in this array
+        //   - count (u64): number of elements
+        //   - count elements, each read via read_gguf_value_with_tag(r, elem_tag, depth+1)
+        //
+        // For [[1, 2], [3, 4]]:
+        //   - Outer array: elem_tag=9 (elements are arrays), count=2
+        //   - Element 1 (an array): elem_tag=4 (Uint32), count=2, values=[1, 2]
+        //   - Element 2 (an array): elem_tag=4 (Uint32), count=2, values=[3, 4]
+        let mut buf = Vec::new();
+
+        // Outer array header: elements are arrays (tag 9), count = 2
+        buf.extend_from_slice(&9u32.to_le_bytes()); // elem_tag = 9 (Array)
+        buf.extend_from_slice(&2u64.to_le_bytes()); // count = 2
+
+        // Element 1: inner array [1, 2]
+        buf.extend_from_slice(&4u32.to_le_bytes()); // inner array elem_tag = 4 (Uint32)
+        buf.extend_from_slice(&2u64.to_le_bytes()); // inner array count = 2
+        buf.extend_from_slice(&1u32.to_le_bytes()); // value 1
+        buf.extend_from_slice(&2u32.to_le_bytes()); // value 2
+
+        // Element 2: inner array [3, 4]
+        buf.extend_from_slice(&4u32.to_le_bytes()); // inner array elem_tag = 4 (Uint32)
+        buf.extend_from_slice(&2u64.to_le_bytes()); // inner array count = 2
+        buf.extend_from_slice(&3u32.to_le_bytes()); // value 3
+        buf.extend_from_slice(&4u32.to_le_bytes()); // value 4
+
+        let mut cursor = std::io::Cursor::new(buf);
+        // Call with tag 9 (Array) - function will read elem_type and count from stream
+        let value = read_gguf_value_with_tag(&mut cursor, 9, 0).expect("parse nested array");
+        if let GgufValue::Array(outer) = value {
+            assert_eq!(outer.len(), 2, "outer array should have 2 elements");
+            if let GgufValue::Array(inner1) = &outer[0] {
+                assert_eq!(inner1.len(), 2);
+                assert_eq!(inner1[0], GgufValue::Uint32(1));
+                assert_eq!(inner1[1], GgufValue::Uint32(2));
+            } else {
+                panic!("expected inner array at index 0, got {:?}", &outer[0]);
+            }
+            if let GgufValue::Array(inner2) = &outer[1] {
+                assert_eq!(inner2.len(), 2);
+                assert_eq!(inner2[0], GgufValue::Uint32(3));
+                assert_eq!(inner2[1], GgufValue::Uint32(4));
+            } else {
+                panic!("expected inner array at index 1, got {:?}", &outer[1]);
+            }
+        } else {
+            panic!("expected outer array, got {:?}", value);
+        }
+    }
+
+    /// Test that arrays nested beyond MAX_GGUF_ARRAY_NESTING_DEPTH return an error.
+    #[test]
+    fn test_gguf_array_nesting_depth_limit() {
+        // Build a buffer for an array nested 65 levels deep (exceeds MAX_GGUF_ARRAY_NESTING_DEPTH = 64)
+        let mut buf = Vec::new();
+
+        // GGUF array format when called via read_gguf_value_with_tag(tag=9, ...):
+        //   [elem_type_tag(u32), count(u64), elements...]
+        // For nested arrays, each element is itself an array.
+        //
+        // The buffer is read from the beginning, so the outermost level comes first.
+        //
+        // We'll build 65 nested arrays (1 outermost + 64 wrapping + 1 innermost = 66 total calls)
+        // The outermost call is at depth=0, so 65 more calls brings us to depth=65,
+        // which exceeds MAX_GGUF_ARRAY_NESTING_DEPTH (64) and triggers the error.
+
+        // Outermost level: elem_type = 9 (Array), count = 1
+        buf.extend_from_slice(&9u32.to_le_bytes()); // elem_type = 9 (Array)
+        buf.extend_from_slice(&1u64.to_le_bytes()); // count = 1
+
+        // 64 wrapping levels: each elem_type = 9 (Array), count = 1
+        for _ in 0..64 {
+            buf.extend_from_slice(&9u32.to_le_bytes()); // elem_type = 9 (Array)
+            buf.extend_from_slice(&1u64.to_le_bytes()); // count = 1
+        }
+
+        // Innermost level: elem_type = 4 (Uint32), count = 1, value = 42
+        buf.extend_from_slice(&4u32.to_le_bytes()); // elem_type = 4 (Uint32)
+        buf.extend_from_slice(&1u64.to_le_bytes()); // count = 1
+        buf.extend_from_slice(&42u32.to_le_bytes()); // value 42
+
+        let mut cursor = std::io::Cursor::new(buf);
+        // Call with tag 9 (Array) - function will read elem_type and count from stream
+        // depth starts at 0, and after 65 recursive calls we reach depth=65 which exceeds the limit
+        let result = read_gguf_value_with_tag(&mut cursor, 9, 0);
+        assert!(result.is_err(), "expected error for deeply nested array, got {:?}", result);
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("GGUF array nesting exceeds max depth"),
+            "error should mention nesting depth limit: {err_msg}"
+        );
+    }
+
+    /// Test that arrays nested exactly at the limit (64 levels) still parse.
+    #[test]
+    fn test_gguf_array_nesting_at_limit() {
+        // Build a buffer for an array nested exactly 64 levels deep (at the limit)
+        let mut buf = Vec::new();
+
+        // Innermost level: array containing Uint32 value 42
+        //   elem_type = 4 (Uint32), count = 1, value = 42
+        buf.extend_from_slice(&4u32.to_le_bytes()); // elem_type = 4 (Uint32)
+        buf.extend_from_slice(&1u64.to_le_bytes()); // count = 1
+        buf.extend_from_slice(&42u32.to_le_bytes()); // value 42
+
+        // Wrap in 63 more levels of arrays (total 64 levels, at the limit)
+        for _ in 0..63 {
+            buf.extend_from_slice(&9u32.to_le_bytes()); // elem_type = 9 (Array)
+            buf.extend_from_slice(&1u64.to_le_bytes()); // count = 1
+        }
+
+        let mut cursor = std::io::Cursor::new(buf);
+        // Call with tag 9 (Array)
+        let result = read_gguf_value_with_tag(&mut cursor, 9, 0);
+        assert!(result.is_ok(), "expected success for array at depth limit, got {:?}", result);
+        // Verify we got an array (the outermost wrapper)
+        let value = result.unwrap();
+        assert!(matches!(value, GgufValue::Array(_)), "expected array at depth limit");
     }
 }

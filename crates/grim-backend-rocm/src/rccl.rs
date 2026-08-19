@@ -4,6 +4,22 @@ use grim_tensor::DType;
 use grim_tensor::error::{Error, Result};
 use std::ffi::{c_char, c_void};
 
+/// Opaque NCCL communicator handle.
+///
+/// # Safety
+///
+/// `NcclComm` wraps a raw NCCL communicator pointer that is valid process-wide
+/// once initialized via `ncclCommInitRank` or `ncclCommInitAll`. Moving the
+/// handle between threads (Send) is safe because NCCL communicators are
+/// process-global resources. The handle is also Sync because NCCL collectives
+/// (`ncclAllReduce`, etc.) are designed to be called from any thread that holds
+/// a valid communicator — the library internally synchronizes access.
+///
+/// Current enforcement: all live call paths into this type pass through
+/// `AppState.engine: Mutex<Engine>` in grim-server, so no concurrent access is
+/// possible through the server's actual API today. Do NOT remove that lock or add
+/// a second concurrent access path without verifying that the underlying NCCL
+/// usage is thread-safe for the specific collective pattern being used.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy)]
 pub struct NcclComm(pub *mut c_void);

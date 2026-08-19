@@ -88,15 +88,30 @@ pub const fn to_route_link(status: P2PStatus, bytes: u64, pcie_threshold_bytes: 
 /// because that wouldn't be pinned and wouldn't satisfy the design
 /// intent — a non-pinned bounce is slower and defeats the host bounce's
 /// reason d'être).
+/// Pinned host memory buffer allocated via `hipHostMalloc`.
+///
+/// # Safety
+///
+/// `HostStagingBuffer` wraps a raw pointer to pinned host memory allocated by
+/// `hipHostMalloc`. The allocation is valid process-wide and can be accessed
+/// from any thread (Send + Sync) because:
+/// - The memory is page-locked and portable across CPU cores.
+/// - `bytes()` and `bytes_mut()` return bounded slices that prevent out-of-bounds
+///   access.
+/// - The lifecycle is managed by the caller (freed via `hipHostFree` or drop).
+///
+/// Current enforcement: all live call paths into this type pass through the
+/// staging cache mutex (`STAGING_CACHE`) in p2p_route.rs, plus
+/// `AppState.engine: Mutex<Engine>` in grim-server. No concurrent access is
+/// possible through the server's actual API today. Do NOT remove these locks or
+/// add a second concurrent access path without auditing the buffer lifecycle
+/// here first.
 pub struct HostStagingBuffer {
     ptr: *mut c_void,
     size: usize,
 }
 
-// SAFETY: ROCm's `hipHostMalloc` is intended to be cross-thread usable
-// when the allocation is pinned + portable. We restrict to the
-// HostStagingBuffer struct so that `bytes`/`bytes_mut` are
-// sound-bound-managed (we'll revisit when adding thread-safety).
+// SAFETY: see the struct-level safety documentation above.
 unsafe impl Send for HostStagingBuffer {}
 unsafe impl Sync for HostStagingBuffer {}
 
@@ -235,12 +250,25 @@ pub fn copy_route(
 /// stream. `None` until the first bounce; grown when a larger transfer
 /// arrives. A bounce on a different stream gets a fresh one-shot buffer
 /// (concurrent streams must not share staging without an event fence).
+/// Cached pinned staging buffer, reused across host-bounce copies on one stream.
+///
+/// # Safety
+///
+/// `StagingCache` holds a raw HIP stream handle and a `HostStagingBuffer`. The
+/// stream handle is valid process-wide and the buffer is Send+Sync (see its
+/// safety documentation). The cache itself is safe to send between threads
+/// because the stream handle is opaque and process-local. It is Sync because
+/// all access to the cache is serialized by the `STAGING_CACHE` mutex — no
+/// concurrent access to the buffer or stream occurs without holding that lock.
+///
+/// Current enforcement: the `STAGING_CACHE` static mutex serializes all access.
+/// Do NOT remove this mutex or add a second concurrent access path without
+/// adding internal synchronization here first.
 struct StagingCache {
     stream: *mut c_void,
     buf: HostStagingBuffer,
 }
-// SAFETY: the cache holds a raw stream handle and a pinned buffer explicitly
-// marked Send+Sync by HostStagingBuffer; access is serialized by the mutex.
+// SAFETY: see the struct-level safety documentation above.
 unsafe impl Send for StagingCache {}
 unsafe impl Sync for StagingCache {}
 
