@@ -5284,6 +5284,33 @@ mod tests {
         assert!(engine.request_input_ids.is_empty());
         assert!(engine.request_last_token.is_empty());
     }
+
+    /// Safety regression guard: `AppState.engine` must remain `Mutex<Engine>`,
+    /// not `RwLock<Engine>` or an unwrapped `Engine`. An `RwLock` would allow
+    /// concurrent *readers*, which is exactly the access pattern the
+    /// `unsafe impl Send + Sync` blocks on ROCm device types
+    /// (`RocmDevice`, `NcclComm`, `HostStagingBuffer`, `StagingCache`,
+    /// `QuantizedMatmulBackwardResiduals`) are NOT proven safe against — those
+    /// types depend on the "exactly one caller at a time" invariant that only a
+    /// `Mutex` (not an `RwLock`) enforces. If a future refactor changes this to
+    /// `RwLock`, add internal locking to those types first.
+    ///
+    /// This is a compile-time assertion via type annotation — if `AppState.engine`
+    /// is ever changed from `Mutex<Engine>` to something else, this binding will
+    /// fail to compile.
+    #[test]
+    fn test_appstate_engine_is_mutex() {
+        // Type annotation forces `engine` to be `Mutex<Engine>` — if AppState
+        // changes, this won't compile.
+        let state: AppState = AppState {
+            engine: Mutex::new(grim_engine::Engine::new(grim_engine::EngineConfig::default())),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            plugin_registry: None,
+        };
+        // Verify we can lock it (Mutex works)
+        let _guard = state.engine.lock().expect("engine mutex should not be poisoned");
+    }
 }
 
 // ============================================================================

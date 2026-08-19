@@ -1755,11 +1755,21 @@ impl QuantizedMatmulBackwardResiduals {
     }
 }
 
-/// # Safety Taxonomy — Tier 2 (Explicit raw pointers for GPU FFI dispatch)
-/// `QuantizedMatmulBackwardResiduals` wraps raw GPU device memory pointers that are thread-safe to pass across worker threads for HIP kernel launch.
+// SAFETY: `QuantizedMatmulBackwardResiduals` contains raw GPU device memory
+// pointers (outlier_indices_ptr, outlier_values_ptr) that are valid process-wide
+// on the owning HIP device. Moving a value to another thread (Send) is safe
+// because the pointers remain valid in the new thread's context. The type is
+// also Sync because the raw pointers are read-only views into device memory
+// that do not require exclusive access — concurrent read-only access from
+// multiple threads is safe as long as the underlying device memory is not freed.
+//
+// Current enforcement: all live call paths into this type pass through
+// `AppState.engine: Mutex<Engine>` in grim-server, so no concurrent access is
+// possible through the server's actual API today. Do NOT remove that lock or add
+// a second concurrent access path (e.g. worker pool, background prefetch thread)
+// without adding an internal Mutex here first. If a worker pool is introduced,
+// this type must be wrapped in a Mutex to serialize access.
 unsafe impl Send for QuantizedMatmulBackwardResiduals {}
-/// # Safety Taxonomy — Tier 2 (Explicit raw pointers for GPU FFI dispatch)
-/// `QuantizedMatmulBackwardResiduals` wraps raw GPU device memory pointers that are thread-safe to pass across worker threads for HIP kernel launch.
 unsafe impl Sync for QuantizedMatmulBackwardResiduals {}
 
 /// Owned tensor storage on a specific backend. Backends manage their own

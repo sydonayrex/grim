@@ -31,7 +31,17 @@ impl RocmHandle {
     }
 }
 
-// SAFETY: HIP stream handles are opaque platform resources that can safely be
+// SAFETY: `RocmHandle` wraps an optional HIP stream pointer. HIP stream handles
+// are opaque platform resources that are valid process-wide on the owning device.
+// Moving the handle to another thread (Send) is safe because the stream remains
+// valid in the new thread's context. The type is intentionally NOT `Sync` —
+// concurrent access to the same stream from multiple threads without external
+// synchronization can cause race conditions on stream-ordered operations.
+//
+// Current enforcement: all live call paths into this type pass through
+// `AppState.engine: Mutex<Engine>` in grim-server, so no concurrent access is
+// possible through the server's actual API today. Do NOT add a `Sync` impl or
+// introduce concurrent stream access without adding an internal Mutex first.
 unsafe impl Send for RocmHandle {}
 
 impl ComputeHandle for RocmHandle {

@@ -211,6 +211,18 @@ pub struct RocmDevice {
     pub(crate) upload_event: Mutex<Option<*mut c_void>>,
 }
 
+// SAFETY: `RocmDevice` wraps HIP device state (context, stream pool, handle
+// caches) that is process-local and accessed only through the owning thread's
+// HIP context. Moving the device to another thread (Send) is safe because HIP
+// contexts are thread-local but the device ordinal remains valid. The type is
+// Sync because all mutable state is behind interior mutability (Mutex,
+// AtomicBool) that serializes access.
+//
+// Current enforcement: all live call paths into this type pass through
+// `AppState.engine: Mutex<Engine>` in grim-server, so no concurrent access is
+// possible through the server's actual API today. Do NOT remove that lock or add
+// a second concurrent access path (e.g. worker pool, background prefetch thread)
+// without auditing the interior mutability here first.
 unsafe impl Send for RocmDevice {}
 unsafe impl Sync for RocmDevice {}
 
