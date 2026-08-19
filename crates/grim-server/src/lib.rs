@@ -5291,7 +5291,8 @@ mod tests {
 // ============================================================================
 
 /// `GET /api/stats` — JSON stats snapshot polled by the dashboard at `/`.
-fn probe_sys_ram() -> (u64, u64) {
+#[doc(hidden)]
+pub fn probe_sys_ram() -> (u64, u64) {
     if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
         let mut total_kb: u64 = 0;
         let mut avail_kb: u64 = 0;
@@ -5315,7 +5316,8 @@ fn probe_sys_ram() -> (u64, u64) {
     (0, 0)
 }
 
-fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::Value>) {
+#[doc(hidden)]
+pub fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::Value>) {
     let mut total_vram_used: u64 = 0;
     let mut total_vram_max: u64 = 0;
     let mut gpus_json = Vec::new();

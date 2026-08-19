@@ -13,8 +13,8 @@
 
 use grim_core::error::{Error, Result};
 use grim_plugin::ArchCompatSpec;
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 /// Generate and install a .grimplugin from a HuggingFace model repo.
 ///
@@ -41,12 +41,12 @@ fn resolve_install_path(
         if out_display.starts_with(&plugins_display) || out_display == plugins_display {
             Ok(out_path.to_path_buf())
         } else {
-                Err(Error::Config(format!(
-                    "Output path '{out_path:?}' is not inside plugins_dir '{plugins_display}' \
+            Err(Error::Config(format!(
+                "Output path '{out_path:?}' is not inside plugins_dir '{plugins_display}' \
                      and therefore will not be auto-discovered by grim run/serve. \
                      Either use a bare filename (writes to '{plugins_display}/{{name}}.grimplugin'), \
                      or specify an absolute path inside '{plugins_display}'."
-                )))
+            )))
         }
     } else {
         // Bare filename — write into plugins_dir.
@@ -60,9 +60,7 @@ pub async fn cmd_arch_plugin_generate(model_id: &str, output: Option<String>) ->
     // Parse the hf:org/repo prefix.
     let org_repo = if model_id.starts_with("hf:") {
         model_id.strip_prefix("hf:").ok_or_else(|| {
-            Error::Config(format!(
-                "model_id must start with 'hf:' (got '{model_id}')"
-            ))
+            Error::Config(format!("model_id must start with 'hf:' (got '{model_id}')"))
         })?
     } else {
         // Accept bare org/repo as well for convenience.
@@ -80,7 +78,7 @@ pub async fn cmd_arch_plugin_generate(model_id: &str, output: Option<String>) ->
     validate_spec(&spec)?;
 
     // Resolve the install path (pure function, testable in isolation).
-    let plugins_dir = grim_core::paths:: grim_plugins_dir();
+    let plugins_dir = grim_core::paths::grim_plugins_dir();
     let out_filename = output.unwrap_or_else(|| format!("{}.grimplugin", spec.model_type));
     let out_path = Path::new(&out_filename);
 
@@ -88,9 +86,7 @@ pub async fn cmd_arch_plugin_generate(model_id: &str, output: Option<String>) ->
 
     // Ensure the plugins directory exists (needed both for the auto-discoverable
     // default path and for any explicit --output inside grim_plugins_dir()).
-    let install_parent = install_path
-        .parent()
-        .unwrap_or(&install_path);
+    let install_parent = install_path.parent().unwrap_or(&install_path);
     fs::create_dir_all(install_parent).map_err(|e| {
         Error::Config(format!(
             "Failed to create directory {:?}: {e}",
@@ -100,12 +96,8 @@ pub async fn cmd_arch_plugin_generate(model_id: &str, output: Option<String>) ->
 
     // Serialize and write the plugin.
     let json_output = spec.to_json()?;
-    fs::write(&install_path, json_output).map_err(|e| {
-        Error::Config(format!(
-            "Failed to write plugin to {:?}: {e}",
-            install_path
-        ))
-    })?;
+    fs::write(&install_path, json_output)
+        .map_err(|e| Error::Config(format!("Failed to write plugin to {:?}: {e}", install_path)))?;
 
     println!(
         "Successfully generated and installed architecture compatibility plugin: {} -> {}",
@@ -116,9 +108,7 @@ pub async fn cmd_arch_plugin_generate(model_id: &str, output: Option<String>) ->
         "  model_type: '{}' (base='{}', layers={}, hidden={})",
         spec.model_type, spec.base_architecture, spec.num_layers, spec.hidden_size
     );
-    println!(
-        "  The next `grim run` or `grim serve` will discover this plugin automatically."
-    );
+    println!("  The next `grim run` or `grim serve` will discover this plugin automatically.");
 
     Ok(())
 }
@@ -135,14 +125,10 @@ fn validate_spec(spec: &ArchCompatSpec) -> Result<()> {
         ));
     }
     if spec.num_layers == 0 {
-        return Err(Error::Config(
-            "num_hidden_layers must be > 0".into(),
-        ));
+        return Err(Error::Config("num_hidden_layers must be > 0".into()));
     }
     if spec.hidden_size == 0 {
-        return Err(Error::Config(
-            "hidden_size must be > 0".into(),
-        ));
+        return Err(Error::Config("hidden_size must be > 0".into()));
     }
     Ok(())
 }
@@ -305,7 +291,10 @@ mod tests {
         let plugins_dir = std::path::PathBuf::from("/tmp/grim-plugins");
         let outside = std::path::PathBuf::from("/tmp/other-dir/plugin.grimplugin");
         let result = resolve_install_path(&outside, &plugins_dir);
-        assert!(result.is_err(), "absolute path outside plugins_dir must be rejected");
+        assert!(
+            result.is_err(),
+            "absolute path outside plugins_dir must be rejected"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("/tmp/other-dir"),
@@ -322,7 +311,10 @@ mod tests {
         let plugins_dir = std::path::PathBuf::from("/tmp/grim-plugins");
         let outside = std::path::PathBuf::from("../other-dir/plugin.grimplugin");
         let result = resolve_install_path(&outside, &plugins_dir);
-        assert!(result.is_err(), "relative path with .. outside plugins_dir must be rejected");
+        assert!(
+            result.is_err(),
+            "relative path with .. outside plugins_dir must be rejected"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("..") || err.contains("other-dir"),

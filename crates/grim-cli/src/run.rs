@@ -692,7 +692,9 @@ fn build_tensor(
         }
         #[cfg(not(feature = "cuda"))]
         grim_tensor::Device::Cuda(_) => {
-            return Err(grim_core::error::Error::Unimplemented("CUDA backend is not enabled in this build".into()));
+            return Err(grim_core::error::Error::Unimplemented(
+                "CUDA backend is not enabled in this build".into(),
+            ));
         }
         grim_tensor::Device::Rocm(ordinal) => {
             // Shared singleton: per-weight `new()` + drop would flush the

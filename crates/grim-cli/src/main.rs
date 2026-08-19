@@ -129,6 +129,29 @@ enum Commands {
         #[arg(long, default_value = "1.1")]
         repeat_penalty: f32,
     },
+    /// Diagnostics TUI chat interface.
+    Tui {
+        /// Name or path of the model (optional; `/model` loads later).
+        model: Option<String>,
+        /// Sampling temperature (0 = greedy).
+        #[arg(long, default_value = "0.7")]
+        temperature: f32,
+        /// Top-p (nucleus) sampling threshold.
+        #[arg(long, default_value = "0.9")]
+        top_p: f32,
+        /// Top-k sampling limit (0 = disabled).
+        #[arg(long, default_value = "40")]
+        top_k: u32,
+        /// Maximum tokens per turn.
+        #[arg(long, default_value = "512")]
+        max_tokens: usize,
+        /// RNG seed (0 = random).
+        #[arg(long, default_value = "0")]
+        seed: u64,
+        /// Repetition penalty (1.0 = disabled). Default 1.10 matches Ollama.
+        #[arg(long, default_value = "1.1")]
+        repeat_penalty: f32,
+    },
     /// Delete a model from local cache.
     Rm {
         /// Model name or path to delete.
@@ -774,6 +797,26 @@ async fn main() -> Result<()> {
             };
             eprintln!("[grim] serve: binding to {effective} (Ollama-compatible)");
             grim_server::serve(&effective, engine, None, plugin_registry).await?;
+        }
+        Commands::Tui {
+            model,
+            temperature,
+            top_p,
+            top_k,
+            max_tokens,
+            seed,
+            repeat_penalty,
+        } => {
+            tui::cmd_tui(
+                model,
+                temperature,
+                top_p,
+                top_k,
+                max_tokens,
+                seed,
+                repeat_penalty,
+            )
+            .await?;
         }
         Commands::Run {
             model,
