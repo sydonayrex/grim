@@ -76,7 +76,7 @@ pub fn strategy_label(s: &Strategy) -> &'static str {
 pub fn bar(used: u64, total: u64) -> String {
     let pct = ratio_percent(used, total) as usize;
     let fill = pct * 18 / 100;
-    let guard = 18.saturating_sub(fill);
+    let guard = 18usize.saturating_sub(fill);
     format!("[{}{}] {}%", "█".repeat(fill), "░".repeat(guard), pct)
 }
 
@@ -85,7 +85,7 @@ pub fn bar(used: u64, total: u64) -> String {
 /// Every telemetry field is optional because the engine can legitimately
 /// return `None` (prefill not yet run, no tokens generated, etc.). We never
 /// invent a number to fill a gap — `n/a` is correct there.
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct DiagnosticsSnapshot {
     /// Model id chosen by the user.
     pub model_name: Option<String>,
@@ -142,7 +142,11 @@ pub fn sidebar_lines(snap: &DiagnosticsSnapshot) -> Vec<String> {
     if snap.loading {
         out.push("model: loading ...".into());
     } else if let Some(name) = &snap.model_name {
-        let quant = snap.quant.as_deref().map(|q| format!(" ({q})")).unwrap_or_default();
+        let quant = snap
+            .quant
+            .as_deref()
+            .map(|q| format!(" ({q})"))
+            .unwrap_or_default();
         out.push(format!("model: {name}{quant}"));
     } else {
         out.push("model: none loaded (/model <name>)".into());
@@ -154,7 +158,10 @@ pub fn sidebar_lines(snap: &DiagnosticsSnapshot) -> Vec<String> {
 
     // spec line: strategy label + acceptance when available.
     let spec = if let Some(s) = &snap.strategy {
-        let acc = snap.accepted_per_step.map(|a| format!(" ({a:.1} tok/step)")).unwrap_or_default();
+        let acc = snap
+            .accepted_per_step
+            .map(|a| format!(" ({a:.1} tok/step)"))
+            .unwrap_or_default();
         format!("spec: {s}{acc}")
     } else {
         "spec: n/a".into()
@@ -173,14 +180,21 @@ pub fn sidebar_lines(snap: &DiagnosticsSnapshot) -> Vec<String> {
     }
     out.push(format!("decode: {}", format_tps(snap.decode_tps)));
     if let Some(t) = snap.turn_tps {
-        out.push(format!("turn: {} ({} tok)", format_tps(Some(t)), snap.tokens_generated));
+        out.push(format!(
+            "turn: {} ({} tok)",
+            format_tps(Some(t)),
+            snap.tokens_generated
+        ));
     }
 
     // KV cache.
     if snap.kv_total_bytes > 0 {
-        out.push(format!("kv {}", bar(snap.kv_used_bytes, snap.kv_total_bytes)));
         out.push(format!(
-            "{} / {} GiB ({} / {} blk)",
+            "kv {}",
+            bar(snap.kv_used_bytes, snap.kv_total_bytes)
+        ));
+        out.push(format!(
+            "{} / {} ({} / {} blk)",
             format_bytes(snap.kv_used_bytes),
             format_bytes(snap.kv_total_bytes),
             snap.kv_blocks_used,
@@ -201,9 +215,12 @@ pub fn sidebar_lines(snap: &DiagnosticsSnapshot) -> Vec<String> {
 
     // vram.
     if snap.vram_total_bytes > 0 {
-        out.push(format!("vram {}", bar(snap.vram_used_bytes, snap.vram_total_bytes)));
         out.push(format!(
-            "{} / {} GiB",
+            "vram {}",
+            bar(snap.vram_used_bytes, snap.vram_total_bytes)
+        ));
+        out.push(format!(
+            "{} / {}",
             format_bytes(snap.vram_used_bytes),
             format_bytes(snap.vram_total_bytes)
         ));
@@ -213,9 +230,12 @@ pub fn sidebar_lines(snap: &DiagnosticsSnapshot) -> Vec<String> {
 
     // ram.
     if snap.ram_total_bytes > 0 {
-        out.push(format!("ram {}", bar(snap.ram_used_bytes, snap.ram_total_bytes)));
         out.push(format!(
-            "{} / {} GiB",
+            "ram {}",
+            bar(snap.ram_used_bytes, snap.ram_total_bytes)
+        ));
+        out.push(format!(
+            "{} / {}",
             format_bytes(snap.ram_used_bytes),
             format_bytes(snap.ram_total_bytes)
         ));
@@ -242,7 +262,10 @@ mod tests {
         assert_eq!(format_tps(Some(41.23)), "41.2 tok/s");
         assert_eq!(acceptance_rate(0, 0), None);
         assert_eq!(acceptance_rate(7, 3), Some(7.0 / 3.0));
-        assert_eq!(bar(31, 100), "[█████░░░░░░░░░░░░░░░] 31%");
+        assert_eq!(
+            bar(31, 100),
+            format!("[{}] 31%", "█".repeat(5) + &"░".repeat(13))
+        );
         assert_eq!(bar(0, 0), "[░░░░░░░░░░░░░░░░░░] 0%");
     }
 
@@ -283,23 +306,26 @@ mod tests {
             loading: false,
             generating: false,
         };
-        assert_eq!(sidebar_lines(&snap), vec![
-            "model: LFM2.5-230M (Q8_0)".into(),
-            "backend: rocm gfx1100".into(),
-            "spec: DSpark (2.3 tok/step)".into(),
-            "encode: 3.1 ms (128 tok)".into(),
-            "prefill: 142.0 ms".into(),
-            "decode: 41.2 tok/s (EMA)".into(),
-            "turn: 38.9 tok/s (57 tok)".into(),
-            "kv [█████░░░░░░░░░░░░░░░] 30%".into(),
-            "1.2 / 4.0 GiB (312/1024 blk)".into(),
-            "ctx [█████░░░░░░░░░░░░░░░] 29%".into(),
-            "2412 / 8192 tok".into(),
-            "vram [████░░░░░░░░░░░░░░░░] 25%".into(),
-            "3.0 / 12.0 GiB".into(),
-            "ram [█████████░░░░░░░░░] 50%".into(),
-            "15.0 / 30.0 GiB".into(),
-        ]);
+        assert_eq!(
+            sidebar_lines(&snap),
+            vec![
+                "model: LFM2.5-230M (Q8_0)".to_string(),
+                "backend: rocm gfx1100".to_string(),
+                "spec: DSpark (2.3 tok/step)".to_string(),
+                "encode: 3.1 ms (128 tok)".to_string(),
+                "prefill: 142.0 ms".to_string(),
+                "decode: 41.2 tok/s".to_string(),
+                "turn: 38.9 tok/s (57 tok)".to_string(),
+                format!("kv {}", bar(1_288_490_187, 4_294_967_296)),
+                "1.2 GiB / 4.0 GiB (312 / 1024 blk)".to_string(),
+                format!("ctx {}", bar(2412, 8192)),
+                "2412 / 8192 tok".to_string(),
+                format!("vram {}", bar(3_221_225_472, 12_884_901_888)),
+                "3.0 GiB / 12.0 GiB".to_string(),
+                format!("ram {}", bar(16_106_127_360, 32_212_254_720)),
+                "15.0 GiB / 30.0 GiB".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -307,7 +333,13 @@ mod tests {
         let snap = DiagnosticsSnapshot::default();
         let lines = sidebar_lines(&snap);
         assert_eq!(lines[0], "model: none loaded (/model <name>)");
-        assert!(lines.iter().any(|l| l == "vram: n/a"), "missing vram n/a line");
-        assert!(lines.iter().any(|l| l == "ram: n/a"), "missing ram n/a line");
+        assert!(
+            lines.iter().any(|l| l == "vram: n/a"),
+            "missing vram n/a line"
+        );
+        assert!(
+            lines.iter().any(|l| l == "ram: n/a"),
+            "missing ram n/a line"
+        );
     }
 }
