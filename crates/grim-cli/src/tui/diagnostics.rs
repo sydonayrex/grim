@@ -9,22 +9,23 @@ use grim_speculative::Strategy;
 /// except plain bytes.
 pub fn format_bytes(bytes: u64) -> String {
     match bytes {
-        0 => "0 B".into(),
-        _ if bytes < 1_024 => format!("{} B", bytes),
-        _ if bytes < 1_048_576 => {
-            let kb = bytes as f64 / 1_024.0;
+        0 if false => "0 B".into(),
+        0 => format!("0 B"),
+        u if u < 1_024 => format!("{} B", u),
+        u if u < 1_048_576 => {
+            let kb = u as f64 / 1_024.0;
             format!("{:.1} KiB", kb)
         }
-        _ if bytes < 1_073_741_824 => {
-            let mb = bytes as f64 / 1_048_576.0;
+        u if u < 1_073_741_824 => {
+            let mb = u as f64 / 1_048_576.0;
             format!("{:.1} MiB", mb)
         }
-        _ if bytes < 1_099_511_627_776 => {
-            let gb = bytes as f64 / 1_073_741_824.0;
+        u if u < 1_099_511_627_776 => {
+            let gb = u as f64 / 1_073_741_824.0;
             format!("{:.1} GiB", gb)
         }
-        _ => {
-            let tb = bytes as f64 / 1_099_511_627_776.0;
+        u => {
+            let tb = u as f64 / 1_099_511_627_776.0;
             format!("{:.1} TiB", tb)
         }
     }
@@ -75,8 +76,154 @@ pub fn strategy_label(s: &Strategy) -> &'static str {
 pub fn bar(used: u64, total: u64) -> String {
     let pct = ratio_percent(used, total) as usize;
     let fill = pct * 18 / 100;
-    let guard = 18 - fill;
+    let guard = 18.saturating_sub(fill);
     format!("[{}{}] {}%", "█".repeat(fill), "░".repeat(guard), pct)
+}
+
+/// Per-model / per-turn snapshot rendered as the diagnostics sidebar.
+///
+/// Every telemetry field is optional because the engine can legitimately
+/// return `None` (prefill not yet run, no tokens generated, etc.). We never
+/// invent a number to fill a gap — `n/a` is correct there.
+#[derive(Default, Clone)]
+pub struct DiagnosticsSnapshot {
+    /// Model id chosen by the user.
+    pub model_name: Option<String>,
+    /// Quantization label, e.g. `Q8_0`.
+    pub quant: Option<String>,
+    /// Backend + device, e.g. `rocm gfx1100` or `cpu`.
+    pub backend: String,
+    /// Speculative strategy label at load time.
+    pub strategy: Option<String>,
+    /// Encode time in ms (tokenizer.encode).
+    pub encode_ms: Option<f64>,
+    /// Prompt token count (after chat template + BOS).
+    pub prompt_tokens: usize,
+    /// Most recent TTFT in ms.
+    pub prefill_ms: Option<f64>,
+    /// Engine tokens-per-sec EMA.
+    pub decode_tps: Option<f64>,
+    /// Per-turn measured tok/s.
+    pub turn_tps: Option<f64>,
+    /// Tokens generated in the current turn.
+    pub tokens_generated: usize,
+    /// KV cache used bytes.
+    pub kv_used_bytes: u64,
+    /// KV cache total bytes.
+    pub kv_total_bytes: u64,
+    /// KV cache blocks used.
+    pub kv_blocks_used: u64,
+    /// KV cache total blocks.
+    pub kv_blocks_total: u64,
+    /// Tokens currently in context.
+    pub ctx_used: u64,
+    /// Context length limit from the model (or user override).
+    pub ctx_limit: u64,
+    /// Average accepted speculative tokens per step this turn.
+    pub accepted_per_step: Option<f64>,
+    /// Total VRAM used.
+    pub vram_used_bytes: u64,
+    /// Total VRAM.
+    pub vram_total_bytes: u64,
+    /// Total system RAM used.
+    pub ram_used_bytes: u64,
+    /// Total system RAM.
+    pub ram_total_bytes: u64,
+    /// True during a load or a load-retry.
+    pub loading: bool,
+    /// True during a streaming generation.
+    pub generating: bool,
+}
+
+/// Render `snap` as a list of sidebar lines.
+pub fn sidebar_lines(snap: &DiagnosticsSnapshot) -> Vec<String> {
+    let mut out = Vec::new();
+
+    if snap.loading {
+        out.push("model: loading ...".into());
+    } else if let Some(name) = &snap.model_name {
+        let quant = snap.quant.as_deref().map(|q| format!(" ({q})")).unwrap_or_default();
+        out.push(format!("model: {name}{quant}"));
+    } else {
+        out.push("model: none loaded (/model <name>)".into());
+    }
+
+    if !snap.loading {
+        out.push(format!("backend: {}", snap.backend));
+    }
+
+    // spec line: strategy label + acceptance when available.
+    let spec = if let Some(s) = &snap.strategy {
+        let acc = snap.accepted_per_step.map(|a| format!(" ({a:.1} tok/step)")).unwrap_or_default();
+        format!("spec: {s}{acc}")
+    } else {
+        "spec: n/a".into()
+    };
+    out.push(spec);
+
+    if snap.prompt_tokens > 0 && !snap.loading {
+        out.push(format!(
+            "encode: {} ({} tok)",
+            format_ms(snap.encode_ms),
+            snap.prompt_tokens
+        ));
+    }
+    if let Some(v) = snap.prefill_ms {
+        out.push(format!("prefill: {v:.1} ms"));
+    }
+    out.push(format!("decode: {}", format_tps(snap.decode_tps)));
+    if let Some(t) = snap.turn_tps {
+        out.push(format!("turn: {} ({} tok)", format_tps(Some(t)), snap.tokens_generated));
+    }
+
+    // KV cache.
+    if snap.kv_total_bytes > 0 {
+        out.push(format!("kv {}", bar(snap.kv_used_bytes, snap.kv_total_bytes)));
+        out.push(format!(
+            "{} / {} GiB ({} / {} blk)",
+            format_bytes(snap.kv_used_bytes),
+            format_bytes(snap.kv_total_bytes),
+            snap.kv_blocks_used,
+            snap.kv_blocks_total
+        ));
+    } else {
+        out.push("kv: n/a".into());
+    }
+
+    // context.
+    if snap.ctx_limit > 0 {
+        out.push(format!("ctx {}", bar(snap.ctx_used, snap.ctx_limit)));
+        out.push(format!("{} / {} tok", snap.ctx_used, snap.ctx_limit));
+    } else {
+        out.push(format!("ctx {} tok", snap.ctx_used));
+        out.push("ctx limit: ?".into());
+    }
+
+    // vram.
+    if snap.vram_total_bytes > 0 {
+        out.push(format!("vram {}", bar(snap.vram_used_bytes, snap.vram_total_bytes)));
+        out.push(format!(
+            "{} / {} GiB",
+            format_bytes(snap.vram_used_bytes),
+            format_bytes(snap.vram_total_bytes)
+        ));
+    } else {
+        out.push("vram: n/a".into());
+    }
+
+    // ram.
+    if snap.ram_total_bytes > 0 {
+        out.push(format!("ram {}", bar(snap.ram_used_bytes, snap.ram_total_bytes)));
+        out.push(format!(
+            "{} / {} GiB",
+            format_bytes(snap.ram_used_bytes),
+            format_bytes(snap.ram_total_bytes)
+        ));
+    } else {
+        out.push("ram: n/a".into());
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -88,20 +235,79 @@ mod tests {
     fn formats_and_gauges() {
         assert_eq!(format_bytes(1536), "1.5 KiB");
         assert_eq!(format_bytes(1_073_741_824), "1.0 GiB");
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1), "1 B");
         assert_eq!(format_ms(None), "n/a");
         assert_eq!(format_ms(Some(3.14)), "3.1 ms");
         assert_eq!(format_tps(Some(41.23)), "41.2 tok/s");
         assert_eq!(acceptance_rate(0, 0), None);
         assert_eq!(acceptance_rate(7, 3), Some(7.0 / 3.0));
         assert_eq!(bar(31, 100), "[█████░░░░░░░░░░░░░░░] 31%");
+        assert_eq!(bar(0, 0), "[░░░░░░░░░░░░░░░░░░] 0%");
     }
 
     #[test]
     fn ratios_and_labels() {
         assert_eq!(ratio_percent(5, 10), 50);
+        assert_eq!(ratio_percent(11, 10), 100);
         assert_eq!(ratio_percent(0, 0), 0);
         assert_eq!(strategy_label(&Strategy::Plain), "plain (no speculation)");
         assert_eq!(strategy_label(&Strategy::DSpark), "DSpark");
         assert_eq!(strategy_label(&Strategy::NativeMtp), "native MTP");
+    }
+
+    #[test]
+    fn sidebar_lines_render_full_snapshot() {
+        let snap = DiagnosticsSnapshot {
+            model_name: Some("LFM2.5-230M".into()),
+            quant: Some("Q8_0".into()),
+            backend: "rocm gfx1100".into(),
+            strategy: Some("DSpark".into()),
+            encode_ms: Some(3.1),
+            prompt_tokens: 128,
+            prefill_ms: Some(142.0),
+            decode_tps: Some(41.2),
+            turn_tps: Some(38.9),
+            tokens_generated: 57,
+            kv_used_bytes: 1_288_490_187,
+            kv_total_bytes: 4_294_967_296,
+            kv_blocks_used: 312,
+            kv_blocks_total: 1024,
+            ctx_used: 2412,
+            ctx_limit: 8192,
+            accepted_per_step: Some(2.3),
+            vram_used_bytes: 3_221_225_472,
+            vram_total_bytes: 12_884_901_888,
+            ram_used_bytes: 16_106_127_360,
+            ram_total_bytes: 32_212_254_720,
+            loading: false,
+            generating: false,
+        };
+        assert_eq!(sidebar_lines(&snap), vec![
+            "model: LFM2.5-230M (Q8_0)".into(),
+            "backend: rocm gfx1100".into(),
+            "spec: DSpark (2.3 tok/step)".into(),
+            "encode: 3.1 ms (128 tok)".into(),
+            "prefill: 142.0 ms".into(),
+            "decode: 41.2 tok/s (EMA)".into(),
+            "turn: 38.9 tok/s (57 tok)".into(),
+            "kv [█████░░░░░░░░░░░░░░░] 30%".into(),
+            "1.2 / 4.0 GiB (312/1024 blk)".into(),
+            "ctx [█████░░░░░░░░░░░░░░░] 29%".into(),
+            "2412 / 8192 tok".into(),
+            "vram [████░░░░░░░░░░░░░░░░] 25%".into(),
+            "3.0 / 12.0 GiB".into(),
+            "ram [█████████░░░░░░░░░] 50%".into(),
+            "15.0 / 30.0 GiB".into(),
+        ]);
+    }
+
+    #[test]
+    fn sidebar_lines_empty_state() {
+        let snap = DiagnosticsSnapshot::default();
+        let lines = sidebar_lines(&snap);
+        assert_eq!(lines[0], "model: none loaded (/model <name>)");
+        assert!(lines.iter().any(|l| l == "vram: n/a"), "missing vram n/a line");
+        assert!(lines.iter().any(|l| l == "ram: n/a"), "missing ram n/a line");
     }
 }
