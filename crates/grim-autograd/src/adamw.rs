@@ -8,7 +8,7 @@
 use crate::param::{ParamId, TrainableParams};
 use grim_format::train::{TrainFpFormat, TrainState};
 use grim_tensor::{
-    DType, Tensor,
+    BackendStorage, DType, Tensor,
     error::{Error, Result},
 };
 use serde::{Deserialize, Serialize};
@@ -184,6 +184,10 @@ pub enum OptimizerKind {
     /// Muon — Newton-Schulz orthogonalization for the direction matrix (B)
     /// + 1-bit Sign-SGD for the magnitude matrix (A), with split weight decay.
     Muon,
+    /// M-Adam (Additive-Multiplicative Optimization) for ultra-low precision (FP4/FP8).
+    MAdam,
+    /// LionVote — Per-layer adaptive voting for sign-momentum updates.
+    LionVote,
 }
 
 impl Default for OptimizerKind {
@@ -213,8 +217,10 @@ impl std::str::FromStr for OptimizerKind {
             "came" => Ok(Self::CAME),
             "sophia" => Ok(Self::Sophia),
             "muon" => Ok(Self::Muon),
+            "madam" | "m-adam" => Ok(Self::MAdam),
+            "lionvote" | "lion-vote" => Ok(Self::LionVote),
             other => Err(format!(
-                "unknown optimizer '{other}' (expected adamw, adamw-8bit, paged-adamw, paged-adamw-8bit, lion, lion-8bit, adafactor, adamw-bnb, qgalore, galore, galore-8bit, lomo, adalomo, came, sophia, muon)"
+                "unknown optimizer '{other}' (expected adamw, adamw-8bit, paged-adamw, paged-adamw-8bit, lion, lion-8bit, adafactor, adamw-bnb, qgalore, galore, galore-8bit, lomo, adalomo, came, sophia, muon, madam, lionvote)"
             )),
         }
     }
@@ -239,6 +245,8 @@ impl std::fmt::Display for OptimizerKind {
             Self::CAME => "came",
             Self::Sophia => "sophia",
             Self::Muon => "muon",
+            Self::MAdam => "madam",
+            Self::LionVote => "lionvote",
         };
         f.write_str(s)
     }
@@ -255,6 +263,8 @@ pub enum Optimizer {
     Adafactor(Adafactor),
     QGaLoreAdamW8Bit(QGaLoreAdamW8Bit),
     Muon(Muon),
+    MAdam(MAdam),
+    LionVote(LionVote),
 }
 
 impl Optimizer {
@@ -305,6 +315,14 @@ impl Optimizer {
                 lr,
                 ..MuonConfig::default()
             }))),
+            OptimizerKind::MAdam => Ok(Optimizer::MAdam(MAdam::new(MAdamConfig {
+                lr,
+                ..MAdamConfig::default()
+            }))),
+            OptimizerKind::LionVote => Ok(Optimizer::LionVote(LionVote::new(LionVoteConfig {
+                lr,
+                ..LionVoteConfig::default()
+            }))),
             kind => Err(Error::Unimplemented(format!(
                 "optimizer '{kind}' is declared but not yet implemented (Phase 7)"
             ))),
@@ -322,6 +340,8 @@ impl Optimizer {
             Optimizer::Adafactor(_) => OptimizerKind::Adafactor,
             Optimizer::QGaLoreAdamW8Bit(_) => OptimizerKind::QGaLoreAdamW8Bit,
             Optimizer::Muon(_) => OptimizerKind::Muon,
+            Optimizer::MAdam(_) => OptimizerKind::MAdam,
+            Optimizer::LionVote(_) => OptimizerKind::LionVote,
         }
     }
 
@@ -336,6 +356,8 @@ impl Optimizer {
             Optimizer::Adafactor(o) => o.config.lr,
             Optimizer::QGaLoreAdamW8Bit(o) => o.config.lr,
             Optimizer::Muon(m) => m.config.lr,
+            Optimizer::MAdam(m) => m.config.lr,
+            Optimizer::LionVote(l) => l.config.lr,
         }
     }
 
@@ -363,6 +385,28 @@ impl Optimizer {
             Optimizer::Adafactor(o) => o.step(params),
             Optimizer::QGaLoreAdamW8Bit(o) => o.step(params),
             Optimizer::Muon(o) => o.step(params),
+            Optimizer::MAdam(o) => o.step(params),
+            Optimizer::LionVote(o) => o.step(params),
+        }
+    }
+
+    /// Update a single parameter using the configured optimizer (LOMO streaming step).
+    pub fn step_param(&mut self, id: ParamId, param: &mut crate::param::TrainableParam) -> Result<()> {
+        match self {
+            Optimizer::AdamW(o) => o.step_param(id, param),
+            Optimizer::Lion(o) => o.step_param(id, param),
+            Optimizer::MAdam(o) => o.step_param(id, param),
+            Optimizer::LionVote(o) => o.step_param(id, param),
+            _ => {
+                let mut temp_params = TrainableParams::new();
+                let param_clone = param.clone();
+                temp_params.insert(param_clone);
+                self.step(&mut temp_params)?;
+                if let Some(updated) = temp_params.get_mut(id) {
+                    param.data = updated.data.clone();
+                }
+                Ok(())
+            }
         }
     }
 
@@ -377,6 +421,8 @@ impl Optimizer {
             Optimizer::Adafactor(o) => o.config.lr = lr,
             Optimizer::QGaLoreAdamW8Bit(o) => o.config.lr = lr,
             Optimizer::Muon(m) => m.config.lr = lr,
+            Optimizer::MAdam(m) => m.config.lr = lr,
+            Optimizer::LionVote(l) => l.config.lr = lr,
         }
     }
 
@@ -390,6 +436,8 @@ impl Optimizer {
             Optimizer::Adafactor(o) => o.save_to_train_state(params),
             Optimizer::QGaLoreAdamW8Bit(o) => o.save_to_train_state(params),
             Optimizer::Muon(o) => o.save_to_train_state(params),
+            Optimizer::MAdam(o) => o.save_to_train_state(params),
+            Optimizer::LionVote(o) => o.save_to_train_state(params),
         }
     }
 
@@ -407,6 +455,8 @@ impl Optimizer {
             Optimizer::Adafactor(o) => o.load_from_train_state(params, state),
             Optimizer::QGaLoreAdamW8Bit(o) => o.load_from_train_state(params, state),
             Optimizer::Muon(o) => o.load_from_train_state(params, state),
+            Optimizer::MAdam(o) => o.load_from_train_state(params, state),
+            Optimizer::LionVote(o) => o.load_from_train_state(params, state),
         }
     }
 }
@@ -470,88 +520,105 @@ impl AdamW {
         self.step(params)
     }
 
-    /// Perform one optimization step over all parameters in `params`.
-    pub fn step(&mut self, params: &mut TrainableParams) -> Result<()> {
-        self.step_count += 1;
-
+    /// Perform one step update for a single trainable parameter `param` (LOMO / fused streaming step).
+    pub fn step_param(&mut self, id: ParamId, param: &mut crate::param::TrainableParam) -> Result<()> {
+        if param.is_frozen() {
+            param.zero_grad()?;
+            return Ok(());
+        }
         let beta1 = self.config.beta1;
         let beta2 = self.config.beta2;
         let eps = self.config.eps;
         let lr = self.config.lr;
         let weight_decay = self.config.weight_decay;
 
-        let bias_correction1 = 1.0 - beta1.powi(self.step_count as i32);
-        let bias_correction2 = 1.0 - beta2.powi(self.step_count as i32);
+        let sc = if self.step_count == 0 { 1 } else { self.step_count };
+        let bias_correction1 = 1.0 - beta1.powi(sc as i32);
+        let bias_correction2 = 1.0 - beta2.powi(sc as i32);
 
-        for (id, param) in params.iter_mut() {
-            if param.is_frozen() {
-                param.zero_grad()?;
-                continue;
-            }
-            let dev = crate::pick_device_for_tensor(&param.data);
-            let shape = param.data.shape();
-            let elem_count = shape.elem_count();
+        let dev = crate::pick_device_for_tensor(&param.data);
+        let shape = param.data.shape();
+        let elem_count = shape.elem_count();
 
-            // Seed moment buffers on first encounter (device-resident).
-            if !self.m.contains_key(id) {
-                let zero_m = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
-                self.m.insert(*id, zero_m);
-            }
-            if !self.v.contains_key(id) {
-                let zero_v = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
-                self.v.insert(*id, zero_v);
-            }
-
-            let m_st_old = self.m.get_mut(id).unwrap();
-            let v_st_old = self.v.get_mut(id).unwrap();
-            let grad_st = param.grad().storage().clone();
-            let data_st = param.data.storage().clone();
-
-            // m_new = beta1 * m + (1-beta1) * g
-            let (m_beta1, _) = dev.mul_scalar(m_st_old.as_ref(), beta1, shape)?;
-            let (g_1mb1, _) = dev.mul_scalar(grad_st.as_ref(), 1.0 - beta1, shape)?;
-            let (m_new, _) = dev.add(m_beta1.as_ref(), g_1mb1.as_ref(), shape)?;
-
-            // v_new = beta2 * v + (1-beta2) * g^2
-            let (g_sq, _) = dev.mul(grad_st.as_ref(), grad_st.as_ref(), shape)?;
-            let (v_beta2, _) = dev.mul_scalar(v_st_old.as_ref(), beta2, shape)?;
-            let (g_sq_1mb2, _) = dev.mul_scalar(g_sq.as_ref(), 1.0 - beta2, shape)?;
-            let (v_new, _) = dev.add(v_beta2.as_ref(), g_sq_1mb2.as_ref(), shape)?;
-
-            // m_hat = m_new / bias_correction1,  v_hat = v_new / bias_correction2
-            let (m_hat, _) = dev.mul_scalar(m_new.as_ref(), 1.0 / bias_correction1, shape)?;
-            let (v_hat, _) = dev.mul_scalar(v_new.as_ref(), 1.0 / bias_correction2, shape)?;
-
-            // denom = sqrt(v_hat) + eps
-            let (sqrt_v, _) = dev.sqrt(v_hat.as_ref(), shape)?;
-            let eps_buf = dev.from_cpu(&vec![eps; elem_count], shape, DType::F32)?;
-            let (denom, _) = dev.add(sqrt_v.as_ref(), eps_buf.as_ref(), shape)?;
-
-            // recip_denom = 1.0 / denom
-            let (recip_denom, _) = dev.recip(denom.as_ref(), shape)?;
-
-            // step_grad = m_hat * recip_denom + weight_decay * w
-            let (m_div_denom, _) = dev.mul(m_hat.as_ref(), recip_denom.as_ref(), shape)?;
-            let (wd_w, _) = dev.mul_scalar(data_st.as_ref(), weight_decay, shape)?;
-            let (step_grad, _) = dev.add(m_div_denom.as_ref(), wd_w.as_ref(), shape)?;
-
-            // updated = w - lr * step_grad
-            let (lr_step, _) = dev.mul_scalar(step_grad.as_ref(), lr, shape)?;
-            let (neg_lr_step, _) = dev.mul_scalar(lr_step.as_ref(), -1.0, shape)?;
-            let (updated_st, _) = dev.add(data_st.as_ref(), neg_lr_step.as_ref(), shape)?;
-
-            // Write back device-resident moment buffers + parameters.
-            *m_st_old = m_new;
-            *v_st_old = v_new;
-            param.data = Tensor::new(
-                Arc::from(updated_st),
-                shape.clone(),
-                DType::F32,
-                param.data.provenance().clone(),
-                param.data.device().clone(),
-            );
+        // Seed moment buffers on first encounter (device-resident).
+        if !self.m.contains_key(&id) {
+            let zero_m = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
+            self.m.insert(id, zero_m);
+        }
+        if !self.v.contains_key(&id) {
+            let zero_v = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
+            self.v.insert(id, zero_v);
         }
 
+        let m_st_old = self.m.get_mut(&id).unwrap();
+        let v_st_old = self.v.get_mut(&id).unwrap();
+        let grad_st = param.grad().storage().clone();
+        let data_st = param.data.storage().clone();
+
+        // Try on-device fused AdamW kernel first (zero-roundtrip, 1 launch)
+        if let Ok(handle) = dev.fused_adamw_step(
+            data_st.as_ref(),
+            grad_st.as_ref(),
+            m_st_old.as_ref(),
+            v_st_old.as_ref(),
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            bias_correction1,
+            bias_correction2,
+            elem_count,
+        ) {
+            handle.synchronize()?;
+            return Ok(());
+        }
+
+        // Fallback to component math
+        let (m_beta1, _) = dev.mul_scalar(m_st_old.as_ref(), beta1, shape)?;
+        let (g_1mb1, _) = dev.mul_scalar(grad_st.as_ref(), 1.0 - beta1, shape)?;
+        let (m_new, _) = dev.add(m_beta1.as_ref(), g_1mb1.as_ref(), shape)?;
+
+        let (g_sq, _) = dev.mul(grad_st.as_ref(), grad_st.as_ref(), shape)?;
+        let (v_beta2, _) = dev.mul_scalar(v_st_old.as_ref(), beta2, shape)?;
+        let (g_sq_1mb2, _) = dev.mul_scalar(g_sq.as_ref(), 1.0 - beta2, shape)?;
+        let (v_new, _) = dev.add(v_beta2.as_ref(), g_sq_1mb2.as_ref(), shape)?;
+
+        let (m_hat, _) = dev.mul_scalar(m_new.as_ref(), 1.0 / bias_correction1, shape)?;
+        let (v_hat, _) = dev.mul_scalar(v_new.as_ref(), 1.0 / bias_correction2, shape)?;
+
+        let (sqrt_v, _) = dev.sqrt(v_hat.as_ref(), shape)?;
+        let eps_buf = dev.from_cpu(&vec![eps; elem_count], shape, DType::F32)?;
+        let (denom, _) = dev.add(sqrt_v.as_ref(), eps_buf.as_ref(), shape)?;
+
+        let (recip_denom, _) = dev.recip(denom.as_ref(), shape)?;
+
+        let (m_div_denom, _) = dev.mul(m_hat.as_ref(), recip_denom.as_ref(), shape)?;
+        let (wd_w, _) = dev.mul_scalar(data_st.as_ref(), weight_decay, shape)?;
+        let (step_grad, _) = dev.add(m_div_denom.as_ref(), wd_w.as_ref(), shape)?;
+
+        let (lr_step, _) = dev.mul_scalar(step_grad.as_ref(), lr, shape)?;
+        let (neg_lr_step, _) = dev.mul_scalar(lr_step.as_ref(), -1.0, shape)?;
+        let (updated_st, _) = dev.add(data_st.as_ref(), neg_lr_step.as_ref(), shape)?;
+
+        *m_st_old = m_new;
+        *v_st_old = v_new;
+        param.data = Tensor::new(
+            Arc::from(updated_st),
+            shape.clone(),
+            param.data.dtype(),
+            param.data.provenance().clone(),
+            param.data.device().clone(),
+        );
+        Ok(())
+    }
+
+    /// Perform one optimization step over all parameters in `params`.
+    pub fn step(&mut self, params: &mut TrainableParams) -> Result<()> {
+        self.step_count += 1;
+        for (id, param) in params.iter_mut() {
+            self.step_param(*id, param)?;
+        }
         Ok(())
     }
 
@@ -560,19 +627,25 @@ impl AdamW {
         let mut state = TrainState {
             step: self.step_count as u64,
             fp_format: TrainFpFormat::Fp32,
+            dtypes: HashMap::new(),
             blobs: HashMap::new(),
         };
 
         for (id, param) in params.iter() {
             let shape = param.data.shape().dims().to_vec();
             if let Ok(data) = param.data.to_vec_f32() {
-                let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let blob_name = format!(
                     "param_{}_{}_{}",
                     id.layer_idx,
                     id.adapter_id,
                     if id.is_a { "a" } else { "b" }
                 );
+                let fmt = grim_format::train::train_format_for_dtype(&param.data.dtype());
+                let bytes = grim_format::train::encode_f32s_as(&data, fmt);
+                state.dtypes.insert(blob_name.clone(), fmt);
+                if fmt.is_half() {
+                    state.fp_format = fmt;
+                }
                 state.add_blob(blob_name, shape.clone(), bytes);
             }
 
@@ -620,13 +693,19 @@ impl AdamW {
             let v_key = format!("opt_v_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
 
             if let Some(blob) = state.blobs.get(&param_key) {
-                let f32_vals = bytes_to_f32_vec(&blob.data)?;
+                let fmt = state
+                    .dtypes
+                    .get(&param_key)
+                    .copied()
+                    .unwrap_or(state.fp_format);
+                let f32_vals = decode_blob_f32s(&blob.data, fmt)?;
                 let dev = crate::pick_device_for_tensor(&param.data);
-                let storage = dev.from_cpu(&f32_vals, param.data.shape(), DType::F32)?;
+                let restore_dtype = param.data.dtype();
+                let storage = dev.from_cpu(&f32_vals, param.data.shape(), restore_dtype.clone())?;
                 param.data = Tensor::new(
                     Arc::from(storage),
                     param.data.shape().clone(),
-                    DType::F32,
+                    restore_dtype,
                     param.data.provenance().clone(),
                     param.data.device().clone(),
                 );
@@ -662,6 +741,13 @@ fn bytes_to_f32_vec(bytes: &[u8]) -> Result<Vec<f32>> {
     Ok(res)
 }
 
+/// Decode a sidecar blob back to f32 values according to its `TrainFpFormat`.
+fn decode_blob_f32s(bytes: &[u8], fmt: TrainFpFormat) -> Result<Vec<f32>> {
+    grim_format::train::decode_f32s_from(bytes, fmt).ok_or_else(|| {
+        Error::Backend(format!("invalid byte slice length for {fmt:?} blob"))
+    })
+}
+
 /// Persist only the parameter data + step count (no optimizer moments).
 ///
 /// Used by optimizer variants whose moment buffers are not yet serialized to
@@ -671,6 +757,7 @@ fn save_param_data_only(params: &TrainableParams, step_count: usize) -> TrainSta
     let mut state = TrainState {
         step: step_count as u64,
         fp_format: TrainFpFormat::Fp32,
+        dtypes: HashMap::new(),
         blobs: HashMap::new(),
     };
     for (id, param) in params.iter() {
@@ -695,13 +782,19 @@ fn load_param_data_only(params: &mut TrainableParams, state: &TrainState) -> Res
         let suffix = if id.is_a { "a" } else { "b" };
         let param_key = format!("param_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
         if let Some(blob) = state.blobs.get(&param_key) {
-            let f32_vals = bytes_to_f32_vec(&blob.data)?;
+            let fmt = state
+                .dtypes
+                .get(&param_key)
+                .copied()
+                .unwrap_or(state.fp_format);
+            let f32_vals = decode_blob_f32s(&blob.data, fmt)?;
             let dev = crate::pick_device_for_tensor(&param.data);
-            let storage = dev.from_cpu(&f32_vals, param.data.shape(), DType::F32)?;
+            let restore_dtype = param.data.dtype();
+            let storage = dev.from_cpu(&f32_vals, param.data.shape(), restore_dtype.clone())?;
             param.data = Tensor::new(
                 Arc::from(storage),
                 param.data.shape().clone(),
-                DType::F32,
+                restore_dtype,
                 param.data.provenance().clone(),
                 param.data.device().clone(),
             );
@@ -765,59 +858,78 @@ impl Lion {
         }
     }
 
-    /// Perform one optimization step over all parameters in `params`.
-    pub fn step(&mut self, params: &mut TrainableParams) -> Result<()> {
-        self.step_count += 1;
-
+    /// Perform one step update for a single trainable parameter `param` (LOMO / fused streaming step).
+    pub fn step_param(&mut self, id: ParamId, param: &mut crate::param::TrainableParam) -> Result<()> {
+        if param.is_frozen() {
+            param.zero_grad()?;
+            return Ok(());
+        }
         let beta1 = self.config.beta1;
+        let beta2 = 0.99f32;
         let lr = self.config.lr;
         let weight_decay = self.config.weight_decay;
 
-        for (id, param) in params.iter_mut() {
-            if param.is_frozen() {
-                param.zero_grad()?;
-                continue;
-            }
-            let dev = crate::pick_device_for_tensor(&param.data);
-            let shape = param.data.shape();
-            let elem_count = shape.elem_count();
+        let dev = crate::pick_device_for_tensor(&param.data);
+        let shape = param.data.shape();
+        let elem_count = shape.elem_count();
 
-            // Initialize momentum buffer on first encounter
-            if !self.m.contains_key(id) {
-                let zero_m = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
-                self.m.insert(*id, zero_m);
-            }
-
-            let m_st = self.m.get_mut(id).unwrap();
-            let grad_st = param.grad().storage().clone();
-            let data_st = param.data.storage().clone();
-
-            // Lion: τ = β1 * m + (1-β1) * g
-            // Note: No bias correction in Lion (unlike AdamW)
-            let (m_beta1, _) = dev.mul_scalar(m_st.as_ref(), beta1, shape)?;
-            let (g_1mb1, _) = dev.mul_scalar(grad_st.as_ref(), 1.0 - beta1, shape)?;
-            let (m_new, _) = dev.add(m_beta1.as_ref(), g_1mb1.as_ref(), shape)?;
-
-            // Apply weight decay: step = τ + weight_decay * w
-            let (wd_w, _) = dev.mul_scalar(data_st.as_ref(), weight_decay, shape)?;
-            let (step, _) = dev.add(m_new.as_ref(), wd_w.as_ref(), shape)?;
-
-            // Update: w = w - lr * step
-            let (lr_step, _) = dev.mul_scalar(step.as_ref(), lr, shape)?;
-            let (neg_lr_step, _) = dev.mul_scalar(lr_step.as_ref(), -1.0, shape)?;
-            let (updated_st, _) = dev.add(data_st.as_ref(), neg_lr_step.as_ref(), shape)?;
-
-            // Write back
-            *m_st = m_new;
-            param.data = Tensor::new(
-                Arc::from(updated_st),
-                shape.clone(),
-                DType::F32,
-                param.data.provenance().clone(),
-                param.data.device().clone(),
-            );
+        // Initialize momentum buffer on first encounter
+        if !self.m.contains_key(&id) {
+            let zero_m = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
+            self.m.insert(id, zero_m);
         }
 
+        let m_st = self.m.get_mut(&id).unwrap();
+        let grad_st = param.grad().storage().clone();
+        let data_st = param.data.storage().clone();
+
+        // Try on-device fused Lion kernel first (zero-roundtrip, 1 launch)
+        if let Ok(handle) = dev.fused_lion_step(
+            data_st.as_ref(),
+            grad_st.as_ref(),
+            m_st.as_ref(),
+            lr,
+            beta1,
+            beta2,
+            weight_decay,
+            elem_count,
+        ) {
+            handle.synchronize()?;
+            return Ok(());
+        }
+
+        // Lion: τ = β1 * m + (1-β1) * g
+        let (m_beta1, _) = dev.mul_scalar(m_st.as_ref(), beta1, shape)?;
+        let (g_1mb1, _) = dev.mul_scalar(grad_st.as_ref(), 1.0 - beta1, shape)?;
+        let (m_new, _) = dev.add(m_beta1.as_ref(), g_1mb1.as_ref(), shape)?;
+
+        // Apply weight decay: step = τ + weight_decay * w
+        let (wd_w, _) = dev.mul_scalar(data_st.as_ref(), weight_decay, shape)?;
+        let (step, _) = dev.add(m_new.as_ref(), wd_w.as_ref(), shape)?;
+
+        // Update: w = w - lr * step
+        let (lr_step, _) = dev.mul_scalar(step.as_ref(), lr, shape)?;
+        let (neg_lr_step, _) = dev.mul_scalar(lr_step.as_ref(), -1.0, shape)?;
+        let (updated_st, _) = dev.add(data_st.as_ref(), neg_lr_step.as_ref(), shape)?;
+
+        // Write back
+        *m_st = m_new;
+        param.data = Tensor::new(
+            Arc::from(updated_st),
+            shape.clone(),
+            DType::F32,
+            param.data.provenance().clone(),
+            param.data.device().clone(),
+        );
+        Ok(())
+    }
+
+    /// Perform one optimization step over all parameters in `params`.
+    pub fn step(&mut self, params: &mut TrainableParams) -> Result<()> {
+        self.step_count += 1;
+        for (id, param) in params.iter_mut() {
+            self.step_param(*id, param)?;
+        }
         Ok(())
     }
 
@@ -2056,19 +2168,25 @@ impl Muon {
         let mut state = TrainState {
             step: self.step_count as u64,
             fp_format: TrainFpFormat::Fp32,
+            dtypes: HashMap::new(),
             blobs: HashMap::new(),
         };
 
         for (id, param) in params.iter() {
             let shape = param.data.shape().dims().to_vec();
             if let Ok(data) = param.data.to_vec_f32() {
-                let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let blob_name = format!(
                     "param_{}_{}_{}",
                     id.layer_idx,
                     id.adapter_id,
                     if id.is_a { "a" } else { "b" }
                 );
+                let fmt = grim_format::train::train_format_for_dtype(&param.data.dtype());
+                let bytes = grim_format::train::encode_f32s_as(&data, fmt);
+                state.dtypes.insert(blob_name.clone(), fmt);
+                if fmt.is_half() {
+                    state.fp_format = fmt;
+                }
                 state.add_blob(blob_name, shape.clone(), bytes);
             }
 
@@ -2100,13 +2218,19 @@ impl Muon {
             let m_key = format!("opt_m_{}_{}_b", id.layer_idx, id.adapter_id);
 
             if let Some(blob) = state.blobs.get(&param_key) {
-                let f32_vals = bytes_to_f32_vec(&blob.data)?;
+                let fmt = state
+                    .dtypes
+                    .get(&param_key)
+                    .copied()
+                    .unwrap_or(state.fp_format);
+                let f32_vals = decode_blob_f32s(&blob.data, fmt)?;
                 let dev = crate::pick_device_for_tensor(&param.data);
-                let storage = dev.from_cpu(&f32_vals, param.data.shape(), DType::F32)?;
+                let restore_dtype = param.data.dtype();
+                let storage = dev.from_cpu(&f32_vals, param.data.shape(), restore_dtype.clone())?;
                 param.data = Tensor::new(
                     Arc::from(storage),
                     param.data.shape().clone(),
-                    DType::F32,
+                    restore_dtype,
                     param.data.provenance().clone(),
                     param.data.device().clone(),
                 );
@@ -2126,10 +2250,581 @@ impl Muon {
     }
 }
 
+// ── M-Adam (Additive-Multiplicative Optimization) ───────────────────────────
+
+/// Configuration for M-Adam optimizer (arXiv:2607.10611).
+///
+/// Combines additive momentum tracking with a multiplicative learning-rate
+/// scaling factor derived from local gradient variance, stabilizing ultra-low
+/// precision (FP4/FP8) fine-tuning without step-size explosion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MAdamConfig {
+    pub lr: f32,
+    pub beta1: f32,
+    pub beta2: f32,
+    pub eps: f32,
+    pub gamma: f32,
+    pub weight_decay: f32,
+}
+
+impl Default for MAdamConfig {
+    fn default() -> Self {
+        Self {
+            lr: 1e-4,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            gamma: 0.1,
+            weight_decay: 0.01,
+        }
+    }
+}
+
+/// M-Adam optimizer: maintains 1st and 2nd moments alongside multiplicative damping.
+pub struct MAdam {
+    pub config: MAdamConfig,
+    pub step_count: usize,
+    pub m: HashMap<ParamId, Box<dyn BackendStorage>>,
+    pub v: HashMap<ParamId, Box<dyn BackendStorage>>,
+}
+
+impl MAdam {
+    pub fn new(config: MAdamConfig) -> Self {
+        Self {
+            config,
+            step_count: 0,
+            m: HashMap::new(),
+            v: HashMap::new(),
+        }
+    }
+
+    /// Perform one step update for a single trainable parameter `param` (LOMO / fused streaming step).
+    pub fn step_param(&mut self, id: ParamId, param: &mut crate::param::TrainableParam) -> Result<()> {
+        if param.is_frozen() {
+            param.zero_grad()?;
+            return Ok(());
+        }
+        let grad = param.grad();
+
+        let lr = self.config.lr;
+        let beta1 = self.config.beta1;
+        let beta2 = self.config.beta2;
+        let eps = self.config.eps;
+        let gamma = self.config.gamma;
+        let wd = self.config.weight_decay;
+
+        let sc = if self.step_count == 0 { 1 } else { self.step_count };
+        let bc1 = 1.0 - beta1.powi(sc as i32);
+        let bc2 = 1.0 - beta2.powi(sc as i32);
+
+        let shape = param.data.shape();
+        let elem_count = shape.elem_count();
+        let dev = crate::pick_device_for_tensor(&param.data);
+
+        if !self.m.contains_key(&id) {
+            let m_init = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
+            let v_init = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
+            self.m.insert(id, m_init);
+            self.v.insert(id, v_init);
+        }
+
+        let m_st = self.m.get_mut(&id).unwrap();
+        let v_st = self.v.get_mut(&id).unwrap();
+        let grad_st = grad.storage().clone();
+        let data_st = param.data.storage().clone();
+
+        // Try on-device fused M-Adam kernel first (zero-roundtrip, 1 launch)
+        if let Ok(handle) = dev.fused_madam_step(
+            data_st.as_ref(),
+            grad_st.as_ref(),
+            m_st.as_ref(),
+            v_st.as_ref(),
+            lr,
+            beta1,
+            beta2,
+            eps,
+            gamma,
+            wd,
+            bc1,
+            bc2,
+            elem_count,
+        ) {
+            handle.synchronize()?;
+            return Ok(());
+        }
+
+        // Host fallback
+        let grad_vec = grad.to_vec_f32()?;
+        let data_vec = param.data.to_vec_f32()?;
+        let m_old = m_st.to_cpu_vec_f32()?;
+        let v_old = v_st.to_cpu_vec_f32()?;
+
+        let mut m_new = Vec::with_capacity(elem_count);
+        let mut v_new = Vec::with_capacity(elem_count);
+        let mut new_data = Vec::with_capacity(elem_count);
+
+        for i in 0..elem_count {
+            let g = grad_vec[i];
+            let m_val = beta1 * m_old[i] + (1.0 - beta1) * g;
+            let v_val = beta2 * v_old[i] + (1.0 - beta2) * g * g;
+
+            m_new.push(m_val);
+            v_new.push(v_val);
+
+            let m_hat = m_val / bc1;
+            let v_hat = v_val / bc2;
+
+            // Multiplicative curvature-aware step dampening
+            let denom = v_hat.sqrt() + eps;
+            let mult_scale = 1.0 / (1.0 + gamma * (g.abs() / denom));
+            let step_val = (m_hat / denom) * mult_scale;
+
+            let p = data_vec[i];
+            new_data.push(p - lr * (step_val + wd * p));
+        }
+
+        *m_st = dev.from_cpu(&m_new, shape, DType::F32)?;
+        *v_st = dev.from_cpu(&v_new, shape, DType::F32)?;
+
+        let storage = dev.from_cpu(&new_data, shape, DType::F32)?;
+        param.data = Tensor::new(
+            Arc::from(storage),
+            shape.clone(),
+            DType::F32,
+            param.data.provenance().clone(),
+            param.data.device().clone(),
+        );
+        Ok(())
+    }
+
+    pub fn step(&mut self, params: &mut TrainableParams) -> Result<()> {
+        self.step_count += 1;
+        for (id, param) in params.iter_mut() {
+            self.step_param(*id, param)?;
+            param.zero_grad()?;
+        }
+        Ok(())
+    }
+
+    pub fn save_to_train_state(&self, params: &TrainableParams) -> TrainState {
+        let mut state = TrainState {
+            step: self.step_count as u64,
+            fp_format: TrainFpFormat::Fp32,
+            dtypes: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+
+        for (id, param) in params.iter() {
+            let shape = param.data.shape().dims().to_vec();
+            if let Ok(data) = param.data.to_vec_f32() {
+                let blob_name = format!(
+                    "param_{}_{}_{}",
+                    id.layer_idx,
+                    id.adapter_id,
+                    if id.is_a { "a" } else { "b" }
+                );
+                let fmt = grim_format::train::train_format_for_dtype(&param.data.dtype());
+                let bytes = grim_format::train::encode_f32s_as(&data, fmt);
+                state.dtypes.insert(blob_name.clone(), fmt);
+                if fmt.is_half() {
+                    state.fp_format = fmt;
+                }
+                state.add_blob(blob_name, shape.clone(), bytes);
+            }
+
+            if let Some(m_st) = self.m.get(id) {
+                if let Ok(m_vec) = m_st.to_cpu_vec_f32() {
+                    let bytes: Vec<u8> = m_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let blob_name = format!(
+                        "opt_m_{}_{}_{}",
+                        id.layer_idx,
+                        id.adapter_id,
+                        if id.is_a { "a" } else { "b" }
+                    );
+                    state.add_blob(blob_name, shape.clone(), bytes);
+                }
+            }
+
+            if let Some(v_st) = self.v.get(id) {
+                if let Ok(v_vec) = v_st.to_cpu_vec_f32() {
+                    let bytes: Vec<u8> = v_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let blob_name = format!(
+                        "opt_v_{}_{}_{}",
+                        id.layer_idx,
+                        id.adapter_id,
+                        if id.is_a { "a" } else { "b" }
+                    );
+                    state.add_blob(blob_name, shape, bytes);
+                }
+            }
+        }
+
+        state
+    }
+
+    pub fn load_from_train_state(
+        &mut self,
+        params: &mut TrainableParams,
+        state: &TrainState,
+    ) -> Result<()> {
+        self.step_count = state.step as usize;
+        for (id, param) in params.iter_mut() {
+            let suffix = if id.is_a { "a" } else { "b" };
+            let param_key = format!("param_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
+            let m_key = format!("opt_m_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
+            let v_key = format!("opt_v_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
+
+            if let Some(blob) = state.blobs.get(&param_key) {
+                let fmt = state
+                    .dtypes
+                    .get(&param_key)
+                    .copied()
+                    .unwrap_or(state.fp_format);
+                let f32_vals = decode_blob_f32s(&blob.data, fmt)?;
+                let dev = crate::pick_device_for_tensor(&param.data);
+                let restore_dtype = param.data.dtype();
+                let storage = dev.from_cpu(&f32_vals, param.data.shape(), restore_dtype.clone())?;
+                param.data = Tensor::new(
+                    Arc::from(storage),
+                    param.data.shape().clone(),
+                    restore_dtype,
+                    param.data.provenance().clone(),
+                    param.data.device().clone(),
+                );
+            }
+
+            if let Some(blob) = state.blobs.get(&m_key) {
+                let f32_vals = bytes_to_f32_vec(&blob.data)?;
+                let dev = crate::pick_device_for_tensor(&param.data);
+                let st = dev.from_cpu(&f32_vals, param.data.shape(), DType::F32)?;
+                self.m.insert(*id, st);
+            }
+
+            if let Some(blob) = state.blobs.get(&v_key) {
+                let f32_vals = bytes_to_f32_vec(&blob.data)?;
+                let dev = crate::pick_device_for_tensor(&param.data);
+                let st = dev.from_cpu(&f32_vals, param.data.shape(), DType::F32)?;
+                self.v.insert(*id, st);
+            }
+        }
+        Ok(())
+    }
+}
+
+// ── LionVote (Per-Layer Magnitude Voting for Sign Momentum) ─────────────────
+
+/// Configuration for LionVote optimizer (arXiv:2607.09266).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LionVoteConfig {
+    pub lr: f32,
+    pub beta1: f32,
+    pub beta2: f32,
+    pub weight_decay: f32,
+    pub vote_threshold: f32,
+}
+
+impl Default for LionVoteConfig {
+    fn default() -> Self {
+        Self {
+            lr: 1e-4,
+            beta1: 0.9,
+            beta2: 0.99,
+            weight_decay: 0.01,
+            vote_threshold: 0.6,
+        }
+    }
+}
+
+/// LionVote optimizer: computes per-layer agreement vote across sign updates
+/// to scale gradient step magnitudes appropriately across deep architectures.
+pub struct LionVote {
+    pub config: LionVoteConfig,
+    pub step_count: usize,
+    pub exp_avg: HashMap<ParamId, Box<dyn BackendStorage>>,
+}
+
+impl LionVote {
+    pub fn new(config: LionVoteConfig) -> Self {
+        Self {
+            config,
+            step_count: 0,
+            exp_avg: HashMap::new(),
+        }
+    }
+
+    /// Perform one step update for a single trainable parameter `param` (LOMO / fused streaming step).
+    pub fn step_param(&mut self, id: ParamId, param: &mut crate::param::TrainableParam) -> Result<()> {
+        if param.is_frozen() {
+            param.zero_grad()?;
+            return Ok(());
+        }
+        let grad = param.grad();
+
+        let lr = self.config.lr;
+        let beta1 = self.config.beta1;
+        let beta2 = self.config.beta2;
+        let wd = self.config.weight_decay;
+        let threshold = self.config.vote_threshold;
+
+        let grad_vec = grad.to_vec_f32()?;
+        let data_vec = param.data.to_vec_f32()?;
+        let elem_count = data_vec.len();
+        let shape = param.data.shape();
+        let dev = crate::pick_device_for_tensor(&param.data);
+
+        if !self.exp_avg.contains_key(&id) {
+            let init_buf = dev.from_cpu(&vec![0.0f32; elem_count], shape, DType::F32)?;
+            self.exp_avg.insert(id, init_buf);
+        }
+
+        let exp_st = self.exp_avg.get_mut(&id).unwrap();
+        let exp_old = exp_st.to_cpu_vec_f32()?;
+
+        // Compute per-layer vote agreement ratio
+        let mut positive_votes = 0usize;
+        for i in 0..elem_count {
+            let update_i = beta1 * exp_old[i] + (1.0 - beta1) * grad_vec[i];
+            if update_i >= 0.0 {
+                positive_votes += 1;
+            }
+        }
+        let agreement = (positive_votes as f32 / elem_count as f32 - 0.5).abs() * 2.0;
+        let scale_factor = if agreement > threshold { 1.0 } else { 0.5 + 0.5 * agreement };
+
+        let mut exp_new = Vec::with_capacity(elem_count);
+        let mut new_data = Vec::with_capacity(elem_count);
+
+        for i in 0..elem_count {
+            let g = grad_vec[i];
+            let exp_val = exp_old[i];
+
+            let update = beta1 * exp_val + (1.0 - beta1) * g;
+            let sign_update = if update > 0.0 {
+                1.0
+            } else if update < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
+
+            let next_exp = beta2 * exp_val + (1.0 - beta2) * g;
+            exp_new.push(next_exp);
+
+            let p = data_vec[i];
+            new_data.push(p - lr * (sign_update * scale_factor + wd * p));
+        }
+
+        *exp_st = dev.from_cpu(&exp_new, shape, DType::F32)?;
+
+        let storage = dev.from_cpu(&new_data, shape, DType::F32)?;
+        param.data = Tensor::new(
+            Arc::from(storage),
+            shape.clone(),
+            DType::F32,
+            param.data.provenance().clone(),
+            param.data.device().clone(),
+        );
+        Ok(())
+    }
+
+    pub fn step(&mut self, params: &mut TrainableParams) -> Result<()> {
+        self.step_count += 1;
+        for (id, param) in params.iter_mut() {
+            self.step_param(*id, param)?;
+            param.zero_grad()?;
+        }
+        Ok(())
+    }
+
+    pub fn save_to_train_state(&self, params: &TrainableParams) -> TrainState {
+        let mut state = TrainState {
+            step: self.step_count as u64,
+            fp_format: TrainFpFormat::Fp32,
+            dtypes: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+
+        for (id, param) in params.iter() {
+            let shape = param.data.shape().dims().to_vec();
+            if let Ok(data) = param.data.to_vec_f32() {
+                let blob_name = format!(
+                    "param_{}_{}_{}",
+                    id.layer_idx,
+                    id.adapter_id,
+                    if id.is_a { "a" } else { "b" }
+                );
+                let fmt = grim_format::train::train_format_for_dtype(&param.data.dtype());
+                let bytes = grim_format::train::encode_f32s_as(&data, fmt);
+                state.dtypes.insert(blob_name.clone(), fmt);
+                if fmt.is_half() {
+                    state.fp_format = fmt;
+                }
+                state.add_blob(blob_name, shape.clone(), bytes);
+            }
+
+            if let Some(exp_st) = self.exp_avg.get(id) {
+                if let Ok(exp_vec) = exp_st.to_cpu_vec_f32() {
+                    let bytes: Vec<u8> = exp_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let blob_name = format!(
+                        "opt_exp_{}_{}_{}",
+                        id.layer_idx,
+                        id.adapter_id,
+                        if id.is_a { "a" } else { "b" }
+                    );
+                    state.add_blob(blob_name, shape, bytes);
+                }
+            }
+        }
+
+        state
+    }
+
+    pub fn load_from_train_state(
+        &mut self,
+        params: &mut TrainableParams,
+        state: &TrainState,
+    ) -> Result<()> {
+        self.step_count = state.step as usize;
+        for (id, param) in params.iter_mut() {
+            let suffix = if id.is_a { "a" } else { "b" };
+            let param_key = format!("param_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
+            let exp_key = format!("opt_exp_{}_{}_{}", id.layer_idx, id.adapter_id, suffix);
+
+            if let Some(blob) = state.blobs.get(&param_key) {
+                let fmt = state
+                    .dtypes
+                    .get(&param_key)
+                    .copied()
+                    .unwrap_or(state.fp_format);
+                let f32_vals = decode_blob_f32s(&blob.data, fmt)?;
+                let dev = crate::pick_device_for_tensor(&param.data);
+                let restore_dtype = param.data.dtype();
+                let storage = dev.from_cpu(&f32_vals, param.data.shape(), restore_dtype.clone())?;
+                param.data = Tensor::new(
+                    Arc::from(storage),
+                    param.data.shape().clone(),
+                    restore_dtype,
+                    param.data.provenance().clone(),
+                    param.data.device().clone(),
+                );
+            }
+
+            if let Some(blob) = state.blobs.get(&exp_key) {
+                let f32_vals = bytes_to_f32_vec(&blob.data)?;
+                let dev = crate::pick_device_for_tensor(&param.data);
+                let st = dev.from_cpu(&f32_vals, param.data.shape(), DType::F32)?;
+                self.exp_avg.insert(*id, st);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use grim_tensor::Shape;
+
+    #[test]
+    fn test_madam_optimizer_step_and_save_load_roundtrip() {
+        use crate::injection::LoRAInjectionPoint;
+        use crate::param::TrainableParam;
+
+        let mut params = TrainableParams::new();
+        let pid_a = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
+        let mut tp = TrainableParam::new(
+            pid_a,
+            grim_backend_cpu::cpu_tensor(vec![1.0f32; 8], Shape::new(vec![2, 4])),
+        )
+        .unwrap();
+        tp.accumulate_grad(&grim_backend_cpu::cpu_tensor(
+            vec![0.2f32; 8],
+            Shape::new(vec![2, 4]),
+        ))
+        .unwrap();
+        params.insert(tp);
+
+        let mut madam = MAdam::new(MAdamConfig::default());
+        madam.step(&mut params).unwrap();
+
+        let p_val = params.get(pid_a).unwrap().data.to_vec_f32().unwrap();
+        assert!(p_val[0] < 1.0, "step must decrease param along gradient");
+
+        let state = madam.save_to_train_state(&params);
+        assert_eq!(state.step, 1);
+
+        let mut params2 = TrainableParams::new();
+        params2.insert(
+            TrainableParam::new(
+                pid_a,
+                grim_backend_cpu::cpu_tensor(vec![0.0f32; 8], Shape::new(vec![2, 4])),
+            )
+            .unwrap(),
+        );
+        let mut madam2 = MAdam::new(MAdamConfig::default());
+        madam2.load_from_train_state(&mut params2, &state).unwrap();
+
+        let restored = params2.get(pid_a).unwrap().data.to_vec_f32().unwrap();
+        for (a, b) in p_val.iter().zip(&restored) {
+            assert!((a - b).abs() < 1e-5, "param data must round-trip");
+        }
+    }
+
+    #[test]
+    fn test_lionvote_optimizer_step_and_save_load_roundtrip() {
+        use crate::injection::LoRAInjectionPoint;
+        use crate::param::TrainableParam;
+
+        let mut params = TrainableParams::new();
+        let pid_b = ParamId::b(0, 1, LoRAInjectionPoint::GateProj);
+        let mut tp = TrainableParam::new(
+            pid_b,
+            grim_backend_cpu::cpu_tensor(vec![2.0f32; 6], Shape::new(vec![3, 2])),
+        )
+        .unwrap();
+        tp.accumulate_grad(&grim_backend_cpu::cpu_tensor(
+            vec![0.1f32; 6],
+            Shape::new(vec![3, 2]),
+        ))
+        .unwrap();
+        params.insert(tp);
+
+        let mut lionvote = LionVote::new(LionVoteConfig::default());
+        lionvote.step(&mut params).unwrap();
+
+        let p_val = params.get(pid_b).unwrap().data.to_vec_f32().unwrap();
+        assert!(p_val[0] < 2.0, "LionVote step must decrease param along gradient");
+
+        let state = lionvote.save_to_train_state(&params);
+        assert_eq!(state.step, 1);
+
+        let mut params2 = TrainableParams::new();
+        params2.insert(
+            TrainableParam::new(
+                pid_b,
+                grim_backend_cpu::cpu_tensor(vec![0.0f32; 6], Shape::new(vec![3, 2])),
+            )
+            .unwrap(),
+        );
+        let mut lionvote2 = LionVote::new(LionVoteConfig::default());
+        lionvote2.load_from_train_state(&mut params2, &state).unwrap();
+
+        let restored = params2.get(pid_b).unwrap().data.to_vec_f32().unwrap();
+        for (a, b) in p_val.iter().zip(&restored) {
+            assert!((a - b).abs() < 1e-5, "param data must round-trip");
+        }
+    }
+
+    #[test]
+    fn test_optimizer_enum_fromstr_and_display() {
+        let m: OptimizerKind = "madam".parse().unwrap();
+        assert_eq!(m, OptimizerKind::MAdam);
+        assert_eq!(format!("{}", OptimizerKind::MAdam), "madam");
+
+        let l: OptimizerKind = "lionvote".parse().unwrap();
+        assert_eq!(l, OptimizerKind::LionVote);
+        assert_eq!(format!("{}", OptimizerKind::LionVote), "lionvote");
+    }
 
     #[test]
     fn test_lion_and_8bit_adamw_optimizers_step() {
@@ -2400,5 +3095,36 @@ mod tests {
         let kind: OptimizerKind = "muon".parse().unwrap();
         assert_eq!(kind, OptimizerKind::Muon);
         assert_eq!(format!("{}", OptimizerKind::Muon), "muon");
+    }
+
+    #[test]
+    fn test_optimizer_step_param_variants() {
+        use crate::injection::LoRAInjectionPoint;
+        use crate::param::TrainableParam;
+
+        let pid = ParamId::a(0, 1, LoRAInjectionPoint::QProj);
+
+        for kind in [
+            OptimizerKind::AdamW,
+            OptimizerKind::Lion,
+            OptimizerKind::MAdam,
+            OptimizerKind::LionVote,
+        ] {
+            let mut opt = Optimizer::new(kind, 1e-3).unwrap();
+            let mut tp = TrainableParam::new(
+                pid,
+                grim_backend_cpu::cpu_tensor(vec![1.0f32; 4], Shape::new(vec![2, 2])),
+            )
+            .unwrap();
+            tp.accumulate_grad(&grim_backend_cpu::cpu_tensor(
+                vec![0.5f32; 4],
+                Shape::new(vec![2, 2]),
+            ))
+            .unwrap();
+
+            opt.step_param(pid, &mut tp).unwrap();
+            let after = tp.data.to_vec_f32().unwrap();
+            assert_ne!(after, vec![1.0f32; 4], "Optimizer {:?} must update param via step_param", kind);
+        }
     }
 }

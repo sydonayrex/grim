@@ -642,7 +642,7 @@ fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     device_tensor(out, gate.shape().clone(), gate.device())
 }
 
-fn apply_rope_neox(
+pub(crate) fn apply_rope_neox(
     v: &mut [f32],
     positions: &[u32],
     num_heads: usize,

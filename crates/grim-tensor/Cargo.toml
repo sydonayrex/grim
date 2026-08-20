@@ -8,6 +8,7 @@ description = "Tensor, DType, Shape, and Device abstractions for the Grim infere
 
 [dependencies]
 thiserror = { workspace = true }
+serde = { workspace = true }
 
 [features]
 default = []

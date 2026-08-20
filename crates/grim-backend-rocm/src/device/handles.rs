@@ -217,6 +217,12 @@ unsafe extern "C" {
         args: *mut *mut c_void,
         extra: *mut c_void,
     ) -> HipErrorT;
+    pub fn hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
+        numBlocks: *mut i32,
+        func: *mut c_void,
+        blockSize: i32,
+        dynamicSMemSize: usize,
+    ) -> HipErrorT;
 
     pub fn hiprtcCreateProgram(
         prog: *mut HiprtcProgram,

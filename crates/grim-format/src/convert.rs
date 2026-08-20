@@ -932,6 +932,10 @@ fn build_grim_metadata(
         quant_method: Some(quant_method),
         rocm_fusion_ops: vec![crate::gguf::GrimFusionOp::QkvAttention],
         kv_layout_optimized: Some(true),
+        // P1 §8 convert-time tag: record the GEMM backend the target's
+        // rocBLAS layer resolves to (RDNA/CDNA both route through rocBLAS
+        // gemm_ex on the current backend).
+        gemm_backend: Some("rocblas".into()),
         ..Default::default()
     }
 }

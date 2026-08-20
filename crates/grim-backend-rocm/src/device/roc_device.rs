@@ -176,6 +176,10 @@ pub struct RocmDevice {
     pub(crate) scratch_pool: Arc<crate::memory::pool::DeviceScratchPool>,
     /// Loaded HIP modules + resolved entry functions, cached per unique kernel entry. [see: `hipModuleLoad`, `hipModuleGetFunction`]
     pub(crate) autotuner: Mutex<crate::autotune::Autotuner>,
+    /// Tuning-mode + occupancy + tuning-solution store for this device.
+    /// [salamander.md §3.6: TuningMode, BlockSizeBand, OccupancyTuning,
+    /// tuning solution storage]
+    pub(crate) tuning: Mutex<crate::autotune::AutotunerConfig>,
 
     pub(crate) module_cache: Mutex<HashMap<String, (*mut c_void, *mut c_void)>>,
     /// Resolved-function fast path for `launch_compute_kernel_with_solution`:
@@ -184,13 +188,18 @@ pub struct RocmDevice {
     /// overwhelming case on the decode hot path). Grid dims are part of the
     /// key because `jit-hw-adaptive` bakes tile geometry derived from them
     /// into the source.
-    pub(crate) resolved_kernel_cache: Mutex<HashMap<(String, u32, u32), *mut c_void>>,
+    pub(crate) resolved_kernel_cache: Mutex<HashMap<(String, u32, u32, Option<i32>), *mut c_void>>,
     /// Interner for `&'static str` autotune keys (entry / arch). Each unique
     /// string is leaked EXACTLY ONCE; repeat `get_or_tune_tiles` /
     /// `store_tune_cache` calls reuse it instead of leaking per call.
     pub(crate) str_interner: Mutex<std::collections::HashSet<&'static str>>,
     /// Real `hipModuleLoad` call count (cache hits excluded). Item 2 acceptance.
     pub(crate) module_load_count: AtomicUsize,
+    /// Total kernel + GEMM launches since the last `reset_launch_count`.
+    /// Instrumentation for fusion-boundary launch-count gates (WI-F1 etc.);
+    /// counts every `hipModuleLaunchKernel` and every rocBLAS GEMM enqueued
+    /// through `matmul_op`.
+    pub(crate) launch_counter: AtomicUsize,
     /// GPU target this device was created for, captured at construction. Used to [see: `temp_env::with_var("GRIM_GPU_TARGET", ..)`]
     pub(crate) gpu_target: String,
     /// Whether graph capture/replay is enabled. Keyed off the `GRIM_CAPTURE_GRAPH`
@@ -572,11 +581,16 @@ impl RocmDevice {
             retained_pins: Mutex::new(Vec::new()),
             scratch_pool: crate::memory::pool::DeviceScratchPool::new(),
             autotuner: Mutex::new(autotuner),
+            /// Tuning-mode + occupancy + tuning-solution store for this device.
+            /// [salamander.md §3.6: TuningMode, BlockSizeBand, OccupancyTuning,
+            /// tuning solution storage]
+            tuning: Mutex::new(crate::autotune::AutotunerConfig::default()),
 
             module_cache: Mutex::new(HashMap::new()),
             resolved_kernel_cache: Mutex::new(HashMap::new()),
             str_interner: Mutex::new(std::collections::HashSet::new()),
             module_load_count: AtomicUsize::new(0),
+            launch_counter: AtomicUsize::new(0),
             gpu_target: gpu_target.clone(),
             capture_enabled: std::env::var("GRIM_CAPTURE_GRAPH").is_ok(),
             capture_stream: RwLock::new(None),
@@ -703,6 +717,47 @@ impl RocmDevice {
     /// Number of real `hipModuleLoad` calls since device creation. Cache hits are [see: `module_cache_loads_each_kernel_once`]
     pub fn module_load_stats(&self) -> usize {
         self.module_load_count.load(Ordering::SeqCst)
+    }
+
+    /// Reset the kernel/GEMM launch counter (fusion-gate instrumentation).
+    pub fn reset_launch_count(&self) {
+        self.launch_counter.store(0, Ordering::SeqCst);
+    }
+
+    /// Kernel + GEMM launches enqueued since the last `reset_launch_count`.
+    pub fn launch_count(&self) -> usize {
+        self.launch_counter.load(Ordering::SeqCst)
+    }
+
+    /// `hipModuleOccupancyMaxActiveBlocksPerMultiprocessor` for a kernel entry that
+    /// has already been launched (and thus resolved) on this device. Returns
+    /// `None` if the entry is not in the resolved-kernel cache yet. Occupancy
+    /// regression harness for fusion gates (WI-F2/F4).
+    pub fn kernel_max_blocks_per_cu(&self, entry: &str, block_size: u32) -> Option<i32> {
+        let func = self
+            .resolved_kernel_cache
+            .lock()
+            .ok()
+            .and_then(|c| {
+                c.iter().find(|(k, _)| k.0 == entry).map(|(_, &f)| f)
+            })?;
+        if func.is_null() {
+            return None;
+        }
+        let mut blocks: i32 = 0;
+        let _dev_guard = crate::device::util::DeviceGuard::set(self.ordinal as i32);
+        let res = unsafe {
+            crate::device::handles::hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
+                &mut blocks,
+                func,
+                block_size as i32,
+                0,
+            )
+        };
+        if res != hipSuccess {
+            return None;
+        }
+        Some(blocks)
     }
 
     /// Phase-3 §3.1: get a pooled scratch buffer. [see: `hipMalloc`, `Result`]
@@ -2345,6 +2400,181 @@ impl BackendDevice for RocmDevice {
         ))
     }
 
+    fn fused_adamw_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        m: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        bc1: f32,
+        bc2: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let p_s = as_rocm(p)?;
+        let g_s = as_rocm(g)?;
+        let m_s = as_rocm(m)?;
+        let v_s = as_rocm(v)?;
+        if !p_s.device_ptr_is_valid()
+            || !g_s.device_ptr_is_valid()
+            || !m_s.device_ptr_is_valid()
+            || !v_s.device_ptr_is_valid()
+        {
+            return Err(Error::Backend(
+                "fused_adamw_step: inputs lack a valid device pointer".into(),
+            ));
+        }
+        let mut p_ptr = dev_ptr(p_s)?;
+        let mut g_ptr = dev_ptr(g_s)?;
+        let mut m_ptr = dev_ptr(m_s)?;
+        let mut v_ptr = dev_ptr(v_s)?;
+        let mut lr = lr;
+        let mut beta1 = beta1;
+        let mut beta2 = beta2;
+        let mut eps = eps;
+        let mut weight_decay = weight_decay;
+        let mut bc1 = bc1;
+        let mut bc2 = bc2;
+        let mut n = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_fused_adamw_step",
+            grid,
+            block,
+            &mut [
+                arg(&mut p_ptr),
+                arg(&mut g_ptr),
+                arg(&mut m_ptr),
+                arg(&mut v_ptr),
+                arg(&mut lr),
+                arg(&mut beta1),
+                arg(&mut beta2),
+                arg(&mut eps),
+                arg(&mut weight_decay),
+                arg(&mut bc1),
+                arg(&mut bc2),
+                arg(&mut n),
+            ],
+        )?;
+        Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+    }
+
+    fn fused_lion_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        exp_avg: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        weight_decay: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let p_s = as_rocm(p)?;
+        let g_s = as_rocm(g)?;
+        let exp_s = as_rocm(exp_avg)?;
+        if !p_s.device_ptr_is_valid() || !g_s.device_ptr_is_valid() || !exp_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "fused_lion_step: inputs lack a valid device pointer".into(),
+            ));
+        }
+        let mut p_ptr = dev_ptr(p_s)?;
+        let mut g_ptr = dev_ptr(g_s)?;
+        let mut exp_ptr = dev_ptr(exp_s)?;
+        let mut lr = lr;
+        let mut beta1 = beta1;
+        let mut beta2 = beta2;
+        let mut weight_decay = weight_decay;
+        let mut n = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_fused_lion_step",
+            grid,
+            block,
+            &mut [
+                arg(&mut p_ptr),
+                arg(&mut g_ptr),
+                arg(&mut exp_ptr),
+                arg(&mut lr),
+                arg(&mut beta1),
+                arg(&mut beta2),
+                arg(&mut weight_decay),
+                arg(&mut n),
+            ],
+        )?;
+        Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+    }
+
+    fn fused_madam_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        m: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        gamma: f32,
+        weight_decay: f32,
+        bc1: f32,
+        bc2: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let p_s = as_rocm(p)?;
+        let g_s = as_rocm(g)?;
+        let m_s = as_rocm(m)?;
+        let v_s = as_rocm(v)?;
+        if !p_s.device_ptr_is_valid()
+            || !g_s.device_ptr_is_valid()
+            || !m_s.device_ptr_is_valid()
+            || !v_s.device_ptr_is_valid()
+        {
+            return Err(Error::Backend(
+                "fused_madam_step: inputs lack a valid device pointer".into(),
+            ));
+        }
+        let mut p_ptr = dev_ptr(p_s)?;
+        let mut g_ptr = dev_ptr(g_s)?;
+        let mut m_ptr = dev_ptr(m_s)?;
+        let mut v_ptr = dev_ptr(v_s)?;
+        let mut lr = lr;
+        let mut beta1 = beta1;
+        let mut beta2 = beta2;
+        let mut eps = eps;
+        let mut gamma = gamma;
+        let mut weight_decay = weight_decay;
+        let mut bc1 = bc1;
+        let mut bc2 = bc2;
+        let mut n = total as i32;
+        let (grid, block) = linear_launch(total);
+        self.launch_compute_kernel(
+            "grim_fused_madam_step",
+            grid,
+            block,
+            &mut [
+                arg(&mut p_ptr),
+                arg(&mut g_ptr),
+                arg(&mut m_ptr),
+                arg(&mut v_ptr),
+                arg(&mut lr),
+                arg(&mut beta1),
+                arg(&mut beta2),
+                arg(&mut eps),
+                arg(&mut gamma),
+                arg(&mut weight_decay),
+                arg(&mut bc1),
+                arg(&mut bc2),
+                arg(&mut n),
+            ],
+        )?;
+        Ok(Box::new(RocmHandle::new(Some(self.active_stream()))))
+    }
+
     fn rms_norm(
         &self,
         x: &dyn BackendStorage,
@@ -2389,6 +2619,220 @@ impl BackendDevice for RocmDevice {
         )?;
         Ok((
             Box::new(storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
+    fn rmsnorm_backward(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        out_grad: &dyn BackendStorage,
+        eps: f32,
+        x_shape: &Shape,
+        w_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let x_s = as_rocm(x)?;
+        let w_s = as_rocm(weight)?;
+        let g_s = as_rocm(out_grad)?;
+        if !x_s.device_ptr_is_valid() || !w_s.device_ptr_is_valid() || !g_s.device_ptr_is_valid() {
+            return Err(Error::Backend("rmsnorm_backward: missing device pointer".into()));
+        }
+        let row_len = *w_shape.dims().last().unwrap_or(&1);
+        let total = x_shape.elem_count();
+        let dx_storage = RocmStorage::alloc_gpu(x_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let dw_storage = RocmStorage::alloc_gpu(w_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut x_ptr = dev_ptr(x_s)?;
+        let mut w_ptr = dev_ptr(w_s)?;
+        let mut g_ptr = dev_ptr(g_s)?;
+        let mut dx_ptr = dev_ptr(&dx_storage)?;
+        let mut row_len_i = row_len as i32;
+        let mut eps_f = eps;
+        let mut total_i = total as i32;
+
+        let (grid, block) = warp_rows_launch(total / row_len.max(1));
+        self.launch_compute_kernel(
+            "grim_rmsnorm_backward",
+            grid,
+            block,
+            &mut [
+                arg(&mut x_ptr),
+                arg(&mut w_ptr),
+                arg(&mut g_ptr),
+                arg(&mut dx_ptr),
+                arg(&mut row_len_i),
+                arg(&mut eps_f),
+                arg(&mut total_i),
+            ],
+        )?;
+        Ok((
+            Box::new(dx_storage),
+            Box::new(dw_storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
+    fn rope_backward(
+        &self,
+        out_grad: &dyn BackendStorage,
+        cos: &dyn BackendStorage,
+        sin: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let g_s = as_rocm(out_grad)?;
+        let c_s = as_rocm(cos)?;
+        let s_s = as_rocm(sin)?;
+        if !g_s.device_ptr_is_valid() || !c_s.device_ptr_is_valid() || !s_s.device_ptr_is_valid() {
+            return Err(Error::Backend("rope_backward: missing device pointer".into()));
+        }
+        let half_dim = cos.shape().elem_count();
+        let head_dim = half_dim * 2;
+        let total_tokens = out_shape.elem_count() / head_dim.max(1);
+        let dx_storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut g_ptr = dev_ptr(g_s)?;
+        let mut c_ptr = dev_ptr(c_s)?;
+        let mut s_ptr = dev_ptr(s_s)?;
+        let mut dx_ptr = dev_ptr(&dx_storage)?;
+        let mut half_dim_i = half_dim as i32;
+        let mut total_tokens_i = total_tokens as i32;
+
+        let total_pairs = (total_tokens * head_dim) / 2;
+        let (grid, block) = linear_launch(total_pairs);
+        self.launch_compute_kernel(
+            "grim_rope_backward",
+            grid,
+            block,
+            &mut [
+                arg(&mut g_ptr),
+                arg(&mut c_ptr),
+                arg(&mut s_ptr),
+                arg(&mut dx_ptr),
+                arg(&mut half_dim_i),
+                arg(&mut total_tokens_i),
+            ],
+        )?;
+        Ok((
+            Box::new(dx_storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
+    fn softmax_backward(
+        &self,
+        out_grad: &dyn BackendStorage,
+        softmax_out: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let g_s = as_rocm(out_grad)?;
+        let s_s = as_rocm(softmax_out)?;
+        if !g_s.device_ptr_is_valid() || !s_s.device_ptr_is_valid() {
+            return Err(Error::Backend("softmax_backward: missing device pointer".into()));
+        }
+        let row_len = *out_shape.dims().last().unwrap_or(&1);
+        let total = out_shape.elem_count();
+        let dx_storage = RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let mut g_ptr = dev_ptr(g_s)?;
+        let mut s_ptr = dev_ptr(s_s)?;
+        let mut dx_ptr = dev_ptr(&dx_storage)?;
+        let mut row_len_i = row_len as i32;
+        let mut total_i = total as i32;
+
+        let (grid, block) = warp_rows_launch(total / row_len.max(1));
+        self.launch_compute_kernel(
+            "grim_softmax_backward",
+            grid,
+            block,
+            &mut [
+                arg(&mut g_ptr),
+                arg(&mut s_ptr),
+                arg(&mut dx_ptr),
+                arg(&mut row_len_i),
+                arg(&mut total_i),
+            ],
+        )?;
+        Ok((
+            Box::new(dx_storage),
+            Box::new(RocmHandle::new(Some(self.active_stream()))),
+        ))
+    }
+
+    /// P3 (4th fused backward kernel): scatter-add embedding gradient on
+    /// device — `dweight[token_ids[t], :] += out_grad[t, :]`. Token ids are
+    /// uploaded as a small U32 buffer; dweight is zero-filled first, then
+    /// atomically accumulated.
+    fn embedding_backward(
+        &self,
+        out_grad: &dyn BackendStorage,
+        token_ids: &[u32],
+        vocab_size: usize,
+        hidden_dim: usize,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let g_s = as_rocm(out_grad)?;
+        if !g_s.device_ptr_is_valid() {
+            return Err(Error::Backend(
+                "embedding_backward: missing device pointer".into(),
+            ));
+        }
+        let num_tokens = token_ids.len();
+        if num_tokens == 0 || hidden_dim == 0 || vocab_size == 0 {
+            return Err(Error::Shape(
+                "embedding_backward: empty vocab/hidden/tokens".into(),
+            ));
+        }
+
+        let dw_shape = Shape::new(vec![vocab_size, hidden_dim]);
+        let dw_storage =
+            RocmStorage::alloc_gpu(&dw_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let ids_shape = Shape::new(vec![num_tokens]);
+        let ids_bytes: Vec<u8> = token_ids
+            .iter()
+            .flat_map(|t| t.to_le_bytes())
+            .collect();
+        let ids_storage = RocmStorage::copy_from_host_raw_bytes(
+            &ids_bytes,
+            &ids_shape,
+            DType::U32,
+            &self.allocator,
+            self.ordinal,
+        )?;
+
+        let mut g_ptr = dev_ptr(g_s)?;
+        let mut ids_ptr = dev_ptr(&ids_storage)?;
+        let mut dw_ptr = dev_ptr(&dw_storage)?;
+        let mut dw_total_i = (vocab_size * hidden_dim) as i32;
+        let mut num_tokens_i = num_tokens as i32;
+        let mut hidden_dim_i = hidden_dim as i32;
+        let mut vocab_size_i = vocab_size as i32;
+
+        // 1) zero-fill dweight.
+        let (grid, block) = linear_launch(vocab_size * hidden_dim);
+        self.launch_compute_kernel(
+            "grim_zero_f32",
+            grid,
+            block,
+            &mut [arg(&mut dw_ptr), arg(&mut dw_total_i)],
+        )?;
+        // 2) atomic scatter-add.
+        let (grid, block) = linear_launch(num_tokens * hidden_dim);
+        self.launch_compute_kernel(
+            "grim_embedding_backward",
+            grid,
+            block,
+            &mut [
+                arg(&mut g_ptr),
+                arg(&mut ids_ptr),
+                arg(&mut dw_ptr),
+                arg(&mut num_tokens_i),
+                arg(&mut hidden_dim_i),
+                arg(&mut vocab_size_i),
+            ],
+        )?;
+        Ok((
+            Box::new(dw_storage),
             Box::new(RocmHandle::new(Some(self.active_stream()))),
         ))
     }
@@ -3672,6 +4116,9 @@ impl BackendDevice for RocmDevice {
         let mut co = cache_offset_i;
         let mut isd = inv_sqrt_d;
         let mut wlo = window_lo_i;
+        let mut oproj_ptr: u64 = 0;
+        let mut odim: i32 = 0;
+        let mut fuseo: i32 = 0;
 
         // Prior RoPE / cache ops were enqueued on the same stream, so stream
         // ordering already guarantees they complete before this kernel reads
@@ -3714,11 +4161,15 @@ impl BackendDevice for RocmDevice {
                 arg(&mut co),
                 arg(&mut isd),
                 arg(&mut wlo),
+                arg(&mut oproj_ptr),
+                arg(&mut odim),
+                arg(&mut fuseo),
             ],
         )?;
 
         let _ = (
             qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd,
+            oproj_ptr, odim, fuseo,
         );
 
         // No post-launch sync: the output storage is returned to the caller
@@ -5172,6 +5623,39 @@ impl RocmDevice {
         routed_scaling_factor: f32,
         num_experts: usize,
     ) -> Result<*mut c_void> {
+        self.launch_charon_grouped_dispatch_entry(
+            activations,
+            expert_gate_w_ptr,
+            expert_up_w_ptr,
+            expert_down_w_ptr,
+            sorted,
+            out_storage,
+            hidden,
+            inter,
+            routed_scaling_factor,
+            num_experts,
+            "grim_moe_fused_grouped",
+        )
+    }
+
+    /// WI-F3 — grouped dispatch against a caller-selected kernel entry, so
+    /// `CharonSelector` variants can route to the WMMA grouped kernel
+    /// (`grim_moe_fused_grouped_wmma`) or the scalar grouped kernel via
+    /// `kernels::charon::grouped_dispatch_entry`. Same host/sort contract.
+    pub(crate) fn launch_charon_grouped_dispatch_entry(
+        &self,
+        activations: &RocmStorage,
+        expert_gate_w_ptr: u64,
+        expert_up_w_ptr: u64,
+        expert_down_w_ptr: u64,
+        sorted: &crate::kernels::charon::SortedRouting,
+        out_storage: &RocmStorage,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+        num_experts: usize,
+        entry: &str,
+    ) -> Result<*mut c_void> {
         let a_ptr = activations.device_ptr.ok_or_else(|| {
             Error::Backend("charon_grouped_dispatch: activations has no device ptr".into())
         })?;
@@ -5220,7 +5704,7 @@ impl RocmDevice {
         let mut rsf = routed_scaling_factor;
 
         let stream = self.launch_compute_kernel(
-            "grim_moe_fused_grouped",
+            entry,
             grid_dim,
             block_dim,
             &mut [
@@ -5943,6 +6427,74 @@ impl RocmDevice {
             inter,
             routed_scaling_factor,
             num_experts,
+        )?;
+        self.synchronize();
+        out_storage.to_cpu_vec_f32()
+    }
+
+    /// WI-F3 — WMMA grouped MoE dispatch roundtrip: sorts via
+    /// `moe_align_block_size`, then launches the WMMA/tensor-core grouped
+    /// kernel (`grim_moe_fused_grouped_wmma`, the
+    /// `CharonVariant::LargeGroupPrefill` dispatch target via
+    /// `kernels::charon::grouped_dispatch_entry`) and reads the result back.
+    /// On non-WMMA arches (gfx1036/RDNA2) the kernel compiles to the scalar
+    /// fallback, so this roundtrip is parity-safe everywhere.
+    pub fn charon_grouped_dispatch_wmma_roundtrip(
+        &self,
+        activations: &[f32],
+        expert_gate_w: &[f32],
+        expert_up_w: &[f32],
+        expert_down_w: &[f32],
+        assignment: &crate::kernels::charon::RoutingAssignment,
+        batch: usize,
+        hidden: usize,
+        inter: usize,
+        routed_scaling_factor: f32,
+    ) -> Result<Vec<f32>> {
+        let num_experts = expert_gate_w.len() / (inter * hidden);
+        let block_size = 128usize;
+
+        let sorted =
+            crate::kernels::charon::moe_align_block_size(assignment, block_size, num_experts);
+
+        let act_shape = Shape::new(vec![batch, hidden]);
+        let exp_gate_shape = Shape::new(vec![expert_gate_w.len()]);
+        let exp_up_shape = Shape::new(vec![expert_up_w.len()]);
+        let exp_down_shape = Shape::new(vec![expert_down_w.len()]);
+        let out_shape = Shape::new(vec![batch, hidden]);
+
+        let act_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, activations, &act_shape, DType::F32)?;
+        let gw_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, expert_gate_w, &exp_gate_shape, DType::F32)?;
+        let uw_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, expert_up_w, &exp_up_shape, DType::F32)?;
+        let dw_storage: Box<dyn BackendStorage> =
+            BackendDevice::from_cpu(self, expert_down_w, &exp_down_shape, DType::F32)?;
+        let out_storage: Box<dyn BackendStorage> =
+            BackendDevice::alloc_storage(self, &out_shape, DType::F32)?;
+
+        let act_s = as_rocm(act_storage.as_ref())?;
+        let gw_s = as_rocm(gw_storage.as_ref())?;
+        let uw_s = as_rocm(uw_storage.as_ref())?;
+        let dw_s = as_rocm(dw_storage.as_ref())?;
+        let out_s = as_rocm(out_storage.as_ref())?;
+
+        let entry = crate::kernels::charon::grouped_dispatch_entry(
+            crate::kernels::charon::CharonVariant::LargeGroupPrefill,
+        );
+        self.launch_charon_grouped_dispatch_entry(
+            act_s,
+            dev_ptr(gw_s)?,
+            dev_ptr(uw_s)?,
+            dev_ptr(dw_s)?,
+            &sorted,
+            out_s,
+            hidden,
+            inter,
+            routed_scaling_factor,
+            num_experts,
+            entry,
         )?;
         self.synchronize();
         out_storage.to_cpu_vec_f32()
@@ -9810,6 +10362,12 @@ impl RocmDevice {
         let _ = autotuner.record(key, config);
     }
 
+    /// Persist the in-memory autotune cache to a JSON file at `path`.
+    pub fn save_autotune_cache(&self, path: &std::path::Path) -> Result<()> {
+        let autotuner = self.autotuner.lock().unwrap();
+        autotuner.save_to_file(path)
+    }
+
     /// Return a fresh HardwareSpec snapshot describing this device.
     pub fn hardware_spec(&self) -> crate::device::hardware_spec::HardwareSpec {
         crate::device::hardware_spec::HardwareSpec::from(self)
@@ -10023,6 +10581,7 @@ impl RocmDevice {
                     "rocblas_gemm_strided_batched_ex failed with status {status}"
                 )));
             }
+            self.launch_counter.fetch_add(1, Ordering::SeqCst);
 
             // Sum up the partials along the batch dimension using the hand-written reduction kernel
             let stream = self.launch_split_k_reduction(
@@ -10154,6 +10713,7 @@ impl RocmDevice {
                 let compute_handle = Box::new(RocmHandle::new(Some(stream)));
                 return Ok((Box::new(out_storage), compute_handle));
             }
+            self.launch_counter.fetch_add(1, Ordering::SeqCst);
         };
 
         let compute_handle = Box::new(RocmHandle::new(Some(self.active_stream())));
@@ -10172,6 +10732,198 @@ impl RocmDevice {
         self.matmul_op(a, b, out_shape, crate::autotune::GemmOp::LmHead)
     }
 
+    /// WI-F1 — Fused QKV projection GEMM. `qkv_weight` must be the load-time
+    /// concatenation of the per-layer Q/K/V projection weights along the
+    /// output dim — row-major `[hidden, q_dim + k_dim + v_dim]`, built once at
+    /// model load via [`crate::fusion::concat_qkv_weights`] (never per forward
+    /// pass). Produces all three projections in a single GEMM launch;
+    /// downstream attention reads q/k/v by offset into the fused output, so
+    /// the projection stage drops from 3 launches to 1 for every layer.
+    pub fn fused_qkv_proj(
+        &self,
+        x: &dyn BackendStorage,
+        qkv_weight: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let x_dims = x.shape().dims();
+        let w_dims = qkv_weight.shape().dims();
+        if x_dims.len() < 2 || w_dims.len() < 2 {
+            return Err(Error::Shape(
+                "fused_qkv_proj expects rank >= 2 inputs".into(),
+            ));
+        }
+        let hidden = x_dims[x_dims.len() - 1];
+        let qkv_dim = w_dims[w_dims.len() - 1];
+        let k2 = qkv_weight.shape().elem_count() / qkv_dim;
+        if hidden != k2 {
+            return Err(Error::ShapeMismatch {
+                expected: x_dims.to_vec(),
+                got: w_dims.to_vec(),
+            });
+        }
+        let tokens = x.shape().elem_count() / hidden;
+        if out_shape.elem_count() != tokens * qkv_dim {
+            return Err(Error::Shape(format!(
+                "expected out elem_count {}, got {:?}",
+                tokens * qkv_dim,
+                out_shape.dims()
+            )));
+        }
+        self.matmul_op(x, qkv_weight, out_shape, crate::autotune::GemmOp::Attention)
+    }
+
+    /// WI-F2 — Fused attention output projection. Runs the same fused QKV
+    /// attention kernel (`grim_qkv_attention`) with the O-projection applied
+    /// in the kernel epilogue: each head's normalized attention vector is
+    /// multiplied by its slice of `o_proj` (row-major
+    /// `[num_heads*head_dim, o_dim]`) and accumulated across heads in-kernel,
+    /// avoiding the HBM round-trip of writing per-head attention output and
+    /// re-reading it for a separate GEMM. `out_shape` is `[seq_len, o_dim]`.
+    /// The unfused path (`qkv_attention` + matmul) remains the reference and
+    /// fallback; arch gating of this fusion is a follow-up under green.
+    pub fn fused_attn_o_proj(
+        &self,
+        q: &dyn BackendStorage,
+        k: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        o_proj: &dyn BackendStorage,
+        num_kv_heads: usize,
+        kv_seq_len: usize,
+        cache_offset: u32,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let q_dims = q.shape().dims();
+        let o_dims = out_shape.dims();
+        if q_dims.len() != 3 || o_dims.len() != 2 {
+            return Err(Error::Shape(
+                "fused_attn_o_proj expects q [seq, heads, head_dim] and out [seq, o_dim]".into(),
+            ));
+        }
+        let seq_len = q_dims[0];
+        let num_heads = q_dims[1];
+        let head_dim = q_dims[2];
+        let o_dim = o_dims[1];
+        if o_dims[0] != seq_len {
+            return Err(Error::Shape(format!(
+                "fused_attn_o_proj: out rows {} must equal seq_len {seq_len}",
+                o_dims[0]
+            )));
+        }
+        if num_heads == 0 || num_kv_heads == 0 || head_dim == 0 || o_dim == 0 {
+            return Err(Error::Shape(
+                "fused_attn_o_proj: zero-sized heads / head_dim / o_dim".into(),
+            ));
+        }
+        if num_heads % num_kv_heads != 0 {
+            return Err(Error::Shape(format!(
+                "fused_attn_o_proj: num_heads ({num_heads}) must be a multiple of num_kv_heads ({num_kv_heads})"
+            )));
+        }
+        if head_dim > 256 {
+            return Err(Error::Shape(format!(
+                "fused_attn_o_proj supports head_dim <= 256 (got {head_dim})"
+            )));
+        }
+        let o_s = as_rocm(o_proj)?;
+        if o_proj.shape().elem_count() != num_heads * head_dim * o_dim {
+            return Err(Error::Shape(format!(
+                "fused_attn_o_proj: o_proj must be [num_heads*head_dim, o_dim] = {} elems (got {})",
+                num_heads * head_dim * o_dim,
+                o_proj.shape().elem_count()
+            )));
+        }
+        let q_s = as_rocm(q)?;
+        let k_s = as_rocm(k)?;
+        let v_s = as_rocm(v)?;
+        if !q_s.device_ptr_is_valid()
+            || !k_s.device_ptr_is_valid()
+            || !v_s.device_ptr_is_valid()
+            || !o_s.device_ptr_is_valid()
+        {
+            return Err(Error::Backend(
+                "fused_attn_o_proj: inputs lack a valid device pointer".into(),
+            ));
+        }
+
+        let config = QkvAttentionFusionConfig {
+            enabled: true,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            max_seq_len: seq_len,
+            wavefront_size: self.props.wavefront_size as u32,
+            quant_mode: QuantMode::Fp32,
+        };
+        let launch = config.hip_launch_params();
+        let storage =
+            RocmStorage::alloc_gpu(out_shape, dtype_f32(), &self.allocator, self.ordinal)?;
+        let out_ptr = dev_ptr(&storage)?;
+
+        // atomicAdd accumulation across heads requires a zeroed output;
+        // async memset on the active stream keeps it stream-ordered.
+        let res =
+            unsafe { hipMemsetAsync(out_ptr as *mut c_void, 0, storage.bytes, self.active_stream()) };
+        if res != hipSuccess {
+            return Err(Error::Backend(format!(
+                "fused_attn_o_proj: hipMemsetAsync failed with status {res}"
+            )));
+        }
+
+        let q_ptr = dev_ptr(q_s)?;
+        let k_ptr = dev_ptr(k_s)?;
+        let v_ptr = dev_ptr(v_s)?;
+        let o_proj_ptr = dev_ptr(o_s)?;
+
+        let mut qptr = q_ptr;
+        let mut kptr = k_ptr;
+        let mut vptr = v_ptr;
+        let mut optr = out_ptr;
+        let mut max_ptr: u64 = 0;
+        let mut sum_ptr: u64 = 0;
+        let mut nh = num_heads as i32;
+        let mut nkv = num_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sl = seq_len as i32;
+        let mut ksl = kv_seq_len as i32;
+        let mut co = cache_offset as i32;
+        let mut isd: f32 = 1.0 / (head_dim as f32).sqrt();
+        let mut wlo: i32 = 0;
+        let mut oproj_ptr = o_proj_ptr;
+        let mut odim = o_dim as i32;
+        let mut fuseo: i32 = 1;
+
+        let stream = self.launch_compute_kernel(
+            "grim_qkv_attention",
+            launch.grid_dim,
+            launch.block_dim,
+            &mut [
+                arg(&mut qptr),
+                arg(&mut kptr),
+                arg(&mut vptr),
+                arg(&mut optr),
+                arg(&mut max_ptr),
+                arg(&mut sum_ptr),
+                arg(&mut nh),
+                arg(&mut nkv),
+                arg(&mut hd),
+                arg(&mut sl),
+                arg(&mut ksl),
+                arg(&mut co),
+                arg(&mut isd),
+                arg(&mut wlo),
+                arg(&mut oproj_ptr),
+                arg(&mut odim),
+                arg(&mut fuseo),
+            ],
+        )?;
+        let _ = (
+            qptr, kptr, vptr, optr, max_ptr, sum_ptr, nh, nkv, hd, sl, ksl, co, isd, wlo,
+            oproj_ptr, odim, fuseo,
+        );
+        Ok((Box::new(storage), Box::new(RocmHandle::new(Some(stream)))))
+    }
+
+
     pub(crate) fn launch_compute_kernel_with_solution(
         &self,
         entry: &str,
@@ -10182,12 +10934,11 @@ impl RocmDevice {
         shared_mem_bytes: usize,
     ) -> Result<*mut c_void> {
         // Fast path: a previously resolved hipFunction for this
-        // (entry, grid-shape) launches directly — no source rebuild, no
-        // seahash, no CString, no module-cache walk. This is the repeat
-        // case for every elementwise/norm/attention kernel on the decode
-        // hot path. `solution_index` only names the on-disk hsaco cache
-        // entry; it never changes the compiled function.
-        let fast_key = (entry.to_string(), grid.x, grid.y);
+        // (entry, grid-shape, solution_index) launches directly — no source
+        // rebuild, no seahash, no CString, no module-cache walk. Same
+        // solution_index is required because different indices map to
+        // different on-disk hsaco files (cache_key includes _sol{N}).
+        let fast_key = (entry.to_string(), grid.x, grid.y, solution_index);
         let cached_func: Option<*mut c_void> = self
             .resolved_kernel_cache
             .lock()
@@ -10342,6 +11093,7 @@ impl RocmDevice {
                 std::ptr::null_mut(),
             )
         })?;
+        self.launch_counter.fetch_add(1, Ordering::SeqCst);
         Ok(stream)
     }
 
@@ -10738,9 +11490,9 @@ impl RocmDevice {
         let mut v = wd[0] as i32;
         let mut tile = v_tile_size;
         let mut b = batch as i32;
-        let block = crate::HipDim3 { x: 128, y: 1, z: 1 };
+        let block = crate::HipDim3 { x: 256, y: 1, z: 1 };
         let grid = crate::HipDim3 {
-            x: ((batch + 127) / 128) as u32,
+            x: batch as u32,
             y: 1,
             z: 1,
         };
@@ -10816,9 +11568,9 @@ impl RocmDevice {
         let mut tile = v_tile_size;
         let mut inv = inv_batch;
         let mut b = batch as i32;
-        let block = crate::HipDim3 { x: 128, y: 1, z: 1 };
+        let block = crate::HipDim3 { x: 256, y: 1, z: 1 };
         let grid = crate::HipDim3 {
-            x: ((batch + 127) / 128) as u32,
+            x: batch as u32,
             y: 1,
             z: 1,
         };

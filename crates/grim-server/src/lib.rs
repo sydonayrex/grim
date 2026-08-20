@@ -399,6 +399,26 @@ fn trim_stop_sequences(text: &str, stop_seqs: &[String]) -> (String, bool) {
     (text.to_string(), false)
 }
 
+/// WI-P9: strip every occurrence of any stop sequence from `text`. The stop
+/// string is a signal, not content (OpenAI convention); non-streaming and
+/// streaming both apply this so the final client-visible content is identical
+/// for the same generated tokens. Kept separate from `trim_stop_sequences`
+/// (suffix-only, used for tool-parse text) so both semantics stay explicit.
+fn strip_stop_sequences(text: &str, stop_seqs: &[String]) -> (String, bool) {
+    let mut out = text.to_string();
+    let mut hit = false;
+    for seq in stop_seqs {
+        if seq.is_empty() {
+            continue;
+        }
+        if out.contains(seq.as_str()) {
+            hit = true;
+            out = out.replace(seq.as_str(), "");
+        }
+    }
+    (out, hit)
+}
+
 /// Split model-generated chain-of-thought preambles from the main response
 /// text.  The model is expected to wrap its reasoning in `<think>`...`</think>`
 /// tags (DeepSeek-R1 / Qwen3-Thinking convention).  Returns
@@ -709,6 +729,61 @@ fn request_error(code: ErrorCode, message: impl Into<String>) -> serde_json::Val
     })
 }
 
+/// WI-3: build a `ConstrainedSampler` from an OpenAI-compatible
+/// `response_format` field, wrapping the given inner sampler.
+///
+/// Returns `Ok(arc)` on success, `Err(message)` on an unsupported schema
+/// feature (callers return a structured 400 rather than silently
+/// under-constraining — silently under-constraining is worse than a clear
+/// rejection, since callers relying on schema conformance would get
+/// malformed output with no signal).
+fn build_constrained_sampler(
+    inner: std::sync::Arc<dyn grim_core::sampler::Sampler>,
+    body: &serde_json::Map<String, serde_json::Value>,
+    vocab: Option<std::sync::Arc<[String]>>,
+) -> std::result::Result<std::sync::Arc<dyn grim_core::sampler::Sampler>, String> {
+    let Some(rf) = body.get("response_format") else {
+        return Ok(inner);
+    };
+    let obj = rf.as_object().ok_or_else(|| {
+        "response_format must be an object with a 'type' field".to_string()
+    })?;
+    let ty = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            "response_format.type is required ('text', 'json_object', 'json_schema')".to_string()
+        })?;
+    match ty {
+        "text" | "text/plain" => Ok(inner),
+        "json_object" => {
+            use grim_constrain::constrained_json_object;
+            let mut s = constrained_json_object(inner);
+            if let Some(v) = vocab {
+                s = s.with_vocab(v);
+            }
+            Ok(std::sync::Arc::new(s))
+        }
+        "json_schema" => {
+            let schema = obj.get("json_schema").cloned().ok_or_else(|| {
+                "response_format.json_schema is required when type='json_schema'"
+                    .to_string()
+            })?;
+            use grim_constrain::{ConstrainedSampler, Constraint};
+            let constraint = Constraint::json_schema(schema)
+                .map_err(|e| e.to_string())?;
+            let mut s = ConstrainedSampler::new(inner, constraint);
+            if let Some(v) = vocab {
+                s = s.with_vocab(v);
+            }
+            Ok(std::sync::Arc::new(s))
+        }
+        other => Err(format!(
+            "unsupported response_format.type '{other}'; expected 'text', 'json_object', or 'json_schema'"
+        )),
+    }
+}
+
 /// Chat completions endpoint — SSE streaming (§8, §4.5).
 ///
 /// §13.3 contract: no silent partial fulfillment.
@@ -815,6 +890,9 @@ async fn chat_completions(
         "sampler",
         "reasoning_effort",
         "thinking",
+        // WI-3: OpenAI-compatible `response_format` — constrains generation
+        // to JSON-mode or JSON-Schema via `grim-constrain::ConstrainedSampler`.
+        "response_format",
     ];
     for key in body_obj.keys() {
         if !KNOWN_FIELDS.contains(&key.as_str()) {
@@ -1008,6 +1086,35 @@ async fn chat_completions(
                 })
         } else {
             std::sync::Arc::from(sampling.into_sampler(sample_seed))
+        };
+
+    // WI-3: `response_format` wraps the chosen sampler in a
+    // `ConstrainedSampler` so generated tokens stay on a valid JSON/JSON-Schema
+    // path. The inner sampler (plugin or SamplingParams) is unmodified —
+    // this is wrapping, not altering, per the plan.
+    //
+    // The tokenizer's vocabulary is passed in so the constrained sampler can
+    // simulate per-token FSM paths; without it the mask is conservative
+    // (all-valid), which is honest but doesn't actually constrain anything.
+    let vocab = state
+        .tokenizer
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|t| std::sync::Arc::from(t.tokens.clone()) as std::sync::Arc<[String]>);
+    let sampler: std::sync::Arc<dyn grim_core::sampler::Sampler> =
+        match build_constrained_sampler(sampler, &body_obj, vocab) {
+            Ok(s) => s,
+            Err(msg) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(request_error(
+                        ErrorCode::InvalidRequest,
+                        format!("invalid response_format: {msg}"),
+                    )),
+                )
+                    .into_response();
+            }
         };
 
     // `max_tokens` bounds generation length; default to a sane non-infinite
@@ -1401,6 +1508,9 @@ async fn chat_completions(
                             .to_string();
                     }
                     if hit_stop {
+                        // Trim the stop string from the buffered text used for
+                        // terminal tool-call parsing (suffix-trim is enough for
+                        // parse purposes).
                         let (trimmed, _) = trim_stop_sequences(&emitted, &stop_seqs);
                         emitted = trimmed;
                     }
@@ -1419,8 +1529,8 @@ async fn chat_completions(
                             &prior_messages,
                             reasoning_content.as_deref(),
                         );
-                        return delta.map(|ev| {
-                            (
+                        if let Some(ev) = delta {
+                            return Some((
                                 ev,
                                 (
                                     step + 1,
@@ -1430,8 +1540,49 @@ async fn chat_completions(
                                     cancel_token,
                                     cleanup_guard,
                                 ),
-                            )
-                        });
+                            ));
+                        }
+                        // WI-P9: no tool call — the stop-triggering token's text
+                        // must still reach the client, or stream:true silently
+                        // drops the final content the non-streaming path returns.
+                        // Emit it stop-stripped (signal, not content) in the same
+                        // chunk shape as every other delta, then close. Setting
+                        // step to max_tokens makes the next unfold iteration hit
+                        // the max-tokens terminal branch, which produces no
+                        // further event, so the stream ends after this delta.
+                        if hit_stop && !clean_emitted.is_empty() {
+                            let (stripped, _) = strip_stop_sequences(&clean_emitted, &stop_seqs);
+                            let prior_raw_len = emitted.len() - token_text.len();
+                            let delta_content = if stripped.len() > prior_raw_len {
+                                stripped[prior_raw_len..].to_string()
+                            } else {
+                                String::new()
+                            };
+                            if !delta_content.is_empty() {
+                                let payload = serde_json::json!({
+                                    "object": "chat.completion.chunk",
+                                    "model": stream_model,
+                                    "choices": [{"index": 0, "delta": {"content": delta_content}, "finish_reason": "stop"}],
+                                    "adapters_active": adapter_ids.len()
+                                })
+                                .to_string();
+                                let event = axum::response::sse::Event::default()
+                                    .event("message")
+                                    .data(payload);
+                                return Some((
+                                    Ok(event),
+                                    (
+                                        max_tokens_clone,
+                                        emitted,
+                                        prompt_tokens,
+                                        request_id,
+                                        cancel_token,
+                                        cleanup_guard,
+                                    ),
+                                ));
+                            }
+                        }
+                        return None;
                     }
                     // WI-2: streaming chunks echo the requested model too, so
                     // clients validating `chunk.model` see what they sent.
@@ -1550,10 +1701,11 @@ async fn chat_completions(
             }
         }
 
-        // Trim the stop sequence from the returned content (OpenAI convention:
-        // the stop string is a signal, not part of the output). This makes
-        // non-streaming and streaming consistent: both omit the stop text.
-        let (content, _hit_stop) = trim_stop_sequences(&content, &stop_sequences);
+        // Strip stop-sequence occurrences from the returned content (OpenAI
+        // convention: the stop string is a signal, not part of the output).
+        // WI-P9: uses the same occurrence-strip as the streaming path's
+        // terminal delta, so stream:true and stream:false agree on content.
+        let (content, _hit_stop) = strip_stop_sequences(&content, &stop_sequences);
 
         // Thinking output handling: when the model emits <think> blocks,
         // split them into reasoning_content (chain-of-thought) and clean
@@ -3344,10 +3496,26 @@ mod tests {
 
     #[test]
     fn test_probe_vram_and_gpus_returns_valid_structure() {
-        let (used, total, gpus) = probe_vram_and_gpus(0);
+        let (used, total, gpus) = probe_vram_and_gpus(1);
         assert!(!gpus.is_empty());
         assert!(gpus[0].get("name").is_some());
         let _ = (used, total);
+    }
+
+    /// WI-1 regression: `compute` must never be a hardcoded `0u32`. On a
+    /// GPU-less box (no ROCm devices) the probe returns `null`, not a
+    /// fabricated zero — a permanently-zero column is worse than absent.
+    #[test]
+    fn test_probe_compute_is_not_fabricated_zero() {
+        // No ROCm devices on this host: the probe falls through to CPU entry.
+        let (_used, _total, gpus) = probe_vram_and_gpus(0);
+        for gpu in &gpus {
+            let compute = gpu.get("compute");
+            assert!(
+                compute.is_none() || compute.unwrap().is_null(),
+                "compute must be null when no utilization API is available, got {compute:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4584,6 +4752,209 @@ mod tests {
         assert_eq!(token_count, 7, "max_tokens: 7 must yield exactly 7 tokens");
     }
 
+    /// Convenience: run one chat_completions request and return the final
+    /// client-visible content — `message.content` for non-streaming, or the
+    /// concatenation of all `delta.content` SSE fragments for streaming.
+    async fn send_and_get_content(
+        app: axum::Router,
+        request_body: &serde_json::Value,
+    ) -> String {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        if request_body["stream"] == serde_json::Value::Bool(true) {
+            let body_str = String::from_utf8_lossy(&bytes);
+            let mut concatenated = String::new();
+            for line in body_str.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if data == "[DONE]" {
+                        continue;
+                    }
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(delta) = val["choices"][0]["delta"]["content"].as_str() {
+                            concatenated.push_str(delta);
+                        }
+                    }
+                }
+            }
+            concatenated
+        } else {
+            let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            val["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        }
+    }
+
+    /// WI-P9 (b): `reasoning_effort` and `thinking` are fully wired into
+    /// `ThinkingLevel` parsing — they must be accepted by KNOWN_FIELDS (not
+    /// 400-rejected) so the parsing code is reachable at all.
+    #[tokio::test]
+    async fn test_reasoning_effort_accepted_and_parsed() {
+        let state = test_app_state();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state.clone());
+
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false,
+            "max_tokens": 3,
+            "reasoning_effort": "medium"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "reasoning_effort must be accepted by KNOWN_FIELDS (a 400 here means the feature is unreachable)"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            val["choices"][0]["message"]["content"].is_string(),
+            "reasoning_effort request must complete normally"
+        );
+        // The parser must map "medium" to ThinkingLevel::Medium (not the
+        // default), proving the field reaches the parsing code.
+        assert_eq!(
+            grim_core::sampler::ThinkingLevel::parse("medium"),
+            grim_core::sampler::ThinkingLevel::Medium
+        );
+
+        // `thinking: true` (boolean form) is a second accepted alias.
+        let request_body = serde_json::json!({
+            "model": "default",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false,
+            "max_tokens": 3,
+            "thinking": true
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "thinking:true must be accepted");
+    }
+
+    /// WI-P9 (a): the same generation request hitting the same stop sequence
+    /// must produce the same client-visible content whether `stream` is true
+    /// or false. RED before the fix: the streaming path drops the
+    /// stop-triggering token's delta entirely while the non-streaming path
+    /// includes it, so the two diverge.
+    #[tokio::test]
+    async fn test_stop_sequence_stream_matches_non_streaming_content() {
+        let state = test_app_state();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state.clone());
+
+        for _ in 0..3 {
+            let req = serde_json::json!({
+                "model": "default",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 20,
+                "stop": ["<tok:"]
+            });
+            let mut non_streaming = req.clone();
+            non_streaming["stream"] = serde_json::Value::Bool(false);
+            let non_streaming_content =
+                send_and_get_content(app.clone(), &non_streaming).await;
+
+            let mut streaming = req.clone();
+            streaming["stream"] = serde_json::Value::Bool(true);
+            let streaming_content = send_and_get_content(app.clone(), &streaming).await;
+
+            // The mock engine samples a fresh random token id per request, so
+            // compare digit-normalized content (ids stripped): post-fix both
+            // paths must reduce to exactly ">". Pre-fix the streaming path
+            // emitted nothing (stop-triggering delta dropped), so it reduced
+            // to "" and the assertion failed.
+            let normalize = |c: &str| c.chars().filter(|ch| !ch.is_ascii_digit()).collect::<String>();
+            assert_eq!(
+                normalize(&streaming_content), normalize(&non_streaming_content),
+                "stream:true content {streaming_content:?} must match stream:false content {non_streaming_content:?} (modulo the random token id) for the same stop-triggering request"
+            );
+            assert_eq!(
+                normalize(&streaming_content), ">",
+                "streaming must deliver the stop-triggering token's stripped text as a final delta; got {streaming_content:?}"
+            );
+            // The stop string is a signal, not content: neither mode may leak it.
+            assert!(
+                !streaming_content.contains("<tok:"),
+                "stop string must be stripped from streaming content: {streaming_content:?}"
+            );
+            assert!(
+                !non_streaming_content.contains("<tok:"),
+                "stop string must be stripped from non-streaming content: {non_streaming_content:?}"
+            );
+        }
+    }
+
+    /// Build the shared mock-engine app state used by the chat_completions
+    /// stop-sequence tests.
+    fn test_app_state() -> Arc<AppState> {
+        let mut engine = grim_engine::Engine::new(grim_engine::EngineConfig::default());
+        let mock_model = Box::new(grim_models_transformer::Llama::random(
+            Device::Cpu,
+            grim_models_transformer::LlamaConfig {
+                vocab_size: 32000,
+                hidden_size: 512,
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                num_layers: 4,
+                intermediate_size: 1024,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                max_seq_len: 2048,
+
+                partial_rotary_factor: 1.0,
+                yarn: None,
+            },
+        ));
+        engine.register_model("default", mock_model);
+        Arc::new(AppState {
+            engine: Mutex::new(engine),
+            tokenizer: Mutex::new(None),
+            model_path: None,
+            plugin_registry: None,
+        })
+    }
+
     /// P0-WI-1: a `stop` sequence that matches every generated token (the
     /// mock emits `<tok:N>`) must terminate generation after the first token,
     /// regardless of `max_tokens`. This proves stop is honored, not ignored.
@@ -4647,11 +5018,13 @@ mod tests {
             .unwrap();
         let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let content = val["choices"][0]["message"]["content"].as_str().unwrap();
-        let token_count = content.matches("<tok:").count();
-        assert_eq!(
-            token_count, 1,
-            "stop sequence must end generation at the first token"
+        // WI-P9: the stop string is stripped from content (it is a signal, not
+        // output) — so the first token reduces to its numeric id fragment.
+        assert!(
+            !content.contains("<tok:"),
+            "stop string must be stripped from non-streaming content, got: {content:?}"
         );
+        assert!(content.ends_with('>'), "expected the trigger token id fragment, got: {content:?}");
     }
 
     /// P0-WI-1: streaming mode stop sequence test — asserts that when a stop
@@ -5360,9 +5733,13 @@ pub fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::
             } else {
                 0
             };
+            // WI-1: `compute` is now a real utilization probe (rsmi busy %).
+            // `null` when the backend has no utilization API — never a
+            // fabricated 0. See `compute_utilization` per backend.
+            let compute = grim_backend_rocm::compute_utilization(ord);
             gpus_json.push(serde_json::json!({
                 "index": ord as u32,
-                "compute": 0u32,
+                "compute": compute,
                 "memory": memory_pct,
                 "name": format!("ROCm GPU {ord}"),
             }));
@@ -5385,9 +5762,10 @@ pub fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::
                 } else {
                     0
                 };
+                let compute = grim_backend_cuda::compute_utilization(ord);
                 gpus_json.push(serde_json::json!({
                     "index": ord as u32,
-                    "compute": 0u32,
+                    "compute": compute,
                     "memory": memory_pct,
                     "name": format!("CUDA GPU {ord}"),
                 }));
@@ -5403,9 +5781,10 @@ pub fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::
         if total > 0 {
             let used = total.saturating_sub(free);
             let memory_pct = ((used as f64 / total as f64) * 100.0) as u32;
+            let compute = grim_backend_metal::compute_utilization(0);
             gpus_json.push(serde_json::json!({
                 "index": 0u32,
-                "compute": 0u32,
+                "compute": compute,
                 "memory": memory_pct,
                 "name": "Metal GPU",
             }));
@@ -5420,9 +5799,10 @@ pub fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::
         if total > 0 {
             let used = total.saturating_sub(free);
             let memory_pct = ((used as f64 / total as f64) * 100.0) as u32;
+            let compute = grim_backend_vulkan::compute_utilization(0);
             gpus_json.push(serde_json::json!({
                 "index": 0u32,
-                "compute": 0u32,
+                "compute": compute,
                 "memory": memory_pct,
                 "name": "Vulkan GPU",
             }));
@@ -5432,7 +5812,7 @@ pub fn probe_vram_and_gpus(rocm_gpu_count: usize) -> (u64, u64, Vec<serde_json::
 
     gpus_json.push(serde_json::json!({
         "index": 0u32,
-        "compute": 0u32,
+        "compute": serde_json::Value::Null,
         "memory": 0u32,
         "name": "CPU",
     }));
@@ -5460,9 +5840,10 @@ fn probe_cuda_vram(cuda_gpu_count: usize) -> (u64, u64, Vec<serde_json::Value>) 
             } else {
                 0
             };
+            let compute = grim_backend_cuda::compute_utilization(ord);
             gpus_json.push(serde_json::json!({
                 "index": ord as u32,
-                "compute": 0u32,
+                "compute": compute,
                 "memory": memory_pct,
                 "name": format!("CUDA GPU {ord}"),
             }));
@@ -5472,6 +5853,13 @@ fn probe_cuda_vram(cuda_gpu_count: usize) -> (u64, u64, Vec<serde_json::Value>) 
     (total_vram_used, total_vram_max, gpus_json)
 }
 
+/// `GET /api/stats` — JSON stats snapshot polled by the dashboard at `/`.
+///
+/// WI-1 wire-shape note: `gpus[].compute` is now `Option<u32>` — a real
+/// per-backend utilization probe, or `null` when the backend has no
+/// utilization API. Consumers that previously read `compute` as an
+/// always-present `u32` must tolerate `null`. A permanently-zero column is
+/// worse than an absent one, so `null` is the honest value here.
 async fn stats_endpoint(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let engine = state.engine.lock().unwrap_or_else(|e| e.into_inner());
     let models = engine.loaded_models();

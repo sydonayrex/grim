@@ -266,6 +266,34 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Hardware-adaptive kernel JIT tuning and pre-compilation
+# ---------------------------------------------------------------------------
+tune_kernels() {
+    if [ "$DETECTED_BACKEND" != "rocm" ]; then
+        echo "[grim] Skipping GPU kernel tuning (detected backend: $DETECTED_BACKEND)."
+        return
+    fi
+
+    echo "[grim] Running post-install hardware JIT kernel tuning for ROCm..."
+    echo "[grim] Sweeping canonical shapes and compiling optimized .hsaco kernels..."
+    
+    local tune_bin="$GRIM_INSTALL_DIR/grim"
+    if [ ! -f "$tune_bin" ]; then
+        tune_bin="$GRIM_BINARY"
+    fi
+
+    if [ -x "$tune_bin" ]; then
+        GRIM_HSACO_CACHE_DIR="${GRIM_CACHE_DIR}/hsaco" \
+            "$tune_bin" tune --device 0 --output-dir "${GRIM_CACHE_DIR}/hsaco" 2>&1 | tee -a "${GRIM_LOG_DIR}/tune.log" || {
+            echo "[grim] WARNING: Hardware kernel tuning encountered an issue; grim will fallback to lazy runtime JIT."
+        }
+        need_root chown -R "${GRIM_USER}:${GRIM_GROUP}" "${GRIM_CACHE_DIR}/hsaco" 2>/dev/null || true
+    else
+        echo "[grim] WARNING: Grim binary not found or not executable for tuning."
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Write the systemd service unit
 # ---------------------------------------------------------------------------
 install_service() {
@@ -377,6 +405,7 @@ case "$ACTION" in
         install_binary
         install_env_file
         install_config
+        tune_kernels
         install_service
         echo ""
         echo "=== Installation Complete ==="

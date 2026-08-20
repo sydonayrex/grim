@@ -24,6 +24,14 @@ const RCCL_SO_CANDIDATES: &[&str] = &[
     "librccl.so.1.0",
 ];
 
+const HIP_SO_CANDIDATES: &[&str] = &[
+    "libamdhip64.so",
+    "libamdhip64.so.6",
+    "libamdhip64.so.5",
+    "libhiprtc.so",
+    "librocblas.so",
+];
+
 /// Candidate ROCm lib-dir roots in priority order. `workspace_root` is the
 /// cargo manifest dir's grandparent (crates/grim-backend-rocm -> workspace).
 fn candidate_lib_dirs(workspace_root: &std::path::Path) -> Vec<PathBuf> {
@@ -36,6 +44,7 @@ fn candidate_lib_dirs(workspace_root: &std::path::Path) -> Vec<PathBuf> {
             }
         }
     };
+    push_env(&mut dirs, "HIP_PATH");
     push_env(&mut dirs, "RCCL_PATH");
     push_env(&mut dirs, "ROCM_RCCL_PATH");
     if let Ok(val) = std::env::var("ROCM_PATH") {
@@ -59,11 +68,24 @@ fn candidate_lib_dirs(workspace_root: &std::path::Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Resolve the directory containing `librccl.so*`, or `None` if RCCL is
-/// not installed at any known location. Never panics.
+/// Resolve directory containing `librccl.so*`, or `None` if RCCL not installed.
+/// Contract: never panics, returns verified existing PathBuf.
 pub fn resolve_rocm_lib_dir(workspace_root: &std::path::Path) -> Option<PathBuf> {
     for dir in candidate_lib_dirs(workspace_root) {
         for so in RCCL_SO_CANDIDATES {
+            if dir.join(so).exists() {
+                return Some(dir);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve directory containing `libamdhip64.so*` or `librocblas.so*`, or `None` if absent.
+/// Contract: used by build script to locate ROCm/HIP dynamic libraries safely.
+pub fn resolve_hip_lib_dir(workspace_root: &std::path::Path) -> Option<PathBuf> {
+    for dir in candidate_lib_dirs(workspace_root) {
+        for so in HIP_SO_CANDIDATES {
             if dir.join(so).exists() {
                 return Some(dir);
             }

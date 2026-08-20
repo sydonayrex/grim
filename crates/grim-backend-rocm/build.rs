@@ -36,8 +36,16 @@ fn main() {
         }
     }
 
-    println!("cargo:rustc-link-lib=dylib=amdhip64");
-    println!("cargo:rustc-link-lib=dylib=rocblas");
+    // ROCm HIP and rocBLAS link directives — gated by `rocm` feature (or `jit-hw-adaptive`)
+    if std::env::var("CARGO_FEATURE_ROCM").is_ok() {
+        if let Some(dir) = resolve_hip_lib_dir(&workspace) {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+        println!("cargo:rustc-link-lib=dylib=amdhip64");
+        println!("cargo:rustc-link-lib=dylib=rocblas");
+        println!("cargo:rerun-if-env-changed=HIP_PATH");
+        println!("cargo:rerun-if-env-changed=ROCM_PATH");
+    }
 
     // grim-sonnet F11 — RCCL is OPTIONAL and discoverable (WI-R0).
     //

@@ -86,7 +86,7 @@ impl ComputeHandle for ReadyHandle {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct YaRNParams {
     pub factor: f32,
     pub original_max_pos: usize,
@@ -95,7 +95,7 @@ pub struct YaRNParams {
     pub attention_factor: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RopeConfig {
     pub dim: usize,
     pub base: f32,
@@ -320,6 +320,70 @@ pub trait BackendDevice: Send + Sync {
         ))
     }
 
+    /// On-device fused AdamW parameter update step:
+    /// `p`, `g`, `m`, `v` updated on device in a single kernel.
+    fn fused_adamw_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        m: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        bc1: f32,
+        bc2: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let _ = (p, g, m, v, lr, beta1, beta2, eps, weight_decay, bc1, bc2, total);
+        Err(crate::error::Error::Unimplemented(
+            "fused_adamw_step not implemented for this backend".into(),
+        ))
+    }
+
+    /// On-device fused Lion parameter update step.
+    fn fused_lion_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        exp_avg: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        weight_decay: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let _ = (p, g, exp_avg, lr, beta1, beta2, weight_decay, total);
+        Err(crate::error::Error::Unimplemented(
+            "fused_lion_step not implemented for this backend".into(),
+        ))
+    }
+
+    /// On-device fused M-Adam parameter update step.
+    fn fused_madam_step(
+        &self,
+        p: &dyn BackendStorage,
+        g: &dyn BackendStorage,
+        m: &dyn BackendStorage,
+        v: &dyn BackendStorage,
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        gamma: f32,
+        weight_decay: f32,
+        bc1: f32,
+        bc2: f32,
+        total: usize,
+    ) -> Result<Box<dyn ComputeHandle>> {
+        let _ = (p, g, m, v, lr, beta1, beta2, eps, gamma, weight_decay, bc1, bc2, total);
+        Err(crate::error::Error::Unimplemented(
+            "fused_madam_step not implemented for this backend".into(),
+        ))
+    }
+
     /// `y = silu(x) * gate` — for LLaMA-style swiglu, fold here for now.
     fn silu_mul(
         &self,
@@ -343,6 +407,71 @@ pub trait BackendDevice: Send + Sync {
         let _ = (e, g, dw, out_shape);
         Err(crate::error::Error::Unimplemented(
             "silu_mul_backward not implemented for this backend".into(),
+        ))
+    }
+
+    /// RMSNorm backward: `(dx, dw) = rmsnorm_backward(x, weight, out_grad, eps)`.
+    fn rmsnorm_backward(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        out_grad: &dyn BackendStorage,
+        eps: f32,
+        x_shape: &Shape,
+        w_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        let _ = (x, weight, out_grad, eps, x_shape, w_shape);
+        Err(crate::error::Error::Unimplemented(
+            "rmsnorm_backward not implemented for this backend".into(),
+        ))
+    }
+
+    /// RoPE backward: `dx = rope_backward(out_grad, cos, sin)`.
+    fn rope_backward(
+        &self,
+        out_grad: &dyn BackendStorage,
+        cos: &dyn BackendStorage,
+        sin: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (out_grad, cos, sin, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "rope_backward not implemented for this backend".into(),
+        ))
+    }
+
+    /// Softmax backward: `dx = softmax_backward(out_grad, softmax_out)`.
+    fn softmax_backward(
+        &self,
+        out_grad: &dyn BackendStorage,
+        softmax_out: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (out_grad, softmax_out, out_shape);
+        Err(crate::error::Error::Unimplemented(
+            "softmax_backward not implemented for this backend".into(),
+        ))
+    }
+
+    /// Embedding backward: scatter-add token gradients into the embedding
+    /// weight gradient — `dweight[token_ids[t], :] += out_grad[t, :]`.
+    ///
+    /// `token_ids` is a host-side slice; GPU backends upload it as a small
+    /// U32 buffer. The returned storage has shape `[vocab_size, hidden_dim]`.
+    fn embedding_backward(
+        &self,
+        out_grad: &dyn BackendStorage,
+        token_ids: &[u32],
+        vocab_size: usize,
+        hidden_dim: usize,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        let _ = (out_grad, token_ids, vocab_size, hidden_dim);
+        Err(crate::error::Error::Unimplemented(
+            "embedding_backward not implemented for this backend".into(),
         ))
     }
 
@@ -1305,6 +1434,51 @@ impl<T: BackendDevice + ?Sized> BackendDevice for std::sync::Arc<T> {
         Box<dyn ComputeHandle>,
     )> {
         (**self).silu_mul_backward(e, g, dw, out_shape)
+    }
+
+    fn rmsnorm_backward(
+        &self,
+        x: &dyn BackendStorage,
+        weight: &dyn BackendStorage,
+        out_grad: &dyn BackendStorage,
+        eps: f32,
+        x_shape: &Shape,
+        w_shape: &Shape,
+    ) -> Result<(
+        Box<dyn BackendStorage>,
+        Box<dyn BackendStorage>,
+        Box<dyn ComputeHandle>,
+    )> {
+        (**self).rmsnorm_backward(x, weight, out_grad, eps, x_shape, w_shape)
+    }
+
+    fn rope_backward(
+        &self,
+        out_grad: &dyn BackendStorage,
+        cos: &dyn BackendStorage,
+        sin: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).rope_backward(out_grad, cos, sin, out_shape)
+    }
+
+    fn softmax_backward(
+        &self,
+        out_grad: &dyn BackendStorage,
+        softmax_out: &dyn BackendStorage,
+        out_shape: &Shape,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).softmax_backward(out_grad, softmax_out, out_shape)
+    }
+
+    fn embedding_backward(
+        &self,
+        out_grad: &dyn BackendStorage,
+        token_ids: &[u32],
+        vocab_size: usize,
+        hidden_dim: usize,
+    ) -> Result<(Box<dyn BackendStorage>, Box<dyn ComputeHandle>)> {
+        (**self).embedding_backward(out_grad, token_ids, vocab_size, hidden_dim)
     }
 
     fn rms_norm(

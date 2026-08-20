@@ -5162,6 +5162,15 @@ pub fn vram_info(_ordinal: usize) -> Option<(u64, u64)> {
     None
 }
 
+/// WI-1: live compute utilization for `ordinal`.
+///
+/// Scope note (per WI-1): Metal has no cross-vendor utilization API. Returns
+/// `None` rather than fabricating a value from indirect signals — `null` on the
+/// wire is the honest answer.
+pub fn compute_utilization(_ordinal: usize) -> Option<u32> {
+    None
+}
+
 impl grim_format::convert::GpuDequant for MetalDevice {
     fn dequantize(
         &self,

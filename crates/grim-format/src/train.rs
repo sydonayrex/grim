@@ -35,13 +35,18 @@ pub const TRAIN_MAGIC: [u8; 8] = [0x47, 0x52, 0x49, 0x4d, 0x54, 0x52, 0x4e, 0x01
 ///
 /// The numeric set RDNA3/4 training targets (Dual-Precision MAC paper:
 /// FP8/FP4 rising in inference, FP16/FP32 still dominate training).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Bf16` and `Fp16` encode the param blob bytes in that format while
+/// optimizer moments remain f32 (sidecar header `dtypes` map disambiguates).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TrainFpFormat {
     Fp16 = 0,
     Fp32 = 1,
     Fp8E4M3 = 2,
     Fp8E5M2 = 3,
     Fp4 = 4,
+    Bf16 = 5,
+    Fp16Param = 6,
 }
 
 impl TrainFpFormat {
@@ -52,16 +57,21 @@ impl TrainFpFormat {
             2 => Some(Self::Fp8E4M3),
             3 => Some(Self::Fp8E5M2),
             4 => Some(Self::Fp4),
+            5 => Some(Self::Bf16),
+            6 => Some(Self::Fp16Param),
             _ => None,
         }
     }
     pub fn as_u8(self) -> u8 {
         self as u8
     }
+    /// Whether this format encodes 2-byte elements (param blobs).
+    pub fn is_half(self) -> bool {
+        matches!(self, Self::Bf16 | Self::Fp16 | Self::Fp16Param)
+    }
 }
 
 /// Convert raw bytes to f32 slice based on the fp_format.
-/// Only Fp32 is supported for bolt-on attach (the sidecar stores adapter weights as f32).
 fn bytes_to_f32s(data: &[u8], fmt: TrainFpFormat) -> Option<Vec<f32>> {
     match fmt {
         TrainFpFormat::Fp32 => {
@@ -74,7 +84,126 @@ fn bytes_to_f32s(data: &[u8], fmt: TrainFpFormat) -> Option<Vec<f32>> {
                     .collect(),
             )
         }
-        _ => None, // F16/F8/F4 conversion not yet supported for bolt-on attach
+        TrainFpFormat::Bf16 => {
+            if data.len() % 2 != 0 {
+                return None;
+            }
+            Some(
+                data.chunks_exact(2)
+                    .map(|c| {
+                        let bits = u32::from(c[0]) | (u32::from(c[1]) << 8);
+                        f32::from_bits(bits << 16)
+                    })
+                    .collect(),
+            )
+        }
+        TrainFpFormat::Fp16 | TrainFpFormat::Fp16Param => {
+            if data.len() % 2 != 0 {
+                return None;
+            }
+            Some(
+                data.chunks_exact(2)
+                    .map(|c| f16_to_f32_le(c))
+                    .collect(),
+            )
+        }
+        TrainFpFormat::Fp8E4M3 | TrainFpFormat::Fp8E5M2 | TrainFpFormat::Fp4 => None,
+    }
+}
+
+/// Round-to-nearest-even F32 -> little-endian BF16 bytes.
+pub fn f32_to_bf16_bytes(v: f32) -> [u8; 2] {
+    let bits = f32::to_bits(v);
+    let discard = (bits & 0xFFFF) as u32;
+    let mut bf16 = (bits >> 16) as u16;
+    if discard > 0x8000 || (discard == 0x8000 && (bf16 & 1) == 1) {
+        bf16 = bf16.wrapping_add(1);
+    }
+    bf16.to_le_bytes()
+}
+
+/// F32 -> little-endian IEEE F16 bytes (subnormals, Inf/NaN, overflow handled).
+pub fn f32_to_f16_bytes(v: f32) -> [u8; 2] {
+    let bits = f32::to_bits(v);
+    let sign = (bits >> 31) as u16;
+    let exp = ((bits >> 23) & 0xFF) as u32;
+    let mant = bits & 0x7FFFFF;
+
+    if exp == 0xFF {
+        // Inf / NaN
+        let result = sign << 15 | 0x7C00 | ((mant >> 13) as u16);
+        return result.to_le_bytes();
+    }
+
+    if exp == 0 {
+        // Zero / subnormal f32 -> zero f16
+        return (sign << 15).to_le_bytes();
+    }
+
+    let new_exp = exp as i32 - 127 + 15;
+
+    if new_exp <= 0 {
+        if new_exp < -10 {
+            return (sign << 15).to_le_bytes();
+        }
+        // Subnormal f16
+        let mant_shift = (-new_exp + 1) as u32;
+        let new_mant = (mant | 0x800000) >> mant_shift;
+        let result = sign << 15 | (new_mant >> 10) as u16;
+        return result.to_le_bytes();
+    }
+
+    if new_exp >= 31 {
+        return (sign << 15 | 0x7C00).to_le_bytes();
+    }
+
+    let new_mant = mant >> 13;
+    let result = (sign << 15) | ((new_exp as u16) << 10) | (new_mant as u16);
+    result.to_le_bytes()
+}
+
+/// Little-endian F16 (IEEE half) byte pair to F32.
+fn f16_to_f32_le(bytes: &[u8]) -> f32 {
+    let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let sign = (bits >> 15) as u32;
+    let exp = ((bits >> 10) & 0x1F) as u32;
+    let mant = (bits & 0x3FF) as u32;
+    if exp == 0 {
+        let value = (mant as f32) * 2f32.powi(-24);
+        if sign != 0 { -value } else { value }
+    } else if exp == 31 {
+        f32::from_bits((sign << 31) | 0x7F80_0000 | (mant << 13))
+    } else {
+        f32::from_bits((sign << 31) | ((exp + 112) << 23) | (mant << 13))
+    }
+}
+
+/// Encode a slice of f32 values into raw little-endian bytes in `fmt`.
+///
+/// Fp32 emits 4-byte words; Bf16/Fp16 emit 2-byte words. FP8/FP4 formats are
+/// not encodable here and fall back to Fp32 (callers must not request them).
+pub fn encode_f32s_as(vals: &[f32], fmt: TrainFpFormat) -> Vec<u8> {
+    match fmt {
+        TrainFpFormat::Bf16 => vals.iter().flat_map(|v| f32_to_bf16_bytes(*v)).collect(),
+        TrainFpFormat::Fp16 | TrainFpFormat::Fp16Param => {
+            vals.iter().flat_map(|v| f32_to_f16_bytes(*v)).collect()
+        }
+        _ => vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    }
+}
+
+/// Decode raw little-endian bytes in `fmt` back to f32 values.
+pub fn decode_f32s_from(data: &[u8], fmt: TrainFpFormat) -> Option<Vec<f32>> {
+    bytes_to_f32s(data, fmt)
+}
+
+/// Map a tensor `DType` to the matching sidecar `TrainFpFormat`.
+pub fn train_format_for_dtype(dt: &grim_tensor::DType) -> TrainFpFormat {
+    use grim_tensor::ArithType;
+    match dt.arith {
+        ArithType::BF16 => TrainFpFormat::Bf16,
+        ArithType::F16 => TrainFpFormat::Fp16Param,
+        _ => TrainFpFormat::Fp32,
     }
 }
 
@@ -163,6 +292,9 @@ pub struct TrainState {
     pub step: u64,
     /// Numeric format the training-state tensors are encoded in.
     pub fp_format: TrainFpFormat,
+    /// Per-blob dtype map. Disambiguates param blobs from optimizer moment blobs
+    /// when `fp_format` is a half-precision type (bf16/fp16) and moments stay f32.
+    pub dtypes: HashMap<String, TrainFpFormat>,
     /// Named training-state blobs keyed by logical slot name
     /// (e.g. `lora_a`, `lora_b`, `opt_m`, `opt_v`, `error_matrix`).
     pub blobs: HashMap<String, TrainBlob>,
@@ -173,6 +305,7 @@ impl Default for TrainState {
         Self {
             step: 0,
             fp_format: TrainFpFormat::Fp32,
+            dtypes: HashMap::new(),
             blobs: HashMap::new(),
         }
     }
@@ -222,9 +355,12 @@ impl TrainState {
         buf.write_all(&TRAIN_MAGIC)
             .map_err(|e| Error::Backend(format!("train magic write failed: {e}")))?;
 
+        let dtypes_tags: std::collections::BTreeMap<&str, u8> =
+            self.dtypes.iter().map(|(k, v)| (k.as_str(), v.as_u8())).collect();
         let header = serde_json::json!({
             "step": self.step,
             "fp_format": self.fp_format.as_u8(),
+            "dtypes": dtypes_tags,
             "blobs": self.blobs.keys().collect::<Vec<_>>(),
         });
         let header_bytes = serde_json::to_vec(&header)
@@ -288,6 +424,16 @@ impl TrainState {
             .and_then(|v| v.as_u64())
             .and_then(|v| TrainFpFormat::from_u8(v as u8))
             .unwrap_or(TrainFpFormat::Fp32);
+        let dtypes = header
+            .get("dtypes")
+            .and_then(|v| v.as_object())
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, v)| {
+                let tag = v.as_u64()?;
+                TrainFpFormat::from_u8(tag as u8).map(|fmt| (k.clone(), fmt))
+            })
+            .collect();
 
         let mut blobs = HashMap::new();
         // The blob stream ends at EOF; read until exhausted.
@@ -314,6 +460,7 @@ impl TrainState {
         Ok(Some(Self {
             step,
             fp_format,
+            dtypes,
             blobs,
         }))
     }
@@ -328,6 +475,7 @@ mod tests {
         let mut state = TrainState {
             step: 42,
             fp_format: TrainFpFormat::Fp8E4M3,
+            dtypes: HashMap::new(),
             blobs: HashMap::new(),
         };
         state.add_blob("lora_a", vec![64, 128], (0u8..=127).collect());
@@ -365,6 +513,7 @@ mod tests {
             let state = TrainState {
                 step,
                 fp_format: TrainFpFormat::Fp32,
+                dtypes: HashMap::new(),
                 blobs: HashMap::new(),
             };
             let dir = tempfile::tempdir().unwrap();
@@ -391,10 +540,68 @@ mod tests {
             TrainFpFormat::Fp8E4M3,
             TrainFpFormat::Fp8E5M2,
             TrainFpFormat::Fp4,
+            TrainFpFormat::Bf16,
+            TrainFpFormat::Fp16Param,
         ] {
             assert_eq!(TrainFpFormat::from_u8(fmt.as_u8()), Some(fmt));
         }
         assert_eq!(TrainFpFormat::from_u8(99), None);
+    }
+
+    #[test]
+    fn bf16_sidecar_round_trips() {
+        let vals: Vec<f32> = vec![0.0, -0.0, 1.0, -1.0, 0.5, 3.14159, -2.71828, 1e10, 1e-10];
+        let bytes = encode_f32s_as(&vals, TrainFpFormat::Bf16);
+        assert_eq!(bytes.len(), vals.len() * 2);
+        let decoded = decode_f32s_from(&bytes, TrainFpFormat::Bf16).expect("decode");
+        for (orig, dec) in vals.iter().zip(decoded.iter()) {
+            let rel = (orig - dec).abs() / orig.abs().max(1e-30);
+            assert!(rel < 1e-2, "bf16 round-trip: {orig} -> {dec}");
+        }
+
+        // Sidecar-level: dtypes map + fp_format survive write/read.
+        let mut state = TrainState {
+            step: 7,
+            fp_format: TrainFpFormat::Bf16,
+            dtypes: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+        state
+            .dtypes
+            .insert("param_0_0_a".to_string(), TrainFpFormat::Bf16);
+        state.add_blob("param_0_0_a", vec![9], bytes.clone());
+        state.add_blob(
+            "opt_m_0_0_a",
+            vec![9],
+            vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bf16.grim.train");
+        state.write(&path).unwrap();
+        let restored = TrainState::read(&path).unwrap().expect("should read");
+        assert_eq!(restored.fp_format, TrainFpFormat::Bf16);
+        assert_eq!(
+            restored.dtypes.get("param_0_0_a"),
+            Some(&TrainFpFormat::Bf16)
+        );
+        assert_eq!(restored.blobs["param_0_0_a"].data, bytes);
+    }
+
+    #[test]
+    fn fp16_sidecar_round_trips() {
+        let vals: Vec<f32> = vec![0.0, 1.0, -1.0, 0.5, 65504.0, -65504.0, 1e-4, 42.0];
+        let bytes = encode_f32s_as(&vals, TrainFpFormat::Fp16);
+        assert_eq!(bytes.len(), vals.len() * 2);
+        let decoded = decode_f32s_from(&bytes, TrainFpFormat::Fp16).expect("decode");
+        for (orig, dec) in vals.iter().zip(decoded.iter()) {
+            let rel = (orig - dec).abs() / orig.abs().max(1e-30);
+            assert!(rel < 1e-3, "fp16 round-trip: {orig} -> {dec}");
+        }
+        // Saturation beyond f16 max clamps to inf, not garbage.
+        let over = encode_f32s_as(&[1e30], TrainFpFormat::Fp16);
+        let dec = decode_f32s_from(&over, TrainFpFormat::Fp16).unwrap();
+        assert!(dec[0].is_infinite());
     }
 
     /// Verifies `TrainState::read` rejects invalid magic bytes.

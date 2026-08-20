@@ -65,6 +65,7 @@ pub async fn cmd_cp(src: &str, dst: &str) -> Result<()> {
             sha256: String::new(),
             pulled_at: chrono::Utc::now().to_rfc3339(),
             source: "local-copy".to_string(),
+            preferred_dtype: String::new(),
         };
         entry.save(&dst_path)?;
     }

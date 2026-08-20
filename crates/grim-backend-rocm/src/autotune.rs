@@ -41,8 +41,9 @@ pub struct TuneKey {
 }
 
 /// Broad category of tensor dimension shapes (e.g., Decode vs Prefill vs TLOLog).
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum ShapeClass {
+    #[default]
     Decode,  // m == 1: per-token GEMM
     Prefill, // m > 1: large-batch GEMM
     TLOLog,  // lm_head / logit-projection ONLY — tagged by op-identity, NOT by m
@@ -335,7 +336,172 @@ impl Default for AutotuneConfig {
     }
 }
 
-/// Cache key for MoE autotuning launch parameters.
+/// Software-wave occupancy tuning field set for one launch config.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OccupancyTuning {
+    #[serde(default = "OccupancyTuning::default_waves_per_cu")]
+    pub waves_per_cu: u32,
+    #[serde(default = "OccupancyTuning::default_lane_fill_factor")]
+    pub lane_fill_factor: f32,
+    #[serde(default = "OccupancyTuning::default_prefetch_hint")]
+    pub compiler_prefetch_hint: i8,
+    #[serde(default)]
+    pub tuned: bool,
+}
+
+impl OccupancyTuning {
+    fn default_waves_per_cu() -> u32 {
+        2
+    }
+    fn default_lane_fill_factor() -> f32 {
+        1.0
+    }
+    fn default_prefetch_hint() -> i8 {
+        0
+    }
+}
+
+impl Default for OccupancyTuning {
+    fn default() -> Self {
+        Self {
+            waves_per_cu: Self::default_waves_per_cu(),
+            lane_fill_factor: Self::default_lane_fill_factor(),
+            compiler_prefetch_hint: Self::default_prefetch_hint(),
+            tuned: false,
+        }
+    }
+}
+
+/// Pre-tuned occupancy block-size band choices (gfx103x/110x/120x, no
+/// per-shape Ncu sweep). These are the default occupant bands for
+/// `TuningMode::Preset` [salamander.md §3.6 block-size presets].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlockSizeBand {
+    /// Conservative: 64 threads / 1 WMMA warp fragment — safest LDS/reg
+    /// pressure, lowest occupancy ceiling. Good for wide K.
+    Band64,
+    /// 128 threads / 2 WMMA fragments — common sweet spot on RDNA3 for
+    /// medium M/N.
+    Band128,
+    /// 256 threads / 4 WMMA fragments — highest occupancy on RDNA3 where
+    /// LDS budget allows; best for narrow K with high arithmetic intensity.
+    Band256,
+}
+
+impl BlockSizeBand {
+    /// Default occupancy fields for this band: (waves_per_cu_target,
+    /// max_registers, vector_width, lds_double_buffer).
+    pub fn occupancy_fields(&self) -> (u32, u32, u32, bool) {
+        match self {
+            Self::Band64 => (2, 128, 8, false),
+            Self::Band128 => (4, 64, 8, true),
+            Self::Band256 => (10, 32, 8, true),
+        }
+    }
+}
+
+/// Which autotuning mode governs launch-config selection.
+/// [salamander.md §3.6 tuning modes: Baseline, Preset(BlockSizeBand), Tuned,
+/// Ncu]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TuningMode {
+    /// Default: baseline grid/block from device count; no tuned configs.
+    Baseline,
+    /// Pick launch configs from the `BlockSizeBand` uniforms; no per-shape
+    /// search. Fast, conservative, and reproducible across machines.
+    Preset(BlockSizeBand),
+    /// Enhanced baseline: run a short tiled search over tile widths on the
+    /// device at first use, then reuse. Not Ncu-heavy — no launch-overhead
+    /// sweep or executable-analyzer Ncu.
+    Tuned,
+    /// Ncu-driven tuner (feature-gated to the `ncu` Cargo feature).
+    /// Requires `nvcc/ncu` at runtime; heavy, slow, and not shipped by
+    /// default. Only valid on devices once `ncu` has produced a JSON
+    /// profile.
+    #[cfg(feature = "ncu")]
+    Ncu,
+}
+
+impl Default for TuningMode {
+    fn default() -> Self {
+        Self::Preset(BlockSizeBand::Band128)
+    }
+}
+
+/// Tuning-mode + per-slot occupancy tuning + tuning solution storage.
+/// [salamander.md §3.6: tuning modes, block-size presets, occupancy fields,
+/// tuning solution storage]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutotunerConfig {
+    /// Which autotuning mode governs launch-config selection for this tuner.
+    #[serde(default)]
+    pub tuning_mode: TuningMode,
+    /// Per-slot occupancy tuning state. Stored compactly so the whole config
+    /// can round-trip through the device's JSON tuning store.
+    #[serde(default)]
+    pub occupancy: OccupancyTuning,
+    /// Tuning solution snapshot keyed by `(kernel, arch)`. Stored separately
+    /// from the in-memory `Autotuner` (which is keyed by `KernelKey` + slot).
+    /// This is the on-disk tuning store that `store_tuning_solution`/`
+    /// load_tuning_solution` write/read.
+    #[serde(default)]
+    pub tuning_solutions: Vec<TuningSolution>,
+}
+
+impl Default for AutotunerConfig {
+    fn default() -> Self {
+        Self {
+            tuning_mode: TuningMode::default(),
+            occupancy: OccupancyTuning::default(),
+            tuning_solutions: Vec::new(),
+        }
+    }
+}
+
+/// A single stored tuning solution for one `(kernel, arch)` slot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuningSolution {
+    /// Kernel entry name (e.g. `grim_qkv_attention`, `grim_rmsnorm`).
+    pub kernel: String,
+    /// GPU arch (e.g. `gfx1100`). The arch field must match the device's
+    /// current arch before the solution is applied — mismatched solutions
+    /// are never used (safety gate).
+    pub arch: String,
+    /// Slot selector: shape class + representative shape that this solution
+    /// was tuned for. Used to match a solve to the right launches.
+    pub slot: TuningSlot,
+    /// The launch config produced by tuning. For preset/tuned modes this
+    /// is the block-dim/occupancy fields the kernel launcher reads; for the
+    /// `Ncu` mode it is the Ncu-derived config (feature-gated, unavailable
+    /// unless `ncu` feature is on).
+    #[serde(default)]
+    pub config: AutotuneConfig,
+}
+
+/// Which shape/slot a tuning solution was produced for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuningSlot {
+    #[serde(default)]
+    pub shape_class: ShapeClass,
+    #[serde(default)]
+    pub m: usize,
+    #[serde(default)]
+    pub n: usize,
+    #[serde(default)]
+    pub k: usize,
+}
+
+impl Default for TuningSlot {
+    fn default() -> Self {
+        Self {
+            shape_class: ShapeClass::Prefill,
+            m: 128,
+            n: 128,
+            k: 128,
+        }
+    }
+}
+
 ///
 /// Encapsulates model geometry (`hidden`, `inter`, `num_experts`, `top_k`)
 /// and coarse `skew_bucket` (quantized routing skew 0..7) to index MoE tuned configs.

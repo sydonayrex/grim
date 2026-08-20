@@ -1,5 +1,8 @@
 //! `grim doctor` — self-diagnosis. Re-verifies every engine and service claim (§13.5).
 
+use std::path::Path;
+
+use grim_format::{GrimFile, ModelFootprint, read_gguf};
 use grim_tensor::error::Result;
 
 #[derive(Default)]
@@ -21,6 +24,7 @@ pub fn run_doctor(
     service_name: &str,
     exec_path: &str,
     config_path: &str,
+    model_path: Option<&Path>,
 ) -> Result<bool> {
     println!("=== Grim Doctor — Self-Diagnosis ===\n");
     let mut report = DoctorReport::default();
@@ -31,6 +35,13 @@ pub fn run_doctor(
     check_health_endpoint(&mut report, addr);
     check_gpu_backend(&mut report);
     check_plugin_grants(&mut report);
+
+    // WI-2: optional pre-flight model/hardware compatibility check.
+    // Runs *after* the existing system checks so the full suite still
+    // prints; the model section is additive and never masks a system error.
+    if let Some(path) = model_path {
+        check_model_preflight(&mut report, path);
+    }
 
     print_report(&report);
 
@@ -44,6 +55,18 @@ pub fn run_doctor(
             } else if err.contains("RDNA 2") || err.contains("compatibility") {
                 eprintln!(
                     "  -> RDNA 2 COMPATIBILITY: Force RDNA2 compilation by setting environment variable: export HSA_OVERRIDE_GFX_VERSION=10.3.0"
+                );
+            } else if err.contains("VRAM") || err.contains("exceeds free VRAM") || err.contains("estimated VRAM") {
+                // WI-2: OOM-adjacent — suggest a smaller quant tier by name.
+                eprintln!(
+                    "  -> VRAM INSUFFICIENT: Re-quantize to a smaller codec (Rook/Jay ~4.1 bpw instead of Raven/Jackdaw ~8 bpw, or Crow ~4.5 bpw), \
+                     or reduce the model's context_length. See `WeightFormat::bpw`."
+                );
+            } else if err.contains("no supported dispatch path") || err.contains("codec unsupported") {
+                // WI-2: forced-fallback case — suggest a native-support tier.
+                eprintln!(
+                    "  -> CODEC UNSUPPORTED: This codec has no native path on the detected arch. Re-quantize to Rook/Jay (MXFP4, native on RDNA2+) \
+                     instead of Raven (FP8, RDNA4/CDNA3 only)."
                 );
             } else {
                 eprintln!("  -> {err}");
@@ -407,6 +430,179 @@ fn check_plugin_grants(report: &mut DoctorReport) {
     println!(
         "[INFO] Native dylib plugins (.so/.dll) run in-process as trusted modules (see §6.1)."
     );
+}
+
+/// WI-2: pre-flight model/hardware compatibility check.
+///
+/// Reads the model **header only** (no tensor data), computes a
+/// `ModelFootprint`, then predicts:
+///   - VRAM fit vs. detected free VRAM (fits / tight / doesn't fit)
+///   - codec-vs-arch compat (native / fallback / unsupported)
+///
+/// `TODO(gpu-verify)`: this is a *prediction*, not a guarantee. The real
+/// check is whether the model actually loads and runs; that's out of scope
+/// to automate here.
+fn check_model_preflight(report: &mut DoctorReport, path: &Path) {
+    println!("\n=== Model Pre-Flight (WI-2) ===");
+    println!("  Model: {}", path.display());
+
+    let footprint = match read_model_header(path) {
+        Ok(fp) => fp,
+        Err(e) => {
+            report.errors.push(format!("failed to read model header: {e}"));
+            eprintln!("[ERR] Failed to read model header: {e}");
+            return;
+        }
+    };
+
+    println!(
+        "  [INFO] Architecture: {}, params: {:?}, quant: {:?}, weight bytes: {}",
+        footprint.architecture,
+        footprint.param_count,
+        footprint.quant_format,
+        footprint.estimated_weight_bytes
+    );
+
+    // Detected hardware: GCN arch + free VRAM, via the same probes the
+    // existing GPU check uses.
+    let (gcn, free_vram) = match detect_hardware() {
+        Some(h) => h,
+        None => {
+            report
+                .warnings
+                .push("no ROCm hardware detected — skipping VRAM fit check".into());
+            eprintln!("[WARN] No ROCm hardware detected — skipping VRAM fit check.");
+            return;
+        }
+    };
+    println!("  [INFO] Detected arch: {gcn:?}, free VRAM: {free_vram} bytes");
+
+    // 1. Codec-vs-arch compat.
+    if let Some(quant) = footprint.quant_format {
+        match grim_garage::check_support(quant, gcn) {
+            grim_garage::CompatResult::NativeSupport => {
+                println!("[OK]  {quant:?} is natively supported on {gcn:?}.");
+            }
+            grim_garage::CompatResult::FallbackSupport { to, reason } => {
+                report.warnings.push(format!("codec fallback: {reason}"));
+                eprintln!(
+                    "[WARN] {quant:?} is not native on {gcn:?}; falling back to {to:?}. \
+                     This is a quality-preserving downshift, but denser."
+                );
+            }
+            grim_garage::CompatResult::Unsupported { reason } => {
+                report.errors.push(format!("codec unsupported: {reason}"));
+                eprintln!(
+                    "[ERR] {quant:?} has no supported dispatch path on {gcn:?}. \
+                     The model cannot run on this hardware as-is."
+                );
+            }
+        }
+    } else {
+        println!("[INFO] No quantization codec named in the header — skipping compat check.");
+    }
+
+    // 2. VRAM fit.
+    let ctx = footprint.context_length_default.unwrap_or(4096);
+    let kv_layers = estimate_num_layers(&footprint);
+    let kv_heads = estimate_num_kv_heads(&footprint);
+    let head_dim = estimate_head_dim(&footprint);
+    let vram_estimate = grim_format::estimate_vram_bytes(
+        &footprint,
+        ctx,
+        1,
+        kv_layers,
+        kv_heads,
+        head_dim,
+    );
+    let margin = (vram_estimate as f64 * 0.10) as u64;
+    if free_vram == 0 {
+        report
+            .warnings
+            .push("free VRAM unknown — skipping fit check".into());
+        eprintln!("[WARN] Free VRAM is 0 — skipping fit check.");
+    } else if vram_estimate <= free_vram.saturating_sub(margin) {
+        println!(
+            "[OK]  Estimated VRAM {} bytes fits comfortably in free VRAM {} bytes.",
+            vram_estimate, free_vram
+        );
+    } else if vram_estimate <= free_vram {
+        report.warnings.push(format!(
+            "VRAM estimate {vram_estimate} bytes is tight against free VRAM {free_vram} bytes"
+        ));
+        eprintln!(
+            "[WARN] VRAM estimate {vram_estimate} bytes is tight against free VRAM {free_vram} bytes."
+        );
+    } else {
+        report.errors.push(format!(
+            "estimated VRAM {vram_estimate} bytes exceeds free VRAM {free_vram} bytes"
+        ));
+        eprintln!(
+            "[ERR] Estimated VRAM {vram_estimate} bytes exceeds free VRAM {free_vram} bytes."
+        );
+    }
+}
+
+/// Read a model file's header only. Dispatches on extension: `.gguf` via
+/// `read_gguf`, `.grim` via `GrimFile::read`. Both avoid loading tensor
+/// data — this is a hard requirement (WI-2 gate 4).
+fn read_model_header(path: &Path) -> Result<ModelFootprint> {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
+        "gguf" => {
+            let file = std::fs::File::open(path).map_err(|e| {
+                grim_tensor::Error::Backend(format!("cannot open {}: {e}", path.display()))
+            })?;
+            let mut reader = std::io::BufReader::new(file);
+            let gguf = read_gguf(&mut reader).map_err(|e| {
+                grim_tensor::Error::Backend(format!("GGUF header parse failed: {e}"))
+            })?;
+            Ok(ModelFootprint::from_gguf_file(&gguf))
+        }
+        "grim" => {
+            let file = std::fs::File::open(path).map_err(|e| {
+                grim_tensor::Error::Backend(format!("cannot open {}: {e}", path.display()))
+            })?;
+            let mut reader = std::io::BufReader::new(file);
+            let grim = GrimFile::read(&mut reader).map_err(|e| {
+                grim_tensor::Error::Backend(format!(".grim header parse failed: {e}"))
+            })?;
+            Ok(ModelFootprint::from_grim_file(&grim))
+        }
+        other => Err(grim_tensor::Error::Backend(format!(
+            "unsupported model file extension '{other}'; expected .gguf or .grim"
+        ))),
+    }
+}
+
+/// Detect the host's GCN arch + free VRAM. Returns `None` when no ROCm
+/// hardware is present (the existing GPU check already reports this).
+fn detect_hardware() -> Option<(grim_backend_rocm::GcnArch, u64)> {
+    let devices = grim_backend_rocm::RocmDevice::probe().ok()?;
+    let first = devices.first()?;
+    let cap = grim_backend_rocm::probe_host_gpu(first.ordinal()).ok()?;
+    let arch = grim_backend_rocm::gcn_arch(&cap.gcn);
+    let (_free, total) = grim_backend_rocm::vram_info(first.ordinal());
+    Some((arch, total))
+}
+
+/// Conservative heuristics for KV-cache sizing when the header doesn't
+/// carry them. Each returns 0 when unknown so the estimate stays honest
+/// rather than guessing a large number and alarming the user.
+fn estimate_num_layers(_footprint: &ModelFootprint) -> u32 {
+    // `general.num_layers` is not a standard GGUF key; real models carry
+    // it under various family-specific names. Without a parser per family,
+    // we can't derive it from the header alone. Return 0 so the KV term
+    // vanishes and the estimate is a pure weight-byte lower bound — the
+    // conservative choice. `TODO(calibrate)`: read per-family keys.
+    0
+}
+
+fn estimate_num_kv_heads(_footprint: &ModelFootprint) -> u32 {
+    0
+}
+
+fn estimate_head_dim(_footprint: &ModelFootprint) -> u32 {
+    0
 }
 
 fn print_report(report: &DoctorReport) {

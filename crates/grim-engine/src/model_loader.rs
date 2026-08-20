@@ -15,12 +15,18 @@ use grim_models_mamba::{
     Rwkv6Config, Rwkv7Config, RwkvConfig,
 };
 use grim_models_transformer::{
-    Bloom, BloomConfig, ChameleonConfig, CommandRConfig, DeepSeek, DeepSeekConfig, DeltaNetBase,
-    DeltaNetBaseConfig, Falcon, FalconConfig, FalconH1Config, FalconH1Model, Gemma, GemmaConfig,
-    Gpt2, Gpt2Config, Laguna, LagunaConfig, Lfm2, Lfm2Config, Llama, LlamaConfig, Mellum,
-    MellumConfig, MiniCpmConfig, MiniCpmModel, Phi2, PhiConfig, Qwen, Qwen3Moe, Qwen3MoeConfig,
-    Qwen35, Qwen35Config, Qwen35Moe, Qwen35MoeConfig, QwenConfig, SmolLm2, SmolLm2Config,
-    SolarOpen2, SolarOpen2Config, T5, T5Config,
+    Bloom, BloomConfig, Chameleon, ChameleonConfig, CogVlm, CogVlmConfig, CogVlmVisionConfig,
+    CommandRConfig, DeepSeek, DeepSeek2, DeepSeek2Config, DeepSeek32, DeepSeek32Config, DeepSeek4,
+    DeepSeek4Config, DeepSeekConfig, DeltaNetBase, DeltaNetBaseConfig, DiffusionGemma,
+    DiffusionGemmaConfig, Falcon, FalconConfig, FalconH1Config, FalconH1Model, Gemma, Gemma3n,
+    Gemma3nConfig, GemmaConfig, Glm52, Glm52Config, Gpt2, Gpt2Config, HunyuanVl, HunyuanVlConfig,
+    HunyuanVlVisionConfig, InklingSmall, InklingSmallConfig, InternS2Mobius, InternS2MobiusConfig,
+    KimiK3, KimiK3Config, Laguna, LagunaConfig, Lfm2, Lfm2Config, Llama, LlamaConfig, Mellum,
+    MellumConfig, MiniCpmConfig, MiniCpmModel, MiniMaxM3, MiniMaxM3Config, Phi2, PhiConfig, Qwen,
+    Qwen2Vl, Qwen2VlConfig, Qwen2VlVisionConfig, Qwen3Moe, Qwen3MoeConfig, Qwen3Vl, Qwen3VlConfig,
+    Qwen3VlVisionConfig, Qwen35, Qwen35Config, Qwen35Moe, Qwen35MoeConfig, QwenConfig, SmolLm2,
+    SmolLm2Config, SolarOpen2, SolarOpen2Config, T5, T5Config, WavTokenizerDec,
+    WavTokenizerDecConfig,
 };
 use grim_models_vision::{Bert, BertConfig, ModernBertConfig, NomicBertConfig, T5EncoderConfig};
 use grim_nn::{TensorParallelConfig, WeightSource};
@@ -709,9 +715,12 @@ fn load_model_from_config(
                 head_dim,
                 num_layers,
                 intermediate_size,
-                rms_norm_eps,
+                layer_norm_epsilon: rms_norm_eps,
                 rope_theta,
                 max_seq_len,
+                parallel_attn: true,
+                new_decoder_architecture: true,
+                multi_query: true,
             };
             eprintln!("[grim] Loading Falcon model with config: {:?}", falcon_cfg);
             let m = Falcon::load_tp(device.clone(), &ws, falcon_cfg, tp)?;
@@ -1331,10 +1340,7 @@ fn load_model_from_config(
             let m = Gemma::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::DeepSeek
-        | ModelArchitecture::DeepSeek2
-        | ModelArchitecture::DeepSeek32
-        | ModelArchitecture::DeepSeek4 => {
+        ModelArchitecture::DeepSeek => {
             let cfg = DeepSeekConfig {
                 vocab_size,
                 hidden_size,
@@ -1346,6 +1352,90 @@ fn load_model_from_config(
                 kv_lora_rank: num_kv_heads * 4,
             };
             let m = DeepSeek::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::DeepSeek2 => {
+            let cfg = DeepSeek2Config {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                kv_lora_rank: 512,
+                q_lora_rank: None,
+                qk_nope_head_dim: 128,
+                qk_rope_head_dim: 64,
+                v_head_dim: 128,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+                moe_intermediate_size,
+                n_routed_experts: 64,
+                n_shared_experts: 2,
+                num_experts_per_tok: 6,
+                first_k_dense_replace: 1,
+                routed_scaling_factor: 1.0,
+            };
+            let m = DeepSeek2::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::DeepSeek32 => {
+            let cfg = DeepSeek32Config {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                kv_lora_rank: 512,
+                q_lora_rank: Some(1536),
+                qk_nope_head_dim: 128,
+                qk_rope_head_dim: 64,
+                v_head_dim: 128,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+                moe_intermediate_size,
+                n_routed_experts: 256,
+                n_shared_experts: 1,
+                num_experts_per_tok: 8,
+                first_k_dense_replace: 1,
+                routed_scaling_factor: 2.5,
+            };
+            let m = DeepSeek32::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::DeepSeek4 => {
+            let cfg = DeepSeek4Config {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                kv_lora_rank: 512,
+                q_lora_rank: Some(1024),
+                qk_nope_head_dim: 448,
+                qk_rope_head_dim: 64,
+                v_head_dim: 512,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+                moe_intermediate_size,
+                n_routed_experts: 256,
+                n_shared_experts: 1,
+                num_experts_per_tok: 6,
+                first_k_dense_replace: 3,
+                routed_scaling_factor: 2.5,
+                hc_mult: 4,
+                sqrtsoftplus_moe: true,
+                compressor_indexer_enabled: true,
+            };
+            let m = DeepSeek4::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::CommandR => {
@@ -1395,13 +1485,36 @@ fn load_model_from_config(
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
-                swin_norm: false,
+                swin_norm: true,
             };
             eprintln!(
                 "[grim] Loading Chameleon model with config: {:?}",
                 chameleon_cfg
             );
-            let llama_cfg = LlamaConfig {
+            let m = Chameleon::load_tp(device.clone(), &ws, chameleon_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::DeltaNetBase => {
+            let delta_cfg = DeltaNetBaseConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                chunk_size: 64,
+                rms_norm_eps,
+                max_seq_len,
+            };
+            eprintln!(
+                "[grim] Loading DeltaNetBase model with config: {:?}",
+                delta_cfg
+            );
+            let m = DeltaNetBase::load_tp(device.clone(), &ws, delta_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::CogVlm => {
+            let cog_cfg = CogVlmConfig {
                 vocab_size,
                 hidden_size,
                 num_heads,
@@ -1412,11 +1525,257 @@ fn load_model_from_config(
                 rms_norm_eps,
                 rope_theta,
                 max_seq_len,
-
-                partial_rotary_factor: 1.0,
-                yarn: None,
+                vision_config: CogVlmVisionConfig {
+                    hidden_size: 1024,
+                    image_size: 490,
+                    patch_size: 14,
+                    num_heads: 16,
+                    num_layers: 24,
+                    in_channels: 3,
+                    out_hidden_size: hidden_size,
+                },
             };
-            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            let m = CogVlm::load_tp(device.clone(), &ws, cog_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Gemma3n => {
+            let gemma_cfg = Gemma3nConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+                sliding_window_size: 1024,
+                query_pre_attn_scalar: 256.0,
+            };
+            let m = Gemma3n::load_tp(device.clone(), &ws, gemma_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::HunyuanVl => {
+            let hy_cfg = HunyuanVlConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+                mrope_section: [2, 2, 2, 2],
+                image_token_id: 5,
+                im_start_id: 120118,
+                im_end_id: 120119,
+                im_newline_id: 120121,
+                vision_config: HunyuanVlVisionConfig {
+                    hidden_size: 64,
+                    num_attention_heads: 4,
+                    num_key_value_heads: 4,
+                    num_hidden_layers: 2,
+                    patch_size: 16,
+                    num_channels: 3,
+                    intermediate_size: 128,
+                    out_hidden_size: 64,
+                },
+            };
+            let m = HunyuanVl::load_tp(device.clone(), &ws, hy_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Qwen2Vl => {
+            let qv_cfg = Qwen2VlConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+                mrope_section: [16, 24, 24],
+                vision_start_token_id: 151652,
+                vision_end_token_id: 151653,
+                vision_token_id: 151654,
+                image_token_id: 151655,
+                video_token_id: 151656,
+                vision_config: Qwen2VlVisionConfig {
+                    depth: 32,
+                    hidden_size: 1280,
+                    num_heads: 16,
+                    patch_size: 14,
+                    spatial_merge_size: 2,
+                    temporal_patch_size: 2,
+                    in_channels: 3,
+                    out_hidden_size: hidden_size,
+                },
+            };
+            let m = Qwen2Vl::load_tp(device.clone(), &ws, qv_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Qwen3Vl => {
+            let qv_cfg = Qwen3VlConfig {
+                vocab_size,
+                hidden_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_seq_len,
+                mrope_section: [24, 20, 20],
+                deepstack_visual_indexes: vec![8, 16, 24],
+                vision_start_token_id: 151652,
+                vision_end_token_id: 151653,
+                vision_token_id: 151654,
+                image_token_id: 151655,
+                video_token_id: 151656,
+                vision_config: Qwen3VlVisionConfig {
+                    depth: 27,
+                    hidden_size: 1152,
+                    num_heads: 16,
+                    patch_size: 16,
+                    spatial_merge_size: 2,
+                    temporal_patch_size: 2,
+                    in_channels: 3,
+                    out_hidden_size: hidden_size,
+                    deepstack_visual_indexes: vec![8, 16, 24],
+                },
+            };
+            let m = Qwen3Vl::load_tp(device.clone(), &ws, qv_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::WavTokenizerDec => {
+            let wav_cfg = WavTokenizerDecConfig {
+                latent_dim: 512,
+                backbone_dim: 768,
+                backbone_num_blocks: 12,
+                backbone_intermediate_dim: 2304,
+                backbone_kernel_size: 7,
+                n_fft: 1280,
+                hop_length: 320,
+                head_dim: 641,
+                codebook_size: 4096,
+                codebook_dim: 512,
+                num_bandwidths: 4,
+                sample_rate: 24000,
+            };
+            let m = WavTokenizerDec::load_tp(device.clone(), &ws, wav_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::InternS2Mobius => {
+            let cfg = InternS2MobiusConfig {
+                vocab_size,
+                hidden_size,
+                num_attention_heads: num_heads,
+                num_key_value_heads: num_kv_heads,
+                head_dim,
+                num_hidden_layers: num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_position_embeddings: max_seq_len,
+            };
+            let m = InternS2Mobius::load_tp(device.clone(), &ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::KimiK3 => {
+            let cfg = KimiK3Config {
+                vocab_size,
+                hidden_size,
+                num_attention_heads: num_heads,
+                num_key_value_heads: num_kv_heads,
+                head_dim,
+                num_hidden_layers: num_layers,
+                q_lora_rank: num_heads,
+                kv_lora_rank: num_kv_heads * 4,
+                qk_nope_head_dim: 128,
+                qk_rope_head_dim: 64,
+                v_head_dim: 128,
+                num_experts: 64,
+                num_experts_per_tok: 6,
+                intermediate_size,
+                routed_scaling_factor,
+                rms_norm_eps,
+                rope_theta,
+            };
+            let m = KimiK3::load_tp(device.clone(), &ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::InklingSmall => {
+            let cfg = InklingSmallConfig {
+                vocab_size,
+                hidden_size,
+                num_attention_heads: num_heads,
+                num_key_value_heads: num_kv_heads,
+                head_dim,
+                num_hidden_layers: num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_position_embeddings: max_seq_len,
+            };
+            let m = InklingSmall::load_tp(device.clone(), &ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Glm52 => {
+            let cfg = Glm52Config {
+                vocab_size,
+                hidden_size,
+                num_attention_heads: num_heads,
+                num_key_value_heads: num_kv_heads,
+                head_dim,
+                num_hidden_layers: num_layers,
+                intermediate_size,
+                num_experts: 8,
+                num_experts_per_tok: 2,
+                rms_norm_eps,
+                rope_theta,
+                max_position_embeddings: max_seq_len,
+            };
+            let m = Glm52::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::DiffusionGemma => {
+            let cfg = DiffusionGemmaConfig {
+                vocab_size,
+                hidden_size,
+                num_attention_heads: num_heads,
+                num_key_value_heads: num_kv_heads,
+                head_dim,
+                num_hidden_layers: num_layers,
+                intermediate_size,
+                rms_norm_eps,
+                rope_theta,
+                max_position_embeddings: max_seq_len,
+            };
+            let m = DiffusionGemma::load_tp(device.clone(), &ws, cfg)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::MiniMaxM3 => {
+            let cfg = MiniMaxM3Config {
+                vocab_size,
+                hidden_size,
+                num_attention_heads: num_heads,
+                num_key_value_heads: num_kv_heads,
+                head_dim,
+                num_hidden_layers: num_layers,
+                intermediate_size,
+                num_experts: 8,
+                num_experts_per_tok: 2,
+                rms_norm_eps,
+                rope_theta,
+                max_position_embeddings: max_seq_len,
+            };
+            let m = MiniMaxM3::load_tp(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
         }
         arch if arch.is_encoder() => {
@@ -1503,7 +1862,6 @@ fn load_model_from_config(
         | ModelArchitecture::BitNet
         | ModelArchitecture::ChatGlm
         | ModelArchitecture::Codeshell
-        | ModelArchitecture::CogVlm
         | ModelArchitecture::Cohere2
         | ModelArchitecture::Dbrx
         | ModelArchitecture::Deci
@@ -1516,7 +1874,6 @@ fn load_model_from_config(
         | ModelArchitecture::Eurobert
         | ModelArchitecture::Exaone
         | ModelArchitecture::Exaone4
-        | ModelArchitecture::Gemma3n
         | ModelArchitecture::Gemma4Assistant
         | ModelArchitecture::GemmaEmbedding
         | ModelArchitecture::Glm4
@@ -1526,7 +1883,6 @@ fn load_model_from_config(
         | ModelArchitecture::Granite
         | ModelArchitecture::Grok
         | ModelArchitecture::HunyuanDense
-        | ModelArchitecture::HunyuanVl
         | ModelArchitecture::HyV3
         | ModelArchitecture::InternLm2
         | ModelArchitecture::Jais
@@ -1553,9 +1909,7 @@ fn load_model_from_config(
         | ModelArchitecture::Plamo2
         | ModelArchitecture::Plamo3
         | ModelArchitecture::Plm
-        | ModelArchitecture::Qwen2Vl
         | ModelArchitecture::Qwen3Next
-        | ModelArchitecture::Qwen3Vl
         | ModelArchitecture::Refact
         | ModelArchitecture::Rnd1
         | ModelArchitecture::SeedOss
@@ -1566,7 +1920,6 @@ fn load_model_from_config(
         | ModelArchitecture::Starcoder2
         | ModelArchitecture::Step35
         | ModelArchitecture::Talkie
-        | ModelArchitecture::WavTokenizerDec
         | ModelArchitecture::Xverse => {
             let llama_cfg = LlamaConfig {
                 vocab_size,
@@ -1774,9 +2127,12 @@ fn load_model_with_providers(
                 head_dim: hparams.head_dim,
                 num_layers: hparams.num_layers,
                 intermediate_size: hparams.intermediate_size,
-                rms_norm_eps: hparams.rms_norm_eps,
+                layer_norm_epsilon: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
+                parallel_attn: true,
+                new_decoder_architecture: true,
+                multi_query: true,
             };
             eprintln!("[grim] Loading Falcon model with config: {:?}", falcon_cfg);
             let m = Falcon::load_tp(device.clone(), &ws, falcon_cfg, tp)?;
@@ -2527,10 +2883,7 @@ fn load_model_with_providers(
             let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
             Ok(Box::new(m))
         }
-        ModelArchitecture::DeepSeek
-        | ModelArchitecture::DeepSeek2
-        | ModelArchitecture::DeepSeek32
-        | ModelArchitecture::DeepSeek4 => {
+        ModelArchitecture::DeepSeek => {
             let cfg = DeepSeekConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
@@ -2542,6 +2895,90 @@ fn load_model_with_providers(
                 kv_lora_rank: hparams.num_kv_heads * 4,
             };
             let m = DeepSeek::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::DeepSeek2 => {
+            let cfg = DeepSeek2Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                kv_lora_rank: 512,
+                q_lora_rank: None,
+                qk_nope_head_dim: 128,
+                qk_rope_head_dim: 64,
+                v_head_dim: 128,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+                moe_intermediate_size: hparams.expert_feed_forward_length.unwrap_or(hparams.intermediate_size),
+                n_routed_experts: hparams.expert_count.unwrap_or(64),
+                n_shared_experts: 2,
+                num_experts_per_tok: hparams.expert_used_count.unwrap_or(6),
+                first_k_dense_replace: 1,
+                routed_scaling_factor: 1.0,
+            };
+            let m = DeepSeek2::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::DeepSeek32 => {
+            let cfg = DeepSeek32Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                kv_lora_rank: 512,
+                q_lora_rank: Some(1536),
+                qk_nope_head_dim: 128,
+                qk_rope_head_dim: 64,
+                v_head_dim: 128,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+                moe_intermediate_size: hparams.expert_feed_forward_length.unwrap_or(hparams.intermediate_size),
+                n_routed_experts: hparams.expert_count.unwrap_or(256),
+                n_shared_experts: 1,
+                num_experts_per_tok: hparams.expert_used_count.unwrap_or(8),
+                first_k_dense_replace: 1,
+                routed_scaling_factor: 2.5,
+            };
+            let m = DeepSeek32::load_tp(device.clone(), &ws, cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::DeepSeek4 => {
+            let cfg = DeepSeek4Config {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                kv_lora_rank: 512,
+                q_lora_rank: Some(1024),
+                qk_nope_head_dim: 448,
+                qk_rope_head_dim: 64,
+                v_head_dim: 512,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+                moe_intermediate_size: hparams.expert_feed_forward_length.unwrap_or(hparams.intermediate_size),
+                n_routed_experts: hparams.expert_count.unwrap_or(256),
+                n_shared_experts: 1,
+                num_experts_per_tok: hparams.expert_used_count.unwrap_or(6),
+                first_k_dense_replace: 3,
+                routed_scaling_factor: 2.5,
+                hc_mult: 4,
+                sqrtsoftplus_moe: true,
+                compressor_indexer_enabled: true,
+            };
+            let m = DeepSeek4::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::MuseGlimmer => {
@@ -2691,8 +3128,10 @@ fn load_model_with_providers(
                 v_head_dim: 128,
                 num_experts: hparams.expert_count.unwrap_or(8),
                 num_experts_per_tok: hparams.expert_used_count.unwrap_or(2),
+                intermediate_size: hparams.intermediate_size,
                 routed_scaling_factor: hparams.routed_scaling_factor,
                 rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
             };
             let m = grim_models_transformer::KimiK3::load_tp(device.clone(), &ws, cfg)?;
             Ok(Box::new(m))
@@ -2729,7 +3168,7 @@ fn load_model_with_providers(
                 rope_theta: hparams.rope_theta,
                 max_position_embeddings: hparams.max_seq_len,
             };
-            let m = grim_models_transformer::Glm52::load_tp(device.clone(), &ws, cfg)?;
+            let m = grim_models_transformer::Glm52::load_tp(device.clone(), &ws, cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::DiffusionGemma => {
@@ -2799,13 +3238,17 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
-                swin_norm: false,
+                swin_norm: true,
             };
             eprintln!(
                 "[grim] Loading Chameleon model with config: {:?}",
                 chameleon_cfg
             );
-            let llama_cfg = LlamaConfig {
+            let m = Chameleon::load_tp(device.clone(), &ws, chameleon_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::CogVlm => {
+            let cog_cfg = CogVlmConfig {
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
                 num_heads: hparams.num_heads,
@@ -2816,11 +3259,150 @@ fn load_model_with_providers(
                 rms_norm_eps: hparams.rms_norm_eps,
                 rope_theta: hparams.rope_theta,
                 max_seq_len: hparams.max_seq_len,
-
-                partial_rotary_factor: 1.0,
-                yarn: None,
+                vision_config: CogVlmVisionConfig {
+                    hidden_size: 1024,
+                    image_size: 490,
+                    patch_size: 14,
+                    num_heads: 16,
+                    num_layers: 24,
+                    in_channels: 3,
+                    out_hidden_size: hparams.hidden_size,
+                },
             };
-            let m = Llama::load_tp(device.clone(), &ws, llama_cfg, tp)?;
+            let m = CogVlm::load_tp(device.clone(), &ws, cog_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Gemma3n => {
+            let gemma_cfg = Gemma3nConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+                sliding_window_size: 1024,
+                query_pre_attn_scalar: 256.0,
+            };
+            let m = Gemma3n::load_tp(device.clone(), &ws, gemma_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::HunyuanVl => {
+            let hy_cfg = HunyuanVlConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+                mrope_section: [2, 2, 2, 2],
+                image_token_id: 5,
+                im_start_id: 120118,
+                im_end_id: 120119,
+                im_newline_id: 120121,
+                vision_config: HunyuanVlVisionConfig {
+                    hidden_size: 64,
+                    num_attention_heads: 4,
+                    num_key_value_heads: 4,
+                    num_hidden_layers: 2,
+                    patch_size: 16,
+                    num_channels: 3,
+                    intermediate_size: 128,
+                    out_hidden_size: 64,
+                },
+            };
+            let m = HunyuanVl::load_tp(device.clone(), &ws, hy_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Qwen2Vl => {
+            let qv_cfg = Qwen2VlConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+                mrope_section: [16, 24, 24],
+                vision_start_token_id: 151652,
+                vision_end_token_id: 151653,
+                vision_token_id: 151654,
+                image_token_id: 151655,
+                video_token_id: 151656,
+                vision_config: Qwen2VlVisionConfig {
+                    depth: 32,
+                    hidden_size: 1280,
+                    num_heads: 16,
+                    patch_size: 14,
+                    spatial_merge_size: 2,
+                    temporal_patch_size: 2,
+                    in_channels: 3,
+                    out_hidden_size: hparams.hidden_size,
+                },
+            };
+            let m = Qwen2Vl::load_tp(device.clone(), &ws, qv_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::Qwen3Vl => {
+            let qv_cfg = Qwen3VlConfig {
+                vocab_size: hparams.vocab_size,
+                hidden_size: hparams.hidden_size,
+                num_heads: hparams.num_heads,
+                num_kv_heads: hparams.num_kv_heads,
+                head_dim: hparams.head_dim,
+                num_layers: hparams.num_layers,
+                intermediate_size: hparams.intermediate_size,
+                rms_norm_eps: hparams.rms_norm_eps,
+                rope_theta: hparams.rope_theta,
+                max_seq_len: hparams.max_seq_len,
+                mrope_section: [24, 20, 20],
+                deepstack_visual_indexes: vec![8, 16, 24],
+                vision_start_token_id: 151652,
+                vision_end_token_id: 151653,
+                vision_token_id: 151654,
+                image_token_id: 151655,
+                video_token_id: 151656,
+                vision_config: Qwen3VlVisionConfig {
+                    depth: 27,
+                    hidden_size: 1152,
+                    num_heads: 16,
+                    patch_size: 16,
+                    spatial_merge_size: 2,
+                    temporal_patch_size: 2,
+                    in_channels: 3,
+                    out_hidden_size: hparams.hidden_size,
+                    deepstack_visual_indexes: vec![8, 16, 24],
+                },
+            };
+            let m = Qwen3Vl::load_tp(device.clone(), &ws, qv_cfg, tp)?;
+            Ok(Box::new(m))
+        }
+        ModelArchitecture::WavTokenizerDec => {
+            let wav_cfg = WavTokenizerDecConfig {
+                latent_dim: 512,
+                backbone_dim: 768,
+                backbone_num_blocks: 12,
+                backbone_intermediate_dim: 2304,
+                backbone_kernel_size: 7,
+                n_fft: 1280,
+                hop_length: 320,
+                head_dim: 641,
+                codebook_size: 4096,
+                codebook_dim: 512,
+                num_bandwidths: 4,
+                sample_rate: 24000,
+            };
+            let m = WavTokenizerDec::load_tp(device.clone(), &ws, wav_cfg, tp)?;
             Ok(Box::new(m))
         }
         ModelArchitecture::DeltaNetBase => {
@@ -2828,8 +3410,11 @@ fn load_model_with_providers(
                 vocab_size: hparams.vocab_size,
                 hidden_size: hparams.hidden_size,
                 num_heads: hparams.num_heads,
+                head_dim: hparams.head_dim,
                 num_layers: hparams.num_layers,
                 intermediate_size: hparams.intermediate_size,
+                chunk_size: 64,
+                rms_norm_eps: hparams.rms_norm_eps,
                 max_seq_len: hparams.max_seq_len,
             };
             eprintln!(
@@ -2870,7 +3455,6 @@ fn load_model_with_providers(
         | ModelArchitecture::BitNet
         | ModelArchitecture::ChatGlm
         | ModelArchitecture::Codeshell
-        | ModelArchitecture::CogVlm
         | ModelArchitecture::Cohere2
         | ModelArchitecture::Dbrx
         | ModelArchitecture::Deci
@@ -2883,7 +3467,6 @@ fn load_model_with_providers(
         | ModelArchitecture::Eurobert
         | ModelArchitecture::Exaone
         | ModelArchitecture::Exaone4
-        | ModelArchitecture::Gemma3n
         | ModelArchitecture::Gemma4Assistant
         | ModelArchitecture::GemmaEmbedding
         | ModelArchitecture::Glm4
@@ -2893,7 +3476,6 @@ fn load_model_with_providers(
         | ModelArchitecture::Granite
         | ModelArchitecture::Grok
         | ModelArchitecture::HunyuanDense
-        | ModelArchitecture::HunyuanVl
         | ModelArchitecture::HyV3
         | ModelArchitecture::InternLm2
         | ModelArchitecture::Jais
@@ -2920,9 +3502,7 @@ fn load_model_with_providers(
         | ModelArchitecture::Plamo2
         | ModelArchitecture::Plamo3
         | ModelArchitecture::Plm
-        | ModelArchitecture::Qwen2Vl
         | ModelArchitecture::Qwen3Next
-        | ModelArchitecture::Qwen3Vl
         | ModelArchitecture::Refact
         | ModelArchitecture::Rnd1
         | ModelArchitecture::SeedOss
@@ -2933,7 +3513,6 @@ fn load_model_with_providers(
         | ModelArchitecture::Starcoder2
         | ModelArchitecture::Step35
         | ModelArchitecture::Talkie
-        | ModelArchitecture::WavTokenizerDec
         | ModelArchitecture::Xverse => {
             let llama_cfg = LlamaConfig {
                 vocab_size: hparams.vocab_size,

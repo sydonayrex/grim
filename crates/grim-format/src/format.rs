@@ -1298,6 +1298,66 @@ impl GrimFile {
     }
 }
 
+/// Rewrite a `.grim` file's JSON metadata in place, preserving every payload
+/// byte (P1 §8: `preferred_dtype`, `gemm_backend`, `fp8`,
+/// `multi_gpu.strategy`, … tags written at train/save time).
+///
+/// The metadata region length changes shift every payload offset, so the file
+/// is rebuilt into a sibling temp file — header + mutated metadata + registry
+/// with recomputed offsets, then each tensor's payload/outlier/KV extents are
+/// stream-copied from the original — and atomically renamed over `path`.
+pub fn rewrite_metadata<P: AsRef<std::path::Path>>(
+    path: P,
+    mutate: impl FnOnce(&mut crate::gguf::GrimMetadata),
+) -> Result<()> {
+    let path = path.as_ref();
+    let mut old_file = std::fs::File::open(path)
+        .map_err(|e| Error::Backend(format!("rewrite_metadata open failed: {e}")))?;
+    let mut grim = GrimFile::read(&mut old_file)?;
+    let old_entries = grim.tensors.clone();
+    mutate(&mut grim.metadata);
+
+    let tmp_path = path.with_extension("grim.tmp");
+    {
+        let mut out = std::fs::File::create(&tmp_path)
+            .map_err(|e| Error::Backend(format!("rewrite_metadata temp create failed: {e}")))?;
+        let new_entries = grim.write(&mut out)?;
+
+        for (old, new) in old_entries.iter().zip(new_entries.iter()) {
+            let extents = [
+                (old.payload_offset, new.payload_offset, old.payload_size),
+                (
+                    old.outlier_offset,
+                    new.outlier_offset,
+                    old.outlier_count as u64 * OUTLIER_RECORD_BYTES as u64,
+                ),
+                (
+                    old.kv_compressed_offset,
+                    new.kv_compressed_offset,
+                    old.kv_compressed_size,
+                ),
+            ];
+            for (old_off, new_off, len) in extents {
+                if len == 0 || old_off == 0 {
+                    continue;
+                }
+                old_file
+                    .seek(std::io::SeekFrom::Start(old_off))
+                    .map_err(|e| Error::Backend(e.to_string()))?;
+                out.seek(std::io::SeekFrom::Start(new_off))
+                    .map_err(|e| Error::Backend(e.to_string()))?;
+                std::io::copy(&mut (&mut old_file).take(len), &mut out)
+                    .map_err(|e| Error::Backend(format!("rewrite_metadata payload copy: {e}")))?;
+            }
+        }
+        out.sync_all()
+            .map_err(|e| Error::Backend(format!("rewrite_metadata sync: {e}")))?;
+    }
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| Error::Backend(format!("rewrite_metadata rename: {e}")))?;
+    Ok(())
+}
+
 /// On-disk byte size of one tensor registry entry (for offset computation).
 fn registry_entry_size(entry: &GrimTensorEntry) -> u64 {
     let name_len = 2 + entry.name.len() as u64;
@@ -1716,6 +1776,91 @@ mod tests {
         // tensor() lookup works.
         assert!(restored.tensor("layer.0.weight").is_some());
         assert!(restored.tensor("nonexistent").is_none());
+    }
+
+    /// P1 §8: `rewrite_metadata` splices new tags into an on-disk `.grim`
+    /// file while preserving every payload/outlier byte at the recomputed
+    /// offsets.
+    #[test]
+    fn rewrite_metadata_updates_tags_and_preserves_payloads() {
+        use crate::gguf::{GrimMetadata, GrimRocmlProfile};
+        use std::io::{Cursor, Seek, SeekFrom, Write};
+
+        let metadata = GrimMetadata {
+            magic: Some("grim-v1".into()),
+            rocml_profile: GrimRocmlProfile::Rdna3,
+            ..Default::default()
+        };
+        let tensor = GrimTensorEntry {
+            name: "layer.0.weight".into(),
+            shape: vec![64, 64],
+            base_bitwidth: 4,
+            payload_size: 256,
+            outlier_count: 4,
+            ..Default::default()
+        };
+        let file = GrimFile {
+            header: GrimHeader::new(1, 0),
+            metadata,
+            tensors: vec![tensor],
+            tensors_by_name: HashMap::new(),
+            kv_blobs: HashMap::new(),
+            wave: WaveSize::W64,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.grim");
+        {
+            let mut out = std::fs::File::create(&path).unwrap();
+            let written = file.write(&mut out).unwrap();
+            let e = &written[0];
+            let payload: Vec<u8> = (0u8..255).cycle().take(256).collect();
+            let outliers: Vec<u8> = (200u8..=255).cycle().take(4 * OUTLIER_RECORD_BYTES).collect();
+            out.seek(SeekFrom::Start(e.payload_offset)).unwrap();
+            out.write_all(&payload).unwrap();
+            out.seek(SeekFrom::Start(e.outlier_offset)).unwrap();
+            out.write_all(&outliers).unwrap();
+            let _ = Cursor::new(&payload);
+        }
+
+        // Grow the metadata (longer than the original) so offsets must shift.
+        grim_test_rewrite(&path);
+        let path = path;
+
+        let mut f = std::fs::File::open(&path).unwrap();
+        let restored = GrimFile::read(&mut f).unwrap();
+        assert_eq!(restored.metadata.preferred_dtype.as_deref(), Some("bf16"));
+        assert_eq!(restored.metadata.gemm_backend.as_deref(), Some("rocblas"));
+        assert_eq!(restored.metadata.fp8, Some(false));
+        assert_eq!(
+            restored.metadata.multi_gpu_strategy.as_deref(),
+            Some("replica-dp")
+        );
+
+        use std::io::Read;
+        let e = &restored.tensors[0];
+        let mut payload = vec![0u8; e.payload_size as usize];
+        f.seek(SeekFrom::Start(e.payload_offset)).unwrap();
+        f.read_exact(&mut payload).unwrap();
+        assert_eq!(payload, (0u8..255).cycle().take(256).collect::<Vec<_>>());
+        let mut outliers = vec![0u8; e.outlier_count as usize * OUTLIER_RECORD_BYTES];
+        f.seek(SeekFrom::Start(e.outlier_offset)).unwrap();
+        f.read_exact(&mut outliers).unwrap();
+        assert_eq!(
+            outliers,
+            (200u8..=255).cycle().take(4 * OUTLIER_RECORD_BYTES).collect::<Vec<_>>()
+        );
+    }
+
+    // Helper kept separate so the test body stays readable.
+    fn grim_test_rewrite(path: &std::path::Path) {
+        rewrite_metadata(path, |m| {
+            m.preferred_dtype = Some("bf16".into());
+            m.gemm_backend = Some("rocblas".into());
+            m.fp8 = Some(false);
+            m.multi_gpu_strategy = Some("replica-dp".into());
+        })
+        .unwrap();
     }
 
     /// WI-R4: a compressed KV block written via `GrimFile::add_kv_blob` +

@@ -1,7 +1,7 @@
 //! `grim train` — SFT training loop: dataset loading, streaming forward, cross-entropy loss, autograd backward, AdamW step, sidecar persistence. F4: real model loading via GrimProvider.
 
 use grim_autograd::{
-    AutogradRegistry, InjectionConfig, LoRAInjectionRegistry, Tape, backward, cross_entropy_loss,
+    AutogradRegistry, AutogradScope, InjectionConfig, LoRAInjectionRegistry, Tape, backward, cross_entropy_loss,
 };
 use grim_core::error::{Error, Result};
 use grim_engine::streaming_forward::StreamingBlockForward;
@@ -19,6 +19,41 @@ use grim_nn::{Embedding, Linear, RmsNorm, WeightSource};
 use grim_tensor::backend::{BackendDevice, ScytheLink, ScythePlacement};
 use serde::Deserialize;
 use std::path::Path;
+
+/// Master-parameter compute precision for training (salamander.md P1).
+///
+/// bf16/fp16 roughly halve VRAM and double matmul throughput vs f32 on
+/// consumer RDNA (gfx103x/110x/120x) — the single biggest lever for fitting
+/// models on 8–16 GB cards. Optimizer moment buffers stay f32 regardless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum TrainDtype {
+    /// Full single-precision (default; maximal accuracy, 2x memory on RDNA).
+    F32,
+    /// Brain float 16 — recommended for consumer RDNA.
+    Bf16,
+    /// IEEE float 16.
+    Fp16,
+}
+
+impl TrainDtype {
+    /// Map to the `grim_tensor` dtype used for trainable master params.
+    pub fn to_dtype(self) -> grim_tensor::DType {
+        match self {
+            TrainDtype::F32 => grim_tensor::DType::F32,
+            TrainDtype::Bf16 => grim_tensor::DType::BF16,
+            TrainDtype::Fp16 => grim_tensor::DType::F16,
+        }
+    }
+    /// Short tag for `.grim` metadata (`preferred_dtype`).
+    pub fn tag(self) -> &'static str {
+        match self {
+            TrainDtype::F32 => "f32",
+            TrainDtype::Bf16 => "bf16",
+            TrainDtype::Fp16 => "fp16",
+        }
+    }
+}
 
 /// Training arguments for CLI execution.
 #[derive(Debug, Clone)]
@@ -62,6 +97,12 @@ pub struct TrainOptions {
     /// Enable SCALE-ECHO echo training mode. When present, bypasses the
     /// autograd tape and uses subspace echo state + FP4 updates.
     pub echo_mode: bool,
+    /// RNG seed for deterministic adapter init (salamander.md P0.2).
+    /// 0 = nondeterministic / system-entropy init.
+    pub seed: u64,
+    /// Master-parameter compute precision (salamander.md P1).
+    /// bf16/fp16 halve VRAM vs f32 on consumer RDNA. Optimizer moments stay f32.
+    pub train_dtype: TrainDtype,
 }
 
 /// Dataset entry in Alpaca format.
@@ -313,6 +354,50 @@ fn load_dataset(
         return examples.map(|exs| pack_training_examples(exs, max_seq_len));
     }
 
+    // Try OpenAI Messages format (array of {messages: [{role, content}]})
+    #[derive(Debug, Deserialize)]
+    struct MessagesTurn {
+        role: String,
+        content: String,
+    }
+    #[derive(Debug, Deserialize)]
+    struct MessagesEntry {
+        messages: Vec<MessagesTurn>,
+    }
+    if let Ok(entries) = serde_json::from_str::<Vec<MessagesEntry>>(&content) {
+        println!("[grim train] Loaded {} ChatTemplate/Messages entries", entries.len());
+        let examples: Vec<_> = entries
+            .iter()
+            .filter_map(|e| {
+                if e.messages.is_empty() {
+                    return None;
+                }
+                let mut tokens = Vec::new();
+                let mut labels = Vec::new();
+                for turn in &e.messages {
+                    let formatted = format!("<|im_start|>{}\n{}<|im_end|>\n", turn.role, turn.content);
+                    let turn_tokens = tokenizer.encode(&formatted);
+                    if turn.role.to_ascii_lowercase() == "user" || turn.role.to_ascii_lowercase() == "system" {
+                        labels.extend(vec![IGNORE_INDEX; turn_tokens.len()]);
+                    } else {
+                        labels.extend(turn_tokens.iter().copied());
+                    }
+                    tokens.extend(turn_tokens);
+                }
+                if tokens.len() > max_seq_len {
+                    tokens.truncate(max_seq_len);
+                    labels.truncate(max_seq_len);
+                }
+                if tokens.len() >= 2 {
+                    Some((tokens, labels))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        return Ok(pack_training_examples(examples, max_seq_len));
+    }
+
     // Try ShareGPT format (array of {conversations: [{from, value}]})
     if let Ok(entries) = serde_json::from_str::<Vec<ShareGptEntry>>(&content) {
         println!("[grim train] Loaded {} ShareGPT entries", entries.len());
@@ -358,7 +443,7 @@ fn load_dataset(
 
 /// Run SFT training loop over a dataset and save the trained adapter sidecar.
 pub fn cmd_train(opts: TrainOptions) -> Result<()> {
-    println!("[grim train] Initializing QLoRA training...");
+    println!("[grim train] Initializing {} training...", opts.mode.to_uppercase());
     println!("             Model: {}", opts.model_path);
     println!("             Dataset: {}", opts.dataset_path);
     println!("             Sidecar Output: {}", opts.output_sidecar);
@@ -411,8 +496,14 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         opts.olora_lambda,
         opts.use_spectral_qlora,
     );
-    let mut autograd_reg = AutogradRegistry::new(model_config.clone(), injection_reg)
-        .map_err(|e| Error::Session(e.to_string()))?;
+    let mut autograd_reg = AutogradRegistry::with_seed_and_dtype(
+        model_config.clone(),
+        injection_reg,
+        AutogradScope::default(),
+        opts.seed,
+        opts.train_dtype.to_dtype(),
+    )
+    .map_err(|e| Error::Session(e.to_string()))?;
 
     if opts.echo_mode {
         let echo_cfg = EchoConfig::default();
@@ -760,6 +851,25 @@ pub fn cmd_train(opts: TrainOptions) -> Result<()> {
         .write(sidecar_path)
         .map_err(|e| Error::Session(e.to_string()))?;
 
+    // P1 §8: tag the `.grim` artifact with the training-time dtype and
+    // multi-GPU strategy so serving/catalog can pick the right path.
+    // Non-fatal: `.gguf` inputs simply keep their original metadata.
+    let multi_gpu_strategy = if opts.num_gpus > 1 {
+        Some("replica-dp".to_string())
+    } else {
+        None
+    };
+    if let Err(e) = grim_format::format::rewrite_metadata(&opts.model_path, |meta| {
+        meta.preferred_dtype = Some(opts.train_dtype.tag().to_string());
+        meta.fp8 = Some(false);
+        meta.multi_gpu_strategy = multi_gpu_strategy.clone();
+    }) {
+        println!(
+            "[grim train] WARNING: could not tag .grim metadata ({}); sidecar is still valid.",
+            e
+        );
+    }
+
     println!(
         "[grim train] Training complete. Sidecar saved to {}",
         opts.output_sidecar
@@ -797,6 +907,8 @@ mod tests {
             early_stopping_patience: 3,
             num_gpus: 1,
             echo_mode: false,
+            seed: 0,
+            train_dtype: TrainDtype::F32,
         };
         assert_eq!(opts.mode, "soul-eater");
     }

@@ -1452,6 +1452,19 @@ pub enum CharonVariant {
     HighSkew,
 }
 
+/// WI-F3 — dispatch-target resolution for the grouped MoE forward: the JIT
+/// kernel entry a `CharonVariant` routes to. Only `LargeGroupPrefill` (the
+/// compute-bound, many-tokens-per-expert regime where tensor-core tiling
+/// pays) resolves to the WMMA grouped kernel (`grim_moe_fused_grouped_wmma`
+/// in `charon_wmma.rs`); decode and high-skew keep the scalar grouped kernel,
+/// which is the right primitive for their launch-overhead-dominated regimes.
+pub fn grouped_dispatch_entry(variant: CharonVariant) -> &'static str {
+    match variant {
+        CharonVariant::SmallBatchDecode | CharonVariant::HighSkew => "grim_moe_fused_grouped",
+        CharonVariant::LargeGroupPrefill => "grim_moe_fused_grouped_wmma",
+    }
+}
+
 impl CharonVariant {
     /// All v1 variants, in stable order (the selector's table index).
     pub const ALL: [Self; 3] = [

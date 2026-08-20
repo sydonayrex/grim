@@ -291,6 +291,18 @@ impl<'a> WeightSource<'a> {
         next
     }
 
+    /// Alias for `pp` to scope sub-modules.
+    pub fn scoped(&self, name: &str) -> WeightSource<'a> {
+        self.pp(name)
+    }
+
+    /// Returns whether a tensor with the given leaf name exists in this weight source.
+    pub fn has_tensor(&self, leaf: &str) -> bool {
+        let name = self.full_name(leaf);
+        self.tensors.meta(&name).is_ok()
+    }
+
+
     fn clone_prefix(&self) -> WeightSource<'a> {
         WeightSource {
             tensors: self.tensors,

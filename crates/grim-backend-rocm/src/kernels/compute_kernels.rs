@@ -39,6 +39,100 @@ extern "C" __global__ void grim_recip(const float* x, float* out, int n) {
     out[i] = 1.0f / x[i];
 }
 
+// ── On-device Fused Optimizer Step Kernels ───────────────────────────────────
+
+extern "C" __global__ void grim_fused_adamw_step(
+    float* __restrict__ p,
+    const float* __restrict__ g,
+    float* __restrict__ m,
+    float* __restrict__ v,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    float bc1,
+    float bc2,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    float grad = g[i];
+    float m_val = beta1 * m[i] + (1.0f - beta1) * grad;
+    float v_val = beta2 * v[i] + (1.0f - beta2) * grad * grad;
+
+    m[i] = m_val;
+    v[i] = v_val;
+
+    float m_hat = m_val / bc1;
+    float v_hat = v_val / bc2;
+    float param_val = p[i];
+
+    p[i] = param_val - lr * ((m_hat / (sqrtf(v_hat) + eps)) + weight_decay * param_val);
+}
+
+extern "C" __global__ void grim_fused_lion_step(
+    float* __restrict__ p,
+    const float* __restrict__ g,
+    float* __restrict__ exp_avg,
+    float lr,
+    float beta1,
+    float beta2,
+    float weight_decay,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    float grad = g[i];
+    float exp_val = exp_avg[i];
+
+    float update = beta1 * exp_val + (1.0f - beta1) * grad;
+    float sign_update = (update > 0.0f) ? 1.0f : ((update < 0.0f) ? -1.0f : 0.0f);
+
+    exp_avg[i] = beta2 * exp_val + (1.0f - beta2) * grad;
+    float param_val = p[i];
+
+    p[i] = param_val - lr * (sign_update + weight_decay * param_val);
+}
+
+extern "C" __global__ void grim_fused_madam_step(
+    float* __restrict__ p,
+    const float* __restrict__ g,
+    float* __restrict__ m,
+    float* __restrict__ v,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float gamma,
+    float weight_decay,
+    float bc1,
+    float bc2,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    float grad = g[i];
+    float m_val = beta1 * m[i] + (1.0f - beta1) * grad;
+    float v_val = beta2 * v[i] + (1.0f - beta2) * grad * grad;
+
+    m[i] = m_val;
+    v[i] = v_val;
+
+    float m_hat = m_val / bc1;
+    float v_hat = v_val / bc2;
+
+    float denom = sqrtf(v_hat) + eps;
+    float mult_scale = 1.0f / (1.0f + gamma * (fabsf(grad) / denom));
+    float step_val = (m_hat / denom) * mult_scale;
+    float param_val = p[i];
+
+    p[i] = param_val - lr * (step_val + weight_decay * param_val);
+}
+
 // In-memory transpose of a contiguous [a, b] f32 matrix to [b, a].
 // Patch-indexed: each thread writes OUT[j*a + i] = IN[i*b + j], so the
 // transposed output is produced directly in device memory — no DtoH + H2D
@@ -452,6 +546,124 @@ extern "C" __global__ void grim_mla_q_kv_norm_split(
         kv_rope[rope_i] = kv_raw[idx];
     }
 }
+
+// Reverse-mode autodiff for RMSNorm (salamander.md Phase 3 & G3):
+// dx[i] = (w[i] / rms) * g[i] - x[i] * (sum_j g[j] * w[j] * x[j]) / (hidden_dim * rms^3)
+// dw[i] = sum_rows g[row, i] * (x[row, i] / rms)
+extern "C" __global__ void __launch_bounds__(256)
+grim_rmsnorm_backward(const float* __restrict__ x, const float* __restrict__ w,
+                      const float* __restrict__ out_grad, float* __restrict__ dx,
+                      int row_len, float eps, int total) {
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    const int rows = total / row_len;
+    if (warp_id >= rows) return;
+    const float* x_row = x + (size_t)warp_id * row_len;
+    const float* g_row = out_grad + (size_t)warp_id * row_len;
+    float* dx_row = dx + (size_t)warp_id * row_len;
+    const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+
+    float ss = 0.0f;
+    float sum_g_w_x = 0.0f;
+    for (int col = lane; col < row_len; col += 32) {
+        float xv = x_row[col];
+        float gv = g_row[col];
+        float wv = w[col];
+        ss += xv * xv;
+        sum_g_w_x += gv * wv * xv;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        ss += __shfl_xor_sync(shfl_mask, ss, off);
+        sum_g_w_x += __shfl_xor_sync(shfl_mask, sum_g_w_x, off);
+    }
+    float rms = sqrtf(ss / (float)row_len + eps);
+    float rms_inv = 1.0f / rms;
+    float scale_sub = (sum_g_w_x / (float)row_len) * (rms_inv * rms_inv * rms_inv);
+
+    for (int col = lane; col < row_len; col += 32) {
+        dx_row[col] = (w[col] * rms_inv) * g_row[col] - x_row[col] * scale_sub;
+    }
+}
+
+// Reverse-mode autodiff for Rotary Position Embedding (RoPE) (salamander.md Phase 3 & G3):
+// Orthogonal rotation matrix backward is R(-theta).
+// dx0 = g0 * cos + g1 * sin
+// dx1 = -g0 * sin + g1 * cos
+extern "C" __global__ void __launch_bounds__(256)
+grim_rope_backward(const float* __restrict__ out_grad, const float* __restrict__ cos_tab,
+                   const float* __restrict__ sin_tab, float* __restrict__ dx,
+                   int half_dim, int total_tokens) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int head_dim = half_dim * 2;
+    int total_pairs = (total_tokens * head_dim) / 2;
+    if (idx >= total_pairs) return;
+
+    int t = idx / half_dim;
+    int i = idx % half_dim;
+    int offset = t * head_dim;
+
+    float g0 = out_grad[offset + i];
+    float g1 = out_grad[offset + half_dim + i];
+    float c = cos_tab[i];
+    float s = sin_tab[i];
+
+    dx[offset + i] = g0 * c + g1 * s;
+    dx[offset + half_dim + i] = -g0 * s + g1 * c;
+}
+
+// Reverse-mode autodiff for Softmax (salamander.md Phase 3 & G3):
+// dx_i = s_i * (g_i - sum_j g_j * s_j)
+extern "C" __global__ void __launch_bounds__(256)
+grim_softmax_backward(const float* __restrict__ out_grad, const float* __restrict__ s_out,
+                      float* __restrict__ dx, int row_len, int total) {
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    const int rows = total / row_len;
+    if (warp_id >= rows) return;
+    const float* g_row = out_grad + (size_t)warp_id * row_len;
+    const float* s_row = s_out + (size_t)warp_id * row_len;
+    float* dx_row = dx + (size_t)warp_id * row_len;
+    const unsigned long long shfl_mask = 0xffffffffffffffffULL;
+
+    float sum_g_s = 0.0f;
+    for (int col = lane; col < row_len; col += 32) {
+        sum_g_s += g_row[col] * s_row[col];
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sum_g_s += __shfl_xor_sync(shfl_mask, sum_g_s, off);
+    }
+    for (int col = lane; col < row_len; col += 32) {
+        dx_row[col] = s_row[col] * (g_row[col] - sum_g_s);
+    }
+}
+
+// Reverse-mode autodiff for token-embedding lookup (salamander.md P3, the
+// 4th fused backward kernel): dweight[token_ids[t], :] += out_grad[t, :].
+// Two kernels: a plain zero-fill of the [vocab, hidden] gradient buffer,
+// then a grid-strided atomic scatter-add over token x hidden elements.
+extern "C" __global__ void __launch_bounds__(256)
+grim_zero_f32(float* __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = 0.0f;
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+grim_embedding_backward(const float* __restrict__ out_grad,
+                        const unsigned int* __restrict__ token_ids,
+                        float* __restrict__ dweight,
+                        int num_tokens, int hidden_dim, int vocab_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_tokens * hidden_dim;
+    if (idx >= total) return;
+    int t = idx / hidden_dim;
+    int d = idx - t * hidden_dim;
+    unsigned int tok = token_ids[t];
+    if (tok >= (unsigned int)vocab_size) return; // mirror CPU bounds check
+    atomicAdd(&dweight[(size_t)tok * hidden_dim + d], out_grad[idx]);
+}
 "#;
 
 #[cfg(test)]
@@ -463,6 +675,24 @@ mod tests {
         assert!(OTHER_KERNEL_SOURCE.contains("grim_short_conv1d_causal_step"));
         assert!(OTHER_KERNEL_SOURCE.contains("grim_kda_gated_delta_rule_step"));
         assert!(OTHER_KERNEL_SOURCE.contains("grim_mla_q_kv_norm_split"));
+    }
+
+    /// P3 (4th fused backward kernel): the embedding scatter-add must be in
+    /// the JIT module source together with its zero-fill prologue kernel.
+    #[test]
+    fn test_embedding_backward_kernel_presence() {
+        assert!(
+            OTHER_KERNEL_SOURCE.contains("grim_embedding_backward"),
+            "grim_embedding_backward kernel missing from OTHER_KERNEL_SOURCE"
+        );
+        assert!(
+            OTHER_KERNEL_SOURCE.contains("grim_zero_f32"),
+            "grim_zero_f32 prologue kernel missing from OTHER_KERNEL_SOURCE"
+        );
+        assert!(
+            OTHER_KERNEL_SOURCE.contains("atomicAdd"),
+            "embedding scatter-add must accumulate with atomicAdd"
+        );
     }
 
     /// `grim_rope_yarn` must carry the full YaRN / partial-rotary contract in

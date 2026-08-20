@@ -25,4 +25,4 @@ pub use ui_state::{
     DisplayState, GarageClient, JobSummaryDto, PollError, Poller, UiAppState, UiJob,
     UiTrainingConfig, merge_fetch, normalize_wire_status, poll_fetch, poll_once,
 };
-pub use weight_format::WeightFormat;
+pub use weight_format::{check_support, CompatResult, WeightFormat};

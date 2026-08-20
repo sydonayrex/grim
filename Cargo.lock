@@ -2255,10 +2255,12 @@ dependencies = [
  "grim-backend-metal",
  "grim-backend-rocm",
  "grim-backend-vulkan",
+ "grim-constrain",
  "grim-core",
  "grim-disagg",
  "grim-engine",
  "grim-format",
+ "grim-garage",
  "grim-memory",
  "grim-models-mamba",
  "grim-models-transformer",
@@ -2280,6 +2282,18 @@ dependencies = [
  "tokio",
  "windows-service",
  "zstd",
+]
+
+[[package]]
+name = "grim-constrain"
+version = "0.1.0"
+dependencies = [
+ "grim-backend-cpu",
+ "grim-core",
+ "grim-format",
+ "grim-tensor",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2470,6 +2484,7 @@ dependencies = [
  "grim-nn",
  "grim-quant",
  "grim-tensor",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
 ]
@@ -2556,6 +2571,7 @@ dependencies = [
  "grim-backend-metal",
  "grim-backend-rocm",
  "grim-backend-vulkan",
+ "grim-constrain",
  "grim-core",
  "grim-disagg",
  "grim-engine",
@@ -2591,6 +2607,7 @@ name = "grim-tensor"
 version = "0.1.0"
 dependencies = [
  "grim-backend-cpu",
+ "serde",
  "thiserror 1.0.69",
 ]
 

@@ -5273,3 +5273,12 @@ pub fn vram_info(_ordinal: usize) -> Option<(u64, u64)> {
 
     None
 }
+
+/// WI-1: live compute utilization for `ordinal`.
+///
+/// Scope note (per WI-1): Vulkan has no core-spec utilization query (vendor
+/// extensions only). Returns `None` rather than fabricating a value from
+/// indirect signals — `null` on the wire is the honest answer.
+pub fn compute_utilization(_ordinal: usize) -> Option<u32> {
+    None
+}

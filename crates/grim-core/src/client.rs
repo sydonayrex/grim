@@ -248,6 +248,7 @@ where
         sha256: sha256_hex,
         pulled_at: utc_now_rfc3339(),
         source: "ollama".to_string(),
+        preferred_dtype: String::new(),
     };
     // WI-3: fill arch/params/context_length from the just-downloaded file's
     // GGUF header so `grim list` shows real metadata without a second scan.
@@ -341,6 +342,7 @@ where
         sha256: sha256_hex,
         pulled_at: utc_now_rfc3339(),
         source: "huggingface".to_string(),
+        preferred_dtype: String::new(),
     };
     // WI-3: enrich arch/params/context_length from the GGUF header.
     crate::catalog::apply_gguf_enrichment(&mut entry, &dest_path);
@@ -360,8 +362,11 @@ where
 async fn resolve_hf_gguf_filename(org: &str, repo: &str) -> Result<String> {
     let client = build_http_client()?;
     let api_url = format!("https://huggingface.co/api/models/{org}/{repo}");
-    let resp = client
-        .get(&api_url)
+    let mut req = client.get(&api_url);
+    if let Some(tk) = get_hf_token() {
+        req = req.header("Authorization", format!("Bearer {tk}"));
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| Error::Backend(format!("HF API request failed: {e}")))?;
@@ -546,6 +551,7 @@ where
         sha256: sha256_hex,
         pulled_at: utc_now_rfc3339(),
         source: source.to_string(),
+        preferred_dtype: String::new(),
     };
     entry.save(&dest_path)?;
 
@@ -562,6 +568,40 @@ where
 // ---------------------------------------------------------------------------
 // Streaming download with progress + SHA-256
 // ---------------------------------------------------------------------------
+
+/// Retrieve HuggingFace API token from environment, stored credentials, or HF cache.
+pub fn get_hf_token() -> Option<String> {
+    if let Ok(t) = std::env::var("HF_TOKEN") {
+        let trimmed = t.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Ok(t) = std::env::var("HUGGING_FACE_HUB_TOKEN") {
+        let trimmed = t.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Ok(Some(t)) = load_login_token("hf.co") {
+        let trimmed = t.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(home) = crate::home_dir() {
+        let cache_token = home.join(".cache").join("huggingface").join("token");
+        if cache_token.is_file() {
+            if let Ok(content) = fs::read_to_string(&cache_token) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    None
+}
 
 /// Stream `url` to `dest`, calling `progress_fn` periodically.
 async fn stream_download<F>(
@@ -582,8 +622,13 @@ where
         dest.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
     ));
 
-    let resp = client
-        .get(url)
+    let mut req = client.get(url);
+    if url.contains("huggingface.co") || url.contains("hf.co") {
+        if let Some(tk) = get_hf_token() {
+            req = req.header("Authorization", format!("Bearer {tk}"));
+        }
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| Error::Backend(format!("download GET failed: {e}")))?;
@@ -612,11 +657,11 @@ where
             .map_err(|e| Error::Backend(format!("disk write error: {e}")))?;
         downloaded += bytes.len() as u64;
 
-        if downloaded - last_report >= REPORT_INTERVAL || downloaded == total_bytes {
+        if downloaded - last_report >= REPORT_INTERVAL || (total_bytes > 0 && downloaded == total_bytes) {
             progress_fn(DownloadProgress {
                 status: "downloading".to_string(),
                 digest: Some(digest.clone()),
-                total: Some(total_bytes),
+                total: if total_bytes > 0 { Some(total_bytes) } else { None },
                 completed: Some(downloaded),
             });
             last_report = downloaded;
@@ -635,7 +680,8 @@ where
     // Compare computed hash against expected digest BEFORE rename,
     // so a corrupted download never reaches its final destination.
     let sha256_hex = format!("{:x}", hasher.finalize());
-    if !digest.is_empty() && sha256_hex != digest {
+    let is_expected_sha256 = digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit());
+    if is_expected_sha256 && !sha256_hex.eq_ignore_ascii_case(&digest) {
         // Remove the partial file so it doesn't linger.
         let _ = fs::remove_file(&part);
         return Err(Error::Backend(format!(
