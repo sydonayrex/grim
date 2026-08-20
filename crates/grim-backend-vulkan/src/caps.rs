@@ -15,6 +15,11 @@ pub struct VulkanCaps {
     pub supports_fp16: bool,
     pub supports_bf16: bool,
     pub supports_fp8: bool,
+    /// True when the device supports `buffer_atomic_add_f32` / `OpAtomicFAdd` on SSBOs.
+    /// Required by the MoE fused dispatch kernel. AMD RADV only assembles this
+    /// instruction on RDNA 3+ (gfx1100+, device_id >= 0x7440); earlier hardware
+    /// (including the Raphael Mendocino iGPU at 0x164e) will SIGABRT in ACO.
+    pub supports_fp32_atomic_add: bool,
 }
 
 impl VulkanCaps {
@@ -25,6 +30,9 @@ impl VulkanCaps {
         device_id: u32,
         driver_version: u32,
     ) -> Self {
+        // AMD RDNA 3+ (gfx1100+): device_id in 0x7440–0x75ff range.
+        // These support native FP32 atomic add on SSBOs via ACO.
+        let supports_fp32_atomic_add = vendor_id == 0x1002 && device_id >= 0x7440 && device_id <= 0x75ff;
         Self {
             device_name,
             vendor_id,
@@ -36,6 +44,7 @@ impl VulkanCaps {
             supports_fp16: true,
             supports_bf16: true,
             supports_fp8: false,
+            supports_fp32_atomic_add,
         }
     }
 

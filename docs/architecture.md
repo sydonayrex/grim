@@ -1,209 +1,184 @@
 # Architecture Overview
 
-Grim is a pure-Rust inference engine designed for running autoregressive language models, SSM-based architectures, diffusion models, and vision/audio encoders on CPU and GPU backends.
+Grim is a pure-Rust neural network inference and fine-tuning engine supporting autoregressive language models, state-space models, vision encoders, audio encoders, and diffusion architectures across CPU, ROCm, CUDA, Vulkan, and Metal backends.
 
 ## Workspace Structure
 
-The workspace contains 28 crates organized into logical layers:
+The workspace contains 28 crates organized into five functional layers:
 
-- **Core layer** (`grim-tensor`, `grim-quant`, `grim-format`): Foundation types for tensors, data types, quantization, and model formats
-- **Backend layer** (`grim-backend-cpu`, `grim-backend-rocm`, `grim-backend-cuda`, `grim-backend-vulkan`, `grim-backend-metal`): Hardware-specific implementations
-- **Model layer** (`grim-nn`, `grim-models-*`): Neural network modules and pre-built model architectures
-- **Runtime layer** (`grim-core`, `grim-engine`, `grim-scheduler`, `grim-memory`, `grim-kvquant`, `grim-kvtransport`, `grim-autograd`, `grim-speculative`): Inference orchestration, memory management, and speculative decoding
-- **Service layer** (`grim-server`, `grim-cli`, `grim-plugin`, `grim-disagg`, `grim-garage`): API serving, CLI, plugins, and training dashboard
+- **Foundation Layer** (`grim-tensor`, `grim-tensor-graph`, `grim-quant`, `grim-format`): Tensors, quantization codecs (Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, FP8, MXFP4), and container file I/O (GGUF, SafeTensors, `.grim`).
+- **Backend Layer** (`grim-backend-cpu`, `grim-backend-rocm`, `grim-backend-cuda`, `grim-backend-vulkan`, `grim-backend-metal`): Hardware execution engines and vendor runtime bindings.
+- **Model Layer** (`grim-nn`, `grim-models-transformer`, `grim-models-mamba`, `grim-models-vision`, `grim-models-audio`, `grim-models-diffusion`): Neural network building blocks, weight loaders, and architecture implementations.
+- **Runtime Layer** (`grim-core`, `grim-engine`, `grim-scheduler`, `grim-memory`, `grim-kvquant`, `grim-kvtransport`, `grim-autograd`, `grim-speculative`, `grim-constrain`): Inference orchestration, continuous batching, paged memory management, speculative execution, grammar-constrained decoding, and adapter autograd.
+- **Service Layer** (`grim-server`, `grim-cli`, `grim-plugin`, `grim-disagg`, `grim-garage`): HTTP/REST API endpoints, command-line interface, WASM plugin sandbox, disaggregated serving, and training telemetry dashboard.
 
 ## Workspace Dependency Graph
 
 ```mermaid
-graph TD
-    %% Core foundation
-    A[grim-tensor] -->|DType, Shape, Device| B[grim-quant]
-    A -->|Tensor, Backend traits| C[grim-format]
-    
-    %% Backend dependencies
-    A -->|BackendDevice trait| D[grim-backend-cpu]
-    A -->|BackendDevice trait| E[grim-backend-rocm]
-    A -->|BackendDevice trait| F[grim-backend-cuda]
-    A -->|BackendDevice trait| G[grim-backend-vulkan]
-    A -->|BackendDevice trait| H[grim-backend-metal]
-    
-    C -->|GGUF I/O| B
-    B -->|Quantization| D
-    B -->|Quantization| E
-    B -->|Quantization| F
-    B -->|Quantization| G
-    B -->|Quantization| H
-    
-    %% Neural network modules
-    A -->|Tensor types| I[grim-nn]
-    D -->|Reference impl| I
-    E -->|GPU kernels| I
-    I -->|WeightSource| J[grim-models-transformer]
-    I -->|WeightSource| K[grim-models-mamba]
-    I -->|WeightSource| L[grim-models-vision]
-    I -->|WeightSource| M[grim-models-audio]
-    I -->|WeightSource| N[grim-models-diffusion]
-    
-    %% Core orchestration
-    A -->|Tensor types| O[grim-core]
-    I -->|Modules| O
-    C -->|Model loading| O
-    D -->|CPU backend| O
-    
-    %% Memory and scheduling
-    A -->|Tensor types| P[grim-memory]
-    O -->|KvCache trait| P
-    A -->|Tensor types| Q[grim-kvquant]
-    O -->|KvCache trait| Q
-    A -->|Tensor types| R[grim-kvtransport]
-    O -->|KvCache trait| R
-    
-    %% Speculative decoding
-    A -->|Tensor types| S[grim-speculative]
-    O -->|Sampler| S
-    J -->|CausalLm| S
-    
-    %% Autograd
-    A -->|Tensor types| T[grim-autograd]
-    C -->|WeightSource| T
-    D -->|CPU backend| T
-    
-    %% Engine
-    A -->|Tensor types| U[grim-engine]
-    O -->|Model traits| U
-    I -->|Modules| U
-    D -->|CPU backend| U
-    E -->|GPU kernels| U
-    P -->|Memory| U
-    S -->|Speculative| U
-    T -->|Autograd| U
-    
-    %% Scheduler
-    O -->|Session, Sampler| V[grim-scheduler]
-    R -->|KV transport| V
-    
-    %% Plugin system
-    A -->|Tensor types| W[grim-plugin]
-    O -->|Paths| W
-    
-    %% Server
-    A -->|Tensor types| X[grim-server]
-    U -->|Engine| X
-    V -->|Scheduler| X
-    E -->|ROCm| X
-    F -->|CUDA| X
-    H -->|Metal| X
-    D -->|CPU| X
-    O -->|Model traits| X
-    C -->|Format| X
-    
-    %% CLI
-    U -->|Engine| Y[grim-cli]
-    X -->|Server| Y
-    W -->|Plugin| Y
-    S -->|Speculative| Y
-    AB -->|Graph| Y
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#2b2d42', 'edgeLabelBackground':'#ffffff', 'tertiaryColor': '#edf2f4'}}}%%
+flowchart TD
+    subgraph Foundation Layer
+        tensor["grim-tensor"]
+        graph["grim-tensor-graph"]
+        quant["grim-quant"]
+        format["grim-format"]
+    end
 
-    %% Disaggregation
-    O -->|Session| Z[grim-disagg]
-    R -->|Transport| Z
+    subgraph Backend Layer
+        cpu["grim-backend-cpu"]
+        rocm["grim-backend-rocm"]
+        cuda["grim-backend-cuda"]
+        vulkan["grim-backend-vulkan"]
+        metal["grim-backend-metal"]
+    end
 
-    %% Garage
-    U -->|Engine| AA[grim-garage]
-    T -->|Autograd| AA
-    
-    %% Graph
-    A -->|Tensor types| AB[grim-tensor-graph]
-    C -->|Format| AB
-    
-    %% Training
-    U -->|Engine| AC[grim-speculative]
-    
-    %% Spacer for 480px min height
-    A ~~~ Spacer1[ ] ~~~ Spacer2[ ] ~~~ Spacer3[ ] ~~~ Spacer4[ ] ~~~ Spacer5[ ] ~~~ Spacer6[ ] ~~~ Spacer7[ ] ~~~ Spacer8[ ] ~~~ Spacer9[ ] ~~~ Spacer10[ ]
-    style Spacer1 fill:none,stroke:none,color:none
-    style Spacer2 fill:none,stroke:none,color:none
-    style Spacer3 fill:none,stroke:none,color:none
-    style Spacer4 fill:none,stroke:none,color:none
-    style Spacer5 fill:none,stroke:none,color:none
-    style Spacer6 fill:none,stroke:none,color:none
-    style Spacer7 fill:none,stroke:none,color:none
-    style Spacer8 fill:none,stroke:none,color:none
-    style Spacer9 fill:none,stroke:none,color:none
-    style Spacer10 fill:none,stroke:none,color:none
+    subgraph Model Layer
+        nn["grim-nn"]
+        transformer["grim-models-transformer"]
+        mamba["grim-models-mamba"]
+        vision["grim-models-vision"]
+        audio["grim-models-audio"]
+        diffusion["grim-models-diffusion"]
+    end
 
-    style A fill:#e1f5e1
-    style O fill:#fff3e0
-    style I fill:#f3e5f5
-    style U fill:#e8f5e8
+    subgraph Runtime Layer
+        core["grim-core"]
+        engine["grim-engine"]
+        scheduler["grim-scheduler"]
+        memory["grim-memory"]
+        kvquant["grim-kvquant"]
+        kvtransport["grim-kvtransport"]
+        autograd["grim-autograd"]
+        speculative["grim-speculative"]
+        constrain["grim-constrain"]
+    end
+
+    subgraph Service Layer
+        server["grim-server"]
+        cli["grim-cli"]
+        plugin["grim-plugin"]
+        disagg["grim-disagg"]
+        garage["grim-garage"]
+    end
+
+    tensor --> quant
+    tensor --> format
+    tensor --> cpu
+    tensor --> rocm
+    tensor --> cuda
+    tensor --> vulkan
+    tensor --> metal
+
+    format --> quant
+    nn --> tensor
+    nn --> transformer
+    nn --> mamba
+    nn --> vision
+    nn --> audio
+    nn --> diffusion
+
+    core --> tensor
+    core --> format
+    memory --> core
+    kvquant --> core
+    kvtransport --> core
+    constrain --> core
+    constrain --> format
+
+    engine --> core
+    engine --> memory
+    engine --> autograd
+    engine --> speculative
+    engine --> rocm
+    engine --> cpu
+
+    scheduler --> core
+    scheduler --> memory
+
+    server --> engine
+    server --> scheduler
+    server --> constrain
+    server --> plugin
+
+    cli --> engine
+    cli --> server
+    cli --> autograd
+    cli --> format
+    cli --> quant
+
+    garage --> autograd
+    disagg --> core
+
+    classDef foundation fill:#2b2d42,stroke:#8d99ae,stroke-width:1px,color:#edf2f4;
+    classDef backend fill:#1d3557,stroke:#457b9d,stroke-width:1px,color:#f1faee;
+    classDef model fill:#4a4e69,stroke:#9a8c98,stroke-width:1px,color:#f2e9e4;
+    classDef runtime fill:#3d5a80,stroke:#98c1d9,stroke-width:1px,color:#e0fbfc;
+    classDef service fill:#d90429,stroke:#ef233c,stroke-width:1px,color:#ffffff;
+
+    class tensor,graph,quant,format foundation;
+    class cpu,rocm,cuda,vulkan,metal backend;
+    class nn,transformer,mamba,vision,audio,diffusion model;
+    class core,engine,scheduler,memory,kvquant,kvtransport,autograd,speculative,constrain runtime;
+    class server,cli,plugin,disagg,garage service;
 ```
 
 ## Key Types and Traits
 
-### Data Flow
+### Data Flow Pipeline
 
-1. **Model Loading** (`grim-format`): Reads GGUF/safetensors files, loads tensors via `TensorProvider` trait
-2. **Weight Application** (`grim-nn`): Applies weights through `VarBuilder`-like interface
-3. **Inference** (`grim-engine`): Orchestrates forward pass through `Engine` struct
-4. **Request Serving** (`grim-server`): HTTP/OpenAI-compatible endpoints via `axum`
+1. **Model Ingestion** (`grim-format`): Reads GGUF, SafeTensors, or `.grim` files; exposes tensors via `TensorProvider`.
+2. **Weight Instantiation** (`grim-nn`): Loads tensors into model layers using `WeightSource`.
+3. **Execution Scheduling** (`grim-scheduler`): Coordinates request queues (waiting, running, swapped) and continuous batching.
+4. **Token Generation** (`grim-engine` / `grim-speculative`): Computes forward passes, evaluates draft tokens, and updates KV cache states.
+5. **Sampling & Constraint** (`grim-core` / `grim-constrain`): Applies temperature, top-k/top-p, and FSM token masking for structured JSON outputs.
+6. **API Delivery** (`grim-server` / `grim-cli`): Streams Server-Sent Events (SSE) or returns complete JSON responses.
 
-### Core Traits
+### Core Abstractions
 
-- **`BackendDevice`** (`grim-tensor`): Hardware-agnostic tensor operations (matmul, attention, etc.)
-- **`BackendStorage`** (`grim-tensor`): Device-specific tensor storage
-- **`ComputeHandle`** (`grim-tensor`): Async operation tracking
-- **`KvCache`** (`grim-core`): Key-value cache interface for autoregressive generation
-- **`SessionT`** (`grim-core`): Object-safe per-request execution state and RNG interface
-- **`Model`** (`grim-core`): Model trait family for different architectures
+- **`BackendDevice`** (`grim-tensor`): Hardware-agnostic compute contract (dense matmul, quantized matmul, RMSNorm, RoPE, SiLU-Mul, softmax).
+- **`BackendStorage`** (`grim-tensor`): Device-allocated memory buffer.
+- **`ComputeHandle`** (`grim-tensor`): Asynchronous stream and event tracker.
+- **`KvCache`** (`grim-core`): Key-value state cache abstraction.
+- **`SessionT`** (`grim-core`): Request context tracking token history and PRNG state.
+- **`Sampler`** (`grim-core`): Logit transformation and token selection interface.
+- **`Tape`** (`grim-autograd`): Differentiable execution tape for parameter-efficient adapter fine-tuning.
 
 ## Backend Architecture
 
 ### Device Abstraction
 
-The `Device` enum supports multiple backends:
+Hardware devices are identified via the `Device` enum:
 
 ```rust
 pub enum Device {
-    Cpu,                    // Always available reference
-    Rocm(usize),           // ROCm/HIP primary target
-    Vulkan,                // Platform-agnostic fallback
-    Cuda(usize),           // NVIDIA CUDA
-    Metal(usize),          // Apple Metal
+    Cpu,
+    Rocm(usize),
+    Cuda(usize),
+    Vulkan,
+    Metal(usize),
 }
 ```
 
-### Backend Features
+### Backend Implementations
 
-- **`grim-backend-cpu`**: SIMD-optimized with OxiBLAS, scalar fallback
-- **`grim-backend-rocm`**: rocBLAS, hip graph capture, fused kernels, cubecl integration
-- **`grim-backend-cuda`**: cuBLAS GEMM operations
-- **`grim-backend-vulkan`**: Simulated JIT/autotuning
-- **`grim-backend-metal`**: Metal compute shaders on Apple Silicon
+- **`grim-backend-cpu`**: Vectorized execution using AVX2/AVX-512/NEON SIMD intrinsics with scalar fallback.
+- **`grim-backend-rocm`**: Primary GPU backend with rocBLAS bindings, HIP runtime FFI, Wave32/Wave64 kernel specialization, and JIT kernel compilation.
+- **`grim-backend-cuda`**: NVIDIA GPU backend with cuBLAS GEMM dispatch and runtime PTX compilation.
+- **`grim-backend-vulkan`**: Platform-portable compute shader backend dispatching SPIR-V pipelines.
+- **`grim-backend-metal`**: Apple Silicon GPU backend using Metal Performance Shaders and MSL shaders.
 
 ## Error Handling Conventions
 
-The workspace uses `thiserror` for error definitions with consistent categorization:
+The workspace uses `thiserror` for library error definitions:
 
-- `grim-tensor::Error`: Tensor operation failures (shape, dtype, device)
-- `grim-core::Error`: Core orchestration failures (config, session, kv cache)
-- `anyhow::Error`: Used sparingly for application-level errors
+- `grim-tensor::Error`: Tensor allocation, dimension mismatch, and backend execution errors.
+- `grim-core::Error`: Engine session, KV cache, and configuration errors.
+- `grim-format::Error`: File header corruption, missing tensors, and tokenizer errors.
+- `grim-autograd::Error`: Gradient tape shape mismatches and optimizer numerical errors.
 
-Error propagation follows the `Result<T, Error>` pattern throughout, with `thiserror` derive macros generating `Display` implementations.
+## Non-Obvious Design Decisions
 
-## Non-obvious Design Decisions
-
-1. **Speculative decoding is default-on**: The `Engine` wraps all causal models in `SpeculativeCausalLm` automatically
-2. **Continuous-batching scheduler**: Three-queue design (waiting/running/swapped) for latency-aware admission control
-3. **Paged KV cache**: Uses block allocator with prefix caching for efficient memory management
-4. **Autograd scope**: Only traces backward for adapter weights (LoRA/QLoRA), not full model parameters
-5. **Tiered KV transport**: GPU → Host RAM → NVMe spill for large context windows
-6. **Self-tuning parameters**: Engine adapts batch size, speculative depth, and KV compression at runtime
-
-## Out of Scope
-
-- Full fine-tuning (only LoRA/QLoRA adapter training)
-- Multimodal embeddings (not implemented)
-- Audio transcription (not implemented)
-- Image generation (not implemented)
-- gRPC serving is not implemented (the `/grpc` route returns a stub)
-- Non-ROCm GPU backends are optional and may fall back to CPU
+1. **Self-Contained FSM Masking**: `grim-constrain` implements finite-state JSON parsing in pure Rust without external C grammar engines.
+2. **Reverse-Mode Adapter Scoping**: `grim-autograd` only records operations that mutate trainable adapter weights, keeping base model parameters immutable in VRAM.
+3. **Implicit Vulkan Layer Suppression**: `grim-backend-vulkan` suppresses display-compositor-dependent layers to avoid headless hangs in CI environments.
+4. **Paged Memory Allocation**: `grim-memory` uses block tables and prefix hashing to eliminate memory fragmentation during long-context generation.

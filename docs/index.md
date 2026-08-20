@@ -53,6 +53,7 @@ Each crate has its own README with detailed documentation:
 - `grim-scheduler` — Continuous-batching scheduler
 - `grim-speculative` — Speculative decoding (DSpark, Native MTP)
 - `grim-autograd` — LoRA/QLoRA backward pass
+- `grim-constrain` — Grammar-based & JSON Schema decoding
 - `grim-engine` — Runtime orchestrator
 - `grim-server` — HTTP serving layer
 - `grim-cli` — Command-line interface

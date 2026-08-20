@@ -177,6 +177,7 @@ Train / fine-tune LoRA adapters on a dataset (SFT QLoRA).
 | `--echo_mode` | - | false | No |
 | `--optimizer` | - | `adamw` | No |
 | `--scheduler` | - | `cosine-warmup` | No |
+| `--seed` | - | `0` (random) | No |
 | `--use_pissa` | - | false | No |
 | `--use_olora` | - | false | No |
 | `--olora_lambda` | - | `1.0` | No |
@@ -333,6 +334,7 @@ Re-verify every claim Grim makes about itself (§13.5). Checks: unit on disk, OS
 
 | Flag | Short | Default | Required |
 |---|---|---|---|
+| `--model` | `-m` | None | No (runs VRAM pre-flight estimation and codec check on target model file) |
 | `--addr` | - | `127.0.0.1:11434` | No |
 | `--service_name` | - | `grim` | No |
 | `--exec_path` | - | `/usr/local/bin/grim` | No |

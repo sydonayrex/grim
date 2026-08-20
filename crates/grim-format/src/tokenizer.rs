@@ -877,53 +877,18 @@ pub fn sanitize_jinja_template(template: &str) -> String {
     //    method. This is used by tool-call templates: `{% for k, v in d.items() %}`.
 
     // Transform `.get('key')` and `.get("key")` → `["key"]`.
-    // Use char-boundary-safe ranges — byte offsets from `find` can land in the
-    // middle of a multi-byte character, causing panic on non-ASCII templates.
-    // [P1-25 fix: char-boundary-safe replace_range.]
-    let mut result = result;
     while let Some(pos) = result.find(".get('") {
         if let Some(end) = result[pos..].find("')") {
-            let abs_end = pos + end;
-            // Clamp to char boundary.
-            let end_char = result[..=abs_end]
-                .char_indices()
-                .last()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            let key = &result[pos + 6..end_char];
-            let replacement = format!("[\"{key}\"]");
-            let start_char = result[..pos].char_indices().count();
-            let end_char_count = result[..=abs_end].char_indices().count();
-            if let Some((s, _)) = result.char_indices().nth(start_char) {
-                if let Some((e, _)) = result.char_indices().nth(end_char_count) {
-                    result.replace_range(s..e, &replacement);
-                    continue;
-                }
-            }
-            break;
+            let key = result[pos + 6..pos + end].to_string();
+            result.replace_range(pos..pos + end + 2, &format!("[\"{key}\"]"));
         } else {
             break;
         }
     }
     while let Some(pos) = result.find(".get(\"") {
         if let Some(end) = result[pos..].find("\")") {
-            let abs_end = pos + end;
-            let end_char = result[..=abs_end]
-                .char_indices()
-                .last()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            let key = &result[pos + 6..end_char];
-            let replacement = format!("[\"{key}\"]");
-            let start_char = result[..pos].char_indices().count();
-            let end_char_count = result[..=abs_end].char_indices().count();
-            if let Some((s, _)) = result.char_indices().nth(start_char) {
-                if let Some((e, _)) = result.char_indices().nth(end_char_count) {
-                    result.replace_range(s..e, &replacement);
-                    continue;
-                }
-            }
-            break;
+            let key = result[pos + 6..pos + end].to_string();
+            result.replace_range(pos..pos + end + 2, &format!("[\"{key}\"]"));
         } else {
             break;
         }

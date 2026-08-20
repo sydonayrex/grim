@@ -1,0 +1,12 @@
+# Workspace-level Cargo configuration.
+
+[env]
+# Disable all implicit Vulkan layers unless the caller explicitly overrides.
+# Prevents display-compositor-dependent layers (Steam overlay, MangoHud,
+# gamescope WSI) from stalling vkCreateInstance in headless/CI test processes.
+# The `force = false` default means an existing shell value takes priority.
+#
+# To pin a specific Vulkan ICD (e.g. for CI or multi-GPU disambiguation):
+#   VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json  -- RADV/AMD
+#   VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json  -- NVIDIA
+VK_LOADER_LAYERS_DISABLE = { value = "~all~", force = false }

@@ -124,6 +124,7 @@ grim/
 │   ├── grim-cli/           # Command-line interface
 │   ├── grim-disagg/        # Disaggregation layer (prefill/decode split)
 │   ├── grim-plugin/        # Plugin system (dylib + WASM)
+│   ├── grim-constrain/     # Structured & JSON Schema grammar decoding
 │   └── grim-garage/        # Training dashboard web app
 ├── docs/                   # Documentation
 │   ├── onboarding.md       # This file

@@ -3259,7 +3259,7 @@ impl BackendDevice for CudaDevice {
                     let b_bytes = b_storage.bytes();
                     let real_packed_size = n * blocks_per_col * 34;
 
-                    let (scales_device_ptr, b_data_offset) = if b_bytes == real_packed_size {
+                    let (_scales_storage, scales_device_ptr, b_data_offset) = if b_bytes == real_packed_size {
                         // Real packed: extract f16 scales from headers.
                         let mut host_packed = vec![0u8; b_bytes];
                         if let Some(dev_ptr) = b_storage.device_ptr {
@@ -3297,7 +3297,7 @@ impl BackendDevice for CudaDevice {
                         let sptr = scales_storage.device_ptr.ok_or_else(|| {
                             Error::Backend("quantized_matmul: failed to upload scales buffer".into())
                         })? as *const c_void;
-                        (sptr, 2usize) // kernel skips 2-byte f16 header per block
+                        (Some(scales_storage), sptr, 2usize) // kernel skips 2-byte f16 header per block
                     } else {
                         // Simplified: use externally-provided b_scales directly.
                         // The kernel still applies the B data at offset 0 (no f16 header skip).
@@ -3326,7 +3326,7 @@ impl BackendDevice for CudaDevice {
                         let sptr = scales_storage.device_ptr.ok_or_else(|| {
                             Error::Backend("quantized_matmul: failed to upload scales buffer".into())
                         })? as *const c_void;
-                        (sptr, 0usize) // no f16 header to skip
+                        (Some(scales_storage), sptr, 0usize) // no f16 header to skip
                     };
 
                     let handle = self

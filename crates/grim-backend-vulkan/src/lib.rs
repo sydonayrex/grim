@@ -2137,9 +2137,10 @@ impl VulkanDevice {
             .as_ref()
             .ok_or_else(|| Error::Backend("Vulkan context uninitialized".into()))?;
 
-        // Output is zero-initialized; the kernel atomicAdds contributions.
+        // Output must be host-visible so we can zero-initialise it via vkMapMemory before the
+        // kernel dispatch; device-local memory cannot be mapped on discrete GPUs (NVIDIA/AMD dGPU).
         let out_storage =
-            VulkanStorage::alloc_device_local_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
+            VulkanStorage::alloc_gpu(out_shape, DType::F32, ctx.device, ctx.physical_device)?;
         unsafe {
             let mut mapped: *mut c_void = std::ptr::null_mut();
             let res = vkMapMemory(
@@ -4639,11 +4640,18 @@ mod tests {
     use grim_tensor::{DType, Shape};
 
     /// GPU-gated parity test for the fused grouped MoE dispatch kernel.
-    /// Runs only when a Vulkan device is present (`cargo test -- --ignored`).
+    /// Runs only when a Vulkan device is present AND it supports FP32 atomic
+    /// add on SSBOs (`cargo test -- --include-ignored`).
+    ///
+    /// The MoE kernel uses `OpAtomicFAdd` / `buffer_atomic_add_f32`, which
+    /// RADV/ACO only assembles on RDNA 3+ (gfx1100+, device_id ≥ 0x7440).
+    /// Running on earlier hardware (e.g. Raphael Mendocino iGPU, gfx1103) will
+    /// SIGABRT inside the ACO backend. The test is `#[ignore]` by default to
+    /// keep `cargo test` green on any GPU; run it explicitly on RDNA 3+ hardware.
+    ///
     /// Compares the GPU output against a hand-computed CPU reference for a
     /// tiny 2-expert / 2-token / top-1 routing. Numerical tolerance is loose
-    /// because FP32 atomic adds can reorder; the contract is correctness of the
-    /// fused gate+up SiLU combine + down + routed_scaling_factor accumulate.
+    /// because FP32 atomic adds can reorder on the GPU.
     #[test]
     #[ignore]
     fn test_vulkan_moe_fused_dispatch_parity() {
@@ -4651,6 +4659,14 @@ mod tests {
             return;
         }
         let dev = VulkanDevice::new();
+        // Skip on hardware that doesn't support FP32 atomic add on SSBOs.
+        if !dev.caps().supports_fp32_atomic_add {
+            eprintln!(
+                "test_vulkan_moe_fused_dispatch_parity: skipped (device '{}' does not support fp32 atomic add; requires RDNA3+)",
+                dev.caps().device_name
+            );
+            return;
+        }
         let hidden: usize = 4;
         let inter: usize = 3;
         let num_experts: usize = 2;
